@@ -21,17 +21,18 @@ enigo = "0.6"
 futures-util = "0.3"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
-mp4e = "1.0.5"
+matroska-demuxer = "0.7.0"
 notify = "6"
-openh264 = "0.9.3"
 portable-pty = "0.9.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
+rubato = "3.0.0"
 rusqlite = { version = "0.32", features = ["bundled"] }
 scap = "0.1.0-beta.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"
 sha2 = "0.10"
+shiguredo_libvpx = "2026.2.0-canary.0"
 sysinfo = "0.39.1"
 tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "tray-icon", "unstable"] }
 tauri-plugin-deep-link = "2"
@@ -42,8 +43,11 @@ tauri-plugin-opener = "2"
 tokio = { version = "1", features = ["macros", "net", "sync", "time"] }
 tokio-tungstenite = { version = "0.26", default-features = false, features = ["connect", "rustls-tls-native-roots"] }
 tungstenite = { version = "0.26", default-features = false, features = ["rustls-tls-native-roots"] }
+unsafe-libopus = "0.2.0"
 uuid = { version = "1", features = ["v4"] }
+webm = "2.2.0"
 window-vibrancy = "0.6"
+yuvutils-rs = "0.8.3"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]

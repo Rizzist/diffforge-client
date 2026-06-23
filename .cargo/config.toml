@@ -1,0 +1,4 @@
+[env]
+LANG = { value = "C", force = true }
+LC_ALL = { value = "C", force = true }
+LC_CTYPE = { value = "C", force = true }

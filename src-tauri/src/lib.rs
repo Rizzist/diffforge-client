@@ -4850,6 +4850,7 @@ pub fn run() {
             snipping_shortcuts_status,
             set_snipping_enabled,
             set_snipping_hide_desktop_icons,
+            set_snipping_freeze_screen,
             set_snipping_upload_public,
             set_snipping_shortcut,
             reset_snipping_shortcuts,

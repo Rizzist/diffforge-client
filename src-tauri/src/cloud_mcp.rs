@@ -32073,6 +32073,7 @@ fn cloud_mcp_asset_mime_for_path(path: &Path) -> String {
         "webp" => "image/webp",
         "svg" => "image/svg+xml",
         "mp4" => "video/mp4",
+        "webm" => "video/webm",
         "mov" => "video/quicktime",
         "mp3" => "audio/mpeg",
         "wav" => "audio/wav",
@@ -32095,6 +32096,7 @@ fn cloud_mcp_asset_extension_for_mime(mime: &str) -> Option<&'static str> {
         "image/webp" => Some("webp"),
         "image/svg+xml" => Some("svg"),
         "video/mp4" => Some("mp4"),
+        "video/webm" => Some("webm"),
         "video/quicktime" => Some("mov"),
         "audio/mpeg" => Some("mp3"),
         "audio/wav" | "audio/wave" => Some("wav"),
@@ -38335,6 +38337,27 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
                     "todoInputCount",
                 ],
             );
+            let model = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "mo",
+                &["model", "model_id", "modelId"],
+            );
+            let reasoning_effort = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "re",
+                &[
+                    "reasoning_effort",
+                    "reasoningEffort",
+                    "effort",
+                    "thinking_power",
+                    "thinkingPower",
+                ],
+            );
+            let speed = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "sp",
+                &["speed", "service_tier", "serviceTier"],
+            );
             let mut payload = serde_json::Map::new();
             payload.insert("id".to_string(), json!(todo_id.clone()));
             payload.insert("todo_id".to_string(), json!(todo_id.clone()));
@@ -38402,6 +38425,25 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
             if !updated_at.is_null() {
                 payload.insert("updated_at".to_string(), updated_at.clone());
                 payload.insert("updatedAt".to_string(), updated_at);
+            }
+            if !model.is_null() {
+                payload.insert("model".to_string(), model.clone());
+                payload.insert("model_id".to_string(), model.clone());
+                payload.insert("modelId".to_string(), model);
+            }
+            if !reasoning_effort.is_null() {
+                payload.insert(
+                    "reasoning_effort".to_string(),
+                    reasoning_effort.clone(),
+                );
+                payload.insert(
+                    "reasoningEffort".to_string(),
+                    reasoning_effort.clone(),
+                );
+                payload.insert("effort".to_string(), reasoning_effort);
+            }
+            if !speed.is_null() {
+                payload.insert("speed".to_string(), speed);
             }
             if let Some(items) = inputs.as_array().filter(|items| !items.is_empty()) {
                 let inputs_value = Value::Array(items.clone());

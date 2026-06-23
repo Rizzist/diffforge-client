@@ -165,6 +165,7 @@ import {
   getDraggedWorkspaceFile,
   getErrorMessage,
   getTerminalAgentColorSlot,
+  buildTerminalSubmittedInput,
   getTerminalSubmitSequence,
   getThreadComposerSyncKey,
   getWorkspaceThreadComposerAttachments,
@@ -12118,6 +12119,65 @@ function getTodoQueueTargetAgentId(item) {
   );
 }
 
+function getTodoQueueStringField(item, keys = []) {
+  const queueState = getTodoQueueRawQueueState(item);
+  const remoteCommand = item?.remoteCommand && typeof item.remoteCommand === "object"
+    ? item.remoteCommand
+    : item?.remote_command && typeof item.remote_command === "object"
+      ? item.remote_command
+      : null;
+  for (const source of [item, queueState, remoteCommand]) {
+    if (!source || typeof source !== "object") {
+      continue;
+    }
+    for (const key of keys) {
+      const text = String(source?.[key] || "").trim();
+      if (text) {
+        return text;
+      }
+    }
+  }
+  return "";
+}
+
+function getTodoQueueRequestedModel(item) {
+  return getTodoQueueStringField(item, ["model", "modelId", "model_id"]);
+}
+
+function getTodoQueueRequestedReasoningEffort(item) {
+  return getTodoQueueStringField(item, [
+    "reasoningEffort",
+    "reasoning_effort",
+    "thinkingPower",
+    "thinking_power",
+    "effort",
+  ]).toLowerCase();
+}
+
+function getTodoQueueRequestedSpeed(item) {
+  return getTodoQueueStringField(item, ["speed", "serviceTier", "service_tier"]).toLowerCase();
+}
+
+function buildTodoQueueAgentModelCommand(agentId, model, reasoningEffort) {
+  const targetAgentId = normalizeTodoTerminalAgentId(agentId);
+  const targetModel = String(model || "").trim();
+  if (!targetModel || !["codex", "claude"].includes(targetAgentId)) {
+    return "";
+  }
+  if (
+    targetModel.length > 120
+    || !targetModel.split("").every((character) => /[A-Za-z0-9._:/-]/.test(character))
+  ) {
+    return "";
+  }
+  const effort = String(reasoningEffort || "").trim().toLowerCase();
+  const codexEfforts = new Set(["low", "medium", "high", "xhigh"]);
+  if (targetAgentId === "codex" && codexEfforts.has(effort)) {
+    return `/model ${targetModel} ${effort}`;
+  }
+  return `/model ${targetModel}`;
+}
+
 function getTodoQueueTargetTerminalName(item) {
   const queueState = getTodoQueueRawQueueState(item);
   const queueTargetExplicit = todoQueueQueueStateTargetIsExplicit(queueState);
@@ -13347,6 +13407,21 @@ function getProviderBindingModelId(providerBinding) {
   ).trim();
 }
 
+function getProviderBindingReasoningEffort(providerBinding) {
+  return String(
+    providerBinding?.reasoningEffort
+      || providerBinding?.reasoning_effort
+      || providerBinding?.thinkingPower
+      || providerBinding?.thinking_power
+      || providerBinding?.effort
+      || providerBinding?.selectedReasoningEffort
+      || providerBinding?.selected_reasoning_effort
+      || providerBinding?.configuredReasoningEffort
+      || providerBinding?.configured_reasoning_effort
+      || "",
+  ).trim().toLowerCase();
+}
+
 function resolveTodoImageInputSupport({ agent, agentStatuses, providerBinding = null, role }) {
   const roleId = normalizeTodoTerminalAgentId(role || agent?.id);
   const agentId = roleId === "generic" || roleId === "terminal" || roleId === "shell"
@@ -13418,7 +13493,10 @@ function getTodoQueueItemLogSummary(items) {
         imageCount: images.length,
         images: getTodoImageLogSummary(images),
         kind: normalizeTodoQueueKind(item?.kind || item?.type),
+        model: getTodoQueueRequestedModel(item),
         noteLength: note ? normalizeTodoQueueMultilineText(note.text).length : 0,
+        reasoningEffort: getTodoQueueRequestedReasoningEffort(item),
+        speed: getTodoQueueRequestedSpeed(item),
         source: normalizeTodoQueueSource(item?.source),
         textLength: normalizeTodoQueueText(item?.text).length,
       };
@@ -13904,6 +13982,9 @@ function createTodoQueueItem(text, options = {}) {
   const deviceId = normalizeWorkspaceTodoDeviceId(options.deviceId || options.device_id);
   const targetAgentId = normalizeTodoTerminalAgentId(options.targetAgentId || options.target_agent_id);
   const targetAgentLabel = String(options.targetAgentLabel || options.target_agent_label || targetAgentId || "").trim();
+  const requestedModel = getTodoQueueRequestedModel(options);
+  const requestedReasoningEffort = getTodoQueueRequestedReasoningEffort(options);
+  const requestedSpeed = getTodoQueueRequestedSpeed(options);
   const targetExplicit = todoQueueItemTargetIsExplicit(options);
   const targetTerminalId = getTodoQueueTargetTerminalId(options);
   const targetTerminalIndex = getTodoQueueTargetTerminalIndex(options);
@@ -13971,6 +14052,9 @@ function createTodoQueueItem(text, options = {}) {
     ...(targetExplicit ? { targetExplicit: true, explicitTarget: true, userPinnedTarget: true } : {}),
     ...(targetAgentId ? { targetAgentId } : {}),
     ...(targetAgentLabel ? { targetAgentLabel } : {}),
+    ...(requestedModel ? { model: requestedModel, modelId: requestedModel } : {}),
+    ...(requestedReasoningEffort ? { effort: requestedReasoningEffort, reasoningEffort: requestedReasoningEffort } : {}),
+    ...(requestedSpeed ? { speed: requestedSpeed } : {}),
     ...(targetTerminalId ? { targetTerminalId } : {}),
     ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
     ...(targetTerminalName ? { targetTerminalName } : {}),
@@ -14004,6 +14088,9 @@ function normalizeTodoQueueItem(item) {
   const deviceId = normalizeWorkspaceTodoDeviceId(item.deviceId || item.device_id);
   const targetAgentId = normalizeTodoTerminalAgentId(item.targetAgentId || item.target_agent_id);
   const targetAgentLabel = String(item.targetAgentLabel || item.target_agent_label || targetAgentId || "").trim();
+  const requestedModel = getTodoQueueRequestedModel(item);
+  const requestedReasoningEffort = getTodoQueueRequestedReasoningEffort(item);
+  const requestedSpeed = getTodoQueueRequestedSpeed(item);
   const targetExplicit = todoQueueItemTargetIsExplicit(item);
   const targetTerminalId = getTodoQueueTargetTerminalId(item);
   const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item);
@@ -14078,6 +14165,9 @@ function normalizeTodoQueueItem(item) {
     ...(targetExplicit ? { targetExplicit: true, explicitTarget: true, userPinnedTarget: true } : {}),
     ...(targetAgentId ? { targetAgentId } : {}),
     ...(targetAgentLabel ? { targetAgentLabel } : {}),
+    ...(requestedModel ? { model: requestedModel, modelId: requestedModel } : {}),
+    ...(requestedReasoningEffort ? { effort: requestedReasoningEffort, reasoningEffort: requestedReasoningEffort } : {}),
+    ...(requestedSpeed ? { speed: requestedSpeed } : {}),
     ...(targetTerminalId ? { targetTerminalId } : {}),
     ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
     ...(targetTerminalName ? { targetTerminalName } : {}),
@@ -14313,6 +14403,9 @@ function buildTodoQueueTodoSyncCommitPayload(syncPayload, {
     }
     const status = normalizeTodoQueueLifecycleStatus(item.todoStatus || item.todo_status || item.status) || "listed";
     const text = normalizeTodoQueueText(item.text || item.body || "");
+    const requestedModel = getTodoQueueRequestedModel(item);
+    const requestedReasoningEffort = getTodoQueueRequestedReasoningEffort(item);
+    const requestedSpeed = getTodoQueueRequestedSpeed(item);
     const queueState = normalizeTodoQueuePersistedQueueState(item) || {};
     const queuedAt = String(item.queuedAt || item.queued_at || queueState.queuedAt || queueState.queued_at || "").trim();
     const meta = {
@@ -14327,6 +14420,13 @@ function buildTodoQueueTodoSyncCommitPayload(syncPayload, {
       ...(queuedAt ? { queued_at: queuedAt, queuedAt } : {}),
       ...(item.source ? { source: item.source, source_kind: item.source, sourceKind: item.source } : {}),
       ...(item.lastDispatchId ? { last_dispatch_id: item.lastDispatchId, lastDispatchId: item.lastDispatchId } : {}),
+      ...(requestedModel ? { model: requestedModel, model_id: requestedModel, modelId: requestedModel } : {}),
+      ...(requestedReasoningEffort ? {
+        effort: requestedReasoningEffort,
+        reasoning_effort: requestedReasoningEffort,
+        reasoningEffort: requestedReasoningEffort,
+      } : {}),
+      ...(requestedSpeed ? { speed: requestedSpeed } : {}),
       ...(item.targetExplicit || item.explicitTarget || item.userPinnedTarget ? {
         explicit_target: true,
         explicitTarget: true,
@@ -15324,16 +15424,33 @@ function createTodoQueueItemFromWorkspaceDispatch(item, workspaceId, hydratedTex
   ).trim();
   const dispatchSource = item?.dispatchSource || item?.dispatch_source || null;
   const dispatchTarget = item?.dispatchTarget || item?.dispatch_target || null;
+  const requestedModel = getTodoQueueRequestedModel(item);
+  const requestedReasoningEffort = getTodoQueueRequestedReasoningEffort(item);
+  const requestedSpeed = getTodoQueueRequestedSpeed(item);
   return normalizeTodoQueueItem({
     createdAt: item?.createdAt || item?.created_at || new Date().toISOString(),
     queuedAt,
     id: commandId,
     kind: "todo",
     ...getTodoQueueAgentSessionMetadata(item),
+    ...(requestedModel ? { model: requestedModel, model_id: requestedModel, modelId: requestedModel } : {}),
+    ...(requestedReasoningEffort ? {
+      effort: requestedReasoningEffort,
+      reasoning_effort: requestedReasoningEffort,
+      reasoningEffort: requestedReasoningEffort,
+    } : {}),
+    ...(requestedSpeed ? { speed: requestedSpeed } : {}),
     remoteCommand: {
       commandId,
       dispatchSource,
       dispatchTarget,
+      ...(requestedModel ? { model: requestedModel, model_id: requestedModel, modelId: requestedModel } : {}),
+      ...(requestedReasoningEffort ? {
+        effort: requestedReasoningEffort,
+        reasoning_effort: requestedReasoningEffort,
+        reasoningEffort: requestedReasoningEffort,
+      } : {}),
+      ...(requestedSpeed ? { speed: requestedSpeed } : {}),
       source: item?.sourceKind || item?.source_kind || "cloud-diffforge-todo-dispatch",
       todoDeviceId: item?.todoDeviceId || item?.todo_device_id || "",
       todoDispatchId: dispatchId,
@@ -27952,6 +28069,26 @@ function TerminalView({
         || "",
     ).trim();
     const syncKey = target.syncKey || "";
+    const requestedModel = getTodoQueueRequestedModel(currentItem);
+    const requestedReasoningEffort = getTodoQueueRequestedReasoningEffort(currentItem);
+    const requestedSpeed = getTodoQueueRequestedSpeed(currentItem);
+    const targetProviderBinding = getWorkspaceThreadProviderBinding(targetThread, targetRole);
+    const targetProviderModelId = getProviderBindingModelId(targetProviderBinding);
+    const targetProviderReasoningEffort = getProviderBindingReasoningEffort(targetProviderBinding);
+    const targetRoleUsesReasoningEffort = normalizeTodoTerminalAgentId(targetRole) === "codex";
+    const requestedModelAlreadyActive = requestedModel && targetProviderModelId === requestedModel;
+    const requestedEffortAlreadyActive = !targetRoleUsesReasoningEffort
+      || !requestedReasoningEffort
+      || targetProviderReasoningEffort === requestedReasoningEffort;
+    const modelSwitchCommand = requestedModel
+      && requestedModelAlreadyActive
+      && requestedEffortAlreadyActive
+      ? ""
+      : buildTodoQueueAgentModelCommand(
+        targetRole,
+        requestedModel,
+        requestedReasoningEffort,
+      );
     setActiveTerminalPaneId(paneId);
     window.dispatchEvent(new CustomEvent(TERMINAL_FOCUS_REQUEST_EVENT, {
       detail: {
@@ -27960,6 +28097,62 @@ function TerminalView({
         terminalIndex: target.targetTerminalIndex,
       },
     }));
+    if (modelSwitchCommand) {
+      const modelSwitchStartedAt = performance.now();
+      logTerminalStatus("frontend.todo_queue.model_switch.start", {
+        ...terminalWriteLogBase,
+        model: requestedModel,
+        reasoningEffort: requestedReasoningEffort,
+        speed: requestedSpeed,
+        threadId: targetThreadId,
+      });
+      try {
+        await invoke("terminal_write", {
+          data: buildTerminalSubmittedInput(modelSwitchCommand, targetRole, false),
+          instanceId: targetBinding?.instanceId,
+          paneId,
+          promptEventSource: "todo-queue-model-change",
+          threadId: targetThreadId,
+        });
+        handleWorkspaceTerminalLifecycle({
+          agentId: targetRole,
+          instanceId: targetBinding?.instanceId || "",
+          model: requestedModel,
+          modelId: requestedModel,
+          modelSource: "loopspace-send-message",
+          paneId,
+          reason: "todo_queue_model_change",
+          speed: requestedSpeed,
+          terminalIndex: target.targetTerminalIndex,
+          thinkingPower: requestedReasoningEffort,
+          threadId: targetThreadId,
+          type: "model-selected",
+          workspaceId,
+        });
+        logTerminalStatus("frontend.todo_queue.model_switch.done", {
+          ...terminalWriteLogBase,
+          elapsedMs: Math.round(performance.now() - modelSwitchStartedAt),
+          model: requestedModel,
+          reasoningEffort: requestedReasoningEffort,
+          speed: requestedSpeed,
+          threadId: targetThreadId,
+        });
+        await new Promise((resolve) => {
+          window.setTimeout(resolve, 160);
+        });
+      } catch (error) {
+        logTerminalStatus("frontend.todo_queue.model_switch.error", {
+          ...terminalWriteLogBase,
+          elapsedMs: Math.round(performance.now() - modelSwitchStartedAt),
+          message: error?.message || String(error || ""),
+          model: requestedModel,
+          reasoningEffort: requestedReasoningEffort,
+          speed: requestedSpeed,
+          threadId: targetThreadId,
+        });
+        throw error;
+      }
+    }
 
     const terminalText = await prepareTodoTerminalText(currentItem);
     const threadMessageText = getTodoQueueItemThreadMessageText(currentItem, terminalText);
@@ -32641,7 +32834,13 @@ function TerminalView({
     const source = getTodoQueueItemAutoQueueSource(queuedItem);
     const targetTerminalIndex = target.targetTerminalIndex;
     const targetColorSlot = getTerminalAgentColorSlot(targetTerminalIndex);
+    const requestedModel = getTodoQueueRequestedModel(queuedItem);
+    const requestedReasoningEffort = getTodoQueueRequestedReasoningEffort(queuedItem);
+    const requestedSpeed = getTodoQueueRequestedSpeed(queuedItem);
     const dispatchTerminalFields = {
+      ...(requestedModel ? { model: requestedModel } : {}),
+      ...(requestedReasoningEffort ? { reasoningEffort: requestedReasoningEffort } : {}),
+      ...(requestedSpeed ? { speed: requestedSpeed } : {}),
       targetAgentId: requestedTargetAgentId || target.targetRole || "",
       targetColorSlot,
       targetTerminalColor: terminalColorForSlot(targetColorSlot),

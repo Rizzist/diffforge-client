@@ -135,9 +135,10 @@ function viewportBounds() {
   if (typeof window === "undefined") {
     return { width: RECORDING_MIN_SELECTION_SIZE, height: RECORDING_MIN_SELECTION_SIZE };
   }
+  const viewport = currentOverlayViewport(document.getElementById("app"));
   return {
-    width: Math.max(RECORDING_MIN_SELECTION_SIZE, window.innerWidth || 0),
-    height: Math.max(RECORDING_MIN_SELECTION_SIZE, window.innerHeight || 0),
+    width: Math.max(RECORDING_MIN_SELECTION_SIZE, viewport.width),
+    height: Math.max(RECORDING_MIN_SELECTION_SIZE, viewport.height),
   };
 }
 
@@ -279,6 +280,7 @@ function fallbackSnippingStatus() {
   return {
     enabled: true,
     hideDesktopIcons: true,
+    freezeScreen: false,
     uploadPublic: true,
     fullScreenshot: {
       shortcut: full,
@@ -447,6 +449,21 @@ function formatRecentTime(value) {
   return `${Math.round(hours / 24)}d ago`;
 }
 
+function currentOverlayViewport(element = null) {
+  if (typeof window === "undefined") {
+    return { width: 1, height: 1 };
+  }
+  const rect = element && typeof element.getBoundingClientRect === "function"
+    ? element.getBoundingClientRect()
+    : null;
+  const width = Number(rect?.width || window.innerWidth || 0);
+  const height = Number(rect?.height || window.innerHeight || 0);
+  return {
+    width: Number.isFinite(width) && width > 0 ? width : 1,
+    height: Number.isFinite(height) && height > 0 ? height : 1,
+  };
+}
+
 export default function SnippingWorkspaceView({
   untrackedLibrary = null,
   untrackedLoading = false,
@@ -464,6 +481,7 @@ export default function SnippingWorkspaceView({
 
   const snippingEnabled = Boolean(status?.enabled);
   const hideDesktopIcons = status?.hideDesktopIcons !== false;
+  const freezeScreen = status?.freezeScreen === true;
   const uploadPublic = status?.uploadPublic !== false;
   const permissions = status?.permissions || fallbackPermissions();
   const fullShortcut = status?.fullScreenshot?.shortcut || defaultFullShortcut();
@@ -492,6 +510,7 @@ export default function SnippingWorkspaceView({
   const savingShortcut = actionState === "saving";
   const togglingSnipping = actionState === "toggling";
   const togglingDesktopIcons = actionState === "toggling-desktop-icons";
+  const togglingFreezeScreen = actionState === "toggling-freeze-screen";
   const togglingUploadPublic = actionState === "toggling-upload-public";
   const capturingFull = actionState === "capturing-full";
   const capturingArea = actionState === "capturing-area";
@@ -542,6 +561,21 @@ export default function SnippingWorkspaceView({
       setStatus(nextStatus || fallbackSnippingStatus());
     } catch (toggleError) {
       setError(getErrorMessage(toggleError, "Unable to update the desktop icons setting."));
+    } finally {
+      setActionState("idle");
+    }
+  }, []);
+
+  const setFreezeScreen = useCallback(async (enabled) => {
+    setActionState("toggling-freeze-screen");
+    setError("");
+    try {
+      const nextStatus = await invoke("set_snipping_freeze_screen", {
+        request: { enabled },
+      });
+      setStatus(nextStatus || fallbackSnippingStatus());
+    } catch (toggleError) {
+      setError(getErrorMessage(toggleError, "Unable to update the freeze screen setting."));
     } finally {
       setActionState("idle");
     }
@@ -844,6 +878,22 @@ export default function SnippingWorkspaceView({
             </AudioRecorderOptionRow>
             <AudioRecorderOptionRow>
               <SettingsHint>
+                {freezeScreen
+                  ? "Area selections use the screen image captured before the overlay opens."
+                  : "Area selections capture the live screen after you release the mouse."}
+              </SettingsHint>
+              <McpSwitchButton
+                aria-pressed={freezeScreen ? "true" : "false"}
+                disabled={togglingFreezeScreen}
+                onClick={() => setFreezeScreen(!freezeScreen)}
+                type="button"
+              >
+                <span aria-hidden="true" />
+                {togglingFreezeScreen ? "Switching" : freezeScreen ? "Freeze on" : "Live capture"}
+              </McpSwitchButton>
+            </AudioRecorderOptionRow>
+            <AudioRecorderOptionRow>
+              <SettingsHint>
                 {uploadPublic
                   ? "Snip uploads publish and copy a public URL automatically."
                   : "Snip uploads create a private Cloud copy first."}
@@ -986,6 +1036,7 @@ export function SnippingOverlayWindow() {
   const activePointerIdRef = useRef(null);
   const capturingRef = useRef(false);
   const lastCursorMoveLogAtRef = useRef(0);
+  const overlayRootRef = useRef(null);
 
   const setCapturingState = useCallback((value) => {
     capturingRef.current = Boolean(value);
@@ -1011,6 +1062,7 @@ export function SnippingOverlayWindow() {
 
   const cursorDebugSnapshot = useCallback((event, extra = {}) => {
     const rootElement = event?.currentTarget || document.getElementById("app");
+    const rootViewport = currentOverlayViewport(rootElement || overlayRootRef.current);
     const pointer = event ? {
       type: event.type,
       pointerType: event.pointerType,
@@ -1043,6 +1095,8 @@ export function SnippingOverlayWindow() {
         width: window.innerWidth,
         height: window.innerHeight,
         devicePixelRatio: window.devicePixelRatio || 1,
+        rootWidth: rootViewport.width,
+        rootHeight: rootViewport.height,
       },
       ...extra,
     };
@@ -1083,8 +1137,9 @@ export function SnippingOverlayWindow() {
       return recordingSelection ? normalizeRecordingSelection(recordingSelection) : null;
     }
     if (!drag) return null;
-    const viewportWidth = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerWidth;
-    const viewportHeight = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerHeight;
+    const viewport = currentOverlayViewport(overlayRootRef.current);
+    const viewportWidth = viewport.width;
+    const viewportHeight = viewport.height;
     const left = Math.max(0, Math.min(drag.startX, drag.endX));
     const top = Math.max(0, Math.min(drag.startY, drag.endY));
     const width = Math.min(Math.abs(drag.endX - drag.startX), Math.max(0, viewportWidth - left));
@@ -1465,8 +1520,9 @@ export function SnippingOverlayWindow() {
       return;
     }
 
-    const viewportWidth = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerWidth;
-    const viewportHeight = typeof window === "undefined" ? Number.MAX_SAFE_INTEGER : window.innerHeight;
+    const requestViewport = currentOverlayViewport(event?.currentTarget || overlayRootRef.current);
+    const viewportWidth = requestViewport.width;
+    const viewportHeight = requestViewport.height;
     const left = Math.max(0, Math.min(currentDrag.startX, currentDrag.endX));
     const top = Math.max(0, Math.min(currentDrag.startY, currentDrag.endY));
     const width = Math.min(Math.abs(currentDrag.endX - currentDrag.startX), Math.max(0, viewportWidth - left));
@@ -1486,6 +1542,7 @@ export function SnippingOverlayWindow() {
     try {
       logCursorDebug("finish_capture_request", cursorDebugSnapshot(event, {
         selection: { left, top, width, height },
+        viewport: requestViewport,
       }));
       await invoke("snipping_finish_area_snip", {
         request: {
@@ -1494,6 +1551,8 @@ export function SnippingOverlayWindow() {
           width,
           height,
           scaleFactor: window.devicePixelRatio || 1,
+          viewportWidth: requestViewport.width,
+          viewportHeight: requestViewport.height,
         },
       });
       setCapturingState(false);
@@ -1527,9 +1586,11 @@ export function SnippingOverlayWindow() {
     setCapturingState(true);
     setError("");
     const overlayWindow = getCurrentWindow();
+    const requestViewport = currentOverlayViewport(overlayRootRef.current || document.getElementById("app"));
     try {
       logCursorDebug("recording_start_request", cursorDebugSnapshot(event, {
         selection: activeSelection,
+        viewport: requestViewport,
       }));
       await invoke("snipping_start_area_recording", {
         request: {
@@ -1538,6 +1599,8 @@ export function SnippingOverlayWindow() {
           width: activeSelection.width,
           height: activeSelection.height,
           scaleFactor: window.devicePixelRatio || 1,
+          viewportWidth: requestViewport.width,
+          viewportHeight: requestViewport.height,
         },
       });
       setRecordingSelection(null);
@@ -1577,6 +1640,7 @@ export function SnippingOverlayWindow() {
         onPointerLeave={(event) => logCursorDebug("pointer_leave", cursorDebugSnapshot(event))}
         onPointerMove={updateDrag}
         onPointerUp={finishDrag}
+        ref={overlayRootRef}
         style={snapshotUrl ? { "--snipping-overlay-snapshot": `url("${snapshotUrl}")` } : undefined}
       >
         {!selection && !capturing && (

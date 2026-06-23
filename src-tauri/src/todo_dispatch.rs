@@ -474,21 +474,29 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
 /// Record remote command intake at the websocket loop, before the webview ever
 /// sees the event. Create-task commands land in the ledger as `queued` and
 /// raise the arrival notification even when no window is alive.
-pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value) {
-    let command_kind = {
-        let raw = todo_dispatch_text(event, &["command_kind", "commandKind", "action", "command"]);
-        let kind = if raw.is_empty() {
-            "create_task".to_string()
-        } else {
-            raw.to_ascii_lowercase()
-        };
-        kind.replace(['.', ' ', '-'], "_")
-    };
-    let is_create_task = matches!(
+fn todo_dispatch_remote_command_is_queue_action(command_kind: &str) -> bool {
+    let command_kind = command_kind
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['.', ' ', '-'], "_");
+    matches!(
         command_kind.as_str(),
-        "create_task" | "remote_command_create_task" | "task_create" | "todo_create"
-    ) || command_kind.is_empty();
-    if !is_create_task {
+        ""
+            | "create_task"
+            | "remote_command_create_task"
+            | "task_create"
+            | "todo_create"
+            | "terminal_orchestrator_send_message"
+            | "terminal_send_message"
+            | "orchestrator_send_message"
+            | "loopspace_send_message"
+            | "send_message"
+    )
+}
+
+pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value) {
+    let command_kind = todo_dispatch_text(event, &["command_kind", "commandKind", "action", "command"]);
+    if !todo_dispatch_remote_command_is_queue_action(&command_kind) {
         return;
     }
     let command_id = todo_dispatch_text(event, &["command_id", "commandId"]);
@@ -553,6 +561,20 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                 .unwrap_or(false);
         if !already_queued && !text.trim().is_empty() {
             let now_iso = chrono_like_now_iso();
+            let requested_model =
+                todo_dispatch_text(event, &["model", "model_id", "modelId"]);
+            let requested_reasoning_effort = todo_dispatch_text(
+                event,
+                &[
+                    "reasoning_effort",
+                    "reasoningEffort",
+                    "effort",
+                    "thinking_power",
+                    "thinkingPower",
+                ],
+            );
+            let requested_speed =
+                todo_dispatch_text(event, &["speed", "service_tier", "serviceTier"]);
             let item = json!({
                 "id": command_id,
                 "kind": "todo",
@@ -574,10 +596,24 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                     event,
                     &["target_agent_id", "targetAgentId", "agent_id", "agentId"],
                 ),
+                "model": requested_model.clone(),
+                "model_id": requested_model.clone(),
+                "modelId": requested_model.clone(),
+                "reasoning_effort": requested_reasoning_effort.clone(),
+                "reasoningEffort": requested_reasoning_effort.clone(),
+                "effort": requested_reasoning_effort.clone(),
+                "speed": requested_speed.clone(),
                 "remoteCommand": {
                     "commandId": command_id,
                     "todoId": todo_dispatch_text(event, &["todo_id", "todoId"]),
                     "originDeviceId": origin_device_id,
+                    "model": requested_model.clone(),
+                    "model_id": requested_model.clone(),
+                    "modelId": requested_model,
+                    "reasoning_effort": requested_reasoning_effort.clone(),
+                    "reasoningEffort": requested_reasoning_effort.clone(),
+                    "effort": requested_reasoning_effort,
+                    "speed": requested_speed,
                     "source": "remote_intake_headless",
                 },
             });
@@ -2036,6 +2072,18 @@ fn todo_dispatch_todo_sync_commit_payload(
     let attempt_id = todo_store_item_attempt_id(item, &todo_id);
     let run_id = todo_store_item_run_id(item, &attempt_id);
     let rust_todo_seq = todo_store_next_authority_seq(workspace_id, &todo_id, &attempt_id);
+    let requested_model = todo_dispatch_text(item, &["model", "modelId", "model_id"]);
+    let requested_reasoning_effort = todo_dispatch_text(
+        item,
+        &[
+            "reasoningEffort",
+            "reasoning_effort",
+            "effort",
+            "thinkingPower",
+            "thinking_power",
+        ],
+    );
+    let requested_speed = todo_dispatch_text(item, &["speed", "serviceTier", "service_tier"]);
     let mut meta = json!({
         "rust_authoritative": true,
         "rustAuthoritative": true,
@@ -2091,6 +2139,13 @@ fn todo_dispatch_todo_sync_commit_payload(
         "commandId": todo_dispatch_text(item, &["commandId", "command_id"]),
         "target_agent_id": todo_dispatch_text(item, &["targetAgentId", "target_agent_id", "agentId", "agent_id"]),
         "targetAgentId": todo_dispatch_text(item, &["targetAgentId", "target_agent_id", "agentId", "agent_id"]),
+        "model": requested_model.clone(),
+        "model_id": requested_model.clone(),
+        "modelId": requested_model,
+        "reasoning_effort": requested_reasoning_effort.clone(),
+        "reasoningEffort": requested_reasoning_effort.clone(),
+        "effort": requested_reasoning_effort,
+        "speed": requested_speed,
         "target_terminal_id": todo_dispatch_text(item, &["targetTerminalId", "target_terminal_id", "paneId", "pane_id"]),
         "targetTerminalId": todo_dispatch_text(item, &["targetTerminalId", "target_terminal_id", "paneId", "pane_id"]),
         "target_thread_id": todo_dispatch_text(item, &["targetThreadId", "target_thread_id", "threadId", "thread_id"]),
@@ -4137,6 +4192,24 @@ mod todo_store_tests {
     use super::*;
 
     #[test]
+    fn remote_intake_accepts_loop_send_message_aliases() {
+        for command_kind in [
+            "",
+            "create_task",
+            "terminal_orchestrator_send_message",
+            "terminal.orchestrator.send-message",
+            "loopspace-send-message",
+            "send_message",
+        ] {
+            assert!(
+                todo_dispatch_remote_command_is_queue_action(command_kind),
+                "{command_kind} should queue"
+            );
+        }
+        assert!(!todo_dispatch_remote_command_is_queue_action("asset_track"));
+    }
+
+    #[test]
     fn tombstone_filter_rejects_by_item_id_and_command_id() {
         let tombstoned: HashSet<String> =
             ["dead-id".to_string(), "dead-command".to_string()].into();
@@ -6042,6 +6115,39 @@ fn todo_dispatch_backend_submit_sequence(item: &Value, target: &Value) -> &'stat
     }
 }
 
+fn todo_dispatch_backend_model_command(item: &Value, target: &Value) -> String {
+    let agent = todo_dispatch_backend_target_agent(item, target);
+    if !agent.contains("codex") && !agent.contains("claude") {
+        return String::new();
+    }
+    let model = todo_dispatch_text(item, &["model", "modelId", "model_id"]);
+    if model.is_empty()
+        || model.len() > 120
+        || !model.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '/' | '-')
+        })
+    {
+        return String::new();
+    }
+    if agent.contains("codex") {
+        let effort = todo_dispatch_text(
+            item,
+            &[
+                "reasoningEffort",
+                "reasoning_effort",
+                "thinkingPower",
+                "thinking_power",
+                "effort",
+            ],
+        )
+        .to_ascii_lowercase();
+        if matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh") {
+            return format!("/model {model} {effort}");
+        }
+    }
+    format!("/model {model}")
+}
+
 #[cfg(test)]
 mod todo_dispatch_backend_tests {
     use super::*;
@@ -6065,6 +6171,29 @@ mod todo_dispatch_backend_tests {
         assert_eq!(
             todo_dispatch_backend_submit_sequence(&claude_item, &generic_target),
             TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE,
+        );
+    }
+
+    #[test]
+    fn backend_model_command_includes_codex_effort() {
+        let codex_target = json!({ "agentKind": "codex" });
+        let codex_item = json!({
+            "model": "gpt-5.1-codex",
+            "reasoning_effort": "high",
+        });
+        assert_eq!(
+            todo_dispatch_backend_model_command(&codex_item, &codex_target),
+            "/model gpt-5.1-codex high",
+        );
+
+        let claude_target = json!({ "agentKind": "claude" });
+        let claude_item = json!({
+            "model": "sonnet-4.6",
+            "reasoning_effort": "high",
+        });
+        assert_eq!(
+            todo_dispatch_backend_model_command(&claude_item, &claude_target),
+            "/model sonnet-4.6",
         );
     }
 
@@ -6497,7 +6626,13 @@ async fn todo_dispatch_backend_submit(
         return false;
     }
     let submit_sequence = todo_dispatch_backend_submit_sequence(item, target);
+    let model_switch_command = todo_dispatch_backend_model_command(item, target);
     if prompt.len() + submit_sequence.len() + 1 > MAX_TERMINAL_WRITE_BYTES {
+        return false;
+    }
+    if !model_switch_command.is_empty()
+        && model_switch_command.len() + submit_sequence.len() + 1 > MAX_TERMINAL_WRITE_BYTES
+    {
         return false;
     }
     let terminal_state = app.state::<TerminalState>();
@@ -6560,6 +6695,55 @@ async fn todo_dispatch_backend_submit(
     // Mirror the proven crash-resume backend submit mechanics: serialize on
     // the input queue, write the prompt, settle, then the submit sequence.
     let _input_guard = instance.input_queue.lock().await;
+    if !model_switch_command.is_empty() {
+        {
+            let mut writer = instance.writer.lock().await;
+            // Ctrl-U clears any stale TUI input before applying the requested
+            // loop agent model/effort settings.
+            if writer.write_all(b"\x15").is_err()
+                || writer.write_all(model_switch_command.as_bytes()).is_err()
+                || writer.flush().is_err()
+            {
+                return false;
+            }
+        }
+        sleep(Duration::from_millis(
+            TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
+        ))
+        .await;
+        {
+            let still_current = {
+                let guard = terminal_state.terminals.read().await;
+                guard
+                    .get(&pane_id)
+                    .map(|current| current.id == instance.id)
+                    .unwrap_or(false)
+            };
+            if !still_current {
+                return false;
+            }
+            let mut writer = instance.writer.lock().await;
+            if writer.write_all(submit_sequence.as_bytes()).is_err() || writer.flush().is_err() {
+                return false;
+            }
+        }
+        sleep(Duration::from_millis(
+            TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
+        ))
+        .await;
+        {
+            let still_current = {
+                let guard = terminal_state.terminals.read().await;
+                guard
+                    .get(&pane_id)
+                    .map(|current| current.id == instance.id)
+                    .unwrap_or(false)
+            };
+            if !still_current {
+                return false;
+            }
+        }
+    }
     {
         let mut writer = instance.writer.lock().await;
         // Ctrl-U clears any stale TUI input left by a previous interrupted or

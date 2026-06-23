@@ -23,12 +23,14 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { createPortal } from "react-dom";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import {
+  cleanAgentLaunchModelId,
   getAgentLaunchDefault,
   getAgentLaunchEffortOptions,
   getAgentLaunchModelOption,
   getAgentLaunchModelOptions,
   getAgentLaunchSpeedOptions,
   isValidAgentLaunchModelId,
+  normalizeAgentLaunchAgentId,
   normalizeAgentLaunchDefault,
   normalizeAgentLaunchDefaults,
   resolveAgentLaunchDefaultForModel,
@@ -337,13 +339,30 @@ import {
   LoopspaceGraphNodeSelectOptionMain,
   LoopspaceGraphNodeSelectOptionDevice,
   LoopspaceGraphNodeSelectEmpty,
+  LoopspaceGraphDocumentPicker,
+  LoopspaceGraphDocumentSearch,
+  LoopspaceGraphDocumentPickList,
+  LoopspaceGraphDocumentPickButton,
+  LoopspaceGraphDocumentRefList,
+  LoopspaceGraphDocumentRefItem,
   LoopspaceGraphNodeAction,
   LoopspaceGraphNodePort,
   LoopspaceGraphMessageRegion,
-  LoopspaceGraphMessageControls,
+  LoopspaceGraphMessageSettingsButton,
+  LoopspaceGraphMessageSummary,
   LoopspaceGraphMessagePrompt,
-  LoopspaceGraphMessageCheckpointList,
-  LoopspaceGraphMessageCheckpoint,
+  LoopspaceGraphMessageSettingsPanel,
+  LoopspaceGraphMessageSettingsHeader,
+  LoopspaceGraphMessageSettingsSection,
+  LoopspaceGraphMessageSettingsGrid,
+  LoopspaceGraphMessageSettingsField,
+  LoopspaceGraphMessageSettingsSelect,
+  LoopspaceGraphMessageSubnodeToolbar,
+  LoopspaceGraphMessageSubnodeButton,
+  LoopspaceGraphMessageSubnodeList,
+  LoopspaceGraphMessageSubnodeItem,
+  LoopspaceGraphMessageSettingsActions,
+  LoopspaceGraphMessageSaveButton,
   LoopspaceGraphMessageResize,
   LoopspaceGraphControls,
   LoopspaceGraphControlButton,
@@ -356,7 +375,9 @@ import {
   LoopspaceGraphPaletteIcon,
   LoopspaceGraphPaletteText,
   LoopspaceRuntimePanel,
+  LoopspaceRuntimePanelAutoScroll,
   LoopspaceRuntimePanelHeader,
+  LoopspaceRuntimePanelResizeHandle,
   LoopspaceRuntimePanelTabs,
   LoopspaceRuntimePanelTab,
   LoopspaceRuntimePanelToggle,
@@ -647,6 +668,7 @@ import {
   ButtonPrivacyIcon,
   ButtonSecurityIcon,
   ButtonSnippingIcon,
+  ButtonEditorIcon,
   ButtonHubIcon,
   ButtonCheckIcon,
   ButtonRailCollapseIcon,
@@ -691,13 +713,17 @@ import {
 import { PlanFlame } from "./PlanFlame.jsx";
 import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
 import {
+  accountDocumentStorageKey,
   documentExtensionForKind,
   normalizedDocumentCollection,
   normalizedDocumentKind,
   normalizedDocumentPath,
 } from "../tools/skillsLibrary.js";
 import {
+  getWorkspaceToolsAccountSkills,
+  getWorkspaceToolsVersion,
   setWorkspaceToolsDocumentDraft,
+  subscribeWorkspaceTools,
   warmWorkspaceTools,
 } from "../tools/workspaceToolsStore.js";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
@@ -738,6 +764,7 @@ import SnippingQuickAccess, {
   SNIPPING_TOAST_HASH,
 } from "../snipping/SnippingQuickAccess.jsx";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
+import EditorWorkspaceView from "../editor/EditorWorkspaceView.jsx";
 
 const BRAND_NAME = "Diff Forge AI";
 const LAUNCH_MINIMUM_MS = 1400;
@@ -785,7 +812,7 @@ const WORKSPACE_TAB_VIEW_BY_ID = {
   history: "architecture",
 };
 const WORKSPACE_TAB_IDS = new Set(Object.keys(WORKSPACE_TAB_VIEW_BY_ID));
-const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "snipping", "audio", "tokenomics", "settings"]);
+const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "snipping", "audio", "editor", "tokenomics", "settings"]);
 const DEVICE_LEVEL_APP_VIEW_IDS = new Set([...ACCOUNT_APP_VIEW_IDS, "architectures", "mcps", "clis", "scripts"]);
 const APP_SCRIPT_LEGACY_WORKSPACE_BUTTON_COLOR = "#1f3f7a";
 const APP_SCRIPT_LEGACY_LOOPSPACE_BUTTON_COLOR = "#4b3512";
@@ -1622,6 +1649,20 @@ const LOOPSPACE_GRAPH_NODE_TEMPLATES = [
     label: "Send message",
     role: "action",
   },
+  {
+    description: "Reference synced docs as read-only context for an agent step.",
+    icon: "document",
+    id: "document_read",
+    label: "Document read",
+    role: "context",
+  },
+  {
+    description: "Tell an agent which synced docs it may update and push-save.",
+    icon: "document",
+    id: "document_write",
+    label: "Document write",
+    role: "context",
+  },
 ];
 const LOOPSPACE_GRAPH_DEFAULT_OUTPUT_PORT = {
   id: "out",
@@ -1651,6 +1692,13 @@ const LOOPSPACE_RUN_SCRIPT_OUTPUT_PORTS = [
   },
 ];
 const LOOPSPACE_SEND_MESSAGE_OUTPUT_PORTS = LOOPSPACE_RUN_SCRIPT_OUTPUT_PORTS;
+const LOOPSPACE_DOCUMENT_READ_OUTPUT_PORTS = [
+  {
+    id: "docs",
+    label: "DOCS",
+    tone: "exec",
+  },
+];
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX = 512;
 const TODO_QUEUE_WORKSPACE_STORAGE_PREFIX = "diffforge.todoQueue.";
@@ -4068,6 +4116,12 @@ const AGENT_PROVIDERS = [
   { id: "claude", label: "Claude Code", shortLabel: "Claude" },
   { id: "opencode", label: "OpenCode", shortLabel: "OpenCode" },
 ];
+const LOOPSPACE_SEND_MESSAGE_AGENT_OPTIONS = AGENT_PROVIDERS.filter((provider) => (
+  provider.id === "codex" || provider.id === "claude"
+));
+const LOOPSPACE_SEND_MESSAGE_AGENT_IDS = new Set(
+  LOOPSPACE_SEND_MESSAGE_AGENT_OPTIONS.map((provider) => provider.id),
+);
 const AGENT_LAUNCH_DEFAULTS_STORAGE_KEY = "diffforge.agentLaunchDefaults.v1";
 const WORKSPACE_TERMINAL_ROLE_GENERIC = "generic";
 const WORKSPACE_TERMINAL_ROLE_OPTIONS = [
@@ -4580,9 +4634,22 @@ const LOOPSPACE_GRAPH_MAX_ZOOM = 2.4;
 const LOOPSPACE_GRAPH_ZOOM_STEP = 1.18;
 const LOOPSPACE_GRAPH_NODE_WIDTH = 220;
 const LOOPSPACE_GRAPH_NODE_HEIGHT = 66;
+const LOOPSPACE_RUNTIME_PANEL_DEFAULT_HEIGHT = 174;
+const LOOPSPACE_RUNTIME_PANEL_MIN_HEIGHT = 88;
+const LOOPSPACE_RUNTIME_PANEL_MIN_GRAPH_HEIGHT = 160;
 
 function clampLoopspaceGraphZoom(value) {
   return Math.min(LOOPSPACE_GRAPH_MAX_ZOOM, Math.max(LOOPSPACE_GRAPH_MIN_ZOOM, Number(value) || 1));
+}
+
+function clampLoopspaceRuntimePanelHeight(value, availableHeight = 0) {
+  const maxHeight = Number.isFinite(availableHeight) && availableHeight > 0
+    ? Math.max(LOOPSPACE_RUNTIME_PANEL_MIN_HEIGHT, availableHeight - LOOPSPACE_RUNTIME_PANEL_MIN_GRAPH_HEIGHT)
+    : 320;
+  return Math.max(
+    LOOPSPACE_RUNTIME_PANEL_MIN_HEIGHT,
+    Math.min(maxHeight, Number.isFinite(Number(value)) ? Number(value) : LOOPSPACE_RUNTIME_PANEL_DEFAULT_HEIGHT),
+  );
 }
 
 function loopspaceParseJsonDragPayload(raw) {
@@ -4630,6 +4697,85 @@ function loopspaceGraphPropValue(props, keys = []) {
   return undefined;
 }
 
+function normalizeLoopspaceSendMessageAgentId(value) {
+  const agentId = normalizeAgentLaunchAgentId(value);
+  return LOOPSPACE_SEND_MESSAGE_AGENT_IDS.has(agentId) ? agentId : "codex";
+}
+
+function getLoopspaceSendMessageAgentLabel(agentId) {
+  const normalizedAgentId = normalizeLoopspaceSendMessageAgentId(agentId);
+  return LOOPSPACE_SEND_MESSAGE_AGENT_OPTIONS.find((provider) => provider.id === normalizedAgentId)?.label
+    || normalizedAgentId;
+}
+
+function normalizeLoopspaceSendMessageLaunchSettings(value = {}, agentLaunchDefaults = null) {
+  const targetAgentId = normalizeLoopspaceSendMessageAgentId(
+    value.target_agent_id
+      || value.targetAgentId
+      || value.agent_id
+      || value.agentId
+      || value.agent
+      || "",
+  );
+  const defaultLaunch = getAgentLaunchDefault(targetAgentId, agentLaunchDefaults);
+  const model = cleanAgentLaunchModelId(
+    value.model || value.model_id || value.modelId || defaultLaunch.model,
+    defaultLaunch.model,
+  );
+  const normalized = normalizeAgentLaunchDefault(targetAgentId, {
+    effort: value.reasoning_effort
+      || value.reasoningEffort
+      || value.effort
+      || value.thinking_power
+      || value.thinkingPower
+      || defaultLaunch.effort,
+    model,
+    speed: value.speed
+      || value.service_tier
+      || value.serviceTier
+      || defaultLaunch.speed,
+  });
+  return {
+    model: normalized.model,
+    reasoning_effort: normalized.effort,
+    speed: normalized.speed,
+    target_agent_id: targetAgentId,
+  };
+}
+
+function normalizeLoopspaceSendMessageDraft(value = {}, agentLaunchDefaults = null) {
+  const input = value && typeof value === "object"
+    ? value
+    : { prompt: String(value || "") };
+  return {
+    ...normalizeLoopspaceSendMessageLaunchSettings(input, agentLaunchDefaults),
+    prompt: String(input.prompt || ""),
+  };
+}
+
+function loopspaceSendMessageDraftFromNode(node, agentLaunchDefaults = null) {
+  const props = node?.props || {};
+  return normalizeLoopspaceSendMessageDraft({
+    model: loopspaceGraphPropValue(props, ["model", "model_id", "modelId"]),
+    prompt: loopspaceGraphPropValue(props, ["prompt", "message", "body", "instructions"]),
+    reasoning_effort: loopspaceGraphPropValue(props, [
+      "reasoning_effort",
+      "reasoningEffort",
+      "effort",
+      "thinking_power",
+      "thinkingPower",
+    ]),
+    speed: loopspaceGraphPropValue(props, ["speed", "service_tier", "serviceTier"]),
+    target_agent_id: loopspaceGraphPropValue(props, [
+      "target_agent_id",
+      "targetAgentId",
+      "agent_id",
+      "agentId",
+      "agent",
+    ]),
+  }, agentLaunchDefaults);
+}
+
 function loopspaceGraphNodeParentId(node) {
   return String(loopspaceGraphPropValue(node?.props || {}, ["parent_id", "parentId", "parent"]) || "").trim();
 }
@@ -4647,7 +4793,7 @@ function parseLoopspaceBlueprintGraphSource(source = "") {
 }
 
 function loopspaceGraphNodeTemplateIcon(templateId) {
-  return templateId === "device" ? "device" : templateId === "send_message" ? "message" : "node";
+  return templateId === "device" ? "device" : templateId === "send_message" ? "message" : templateId?.startsWith?.("document_") ? "document" : "node";
 }
 
 function loopspaceGraphDeviceStatus(device) {
@@ -4663,6 +4809,99 @@ function loopspaceGraphDeviceStatus(device) {
     return "online";
   }
   return rawStatus || "offline";
+}
+
+function loopspaceGraphDeviceHasConnectionHint(device) {
+  return Boolean(
+    device
+      && typeof device === "object"
+      && (
+        device.connected !== undefined
+          || device.online !== undefined
+          || device.native_connected !== undefined
+          || device.nativeConnected !== undefined
+          || device.native_online !== undefined
+          || device.nativeOnline !== undefined
+          || device.web_connected !== undefined
+          || device.webConnected !== undefined
+          || device.web_online !== undefined
+          || device.webOnline !== undefined
+          || device.status !== undefined
+          || device.state !== undefined
+          || device.connection_status !== undefined
+          || device.connectionStatus !== undefined
+      )
+  );
+}
+
+function loopspaceGraphNormalizeDeviceRow(device, index = 0, options = {}) {
+  if (!device || typeof device !== "object") return null;
+  const isRegistered = Boolean(options.registered || cloudDeviceRowLooksRegistered(device));
+  const preparedDevice = isRegistered && !loopspaceGraphDeviceHasConnectionHint(device)
+    ? { ...device, connected: false, status: "offline" }
+    : device;
+  const normalized = normalizeCloudConnectedDevice(preparedDevice, index, {
+    includeOffline: true,
+    registered: isRegistered,
+  });
+  if (normalized) return normalized;
+  const deviceId = safeCloudMcpText(
+    device.device_id || device.deviceId || device.machine_id || device.machineId || device.id,
+    "",
+  ).toLowerCase();
+  if (!deviceId) return null;
+  const aliases = cloudDeviceAliasList(device, deviceId);
+  const status = loopspaceGraphDeviceStatus(device);
+  return {
+    ...device,
+    connected: ["online", "connected", "active", "ready"].includes(status),
+    deviceAliases: aliases,
+    device_aliases: aliases,
+    deviceId,
+    displayName: safeCloudMcpText(
+      device.display_name
+        || device.displayName
+        || device.device_label
+        || device.deviceLabel
+        || device.device_name
+        || device.deviceName
+        || device.machine_name
+        || device.machineName
+        || device.hostname
+        || device.name,
+      deviceId,
+    ),
+    nativeConnected: Boolean(device.nativeConnected || device.native_connected),
+    native_connected: Boolean(device.nativeConnected || device.native_connected),
+    registered: isRegistered,
+    status,
+    webConnected: Boolean(device.webConnected || device.web_connected),
+    web_connected: Boolean(device.webConnected || device.web_connected),
+  };
+}
+
+function loopspaceGraphDeviceRowsFromSources(sources = []) {
+  const byId = new Map();
+  let index = 0;
+  const upsert = (device, options = {}) => {
+    const normalized = loopspaceGraphNormalizeDeviceRow(device, index, options);
+    index += 1;
+    if (!normalized) return;
+    upsertCloudConnectedDevice(byId, normalized);
+  };
+  sources.forEach((source) => {
+    const rows = safeCloudMcpArray(source?.rows);
+    rows.forEach((device) => upsert(device, source?.options || {}));
+  });
+  foldCloudWebOnlyDeviceRows(byId);
+  return Array.from(byId.values());
+}
+
+function loopspaceGraphDeviceOptionMatches(option, selectedKey = "") {
+  const key = safeCloudMcpText(selectedKey, "").toLowerCase();
+  if (!key) return false;
+  if (safeCloudMcpText(option?.id, "").toLowerCase() === key) return true;
+  return safeCloudMcpArray(option?.aliases).some((alias) => safeCloudMcpText(alias, "").toLowerCase() === key);
 }
 
 function loopspaceGraphDeviceTemplateFromDevice(device) {
@@ -4757,6 +4996,65 @@ function loopspaceGraphScriptOptionKey(option = {}) {
   return String(option.script_id || option.path_key || "").trim();
 }
 
+function loopspaceGraphDocumentTitle(document = {}) {
+  const pathKey = normalizedDocumentPath(document.pathKey || document.path_key || document.filePath || document.file_path || "");
+  const leaf = pathKey.split("/").filter(Boolean).pop() || "";
+  return String(document.title || document.name || document.label || leaf.replace(/\.(?:md|markdown|arch)$/iu, "") || pathKey || "Document").trim();
+}
+
+function loopspaceGraphDocumentOptionsFromRows(rows = []) {
+  const byPathKey = new Map();
+  safeCloudMcpArray(rows).forEach((document) => {
+    const rowType = String(document?.rowType || document?.row_type || document?.type || "").trim().toLowerCase();
+    const entryKind = String(document?.entryKind || document?.entry_kind || document?.kind || "").trim().toLowerCase();
+    if (rowType === "folder" || entryKind === "account_document_folder") return;
+    const pathKey = normalizedDocumentPath(
+      document?.pathKey
+        || document?.path_key
+        || document?.filePath
+        || document?.file_path
+        || accountDocumentStorageKey(document),
+    );
+    if (!pathKey || pathKey.startsWith("folder:")) return;
+    const documentKind = normalizedDocumentKind(
+      document?.documentKind
+        || document?.document_kind
+        || document?.source
+        || document?.kind,
+      document?.collection,
+    );
+    byPathKey.set(pathKey, {
+      document_kind: documentKind,
+      key: pathKey,
+      label: loopspaceGraphDocumentTitle({ ...document, pathKey }),
+      path_key: pathKey,
+    });
+  });
+  return Array.from(byPathKey.values()).sort((left, right) => (
+    left.label.localeCompare(right.label, undefined, { sensitivity: "base" })
+  ));
+}
+
+function loopspaceGraphDocumentOptionKey(option = {}) {
+  return normalizedDocumentPath(option.path_key || option.pathKey || option.key || "");
+}
+
+function loopspaceGraphDocumentRefsFromProps(props = {}) {
+  return String(loopspaceGraphPropValue(props, ["doc_refs", "documents", "path_key"]) || "")
+    .split("|")
+    .map((value) => normalizedDocumentPath(value))
+    .filter(Boolean)
+    .filter((value, index, array) => array.indexOf(value) === index);
+}
+
+function loopspaceGraphDocumentRefsValue(refs = []) {
+  return safeCloudMcpArray(refs)
+    .map((value) => normalizedDocumentPath(value))
+    .filter(Boolean)
+    .filter((value, index, array) => array.indexOf(value) === index)
+    .join("|");
+}
+
 function loopspaceGraphNodeTemplateLine(template, position = null) {
   const node = createDfBlueprintNodeFromTemplate(template, position);
   return addDfBlueprintNode("", node).trim();
@@ -4795,11 +5093,11 @@ function loopspaceGraphEscapeLabel(label) {
 }
 
 function loopspaceGraphOutputPortsForNode(node) {
-  return node?.nodeKind === "run_script"
-    ? LOOPSPACE_RUN_SCRIPT_OUTPUT_PORTS
-    : node?.nodeKind === "send_message"
-      ? LOOPSPACE_SEND_MESSAGE_OUTPUT_PORTS
-    : [LOOPSPACE_GRAPH_DEFAULT_OUTPUT_PORT];
+  if (node?.nodeKind === "run_script") return LOOPSPACE_RUN_SCRIPT_OUTPUT_PORTS;
+  if (node?.nodeKind === "send_message") return LOOPSPACE_SEND_MESSAGE_OUTPUT_PORTS;
+  if (node?.nodeKind === "document_read") return LOOPSPACE_DOCUMENT_READ_OUTPUT_PORTS;
+  if (node?.nodeKind === "document_write") return [];
+  return [LOOPSPACE_GRAPH_DEFAULT_OUTPUT_PORT];
 }
 
 function loopspaceGraphOutputPortForId(node, portId = "") {
@@ -4899,13 +5197,21 @@ function loopspaceGraphSourceWithoutTrigger(source, triggerId) {
 
 function loopspaceGraphNodeLayout(node, index = 0) {
   const isSendMessage = node?.nodeKind === "send_message";
+  const isDocumentContext = node?.nodeKind === "document_read" || node?.nodeKind === "document_write";
+  const documentRefCount = isDocumentContext
+    ? loopspaceGraphDocumentRefsFromProps(node?.props || {}).length
+    : 0;
   const nodeHeight = isSendMessage
-    ? Math.max(280, loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["h", "height"]), 360))
+    ? Math.max(220, loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["h", "height"]), 260))
+    : isDocumentContext
+      ? Math.max(128, 112 + (documentRefCount * 38))
     : node?.nodeKind === "run_script"
       ? 132
       : LOOPSPACE_GRAPH_NODE_HEIGHT;
   const nodeWidth = isSendMessage
-    ? Math.max(420, loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["w", "width"]), 620))
+    ? Math.max(560, loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["w", "width"]), 680))
+    : isDocumentContext
+      ? 270
     : LOOPSPACE_GRAPH_NODE_WIDTH;
   return {
     height: nodeHeight,
@@ -5107,6 +5413,289 @@ function LoopspaceRunScriptSelect({
   );
 }
 
+function LoopspaceSendMessageDeviceSelect({
+  busy = false,
+  canvasPan = null,
+  canvasZoom = 1,
+  nodeLabel = "",
+  onSelect,
+  options = [],
+  selectedKey = "",
+}) {
+  const [open, setOpen] = useState(false);
+  const [placement, setPlacement] = useState(null);
+  const triggerRef = useRef(null);
+
+  const hasOptions = options.length > 0;
+  const disabled = busy || !hasOptions;
+  const selectedOption = useMemo(
+    () => options.find((option) => loopspaceGraphDeviceOptionMatches(option, selectedKey)) || null,
+    [options, selectedKey],
+  );
+
+  const reposition = useCallback(() => {
+    const element = triggerRef.current;
+    if (!element) return;
+    const rect = element.getBoundingClientRect();
+    const viewportHeight = window.innerHeight || 0;
+    const spaceBelow = viewportHeight - rect.bottom;
+    const openUp = spaceBelow < 220 && rect.top > spaceBelow;
+    setPlacement({
+      left: rect.left,
+      width: rect.width,
+      maxWidth: Math.max(rect.width, 260),
+      ...(openUp
+        ? { bottom: viewportHeight - rect.top + 6, maxHeight: Math.max(140, rect.top - 18) }
+        : { top: rect.bottom + 6, maxHeight: Math.max(140, spaceBelow - 18) }),
+    });
+  }, []);
+
+  useEffect(() => {
+    setOpen(false);
+  }, [canvasPan?.x, canvasPan?.y, canvasZoom]);
+
+  useEffect(() => {
+    if (!open) return undefined;
+    reposition();
+    const onViewportChange = () => reposition();
+    const onPointerDown = (event) => {
+      if (triggerRef.current?.contains(event.target)) return;
+      if (event.target?.closest?.("[data-loopspace-device-menu='true']")) return;
+      setOpen(false);
+    };
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    window.addEventListener("resize", onViewportChange);
+    window.addEventListener("scroll", onViewportChange, true);
+    document.addEventListener("pointerdown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    return () => {
+      window.removeEventListener("resize", onViewportChange);
+      window.removeEventListener("scroll", onViewportChange, true);
+      document.removeEventListener("pointerdown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+    };
+  }, [open, reposition]);
+
+  const stopEvent = useCallback((event) => event.stopPropagation(), []);
+
+  const handleSelect = useCallback((key) => {
+    setOpen(false);
+    if (typeof onSelect === "function") onSelect(key);
+  }, [onSelect]);
+
+  const selectedLabel = selectedOption?.label || (hasOptions ? "Select device..." : "No devices");
+  const selectedStatus = selectedOption?.status || "";
+
+  return (
+    <>
+      <LoopspaceGraphNodeSelectButton
+        aria-expanded={open ? "true" : "false"}
+        aria-haspopup="listbox"
+        aria-label={`Target device for ${nodeLabel || "Send message"}`}
+        data-open={open ? "true" : undefined}
+        disabled={disabled}
+        onClick={(event) => {
+          event.stopPropagation();
+          if (disabled) return;
+          setOpen((value) => !value);
+        }}
+        onPointerDown={stopEvent}
+        ref={triggerRef}
+        title={hasOptions ? "Select target device" : "No devices available"}
+        type="button"
+      >
+        <LoopspaceGraphNodeSelectValue>
+          <strong>{selectedLabel}</strong>
+          <LoopspaceGraphNodeSelectDevice data-muted={!selectedOption ? "true" : undefined}>
+            <Devices aria-hidden="true" />
+            {selectedOption ? (
+              <LoopspaceGraphNodeDeviceDot
+                aria-hidden="true"
+                data-status={selectedStatus || "offline"}
+              />
+            ) : null}
+            <span>{selectedStatus || "device"}</span>
+          </LoopspaceGraphNodeSelectDevice>
+        </LoopspaceGraphNodeSelectValue>
+        <LoopspaceGraphNodeSelectChevron aria-hidden="true">
+          <KeyboardArrowDown />
+        </LoopspaceGraphNodeSelectChevron>
+      </LoopspaceGraphNodeSelectButton>
+      {open && placement
+        ? createPortal(
+            <LoopspaceGraphNodeSelectMenu
+              data-loopspace-device-menu="true"
+              onPointerDown={stopEvent}
+              onWheel={stopEvent}
+              role="listbox"
+              style={{
+                left: `${placement.left}px`,
+                width: `${placement.width}px`,
+                maxWidth: `${placement.maxWidth}px`,
+                maxHeight: `${placement.maxHeight}px`,
+                ...(placement.top !== undefined ? { top: `${placement.top}px` } : {}),
+                ...(placement.bottom !== undefined ? { bottom: `${placement.bottom}px` } : {}),
+              }}
+            >
+              {hasOptions ? (
+                <>
+                  <LoopspaceGraphNodeSelectOption
+                    data-selected={selectedKey ? undefined : "true"}
+                    onClick={() => handleSelect("")}
+                    role="option"
+                    type="button"
+                  >
+                    <LoopspaceGraphNodeSelectOptionMain>
+                      <strong>Select device...</strong>
+                      <LoopspaceGraphNodeSelectOptionDevice>
+                        <span>Clear selection</span>
+                      </LoopspaceGraphNodeSelectOptionDevice>
+                    </LoopspaceGraphNodeSelectOptionMain>
+                    {selectedKey ? null : <ButtonCheckIcon aria-hidden="true" />}
+                  </LoopspaceGraphNodeSelectOption>
+                  {options.map((option) => {
+                    const isSelected = loopspaceGraphDeviceOptionMatches(option, selectedKey);
+                    return (
+                      <LoopspaceGraphNodeSelectOption
+                        data-selected={isSelected ? "true" : undefined}
+                        key={option.id}
+                        onClick={() => handleSelect(option.id)}
+                        role="option"
+                        type="button"
+                      >
+                        <LoopspaceGraphNodeSelectOptionMain>
+                          <strong>{option.label}</strong>
+                          <LoopspaceGraphNodeSelectOptionDevice>
+                            <Devices aria-hidden="true" />
+                            <span>{option.status || "device"}</span>
+                          </LoopspaceGraphNodeSelectOptionDevice>
+                        </LoopspaceGraphNodeSelectOptionMain>
+                        {isSelected ? <ButtonCheckIcon aria-hidden="true" /> : null}
+                      </LoopspaceGraphNodeSelectOption>
+                    );
+                  })}
+                </>
+              ) : (
+                <LoopspaceGraphNodeSelectEmpty>
+                  No devices available.
+                </LoopspaceGraphNodeSelectEmpty>
+              )}
+            </LoopspaceGraphNodeSelectMenu>,
+            document.body,
+          )
+        : null}
+    </>
+  );
+}
+
+function LoopspaceDocumentContextPicker({
+  busy = false,
+  mode = "read",
+  onRefsChange,
+  options = [],
+  refs = [],
+  search = "",
+  setSearch,
+}) {
+  const selectedRefs = useMemo(() => loopspaceGraphDocumentRefsValue(refs).split("|").filter(Boolean), [refs]);
+  const selectedSet = useMemo(() => new Set(selectedRefs), [selectedRefs]);
+  const optionByKey = useMemo(() => {
+    const map = new Map();
+    options.forEach((option) => {
+      const key = loopspaceGraphDocumentOptionKey(option);
+      if (key) map.set(key, option);
+    });
+    return map;
+  }, [options]);
+  const query = String(search || "").trim().toLowerCase();
+  const filteredOptions = useMemo(() => {
+    const matches = options.filter((option) => {
+      const key = loopspaceGraphDocumentOptionKey(option);
+      if (!key || selectedSet.has(key)) return false;
+      if (!query) return selectedRefs.length === 0;
+      const haystack = `${option.label || ""} ${option.path_key || ""} ${option.document_kind || ""}`.toLowerCase();
+      return haystack.includes(query);
+    });
+    return matches.slice(0, 5);
+  }, [options, query, selectedRefs.length, selectedSet]);
+  const stopEvent = useCallback((event) => event.stopPropagation(), []);
+  const updateSearch = useCallback((event) => {
+    if (typeof setSearch === "function") setSearch(event.target.value);
+  }, [setSearch]);
+  const addRef = useCallback((key) => {
+    const pathKey = normalizedDocumentPath(key);
+    if (!pathKey || selectedSet.has(pathKey) || busy) return;
+    if (typeof onRefsChange === "function") onRefsChange([...selectedRefs, pathKey]);
+    if (typeof setSearch === "function") setSearch("");
+  }, [busy, onRefsChange, selectedRefs, selectedSet, setSearch]);
+  const removeRef = useCallback((key) => {
+    const pathKey = normalizedDocumentPath(key);
+    if (!pathKey || busy) return;
+    if (typeof onRefsChange === "function") onRefsChange(selectedRefs.filter((item) => item !== pathKey));
+  }, [busy, onRefsChange, selectedRefs]);
+
+  return (
+    <LoopspaceGraphDocumentPicker
+      data-mode={mode}
+      onClick={stopEvent}
+      onPointerDown={stopEvent}
+      onWheel={stopEvent}
+    >
+      <LoopspaceGraphDocumentSearch
+        aria-label={`${mode === "write" ? "Writable" : "Readable"} document search`}
+        disabled={busy}
+        onChange={updateSearch}
+        placeholder={mode === "write" ? "Search writable docs…" : "Search readable docs…"}
+        value={search}
+      />
+      {selectedRefs.length ? (
+        <LoopspaceGraphDocumentRefList aria-label="Selected documents">
+          {selectedRefs.map((key) => {
+            const option = optionByKey.get(key);
+            return (
+              <LoopspaceGraphDocumentRefItem key={key} title={key}>
+                <span>
+                  <strong>{option?.label || key.split("/").filter(Boolean).pop() || key}</strong>
+                  <em>{key}</em>
+                </span>
+                <button
+                  aria-label={`Remove ${option?.label || key}`}
+                  disabled={busy}
+                  onClick={() => removeRef(key)}
+                  type="button"
+                >
+                  <ButtonCloseIcon aria-hidden="true" />
+                </button>
+              </LoopspaceGraphDocumentRefItem>
+            );
+          })}
+        </LoopspaceGraphDocumentRefList>
+      ) : null}
+      {filteredOptions.length ? (
+        <LoopspaceGraphDocumentPickList aria-label="Document search results">
+          {filteredOptions.map((option) => {
+            const key = loopspaceGraphDocumentOptionKey(option);
+            return (
+              <LoopspaceGraphDocumentPickButton
+                disabled={busy}
+                key={key}
+                onClick={() => addRef(key)}
+                title={option.path_key}
+                type="button"
+              >
+                <strong>{option.label}</strong>
+                <span>{option.document_kind || "document"}</span>
+              </LoopspaceGraphDocumentPickButton>
+            );
+          })}
+        </LoopspaceGraphDocumentPickList>
+      ) : null}
+    </LoopspaceGraphDocumentPicker>
+  );
+}
+
 function LoopspaceRuntimeView({
   actionState,
   error,
@@ -5117,6 +5706,9 @@ function LoopspaceRuntimeView({
 }) {
   const [runtimePanelTab, setRuntimePanelTab] = useState("runtime");
   const [runtimePanelExpanded, setRuntimePanelExpanded] = useState(true);
+  const [runtimePanelHeight, setRuntimePanelHeight] = useState(LOOPSPACE_RUNTIME_PANEL_DEFAULT_HEIGHT);
+  const [runtimePanelResizing, setRuntimePanelResizing] = useState(false);
+  const [runtimePanelAutoScroll, setRuntimePanelAutoScroll] = useState(true);
   const [selectedHistoryRunId, setSelectedHistoryRunId] = useState("");
   const [timerNowMs, setTimerNowMs] = useState(() => Date.now());
   const [triggers, setTriggers] = useState([]);
@@ -5138,6 +5730,10 @@ function LoopspaceRuntimeView({
   const [nodeDragPositions, setNodeDragPositions] = useState({});
   const [pendingGraphNodeIds, setPendingGraphNodeIds] = useState(() => new Set());
   const [nodeSizes, setNodeSizes] = useState({});
+  const [documentContextSearchByNode, setDocumentContextSearchByNode] = useState({});
+  const [sendMessageSettingsNodeId, setSendMessageSettingsNodeId] = useState("");
+  const [sendMessageSettingsDrafts, setSendMessageSettingsDrafts] = useState({});
+  const [workspaceToolsVersion, setWorkspaceToolsVersion] = useState(() => getWorkspaceToolsVersion());
   const loopspaceId = loopspace?.id || "";
   const busy = actionState === "renaming" || actionState === "deleting" || loadingState === "saving";
   const loopspaceRef = useRef(loopspace);
@@ -5147,6 +5743,9 @@ function LoopspaceRuntimeView({
   const triggersRef = useRef([]);
   const triggerRefsRef = useRef([]);
   const refreshGenerationRef = useRef(0);
+  const runtimeSurfaceRef = useRef(null);
+  const runtimePanelBodyRef = useRef(null);
+  const runtimePanelResizeGestureRef = useRef(null);
   const graphCanvasRef = useRef(null);
   const canvasPanRef = useRef(canvasPan);
   const canvasZoomRef = useRef(canvasZoom);
@@ -5156,6 +5755,41 @@ function LoopspaceRuntimeView({
   const nodeSizesRef = useRef({});
   const nodeResizeObserverRef = useRef(null);
   const nodeElementsRef = useRef(new Map());
+
+  useEffect(() => subscribeWorkspaceTools(() => {
+    setWorkspaceToolsVersion(getWorkspaceToolsVersion());
+  }), []);
+
+  const finishRuntimePanelResize = useCallback((event) => {
+    const gesture = runtimePanelResizeGestureRef.current;
+    if (!gesture || (event?.pointerId !== undefined && gesture.pointerId !== event.pointerId)) return;
+    runtimePanelResizeGestureRef.current = null;
+    setRuntimePanelResizing(false);
+    event?.currentTarget?.releasePointerCapture?.(gesture.pointerId);
+  }, []);
+
+  const onRuntimePanelResizePointerMove = useCallback((event) => {
+    const gesture = runtimePanelResizeGestureRef.current;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const nextHeight = gesture.surfaceBottom - event.clientY;
+    setRuntimePanelHeight(clampLoopspaceRuntimePanelHeight(nextHeight, gesture.surfaceHeight));
+  }, []);
+
+  const startRuntimePanelResize = useCallback((event) => {
+    if (event.button !== 0) return;
+    const rect = runtimeSurfaceRef.current?.getBoundingClientRect?.();
+    if (!rect) return;
+    event.preventDefault();
+    event.stopPropagation();
+    runtimePanelResizeGestureRef.current = {
+      pointerId: event.pointerId,
+      surfaceBottom: rect.bottom,
+      surfaceHeight: rect.height,
+    };
+    setRuntimePanelResizing(true);
+    event.currentTarget?.setPointerCapture?.(event.pointerId);
+  }, []);
 
   const recordGraphNodeSize = useCallback((nodeId, element) => {
     if (!element) return;
@@ -5559,40 +6193,35 @@ function LoopspaceRuntimeView({
     loopspaceGraphScriptOptionsFromRows(localScripts, localDesktopProfile)
   ), [localDesktopProfile, localScripts]);
 
-  const loopspaceGraphDeviceLookup = useMemo(() => {
-    const map = new Map();
-    [
-      ...safeCloudMcpArray(registeredDevices),
-      ...safeCloudMcpArray(loopspace?.registered_devices),
-      ...safeCloudMcpArray(knownDevices),
-      localDesktopProfile,
-    ].filter(Boolean).forEach((device) => {
-      cloudDeviceAliasList(device).forEach((alias) => {
-        if (alias && !map.has(alias)) map.set(alias, device);
-      });
-      const id = safeCloudMcpText(device?.device_id || device?.deviceId || device?.id, "");
-      if (id && !map.has(id)) map.set(id, device);
-    });
-    return map;
-  }, [knownDevices, localDesktopProfile, loopspace?.registered_devices, registeredDevices]);
+  const loopspaceGraphDocumentOptions = useMemo(() => (
+    loopspaceGraphDocumentOptionsFromRows(getWorkspaceToolsAccountSkills())
+  ), [workspaceToolsVersion]);
+
+  const loopspaceGraphLiveDeviceRows = useMemo(() => (
+    loopspaceGraphDeviceRowsFromSources([
+      { options: { registered: true }, rows: registeredDevices },
+      { options: { registered: true }, rows: loopspace?.registered_devices },
+      { rows: knownDevices },
+      { rows: localDesktopProfile ? [{ ...localDesktopProfile, connected: true, native_connected: true }] : [] },
+    ])
+  ), [knownDevices, localDesktopProfile, loopspace?.registered_devices, registeredDevices]);
 
   const loopspaceGraphDeviceOptions = useMemo(() => {
     const seen = new Set();
-    return [
-      ...safeCloudMcpArray(registeredDevices),
-      ...safeCloudMcpArray(loopspace?.registered_devices),
-      ...safeCloudMcpArray(knownDevices),
-      localDesktopProfile,
-    ]
+    return loopspaceGraphLiveDeviceRows
       .filter(Boolean)
       .map((device) => {
-        const id = safeCloudMcpText(device?.device_id || device?.deviceId || device?.id, "");
+        const id = safeCloudMcpText(device?.deviceId || device?.device_id || device?.id, "").toLowerCase();
         if (!id || seen.has(id)) return null;
         seen.add(id);
+        const aliases = cloudDeviceAliasList(device, id);
         return {
+          aliases,
           id,
           label: safeCloudMcpText(
-            device?.device_label
+            device?.displayName
+              || device?.display_name
+              || device?.device_label
               || device?.deviceLabel
               || device?.device_name
               || device?.deviceName
@@ -5604,23 +6233,31 @@ function LoopspaceRuntimeView({
       })
       .filter(Boolean)
       .sort((left, right) => left.label.localeCompare(right.label, undefined, { sensitivity: "base" }));
-  }, [knownDevices, localDesktopProfile, loopspace?.registered_devices, registeredDevices]);
+  }, [loopspaceGraphLiveDeviceRows]);
+
+  const loopspaceGraphDeviceLookup = useMemo(() => {
+    const map = new Map();
+    loopspaceGraphLiveDeviceRows.filter(Boolean).forEach((device) => {
+      cloudDeviceAliasList(device, device?.deviceId || device?.device_id).forEach((alias) => {
+        if (alias) map.set(alias, device);
+      });
+    });
+    return map;
+  }, [loopspaceGraphLiveDeviceRows]);
+
+  const loopspaceGraphDefaultDeviceOption = useMemo(() => (
+    loopspaceGraphDeviceOptions.find((device) => ["online", "connected", "active", "ready"].includes(String(device?.status || "").toLowerCase()))
+      || loopspaceGraphDeviceOptions[0]
+      || null
+  ), [loopspaceGraphDeviceOptions]);
 
   const loopspaceGraphPaletteTemplates = useMemo(() => {
-    const deviceTemplates = loopspaceGraphDeviceTemplatesFromRows([
-      ...safeCloudMcpArray(registeredDevices),
-      ...safeCloudMcpArray(loopspace?.registered_devices),
-      ...safeCloudMcpArray(knownDevices),
-    ]);
+    const deviceTemplates = loopspaceGraphDeviceTemplatesFromRows(loopspaceGraphLiveDeviceRows);
     return [
       ...deviceTemplates,
       ...LOOPSPACE_GRAPH_NODE_TEMPLATES,
     ];
-  }, [
-    knownDevices,
-    loopspace?.registered_devices,
-    registeredDevices,
-  ]);
+  }, [loopspaceGraphLiveDeviceRows]);
 
   const graphPaletteTemplateByKey = useMemo(() => {
     const map = new Map();
@@ -5752,10 +6389,56 @@ function LoopspaceRuntimeView({
     });
   }, [attachedTriggerIds, busy, commitLoopspaceGraphSource, graphSource, loopspaceId, triggerById]);
 
+  const findSendMessageParentForPosition = useCallback((position = null) => {
+    if (!position) return null;
+    for (const node of visibleGraphNodes) {
+      if (node.nodeKind !== "send_message") continue;
+      const layout = graphNodeLayouts.get(node.id);
+      if (!layout) continue;
+      if (
+        position.x >= layout.x
+          && position.x <= layout.x + layout.width
+          && position.y >= layout.y
+          && position.y <= layout.y + layout.height
+      ) {
+        return { layout, node };
+      }
+    }
+    return null;
+  }, [graphNodeLayouts, visibleGraphNodes]);
+
   const attachGraphNodeTemplateToLoop = useCallback(async (template, position = null) => {
     if (!loopspaceId || busy || !template?.id) return;
     const baseSource = graphSourceRef.current || graphSource;
-    const node = createDfBlueprintNodeFromTemplate(template, position);
+    const sendMessageDefaults = template.id === "send_message"
+      ? normalizeLoopspaceSendMessageDraft(template, agentLaunchDefaultsRef.current)
+      : null;
+    const templateWithDefaults = template.id === "send_message"
+      ? {
+          ...template,
+          ...(loopspaceGraphDefaultDeviceOption ? {
+            device_id: template.device_id || loopspaceGraphDefaultDeviceOption.id,
+            device_label: template.device_label || loopspaceGraphDefaultDeviceOption.label,
+          } : {}),
+          model: template.model || sendMessageDefaults?.model || "",
+          reasoning_effort: template.reasoning_effort || template.effort || sendMessageDefaults?.reasoning_effort || "",
+          speed: template.speed || sendMessageDefaults?.speed || "",
+          target_agent_id: sendMessageDefaults?.target_agent_id || "codex",
+        }
+      : template;
+    const node = createDfBlueprintNodeFromTemplate(templateWithDefaults, position);
+    if (node.nodeKind === "document_read" || node.nodeKind === "document_write") {
+      const parent = findSendMessageParentForPosition(position);
+      if (parent?.node?.id) {
+        node.props = {
+          ...(node.props || {}),
+          parent_id: parent.node.id,
+          x: String(Math.max(8, Math.round((Number(position?.x) || 0) - parent.layout.x))),
+          y: String(Math.max(8, Math.round((Number(position?.y) || 0) - parent.layout.y))),
+        };
+        node.hasPosition = false;
+      }
+    }
     const nextSource = addDfBlueprintNode(baseSource, node);
     if (nextSource === baseSource) {
       setRuntimeError(template.id === "device"
@@ -5766,7 +6449,7 @@ function LoopspaceRuntimeView({
     await commitLoopspaceGraphSource(nextSource, "Unable to add graph node.", {
       pendingNodeIds: [node.id],
     });
-  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
+  }, [busy, commitLoopspaceGraphSource, findSendMessageParentForPosition, graphSource, loopspaceGraphDefaultDeviceOption, loopspaceId]);
 
   const detachTriggerFromLoop = useCallback(async (trigger) => {
     if (!loopspaceId || !trigger?.id || busy) return;
@@ -5822,7 +6505,9 @@ function LoopspaceRuntimeView({
 
   const updateSendMessageDeviceSelection = useCallback(async (node, selectedDeviceId) => {
     const deviceId = String(selectedDeviceId || "").trim();
-    const device = loopspaceGraphDeviceOptions.find((option) => option.id === deviceId);
+    const device = loopspaceGraphDeviceOptions.find((option) => (
+      option.id === deviceId || loopspaceGraphDeviceOptionMatches(option, deviceId)
+    ));
     await updateSendMessageNodeProps(node, {
       props: {
         device_id: device?.id || "",
@@ -5831,14 +6516,78 @@ function LoopspaceRuntimeView({
     });
   }, [loopspaceGraphDeviceOptions, updateSendMessageNodeProps]);
 
-  const updateSendMessagePrompt = useCallback(async (node, prompt) => {
-    const text = String(prompt || "").trim();
+  const updateSendMessageSettingsDraft = useCallback((nodeId, patch = {}) => {
+    const key = String(nodeId || "").trim();
+    if (!key) return;
+    setSendMessageSettingsDrafts((current) => ({
+      ...current,
+      [key]: {
+        ...(current[key] && typeof current[key] === "object"
+          ? current[key]
+          : { prompt: String(current[key] || "") }),
+        ...(patch && typeof patch === "object" ? patch : { prompt: String(patch || "") }),
+      },
+    }));
+  }, []);
+
+  const saveSendMessageSettings = useCallback(async (node, draft) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!nodeId || busy) return;
+    const normalized = normalizeLoopspaceSendMessageDraft(draft, agentLaunchDefaultsRef.current);
     await updateSendMessageNodeProps(node, {
       props: {
-        prompt: text,
+        model: normalized.model,
+        prompt: normalized.prompt.trim(),
+        reasoning_effort: normalized.reasoning_effort,
+        speed: normalized.speed,
+        target_agent_id: normalized.target_agent_id,
       },
     });
-  }, [updateSendMessageNodeProps]);
+    setSendMessageSettingsNodeId("");
+    setSendMessageSettingsDrafts((current) => {
+      const next = { ...current };
+      delete next[nodeId];
+      return next;
+    });
+  }, [busy, updateSendMessageNodeProps]);
+
+  const addSendMessageDocumentSubnode = useCallback(async (node, nodeKind) => {
+    const nodeId = String(node?.id || "").trim();
+    const kind = nodeKind === "document_write" ? "document_write" : "document_read";
+    if (!loopspaceId || !nodeId || busy) return;
+    const template = LOOPSPACE_GRAPH_NODE_TEMPLATES.find((item) => item.id === kind);
+    if (!template) return;
+    const existingChildren = parsedGraph.nodes.filter((item) => loopspaceGraphNodeParentId(item) === nodeId);
+    const childIndex = existingChildren.length;
+    const childNode = createDfBlueprintNodeFromTemplate(template, null);
+    childNode.hasPosition = false;
+    childNode.props = {
+      ...(childNode.props || {}),
+      parent_id: nodeId,
+      x: String(18 + ((childIndex % 2) * 230)),
+      y: String(18 + (Math.floor(childIndex / 2) * 104)),
+    };
+    const source = graphSourceRef.current || graphSource;
+    const nextSource = addDfBlueprintNode(source, childNode);
+    if (nextSource === source) {
+      setRuntimeError("Unable to add document subnode.");
+      return;
+    }
+    await commitLoopspaceGraphSource(nextSource, "Unable to add document subnode.", {
+      pendingNodeIds: [childNode.id],
+    });
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId, parsedGraph.nodes]);
+
+  const updateDocumentContextNodeRefs = useCallback(async (node, refs = []) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy) return;
+    const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, nodeId, {
+      props: {
+        doc_refs: loopspaceGraphDocumentRefsValue(refs),
+      },
+    });
+    await commitLoopspaceGraphSource(nextSource, "Unable to update document context node.");
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
 
   const updateSendMessageSize = useCallback(async (node, size) => {
     await updateSendMessageNodeProps(node, {
@@ -6013,13 +6762,31 @@ function LoopspaceRuntimeView({
   const commitGraphNodePosition = useCallback(async (nodeId, position) => {
     const id = String(nodeId || "").trim();
     if (!id || !position || busy) return;
+    const node = graphNodeLookup.get(id);
+    const isDocumentContextNode = node?.nodeKind === "document_read" || node?.nodeKind === "document_write";
+    const parent = isDocumentContextNode ? findSendMessageParentForPosition(position) : null;
+    const patch = parent?.node?.id && parent.node.id !== id
+      ? {
+          hasPosition: false,
+          props: {
+            parent_id: parent.node.id,
+            x: String(Math.max(8, Math.round((Number(position.x) || 0) - parent.layout.x))),
+            y: String(Math.max(8, Math.round((Number(position.y) || 0) - parent.layout.y))),
+          },
+          x: undefined,
+          y: undefined,
+        }
+      : {
+          hasPosition: true,
+          props: isDocumentContextNode ? { parent_id: "" } : {},
+          x: position.x,
+          y: position.y,
+        };
     const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, id, {
-      hasPosition: true,
-      x: position.x,
-      y: position.y,
+      ...patch,
     });
     await commitLoopspaceGraphSource(nextSource, "Unable to move graph node.");
-  }, [busy, commitLoopspaceGraphSource, graphSource]);
+  }, [busy, commitLoopspaceGraphSource, findSendMessageParentForPosition, graphNodeLookup, graphSource]);
 
   const startGraphNodeDrag = useCallback((event, node) => {
     if (busy || event.button !== 0 || !node?.id) return;
@@ -6613,9 +7380,29 @@ function LoopspaceRuntimeView({
   const runtimePanelNodeTemplates = loopspaceGraphPaletteTemplates;
   const runtimeStatus = runtimeError || error;
 
+  useLayoutEffect(() => {
+    if (!runtimePanelExpanded || !runtimePanelAutoScroll) return;
+    const panelBody = runtimePanelBodyRef.current;
+    if (!panelBody || runtimePanelTab === "nodes") return;
+    panelBody.scrollTop = 0;
+  }, [
+    currentRuntimeSegments.length,
+    logs.length,
+    runtimeHeadRunId,
+    runtimePanelAutoScroll,
+    runtimePanelExpanded,
+    runtimePanelTab,
+    selectedHistoryRunId,
+  ]);
+
   return (
-    <LoopspaceRuntimeSurface aria-label={loopspace?.name || "Loop"}>
-      <LoopspaceRuntimeStage>
+    <LoopspaceRuntimeSurface aria-label={loopspace?.name || "Loop"} ref={runtimeSurfaceRef}>
+      <LoopspaceRuntimeStage
+        data-panel-collapsed={runtimePanelExpanded ? undefined : "true"}
+        style={{
+          "--loopspace-runtime-panel-height": `${runtimePanelHeight}px`,
+        }}
+      >
         <LoopspaceGraphCanvas
             data-drop-active={dropActive ? "true" : undefined}
             data-panning={isCanvasPanning ? "true" : undefined}
@@ -6737,7 +7524,16 @@ function LoopspaceRuntimeView({
                 const nodeLayout = graphNodeLayouts.get(node.id) || loopspaceGraphNodeLayout(node, index);
                 const isTriggerNode = Boolean(node.triggerId);
                 const canRemoveNode = Boolean(node.triggerId || node.nodeKind);
+                const isDocumentReadNode = node.nodeKind === "document_read";
+                const isDocumentWriteNode = node.nodeKind === "document_write";
+                const isDocumentContextNode = isDocumentReadNode || isDocumentWriteNode;
                 const nodeOutputPorts = loopspaceGraphOutputPortsForNode(node);
+                const nodeDocumentRefs = isDocumentContextNode
+                  ? loopspaceGraphDocumentRefsFromProps(node.props)
+                  : [];
+                const nodeDocumentSearch = isDocumentContextNode
+                  ? String(documentContextSearchByNode[node.id] || "")
+                  : "";
                 const nodeScriptKey = node.nodeKind === "run_script"
                   ? String(
                     loopspaceGraphPropValue(node.props, ["script_id", "scriptId"])
@@ -6748,6 +7544,30 @@ function LoopspaceRuntimeView({
                 const selectedScriptOption = node.nodeKind === "run_script"
                   ? loopspaceGraphScriptOptions.find((option) => loopspaceGraphScriptOptionKey(option) === nodeScriptKey)
                   : null;
+                const graphDeviceId = node.nodeKind === "device"
+                  ? String(loopspaceGraphPropValue(node.props, ["device_id", "deviceId"]) || "").trim()
+                  : "";
+                const graphDevice = graphDeviceId
+                  ? loopspaceGraphDeviceLookup.get(graphDeviceId.toLowerCase())
+                  : null;
+                const graphDeviceLabel = node.nodeKind === "device"
+                  ? String(
+                    graphDevice?.displayName
+                      || graphDevice?.display_name
+                      || graphDevice?.device_label
+                      || graphDevice?.deviceLabel
+                      || graphDevice?.device_name
+                      || graphDevice?.deviceName
+                      || graphDevice?.name
+                      || node.label
+                      || "Device",
+                  ).trim()
+                  : "";
+                const graphDeviceStatus = node.nodeKind === "device"
+                  ? graphDevice
+                    ? loopspaceGraphDeviceStatus(graphDevice)
+                    : String(loopspaceGraphPropValue(node.props, ["status"]) || node.status || "offline").trim()
+                  : "";
                 const runScriptDeviceId = node.nodeKind === "run_script"
                   ? String(
                     loopspaceGraphPropValue(node.props, ["device_id", "deviceId"])
@@ -6756,12 +7576,14 @@ function LoopspaceRuntimeView({
                   ).trim()
                   : "";
                 const runScriptDevice = runScriptDeviceId
-                  ? loopspaceGraphDeviceLookup.get(runScriptDeviceId)
+                  ? loopspaceGraphDeviceLookup.get(runScriptDeviceId.toLowerCase())
                   : null;
                 const runScriptDeviceLabel = node.nodeKind === "run_script"
                   ? String(
                     loopspaceGraphPropValue(node.props, ["device_label", "deviceLabel"])
                       || selectedScriptOption?.device_label
+                      || runScriptDevice?.displayName
+                      || runScriptDevice?.display_name
                       || runScriptDevice?.device_label
                       || runScriptDevice?.deviceLabel
                       || runScriptDevice?.device_name
@@ -6779,35 +7601,43 @@ function LoopspaceRuntimeView({
                 const sendMessageDeviceId = node.nodeKind === "send_message"
                   ? String(loopspaceGraphPropValue(node.props, ["device_id", "deviceId"]) || "").trim()
                   : "";
-                const sendMessageDevice = sendMessageDeviceId
-                  ? loopspaceGraphDeviceLookup.get(sendMessageDeviceId)
-                  : null;
-                const sendMessageDeviceLabel = node.nodeKind === "send_message"
-                  ? String(
-                    loopspaceGraphPropValue(node.props, ["device_label", "deviceLabel"])
-                      || sendMessageDevice?.device_label
-                      || sendMessageDevice?.deviceLabel
-                      || sendMessageDevice?.device_name
-                      || sendMessageDevice?.deviceName
-                      || sendMessageDevice?.name
-                      || sendMessageDeviceId
-                      || "Target device",
-                  ).trim()
-                  : "";
-                const sendMessageDeviceStatus = sendMessageDevice
-                  ? loopspaceGraphDeviceStatus(sendMessageDevice)
-                  : sendMessageDeviceId
-                    ? "offline"
-                    : "";
                 const sendMessagePrompt = node.nodeKind === "send_message"
                   ? String(loopspaceGraphPropValue(node.props, ["prompt", "message", "body", "instructions"]) || "")
                   : "";
                 const isSendMessageRegion = node.nodeKind === "send_message";
+                const sendMessageSettingsOpen = isSendMessageRegion && sendMessageSettingsNodeId === node.id;
+                const sendMessageNodeDraft = isSendMessageRegion
+                  ? loopspaceSendMessageDraftFromNode(node, agentLaunchDefaults)
+                  : null;
+                const sendMessageDraft = isSendMessageRegion
+                  && Object.prototype.hasOwnProperty.call(sendMessageSettingsDrafts, node.id)
+                  ? normalizeLoopspaceSendMessageDraft(sendMessageSettingsDrafts[node.id], agentLaunchDefaults)
+                  : sendMessageNodeDraft;
+                const sendMessageDraftPrompt = sendMessageDraft?.prompt || "";
+                const sendMessageModelOptions = isSendMessageRegion
+                  ? getAgentLaunchModelOptions(sendMessageDraft.target_agent_id)
+                  : [];
+                const sendMessageModelOptionValues = new Set(sendMessageModelOptions.map((option) => option.value));
+                const sendMessageEffortOptions = isSendMessageRegion
+                  ? getAgentLaunchEffortOptions(sendMessageDraft.target_agent_id, sendMessageDraft.model)
+                  : [];
+                const sendMessageSpeedOptions = isSendMessageRegion
+                  ? getAgentLaunchSpeedOptions(sendMessageDraft.target_agent_id, sendMessageDraft.model)
+                  : [];
+                const sendMessageAgentLabel = isSendMessageRegion
+                  ? getLoopspaceSendMessageAgentLabel(sendMessageDraft.target_agent_id)
+                  : "";
+                const sendMessageModelLabel = isSendMessageRegion
+                  ? getAgentLaunchModelOption(sendMessageDraft.target_agent_id, sendMessageDraft.model)?.label || sendMessageDraft.model
+                  : "";
                 const sendMessageCheckpoints = isSendMessageRegion
                   ? parsedGraph.nodes.filter((item) => (
                     String(loopspaceGraphPropValue(item.props, ["parent_id", "parentId", "parent"]) || "").trim() === node.id
                   ))
                   : [];
+                const sendMessageDocumentCount = sendMessageCheckpoints.filter((item) => (
+                  item.nodeKind === "document_read" || item.nodeKind === "document_write"
+                )).length;
                 const cronCountdown = node.triggerId && (trigger?.type || "").toLowerCase() === "cron"
                   ? formatLoopspaceCountdown(trigger?.nextDueAtMs, timerNowMs)
                   : "";
@@ -6835,7 +7665,7 @@ function LoopspaceRuntimeView({
                       "--loopspace-node-y": `${nodeLayout.y}px`,
                     }}
                   >
-                    {isTriggerNode ? null : (
+                    {isTriggerNode || isDocumentReadNode ? null : (
                       <LoopspaceGraphNodePort
                         aria-label={`Connect into ${trigger?.name || node.label}`}
                         data-loopspace-graph-input-id={node.id}
@@ -6855,7 +7685,7 @@ function LoopspaceRuntimeView({
                       <Icon aria-hidden="true" />
                     </LoopspaceGraphNodeIcon>
                     <LoopspaceGraphNodeText>
-                      <strong>{node.nodeKind === "run_script" ? "Run script" : (trigger?.name || node.label)}</strong>
+                      <strong>{node.nodeKind === "run_script" ? "Run script" : node.nodeKind === "device" ? graphDeviceLabel : isDocumentContextNode ? (isDocumentReadNode ? "Document read" : "Document write") : (trigger?.name || node.label)}</strong>
                       <span>
                         {[
                           node.triggerId
@@ -6863,12 +7693,16 @@ function LoopspaceRuntimeView({
                             : node.nodeKind === "device"
                               ? [
                                   "Device",
-                                  loopspaceGraphPropValue(node.props, ["status"]) || node.status,
+                                  graphDeviceStatus,
                                 ].filter(Boolean).join(" - ")
                               : node.nodeKind === "run_script"
                                 ? "Run script"
                               : node.nodeKind === "send_message"
                                 ? "Send message"
+                              : isDocumentReadNode
+                                ? "Readable docs"
+                              : isDocumentWriteNode
+                                ? "Writable docs"
                                 : (type || "Graph node"),
                           isRuntimeNode ? (runtimeHead?.status || "active") : "",
                         ].filter(Boolean).join(" - ")}
@@ -6892,14 +7726,15 @@ function LoopspaceRuntimeView({
                         />
                       ) : null}
                       {node.nodeKind === "send_message" ? (
-                        <LoopspaceGraphNodeDeviceBadge title={sendMessageDeviceStatus ? `${sendMessageDeviceLabel} - ${sendMessageDeviceStatus}` : sendMessageDeviceLabel}>
-                          <Devices aria-hidden="true" />
-                          <LoopspaceGraphNodeDeviceDot
-                            aria-hidden="true"
-                            data-status={sendMessageDeviceStatus || "offline"}
-                          />
-                          <span>{sendMessageDeviceLabel}</span>
-                        </LoopspaceGraphNodeDeviceBadge>
+                        <LoopspaceSendMessageDeviceSelect
+                          busy={busy}
+                          canvasPan={canvasPan}
+                          canvasZoom={canvasZoom}
+                          nodeLabel={node.label}
+                          onSelect={(key) => void updateSendMessageDeviceSelection(node, key)}
+                          options={loopspaceGraphDeviceOptions}
+                          selectedKey={sendMessageDeviceId}
+                        />
                       ) : null}
                       {node.nodeKind === "run_script" ? (
                         <LoopspaceGraphNodeDeviceBadge title={runScriptDeviceStatus ? `${runScriptDeviceLabel} - ${runScriptDeviceStatus}` : runScriptDeviceLabel}>
@@ -6911,72 +7746,257 @@ function LoopspaceRuntimeView({
                           <span>{runScriptDeviceLabel}</span>
                         </LoopspaceGraphNodeDeviceBadge>
                       ) : null}
+                      {isDocumentContextNode ? (
+                        <LoopspaceDocumentContextPicker
+                          busy={busy}
+                          mode={isDocumentWriteNode ? "write" : "read"}
+                          onRefsChange={(refs) => void updateDocumentContextNodeRefs(node, refs)}
+                          options={loopspaceGraphDocumentOptions}
+                          refs={nodeDocumentRefs}
+                          search={nodeDocumentSearch}
+                          setSearch={(value) => setDocumentContextSearchByNode((current) => ({
+                            ...current,
+                            [node.id]: value,
+                          }))}
+                        />
+                      ) : null}
                     </LoopspaceGraphNodeText>
                     {node.nodeKind === "send_message" ? (
-                      <LoopspaceGraphMessageRegion>
-                        <LoopspaceGraphMessageControls>
-                          <LoopspaceGraphMessagePrompt
-                            as="select"
-                            aria-label={`Target device for ${node.label}`}
-                            disabled={busy}
-                            onChange={(event) => {
-                              event.stopPropagation();
-                              void updateSendMessageDeviceSelection(node, event.target.value);
-                            }}
-                            onPointerDown={(event) => event.stopPropagation()}
-                            value={sendMessageDeviceId}
-                          >
-                            <option value="">Select device…</option>
-                            {loopspaceGraphDeviceOptions.map((device) => (
-                              <option key={device.id} value={device.id}>
-                                {device.label}{device.status ? ` · ${device.status}` : ""}
-                              </option>
-                            ))}
-                          </LoopspaceGraphMessagePrompt>
-                          <LoopspaceGraphMessagePrompt
-                            aria-label={`Prompt for ${node.label}`}
-                            defaultValue={sendMessagePrompt}
-                            disabled={busy}
-                            key={`${node.id}:${sendMessagePrompt}`}
-                            onBlur={(event) => {
-                              if (event.target.value !== sendMessagePrompt) {
-                                void updateSendMessagePrompt(node, event.target.value);
-                              }
-                            }}
-                            onPointerDown={(event) => event.stopPropagation()}
-                            placeholder="Message the terminal orchestrator…"
-                          />
-                        </LoopspaceGraphMessageControls>
-                        <LoopspaceGraphMessageCheckpointList aria-label="Message checkpoints">
-                          {sendMessageCheckpoints.length ? sendMessageCheckpoints.map((checkpoint, checkpointIndex) => (
-                            <LoopspaceGraphMessageCheckpoint
-                              key={checkpoint.id}
-                              onPointerDown={(event) => startSendMessageCheckpointDrag(event, node, checkpoint, checkpointIndex)}
-                              style={{
-                                "--checkpoint-x": `${Math.max(8, Math.min(
-                                  Math.max(8, nodeLayout.width - 220),
-                                  loopspaceGraphFiniteNumber(loopspaceGraphPropValue(checkpoint.props, ["x"]), 18 + (checkpointIndex * 34)),
-                                ))}px`,
-                                "--checkpoint-y": `${Math.max(8, Math.min(
-                                  Math.max(8, nodeLayout.height - 190),
-                                  loopspaceGraphFiniteNumber(loopspaceGraphPropValue(checkpoint.props, ["y"]), 18 + (checkpointIndex * 42)),
-                                ))}px`,
-                              }}
-                              title={checkpoint.label}
+                      <>
+                        <LoopspaceGraphMessageSettingsButton
+                          aria-label={`${sendMessageSettingsOpen ? "Close" : "Open"} send message settings`}
+                          data-open={sendMessageSettingsOpen ? "true" : undefined}
+                          disabled={busy}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            if (sendMessageSettingsOpen) {
+                              setSendMessageSettingsNodeId("");
+                              return;
+                            }
+                            setSendMessageSettingsDrafts((current) => ({
+                              ...current,
+                              [node.id]: sendMessageNodeDraft,
+                            }));
+                            setSendMessageSettingsNodeId(node.id);
+                          }}
+                          onPointerDown={(event) => event.stopPropagation()}
+                          title="Send message settings"
+                          type="button"
+                        >
+                          <ButtonSettingsIcon aria-hidden="true" />
+                        </LoopspaceGraphMessageSettingsButton>
+                        <LoopspaceGraphMessageRegion data-open={sendMessageSettingsOpen ? "true" : undefined}>
+                          {sendMessageSettingsOpen ? (
+                            <LoopspaceGraphMessageSettingsPanel
+                              onPointerDown={(event) => event.stopPropagation()}
+                              onWheel={(event) => event.stopPropagation()}
                             >
-                              {checkpoint.label}
-                            </LoopspaceGraphMessageCheckpoint>
-                          )) : (
-                            <LoopspaceGraphMessageCheckpoint
-                              style={{
-                                "--checkpoint-x": "18px",
-                                "--checkpoint-y": "18px",
-                              }}
-                            >
-                              Checkpoints appear here
-                            </LoopspaceGraphMessageCheckpoint>
+                              <LoopspaceGraphMessageSettingsHeader>
+                                <strong>Message settings</strong>
+                                <span>Prompt and document subnodes</span>
+                              </LoopspaceGraphMessageSettingsHeader>
+                              <LoopspaceGraphMessageSettingsSection>
+                                <strong>Agent</strong>
+                                <span>Terminal provider and launch preferences for this message.</span>
+                                <LoopspaceGraphMessageSettingsGrid>
+                                  <LoopspaceGraphMessageSettingsField>
+                                    <span>Agent</span>
+                                    <LoopspaceGraphMessageSettingsSelect
+                                      disabled={busy}
+                                      onChange={(event) => {
+                                        const targetAgentId = normalizeLoopspaceSendMessageAgentId(event.target.value);
+                                        const launchDefault = getAgentLaunchDefault(targetAgentId, agentLaunchDefaults);
+                                        updateSendMessageSettingsDraft(node.id, {
+                                          model: launchDefault.model,
+                                          reasoning_effort: launchDefault.effort,
+                                          speed: launchDefault.speed,
+                                          target_agent_id: targetAgentId,
+                                        });
+                                      }}
+                                      onPointerDown={(event) => event.stopPropagation()}
+                                      value={sendMessageDraft.target_agent_id}
+                                    >
+                                      {LOOPSPACE_SEND_MESSAGE_AGENT_OPTIONS.map((agent) => (
+                                        <option key={agent.id} value={agent.id}>{agent.label}</option>
+                                      ))}
+                                    </LoopspaceGraphMessageSettingsSelect>
+                                  </LoopspaceGraphMessageSettingsField>
+                                  <LoopspaceGraphMessageSettingsField>
+                                    <span>Model</span>
+                                    <LoopspaceGraphMessageSettingsSelect
+                                      disabled={busy}
+                                      onChange={(event) => {
+                                        const model = cleanAgentLaunchModelId(event.target.value, sendMessageDraft.model);
+                                        const resolved = resolveAgentLaunchDefaultForModel(
+                                          sendMessageDraft.target_agent_id,
+                                          agentLaunchDefaults,
+                                          model,
+                                        );
+                                        updateSendMessageSettingsDraft(node.id, {
+                                          model: resolved.model,
+                                          reasoning_effort: resolved.effort,
+                                          speed: resolved.speed,
+                                        });
+                                      }}
+                                      onPointerDown={(event) => event.stopPropagation()}
+                                      value={sendMessageDraft.model}
+                                    >
+                                      {!sendMessageModelOptionValues.has(sendMessageDraft.model) ? (
+                                        <option value={sendMessageDraft.model}>{sendMessageDraft.model}</option>
+                                      ) : null}
+                                      {sendMessageModelOptions.map((modelOption) => (
+                                        <option key={modelOption.value} value={modelOption.value}>{modelOption.label}</option>
+                                      ))}
+                                    </LoopspaceGraphMessageSettingsSelect>
+                                  </LoopspaceGraphMessageSettingsField>
+                                  <LoopspaceGraphMessageSettingsField>
+                                    <span>Thinking</span>
+                                    <LoopspaceGraphMessageSettingsSelect
+                                      disabled={busy}
+                                      onChange={(event) => updateSendMessageSettingsDraft(node.id, {
+                                        reasoning_effort: event.target.value,
+                                      })}
+                                      onPointerDown={(event) => event.stopPropagation()}
+                                      value={sendMessageDraft.reasoning_effort}
+                                    >
+                                      {sendMessageEffortOptions.map((effortOption) => (
+                                        <option key={effortOption.value} value={effortOption.value}>{effortOption.label}</option>
+                                      ))}
+                                    </LoopspaceGraphMessageSettingsSelect>
+                                  </LoopspaceGraphMessageSettingsField>
+                                  <LoopspaceGraphMessageSettingsField>
+                                    <span>Speed</span>
+                                    <LoopspaceGraphMessageSettingsSelect
+                                      disabled={busy || sendMessageSpeedOptions.length <= 1}
+                                      onChange={(event) => updateSendMessageSettingsDraft(node.id, {
+                                        speed: event.target.value,
+                                      })}
+                                      onPointerDown={(event) => event.stopPropagation()}
+                                      value={sendMessageDraft.speed}
+                                    >
+                                      {sendMessageSpeedOptions.map((speedOption) => (
+                                        <option key={speedOption.value} value={speedOption.value}>{speedOption.label}</option>
+                                      ))}
+                                    </LoopspaceGraphMessageSettingsSelect>
+                                  </LoopspaceGraphMessageSettingsField>
+                                </LoopspaceGraphMessageSettingsGrid>
+                              </LoopspaceGraphMessageSettingsSection>
+                              <LoopspaceGraphMessageSettingsSection data-grow="true">
+                                <strong>Prompt</strong>
+                                <span>Guidance sent to the selected device agent.</span>
+                                <LoopspaceGraphMessagePrompt
+                                  aria-label={`Prompt for ${node.label}`}
+                                  disabled={busy}
+                                  onChange={(event) => updateSendMessageSettingsDraft(node.id, {
+                                    prompt: event.target.value,
+                                  })}
+                                  onPointerDown={(event) => event.stopPropagation()}
+                                  placeholder="Optional prompt. Leave empty to send the default loop message."
+                                  value={sendMessageDraftPrompt}
+                                />
+                              </LoopspaceGraphMessageSettingsSection>
+                              <LoopspaceGraphMessageSettingsSection>
+                                <strong>Subnodes</strong>
+                                <span>Add document context nodes for the message prompt.</span>
+                                <LoopspaceGraphMessageSubnodeToolbar>
+                                  <LoopspaceGraphMessageSubnodeButton
+                                    disabled={busy}
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void addSendMessageDocumentSubnode(node, "document_read");
+                                    }}
+                                    type="button"
+                                  >
+                                    + Read docs
+                                  </LoopspaceGraphMessageSubnodeButton>
+                                  <LoopspaceGraphMessageSubnodeButton
+                                    disabled={busy}
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void addSendMessageDocumentSubnode(node, "document_write");
+                                    }}
+                                    type="button"
+                                  >
+                                    + Write docs
+                                  </LoopspaceGraphMessageSubnodeButton>
+                                </LoopspaceGraphMessageSubnodeToolbar>
+                                <LoopspaceGraphMessageSubnodeList aria-label="Message subnodes">
+                                  {sendMessageCheckpoints.length ? sendMessageCheckpoints.map((checkpoint) => {
+                                    const checkpointIsDocument = checkpoint.nodeKind === "document_read" || checkpoint.nodeKind === "document_write";
+                                    const checkpointMode = checkpoint.nodeKind === "document_write" ? "write" : "read";
+                                    return (
+                                      <LoopspaceGraphMessageSubnodeItem
+                                        data-mode={checkpointMode}
+                                        key={checkpoint.id}
+                                      >
+                                        <LoopspaceGraphNodeText>
+                                          <strong>{checkpoint.nodeKind === "document_write" ? "Document write" : checkpoint.nodeKind === "document_read" ? "Document read" : checkpoint.label}</strong>
+                                          <span>{checkpointIsDocument ? (checkpointMode === "write" ? "Writable docs" : "Readable docs") : "Message subnode"}</span>
+                                        </LoopspaceGraphNodeText>
+                                        <button
+                                          aria-label={`Remove ${checkpoint.label || "subnode"}`}
+                                          disabled={busy}
+                                          onClick={(event) => {
+                                            event.stopPropagation();
+                                            void detachGraphNodeFromLoop(checkpoint);
+                                          }}
+                                          type="button"
+                                        >
+                                          <ButtonCloseIcon aria-hidden="true" />
+                                        </button>
+                                        {checkpointIsDocument ? (
+                                          <LoopspaceDocumentContextPicker
+                                            busy={busy}
+                                            mode={checkpointMode}
+                                            onRefsChange={(refs) => void updateDocumentContextNodeRefs(checkpoint, refs)}
+                                            options={loopspaceGraphDocumentOptions}
+                                            refs={loopspaceGraphDocumentRefsFromProps(checkpoint.props)}
+                                            search={String(documentContextSearchByNode[checkpoint.id] || "")}
+                                            setSearch={(value) => setDocumentContextSearchByNode((current) => ({
+                                              ...current,
+                                              [checkpoint.id]: value,
+                                            }))}
+                                          />
+                                        ) : null}
+                                      </LoopspaceGraphMessageSubnodeItem>
+                                    );
+                                  }) : (
+                                    <LoopspaceGraphMessageSubnodeItem data-empty="true">
+                                      <LoopspaceGraphNodeText>
+                                        <strong>No subnodes yet</strong>
+                                        <span>Add read/write docs for this message.</span>
+                                      </LoopspaceGraphNodeText>
+                                    </LoopspaceGraphMessageSubnodeItem>
+                                  )}
+                                </LoopspaceGraphMessageSubnodeList>
+                              </LoopspaceGraphMessageSettingsSection>
+                              <LoopspaceGraphMessageSettingsActions>
+                                <LoopspaceGraphMessageSaveButton
+                                  disabled={busy}
+                                  onClick={(event) => {
+                                    event.stopPropagation();
+                                    void saveSendMessageSettings(node, sendMessageDraft);
+                                  }}
+                                  type="button"
+                                >
+                                  Save
+                                </LoopspaceGraphMessageSaveButton>
+                              </LoopspaceGraphMessageSettingsActions>
+                            </LoopspaceGraphMessageSettingsPanel>
+                          ) : (
+                            <LoopspaceGraphMessageSummary>
+                              <strong>{sendMessagePrompt.trim() ? "Custom prompt" : "Default loop prompt"}</strong>
+                              <span>
+                                {[
+                                  `${sendMessageAgentLabel} / ${sendMessageModelLabel}`,
+                                  sendMessageDocumentCount
+                                    ? `${sendMessageDocumentCount} document context ${sendMessageDocumentCount === 1 ? "node" : "nodes"}`
+                                    : "Open settings to edit prompt and docs",
+                                ].filter(Boolean).join(" - ")}
+                              </span>
+                            </LoopspaceGraphMessageSummary>
                           )}
-                        </LoopspaceGraphMessageCheckpointList>
+                        </LoopspaceGraphMessageRegion>
                         <LoopspaceGraphMessageResize
                           aria-label={`Resize ${node.label}`}
                           disabled={busy}
@@ -6984,7 +8004,7 @@ function LoopspaceRuntimeView({
                           title="Resize send message region"
                           type="button"
                         />
-                      </LoopspaceGraphMessageRegion>
+                      </>
                     ) : null}
                     {canRemoveNode ? (
                       <LoopspaceGraphNodeAction
@@ -7037,6 +8057,8 @@ function LoopspaceRuntimeView({
                     ? Terminal
                     : node.nodeKind === "send_message"
                       ? AdsClick
+                      : node.nodeKind === "document_read" || node.nodeKind === "document_write"
+                        ? AccountTree
                       : AccountTree;
                 return (
                   <LoopspaceGraphNode
@@ -7054,7 +8076,7 @@ function LoopspaceRuntimeView({
                     </LoopspaceGraphNodeIcon>
                     <LoopspaceGraphNodeText>
                       <strong>{node.label || "Drop node"}</strong>
-                      <span>{node.nodeKind === "device" ? "Device" : node.nodeKind === "run_script" ? "Run script" : "Pending drop"}</span>
+                      <span>{node.nodeKind === "device" ? "Device" : node.nodeKind === "run_script" ? "Run script" : node.nodeKind === "document_read" || node.nodeKind === "document_write" ? "Document context" : "Pending drop"}</span>
                     </LoopspaceGraphNodeText>
                   </LoopspaceGraphNode>
                 );
@@ -7094,158 +8116,6 @@ function LoopspaceRuntimeView({
                 <ButtonRefreshIcon aria-hidden="true" />
               </LoopspaceGraphControlButton>
             </LoopspaceGraphControls>
-            <LoopspaceRuntimePanel
-              data-collapsed={runtimePanelExpanded ? undefined : "true"}
-              data-loopspace-graph-no-drop="true"
-              onPointerDown={(event) => event.stopPropagation()}
-              onWheel={(event) => event.stopPropagation()}
-            >
-              <LoopspaceRuntimePanelHeader>
-                <LoopspaceRuntimePanelTabs aria-label="Loop runtime panel" role="tablist">
-                  {[
-                    ["runtime", "Runtime"],
-                    ["nodes", "Nodes"],
-                    ["logs", "Logs"],
-                  ].map(([tabId, label]) => (
-                    <LoopspaceRuntimePanelTab
-                      data-active={runtimePanelTab === tabId ? "true" : undefined}
-                      key={tabId}
-                      onClick={() => {
-                        setRuntimePanelTab(tabId);
-                        setRuntimePanelExpanded(true);
-                      }}
-                      role="tab"
-                      type="button"
-                    >
-                      {label}
-                    </LoopspaceRuntimePanelTab>
-                  ))}
-                </LoopspaceRuntimePanelTabs>
-                <LoopspaceRuntimePanelToggle
-                  aria-label={runtimePanelExpanded ? "Minimize loop panel" : "Maximize loop panel"}
-                  data-collapsed={runtimePanelExpanded ? undefined : "true"}
-                  onClick={() => setRuntimePanelExpanded((value) => !value)}
-                  title={runtimePanelExpanded ? "Minimize" : "Maximize"}
-                  type="button"
-                >
-                  <KeyboardArrowDown aria-hidden="true" />
-                </LoopspaceRuntimePanelToggle>
-              </LoopspaceRuntimePanelHeader>
-              {runtimePanelExpanded ? (
-                <LoopspaceRuntimePanelBody data-tab={runtimePanelTab}>
-                  {runtimePanelTab === "runtime" ? (
-                    runtimeHead ? (
-                      <LoopspaceRuntimePanelEventList>
-                        <LoopspaceRuntimePanelEventRow data-tone={loopspaceRuntimeStatusTone(runtimeHeadStatus)}>
-                          <span>{formatLoopspaceRuntimeTime(runtimeHead?.updatedAtMs || runtimeHead?.updated_at_ms || runtimeHead?.createdAtMs || runtimeHead?.created_at_ms) || "now"}</span>
-                          <strong>{runtimeHeadStatus || "active"}</strong>
-                          <em>{runtimeHeadNodeId || runtimeHeadRunId || "Loop runtime"}</em>
-                          <LoopspaceRuntimePanelResumeButton disabled title="Resume runtime checkpoint is not available yet." type="button">
-                            Resume
-                          </LoopspaceRuntimePanelResumeButton>
-                        </LoopspaceRuntimePanelEventRow>
-                        {currentRuntimeSegments.map((segment, index) => {
-                          const segmentId = loopspaceRuntimeField(segment, ["segment_id", "segmentId"], `segment-${index + 1}`);
-                          const segmentHash = loopspaceRuntimeField(segment, ["content_hash", "contentHash"]);
-                          const segmentRunId = loopspaceRuntimeField(segment, ["run_id", "runId"]);
-                          return (
-                            <LoopspaceRuntimePanelEventRow data-tone="neutral" key={`${segmentId}-${index}`}>
-                              <span>{formatLoopspaceRuntimeTime(segment?.createdAtMs || segment?.created_at_ms) || "segment"}</span>
-                              <strong>{segmentId}</strong>
-                              <em>{[segmentRunId, segmentHash ? `hash ${segmentHash.slice(0, 10)}` : ""].filter(Boolean).join(" - ") || "Runtime log segment"}</em>
-                            </LoopspaceRuntimePanelEventRow>
-                          );
-                        })}
-                      </LoopspaceRuntimePanelEventList>
-                    ) : (
-                      <LoopspaceRuntimePanelEmpty>
-                        <strong>No active run</strong>
-                        <span>The next trigger execution will stream its current state here.</span>
-                      </LoopspaceRuntimePanelEmpty>
-                    )
-                  ) : runtimePanelTab === "nodes" ? (
-                    <LoopspaceRuntimePanelGrid>
-                      {runtimePanelNodeTemplates.map((template) => {
-                        const PaletteIcon = template.id === "device"
-                          ? Devices
-                          : template.id === "run_script"
-                            ? Terminal
-                            : template.id === "send_message"
-                              ? AdsClick
-                              : AccountTree;
-                        const templateKey = template.id === "device"
-                          ? `${template.id}:${template.device_id}`
-                          : template.id;
-                        return (
-                          <LoopspaceRuntimePanelNodeCard
-                            data-kind={template.id}
-                            key={templateKey}
-                            onPointerDown={(event) => startGraphTemplatePointerDrag(event, template, templateKey)}
-                            title={`Drag ${template.label} into the graph`}
-                          >
-                            <LoopspaceGraphPaletteIcon>
-                              <PaletteIcon aria-hidden="true" />
-                            </LoopspaceGraphPaletteIcon>
-                            <LoopspaceGraphPaletteText>
-                              <strong>{template.label}</strong>
-                              <span>{template.description}</span>
-                            </LoopspaceGraphPaletteText>
-                          </LoopspaceRuntimePanelNodeCard>
-                        );
-                      })}
-                    </LoopspaceRuntimePanelGrid>
-                  ) : (
-                    sortedRuntimeLogs.length ? (
-                      <LoopspaceRuntimePanelDetail>
-                        <LoopspaceRuntimePanelEventList>
-                          {sortedRuntimeLogs.map((run) => {
-                            const trigger = triggerById.get(run.triggerId);
-                            const type = run.type || trigger?.type || "manual";
-                            const status = run.status || "run";
-                            return (
-                              <LoopspaceRuntimePanelEventRow
-                                data-clickable="true"
-                                data-selected={selectedHistoryRun?.id === run.id ? "true" : undefined}
-                                data-tone={loopspaceRuntimeStatusTone(status)}
-                                key={run.id}
-                                onKeyDown={(event) => {
-                                  if (event.key === "Enter" || event.key === " ") {
-                                    event.preventDefault();
-                                    setSelectedHistoryRunId(run.id);
-                                  }
-                                }}
-                                onClick={() => setSelectedHistoryRunId(run.id)}
-                                role="button"
-                                tabIndex={0}
-                              >
-                                <span>{formatLoopspaceRuntimeTime(run.createdAtMs) || "run"}</span>
-                                <strong>{trigger?.name || run.triggerId || "Trigger run"}</strong>
-                                <em>{[loopspaceTriggerTypeLabel(type), status, run.error].filter(Boolean).join(" - ")}</em>
-                              </LoopspaceRuntimePanelEventRow>
-                            );
-                          })}
-                        </LoopspaceRuntimePanelEventList>
-                        {selectedHistoryRun ? (
-                          <LoopspaceRuntimePanelDetail data-detail="true">
-                            <strong>{selectedHistoryRun.id}</strong>
-                            <span>{[
-                              `status ${selectedHistoryRun.status || "run"}`,
-                              selectedHistoryRun.completedAtMs ? `completed ${formatLoopspaceRuntimeTime(selectedHistoryRun.completedAtMs)}` : "",
-                              selectedHistoryRun.error,
-                            ].filter(Boolean).join(" - ")}</span>
-                          </LoopspaceRuntimePanelDetail>
-                        ) : null}
-                      </LoopspaceRuntimePanelDetail>
-                    ) : (
-                      <LoopspaceRuntimePanelEmpty>
-                        <strong>No run history</strong>
-                        <span>Completed trigger runs for this loop will stay here.</span>
-                      </LoopspaceRuntimePanelEmpty>
-                    )
-                  )}
-                </LoopspaceRuntimePanelBody>
-              ) : null}
-            </LoopspaceRuntimePanel>
             <LoopspaceGraphNavHud
               aria-label="Graph viewport"
               data-loopspace-graph-no-drop="true"
@@ -7268,6 +8138,212 @@ function LoopspaceRuntimeView({
               </LoopspaceGraphNavStats>
             </LoopspaceGraphNavHud>
           </LoopspaceGraphCanvas>
+          <LoopspaceRuntimePanelResizeHandle
+            aria-label="Resize loop runtime panel"
+            data-dragging={runtimePanelResizing ? "true" : undefined}
+            data-hidden={runtimePanelExpanded ? undefined : "true"}
+            onPointerCancel={finishRuntimePanelResize}
+            onPointerDown={startRuntimePanelResize}
+            onPointerMove={onRuntimePanelResizePointerMove}
+            onPointerUp={finishRuntimePanelResize}
+            role="separator"
+            tabIndex={runtimePanelExpanded ? 0 : -1}
+          />
+          <LoopspaceRuntimePanel
+            data-collapsed={runtimePanelExpanded ? undefined : "true"}
+            data-loopspace-graph-no-drop="true"
+            onPointerDown={(event) => event.stopPropagation()}
+            onWheel={(event) => event.stopPropagation()}
+          >
+            {runtimePanelExpanded ? (
+              <LoopspaceRuntimePanelHeader>
+                <LoopspaceRuntimePanelTabs aria-label="Loop runtime panel" role="tablist">
+                  {[
+                    ["runtime", "Runtime"],
+                    ["nodes", "Nodes"],
+                    ["logs", "Logs"],
+                  ].map(([tabId, label]) => (
+                    <LoopspaceRuntimePanelTab
+                      data-active={runtimePanelTab === tabId ? "true" : undefined}
+                      key={tabId}
+                      onClick={() => {
+                        setRuntimePanelTab(tabId);
+                        setRuntimePanelExpanded(true);
+                      }}
+                      role="tab"
+                      type="button"
+                    >
+                      {label}
+                    </LoopspaceRuntimePanelTab>
+                  ))}
+                </LoopspaceRuntimePanelTabs>
+                {runtimePanelTab === "nodes" ? null : (
+                  <LoopspaceRuntimePanelAutoScroll
+                    aria-pressed={runtimePanelAutoScroll}
+                    data-enabled={runtimePanelAutoScroll ? "true" : "false"}
+                    onClick={() => setRuntimePanelAutoScroll((value) => !value)}
+                    title={runtimePanelAutoScroll ? "Auto-scroll enabled" : "Auto-scroll disabled"}
+                    type="button"
+                  >
+                    Auto-scroll
+                  </LoopspaceRuntimePanelAutoScroll>
+                )}
+                <LoopspaceRuntimePanelToggle
+                  aria-label="Minimize loop panel"
+                  onClick={() => setRuntimePanelExpanded(false)}
+                  title="Minimize"
+                  type="button"
+                >
+                  <KeyboardArrowDown aria-hidden="true" />
+                </LoopspaceRuntimePanelToggle>
+              </LoopspaceRuntimePanelHeader>
+            ) : (
+              <LoopspaceRuntimePanelHeader
+                data-collapsed="true"
+                onClick={() => setRuntimePanelExpanded(true)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter" || event.key === " ") {
+                    event.preventDefault();
+                    setRuntimePanelExpanded(true);
+                  }
+                }}
+                role="button"
+                tabIndex={0}
+                title="Maximize runtime panel"
+              >
+                <span data-restore-label="true">Runtime panel</span>
+                <span data-restore-hint="true">Click to expand</span>
+                <LoopspaceRuntimePanelToggle
+                  aria-label="Maximize loop panel"
+                  data-collapsed="true"
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setRuntimePanelExpanded(true);
+                  }}
+                  title="Maximize"
+                  type="button"
+                >
+                  <KeyboardArrowDown aria-hidden="true" />
+                </LoopspaceRuntimePanelToggle>
+              </LoopspaceRuntimePanelHeader>
+            )}
+            {runtimePanelExpanded ? (
+              <LoopspaceRuntimePanelBody data-tab={runtimePanelTab} ref={runtimePanelBodyRef}>
+                {runtimePanelTab === "runtime" ? (
+                  runtimeHead ? (
+                    <LoopspaceRuntimePanelEventList>
+                      <LoopspaceRuntimePanelEventRow data-tone={loopspaceRuntimeStatusTone(runtimeHeadStatus)}>
+                        <span>{formatLoopspaceRuntimeTime(runtimeHead?.updatedAtMs || runtimeHead?.updated_at_ms || runtimeHead?.createdAtMs || runtimeHead?.created_at_ms) || "now"}</span>
+                        <strong>{runtimeHeadStatus || "active"}</strong>
+                        <em>{runtimeHeadNodeId || runtimeHeadRunId || "Loop runtime"}</em>
+                        <LoopspaceRuntimePanelResumeButton disabled title="Resume runtime checkpoint is not available yet." type="button">
+                          Resume
+                        </LoopspaceRuntimePanelResumeButton>
+                      </LoopspaceRuntimePanelEventRow>
+                      {currentRuntimeSegments.map((segment, index) => {
+                        const segmentId = loopspaceRuntimeField(segment, ["segment_id", "segmentId"], `segment-${index + 1}`);
+                        const segmentHash = loopspaceRuntimeField(segment, ["content_hash", "contentHash"]);
+                        const segmentRunId = loopspaceRuntimeField(segment, ["run_id", "runId"]);
+                        return (
+                          <LoopspaceRuntimePanelEventRow data-tone="neutral" key={`${segmentId}-${index}`}>
+                            <span>{formatLoopspaceRuntimeTime(segment?.createdAtMs || segment?.created_at_ms) || "segment"}</span>
+                            <strong>{segmentId}</strong>
+                            <em>{[segmentRunId, segmentHash ? `hash ${segmentHash.slice(0, 10)}` : ""].filter(Boolean).join(" - ") || "Runtime log segment"}</em>
+                          </LoopspaceRuntimePanelEventRow>
+                        );
+                      })}
+                    </LoopspaceRuntimePanelEventList>
+                  ) : (
+                    <LoopspaceRuntimePanelEmpty>
+                      <strong>No active run</strong>
+                      <span>The next trigger execution will stream its current state here.</span>
+                    </LoopspaceRuntimePanelEmpty>
+                  )
+                ) : runtimePanelTab === "nodes" ? (
+                  <LoopspaceRuntimePanelGrid>
+                    {runtimePanelNodeTemplates.map((template) => {
+                        const PaletteIcon = template.id === "device"
+                          ? Devices
+                          : template.id === "run_script"
+                            ? Terminal
+                            : template.id === "send_message"
+                              ? AdsClick
+                              : template.id === "document_read" || template.id === "document_write"
+                                ? AccountTree
+                              : AccountTree;
+                      const templateKey = template.id === "device"
+                        ? `${template.id}:${template.device_id}`
+                        : template.id;
+                      return (
+                        <LoopspaceRuntimePanelNodeCard
+                          data-kind={template.id}
+                          key={templateKey}
+                          onPointerDown={(event) => startGraphTemplatePointerDrag(event, template, templateKey)}
+                          title={`Drag ${template.label} into the graph`}
+                        >
+                          <LoopspaceGraphPaletteIcon>
+                            <PaletteIcon aria-hidden="true" />
+                          </LoopspaceGraphPaletteIcon>
+                          <LoopspaceGraphPaletteText>
+                            <strong>{template.label}</strong>
+                            <span>{template.description}</span>
+                          </LoopspaceGraphPaletteText>
+                        </LoopspaceRuntimePanelNodeCard>
+                      );
+                    })}
+                  </LoopspaceRuntimePanelGrid>
+                ) : (
+                  sortedRuntimeLogs.length ? (
+                    <LoopspaceRuntimePanelDetail>
+                      <LoopspaceRuntimePanelEventList>
+                        {sortedRuntimeLogs.map((run) => {
+                          const trigger = triggerById.get(run.triggerId);
+                          const type = run.type || trigger?.type || "manual";
+                          const status = run.status || "run";
+                          return (
+                            <LoopspaceRuntimePanelEventRow
+                              data-clickable="true"
+                              data-selected={selectedHistoryRun?.id === run.id ? "true" : undefined}
+                              data-tone={loopspaceRuntimeStatusTone(status)}
+                              key={run.id}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter" || event.key === " ") {
+                                  event.preventDefault();
+                                  setSelectedHistoryRunId(run.id);
+                                }
+                              }}
+                              onClick={() => setSelectedHistoryRunId(run.id)}
+                              role="button"
+                              tabIndex={0}
+                            >
+                              <span>{formatLoopspaceRuntimeTime(run.createdAtMs) || "run"}</span>
+                              <strong>{trigger?.name || run.triggerId || "Trigger run"}</strong>
+                              <em>{[loopspaceTriggerTypeLabel(type), status, run.error].filter(Boolean).join(" - ")}</em>
+                            </LoopspaceRuntimePanelEventRow>
+                          );
+                        })}
+                      </LoopspaceRuntimePanelEventList>
+                      {selectedHistoryRun ? (
+                        <LoopspaceRuntimePanelDetail data-detail="true">
+                          <strong>{selectedHistoryRun.id}</strong>
+                          <span>{[
+                            `status ${selectedHistoryRun.status || "run"}`,
+                            selectedHistoryRun.completedAtMs ? `completed ${formatLoopspaceRuntimeTime(selectedHistoryRun.completedAtMs)}` : "",
+                            selectedHistoryRun.error,
+                          ].filter(Boolean).join(" - ")}</span>
+                        </LoopspaceRuntimePanelDetail>
+                      ) : null}
+                    </LoopspaceRuntimePanelDetail>
+                  ) : (
+                    <LoopspaceRuntimePanelEmpty>
+                      <strong>No run history</strong>
+                      <span>Completed trigger runs for this loop will stay here.</span>
+                    </LoopspaceRuntimePanelEmpty>
+                  )
+                )}
+              </LoopspaceRuntimePanelBody>
+            ) : null}
+          </LoopspaceRuntimePanel>
       </LoopspaceRuntimeStage>
       {runtimeStatus && <LoopspaceRuntimeError>{runtimeStatus}</LoopspaceRuntimeError>}
     </LoopspaceRuntimeSurface>
@@ -27917,6 +28993,19 @@ export default function App() {
               || event.payload?.targetAgentId
               || "",
           );
+          const requestedModel = remoteCommandStringField(event, ["model", "model_id", "modelId"]);
+          const requestedReasoningEffort = remoteCommandStringField(event, [
+            "reasoning_effort",
+            "reasoningEffort",
+            "effort",
+            "thinking_power",
+            "thinkingPower",
+          ]);
+          const requestedSpeed = remoteCommandStringField(event, [
+            "speed",
+            "service_tier",
+            "serviceTier",
+          ]);
           let targetTerminalId = remoteCommandStringField(event, [
             "target_terminal_id",
             "targetTerminalId",
@@ -28150,6 +29239,13 @@ export default function App() {
                   todoId,
                   todoDeviceId,
                   todoWorkspaceId,
+                  ...(requestedModel ? { model: requestedModel, model_id: requestedModel, modelId: requestedModel } : {}),
+                  ...(requestedReasoningEffort ? {
+                    effort: requestedReasoningEffort,
+                    reasoning_effort: requestedReasoningEffort,
+                    reasoningEffort: requestedReasoningEffort,
+                  } : {}),
+                  ...(requestedSpeed ? { speed: requestedSpeed } : {}),
                   targetTerminalId,
                   targetTerminalIndex,
                   targetTerminalName,
@@ -28160,6 +29256,13 @@ export default function App() {
                 source: "next-remote-control",
                 targetAgentId: agentId || "",
                 targetAgentLabel: agentId ? getManagedAgentLabel(agentId) : "",
+                ...(requestedModel ? { model: requestedModel, modelId: requestedModel } : {}),
+                ...(requestedReasoningEffort ? {
+                  effort: requestedReasoningEffort,
+                  reasoning_effort: requestedReasoningEffort,
+                  reasoningEffort: requestedReasoningEffort,
+                } : {}),
+                ...(requestedSpeed ? { speed: requestedSpeed } : {}),
                 ...(targetTerminalColor ? { targetTerminalColor } : {}),
                 ...(Number.isInteger(targetColorSlot) ? { targetColorSlot } : {}),
                 targetTerminalId,
@@ -35284,6 +36387,17 @@ export default function App() {
                         <span>Audio</span>
                       </RailActionButton>
                       <RailActionButton
+                        aria-label="Editor"
+                        data-active={activeView === "editor"}
+                        data-scope="global"
+                        onClick={() => showView("editor")}
+                        title="Editor"
+                        type="button"
+                      >
+                        <ButtonEditorIcon aria-hidden="true" />
+                        <span>Editor</span>
+                      </RailActionButton>
+                      <RailActionButton
                         aria-label="Tokenomics"
                         data-active={activeView === "tokenomics"}
                         data-scope="global"
@@ -36936,6 +38050,10 @@ export default function App() {
                     permissionAttentionId={snippingPermissionAttentionId}
                     captureAttention={snippingCaptureAttention}
                   />
+                </ForgeWorkspace>
+              ) : visibleView === "editor" ? (
+                <ForgeWorkspace aria-label="Editor" data-motion={viewMotion}>
+                  <EditorWorkspaceView defaultWorkingDirectory={defaultWorkingDirectory} />
                 </ForgeWorkspace>
               ) : visibleView === "audio" ? (
                 <ForgeWorkspace aria-label="Workspace audio" data-motion={viewMotion}>

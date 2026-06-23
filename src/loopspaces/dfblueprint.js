@@ -376,11 +376,36 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
         device_id: deviceId,
         device_label: deviceLabel,
         display: "region",
-        h: "360",
+        h: "260",
+        model: safeText(template?.model),
         prompt: "",
+        reasoning_effort: safeText(template?.reasoning_effort || template?.effort),
+        speed: safeText(template?.speed),
+        target_agent_id: safeText(template?.target_agent_id || template?.agent_id, "codex"),
         target_terminal_id: safeText(template?.target_terminal_id),
         target_terminal_name: safeText(template?.target_terminal_name),
-        w: "620",
+        w: "680",
+      },
+    };
+  }
+  if (templateId === "document_read" || templateId === "document_write") {
+    const mode = templateId === "document_read" ? "read" : "write";
+    const label = safeText(template?.label, mode === "read" ? "Document read" : "Document write");
+    return {
+      id: `${templateId}-${suffix}`,
+      icon: safeText(template?.icon, "document"),
+      label,
+      mode,
+      nodeKind: templateId,
+      kind: templateId,
+      role: safeText(template?.role, "context"),
+      triggerId: "",
+      hasPosition: Boolean(position),
+      x: position ? Math.round(Number(position.x) || 0) : 0,
+      y: position ? Math.round(Number(position.y) || 0) : 0,
+      props: {
+        doc_refs: safeText(template?.doc_refs || template?.documents || template?.path_key),
+        mode,
       },
     };
   }
@@ -494,7 +519,9 @@ export function updateDfBlueprintNodeProps(source, nodeId, patch = {}) {
         ...(patch.props || {}),
       },
     };
-    if (Object.prototype.hasOwnProperty.call(patch, "x") || Object.prototype.hasOwnProperty.call(patch, "y")) {
+    if (Object.prototype.hasOwnProperty.call(patch, "hasPosition")) {
+      next.hasPosition = Boolean(patch.hasPosition);
+    } else if (Object.prototype.hasOwnProperty.call(patch, "x") || Object.prototype.hasOwnProperty.call(patch, "y")) {
       next.hasPosition = true;
     }
     return next;
@@ -520,6 +547,7 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         script_id: op.script_id,
         script_name: op.script_name,
         shell: op.shell,
+        doc_refs: op.doc_refs || op.documents,
       }, op.position || { x: op.x, y: op.y });
       if (op.id) node.id = sanitizeDfBlueprintId(op.id, node.id);
       const existingIndex = ast.nodes.findIndex((item) => item.id === node.id);
