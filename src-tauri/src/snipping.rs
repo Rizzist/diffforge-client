@@ -43,6 +43,8 @@ const SNIPPING_STARTUP_PREWARM_ENABLED: bool = false;
 const SNIPPING_WARM_CAPTURE_ENABLED: bool = false;
 const SNIPPING_RECORDING_TARGET_FPS: u32 = 60;
 const SNIPPING_RECORDING_FALLBACK_FPS: u32 = 30;
+const SNIPPING_RECORDING_MAX_OUTPUT_PIXELS: u64 = 1920 * 1080;
+const SNIPPING_RECORDING_TIMESTAMP_NS_PER_SECOND: u64 = 1_000_000_000;
 const SNIPPING_WARM_CAPTURE_FRAME_MAX_AGE_MS: u64 = 750;
 const SNIPPING_WARM_CAPTURE_RESTART_MIN_MS: u64 = 2_000;
 const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
@@ -4154,6 +4156,7 @@ fn snipping_recording_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
     bitrate.clamp(2_000_000, 40_000_000) as u32
 }
 
+#[cfg(test)]
 fn snipping_recording_system_time_ms(value: SystemTime) -> Option<u64> {
     value
         .duration_since(UNIX_EPOCH)
@@ -4161,6 +4164,14 @@ fn snipping_recording_system_time_ms(value: SystemTime) -> Option<u64> {
         .and_then(|duration| u64::try_from(duration.as_millis()).ok())
 }
 
+fn snipping_recording_system_time_ns(value: SystemTime) -> Option<u64> {
+    value
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| u64::try_from(duration.as_nanos()).ok())
+}
+
+#[cfg(test)]
 fn snipping_recording_frame_pts_ms(
     frame_epoch_ms: u64,
     first_frame_epoch_ms: &mut Option<u64>,
@@ -4249,6 +4260,7 @@ fn snipping_bt709_full_v(red: i32, green: i32, blue: i32) -> u8 {
     )
 }
 
+#[cfg(test)]
 fn snipping_bgra_to_i420(
     bgra: &[u8],
     width: u32,
@@ -4317,6 +4329,139 @@ fn snipping_bgra_to_i420(
     }
 
     Ok(())
+}
+
+struct SnippingRecordingScaler {
+    source_width: usize,
+    source_height: usize,
+    output_width: usize,
+    output_height: usize,
+    x_map: Vec<usize>,
+    y_map: Vec<usize>,
+}
+
+impl SnippingRecordingScaler {
+    fn new(
+        source_width: u32,
+        source_height: u32,
+        output_width: u32,
+        output_height: u32,
+    ) -> Result<Self, String> {
+        if source_width == 0
+            || source_height == 0
+            || output_width == 0
+            || output_height == 0
+            || output_width % 2 != 0
+            || output_height % 2 != 0
+        {
+            return Err("Screen recording frame dimensions must be non-zero and even.".to_string());
+        }
+        let source_width_usize = usize::try_from(source_width)
+            .map_err(|_| "Screen recording source width is too large.".to_string())?;
+        let source_height_usize = usize::try_from(source_height)
+            .map_err(|_| "Screen recording source height is too large.".to_string())?;
+        let output_width_usize = usize::try_from(output_width)
+            .map_err(|_| "Screen recording output width is too large.".to_string())?;
+        let output_height_usize = usize::try_from(output_height)
+            .map_err(|_| "Screen recording output height is too large.".to_string())?;
+
+        Ok(Self {
+            source_width: source_width_usize,
+            source_height: source_height_usize,
+            output_width: output_width_usize,
+            output_height: output_height_usize,
+            x_map: snipping_recording_scaled_axis_map(source_width, output_width)?,
+            y_map: snipping_recording_scaled_axis_map(source_height, output_height)?,
+        })
+    }
+
+    fn write_i420(&self, bgra: &[u8], yuv: &mut Vec<u8>) -> Result<(), String> {
+        let source_stride = self
+            .source_width
+            .checked_mul(4)
+            .ok_or_else(|| "Screen recording source frame is too large.".to_string())?;
+        let expected_bgra_len = self
+            .source_height
+            .checked_mul(source_stride)
+            .ok_or_else(|| "Screen recording source frame is too large.".to_string())?;
+        if bgra.len() < expected_bgra_len {
+            return Err("Screen recording frame returned incomplete pixel data.".to_string());
+        }
+
+        let pixels = self
+            .output_width
+            .checked_mul(self.output_height)
+            .ok_or_else(|| "Screen recording output frame is too large.".to_string())?;
+        let uv_len = pixels / 4;
+        let yuv_len = pixels
+            .checked_add(uv_len)
+            .and_then(|value| value.checked_add(uv_len))
+            .ok_or_else(|| "Screen recording output frame is too large.".to_string())?;
+        yuv.resize(yuv_len, 0);
+        let (y_plane, uv_plane) = yuv.split_at_mut(pixels);
+        let (u_plane, v_plane) = uv_plane.split_at_mut(uv_len);
+
+        for output_y in (0..self.output_height).step_by(2) {
+            for output_x in (0..self.output_width).step_by(2) {
+                let mut blue_sum = 0_i32;
+                let mut green_sum = 0_i32;
+                let mut red_sum = 0_i32;
+                for y_offset in 0..2 {
+                    let y_index = output_y + y_offset;
+                    let source_y = self.y_map[y_index];
+                    for x_offset in 0..2 {
+                        let x_index = output_x + x_offset;
+                        let source_x = self.x_map[x_index];
+                        let pixel_offset = source_y
+                            .checked_mul(source_stride)
+                            .and_then(|row| row.checked_add(source_x.checked_mul(4)?))
+                            .ok_or_else(|| {
+                                "Screen recording source pixel offset is too large.".to_string()
+                            })?;
+                        let blue = i32::from(bgra[pixel_offset]);
+                        let green = i32::from(bgra[pixel_offset + 1]);
+                        let red = i32::from(bgra[pixel_offset + 2]);
+                        y_plane[y_index * self.output_width + x_index] =
+                            snipping_bt709_full_y(red, green, blue);
+                        blue_sum += blue;
+                        green_sum += green;
+                        red_sum += red;
+                    }
+                }
+                let blue = (blue_sum + 2) / 4;
+                let green = (green_sum + 2) / 4;
+                let red = (red_sum + 2) / 4;
+                let uv_index = (output_y / 2) * (self.output_width / 2) + (output_x / 2);
+                u_plane[uv_index] = snipping_bt709_full_u(red, green, blue);
+                v_plane[uv_index] = snipping_bt709_full_v(red, green, blue);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn snipping_recording_scaled_axis_map(source: u32, output: u32) -> Result<Vec<usize>, String> {
+    if source == 0 || output == 0 {
+        return Err("Screen recording scale dimensions must be non-zero.".to_string());
+    }
+    let source_max = u128::from(source.saturating_sub(1));
+    let denominator = u128::from(output).saturating_mul(2);
+    let mut map = Vec::with_capacity(
+        usize::try_from(output)
+            .map_err(|_| "Screen recording output dimension is too large.".to_string())?,
+    );
+    for output_index in 0..output {
+        let numerator = u128::from(output_index)
+            .saturating_mul(2)
+            .saturating_add(1)
+            .saturating_mul(u128::from(source));
+        let source_index = (numerator / denominator).min(source_max);
+        map.push(
+            usize::try_from(source_index)
+                .map_err(|_| "Screen recording source dimension is too large.".to_string())?,
+        );
+    }
+    Ok(map)
 }
 
 #[derive(Default)]
@@ -4641,10 +4786,19 @@ fn snipping_validate_recording_webm(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn snipping_recording_webm_timestamp_ns(pts_ms: u64) -> Result<u64, String> {
-    pts_ms
-        .checked_mul(1_000_000)
-        .ok_or_else(|| "Screen recording timestamp is too large.".to_string())
+fn snipping_recording_frame_index_for_elapsed_ns(elapsed_ns: u64, fps: u32) -> u64 {
+    let fps = u128::from(fps.max(1));
+    let index = u128::from(elapsed_ns).saturating_mul(fps)
+        / u128::from(SNIPPING_RECORDING_TIMESTAMP_NS_PER_SECOND);
+    u64::try_from(index).unwrap_or(u64::MAX)
+}
+
+fn snipping_recording_frame_index_timestamp_ns(frame_index: u64, fps: u32) -> Result<u64, String> {
+    let fps = u128::from(fps.max(1));
+    let timestamp = u128::from(frame_index)
+        .saturating_mul(u128::from(SNIPPING_RECORDING_TIMESTAMP_NS_PER_SECOND))
+        / fps;
+    u64::try_from(timestamp).map_err(|_| "Screen recording timestamp is too large.".to_string())
 }
 
 fn snipping_recording_vp9_config(
@@ -4691,24 +4845,65 @@ fn snipping_write_pending_vp9_frames(
     encoder: &mut shiguredo_libvpx::Encoder,
     segment: &mut webm::mux::Segment<std::io::BufWriter<fs::File>>,
     video_track: webm::mux::VideoTrack,
-    pending_pts_ms: &mut VecDeque<u64>,
+    pending_pts_ns: &mut VecDeque<u64>,
     sample_count: &mut u64,
 ) -> Result<(), String> {
     while let Some(frame) = encoder.next_frame() {
-        let pts_ms = pending_pts_ms
+        let pts_ns = pending_pts_ns
             .pop_front()
             .ok_or_else(|| "VP9 encoder returned an unexpected video frame.".to_string())?;
         segment
-            .add_frame(
-                video_track,
-                frame.data(),
-                snipping_recording_webm_timestamp_ns(pts_ms)?,
-                frame.is_keyframe(),
-            )
+            .add_frame(video_track, frame.data(), pts_ns, frame.is_keyframe())
             .map_err(|error| format!("Unable to write recording frame: {error:?}"))?;
         *sample_count = sample_count.saturating_add(1);
     }
     Ok(())
+}
+
+fn snipping_encode_recording_yuv_frame(
+    encoder: &mut shiguredo_libvpx::Encoder,
+    segment: &mut webm::mux::Segment<std::io::BufWriter<fs::File>>,
+    video_track: webm::mux::VideoTrack,
+    pending_pts_ns: &mut VecDeque<u64>,
+    sample_count: &mut u64,
+    yuv_frame: &[u8],
+    width: u32,
+    height: u32,
+    frame_index: u64,
+    fps: u32,
+) -> Result<(), String> {
+    let y_len = usize::try_from(width)
+        .ok()
+        .and_then(|frame_width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|frame_height| frame_width.checked_mul(frame_height))
+        })
+        .ok_or_else(|| "Screen recording frame is too large.".to_string())?;
+    let uv_len = y_len / 4;
+    let expected_len = y_len
+        .checked_add(uv_len)
+        .and_then(|value| value.checked_add(uv_len))
+        .ok_or_else(|| "Screen recording frame is too large.".to_string())?;
+    if yuv_frame.len() < expected_len {
+        return Err("Screen recording frame returned incomplete YUV data.".to_string());
+    }
+    let (y_plane, uv_plane) = yuv_frame.split_at(y_len);
+    let (u_plane, v_plane) = uv_plane.split_at(uv_len);
+    let image = shiguredo_libvpx::ImageData::I420 {
+        y: y_plane,
+        u: u_plane,
+        v: v_plane,
+    };
+    let force_keyframe = *sample_count == 0 && pending_pts_ns.is_empty();
+    pending_pts_ns.push_back(snipping_recording_frame_index_timestamp_ns(
+        frame_index,
+        fps,
+    )?);
+    encoder
+        .encode(&image, &shiguredo_libvpx::EncodeOptions { force_keyframe })
+        .map_err(|error| format!("Unable to encode recording frame: {error}"))?;
+    snipping_write_pending_vp9_frames(encoder, segment, video_track, pending_pts_ns, sample_count)
 }
 
 fn snipping_recording_active(app: &AppHandle) -> bool {
@@ -4986,6 +5181,16 @@ fn snipping_stop_recording_for(app: &AppHandle, reason: &str) -> Result<Value, S
     }))
 }
 
+fn snipping_recording_duration_ms(session: &SnippingRecordingSession) -> u64 {
+    let stopped_at_ms = session.stop_requested_at_ms.load(Ordering::Acquire);
+    let ended_at_ms = if stopped_at_ms > 0 {
+        stopped_at_ms
+    } else {
+        current_time_ms()
+    };
+    ended_at_ms.saturating_sub(session.started_at_ms)
+}
+
 fn snipping_recording_loop(
     app: AppHandle,
     session: SnippingRecordingSession,
@@ -4996,6 +5201,8 @@ fn snipping_recording_loop(
     source_height: u32,
     frame_x: u32,
     frame_y: u32,
+    frame_width: u32,
+    frame_height: u32,
     reason: String,
     shortcut: String,
 ) {
@@ -5011,6 +5218,8 @@ fn snipping_recording_loop(
             source_height,
             frame_x,
             frame_y,
+            frame_width,
+            frame_height,
             reason,
             shortcut,
         )
@@ -5086,6 +5295,8 @@ fn snipping_recording_loop_inner(
     source_height: u32,
     frame_x: u32,
     frame_y: u32,
+    frame_width: u32,
+    frame_height: u32,
     reason: String,
     shortcut: String,
 ) -> Result<(), String> {
@@ -5117,15 +5328,21 @@ fn snipping_recording_loop_inner(
             Err(error) => return Err(error),
         };
 
-    let encoder_config = snipping_recording_vp9_config(session.width, session.height, active_fps)?;
+    let recording_fps = SNIPPING_RECORDING_TARGET_FPS;
+    let encoder_config =
+        snipping_recording_vp9_config(session.width, session.height, recording_fps)?;
     log_terminal_status_event(
         "backend.snipping.recording.started",
         json!({
-            "fps": active_fps,
+            "fps": recording_fps,
+            "capture_fps": active_fps,
             "target_fps": SNIPPING_RECORDING_TARGET_FPS,
             "fallback_fps": SNIPPING_RECORDING_FALLBACK_FPS,
             "width": session.width,
             "height": session.height,
+            "source_width": frame_width,
+            "source_height": frame_height,
+            "max_output_pixels": SNIPPING_RECORDING_MAX_OUTPUT_PIXELS,
         }),
     );
     if active_fps != SNIPPING_RECORDING_TARGET_FPS {
@@ -5182,13 +5399,16 @@ fn snipping_recording_loop_inner(
         .set_matrix_coefficients(video_track, webm::mux::MatrixCoefficients::Bt709)
         .map_err(|error| format!("Unable to configure WebM matrix metadata: {error:?}"))?;
     let mut segment = builder.build();
+    let recording_scaler =
+        SnippingRecordingScaler::new(frame_width, frame_height, session.width, session.height)?;
 
     capturer.start_capture();
     let mut sample_count = 0_u64;
-    let mut first_frame_epoch_ms = None;
-    let mut last_frame_pts_ms = None;
-    let mut pending_vp9_pts_ms = VecDeque::new();
+    let mut first_frame_epoch_ns = None;
+    let mut next_output_frame_index = 0_u64;
+    let mut pending_vp9_pts_ns = VecDeque::new();
     let mut yuv_frame = Vec::new();
+    let mut last_yuv_frame = Vec::new();
     let write_result = (|| -> Result<(), String> {
         while !session.stop.load(Ordering::Acquire) {
             let next_frame = match capturer.get_next_frame() {
@@ -5230,13 +5450,13 @@ fn snipping_recording_loop_inner(
                                 capturer.start_capture();
                             }
                             Err(rebuild_error) => {
-                                if sample_count > 0 || !pending_vp9_pts_ms.is_empty() {
+                                if sample_count > 0 || !pending_vp9_pts_ns.is_empty() {
                                     log_terminal_status_event(
                                         "backend.snipping.recording.fallback_unavailable",
                                         json!({
                                             "fps": active_fps,
                                             "sample_count": sample_count,
-                                            "pending_frames": pending_vp9_pts_ms.len(),
+                                            "pending_frames": pending_vp9_pts_ns.len(),
                                             "error": rebuild_error,
                                         }),
                                     );
@@ -5247,13 +5467,13 @@ fn snipping_recording_loop_inner(
                         }
                         continue;
                     }
-                    if sample_count > 0 || !pending_vp9_pts_ms.is_empty() {
+                    if sample_count > 0 || !pending_vp9_pts_ns.is_empty() {
                         log_terminal_status_event(
                             "backend.snipping.recording.capture_ended",
                             json!({
                                 "fps": active_fps,
                                 "sample_count": sample_count,
-                                "pending_frames": pending_vp9_pts_ms.len(),
+                                "pending_frames": pending_vp9_pts_ns.len(),
                                 "error": error.to_string(),
                             }),
                         );
@@ -5264,81 +5484,106 @@ fn snipping_recording_loop_inner(
             };
             match next_frame {
                 scap::frame::Frame::Video(frame) => {
-                    let (bytes, frame_width, frame_height, display_time) =
+                    let (bytes, captured_frame_width, captured_frame_height, display_time) =
                         snipping_scap_video_frame_to_bgra_bytes(frame)?;
-                    let frame_epoch_ms = snipping_recording_system_time_ms(display_time)
-                        .unwrap_or_else(current_time_ms);
-                    let frame_pts_ms = snipping_recording_frame_pts_ms(
-                        frame_epoch_ms,
-                        &mut first_frame_epoch_ms,
-                        &mut last_frame_pts_ms,
-                    );
-                    let frame_bytes =
-                        if frame_width == session.width && frame_height == session.height {
-                            bytes
-                        } else if frame_width >= frame_x.saturating_add(session.width)
-                            && frame_height >= frame_y.saturating_add(session.height)
-                        {
-                            snipping_crop_bgra_bytes(
-                                &bytes,
-                                frame_width,
-                                frame_height,
-                                frame_x,
-                                frame_y,
-                                session.width,
-                                session.height,
-                            )
-                            .ok_or_else(|| "Unable to crop screen recording frame.".to_string())?
-                        } else if frame_width >= session.width && frame_height >= session.height {
-                            snipping_crop_bgra_bytes(
-                                &bytes,
-                                frame_width,
-                                frame_height,
-                                0,
-                                0,
-                                session.width,
-                                session.height,
-                            )
-                            .ok_or_else(|| "Unable to crop screen recording frame.".to_string())?
-                        } else {
-                            continue;
-                        };
-                    snipping_bgra_to_i420(
-                        &frame_bytes,
-                        session.width,
-                        session.height,
-                        &mut yuv_frame,
-                    )?;
-                    let y_len = usize::try_from(session.width)
-                        .ok()
-                        .and_then(|frame_width| {
-                            usize::try_from(session.height)
-                                .ok()
-                                .and_then(|frame_height| frame_width.checked_mul(frame_height))
-                        })
-                        .ok_or_else(|| "Screen recording frame is too large.".to_string())?;
-                    let uv_len = y_len / 4;
-                    let (y_plane, uv_plane) = yuv_frame.split_at(y_len);
-                    let (u_plane, v_plane) = uv_plane.split_at(uv_len);
-                    let image = shiguredo_libvpx::ImageData::I420 {
-                        y: y_plane,
-                        u: u_plane,
-                        v: v_plane,
+                    let frame_epoch_ns = snipping_recording_system_time_ns(display_time)
+                        .unwrap_or_else(|| current_time_ms().saturating_mul(1_000_000));
+                    let first_epoch_ns = *first_frame_epoch_ns.get_or_insert(frame_epoch_ns);
+                    let elapsed_ns = frame_epoch_ns.saturating_sub(first_epoch_ns);
+                    let mut target_frame_index =
+                        snipping_recording_frame_index_for_elapsed_ns(elapsed_ns, recording_fps);
+                    if target_frame_index < next_output_frame_index {
+                        target_frame_index = next_output_frame_index;
+                    }
+                    let frame_bytes = if captured_frame_width == frame_width
+                        && captured_frame_height == frame_height
+                    {
+                        bytes
+                    } else if captured_frame_width >= frame_x.saturating_add(frame_width)
+                        && captured_frame_height >= frame_y.saturating_add(frame_height)
+                    {
+                        snipping_crop_bgra_bytes(
+                            &bytes,
+                            captured_frame_width,
+                            captured_frame_height,
+                            frame_x,
+                            frame_y,
+                            frame_width,
+                            frame_height,
+                        )
+                        .ok_or_else(|| "Unable to crop screen recording frame.".to_string())?
+                    } else if captured_frame_width >= frame_width
+                        && captured_frame_height >= frame_height
+                    {
+                        snipping_crop_bgra_bytes(
+                            &bytes,
+                            captured_frame_width,
+                            captured_frame_height,
+                            0,
+                            0,
+                            frame_width,
+                            frame_height,
+                        )
+                        .ok_or_else(|| "Unable to crop screen recording frame.".to_string())?
+                    } else {
+                        continue;
                     };
-                    let force_keyframe = sample_count == 0 && pending_vp9_pts_ms.is_empty();
-                    pending_vp9_pts_ms.push_back(frame_pts_ms);
-                    encoder
-                        .encode(&image, &shiguredo_libvpx::EncodeOptions { force_keyframe })
-                        .map_err(|error| format!("Unable to encode recording frame: {error}"))?;
-                    snipping_write_pending_vp9_frames(
+                    recording_scaler.write_i420(&frame_bytes, &mut yuv_frame)?;
+                    while next_output_frame_index < target_frame_index {
+                        if last_yuv_frame.is_empty() {
+                            break;
+                        }
+                        snipping_encode_recording_yuv_frame(
+                            &mut encoder,
+                            &mut segment,
+                            video_track,
+                            &mut pending_vp9_pts_ns,
+                            &mut sample_count,
+                            &last_yuv_frame,
+                            session.width,
+                            session.height,
+                            next_output_frame_index,
+                            recording_fps,
+                        )?;
+                        next_output_frame_index = next_output_frame_index.saturating_add(1);
+                    }
+                    snipping_encode_recording_yuv_frame(
                         &mut encoder,
                         &mut segment,
                         video_track,
-                        &mut pending_vp9_pts_ms,
+                        &mut pending_vp9_pts_ns,
                         &mut sample_count,
+                        &yuv_frame,
+                        session.width,
+                        session.height,
+                        target_frame_index,
+                        recording_fps,
                     )?;
+                    next_output_frame_index = target_frame_index.saturating_add(1);
+                    std::mem::swap(&mut last_yuv_frame, &mut yuv_frame);
                 }
                 scap::frame::Frame::Audio(_) => {}
+            }
+        }
+        if !last_yuv_frame.is_empty() {
+            let final_frame_count = snipping_recording_frame_index_for_elapsed_ns(
+                snipping_recording_duration_ms(session).saturating_mul(1_000_000),
+                recording_fps,
+            );
+            while next_output_frame_index < final_frame_count {
+                snipping_encode_recording_yuv_frame(
+                    &mut encoder,
+                    &mut segment,
+                    video_track,
+                    &mut pending_vp9_pts_ns,
+                    &mut sample_count,
+                    &last_yuv_frame,
+                    session.width,
+                    session.height,
+                    next_output_frame_index,
+                    recording_fps,
+                )?;
+                next_output_frame_index = next_output_frame_index.saturating_add(1);
             }
         }
         encoder
@@ -5348,10 +5593,10 @@ fn snipping_recording_loop_inner(
             &mut encoder,
             &mut segment,
             video_track,
-            &mut pending_vp9_pts_ms,
+            &mut pending_vp9_pts_ns,
             &mut sample_count,
         )?;
-        if !pending_vp9_pts_ms.is_empty() {
+        if !pending_vp9_pts_ns.is_empty() {
             return Err("VP9 encoder finished with unwritten video frames.".to_string());
         }
         if sample_count == 0 {
@@ -5368,13 +5613,7 @@ fn snipping_recording_loop_inner(
         let _ = fs::remove_file(&session.tmp_path);
         return Err(error);
     }
-    let stopped_at_ms = session.stop_requested_at_ms.load(Ordering::Acquire);
-    let duration_ms = if stopped_at_ms > 0 {
-        stopped_at_ms
-    } else {
-        current_time_ms()
-    }
-    .saturating_sub(session.started_at_ms);
+    let duration_ms = snipping_recording_duration_ms(session);
     let writer = match segment.finalize(Some(duration_ms)) {
         Ok(writer) => writer,
         Err(writer) => {
@@ -5461,6 +5700,46 @@ fn snipping_even_recording_rect(
     (x, y, width, height)
 }
 
+fn snipping_even_recording_dimension(value: u32) -> u32 {
+    let value = value.max(1);
+    if value > 2 {
+        value - (value % 2)
+    } else {
+        value
+    }
+}
+
+fn snipping_recording_output_size(source_width: u32, source_height: u32) -> (u32, u32) {
+    let source_width = snipping_even_recording_dimension(source_width);
+    let source_height = snipping_even_recording_dimension(source_height);
+    let source_pixels = u64::from(source_width).saturating_mul(u64::from(source_height));
+    if source_pixels <= SNIPPING_RECORDING_MAX_OUTPUT_PIXELS {
+        return (source_width, source_height);
+    }
+
+    let scale = (SNIPPING_RECORDING_MAX_OUTPUT_PIXELS as f64 / source_pixels as f64).sqrt();
+    let mut output_width =
+        snipping_even_recording_dimension((f64::from(source_width) * scale).round() as u32);
+    let mut output_height =
+        snipping_even_recording_dimension((f64::from(source_height) * scale).round() as u32);
+    output_width = output_width.min(source_width).max(2);
+    output_height = output_height.min(source_height).max(2);
+
+    while u64::from(output_width).saturating_mul(u64::from(output_height))
+        > SNIPPING_RECORDING_MAX_OUTPUT_PIXELS
+    {
+        if output_width >= output_height && output_width > 2 {
+            output_width = output_width.saturating_sub(2);
+        } else if output_height > 2 {
+            output_height = output_height.saturating_sub(2);
+        } else {
+            break;
+        }
+    }
+
+    (output_width.max(2), output_height.max(2))
+}
+
 #[derive(Clone, Copy)]
 struct SnippingRecordingArea {
     source_x: u32,
@@ -5471,6 +5750,8 @@ struct SnippingRecordingArea {
     frame_y: u32,
     frame_width: u32,
     frame_height: u32,
+    output_width: u32,
+    output_height: u32,
 }
 
 fn snipping_recording_capture_scale(monitor: &SnippingAreaMonitor) -> f64 {
@@ -5505,6 +5786,7 @@ fn snipping_recording_area_from_selection(
     let frame_height = ((f64::from(source_height) * scale).round() as u32).max(1);
     let (_, _, frame_width, frame_height) =
         snipping_even_recording_rect(u32::MAX, u32::MAX, 0, 0, frame_width, frame_height);
+    let (output_width, output_height) = snipping_recording_output_size(frame_width, frame_height);
 
     SnippingRecordingArea {
         source_x,
@@ -5515,6 +5797,8 @@ fn snipping_recording_area_from_selection(
         frame_y,
         frame_width,
         frame_height,
+        output_width,
+        output_height,
     }
 }
 
@@ -5544,6 +5828,7 @@ fn snipping_recording_area_from_selection(
         selection_width,
         selection_height,
     );
+    let (output_width, output_height) = snipping_recording_output_size(width, height);
     SnippingRecordingArea {
         source_x: x,
         source_y: y,
@@ -5553,6 +5838,8 @@ fn snipping_recording_area_from_selection(
         frame_y: y,
         frame_width: width,
         frame_height: height,
+        output_width,
+        output_height,
     }
 }
 
@@ -5601,8 +5888,8 @@ fn snipping_start_area_recording_for(
         target_path,
         tmp_path,
         started_at_ms: current_time_ms(),
-        width: recording_area.frame_width,
-        height: recording_area.frame_height,
+        width: recording_area.output_width,
+        height: recording_area.output_height,
     };
     {
         let state = app.state::<SnippingState>().recording.clone();
@@ -5641,6 +5928,8 @@ fn snipping_start_area_recording_for(
             recording_area.source_height,
             recording_area.frame_x,
             recording_area.frame_y,
+            recording_area.frame_width,
+            recording_area.frame_height,
             "area-recording".to_string(),
             String::new(),
         );
@@ -5653,8 +5942,10 @@ fn snipping_start_area_recording_for(
         "localPath": session.target_path.display().to_string(),
         "started_at_ms": session.started_at_ms,
         "startedAtMs": session.started_at_ms,
-        "width": recording_area.frame_width,
-        "height": recording_area.frame_height,
+        "width": recording_area.output_width,
+        "height": recording_area.output_height,
+        "source_width": recording_area.frame_width,
+        "source_height": recording_area.frame_height,
     }))
 }
 
@@ -11897,6 +12188,67 @@ mod snipping_recording_webm_tests {
     }
 
     #[test]
+    fn recording_output_size_scales_large_regions_to_1080p_pixel_budget() {
+        assert_eq!(snipping_recording_output_size(800, 600), (800, 600));
+
+        let (width, height) = snipping_recording_output_size(2484, 1616);
+
+        assert_eq!(width % 2, 0);
+        assert_eq!(height % 2, 0);
+        assert!(width < 2484);
+        assert!(height < 1616);
+        assert!(
+            u64::from(width).saturating_mul(u64::from(height))
+                <= SNIPPING_RECORDING_MAX_OUTPUT_PIXELS
+        );
+        let source_aspect = 2484.0 / 1616.0;
+        let output_aspect = f64::from(width) / f64::from(height);
+        assert!((source_aspect - output_aspect).abs() < 0.01);
+    }
+
+    #[test]
+    fn recording_scaler_writes_i420_at_output_size() {
+        let mut bgra = solid_bgra(0, 0, 0, 16);
+        let mut set_pixel = |x: usize, y: usize, red: u8, green: u8, blue: u8| {
+            let offset = (y * 4 + x) * 4;
+            bgra[offset..offset + 4].copy_from_slice(&[blue, green, red, 255]);
+        };
+        set_pixel(1, 1, 255, 0, 0);
+        set_pixel(3, 1, 0, 255, 0);
+        set_pixel(1, 3, 0, 0, 255);
+        set_pixel(3, 3, 255, 255, 255);
+
+        let scaler = SnippingRecordingScaler::new(4, 4, 2, 2).unwrap();
+        let mut yuv = Vec::new();
+        scaler.write_i420(&bgra, &mut yuv).unwrap();
+
+        assert_eq!(
+            &yuv[..4],
+            &[
+                snipping_bt709_full_y(255, 0, 0),
+                snipping_bt709_full_y(0, 255, 0),
+                snipping_bt709_full_y(0, 0, 255),
+                snipping_bt709_full_y(255, 255, 255),
+            ]
+        );
+        assert_eq!(yuv[4], 128);
+        assert_eq!(yuv[5], 128);
+    }
+
+    #[test]
+    fn recording_frame_index_uses_sixty_fps_timestamps() {
+        assert_eq!(snipping_recording_frame_index_for_elapsed_ns(0, 60), 0);
+        assert_eq!(
+            snipping_recording_frame_index_timestamp_ns(1, 60).unwrap(),
+            16_666_666
+        );
+        assert_eq!(
+            snipping_recording_frame_index_for_elapsed_ns(150_000_000, 60),
+            9
+        );
+    }
+
+    #[test]
     fn recording_webm_validation_rejects_header_only_file() {
         let bytes = recording_marker_blob(false);
         let path = write_test_recording("empty-recording", &bytes);
@@ -11937,7 +12289,7 @@ mod snipping_recording_webm_tests {
             snipping_recording_vp9_config(16, 16, SNIPPING_RECORDING_FALLBACK_FPS).unwrap(),
         )
         .unwrap();
-        let mut pending_pts_ms = VecDeque::new();
+        let mut pending_pts_ns = VecDeque::new();
         let mut sample_count = 0_u64;
         let mut yuv = Vec::new();
 
@@ -11946,7 +12298,7 @@ mod snipping_recording_webm_tests {
             snipping_bgra_to_i420(&bgra, 16, 16, &mut yuv).unwrap();
             let (y_plane, uv_plane) = yuv.split_at(16 * 16);
             let (u_plane, v_plane) = uv_plane.split_at((16 * 16) / 4);
-            pending_pts_ms.push_back((index as u64).saturating_mul(33));
+            pending_pts_ns.push_back((index as u64).saturating_mul(33_000_000));
             encoder
                 .encode(
                     &shiguredo_libvpx::ImageData::I420 {
@@ -11963,7 +12315,7 @@ mod snipping_recording_webm_tests {
                 &mut encoder,
                 &mut segment,
                 video_track,
-                &mut pending_pts_ms,
+                &mut pending_pts_ns,
                 &mut sample_count,
             )
             .unwrap();
@@ -11974,11 +12326,11 @@ mod snipping_recording_webm_tests {
             &mut encoder,
             &mut segment,
             video_track,
-            &mut pending_pts_ms,
+            &mut pending_pts_ns,
             &mut sample_count,
         )
         .unwrap();
-        assert!(pending_pts_ms.is_empty());
+        assert!(pending_pts_ns.is_empty());
         assert!(sample_count > 0);
 
         let writer = match segment.finalize(Some(66)) {

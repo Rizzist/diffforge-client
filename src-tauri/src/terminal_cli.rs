@@ -3533,7 +3533,15 @@ fn terminal_env_vars_with_opencode_tui_config(
     env_vars: &[(String, String)],
 ) -> Result<Vec<(String, String)>, String> {
     let mut next = env_vars.to_vec();
-    if !provider_id.trim().to_ascii_lowercase().contains("opencode") {
+    let normalized_provider = provider_id.trim().to_ascii_lowercase();
+    set_terminal_env_var(&mut next, "DIFFFORGE_MANAGED_AGENT_TERMINAL", "1");
+    if normalized_provider.contains("claude") {
+        set_terminal_env_var(&mut next, "DISABLE_AUTOUPDATER", "1");
+    }
+    if normalized_provider.contains("codex") {
+        set_terminal_env_var(&mut next, "DIFFFORGE_CODEX_UPDATE_CHECK_DISABLED", "1");
+    }
+    if !normalized_provider.contains("opencode") {
         return Ok(next);
     }
 

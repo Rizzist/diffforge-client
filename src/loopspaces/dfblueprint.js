@@ -1,3 +1,10 @@
+import {
+  loopspaceGraphVisualDefaultsForNode,
+  validateLoopspaceGraphAst,
+  validateLoopspaceGraphAstForUpdate,
+  validateLoopspaceGraphEdgeCandidate,
+} from "./graphContract.js";
+
 export const DFBLUEPRINT_SOURCE_FORMAT = "dfblueprint.v1";
 export const DFBLUEPRINT_CANONICAL_FORMAT = "diffforge.dfblueprint.v1";
 
@@ -304,6 +311,17 @@ export function normalizeDfBlueprintSource(source = "", options = {}) {
   return serializeDfBlueprint(ast);
 }
 
+export function validateDfBlueprintSource(source = "", options = {}) {
+  return validateLoopspaceGraphAst(parseDfBlueprintSource(source), options);
+}
+
+export function validateDfBlueprintSourceForUpdate(source = "", previousSource = "") {
+  return validateLoopspaceGraphAstForUpdate(
+    parseDfBlueprintSource(source),
+    parseDfBlueprintSource(previousSource),
+  );
+}
+
 export function createDfBlueprintNodeFromTemplate(template, position = null) {
   const templateId = sanitizeDfBlueprintId(template?.id || template?.node_kind || "node", "node").replace(/-/g, "_");
   const deviceId = safeText(template?.device_id);
@@ -336,6 +354,7 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
     const pathKey = safeText(template?.path_key);
     const scriptName = safeText(template?.script_name || template?.label, scriptId || pathKey || "Script");
     const deviceLabel = safeText(template?.device_label);
+    const visualDefaults = loopspaceGraphVisualDefaultsForNode("run_script");
     return {
       id: `${templateId}-${sanitizeDfBlueprintId(scriptId || pathKey || "script", "script")}-${suffix}`,
       icon: safeText(template?.icon, "terminal"),
@@ -351,17 +370,18 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       props: {
         device_id: deviceId,
         device_label: deviceLabel,
-        h: "132",
+        h: safeText(template?.h || template?.height, String(visualDefaults.height || 132)),
         path_key: pathKey,
         script_id: scriptId || pathKey,
         script_name: scriptName,
         shell: safeText(template?.shell),
-        w: "360",
+        w: safeText(template?.w || template?.width, String(visualDefaults.width || 360)),
       },
     };
   }
   if (templateId === "send_message") {
     const deviceLabel = safeText(template?.device_label);
+    const visualDefaults = loopspaceGraphVisualDefaultsForNode("send_message");
     return {
       id: `${templateId}-${suffix}`,
       icon: safeText(template?.icon, "message"),
@@ -378,7 +398,7 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
         device_id: deviceId,
         device_label: deviceLabel,
         display: "region",
-        h: "260",
+        h: safeText(template?.h || template?.height, String(visualDefaults.height || 260)),
         model: safeText(template?.model),
         prompt: "",
         reasoning_effort: safeText(template?.reasoning_effort || template?.effort),
@@ -386,7 +406,7 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
         target_agent_id: safeText(template?.target_agent_id || template?.agent_id, "codex"),
         target_terminal_id: safeText(template?.target_terminal_id),
         target_terminal_name: safeText(template?.target_terminal_name),
-        w: "680",
+        w: safeText(template?.w || template?.width, String(visualDefaults.width || 680)),
       },
     };
   }
@@ -408,6 +428,28 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       props: {
         doc_refs: safeText(template?.doc_refs || template?.documents || template?.path_key),
         mode,
+      },
+    };
+  }
+  if (templateId === "checkpoint" || templateId === "message_step" || templateId === "step" || templateId === "substep" || templateId === "todo") {
+    const label = safeText(template?.label || template?.title || template?.name, "Step");
+    return {
+      id: `${templateId}-${suffix}`,
+      icon: safeText(template?.icon, "node"),
+      label,
+      mode: "",
+      nodeKind: "step",
+      kind: "step",
+      role: safeText(template?.role, "checkpoint"),
+      triggerId: "",
+      hasPosition: Boolean(position),
+      x: position ? Math.round(Number(position.x) || 0) : 0,
+      y: position ? Math.round(Number(position.y) || 0) : 0,
+      props: {
+        description: safeText(template?.description || template?.desc || template?.details),
+        order: safeText(template?.order || template?.index),
+        parent_id: safeText(template?.parent_id || template?.parentId || template?.parent),
+        status: safeText(template?.status, "pending"),
       },
     };
   }
@@ -485,6 +527,19 @@ export function connectDfBlueprintNodes(source, fromNode, toNode, options = {}) 
   const ast = parseDfBlueprintSource(source);
   const fromPort = safeText(options.fromPort || options.from_port, "out");
   const toPort = safeText(options.toPort || options.to_port, "in");
+  const fromGraphNode = ast.nodes.find((node) => node.id === from)
+    || (fromNode && typeof fromNode === "object" ? fromNode : null);
+  const toGraphNode = ast.nodes.find((node) => node.id === to)
+    || (toNode && typeof toNode === "object" ? toNode : null);
+  const validation = validateLoopspaceGraphEdgeCandidate(fromGraphNode, toGraphNode, {
+    from,
+    fromPort,
+    to,
+    toPort,
+  });
+  if (!validation.ok) {
+    return serializeDfBlueprint(ast);
+  }
   const branch = safeText(options.branch || fromPort);
   const label = safeText(options.label, branch ? branch.toUpperCase() : "NEXT");
   if (ast.edges.some((edge) => (
@@ -549,7 +604,11 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         script_id: op.script_id,
         script_name: op.script_name,
         shell: op.shell,
+        description: op.description || op.desc || op.details,
         doc_refs: op.doc_refs || op.documents,
+        order: op.order || op.index,
+        parent_id: op.parent_id || op.parentId || op.parent,
+        status: op.status,
       }, op.position || { x: op.x, y: op.y });
       if (op.id) node.id = sanitizeDfBlueprintId(op.id, node.id);
       const existingIndex = ast.nodes.findIndex((item) => item.id === node.id);
@@ -587,9 +646,24 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
     } else if (action === "connect") {
       const from = safeText(op.from || op.from_id);
       const to = safeText(op.to || op.to_id);
-      const fromPort = safeText(op.from_port);
-      const toPort = safeText(op.to_port);
+      const fromPort = safeText(op.from_port || op.fromPort, "out");
+      const toPort = safeText(op.to_port || op.toPort, "in");
       const branch = safeText(op.branch || fromPort);
+      const validation = validateLoopspaceGraphEdgeCandidate(
+        ast.nodes.find((node) => node.id === from),
+        ast.nodes.find((node) => node.id === to),
+        {
+          from,
+          fromPort,
+          to,
+          toPort,
+        },
+      );
+      if (!validation.ok) {
+        const error = new Error(validation.error || "Invalid Loopspace graph connection.");
+        error.code = "loopspace_graph_contract_invalid";
+        throw error;
+      }
       if (from && to && from !== to && fromPort && toPort && !ast.edges.some((edge) => (
         edge.from === from
         && edge.to === to

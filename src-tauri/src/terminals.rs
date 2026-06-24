@@ -234,6 +234,11 @@ fn terminal_append_provider_launch_args(
     args: &mut Vec<String>,
     launch: &TerminalProviderResolvedLaunchOptions,
 ) {
+    if matches!(provider, AgentProvider::Codex) {
+        args.push("-c".to_string());
+        args.push("check_for_update_on_startup=false".to_string());
+    }
+
     if let Some(model) = launch.model.as_ref() {
         args.push("--model".to_string());
         args.push(model.clone());
@@ -5933,11 +5938,11 @@ async fn terminal_start_agent(
     let provider = parse_agent_provider(&provider)?;
     let definition = agent_definition(provider);
     let mut args = Vec::new();
-
-    if let Some(model) = normalize_forge_model(model)? {
-        args.push("--model".to_string());
-        args.push(model);
-    }
+    let launch = TerminalProviderResolvedLaunchOptions {
+        model: normalize_forge_model(model)?,
+        ..Default::default()
+    };
+    terminal_append_provider_launch_args(provider, &mut args, &launch);
 
     let command_candidates = agent_command_candidates(definition);
     let command_path = command_candidates
@@ -6762,6 +6767,7 @@ fn terminal_observe_input_gate_submitted_prompt(
     gate: &mut TerminalInputGate,
     data: &str,
 ) -> Option<String> {
+    const SHIFT_ENTER_MARKER: char = '\u{e000}';
     let mut submitted = None;
 
     if data == TERMINAL_SHIFT_ENTER_SEQUENCE {
@@ -6772,8 +6778,12 @@ fn terminal_observe_input_gate_submitted_prompt(
 
     let normalized_data;
     let data =
-        if data.contains(TERMINAL_ENTER_SEQUENCE) || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1) {
+        if data.contains(TERMINAL_SHIFT_ENTER_SEQUENCE)
+            || data.contains(TERMINAL_ENTER_SEQUENCE)
+            || data.contains(TERMINAL_ENTER_SEQUENCE_MOD1)
+        {
             normalized_data = data
+                .replace(TERMINAL_SHIFT_ENTER_SEQUENCE, &SHIFT_ENTER_MARKER.to_string())
                 .replace(TERMINAL_ENTER_SEQUENCE_MOD1, "\r")
                 .replace(TERMINAL_ENTER_SEQUENCE, "\r");
             normalized_data.as_str()
@@ -6882,6 +6892,10 @@ fn terminal_observe_input_gate_submitted_prompt(
         }
 
         match character {
+            SHIFT_ENTER_MARKER => {
+                terminal_input_gate_insert_char(gate, '\n');
+                gate.current_line_user_touched = true;
+            }
             '\r' | '\n' => {
                 let prompt = gate.current_line.trim().to_string();
                 gate.current_line.clear();
@@ -13998,6 +14012,20 @@ mod terminal_tests {
     }
 
     #[test]
+    fn codex_launch_args_disable_startup_update_checks() {
+        let mut args = Vec::new();
+        terminal_append_provider_launch_args(
+            AgentProvider::Codex,
+            &mut args,
+            &TerminalProviderResolvedLaunchOptions::default(),
+        );
+
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "-c" && pair[1] == "check_for_update_on_startup=false"
+        }));
+    }
+
+    #[test]
     fn transcript_path_session_fallback_extracts_uuid() {
         let session_id = "550e8400-e29b-41d4-a716-446655440000";
         let event = json!({
@@ -14936,6 +14964,23 @@ mod terminal_tests {
         assert_eq!(
             terminal_observe_input_gate_submitted_prompt(&mut gate, "\r"),
             Some("hey there".to_string())
+        );
+    }
+
+    #[test]
+    fn embedded_shift_enter_sequence_preserves_multiline_prompt_sync() {
+        let mut gate = TerminalInputGate::default();
+
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(
+                &mut gate,
+                &format!("\x15first line{TERMINAL_SHIFT_ENTER_SEQUENCE}second line"),
+            ),
+            None
+        );
+        assert_eq!(
+            terminal_observe_input_gate_submitted_prompt(&mut gate, "\r"),
+            Some("first line\nsecond line".to_string())
         );
     }
 
@@ -17075,10 +17120,33 @@ mod terminal_tests {
         )
         .unwrap();
 
-        assert_eq!(
-            env_vars,
-            vec![("COORDINATION_ENABLED".to_string(), "1".to_string())]
-        );
+        assert!(env_vars
+            .iter()
+            .any(|(key, value)| key == "COORDINATION_ENABLED" && value == "1"));
+        assert!(env_vars
+            .iter()
+            .any(|(key, value)| key == "DIFFFORGE_MANAGED_AGENT_TERMINAL" && value == "1"));
+        assert!(env_vars
+            .iter()
+            .any(|(key, value)| key == "DIFFFORGE_CODEX_UPDATE_CHECK_DISABLED" && value == "1"));
+        assert!(!env_vars
+            .iter()
+            .any(|(key, _)| key == OPENCODE_TUI_CONFIG_ENV));
+    }
+
+    #[test]
+    fn claude_launch_env_disables_background_autoupdater() {
+        let env_vars = terminal_env_vars_with_opencode_tui_config("claude", &[]).unwrap();
+
+        assert!(env_vars
+            .iter()
+            .any(|(key, value)| key == "DIFFFORGE_MANAGED_AGENT_TERMINAL" && value == "1"));
+        assert!(env_vars
+            .iter()
+            .any(|(key, value)| key == "DISABLE_AUTOUPDATER" && value == "1"));
+        assert!(!env_vars
+            .iter()
+            .any(|(key, _)| key == OPENCODE_TUI_CONFIG_ENV));
     }
 
     #[cfg(windows)]

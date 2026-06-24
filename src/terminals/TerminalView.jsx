@@ -90,6 +90,7 @@ import {
   getThreadTerminalGroundTruth,
 } from "../threads/threadTerminalGroundTruth.js";
 import {
+  createWorkspaceThreadId,
   getWorkspaceThreadProviderBinding,
 } from "../threads/workspaceThreads";
 import GitWorkspaceView from "../git/GitWorkspaceView.jsx";
@@ -152,6 +153,7 @@ import {
   TERMINAL_ACTIVITY_HOOK_EVENT,
   TERMINAL_PARKED_PROMPT_EVENT,
   TERMINAL_SHIFT_ENTER_SEQUENCE,
+  WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT,
   WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT,
 } from "./WorkspaceTerminal/terminalCore.js";
 import {
@@ -237,10 +239,14 @@ const terminalBreakoutActivityCache = new Map();
 const terminalBreakoutActivityRequests = new Map();
 const TODO_QUEUE_CONSUME_TIMEOUT_MS = 45000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS = 10 * 60 * 1000;
+const TODO_QUEUE_CONFIRMED_PROMPT_TIMEOUT_MS = 3 * 60 * 60 * 1000;
 const TODO_QUEUE_IN_FLIGHT_PROMPT_READY_GRACE_MS = 1000;
 const TODO_QUEUE_PROMPT_ACCEPT_GRACE_MS = 1200;
 const TODO_QUEUE_SUBMIT_RETRY_DELAYS_MS = [350, 900];
 const TODO_QUEUE_SUBMIT_SYNC_SETTLE_MS = 80;
+const APP_CONTROL_SEND_MESSAGE_ACCEPTANCE_TIMEOUT_MS = 70_000;
+const APP_CONTROL_SEND_MESSAGE_RECOVERY_DELAY_MS = 900;
+const APP_CONTROL_SEND_MESSAGE_MAX_RECOVERY_ATTEMPTS = 1;
 const TODO_QUEUE_RESUME_LOCK_STALE_MS = 30 * 60 * 1000;
 const TODO_QUEUE_PENDING_SPOKES = Array.from({ length: 8 }, (_, index) => index);
 const TODO_QUEUE_AGENT_ROLES = new Set(["codex", "claude", "opencode"]);
@@ -298,6 +304,7 @@ const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
 const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 const APP_CONTROL_TERMINAL_FOCUS_EVENT = "forge-app-control-terminal-focus";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
+const REMOTE_APP_CONTROL_SEND_MESSAGE_EVENT = "diffforge:remote-app-control-send-message";
 const TODO_HISTORY_CONTROL_EVENT = "diffforge:todo-history-control";
 const TODO_HISTORY_CONTROL_RESULT_EVENT = "diffforge:todo-history-control-result";
 const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
@@ -2762,6 +2769,7 @@ const APP_CONTROL_AGENT_WORKSPACE = Object.freeze({
   name: "App Control",
 });
 const APP_CONTROL_AGENT_PANE_ID = "forge-app-control-agent-terminal";
+const APP_CONTROL_AGENT_MAX_TERMINAL_COUNT = 4;
 const APP_CONTROL_AGENT_WORKSPACE_IDS = new Set([
   APP_CONTROL_AGENT_WORKSPACE.id,
   "diffforge_app_control",
@@ -2782,6 +2790,13 @@ function isAppControlAgentWorkspaceId(value) {
   return APP_CONTROL_AGENT_WORKSPACE_IDS.has(String(value || "").trim().toLowerCase());
 }
 
+function getAppControlAgentPaneId(terminalIndex) {
+  const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
+  return safeIndex === 0
+    ? APP_CONTROL_AGENT_PANE_ID
+    : `${APP_CONTROL_AGENT_PANE_ID}-${safeIndex}`;
+}
+
 function normalizeAppControlAgentRole(value) {
   const normalized = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
   if (normalized === "terminal" || normalized === "shell" || normalized === "plain-shell") {
@@ -2796,6 +2811,54 @@ function normalizeAppControlAgentRole(value) {
   return ["claude", "codex", "generic", "opencode"].includes(normalized)
     ? normalized
     : APP_CONTROL_AGENT_DEFAULT_ROLE;
+}
+
+function appControlRemoteDetailValue(detail = {}, keys = []) {
+  const event = detail?.event && typeof detail.event === "object" ? detail.event : {};
+  const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+  for (const key of keys) {
+    const value = detail?.[key] ?? event?.[key] ?? payload?.[key];
+    if (value === undefined || value === null) {
+      continue;
+    }
+    const text = String(value).trim();
+    if (text) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function appControlRemoteDetailString(detail = {}, keys = []) {
+  return String(appControlRemoteDetailValue(detail, keys) || "").trim();
+}
+
+function appControlRemoteDetailInteger(detail = {}, keys = []) {
+  const value = appControlRemoteDetailValue(detail, keys);
+  if (value === "" || value === null || value === undefined) {
+    return null;
+  }
+  const number = Number.parseInt(value, 10);
+  return Number.isInteger(number) ? number : null;
+}
+
+function appControlRemoteMessageText(detail = {}) {
+  return appControlRemoteDetailString(detail, [
+    "text",
+    "message",
+    "body",
+    "prompt",
+  ]);
+}
+
+function createAppControlAgentRetryPromptId(promptId, recoveryAttempt) {
+  const safePromptId = String(promptId || "app-control-send")
+    .trim()
+    .replace(/[^A-Za-z0-9_.:-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    || "app-control-send";
+  const safeAttempt = Math.max(1, Number.parseInt(recoveryAttempt, 10) || 1);
+  return `${safePromptId}-retry-${safeAttempt}-${Date.now().toString(36)}-${Math.random().toString(16).slice(2, 8)}`;
 }
 
 function getAppControlAgent(agentStatuses, role) {
@@ -2816,6 +2879,35 @@ function getAppControlAgent(agentStatuses, role) {
     installed: true,
     authenticated: true,
   };
+}
+
+function reorderAppControlAgentTerminalIndexes(indexes, terminalIndex, targetIndex) {
+  const currentIndexes = (Array.isArray(indexes) ? indexes : [])
+    .map((index) => Number.parseInt(index, 10))
+    .filter((index) => Number.isInteger(index));
+  const movingIndex = Number.parseInt(terminalIndex, 10);
+  const sourcePosition = currentIndexes.indexOf(movingIndex);
+  if (!Number.isInteger(movingIndex) || sourcePosition < 0) {
+    return currentIndexes;
+  }
+
+  const movingTerminalIndex = currentIndexes[sourcePosition];
+  const withoutMoving = currentIndexes.filter((index) => index !== movingTerminalIndex);
+  const rawTargetIndex = Math.max(
+    0,
+    Math.min(Number.parseInt(targetIndex, 10) || 0, currentIndexes.length),
+  );
+  const adjustedTargetIndex = sourcePosition < rawTargetIndex
+    ? rawTargetIndex - 1
+    : rawTargetIndex;
+  const nextTargetIndex = Math.max(0, Math.min(adjustedTargetIndex, withoutMoving.length));
+
+  if (nextTargetIndex === sourcePosition) {
+    return currentIndexes;
+  }
+
+  withoutMoving.splice(nextTargetIndex, 0, movingTerminalIndex);
+  return withoutMoving;
 }
 
 const TodoQueueSurface = styled.aside`
@@ -10027,6 +10119,40 @@ function normalizeTodoQueueSource(value) {
   return String(value || "").trim().slice(0, 80);
 }
 
+function normalizeRemoteCommandKind(value) {
+  return String(value || "")
+    .trim()
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "");
+}
+
+function getTodoQueueRemoteCommandObject(item) {
+  if (item?.remoteCommand && typeof item.remoteCommand === "object") {
+    return item.remoteCommand;
+  }
+  if (item?.remote_command && typeof item.remote_command === "object") {
+    return item.remote_command;
+  }
+  return {};
+}
+
+function isTerminalOrchestratorRemoteCommand(item) {
+  const remoteCommand = getTodoQueueRemoteCommandObject(item);
+  const commandKind = normalizeRemoteCommandKind(
+    remoteCommand.commandKind
+      || remoteCommand.command_kind
+      || remoteCommand.kind
+      || remoteCommand.type
+      || item?.commandKind
+      || item?.command_kind
+      || item?.command_kind_id
+      || "",
+  );
+  return commandKind === "terminal_orchestrator_send_message";
+}
+
 function normalizeTerminalCoordinationTarget(value) {
   const target = value && typeof value === "object" && !Array.isArray(value) ? value : null;
   if (!target) {
@@ -15427,6 +15553,24 @@ function createTodoQueueItemFromWorkspaceDispatch(item, workspaceId, hydratedTex
   const requestedModel = getTodoQueueRequestedModel(item);
   const requestedReasoningEffort = getTodoQueueRequestedReasoningEffort(item);
   const requestedSpeed = getTodoQueueRequestedSpeed(item);
+  const sourceRemoteCommand = item?.remoteCommand && typeof item.remoteCommand === "object"
+    ? item.remoteCommand
+    : item?.remote_command && typeof item.remote_command === "object"
+      ? item.remote_command
+      : {};
+  const commandKind = String(
+    item?.commandKind
+      || item?.command_kind
+      || sourceRemoteCommand.commandKind
+      || sourceRemoteCommand.command_kind
+      || "",
+  ).trim();
+  const loopRuntimeRunId = String(item?.loopRuntimeRunId || item?.loop_runtime_run_id || sourceRemoteCommand.loopRuntimeRunId || sourceRemoteCommand.loop_runtime_run_id || "").trim();
+  const loopRuntimeNodeId = String(item?.loopRuntimeNodeId || item?.loop_runtime_node_id || sourceRemoteCommand.loopRuntimeNodeId || sourceRemoteCommand.loop_runtime_node_id || "").trim();
+  const loopRuntimeEdgeId = String(item?.loopRuntimeEdgeId || item?.loop_runtime_edge_id || sourceRemoteCommand.loopRuntimeEdgeId || sourceRemoteCommand.loop_runtime_edge_id || "").trim();
+  const loopspaceId = String(item?.loopspaceId || item?.loopspace_id || sourceRemoteCommand.loopspaceId || sourceRemoteCommand.loopspace_id || "").trim();
+  const triggerId = String(item?.triggerId || item?.trigger_id || sourceRemoteCommand.triggerId || sourceRemoteCommand.trigger_id || "").trim();
+  const triggerRunId = String(item?.triggerRunId || item?.trigger_run_id || sourceRemoteCommand.triggerRunId || sourceRemoteCommand.trigger_run_id || "").trim();
   return normalizeTodoQueueItem({
     createdAt: item?.createdAt || item?.created_at || new Date().toISOString(),
     queuedAt,
@@ -15442,6 +15586,7 @@ function createTodoQueueItemFromWorkspaceDispatch(item, workspaceId, hydratedTex
     ...(requestedSpeed ? { speed: requestedSpeed } : {}),
     remoteCommand: {
       commandId,
+      ...(commandKind ? { commandKind, command_kind: commandKind } : {}),
       dispatchSource,
       dispatchTarget,
       ...(requestedModel ? { model: requestedModel, model_id: requestedModel, modelId: requestedModel } : {}),
@@ -15451,6 +15596,12 @@ function createTodoQueueItemFromWorkspaceDispatch(item, workspaceId, hydratedTex
         reasoningEffort: requestedReasoningEffort,
       } : {}),
       ...(requestedSpeed ? { speed: requestedSpeed } : {}),
+      ...(loopRuntimeRunId ? { loopRuntimeRunId, loop_runtime_run_id: loopRuntimeRunId } : {}),
+      ...(loopRuntimeNodeId ? { loopRuntimeNodeId, loop_runtime_node_id: loopRuntimeNodeId } : {}),
+      ...(loopRuntimeEdgeId ? { loopRuntimeEdgeId, loop_runtime_edge_id: loopRuntimeEdgeId } : {}),
+      ...(loopspaceId ? { loopspaceId, loopspace_id: loopspaceId } : {}),
+      ...(triggerId ? { triggerId, trigger_id: triggerId } : {}),
+      ...(triggerRunId ? { triggerRunId, trigger_run_id: triggerRunId } : {}),
       source: item?.sourceKind || item?.source_kind || "cloud-diffforge-todo-dispatch",
       todoDeviceId: item?.todoDeviceId || item?.todo_device_id || "",
       todoDispatchId: dispatchId,
@@ -16152,7 +16303,15 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   }, []);
 
   const [activeOrchestratorSection, setActiveOrchestratorSection] = useState("todo");
-  const [appControlAgentRole, setAppControlAgentRole] = useState(APP_CONTROL_AGENT_DEFAULT_ROLE);
+  const [appControlAgentTerminalIndexes, setAppControlAgentTerminalIndexes] = useState([0]);
+  const [appControlAgentRolesByIndex, setAppControlAgentRolesByIndex] = useState(() => ({
+    0: APP_CONTROL_AGENT_DEFAULT_ROLE,
+  }));
+  const [appControlAgentPendingPromptsByIndex, setAppControlAgentPendingPromptsByIndex] = useState({});
+  const [activeAppControlAgentPaneId, setActiveAppControlAgentPaneId] = useState(
+    () => getAppControlAgentPaneId(0),
+  );
+  const [appControlAgentDraggingIndex, setAppControlAgentDraggingIndex] = useState(null);
   const [editingItemId, setEditingItemId] = useState("");
   const [editingDraft, setEditingDraft] = useState("");
   const [orchestratorVoiceError, setOrchestratorVoiceError] = useState("");
@@ -16234,6 +16393,18 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     timer: 0,
   });
   const todoBoardRef = useRef(null);
+  const appControlAgentSurfaceRef = useRef(null);
+  const appControlAgentTerminalIndexesRef = useRef(appControlAgentTerminalIndexes);
+  const appControlAgentPendingPromptsRef = useRef(appControlAgentPendingPromptsByIndex);
+  const appControlAgentRemoteCommandsByPromptIdRef = useRef(new Map());
+  const appControlAgentSendQueuesByIndexRef = useRef(new Map());
+  const appControlAgentSendWatchdogsByPromptIdRef = useRef(new Map());
+  const appControlAgentRetryTimersByPromptIdRef = useRef(new Map());
+  const appControlAgentSendWatchdogHandlerRef = useRef(null);
+  const appControlAgentThreadIdsRef = useRef(new Map());
+  const appControlAgentPanelRefs = useRef(new Map());
+  const appControlAgentDragCleanupRef = useRef(null);
+  const appControlAgentDragRef = useRef(null);
   const todoItemElementsRef = useRef(new Map());
   const todoDragGestureRef = useRef(null);
   const todoReorderDragRef = useRef(null);
@@ -16263,13 +16434,1008 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     workspace?.workspaceName,
     workspaceTodos,
   ]);
-  const appControlAgent = useMemo(
-    () => getAppControlAgent(agentStatuses, appControlAgentRole),
-    [agentStatuses, appControlAgentRole],
-  );
-  const handleAppControlAgentRoleChange = useCallback(({ role }) => {
-    setAppControlAgentRole(normalizeAppControlAgentRole(role));
+  const appControlAgentTerminalCount = appControlAgentTerminalIndexes.length;
+  useEffect(() => {
+    appControlAgentTerminalIndexesRef.current = appControlAgentTerminalIndexes;
+  }, [appControlAgentTerminalIndexes]);
+  useEffect(() => {
+    appControlAgentPendingPromptsRef.current = appControlAgentPendingPromptsByIndex;
+  }, [appControlAgentPendingPromptsByIndex]);
+  useEffect(() => () => {
+    appControlAgentSendWatchdogsByPromptIdRef.current.forEach((timer) => {
+      window.clearTimeout(timer);
+    });
+    appControlAgentSendWatchdogsByPromptIdRef.current.clear();
+    appControlAgentRetryTimersByPromptIdRef.current.forEach((timer) => {
+      window.clearTimeout(timer);
+    });
+    appControlAgentRetryTimersByPromptIdRef.current.clear();
   }, []);
+  const getAppControlAgentThreadId = useCallback((terminalIndex) => {
+    const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
+    const existingThreadId = appControlAgentThreadIdsRef.current.get(safeIndex);
+    if (existingThreadId) {
+      return existingThreadId;
+    }
+    const nextThreadId = createWorkspaceThreadId(APP_CONTROL_AGENT_WORKSPACE.id, safeIndex);
+    appControlAgentThreadIdsRef.current.set(safeIndex, nextThreadId);
+    return nextThreadId;
+  }, []);
+  const recordAppControlRemoteCommandStatus = useCallback((remoteEvent, status, message, details = {}) => {
+    if (!remoteEvent || typeof remoteEvent !== "object" || !status) {
+      return Promise.resolve();
+    }
+    return invoke("cloud_mcp_record_remote_command_status", {
+      details: {
+        ...details,
+        terminalScope: "device",
+        workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+      },
+      event: remoteEvent,
+      message,
+      status,
+    }).catch(() => {});
+  }, []);
+  const clearAppControlAgentSendWatchdog = useCallback((promptId) => {
+    const safePromptId = String(promptId || "").trim();
+    if (!safePromptId) {
+      return;
+    }
+    const timer = appControlAgentSendWatchdogsByPromptIdRef.current.get(safePromptId);
+    if (timer) {
+      window.clearTimeout(timer);
+      appControlAgentSendWatchdogsByPromptIdRef.current.delete(safePromptId);
+    }
+  }, []);
+  const scheduleAppControlAgentSendWatchdog = useCallback((promptId) => {
+    const safePromptId = String(promptId || "").trim();
+    if (!safePromptId) {
+      return;
+    }
+    clearAppControlAgentSendWatchdog(safePromptId);
+    const timer = window.setTimeout(() => {
+      appControlAgentSendWatchdogsByPromptIdRef.current.delete(safePromptId);
+      appControlAgentSendWatchdogHandlerRef.current?.(safePromptId);
+    }, APP_CONTROL_SEND_MESSAGE_ACCEPTANCE_TIMEOUT_MS);
+    appControlAgentSendWatchdogsByPromptIdRef.current.set(safePromptId, timer);
+  }, [clearAppControlAgentSendWatchdog]);
+  const clearAppControlAgentRetryTimer = useCallback((promptId) => {
+    const safePromptId = String(promptId || "").trim();
+    if (!safePromptId) {
+      return;
+    }
+    const timer = appControlAgentRetryTimersByPromptIdRef.current.get(safePromptId);
+    if (timer) {
+      window.clearTimeout(timer);
+      appControlAgentRetryTimersByPromptIdRef.current.delete(safePromptId);
+    }
+  }, []);
+  const clearAppControlAgentPendingPrompt = useCallback((promptId) => {
+    const safePromptId = String(promptId || "").trim();
+    if (!safePromptId) {
+      return;
+    }
+    setAppControlAgentPendingPromptsByIndex((current) => {
+      let changed = false;
+      const next = { ...current };
+      Object.entries(next).forEach(([indexKey, candidate]) => {
+        if (String(candidate?.id || candidate?.promptEventId || "").trim() === safePromptId) {
+          delete next[indexKey];
+          changed = true;
+        }
+      });
+      if (!changed) {
+        return current;
+      }
+      appControlAgentPendingPromptsRef.current = next;
+      return next;
+    });
+  }, []);
+  const resolveAppControlAgentTerminalIndex = useCallback((detail = {}) => {
+    const indexes = appControlAgentTerminalIndexesRef.current.length
+      ? appControlAgentTerminalIndexesRef.current
+      : [0];
+    const targetTerminalId = appControlRemoteDetailString(detail, [
+      "targetTerminalId",
+      "target_terminal_id",
+      "terminalId",
+      "terminal_id",
+      "paneId",
+      "pane_id",
+    ]);
+    if (targetTerminalId) {
+      const idMatch = indexes.find((index) => (
+        getAppControlAgentPaneId(index) === targetTerminalId
+      ));
+      if (Number.isInteger(idMatch)) {
+        return idMatch;
+      }
+    }
+
+    const targetTerminalIndex = appControlRemoteDetailInteger(detail, [
+      "targetTerminalIndex",
+      "target_terminal_index",
+      "terminalIndex",
+      "terminal_index",
+    ]);
+    if (
+      Number.isInteger(targetTerminalIndex)
+      && targetTerminalIndex >= 0
+      && targetTerminalIndex < APP_CONTROL_AGENT_MAX_TERMINAL_COUNT
+    ) {
+      return targetTerminalIndex;
+    }
+
+    const targetTerminalName = appControlRemoteDetailString(detail, [
+      "targetTerminalName",
+      "target_terminal_name",
+      "targetTerminalNickname",
+      "target_terminal_nickname",
+      "terminalName",
+      "terminal_name",
+      "terminalNickname",
+      "terminal_nickname",
+      "targetName",
+      "target_name",
+      "name",
+    ]).toLowerCase();
+    if (targetTerminalName) {
+      const nameMatch = indexes.find((index) => {
+        const oneBased = String(index + 1);
+        return targetTerminalName === oneBased
+          || targetTerminalName === String(index)
+          || targetTerminalName === `terminal ${oneBased}`
+          || targetTerminalName === `agent ${oneBased}`
+          || targetTerminalName === getAppControlAgentPaneId(index).toLowerCase();
+      });
+      if (Number.isInteger(nameMatch)) {
+        return nameMatch;
+      }
+    }
+
+    const activeMatch = indexes.find((index) => getAppControlAgentPaneId(index) === activeAppControlAgentPaneId);
+    return Number.isInteger(activeMatch) ? activeMatch : indexes[0] || 0;
+  }, [activeAppControlAgentPaneId]);
+  const appControlAgentTerminalHasActiveRemoteCommand = useCallback((terminalIndex) => {
+    const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
+    if (appControlAgentPendingPromptsRef.current?.[safeIndex]) {
+      return true;
+    }
+    for (const context of appControlAgentRemoteCommandsByPromptIdRef.current.values()) {
+      const contextIndex = Number(context?.terminalIndex);
+      const status = String(context?.lastRemoteStatus || "").trim().toLowerCase();
+      if (
+        Number.isInteger(contextIndex)
+        && contextIndex === safeIndex
+        && !["completed", "failed", "interrupted"].includes(status)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }, []);
+  const startAppControlAgentPendingPrompt = useCallback((terminalIndex, pendingPrompt, options = {}) => {
+    const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
+    const promptId = String(pendingPrompt?.id || pendingPrompt?.promptEventId || "").trim();
+    const remoteCommand = pendingPrompt?.remoteCommand && typeof pendingPrompt.remoteCommand === "object"
+      ? pendingPrompt.remoteCommand
+      : {};
+    if (!promptId || !remoteCommand.event) {
+      return;
+    }
+
+    const paneId = remoteCommand.paneId || getAppControlAgentPaneId(safeIndex);
+    const role = normalizeAppControlAgentRole(remoteCommand.agentId || APP_CONTROL_AGENT_DEFAULT_ROLE);
+    const threadId = String(remoteCommand.threadId || getAppControlAgentThreadId(safeIndex)).trim();
+    const recoveryAttempt = Math.max(0, Number.parseInt(
+      remoteCommand.recoveryAttempt ?? pendingPrompt?.recoveryAttempt ?? 0,
+      10,
+    ) || 0);
+    const nextRemoteCommand = {
+      ...remoteCommand,
+      agentId: role,
+      lastRemoteStatus: "running",
+      model: pendingPrompt.model || remoteCommand.model || "",
+      paneId,
+      reasoningEffort: pendingPrompt.reasoningEffort || remoteCommand.reasoningEffort || "",
+      recoveryAttempt,
+      speed: pendingPrompt.speed || remoteCommand.speed || "",
+      terminalAccepted: false,
+      terminalIndex: safeIndex,
+      text: String(pendingPrompt.text || pendingPrompt.message || ""),
+      threadId,
+    };
+    const nextPendingPrompt = {
+      ...pendingPrompt,
+      remoteCommand: nextRemoteCommand,
+    };
+    appControlAgentThreadIdsRef.current.set(safeIndex, threadId);
+    appControlAgentRemoteCommandsByPromptIdRef.current.set(promptId, nextRemoteCommand);
+    setAppControlAgentTerminalIndexes((current) => {
+      if (current.includes(safeIndex)) {
+        return current;
+      }
+      const next = [...current, safeIndex].slice(0, APP_CONTROL_AGENT_MAX_TERMINAL_COUNT);
+      next.sort((left, right) => left - right);
+      appControlAgentTerminalIndexesRef.current = next;
+      return next;
+    });
+    setAppControlAgentRolesByIndex((current) => (
+      current?.[safeIndex] === role
+        ? current
+        : {
+          ...current,
+          [safeIndex]: role,
+        }
+    ));
+    setActiveWorkspaceTool("orchestrator");
+    setActiveOrchestratorSection("agent");
+    setActiveAppControlAgentPaneId(paneId);
+    setAppControlAgentPendingPromptsByIndex((current) => {
+      const next = {
+        ...current,
+        [safeIndex]: nextPendingPrompt,
+      };
+      appControlAgentPendingPromptsRef.current = next;
+      return next;
+    });
+    logTerminalStatus("frontend.app_control.remote_send_message_started", {
+      agentId: role,
+      commandId: remoteCommand.commandId || "",
+      commandKind: remoteCommand.commandKind || "terminal_orchestrator_send_message",
+      paneId,
+      promptId,
+      queueDepth: Number(options.queueDepth || 0),
+      recoveryAttempt,
+      targetTerminalIndex: safeIndex,
+      textLength: String(pendingPrompt.text || pendingPrompt.message || "").length,
+      threadId,
+      workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+    });
+    scheduleAppControlAgentSendWatchdog(promptId);
+    void recordAppControlRemoteCommandStatus(
+      remoteCommand.event,
+      "running",
+      options.message || "Preparing terminal orchestrator message.",
+      {
+        agentId: role,
+        commandId: remoteCommand.commandId || "",
+        commandKind: remoteCommand.commandKind || "terminal_orchestrator_send_message",
+        paneId,
+        promptId,
+        queueDepth: Number(options.queueDepth || 0),
+        recoveryAttempt,
+        targetTerminalIndex: safeIndex,
+        targetThreadId: threadId,
+        textPreview: remoteCommand.textPreview || "",
+      },
+    );
+  }, [
+    getAppControlAgentThreadId,
+    recordAppControlRemoteCommandStatus,
+    scheduleAppControlAgentSendWatchdog,
+    setActiveWorkspaceTool,
+  ]);
+  const drainAppControlAgentSendQueue = useCallback((terminalIndex) => {
+    const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
+    if (appControlAgentTerminalHasActiveRemoteCommand(safeIndex)) {
+      return;
+    }
+    const queue = appControlAgentSendQueuesByIndexRef.current.get(safeIndex) || [];
+    if (!queue.length) {
+      return;
+    }
+    const [nextPrompt, ...remainingPrompts] = queue;
+    if (remainingPrompts.length) {
+      appControlAgentSendQueuesByIndexRef.current.set(safeIndex, remainingPrompts);
+    } else {
+      appControlAgentSendQueuesByIndexRef.current.delete(safeIndex);
+    }
+    startAppControlAgentPendingPrompt(safeIndex, nextPrompt, {
+      message: "Dequeued terminal orchestrator message.",
+      queueDepth: remainingPrompts.length,
+    });
+  }, [
+    appControlAgentTerminalHasActiveRemoteCommand,
+    startAppControlAgentPendingPrompt,
+  ]);
+  const recoverOrFailAppControlAgentSendMessage = useCallback((promptId, reason, event = {}) => {
+    const safePromptId = String(promptId || "").trim();
+    if (!safePromptId) {
+      return false;
+    }
+    const existingContext = appControlAgentRemoteCommandsByPromptIdRef.current.get(safePromptId);
+    if (!existingContext?.event) {
+      return false;
+    }
+    if (existingContext.terminalAccepted) {
+      return false;
+    }
+
+    clearAppControlAgentSendWatchdog(safePromptId);
+    clearAppControlAgentRetryTimer(safePromptId);
+    clearAppControlAgentPendingPrompt(safePromptId);
+
+    const terminalIndex = Math.max(0, Number.parseInt(
+      existingContext.terminalIndex ?? event.terminalIndex ?? event.terminal_index ?? 0,
+      10,
+    ) || 0);
+    const paneId = existingContext.paneId || event.paneId || getAppControlAgentPaneId(terminalIndex);
+    const threadId = String(existingContext.threadId || event.threadId || getAppControlAgentThreadId(terminalIndex)).trim();
+    const recoveryAttempt = Math.max(0, Number.parseInt(existingContext.recoveryAttempt || 0, 10) || 0);
+    const originalPromptId = String(existingContext.originalPromptId || existingContext.remotePromptId || safePromptId).trim();
+    const lifecycleEventType = String(event.type || event.eventType || event.event_type || "watchdog-timeout").trim();
+    const errorMessage = String(event.error || event.message || reason || "Terminal orchestrator did not accept the message.").trim();
+    const details = {
+      agentId: existingContext.agentId || event.agentId || event.agentKind || "",
+      commandId: existingContext.commandId || "",
+      commandKind: existingContext.commandKind || "terminal_orchestrator_send_message",
+      lifecycleEventType,
+      originalPromptId,
+      paneId,
+      promptId: safePromptId,
+      recoveryAttempt,
+      recoveryReason: reason || "",
+      targetTerminalIndex: terminalIndex,
+      targetThreadId: threadId,
+      textPreview: existingContext.textPreview || "",
+    };
+
+    if (recoveryAttempt < APP_CONTROL_SEND_MESSAGE_MAX_RECOVERY_ATTEMPTS) {
+      const nextRecoveryAttempt = recoveryAttempt + 1;
+      const nextPromptId = createAppControlAgentRetryPromptId(originalPromptId, nextRecoveryAttempt);
+      const nextThreadId = createWorkspaceThreadId(APP_CONTROL_AGENT_WORKSPACE.id, terminalIndex);
+      const nextContext = {
+        ...existingContext,
+        lastRemoteStatus: "queued",
+        originalPromptId,
+        paneId,
+        previousPromptId: safePromptId,
+        promptId: nextPromptId,
+        recoveryAttempt: nextRecoveryAttempt,
+        terminalAccepted: false,
+        terminalIndex,
+        threadId: nextThreadId,
+      };
+      const retryPrompt = {
+        createdAt: new Date().toISOString(),
+        deliveryMode: "terminal-confirmed",
+        id: nextPromptId,
+        message: existingContext.text || existingContext.message || existingContext.textPreview || "",
+        model: existingContext.model || "",
+        promptEventId: nextPromptId,
+        reasoningEffort: existingContext.reasoningEffort || "",
+        recoveryAttempt: nextRecoveryAttempt,
+        remoteCommand: nextContext,
+        speed: existingContext.speed || "",
+        text: existingContext.text || existingContext.message || existingContext.textPreview || "",
+      };
+      appControlAgentRemoteCommandsByPromptIdRef.current.delete(safePromptId);
+      appControlAgentRemoteCommandsByPromptIdRef.current.set(nextPromptId, nextContext);
+      appControlAgentThreadIdsRef.current.set(terminalIndex, nextThreadId);
+      logTerminalStatus("frontend.app_control.remote_send_message_recovery_restart", {
+        ...details,
+        error: errorMessage,
+        nextRecoveryAttempt,
+        nextPromptId,
+        nextThreadId,
+        workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+      });
+      void recordAppControlRemoteCommandStatus(
+        existingContext.event,
+        "queued",
+        "Restarting terminal orchestrator and retrying the message.",
+        {
+          ...details,
+          error: errorMessage,
+          nextRecoveryAttempt,
+          nextPromptId,
+          nextThreadId,
+        },
+      );
+      window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_ARCHIVE_TERMINAL_RESET_EVENT, {
+        detail: {
+          agentId: existingContext.agentId || APP_CONTROL_AGENT_DEFAULT_ROLE,
+          nextThreadId,
+          paneId,
+          reason: "app_control_remote_send_message_recovery",
+          statusDetail: "Restarting terminal orchestrator after send failed.",
+          terminalIndex,
+          threadId,
+          workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+          workspaceName: APP_CONTROL_AGENT_WORKSPACE.name,
+        },
+      }));
+      const retryTimer = window.setTimeout(() => {
+        appControlAgentRetryTimersByPromptIdRef.current.delete(nextPromptId);
+        const latestContext = appControlAgentRemoteCommandsByPromptIdRef.current.get(nextPromptId);
+        if (!latestContext || latestContext.recoveryAttempt !== nextRecoveryAttempt || latestContext.terminalAccepted) {
+          return;
+        }
+        startAppControlAgentPendingPrompt(terminalIndex, retryPrompt, {
+          message: "Retrying terminal orchestrator message after restart.",
+          recoveryAttempt: nextRecoveryAttempt,
+        });
+      }, APP_CONTROL_SEND_MESSAGE_RECOVERY_DELAY_MS);
+      appControlAgentRetryTimersByPromptIdRef.current.set(nextPromptId, retryTimer);
+      return true;
+    }
+
+    const failedContext = {
+      ...existingContext,
+      lastRemoteStatus: "failed",
+      terminalIndex,
+      threadId,
+    };
+    appControlAgentRemoteCommandsByPromptIdRef.current.set(safePromptId, failedContext);
+    logTerminalStatus("frontend.app_control.remote_send_message_failed", {
+      ...details,
+      error: errorMessage,
+      workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+    });
+    void recordAppControlRemoteCommandStatus(
+      existingContext.event,
+      "failed",
+      errorMessage || "Terminal orchestrator message failed.",
+      {
+        ...details,
+        error: errorMessage,
+        recovered: false,
+      },
+    ).then(() => {
+      appControlAgentRemoteCommandsByPromptIdRef.current.delete(safePromptId);
+      drainAppControlAgentSendQueue(terminalIndex);
+    });
+    return false;
+  }, [
+    clearAppControlAgentPendingPrompt,
+    clearAppControlAgentRetryTimer,
+    clearAppControlAgentSendWatchdog,
+    drainAppControlAgentSendQueue,
+    getAppControlAgentThreadId,
+    recordAppControlRemoteCommandStatus,
+    startAppControlAgentPendingPrompt,
+  ]);
+  useEffect(() => {
+    appControlAgentSendWatchdogHandlerRef.current = (promptId) => {
+      recoverOrFailAppControlAgentSendMessage(promptId, "terminal_acceptance_timeout", {
+        message: "Timed out waiting for the terminal orchestrator to accept the message.",
+        type: "watchdog-timeout",
+      });
+    };
+    return () => {
+      appControlAgentSendWatchdogHandlerRef.current = null;
+    };
+  }, [recoverOrFailAppControlAgentSendMessage]);
+  const handleActivateAppControlAgentTerminal = useCallback(({ paneId }) => {
+    if (paneId) {
+      setActiveAppControlAgentPaneId(paneId);
+    }
+  }, []);
+  const handleAppControlAgentRoleChange = useCallback(({ role, terminalIndex }) => {
+    const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
+    setAppControlAgentRolesByIndex((current) => ({
+      ...current,
+      [safeIndex]: normalizeAppControlAgentRole(role),
+    }));
+  }, []);
+  const handleSplitAppControlAgentTerminal = useCallback(({ terminalIndex } = {}) => {
+    if (appControlAgentTerminalIndexes.length >= APP_CONTROL_AGENT_MAX_TERMINAL_COUNT) {
+      return;
+    }
+
+    const requestedIndex = Number.parseInt(terminalIndex, 10);
+    const sourceIndex = Number.isInteger(requestedIndex)
+      && appControlAgentTerminalIndexes.includes(requestedIndex)
+      ? requestedIndex
+      : appControlAgentTerminalIndexes[0] || 0;
+    let nextTerminalIndex = -1;
+
+    for (let index = 0; index < APP_CONTROL_AGENT_MAX_TERMINAL_COUNT; index += 1) {
+      if (!appControlAgentTerminalIndexes.includes(index)) {
+        nextTerminalIndex = index;
+        break;
+      }
+    }
+
+    if (nextTerminalIndex < 0) {
+      return;
+    }
+
+    const nextIndexes = appControlAgentTerminalIndexes.slice();
+    const sourcePosition = Math.max(0, nextIndexes.indexOf(sourceIndex));
+    nextIndexes.splice(sourcePosition + 1, 0, nextTerminalIndex);
+
+    setAppControlAgentTerminalIndexes(nextIndexes);
+    setAppControlAgentRolesByIndex((current) => ({
+      ...current,
+      [nextTerminalIndex]: normalizeAppControlAgentRole(
+        current?.[sourceIndex] || APP_CONTROL_AGENT_DEFAULT_ROLE,
+      ),
+    }));
+    setActiveAppControlAgentPaneId(getAppControlAgentPaneId(nextTerminalIndex));
+  }, [appControlAgentTerminalIndexes]);
+  const handleAppControlAgentTerminalLifecycle = useCallback((event = {}) => {
+    const eventType = String(event.type || event.eventType || event.event_type || "").trim().toLowerCase();
+    let promptId = String(
+      event.promptEventId
+        || event.prompt_event_id
+        || event.pendingPromptId
+        || event.pending_prompt_id
+        || event.promptId
+        || event.prompt_id
+        || "",
+    ).trim();
+    if (!promptId) {
+      const terminalIndex = Number(event.terminalIndex ?? event.terminal_index);
+      if (Number.isInteger(terminalIndex)) {
+        const activeEntry = Array.from(appControlAgentRemoteCommandsByPromptIdRef.current.entries()).find(([, context]) => {
+          const contextIndex = Number(context?.terminalIndex);
+          const status = String(context?.lastRemoteStatus || "").trim().toLowerCase();
+          return Number.isInteger(contextIndex)
+            && contextIndex === terminalIndex
+            && !["completed", "failed", "interrupted"].includes(status);
+        });
+        promptId = String(activeEntry?.[0] || "").trim();
+      }
+    }
+    if (!promptId || !eventType) {
+      return;
+    }
+
+    const pendingEntries = Object.entries(appControlAgentPendingPromptsRef.current || {});
+    const pendingEntry = pendingEntries.find(([, pendingPrompt]) => (
+      String(pendingPrompt?.id || pendingPrompt?.promptEventId || "").trim() === promptId
+    ));
+    const pendingPrompt = pendingEntry?.[1] || null;
+    const existingContext = appControlAgentRemoteCommandsByPromptIdRef.current.get(promptId)
+      || pendingPrompt?.remoteCommand
+      || null;
+    if (!existingContext?.event) {
+      return;
+    }
+    const eventThreadId = String(event.threadId || event.thread_id || "").trim();
+    const contextThreadId = String(existingContext.threadId || "").trim();
+    if (eventThreadId && contextThreadId && eventThreadId !== contextThreadId) {
+      logTerminalStatus("frontend.app_control.remote_send_message_lifecycle_ignored", {
+        contextThreadId,
+        eventThreadId,
+        eventType,
+        paneId: event.paneId || existingContext.paneId || "",
+        promptId,
+        reason: "thread_mismatch",
+        workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+      });
+      return;
+    }
+
+    if (eventType === "pending-prompt-sent" || eventType === "pending-prompt-error") {
+      clearAppControlAgentPendingPrompt(promptId);
+    }
+
+    const failed = [
+      "error",
+      "failed",
+      "pending-prompt-error",
+      "provider-turn-error",
+      "provider-turn-failed",
+    ].includes(eventType);
+    const completed = eventType === "provider-turn-completed";
+    const interrupted = eventType === "provider-turn-interrupted";
+    const running = [
+      "agent-output",
+      "message-submitted",
+      "pending-prompt-sent",
+      "provider-turn-started",
+    ].includes(eventType);
+    const terminalAccepted = existingContext.terminalAccepted
+      || eventType === "pending-prompt-sent"
+      || eventType === "provider-turn-started"
+      || eventType === "message-submitted";
+    if (terminalAccepted || completed || interrupted) {
+      clearAppControlAgentSendWatchdog(promptId);
+      clearAppControlAgentRetryTimer(promptId);
+    }
+    if (terminalAccepted) {
+      const acceptedThreadId = eventThreadId || existingContext.threadId || "";
+      const acceptedAgentId = String(
+        existingContext.agentId
+          || event.agentId
+          || event.agent_id
+          || event.agentKind
+          || event.agent_kind
+          || "",
+      ).trim();
+      const acceptedPromptText = String(
+        existingContext.text
+          || existingContext.message
+          || pendingPrompt?.text
+          || pendingPrompt?.message
+          || event.userMessage
+          || event.user_message
+          || event.message
+          || "",
+      ).trim();
+      const acceptedSessionId = String(
+        event.nativeSessionId
+          || event.native_session_id
+          || event.providerSessionId
+          || event.provider_session_id
+          || "",
+      ).trim();
+      window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, {
+        detail: {
+          agentId: acceptedAgentId,
+          matchedBy: `app-control-${eventType}`,
+          promptEventId: promptId,
+          promptText: acceptedPromptText,
+          sessionId: acceptedSessionId,
+          threadId: acceptedThreadId,
+          workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+        },
+      }));
+      logTerminalStatus("frontend.app_control.remote_send_message_prompt_accepted", {
+        agentId: acceptedAgentId,
+        commandId: existingContext.commandId || "",
+        eventType,
+        matchedBy: `app-control-${eventType}`,
+        paneId: event.paneId || existingContext.paneId || "",
+        promptId,
+        sessionIdPresent: Boolean(acceptedSessionId),
+        targetTerminalIndex: existingContext.terminalIndex ?? event.terminalIndex ?? null,
+        targetThreadId: acceptedThreadId,
+        workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+      });
+    }
+    if (failed && !terminalAccepted) {
+      recoverOrFailAppControlAgentSendMessage(promptId, "terminal_lifecycle_failure", event);
+      return;
+    }
+    const status = failed
+      ? "failed"
+      : completed
+        ? "completed"
+        : interrupted
+          ? "interrupted"
+          : running
+            ? "running"
+            : "";
+    if (!status) {
+      return;
+    }
+
+    const nextContext = {
+      ...existingContext,
+      lastRemoteStatus: status,
+      terminalAccepted,
+    };
+    if (
+      status === "running"
+      && existingContext.lastRemoteStatus === "running"
+      && Boolean(existingContext.terminalAccepted) === Boolean(terminalAccepted)
+    ) {
+      return;
+    }
+    appControlAgentRemoteCommandsByPromptIdRef.current.set(promptId, nextContext);
+
+    const message = failed
+      ? String(event.error || event.message || "Terminal orchestrator message failed.").trim()
+      : completed
+        ? "Terminal orchestrator message completed."
+        : interrupted
+          ? "Terminal orchestrator message interrupted."
+          : eventType === "pending-prompt-sent"
+            ? "Send message submitted to the terminal orchestrator."
+            : "Terminal orchestrator message is running.";
+    void recordAppControlRemoteCommandStatus(existingContext.event, status, message, {
+      agentId: existingContext.agentId || event.agentId || event.agentKind || "",
+      commandId: existingContext.commandId || "",
+      commandKind: existingContext.commandKind || "terminal_orchestrator_send_message",
+      lifecycleEventType: eventType,
+      paneId: event.paneId || existingContext.paneId || "",
+      promptId,
+      targetTerminalIndex: existingContext.terminalIndex ?? event.terminalIndex ?? null,
+      targetThreadId: event.threadId || existingContext.threadId || "",
+      textPreview: existingContext.textPreview || "",
+    }).then(() => {
+      if (failed || completed || interrupted) {
+        clearAppControlAgentSendWatchdog(promptId);
+        clearAppControlAgentRetryTimer(promptId);
+        appControlAgentRemoteCommandsByPromptIdRef.current.delete(promptId);
+        drainAppControlAgentSendQueue(existingContext.terminalIndex ?? event.terminalIndex ?? 0);
+      }
+    });
+  }, [
+    clearAppControlAgentPendingPrompt,
+    clearAppControlAgentRetryTimer,
+    clearAppControlAgentSendWatchdog,
+    drainAppControlAgentSendQueue,
+    recordAppControlRemoteCommandStatus,
+    recoverOrFailAppControlAgentSendMessage,
+  ]);
+  const handleRemoteAppControlSendMessage = useCallback((event) => {
+    const detail = event?.detail || {};
+    const text = appControlRemoteMessageText(detail);
+    const remoteEvent = detail.event && typeof detail.event === "object"
+      ? detail.event
+      : {
+        command_id: appControlRemoteDetailString(detail, ["commandId", "command_id"]) || "",
+        command_kind: appControlRemoteDetailString(detail, ["commandKind", "command_kind"]) || "terminal_orchestrator_send_message",
+        message: text,
+      };
+    const commandId = appControlRemoteDetailString(detail, ["commandId", "command_id"])
+      || String(remoteEvent.command_id || remoteEvent.commandId || "").trim()
+      || `app-control-send-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const commandKind = appControlRemoteDetailString(detail, ["commandKind", "command_kind"])
+      || String(remoteEvent.command_kind || remoteEvent.commandKind || "").trim()
+      || "terminal_orchestrator_send_message";
+    if (!text) {
+      void recordAppControlRemoteCommandStatus(remoteEvent, "failed", "Remote command did not include a terminal orchestrator message.", {
+        commandId,
+        commandKind,
+      });
+      return;
+    }
+
+    const currentIndexes = appControlAgentTerminalIndexesRef.current.length
+      ? appControlAgentTerminalIndexesRef.current
+      : [0];
+    let terminalIndex = resolveAppControlAgentTerminalIndex(detail);
+    if (!currentIndexes.includes(terminalIndex) && currentIndexes.length >= APP_CONTROL_AGENT_MAX_TERMINAL_COUNT) {
+      terminalIndex = currentIndexes[0] || 0;
+    }
+    const paneId = getAppControlAgentPaneId(terminalIndex);
+    const rawAgentId = appControlRemoteDetailString(detail, [
+      "targetAgentId",
+      "target_agent_id",
+      "agentId",
+      "agent_id",
+    ]);
+    const normalizedRole = normalizeAppControlAgentRole(rawAgentId);
+    const role = normalizedRole === "generic" ? APP_CONTROL_AGENT_DEFAULT_ROLE : normalizedRole;
+    const threadId = appControlRemoteDetailString(detail, [
+      "targetThreadId",
+      "target_thread_id",
+      "threadId",
+      "thread_id",
+    ]) || getAppControlAgentThreadId(terminalIndex);
+
+    const promptId = appControlRemoteDetailString(detail, [
+      "promptEventId",
+      "prompt_event_id",
+      "pendingPromptId",
+      "pending_prompt_id",
+      "promptId",
+      "prompt_id",
+    ]) || commandId;
+    const createdAt = new Date().toISOString();
+    const remoteCommand = {
+      agentId: role,
+      commandId,
+      commandKind,
+      event: remoteEvent,
+      paneId,
+      promptId,
+      terminalIndex,
+      textPreview: text.slice(0, 200),
+      threadId,
+    };
+    const pendingPrompt = {
+      createdAt,
+      deliveryMode: "terminal-confirmed",
+      id: promptId,
+      message: text,
+      model: appControlRemoteDetailString(detail, ["model", "modelId", "model_id", "requestedModel"]),
+      promptEventId: promptId,
+      reasoningEffort: appControlRemoteDetailString(detail, [
+        "reasoningEffort",
+        "reasoning_effort",
+        "effort",
+        "requestedReasoningEffort",
+      ]),
+      remoteCommand,
+      speed: appControlRemoteDetailString(detail, ["speed", "serviceTier", "service_tier", "requestedSpeed"]),
+      text,
+    };
+
+    if (appControlAgentTerminalHasActiveRemoteCommand(terminalIndex)) {
+      const queue = appControlAgentSendQueuesByIndexRef.current.get(terminalIndex) || [];
+      const nextQueue = queue.concat([{
+        ...pendingPrompt,
+        remoteCommand: {
+          ...remoteCommand,
+          lastRemoteStatus: "queued",
+        },
+      }]);
+      appControlAgentSendQueuesByIndexRef.current.set(terminalIndex, nextQueue);
+      logTerminalStatus("frontend.app_control.remote_send_message_waiting", {
+        agentId: role,
+        commandId,
+        commandKind,
+        paneId,
+        promptId,
+        queueDepth: nextQueue.length,
+        targetTerminalIndex: terminalIndex,
+        textLength: text.length,
+        threadId,
+        workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+      });
+      void recordAppControlRemoteCommandStatus(remoteEvent, "queued", "Queued behind an active terminal orchestrator message.", {
+        agentId: role,
+        commandId,
+        commandKind,
+        paneId,
+        promptId,
+        queueDepth: nextQueue.length,
+        targetTerminalIndex: terminalIndex,
+        targetThreadId: threadId,
+        textPreview: text.slice(0, 200),
+      });
+      return;
+    }
+
+    startAppControlAgentPendingPrompt(terminalIndex, pendingPrompt);
+  }, [
+    appControlAgentTerminalHasActiveRemoteCommand,
+    getAppControlAgentThreadId,
+    recordAppControlRemoteCommandStatus,
+    resolveAppControlAgentTerminalIndex,
+    startAppControlAgentPendingPrompt,
+  ]);
+  useEffect(() => {
+    window.addEventListener(REMOTE_APP_CONTROL_SEND_MESSAGE_EVENT, handleRemoteAppControlSendMessage);
+    return () => {
+      window.removeEventListener(REMOTE_APP_CONTROL_SEND_MESSAGE_EVENT, handleRemoteAppControlSendMessage);
+    };
+  }, [handleRemoteAppControlSendMessage]);
+  const setAppControlAgentPanelRef = useCallback((terminalIndex, element) => {
+    const safeIndex = Number.parseInt(terminalIndex, 10);
+    if (!Number.isInteger(safeIndex)) {
+      return;
+    }
+    if (element) {
+      appControlAgentPanelRefs.current.set(safeIndex, element);
+    } else {
+      appControlAgentPanelRefs.current.delete(safeIndex);
+    }
+  }, []);
+  const stopAppControlAgentTerminalDrag = useCallback(() => {
+    appControlAgentDragCleanupRef.current?.();
+    appControlAgentDragCleanupRef.current = null;
+    appControlAgentDragRef.current = null;
+    setAppControlAgentDraggingIndex(null);
+  }, []);
+  const handleBeginAppControlAgentTerminalDrag = useCallback((event = {}) => {
+    const terminalIndex = Number.parseInt(event.terminalIndex, 10);
+    const pointerId = Number.parseInt(event.pointerId, 10);
+    if (
+      !Number.isInteger(terminalIndex)
+      || !Number.isInteger(pointerId)
+      || appControlAgentTerminalIndexesRef.current.length <= 1
+      || typeof window === "undefined"
+      || typeof document === "undefined"
+    ) {
+      return;
+    }
+
+    stopAppControlAgentTerminalDrag();
+    setActiveAppControlAgentPaneId(event.paneId || getAppControlAgentPaneId(terminalIndex));
+    appControlAgentDragRef.current = {
+      pointerId,
+      terminalIndex,
+    };
+    setAppControlAgentDraggingIndex(terminalIndex);
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+
+    const getTargetIndex = (clientY) => {
+      const getPanelElement = (index) => {
+        const refElement = appControlAgentPanelRefs.current.get(index);
+        if (typeof refElement?.getBoundingClientRect === "function") {
+          return refElement;
+        }
+        return appControlAgentSurfaceRef.current?.querySelector?.(
+          `[data-app-control-agent-terminal-index="${index}"]`,
+        ) || null;
+      };
+      const entries = appControlAgentTerminalIndexesRef.current
+        .map((index, orderIndex) => ({
+          index,
+          orderIndex,
+          rect: getPanelElement(index)?.getBoundingClientRect?.(),
+        }))
+        .filter((entry) => entry.rect);
+
+      for (const entry of entries) {
+        if (clientY < entry.rect.top + entry.rect.height / 2) {
+          return entry.orderIndex;
+        }
+      }
+
+      return entries.length;
+    };
+
+    const moveDraggedTerminal = (clientY) => {
+      const targetIndex = getTargetIndex(clientY);
+      setAppControlAgentTerminalIndexes((currentIndexes) => {
+        const nextIndexes = reorderAppControlAgentTerminalIndexes(currentIndexes, terminalIndex, targetIndex);
+        const unchanged = nextIndexes.length === currentIndexes.length
+          && nextIndexes.every((index, orderIndex) => index === currentIndexes[orderIndex]);
+        if (unchanged) {
+          return currentIndexes;
+        }
+        appControlAgentTerminalIndexesRef.current = nextIndexes;
+        return nextIndexes;
+      });
+    };
+
+    const handlePointerMove = (pointerEvent) => {
+      const currentDrag = appControlAgentDragRef.current;
+      if (!currentDrag || pointerEvent.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+      pointerEvent.preventDefault();
+      moveDraggedTerminal(pointerEvent.clientY);
+    };
+
+    const endDrag = (pointerEvent) => {
+      const currentDrag = appControlAgentDragRef.current;
+      if (!currentDrag || pointerEvent.pointerId !== currentDrag.pointerId) {
+        return;
+      }
+      pointerEvent.preventDefault();
+      stopAppControlAgentTerminalDrag();
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { capture: true, passive: false });
+    window.addEventListener("pointerup", endDrag, { capture: true, passive: false });
+    window.addEventListener("pointercancel", endDrag, { capture: true, passive: false });
+    appControlAgentDragCleanupRef.current = () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("pointermove", handlePointerMove, true);
+      window.removeEventListener("pointerup", endDrag, true);
+      window.removeEventListener("pointercancel", endDrag, true);
+    };
+
+    moveDraggedTerminal(event.clientY);
+  }, [stopAppControlAgentTerminalDrag]);
+  useEffect(() => () => {
+    stopAppControlAgentTerminalDrag();
+  }, [stopAppControlAgentTerminalDrag]);
+  useEffect(() => {
+    if (
+      appControlAgentTerminalIndexes.some((terminalIndex) => (
+        getAppControlAgentPaneId(terminalIndex) === activeAppControlAgentPaneId
+      ))
+    ) {
+      return;
+    }
+
+    setActiveAppControlAgentPaneId(getAppControlAgentPaneId(appControlAgentTerminalIndexes[0] || 0));
+  }, [activeAppControlAgentPaneId, appControlAgentTerminalIndexes]);
+  const appControlAgentTerminals = useMemo(() => (
+    appControlAgentTerminalIndexes.map((terminalIndex) => {
+      const role = normalizeAppControlAgentRole(
+        appControlAgentRolesByIndex?.[terminalIndex] || APP_CONTROL_AGENT_DEFAULT_ROLE,
+      );
+      return {
+        agent: getAppControlAgent(agentStatuses, role),
+        paneId: getAppControlAgentPaneId(terminalIndex),
+        role,
+        terminalIndex,
+      };
+    })
+  ), [
+    agentStatuses,
+    appControlAgentRolesByIndex,
+    appControlAgentTerminalIndexes,
+  ]);
+  const appControlAgentPanelMinSize = getTerminalPaneMinSizePercent(appControlAgentTerminalCount);
+  const appControlAgentPanelDefaultSize = `${100 / Math.max(1, appControlAgentTerminalCount)}%`;
   const orchestratorDeviceRows = useMemo(
     () => buildAccountLiveDeviceRows({
       connectedDevices,
@@ -18885,38 +20051,75 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             <OrchestratorAgentTerminalSurface
               aria-hidden={appControlAgentVisible ? undefined : "true"}
               data-active={appControlAgentVisible ? "true" : "false"}
+              ref={appControlAgentSurfaceRef}
             >
-              <WorkspaceTerminal
-                agent={appControlAgent}
-                agentLaunchReady
-                agentStatuses={agentStatuses}
-                agentStatusError={agentStatusError}
-                agentStatusState={agentStatusState}
-                appControlMcp={appControlAgentRole !== "generic"}
-                defaultSessionMode="free"
-                dockedChrome
-                fullscreenState="idle"
-                isActive={appControlAgentVisible}
-                isFullscreen={false}
-                onChangeTerminalRole={handleAppControlAgentRoleChange}
-                onOpenSettings={noopWorkspaceToolHandler}
-                onRecheckAgents={onRecheckAgents || noopWorkspaceToolHandler}
-                paneIdOverride={APP_CONTROL_AGENT_PANE_ID}
-                prewarmShell={false}
-                startupReady
-                terminalBreakoutActive={false}
-                terminalCount={1}
-                terminalIndex={0}
-                terminalRole={appControlAgentRole}
-                terminalSelectionMode="pointerdown"
-                thread={null}
-                threadsViewActive={false}
-                workingDirectory={defaultWorkingDirectory || rootDirectory}
-                workspace={APP_CONTROL_AGENT_WORKSPACE}
-                workspaceError=""
-                workspaceThreads={{}}
-                workspaces={workspaces}
-              />
+              <ResizePanelGroup
+                id="orchestrator-agent-terminal-panes"
+                orientation="vertical"
+              >
+                {appControlAgentTerminals.map((terminal, terminalOrderIndex) => (
+                  <Fragment key={terminal.paneId}>
+                    {terminalOrderIndex > 0 && (
+                      <ResizeHandle data-direction="vertical" />
+                    )}
+                    <ResizePanel
+                      data-app-control-agent-dragging={
+                        appControlAgentDraggingIndex === terminal.terminalIndex ? "true" : undefined
+                      }
+                      data-app-control-agent-terminal-index={terminal.terminalIndex}
+                      data-terminal-row="true"
+                      defaultSize={appControlAgentPanelDefaultSize}
+                      id={`orchestrator-agent-terminal-pane-${terminal.terminalIndex}`}
+                      minSize={appControlAgentPanelMinSize}
+                      ref={(element) => setAppControlAgentPanelRef(terminal.terminalIndex, element)}
+                    >
+                      <WorkspaceTerminal
+                        agent={terminal.agent}
+                        agentLaunchReady
+                        agentStatuses={agentStatuses}
+                        agentStatusError={agentStatusError}
+                        agentStatusState={agentStatusState}
+                        appControlMcp={terminal.role !== "generic"}
+                        defaultSessionMode="free"
+                        dockedChrome
+                        fullscreenState="idle"
+                        isActive={appControlAgentVisible && activeAppControlAgentPaneId === terminal.paneId}
+                        isFullscreen={false}
+                        onActivateTerminal={handleActivateAppControlAgentTerminal}
+                        onBeginTerminalDrag={handleBeginAppControlAgentTerminalDrag}
+                        onChangeTerminalRole={handleAppControlAgentRoleChange}
+                        onOpenSettings={noopWorkspaceToolHandler}
+                        onRecheckAgents={onRecheckAgents || noopWorkspaceToolHandler}
+                        onSplitTerminal={handleSplitAppControlAgentTerminal}
+                        onThreadTerminalLifecycle={handleAppControlAgentTerminalLifecycle}
+                        paneIdOverride={terminal.paneId}
+                        prewarmShell={false}
+                        showDockedDragHandle={appControlAgentTerminalCount > 1}
+                        startupReady
+                        terminalBreakoutActive={false}
+                        terminalCount={appControlAgentTerminalCount}
+                        terminalIndex={terminal.terminalIndex}
+                        terminalRole={terminal.role}
+                        terminalSelectionMode="pointerdown"
+                        terminalSplitLimit={APP_CONTROL_AGENT_MAX_TERMINAL_COUNT}
+                        terminalSplitMode="vertical-only"
+                        thread={{
+                          id: getAppControlAgentThreadId(terminal.terminalIndex),
+                          pendingPrompt: appControlAgentPendingPromptsByIndex[terminal.terminalIndex] || null,
+                          terminalIndex: terminal.terminalIndex,
+                          workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+                        }}
+                        threadsViewActive={false}
+                        workingDirectory={defaultWorkingDirectory || rootDirectory}
+                        workspace={APP_CONTROL_AGENT_WORKSPACE}
+                        workspaceError=""
+                        workspaceThreads={{}}
+                        workspaces={workspaces}
+                      />
+                    </ResizePanel>
+                  </Fragment>
+                ))}
+              </ResizePanelGroup>
             </OrchestratorAgentTerminalSurface>
             {activeOrchestratorSection === "todo" ? (
               workspaceScopedTabsEnabled ? (
@@ -23366,7 +24569,9 @@ function TerminalView({
     if (
       activeInFlightPrompt
       && Number(activeInFlightPrompt.startedAtMs || 0) > 0
-      && Date.now() - Number(activeInFlightPrompt.startedAtMs || 0) > TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS
+      && Date.now() - Number(activeInFlightPrompt.startedAtMs || 0) > (
+        Number(activeInFlightPrompt.timeoutMs || 0) || TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS
+      )
     ) {
       todoQueueTerminalInFlightPromptsRef.current.delete(targetTerminalIndex);
       logTerminalStatus("frontend.todo_queue.in_flight_prompt_expired", {
@@ -23399,7 +24604,7 @@ function TerminalView({
         },
         terminalStatus,
         targetThread,
-        timeoutMs: TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS,
+        timeoutMs: Number(blockingInFlightPrompt?.timeoutMs || 0) || TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS,
       });
       if (inFlightEvaluation.releaseReason) {
         logTerminalStatus("frontend.todo_queue.in_flight_prompt_cleared", {
@@ -23785,7 +24990,7 @@ function TerminalView({
           terminalGroundTruth,
           terminalStatus: liveTerminal?.status || providerBinding?.status || "",
           targetThread,
-          timeoutMs: TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS,
+          timeoutMs: Number(inFlightPrompt?.timeoutMs || 0) || TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS,
         });
         const providerSessionId = String(
           getProviderSessionId(targetThread)
@@ -23905,24 +25110,25 @@ function TerminalView({
           return;
         }
 
-          todoQueueTerminalInFlightPromptsRef.current.set(terminalIndex, {
-            ...inFlightPrompt,
-            accepted: true,
-            acceptedAt: new Date().toISOString(),
-            acceptedAtMs: Date.now(),
-            acceptedMatchedBy: detail.matchedBy || "",
-            sessionId: detail.sessionId || inFlightPrompt?.sessionId || "",
-          });
-          changed = true;
-          logTerminalStatus("frontend.todo_queue.in_flight_prompt_acknowledged", {
-            matchedBy: detail.matchedBy || "",
+        todoQueueTerminalInFlightPromptsRef.current.set(terminalIndex, {
+          ...inFlightPrompt,
+          accepted: true,
+          acceptedAt: new Date().toISOString(),
+          acceptedAtMs: Date.now(),
+          acceptedMatchedBy: detail.matchedBy || "",
+          awaitingSessionAcceptance: false,
+          sessionId: detail.sessionId || inFlightPrompt?.sessionId || "",
+        });
+        changed = true;
+        logTerminalStatus("frontend.todo_queue.in_flight_prompt_acknowledged", {
+          matchedBy: detail.matchedBy || "",
           promptEventId,
           reason: "prompt_accepted_waiting_for_terminal_ready",
           source: inFlightPrompt?.source || "",
           targetTerminalIndex: terminalIndex,
           threadId: detail.threadId || inFlightPrompt?.threadId || "",
-            workspaceId: detail.workspaceId || inFlightPrompt?.workspaceId || terminalWorkspace?.id || "",
-          });
+          workspaceId: detail.workspaceId || inFlightPrompt?.workspaceId || terminalWorkspace?.id || "",
+        });
         });
         if (changed) {
           setTodoQueueDispatchRevision((revision) => revision + 1);
@@ -25867,12 +27073,28 @@ function TerminalView({
     const startedAtMs = Date.now();
     const rawPhase = String(fields.phase || fields.state || "sending").trim().toLowerCase();
     const phase = rawPhase === "queued" ? "queued" : "sending";
+    const pendingReason = String(fields.reason || "").trim().toLowerCase();
+    const submitConfirmed = Boolean(
+      fields.submitConfirmed === true
+        || fields.confirmedSubmit === true
+        || fields.submit_confirmed === true
+        || pendingReason.includes("terminal_submit_confirmed")
+        || pendingReason.includes("session_accepted_waiting_for_completion")
+    );
+    const awaitingSessionAcceptance = Boolean(
+      fields.awaitingSessionAcceptance === true
+        || fields.awaiting_session_acceptance === true
+        || pendingReason.includes("session_acceptance_pending")
+        || pendingReason.includes("terminal_submit_confirmed_waiting_for_session_acceptance")
+    );
     const requestedTimeoutMs = Number(fields.timeoutMs || 0);
     const timeoutMs = phase === "queued"
       ? 0
       : requestedTimeoutMs > 0
         ? requestedTimeoutMs
-        : TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS;
+        : submitConfirmed
+          ? TODO_QUEUE_CONFIRMED_PROMPT_TIMEOUT_MS
+          : TODO_QUEUE_IN_FLIGHT_PROMPT_TIMEOUT_MS;
     const pendingSessionFields = getTodoQueueAgentSessionCloudFields(fields);
     const pendingItem = {
       cancellable: phase === "queued",
@@ -25887,6 +27109,8 @@ function TerminalView({
       reason: String(fields.reason || ""),
       startedAtMs,
       state: phase,
+      awaitingSessionAcceptance,
+      submitConfirmed,
       targetAgentId: String(fields.targetAgentId || fields.targetRole || ""),
       targetColorSlot: fields.targetColorSlot ?? "",
       targetTerminalColor: String(fields.targetTerminalColor || ""),
@@ -25975,6 +27199,41 @@ function TerminalView({
           targetThreadId: pendingItem.targetThreadId || "",
         };
         const currentItem = todoQueueItemsRef.current.find((candidate) => candidate.id === safeItemId) || null;
+        const keepSubmittedPromptRunning = Boolean(
+          currentPendingItem.submitConfirmed
+            || currentPendingItem.confirmedSubmit
+            || currentPendingItem.submit_confirmed
+            || String(currentPendingItem.reason || "").toLowerCase().includes("terminal_submit_confirmed")
+            || String(currentPendingItem.reason || "").toLowerCase().includes("session_accepted_waiting_for_completion")
+        );
+        if (keepSubmittedPromptRunning) {
+          if (currentItem) {
+            recordTodoQueueRemoteCommandReceipt(currentItem, "submitted", {
+              ...terminalAssignmentFields,
+              reason: "confirmed_submit_pending_timeout_keep_running",
+              workspaceId: pendingItem.workspaceId || terminalWorkspace?.id || "",
+            });
+          }
+          updateTodoQueueItems((currentItems) => (
+            currentItems.map((item) => (
+              item.id === safeItemId
+                ? getTodoQueueItemWithCloudStatus(
+                  getTodoQueueItemWithTerminalAssignment(item, terminalAssignmentFields),
+                  "running",
+                  {
+                    reason: "confirmed_submit_pending_timeout_keep_running",
+                    updatedAt: new Date().toISOString(),
+                  },
+                )
+                : item
+            ))
+          ), {
+            force: true,
+            immediate: true,
+            reason: "todo_queue_confirmed_submit_pending_timeout_keep_running",
+          });
+          return;
+        }
         if (currentItem) {
           recordTodoQueueRemoteCommandReceipt(currentItem, "timed_out", {
             ...terminalAssignmentFields,
@@ -28874,6 +30133,18 @@ function TerminalView({
           let writeResult = null;
           let submittedPayload = null;
           let lastSubmitError = null;
+          const currentItemRemoteCommand = currentItem?.remoteCommand && typeof currentItem.remoteCommand === "object"
+            ? currentItem.remoteCommand
+            : currentItem?.remote_command && typeof currentItem.remote_command === "object"
+              ? currentItem.remote_command
+              : {};
+          const isLoopspaceRemoteSubmit = Boolean(
+            currentItemRemoteCommand.loopRuntimeRunId
+              || currentItemRemoteCommand.loop_runtime_run_id
+              || currentItemRemoteCommand.loopspaceId
+              || currentItemRemoteCommand.loopspace_id
+          );
+          const isTerminalOrchestratorRemoteSubmit = isTerminalOrchestratorRemoteCommand(currentItem);
           const backendSubmitTarget = shouldUseBackendHookSubmit
             ? {
               agentId: targetRole,
@@ -28991,6 +30262,7 @@ function TerminalView({
               syncDataLength: syncData.length,
               threadId: targetThreadId,
             });
+            let submitWriteCompleted = false;
             try {
               if (shouldUseBackendHookSubmit) {
                 writeResult = await invoke("todo_dispatch_backend_submit_now", {
@@ -29020,6 +30292,7 @@ function TerminalView({
                   todoResumeRequested,
                   threadId: targetThreadId,
                 });
+                submitWriteCompleted = true;
               }
               logTerminalStatus("frontend.todo_queue.terminal_write.submit_done", {
                 ...terminalWriteLogBase,
@@ -29068,6 +30341,12 @@ function TerminalView({
               submittedWaiter?.cancel?.();
               lastSubmitError = error;
               const submitErrorMessage = String(error?.message || error || "");
+              const submitObservationTimedOut = Boolean(
+                submitWriteCompleted
+                  && (isLoopspaceRemoteSubmit || isTerminalOrchestratorRemoteSubmit)
+                  && !shouldUseBackendHookSubmit
+                  && submitErrorMessage.includes("Timed out waiting for the prompt to be observed in the terminal")
+              );
               logTerminalStatus("frontend.todo_queue.terminal_write.submit_error", {
                 ...terminalWriteLogBase,
                 atomicSubmit: true,
@@ -29084,11 +30363,44 @@ function TerminalView({
                 retry: isRetry,
                 submitSequenceLength: terminalSubmitSequence.length,
                 threadId: targetThreadId,
-                willRetry: !shouldUseBackendHookSubmit && submitAttemptIndex < submitAttemptDelays.length - 1,
+                willRetry: !submitObservationTimedOut && !shouldUseBackendHookSubmit && submitAttemptIndex < submitAttemptDelays.length - 1,
               });
+              if (submitObservationTimedOut) {
+                submittedPayload = {
+                  promptMatch: true,
+                  promptSource: "terminal_write_completed_submit_observation_missed",
+                };
+                submittedAt = attemptSubmittedAt;
+                logTerminalStatus("frontend.todo_queue.terminal_write.submit_observation_missed_assumed_submitted", {
+                  ...terminalWriteLogBase,
+                  attempt: submitAttemptIndex + 1,
+                  instanceId: targetBinding?.instanceId || "",
+                  promptEventId: promptId,
+                  reason: isTerminalOrchestratorRemoteSubmit
+                    ? "terminal_orchestrator_send_message_write_completed"
+                    : "loopspace_send_message_write_completed",
+                  targetTerminalIndex: targetLogIndex,
+                  threadId: targetThreadId,
+                });
+                break;
+              }
               if (
                 shouldUseBackendHookSubmit
-                && submitErrorMessage.includes("target_terminal_not_input_ready")
+                && (
+                  submitErrorMessage.includes("target_terminal_not_input_ready")
+                    || (
+                      (
+                        currentItem?.remoteCommand?.loopRuntimeRunId
+                          || currentItem?.remoteCommand?.loop_runtime_run_id
+                          || currentItem?.remoteCommand?.loopspaceId
+                          || currentItem?.remoteCommand?.loopspace_id
+                      )
+                      && (
+                        submitErrorMessage.includes("startup_reconciliation_active")
+                          || submitErrorMessage.includes("Unable to submit todo to the target terminal")
+                      )
+                    )
+                )
               ) {
                 throw createTodoQueueBusyError(
                   "target_terminal_not_input_ready",
@@ -29107,8 +30419,11 @@ function TerminalView({
           if (String(inFlightPrompt?.promptId || "") === promptId) {
             todoQueueTerminalInFlightPromptsRef.current.set(Number(target.targetTerminalIndex), {
               ...inFlightPrompt,
+              awaitingSessionAcceptance: true,
+              submitConfirmed: true,
               submittedAt,
               submittedAtMs: Date.parse(submittedAt) || Date.now(),
+              timeoutMs: TODO_QUEUE_CONFIRMED_PROMPT_TIMEOUT_MS,
             });
           }
           logTerminalStatus("frontend.todo_queue.terminal_write.submit_observed", {
@@ -29294,6 +30609,7 @@ function TerminalView({
                 acceptedAt: new Date().toISOString(),
                 acceptedAtMs: Date.now(),
                 acceptedMatchedBy,
+                awaitingSessionAcceptance: false,
                 lifecycleDispatched: Boolean(
                   inFlightPrompt?.lifecycleDispatched
                     || lifecycleDispatchedAtAcceptance
@@ -32730,7 +34046,12 @@ function TerminalView({
       if (queuedItem && queuedItemHasExplicitTerminalTarget && [
         "terminal_unavailable",
         "target_agent_mismatch",
-      ].includes(dispatchWaitReasonKey)) {
+      ].includes(dispatchWaitReasonKey) && !(
+        queuedItem?.remoteCommand?.loopRuntimeRunId
+          || queuedItem?.remoteCommand?.loop_runtime_run_id
+          || queuedItem?.remoteCommand?.loopspaceId
+          || queuedItem?.remoteCommand?.loopspace_id
+      )) {
         const releasedAt = new Date().toISOString();
         const pendingItems = { ...todoQueuePendingItemsRef.current };
         delete pendingItems[queuedItem.id];

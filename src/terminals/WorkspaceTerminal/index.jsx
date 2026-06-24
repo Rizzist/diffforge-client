@@ -670,6 +670,11 @@ const APP_CONTROL_TERMINAL_WORKSPACE_IDS = new Set([
   "diffforge_app_control",
 ]);
 const APP_CONTROL_TERMINAL_PANE_ID = "forge-app-control-agent-terminal";
+const PENDING_PROMPT_SUBMIT_SYNC_SETTLE_MS = 120;
+const PENDING_PROMPT_SUBMIT_OBSERVE_TIMEOUT_MS = 3000;
+const PENDING_PROMPT_SUBMIT_RETRY_TIMEOUT_MS = 6000;
+const PENDING_PROMPT_SUBMIT_FALLBACK_ACCEPT_GRACE_MS = 700;
+const PENDING_PROMPT_SUBMIT_OBSERVED_ACCEPT_GRACE_MS = 1800;
 
 function normalizeAppControlTerminalWorkspaceId(value) {
   return String(value || "").trim().toLowerCase();
@@ -1404,6 +1409,29 @@ function getTerminalInputSequenceDiagnosticFields(data) {
   };
 }
 
+function isTerminalPromptObservedTimeout(error) {
+  return String(error?.message || error || "")
+    .includes("Timed out waiting for the prompt to be observed in the terminal");
+}
+
+function getPendingPromptSubmitAttemptSequences(agentKind, isGenericTerminal = false) {
+  const primary = getTerminalSubmitSequence(agentKind, isGenericTerminal);
+  const sequences = [];
+  if (primary) {
+    sequences.push(primary);
+  }
+  if (getTerminalAgentKind(agentKind) === "codex" && primary !== "\r") {
+    sequences.push("\r");
+  }
+  return sequences;
+}
+
+function waitForPendingPromptSubmitSettle(delayMs = PENDING_PROMPT_SUBMIT_SYNC_SETTLE_MS) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, Math.max(0, Number(delayMs) || 0));
+  });
+}
+
 function dispatchTerminalControlUiSuppression(detail = {}) {
   if (typeof window === "undefined" || typeof window.dispatchEvent !== "function") {
     return;
@@ -2031,7 +2059,10 @@ function WorkspaceTerminal({
   onPopOutTerminalWindow,
   prewarmShell = false,
   startupReady = true,
+  showDockedDragHandle = false,
   terminalBreakoutActive = false,
+  terminalSplitLimit = MAX_WORKSPACE_TERMINAL_COUNT,
+  terminalSplitMode = "both",
   terminalSelectionMode = "pointerdown",
   windowBreakoutHosted = false,
   terminalIndex = 0,
@@ -2504,6 +2535,7 @@ function WorkspaceTerminal({
   };
   const terminalEventListenerStateRef = useRef({});
   terminalEventListenerStateRef.current = {
+    appControlTerminalSurface,
     getTerminalCliStatusLogBase,
     isGenericTerminal,
     markTerminalThreadActivityStatus,
@@ -2750,6 +2782,58 @@ function WorkspaceTerminal({
         forceNewTurn: Boolean(started),
         reason: `terminal_activity_hook:${eventType}`,
       });
+
+      if (listenerState.appControlTerminalSurface && listenerState.onThreadTerminalLifecycle && threadIdForPrompt) {
+        const lifecycleWorkspaceId = currentWorkspaceId || listenerState.workspaceId || listenerState.threadWorkspaceId || "";
+        const lifecyclePaneId = payloadPaneId || currentPaneId;
+        const lifecycleTerminalIndex = Number.isFinite(payloadTerminalIndex)
+          ? payloadTerminalIndex
+          : currentTerminalIndex;
+        listenerState.onThreadTerminalLifecycle({
+          activityStatus: nextActivityStatus,
+          agentId: payload.agentId || payload.agent_id || payload.agentKind || payload.agent_kind || listenerState.terminalAgentKind || "",
+          commandPhase: completed
+            ? eventType === "provider-turn-error"
+              ? "failed"
+              : eventType === "provider-turn-interrupted"
+                ? "interrupted"
+                : "completed"
+            : started
+              ? "running"
+              : "",
+          completedAt: payload.completedAt || payload.completed_at || "",
+          error: payload.error || "",
+          eventType,
+          hookEventName: payload.hookEventName || payload.hook_event_name || "",
+          inputReady: payload.inputReady ?? payload.input_ready,
+          instanceId: Number(payload.instanceId ?? payload.instance_id ?? terminalInstanceIdRef.current ?? 0) || undefined,
+          message: payload.message || payload.userMessage || payload.user_message || "",
+          model: payload.model || payload.model_id || payload.modelId || "",
+          nativeSessionId: payload.providerSessionId || payload.provider_session_id || "",
+          nativeSessionKind: payload.providerSessionId || payload.provider_session_id ? "session" : "",
+          nativeSessionSource: payload.providerSessionId || payload.provider_session_id ? "terminal-activity-hook" : "",
+          ...getTerminalNativeRailStateFields(nextActivityStatus),
+          paneId: lifecyclePaneId,
+          pendingPromptId: promptEventId,
+          promptEventId,
+          promptReadyAt: payload.promptReadyAt || payload.prompt_ready_at || "",
+          providerSessionId: payload.providerSessionId || payload.provider_session_id || "",
+          providerTurnId: payload.providerTurnId || payload.provider_turn_id || "",
+          source: payload.source || `terminal_activity_hook:${eventType}`,
+          status: completed
+            ? eventType === "provider-turn-error"
+              ? "failed"
+              : eventType === "provider-turn-interrupted"
+                ? "interrupted"
+                : "completed"
+            : "active",
+          terminalIndex: lifecycleTerminalIndex,
+          threadId: threadIdForPrompt,
+          type: eventType,
+          userMessage: payload.userMessage || payload.user_message || payload.message || "",
+          workspaceId: lifecycleWorkspaceId,
+        });
+      }
 
       if (completed || payload.inputReady === true || payload.input_ready === true) {
         const inputReadyAt = String(
@@ -13976,16 +14060,6 @@ function WorkspaceTerminal({
             threadId: currentThreadId,
             workspaceId: workspace?.id || thread?.workspaceId || "",
           });
-          const waiter = await createTerminalPromptSubmittedWaiter({
-            allowObservedInputGateForHookManaged: true,
-            agentId: terminalAgentKind,
-            expectedPrompt: promptText,
-            instanceId: currentInstanceId,
-            paneId,
-            promptId,
-            threadId: currentThreadId,
-            workspaceId: workspace?.id || thread?.workspaceId || "",
-          });
           const acceptedWaiter = createWorkspaceThreadPromptAcceptedWaiter({
             agentId: terminalAgentKind,
             expectedPrompt: promptText,
@@ -13993,64 +14067,28 @@ function WorkspaceTerminal({
             threadId: currentThreadId,
             workspaceId: workspace?.id || thread?.workspaceId || "",
           });
-          try {
-            const pendingPromptSubmittedAt = new Date().toISOString();
-            const submitSequence = getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal);
-            const submitSequenceTrace = getTerminalInputSequenceDiagnosticFields(submitSequence);
-            logTerminalStatus("frontend.pending_prompt.submit_write_start", {
-              ...pendingPromptLogFields,
-              instanceId: currentInstanceId,
-              promptEventSubmittedAt: pendingPromptSubmittedAt,
-              submitSequence: submitSequenceTrace,
-              submitSequenceLength: submitSequence.length,
-              threadId: currentThreadId,
-            });
-            logThreadBridgeDiagnostic("frontend.pending_prompt.submit_sequence_resolved", {
-              agentId: terminalAgentKind,
-              deliveryMode: effectiveDeliveryMode,
-              instanceId: currentInstanceId,
-              paneId,
-              promptId,
-              promptEventSubmittedAt: pendingPromptSubmittedAt,
-              promptText: pendingPromptTextDiagnostic,
-              sendPolicy: "pending-prompt-terminal-confirmed-submit",
-              submitSequence: submitSequenceTrace,
-              terminalIndex,
-              threadId: currentThreadId,
-              workspaceId: workspace?.id || thread?.workspaceId || "",
-            });
-            await invoke("terminal_write", {
-              data: submitSequence,
-              instanceId: currentInstanceId,
-              paneId,
-              promptEventId: promptId,
-              promptEventSource: "pending-prompt",
-              promptEventSubmittedAt: pendingPromptSubmittedAt,
-              promptEventText: promptText,
-              threadId: currentThreadId,
-            });
-            logTerminalStatus("frontend.pending_prompt.submit_write_done", {
-              ...pendingPromptLogFields,
-              instanceId: currentInstanceId,
-              promptEventSubmittedAt: pendingPromptSubmittedAt,
-              submitSequence: submitSequenceTrace,
-              submitSequenceLength: submitSequence.length,
-              threadId: currentThreadId,
-            });
-            logThreadBridgeDiagnostic("frontend.pending_prompt.submit_write_done", {
-              agentId: terminalAgentKind,
-              deliveryMode: effectiveDeliveryMode,
-              instanceId: currentInstanceId,
-              paneId,
-              promptId,
-              promptEventSubmittedAt: pendingPromptSubmittedAt,
-              promptText: pendingPromptTextDiagnostic,
-              sendPolicy: "pending-prompt-terminal-confirmed-submit",
-              submitSequence: submitSequenceTrace,
-              terminalIndex,
-              threadId: currentThreadId,
-              workspaceId: workspace?.id || thread?.workspaceId || "",
-            });
+          const acceptedPromise = acceptedWaiter.promise.then((detail) => ({
+            detail,
+            kind: "accepted",
+          }), (error) => ({
+            error,
+            kind: "accept_error",
+          }));
+          const submitSequences = getPendingPromptSubmitAttemptSequences(
+            terminalAgentKind,
+            isGenericTerminal,
+          );
+          let activeSubmitWaiter = null;
+          let directTodoCaptureSettled = false;
+          let acceptedDetailFromRace = null;
+          let observedSubmit = false;
+          let observedSubmitRetried = false;
+
+          const captureDirectTodoIfNeeded = async (pendingPromptSubmittedAt) => {
+            if (directTodoCaptureSettled) {
+              return;
+            }
+            directTodoCaptureSettled = true;
             if (appControlTerminalSurface) {
               logTerminalStatus("frontend.pending_prompt.direct_todo_capture_skip", {
                 ...pendingPromptLogFields,
@@ -14071,67 +14109,320 @@ function WorkspaceTerminal({
                 threadId: currentThreadId,
                 workspaceId: workspace?.id || thread?.workspaceId || "",
               });
-            } else {
-              try {
-                const capturedTodoItemId = await invoke("terminal_capture_direct_prompt_todo", {
-                  request: {
-                    agentKind: terminalAgentKind,
-                    itemId: "",
-                    paneId,
-                    prompt: promptText,
-                    promptEventId: promptId,
-                    terminalIndex,
-                    threadId: currentThreadId,
-                    workspaceId: workspace?.id || thread?.workspaceId || "",
-                    workspaceName: workspace?.name || "",
-                  },
-                });
-                logTerminalStatus("frontend.pending_prompt.direct_todo_captured", {
-                  ...pendingPromptLogFields,
-                  capturedTodoItemId: capturedTodoItemId || "",
-                  instanceId: currentInstanceId,
-                  promptEventSubmittedAt: pendingPromptSubmittedAt,
-                  threadId: currentThreadId,
-                });
-                logThreadBridgeDiagnostic("frontend.pending_prompt.direct_todo_captured", {
-                  agentId: terminalAgentKind,
-                  capturedTodoItemId: capturedTodoItemId || "",
-                  deliveryMode: effectiveDeliveryMode,
-                  instanceId: currentInstanceId,
+              return;
+            }
+
+            try {
+              const capturedTodoItemId = await invoke("terminal_capture_direct_prompt_todo", {
+                request: {
+                  agentKind: terminalAgentKind,
+                  itemId: "",
                   paneId,
-                  promptId,
-                  promptText: pendingPromptTextDiagnostic,
-                  sendPolicy: "pending-prompt-terminal-direct-todo",
+                  prompt: promptText,
+                  promptEventId: promptId,
                   terminalIndex,
                   threadId: currentThreadId,
                   workspaceId: workspace?.id || thread?.workspaceId || "",
+                  workspaceName: workspace?.name || "",
+                },
+              });
+              logTerminalStatus("frontend.pending_prompt.direct_todo_captured", {
+                ...pendingPromptLogFields,
+                capturedTodoItemId: capturedTodoItemId || "",
+                instanceId: currentInstanceId,
+                promptEventSubmittedAt: pendingPromptSubmittedAt,
+                threadId: currentThreadId,
+              });
+              logThreadBridgeDiagnostic("frontend.pending_prompt.direct_todo_captured", {
+                agentId: terminalAgentKind,
+                capturedTodoItemId: capturedTodoItemId || "",
+                deliveryMode: effectiveDeliveryMode,
+                instanceId: currentInstanceId,
+                paneId,
+                promptId,
+                promptText: pendingPromptTextDiagnostic,
+                sendPolicy: "pending-prompt-terminal-direct-todo",
+                terminalIndex,
+                threadId: currentThreadId,
+                workspaceId: workspace?.id || thread?.workspaceId || "",
+              });
+            } catch (captureError) {
+              const captureMessage = getErrorMessage(captureError, "Unable to capture pending prompt todo.");
+              logTerminalStatus("frontend.pending_prompt.direct_todo_capture_error", {
+                ...pendingPromptLogFields,
+                error: captureMessage,
+                instanceId: currentInstanceId,
+                promptEventSubmittedAt: pendingPromptSubmittedAt,
+                threadId: currentThreadId,
+              });
+              logThreadBridgeDiagnostic("frontend.pending_prompt.direct_todo_capture_error", {
+                agentId: terminalAgentKind,
+                deliveryMode: effectiveDeliveryMode,
+                error: captureMessage,
+                instanceId: currentInstanceId,
+                paneId,
+                promptId,
+                terminalIndex,
+                threadId: currentThreadId,
+                workspaceId: workspace?.id || thread?.workspaceId || "",
+              });
+            }
+          };
+
+          const writePendingPromptSubmit = async ({
+            attemptIndex,
+            promptEventSource,
+            submitSequence,
+            timeoutMs,
+          }) => {
+            const pendingPromptSubmittedAt = new Date().toISOString();
+            const submitSequenceTrace = getTerminalInputSequenceDiagnosticFields(submitSequence);
+            activeSubmitWaiter = await createTerminalPromptSubmittedWaiter({
+              allowObservedInputGateForHookManaged: true,
+              agentId: terminalAgentKind,
+              expectedPrompt: promptText,
+              instanceId: currentInstanceId,
+              paneId,
+              promptId,
+              threadId: currentThreadId,
+              timeoutMs,
+              workspaceId: workspace?.id || thread?.workspaceId || "",
+            });
+            logTerminalStatus("frontend.pending_prompt.submit_write_start", {
+              ...pendingPromptLogFields,
+              attempt: attemptIndex + 1,
+              instanceId: currentInstanceId,
+              promptEventSubmittedAt: pendingPromptSubmittedAt,
+              promptEventSource,
+              submitSequence: submitSequenceTrace,
+              submitSequenceLength: submitSequence.length,
+              threadId: currentThreadId,
+            });
+            logThreadBridgeDiagnostic("frontend.pending_prompt.submit_sequence_resolved", {
+              agentId: terminalAgentKind,
+              attempt: attemptIndex + 1,
+              deliveryMode: effectiveDeliveryMode,
+              instanceId: currentInstanceId,
+              paneId,
+              promptId,
+              promptEventSource,
+              promptEventSubmittedAt: pendingPromptSubmittedAt,
+              promptText: pendingPromptTextDiagnostic,
+              sendPolicy: "pending-prompt-terminal-confirmed-submit",
+              submitSequence: submitSequenceTrace,
+              terminalIndex,
+              threadId: currentThreadId,
+              workspaceId: workspace?.id || thread?.workspaceId || "",
+            });
+            await invoke("terminal_write", {
+              data: submitSequence,
+              instanceId: currentInstanceId,
+              paneId,
+              promptEventId: promptId,
+              promptEventSource,
+              promptEventSubmittedAt: pendingPromptSubmittedAt,
+              promptEventText: promptText,
+              threadId: currentThreadId,
+            });
+            logTerminalStatus("frontend.pending_prompt.submit_write_done", {
+              ...pendingPromptLogFields,
+              attempt: attemptIndex + 1,
+              instanceId: currentInstanceId,
+              promptEventSubmittedAt: pendingPromptSubmittedAt,
+              promptEventSource,
+              submitSequence: submitSequenceTrace,
+              submitSequenceLength: submitSequence.length,
+              threadId: currentThreadId,
+            });
+            logThreadBridgeDiagnostic("frontend.pending_prompt.submit_write_done", {
+              agentId: terminalAgentKind,
+              attempt: attemptIndex + 1,
+              deliveryMode: effectiveDeliveryMode,
+              instanceId: currentInstanceId,
+              paneId,
+              promptId,
+              promptEventSource,
+              promptEventSubmittedAt: pendingPromptSubmittedAt,
+              promptText: pendingPromptTextDiagnostic,
+              sendPolicy: "pending-prompt-terminal-confirmed-submit",
+              submitSequence: submitSequenceTrace,
+              terminalIndex,
+              threadId: currentThreadId,
+              workspaceId: workspace?.id || thread?.workspaceId || "",
+            });
+            await captureDirectTodoIfNeeded(pendingPromptSubmittedAt);
+            const submitOutcome = await Promise.race([
+              activeSubmitWaiter.promise.then((payload) => ({
+                kind: "submitted",
+                payload,
+              }), (error) => ({
+                error,
+                kind: "submit_error",
+              })),
+              acceptedPromise,
+            ]);
+            if (submitOutcome.kind === "accepted") {
+              activeSubmitWaiter.cancel();
+              activeSubmitWaiter = null;
+              return submitOutcome;
+            }
+            if (submitOutcome.kind === "submit_error") {
+              activeSubmitWaiter = null;
+              throw submitOutcome.error;
+            }
+            activeSubmitWaiter = null;
+            return submitOutcome;
+          };
+          try {
+            if (!submitSequences.length) {
+              throw new Error("This pending prompt cannot send without a live coding-agent TUI.");
+            }
+            if (syncData && PENDING_PROMPT_SUBMIT_SYNC_SETTLE_MS > 0) {
+              await waitForPendingPromptSubmitSettle();
+            }
+            let lastSubmitError = null;
+            for (let attemptIndex = 0; attemptIndex < submitSequences.length; attemptIndex += 1) {
+              const submitSequence = submitSequences[attemptIndex];
+              const promptEventSource = attemptIndex === 0
+                ? "pending-prompt"
+                : "pending-prompt-submit-fallback";
+              try {
+                const submitOutcome = await writePendingPromptSubmit({
+                  attemptIndex,
+                  promptEventSource,
+                  submitSequence,
+                  timeoutMs: attemptIndex === 0
+                    ? PENDING_PROMPT_SUBMIT_OBSERVE_TIMEOUT_MS
+                    : PENDING_PROMPT_SUBMIT_RETRY_TIMEOUT_MS,
                 });
-              } catch (captureError) {
-                const captureMessage = getErrorMessage(captureError, "Unable to capture pending prompt todo.");
-                logTerminalStatus("frontend.pending_prompt.direct_todo_capture_error", {
+                if (submitOutcome.kind === "accepted") {
+                  acceptedDetailFromRace = submitOutcome.detail;
+                } else if (submitOutcome.kind === "submitted") {
+                  observedSubmit = true;
+                  const hasFallback = attemptIndex < submitSequences.length - 1;
+                  if (
+                    hasFallback
+                    && getTerminalAgentKind(terminalAgentKind) === "codex"
+                    && submitSequence !== "\r"
+                  ) {
+                    const acceptedAfterObservedSubmit = await Promise.race([
+                      acceptedPromise,
+                      waitForPendingPromptSubmitSettle(PENDING_PROMPT_SUBMIT_OBSERVED_ACCEPT_GRACE_MS)
+                        .then(() => ({ kind: "pending" })),
+                    ]);
+                    if (acceptedAfterObservedSubmit.kind === "accepted") {
+                      acceptedDetailFromRace = acceptedAfterObservedSubmit.detail;
+                    } else {
+                      const latestDraft = String(threadComposerDraftsRef.current.get(pendingSyncKey) || "").trim();
+                      if (latestDraft === promptText) {
+                        observedSubmit = false;
+                        observedSubmitRetried = true;
+                        logTerminalStatus("frontend.pending_prompt.submit_observed_retry", {
+                          ...pendingPromptLogFields,
+                          attempt: attemptIndex + 1,
+                          instanceId: currentInstanceId,
+                          reason: "codex_primary_submit_observed_without_acceptance",
+                          threadId: currentThreadId,
+                        });
+                        logThreadBridgeDiagnostic("frontend.pending_prompt.submit_observed_retry", {
+                          agentId: terminalAgentKind,
+                          attempt: attemptIndex + 1,
+                          deliveryMode: effectiveDeliveryMode,
+                          instanceId: currentInstanceId,
+                          paneId,
+                          promptId,
+                          reason: "codex_primary_submit_observed_without_acceptance",
+                          terminalIndex,
+                          threadId: currentThreadId,
+                          workspaceId: workspace?.id || thread?.workspaceId || "",
+                        });
+                        continue;
+                      }
+                    }
+                  }
+                }
+                break;
+              } catch (submitError) {
+                activeSubmitWaiter?.cancel?.();
+                activeSubmitWaiter = null;
+                lastSubmitError = submitError;
+                const hasFallback = attemptIndex < submitSequences.length - 1;
+                const latestDraft = String(threadComposerDraftsRef.current.get(pendingSyncKey) || "").trim();
+                const submitObservedTimedOut = isTerminalPromptObservedTimeout(submitError);
+                if (!submitObservedTimedOut) {
+                  throw submitError;
+                }
+                if (!hasFallback) {
+                  const acceptedAfterObserverTimeout = await acceptedPromise;
+                  if (acceptedAfterObserverTimeout.kind === "accepted") {
+                    acceptedDetailFromRace = acceptedAfterObserverTimeout.detail;
+                    break;
+                  }
+                  throw submitError;
+                }
+                const acceptedBeforeFallback = await Promise.race([
+                  acceptedPromise,
+                  waitForPendingPromptSubmitSettle(PENDING_PROMPT_SUBMIT_FALLBACK_ACCEPT_GRACE_MS)
+                    .then(() => ({ kind: "pending" })),
+                ]);
+                if (acceptedBeforeFallback.kind === "accepted") {
+                  acceptedDetailFromRace = acceptedBeforeFallback.detail;
+                  break;
+                }
+                if (latestDraft !== promptText) {
+                  throw submitError;
+                }
+                observedSubmitRetried = true;
+                logTerminalStatus("frontend.pending_prompt.submit_observation_retry", {
                   ...pendingPromptLogFields,
-                  error: captureMessage,
+                  attempt: attemptIndex + 1,
                   instanceId: currentInstanceId,
-                  promptEventSubmittedAt: pendingPromptSubmittedAt,
+                  reason: "submit_observation_timeout",
                   threadId: currentThreadId,
                 });
-                logThreadBridgeDiagnostic("frontend.pending_prompt.direct_todo_capture_error", {
+                logThreadBridgeDiagnostic("frontend.pending_prompt.submit_observation_retry", {
                   agentId: terminalAgentKind,
+                  attempt: attemptIndex + 1,
                   deliveryMode: effectiveDeliveryMode,
-                  error: captureMessage,
                   instanceId: currentInstanceId,
                   paneId,
                   promptId,
+                  reason: "submit_observation_timeout",
                   terminalIndex,
                   threadId: currentThreadId,
                   workspaceId: workspace?.id || thread?.workspaceId || "",
                 });
               }
             }
-            await waiter.promise;
+            if (!observedSubmit && !acceptedDetailFromRace) {
+              throw lastSubmitError || new Error("Timed out waiting for the prompt to be observed in the terminal.");
+            }
+            if (acceptedDetailFromRace) {
+              logTerminalStatus("frontend.pending_prompt.submit_accepted_without_observer", {
+                ...pendingPromptLogFields,
+                instanceId: currentInstanceId,
+                matchedBy: acceptedDetailFromRace?.matchedBy || "",
+                threadId: currentThreadId,
+              });
+              logThreadBridgeDiagnostic("frontend.pending_prompt.submit_accepted_without_observer", {
+                agentId: terminalAgentKind,
+                deliveryMode: effectiveDeliveryMode,
+                instanceId: currentInstanceId,
+                matchedBy: acceptedDetailFromRace?.matchedBy || "",
+                paneId,
+                promptId,
+                promptText: pendingPromptTextDiagnostic,
+                sendPolicy: "terminal-accepted-before-submit-observed",
+                terminalIndex,
+                threadId: currentThreadId,
+                workspaceId: workspace?.id || thread?.workspaceId || "",
+              });
+              return acceptedDetailFromRace;
+            }
             logTerminalStatus("frontend.pending_prompt.submit_observed", {
               ...pendingPromptLogFields,
               instanceId: currentInstanceId,
+              retried: observedSubmitRetried,
               threadId: currentThreadId,
             });
             logThreadBridgeDiagnostic("frontend.pending_prompt.await_session_acceptance", {
@@ -14156,14 +14447,17 @@ function WorkspaceTerminal({
               expectedPrompt: promptText,
               getDraftValue: () => threadComposerDraftsRef.current.get(pendingSyncKey) || "",
               isGenericTerminal,
+              allowEnterRetry: !observedSubmitRetried,
               logPrefix: "frontend.pending_prompt",
               promptId,
-              submitSequence: getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal),
+              submitSequence: getTerminalAgentKind(terminalAgentKind) === "codex"
+                ? submitSequences[submitSequences.length - 1] || getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal)
+                : submitSequences[0] || getTerminalSubmitSequence(terminalAgentKind, isGenericTerminal),
               threadId: currentThreadId,
               workspaceId: workspace?.id || thread?.workspaceId || "",
             });
           } catch (error) {
-            waiter.cancel();
+            activeSubmitWaiter?.cancel?.();
             acceptedWaiter.cancel();
             throw error;
           }
@@ -15095,7 +15389,22 @@ function WorkspaceTerminal({
     workspace?.name,
   ]);
 
-  const canSplitTerminal = !threadsViewActive && terminalCount < MAX_WORKSPACE_TERMINAL_COUNT;
+  const terminalSplitModeId = String(terminalSplitMode || "both").trim().toLowerCase();
+  const normalizedTerminalSplitLimit = Math.max(
+    1,
+    Math.min(
+      MAX_WORKSPACE_TERMINAL_COUNT,
+      Number.parseInt(terminalSplitLimit, 10) || MAX_WORKSPACE_TERMINAL_COUNT,
+    ),
+  );
+  const terminalHorizontalSplitAllowed = terminalSplitModeId !== "vertical-only";
+  const terminalVerticalSplitAllowed = terminalSplitModeId !== "horizontal-only";
+  const canSplitTerminal = !threadsViewActive
+    && typeof onSplitTerminal === "function"
+    && terminalCount < normalizedTerminalSplitLimit
+    && (terminalHorizontalSplitAllowed || terminalVerticalSplitAllowed);
+  const canSplitTerminalHorizontally = canSplitTerminal && terminalHorizontalSplitAllowed;
+  const canSplitTerminalVertically = canSplitTerminal && terminalVerticalSplitAllowed;
   const canOpenTerminalUiView = !threadsViewActive
     && !terminalClosed
     && !terminalClosing
@@ -15580,6 +15889,8 @@ function WorkspaceTerminal({
         "--terminal-slot-accent": shellLauncherHasLaunched ? "#3ccb7f" : "#f2c24e",
       }
       : undefined;
+  const showDockedTerminalDragHandle = terminalChromeDocked && showDockedDragHandle && terminalCount > 1;
+  const terminalDragHandleVisible = !terminalChromeDocked || showDockedTerminalDragHandle;
 
   return (
     <TerminalWorkspaceSurface
@@ -15597,20 +15908,20 @@ function WorkspaceTerminal({
     >
       <TerminalRestartPill data-terminal-control="true">
         <TerminalRailIdentity data-docked={terminalChromeDocked ? "true" : undefined}>
+          {terminalDragHandleVisible && (
+            <TerminalRestartButton
+              aria-label="Drag terminal"
+              data-terminal-drag-handle="true"
+              disabled={terminalClosed || terminalClosing || isFullscreen || (!terminalBreakoutActive && terminalCount <= 1)}
+              onPointerDown={beginTerminalDrag}
+              title={isFullscreen ? "Exit fullscreen to reorder terminals" : "Drag terminal"}
+              type="button"
+            >
+              <ButtonDragIcon aria-hidden="true" />
+            </TerminalRestartButton>
+          )}
           {!terminalChromeDocked && (
             <>
-              {/* Drag handle lives at the far left of the rail, away from the
-                  destructive close button on the right. */}
-              <TerminalRestartButton
-                aria-label="Drag terminal"
-                data-terminal-drag-handle="true"
-                disabled={terminalClosed || terminalClosing || isFullscreen || (!terminalBreakoutActive && terminalCount <= 1)}
-                onPointerDown={beginTerminalDrag}
-                title={isFullscreen ? "Exit fullscreen to reorder terminals" : "Drag terminal"}
-                type="button"
-              >
-                <ButtonDragIcon aria-hidden="true" />
-              </TerminalRestartButton>
               <TerminalAgentDot
                 aria-hidden="true"
                 data-agent={shellLauncherRailAgentKind}
@@ -15803,26 +16114,34 @@ function WorkspaceTerminal({
           >
             <ButtonFontPlusIcon aria-hidden="true" />
           </TerminalRestartButton>
+          {(!terminalChromeDocked || terminalSplitModeId !== "both") && (
+            <>
+              {terminalHorizontalSplitAllowed && (
+                <TerminalRestartButton
+                  aria-label="Split terminal horizontally"
+                  disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminalHorizontally}
+                  onClick={splitTerminalHorizontal}
+                  title={threadsViewActive ? "Exit threads view to split" : canSplitTerminalHorizontally ? "Split terminal horizontally" : "Terminal limit reached"}
+                  type="button"
+                >
+                  <ButtonSplitHorizontalIcon aria-hidden="true" />
+                </TerminalRestartButton>
+              )}
+              {terminalVerticalSplitAllowed && (
+                <TerminalRestartButton
+                  aria-label="Split terminal vertically"
+                  disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminalVertically}
+                  onClick={splitTerminalVertical}
+                  title={threadsViewActive ? "Exit threads view to split" : canSplitTerminalVertically ? "Split terminal vertically" : "Terminal limit reached"}
+                  type="button"
+                >
+                  <ButtonSplitVerticalIcon aria-hidden="true" />
+                </TerminalRestartButton>
+              )}
+            </>
+          )}
           {!terminalChromeDocked && (
             <>
-              <TerminalRestartButton
-                aria-label="Split terminal horizontally"
-                disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
-                onClick={splitTerminalHorizontal}
-                title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal horizontally" : "Terminal limit reached"}
-                type="button"
-              >
-                <ButtonSplitHorizontalIcon aria-hidden="true" />
-              </TerminalRestartButton>
-              <TerminalRestartButton
-                aria-label="Split terminal vertically"
-                disabled={threadsViewActive || terminalClosed || terminalClosing || !canSplitTerminal}
-                onClick={splitTerminalVertical}
-                title={threadsViewActive ? "Exit threads view to split" : canSplitTerminal ? "Split terminal vertically" : "Terminal limit reached"}
-                type="button"
-              >
-                <ButtonSplitVerticalIcon aria-hidden="true" />
-              </TerminalRestartButton>
               <TerminalRestartButton
                 aria-label={isFullscreen ? "Restore terminal" : "Maximize terminal"}
                 disabled={terminalClosed || terminalClosing}

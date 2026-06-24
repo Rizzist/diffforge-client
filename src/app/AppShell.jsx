@@ -19,7 +19,7 @@ import { KeyboardArrowDown } from "@styled-icons/material-rounded/KeyboardArrowD
 import { Schedule } from "@styled-icons/material-rounded/Schedule";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Webhook } from "@styled-icons/material-rounded/Webhook";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import {
@@ -130,7 +130,18 @@ import {
   removeDfBlueprintTrigger,
   sanitizeDfBlueprintId,
   updateDfBlueprintNodeProps,
+  validateDfBlueprintSourceForUpdate,
+  validateDfBlueprintSource,
 } from "../loopspaces/dfblueprint.js";
+import {
+  LOOPSPACE_GRAPH_NODE_TEMPLATES,
+  loopspaceGraphInputPortsForNode as contractLoopspaceGraphInputPortsForNode,
+  loopspaceGraphOutputPortForId as contractLoopspaceGraphOutputPortForId,
+  loopspaceGraphOutputPortsForNode as contractLoopspaceGraphOutputPortsForNode,
+  loopspaceGraphPortLabel as contractLoopspaceGraphPortLabel,
+  loopspaceGraphVisualDefaultsForNode as contractLoopspaceGraphVisualDefaultsForNode,
+  validateLoopspaceGraphEdgeCandidate,
+} from "../loopspaces/graphContract.js";
 import {
   disposeSharedNotificationSfx,
   getSharedNotificationSfx,
@@ -349,10 +360,14 @@ import {
   LoopspaceGraphNodePort,
   LoopspaceGraphMessageRegion,
   LoopspaceGraphMessageSettingsButton,
-  LoopspaceGraphMessageSummary,
+  LoopspaceGraphMessageFlow,
+  LoopspaceGraphMessageFlowEdges,
+  LoopspaceGraphMessageFlowEdgePath,
+  LoopspaceGraphMessageFlowNode,
+  LoopspaceGraphMessageFlowNodePort,
+  LoopspaceGraphMessageFlowNodeText,
   LoopspaceGraphMessagePrompt,
   LoopspaceGraphMessageSettingsPanel,
-  LoopspaceGraphMessageSettingsHeader,
   LoopspaceGraphMessageSettingsSection,
   LoopspaceGraphMessageSettingsGrid,
   LoopspaceGraphMessageSettingsField,
@@ -361,6 +376,11 @@ import {
   LoopspaceGraphMessageSubnodeButton,
   LoopspaceGraphMessageSubnodeList,
   LoopspaceGraphMessageSubnodeItem,
+  LoopspaceGraphMessageSubnodeMain,
+  LoopspaceGraphMessageStepHeader,
+  LoopspaceGraphMessageStepNumber,
+  LoopspaceGraphMessageStepInput,
+  LoopspaceGraphMessageStepDescription,
   LoopspaceGraphMessageSettingsActions,
   LoopspaceGraphMessageSaveButton,
   LoopspaceGraphMessageResize,
@@ -387,8 +407,11 @@ import {
   LoopspaceRuntimePanelNodeCard,
   LoopspaceRuntimePanelEventList,
   LoopspaceRuntimePanelEventRow,
-  LoopspaceRuntimePanelDetail,
   LoopspaceRuntimePanelResumeButton,
+  LoopspaceRuntimeConsole,
+  LoopspaceRuntimeConsoleDetail,
+  LoopspaceRuntimeConsoleLoader,
+  LoopspaceRuntimeConsoleRow,
   LoopspaceRailSettingsMenu,
   LoopspaceRailSettingsItem,
   LoopspaceRuntimeError,
@@ -837,8 +860,10 @@ const REMOTE_NAVIGATION_COMMANDS = new Set([
 ]);
 const APP_CONTROL_MCP_REQUEST_EVENT = "forge-app-control-mcp-request";
 const APP_CONTROL_TERMINAL_FOCUS_EVENT = "forge-app-control-terminal-focus";
+const REMOTE_APP_CONTROL_SEND_MESSAGE_EVENT = "diffforge:remote-app-control-send-message";
+const DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID = "__diffforge_app_control__";
 const DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_IDS = new Set([
-  "__diffforge_app_control__",
+  DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
   "diffforge_app_control",
 ]);
 const DEVICE_TERMINAL_ORCHESTRATOR_PANE_ID = "forge-app-control-agent-terminal";
@@ -981,6 +1006,203 @@ function appControlLoopspaceTriggerRunRows(value) {
       };
     }).filter((row) => row.id)
     : [];
+}
+
+function filterLoopspaceRuntimeEvents(events, loopspaceId) {
+  const target = String(loopspaceId || "").trim();
+  if (!target) return events || [];
+  return (events || []).filter((event) => (
+    !event?.loopspaceId || event.loopspaceId === target
+  ));
+}
+
+function appControlLoopspaceRuntimeEventRows(value, loopspaceId = "") {
+  const targetLoopspaceId = String(loopspaceId || "").trim();
+  const candidates = [
+    value?.payload,
+    value?.sync,
+    value?.response,
+    value?.data,
+    value?.event,
+    value?.appliedPayload,
+    value?.applied_payload,
+    value,
+  ].filter(Boolean);
+  const rows = [];
+  const pushEventRows = (items, parentLoopspaceId = "") => {
+    const parentId = String(parentLoopspaceId || "").trim();
+    if (targetLoopspaceId && parentId && parentId !== targetLoopspaceId) return;
+    if (!Array.isArray(items)) return;
+    for (const item of items) {
+      if (!item || typeof item !== "object") continue;
+      const eventLoopspaceId = appControlText(item, ["loopspaceId", "loopspace_id"]);
+      if (targetLoopspaceId && eventLoopspaceId && eventLoopspaceId !== targetLoopspaceId) continue;
+      rows.push(parentId && !eventLoopspaceId
+        ? {
+          ...item,
+          loopspace_id: parentId,
+          loopspaceId: parentId,
+        }
+        : item);
+    }
+  };
+  for (const candidate of candidates) {
+    for (const key of ["runtimeEvents", "runtime_events", "events"]) {
+      pushEventRows(candidate?.[key]);
+    }
+    const loopspaces = Array.isArray(candidate?.loopspaces) ? candidate.loopspaces : [];
+    for (const loopspaceRow of loopspaces) {
+      const parentLoopspaceId = appControlText(loopspaceRow, ["id", "loopspaceId", "loopspace_id"]);
+      for (const key of ["runtimeEvents", "runtime_events", "events"]) {
+        pushEventRows(loopspaceRow?.[key], parentLoopspaceId);
+      }
+    }
+    const loopspaceRow = candidate?.loopspace && typeof candidate.loopspace === "object"
+      ? candidate.loopspace
+      : null;
+    if (loopspaceRow) {
+      const parentLoopspaceId = appControlText(loopspaceRow, ["id", "loopspaceId", "loopspace_id"]);
+      for (const key of ["runtimeEvents", "runtime_events", "events"]) {
+        pushEventRows(loopspaceRow?.[key], parentLoopspaceId);
+      }
+    }
+  }
+  const byId = new Map();
+  for (const row of rows) {
+    const id = appControlText(row, ["id", "event_id", "eventId"]);
+    if (!id) continue;
+    const details = row?.details && typeof row.details === "object"
+      ? row.details
+      : row?.details_json && typeof row.details_json === "object"
+        ? row.details_json
+        : {};
+    const normalized = {
+      ...row,
+      createdAtMs: Number(row?.createdAtMs || row?.created_at_ms || 0) || 0,
+      details,
+      edgeId: appControlText(row, ["edgeId", "edge_id"]),
+      eventSeq: Number(row?.eventSeq || row?.event_seq || row?.seq || 0) || 0,
+      id,
+      kind: appControlText(row, ["kind", "eventKind", "event_kind"]) || "runtime.event",
+      loopspaceId: appControlText(row, ["loopspaceId", "loopspace_id"]),
+      message: appControlText(row, ["message"]) || appControlText(row, ["status"]) || "Runtime event",
+      nodeId: appControlText(row, ["nodeId", "node_id"]),
+      runId: appControlText(row, ["runId", "run_id"]),
+      severity: appControlText(row, ["severity"]).toLowerCase() || "info",
+      status: appControlText(row, ["status"]),
+      triggerId: appControlText(row, ["triggerId", "trigger_id"]),
+      triggerRunId: appControlText(row, ["triggerRunId", "trigger_run_id"]),
+    };
+    if (targetLoopspaceId && normalized.loopspaceId !== targetLoopspaceId) {
+      continue;
+    }
+    byId.set(id, { ...(byId.get(id) || {}), ...normalized });
+  }
+  return [...byId.values()].sort((left, right) => (
+    (left.eventSeq || 0) - (right.eventSeq || 0)
+    || (left.createdAtMs || 0) - (right.createdAtMs || 0)
+    || String(left.id).localeCompare(String(right.id))
+  ));
+}
+
+function appControlLoopspaceRuntimeEventPage(value, loopspaceId = "") {
+  const targetLoopspaceId = String(loopspaceId || "").trim();
+  const candidates = [
+    value?.payload,
+    value?.sync,
+    value?.response,
+    value?.data,
+    value?.event,
+    value?.appliedPayload,
+    value?.applied_payload,
+    value,
+  ].filter(Boolean);
+  const normalizePage = (page) => page && typeof page === "object"
+    ? {
+      beforeEventSeq: Number(page.beforeEventSeq || page.before_event_seq || 0) || 0,
+      hasMoreBefore: Boolean(page.hasMoreBefore ?? page.has_more_before),
+    }
+    : null;
+  if (targetLoopspaceId) {
+    for (const candidate of candidates) {
+      const loopspaces = Array.isArray(candidate?.loopspaces) ? candidate.loopspaces : [];
+      for (const loopspaceRow of loopspaces) {
+        const rowLoopspaceId = appControlText(loopspaceRow, ["id", "loopspaceId", "loopspace_id"]);
+        if (rowLoopspaceId !== targetLoopspaceId) continue;
+        const page = normalizePage(loopspaceRow.runtimeEventPage || loopspaceRow.runtime_event_page);
+        if (page) return page;
+      }
+      const loopspaceRow = candidate?.loopspace && typeof candidate.loopspace === "object"
+        ? candidate.loopspace
+        : null;
+      if (loopspaceRow) {
+        const rowLoopspaceId = appControlText(loopspaceRow, ["id", "loopspaceId", "loopspace_id"]);
+        if (!rowLoopspaceId || rowLoopspaceId === targetLoopspaceId) {
+          const page = normalizePage(loopspaceRow.runtimeEventPage || loopspaceRow.runtime_event_page);
+          if (page) return page;
+        }
+      }
+    }
+  }
+  for (const candidate of candidates) {
+    const page = normalizePage(candidate?.runtimeEventPage || candidate?.runtime_event_page);
+    if (page) return page;
+  }
+  const direct = candidates.find((candidate) => (
+    candidate?.hasMoreBefore !== undefined || candidate?.has_more_before !== undefined
+  ));
+  return {
+    beforeEventSeq: 0,
+    hasMoreBefore: Boolean(direct?.hasMoreBefore ?? direct?.has_more_before),
+  };
+}
+
+function mergeLoopspaceRuntimeEventRows(existing, incoming, replace = false) {
+  const byId = new Map();
+  if (!replace) {
+    for (const row of existing || []) {
+      if (row?.id) byId.set(row.id, row);
+    }
+  }
+  for (const row of incoming || []) {
+    if (row?.id) byId.set(row.id, { ...(byId.get(row.id) || {}), ...row });
+  }
+  return [...byId.values()].sort((left, right) => (
+    (left.eventSeq || 0) - (right.eventSeq || 0)
+    || (left.createdAtMs || 0) - (right.createdAtMs || 0)
+    || String(left.id).localeCompare(String(right.id))
+  ));
+}
+
+function loopspaceRuntimeEventTone(event) {
+  const severity = String(event?.severity || "").toLowerCase();
+  const status = String(event?.status || "").toLowerCase();
+  if (["error", "failed", "failure", "interrupted", "cancelled"].some((item) => severity === item || status === item)) return "error";
+  if (["warn", "warning", "blocked", "awaiting_device"].some((item) => severity === item || status === item)) return "queued";
+  if (["good", "success", "succeeded", "completed", "complete"].some((item) => severity === item || status === item)) return "good";
+  if (["running", "queued", "dispatched"].includes(status)) return "active";
+  return "neutral";
+}
+
+function loopspaceRuntimeEventKindLabel(event) {
+  const kind = String(event?.kind || event?.eventKind || "").trim();
+  if (!kind) return "runtime";
+  const [head, tail] = kind.split(".");
+  return (tail || head || "runtime").replace(/_/g, " ");
+}
+
+function formatLoopspaceRuntimeConsoleTime(value) {
+  const ms = Number(value || 0);
+  if (!Number.isFinite(ms) || ms <= 0) return "--:--:--";
+  try {
+    return new Date(ms).toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    });
+  } catch {
+    return "--:--:--";
+  }
 }
 
 function loopspaceTriggerTypeLabel(type) {
@@ -1634,71 +1856,6 @@ const LOOPSPACE_TRIGGER_DRAG_MIME = "application/x-diffforge-loopspace-trigger";
 const LOOPSPACE_TRIGGER_DRAG_KIND = "loopspace_trigger_ref";
 const LOOPSPACE_GRAPH_NODE_DRAG_MIME = "application/x-diffforge-loopspace-node-template";
 const LOOPSPACE_GRAPH_NODE_TEMPLATE_DRAG_KIND = "loopspace_graph_node_template";
-const LOOPSPACE_GRAPH_NODE_TEMPLATES = [
-  {
-    description: "Run a selected local script on its device.",
-    icon: "terminal",
-    id: "run_script",
-    label: "Run script",
-    role: "action",
-  },
-  {
-    description: "Send a prompt into a device terminal agent.",
-    icon: "message",
-    id: "send_message",
-    label: "Send message",
-    role: "action",
-  },
-  {
-    description: "Reference synced docs as read-only context for an agent step.",
-    icon: "document",
-    id: "document_read",
-    label: "Document read",
-    role: "context",
-  },
-  {
-    description: "Tell an agent which synced docs it may update and push-save.",
-    icon: "document",
-    id: "document_write",
-    label: "Document write",
-    role: "context",
-  },
-];
-const LOOPSPACE_GRAPH_DEFAULT_OUTPUT_PORT = {
-  id: "out",
-  label: "OUT",
-  tone: "default",
-};
-const LOOPSPACE_RUN_SCRIPT_OUTPUT_PORTS = [
-  {
-    id: "exec",
-    label: "EXECOUT",
-    tone: "exec",
-  },
-  {
-    id: "success",
-    label: "SUCCESS",
-    tone: "success",
-  },
-  {
-    id: "failure",
-    label: "FAILURE",
-    tone: "failure",
-  },
-  {
-    id: "interrupt",
-    label: "INTERRUPT",
-    tone: "interrupt",
-  },
-];
-const LOOPSPACE_SEND_MESSAGE_OUTPUT_PORTS = LOOPSPACE_RUN_SCRIPT_OUTPUT_PORTS;
-const LOOPSPACE_DOCUMENT_READ_OUTPUT_PORTS = [
-  {
-    id: "docs",
-    label: "DOCS",
-    tone: "exec",
-  },
-];
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX = 512;
 const TODO_QUEUE_WORKSPACE_STORAGE_PREFIX = "diffforge.todoQueue.";
@@ -4619,11 +4776,6 @@ function loopspaceGraphNodeIdFromLabel(label) {
   return sanitizeDfBlueprintId(label, "");
 }
 
-function parseLoopspaceGraphProps(rawProps = "") {
-  const source = `node "props" [${rawProps}]`;
-  return parseDfBlueprintSource(`dfblueprint "props"\n${source}\n`).nodes[0]?.props || {};
-}
-
 function loopspaceGraphFiniteNumber(value, fallback = 0) {
   const number = Number.parseFloat(value);
   return Number.isFinite(number) ? number : fallback;
@@ -4634,12 +4786,18 @@ const LOOPSPACE_GRAPH_MAX_ZOOM = 2.4;
 const LOOPSPACE_GRAPH_ZOOM_STEP = 1.18;
 const LOOPSPACE_GRAPH_NODE_WIDTH = 220;
 const LOOPSPACE_GRAPH_NODE_HEIGHT = 66;
-const LOOPSPACE_RUN_SCRIPT_NODE_WIDTH = 360;
-const LOOPSPACE_RUN_SCRIPT_NODE_HEIGHT = 132;
-const LOOPSPACE_MULTI_OUTPUT_PORT_CENTER_INSET = 21;
+const LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH = 148;
+const LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT = Math.round(LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH / 1.618);
+const LOOPSPACE_GRAPH_MESSAGE_STEP_GAP = 30;
+const LOOPSPACE_GRAPH_MESSAGE_STEP_COLLISION_GAP = 16;
+const LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET = 8;
+const LOOPSPACE_GRAPH_MESSAGE_FLOW_MIN_HEIGHT = 118;
+const LOOPSPACE_GRAPH_MESSAGE_SETTINGS_MIN_WIDTH = 840;
+const LOOPSPACE_GRAPH_MESSAGE_SETTINGS_MIN_HEIGHT = 360;
 const LOOPSPACE_RUNTIME_PANEL_DEFAULT_HEIGHT = 174;
 const LOOPSPACE_RUNTIME_PANEL_MIN_HEIGHT = 88;
 const LOOPSPACE_RUNTIME_PANEL_MIN_GRAPH_HEIGHT = 160;
+const LOOPSPACE_RUNTIME_LOG_PAGE_SIZE = 30;
 
 function clampLoopspaceGraphZoom(value) {
   return Math.min(LOOPSPACE_GRAPH_MAX_ZOOM, Math.max(LOOPSPACE_GRAPH_MIN_ZOOM, Number(value) || 1));
@@ -4698,6 +4856,238 @@ function loopspaceGraphPropValue(props, keys = []) {
     }
   }
   return undefined;
+}
+
+const LOOPSPACE_MESSAGE_STEP_NODE_KINDS = new Set(["checkpoint", "step", "substep", "todo"]);
+
+function loopspaceGraphNodeIsMessageStep(node) {
+  const kind = String(node?.nodeKind || node?.kind || "").trim().toLowerCase();
+  return LOOPSPACE_MESSAGE_STEP_NODE_KINDS.has(kind);
+}
+
+function loopspaceGraphStepOrder(node, fallback = 0) {
+  const order = loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node?.props || {}, ["order", "index"]), NaN);
+  return Number.isFinite(order) ? order : fallback;
+}
+
+function loopspaceGraphStepTitle(node, fallbackIndex = 0) {
+  return String(loopspaceGraphPropValue(node?.props || {}, ["title", "name"]) || node?.label || `Step ${fallbackIndex + 1}`).trim();
+}
+
+function loopspaceGraphStepDescription(node) {
+  return String(loopspaceGraphPropValue(node?.props || {}, ["description", "desc", "details"]) || "").trim();
+}
+
+function loopspaceGraphMessageChildTitle(node, fallbackIndex = 0) {
+  if (loopspaceGraphNodeIsMessageStep(node)) {
+    return loopspaceGraphStepTitle(node, fallbackIndex);
+  }
+  return String(node?.label || `Step ${fallbackIndex + 1}`).trim();
+}
+
+function loopspaceGraphMessageChildSubtitle(node, fallbackIndex = 0) {
+  if (loopspaceGraphNodeIsMessageStep(node)) {
+    return loopspaceGraphStepDescription(node) || `Step ${fallbackIndex + 1}`;
+  }
+  if (node?.nodeKind === "document_read") return "Document read";
+  if (node?.nodeKind === "document_write") return "Document write";
+  if (node?.nodeKind === "run_script") return "Run script";
+  return String(node?.role || node?.nodeKind || "Internal step").trim();
+}
+
+function loopspaceGraphMessageChildOrder(node, fallback = 0) {
+  const order = loopspaceGraphStepOrder(node, fallback);
+  return Number.isFinite(order) ? order : fallback;
+}
+
+function loopspaceGraphMessageChildLocalPosition(node, index = 0, bounds = {}) {
+  const width = Math.max(LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH + 28, Number(bounds.width) || 0);
+  const height = Math.max(LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT + 28, Number(bounds.height) || 0);
+  const columns = Math.max(
+    1,
+    Math.floor((width - 52) / (LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH + LOOPSPACE_GRAPH_MESSAGE_STEP_GAP)),
+  );
+  const defaultX = 38 + ((index % columns) * (LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH + LOOPSPACE_GRAPH_MESSAGE_STEP_GAP));
+  const defaultY = Math.max(
+    14,
+    Math.round(
+      ((height - LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT) / 2)
+        + (Math.floor(index / columns) * (LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT + 18)),
+    ),
+  );
+  const rawX = loopspaceGraphFiniteNumber(
+    loopspaceGraphPropValue(node?.props || {}, ["inner_x", "innerX", "local_x", "localX", "x"]),
+    defaultX,
+  );
+  const rawY = loopspaceGraphFiniteNumber(
+    loopspaceGraphPropValue(node?.props || {}, ["inner_y", "innerY", "local_y", "localY", "y"]),
+    defaultY,
+  );
+  return {
+    height: LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT,
+    width: LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH,
+    x: Math.max(8, Math.min(Math.max(8, width - LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH - 8), rawX)),
+    y: Math.max(8, Math.min(Math.max(8, height - LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT - 8), rawY)),
+  };
+}
+
+function loopspaceGraphClampMessageFlowLayout(layout, bounds = {}) {
+  const width = Math.max(LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH + 28, Number(bounds.width) || 0);
+  const height = Math.max(LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT + 28, Number(bounds.height) || 0);
+  const nodeWidth = Number(layout?.width) || LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH;
+  const nodeHeight = Number(layout?.height) || LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT;
+  const minX = LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET;
+  const minY = LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET;
+  const maxX = Math.max(minX, width - nodeWidth - LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET);
+  const maxY = Math.max(minY, height - nodeHeight - LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET);
+  return {
+    ...layout,
+    height: nodeHeight,
+    width: nodeWidth,
+    x: Math.max(minX, Math.min(maxX, Number(layout?.x) || minX)),
+    y: Math.max(minY, Math.min(maxY, Number(layout?.y) || minY)),
+  };
+}
+
+function loopspaceGraphMessageFlowLayoutsOverlap(left, right, gap = LOOPSPACE_GRAPH_MESSAGE_STEP_COLLISION_GAP) {
+  return !(
+    left.x + left.width + gap <= right.x
+    || right.x + right.width + gap <= left.x
+    || left.y + left.height + gap <= right.y
+    || right.y + right.height + gap <= left.y
+  );
+}
+
+function loopspaceGraphMessageFlowLayoutDistance(left, right) {
+  const leftCenterX = left.x + (left.width / 2);
+  const leftCenterY = left.y + (left.height / 2);
+  const rightCenterX = right.x + (right.width / 2);
+  const rightCenterY = right.y + (right.height / 2);
+  return Math.hypot(leftCenterX - rightCenterX, leftCenterY - rightCenterY);
+}
+
+function loopspaceGraphFindMessageFlowSlot(layout, bounds, placed) {
+  const original = loopspaceGraphClampMessageFlowLayout(layout, bounds);
+  if (!placed.some((item) => loopspaceGraphMessageFlowLayoutsOverlap(original, item.layout))) {
+    return original;
+  }
+  const width = Math.max(LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH + 28, Number(bounds?.width) || 0);
+  const height = Math.max(LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT + 28, Number(bounds?.height) || 0);
+  const minX = LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET;
+  const minY = LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET;
+  const maxX = Math.max(minX, width - original.width - LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET);
+  const maxY = Math.max(minY, height - original.height - LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET);
+  const step = 8;
+  let best = null;
+  for (let y = minY; y <= maxY; y += step) {
+    for (let x = minX; x <= maxX; x += step) {
+      const candidate = { ...original, x, y };
+      if (placed.some((item) => loopspaceGraphMessageFlowLayoutsOverlap(candidate, item.layout))) {
+        continue;
+      }
+      if (!best || loopspaceGraphMessageFlowLayoutDistance(candidate, original) < loopspaceGraphMessageFlowLayoutDistance(best, original)) {
+        best = candidate;
+      }
+    }
+  }
+  if (best) return best;
+  const fallbackY = placed.reduce(
+    (bottom, item) => Math.max(bottom, item.layout.y + item.layout.height + LOOPSPACE_GRAPH_MESSAGE_STEP_COLLISION_GAP),
+    LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET,
+  );
+  return {
+    ...original,
+    x: LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET,
+    y: fallbackY,
+  };
+}
+
+function loopspaceGraphResolveMessageFlowNodes(nodes, bounds) {
+  const byId = new Map();
+  const placed = [];
+  const ordered = [...nodes]
+    .map((node, index) => ({
+      ...node,
+      originalIndex: index,
+      layout: loopspaceGraphClampMessageFlowLayout(node.layout, bounds),
+    }))
+    .sort((left, right) => {
+      const leftPinned = left.dragging || left.priority ? 1 : 0;
+      const rightPinned = right.dragging || right.priority ? 1 : 0;
+      return rightPinned - leftPinned
+        || left.originalIndex - right.originalIndex;
+    });
+  for (const node of ordered) {
+    const layout = node.dragging || node.priority
+      ? loopspaceGraphClampMessageFlowLayout(node.layout, bounds)
+      : loopspaceGraphFindMessageFlowSlot(node.layout, bounds, placed);
+    const resolved = {
+      ...node,
+      center: {
+        x: layout.x + (layout.width / 2),
+        y: layout.y + (layout.height / 2),
+      },
+      layout,
+    };
+    byId.set(node.item.id, resolved);
+    placed.push(resolved);
+  }
+  return nodes.map((node) => byId.get(node.item.id) || node);
+}
+
+function loopspaceGraphMessageFlowBounds(nodeLayout, node = null, childCount = 0) {
+  const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node || "send_message");
+  const width = Math.max(
+    220,
+    (Number(nodeLayout?.width) || 0) - (visualDefaults.outputGutter || 92) - 28,
+  );
+  const safeChildCount = Math.max(0, Number(childCount) || 0);
+  const columns = Math.max(
+    1,
+    Math.floor(
+      (width - (LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET * 2) + LOOPSPACE_GRAPH_MESSAGE_STEP_COLLISION_GAP)
+        / (LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH + LOOPSPACE_GRAPH_MESSAGE_STEP_COLLISION_GAP),
+    ),
+  );
+  const rows = safeChildCount ? Math.ceil(safeChildCount / columns) : 0;
+  const childHeight = rows
+    ? (LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET * 2)
+      + (rows * LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT)
+      + ((rows - 1) * LOOPSPACE_GRAPH_MESSAGE_STEP_COLLISION_GAP)
+    : 0;
+  const height = Math.max(
+    LOOPSPACE_GRAPH_MESSAGE_FLOW_MIN_HEIGHT,
+    (Number(nodeLayout?.height) || 0) - 108,
+    childHeight,
+  );
+  return {
+    height,
+    requiredNodeHeight: height + 108,
+    width,
+  };
+}
+
+function loopspaceGraphMessageFlowAnchorY(nodeLayout, flowBounds, node = null, portId = "in") {
+  const nodeHeight = Number(nodeLayout?.height) || 0;
+  const flowHeight = Number(flowBounds?.height) || LOOPSPACE_GRAPH_MESSAGE_FLOW_MIN_HEIGHT;
+  const flowTop = Math.max(0, nodeHeight - flowHeight);
+  const portPoint = portId === "success"
+    ? loopspaceGraphOutputPoint({ x: 0, y: 0, width: Number(nodeLayout?.width) || 0, height: nodeHeight }, node, "success")
+    : { x: 0, y: nodeHeight / 2 };
+  return Math.max(0, Math.min(flowHeight, portPoint.y - flowTop));
+}
+
+function loopspaceGraphMessageFlowParentInputX() {
+  return -17;
+}
+
+function loopspaceGraphMessageFlowParentOutputX(nodeLayout) {
+  return Math.max(0, (Number(nodeLayout?.width) || 0) - 17);
+}
+
+function loopspaceGraphMessageFlowPathBetween(fromPoint, toPoint) {
+  const dx = Math.max(26, Math.abs(toPoint.x - fromPoint.x) * 0.42);
+  return `M ${fromPoint.x} ${fromPoint.y} C ${fromPoint.x + dx} ${fromPoint.y}, ${toPoint.x - dx} ${toPoint.y}, ${toPoint.x} ${toPoint.y}`;
 }
 
 function normalizeLoopspaceSendMessageAgentId(value) {
@@ -4785,10 +5175,6 @@ function loopspaceGraphNodeParentId(node) {
 
 function loopspaceGraphSnapCoordinate(value) {
   return Math.round(loopspaceGraphFiniteNumber(value, 0) / 16) * 16;
-}
-
-function parseLoopspaceGraphEdgeLine(line) {
-  return parseDfBlueprintSource(`dfblueprint "edge"\n${line}\n`).edges[0] || null;
 }
 
 function parseLoopspaceBlueprintGraphSource(source = "") {
@@ -5058,16 +5444,6 @@ function loopspaceGraphDocumentRefsValue(refs = []) {
     .join("|");
 }
 
-function loopspaceGraphNodeTemplateLine(template, position = null) {
-  const node = createDfBlueprintNodeFromTemplate(template, position);
-  return addDfBlueprintNode("", node).trim();
-}
-
-function loopspaceTriggerGraphNodeLine(trigger, position = null) {
-  const node = createDfBlueprintTriggerNode(trigger, position);
-  return addDfBlueprintNode("", node).trim();
-}
-
 function loopspaceGraphTriggerIdFromLine(line) {
   return String(parseDfBlueprintSource(`dfblueprint "trigger"\n${line}\n`).nodes[0]?.triggerId || "").trim();
 }
@@ -5091,22 +5467,16 @@ function loopspaceGraphSourceWithNodeTemplate(source, template, position = null)
   return addDfBlueprintNode(source, createDfBlueprintNodeFromTemplate(template, position));
 }
 
-function loopspaceGraphEscapeLabel(label) {
-  return String(label || "Graph node").trim().replace(/"/g, "'");
+function loopspaceGraphOutputPortsForNode(node) {
+  return contractLoopspaceGraphOutputPortsForNode(node);
 }
 
-function loopspaceGraphOutputPortsForNode(node) {
-  if (node?.nodeKind === "run_script") return LOOPSPACE_RUN_SCRIPT_OUTPUT_PORTS;
-  if (node?.nodeKind === "send_message") return LOOPSPACE_SEND_MESSAGE_OUTPUT_PORTS;
-  if (node?.nodeKind === "document_read") return LOOPSPACE_DOCUMENT_READ_OUTPUT_PORTS;
-  if (node?.nodeKind === "document_write") return [];
-  return [LOOPSPACE_GRAPH_DEFAULT_OUTPUT_PORT];
+function loopspaceGraphInputPortsForNode(node) {
+  return contractLoopspaceGraphInputPortsForNode(node);
 }
 
 function loopspaceGraphOutputPortForId(node, portId = "") {
-  const ports = loopspaceGraphOutputPortsForNode(node);
-  const safePortId = String(portId || "").trim();
-  return ports.find((port) => port.id === safePortId) || ports[0] || LOOPSPACE_GRAPH_DEFAULT_OUTPUT_PORT;
+  return contractLoopspaceGraphOutputPortForId(node, portId);
 }
 
 function loopspaceGraphEdgeBranch(edge) {
@@ -5114,12 +5484,7 @@ function loopspaceGraphEdgeBranch(edge) {
 }
 
 function loopspaceGraphPortLabel(portId = "") {
-  const safePortId = String(portId || "").trim().toLowerCase();
-  if (safePortId === "exec") return "EXECOUT";
-  if (safePortId === "success") return "SUCCESS";
-  if (safePortId === "failure") return "FAILURE";
-  if (safePortId === "interrupt") return "INTERRUPT";
-  return safePortId ? safePortId.toUpperCase() : "OUT";
+  return contractLoopspaceGraphPortLabel(portId);
 }
 
 function loopspaceGraphSourceHasEdge(source, fromId, toId, fromPort = "out", toPort = "in") {
@@ -5138,8 +5503,8 @@ function loopspaceGraphSourceWithEdge(source, fromNode, toNode, fromPort = "out"
   const fromId = String(fromNode?.id || "").trim();
   const toId = String(toNode?.id || "").trim();
   if (!fromId || !toId || fromId === toId) return source || "";
-  const outputPort = loopspaceGraphOutputPortForId(fromNode, fromPort);
-  const safeFromPort = String(outputPort.id || fromPort || "").trim();
+  const outputPort = contractLoopspaceGraphOutputPortForId(fromNode, fromPort, { fallback: false });
+  const safeFromPort = String(outputPort?.id || fromPort || "").trim();
   const branch = safeFromPort;
   if (loopspaceGraphSourceHasEdge(source, fromId, toId, safeFromPort, toPort)) {
     return source || "";
@@ -5156,42 +5521,8 @@ function loopspaceGraphSourceWithoutEdge(source, edgeId) {
   return removeDfBlueprintEdge(source, edgeId);
 }
 
-function loopspaceGraphLineReferencesNode(line, nodeId) {
-  const id = String(nodeId || "").trim();
-  if (!id) return false;
-  const graph = parseDfBlueprintSource(`dfblueprint "line"\n${line}\n`);
-  return graph.nodes.some((node) => node.id === id)
-    || graph.edges.some((edge) => edge.from === id || edge.to === id);
-}
-
-function loopspaceGraphNodeIdFromLine(line) {
-  return String(parseDfBlueprintSource(`dfblueprint "node"\n${line}\n`).nodes[0]?.id || "").trim();
-}
-
 function loopspaceGraphSourceWithoutNode(source, nodeId) {
   return removeDfBlueprintNode(source, nodeId);
-}
-
-function loopspaceGraphUpsertProp(rawProps, key, value) {
-  const safeKey = String(key || "").trim();
-  if (!safeKey) return rawProps || "";
-  const safeValue = String(value || "").trim().replace(/"/g, "'");
-  const targetKey = safeKey.toLowerCase();
-  let replaced = false;
-  const parts = String(rawProps || "")
-    .split(",")
-    .map((part) => part.trim())
-    .filter(Boolean)
-    .map((part) => {
-      const index = part.indexOf(":");
-      if (index <= 0) return part;
-      const partKey = part.slice(0, index).trim();
-      if (partKey.toLowerCase() !== targetKey || replaced) return part;
-      replaced = true;
-      return `${safeKey}: ${safeValue}`;
-    });
-  if (!replaced) parts.push(`${safeKey}: ${safeValue}`);
-  return parts.join(", ");
 }
 
 function loopspaceGraphSourceWithoutTrigger(source, triggerId) {
@@ -5201,32 +5532,43 @@ function loopspaceGraphSourceWithoutTrigger(source, triggerId) {
 function loopspaceGraphNodeLayout(node, index = 0) {
   const isSendMessage = node?.nodeKind === "send_message";
   const isDocumentContext = node?.nodeKind === "document_read" || node?.nodeKind === "document_write";
+  const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
+  const defaultHeight = visualDefaults.height || LOOPSPACE_GRAPH_NODE_HEIGHT;
+  const defaultWidth = visualDefaults.width || LOOPSPACE_GRAPH_NODE_WIDTH;
+  const minHeight = visualDefaults.minHeight || defaultHeight;
+  const minWidth = visualDefaults.minWidth || defaultWidth;
   const documentRefCount = isDocumentContext
     ? loopspaceGraphDocumentRefsFromProps(node?.props || {}).length
     : 0;
   const nodeHeight = isSendMessage
-    ? Math.max(220, loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["h", "height"]), 260))
+    ? Math.max(
+        minHeight,
+        loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["h", "height"]), defaultHeight),
+      )
     : isDocumentContext
-      ? Math.max(128, 112 + (documentRefCount * 38))
-    : node?.nodeKind === "run_script"
+      ? Math.max(minHeight, 112 + (documentRefCount * 38))
+    : visualDefaults.sized
       ? Math.max(
-          LOOPSPACE_RUN_SCRIPT_NODE_HEIGHT,
+          minHeight,
           loopspaceGraphFiniteNumber(
             loopspaceGraphPropValue(node.props, ["h", "height"]),
-            LOOPSPACE_RUN_SCRIPT_NODE_HEIGHT,
+            defaultHeight,
           ),
         )
       : LOOPSPACE_GRAPH_NODE_HEIGHT;
   const nodeWidth = isSendMessage
-    ? Math.max(560, loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["w", "width"]), 680))
+    ? Math.max(
+        minWidth,
+        loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["w", "width"]), defaultWidth),
+      )
     : isDocumentContext
-      ? 270
-    : node?.nodeKind === "run_script"
+      ? defaultWidth
+    : visualDefaults.sized
       ? Math.max(
-          LOOPSPACE_RUN_SCRIPT_NODE_WIDTH,
+          minWidth,
           loopspaceGraphFiniteNumber(
             loopspaceGraphPropValue(node.props, ["w", "width"]),
-            LOOPSPACE_RUN_SCRIPT_NODE_WIDTH,
+            defaultWidth,
           ),
         )
     : LOOPSPACE_GRAPH_NODE_WIDTH;
@@ -5266,11 +5608,8 @@ function loopspaceGraphOutputPoint(layout, node = null, portId = "out") {
   const yOffset = portCount === 1
     ? layout.height / 2
     : ((layout.height - stackHeight) / 2) + 9 + (safeIndex * portSpacing);
-  const outputX = node?.nodeKind === "run_script" || node?.nodeKind === "send_message"
-    ? layout.x + layout.width - LOOPSPACE_MULTI_OUTPUT_PORT_CENTER_INSET
-    : layout.x + layout.width;
   return {
-    x: outputX,
+    x: layout.x + layout.width,
     y: layout.y + yOffset,
   };
 }
@@ -5741,6 +6080,9 @@ function LoopspaceRuntimeView({
   const [timerNowMs, setTimerNowMs] = useState(() => Date.now());
   const [triggers, setTriggers] = useState([]);
   const [logs, setLogs] = useState([]);
+  const [runtimeEvents, setRuntimeEvents] = useState([]);
+  const [runtimeEventsHasMoreBefore, setRuntimeEventsHasMoreBefore] = useState(false);
+  const [runtimeEventsLoadingMore, setRuntimeEventsLoadingMore] = useState(false);
   const [graphSource, setGraphSource] = useState("");
   const [graphMeta, setGraphMeta] = useState(null);
   const [triggerRefs, setTriggerRefs] = useState([]);
@@ -5761,6 +6103,8 @@ function LoopspaceRuntimeView({
   const [documentContextSearchByNode, setDocumentContextSearchByNode] = useState({});
   const [sendMessageSettingsNodeId, setSendMessageSettingsNodeId] = useState("");
   const [sendMessageSettingsDrafts, setSendMessageSettingsDrafts] = useState({});
+  const [sendMessageCheckpointDragPositions, setSendMessageCheckpointDragPositions] = useState({});
+  const [sendMessageCheckpointLayoutPriorityId, setSendMessageCheckpointLayoutPriorityId] = useState("");
   const [workspaceToolsVersion, setWorkspaceToolsVersion] = useState(() => getWorkspaceToolsVersion());
   const loopspaceId = loopspace?.id || "";
   const busy = actionState === "renaming" || actionState === "deleting" || loadingState === "saving";
@@ -5773,6 +6117,7 @@ function LoopspaceRuntimeView({
   const refreshGenerationRef = useRef(0);
   const runtimeSurfaceRef = useRef(null);
   const runtimePanelBodyRef = useRef(null);
+  const runtimeEventsPaginationRef = useRef({ loading: false, restore: null });
   const runtimePanelResizeGestureRef = useRef(null);
   const graphCanvasRef = useRef(null);
   const canvasPanRef = useRef(canvasPan);
@@ -5780,6 +6125,7 @@ function LoopspaceRuntimeView({
   const canvasPanGestureRef = useRef(null);
   const nodeDragGestureRef = useRef(null);
   const nodeDragPositionsRef = useRef({});
+  const sendMessageCheckpointDragPositionsRef = useRef({});
   const nodeSizesRef = useRef({});
   const nodeResizeObserverRef = useRef(null);
   const nodeElementsRef = useRef(new Map());
@@ -5826,6 +6172,7 @@ function LoopspaceRuntimeView({
 
   const recordGraphNodeSize = useCallback((nodeId, element) => {
     if (!element) return;
+    if (element.getAttribute?.("data-settings-open") === "true") return;
     const width = element.offsetWidth;
     const height = element.offsetHeight;
     if (!width || !height) return;
@@ -5969,14 +6316,32 @@ function LoopspaceRuntimeView({
     setRuntimeSegments(
       safeCloudMcpArray(value?.logSegments || value?.log_segments || row?.logSegments || row?.log_segments),
     );
+    const nextEvents = appControlLoopspaceRuntimeEventRows(value, loopspaceId);
+    if (nextEvents.length) {
+      setRuntimeEvents((current) => filterLoopspaceRuntimeEvents(
+        mergeLoopspaceRuntimeEventRows(current, nextEvents),
+        loopspaceId,
+      ));
+      const page = appControlLoopspaceRuntimeEventPage(value, loopspaceId);
+      if (page.hasMoreBefore) setRuntimeEventsHasMoreBefore(true);
+    }
     return { graph, refs, row, source };
   }, [loopspaceId]);
 
   const applyTriggerSnapshot = useCallback((value) => {
     const nextTriggers = appControlLoopspaceTriggerRows(value);
     const nextRuns = appControlLoopspaceTriggerRunRows(value);
+    const nextEvents = appControlLoopspaceRuntimeEventRows(value, loopspaceId);
     triggersRef.current = nextTriggers;
     setTriggers(nextTriggers);
+    if (nextEvents.length) {
+      setRuntimeEvents((current) => filterLoopspaceRuntimeEvents(
+        mergeLoopspaceRuntimeEventRows(current, nextEvents),
+        loopspaceId,
+      ));
+      const page = appControlLoopspaceRuntimeEventPage(value, loopspaceId);
+      if (page.hasMoreBefore) setRuntimeEventsHasMoreBefore(true);
+    }
     if (loopspaceId) {
       const triggerLoopspaceIds = new Map(nextTriggers.map((trigger) => [trigger.id, trigger.loopspaceIds]));
       const graphTriggerIds = new Set(
@@ -6000,14 +6365,19 @@ function LoopspaceRuntimeView({
     activeLoopspaceId = loopspaceId,
     generation = refreshGenerationRef.current,
     remote = true,
+    options = {},
   ) => {
     if (!activeLoopspaceId) {
       setLogs([]);
+      setRuntimeEvents([]);
+      setRuntimeEventsHasMoreBefore(false);
       return;
     }
     const applyLogs = (value) => {
       if (generation !== refreshGenerationRef.current) return;
       const nextRuns = appControlLoopspaceTriggerRunRows(value);
+      const nextEvents = appControlLoopspaceRuntimeEventRows(value, activeLoopspaceId);
+      const eventPage = appControlLoopspaceRuntimeEventPage(value, activeLoopspaceId);
       const triggerLoopspaceIds = new Map(
         triggersRef.current.map((trigger) => [trigger.id, trigger.loopspaceIds]),
       );
@@ -6022,12 +6392,27 @@ function LoopspaceRuntimeView({
         || (triggerLoopspaceIds.get(run.triggerId) || []).includes(activeLoopspaceId)
         || graphTriggerIds.has(run.triggerId)
       )));
+      if (nextEvents.length || !options.mergeEvents) {
+        setRuntimeEvents((current) => mergeLoopspaceRuntimeEventRows(
+          filterLoopspaceRuntimeEvents(current, activeLoopspaceId),
+          filterLoopspaceRuntimeEvents(nextEvents, activeLoopspaceId),
+          !options.mergeEvents,
+        ));
+      }
+      setRuntimeEventsHasMoreBefore(Boolean(eventPage.hasMoreBefore));
     };
+    const beforeEventSeq = Number(options.beforeEventSeq || 0) || 0;
+    const commandArgs = {
+      limit: LOOPSPACE_RUNTIME_LOG_PAGE_SIZE,
+      loopspaceId: activeLoopspaceId,
+    };
+    if (beforeEventSeq > 0) {
+      commandArgs.beforeEventSeq = beforeEventSeq;
+    }
     if (remote) {
       try {
         const value = await invoke("cloud_mcp_sync_loopspace_logs", {
-          limit: 100,
-          loopspaceId: activeLoopspaceId,
+          ...commandArgs,
         });
         applyLogs(value);
         return;
@@ -6037,8 +6422,7 @@ function LoopspaceRuntimeView({
     }
     try {
       const value = await invoke("cloud_mcp_get_loopspace_logs", {
-        limit: 100,
-        loopspaceId: activeLoopspaceId,
+        ...commandArgs,
       });
       applyLogs(value);
     } catch {
@@ -6056,6 +6440,8 @@ function LoopspaceRuntimeView({
       setTriggerRefs([]);
       setRuntimeHead(null);
       setRuntimeSegments([]);
+      setRuntimeEvents([]);
+      setRuntimeEventsHasMoreBefore(false);
       return;
     }
     try {
@@ -6138,6 +6524,9 @@ function LoopspaceRuntimeView({
     setRuntimePanelTab("runtime");
     setRuntimePanelExpanded(true);
     setSelectedHistoryRunId("");
+    setRuntimeEvents([]);
+    setRuntimeEventsHasMoreBefore(false);
+    setRuntimeEventsLoadingMore(false);
     setRuntimeError("");
     setDropActive(false);
     setGraphDragGhost(null);
@@ -6150,10 +6539,13 @@ function LoopspaceRuntimeView({
     canvasPanGestureRef.current = null;
     nodeDragGestureRef.current = null;
     nodeDragPositionsRef.current = {};
+    sendMessageCheckpointDragPositionsRef.current = {};
     setCanvasPan(resetPan);
     setCanvasZoom(1);
     setCanvasPanning(false);
     setNodeDragPositions({});
+    setSendMessageCheckpointDragPositions({});
+    setSendMessageCheckpointLayoutPriorityId("");
     setPendingGraphNodeIds(new Set());
     void refreshLoopspaceGraph(true, generation);
     void refreshLoopspaceTriggers(true, generation);
@@ -6171,7 +6563,7 @@ function LoopspaceRuntimeView({
     void listen(CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT, (event) => {
       if (disposed) return;
       applyTriggerSnapshot(event?.payload || event);
-      void refreshLoopspaceLogs(loopspaceId, refreshGenerationRef.current, false);
+      void refreshLoopspaceLogs(loopspaceId, refreshGenerationRef.current, false, { mergeEvents: true });
     }).then((unlisten) => {
       if (disposed) {
         unlisten();
@@ -6317,25 +6709,60 @@ function LoopspaceRuntimeView({
 
   const graphNodeLayouts = useMemo(() => {
     const map = new Map();
+    const childCountByParentId = new Map();
+    parsedGraph.nodes.forEach((node) => {
+      const parentId = loopspaceGraphNodeParentId(node);
+      if (!parentId) return;
+      childCountByParentId.set(parentId, (childCountByParentId.get(parentId) || 0) + 1);
+    });
     visibleGraphNodes.forEach((node, index) => {
       const dragPosition = nodeDragPositions[node.id];
       const measured = nodeSizes[node.id];
-      const layout = {
-        ...loopspaceGraphNodeLayout(node, index),
+      const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
+      const baseLayout = loopspaceGraphNodeLayout(node, index);
+      const sizedNode = Boolean(visualDefaults.sized || visualDefaults.minWidth || visualDefaults.minHeight);
+      let layout = {
+        ...baseLayout,
         ...(measured && measured.width && measured.height ? {
-          height: measured.height,
-          width: measured.width,
+          height: sizedNode
+            ? Math.max(visualDefaults.minHeight || baseLayout.height, measured.height)
+            : measured.height,
+          width: sizedNode
+            ? Math.max(visualDefaults.minWidth || baseLayout.width, measured.width)
+            : measured.width,
         } : {}),
         ...(dragPosition ? {
           x: dragPosition.x,
           y: dragPosition.y,
         } : {}),
       };
+      if (node.nodeKind === "send_message") {
+        const priorityChild = sendMessageCheckpointLayoutPriorityId
+          ? parsedGraph.nodes.find((item) => item.id === sendMessageCheckpointLayoutPriorityId)
+          : null;
+        const reserveDragSlot = priorityChild && loopspaceGraphNodeParentId(priorityChild) === node.id ? 1 : 0;
+        const flowBounds = loopspaceGraphMessageFlowBounds(
+          layout,
+          node,
+          (childCountByParentId.get(node.id) || 0) + reserveDragSlot,
+        );
+        layout = {
+          ...layout,
+          height: Math.max(layout.height, flowBounds.requiredNodeHeight || layout.height),
+        };
+        if (sendMessageSettingsNodeId === node.id) {
+          layout = {
+            ...layout,
+            height: Math.max(layout.height, LOOPSPACE_GRAPH_MESSAGE_SETTINGS_MIN_HEIGHT),
+            width: Math.max(layout.width, LOOPSPACE_GRAPH_MESSAGE_SETTINGS_MIN_WIDTH),
+          };
+        }
+      }
       map.set(node.id, layout);
       map.set(loopspaceGraphNodeIdFromLabel(node.label), layout);
     });
     return map;
-  }, [nodeDragPositions, nodeSizes, visibleGraphNodes]);
+  }, [nodeDragPositions, nodeSizes, parsedGraph.nodes, sendMessageCheckpointLayoutPriorityId, sendMessageSettingsNodeId, visibleGraphNodes]);
 
   const commitLoopspaceGraphSource = useCallback(async (nextSource, fallbackError, options = {}) => {
     if (!loopspaceId || busy) return;
@@ -6343,6 +6770,11 @@ function LoopspaceRuntimeView({
     const normalizedSource = normalizeDfBlueprintSource(nextSource, {
       name: loopspaceRef.current?.name || loopspace?.name || "Loopspace",
     });
+    const graphValidation = validateDfBlueprintSourceForUpdate(normalizedSource, previousSource);
+    if (!graphValidation.ok) {
+      setRuntimeError(graphValidation.errors[0] || fallbackError || "Loop graph contains an invalid connection.");
+      return;
+    }
     const pendingNodeIds = safeCloudMcpArray(options.pendingNodeIds)
       .map((id) => String(id || "").trim())
       .filter(Boolean);
@@ -6465,8 +6897,8 @@ function LoopspaceRuntimeView({
         node.props = {
           ...(node.props || {}),
           parent_id: parent.node.id,
-          x: String(Math.max(8, Math.round((Number(position?.x) || 0) - parent.layout.x))),
-          y: String(Math.max(8, Math.round((Number(position?.y) || 0) - parent.layout.y))),
+          inner_x: String(Math.max(8, Math.round((Number(position?.x) || 0) - parent.layout.x))),
+          inner_y: String(Math.max(8, Math.round((Number(position?.y) || 0) - parent.layout.y))),
         };
         node.hasPosition = false;
       }
@@ -6562,6 +6994,18 @@ function LoopspaceRuntimeView({
     }));
   }, []);
 
+  const cancelSendMessageSettings = useCallback((nodeId) => {
+    const key = String(nodeId || "").trim();
+    if (!key) return;
+    setSendMessageSettingsNodeId((current) => (current === key ? "" : current));
+    setSendMessageSettingsDrafts((current) => {
+      if (!Object.prototype.hasOwnProperty.call(current, key)) return current;
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }, []);
+
   const saveSendMessageSettings = useCallback(async (node, draft) => {
     const nodeId = String(node?.id || "").trim();
     if (!nodeId || busy) return;
@@ -6583,32 +7027,70 @@ function LoopspaceRuntimeView({
     });
   }, [busy, updateSendMessageNodeProps]);
 
-  const addSendMessageDocumentSubnode = useCallback(async (node, nodeKind) => {
+  const addSendMessageStep = useCallback(async (node) => {
     const nodeId = String(node?.id || "").trim();
-    const kind = nodeKind === "document_write" ? "document_write" : "document_read";
     if (!loopspaceId || !nodeId || busy) return;
-    const template = LOOPSPACE_GRAPH_NODE_TEMPLATES.find((item) => item.id === kind);
-    if (!template) return;
-    const existingChildren = parsedGraph.nodes.filter((item) => loopspaceGraphNodeParentId(item) === nodeId);
+    const existingChildren = parsedGraph.nodes.filter((item) => (
+      loopspaceGraphNodeParentId(item) === nodeId && loopspaceGraphNodeIsMessageStep(item)
+    ));
     const childIndex = existingChildren.length;
-    const childNode = createDfBlueprintNodeFromTemplate(template, null);
+    const childNode = createDfBlueprintNodeFromTemplate({
+      description: "",
+      id: "step",
+      label: `Step ${childIndex + 1}`,
+      order: String(childIndex + 1),
+      parent_id: nodeId,
+      role: "checkpoint",
+      status: "pending",
+    }, null);
     childNode.hasPosition = false;
     childNode.props = {
       ...(childNode.props || {}),
+      description: "",
+      order: String(childIndex + 1),
       parent_id: nodeId,
-      x: String(18 + ((childIndex % 2) * 230)),
-      y: String(18 + (Math.floor(childIndex / 2) * 104)),
+      status: "pending",
     };
     const source = graphSourceRef.current || graphSource;
     const nextSource = addDfBlueprintNode(source, childNode);
     if (nextSource === source) {
-      setRuntimeError("Unable to add document subnode.");
+      setRuntimeError("Unable to add step.");
       return;
     }
-    await commitLoopspaceGraphSource(nextSource, "Unable to add document subnode.", {
+    await commitLoopspaceGraphSource(nextSource, "Unable to add step.", {
       pendingNodeIds: [childNode.id],
     });
   }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId, parsedGraph.nodes]);
+
+  const updateSendMessageStep = useCallback(async (stepNode, patch = {}) => {
+    const stepId = String(stepNode?.id || "").trim();
+    if (!loopspaceId || !stepId || busy) return;
+    const nextPatch = {};
+    if (Object.prototype.hasOwnProperty.call(patch, "title")) {
+      const title = String(patch.title || "").trim() || "Step";
+      nextPatch.label = title;
+      nextPatch.props = {
+        ...(nextPatch.props || {}),
+        title,
+      };
+    }
+    const props = {};
+    if (Object.prototype.hasOwnProperty.call(patch, "description")) {
+      props.description = String(patch.description || "");
+    }
+    if (Object.prototype.hasOwnProperty.call(patch, "order")) {
+      props.order = String(patch.order || "");
+    }
+    if (Object.keys(props).length) {
+      nextPatch.props = {
+        ...(nextPatch.props || {}),
+        ...props,
+      };
+    }
+    if (!Object.keys(nextPatch).length) return;
+    const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, stepId, nextPatch);
+    await commitLoopspaceGraphSource(nextSource, "Unable to update step.");
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
 
   const updateDocumentContextNodeRefs = useCallback(async (node, refs = []) => {
     const nodeId = String(node?.id || "").trim();
@@ -6622,10 +7104,17 @@ function LoopspaceRuntimeView({
   }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
 
   const updateSendMessageSize = useCallback(async (node, size) => {
+    const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node || "send_message");
     await updateSendMessageNodeProps(node, {
       props: {
-        h: String(Math.round(Math.max(280, Number(size?.height) || 360))),
-        w: String(Math.round(Math.max(420, Number(size?.width) || 620))),
+        h: String(Math.round(Math.max(
+          visualDefaults.minHeight || visualDefaults.height || 260,
+          Number(size?.height) || visualDefaults.height || 260,
+        ))),
+        w: String(Math.round(Math.max(
+          visualDefaults.minWidth || visualDefaults.width || 680,
+          Number(size?.width) || visualDefaults.width || 680,
+        ))),
       },
     });
   }, [updateSendMessageNodeProps]);
@@ -6637,8 +7126,8 @@ function LoopspaceRuntimeView({
     const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, checkpointId, {
       props: {
         parent_id: nodeId,
-        x: String(Math.round(Number(position.x) || 0)),
-        y: String(Math.round(Number(position.y) || 0)),
+        inner_x: String(Math.round(Number(position.x) || 0)),
+        inner_y: String(Math.round(Number(position.y) || 0)),
       },
     });
     await commitLoopspaceGraphSource(nextSource, "Unable to move message checkpoint.");
@@ -6677,20 +7166,33 @@ function LoopspaceRuntimeView({
     const fromNode = graphNodeLookup.get(String(fromId || "").trim());
     const toNode = graphNodeLookup.get(String(toId || "").trim());
     if (!fromNode || !toNode || fromNode.id === toNode.id || busy) return;
+    const validation = validateLoopspaceGraphEdgeCandidate(fromNode, toNode, {
+      fromPort,
+      toPort: "in",
+    });
+    if (!validation.ok) {
+      setRuntimeError(validation.error || "That graph connection is not allowed.");
+      return;
+    }
     const source = graphSourceRef.current || graphSource;
     const nextSource = loopspaceGraphSourceWithEdge(source, fromNode, toNode, fromPort, "in");
     if (nextSource === source) return;
     await commitLoopspaceGraphSource(nextSource, "Unable to connect graph nodes.");
   }, [busy, commitLoopspaceGraphSource, graphNodeLookup, graphSource]);
 
-  const graphPointFromClient = useCallback((clientX, clientY) => {
+  const graphPointFromClient = useCallback((clientX, clientY, options = {}) => {
     const rect = graphCanvasRef.current?.getBoundingClientRect?.();
     if (!rect) return { x: 0, y: 0 };
     const pan = canvasPanRef.current || { x: 0, y: 0 };
     const zoom = canvasZoomRef.current || 1;
+    const point = {
+      x: (clientX - rect.left - (rect.width / 2) - pan.x) / zoom,
+      y: (clientY - rect.top - (rect.height / 2) - pan.y) / zoom,
+    };
+    if (options.snap === false) return point;
     return {
-      x: loopspaceGraphSnapCoordinate((clientX - rect.left - (rect.width / 2) - pan.x) / zoom),
-      y: loopspaceGraphSnapCoordinate((clientY - rect.top - (rect.height / 2) - pan.y) / zoom),
+      x: loopspaceGraphSnapCoordinate(point.x),
+      y: loopspaceGraphSnapCoordinate(point.y),
     };
   }, []);
 
@@ -6703,6 +7205,9 @@ function LoopspaceRuntimeView({
     const zoom = canvasZoomRef.current || 1;
     const startWidth = layout.width;
     const startHeight = layout.height;
+    const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
+    const minWidth = visualDefaults.minWidth || visualDefaults.width || 680;
+    const minHeight = visualDefaults.minHeight || visualDefaults.height || 260;
     const pointerId = event.pointerId;
     const target = event.currentTarget;
     target?.setPointerCapture?.(pointerId);
@@ -6714,8 +7219,8 @@ function LoopspaceRuntimeView({
       const next = {
         ...nodeSizesRef.current,
         [node.id]: {
-          width: Math.max(420, width),
-          height: Math.max(280, height),
+          width: Math.max(minWidth, width),
+          height: Math.max(minHeight, height),
         },
       };
       nodeSizesRef.current = next;
@@ -6736,35 +7241,31 @@ function LoopspaceRuntimeView({
     window.addEventListener("pointercancel", onEnd, { passive: false });
   }, [busy, updateSendMessageSize]);
 
-  const startSendMessageCheckpointDrag = useCallback((event, node, checkpoint, checkpointIndex = 0) => {
+  const startSendMessageCheckpointDrag = useCallback((event, node, checkpoint, checkpointIndex = 0, stepLayout = null) => {
     if (busy || event.button !== 0 || !node?.id || !checkpoint?.id) return;
-    const list = event.currentTarget?.parentElement;
-    if (!list) return;
+    const flow = event.currentTarget?.parentElement;
+    if (!flow) return;
     event.preventDefault();
     event.stopPropagation();
     const zoom = canvasZoomRef.current || 1;
-    const listRect = list.getBoundingClientRect();
-    const chipRect = event.currentTarget.getBoundingClientRect();
-    const listWidth = Math.max(0, listRect.width / zoom);
-    const listHeight = Math.max(0, listRect.height / zoom);
-    const chipWidth = Math.max(48, chipRect.width / zoom);
-    const chipHeight = Math.max(24, chipRect.height / zoom);
-    const startX = Math.max(12, loopspaceGraphFiniteNumber(
-      loopspaceGraphPropValue(checkpoint.props, ["x"]),
-      18 + (checkpointIndex * 34),
-    ));
-    const startY = Math.max(12, loopspaceGraphFiniteNumber(
-      loopspaceGraphPropValue(checkpoint.props, ["y"]),
-      18 + (checkpointIndex * 42),
-    ));
+    const flowRect = flow.getBoundingClientRect();
+    const stepRect = event.currentTarget.getBoundingClientRect();
+    const flowWidth = Math.max(0, flowRect.width / zoom);
+    const flowHeight = Math.max(0, flowRect.height / zoom);
+    const stepWidth = Math.max(48, stepRect.width / zoom);
+    const stepHeight = Math.max(24, stepRect.height / zoom);
+    const startX = Math.max(8, Number(stepLayout?.x) || 8);
+    const startY = Math.max(8, Number(stepLayout?.y) || 8);
     const startClientX = event.clientX;
     const startClientY = event.clientY;
     const pointerId = event.pointerId;
     const target = event.currentTarget;
     let finalPosition = { x: startX, y: startY };
+    let moved = false;
+    setSendMessageCheckpointLayoutPriorityId(checkpoint.id);
     const clampPosition = (x, y) => ({
-      x: Math.max(8, Math.min(Math.max(8, listWidth - chipWidth - 8), x)),
-      y: Math.max(8, Math.min(Math.max(8, listHeight - chipHeight - 8), y)),
+      x: Math.max(8, Math.min(Math.max(8, flowWidth - stepWidth - 8), x)),
+      y: Math.max(8, Math.min(Math.max(8, flowHeight - stepHeight - 8), y)),
     });
     target?.setPointerCapture?.(pointerId);
     const onMove = (moveEvent) => {
@@ -6774,8 +7275,15 @@ function LoopspaceRuntimeView({
         startX + ((moveEvent.clientX - startClientX) / zoom),
         startY + ((moveEvent.clientY - startClientY) / zoom),
       );
-      target.style.setProperty("--checkpoint-x", `${Math.round(finalPosition.x)}px`);
-      target.style.setProperty("--checkpoint-y", `${Math.round(finalPosition.y)}px`);
+      moved = moved
+        || Math.abs(finalPosition.x - startX) > 1
+        || Math.abs(finalPosition.y - startY) > 1;
+      const next = {
+        ...sendMessageCheckpointDragPositionsRef.current,
+        [checkpoint.id]: finalPosition,
+      };
+      sendMessageCheckpointDragPositionsRef.current = next;
+      setSendMessageCheckpointDragPositions(next);
     };
     const onEnd = (endEvent) => {
       if (endEvent.pointerId !== pointerId) return;
@@ -6784,7 +7292,25 @@ function LoopspaceRuntimeView({
       window.removeEventListener("pointerup", onEnd);
       window.removeEventListener("pointercancel", onEnd);
       target?.releasePointerCapture?.(pointerId);
-      void updateSendMessageCheckpointPosition(node, checkpoint, finalPosition);
+      setSendMessageCheckpointLayoutPriorityId((current) => (current === checkpoint.id ? "" : current));
+      const clearHeldPosition = () => {
+        const next = { ...sendMessageCheckpointDragPositionsRef.current };
+        delete next[checkpoint.id];
+        sendMessageCheckpointDragPositionsRef.current = next;
+        setSendMessageCheckpointDragPositions(next);
+      };
+      if (moved) {
+        const next = {
+          ...sendMessageCheckpointDragPositionsRef.current,
+          [checkpoint.id]: finalPosition,
+        };
+        sendMessageCheckpointDragPositionsRef.current = next;
+        setSendMessageCheckpointDragPositions(next);
+        void updateSendMessageCheckpointPosition(node, checkpoint, finalPosition)
+          .finally(clearHeldPosition);
+      } else {
+        clearHeldPosition();
+      }
     };
     window.addEventListener("pointermove", onMove, { passive: false });
     window.addEventListener("pointerup", onEnd, { passive: false });
@@ -6801,16 +7327,16 @@ function LoopspaceRuntimeView({
       ? {
           hasPosition: false,
           props: {
+            inner_x: String(Math.max(8, Math.round((Number(position.x) || 0) - parent.layout.x))),
+            inner_y: String(Math.max(8, Math.round((Number(position.y) || 0) - parent.layout.y))),
             parent_id: parent.node.id,
-            x: String(Math.max(8, Math.round((Number(position.x) || 0) - parent.layout.x))),
-            y: String(Math.max(8, Math.round((Number(position.y) || 0) - parent.layout.y))),
           },
           x: undefined,
           y: undefined,
         }
       : {
           hasPosition: true,
-          props: isDocumentContextNode ? { parent_id: "" } : {},
+          props: isDocumentContextNode ? { inner_x: "", inner_y: "", parent_id: "" } : {},
           x: position.x,
           y: position.y,
         };
@@ -6827,7 +7353,7 @@ function LoopspaceRuntimeView({
       return;
     }
     const layout = graphNodeLayouts.get(node.id) || loopspaceGraphNodeLayout(node, 0);
-    const point = graphPointFromClient(event.clientX, event.clientY);
+    const point = graphPointFromClient(event.clientX, event.clientY, { snap: false });
     event.preventDefault();
     event.stopPropagation();
     nodeDragGestureRef.current = {
@@ -6851,7 +7377,7 @@ function LoopspaceRuntimeView({
     if (!gesture || gesture.pointerId !== event.pointerId) return;
     event.preventDefault();
     event.stopPropagation();
-    const point = graphPointFromClient(event.clientX, event.clientY);
+    const point = graphPointFromClient(event.clientX, event.clientY, { snap: false });
     const position = {
       x: loopspaceGraphSnapCoordinate(point.x - gesture.offsetX),
       y: loopspaceGraphSnapCoordinate(point.y - gesture.offsetY),
@@ -6900,7 +7426,7 @@ function LoopspaceRuntimeView({
       fromId: node.id,
       fromPort: port.id,
       fromPoint: loopspaceGraphOutputPoint(layout, node, port.id),
-      toPoint: graphPointFromClient(event.clientX, event.clientY),
+      toPoint: graphPointFromClient(event.clientX, event.clientY, { snap: false }),
     });
     event.currentTarget?.setPointerCapture?.(event.pointerId);
   }, [busy, disconnectGraphPort, graphNodeLayouts, graphPointFromClient]);
@@ -6912,7 +7438,7 @@ function LoopspaceRuntimeView({
       event.stopPropagation();
       return {
         ...current,
-        toPoint: graphPointFromClient(event.clientX, event.clientY),
+        toPoint: graphPointFromClient(event.clientX, event.clientY, { snap: false }),
       };
     });
   }, [graphPointFromClient]);
@@ -7455,22 +7981,101 @@ function LoopspaceRuntimeView({
     });
   }, [runtimeHeadRunId, runtimeSegments]);
   const sortedRuntimeLogs = useMemo(() => (
-    [...logs].sort((left, right) => (right.createdAtMs || 0) - (left.createdAtMs || 0))
+    [...logs].sort((left, right) => (left.createdAtMs || 0) - (right.createdAtMs || 0))
   ), [logs]);
-  const selectedHistoryRun = useMemo(() => (
-    sortedRuntimeLogs.find((run) => run.id === selectedHistoryRunId) || sortedRuntimeLogs[0] || null
-  ), [selectedHistoryRunId, sortedRuntimeLogs]);
+  const legacyRuntimeEvents = useMemo(() => sortedRuntimeLogs.map((run) => {
+    const trigger = triggerById.get(run.triggerId);
+    const type = run.type || trigger?.type || "manual";
+    const status = run.status || "run";
+    return {
+      createdAtMs: run.createdAtMs,
+      details: run,
+      eventSeq: run.createdAtMs,
+      id: `legacy-${run.id}`,
+      kind: `trigger.${type}`,
+      message: [trigger?.name || run.triggerId || "Trigger", loopspaceTriggerTypeLabel(type), status, run.error]
+        .filter(Boolean)
+        .join(" - "),
+      severity: run.error ? "error" : status === "success" ? "good" : "info",
+      status,
+    };
+  }), [sortedRuntimeLogs, triggerById]);
+  const scopedRuntimeEvents = useMemo(
+    () => filterLoopspaceRuntimeEvents(runtimeEvents, loopspaceId),
+    [loopspaceId, runtimeEvents],
+  );
+  const visibleRuntimeEvents = scopedRuntimeEvents.length ? scopedRuntimeEvents : legacyRuntimeEvents;
+  const selectedRuntimeEvent = useMemo(() => (
+    visibleRuntimeEvents.find((event) => event.id === selectedHistoryRunId) || null
+  ), [selectedHistoryRunId, visibleRuntimeEvents]);
   const runtimePanelNodeTemplates = loopspaceGraphPaletteTemplates;
   const runtimeStatus = runtimeError || error;
+
+  const loadOlderRuntimeEvents = useCallback(async () => {
+    if (
+      runtimeEventsPaginationRef.current.loading
+      || !runtimeEventsHasMoreBefore
+      || !scopedRuntimeEvents.length
+      || !loopspaceId
+    ) {
+      return;
+    }
+    const panelBody = runtimePanelBodyRef.current;
+    runtimeEventsPaginationRef.current = {
+      loading: true,
+      restore: panelBody
+        ? {
+          scrollHeight: panelBody.scrollHeight,
+          scrollTop: panelBody.scrollTop,
+        }
+        : null,
+    };
+    setRuntimeEventsLoadingMore(true);
+    const beforeEventSeq = scopedRuntimeEvents[0]?.eventSeq || 0;
+    try {
+      await refreshLoopspaceLogs(loopspaceId, refreshGenerationRef.current, true, {
+        beforeEventSeq,
+        mergeEvents: true,
+      });
+    } finally {
+      setRuntimeEventsLoadingMore(false);
+      window.requestAnimationFrame(() => {
+        const restore = runtimeEventsPaginationRef.current.restore;
+        const body = runtimePanelBodyRef.current;
+        runtimeEventsPaginationRef.current = { loading: false, restore: null };
+        if (body && restore) {
+          body.scrollTop = body.scrollHeight - restore.scrollHeight + restore.scrollTop;
+        }
+      });
+    }
+  }, [loopspaceId, refreshLoopspaceLogs, scopedRuntimeEvents, runtimeEventsHasMoreBefore]);
+
+  const onRuntimePanelScroll = useCallback((event) => {
+    if (runtimePanelTab !== "logs") return;
+    const body = event.currentTarget;
+    if (!body) return;
+    const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 36;
+    if (!nearBottom && runtimePanelAutoScroll) {
+      setRuntimePanelAutoScroll(false);
+    }
+    if (nearBottom && !runtimePanelAutoScroll) {
+      setRuntimePanelAutoScroll(true);
+    }
+    if (body.scrollTop < 28) {
+      void loadOlderRuntimeEvents();
+    }
+  }, [loadOlderRuntimeEvents, runtimePanelAutoScroll, runtimePanelTab]);
 
   useLayoutEffect(() => {
     if (!runtimePanelExpanded || !runtimePanelAutoScroll) return;
     const panelBody = runtimePanelBodyRef.current;
     if (!panelBody || runtimePanelTab === "nodes") return;
-    panelBody.scrollTop = 0;
+    if (runtimePanelTab === "logs" && runtimeEventsPaginationRef.current.loading) return;
+    panelBody.scrollTop = runtimePanelTab === "logs" ? panelBody.scrollHeight : 0;
   }, [
     currentRuntimeSegments.length,
     logs.length,
+    runtimeEvents.length,
     runtimeHeadRunId,
     runtimePanelAutoScroll,
     runtimePanelExpanded,
@@ -7610,6 +8215,7 @@ function LoopspaceRuntimeView({
                 const isDocumentReadNode = node.nodeKind === "document_read";
                 const isDocumentWriteNode = node.nodeKind === "document_write";
                 const isDocumentContextNode = isDocumentReadNode || isDocumentWriteNode;
+                const nodeInputPorts = loopspaceGraphInputPortsForNode(node);
                 const nodeOutputPorts = loopspaceGraphOutputPortsForNode(node);
                 const nodeDocumentRefs = isDocumentContextNode
                   ? loopspaceGraphDocumentRefsFromProps(node.props)
@@ -7688,7 +8294,8 @@ function LoopspaceRuntimeView({
                   ? String(loopspaceGraphPropValue(node.props, ["prompt", "message", "body", "instructions"]) || "")
                   : "";
                 const isSendMessageRegion = node.nodeKind === "send_message";
-                const isSizedGraphNode = isSendMessageRegion || node.nodeKind === "run_script";
+                const nodeVisualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
+                const isSizedGraphNode = Boolean(nodeVisualDefaults.sized);
                 const sendMessageSettingsOpen = isSendMessageRegion && sendMessageSettingsNodeId === node.id;
                 const sendMessageNodeDraft = isSendMessageRegion
                   ? loopspaceSendMessageDraftFromNode(node, agentLaunchDefaults)
@@ -7708,20 +8315,98 @@ function LoopspaceRuntimeView({
                 const sendMessageSpeedOptions = isSendMessageRegion
                   ? getAgentLaunchSpeedOptions(sendMessageDraft.target_agent_id, sendMessageDraft.model)
                   : [];
-                const sendMessageAgentLabel = isSendMessageRegion
-                  ? getLoopspaceSendMessageAgentLabel(sendMessageDraft.target_agent_id)
-                  : "";
-                const sendMessageModelLabel = isSendMessageRegion
-                  ? getAgentLaunchModelOption(sendMessageDraft.target_agent_id, sendMessageDraft.model)?.label || sendMessageDraft.model
-                  : "";
                 const sendMessageCheckpoints = isSendMessageRegion
                   ? parsedGraph.nodes.filter((item) => (
                     String(loopspaceGraphPropValue(item.props, ["parent_id", "parentId", "parent"]) || "").trim() === node.id
                   ))
                   : [];
-                const sendMessageDocumentCount = sendMessageCheckpoints.filter((item) => (
-                  item.nodeKind === "document_read" || item.nodeKind === "document_write"
-                )).length;
+                const sendMessageInternalNodes = sendMessageCheckpoints
+                  .map((item, itemIndex) => ({ item, itemIndex }))
+                  .sort((left, right) => {
+                    const orderDelta = loopspaceGraphMessageChildOrder(left.item, left.itemIndex + 1)
+                      - loopspaceGraphMessageChildOrder(right.item, right.itemIndex + 1);
+                    return orderDelta || (left.itemIndex - right.itemIndex);
+                  });
+                const sendMessageSteps = sendMessageCheckpoints
+                  .filter(loopspaceGraphNodeIsMessageStep)
+                  .map((item, itemIndex) => ({ item, itemIndex }))
+                  .sort((left, right) => (
+                    loopspaceGraphStepOrder(left.item, left.itemIndex + 1) - loopspaceGraphStepOrder(right.item, right.itemIndex + 1)
+                  ));
+                const sendMessageFlowBounds = isSendMessageRegion
+                  ? loopspaceGraphMessageFlowBounds(
+                    nodeLayout,
+                    node,
+                    sendMessageInternalNodes.length + (
+                      sendMessageInternalNodes.some(({ item }) => item.id === sendMessageCheckpointLayoutPriorityId)
+                        ? 1
+                        : 0
+                    ),
+                  )
+                  : null;
+                const sendMessageFlowNodes = sendMessageFlowBounds
+                  ? loopspaceGraphResolveMessageFlowNodes(sendMessageInternalNodes.map(({ item, itemIndex }, flowIndex) => {
+                    const baseLayout = loopspaceGraphMessageChildLocalPosition(item, flowIndex, sendMessageFlowBounds);
+                    const dragPosition = sendMessageCheckpointDragPositions[item.id];
+                    const childLayout = dragPosition
+                      ? {
+                        ...baseLayout,
+                        x: dragPosition.x,
+                        y: dragPosition.y,
+                      }
+                      : baseLayout;
+                    return {
+                      dragging: Boolean(dragPosition) && item.id === sendMessageCheckpointLayoutPriorityId,
+                      item,
+                      itemIndex,
+                      layout: childLayout,
+                      priority: item.id === sendMessageCheckpointLayoutPriorityId,
+                    };
+                  }), sendMessageFlowBounds)
+                  : [];
+                const sendMessageFlowInputY = sendMessageFlowBounds
+                  ? loopspaceGraphMessageFlowAnchorY(nodeLayout, sendMessageFlowBounds, node, "in")
+                  : 0;
+                const sendMessageFlowSuccessY = sendMessageFlowBounds
+                  ? loopspaceGraphMessageFlowAnchorY(nodeLayout, sendMessageFlowBounds, node, "success")
+                  : 0;
+                const sendMessageFlowInputX = loopspaceGraphMessageFlowParentInputX();
+                const sendMessageFlowSuccessX = loopspaceGraphMessageFlowParentOutputX(nodeLayout);
+                const sendMessageFlowEdges = sendMessageFlowBounds && sendMessageFlowNodes.length
+                  ? [
+                      {
+                        id: `${node.id}:in`,
+                        from: { x: sendMessageFlowInputX, y: sendMessageFlowInputY },
+                        to: { x: sendMessageFlowNodes[0].layout.x, y: sendMessageFlowNodes[0].center.y },
+                      },
+                      ...sendMessageFlowNodes.slice(0, -1).map((flowNode, flowIndex) => {
+                        const nextFlowNode = sendMessageFlowNodes[flowIndex + 1];
+                        return {
+                          id: `${flowNode.item.id}:${nextFlowNode.item.id}`,
+                          from: {
+                            x: flowNode.layout.x + flowNode.layout.width,
+                            y: flowNode.center.y,
+                          },
+                          to: {
+                            x: nextFlowNode.layout.x,
+                            y: nextFlowNode.center.y,
+                          },
+                        };
+                      }),
+                      {
+                        id: `${node.id}:success`,
+                        from: {
+                          x: sendMessageFlowNodes[sendMessageFlowNodes.length - 1].layout.x
+                            + sendMessageFlowNodes[sendMessageFlowNodes.length - 1].layout.width,
+                          y: sendMessageFlowNodes[sendMessageFlowNodes.length - 1].center.y,
+                        },
+                        to: {
+                          x: sendMessageFlowSuccessX,
+                          y: sendMessageFlowSuccessY,
+                        },
+                      },
+                    ]
+                  : [];
                 const cronCountdown = node.triggerId && (trigger?.type || "").toLowerCase() === "cron"
                   ? formatLoopspaceCountdown(trigger?.nextDueAtMs, timerNowMs)
                   : "";
@@ -7734,6 +8419,7 @@ function LoopspaceRuntimeView({
                     data-dragging={nodeDragPositions[node.id] ? "true" : undefined}
                     data-pending={pendingGraphNodeIds.has(node.id) ? "true" : undefined}
                     data-runtime={isRuntimeNode ? String(runtimeHead?.status || "active") : undefined}
+                    data-settings-open={sendMessageSettingsOpen ? "true" : undefined}
                     key={node.id}
                     onPointerCancel={finishGraphNodeDrag}
                     onPointerDown={(event) => startGraphNodeDrag(event, node)}
@@ -7743,13 +8429,16 @@ function LoopspaceRuntimeView({
                     style={{
                       ...(isSizedGraphNode ? {
                         "--loopspace-node-height": `${nodeLayout.height}px`,
+                        ...(nodeVisualDefaults.outputGutter ? {
+                          "--loopspace-node-output-gutter": `${nodeVisualDefaults.outputGutter}px`,
+                        } : {}),
                         "--loopspace-node-width": `${nodeLayout.width}px`,
                       } : {}),
                       "--loopspace-node-x": `${nodeLayout.x}px`,
                       "--loopspace-node-y": `${nodeLayout.y}px`,
                     }}
                   >
-                    {isTriggerNode || isDocumentReadNode ? null : (
+                    {!nodeInputPorts.length ? null : (
                       <LoopspaceGraphNodePort
                         aria-label={`Connect into ${trigger?.name || node.label}`}
                         data-loopspace-graph-input-id={node.id}
@@ -7848,13 +8537,13 @@ function LoopspaceRuntimeView({
                     {node.nodeKind === "send_message" ? (
                       <>
                         <LoopspaceGraphMessageSettingsButton
-                          aria-label={`${sendMessageSettingsOpen ? "Close" : "Open"} send message settings`}
+                          aria-label={sendMessageSettingsOpen ? "Cancel send message settings" : "Open send message settings"}
                           data-open={sendMessageSettingsOpen ? "true" : undefined}
                           disabled={busy}
                           onClick={(event) => {
                             event.stopPropagation();
                             if (sendMessageSettingsOpen) {
-                              setSendMessageSettingsNodeId("");
+                              cancelSendMessageSettings(node.id);
                               return;
                             }
                             setSendMessageSettingsDrafts((current) => ({
@@ -7864,10 +8553,14 @@ function LoopspaceRuntimeView({
                             setSendMessageSettingsNodeId(node.id);
                           }}
                           onPointerDown={(event) => event.stopPropagation()}
-                          title="Send message settings"
+                          title={sendMessageSettingsOpen ? "Cancel settings changes" : "Send message settings"}
                           type="button"
                         >
-                          <ButtonSettingsIcon aria-hidden="true" />
+                          {sendMessageSettingsOpen ? (
+                            <ButtonCloseIcon aria-hidden="true" />
+                          ) : (
+                            <ButtonSettingsIcon aria-hidden="true" />
+                          )}
                         </LoopspaceGraphMessageSettingsButton>
                         <LoopspaceGraphMessageRegion data-open={sendMessageSettingsOpen ? "true" : undefined}>
                           {sendMessageSettingsOpen ? (
@@ -7875,14 +8568,9 @@ function LoopspaceRuntimeView({
                               onPointerDown={(event) => event.stopPropagation()}
                               onWheel={(event) => event.stopPropagation()}
                             >
-                              <LoopspaceGraphMessageSettingsHeader>
-                                <strong>Message settings</strong>
-                                <span>Prompt and document subnodes</span>
-                              </LoopspaceGraphMessageSettingsHeader>
-                              <LoopspaceGraphMessageSettingsSection>
-                                <strong>Agent</strong>
-                                <span>Terminal provider and launch preferences for this message.</span>
-                                <LoopspaceGraphMessageSettingsGrid>
+                              <LoopspaceGraphMessageSettingsSection data-column="model">
+                                <strong>Model</strong>
+                                <LoopspaceGraphMessageSettingsGrid data-stack="true">
                                   <LoopspaceGraphMessageSettingsField>
                                     <span>Agent</span>
                                     <LoopspaceGraphMessageSettingsSelect
@@ -7965,9 +8653,8 @@ function LoopspaceRuntimeView({
                                   </LoopspaceGraphMessageSettingsField>
                                 </LoopspaceGraphMessageSettingsGrid>
                               </LoopspaceGraphMessageSettingsSection>
-                              <LoopspaceGraphMessageSettingsSection data-grow="true">
+                              <LoopspaceGraphMessageSettingsSection data-column="prompt" data-grow="true">
                                 <strong>Prompt</strong>
-                                <span>Guidance sent to the selected device agent.</span>
                                 <LoopspaceGraphMessagePrompt
                                   aria-label={`Prompt for ${node.label}`}
                                   disabled={busy}
@@ -7978,47 +8665,92 @@ function LoopspaceRuntimeView({
                                   placeholder="Optional prompt. Leave empty to send the default loop message."
                                   value={sendMessageDraftPrompt}
                                 />
+                                <LoopspaceGraphMessageSettingsActions>
+                                  <LoopspaceGraphMessageSaveButton
+                                    disabled={busy}
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      void saveSendMessageSettings(node, sendMessageDraft);
+                                    }}
+                                    type="button"
+                                  >
+                                    Save
+                                  </LoopspaceGraphMessageSaveButton>
+                                  <LoopspaceGraphMessageSaveButton
+                                    data-variant="secondary"
+                                    disabled={busy}
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      cancelSendMessageSettings(node.id);
+                                    }}
+                                    type="button"
+                                  >
+                                    Cancel
+                                  </LoopspaceGraphMessageSaveButton>
+                                </LoopspaceGraphMessageSettingsActions>
                               </LoopspaceGraphMessageSettingsSection>
-                              <LoopspaceGraphMessageSettingsSection>
-                                <strong>Subnodes</strong>
-                                <span>Add document context nodes for the message prompt.</span>
+                              <LoopspaceGraphMessageSettingsSection data-column="steps">
+                                <strong>Steps</strong>
                                 <LoopspaceGraphMessageSubnodeToolbar>
                                   <LoopspaceGraphMessageSubnodeButton
                                     disabled={busy}
                                     onClick={(event) => {
                                       event.stopPropagation();
-                                      void addSendMessageDocumentSubnode(node, "document_read");
+                                      void addSendMessageStep(node);
                                     }}
                                     type="button"
                                   >
-                                    + Read docs
-                                  </LoopspaceGraphMessageSubnodeButton>
-                                  <LoopspaceGraphMessageSubnodeButton
-                                    disabled={busy}
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      void addSendMessageDocumentSubnode(node, "document_write");
-                                    }}
-                                    type="button"
-                                  >
-                                    + Write docs
+                                    + Step
                                   </LoopspaceGraphMessageSubnodeButton>
                                 </LoopspaceGraphMessageSubnodeToolbar>
-                                <LoopspaceGraphMessageSubnodeList aria-label="Message subnodes">
-                                  {sendMessageCheckpoints.length ? sendMessageCheckpoints.map((checkpoint) => {
-                                    const checkpointIsDocument = checkpoint.nodeKind === "document_read" || checkpoint.nodeKind === "document_write";
-                                    const checkpointMode = checkpoint.nodeKind === "document_write" ? "write" : "read";
+                                <LoopspaceGraphMessageSubnodeList aria-label="Message steps">
+                                  {sendMessageSteps.length ? sendMessageSteps.map(({ item: checkpoint }, checkpointIndex) => {
+                                    const stepTitle = loopspaceGraphStepTitle(checkpoint, checkpointIndex);
+                                    const stepDescription = loopspaceGraphStepDescription(checkpoint);
                                     return (
                                       <LoopspaceGraphMessageSubnodeItem
-                                        data-mode={checkpointMode}
+                                        data-mode="step"
                                         key={checkpoint.id}
                                       >
-                                        <LoopspaceGraphNodeText>
-                                          <strong>{checkpoint.nodeKind === "document_write" ? "Document write" : checkpoint.nodeKind === "document_read" ? "Document read" : checkpoint.label}</strong>
-                                          <span>{checkpointIsDocument ? (checkpointMode === "write" ? "Writable docs" : "Readable docs") : "Message subnode"}</span>
-                                        </LoopspaceGraphNodeText>
+                                        <LoopspaceGraphMessageSubnodeMain>
+                                          <LoopspaceGraphMessageStepHeader>
+                                            <LoopspaceGraphMessageStepNumber>{checkpointIndex + 1}</LoopspaceGraphMessageStepNumber>
+                                            <LoopspaceGraphMessageStepInput
+                                              aria-label={`Title for step ${checkpointIndex + 1}`}
+                                              disabled={busy}
+                                              onBlur={(event) => {
+                                                const title = event.target.value;
+                                                if (title !== stepTitle) {
+                                                  void updateSendMessageStep(checkpoint, { title });
+                                                }
+                                              }}
+                                              onKeyDown={(event) => {
+                                                if (event.key === "Enter") {
+                                                  event.preventDefault();
+                                                  event.currentTarget.blur();
+                                                }
+                                              }}
+                                              onPointerDown={(event) => event.stopPropagation()}
+                                              placeholder={`Step ${checkpointIndex + 1}`}
+                                              defaultValue={stepTitle}
+                                            />
+                                          </LoopspaceGraphMessageStepHeader>
+                                          <LoopspaceGraphMessageStepDescription
+                                            aria-label={`Description for step ${checkpointIndex + 1}`}
+                                            disabled={busy}
+                                            onBlur={(event) => {
+                                              const description = event.target.value;
+                                              if (description !== stepDescription) {
+                                                void updateSendMessageStep(checkpoint, { description });
+                                              }
+                                            }}
+                                            onPointerDown={(event) => event.stopPropagation()}
+                                            placeholder="Describe what the agent should complete at this checkpoint."
+                                            defaultValue={stepDescription}
+                                          />
+                                        </LoopspaceGraphMessageSubnodeMain>
                                         <button
-                                          aria-label={`Remove ${checkpoint.label || "subnode"}`}
+                                          aria-label={`Remove ${stepTitle || "step"}`}
                                           disabled={busy}
                                           onClick={(event) => {
                                             event.stopPropagation();
@@ -8028,57 +8760,65 @@ function LoopspaceRuntimeView({
                                         >
                                           <ButtonCloseIcon aria-hidden="true" />
                                         </button>
-                                        {checkpointIsDocument ? (
-                                          <LoopspaceDocumentContextPicker
-                                            busy={busy}
-                                            mode={checkpointMode}
-                                            onRefsChange={(refs) => void updateDocumentContextNodeRefs(checkpoint, refs)}
-                                            options={loopspaceGraphDocumentOptions}
-                                            refs={loopspaceGraphDocumentRefsFromProps(checkpoint.props)}
-                                            search={String(documentContextSearchByNode[checkpoint.id] || "")}
-                                            setSearch={(value) => setDocumentContextSearchByNode((current) => ({
-                                              ...current,
-                                              [checkpoint.id]: value,
-                                            }))}
-                                          />
-                                        ) : null}
                                       </LoopspaceGraphMessageSubnodeItem>
                                     );
                                   }) : (
                                     <LoopspaceGraphMessageSubnodeItem data-empty="true">
                                       <LoopspaceGraphNodeText>
-                                        <strong>No subnodes yet</strong>
-                                        <span>Add read/write docs for this message.</span>
+                                        <strong>No steps yet</strong>
+                                        <span>Add internal checkpoints for this message.</span>
                                       </LoopspaceGraphNodeText>
                                     </LoopspaceGraphMessageSubnodeItem>
                                   )}
                                 </LoopspaceGraphMessageSubnodeList>
                               </LoopspaceGraphMessageSettingsSection>
-                              <LoopspaceGraphMessageSettingsActions>
-                                <LoopspaceGraphMessageSaveButton
-                                  disabled={busy}
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    void saveSendMessageSettings(node, sendMessageDraft);
-                                  }}
-                                  type="button"
-                                >
-                                  Save
-                                </LoopspaceGraphMessageSaveButton>
-                              </LoopspaceGraphMessageSettingsActions>
                             </LoopspaceGraphMessageSettingsPanel>
                           ) : (
-                            <LoopspaceGraphMessageSummary>
-                              <strong>{sendMessagePrompt.trim() ? "Custom prompt" : "Default loop prompt"}</strong>
-                              <span>
-                                {[
-                                  `${sendMessageAgentLabel} / ${sendMessageModelLabel}`,
-                                  sendMessageDocumentCount
-                                    ? `${sendMessageDocumentCount} document context ${sendMessageDocumentCount === 1 ? "node" : "nodes"}`
-                                    : "Open settings to edit prompt and docs",
-                                ].filter(Boolean).join(" - ")}
-                              </span>
-                            </LoopspaceGraphMessageSummary>
+                            <LoopspaceGraphMessageFlow
+                              aria-label="Internal send message steps"
+                              data-empty={sendMessageFlowNodes.length ? undefined : "true"}
+                              style={{
+                                "--loopspace-message-flow-height": `${sendMessageFlowBounds?.height || LOOPSPACE_GRAPH_MESSAGE_FLOW_MIN_HEIGHT}px`,
+                                "--loopspace-message-flow-width": `${sendMessageFlowBounds?.width || 220}px`,
+                              }}
+                            >
+                              <LoopspaceGraphMessageFlowEdges
+                                aria-hidden="true"
+                                viewBox={`0 0 ${sendMessageFlowBounds?.width || 220} ${sendMessageFlowBounds?.height || LOOPSPACE_GRAPH_MESSAGE_FLOW_MIN_HEIGHT}`}
+                              >
+                                {sendMessageFlowEdges.map((flowEdge) => (
+                                  <LoopspaceGraphMessageFlowEdgePath
+                                    d={loopspaceGraphMessageFlowPathBetween(flowEdge.from, flowEdge.to)}
+                                    key={flowEdge.id}
+                                  />
+                                ))}
+                              </LoopspaceGraphMessageFlowEdges>
+                              {sendMessageFlowNodes.map(({ item: stepNode, itemIndex, layout: stepLayout }, flowIndex) => {
+                                const stepTitle = loopspaceGraphMessageChildTitle(stepNode, itemIndex);
+                                const stepSubtitle = loopspaceGraphMessageChildSubtitle(stepNode, itemIndex);
+                                return (
+                                  <LoopspaceGraphMessageFlowNode
+                                    data-kind={stepNode.nodeKind || stepNode.kind || "step"}
+                                    key={stepNode.id}
+                                    onPointerDown={(event) => startSendMessageCheckpointDrag(event, node, stepNode, flowIndex, stepLayout)}
+                                    style={{
+                                      "--loopspace-flow-node-height": `${stepLayout.height}px`,
+                                      "--loopspace-flow-node-width": `${stepLayout.width}px`,
+                                      "--loopspace-flow-node-x": `${stepLayout.x}px`,
+                                      "--loopspace-flow-node-y": `${stepLayout.y}px`,
+                                    }}
+                                    title={stepTitle}
+                                  >
+                                    <LoopspaceGraphMessageFlowNodePort data-side="input" aria-hidden="true" />
+                                    <LoopspaceGraphMessageFlowNodeText>
+                                      <strong>{stepTitle}</strong>
+                                      {stepSubtitle ? <span>{stepSubtitle}</span> : null}
+                                    </LoopspaceGraphMessageFlowNodeText>
+                                    <LoopspaceGraphMessageFlowNodePort data-side="output" aria-hidden="true" />
+                                  </LoopspaceGraphMessageFlowNode>
+                                );
+                              })}
+                            </LoopspaceGraphMessageFlow>
                           )}
                         </LoopspaceGraphMessageRegion>
                         <LoopspaceGraphMessageResize
@@ -8136,7 +8876,8 @@ function LoopspaceRuntimeView({
                 const nodeLayout = loopspaceGraphNodeLayout(node, 0);
                 const type = node.nodeKind || node.role || "node";
                 const isGhostRegion = node.nodeKind === "send_message";
-                const isGhostSizedNode = isGhostRegion || node.nodeKind === "run_script";
+                const ghostVisualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
+                const isGhostSizedNode = Boolean(ghostVisualDefaults.sized);
                 const Icon = node.nodeKind === "device"
                   ? Devices
                   : node.nodeKind === "run_script"
@@ -8156,6 +8897,9 @@ function LoopspaceRuntimeView({
                     style={{
                       ...(isGhostSizedNode ? {
                         "--loopspace-node-height": `${nodeLayout.height}px`,
+                        ...(ghostVisualDefaults.outputGutter ? {
+                          "--loopspace-node-output-gutter": `${ghostVisualDefaults.outputGutter}px`,
+                        } : {}),
                         "--loopspace-node-width": `${nodeLayout.width}px`,
                       } : {}),
                       "--loopspace-node-x": `${nodeLayout.x}px`,
@@ -8255,6 +8999,7 @@ function LoopspaceRuntimeView({
                     ["logs", "Logs"],
                   ].map(([tabId, label]) => (
                     <LoopspaceRuntimePanelTab
+                      aria-selected={runtimePanelTab === tabId}
                       data-active={runtimePanelTab === tabId ? "true" : undefined}
                       key={tabId}
                       onClick={() => {
@@ -8273,10 +9018,10 @@ function LoopspaceRuntimeView({
                     aria-pressed={runtimePanelAutoScroll}
                     data-enabled={runtimePanelAutoScroll ? "true" : "false"}
                     onClick={() => setRuntimePanelAutoScroll((value) => !value)}
-                    title={runtimePanelAutoScroll ? "Auto-scroll enabled" : "Auto-scroll disabled"}
+                    title={runtimePanelAutoScroll ? "Follow enabled" : "Follow disabled"}
                     type="button"
                   >
-                    Auto-scroll
+                    Follow
                   </LoopspaceRuntimePanelAutoScroll>
                 )}
                 <LoopspaceRuntimePanelToggle
@@ -8291,35 +9036,26 @@ function LoopspaceRuntimeView({
             ) : (
               <LoopspaceRuntimePanelHeader
                 data-collapsed="true"
-                onClick={() => setRuntimePanelExpanded(true)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter" || event.key === " ") {
-                    event.preventDefault();
-                    setRuntimePanelExpanded(true);
-                  }
-                }}
-                role="button"
-                tabIndex={0}
-                title="Maximize runtime panel"
               >
-                <span data-restore-label="true">Runtime panel</span>
-                <span data-restore-hint="true">Click to expand</span>
+                <span data-restore-label="true">Runtime minimized</span>
+                <span data-restore-hint="true">Hidden</span>
                 <LoopspaceRuntimePanelToggle
-                  aria-label="Maximize loop panel"
+                  aria-label="Expand runtime panel"
                   data-collapsed="true"
                   onClick={(event) => {
                     event.stopPropagation();
                     setRuntimePanelExpanded(true);
                   }}
-                  title="Maximize"
+                  title="Expand runtime panel"
                   type="button"
                 >
+                  <span>Expand</span>
                   <KeyboardArrowDown aria-hidden="true" />
                 </LoopspaceRuntimePanelToggle>
               </LoopspaceRuntimePanelHeader>
             )}
             {runtimePanelExpanded ? (
-              <LoopspaceRuntimePanelBody data-tab={runtimePanelTab} ref={runtimePanelBodyRef}>
+              <LoopspaceRuntimePanelBody data-tab={runtimePanelTab} onScroll={onRuntimePanelScroll} ref={runtimePanelBodyRef}>
                 {runtimePanelTab === "runtime" ? (
                   runtimeHead ? (
                     <LoopspaceRuntimePanelEventList>
@@ -8389,54 +9125,60 @@ function LoopspaceRuntimeView({
                       );
                     })}
                   </LoopspaceRuntimePanelGrid>
+                ) : visibleRuntimeEvents.length ? (
+                  <LoopspaceRuntimeConsole aria-live="polite">
+                    {runtimeEventsHasMoreBefore || runtimeEventsLoadingMore ? (
+                      <LoopspaceRuntimeConsoleLoader
+                        data-loading={runtimeEventsLoadingMore ? "true" : undefined}
+                        disabled={runtimeEventsLoadingMore || !runtimeEventsHasMoreBefore}
+                        onClick={() => {
+                          if (!runtimeEventsLoadingMore) void loadOlderRuntimeEvents();
+                        }}
+                        type="button"
+                      >
+                        {runtimeEventsLoadingMore ? "Loading previous events..." : "Older events"}
+                      </LoopspaceRuntimeConsoleLoader>
+                    ) : null}
+                    {visibleRuntimeEvents.map((event) => {
+                      const selected = selectedRuntimeEvent?.id === event.id;
+                      const detailsText = selected
+                        ? JSON.stringify(event.details && Object.keys(event.details).length ? event.details : event, null, 2)
+                        : "";
+                      return (
+                        <Fragment key={event.id}>
+                          <LoopspaceRuntimeConsoleRow
+                            aria-expanded={selected}
+                            data-clickable="true"
+                            data-selected={selected ? "true" : undefined}
+                            data-tone={loopspaceRuntimeEventTone(event)}
+                            onClick={() => setSelectedHistoryRunId((current) => (current === event.id ? "" : event.id))}
+                            onKeyDown={(rowEvent) => {
+                              if (rowEvent.key === "Enter" || rowEvent.key === " ") {
+                                rowEvent.preventDefault();
+                                setSelectedHistoryRunId((current) => (current === event.id ? "" : event.id));
+                              }
+                            }}
+                            role="button"
+                            tabIndex={0}
+                          >
+                            <span>{formatLoopspaceRuntimeConsoleTime(event.createdAtMs)}</span>
+                            <strong>{loopspaceRuntimeEventKindLabel(event)}</strong>
+                            <em>{event.message || event.status || "Runtime event"}</em>
+                          </LoopspaceRuntimeConsoleRow>
+                          {selected ? (
+                            <LoopspaceRuntimeConsoleDetail>
+                              {detailsText}
+                            </LoopspaceRuntimeConsoleDetail>
+                          ) : null}
+                        </Fragment>
+                      );
+                    })}
+                  </LoopspaceRuntimeConsole>
                 ) : (
-                  sortedRuntimeLogs.length ? (
-                    <LoopspaceRuntimePanelDetail>
-                      <LoopspaceRuntimePanelEventList>
-                        {sortedRuntimeLogs.map((run) => {
-                          const trigger = triggerById.get(run.triggerId);
-                          const type = run.type || trigger?.type || "manual";
-                          const status = run.status || "run";
-                          return (
-                            <LoopspaceRuntimePanelEventRow
-                              data-clickable="true"
-                              data-selected={selectedHistoryRun?.id === run.id ? "true" : undefined}
-                              data-tone={loopspaceRuntimeStatusTone(status)}
-                              key={run.id}
-                              onKeyDown={(event) => {
-                                if (event.key === "Enter" || event.key === " ") {
-                                  event.preventDefault();
-                                  setSelectedHistoryRunId(run.id);
-                                }
-                              }}
-                              onClick={() => setSelectedHistoryRunId(run.id)}
-                              role="button"
-                              tabIndex={0}
-                            >
-                              <span>{formatLoopspaceRuntimeTime(run.createdAtMs) || "run"}</span>
-                              <strong>{trigger?.name || run.triggerId || "Trigger run"}</strong>
-                              <em>{[loopspaceTriggerTypeLabel(type), status, run.error].filter(Boolean).join(" - ")}</em>
-                            </LoopspaceRuntimePanelEventRow>
-                          );
-                        })}
-                      </LoopspaceRuntimePanelEventList>
-                      {selectedHistoryRun ? (
-                        <LoopspaceRuntimePanelDetail data-detail="true">
-                          <strong>{selectedHistoryRun.id}</strong>
-                          <span>{[
-                            `status ${selectedHistoryRun.status || "run"}`,
-                            selectedHistoryRun.completedAtMs ? `completed ${formatLoopspaceRuntimeTime(selectedHistoryRun.completedAtMs)}` : "",
-                            selectedHistoryRun.error,
-                          ].filter(Boolean).join(" - ")}</span>
-                        </LoopspaceRuntimePanelDetail>
-                      ) : null}
-                    </LoopspaceRuntimePanelDetail>
-                  ) : (
-                    <LoopspaceRuntimePanelEmpty>
-                      <strong>No run history</strong>
-                      <span>Completed trigger runs for this loop will stay here.</span>
-                    </LoopspaceRuntimePanelEmpty>
-                  )
+                  <LoopspaceRuntimePanelEmpty>
+                    <strong>No runtime events</strong>
+                    <span>The next loop run will stream terminal-style events here.</span>
+                  </LoopspaceRuntimePanelEmpty>
                 )}
               </LoopspaceRuntimePanelBody>
             ) : null}
@@ -14598,6 +15340,13 @@ export default function App() {
       setAppScriptsState("ready");
     }
   }, [appScriptRunResults, defaultWorkingDirectory, focusAppScriptLogs]);
+
+  const handleAppGlobalScriptClick = useCallback((script, runLog = {}) => {
+    const runState = appScriptText(runLog?.state).toLowerCase();
+    focusAppScriptLogs(script);
+    if (runState === "queued" || runState === "running") return;
+    void runAppScript(script);
+  }, [focusAppScriptLogs, runAppScript]);
 
   const cancelAppScriptRun = useCallback(async (script, runLog = {}) => {
     const pathKey = appScriptPathKey(script);
@@ -27738,6 +28487,15 @@ export default function App() {
       || commandKind === "loopspace_send_message"
       || commandKind === "send_message"
     );
+    const remoteCommandIsSendMessageTask = (commandKind) => (
+      [
+        "terminal_orchestrator_send_message",
+        "terminal_send_message",
+        "orchestrator_send_message",
+        "loopspace_send_message",
+        "send_message",
+      ].includes(normalizeRemoteCommandName(commandKind))
+    );
     const remoteCommandIsAgentPackageAction = (commandKind) => (
       [
         "agent_install",
@@ -27949,6 +28707,24 @@ export default function App() {
       const targetId = String(targetTerminalId || "").trim();
       return Boolean(targetId && remoteControlTerminalIdentityValues(workspaceId, terminal).has(targetId));
     };
+    const remoteControlNormalizeTerminalName = (value) => (
+      String(value || "").trim().toLowerCase().replace(/\s+/g, " ")
+    );
+    const remoteControlTerminalMatchesName = (terminal, targetTerminalName) => {
+      const targetName = remoteControlNormalizeTerminalName(targetTerminalName);
+      if (!targetName) return false;
+      return [
+        "terminalNickname",
+        "terminal_nickname",
+        "terminalName",
+        "terminal_name",
+        "displayName",
+        "display_name",
+        "agentDisplayName",
+        "agent_display_name",
+        "name",
+      ].some((key) => remoteControlNormalizeTerminalName(terminal?.[key]) === targetName);
+    };
     const remoteControlTerminalStatusValues = (terminal) => [
       terminal?.nativeRailState,
       terminal?.native_rail_state,
@@ -28011,11 +28787,32 @@ export default function App() {
       const presenceWorkspace = findRemoteControlPresenceWorkspace(workspaceId);
       const terminals = Array.isArray(presenceWorkspace?.terminals) ? presenceWorkspace.terminals : [];
       const targetTerminalId = String(target.targetTerminalId || "").trim();
-      const terminal = targetTerminalId
-        ? terminals.find((candidate) => (
-          remoteControlTerminalMatchesTargetId(workspaceId, candidate, targetTerminalId)
-        )) || null
+      const targetThreadId = String(target.targetThreadId || "").trim();
+      const targetTerminalName = String(target.targetTerminalName || "").trim();
+      const targetTerminalIndex = Number.isInteger(target.targetTerminalIndex)
+        ? target.targetTerminalIndex
         : null;
+      let terminal = null;
+      if (targetTerminalId) {
+        terminal = terminals.find((candidate) => (
+          remoteControlTerminalMatchesTargetId(workspaceId, candidate, targetTerminalId)
+        )) || null;
+      }
+      if (!terminal && targetThreadId) {
+        terminal = terminals.find((candidate) => (
+          remoteControlTerminalText(candidate, ["threadId", "thread_id"]) === targetThreadId
+        )) || null;
+      }
+      if (!terminal && Number.isInteger(targetTerminalIndex)) {
+        terminal = terminals.find((candidate) => (
+          remoteControlTerminalNumber(candidate, ["terminalIndex", "terminal_index", "index"]) === targetTerminalIndex
+        )) || null;
+      }
+      if (!terminal && targetTerminalName) {
+        terminal = terminals.find((candidate) => (
+          remoteControlTerminalMatchesName(candidate, targetTerminalName)
+        )) || null;
+      }
       return {
         presenceWorkspace,
         terminal,
@@ -29010,6 +29807,168 @@ export default function App() {
       });
     };
 
+    const prepareRemoteSendMessageTarget = async ({
+      agentId,
+      commandId,
+      commandKind,
+      event,
+      targetTerminalId,
+      targetTerminalIndex,
+      targetTerminalName,
+      targetThreadId,
+      workspaceId,
+    }) => {
+      const nextAgentId = normalizeManagedAgentProviderId(agentId);
+      const nextTarget = {
+        targetTerminalId,
+        targetTerminalIndex,
+        targetTerminalName,
+        targetThreadId,
+      };
+      if (!workspaceId || !nextAgentId) {
+        return nextTarget;
+      }
+      const { terminal, terminals } = findRemoteControlTerminal(workspaceId, nextTarget);
+      const switchTerminalToAgent = async (terminalToSwitch, reason) => {
+        const terminalIndex = remoteControlTerminalNumber(terminalToSwitch, ["terminalIndex", "terminal_index", "index"]);
+        if (!Number.isInteger(terminalIndex)) {
+          return false;
+        }
+        const assessment = assessRemoteControlTerminalIdle(terminalToSwitch);
+        const terminalBusy = Boolean(terminalToSwitch)
+          && !assessment.idle
+          && !["already_closed", "unknown", "error", "failed", "timeout"].includes(assessment.reason);
+        if (terminalBusy) {
+          await recordRemoteCommandStatus(event, "running", "Target terminal is busy; the message is queued until it can switch agents.", {
+            agentId: nextAgentId,
+            assessment,
+            commandId,
+            commandKind,
+            terminal: remoteControlTerminalSummary(terminalToSwitch, { reason: assessment.reason, ...nextTarget }),
+            workspaceId,
+          });
+          return false;
+        }
+        const previousAgentId = normalizeManagedAgentProviderId(remoteControlTerminalText(terminalToSwitch, [
+          "agentId",
+          "agent_id",
+          "agentKind",
+          "agent_kind",
+          "agentType",
+          "agent_type",
+          "role",
+        ]));
+        await recordRemoteCommandStatus(event, "running", `Relaunching terminal as ${getManagedAgentLabel(nextAgentId)} for the loopspace message.`, {
+          agentId: nextAgentId,
+          commandId,
+          commandKind,
+          previousAgentId,
+          reason,
+          terminalIndex,
+          workspaceId,
+        });
+        changeWorkspaceTerminalRole({
+          restart: false,
+          role: nextAgentId,
+          source: "loopspace_send_message_agent_switch",
+          terminalIndex,
+          threadId: remoteControlTerminalText(terminalToSwitch, ["threadId", "thread_id"]) || nextTarget.targetThreadId,
+          workspaceId,
+        });
+        await syncRemoteControlState("loopspace_send_message_agent_switch");
+        nextTarget.targetTerminalId = "";
+        nextTarget.targetThreadId = "";
+        nextTarget.targetTerminalIndex = terminalIndex;
+        nextTarget.targetTerminalName = nextTarget.targetTerminalName || remoteControlTerminalText(terminalToSwitch, [
+          "terminalNickname",
+          "terminal_nickname",
+          "terminalName",
+          "terminal_name",
+          "displayName",
+          "display_name",
+          "agentDisplayName",
+          "agent_display_name",
+        ]);
+        return true;
+      };
+
+      if (terminal) {
+        const currentAgentId = normalizeManagedAgentProviderId(remoteControlTerminalText(terminal, [
+          "agentId",
+          "agent_id",
+          "agentKind",
+          "agent_kind",
+          "agentType",
+          "agent_type",
+          "role",
+        ]));
+        if (currentAgentId && currentAgentId !== nextAgentId) {
+          await switchTerminalToAgent(terminal, "explicit_target_agent_mismatch");
+        }
+        return nextTarget;
+      }
+
+      const matchingTerminal = terminals.find((candidate) => (
+        !remoteControlTerminalLooksClosed(candidate)
+          && normalizeManagedAgentProviderId(remoteControlTerminalText(candidate, [
+            "agentId",
+            "agent_id",
+            "agentKind",
+            "agent_kind",
+            "agentType",
+            "agent_type",
+            "role",
+          ])) === nextAgentId
+      ));
+      if (matchingTerminal) {
+        nextTarget.targetTerminalId = nextTarget.targetTerminalId || remoteControlTerminalText(
+          matchingTerminal,
+          ["paneId", "pane_id", "terminalId", "terminal_id"],
+        );
+        nextTarget.targetThreadId = nextTarget.targetThreadId || remoteControlTerminalText(matchingTerminal, ["threadId", "thread_id"]);
+        if (!Number.isInteger(nextTarget.targetTerminalIndex)) {
+          nextTarget.targetTerminalIndex = remoteControlTerminalNumber(matchingTerminal, ["terminalIndex", "terminal_index", "index"]);
+        }
+        return nextTarget;
+      }
+
+      const idleTerminal = terminals.find((candidate) => assessRemoteControlTerminalIdle(candidate).idle);
+      if (idleTerminal) {
+        await switchTerminalToAgent(idleTerminal, "idle_terminal_reuse");
+        return nextTarget;
+      }
+
+      try {
+        if (activatedWorkspaceIdRef.current !== workspaceId) {
+          requestWorkspaceActivation(workspaceId, "loopspace_send_message_agent_prepare");
+        }
+        const result = await manageWorkspaceAgents({
+          action: "ensure_count",
+          agentType: nextAgentId,
+          count: 1,
+          source: "loopspace_send_message_agent_prepare",
+          workspaceId,
+        });
+        await syncRemoteControlState("loopspace_send_message_agent_prepare");
+        await recordRemoteCommandStatus(event, "running", result?.message || `Preparing ${getManagedAgentLabel(nextAgentId)} for the loopspace message.`, {
+          agentId: nextAgentId,
+          commandId,
+          commandKind,
+          result: result || null,
+          workspaceId,
+        });
+      } catch (error) {
+        await recordRemoteCommandStatus(event, "running", "The message is queued while a matching coding-agent terminal becomes available.", {
+          agentId: nextAgentId,
+          commandId,
+          commandKind,
+          error: getErrorMessage(error, "Unable to prepare coding-agent terminal."),
+          workspaceId,
+        });
+      }
+      return nextTarget;
+    };
+
     const startRemoteCommandListener = async () => {
       try {
         await invoke("cloud_mcp_start_remote_command_listener");
@@ -29023,8 +29982,9 @@ export default function App() {
           const commandId = String(event.command_id || event.commandId || event.payload?.command_id || event.payload?.commandId || "").trim()
             || `remote-command-${Date.now()}-${Math.random().toString(16).slice(2)}`;
           const commandKind = remoteCommandKind(event);
+          const sendMessageTask = remoteCommandIsSendMessageTask(commandKind);
           let text = remoteCommandText(event);
-          const workspaceId = remoteCommandWorkspaceId(event);
+          const workspaceId = sendMessageTask ? "" : remoteCommandWorkspaceId(event);
           const todoDispatchId = remoteCommandStringField(event, [
             "todo_dispatch_id",
             "todoDispatchId",
@@ -29164,7 +30124,7 @@ export default function App() {
               );
             }
           }
-          const targetColorSlot = normalizeTerminalColorSlot(remoteCommandIntegerField(event, [
+          let targetColorSlot = normalizeTerminalColorSlot(remoteCommandIntegerField(event, [
             "target_color_slot",
             "targetColorSlot",
             "color_slot",
@@ -29185,9 +30145,7 @@ export default function App() {
               || Number.isInteger(targetTerminalIndex)
               || targetTerminalName,
           );
-          const terminalTargetHintWithoutId = hasTerminalTarget && !targetTerminalId;
-          const hasResolvedTerminalTarget = Boolean(targetTerminalId);
-          const targetTerminalColor = hasTerminalTarget
+          let targetTerminalColor = hasTerminalTarget
             ? sanitizeTerminalColor(rawTargetTerminalColor, targetColorSlot ?? targetTerminalIndex ?? 0)
             : "";
           const agentPackageAction = remoteCommandIsAgentPackageAction(commandKind);
@@ -29208,29 +30166,19 @@ export default function App() {
           }
           const navigationAction = remoteCommandIsNavigationAction(commandKind);
           const deviceOnlyNavigationAction = remoteCommandIsDeviceOnlyNavigationAction(commandKind);
-          const receiptWorkspaceId = workspaceId || (agentPackageAction || deviceOnlyNavigationAction ? "device" : "");
-          if (!workspaceId && !agentPackageAction && !deviceOnlyNavigationAction) {
+          const terminalOrchestratorMessageAction = sendMessageTask;
+          const receiptWorkspaceId = workspaceId
+            || (terminalOrchestratorMessageAction
+              ? DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID
+              : agentPackageAction || deviceOnlyNavigationAction
+                ? "device"
+                : "");
+          if (!workspaceId && !agentPackageAction && !deviceOnlyNavigationAction && !terminalOrchestratorMessageAction) {
             await recordRemoteCommandStatus(
               event,
               "failed",
               "No local workspace is available for the remote command.",
               { commandId, commandKind },
-            );
-            return;
-          }
-          if (terminalTargetHintWithoutId) {
-            await recordRemoteCommandStatus(
-              event,
-              "failed",
-              "Remote terminal target hints must include an exact terminal id.",
-              {
-                commandId,
-                commandKind,
-                targetTerminalIndex,
-                targetTerminalName,
-                targetThreadId,
-                workspaceId,
-              },
             );
             return;
           }
@@ -29246,6 +30194,68 @@ export default function App() {
               commandKind,
               workspaceId: receiptWorkspaceId,
             });
+            return;
+          }
+          if (terminalOrchestratorMessageAction) {
+            if (!text) {
+              await recordRemoteCommandStatus(event, "failed", "Remote command did not include a terminal orchestrator message.", {
+                commandId,
+                commandKind,
+                terminalScope: "device",
+                workspaceId: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
+              });
+              return;
+            }
+            setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
+            await recordRemoteCommandStatus(event, "queued", "Queued for the terminal orchestrator.", {
+              agentId,
+              commandId,
+              commandKind,
+              targetTerminalId,
+              targetTerminalIndex,
+              targetTerminalName,
+              targetThreadId,
+              terminalScope: "device",
+              workspaceId: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
+            });
+            window.dispatchEvent(new CustomEvent(REMOTE_APP_CONTROL_SEND_MESSAGE_EVENT, {
+              detail: {
+                agentId,
+                body: text,
+                commandId,
+                commandKind,
+                dispatchSource,
+                dispatchTarget,
+                event,
+                loopRuntimeEdgeId,
+                loopRuntimeNodeId,
+                loopRuntimeRunId,
+                loopspaceId: loopspaceRuntimeId,
+                message: text,
+                model: requestedModel,
+                prompt: text,
+                reasoningEffort: requestedReasoningEffort,
+                requestedModel,
+                requestedReasoningEffort,
+                requestedSpeed,
+                source: event.source || "next-diffforge",
+                speed: requestedSpeed,
+                targetAgentId: agentId || "",
+                targetTerminalId,
+                targetTerminalIndex,
+                targetTerminalName,
+                targetThreadId,
+                terminalScope: "device",
+                text,
+                todoDeviceId,
+                todoDispatchId,
+                todoId,
+                todoWorkspaceId,
+                triggerId: triggerRuntimeId,
+                triggerRunId: triggerRunRuntimeId,
+                workspaceId: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
+              },
+            }));
             return;
           }
           if (agentPackageAction) {
@@ -29296,6 +30306,36 @@ export default function App() {
               workspaceId,
             });
             return;
+          }
+          if (remoteCommandIsSendMessageTask(commandKind)) {
+            const preparedTarget = await prepareRemoteSendMessageTarget({
+              agentId,
+              commandId,
+              commandKind,
+              event,
+              targetTerminalId,
+              targetTerminalIndex,
+              targetTerminalName,
+              targetThreadId,
+              workspaceId,
+            });
+            targetTerminalId = preparedTarget.targetTerminalId || "";
+            targetTerminalIndex = Number.isInteger(preparedTarget.targetTerminalIndex)
+              ? preparedTarget.targetTerminalIndex
+              : null;
+            targetTerminalName = preparedTarget.targetTerminalName || "";
+            targetThreadId = preparedTarget.targetThreadId || "";
+            targetColorSlot = normalizeTerminalColorSlot(remoteCommandIntegerField(event, [
+              "target_color_slot",
+              "targetColorSlot",
+              "color_slot",
+              "colorSlot",
+              "terminal_color_slot",
+              "terminalColorSlot",
+            ]) ?? targetTerminalIndex);
+            targetTerminalColor = (targetTerminalId || targetThreadId || Number.isInteger(targetTerminalIndex) || targetTerminalName)
+              ? sanitizeTerminalColor(rawTargetTerminalColor, targetColorSlot ?? targetTerminalIndex ?? 0)
+              : "";
           }
           window.dispatchEvent(new CustomEvent(REMOTE_TODO_QUEUE_EVENT, {
             detail: {
@@ -29379,7 +30419,7 @@ export default function App() {
           // The arrival native notification is sent from Rust at remote
           // intake (todo_dispatch_record_remote_intake), before the webview
           // ever sees the command.
-          if (hasResolvedTerminalTarget) {
+          if (targetTerminalId || targetThreadId || Number.isInteger(targetTerminalIndex) || targetTerminalName) {
             terminalStatusEventEmitterRef.current?.({
               activityStatus: "queued",
               agentId: agentId || "",
@@ -30581,6 +31621,15 @@ export default function App() {
         throw error;
       }
     };
+    const validateLoopspaceGraphSourceContractForAppControl = (source, options = {}) => {
+      const validation = typeof options.previousSource === "string"
+        ? validateDfBlueprintSourceForUpdate(source, options.previousSource)
+        : validateDfBlueprintSource(source);
+      if (validation.ok) return;
+      const error = new Error(validation.errors[0] || "Loopspace graph contains an invalid node or port connection.");
+      error.code = "loopspace_graph_contract_invalid";
+      throw error;
+    };
     const normalizeLoopspaceGraphPatchOperationsForAppControl = (operations = [], rows = []) => (
       operations.map((operation) => {
         const op = operation && typeof operation === "object" ? operation : {};
@@ -31081,7 +32130,7 @@ export default function App() {
               result,
               source_format: DFBLUEPRINT_SOURCE_FORMAT,
               blueprint: parseDfBlueprintSource(String(result?.graph?.source || result?.graph?.sourceText || result?.graph?.source_text || "")),
-              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger if needed, then patch with attach_trigger and trigger_id. Never invent standalone cron/manual/webhook trigger nodes.",
+              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: run_script/send_message expose exec, success, failure, interrupt; document_read exposes docs; most executable targets accept in. Never invent standalone cron/manual/webhook trigger nodes.",
               loopspace: { id: loopspace.id, name: loopspace.name },
               state: buildAppControlState(),
             },
@@ -31149,8 +32198,26 @@ export default function App() {
             });
           }
           const currentSource = String(current?.graph?.source || current?.graph?.sourceText || current?.graph?.source_text || "");
-          const source = applyDfBlueprintPatchOperations(currentSource, normalizedOperations, { name: loopspace.name });
+          let source;
           try {
+            source = applyDfBlueprintPatchOperations(currentSource, normalizedOperations, { name: loopspace.name });
+          } catch (patchError) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: patchError?.code || "loopspace_graph_patch_invalid",
+                message: String(patchError?.message || patchError || "Invalid Loopspace graph patch."),
+              },
+              data: {
+                loopspace: { id: loopspace.id, name: loopspace.name },
+                state: buildAppControlState(),
+                triggers: triggerRows,
+              },
+            });
+            return;
+          }
+          try {
+            validateLoopspaceGraphSourceContractForAppControl(source, { previousSource: currentSource });
             validateLoopspaceGraphSourceTriggerRefsForAppControl(source, triggerRows);
           } catch (patchError) {
             sendAppControlReply(requestId, {
@@ -31225,6 +32292,7 @@ export default function App() {
           const normalizedSource = normalizeDfBlueprintSource(source, { name: loopspace.name });
           const triggerRows = await getLoopspaceTriggerRowsForAppControl(true);
           try {
+            validateLoopspaceGraphSourceContractForAppControl(normalizedSource);
             validateLoopspaceGraphSourceTriggerRefsForAppControl(normalizedSource, triggerRows);
           } catch (graphError) {
             sendAppControlReply(requestId, {
@@ -38300,12 +39368,12 @@ export default function App() {
                           aria-busy={busy ? "true" : "false"}
                           data-running={busy ? "true" : "false"}
                           key={pathKey}
-                          onClick={() => void runAppScript(script)}
+                          onClick={() => handleAppGlobalScriptClick(script, runLog)}
                           style={{
                             "--script-button-bg": scriptColors.buttonColor,
                             "--script-button-color": scriptColors.textColor,
                           }}
-                          title={busy ? `Queue another ${scriptTitle} run` : `Run ${scriptTitle}`}
+                          title={busy ? `View live logs for ${scriptTitle}` : `Run ${scriptTitle}`}
                           type="button"
                         >
                           {busy && (

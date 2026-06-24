@@ -93,6 +93,7 @@ const CLOUD_MCP_LOOPSPACE_TRIGGER_MIRROR_TABLE: &str = "loopspace_trigger_mirror
 const CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_MIRROR_TABLE: &str = "loopspace_trigger_run_mirror_rows";
 const CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_LOOPSPACE_MIRROR_TABLE: &str =
     "loopspace_trigger_run_loopspace_rows";
+const CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE: &str = "loopspace_runtime_event_mirror_rows";
 const CLOUD_MCP_LOOPSPACE_TRIGGER_SYNC_STATE_TABLE: &str = "loopspace_trigger_sync_state";
 const CLOUD_MCP_ASSET_LIBRARY_DB_FILE: &str = "account-asset-library.sqlite";
 const CLOUD_MCP_LEGACY_ASSET_LIBRARY_DB_FILE: &str = "workspace-asset-library.sqlite";
@@ -2207,6 +2208,23 @@ fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<(
             ON {CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_LOOPSPACE_MIRROR_TABLE}(scope_key, loopspace_id, created_at_ms DESC, run_id DESC);
         CREATE INDEX IF NOT EXISTS idx_loopspace_trigger_run_loopspace_mirror_trigger
             ON {CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_LOOPSPACE_MIRROR_TABLE}(scope_key, trigger_id);
+        CREATE TABLE IF NOT EXISTS {CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE}(
+            scope_key TEXT NOT NULL DEFAULT '',
+            loopspace_id TEXT NOT NULL DEFAULT '',
+            event_id TEXT NOT NULL,
+            event_seq INTEGER NOT NULL DEFAULT 0,
+            run_id TEXT NOT NULL DEFAULT '',
+            trigger_run_id TEXT NOT NULL DEFAULT '',
+            trigger_id TEXT NOT NULL DEFAULT '',
+            created_at_ms INTEGER NOT NULL DEFAULT 0,
+            row_json TEXT NOT NULL DEFAULT '{{}}',
+            updated_at_ms INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(scope_key, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_loopspace_runtime_event_mirror_loop
+            ON {CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE}(scope_key, loopspace_id, event_seq DESC);
+        CREATE INDEX IF NOT EXISTS idx_loopspace_runtime_event_mirror_run
+            ON {CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE}(scope_key, run_id, event_seq DESC);
         CREATE TABLE IF NOT EXISTS {CLOUD_MCP_LOOPSPACE_TRIGGER_SYNC_STATE_TABLE}(
             scope_key TEXT PRIMARY KEY,
             server_cursor INTEGER NOT NULL DEFAULT 0,
@@ -3436,8 +3454,8 @@ fn cloud_mcp_outbox_snapshot_coalesce_key(event_kind: &str, payload: &Value) -> 
         )
         .unwrap_or_default();
         if !device_id.is_empty() {
-            let scope_key =
-                cloud_mcp_payload_scope_key(payload).unwrap_or_else(cloud_mcp_process_account_scope_key);
+            let scope_key = cloud_mcp_payload_scope_key(payload)
+                .unwrap_or_else(cloud_mcp_process_account_scope_key);
             return Some(format!("script-inventory:{scope_key}:{device_id}"));
         }
     }
@@ -3729,9 +3747,8 @@ fn cloud_mcp_outbox_idempotency_key(
             &["owner_device_id", "device_id", "ownerDeviceId", "deviceId"],
         )
         .unwrap_or_default();
-        let inventory_hash =
-            cloud_mcp_payload_text(payload, &["inventory_hash", "inventoryHash"])
-                .unwrap_or_else(|| payload_hash.to_string());
+        let inventory_hash = cloud_mcp_payload_text(payload, &["inventory_hash", "inventoryHash"])
+            .unwrap_or_else(|| payload_hash.to_string());
         if !device_id.is_empty() {
             return format!("script_inventory:{device_id}:{inventory_hash}");
         }
@@ -11599,7 +11616,241 @@ fn cloud_mcp_loopspace_delete_row(
             rusqlite::params![scope_key, loopspace_id.trim()],
         )
         .map_err(|error| format!("Unable to delete loopspace mirror row: {error}"))?;
+    let _ = conn
+        .execute(
+            &format!(
+                "DELETE FROM {CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE}
+                 WHERE scope_key=?1 AND loopspace_id=?2"
+            ),
+            rusqlite::params![scope_key, loopspace_id.trim()],
+        )
+        .map_err(|error| format!("Unable to delete loopspace runtime event rows: {error}"))?;
     Ok(removed > 0)
+}
+
+fn cloud_mcp_loopspace_runtime_event_normalized_row(
+    row: &Value,
+) -> Option<(String, String, i64, String, String, String, i64, Value)> {
+    let event_id = cloud_mcp_payload_text(row, &["id", "event_id", "eventId"])?;
+    let event_id = event_id.trim().to_string();
+    if event_id.is_empty() {
+        return None;
+    }
+    let loopspace_id = cloud_mcp_payload_text(row, &["loopspace_id", "loopspaceId"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if loopspace_id.is_empty() {
+        return None;
+    }
+    let event_seq = cloud_mcp_payload_i64(row, &["event_seq", "eventSeq", "seq"])
+        .unwrap_or(0)
+        .max(0);
+    let run_id = cloud_mcp_payload_text(row, &["run_id", "runId"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let trigger_run_id = cloud_mcp_payload_text(row, &["trigger_run_id", "triggerRunId"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let trigger_id = cloud_mcp_payload_text(row, &["trigger_id", "triggerId"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let created_at_ms = cloud_mcp_payload_i64(row, &["created_at_ms", "createdAtMs"])
+        .unwrap_or(0)
+        .max(0);
+    let mut normalized = row.clone();
+    if let Some(object) = normalized.as_object_mut() {
+        object.insert("id".to_string(), json!(event_id.clone()));
+        object.insert("event_id".to_string(), json!(event_id.clone()));
+        object.insert("eventId".to_string(), json!(event_id.clone()));
+        object.insert("loopspace_id".to_string(), json!(loopspace_id.clone()));
+        object.insert("loopspaceId".to_string(), json!(loopspace_id.clone()));
+        object.insert("event_seq".to_string(), json!(event_seq));
+        object.insert("eventSeq".to_string(), json!(event_seq));
+        object.insert("run_id".to_string(), json!(run_id.clone()));
+        object.insert("runId".to_string(), json!(run_id.clone()));
+        object.insert("trigger_run_id".to_string(), json!(trigger_run_id.clone()));
+        object.insert("triggerRunId".to_string(), json!(trigger_run_id.clone()));
+        object.insert("trigger_id".to_string(), json!(trigger_id.clone()));
+        object.insert("triggerId".to_string(), json!(trigger_id.clone()));
+        object.insert("created_at_ms".to_string(), json!(created_at_ms));
+        object.insert("createdAtMs".to_string(), json!(created_at_ms));
+    }
+    Some((
+        event_id,
+        loopspace_id,
+        event_seq,
+        run_id,
+        trigger_run_id,
+        trigger_id,
+        created_at_ms,
+        normalized,
+    ))
+}
+
+fn cloud_mcp_loopspace_runtime_event_upsert_row(
+    conn: &rusqlite::Connection,
+    scope_key: &str,
+    row: &Value,
+) -> Result<bool, String> {
+    let Some((
+        event_id,
+        loopspace_id,
+        event_seq,
+        run_id,
+        trigger_run_id,
+        trigger_id,
+        created_at_ms,
+        normalized,
+    )) = cloud_mcp_loopspace_runtime_event_normalized_row(row)
+    else {
+        return Ok(false);
+    };
+    let row_json = serde_json::to_string(&normalized)
+        .map_err(|error| format!("Unable to encode loopspace runtime event row: {error}"))?;
+    let changed = conn
+        .execute(
+            &format!(
+                "INSERT INTO {CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE}(
+                   scope_key, loopspace_id, event_id, event_seq, run_id,
+                   trigger_run_id, trigger_id, created_at_ms, row_json, updated_at_ms
+                 )
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(scope_key, event_id) DO UPDATE SET
+                   loopspace_id=excluded.loopspace_id,
+                   event_seq=excluded.event_seq,
+                   run_id=excluded.run_id,
+                   trigger_run_id=excluded.trigger_run_id,
+                   trigger_id=excluded.trigger_id,
+                   created_at_ms=excluded.created_at_ms,
+                   row_json=excluded.row_json,
+                   updated_at_ms=excluded.updated_at_ms"
+            ),
+            rusqlite::params![
+                scope_key,
+                loopspace_id,
+                event_id,
+                event_seq,
+                run_id,
+                trigger_run_id,
+                trigger_id,
+                created_at_ms,
+                row_json,
+                cloud_mcp_now_ms() as i64
+            ],
+        )
+        .map_err(|error| format!("Unable to upsert loopspace runtime event row: {error}"))?
+        > 0;
+    Ok(changed)
+}
+
+fn cloud_mcp_loopspace_runtime_event_arrays_from_payload(payload: &Value) -> Vec<Value> {
+    let mut events = Vec::new();
+    for key in ["runtime_events", "runtimeEvents", "events"] {
+        if let Some(rows) = payload.get(key).and_then(Value::as_array) {
+            events.extend(rows.iter().cloned());
+        }
+    }
+    for loopspace_key in [
+        "loopspaces",
+        "runtime_loopspaces",
+        "runtimeLoopspaces",
+        "removed_loopspaces",
+        "removedLoopspaces",
+    ] {
+        if let Some(loopspaces) = payload.get(loopspace_key).and_then(Value::as_array) {
+            for loopspace in loopspaces {
+                for key in ["runtime_events", "runtimeEvents", "events"] {
+                    if let Some(rows) = loopspace.get(key).and_then(Value::as_array) {
+                        events.extend(rows.iter().cloned());
+                    }
+                }
+            }
+        }
+    }
+    events
+}
+
+fn cloud_mcp_loopspace_runtime_events_upsert_from_payload(
+    conn: &rusqlite::Connection,
+    scope_key: &str,
+    payload: &Value,
+) -> Result<bool, String> {
+    let mut changed = false;
+    for event in cloud_mcp_loopspace_runtime_event_arrays_from_payload(payload) {
+        changed |= cloud_mcp_loopspace_runtime_event_upsert_row(conn, scope_key, &event)?;
+    }
+    Ok(changed)
+}
+
+fn cloud_mcp_loopspace_runtime_event_page_from_conn(
+    conn: &rusqlite::Connection,
+    scope_key: &str,
+    loopspace_id: &str,
+    limit: u32,
+    before_event_seq: Option<i64>,
+) -> Result<(Vec<Value>, bool), String> {
+    let loopspace_id = loopspace_id.trim();
+    if loopspace_id.is_empty() {
+        return Ok((Vec::new(), false));
+    }
+    let max_rows = i64::from(limit.clamp(1, 100));
+    let query_limit = max_rows + 1;
+    let mut rows = Vec::new();
+    if let Some(before_seq) = before_event_seq.filter(|value| *value > 0) {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT row_json
+                 FROM {CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE}
+                 WHERE scope_key=?1 AND loopspace_id=?2 AND event_seq<?3
+                 ORDER BY event_seq DESC
+                 LIMIT ?4"
+            ))
+            .map_err(|error| format!("Unable to read older loopspace runtime events: {error}"))?;
+        for row_json in statement
+            .query_map(
+                rusqlite::params![scope_key, loopspace_id, before_seq, query_limit],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("Unable to query older loopspace runtime events: {error}"))?
+            .filter_map(|row| row.ok())
+        {
+            if let Ok(event) = serde_json::from_str::<Value>(&row_json) {
+                rows.push(event);
+            }
+        }
+    } else {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT row_json
+                 FROM {CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE}
+                 WHERE scope_key=?1 AND loopspace_id=?2
+                 ORDER BY event_seq DESC
+                 LIMIT ?3"
+            ))
+            .map_err(|error| format!("Unable to read loopspace runtime events: {error}"))?;
+        for row_json in statement
+            .query_map(
+                rusqlite::params![scope_key, loopspace_id, query_limit],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|error| format!("Unable to query loopspace runtime events: {error}"))?
+            .filter_map(|row| row.ok())
+        {
+            if let Ok(event) = serde_json::from_str::<Value>(&row_json) {
+                rows.push(event);
+            }
+        }
+    }
+    let has_more_before = rows.len() > max_rows as usize;
+    if has_more_before {
+        rows.truncate(max_rows as usize);
+    }
+    rows.reverse();
+    Ok((rows, has_more_before))
 }
 
 fn cloud_mcp_loopspace_op_id(op: &Value) -> Option<String> {
@@ -11674,12 +11925,44 @@ fn cloud_mcp_loopspace_snapshot_from_conn(
              ORDER BY sort_order ASC, updated_at_ms ASC, loopspace_id ASC"
         ))
         .map_err(|error| format!("Unable to read loopspace mirror rows: {error}"))?;
-    let rows = statement
+    let mut rows = statement
         .query_map(rusqlite::params![scope_key], |row| row.get::<_, String>(0))
         .map_err(|error| format!("Unable to query loopspace mirror rows: {error}"))?
         .filter_map(|row| row.ok())
         .filter_map(|row_json| serde_json::from_str::<Value>(&row_json).ok())
         .collect::<Vec<_>>();
+    for row in &mut rows {
+        let loopspace_id =
+            cloud_mcp_payload_text(row, &["id", "loopspace_id", "loopspaceId"]).unwrap_or_default();
+        if loopspace_id.trim().is_empty() {
+            continue;
+        }
+        let (events, has_more_before) = cloud_mcp_loopspace_runtime_event_page_from_conn(
+            conn,
+            scope_key,
+            &loopspace_id,
+            30,
+            None,
+        )?;
+        if let Some(object) = row.as_object_mut() {
+            object.insert("runtime_events".to_string(), json!(events.clone()));
+            object.insert("runtimeEvents".to_string(), json!(events.clone()));
+            object.insert(
+                "runtime_event_page".to_string(),
+                json!({
+                    "limit": 30,
+                    "has_more_before": has_more_before,
+                    "hasMoreBefore": has_more_before,
+                    "before_event_seq": events.first()
+                        .and_then(|event| cloud_mcp_payload_i64(event, &["event_seq", "eventSeq"]))
+                        .unwrap_or(0),
+                    "beforeEventSeq": events.first()
+                        .and_then(|event| cloud_mcp_payload_i64(event, &["event_seq", "eventSeq"]))
+                        .unwrap_or(0),
+                }),
+            );
+        }
+    }
     Ok(json!({
         "ok": true,
         "kind": "loopspaces.sync",
@@ -11732,6 +12015,16 @@ async fn cloud_mcp_apply_loopspaces_sync_data(
                 rusqlite::params![scope_key],
             )
             .map_err(|error| format!("Unable to replace loopspace mirror snapshot: {error}"))?;
+            conn.execute(
+                &format!(
+                    "DELETE FROM {CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE}
+                     WHERE scope_key=?1"
+                ),
+                rusqlite::params![scope_key],
+            )
+            .map_err(|error| {
+                format!("Unable to replace loopspace runtime event mirror snapshot: {error}")
+            })?;
             changed = true;
         }
 
@@ -11746,6 +12039,9 @@ async fn cloud_mcp_apply_loopspaces_sync_data(
                 changed |= cloud_mcp_loopspace_upsert_row(&conn, &scope_key, loopspace)?;
             }
         }
+
+        changed |=
+            cloud_mcp_loopspace_runtime_events_upsert_from_payload(&conn, &scope_key, &payload)?;
 
         for removed_key in ["removed_loopspaces", "removedLoopspaces"] {
             if let Some(removed) = payload.get(removed_key).and_then(Value::as_array) {
@@ -12232,12 +12528,21 @@ fn cloud_mcp_loopspace_graph_result_source(value: &Value) -> String {
     value
         .get("graph")
         .and_then(|graph| {
-            cloud_mcp_payload_text(graph, &["source", "source_text", "sourceText", "graph_source"])
+            cloud_mcp_payload_text(
+                graph,
+                &["source", "source_text", "sourceText", "graph_source"],
+            )
         })
         .or_else(|| {
             cloud_mcp_payload_text(
                 value,
-                &["source", "source_text", "sourceText", "graph_source", "graphSource"],
+                &[
+                    "source",
+                    "source_text",
+                    "sourceText",
+                    "graph_source",
+                    "graphSource",
+                ],
             )
         })
         .unwrap_or_default()
@@ -13004,6 +13309,7 @@ fn cloud_mcp_get_loopspace_triggers_snapshot() -> Result<Value, String> {
 fn cloud_mcp_get_loopspace_logs_snapshot(
     loopspace_id: &str,
     limit: Option<u32>,
+    before_event_seq: Option<i64>,
 ) -> Result<Value, String> {
     let loopspace_id = loopspace_id.trim();
     if loopspace_id.is_empty() {
@@ -13011,7 +13317,19 @@ fn cloud_mcp_get_loopspace_logs_snapshot(
     }
     let conn = cloud_mcp_open_outbox_conn()?;
     let scope_key = cloud_mcp_loopspace_scope_key(None);
-    let max_rows = i64::from(limit.unwrap_or(100).clamp(1, 250));
+    let page_limit = limit.unwrap_or(30).clamp(1, 100);
+    let max_rows = i64::from(page_limit.clamp(1, 250));
+    let (runtime_events, has_more_before) = cloud_mcp_loopspace_runtime_event_page_from_conn(
+        &conn,
+        &scope_key,
+        loopspace_id,
+        page_limit,
+        before_event_seq,
+    )?;
+    let before_event_seq_value = runtime_events
+        .first()
+        .and_then(|event| cloud_mcp_payload_i64(event, &["event_seq", "eventSeq"]))
+        .unwrap_or(0);
     let mut trigger_statement = conn
         .prepare(&format!(
             "SELECT row_json
@@ -13143,6 +13461,25 @@ fn cloud_mcp_get_loopspace_logs_snapshot(
         "loopspaceId": loopspace_id,
         "logs": logs,
         "runs": logs,
+        "events": runtime_events.clone(),
+        "runtime_events": runtime_events.clone(),
+        "runtimeEvents": runtime_events,
+        "runtime_event_page": {
+            "limit": page_limit,
+            "has_more_before": has_more_before,
+            "hasMoreBefore": has_more_before,
+            "before_event_seq": before_event_seq_value,
+            "beforeEventSeq": before_event_seq_value,
+        },
+        "runtimeEventPage": {
+            "limit": page_limit,
+            "has_more_before": has_more_before,
+            "hasMoreBefore": has_more_before,
+            "before_event_seq": before_event_seq_value,
+            "beforeEventSeq": before_event_seq_value,
+        },
+        "has_more_before": has_more_before,
+        "hasMoreBefore": has_more_before,
     }))
 }
 
@@ -13199,8 +13536,30 @@ async fn cloud_mcp_apply_loopspace_triggers_sync_data(
             .map_err(|error| {
                 format!("Unable to replace loopspace trigger run loop mirror snapshot: {error}")
             })?;
+            conn.execute(
+                &format!(
+                    "DELETE FROM {CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE}
+                     WHERE scope_key=?1"
+                ),
+                rusqlite::params![scope_key],
+            )
+            .map_err(|error| {
+                format!("Unable to replace loopspace runtime event mirror snapshot: {error}")
+            })?;
             changed = true;
         } else if snapshot_full {
+            conn.execute(
+                &format!(
+                    "DELETE FROM {CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE}
+                     WHERE scope_key=?1 AND loopspace_id=?2"
+                ),
+                rusqlite::params![scope_key, targeted_loopspace_id.trim()],
+            )
+            .map_err(|error| {
+                format!(
+                    "Unable to replace targeted loopspace runtime event mirror snapshot: {error}"
+                )
+            })?;
             changed = true;
         }
 
@@ -13225,6 +13584,9 @@ async fn cloud_mcp_apply_loopspace_triggers_sync_data(
                 }
             }
         }
+
+        changed |=
+            cloud_mcp_loopspace_runtime_events_upsert_from_payload(&conn, &scope_key, &payload)?;
 
         for removed_key in ["removed_triggers", "removedTriggers"] {
             if let Some(removed) = payload.get(removed_key).and_then(Value::as_array) {
@@ -13526,8 +13888,9 @@ async fn cloud_mcp_get_loopspace_logs(
     _state: State<'_, CloudMcpState>,
     loopspace_id: String,
     limit: Option<u32>,
+    before_event_seq: Option<i64>,
 ) -> Result<Value, String> {
-    cloud_mcp_get_loopspace_logs_snapshot(&loopspace_id, limit)
+    cloud_mcp_get_loopspace_logs_snapshot(&loopspace_id, limit, before_event_seq)
 }
 
 #[tauri::command]
@@ -13535,12 +13898,13 @@ async fn cloud_mcp_sync_loopspace_logs(
     state: State<'_, CloudMcpState>,
     loopspace_id: String,
     limit: Option<u32>,
+    before_event_seq: Option<i64>,
 ) -> Result<Value, String> {
     let loopspace_id = loopspace_id.trim().to_string();
     if loopspace_id.is_empty() {
         return Err("Loop id is required.".to_string());
     }
-    let limit = limit.unwrap_or(100).clamp(1, 250);
+    let limit = limit.unwrap_or(30).clamp(1, 100);
     let mut payload = cloud_mcp_loopspace_trigger_sync_payload("manual_loopspace_logs_sync");
     if let Some(object) = payload.as_object_mut() {
         object.insert("m".to_string(), json!("hello"));
@@ -13556,8 +13920,14 @@ async fn cloud_mcp_sync_loopspace_logs(
         object.insert("loopspace_id".to_string(), json!(loopspace_id.clone()));
         object.insert("loopspaceId".to_string(), json!(loopspace_id.clone()));
         object.insert("limit".to_string(), json!(limit));
+        if let Some(before_seq) = before_event_seq.filter(|value| *value > 0) {
+            object.insert("before_event_seq".to_string(), json!(before_seq));
+            object.insert("beforeEventSeq".to_string(), json!(before_seq));
+        }
         object.insert("run_limit".to_string(), json!(limit));
         object.insert("runLimit".to_string(), json!(limit));
+        object.insert("event_limit".to_string(), json!(limit));
+        object.insert("eventLimit".to_string(), json!(limit));
     }
     match cloud_mcp_send_loopspace_trigger_sync_request(
         state.inner(),
@@ -13566,9 +13936,15 @@ async fn cloud_mcp_sync_loopspace_logs(
     )
     .await
     {
-        Ok(_) => cloud_mcp_get_loopspace_logs_snapshot(&loopspace_id, Some(limit)),
+        Ok(_) => {
+            cloud_mcp_get_loopspace_logs_snapshot(&loopspace_id, Some(limit), before_event_seq)
+        }
         Err(error) if cloud_mcp_ws_request_error_is_transient(&error) => {
-            let mut snapshot = cloud_mcp_get_loopspace_logs_snapshot(&loopspace_id, Some(limit))?;
+            let mut snapshot = cloud_mcp_get_loopspace_logs_snapshot(
+                &loopspace_id,
+                Some(limit),
+                before_event_seq,
+            )?;
             if let Some(object) = snapshot.as_object_mut() {
                 object.insert("remote".to_string(), json!(false));
                 object.insert(
@@ -13767,7 +14143,9 @@ async fn cloud_mcp_update_loopspace_trigger(
     }
     if let Some(mode) = cloud_mcp_normalize_webhook_auth_mode(webhook_auth_mode.as_deref())? {
         if mode == "public_token" && !public_webhook_confirmed.unwrap_or(false) {
-            return Err("Switching to a public webhook requires explicit confirmation.".to_string());
+            return Err(
+                "Switching to a public webhook requires explicit confirmation.".to_string(),
+            );
         }
         op["webhook_auth_mode"] = json!(mode);
         op["webhookAuthMode"] = json!(mode);
@@ -20646,6 +21024,12 @@ fn cloud_mcp_direct_target_from_route(
         direct
             .get("voice_websocket_url")
             .or_else(|| direct.get("voiceWebsocketUrl"))
+    } else if endpoint_path == "/v1/media/convert/ws" {
+        direct
+            .get("media_convert_websocket_url")
+            .or_else(|| direct.get("mediaConvertWebsocketUrl"))
+            .or_else(|| direct.get("browser_media_convert_websocket_url"))
+            .or_else(|| direct.get("browserMediaConvertWebsocketUrl"))
     } else {
         None
     };
@@ -34786,10 +35170,7 @@ async fn cloud_mcp_record_todo_dispatch_status(
                     "loop_runtime_edge_id",
                     &["loop_runtime_edge_id", "loopRuntimeEdgeId"][..],
                 ),
-                (
-                    "loopspace_id",
-                    &["loopspace_id", "loopspaceId"][..],
-                ),
+                ("loopspace_id", &["loopspace_id", "loopspaceId"][..]),
                 (
                     "trigger_id",
                     &["trigger_id", "triggerId", "loopRuntimeTriggerId"][..],
@@ -38432,14 +38813,8 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
                 payload.insert("modelId".to_string(), model);
             }
             if !reasoning_effort.is_null() {
-                payload.insert(
-                    "reasoning_effort".to_string(),
-                    reasoning_effort.clone(),
-                );
-                payload.insert(
-                    "reasoningEffort".to_string(),
-                    reasoning_effort.clone(),
-                );
+                payload.insert("reasoning_effort".to_string(), reasoning_effort.clone());
+                payload.insert("reasoningEffort".to_string(), reasoning_effort.clone());
                 payload.insert("effort".to_string(), reasoning_effort);
             }
             if !speed.is_null() {

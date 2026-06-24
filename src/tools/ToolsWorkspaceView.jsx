@@ -6757,26 +6757,26 @@ const ScriptLogsHeader = styled.header`
     linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.12), rgba(214, 164, 70, 0.08)),
     rgba(12, 16, 23, 0.72);
 
-  div {
+  > div:first-child {
     display: grid;
     gap: 4px;
     min-width: 0;
   }
 
-  strong,
-  span {
+  > div:first-child strong,
+  > div:first-child span {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  strong {
+  > div:first-child strong {
     color: var(--forge-text-strong, #f6f8fb);
     font-size: 13px;
     font-weight: 900;
   }
 
-  span {
+  > div:first-child span {
     color: var(--forge-text-muted, #8d96a6);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
     font-size: 10px;
@@ -6787,11 +6787,14 @@ const ScriptLogsHeader = styled.header`
 const ScriptLogsStatus = styled.div`
   display: inline-flex;
   flex-direction: row;
+  flex-wrap: nowrap;
   align-items: center;
   justify-content: center;
   gap: 7px;
   flex: 0 0 auto;
+  box-sizing: border-box;
   width: max-content;
+  min-width: max-content;
   min-height: 24px;
   padding: 0 8px;
   border: 1px solid rgba(125, 211, 252, 0.24);

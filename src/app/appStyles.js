@@ -4522,13 +4522,14 @@ export const LoopspaceGraphNode = styled.div`
   &[data-kind="document_write"] { --loop-node-accent: 251, 191, 36; }
   &[data-region="true"] {
     box-sizing: border-box;
-    width: var(--loopspace-node-width, 620px);
-    height: var(--loopspace-node-height, 360px);
+    width: var(--loopspace-node-width, 680px);
+    height: var(--loopspace-node-height, 260px);
     max-width: none;
     align-items: start;
     grid-template-columns: 38px minmax(0, 1fr);
     grid-template-rows: auto minmax(0, 1fr);
-    padding: 14px 92px 16px 16px;
+    --loopspace-output-gutter: var(--loopspace-node-output-gutter, 92px);
+    padding: 14px var(--loopspace-output-gutter) 16px 16px;
     background:
       linear-gradient(135deg, rgba(var(--loop-node-accent), 0.12), rgba(255, 255, 255, 0.025)),
       rgba(5, 10, 11, 0.72);
@@ -4539,7 +4540,7 @@ export const LoopspaceGraphNode = styled.div`
   }
   &[data-kind="run_script"] {
     --loop-node-accent: 251, 191, 36;
-    --loopspace-output-gutter: 112px;
+    --loopspace-output-gutter: var(--loopspace-node-output-gutter, 112px);
     box-sizing: border-box;
     width: var(--loopspace-node-width, 360px);
     max-width: none;
@@ -4593,14 +4594,6 @@ export const LoopspaceGraphNodeOutputPorts = styled.div`
   display: grid;
   gap: 8px;
   transform: translateY(-50%);
-
-  ${LoopspaceGraphNode}[data-region="true"] & {
-    right: 12px;
-  }
-
-  ${LoopspaceGraphNode}[data-kind="run_script"] & {
-    right: 12px;
-  }
 `;
 
 export const LoopspaceGraphNodePort = styled.button`
@@ -5243,7 +5236,8 @@ export const LoopspaceGraphMessageRegion = styled.div`
   padding-top: 4px;
 
   &[data-open="true"] {
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    padding-top: 2px;
   }
 `;
 
@@ -5284,27 +5278,280 @@ export const LoopspaceGraphMessageSettingsButton = styled.button`
   }
 `;
 
-export const LoopspaceGraphMessageSummary = styled.div`
-  display: grid;
+export const LoopspaceGraphMessageFlow = styled.div`
+  position: relative;
   align-self: stretch;
+  width: var(--loopspace-message-flow-width, 220px);
+  max-width: 100%;
+  height: var(--loopspace-message-flow-height, 132px);
+  min-width: 0;
   min-height: 0;
-  place-content: center start;
-  gap: 4px;
+  overflow: visible;
+  pointer-events: none;
+
+  &[data-empty="true"] {
+    opacity: 0.7;
+  }
+`;
+
+export const LoopspaceGraphMessageFlowEdges = styled.svg`
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+`;
+
+export const LoopspaceGraphMessageFlowEdgePath = styled.path`
+  fill: none;
+  stroke: rgba(var(--loop-node-accent), 0.54);
+  stroke-width: 2;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 8px rgba(var(--loop-node-accent), 0.2));
+`;
+
+export const LoopspaceGraphMessageFlowNode = styled.div`
+  --loop-message-child-accent: var(--loop-node-accent);
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  display: grid;
+  width: var(--loopspace-flow-node-width, 148px);
+  height: var(--loopspace-flow-node-height, 91px);
+  min-width: 0;
+  place-items: center;
   padding: 12px 14px;
-  border: 1px dashed rgba(var(--loop-node-accent), 0.18);
+  border: 1px solid rgba(var(--loop-message-child-accent), 0.34);
   border-radius: 8px;
-  color: rgba(248, 250, 252, 0.86);
-  background: rgba(255, 255, 255, 0.025);
+  color: #f8fafc;
+  background:
+    linear-gradient(135deg, rgba(var(--loop-message-child-accent), 0.15), rgba(2, 6, 8, 0.5)),
+    rgba(2, 8, 9, 0.86);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.025),
+    0 12px 28px rgba(0, 0, 0, 0.28);
+  cursor: grab;
+  pointer-events: auto;
+  transform: translate3d(var(--loopspace-flow-node-x, 8px), var(--loopspace-flow-node-y, 8px), 0);
+
+  &[data-kind="document_read"] {
+    --loop-message-child-accent: 96, 165, 250;
+  }
+
+  &[data-kind="document_write"] {
+    --loop-message-child-accent: 251, 191, 36;
+  }
+
+  &[data-kind="run_script"] {
+    --loop-message-child-accent: 251, 191, 36;
+  }
+
+  &:active {
+    cursor: grabbing;
+  }
+`;
+
+export const LoopspaceGraphMessageFlowNodeText = styled.div`
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  text-align: center;
 
   strong {
-    font-size: 11px;
-    font-weight: 850;
+    min-width: 0;
+    overflow: hidden;
+    color: #f8fafc;
+    font-size: 13px;
+    font-weight: 900;
+    line-height: 1.18;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   span {
-    color: rgba(248, 250, 252, 0.52);
+    display: -webkit-box;
+    min-width: 0;
+    overflow: hidden;
+    color: rgba(248, 250, 252, 0.54);
+    font-size: 9px;
+    font-weight: 820;
+    letter-spacing: 0.04em;
+    line-height: 1.22;
+    text-transform: uppercase;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+  }
+`;
+
+export const LoopspaceGraphMessageFlowNodePort = styled.span`
+  position: absolute;
+  top: 50%;
+  display: grid;
+  width: 14px;
+  height: 14px;
+  place-items: center;
+  border: 1px solid rgba(var(--loop-message-child-accent), 0.54);
+  border-radius: 999px;
+  background: rgba(2, 6, 8, 0.94);
+  box-shadow:
+    0 0 0 3px rgba(var(--loop-message-child-accent), 0.08),
+    0 0 12px rgba(var(--loop-message-child-accent), 0.18);
+  transform: translateY(-50%);
+
+  &::after {
+    width: 5px;
+    height: 5px;
+    border-radius: inherit;
+    background: rgba(var(--loop-message-child-accent), 0.9);
+    content: "";
+  }
+
+  &[data-side="input"] {
+    left: -7px;
+  }
+
+  &[data-side="output"] {
+    right: -7px;
+  }
+`;
+
+export const LoopspaceGraphMessageStepPreviewList = styled.div`
+  --loop-step-rail-x: 36px;
+  --loop-step-gap: 8px;
+  position: relative;
+  display: grid;
+  align-content: start;
+  align-self: stretch;
+  min-height: 0;
+  gap: var(--loop-step-gap);
+  overflow: hidden;
+  padding: 8px 58px 0 24px;
+
+  &::before {
+    position: absolute;
+    top: 22px;
+    left: 0;
+    width: var(--loop-step-rail-x);
+    height: 2px;
+    border-radius: 999px;
+    background: linear-gradient(90deg, rgba(var(--loop-node-accent), 0.16), rgba(var(--loop-node-accent), 0.68));
+    box-shadow: 0 0 10px rgba(var(--loop-node-accent), 0.2);
+    content: "";
+    pointer-events: none;
+  }
+
+  &[data-empty="true"] {
+    padding: 0;
+  }
+
+  &[data-empty="true"]::before {
+    display: none;
+  }
+`;
+
+export const LoopspaceGraphMessageStepPreviewItem = styled.div`
+  position: relative;
+  display: grid;
+  grid-template-columns: 24px minmax(0, 1fr);
+  gap: 8px;
+  min-width: 0;
+  min-height: 30px;
+  align-items: center;
+  color: rgba(248, 250, 252, 0.9);
+
+  &::before,
+  &::after {
+    position: absolute;
+    border-radius: 999px;
+    background: rgba(var(--loop-node-accent), 0.58);
+    box-shadow: 0 0 10px rgba(var(--loop-node-accent), 0.18);
+    content: "";
+    pointer-events: none;
+  }
+
+  &::before {
+    top: 50%;
+    left: 12px;
+    width: 34px;
+    height: 2px;
+    transform: translateY(-50%);
+  }
+
+  &:last-child::before {
+    right: -58px;
+    width: auto;
+    background: linear-gradient(90deg, rgba(var(--loop-node-accent), 0.7), rgba(var(--loop-node-accent), 0.2));
+  }
+
+  &:not(:last-child)::after {
+    top: 50%;
+    left: 11px;
+    width: 2px;
+    height: calc(100% + var(--loop-step-gap));
+  }
+`;
+
+export const LoopspaceGraphMessageStepPreviewNumber = styled.span`
+  position: relative;
+  z-index: 2;
+  display: grid;
+  width: 24px;
+  height: 24px;
+  place-items: center;
+  border: 1px solid rgba(var(--loop-node-accent), 0.34);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.78);
+  background:
+    radial-gradient(circle at center, rgba(var(--loop-node-accent), 0.9) 0 4px, transparent 5px),
+    rgba(2, 6, 8, 0.82);
+  font-size: 0;
+  font-weight: 900;
+  line-height: 1;
+  box-shadow:
+    0 0 0 3px rgba(var(--loop-node-accent), 0.08),
+    0 0 10px rgba(var(--loop-node-accent), 0.24);
+`;
+
+export const LoopspaceGraphMessageStepPreviewCopy = styled.div`
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  width: fit-content;
+  max-width: 100%;
+  min-height: 30px;
+  min-width: 0;
+  padding: 0 10px;
+  border: 1px solid rgba(var(--loop-node-accent), 0.24);
+  border-radius: 7px;
+  background:
+    linear-gradient(135deg, rgba(var(--loop-node-accent), 0.12), rgba(2, 6, 8, 0.42)),
+    rgba(2, 6, 8, 0.72);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.025);
+
+  strong {
+    min-width: 0;
+    overflow: hidden;
+    color: #f8fafc;
+    font-size: 12px;
+    font-weight: 900;
+    line-height: 1.22;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span {
+    display: -webkit-box;
+    min-width: 0;
+    overflow: hidden;
+    color: rgba(248, 250, 252, 0.58);
     font-size: 10px;
-    font-weight: 740;
+    font-weight: 720;
+    line-height: 1.28;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
   }
 `;
 
@@ -5352,36 +5599,23 @@ export const LoopspaceGraphMessagePrompt = styled.textarea`
 
 export const LoopspaceGraphMessageSettingsPanel = styled.div`
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
-  gap: 8px;
+  grid-template-columns: minmax(150px, 0.72fr) minmax(250px, 1.18fr) minmax(210px, 0.9fr);
+  grid-template-rows: minmax(0, 1fr);
+  gap: 10px;
   min-width: 0;
   min-height: 0;
   height: 100%;
-  padding: 8px;
+  padding: 9px;
   border: 1px solid rgba(var(--loop-node-accent), 0.22);
   border-radius: 9px;
   background: rgba(2, 6, 8, 0.58);
   overflow: hidden;
   pointer-events: auto;
-`;
 
-export const LoopspaceGraphMessageSettingsHeader = styled.div`
-  display: grid;
-  gap: 2px;
-  min-width: 0;
-
-  strong {
-    color: #f8fafc;
-    font-size: 12px;
-    font-weight: 880;
-  }
-
-  span {
-    color: rgba(248, 250, 252, 0.52);
-    font-size: 9.5px;
-    font-weight: 760;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
+  @media (max-width: 760px) {
+    grid-template-columns: minmax(0, 1fr);
+    grid-auto-rows: minmax(0, auto);
+    overflow: auto;
   }
 `;
 
@@ -5390,9 +5624,28 @@ export const LoopspaceGraphMessageSettingsSection = styled.div`
   gap: 6px;
   min-width: 0;
   min-height: 0;
+  align-content: start;
 
   &[data-grow="true"] {
     overflow: hidden;
+  }
+
+  &[data-column="model"] {
+    grid-template-rows: auto minmax(0, auto);
+  }
+
+  &[data-column="prompt"] {
+    grid-template-rows: auto minmax(0, 1fr) auto;
+  }
+
+  &[data-column="steps"] {
+    grid-template-rows: auto auto minmax(0, 1fr);
+    overflow: hidden;
+  }
+
+  &[data-column="prompt"] ${LoopspaceGraphMessagePrompt} {
+    height: 100%;
+    min-height: 0;
   }
 
   > strong {
@@ -5415,6 +5668,10 @@ export const LoopspaceGraphMessageSettingsGrid = styled.div`
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 6px;
   min-width: 0;
+
+  &[data-stack="true"] {
+    grid-template-columns: minmax(0, 1fr);
+  }
 
   @media (max-width: 720px) {
     grid-template-columns: minmax(0, 1fr);
@@ -5502,6 +5759,11 @@ export const LoopspaceGraphMessageSubnodeList = styled.div`
   min-height: 0;
   overflow: auto;
   padding-right: 2px;
+
+  ${LoopspaceGraphMessageSettingsSection}[data-column="steps"] & {
+    height: 100%;
+    padding-right: 4px;
+  }
 `;
 
 export const LoopspaceGraphMessageSubnodeItem = styled.div`
@@ -5559,10 +5821,93 @@ export const LoopspaceGraphMessageSubnodeItem = styled.div`
   }
 `;
 
+export const LoopspaceGraphMessageSubnodeMain = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+`;
+
+export const LoopspaceGraphMessageStepHeader = styled.div`
+  display: grid;
+  grid-template-columns: 22px minmax(0, 1fr);
+  gap: 6px;
+  min-width: 0;
+  align-items: center;
+`;
+
+export const LoopspaceGraphMessageStepNumber = styled.span`
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border: 1px solid rgba(var(--loop-node-accent), 0.28);
+  border-radius: 999px;
+  color: rgba(248, 250, 252, 0.7);
+  background: rgba(var(--loop-node-accent), 0.1);
+  font-size: 9px;
+  font-weight: 900;
+`;
+
+export const LoopspaceGraphMessageStepInput = styled.input`
+  width: 100%;
+  min-width: 0;
+  min-height: 25px;
+  padding: 0 8px;
+  border: 1px solid rgba(var(--loop-node-accent), 0.22);
+  border-radius: 7px;
+  color: #f8fafc;
+  background: rgba(2, 6, 8, 0.72);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 850;
+  outline: none;
+  pointer-events: auto;
+
+  &:focus {
+    border-color: rgba(var(--loop-node-accent), 0.58);
+    box-shadow: 0 0 0 2px rgba(var(--loop-node-accent), 0.12);
+  }
+
+  &::placeholder {
+    color: rgba(248, 250, 252, 0.34);
+  }
+`;
+
+export const LoopspaceGraphMessageStepDescription = styled.textarea`
+  width: 100%;
+  min-width: 0;
+  min-height: 50px;
+  resize: none;
+  padding: 7px 8px;
+  border: 1px solid rgba(var(--loop-node-accent), 0.18);
+  border-radius: 7px;
+  color: rgba(248, 250, 252, 0.84);
+  background: rgba(2, 6, 8, 0.56);
+  font: inherit;
+  font-size: 9.5px;
+  font-weight: 720;
+  line-height: 1.35;
+  outline: none;
+  pointer-events: auto;
+
+  &:focus {
+    border-color: rgba(var(--loop-node-accent), 0.52);
+    box-shadow: 0 0 0 2px rgba(var(--loop-node-accent), 0.1);
+  }
+
+  &::placeholder {
+    color: rgba(248, 250, 252, 0.32);
+  }
+`;
+
 export const LoopspaceGraphMessageSettingsActions = styled.div`
   display: flex;
-  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: center;
+  align-items: center;
   min-width: 0;
+  padding-top: 2px;
 `;
 
 export const LoopspaceGraphMessageSaveButton = styled.button`
@@ -5587,6 +5932,19 @@ export const LoopspaceGraphMessageSaveButton = styled.button`
   &:disabled {
     cursor: not-allowed;
     opacity: 0.5;
+  }
+
+  &[data-variant="secondary"] {
+    border-color: rgba(248, 250, 252, 0.22);
+    color: rgba(248, 250, 252, 0.76);
+    background: rgba(0, 0, 0, 0.32);
+  }
+
+  &[data-variant="secondary"]:hover,
+  &[data-variant="secondary"]:focus-visible {
+    border-color: rgba(248, 250, 252, 0.42);
+    color: #f8fafc;
+    background: rgba(248, 250, 252, 0.08);
   }
 `;
 
@@ -5996,6 +6354,7 @@ export const LoopspaceRuntimePanel = styled.div`
 
   &[data-collapsed="true"] {
     grid-template-rows: auto;
+    min-height: 28px;
     background:
       linear-gradient(90deg, rgba(255, 209, 102, 0.075), rgba(255, 209, 102, 0.018)),
       rgba(5, 5, 5, 0.98);
@@ -6052,16 +6411,20 @@ export const LoopspaceRuntimePanelHeader = styled.div`
   background: rgba(4, 8, 12, 0.92);
 
   &[data-collapsed="true"] {
-    grid-template-columns: minmax(0, 1fr) auto auto;
+    grid-template-columns: minmax(0, 1fr) auto;
     min-height: 28px;
     height: 28px;
-    padding: 0 9px;
+    padding: 0 8px 0 10px;
+    border-top: 1px solid rgba(255, 209, 102, 0.18);
     border-bottom: 0;
     color: rgba(255, 246, 223, 0.82);
     background:
-      linear-gradient(90deg, rgba(255, 209, 102, 0.08), rgba(255, 209, 102, 0.025)),
+      linear-gradient(90deg, rgba(255, 209, 102, 0.13), rgba(255, 209, 102, 0.032)),
       rgba(5, 7, 10, 0.98);
-    cursor: pointer;
+    box-shadow:
+      inset 0 1px 0 rgba(255, 246, 223, 0.05),
+      0 -12px 30px rgba(0, 0, 0, 0.34);
+    cursor: default;
   }
 
   &[data-collapsed="true"]:hover,
@@ -6069,7 +6432,7 @@ export const LoopspaceRuntimePanelHeader = styled.div`
     outline: none;
     color: #fff6df;
     background:
-      linear-gradient(90deg, rgba(255, 209, 102, 0.13), rgba(255, 209, 102, 0.04)),
+      linear-gradient(90deg, rgba(255, 209, 102, 0.18), rgba(255, 209, 102, 0.055)),
       rgba(7, 8, 10, 0.98);
   }
 
@@ -6082,14 +6445,16 @@ export const LoopspaceRuntimePanelHeader = styled.div`
   }
 
   [data-restore-label="true"] {
+    color: rgba(255, 246, 223, 0.94);
     font-size: 10px;
-    font-weight: 850;
-    letter-spacing: 0.04em;
+    font-weight: 900;
+    letter-spacing: 0.02em;
     text-transform: uppercase;
   }
 
   [data-restore-hint="true"] {
-    color: rgba(248, 250, 252, 0.54);
+    display: none;
+    color: rgba(248, 250, 252, 0.62);
     font-size: 10px;
     font-weight: 760;
   }
@@ -6164,7 +6529,37 @@ export const LoopspaceRuntimePanelToggle = styled.button`
   }
 
   &[data-collapsed="true"] svg {
+    width: 14px;
+    height: 14px;
     transform: rotate(180deg);
+  }
+
+  &[data-collapsed="true"] {
+    display: inline-flex;
+    width: auto;
+    min-width: 68px;
+    height: 22px;
+    align-items: center;
+    justify-content: center;
+    gap: 5px;
+    padding: 0 8px;
+    border: 1px solid rgba(255, 209, 102, 0.36);
+    border-radius: 7px;
+    color: #fff6df;
+    background:
+      linear-gradient(135deg, rgba(255, 209, 102, 0.2), rgba(255, 255, 255, 0.045)),
+      rgba(8, 9, 10, 0.94);
+    box-shadow:
+      0 0 0 1px rgba(255, 209, 102, 0.08),
+      0 8px 22px rgba(0, 0, 0, 0.24);
+  }
+
+  &[data-collapsed="true"] span {
+    font-size: 9px;
+    font-weight: 900;
+    letter-spacing: 0.02em;
+    line-height: 1;
+    text-transform: uppercase;
   }
 
   &:hover,
@@ -6172,6 +6567,18 @@ export const LoopspaceRuntimePanelToggle = styled.button`
     color: #fff;
     outline: none;
     background: rgba(255, 209, 102, 0.1);
+  }
+
+  &[data-collapsed="true"]:hover,
+  &[data-collapsed="true"]:focus-visible {
+    border-color: rgba(255, 209, 102, 0.58);
+    color: #ffffff;
+    background:
+      linear-gradient(135deg, rgba(255, 209, 102, 0.28), rgba(255, 255, 255, 0.06)),
+      rgba(12, 10, 7, 0.96);
+    box-shadow:
+      0 0 0 2px rgba(255, 209, 102, 0.12),
+      0 10px 24px rgba(0, 0, 0, 0.28);
   }
 `;
 
@@ -6396,38 +6803,152 @@ export const LoopspaceRuntimePanelEventRow = styled.div`
   }
 `;
 
-export const LoopspaceRuntimePanelDetail = styled.div`
+export const LoopspaceRuntimeConsole = styled.div`
   display: grid;
-  gap: 8px;
+  align-content: start;
   min-width: 0;
+  min-height: 100%;
+  padding: 4px 0 8px;
+  color: rgba(233, 238, 244, 0.9);
+  background:
+    linear-gradient(180deg, rgba(0, 0, 0, 0.18), transparent 42px),
+    #050608;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+`;
 
-  &[data-detail="true"] {
-    margin: 6px 10px 8px;
-    padding: 7px 8px;
-    border: 1px solid rgba(255, 209, 102, 0.1);
-    border-radius: 6px;
-    background: rgba(0, 0, 0, 0.2);
+export const LoopspaceRuntimeConsoleLoader = styled.button`
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  min-height: 24px;
+  width: 100%;
+  border: 0;
+  border-bottom: 1px solid rgba(255, 209, 102, 0.12);
+  color: rgba(255, 246, 223, 0.58);
+  background: rgba(5, 6, 8, 0.94);
+  backdrop-filter: blur(10px);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 10px;
+  font-weight: 760;
+
+  &:hover,
+  &:focus-visible {
+    color: rgba(255, 231, 161, 0.9);
+    outline: none;
+    background: rgba(24, 18, 7, 0.96);
   }
 
+  &[data-loading="true"] {
+    color: rgba(255, 231, 161, 0.82);
+    cursor: wait;
+  }
+`;
+
+export const LoopspaceRuntimeConsoleRow = styled.div`
+  display: grid;
+  grid-template-columns: 76px 92px minmax(0, 1fr);
+  align-items: baseline;
+  gap: 10px;
+  min-width: 0;
+  min-height: 23px;
+  padding: 3px 12px;
+  border-left: 2px solid transparent;
+  color: rgba(233, 238, 244, 0.86);
+  cursor: default;
+  animation: loopspaceRuntimeConsoleLineIn 0.18s ease both;
+
+  &[data-clickable="true"] {
+    cursor: pointer;
+  }
+
+  &[data-clickable="true"]:hover,
+  &[data-clickable="true"]:focus-visible,
+  &[data-selected="true"] {
+    outline: none;
+    background: rgba(96, 165, 250, 0.08);
+  }
+
+  &[data-tone="good"] {
+    border-left-color: rgba(74, 222, 128, 0.74);
+  }
+
+  &[data-tone="error"] {
+    border-left-color: rgba(248, 113, 113, 0.82);
+    background: rgba(127, 29, 29, 0.12);
+  }
+
+  &[data-tone="active"] {
+    border-left-color: rgba(96, 165, 250, 0.8);
+  }
+
+  &[data-tone="queued"] {
+    border-left-color: rgba(250, 204, 21, 0.78);
+  }
+
+  span,
   strong,
-  span {
+  em {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  strong {
-    color: #f8fafc;
-    font-size: 11px;
-    font-weight: 840;
+  span {
+    color: rgba(148, 163, 184, 0.78);
+    font-size: 10px;
+    font-weight: 720;
   }
 
-  span {
-    color: rgba(248, 250, 252, 0.56);
+  strong {
+    color: rgba(255, 231, 161, 0.86);
     font-size: 10px;
+    font-weight: 820;
+    text-transform: uppercase;
+  }
+
+  em {
+    color: rgba(233, 238, 244, 0.84);
+    font-size: 10.5px;
+    font-style: normal;
     font-weight: 700;
   }
+
+  @keyframes loopspaceRuntimeConsoleLineIn {
+    from {
+      opacity: 0;
+      transform: translateY(5px);
+    }
+
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+`;
+
+export const LoopspaceRuntimeConsoleDetail = styled.pre`
+  min-width: 0;
+  max-height: 150px;
+  overflow: auto;
+  margin: 0 12px 4px 180px;
+  border-left: 2px solid rgba(96, 165, 250, 0.34);
+  padding: 6px 8px;
+  color: rgba(203, 213, 225, 0.82);
+  background: rgba(15, 23, 42, 0.62);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-size: 9.5px;
+  font-weight: 650;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
 `;
 
 export const LoopspaceRuntimePanelResumeButton = styled.button`
