@@ -24,11 +24,15 @@ const ARCHITECTURE_CHANGE_EVENTS = [
 const ACCOUNT_TOOLS_CHANGE_EVENTS = [
   "cloud-mcp-account-documents-updated",
 ];
+const ACCOUNT_DOCUMENT_DRAFT_CHANGE_EVENTS = [
+  "cloud-mcp-account-document-draft-updated",
+];
 
 const workspaceToolsStore = {
   architecturesByRepo: new Map(), // repoPath -> [{ graphId, repoLabel, repoPath, title }]
   archAttemptedRepos: new Set(),
-  documentDraft: null,
+  activeDocumentDraftKey: "",
+  documentDrafts: new Map(),
   documentDraftLoaded: false,
   knownRepos: new Map(), // repoPath -> label; event refreshes re-fetch all of these
   skillsEntries: [],
@@ -43,6 +47,7 @@ const inFlightArchitectureLoads = new Map(); // repoPath -> Promise
 let inFlightSkillsLoad = null;
 let architectureEventsWired = false;
 let accountToolsEventsWired = false;
+let accountDocumentDraftEventsWired = false;
 let architectureEventTimer = 0;
 let accountToolsEventTimer = 0;
 
@@ -60,42 +65,84 @@ function clonePlainObject(value) {
   }
 }
 
-function readWorkspaceToolsDocumentDraftFromStorage() {
-  if (typeof window === "undefined") return null;
+function readWorkspaceToolsDocumentDraftsFromStorage() {
+  if (typeof window === "undefined") return { activeDocumentDraftKey: "", drafts: [] };
   try {
     const raw = window.localStorage?.getItem(ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY);
-    if (!raw) return null;
+    if (!raw) return { activeDocumentDraftKey: "", drafts: [] };
     const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return null;
-    return parsed;
+    if (!parsed) return { activeDocumentDraftKey: "", drafts: [] };
+    if (Array.isArray(parsed)) {
+      return {
+        activeDocumentDraftKey: "",
+        drafts: parsed.filter((draft) => draft && typeof draft === "object" && !Array.isArray(draft)),
+      };
+    }
+    if (typeof parsed !== "object") return { activeDocumentDraftKey: "", drafts: [] };
+    if (Array.isArray(parsed.drafts)) {
+      return {
+        activeDocumentDraftKey: text(parsed.activeDocumentDraftKey || parsed.active_document_draft_key),
+        drafts: parsed.drafts.filter((draft) => draft && typeof draft === "object" && !Array.isArray(draft)),
+      };
+    }
+    return {
+      activeDocumentDraftKey: "",
+      drafts: [parsed],
+    };
   } catch {
-    return null;
+    return { activeDocumentDraftKey: "", drafts: [] };
   }
 }
 
-function writeWorkspaceToolsDocumentDraftToStorage(draft) {
+function writeWorkspaceToolsDocumentDraftsToStorage() {
   if (typeof window === "undefined") return;
   try {
-    if (!draft) {
+    const drafts = Array.from(workspaceToolsStore.documentDrafts.values());
+    if (!drafts.length) {
       window.localStorage?.removeItem(ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY);
       return;
     }
-    window.localStorage?.setItem(ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY, JSON.stringify(draft));
+    window.localStorage?.setItem(ACCOUNT_DOCUMENT_DRAFT_STORAGE_KEY, JSON.stringify({
+      activeDocumentDraftKey: workspaceToolsStore.activeDocumentDraftKey,
+      drafts,
+    }));
   } catch {
     // Draft persistence is best-effort; the in-memory copy still survives tab switches.
   }
 }
 
+function workspaceToolsDocumentDraftMapKey(draft) {
+  const identity = workspaceToolsDocumentDraftIdentity(draft);
+  return identity.draftPath
+    || (identity.draftId ? `draft-id:${identity.draftId}` : "")
+    || identity.documentKey
+    || text(draft?.documentKey || draft?.document_key || accountDocumentStorageKey(draft) || draft?.id);
+}
+
 function ensureWorkspaceToolsDocumentDraftLoaded() {
   if (workspaceToolsStore.documentDraftLoaded) return;
   workspaceToolsStore.documentDraftLoaded = true;
-  workspaceToolsStore.documentDraft = readWorkspaceToolsDocumentDraftFromStorage();
+  const stored = readWorkspaceToolsDocumentDraftsFromStorage();
+  const storedDrafts = Array.isArray(stored) ? stored : stored?.drafts;
+  (Array.isArray(storedDrafts) ? storedDrafts : []).forEach((draft) => {
+    const normalized = normalizeWorkspaceToolsDocumentDraft(draft);
+    const key = workspaceToolsDocumentDraftMapKey(normalized);
+    if (!normalized || !key) return;
+    workspaceToolsStore.documentDrafts.set(key, normalized);
+  });
+  const storedActiveKey = Array.isArray(stored) ? "" : text(stored?.activeDocumentDraftKey || stored?.active_document_draft_key);
+  if (storedActiveKey && workspaceToolsStore.documentDrafts.has(storedActiveKey)) {
+    workspaceToolsStore.activeDocumentDraftKey = storedActiveKey;
+  }
+  if (!workspaceToolsStore.activeDocumentDraftKey && workspaceToolsStore.documentDrafts.size) {
+    workspaceToolsStore.activeDocumentDraftKey = Array.from(workspaceToolsStore.documentDrafts.keys()).at(-1) || "";
+  }
 }
 
 function normalizeWorkspaceToolsDocumentDraft(draft) {
   if (!draft || typeof draft !== "object" || Array.isArray(draft)) return null;
   const title = text(draft.title || draft.name || draft.id);
-  const content = String(draft.content ?? draft.content_md ?? draft.contentMd ?? "");
+  const content = String(draft.content ?? draft.content_md ?? draft.contentMd ?? draft.body ?? "");
   const documentKey = text(draft.documentKey || draft.document_key || accountDocumentStorageKey(draft) || draft.id);
   if (!documentKey && !title && !content) return null;
   return {
@@ -109,6 +156,107 @@ function normalizeWorkspaceToolsDocumentDraft(draft) {
     title: title || "Untitled document",
     updatedAtMs: Date.now(),
   };
+}
+
+function objectHasValue(object, key) {
+  return Object.prototype.hasOwnProperty.call(object, key) && object[key] !== undefined && object[key] !== null;
+}
+
+export function workspaceToolsDocumentDraftHasContentPayload(draft) {
+  if (!draft || typeof draft !== "object" || Array.isArray(draft)) return false;
+  if (draft.hasContentPayload === false || draft.has_content_payload === false) {
+    return false;
+  }
+  return objectHasValue(draft, "content_md")
+    || objectHasValue(draft, "contentMd")
+    || objectHasValue(draft, "body")
+    || objectHasValue(draft, "content")
+    || draft.hasContentPayload === true
+    || draft.has_content_payload === true;
+}
+
+function normalizedDraftDocumentIdentityKey(value) {
+  const cleaned = text(value);
+  return cleaned.startsWith("draft:") ? cleaned.slice("draft:".length) : cleaned;
+}
+
+function workspaceToolsDocumentDraftDocumentKeys(draft) {
+  if (!draft || typeof draft !== "object" || Array.isArray(draft)) return [];
+  const keys = [
+    draft.documentKey,
+    draft.document_key,
+    accountDocumentStorageKey(draft),
+    draft.pathKey,
+    draft.path_key,
+    draft.filePath,
+    draft.file_path,
+    draft.doc_id,
+    draft.document_id,
+    draft.id,
+  ].map(normalizedDraftDocumentIdentityKey).filter(Boolean);
+  return Array.from(new Set(keys));
+}
+
+function workspaceToolsDocumentDraftIdentity(draft) {
+  if (!draft || typeof draft !== "object" || Array.isArray(draft)) {
+    return { documentKey: "", documentKeys: [], draftId: "", draftPath: "" };
+  }
+  const documentKeys = workspaceToolsDocumentDraftDocumentKeys(draft);
+  return {
+    documentKey: documentKeys[0] || "",
+    documentKeys,
+    draftId: text(draft.draftId || draft.draft_id),
+    draftPath: text(draft.draftPath || draft.draft_path),
+  };
+}
+
+export function workspaceToolsDocumentDraftIdentityMatches(currentDraft, incomingDraft) {
+  const current = workspaceToolsDocumentDraftIdentity(currentDraft);
+  const incoming = workspaceToolsDocumentDraftIdentity(incomingDraft);
+  return Boolean(
+    (current.draftPath && incoming.draftPath && current.draftPath === incoming.draftPath)
+      || (current.draftId && incoming.draftId && current.draftId === incoming.draftId)
+      || current.documentKeys.some((key) => incoming.documentKeys.includes(key)),
+  );
+}
+
+export function mergeWorkspaceToolsDocumentDraft(currentDraft, incomingDraft) {
+  const incomingHasContentPayload = workspaceToolsDocumentDraftHasContentPayload(incomingDraft);
+  const incoming = normalizeWorkspaceToolsDocumentDraft(incomingDraft);
+  if (!incoming) return null;
+  const current = normalizeWorkspaceToolsDocumentDraft(currentDraft);
+  if (!current || !workspaceToolsDocumentDraftIdentityMatches(current, incomingDraft || incoming)) {
+    return incoming;
+  }
+
+  const merged = {
+    ...current,
+    ...incoming,
+    documentKey: incoming.documentKey || current.documentKey,
+    draft: true,
+    isDraft: true,
+    rowType: "document",
+    syncStatus: "draft",
+  };
+
+  if (!incomingHasContentPayload) {
+    merged.content = String(current.content ?? "");
+  }
+
+  return merged;
+}
+
+function matchingWorkspaceToolsDocumentDraftKey(incomingDraft) {
+  const incoming = normalizeWorkspaceToolsDocumentDraft(incomingDraft);
+  if (!incoming) return "";
+  const explicitKey = workspaceToolsDocumentDraftMapKey(incoming);
+  if (!workspaceToolsStore.documentDrafts.size) return explicitKey;
+  for (const [key, current] of workspaceToolsStore.documentDrafts.entries()) {
+    if (workspaceToolsDocumentDraftIdentityMatches(current, incoming)) {
+      return key;
+    }
+  }
+  return explicitKey;
 }
 
 export function workspaceToolsRepoDescriptors(coordinationTargets, rootDirectory) {
@@ -259,6 +407,123 @@ function accountToolsSkillUnitsFromEventPayload(payload) {
   return Array.from(byId.values());
 }
 
+function draftEventCandidateWithMetadata(candidate, document) {
+  if (!document || typeof document !== "object" || Array.isArray(document)) return null;
+  const merged = { ...clonePlainObject(document) };
+  [
+    "base_content_hash",
+    "baseContentHash",
+    "canonical_local_path",
+    "canonicalLocalPath",
+    "collection",
+    "content_hash",
+    "contentHash",
+    "document_id",
+    "documentId",
+    "document_key",
+    "documentKey",
+    "draft_id",
+    "draftId",
+    "draft_path",
+    "draftPath",
+    "file_path",
+    "filePath",
+    "path_key",
+    "pathKey",
+    "scope_key",
+    "scopeKey",
+  ].forEach((key) => {
+    if (!objectHasValue(merged, key) && objectHasValue(candidate, key)) {
+      merged[key] = candidate[key];
+    }
+  });
+  ["body", "content", "content_md", "contentMd"].forEach((key) => {
+    if (!objectHasValue(merged, key) && objectHasValue(candidate, key)) {
+      merged[key] = candidate[key];
+    }
+  });
+  return merged;
+}
+
+function accountDocumentDraftsFromEventPayload(payload) {
+  const drafts = [];
+  accountToolsEventCandidates(payload).forEach((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return;
+    [
+      candidate.document,
+      candidate.draft,
+      candidate.draftDocument,
+      candidate.draft_document,
+    ].forEach((document) => {
+      const draft = draftEventCandidateWithMetadata(candidate, document);
+      if (draft) drafts.push(draft);
+    });
+    ["documents", "items"].forEach((key) => {
+      const documents = Array.isArray(candidate[key]) ? candidate[key] : [];
+      documents.forEach((document) => {
+        const draft = draftEventCandidateWithMetadata(candidate, document);
+        if (draft) drafts.push(draft);
+      });
+    });
+    accountDocumentUnitsFromPayload(candidate).forEach((unit) => {
+      const draft = draftEventCandidateWithMetadata(candidate, unit);
+      if (draft) drafts.push(draft);
+    });
+    const identity = workspaceToolsDocumentDraftIdentity(candidate);
+    if (identity.draftPath || identity.draftId || identity.documentKey) {
+      drafts.push(candidate);
+    }
+  });
+  return drafts;
+}
+
+function accountDocumentDraftEventClearsDraft(payload, draft) {
+  return accountToolsEventCandidates(payload).some((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    if (!workspaceToolsDocumentDraftIdentityMatches(draft, candidate)) return false;
+    const kind = text(candidate.kind || candidate.event_kind || candidate.c).toLowerCase();
+    return candidate.deleted === true
+      || candidate.discarded === true
+      || kind === "account_document_draft_discarded"
+      || kind === "doc.draft.discarded";
+  });
+}
+
+export function applyWorkspaceToolsDocumentDraftEventPayload(payload) {
+  ensureWorkspaceToolsDocumentDraftLoaded();
+  const incomingDrafts = accountDocumentDraftsFromEventPayload(payload);
+  if (!incomingDrafts.length) return false;
+  const previousKey = JSON.stringify(Array.from(workspaceToolsStore.documentDrafts.entries()));
+  incomingDrafts.forEach((matchingDraft) => {
+    const key = matchingWorkspaceToolsDocumentDraftKey(matchingDraft);
+    if (!key) return;
+    const current = workspaceToolsStore.documentDrafts.get(key);
+    if (accountDocumentDraftEventClearsDraft(payload, matchingDraft)) {
+      workspaceToolsStore.documentDrafts.delete(key);
+      if (workspaceToolsStore.activeDocumentDraftKey === key) {
+        workspaceToolsStore.activeDocumentDraftKey = Array.from(workspaceToolsStore.documentDrafts.keys()).at(-1) || "";
+      }
+      return;
+    }
+    const merged = mergeWorkspaceToolsDocumentDraft(current, matchingDraft);
+    if (merged) {
+      const nextKey = workspaceToolsDocumentDraftMapKey(merged) || key;
+      if (nextKey !== key) {
+        workspaceToolsStore.documentDrafts.delete(key);
+      }
+      workspaceToolsStore.documentDrafts.set(nextKey, merged);
+      if (!workspaceToolsStore.activeDocumentDraftKey) {
+        workspaceToolsStore.activeDocumentDraftKey = nextKey;
+      }
+    }
+  });
+  writeWorkspaceToolsDocumentDraftsToStorage();
+  if (previousKey !== JSON.stringify(Array.from(workspaceToolsStore.documentDrafts.entries()))) {
+    notifyWorkspaceToolsListeners();
+  }
+  return true;
+}
+
 function applyAccountSkillUnits(units, { replace = false } = {}) {
   if (!Array.isArray(units) || (!units.length && !replace)) return false;
   workspaceToolsStore.skillsFetchedAtMs = Date.now();
@@ -280,7 +545,7 @@ async function loadAccountSkills({ force = false } = {}) {
         request: { limit: 2000, local_only: true },
       });
       const localUnits = accountDocumentUnitsFromPayload(localTools);
-      applyAccountSkills(skillsFromUnits(localUnits));
+      applyAccountSkills(mergeSkillUnits(workspaceToolsStore.skills, localUnits));
     } catch {
       if (!workspaceToolsStore.skillsLoaded) {
         applyAccountSkills([]);
@@ -296,7 +561,7 @@ async function loadAccountSkills({ force = false } = {}) {
       });
       workspaceToolsStore.skillsFetchedAtMs = Date.now();
       const units = accountDocumentUnitsFromPayload(tools);
-      applyAccountSkills(skillsFromUnits(units));
+      applyAccountSkills(mergeSkillUnits(workspaceToolsStore.skills, units));
     } catch {
       // Offline or transient failure: keep the local cache. Docs are account
       // data, not a tab-scoped loading surface.
@@ -357,9 +622,22 @@ function wireAccountToolsChangeEvents() {
   });
 }
 
+function wireAccountDocumentDraftChangeEvents() {
+  if (accountDocumentDraftEventsWired) return;
+  accountDocumentDraftEventsWired = true;
+  ACCOUNT_DOCUMENT_DRAFT_CHANGE_EVENTS.forEach((eventName) => {
+    void listen(eventName, (event) => {
+      applyWorkspaceToolsDocumentDraftEventPayload(event?.payload);
+    }).catch(() => {
+      // Event wiring is best-effort; local draft persistence remains authoritative.
+    });
+  });
+}
+
 /** Serve-from-cache plus silent revalidate for the given workspace repos. */
 export function ensureWorkspaceToolsFresh(repoDescriptors) {
   wireAccountToolsChangeEvents();
+  wireAccountDocumentDraftChangeEvents();
   const descriptors = Array.isArray(repoDescriptors) ? repoDescriptors : [];
   const activeRepos = new Set();
   descriptors.forEach(({ repoPath, label }) => {
@@ -385,6 +663,7 @@ export function warmWorkspaceTools(coordinationTargets, rootDirectory) {
 /** Background-safe account-doc refresh for app-control MCP inventory tools. */
 export async function refreshWorkspaceToolsAccountSkills({ force = false } = {}) {
   wireAccountToolsChangeEvents();
+  wireAccountDocumentDraftChangeEvents();
   await loadAccountSkills({ force: force === true });
   return getWorkspaceToolsAccountSkills();
 }
@@ -397,34 +676,80 @@ export function noteAccountSkillUnits(skills) {
 
 export function getWorkspaceToolsDocumentDraft() {
   ensureWorkspaceToolsDocumentDraftLoaded();
-  return clonePlainObject(workspaceToolsStore.documentDraft);
+  const key = workspaceToolsStore.activeDocumentDraftKey;
+  const draft = key ? workspaceToolsStore.documentDrafts.get(key) : null;
+  if (draft) return clonePlainObject(draft);
+  const fallback = Array.from(workspaceToolsStore.documentDrafts.values()).at(-1) || null;
+  return clonePlainObject(fallback);
 }
 
-export function setWorkspaceToolsDocumentDraft(draft) {
+export function getWorkspaceToolsDocumentDrafts() {
   ensureWorkspaceToolsDocumentDraftLoaded();
-  const nextDraft = normalizeWorkspaceToolsDocumentDraft(draft);
-  const previousKey = JSON.stringify(workspaceToolsStore.documentDraft || null);
-  const nextKey = JSON.stringify(nextDraft || null);
-  workspaceToolsStore.documentDraft = nextDraft;
-  writeWorkspaceToolsDocumentDraftToStorage(nextDraft);
-  if (previousKey !== nextKey) notifyWorkspaceToolsListeners();
+  return Array.from(workspaceToolsStore.documentDrafts.values())
+    .map(clonePlainObject)
+    .filter(Boolean);
+}
+
+export function setWorkspaceToolsDocumentDraft(draft, options = {}) {
+  ensureWorkspaceToolsDocumentDraftLoaded();
+  const key = matchingWorkspaceToolsDocumentDraftKey(draft);
+  const currentDraft = key ? workspaceToolsStore.documentDrafts.get(key) : null;
+  const nextDraft = mergeWorkspaceToolsDocumentDraft(currentDraft, draft);
+  const previousKey = JSON.stringify(Array.from(workspaceToolsStore.documentDrafts.entries()));
+  if (nextDraft) {
+    const nextKey = workspaceToolsDocumentDraftMapKey(nextDraft) || key;
+    if (key && nextKey !== key) {
+      workspaceToolsStore.documentDrafts.delete(key);
+    }
+    workspaceToolsStore.documentDrafts.set(nextKey, nextDraft);
+    if (options.activate !== false) {
+      workspaceToolsStore.activeDocumentDraftKey = nextKey;
+    } else if (!workspaceToolsStore.activeDocumentDraftKey) {
+      workspaceToolsStore.activeDocumentDraftKey = nextKey;
+    }
+  }
+  writeWorkspaceToolsDocumentDraftsToStorage();
+  if (previousKey !== JSON.stringify(Array.from(workspaceToolsStore.documentDrafts.entries()))) {
+    notifyWorkspaceToolsListeners();
+  }
 }
 
 export function clearWorkspaceToolsDocumentDraft(documentKey = "") {
   ensureWorkspaceToolsDocumentDraftLoaded();
-  const current = workspaceToolsStore.documentDraft;
-  if (!current) return;
+  if (!workspaceToolsStore.documentDrafts.size) return;
   const requestedKey = text(documentKey);
-  const currentKey = text(current.documentKey || current.document_key || accountDocumentStorageKey(current) || current.id);
-  if (requestedKey && currentKey && requestedKey !== currentKey) return;
-  workspaceToolsStore.documentDraft = null;
-  writeWorkspaceToolsDocumentDraftToStorage(null);
-  notifyWorkspaceToolsListeners();
+  const previousKey = JSON.stringify(Array.from(workspaceToolsStore.documentDrafts.entries()));
+  if (!requestedKey) {
+    workspaceToolsStore.documentDrafts.clear();
+    workspaceToolsStore.activeDocumentDraftKey = "";
+  } else {
+    for (const [key, current] of workspaceToolsStore.documentDrafts.entries()) {
+      if (
+        key === requestedKey
+        || workspaceToolsDocumentDraftIdentityMatches(current, { documentKey: requestedKey })
+        || workspaceToolsDocumentDraftIdentityMatches(current, { document_key: requestedKey })
+        || workspaceToolsDocumentDraftIdentityMatches(current, { draftPath: requestedKey })
+        || workspaceToolsDocumentDraftIdentityMatches(current, { draft_path: requestedKey })
+        || workspaceToolsDocumentDraftIdentityMatches(current, { draftId: requestedKey })
+        || workspaceToolsDocumentDraftIdentityMatches(current, { draft_id: requestedKey })
+      ) {
+        workspaceToolsStore.documentDrafts.delete(key);
+      }
+    }
+    if (!workspaceToolsStore.documentDrafts.has(workspaceToolsStore.activeDocumentDraftKey)) {
+      workspaceToolsStore.activeDocumentDraftKey = Array.from(workspaceToolsStore.documentDrafts.keys()).at(-1) || "";
+    }
+  }
+  writeWorkspaceToolsDocumentDraftsToStorage();
+  if (previousKey !== JSON.stringify(Array.from(workspaceToolsStore.documentDrafts.entries()))) {
+    notifyWorkspaceToolsListeners();
+  }
 }
 
 export function subscribeWorkspaceTools(listener) {
   workspaceToolsListeners.add(listener);
   wireAccountToolsChangeEvents();
+  wireAccountDocumentDraftChangeEvents();
   return () => {
     workspaceToolsListeners.delete(listener);
   };

@@ -303,7 +303,8 @@ async fn handle_app_control_mcp_bridge_connection(
         return Ok(());
     }
 
-    let response = match timeout(Duration::from_millis(APP_CONTROL_MCP_TIMEOUT_MS), receiver).await
+    let ui_timeout_ms = app_control_mcp_tool_timeout_ms(&request.tool);
+    let response = match timeout(Duration::from_millis(ui_timeout_ms), receiver).await
     {
         Ok(Ok(value)) => value,
         Ok(Err(_)) => json!({
@@ -552,7 +553,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "get_doc",
-            "description": "Return one account Tools document by document_key, doc_id/document_id, path_key, file_path, title, or name without changing the visible tab, active view, selected document, or highlighted range. Use includeContent=true to hydrate and return content for that one document.",
+            "description": "Return one account Tools document by document_key, doc_id/document_id, path_key, file_path, title, or name without changing the visible tab, active view, selected document, or highlighted range. Use includeContent=true to hydrate and return content for that one document. Do not directly edit local_path; call prepare_doc_draft for file-backed edits.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -570,6 +571,76 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "includeContent": {"type": "boolean", "description": "When true or omitted, include document content, hydrating this single document if needed."},
                     "refresh": {"type": "boolean", "description": "When true, force a Cloud/cache refresh before resolving the document."}
                 },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "prepare_doc_draft",
+            "description": "Prepare a separate file-backed draft for an account Tools document without switching tabs. Edit the returned draft_path directly on disk, then call save_doc with draft_path/draft_id/base_content_hash and the document key to promote it. This keeps hydration and canonical local_path untouched until save.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "document_key": {"type": "string"},
+                    "documentKey": {"type": "string"},
+                    "doc_id": {"type": "string"},
+                    "document_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "path_key": {"type": "string"},
+                    "pathKey": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "filePath": {"type": "string"},
+                    "title": {"type": "string"},
+                    "name": {"type": "string"},
+                    "content": {"type": "string"},
+                    "content_md": {"type": "string"},
+                    "reuse_existing": {"type": "boolean"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "save_doc",
+            "description": "Register and save an account Tools document by document_key, doc_id/document_id, path_key, file_path, title, name, draft_path, or draft_id without switching tabs. Prefer prepare_doc_draft, edit the returned draft_path, then save_doc with draft_path, draft_id, base_content_hash, and document_key/path_key to promote it. If content/content_md is supplied, Diff Forge writes that content. Default mode is publish/sync so other clients can see it; use mode=local only for local-only saves. Empty overwrites require allow_empty_overwrite=true.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "document_key": {"type": "string"},
+                    "documentKey": {"type": "string"},
+                    "doc_id": {"type": "string"},
+                    "document_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "path_key": {"type": "string"},
+                    "pathKey": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "filePath": {"type": "string"},
+                    "local_path": {"type": "string"},
+                    "localPath": {"type": "string"},
+                    "draft_path": {"type": "string"},
+                    "draftPath": {"type": "string"},
+                    "draft_id": {"type": "string"},
+                    "draftId": {"type": "string"},
+                    "base_content_hash": {"type": "string", "description": "Required when promoting a draft over an existing canonical document; use the value returned by prepare_doc_draft."},
+                    "baseContentHash": {"type": "string"},
+                    "base_hash": {"type": "string"},
+                    "baseHash": {"type": "string"},
+                    "title": {"type": "string"},
+                    "name": {"type": "string"},
+                    "content": {"type": "string"},
+                    "content_md": {"type": "string"},
+                    "mode": {"type": "string", "description": "publish, push, sync, save, or local. save aliases publish; use local only for local-only saves."},
+                    "allow_empty_overwrite": {"type": "boolean"},
+                    "allowEmptyOverwrite": {"type": "boolean"},
+                    "allow_conflict": {"type": "boolean", "description": "Force-promote a draft even if the canonical document changed after prepare_doc_draft."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "write_doc",
+            "description": "Alias for save_doc. Promote an account document draft_path/draft_id or save content/content_md.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {},
                 "additionalProperties": true
             }
         }),
@@ -645,7 +716,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "save_selected_document",
-            "description": "Save the currently selected Tools document from Diff Forge's live editor state. Use mode=local for local-only pending save. Use mode=publish when the user says publish, push, sync, fan out, or save for other clients.",
+            "description": "Save the currently selected Tools document from Diff Forge's live editor state. Default mode is publish/sync so other clients can see it. Use mode=local only for local-only pending save.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -721,6 +792,116 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "path_key": {"type": "string", "description": "Local path key such as scripts/deploy.sh or deploy.sh."},
                     "working_directory": {"type": "string", "description": "Optional cwd override."},
                     "shell": {"type": "string", "description": "Optional shell override: zsh, bash, python3, node, powershell, cmd."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "list_assets",
+            "description": "List compact account asset rows from the local Rust asset mirror without changing tabs, including local/cloud availability and recent transfer status. Use asset_id/asset_ids, kind, status, transfer_status, active_only, device_id/device_ids, and limit to filter.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "asset_id": {"type": "string"},
+                    "asset_ids": {"type": "array", "items": {"type": "string"}},
+                    "kind": {"type": "string", "description": "Optional asset kind filter, for example image, video, audio, pdf, archive, or document."},
+                    "status": {"type": "string", "description": "Optional asset status filter."},
+                    "transfer_status": {"type": "string", "description": "Optional transfer status filter. Use active for in-flight transfers."},
+                    "active_only": {"type": "boolean"},
+                    "device_id": {"type": "string"},
+                    "device_ids": {"type": "array", "items": {"type": "string"}},
+                    "limit": {"type": "integer", "default": 100, "maximum": 1000}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "get_asset_root",
+            "description": "Return the managed Diff Forge account asset root and a safe suggested local_path for a generated/reusable asset. Write the file to local_path, then call upload_asset with that path so Rust tracks, hashes, dedupes, and uploads it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "asset_id": {"type": "string", "description": "Optional caller-provided asset id. Omit to let Diff Forge suggest one."},
+                    "name": {"type": "string", "description": "Preferred filename, for example qa-screenshot.png."},
+                    "filename": {"type": "string", "description": "Alias for name."},
+                    "mime_type": {"type": "string", "description": "Optional MIME type used to infer an extension."},
+                    "extension": {"type": "string", "description": "Optional extension without a leading dot."},
+                    "group": {"type": "string", "description": "Optional managed library subfolder. Defaults to generated."},
+                    "source_kind": {"type": "string", "description": "Optional provenance/source label."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "upload_asset",
+            "description": "Track and upload one local generated asset. Rust computes sha256/size, stores the local mirror row, asks Cloud to dedupe or prepare upload, and streams bytes only when Cloud needs the blob. Call get_asset_root first for generated files.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Required local file path to track and upload."},
+                    "local_path": {"type": "string", "description": "Alias for path."},
+                    "asset_id": {"type": "string", "description": "Optional caller-provided asset id."},
+                    "name": {"type": "string", "description": "Optional display name."},
+                    "filename": {"type": "string", "description": "Alias for name."},
+                    "mime_type": {"type": "string", "description": "Optional MIME type override."},
+                    "kind": {"type": "string", "description": "Optional asset kind override."},
+                    "source_kind": {"type": "string", "description": "Optional provenance/source label."},
+                    "group": {"type": "string", "description": "Optional managed library subfolder."},
+                    "metadata": {"type": "object", "additionalProperties": true}
+                },
+                "required": ["path"],
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "upload_asset_status",
+            "description": "Read recent upload transfer status from the local Rust asset mirror. Filter by asset_id/asset_ids, transfer_id/transfer_ids, device_id/device_ids, active_only, status, or limit.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "asset_id": {"type": "string"},
+                    "asset_ids": {"type": "array", "items": {"type": "string"}},
+                    "transfer_id": {"type": "string"},
+                    "transfer_ids": {"type": "array", "items": {"type": "string"}},
+                    "device_id": {"type": "string"},
+                    "device_ids": {"type": "array", "items": {"type": "string"}},
+                    "active_only": {"type": "boolean"},
+                    "status": {"type": "string", "description": "Optional upload transfer status. Use active for in-flight uploads."},
+                    "limit": {"type": "integer", "default": 100, "maximum": 1000}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "download_asset",
+            "description": "Download one Cloud asset into the device-level Diff Forge asset library by default, or a caller-provided target directory. Use this when list_assets shows an input asset but no local_path/local copy is available.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "asset_id": {"type": "string", "description": "Required Cloud asset id to download."},
+                    "assetId": {"type": "string", "description": "Alias for asset_id."},
+                    "target_directory": {"type": "string", "description": "Optional download directory. Defaults to the device-level Diff Forge asset library."},
+                    "targetDirectory": {"type": "string", "description": "Alias for target_directory."}
+                },
+                "required": ["asset_id"],
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "download_asset_status",
+            "description": "Read recent download transfer status from the local Rust asset mirror. Filter by asset_id/asset_ids, transfer_id/transfer_ids, device_id/device_ids, active_only, status, or limit.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "asset_id": {"type": "string"},
+                    "asset_ids": {"type": "array", "items": {"type": "string"}},
+                    "transfer_id": {"type": "string"},
+                    "transfer_ids": {"type": "array", "items": {"type": "string"}},
+                    "device_id": {"type": "string"},
+                    "device_ids": {"type": "array", "items": {"type": "string"}},
+                    "active_only": {"type": "boolean"},
+                    "status": {"type": "string", "description": "Optional download transfer status. Use active for in-flight downloads."},
+                    "limit": {"type": "integer", "default": 100, "maximum": 1000}
                 },
                 "additionalProperties": true
             }
@@ -807,7 +988,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "record_loopspace_step_progress",
-            "description": "Record progress for the current Loopspace send-message checkpoint. Use this for Diff Forge internal send-message steps: call with status='running' when starting a step and status='completed' when that step is done. This updates checkpoint UI only; it does not complete the whole send-message node.",
+            "description": "Record progress for the current Loopspace send-message checkpoint. Use this for Diff Forge internal send-message steps: call with status='running' when starting a step and status='completed' when that step is done. If a checkpoint generated assets, include asset_id or asset_ids after upload_asset succeeds. This updates checkpoint UI only; it does not complete the whole send-message node.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -830,6 +1011,9 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "step_title": {"type": "string"},
                     "stepTitle": {"type": "string"},
                     "status": {"type": "string", "description": "running, completed, failed, or skipped."},
+                    "asset_id": {"type": "string", "description": "Generated/uploaded asset id for this checkpoint."},
+                    "asset_ids": {"type": "array", "items": {"type": "string"}, "description": "Generated/uploaded asset ids for this checkpoint."},
+                    "produced_assets": {"type": "array", "items": {"type": "object", "additionalProperties": true}, "description": "Optional compact generated asset rows returned by upload_asset."},
                     "message": {"type": "string"}
                 },
                 "additionalProperties": true
@@ -883,7 +1067,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "patch_loopspace_graph",
-            "description": "Patch a Loopspace .dfblueprint graph without rewriting the whole source. Call get_loopspace_graph and list_loopspace_triggers first. Trigger graph nodes must reference inventory: use attach_trigger with trigger_id, or create_loopspace_trigger first. Do not invent standalone cron/manual/webhook nodes. For add_node, use supported node kinds: document_read, document_write, run_script, send_message, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message and run_script nodes. Edges are explicit node_id.port -> node_id.port connections. Use document_read.docs -> step.in for readable substep context and step.docs -> document_write.in for writable substep output.",
+            "description": "Patch a Loopspace .dfblueprint graph without rewriting the whole source. Call get_loopspace_graph and list_loopspace_triggers first. Trigger graph nodes must reference inventory: use attach_trigger with trigger_id, or create_loopspace_trigger first. Do not invent standalone cron/manual/webhook nodes. For add_node, use supported node kinds: document_read, document_write, asset_read, asset_write, run_script, send_message, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message and run_script nodes. Edges are explicit node_id.port -> node_id.port connections. Resource ports: document_read/document_write expose docs; asset_read/asset_write expose assets. Use doc_refs for document selections, asset_refs for asset selections, h for resource node height, and target_mode for selection/create behavior. For send-message substep guidance, use document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for generated documents, and step.assets -> asset_write.in for generated assets. Write nodes may include create_name for a new/generated resource name. add_node and update_node_props accept resource metadata as top-level fields or nested under props.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -894,7 +1078,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "operations": {
                         "type": "array",
                         "items": {"type": "object", "additionalProperties": true},
-                        "description": "Examples: {op:'attach_trigger', trigger_id:'trigger-...', x:0, y:0}; {op:'add_node', id:'read_doc', kind:'document_read', label:'Read document'}; {op:'add_node', id:'message_agent', kind:'send_message', label:'Message agent'}; {op:'connect', from:'trigger-basic', to:'message_agent'}."
+                        "description": "Examples: {op:'attach_trigger', trigger_id:'trigger-...', x:0, y:0}; {op:'add_node', id:'read_doc', kind:'document_read', label:'Read document'}; {op:'add_node', id:'make_asset', kind:'asset_write', label:'Create screenshot asset', create_name:'qa-screenshot.png'}; {op:'add_node', id:'message_agent', kind:'send_message', label:'Message agent'}; {op:'connect', from:'trigger-basic', to:'message_agent'}."
                     },
                     "ops": {
                         "type": "array",
@@ -994,6 +1178,9 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "get_visible_context",
         "list_docs",
         "get_doc",
+        "prepare_doc_draft",
+        "save_doc",
+        "write_doc",
         "get_selected_document_context",
         "get_selected_script_context",
         "get_selection_context",
@@ -1003,6 +1190,12 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "update_selected_script",
         "run_selected_script",
         "run_local_script",
+        "list_assets",
+        "get_asset_root",
+        "upload_asset",
+        "upload_asset_status",
+        "download_asset",
+        "download_asset_status",
         "list_local_scripts",
         "list_scripts",
         "get_script",
@@ -1050,11 +1243,7 @@ fn app_control_mcp_forward_to_app(
 ) -> Result<Value, String> {
     let mut stream = std::net::TcpStream::connect(context.endpoint.trim())
         .map_err(|error| format!("Unable to connect to app-control bridge: {error}"))?;
-    let bridge_timeout_ms = if tool == "run_local_script" {
-        APP_CONTROL_MCP_SCRIPT_RUN_TIMEOUT_MS
-    } else {
-        APP_CONTROL_MCP_TIMEOUT_MS + 1000
-    };
+    let bridge_timeout_ms = app_control_mcp_tool_timeout_ms(tool).saturating_add(1000);
     let timeout_duration = Duration::from_millis(bridge_timeout_ms);
     let _ = stream.set_read_timeout(Some(timeout_duration));
     let _ = stream.set_write_timeout(Some(timeout_duration));
@@ -1077,4 +1266,12 @@ fn app_control_mcp_forward_to_app(
         .map_err(|error| format!("Unable to read app-control bridge response: {error}"))?;
     serde_json::from_str(response.trim())
         .map_err(|error| format!("Invalid app-control bridge response: {error}"))
+}
+
+fn app_control_mcp_tool_timeout_ms(tool: &str) -> u64 {
+    if tool == "run_local_script" || tool == "upload_asset" || tool == "download_asset" {
+        APP_CONTROL_MCP_SCRIPT_RUN_TIMEOUT_MS
+    } else {
+        APP_CONTROL_MCP_TIMEOUT_MS
+    }
 }

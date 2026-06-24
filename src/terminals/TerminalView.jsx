@@ -95,9 +95,8 @@ import {
 } from "../threads/workspaceThreads";
 import GitWorkspaceView from "../git/GitWorkspaceView.jsx";
 import PlansWorkspaceView from "../plans/PlansWorkspaceView.jsx";
-import WorkspaceToolsDragPanel, {
-  WORKSPACE_TOOL_TODO_DRAG_MIME,
-} from "../tools/WorkspaceToolsDragPanel.jsx";
+import WorkspaceToolsDragPanel from "../tools/WorkspaceToolsDragPanel.jsx";
+import { WORKSPACE_TOOL_TODO_DRAG_MIME } from "../tools/workspaceToolDragTypes.js";
 import { warmWorkspaceTools } from "../tools/workspaceToolsStore.js";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 import { logTerminalStatus } from "./terminalStatusLog.js";
@@ -2888,6 +2887,61 @@ function appControlCheckpointText(value = {}, keys = []) {
   return "";
 }
 
+function appControlCheckpointResourceList(checkpoint = {}, keys = []) {
+  const roots = [
+    checkpoint?.resource_context,
+    checkpoint?.resourceContext,
+    checkpoint?.resources,
+  ].filter((value) => value && typeof value === "object" && !Array.isArray(value));
+  for (const root of roots) {
+    for (const key of keys) {
+      const value = root[key];
+      if (Array.isArray(value)) return value.filter((item) => item && typeof item === "object");
+    }
+  }
+  return [];
+}
+
+function appControlCheckpointResourceRefs(resource = {}) {
+  const rawRefs = resource.refs
+    || resource.ref
+    || resource.doc_refs
+    || resource.docRefs
+    || resource.asset_refs
+    || resource.assetRefs
+    || [];
+  const refs = Array.isArray(rawRefs)
+    ? rawRefs
+    : String(rawRefs || "").split("|");
+  return refs
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .filter((value, index, array) => array.indexOf(value) === index);
+}
+
+function appControlCheckpointResourceEntryText(resource = {}) {
+  const label = appControlCheckpointText(resource, ["label", "title", "name", "createName", "create_name"])
+    || "resource";
+  const createName = appControlCheckpointText(resource, ["createName", "create_name"]);
+  const refs = appControlCheckpointResourceRefs(resource);
+  const details = [
+    createName && createName !== label ? `create_name: ${createName}` : "",
+    refs.length ? `refs: ${refs.join(", ")}` : "",
+  ].filter(Boolean);
+  return details.length ? `${label} (${details.join("; ")})` : label;
+}
+
+function appControlCheckpointResourcePromptLines(checkpoint = {}) {
+  return [
+    ["Read docs", appControlCheckpointResourceList(checkpoint, ["readable_documents", "readableDocuments", "read_docs", "readDocs"])],
+    ["Write docs", appControlCheckpointResourceList(checkpoint, ["writable_documents", "writableDocuments", "write_docs", "writeDocs"])],
+    ["Read assets", appControlCheckpointResourceList(checkpoint, ["readable_assets", "readableAssets", "read_assets", "readAssets"])],
+    ["Write assets", appControlCheckpointResourceList(checkpoint, ["writable_assets", "writableAssets", "write_assets", "writeAssets"])],
+  ]
+    .filter(([, resources]) => resources.length)
+    .map(([label, resources]) => `${label}: ${resources.map(appControlCheckpointResourceEntryText).join("; ")}`);
+}
+
 function appControlRemoteCheckpointPromptBlock(detail = {}, checkpointPlan = []) {
   const checkpoints = (Array.isArray(checkpointPlan) ? checkpointPlan : [])
     .filter((checkpoint) => checkpoint && typeof checkpoint === "object");
@@ -2898,6 +2952,7 @@ function appControlRemoteCheckpointPromptBlock(detail = {}, checkpointPlan = [])
     "Diff Forge internal send-message steps:",
     "- Treat these as ordered internal checkpoints for this message.",
     "- As you make progress, call the diffforge-app-control MCP tool record_loopspace_step_progress with status \"running\" when you start a checkpoint and status \"completed\" when that checkpoint is done.",
+    "- For Write docs resources, use prepare_doc_draft first, edit the returned draft_path, then call save_doc with document_key/path_key/draft_path/draft_id/base_content_hash before marking that checkpoint completed. Do not edit canonical local_path directly.",
   ];
   const fieldPairs = [
     ["loopspace_id", appControlRemoteDetailString(detail, ["loopspace_id", "loopspaceId"])],
@@ -2917,6 +2972,8 @@ function appControlRemoteCheckpointPromptBlock(detail = {}, checkpointPlan = [])
     const description = appControlCheckpointText(checkpoint, ["description", "desc", "details"]);
     const idSuffix = stepId ? ` [step_id: ${stepId}]` : "";
     lines.push(`${index + 1}. ${label}${idSuffix}${description ? ` - ${description}` : ""}`);
+    appControlCheckpointResourcePromptLines(checkpoint)
+      .forEach((line) => lines.push(`   - ${line}`));
   });
   return lines.join("\n");
 }

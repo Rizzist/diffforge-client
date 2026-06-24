@@ -101,6 +101,11 @@ const SNAP_THRESHOLD_PX = 8;
 const AUTOSCROLL_EDGE_PX = 48;
 const AUTOSCROLL_MAX_PX = 26;
 const RULER_TARGET_PX = 84;
+const NATIVE_VIDEO_DRIFT_CORRECTION_SECONDS = 0.6;
+const NATIVE_VIDEO_CORRECTION_INTERVAL_MS = 700;
+const NATIVE_VIDEO_START_GRACE_MS = 900;
+const NATIVE_VIDEO_STALL_MS = 900;
+const NATIVE_VIDEO_PROGRESS_EPSILON_SECONDS = 0.015;
 const RULER_NICE_STEPS_MS = [
   100, 200, 500, 1000, 2000, 5000, 10000, 15000, 30000, 60000, 120000, 300000, 600000, 900000,
   1800000, 3600000,
@@ -661,7 +666,8 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   const processedRef = useRef(new Set());
   const pendingFrameRef = useRef(null); // latest desired preview frame {path,timeMs}
   const decodeInFlightRef = useRef(false); // a single decode is chasing the latest frame
-  const previewTokenRef = useRef(0); // bumps on every preview target change/clear
+  const previewTokenRef = useRef(0); // bumps on every preview source change/clear
+  const previewTokenSourceRef = useRef("");
   const mountedRef = useRef(true);
   // Audio playback (Web Audio): decoded PCM buffers + the live scheduled nodes +
   // the master-clock anchor (audio drives the playhead when audio is present).
@@ -677,6 +683,8 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   const autoScrollRafRef = useRef(0);
   const conversionCleanupTimersRef = useRef(new Map());
   const previewVideoRef = useRef(null);
+  const nativeVideoSyncRef = useRef({ key: "", run: -1, lastCorrectionAt: 0, ignoreProgressUntil: 0 });
+  const playbackVideoTimeRef = useRef(0);
 
   // The committed document (last server state) + in-session undo/redo of
   // committed snapshots. `clips` is the live working copy (may diverge mid-drag).
@@ -1055,9 +1063,8 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   const nativeVideoActive = playing && !!playbackVideoSource && !nativeVideoFailed;
   const markNativeVideoFailed = useCallback((key) => {
     if (key) {
-      setNativeVideoFailedKey(key);
+      setNativeVideoFailedKey((current) => (current === key ? current : key));
     }
-    setPlaying(false);
   }, []);
 
   // The frame the viewer should show, quantized to the fps grid so the backend
@@ -1116,12 +1123,29 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
       if (cancelled) {
         return;
       }
+      const syncState = nativeVideoSyncRef.current;
+      const syncReset = syncState.key !== playbackVideoSource.key || syncState.run !== playbackRun;
+      if (syncReset) {
+        syncState.key = playbackVideoSource.key;
+        syncState.run = playbackRun;
+        syncState.lastCorrectionAt = 0;
+        syncState.ignoreProgressUntil = 0;
+      }
       const duration = Number.isFinite(video.duration) ? video.duration : 0;
       const boundedSeconds = duration > 0 ? Math.min(targetSeconds, Math.max(0, duration - 0.008)) : targetSeconds;
       const drift = Math.abs((Number.isFinite(video.currentTime) ? video.currentTime : 0) - boundedSeconds);
-      if (!playing || drift > 0.18) {
+      const now = performance.now();
+      const shouldCorrect =
+        !playing || syncReset || drift > NATIVE_VIDEO_DRIFT_CORRECTION_SECONDS;
+      const canCorrect =
+        !playing
+        || syncReset
+        || now - syncState.lastCorrectionAt >= NATIVE_VIDEO_CORRECTION_INTERVAL_MS;
+      if (shouldCorrect && canCorrect) {
         try {
           video.currentTime = boundedSeconds;
+          syncState.lastCorrectionAt = now;
+          syncState.ignoreProgressUntil = now + 250;
         } catch {
           // Some WebViews reject seeks before metadata is ready; the next sync fixes it.
         }
@@ -1150,17 +1174,71 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
       cancelled = true;
       video.removeEventListener("loadedmetadata", syncVideo);
     };
-  }, [playbackVideoSource, playbackVideoTimeMs, playing, nativeVideoFailed, markNativeVideoFailed]);
+  }, [playbackVideoSource, playbackVideoTimeMs, playbackRun, playing, nativeVideoFailed, markNativeVideoFailed]);
+
+  useEffect(() => {
+    if (!playing || !playbackVideoSource || nativeVideoFailed) {
+      return undefined;
+    }
+    const video = previewVideoRef.current;
+    if (!video) {
+      return undefined;
+    }
+    const key = playbackVideoSource.key;
+    let cancelled = false;
+    let raf = 0;
+    let lastVideoSeconds = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+    let lastProgressAt = performance.now();
+    const startedAt = lastProgressAt;
+    const watch = () => {
+      if (cancelled || nativeVideoFailedKey === key) {
+        return;
+      }
+      const now = performance.now();
+      const currentSeconds = Number.isFinite(video.currentTime) ? video.currentTime : 0;
+      const seekCorrectionActive = now < (nativeVideoSyncRef.current.ignoreProgressUntil || 0);
+      if (
+        !seekCorrectionActive
+        && !video.seeking
+        && Math.abs(currentSeconds - lastVideoSeconds) >= NATIVE_VIDEO_PROGRESS_EPSILON_SECONDS
+      ) {
+        lastVideoSeconds = currentSeconds;
+        lastProgressAt = now;
+      } else if (seekCorrectionActive) {
+        lastVideoSeconds = currentSeconds;
+      }
+      const expectedSeconds = Math.max(0, playbackVideoTimeRef.current / 1000);
+      const playheadStillMoving =
+        playingRef.current && playheadRef.current < Math.max(0, effectiveTotalMsRef.current - 80);
+      const startupGraceElapsed = now - startedAt >= NATIVE_VIDEO_START_GRACE_MS;
+      const stalledLongEnough = now - lastProgressAt >= NATIVE_VIDEO_STALL_MS;
+      const visiblyBehind = expectedSeconds - currentSeconds > NATIVE_VIDEO_DRIFT_CORRECTION_SECONDS;
+      if (startupGraceElapsed && stalledLongEnough && visiblyBehind && playheadStillMoving && !video.ended) {
+        markNativeVideoFailed(key);
+        return;
+      }
+      raf = window.requestAnimationFrame(watch);
+    };
+    raf = window.requestAnimationFrame(watch);
+    return () => {
+      cancelled = true;
+      window.cancelAnimationFrame(raf);
+    };
+  }, [playing, playbackVideoSource?.key, nativeVideoFailed, nativeVideoFailedKey, markNativeVideoFailed]);
 
   // Decode still/scrub preview frames. Live transport playback uses the native
   // video element above, so the backend decoder is not hammered every RAF tick.
   // A SINGLE in-flight decode chases the latest target (coalescing), and a
   // completed decode is never discarded.
   useEffect(() => {
-    // A token bumps on every target change/clear; an in-flight decode whose token
-    // is stale must not paint (it would flash an old frame after a gap or source
-    // switch). Last-writer-wins is enforced per target, not per closure.
-    previewTokenRef.current += 1;
+    // A token bumps on source changes/clears; in-flight decodes for a previous
+    // file must not paint, while same-file frames are allowed to land during
+    // decoded playback so the viewport never waits forever for "latest".
+    const tokenSource = previewFrame?.path || "";
+    if (previewTokenSourceRef.current !== tokenSource) {
+      previewTokenSourceRef.current = tokenSource;
+      previewTokenRef.current += 1;
+    }
     if (!previewFrame) {
       pendingFrameRef.current = null;
       if (!nativeVideoActive) {
@@ -2096,6 +2174,7 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     clipsRef.current = clips;
     playheadRef.current = playheadMs;
     playingRef.current = playing;
+    playbackVideoTimeRef.current = playbackVideoTimeMs;
     effectiveTotalMsRef.current = effectiveTotalMs;
     selectionRef.current = selection;
     activeClipRef.current = activeClipId;

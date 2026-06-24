@@ -54,6 +54,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+cidre = { version = "0.10.1", default-features = false, features = ["async", "blocks", "cf", "cg", "cm", "cv", "dispatch", "ns", "objc", "sc"] }
 coreaudio-rs = "0.12"
 # "exception": AppKit NSExceptions raised inside our main-thread window calls
 # must be caught at the ObjC boundary — one unwinding into the runloop
@@ -72,7 +73,6 @@ windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win3
 [patch.crates-io]
 cidre = { path = "vendor/cidre" }
 portable-pty = { path = "vendor/portable-pty" }
-scap = { path = "vendor/scap" }
 
 # Production build is tuned for runtime energy: thin LTO inlines across crate
 # boundaries (hot paths here are serde_json IPC (de)serialization and rusqlite

@@ -11,6 +11,15 @@ import {
   skillsToSkillUnits,
   skillsToToolEntries,
 } from "./skillsLibrary.js";
+import {
+  applyWorkspaceToolsDocumentDraftEventPayload,
+  clearWorkspaceToolsDocumentDraft,
+  getWorkspaceToolsDocumentDraft,
+  getWorkspaceToolsDocumentDrafts,
+  mergeWorkspaceToolsDocumentDraft,
+  setWorkspaceToolsDocumentDraft,
+  workspaceToolsDocumentDraftIdentityMatches,
+} from "./workspaceToolsStore.js";
 
 test("skills normalize from unit metadata", () => {
   const skills = skillsFromUnits([{
@@ -210,6 +219,69 @@ test("metadata-only same-hash document updates keep local content materialized",
   assert.equal(merged[0].hasContentPayload, true);
 });
 
+test("workspace tools store tracks multiple account document drafts", () => {
+  clearWorkspaceToolsDocumentDraft();
+  try {
+    setWorkspaceToolsDocumentDraft({
+      content: "Feature draft",
+      documentKey: "Features.md",
+      draftPath: "/tmp/drafts/draft-features/Features.md",
+      pathKey: "Features.md",
+      title: "Features",
+    });
+    setWorkspaceToolsDocumentDraft({
+      content: "Blog draft",
+      documentKey: "Blogs.md",
+      draftPath: "/tmp/drafts/draft-blogs/Blogs.md",
+      pathKey: "Blogs.md",
+      title: "Blogs",
+    });
+
+    const drafts = getWorkspaceToolsDocumentDrafts();
+    assert.equal(drafts.length, 2);
+    assert.deepEqual(drafts.map((draft) => draft.title).sort(), ["Blogs", "Features"]);
+    assert.equal(getWorkspaceToolsDocumentDraft().title, "Blogs");
+
+    clearWorkspaceToolsDocumentDraft("Features.md");
+    const remaining = getWorkspaceToolsDocumentDrafts();
+    assert.equal(remaining.length, 1);
+    assert.equal(remaining[0].title, "Blogs");
+  } finally {
+    clearWorkspaceToolsDocumentDraft();
+  }
+});
+
+test("draft watcher payloads create visible drafts without an active editor draft", () => {
+  clearWorkspaceToolsDocumentDraft();
+  try {
+    const applied = applyWorkspaceToolsDocumentDraftEventPayload({
+      kind: "account_document_draft_updated",
+      draft_path: "/tmp/drafts/draft-rust/RustClientFeatures.md",
+      draft_id: "draft-rust",
+      document: {
+        content_md: "Agent wrote this live.",
+        doc_id: "RustClientFeatures",
+        draft: true,
+        draft_id: "draft-rust",
+        draft_path: "/tmp/drafts/draft-rust/RustClientFeatures.md",
+        file_path: "RustClientFeatures.md",
+        is_draft: true,
+        path_key: "RustClientFeatures.md",
+        sync_status: "draft",
+        title: "RustClientFeatures",
+      },
+    });
+
+    assert.equal(applied, true);
+    const drafts = getWorkspaceToolsDocumentDrafts();
+    assert.equal(drafts.length, 1);
+    assert.equal(drafts[0].title, "RustClientFeatures");
+    assert.equal(drafts[0].content, "Agent wrote this live.");
+  } finally {
+    clearWorkspaceToolsDocumentDraft();
+  }
+});
+
 test("metadata-only document updates preserve pending local saves", () => {
   const current = skillsFromUnits([{
     content_hash: "old-hash",
@@ -245,6 +317,86 @@ test("metadata-only document updates preserve pending local saves", () => {
   assert.equal(synced[0].content, "Cloud accepted body.");
   assert.equal(synced[0].pendingPush, false);
   assert.equal(synced[0].syncStatus, "synced");
+});
+
+test("metadata-only document draft updates preserve matching draft content", () => {
+  const current = mergeWorkspaceToolsDocumentDraft(null, {
+    content: "Unsaved editor body.",
+    documentKey: "draft:Docs/Review.md",
+    draftId: "draft-review",
+    draftPath: "/tmp/drafts/draft-review/Review.md",
+    pathKey: "Docs/Review.md",
+    title: "Review",
+  });
+
+  const metadataOnly = mergeWorkspaceToolsDocumentDraft(current, {
+    base_content_hash: "fresh-base",
+    content_hash: "fresh-draft-hash",
+    document_key: "Docs/Review.md",
+    draft_id: "draft-review",
+    draft_path: "/tmp/drafts/draft-review/Review.md",
+    path_key: "Docs/Review.md",
+    title: "Review renamed",
+  });
+
+  assert.equal(metadataOnly.content, "Unsaved editor body.");
+  assert.equal(metadataOnly.title, "Review renamed");
+  assert.equal(metadataOnly.base_content_hash, "fresh-base");
+  assert.equal(workspaceToolsDocumentDraftIdentityMatches(current, metadataOnly), true);
+
+  const hydratedEmpty = mergeWorkspaceToolsDocumentDraft(metadataOnly, {
+    content_md: "",
+    document_key: "draft:Docs/Review.md",
+    draft_id: "draft-review",
+    draft_path: "/tmp/drafts/draft-review/Review.md",
+    title: "Review renamed",
+  });
+
+  assert.equal(hydratedEmpty.content, "");
+});
+
+test("document draft events do not overwrite active drafts but track nonmatching drafts", () => {
+  clearWorkspaceToolsDocumentDraft();
+  try {
+    setWorkspaceToolsDocumentDraft({
+      content: "Keep this active draft.",
+      documentKey: "draft:Docs/Active.md",
+      draftId: "draft-active",
+      draftPath: "/tmp/drafts/draft-active/Active.md",
+      pathKey: "Docs/Active.md",
+      title: "Active",
+    });
+
+    assert.equal(applyWorkspaceToolsDocumentDraftEventPayload({
+      document: {
+        content_md: "Other draft body.",
+        document_key: "draft:Docs/Other.md",
+        draft_id: "draft-other",
+        draft_path: "/tmp/drafts/draft-other/Other.md",
+        title: "Other",
+      },
+    }), true);
+    assert.equal(getWorkspaceToolsDocumentDraft().content, "Keep this active draft.");
+    assert.equal(getWorkspaceToolsDocumentDrafts().length, 2);
+
+    assert.equal(applyWorkspaceToolsDocumentDraftEventPayload({
+      kind: "account_document_draft_prepared",
+      document: {
+        base_content_hash: "new-base",
+        path_key: "Docs/Active.md",
+        draft_id: "draft-active",
+        draft_path: "/tmp/drafts/draft-active/Active.md",
+        title: "Active updated",
+      },
+    }), true);
+
+    const active = getWorkspaceToolsDocumentDraft();
+    assert.equal(active.content, "Keep this active draft.");
+    assert.equal(active.title, "Active updated");
+    assert.equal(active.base_content_hash, "new-base");
+  } finally {
+    clearWorkspaceToolsDocumentDraft();
+  }
 });
 
 test("local save payload projection does not erase materialized document content", () => {

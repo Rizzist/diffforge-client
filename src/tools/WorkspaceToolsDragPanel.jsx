@@ -16,6 +16,11 @@ import {
   subscribeWorkspaceTools,
   workspaceToolsRepoDescriptors,
 } from "./workspaceToolsStore.js";
+import {
+  WORKSPACE_TOOL_DOC_DRAG_KIND,
+  WORKSPACE_TOOL_DOC_DRAG_MIME,
+  WORKSPACE_TOOL_TODO_DRAG_MIME,
+} from "./workspaceToolDragTypes.js";
 
 const FILTERS = [
   { id: "all", label: "All" },
@@ -27,8 +32,6 @@ const FILTERS = [
 
 const FILTER_STORAGE_PREFIX = "diffforge.workspaceTools.filter";
 const SEND_STORAGE_PREFIX = "diffforge.workspaceTools.sendOnDrop";
-export const WORKSPACE_TOOL_TODO_DRAG_MIME = "application/x-diffforge-workspace-tool-todo";
-export const WORKSPACE_TOOL_DOC_DRAG_MIME = "application/x-diffforge-workspace-doc";
 
 const DOC_KIND_LABELS = {
   architecture: "Arch",
@@ -196,7 +199,12 @@ export default function WorkspaceToolsDragPanel({
   const handleDragStart = useCallback((event, entry) => {
     const payload = docDragPayload(entry, sendOnDrop);
     event.dataTransfer.setData(WORKSPACE_TOOL_TODO_DRAG_MIME, JSON.stringify(payload));
-    event.dataTransfer.setData(WORKSPACE_TOOL_DOC_DRAG_MIME, JSON.stringify(payload.document));
+    event.dataTransfer.setData(WORKSPACE_TOOL_DOC_DRAG_MIME, JSON.stringify({
+      ...payload.document,
+      document: payload.document,
+      kind: WORKSPACE_TOOL_DOC_DRAG_KIND,
+      type: payload.type,
+    }));
     event.dataTransfer.setData("text/plain", payload.text);
     event.dataTransfer.effectAllowed = "copy";
   }, [sendOnDrop]);
@@ -249,8 +257,8 @@ export default function WorkspaceToolsDragPanel({
                   onDragStart={(event) => handleDragStart(event, entry)}
                   role="listitem"
                   title={sendOnDrop
-                    ? "Drag onto a terminal to send"
-                    : "Drag onto a terminal to add without sending"}
+                    ? "Drag onto a terminal to send, or onto a graph to attach"
+                    : "Drag onto a terminal, graph, or document node"}
                 >
                   <DocCardContent>
                     <DocCardIcon aria-hidden="true" data-kind={entry.kind}>

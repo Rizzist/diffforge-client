@@ -46,6 +46,7 @@ import {
 import {
   clearWorkspaceToolsDocumentDraft,
   getWorkspaceToolsDocumentDraft,
+  getWorkspaceToolsDocumentDrafts,
   getWorkspaceToolsAccountSkills,
   hasWorkspaceToolsLoaded,
   noteAccountSkillUnits,
@@ -65,6 +66,7 @@ const GLOBAL_MCP_DEFAULTS_WORKSPACE_ID = "account-global-mcp-defaults";
 const SKILL_EDITOR_THEME_STORAGE_KEY = "diffforge.tools.skillEditorTheme";
 const ACCOUNT_DOCS_BACKGROUND_REFRESH_TIMEOUT_MS = 4_500;
 const ACCOUNT_DOCS_FOREGROUND_REFRESH_TIMEOUT_MS = 12_000;
+const ACCOUNT_DOCS_DRAFT_HUMAN_EDIT_GUARD_MS = 2_500;
 const SKILL_DOCUMENT_A4_WIDTH_PX = 794;
 const SKILL_DOCUMENT_A4_HEIGHT_PX = 1123;
 const SKILL_DOCUMENT_CANVAS_INLINE_GUTTER_PX = 48;
@@ -222,9 +224,15 @@ function workspaceContextMenuPosition(event, container, menuWidth = 190, menuHei
   };
 }
 
-function skillDocumentPageStyle(scale) {
+function documentInlineContent(document) {
+  return String(document?.content ?? document?.content_md ?? document?.contentMd ?? document?.body ?? "");
+}
+
+function skillDocumentPageStyle(scale, pageCount = 1) {
   const safeScale = clampSkillDocumentScale(scale);
+  const safePageCount = Math.max(1, Math.min(64, Number.parseInt(pageCount, 10) || 1));
   const pageHeight = SKILL_DOCUMENT_A4_HEIGHT_PX * safeScale;
+  const totalPageHeight = pageHeight * safePageCount;
   const paddingTop = Math.max(20, 52 * safeScale);
   const paddingBottom = Math.max(26, 76 * safeScale);
   const titleFontSize = Math.max(16, 30 * safeScale);
@@ -232,7 +240,7 @@ function skillDocumentPageStyle(scale) {
   const bodyMarginTop = Math.max(10, 24 * safeScale);
   const bodyMinHeight = Math.max(
     180,
-    pageHeight
+    totalPageHeight
       - paddingTop
       - paddingBottom
       - titleFontSize * 1.18
@@ -242,8 +250,10 @@ function skillDocumentPageStyle(scale) {
   );
   return {
     "--skill-document-page-scale": String(safeScale),
+    "--skill-document-page-count": String(safePageCount),
     "--skill-document-page-width": roundedDocumentPx(SKILL_DOCUMENT_A4_WIDTH_PX * safeScale),
     "--skill-document-page-height": roundedDocumentPx(SKILL_DOCUMENT_A4_HEIGHT_PX * safeScale),
+    "--skill-document-total-page-height": roundedDocumentPx(totalPageHeight),
     "--skill-document-page-padding-top": roundedDocumentPx(paddingTop),
     "--skill-document-page-padding-inline": roundedDocumentPx(58 * safeScale, 22),
     "--skill-document-page-padding-bottom": roundedDocumentPx(paddingBottom),
@@ -717,22 +727,26 @@ function documentIsFolderRow(document) {
 
 function documentEditorDraft(document) {
   const option = documentTypeOption(document?.documentKind || document?.source, document?.collection);
-  const content = String(document?.content || "");
+  const content = documentInlineContent(document);
   const title = text(document?.title || document?.name || document?.id);
   const isDraft = Boolean(document?.isDraft || document?.draft || text(document?.syncStatus || document?.sync_status) === "draft");
   return {
-    assetId: text(document?.assetId || document?.asset_id),
-    baseContent: isDraft ? String(document?.baseContent ?? "") : content,
-    baseTitle: isDraft ? text(document?.baseTitle, title) : title,
-    collection: option.collection,
-    content,
-    contentHash: text(document?.contentHash || document?.content_hash || document?.sha256),
+	    assetId: text(document?.assetId || document?.asset_id),
+	    baseContentHash: text(document?.baseContentHash || document?.base_content_hash),
+	    baseContent: isDraft ? String(document?.baseContent ?? "") : content,
+	    baseTitle: isDraft ? text(document?.baseTitle, title) : title,
+	    canonicalLocalPath: text(document?.canonicalLocalPath || document?.canonical_local_path),
+	    collection: option.collection,
+	    content,
+	    contentHash: text(document?.contentHash || document?.content_hash || document?.sha256),
     documentKey: isDraft
       ? text(document?.documentKey || document?.document_key || accountDocumentStorageKey(document))
       : accountDocumentStorageKey(document),
-    documentKind: option.id,
-    draft: isDraft,
-    extension: text(document?.extension, option.extension),
+	    documentKind: option.id,
+	    draft: isDraft,
+	    draftId: text(document?.draftId || document?.draft_id),
+	    draftPath: text(document?.draftPath || document?.draft_path),
+	    extension: text(document?.extension, option.extension),
     fileName: text(document?.fileName || document?.file_name),
     filePath: normalizedDocumentPath(document?.filePath || document?.file_path),
     folderId: normalizedDocumentPath(document?.folderId || document?.folder_id),
@@ -755,7 +769,7 @@ function documentHasMaterializedContent(document) {
 }
 
 function documentHasInlineContent(document) {
-  return String(document?.content ?? document?.content_md ?? document?.contentMd ?? document?.body ?? "").length > 0;
+  return documentInlineContent(document).length > 0;
 }
 
 function documentContentHash(document) {
@@ -803,6 +817,17 @@ function documentDraftKey(document) {
   return `draft:${base}`;
 }
 
+function documentDraftClearKey(document, fallback = "") {
+  if (!document) return text(fallback);
+  return text(document.draftPath || document.draft_path)
+    || text(document.draftId || document.draft_id)
+    || text(document.documentKey || document.document_key)
+    || normalizedDocumentPath(document.pathKey || document.path_key || document.filePath || document.file_path)
+    || accountDocumentStorageKey(document)
+    || text(document.id)
+    || text(fallback);
+}
+
 function editorHasUnsavedDraft(editor, selectedDocument = null) {
   if (!editor) return false;
   if (editor.isDraft === true || editor.draft === true || text(editor.syncStatus || editor.sync_status) === "draft") {
@@ -837,9 +862,63 @@ function editorDraftSnapshot(editor, selectedKey = "", selectedDocument = null) 
   };
 }
 
+function documentDraftMatchesEditor(draft, editor, selectedKey = "") {
+  if (!draft || !editor) return false;
+  const normalizeKey = (value) => {
+    const raw = text(value);
+    if (!raw) return "";
+    if (raw.startsWith("library:")) return normalizedDocumentPath(raw.slice("library:".length)) || raw.slice("library:".length);
+    if (raw.startsWith("draft:")) return normalizedDocumentPath(raw.slice("draft:".length)) || raw.slice("draft:".length);
+    return normalizedDocumentPath(raw) || raw;
+  };
+  const collectKeys = (value, extraSelectedKey = "") => {
+    const keys = new Set();
+    [
+      value?.documentKey,
+      value?.document_key,
+      value?.pathKey,
+      value?.path_key,
+      value?.filePath,
+      value?.file_path,
+      accountDocumentStorageKey(value),
+      value?.id,
+      value?.documentId,
+      value?.document_id,
+      value?.docId,
+      value?.doc_id,
+      value?.selectedKey,
+      value?.selected_key,
+      extraSelectedKey,
+    ].forEach((candidate) => {
+      const key = normalizeKey(candidate);
+      if (key) keys.add(key);
+    });
+    return keys;
+  };
+  const draftPath = text(draft.draftPath || draft.draft_path);
+  const editorDraftPath = text(editor.draftPath || editor.draft_path);
+  if (draftPath && editorDraftPath && draftPath === editorDraftPath) return true;
+  const draftId = text(draft.draftId || draft.draft_id);
+  const editorDraftId = text(editor.draftId || editor.draft_id);
+  if (draftId && editorDraftId && draftId === editorDraftId) return true;
+  const draftKeys = collectKeys(draft);
+  const editorKeys = collectKeys(editor, selectedKey);
+  return Array.from(draftKeys).some((key) => editorKeys.has(key));
+}
+
 function editorWithRemoteDocumentContent(current, document) {
   if (!current || !document) return current;
-  const currentKey = current.documentKey || accountDocumentStorageKey(current);
+  const currentDocumentKey = text(current.documentKey || current.document_key);
+  const currentStorageKey = accountDocumentStorageKey(current);
+  const currentIsDraft = Boolean(
+    current.isDraft === true
+      || current.draft === true
+      || text(current.syncStatus || current.sync_status) === "draft"
+      || currentDocumentKey.startsWith("draft:")
+  );
+  const currentKey = currentIsDraft && currentDocumentKey.startsWith("draft:")
+    ? (currentStorageKey || currentDocumentKey.slice("draft:".length))
+    : (currentDocumentKey || currentStorageKey);
   const documentKey = accountDocumentStorageKey(document);
   if (!currentKey || currentKey !== documentKey) return current;
   const baseContent = String(current.baseContent ?? current.content ?? "");
@@ -864,6 +943,35 @@ function editorWithRemoteDocumentContent(current, document) {
     source: normalizedDocumentKind(document.documentKind || document.document_kind || document.source, current.collection),
     title: titleDirty ? currentTitle : remoteTitle,
   };
+  if (currentIsDraft) {
+    if (
+      current.assetId === nextMetadata.assetId
+      && current.baseTitle === nextMetadata.baseTitle
+      && current.documentKind === nextMetadata.documentKind
+      && current.extension === nextMetadata.extension
+      && current.fileName === nextMetadata.fileName
+      && current.filePath === nextMetadata.filePath
+      && current.folderId === nextMetadata.folderId
+      && current.folderPath === nextMetadata.folderPath
+      && current.localPath === nextMetadata.localPath
+      && current.parentPathKey === nextMetadata.parentPathKey
+      && current.pathKey === nextMetadata.pathKey
+      && current.source === nextMetadata.source
+      && current.title === nextMetadata.title
+      && current.draft === true
+      && current.isDraft === true
+      && current.syncStatus === "draft"
+    ) {
+      return current;
+    }
+    return {
+      ...current,
+      ...nextMetadata,
+      draft: true,
+      isDraft: true,
+      syncStatus: "draft",
+    };
+  }
   if (bodyDirty) {
     if (
       current.assetId === nextMetadata.assetId
@@ -910,7 +1018,7 @@ function editorWithRemoteDocumentContent(current, document) {
       ...nextMetadata,
     };
   }
-  const content = String(document.content || "");
+  const content = documentInlineContent(document);
   if (
     current.content === content
     && current.contentHash === text(document.contentHash || document.content_hash || document.sha256)
@@ -1095,6 +1203,39 @@ function clearLocalPendingSkill(skill) {
   };
 }
 
+function skillHasDraftFile(skill) {
+  return Boolean(text(skill?.draftPath || skill?.draft_path || skill?.draftId || skill?.draft_id));
+}
+
+function clearDraftFileSkill(skill) {
+  if (!skill) return skill;
+  const next = { ...skill };
+  delete next.allowEmptyOverwrite;
+  delete next.allow_empty_overwrite;
+  delete next.baseContentHash;
+  delete next.base_content_hash;
+  delete next.canonicalLocalPath;
+  delete next.canonical_local_path;
+  delete next.draft;
+  delete next.draftId;
+  delete next.draft_id;
+  delete next.draftPath;
+  delete next.draft_path;
+  delete next.isDraft;
+  delete next.is_draft;
+  if (next.syncStatus === "draft") next.syncStatus = "";
+  if (next.sync_status === "draft") next.sync_status = "";
+  return next;
+}
+
+async function discardSkillDraftFile(skill) {
+  if (!skillHasDraftFile(skill)) return false;
+  await invoke("cloud_mcp_discard_account_document_draft", {
+    request: accountDocumentRequestFromSkill(skill, { local_only: true }),
+  }).catch(() => {});
+  return true;
+}
+
 function timeAgo(value) {
   const at = Date.parse(String(value || ""));
   const ms = Number.isFinite(at) ? at : Number(value) * 1000;
@@ -1257,11 +1398,20 @@ export default function ToolsWorkspaceView({
   });
   const skillsHydrationRunRef = useRef(0);
   const hydratingDocKeyRef = useRef("");
+  const documentDraftPersistRef = useRef({ key: "", run: 0 });
+  const invalidateDocumentDraftPersist = useCallback(() => {
+    documentDraftPersistRef.current = {
+      key: "",
+      run: documentDraftPersistRef.current.run + 1,
+    };
+  }, []);
   const [hydratingDocKeys, setHydratingDocKeys] = useState(() => new Set());
   const [skillsQuery, setSkillsQuery] = useState("");
   const [templateQuery, setTemplateQuery] = useState("");
   const [newDocDraft, setNewDocDraft] = useState({ createKind: "document", folderPath: "", name: "", type: "skill" });
   const [documentDraft, setDocumentDraft] = useState(() => getWorkspaceToolsDocumentDraft());
+  const [documentDrafts, setDocumentDrafts] = useState(() => getWorkspaceToolsDocumentDrafts());
+  const [documentDraftApplyTick, setDocumentDraftApplyTick] = useState(0);
   // "library:<collection>:<id>" or "catalog:<id>" — selecting a document shows its contents.
   const [selectedSkillKey, setSelectedSkillKey] = useState(() => text(getWorkspaceToolsDocumentDraft()?.selectedKey));
   // { id: ""|documentId, title, content } while creating/editing.
@@ -1269,6 +1419,23 @@ export default function ToolsWorkspaceView({
     const restoredDraft = getWorkspaceToolsDocumentDraft();
     return restoredDraft ? documentEditorDraft(restoredDraft) : null;
   });
+  const selectedSkill = useMemo(() => {
+    const [scope, ...rest] = selectedSkillKey.split(":");
+    const key = rest.join(":");
+    if (!key) return null;
+    if (scope === "library") {
+      const skill = skillsLibrary.skills.find((entry) => (
+        !documentIsFolderRow(entry)
+        && (accountDocumentStorageKey(entry) === key || entry.id === key)
+      ));
+      return skill ? { ...skill, owned: true } : null;
+    }
+    if (scope === "catalog") {
+      const entry = SKILLS_CATALOG.find((candidate) => candidate.id === key);
+      return entry ? { ...entry, owned: false } : null;
+    }
+    return null;
+  }, [selectedSkillKey, skillsLibrary.skills]);
   const [skillEditorSelection, setSkillEditorSelection] = useState({
     direction: "",
     end: 0,
@@ -1276,6 +1443,7 @@ export default function ToolsWorkspaceView({
     updatedAtMs: 0,
   });
   const [lastDocumentSelection, setLastDocumentSelection] = useState(null);
+  const lastHumanDocumentEditAtRef = useRef(0);
   const documentSelectionClearAtRef = useRef(0);
   const [skillEditorTheme, setSkillEditorTheme] = useState(() => {
     if (typeof window === "undefined") return "dark";
@@ -1854,7 +2022,9 @@ export default function ToolsWorkspaceView({
         });
         if (skillsHydrationRunRef.current === hydrationRunId) {
           const localUnits = accountDocumentUnitsFromPayload(localData);
-          const localSkillsLibrary = { skills: skillsFromUnits(localUnits) };
+          const localSkillsLibrary = {
+            skills: mergeSkillUnits(getWorkspaceToolsAccountSkills(), localUnits),
+          };
           lastLocalLibrary = localSkillsLibrary;
           setSkillsLibrary(localSkillsLibrary);
           noteAccountSkillUnits(localSkillsLibrary.skills);
@@ -1992,15 +2162,96 @@ export default function ToolsWorkspaceView({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  useEffect(() => {
-    return subscribeWorkspaceTools(() => {
-      setSkillsLibrary({ skills: getWorkspaceToolsAccountSkills() });
-      setDocumentDraft(getWorkspaceToolsDocumentDraft());
-      if (hasWorkspaceToolsLoaded()) {
-        setSkillsState((current) => (current === "loading" ? "ready" : current));
-      }
-    });
-  }, []);
+	  useEffect(() => {
+	    return subscribeWorkspaceTools(() => {
+	      setSkillsLibrary({ skills: getWorkspaceToolsAccountSkills() });
+	      setDocumentDraft(getWorkspaceToolsDocumentDraft());
+	      setDocumentDrafts(getWorkspaceToolsDocumentDrafts());
+	      if (hasWorkspaceToolsLoaded()) {
+	        setSkillsState((current) => (current === "loading" ? "ready" : current));
+	      }
+	    });
+	  }, []);
+
+	  const selectedDocumentDraft = useMemo(() => {
+	    const drafts = Array.isArray(documentDrafts) ? documentDrafts : [];
+	    if (!drafts.length) return null;
+	    if (skillEditor) {
+	      return drafts.find((draft) => documentDraftMatchesEditor(draft, skillEditor, selectedSkillKey)) || null;
+	    }
+	    if (selectedSkillKey) {
+	      return drafts.find((draft) => text(draft?.selectedKey || draft?.selected_key) === selectedSkillKey) || null;
+	    }
+	    return documentDraft || drafts.at(-1) || null;
+	  }, [documentDraft, documentDrafts, selectedSkillKey, skillEditor]);
+
+	  useEffect(() => {
+	    if (!selectedDocumentDraft) return;
+	    const draftEditor = documentEditorDraft(selectedDocumentDraft);
+	    const draftContent = String(draftEditor.content || "");
+	    const persistKey = [
+	      draftEditor.documentKey,
+	      draftEditor.pathKey,
+	      draftEditor.title,
+	      documentDraftFingerprint(draftContent),
+	    ].map(text).join("|");
+	    setSkillEditor((current) => {
+	      if (!documentDraftMatchesEditor(selectedDocumentDraft, current, selectedSkillKey)) {
+	        return current;
+	      }
+	      const activeHumanEdit = Date.now() - lastHumanDocumentEditAtRef.current < ACCOUNT_DOCS_DRAFT_HUMAN_EDIT_GUARD_MS;
+	      const preserveHumanContent = activeHumanEdit
+	        && String(current?.content || "") !== draftContent;
+	      const next = {
+	        ...current,
+	        ...draftEditor,
+	        content: preserveHumanContent ? String(current?.content || "") : draftEditor.content,
+	        draftContentGuarded: preserveHumanContent,
+	        documentKey: draftEditor.documentKey || current.documentKey,
+	        selectedKey: draftEditor.selectedKey || current.selectedKey,
+	      };
+	      if (!preserveHumanContent) {
+	        delete next.draftContentGuarded;
+	      }
+      const unchanged = [
+        "baseContent",
+        "baseContentHash",
+        "canonicalLocalPath",
+        "content",
+        "contentHash",
+        "documentKey",
+        "draftContentGuarded",
+        "draftId",
+        "draftPath",
+        "filePath",
+        "localPath",
+        "pathKey",
+        "selectedKey",
+        "syncStatus",
+        "title",
+      ].every((key) => String(current?.[key] ?? "") === String(next?.[key] ?? ""));
+      if (unchanged) return current;
+	      documentDraftPersistRef.current = {
+	        key: persistKey,
+	        run: documentDraftPersistRef.current.run + 1,
+	      };
+	      return next;
+	    });
+	  }, [documentDraftApplyTick, selectedDocumentDraft, selectedSkillKey]);
+
+	  useEffect(() => {
+	    if (!selectedDocumentDraft || !skillEditor) return undefined;
+	    if (!documentDraftMatchesEditor(selectedDocumentDraft, skillEditor, selectedSkillKey)) return undefined;
+	    const draftEditor = documentEditorDraft(selectedDocumentDraft);
+	    if (String(skillEditor.content || "") === String(draftEditor.content || "")) return undefined;
+	    const remainingGuardMs = ACCOUNT_DOCS_DRAFT_HUMAN_EDIT_GUARD_MS
+	      - (Date.now() - lastHumanDocumentEditAtRef.current);
+	    if (remainingGuardMs <= 0) return undefined;
+	    const timer = window.setTimeout(() => {
+	      setDocumentDraftApplyTick((current) => current + 1);
+	    }, remainingGuardMs + 25);
+	    return () => window.clearTimeout(timer);
+	  }, [selectedDocumentDraft, selectedSkillKey, skillEditor]);
 
   useEffect(() => {
     void refreshCliStatuses();
@@ -2185,18 +2436,20 @@ export default function ToolsWorkspaceView({
     setSkillsState("saving");
     setSkillsError("");
     noteAccountSkillUnits(nextLibrary.skills);
-    try {
-      const results = [];
-      for (const skill of removed) {
-        results.push(await invoke("cloud_mcp_delete_account_document", {
-          request: accountDocumentRequestFromSkill(skill),
-        }));
-      }
-      for (const skill of upserts) {
-        results.push(await invoke("cloud_mcp_save_account_document", {
-          request: accountDocumentRequestFromSkill(skill),
-        }));
-      }
+	    try {
+	      const results = [];
+		      for (const skill of removed) {
+		        await discardSkillDraftFile(skill);
+		        results.push(await invoke("cloud_mcp_delete_account_document", {
+		          request: accountDocumentRequestFromSkill(skill),
+		        }));
+		      }
+		      for (const skill of upserts) {
+		        const hasDraftFile = skillHasDraftFile(skill);
+		        results.push(await invoke(hasDraftFile ? "cloud_mcp_save_account_document_draft" : "cloud_mcp_save_account_document", {
+		          request: accountDocumentRequestFromSkill(skill),
+		        }));
+	      }
       const result = [...results].reverse().find((entry) => entry) || {};
       const failed = results.find((entry) => text(entry?.cloud_error || entry?.cloudError));
       setSkillsRevision(
@@ -2217,16 +2470,17 @@ export default function ToolsWorkspaceView({
           return [accountDocumentStorageKey(document) || text(document.id || document.document_id || document.doc_id), entry];
         })
         .filter(([key]) => key));
-      const syncedLibrary = {
-        skills: nextLibrary.skills.map((skill) => {
-          const key = accountDocumentStorageKey(skill) || text(skill?.id);
-          const result = savedResultsByKey.get(key);
-          if (result && result.cloud_synced !== true && result.cloudSynced !== true) {
-            return withLocalPendingSkill(skill, text(result.document?.local_saved_at || result.document?.localSavedAt || skill.localSavedAt));
-          }
-          return clearLocalPendingSkill(skill);
-        }),
-      };
+	      const syncedLibrary = {
+	        skills: nextLibrary.skills.map((skill) => {
+	          const key = accountDocumentStorageKey(skill) || text(skill?.id);
+	          const result = savedResultsByKey.get(key);
+	          const savedSkill = result ? clearDraftFileSkill(skill) : skill;
+	          if (result && result.cloud_synced !== true && result.cloudSynced !== true) {
+	            return withLocalPendingSkill(savedSkill, text(result.document?.local_saved_at || result.document?.localSavedAt || skill.localSavedAt));
+	          }
+	          return clearLocalPendingSkill(savedSkill);
+	        }),
+	      };
       setSkillsLibrary(syncedLibrary);
       noteAccountSkillUnits(syncedLibrary.skills);
       setSkillsState("ready");
@@ -2252,24 +2506,34 @@ export default function ToolsWorkspaceView({
     setSkillsState("savingLocal");
     setSkillsError("");
     noteAccountSkillUnits(nextLibrary.skills);
-    try {
-      const results = [];
-      for (const skill of nextLibrary.skills.filter((entry) => pendingIds.has(accountDocumentStorageKey(entry) || entry.id) && !documentIsFolderRow(entry))) {
-        results.push(await invoke("cloud_mcp_save_account_document", {
-          request: accountDocumentRequestFromSkill(skill, { local_only: true }),
-        }));
-      }
+	    try {
+		      const results = [];
+		      for (const skill of nextLibrary.skills.filter((entry) => pendingIds.has(accountDocumentStorageKey(entry) || entry.id) && !documentIsFolderRow(entry))) {
+		        const hasDraftFile = skillHasDraftFile(skill);
+		        results.push(await invoke(hasDraftFile ? "cloud_mcp_save_account_document_draft" : "cloud_mcp_save_account_document", {
+		          request: accountDocumentRequestFromSkill(skill, { local_only: true }),
+		        }));
+	      }
       const result = [...results].reverse().find((entry) => entry) || {};
       setSkillsRevision(
         Number.isFinite(Number(result?.revision)) ? Number(result.revision) : skillsRevision,
       );
-      setSkillsMeta((current) => ({
-        ...current,
-        updatedAt: text(result?.local_saved_at || result?.localSavedAt || current.updatedAt),
-        offline: false,
-      }));
-      setSkillsState("ready");
-      return true;
+	      setSkillsMeta((current) => ({
+	        ...current,
+	        updatedAt: text(result?.local_saved_at || result?.localSavedAt || current.updatedAt),
+	        offline: false,
+	      }));
+	      const syncedLibrary = {
+	        skills: nextLibrary.skills.map((skill) => {
+	          const key = accountDocumentStorageKey(skill) || skill.id;
+	          if (!pendingIds.has(key) || documentIsFolderRow(skill)) return skill;
+	          return withLocalPendingSkill(clearDraftFileSkill(skill), text(result?.local_saved_at || result?.localSavedAt || localSavedAt));
+	        }),
+	      };
+	      setSkillsLibrary(syncedLibrary);
+	      noteAccountSkillUnits(syncedLibrary.skills);
+	      setSkillsState("ready");
+	      return true;
     } catch (error) {
       setSkillsError(getErrorMessage(error, "Unable to save doc locally."));
       setSkillsState("ready");
@@ -2317,31 +2581,49 @@ export default function ToolsWorkspaceView({
     setSkillEditor(documentEditorDraft(skill));
   }, [persistSkillsLibrary, skillsLibrary.skills]);
 
-  const removeSkill = useCallback((skillKeyOrId) => {
-    if (skillEditor?.isDraft || skillEditor?.draft || text(skillEditor?.syncStatus) === "draft") {
-      const draftKey = text(skillEditor.documentKey || documentDraftKey(skillEditor));
-      if (!skillKeyOrId || skillKeyOrId === draftKey || String(skillKeyOrId).startsWith("draft:")) {
-        clearWorkspaceToolsDocumentDraft(draftKey);
-        setSelectedSkillKey("");
-        setSkillEditor(null);
-        return;
-      }
+	  const removeDocument = useCallback((documentKeyOrId) => {
+	    if (skillEditor?.isDraft || skillEditor?.draft || text(skillEditor?.syncStatus) === "draft") {
+	      const requestedKey = text(documentKeyOrId);
+	      const draftKey = documentDraftClearKey(skillEditor);
+	      const editorKeys = [
+	        draftKey,
+	        text(skillEditor.documentKey || skillEditor.document_key),
+	        documentDraftKey(skillEditor),
+	        accountDocumentStorageKey(skillEditor),
+	        normalizedDocumentPath(skillEditor.pathKey || skillEditor.path_key || skillEditor.filePath || skillEditor.file_path),
+	        text(skillEditor.id),
+	      ].filter(Boolean);
+	      if (
+	        !requestedKey
+	        || requestedKey.startsWith("draft:")
+	        || editorKeys.includes(requestedKey)
+	        || editorKeys.includes(normalizedDocumentPath(requestedKey))
+	      ) {
+	        invalidateDocumentDraftPersist();
+	        void discardSkillDraftFile(skillEditor);
+	        clearWorkspaceToolsDocumentDraft(draftKey);
+	        setSelectedSkillKey("");
+	        setSkillEditor(null);
+	        return;
+	      }
     }
-    const skill = skillsLibrary.skills.find((entry) => (
+    const document = skillsLibrary.skills.find((entry) => (
       !documentIsFolderRow(entry)
-      && (accountDocumentStorageKey(entry) === skillKeyOrId || entry.id === skillKeyOrId)
+      && (accountDocumentStorageKey(entry) === documentKeyOrId || entry.id === documentKeyOrId)
     ));
-    if (!skill) return;
-    const skillKey = accountDocumentStorageKey(skill) || skill.id;
-    if (typeof window !== "undefined" && !window.confirm(`Remove the doc "${skill.title}"?`)) {
-      return;
-    }
-    void persistSkillsLibrary(skillsLibrary.skills.filter((entry) => (
-      (accountDocumentStorageKey(entry) || entry.id) !== skillKey
-    )));
-    setSelectedSkillKey("");
-    setSkillEditor(null);
-  }, [persistSkillsLibrary, skillEditor, skillsLibrary.skills]);
+    if (!document) return;
+    const documentKey = accountDocumentStorageKey(document) || document.id;
+	    if (typeof window !== "undefined" && !window.confirm(`Remove the doc "${document.title}"?`)) {
+	      return;
+	    }
+	    invalidateDocumentDraftPersist();
+	    void discardSkillDraftFile(document);
+	    void persistSkillsLibrary(skillsLibrary.skills.filter((entry) => (
+	      (accountDocumentStorageKey(entry) || entry.id) !== documentKey
+	    )));
+	    setSelectedSkillKey("");
+	    setSkillEditor(null);
+	  }, [invalidateDocumentDraftPersist, persistSkillsLibrary, skillEditor, skillsLibrary.skills]);
 
   const closeDocsContextMenu = useCallback(() => {
     setDocsContextMenu(null);
@@ -2419,20 +2701,28 @@ export default function ToolsWorkspaceView({
     return true;
   }, [persistSkillsLibrary, skillsLibrary.skills]);
 
-  const deleteContextTarget = useCallback((target = docsContextMenu?.target || {}) => {
-    closeDocsContextMenu();
-    const targetKind = text(target.kind);
-    if (targetKind === "document") {
-      if (target.isDraft || target.draft || text(target.syncStatus || target.sync_status) === "draft") {
-        clearWorkspaceToolsDocumentDraft(target.storageKey || target.documentKey || target.document_key);
-        setDocumentDraft(null);
-        if ((skillEditor?.documentKey || documentDraftKey(skillEditor)) === target.storageKey) {
+	  const deleteContextTarget = useCallback((target = docsContextMenu?.target || {}) => {
+	    closeDocsContextMenu();
+	    const targetKind = text(target.kind);
+	    if (targetKind === "document") {
+	      if (target.isDraft || target.draft || text(target.syncStatus || target.sync_status) === "draft") {
+		        const targetDraft = target.draftDocument || target.draft_document || target;
+		        const targetClearKey = documentDraftClearKey(targetDraft, target.storageKey || target.documentKey || target.document_key);
+		        invalidateDocumentDraftPersist();
+		        void discardSkillDraftFile(targetDraft);
+		        clearWorkspaceToolsDocumentDraft(targetClearKey);
+		        setDocumentDraft(getWorkspaceToolsDocumentDraft());
+		        setDocumentDrafts(getWorkspaceToolsDocumentDrafts());
+		        if (
+		          (skillEditor?.documentKey || documentDraftKey(skillEditor)) === target.storageKey
+		          || documentDraftMatchesEditor(targetDraft, skillEditor, selectedSkillKey)
+		        ) {
           setSkillEditor(null);
           setSelectedSkillKey("");
         }
         return;
       }
-      removeSkill(target.storageKey);
+      removeDocument(target.storageKey);
       return;
     }
     if (targetKind !== "folder") return;
@@ -2465,11 +2755,16 @@ export default function ToolsWorkspaceView({
       setSelectedSkillKey("");
       setSkillEditor(null);
     }
-    const draftPath = normalizedDocumentPath(documentDraft?.pathKey || documentDraft?.path_key || documentDraft?.filePath || documentDraft?.file_path);
-    if (draftPath && documentPathIsSameOrChild(draftPath, folderPath)) {
-      clearWorkspaceToolsDocumentDraft(documentDraft.documentKey || documentDraftKey(documentDraft));
-      setDocumentDraft(null);
-    }
+		    documentDrafts.forEach((draft) => {
+		      const draftPath = normalizedDocumentPath(draft?.pathKey || draft?.path_key || draft?.filePath || draft?.file_path);
+		      if (draftPath && documentPathIsSameOrChild(draftPath, folderPath)) {
+		        invalidateDocumentDraftPersist();
+		        void discardSkillDraftFile(draft);
+		        clearWorkspaceToolsDocumentDraft(documentDraftClearKey(draft));
+		      }
+		    });
+		    setDocumentDraft(getWorkspaceToolsDocumentDraft());
+		    setDocumentDrafts(getWorkspaceToolsDocumentDrafts());
     setNewDocDraft((current) => ({
       ...current,
       folderPath: documentPathIsSameOrChild(current.folderPath, folderPath) ? "" : current.folderPath,
@@ -2478,9 +2773,10 @@ export default function ToolsWorkspaceView({
   }, [
     closeDocsContextMenu,
     docsContextMenu,
-    documentDraft,
-    persistSkillsLibrary,
-    removeSkill,
+	    documentDrafts,
+	    invalidateDocumentDraftPersist,
+	    persistSkillsLibrary,
+    removeDocument,
     selectedSkillKey,
     skillEditor,
     skillsLibrary.skills,
@@ -2509,10 +2805,15 @@ export default function ToolsWorkspaceView({
     const activeEditor = editorOverride || skillEditor;
     if (!activeEditor || !text(activeEditor.title)) return false;
     const typeOption = documentTypeOption(activeEditor.documentKind || activeEditor.source, activeEditor.collection);
+    const saveMode = text(mode, "push").toLowerCase();
+    const draftMode = saveMode === "draft";
     const editorCollection = typeOption.collection;
     const editorKind = text(activeEditor.documentKind, typeOption.id);
     const editorExtension = text(activeEditor.extension, typeOption.extension);
     const displayTitle = text(activeEditor.title);
+    const editorContent = String(activeEditor.content || "");
+    const allowEditorEmptyOverwrite = editorContent.length === 0
+      && String(activeEditor.baseContent ?? "").length > 0;
     const existing = activeEditor.id
       ? skillsLibrary.skills.find((entry) => (
         !documentIsFolderRow(entry)
@@ -2538,9 +2839,14 @@ export default function ToolsWorkspaceView({
       nextSkills = skillsLibrary.skills.map((entry) => ((accountDocumentStorageKey(entry) || entry.id) === existingKey
         ? {
           ...entry,
-          content: String(activeEditor.content || ""),
+          allowEmptyOverwrite: allowEditorEmptyOverwrite,
+          baseContentHash: text(activeEditor.baseContentHash || entry.baseContentHash),
+          canonicalLocalPath: text(activeEditor.canonicalLocalPath || entry.canonicalLocalPath),
+          content: editorContent,
           documentKind: editorKind,
-          extension: editorExtension,
+          draftId: text(activeEditor.draftId || entry.draftId),
+          draftPath: text(activeEditor.draftPath || entry.draftPath),
+	          extension: editorExtension,
           collection: editorCollection,
           ...savedPathMeta,
           rowType: "document",
@@ -2558,8 +2864,13 @@ export default function ToolsWorkspaceView({
       });
       nextSkills = [...skillsLibrary.skills, {
         collection: editorCollection,
-        content: String(activeEditor.content || ""),
+        allowEmptyOverwrite: allowEditorEmptyOverwrite,
+        content: editorContent,
+        baseContentHash: text(activeEditor.baseContentHash),
+        canonicalLocalPath: text(activeEditor.canonicalLocalPath),
         documentKind: editorKind,
+        draftId: text(activeEditor.draftId),
+        draftPath: text(activeEditor.draftPath),
         extension: editorExtension,
         ...savedPathMeta,
         icon: "",
@@ -2573,24 +2884,85 @@ export default function ToolsWorkspaceView({
       }];
     }
     const savedKey = accountDocumentStorageKey({ id: savedId, ...savedPathMeta, rowType: "document" }) || savedId;
-    const activeDraftKey = activeEditor.isDraft || activeEditor.draft || text(activeEditor.syncStatus) === "draft"
-      ? text(activeEditor.documentKey || documentDraftKey(activeEditor))
-      : "";
-    const savePromise = mode === "local"
-      ? saveSkillsLibraryLocal(nextSkills, [savedKey])
-      : persistSkillsLibrary(nextSkills, [savedKey]);
-    const savedSkill = nextSkills.find((entry) => (accountDocumentStorageKey(entry) || entry.id) === savedKey);
+    let nextSkillsForSave = nextSkills;
+    const pendingSavedSkill = nextSkills.find((entry) => (accountDocumentStorageKey(entry) || entry.id) === savedKey);
+    if (pendingSavedSkill && !documentIsFolderRow(pendingSavedSkill)) {
+      try {
+        const prepareRequest = accountDocumentRequestFromSkill({
+          ...pendingSavedSkill,
+          baseContentHash: pendingSavedSkill.baseContentHash || activeEditor.baseContentHash || selectedSkill?.contentHash || selectedSkill?.sha256 || "",
+          content: editorContent,
+        }, { local_only: true });
+        prepareRequest.reuse_existing = false;
+        const draftResult = await invoke("cloud_mcp_prepare_account_document_draft", { request: prepareRequest });
+        const preparedDocument = draftResult?.document || {};
+        const draftFields = {
+          baseContentHash: text(draftResult?.base_content_hash || preparedDocument.base_content_hash || pendingSavedSkill.baseContentHash),
+          canonicalLocalPath: text(draftResult?.canonical_local_path || preparedDocument.canonical_local_path || pendingSavedSkill.canonicalLocalPath),
+          draftId: text(draftResult?.draft_id || preparedDocument.draft_id || pendingSavedSkill.draftId),
+          draftPath: text(draftResult?.draft_path || preparedDocument.draft_path || pendingSavedSkill.draftPath),
+        };
+        nextSkillsForSave = nextSkills.map((entry) => ((accountDocumentStorageKey(entry) || entry.id) === savedKey
+          ? { ...entry, ...draftFields }
+          : entry));
+        if (draftMode) {
+          const selectedKey = `library:${savedKey}`;
+          const draftSnapshot = editorDraftSnapshot({
+            ...pendingSavedSkill,
+            ...draftFields,
+            baseContent: String(activeEditor.baseContent ?? pendingSavedSkill.baseContent ?? ""),
+            baseTitle: text(activeEditor.baseTitle || pendingSavedSkill.baseTitle || selectedSkill?.title || displayTitle),
+            content: editorContent,
+            localPath: text(preparedDocument.local_path || activeEditor.localPath),
+          }, selectedKey, selectedSkill);
+          const nextDraft = {
+            ...draftSnapshot,
+            ...draftFields,
+            content: editorContent,
+            contentHash: text(draftResult?.content_hash || preparedDocument.content_hash || draftSnapshot.contentHash),
+            localPath: text(preparedDocument.local_path || draftSnapshot.localPath),
+          };
+	          setWorkspaceToolsDocumentDraft(nextDraft);
+	          setDocumentDraft(nextDraft);
+	          setDocumentDrafts(getWorkspaceToolsDocumentDrafts());
+	          setSelectedSkillKey(selectedKey);
+          setSkillEditor(documentEditorDraft(nextDraft));
+          setSkillsError("");
+          return true;
+        }
+      } catch (error) {
+        setSkillsError(getErrorMessage(error, "Unable to prepare document draft before save."));
+        return false;
+      }
+    }
+    const savePromise = saveMode === "local"
+      ? saveSkillsLibraryLocal(nextSkillsForSave, [savedKey])
+      : persistSkillsLibrary(nextSkillsForSave, [savedKey]);
+    const savedSkill = nextSkillsForSave.find((entry) => (accountDocumentStorageKey(entry) || entry.id) === savedKey);
     setSelectedSkillKey(`library:${savedKey}`);
     setSkillEditor({
       ...documentEditorDraft(savedSkill),
       documentKey: savedKey,
     });
     const ok = await savePromise;
-    if (ok && activeDraftKey) {
-      clearWorkspaceToolsDocumentDraft(activeDraftKey);
-    }
+    if (ok) {
+      const cleanedSkill = clearDraftFileSkill({
+        ...(savedSkill || activeEditor),
+        content: editorContent,
+      });
+      setSkillEditor({
+        ...documentEditorDraft(cleanedSkill),
+        baseContent: editorContent,
+        content: editorContent,
+        documentKey: savedKey,
+	      });
+	      invalidateDocumentDraftPersist();
+	      clearWorkspaceToolsDocumentDraft(documentDraftClearKey(activeEditor, savedKey));
+	      setDocumentDraft(getWorkspaceToolsDocumentDraft());
+	      setDocumentDrafts(getWorkspaceToolsDocumentDrafts());
+	    }
     return ok;
-  }, [persistSkillsLibrary, saveSkillsLibraryLocal, skillEditor, skillsLibrary.skills]);
+  }, [invalidateDocumentDraftPersist, persistSkillsLibrary, saveSkillsLibraryLocal, selectedSkill, skillEditor, skillsLibrary.skills]);
 
   const runCliAction = useCallback(async (provider, action) => {
     const key = `${provider}:${action}`;
@@ -2765,18 +3137,11 @@ export default function ToolsWorkspaceView({
         node.searchText = `${node.displayName} ${node.fileName} ${node.pathKey} ${text(node.localPath)}`.toLowerCase();
       }
       return node;
-    };
-    const docs = [];
-    const draftKey = documentDraft ? text(documentDraft.documentKey || documentDraft.document_key || documentDraftKey(documentDraft)) : "";
-    const draftSelectedKey = text(documentDraft?.selectedKey || documentDraft?.selected_key);
-    const draftStorageKey = documentDraft ? accountDocumentStorageKey(documentDraft) : "";
-    const draftTargetKey = draftSelectedKey.startsWith("library:")
-      ? draftSelectedKey.slice("library:".length)
-      : draftStorageKey && !draftStorageKey.startsWith("draft:")
-        ? draftStorageKey
-        : "";
-    let draftMergedIntoSavedRow = false;
-    (skillsLibrary.skills || []).forEach((skill) => {
+	    };
+	    const docs = [];
+	    const allDocumentDrafts = Array.isArray(documentDrafts) ? documentDrafts : [];
+	    const mergedDraftKeys = new Set();
+	    (skillsLibrary.skills || []).forEach((skill) => {
       if (documentIsFolderRow(skill)) {
         const pathKey = normalizedDocumentPath(skill.pathKey || skill.path_key || skill.folderPath || skill.folder_path || skill.id);
         const folder = ensureFolder(pathKey, skill);
@@ -2787,13 +3152,18 @@ export default function ToolsWorkspaceView({
         }
         return;
       }
-      const key = accountDocumentStorageKey(skill) || skill.id;
-      if (!key) return;
-      const draftForSavedRow = draftTargetKey && draftTargetKey === key ? documentDraft : null;
-      if (draftForSavedRow) {
-        draftMergedIntoSavedRow = true;
-      }
-      const fileName = documentFileName(skill);
+	      const key = accountDocumentStorageKey(skill) || skill.id;
+	      if (!key) return;
+	      const draftForSavedRow = allDocumentDrafts.find((draft) => (
+	        documentDraftMatchesEditor(draft, skill, `library:${key}`)
+	      )) || null;
+	      const draftKey = draftForSavedRow
+	        ? text(draftForSavedRow.documentKey || draftForSavedRow.document_key || documentDraftKey(draftForSavedRow))
+	        : "";
+	      if (draftForSavedRow) {
+	        mergedDraftKeys.add(draftKey || accountDocumentStorageKey(draftForSavedRow) || text(draftForSavedRow.id));
+	      }
+	      const fileName = documentFileName(skill);
       const displayName = text(skill.title, fileName);
       const pathKey = normalizedDocumentPath(skill.pathKey || skill.path_key || skill.filePath || skill.file_path || key);
       const parentPathKey = normalizedDocumentPath(skill.parentPathKey || skill.parent_path_key || skill.folderPath || skill.folder_path || pathKey.split("/").slice(0, -1).join("/"));
@@ -2805,9 +3175,9 @@ export default function ToolsWorkspaceView({
         fileName,
         filePath: normalizedDocumentPath(skill.filePath || skill.file_path || pathKey),
         folderPath: parentPathKey,
-        draft: Boolean(draftForSavedRow),
-        draftDocument: draftForSavedRow || null,
-        draftKey: draftForSavedRow ? draftKey : "",
+	        draft: Boolean(draftForSavedRow),
+	        draftDocument: draftForSavedRow || null,
+	        draftKey: draftForSavedRow ? draftKey : "",
         draftSelectedKey: draftForSavedRow ? `library:${key}` : "",
         hydrating: documentNeedsHydration(skill)
           && (hydratingDocKeys.has(key) || hydrationPassActive),
@@ -2837,45 +3207,48 @@ export default function ToolsWorkspaceView({
         || normalizedDocumentPath(draftForSavedRow?.pathKey || draftForSavedRow?.path_key || draftForSavedRow?.filePath || draftForSavedRow?.file_path).toLowerCase().includes(query)
         || text(row.localPath).toLowerCase().includes(query)
       );
-      if (matches) docs.push(row);
-    });
-    if (documentDraft && !draftMergedIntoSavedRow) {
-      const fileName = documentFileName(documentDraft);
-      const displayName = text(documentDraft.title, fileName);
-      const pathKey = normalizedDocumentPath(documentDraft.pathKey || documentDraft.path_key || documentDraft.filePath || documentDraft.file_path || fileName);
-      const parentPathKey = normalizedDocumentPath(documentDraft.parentPathKey || documentDraft.parent_path_key || documentDraft.folderPath || documentDraft.folder_path || pathKey.split("/").slice(0, -1).join("/"));
-      ensureFolder(parentPathKey);
-      const row = {
-        ...documentDraft,
-        depth: parentPathKey ? parentPathKey.split("/").filter(Boolean).length + 1 : 1,
-        displayName,
-        draft: true,
-        fileName,
-        filePath: normalizedDocumentPath(documentDraft.filePath || documentDraft.file_path || pathKey),
-        folderPath: parentPathKey,
-        hydrating: false,
-        isDraft: true,
-        key: `draft:${draftKey}`,
-        parentPathKey,
-        pathKey,
-        preview: documentPreviewLine(documentDraft),
-        rowType: "document",
-        selectedKey: text(documentDraft.selectedKey),
-        storageKey: draftKey,
-        syncStatus: "draft",
-        typeLabel: `${documentTypeLabel(documentDraft.documentKind, documentDraft.collection)} draft`,
-      };
-      const matches = (
-        !query
+	      if (matches) docs.push(row);
+	    });
+	    allDocumentDrafts.forEach((draft) => {
+	      const draftKey = text(draft.documentKey || draft.document_key || documentDraftKey(draft));
+	      const storageKey = accountDocumentStorageKey(draft) || text(draft.id);
+	      if (mergedDraftKeys.has(draftKey) || mergedDraftKeys.has(storageKey)) return;
+	      const fileName = documentFileName(draft);
+	      const displayName = text(draft.title, fileName);
+	      const pathKey = normalizedDocumentPath(draft.pathKey || draft.path_key || draft.filePath || draft.file_path || fileName);
+	      const parentPathKey = normalizedDocumentPath(draft.parentPathKey || draft.parent_path_key || draft.folderPath || draft.folder_path || pathKey.split("/").slice(0, -1).join("/"));
+	      ensureFolder(parentPathKey);
+	      const row = {
+	        ...draft,
+	        depth: parentPathKey ? parentPathKey.split("/").filter(Boolean).length + 1 : 1,
+	        displayName,
+	        draft: true,
+	        fileName,
+	        filePath: normalizedDocumentPath(draft.filePath || draft.file_path || pathKey),
+	        folderPath: parentPathKey,
+	        hydrating: false,
+	        isDraft: true,
+	        key: `draft:${draftKey}`,
+	        parentPathKey,
+	        pathKey,
+	        preview: documentPreviewLine(draft),
+	        rowType: "document",
+	        selectedKey: text(draft.selectedKey),
+	        storageKey: draftKey,
+	        syncStatus: "draft",
+	        typeLabel: `${documentTypeLabel(draft.documentKind, draft.collection)} draft`,
+	      };
+	      const matches = (
+	        !query
         || row.displayName.toLowerCase().includes(query)
         || row.fileName.toLowerCase().includes(query)
         || row.title.toLowerCase().includes(query)
         || row.pathKey.toLowerCase().includes(query)
         || row.preview.toLowerCase().includes(query)
         || row.typeLabel.toLowerCase().includes(query)
-      );
-      if (matches) docs.push(row);
-    }
+	      );
+	      if (matches) docs.push(row);
+	    });
     docs.forEach((row) => {
       let current = row.parentPathKey;
       while (current) {
@@ -2905,7 +3278,7 @@ export default function ToolsWorkspaceView({
     };
     pushFolder("");
     return { files: docs, rows };
-  }, [documentDraft, hydratingDocKeys, skillsHydration.state, skillsHydration.visible, skillsLibrary.skills, skillsQuery]);
+	  }, [documentDrafts, hydratingDocKeys, skillsHydration.state, skillsHydration.visible, skillsLibrary.skills, skillsQuery]);
   const docFileRows = docsExplorerModel.files;
   const docsExplorerRows = docsExplorerModel.rows;
 
@@ -2983,29 +3356,71 @@ export default function ToolsWorkspaceView({
     setNewDocDraft((current) => ({ ...current, createKind: "document", name: "" }));
   }, [createDocumentFolder, newDocDraft, skillsLibrary.skills]);
 
-  const selectedSkill = useMemo(() => {
-    const [scope, ...rest] = selectedSkillKey.split(":");
-    const key = rest.join(":");
-    if (!key) return null;
-    if (scope === "library") {
-      const skill = skillsLibrary.skills.find((entry) => (
-        !documentIsFolderRow(entry)
-        && (accountDocumentStorageKey(entry) === key || entry.id === key)
-      ));
-      return skill ? { ...skill, owned: true } : null;
-    }
-    if (scope === "catalog") {
-      const entry = SKILLS_CATALOG.find((candidate) => candidate.id === key);
-      return entry ? { ...entry, owned: false } : null;
-    }
-    return null;
-  }, [selectedSkillKey, skillsLibrary.skills]);
-
-  useEffect(() => {
-    if (!skillEditor) return;
-    if (!editorHasUnsavedDraft(skillEditor, selectedSkill)) return;
-    setWorkspaceToolsDocumentDraft(editorDraftSnapshot(skillEditor, selectedSkillKey, selectedSkill));
-  }, [selectedSkill, selectedSkillKey, skillEditor]);
+	  useEffect(() => {
+	    if (!skillEditor) return undefined;
+	    if (!editorHasUnsavedDraft(skillEditor, selectedSkill)) return undefined;
+	    if (skillEditor.draftContentGuarded === true) return undefined;
+	    const snapshot = editorDraftSnapshot(skillEditor, selectedSkillKey, selectedSkill);
+	    const content = String(snapshot?.content || "");
+	    const persistKey = [
+	      snapshot?.documentKey,
+	      snapshot?.pathKey,
+	      snapshot?.title,
+	      documentDraftFingerprint(content),
+	    ].map(text).join("|");
+	    setWorkspaceToolsDocumentDraft(snapshot);
+	    if (!persistKey || documentDraftPersistRef.current.key === persistKey) {
+	      return undefined;
+	    }
+	    const run = documentDraftPersistRef.current.run + 1;
+	    documentDraftPersistRef.current = { key: persistKey, run };
+	    const timer = window.setTimeout(async () => {
+	      try {
+	        const request = accountDocumentRequestFromSkill({
+	          ...snapshot,
+	          baseContentHash: snapshot.baseContentHash || selectedSkill?.contentHash || selectedSkill?.sha256 || "",
+	          content,
+	        }, { local_only: true });
+	        request.reuse_existing = false;
+	        const result = await invoke("cloud_mcp_prepare_account_document_draft", { request });
+	        if (documentDraftPersistRef.current.run !== run) return;
+	        const preparedDocument = result?.document || {};
+	        const nextDraft = {
+	          ...snapshot,
+	          baseContentHash: text(result?.base_content_hash || preparedDocument.base_content_hash || snapshot.baseContentHash),
+	          canonicalLocalPath: text(result?.canonical_local_path || preparedDocument.canonical_local_path || snapshot.canonicalLocalPath),
+	          content,
+	          draftId: text(result?.draft_id || preparedDocument.draft_id || snapshot.draftId),
+	          draftPath: text(result?.draft_path || preparedDocument.draft_path || snapshot.draftPath),
+	          localPath: text(preparedDocument.local_path || snapshot.localPath),
+	        };
+	        setWorkspaceToolsDocumentDraft(nextDraft);
+	        setSkillEditor((current) => {
+	          if (!current) return current;
+	          const currentKey = current.documentKey || accountDocumentStorageKey(current) || current.id || "";
+	          const snapshotKey = snapshot.documentKey || accountDocumentStorageKey(snapshot) || snapshot.id || "";
+	          if (currentKey !== snapshotKey) return current;
+	          if (String(current.content || "") !== content) return current;
+	          return {
+	            ...current,
+	            baseContentHash: nextDraft.baseContentHash,
+	            canonicalLocalPath: nextDraft.canonicalLocalPath,
+	            draftId: nextDraft.draftId,
+	            draftPath: nextDraft.draftPath,
+	            localPath: nextDraft.localPath,
+	          };
+	        });
+	      } catch (error) {
+	        if (documentDraftPersistRef.current.run === run) {
+	          documentDraftPersistRef.current = { key: "", run };
+	          setSkillsError(getErrorMessage(error, "Unable to prepare document draft file."));
+	        }
+	      }
+	    }, 350);
+	    return () => {
+	      window.clearTimeout(timer);
+	    };
+	  }, [selectedSkill, selectedSkillKey, skillEditor]);
 
   useEffect(() => {
     if (!selectedSkill?.owned || !documentHasMaterializedContent(selectedSkill)) return;
@@ -3105,37 +3520,40 @@ export default function ToolsWorkspaceView({
     const candidateKeys = new Set([
       skillEditorDocumentKey,
       selectedLibraryKey,
-      text(skillEditor?.selectedKey || skillEditor?.selected_key).startsWith("library:")
-        ? text(skillEditor?.selectedKey || skillEditor?.selected_key).slice("library:".length)
-        : "",
-      text(documentDraft?.selectedKey || documentDraft?.selected_key).startsWith("library:")
-        ? text(documentDraft?.selectedKey || documentDraft?.selected_key).slice("library:".length)
-        : "",
-    ].filter(Boolean));
+	      text(skillEditor?.selectedKey || skillEditor?.selected_key).startsWith("library:")
+	        ? text(skillEditor?.selectedKey || skillEditor?.selected_key).slice("library:".length)
+	        : "",
+	      text(selectedDocumentDraft?.selectedKey || selectedDocumentDraft?.selected_key).startsWith("library:")
+	        ? text(selectedDocumentDraft?.selectedKey || selectedDocumentDraft?.selected_key).slice("library:".length)
+	        : "",
+	    ].filter(Boolean));
     if (!candidateKeys.size) return null;
     return skillsLibrary.skills.find((entry) => (
       !documentIsFolderRow(entry)
       && candidateKeys.has(accountDocumentStorageKey(entry) || entry.id)
     )) || null;
-  }, [documentDraft, selectedSkillKey, skillEditor, skillEditorDocumentKey, skillsLibrary.skills]);
+	  }, [selectedDocumentDraft, selectedSkillKey, skillEditor, skillEditorDocumentKey, skillsLibrary.skills]);
   const skillEditorHasDraftChanges = Boolean(
     skillEditor
     && (
       editorHasUnsavedDraft(skillEditor, selectedSkill || savedDocumentForEditor)
       || (
-        documentDraft
-        && (
-          text(documentDraft.documentKey || documentDraft.document_key) === skillEditorDocumentKey
-          || text(documentDraft.selectedKey || documentDraft.selected_key) === selectedSkillKey
-        )
-      )
-    ),
+	        selectedDocumentDraft
+	        && (
+	          text(selectedDocumentDraft.documentKey || selectedDocumentDraft.document_key) === skillEditorDocumentKey
+	          || text(selectedDocumentDraft.selectedKey || selectedDocumentDraft.selected_key) === selectedSkillKey
+	        )
+	      )
+	    ),
   );
-  const discardSkillEditorDraft = useCallback(() => {
-    if (!skillEditor) return;
-    clearWorkspaceToolsDocumentDraft();
-    setDocumentDraft(null);
-    setSkillsError("");
+		  const discardSkillEditorDraft = useCallback(() => {
+			    if (!skillEditor) return;
+			    invalidateDocumentDraftPersist();
+			    void discardSkillDraftFile(skillEditor);
+			    clearWorkspaceToolsDocumentDraft(documentDraftClearKey(skillEditor));
+		    setDocumentDraft(getWorkspaceToolsDocumentDraft());
+		    setDocumentDrafts(getWorkspaceToolsDocumentDrafts());
+		    setSkillsError("");
 
     if (savedDocumentForEditor) {
       const savedKey = accountDocumentStorageKey(savedDocumentForEditor) || savedDocumentForEditor.id;
@@ -3147,15 +3565,28 @@ export default function ToolsWorkspaceView({
       return;
     }
 
-    setSelectedSkillKey("");
-    setSkillEditor(null);
-  }, [savedDocumentForEditor, skillEditor]);
+	    setSelectedSkillKey("");
+	    setSkillEditor(null);
+		  }, [invalidateDocumentDraftPersist, savedDocumentForEditor, skillEditor]);
   const skillEditorBusy = skillsState === "saving" || skillsState === "savingLocal";
   const skillEditorReadOnly = selectedDocumentRefreshing || skillEditorBusy;
   const skillEditorOpen = Boolean(skillEditor);
+  const skillEditorLayout = useMemo(() => {
+    const content = String(skillEditor?.content || "");
+    const estimatedLines = content.split("\n").reduce((total, line) => {
+      return total + Math.max(1, Math.ceil(line.length / 82));
+    }, 0);
+    const rows = Math.max(1, Math.min(4000, estimatedLines + 4));
+    return {
+      pageCount: Math.max(1, Math.ceil(rows / 34)),
+      rows,
+    };
+  }, [skillEditor?.content]);
+  const skillEditorRows = skillEditorLayout.rows;
+  const skillEditorPageCount = skillEditorLayout.pageCount;
   const skillDocumentMetricsStyle = useMemo(
-    () => skillDocumentPageStyle(skillDocumentScale),
-    [skillDocumentScale],
+    () => skillDocumentPageStyle(skillDocumentScale, skillEditorPageCount),
+    [skillDocumentScale, skillEditorPageCount],
   );
   const appControlDocumentContext = useMemo(() => {
     const content = String(skillEditor?.content || "");
@@ -3558,12 +3989,16 @@ export default function ToolsWorkspaceView({
     const requestedFileName = hasOwn("file_name") ? text(input.file_name) : "";
     const requestedFilePath = hasOwn("file_path") ? normalizedDocumentPath(input.file_path) : "";
     const requestedPathKey = hasOwn("path_key") ? normalizedDocumentPath(input.path_key) : "";
-    const hasContentPatch = hasOwn("content_md") || hasOwn("content");
+    const hasContentPatch = hasOwn("content_md") || hasOwn("contentMd") || hasOwn("content") || hasOwn("body");
     const requestedContent = hasOwn("content_md")
       ? String(input.content_md ?? "")
+      : hasOwn("contentMd")
+        ? String(input.contentMd ?? "")
       : hasOwn("content")
         ? String(input.content ?? "")
-        : "";
+        : hasOwn("body")
+          ? String(input.body ?? "")
+          : "";
     const baseTitle = requestedTitle || text(skillEditor?.title || newDocDraft.name, "Untitled document");
     if (!skillEditor && !baseTitle) {
       return {
@@ -3708,8 +4143,9 @@ export default function ToolsWorkspaceView({
       clearDocumentSelection();
     }
 
-    const requestedMode = text(input.mode || input.save_mode, input.save === true ? "local" : "draft").toLowerCase();
-    const shouldSave = input.save === true || !["", "draft", "edit", "update", "none"].includes(requestedMode);
+    const requestedMode = text(input.mode || input.save_mode, input.save === true ? "publish" : "draft").toLowerCase();
+    const draftRequested = requestedMode === "draft";
+    const shouldSave = input.save === true || draftRequested || !["", "edit", "update", "none"].includes(requestedMode);
     if (!shouldSave) {
       return {
         ok: true,
@@ -3718,11 +4154,11 @@ export default function ToolsWorkspaceView({
         context: nextContext,
       };
     }
-    const localOnly = ["local", "local_only", "local-only", "draft"].includes(requestedMode);
-    const ok = await saveSkillEditor(localOnly ? "local" : "push", nextEditor);
+    const localOnly = ["local", "local_only", "local-only"].includes(requestedMode);
+    const ok = await saveSkillEditor(draftRequested ? "draft" : localOnly ? "local" : "push", nextEditor);
     return {
       ok: Boolean(ok),
-      mode: localOnly ? "local" : "publish",
+      mode: draftRequested ? "draft" : localOnly ? "local" : "publish",
       source: "editor_state",
       context: nextContext,
     };
@@ -3755,10 +4191,12 @@ export default function ToolsWorkspaceView({
       }
       const requestedMode = text(input.mode || input.saveMode || input.save_mode || input.action, "publish")
         .toLowerCase();
-      const localOnly = ["local", "local_only", "local-only", "draft"].includes(requestedMode);
+      const draftRequested = requestedMode === "draft";
+      const localOnly = ["local", "local_only", "local-only"].includes(requestedMode);
       const document = appControlDocumentContext.document || {};
       const editorDirty = String(skillEditor.content || "") !== String(skillEditor.baseContent ?? skillEditor.content ?? "");
-      if (document.localPath && document.id && !editorDirty) {
+      const editorDraft = Boolean(skillEditor.isDraft || skillEditor.draft || text(skillEditor.syncStatus || skillEditor.sync_status) === "draft");
+      if (!draftRequested && !editorDraft && document.localPath && document.id && !editorDirty) {
         const result = await invoke("cloud_mcp_save_account_document", {
           request: {
             document: {
@@ -3799,10 +4237,10 @@ export default function ToolsWorkspaceView({
           context: appControlDocumentContext,
         };
       }
-      const ok = await saveSkillEditor(localOnly ? "local" : "push");
+      const ok = await saveSkillEditor(draftRequested ? "draft" : localOnly ? "local" : "push");
       return {
         ok: Boolean(ok),
-        mode: localOnly ? "local" : "publish",
+        mode: draftRequested ? "draft" : localOnly ? "local" : "publish",
         source: "editor_state",
         context: appControlDocumentContext,
       };
@@ -3991,13 +4429,6 @@ export default function ToolsWorkspaceView({
 
   const docsCreateMode = !skillEditor;
   const showDocsTemplatesPane = docsCreateMode && !rightToolsOrchestratorOpen;
-  const skillEditorRows = useMemo(() => {
-    const content = String(skillEditor?.content || "");
-    const estimatedLines = content.split("\n").reduce((total, line) => {
-      return total + Math.max(1, Math.ceil(line.length / 82));
-    }, 0);
-    return Math.max(1, Math.min(260, estimatedLines + 4));
-  }, [skillEditor?.content]);
   const preservedSkillEditorSelection = useMemo(() => {
     if (!skillEditor || !lastDocumentSelection) return null;
     const content = String(skillEditor.content || "");
@@ -4011,14 +4442,6 @@ export default function ToolsWorkspaceView({
     }
     return documentSelectionSegments(content, lastDocumentSelection);
   }, [skillEditor, lastDocumentSelection]);
-  const scrollSkillDocumentCanvas = useCallback((event) => {
-    const canvas = skillDocumentCanvasRef.current;
-    if (!canvas) return;
-    event.preventDefault();
-    event.stopPropagation();
-    canvas.scrollTop += event.deltaY;
-    canvas.scrollLeft += event.deltaX;
-  }, []);
   const scrollScriptDocumentCanvas = useCallback((event) => {
     const canvas = scriptDocumentCanvasRef.current;
     if (!canvas) return;
@@ -4476,7 +4899,7 @@ export default function ToolsWorkspaceView({
                                 <ToolsGhostButton
                                   data-danger="true"
                                   disabled={skillEditorReadOnly}
-                                  onClick={() => removeSkill(skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id)}
+                                  onClick={() => removeDocument(skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id)}
                                   type="button"
                                 >
                                   Delete
@@ -4507,12 +4930,15 @@ export default function ToolsWorkspaceView({
                             </SkillDocumentRefreshOverlay>
                           )}
                           <SkillDocumentPage onPointerDownCapture={clearDocumentSelection}>
-                            <SkillDocumentTitleInput
-                              aria-label="Document name"
-                              readOnly={skillEditorReadOnly}
-                              onChange={(event) => setSkillEditor((current) => ({ ...current, title: event.target.value }))}
-                              placeholder="doc_name"
-                              value={skillEditor.title}
+	                            <SkillDocumentTitleInput
+	                              aria-label="Document name"
+	                              readOnly={skillEditorReadOnly}
+	                              onChange={(event) => {
+	                                lastHumanDocumentEditAtRef.current = Date.now();
+	                                setSkillEditor((current) => ({ ...current, title: event.target.value }));
+	                              }}
+	                              placeholder="doc_name"
+	                              value={skillEditor.title}
                             />
                             <SkillDocumentBodyStack>
                               {preservedSkillEditorSelection?.active && (
@@ -4524,16 +4950,16 @@ export default function ToolsWorkspaceView({
                               )}
                               <ToolsSkillsEditor
                                 aria-label="Document content"
-                                readOnly={skillEditorReadOnly}
-                                onChange={(event) => {
-                                  updateSkillEditorSelection(event);
-                                  setSkillEditor((current) => ({ ...current, content: event.target.value }));
-                                }}
+	                                readOnly={skillEditorReadOnly}
+	                                onChange={(event) => {
+	                                  lastHumanDocumentEditAtRef.current = Date.now();
+	                                  updateSkillEditorSelection(event);
+	                                  setSkillEditor((current) => ({ ...current, content: event.target.value }));
+	                                }}
                                 onBlur={updateSkillEditorSelection}
                                 onKeyUp={updateSkillEditorSelection}
                                 onMouseUp={updateSkillEditorSelection}
                                 onSelect={updateSkillEditorSelection}
-                                onWheelCapture={scrollSkillDocumentCanvas}
                                 placeholder={skillEditor.extension === "arch" ? "title System_Map" : "# Notes"}
                                 rows={skillEditorRows}
                                 spellCheck={false}
@@ -6548,8 +6974,7 @@ const SkillDocumentPage = styled.div`
   align-content: start;
   box-sizing: border-box;
   width: var(--skill-document-page-width, 794px);
-  min-height: var(--skill-document-page-height, 1123px);
-  aspect-ratio: 210 / 297;
+  min-height: var(--skill-document-total-page-height, var(--skill-document-page-height, 1123px));
   padding:
     var(--skill-document-page-padding-top, 52px)
     var(--skill-document-page-padding-inline, 58px)
@@ -6557,7 +6982,15 @@ const SkillDocumentPage = styled.div`
   border: 1px solid var(--skill-editor-page-border);
   border-radius: 4px;
   color: var(--skill-editor-page-text);
-  background: var(--skill-editor-page);
+  background:
+    repeating-linear-gradient(
+      to bottom,
+      transparent 0,
+      transparent calc(var(--skill-document-page-height, 1123px) - 1px),
+      var(--skill-editor-page-rule) calc(var(--skill-document-page-height, 1123px) - 1px),
+      var(--skill-editor-page-rule) var(--skill-document-page-height, 1123px)
+    ),
+    var(--skill-editor-page);
   box-shadow: var(--skill-editor-page-shadow);
   transition:
     filter 140ms ease,
@@ -6658,7 +7091,8 @@ const ToolsSkillsEditor = styled.textarea`
   font-weight: 520;
   line-height: 1.72;
   outline: none;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
   resize: none;
   transition:
     background 140ms ease,

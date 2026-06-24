@@ -16,6 +16,8 @@ import { AdsClick } from "@styled-icons/material-rounded/AdsClick";
 import { Devices } from "@styled-icons/material-rounded/Devices";
 import { History } from "@styled-icons/material-rounded/History";
 import { KeyboardArrowDown } from "@styled-icons/material-rounded/KeyboardArrowDown";
+import { PermMedia } from "@styled-icons/material-rounded/PermMedia";
+import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
 import { Schedule } from "@styled-icons/material-rounded/Schedule";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Webhook } from "@styled-icons/material-rounded/Webhook";
@@ -344,6 +346,7 @@ import {
   LoopspaceGraphNodeDeviceBadge,
   LoopspaceGraphNodeDeviceDot,
   LoopspaceGraphNodeTimer,
+  LoopspaceGraphTriggerRunButton,
   LoopspaceGraphNodeSelectChevron,
   LoopspaceGraphNodeSelectMenu,
   LoopspaceGraphNodeSelectOption,
@@ -354,6 +357,8 @@ import {
   LoopspaceGraphDocumentSearch,
   LoopspaceGraphDocumentPickList,
   LoopspaceGraphDocumentPickButton,
+  LoopspaceGraphDocumentCreateButton,
+  LoopspaceGraphDocumentCreateInput,
   LoopspaceGraphDocumentRefList,
   LoopspaceGraphDocumentRefItem,
   LoopspaceGraphNodeAction,
@@ -412,8 +417,6 @@ import {
   LoopspaceRuntimeConsoleDetail,
   LoopspaceRuntimeConsoleLoader,
   LoopspaceRuntimeConsoleRow,
-  LoopspaceRailSettingsMenu,
-  LoopspaceRailSettingsItem,
   LoopspaceRuntimeError,
   ForgeWorkspace,
   TerminalWorkspaceSurface,
@@ -747,13 +750,18 @@ import {
 } from "../tools/skillsLibrary.js";
 import {
   getWorkspaceToolsAccountSkills,
-  getWorkspaceToolsDocumentDraft,
+  getWorkspaceToolsDocumentDrafts,
   getWorkspaceToolsVersion,
+  clearWorkspaceToolsDocumentDraft,
   refreshWorkspaceToolsAccountSkills,
   setWorkspaceToolsDocumentDraft,
   subscribeWorkspaceTools,
   warmWorkspaceTools,
 } from "../tools/workspaceToolsStore.js";
+import {
+  WORKSPACE_TOOL_DOC_DRAG_KIND,
+  WORKSPACE_TOOL_DOC_DRAG_MIME,
+} from "../tools/workspaceToolDragTypes.js";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
@@ -1342,13 +1350,13 @@ function buildLoopspaceCheckpointProgressMap(events, runId, nodeId) {
       continue;
     }
     for (const key of loopspaceCheckpointProgressKeys(progress)) {
-      map.set(key, status);
+      map.set(key, { progress, status });
     }
   }
   return map;
 }
 
-function loopspaceCheckpointStatusForNode(node, oneBasedIndex, progressMap) {
+function loopspaceCheckpointProgressValueForNode(node, oneBasedIndex, progressMap) {
   const nodeId = String(node?.id || "").trim();
   if (nodeId && progressMap?.has(`id:${nodeId}`)) {
     return progressMap.get(`id:${nodeId}`);
@@ -1356,7 +1364,43 @@ function loopspaceCheckpointStatusForNode(node, oneBasedIndex, progressMap) {
   if (Number.isFinite(oneBasedIndex) && progressMap?.has(`index:${oneBasedIndex}`)) {
     return progressMap.get(`index:${oneBasedIndex}`);
   }
+  return null;
+}
+
+function loopspaceCheckpointStatusForNode(node, oneBasedIndex, progressMap) {
+  const value = loopspaceCheckpointProgressValueForNode(node, oneBasedIndex, progressMap);
+  if (typeof value === "string") {
+    return value;
+  }
+  if (value && typeof value === "object") {
+    return normalizeLoopspaceCheckpointProgressStatus(value.status || value.progress?.status);
+  }
   return "";
+}
+
+function loopspaceCheckpointProgressForNode(node, oneBasedIndex, progressMap) {
+  const value = loopspaceCheckpointProgressValueForNode(node, oneBasedIndex, progressMap);
+  if (value?.progress && typeof value.progress === "object") {
+    return value.progress;
+  }
+  return value && typeof value === "object" ? value : null;
+}
+
+function loopspaceCheckpointProgressAssetIds(progress) {
+  if (!progress || typeof progress !== "object") {
+    return [];
+  }
+  const ids = [
+    ...safeCloudMcpArray(progress.assetIds || progress.asset_ids),
+    ...safeCloudMcpArray(progress.producedAssetIds || progress.produced_asset_ids),
+    ...safeCloudMcpArray(progress.assets || progress.producedAssets || progress.produced_assets)
+      .map((asset) => (
+        asset && typeof asset === "object"
+          ? appControlText(asset, ["asset_id", "assetId", "id"])
+          : String(asset || "")
+      )),
+  ].map((id) => String(id || "").trim()).filter(Boolean);
+  return ids.filter((id, index) => ids.indexOf(id) === index);
 }
 
 function appShellIsMacPlatform() {
@@ -1876,6 +1920,7 @@ const WORKSPACE_LIFECYCLE_STORAGE_KEY = "diffforge.workspaceLifecycle.v1";
 const WORKSPACE_RAIL_STORAGE_KEY = "diffforge.workspaceRail.v1";
 const APP_APPEARANCE_STORAGE_KEY = "diffforge.appearance.v1";
 const APP_SPACE_MODE_STORAGE_KEY = "diffforge.app.spaceMode";
+const LOOPSPACE_CACHE_STORAGE_KEY = "diffforge.loopspaces.cache.v1";
 const APP_THEME_DARK = "dark";
 const APP_THEME_LIGHT = "light";
 const APP_THEME_DEFAULT = APP_THEME_DARK;
@@ -1951,6 +1996,8 @@ const LOOPSPACE_TRIGGER_DRAG_MIME = "application/x-diffforge-loopspace-trigger";
 const LOOPSPACE_TRIGGER_DRAG_KIND = "loopspace_trigger_ref";
 const LOOPSPACE_GRAPH_NODE_DRAG_MIME = "application/x-diffforge-loopspace-node-template";
 const LOOPSPACE_GRAPH_NODE_TEMPLATE_DRAG_KIND = "loopspace_graph_node_template";
+const LOOPSPACE_DOCUMENT_DRAG_MIME = WORKSPACE_TOOL_DOC_DRAG_MIME;
+const LOOPSPACE_DOCUMENT_DRAG_KIND = WORKSPACE_TOOL_DOC_DRAG_KIND;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_TTL_MS = 10 * 60 * 1000;
 const CLOUD_MCP_REMOTE_COMMAND_RECEIPT_MAX = 512;
 const TODO_QUEUE_WORKSPACE_STORAGE_PREFIX = "diffforge.todoQueue.";
@@ -4827,15 +4874,17 @@ function LoopspaceCreatePanel({
             <PanelKicker>New loop</PanelKicker>
             <PanelHeading>Create loop</PanelHeading>
           </div>
-          <WorkspaceModalCloseButton
-            aria-label="Close create loop"
-            disabled={creating}
-            onClick={onClose}
-            title="Close"
-            type="button"
-          >
-            <ButtonCloseIcon aria-hidden="true" />
-          </WorkspaceModalCloseButton>
+          <WorkspaceSettingsHeaderActions>
+            <WorkspaceModalCloseButton
+              aria-label="Close create loop"
+              disabled={creating}
+              onClick={onClose}
+              title="Close"
+              type="button"
+            >
+              <ButtonCloseIcon aria-hidden="true" />
+            </WorkspaceModalCloseButton>
+          </WorkspaceSettingsHeaderActions>
         </WorkspaceCreateHeader>
 
         <WorkspaceCreateSection>
@@ -4853,10 +4902,41 @@ function LoopspaceCreatePanel({
           />
         </WorkspaceCreateSection>
 
+        <WorkspaceCreateSection>
+          <SettingsLabel>Storage</SettingsLabel>
+          <SettingsHint>Cloud loops sync across devices. Local-only loops are coming soon.</SettingsHint>
+          <AppearanceThemeGrid>
+            <AppearanceThemeButton
+              data-selected="false"
+              disabled
+              type="button"
+            >
+              <span><ButtonTerminalIcon aria-hidden="true" /></span>
+              <div>
+                <strong>Local</strong>
+                <small>Coming soon</small>
+              </div>
+            </AppearanceThemeButton>
+            <AppearanceThemeButton
+              data-selected="true"
+              type="button"
+            >
+              <span><ButtonForgeIcon aria-hidden="true" /></span>
+              <div>
+                <strong>Cloud</strong>
+                <small>Selected</small>
+              </div>
+            </AppearanceThemeButton>
+          </AppearanceThemeGrid>
+        </WorkspaceCreateSection>
+
         {loopspaceError && <FormMessage $state="error">{loopspaceError}</FormMessage>}
 
         <WorkspaceCreateFooter>
-          <span />
+          <SecondaryButton disabled={creating} onClick={onClose} type="button">
+            <ButtonCloseIcon aria-hidden="true" />
+            <span>Cancel</span>
+          </SecondaryButton>
           <PrimaryButton disabled={!canCreate} type="submit">
             <ButtonAddIcon aria-hidden="true" />
             <span>{creating ? "Creating..." : "Create loop"}</span>
@@ -4883,6 +4963,8 @@ const LOOPSPACE_GRAPH_NODE_WIDTH = 220;
 const LOOPSPACE_GRAPH_NODE_HEIGHT = 66;
 const LOOPSPACE_GRAPH_PORT_SIZE = 18;
 const LOOPSPACE_GRAPH_PORT_GAP = 8;
+const LOOPSPACE_GRAPH_FLOW_PORT_SIZE = 14;
+const LOOPSPACE_GRAPH_FLOW_PORT_GAP = 8;
 const LOOPSPACE_GRAPH_DOCUMENT_AUTO_REF_LIMIT = 3;
 const LOOPSPACE_GRAPH_DOCUMENT_BASE_HEIGHT = 112;
 const LOOPSPACE_GRAPH_DOCUMENT_REF_ROW_HEIGHT = 38;
@@ -4958,7 +5040,7 @@ function loopspaceGraphPropValue(props, keys = []) {
   return undefined;
 }
 
-const LOOPSPACE_MESSAGE_STEP_NODE_KINDS = new Set(["checkpoint", "step", "substep", "todo"]);
+const LOOPSPACE_MESSAGE_STEP_NODE_KINDS = new Set(["checkpoint", "message_step", "step", "substep", "todo"]);
 
 function loopspaceGraphNodeIsMessageStep(node) {
   const kind = String(node?.nodeKind || node?.kind || "").trim().toLowerCase();
@@ -4991,6 +5073,8 @@ function loopspaceGraphMessageChildSubtitle(node, fallbackIndex = 0) {
   }
   if (node?.nodeKind === "document_read") return "Document read";
   if (node?.nodeKind === "document_write") return "Document write";
+  if (node?.nodeKind === "asset_read") return "Asset read";
+  if (node?.nodeKind === "asset_write") return "Asset write";
   if (node?.nodeKind === "run_script") return "Run script";
   return String(node?.role || node?.nodeKind || "Internal step").trim();
 }
@@ -5192,6 +5276,42 @@ function loopspaceGraphMessageFlowOrigin(nodeLayout, flowBounds) {
   };
 }
 
+function loopspaceGraphMessageFlowNodePortY(layout, portIndex = 0, portCount = 1) {
+  const nodeHeight = Number(layout?.height) || LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT;
+  const safePortCount = Math.max(1, Number(portCount) || 1);
+  if (safePortCount <= 1) return nodeHeight / 2;
+  const safePortIndex = Math.max(0, Math.min(safePortCount - 1, Number(portIndex) || 0));
+  return (nodeHeight / 2)
+    + ((safePortIndex - ((safePortCount - 1) / 2)) * (LOOPSPACE_GRAPH_FLOW_PORT_SIZE + LOOPSPACE_GRAPH_FLOW_PORT_GAP));
+}
+
+function loopspaceGraphMessageFlowNodeInputPoint(flowNode) {
+  const inputPorts = loopspaceGraphInputPortsForNode(flowNode?.item);
+  return {
+    x: flowNode.layout.x,
+    y: flowNode.layout.y + loopspaceGraphMessageFlowNodePortY(flowNode.layout, 0, inputPorts.length),
+  };
+}
+
+function loopspaceGraphMessageFlowNodeFlowOutputPoint(flowNode) {
+  const outputPorts = loopspaceGraphOutputPortsForNode(flowNode?.item);
+  return {
+    x: flowNode.layout.x + flowNode.layout.width,
+    y: flowNode.layout.y + loopspaceGraphMessageFlowNodePortY(flowNode.layout, 0, outputPorts.length),
+  };
+}
+
+function loopspaceGraphMessageFlowParentPortY(nodeLayout, flowBounds, node = null, portId = "in") {
+  const nodeHeight = Number(nodeLayout?.height) || 0;
+  const nodeWidth = Number(nodeLayout?.width) || 0;
+  const flowHeight = Number(flowBounds?.height) || LOOPSPACE_GRAPH_MESSAGE_FLOW_MIN_HEIGHT;
+  const flowOrigin = loopspaceGraphMessageFlowOrigin(nodeLayout, flowBounds);
+  const portPoint = portId === "success"
+    ? loopspaceGraphOutputPoint({ x: 0, y: 0, width: nodeWidth, height: nodeHeight }, node, "success")
+    : loopspaceGraphInputPoint({ x: 0, y: 0, width: nodeWidth, height: nodeHeight }, node, "in");
+  return Math.max(0, Math.min(flowHeight, portPoint.y - flowOrigin.y));
+}
+
 function loopspaceGraphMessageFlowPathBetween(fromPoint, toPoint) {
   const dx = Math.max(26, Math.abs(toPoint.x - fromPoint.x) * 0.42);
   return `M ${fromPoint.x} ${fromPoint.y} C ${fromPoint.x + dx} ${fromPoint.y}, ${toPoint.x - dx} ${toPoint.y}, ${toPoint.x} ${toPoint.y}`;
@@ -5293,21 +5413,105 @@ function loopspaceGraphSourceTextFromRow(row = null) {
   );
 }
 
+function loopspaceGraphResourcePlanEntryFromNode(node = null, resourceKind = "document") {
+  if (!node) return null;
+  const props = node.props || {};
+  const id = String(node.id || "").trim();
+  const createName = String(loopspaceGraphPropValue(props, ["create_name", "createName", "name"]) || "").trim();
+  const refs = resourceKind === "asset"
+    ? loopspaceGraphAssetRefsFromProps(props)
+    : loopspaceGraphDocumentRefsFromProps(props);
+  return {
+    createName,
+    create_name: createName,
+    id,
+    kind: String(node.nodeKind || node.kind || resourceKind).trim(),
+    label: String(node.label || createName || (resourceKind === "asset" ? "Asset" : "Document")).trim(),
+    node_id: id,
+    refs,
+    targetMode: String(loopspaceGraphPropValue(props, ["target_mode", "targetMode"]) || "").trim(),
+    target_mode: String(loopspaceGraphPropValue(props, ["target_mode", "targetMode"]) || "").trim(),
+  };
+}
+
+function loopspaceGraphResourcePlanContextIsEmpty(context = {}) {
+  return ![
+    context.readable_documents,
+    context.writable_documents,
+    context.readable_assets,
+    context.writable_assets,
+  ].some((items) => Array.isArray(items) && items.length);
+}
+
+function loopspaceGraphResourcePlanContextForStep(ast = {}, nodeById = new Map(), stepId = "") {
+  const safeStepId = String(stepId || "").trim();
+  const context = {
+    readable_assets: [],
+    readable_documents: [],
+    writable_assets: [],
+    writable_documents: [],
+  };
+  if (!safeStepId) return context;
+  const edges = Array.isArray(ast.edges) ? ast.edges : [];
+  const appendUnique = (key, entry) => {
+    if (!entry?.id) return;
+    if (context[key].some((item) => item.id === entry.id)) return;
+    context[key].push(entry);
+  };
+  edges.forEach((edge) => {
+    const fromId = String(edge?.from || "").trim();
+    const toId = String(edge?.to || "").trim();
+    const fromPort = String(edge?.fromPort || edge?.from_port || "").trim().toLowerCase();
+    const toPort = String(edge?.toPort || edge?.to_port || "").trim().toLowerCase();
+    if (toId === safeStepId && toPort === "in") {
+      const fromNode = nodeById.get(fromId);
+      const fromKind = String(fromNode?.nodeKind || fromNode?.kind || "").trim();
+      if ((fromKind === "document_read" || fromKind === "document_write") && fromPort === "docs") {
+        appendUnique("readable_documents", loopspaceGraphResourcePlanEntryFromNode(fromNode, "document"));
+      }
+      if ((fromKind === "asset_read" || fromKind === "asset_write") && fromPort === "assets") {
+        appendUnique("readable_assets", loopspaceGraphResourcePlanEntryFromNode(fromNode, "asset"));
+      }
+    }
+    if (fromId === safeStepId && toPort === "in") {
+      const toNode = nodeById.get(toId);
+      const toKind = String(toNode?.nodeKind || toNode?.kind || "").trim();
+      if (toKind === "document_write" && fromPort === "docs") {
+        appendUnique("writable_documents", loopspaceGraphResourcePlanEntryFromNode(toNode, "document"));
+      }
+      if (toKind === "asset_write" && fromPort === "assets") {
+        appendUnique("writable_assets", loopspaceGraphResourcePlanEntryFromNode(toNode, "asset"));
+      }
+    }
+  });
+  return context;
+}
+
 function loopspaceGraphCheckpointPlanForSendMessage(source = "", nodeId = "") {
   const safeNodeId = String(nodeId || "").trim();
   if (!safeNodeId || !String(source || "").trim()) {
     return [];
   }
   try {
-    return parseDfBlueprintSource(String(source || ""))
-	      .nodes
-	      .filter((node) => loopspaceGraphNodeParentId(node) === safeNodeId && loopspaceGraphNodeIsMessageStep(node))
-	      .map((node, index) => ({
-	        id: String(node?.id || "").trim(),
-	        index: index + 1,
-	        label: loopspaceGraphStepTitle(node, index),
-	        order: loopspaceGraphStepOrder(node, index + 1) || index + 1,
-	      }))
+    const ast = parseDfBlueprintSource(String(source || ""));
+    const nodeById = new Map((Array.isArray(ast.nodes) ? ast.nodes : [])
+      .map((node) => [String(node?.id || "").trim(), node])
+      .filter(([id]) => id));
+    return (Array.isArray(ast.nodes) ? ast.nodes : [])
+      .filter((node) => loopspaceGraphNodeParentId(node) === safeNodeId && loopspaceGraphNodeIsMessageStep(node))
+      .map((node, index) => {
+        const resourceContext = loopspaceGraphResourcePlanContextForStep(ast, nodeById, node.id);
+        return {
+          id: String(node?.id || "").trim(),
+          index: index + 1,
+          label: loopspaceGraphStepTitle(node, index),
+          order: loopspaceGraphStepOrder(node, index + 1) || index + 1,
+          ...(!loopspaceGraphResourcePlanContextIsEmpty(resourceContext) ? {
+            resourceContext,
+            resource_context: resourceContext,
+          } : {}),
+        };
+      })
       .sort((left, right) => (
         left.order - right.order
           || left.label.localeCompare(right.label)
@@ -5330,6 +5534,10 @@ function loopspaceGraphCheckpointPlanFromDispatch(value = []) {
       index: index + 1,
       label: appControlText(checkpoint, ["label", "title", "name"]) || `Step ${index + 1}`,
       order: Number.parseInt(checkpoint.order ?? checkpoint.index ?? index + 1, 10) || index + 1,
+      ...((checkpoint.resource_context || checkpoint.resourceContext) ? {
+        resourceContext: checkpoint.resourceContext || checkpoint.resource_context,
+        resource_context: checkpoint.resource_context || checkpoint.resourceContext,
+      } : {}),
     }))
     .sort((left, right) => (
       left.order - right.order
@@ -5340,6 +5548,35 @@ function loopspaceGraphCheckpointPlanFromDispatch(value = []) {
       ...checkpoint,
       index: index + 1,
     }));
+}
+
+function loopspaceGraphMergeCheckpointPlansForDispatch(primaryPlan = [], enrichedPlan = []) {
+  const primary = Array.isArray(primaryPlan) ? primaryPlan : [];
+  const enriched = Array.isArray(enrichedPlan) ? enrichedPlan : [];
+  if (!primary.length) return enriched;
+  if (!enriched.length) return primary;
+  const enrichedById = new Map(enriched
+    .map((checkpoint) => [String(checkpoint?.id || "").trim(), checkpoint])
+    .filter(([id]) => id));
+  const enrichedByOrder = new Map(enriched
+    .map((checkpoint) => [String(checkpoint?.order || checkpoint?.index || "").trim(), checkpoint])
+    .filter(([order]) => order));
+  const enrichedByLabel = new Map(enriched
+    .map((checkpoint) => [String(checkpoint?.label || checkpoint?.title || checkpoint?.name || "").trim().toLowerCase(), checkpoint])
+    .filter(([label]) => label));
+  return primary.map((checkpoint, index) => {
+    const match = enrichedById.get(String(checkpoint?.id || checkpoint?.step_id || checkpoint?.stepId || "").trim())
+      || enrichedByOrder.get(String(checkpoint?.order || checkpoint?.index || index + 1).trim())
+      || enrichedByLabel.get(String(checkpoint?.label || checkpoint?.title || checkpoint?.name || "").trim().toLowerCase())
+      || null;
+    if (!match?.resource_context && !match?.resourceContext) return checkpoint;
+    return {
+      ...match,
+      ...checkpoint,
+      resourceContext: checkpoint.resourceContext || checkpoint.resource_context || match.resourceContext || match.resource_context,
+      resource_context: checkpoint.resource_context || checkpoint.resourceContext || match.resource_context || match.resourceContext,
+    };
+  });
 }
 
 function loopspaceGraphCheckpointMatchesProgress(checkpoint = {}, progress = {}) {
@@ -5558,6 +5795,60 @@ function loopspaceGraphDocumentOptionKey(option = {}) {
   return normalizedDocumentPath(option.path_key || option.pathKey || option.key || "");
 }
 
+function loopspaceGraphDocumentOptionFromDragPayload(payload = {}) {
+  const source = payload && typeof payload === "object" && !Array.isArray(payload) ? payload : {};
+  const document = source.document && typeof source.document === "object" && !Array.isArray(source.document)
+    ? source.document
+    : source;
+  const pathKey = normalizedDocumentPath(
+    document.path_key
+      || document.pathKey
+      || document.document_key
+      || document.documentKey
+      || document.key
+      || document.doc_id
+      || document.document_id
+      || document.id
+      || source.path_key
+      || source.pathKey
+      || source.key
+      || accountDocumentStorageKey(document)
+      || accountDocumentStorageKey(source)
+      || "",
+  );
+  if (!pathKey) return null;
+  return {
+    document_kind: normalizedDocumentKind(
+      document.document_kind
+        || document.documentKind
+        || document.source
+        || document.kind
+        || source.document_kind
+        || source.documentKind
+        || source.kind,
+      document.collection || source.collection,
+    ),
+    key: pathKey,
+    label: loopspaceGraphDocumentTitle({
+      ...source,
+      ...document,
+      pathKey,
+    }),
+    path_key: pathKey,
+  };
+}
+
+function loopspaceGraphDocumentReadTemplateFromOption(option = {}) {
+  const pathKey = loopspaceGraphDocumentOptionKey(option);
+  return {
+    doc_refs: pathKey,
+    documents: pathKey,
+    id: "document_read",
+    label: "Document read",
+    path_key: pathKey,
+  };
+}
+
 function loopspaceGraphDocumentRefsFromProps(props = {}) {
   return String(loopspaceGraphPropValue(props, ["doc_refs", "documents", "path_key"]) || "")
     .split("|")
@@ -5569,6 +5860,82 @@ function loopspaceGraphDocumentRefsFromProps(props = {}) {
 function loopspaceGraphDocumentRefsValue(refs = []) {
   return safeCloudMcpArray(refs)
     .map((value) => normalizedDocumentPath(value))
+    .filter(Boolean)
+    .filter((value, index, array) => array.indexOf(value) === index)
+    .join("|");
+}
+
+function loopspaceGraphAssetTitle(asset = {}) {
+  const localPath = String(asset.localPath || asset.local_path || asset.path || "").trim();
+  const leaf = localPath.split(/[\\/]/u).filter(Boolean).pop() || "";
+  return String(
+    asset.name
+      || asset.filename
+      || asset.fileName
+      || asset.file_name
+      || asset.label
+      || leaf
+      || asset.assetId
+      || asset.asset_id
+      || asset.id
+      || "Asset",
+  ).trim();
+}
+
+function loopspaceGraphAssetKind(asset = {}) {
+  return String(
+    asset.kind
+      || asset.assetKind
+      || asset.asset_kind
+      || asset.mimeType
+      || asset.mime_type
+      || asset.contentType
+      || asset.content_type
+      || "asset",
+  ).trim();
+}
+
+function loopspaceGraphAssetOptionsFromLibrary(library = {}) {
+  const rows = safeCloudMcpArray(library?.items).length
+    ? safeCloudMcpArray(library.items)
+    : safeCloudMcpArray(library?.assets);
+  const byKey = new Map();
+  rows.forEach((asset) => {
+    if (!asset || typeof asset !== "object") return;
+    const assetId = String(asset.assetId || asset.asset_id || asset.id || "").trim();
+    const localPath = String(asset.localPath || asset.local_path || asset.path || "").trim();
+    const objectKey = String(asset.objectKey || asset.object_key || asset.blobId || asset.blob_id || "").trim();
+    const key = assetId || localPath || objectKey;
+    if (!key) return;
+    byKey.set(key, {
+      asset_id: assetId,
+      asset_kind: loopspaceGraphAssetKind(asset),
+      key,
+      label: loopspaceGraphAssetTitle(asset),
+      local_path: localPath,
+      object_key: objectKey,
+    });
+  });
+  return Array.from(byKey.values()).sort((left, right) => (
+    left.label.localeCompare(right.label, undefined, { sensitivity: "base" })
+  ));
+}
+
+function loopspaceGraphAssetOptionKey(option = {}) {
+  return String(option.key || option.asset_id || option.assetId || option.local_path || option.localPath || option.path || "").trim();
+}
+
+function loopspaceGraphAssetRefsFromProps(props = {}) {
+  return String(loopspaceGraphPropValue(props, ["asset_refs", "assets", "asset_id", "path_key"]) || "")
+    .split("|")
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .filter((value, index, array) => array.indexOf(value) === index);
+}
+
+function loopspaceGraphAssetRefsValue(refs = []) {
+  return safeCloudMcpArray(refs)
+    .map((value) => String(value || "").trim())
     .filter(Boolean)
     .filter((value, index, array) => array.indexOf(value) === index)
     .join("|");
@@ -5598,7 +5965,13 @@ function loopspaceGraphSourceWithNodeTemplate(source, template, position = null)
 }
 
 function loopspaceGraphOutputPortsForNode(node) {
-  return contractLoopspaceGraphOutputPortsForNode(node);
+  const ports = contractLoopspaceGraphOutputPortsForNode(node);
+  if (!loopspaceGraphNodeIsMessageStep(node)) return ports;
+  return [...ports].sort((left, right) => {
+    if (left.id === "docs" && right.id !== "docs") return 1;
+    if (right.id === "docs" && left.id !== "docs") return -1;
+    return 0;
+  });
 }
 
 function loopspaceGraphInputPortsForNode(node) {
@@ -5662,15 +6035,19 @@ function loopspaceGraphSourceWithoutTrigger(source, triggerId) {
 function loopspaceGraphNodeLayout(node, index = 0) {
   const isSendMessage = node?.nodeKind === "send_message";
   const isDocumentContext = node?.nodeKind === "document_read" || node?.nodeKind === "document_write";
+  const isAssetContext = node?.nodeKind === "asset_read" || node?.nodeKind === "asset_write";
+  const isResourceContext = isDocumentContext || isAssetContext;
   const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
   const defaultHeight = visualDefaults.height || LOOPSPACE_GRAPH_NODE_HEIGHT;
   const defaultWidth = visualDefaults.width || LOOPSPACE_GRAPH_NODE_WIDTH;
   const minHeight = visualDefaults.minHeight || defaultHeight;
   const minWidth = visualDefaults.minWidth || defaultWidth;
-  const documentRefCount = isDocumentContext
-    ? loopspaceGraphDocumentRefsFromProps(node?.props || {}).length
+  const resourceRefCount = isResourceContext
+    ? isAssetContext
+      ? loopspaceGraphAssetRefsFromProps(node?.props || {}).length
+      : loopspaceGraphDocumentRefsFromProps(node?.props || {}).length
     : 0;
-  const documentHeight = isDocumentContext
+  const resourceHeight = isResourceContext
     ? loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node?.props || {}, ["h", "height"]), 0)
     : 0;
   const nodeHeight = isSendMessage
@@ -5678,12 +6055,12 @@ function loopspaceGraphNodeLayout(node, index = 0) {
         minHeight,
         loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["h", "height"]), defaultHeight),
       )
-    : isDocumentContext
+    : isResourceContext
       ? Math.max(
           minHeight,
-          documentHeight || (
+          resourceHeight || (
             LOOPSPACE_GRAPH_DOCUMENT_BASE_HEIGHT
-              + (Math.min(documentRefCount, LOOPSPACE_GRAPH_DOCUMENT_AUTO_REF_LIMIT) * LOOPSPACE_GRAPH_DOCUMENT_REF_ROW_HEIGHT)
+              + (Math.min(resourceRefCount, LOOPSPACE_GRAPH_DOCUMENT_AUTO_REF_LIMIT) * LOOPSPACE_GRAPH_DOCUMENT_REF_ROW_HEIGHT)
           ),
         )
     : visualDefaults.sized
@@ -5700,7 +6077,7 @@ function loopspaceGraphNodeLayout(node, index = 0) {
         minWidth,
         loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["w", "width"]), defaultWidth),
       )
-    : isDocumentContext
+    : isResourceContext
       ? defaultWidth
     : visualDefaults.sized
       ? Math.max(
@@ -5730,10 +6107,55 @@ function loopspaceGraphNodePositionedForDrop(node, pointerPosition) {
   };
 }
 
-function loopspaceGraphInputPoint(layout) {
+function loopspaceGraphPortStackOffset(portCount, portIndex, options = {}) {
+  const safePortCount = Math.max(1, Number(portCount) || 1);
+  const safePortIndex = Math.max(0, Math.min(safePortCount - 1, Number(portIndex) || 0));
+  const portSize = Number(options.portSize) || LOOPSPACE_GRAPH_PORT_SIZE;
+  const portGap = Number(options.portGap) || LOOPSPACE_GRAPH_PORT_GAP;
+  const portSpacing = portSize + portGap;
+  const stackHeight = (safePortCount * portSize) + ((safePortCount - 1) * portGap);
+  return {
+    portSpacing,
+    stackHeight,
+    yFromTop: (portSize / 2) + (safePortIndex * portSpacing),
+  };
+}
+
+function loopspaceGraphStackCenterForPort(portCount, portIndex, portY, options = {}) {
+  const stack = loopspaceGraphPortStackOffset(portCount, portIndex, options);
+  return (Number(portY) || 0) - stack.yFromTop + (stack.stackHeight / 2);
+}
+
+function loopspaceGraphInputPoint(layout, node = null, portId = "in") {
+  const ports = loopspaceGraphInputPortsForNode(node);
+  const index = Math.max(0, ports.findIndex((port) => port.id === String(portId || "").trim()));
+  const safeIndex = index >= 0 ? index : 0;
+  const portCount = Math.max(1, ports.length);
+  const inputPortYById = layout?.inputPortYById && typeof layout.inputPortYById === "object"
+    ? layout.inputPortYById
+    : {};
+  const explicitPortY = inputPortYById[String(portId || "").trim()];
+  if (Number.isFinite(explicitPortY)) {
+    return {
+      x: layout.x,
+      y: layout.y + explicitPortY,
+    };
+  }
+  const stack = loopspaceGraphPortStackOffset(portCount, safeIndex, {
+    portGap: layout?.portGap,
+    portSize: layout?.portSize,
+  });
+  const stackCenterY = Number.isFinite(layout?.inputStackCenterY)
+    ? layout.inputStackCenterY
+    : Number.isFinite(layout?.inputY)
+      ? layout.inputY
+      : (layout.height / 2);
+  const yOffset = portCount === 1
+    ? stackCenterY
+    : stackCenterY - (stack.stackHeight / 2) + stack.yFromTop;
   return {
     x: layout.x,
-    y: layout.y + (layout.height / 2),
+    y: layout.y + yOffset,
   };
 }
 
@@ -5742,11 +6164,26 @@ function loopspaceGraphOutputPoint(layout, node = null, portId = "out") {
   const index = Math.max(0, ports.findIndex((port) => port.id === String(portId || "").trim()));
   const safeIndex = index >= 0 ? index : 0;
   const portCount = Math.max(1, ports.length);
-  const portSpacing = LOOPSPACE_GRAPH_PORT_SIZE + LOOPSPACE_GRAPH_PORT_GAP;
-  const stackHeight = (portCount * LOOPSPACE_GRAPH_PORT_SIZE) + ((portCount - 1) * LOOPSPACE_GRAPH_PORT_GAP);
+  const outputPortYById = layout?.outputPortYById && typeof layout.outputPortYById === "object"
+    ? layout.outputPortYById
+    : {};
+  const explicitPortY = outputPortYById[String(portId || "").trim()];
+  if (Number.isFinite(explicitPortY)) {
+    return {
+      x: layout.x + layout.width,
+      y: layout.y + explicitPortY,
+    };
+  }
+  const stack = loopspaceGraphPortStackOffset(portCount, safeIndex, {
+    portGap: layout?.portGap,
+    portSize: layout?.portSize,
+  });
+  const stackCenterY = Number.isFinite(layout?.outputStackCenterY)
+    ? layout.outputStackCenterY
+    : (layout.height / 2);
   const yOffset = portCount === 1
     ? layout.height / 2
-    : ((layout.height - stackHeight) / 2) + (LOOPSPACE_GRAPH_PORT_SIZE / 2) + (safeIndex * portSpacing);
+    : stackCenterY - (stack.stackHeight / 2) + stack.yFromTop;
   return {
     x: layout.x + layout.width,
     y: layout.y + yOffset,
@@ -5756,6 +6193,24 @@ function loopspaceGraphOutputPoint(layout, node = null, portId = "out") {
 function loopspaceGraphPathBetween(fromPoint, toPoint) {
   const dx = Math.max(52, Math.abs(toPoint.x - fromPoint.x) * 0.48);
   return `M ${fromPoint.x} ${fromPoint.y} C ${fromPoint.x + dx} ${fromPoint.y}, ${toPoint.x - dx} ${toPoint.y}, ${toPoint.x} ${toPoint.y}`;
+}
+
+function loopspaceGraphNodeIsResourceContextNode(node) {
+  return node?.nodeKind === "document_read"
+    || node?.nodeKind === "document_write"
+    || node?.nodeKind === "asset_read"
+    || node?.nodeKind === "asset_write";
+}
+
+function loopspaceGraphEdgeNeedsForegroundLayer(edge, nodeLookup) {
+  const fromNode = nodeLookup?.get?.(edge?.from);
+  const toNode = nodeLookup?.get?.(edge?.to);
+  if (!fromNode || !toNode) return false;
+  return (
+    loopspaceGraphNodeIsMessageStep(fromNode) && loopspaceGraphNodeIsResourceContextNode(toNode)
+  ) || (
+    loopspaceGraphNodeIsResourceContextNode(fromNode) && loopspaceGraphNodeIsMessageStep(toNode)
+  );
 }
 
 function LoopspaceRunScriptSelect({
@@ -6097,13 +6552,19 @@ function LoopspaceSendMessageDeviceSelect({
 
 function LoopspaceDocumentContextPicker({
   busy = false,
+  createName = "",
   mode = "read",
+  onCreateNameChange,
   onRefsChange,
   options = [],
   refs = [],
   search = "",
   setSearch,
 }) {
+  const normalizedCreateName = String(createName || "").trim();
+  const [createDraft, setCreateDraft] = useState(normalizedCreateName);
+  const [createEditing, setCreateEditing] = useState(false);
+  const createInputRef = useRef(null);
   const selectedRefs = useMemo(() => loopspaceGraphDocumentRefsValue(refs).split("|").filter(Boolean), [refs]);
   const selectedSet = useMemo(() => new Set(selectedRefs), [selectedRefs]);
   const optionByKey = useMemo(() => {
@@ -6129,6 +6590,42 @@ function LoopspaceDocumentContextPicker({
   const updateSearch = useCallback((event) => {
     if (typeof setSearch === "function") setSearch(event.target.value);
   }, [setSearch]);
+  useEffect(() => {
+    if (!createEditing) {
+      setCreateDraft(normalizedCreateName);
+    }
+  }, [createEditing, normalizedCreateName]);
+  useEffect(() => {
+    if (!createEditing) return undefined;
+    const frame = requestAnimationFrame(() => {
+      createInputRef.current?.focus();
+      createInputRef.current?.select();
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [createEditing]);
+  const startCreateNameEdit = useCallback(() => {
+    if (busy) return;
+    setCreateDraft(normalizedCreateName);
+    setCreateEditing(true);
+  }, [busy, normalizedCreateName]);
+  const commitCreateName = useCallback((value = createDraft) => {
+    const nextCreateName = String(value || "").trim();
+    setCreateDraft(nextCreateName);
+    setCreateEditing(false);
+    if (typeof onCreateNameChange === "function" && nextCreateName !== normalizedCreateName) {
+      onCreateNameChange(nextCreateName);
+    }
+  }, [createDraft, normalizedCreateName, onCreateNameChange]);
+  const clearCreateName = useCallback((event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (busy) return;
+    setCreateDraft("");
+    setCreateEditing(false);
+    if (typeof onCreateNameChange === "function" && normalizedCreateName) {
+      onCreateNameChange("");
+    }
+  }, [busy, normalizedCreateName, onCreateNameChange]);
   const addRef = useCallback((key) => {
     const pathKey = normalizedDocumentPath(key);
     if (!pathKey || selectedSet.has(pathKey) || busy) return;
@@ -6148,6 +6645,86 @@ function LoopspaceDocumentContextPicker({
       onPointerDown={stopEvent}
       onWheel={stopEvent}
     >
+      {mode === "write" ? (
+        createEditing ? (
+          <LoopspaceGraphDocumentRefItem data-generated="true">
+            <span>
+              <LoopspaceGraphDocumentCreateInput
+                aria-label="Generated document name"
+                disabled={busy}
+                onBlur={(event) => commitCreateName(event.currentTarget.value)}
+                onChange={(event) => setCreateDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    commitCreateName(event.currentTarget.value);
+                  } else if (event.key === "Escape") {
+                    event.preventDefault();
+                    setCreateDraft(normalizedCreateName);
+                    setCreateEditing(false);
+                  }
+                }}
+                placeholder="Document name..."
+                ref={createInputRef}
+                value={createDraft}
+              />
+              <em>New document</em>
+            </span>
+            <button
+              aria-label="Clear generated document"
+              disabled={busy}
+              onClick={clearCreateName}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              type="button"
+            >
+              <ButtonCloseIcon aria-hidden="true" />
+            </button>
+          </LoopspaceGraphDocumentRefItem>
+        ) : normalizedCreateName ? (
+          <LoopspaceGraphDocumentRefItem
+            data-generated="true"
+            onClick={startCreateNameEdit}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                startCreateNameEdit();
+              }
+            }}
+            role="button"
+            tabIndex={0}
+          >
+            <span>
+              <strong>{normalizedCreateName}</strong>
+              <em>Create document</em>
+            </span>
+            <button
+              aria-label={`Remove generated document ${normalizedCreateName}`}
+              disabled={busy}
+              onClick={clearCreateName}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              type="button"
+            >
+              <ButtonCloseIcon aria-hidden="true" />
+            </button>
+          </LoopspaceGraphDocumentRefItem>
+        ) : (
+          <LoopspaceGraphDocumentCreateButton
+            disabled={busy}
+            onClick={startCreateNameEdit}
+            type="button"
+          >
+            <ButtonAddIcon aria-hidden="true" />
+            <strong>Create document</strong>
+            <span>New</span>
+          </LoopspaceGraphDocumentCreateButton>
+        )
+      ) : null}
       <LoopspaceGraphDocumentSearch
         aria-label={`${mode === "write" ? "Writable" : "Readable"} document search`}
         disabled={busy}
@@ -6160,7 +6737,7 @@ function LoopspaceDocumentContextPicker({
           {selectedRefs.map((key) => {
             const option = optionByKey.get(key);
             return (
-              <LoopspaceGraphDocumentRefItem key={key} title={key}>
+              <LoopspaceGraphDocumentRefItem key={key}>
                 <span>
                   <strong>{option?.label || key.split("/").filter(Boolean).pop() || key}</strong>
                   <em>{key}</em>
@@ -6187,7 +6764,6 @@ function LoopspaceDocumentContextPicker({
                 disabled={busy}
                 key={key}
                 onClick={() => addRef(key)}
-                title={option.path_key}
                 type="button"
               >
                 <strong>{option.label}</strong>
@@ -6201,10 +6777,137 @@ function LoopspaceDocumentContextPicker({
   );
 }
 
+function LoopspaceAssetContextPicker({
+  busy = false,
+  createName = "",
+  mode = "read",
+  onCreateNameChange,
+  onRefsChange,
+  options = [],
+  refs = [],
+  search = "",
+  setSearch,
+}) {
+  const selectedRefs = useMemo(() => loopspaceGraphAssetRefsValue(refs).split("|").filter(Boolean), [refs]);
+  const selectedSet = useMemo(() => new Set(selectedRefs), [selectedRefs]);
+  const optionByKey = useMemo(() => {
+    const map = new Map();
+    options.forEach((option) => {
+      const key = loopspaceGraphAssetOptionKey(option);
+      if (key) map.set(key, option);
+    });
+    return map;
+  }, [options]);
+  const query = String(search || "").trim().toLowerCase();
+  const filteredOptions = useMemo(() => {
+    const matches = options.filter((option) => {
+      const key = loopspaceGraphAssetOptionKey(option);
+      if (!key || selectedSet.has(key)) return false;
+      if (!query) return selectedRefs.length === 0;
+      const haystack = `${option.label || ""} ${option.local_path || ""} ${option.asset_kind || ""}`.toLowerCase();
+      return haystack.includes(query);
+    });
+    return matches.slice(0, 5);
+  }, [options, query, selectedRefs.length, selectedSet]);
+  const stopEvent = useCallback((event) => event.stopPropagation(), []);
+  const updateSearch = useCallback((event) => {
+    if (typeof setSearch === "function") setSearch(event.target.value);
+  }, [setSearch]);
+  const updateCreateName = useCallback((event) => {
+    if (typeof onCreateNameChange === "function") onCreateNameChange(event.target.value);
+  }, [onCreateNameChange]);
+  const addRef = useCallback((key) => {
+    const assetKey = String(key || "").trim();
+    if (!assetKey || selectedSet.has(assetKey) || busy) return;
+    if (typeof onRefsChange === "function") onRefsChange([...selectedRefs, assetKey]);
+    if (typeof setSearch === "function") setSearch("");
+  }, [busy, onRefsChange, selectedRefs, selectedSet, setSearch]);
+  const removeRef = useCallback((key) => {
+    const assetKey = String(key || "").trim();
+    if (!assetKey || busy) return;
+    if (typeof onRefsChange === "function") onRefsChange(selectedRefs.filter((item) => item !== assetKey));
+  }, [busy, onRefsChange, selectedRefs]);
+
+  return (
+    <LoopspaceGraphDocumentPicker
+      data-mode={mode}
+      data-resource="asset"
+      onClick={stopEvent}
+      onPointerDown={stopEvent}
+      onWheel={stopEvent}
+    >
+      {mode === "write" ? (
+        <LoopspaceGraphDocumentSearch
+          aria-label="Generated asset name"
+          defaultValue={createName}
+          disabled={busy}
+          onBlur={updateCreateName}
+          onKeyDown={(event) => {
+            if (event.key === "Enter") {
+              event.preventDefault();
+              event.currentTarget.blur();
+            }
+          }}
+          placeholder="Capture/create asset name…"
+        />
+      ) : null}
+      <LoopspaceGraphDocumentSearch
+        aria-label={`${mode === "write" ? "Writable" : "Readable"} asset search`}
+        disabled={busy}
+        onChange={updateSearch}
+        placeholder={mode === "write" ? "Search output assets…" : "Search readable assets…"}
+        value={search}
+      />
+      {selectedRefs.length ? (
+        <LoopspaceGraphDocumentRefList aria-label="Selected assets">
+          {selectedRefs.map((key) => {
+            const option = optionByKey.get(key);
+            return (
+              <LoopspaceGraphDocumentRefItem key={key}>
+                <span>
+                  <strong>{option?.label || key.split(/[\\/]/u).filter(Boolean).pop() || key}</strong>
+                  <em>{option?.local_path || key}</em>
+                </span>
+                <button
+                  aria-label={`Remove ${option?.label || key}`}
+                  disabled={busy}
+                  onClick={() => removeRef(key)}
+                  type="button"
+                >
+                  <ButtonCloseIcon aria-hidden="true" />
+                </button>
+              </LoopspaceGraphDocumentRefItem>
+            );
+          })}
+        </LoopspaceGraphDocumentRefList>
+      ) : null}
+      {filteredOptions.length ? (
+        <LoopspaceGraphDocumentPickList aria-label="Asset search results">
+          {filteredOptions.map((option) => {
+            const key = loopspaceGraphAssetOptionKey(option);
+            return (
+              <LoopspaceGraphDocumentPickButton
+                disabled={busy}
+                key={key}
+                onClick={() => addRef(key)}
+                type="button"
+              >
+                <strong>{option.label}</strong>
+                <span>{option.asset_kind || "asset"}</span>
+              </LoopspaceGraphDocumentPickButton>
+            );
+          })}
+        </LoopspaceGraphDocumentPickList>
+      ) : null}
+    </LoopspaceGraphDocumentPicker>
+  );
+}
+
 function LoopspaceRuntimeView({
   actionState,
   agentLaunchDefaults = null,
   error,
+  assetLibrary = null,
   knownDevices = [],
   localDesktopProfile = null,
   localScripts = [],
@@ -6232,6 +6935,7 @@ function LoopspaceRuntimeView({
   const [runtimeError, setRuntimeError] = useState("");
   const [dropActive, setDropActive] = useState(false);
   const [graphDragGhost, setGraphDragGhost] = useState(null);
+  const [documentDropTargetNodeId, setDocumentDropTargetNodeId] = useState("");
   const [canvasPan, setCanvasPan] = useState({ x: 0, y: 0 });
   const [canvasZoom, setCanvasZoom] = useState(1);
   const [isCanvasPanning, setCanvasPanning] = useState(false);
@@ -6244,6 +6948,7 @@ function LoopspaceRuntimeView({
   const [sendMessageSettingsDrafts, setSendMessageSettingsDrafts] = useState({});
   const [sendMessageCheckpointDragPositions, setSendMessageCheckpointDragPositions] = useState({});
   const [sendMessageCheckpointLayoutPriorityId, setSendMessageCheckpointLayoutPriorityId] = useState("");
+  const [manualTriggerRunPendingId, setManualTriggerRunPendingId] = useState("");
   const [workspaceToolsVersion, setWorkspaceToolsVersion] = useState(() => getWorkspaceToolsVersion());
   const loopspaceId = loopspace?.id || "";
   const busy = actionState === "renaming" || actionState === "deleting" || loadingState === "saving";
@@ -6313,10 +7018,13 @@ function LoopspaceRuntimeView({
     if (!element) return;
     if (element.getAttribute?.("data-settings-open") === "true") return;
     const nodeKind = element.getAttribute?.("data-kind");
-    const isDocumentContextNode = nodeKind === "document_read" || nodeKind === "document_write";
+    const isResourceContextNode = nodeKind === "document_read"
+      || nodeKind === "document_write"
+      || nodeKind === "asset_read"
+      || nodeKind === "asset_write";
     const existing = nodeSizesRef.current[nodeId];
     if (
-      isDocumentContextNode
+      isResourceContextNode
       && element.getAttribute?.("data-explicit-height") !== "true"
       && existing?.manual !== true
     ) {
@@ -6589,6 +7297,7 @@ function LoopspaceRuntimeView({
   const refreshLoopspaceGraph = useCallback(async (
     remote = true,
     generation = refreshGenerationRef.current,
+    options = {},
   ) => {
     if (!loopspaceId) {
       setGraphSource("");
@@ -6616,7 +7325,9 @@ function LoopspaceRuntimeView({
         }
       } catch (graphError) {
         if (generation === refreshGenerationRef.current) {
-          setRuntimeError(String(graphError || "Unable to sync loop graph."));
+          if (!options.silent) {
+            setRuntimeError(String(graphError || "Unable to sync loop graph."));
+          }
         }
       }
     }
@@ -6639,9 +7350,8 @@ function LoopspaceRuntimeView({
         applyTriggerSnapshot(local);
       }
     } catch {
-      if (generation === refreshGenerationRef.current) {
-        applyTriggerSnapshot({});
-      }
+      // Keep the last known trigger inventory; the remote sync below can repair
+      // a stale local mirror without making attached graph triggers disappear.
     }
     if (remote) {
       try {
@@ -6702,6 +7412,7 @@ function LoopspaceRuntimeView({
     setNodeDragPositions({});
     setSendMessageCheckpointDragPositions({});
     setSendMessageCheckpointLayoutPriorityId("");
+    setManualTriggerRunPendingId("");
     setPendingGraphNodeIds(new Set());
     void refreshLoopspaceGraph(true, generation);
     void refreshLoopspaceTriggers(true, generation);
@@ -6777,6 +7488,10 @@ function LoopspaceRuntimeView({
   const loopspaceGraphDocumentOptions = useMemo(() => (
     loopspaceGraphDocumentOptionsFromRows(getWorkspaceToolsAccountSkills())
   ), [workspaceToolsVersion]);
+
+  const loopspaceGraphAssetOptions = useMemo(() => (
+    loopspaceGraphAssetOptionsFromLibrary(assetLibrary || {})
+  ), [assetLibrary]);
 
   const loopspaceGraphLiveDeviceRows = useMemo(() => (
     loopspaceGraphDeviceRowsFromSources([
@@ -6872,21 +7587,24 @@ function LoopspaceRuntimeView({
       const measured = nodeSizes[node.id];
       const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
       const baseLayout = loopspaceGraphNodeLayout(node, index);
-      const isDocumentContextNode = node.nodeKind === "document_read" || node.nodeKind === "document_write";
-      const hasExplicitDocumentHeight = isDocumentContextNode
+      const isResourceContextNode = node.nodeKind === "document_read"
+        || node.nodeKind === "document_write"
+        || node.nodeKind === "asset_read"
+        || node.nodeKind === "asset_write";
+      const hasExplicitResourceHeight = isResourceContextNode
         && Boolean(loopspaceGraphPropValue(node.props, ["h", "height"]));
       const sizedNode = Boolean(visualDefaults.sized || visualDefaults.minWidth || visualDefaults.minHeight);
       let layout = {
         ...baseLayout,
         ...(measured && measured.width && measured.height ? {
-          height: isDocumentContextNode
-            ? (hasExplicitDocumentHeight || measured.manual === true
+          height: isResourceContextNode
+            ? (hasExplicitResourceHeight || measured.manual === true
                 ? Math.max(visualDefaults.minHeight || baseLayout.height, baseLayout.height, measured.height)
                 : baseLayout.height)
             : sizedNode
             ? Math.max(visualDefaults.minHeight || baseLayout.height, measured.height)
             : measured.height,
-          width: isDocumentContextNode
+          width: isResourceContextNode
             ? baseLayout.width
             : sizedNode
             ? Math.max(visualDefaults.minWidth || baseLayout.width, measured.width)
@@ -6962,6 +7680,9 @@ function LoopspaceRuntimeView({
         if (!item?.id || !layout) return;
         const absoluteLayout = {
           ...layout,
+          inputY: layout.height / 2,
+          portGap: LOOPSPACE_GRAPH_FLOW_PORT_GAP,
+          portSize: LOOPSPACE_GRAPH_FLOW_PORT_SIZE,
           x: parentLayout.x + flowOrigin.x + layout.x,
           y: parentLayout.y + flowOrigin.y + layout.y,
         };
@@ -7057,6 +7778,47 @@ function LoopspaceRuntimeView({
     });
   }, [attachedTriggerIds, busy, commitLoopspaceGraphSource, graphSource, loopspaceId, triggerById]);
 
+  const runManualTriggerFromGraph = useCallback(async (triggerLike) => {
+    if (!loopspaceId || busy) return;
+    const triggerId = String(triggerLike?.id || triggerLike?.trigger_id || "").trim();
+    if (!triggerId) {
+      setRuntimeError("Trigger is missing an id.");
+      return;
+    }
+    const trigger = triggerById.get(triggerId);
+    if (!trigger) {
+      setRuntimeError("Trigger is not in local trigger inventory yet; refresh triggers and try again.");
+      return;
+    }
+    if (trigger.type !== "manual") {
+      setRuntimeError("Only manual Loopspace triggers can be run directly.");
+      return;
+    }
+    if (!trigger.enabled) {
+      setRuntimeError("Enable this manual trigger before running it.");
+      return;
+    }
+    setManualTriggerRunPendingId(triggerId);
+    setLoadingState("saving");
+    setRuntimeError("");
+    try {
+      const result = await invoke("cloud_mcp_run_loopspace_trigger", {
+        payload: {},
+        source: "rust-diffforge-ui",
+        triggerId,
+      });
+      applyTriggerSnapshot(result);
+      await refreshLoopspaceGraph(true, refreshGenerationRef.current, { silent: true });
+      await refreshLoopspaceLogs(loopspaceId, refreshGenerationRef.current, false, { mergeEvents: true });
+      setLoadingState("idle");
+    } catch (runError) {
+      setLoadingState("idle");
+      setRuntimeError(String(runError || "Unable to run trigger."));
+    } finally {
+      setManualTriggerRunPendingId((current) => (current === triggerId ? "" : current));
+    }
+  }, [applyTriggerSnapshot, busy, loopspaceId, refreshLoopspaceGraph, refreshLoopspaceLogs, triggerById]);
+
   const findSendMessageParentForPosition = useCallback((position = null) => {
     if (!position) return null;
     for (const node of visibleGraphNodes) {
@@ -7075,8 +7837,8 @@ function LoopspaceRuntimeView({
     return null;
   }, [graphNodeLayouts, visibleGraphNodes]);
 
-  const attachGraphNodeTemplateToLoop = useCallback(async (template, position = null) => {
-    if (!loopspaceId || busy || !template?.id) return;
+	  const attachGraphNodeTemplateToLoop = useCallback(async (template, position = null) => {
+	    if (!loopspaceId || busy || !template?.id) return;
     const baseSource = graphSourceRef.current || graphSource;
     const sendMessageDefaults = template.id === "send_message"
       ? normalizeLoopspaceSendMessageDraft(template, loopspaceAgentLaunchDefaultsRef.current)
@@ -7099,7 +7861,7 @@ function LoopspaceRuntimeView({
       createDfBlueprintNodeFromTemplate(templateWithDefaults, position),
       position,
     );
-    if (node.nodeKind === "document_read" || node.nodeKind === "document_write") {
+    if (["document_read", "document_write", "asset_read", "asset_write"].includes(node.nodeKind)) {
       const parent = findSendMessageParentForPosition(position);
       if (parent?.node?.id) {
         node.props = {
@@ -7120,6 +7882,15 @@ function LoopspaceRuntimeView({
       pendingNodeIds: [node.id],
     });
   }, [busy, commitLoopspaceGraphSource, findSendMessageParentForPosition, graphSource, loopspaceGraphDeviceOptions, loopspaceId]);
+
+  const attachDocumentReadNodeToLoop = useCallback(async (document, position = null) => {
+    const option = loopspaceGraphDocumentOptionFromDragPayload(document);
+    if (!option?.path_key) {
+      setRuntimeError("Unable to read the dropped document.");
+      return;
+    }
+    await attachGraphNodeTemplateToLoop(loopspaceGraphDocumentReadTemplateFromOption(option), position);
+  }, [attachGraphNodeTemplateToLoop]);
 
   const detachTriggerFromLoop = useCallback(async (trigger) => {
     if (!loopspaceId || !trigger?.id || busy) return;
@@ -7309,6 +8080,44 @@ function LoopspaceRuntimeView({
     await commitLoopspaceGraphSource(nextSource, "Unable to update document context node.");
   }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
 
+  const appendDocumentToContextNode = useCallback(async (node, document) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy) return false;
+    if (node.nodeKind !== "document_read" && node.nodeKind !== "document_write") return false;
+    const option = loopspaceGraphDocumentOptionFromDragPayload(document);
+    const pathKey = loopspaceGraphDocumentOptionKey(option);
+    if (!pathKey) {
+      setRuntimeError("Unable to read the dropped document.");
+      return false;
+    }
+    const refs = loopspaceGraphDocumentRefsFromProps(node.props || {});
+    if (refs.includes(pathKey)) return true;
+    await updateDocumentContextNodeRefs(node, [...refs, pathKey]);
+    return true;
+  }, [busy, loopspaceId, updateDocumentContextNodeRefs]);
+
+  const updateAssetContextNodeRefs = useCallback(async (node, refs = []) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy) return;
+    const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, nodeId, {
+      props: {
+        asset_refs: loopspaceGraphAssetRefsValue(refs),
+      },
+    });
+    await commitLoopspaceGraphSource(nextSource, "Unable to update asset context node.");
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
+
+  const updateResourceContextCreateName = useCallback(async (node, createName = "") => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy) return;
+    const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, nodeId, {
+      props: {
+        create_name: String(createName || "").trim(),
+      },
+    });
+    await commitLoopspaceGraphSource(nextSource, "Unable to update generated resource name.");
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
+
   const updateSendMessageSize = useCallback(async (node, size) => {
     const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node || "send_message");
     await updateSendMessageNodeProps(node, {
@@ -7383,21 +8192,22 @@ function LoopspaceRuntimeView({
     await commitLoopspaceGraphSource(nextSource, "Unable to unlink graph edge.");
   }, [busy, commitLoopspaceGraphSource, graphSource]);
 
-  const connectGraphNodes = useCallback(async (fromId, toId, fromPort = "out") => {
+  const connectGraphNodes = useCallback(async (fromId, toId, fromPort = "out", toPort = "in") => {
     const fromNode = graphNodeLookup.get(String(fromId || "").trim());
     const toNode = graphNodeLookup.get(String(toId || "").trim());
+    const safeToPort = String(toPort || "in").trim() || "in";
     if (!fromNode || !toNode || fromNode.id === toNode.id || busy) return;
     const validation = validateLoopspaceGraphEdgeCandidate(fromNode, toNode, {
       fromPort,
       nodeById: graphNodeLookup,
-      toPort: "in",
+      toPort: safeToPort,
     });
     if (!validation.ok) {
       setRuntimeError(validation.error || "That graph connection is not allowed.");
       return;
     }
     const source = graphSourceRef.current || graphSource;
-    const nextSource = loopspaceGraphSourceWithEdge(source, fromNode, toNode, fromPort, "in");
+    const nextSource = loopspaceGraphSourceWithEdge(source, fromNode, toNode, fromPort, safeToPort);
     if (nextSource === source) return;
     await commitLoopspaceGraphSource(nextSource, "Unable to connect graph nodes.");
   }, [busy, commitLoopspaceGraphSource, graphNodeLookup, graphSource]);
@@ -7469,7 +8279,7 @@ function LoopspaceRuntimeView({
       || event.button !== 0
       || !node?.id
       || !layout
-      || (node.nodeKind !== "document_read" && node.nodeKind !== "document_write")
+      || !["document_read", "document_write", "asset_read", "asset_write"].includes(node.nodeKind)
     ) {
       return;
     }
@@ -7593,8 +8403,8 @@ function LoopspaceRuntimeView({
     const id = String(nodeId || "").trim();
     if (!id || !position || busy) return;
     const node = graphNodeLookup.get(id);
-    const isDocumentContextNode = node?.nodeKind === "document_read" || node?.nodeKind === "document_write";
-    const parent = isDocumentContextNode ? findSendMessageParentForPosition(position) : null;
+    const isResourceContextNode = ["document_read", "document_write", "asset_read", "asset_write"].includes(node?.nodeKind);
+    const parent = isResourceContextNode ? findSendMessageParentForPosition(position) : null;
     const patch = parent?.node?.id && parent.node.id !== id
       ? {
           hasPosition: false,
@@ -7608,7 +8418,7 @@ function LoopspaceRuntimeView({
         }
       : {
           hasPosition: true,
-          props: isDocumentContextNode ? { inner_x: "", inner_y: "", parent_id: "" } : {},
+          props: isResourceContextNode ? { inner_x: "", inner_y: "", parent_id: "" } : {},
           x: position.x,
           y: position.y,
         };
@@ -7726,15 +8536,55 @@ function LoopspaceRuntimeView({
     const toId = inputPort?.getAttribute?.("data-loopspace-graph-input-id")
       || targetNode?.getAttribute?.("data-loopspace-graph-node-id")
       || "";
+    const toPort = inputPort?.getAttribute?.("data-loopspace-graph-input-port") || "in";
     setPendingConnection(null);
     event.currentTarget?.releasePointerCapture?.(event.pointerId);
     if (toId && toId !== current.fromId && current.fromPort) {
-      void connectGraphNodes(current.fromId, toId, current.fromPort);
+      void connectGraphNodes(current.fromId, toId, current.fromPort, toPort);
     }
   }, [connectGraphNodes, pendingConnection]);
 
-  const readDroppedTrigger = useCallback((event) => {
+  const hasDroppedDocumentType = useCallback((event) => (
+    (() => {
+      const types = Array.from(event.dataTransfer?.types || []);
+      if (types.includes("Files")) return false;
+      if (types.includes(LOOPSPACE_DOCUMENT_DRAG_MIME)) return true;
+      const plainPayload = loopspaceDragPayloadFromPlainText(event.dataTransfer);
+      return plainPayload?.kind === LOOPSPACE_DOCUMENT_DRAG_KIND
+        || plainPayload?.type === "account_document"
+        || Boolean(plainPayload?.document);
+    })()
+  ), []);
+
+  const readDroppedDocument = useCallback((event) => {
+    const customPayload = loopspaceParseJsonDragPayload(
+      event.dataTransfer?.getData?.(LOOPSPACE_DOCUMENT_DRAG_MIME),
+    );
+    const customOption = loopspaceGraphDocumentOptionFromDragPayload(customPayload);
+    if (customOption) return customOption;
     const plainPayload = loopspaceDragPayloadFromPlainText(event.dataTransfer);
+    if (
+      plainPayload?.kind === LOOPSPACE_DOCUMENT_DRAG_KIND
+      || plainPayload?.type === "account_document"
+      || plainPayload?.document
+    ) {
+      return loopspaceGraphDocumentOptionFromDragPayload(plainPayload);
+    }
+    return null;
+  }, []);
+
+  const readDroppedTrigger = useCallback((event) => {
+    if (Array.from(event.dataTransfer?.types || []).includes(LOOPSPACE_DOCUMENT_DRAG_MIME)) {
+      return null;
+    }
+    const plainPayload = loopspaceDragPayloadFromPlainText(event.dataTransfer);
+    if (
+      plainPayload?.kind === LOOPSPACE_DOCUMENT_DRAG_KIND
+      || plainPayload?.type === "account_document"
+      || plainPayload?.document
+    ) {
+      return null;
+    }
     if (plainPayload?.kind === LOOPSPACE_TRIGGER_DRAG_KIND) {
       return {
         id: plainPayload.trigger_id || plainPayload.id || "",
@@ -7765,11 +8615,17 @@ function LoopspaceRuntimeView({
   ), []);
 
   const readDroppedGraphNodeTemplate = useCallback((event) => {
+    if (Array.from(event.dataTransfer?.types || []).includes(LOOPSPACE_DOCUMENT_DRAG_MIME)) {
+      return null;
+    }
     const templateFromLoosePayload = (payload) => {
       if (!payload || typeof payload !== "object") return null;
       if (
         payload.kind === LOOPSPACE_TRIGGER_DRAG_KIND
           || payload.kind === LOOPSPACE_GRAPH_NODE_TEMPLATE_DRAG_KIND
+          || payload.kind === LOOPSPACE_DOCUMENT_DRAG_KIND
+          || payload.type === "account_document"
+          || payload.document
       ) {
         return null;
       }
@@ -7834,7 +8690,9 @@ function LoopspaceRuntimeView({
 
   const hasDroppedTriggerPlainTextFallbackType = useCallback((event) => {
     const types = Array.from(event.dataTransfer?.types || []);
-    return types.includes("text/plain") && !types.includes("Files");
+    return types.includes("text/plain")
+      && !types.includes("Files")
+      && !types.includes(LOOPSPACE_DOCUMENT_DRAG_MIME);
   }, []);
 
   const hasDroppedLoopspaceGraphItemType = useCallback((event) => (
@@ -7845,12 +8703,21 @@ function LoopspaceRuntimeView({
       return activeGraphDragRef.current?.kind === "template"
         || hasDroppedTriggerType(event)
         || hasDroppedGraphNodeTemplateType(event)
+        || hasDroppedDocumentType(event)
         || plainPayload?.kind === LOOPSPACE_TRIGGER_DRAG_KIND
         || plainPayload?.kind === LOOPSPACE_GRAPH_NODE_TEMPLATE_DRAG_KIND
+        || plainPayload?.kind === LOOPSPACE_DOCUMENT_DRAG_KIND
+        || plainPayload?.type === "account_document"
+        || Boolean(plainPayload?.document)
         || hasDroppedTriggerPlainTextFallbackType(event)
         || types.length === 0;
     })()
-  ), [hasDroppedGraphNodeTemplateType, hasDroppedTriggerPlainTextFallbackType, hasDroppedTriggerType]);
+  ), [
+    hasDroppedDocumentType,
+    hasDroppedGraphNodeTemplateType,
+    hasDroppedTriggerPlainTextFallbackType,
+    hasDroppedTriggerType,
+  ]);
 
   const applyGraphViewport = useCallback((nextPan, nextZoom = canvasZoomRef.current) => {
     const safePan = {
@@ -8123,6 +8990,13 @@ function LoopspaceRuntimeView({
   ]);
 
   const graphPreviewNodeFromDropEvent = useCallback((event, position) => {
+    const droppedDocument = readDroppedDocument(event);
+    if (droppedDocument) {
+      return loopspaceGraphNodePositionedForDrop(
+        createDfBlueprintNodeFromTemplate(loopspaceGraphDocumentReadTemplateFromOption(droppedDocument), position),
+        position,
+      );
+    }
     const graphNodeTemplate = readDroppedGraphNodeTemplate(event);
     if (graphNodeTemplate) {
       return loopspaceGraphNodePositionedForDrop(
@@ -8156,6 +9030,12 @@ function LoopspaceRuntimeView({
         role: "trigger",
       }, position);
     }
+    if (hasDroppedDocumentType(event)) {
+      return createDfBlueprintNodeFromTemplate({
+        id: "document_read",
+        label: "Document read",
+      }, position);
+    }
     if (hasDroppedLoopspaceGraphItemType(event)) {
       return createDfBlueprintNodeFromTemplate({
         icon: "node",
@@ -8166,8 +9046,10 @@ function LoopspaceRuntimeView({
     }
     return null;
   }, [
+    hasDroppedDocumentType,
     hasDroppedLoopspaceGraphItemType,
     hasDroppedTriggerType,
+    readDroppedDocument,
     readDroppedGraphNodeTemplate,
     readDroppedTrigger,
     triggerById,
@@ -8194,6 +9076,7 @@ function LoopspaceRuntimeView({
   const onGraphDrop = useCallback((event) => {
     setDropActive(false);
     setGraphDragGhost(null);
+    setDocumentDropTargetNodeId("");
     if (!hasDroppedLoopspaceGraphItemType(event)) {
       return;
     }
@@ -8206,6 +9089,11 @@ function LoopspaceRuntimeView({
       return;
     }
     const position = graphPointFromClient(event.clientX, event.clientY);
+    const droppedDocument = readDroppedDocument(event);
+    if (droppedDocument) {
+      void attachDocumentReadNodeToLoop(droppedDocument, position);
+      return;
+    }
     const graphNodeTemplate = readDroppedGraphNodeTemplate(event);
     if (graphNodeTemplate) {
       void attachGraphNodeTemplateToLoop(graphNodeTemplate, position);
@@ -8223,15 +9111,76 @@ function LoopspaceRuntimeView({
       setRuntimeError("Unable to read the dropped graph item.");
     }
   }, [
+    attachDocumentReadNodeToLoop,
     attachGraphNodeTemplateToLoop,
     attachTriggerToLoop,
     busy,
     graphPointFromClient,
     hasDroppedLoopspaceGraphItemType,
     isGraphDropPoint,
+    readDroppedDocument,
     readDroppedGraphNodeTemplate,
     readDroppedTrigger,
     triggerById,
+  ]);
+
+  const onDocumentContextNodeDragEnter = useCallback((event, node) => {
+    if ((node?.nodeKind !== "document_read" && node?.nodeKind !== "document_write") || !hasDroppedDocumentType(event)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    setDropActive(false);
+    setGraphDragGhost(null);
+    setDocumentDropTargetNodeId(node.id || "");
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = "copy";
+    }
+  }, [hasDroppedDocumentType]);
+
+  const onDocumentContextNodeDragOver = useCallback((event, node) => {
+    if ((node?.nodeKind !== "document_read" && node?.nodeKind !== "document_write") || !hasDroppedDocumentType(event)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    setDropActive(false);
+    setGraphDragGhost(null);
+    setDocumentDropTargetNodeId(node.id || "");
+    if (event.dataTransfer) {
+      event.dataTransfer.dropEffect = "copy";
+    }
+  }, [hasDroppedDocumentType]);
+
+  const onDocumentContextNodeDragLeave = useCallback((event, node) => {
+    if (event.currentTarget?.contains?.(event.relatedTarget)) return;
+    setDocumentDropTargetNodeId((current) => (current === String(node?.id || "") ? "" : current));
+  }, []);
+
+  const onDocumentContextNodeDrop = useCallback((event, node) => {
+    if ((node?.nodeKind !== "document_read" && node?.nodeKind !== "document_write") || !hasDroppedDocumentType(event)) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    setDropActive(false);
+    setGraphDragGhost(null);
+    setDocumentDropTargetNodeId("");
+    if (busy) {
+      setRuntimeError("Graph is still saving. Try the drop again after Cloud confirms the current edit.");
+      return;
+    }
+    const droppedDocument = readDroppedDocument(event);
+    if (!droppedDocument) {
+      setRuntimeError("Unable to read the dropped document.");
+      return;
+    }
+    void appendDocumentToContextNode(node, droppedDocument);
+  }, [
+    appendDocumentToContextNode,
+    busy,
+    hasDroppedDocumentType,
+    readDroppedDocument,
   ]);
 
   const graphZoomPercent = Math.round(canvasZoom * 100);
@@ -8290,6 +9239,55 @@ function LoopspaceRuntimeView({
   ), [selectedHistoryRunId, visibleRuntimeEvents]);
   const runtimePanelNodeTemplates = loopspaceGraphPaletteTemplates;
   const runtimeStatus = runtimeError || error;
+  const foregroundGraphEdges = visibleGraphEdges.filter((edge) => loopspaceGraphEdgeNeedsForegroundLayer(edge, graphNodeLookup));
+  const backgroundGraphEdges = visibleGraphEdges.filter((edge) => !loopspaceGraphEdgeNeedsForegroundLayer(edge, graphNodeLookup));
+  const renderLoopspaceGraphEdge = (edge) => {
+    const fromNode = graphNodeLookup.get(edge.from);
+    const toNode = graphNodeLookup.get(edge.to);
+    const fromLayout = graphNodeLayouts.get(edge.from);
+    const toLayout = graphNodeLayouts.get(edge.to);
+    if (!fromLayout || !toLayout) return null;
+    const edgeFromPort = String(edge.fromPort || "").trim();
+    if (!edgeFromPort) return null;
+    const fromPoint = loopspaceGraphOutputPoint(fromLayout, fromNode, edgeFromPort);
+    const toPoint = loopspaceGraphInputPoint(toLayout, toNode, edge.toPort || "in");
+    const labelPoint = {
+      x: (fromPoint.x + toPoint.x) / 2,
+      y: (fromPoint.y + toPoint.y) / 2,
+    };
+    const branch = loopspaceGraphEdgeBranch(edge);
+    const isActiveEdge = activeRuntimeStatus && runtimeHeadEdgeId && edge.id === runtimeHeadEdgeId;
+    const edgeLabel = edge.label || loopspaceGraphPortLabel(branch || edgeFromPort);
+    return (
+      <g key={edge.id}>
+        <LoopspaceGraphEdgePath
+          d={loopspaceGraphPathBetween(fromPoint, toPoint)}
+          data-active={isActiveEdge ? "true" : undefined}
+          data-branch={branch || undefined}
+          onPointerDown={(event) => {
+            if (!event.altKey) return;
+            event.preventDefault();
+            event.stopPropagation();
+            void disconnectGraphEdge(edge.id);
+          }}
+        />
+        {edgeLabel ? (
+          <LoopspaceGraphEdgeLabel
+            onPointerDown={(event) => {
+              if (!event.altKey) return;
+              event.preventDefault();
+              event.stopPropagation();
+              void disconnectGraphEdge(edge.id);
+            }}
+            x={labelPoint.x}
+            y={labelPoint.y - 6}
+          >
+            {edgeLabel}
+          </LoopspaceGraphEdgeLabel>
+        ) : null}
+      </g>
+    );
+  };
 
   const loadOlderRuntimeEvents = useCallback(async () => {
     if (
@@ -8386,13 +9384,14 @@ function LoopspaceRuntimeView({
                 updateGraphDragGhostFromEvent(event);
               }
             }}
-            onDragLeave={(event) => {
-              const nextTarget = event.relatedTarget;
-              if (!nextTarget || !event.currentTarget.contains(nextTarget)) {
-                setDropActive(false);
-                setGraphDragGhost(null);
-              }
-            }}
+	            onDragLeave={(event) => {
+	              const nextTarget = event.relatedTarget;
+	              if (!nextTarget || !event.currentTarget.contains(nextTarget)) {
+	                setDropActive(false);
+	                setGraphDragGhost(null);
+                  setDocumentDropTargetNodeId("");
+	              }
+	            }}
             onDragOver={(event) => {
               if (hasDroppedLoopspaceGraphItemType(event)) {
                 if (!isGraphDropPoint(event.clientX, event.clientY)) {
@@ -8423,84 +9422,51 @@ function LoopspaceRuntimeView({
             }}
           >
             <LoopspaceGraphContent>
-              <LoopspaceGraphEdges aria-label="Loop graph connections">
-                {visibleGraphEdges.map((edge) => {
-                  const fromNode = graphNodeLookup.get(edge.from);
-                  const fromLayout = graphNodeLayouts.get(edge.from);
-                  const toLayout = graphNodeLayouts.get(edge.to);
-                  if (!fromLayout || !toLayout) return null;
-                  const edgeFromPort = String(edge.fromPort || "").trim();
-                  if (!edgeFromPort) return null;
-                  const fromPoint = loopspaceGraphOutputPoint(fromLayout, fromNode, edgeFromPort);
-                  const toPoint = loopspaceGraphInputPoint(toLayout);
-                  const labelPoint = {
-                    x: (fromPoint.x + toPoint.x) / 2,
-                    y: (fromPoint.y + toPoint.y) / 2,
-                  };
-                  const branch = loopspaceGraphEdgeBranch(edge);
-                  const isActiveEdge = activeRuntimeStatus && runtimeHeadEdgeId && edge.id === runtimeHeadEdgeId;
-                  const edgeLabel = edge.label || loopspaceGraphPortLabel(branch || edgeFromPort);
-                  return (
-                    <g key={edge.id}>
-                      <LoopspaceGraphEdgePath
-                        d={loopspaceGraphPathBetween(fromPoint, toPoint)}
-                        data-active={isActiveEdge ? "true" : undefined}
-                        data-branch={branch || undefined}
-                        onPointerDown={(event) => {
-                          if (!event.altKey) return;
-                          event.preventDefault();
-                          event.stopPropagation();
-                          void disconnectGraphEdge(edge.id);
-                        }}
-                      />
-                      {edgeLabel ? (
-                        <LoopspaceGraphEdgeLabel
-                          onPointerDown={(event) => {
-                            if (!event.altKey) return;
-                            event.preventDefault();
-                            event.stopPropagation();
-                            void disconnectGraphEdge(edge.id);
-                          }}
-                          x={labelPoint.x}
-                          y={labelPoint.y - 6}
-                        >
-                          {edgeLabel}
-                        </LoopspaceGraphEdgeLabel>
-                      ) : null}
-                    </g>
-                  );
-                })}
-                {pendingConnection ? (
-                  <LoopspaceGraphConnectionPreview
-                    d={loopspaceGraphPathBetween(pendingConnection.fromPoint, pendingConnection.toPoint)}
-                  />
-                ) : null}
+              <LoopspaceGraphEdges aria-label="Loop graph connections" data-layer="background">
+                {backgroundGraphEdges.map(renderLoopspaceGraphEdge)}
               </LoopspaceGraphEdges>
               {visibleGraphNodes.map((node, index) => {
                 const trigger = node.triggerId ? triggerById.get(node.triggerId) : null;
                 const type = trigger?.type || node.nodeKind || node.role || "loop";
+                const isTriggerNode = Boolean(node.triggerId);
+                const nodeTriggerType = isTriggerNode
+                  ? String(trigger?.type || node.triggerType || node.trigger_type || "").trim().toLowerCase()
+                  : "";
                 const Icon = node.triggerId
-                  ? loopspaceTriggerTypeIcon(trigger?.type || "manual")
+                  ? loopspaceTriggerTypeIcon(nodeTriggerType || "manual")
                   : node.nodeKind === "device"
                     ? Devices
                     : node.nodeKind === "run_script"
                       ? Terminal
                     : node.nodeKind === "send_message"
                     ? AdsClick
+                    : node.nodeKind === "asset_read" || node.nodeKind === "asset_write"
+                    ? PermMedia
                     : AccountTree;
                 const isRuntimeNode = activeRuntimeStatus && String(runtimeHead?.currentNodeId || runtimeHead?.current_node_id || runtimeHead?.cursorNodeId || runtimeHead?.cursor_node_id || "") === node.id;
                 const nodeLayout = graphNodeLayouts.get(node.id) || loopspaceGraphNodeLayout(node, index);
-                const isTriggerNode = Boolean(node.triggerId);
+                const isManualTriggerNode = isTriggerNode && nodeTriggerType === "manual";
+                const manualTriggerRunPending = isManualTriggerNode && manualTriggerRunPendingId === node.triggerId;
                 const canRemoveNode = Boolean(node.triggerId || node.nodeKind);
                 const isDocumentReadNode = node.nodeKind === "document_read";
                 const isDocumentWriteNode = node.nodeKind === "document_write";
+                const isAssetReadNode = node.nodeKind === "asset_read";
+                const isAssetWriteNode = node.nodeKind === "asset_write";
                 const isDocumentContextNode = isDocumentReadNode || isDocumentWriteNode;
+                const isAssetContextNode = isAssetReadNode || isAssetWriteNode;
+                const isResourceContextNode = isDocumentContextNode || isAssetContextNode;
                 const nodeInputPorts = loopspaceGraphInputPortsForNode(node);
                 const nodeOutputPorts = loopspaceGraphOutputPortsForNode(node);
                 const nodeDocumentRefs = isDocumentContextNode
                   ? loopspaceGraphDocumentRefsFromProps(node.props)
                   : [];
-                const nodeDocumentSearch = isDocumentContextNode
+                const nodeAssetRefs = isAssetContextNode
+                  ? loopspaceGraphAssetRefsFromProps(node.props)
+                  : [];
+                const nodeResourceCreateName = isResourceContextNode
+                  ? String(loopspaceGraphPropValue(node.props, ["create_name", "createName", "name"]) || "").trim()
+                  : "";
+                const nodeDocumentSearch = isResourceContextNode
                   ? String(documentContextSearchByNode[node.id] || "")
                   : "";
                 const nodeScriptKey = node.nodeKind === "run_script"
@@ -8634,8 +9600,8 @@ function LoopspaceRuntimeView({
                     ),
                   )
                   : null;
-                const sendMessageFlowNodes = sendMessageFlowBounds
-                  ? loopspaceGraphResolveMessageFlowNodes(sendMessageInternalNodes.map(({ item, itemIndex }, flowIndex) => {
+	                const sendMessageFlowNodes = sendMessageFlowBounds
+	                  ? loopspaceGraphResolveMessageFlowNodes(sendMessageInternalNodes.map(({ item, itemIndex }, flowIndex) => {
                     const baseLayout = loopspaceGraphMessageChildLocalPosition(item, flowIndex, sendMessageFlowBounds);
                     const dragPosition = sendMessageCheckpointDragPositions[item.id];
                     const childLayout = dragPosition
@@ -8653,51 +9619,44 @@ function LoopspaceRuntimeView({
                       priority: item.id === sendMessageCheckpointLayoutPriorityId,
                     };
                   }), sendMessageFlowBounds)
-                  : [];
+	                  : [];
+                const sendMessageFlowOrigin = sendMessageFlowBounds
+                  ? loopspaceGraphMessageFlowOrigin(nodeLayout, sendMessageFlowBounds)
+                  : null;
                 const sendMessageFlowInputY = sendMessageFlowBounds
-                  ? loopspaceGraphMessageFlowAnchorY(nodeLayout, sendMessageFlowBounds, node, "in")
+                  ? loopspaceGraphMessageFlowParentPortY(nodeLayout, sendMessageFlowBounds, node, "in")
                   : 0;
                 const sendMessageFlowSuccessY = sendMessageFlowBounds
-                  ? loopspaceGraphMessageFlowAnchorY(nodeLayout, sendMessageFlowBounds, node, "success")
+                  ? loopspaceGraphMessageFlowParentPortY(nodeLayout, sendMessageFlowBounds, node, "success")
                   : 0;
-                const sendMessageFlowInputX = loopspaceGraphMessageFlowParentInputX();
-                const sendMessageFlowSuccessX = loopspaceGraphMessageFlowParentOutputX(nodeLayout);
-                const sendMessageFlowEdges = sendMessageFlowBounds && sendMessageFlowNodes.length
-                  ? [
-                      {
-                        id: `${node.id}:in`,
-                        from: { x: sendMessageFlowInputX, y: sendMessageFlowInputY },
-                        to: { x: sendMessageFlowNodes[0].layout.x, y: sendMessageFlowNodes[0].center.y },
-                      },
-                      ...sendMessageFlowNodes.slice(0, -1).map((flowNode, flowIndex) => {
-                        const nextFlowNode = sendMessageFlowNodes[flowIndex + 1];
-                        return {
-                          id: `${flowNode.item.id}:${nextFlowNode.item.id}`,
-                          from: {
-                            x: flowNode.layout.x + flowNode.layout.width,
-                            y: flowNode.center.y,
-                          },
-                          to: {
-                            x: nextFlowNode.layout.x,
-                            y: nextFlowNode.center.y,
-                          },
-                        };
-                      }),
-                      {
-                        id: `${node.id}:success`,
-                        from: {
-                          x: sendMessageFlowNodes[sendMessageFlowNodes.length - 1].layout.x
-                            + sendMessageFlowNodes[sendMessageFlowNodes.length - 1].layout.width,
-                          y: sendMessageFlowNodes[sendMessageFlowNodes.length - 1].center.y,
-                        },
-                        to: {
-                          x: sendMessageFlowSuccessX,
+	                const sendMessageFlowInputX = loopspaceGraphMessageFlowParentInputX();
+	                const sendMessageFlowSuccessX = loopspaceGraphMessageFlowParentOutputX(nodeLayout);
+	                const sendMessageFlowEdges = sendMessageFlowBounds && sendMessageFlowNodes.length
+	                  ? [
+	                      {
+	                        id: `${node.id}:in`,
+	                        from: { x: sendMessageFlowInputX, y: sendMessageFlowInputY },
+	                        to: loopspaceGraphMessageFlowNodeInputPoint(sendMessageFlowNodes[0]),
+	                      },
+	                      ...sendMessageFlowNodes.slice(0, -1).map((flowNode, flowIndex) => {
+	                        const nextFlowNode = sendMessageFlowNodes[flowIndex + 1];
+	                        return {
+	                          id: `${flowNode.item.id}:${nextFlowNode.item.id}`,
+	                          from: loopspaceGraphMessageFlowNodeFlowOutputPoint(flowNode),
+	                          to: loopspaceGraphMessageFlowNodeInputPoint(nextFlowNode),
+	                        };
+	                      }),
+	                      {
+	                        id: `${node.id}:success`,
+	                        from: loopspaceGraphMessageFlowNodeFlowOutputPoint(sendMessageFlowNodes[sendMessageFlowNodes.length - 1]),
+	                        to: {
+	                          x: sendMessageFlowSuccessX,
                           y: sendMessageFlowSuccessY,
                         },
                       },
                     ]
                   : [];
-                const cronCountdown = node.triggerId && (trigger?.type || "").toLowerCase() === "cron"
+                const cronCountdown = node.triggerId && nodeTriggerType === "cron"
                   ? formatLoopspaceCountdown(trigger?.nextDueAtMs, timerNowMs)
                   : "";
                 const nodeTitle = node.nodeKind === "run_script"
@@ -8706,9 +9665,11 @@ function LoopspaceRuntimeView({
                     ? graphDeviceLabel
                     : isDocumentContextNode
                       ? (isDocumentReadNode ? "Document read" : "Document write")
+                      : isAssetContextNode
+                        ? (isAssetReadNode ? "Asset read" : "Asset write")
                       : (trigger?.name || node.label);
                 const nodeSubtitleBase = node.triggerId
-                  ? loopspaceTriggerTypeLabel(trigger?.type || "manual")
+                  ? loopspaceTriggerTypeLabel(nodeTriggerType || "manual")
                   : node.nodeKind === "device"
                     ? [
                         "Device",
@@ -8720,8 +9681,12 @@ function LoopspaceRuntimeView({
                         ? "Send message"
                         : isDocumentReadNode
                           ? "Readable docs"
-                          : isDocumentWriteNode
-                            ? "Writable docs"
+                        : isDocumentWriteNode
+                          ? "Writable docs"
+                        : isAssetReadNode
+                          ? "Readable assets"
+                        : isAssetWriteNode
+                          ? "Writable assets"
                             : (type || "Graph node");
                 const nodeTitleKey = String(nodeTitle || "").trim().toLowerCase();
                 const nodeSubtitle = [
@@ -8733,7 +9698,7 @@ function LoopspaceRuntimeView({
                   .join(" - ");
                 return (
                   <LoopspaceGraphNode
-                    data-kind={node.triggerId ? (trigger?.type || "manual") : (node.nodeKind || "loop")}
+                    data-kind={node.triggerId ? (nodeTriggerType || "manual") : (node.nodeKind || "loop")}
                     data-region={isSendMessageRegion ? "true" : undefined}
                     data-loopspace-graph-node-id={node.id}
                     data-loopspace-graph-node="true"
@@ -8741,41 +9706,62 @@ function LoopspaceRuntimeView({
                     data-pending={pendingGraphNodeIds.has(node.id) ? "true" : undefined}
                     data-runtime={isRuntimeNode ? String(runtimeHead?.status || "active") : undefined}
                     data-settings-open={sendMessageSettingsOpen ? "true" : undefined}
-                    data-explicit-height={isDocumentContextNode && loopspaceGraphPropValue(node.props, ["h", "height"]) ? "true" : undefined}
+                    data-document-drop-target={documentDropTargetNodeId === node.id ? "true" : undefined}
+                    data-explicit-height={isResourceContextNode && loopspaceGraphPropValue(node.props, ["h", "height"]) ? "true" : undefined}
                     key={node.id}
+                    onDragEnter={(event) => onDocumentContextNodeDragEnter(event, node)}
+                    onDragLeave={(event) => onDocumentContextNodeDragLeave(event, node)}
+                    onDragOver={(event) => onDocumentContextNodeDragOver(event, node)}
+                    onDrop={(event) => onDocumentContextNodeDrop(event, node)}
                     onPointerCancel={finishGraphNodeDrag}
                     onPointerDown={(event) => startGraphNodeDrag(event, node)}
                     onPointerMove={moveGraphNodeDrag}
                     onPointerUp={finishGraphNodeDrag}
                     ref={registerGraphNodeElement(node.id)}
-                    style={{
-                      ...(isSizedGraphNode ? {
-                        "--loopspace-node-height": `${nodeLayout.height}px`,
-                        ...(nodeVisualDefaults.outputGutter ? {
-                          "--loopspace-node-output-gutter": `${nodeVisualDefaults.outputGutter}px`,
-                        } : {}),
-                        "--loopspace-node-width": `${nodeLayout.width}px`,
-                      } : {}),
-                      "--loopspace-node-x": `${nodeLayout.x}px`,
-                      "--loopspace-node-y": `${nodeLayout.y}px`,
-                    }}
-                  >
-                    {!nodeInputPorts.length ? null : (
-                      <LoopspaceGraphNodePort
-                        aria-label={`Connect into ${trigger?.name || node.label}`}
-                        data-loopspace-graph-input-id={node.id}
-                        data-loopspace-graph-port="true"
-                        data-side="input"
-                        onPointerDown={(event) => {
-                          if (!event.altKey) return;
-                          event.preventDefault();
-                          event.stopPropagation();
-                          void disconnectGraphPort(node.id, "input", "in");
-                        }}
-                        title="Input"
-                        type="button"
-                      />
-                    )}
+	                    style={{
+	                      ...(isSizedGraphNode ? {
+	                        "--loopspace-node-height": `${nodeLayout.height}px`,
+	                        ...(nodeVisualDefaults.outputGutter ? {
+	                          "--loopspace-node-output-gutter": `${nodeVisualDefaults.outputGutter}px`,
+	                        } : {}),
+	                        "--loopspace-node-width": `${nodeLayout.width}px`,
+	                      } : {}),
+	                      ...(Number.isFinite(nodeLayout.inputY) ? {
+	                        "--loopspace-node-input-y": `${nodeLayout.inputY}px`,
+	                      } : {}),
+	                      ...(Number.isFinite(nodeLayout.outputStackCenterY) ? {
+	                        "--loopspace-node-output-y": `${nodeLayout.outputStackCenterY}px`,
+	                      } : {}),
+	                      "--loopspace-node-x": `${nodeLayout.x}px`,
+	                      "--loopspace-node-y": `${nodeLayout.y}px`,
+	                    }}
+	                  >
+	                    {nodeInputPorts.map((port, portIndex) => {
+	                      const baseInputY = Number.isFinite(nodeLayout.inputY)
+	                        ? `${nodeLayout.inputY}px`
+	                        : "50%";
+	                      const inputPortY = nodeInputPorts.length <= 1
+	                        ? baseInputY
+	                        : `calc(${baseInputY} + ${(portIndex - ((nodeInputPorts.length - 1) / 2)) * (LOOPSPACE_GRAPH_PORT_SIZE + LOOPSPACE_GRAPH_PORT_GAP)}px)`;
+	                      return (
+	                        <LoopspaceGraphNodePort
+	                          aria-label={`Connect ${port.label || port.id} into ${trigger?.name || node.label}`}
+	                          data-loopspace-graph-input-id={node.id}
+	                          data-loopspace-graph-input-port={port.id}
+	                          data-loopspace-graph-port="true"
+	                          data-side="input"
+	                          key={port.id}
+	                          onPointerDown={(event) => {
+	                            if (!event.altKey) return;
+	                            event.preventDefault();
+	                            event.stopPropagation();
+	                            void disconnectGraphPort(node.id, "input", port.id);
+	                          }}
+	                          style={{ "--loopspace-node-input-y": inputPortY }}
+	                          type="button"
+	                        />
+	                      );
+	                    })}
                     <LoopspaceGraphNodeIcon>
                       <Icon aria-hidden="true" />
                     </LoopspaceGraphNodeIcon>
@@ -8787,6 +9773,34 @@ function LoopspaceRuntimeView({
                           <Schedule aria-hidden="true" />
                           <span>Next {cronCountdown}</span>
                         </LoopspaceGraphNodeTimer>
+                      ) : null}
+                      {isManualTriggerNode ? (
+                        <LoopspaceGraphTriggerRunButton
+                          aria-label={`Run ${nodeTitle || "manual trigger"}`}
+                          data-running={manualTriggerRunPending ? "true" : undefined}
+                          disabled={busy || manualTriggerRunPending || !trigger || !trigger.enabled}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void runManualTriggerFromGraph(trigger || node);
+                          }}
+                          onPointerDown={(event) => event.stopPropagation()}
+                          title={
+                            !trigger
+                              ? "Refresh triggers before running"
+                              : !trigger.enabled
+                              ? "Enable this trigger before running"
+                              : manualTriggerRunPending
+                                ? "Running"
+                                : "Run manual trigger"
+                          }
+                          type="button"
+                        >
+                          {manualTriggerRunPending ? (
+                            <PendingIcon aria-hidden="true" />
+                          ) : (
+                            <PlayArrow aria-hidden="true" />
+                          )}
+                        </LoopspaceGraphTriggerRunButton>
                       ) : null}
                       {node.nodeKind === "run_script" ? (
                         <LoopspaceRunScriptSelect
@@ -8824,10 +9838,28 @@ function LoopspaceRuntimeView({
                       {isDocumentContextNode ? (
                         <LoopspaceDocumentContextPicker
                           busy={busy}
+                          createName={nodeResourceCreateName}
                           mode={isDocumentWriteNode ? "write" : "read"}
+                          onCreateNameChange={(value) => void updateResourceContextCreateName(node, value)}
                           onRefsChange={(refs) => void updateDocumentContextNodeRefs(node, refs)}
                           options={loopspaceGraphDocumentOptions}
                           refs={nodeDocumentRefs}
+                          search={nodeDocumentSearch}
+                          setSearch={(value) => setDocumentContextSearchByNode((current) => ({
+                            ...current,
+                            [node.id]: value,
+                          }))}
+                        />
+                      ) : null}
+                      {isAssetContextNode ? (
+                        <LoopspaceAssetContextPicker
+                          busy={busy}
+                          createName={nodeResourceCreateName}
+                          mode={isAssetWriteNode ? "write" : "read"}
+                          onCreateNameChange={(value) => void updateResourceContextCreateName(node, value)}
+                          onRefsChange={(refs) => void updateAssetContextNodeRefs(node, refs)}
+                          options={loopspaceGraphAssetOptions}
+                          refs={nodeAssetRefs}
                           search={nodeDocumentSearch}
                           setSearch={(value) => setDocumentContextSearchByNode((current) => ({
                             ...current,
@@ -8864,7 +9896,15 @@ function LoopspaceRuntimeView({
                             <ButtonSettingsIcon aria-hidden="true" />
                           )}
                         </LoopspaceGraphMessageSettingsButton>
-                        <LoopspaceGraphMessageRegion data-open={sendMessageSettingsOpen ? "true" : undefined}>
+	                        <LoopspaceGraphMessageRegion
+	                          data-open={sendMessageSettingsOpen ? "true" : undefined}
+	                          style={sendMessageFlowBounds && sendMessageFlowOrigin ? {
+	                            "--loopspace-message-flow-height": `${sendMessageFlowBounds.height}px`,
+	                            "--loopspace-message-flow-origin-x": `${sendMessageFlowOrigin.x}px`,
+	                            "--loopspace-message-flow-origin-y": `${sendMessageFlowOrigin.y}px`,
+	                            "--loopspace-message-flow-width": `${sendMessageFlowBounds.width}px`,
+	                          } : undefined}
+	                        >
                           {sendMessageSettingsOpen ? (
                             <LoopspaceGraphMessageSettingsPanel
                               onPointerDown={(event) => event.stopPropagation()}
@@ -9097,17 +10137,38 @@ function LoopspaceRuntimeView({
                               </LoopspaceGraphMessageFlowEdges>
                               {sendMessageFlowNodes.map(({ item: stepNode, itemIndex, layout: stepLayout }, flowIndex) => {
                                 const stepTitle = loopspaceGraphMessageChildTitle(stepNode, itemIndex);
-                                const stepSubtitle = loopspaceGraphMessageChildSubtitle(stepNode, itemIndex);
+	                                const stepSubtitle = loopspaceGraphMessageChildSubtitle(stepNode, itemIndex);
+		                                const flowInputPorts = loopspaceGraphInputPortsForNode(stepNode);
+		                                const flowOutputPorts = loopspaceGraphOutputPortsForNode(stepNode);
+                                const flowPortY = (portIndex, portCount) => `${loopspaceGraphMessageFlowNodePortY(
+                                  stepLayout,
+                                  portIndex,
+                                  portCount,
+                                )}px`;
                                 const stepRuntimeStatus = loopspaceCheckpointStatusForNode(
                                   stepNode,
                                   sendMessageStepProgressIndexById.get(String(stepNode.id || "").trim()) || 0,
                                   sendMessageCheckpointProgressByKey,
                                 );
+                                const stepRuntimeProgress = loopspaceCheckpointProgressForNode(
+                                  stepNode,
+                                  sendMessageStepProgressIndexById.get(String(stepNode.id || "").trim()) || 0,
+                                  sendMessageCheckpointProgressByKey,
+                                );
+                                const stepRuntimeAssetIds = loopspaceCheckpointProgressAssetIds(stepRuntimeProgress);
+                                const stepRuntimeAssetLabel = stepRuntimeAssetIds.length
+                                  ? `${stepRuntimeAssetIds.length} asset${stepRuntimeAssetIds.length === 1 ? "" : "s"}`
+                                  : "";
                                 return (
-                                  <LoopspaceGraphMessageFlowNode
-                                    data-status={stepRuntimeStatus || undefined}
-                                    data-kind={stepNode.nodeKind || stepNode.kind || "step"}
-                                    key={stepNode.id}
+	                                  <LoopspaceGraphMessageFlowNode
+	                                    aria-label={[
+	                                      stepTitle,
+	                                      stepRuntimeStatus,
+	                                      stepRuntimeAssetIds.length ? `Assets: ${stepRuntimeAssetIds.join(", ")}` : "",
+	                                    ].filter(Boolean).join(" - ")}
+	                                    data-status={stepRuntimeStatus || undefined}
+	                                    data-kind={stepNode.nodeKind || stepNode.kind || "step"}
+	                                    key={stepNode.id}
                                     onPointerDown={(event) => startSendMessageCheckpointDrag(event, node, stepNode, flowIndex, stepLayout)}
                                     style={{
                                       "--loopspace-flow-node-height": `${stepLayout.height}px`,
@@ -9115,43 +10176,50 @@ function LoopspaceRuntimeView({
                                       "--loopspace-flow-node-x": `${stepLayout.x}px`,
                                       "--loopspace-flow-node-y": `${stepLayout.y}px`,
                                     }}
-                                    title={[stepTitle, stepRuntimeStatus].filter(Boolean).join(" - ")}
-                                  >
-                                    <LoopspaceGraphMessageFlowNodePort
-                                      aria-label={`Attach readable documents to ${stepTitle}`}
-                                      as="button"
-                                      data-loopspace-graph-input-id={stepNode.id}
-                                      data-loopspace-graph-port="true"
-                                      data-side="input"
-                                      onPointerDown={(event) => {
-                                        if (!event.altKey) {
+	                                  >
+	                                    {flowInputPorts.map((port, portIndex) => (
+	                                      <LoopspaceGraphMessageFlowNodePort
+	                                        aria-label={`Attach context to ${stepTitle}`}
+	                                        as="button"
+	                                        data-loopspace-graph-input-id={stepNode.id}
+	                                        data-loopspace-graph-input-port={port.id}
+	                                        data-loopspace-graph-port="true"
+	                                        data-side="input"
+	                                        key={port.id}
+                                        onPointerDown={(event) => {
+                                          if (!event.altKey) {
+                                            event.stopPropagation();
+                                            return;
+                                          }
+                                          event.preventDefault();
                                           event.stopPropagation();
-                                          return;
-                                        }
-                                        event.preventDefault();
-                                        event.stopPropagation();
-                                        void disconnectGraphPort(stepNode.id, "input", "in");
-                                      }}
-                                      title="Drop document read context here. Option/Alt-click to unlink this input."
-                                      type="button"
-                                    />
+	                                          void disconnectGraphPort(stepNode.id, "input", port.id);
+	                                        }}
+		                                        style={{ "--loopspace-flow-port-y": flowPortY(portIndex, flowInputPorts.length) }}
+	                                        type="button"
+	                                      />
+	                                    ))}
                                     <LoopspaceGraphMessageFlowNodeText>
                                       <strong>{stepTitle}</strong>
                                       {stepSubtitle ? <span>{stepSubtitle}</span> : null}
+                                      {stepRuntimeAssetLabel ? <span>{stepRuntimeAssetLabel}</span> : null}
                                     </LoopspaceGraphMessageFlowNodeText>
-                                    <LoopspaceGraphMessageFlowNodePort
-                                      aria-label={`Connect writable document output from ${stepTitle}`}
-                                      as="button"
-                                      data-active={pendingConnection?.fromId === stepNode.id && pendingConnection?.fromPort === "docs" ? "true" : undefined}
-                                      data-loopspace-graph-port="true"
-                                      data-side="output"
-                                      onPointerCancel={finishGraphConnection}
-                                      onPointerDown={(event) => startGraphConnection(event, stepNode, "docs")}
-                                      onPointerMove={moveGraphConnection}
-                                      onPointerUp={finishGraphConnection}
-                                      title="Drag to a document write node. Option/Alt-click to unlink this output."
-                                      type="button"
-                                    />
+                                    {flowOutputPorts.map((port, portIndex) => (
+                                      <LoopspaceGraphMessageFlowNodePort
+                                        aria-label={`Connect ${port.label} output from ${stepTitle}`}
+                                        as="button"
+                                        data-active={pendingConnection?.fromId === stepNode.id && pendingConnection?.fromPort === port.id ? "true" : undefined}
+                                        data-loopspace-graph-port="true"
+                                        data-side="output"
+                                        key={port.id}
+                                        onPointerCancel={finishGraphConnection}
+                                        onPointerDown={(event) => startGraphConnection(event, stepNode, port.id)}
+	                                        onPointerMove={moveGraphConnection}
+	                                        onPointerUp={finishGraphConnection}
+		                                        style={{ "--loopspace-flow-port-y": flowPortY(portIndex, flowOutputPorts.length) }}
+	                                        type="button"
+	                                      />
+                                    ))}
                                   </LoopspaceGraphMessageFlowNode>
                                 );
                               })}
@@ -9167,13 +10235,13 @@ function LoopspaceRuntimeView({
                         />
                       </>
                     ) : null}
-                    {isDocumentContextNode ? (
+                    {isResourceContextNode ? (
                       <LoopspaceGraphMessageResize
                         aria-label={`Resize ${nodeTitle}`}
                         data-axis="vertical"
                         disabled={busy}
                         onPointerDown={(event) => startDocumentContextResize(event, node, nodeLayout)}
-                        title="Resize document list"
+                        title="Resize resource list"
                         type="button"
                       />
                     ) : null}
@@ -9206,20 +10274,27 @@ function LoopspaceRuntimeView({
                             data-loopspace-graph-port="true"
                             data-side="output"
                             onPointerCancel={finishGraphConnection}
-                            onPointerDown={(event) => startGraphConnection(event, node, port.id)}
-                            onPointerMove={moveGraphConnection}
-                            onPointerUp={finishGraphConnection}
-                            title="Drag to another node input. Option/Alt-click to unlink this output."
-                            type="button"
-                          />
+	                            onPointerDown={(event) => startGraphConnection(event, node, port.id)}
+	                            onPointerMove={moveGraphConnection}
+	                            onPointerUp={finishGraphConnection}
+	                            type="button"
+	                          />
                         </LoopspaceGraphNodeOutputPort>
                       ))}
                     </LoopspaceGraphNodeOutputPorts>
-                  </LoopspaceGraphNode>
-                );
-              })}
-              {graphDragGhost?.node ? (() => {
-                const node = graphDragGhost.node;
+	                  </LoopspaceGraphNode>
+	                );
+	              })}
+              <LoopspaceGraphEdges aria-label="Loop graph foreground connections" data-layer="foreground">
+                {foregroundGraphEdges.map(renderLoopspaceGraphEdge)}
+                {pendingConnection ? (
+                  <LoopspaceGraphConnectionPreview
+                    d={loopspaceGraphPathBetween(pendingConnection.fromPoint, pendingConnection.toPoint)}
+                  />
+                ) : null}
+              </LoopspaceGraphEdges>
+	              {graphDragGhost?.node ? (() => {
+	                const node = graphDragGhost.node;
                 const nodeLayout = loopspaceGraphNodeLayout(node, 0);
                 const type = node.nodeKind || node.role || "node";
                 const isGhostRegion = node.nodeKind === "send_message";
@@ -9233,6 +10308,8 @@ function LoopspaceRuntimeView({
                       ? AdsClick
                       : node.nodeKind === "document_read" || node.nodeKind === "document_write"
                         ? AccountTree
+                      : node.nodeKind === "asset_read" || node.nodeKind === "asset_write"
+                        ? PermMedia
                       : AccountTree;
                 return (
                   <LoopspaceGraphNode
@@ -9258,7 +10335,7 @@ function LoopspaceRuntimeView({
                     </LoopspaceGraphNodeIcon>
                     <LoopspaceGraphNodeText>
                       <strong>{node.label || "Drop node"}</strong>
-                      <span>{node.nodeKind === "device" ? "Device" : node.nodeKind === "run_script" ? "Run script" : node.nodeKind === "send_message" ? "Send message region" : node.nodeKind === "document_read" || node.nodeKind === "document_write" ? "Document context" : "Pending drop"}</span>
+                      <span>{node.nodeKind === "device" ? "Device" : node.nodeKind === "run_script" ? "Run script" : node.nodeKind === "send_message" ? "Send message region" : node.nodeKind === "document_read" || node.nodeKind === "document_write" ? "Document context" : node.nodeKind === "asset_read" || node.nodeKind === "asset_write" ? "Asset context" : "Pending drop"}</span>
                     </LoopspaceGraphNodeText>
                   </LoopspaceGraphNode>
                 );
@@ -9442,6 +10519,8 @@ function LoopspaceRuntimeView({
                           ? AdsClick
                           : template.id === "document_read" || template.id === "document_write"
                             ? AccountTree
+                          : template.id === "asset_read" || template.id === "asset_write"
+                            ? PermMedia
                             : AccountTree;
                       const templateKey = template.id;
                       return (
@@ -14102,6 +15181,53 @@ function normalizeLoopspaces(value) {
     });
 }
 
+function loopspaceSnapshotCandidates(value) {
+  return [
+    value?.sync,
+    value?.payload,
+    value?.data,
+    value?.response,
+    value?.event,
+    value,
+  ].filter((candidate) => candidate && typeof candidate === "object");
+}
+
+function loopspaceSnapshotScopeKey(value) {
+  for (const candidate of loopspaceSnapshotCandidates(value)) {
+    const scopeKey = String(candidate.scopeKey || candidate.scope_key || "").trim();
+    if (scopeKey) {
+      return scopeKey;
+    }
+  }
+  return "";
+}
+
+function loopspaceSnapshotHasSyncState(value) {
+  return loopspaceSnapshotCandidates(value).some((candidate) => {
+    const cursor = Number(
+      candidate.serverCursor
+      || candidate.server_cursor
+      || candidate.syncCursor
+      || candidate.sync_cursor
+      || candidate.cursor
+      || 0,
+    ) || 0;
+    const manifestHash = String(candidate.manifestHash || candidate.manifest_hash || "").trim();
+    return cursor > 0 || Boolean(manifestHash);
+  });
+}
+
+function loopspaceSnapshotHasRemoteResponse(value) {
+  return loopspaceSnapshotCandidates(value).some((candidate) => (
+    candidate !== value && (
+      Array.isArray(candidate.loopspaces)
+      || candidate.kind === "loopspaces.sync"
+      || candidate.eventKind === "loopspaces.sync"
+      || candidate.event_kind === "loopspaces.sync"
+    )
+  ));
+}
+
 function loopspaceSnapshotQueued(value) {
   return [value, value?.sync, value?.response, value?.payload, value?.data]
     .filter(Boolean)
@@ -14115,8 +15241,101 @@ function loopspaceSnapshotSyncError(value) {
   return String(candidate?.syncError || candidate?.sync_error || "").trim();
 }
 
-function readLoopspaces() {
-  return [];
+function cacheableLoopspaceEntry(entry) {
+  const loopspace = normalizeLoopspaceEntry(entry);
+  if (!loopspace) {
+    return null;
+  }
+  return {
+    id: loopspace.id,
+    name: loopspace.name,
+    createdAt: loopspace.createdAt,
+    updatedAt: loopspace.updatedAt,
+    revision: loopspace.revision,
+    graph: loopspace.graph,
+    graphContentHash: loopspace.graphContentHash,
+    graphEpoch: loopspace.graphEpoch,
+    runtimeHead: loopspace.runtimeHead,
+    triggerRefs: loopspace.triggerRefs,
+  };
+}
+
+function normalizeLoopspaceCache(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  const scopeKey = String(value.scopeKey || value.scope_key || "").trim();
+  const loopspaces = normalizeLoopspaces(value)
+    .map(cacheableLoopspaceEntry)
+    .filter(Boolean);
+  return {
+    cachedAtMs: Number(value.cachedAtMs || value.cached_at_ms || 0) || 0,
+    loopspaces,
+    scopeKey,
+    version: 1,
+  };
+}
+
+function readLoopspacesCache() {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return null;
+  }
+  try {
+    return normalizeLoopspaceCache(
+      JSON.parse(window.localStorage.getItem(LOOPSPACE_CACHE_STORAGE_KEY) || "null"),
+    );
+  } catch {
+    return null;
+  }
+}
+
+function readLoopspaces(expectedScopeKey = accountScopeKey()) {
+  const cached = readLoopspacesCache();
+  if (!cached) {
+    return [];
+  }
+  const cacheScopeKey = String(cached.scopeKey || "").trim();
+  const targetScopeKey = String(expectedScopeKey || "").trim();
+  if (cacheScopeKey && targetScopeKey && cacheScopeKey !== targetScopeKey) {
+    return [];
+  }
+  return normalizeLoopspaces(cached);
+}
+
+function persistLoopspacesCache(value, options = {}) {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return;
+  }
+  if (loopspaceSnapshotQueued(value) || loopspaceSnapshotSyncError(value)) {
+    return;
+  }
+  const loopspaces = normalizeLoopspaces(value)
+    .map(cacheableLoopspaceEntry)
+    .filter(Boolean);
+  const allowEmpty = Boolean(
+    options.allowEmpty
+    || loopspaceSnapshotHasSyncState(value)
+    || loopspaceSnapshotHasRemoteResponse(value),
+  );
+  if (!loopspaces.length && !allowEmpty) {
+    return;
+  }
+  const scopeKey = String(
+    options.scopeKey
+    || loopspaceSnapshotScopeKey(value)
+    || accountScopeKey(),
+  ).trim() || "personal";
+  const snapshot = {
+    cachedAtMs: Date.now(),
+    loopspaces,
+    scopeKey,
+    version: 1,
+  };
+  try {
+    window.localStorage.setItem(LOOPSPACE_CACHE_STORAGE_KEY, JSON.stringify(snapshot));
+  } catch {
+    // Loopspace cache is only a first-paint convenience; Rust/cloud remain authoritative.
+  }
 }
 
 function catalogWorkspaceEntryIsDeleted(entry) {
@@ -15253,7 +16472,7 @@ export default function App() {
   const [loopspaceError, setLoopspaceError] = useState("");
   const [loopspaceRenameDraft, setLoopspaceRenameDraft] = useState("");
   const [loopspaceActionState, setLoopspaceActionState] = useState("idle");
-  const [loopspaceSettingsMenuId, setLoopspaceSettingsMenuId] = useState("");
+  const [loopspaceSettingsPanelId, setLoopspaceSettingsPanelId] = useState("");
   const [workspaceSyncState, setWorkspaceSyncState] = useState("idle");
   const [workspaceListHydrated, setWorkspaceListHydrated] = useState(false);
   const [workspaceHydrationReady, setWorkspaceHydrationReady] = useState(false);
@@ -18611,8 +19830,18 @@ export default function App() {
     [workspaceCatalog],
   );
   const selectedLoopspace = findLoopspaceById(loopspaces, selectedLoopspaceId);
-  const applyLoopspaceSnapshot = useCallback((value) => {
+  const applyLoopspaceSnapshot = useCallback((value, options = {}) => {
     const nextLoopspaces = normalizeLoopspaces(value);
+    const preserveCurrentOnColdEmpty = Boolean(options?.preserveCurrentOnColdEmpty);
+    if (
+      preserveCurrentOnColdEmpty
+      && !nextLoopspaces.length
+      && loopspacesRef.current.length
+      && !loopspaceSnapshotHasSyncState(value)
+      && !loopspaceSnapshotHasRemoteResponse(value)
+    ) {
+      return loopspacesRef.current;
+    }
     loopspacesRef.current = nextLoopspaces;
     setLoopspaces(nextLoopspaces);
     setSelectedLoopspaceId((currentId) => {
@@ -18624,11 +19853,17 @@ export default function App() {
       selectedLoopspaceIdRef.current = nextId;
       return nextId;
     });
-    setLoopspaceSettingsMenuId((currentId) => (
+    setLoopspaceSettingsPanelId((currentId) => (
       currentId && nextLoopspaces.some((loopspace) => loopspace.id === currentId) ? currentId : ""
     ));
+    if (options?.persist !== false) {
+      persistLoopspacesCache(value, {
+        allowEmpty: Boolean(options?.allowEmptyPersist),
+        scopeKey: activeAccountScopeKey,
+      });
+    }
     return nextLoopspaces;
-  }, []);
+  }, [activeAccountScopeKey]);
 
   useEffect(() => {
     let cancelled = false;
@@ -18637,11 +19872,14 @@ export default function App() {
       try {
         const local = await invoke("cloud_mcp_get_loopspaces");
         if (!cancelled) {
-          applyLoopspaceSnapshot(local);
+          applyLoopspaceSnapshot(local, {
+            allowEmptyPersist: loopspaceSnapshotHasSyncState(local),
+            preserveCurrentOnColdEmpty: true,
+          });
         }
       } catch {
-        if (!cancelled) {
-          applyLoopspaceSnapshot([]);
+        if (!cancelled && !loopspacesRef.current.length) {
+          applyLoopspaceSnapshot([], { persist: false });
         }
       }
 
@@ -18652,7 +19890,10 @@ export default function App() {
       try {
         const synced = await invoke("cloud_mcp_sync_loopspaces");
         if (!cancelled) {
-          applyLoopspaceSnapshot(synced);
+          applyLoopspaceSnapshot(synced, {
+            allowEmptyPersist: !loopspaceSnapshotSyncError(synced),
+            persist: !loopspaceSnapshotSyncError(synced),
+          });
         }
       } catch (error) {
         if (!cancelled) {
@@ -18673,7 +19914,9 @@ export default function App() {
 
     listen(CLOUD_MCP_LOOPSPACES_UPDATED_EVENT, (event) => {
       if (!disposed) {
-        applyLoopspaceSnapshot(event?.payload || event);
+        applyLoopspaceSnapshot(event?.payload || event, {
+          allowEmptyPersist: true,
+        });
       }
     }).then((unlisten) => {
       if (disposed) {
@@ -19791,6 +21034,7 @@ export default function App() {
     setSpaceMode(APP_SPACE_MODE_WORKSPACES);
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(false);
+    setLoopspaceSettingsPanelId("");
     setLoopspaceError("");
     setLoopspaceActionState("idle");
     setWorkspaceSettingsModalId("");
@@ -19892,6 +21136,7 @@ export default function App() {
     setSpaceMode(APP_SPACE_MODE_WORKSPACES);
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(false);
+    setLoopspaceSettingsPanelId("");
     setLoopspaceError("");
     setLoopspaceActionState("idle");
     setWorkspaceCreateModalOpen(false);
@@ -19922,6 +21167,7 @@ export default function App() {
     setWorkspacePendingActivationId("");
     setWorkspaceSettingsModalId("");
     setWorkspaceCreateModalOpen(false);
+    setLoopspaceSettingsPanelId("");
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceDeleteConfirmId("");
@@ -19939,6 +21185,7 @@ export default function App() {
     setSpaceMode(APP_SPACE_MODE_WORKSPACES);
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(false);
+    setLoopspaceSettingsPanelId("");
     setLoopspaceError("");
     setLoopspaceActionState("idle");
     showView(DEFAULT_WORKSPACE_VIEW, {
@@ -19971,6 +21218,7 @@ export default function App() {
     setWorkspaceSettingsModalId("");
     setWorkspaceCreateModalOpen(false);
     setLoopspaceCreatePanelOpen(false);
+    setLoopspaceSettingsPanelId("");
     setLoopspaceError("");
     setLoopspaceActionState("idle");
     setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
@@ -21502,6 +22750,7 @@ export default function App() {
     setSpaceMode(APP_SPACE_MODE_WORKSPACES);
     setSelectedLoopspaceId("");
     setLoopspaceCreatePanelOpen(false);
+    setLoopspaceSettingsPanelId("");
     setLoopspaceError("");
     setWorkspaceName("");
     setNewWorkspaceRootDraft(defaultWorkingDirectory || "");
@@ -21594,7 +22843,7 @@ export default function App() {
   }, []);
 
   const renameSelectedLoopspace = useCallback(async (event) => {
-    event.preventDefault();
+    event?.preventDefault?.();
     if (!selectedLoopspace?.id || loopspaceActionState === "deleting") {
       return;
     }
@@ -21605,6 +22854,7 @@ export default function App() {
     }
     if (name === selectedLoopspace.name) {
       setLoopspaceError("");
+      setLoopspaceSettingsPanelId("");
       return;
     }
     setLoopspaceActionState("renaming");
@@ -21616,6 +22866,7 @@ export default function App() {
       });
       applyLoopspaceSnapshot(result);
       setLoopspaceActionState("idle");
+      setLoopspaceSettingsPanelId("");
     } catch (error) {
       setLoopspaceActionState("idle");
       setLoopspaceError(String(error || "Unable to rename loop."));
@@ -21641,6 +22892,7 @@ export default function App() {
       applyLoopspaceSnapshot(result);
       selectedLoopspaceIdRef.current = "";
       setSelectedLoopspaceId("");
+      setLoopspaceSettingsPanelId("");
       setLoopspaceActionState("idle");
     } catch (error) {
       setLoopspaceActionState("idle");
@@ -21648,88 +22900,40 @@ export default function App() {
     }
   }, [applyLoopspaceSnapshot, loopspaceActionState, selectedLoopspace]);
 
-  const renameLoopspaceFromRail = useCallback(async (loopspace) => {
-    if (!loopspace?.id || loopspaceActionState === "deleting") {
+  const openLoopspaceSettings = useCallback((loopspaceId) => {
+    const loopspace = findLoopspaceById(loopspaces, loopspaceId);
+    if (!loopspace) {
       return;
     }
-    const currentName = loopspace.name || "";
-    const nextName = typeof window === "undefined"
-      ? currentName
-      : window.prompt("Rename loop", currentName);
-    if (nextName == null) {
-      return;
-    }
-    const name = String(nextName || "").trim();
-    if (!name || name === currentName) {
-      return;
-    }
-    setLoopspaceSettingsMenuId("");
-    setLoopspaceActionState("renaming");
+    cancelDeferredWorkspaceActivation();
+    selectedWorkspaceIdRef.current = "";
+    workspacePendingActivationIdRef.current = "";
+    selectedLoopspaceIdRef.current = loopspace.id;
+    spaceModeRef.current = APP_SPACE_MODE_LOOPSPACES;
+    setSelectedWorkspaceId("");
+    setWorkspacePendingActivationId("");
+    setWorkspaceSettingsModalId("");
+    setWorkspaceCreateModalOpen(false);
+    setLoopspaceCreatePanelOpen(false);
+    setLoopspaceSettingsPanelId(loopspace.id);
+    setLoopspaceRenameDraft(loopspace.name || "");
     setLoopspaceError("");
-    try {
-      const result = await invoke("cloud_mcp_rename_loopspace", {
-        loopspaceId: loopspace.id,
-        name,
-      });
-      applyLoopspaceSnapshot(result);
-      setLoopspaceActionState("idle");
-    } catch (error) {
-      setLoopspaceActionState("idle");
-      setLoopspaceError(String(error || "Unable to rename loop."));
-    }
-  }, [applyLoopspaceSnapshot, loopspaceActionState]);
+    setLoopspaceActionState("idle");
+    setSpaceMode(APP_SPACE_MODE_LOOPSPACES);
+    setSelectedLoopspaceId(loopspace.id);
+    showView(DEFAULT_WORKSPACE_VIEW, {
+      immediate: true,
+      telemetrySource: "loopspace_settings_panel",
+    });
+  }, [cancelDeferredWorkspaceActivation, loopspaces, showView]);
 
-  const deleteLoopspaceFromRail = useCallback(async (loopspace) => {
-    if (!loopspace?.id || loopspaceActionState === "renaming") {
+  const closeLoopspaceSettings = useCallback(() => {
+    if (loopspaceActionState === "renaming" || loopspaceActionState === "deleting") {
       return;
     }
-    const confirmed = typeof window === "undefined"
-      ? true
-      : window.confirm(`Delete "${loopspace.name}"?`);
-    if (!confirmed) {
-      return;
-    }
-    setLoopspaceSettingsMenuId("");
-    setLoopspaceActionState("deleting");
+    setLoopspaceSettingsPanelId("");
     setLoopspaceError("");
-    try {
-      const result = await invoke("cloud_mcp_delete_loopspace", {
-        loopspaceId: loopspace.id,
-      });
-      applyLoopspaceSnapshot(result);
-      if (selectedLoopspaceId === loopspace.id) {
-        selectedLoopspaceIdRef.current = "";
-        setSelectedLoopspaceId("");
-      }
-      setLoopspaceActionState("idle");
-    } catch (error) {
-      setLoopspaceActionState("idle");
-      setLoopspaceError(String(error || "Unable to delete loop."));
-    }
-  }, [applyLoopspaceSnapshot, loopspaceActionState, selectedLoopspaceId]);
-
-  useEffect(() => {
-    if (!loopspaceSettingsMenuId) {
-      return undefined;
-    }
-    const onKeyDown = (event) => {
-      if (event.key === "Escape") {
-        setLoopspaceSettingsMenuId("");
-      }
-    };
-    const onPointerDown = (event) => {
-      if (event.target?.closest?.("[data-loopspace-settings-menu]")) {
-        return;
-      }
-      setLoopspaceSettingsMenuId("");
-    };
-    window.addEventListener("keydown", onKeyDown);
-    window.addEventListener("pointerdown", onPointerDown);
-    return () => {
-      window.removeEventListener("keydown", onKeyDown);
-      window.removeEventListener("pointerdown", onPointerDown);
-    };
-  }, [loopspaceSettingsMenuId]);
+  }, [loopspaceActionState]);
 
   const closeCreateWorkspaceModal = useCallback(() => {
     if (workspaceSyncState === "creating") {
@@ -26810,6 +28014,13 @@ export default function App() {
   const loopspacesModeActive = spaceMode === APP_SPACE_MODE_LOOPSPACES;
   const railSpaceModeLabel = loopspacesModeActive ? "Loopspaces" : "Workspaces";
   const railSpaceModeTitle = loopspacesModeActive ? "Show workspaces" : "Enter Loopspaces";
+  const loopspaceSettingsLoop = loopspaceSettingsPanelId
+    ? findLoopspaceById(loopspaces, loopspaceSettingsPanelId)
+    : null;
+  const isLoopspaceSettingsOpen = Boolean(loopspacesModeActive && loopspaceSettingsLoop);
+  const isLoopspaceSettingsBusy = loopspaceActionState === "renaming" || loopspaceActionState === "deleting";
+  const isLoopspaceSettingsDeleting = loopspaceActionState === "deleting";
+  const isLoopspaceSettingsRenaming = loopspaceActionState === "renaming";
   const loopspaceIdleTitle = selectedLoopspace?.name || "Loopspaces";
   const loopspaceIdleDetail = selectedLoopspace
     ? "No loop content yet."
@@ -30385,7 +31596,7 @@ export default function App() {
             "trigger_run_id",
             "triggerRunId",
           ]);
-          const checkpointPlan = remoteCommandArrayField(event, [
+          let checkpointPlan = remoteCommandArrayField(event, [
             "checkpoint_plan",
             "checkpointPlan",
           ]);
@@ -30553,6 +31764,23 @@ export default function App() {
               workspaceId: receiptWorkspaceId,
             });
             return;
+          }
+          if (terminalOrchestratorMessageAction && loopspaceRuntimeId && loopRuntimeNodeId) {
+            let graphResult = await invoke("cloud_mcp_get_loopspace_graph", {
+              loopspaceId: loopspaceRuntimeId,
+            }).catch(() => null);
+            let graphSourceText = loopspaceGraphSourceTextFromRow(graphResult);
+            if (!graphSourceText) {
+              graphResult = await invoke("cloud_mcp_sync_loopspace_graph", {
+                loopspaceId: loopspaceRuntimeId,
+              }).catch(() => null);
+              graphSourceText = loopspaceGraphSourceTextFromRow(graphResult);
+            }
+            const graphCheckpointPlan = loopspaceGraphCheckpointPlanForSendMessage(
+              graphSourceText,
+              loopRuntimeNodeId,
+            );
+            checkpointPlan = loopspaceGraphMergeCheckpointPlansForDispatch(checkpointPlan, graphCheckpointPlan);
           }
           if (terminalOrchestratorMessageAction) {
             if (!text) {
@@ -31776,21 +33004,37 @@ export default function App() {
           || document.hasContentPayload === true
           || document.has_content_payload === true
           || appControlDocumentHasInlineContent(document),
-        has_content_payload: document.hasContentPayload === true || document.has_content_payload === true,
-        kind: documentKind,
-        local_path: String(document.localPath || document.local_path || "").trim(),
-        parent_path_key: parentPathKey,
-        path_key: pathKey,
-        pending_push: document.pendingPush === true || document.pending_push === true,
-        row_type: rowType,
-        source: String(document.source || documentKind).trim(),
-        sync_status: String(document.syncStatus || document.sync_status || "").trim(),
-        title: String(document.title || document.name || document.label || document.id || fileName).trim(),
-        updated_at: String(document.updatedAt || document.updated_at || document.localSavedAt || document.local_saved_at || "").trim(),
-      };
-      if (Number.isFinite(sizeBytes)) {
-        summary.size_bytes = sizeBytes;
-      }
+	        has_content_payload: document.hasContentPayload === true || document.has_content_payload === true,
+	        kind: documentKind,
+	        local_path: String(document.localPath || document.local_path || "").trim(),
+	        parent_path_key: parentPathKey,
+	        path_key: pathKey,
+	        pending_push: document.pendingPush === true || document.pending_push === true,
+	        row_type: rowType,
+	        source: String(document.source || documentKind).trim(),
+	        sync_status: String(document.syncStatus || document.sync_status || "").trim(),
+	        title: String(document.title || document.name || document.label || document.id || fileName).trim(),
+	        updated_at: String(document.updatedAt || document.updated_at || document.localSavedAt || document.local_saved_at || "").trim(),
+	      };
+	      const draftPath = String(document.draftPath || document.draft_path || "").trim();
+	      const draftId = String(document.draftId || document.draft_id || "").trim();
+	      const baseContentHash = String(document.baseContentHash || document.base_content_hash || "").trim();
+	      const canonicalLocalPath = String(document.canonicalLocalPath || document.canonical_local_path || "").trim();
+	      if (draftPath) {
+	        summary.draft_path = draftPath;
+	      }
+	      if (draftId) {
+	        summary.draft_id = draftId;
+	      }
+	      if (baseContentHash) {
+	        summary.base_content_hash = baseContentHash;
+	      }
+	      if (canonicalLocalPath) {
+	        summary.canonical_local_path = canonicalLocalPath;
+	      }
+	      if (Number.isFinite(sizeBytes)) {
+	        summary.size_bytes = sizeBytes;
+	      }
       const contentHash = String(document.contentHash || document.content_hash || document.sha256 || "").trim();
       if (contentHash) {
         summary.content_hash = contentHash;
@@ -31806,14 +33050,20 @@ export default function App() {
       document.document_key,
       document.doc_id,
       document.document_id,
-      document.id,
-      document.pathKey,
-      document.path_key,
-      document.filePath,
-      document.file_path,
-      document.fileName,
-      document.file_name,
-      document.title,
+	      document.id,
+	      document.pathKey,
+	      document.path_key,
+	      document.filePath,
+	      document.file_path,
+		      document.localPath,
+		      document.local_path,
+		      document.draftPath,
+		      document.draft_path,
+		      document.draftId,
+		      document.draft_id,
+		      document.fileName,
+	      document.file_name,
+	      document.title,
       document.name,
       document.label,
     );
@@ -31840,11 +33090,17 @@ export default function App() {
         input.id,
         input.path_key,
         input.pathKey,
-        input.file_path,
-        input.filePath,
-        input.file_name,
-        input.fileName,
-        input.title,
+	        input.file_path,
+	        input.filePath,
+	        input.local_path,
+	        input.localPath,
+	        input.draft_path,
+	        input.draftPath,
+	        input.draft_id,
+	        input.draftId,
+	        input.file_name,
+	        input.fileName,
+	        input.title,
         input.name,
       );
       if (!needles.size) return null;
@@ -31859,11 +33115,11 @@ export default function App() {
       const includeDrafts = options.includeDrafts !== false;
       const byKey = new Map();
       if (includeDrafts) {
-        const draft = getWorkspaceToolsDocumentDraft();
-        if (draft) {
+        const drafts = getWorkspaceToolsDocumentDrafts();
+        drafts.forEach((draft) => {
           const draftKey = accountDocumentStorageKey(draft) || String(draft.id || draft.title || "draft").trim();
           if (draftKey) byKey.set(`draft:${draftKey}`, { ...draft, isDraft: true, draft: true, syncStatus: "draft" });
-        }
+        });
       }
       (Array.isArray(rows) ? rows : []).forEach((document) => {
         const key = accountDocumentStorageKey(document) || String(document?.id || document?.title || "").trim();
@@ -31902,13 +33158,169 @@ export default function App() {
         request: accountDocumentHydrateRequestFromSkill(document),
       });
       const hydrated = skillsFromUnits(accountDocumentUnitsFromPayload(result));
-      const requestedKey = accountDocumentStorageKey(document) || String(document?.id || "").trim();
-      return hydrated.find((candidate) => (
-        requestedKey
-        && (accountDocumentStorageKey(candidate) || String(candidate?.id || "").trim()) === requestedKey
-      )) || hydrated[0] || null;
-    };
-    const updateHiddenAppControlDocumentDraft = (input = {}) => {
+	      const requestedKey = accountDocumentStorageKey(document) || String(document?.id || "").trim();
+	      return hydrated.find((candidate) => (
+	        requestedKey
+	        && (accountDocumentStorageKey(candidate) || String(candidate?.id || "").trim()) === requestedKey
+	      )) || hydrated[0] || null;
+	    };
+	    const appControlDocumentInputHasOwn = (input = {}, key = "") => (
+	      Object.prototype.hasOwnProperty.call(input, key)
+	    );
+		    const appControlDocumentInputContent = (input = {}) => {
+		      if (appControlDocumentInputHasOwn(input, "content_md")) return String(input.content_md ?? "");
+		      if (appControlDocumentInputHasOwn(input, "contentMd")) return String(input.contentMd ?? "");
+		      if (appControlDocumentInputHasOwn(input, "content")) return String(input.content ?? "");
+		      if (appControlDocumentInputHasOwn(input, "body")) return String(input.body ?? "");
+		      return null;
+		    };
+		    const appControlDocumentInputHasIdentity = (input = {}) => appControlStringValues(
+		      input.document_key,
+		      input.documentKey,
+		      input.doc_id,
+		      input.docId,
+		      input.document_id,
+		      input.documentId,
+		      input.id,
+		      input.path_key,
+		      input.pathKey,
+		      input.file_path,
+		      input.filePath,
+		      input.local_path,
+		      input.localPath,
+		      input.file_name,
+		      input.fileName,
+		      input.title,
+		      input.name,
+		    ).length > 0;
+		    const appControlDocumentIdFromPath = (path, fallback = "document") => {
+		      const leaf = normalizedDocumentPath(path).split("/").filter(Boolean).pop() || fallback;
+		      return leaf.replace(/\.(?:md|markdown|arch)$/iu, "") || fallback;
+	    };
+	    const buildAppControlSaveDocumentRequest = (input = {}, document = null) => {
+	      const base = document ? appControlDocumentSummary(document, { includeContent: false }) : {};
+      const requestedMode = String(input.mode || input.save_mode || input.saveMode || input.action || "publish").trim().toLowerCase();
+	      const localOnly = ["local", "local_only", "local-only", "save_local", "local_save"].includes(requestedMode);
+	      const documentKind = normalizedDocumentKind(
+	        input.document_kind
+	          || input.documentKind
+	          || input.kind
+	          || input.source
+	          || base.kind
+	          || base.source
+	          || "document",
+	        base.collection,
+	      );
+	      const extension = String(
+	        input.extension
+	          || input.ext
+	          || base.extension
+	          || documentExtensionForKind(documentKind),
+	      ).trim().replace(/^\./u, "").toLowerCase() || documentExtensionForKind(documentKind);
+		      const requestedLocalPath = String(input.local_path || input.localPath || base.local_path || "").trim();
+		      const requestedDraftPath = String(input.draft_path || input.draftPath || base.draft_path || "").trim();
+		      const requestedDraftId = String(input.draft_id || input.draftId || base.draft_id || "").trim();
+			      const requestedBaseContentHash = String(
+			        input.base_content_hash
+			          || input.baseContentHash
+			          || input.base_hash
+			          || input.baseHash
+			          || base.base_content_hash
+			          || "",
+			      ).trim();
+		      const localPathFileName = normalizedDocumentPath(requestedLocalPath.split(/[\\/]/u).filter(Boolean).pop()).split("/").pop();
+	      const requestedFileName = normalizedDocumentPath(input.file_name || input.fileName).split("/").filter(Boolean).pop();
+	      const requestedFolderPath = normalizedDocumentPath(input.folder_path || input.folderPath || base.folder_path);
+	      let filePath = normalizedDocumentPath(
+	        input.path_key
+	          || input.pathKey
+	          || input.file_path
+	          || input.filePath
+	          || base.path_key
+	          || base.file_path,
+	      );
+	      const title = String(
+	        input.title
+	          || input.name
+	          || base.title
+	          || requestedFileName
+	          || localPathFileName?.replace(/\.(?:md|markdown|arch)$/iu, "")
+	          || "Document",
+	      ).trim() || "Document";
+	      if (!filePath) {
+	        const fileName = requestedFileName || `${title.replace(/\.(?:md|markdown|arch)$/iu, "")}.${extension}`;
+	        filePath = requestedFolderPath ? `${requestedFolderPath}/${fileName}` : fileName;
+	      }
+	      const fileName = requestedFileName || normalizedDocumentPath(base.file_name).split("/").filter(Boolean).pop()
+	        || localPathFileName
+	        || filePath.split("/").filter(Boolean).pop()
+	        || `${title}.${extension}`;
+	      const parentPathKey = normalizedDocumentPath(
+	        input.parent_path_key
+	          || input.parentPathKey
+	          || requestedFolderPath
+	          || base.parent_path_key
+	          || filePath.split("/").slice(0, -1).join("/"),
+	      );
+	      const documentId = String(
+	        input.doc_id
+	          || input.docId
+	          || input.document_id
+	          || input.documentId
+	          || input.id
+	          || base.document_id
+	          || base.document_key
+	          || appControlDocumentIdFromPath(filePath, title),
+	      ).trim();
+	      const content = appControlDocumentInputContent(input);
+	      const saveDocument = {
+	        collection: normalizedDocumentCollection(),
+	        doc_id: documentId,
+	        document_id: documentId,
+	        document_kind: documentKind,
+	        entry_kind: "document",
+	        extension,
+	        file_name: fileName,
+	        file_path: filePath,
+	        folder_id: parentPathKey,
+	        folder_path: parentPathKey,
+	        id: documentId,
+		        kind: "account_document",
+		        local_path: requestedLocalPath,
+		        name: title,
+	        parent_folder_id: parentPathKey,
+	        parent_path_key: parentPathKey,
+	        path_key: filePath,
+	        row_type: "document",
+	        source: documentKind,
+	        title,
+		        type: "document",
+		      };
+		      if (requestedDraftPath) {
+		        saveDocument.draft_path = requestedDraftPath;
+		      }
+		      if (requestedDraftId) {
+		        saveDocument.draft_id = requestedDraftId;
+		      }
+		      if (requestedBaseContentHash) {
+		        saveDocument.base_content_hash = requestedBaseContentHash;
+		      }
+	      if (content !== null) {
+	        saveDocument.content = content;
+	        saveDocument.content_md = content;
+	        saveDocument.has_content_payload = true;
+	      }
+	      return {
+	        allow_empty_overwrite: appControlBooleanValue(
+	          input.allow_empty_overwrite ?? input.allowEmptyOverwrite,
+	          false,
+	        ),
+	        document: saveDocument,
+	        local_only: localOnly,
+	        mode: localOnly ? "local" : "publish",
+	      };
+	    };
+		    const updateHiddenAppControlDocumentDraft = async (input = {}) => {
       const visibleContext = buildAppControlVisibleContext(
         { includeContent: true, include_content: true },
         { allowSelectionSnapshot: true },
@@ -31945,12 +33357,16 @@ export default function App() {
       }
 
       const existingContent = String(context.fullContent ?? context.draftContent ?? context.content ?? "");
-      const hasContentPatch = hasOwn("content_md") || hasOwn("content");
+      const hasContentPatch = hasOwn("content_md") || hasOwn("contentMd") || hasOwn("content") || hasOwn("body");
       const content = hasOwn("content_md")
         ? String(input.content_md ?? "")
+        : hasOwn("contentMd")
+          ? String(input.contentMd ?? "")
         : hasOwn("content")
           ? String(input.content ?? "")
-          : existingContent;
+          : hasOwn("body")
+            ? String(input.body ?? "")
+            : existingContent;
       const title = String(
         input.title
           || input.name
@@ -32026,26 +33442,62 @@ export default function App() {
         syncStatus: "draft",
         title,
       };
-      const nextContext = {
-        ...context,
-        active: false,
-        contentPreview,
+	      const nextContext = {
+	        ...context,
+	        active: false,
+	        contentPreview,
         contentPreviewTruncated: content.length > previewMaxLength,
         dirty: true,
         document: nextDocument,
         draftContent: content,
         fullContent: content,
         highlightedRange: hasContentPatch ? null : context.highlightedRange,
-        restoredFromDocumentSnapshot: true,
-        selectedKey: String(context.selectedKey || "").trim(),
-      };
-      setWorkspaceToolsDocumentDraft({
-        ...nextDocument,
-        baseContent: String(context.document?.baseContent ?? ""),
-        baseTitle: String(context.document?.baseTitle || document.title || ""),
-        content,
-        selectedKey: nextContext.selectedKey,
-      });
+	        restoredFromDocumentSnapshot: true,
+	        selectedKey: String(context.selectedKey || "").trim(),
+	      };
+	      let preparedDocument = nextDocument;
+	      let draftResult = null;
+	      try {
+	        const draftRequest = buildAppControlSaveDocumentRequest({
+	          ...input,
+	          content,
+	          content_md: content,
+	        }, nextDocument);
+	        draftRequest.reuse_existing = false;
+	        draftResult = await invoke("cloud_mcp_prepare_account_document_draft", {
+	          request: draftRequest,
+	        });
+	        preparedDocument = {
+	          ...nextDocument,
+	          ...(draftResult?.document || {}),
+	          baseContentHash: String(draftResult?.base_content_hash || draftResult?.document?.base_content_hash || ""),
+	          canonicalLocalPath: String(draftResult?.canonical_local_path || draftResult?.document?.canonical_local_path || ""),
+	          draftId: String(draftResult?.draft_id || draftResult?.document?.draft_id || ""),
+	          draftPath: String(draftResult?.draft_path || draftResult?.document?.draft_path || ""),
+	          isDraft: true,
+	          draft: true,
+	          syncStatus: "draft",
+	        };
+	        nextContext.document = preparedDocument;
+	      } catch (error) {
+	        return {
+	          ok: false,
+	          error: {
+	            code: "document_draft_prepare_failed",
+	            message: getErrorMessage(error, "Unable to prepare document draft file."),
+	          },
+	          context: nextContext,
+	          mode: "draft",
+	          source: "draft_snapshot",
+	        };
+	      }
+	      setWorkspaceToolsDocumentDraft({
+	        ...preparedDocument,
+	        baseContent: String(context.document?.baseContent ?? ""),
+	        baseTitle: String(context.document?.baseTitle || document.title || ""),
+	        content,
+	        selectedKey: nextContext.selectedKey,
+	      });
       appControlDocumentContextSnapshotRef.current = {
         ...nextContext,
         documentContextCapturedAtMs: Date.now(),
@@ -32054,11 +33506,12 @@ export default function App() {
         appControlDocumentSelectionSnapshotRef.current = null;
       }
       return {
-        ok: true,
-        context: nextContext,
-        mode: "draft",
-        source: "draft_snapshot",
-      };
+	        ok: true,
+	        context: nextContext,
+	        result: draftResult,
+	        mode: "draft",
+	        source: "draft_snapshot",
+	      };
     };
     const currentLoopspaceStateForAppControl = () => {
       const currentLoopspaces = Array.isArray(loopspacesRef.current) ? loopspacesRef.current : [];
@@ -32248,14 +33701,14 @@ export default function App() {
           return;
         }
 
-        if (tool === "get_doc") {
-          const includeContent = appControlBooleanValue(input.includeContent ?? input.include_content, true);
-          const inventory = await buildAppControlDocsInventory({ ...input, includeContent: false, include_content: false });
-          const draftDocument = getWorkspaceToolsDocumentDraft();
-          let document = resolveAppControlDocumentFromRows(input, [
-            ...getWorkspaceToolsAccountSkills(),
-            ...(draftDocument ? [draftDocument] : []),
-          ]);
+	        if (tool === "get_doc") {
+	          const includeContent = appControlBooleanValue(input.includeContent ?? input.include_content, true);
+	          const inventory = await buildAppControlDocsInventory({ ...input, includeContent: false, include_content: false });
+		          const draftDocuments = getWorkspaceToolsDocumentDrafts();
+	          let document = resolveAppControlDocumentFromRows(input, [
+	            ...getWorkspaceToolsAccountSkills(),
+	            ...draftDocuments,
+	          ]);
           if (!document) {
             sendAppControlReply(requestId, {
               ok: false,
@@ -32288,11 +33741,200 @@ export default function App() {
               document: appControlDocumentSummary(document, { includeContent }),
               state: buildAppControlState(),
             },
-          });
-          return;
-        }
+		          });
+		          return;
+		        }
 
-        if (tool === "get_selected_document_context") {
+		        if (tool === "prepare_doc_draft") {
+		          const inventory = await buildAppControlDocsInventory({ ...input, includeContent: false, include_content: false });
+			          const draftDocuments = getWorkspaceToolsDocumentDrafts();
+			          let document = resolveAppControlDocumentFromRows(input, [
+			            ...getWorkspaceToolsAccountSkills(),
+			            ...draftDocuments,
+			          ]);
+		          const canCreateFromInput = Boolean(
+		            input.title
+		              || input.name
+		              || input.path_key
+		              || input.pathKey
+		              || input.file_path
+		              || input.filePath
+		              || input.doc_id
+		              || input.document_id
+		              || input.id,
+		          );
+		          if (!document && !canCreateFromInput) {
+		            sendAppControlReply(requestId, {
+		              ok: false,
+		              error: {
+		                code: "document_not_found",
+		                message: "No account document matched the requested id, path_key, document_key, title, or name.",
+		              },
+		              data: {
+		                inventory,
+		                state: buildAppControlState(),
+		              },
+		            });
+		            return;
+		          }
+		          if (document && appControlDocumentRowType(document) !== "folder" && !appControlDocumentHasInlineContent(document)) {
+		            const hydrated = await hydrateAppControlDocument(document).catch(() => null);
+		            if (hydrated) {
+		              document = hydrated;
+		            }
+		          }
+		          const draftRequest = buildAppControlSaveDocumentRequest(input, document);
+		          if (appControlDocumentInputContent(input) === null && document && appControlDocumentHasInlineContent(document)) {
+		            const content = appControlDocumentContent(document);
+		            draftRequest.document.content = content;
+		            draftRequest.document.content_md = content;
+		            draftRequest.document.has_content_payload = true;
+		          }
+		          draftRequest.reuse_existing = appControlBooleanValue(input.reuse_existing ?? input.reuseExisting, true);
+		          const result = await invoke("cloud_mcp_prepare_account_document_draft", {
+		            request: draftRequest,
+		          });
+		          const preparedDocument = result?.document || draftRequest.document;
+		          const preparedContent = String(
+		            preparedDocument?.content_md
+		              ?? preparedDocument?.content
+		              ?? result?.content
+		              ?? "",
+		          );
+		          setWorkspaceToolsDocumentDraft({
+		            ...preparedDocument,
+		            baseContent: String(document?.content ?? preparedContent),
+		            baseContentHash: String(result?.base_content_hash || preparedDocument?.base_content_hash || ""),
+		            canonicalLocalPath: String(result?.canonical_local_path || preparedDocument?.canonical_local_path || ""),
+		            content: preparedContent,
+		            draft: true,
+		            draftId: String(result?.draft_id || preparedDocument?.draft_id || ""),
+		            draftPath: String(result?.draft_path || preparedDocument?.draft_path || ""),
+		            isDraft: true,
+		            selectedKey: String(input.selectedKey || input.selected_key || "").trim(),
+		            syncStatus: "draft",
+		          });
+		          sendAppControlReply(requestId, {
+		            ok: result?.ok !== false,
+		            data: {
+		              document: appControlDocumentSummary(preparedDocument, { includeContent: true }),
+		              result,
+		              state: buildAppControlState(),
+		            },
+		          });
+		          return;
+		        }
+
+		        if (tool === "save_doc" || tool === "write_doc") {
+		          const inventory = await buildAppControlDocsInventory({ ...input, includeContent: false, include_content: false });
+			          const draftDocuments = getWorkspaceToolsDocumentDrafts();
+				          const document = resolveAppControlDocumentFromRows(input, [
+				            ...getWorkspaceToolsAccountSkills(),
+				            ...draftDocuments,
+				          ]);
+			          const requestedDraftRef = Boolean(String(
+			            input.draft_path
+			              || input.draftPath
+			              || input.draft_id
+			              || input.draftId
+			              || "",
+			          ).trim());
+			          if (requestedDraftRef && !document && !appControlDocumentInputHasIdentity(input)) {
+			            sendAppControlReply(requestId, {
+			              ok: false,
+			              error: {
+			                code: "document_identity_required",
+			                message: "save_doc matched no prepared draft. Pass the document_key/path_key returned by prepare_doc_draft along with draft_path/draft_id/base_content_hash.",
+			              },
+			              data: {
+			                inventory,
+			                state: buildAppControlState(),
+			              },
+			            });
+			            return;
+			          }
+			          const saveRequest = buildAppControlSaveDocumentRequest(input, document);
+			          const hasContentPayload = appControlDocumentInputContent(input) !== null;
+		          const draftPath = String(
+		            input.draft_path
+		              || input.draftPath
+		              || saveRequest.document.draft_path
+		              || document?.draftPath
+		              || document?.draft_path
+		              || "",
+		          ).trim();
+		          const draftId = String(
+		            input.draft_id
+		              || input.draftId
+		              || saveRequest.document.draft_id
+		              || document?.draftId
+		              || document?.draft_id
+		              || "",
+		          ).trim();
+		          if (draftPath) {
+		            saveRequest.document.draft_path = draftPath;
+		          }
+			          if (draftId) {
+			            saveRequest.document.draft_id = draftId;
+			          }
+			          const baseContentHash = String(
+			            input.base_content_hash
+			              || input.baseContentHash
+			              || input.base_hash
+			              || input.baseHash
+			              || saveRequest.document.base_content_hash
+			              || document?.baseContentHash
+			              || document?.base_content_hash
+			              || "",
+			          ).trim();
+			          if (baseContentHash) {
+			            saveRequest.base_content_hash = baseContentHash;
+			            saveRequest.document.base_content_hash = baseContentHash;
+			          }
+			          const shouldPromoteDraft = Boolean(draftPath || draftId || document?.draft || document?.isDraft || String(document?.syncStatus || document?.sync_status || "").toLowerCase() === "draft");
+		          if (!shouldPromoteDraft && !hasContentPayload) {
+		            sendAppControlReply(requestId, {
+		              ok: false,
+		              error: {
+		                code: "document_draft_required",
+		                message: "save_doc needs content/content_md or a prepared draft_path. Call prepare_doc_draft first, edit the returned draft_path, then call save_doc with document_key/path_key/draft_path.",
+		              },
+		              data: {
+		                inventory,
+	                state: buildAppControlState(),
+	              },
+		            });
+		            return;
+		          }
+		          const result = await invoke(
+		            shouldPromoteDraft ? "cloud_mcp_save_account_document_draft" : "cloud_mcp_save_account_document",
+		            { request: saveRequest },
+		          );
+		          await refreshWorkspaceToolsAccountSkills({ force: true }).catch(() => undefined);
+		          if (shouldPromoteDraft) {
+		            clearWorkspaceToolsDocumentDraft(
+		              draftPath
+		                || draftId
+		                || String(saveRequest.document.document_key || saveRequest.document.documentKey || "").trim()
+		                || normalizedDocumentPath(saveRequest.document.path_key || saveRequest.document.pathKey || saveRequest.document.file_path || saveRequest.document.filePath)
+		                || String(document?.documentKey || document?.document_key || "").trim()
+		                || accountDocumentStorageKey(document)
+		                || String(document?.id || "").trim(),
+		            );
+		          }
+		          sendAppControlReply(requestId, {
+		            ok: result?.ok !== false,
+	            data: {
+	              inventory: await buildAppControlDocsInventory({ includeContent: false, include_content: false }),
+	              mode: saveRequest.mode,
+	              result,
+	              state: buildAppControlState(),
+	            },
+	          });
+	          return;
+	        }
+
+	        if (tool === "get_selected_document_context") {
           const visibleContext = buildAppControlVisibleContext(input, { allowSelectionSnapshot: true });
           const documentContext = visibleContext.context?.document ? visibleContext.context : null;
           sendAppControlReply(requestId, {
@@ -32371,7 +34013,7 @@ export default function App() {
         if (tool === "update_selected_document") {
           const actions = appControlDocumentActionsRef.current || {};
           if (typeof actions.updateSelectedDocument !== "function") {
-            const hiddenDraftResult = updateHiddenAppControlDocumentDraft(input);
+	            const hiddenDraftResult = await updateHiddenAppControlDocumentDraft(input);
             if (hiddenDraftResult) {
               sendAppControlReply(requestId, {
                 ok: hiddenDraftResult?.ok !== false,
@@ -32475,6 +34117,39 @@ export default function App() {
             data: {
               result,
               state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        const appControlAssetToolCommands = {
+          download_asset: "cloud_mcp_agent_download_asset",
+          download_asset_status: "cloud_mcp_agent_download_asset_status",
+          get_asset_root: "cloud_mcp_agent_get_asset_root",
+          list_assets: "cloud_mcp_agent_list_assets",
+          upload_asset: "cloud_mcp_agent_upload_asset",
+          upload_asset_status: "cloud_mcp_agent_upload_asset_status",
+        };
+        if (Object.prototype.hasOwnProperty.call(appControlAssetToolCommands, tool)) {
+          const result = await invoke(appControlAssetToolCommands[tool], { input });
+          if (
+            tool === "upload_asset"
+            || tool === "upload_asset_status"
+            || tool === "download_asset"
+            || tool === "download_asset_status"
+            || tool === "list_assets"
+          ) {
+            await accountAssetsLibrary.refresh({ force: true, silent: true }).catch(() => null);
+          }
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            data: {
+              assets: safeCloudMcpArray(result?.items).length
+                ? safeCloudMcpArray(result.items)
+                : safeCloudMcpArray(result?.assets),
+              result,
+              state: buildAppControlState(),
+              transfers: safeCloudMcpArray(result?.transfers),
             },
           });
           return;
@@ -32735,6 +34410,13 @@ export default function App() {
           const stepId = appControlText(input, ["step_id", "stepId", "checkpoint_id", "checkpointId"]);
           const stepTitle = appControlText(input, ["step_title", "stepTitle", "title", "label", "name"]);
           const progressMessage = appControlText(input, ["message", "summary", "detail", "details"]);
+          const progressAssetIds = [
+            ...safeCloudMcpArray(input.asset_ids || input.assetIds)
+              .map((value) => String(value || "").trim()),
+            appControlText(input, ["asset_id", "assetId"]),
+          ].filter((value, index, values) => value && values.indexOf(value) === index);
+          const progressAssets = safeCloudMcpArray(input.produced_assets || input.producedAssets || input.assets)
+            .filter((asset) => asset && typeof asset === "object");
           if (!loopspaceId || !loopRuntimeRunId) {
             sendAppControlReply(requestId, {
               ok: false,
@@ -32756,6 +34438,17 @@ export default function App() {
             ...(stepId ? { stepId, step_id: stepId } : {}),
             ...(stepTitle ? { stepTitle, step_title: stepTitle, title: stepTitle } : {}),
             status: stepStatus,
+            ...(progressAssetIds.length ? {
+              assetIds: progressAssetIds,
+              asset_ids: progressAssetIds,
+              producedAssetIds: progressAssetIds,
+              produced_asset_ids: progressAssetIds,
+            } : {}),
+            ...(progressAssets.length ? {
+              assets: progressAssets,
+              producedAssets: progressAssets,
+              produced_assets: progressAssets,
+            } : {}),
             ...(progressMessage ? { message: progressMessage } : {}),
             source: "app_control_mcp",
             updatedAt: new Date().toISOString(),
@@ -32936,7 +34629,7 @@ export default function App() {
               result,
               source_format: DFBLUEPRINT_SOURCE_FORMAT,
               blueprint: parseDfBlueprintSource(String(result?.graph?.source || result?.graph?.sourceText || result?.graph?.source_text || "")),
-              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: run_script/send_message expose exec, success, failure, interrupt; document_read exposes docs; most executable targets accept in. To guide a send-message substep, connect document_read.docs -> step.in for readable context and step.docs -> document_write.in for writable output. Never invent standalone cron/manual/webhook trigger nodes.",
+              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: run_script/send_message expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. To guide a send-message substep, connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation. add_node and update_node_props accept resource metadata as top-level fields or nested under props. Never invent standalone cron/manual/webhook trigger nodes.",
               loopspace: { id: loopspace.id, name: loopspace.name },
               state: buildAppControlState(),
             },
@@ -33348,6 +35041,7 @@ export default function App() {
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
     workspaces,
+    accountAssetsLibrary.refresh,
   ]);
 
   const openSelectedWorkspaceSettings = useCallback(() => {
@@ -38115,40 +39809,13 @@ export default function App() {
                                   aria-label={`Open settings for ${loopspace.name}`}
                                   onClick={(event) => {
                                     event.stopPropagation();
-                                    setLoopspaceSettingsMenuId((current) => (
-                                      current === loopspace.id ? "" : loopspace.id
-                                    ));
+                                    openLoopspaceSettings(loopspace.id);
                                   }}
                                   title="Loop settings"
                                   type="button"
                                 >
                                   <ButtonSettingsIcon aria-hidden="true" />
                                 </WorkspaceSettingsButton>
-                                {loopspaceSettingsMenuId === loopspace.id ? (
-                                  <LoopspaceRailSettingsMenu
-                                    data-loopspace-settings-menu="true"
-                                    onClick={(event) => event.stopPropagation()}
-                                    role="menu"
-                                  >
-                                    <LoopspaceRailSettingsItem
-                                      onClick={() => renameLoopspaceFromRail(loopspace)}
-                                      role="menuitem"
-                                      type="button"
-                                    >
-                                      <ButtonSettingsIcon aria-hidden="true" />
-                                      <span>Rename</span>
-                                    </LoopspaceRailSettingsItem>
-                                    <LoopspaceRailSettingsItem
-                                      data-tone="danger"
-                                      onClick={() => deleteLoopspaceFromRail(loopspace)}
-                                      role="menuitem"
-                                      type="button"
-                                    >
-                                      <ButtonDeleteIcon aria-hidden="true" />
-                                      <span>Delete</span>
-                                    </LoopspaceRailSettingsItem>
-                                  </LoopspaceRailSettingsMenu>
-                                ) : null}
                               </WorkspaceRow>
                             );
                           })}
@@ -38581,6 +40248,7 @@ export default function App() {
                           actionState={loopspaceActionState}
                           agentLaunchDefaults={agentLaunchDefaults}
                           error={loopspaceError}
+                          assetLibrary={accountAssetsLibrary.library}
                           knownDevices={cloudWorkspaceProgress.knownDevices}
                           localDesktopProfile={cloudDesktopDeviceProfile}
                           localScripts={appScriptsLibrary.scripts}
@@ -38656,6 +40324,108 @@ export default function App() {
                         onSubmit={createLoopspace}
                         setLoopspaceName={setLoopspaceName}
                       />
+                    )}
+                  </WorkspaceCreateLayer>
+                  <WorkspaceCreateLayer
+                    aria-hidden={visibleView !== DEFAULT_WORKSPACE_VIEW || !isLoopspaceSettingsOpen}
+                    data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && isLoopspaceSettingsOpen}
+                  >
+                    {isLoopspaceSettingsOpen && (
+                      <WorkspaceCreateSurface>
+                        <WorkspaceCreateCard
+                          aria-busy={isLoopspaceSettingsBusy}
+                          aria-label="Loop settings"
+                          onSubmit={renameSelectedLoopspace}
+                        >
+                          <WorkspaceCreateHeader>
+                            <div>
+                              <PanelKicker>Loop settings</PanelKicker>
+                              <PanelHeading>{loopspaceSettingsLoop.name}</PanelHeading>
+                            </div>
+                            <WorkspaceSettingsHeaderActions>
+                              <WorkspaceModalCloseButton
+                                aria-label="Close loop settings"
+                                disabled={isLoopspaceSettingsBusy}
+                                onClick={closeLoopspaceSettings}
+                                title="Close"
+                                type="button"
+                              >
+                                <ButtonCloseIcon aria-hidden="true" />
+                              </WorkspaceModalCloseButton>
+                            </WorkspaceSettingsHeaderActions>
+                          </WorkspaceCreateHeader>
+
+                          <WorkspaceCreateSection>
+                            <SettingsLabel>Name</SettingsLabel>
+                            <WorkspaceSettingsInput
+                              disabled={isLoopspaceSettingsBusy}
+                              maxLength={80}
+                              minLength={1}
+                              onChange={(event) => {
+                                setLoopspaceRenameDraft(event.target.value);
+                                setLoopspaceError("");
+                              }}
+                              value={loopspaceRenameDraft}
+                            />
+                          </WorkspaceCreateSection>
+
+                          <WorkspaceCreateSection>
+                            <SettingsLabel>Storage</SettingsLabel>
+                            <SettingsHint>Cloud is selected for this loop. Local-only loopspaces are not enabled yet.</SettingsHint>
+                            <AppearanceThemeGrid>
+                              <AppearanceThemeButton
+                                data-selected="false"
+                                disabled
+                                type="button"
+                              >
+                                <span><ButtonTerminalIcon aria-hidden="true" /></span>
+                                <div>
+                                  <strong>Local</strong>
+                                  <small>Coming soon</small>
+                                </div>
+                              </AppearanceThemeButton>
+                              <AppearanceThemeButton
+                                data-selected="true"
+                                type="button"
+                              >
+                                <span><ButtonForgeIcon aria-hidden="true" /></span>
+                                <div>
+                                  <strong>Cloud</strong>
+                                  <small>Selected</small>
+                                </div>
+                              </AppearanceThemeButton>
+                            </AppearanceThemeGrid>
+                          </WorkspaceCreateSection>
+
+                          {loopspaceError && <FormMessage $state="error">{loopspaceError}</FormMessage>}
+
+                          <WorkspaceCreateFooter>
+                            <PrimaryDangerButton
+                              disabled={isLoopspaceSettingsBusy}
+                              onClick={deleteSelectedLoopspace}
+                              type="button"
+                            >
+                              <ButtonDeleteIcon aria-hidden="true" />
+                              <span>{isLoopspaceSettingsDeleting ? "Deleting..." : "Delete loop"}</span>
+                            </PrimaryDangerButton>
+                            <SecondaryButton
+                              disabled={isLoopspaceSettingsBusy}
+                              onClick={closeLoopspaceSettings}
+                              type="button"
+                            >
+                              <ButtonCloseIcon aria-hidden="true" />
+                              <span>Close</span>
+                            </SecondaryButton>
+                            <PrimaryButton
+                              disabled={isLoopspaceSettingsBusy || !loopspaceRenameDraft.trim()}
+                              type="submit"
+                            >
+                              <ButtonCheckIcon aria-hidden="true" />
+                              <span>{isLoopspaceSettingsRenaming ? "Saving..." : "Save"}</span>
+                            </PrimaryButton>
+                          </WorkspaceCreateFooter>
+                        </WorkspaceCreateCard>
+                      </WorkspaceCreateSurface>
                     )}
                   </WorkspaceCreateLayer>
                   <WorkspaceCreateLayer

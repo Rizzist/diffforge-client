@@ -1,4 +1,5 @@
 const OUTPUT_PORTS_BY_ID = {
+  assets: { id: "assets", label: "ASSETS", tone: "asset" },
   docs: { id: "docs", label: "DOCS", tone: "exec" },
   exec: { id: "exec", label: "EXECOUT", tone: "exec" },
   failure: { id: "failure", label: "FAILURE", tone: "failure" },
@@ -34,6 +35,20 @@ export const LOOPSPACE_GRAPH_NODE_TEMPLATES = [
     role: "context",
   },
   {
+    description: "Attach existing assets as readable runtime context.",
+    icon: "asset",
+    id: "asset_read",
+    label: "Asset read",
+    role: "context",
+  },
+  {
+    description: "Capture or create assets from runtime output.",
+    icon: "asset",
+    id: "asset_write",
+    label: "Asset write",
+    role: "context",
+  },
+  {
     description: "Run a selected local script on its device.",
     icon: "terminal",
     id: "run_script",
@@ -64,7 +79,19 @@ export const LOOPSPACE_GRAPH_NODE_CONTRACTS = {
   },
   document_write: {
     inputs: [INPUT_PORTS_BY_ID.in],
-    outputs: [],
+    outputs: [OUTPUT_PORTS_BY_ID.docs],
+    role: "context",
+    visual: { height: 128, minHeight: 128, minWidth: 270, sized: true, width: 270 },
+  },
+  asset_read: {
+    inputs: [],
+    outputs: [OUTPUT_PORTS_BY_ID.assets],
+    role: "context",
+    visual: { height: 128, minHeight: 128, minWidth: 270, sized: true, width: 270 },
+  },
+  asset_write: {
+    inputs: [INPUT_PORTS_BY_ID.in],
+    outputs: [OUTPUT_PORTS_BY_ID.assets],
     role: "context",
     visual: { height: 128, minHeight: 128, minWidth: 270, sized: true, width: 270 },
   },
@@ -106,7 +133,7 @@ export const LOOPSPACE_GRAPH_NODE_CONTRACTS = {
   step: {
     inputs: [INPUT_PORTS_BY_ID.in],
     internal: true,
-    outputs: [OUTPUT_PORTS_BY_ID.docs],
+    outputs: [OUTPUT_PORTS_BY_ID.docs, OUTPUT_PORTS_BY_ID.assets],
     role: "checkpoint",
     visual: { height: 30, width: 160 },
   },
@@ -163,7 +190,7 @@ function graphContractIsSendMessageSubstep(node, nodeLookup = null) {
   const parentId = graphContractNodeParentId(node);
   if (!parentId || parentId === String(node?.id || "").trim()) return false;
   const parentNode = graphContractNodeFromLookup(nodeLookup, parentId);
-  if (!parentNode) return true;
+  if (!parentNode) return false;
   return normalizeLoopspaceGraphNodeKind(parentNode) === "send_message";
 }
 
@@ -241,7 +268,7 @@ export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = 
   const fromKind = normalizeLoopspaceGraphNodeKind(fromNode);
   const toKind = normalizeLoopspaceGraphNodeKind(toNode);
   const nodeLookup = options.nodeById || options.nodeLookup || options.nodes || null;
-  const isDocumentStepContextEdge = (
+  const isResourceStepContextEdge = (
     fromKind === "document_read"
       && toKind === "step"
       && fromPort === "docs"
@@ -253,8 +280,32 @@ export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = 
       && fromPort === "docs"
       && toPort === "in"
       && graphContractIsSendMessageSubstep(fromNode, nodeLookup)
+  ) || (
+    fromKind === "step"
+      && toKind === "asset_write"
+      && fromPort === "assets"
+      && toPort === "in"
+      && graphContractIsSendMessageSubstep(fromNode, nodeLookup)
+  ) || (
+    fromKind === "document_write"
+      && toKind === "step"
+      && fromPort === "docs"
+      && toPort === "in"
+      && graphContractIsSendMessageSubstep(toNode, nodeLookup)
+  ) || (
+    fromKind === "asset_read"
+      && toKind === "step"
+      && fromPort === "assets"
+      && toPort === "in"
+      && graphContractIsSendMessageSubstep(toNode, nodeLookup)
+  ) || (
+    fromKind === "asset_write"
+      && toKind === "step"
+      && fromPort === "assets"
+      && toPort === "in"
+      && graphContractIsSendMessageSubstep(toNode, nodeLookup)
   );
-  if ((fromContract.internal || toContract.internal) && !isDocumentStepContextEdge) {
+  if ((fromContract.internal || toContract.internal) && !isResourceStepContextEdge) {
     return { error: "Internal send-message steps cannot be connected as graph nodes.", ok: false };
   }
   if (!loopspaceGraphNodeHasOutputPort(fromNode, fromPort, { allowLegacy: options.allowLegacy })) {

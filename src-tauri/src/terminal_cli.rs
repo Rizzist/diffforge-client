@@ -798,6 +798,9 @@ const APP_CONTROL_MCP_TOOL_NAMES: &[&str] = &[
     "get_visible_context",
     "list_docs",
     "get_doc",
+    "prepare_doc_draft",
+    "save_doc",
+    "write_doc",
     "get_selected_document_context",
     "get_selected_script_context",
     "get_selection_context",
@@ -807,6 +810,12 @@ const APP_CONTROL_MCP_TOOL_NAMES: &[&str] = &[
     "update_selected_script",
     "run_selected_script",
     "run_local_script",
+    "list_assets",
+    "get_asset_root",
+    "upload_asset",
+    "upload_asset_status",
+    "download_asset",
+    "download_asset_status",
     "list_local_scripts",
     "list_scripts",
     "get_script",
@@ -832,12 +841,14 @@ You are Diff Forge's app-control terminal orchestrator. Treat the visible Diff F
 Default routing:
 - Start with get_visible_context when the request could refer to the current tab, selected Tools document, selected local script, draft, or highlighted text.
 - For background Tools document inventory questions, use list_docs or get_doc. These tools do not switch tabs or disturb the user's selected document. For questions about the selected/visible document, use get_selected_document_context or get_visible_context(includeContent=true) and explain the selected skill, instruction, architecture, or document from that context.
+- For account document edits, call prepare_doc_draft first, edit the returned draft_path directly, then call save_doc with draft_path, draft_id, base_content_hash, and the document_key/path_key before reporting the edit done or completing a Loopspace checkpoint. Do not edit canonical local_path directly. Default to mode=\"publish\" so other clients can see completed document writes; use mode=\"local\" only when the user asks for local-only/save locally. Empty overwrites require allow_empty_overwrite=true.
 - For creating a skill/instruction/architecture/document draft, call update_selected_document with title, document_kind, content or content_md, and mode=\"draft\" unless the user asks to save or publish.
 - For modifying or deleting highlighted text, get the selection context, preserve the surrounding document, send the full updated document content through update_selected_document, and keep mode=\"draft\" unless the user asks for local save or publish.
 - For save locally, use mode=\"local\". For publish, push, sync, fan out, or share with other clients, use mode=\"publish\".
 - For background local script inventory questions, use list_scripts or get_script. These tools do not switch tabs or disturb the user's selected script. For selected/visible local Scripts tab questions, use get_selected_script_context or get_visible_context(includeContent=true). For creating or editing a local script, call update_selected_script with title, shell, content/content_md, and mode=\"draft\" unless the user asks to save or run. For save locally use save_selected_script or update_selected_script(mode=\"local\"). For saved selected or named scripts, prefer run_local_script with script_id when available or an exact script_name; use run_selected_script when a selected draft may need saving first. Script run tools are fire-and-forget: once accepted, tell the user it started and stop; do not monitor logs unless the user explicitly asks.
+- For readable input assets, call list_assets and use an existing local_path when present; if an asset is Cloud-only, call download_asset first and use download_asset_status if you need to verify transfer state. For generated screenshots, images, media, or reusable file assets, call get_asset_root with a filename first, write the generated file to the returned local_path, then call upload_asset with that path. Use upload_asset_status to verify uploads. When completing a Loopspace checkpoint that generated assets, include asset_id or asset_ids in record_loopspace_step_progress.
 - For Loopspace manual trigger requests, call run_loopspace_trigger with a trigger_id or trigger_name and optional payload.
-- For Loopspace graph edits, call get_loopspace_graph and list_loopspace_triggers first. Loopspace graphs use .dfblueprint source with explicit node ids, typed node kinds, and edge node.port -> node.port connections. Trigger nodes are references to reusable trigger inventory: if the requested cron/webhook/manual trigger does not exist, call create_loopspace_trigger first, then patch_loopspace_graph with op=\"attach_trigger\" and trigger_id. Webhook triggers default to signed_hmac; only use public_token when the user explicitly asks for a public URL and set public_webhook_confirmed=true. Use update_loopspace_trigger to rename, enable, disable, rotate, or change webhook auth. Never invent standalone cron/manual/webhook trigger nodes in the graph source. For add_node, use supported node kinds: document_read, document_write, run_script, send_message, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message and run_script nodes. For send-message substep document guidance, connect document_read.docs -> step.in for readable context and step.docs -> document_write.in for writable output. Prefer patch_loopspace_graph for attach_trigger, add_node, move_node, remove_node, connect, disconnect, and update_node_props. Use update_loopspace_graph only for larger full-source rewrites, preserve existing ids, and wait for the hydrated result.
+- For Loopspace graph edits, call get_loopspace_graph and list_loopspace_triggers first. Loopspace graphs use .dfblueprint source with explicit node ids, typed node kinds, and edge node.port -> node.port connections. Trigger nodes are references to reusable trigger inventory: if the requested cron/webhook/manual trigger does not exist, call create_loopspace_trigger first, then patch_loopspace_graph with op=\"attach_trigger\" and trigger_id. Webhook triggers default to signed_hmac; only use public_token when the user explicitly asks for a public URL and set public_webhook_confirmed=true. Use update_loopspace_trigger to rename, enable, disable, rotate, or change webhook auth. Never invent standalone cron/manual/webhook trigger nodes in the graph source. For add_node, use supported node kinds: document_read, document_write, asset_read, asset_write, run_script, send_message, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message and run_script nodes. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. For send-message substep resource guidance, connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for generated documents, and step.assets -> asset_write.in for generated assets. Prefer patch_loopspace_graph for attach_trigger, add_node, move_node, remove_node, connect, disconnect, and update_node_props; resource metadata may be top-level or nested under props. Use update_loopspace_graph only for larger full-source rewrites, preserve existing ids, and wait for the hydrated result.
 - For tab or workspace navigation and terminal management, use select_tab, select_workspace, list_terminals, open_terminals, close_terminals, or focus_terminal.
 
 Do not search for legacy account-skills.md or random files when the app-control tools can answer or edit the live UI state. Ask a brief clarifying question only when the visible context is missing and the user's target cannot be inferred.";
@@ -987,7 +998,7 @@ fn terminal_env_vars_with_app_control_mcp_identity(
             "type": "local",
             "command": command,
             "enabled": true,
-            "timeout": APP_CONTROL_MCP_TIMEOUT_MS,
+            "timeout": APP_CONTROL_MCP_SCRIPT_RUN_TIMEOUT_MS,
             "environment": {
                 "DIFFFORGE_APP_CONTROL_MCP": "1"
             }
@@ -2924,6 +2935,8 @@ mod terminal_cli_tests {
         assert!(prompt.contains("app-control terminal orchestrator"));
         assert!(prompt.contains("make a skill"));
         assert!(prompt.contains("list_docs"));
+        assert!(prompt.contains("prepare_doc_draft"));
+        assert!(prompt.contains("save_doc"));
         assert!(prompt.contains("list_scripts"));
         assert!(prompt.contains("modify this selection"));
         assert!(prompt.contains("update_selected_document"));
@@ -2937,7 +2950,13 @@ mod terminal_cli_tests {
             .unwrap();
         assert!(allowed_tools.contains("mcp__diffforge-app-control__get_visible_context"));
         assert!(allowed_tools.contains("mcp__diffforge-app-control__list_docs"));
+        assert!(allowed_tools.contains("mcp__diffforge-app-control__prepare_doc_draft"));
+        assert!(allowed_tools.contains("mcp__diffforge-app-control__save_doc"));
         assert!(allowed_tools.contains("mcp__diffforge-app-control__list_scripts"));
+        assert!(allowed_tools.contains("mcp__diffforge-app-control__list_assets"));
+        assert!(allowed_tools.contains("mcp__diffforge-app-control__get_asset_root"));
+        assert!(allowed_tools.contains("mcp__diffforge-app-control__upload_asset"));
+        assert!(allowed_tools.contains("mcp__diffforge-app-control__download_asset"));
         assert!(allowed_tools.contains("mcp__diffforge-app-control__record_loopspace_step_progress"));
         assert!(allowed_tools.contains("mcp__diffforge-app-control__update_selected_document"));
         assert!(args.windows(2).any(|pair| pair[0] == "--mcp-config"));
@@ -2971,6 +2990,8 @@ mod terminal_cli_tests {
         assert!(prompt.contains("app-control terminal orchestrator"));
         assert!(prompt.contains("make a skill"));
         assert!(prompt.contains("list_docs"));
+        assert!(prompt.contains("prepare_doc_draft"));
+        assert!(prompt.contains("save_doc"));
         assert!(prompt.contains("list_scripts"));
         assert!(prompt.contains("update_selected_document"));
         assert!(args.iter().any(|arg| {

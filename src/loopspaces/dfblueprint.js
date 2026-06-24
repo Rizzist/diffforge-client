@@ -397,6 +397,7 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
   if (templateId === "document_read" || templateId === "document_write") {
     const mode = templateId === "document_read" ? "read" : "write";
     const label = safeText(template?.label, mode === "read" ? "Document read" : "Document write");
+    const visualDefaults = loopspaceGraphVisualDefaultsForNode(templateId);
     return {
       id: `${templateId}-${suffix}`,
       icon: safeText(template?.icon, "document"),
@@ -410,8 +411,36 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       x: position ? Math.round(Number(position.x) || 0) : 0,
       y: position ? Math.round(Number(position.y) || 0) : 0,
       props: {
+        create_name: safeText(template?.create_name || template?.name),
         doc_refs: safeText(template?.doc_refs || template?.documents || template?.path_key),
+        h: safeText(template?.h || template?.height, String(visualDefaults.height || 128)),
         mode,
+        target_mode: safeText(template?.target_mode, mode === "write" ? "create_or_update" : "select"),
+      },
+    };
+  }
+  if (templateId === "asset_read" || templateId === "asset_write") {
+    const mode = templateId === "asset_read" ? "read" : "write";
+    const label = safeText(template?.label, mode === "read" ? "Asset read" : "Asset write");
+    const visualDefaults = loopspaceGraphVisualDefaultsForNode(templateId);
+    return {
+      id: `${templateId}-${suffix}`,
+      icon: safeText(template?.icon, "asset"),
+      label,
+      mode,
+      nodeKind: templateId,
+      kind: templateId,
+      role: safeText(template?.role, "context"),
+      triggerId: "",
+      hasPosition: Boolean(position),
+      x: position ? Math.round(Number(position.x) || 0) : 0,
+      y: position ? Math.round(Number(position.y) || 0) : 0,
+      props: {
+        asset_refs: safeText(template?.asset_refs || template?.assets || template?.path_key || template?.asset_id),
+        create_name: safeText(template?.create_name || template?.name),
+        h: safeText(template?.h || template?.height, String(visualDefaults.height || 128)),
+        mode,
+        target_mode: safeText(template?.target_mode, mode === "write" ? "capture_generated" : "select"),
       },
     };
   }
@@ -572,6 +601,30 @@ export function updateDfBlueprintNodeProps(source, nodeId, patch = {}) {
   return serializeDfBlueprint(ast);
 }
 
+function dfBlueprintResourcePropsFromPatchOperation(op = {}, node = null) {
+  const nodeKind = sanitizeDfBlueprintId(node?.nodeKind || node?.kind || "", "").replace(/-/g, "_");
+  const props = {};
+  const putFirst = (targetKey, aliases = []) => {
+    for (const alias of aliases) {
+      if (Object.prototype.hasOwnProperty.call(op, alias) && op[alias] !== undefined) {
+        props[targetKey] = safeText(op[alias]);
+        return;
+      }
+    }
+  };
+  putFirst("create_name", ["create_name", "createName"]);
+  putFirst("h", ["h", "height"]);
+  putFirst("mode", ["mode"]);
+  putFirst("target_mode", ["target_mode", "targetMode"]);
+  if (nodeKind === "document_read" || nodeKind === "document_write") {
+    putFirst("doc_refs", ["doc_refs", "docRefs", "documents", "path_key", "pathKey"]);
+  }
+  if (nodeKind === "asset_read" || nodeKind === "asset_write") {
+    putFirst("asset_refs", ["asset_refs", "assetRefs", "assets", "asset_id", "assetId", "path_key", "pathKey"]);
+  }
+  return props;
+}
+
 export function applyDfBlueprintPatchOperations(source, operations = [], options = {}) {
   let ast = parseDfBlueprintSource(source);
   if (options.name && (!ast.name || ast.name === "Loopspace")) ast.name = options.name;
@@ -595,10 +648,14 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         script_name: op.script_name,
         shell: op.shell,
         description: op.description || op.desc || op.details,
+        asset_refs: op.asset_refs || op.assets,
+        create_name: op.create_name || op.createName,
         doc_refs: op.doc_refs || op.documents,
+        h: op.h || op.height,
         order: op.order || op.index,
         parent_id: op.parent_id || op.parentId || op.parent,
         status: op.status,
+        target_mode: op.target_mode || op.targetMode,
       }, op.position || { x: op.x, y: op.y });
       if (op.id) node.id = sanitizeDfBlueprintId(op.id, node.id);
       const existingIndex = ast.nodes.findIndex((item) => item.id === node.id);
@@ -692,7 +749,10 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
       const id = safeText(op.node_id || op.id);
       ast.nodes = ast.nodes.map((node) => {
         if (node.id !== id) return node;
-        const props = op.props && typeof op.props === "object" ? op.props : {};
+        const props = {
+          ...(op.props && typeof op.props === "object" ? op.props : {}),
+          ...dfBlueprintResourcePropsFromPatchOperation(op, node),
+        };
         return {
           ...node,
           ...props,

@@ -11,6 +11,7 @@ import {
 import {
   applyDfBlueprintPatchOperations,
   parseDfBlueprintSource,
+  validateDfBlueprintSource,
 } from "./dfblueprint.js";
 
 const triggerNode = { id: "trigger-1", kind: "trigger", label: "Kick" };
@@ -18,6 +19,8 @@ const runScriptNode = { id: "run-script-1", kind: "run_script", label: "Run scri
 const sendMessageNode = { id: "send-message-1", kind: "send_message", label: "Send message" };
 const documentReadNode = { id: "doc-read-1", kind: "document_read", label: "Read docs" };
 const documentWriteNode = { id: "doc-write-1", kind: "document_write", label: "Write docs" };
+const assetReadNode = { id: "asset-read-1", kind: "asset_read", label: "Read assets" };
+const assetWriteNode = { id: "asset-write-1", kind: "asset_write", label: "Write assets" };
 const stepNode = {
   id: "step-1",
   kind: "step",
@@ -31,6 +34,12 @@ const wrongParentStepNode = {
   label: "Wrong parent checkpoint",
   props: { parent_id: runScriptNode.id },
 };
+const missingParentStepNode = {
+  id: "missing-parent-step-1",
+  kind: "step",
+  label: "Missing parent checkpoint",
+  props: { parent_id: "missing-message" },
+};
 
 test("graph contract exposes execution branches for action nodes", () => {
   assert.deepEqual(
@@ -40,6 +49,29 @@ test("graph contract exposes execution branches for action nodes", () => {
   assert.deepEqual(
     loopspaceGraphOutputPortsForNode(sendMessageNode).map((port) => port.id),
     ["exec", "success", "failure", "interrupt"],
+  );
+});
+
+test("graph contract exposes document and asset resource ports", () => {
+  assert.deepEqual(
+    loopspaceGraphOutputPortsForNode(documentReadNode).map((port) => port.id),
+    ["docs"],
+  );
+  assert.deepEqual(
+    loopspaceGraphOutputPortsForNode(documentWriteNode).map((port) => port.id),
+    ["docs"],
+  );
+  assert.deepEqual(
+    loopspaceGraphOutputPortsForNode(assetReadNode).map((port) => port.id),
+    ["assets"],
+  );
+  assert.deepEqual(
+    loopspaceGraphOutputPortsForNode(assetWriteNode).map((port) => port.id),
+    ["assets"],
+  );
+  assert.deepEqual(
+    loopspaceGraphOutputPortsForNode(stepNode).map((port) => port.id),
+    ["docs", "assets"],
   );
 });
 
@@ -105,6 +137,7 @@ test("graph contract accepts document context edges for send-message steps only"
     [stepNode.id, stepNode],
     [orphanStepNode.id, orphanStepNode],
     [wrongParentStepNode.id, wrongParentStepNode],
+    [missingParentStepNode.id, missingParentStepNode],
   ]);
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(documentReadNode, stepNode, {
@@ -147,8 +180,83 @@ test("graph contract accepts document context edges for send-message steps only"
     false,
   );
   assert.equal(
+    validateLoopspaceGraphEdgeCandidate(documentWriteNode, missingParentStepNode, {
+      fromPort: "docs",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    false,
+  );
+  assert.equal(
     validateLoopspaceGraphEdgeCandidate(stepNode, sendMessageNode, {
       fromPort: "docs",
+      toPort: "in",
+    }).ok,
+    false,
+  );
+});
+
+test("graph contract accepts asset context edges for send-message steps only", () => {
+  const nodeById = new Map([
+    [sendMessageNode.id, sendMessageNode],
+    [runScriptNode.id, runScriptNode],
+    [stepNode.id, stepNode],
+    [orphanStepNode.id, orphanStepNode],
+    [wrongParentStepNode.id, wrongParentStepNode],
+    [missingParentStepNode.id, missingParentStepNode],
+  ]);
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(assetReadNode, stepNode, {
+      fromPort: "assets",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    true,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(stepNode, assetWriteNode, {
+      fromPort: "assets",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    true,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(assetWriteNode, stepNode, {
+      fromPort: "assets",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    true,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(stepNode, assetWriteNode, {
+      fromPort: "docs",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    false,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(assetReadNode, orphanStepNode, {
+      fromPort: "assets",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    false,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(wrongParentStepNode, assetWriteNode, {
+      fromPort: "assets",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    false,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(assetWriteNode, missingParentStepNode, {
+      fromPort: "assets",
+      nodeById,
       toPort: "in",
     }).ok,
     false,
@@ -251,6 +359,69 @@ test("graph ast validation accepts document context edges to internal steps", ()
   assert.equal(validation.ok, true);
 });
 
+test("dfblueprint validation accepts document edges to hyphenated internal steps", () => {
+  const source = `dfblueprint "Document step graph"
+format diffforge.dfblueprint.v1
+direction right
+node "Send message" [id: send-message-mqruul0w-r330x, kind: send_message, role: action]
+node "List docs" [id: step-mqruul0w-r330x, kind: step, role: checkpoint, parent_id: send-message-mqruul0w-r330x]
+node "Read docs" [id: document-read-mqruul0w-r330x, kind: document_read, role: context]
+node "Write docs" [id: document-write-mqruul0w-r330x, kind: document_write, role: context]
+edge document-read-mqruul0w-r330x.docs -> step-mqruul0w-r330x.in [id: edge-read-step, branch: docs]
+edge step-mqruul0w-r330x.docs -> document-write-mqruul0w-r330x.in [id: edge-step-write, branch: docs]
+`;
+  const validation = validateDfBlueprintSource(source);
+
+  assert.equal(validation.ok, true, validation.errors.join("\n"));
+});
+
+test("dfblueprint validation accepts asset edges to hyphenated internal steps", () => {
+  const source = `dfblueprint "Asset step graph"
+format diffforge.dfblueprint.v1
+direction right
+node "Send message" [id: send-message-mqruul0w-r330x, kind: send_message, role: action]
+node "Create assets" [id: step-mqruul0w-r330x, kind: step, role: checkpoint, parent_id: send-message-mqruul0w-r330x]
+node "Read assets" [id: asset-read-mqruul0w-r330x, kind: asset_read, role: context]
+node "Write assets" [id: asset-write-mqruul0w-r330x, kind: asset_write, role: context]
+edge asset-read-mqruul0w-r330x.assets -> step-mqruul0w-r330x.in [id: edge-read-step, branch: assets]
+edge step-mqruul0w-r330x.assets -> asset-write-mqruul0w-r330x.in [id: edge-step-write, branch: assets]
+`;
+  const validation = validateDfBlueprintSource(source);
+
+  assert.equal(validation.ok, true, validation.errors.join("\n"));
+});
+
+test("graph ast validation accepts asset context edges to internal steps", () => {
+  const validation = validateLoopspaceGraphAst({
+    nodes: [sendMessageNode, assetReadNode, stepNode, assetWriteNode],
+    edges: [
+      {
+        id: "edge-asset-read-step",
+        from: assetReadNode.id,
+        fromPort: "assets",
+        to: stepNode.id,
+        toPort: "in",
+      },
+      {
+        id: "edge-step-asset-write",
+        from: stepNode.id,
+        fromPort: "assets",
+        to: assetWriteNode.id,
+        toPort: "in",
+      },
+      {
+        id: "edge-asset-write-next-step",
+        from: assetWriteNode.id,
+        fromPort: "assets",
+        to: stepNode.id,
+        toPort: "in",
+      },
+    ],
+  });
+
+  assert.equal(validation.ok, true);
+});
+
 test("graph ast validation rejects document context edges to orphan or non-message steps", () => {
   const orphanValidation = validateLoopspaceGraphAst({
     nodes: [documentReadNode, orphanStepNode, documentWriteNode],
@@ -295,6 +466,28 @@ test("graph ast validation rejects document context edges to orphan or non-messa
   });
   assert.equal(wrongParentValidation.ok, false);
   assert.match(wrongParentValidation.errors.join("\n"), /Internal send-message steps/);
+
+  const missingParentValidation = validateLoopspaceGraphAst({
+    nodes: [documentReadNode, missingParentStepNode, documentWriteNode],
+    edges: [
+      {
+        id: "edge-read-missing-parent-step",
+        from: documentReadNode.id,
+        fromPort: "docs",
+        to: missingParentStepNode.id,
+        toPort: "in",
+      },
+      {
+        id: "edge-missing-parent-step-write",
+        from: missingParentStepNode.id,
+        fromPort: "docs",
+        to: documentWriteNode.id,
+        toPort: "in",
+      },
+    ],
+  });
+  assert.equal(missingParentValidation.ok, false);
+  assert.match(missingParentValidation.errors.join("\n"), /Internal send-message steps/);
 });
 
 test("graph ast validation reports illegal ports with edge context", () => {
@@ -363,4 +556,80 @@ test("graph contract owns action node visual gutters", () => {
     sized: true,
     width: 270,
   });
+  assert.deepEqual(loopspaceGraphVisualDefaultsForNode(assetReadNode), {
+    height: 128,
+    minHeight: 128,
+    minWidth: 270,
+    sized: true,
+    width: 270,
+  });
+});
+
+test("graph patches create asset resource nodes with generation metadata", () => {
+  const patched = applyDfBlueprintPatchOperations("", [
+    {
+      op: "add_node",
+      id: "generated-screenshot",
+      kind: "asset_write",
+      label: "Generated screenshot",
+      create_name: "qa-homepage.png",
+      asset_refs: "asset-previous",
+      h: 196,
+    },
+  ]);
+  const ast = parseDfBlueprintSource(patched);
+  const node = ast.nodes.find((item) => item.id === "generated-screenshot");
+
+  assert.equal(node?.kind, "asset_write");
+  assert.equal(node?.props?.create_name, "qa-homepage.png");
+  assert.equal(node?.props?.asset_refs, "asset-previous");
+  assert.equal(node?.props?.target_mode, "capture_generated");
+  assert.equal(node?.props?.h, "196");
+});
+
+test("graph patches update resource node metadata from top-level fields", () => {
+  const source = applyDfBlueprintPatchOperations("", [
+    {
+      op: "add_node",
+      id: "generated-doc",
+      kind: "document_write",
+      label: "Generated document",
+    },
+    {
+      op: "add_node",
+      id: "generated-asset",
+      kind: "asset_write",
+      label: "Generated asset",
+    },
+  ]);
+  const patched = applyDfBlueprintPatchOperations(source, [
+    {
+      op: "update_node_props",
+      id: "generated-doc",
+      create_name: "brief.md",
+      doc_refs: "doc-existing",
+      h: 184,
+      target_mode: "create_or_update",
+    },
+    {
+      op: "update_node_props",
+      id: "generated-asset",
+      asset_refs: "asset-existing",
+      create_name: "hero.png",
+      height: 208,
+      targetMode: "capture_generated",
+    },
+  ]);
+  const ast = parseDfBlueprintSource(patched);
+  const docNode = ast.nodes.find((node) => node.id === "generated-doc");
+  const assetNode = ast.nodes.find((node) => node.id === "generated-asset");
+
+  assert.equal(docNode?.props?.create_name, "brief.md");
+  assert.equal(docNode?.props?.doc_refs, "doc-existing");
+  assert.equal(docNode?.props?.h, "184");
+  assert.equal(docNode?.props?.target_mode, "create_or_update");
+  assert.equal(assetNode?.props?.asset_refs, "asset-existing");
+  assert.equal(assetNode?.props?.create_name, "hero.png");
+  assert.equal(assetNode?.props?.h, "208");
+  assert.equal(assetNode?.props?.target_mode, "capture_generated");
 });
