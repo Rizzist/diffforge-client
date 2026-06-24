@@ -1401,26 +1401,10 @@ function modelRowsForDisplay(summary = {}) {
   return legacy.length ? legacy : hourly;
 }
 
-function dailyDisplayMergeKey(row = {}) {
-  return [
-    bucketDayKey(row),
-    rowDeviceId(row) || "unknown-device",
-    rowScopeKey(row),
-    providerKey(row),
-    rowProviderAccountKey(row) || "unknown-account",
-  ].join("\u001f");
-}
-
 function dailyRowsForDisplay(summary = {}) {
   const daily = summaryArray(summary, "daily_by_device_provider", "dailyByDeviceProvider", "daily");
-  const hourly = hourlyRowsForDisplay(summary);
-  if (!daily.length) return hourly;
-  if (!hourly.length) return daily;
-  const dailyKeys = new Set(daily.map(dailyDisplayMergeKey).filter(Boolean));
-  return [
-    ...daily,
-    ...hourly.filter((row) => !dailyKeys.has(dailyDisplayMergeKey(row))),
-  ];
+  if (daily.length) return daily;
+  return hourlyRowsForDisplay(summary);
 }
 
 function usageRowsForDisplay(summary = {}) {
@@ -1957,6 +1941,70 @@ function limitDisplayPercent(limit = {}, usedPercent = null, remainingPercent = 
   return percent == null ? null : Math.max(0, Math.min(100, Math.round(percent)));
 }
 
+function formatLimitResetDuration(seconds) {
+  const total = Math.max(0, Math.round(Number(seconds) || 0));
+  const days = Math.floor(total / 86_400);
+  const hours = Math.floor((total % 86_400) / 3_600);
+  const minutes = Math.floor((total % 3_600) / 60);
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return `${hours}h ${minutes}m`;
+  if (minutes > 0) return `${minutes}m`;
+  return `${total}s`;
+}
+
+function limitResetLabelIsPlaceholder(value) {
+  const text = String(value || "").trim().toLowerCase();
+  if (!text) return true;
+  return text === "reset time unavailable"
+    || text === "resets with provider window"
+    || text === "resets on provider schedule"
+    || text.includes("provider limit unavailable")
+    || text.includes("provider schedule unavailable")
+    || text.includes("provider window reset")
+    || text.includes("open claude code")
+    || text.includes("claude code has not reported");
+}
+
+function meaningfulLimitResetLabel(limit = {}) {
+  const explicit = String(limit.reset_label || limit.resetLabel || "").trim();
+  return explicit && !limitResetLabelIsPlaceholder(explicit) ? explicit : "";
+}
+
+function limitHasResetTiming(limit = {}) {
+  if (meaningfulLimitResetLabel(limit)) return true;
+  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds, limit.resetAfterSeconds);
+  if (resetAfterSeconds != null && resetAfterSeconds > 0) return true;
+  const resetDate = limitResetDate(limit);
+  return Boolean(resetDate && resetDate.getTime() > Date.now());
+}
+
+function limitResetReferenceRow(rows = []) {
+  const candidates = (Array.isArray(rows) ? rows : []).filter(limitHasResetTiming);
+  const source = candidates.length ? candidates : (Array.isArray(rows) ? rows : []);
+  return [...source].sort((left, right) => {
+    const activeDelta = Number(providerLimitUsesActiveAccount(right)) - Number(providerLimitUsesActiveAccount(left));
+    if (activeDelta) return activeDelta;
+    return limitTimestampMs(right) - limitTimestampMs(left);
+  })[0] || {};
+}
+
+function computedLimitResetLabel(limit = {}, windowKind = "5_hour") {
+  const explicit = meaningfulLimitResetLabel(limit);
+  if (explicit) return explicit;
+  const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds, limit.resetAfterSeconds);
+  if (resetAfterSeconds != null && resetAfterSeconds > 0) {
+    return `Resets in ${formatLimitResetDuration(resetAfterSeconds)}`;
+  }
+  const resetDate = limitResetDate(limit);
+  if (resetDate) {
+    const secondsUntilReset = Math.round((resetDate.getTime() - Date.now()) / 1000);
+    if (secondsUntilReset > 0) {
+      return `Resets in ${formatLimitResetDuration(secondsUntilReset)}`;
+    }
+  }
+  return windowKind === "5_hour" ? "Resets with provider window" : "Resets on provider schedule";
+}
+
 function isProviderResetEstimate(limit = {}) {
   if (!(limit?.client_estimated || limit?.clientEstimated)) return false;
   const resetAfterSeconds = limitNumberOrNull(limit.reset_after_seconds, limit.resetAfterSeconds);
@@ -1969,10 +2017,13 @@ function clientProjectedLimit(limit = {}) {
   if (!resetDate || !hasKnownLimitPercent(limit)) return limit;
   const secondsUntilReset = Math.round((resetDate.getTime() - Date.now()) / 1000);
   if (secondsUntilReset > 0) {
+    const resetLabel = `Resets in ${formatLimitResetDuration(secondsUntilReset)}`;
     return {
       ...limit,
       reset_after_seconds: secondsUntilReset,
       resetAfterSeconds: secondsUntilReset,
+      reset_label: resetLabel,
+      resetLabel,
     };
   }
   const resetWindowKind = String(limit.window_kind || limit.windowKind || limit.limit_kind || limit.limitKind || "");
@@ -2081,6 +2132,7 @@ function mergeLimits(limits, windowKind) {
   const claudeUnavailable = isClaudeLimitUnavailable(rows);
   const paceStatus = resetEstimated ? "unknown" : limitPaceStatus(rows);
   const overPace = paceStatus === "over_pace" || (paceDelta != null && paceDelta > 0);
+  const resetReference = limitResetReferenceRow(rows);
   return {
     windowKind: normalizedWindowKind,
     label: rows[0]?.label || (normalizedWindowKind === "5_hour" ? "5-Hour Session" : "Weekly Limit"),
@@ -2097,10 +2149,10 @@ function mergeLimits(limits, windowKind) {
     paceStatus,
     overPace,
     statusLabel: resetEstimated ? "Available" : limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable, paceStatus),
-    resetLabel: limitResetLabel(rows, normalizedWindowKind, claudeUnavailable),
+    resetLabel: limitResetLabel(rows, normalizedWindowKind, claudeUnavailable, resetReference),
     ratePoints,
-    limitWindowSeconds: numeric(rows[0]?.limit_window_seconds, rows[0]?.limitWindowSeconds),
-    resetAfterSeconds: numeric(rows[0]?.reset_after_seconds, rows[0]?.resetAfterSeconds),
+    limitWindowSeconds: limitNumberOrNull(resetReference?.limit_window_seconds, resetReference?.limitWindowSeconds, rows[0]?.limit_window_seconds, rows[0]?.limitWindowSeconds) ?? 0,
+    resetAfterSeconds: limitNumberOrNull(resetReference?.reset_after_seconds, resetReference?.resetAfterSeconds, rows[0]?.reset_after_seconds, rows[0]?.resetAfterSeconds) ?? 0,
   };
 }
 
@@ -2136,18 +2188,25 @@ function limitPaceStatus(rows) {
   return "unknown";
 }
 
-function limitResetLabel(rows, windowKind, claudeUnavailable) {
-  const current = rows[0]?.reset_label || rows[0]?.resetLabel || "";
+function limitResetLabel(rows, windowKind, claudeUnavailable, resetReference = null) {
+  const reference = resetReference || limitResetReferenceRow(rows);
+  const explicit = meaningfulLimitResetLabel(reference);
   if (!claudeUnavailable) {
+    const current = computedLimitResetLabel(reference, windowKind);
     return current || (windowKind === "5_hour" ? "Resets with provider window" : "Resets on provider schedule");
   }
-  if (!current || current.includes("Provider limit unavailable")) {
+  if (limitHasResetTiming(reference)) {
+    const current = computedLimitResetLabel(reference, windowKind);
+    if (current && !limitResetLabelIsPlaceholder(current)) return current;
+  }
+  const rawExplicit = String(reference?.reset_label || reference?.resetLabel || "").trim();
+  if (!rawExplicit || rawExplicit.includes("Provider limit unavailable")) {
     return "Open Claude Code to publish live limits";
   }
-  if (current.includes("Provider schedule unavailable")) {
+  if (rawExplicit.includes("Provider schedule unavailable")) {
     return "Claude Code has not reported its weekly window";
   }
-  return current;
+  return rawExplicit;
 }
 
 function limitStatusLabel(remainingPercent, paceDelta, rows, claudeUnavailable = false, paceStatus = "unknown") {
@@ -2594,6 +2653,27 @@ function tokenomicsLimitPercentSignature(summary = {}) {
   return [limitSignature, sampleSignature].filter(Boolean).join("|");
 }
 
+function dailyRollupMergeKey(row = {}) {
+  return [
+    bucketDayKey(row),
+    rowDeviceId(row) || "unknown-device",
+    rowScopeKey(row),
+    providerKey(row),
+    String(row?.agent_kind || row?.agentKind || ""),
+    String(row?.model || ""),
+    rowProviderAccountKey(row) || "unknown-account",
+  ].join("\u001f");
+}
+
+function mergeDailyRollupRows(previousRows, nextRows) {
+  const previous = Array.isArray(previousRows) ? previousRows : [];
+  if (!Array.isArray(nextRows) || !nextRows.length) return previous;
+  const merged = new Map();
+  previous.forEach((row) => merged.set(dailyRollupMergeKey(row), row));
+  nextRows.forEach((row) => merged.set(dailyRollupMergeKey(row), row));
+  return [...merged.values()].sort((left, right) => bucketDayKey(right).localeCompare(bucketDayKey(left)));
+}
+
 function mergeTokenomicsSummary(previous, next) {
   if (!previous) return next || {};
   if (!next) return previous;
@@ -2617,6 +2697,25 @@ function mergeTokenomicsSummary(previous, next) {
     limitSamples: mergeProviderLimitSamples(previous.limitSamples || previous.limit_samples, next.limitSamples || next.limit_samples),
     device_identities: next.device_identities || previous.device_identities,
     deviceIdentities: next.deviceIdentities || previous.deviceIdentities,
+  };
+}
+
+function mergeTokenomicsSummaryDelta(previous, next) {
+  if (!previous) return next || {};
+  if (!next) return previous;
+  const nextDaily = next.daily_by_device_provider || next.dailyByDeviceProvider;
+  const mergedDaily = mergeDailyRollupRows(
+    previous.daily_by_device_provider || previous.dailyByDeviceProvider,
+    nextDaily,
+  );
+  return {
+    ...previous,
+    schema_version: next.schema_version || previous.schema_version,
+    schemaVersion: next.schemaVersion || next.schema_version || previous.schemaVersion,
+    updated_at: next.updated_at || previous.updated_at,
+    updatedAt: next.updatedAt || next.updated_at || previous.updatedAt,
+    daily_by_device_provider: mergedDaily,
+    dailyByDeviceProvider: mergedDaily,
   };
 }
 
@@ -2705,6 +2804,13 @@ function mergeSummaryIntoTokenomicsStore(next, { syncLimitChanges = false } = {}
   }
 }
 
+function mergeSummaryDeltaIntoTokenomicsStore(next) {
+  if (!next) return;
+  updateTokenomicsStore((previous) => ({
+    summary: mergeTokenomicsSummaryDelta(previous.summary, next),
+  }));
+}
+
 function resetTokenomicsStoreForAccount(accountKey) {
   const normalizedAccountKey = normalizeTokenomicsAccountKey(accountKey);
   if (tokenomicsStore.accountKey === normalizedAccountKey) {
@@ -2737,6 +2843,10 @@ function ensureTokenomicsProgressListener() {
     updateTokenomicsStore({ scanProgress: payload });
     if (payload?.summary) {
       mergeSummaryIntoTokenomicsStore(payload.summary);
+    }
+    const summaryDelta = payload?.summary_delta || payload?.summaryDelta;
+    if (summaryDelta) {
+      mergeSummaryDeltaIntoTokenomicsStore(summaryDelta);
     }
   })
     .then((handler) => {

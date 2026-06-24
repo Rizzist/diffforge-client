@@ -93,6 +93,10 @@ const SCRIPT_DEFAULT_LOOPSPACE_BUTTON_COLOR = "#120c04";
 const SCRIPT_DEFAULT_WORKSPACE_TEXT_COLOR = "#ffffff";
 const SCRIPT_DEFAULT_LOOPSPACE_TEXT_COLOR = "#ffffff";
 const SCRIPT_EXPLORER_FINISH_BADGE_MS = 5000;
+const SCRIPT_HISTORY_ESTIMATED_ROW_HEIGHT = 68;
+const SCRIPT_HISTORY_ROW_GAP = 8;
+const SCRIPT_HISTORY_VIEWPORT_FALLBACK_HEIGHT = 360;
+const SCRIPT_HISTORY_VIRTUAL_OVERSCAN_ROWS = 6;
 
 function normalizedSectionId(value, fallback = "docs") {
   const normalized = text(value);
@@ -463,6 +467,54 @@ function formatScriptLogDuration(value) {
   return `${minutes}m ${seconds}s`;
 }
 
+function formatScriptTerseDuration(value) {
+  const ms = Number(value);
+  if (!Number.isFinite(ms) || ms < 0) return "pending";
+  let seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds <= 0) return "0s";
+  const days = Math.floor(seconds / 86_400);
+  seconds %= 86_400;
+  const hours = Math.floor(seconds / 3_600);
+  seconds %= 3_600;
+  const minutes = Math.floor(seconds / 60);
+  seconds %= 60;
+
+  if (days > 0) return [days ? `${days}d` : "", hours ? `${hours}h` : ""].filter(Boolean).join(" ");
+  if (hours > 0) return [hours ? `${hours}h` : "", minutes ? `${minutes}m` : ""].filter(Boolean).join(" ");
+  if (minutes > 0) return [minutes ? `${minutes}m` : "", seconds ? `${seconds}s` : ""].filter(Boolean).join(" ");
+  return `${seconds}s`;
+}
+
+function formatScriptRunAgo(run = {}, nowMs = Date.now()) {
+  const atMs = scriptRunTimestampMs(run.startedAtMs, run.started_at_ms, run.startedAt, run.started_at, run.queuedAtMs, run.queued_at_ms, run.queuedAt, run.queued_at);
+  if (!atMs) return "unknown";
+  const ageMs = Math.max(0, Number(nowMs) - atMs);
+  if (ageMs < 30_000) return "just now";
+  return `${formatScriptTerseDuration(ageMs)} ago`;
+}
+
+function scriptRunRuntimeMs(run = {}, nowMs = Date.now()) {
+  if (run.state === "queued") return 0;
+  const startedAtMs = scriptRunTimestampMs(run.startedAtMs, run.started_at_ms, run.startedAt, run.started_at);
+  const endedAtMs = scriptRunTimestampMs(run.endedAtMs, run.ended_at_ms, run.endedAt, run.ended_at);
+  const explicitDuration = Number(run.durationMs ?? run.duration_ms);
+  if (run.state === "running" && startedAtMs) {
+    return Math.max(0, Number(nowMs) - startedAtMs);
+  }
+  if (Number.isFinite(explicitDuration) && explicitDuration > 0) {
+    return explicitDuration;
+  }
+  if (startedAtMs && endedAtMs) {
+    return Math.max(0, endedAtMs - startedAtMs);
+  }
+  return 0;
+}
+
+function formatScriptRunRuntime(run = {}, nowMs = Date.now()) {
+  if (run.state === "queued") return "queued";
+  return formatScriptTerseDuration(scriptRunRuntimeMs(run, nowMs));
+}
+
 function scriptRunTimestampMs(...values) {
   for (const value of values) {
     if (typeof value === "number" && Number.isFinite(value) && value > 0) return value;
@@ -539,6 +591,7 @@ function scriptRunDisplayLog(result = null) {
   return {
     ...result,
     chunks,
+    cause: text(result.cause || result.sourceKind || result.source_kind, "manual"),
     durationLabel: formatScriptLogDuration(result.durationMs ?? result.duration_ms),
     durationMs: Number(result.durationMs ?? result.duration_ms) || 0,
     endedAt,
@@ -597,6 +650,63 @@ function scriptRunMatchesPath(run = {}, activePathKey = "") {
   const expected = normalizedDocumentPath(activePathKey);
   if (!expected) return true;
   return normalizedDocumentPath(run.pathKey || run.path_key || run.script?.pathKey || run.script?.path_key) === expected;
+}
+
+function buildScriptHistoryVirtualWindow(rows, viewport, rowHeights) {
+  const items = Array.isArray(rows) ? rows : [];
+  if (!items.length) {
+    return { items: [], totalHeight: 0 };
+  }
+
+  const viewportHeight = Math.max(
+    1,
+    Number(viewport?.height || SCRIPT_HISTORY_VIEWPORT_FALLBACK_HEIGHT),
+  );
+  const scrollTop = Math.max(0, Number(viewport?.scrollTop || 0));
+  const overscanPx = SCRIPT_HISTORY_ESTIMATED_ROW_HEIGHT * SCRIPT_HISTORY_VIRTUAL_OVERSCAN_ROWS;
+  const startBoundary = Math.max(0, scrollTop - overscanPx);
+  const endBoundary = scrollTop + viewportHeight + overscanPx;
+  const offsets = [];
+  const heights = [];
+  let totalHeight = 0;
+
+  items.forEach((row, index) => {
+    const rowKey = scriptRunHistoryKey(row);
+    const measuredHeight = Number(rowHeights?.get?.(rowKey) || 0);
+    const height = measuredHeight > 0 ? measuredHeight : SCRIPT_HISTORY_ESTIMATED_ROW_HEIGHT;
+    offsets[index] = totalHeight;
+    heights[index] = height;
+    totalHeight += height + (index === items.length - 1 ? 0 : SCRIPT_HISTORY_ROW_GAP);
+  });
+
+  let startIndex = 0;
+  while (
+    startIndex < items.length - 1
+    && offsets[startIndex] + heights[startIndex] < startBoundary
+  ) {
+    startIndex += 1;
+  }
+
+  let endIndex = startIndex;
+  while (endIndex < items.length && offsets[endIndex] <= endBoundary) {
+    endIndex += 1;
+  }
+
+  if (endIndex <= startIndex) {
+    endIndex = Math.min(items.length, startIndex + 1);
+  }
+
+  return {
+    items: items.slice(startIndex, endIndex).map((row, sliceIndex) => {
+      const index = startIndex + sliceIndex;
+      return {
+        key: scriptRunHistoryKey(row),
+        row,
+        top: offsets[index],
+      };
+    }),
+    totalHeight,
+  };
 }
 
 function documentIsFolderRow(document) {
@@ -1257,6 +1367,15 @@ export default function ToolsWorkspaceView({
   const [scriptCompletionMarkers, setScriptCompletionMarkers] = useState({});
   const scriptRunStateRef = useRef({});
   const scriptCompletionTimersRef = useRef(new Map());
+  const [scriptHistoryNowMs, setScriptHistoryNowMs] = useState(() => Date.now());
+  const scriptHistoryViewportRef = useRef(null);
+  const scriptHistoryScrollFrameRef = useRef(0);
+  const scriptHistoryRowHeightsRef = useRef(new Map());
+  const [scriptHistoryViewport, setScriptHistoryViewport] = useState({
+    height: SCRIPT_HISTORY_VIEWPORT_FALLBACK_HEIGHT,
+    scrollTop: 0,
+  });
+  const [scriptHistoryMeasureVersion, setScriptHistoryMeasureVersion] = useState(0);
 
   const loadLocalScripts = useCallback(async ({ selectKey = "" } = {}) => {
     setScriptsState((current) => (current === "ready" ? "refreshing" : "loading"));
@@ -1524,6 +1643,10 @@ export default function ToolsWorkspaceView({
     return () => {
       scriptCompletionTimersRef.current.forEach((timer) => window.clearTimeout(timer));
       scriptCompletionTimersRef.current.clear();
+      if (scriptHistoryScrollFrameRef.current) {
+        window.cancelAnimationFrame(scriptHistoryScrollFrameRef.current);
+        scriptHistoryScrollFrameRef.current = 0;
+      }
     };
   }, []);
 
@@ -3201,6 +3324,73 @@ export default function ToolsWorkspaceView({
     return Array.from(rowsByRun.values())
       .sort((a, b) => scriptRunHistorySortValue(b) - scriptRunHistorySortValue(a));
   }, [activeScriptLogKey, mergedScriptRunResults, scriptRunHistory]);
+  const scriptHistoryWindow = useMemo(() => (
+    buildScriptHistoryVirtualWindow(
+      activeScriptHistory,
+      scriptHistoryViewport,
+      scriptHistoryRowHeightsRef.current,
+    )
+  ), [activeScriptHistory, scriptHistoryMeasureVersion, scriptHistoryViewport]);
+  const syncScriptHistoryViewport = useCallback((node) => {
+    if (!node) return;
+    const nextViewport = {
+      height: node.clientHeight || SCRIPT_HISTORY_VIEWPORT_FALLBACK_HEIGHT,
+      scrollTop: node.scrollTop || 0,
+    };
+    setScriptHistoryViewport((current) => (
+      current.height === nextViewport.height && current.scrollTop === nextViewport.scrollTop
+        ? current
+        : nextViewport
+    ));
+  }, []);
+  const handleScriptHistoryScroll = useCallback((event) => {
+    const node = event.currentTarget;
+    if (!node) return;
+    if (
+      scriptHistoryScrollFrameRef.current
+      && typeof window !== "undefined"
+      && typeof window.cancelAnimationFrame === "function"
+    ) {
+      window.cancelAnimationFrame(scriptHistoryScrollFrameRef.current);
+    }
+    const update = () => {
+      scriptHistoryScrollFrameRef.current = 0;
+      syncScriptHistoryViewport(node);
+    };
+    if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+      scriptHistoryScrollFrameRef.current = window.requestAnimationFrame(update);
+    } else {
+      update();
+    }
+  }, [syncScriptHistoryViewport]);
+  const measureScriptHistoryRow = useCallback((rowKey, height) => {
+    const roundedHeight = Math.ceil(Number(height || 0));
+    if (!rowKey || roundedHeight <= 0) return;
+    const currentHeight = scriptHistoryRowHeightsRef.current.get(rowKey) || 0;
+    if (Math.abs(currentHeight - roundedHeight) <= 1) return;
+    scriptHistoryRowHeightsRef.current.set(rowKey, roundedHeight);
+    setScriptHistoryMeasureVersion((version) => version + 1);
+  }, []);
+  useEffect(() => {
+    if (section !== "scripts" || scriptPaneTab !== "history") return undefined;
+    setScriptHistoryNowMs(Date.now());
+    const timer = window.setInterval(() => {
+      setScriptHistoryNowMs(Date.now());
+    }, 1000);
+    return () => window.clearInterval(timer);
+  }, [scriptPaneTab, section]);
+  useEffect(() => {
+    const node = scriptHistoryViewportRef.current;
+    if (node) {
+      node.scrollTop = 0;
+      syncScriptHistoryViewport(node);
+    } else {
+      setScriptHistoryViewport({
+        height: SCRIPT_HISTORY_VIEWPORT_FALLBACK_HEIGHT,
+        scrollTop: 0,
+      });
+    }
+  }, [activeScriptLogKey, syncScriptHistoryViewport]);
   useEffect(() => {
     if (section !== "scripts" || scriptPaneTab !== "history") return;
     void loadScriptRunHistory(activeScriptLogKey);
@@ -4748,30 +4938,67 @@ export default function ToolsWorkspaceView({
                         ))}
                       </ScriptPaneTabs>
                       {scriptPaneTab === "history" ? (
-                        <ScriptLogsPanel>
+                        <ScriptLogsPanel data-history="true">
                           {activeScriptHistory.length ? (
-                            <ScriptHistoryList>
-                              {activeScriptHistory.map((run) => {
-                                const isActive = ["queued", "running"].includes(run.state);
-                                return (
-                                  <ScriptHistoryRow key={run.runId || `${run.pathKey}-${run.startedAtMs}-${run.updatedAtMs}`}>
-                                    <ScriptHistoryRowMain>
-                                      <strong>{run.title}</strong>
-                                      <ScriptHistoryRowMeta>
-                                        <span>Cause {text(run.cause, "manual")}</span>
-                                        <span>Start {run.startedAtLabel}</span>
-                                        <span>End {isActive ? "pending" : run.endedAtLabel}</span>
-                                        <span>Duration {run.state === "queued" ? "queued" : run.state === "running" ? "running" : run.durationLabel}</span>
-                                      </ScriptHistoryRowMeta>
-                                    </ScriptHistoryRowMain>
-                                    <ScriptLogsStatus data-state={scriptRunStatusTone(run)}>
-                                      {isActive && <DocsExplorerSpinner aria-hidden="true" />}
-                                      <span>{scriptRunStatusLabel(run)}</span>
-                                    </ScriptLogsStatus>
-                                  </ScriptHistoryRow>
-                                );
-                              })}
-                            </ScriptHistoryList>
+                            <ScriptHistoryVirtualList
+                              aria-label="Script run history"
+                              onScroll={handleScriptHistoryScroll}
+                              ref={scriptHistoryViewportRef}
+                              role="list"
+                            >
+                              <ScriptHistoryList
+                                style={{
+                                  height: `${Math.max(scriptHistoryWindow.totalHeight, 1)}px`,
+                                }}
+                              >
+                                {scriptHistoryWindow.items.map(({ key, row: run, top }) => {
+                                  const isActive = ["queued", "running"].includes(run.state);
+                                  const ranAgo = formatScriptRunAgo(run, scriptHistoryNowMs);
+                                  const runtime = formatScriptRunRuntime(run, scriptHistoryNowMs);
+                                  const cause = text(run.cause, "manual");
+                                  const runtimeCopy = run.state === "queued"
+                                    ? "Queued"
+                                    : run.state === "running"
+                                      ? `Running ${runtime}`
+                                      : `Runtime ${runtime}`;
+                                  const startedTitle = run.startedAtLabel === "pending" ? "" : `Started ${run.startedAtLabel}`;
+                                  const endedTitle = isActive || run.endedAtLabel === "pending" ? "" : `Ended ${run.endedAtLabel}`;
+                                  const rowTitle = [run.title, startedTitle, endedTitle, runtimeCopy].filter(Boolean).join(" · ");
+                                  return (
+                                    <ScriptHistoryRow
+                                      data-active={isActive ? "true" : "false"}
+                                      key={key}
+                                      ref={(node) => measureScriptHistoryRow(key, node?.offsetHeight)}
+                                      role="listitem"
+                                      style={{
+                                        left: 0,
+                                        position: "absolute",
+                                        right: 0,
+                                        top: 0,
+                                        transform: `translateY(${top}px)`,
+                                      }}
+                                      title={rowTitle}
+                                    >
+                                      <ScriptHistoryRowMain>
+                                        <strong>{run.title}</strong>
+                                        <ScriptHistoryRowMeta>
+                                          <span title={startedTitle || undefined}>Ran {ranAgo}</span>
+                                          <span title={endedTitle || undefined}>{runtimeCopy}</span>
+                                          <span title={`Cause ${cause}`}>{cause}</span>
+                                          {run.exitCode !== null && run.exitCode !== undefined && (
+                                            <span title={`Exit ${String(run.exitCode)}`}>Exit {String(run.exitCode)}</span>
+                                          )}
+                                        </ScriptHistoryRowMeta>
+                                      </ScriptHistoryRowMain>
+                                      <ScriptLogsStatus data-state={scriptRunStatusTone(run)}>
+                                        {isActive && <DocsExplorerSpinner aria-hidden="true" />}
+                                        <span>{scriptRunStatusLabel(run)}</span>
+                                      </ScriptLogsStatus>
+                                    </ScriptHistoryRow>
+                                  );
+                                })}
+                              </ScriptHistoryList>
+                            </ScriptHistoryVirtualList>
                           ) : (
                             <ScriptLogsEmpty>
                               <strong>No run history</strong>
@@ -6156,7 +6383,8 @@ const SkillDocumentEditor = styled.div`
 
   display: grid;
   grid-row: 2;
-  grid-template-rows: auto minmax(0, 1fr);
+  grid-template-rows: max-content minmax(0, 1fr);
+  align-items: stretch;
   height: 100%;
   max-height: 100%;
   min-width: 0;
@@ -6184,18 +6412,17 @@ const SkillDocumentEditor = styled.div`
 `;
 
 const SkillDocumentToolbar = styled.div`
-  display: flex;
-  flex-wrap: wrap;
   position: relative;
   z-index: 5;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 360px), 1fr));
+  align-items: start;
   box-sizing: border-box;
   flex: 0 0 auto;
   min-width: 0;
   min-height: 44px;
-  align-items: flex-start;
-  align-content: flex-start;
   gap: 8px;
-  overflow: visible;
+  overflow: hidden;
   padding: 7px 10px;
   border-bottom: 1px solid var(--tools-border, rgba(230, 236, 245, 0.08));
   background: var(--tools-control-bg);
@@ -6221,27 +6448,23 @@ const SkillDocumentToolbarCopy = styled.div`
 
 const SkillDocumentToolbarControls = styled.div`
   display: flex;
-  flex: 1 1 260px;
+  flex: 1 1 auto;
   flex-wrap: wrap;
   align-items: center;
   align-content: flex-start;
   justify-content: flex-start;
   gap: 8px;
+  justify-self: stretch;
   min-width: 0;
+  width: 100%;
   max-width: 100%;
 
   &[data-side="right"] {
     flex: 0 1 auto;
     justify-content: flex-end;
-    margin-left: auto;
-    overflow: visible;
-  }
-
-  @media (max-width: 980px) {
-    &[data-side="right"] {
-      justify-content: flex-start;
-      margin-left: 0;
-    }
+    justify-self: stretch;
+    width: 100%;
+    overflow: hidden;
   }
 `;
 
@@ -6285,8 +6508,8 @@ const SkillDocumentCanvas = styled.div`
   align-content: start;
   justify-items: center;
   box-sizing: border-box;
-  height: 100%;
-  max-height: 100%;
+  height: auto;
+  max-height: none;
   min-width: 0;
   min-height: 0;
   contain: layout paint;
@@ -6515,6 +6738,10 @@ const ScriptLogsPanel = styled.section`
   height: auto;
   overflow: hidden;
   padding: 0 10px 10px;
+
+  &[data-history="true"] {
+    grid-template-rows: minmax(0, 1fr);
+  }
 `;
 
 const ScriptLogsHeader = styled.header`
@@ -6658,32 +6885,64 @@ const ScriptLogsTerminal = styled.pre`
   overflow-wrap: anywhere;
 `;
 
-const ScriptHistoryList = styled.div`
-  display: grid;
-  gap: 10px;
+const ScriptHistoryVirtualList = styled.div`
   min-width: 0;
   min-height: 0;
+  height: 100%;
   overflow: auto;
-  padding: 0 2px 4px;
+  overscroll-behavior: contain;
+  padding: 2px 3px 4px 0;
+  border-radius: 10px;
+  contain: layout paint style;
+`;
+
+const ScriptHistoryList = styled.div`
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
 `;
 
 const ScriptHistoryRow = styled.article`
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1fr) minmax(72px, auto);
   align-items: center;
   gap: 10px;
+  box-sizing: border-box;
   min-width: 0;
-  min-height: 50px;
+  width: 100%;
+  min-height: ${SCRIPT_HISTORY_ESTIMATED_ROW_HEIGHT - 8}px;
+  overflow: hidden;
   padding: 8px 10px;
   border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
   border-radius: 10px;
   background: rgba(8, 11, 16, 0.46);
+  will-change: transform;
+
+  &[data-active="true"] {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.28);
+    background:
+      linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.12), rgba(214, 164, 70, 0.06)),
+      rgba(8, 11, 16, 0.56);
+  }
+
+  ${ScriptLogsStatus} {
+    max-width: 100%;
+    overflow: hidden;
+  }
+
+  ${ScriptLogsStatus} span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 `;
 
 const ScriptHistoryRowMain = styled.div`
   display: grid;
   gap: 5px;
   min-width: 0;
+  overflow: hidden;
 
   strong {
     min-width: 0;
@@ -6701,12 +6960,25 @@ const ScriptHistoryRowMeta = styled.div`
   flex-wrap: wrap;
   gap: 6px;
   min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
 
   span {
+    display: inline-flex;
+    min-width: 0;
+    max-width: 100%;
+    min-height: 20px;
+    align-items: center;
+    padding: 2px 7px;
+    border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
+    border-radius: 999px;
+    overflow: hidden;
     color: var(--forge-text-muted, #8d96a6);
+    background: rgba(8, 11, 16, 0.42);
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
     font-size: 9px;
     font-weight: 760;
+    text-overflow: ellipsis;
     white-space: nowrap;
   }
 `;

@@ -4053,7 +4053,9 @@ export const AppGlobalScriptButton = styled.button`
   }
 
   &[data-running="true"] {
+    gap: 5px;
     opacity: 0.7;
+    padding-left: 8px;
   }
 
   &[data-running="true"]:hover ${AppGlobalScriptRunStatus} [data-spinner-icon="true"],
@@ -4519,6 +4521,7 @@ export const LoopspaceGraphNode = styled.div`
   &[data-kind="document_read"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="document_write"] { --loop-node-accent: 251, 191, 36; }
   &[data-region="true"] {
+    box-sizing: border-box;
     width: var(--loopspace-node-width, 620px);
     height: var(--loopspace-node-height, 360px);
     max-width: none;
@@ -4536,8 +4539,12 @@ export const LoopspaceGraphNode = styled.div`
   }
   &[data-kind="run_script"] {
     --loop-node-accent: 251, 191, 36;
-    min-height: 132px;
-    padding-right: 42px;
+    --loopspace-output-gutter: 112px;
+    box-sizing: border-box;
+    width: var(--loopspace-node-width, 360px);
+    max-width: none;
+    min-height: var(--loopspace-node-height, 132px);
+    padding-right: var(--loopspace-output-gutter);
   }
   &[data-kind="document_read"],
   &[data-kind="document_write"] {
@@ -4588,7 +4595,11 @@ export const LoopspaceGraphNodeOutputPorts = styled.div`
   transform: translateY(-50%);
 
   ${LoopspaceGraphNode}[data-region="true"] & {
-    right: -14px;
+    right: 12px;
+  }
+
+  ${LoopspaceGraphNode}[data-kind="run_script"] & {
+    right: 12px;
   }
 `;
 

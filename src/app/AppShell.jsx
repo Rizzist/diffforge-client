@@ -4634,6 +4634,9 @@ const LOOPSPACE_GRAPH_MAX_ZOOM = 2.4;
 const LOOPSPACE_GRAPH_ZOOM_STEP = 1.18;
 const LOOPSPACE_GRAPH_NODE_WIDTH = 220;
 const LOOPSPACE_GRAPH_NODE_HEIGHT = 66;
+const LOOPSPACE_RUN_SCRIPT_NODE_WIDTH = 360;
+const LOOPSPACE_RUN_SCRIPT_NODE_HEIGHT = 132;
+const LOOPSPACE_MULTI_OUTPUT_PORT_CENTER_INSET = 21;
 const LOOPSPACE_RUNTIME_PANEL_DEFAULT_HEIGHT = 174;
 const LOOPSPACE_RUNTIME_PANEL_MIN_HEIGHT = 88;
 const LOOPSPACE_RUNTIME_PANEL_MIN_GRAPH_HEIGHT = 160;
@@ -5206,18 +5209,43 @@ function loopspaceGraphNodeLayout(node, index = 0) {
     : isDocumentContext
       ? Math.max(128, 112 + (documentRefCount * 38))
     : node?.nodeKind === "run_script"
-      ? 132
+      ? Math.max(
+          LOOPSPACE_RUN_SCRIPT_NODE_HEIGHT,
+          loopspaceGraphFiniteNumber(
+            loopspaceGraphPropValue(node.props, ["h", "height"]),
+            LOOPSPACE_RUN_SCRIPT_NODE_HEIGHT,
+          ),
+        )
       : LOOPSPACE_GRAPH_NODE_HEIGHT;
   const nodeWidth = isSendMessage
     ? Math.max(560, loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["w", "width"]), 680))
     : isDocumentContext
       ? 270
+    : node?.nodeKind === "run_script"
+      ? Math.max(
+          LOOPSPACE_RUN_SCRIPT_NODE_WIDTH,
+          loopspaceGraphFiniteNumber(
+            loopspaceGraphPropValue(node.props, ["w", "width"]),
+            LOOPSPACE_RUN_SCRIPT_NODE_WIDTH,
+          ),
+        )
     : LOOPSPACE_GRAPH_NODE_WIDTH;
   return {
     height: nodeHeight,
     width: nodeWidth,
     x: node?.hasPosition ? node.x : ((index % 4) * 240) - 120,
     y: node?.hasPosition ? node.y : Math.floor(index / 4) * 96,
+  };
+}
+
+function loopspaceGraphNodePositionedForDrop(node, pointerPosition) {
+  if (!node || !pointerPosition || node.nodeKind !== "send_message") return node;
+  const layout = loopspaceGraphNodeLayout(node, 0);
+  return {
+    ...node,
+    hasPosition: true,
+    x: loopspaceGraphSnapCoordinate((Number(pointerPosition.x) || 0) - (layout.width / 2)),
+    y: loopspaceGraphSnapCoordinate((Number(pointerPosition.y) || 0) - (layout.height / 2)),
   };
 }
 
@@ -5238,8 +5266,11 @@ function loopspaceGraphOutputPoint(layout, node = null, portId = "out") {
   const yOffset = portCount === 1
     ? layout.height / 2
     : ((layout.height - stackHeight) / 2) + 9 + (safeIndex * portSpacing);
+  const outputX = node?.nodeKind === "run_script" || node?.nodeKind === "send_message"
+    ? layout.x + layout.width - LOOPSPACE_MULTI_OUTPUT_PORT_CENTER_INSET
+    : layout.x + layout.width;
   return {
-    x: layout.x + layout.width,
+    x: outputX,
     y: layout.y + yOffset,
   };
 }
@@ -5427,7 +5458,7 @@ function LoopspaceSendMessageDeviceSelect({
   const triggerRef = useRef(null);
 
   const hasOptions = options.length > 0;
-  const disabled = busy || !hasOptions;
+  const disabled = busy;
   const selectedOption = useMemo(
     () => options.find((option) => loopspaceGraphDeviceOptionMatches(option, selectedKey)) || null,
     [options, selectedKey],
@@ -5485,7 +5516,7 @@ function LoopspaceSendMessageDeviceSelect({
     if (typeof onSelect === "function") onSelect(key);
   }, [onSelect]);
 
-  const selectedLabel = selectedOption?.label || (hasOptions ? "Select device..." : "No devices");
+  const selectedLabel = selectedOption?.label || "No target device";
   const selectedStatus = selectedOption?.status || "";
 
   return (
@@ -5503,7 +5534,7 @@ function LoopspaceSendMessageDeviceSelect({
         }}
         onPointerDown={stopEvent}
         ref={triggerRef}
-        title={hasOptions ? "Select target device" : "No devices available"}
+        title="Select target device"
         type="button"
       >
         <LoopspaceGraphNodeSelectValue>
@@ -5539,47 +5570,43 @@ function LoopspaceSendMessageDeviceSelect({
                 ...(placement.bottom !== undefined ? { bottom: `${placement.bottom}px` } : {}),
               }}
             >
-              {hasOptions ? (
-                <>
+              <LoopspaceGraphNodeSelectOption
+                data-selected={selectedKey ? undefined : "true"}
+                onClick={() => handleSelect("")}
+                role="option"
+                type="button"
+              >
+                <LoopspaceGraphNodeSelectOptionMain>
+                  <strong>No target device</strong>
+                  <LoopspaceGraphNodeSelectOptionDevice>
+                    <span>Unselected</span>
+                  </LoopspaceGraphNodeSelectOptionDevice>
+                </LoopspaceGraphNodeSelectOptionMain>
+                {selectedKey ? null : <ButtonCheckIcon aria-hidden="true" />}
+              </LoopspaceGraphNodeSelectOption>
+              {hasOptions ? options.map((option) => {
+                const isSelected = loopspaceGraphDeviceOptionMatches(option, selectedKey);
+                return (
                   <LoopspaceGraphNodeSelectOption
-                    data-selected={selectedKey ? undefined : "true"}
-                    onClick={() => handleSelect("")}
+                    data-selected={isSelected ? "true" : undefined}
+                    key={option.id}
+                    onClick={() => handleSelect(option.id)}
                     role="option"
                     type="button"
                   >
                     <LoopspaceGraphNodeSelectOptionMain>
-                      <strong>Select device...</strong>
+                      <strong>{option.label}</strong>
                       <LoopspaceGraphNodeSelectOptionDevice>
-                        <span>Clear selection</span>
+                        <Devices aria-hidden="true" />
+                        <span>{option.status || "device"}</span>
                       </LoopspaceGraphNodeSelectOptionDevice>
                     </LoopspaceGraphNodeSelectOptionMain>
-                    {selectedKey ? null : <ButtonCheckIcon aria-hidden="true" />}
+                    {isSelected ? <ButtonCheckIcon aria-hidden="true" /> : null}
                   </LoopspaceGraphNodeSelectOption>
-                  {options.map((option) => {
-                    const isSelected = loopspaceGraphDeviceOptionMatches(option, selectedKey);
-                    return (
-                      <LoopspaceGraphNodeSelectOption
-                        data-selected={isSelected ? "true" : undefined}
-                        key={option.id}
-                        onClick={() => handleSelect(option.id)}
-                        role="option"
-                        type="button"
-                      >
-                        <LoopspaceGraphNodeSelectOptionMain>
-                          <strong>{option.label}</strong>
-                          <LoopspaceGraphNodeSelectOptionDevice>
-                            <Devices aria-hidden="true" />
-                            <span>{option.status || "device"}</span>
-                          </LoopspaceGraphNodeSelectOptionDevice>
-                        </LoopspaceGraphNodeSelectOptionMain>
-                        {isSelected ? <ButtonCheckIcon aria-hidden="true" /> : null}
-                      </LoopspaceGraphNodeSelectOption>
-                    );
-                  })}
-                </>
-              ) : (
+                );
+              }) : (
                 <LoopspaceGraphNodeSelectEmpty>
-                  No devices available.
+                  No registered devices available.
                 </LoopspaceGraphNodeSelectEmpty>
               )}
             </LoopspaceGraphNodeSelectMenu>,
@@ -5698,6 +5725,7 @@ function LoopspaceDocumentContextPicker({
 
 function LoopspaceRuntimeView({
   actionState,
+  agentLaunchDefaults = null,
   error,
   knownDevices = [],
   localDesktopProfile = null,
@@ -5755,10 +5783,15 @@ function LoopspaceRuntimeView({
   const nodeSizesRef = useRef({});
   const nodeResizeObserverRef = useRef(null);
   const nodeElementsRef = useRef(new Map());
+  const loopspaceAgentLaunchDefaultsRef = useRef(agentLaunchDefaults);
 
   useEffect(() => subscribeWorkspaceTools(() => {
     setWorkspaceToolsVersion(getWorkspaceToolsVersion());
   }), []);
+
+  useEffect(() => {
+    loopspaceAgentLaunchDefaultsRef.current = agentLaunchDefaults;
+  }, [agentLaunchDefaults]);
 
   const finishRuntimePanelResize = useCallback((event) => {
     const gesture = runtimePanelResizeGestureRef.current;
@@ -6210,6 +6243,7 @@ function LoopspaceRuntimeView({
     const seen = new Set();
     return loopspaceGraphLiveDeviceRows
       .filter(Boolean)
+      .filter((device) => device?.registered || cloudDeviceRowLooksRegistered(device))
       .map((device) => {
         const id = safeCloudMcpText(device?.deviceId || device?.device_id || device?.id, "").toLowerCase();
         if (!id || seen.has(id)) return null;
@@ -6244,12 +6278,6 @@ function LoopspaceRuntimeView({
     });
     return map;
   }, [loopspaceGraphLiveDeviceRows]);
-
-  const loopspaceGraphDefaultDeviceOption = useMemo(() => (
-    loopspaceGraphDeviceOptions.find((device) => ["online", "connected", "active", "ready"].includes(String(device?.status || "").toLowerCase()))
-      || loopspaceGraphDeviceOptions[0]
-      || null
-  ), [loopspaceGraphDeviceOptions]);
 
   const loopspaceGraphPaletteTemplates = useMemo(() => {
     const deviceTemplates = loopspaceGraphDeviceTemplatesFromRows(loopspaceGraphLiveDeviceRows);
@@ -6411,22 +6439,26 @@ function LoopspaceRuntimeView({
     if (!loopspaceId || busy || !template?.id) return;
     const baseSource = graphSourceRef.current || graphSource;
     const sendMessageDefaults = template.id === "send_message"
-      ? normalizeLoopspaceSendMessageDraft(template, agentLaunchDefaultsRef.current)
+      ? normalizeLoopspaceSendMessageDraft(template, loopspaceAgentLaunchDefaultsRef.current)
+      : null;
+    const sendMessageTemplateDevice = template.id === "send_message" && template.device_id
+      ? loopspaceGraphDeviceOptions.find((option) => loopspaceGraphDeviceOptionMatches(option, template.device_id))
       : null;
     const templateWithDefaults = template.id === "send_message"
       ? {
           ...template,
-          ...(loopspaceGraphDefaultDeviceOption ? {
-            device_id: template.device_id || loopspaceGraphDefaultDeviceOption.id,
-            device_label: template.device_label || loopspaceGraphDefaultDeviceOption.label,
-          } : {}),
+          device_id: sendMessageTemplateDevice?.id || "",
+          device_label: sendMessageTemplateDevice?.label || "",
           model: template.model || sendMessageDefaults?.model || "",
           reasoning_effort: template.reasoning_effort || template.effort || sendMessageDefaults?.reasoning_effort || "",
           speed: template.speed || sendMessageDefaults?.speed || "",
           target_agent_id: sendMessageDefaults?.target_agent_id || "codex",
         }
       : template;
-    const node = createDfBlueprintNodeFromTemplate(templateWithDefaults, position);
+    const node = loopspaceGraphNodePositionedForDrop(
+      createDfBlueprintNodeFromTemplate(templateWithDefaults, position),
+      position,
+    );
     if (node.nodeKind === "document_read" || node.nodeKind === "document_write") {
       const parent = findSendMessageParentForPosition(position);
       if (parent?.node?.id) {
@@ -6449,7 +6481,7 @@ function LoopspaceRuntimeView({
     await commitLoopspaceGraphSource(nextSource, "Unable to add graph node.", {
       pendingNodeIds: [node.id],
     });
-  }, [busy, commitLoopspaceGraphSource, findSendMessageParentForPosition, graphSource, loopspaceGraphDefaultDeviceOption, loopspaceId]);
+  }, [busy, commitLoopspaceGraphSource, findSendMessageParentForPosition, graphSource, loopspaceGraphDeviceOptions, loopspaceId]);
 
   const detachTriggerFromLoop = useCallback(async (trigger) => {
     if (!loopspaceId || !trigger?.id || busy) return;
@@ -6533,7 +6565,7 @@ function LoopspaceRuntimeView({
   const saveSendMessageSettings = useCallback(async (node, draft) => {
     const nodeId = String(node?.id || "").trim();
     if (!nodeId || busy) return;
-    const normalized = normalizeLoopspaceSendMessageDraft(draft, agentLaunchDefaultsRef.current);
+    const normalized = normalizeLoopspaceSendMessageDraft(draft, loopspaceAgentLaunchDefaultsRef.current);
     await updateSendMessageNodeProps(node, {
       props: {
         model: normalized.model,
@@ -6935,6 +6967,31 @@ function LoopspaceRuntimeView({
   ), []);
 
   const readDroppedGraphNodeTemplate = useCallback((event) => {
+    const templateFromLoosePayload = (payload) => {
+      if (!payload || typeof payload !== "object") return null;
+      if (
+        payload.kind === LOOPSPACE_TRIGGER_DRAG_KIND
+          || payload.kind === LOOPSPACE_GRAPH_NODE_TEMPLATE_DRAG_KIND
+      ) {
+        return null;
+      }
+      const templateKey = String(
+        payload.template_key
+          || payload.templateKey
+          || payload.node_kind
+          || payload.nodeKind
+          || payload.id
+          || payload.kind
+          || "",
+      ).trim();
+      if (!templateKey) return null;
+      return graphPaletteTemplateByKey.get(templateKey)
+        || graphPaletteTemplateByKey.get(templateKey.split(":")[0])
+        || {
+          ...payload,
+          id: templateKey,
+        };
+    };
     const activeDrag = activeGraphDragRef.current;
     if (activeDrag?.kind === "template" && activeDrag.template?.id) {
       return activeDrag.template;
@@ -6949,6 +7006,8 @@ function LoopspaceRuntimeView({
           || null;
       }
     }
+    const loosePlainTemplate = templateFromLoosePayload(plainPayload);
+    if (loosePlainTemplate) return loosePlainTemplate;
     const customPayload = loopspaceParseJsonDragPayload(
       event.dataTransfer?.getData?.(LOOPSPACE_GRAPH_NODE_DRAG_MIME),
     );
@@ -6961,6 +7020,8 @@ function LoopspaceRuntimeView({
           || null;
       }
     }
+    const looseCustomTemplate = templateFromLoosePayload(customPayload);
+    if (looseCustomTemplate) return looseCustomTemplate;
     if (customPayload?.id) {
       return customPayload;
     }
@@ -7102,7 +7163,9 @@ function LoopspaceRuntimeView({
       const template = drag.template?.id
         ? drag.template
         : graphPaletteTemplateByKey.get(String(drag.template_key || "").trim());
-      return template ? createDfBlueprintNodeFromTemplate(template, position) : null;
+      return template
+        ? loopspaceGraphNodePositionedForDrop(createDfBlueprintNodeFromTemplate(template, position), position)
+        : null;
     }
     if (drag.kind === "trigger") {
       const triggerId = String(drag.trigger?.trigger_id || drag.trigger?.id || "").trim();
@@ -7161,10 +7224,13 @@ function LoopspaceRuntimeView({
   const startPointerGraphDrag = useCallback((drag, eventLike = null) => {
     const pointerId = Number(eventLike?.pointerId ?? drag?.pointer_id);
     if (!drag || !Number.isFinite(pointerId)) return;
+    const sourceElement = eventLike?.currentTarget || null;
+    sourceElement?.setPointerCapture?.(pointerId);
     activeGraphDragRef.current = {
       ...drag,
       mode: "pointer",
       pointerId,
+      sourceElement,
     };
     setDropActive(false);
     setGraphDragGhost(null);
@@ -7172,7 +7238,6 @@ function LoopspaceRuntimeView({
 
   const startGraphTemplatePointerDrag = useCallback((event, template, templateKey) => {
     if (event.button !== 0 || !template?.id) return;
-    event.preventDefault();
     event.stopPropagation();
     startPointerGraphDrag({
       kind: "template",
@@ -7180,6 +7245,19 @@ function LoopspaceRuntimeView({
       template_key: templateKey,
     }, event);
   }, [startPointerGraphDrag]);
+
+  const startGraphTemplateNativeDrag = useCallback((event, template, templateKey) => {
+    if (!template?.id) return;
+    event.stopPropagation();
+    loopspaceSetDragPayload(event, LOOPSPACE_GRAPH_NODE_DRAG_MIME, {
+      kind: LOOPSPACE_GRAPH_NODE_TEMPLATE_DRAG_KIND,
+      template,
+      template_key: templateKey,
+    }, templateKey);
+    if (event.dataTransfer) {
+      event.dataTransfer.effectAllowed = "copy";
+    }
+  }, []);
 
   useEffect(() => {
     const handleExternalPointerDragStart = (event) => {
@@ -7215,6 +7293,7 @@ function LoopspaceRuntimeView({
       activeGraphDragRef.current = null;
       setDropActive(false);
       setGraphDragGhost(null);
+      drag.sourceElement?.releasePointerCapture?.(event.pointerId);
       if (overGraph && position) {
         finishPointerGraphDrop(drag, position);
       }
@@ -7225,6 +7304,7 @@ function LoopspaceRuntimeView({
       activeGraphDragRef.current = null;
       setDropActive(false);
       setGraphDragGhost(null);
+      drag.sourceElement?.releasePointerCapture?.(drag.pointerId);
     };
     window.addEventListener(LOOPSPACE_GRAPH_POINTER_DRAG_EVENT, handleExternalPointerDragStart);
     window.addEventListener("pointermove", handlePointerMove, { passive: false });
@@ -7247,7 +7327,10 @@ function LoopspaceRuntimeView({
   const graphPreviewNodeFromDropEvent = useCallback((event, position) => {
     const graphNodeTemplate = readDroppedGraphNodeTemplate(event);
     if (graphNodeTemplate) {
-      return createDfBlueprintNodeFromTemplate(graphNodeTemplate, position);
+      return loopspaceGraphNodePositionedForDrop(
+        createDfBlueprintNodeFromTemplate(graphNodeTemplate, position),
+        position,
+      );
     }
     const trigger = readDroppedTrigger(event);
     if (trigger) {
@@ -7605,6 +7688,7 @@ function LoopspaceRuntimeView({
                   ? String(loopspaceGraphPropValue(node.props, ["prompt", "message", "body", "instructions"]) || "")
                   : "";
                 const isSendMessageRegion = node.nodeKind === "send_message";
+                const isSizedGraphNode = isSendMessageRegion || node.nodeKind === "run_script";
                 const sendMessageSettingsOpen = isSendMessageRegion && sendMessageSettingsNodeId === node.id;
                 const sendMessageNodeDraft = isSendMessageRegion
                   ? loopspaceSendMessageDraftFromNode(node, agentLaunchDefaults)
@@ -7657,7 +7741,7 @@ function LoopspaceRuntimeView({
                     onPointerUp={finishGraphNodeDrag}
                     ref={registerGraphNodeElement(node.id)}
                     style={{
-                      ...(isSendMessageRegion ? {
+                      ...(isSizedGraphNode ? {
                         "--loopspace-node-height": `${nodeLayout.height}px`,
                         "--loopspace-node-width": `${nodeLayout.width}px`,
                       } : {}),
@@ -8051,6 +8135,8 @@ function LoopspaceRuntimeView({
                 const node = graphDragGhost.node;
                 const nodeLayout = loopspaceGraphNodeLayout(node, 0);
                 const type = node.nodeKind || node.role || "node";
+                const isGhostRegion = node.nodeKind === "send_message";
+                const isGhostSizedNode = isGhostRegion || node.nodeKind === "run_script";
                 const Icon = node.nodeKind === "device"
                   ? Devices
                   : node.nodeKind === "run_script"
@@ -8065,8 +8151,13 @@ function LoopspaceRuntimeView({
                     aria-hidden="true"
                     data-ghost="true"
                     data-kind={node.nodeKind || type || "loop"}
+                    data-region={isGhostRegion ? "true" : undefined}
                     key="loopspace-graph-drag-ghost"
                     style={{
+                      ...(isGhostSizedNode ? {
+                        "--loopspace-node-height": `${nodeLayout.height}px`,
+                        "--loopspace-node-width": `${nodeLayout.width}px`,
+                      } : {}),
                       "--loopspace-node-x": `${nodeLayout.x}px`,
                       "--loopspace-node-y": `${nodeLayout.y}px`,
                     }}
@@ -8076,7 +8167,7 @@ function LoopspaceRuntimeView({
                     </LoopspaceGraphNodeIcon>
                     <LoopspaceGraphNodeText>
                       <strong>{node.label || "Drop node"}</strong>
-                      <span>{node.nodeKind === "device" ? "Device" : node.nodeKind === "run_script" ? "Run script" : node.nodeKind === "document_read" || node.nodeKind === "document_write" ? "Document context" : "Pending drop"}</span>
+                      <span>{node.nodeKind === "device" ? "Device" : node.nodeKind === "run_script" ? "Run script" : node.nodeKind === "send_message" ? "Send message region" : node.nodeKind === "document_read" || node.nodeKind === "document_write" ? "Document context" : "Pending drop"}</span>
                     </LoopspaceGraphNodeText>
                   </LoopspaceGraphNode>
                 );
@@ -8277,7 +8368,13 @@ function LoopspaceRuntimeView({
                       return (
                         <LoopspaceRuntimePanelNodeCard
                           data-kind={template.id}
+                          draggable
                           key={templateKey}
+                          onDragEnd={() => {
+                            setDropActive(false);
+                            setGraphDragGhost(null);
+                          }}
+                          onDragStart={(event) => startGraphTemplateNativeDrag(event, template, templateKey)}
                           onPointerDown={(event) => startGraphTemplatePointerDrag(event, template, templateKey)}
                           title={`Drag ${template.label} into the graph`}
                         >
@@ -36608,6 +36705,7 @@ export default function App() {
                       {selectedLoopspace ? (
                         <LoopspaceRuntimeView
                           actionState={loopspaceActionState}
+                          agentLaunchDefaults={agentLaunchDefaults}
                           error={loopspaceError}
                           knownDevices={cloudWorkspaceProgress.knownDevices}
                           localDesktopProfile={cloudDesktopDeviceProfile}

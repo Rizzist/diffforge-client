@@ -351,10 +351,12 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       props: {
         device_id: deviceId,
         device_label: deviceLabel,
+        h: "132",
         path_key: pathKey,
         script_id: scriptId || pathKey,
         script_name: scriptName,
         shell: safeText(template?.shell),
+        w: "360",
       },
     };
   }

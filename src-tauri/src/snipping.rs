@@ -1,8 +1,8 @@
+use image::ImageFormat as SnippingImageFormat;
 #[cfg(target_os = "macos")]
-use objc2_app_kit::{NSCursor, NSWindow};
+use objc2_app_kit::{NSCursor, NSWindow, NSWindowSharingType};
 #[cfg(target_os = "macos")]
 use objc2_core_foundation::{CGPoint, CGRect};
-use image::ImageFormat as SnippingImageFormat;
 
 const SNIPPING_SHORTCUTS_CHANGED_EVENT: &str = "forge-snipping-shortcuts-changed";
 const SNIPPING_CAPTURE_SAVED_EVENT: &str = "forge-snipping-capture-saved";
@@ -12,8 +12,7 @@ const SNIPPING_SOURCE_UPDATED_EVENT: &str = "forge-snip-source-updated";
 const SNIPPING_CLOUD_UPLOAD_EVENT: &str = "forge-snip-cloud-upload";
 const SNIPPING_AREA_OVERLAY_STARTED_EVENT: &str = "forge-snipping-area-overlay-started";
 const SNIPPING_AREA_OVERLAY_SNAPSHOT_EVENT: &str = "forge-snipping-area-overlay-snapshot";
-const SNIPPING_DISPATCH_TARGETS_CHANGED_EVENT: &str =
-    "diffforge:snipping-dispatch-targets-changed";
+const SNIPPING_DISPATCH_TARGETS_CHANGED_EVENT: &str = "diffforge:snipping-dispatch-targets-changed";
 const SNIPPING_AREA_OVERLAY_WINDOW_PREFIX: &str = "snipping-overlay";
 const SNIPPING_RECORDING_CONTROLS_WINDOW_LABEL: &str = "snipping-recording-controls";
 const SNIPPING_RECORDING_CONTROLS_TITLE: &str = "Diff Forge Recording Controls";
@@ -33,7 +32,7 @@ static SNIPPING_AREA_BEGIN_STARTED_AT_MS: AtomicU64 = AtomicU64::new(0);
 static SNIPPING_AREA_BEGIN_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SNIPPING_AREA_CURSOR_DEBUG_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static SNIPPING_AREA_CURSOR_DEBUG_LAST_MOUSE_LOG_MS: AtomicU64 = AtomicU64::new(0);
-const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 16;
+const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 80;
 const SNIPPING_SCAP_CAPTURE_FPS: u32 = 60;
 const SNIPPING_SCAP_WARM_CAPTURE_FPS: u32 = 30;
 const SNIPPING_SCAP_CAPTURE_TIMEOUT_MS: u64 = 4_500;
@@ -42,7 +41,8 @@ const SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS: u64 = 5_500;
 const SNIPPING_AREA_BEGIN_STALE_MS: u64 = SNIPPING_AREA_BEGIN_CAPTURE_TIMEOUT_MS + 3_000;
 const SNIPPING_STARTUP_PREWARM_ENABLED: bool = false;
 const SNIPPING_WARM_CAPTURE_ENABLED: bool = false;
-const SNIPPING_RECORDING_FPS: u32 = 30;
+const SNIPPING_RECORDING_TARGET_FPS: u32 = 60;
+const SNIPPING_RECORDING_FALLBACK_FPS: u32 = 30;
 const SNIPPING_WARM_CAPTURE_FRAME_MAX_AGE_MS: u64 = 750;
 const SNIPPING_WARM_CAPTURE_RESTART_MIN_MS: u64 = 2_000;
 const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
@@ -149,8 +149,10 @@ struct SnippingMacosProcessSerialNumber {
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     fn GetCurrentProcess(psn: *mut SnippingMacosProcessSerialNumber) -> i32;
-    fn TransformProcessType(psn: *const SnippingMacosProcessSerialNumber, transform_state: u32)
-        -> i32;
+    fn TransformProcessType(
+        psn: *const SnippingMacosProcessSerialNumber,
+        transform_state: u32,
+    ) -> i32;
 }
 
 /// kCGEventSourceStateCombinedSessionState / kCGMouseButtonLeft: true while
@@ -771,13 +773,8 @@ impl SnippingShortcutAction {
                 Ok(Self::FullScreenshot)
             }
             "area" | "area-snip" | "area_snip" | "snip" | "selection" => Ok(Self::AreaSnip),
-            "record"
-            | "recording"
-            | "area-recording"
-            | "area_recording"
-            | "screen-recording"
-            | "screen_recording"
-            | "video" => Ok(Self::AreaRecording),
+            "record" | "recording" | "area-recording" | "area_recording" | "screen-recording"
+            | "screen_recording" | "video" => Ok(Self::AreaRecording),
             _ => Err("Unknown snipping shortcut action.".to_string()),
         }
     }
@@ -1121,11 +1118,8 @@ fn sanitized_snipping_settings(settings: SnippingSettings) -> SnippingSettings {
         area_snip = defaults.area_snip.clone();
     }
 
-    if validate_snipping_shortcut_for_action(
-        SnippingShortcutAction::AreaRecording,
-        &area_recording,
-    )
-    .is_err()
+    if validate_snipping_shortcut_for_action(SnippingShortcutAction::AreaRecording, &area_recording)
+        .is_err()
     {
         area_recording = defaults.area_recording.clone();
     }
@@ -1310,7 +1304,7 @@ fn snipping_windows_desktop_icons_view() -> *mut std::ffi::c_void {
 #[cfg(windows)]
 fn snipping_windows_show_desktop_icons_view(visible: bool) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        IsWindowVisible, ShowWindow, SW_HIDE, SW_SHOW,
+        IsWindowVisible, SW_HIDE, SW_SHOW, ShowWindow,
     };
 
     let defview = snipping_windows_desktop_icons_view();
@@ -1661,12 +1655,7 @@ fn focus_main_window_for_snipping_permission(app: &AppHandle) {
     }
 }
 
-fn emit_snipping_permission_attention(
-    app: &AppHandle,
-    reason: &str,
-    shortcut: &str,
-    error: &str,
-) {
+fn emit_snipping_permission_attention(app: &AppHandle, reason: &str, shortcut: &str, error: &str) {
     if !snipping_reason_is_hotkey(reason) || !snipping_error_is_screen_capture_permission(error) {
         return;
     }
@@ -1735,8 +1724,11 @@ fn register_snipping_shortcut_handler(
             match action {
                 SnippingShortcutAction::FullScreenshot => {
                     thread::spawn(move || {
-                        let result =
-                            snipping_capture_full_for(&app_handle, "shortcut", shortcut_text.clone());
+                        let result = snipping_capture_full_for(
+                            &app_handle,
+                            "shortcut",
+                            shortcut_text.clone(),
+                        );
                         if let Err(error) = result {
                             emit_snipping_hotkey_failure_attention(
                                 &app_handle,
@@ -1751,8 +1743,11 @@ fn register_snipping_shortcut_handler(
                     // Capture + overlay prep must never block the shortcut
                     // dispatch thread, or the overlay appears with a visible lag.
                     thread::spawn(move || {
-                        let result =
-                            snipping_begin_area_snip_for(&app_handle, "shortcut", shortcut_text.clone());
+                        let result = snipping_begin_area_snip_for(
+                            &app_handle,
+                            "shortcut",
+                            shortcut_text.clone(),
+                        );
                         if let Err(error) = result {
                             emit_snipping_hotkey_failure_attention(
                                 &app_handle,
@@ -1909,7 +1904,8 @@ extern "C" fn snipping_macos_event_tap_callback(
     };
 
     let is_autorepeat =
-        unsafe { CGEventGetIntegerValueField(event, SNIPPING_MACOS_KEYBOARD_EVENT_AUTOREPEAT) } != 0;
+        unsafe { CGEventGetIntegerValueField(event, SNIPPING_MACOS_KEYBOARD_EVENT_AUTOREPEAT) }
+            != 0;
     if is_autorepeat {
         log_terminal_status_event(
             "backend.snipping.macos_default_shortcut.autorepeat_ignored",
@@ -1923,16 +1919,12 @@ extern "C" fn snipping_macos_event_tap_callback(
     thread::spawn(move || {
         let shortcut_text = action.default_shortcut();
         let result = match action {
-            SnippingShortcutAction::FullScreenshot => snipping_capture_full_for(
-                &app,
-                "macos-default-override",
-                shortcut_text.clone(),
-            ),
-            SnippingShortcutAction::AreaSnip => snipping_begin_area_snip_for(
-                &app,
-                "macos-default-override",
-                shortcut_text.clone(),
-            ),
+            SnippingShortcutAction::FullScreenshot => {
+                snipping_capture_full_for(&app, "macos-default-override", shortcut_text.clone())
+            }
+            SnippingShortcutAction::AreaSnip => {
+                snipping_begin_area_snip_for(&app, "macos-default-override", shortcut_text.clone())
+            }
             SnippingShortcutAction::AreaRecording => snipping_toggle_area_recording_shortcut_for(
                 &app,
                 "macos-default-override",
@@ -2431,13 +2423,21 @@ fn snipping_mark_area_overlay_ready(app: &AppHandle, label: &str) {
     if !snipping_is_overlay_label(label) {
         return;
     }
-    if let Ok(mut labels) = app.state::<SnippingState>().area_overlay_ready_labels.lock() {
+    if let Ok(mut labels) = app
+        .state::<SnippingState>()
+        .area_overlay_ready_labels
+        .lock()
+    {
         labels.insert(label.to_string());
     }
 }
 
 fn snipping_forget_area_overlay_ready(app: &AppHandle, label: &str) {
-    if let Ok(mut labels) = app.state::<SnippingState>().area_overlay_ready_labels.lock() {
+    if let Ok(mut labels) = app
+        .state::<SnippingState>()
+        .area_overlay_ready_labels
+        .lock()
+    {
         labels.remove(label);
     }
 }
@@ -2542,25 +2542,39 @@ fn snipping_area_selection_rect_for_frame(
 ) -> (u32, u32, u32, u32) {
     let frame_width = frame_width.max(1);
     let frame_height = frame_height.max(1);
-    let (scale_x, scale_y) =
-        if let Some((viewport_width, viewport_height)) = snipping_area_selection_viewport(request) {
-            (
-                f64::from(frame_width) / viewport_width,
-                f64::from(frame_height) / viewport_height,
-            )
-        } else {
-            let fallback_scale = request.scale_factor.unwrap_or(1.0).max(0.1);
-            (fallback_scale, fallback_scale)
-        };
+    let (scale_x, scale_y) = if let Some((viewport_width, viewport_height)) =
+        snipping_area_selection_viewport(request)
+    {
+        (
+            f64::from(frame_width) / viewport_width,
+            f64::from(frame_height) / viewport_height,
+        )
+    } else {
+        let fallback_scale = request.scale_factor.unwrap_or(1.0).max(0.1);
+        (fallback_scale, fallback_scale)
+    };
 
-    let x = (request.x.max(0.0) * scale_x).round() as u32;
-    let y = (request.y.max(0.0) * scale_y).round() as u32;
-    let width = (request.width.max(0.0) * scale_x).round() as u32;
-    let height = (request.height.max(0.0) * scale_y).round() as u32;
+    let request_left = request.x.max(0.0);
+    let request_top = request.y.max(0.0);
+    let request_right = (request.x + request.width.max(0.0)).max(request_left);
+    let request_bottom = (request.y + request.height.max(0.0)).max(request_top);
+
+    let x = (request_left * scale_x).ceil() as u32;
+    let y = (request_top * scale_y).ceil() as u32;
+    let right = (request_right * scale_x).floor() as u32;
+    let bottom = (request_bottom * scale_y).floor() as u32;
     let x = x.min(frame_width.saturating_sub(1));
     let y = y.min(frame_height.saturating_sub(1));
-    let width = width.min(frame_width.saturating_sub(x)).max(1);
-    let height = height.min(frame_height.saturating_sub(y)).max(1);
+    let right = right.min(frame_width);
+    let bottom = bottom.min(frame_height);
+    let width = right
+        .saturating_sub(x)
+        .min(frame_width.saturating_sub(x))
+        .max(1);
+    let height = bottom
+        .saturating_sub(y)
+        .min(frame_height.saturating_sub(y))
+        .max(1);
     (x, y, width, height)
 }
 
@@ -2618,7 +2632,7 @@ fn snipping_warm_capture_has_fresh_frames_for(
                                 <= SNIPPING_WARM_CAPTURE_FRAME_MAX_AGE_MS
                     })
                 })
-            })
+        })
         .unwrap_or(false)
 }
 
@@ -2703,9 +2717,8 @@ fn snipping_warm_capture_loop(
     capturer.start_capture();
 
     while state.generation.load(Ordering::Acquire) == generation {
-        let frame = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            capturer.get_next_frame()
-        }));
+        let frame =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| capturer.get_next_frame()));
         match frame {
             Ok(Ok(scap::frame::Frame::Video(frame))) => {
                 snipping_store_warm_capture_frame(&state, generation, &key, frame);
@@ -2788,7 +2801,9 @@ fn snipping_start_warm_capture_if_ready(app: &AppHandle) {
         }));
         state.starting.store(false, Ordering::Release);
         if !matches!(result, Ok(Ok(()))) {
-            state.last_start_ms.store(current_time_ms(), Ordering::Release);
+            state
+                .last_start_ms
+                .store(current_time_ms(), Ordering::Release);
         }
     });
 }
@@ -2911,12 +2926,7 @@ fn snipping_scap_display_target_for_area_monitor(
     display_targets.into_iter().next()
 }
 
-fn snipping_scap_capture_area(
-    x: u32,
-    y: u32,
-    width: u32,
-    height: u32,
-) -> scap::capturer::Area {
+fn snipping_scap_capture_area(x: u32, y: u32, width: u32, height: u32) -> scap::capturer::Area {
     scap::capturer::Area {
         origin: scap::capturer::Point {
             x: f64::from(x),
@@ -2964,7 +2974,8 @@ fn snipping_prewarm_capture_session_blocking() -> bool {
     // Prefer a concrete display target like the real capture paths do; fall back
     // to the scap default if enumeration comes up empty.
     let target = snipping_scap_display_targets().into_iter().next();
-    let established = snipping_scap_capture_image(target, None, "prewarming screen capture").is_ok();
+    let established =
+        snipping_scap_capture_image(target, None, "prewarming screen capture").is_ok();
     if established {
         snipping_mark_screen_capture_confirmed();
     }
@@ -3286,7 +3297,9 @@ fn snipping_scap_capture_image_inner(
                 .get_next_frame()
                 .map_err(|error| format!("Unable to receive screen frame: {error}"))?
             {
-                scap::frame::Frame::Video(frame) => return snipping_scap_video_frame_to_rgba(frame),
+                scap::frame::Frame::Video(frame) => {
+                    return snipping_scap_video_frame_to_rgba(frame);
+                }
                 scap::frame::Frame::Audio(_) => continue,
             }
         }
@@ -3496,7 +3509,9 @@ fn snipping_scap_capture_image_via_helper(
         Err(error) => {
             let _ = fs::remove_file(&frame_path);
             return Err(if error.contains(" timed out.") {
-                format!("Timed out while {context}; restarted the screen capture helper. Try the snip again.")
+                format!(
+                    "Timed out while {context}; restarted the screen capture helper. Try the snip again."
+                )
             } else {
                 format!("Screen capture helper failed while {context}: {error}")
             });
@@ -3542,26 +3557,26 @@ fn snipping_scap_capture_image(
 
     #[cfg(not(target_os = "macos"))]
     {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    let context_for_worker = context.to_string();
-    thread::spawn(move || {
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            snipping_scap_capture_image_inner(target, crop_area)
-        }))
-        .map_err(|_| format!("Screen capture backend panicked while {context_for_worker}."))
-        .and_then(|result| result);
-        let _ = sender.send(result);
-    });
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let context_for_worker = context.to_string();
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                snipping_scap_capture_image_inner(target, crop_area)
+            }))
+            .map_err(|_| format!("Screen capture backend panicked while {context_for_worker}."))
+            .and_then(|result| result);
+            let _ = sender.send(result);
+        });
 
-    match receiver.recv_timeout(Duration::from_millis(SNIPPING_SCAP_CAPTURE_TIMEOUT_MS)) {
-        Ok(result) => result,
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
-            "Timed out while {context}. Try the snip again; if it keeps happening, reopen Screen Recording permission for Diff Forge AI."
-        )),
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-            Err(format!("Screen capture backend stopped while {context}."))
+        match receiver.recv_timeout(Duration::from_millis(SNIPPING_SCAP_CAPTURE_TIMEOUT_MS)) {
+            Ok(result) => result,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(format!(
+                "Timed out while {context}. Try the snip again; if it keeps happening, reopen Screen Recording permission for Diff Forge AI."
+            )),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(format!("Screen capture backend stopped while {context}."))
+            }
         }
-    }
     }
 }
 
@@ -3908,12 +3923,8 @@ fn snipping_emit_untracked_image_saved_with_toast(
         let app_for_preview = app.clone();
         let preview_path = target.display().to_string();
         let _ = app.run_on_main_thread(move || {
-            let _ = snipping_open_snip_preview_window_for(
-                &app_for_preview,
-                &preview_path,
-                None,
-                false,
-            );
+            let _ =
+                snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false);
         });
     }
     let root = diffforge_prepare_untracked_asset_root()?;
@@ -3960,12 +3971,8 @@ fn snipping_emit_untracked_video_saved_with_toast(
         let app_for_preview = app.clone();
         let preview_path = target.display().to_string();
         let _ = app.run_on_main_thread(move || {
-            let _ = snipping_open_snip_preview_window_for(
-                &app_for_preview,
-                &preview_path,
-                None,
-                false,
-            );
+            let _ =
+                snipping_open_snip_preview_window_for(&app_for_preview, &preview_path, None, false);
         });
     }
     let root = diffforge_prepare_untracked_asset_root()?;
@@ -3995,7 +4002,11 @@ fn snipping_emit_untracked_video_saved_with_toast(
         "item": item,
         "library": diffforge_untracked_asset_library(None)?,
     });
-    diffforge_emit_untracked_assets_updated(app, "snip-recording-saved", payload.get("item").cloned());
+    diffforge_emit_untracked_assets_updated(
+        app,
+        "snip-recording-saved",
+        payload.get("item").cloned(),
+    );
     snipping_push_recent_capture_toast(app, payload.clone());
     let _ = app.emit(SNIPPING_CAPTURE_SAVED_EVENT, payload.clone());
     Ok(payload)
@@ -4061,7 +4072,12 @@ fn snipping_write_png_fast(image: &image::RgbaImage, path: &Path) -> Result<(), 
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         encoder.write_image(raw, width, height, image::ExtendedColorType::Rgba8)
     }))
-    .map_err(|_| format!("Unable to encode snip image {}: PNG encoder panicked", path.display()))?
+    .map_err(|_| {
+        format!(
+            "Unable to encode snip image {}: PNG encoder panicked",
+            path.display()
+        )
+    })?
     .map_err(|error| format!("Unable to encode snip image {}: {error}", path.display()))
 }
 
@@ -4112,13 +4128,16 @@ fn snipping_crop_bgra_bytes(
     }
     let source_stride = usize::try_from(source_width).ok()?.checked_mul(4)?;
     let row_len = usize::try_from(width).ok()?.checked_mul(4)?;
-    let expected_len = usize::try_from(source_height).ok()?.checked_mul(source_stride)?;
+    let expected_len = usize::try_from(source_height)
+        .ok()?
+        .checked_mul(source_stride)?;
     if data.len() < expected_len {
         return None;
     }
     let mut cropped = Vec::with_capacity(usize::try_from(height).ok()?.checked_mul(row_len)?);
     for row in y..y.saturating_add(height) {
-        let offset = usize::try_from(row).ok()?
+        let offset = usize::try_from(row)
+            .ok()?
             .checked_mul(source_stride)?
             .checked_add(usize::try_from(x).ok()?.checked_mul(4)?)?;
         let end = offset.checked_add(row_len)?;
@@ -4127,12 +4146,12 @@ fn snipping_crop_bgra_bytes(
     Some(cropped)
 }
 
-fn snipping_recording_bitrate_bps(width: u32, height: u32) -> u32 {
+fn snipping_recording_bitrate_bps(width: u32, height: u32, fps: u32) -> u32 {
     let pixels = u64::from(width).saturating_mul(u64::from(height));
     let bitrate = pixels
-        .saturating_mul(u64::from(SNIPPING_RECORDING_FPS))
+        .saturating_mul(u64::from(fps.max(1)))
         .saturating_div(12);
-    bitrate.clamp(1_500_000, 20_000_000) as u32
+    bitrate.clamp(2_000_000, 40_000_000) as u32
 }
 
 fn snipping_recording_system_time_ms(value: SystemTime) -> Option<u64> {
@@ -4162,20 +4181,20 @@ fn snipping_clamp_u8(value: i32) -> u8 {
     value.clamp(0, 255) as u8
 }
 
-// BT.709 limited-range RGB->YCbCr coefficients. U/V sums stay zero so gray remains neutral.
-const SNIPPING_BT709_LIMITED_SCALE_BITS: i32 = 16;
-const SNIPPING_BT709_LIMITED_ROUNDING: i32 = 1 << (SNIPPING_BT709_LIMITED_SCALE_BITS - 1);
-const SNIPPING_BT709_LIMITED_Y_R: i32 = 11_966;
-const SNIPPING_BT709_LIMITED_Y_G: i32 = 40_254;
-const SNIPPING_BT709_LIMITED_Y_B: i32 = 4_064;
-const SNIPPING_BT709_LIMITED_U_R: i32 = -6_596;
-const SNIPPING_BT709_LIMITED_U_G: i32 = -22_189;
-const SNIPPING_BT709_LIMITED_U_B: i32 = 28_785;
-const SNIPPING_BT709_LIMITED_V_R: i32 = 28_784;
-const SNIPPING_BT709_LIMITED_V_G: i32 = -26_145;
-const SNIPPING_BT709_LIMITED_V_B: i32 = -2_639;
+// BT.709 full-range RGB->YCbCr coefficients. U/V sums stay zero so gray remains neutral.
+const SNIPPING_BT709_FULL_SCALE_BITS: i32 = 16;
+const SNIPPING_BT709_FULL_ROUNDING: i32 = 1 << (SNIPPING_BT709_FULL_SCALE_BITS - 1);
+const SNIPPING_BT709_FULL_Y_R: i32 = 13_933;
+const SNIPPING_BT709_FULL_Y_G: i32 = 46_871;
+const SNIPPING_BT709_FULL_Y_B: i32 = 4_732;
+const SNIPPING_BT709_FULL_U_R: i32 = -7_509;
+const SNIPPING_BT709_FULL_U_G: i32 = -25_259;
+const SNIPPING_BT709_FULL_U_B: i32 = 32_768;
+const SNIPPING_BT709_FULL_V_R: i32 = 32_768;
+const SNIPPING_BT709_FULL_V_G: i32 = -29_763;
+const SNIPPING_BT709_FULL_V_B: i32 = -3_005;
 
-fn snipping_bt709_limited_component(
+fn snipping_bt709_full_component(
     red: i32,
     green: i32,
     blue: i32,
@@ -4188,44 +4207,44 @@ fn snipping_bt709_limited_component(
         (((red_coeff * red)
             + (green_coeff * green)
             + (blue_coeff * blue)
-            + SNIPPING_BT709_LIMITED_ROUNDING)
-            >> SNIPPING_BT709_LIMITED_SCALE_BITS)
+            + SNIPPING_BT709_FULL_ROUNDING)
+            >> SNIPPING_BT709_FULL_SCALE_BITS)
             + offset,
     )
 }
 
-fn snipping_bt709_limited_y(red: i32, green: i32, blue: i32) -> u8 {
-    snipping_bt709_limited_component(
+fn snipping_bt709_full_y(red: i32, green: i32, blue: i32) -> u8 {
+    snipping_bt709_full_component(
         red,
         green,
         blue,
-        SNIPPING_BT709_LIMITED_Y_R,
-        SNIPPING_BT709_LIMITED_Y_G,
-        SNIPPING_BT709_LIMITED_Y_B,
-        16,
+        SNIPPING_BT709_FULL_Y_R,
+        SNIPPING_BT709_FULL_Y_G,
+        SNIPPING_BT709_FULL_Y_B,
+        0,
     )
 }
 
-fn snipping_bt709_limited_u(red: i32, green: i32, blue: i32) -> u8 {
-    snipping_bt709_limited_component(
+fn snipping_bt709_full_u(red: i32, green: i32, blue: i32) -> u8 {
+    snipping_bt709_full_component(
         red,
         green,
         blue,
-        SNIPPING_BT709_LIMITED_U_R,
-        SNIPPING_BT709_LIMITED_U_G,
-        SNIPPING_BT709_LIMITED_U_B,
+        SNIPPING_BT709_FULL_U_R,
+        SNIPPING_BT709_FULL_U_G,
+        SNIPPING_BT709_FULL_U_B,
         128,
     )
 }
 
-fn snipping_bt709_limited_v(red: i32, green: i32, blue: i32) -> u8 {
-    snipping_bt709_limited_component(
+fn snipping_bt709_full_v(red: i32, green: i32, blue: i32) -> u8 {
+    snipping_bt709_full_component(
         red,
         green,
         blue,
-        SNIPPING_BT709_LIMITED_V_R,
-        SNIPPING_BT709_LIMITED_V_G,
-        SNIPPING_BT709_LIMITED_V_B,
+        SNIPPING_BT709_FULL_V_R,
+        SNIPPING_BT709_FULL_V_G,
+        SNIPPING_BT709_FULL_V_B,
         128,
     )
 }
@@ -4270,7 +4289,7 @@ fn snipping_bgra_to_i420(
             let blue = i32::from(bgra[pixel_offset]);
             let green = i32::from(bgra[pixel_offset + 1]);
             let red = i32::from(bgra[pixel_offset + 2]);
-            y_plane[row_base + col] = snipping_bt709_limited_y(red, green, blue);
+            y_plane[row_base + col] = snipping_bt709_full_y(red, green, blue);
         }
     }
 
@@ -4292,8 +4311,8 @@ fn snipping_bgra_to_i420(
             let green = (green_sum + 2) / 4;
             let red = (red_sum + 2) / 4;
             let uv_index = (row / 2) * half_width + (col / 2);
-            u_plane[uv_index] = snipping_bt709_limited_u(red, green, blue);
-            v_plane[uv_index] = snipping_bt709_limited_v(red, green, blue);
+            u_plane[uv_index] = snipping_bt709_full_u(red, green, blue);
+            v_plane[uv_index] = snipping_bt709_full_v(red, green, blue);
         }
     }
 
@@ -4393,8 +4412,8 @@ fn snipping_read_ebml_element(
     }
     let data_end = match size {
         Some(size) => {
-            let size = usize::try_from(size)
-                .map_err(|_| "WebM element is too large.".to_string())?;
+            let size =
+                usize::try_from(size).map_err(|_| "WebM element is too large.".to_string())?;
             data_start
                 .checked_add(size)
                 .ok_or_else(|| "WebM element is too large.".to_string())?
@@ -4442,11 +4461,7 @@ fn snipping_scan_webm_header(
     Ok(())
 }
 
-fn snipping_scan_webm_track_entry(
-    bytes: &[u8],
-    start: usize,
-    end: usize,
-) -> Result<bool, String> {
+fn snipping_scan_webm_track_entry(bytes: &[u8], start: usize, end: usize) -> Result<bool, String> {
     let mut offset = start;
     let mut is_video = false;
     let mut is_vp9 = false;
@@ -4454,7 +4469,8 @@ fn snipping_scan_webm_track_entry(
         let element = snipping_read_ebml_element(bytes, offset, end)?;
         match element.id {
             SNIPPING_WEBM_TRACK_TYPE_ID => {
-                is_video = snipping_read_ebml_uint(&bytes[element.data_start..element.data_end])? == 1;
+                is_video =
+                    snipping_read_ebml_uint(&bytes[element.data_start..element.data_end])? == 1;
             }
             SNIPPING_WEBM_CODEC_ID => {
                 is_vp9 = &bytes[element.data_start..element.data_end] == b"V_VP9";
@@ -4519,7 +4535,12 @@ fn snipping_scan_webm_cluster(
                 return Ok(());
             }
             SNIPPING_WEBM_BLOCK_GROUP_ID => {
-                snipping_scan_webm_block_group(bytes, element.data_start, element.data_end, summary)?;
+                snipping_scan_webm_block_group(
+                    bytes,
+                    element.data_start,
+                    element.data_end,
+                    summary,
+                )?;
                 if summary.has_media_block {
                     return Ok(());
                 }
@@ -4567,11 +4588,21 @@ fn snipping_scan_webm_recording_bytes(
         match element.id {
             SNIPPING_WEBM_EBML_ID => {
                 summary.has_ebml_header = offset == 0;
-                snipping_scan_webm_header(bytes, element.data_start, element.data_end, &mut summary)?;
+                snipping_scan_webm_header(
+                    bytes,
+                    element.data_start,
+                    element.data_end,
+                    &mut summary,
+                )?;
             }
             SNIPPING_WEBM_SEGMENT_ID => {
                 summary.has_segment = true;
-                snipping_scan_webm_segment(bytes, element.data_start, element.data_end, &mut summary)?;
+                snipping_scan_webm_segment(
+                    bytes,
+                    element.data_start,
+                    element.data_end,
+                    &mut summary,
+                )?;
             }
             _ => {}
         }
@@ -4619,12 +4650,14 @@ fn snipping_recording_webm_timestamp_ns(pts_ms: u64) -> Result<u64, String> {
 fn snipping_recording_vp9_config(
     width: u32,
     height: u32,
+    fps: u32,
 ) -> Result<shiguredo_libvpx::EncoderConfig, String> {
     let width = usize::try_from(width)
         .map_err(|_| "Screen recording frame width is too large.".to_string())?;
     let height = usize::try_from(height)
         .map_err(|_| "Screen recording frame height is too large.".to_string())?;
-    let keyframe_interval = usize::try_from(SNIPPING_RECORDING_FPS.saturating_mul(2))
+    let fps = fps.max(1);
+    let keyframe_interval = usize::try_from(fps.saturating_mul(2))
         .map_err(|_| "Screen recording frame rate is too large.".to_string())?;
     let threads = std::thread::available_parallelism()
         .ok()
@@ -4641,9 +4674,10 @@ fn snipping_recording_vp9_config(
         shiguredo_libvpx::ImageFormat::I420,
         shiguredo_libvpx::CodecConfig::Vp9(vp9),
     );
-    config.fps_numerator = SNIPPING_RECORDING_FPS as usize;
+    config.fps_numerator = fps as usize;
     config.fps_denominator = 1;
-    config.target_bitrate = snipping_recording_bitrate_bps(width as u32, height as u32) as usize;
+    config.target_bitrate =
+        snipping_recording_bitrate_bps(width as u32, height as u32, fps) as usize;
     config.deadline = shiguredo_libvpx::EncodingDeadline::Realtime;
     config.rate_control = shiguredo_libvpx::RateControlMode::Cbr;
     config.cpu_used = Some(8);
@@ -4723,10 +4757,7 @@ fn snipping_clear_recording_if_current(app: &AppHandle, id: &str) {
 }
 
 #[cfg(windows)]
-fn snipping_set_recording_controls_capture_exclusion(
-    window: &tauri::WebviewWindow,
-    enabled: bool,
-) {
+fn snipping_set_window_capture_exclusion(window: &tauri::WebviewWindow, enabled: bool) {
     const WDA_NONE: u32 = 0x0000_0000;
     const WDA_EXCLUDEFROMCAPTURE: u32 = 0x0000_0011;
     let Ok(hwnd) = window.hwnd() else {
@@ -4742,11 +4773,32 @@ fn snipping_set_recording_controls_capture_exclusion(
     }
 }
 
-#[cfg(not(windows))]
-fn snipping_set_recording_controls_capture_exclusion(
-    _window: &tauri::WebviewWindow,
-    _enabled: bool,
-) {
+#[cfg(target_os = "macos")]
+fn snipping_set_window_capture_exclusion(window: &tauri::WebviewWindow, enabled: bool) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        snipping_catch_objc("set_window_capture_exclusion", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            };
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setSharingType(if enabled {
+                NSWindowSharingType::None
+            } else {
+                NSWindowSharingType::ReadOnly
+            });
+        });
+    });
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn snipping_set_window_capture_exclusion(_window: &tauri::WebviewWindow, _enabled: bool) {}
+
+fn snipping_set_recording_controls_capture_exclusion(window: &tauri::WebviewWindow, enabled: bool) {
+    snipping_set_window_capture_exclusion(window, enabled);
 }
 
 #[cfg(target_os = "macos")]
@@ -5001,6 +5053,28 @@ fn snipping_recording_excluded_targets() -> Option<Vec<scap::Target>> {
     None
 }
 
+fn snipping_recording_build_capturer(
+    target: Option<scap::Target>,
+    crop_area: Option<scap::capturer::Area>,
+    fps: u32,
+) -> Result<scap::capturer::Capturer, String> {
+    let fps = fps.max(1);
+    let options = scap::capturer::Options {
+        fps,
+        show_cursor: true,
+        show_highlight: false,
+        target,
+        crop_area,
+        output_type: scap::frame::FrameType::BGRAFrame,
+        output_resolution: scap::capturer::Resolution::Captured,
+        excluded_targets: snipping_recording_excluded_targets(),
+        captures_audio: false,
+        exclude_current_process_audio: true,
+    };
+    scap::capturer::Capturer::build(options)
+        .map_err(|error| format!("Unable to initialize screen recording at {fps} FPS: {error}"))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn snipping_recording_loop_inner(
     app: &AppHandle,
@@ -5023,22 +5097,47 @@ fn snipping_recording_loop_inner(
         source_width,
         source_height,
     ));
-    let options = scap::capturer::Options {
-        fps: SNIPPING_RECORDING_FPS,
-        show_cursor: true,
-        show_highlight: false,
-        target,
-        crop_area,
-        output_type: scap::frame::FrameType::BGRAFrame,
-        output_resolution: scap::capturer::Resolution::Captured,
-        excluded_targets: snipping_recording_excluded_targets(),
-        captures_audio: false,
-        exclude_current_process_audio: true,
-    };
-    let mut capturer = scap::capturer::Capturer::build(options)
-        .map_err(|error| format!("Unable to initialize screen recording: {error}"))?;
+    let mut active_fps = SNIPPING_RECORDING_TARGET_FPS;
+    let mut capturer =
+        match snipping_recording_build_capturer(target.clone(), crop_area.clone(), active_fps) {
+            Ok(capturer) => capturer,
+            Err(error) if active_fps != SNIPPING_RECORDING_FALLBACK_FPS => {
+                log_terminal_status_event(
+                    "backend.snipping.recording.fps_fallback",
+                    json!({
+                        "stage": "build",
+                        "from_fps": active_fps,
+                        "to_fps": SNIPPING_RECORDING_FALLBACK_FPS,
+                        "error": error,
+                    }),
+                );
+                active_fps = SNIPPING_RECORDING_FALLBACK_FPS;
+                snipping_recording_build_capturer(target.clone(), crop_area.clone(), active_fps)?
+            }
+            Err(error) => return Err(error),
+        };
 
-    let encoder_config = snipping_recording_vp9_config(session.width, session.height)?;
+    let encoder_config = snipping_recording_vp9_config(session.width, session.height, active_fps)?;
+    log_terminal_status_event(
+        "backend.snipping.recording.started",
+        json!({
+            "fps": active_fps,
+            "target_fps": SNIPPING_RECORDING_TARGET_FPS,
+            "fallback_fps": SNIPPING_RECORDING_FALLBACK_FPS,
+            "width": session.width,
+            "height": session.height,
+        }),
+    );
+    if active_fps != SNIPPING_RECORDING_TARGET_FPS {
+        log_snipping_area_cursor_debug_event(
+            "native.recording_fps_fallback",
+            json!({
+                "stage": "build",
+                "fps": active_fps,
+            }),
+        );
+    }
+
     let mut encoder = shiguredo_libvpx::Encoder::new(encoder_config)
         .map_err(|error| format!("Unable to initialize screen recording encoder: {error}"))?;
     let file = fs::File::create(&session.tmp_path).map_err(|error| {
@@ -5070,10 +5169,13 @@ fn snipping_recording_loop_inner(
                 chroma_horizontal: 1,
                 chroma_vertical: 1,
             },
-            webm::mux::ColorRange::Broadcast,
+            webm::mux::ColorRange::Full,
         )
         .map_err(|error| format!("Unable to configure WebM color metadata: {error:?}"))?
-        .set_transfer_characteristics(video_track, webm::mux::TransferCharacteristics::Bt709)
+        .set_transfer_characteristics(
+            video_track,
+            webm::mux::TransferCharacteristics::Iec61966_2_1,
+        )
         .map_err(|error| format!("Unable to configure WebM transfer metadata: {error:?}"))?
         .set_primaries(video_track, webm::mux::ColorPrimaries::Bt709)
         .map_err(|error| format!("Unable to configure WebM primary metadata: {error:?}"))?
@@ -5089,15 +5191,83 @@ fn snipping_recording_loop_inner(
     let mut yuv_frame = Vec::new();
     let write_result = (|| -> Result<(), String> {
         while !session.stop.load(Ordering::Acquire) {
-            match capturer
-                .get_next_frame()
-                .map_err(|error| format!("Unable to receive screen recording frame: {error}"))?
-            {
+            let next_frame = match capturer.get_next_frame() {
+                Ok(frame) => frame,
+                Err(error) => {
+                    if !session.stop.load(Ordering::Acquire)
+                        && active_fps != SNIPPING_RECORDING_FALLBACK_FPS
+                    {
+                        let error = error.to_string();
+                        log_terminal_status_event(
+                            "backend.snipping.recording.fps_fallback",
+                            json!({
+                                "stage": "receive",
+                                "from_fps": active_fps,
+                                "to_fps": SNIPPING_RECORDING_FALLBACK_FPS,
+                                "error": error,
+                            }),
+                        );
+                        log_snipping_area_cursor_debug_event(
+                            "native.recording_fps_fallback",
+                            json!({
+                                "stage": "receive",
+                                "from_fps": active_fps,
+                                "to_fps": SNIPPING_RECORDING_FALLBACK_FPS,
+                                "error": error,
+                            }),
+                        );
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            capturer.stop_capture();
+                        }));
+                        active_fps = SNIPPING_RECORDING_FALLBACK_FPS;
+                        match snipping_recording_build_capturer(
+                            target.clone(),
+                            crop_area.clone(),
+                            active_fps,
+                        ) {
+                            Ok(next_capturer) => {
+                                capturer = next_capturer;
+                                capturer.start_capture();
+                            }
+                            Err(rebuild_error) => {
+                                if sample_count > 0 || !pending_vp9_pts_ms.is_empty() {
+                                    log_terminal_status_event(
+                                        "backend.snipping.recording.fallback_unavailable",
+                                        json!({
+                                            "fps": active_fps,
+                                            "sample_count": sample_count,
+                                            "pending_frames": pending_vp9_pts_ms.len(),
+                                            "error": rebuild_error,
+                                        }),
+                                    );
+                                    break;
+                                }
+                                return Err(rebuild_error);
+                            }
+                        }
+                        continue;
+                    }
+                    if sample_count > 0 || !pending_vp9_pts_ms.is_empty() {
+                        log_terminal_status_event(
+                            "backend.snipping.recording.capture_ended",
+                            json!({
+                                "fps": active_fps,
+                                "sample_count": sample_count,
+                                "pending_frames": pending_vp9_pts_ms.len(),
+                                "error": error.to_string(),
+                            }),
+                        );
+                        break;
+                    }
+                    return Err(format!("Unable to receive screen recording frame: {error}"));
+                }
+            };
+            match next_frame {
                 scap::frame::Frame::Video(frame) => {
                     let (bytes, frame_width, frame_height, display_time) =
                         snipping_scap_video_frame_to_bgra_bytes(frame)?;
-                    let frame_epoch_ms =
-                        snipping_recording_system_time_ms(display_time).unwrap_or_else(current_time_ms);
+                    let frame_epoch_ms = snipping_recording_system_time_ms(display_time)
+                        .unwrap_or_else(current_time_ms);
                     let frame_pts_ms = snipping_recording_frame_pts_ms(
                         frame_epoch_ms,
                         &mut first_frame_epoch_ms,
@@ -5118,9 +5288,7 @@ fn snipping_recording_loop_inner(
                                 session.width,
                                 session.height,
                             )
-                            .ok_or_else(|| {
-                                "Unable to crop screen recording frame.".to_string()
-                            })?
+                            .ok_or_else(|| "Unable to crop screen recording frame.".to_string())?
                         } else if frame_width >= session.width && frame_height >= session.height {
                             snipping_crop_bgra_bytes(
                                 &bytes,
@@ -5131,9 +5299,7 @@ fn snipping_recording_loop_inner(
                                 session.width,
                                 session.height,
                             )
-                            .ok_or_else(|| {
-                                "Unable to crop screen recording frame.".to_string()
-                            })?
+                            .ok_or_else(|| "Unable to crop screen recording frame.".to_string())?
                         } else {
                             continue;
                         };
@@ -5162,10 +5328,7 @@ fn snipping_recording_loop_inner(
                     let force_keyframe = sample_count == 0 && pending_vp9_pts_ms.is_empty();
                     pending_vp9_pts_ms.push_back(frame_pts_ms);
                     encoder
-                        .encode(
-                            &image,
-                            &shiguredo_libvpx::EncodeOptions { force_keyframe },
-                        )
+                        .encode(&image, &shiguredo_libvpx::EncodeOptions { force_keyframe })
                         .map_err(|error| format!("Unable to encode recording frame: {error}"))?;
                     snipping_write_pending_vp9_frames(
                         &mut encoder,
@@ -5229,7 +5392,12 @@ fn snipping_recording_loop_inner(
     drop(writer);
 
     let size = fs::metadata(&session.tmp_path)
-        .map_err(|error| format!("Unable to read recording file {}: {error}", session.tmp_path.display()))?
+        .map_err(|error| {
+            format!(
+                "Unable to read recording file {}: {error}",
+                session.tmp_path.display()
+            )
+        })?
         .len();
     if size == 0 {
         let _ = fs::remove_file(&session.tmp_path);
@@ -5451,7 +5619,9 @@ fn snipping_start_area_recording_for(
     snipping_stop_warm_capture(app);
     snipping_clear_area_sessions(app)?;
     snipping_hide_area_overlay(app);
-    thread::sleep(Duration::from_millis(SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS));
+    thread::sleep(Duration::from_millis(
+        SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS,
+    ));
     if let Err(error) = snipping_show_recording_controls(app, &monitor, &request) {
         snipping_clear_recording_if_current(app, &session.id);
         snipping_start_warm_capture_if_ready(app);
@@ -5977,6 +6147,7 @@ fn ensure_snipping_overlay_window(
 ) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(label) {
         size_snipping_overlay_window(&window, monitor);
+        snipping_set_window_capture_exclusion(&window, true);
         return Ok(window);
     }
 
@@ -6014,6 +6185,7 @@ fn ensure_snipping_overlay_window(
         });
     }
     size_snipping_overlay_window(&window, monitor);
+    snipping_set_window_capture_exclusion(&window, true);
     #[cfg(target_os = "macos")]
     {
         snipping_convert_overlay_window_to_panel(&window);
@@ -6089,6 +6261,7 @@ fn snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window: &NSWin
             | objc2_app_kit::NSWindowCollectionBehavior::Stationary
             | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
     );
+    ns_window.setSharingType(NSWindowSharingType::None);
     ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
     ns_window.setAcceptsMouseMovedEvents(true);
     if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
@@ -6121,6 +6294,7 @@ fn snipping_force_area_crosshair_for_visible_overlays(
         NSCursor::crosshairCursor().set();
 
         let location = objc2_app_kit::NSEvent::mouseLocation();
+        let mouse_button_down = snipping_left_mouse_button_pressed();
         let mut forced_cursor_window = false;
         let mut windows_debug = Vec::new();
         for (_, window) in snipping_overlay_windows(app) {
@@ -6141,8 +6315,12 @@ fn snipping_force_area_crosshair_for_visible_overlays(
                 }
                 continue;
             }
-            snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window);
-            ns_window.orderFrontRegardless();
+            if mouse_button_down {
+                snipping_force_area_crosshair_for_ns_window(ns_window);
+            } else {
+                snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window);
+                ns_window.orderFrontRegardless();
+            }
             let frame = ns_window.frame();
             let inside = location.x >= frame.origin.x
                 && location.x < frame.origin.x + frame.size.width
@@ -6150,15 +6328,13 @@ fn snipping_force_area_crosshair_for_visible_overlays(
                 && location.y < frame.origin.y + frame.size.height;
             if should_log {
                 windows_debug.push(snipping_macos_window_cursor_debug_value(
-                    &label,
-                    ns_window,
-                    location,
+                    &label, ns_window, location,
                 ));
             }
             if !inside {
                 continue;
             }
-            if !ns_window.isKeyWindow() {
+            if !mouse_button_down && !ns_window.isKeyWindow() {
                 ns_window.makeKeyAndOrderFront(None);
             }
             snipping_force_area_crosshair_for_ns_window(ns_window);
@@ -6188,8 +6364,12 @@ fn snipping_force_area_crosshair_for_visible_overlays(
                         ),
                     }));
                 }
-                snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window);
-                ns_window.orderFrontRegardless();
+                if mouse_button_down {
+                    snipping_force_area_crosshair_for_ns_window(ns_window);
+                } else {
+                    snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window);
+                    ns_window.orderFrontRegardless();
+                }
                 snipping_force_area_crosshair_for_ns_window(ns_window);
                 break;
             }
@@ -6202,6 +6382,7 @@ fn snipping_force_area_crosshair_for_visible_overlays(
                 json!({
                     "reason": reason,
                     "mouse_location": snipping_macos_point_debug_value(location),
+                    "mouse_button_down": mouse_button_down,
                     "forced_cursor_window": forced_cursor_window,
                     "before": before.unwrap_or(Value::Null),
                     "after": snipping_macos_current_cursor_debug_value(),
@@ -6304,10 +6485,21 @@ fn snipping_order_overlay_front_regardless(window: &tauri::WebviewWindow) {
                 return;
             }
             let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-            ns_window.orderFrontRegardless();
             if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+                if snipping_left_mouse_button_pressed() {
+                    snipping_force_area_crosshair_for_ns_window(ns_window);
+                    log_snipping_area_cursor_debug_event(
+                        "native.order_overlay_skipped_during_drag",
+                        json!({
+                            "overlay_label": window_for_main.label(),
+                            "context": snipping_macos_cursor_context_debug_value(),
+                        }),
+                    );
+                    return;
+                }
                 snipping_force_area_crosshair_for_ns_window(ns_window);
             }
+            ns_window.orderFrontRegardless();
         });
     });
 }
@@ -6471,7 +6663,8 @@ fn snipping_restore_window_class_for_close_now(window: &tauri::WebviewWindow) {
     if ns_window.is_null() {
         return;
     }
-    let object: &objc2::runtime::AnyObject = unsafe { &*ns_window.cast::<objc2::runtime::AnyObject>() };
+    let object: &objc2::runtime::AnyObject =
+        unsafe { &*ns_window.cast::<objc2::runtime::AnyObject>() };
     if std::ptr::eq(object.class(), panel_class) {
         unsafe {
             objc2::runtime::AnyObject::set_class(object, original_class);
@@ -6545,9 +6738,7 @@ fn snipping_show_area_overlay_window_for_session(
             let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
             snipping_convert_ns_window_to_panel(ns_window);
             snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window);
-            window_for_main
-                .show()
-                .map_err(|error| format!("{error}"))?;
+            window_for_main.show().map_err(|error| format!("{error}"))?;
             ns_window.orderFrontRegardless();
             if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
                 snipping_force_area_crosshair_for_ns_window(ns_window);
@@ -6624,10 +6815,21 @@ fn snipping_make_overlay_key(window: &tauri::WebviewWindow) {
                 return;
             }
             let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
-            ns_window.makeKeyAndOrderFront(None);
             if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+                if snipping_left_mouse_button_pressed() {
+                    snipping_force_area_crosshair_for_ns_window(ns_window);
+                    log_snipping_area_cursor_debug_event(
+                        "native.key_overlay_skipped_during_drag",
+                        json!({
+                            "overlay_label": window_for_main.label(),
+                            "context": snipping_macos_cursor_context_debug_value(),
+                        }),
+                    );
+                    return;
+                }
                 snipping_force_area_crosshair_for_ns_window(ns_window);
             }
+            ns_window.makeKeyAndOrderFront(None);
         });
     });
 }
@@ -6647,10 +6849,27 @@ fn snipping_make_overlay_key_sync(app: &AppHandle, window: &tauri::WebviewWindow
             let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
             snipping_convert_ns_window_to_panel(ns_window);
             snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window);
-            ns_window.makeKeyAndOrderFront(None);
             if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+                if snipping_left_mouse_button_pressed() {
+                    snipping_force_area_crosshair_for_ns_window(ns_window);
+                    NSCursor::crosshairCursor().set();
+                    log_snipping_area_cursor_debug_event(
+                        "native.key_overlay_skipped_during_drag",
+                        json!({
+                            "overlay_label": window_for_main.label(),
+                            "window": snipping_macos_window_cursor_debug_value(
+                                window_for_main.label(),
+                                ns_window,
+                                objc2_app_kit::NSEvent::mouseLocation(),
+                            ),
+                            "context": snipping_macos_cursor_context_debug_value(),
+                        }),
+                    );
+                    return Ok(());
+                }
                 snipping_force_area_crosshair_for_ns_window(ns_window);
             }
+            ns_window.makeKeyAndOrderFront(None);
             NSCursor::crosshairCursor().set();
             log_snipping_area_cursor_debug_event(
                 "native.key_overlay_crosshair_committed",
@@ -6725,13 +6944,12 @@ fn snipping_schedule_area_overlay_reassertions(app: &AppHandle, reason: &'static
             }
             let app_for_main = app_for_guard.clone();
             let _ = app_for_guard.run_on_main_thread(move || {
-                snipping_force_area_crosshair_for_visible_overlays(
-                    &app_for_main,
-                    reason,
-                    false,
-                );
+                snipping_force_area_crosshair_for_visible_overlays(&app_for_main, reason, false);
             });
-            sleep(Duration::from_millis(SNIPPING_AREA_CURSOR_GUARD_INTERVAL_MS)).await;
+            sleep(Duration::from_millis(
+                SNIPPING_AREA_CURSOR_GUARD_INTERVAL_MS,
+            ))
+            .await;
             elapsed_ms += SNIPPING_AREA_CURSOR_GUARD_INTERVAL_MS;
         }
     });
@@ -6759,11 +6977,7 @@ fn snipping_schedule_area_overlay_reassertions(app: &AppHandle, reason: &'static
                         "context": snipping_macos_cursor_context_debug_value(),
                     }),
                 );
-                snipping_force_area_crosshair_for_visible_overlays(
-                    &app_for_main,
-                    reason,
-                    true,
-                );
+                snipping_force_area_crosshair_for_visible_overlays(&app_for_main, reason, true);
             });
         });
     }
@@ -7169,8 +7383,7 @@ fn snipping_begin_area_for(
 
     let freeze_screen = snipping_freeze_screen_enabled(app);
     let mut sessions = HashMap::new();
-    let mut ordered: Vec<(String, SnippingAreaMonitor, Option<Arc<image::RgbaImage>>)> =
-        Vec::new();
+    let mut ordered: Vec<(String, SnippingAreaMonitor, Option<Arc<image::RgbaImage>>)> = Vec::new();
     let mut first_error: Option<String> = None;
 
     if freeze_screen {
@@ -7307,8 +7520,8 @@ fn snipping_begin_area_for(
             }),
         );
         snipping_restore_desktop_icons_after_capture(app);
-        let error = first_error
-            .unwrap_or_else(|| "Unable to capture screen for area snip.".to_string());
+        let error =
+            first_error.unwrap_or_else(|| "Unable to capture screen for area snip.".to_string());
         return Err(error);
     }
 
@@ -8137,12 +8350,8 @@ async fn snipping_publish_uploaded_asset_to_cloud(
     app: &AppHandle,
     asset_id: String,
 ) -> Result<String, String> {
-    let published = cloud_mcp_publish_account_asset(
-        app.state::<CloudMcpState>(),
-        asset_id,
-        None,
-    )
-    .await?;
+    let published =
+        cloud_mcp_publish_account_asset(app.state::<CloudMcpState>(), asset_id, None).await?;
     snipping_publish_public_url(&published)
         .ok_or_else(|| "Snip published, but the cloud did not return a public URL.".to_string())
 }
@@ -8206,12 +8415,8 @@ async fn snipping_upload_known_asset_to_cloud(
         }),
     );
 
-    if let Err(error) = cloud_mcp_upload_account_asset(
-        app.state::<CloudMcpState>(),
-        asset_id.clone(),
-        None,
-    )
-    .await
+    if let Err(error) =
+        cloud_mcp_upload_account_asset(app.state::<CloudMcpState>(), asset_id.clone(), None).await
     {
         let _ = app.emit(
             SNIPPING_CLOUD_UPLOAD_EVENT,
@@ -8292,13 +8497,8 @@ async fn snipping_upload_untracked_asset_to_cloud(
     {
         let local_path = snipping_preview_current_path_string(&app, &requested_path)
             .unwrap_or_else(|_| requested_path.clone());
-        return snipping_upload_known_asset_to_cloud(
-            &app,
-            asset_id,
-            local_path,
-            requested_path,
-        )
-        .await;
+        return snipping_upload_known_asset_to_cloud(&app, asset_id, local_path, requested_path)
+            .await;
     }
 
     let promoted = snipping_upload_untracked_asset_for(&app, request)?;
@@ -8642,7 +8842,9 @@ fn snipping_close_editor_window(app: &AppHandle, label: &str, reason: &'static s
         let _ = app_for_thread.run_on_main_thread(move || {
             if let Some(window) = app_for_main.get_webview_window(&label_for_main) {
                 snipping_close_window_now(&window, "close_editor_window");
-            } else if let Ok(mut editors) = app_for_main.state::<SnippingState>().editor_paths.lock() {
+            } else if let Ok(mut editors) =
+                app_for_main.state::<SnippingState>().editor_paths.lock()
+            {
                 editors.remove(&label_for_main);
             }
         });
@@ -9200,7 +9402,11 @@ fn snipping_preview_drag_handoff_active(app: &AppHandle, label: &str) -> bool {
     app.state::<SnippingState>()
         .preview_drag_handoff_until_ms
         .lock()
-        .map(|handoffs| handoffs.get(label).is_some_and(|until_ms| now_ms < *until_ms))
+        .map(|handoffs| {
+            handoffs
+                .get(label)
+                .is_some_and(|until_ms| now_ms < *until_ms)
+        })
         .unwrap_or(false)
 }
 
@@ -9543,10 +9749,7 @@ fn snipping_preview_overlaps_strip(app: &AppHandle, preview: &tauri::WebviewWind
     overlap_x >= min_overlap_x && overlap_y >= min_overlap_y
 }
 
-fn snipping_preview_strip_client_x(
-    app: &AppHandle,
-    preview: &tauri::WebviewWindow,
-) -> Option<f64> {
+fn snipping_preview_strip_client_x(app: &AppHandle, preview: &tauri::WebviewWindow) -> Option<f64> {
     let strip = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL)?;
     let preview_position = preview.outer_position().ok()?;
     let preview_size = preview.outer_size().ok()?;
@@ -9583,7 +9786,11 @@ fn snipping_emit_strip_drag_event(
     {
         payload["clientX"] = json!(client_x);
     }
-    let _ = app.emit_to(SNIPPING_STRIP_WINDOW_LABEL, SNIPPING_STRIP_DRAG_EVENT, payload);
+    let _ = app.emit_to(
+        SNIPPING_STRIP_WINDOW_LABEL,
+        SNIPPING_STRIP_DRAG_EVENT,
+        payload,
+    );
 }
 
 fn snipping_update_preview_strip_drag_state(
@@ -9997,7 +10204,10 @@ fn snipping_cursor_logical_origin_for_preview(
         .or_else(|| app.primary_monitor().ok().flatten())
         .map(|monitor| monitor.scale_factor().max(0.1))
         .unwrap_or(1.0);
-    Some((cursor.x / scale - width * 0.5, cursor.y / scale - height * 0.5))
+    Some((
+        cursor.x / scale - width * 0.5,
+        cursor.y / scale - height * 0.5,
+    ))
 }
 
 fn snipping_position_preview_under_cursor(
@@ -10308,11 +10518,7 @@ fn snipping_start_float_hover_watcher(app: &AppHandle) {
                     } else {
                         json!({ "label": label.as_str(), "hovered": false })
                     };
-                    let _ = window.emit_to(
-                        label.as_str(),
-                        SNIPPING_FLOAT_HOVER_EVENT,
-                        payload,
-                    );
+                    let _ = window.emit_to(label.as_str(), SNIPPING_FLOAT_HOVER_EVENT, payload);
                 }
             }
             hovered_by_label.retain(|label, _| app.get_webview_window(label).is_some());
@@ -10885,7 +11091,8 @@ fn snipping_animate_strip_position(
             if generation.load(Ordering::SeqCst) != ticket {
                 return;
             }
-            let progress = (started.elapsed().as_millis() as f64 / SNIPPING_STRIP_POSITION_ANIMATE_MS)
+            let progress = (started.elapsed().as_millis() as f64
+                / SNIPPING_STRIP_POSITION_ANIMATE_MS)
                 .min(1.0);
             let eased = snipping_tween_eased(progress, SnippingTweenEasing::Track);
             let x = start.x + (f64::from(target.x - start.x) * eased).round() as i32;
@@ -10896,8 +11103,9 @@ fn snipping_animate_strip_position(
                 if frame_generation.load(Ordering::SeqCst) != ticket {
                     return;
                 }
-                let _ = window_for_frame
-                    .set_position(tauri::Position::Physical(tauri::PhysicalPosition::new(x, y)));
+                let _ = window_for_frame.set_position(tauri::Position::Physical(
+                    tauri::PhysicalPosition::new(x, y),
+                ));
             });
             if progress >= 1.0 {
                 return;
@@ -11166,8 +11374,7 @@ fn snipping_open_snip_float_for_drag(
         SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
     );
     let initial_position =
-        snipping_cursor_logical_origin_for_preview(&app, drag_size.0, drag_size.1)
-            .or(Some((x, y)));
+        snipping_cursor_logical_origin_for_preview(&app, drag_size.0, drag_size.1).or(Some((x, y)));
     let opened = snipping_open_snip_preview_window_for_with_size(
         &app,
         &path,
@@ -11668,13 +11875,13 @@ mod snipping_recording_webm_tests {
     }
 
     #[test]
-    fn recording_bgra_to_i420_uses_bt709_limited_range() {
+    fn recording_bgra_to_i420_uses_bt709_full_range() {
         let cases = [
-            ("black", 0, 0, 0, 16, 128, 128),
-            ("white", 255, 255, 255, 235, 128, 128),
-            ("red", 255, 0, 0, 63, 102, 240),
-            ("green", 0, 255, 0, 173, 42, 26),
-            ("blue", 0, 0, 255, 32, 240, 118),
+            ("black", 0, 0, 0, 0, 128, 128),
+            ("white", 255, 255, 255, 255, 128, 128),
+            ("red", 255, 0, 0, 54, 99, 255),
+            ("green", 0, 255, 0, 182, 30, 12),
+            ("blue", 0, 0, 255, 18, 255, 116),
         ];
 
         for (name, red, green, blue, expected_y, expected_u, expected_v) in cases {
@@ -11726,9 +11933,10 @@ mod snipping_recording_webm_tests {
             .add_video_track(16, 16, webm::mux::VideoCodecId::VP9, None)
             .unwrap();
         let mut segment = builder.build();
-        let mut encoder =
-            shiguredo_libvpx::Encoder::new(snipping_recording_vp9_config(16, 16).unwrap())
-                .unwrap();
+        let mut encoder = shiguredo_libvpx::Encoder::new(
+            snipping_recording_vp9_config(16, 16, SNIPPING_RECORDING_FALLBACK_FPS).unwrap(),
+        )
+        .unwrap();
         let mut pending_pts_ms = VecDeque::new();
         let mut sample_count = 0_u64;
         let mut yuv = Vec::new();
@@ -11852,7 +12060,12 @@ mod snipping_recording_webm_tests {
             (100, 50, 400, 300)
         );
         assert_eq!(
-            (area.frame_x, area.frame_y, area.frame_width, area.frame_height),
+            (
+                area.frame_x,
+                area.frame_y,
+                area.frame_width,
+                area.frame_height
+            ),
             (200, 100, 800, 600)
         );
     }
@@ -11872,6 +12085,24 @@ mod snipping_recording_webm_tests {
         assert_eq!(
             snipping_area_selection_rect_for_frame(&request, 1600, 1200),
             (200, 100, 800, 600)
+        );
+    }
+
+    #[test]
+    fn area_selection_rect_stays_inside_fractional_selection_edges() {
+        let request = SnippingAreaSelectionRequest {
+            x: 100.25,
+            y: 50.25,
+            width: 399.4,
+            height: 299.4,
+            scale_factor: Some(1.0),
+            viewport_width: Some(800.0),
+            viewport_height: Some(600.0),
+        };
+
+        assert_eq!(
+            snipping_area_selection_rect_for_frame(&request, 1600, 1200),
+            (201, 101, 798, 598)
         );
     }
 }

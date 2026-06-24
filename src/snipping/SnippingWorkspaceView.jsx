@@ -52,6 +52,7 @@ const FORGE_SPACE_MODE_STORAGE_KEY = "diffforge.app.spaceMode";
 const FORGE_SPACE_MODE_LOOPSPACES = "loopspaces";
 const FORGE_SPACE_MODE_WORKSPACES = "workspaces";
 const RECORDING_MIN_SELECTION_SIZE = 36;
+const RECORDING_RESIZE_EDGE_HIT_SIZE = 18;
 const RECORDING_RESIZE_HANDLES = ["nw", "n", "ne", "e", "se", "s", "sw", "w"];
 
 function normalizeForgeSpaceMode(value) {
@@ -184,6 +185,33 @@ function recordingSelectionFromDrag({ startX, startY, endX, endY }) {
     width: Math.max(RECORDING_MIN_SELECTION_SIZE, right - left),
     height: Math.max(RECORDING_MIN_SELECTION_SIZE, bottom - top),
   });
+}
+
+function recordingResizeHandleFromPoint(selection, point) {
+  if (!selection || !point) return "";
+  const left = Number(selection.left);
+  const top = Number(selection.top);
+  const right = left + Number(selection.width);
+  const bottom = top + Number(selection.height);
+  if (![left, top, right, bottom, point.x, point.y].every(Number.isFinite)) return "";
+
+  const hit = RECORDING_RESIZE_EDGE_HIT_SIZE;
+  const withinX = point.x >= left - hit && point.x <= right + hit;
+  const withinY = point.y >= top - hit && point.y <= bottom + hit;
+  const nearTop = withinX && Math.abs(point.y - top) <= hit;
+  const nearRight = withinY && Math.abs(point.x - right) <= hit;
+  const nearBottom = withinX && Math.abs(point.y - bottom) <= hit;
+  const nearLeft = withinY && Math.abs(point.x - left) <= hit;
+
+  if (nearTop && nearLeft) return "nw";
+  if (nearTop && nearRight) return "ne";
+  if (nearBottom && nearRight) return "se";
+  if (nearBottom && nearLeft) return "sw";
+  if (nearTop) return "n";
+  if (nearRight) return "e";
+  if (nearBottom) return "s";
+  if (nearLeft) return "w";
+  return "";
 }
 
 function resizeRecordingSelection(selection, handle, dx, dy) {
@@ -1388,7 +1416,8 @@ export function SnippingOverlayWindow() {
     const point = overlayPoint(event);
     if (overlayMode === "recording") {
       const currentSelection = normalizeRecordingSelection(recordingSelection || fullViewportSelection());
-      const handle = text(event.target?.closest?.("[data-recording-resize-handle]")?.getAttribute("data-recording-resize-handle"));
+      const domHandle = text(event.target?.closest?.("[data-recording-resize-handle]")?.getAttribute("data-recording-resize-handle"));
+      const handle = domHandle || recordingResizeHandleFromPoint(currentSelection, point);
       const insideSelection = point.x >= currentSelection.left
         && point.x <= currentSelection.left + currentSelection.width
         && point.y >= currentSelection.top
@@ -2152,11 +2181,12 @@ const SnippingOverlayHint = styled.div`
 
 const SnippingSelectionBox = styled.div`
   position: absolute;
-  border: 1.5px solid var(--snipping-selection-border);
+  border: 0;
   border-radius: 2px;
   /* Subtle spotlight: hint the selection without darkening the screen. */
   box-shadow:
-    0 0 0 1px rgba(8, 10, 14, 0.35),
+    0 0 0 1.5px var(--snipping-selection-border),
+    0 0 0 2.5px rgba(8, 10, 14, 0.35),
     0 0 0 100000px var(--snipping-selection-shadow),
     0 0 28px rgba(var(--snipping-overlay-accent-rgb), 0.2);
   pointer-events: none;

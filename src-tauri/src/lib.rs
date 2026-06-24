@@ -2489,6 +2489,7 @@ include!("audio_history.rs");
 include!("handsfree_audio.rs");
 include!("voice_text_rules.rs");
 include!("snipping.rs");
+include!("editor.rs");
 
 fn diagnostic_log_path(file_name: &str) -> PathBuf {
     let tauri_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -4789,6 +4790,17 @@ pub fn run() {
             rename_workspace_entry,
             delete_workspace_entry,
             move_workspace_entry,
+            editor_list_projects,
+            editor_create_project,
+            editor_get_project,
+            editor_rename_project,
+            editor_delete_project,
+            editor_save_timeline,
+            editor_list_media,
+            editor_import_media,
+            editor_probe_media,
+            editor_thumbnail,
+            editor_decode_frame,
             workspace_threads_read,
             workspace_threads_persist,
             workspace_threads_persist_delta,
