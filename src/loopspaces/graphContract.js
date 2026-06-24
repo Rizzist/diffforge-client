@@ -60,13 +60,13 @@ export const LOOPSPACE_GRAPH_NODE_CONTRACTS = {
     inputs: [],
     outputs: [OUTPUT_PORTS_BY_ID.docs],
     role: "context",
-    visual: { height: 128, width: 270 },
+    visual: { height: 128, minHeight: 128, minWidth: 270, sized: true, width: 270 },
   },
   document_write: {
     inputs: [INPUT_PORTS_BY_ID.in],
     outputs: [],
     role: "context",
-    visual: { height: 128, width: 270 },
+    visual: { height: 128, minHeight: 128, minWidth: 270, sized: true, width: 270 },
   },
   loop: {
     inputs: [INPUT_PORTS_BY_ID.in],
@@ -104,9 +104,9 @@ export const LOOPSPACE_GRAPH_NODE_CONTRACTS = {
     },
   },
   step: {
-    inputs: [],
+    inputs: [INPUT_PORTS_BY_ID.in],
     internal: true,
-    outputs: [],
+    outputs: [OUTPUT_PORTS_BY_ID.docs],
     role: "checkpoint",
     visual: { height: 30, width: 160 },
   },
@@ -135,6 +135,36 @@ function nodeKindFromValue(value) {
     return cleanKind(value.nodeKind || value.node_kind || value.kind || value.role || "loop");
   }
   return cleanKind(value || "loop");
+}
+
+function graphContractNodeParentId(value) {
+  if (!value || typeof value !== "object") return "";
+  return String(
+    value?.props?.parent_id
+      || value?.props?.parentId
+      || value?.props?.parent
+      || value?.parent_id
+      || value?.parentId
+      || value?.parent
+      || "",
+  ).trim();
+}
+
+function graphContractNodeFromLookup(lookup, id) {
+  const safeId = String(id || "").trim();
+  if (!safeId || !lookup) return null;
+  if (lookup instanceof Map) return lookup.get(safeId) || null;
+  if (typeof lookup === "object" && !Array.isArray(lookup)) return lookup[safeId] || null;
+  return null;
+}
+
+function graphContractIsSendMessageSubstep(node, nodeLookup = null) {
+  if (normalizeLoopspaceGraphNodeKind(node) !== "step") return false;
+  const parentId = graphContractNodeParentId(node);
+  if (!parentId || parentId === String(node?.id || "").trim()) return false;
+  const parentNode = graphContractNodeFromLookup(nodeLookup, parentId);
+  if (!parentNode) return true;
+  return normalizeLoopspaceGraphNodeKind(parentNode) === "send_message";
 }
 
 export function normalizeLoopspaceGraphNodeKind(value) {
@@ -208,7 +238,23 @@ export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = 
   }
   const fromContract = loopspaceGraphNodeContract(fromNode);
   const toContract = loopspaceGraphNodeContract(toNode);
-  if (fromContract.internal || toContract.internal) {
+  const fromKind = normalizeLoopspaceGraphNodeKind(fromNode);
+  const toKind = normalizeLoopspaceGraphNodeKind(toNode);
+  const nodeLookup = options.nodeById || options.nodeLookup || options.nodes || null;
+  const isDocumentStepContextEdge = (
+    fromKind === "document_read"
+      && toKind === "step"
+      && fromPort === "docs"
+      && toPort === "in"
+      && graphContractIsSendMessageSubstep(toNode, nodeLookup)
+  ) || (
+    fromKind === "step"
+      && toKind === "document_write"
+      && fromPort === "docs"
+      && toPort === "in"
+      && graphContractIsSendMessageSubstep(fromNode, nodeLookup)
+  );
+  if ((fromContract.internal || toContract.internal) && !isDocumentStepContextEdge) {
     return { error: "Internal send-message steps cannot be connected as graph nodes.", ok: false };
   }
   if (!loopspaceGraphNodeHasOutputPort(fromNode, fromPort, { allowLegacy: options.allowLegacy })) {
@@ -299,6 +345,7 @@ export function validateLoopspaceGraphAst(ast = {}, options = {}) {
     let validation = validateLoopspaceGraphEdgeCandidate(nodeById.get(from), nodeById.get(to), {
       from,
       fromPort: edge?.fromPort,
+      nodeById,
       to,
       toPort: edge?.toPort,
     });
@@ -310,6 +357,7 @@ export function validateLoopspaceGraphAst(ast = {}, options = {}) {
           allowLegacy: true,
           from,
           fromPort: edge?.fromPort,
+          nodeById,
           to,
           toPort: edge?.toPort,
         });
@@ -323,6 +371,7 @@ export function validateLoopspaceGraphAst(ast = {}, options = {}) {
         allowLegacy: true,
         from,
         fromPort: edge?.fromPort,
+        nodeById,
         to,
         toPort: edge?.toPort,
       });

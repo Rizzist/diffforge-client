@@ -382,6 +382,13 @@ export function warmWorkspaceTools(coordinationTargets, rootDirectory) {
   ensureWorkspaceToolsFresh(workspaceToolsRepoDescriptors(coordinationTargets, rootDirectory));
 }
 
+/** Background-safe account-doc refresh for app-control MCP inventory tools. */
+export async function refreshWorkspaceToolsAccountSkills({ force = false } = {}) {
+  wireAccountToolsChangeEvents();
+  await loadAccountSkills({ force: force === true });
+  return getWorkspaceToolsAccountSkills();
+}
+
 /** Push locally loaded/saved account skill units into the Tools cache. */
 export function noteAccountSkillUnits(skills) {
   workspaceToolsStore.skillsFetchedAtMs = Date.now();

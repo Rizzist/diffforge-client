@@ -4807,6 +4807,7 @@ pub fn run() {
             editor_thumbnail,
             editor_decode_frame,
             editor_waveform,
+            editor_decode_audio_pcm,
             workspace_threads_read,
             workspace_threads_persist,
             workspace_threads_persist_delta,

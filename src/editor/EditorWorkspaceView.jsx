@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -93,8 +93,8 @@ const MIN_PX_PER_SECOND = 8;
 const MAX_PX_PER_SECOND = 600;
 const TRACK_GUTTER_PX = 120;
 const MIN_CLIP_MS = 200;
-const PREVIEW_DEBOUNCE_MS = 130;
 const DEFAULT_FPS = 30;
+const MAX_AUDIO_BUFFER_CACHE = 12;
 const UNDO_DEPTH = 100;
 const RANGE_SELECT_MIN_MS = 60;
 const SNAP_THRESHOLD_PX = 8;
@@ -126,7 +126,7 @@ const VIDEO_EXTENSIONS = ["webm", "mp4", "mov", "mkv", "m4v"];
 const IMAGE_EXTENSIONS = ["png", "jpg", "jpeg", "gif", "webp", "bmp", "avif", "svg"];
 const AUDIO_EXTENSIONS = ["opus", "ogg", "oga", "wav", "mp3", "m4a", "flac"];
 const MEDIA_EXTENSIONS = [...VIDEO_EXTENSIONS, ...IMAGE_EXTENSIONS, ...AUDIO_EXTENSIONS];
-const MEDIA_TILE_MIN_PX = 118;
+const MEDIA_TILE_MIN_PX = 62;
 
 function pathBaseName(path) {
   const text = String(path || "");
@@ -315,6 +315,18 @@ function normalizeClip(clip) {
 function isMediaPath(path) {
   const lower = String(path || "").toLowerCase();
   return MEDIA_EXTENSIONS.some((ext) => lower.endsWith(`.${ext}`));
+}
+
+function base64ToUint8(b64) {
+  if (typeof atob !== "function" || !b64) {
+    return new Uint8Array(0);
+  }
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) {
+    out[i] = bin.charCodeAt(i);
+  }
+  return out;
 }
 
 // Suppress native text/region selection for the duration of a pointer drag so
@@ -610,10 +622,15 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   const [thumbs, setThumbs] = useState({});
   const [playheadMs, setPlayheadMs] = useState(0);
   const [previewUrl, setPreviewUrl] = useState("");
+  const [decodedPreviewKey, setDecodedPreviewKey] = useState("");
   const [previewBusy, setPreviewBusy] = useState(false);
+  const [nativeVideoFailedKey, setNativeVideoFailedKey] = useState("");
   const [importBusy, setImportBusy] = useState(false);
   const [dropActive, setDropActive] = useState(false);
   const [playing, setPlaying] = useState(false);
+  const [playbackRun, setPlaybackRun] = useState(0);
+  // What the viewer/transport play: the timeline, or a single previewed asset.
+  const [previewSource, setPreviewSource] = useState({ kind: "timeline" });
   // Session (ephemeral, not persisted, not undoable):
   const [selection, setSelection] = useState(null); // { startMs, endMs } | null
   const [activeClipId, setActiveClipId] = useState(null); // the focused clip (inspector target)
@@ -642,15 +659,24 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
 
   const dragRef = useRef(null);
   const processedRef = useRef(new Set());
-  const previewReqRef = useRef(0);
-  const previewTimerRef = useRef(0);
-  const lastDecodeRef = useRef(0);
+  const pendingFrameRef = useRef(null); // latest desired preview frame {path,timeMs}
+  const decodeInFlightRef = useRef(false); // a single decode is chasing the latest frame
+  const previewTokenRef = useRef(0); // bumps on every preview target change/clear
   const mountedRef = useRef(true);
+  // Audio playback (Web Audio): decoded PCM buffers + the live scheduled nodes +
+  // the master-clock anchor (audio drives the playhead when audio is present).
+  const audioCtxRef = useRef(null);
+  const audioBufferCacheRef = useRef(new Map()); // path -> AudioBuffer | null (null = no audio)
+  const audioNodesRef = useRef([]); // [{ source, gain }] currently scheduled
+  const audioAnchorRef = useRef(null); // { ctxTime, playheadMs } when audio is the clock
+  const wallAnchorRef = useRef(null); // { perfTime, playheadMs } fallback clock
+  const audioRunRef = useRef(0); // invalidates stale async audio scheduling
   const doImportRef = useRef(null);
   const timelineScrollRef = useRef(null); // the horizontally-scrolling timeline viewport
   const autoScrollRef = useRef(0); // active edge-autoscroll velocity (px/frame)
   const autoScrollRafRef = useRef(0);
   const conversionCleanupTimersRef = useRef(new Map());
+  const previewVideoRef = useRef(null);
 
   // The committed document (last server state) + in-session undo/redo of
   // committed snapshots. `clips` is the live working copy (may diverge mid-drag).
@@ -664,6 +690,8 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   // read fresh values without re-subscribing.
   const clipsRef = useRef([]);
   const playheadRef = useRef(0);
+  const playingRef = useRef(false);
+  const effectiveTotalMsRef = useRef(0);
   const selectionRef = useRef(null);
   const activeClipRef = useRef(null);
   const selectedClipIdsRef = useRef([]);
@@ -678,15 +706,24 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   const ppsRef = useRef(BASE_PX_PER_SECOND);
   const toolRef = useRef("select");
   const commitRef = useRef(null);
+  const previewSourceRef = useRef({ kind: "timeline" });
 
   useEffect(() => {
     return () => {
       mountedRef.current = false;
-      window.clearTimeout(previewTimerRef.current);
       for (const timer of conversionCleanupTimersRef.current.values()) {
         window.clearTimeout(timer);
       }
       conversionCleanupTimersRef.current.clear();
+      // The component remounts on project switch (key={openProjectId}). Browsers
+      // cap concurrent AudioContexts (~6); without closing, a few project opens
+      // exhaust the pool and all audio silently dies. Close + drop cached buffers
+      // (they belong to this context and must not be reused on a new one).
+      if (audioCtxRef.current) {
+        audioCtxRef.current.close().catch(() => {});
+        audioCtxRef.current = null;
+      }
+      audioBufferCacheRef.current.clear();
     };
   }, []);
 
@@ -921,6 +958,13 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     return clips.reduce((max, clip) => Math.max(max, (clip.startMs ?? 0) + clipLengthMs(clip)), 0);
   }, [clips]);
 
+  // The duration the viewer/transport operate on: the timeline, or the previewed
+  // asset when one is loaded.
+  const effectiveTotalMs = useMemo(
+    () => (previewSource.kind === "asset" ? Math.max(0, previewSource.durationMs || 0) : totalMs),
+    [previewSource, totalMs],
+  );
+
   const timelineWidthPx = useMemo(
     () => Math.max(msToPx(totalMs, pxPerSecond) + 240, 720),
     [totalMs, pxPerSecond],
@@ -944,88 +988,464 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     return targets;
   }, []);
 
-  // The video clip currently under the playhead (for preview).
+  // The video clip under the playhead (timeline mode). On overlap the latest-placed
+  // (highest startMs) wins, matching NLE convention.
   const activeVideoClip = useMemo(() => {
-    return (
-      clips.find(
-        (clip) =>
-          clip.track === "video" &&
-          playheadMs >= (clip.startMs ?? 0) &&
-          playheadMs < (clip.startMs ?? 0) + clipLengthMs(clip),
-      ) || null
-    );
-  }, [clips, playheadMs]);
-
-  // Decode the preview frame as the playhead/active clip changes. Throttled
-  // (leading + trailing) rather than debounced, so it keeps refreshing during
-  // continuous playback instead of waiting for the playhead to stop.
-  useEffect(() => {
-    if (!activeVideoClip) {
-      setPreviewUrl("");
-      setPreviewBusy(false);
-      return undefined;
+    if (previewSource.kind !== "timeline") {
+      return null;
     }
-    const clip = activeVideoClip;
-    const sourceTime = Math.max(0, playheadMs - (clip.startMs ?? 0) + (clip.inMs ?? 0));
-    let cancelled = false;
-    const decode = async () => {
-      lastDecodeRef.current = performance.now();
-      const reqId = previewReqRef.current + 1;
-      previewReqRef.current = reqId;
-      setPreviewBusy(true);
-      try {
-        const frame = await invoke("editor_decode_frame", {
-          path: clip.mediaPath,
-          timeMs: Math.round(sourceTime),
-        });
-        if (!cancelled && previewReqRef.current === reqId && mountedRef.current) {
-          setPreviewUrl(frame?.dataUrl || "");
-        }
-      } catch {
-        if (!cancelled && previewReqRef.current === reqId && mountedRef.current) {
-          setPreviewUrl("");
-        }
-      } finally {
-        if (previewReqRef.current === reqId && mountedRef.current) {
-          setPreviewBusy(false);
+    let best = null;
+    for (const clip of clips) {
+      if (clip.track !== "video") {
+        continue;
+      }
+      const start = clip.startMs ?? 0;
+      if (playheadMs >= start && playheadMs < start + clipLengthMs(clip)) {
+        if (!best || start >= (best.startMs ?? 0)) {
+          best = clip;
         }
       }
+    }
+    return best;
+  }, [clips, playheadMs, previewSource]);
+
+  const playbackVideoSource = useMemo(() => {
+    if (previewSource.kind === "asset") {
+      if (!previewSource.path) {
+        return null;
+      }
+      const durationMs = Math.max(0, Number(previewSource.durationMs) || 0);
+      return {
+        key: `asset:${previewSource.path}`,
+        src: convertFileSrc(previewSource.path),
+        startMs: 0,
+        inMs: 0,
+        outMs: durationMs,
+      };
+    }
+    if (!activeVideoClip?.mediaPath) {
+      return null;
+    }
+    const inMs = Math.max(0, Number(activeVideoClip.inMs) || 0);
+    const explicitOutMs = Math.max(0, Number(activeVideoClip.outMs ?? activeVideoClip.durationMs) || 0);
+    const outMs = explicitOutMs > inMs ? explicitOutMs : inMs + clipLengthMs(activeVideoClip);
+    return {
+      key: `clip:${activeVideoClip.id}:${activeVideoClip.mediaPath}:${inMs}:${outMs}`,
+      src: convertFileSrc(activeVideoClip.mediaPath),
+      startMs: Math.max(0, Number(activeVideoClip.startMs) || 0),
+      inMs,
+      outMs,
     };
-    const sinceLast = performance.now() - lastDecodeRef.current;
-    if (sinceLast >= PREVIEW_DEBOUNCE_MS) {
-      decode();
+  }, [previewSource, activeVideoClip]);
+
+  const playbackVideoTimeMs = useMemo(() => {
+    if (!playbackVideoSource) {
+      return 0;
+    }
+    const relativeMs = previewSource.kind === "asset" ? playheadMs : playheadMs - playbackVideoSource.startMs;
+    const targetMs = playbackVideoSource.inMs + Math.max(0, relativeMs);
+    const upperMs =
+      playbackVideoSource.outMs > playbackVideoSource.inMs
+        ? Math.max(playbackVideoSource.inMs, playbackVideoSource.outMs - 8)
+        : targetMs;
+    return Math.min(upperMs, Math.max(playbackVideoSource.inMs, targetMs));
+  }, [playbackVideoSource, playheadMs, previewSource.kind]);
+
+  const nativeVideoFailed = !!playbackVideoSource && nativeVideoFailedKey === playbackVideoSource.key;
+  const nativeVideoActive = playing && !!playbackVideoSource && !nativeVideoFailed;
+  const markNativeVideoFailed = useCallback((key) => {
+    if (key) {
+      setNativeVideoFailedKey(key);
+    }
+    setPlaying(false);
+  }, []);
+
+  // The frame the viewer should show, quantized to the fps grid so the backend
+  // frame cache hits on replay/scrub-back and decode requests dedupe.
+  const previewFrame = useMemo(() => {
+    if (nativeVideoActive) {
+      return null;
+    }
+    const fps = settings.fps || DEFAULT_FPS;
+    const frameMs = 1000 / Math.max(1, fps);
+    const quant = (t) => Math.max(0, Math.round(t / frameMs) * frameMs);
+    const clampFrameTime = (timeMs, inMs = 0, outMs = 0) => {
+      const lower = Math.max(0, inMs);
+      const upper = outMs > lower ? Math.max(lower, outMs - frameMs) : Math.max(lower, timeMs);
+      return Math.min(upper, Math.max(lower, timeMs));
+    };
+    if (previewSource.kind === "asset") {
+      if (!previewSource.path) {
+        return null;
+      }
+      const cap = previewSource.durationMs ? Math.max(0, previewSource.durationMs - frameMs) : playheadMs;
+      return {
+        path: previewSource.path,
+        timeMs: clampFrameTime(quant(Math.min(playheadMs, cap)), 0, previewSource.durationMs || 0),
+      };
+    }
+    if (activeVideoClip) {
+      const inMs = Math.max(0, Number(activeVideoClip.inMs) || 0);
+      const explicitOutMs = Math.max(0, Number(activeVideoClip.outMs ?? activeVideoClip.durationMs) || 0);
+      const outMs = explicitOutMs > inMs ? explicitOutMs : inMs + clipLengthMs(activeVideoClip);
+      return {
+        path: activeVideoClip.mediaPath,
+        timeMs: clampFrameTime(
+          quant(playheadMs - (activeVideoClip.startMs ?? 0) + inMs),
+          inMs,
+          outMs,
+        ),
+      };
+    }
+    return null;
+  }, [previewSource, activeVideoClip, playheadMs, settings.fps, nativeVideoActive]);
+
+  const previewKey = previewFrame ? `${previewFrame.path}|${previewFrame.timeMs}` : "";
+  const previewStillCurrent = !!previewKey && decodedPreviewKey === previewKey && !!previewUrl;
+  const previewVideoVisible =
+    !!playbackVideoSource && !nativeVideoFailed && (nativeVideoActive || (!!previewKey && !previewStillCurrent));
+
+  useEffect(() => {
+    const video = previewVideoRef.current;
+    if (!video || !playbackVideoSource || nativeVideoFailed) {
+      return undefined;
+    }
+    let cancelled = false;
+    const targetSeconds = Math.max(0, playbackVideoTimeMs / 1000);
+    const syncVideo = () => {
+      if (cancelled) {
+        return;
+      }
+      const duration = Number.isFinite(video.duration) ? video.duration : 0;
+      const boundedSeconds = duration > 0 ? Math.min(targetSeconds, Math.max(0, duration - 0.008)) : targetSeconds;
+      const drift = Math.abs((Number.isFinite(video.currentTime) ? video.currentTime : 0) - boundedSeconds);
+      if (!playing || drift > 0.18) {
+        try {
+          video.currentTime = boundedSeconds;
+        } catch {
+          // Some WebViews reject seeks before metadata is ready; the next sync fixes it.
+        }
+      }
+      video.muted = true;
+      video.playsInline = true;
+      if (playing) {
+        if (video.paused) {
+          const promise = video.play();
+          promise?.catch?.((error) => {
+            if (!cancelled && error?.name !== "AbortError") {
+              markNativeVideoFailed(playbackVideoSource.key);
+            }
+          });
+        }
+      } else if (!video.paused) {
+        video.pause();
+      }
+    };
+    if (video.readyState >= 1) {
+      syncVideo();
     } else {
-      window.clearTimeout(previewTimerRef.current);
-      previewTimerRef.current = window.setTimeout(decode, PREVIEW_DEBOUNCE_MS - sinceLast);
+      video.addEventListener("loadedmetadata", syncVideo, { once: true });
     }
     return () => {
       cancelled = true;
+      video.removeEventListener("loadedmetadata", syncVideo);
     };
-  }, [activeVideoClip, playheadMs]);
+  }, [playbackVideoSource, playbackVideoTimeMs, playing, nativeVideoFailed, markNativeVideoFailed]);
 
-  // Simple real-time playback: advance the playhead; the preview follows (debounced).
+  // Decode still/scrub preview frames. Live transport playback uses the native
+  // video element above, so the backend decoder is not hammered every RAF tick.
+  // A SINGLE in-flight decode chases the latest target (coalescing), and a
+  // completed decode is never discarded.
+  useEffect(() => {
+    // A token bumps on every target change/clear; an in-flight decode whose token
+    // is stale must not paint (it would flash an old frame after a gap or source
+    // switch). Last-writer-wins is enforced per target, not per closure.
+    previewTokenRef.current += 1;
+    if (!previewFrame) {
+      pendingFrameRef.current = null;
+      if (!nativeVideoActive) {
+        setPreviewUrl("");
+        setDecodedPreviewKey("");
+      }
+      setPreviewBusy(false);
+      return;
+    }
+    pendingFrameRef.current = previewFrame;
+    if (decodeInFlightRef.current) {
+      return; // the running loop will pick up the newer target
+    }
+    decodeInFlightRef.current = true;
+    setPreviewBusy(true);
+    (async () => {
+      while (pendingFrameRef.current && mountedRef.current) {
+        const target = pendingFrameRef.current;
+        pendingFrameRef.current = null;
+        const myToken = previewTokenRef.current;
+        try {
+          const targetKey = `${target.path}|${target.timeMs}`;
+          const frame = await invoke("editor_decode_frame", {
+            path: target.path,
+            timeMs: Math.round(target.timeMs),
+          });
+          if (mountedRef.current && previewTokenRef.current === myToken) {
+            setPreviewUrl(frame?.dataUrl || "");
+            setDecodedPreviewKey(targetKey);
+          }
+        } catch {
+          if (mountedRef.current && previewTokenRef.current === myToken) {
+            setPreviewUrl("");
+            setDecodedPreviewKey(`${target.path}|${target.timeMs}`);
+          }
+        }
+      }
+      decodeInFlightRef.current = false;
+      if (mountedRef.current) {
+        setPreviewBusy(false);
+      }
+    })();
+  }, [previewKey, nativeVideoActive]);
+
+  // ---------------------------------------------------------------- audio engine
+
+  const ensureAudioCtx = useCallback(() => {
+    if (typeof window === "undefined") {
+      return null;
+    }
+    if (!audioCtxRef.current) {
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      if (!Ctx) {
+        return null;
+      }
+      audioCtxRef.current = new Ctx();
+    }
+    if (audioCtxRef.current.state === "suspended") {
+      audioCtxRef.current.resume().catch(() => {});
+    }
+    return audioCtxRef.current;
+  }, []);
+
+  const decodeClipAudioBuffer = useCallback(
+    async (path) => {
+      const cache = audioBufferCacheRef.current;
+      if (cache.has(path)) {
+        return cache.get(path);
+      }
+      const ctx = ensureAudioCtx();
+      if (!ctx) {
+        return null;
+      }
+      try {
+        const pcm = await invoke("editor_decode_audio_pcm", { path });
+        if (!pcm?.hasAudio || !pcm.data) {
+          cache.set(path, null);
+          return null;
+        }
+        const bytes = base64ToUint8(pcm.data);
+        const interleaved = new Float32Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 4));
+        const channels = Math.max(1, pcm.channels || 1);
+        const frames = Math.floor(interleaved.length / channels);
+        if (frames <= 0) {
+          cache.set(path, null);
+          return null;
+        }
+        const buffer = ctx.createBuffer(channels, frames, pcm.sampleRate || 48000);
+        for (let ch = 0; ch < channels; ch += 1) {
+          const channelData = buffer.getChannelData(ch);
+          for (let i = 0; i < frames; i += 1) {
+            channelData[i] = interleaved[i * channels + ch];
+          }
+        }
+        // Decoded buffers are large (~MBs/min). Bound the cache so a long session
+        // playing many clips doesn't grow unbounded; evict oldest insertions first.
+        while (cache.size >= MAX_AUDIO_BUFFER_CACHE) {
+          const oldest = cache.keys().next().value;
+          if (oldest === undefined || oldest === path) {
+            break;
+          }
+          cache.delete(oldest);
+        }
+        cache.set(path, buffer);
+        return buffer;
+      } catch {
+        cache.set(path, null);
+        return null;
+      }
+    },
+    [ensureAudioCtx],
+  );
+
+  const stopAudioPlayback = useCallback(() => {
+    for (const node of audioNodesRef.current) {
+      try {
+        node.source.stop();
+      } catch {
+        // already stopped
+      }
+      try {
+        node.source.disconnect();
+        node.gain.disconnect();
+      } catch {
+        // already disconnected
+      }
+    }
+    audioNodesRef.current = [];
+    audioAnchorRef.current = null;
+  }, []);
+
+  // Decode + schedule all audio that should sound from the current playhead onward,
+  // then anchor the master clock to it (audio-as-master).
+  const startAudioPlayback = useCallback(
+    async (runId) => {
+      const ctx = ensureAudioCtx();
+      if (!ctx) {
+        return;
+      }
+      const source = previewSourceRef.current;
+      const clipsToPlay =
+        source.kind === "asset"
+          ? [
+              {
+                mediaPath: source.path,
+                startMs: 0,
+                inMs: 0,
+                outMs: source.durationMs || 0,
+                durationMs: source.durationMs || 0,
+                gain: 1,
+                track: "audio",
+              },
+            ]
+          : clipsRef.current.filter(
+              (clip) => clip.track === "audio" || (clip.track === "video" && clip.hasAudio),
+            );
+      // Pre-decode every needed buffer before scheduling so the anchor matches the
+      // playhead at schedule time (no backward jump).
+      const buffers = await Promise.all(
+        clipsToPlay.map((clip) => decodeClipAudioBuffer(clip.mediaPath)),
+      );
+      if (runId !== audioRunRef.current || !audioCtxRef.current) {
+        return; // playback was paused/seeked/restarted while decoding
+      }
+      const scheduleFrom = playheadRef.current;
+      const baseCtxTime = ctx.currentTime;
+      let scheduledAny = false;
+      clipsToPlay.forEach((clip, index) => {
+        const buffer = buffers[index];
+        if (!buffer) {
+          return;
+        }
+        const len = clipLengthMs(clip);
+        const clipStart = clip.startMs ?? 0;
+        const clipEnd = clipStart + len;
+        if (clipEnd <= scheduleFrom) {
+          return;
+        }
+        const intoClipMs = Math.max(0, scheduleFrom - clipStart);
+        const offsetSec = ((clip.inMs ?? 0) + intoClipMs) / 1000;
+        if (offsetSec >= buffer.duration) {
+          return;
+        }
+        const remainMs = clipEnd - Math.max(clipStart, scheduleFrom);
+        const playDurSec = Math.min(remainMs / 1000, Math.max(0, buffer.duration - offsetSec));
+        if (playDurSec <= 0) {
+          return;
+        }
+        const playDelaySec = Math.max(0, (clipStart - scheduleFrom) / 1000);
+        const src = ctx.createBufferSource();
+        src.buffer = buffer;
+        const gainNode = ctx.createGain();
+        gainNode.gain.value = clip.gain == null ? 1 : clip.gain;
+        src.connect(gainNode).connect(ctx.destination);
+        try {
+          src.start(baseCtxTime + playDelaySec, offsetSec, playDurSec);
+        } catch {
+          return;
+        }
+        audioNodesRef.current.push({ source: src, gain: gainNode });
+        scheduledAny = true;
+      });
+      if (scheduledAny) {
+        audioAnchorRef.current = { ctxTime: baseCtxTime, playheadMs: scheduleFrom };
+      }
+    },
+    [ensureAudioCtx, decodeClipAudioBuffer],
+  );
+
+  // Real-time playback. The playhead is driven by the audio clock when audio is
+  // scheduled (master), otherwise by a wall clock. Video frames follow the playhead.
   useEffect(() => {
     if (!playing) {
+      audioRunRef.current += 1;
+      stopAudioPlayback();
+      wallAnchorRef.current = null;
       return undefined;
     }
+    const runId = (audioRunRef.current += 1);
+    wallAnchorRef.current = { perfTime: performance.now(), playheadMs: playheadRef.current };
+    startAudioPlayback(runId);
     let raf = 0;
-    let last = performance.now();
-    const tick = (now) => {
-      const delta = now - last;
-      last = now;
-      setPlayheadMs((current) => {
-        const next = current + delta;
-        if (next >= totalMs) {
-          setPlaying(false);
-          return totalMs;
-        }
-        return next;
-      });
+    const tick = () => {
+      const anchor = audioAnchorRef.current;
+      const ctx = audioCtxRef.current;
+      let next;
+      if (anchor && ctx) {
+        next = anchor.playheadMs + (ctx.currentTime - anchor.ctxTime) * 1000;
+      } else {
+        const wall = wallAnchorRef.current;
+        next = wall ? wall.playheadMs + (performance.now() - wall.perfTime) : playheadRef.current;
+      }
+      if (next >= effectiveTotalMs) {
+        setPlayheadMs(effectiveTotalMs);
+        setPlaying(false);
+        return;
+      }
+      setPlayheadMs(Math.max(0, next));
       raf = window.requestAnimationFrame(tick);
     };
     raf = window.requestAnimationFrame(tick);
-    return () => window.cancelAnimationFrame(raf);
-  }, [playing, totalMs]);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      audioRunRef.current += 1;
+      stopAudioPlayback();
+      wallAnchorRef.current = null;
+    };
+  }, [
+    playing,
+    playbackRun,
+    effectiveTotalMs,
+    startAudioPlayback,
+    stopAudioPlayback,
+    playbackVideoSource?.key,
+  ]);
+
+  // Click a media tile's play button: load it into the viewer and play it.
+  const previewAsset = useCallback(async (item) => {
+    setPlaying(false);
+    let durationMs = probesRef.current[item.path]?.durationMs || 0;
+    if (!durationMs) {
+      try {
+        const probe = await invoke("editor_probe_media", { path: item.path });
+        durationMs = probe?.durationMs || 0;
+      } catch {
+        durationMs = 0;
+      }
+    }
+    if (!mountedRef.current) {
+      return;
+    }
+    const nextSource = { kind: "asset", path: item.path, name: item.name, durationMs };
+    previewSourceRef.current = nextSource;
+    playheadRef.current = 0;
+    setPreviewSource(nextSource);
+    setPlayheadMs(0);
+    setPlaybackRun((run) => run + 1);
+    setPlaying(true);
+  }, []);
+
+  const backToTimeline = useCallback(() => {
+    setPlaying(false);
+    setPreviewSource({ kind: "timeline" });
+    setPlayheadMs(0);
+  }, []);
 
   // Native OS drag-and-drop of files onto the workbench.
   useEffect(() => {
@@ -1656,11 +2076,27 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     setPlayheadMs((current) => Math.max(0, Math.round(current + deltaMs)));
   }, []);
 
+  const togglePlayback = useCallback(() => {
+    if (playingRef.current) {
+      setPlaying(false);
+      return;
+    }
+    const total = Math.max(0, effectiveTotalMsRef.current || 0);
+    if (total > 0 && playheadRef.current >= total - 1) {
+      playheadRef.current = 0;
+      setPlayheadMs(0);
+    }
+    setPlaybackRun((run) => run + 1);
+    setPlaying(true);
+  }, []);
+
   // Keep refs in sync with fast-changing state so the lifetime listeners and the
   // keyboard handler read fresh values without re-subscribing.
-  useEffect(() => {
+  useLayoutEffect(() => {
     clipsRef.current = clips;
     playheadRef.current = playheadMs;
+    playingRef.current = playing;
+    effectiveTotalMsRef.current = effectiveTotalMs;
     selectionRef.current = selection;
     activeClipRef.current = activeClipId;
     selectedClipIdsRef.current = selectedClipIds;
@@ -1672,6 +2108,7 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     mediaSubpathRef.current = mediaSubpath;
     ppsRef.current = pxPerSecond;
     toolRef.current = tool;
+    previewSourceRef.current = previewSource;
   });
 
   // Persist zoom across sessions.
@@ -2037,7 +2474,7 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
       switch (event.key) {
         case " ":
           event.preventDefault();
-          setPlaying((value) => !value);
+          togglePlayback();
           break;
         case "ArrowLeft":
           event.preventDefault();
@@ -2056,7 +2493,9 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
           event.preventDefault();
           setPlaying(false);
           setPlayheadMs(
-            clipsRef.current.reduce((m, c) => Math.max(m, (c.startMs ?? 0) + clipLengthMs(c)), 0),
+            previewSourceRef.current.kind === "asset"
+              ? Math.max(0, previewSourceRef.current.durationMs || 0)
+              : clipsRef.current.reduce((m, c) => Math.max(m, (c.startMs ?? 0) + clipLengthMs(c)), 0),
           );
           break;
         case "s":
@@ -2091,7 +2530,16 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [loadState, doUndo, doRedo, nudgePlayhead, splitActiveClip, deleteSelectionOrActive, rippleDeleteSelection]);
+  }, [
+    loadState,
+    doUndo,
+    doRedo,
+    nudgePlayhead,
+    togglePlayback,
+    splitActiveClip,
+    deleteSelectionOrActive,
+    rippleDeleteSelection,
+  ]);
 
   const beginDrag = useCallback((event, descriptor) => {
     event.preventDefault();
@@ -2195,6 +2643,10 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
       const ms = Math.max(0, Math.round(pxToMs(event.clientX - rect.left, ppsRef.current)));
       setPlaying(false);
       setSelection(null);
+      // Scrubbing the timeline ruler returns the viewer to the timeline source.
+      if (previewSourceRef.current.kind !== "timeline") {
+        setPreviewSource({ kind: "timeline" });
+      }
       setPlayheadMs(ms);
       beginDrag(event, { type: "playhead", origPlayhead: ms });
     },
@@ -2374,7 +2826,19 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
             <Description aria-hidden="true" />
           )}
           {item.kind === "video" && (
-            <TilePlay aria-hidden="true">
+            <TilePlay
+              as="button"
+              data-interactive="true"
+              aria-label={`Preview ${item.name}`}
+              onClick={(event) => {
+                event.stopPropagation();
+                previewAsset(item);
+              }}
+              onDoubleClick={(event) => event.stopPropagation()}
+              onPointerDown={(event) => event.stopPropagation()}
+              title="Preview in viewer"
+              type="button"
+            >
               <PlayArrow />
             </TilePlay>
           )}
@@ -2809,8 +3273,33 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
               <ColHandle />
               <PanelBox id="player" minSize="32%">
                 <ViewerPane aria-label="WebM viewer">
+            {previewSource.kind === "asset" && (
+              <ViewerSourceBar>
+                <ViewerSourceName title={previewSource.name}>
+                  Previewing {previewSource.name || "asset"}
+                </ViewerSourceName>
+                <ViewerSourceBack onClick={backToTimeline} type="button">
+                  <ButtonIcon as={ArrowBack} aria-hidden="true" />
+                  <span>Timeline</span>
+                </ViewerSourceBack>
+              </ViewerSourceBar>
+            )}
             <ViewerFrame>
-              {previewUrl ? (
+              {previewVideoVisible && playbackVideoSource ? (
+                <PreviewVideo
+                  key={playbackVideoSource.key}
+                  ref={previewVideoRef}
+                  aria-label="Playing preview"
+                  controls={false}
+                  disablePictureInPicture
+                  muted
+                  onError={() => markNativeVideoFailed(playbackVideoSource.key)}
+                  playsInline
+                  poster={previewUrl || undefined}
+                  preload="auto"
+                  src={playbackVideoSource.src}
+                />
+              ) : previewUrl ? (
                 <PreviewImg alt="Preview frame" src={previewUrl} />
               ) : (
                 <ViewerEmpty>
@@ -2818,15 +3307,19 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
                     <Videocam />
                   </ViewerGlyph>
                   <ViewerEmptyText>{previewBusy ? "Decoding…" : "No frame at playhead"}</ViewerEmptyText>
-                  <ViewerEmptyHint>Add a clip and move the playhead to preview.</ViewerEmptyHint>
+                  <ViewerEmptyHint>
+                    {previewSource.kind === "asset"
+                      ? "Press play to preview this asset."
+                      : "Add a clip and move the playhead to preview."}
+                  </ViewerEmptyHint>
                 </ViewerEmpty>
               )}
             </ViewerFrame>
             <TransportBar>
               <TransportButton
                 aria-label={playing ? "Pause" : "Play"}
-                disabled={totalMs <= 0}
-                onClick={() => setPlaying((value) => !value)}
+                disabled={effectiveTotalMs <= 0}
+                onClick={togglePlayback}
                 title={playing ? "Pause" : "Play"}
                 type="button"
               >
@@ -2835,7 +3328,7 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
               <TransportTime>
                 <TimecodeNow>{formatDuration(playheadMs)}</TimecodeNow>
                 <TransportSep>/</TransportSep>
-                {formatDuration(totalMs)}
+                {formatDuration(effectiveTotalMs)}
               </TransportTime>
             </TransportBar>
                 </ViewerPane>
@@ -3192,8 +3685,8 @@ function VirtualMediaGrid({
   renderItem,
   emptyState,
   minTile = MEDIA_TILE_MIN_PX,
-  gap = 10,
-  labelHeight = 30,
+  gap = 7,
+  labelHeight = 17,
   overscanRows = 2,
 }) {
   const scrollRef = useRef(null);
@@ -3219,8 +3712,12 @@ function VirtualMediaGrid({
   const PAD = 10;
   const layout = useMemo(() => {
     const avail = Math.max(0, box.width - PAD * 2);
-    const cols = Math.max(1, Math.floor((avail + gap) / (minTile + gap)));
-    const cellW = Math.max(minTile, Math.floor((avail - gap * (cols - 1)) / cols));
+    // minTile is the TARGET tile size, not a floor: pick the column count whose
+    // resulting cell width lands closest to it (round, not floor), then split the
+    // width evenly. This keeps tiles ~minTile instead of stretching to fill the
+    // column — a wider panel gets more columns rather than bigger tiles.
+    const cols = Math.max(1, Math.round((avail + gap) / (minTile + gap)));
+    const cellW = Math.max(36, Math.floor((avail - gap * (cols - 1)) / cols));
     const rowHeight = cellW + labelHeight + gap;
     const rows = Math.ceil(items.length / cols);
     return { cols, cellW, rowHeight, rows, totalHeight: rows * rowHeight + PAD * 2 };
@@ -3919,15 +4416,15 @@ const FolderPane = styled.aside`
 const PaneHeader = styled.div`
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 12px 14px;
+  gap: 6px;
+  padding: 4px 9px;
   border-bottom: 1px solid var(--forge-border);
 `;
 
 const PaneHeaderIcon = styled.span`
   display: inline-flex;
-  width: 16px;
-  height: 16px;
+  width: 13px;
+  height: 13px;
   color: var(--forge-text-muted);
 
   svg {
@@ -3956,14 +4453,14 @@ const MediaBreadcrumb = styled.div`
 const Crumb = styled.button`
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: 4px;
   max-width: 140px;
-  padding: 3px 6px;
+  padding: 2px 5px;
   border: none;
-  border-radius: 6px;
+  border-radius: 5px;
   background: transparent;
   color: var(--forge-text-muted);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.02em;
   text-transform: uppercase;
@@ -3994,7 +4491,7 @@ const CrumbSep = styled.span`
 const PaneHeaderActions = styled.div`
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   margin-left: auto;
   flex: 0 0 auto;
 `;
@@ -4003,17 +4500,17 @@ const PaneIconButton = styled.button`
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 30px;
+  width: 22px;
+  height: 22px;
   border: 1px solid var(--forge-border-strong);
-  border-radius: 8px;
+  border-radius: 6px;
   background: var(--forge-surface-control);
   color: var(--forge-text-soft);
   transition: border-color var(--ed-anim-hover) ease, color var(--ed-anim-hover) ease;
 
   svg {
-    width: 17px;
-    height: 17px;
+    width: 13px;
+    height: 13px;
   }
 
   &:hover {
@@ -4025,19 +4522,19 @@ const PaneIconButton = styled.button`
 const ImportButton = styled.button`
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 11px;
+  gap: 5px;
+  padding: 4px 8px;
   border: 1px solid var(--forge-border-strong);
-  border-radius: 8px;
+  border-radius: 6px;
   background: var(--forge-surface-control);
   color: var(--forge-text-soft);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
   transition: border-color 150ms ease, color 150ms ease;
 
   svg {
-    width: 15px;
-    height: 15px;
+    width: 12px;
+    height: 12px;
   }
 
   &:hover:not(:disabled) {
@@ -4062,18 +4559,18 @@ const FolderEmpty = styled.div`
   color: var(--forge-text-disabled);
 
   svg {
-    width: 30px;
-    height: 30px;
+    width: 24px;
+    height: 24px;
     color: var(--forge-text-muted);
   }
 
   span {
-    font-size: 13px;
+    font-size: 12px;
     color: var(--forge-text-soft);
   }
 
   small {
-    font-size: 11.5px;
+    font-size: 11px;
   }
 `;
 
@@ -4089,7 +4586,7 @@ const MediaTile = styled.div`
   position: relative;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 3px;
   height: 100%;
   cursor: grab;
   user-select: none;
@@ -4119,7 +4616,7 @@ const TileThumb = styled.div`
   align-items: center;
   justify-content: center;
   border: 1px solid var(--forge-border);
-  border-radius: 10px;
+  border-radius: 7px;
   overflow: hidden;
   background: radial-gradient(circle at 50% 40%, rgba(13, 17, 23, 0.5), rgba(2, 3, 4, 0.92));
   transition:
@@ -4127,8 +4624,8 @@ const TileThumb = styled.div`
     box-shadow var(--ed-anim-hover) ease;
 
   & > svg {
-    width: 34%;
-    height: 34%;
+    width: 44%;
+    height: 44%;
     color: var(--forge-text-muted);
   }
 
@@ -4161,37 +4658,52 @@ const TilePlay = styled.span`
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 34px;
-  height: 34px;
+  width: 22px;
+  height: 22px;
+  padding: 0;
   border-radius: 999px;
   background: rgba(2, 4, 8, 0.55);
   border: 1px solid rgba(255, 255, 255, 0.5);
+  color: #ffffff;
   pointer-events: none;
+  transition: background 150ms ease, transform 150ms ease;
 
   svg {
-    width: 20px;
-    height: 20px;
+    width: 13px;
+    height: 13px;
     color: #ffffff;
+  }
+
+  /* The media-tile variant is a real button (preview); the rest stay decorative. */
+  &[data-interactive="true"] {
+    pointer-events: auto;
+    cursor: pointer;
+  }
+
+  &[data-interactive="true"]:hover {
+    background: rgba(var(--forge-accent-rgb), 0.85);
+    transform: translate(-50%, -50%) scale(1.08);
   }
 `;
 
 const TileConvertButton = styled.button`
   position: absolute;
-  left: 8px;
-  right: 8px;
-  bottom: 8px;
+  left: 5px;
+  right: 5px;
+  bottom: 5px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  min-height: 28px;
-  padding: 0 8px;
+  min-height: 18px;
+  padding: 0 5px;
   border: 1px solid rgba(255, 255, 255, 0.28);
-  border-radius: 6px;
+  border-radius: 5px;
   background: rgba(2, 4, 8, 0.76);
   color: #ffffff;
-  font-size: 11px;
+  font-size: 8.5px;
   font-weight: 700;
-  line-height: 1.15;
+  line-height: 1.1;
+  white-space: nowrap;
   opacity: 0;
   transform: translateY(5px);
   transition:
@@ -4215,9 +4727,9 @@ const TileConvertButton = styled.button`
 
 const TileLabel = styled.span`
   flex: 0 0 auto;
-  font-size: 11.5px;
+  font-size: 9.5px;
   color: var(--forge-text-soft);
-  line-height: 1.3;
+  line-height: 1.25;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4226,13 +4738,13 @@ const TileLabel = styled.span`
 
 const TileDelete = styled.button`
   position: absolute;
-  top: 6px;
-  right: 6px;
+  top: 4px;
+  right: 4px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 22px;
-  height: 22px;
+  width: 16px;
+  height: 16px;
   border: none;
   border-radius: 999px;
   background: rgba(2, 4, 8, 0.6);
@@ -4245,8 +4757,8 @@ const TileDelete = styled.button`
     background 120ms ease;
 
   svg {
-    width: 14px;
-    height: 14px;
+    width: 10px;
+    height: 10px;
   }
 
   ${MediaTile}:hover & {
@@ -4264,21 +4776,21 @@ const MediaDragGhost = styled.div`
   z-index: 60;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  max-width: 220px;
-  padding: 6px 10px;
+  gap: 6px;
+  max-width: 200px;
+  padding: 5px 8px;
   border: 1px solid var(--forge-accent-selected-border);
-  border-radius: 8px;
+  border-radius: 7px;
   background: var(--forge-surface-raised);
   color: var(--forge-text);
-  font-size: 12px;
+  font-size: 10.5px;
   font-weight: 600;
   box-shadow: 0 12px 26px rgba(2, 6, 23, 0.55);
   pointer-events: none;
 
   svg {
-    width: 15px;
-    height: 15px;
+    width: 12px;
+    height: 12px;
     flex: 0 0 auto;
     color: var(--forge-accent-soft);
   }
@@ -4395,15 +4907,15 @@ const GeneratingOverlay = styled.div`
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: 5px;
   color: var(--forge-text-soft);
-  font-size: 11px;
+  font-size: 9px;
   font-weight: 600;
 `;
 
 const GeneratingBar = styled.span`
   width: 60%;
-  height: 4px;
+  height: 3px;
   border-radius: 999px;
   background: linear-gradient(
     90deg,
@@ -4422,8 +4934,8 @@ const ConversionOverlay = styled.div`
   flex-direction: column;
   align-items: stretch;
   justify-content: center;
-  gap: 7px;
-  padding: 14px;
+  gap: 4px;
+  padding: 7px;
   background: linear-gradient(180deg, rgba(2, 4, 8, 0.52), rgba(2, 4, 8, 0.86));
   color: #ffffff;
   text-align: left;
@@ -4432,7 +4944,7 @@ const ConversionOverlay = styled.div`
 const ConversionStage = styled.span`
   display: block;
   min-width: 0;
-  font-size: 11px;
+  font-size: 9px;
   font-weight: 800;
   line-height: 1.2;
   overflow: hidden;
@@ -4443,7 +4955,7 @@ const ConversionStage = styled.span`
 const ConversionProgressTrack = styled.span`
   display: block;
   width: 100%;
-  height: 5px;
+  height: 3px;
   border-radius: 999px;
   overflow: hidden;
   background: rgba(255, 255, 255, 0.18);
@@ -4459,7 +4971,7 @@ const ConversionProgressFill = styled.span`
 `;
 
 const ConversionPercent = styled.span`
-  font-size: 11px;
+  font-size: 9px;
   font-weight: 700;
   color: rgba(255, 255, 255, 0.78);
 `;
@@ -4926,6 +5438,47 @@ const ViewerPane = styled.div`
   gap: 12px;
 `;
 
+const ViewerSourceBar = styled.div`
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--forge-accent-selected-border);
+  border-radius: 9px;
+  background: rgba(var(--forge-accent-rgb), 0.1);
+`;
+
+const ViewerSourceName = styled.span`
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--forge-text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const ViewerSourceBack = styled.button`
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 10px;
+  border: 1px solid var(--forge-border-strong);
+  border-radius: 7px;
+  background: var(--forge-surface-control);
+  color: var(--forge-text-soft);
+  font-size: 12px;
+  font-weight: 600;
+
+  &:hover {
+    color: var(--forge-text);
+    border-color: var(--forge-accent-selected-border);
+  }
+`;
+
 const ViewerFrame = styled.div`
   position: relative;
   flex: 1 1 auto;
@@ -4940,6 +5493,12 @@ const ViewerFrame = styled.div`
 `;
 
 const PreviewImg = styled.img`
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+`;
+
+const PreviewVideo = styled.video`
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;

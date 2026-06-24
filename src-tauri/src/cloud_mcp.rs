@@ -77,11 +77,17 @@ const CLOUD_MCP_CREDIT_METER_COORDINATION_TASK: &str = "coordination.task";
 const CLOUD_MCP_CREDIT_METER_TODO_CREATED: &str = "todo.created";
 const CLOUD_MCP_CREDIT_METER_PLAN_CREATED: &str = "plan.created";
 const CLOUD_MCP_CREDIT_METER_ASSET_TRANSFER: &str = "asset.transfer";
+const CLOUD_MCP_CREDIT_METER_EDITOR_MEDIA_CONVERSION_TRANSFER: &str =
+    "editor.media_conversion.transfer";
 const CLOUD_MCP_CREDIT_METER_RENAMES: &[(&str, &str)] = &[
     ("task_created", CLOUD_MCP_CREDIT_METER_COORDINATION_TASK),
     ("todo_created", CLOUD_MCP_CREDIT_METER_TODO_CREATED),
     ("plan_created", CLOUD_MCP_CREDIT_METER_PLAN_CREATED),
     ("asset_transfer_mb", CLOUD_MCP_CREDIT_METER_ASSET_TRANSFER),
+    (
+        "editor_media_conversion_transfer_mb",
+        CLOUD_MCP_CREDIT_METER_EDITOR_MEDIA_CONVERSION_TRANSFER,
+    ),
 ];
 const CLOUD_MCP_OUTBOX_DB_FILE: &str = "cloud-sync-outbox.sqlite";
 const CLOUD_MCP_OUTBOX_TABLE: &str = "cloud_sync_outbox";
@@ -1474,11 +1480,16 @@ fn cloud_mcp_asset_transfer_status_is_billable(status: &str) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cloud_mcp_record_diffforge_asset_transfer_credit(
+fn cloud_mcp_record_diffforge_transfer_credit(
+    meter: &str,
+    entity_type: &str,
+    reason: &str,
+    description_title: &str,
+    event_dedupe_prefix: &str,
     source: &str,
     repo_id: Option<&str>,
     workspace_id: Option<&str>,
-    asset_id: &str,
+    entity_id: &str,
     transfer_id: &str,
     cloud_id: &str,
     direction: &str,
@@ -1496,14 +1507,19 @@ fn cloud_mcp_record_diffforge_asset_transfer_credit(
     } else {
         cloud_id.trim()
     };
-    let event_dedupe_key = format!("{scope_key}:asset_transfer_bytes:{cloud_id}:{transfer_id}");
     let now = cloud_mcp_rfc3339_now();
     let now_ms = cloud_mcp_now_ms() as i64;
+    let entity_id = entity_id.trim();
+    let direction = direction.trim().to_ascii_lowercase();
     let metadata = json!({
-        "meter": CLOUD_MCP_CREDIT_METER_ASSET_TRANSFER,
+        "meter": meter,
         "source": source,
-        "asset_id": asset_id,
-        "assetId": asset_id,
+        "entity_type": entity_type,
+        "entityType": entity_type,
+        "entity_id": entity_id,
+        "entityId": entity_id,
+        "asset_id": entity_id,
+        "assetId": entity_id,
         "transfer_id": transfer_id,
         "transferId": transfer_id,
         "cloud_id": cloud_id,
@@ -1513,6 +1529,7 @@ fn cloud_mcp_record_diffforge_asset_transfer_credit(
         "bytes_per_credit": CLOUD_MCP_CREDIT_TRANSFER_BYTES_PER_CREDIT,
         "bytesPerCredit": CLOUD_MCP_CREDIT_TRANSFER_BYTES_PER_CREDIT,
     });
+    let event_dedupe_key = format!("{scope_key}:{event_dedupe_prefix}:{cloud_id}:{transfer_id}");
     let metadata_json = serde_json::to_string(&metadata).unwrap_or_else(|_| "{}".to_string());
     conn.execute_batch("BEGIN IMMEDIATE").map_err(|error| {
         format!("Unable to start Diff Forge transfer billing transaction: {error}")
@@ -1530,7 +1547,7 @@ fn cloud_mcp_record_diffforge_asset_transfer_credit(
                     transfer_id,
                     direction,
                     bytes,
-                    asset_id,
+                    entity_id,
                     workspace_id.unwrap_or_default(),
                     repo_id.unwrap_or_default(),
                     source,
@@ -1571,19 +1588,19 @@ fn cloud_mcp_record_diffforge_asset_transfer_credit(
             let mb_start = previous_billed + 1;
             let mb_end = next_billed;
             let dedupe =
-                format!("{scope_key}:asset.transfer:{cloud_id}:{transfer_id}:{mb_start}-{mb_end}");
+                format!("{scope_key}:{meter}:{cloud_id}:{transfer_id}:{mb_start}-{mb_end}");
             let description = format!(
-                "Asset transfer · {} MB · {} {} bytes",
+                "{description_title} · {} MB · {} {} bytes",
                 credits_to_bill, direction, bytes
             );
             cloud_mcp_record_diffforge_credit_ledger_row(
                 &conn,
-                CLOUD_MCP_CREDIT_METER_ASSET_TRANSFER,
-                "asset_transfer",
+                meter,
+                entity_type,
                 transfer_id,
                 credits_to_bill,
                 bytes,
-                "Asset transfer",
+                reason,
                 &description,
                 workspace_id,
                 repo_id,
@@ -1606,6 +1623,62 @@ fn cloud_mcp_record_diffforge_asset_transfer_credit(
             Err(error)
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cloud_mcp_record_diffforge_asset_transfer_credit(
+    source: &str,
+    repo_id: Option<&str>,
+    workspace_id: Option<&str>,
+    asset_id: &str,
+    transfer_id: &str,
+    cloud_id: &str,
+    direction: &str,
+    bytes: i64,
+) -> Result<i64, String> {
+    cloud_mcp_record_diffforge_transfer_credit(
+        CLOUD_MCP_CREDIT_METER_ASSET_TRANSFER,
+        "asset_transfer",
+        "Asset transfer",
+        "Asset transfer",
+        "asset_transfer_bytes",
+        source,
+        repo_id,
+        workspace_id,
+        asset_id,
+        transfer_id,
+        cloud_id,
+        direction,
+        bytes,
+    )
+}
+
+fn cloud_mcp_record_diffforge_editor_media_conversion_transfer_credit(
+    job_id: &str,
+    direction: &str,
+    bytes: i64,
+) -> Result<i64, String> {
+    let job_id = job_id.trim();
+    if job_id.is_empty() {
+        return Ok(0);
+    }
+    let direction = direction.trim().to_ascii_lowercase();
+    let transfer_id = format!("editor-media-conversion-{job_id}-{direction}");
+    cloud_mcp_record_diffforge_transfer_credit(
+        CLOUD_MCP_CREDIT_METER_EDITOR_MEDIA_CONVERSION_TRANSFER,
+        "editor_media_conversion_transfer",
+        "Editor WebM Conversion Transfer",
+        "Editor WebM Conversion Transfer",
+        "editor_media_conversion_transfer_bytes",
+        "editor.media_conversion.transfer",
+        None,
+        None,
+        job_id,
+        &transfer_id,
+        "diffforge-editor-cloud-convert",
+        &direction,
+        bytes,
+    )
 }
 
 fn cloud_mcp_credit_ledger_row_from_sql(row: &rusqlite::Row<'_>) -> rusqlite::Result<Value> {
@@ -46515,14 +46588,41 @@ mod cloud_mcp_tests {
             .unwrap(),
             0
         );
+        assert_eq!(
+            cloud_mcp_record_diffforge_editor_media_conversion_transfer_credit(
+                "editor-job-1",
+                "upload",
+                400_000,
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            cloud_mcp_record_diffforge_editor_media_conversion_transfer_credit(
+                "editor-job-1",
+                "download",
+                700_000,
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            cloud_mcp_record_diffforge_editor_media_conversion_transfer_credit(
+                "editor-job-1",
+                "download",
+                700_000,
+            )
+            .unwrap(),
+            0
+        );
 
         let summary = cloud_mcp_diffforge_credit_ledger_summary(20);
-        assert_eq!(summary["totalCredits"].as_i64(), Some(5));
-        assert_eq!(summary["transfer"]["totalBytes"].as_i64(), Some(1_100_000));
-        assert_eq!(summary["transfer"]["billedCredits"].as_i64(), Some(1));
+        assert_eq!(summary["totalCredits"].as_i64(), Some(6));
+        assert_eq!(summary["transfer"]["totalBytes"].as_i64(), Some(2_200_000));
+        assert_eq!(summary["transfer"]["billedCredits"].as_i64(), Some(2));
         assert_eq!(
             summary["transfer"]["remainderBytes"].as_i64(),
-            Some(100_000)
+            Some(200_000)
         );
 
         let by_meter = summary["byMeter"].as_array().unwrap();
@@ -46537,6 +46637,18 @@ mod cloud_mcp_tests {
         assert_eq!(meter_credits(CLOUD_MCP_CREDIT_METER_PLAN_CREATED), 1);
         assert_eq!(meter_credits(CLOUD_MCP_CREDIT_METER_COORDINATION_TASK), 1);
         assert_eq!(meter_credits(CLOUD_MCP_CREDIT_METER_ASSET_TRANSFER), 1);
+        assert_eq!(
+            meter_credits(CLOUD_MCP_CREDIT_METER_EDITOR_MEDIA_CONVERSION_TRANSFER),
+            1
+        );
+        let items = summary["items"].as_array().unwrap();
+        assert!(items.iter().any(|item| {
+            item["meter"].as_str() == Some(CLOUD_MCP_CREDIT_METER_EDITOR_MEDIA_CONVERSION_TRANSFER)
+                && item["reason"].as_str() == Some("Editor WebM Conversion Transfer")
+                && item["description"].as_str().is_some_and(|description| {
+                    description.contains("Editor WebM Conversion Transfer")
+                })
+        }));
 
         let merged = cloud_mcp_merge_diffforge_credit_ledger(
             json!({"credits": {"used_credits": 99}}),
@@ -46544,7 +46656,7 @@ mod cloud_mcp_tests {
         );
         assert_eq!(
             merged["credits"]["localMeteredUsedCredits"].as_i64(),
-            Some(5)
+            Some(6)
         );
         assert_eq!(
             merged["credits"]["usageHistory"].as_array().map(Vec::len),

@@ -1407,6 +1407,11 @@ where
         ))
         .await
         .map_err(|error| format!("Unable to finalize MP4 conversion upload: {error}"))?;
+    let _ = cloud_mcp_record_diffforge_editor_media_conversion_transfer_credit(
+        job_id,
+        "upload",
+        sent.min(i64::MAX as u64) as i64,
+    );
     Ok(sha256)
 }
 
@@ -1562,6 +1567,11 @@ where
                         tokio::fs::rename(partial_path, target_path)
                             .await
                             .map_err(|error| format!("Unable to save converted WebM: {error}"))?;
+                        let _ = cloud_mcp_record_diffforge_editor_media_conversion_transfer_credit(
+                            job_id,
+                            "download",
+                            downloaded.min(i64::MAX as u64) as i64,
+                        );
                         editor_emit_media_conversion(
                             app,
                             json!({
@@ -2405,4 +2415,115 @@ async fn editor_waveform(path: String) -> Result<EditorWaveform, String> {
     tauri::async_runtime::spawn_blocking(move || editor_waveform_blocking(&path))
         .await
         .map_err(|error| format!("Waveform task failed: {error}"))
+}
+
+// ----------------------------------------------------------- audio PCM (preview)
+
+#[derive(Serialize, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+struct EditorAudioPcm {
+    sample_rate: u32,
+    channels: u32,
+    frames: u64,
+    has_audio: bool,
+    /// Interleaved f32 little-endian samples, base64-encoded. Empty when the clip
+    /// has no decodable Opus audio.
+    data: String,
+}
+
+/// Decode a clip's embedded Opus audio to interleaved 48 kHz f32 PCM (base64) for
+/// Web Audio playback. Mirrors the waveform decoder but keeps every sample. Capped
+/// to a safe duration; returns empty audio on any failure so playback degrades to
+/// video-only rather than erroring.
+fn editor_decode_audio_pcm_compute(path: &str) -> Result<EditorAudioPcm, String> {
+    const MAX_FRAMES: u64 = 48_000 * 600; // 10 minutes safety cap
+    let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
+    let mut mkv = MatroskaFile::open(file).map_err(|e| format!("read: {e}"))?;
+
+    let mut audio_track = 0u64;
+    let mut channels = 1u32;
+    let mut is_opus = false;
+    for track in mkv.tracks() {
+        if track.track_type() == TrackType::Audio {
+            audio_track = track.track_number().get();
+            if let Some(a) = track.audio() {
+                channels = a.channels().get() as u32;
+            }
+            is_opus = track.codec_id().to_uppercase().contains("OPUS");
+            break;
+        }
+    }
+    if audio_track == 0 || !is_opus {
+        return Err("no Opus audio track".to_string());
+    }
+
+    let dec_channels = channels.clamp(1, 2) as i32;
+    let mut err: i32 = 0;
+    let decoder = unsafe { unsafe_libopus::opus_decoder_create(48000, dec_channels, &mut err) };
+    if decoder.is_null() || err != 0 {
+        return Err("opus decoder create failed".to_string());
+    }
+    struct DecGuard(*mut unsafe_libopus::OpusDecoder);
+    impl Drop for DecGuard {
+        fn drop(&mut self) {
+            unsafe { unsafe_libopus::opus_decoder_destroy(self.0) };
+        }
+    }
+    let _guard = DecGuard(decoder);
+
+    const MAX_FRAME: usize = 5760; // 120 ms @ 48 kHz
+    let mut pcm = vec![0f32; MAX_FRAME * dec_channels as usize];
+    let mut samples: Vec<f32> = Vec::new();
+    let mut total_frames: u64 = 0;
+
+    let mut frame = MkvFrame::default();
+    while mkv
+        .next_frame(&mut frame)
+        .map_err(|e| format!("read frame: {e}"))?
+    {
+        if frame.track != audio_track {
+            continue;
+        }
+        let decoded = unsafe {
+            unsafe_libopus::opus_decode_float(
+                decoder,
+                frame.data.as_ptr(),
+                frame.data.len() as i32,
+                pcm.as_mut_ptr(),
+                MAX_FRAME as i32,
+                0,
+            )
+        };
+        if decoded <= 0 {
+            continue;
+        }
+        let decoded = decoded as usize;
+        let count = decoded * dec_channels as usize;
+        samples.extend_from_slice(&pcm[..count]);
+        total_frames += decoded as u64;
+        if total_frames >= MAX_FRAMES {
+            break;
+        }
+    }
+
+    let mut bytes = Vec::with_capacity(samples.len() * 4);
+    for sample in &samples {
+        bytes.extend_from_slice(&sample.to_le_bytes());
+    }
+    Ok(EditorAudioPcm {
+        sample_rate: 48000,
+        channels: dec_channels as u32,
+        frames: total_frames,
+        has_audio: total_frames > 0,
+        data: general_purpose::STANDARD.encode(&bytes),
+    })
+}
+
+#[tauri::command]
+async fn editor_decode_audio_pcm(path: String) -> Result<EditorAudioPcm, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        editor_decode_audio_pcm_compute(&path).unwrap_or_default()
+    })
+    .await
+    .map_err(|error| format!("Audio decode task failed: {error}"))
 }

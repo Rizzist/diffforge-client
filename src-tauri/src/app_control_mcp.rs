@@ -211,18 +211,56 @@ async fn handle_app_control_mcp_bridge_connection(
         return Ok(());
     }
 
-    if request.tool == "list_local_scripts" {
-        let response = match local_scripts_list(Some(json!({ "include_content": false }))).await {
-            Ok(result) => json!({
-                "ok": true,
-                "data": {
-                    "inventory": result,
-                },
-            }),
+    if request.tool == "list_local_scripts" || request.tool == "list_scripts" {
+        let include_content = request
+            .input
+            .get("include_content")
+            .or_else(|| request.input.get("includeContent"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let response = match local_scripts_list(Some(json!({ "include_content": include_content }))).await {
+            Ok(result) => {
+                let scripts = result.get("scripts").cloned().unwrap_or_else(|| json!([]));
+                let count = scripts.as_array().map(|scripts| scripts.len()).unwrap_or(0);
+                let root = result.get("root").cloned().unwrap_or_else(|| json!(""));
+                json!({
+                    "ok": true,
+                    "data": {
+                        "count": count,
+                        "inventory": result,
+                        "root": root,
+                        "scripts": scripts,
+                    },
+                })
+            }
             Err(error) => json!({
                 "ok": false,
                 "error": {
                     "code": "local_scripts_list_failed",
+                    "message": error,
+                },
+            }),
+        };
+        write_app_control_mcp_bridge_response(&mut stream, response).await?;
+        return Ok(());
+    }
+
+    if request.tool == "get_script" {
+        let response = match local_scripts_read(request.input).await {
+            Ok(result) => {
+                let script = result.get("script").cloned().unwrap_or_else(|| result.clone());
+                json!({
+                    "ok": true,
+                    "data": {
+                        "result": result,
+                        "script": script,
+                    },
+                })
+            }
+            Err(error) => json!({
+                "ok": false,
+                "error": {
+                    "code": "local_script_not_found",
                     "message": error,
                 },
             }),
@@ -485,16 +523,52 @@ fn app_control_mcp_tools() -> Vec<Value> {
     vec![
         json!({
             "name": "get_state",
-            "description": "Return the current Diff Forge app view, selected workspace, active workspace, localScripts inventory, available navigation targets, and a compact visible-context summary. Call this before app-control actions when the target tab, workspace, document, script, or selection is unclear.",
+            "description": "Return the current Diff Forge app view, selected workspace, active workspace, compact accountDocs and localScripts inventories, available navigation targets, and a compact visible-context summary. Call this before app-control actions when the target tab, workspace, document, script, or selection is unclear.",
             "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
         }),
         json!({
             "name": "get_visible_context",
-            "description": "Return the currently visible Diff Forge context, including selected Tools document or local script metadata, highlighted range, and state.localScripts inventory when available. Use this first for prompts like explain this skill, create a draft here, modify/delete this selection, run a local script, or what is selected. Use localPath only for direct file edits when appropriate. For unsaved Tools document drafts, use update_selected_document; for unsaved local scripts, use update_selected_script.",
+            "description": "Return the currently visible Diff Forge context, including selected Tools document or local script metadata, highlighted range, and compact state inventories when available. Use this first for prompts like explain this selected skill, create a draft here, modify/delete this selection, run the selected local script, or what is selected. For background inventory questions that should not disturb the user's view, use list_docs/list_scripts instead. Use localPath only for direct file edits when appropriate. For unsaved Tools document drafts, use update_selected_document; for unsaved local scripts, use update_selected_script.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "includeContent": {"type": "boolean", "description": "When true, include any small in-memory draft preview the UI can safely expose."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "list_docs",
+            "description": "Return the account Tools documents inventory in the background without changing the visible tab, active view, selected document, or highlighted range. Use this for questions like how many docs exist, list docs, find a document by name/path, or compare docs while the user keeps working elsewhere.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "refresh": {"type": "boolean", "description": "When true, force a Cloud/cache refresh before returning cached inventory."},
+                    "includeContent": {"type": "boolean", "description": "When true, include only already cached inline document content. This does not hydrate every document."},
+                    "includeDrafts": {"type": "boolean", "description": "When true or omitted, include the current unsaved document draft as a draft item when present."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "get_doc",
+            "description": "Return one account Tools document by document_key, doc_id/document_id, path_key, file_path, title, or name without changing the visible tab, active view, selected document, or highlighted range. Use includeContent=true to hydrate and return content for that one document.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "document_key": {"type": "string"},
+                    "documentKey": {"type": "string"},
+                    "doc_id": {"type": "string"},
+                    "document_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "path_key": {"type": "string"},
+                    "pathKey": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "filePath": {"type": "string"},
+                    "title": {"type": "string"},
+                    "name": {"type": "string"},
+                    "includeContent": {"type": "boolean", "description": "When true or omitted, include document content, hydrating this single document if needed."},
+                    "refresh": {"type": "boolean", "description": "When true, force a Cloud/cache refresh before resolving the document."}
                 },
                 "additionalProperties": true
             }
@@ -523,8 +597,46 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "list_local_scripts",
-            "description": "Return every saved local Tools script available on this device, including stable script_id, exact script name, path_key, file_name, and shell. Use this before run_local_script when the user names a script that is not selected or when more than one script exists.",
-            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+            "description": "Return every saved local Tools script available on this device without changing the visible tab, active view, selected script, or highlighted range, including stable script_id, exact script name, path_key, file_name, and shell. Alias: list_scripts. Use this before run_local_script when the user names a script that is not selected or when more than one script exists.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "includeContent": {"type": "boolean", "description": "When true, include script file contents."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "list_scripts",
+            "description": "Return every saved local Tools script available on this device without changing the visible tab, active view, selected script, or highlighted range, including stable script_id, exact script name, path_key, file_name, and shell. Use this for background script inventory questions.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "includeContent": {"type": "boolean", "description": "When true, include script file contents."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "get_script",
+            "description": "Return one saved local Tools script by script_id, path_key, file_path, filename/stem, title, or name without changing the visible tab, active view, selected script, or highlighted range.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "script_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "script_name": {"type": "string"},
+                    "scriptName": {"type": "string"},
+                    "name": {"type": "string"},
+                    "title": {"type": "string"},
+                    "path_key": {"type": "string"},
+                    "pathKey": {"type": "string"},
+                    "file_path": {"type": "string"},
+                    "filePath": {"type": "string"},
+                    "path": {"type": "string"}
+                },
+                "additionalProperties": true
+            }
         }),
         json!({
             "name": "get_selection_context",
@@ -694,6 +806,36 @@ fn app_control_mcp_tools() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "record_loopspace_step_progress",
+            "description": "Record progress for the current Loopspace send-message checkpoint. Use this for Diff Forge internal send-message steps: call with status='running' when starting a step and status='completed' when that step is done. This updates checkpoint UI only; it does not complete the whole send-message node.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "loopspace_id": {"type": "string"},
+                    "loopspaceId": {"type": "string"},
+                    "loop_runtime_run_id": {"type": "string"},
+                    "loopRuntimeRunId": {"type": "string"},
+                    "loop_runtime_node_id": {"type": "string"},
+                    "loopRuntimeNodeId": {"type": "string"},
+                    "loop_runtime_edge_id": {"type": "string"},
+                    "loopRuntimeEdgeId": {"type": "string"},
+                    "trigger_id": {"type": "string"},
+                    "triggerId": {"type": "string"},
+                    "trigger_run_id": {"type": "string"},
+                    "triggerRunId": {"type": "string"},
+                    "step_index": {"type": "integer", "minimum": 1},
+                    "stepIndex": {"type": "integer", "minimum": 1},
+                    "step_id": {"type": "string"},
+                    "stepId": {"type": "string"},
+                    "step_title": {"type": "string"},
+                    "stepTitle": {"type": "string"},
+                    "status": {"type": "string", "description": "running, completed, failed, or skipped."},
+                    "message": {"type": "string"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
             "name": "get_loopspace_graph",
             "description": "Return the selected Loopspace .dfblueprint graph document, parsed blueprint AST, source format, runtime head, and graph metadata. Use this before editing a Loopspace graph.",
             "inputSchema": {
@@ -741,7 +883,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "patch_loopspace_graph",
-            "description": "Patch a Loopspace .dfblueprint graph without rewriting the whole source. Call get_loopspace_graph and list_loopspace_triggers first. Trigger graph nodes must reference inventory: use attach_trigger with trigger_id, or create_loopspace_trigger first. Do not invent standalone cron/manual/webhook nodes. Edges are explicit node_id.port -> node_id.port connections.",
+            "description": "Patch a Loopspace .dfblueprint graph without rewriting the whole source. Call get_loopspace_graph and list_loopspace_triggers first. Trigger graph nodes must reference inventory: use attach_trigger with trigger_id, or create_loopspace_trigger first. Do not invent standalone cron/manual/webhook nodes. For add_node, use supported node kinds: document_read, document_write, run_script, send_message, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message and run_script nodes. Edges are explicit node_id.port -> node_id.port connections. Use document_read.docs -> step.in for readable substep context and step.docs -> document_write.in for writable substep output.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -752,7 +894,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "operations": {
                         "type": "array",
                         "items": {"type": "object", "additionalProperties": true},
-                        "description": "Examples: {op:'attach_trigger', trigger_id:'trigger-...', x:0, y:0}; {op:'add_node', id:'read_doc', kind:'send_message', label:'Read document'}; {op:'connect', from:'trigger-basic', to:'read_doc'}."
+                        "description": "Examples: {op:'attach_trigger', trigger_id:'trigger-...', x:0, y:0}; {op:'add_node', id:'read_doc', kind:'document_read', label:'Read document'}; {op:'add_node', id:'message_agent', kind:'send_message', label:'Message agent'}; {op:'connect', from:'trigger-basic', to:'message_agent'}."
                     },
                     "ops": {
                         "type": "array",
@@ -850,6 +992,8 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
     if ![
         "get_state",
         "get_visible_context",
+        "list_docs",
+        "get_doc",
         "get_selected_document_context",
         "get_selected_script_context",
         "get_selection_context",
@@ -860,11 +1004,14 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "run_selected_script",
         "run_local_script",
         "list_local_scripts",
+        "list_scripts",
+        "get_script",
         "select_workspace",
         "list_loopspace_triggers",
         "create_loopspace_trigger",
         "update_loopspace_trigger",
         "run_loopspace_trigger",
+        "record_loopspace_step_progress",
         "get_loopspace_graph",
         "update_loopspace_graph",
         "edit_loopspace_graph",

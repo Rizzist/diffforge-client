@@ -72,6 +72,7 @@ windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win3
 [patch.crates-io]
 cidre = { path = "vendor/cidre" }
 portable-pty = { path = "vendor/portable-pty" }
+scap = { path = "vendor/scap" }
 
 # Production build is tuned for runtime energy: thin LTO inlines across crate
 # boundaries (hot paths here are serde_json IPC (de)serialization and rusqlite

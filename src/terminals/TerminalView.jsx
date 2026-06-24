@@ -276,6 +276,7 @@ const TODO_QUEUE_BUSY_REASONS = new Set([
   "target_terminal_not_input_ready",
   "terminal_starting",
 ]);
+const APP_CONTROL_SETTLED_COMMAND_TOMBSTONE_TTL_MS = 120000;
 const TODO_QUEUE_ATTEMPT_ONLY_TARGET_REASONS = new Set([
   "target_terminal_not_input_ready",
   "todo_queue_backend_submit_requested",
@@ -305,6 +306,7 @@ const TERMINAL_FOCUS_REQUEST_EVENT = "diffforge:terminal-focus-request";
 const APP_CONTROL_TERMINAL_FOCUS_EVENT = "forge-app-control-terminal-focus";
 const REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
 const REMOTE_APP_CONTROL_SEND_MESSAGE_EVENT = "diffforge:remote-app-control-send-message";
+const APP_CONTROL_REMOTE_COMMAND_SETTLED_EVENT = "diffforge:app-control-remote-command-settled";
 const TODO_HISTORY_CONTROL_EVENT = "diffforge:todo-history-control";
 const TODO_HISTORY_CONTROL_RESULT_EVENT = "diffforge:todo-history-control-result";
 const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
@@ -2849,6 +2851,87 @@ function appControlRemoteMessageText(detail = {}) {
     "body",
     "prompt",
   ]);
+}
+
+function appControlRemoteCheckpointPlan(detail = {}) {
+  const event = detail?.event && typeof detail.event === "object" ? detail.event : {};
+  const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+  for (const value of [
+    detail?.checkpointPlan,
+    detail?.checkpoint_plan,
+    event?.checkpointPlan,
+    event?.checkpoint_plan,
+    payload?.checkpointPlan,
+    payload?.checkpoint_plan,
+  ]) {
+    if (Array.isArray(value)) {
+      return value;
+    }
+  }
+  return [];
+}
+
+function appControlCheckpointText(value = {}, keys = []) {
+  if (!value || typeof value !== "object") {
+    return "";
+  }
+  for (const key of keys) {
+    const item = value[key];
+    if (item === undefined || item === null) {
+      continue;
+    }
+    const text = String(item).trim();
+    if (text) {
+      return text;
+    }
+  }
+  return "";
+}
+
+function appControlRemoteCheckpointPromptBlock(detail = {}, checkpointPlan = []) {
+  const checkpoints = (Array.isArray(checkpointPlan) ? checkpointPlan : [])
+    .filter((checkpoint) => checkpoint && typeof checkpoint === "object");
+  if (!checkpoints.length) {
+    return "";
+  }
+  const lines = [
+    "Diff Forge internal send-message steps:",
+    "- Treat these as ordered internal checkpoints for this message.",
+    "- As you make progress, call the diffforge-app-control MCP tool record_loopspace_step_progress with status \"running\" when you start a checkpoint and status \"completed\" when that checkpoint is done.",
+  ];
+  const fieldPairs = [
+    ["loopspace_id", appControlRemoteDetailString(detail, ["loopspace_id", "loopspaceId"])],
+    ["loop_runtime_run_id", appControlRemoteDetailString(detail, ["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"])],
+    ["loop_runtime_node_id", appControlRemoteDetailString(detail, ["loop_runtime_node_id", "loopRuntimeNodeId", "node_id", "nodeId"])],
+    ["loop_runtime_edge_id", appControlRemoteDetailString(detail, ["loop_runtime_edge_id", "loopRuntimeEdgeId", "edge_id", "edgeId"])],
+    ["trigger_id", appControlRemoteDetailString(detail, ["trigger_id", "triggerId"])],
+    ["trigger_run_id", appControlRemoteDetailString(detail, ["trigger_run_id", "triggerRunId"])],
+  ].filter(([, value]) => value);
+  if (fieldPairs.length) {
+    lines.push(`- Include these fields on every checkpoint call: ${fieldPairs.map(([key, value]) => `${key}="${value}"`).join(", ")}.`);
+  }
+  checkpoints.forEach((checkpoint, index) => {
+    const label = appControlCheckpointText(checkpoint, ["label", "title", "name"])
+      || `Step ${index + 1}`;
+    const stepId = appControlCheckpointText(checkpoint, ["id", "step_id", "stepId", "checkpoint_id", "checkpointId"]);
+    const description = appControlCheckpointText(checkpoint, ["description", "desc", "details"]);
+    const idSuffix = stepId ? ` [step_id: ${stepId}]` : "";
+    lines.push(`${index + 1}. ${label}${idSuffix}${description ? ` - ${description}` : ""}`);
+  });
+  return lines.join("\n");
+}
+
+function appControlRemoteMessageTextWithCheckpointPlan(detail = {}, checkpointPlan = []) {
+  const text = appControlRemoteMessageText(detail);
+  const checkpointBlock = appControlRemoteCheckpointPromptBlock(detail, checkpointPlan);
+  if (
+    !checkpointBlock
+    || text.includes("Diff Forge internal send-message steps:")
+    || text.includes("record_loopspace_step_progress")
+  ) {
+    return text;
+  }
+  return [text, checkpointBlock].filter(Boolean).join("\n\n");
 }
 
 function createAppControlAgentRetryPromptId(promptId, recoveryAttempt) {
@@ -16397,6 +16480,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   const appControlAgentTerminalIndexesRef = useRef(appControlAgentTerminalIndexes);
   const appControlAgentPendingPromptsRef = useRef(appControlAgentPendingPromptsByIndex);
   const appControlAgentRemoteCommandsByPromptIdRef = useRef(new Map());
+  const appControlAgentSettledCommandTombstonesByTerminalRef = useRef(new Map());
   const appControlAgentSendQueuesByIndexRef = useRef(new Map());
   const appControlAgentSendWatchdogsByPromptIdRef = useRef(new Map());
   const appControlAgentRetryTimersByPromptIdRef = useRef(new Map());
@@ -16441,16 +16525,17 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   useEffect(() => {
     appControlAgentPendingPromptsRef.current = appControlAgentPendingPromptsByIndex;
   }, [appControlAgentPendingPromptsByIndex]);
-  useEffect(() => () => {
-    appControlAgentSendWatchdogsByPromptIdRef.current.forEach((timer) => {
-      window.clearTimeout(timer);
-    });
-    appControlAgentSendWatchdogsByPromptIdRef.current.clear();
-    appControlAgentRetryTimersByPromptIdRef.current.forEach((timer) => {
-      window.clearTimeout(timer);
-    });
-    appControlAgentRetryTimersByPromptIdRef.current.clear();
-  }, []);
+	  useEffect(() => () => {
+	    appControlAgentSendWatchdogsByPromptIdRef.current.forEach((timer) => {
+	      window.clearTimeout(timer);
+	    });
+	    appControlAgentSendWatchdogsByPromptIdRef.current.clear();
+	    appControlAgentRetryTimersByPromptIdRef.current.forEach((timer) => {
+	      window.clearTimeout(timer);
+	    });
+	    appControlAgentRetryTimersByPromptIdRef.current.clear();
+	    appControlAgentSettledCommandTombstonesByTerminalRef.current.clear();
+	  }, []);
   const getAppControlAgentThreadId = useCallback((terminalIndex) => {
     const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
     const existingThreadId = appControlAgentThreadIdsRef.current.get(safeIndex);
@@ -16955,6 +17040,103 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     }));
     setActiveAppControlAgentPaneId(getAppControlAgentPaneId(nextTerminalIndex));
   }, [appControlAgentTerminalIndexes]);
+  const settleAppControlAgentRemoteCommand = useCallback((detail = {}) => {
+    const rawStatus = appControlRemoteDetailString(detail, ["status", "parentStatus", "state"])
+      .toLowerCase()
+      .replace(/[\s.-]+/g, "_");
+    const status = rawStatus === "cancelled" || rawStatus === "canceled" || rawStatus === "timed_out"
+      ? "interrupted"
+      : rawStatus;
+    if (!["completed", "failed", "interrupted"].includes(status)) {
+      return false;
+    }
+
+    const candidateIds = new Set([
+      appControlRemoteDetailString(detail, ["promptId", "prompt_id", "promptEventId", "prompt_event_id"]),
+      appControlRemoteDetailString(detail, ["commandId", "command_id"]),
+      appControlRemoteDetailString(detail, ["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"]),
+    ].filter(Boolean));
+    let promptId = "";
+    let existingContext = null;
+    for (const candidateId of candidateIds) {
+      const directContext = appControlAgentRemoteCommandsByPromptIdRef.current.get(candidateId);
+      if (directContext?.event) {
+        promptId = candidateId;
+        existingContext = directContext;
+        break;
+      }
+    }
+    if (!existingContext) {
+      for (const [entryPromptId, context] of appControlAgentRemoteCommandsByPromptIdRef.current.entries()) {
+        const event = context?.event && typeof context.event === "object" ? context.event : {};
+        const contextIds = new Set([
+          entryPromptId,
+          context?.promptId,
+          context?.commandId,
+          context?.loopRuntimeRunId,
+          event?.command_id,
+          event?.commandId,
+          event?.loop_runtime_run_id,
+          event?.loopRuntimeRunId,
+          event?.run_id,
+          event?.runId,
+        ].map((value) => String(value || "").trim()).filter(Boolean));
+        if ([...candidateIds].some((candidateId) => contextIds.has(candidateId))) {
+          promptId = entryPromptId;
+          existingContext = context;
+          break;
+        }
+      }
+    }
+    if (!promptId || !existingContext?.event) {
+      return false;
+    }
+
+    const terminalIndex = Math.max(0, Number.parseInt(
+      existingContext.terminalIndex
+        ?? detail.terminalIndex
+        ?? detail.terminal_index
+        ?? 0,
+      10,
+    ) || 0);
+    clearAppControlAgentSendWatchdog(promptId);
+    clearAppControlAgentRetryTimer(promptId);
+    clearAppControlAgentPendingPrompt(promptId);
+    appControlAgentRemoteCommandsByPromptIdRef.current.delete(promptId);
+    const commandId = existingContext.commandId || appControlRemoteDetailString(detail, ["commandId", "command_id"]);
+    const loopRuntimeRunId = appControlRemoteDetailString(detail, ["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"]);
+    appControlAgentSettledCommandTombstonesByTerminalRef.current.set(terminalIndex, {
+      commandId,
+      loopRuntimeRunId,
+      paneId: existingContext.paneId || detail.paneId || detail.pane_id || "",
+      promptId,
+      settledAtMs: Date.now(),
+      status,
+      threadId: existingContext.threadId || detail.threadId || detail.thread_id || "",
+    });
+    logTerminalStatus("frontend.app_control.remote_send_message_settled", {
+      commandId,
+      commandKind: existingContext.commandKind || "terminal_orchestrator_send_message",
+      loopRuntimeRunId,
+      paneId: existingContext.paneId || detail.paneId || detail.pane_id || "",
+      promptId,
+      reason: detail.reason || "app_control_checkpoint_completion",
+      status,
+      targetTerminalIndex: terminalIndex,
+      targetThreadId: existingContext.threadId || detail.threadId || detail.thread_id || "",
+      workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+    });
+    drainAppControlAgentSendQueue(terminalIndex);
+    return true;
+  }, [
+    clearAppControlAgentPendingPrompt,
+    clearAppControlAgentRetryTimer,
+    clearAppControlAgentSendWatchdog,
+    drainAppControlAgentSendQueue,
+  ]);
+  const handleAppControlRemoteCommandSettled = useCallback((event = {}) => {
+    settleAppControlAgentRemoteCommand(event?.detail || {});
+  }, [settleAppControlAgentRemoteCommand]);
   const handleAppControlAgentTerminalLifecycle = useCallback((event = {}) => {
     const eventType = String(event.type || event.eventType || event.event_type || "").trim().toLowerCase();
     let promptId = String(
@@ -16976,6 +17158,50 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             && contextIndex === terminalIndex
             && !["completed", "failed", "interrupted"].includes(status);
         });
+        const terminalOnlyFinalLifecycle = [
+          "provider-turn-completed",
+          "provider-turn-error",
+          "provider-turn-failed",
+          "provider-turn-interrupted",
+        ].includes(eventType);
+        if (terminalOnlyFinalLifecycle) {
+          const tombstone = appControlAgentSettledCommandTombstonesByTerminalRef.current.get(terminalIndex);
+          const tombstoneAgeMs = Date.now() - Number(tombstone?.settledAtMs || 0);
+          if (tombstone && tombstoneAgeMs > APP_CONTROL_SETTLED_COMMAND_TOMBSTONE_TTL_MS) {
+            appControlAgentSettledCommandTombstonesByTerminalRef.current.delete(terminalIndex);
+          } else if (tombstone) {
+            const eventThreadId = String(event.threadId || event.thread_id || "").trim();
+            const eventIds = [
+              event.commandId,
+              event.command_id,
+              event.loopRuntimeRunId,
+              event.loop_runtime_run_id,
+              event.runId,
+              event.run_id,
+            ].map((value) => String(value || "").trim()).filter(Boolean);
+            const tombstoneIds = new Set([
+              tombstone.promptId,
+              tombstone.commandId,
+              tombstone.loopRuntimeRunId,
+            ].map((value) => String(value || "").trim()).filter(Boolean));
+            const eventMatchesTombstone = eventIds.some((id) => tombstoneIds.has(id));
+            const threadMatchesTombstone = !eventThreadId
+              || !tombstone.threadId
+              || eventThreadId === tombstone.threadId;
+            if (eventMatchesTombstone || (!activeEntry && !eventIds.length && threadMatchesTombstone)) {
+              logTerminalStatus("frontend.app_control.remote_send_message_lifecycle_ignored", {
+                eventType,
+                paneId: event.paneId || event.pane_id || tombstone.paneId || "",
+                promptId: tombstone.promptId || "",
+                reason: "settled_command_tombstone",
+                targetTerminalIndex: terminalIndex,
+                tombstoneAgeMs,
+                workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
+              });
+              return;
+            }
+          }
+        }
         promptId = String(activeEntry?.[0] || "").trim();
       }
     }
@@ -17093,12 +17319,14 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     }
     const status = failed
       ? "failed"
-      : completed
-        ? "completed"
-        : interrupted
-          ? "interrupted"
-          : running
-            ? "running"
+      : completed && Array.isArray(existingContext.checkpointPlan) && existingContext.checkpointPlan.length
+        ? "running"
+        : completed
+          ? "completed"
+          : interrupted
+            ? "interrupted"
+            : running
+              ? "running"
             : "";
     if (!status) {
       return;
@@ -17120,10 +17348,12 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
 
     const message = failed
       ? String(event.error || event.message || "Terminal orchestrator message failed.").trim()
-      : completed
-        ? "Terminal orchestrator message completed."
-        : interrupted
-          ? "Terminal orchestrator message interrupted."
+      : completed && status === "running"
+        ? "Terminal orchestrator turn completed; waiting for final checkpoint."
+        : completed
+          ? "Terminal orchestrator message completed."
+          : interrupted
+            ? "Terminal orchestrator message interrupted."
           : eventType === "pending-prompt-sent"
             ? "Send message submitted to the terminal orchestrator."
             : "Terminal orchestrator message is running.";
@@ -17138,7 +17368,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       targetThreadId: event.threadId || existingContext.threadId || "",
       textPreview: existingContext.textPreview || "",
     }).then(() => {
-      if (failed || completed || interrupted) {
+      if (failed || (completed && status !== "running") || interrupted) {
         clearAppControlAgentSendWatchdog(promptId);
         clearAppControlAgentRetryTimer(promptId);
         appControlAgentRemoteCommandsByPromptIdRef.current.delete(promptId);
@@ -17155,7 +17385,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   ]);
   const handleRemoteAppControlSendMessage = useCallback((event) => {
     const detail = event?.detail || {};
-    const text = appControlRemoteMessageText(detail);
+    const checkpointPlan = appControlRemoteCheckpointPlan(detail);
+    const text = appControlRemoteMessageTextWithCheckpointPlan(detail, checkpointPlan);
     const remoteEvent = detail.event && typeof detail.event === "object"
       ? detail.event
       : {
@@ -17213,9 +17444,12 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       agentId: role,
       commandId,
       commandKind,
+      checkpointPlan,
       event: remoteEvent,
+      message: text,
       paneId,
       promptId,
+      text,
       terminalIndex,
       textPreview: text.slice(0, 200),
       threadId,
@@ -17288,6 +17522,12 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       window.removeEventListener(REMOTE_APP_CONTROL_SEND_MESSAGE_EVENT, handleRemoteAppControlSendMessage);
     };
   }, [handleRemoteAppControlSendMessage]);
+  useEffect(() => {
+    window.addEventListener(APP_CONTROL_REMOTE_COMMAND_SETTLED_EVENT, handleAppControlRemoteCommandSettled);
+    return () => {
+      window.removeEventListener(APP_CONTROL_REMOTE_COMMAND_SETTLED_EVENT, handleAppControlRemoteCommandSettled);
+    };
+  }, [handleAppControlRemoteCommandSettled]);
   const setAppControlAgentPanelRef = useCallback((terminalIndex, element) => {
     const safeIndex = Number.parseInt(terminalIndex, 10);
     if (!Number.isInteger(safeIndex)) {

@@ -4422,6 +4422,7 @@ export const LoopspaceGraphCanvas = styled.div`
   cursor: grab;
   touch-action: none;
   user-select: none;
+  -webkit-user-select: none;
 
   &[data-panning="true"] {
     cursor: grabbing;
@@ -4439,6 +4440,8 @@ export const LoopspaceGraphContent = styled.div`
   ) scale(var(--loopspace-zoom, 1));
   transform-origin: 0 0;
   pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
 `;
 
 export const LoopspaceGraphEdges = styled.svg`
@@ -4490,6 +4493,8 @@ export const LoopspaceGraphEdgeLabel = styled.text`
   text-anchor: middle;
   text-transform: uppercase;
   cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
 `;
 
 export const LoopspaceGraphNode = styled.div`
@@ -4513,13 +4518,15 @@ export const LoopspaceGraphNode = styled.div`
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
   pointer-events: auto;
   transform: translate3d(var(--loopspace-node-x, 0px), var(--loopspace-node-y, 0px), 0);
+  user-select: none;
+  -webkit-user-select: none;
 
   &[data-kind="cron"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="webhook"] { --loop-node-accent: 45, 212, 191; }
   &[data-kind="manual"] { --loop-node-accent: 251, 191, 36; }
   &[data-kind="send_message"] { --loop-node-accent: 45, 212, 191; }
   &[data-kind="document_read"] { --loop-node-accent: 96, 165, 250; }
-  &[data-kind="document_write"] { --loop-node-accent: 251, 191, 36; }
+  &[data-kind="document_write"] { --loop-node-accent: 96, 165, 250; }
   &[data-region="true"] {
     box-sizing: border-box;
     width: var(--loopspace-node-width, 680px);
@@ -4549,10 +4556,14 @@ export const LoopspaceGraphNode = styled.div`
   }
   &[data-kind="document_read"],
   &[data-kind="document_write"] {
-    width: 270px;
-    max-width: 270px;
-    align-items: start;
+    box-sizing: border-box;
+    width: var(--loopspace-node-width, 270px);
+    height: var(--loopspace-node-height, 128px);
+    max-width: none;
+    grid-template-rows: minmax(0, 1fr);
+    align-items: stretch;
     padding-right: 32px;
+    overflow: hidden;
   }
   &[data-kind="loop"] {
     --loop-node-accent: 255, 209, 102;
@@ -4592,11 +4603,13 @@ export const LoopspaceGraphNodeOutputPorts = styled.div`
   right: -10px;
   z-index: 3;
   display: grid;
+  grid-auto-rows: 18px;
   gap: 8px;
   transform: translateY(-50%);
 `;
 
 export const LoopspaceGraphNodePort = styled.button`
+  box-sizing: border-box;
   position: absolute;
   top: 50%;
   z-index: 2;
@@ -4612,6 +4625,7 @@ export const LoopspaceGraphNodePort = styled.button`
     0 0 0 3px rgba(var(--loop-node-accent), 0.1),
     0 0 16px rgba(var(--loop-node-accent), 0.18);
   cursor: crosshair;
+  line-height: 0;
   transform: translateY(-50%);
 
   &::after {
@@ -4642,15 +4656,18 @@ export const LoopspaceGraphNodePort = styled.button`
 `;
 
 export const LoopspaceGraphNodeOutputPort = styled.span`
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
   justify-content: flex-end;
   gap: 6px;
+  height: 18px;
   min-height: 18px;
   color: rgba(248, 250, 252, 0.58);
   font-size: 8.5px;
   font-weight: 900;
   letter-spacing: 0.04em;
+  line-height: 1;
   text-transform: uppercase;
   pointer-events: auto;
 
@@ -4709,6 +4726,7 @@ export const LoopspaceGraphNodeIcon = styled.span`
 export const LoopspaceGraphNodeText = styled.div`
   display: grid;
   min-width: 0;
+  min-height: 0;
   gap: 3px;
 
   & > strong,
@@ -4730,6 +4748,13 @@ export const LoopspaceGraphNodeText = styled.div`
     font-weight: 740;
     letter-spacing: 0;
     text-transform: uppercase;
+  }
+
+  ${LoopspaceGraphNode}[data-kind="document_read"] &,
+  ${LoopspaceGraphNode}[data-kind="document_write"] & {
+    grid-template-rows: auto auto minmax(0, 1fr);
+    align-self: stretch;
+    height: 100%;
   }
 `;
 
@@ -5036,8 +5061,10 @@ export const LoopspaceGraphNodeSelectEmpty = styled.div`
 
 export const LoopspaceGraphDocumentPicker = styled.div`
   display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   gap: 7px;
   min-width: 0;
+  min-height: 0;
   margin-top: 6px;
   pointer-events: auto;
 `;
@@ -5055,6 +5082,8 @@ export const LoopspaceGraphDocumentSearch = styled.input`
   font-weight: 720;
   letter-spacing: 0;
   outline: none;
+  user-select: text;
+  -webkit-user-select: text;
 
   &:focus {
     border-color: rgba(var(--loop-node-accent), 0.62);
@@ -5068,8 +5097,12 @@ export const LoopspaceGraphDocumentSearch = styled.input`
 
 export const LoopspaceGraphDocumentPickList = styled.div`
   display: grid;
+  align-content: start;
   gap: 4px;
   min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
 `;
 
 export const LoopspaceGraphDocumentPickButton = styled.button`
@@ -5118,8 +5151,22 @@ export const LoopspaceGraphDocumentPickButton = styled.button`
 
 export const LoopspaceGraphDocumentRefList = styled.div`
   display: grid;
+  align-content: start;
   gap: 4px;
   min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  padding-right: 2px;
+  overscroll-behavior: contain;
+
+  &::-webkit-scrollbar {
+    width: 7px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(var(--loop-node-accent), 0.24);
+  }
 `;
 
 export const LoopspaceGraphDocumentRefItem = styled.span`
@@ -5243,8 +5290,8 @@ export const LoopspaceGraphMessageRegion = styled.div`
 
 export const LoopspaceGraphMessageSettingsButton = styled.button`
   position: absolute;
-  top: 10px;
-  right: 42px;
+  top: 8px;
+  right: 16px;
   z-index: 5;
   display: grid;
   width: 26px;
@@ -5335,13 +5382,46 @@ export const LoopspaceGraphMessageFlowNode = styled.div`
   cursor: grab;
   pointer-events: auto;
   transform: translate3d(var(--loopspace-flow-node-x, 8px), var(--loopspace-flow-node-y, 8px), 0);
+  user-select: none;
+  -webkit-user-select: none;
+
+  &[data-status]::after {
+    content: "";
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: 14px;
+    height: 14px;
+    border-radius: 999px;
+    box-shadow:
+      0 0 0 2px rgba(2, 8, 9, 0.94),
+      0 0 12px rgba(var(--loop-message-child-accent), 0.28);
+  }
+
+  &[data-status="running"]::after {
+    border: 2px solid rgba(125, 211, 252, 0.92);
+    border-top-color: transparent;
+    animation: loopspace-message-step-spin 780ms linear infinite;
+  }
+
+  &[data-status="completed"]::after {
+    background: #34d399;
+  }
+
+  &[data-status="failed"]::after {
+    background: #fb7185;
+  }
+
+  &[data-status="skipped"]::after {
+    background: #94a3b8;
+  }
 
   &[data-kind="document_read"] {
     --loop-message-child-accent: 96, 165, 250;
   }
 
   &[data-kind="document_write"] {
-    --loop-message-child-accent: 251, 191, 36;
+    --loop-message-child-accent: 96, 165, 250;
   }
 
   &[data-kind="run_script"] {
@@ -5350,6 +5430,12 @@ export const LoopspaceGraphMessageFlowNode = styled.div`
 
   &:active {
     cursor: grabbing;
+  }
+
+  @keyframes loopspace-message-step-spin {
+    to {
+      transform: rotate(360deg);
+    }
   }
 `;
 
@@ -5386,18 +5472,23 @@ export const LoopspaceGraphMessageFlowNodeText = styled.div`
 `;
 
 export const LoopspaceGraphMessageFlowNodePort = styled.span`
+  box-sizing: border-box;
   position: absolute;
   top: 50%;
   display: grid;
   width: 14px;
   height: 14px;
   place-items: center;
+  padding: 0;
   border: 1px solid rgba(var(--loop-message-child-accent), 0.54);
   border-radius: 999px;
   background: rgba(2, 6, 8, 0.94);
   box-shadow:
     0 0 0 3px rgba(var(--loop-message-child-accent), 0.08),
     0 0 12px rgba(var(--loop-message-child-accent), 0.18);
+  cursor: crosshair;
+  line-height: 0;
+  pointer-events: auto;
   transform: translateY(-50%);
 
   &::after {
@@ -5414,6 +5505,16 @@ export const LoopspaceGraphMessageFlowNodePort = styled.span`
 
   &[data-side="output"] {
     right: -7px;
+  }
+
+  &[data-active="true"],
+  &:hover,
+  &:focus-visible {
+    outline: none;
+    border-color: #ffffff;
+    box-shadow:
+      0 0 0 4px rgba(var(--loop-message-child-accent), 0.18),
+      0 0 18px rgba(var(--loop-message-child-accent), 0.32);
   }
 `;
 
@@ -6031,6 +6132,19 @@ export const LoopspaceGraphMessageResize = styled.button`
     outline: none;
     border-color: rgba(var(--loop-node-accent), 0.58);
     color: #fff;
+  }
+
+  &[data-axis="vertical"] {
+    cursor: ns-resize;
+  }
+
+  &[data-axis="vertical"]::before {
+    width: 10px;
+    height: 8px;
+    border-right: 0;
+    border-left: 0;
+    border-top: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
   }
 `;
 

@@ -1414,16 +1414,19 @@ function isTerminalPromptObservedTimeout(error) {
     .includes("Timed out waiting for the prompt to be observed in the terminal");
 }
 
-function getPendingPromptSubmitAttemptSequences(agentKind, isGenericTerminal = false) {
+function getPendingPromptSubmitAttemptSequences(agentKind, isGenericTerminal = false, options = {}) {
   const primary = getTerminalSubmitSequence(agentKind, isGenericTerminal);
   const sequences = [];
+  if (options.preferCarriageReturn && getTerminalAgentKind(agentKind) === "codex") {
+    sequences.push("\r");
+  }
   if (primary) {
     sequences.push(primary);
   }
   if (getTerminalAgentKind(agentKind) === "codex" && primary !== "\r") {
     sequences.push("\r");
   }
-  return sequences;
+  return [...new Set(sequences)];
 }
 
 function waitForPendingPromptSubmitSettle(delayMs = PENDING_PROMPT_SUBMIT_SYNC_SETTLE_MS) {
@@ -14077,6 +14080,7 @@ function WorkspaceTerminal({
           const submitSequences = getPendingPromptSubmitAttemptSequences(
             terminalAgentKind,
             isGenericTerminal,
+            { preferCarriageReturn: appControlTerminalSurface },
           );
           let activeSubmitWaiter = null;
           let directTodoCaptureSettled = false;
@@ -14352,6 +14356,30 @@ function WorkspaceTerminal({
                 if (!submitObservedTimedOut) {
                   throw submitError;
                 }
+                if (appControlTerminalSurface) {
+                  observedSubmit = true;
+                  logTerminalStatus("frontend.pending_prompt.submit_observation_missed_assumed_submitted", {
+                    ...pendingPromptLogFields,
+                    attempt: attemptIndex + 1,
+                    instanceId: currentInstanceId,
+                    reason: "app_control_terminal_write_completed",
+                    threadId: currentThreadId,
+                  });
+                  logThreadBridgeDiagnostic("frontend.pending_prompt.submit_observation_missed_assumed_submitted", {
+                    agentId: terminalAgentKind,
+                    attempt: attemptIndex + 1,
+                    deliveryMode: effectiveDeliveryMode,
+                    instanceId: currentInstanceId,
+                    paneId,
+                    promptId,
+                    reason: "app_control_terminal_write_completed",
+                    sendPolicy: "terminal-orchestrator-write-confirmed",
+                    terminalIndex,
+                    threadId: currentThreadId,
+                    workspaceId: workspace?.id || thread?.workspaceId || "",
+                  });
+                  break;
+                }
                 if (!hasFallback) {
                   const acceptedAfterObserverTimeout = await acceptedPromise;
                   if (acceptedAfterObserverTimeout.kind === "accepted") {
@@ -14425,6 +14453,24 @@ function WorkspaceTerminal({
               retried: observedSubmitRetried,
               threadId: currentThreadId,
             });
+            if (appControlTerminalSurface) {
+              logThreadBridgeDiagnostic("frontend.pending_prompt.app_control_delivery_confirmed", {
+                agentId: terminalAgentKind,
+                deliveryMode: effectiveDeliveryMode,
+                instanceId: currentInstanceId,
+                paneId,
+                promptId,
+                sendPolicy: "terminal-orchestrator-write-confirmed",
+                terminalIndex,
+                threadId: currentThreadId,
+                workspaceId: workspace?.id || thread?.workspaceId || "",
+              });
+              return {
+                matchedBy: "app-control-terminal-write-confirmed",
+                promptEventId: promptId,
+                sessionId: threadProviderSessionId || "",
+              };
+            }
             logThreadBridgeDiagnostic("frontend.pending_prompt.await_session_acceptance", {
               agentId: terminalAgentKind,
               deliveryMode: effectiveDeliveryMode,

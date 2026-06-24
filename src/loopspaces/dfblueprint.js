@@ -23,6 +23,13 @@ export function sanitizeDfBlueprintId(value, fallback = "node") {
   return safe || fallback;
 }
 
+const DEPRECATED_DFBLUEPRINT_CREATION_KINDS = new Set(["device"]);
+
+function creatableDfBlueprintTemplateId(value, fallback = "node") {
+  const templateId = sanitizeDfBlueprintId(value, fallback).replace(/-/g, "_");
+  return DEPRECATED_DFBLUEPRINT_CREATION_KINDS.has(templateId) ? fallback : templateId;
+}
+
 function quoteDfBlueprint(value) {
   return `"${String(value ?? "")
     .replace(/\\/g, "\\\\")
@@ -323,31 +330,8 @@ export function validateDfBlueprintSourceForUpdate(source = "", previousSource =
 }
 
 export function createDfBlueprintNodeFromTemplate(template, position = null) {
-  const templateId = sanitizeDfBlueprintId(template?.id || template?.node_kind || "node", "node").replace(/-/g, "_");
+  const templateId = creatableDfBlueprintTemplateId(template?.id || template?.node_kind || "node", "node");
   const deviceId = safeText(template?.device_id);
-  if (templateId === "device" && deviceId) {
-    const safeDeviceId = sanitizeDfBlueprintId(deviceId, "device");
-    const label = safeText(template?.label || template?.device_label, deviceId);
-    return {
-      id: `device-${safeDeviceId}`,
-      icon: safeText(template?.icon, "device"),
-      label,
-      mode: "",
-      nodeKind: "device",
-      kind: "device",
-      role: safeText(template?.role, "variable"),
-      triggerId: "",
-      hasPosition: Boolean(position),
-      x: position ? Math.round(Number(position.x) || 0) : 0,
-      y: position ? Math.round(Number(position.y) || 0) : 0,
-      props: {
-        device_id: deviceId,
-        device_label: label,
-        platform: safeText(template?.platform),
-        status: safeText(template?.status, "offline"),
-      },
-    };
-  }
   const suffix = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
   if (templateId === "run_script") {
     const scriptId = safeText(template?.script_id || template?.script);
@@ -527,13 +511,15 @@ export function connectDfBlueprintNodes(source, fromNode, toNode, options = {}) 
   const ast = parseDfBlueprintSource(source);
   const fromPort = safeText(options.fromPort || options.from_port, "out");
   const toPort = safeText(options.toPort || options.to_port, "in");
-  const fromGraphNode = ast.nodes.find((node) => node.id === from)
+  const nodeById = new Map(ast.nodes.map((node) => [node.id, node]));
+  const fromGraphNode = nodeById.get(from)
     || (fromNode && typeof fromNode === "object" ? fromNode : null);
-  const toGraphNode = ast.nodes.find((node) => node.id === to)
+  const toGraphNode = nodeById.get(to)
     || (toNode && typeof toNode === "object" ? toNode : null);
   const validation = validateLoopspaceGraphEdgeCandidate(fromGraphNode, toGraphNode, {
     from,
     fromPort,
+    nodeById,
     to,
     toPort,
   });
@@ -592,8 +578,12 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
   for (const op of Array.isArray(operations) ? operations : []) {
     const action = safeText(op?.op || op?.type || op?.action).toLowerCase();
     if (action === "addnode" || action === "add_node") {
+      const requestedKind = sanitizeDfBlueprintId(op?.kind || op?.node_kind || "action", "action").replace(/-/g, "_");
+      if (DEPRECATED_DFBLUEPRINT_CREATION_KINDS.has(requestedKind)) {
+        continue;
+      }
       const node = createDfBlueprintNodeFromTemplate({
-        id: op.kind || op.node_kind || "action",
+        id: requestedKind,
         label: op.label || op.name || "Graph node",
         role: op.role || "action",
         icon: op.icon || "",
@@ -649,12 +639,14 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
       const fromPort = safeText(op.from_port || op.fromPort, "out");
       const toPort = safeText(op.to_port || op.toPort, "in");
       const branch = safeText(op.branch || fromPort);
+      const nodeById = new Map(ast.nodes.map((node) => [node.id, node]));
       const validation = validateLoopspaceGraphEdgeCandidate(
-        ast.nodes.find((node) => node.id === from),
-        ast.nodes.find((node) => node.id === to),
+        nodeById.get(from),
+        nodeById.get(to),
         {
           from,
           fromPort,
+          nodeById,
           to,
           toPort,
         },

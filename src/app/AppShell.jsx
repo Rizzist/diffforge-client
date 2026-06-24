@@ -736,15 +736,20 @@ import {
 import { PlanFlame } from "./PlanFlame.jsx";
 import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
 import {
+  accountDocumentHydrateRequestFromSkill,
   accountDocumentStorageKey,
+  accountDocumentUnitsFromPayload,
   documentExtensionForKind,
   normalizedDocumentCollection,
   normalizedDocumentKind,
   normalizedDocumentPath,
+  skillsFromUnits,
 } from "../tools/skillsLibrary.js";
 import {
   getWorkspaceToolsAccountSkills,
+  getWorkspaceToolsDocumentDraft,
   getWorkspaceToolsVersion,
+  refreshWorkspaceToolsAccountSkills,
   setWorkspaceToolsDocumentDraft,
   subscribeWorkspaceTools,
   warmWorkspaceTools,
@@ -861,6 +866,7 @@ const REMOTE_NAVIGATION_COMMANDS = new Set([
 const APP_CONTROL_MCP_REQUEST_EVENT = "forge-app-control-mcp-request";
 const APP_CONTROL_TERMINAL_FOCUS_EVENT = "forge-app-control-terminal-focus";
 const REMOTE_APP_CONTROL_SEND_MESSAGE_EVENT = "diffforge:remote-app-control-send-message";
+const APP_CONTROL_REMOTE_COMMAND_SETTLED_EVENT = "diffforge:app-control-remote-command-settled";
 const DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID = "__diffforge_app_control__";
 const DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_IDS = new Set([
   DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
@@ -1262,6 +1268,95 @@ function loopspaceRuntimeStatusTone(status) {
   if (["queued", "awaiting_device", "pending"].includes(normalized)) return "queued";
   if (["running", "active", "dispatching"].includes(normalized)) return "active";
   return "neutral";
+}
+
+function normalizeLoopspaceCheckpointProgressStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (["complete", "completed", "done", "success", "succeeded"].includes(normalized)) return "completed";
+  if (["active", "processing", "running", "started", "working"].includes(normalized)) return "running";
+  if (["failed", "failure", "error", "blocked"].includes(normalized)) return "failed";
+  if (["skip", "skipped"].includes(normalized)) return "skipped";
+  return "";
+}
+
+function loopspaceCheckpointProgressFromRuntimeEvent(event) {
+  const roots = [
+    event,
+    event?.payload,
+    event?.result,
+    event?.details,
+    event?.details?.details,
+    event?.details?.result,
+    event?.details?.payload,
+    event?.details?.details?.details,
+    event?.details?.details?.result,
+    event?.details?.details?.payload,
+  ];
+  for (const root of roots) {
+    if (!root || typeof root !== "object" || Array.isArray(root)) {
+      continue;
+    }
+    const progress = root.checkpointProgress || root.checkpoint_progress;
+    if (progress && typeof progress === "object" && !Array.isArray(progress)) {
+      return progress;
+    }
+  }
+  return null;
+}
+
+function loopspaceCheckpointProgressKeys(progress) {
+  if (!progress || typeof progress !== "object") {
+    return [];
+  }
+  const keys = [];
+  const stepId = appControlText(progress, ["stepId", "step_id", "checkpointId", "checkpoint_id", "id"]);
+  if (stepId) {
+    keys.push(`id:${stepId}`);
+  }
+  const stepIndex = Number.parseInt(
+    progress.stepIndex ?? progress.step_index ?? progress.stepOrdinal ?? progress.step_ordinal ?? progress.index ?? 0,
+    10,
+  );
+  if (Number.isFinite(stepIndex) && stepIndex > 0) {
+    keys.push(`index:${stepIndex}`);
+  }
+  return keys;
+}
+
+function buildLoopspaceCheckpointProgressMap(events, runId, nodeId) {
+  const map = new Map();
+  const safeRunId = String(runId || "").trim();
+  const safeNodeId = String(nodeId || "").trim();
+  for (const event of jsonArray(events)) {
+    const eventRunId = loopspaceRuntimeField(event, ["run_id", "runId"]);
+    if (safeRunId && eventRunId && eventRunId !== safeRunId) {
+      continue;
+    }
+    const eventNodeId = loopspaceRuntimeField(event, ["node_id", "nodeId"]);
+    if (safeNodeId && eventNodeId && eventNodeId !== safeNodeId) {
+      continue;
+    }
+    const progress = loopspaceCheckpointProgressFromRuntimeEvent(event);
+    const status = normalizeLoopspaceCheckpointProgressStatus(progress?.status);
+    if (!progress || !status) {
+      continue;
+    }
+    for (const key of loopspaceCheckpointProgressKeys(progress)) {
+      map.set(key, status);
+    }
+  }
+  return map;
+}
+
+function loopspaceCheckpointStatusForNode(node, oneBasedIndex, progressMap) {
+  const nodeId = String(node?.id || "").trim();
+  if (nodeId && progressMap?.has(`id:${nodeId}`)) {
+    return progressMap.get(`id:${nodeId}`);
+  }
+  if (Number.isFinite(oneBasedIndex) && progressMap?.has(`index:${oneBasedIndex}`)) {
+    return progressMap.get(`index:${oneBasedIndex}`);
+  }
+  return "";
 }
 
 function appShellIsMacPlatform() {
@@ -4786,6 +4881,11 @@ const LOOPSPACE_GRAPH_MAX_ZOOM = 2.4;
 const LOOPSPACE_GRAPH_ZOOM_STEP = 1.18;
 const LOOPSPACE_GRAPH_NODE_WIDTH = 220;
 const LOOPSPACE_GRAPH_NODE_HEIGHT = 66;
+const LOOPSPACE_GRAPH_PORT_SIZE = 18;
+const LOOPSPACE_GRAPH_PORT_GAP = 8;
+const LOOPSPACE_GRAPH_DOCUMENT_AUTO_REF_LIMIT = 3;
+const LOOPSPACE_GRAPH_DOCUMENT_BASE_HEIGHT = 112;
+const LOOPSPACE_GRAPH_DOCUMENT_REF_ROW_HEIGHT = 38;
 const LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH = 148;
 const LOOPSPACE_GRAPH_MESSAGE_STEP_HEIGHT = Math.round(LOOPSPACE_GRAPH_MESSAGE_STEP_WIDTH / 1.618);
 const LOOPSPACE_GRAPH_MESSAGE_STEP_GAP = 30;
@@ -5085,6 +5185,13 @@ function loopspaceGraphMessageFlowParentOutputX(nodeLayout) {
   return Math.max(0, (Number(nodeLayout?.width) || 0) - 17);
 }
 
+function loopspaceGraphMessageFlowOrigin(nodeLayout, flowBounds) {
+  return {
+    x: Math.abs(loopspaceGraphMessageFlowParentInputX()),
+    y: Math.max(0, (Number(nodeLayout?.height) || 0) - (Number(flowBounds?.height) || LOOPSPACE_GRAPH_MESSAGE_FLOW_MIN_HEIGHT)),
+  };
+}
+
 function loopspaceGraphMessageFlowPathBetween(fromPoint, toPoint) {
   const dx = Math.max(26, Math.abs(toPoint.x - fromPoint.x) * 0.42);
   return `M ${fromPoint.x} ${fromPoint.y} C ${fromPoint.x + dx} ${fromPoint.y}, ${toPoint.x - dx} ${toPoint.y}, ${toPoint.x} ${toPoint.y}`;
@@ -5173,16 +5280,87 @@ function loopspaceGraphNodeParentId(node) {
   return String(loopspaceGraphPropValue(node?.props || {}, ["parent_id", "parentId", "parent"]) || "").trim();
 }
 
+function loopspaceGraphSourceTextFromRow(row = null) {
+  const graph = row?.graph && typeof row.graph === "object" ? row.graph : null;
+  return String(
+    graph?.source
+      || graph?.sourceText
+      || graph?.source_text
+      || row?.source
+      || row?.sourceText
+      || row?.source_text
+      || "",
+  );
+}
+
+function loopspaceGraphCheckpointPlanForSendMessage(source = "", nodeId = "") {
+  const safeNodeId = String(nodeId || "").trim();
+  if (!safeNodeId || !String(source || "").trim()) {
+    return [];
+  }
+  try {
+    return parseDfBlueprintSource(String(source || ""))
+	      .nodes
+	      .filter((node) => loopspaceGraphNodeParentId(node) === safeNodeId && loopspaceGraphNodeIsMessageStep(node))
+	      .map((node, index) => ({
+	        id: String(node?.id || "").trim(),
+	        index: index + 1,
+	        label: loopspaceGraphStepTitle(node, index),
+	        order: loopspaceGraphStepOrder(node, index + 1) || index + 1,
+	      }))
+      .sort((left, right) => (
+        left.order - right.order
+          || left.label.localeCompare(right.label)
+          || left.id.localeCompare(right.id)
+      ))
+      .map((checkpoint, index) => ({
+        ...checkpoint,
+        index: index + 1,
+      }));
+  } catch {
+    return [];
+  }
+}
+
+function loopspaceGraphCheckpointPlanFromDispatch(value = []) {
+  return (Array.isArray(value) ? value : [])
+    .filter((checkpoint) => checkpoint && typeof checkpoint === "object")
+    .map((checkpoint, index) => ({
+      id: appControlText(checkpoint, ["id", "step_id", "stepId", "checkpoint_id", "checkpointId"]),
+      index: index + 1,
+      label: appControlText(checkpoint, ["label", "title", "name"]) || `Step ${index + 1}`,
+      order: Number.parseInt(checkpoint.order ?? checkpoint.index ?? index + 1, 10) || index + 1,
+    }))
+    .sort((left, right) => (
+      left.order - right.order
+        || left.label.localeCompare(right.label)
+        || left.id.localeCompare(right.id)
+    ))
+    .map((checkpoint, index) => ({
+      ...checkpoint,
+      index: index + 1,
+    }));
+}
+
+function loopspaceGraphCheckpointMatchesProgress(checkpoint = {}, progress = {}) {
+  const stepId = String(progress.stepId || progress.step_id || "").trim();
+  if (stepId && checkpoint.id && stepId === checkpoint.id) {
+    return true;
+  }
+  const stepIndex = Number.parseInt(progress.stepIndex ?? progress.step_index ?? 0, 10);
+  if (Number.isFinite(stepIndex) && stepIndex > 0 && stepIndex === checkpoint.index) {
+    return true;
+  }
+  const stepTitle = String(progress.stepTitle || progress.step_title || progress.title || "").trim().toLowerCase();
+  return Boolean(stepTitle && checkpoint.label && stepTitle === checkpoint.label.toLowerCase());
+}
+
 function loopspaceGraphSnapCoordinate(value) {
   return Math.round(loopspaceGraphFiniteNumber(value, 0) / 16) * 16;
 }
 
 function parseLoopspaceBlueprintGraphSource(source = "") {
   return parseDfBlueprintSource(source);
-}
-
-function loopspaceGraphNodeTemplateIcon(templateId) {
-  return templateId === "device" ? "device" : templateId === "send_message" ? "message" : templateId?.startsWith?.("document_") ? "document" : "node";
 }
 
 function loopspaceGraphDeviceStatus(device) {
@@ -5293,56 +5471,8 @@ function loopspaceGraphDeviceOptionMatches(option, selectedKey = "") {
   return safeCloudMcpArray(option?.aliases).some((alias) => safeCloudMcpText(alias, "").toLowerCase() === key);
 }
 
-function loopspaceGraphDeviceTemplateFromDevice(device) {
-  if (!device || typeof device !== "object" || !cloudDeviceRowLooksRegistered(device)) {
-    return null;
-  }
-  const aliases = cloudDeviceAliasList(device);
-  const deviceId = aliases[0] || safeCloudMcpText(device.device_id || device.id, "");
-  if (!deviceId) return null;
-  const label = safeCloudMcpText(
-    device.device_label
-      || device.deviceLabel
-      || device.device_name
-      || device.deviceName
-      || device.machine_name
-      || device.machineName
-      || device.hostname
-      || device.name,
-    deviceId,
-  );
-  const platform = safeCloudMcpText(device.platform || device.os || device.device_type || device.deviceType, "");
-  const status = loopspaceGraphDeviceStatus(device);
-  return {
-    description: [status, platform].filter(Boolean).join(" - "),
-    device_id: deviceId,
-    icon: "device",
-    id: "device",
-    label,
-    platform,
-    role: "variable",
-    status,
-  };
-}
-
-function loopspaceGraphDeviceTemplatesFromRows(rows = []) {
-  const byDeviceId = new Map();
-  safeCloudMcpArray(rows).forEach((device) => {
-    const template = loopspaceGraphDeviceTemplateFromDevice(device);
-    if (template?.device_id && !byDeviceId.has(template.device_id)) {
-      byDeviceId.set(template.device_id, template);
-    }
-  });
-  return Array.from(byDeviceId.values()).sort((left, right) => (
-    left.label.localeCompare(right.label, undefined, { sensitivity: "base" })
-  ));
-}
-
 function loopspaceGraphPaletteTemplateKey(template = {}) {
   const templateId = String(template?.id || "").trim();
-  if (templateId === "device") {
-    return `${templateId}:${template.device_id || template.deviceId || ""}`;
-  }
   return templateId || "node";
 }
 
@@ -5540,13 +5670,22 @@ function loopspaceGraphNodeLayout(node, index = 0) {
   const documentRefCount = isDocumentContext
     ? loopspaceGraphDocumentRefsFromProps(node?.props || {}).length
     : 0;
+  const documentHeight = isDocumentContext
+    ? loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node?.props || {}, ["h", "height"]), 0)
+    : 0;
   const nodeHeight = isSendMessage
     ? Math.max(
         minHeight,
         loopspaceGraphFiniteNumber(loopspaceGraphPropValue(node.props, ["h", "height"]), defaultHeight),
       )
     : isDocumentContext
-      ? Math.max(minHeight, 112 + (documentRefCount * 38))
+      ? Math.max(
+          minHeight,
+          documentHeight || (
+            LOOPSPACE_GRAPH_DOCUMENT_BASE_HEIGHT
+              + (Math.min(documentRefCount, LOOPSPACE_GRAPH_DOCUMENT_AUTO_REF_LIMIT) * LOOPSPACE_GRAPH_DOCUMENT_REF_ROW_HEIGHT)
+          ),
+        )
     : visualDefaults.sized
       ? Math.max(
           minHeight,
@@ -5603,11 +5742,11 @@ function loopspaceGraphOutputPoint(layout, node = null, portId = "out") {
   const index = Math.max(0, ports.findIndex((port) => port.id === String(portId || "").trim()));
   const safeIndex = index >= 0 ? index : 0;
   const portCount = Math.max(1, ports.length);
-  const portSpacing = 26;
-  const stackHeight = ((portCount - 1) * portSpacing) + 18;
+  const portSpacing = LOOPSPACE_GRAPH_PORT_SIZE + LOOPSPACE_GRAPH_PORT_GAP;
+  const stackHeight = (portCount * LOOPSPACE_GRAPH_PORT_SIZE) + ((portCount - 1) * LOOPSPACE_GRAPH_PORT_GAP);
   const yOffset = portCount === 1
     ? layout.height / 2
-    : ((layout.height - stackHeight) / 2) + 9 + (safeIndex * portSpacing);
+    : ((layout.height - stackHeight) / 2) + (LOOPSPACE_GRAPH_PORT_SIZE / 2) + (safeIndex * portSpacing);
   return {
     x: layout.x + layout.width,
     y: layout.y + yOffset,
@@ -6173,12 +6312,29 @@ function LoopspaceRuntimeView({
   const recordGraphNodeSize = useCallback((nodeId, element) => {
     if (!element) return;
     if (element.getAttribute?.("data-settings-open") === "true") return;
+    const nodeKind = element.getAttribute?.("data-kind");
+    const isDocumentContextNode = nodeKind === "document_read" || nodeKind === "document_write";
+    const existing = nodeSizesRef.current[nodeId];
+    if (
+      isDocumentContextNode
+      && element.getAttribute?.("data-explicit-height") !== "true"
+      && existing?.manual !== true
+    ) {
+      return;
+    }
     const width = element.offsetWidth;
     const height = element.offsetHeight;
     if (!width || !height) return;
     const previous = nodeSizesRef.current[nodeId];
     if (previous && previous.width === width && previous.height === height) return;
-    const next = { ...nodeSizesRef.current, [nodeId]: { width, height } };
+    const next = {
+      ...nodeSizesRef.current,
+      [nodeId]: {
+        width,
+        height,
+        ...(previous?.manual === true ? { manual: true } : {}),
+      },
+    };
     nodeSizesRef.current = next;
     setNodeSizes(next);
   }, []);
@@ -6593,13 +6749,13 @@ function LoopspaceRuntimeView({
     () => parsedGraph.nodes.filter((node) => !loopspaceGraphNodeParentId(node)),
     [parsedGraph.nodes],
   );
-  const visibleGraphNodeIds = useMemo(
-    () => new Set(visibleGraphNodes.map((node) => node.id)),
-    [visibleGraphNodes],
+  const graphNodeIds = useMemo(
+    () => new Set(parsedGraph.nodes.map((node) => node.id)),
+    [parsedGraph.nodes],
   );
   const visibleGraphEdges = useMemo(
-    () => parsedGraph.edges.filter((edge) => visibleGraphNodeIds.has(edge.from) && visibleGraphNodeIds.has(edge.to)),
-    [parsedGraph.edges, visibleGraphNodeIds],
+    () => parsedGraph.edges.filter((edge) => graphNodeIds.has(edge.from) && graphNodeIds.has(edge.to)),
+    [graphNodeIds, parsedGraph.edges],
   );
 
   const attachedTriggerIds = useMemo(() => {
@@ -6672,12 +6828,8 @@ function LoopspaceRuntimeView({
   }, [loopspaceGraphLiveDeviceRows]);
 
   const loopspaceGraphPaletteTemplates = useMemo(() => {
-    const deviceTemplates = loopspaceGraphDeviceTemplatesFromRows(loopspaceGraphLiveDeviceRows);
-    return [
-      ...deviceTemplates,
-      ...LOOPSPACE_GRAPH_NODE_TEMPLATES,
-    ];
-  }, [loopspaceGraphLiveDeviceRows]);
+    return LOOPSPACE_GRAPH_NODE_TEMPLATES;
+  }, []);
 
   const graphPaletteTemplateByKey = useMemo(() => {
     const map = new Map();
@@ -6720,14 +6872,23 @@ function LoopspaceRuntimeView({
       const measured = nodeSizes[node.id];
       const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
       const baseLayout = loopspaceGraphNodeLayout(node, index);
+      const isDocumentContextNode = node.nodeKind === "document_read" || node.nodeKind === "document_write";
+      const hasExplicitDocumentHeight = isDocumentContextNode
+        && Boolean(loopspaceGraphPropValue(node.props, ["h", "height"]));
       const sizedNode = Boolean(visualDefaults.sized || visualDefaults.minWidth || visualDefaults.minHeight);
       let layout = {
         ...baseLayout,
         ...(measured && measured.width && measured.height ? {
-          height: sizedNode
+          height: isDocumentContextNode
+            ? (hasExplicitDocumentHeight || measured.manual === true
+                ? Math.max(visualDefaults.minHeight || baseLayout.height, baseLayout.height, measured.height)
+                : baseLayout.height)
+            : sizedNode
             ? Math.max(visualDefaults.minHeight || baseLayout.height, measured.height)
             : measured.height,
-          width: sizedNode
+          width: isDocumentContextNode
+            ? baseLayout.width
+            : sizedNode
             ? Math.max(visualDefaults.minWidth || baseLayout.width, measured.width)
             : measured.width,
         } : {}),
@@ -6761,8 +6922,55 @@ function LoopspaceRuntimeView({
       map.set(node.id, layout);
       map.set(loopspaceGraphNodeIdFromLabel(node.label), layout);
     });
+    visibleGraphNodes.forEach((node) => {
+      if (node.nodeKind !== "send_message" || sendMessageSettingsNodeId === node.id) return;
+      const parentLayout = map.get(node.id);
+      if (!parentLayout) return;
+      const children = parsedGraph.nodes
+        .filter((item) => loopspaceGraphNodeParentId(item) === node.id)
+        .map((item, itemIndex) => ({ item, itemIndex }))
+        .sort((left, right) => {
+          const orderDelta = loopspaceGraphMessageChildOrder(left.item, left.itemIndex + 1)
+            - loopspaceGraphMessageChildOrder(right.item, right.itemIndex + 1);
+          return orderDelta || (left.itemIndex - right.itemIndex);
+        });
+      if (!children.length) return;
+      const priorityChild = sendMessageCheckpointLayoutPriorityId
+        ? parsedGraph.nodes.find((item) => item.id === sendMessageCheckpointLayoutPriorityId)
+        : null;
+      const reserveDragSlot = priorityChild && loopspaceGraphNodeParentId(priorityChild) === node.id ? 1 : 0;
+      const flowBounds = loopspaceGraphMessageFlowBounds(parentLayout, node, children.length + reserveDragSlot);
+      const flowOrigin = loopspaceGraphMessageFlowOrigin(parentLayout, flowBounds);
+      const flowNodes = loopspaceGraphResolveMessageFlowNodes(children.map(({ item, itemIndex }, flowIndex) => {
+        const baseLayout = loopspaceGraphMessageChildLocalPosition(item, flowIndex, flowBounds);
+        const dragPosition = sendMessageCheckpointDragPositions[item.id];
+        return {
+          dragging: Boolean(dragPosition) && item.id === sendMessageCheckpointLayoutPriorityId,
+          item,
+          itemIndex,
+          layout: dragPosition
+            ? {
+              ...baseLayout,
+              x: dragPosition.x,
+              y: dragPosition.y,
+            }
+            : baseLayout,
+          priority: item.id === sendMessageCheckpointLayoutPriorityId,
+        };
+      }), flowBounds);
+      flowNodes.forEach(({ item, layout }) => {
+        if (!item?.id || !layout) return;
+        const absoluteLayout = {
+          ...layout,
+          x: parentLayout.x + flowOrigin.x + layout.x,
+          y: parentLayout.y + flowOrigin.y + layout.y,
+        };
+        map.set(item.id, absoluteLayout);
+        map.set(loopspaceGraphNodeIdFromLabel(item.label), absoluteLayout);
+      });
+    });
     return map;
-  }, [nodeDragPositions, nodeSizes, parsedGraph.nodes, sendMessageCheckpointLayoutPriorityId, sendMessageSettingsNodeId, visibleGraphNodes]);
+  }, [nodeDragPositions, nodeSizes, parsedGraph.nodes, sendMessageCheckpointDragPositions, sendMessageCheckpointLayoutPriorityId, sendMessageSettingsNodeId, visibleGraphNodes]);
 
   const commitLoopspaceGraphSource = useCallback(async (nextSource, fallbackError, options = {}) => {
     if (!loopspaceId || busy) return;
@@ -6905,9 +7113,7 @@ function LoopspaceRuntimeView({
     }
     const nextSource = addDfBlueprintNode(baseSource, node);
     if (nextSource === baseSource) {
-      setRuntimeError(template.id === "device"
-        ? "Device is already on this loop graph."
-        : "Graph node is already on this loop graph.");
+      setRuntimeError("Graph node is already on this loop graph.");
       return;
     }
     await commitLoopspaceGraphSource(nextSource, "Unable to add graph node.", {
@@ -7119,6 +7325,21 @@ function LoopspaceRuntimeView({
     });
   }, [updateSendMessageNodeProps]);
 
+  const updateDocumentContextSize = useCallback(async (node, size) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy) return;
+    const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node || "document_read");
+    const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, nodeId, {
+      props: {
+        h: String(Math.round(Math.max(
+          visualDefaults.minHeight || visualDefaults.height || 128,
+          Number(size?.height) || visualDefaults.height || 128,
+        ))),
+      },
+    });
+    await commitLoopspaceGraphSource(nextSource, "Unable to resize document context node.");
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
+
   const updateSendMessageCheckpointPosition = useCallback(async (node, checkpoint, position) => {
     const nodeId = String(node?.id || "").trim();
     const checkpointId = String(checkpoint?.id || "").trim();
@@ -7168,6 +7389,7 @@ function LoopspaceRuntimeView({
     if (!fromNode || !toNode || fromNode.id === toNode.id || busy) return;
     const validation = validateLoopspaceGraphEdgeCandidate(fromNode, toNode, {
       fromPort,
+      nodeById: graphNodeLookup,
       toPort: "in",
     });
     if (!validation.ok) {
@@ -7240,6 +7462,56 @@ function LoopspaceRuntimeView({
     window.addEventListener("pointerup", onEnd, { passive: false });
     window.addEventListener("pointercancel", onEnd, { passive: false });
   }, [busy, updateSendMessageSize]);
+
+  const startDocumentContextResize = useCallback((event, node, layout) => {
+    if (
+      busy
+      || event.button !== 0
+      || !node?.id
+      || !layout
+      || (node.nodeKind !== "document_read" && node.nodeKind !== "document_write")
+    ) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    const startY = event.clientY;
+    const zoom = canvasZoomRef.current || 1;
+    const startHeight = layout.height;
+    const visualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
+    const minHeight = visualDefaults.minHeight || visualDefaults.height || 128;
+    const pointerId = event.pointerId;
+    const target = event.currentTarget;
+    target?.setPointerCapture?.(pointerId);
+    const onMove = (moveEvent) => {
+      if (moveEvent.pointerId !== pointerId) return;
+      moveEvent.preventDefault();
+      const height = loopspaceGraphSnapCoordinate(startHeight + ((moveEvent.clientY - startY) / zoom));
+      const next = {
+        ...nodeSizesRef.current,
+        [node.id]: {
+          height: Math.max(minHeight, height),
+          manual: true,
+          width: layout.width,
+        },
+      };
+      nodeSizesRef.current = next;
+      setNodeSizes(next);
+    };
+    const onEnd = (endEvent) => {
+      if (endEvent.pointerId !== pointerId) return;
+      endEvent.preventDefault();
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onEnd);
+      window.removeEventListener("pointercancel", onEnd);
+      target?.releasePointerCapture?.(pointerId);
+      const size = nodeSizesRef.current[node.id] || layout;
+      void updateDocumentContextSize(node, size);
+    };
+    window.addEventListener("pointermove", onMove, { passive: false });
+    window.addEventListener("pointerup", onEnd, { passive: false });
+    window.addEventListener("pointercancel", onEnd, { passive: false });
+  }, [busy, updateDocumentContextSize]);
 
   const startSendMessageCheckpointDrag = useCallback((event, node, checkpoint, checkpointIndex = 0, stepLayout = null) => {
     if (busy || event.button !== 0 || !node?.id || !checkpoint?.id) return;
@@ -8005,6 +8277,14 @@ function LoopspaceRuntimeView({
     [loopspaceId, runtimeEvents],
   );
   const visibleRuntimeEvents = scopedRuntimeEvents.length ? scopedRuntimeEvents : legacyRuntimeEvents;
+  const sendMessageCheckpointProgressByKey = useMemo(
+    () => buildLoopspaceCheckpointProgressMap(
+      visibleRuntimeEvents,
+      runtimeHeadRunId,
+      runtimeHeadNodeId,
+    ),
+    [runtimeHeadNodeId, runtimeHeadRunId, visibleRuntimeEvents],
+  );
   const selectedRuntimeEvent = useMemo(() => (
     visibleRuntimeEvents.find((event) => event.id === selectedHistoryRunId) || null
   ), [selectedHistoryRunId, visibleRuntimeEvents]);
@@ -8330,9 +8610,19 @@ function LoopspaceRuntimeView({
                 const sendMessageSteps = sendMessageCheckpoints
                   .filter(loopspaceGraphNodeIsMessageStep)
                   .map((item, itemIndex) => ({ item, itemIndex }))
-                  .sort((left, right) => (
-                    loopspaceGraphStepOrder(left.item, left.itemIndex + 1) - loopspaceGraphStepOrder(right.item, right.itemIndex + 1)
-                  ));
+                  .sort((left, right) => {
+                    const orderDelta = loopspaceGraphStepOrder(left.item, left.itemIndex + 1)
+                      - loopspaceGraphStepOrder(right.item, right.itemIndex + 1);
+                    return orderDelta
+                      || loopspaceGraphStepTitle(left.item, left.itemIndex).localeCompare(
+                        loopspaceGraphStepTitle(right.item, right.itemIndex),
+                      );
+                  });
+                const sendMessageStepProgressIndexById = new Map(
+                  sendMessageSteps
+                    .map(({ item }, stepIndex) => [String(item.id || "").trim(), stepIndex + 1])
+                    .filter(([id]) => id),
+                );
                 const sendMessageFlowBounds = isSendMessageRegion
                   ? loopspaceGraphMessageFlowBounds(
                     nodeLayout,
@@ -8410,6 +8700,37 @@ function LoopspaceRuntimeView({
                 const cronCountdown = node.triggerId && (trigger?.type || "").toLowerCase() === "cron"
                   ? formatLoopspaceCountdown(trigger?.nextDueAtMs, timerNowMs)
                   : "";
+                const nodeTitle = node.nodeKind === "run_script"
+                  ? "Run script"
+                  : node.nodeKind === "device"
+                    ? graphDeviceLabel
+                    : isDocumentContextNode
+                      ? (isDocumentReadNode ? "Document read" : "Document write")
+                      : (trigger?.name || node.label);
+                const nodeSubtitleBase = node.triggerId
+                  ? loopspaceTriggerTypeLabel(trigger?.type || "manual")
+                  : node.nodeKind === "device"
+                    ? [
+                        "Device",
+                        graphDeviceStatus,
+                      ].filter(Boolean).join(" - ")
+                    : node.nodeKind === "run_script"
+                      ? "Run script"
+                      : node.nodeKind === "send_message"
+                        ? "Send message"
+                        : isDocumentReadNode
+                          ? "Readable docs"
+                          : isDocumentWriteNode
+                            ? "Writable docs"
+                            : (type || "Graph node");
+                const nodeTitleKey = String(nodeTitle || "").trim().toLowerCase();
+                const nodeSubtitle = [
+                  nodeSubtitleBase,
+                  isRuntimeNode ? (runtimeHead?.status || "active") : "",
+                ]
+                  .filter(Boolean)
+                  .filter((part) => String(part || "").trim().toLowerCase() !== nodeTitleKey)
+                  .join(" - ");
                 return (
                   <LoopspaceGraphNode
                     data-kind={node.triggerId ? (trigger?.type || "manual") : (node.nodeKind || "loop")}
@@ -8420,6 +8741,7 @@ function LoopspaceRuntimeView({
                     data-pending={pendingGraphNodeIds.has(node.id) ? "true" : undefined}
                     data-runtime={isRuntimeNode ? String(runtimeHead?.status || "active") : undefined}
                     data-settings-open={sendMessageSettingsOpen ? "true" : undefined}
+                    data-explicit-height={isDocumentContextNode && loopspaceGraphPropValue(node.props, ["h", "height"]) ? "true" : undefined}
                     key={node.id}
                     onPointerCancel={finishGraphNodeDrag}
                     onPointerDown={(event) => startGraphNodeDrag(event, node)}
@@ -8458,28 +8780,8 @@ function LoopspaceRuntimeView({
                       <Icon aria-hidden="true" />
                     </LoopspaceGraphNodeIcon>
                     <LoopspaceGraphNodeText>
-                      <strong>{node.nodeKind === "run_script" ? "Run script" : node.nodeKind === "device" ? graphDeviceLabel : isDocumentContextNode ? (isDocumentReadNode ? "Document read" : "Document write") : (trigger?.name || node.label)}</strong>
-                      <span>
-                        {[
-                          node.triggerId
-                            ? loopspaceTriggerTypeLabel(trigger?.type || "manual")
-                            : node.nodeKind === "device"
-                              ? [
-                                  "Device",
-                                  graphDeviceStatus,
-                                ].filter(Boolean).join(" - ")
-                              : node.nodeKind === "run_script"
-                                ? "Run script"
-                              : node.nodeKind === "send_message"
-                                ? "Send message"
-                              : isDocumentReadNode
-                                ? "Readable docs"
-                              : isDocumentWriteNode
-                                ? "Writable docs"
-                                : (type || "Graph node"),
-                          isRuntimeNode ? (runtimeHead?.status || "active") : "",
-                        ].filter(Boolean).join(" - ")}
-                      </span>
+                      <strong>{nodeTitle}</strong>
+                      {nodeSubtitle ? <span>{nodeSubtitle}</span> : null}
                       {cronCountdown ? (
                         <LoopspaceGraphNodeTimer>
                           <Schedule aria-hidden="true" />
@@ -8796,8 +9098,14 @@ function LoopspaceRuntimeView({
                               {sendMessageFlowNodes.map(({ item: stepNode, itemIndex, layout: stepLayout }, flowIndex) => {
                                 const stepTitle = loopspaceGraphMessageChildTitle(stepNode, itemIndex);
                                 const stepSubtitle = loopspaceGraphMessageChildSubtitle(stepNode, itemIndex);
+                                const stepRuntimeStatus = loopspaceCheckpointStatusForNode(
+                                  stepNode,
+                                  sendMessageStepProgressIndexById.get(String(stepNode.id || "").trim()) || 0,
+                                  sendMessageCheckpointProgressByKey,
+                                );
                                 return (
                                   <LoopspaceGraphMessageFlowNode
+                                    data-status={stepRuntimeStatus || undefined}
                                     data-kind={stepNode.nodeKind || stepNode.kind || "step"}
                                     key={stepNode.id}
                                     onPointerDown={(event) => startSendMessageCheckpointDrag(event, node, stepNode, flowIndex, stepLayout)}
@@ -8807,14 +9115,43 @@ function LoopspaceRuntimeView({
                                       "--loopspace-flow-node-x": `${stepLayout.x}px`,
                                       "--loopspace-flow-node-y": `${stepLayout.y}px`,
                                     }}
-                                    title={stepTitle}
+                                    title={[stepTitle, stepRuntimeStatus].filter(Boolean).join(" - ")}
                                   >
-                                    <LoopspaceGraphMessageFlowNodePort data-side="input" aria-hidden="true" />
+                                    <LoopspaceGraphMessageFlowNodePort
+                                      aria-label={`Attach readable documents to ${stepTitle}`}
+                                      as="button"
+                                      data-loopspace-graph-input-id={stepNode.id}
+                                      data-loopspace-graph-port="true"
+                                      data-side="input"
+                                      onPointerDown={(event) => {
+                                        if (!event.altKey) {
+                                          event.stopPropagation();
+                                          return;
+                                        }
+                                        event.preventDefault();
+                                        event.stopPropagation();
+                                        void disconnectGraphPort(stepNode.id, "input", "in");
+                                      }}
+                                      title="Drop document read context here. Option/Alt-click to unlink this input."
+                                      type="button"
+                                    />
                                     <LoopspaceGraphMessageFlowNodeText>
                                       <strong>{stepTitle}</strong>
                                       {stepSubtitle ? <span>{stepSubtitle}</span> : null}
                                     </LoopspaceGraphMessageFlowNodeText>
-                                    <LoopspaceGraphMessageFlowNodePort data-side="output" aria-hidden="true" />
+                                    <LoopspaceGraphMessageFlowNodePort
+                                      aria-label={`Connect writable document output from ${stepTitle}`}
+                                      as="button"
+                                      data-active={pendingConnection?.fromId === stepNode.id && pendingConnection?.fromPort === "docs" ? "true" : undefined}
+                                      data-loopspace-graph-port="true"
+                                      data-side="output"
+                                      onPointerCancel={finishGraphConnection}
+                                      onPointerDown={(event) => startGraphConnection(event, stepNode, "docs")}
+                                      onPointerMove={moveGraphConnection}
+                                      onPointerUp={finishGraphConnection}
+                                      title="Drag to a document write node. Option/Alt-click to unlink this output."
+                                      type="button"
+                                    />
                                   </LoopspaceGraphMessageFlowNode>
                                 );
                               })}
@@ -8829,6 +9166,16 @@ function LoopspaceRuntimeView({
                           type="button"
                         />
                       </>
+                    ) : null}
+                    {isDocumentContextNode ? (
+                      <LoopspaceGraphMessageResize
+                        aria-label={`Resize ${nodeTitle}`}
+                        data-axis="vertical"
+                        disabled={busy}
+                        onPointerDown={(event) => startDocumentContextResize(event, node, nodeLayout)}
+                        title="Resize document list"
+                        type="button"
+                      />
                     ) : null}
                     {canRemoveNode ? (
                       <LoopspaceGraphNodeAction
@@ -9089,18 +9436,14 @@ function LoopspaceRuntimeView({
                 ) : runtimePanelTab === "nodes" ? (
                   <LoopspaceRuntimePanelGrid>
                     {runtimePanelNodeTemplates.map((template) => {
-                        const PaletteIcon = template.id === "device"
-                          ? Devices
-                          : template.id === "run_script"
-                            ? Terminal
-                            : template.id === "send_message"
-                              ? AdsClick
-                              : template.id === "document_read" || template.id === "document_write"
-                                ? AccountTree
-                              : AccountTree;
-                      const templateKey = template.id === "device"
-                        ? `${template.id}:${template.device_id}`
-                        : template.id;
+                      const PaletteIcon = template.id === "run_script"
+                        ? Terminal
+                        : template.id === "send_message"
+                          ? AdsClick
+                          : template.id === "document_read" || template.id === "document_write"
+                            ? AccountTree
+                            : AccountTree;
+                      const templateKey = template.id;
                       return (
                         <LoopspaceRuntimePanelNodeCard
                           data-kind={template.id}
@@ -15007,6 +15350,7 @@ export default function App() {
   const workspaceToolLayoutRef = useRef(null);
   const workspaceToolPanelRef = useRef(null);
   const workspaceToolMainPanelRef = useRef(null);
+  const appControlLoopspaceCheckpointPlansByRunIdRef = useRef(new Map());
   const appScriptsShelfRef = useRef(null);
   const [cloudSqliteResetState, setCloudSqliteResetState] = useState("idle");
   const [cloudSqliteResetMessage, setCloudSqliteResetMessage] = useState("");
@@ -28303,6 +28647,16 @@ export default function App() {
       }
       return null;
     };
+    const remoteCommandArrayField = (event, keys) => {
+      const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+      for (const key of keys) {
+        const value = event?.[key] ?? payload?.[key];
+        if (Array.isArray(value)) {
+          return value;
+        }
+      }
+      return [];
+    };
     const hydrateRemoteCommandTodoText = async (event, workspaceId, currentText = "") => {
       const existingText = String(currentText || "").trim();
       if (existingText) {
@@ -30031,6 +30385,10 @@ export default function App() {
             "trigger_run_id",
             "triggerRunId",
           ]);
+          const checkpointPlan = remoteCommandArrayField(event, [
+            "checkpoint_plan",
+            "checkpointPlan",
+          ]);
           const dispatchSource = remoteCommandObjectField(event, [
             "dispatch_source",
             "dispatchSource",
@@ -30218,12 +30576,29 @@ export default function App() {
               terminalScope: "device",
               workspaceId: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
             });
+            if (loopRuntimeRunId && checkpointPlan.length) {
+              const plansByRunId = appControlLoopspaceCheckpointPlansByRunIdRef.current;
+              plansByRunId.set(loopRuntimeRunId, {
+                checkpointPlan: loopspaceGraphCheckpointPlanFromDispatch(checkpointPlan),
+                createdAtMs: Date.now(),
+                loopRuntimeNodeId,
+                loopspaceId: loopspaceRuntimeId,
+              });
+              if (plansByRunId.size > 200) {
+                const staleKeys = [...plansByRunId.entries()]
+                  .sort((left, right) => Number(left[1]?.createdAtMs || 0) - Number(right[1]?.createdAtMs || 0))
+                  .slice(0, plansByRunId.size - 200)
+                  .map(([key]) => key);
+                staleKeys.forEach((key) => plansByRunId.delete(key));
+              }
+            }
             window.dispatchEvent(new CustomEvent(REMOTE_APP_CONTROL_SEND_MESSAGE_EVENT, {
               detail: {
                 agentId,
                 body: text,
                 commandId,
                 commandKind,
+                checkpointPlan,
                 dispatchSource,
                 dispatchTarget,
                 event,
@@ -31356,6 +31731,183 @@ export default function App() {
         selection: context.highlightedRange || null,
       };
     };
+    const appControlDocumentRowType = (document = {}) => {
+      const entryKind = String(document.entry_kind || document.entryKind || "").trim().toLowerCase();
+      if (entryKind === "folder" || entryKind === "document") return entryKind;
+      const rowType = String(document.row_type || document.rowType || document.type || "").trim().toLowerCase();
+      const kind = String(document.kind || "").trim().toLowerCase();
+      return rowType === "folder" || kind === "account_document_folder" ? "folder" : "document";
+    };
+    const appControlDocumentContent = (document = {}) => String(
+      document.content ?? document.content_md ?? document.contentMd ?? document.body ?? "",
+    );
+    const appControlDocumentHasInlineContent = (document = {}) => appControlDocumentContent(document).length > 0;
+    const appControlDocumentSummary = (document = {}, options = {}) => {
+      const rowType = appControlDocumentRowType(document);
+      const documentKind = normalizedDocumentKind(
+        document.documentKind || document.document_kind || document.source || document.kind,
+        document.collection || document.source,
+      );
+      const pathKey = normalizedDocumentPath(document.pathKey || document.path_key || document.filePath || document.file_path);
+      const filePath = normalizedDocumentPath(document.filePath || document.file_path || pathKey);
+      const parentPathKey = normalizedDocumentPath(
+        document.parentPathKey
+          || document.parent_path_key
+          || document.folderPath
+          || document.folder_path
+          || pathKey.split("/").slice(0, -1).join("/"),
+      );
+      const fileName = normalizedDocumentPath(document.fileName || document.file_name).split("/").filter(Boolean).pop()
+        || filePath.split("/").filter(Boolean).pop()
+        || `${String(document.title || document.name || document.id || "document").trim() || "document"}.${documentExtensionForKind(documentKind)}`;
+      const documentKey = accountDocumentStorageKey(document)
+        || normalizedDocumentPath(document.documentKey || document.document_key || pathKey)
+        || String(document.id || "").trim();
+      const sizeBytes = Number(document.sizeBytes ?? document.size_bytes);
+      const summary = {
+        document_id: String(document.doc_id || document.document_id || document.id || "").trim(),
+        document_key: documentKey,
+        extension: String(document.extension || document.ext || documentExtensionForKind(documentKind)).trim(),
+        file_name: fileName,
+        file_path: filePath,
+        folder_path: normalizedDocumentPath(document.folderPath || document.folder_path || parentPathKey),
+        has_content: document.hasContent === true
+          || document.has_content === true
+          || document.hasContentPayload === true
+          || document.has_content_payload === true
+          || appControlDocumentHasInlineContent(document),
+        has_content_payload: document.hasContentPayload === true || document.has_content_payload === true,
+        kind: documentKind,
+        local_path: String(document.localPath || document.local_path || "").trim(),
+        parent_path_key: parentPathKey,
+        path_key: pathKey,
+        pending_push: document.pendingPush === true || document.pending_push === true,
+        row_type: rowType,
+        source: String(document.source || documentKind).trim(),
+        sync_status: String(document.syncStatus || document.sync_status || "").trim(),
+        title: String(document.title || document.name || document.label || document.id || fileName).trim(),
+        updated_at: String(document.updatedAt || document.updated_at || document.localSavedAt || document.local_saved_at || "").trim(),
+      };
+      if (Number.isFinite(sizeBytes)) {
+        summary.size_bytes = sizeBytes;
+      }
+      const contentHash = String(document.contentHash || document.content_hash || document.sha256 || "").trim();
+      if (contentHash) {
+        summary.content_hash = contentHash;
+      }
+      if (options.includeContent === true && rowType !== "folder") {
+        summary.content = appControlDocumentContent(document);
+      }
+      return summary;
+    };
+    const appControlDocumentLookupValues = (document = {}) => appControlStringValues(
+      accountDocumentStorageKey(document),
+      document.documentKey,
+      document.document_key,
+      document.doc_id,
+      document.document_id,
+      document.id,
+      document.pathKey,
+      document.path_key,
+      document.filePath,
+      document.file_path,
+      document.fileName,
+      document.file_name,
+      document.title,
+      document.name,
+      document.label,
+    );
+    const appControlLookupNeedles = (...values) => {
+      const needles = new Set();
+      appControlStringValues(...values).forEach((value) => {
+        const raw = String(value || "").trim();
+        const normalizedPath = normalizedDocumentPath(raw);
+        [raw, normalizedPath].forEach((candidate) => {
+          const key = String(candidate || "").trim().toLowerCase();
+          if (key) needles.add(key);
+        });
+      });
+      return needles;
+    };
+    const resolveAppControlDocumentFromRows = (input = {}, rows = []) => {
+      const needles = appControlLookupNeedles(
+        input.document_key,
+        input.documentKey,
+        input.doc_id,
+        input.docId,
+        input.document_id,
+        input.documentId,
+        input.id,
+        input.path_key,
+        input.pathKey,
+        input.file_path,
+        input.filePath,
+        input.file_name,
+        input.fileName,
+        input.title,
+        input.name,
+      );
+      if (!needles.size) return null;
+      return rows.find((document) => appControlDocumentLookupValues(document).some((value) => {
+        const raw = String(value || "").trim().toLowerCase();
+        const normalizedPath = normalizedDocumentPath(value).toLowerCase();
+        return (raw && needles.has(raw)) || (normalizedPath && needles.has(normalizedPath));
+      })) || null;
+    };
+    const buildAppControlDocsInventoryFromRows = (rows = [], options = {}) => {
+      const includeContent = options.includeContent === true;
+      const includeDrafts = options.includeDrafts !== false;
+      const byKey = new Map();
+      if (includeDrafts) {
+        const draft = getWorkspaceToolsDocumentDraft();
+        if (draft) {
+          const draftKey = accountDocumentStorageKey(draft) || String(draft.id || draft.title || "draft").trim();
+          if (draftKey) byKey.set(`draft:${draftKey}`, { ...draft, isDraft: true, draft: true, syncStatus: "draft" });
+        }
+      }
+      (Array.isArray(rows) ? rows : []).forEach((document) => {
+        const key = accountDocumentStorageKey(document) || String(document?.id || document?.title || "").trim();
+        if (key) byKey.set(key, document);
+      });
+      const items = Array.from(byKey.values())
+        .map((document) => appControlDocumentSummary(document, { includeContent }))
+        .filter((document) => document.document_key || document.path_key || document.document_id || document.title);
+      const documents = items.filter((document) => document.row_type !== "folder");
+      const folders = items.filter((document) => document.row_type === "folder");
+      return {
+        count: documents.length,
+        document_count: documents.length,
+        documents,
+        folder_count: folders.length,
+        folders,
+        item_count: items.length,
+        items,
+        version: getWorkspaceToolsVersion(),
+      };
+    };
+    const buildAppControlDocsInventory = async (input = {}) => {
+      const refresh = appControlBooleanValue(input.refresh ?? input.force ?? input.remote, false);
+      await refreshWorkspaceToolsAccountSkills({ force: refresh }).catch(() => undefined);
+      return {
+        ...buildAppControlDocsInventoryFromRows(getWorkspaceToolsAccountSkills(), {
+          includeContent: appControlBooleanValue(input.includeContent ?? input.include_content, false),
+          includeDrafts: input.includeDrafts !== false && input.include_drafts !== false,
+        }),
+        refreshed: refresh,
+        source: "workspace_tools_store",
+      };
+    };
+    const hydrateAppControlDocument = async (document) => {
+      const result = await invoke("cloud_mcp_hydrate_account_document", {
+        request: accountDocumentHydrateRequestFromSkill(document),
+      });
+      const hydrated = skillsFromUnits(accountDocumentUnitsFromPayload(result));
+      const requestedKey = accountDocumentStorageKey(document) || String(document?.id || "").trim();
+      return hydrated.find((candidate) => (
+        requestedKey
+        && (accountDocumentStorageKey(candidate) || String(candidate?.id || "").trim()) === requestedKey
+      )) || hydrated[0] || null;
+    };
     const updateHiddenAppControlDocumentDraft = (input = {}) => {
       const visibleContext = buildAppControlVisibleContext(
         { includeContent: true, include_content: true },
@@ -31535,6 +32087,10 @@ export default function App() {
         activeView: activeViewRef.current || activeView,
         visibleContext: buildAppControlVisibleContext(),
         visibleView: visibleViewRef.current || visibleView,
+        accountDocs: buildAppControlDocsInventoryFromRows(getWorkspaceToolsAccountSkills(), {
+          includeContent: false,
+          includeDrafts: true,
+        }),
         localScripts: {
           count: localScripts.length,
           root: appScriptText(appScriptsLibrary.root),
@@ -31674,6 +32230,62 @@ export default function App() {
             ok: true,
             data: {
               ...buildAppControlVisibleContext(input),
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "list_docs") {
+          const inventory = await buildAppControlDocsInventory(input);
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              inventory,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "get_doc") {
+          const includeContent = appControlBooleanValue(input.includeContent ?? input.include_content, true);
+          const inventory = await buildAppControlDocsInventory({ ...input, includeContent: false, include_content: false });
+          const draftDocument = getWorkspaceToolsDocumentDraft();
+          let document = resolveAppControlDocumentFromRows(input, [
+            ...getWorkspaceToolsAccountSkills(),
+            ...(draftDocument ? [draftDocument] : []),
+          ]);
+          if (!document) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "document_not_found",
+                message: "No account document matched the requested id, path_key, document_key, title, or name.",
+              },
+              data: {
+                inventory,
+                state: buildAppControlState(),
+              },
+            });
+            return;
+          }
+          if (includeContent && appControlDocumentRowType(document) !== "folder") {
+            const shouldHydrate = input.hydrate === true
+              || document.contentStale === true
+              || document.content_stale === true
+              || !appControlDocumentHasInlineContent(document);
+            if (shouldHydrate) {
+              const hydrated = await hydrateAppControlDocument(document).catch(() => null);
+              if (hydrated) {
+                document = hydrated;
+              }
+            }
+          }
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              document: appControlDocumentSummary(document, { includeContent }),
               state: buildAppControlState(),
             },
           });
@@ -32103,6 +32715,200 @@ export default function App() {
           return;
         }
 
+        if (tool === "record_loopspace_step_progress") {
+          const loopspaceId = appControlText(input, ["loopspace_id", "loopspaceId"]);
+          const loopRuntimeRunId = appControlText(input, ["loop_runtime_run_id", "loopRuntimeRunId", "run_id", "runId"]);
+          let loopRuntimeNodeId = appControlText(input, ["loop_runtime_node_id", "loopRuntimeNodeId", "node_id", "nodeId"]);
+          const loopRuntimeEdgeId = appControlText(input, ["loop_runtime_edge_id", "loopRuntimeEdgeId", "edge_id", "edgeId"]);
+          const triggerId = appControlText(input, ["trigger_id", "triggerId"]);
+          const triggerRunId = appControlText(input, ["trigger_run_id", "triggerRunId"]);
+          const rawStatus = appControlText(input, ["status", "step_status", "stepStatus"])
+            .toLowerCase()
+            .replace(/[\s-]+/g, "_");
+          const stepStatus = ["running", "completed", "failed", "skipped"].includes(rawStatus)
+            ? rawStatus
+            : "running";
+          const stepIndex = Number.parseInt(
+            input?.step_index ?? input?.stepIndex ?? input?.index ?? input?.ordinal ?? 0,
+            10,
+          );
+          const stepId = appControlText(input, ["step_id", "stepId", "checkpoint_id", "checkpointId"]);
+          const stepTitle = appControlText(input, ["step_title", "stepTitle", "title", "label", "name"]);
+          const progressMessage = appControlText(input, ["message", "summary", "detail", "details"]);
+          if (!loopspaceId || !loopRuntimeRunId) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "loopspace_runtime_required",
+                message: "record_loopspace_step_progress requires loopspace_id and loop_runtime_run_id.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          const checkpointProgress = {
+            ...(Number.isFinite(stepIndex) && stepIndex > 0 ? {
+              stepIndex,
+              step_index: stepIndex,
+              stepOrdinal: stepIndex,
+              step_ordinal: stepIndex,
+            } : {}),
+            ...(stepId ? { stepId, step_id: stepId } : {}),
+            ...(stepTitle ? { stepTitle, step_title: stepTitle, title: stepTitle } : {}),
+            status: stepStatus,
+            ...(progressMessage ? { message: progressMessage } : {}),
+            source: "app_control_mcp",
+            updatedAt: new Date().toISOString(),
+          };
+          let checkpointPlan = [];
+          let checkpointPlanSource = "";
+          const cachedCheckpointPlan = appControlLoopspaceCheckpointPlansByRunIdRef.current.get(loopRuntimeRunId);
+          if (
+            cachedCheckpointPlan
+            && (!cachedCheckpointPlan.loopspaceId || cachedCheckpointPlan.loopspaceId === loopspaceId)
+          ) {
+            if (!loopRuntimeNodeId && cachedCheckpointPlan.loopRuntimeNodeId) {
+              loopRuntimeNodeId = cachedCheckpointPlan.loopRuntimeNodeId;
+            }
+            checkpointPlan = Array.isArray(cachedCheckpointPlan.checkpointPlan)
+              ? cachedCheckpointPlan.checkpointPlan
+              : [];
+            checkpointPlanSource = checkpointPlan.length ? "dispatch_cache" : "";
+          }
+          const loopspace = resolveLoopspaceForAppControl({ loopspace_id: loopspaceId });
+          const selectedLoopspaceId = String(selectedLoopspaceIdRef.current || "").trim();
+          const localGraphSource = loopspaceGraphSourceTextFromRow(loopspace)
+            || (selectedLoopspaceId === loopspaceId ? graphSourceRef.current : "");
+          if (!checkpointPlan.length && localGraphSource) {
+            checkpointPlan = loopspaceGraphCheckpointPlanForSendMessage(localGraphSource, loopRuntimeNodeId);
+            checkpointPlanSource = "local";
+          }
+          if (!checkpointPlan.length && loopspaceId && loopRuntimeNodeId) {
+            const graphResult = await invoke("cloud_mcp_get_loopspace_graph", {
+              loopspaceId,
+            }).catch(() => null);
+            const remoteSource = String(
+              graphResult?.graph?.source
+                || graphResult?.graph?.sourceText
+                || graphResult?.graph?.source_text
+                || graphResult?.loopspace?.graph?.source
+                || graphResult?.loopspace?.graph?.sourceText
+                || graphResult?.loopspace?.graph?.source_text
+                || "",
+            );
+            if (remoteSource) {
+              checkpointPlan = loopspaceGraphCheckpointPlanForSendMessage(remoteSource, loopRuntimeNodeId);
+              checkpointPlanSource = "cloud";
+            }
+          }
+          const checkpointIndex = checkpointPlan.findIndex((checkpoint) => (
+            loopspaceGraphCheckpointMatchesProgress(checkpoint, checkpointProgress)
+          ));
+          const checkpointMatched = checkpointIndex >= 0;
+          const explicitCheckpointCount = Number.parseInt(
+            input?.checkpoint_count ?? input?.checkpointCount ?? input?.step_count ?? input?.stepCount ?? 0,
+            10,
+          );
+          const explicitFinalCheckpoint = appControlBoolean(input, [
+            "final_checkpoint",
+            "finalCheckpoint",
+            "is_final_checkpoint",
+            "isFinalCheckpoint",
+            "is_final",
+            "isFinal",
+          ]);
+          const finalCheckpoint = (checkpointMatched && checkpointIndex === checkpointPlan.length - 1)
+            || explicitFinalCheckpoint
+            || (
+              Number.isFinite(explicitCheckpointCount)
+              && explicitCheckpointCount > 0
+              && Number.isFinite(stepIndex)
+              && stepIndex === explicitCheckpointCount
+            );
+          const parentStatus = stepStatus === "failed"
+            ? "failed"
+            : finalCheckpoint && (stepStatus === "completed" || stepStatus === "skipped")
+              ? "completed"
+              : "running";
+          if (checkpointPlan.length) {
+            checkpointProgress.checkpointCount = checkpointPlan.length;
+            checkpointProgress.checkpoint_count = checkpointPlan.length;
+          }
+          if (checkpointMatched) {
+            checkpointProgress.checkpointOrdinal = checkpointIndex + 1;
+            checkpointProgress.checkpoint_ordinal = checkpointIndex + 1;
+          }
+          if (finalCheckpoint) {
+            checkpointProgress.finalCheckpoint = true;
+            checkpointProgress.final_checkpoint = true;
+          }
+          const remoteEvent = {
+            command_id: loopRuntimeRunId,
+            commandId: loopRuntimeRunId,
+            command_kind: "terminal_orchestrator_send_message",
+            commandKind: "terminal_orchestrator_send_message",
+            loop_runtime_run_id: loopRuntimeRunId,
+            loopRuntimeRunId,
+            loop_runtime_node_id: loopRuntimeNodeId,
+            loopRuntimeNodeId,
+            loop_runtime_edge_id: loopRuntimeEdgeId,
+            loopRuntimeEdgeId,
+            loopspace_id: loopspaceId,
+            loopspaceId,
+            trigger_id: triggerId,
+            triggerId,
+            trigger_run_id: triggerRunId,
+            triggerRunId,
+          };
+          const result = await invoke("cloud_mcp_record_remote_command_status", {
+            details: {
+              checkpointProgress,
+              checkpoint_progress: checkpointProgress,
+              checkpointPlanSource,
+              source: "app_control_mcp",
+            },
+            event: remoteEvent,
+            message: progressMessage || (
+              parentStatus === "completed"
+                ? "Loopspace send-message checkpoints completed."
+                : stepTitle
+                  ? `${stepTitle} ${stepStatus}.`
+                  : `Loopspace checkpoint ${stepStatus}.`
+            ),
+            status: parentStatus,
+          });
+          if (["completed", "failed", "interrupted"].includes(parentStatus)) {
+            window.dispatchEvent(new CustomEvent(APP_CONTROL_REMOTE_COMMAND_SETTLED_EVENT, {
+              detail: {
+                commandId: loopRuntimeRunId,
+                commandKind: "terminal_orchestrator_send_message",
+                loopRuntimeEdgeId,
+                loopRuntimeNodeId,
+                loopRuntimeRunId,
+                loopspaceId,
+                message: progressMessage || (
+                  parentStatus === "completed"
+                    ? "Loopspace send-message checkpoints completed."
+                    : `Loopspace send-message ${parentStatus}.`
+                ),
+                status: parentStatus,
+                triggerId,
+                triggerRunId,
+              },
+            }));
+          }
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            data: {
+              checkpointProgress,
+              parentStatus,
+              result,
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
         if (tool === "get_loopspace_graph") {
           const loopspace = resolveLoopspaceForAppControl(input);
           if (!loopspace) {
@@ -32130,7 +32936,7 @@ export default function App() {
               result,
               source_format: DFBLUEPRINT_SOURCE_FORMAT,
               blueprint: parseDfBlueprintSource(String(result?.graph?.source || result?.graph?.sourceText || result?.graph?.source_text || "")),
-              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: run_script/send_message expose exec, success, failure, interrupt; document_read exposes docs; most executable targets accept in. Never invent standalone cron/manual/webhook trigger nodes.",
+              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: run_script/send_message expose exec, success, failure, interrupt; document_read exposes docs; most executable targets accept in. To guide a send-message substep, connect document_read.docs -> step.in for readable context and step.docs -> document_write.in for writable output. Never invent standalone cron/manual/webhook trigger nodes.",
               loopspace: { id: loopspace.id, name: loopspace.name },
               state: buildAppControlState(),
             },

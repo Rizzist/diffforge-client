@@ -796,6 +796,8 @@ const TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
 const APP_CONTROL_MCP_TOOL_NAMES: &[&str] = &[
     "get_state",
     "get_visible_context",
+    "list_docs",
+    "get_doc",
     "get_selected_document_context",
     "get_selected_script_context",
     "get_selection_context",
@@ -806,11 +808,14 @@ const APP_CONTROL_MCP_TOOL_NAMES: &[&str] = &[
     "run_selected_script",
     "run_local_script",
     "list_local_scripts",
+    "list_scripts",
+    "get_script",
     "select_workspace",
     "list_loopspace_triggers",
     "create_loopspace_trigger",
     "update_loopspace_trigger",
     "run_loopspace_trigger",
+    "record_loopspace_step_progress",
     "get_loopspace_graph",
     "update_loopspace_graph",
     "edit_loopspace_graph",
@@ -826,13 +831,13 @@ You are Diff Forge's app-control terminal orchestrator. Treat the visible Diff F
 
 Default routing:
 - Start with get_visible_context when the request could refer to the current tab, selected Tools document, selected local script, draft, or highlighted text.
-- For Tools document questions, use get_selected_document_context or get_visible_context(includeContent=true) and explain the selected skill, instruction, architecture, or document from that context.
+- For background Tools document inventory questions, use list_docs or get_doc. These tools do not switch tabs or disturb the user's selected document. For questions about the selected/visible document, use get_selected_document_context or get_visible_context(includeContent=true) and explain the selected skill, instruction, architecture, or document from that context.
 - For creating a skill/instruction/architecture/document draft, call update_selected_document with title, document_kind, content or content_md, and mode=\"draft\" unless the user asks to save or publish.
 - For modifying or deleting highlighted text, get the selection context, preserve the surrounding document, send the full updated document content through update_selected_document, and keep mode=\"draft\" unless the user asks for local save or publish.
 - For save locally, use mode=\"local\". For publish, push, sync, fan out, or share with other clients, use mode=\"publish\".
-- For local Scripts tab questions, use get_selected_script_context or get_visible_context(includeContent=true). The state includes localScripts; use list_local_scripts when you need the complete current script inventory. For creating or editing a local script, call update_selected_script with title, shell, content/content_md, and mode=\"draft\" unless the user asks to save or run. For save locally use save_selected_script or update_selected_script(mode=\"local\"). For saved selected or named scripts, prefer run_local_script with script_id when available or an exact script_name; use run_selected_script when a selected draft may need saving first. Script run tools are fire-and-forget: once accepted, tell the user it started and stop; do not monitor logs unless the user explicitly asks.
+- For background local script inventory questions, use list_scripts or get_script. These tools do not switch tabs or disturb the user's selected script. For selected/visible local Scripts tab questions, use get_selected_script_context or get_visible_context(includeContent=true). For creating or editing a local script, call update_selected_script with title, shell, content/content_md, and mode=\"draft\" unless the user asks to save or run. For save locally use save_selected_script or update_selected_script(mode=\"local\"). For saved selected or named scripts, prefer run_local_script with script_id when available or an exact script_name; use run_selected_script when a selected draft may need saving first. Script run tools are fire-and-forget: once accepted, tell the user it started and stop; do not monitor logs unless the user explicitly asks.
 - For Loopspace manual trigger requests, call run_loopspace_trigger with a trigger_id or trigger_name and optional payload.
-- For Loopspace graph edits, call get_loopspace_graph and list_loopspace_triggers first. Loopspace graphs use .dfblueprint source with explicit node ids, typed node kinds, and edge node.port -> node.port connections. Trigger nodes are references to reusable trigger inventory: if the requested cron/webhook/manual trigger does not exist, call create_loopspace_trigger first, then patch_loopspace_graph with op=\"attach_trigger\" and trigger_id. Webhook triggers default to signed_hmac; only use public_token when the user explicitly asks for a public URL and set public_webhook_confirmed=true. Use update_loopspace_trigger to rename, enable, disable, rotate, or change webhook auth. Never invent standalone cron/manual/webhook trigger nodes in the graph source. Prefer patch_loopspace_graph for attach_trigger, add_node, move_node, remove_node, connect, disconnect, and update_node_props. Use update_loopspace_graph only for larger full-source rewrites, preserve existing ids, and wait for the hydrated result.
+- For Loopspace graph edits, call get_loopspace_graph and list_loopspace_triggers first. Loopspace graphs use .dfblueprint source with explicit node ids, typed node kinds, and edge node.port -> node.port connections. Trigger nodes are references to reusable trigger inventory: if the requested cron/webhook/manual trigger does not exist, call create_loopspace_trigger first, then patch_loopspace_graph with op=\"attach_trigger\" and trigger_id. Webhook triggers default to signed_hmac; only use public_token when the user explicitly asks for a public URL and set public_webhook_confirmed=true. Use update_loopspace_trigger to rename, enable, disable, rotate, or change webhook auth. Never invent standalone cron/manual/webhook trigger nodes in the graph source. For add_node, use supported node kinds: document_read, document_write, run_script, send_message, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message and run_script nodes. For send-message substep document guidance, connect document_read.docs -> step.in for readable context and step.docs -> document_write.in for writable output. Prefer patch_loopspace_graph for attach_trigger, add_node, move_node, remove_node, connect, disconnect, and update_node_props. Use update_loopspace_graph only for larger full-source rewrites, preserve existing ids, and wait for the hydrated result.
 - For tab or workspace navigation and terminal management, use select_tab, select_workspace, list_terminals, open_terminals, close_terminals, or focus_terminal.
 
 Do not search for legacy account-skills.md or random files when the app-control tools can answer or edit the live UI state. Ask a brief clarifying question only when the visible context is missing and the user's target cannot be inferred.";
@@ -2918,6 +2923,8 @@ mod terminal_cli_tests {
             .unwrap();
         assert!(prompt.contains("app-control terminal orchestrator"));
         assert!(prompt.contains("make a skill"));
+        assert!(prompt.contains("list_docs"));
+        assert!(prompt.contains("list_scripts"));
         assert!(prompt.contains("modify this selection"));
         assert!(prompt.contains("update_selected_document"));
 
@@ -2929,6 +2936,9 @@ mod terminal_cli_tests {
             })
             .unwrap();
         assert!(allowed_tools.contains("mcp__diffforge-app-control__get_visible_context"));
+        assert!(allowed_tools.contains("mcp__diffforge-app-control__list_docs"));
+        assert!(allowed_tools.contains("mcp__diffforge-app-control__list_scripts"));
+        assert!(allowed_tools.contains("mcp__diffforge-app-control__record_loopspace_step_progress"));
         assert!(allowed_tools.contains("mcp__diffforge-app-control__update_selected_document"));
         assert!(args.windows(2).any(|pair| pair[0] == "--mcp-config"));
         assert!(args.iter().any(|arg| arg == "--strict-mcp-config"));
@@ -2960,6 +2970,8 @@ mod terminal_cli_tests {
         assert!(prompt.contains("Keep existing app instruction"));
         assert!(prompt.contains("app-control terminal orchestrator"));
         assert!(prompt.contains("make a skill"));
+        assert!(prompt.contains("list_docs"));
+        assert!(prompt.contains("list_scripts"));
         assert!(prompt.contains("update_selected_document"));
         assert!(args.iter().any(|arg| {
             arg.contains("mcp_servers.diffforge-app-control.command") && arg.contains("diff-forge")
