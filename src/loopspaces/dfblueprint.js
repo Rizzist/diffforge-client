@@ -415,6 +415,18 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
         doc_refs: safeText(template?.doc_refs || template?.documents || template?.path_key),
         h: safeText(template?.h || template?.height, String(visualDefaults.height || 128)),
         mode,
+        operation: mode === "write"
+          ? safeText(
+            template?.operation
+              || template?.write_operation
+              || template?.document_operation
+              || template?.documentOperation,
+            "append",
+          )
+          : "",
+        content_template: mode === "write"
+          ? safeText(template?.content_template || template?.contentTemplate || template?.template)
+          : "",
         target_mode: safeText(template?.target_mode, mode === "write" ? "create_or_update" : "select"),
       },
     };
@@ -440,6 +452,18 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
         create_name: safeText(template?.create_name || template?.name),
         h: safeText(template?.h || template?.height, String(visualDefaults.height || 128)),
         mode,
+        operation: mode === "write"
+          ? safeText(
+            template?.operation
+              || template?.write_operation
+              || template?.asset_operation
+              || template?.assetOperation,
+            "add_version",
+          )
+          : "",
+        content_template: mode === "write"
+          ? safeText(template?.content_template || template?.contentTemplate || template?.template)
+          : "",
         target_mode: safeText(template?.target_mode, mode === "write" ? "capture_generated" : "select"),
       },
     };
@@ -615,6 +639,8 @@ function dfBlueprintResourcePropsFromPatchOperation(op = {}, node = null) {
   putFirst("create_name", ["create_name", "createName"]);
   putFirst("h", ["h", "height"]);
   putFirst("mode", ["mode"]);
+  putFirst("operation", ["operation", "write_operation", "writeOperation", "document_operation", "documentOperation", "asset_operation", "assetOperation"]);
+  putFirst("content_template", ["content_template", "contentTemplate", "template", "body_template", "bodyTemplate"]);
   putFirst("target_mode", ["target_mode", "targetMode"]);
   if (nodeKind === "document_read" || nodeKind === "document_write") {
     putFirst("doc_refs", ["doc_refs", "docRefs", "documents", "path_key", "pathKey"]);
@@ -652,6 +678,8 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         create_name: op.create_name || op.createName,
         doc_refs: op.doc_refs || op.documents,
         h: op.h || op.height,
+        operation: op.operation || op.write_operation || op.writeOperation || op.document_operation || op.documentOperation || op.asset_operation || op.assetOperation,
+        content_template: op.content_template || op.contentTemplate || op.template || op.body_template || op.bodyTemplate,
         order: op.order || op.index,
         parent_id: op.parent_id || op.parentId || op.parent,
         status: op.status,

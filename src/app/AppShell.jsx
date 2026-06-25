@@ -335,6 +335,8 @@ import {
   LoopspaceGraphEdgePath,
   LoopspaceGraphEdgeLabel,
   LoopspaceGraphConnectionPreview,
+  LoopspaceRuntimeSignalDot,
+  LoopspaceRuntimeSignalLayer,
   LoopspaceGraphNode,
   LoopspaceGraphNodeIcon,
   LoopspaceGraphNodeText,
@@ -355,6 +357,8 @@ import {
   LoopspaceGraphNodeSelectEmpty,
   LoopspaceGraphDocumentPicker,
   LoopspaceGraphDocumentSearch,
+  LoopspaceGraphDocumentOperationSelect,
+  LoopspaceGraphDocumentTemplateInput,
   LoopspaceGraphDocumentPickList,
   LoopspaceGraphDocumentPickButton,
   LoopspaceGraphDocumentCreateButton,
@@ -363,6 +367,8 @@ import {
   LoopspaceGraphDocumentRefItem,
   LoopspaceGraphNodeAction,
   LoopspaceGraphNodePort,
+  LoopspaceGraphNodeResumeButton,
+  LoopspaceGraphNodeStateBadge,
   LoopspaceGraphMessageRegion,
   LoopspaceGraphMessageSettingsButton,
   LoopspaceGraphMessageFlow,
@@ -392,6 +398,7 @@ import {
   LoopspaceGraphControls,
   LoopspaceGraphControlButton,
   LoopspaceGraphZoomReadout,
+  LoopspaceGraphSaveBadge,
   LoopspaceGraphNavHud,
   LoopspaceGraphNavMap,
   LoopspaceGraphNavViewport,
@@ -763,6 +770,7 @@ import {
   WORKSPACE_TOOL_DOC_DRAG_MIME,
 } from "../tools/workspaceToolDragTypes.js";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
+import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
 import BackgroundMonitorWindow from "../background/BackgroundMonitorWindow.jsx";
@@ -840,11 +848,12 @@ const APP_CONTROL_DOCUMENT_SELECTION_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
 const MACOS_NOTIFICATIONS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.notifications";
 const MACOS_AUTOMATION_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation";
 const MACOS_FULL_DISK_ACCESS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
-const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "architecture"]);
+const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "web", "architecture"]);
 const GLOBAL_TOOLS_VIEWS = new Set(["tools", "architectures", "mcps", "clis", "scripts"]);
 const WORKSPACE_TAB_VIEW_BY_ID = {
   terminals: DEFAULT_WORKSPACE_VIEW,
   files: "files",
+  web: "web",
   history: "architecture",
 };
 const WORKSPACE_TAB_IDS = new Set(Object.keys(WORKSPACE_TAB_VIEW_BY_ID));
@@ -1090,23 +1099,29 @@ function appControlLoopspaceRuntimeEventRows(value, loopspaceId = "") {
       : row?.details_json && typeof row.details_json === "object"
         ? row.details_json
         : {};
-    const normalized = {
-      ...row,
-      createdAtMs: Number(row?.createdAtMs || row?.created_at_ms || 0) || 0,
-      details,
-      edgeId: appControlText(row, ["edgeId", "edge_id"]),
-      eventSeq: Number(row?.eventSeq || row?.event_seq || row?.seq || 0) || 0,
-      id,
-      kind: appControlText(row, ["kind", "eventKind", "event_kind"]) || "runtime.event",
-      loopspaceId: appControlText(row, ["loopspaceId", "loopspace_id"]),
-      message: appControlText(row, ["message"]) || appControlText(row, ["status"]) || "Runtime event",
-      nodeId: appControlText(row, ["nodeId", "node_id"]),
-      runId: appControlText(row, ["runId", "run_id"]),
-      severity: appControlText(row, ["severity"]).toLowerCase() || "info",
-      status: appControlText(row, ["status"]),
-      triggerId: appControlText(row, ["triggerId", "trigger_id"]),
-      triggerRunId: appControlText(row, ["triggerRunId", "trigger_run_id"]),
-    };
+      const normalized = {
+        ...row,
+        createdAtMs: Number(row?.createdAtMs || row?.created_at_ms || 0) || 0,
+        details,
+        edgeId: appControlText(row, ["edgeId", "edge_id", "loopRuntimeEdgeId", "loop_runtime_edge_id"])
+          || appControlText(details, ["edgeId", "edge_id", "loopRuntimeEdgeId", "loop_runtime_edge_id"]),
+        eventSeq: Number(row?.eventSeq || row?.event_seq || row?.seq || 0) || 0,
+        id,
+        kind: appControlText(row, ["kind", "eventKind", "event_kind"]) || "runtime.event",
+        loopspaceId: appControlText(row, ["loopspaceId", "loopspace_id"])
+          || appControlText(details, ["loopspaceId", "loopspace_id"]),
+        message: appControlText(row, ["message"]) || appControlText(row, ["status"]) || "Runtime event",
+        nodeId: appControlText(row, ["nodeId", "node_id", "loopRuntimeNodeId", "loop_runtime_node_id"])
+          || appControlText(details, ["nodeId", "node_id", "loopRuntimeNodeId", "loop_runtime_node_id"]),
+        runId: appControlText(row, ["runId", "run_id", "loopRuntimeRunId", "loop_runtime_run_id"])
+          || appControlText(details, ["runId", "run_id", "loopRuntimeRunId", "loop_runtime_run_id"]),
+        severity: appControlText(row, ["severity"]).toLowerCase() || "info",
+        status: appControlText(row, ["status"]) || appControlText(details, ["status", "state", "parentStatus", "parent_status"]),
+        triggerId: appControlText(row, ["triggerId", "trigger_id"])
+          || appControlText(details, ["triggerId", "trigger_id"]),
+        triggerRunId: appControlText(row, ["triggerRunId", "trigger_run_id"])
+          || appControlText(details, ["triggerRunId", "trigger_run_id"]),
+      };
     if (targetLoopspaceId && normalized.loopspaceId !== targetLoopspaceId) {
       continue;
     }
@@ -1272,10 +1287,311 @@ function loopspaceRuntimeField(row, keys, fallback = "") {
 function loopspaceRuntimeStatusTone(status) {
   const normalized = String(status || "").trim().toLowerCase();
   if (["success", "completed", "done"].includes(normalized)) return "good";
+  if (["resume_ready", "interrupted"].includes(normalized)) return "paused";
   if (["error", "failed", "timeout", "cancelled"].includes(normalized)) return "error";
   if (["queued", "awaiting_device", "pending"].includes(normalized)) return "queued";
-  if (["running", "active", "dispatching"].includes(normalized)) return "active";
+  if (["running", "active", "dispatching", "resume_requested"].includes(normalized)) return "active";
   return "neutral";
+}
+
+function normalizeLoopspaceNodeRuntimeStatus(status) {
+  const normalized = String(status || "").trim().toLowerCase().replace(/[\s.-]+/g, "_");
+  if (!normalized) return "";
+  if (["complete", "completed", "done", "success", "succeeded"].includes(normalized)) return "success";
+  if (["failed", "failure", "error", "blocked"].includes(normalized)) return "failed";
+  if (["resume_ready", "ready_to_resume", "resumable", "interrupted_resumable"].includes(normalized)) return "resume_ready";
+  if (["resume_requested", "resuming", "resumed"].includes(normalized)) return "resume_requested";
+  if (["interrupted", "interrupt", "cancelled", "canceled", "timed_out", "timeout", "aborted"].includes(normalized)) return "interrupted";
+  if (["queued", "pending", "awaiting_device", "waiting"].includes(normalized)) return "queued";
+  if (["active", "dispatching", "processing", "running", "started", "submitted", "thinking", "working"].includes(normalized)) return "running";
+  return "";
+}
+
+function loopspaceNodeRuntimeStatusLabel(status) {
+  switch (normalizeLoopspaceNodeRuntimeStatus(status)) {
+    case "queued":
+      return "Queued";
+    case "running":
+      return "Running";
+    case "success":
+      return "Success";
+    case "failed":
+      return "Failed";
+    case "interrupted":
+      return "Interrupted";
+    case "resume_ready":
+      return "Resume ready";
+    case "resume_requested":
+      return "Resuming";
+    default:
+      return "";
+  }
+}
+
+function loopspaceNodeRuntimeStatusTone(status) {
+  const normalized = normalizeLoopspaceNodeRuntimeStatus(status);
+  if (normalized === "success") return "good";
+  if (normalized === "failed") return "error";
+  if (normalized === "interrupted" || normalized === "resume_ready") return "paused";
+  if (normalized === "queued") return "queued";
+  if (normalized === "running" || normalized === "resume_requested") return "active";
+  return "neutral";
+}
+
+function loopspaceRuntimeEventNodeId(event) {
+  return loopspaceRuntimeField(event, [
+    "node_id",
+    "nodeId",
+    "loop_runtime_node_id",
+    "loopRuntimeNodeId",
+  ]) || loopspaceRuntimeField(event?.details, [
+    "node_id",
+    "nodeId",
+    "loop_runtime_node_id",
+    "loopRuntimeNodeId",
+  ]);
+}
+
+function loopspaceRuntimeEventRunId(event) {
+  return loopspaceRuntimeField(event, [
+    "run_id",
+    "runId",
+    "loop_runtime_run_id",
+    "loopRuntimeRunId",
+  ]) || loopspaceRuntimeField(event?.details, [
+    "run_id",
+    "runId",
+    "loop_runtime_run_id",
+    "loopRuntimeRunId",
+  ]);
+}
+
+function loopspaceRuntimeEventEdgeId(event) {
+  return loopspaceRuntimeField(event, [
+    "edge_id",
+    "edgeId",
+    "loop_runtime_edge_id",
+    "loopRuntimeEdgeId",
+  ]) || loopspaceRuntimeField(event?.details, [
+    "edge_id",
+    "edgeId",
+    "loop_runtime_edge_id",
+    "loopRuntimeEdgeId",
+  ]);
+}
+
+function loopspaceRuntimeEventStatus(event) {
+  const roots = [
+    event,
+    event?.details,
+    event?.result,
+    event?.payload,
+    event?.details?.result,
+    event?.details?.payload,
+    event?.details?.details,
+    event?.details?.details?.result,
+  ];
+  for (const root of roots) {
+    if (!root || typeof root !== "object" || Array.isArray(root)) continue;
+    const status = normalizeLoopspaceNodeRuntimeStatus(
+      root.parentStatus
+        || root.parent_status
+        || root.status
+        || root.state
+        || root.runStatus
+        || root.run_status,
+    );
+    if (status) return status;
+  }
+  return "";
+}
+
+function loopspaceRuntimeEventSortValue(event) {
+  const eventSeq = Number(event?.eventSeq || event?.event_seq || event?.seq || 0) || 0;
+  const createdAtMs = Number(event?.createdAtMs || event?.created_at_ms || event?.ts_ms || 0) || 0;
+  return (eventSeq * 10000000000000) + createdAtMs;
+}
+
+function loopspaceRuntimeTimestampMs(row) {
+  const candidates = [
+    row?.updatedAtMs,
+    row?.updated_at_ms,
+    row?.createdAtMs,
+    row?.created_at_ms,
+    row?.tsMs,
+    row?.ts_ms,
+    row?.updatedAt,
+    row?.updated_at,
+    row?.createdAt,
+    row?.created_at,
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate > 0) {
+      return candidate;
+    }
+    if (typeof candidate === "string" && candidate.trim()) {
+      const numeric = Number(candidate);
+      if (Number.isFinite(numeric) && numeric > 0) return numeric;
+      const parsed = Date.parse(candidate);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+  }
+  return 0;
+}
+
+function buildLoopspaceNodeRuntimeStateMap(events, runtimeHead) {
+  const byNodeId = new Map();
+  for (const event of jsonArray(events)) {
+    const nodeId = loopspaceRuntimeEventNodeId(event);
+    const status = loopspaceRuntimeEventStatus(event);
+    if (!nodeId || !status) continue;
+    const sortValue = loopspaceRuntimeEventSortValue(event);
+    const previous = byNodeId.get(nodeId);
+    if (previous && previous.sortValue > sortValue) continue;
+    byNodeId.set(nodeId, {
+      details: event?.details && typeof event.details === "object" ? event.details : {},
+      edgeId: loopspaceRuntimeEventEdgeId(event),
+      event,
+      label: loopspaceNodeRuntimeStatusLabel(status),
+      runId: loopspaceRuntimeEventRunId(event),
+      sortValue,
+      status,
+      tone: loopspaceNodeRuntimeStatusTone(status),
+    });
+  }
+  const headNodeId = loopspaceRuntimeField(runtimeHead, [
+    "cursor_node_id",
+    "cursorNodeId",
+    "current_node_id",
+    "currentNodeId",
+    "node_id",
+    "nodeId",
+    "loop_runtime_node_id",
+    "loopRuntimeNodeId",
+  ]);
+  const headStatus = normalizeLoopspaceNodeRuntimeStatus(loopspaceRuntimeField(runtimeHead, ["status"]));
+  if (headNodeId && headStatus) {
+    const sortValue = Math.max(
+      loopspaceRuntimeEventSortValue(runtimeHead),
+      byNodeId.get(headNodeId)?.sortValue || 0,
+    ) + 1;
+    byNodeId.set(headNodeId, {
+      details: runtimeHead?.details && typeof runtimeHead.details === "object" ? runtimeHead.details : {},
+      edgeId: loopspaceRuntimeField(runtimeHead, ["edge_id", "edgeId", "loop_runtime_edge_id", "loopRuntimeEdgeId"]),
+      event: runtimeHead,
+      label: loopspaceNodeRuntimeStatusLabel(headStatus),
+      runId: loopspaceRuntimeField(runtimeHead, ["run_id", "runId", "id", "loop_runtime_run_id", "loopRuntimeRunId"]),
+      sortValue,
+      status: headStatus,
+      tone: loopspaceNodeRuntimeStatusTone(headStatus),
+    });
+  }
+  return byNodeId;
+}
+
+function loopspaceRuntimeStateCanResume(state) {
+  const status = normalizeLoopspaceNodeRuntimeStatus(state?.status);
+  return status === "resume_ready" || status === "interrupted";
+}
+
+function loopspaceRuntimeResumeField(state, keys, fallback = "") {
+  const roots = [
+    state,
+    state?.details,
+    state?.details?.details,
+    state?.details?.resumeContext,
+    state?.details?.resume_context,
+    state?.event,
+    state?.event?.details,
+    state?.event?.details?.details,
+    state?.event?.details?.resumeContext,
+    state?.event?.details?.resume_context,
+    state?.event?.details?.details?.resumeContext,
+    state?.event?.details?.details?.resume_context,
+  ];
+  for (const root of roots) {
+    if (!root || typeof root !== "object" || Array.isArray(root)) continue;
+    for (const key of keys) {
+      const value = root[key];
+      if (typeof value === "string" && value.trim()) return value.trim();
+      if (typeof value === "number" && Number.isFinite(value)) return String(value);
+    }
+  }
+  return fallback;
+}
+
+function loopspaceRuntimeResumeCheckpointPlan(state) {
+  const roots = [
+    state?.details,
+    state?.details?.details,
+    state?.details?.resumeContext,
+    state?.details?.resume_context,
+    state?.event?.details,
+    state?.event?.details?.details,
+    state?.event?.details?.resumeContext,
+    state?.event?.details?.resume_context,
+    state?.event?.details?.details?.resumeContext,
+    state?.event?.details?.details?.resume_context,
+  ];
+  for (const root of roots) {
+    if (!root || typeof root !== "object" || Array.isArray(root)) continue;
+    const plan = root.checkpointPlan || root.checkpoint_plan;
+    if (Array.isArray(plan) && plan.length) {
+      return loopspaceGraphCheckpointPlanFromDispatch(plan);
+    }
+  }
+  return [];
+}
+
+function buildLoopspaceSendMessageResumePrompt({
+  checkpointPlan = [],
+  completedCheckpoints = [],
+  loopRuntimeEdgeId = "",
+  loopRuntimeNodeId = "",
+  loopRuntimeRunId = "",
+  loopspaceId = "",
+  nextCheckpoints = [],
+  originalPrompt = "",
+  triggerId = "",
+  triggerRunId = "",
+} = {}) {
+  const completedLines = completedCheckpoints.length
+    ? completedCheckpoints.map((checkpoint) => `- ${checkpoint.index}. ${checkpoint.label}`).join("\n")
+    : "- None recorded.";
+  const nextLines = nextCheckpoints.length
+    ? nextCheckpoints.map((checkpoint) => `- ${checkpoint.index}. ${checkpoint.label}`).join("\n")
+    : "- Continue from the next unfinished checkpoint you can infer from the terminal state.";
+  const allLines = checkpointPlan.length
+    ? checkpointPlan.map((checkpoint) => `- ${checkpoint.index}. ${checkpoint.label} [step_id: ${checkpoint.id || "unknown"}]`).join("\n")
+    : "- No explicit checkpoint plan was available.";
+  return [
+    "Resume the interrupted Diff Forge Loopspace send-message run.",
+    "",
+    "Diff Forge resume context:",
+    `- loopspace_id=${loopspaceId || "unknown"}`,
+    `- loop_runtime_run_id=${loopRuntimeRunId || "unknown"}`,
+    `- loop_runtime_node_id=${loopRuntimeNodeId || "unknown"}`,
+    `- loop_runtime_edge_id=${loopRuntimeEdgeId || "unknown"}`,
+    ...(triggerId ? [`- trigger_id=${triggerId}`] : []),
+    ...(triggerRunId ? [`- trigger_run_id=${triggerRunId}`] : []),
+    "",
+    "Rules:",
+    "- Continue this same run. Do not restart the loop from checkpoint 1 unless the terminal state clearly requires it.",
+    "- Keep using record_loopspace_step_progress for checkpoint status updates with the ids above.",
+    "- Treat completed checkpoints as already done; only revisit them if you need to verify current state.",
+    "",
+    "Completed checkpoints:",
+    completedLines,
+    "",
+    "Continue with:",
+    nextLines,
+    "",
+    "Full checkpoint plan:",
+    allLines,
+    "",
+    "Original message:",
+    originalPrompt.trim() || "(Use the visible terminal state and checkpoint plan as the source of truth.)",
+  ].join("\n");
 }
 
 function normalizeLoopspaceCheckpointProgressStatus(status) {
@@ -1336,11 +1652,11 @@ function buildLoopspaceCheckpointProgressMap(events, runId, nodeId) {
   const safeRunId = String(runId || "").trim();
   const safeNodeId = String(nodeId || "").trim();
   for (const event of jsonArray(events)) {
-    const eventRunId = loopspaceRuntimeField(event, ["run_id", "runId"]);
+    const eventRunId = loopspaceRuntimeEventRunId(event);
     if (safeRunId && eventRunId && eventRunId !== safeRunId) {
       continue;
     }
-    const eventNodeId = loopspaceRuntimeField(event, ["node_id", "nodeId"]);
+    const eventNodeId = loopspaceRuntimeEventNodeId(event);
     if (safeNodeId && eventNodeId && eventNodeId !== safeNodeId) {
       continue;
     }
@@ -1438,6 +1754,9 @@ function normalizeWorkspaceTabId(value) {
   }
   if (normalized === "file" || normalized === "workspace_files") {
     return "files";
+  }
+  if (normalized === "browser" || normalized === "workspace_web" || normalized === "workspace_browser") {
+    return "web";
   }
   if (normalized === "histories" || normalized === "task_history" || normalized === "todo_history") {
     return "history";
@@ -5421,13 +5740,43 @@ function loopspaceGraphResourcePlanEntryFromNode(node = null, resourceKind = "do
   const refs = resourceKind === "asset"
     ? loopspaceGraphAssetRefsFromProps(props)
     : loopspaceGraphDocumentRefsFromProps(props);
+  const nodeKind = String(node.nodeKind || node.kind || "").trim();
+  const operation = nodeKind === "document_write"
+    ? normalizeLoopspaceDocumentWriteOperation(loopspaceGraphPropValue(props, [
+      "operation",
+      "write_operation",
+      "writeOperation",
+      "document_operation",
+      "documentOperation",
+    ]))
+    : nodeKind === "asset_write"
+      ? normalizeLoopspaceAssetWriteOperation(loopspaceGraphPropValue(props, [
+        "operation",
+        "write_operation",
+        "writeOperation",
+        "asset_operation",
+        "assetOperation",
+      ]))
+      : "";
+  const contentTemplate = nodeKind === "document_write" || nodeKind === "asset_write"
+    ? String(loopspaceGraphPropValue(props, [
+      "content_template",
+      "contentTemplate",
+      "template",
+      "body_template",
+      "bodyTemplate",
+    ]) || "").trim()
+    : "";
   return {
+    contentTemplate,
+    content_template: contentTemplate,
     createName,
     create_name: createName,
     id,
-    kind: String(node.nodeKind || node.kind || resourceKind).trim(),
+    kind: nodeKind || resourceKind,
     label: String(node.label || createName || (resourceKind === "asset" ? "Asset" : "Document")).trim(),
     node_id: id,
+    operation,
     refs,
     targetMode: String(loopspaceGraphPropValue(props, ["target_mode", "targetMode"]) || "").trim(),
     target_mode: String(loopspaceGraphPropValue(props, ["target_mode", "targetMode"]) || "").trim(),
@@ -5865,6 +6214,44 @@ function loopspaceGraphDocumentRefsValue(refs = []) {
     .join("|");
 }
 
+const LOOPSPACE_DOCUMENT_WRITE_OPERATIONS = [
+  { value: "append", label: "Append" },
+  { value: "replace", label: "Replace" },
+  { value: "prepend", label: "Prepend" },
+  { value: "create_if_missing", label: "Create only" },
+  { value: "delete", label: "Delete" },
+];
+
+function normalizeLoopspaceDocumentWriteOperation(value = "") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/gu, "_");
+  if (["replace", "overwrite", "set"].includes(normalized)) return "replace";
+  if (["prepend", "prepend_or_create"].includes(normalized)) return "prepend";
+  if (["create", "create_if_missing", "create_only"].includes(normalized)) return "create_if_missing";
+  if (["delete", "del", "remove"].includes(normalized)) return "delete";
+  return "append";
+}
+
+const LOOPSPACE_ASSET_WRITE_OPERATIONS = [
+  { value: "add_version", label: "Add version" },
+  { value: "replace", label: "Replace" },
+  { value: "create_if_missing", label: "Create only" },
+  { value: "delete", label: "Delete" },
+];
+
+function normalizeLoopspaceAssetWriteOperation(value = "") {
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/gu, "_");
+  if (["replace", "overwrite", "update", "set"].includes(normalized)) return "replace";
+  if (["create", "create_if_missing", "create_only", "if_missing"].includes(normalized)) return "create_if_missing";
+  if (["delete", "del", "remove", "unlink"].includes(normalized)) return "delete";
+  return "add_version";
+}
+
 function loopspaceGraphAssetTitle(asset = {}) {
   const localPath = String(asset.localPath || asset.local_path || asset.path || "").trim();
   const leaf = localPath.split(/[\\/]/u).filter(Boolean).pop() || "";
@@ -6193,6 +6580,56 @@ function loopspaceGraphOutputPoint(layout, node = null, portId = "out") {
 function loopspaceGraphPathBetween(fromPoint, toPoint) {
   const dx = Math.max(52, Math.abs(toPoint.x - fromPoint.x) * 0.48);
   return `M ${fromPoint.x} ${fromPoint.y} C ${fromPoint.x + dx} ${fromPoint.y}, ${toPoint.x - dx} ${toPoint.y}, ${toPoint.x} ${toPoint.y}`;
+}
+
+function loopspaceGraphPointBetween(fromPoint, toPoint, progress = 0.5) {
+  const t = Math.max(0, Math.min(1, Number(progress) || 0));
+  const dx = Math.max(52, Math.abs(toPoint.x - fromPoint.x) * 0.48);
+  const c1 = { x: fromPoint.x + dx, y: fromPoint.y };
+  const c2 = { x: toPoint.x - dx, y: toPoint.y };
+  const mt = 1 - t;
+  return {
+    x: (mt ** 3 * fromPoint.x) + (3 * mt * mt * t * c1.x) + (3 * mt * t * t * c2.x) + (t ** 3 * toPoint.x),
+    y: (mt ** 3 * fromPoint.y) + (3 * mt * mt * t * c1.y) + (3 * mt * t * t * c2.y) + (t ** 3 * toPoint.y),
+  };
+}
+
+function loopspaceGraphRuntimeSignalPoint({
+  edgeLookup,
+  frameMs,
+  nodeId,
+  nodeLookup,
+  nodeLayouts,
+  runtimeHead,
+  status,
+}) {
+  if (!runtimeHead) return null;
+  const normalizedStatus = normalizeLoopspaceNodeRuntimeStatus(status) || "running";
+  const edgeId = loopspaceRuntimeField(runtimeHead, ["edge_id", "edgeId", "loop_runtime_edge_id", "loopRuntimeEdgeId"]);
+  if (edgeId && edgeLookup?.has?.(edgeId)) {
+    const edge = edgeLookup.get(edgeId);
+    const fromNode = nodeLookup.get(edge.from);
+    const toNode = nodeLookup.get(edge.to);
+    const fromLayout = nodeLayouts.get(edge.from);
+    const toLayout = nodeLayouts.get(edge.to);
+    if (fromNode && toNode && fromLayout && toLayout) {
+      const fromPoint = loopspaceGraphOutputPoint(fromLayout, fromNode, edge.fromPort || "out");
+      const toPoint = loopspaceGraphInputPoint(toLayout, toNode, edge.toPort || "in");
+      if (normalizedStatus === "success") return toPoint;
+      const phase = ((Number(frameMs) || Date.now()) % 1800) / 1800;
+      const progress = normalizedStatus === "running" || normalizedStatus === "resume_requested"
+        ? phase
+        : 0.58;
+      return loopspaceGraphPointBetween(fromPoint, toPoint, progress);
+    }
+  }
+  const safeNodeId = String(nodeId || "").trim();
+  const layout = safeNodeId ? nodeLayouts.get(safeNodeId) : null;
+  if (!layout) return null;
+  return {
+    x: layout.x + (layout.width / 2),
+    y: layout.y + 10,
+  };
 }
 
 function loopspaceGraphNodeIsResourceContextNode(node) {
@@ -6552,21 +6989,29 @@ function LoopspaceSendMessageDeviceSelect({
 
 function LoopspaceDocumentContextPicker({
   busy = false,
+  contentTemplate = "",
   createName = "",
   mode = "read",
+  onContentTemplateChange,
   onCreateNameChange,
+  onOperationChange,
   onRefsChange,
+  operation = "append",
   options = [],
   refs = [],
   search = "",
   setSearch,
 }) {
   const normalizedCreateName = String(createName || "").trim();
+  const normalizedContentTemplate = String(contentTemplate || "");
   const [createDraft, setCreateDraft] = useState(normalizedCreateName);
   const [createEditing, setCreateEditing] = useState(false);
+  const [templateDraft, setTemplateDraft] = useState(normalizedContentTemplate);
+  const [templateEditing, setTemplateEditing] = useState(false);
   const createInputRef = useRef(null);
   const selectedRefs = useMemo(() => loopspaceGraphDocumentRefsValue(refs).split("|").filter(Boolean), [refs]);
   const selectedSet = useMemo(() => new Set(selectedRefs), [selectedRefs]);
+  const normalizedOperation = normalizeLoopspaceDocumentWriteOperation(operation);
   const optionByKey = useMemo(() => {
     const map = new Map();
     options.forEach((option) => {
@@ -6590,11 +7035,21 @@ function LoopspaceDocumentContextPicker({
   const updateSearch = useCallback((event) => {
     if (typeof setSearch === "function") setSearch(event.target.value);
   }, [setSearch]);
+  const updateOperation = useCallback((event) => {
+    if (typeof onOperationChange === "function") {
+      onOperationChange(normalizeLoopspaceDocumentWriteOperation(event.target.value));
+    }
+  }, [onOperationChange]);
   useEffect(() => {
     if (!createEditing) {
       setCreateDraft(normalizedCreateName);
     }
   }, [createEditing, normalizedCreateName]);
+  useEffect(() => {
+    if (!templateEditing) {
+      setTemplateDraft(normalizedContentTemplate);
+    }
+  }, [normalizedContentTemplate, templateEditing]);
   useEffect(() => {
     if (!createEditing) return undefined;
     const frame = requestAnimationFrame(() => {
@@ -6626,6 +7081,17 @@ function LoopspaceDocumentContextPicker({
       onCreateNameChange("");
     }
   }, [busy, normalizedCreateName, onCreateNameChange]);
+  const commitContentTemplate = useCallback((value = templateDraft) => {
+    const nextTemplate = String(value || "");
+    setTemplateDraft(nextTemplate);
+    setTemplateEditing(false);
+    if (
+      typeof onContentTemplateChange === "function"
+      && nextTemplate !== normalizedContentTemplate
+    ) {
+      onContentTemplateChange(nextTemplate);
+    }
+  }, [normalizedContentTemplate, onContentTemplateChange, templateDraft]);
   const addRef = useCallback((key) => {
     const pathKey = normalizedDocumentPath(key);
     if (!pathKey || selectedSet.has(pathKey) || busy) return;
@@ -6725,6 +7191,37 @@ function LoopspaceDocumentContextPicker({
           </LoopspaceGraphDocumentCreateButton>
         )
       ) : null}
+      {mode === "write" ? (
+        <LoopspaceGraphDocumentOperationSelect
+          aria-label="Document write operation"
+          disabled={busy}
+          onChange={updateOperation}
+          value={normalizedOperation}
+        >
+          {LOOPSPACE_DOCUMENT_WRITE_OPERATIONS.map((item) => (
+            <option key={item.value} value={item.value}>{item.label}</option>
+          ))}
+        </LoopspaceGraphDocumentOperationSelect>
+      ) : null}
+      {mode === "write" ? (
+        <LoopspaceGraphDocumentTemplateInput
+          aria-label="Document write content template"
+          disabled={busy}
+          onBlur={(event) => commitContentTemplate(event.currentTarget.value)}
+          onChange={(event) => setTemplateDraft(event.target.value)}
+          onFocus={() => setTemplateEditing(true)}
+          onKeyDown={(event) => {
+            if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+              event.preventDefault();
+              commitContentTemplate(event.currentTarget.value);
+              event.currentTarget.blur();
+            }
+          }}
+          placeholder="Template: {{payload_json}}"
+          rows={2}
+          value={templateDraft}
+        />
+      ) : null}
       <LoopspaceGraphDocumentSearch
         aria-label={`${mode === "write" ? "Writable" : "Readable"} document search`}
         disabled={busy}
@@ -6782,14 +7279,21 @@ function LoopspaceAssetContextPicker({
   createName = "",
   mode = "read",
   onCreateNameChange,
+  onOperationChange,
   onRefsChange,
+  operation = "add_version",
   options = [],
   refs = [],
   search = "",
   setSearch,
 }) {
+  const normalizedCreateName = String(createName || "").trim();
+  const [createDraft, setCreateDraft] = useState(normalizedCreateName);
+  const [createEditing, setCreateEditing] = useState(false);
+  const createInputRef = useRef(null);
   const selectedRefs = useMemo(() => loopspaceGraphAssetRefsValue(refs).split("|").filter(Boolean), [refs]);
   const selectedSet = useMemo(() => new Set(selectedRefs), [selectedRefs]);
+  const normalizedOperation = normalizeLoopspaceAssetWriteOperation(operation);
   const optionByKey = useMemo(() => {
     const map = new Map();
     options.forEach((option) => {
@@ -6813,9 +7317,47 @@ function LoopspaceAssetContextPicker({
   const updateSearch = useCallback((event) => {
     if (typeof setSearch === "function") setSearch(event.target.value);
   }, [setSearch]);
-  const updateCreateName = useCallback((event) => {
-    if (typeof onCreateNameChange === "function") onCreateNameChange(event.target.value);
-  }, [onCreateNameChange]);
+  const updateOperation = useCallback((event) => {
+    if (typeof onOperationChange === "function") {
+      onOperationChange(normalizeLoopspaceAssetWriteOperation(event.target.value));
+    }
+  }, [onOperationChange]);
+  useEffect(() => {
+    if (!createEditing) {
+      setCreateDraft(normalizedCreateName);
+    }
+  }, [createEditing, normalizedCreateName]);
+  useEffect(() => {
+    if (createEditing && createInputRef.current) {
+      createInputRef.current.focus();
+      createInputRef.current.select();
+    }
+  }, [createEditing]);
+  const startCreateNameEdit = useCallback((event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (busy) return;
+    setCreateDraft(normalizedCreateName);
+    setCreateEditing(true);
+  }, [busy, normalizedCreateName]);
+  const commitCreateName = useCallback((value = createDraft) => {
+    const nextName = String(value || "").trim();
+    setCreateDraft(nextName);
+    setCreateEditing(false);
+    if (typeof onCreateNameChange === "function" && nextName !== normalizedCreateName) {
+      onCreateNameChange(nextName);
+    }
+  }, [createDraft, normalizedCreateName, onCreateNameChange]);
+  const clearCreateName = useCallback((event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    if (busy) return;
+    setCreateDraft("");
+    setCreateEditing(false);
+    if (typeof onCreateNameChange === "function" && normalizedCreateName) {
+      onCreateNameChange("");
+    }
+  }, [busy, normalizedCreateName, onCreateNameChange]);
   const addRef = useCallback((key) => {
     const assetKey = String(key || "").trim();
     if (!assetKey || selectedSet.has(assetKey) || busy) return;
@@ -6837,19 +7379,96 @@ function LoopspaceAssetContextPicker({
       onWheel={stopEvent}
     >
       {mode === "write" ? (
-        <LoopspaceGraphDocumentSearch
-          aria-label="Generated asset name"
-          defaultValue={createName}
+        createEditing ? (
+          <LoopspaceGraphDocumentRefItem data-generated="true">
+            <span>
+              <LoopspaceGraphDocumentCreateInput
+                aria-label="Generated asset name"
+                disabled={busy}
+                onBlur={(event) => commitCreateName(event.currentTarget.value)}
+                onChange={(event) => setCreateDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    commitCreateName(event.currentTarget.value);
+                  } else if (event.key === "Escape") {
+                    event.preventDefault();
+                    setCreateDraft(normalizedCreateName);
+                    setCreateEditing(false);
+                  }
+                }}
+                placeholder="Asset name..."
+                ref={createInputRef}
+                value={createDraft}
+              />
+              <em>New asset</em>
+            </span>
+            <button
+              aria-label="Clear generated asset"
+              disabled={busy}
+              onClick={clearCreateName}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              type="button"
+            >
+              <ButtonCloseIcon aria-hidden="true" />
+            </button>
+          </LoopspaceGraphDocumentRefItem>
+        ) : normalizedCreateName ? (
+          <LoopspaceGraphDocumentRefItem
+            data-generated="true"
+            onClick={startCreateNameEdit}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                startCreateNameEdit();
+              }
+            }}
+            role="button"
+            tabIndex={0}
+          >
+            <span>
+              <strong>{normalizedCreateName}</strong>
+              <em>Create asset</em>
+            </span>
+            <button
+              aria-label={`Remove generated asset ${normalizedCreateName}`}
+              disabled={busy}
+              onClick={clearCreateName}
+              onPointerDown={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+              }}
+              type="button"
+            >
+              <ButtonCloseIcon aria-hidden="true" />
+            </button>
+          </LoopspaceGraphDocumentRefItem>
+        ) : (
+          <LoopspaceGraphDocumentCreateButton
+            disabled={busy}
+            onClick={startCreateNameEdit}
+            type="button"
+          >
+            <ButtonAddIcon aria-hidden="true" />
+            <strong>Create asset</strong>
+            <span>New</span>
+          </LoopspaceGraphDocumentCreateButton>
+        )
+      ) : null}
+      {mode === "write" ? (
+        <LoopspaceGraphDocumentOperationSelect
+          aria-label="Asset write operation"
           disabled={busy}
-          onBlur={updateCreateName}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") {
-              event.preventDefault();
-              event.currentTarget.blur();
-            }
-          }}
-          placeholder="Capture/create asset name…"
-        />
+          onChange={updateOperation}
+          value={normalizedOperation}
+        >
+          {LOOPSPACE_ASSET_WRITE_OPERATIONS.map((item) => (
+            <option key={item.value} value={item.value}>{item.label}</option>
+          ))}
+        </LoopspaceGraphDocumentOperationSelect>
       ) : null}
       <LoopspaceGraphDocumentSearch
         aria-label={`${mode === "write" ? "Writable" : "Readable"} asset search`}
@@ -6919,6 +7538,7 @@ function LoopspaceRuntimeView({
   const [runtimePanelResizing, setRuntimePanelResizing] = useState(false);
   const [runtimePanelAutoScroll, setRuntimePanelAutoScroll] = useState(true);
   const [selectedHistoryRunId, setSelectedHistoryRunId] = useState("");
+  const [runtimeSignalFrameMs, setRuntimeSignalFrameMs] = useState(() => Date.now());
   const [timerNowMs, setTimerNowMs] = useState(() => Date.now());
   const [triggers, setTriggers] = useState([]);
   const [logs, setLogs] = useState([]);
@@ -6949,12 +7569,18 @@ function LoopspaceRuntimeView({
   const [sendMessageCheckpointDragPositions, setSendMessageCheckpointDragPositions] = useState({});
   const [sendMessageCheckpointLayoutPriorityId, setSendMessageCheckpointLayoutPriorityId] = useState("");
   const [manualTriggerRunPendingId, setManualTriggerRunPendingId] = useState("");
+  const [graphSaveState, setGraphSaveState] = useState("idle");
   const [workspaceToolsVersion, setWorkspaceToolsVersion] = useState(() => getWorkspaceToolsVersion());
   const loopspaceId = loopspace?.id || "";
   const busy = actionState === "renaming" || actionState === "deleting" || loadingState === "saving";
   const loopspaceRef = useRef(loopspace);
   const graphSourceRef = useRef("");
+  const graphConfirmedSourceRef = useRef("");
   const pendingGraphCommitRef = useRef(null);
+  const graphSaveInFlightRef = useRef(null);
+  const graphSaveQueuedRef = useRef(null);
+  const graphSaveIdleWaitersRef = useRef([]);
+  const graphSaveVersionRef = useRef(0);
   const activeGraphDragRef = useRef(null);
   const triggersRef = useRef([]);
   const triggerRefsRef = useRef([]);
@@ -7101,6 +7727,37 @@ function LoopspaceRuntimeView({
     return () => window.clearInterval(timer);
   }, []);
 
+  const resolveGraphSaveIdleWaiters = useCallback((value) => {
+    const waiters = graphSaveIdleWaitersRef.current;
+    graphSaveIdleWaitersRef.current = [];
+    waiters.forEach((waiter) => {
+      if (waiter?.timeoutId) {
+        window.clearTimeout(waiter.timeoutId);
+      }
+      waiter?.resolve?.(value);
+    });
+  }, []);
+
+  const waitForGraphSaveIdle = useCallback(() => {
+    if (
+      !pendingGraphCommitRef.current?.source
+      && !graphSaveInFlightRef.current
+      && !graphSaveQueuedRef.current
+    ) {
+      return Promise.resolve(true);
+    }
+    return new Promise((resolve) => {
+      const waiter = {
+        resolve,
+        timeoutId: window.setTimeout(() => {
+          graphSaveIdleWaitersRef.current = graphSaveIdleWaitersRef.current.filter((item) => item !== waiter);
+          resolve(false);
+        }, 12000),
+      };
+      graphSaveIdleWaitersRef.current = [...graphSaveIdleWaitersRef.current, waiter];
+    });
+  }, []);
+
   const applyGraphSnapshot = useCallback((value) => {
     const fallbackLoopspace = loopspaceRef.current;
     const candidates = [
@@ -7132,7 +7789,10 @@ function LoopspaceRuntimeView({
     if (!graph) return null;
     const source = String(graph.source || graph.sourceText || graph.source_text || "");
     const pendingGraph = pendingGraphCommitRef.current;
-    if (pendingGraph?.source && source && source !== pendingGraph.source) {
+    if (pendingGraph?.source && (!source || source !== pendingGraph.source)) {
+      if (source) {
+        graphConfirmedSourceRef.current = source;
+      }
       return {
         graph,
         pending: true,
@@ -7145,7 +7805,10 @@ function LoopspaceRuntimeView({
     if (pendingGraph?.source && source === pendingGraph.source) {
       pendingGraphCommitRef.current = null;
       setPendingGraphNodeIds(new Set());
+      setGraphSaveState("idle");
+      resolveGraphSaveIdleWaiters(true);
     }
+    graphConfirmedSourceRef.current = source;
     graphSourceRef.current = source;
     setGraphSource(source);
     setGraphMeta(graph);
@@ -7190,7 +7853,7 @@ function LoopspaceRuntimeView({
       if (page.hasMoreBefore) setRuntimeEventsHasMoreBefore(true);
     }
     return { graph, refs, row, source };
-  }, [loopspaceId]);
+  }, [loopspaceId, resolveGraphSaveIdleWaiters]);
 
   const applyTriggerSnapshot = useCallback((value) => {
     const nextTriggers = appControlLoopspaceTriggerRows(value);
@@ -7398,7 +8061,15 @@ function LoopspaceRuntimeView({
     setGraphDragGhost(null);
     setPendingConnection(null);
     pendingGraphCommitRef.current = null;
+    graphSaveInFlightRef.current = null;
+    graphSaveQueuedRef.current = null;
+    graphSaveIdleWaitersRef.current.forEach((waiter) => {
+      if (waiter?.timeoutId) window.clearTimeout(waiter.timeoutId);
+      waiter?.resolve?.(false);
+    });
+    graphSaveIdleWaitersRef.current = [];
     activeGraphDragRef.current = null;
+    graphConfirmedSourceRef.current = "";
     const resetPan = { x: 0, y: 0 };
     canvasPanRef.current = resetPan;
     canvasZoomRef.current = 1;
@@ -7413,6 +8084,7 @@ function LoopspaceRuntimeView({
     setSendMessageCheckpointDragPositions({});
     setSendMessageCheckpointLayoutPriorityId("");
     setManualTriggerRunPendingId("");
+    setGraphSaveState("idle");
     setPendingGraphNodeIds(new Set());
     void refreshLoopspaceGraph(true, generation);
     void refreshLoopspaceTriggers(true, generation);
@@ -7468,6 +8140,13 @@ function LoopspaceRuntimeView({
     () => parsedGraph.edges.filter((edge) => graphNodeIds.has(edge.from) && graphNodeIds.has(edge.to)),
     [graphNodeIds, parsedGraph.edges],
   );
+  const graphEdgeLookup = useMemo(() => {
+    const map = new Map();
+    visibleGraphEdges.forEach((edge) => {
+      if (edge?.id) map.set(edge.id, edge);
+    });
+    return map;
+  }, [visibleGraphEdges]);
 
   const attachedTriggerIds = useMemo(() => {
     const ids = new Set(
@@ -7693,6 +8372,61 @@ function LoopspaceRuntimeView({
     return map;
   }, [nodeDragPositions, nodeSizes, parsedGraph.nodes, sendMessageCheckpointDragPositions, sendMessageCheckpointLayoutPriorityId, sendMessageSettingsNodeId, visibleGraphNodes]);
 
+  const drainGraphSaveQueue = useCallback(async () => {
+    if (graphSaveInFlightRef.current) return;
+    while (graphSaveQueuedRef.current) {
+      const save = graphSaveQueuedRef.current;
+      graphSaveQueuedRef.current = null;
+      graphSaveInFlightRef.current = save;
+      setGraphSaveState("saving");
+      try {
+        const result = await invoke("cloud_mcp_update_loopspace_graph", {
+          loopspaceId: save.loopspaceId,
+          source: save.source,
+          source_format: DFBLUEPRINT_SOURCE_FORMAT,
+        });
+        if (String(loopspaceRef.current?.id || "") === save.loopspaceId) {
+          if (result?.hydrated === false || loopspaceSnapshotQueued(result)) {
+            if (pendingGraphCommitRef.current?.source === save.source) {
+              setGraphSaveState("queued");
+              setRuntimeError(loopspaceSnapshotQueued(result)
+                ? "Graph edit was queued for retry and will appear after Cloud confirms it."
+                : "Cloud accepted the graph edit, but the updated graph did not hydrate locally yet.");
+            }
+          } else {
+            const applied = applyGraphSnapshot(result);
+            if (applied?.stale && pendingGraphCommitRef.current?.source === save.source) {
+              setGraphSaveState("queued");
+              setRuntimeError("Waiting for Cloud to confirm the latest graph edit.");
+            }
+          }
+          await refreshLoopspaceLogs(save.loopspaceId, refreshGenerationRef.current, false, {
+            mergeEvents: true,
+          }).catch(() => undefined);
+        }
+      } catch (graphError) {
+        if (String(loopspaceRef.current?.id || "") === save.loopspaceId) {
+          if (!graphSaveQueuedRef.current) {
+            setGraphSaveState("error");
+            setRuntimeError(String(graphError || save.fallbackError || "Unable to update loop graph."));
+            resolveGraphSaveIdleWaiters(false);
+          }
+        }
+      } finally {
+        if (graphSaveInFlightRef.current?.id === save.id) {
+          graphSaveInFlightRef.current = null;
+        }
+      }
+    }
+    if (!pendingGraphCommitRef.current?.source) {
+      setGraphSaveState("idle");
+      setPendingGraphNodeIds(new Set());
+      resolveGraphSaveIdleWaiters(true);
+    } else if (!graphSaveInFlightRef.current && !graphSaveQueuedRef.current) {
+      setGraphSaveState((current) => (current === "error" ? current : "queued"));
+    }
+  }, [applyGraphSnapshot, refreshLoopspaceLogs, resolveGraphSaveIdleWaiters]);
+
   const commitLoopspaceGraphSource = useCallback(async (nextSource, fallbackError, options = {}) => {
     if (!loopspaceId || busy) return;
     const previousSource = graphSourceRef.current;
@@ -7716,35 +8450,20 @@ function LoopspaceRuntimeView({
     graphSourceRef.current = normalizedSource;
     setGraphSource(normalizedSource);
     setPendingGraphNodeIds(new Set(pendingNodeIds));
-    setLoadingState("saving");
+    graphSaveVersionRef.current += 1;
+    graphSaveQueuedRef.current = {
+      fallbackError,
+      id: graphSaveVersionRef.current,
+      loopspaceId,
+      nodeIds: pendingNodeIds,
+      previousSource,
+      source: normalizedSource,
+      startedAtMs: Date.now(),
+    };
+    setGraphSaveState(graphSaveInFlightRef.current ? "queued" : "saving");
     setRuntimeError("");
-    try {
-      const result = await invoke("cloud_mcp_update_loopspace_graph", {
-        loopspaceId,
-        source: normalizedSource,
-        source_format: DFBLUEPRINT_SOURCE_FORMAT,
-      });
-      if (result?.hydrated === false || loopspaceSnapshotQueued(result)) {
-        setRuntimeError(loopspaceSnapshotQueued(result)
-          ? "Graph edit was queued for retry and will appear after Cloud confirms it."
-          : "Cloud accepted the graph edit, but the updated graph did not hydrate locally yet.");
-      } else {
-        const applied = applyGraphSnapshot(result);
-        if (applied?.stale) {
-          setRuntimeError("Waiting for Cloud to confirm the latest graph edit.");
-        }
-      }
-      await refreshLoopspaceLogs();
-      setLoadingState("idle");
-    } catch (graphError) {
-      pendingGraphCommitRef.current = null;
-      graphSourceRef.current = previousSource;
-      setGraphSource(previousSource);
-      setPendingGraphNodeIds(new Set());
-      setLoadingState("idle");
-      setRuntimeError(String(graphError || fallbackError || "Unable to update loop graph."));
-    }
-  }, [applyGraphSnapshot, busy, loopspace?.name, loopspaceId, refreshLoopspaceLogs]);
+    void drainGraphSaveQueue();
+  }, [busy, drainGraphSaveQueue, loopspace?.name, loopspaceId]);
 
   const attachTriggerToLoop = useCallback(async (triggerLike, position = null) => {
     if (!loopspaceId || busy) return;
@@ -7798,6 +8517,18 @@ function LoopspaceRuntimeView({
       setRuntimeError("Enable this manual trigger before running it.");
       return;
     }
+    if (
+      pendingGraphCommitRef.current?.source
+      || graphSaveInFlightRef.current
+      || graphSaveQueuedRef.current
+    ) {
+      setRuntimeError("Saving the latest graph before running the manual trigger.");
+      const graphReady = await waitForGraphSaveIdle();
+      if (!graphReady || pendingGraphCommitRef.current?.source) {
+        setRuntimeError("The graph has local changes that are not confirmed yet. Wait for sync, then run again.");
+        return;
+      }
+    }
     setManualTriggerRunPendingId(triggerId);
     setLoadingState("saving");
     setRuntimeError("");
@@ -7817,7 +8548,7 @@ function LoopspaceRuntimeView({
     } finally {
       setManualTriggerRunPendingId((current) => (current === triggerId ? "" : current));
     }
-  }, [applyTriggerSnapshot, busy, loopspaceId, refreshLoopspaceGraph, refreshLoopspaceLogs, triggerById]);
+  }, [applyTriggerSnapshot, busy, loopspaceId, refreshLoopspaceGraph, refreshLoopspaceLogs, triggerById, waitForGraphSaveIdle]);
 
   const findSendMessageParentForPosition = useCallback((position = null) => {
     if (!position) return null;
@@ -8116,6 +8847,39 @@ function LoopspaceRuntimeView({
       },
     });
     await commitLoopspaceGraphSource(nextSource, "Unable to update generated resource name.");
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
+
+  const updateDocumentWriteOperation = useCallback(async (node, operation = "append") => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy || node?.nodeKind !== "document_write") return;
+    const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, nodeId, {
+      props: {
+        operation: normalizeLoopspaceDocumentWriteOperation(operation),
+      },
+    });
+    await commitLoopspaceGraphSource(nextSource, "Unable to update document write operation.");
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
+
+  const updateAssetWriteOperation = useCallback(async (node, operation = "add_version") => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy || node?.nodeKind !== "asset_write") return;
+    const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, nodeId, {
+      props: {
+        operation: normalizeLoopspaceAssetWriteOperation(operation),
+      },
+    });
+    await commitLoopspaceGraphSource(nextSource, "Unable to update asset write operation.");
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
+
+  const updateDocumentWriteContentTemplate = useCallback(async (node, contentTemplate = "") => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy || node?.nodeKind !== "document_write") return;
+    const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, nodeId, {
+      props: {
+        content_template: String(contentTemplate || ""),
+      },
+    });
+    await commitLoopspaceGraphSource(nextSource, "Unable to update document write template.");
   }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
 
   const updateSendMessageSize = useCallback(async (node, size) => {
@@ -8851,7 +9615,7 @@ function LoopspaceRuntimeView({
   const finishPointerGraphDrop = useCallback((drag, position) => {
     if (!drag || !position) return;
     if (busy) {
-      setRuntimeError("Graph is still saving. Try the drop again after Cloud confirms the current edit.");
+      setRuntimeError("Graph is busy. Try the drop again after the current action finishes.");
       return;
     }
     if (drag.kind === "template") {
@@ -9085,7 +9849,7 @@ function LoopspaceRuntimeView({
     }
     event.preventDefault();
     if (busy) {
-      setRuntimeError("Graph is still saving. Try the drop again after Cloud confirms the current edit.");
+      setRuntimeError("Graph is busy. Try the drop again after the current action finishes.");
       return;
     }
     const position = graphPointFromClient(event.clientX, event.clientY);
@@ -9167,7 +9931,7 @@ function LoopspaceRuntimeView({
     setGraphDragGhost(null);
     setDocumentDropTargetNodeId("");
     if (busy) {
-      setRuntimeError("Graph is still saving. Try the drop again after Cloud confirms the current edit.");
+      setRuntimeError("Graph is busy. Try the drop again after the current action finishes.");
       return;
     }
     const droppedDocument = readDroppedDocument(event);
@@ -9188,11 +9952,63 @@ function LoopspaceRuntimeView({
   const graphMajorGridSize = Math.max(40, 160 * canvasZoom);
   const graphNavX = Math.max(-30, Math.min(30, -canvasPan.x * 0.045));
   const graphNavY = Math.max(-30, Math.min(30, -canvasPan.y * 0.045));
-  const runtimeHeadRunId = loopspaceRuntimeField(runtimeHead, ["run_id", "runId", "id"]);
-  const runtimeHeadNodeId = loopspaceRuntimeField(runtimeHead, ["cursor_node_id", "cursorNodeId", "current_node_id", "currentNodeId"]);
+  const runtimeHeadRunId = loopspaceRuntimeField(runtimeHead, ["run_id", "runId", "id", "loop_runtime_run_id", "loopRuntimeRunId"]);
+  const runtimeHeadNodeId = loopspaceRuntimeField(runtimeHead, [
+    "cursor_node_id",
+    "cursorNodeId",
+    "current_node_id",
+    "currentNodeId",
+    "node_id",
+    "nodeId",
+    "loop_runtime_node_id",
+    "loopRuntimeNodeId",
+  ]);
   const runtimeHeadEdgeId = loopspaceRuntimeField(runtimeHead, ["edge_id", "edgeId", "loop_runtime_edge_id", "loopRuntimeEdgeId"]);
   const runtimeHeadStatus = loopspaceRuntimeField(runtimeHead, ["status"], runtimeHead ? "active" : "");
-  const activeRuntimeStatus = ["queued", "running", "awaiting_device", "resume_ready", "active"].includes(String(runtimeHeadStatus || "").toLowerCase());
+  const runtimeSignalStatus = normalizeLoopspaceNodeRuntimeStatus(runtimeHeadStatus) || (runtimeHead ? "running" : "");
+  const activeRuntimeStatus = ["queued", "running", "resume_ready", "resume_requested"].includes(runtimeSignalStatus);
+  const runtimeSignalUpdatedAtMs = loopspaceRuntimeTimestampMs(runtimeHead);
+  const runtimeSignalFinalVisible = runtimeSignalStatus === "success"
+    && runtimeSignalUpdatedAtMs > 0
+    && timerNowMs - runtimeSignalUpdatedAtMs < 6500;
+  const runtimeSignalVisible = Boolean(
+    runtimeHead
+      && runtimeSignalStatus
+      && (
+        activeRuntimeStatus
+        || runtimeSignalFinalVisible
+        || ["failed", "interrupted", "resume_ready"].includes(runtimeSignalStatus)
+      ),
+  );
+  useEffect(() => {
+    if (!runtimeSignalVisible || !activeRuntimeStatus || !runtimeHeadEdgeId) return undefined;
+    const timer = window.setInterval(() => {
+      setRuntimeSignalFrameMs(Date.now());
+    }, 80);
+    return () => window.clearInterval(timer);
+  }, [activeRuntimeStatus, runtimeHeadEdgeId, runtimeSignalVisible]);
+  const runtimeSignalPoint = useMemo(() => {
+    if (!runtimeSignalVisible) return null;
+    return loopspaceGraphRuntimeSignalPoint({
+      edgeLookup: graphEdgeLookup,
+      frameMs: runtimeSignalFrameMs,
+      nodeId: runtimeHeadNodeId,
+      nodeLookup: graphNodeLookup,
+      nodeLayouts: graphNodeLayouts,
+      runtimeHead,
+      status: runtimeSignalStatus,
+    });
+  }, [
+    graphEdgeLookup,
+    graphNodeLayouts,
+    graphNodeLookup,
+    runtimeHead,
+    runtimeHeadNodeId,
+    runtimeSignalFrameMs,
+    runtimeSignalStatus,
+    runtimeSignalVisible,
+  ]);
+  const runtimeSignalTone = loopspaceNodeRuntimeStatusTone(runtimeSignalStatus);
   const currentRuntimeSegments = useMemo(() => {
     const runId = runtimeHeadRunId;
     return safeCloudMcpArray(runtimeSegments).filter((segment) => {
@@ -9226,6 +10042,10 @@ function LoopspaceRuntimeView({
     [loopspaceId, runtimeEvents],
   );
   const visibleRuntimeEvents = scopedRuntimeEvents.length ? scopedRuntimeEvents : legacyRuntimeEvents;
+  const runtimeStateByNodeId = useMemo(
+    () => buildLoopspaceNodeRuntimeStateMap(visibleRuntimeEvents, runtimeHead),
+    [runtimeHead, visibleRuntimeEvents],
+  );
   const sendMessageCheckpointProgressByKey = useMemo(
     () => buildLoopspaceCheckpointProgressMap(
       visibleRuntimeEvents,
@@ -9234,9 +10054,199 @@ function LoopspaceRuntimeView({
     ),
     [runtimeHeadNodeId, runtimeHeadRunId, visibleRuntimeEvents],
   );
+  const resumeSendMessageNode = useCallback((node, runtimeState = null) => {
+    const loopRuntimeNodeId = String(node?.id || "").trim();
+    if (!loopRuntimeNodeId) return;
+    const graphPlan = loopspaceGraphCheckpointPlanForSendMessage(
+      graphSourceRef.current || graphSource,
+      loopRuntimeNodeId,
+    );
+    const checkpointPlan = graphPlan.length
+      ? graphPlan
+      : loopspaceRuntimeResumeCheckpointPlan(runtimeState);
+    const nodeDraft = loopspaceSendMessageDraftFromNode(node, agentLaunchDefaults);
+    const loopRuntimeRunId = String(
+      runtimeState?.runId
+        || loopspaceRuntimeResumeField(runtimeState, ["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"])
+        || runtimeHeadRunId
+        || "",
+    ).trim();
+    const loopRuntimeEdgeId = String(
+      runtimeState?.edgeId
+        || loopspaceRuntimeResumeField(runtimeState, ["loopRuntimeEdgeId", "loop_runtime_edge_id", "edgeId", "edge_id"])
+        || runtimeHeadEdgeId
+        || "",
+    ).trim();
+    const targetAgentId = normalizeLoopspaceSendMessageAgentId(
+      loopspaceRuntimeResumeField(runtimeState, ["targetAgentId", "target_agent_id", "agentId", "agent_id"])
+        || nodeDraft.target_agent_id,
+    );
+    const requestedModel = loopspaceRuntimeResumeField(runtimeState, ["model", "modelId", "model_id", "requestedModel"])
+      || nodeDraft.model;
+    const requestedReasoningEffort = loopspaceRuntimeResumeField(runtimeState, [
+      "reasoningEffort",
+      "reasoning_effort",
+      "requestedReasoningEffort",
+      "effort",
+    ]) || nodeDraft.reasoning_effort;
+    const requestedSpeed = loopspaceRuntimeResumeField(runtimeState, [
+      "speed",
+      "serviceTier",
+      "service_tier",
+      "requestedSpeed",
+    ]) || nodeDraft.speed;
+    const targetThreadId = loopspaceRuntimeResumeField(runtimeState, ["targetThreadId", "target_thread_id", "threadId", "thread_id"]);
+    const targetTerminalId = loopspaceRuntimeResumeField(runtimeState, ["targetTerminalId", "target_terminal_id", "paneId", "pane_id"]);
+    const targetTerminalName = loopspaceRuntimeResumeField(runtimeState, ["targetTerminalName", "target_terminal_name", "terminalName", "terminal_name"]);
+    const targetTerminalIndexText = loopspaceRuntimeResumeField(runtimeState, ["targetTerminalIndex", "target_terminal_index", "terminalIndex", "terminal_index"]);
+    const targetTerminalIndex = Number.parseInt(targetTerminalIndexText, 10);
+    const triggerId = loopspaceRuntimeResumeField(runtimeState, ["triggerId", "trigger_id"]);
+    const triggerRunId = loopspaceRuntimeResumeField(runtimeState, ["triggerRunId", "trigger_run_id"]);
+    const originalPrompt = loopspaceRuntimeResumeField(runtimeState, [
+      "originalText",
+      "original_text",
+      "originalPrompt",
+      "original_prompt",
+      "message",
+      "text",
+    ]) || String(loopspaceGraphPropValue(node?.props, ["prompt", "message", "body", "instructions"]) || "") || nodeDraft.prompt || "";
+    const checkpointsWithStatus = checkpointPlan.map((checkpoint, index) => {
+      const status = loopspaceCheckpointStatusForNode(
+        { id: checkpoint.id },
+        checkpoint.index || index + 1,
+        sendMessageCheckpointProgressByKey,
+      );
+      return {
+        ...checkpoint,
+        index: checkpoint.index || index + 1,
+        status,
+      };
+    });
+    const completedCheckpoints = checkpointsWithStatus.filter((checkpoint) => checkpoint.status === "completed");
+    const nextCheckpoints = checkpointsWithStatus.filter((checkpoint) => checkpoint.status !== "completed");
+    const resumePrompt = buildLoopspaceSendMessageResumePrompt({
+      checkpointPlan: checkpointsWithStatus,
+      completedCheckpoints,
+      loopRuntimeEdgeId,
+      loopRuntimeNodeId,
+      loopRuntimeRunId,
+      loopspaceId,
+      nextCheckpoints,
+      originalPrompt,
+      triggerId,
+      triggerRunId,
+    });
+    const commandId = `loopspace-resume-${loopRuntimeNodeId}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    const promptEventId = `${commandId}-prompt`;
+    const remoteEvent = {
+      command_id: commandId,
+      command_kind: "terminal_orchestrator_send_message",
+      loop_runtime_edge_id: loopRuntimeEdgeId,
+      loop_runtime_node_id: loopRuntimeNodeId,
+      loop_runtime_run_id: loopRuntimeRunId,
+      loopspace_id: loopspaceId,
+      message: resumePrompt,
+      resume: true,
+      resume_from_status: runtimeState?.status || "resume_ready",
+      target_agent_id: targetAgentId,
+      target_terminal_id: targetTerminalId,
+      target_terminal_index: Number.isFinite(targetTerminalIndex) ? targetTerminalIndex : undefined,
+      target_terminal_name: targetTerminalName,
+      target_thread_id: targetThreadId,
+      trigger_id: triggerId,
+      trigger_run_id: triggerRunId,
+      model: requestedModel,
+      reasoning_effort: requestedReasoningEffort,
+      speed: requestedSpeed,
+      source: "diffforge-loopspace-resume",
+      terminal_scope: "device",
+      workspace_id: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
+    };
+    void invoke("cloud_mcp_record_remote_command_status", {
+      details: {
+        checkpointPlan: loopspaceGraphCheckpointPlanFromDispatch(checkpointsWithStatus),
+        checkpoint_plan: loopspaceGraphCheckpointPlanFromDispatch(checkpointsWithStatus),
+        commandId,
+        commandKind: "terminal_orchestrator_send_message",
+        completedCheckpointCount: completedCheckpoints.length,
+        loopRuntimeEdgeId,
+        loopRuntimeNodeId,
+        loopRuntimeRunId,
+        loopspaceId,
+        promptId: promptEventId,
+        resumeRequested: true,
+        targetAgentId,
+        targetTerminalId,
+        targetTerminalIndex: Number.isFinite(targetTerminalIndex) ? targetTerminalIndex : null,
+        targetTerminalName,
+        targetThreadId,
+        terminalScope: "device",
+        triggerId,
+        triggerRunId,
+        workspaceId: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
+      },
+      event: remoteEvent,
+      message: "Resume requested for interrupted terminal orchestrator message.",
+      status: "resume_requested",
+    }).catch(() => {});
+    window.dispatchEvent(new CustomEvent(REMOTE_APP_CONTROL_SEND_MESSAGE_EVENT, {
+      detail: {
+        agentId: targetAgentId,
+        body: resumePrompt,
+        checkpointPlan,
+        commandId,
+        commandKind: "terminal_orchestrator_send_message",
+        event: remoteEvent,
+        loopRuntimeEdgeId,
+        loopRuntimeNodeId,
+        loopRuntimeRunId,
+        loopspaceId,
+        message: resumePrompt,
+        model: requestedModel,
+        prompt: resumePrompt,
+        promptEventId,
+        reasoningEffort: requestedReasoningEffort,
+        requestedModel,
+        requestedReasoningEffort,
+        requestedSpeed,
+        resume: true,
+        source: "diffforge-loopspace-resume",
+        speed: requestedSpeed,
+        targetAgentId,
+        targetTerminalId,
+        ...(Number.isFinite(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+        targetTerminalName,
+        targetThreadId,
+        terminalScope: "device",
+        text: resumePrompt,
+        triggerId,
+        triggerRunId,
+        workspaceId: DEVICE_TERMINAL_ORCHESTRATOR_WORKSPACE_ID,
+      },
+    }));
+  }, [
+    agentLaunchDefaults,
+    graphSource,
+    loopspaceId,
+    runtimeHeadEdgeId,
+    runtimeHeadRunId,
+    sendMessageCheckpointProgressByKey,
+  ]);
   const selectedRuntimeEvent = useMemo(() => (
     visibleRuntimeEvents.find((event) => event.id === selectedHistoryRunId) || null
   ), [selectedHistoryRunId, visibleRuntimeEvents]);
+  const runtimeHeadNode = runtimeHeadNodeId ? graphNodeLookup.get(runtimeHeadNodeId) : null;
+  const runtimeHeadResumeState = runtimeHeadNodeId
+    ? (runtimeStateByNodeId.get(runtimeHeadNodeId) || {
+      details: runtimeHead?.details && typeof runtimeHead.details === "object" ? runtimeHead.details : {},
+      edgeId: runtimeHeadEdgeId,
+      event: runtimeHead,
+      runId: runtimeHeadRunId,
+      status: runtimeHeadStatus,
+    })
+    : null;
+  const runtimeHeadCanResume = runtimeHeadNode?.nodeKind === "send_message"
+    && loopspaceRuntimeStateCanResume(runtimeHeadResumeState);
   const runtimePanelNodeTemplates = loopspaceGraphPaletteTemplates;
   const runtimeStatus = runtimeError || error;
   const foregroundGraphEdges = visibleGraphEdges.filter((edge) => loopspaceGraphEdgeNeedsForegroundLayer(edge, graphNodeLookup));
@@ -9361,6 +10371,14 @@ function LoopspaceRuntimeView({
     selectedHistoryRunId,
   ]);
 
+  const graphSaveStateLabel = graphSaveState === "saving"
+    ? "Saving"
+    : graphSaveState === "queued"
+      ? "Queued"
+      : graphSaveState === "error"
+        ? "Unsynced"
+        : "";
+
   return (
     <LoopspaceRuntimeSurface aria-label={loopspace?.name || "Loop"} ref={runtimeSurfaceRef}>
       <LoopspaceRuntimeStage
@@ -9371,6 +10389,7 @@ function LoopspaceRuntimeView({
       >
         <LoopspaceGraphCanvas
             data-drop-active={dropActive ? "true" : undefined}
+            data-graph-save-state={graphSaveState !== "idle" ? graphSaveState : undefined}
             data-panning={isCanvasPanning ? "true" : undefined}
             onDragEnter={(event) => {
               if (hasDroppedLoopspaceGraphItemType(event)) {
@@ -9540,6 +10559,13 @@ function LoopspaceRuntimeView({
                   ? String(loopspaceGraphPropValue(node.props, ["prompt", "message", "body", "instructions"]) || "")
                   : "";
                 const isSendMessageRegion = node.nodeKind === "send_message";
+                const sendMessageRuntimeState = isSendMessageRegion
+                  ? runtimeStateByNodeId.get(node.id)
+                  : null;
+                const sendMessageRuntimeLabel = sendMessageRuntimeState?.label || "";
+                const sendMessageRuntimeTone = sendMessageRuntimeState?.tone || "neutral";
+                const sendMessageCanResume = isSendMessageRegion
+                  && loopspaceRuntimeStateCanResume(sendMessageRuntimeState);
                 const nodeVisualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
                 const isSizedGraphNode = Boolean(nodeVisualDefaults.sized);
                 const sendMessageSettingsOpen = isSendMessageRegion && sendMessageSettingsNodeId === node.id;
@@ -9835,15 +10861,31 @@ function LoopspaceRuntimeView({
                           <span>{runScriptDeviceLabel}</span>
                         </LoopspaceGraphNodeDeviceBadge>
                       ) : null}
-                      {isDocumentContextNode ? (
-                        <LoopspaceDocumentContextPicker
-                          busy={busy}
-                          createName={nodeResourceCreateName}
-                          mode={isDocumentWriteNode ? "write" : "read"}
-                          onCreateNameChange={(value) => void updateResourceContextCreateName(node, value)}
-                          onRefsChange={(refs) => void updateDocumentContextNodeRefs(node, refs)}
-                          options={loopspaceGraphDocumentOptions}
-                          refs={nodeDocumentRefs}
+		                      {isDocumentContextNode ? (
+		                        <LoopspaceDocumentContextPicker
+		                          busy={busy}
+                              contentTemplate={isDocumentWriteNode ? loopspaceGraphPropValue(node.props, [
+                                "content_template",
+                                "contentTemplate",
+                                "template",
+                                "body_template",
+                                "bodyTemplate",
+                              ]) : ""}
+		                          createName={nodeResourceCreateName}
+		                          mode={isDocumentWriteNode ? "write" : "read"}
+                              onContentTemplateChange={(value) => void updateDocumentWriteContentTemplate(node, value)}
+		                          onCreateNameChange={(value) => void updateResourceContextCreateName(node, value)}
+		                          onOperationChange={(value) => void updateDocumentWriteOperation(node, value)}
+	                          onRefsChange={(refs) => void updateDocumentContextNodeRefs(node, refs)}
+	                          operation={isDocumentWriteNode ? loopspaceGraphPropValue(node.props, [
+	                            "operation",
+	                            "write_operation",
+	                            "writeOperation",
+	                            "document_operation",
+	                            "documentOperation",
+	                          ]) : "append"}
+	                          options={loopspaceGraphDocumentOptions}
+	                          refs={nodeDocumentRefs}
                           search={nodeDocumentSearch}
                           setSearch={(value) => setDocumentContextSearchByNode((current) => ({
                             ...current,
@@ -9857,7 +10899,15 @@ function LoopspaceRuntimeView({
                           createName={nodeResourceCreateName}
                           mode={isAssetWriteNode ? "write" : "read"}
                           onCreateNameChange={(value) => void updateResourceContextCreateName(node, value)}
+                          onOperationChange={(value) => void updateAssetWriteOperation(node, value)}
                           onRefsChange={(refs) => void updateAssetContextNodeRefs(node, refs)}
+                          operation={isAssetWriteNode ? loopspaceGraphPropValue(node.props, [
+                            "operation",
+                            "write_operation",
+                            "writeOperation",
+                            "asset_operation",
+                            "assetOperation",
+                          ]) : "add_version"}
                           options={loopspaceGraphAssetOptions}
                           refs={nodeAssetRefs}
                           search={nodeDocumentSearch}
@@ -9870,6 +10920,30 @@ function LoopspaceRuntimeView({
                     </LoopspaceGraphNodeText>
                     {node.nodeKind === "send_message" ? (
                       <>
+                        {sendMessageRuntimeLabel ? (
+                          <LoopspaceGraphNodeStateBadge
+                            data-tone={sendMessageRuntimeTone}
+                            onPointerDown={(event) => event.stopPropagation()}
+                            title={sendMessageRuntimeLabel}
+                          >
+                            <span>{sendMessageRuntimeLabel}</span>
+                            {sendMessageCanResume ? (
+                              <LoopspaceGraphNodeResumeButton
+                                aria-label={`Resume ${nodeTitle}`}
+                                disabled={busy}
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  resumeSendMessageNode(node, sendMessageRuntimeState);
+                                }}
+                                onPointerDown={(event) => event.stopPropagation()}
+                                title="Resume this interrupted send message"
+                                type="button"
+                              >
+                                Resume
+                              </LoopspaceGraphNodeResumeButton>
+                            ) : null}
+                          </LoopspaceGraphNodeStateBadge>
+                        ) : null}
                         <LoopspaceGraphMessageSettingsButton
                           aria-label={sendMessageSettingsOpen ? "Cancel send message settings" : "Open send message settings"}
                           data-open={sendMessageSettingsOpen ? "true" : undefined}
@@ -10293,8 +11367,21 @@ function LoopspaceRuntimeView({
                   />
                 ) : null}
               </LoopspaceGraphEdges>
-	              {graphDragGhost?.node ? (() => {
-	                const node = graphDragGhost.node;
+              {runtimeSignalPoint ? (
+                <LoopspaceRuntimeSignalLayer aria-label="Loop runtime signal">
+                  <LoopspaceRuntimeSignalDot
+                    data-status={runtimeSignalStatus}
+                    data-tone={runtimeSignalTone}
+                    style={{
+                      "--loopspace-signal-x": `${runtimeSignalPoint.x}px`,
+                      "--loopspace-signal-y": `${runtimeSignalPoint.y}px`,
+                    }}
+                    title={`${loopspaceNodeRuntimeStatusLabel(runtimeSignalStatus) || runtimeHeadStatus || "Runtime signal"}${runtimeHeadRunId ? ` - ${runtimeHeadRunId}` : ""}`}
+                  />
+                </LoopspaceRuntimeSignalLayer>
+              ) : null}
+		              {graphDragGhost?.node ? (() => {
+		                const node = graphDragGhost.node;
                 const nodeLayout = loopspaceGraphNodeLayout(node, 0);
                 const type = node.nodeKind || node.role || "node";
                 const isGhostRegion = node.nodeKind === "send_message";
@@ -10347,6 +11434,12 @@ function LoopspaceRuntimeView({
               onPointerDown={(event) => event.stopPropagation()}
               onWheel={(event) => event.stopPropagation()}
             >
+              {graphSaveStateLabel ? (
+                <LoopspaceGraphSaveBadge data-state={graphSaveState}>
+                  <span aria-hidden="true" />
+                  {graphSaveStateLabel}
+                </LoopspaceGraphSaveBadge>
+              ) : null}
               <LoopspaceGraphControlButton
                 aria-label="Zoom out"
                 disabled={canvasZoom <= LOOPSPACE_GRAPH_MIN_ZOOM}
@@ -10487,9 +11580,16 @@ function LoopspaceRuntimeView({
                         <span>{formatLoopspaceRuntimeTime(runtimeHead?.updatedAtMs || runtimeHead?.updated_at_ms || runtimeHead?.createdAtMs || runtimeHead?.created_at_ms) || "now"}</span>
                         <strong>{runtimeHeadStatus || "active"}</strong>
                         <em>{runtimeHeadNodeId || runtimeHeadRunId || "Loop runtime"}</em>
-                        <LoopspaceRuntimePanelResumeButton disabled title="Resume runtime checkpoint is not available yet." type="button">
-                          Resume
-                        </LoopspaceRuntimePanelResumeButton>
+                        {runtimeHeadCanResume ? (
+                          <LoopspaceRuntimePanelResumeButton
+                            disabled={busy}
+                            onClick={() => resumeSendMessageNode(runtimeHeadNode, runtimeHeadResumeState)}
+                            title="Resume this interrupted send message"
+                            type="button"
+                          >
+                            Resume
+                          </LoopspaceRuntimePanelResumeButton>
+                        ) : null}
                       </LoopspaceRuntimePanelEventRow>
                       {currentRuntimeSegments.map((segment, index) => {
                         const segmentId = loopspaceRuntimeField(segment, ["segment_id", "segmentId"], `segment-${index + 1}`);
@@ -32735,6 +33835,262 @@ export default function App() {
         workspace: workspaceSummary(workspace),
       };
     };
+    const appControlTodoResponseOptions = (input = {}) => ({
+      includeState: appControlBooleanValue(input.includeState ?? input.include_state, false),
+      verbose: appControlBooleanValue(input.verbose ?? input.includeDetails ?? input.include_details, false),
+    });
+    const compactAppControlTodoTerminal = (terminal, { verbose = false } = {}) => ({
+      agent: terminal.agentId || terminal.role || "",
+      configured: Boolean(terminal.configured),
+      idle: Boolean(terminal.idle),
+      index: Number.isInteger(terminal.terminalIndex) ? terminal.terminalIndex : null,
+      inputReady: Boolean(terminal.inputReady),
+      live: Boolean(terminal.live),
+      name: terminal.terminalName || "",
+      paneId: terminal.paneId || "",
+      status: terminal.status || "",
+      threadId: terminal.threadId || "",
+      ...(verbose ? {
+        agentLabel: terminal.agentLabel || "",
+        idleReason: terminal.idleReason || "",
+        instanceId: terminal.instanceId || "",
+        statuses: terminal.statuses || [],
+        terminalNumber: terminal.terminalNumber || null,
+        workspaceId: terminal.workspaceId || "",
+      } : {}),
+    });
+    const compactAppControlTodoWorkspace = (snapshot, { verbose = false } = {}) => {
+      const terminals = Array.isArray(snapshot?.terminals) ? snapshot.terminals : [];
+      const liveTerminals = terminals.filter((terminal) => terminal.live);
+      const idleTerminals = terminals.filter((terminal) => terminal.idle);
+      const workspace = snapshot?.workspace || {};
+      return {
+        activated: activatedWorkspace?.id === workspace.id,
+        active: Boolean(workspace.active),
+        busyTerminalCount: Math.max(0, terminals.length - idleTerminals.length),
+        configuredTerminalCount: snapshot?.configuredCount || 0,
+        id: workspace.id || "",
+        idleTerminalCount: idleTerminals.length,
+        live: Boolean(workspace.active || liveTerminals.length > 0),
+        liveTerminalCount: liveTerminals.length,
+        name: workspace.name || "",
+        queueable: Boolean(workspace.id),
+        selected: Boolean(workspace.selected),
+        terminalLimit: snapshot?.terminalLimit || MAX_WORKSPACE_TERMINAL_COUNT,
+        terminals: terminals.map((terminal) => compactAppControlTodoTerminal(terminal, { verbose })),
+        totalTerminalCount: snapshot?.totalTerminals || terminals.length,
+        ...(verbose ? {
+          rootDirectory: workspace.rootDirectory || "",
+        } : {}),
+      };
+    };
+    const compactAppControlTodoWorkspaceSummary = (workspace) => {
+      const summary = workspace ? workspaceSummary(workspace) : null;
+      if (!summary) return null;
+      return {
+        active: Boolean(summary.active),
+        id: summary.id,
+        name: summary.name,
+        selected: Boolean(summary.selected),
+      };
+    };
+    const listAppControlTodoTargets = (input = {}) => {
+      const options = appControlTodoResponseOptions(input);
+      const inventory = listAppControlTerminals(input);
+      return {
+        activatedWorkspace: compactAppControlTodoWorkspaceSummary(activatedWorkspace),
+        selectedWorkspace: compactAppControlTodoWorkspaceSummary(selectedWorkspace),
+        workspaces: inventory.workspaces.map((snapshot) => compactAppControlTodoWorkspace(snapshot, options)),
+      };
+    };
+    const appControlTodoText = (input = {}) => {
+      for (const key of ["text", "prompt", "message", "body", "todo", "title", "task"]) {
+        const value = input?.[key];
+        if (typeof value === "string" && value.trim()) {
+          return value.trim();
+        }
+      }
+      return "";
+    };
+    const appControlTerminalSelectorProvided = (input = {}) => (
+      collectAppControlValues(
+        input.targetTerminalId,
+        input.target_terminal_id,
+        input.terminalId,
+        input.terminal_id,
+        input.paneId,
+        input.pane_id,
+        input.targetThreadId,
+        input.target_thread_id,
+        input.threadId,
+        input.thread_id,
+        input.targetTerminalName,
+        input.target_terminal_name,
+        input.terminalName,
+        input.terminal_name,
+        input.targetName,
+        input.target_name,
+        input.targetTerminalIndex,
+        input.target_terminal_index,
+        input.terminalIndex,
+        input.terminal_index,
+        input.index,
+        input.terminalNumber,
+        input.terminal_number,
+      ).length > 0
+    );
+    const queueAppControlTodo = (input = {}, toolName = "queue_todo") => {
+      const options = appControlTodoResponseOptions(input);
+      const workspace = resolveWorkspaceForAppControl(input);
+      if (!workspace) {
+        throw new Error("No matching workspace was found.");
+      }
+      const text = appControlTodoText(input);
+      if (!text) {
+        throw new Error("Todo text is required. Pass text, prompt, message, body, title, or task.");
+      }
+
+      const openWorkspace = appControlBooleanValue(
+        input.openWorkspace ?? input.open_workspace ?? input.activateWorkspace ?? input.activate_workspace,
+        true,
+      );
+      let activated = false;
+      if (openWorkspace) {
+        activated = showAppControlWorkspaceTerminals(workspace, "app_control_mcp_queue_todo");
+      }
+
+      let openedTerminals = null;
+      if (appControlBooleanValue(
+        input.openTerminals ?? input.open_terminals ?? input.ensureTerminal ?? input.ensure_terminal ?? input.ensureTerminals ?? input.ensure_terminals,
+        false,
+      )) {
+        openedTerminals = openAppControlTerminals({
+          ...input,
+          count: input.terminalCount ?? input.terminal_count ?? input.count ?? 1,
+          focus: input.focus ?? input.select ?? openWorkspace,
+          mode: input.openMode ?? input.open_mode ?? "ensure",
+          workspaceId: workspace.id,
+        });
+      }
+
+      const snapshot = buildAppControlTerminalSnapshot(workspace);
+      const targetResolution = resolveAppControlTerminalTargets(workspace, input, { requireTarget: false });
+      const explicitTerminalSelector = appControlTerminalSelectorProvided(input);
+      const targetTerminal = explicitTerminalSelector ? targetResolution.targets[0] || null : null;
+      const targetAgentId = normalizeAppControlTerminalRole(
+        input.targetAgentId,
+        input.target_agent_id,
+        input.agent,
+        input.agentType,
+        input.agent_type,
+        input.provider,
+        input.role,
+      );
+      const targetTerminalId = appControlTerminalText({
+        targetTerminalId: input.targetTerminalId || input.target_terminal_id,
+        terminalId: input.terminalId || input.terminal_id,
+        paneId: input.paneId || input.pane_id,
+      }, ["targetTerminalId", "terminalId", "paneId"]) || (targetTerminal?.paneId || "");
+      const targetTerminalName = appControlTerminalText({
+        targetTerminalName: input.targetTerminalName || input.target_terminal_name,
+        terminalName: input.terminalName || input.terminal_name,
+        targetName: input.targetName || input.target_name,
+      }, ["targetTerminalName", "terminalName", "targetName"]) || (targetTerminal?.terminalName || "");
+      const targetThreadId = appControlTerminalText({
+        targetThreadId: input.targetThreadId || input.target_thread_id,
+        threadId: input.threadId || input.thread_id,
+      }, ["targetThreadId", "threadId"]) || (targetTerminal?.threadId || "");
+      const requestedTerminalIndex = targetResolution.indexes[0];
+      const targetTerminalIndex = explicitTerminalSelector && Number.isInteger(targetTerminal?.terminalIndex)
+        ? targetTerminal.terminalIndex
+        : explicitTerminalSelector && Number.isInteger(requestedTerminalIndex)
+          ? requestedTerminalIndex
+          : null;
+      const requestedModel = String(input.model || input.modelId || input.model_id || "").trim();
+      const requestedReasoningEffort = String(input.reasoningEffort || input.reasoning_effort || input.effort || "").trim();
+      const requestedSpeed = String(input.speed || "").trim();
+      const commandId = String(input.commandId || input.command_id || input.todoId || input.todo_id || "").trim()
+        || `app-control-todo-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const createdAt = String(input.createdAt || input.created_at || "").trim() || new Date().toISOString();
+      const remoteCommand = {
+        commandId,
+        commandKind: toolName,
+        source: "app-control-mcp",
+        ...(requestedModel ? { model: requestedModel, model_id: requestedModel, modelId: requestedModel } : {}),
+        ...(requestedReasoningEffort ? {
+          effort: requestedReasoningEffort,
+          reasoning_effort: requestedReasoningEffort,
+          reasoningEffort: requestedReasoningEffort,
+        } : {}),
+        ...(requestedSpeed ? { speed: requestedSpeed } : {}),
+        ...(targetAgentId ? { targetAgentId, target_agent_id: targetAgentId } : {}),
+        ...(targetTerminalId ? { targetTerminalId, target_terminal_id: targetTerminalId } : {}),
+        ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex, target_terminal_index: targetTerminalIndex } : {}),
+        ...(targetTerminalName ? { targetTerminalName, target_terminal_name: targetTerminalName } : {}),
+        ...(targetThreadId ? { targetThreadId, target_thread_id: targetThreadId } : {}),
+      };
+      const item = {
+        createdAt,
+        id: commandId,
+        kind: "todo",
+        remoteCommand,
+        source: "app-control-mcp",
+        ...(targetAgentId ? {
+          targetAgentId,
+          targetAgentLabel: targetAgentId === WORKSPACE_TERMINAL_ROLE_GENERIC ? "Terminal" : getManagedAgentLabel(targetAgentId),
+        } : {}),
+        ...(requestedModel ? { model: requestedModel, modelId: requestedModel } : {}),
+        ...(requestedReasoningEffort ? {
+          effort: requestedReasoningEffort,
+          reasoning_effort: requestedReasoningEffort,
+          reasoningEffort: requestedReasoningEffort,
+        } : {}),
+        ...(requestedSpeed ? { speed: requestedSpeed } : {}),
+        ...(targetTerminalId ? { targetTerminalId } : {}),
+        ...(Number.isInteger(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+        ...(targetTerminalName ? { targetTerminalName } : {}),
+        ...(targetThreadId ? { targetThreadId } : {}),
+        text,
+        workspaceId: workspace.id,
+      };
+      const detail = {
+        commandId,
+        item,
+        source: "app-control-mcp",
+        workspaceId: workspace.id,
+        workspaceName: workspace.name || "",
+      };
+      const dispatchQueueEvent = () => {
+        window.dispatchEvent(new CustomEvent(REMOTE_TODO_QUEUE_EVENT, { detail }));
+      };
+      dispatchQueueEvent();
+      if (openWorkspace) {
+        window.setTimeout(dispatchQueueEvent, 100);
+        window.setTimeout(dispatchQueueEvent, 300);
+      }
+
+      return {
+        activated,
+        commandId,
+        ...(options.verbose ? { item } : {
+          todo: {
+            id: commandId,
+            textLength: text.length,
+            textPreview: text.slice(0, 160),
+          },
+        }),
+        openedTerminals,
+        target: {
+          targetAgentId,
+          targetTerminalId,
+          targetTerminalIndex,
+          targetTerminalName,
+          targetThreadId,
+        },
+        workspace: compactAppControlTodoWorkspaceSummary(workspace),
+        workspaceTerminals: compactAppControlTodoWorkspace(snapshot, options),
+      };
+    };
     const sendAppControlReply = (requestId, response) => {
       if (!requestId) {
         return;
@@ -34690,7 +36046,7 @@ export default function App() {
               result,
               source_format: DFBLUEPRINT_SOURCE_FORMAT,
               blueprint: parseDfBlueprintSource(String(result?.graph?.source || result?.graph?.sourceText || result?.graph?.source_text || "")),
-              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: run_script/send_message expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. To guide a send-message substep, connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation. add_node and update_node_props accept resource metadata as top-level fields or nested under props. Never invent standalone cron/manual/webhook trigger nodes.",
+              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: run_script/send_message expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. document_write accepts operation append|replace|prepend|create_if_missing|delete and optional content_template for deterministic webhook/body writes without an agent. asset_write accepts operation add_version|replace|create_if_missing|delete and optional content_template for deterministic webhook/body assets without an agent. To guide a send-message substep, connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation. add_node and update_node_props accept resource metadata as top-level fields or nested under props. Never invent standalone cron/manual/webhook trigger nodes.",
               loopspace: { id: loopspace.id, name: loopspace.name },
               state: buildAppControlState(),
             },
@@ -35006,6 +36362,35 @@ export default function App() {
           return;
         }
 
+        if (tool === "list_todo_targets" || tool === "list_workspace_todo_targets") {
+          const includeState = appControlTodoResponseOptions(input).includeState;
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...listAppControlTodoTargets(input),
+              ...(includeState ? { state: buildAppControlState() } : {}),
+            },
+          });
+          return;
+        }
+
+        if (
+          tool === "queue_todo"
+          || tool === "send_todo"
+          || tool === "create_todo"
+          || tool === "queue_workspace_todo"
+        ) {
+          const includeState = appControlTodoResponseOptions(input).includeState;
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...queueAppControlTodo(input, tool),
+              ...(includeState ? { state: buildAppControlState() } : {}),
+            },
+          });
+          return;
+        }
+
         if (tool === "open_terminals") {
           sendAppControlReply(requestId, {
             ok: true,
@@ -35049,13 +36434,20 @@ export default function App() {
           data: buildAppControlState(),
         });
       } catch (error) {
+        const todoTool = tool === "list_todo_targets"
+          || tool === "list_workspace_todo_targets"
+          || tool === "queue_todo"
+          || tool === "send_todo"
+          || tool === "create_todo"
+          || tool === "queue_workspace_todo";
+        const includeState = todoTool ? appControlTodoResponseOptions(input).includeState : true;
         sendAppControlReply(requestId, {
           ok: false,
           error: {
             code: "tool_failed",
             message: getErrorMessage(error, "Unable to handle app-control MCP request."),
           },
-          data: buildAppControlState(),
+          data: includeState ? buildAppControlState() : { tool },
         });
       }
     };
@@ -40029,6 +41421,16 @@ export default function App() {
                           <span>Files</span>
                         </RailActionButton>
                         <RailActionButton
+                          aria-label="Web"
+                          data-active={activeView === "web"}
+                          onClick={() => showView("web")}
+                          title="Web"
+                          type="button"
+                        >
+                          <ButtonBrowserIcon aria-hidden="true" />
+                          <span>Web</span>
+                        </RailActionButton>
+                        <RailActionButton
                           aria-label="History"
                           data-active={activeView === "architecture"}
                           onClick={() => showView("architecture")}
@@ -40085,17 +41487,20 @@ export default function App() {
                         <ButtonMicIcon aria-hidden="true" />
                         <span>Audio</span>
                       </RailActionButton>
-                      <RailActionButton
-                        aria-label="Editor"
-                        data-active={activeView === "editor"}
-                        data-scope="global"
-                        onClick={() => showView("editor")}
-                        title="Editor"
-                        type="button"
-                      >
-                        <ButtonEditorIcon aria-hidden="true" />
-                        <span>Editor</span>
-                      </RailActionButton>
+                      {/* Editor nav button hidden for now (still reachable via showView("editor")). */}
+                      {false && (
+                        <RailActionButton
+                          aria-label="Editor"
+                          data-active={activeView === "editor"}
+                          data-scope="global"
+                          onClick={() => showView("editor")}
+                          title="Editor"
+                          type="button"
+                        >
+                          <ButtonEditorIcon aria-hidden="true" />
+                          <span>Editor</span>
+                        </RailActionButton>
+                      )}
                       <RailActionButton
                         aria-label="Tokenomics"
                         data-active={activeView === "tokenomics"}
@@ -41756,6 +43161,24 @@ export default function App() {
                     />
                   ) : (
                     <WorkspaceIdleState detail="Select a workspace to browse files." viewMotion={viewMotion} />
+                  )}
+                </ForgeWorkspace>
+              ) : visibleView === "web" ? (
+                <ForgeWorkspace aria-label="Workspace web" data-motion={viewMotion} data-surface="web">
+                  {shouldShowWorkspaceSetup ? (
+                    <WorkspaceIdleState
+                      actionLabel="Create First Workspace"
+                      detail="Create a workspace before opening the web view."
+                      flameActive={visibleView === "web" && !workspaceCreateModalOpen}
+                      onAction={openCreateWorkspaceModal}
+                      plan={billingPlanNameFromStatus(billingStatus, user)}
+                      title="No Workspaces Selected"
+                      viewMotion={viewMotion}
+                    />
+                  ) : selectedWorkspace ? (
+                    <WebWorkspaceView workspace={selectedWorkspace} />
+                  ) : (
+                    <WorkspaceIdleState detail="Select a workspace to open the web view." viewMotion={viewMotion} />
                   )}
                 </ForgeWorkspace>
               ) : visibleView === "architecture" ? (

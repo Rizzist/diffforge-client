@@ -633,3 +633,59 @@ test("graph patches update resource node metadata from top-level fields", () => 
   assert.equal(assetNode?.props?.h, "208");
   assert.equal(assetNode?.props?.target_mode, "capture_generated");
 });
+
+test("graph patches preserve deterministic document write operation metadata", () => {
+  const source = applyDfBlueprintPatchOperations("", [
+    {
+      op: "add_node",
+      id: "webhook-log",
+      kind: "document_write",
+      label: "Webhook log",
+      create_name: "Webhook Logs.md",
+      operation: "append",
+      content_template: "Payload: {{payload_json}}",
+    },
+  ]);
+  const updated = applyDfBlueprintPatchOperations(source, [
+    {
+      op: "update_node_props",
+      id: "webhook-log",
+      document_operation: "replace",
+      contentTemplate: "Latest: {{body_json}}",
+    },
+  ]);
+  const ast = parseDfBlueprintSource(updated);
+  const docNode = ast.nodes.find((node) => node.id === "webhook-log");
+
+  assert.equal(docNode?.props?.create_name, "Webhook Logs.md");
+  assert.equal(docNode?.props?.operation, "replace");
+  assert.equal(docNode?.props?.content_template, "Latest: {{body_json}}");
+});
+
+test("graph patches preserve deterministic asset write operation metadata", () => {
+  const source = applyDfBlueprintPatchOperations("", [
+    {
+      op: "add_node",
+      id: "webhook-asset",
+      kind: "asset_write",
+      label: "Webhook asset",
+      create_name: "payload.json",
+      asset_operation: "create_if_missing",
+      content_template: "{{payload_json}}",
+    },
+  ]);
+  const updated = applyDfBlueprintPatchOperations(source, [
+    {
+      op: "update_node_props",
+      id: "webhook-asset",
+      assetOperation: "replace",
+      contentTemplate: "Latest: {{body_json}}",
+    },
+  ]);
+  const ast = parseDfBlueprintSource(updated);
+  const assetNode = ast.nodes.find((node) => node.id === "webhook-asset");
+
+  assert.equal(assetNode?.props?.create_name, "payload.json");
+  assert.equal(assetNode?.props?.operation, "replace");
+  assert.equal(assetNode?.props?.content_template, "Latest: {{body_json}}");
+});

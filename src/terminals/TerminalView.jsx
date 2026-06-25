@@ -7575,22 +7575,34 @@ const TodoQueueDispatchSelect = styled.select`
   padding: 0;
   border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.24);
   border-radius: 6px;
-  color: var(--forge-tint-soft);
-  background: rgba(24, 34, 54, 0.92);
+  color: transparent;
+  background-color: rgba(24, 34, 54, 0.92);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: center;
+  background-size: 13px 13px;
+  color-scheme: dark;
   font-size: 11px;
   font-weight: 800;
   opacity: 0;
   pointer-events: none;
+  appearance: none;
+  -webkit-appearance: none;
+  cursor: pointer;
   transition:
-    background 130ms ease,
+    background-color 130ms ease,
     border-color 130ms ease,
     opacity 130ms ease,
     transform 130ms ease;
 
+  &::-ms-expand {
+    display: none;
+  }
+
   &:hover,
   &:focus-visible {
     border-color: rgba(var(--forge-tint-soft-rgb), 0.42);
-    background: rgba(32, 48, 78, 0.96);
+    background-color: rgba(32, 48, 78, 0.96);
     outline: none;
     transform: translateY(-1px);
   }
@@ -7602,8 +7614,9 @@ const TodoQueueDispatchSelect = styled.select`
   }
 
   html[data-forge-theme="light"] & {
-    color: var(--forge-tint);
-    background: rgba(255, 255, 255, 0.94);
+    background-color: rgba(255, 255, 255, 0.94);
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%230066cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    color-scheme: light;
   }
 `;
 
@@ -16747,12 +16760,12 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       const contextIndex = Number(context?.terminalIndex);
       const status = String(context?.lastRemoteStatus || "").trim().toLowerCase();
       if (
-        Number.isInteger(contextIndex)
-        && contextIndex === safeIndex
-        && !["completed", "failed", "interrupted"].includes(status)
-      ) {
-        return true;
-      }
+	        Number.isInteger(contextIndex)
+	        && contextIndex === safeIndex
+	        && !["completed", "failed", "interrupted", "resume_ready"].includes(status)
+	      ) {
+	        return true;
+	      }
     }
     return false;
   }, []);
@@ -16840,18 +16853,25 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       "running",
       options.message || "Preparing terminal orchestrator message.",
       {
-        agentId: role,
-        commandId: remoteCommand.commandId || "",
-        commandKind: remoteCommand.commandKind || "terminal_orchestrator_send_message",
-        paneId,
-        promptId,
-        queueDepth: Number(options.queueDepth || 0),
-        recoveryAttempt,
-        targetTerminalIndex: safeIndex,
-        targetThreadId: threadId,
-        textPreview: remoteCommand.textPreview || "",
-      },
-    );
+	        agentId: role,
+	        commandId: remoteCommand.commandId || "",
+	        commandKind: remoteCommand.commandKind || "terminal_orchestrator_send_message",
+	        loopRuntimeEdgeId: remoteCommand.loopRuntimeEdgeId || "",
+	        loopRuntimeNodeId: remoteCommand.loopRuntimeNodeId || "",
+	        loopRuntimeRunId: remoteCommand.loopRuntimeRunId || "",
+	        loopspaceId: remoteCommand.loopspaceId || "",
+	        paneId,
+	        promptId,
+	        queueDepth: Number(options.queueDepth || 0),
+	        recoveryAttempt,
+	        resumeRequested: Boolean(remoteCommand.resumeRequested),
+	        targetTerminalIndex: safeIndex,
+	        targetThreadId: threadId,
+	        textPreview: remoteCommand.textPreview || "",
+	        triggerId: remoteCommand.triggerId || "",
+	        triggerRunId: remoteCommand.triggerRunId || "",
+	      },
+	    );
   }, [
     getAppControlAgentThreadId,
     recordAppControlRemoteCommandStatus,
@@ -17211,10 +17231,10 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         const activeEntry = Array.from(appControlAgentRemoteCommandsByPromptIdRef.current.entries()).find(([, context]) => {
           const contextIndex = Number(context?.terminalIndex);
           const status = String(context?.lastRemoteStatus || "").trim().toLowerCase();
-          return Number.isInteger(contextIndex)
-            && contextIndex === terminalIndex
-            && !["completed", "failed", "interrupted"].includes(status);
-        });
+	          return Number.isInteger(contextIndex)
+	            && contextIndex === terminalIndex
+	            && !["completed", "failed", "interrupted", "resume_ready"].includes(status);
+	        });
         const terminalOnlyFinalLifecycle = [
           "provider-turn-completed",
           "provider-turn-error",
@@ -17370,21 +17390,45 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
       });
     }
-    if (failed && !terminalAccepted) {
-      recoverOrFailAppControlAgentSendMessage(promptId, "terminal_lifecycle_failure", event);
-      return;
-    }
-    const status = failed
-      ? "failed"
-      : completed && Array.isArray(existingContext.checkpointPlan) && existingContext.checkpointPlan.length
-        ? "running"
-        : completed
-          ? "completed"
-          : interrupted
-            ? "interrupted"
-            : running
-              ? "running"
-            : "";
+	    if (failed && !terminalAccepted) {
+	      recoverOrFailAppControlAgentSendMessage(promptId, "terminal_lifecycle_failure", event);
+	      return;
+	    }
+	    const loopspaceId = existingContext.loopspaceId
+	      || appControlRemoteDetailString(existingContext.event, ["loopspaceId", "loopspace_id"])
+	      || appControlRemoteDetailString(event, ["loopspaceId", "loopspace_id"]);
+	    const loopRuntimeRunId = existingContext.loopRuntimeRunId
+	      || appControlRemoteDetailString(existingContext.event, ["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"])
+	      || appControlRemoteDetailString(event, ["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"]);
+	    const loopRuntimeNodeId = existingContext.loopRuntimeNodeId
+	      || appControlRemoteDetailString(existingContext.event, ["loopRuntimeNodeId", "loop_runtime_node_id", "nodeId", "node_id"])
+	      || appControlRemoteDetailString(event, ["loopRuntimeNodeId", "loop_runtime_node_id", "nodeId", "node_id"]);
+	    const loopRuntimeEdgeId = existingContext.loopRuntimeEdgeId
+	      || appControlRemoteDetailString(existingContext.event, ["loopRuntimeEdgeId", "loop_runtime_edge_id", "edgeId", "edge_id"])
+	      || appControlRemoteDetailString(event, ["loopRuntimeEdgeId", "loop_runtime_edge_id", "edgeId", "edge_id"]);
+	    const triggerId = existingContext.triggerId
+	      || appControlRemoteDetailString(existingContext.event, ["triggerId", "trigger_id"])
+	      || appControlRemoteDetailString(event, ["triggerId", "trigger_id"]);
+	    const triggerRunId = existingContext.triggerRunId
+	      || appControlRemoteDetailString(existingContext.event, ["triggerRunId", "trigger_run_id"])
+	      || appControlRemoteDetailString(event, ["triggerRunId", "trigger_run_id"]);
+	    const resumableLoopspaceInterruption = interrupted && Boolean(
+	      loopspaceId
+	        || loopRuntimeRunId
+	        || loopRuntimeNodeId
+	        || (Array.isArray(existingContext.checkpointPlan) && existingContext.checkpointPlan.length),
+	    );
+	    const status = failed
+	      ? "failed"
+	      : completed && Array.isArray(existingContext.checkpointPlan) && existingContext.checkpointPlan.length
+	        ? "running"
+	        : completed
+	          ? "completed"
+	          : interrupted
+	            ? (resumableLoopspaceInterruption ? "resume_ready" : "interrupted")
+	            : running
+	              ? "running"
+	            : "";
     if (!status) {
       return;
     }
@@ -17403,35 +17447,79 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     }
     appControlAgentRemoteCommandsByPromptIdRef.current.set(promptId, nextContext);
 
-    const message = failed
-      ? String(event.error || event.message || "Terminal orchestrator message failed.").trim()
-      : completed && status === "running"
-        ? "Terminal orchestrator turn completed; waiting for final checkpoint."
-        : completed
-          ? "Terminal orchestrator message completed."
-          : interrupted
-            ? "Terminal orchestrator message interrupted."
-          : eventType === "pending-prompt-sent"
-            ? "Send message submitted to the terminal orchestrator."
-            : "Terminal orchestrator message is running.";
-    void recordAppControlRemoteCommandStatus(existingContext.event, status, message, {
-      agentId: existingContext.agentId || event.agentId || event.agentKind || "",
-      commandId: existingContext.commandId || "",
-      commandKind: existingContext.commandKind || "terminal_orchestrator_send_message",
-      lifecycleEventType: eventType,
-      paneId: event.paneId || existingContext.paneId || "",
-      promptId,
-      targetTerminalIndex: existingContext.terminalIndex ?? event.terminalIndex ?? null,
-      targetThreadId: event.threadId || existingContext.threadId || "",
-      textPreview: existingContext.textPreview || "",
-    }).then(() => {
-      if (failed || (completed && status !== "running") || interrupted) {
-        clearAppControlAgentSendWatchdog(promptId);
-        clearAppControlAgentRetryTimer(promptId);
-        appControlAgentRemoteCommandsByPromptIdRef.current.delete(promptId);
-        drainAppControlAgentSendQueue(existingContext.terminalIndex ?? event.terminalIndex ?? 0);
-      }
-    });
+	    const message = failed
+	      ? String(event.error || event.message || "Terminal orchestrator message failed.").trim()
+	      : completed && status === "running"
+	        ? "Terminal orchestrator turn completed; waiting for final checkpoint."
+	        : completed
+	          ? "Terminal orchestrator message completed."
+	          : interrupted
+	            ? (status === "resume_ready"
+	              ? "Terminal orchestrator message interrupted; ready to resume."
+	              : "Terminal orchestrator message interrupted.")
+	          : eventType === "pending-prompt-sent"
+	            ? "Send message submitted to the terminal orchestrator."
+	            : "Terminal orchestrator message is running.";
+	    const resumeContext = status === "resume_ready"
+	      ? {
+	        checkpointPlan: Array.isArray(existingContext.checkpointPlan) ? existingContext.checkpointPlan : [],
+	        checkpoint_plan: Array.isArray(existingContext.checkpointPlan) ? existingContext.checkpointPlan : [],
+	        interruptedAt: new Date().toISOString(),
+	        loopRuntimeEdgeId,
+	        loopRuntimeNodeId,
+	        loopRuntimeRunId,
+	        loopspaceId,
+	        originalPromptId: existingContext.originalPromptId || promptId,
+	        originalText: String(existingContext.text || existingContext.message || existingContext.textPreview || "").slice(0, 8000),
+	        paneId: event.paneId || existingContext.paneId || "",
+	        reasoningEffort: existingContext.reasoningEffort || "",
+	        resumeReady: true,
+	        resume_ready: true,
+	        speed: existingContext.speed || "",
+	        targetAgentId: existingContext.agentId || event.agentId || event.agentKind || "",
+	        targetTerminalId: existingContext.targetTerminalId || "",
+	        targetTerminalIndex: existingContext.terminalIndex ?? event.terminalIndex ?? null,
+	        targetTerminalName: existingContext.targetTerminalName || "",
+	        targetThreadId: event.threadId || existingContext.threadId || "",
+	        triggerId,
+	        triggerRunId,
+	      }
+	      : null;
+	    void recordAppControlRemoteCommandStatus(existingContext.event, status, message, {
+	      agentId: existingContext.agentId || event.agentId || event.agentKind || "",
+	      commandId: existingContext.commandId || "",
+	      commandKind: existingContext.commandKind || "terminal_orchestrator_send_message",
+	      lifecycleEventType: eventType,
+	      loopRuntimeEdgeId,
+	      loopRuntimeNodeId,
+	      loopRuntimeRunId,
+	      loopspaceId,
+	      paneId: event.paneId || existingContext.paneId || "",
+	      promptId,
+	      ...(resumeContext ? {
+	        resumeContext,
+	        resume_context: resumeContext,
+	        resumeReady: true,
+	        resume_ready: true,
+	      } : {}),
+	      targetTerminalIndex: existingContext.terminalIndex ?? event.terminalIndex ?? null,
+	      targetThreadId: event.threadId || existingContext.threadId || "",
+	      textPreview: existingContext.textPreview || "",
+	      triggerId,
+	      triggerRunId,
+	    }).then(() => {
+	      if (failed || (completed && status !== "running") || interrupted) {
+	        const terminalIndex = existingContext.terminalIndex ?? event.terminalIndex ?? 0;
+	        clearAppControlAgentSendWatchdog(promptId);
+	        clearAppControlAgentRetryTimer(promptId);
+	        appControlAgentRemoteCommandsByPromptIdRef.current.delete(promptId);
+	        if (interrupted) {
+	          appControlAgentSendQueuesByIndexRef.current.delete(Math.max(0, Number.parseInt(terminalIndex, 10) || 0));
+	          return;
+	        }
+	        drainAppControlAgentSendQueue(terminalIndex);
+	      }
+	    });
   }, [
     clearAppControlAgentPendingPrompt,
     clearAppControlAgentRetryTimer,
@@ -17497,20 +17585,37 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       "prompt_id",
     ]) || commandId;
     const createdAt = new Date().toISOString();
-    const remoteCommand = {
-      agentId: role,
-      commandId,
-      commandKind,
-      checkpointPlan,
-      event: remoteEvent,
-      message: text,
-      paneId,
-      promptId,
-      text,
-      terminalIndex,
-      textPreview: text.slice(0, 200),
-      threadId,
-    };
+	    const remoteCommand = {
+	      agentId: role,
+	      commandId,
+	      commandKind,
+	      checkpointPlan,
+	      event: remoteEvent,
+	      loopRuntimeEdgeId: appControlRemoteDetailString(detail, ["loopRuntimeEdgeId", "loop_runtime_edge_id", "edgeId", "edge_id"]),
+	      loopRuntimeNodeId: appControlRemoteDetailString(detail, ["loopRuntimeNodeId", "loop_runtime_node_id", "nodeId", "node_id"]),
+	      loopRuntimeRunId: appControlRemoteDetailString(detail, ["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"]),
+	      loopspaceId: appControlRemoteDetailString(detail, ["loopspaceId", "loopspace_id"]),
+	      message: text,
+	      model: appControlRemoteDetailString(detail, ["model", "modelId", "model_id", "requestedModel"]),
+	      paneId,
+	      promptId,
+	      reasoningEffort: appControlRemoteDetailString(detail, [
+	        "reasoningEffort",
+	        "reasoning_effort",
+	        "effort",
+	        "requestedReasoningEffort",
+	      ]),
+	      resumeRequested: Boolean(detail.resume || detail.resumeRequested || detail.resume_requested),
+	      speed: appControlRemoteDetailString(detail, ["speed", "serviceTier", "service_tier", "requestedSpeed"]),
+	      targetTerminalId: appControlRemoteDetailString(detail, ["targetTerminalId", "target_terminal_id", "terminalId", "terminal_id"]),
+	      targetTerminalName: appControlRemoteDetailString(detail, ["targetTerminalName", "target_terminal_name", "terminalName", "terminal_name"]),
+	      text,
+	      terminalIndex,
+	      textPreview: text.slice(0, 200),
+	      threadId,
+	      triggerId: appControlRemoteDetailString(detail, ["triggerId", "trigger_id"]),
+	      triggerRunId: appControlRemoteDetailString(detail, ["triggerRunId", "trigger_run_id"]),
+	    };
     const pendingPrompt = {
       createdAt,
       deliveryMode: "terminal-confirmed",
@@ -17552,16 +17657,23 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
       });
       void recordAppControlRemoteCommandStatus(remoteEvent, "queued", "Queued behind an active terminal orchestrator message.", {
-        agentId: role,
-        commandId,
-        commandKind,
-        paneId,
-        promptId,
-        queueDepth: nextQueue.length,
-        targetTerminalIndex: terminalIndex,
-        targetThreadId: threadId,
-        textPreview: text.slice(0, 200),
-      });
+	        agentId: role,
+	        commandId,
+	        commandKind,
+	        loopRuntimeEdgeId: remoteCommand.loopRuntimeEdgeId || "",
+	        loopRuntimeNodeId: remoteCommand.loopRuntimeNodeId || "",
+	        loopRuntimeRunId: remoteCommand.loopRuntimeRunId || "",
+	        loopspaceId: remoteCommand.loopspaceId || "",
+	        paneId,
+	        promptId,
+	        queueDepth: nextQueue.length,
+	        resumeRequested: Boolean(remoteCommand.resumeRequested),
+	        targetTerminalIndex: terminalIndex,
+	        targetThreadId: threadId,
+	        textPreview: text.slice(0, 200),
+	        triggerId: remoteCommand.triggerId || "",
+	        triggerRunId: remoteCommand.triggerRunId || "",
+	      });
       return;
     }
 

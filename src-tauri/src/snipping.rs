@@ -586,6 +586,13 @@ struct SnippingState {
     /// still being adopted by the OS. During this short phase, synthetic
     /// position/size moves must not trigger left-column queue reflow.
     preview_drag_handoff_until_ms: Arc<StdMutex<HashMap<String, u64>>>,
+    /// Preview window label -> normalized grab point captured at strip drag-out.
+    /// Later resize/hover handoff steps scale this so the cursor stays on the
+    /// same image point instead of recentering the window.
+    preview_drag_grab_ratios: Arc<StdMutex<HashMap<String, (f64, f64)>>>,
+    /// Preview window label -> original recent-strip slot for previews opened
+    /// from the strip. Manual close returns these to the same local strip slot.
+    preview_strip_origins: Arc<StdMutex<HashMap<String, SnippingPreviewStripOrigin>>>,
     /// Epoch-ms guard set by the strip webview while a tile drag is active or
     /// has just ended. Outside-click dismissal checks this before hiding the
     /// strip on focus loss or global mouse release.
@@ -644,6 +651,8 @@ impl SnippingState {
             preview_post_release_settling_labels: Arc::new(StdMutex::new(HashSet::new())),
             preview_strip_hover_labels: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_handoff_until_ms: Arc::new(StdMutex::new(HashMap::new())),
+            preview_drag_grab_ratios: Arc::new(StdMutex::new(HashMap::new())),
+            preview_strip_origins: Arc::new(StdMutex::new(HashMap::new())),
             strip_interaction_guard_until_ms: Arc::new(AtomicU64::new(0)),
             strip_outside_click_watcher_active: Arc::new(AtomicBool::new(false)),
             strip_visibility_generation: Arc::new(AtomicU64::new(0)),
@@ -10738,6 +10747,135 @@ const SNIPPING_FLOAT_DISPOSE_EVENT: &str = "forge-snip-float-dispose";
 const SNIPPING_FLOAT_CLOSE_GRACE_MS: u64 = 45;
 const SNIPPING_FLOAT_CLOSE_RELEASE_WAIT_MS: u64 = 1200;
 
+#[derive(Clone, Debug)]
+struct SnippingPreviewStripOrigin {
+    path: String,
+    index: usize,
+    before_path: Option<String>,
+    after_path: Option<String>,
+}
+
+fn snipping_clean_optional_path(value: Option<String>) -> Option<String> {
+    value
+        .map(|path| path.trim().to_string())
+        .filter(|path| !path.is_empty())
+}
+
+fn snipping_register_preview_strip_origin(
+    app: &AppHandle,
+    label: &str,
+    path: &str,
+    index: Option<usize>,
+    before_path: Option<String>,
+    after_path: Option<String>,
+) {
+    let Some(index) = index else {
+        return;
+    };
+    let path = path.trim();
+    if label.trim().is_empty() || path.is_empty() {
+        return;
+    }
+    if let Ok(mut origins) = app.state::<SnippingState>().preview_strip_origins.lock() {
+        origins.insert(
+            label.to_string(),
+            SnippingPreviewStripOrigin {
+                path: path.to_string(),
+                index,
+                before_path: snipping_clean_optional_path(before_path),
+                after_path: snipping_clean_optional_path(after_path),
+            },
+        );
+    }
+}
+
+fn snipping_preview_close_should_restore_to_strip(reason: &'static str) -> bool {
+    matches!(reason, "preview-command" | "close-requested" | "path-command")
+}
+
+fn snipping_preview_strip_origin_for_close(
+    app: &AppHandle,
+    label: &str,
+    reason: &'static str,
+) -> Option<SnippingPreviewStripOrigin> {
+    if !snipping_preview_close_should_restore_to_strip(reason) {
+        return None;
+    }
+    app.state::<SnippingState>()
+        .preview_strip_origins
+        .lock()
+        .ok()
+        .and_then(|origins| origins.get(label).cloned())
+}
+
+fn snipping_emit_strip_restore_event(
+    app: &AppHandle,
+    label: &str,
+    origin: &SnippingPreviewStripOrigin,
+) {
+    let mut payload = json!({
+        "kind": "snip_strip_drag",
+        "label": label,
+        "path": origin.path,
+        "over": false,
+        "done": true,
+        "docked": true,
+        "index": origin.index,
+    });
+    if let Some(before_path) = &origin.before_path {
+        payload["beforePath"] = json!(before_path);
+    }
+    if let Some(after_path) = &origin.after_path {
+        payload["afterPath"] = json!(after_path);
+    }
+    let _ = app.emit_to(
+        SNIPPING_STRIP_WINDOW_LABEL,
+        SNIPPING_STRIP_DRAG_EVENT,
+        payload,
+    );
+}
+
+fn snipping_set_preview_drag_grab_ratio(
+    app: &AppHandle,
+    label: &str,
+    offset_x: f64,
+    offset_y: f64,
+    width: f64,
+    height: f64,
+) {
+    if label.trim().is_empty() {
+        return;
+    }
+    let ratio_x = if width > 0.0 {
+        (offset_x / width).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    let ratio_y = if height > 0.0 {
+        (offset_y / height).clamp(0.0, 1.0)
+    } else {
+        0.5
+    };
+    if let Ok(mut ratios) = app.state::<SnippingState>().preview_drag_grab_ratios.lock() {
+        ratios.insert(label.to_string(), (ratio_x, ratio_y));
+    }
+}
+
+fn snipping_preview_drag_offset_for_size(
+    app: &AppHandle,
+    label: &str,
+    width: f64,
+    height: f64,
+) -> (f64, f64) {
+    app.state::<SnippingState>()
+        .preview_drag_grab_ratios
+        .lock()
+        .ok()
+        .and_then(|ratios| ratios.get(label).copied())
+        .map(|(ratio_x, ratio_y)| (ratio_x * width, ratio_y * height))
+        .unwrap_or((width * 0.5, height * 0.5))
+}
+
 fn snipping_preview_closing_labels(app: &AppHandle) -> HashSet<String> {
     app.state::<SnippingState>()
         .preview_closing
@@ -10813,6 +10951,9 @@ fn snipping_begin_preview_drag_session(
     if let Ok(mut handoffs) = state.preview_drag_handoff_until_ms.lock() {
         handoffs.remove(label);
     }
+    if let Ok(mut ratios) = state.preview_drag_grab_ratios.lock() {
+        ratios.remove(label);
+    }
     state
         .preview_post_release_check_pending
         .store(false, Ordering::SeqCst);
@@ -10847,6 +10988,12 @@ fn snipping_cleanup_preview_registry(app: &AppHandle, label: &str) {
     }
     if let Ok(mut handoffs) = state.preview_drag_handoff_until_ms.lock() {
         handoffs.remove(label);
+    }
+    if let Ok(mut ratios) = state.preview_drag_grab_ratios.lock() {
+        ratios.remove(label);
+    }
+    if let Ok(mut origins) = state.preview_strip_origins.lock() {
+        origins.remove(label);
     }
     state
         .preview_post_release_check_pending
@@ -10883,6 +11030,12 @@ fn snipping_begin_preview_close(app: &AppHandle, label: &str) -> bool {
     }
     if let Ok(mut handoffs) = state.preview_drag_handoff_until_ms.lock() {
         handoffs.remove(label);
+    }
+    if let Ok(mut ratios) = state.preview_drag_grab_ratios.lock() {
+        ratios.remove(label);
+    }
+    if let Ok(mut origins) = state.preview_strip_origins.lock() {
+        origins.remove(label);
     }
     state
         .preview_post_release_check_pending
@@ -10921,6 +11074,9 @@ fn snipping_park_preview_window(app: &AppHandle, label: &str, window: &tauri::We
     if let Ok(mut handoffs) = state.preview_drag_handoff_until_ms.lock() {
         handoffs.remove(label);
     }
+    if let Ok(mut ratios) = state.preview_drag_grab_ratios.lock() {
+        ratios.remove(label);
+    }
     state
         .preview_post_release_check_pending
         .store(false, Ordering::SeqCst);
@@ -10940,8 +11096,12 @@ fn snipping_close_preview_window(app: &AppHandle, label: &str, reason: &'static 
         snipping_cleanup_preview_registry(app, &label);
         return false;
     };
+    let strip_origin = snipping_preview_strip_origin_for_close(app, &label, reason);
     if !snipping_begin_preview_close(app, &label) {
         return true;
+    }
+    if let Some(origin) = strip_origin {
+        snipping_emit_strip_restore_event(app, &label, &origin);
     }
 
     let _ = app.emit_to(
@@ -11304,11 +11464,19 @@ fn snipping_animate_preview_logical_size(
                 if center_on_cursor
                     && snipping_preview_is_dragging(&app_for_frame, &label_for_frame)
                 {
-                    let _ = snipping_position_preview_under_cursor(
+                    let (offset_x, offset_y) = snipping_preview_drag_offset_for_size(
+                        &app_for_frame,
+                        &label_for_frame,
+                        width,
+                        height,
+                    );
+                    let _ = snipping_position_preview_under_cursor_with_offset(
                         &app_for_frame,
                         &window_for_frame,
                         width,
                         height,
+                        offset_x,
+                        offset_y,
                     );
                 }
             });
@@ -12001,11 +12169,19 @@ fn snipping_update_preview_strip_drag_state(
                 SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
                 SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
             );
-            let _ = snipping_position_preview_under_cursor(
+            let (offset_x, offset_y) = snipping_preview_drag_offset_for_size(
+                app,
+                label,
+                SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
+                SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
+            );
+            let _ = snipping_position_preview_under_cursor_with_offset(
                 app,
                 &window,
                 SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
                 SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
+                offset_x,
+                offset_y,
             );
         }
         snipping_emit_strip_drag_event(app, label, Some(&window), true, false, false);
@@ -12361,10 +12537,12 @@ fn snipping_position_preview_window(
     }
 }
 
-fn snipping_cursor_logical_origin_for_preview(
+fn snipping_cursor_logical_origin_for_preview_with_offset(
     app: &AppHandle,
     width: f64,
     height: f64,
+    offset_x: f64,
+    offset_y: f64,
 ) -> Option<(f64, f64)> {
     let cursor = app.cursor_position().ok()?;
     let scale = app
@@ -12374,17 +12552,21 @@ fn snipping_cursor_logical_origin_for_preview(
         .or_else(|| app.primary_monitor().ok().flatten())
         .map(|monitor| monitor.scale_factor().max(0.1))
         .unwrap_or(1.0);
+    let offset_x = offset_x.clamp(0.0, width.max(0.0));
+    let offset_y = offset_y.clamp(0.0, height.max(0.0));
     Some((
-        cursor.x / scale - width * 0.5,
-        cursor.y / scale - height * 0.5,
+        cursor.x / scale - offset_x,
+        cursor.y / scale - offset_y,
     ))
 }
 
-fn snipping_position_preview_under_cursor(
+fn snipping_position_preview_under_cursor_with_offset(
     app: &AppHandle,
     window: &tauri::WebviewWindow,
     width: f64,
     height: f64,
+    offset_x: f64,
+    offset_y: f64,
 ) -> bool {
     let Ok(cursor) = app.cursor_position() else {
         return false;
@@ -12397,10 +12579,10 @@ fn snipping_position_preview_under_cursor(
         .or_else(|| app.primary_monitor().ok().flatten())
         .map(|monitor| monitor.scale_factor().max(0.1))
         .unwrap_or(1.0);
-    let width_physical = (width * scale).round() as i32;
-    let height_physical = (height * scale).round() as i32;
-    let x = cursor.x.round() as i32 - width_physical / 2;
-    let y = cursor.y.round() as i32 - height_physical / 2;
+    let offset_x = offset_x.clamp(0.0, width.max(0.0));
+    let offset_y = offset_y.clamp(0.0, height.max(0.0));
+    let x = cursor.x.round() as i32 - (offset_x * scale).round() as i32;
+    let y = cursor.y.round() as i32 - (offset_y * scale).round() as i32;
     window
         .set_position(tauri::PhysicalPosition::new(x, y))
         .is_ok()
@@ -13522,14 +13704,34 @@ fn snipping_open_snip_float(
     x: Option<f64>,
     y: Option<f64>,
     focused: Option<bool>,
+    strip_index: Option<usize>,
+    strip_before_path: Option<String>,
+    strip_after_path: Option<String>,
 ) -> Result<Value, String> {
     let explicit_position = match (x, y) {
-        (Some(x), Some(y)) => Some((x, y)),
+        (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Some((x, y)),
         _ => None,
     };
     // `focused: false` keeps quick-access opens from stealing focus away from
     // the strip/background workflow.
-    snipping_open_snip_preview_window_for(&app, &path, explicit_position, focused.unwrap_or(true))
+    let opened =
+        snipping_open_snip_preview_window_for(&app, &path, explicit_position, focused.unwrap_or(true))?;
+    if strip_index.is_some() {
+        if let (Some(label), Some(opened_path)) = (
+            opened.get("label").and_then(Value::as_str),
+            opened.get("path").and_then(Value::as_str),
+        ) {
+            snipping_register_preview_strip_origin(
+                &app,
+                label,
+                opened_path,
+                strip_index,
+                strip_before_path,
+                strip_after_path,
+            );
+        }
+    }
+    Ok(opened)
 }
 
 #[tauri::command]
@@ -13538,13 +13740,33 @@ fn snipping_open_snip_float_for_drag(
     path: String,
     x: f64,
     y: f64,
+    grab_offset_x: Option<f64>,
+    grab_offset_y: Option<f64>,
+    strip_index: Option<usize>,
+    strip_before_path: Option<String>,
+    strip_after_path: Option<String>,
 ) -> Result<Value, String> {
     let drag_size = (
         SNIPPING_STRIP_TILE_LOGICAL_WIDTH,
         SNIPPING_STRIP_TILE_LOGICAL_HEIGHT,
     );
-    let initial_position =
-        snipping_cursor_logical_origin_for_preview(&app, drag_size.0, drag_size.1).or(Some((x, y)));
+    let grab_offset_x = grab_offset_x
+        .filter(|value| value.is_finite())
+        .unwrap_or(drag_size.0 * 0.5)
+        .clamp(0.0, drag_size.0);
+    let grab_offset_y = grab_offset_y
+        .filter(|value| value.is_finite())
+        .unwrap_or(drag_size.1 * 0.5)
+        .clamp(0.0, drag_size.1);
+    let fallback_position = (x.is_finite() && y.is_finite()).then_some((x, y));
+    let initial_position = snipping_cursor_logical_origin_for_preview_with_offset(
+        &app,
+        drag_size.0,
+        drag_size.1,
+        grab_offset_x,
+        grab_offset_y,
+    )
+    .or(fallback_position);
     let opened = snipping_open_snip_preview_window_for_with_size(
         &app,
         &path,
@@ -13561,13 +13783,47 @@ fn snipping_open_snip_float_for_drag(
         .get_webview_window(&label)
         .ok_or_else(|| "Snip preview window is not open.".to_string())?;
     snipping_set_preview_logical_size_now(&app, &window, drag_size.0, drag_size.1);
-    let _ = snipping_position_preview_under_cursor(&app, &window, drag_size.0, drag_size.1);
+    let _ = snipping_position_preview_under_cursor_with_offset(
+        &app,
+        &window,
+        drag_size.0,
+        drag_size.1,
+        grab_offset_x,
+        grab_offset_y,
+    );
     let position = window
         .outer_position()
         .map_err(|error| format!("Unable to read snip preview position: {error}"))?;
     snipping_begin_preview_drag_session(&app, &label, position);
+    snipping_set_preview_drag_grab_ratio(
+        &app,
+        &label,
+        grab_offset_x,
+        grab_offset_y,
+        drag_size.0,
+        drag_size.1,
+    );
+    if strip_index.is_some() {
+        if let Some(opened_path) = opened.get("path").and_then(Value::as_str) {
+            snipping_register_preview_strip_origin(
+                &app,
+                &label,
+                opened_path,
+                strip_index,
+                strip_before_path,
+                strip_after_path,
+            );
+        }
+    }
     snipping_begin_preview_drag_handoff(&app, &label);
-    let _ = snipping_position_preview_under_cursor(&app, &window, drag_size.0, drag_size.1);
+    let _ = snipping_position_preview_under_cursor_with_offset(
+        &app,
+        &window,
+        drag_size.0,
+        drag_size.1,
+        grab_offset_x,
+        grab_offset_y,
+    );
     let drag_started = window.start_dragging().is_ok();
     let mut opened = opened;
     opened["dragStarted"] = json!(drag_started);

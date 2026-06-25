@@ -20915,6 +20915,160 @@ fn cloud_mcp_region_hint() -> Option<&'static str> {
     })
 }
 
+fn cloud_mcp_route_request_url(base_url: &str) -> String {
+    let normalized = base_url.trim_end_matches('/');
+    if cloud_mcp_local_http_url_allowed(normalized) {
+        format!("{normalized}/v1/route")
+    } else {
+        api_endpoint("agents/route")
+    }
+}
+
+fn cloud_mcp_route_response_content_type(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string()
+}
+
+fn cloud_mcp_route_response_preview(body: &str) -> String {
+    let compact = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    clean_terminal_telemetry_text(&compact)
+        .chars()
+        .take(240)
+        .collect()
+}
+
+fn cloud_mcp_route_invalid_json_message(
+    status: reqwest::StatusCode,
+    content_type: &str,
+    body: &str,
+    parse_error: serde_json::Error,
+) -> String {
+    let preview = cloud_mcp_route_response_preview(body);
+    let suffix = if preview.is_empty() {
+        String::new()
+    } else {
+        format!("; body_preview={preview:?}")
+    };
+    if status.is_success() {
+        return format!(
+            "Cloud MCP route response was invalid JSON: HTTP {}; content-type={content_type}; parse_error={parse_error}{suffix}",
+            status.as_u16()
+        );
+    }
+
+    format!(
+        "Cloud MCP route request returned HTTP {} with a non-JSON response; content-type={content_type}; parse_error={parse_error}{suffix}",
+        status.as_u16()
+    )
+}
+
+fn cloud_mcp_parse_route_response_body(
+    status: reqwest::StatusCode,
+    content_type: &str,
+    response_text: &str,
+) -> Result<Value, String> {
+    if response_text.trim().is_empty() {
+        return Ok(json!({}));
+    }
+
+    serde_json::from_str::<Value>(response_text).map_err(|error| {
+        cloud_mcp_route_invalid_json_message(status, content_type, response_text, error)
+    })
+}
+
+async fn cloud_mcp_read_route_response(
+    response: reqwest::Response,
+) -> Result<(reqwest::StatusCode, Value), String> {
+    let status = response.status();
+    let content_type = cloud_mcp_route_response_content_type(response.headers());
+    let response_text = response
+        .text()
+        .await
+        .map_err(|error| format!("Unable to read Cloud MCP route response: {error}"))?;
+    let parsed = cloud_mcp_parse_route_response_body(status, &content_type, &response_text)?;
+    Ok((status, parsed))
+}
+
+fn cloud_mcp_read_route_response_blocking(
+    response: reqwest::blocking::Response,
+) -> Result<(reqwest::StatusCode, Value), String> {
+    let status = response.status();
+    let content_type = cloud_mcp_route_response_content_type(response.headers());
+    let response_text = response
+        .text()
+        .map_err(|error| format!("Unable to read Cloud MCP route response: {error}"))?;
+    let parsed = cloud_mcp_parse_route_response_body(status, &content_type, &response_text)?;
+    Ok((status, parsed))
+}
+
+fn cloud_mcp_route_response_message(route: &Value, fallback: &str) -> String {
+    route
+        .pointer("/error/message")
+        .and_then(Value::as_str)
+        .or_else(|| route.get("error").and_then(Value::as_str))
+        .or_else(|| route.get("message").and_then(Value::as_str))
+        .unwrap_or(fallback)
+        .to_string()
+}
+
+fn cloud_mcp_direct_route_pending_error(route: &Value) -> Option<String> {
+    let route_state = route
+        .get("route_state")
+        .or_else(|| route.get("routeState"))
+        .and_then(Value::as_str)
+        .unwrap_or("route_not_ready");
+    let backend_status = route
+        .get("backend_status")
+        .or_else(|| route.get("backendStatus"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let retry_after_ms = route
+        .get("retry_after_ms")
+        .or_else(|| route.get("retryAfterMs"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let waiting = route
+        .get("waiting")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let initializing = route
+        .get("initializing")
+        .or_else(|| route.get("initializingWorkspace"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
+    if initializing
+        || waiting
+        || cloud_mcp_route_state_is_provisioning(route_state, backend_status)
+    {
+        return Some(format!(
+            "Cloud MCP route pending: route_state={route_state}; backend_status={backend_status}; retry_after_ms={retry_after_ms}"
+        ));
+    }
+
+    None
+}
+
+fn cloud_mcp_direct_route_rejected_error(route: &Value) -> Option<String> {
+    if route.get("ok").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let route_state = route
+        .get("route_state")
+        .or_else(|| route.get("routeState"))
+        .and_then(Value::as_str)
+        .unwrap_or("blocked");
+    let message = cloud_mcp_route_response_message(route, "route rejected");
+    Some(format!(
+        "Cloud MCP route rejected: route_state={route_state}; {message}"
+    ))
+}
+
 async fn cloud_mcp_fetch_direct_route_async(
     base_url: &str,
     endpoint_path: &str,
@@ -20925,7 +21079,7 @@ async fn cloud_mcp_fetch_direct_route_async(
     device_limit: Option<u64>,
     device_id: Option<&str>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
-    let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
+    let url = cloud_mcp_route_request_url(base_url);
     let region_hint = cloud_mcp_region_hint();
     let body = json!({
         "requestedPath": endpoint_path,
@@ -20945,6 +21099,7 @@ async fn cloud_mcp_fetch_direct_route_async(
         .post(url)
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
         .header("Authorization", format!("Bearer {bearer}"))
+        .header("Accept", "application/json")
         .header("x-diffforge-client-id", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-billing-scope-type", billing_scope_type)
@@ -20975,55 +21130,21 @@ async fn cloud_mcp_fetch_direct_route_async(
         .send()
         .await
         .map_err(|error| format!("Cloud MCP route request failed: {error}"))?;
-    let status = response.status();
-    let parsed = response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("Cloud MCP route response was invalid JSON: {error}"))?;
+    let (status, parsed) = cloud_mcp_read_route_response(response).await?;
     if !status.is_success() {
         return Err(format!(
             "Cloud MCP route request returned {}: {}",
             status.as_u16(),
-            parsed
-                .get("message")
-                .or_else(|| parsed.pointer("/error/message"))
-                .and_then(Value::as_str)
-                .unwrap_or("route rejected")
+            cloud_mcp_route_response_message(&parsed, "route rejected")
         ));
     }
     let target = cloud_mcp_direct_target_from_route(&parsed, endpoint_path);
     if target.is_none() {
-        let route_state = parsed
-            .get("route_state")
-            .or_else(|| parsed.get("routeState"))
-            .and_then(Value::as_str)
-            .unwrap_or("route_not_ready");
-        let backend_status = parsed
-            .get("backend_status")
-            .or_else(|| parsed.get("backendStatus"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let retry_after_ms = parsed
-            .get("retry_after_ms")
-            .or_else(|| parsed.get("retryAfterMs"))
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        let waiting = parsed
-            .get("waiting")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let initializing = parsed
-            .get("initializing")
-            .or_else(|| parsed.get("initializingWorkspace"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if initializing
-            || waiting
-            || cloud_mcp_route_state_is_provisioning(route_state, backend_status)
-        {
-            return Err(format!(
-                "Cloud MCP route pending: route_state={route_state}; backend_status={backend_status}; retry_after_ms={retry_after_ms}"
-            ));
+        if let Some(error) = cloud_mcp_direct_route_pending_error(&parsed) {
+            return Err(error);
+        }
+        if let Some(error) = cloud_mcp_direct_route_rejected_error(&parsed) {
+            return Err(error);
         }
     }
     Ok(target)
@@ -21087,7 +21208,21 @@ fn cloud_mcp_direct_target_from_route(
     route: &Value,
     endpoint_path: &str,
 ) -> Option<CloudMcpWsTarget> {
-    let direct = route.get("direct")?;
+    if let Some(target) = route
+        .get("direct")
+        .filter(|value| value.is_object())
+        .and_then(|direct| cloud_mcp_direct_target_from_balancer_route(direct, endpoint_path))
+    {
+        return Some(target);
+    }
+
+    cloud_mcp_direct_target_from_broker_route(route, endpoint_path)
+}
+
+fn cloud_mcp_direct_target_from_balancer_route(
+    direct: &Value,
+    endpoint_path: &str,
+) -> Option<CloudMcpWsTarget> {
     if direct.get("enabled").and_then(Value::as_bool) == Some(false) {
         return None;
     }
@@ -21126,6 +21261,42 @@ fn cloud_mcp_direct_target_from_route(
         ws_url,
         route_token: Some(route_token),
         transport: direct
+            .get("transport")
+            .and_then(Value::as_str)
+            .unwrap_or("direct_cloud_container")
+            .to_string(),
+    })
+}
+
+fn cloud_mcp_direct_target_from_broker_route(
+    route: &Value,
+    endpoint_path: &str,
+) -> Option<CloudMcpWsTarget> {
+    let route_token = route
+        .get("routeToken")
+        .or_else(|| route.get("route_token"))
+        .and_then(Value::as_str)
+        .map(str::to_string)?;
+    let preferred = if endpoint_path == "/v1/voice/ws" {
+        route.get("voiceWebsocketUrl")
+            .or_else(|| route.get("voice_websocket_url"))
+            .or_else(|| route.get("websocketUrl"))
+            .or_else(|| route.get("websocket_url"))
+    } else {
+        route.get("websocketUrl")
+            .or_else(|| route.get("websocket_url"))
+            .or_else(|| route.get("appWebsocketUrl"))
+            .or_else(|| route.get("app_websocket_url"))
+    };
+    let ws_url = preferred.and_then(Value::as_str)?.trim().to_string();
+    if !(ws_url.starts_with("ws://") || ws_url.starts_with("wss://")) {
+        return None;
+    }
+    let ws_url = cloud_mcp_rewrite_ws_endpoint(&ws_url, endpoint_path);
+    Some(CloudMcpWsTarget {
+        ws_url,
+        route_token: Some(route_token),
+        transport: route
             .get("transport")
             .and_then(Value::as_str)
             .unwrap_or("direct_cloud_container")
@@ -47136,6 +47307,63 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn production_route_requests_use_next_broker() {
+        assert_eq!(
+            cloud_mcp_route_request_url(CLOUD_MCP_DEFAULT_BASE_URL),
+            api_endpoint("agents/route")
+        );
+        assert_eq!(
+            cloud_mcp_route_request_url("http://127.0.0.1:8080"),
+            "http://127.0.0.1:8080/v1/route"
+        );
+    }
+
+    #[test]
+    fn direct_target_accepts_next_route_broker_response() {
+        let route = json!({
+            "ok": true,
+            "direct": true,
+            "browserCompatible": true,
+            "websocketUrl": "wss://node-a.nodes.diffforge.ai/_diffforge/instances/abc/v1/app/ws",
+            "voiceWebsocketUrl": "wss://node-a.nodes.diffforge.ai/_diffforge/instances/abc/v1/voice/ws",
+            "routeToken": "route-token-123",
+            "transport": "cloudflare_node_gateway",
+        });
+
+        let app_target =
+            cloud_mcp_direct_target_from_route(&route, "/v1/app/ws").expect("app route target");
+        assert_eq!(
+            app_target.ws_url,
+            "wss://node-a.nodes.diffforge.ai/_diffforge/instances/abc/v1/app/ws"
+        );
+        assert_eq!(app_target.route_token.as_deref(), Some("route-token-123"));
+        assert_eq!(app_target.transport, "cloudflare_node_gateway");
+
+        let voice_target =
+            cloud_mcp_direct_target_from_route(&route, "/v1/voice/ws").expect("voice route target");
+        assert_eq!(
+            voice_target.ws_url,
+            "wss://node-a.nodes.diffforge.ai/_diffforge/instances/abc/v1/voice/ws"
+        );
+        assert_eq!(voice_target.route_token.as_deref(), Some("route-token-123"));
+    }
+
+    #[test]
+    fn route_response_non_json_errors_preserve_status_and_content_type() {
+        let error = cloud_mcp_parse_route_response_body(
+            reqwest::StatusCode::FORBIDDEN,
+            "text/html; charset=UTF-8",
+            "<html><head><title>Attention Required!</title></head></html>",
+        )
+        .expect_err("html response should not parse as route json");
+
+        assert!(error.contains("HTTP 403"));
+        assert!(error.contains("non-JSON"));
+        assert!(error.contains("text/html"));
+        assert!(error.contains("Attention Required"));
+    }
+
+    #[test]
     fn device_limit_normalization_preserves_explicit_values() {
         assert_eq!(
             cloud_mcp_device_limit_from_value(Some(11), "plus"),
@@ -54740,7 +54968,7 @@ fn cloud_mcp_fetch_direct_route_blocking(
     device_limit: Option<u64>,
     device_id: Option<&str>,
 ) -> Result<Option<CloudMcpWsTarget>, String> {
-    let url = format!("{}/v1/route", base_url.trim_end_matches('/'));
+    let url = cloud_mcp_route_request_url(base_url);
     let region_hint = cloud_mcp_region_hint();
     let body = json!({
         "requestedPath": endpoint_path,
@@ -54760,6 +54988,7 @@ fn cloud_mcp_fetch_direct_route_blocking(
         .post(url)
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
         .header("Authorization", format!("Bearer {bearer}"))
+        .header("Accept", "application/json")
         .header("x-diffforge-client-id", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-actor", CLOUD_MCP_RUST_CLIENT_ID)
         .header("x-diffforge-billing-scope-type", billing_scope_type)
@@ -54789,17 +55018,24 @@ fn cloud_mcp_fetch_direct_route_blocking(
         .json(&body)
         .send()
         .map_err(|error| format!("Cloud MCP route request failed: {error}"))?;
-    let status = response.status();
-    let parsed = response
-        .json::<Value>()
-        .map_err(|error| format!("Cloud MCP route response was invalid JSON: {error}"))?;
+    let (status, parsed) = cloud_mcp_read_route_response_blocking(response)?;
     if !status.is_success() {
         return Err(format!(
-            "Cloud MCP route request returned {}",
-            status.as_u16()
+            "Cloud MCP route request returned {}: {}",
+            status.as_u16(),
+            cloud_mcp_route_response_message(&parsed, "route rejected")
         ));
     }
-    Ok(cloud_mcp_direct_target_from_route(&parsed, endpoint_path))
+    let target = cloud_mcp_direct_target_from_route(&parsed, endpoint_path);
+    if target.is_none() {
+        if let Some(error) = cloud_mcp_direct_route_pending_error(&parsed) {
+            return Err(error);
+        }
+        if let Some(error) = cloud_mcp_direct_route_rejected_error(&parsed) {
+            return Err(error);
+        }
+    }
+    Ok(target)
 }
 
 fn cloud_mcp_proxy_read_blocking_ws_text<S>(

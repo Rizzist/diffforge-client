@@ -10458,10 +10458,22 @@ const ArchitectureRootPicker = styled.select`
   border: 1px solid var(--files-vscode-border);
   border-radius: 4px;
   color: var(--files-vscode-text);
-  background: var(--files-vscode-editor);
+  background-color: var(--files-vscode-editor);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  background-size: 13px 13px;
+  color-scheme: dark;
   font: inherit;
   font-size: 12px;
   outline: none;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+
+  &::-ms-expand {
+    display: none;
+  }
 
   &:focus {
     border-color: var(--files-vscode-focus);
@@ -11992,12 +12004,23 @@ const ArchitectureRunSelect = styled.select`
   border: 1px solid rgba(148, 163, 184, 0.14);
   border-radius: 999px;
   color: rgba(226, 232, 240, 0.84);
-  background: rgba(15, 23, 42, 0.92);
+  background-color: rgba(15, 23, 42, 0.92);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  background-size: 12px 12px;
+  color-scheme: dark;
   font: inherit;
   font-size: 9px;
   font-weight: 820;
   outline: none;
   cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+
+  &::-ms-expand {
+    display: none;
+  }
 
   &:disabled {
     cursor: default;

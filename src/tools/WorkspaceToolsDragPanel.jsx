@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Architecture } from "@styled-icons/material-rounded/Architecture";
 import { Article } from "@styled-icons/material-rounded/Article";
-import { IntegrationInstructions } from "@styled-icons/material-rounded/IntegrationInstructions";
 import { Psychology } from "@styled-icons/material-rounded/Psychology";
 import styled from "styled-components";
 import {
@@ -25,25 +24,22 @@ import {
 const FILTERS = [
   { id: "all", label: "All" },
   { id: "skill", label: "Skills" },
-  { id: "architecture", label: "Arch" },
-  { id: "instruction", label: "Instructions" },
-  { id: "document", label: "Generic" },
+  { id: "architecture", label: "Architectures" },
+  { id: "document", label: "Documents" },
 ];
 
 const FILTER_STORAGE_PREFIX = "diffforge.workspaceTools.filter";
 const SEND_STORAGE_PREFIX = "diffforge.workspaceTools.sendOnDrop";
 
 const DOC_KIND_LABELS = {
-  architecture: "Arch",
-  document: "Generic",
-  instruction: "Instruction",
+  architecture: "Architecture",
+  document: "Document",
   skill: "Skill",
 };
 
 const DOC_KIND_ICONS = {
   architecture: Architecture,
   document: Article,
-  instruction: IntegrationInstructions,
   skill: Psychology,
 };
 
@@ -77,8 +73,8 @@ function normalizedFilterId(value) {
   const normalized = text(value, "all").toLowerCase();
   if (normalized === "arch" || normalized === "architectures") return "architecture";
   if (normalized === "skills") return "skill";
-  if (normalized === "instructions") return "instruction";
-  if (normalized === "docs" || normalized === "documents") return "all";
+  if (normalized === "instruction" || normalized === "instructions") return "document";
+  if (normalized === "docs" || normalized === "documents") return "document";
   if (normalized === "generic" || normalized === "doc" || normalized === "document") return "document";
   return FILTERS.some((entry) => entry.id === normalized) ? normalized : "all";
 }
@@ -116,7 +112,7 @@ function docCardEntry(entry) {
     localPath: text(entry?.localPath || entry?.local_path),
     pathKey: text(entry?.pathKey || entry?.path_key),
     title,
-    typeLabel: DOC_KIND_LABELS[kind] || "Generic",
+    typeLabel: DOC_KIND_LABELS[kind] || "Document",
   };
 }
 
@@ -484,11 +480,6 @@ const DocCardIcon = styled.span`
   &[data-kind="architecture"] {
     color: rgba(150, 190, 255, 0.96);
     background: rgba(80, 135, 245, 0.14);
-  }
-
-  &[data-kind="instruction"] {
-    color: rgba(238, 187, 104, 0.96);
-    background: rgba(238, 187, 104, 0.13);
   }
 
   &[data-kind="document"] {

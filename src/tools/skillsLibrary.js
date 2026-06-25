@@ -26,12 +26,10 @@ export function normalizedDocumentKind(value, collection = "documents") {
   const normalized = text(value).toLowerCase();
   if (["arch", "architecture", "architectures", "graph", "graphs"].includes(normalized)) return "architecture";
   if (["skill", "skills"].includes(normalized)) return "skill";
-  if (["instruction", "instructions"].includes(normalized)) return "instruction";
   if (["generic", "document", "documents", "doc", "docs"].includes(normalized)) return "document";
   const rawCollection = text(collection).toLowerCase();
   if (["arch", "architecture", "architectures", "graph", "graphs"].includes(rawCollection)) return "architecture";
   if (["skill", "skills"].includes(rawCollection)) return "skill";
-  if (["instruction", "instructions"].includes(rawCollection)) return "instruction";
   return "document";
 }
 
@@ -593,7 +591,7 @@ export function accountDocumentUnitsFromPayload(payload) {
   return Array.from(byKey.values());
 }
 
-export function accountDocumentRequestFromSkill(skill, { local_only = false } = {}) {
+export function accountDocumentRequestFromSkill(skill, { allow_conflict = false, local_only = false } = {}) {
   const collection = normalizedDocumentCollection();
   const rowKind = text(skill?.entryKind || skill?.entry_kind || skill?.rowType || skill?.row_type || skill?.type || skill?.kind).toLowerCase();
   if (rowKind === "folder" || rowKind === "account_document_folder") {
@@ -685,6 +683,7 @@ export function accountDocumentRequestFromSkill(skill, { local_only = false } = 
     if (document[key] === "" && key !== "content" && key !== "content_md") delete document[key];
   });
   return {
+    ...(allow_conflict ? { allow_conflict: true } : {}),
     document,
     local_only: Boolean(local_only),
   };

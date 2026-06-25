@@ -269,6 +269,18 @@ async fn handle_app_control_mcp_bridge_connection(
         return Ok(());
     }
 
+    if request.tool == "editor_control" {
+        let response = match editor_control_dispatch(&app, &request.input).await {
+            Ok(data) => json!({ "ok": true, "data": data }),
+            Err(error) => json!({
+                "ok": false,
+                "error": { "code": "editor_control_failed", "message": error },
+            }),
+        };
+        write_app_control_mcp_bridge_response(&mut stream, response).await?;
+        return Ok(());
+    }
+
     let request_id = format!(
         "app-control-mcp-{}",
         counter.fetch_add(1, Ordering::Relaxed)
@@ -1109,10 +1121,91 @@ fn app_control_mcp_tools() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "workspaceId": {"type": "string"},
-                    "workspaceName": {"type": "string"}
+                    "workspaceName": {"type": "string"},
+                    "verbose": {"type": "boolean", "description": "When true, include root directories, status arrays, idle reasons, and extra terminal details."},
+                    "includeState": {"type": "boolean", "description": "When true, include the broader app-control state. Defaults false to keep live routing token-light."}
                 },
                 "additionalProperties": true
             }
+        }),
+        json!({
+            "name": "list_todo_targets",
+            "description": "List queueable workspace todo targets for terminal orchestrator agents, including selected/activated workspaces, live workspace state, configured terminals, live terminals, idle/busy status, agent type, pane id, thread id, and terminal indexes. Use this before queue_todo/send_todo when the target workspace or terminal is unclear.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspaceId": {"type": "string"},
+                    "workspaceName": {"type": "string"},
+                    "verbose": {"type": "boolean"},
+                    "includeState": {"type": "boolean"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "list_workspace_todo_targets",
+            "description": "Alias for list_todo_targets. Return live queueable workspace/terminal todo targets without changing the user's selected todo.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspaceId": {"type": "string"},
+                    "workspaceName": {"type": "string"},
+                    "verbose": {"type": "boolean"},
+                    "includeState": {"type": "boolean"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "queue_todo",
+            "description": "Queue a todo/prompt into a workspace terminal queue from the terminal orchestrator. Pass workspaceId or workspaceName plus text/prompt/message/body/title/task. Omit terminal selectors for the next available terminal, or pass terminalIndex, paneId, targetTerminalId, targetThreadId, or targetTerminalName for a specific terminal. Optional agent/targetAgentId constrains to claude, codex, opencode, or shell. By default this activates the workspace so its queue can receive the item; set openWorkspace=false to avoid switching views.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspaceId": {"type": "string"},
+                    "workspaceName": {"type": "string"},
+                    "text": {"type": "string"},
+                    "prompt": {"type": "string"},
+                    "message": {"type": "string"},
+                    "body": {"type": "string"},
+                    "title": {"type": "string"},
+                    "task": {"type": "string"},
+                    "agent": {"type": "string"},
+                    "targetAgentId": {"type": "string"},
+                    "terminalIndex": {"type": "integer", "minimum": 0},
+                    "terminalNumber": {"type": "integer", "minimum": 1},
+                    "paneId": {"type": "string"},
+                    "targetTerminalId": {"type": "string"},
+                    "targetTerminalName": {"type": "string"},
+                    "targetThreadId": {"type": "string"},
+                    "model": {"type": "string"},
+                    "reasoningEffort": {"type": "string"},
+                    "speed": {"type": "string"},
+                    "openWorkspace": {"type": "boolean"},
+                    "openTerminals": {"type": "boolean"},
+                    "ensureTerminal": {"type": "boolean"},
+                    "terminalCount": {"type": "integer", "minimum": 1},
+                    "commandId": {"type": "string"},
+                    "verbose": {"type": "boolean", "description": "When true, echo the full queued item and detailed terminal target snapshot. Defaults false."},
+                    "includeState": {"type": "boolean", "description": "When true, include broader app-control state. Defaults false."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "send_todo",
+            "description": "Alias for queue_todo. Queue a todo/prompt for workspace terminal dispatch; the existing terminal queue decides when it can send safely.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": true}
+        }),
+        json!({
+            "name": "create_todo",
+            "description": "Alias for queue_todo. Create and queue a workspace todo for a specific workspace or terminal.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": true}
+        }),
+        json!({
+            "name": "queue_workspace_todo",
+            "description": "Alias for queue_todo. Queue a workspace todo generally or to a selected terminal.",
+            "inputSchema": {"type": "object", "properties": {}, "additionalProperties": true}
         }),
         json!({
             "name": "open_terminals",
@@ -1169,6 +1262,33 @@ fn app_control_mcp_tools() -> Vec<Value> {
                 "additionalProperties": true
             }
         }),
+        json!({
+            "name": "editor_control",
+            "description": "Control the Diff Forge video Editor token-efficiently via one action. Use action=get_context first to see the open project, the user's EXPOSED SELECTION (highlighted clips/region, playhead, active generation form), and the project list. Then: organize assets (list_media/create_folder/import_media/delete_media), edit the timeline (apply_ops — place_clip/move_clip/trim_clip/split_clip/remove_clip/delete_range/ripple_delete_range and tracks add_track/remove_track/rename_track/reorder_track/set_track_mute/set_track_gain; target the highlighted area using selection.startMs/endMs and activeClipId), generate (generate), or export to WebM (export). projectId defaults to the open project from get_context.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "get_context", "get_selection", "list_projects", "get_project",
+                            "list_media", "create_folder", "import_media", "delete_media",
+                            "apply_ops", "generate", "export"
+                        ]
+                    },
+                    "projectId": {"type": "string", "description": "Target project id; defaults to the open project."},
+                    "subpath": {"type": "string", "description": "Media subfolder (for list_media/create_folder/import_media)."},
+                    "name": {"type": "string", "description": "Folder name (create_folder) or generation name (generate)."},
+                    "path": {"type": "string", "description": "Media path to delete (delete_media)."},
+                    "sources": {"type": "array", "items": {"type": "string"}, "description": "Absolute file paths to import (import_media)."},
+                    "ops": {"type": "array", "items": {"type": "object"}, "description": "Timeline ops batch (apply_ops)."},
+                    "source": {"type": "string", "description": "Optional start-image media path (generate)."},
+                    "options": {"type": "object", "description": "Export overrides: width/height/fps (export)."}
+                },
+                "required": ["action"],
+                "additionalProperties": true
+            }
+        }),
     ]
 }
 
@@ -1211,9 +1331,16 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "patch_loopspace_graph",
         "select_tab",
         "list_terminals",
+        "list_todo_targets",
+        "list_workspace_todo_targets",
+        "queue_todo",
+        "send_todo",
+        "create_todo",
+        "queue_workspace_todo",
         "open_terminals",
         "close_terminals",
         "focus_terminal",
+        "editor_control",
     ]
     .contains(&tool)
     {
@@ -1269,7 +1396,11 @@ fn app_control_mcp_forward_to_app(
 }
 
 fn app_control_mcp_tool_timeout_ms(tool: &str) -> u64 {
-    if tool == "run_local_script" || tool == "upload_asset" || tool == "download_asset" {
+    if tool == "run_local_script"
+        || tool == "upload_asset"
+        || tool == "download_asset"
+        || tool == "editor_control"
+    {
         APP_CONTROL_MCP_SCRIPT_RUN_TIMEOUT_MS
     } else {
         APP_CONTROL_MCP_TIMEOUT_MS

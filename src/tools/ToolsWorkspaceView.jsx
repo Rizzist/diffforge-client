@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
@@ -53,6 +54,21 @@ import {
   setWorkspaceToolsDocumentDraft,
   subscribeWorkspaceTools,
 } from "./workspaceToolsStore.js";
+import {
+  TOOLS_WINDOW_CLOSED_EVENT,
+  TOOLS_WINDOW_CONTROL_CLOSE,
+  TOOLS_WINDOW_CONTROL_DELETE,
+  TOOLS_WINDOW_CONTROL_DISCARD,
+  TOOLS_WINDOW_CONTROL_EVENT,
+  TOOLS_WINDOW_CONTROL_FOCUS_MAIN,
+  TOOLS_WINDOW_CONTROL_RETURN,
+  TOOLS_WINDOW_CONTROL_RUN,
+  TOOLS_WINDOW_CONTROL_SAVE_LOCAL,
+  TOOLS_WINDOW_CONTROL_SAVE_PUSH,
+  TOOLS_WINDOW_CONTROL_UPDATE,
+  TOOLS_WINDOW_META_EVENT,
+  TOOLS_WINDOW_META_REQUEST_EVENT,
+} from "./toolsWindowBridge.js";
 
 const SECTIONS = [
   { id: "docs", label: "Docs" },
@@ -93,7 +109,6 @@ const SCRIPT_DOCUMENT_BODY_AVERAGE_CHAR_WIDTH_EM = 0.585;
 const DOCUMENT_TYPE_OPTIONS = [
   { id: "skill", label: "Skill", collection: "documents", extension: "md" },
   { id: "architecture", label: "Architecture", collection: "documents", extension: "arch" },
-  { id: "instruction", label: "Instruction", collection: "documents", extension: "md" },
   { id: "document", label: "Document", collection: "documents", extension: "md" },
 ];
 const SCRIPT_SHELL_OPTIONS = [
@@ -116,6 +131,13 @@ const SCRIPT_HISTORY_ESTIMATED_ROW_HEIGHT = 68;
 const SCRIPT_HISTORY_ROW_GAP = 8;
 const SCRIPT_HISTORY_VIEWPORT_FALLBACK_HEIGHT = 360;
 const SCRIPT_HISTORY_VIRTUAL_OVERSCAN_ROWS = 6;
+const TOOLS_WINDOW_DEFAULT_WIDTH = 920;
+const TOOLS_WINDOW_DEFAULT_HEIGHT = 760;
+
+function normalizedToolsWindowTheme(value, fallback = "dark") {
+  const normalized = text(value).toLowerCase();
+  return ["dark", "navy", "gold", "light"].includes(normalized) ? normalized : fallback;
+}
 
 function normalizedSectionId(value, fallback = "docs") {
   const normalized = text(value);
@@ -1497,11 +1519,71 @@ export default function ToolsWorkspaceView({
   workspaces = [],
 }) {
   const [section, setSection] = useState(() => normalizedSectionId(initialSection));
+  const [toolsWindowBreakouts, setToolsWindowBreakouts] = useState({});
+  const toolsWindowBreakoutsRef = useRef(toolsWindowBreakouts);
 
   useEffect(() => {
     const nextSection = normalizedSectionId(initialSection);
     setSection((current) => (current === nextSection ? current : nextSection));
   }, [initialSection]);
+
+  useEffect(() => {
+    toolsWindowBreakoutsRef.current = toolsWindowBreakouts;
+  }, [toolsWindowBreakouts]);
+
+  const focusToolsWindow = useCallback(async (label) => {
+    const safeLabel = text(label);
+    if (!safeLabel) return false;
+    return invoke("tools_window_focus", { label: safeLabel })
+      .then(Boolean)
+      .catch(() => false);
+  }, []);
+
+  const closeToolsWindow = useCallback(async (breakoutOrLabel) => {
+    const label = typeof breakoutOrLabel === "string"
+      ? breakoutOrLabel
+      : text(breakoutOrLabel?.label);
+    if (!label) return;
+    await invoke("tools_window_close", { label }).catch(() => {});
+    setToolsWindowBreakouts((current) => {
+      const next = { ...current };
+      Object.entries(next).forEach(([id, breakout]) => {
+        if (breakout?.label === label) delete next[id];
+      });
+      return next;
+    });
+  }, []);
+
+  const openToolsWindow = useCallback(async ({
+    key,
+    mode,
+    theme = "dark",
+    title = "Tools",
+  } = {}) => {
+    const normalizedMode = normalizedSectionId(mode, "docs") === "scripts" ? "scripts" : "docs";
+    const safeKey = text(key);
+    if (!safeKey) return "";
+    const result = await invoke("tools_window_open", {
+      height: TOOLS_WINDOW_DEFAULT_HEIGHT,
+      key: safeKey,
+      mode: normalizedMode,
+      theme: normalizedToolsWindowTheme(theme),
+      title,
+      width: TOOLS_WINDOW_DEFAULT_WIDTH,
+    });
+    const label = text(result?.label);
+    if (!label) return "";
+    setToolsWindowBreakouts((current) => ({
+      ...current,
+      [label]: {
+        key: safeKey,
+        label,
+        mode: normalizedMode,
+        title,
+      },
+    }));
+    return label;
+  }, []);
 
   // ---- MCP scope (global defaults vs per-workspace) ----
   const [mcpScope, setMcpScope] = useState(GLOBAL_MCP_DEFAULTS_SCOPE);
@@ -1593,7 +1675,7 @@ export default function ToolsWorkspaceView({
   const [hydratingDocKeys, setHydratingDocKeys] = useState(() => new Set());
   const [skillsQuery, setSkillsQuery] = useState("");
   const [templateQuery, setTemplateQuery] = useState("");
-  const [newDocDraft, setNewDocDraft] = useState({ createKind: "document", folderPath: "", name: "", type: "skill" });
+  const [newDocDraft, setNewDocDraft] = useState({ createKind: "document", folderPath: "", name: "", type: "document" });
   const [documentDraft, setDocumentDraft] = useState(() => getWorkspaceToolsDocumentDraft());
   const [documentDrafts, setDocumentDrafts] = useState(() => getWorkspaceToolsDocumentDrafts());
   const [documentDraftApplyTick, setDocumentDraftApplyTick] = useState(0);
@@ -2693,10 +2775,13 @@ export default function ToolsWorkspaceView({
     noteAccountSkillUnits(nextLibrary.skills);
 	    try {
 		      const results = [];
-		      for (const skill of nextLibrary.skills.filter((entry) => pendingIds.has(accountDocumentStorageKey(entry) || entry.id) && !documentIsFolderRow(entry))) {
+	      for (const skill of nextLibrary.skills.filter((entry) => pendingIds.has(accountDocumentStorageKey(entry) || entry.id) && !documentIsFolderRow(entry))) {
 		        const hasDraftFile = skillHasDraftFile(skill);
 		        results.push(await invoke(hasDraftFile ? "cloud_mcp_save_account_document_draft" : "cloud_mcp_save_account_document", {
-		          request: accountDocumentRequestFromSkill(skill, { local_only: true }),
+		          request: accountDocumentRequestFromSkill(skill, {
+		            allow_conflict: hasDraftFile,
+		            local_only: true,
+		          }),
 		        }));
 	      }
       const result = [...results].reverse().find((entry) => entry) || {};
@@ -3075,7 +3160,7 @@ export default function ToolsWorkspaceView({
       try {
         const prepareRequest = accountDocumentRequestFromSkill({
           ...pendingSavedSkill,
-          baseContentHash: pendingSavedSkill.baseContentHash || activeEditor.baseContentHash || selectedSkill?.contentHash || selectedSkill?.sha256 || "",
+          baseContentHash: pendingSavedSkill.baseContentHash || activeEditor.baseContentHash || "",
           content: editorContent,
         }, { local_only: true });
         prepareRequest.reuse_existing = false;
@@ -3563,7 +3648,7 @@ export default function ToolsWorkspaceView({
 	      try {
 	        const request = accountDocumentRequestFromSkill({
 	          ...snapshot,
-	          baseContentHash: snapshot.baseContentHash || selectedSkill?.contentHash || selectedSkill?.sha256 || "",
+	          baseContentHash: snapshot.baseContentHash || "",
 	          content,
 	        }, { local_only: true });
 	        request.reuse_existing = false;
@@ -4600,6 +4685,370 @@ export default function ToolsWorkspaceView({
     return onAppControlScriptActions(appControlScriptActions);
   }, [appControlScriptActions, onAppControlScriptActions]);
 
+  const activeDocsBreakout = useMemo(() => (
+    Object.values(toolsWindowBreakouts).find((breakout) => breakout?.mode === "docs") || null
+  ), [toolsWindowBreakouts]);
+  const activeScriptsBreakout = useMemo(() => (
+    Object.values(toolsWindowBreakouts).find((breakout) => breakout?.mode === "scripts") || null
+  ), [toolsWindowBreakouts]);
+
+  const buildToolsWindowMeta = useCallback((breakout) => {
+    if (!breakout?.label) return null;
+    if (breakout.mode === "scripts") {
+      return {
+        busy: scriptEditorBusy,
+        canDelete: Boolean(scriptEditor?.localPath || scriptEditorKey),
+        content: String(scriptEditor?.content || ""),
+        dirty: Boolean(scriptEditor && (scriptHasUnsavedChanges(scriptEditor) || !scriptEditor.localPath)),
+        error: scriptsError,
+        key: breakout.key,
+        mode: "scripts",
+        pathKey: scriptEditorKey,
+        readOnly: scriptEditorReadOnly,
+        running: scriptEditorRunning,
+        scriptKey: scriptEditorKey,
+        shell: text(scriptEditor?.shell),
+        state: scriptsState,
+        subtitle: scriptEditorKey || text(scriptEditor?.localPath),
+        title: text(scriptEditor?.title, "Script"),
+        updatedAtMs: Date.now(),
+        windowId: breakout.label,
+      };
+    }
+    return {
+      busy: skillEditorBusy || selectedDocumentRefreshing,
+      canDelete: Boolean(skillEditor?.id || skillEditorDocumentKey),
+      content: String(skillEditor?.content || ""),
+      dirty: skillEditorHasDraftChanges,
+      documentKey: skillEditorDocumentKey,
+      error: skillsError,
+      extension: text(skillEditor?.extension),
+      key: breakout.key,
+      mode: "docs",
+      pathKey: normalizedDocumentPath(skillEditor?.pathKey || skillEditor?.path_key || skillEditor?.filePath || skillEditor?.file_path),
+      readOnly: skillEditorReadOnly,
+      state: skillsState,
+      subtitle: normalizedDocumentPath(skillEditor?.pathKey || skillEditor?.path_key || skillEditor?.filePath || skillEditor?.file_path)
+        || skillEditorDocumentKey,
+      title: text(skillEditor?.title, "Document"),
+      updatedAtMs: Date.now(),
+      windowId: breakout.label,
+    };
+  }, [
+    scriptEditor,
+    scriptEditorBusy,
+    scriptEditorKey,
+    scriptEditorReadOnly,
+    scriptEditorRunning,
+    scriptsError,
+    scriptsState,
+    selectedDocumentRefreshing,
+    skillEditor,
+    skillEditorBusy,
+    skillEditorDocumentKey,
+    skillEditorHasDraftChanges,
+    skillEditorReadOnly,
+    skillsError,
+    skillsState,
+  ]);
+
+  const emitToolsWindowMeta = useCallback((breakout) => {
+    const meta = buildToolsWindowMeta(breakout);
+    if (!meta) return;
+    emit(TOOLS_WINDOW_META_EVENT, meta).catch(() => {});
+  }, [buildToolsWindowMeta]);
+
+  useEffect(() => {
+    if (activeDocsBreakout) emitToolsWindowMeta(activeDocsBreakout);
+    if (activeScriptsBreakout) emitToolsWindowMeta(activeScriptsBreakout);
+  }, [activeDocsBreakout, activeScriptsBreakout, emitToolsWindowMeta]);
+
+  const openDocumentBreakout = useCallback(async () => {
+    if (!skillEditor) return;
+    const key = skillEditorDocumentKey || selectedSkillKey || accountDocumentStorageKey(skillEditor) || skillEditor.id;
+    if (!key) return;
+    setSection("docs");
+    const existing = Object.values(toolsWindowBreakoutsRef.current).filter((breakout) => breakout?.mode === "docs");
+    for (const breakout of existing) {
+      if (breakout?.label && breakout.key !== key) {
+        // eslint-disable-next-line no-await-in-loop
+        await closeToolsWindow(breakout.label);
+      }
+    }
+    try {
+      const label = await openToolsWindow({
+        key,
+        mode: "docs",
+        theme: skillEditorTheme,
+        title: text(skillEditor.title, "Document"),
+      });
+      if (label) {
+        emitToolsWindowMeta({
+          key,
+          label,
+          mode: "docs",
+          title: text(skillEditor.title, "Document"),
+        });
+      }
+    } catch (error) {
+      setSkillsError(getErrorMessage(error, "Unable to open document window."));
+    }
+  }, [
+    closeToolsWindow,
+    emitToolsWindowMeta,
+    openToolsWindow,
+    selectedSkillKey,
+    skillEditor,
+    skillEditorDocumentKey,
+    skillEditorTheme,
+  ]);
+
+  const openScriptBreakout = useCallback(async () => {
+    if (!scriptEditor) return;
+    const key = scriptEditorKey || scriptPathKey(scriptEditor) || scriptEditor.id;
+    if (!key) return;
+    setSection("scripts");
+    setScriptPaneTab("editor");
+    const existing = Object.values(toolsWindowBreakoutsRef.current).filter((breakout) => breakout?.mode === "scripts");
+    for (const breakout of existing) {
+      if (breakout?.label && breakout.key !== key) {
+        // eslint-disable-next-line no-await-in-loop
+        await closeToolsWindow(breakout.label);
+      }
+    }
+    try {
+      const label = await openToolsWindow({
+        key,
+        mode: "scripts",
+        theme: skillEditorTheme,
+        title: text(scriptEditor.title, "Script"),
+      });
+      if (label) {
+        emitToolsWindowMeta({
+          key,
+          label,
+          mode: "scripts",
+          title: text(scriptEditor.title, "Script"),
+        });
+      }
+    } catch (error) {
+      setScriptsError(getErrorMessage(error, "Unable to open script window."));
+    }
+  }, [
+    closeToolsWindow,
+    emitToolsWindowMeta,
+    openToolsWindow,
+    scriptEditor,
+    scriptEditorKey,
+    skillEditorTheme,
+  ]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(TOOLS_WINDOW_CLOSED_EVENT, (event) => {
+      if (disposed) return;
+      const windowId = text(event.payload?.windowId);
+      const mode = normalizedSectionId(event.payload?.mode, "");
+      const key = text(event.payload?.key);
+      setToolsWindowBreakouts((current) => {
+        const next = { ...current };
+        Object.entries(next).forEach(([id, breakout]) => {
+          if (
+            (windowId && breakout?.label === windowId)
+            || (mode && breakout?.mode === mode && (!key || breakout?.key === key))
+          ) {
+            delete next[id];
+          }
+        });
+        return next;
+      });
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(TOOLS_WINDOW_META_REQUEST_EVENT, (event) => {
+      if (disposed) return;
+      const windowId = text(event.payload?.windowId);
+      const mode = normalizedSectionId(event.payload?.mode, "");
+      const key = text(event.payload?.key);
+      const breakout = toolsWindowBreakoutsRef.current[windowId]
+        || Object.values(toolsWindowBreakoutsRef.current).find((candidate) => (
+          candidate?.mode === mode && (!key || candidate?.key === key)
+        ));
+      if (breakout) {
+        emitToolsWindowMeta(windowId ? { ...breakout, label: windowId } : breakout);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [emitToolsWindowMeta]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(TOOLS_WINDOW_CONTROL_EVENT, (event) => {
+      if (disposed) return;
+      const payload = event.payload || {};
+      const windowId = text(payload.windowId);
+      const mode = normalizedSectionId(payload.mode, "");
+      const key = text(payload.key);
+      const breakout = toolsWindowBreakoutsRef.current[windowId]
+        || Object.values(toolsWindowBreakoutsRef.current).find((candidate) => (
+          candidate?.mode === mode && (!key || candidate?.key === key)
+        ));
+      if (!breakout) return;
+      const control = text(payload.control);
+      const focusMainWindow = () => {
+        getCurrentWindow().setFocus().catch(() => {});
+      };
+
+      if (control === TOOLS_WINDOW_CONTROL_FOCUS_MAIN) {
+        setSection(breakout.mode);
+        focusMainWindow();
+        return;
+      }
+      if (control === TOOLS_WINDOW_CONTROL_RETURN) {
+        setSection(breakout.mode);
+        focusMainWindow();
+        setToolsWindowBreakouts((current) => {
+          const next = { ...current };
+          delete next[breakout.label];
+          return next;
+        });
+        return;
+      }
+
+      if (breakout.mode === "docs") {
+        if (control === TOOLS_WINDOW_CONTROL_UPDATE) {
+          const hasTitle = Object.prototype.hasOwnProperty.call(payload, "title");
+          const hasContent = Object.prototype.hasOwnProperty.call(payload, "content");
+          if (hasTitle || hasContent) {
+            lastHumanDocumentEditAtRef.current = Date.now();
+            setSkillEditor((current) => {
+              if (!current) return current;
+              return {
+                ...current,
+                ...(hasTitle ? { title: String(payload.title ?? "") } : {}),
+                ...(hasContent ? { content: String(payload.content ?? "") } : {}),
+              };
+            });
+          }
+          return;
+        }
+        if (control === TOOLS_WINDOW_CONTROL_SAVE_LOCAL) {
+          void saveSkillEditor("local");
+          return;
+        }
+        if (control === TOOLS_WINDOW_CONTROL_SAVE_PUSH) {
+          void saveSkillEditor("push");
+          return;
+        }
+        if (control === TOOLS_WINDOW_CONTROL_DISCARD) {
+          discardSkillEditorDraft();
+          return;
+        }
+        if (control === TOOLS_WINDOW_CONTROL_DELETE) {
+          removeDocument(skillEditor?.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor?.id);
+          void closeToolsWindow(breakout.label);
+          return;
+        }
+        if (control === TOOLS_WINDOW_CONTROL_CLOSE) {
+          setSkillEditor(null);
+          setSelectedSkillKey("");
+          void closeToolsWindow(breakout.label);
+        }
+        return;
+      }
+
+      if (control === TOOLS_WINDOW_CONTROL_UPDATE) {
+        const hasTitle = Object.prototype.hasOwnProperty.call(payload, "title");
+        const hasContent = Object.prototype.hasOwnProperty.call(payload, "content");
+        if (hasTitle || hasContent) {
+          setScriptEditor((current) => {
+            if (!current) return current;
+            return {
+              ...current,
+              ...(hasTitle ? { title: String(payload.title ?? "") } : {}),
+              ...(hasContent ? { content: String(payload.content ?? "") } : {}),
+            };
+          });
+        }
+        return;
+      }
+      if (control === TOOLS_WINDOW_CONTROL_SAVE_LOCAL) {
+        void saveLocalScript(scriptEditor);
+        return;
+      }
+      if (control === TOOLS_WINDOW_CONTROL_RUN) {
+        void (async () => {
+          const saved = scriptHasUnsavedChanges(scriptEditor) || !scriptEditor?.localPath
+            ? await saveLocalScript(scriptEditor)
+            : true;
+          if (saved) await runLocalScript(scriptEditor);
+        })();
+        return;
+      }
+      if (control === TOOLS_WINDOW_CONTROL_DELETE) {
+        void deleteLocalScript(scriptEditor);
+        void closeToolsWindow(breakout.label);
+        return;
+      }
+      if (control === TOOLS_WINDOW_CONTROL_CLOSE) {
+        setScriptEditor(null);
+        setSelectedScriptKey("");
+        void closeToolsWindow(breakout.label);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [
+    closeToolsWindow,
+    deleteLocalScript,
+    discardSkillEditorDraft,
+    emitToolsWindowMeta,
+    removeDocument,
+    runLocalScript,
+    saveLocalScript,
+    saveSkillEditor,
+    scriptEditor,
+    skillEditor,
+  ]);
+
   const docsCreateMode = !skillEditor;
   const showDocsTemplatesPane = docsCreateMode && !rightToolsOrchestratorOpen;
   const preservedSkillEditorSelection = useMemo(() => {
@@ -5040,7 +5489,27 @@ export default function ToolsWorkspaceView({
                     <DocsCenterPane aria-label="Document editor">
                   {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
                   {skillEditor ? (
-                    <>
+                    activeDocsBreakout ? (
+                      <ToolsWindowBreakoutPlaceholder>
+                        <span className="codicon codicon-multiple-windows" aria-hidden="true" />
+                        <strong>{text(skillEditor.title, "Document")} is open in its own window</strong>
+                        <p>The document editor is still live. Use the window or return it here.</p>
+                        <ToolsWindowBreakoutActions>
+                          <ToolsGhostButton
+                            onClick={() => void focusToolsWindow(activeDocsBreakout.label)}
+                            type="button"
+                          >
+                            Focus window
+                          </ToolsGhostButton>
+                          <ToolsPrimaryButton
+                            onClick={() => void closeToolsWindow(activeDocsBreakout.label)}
+                            type="button"
+                          >
+                            Return here
+                          </ToolsPrimaryButton>
+                        </ToolsWindowBreakoutActions>
+                      </ToolsWindowBreakoutPlaceholder>
+                    ) : (
                       <SkillDocumentEditor
                         aria-busy={selectedDocumentRefreshing ? "true" : "false"}
                         data-page-theme={skillEditorTheme}
@@ -5064,6 +5533,20 @@ export default function ToolsWorkspaceView({
                           </SkillDocumentToolbarControls>
                           <SkillDocumentToolbarControls data-side="right">
                             <SkillDocumentActions data-placement="toolbar">
+                              <ToolsGhostButton
+                                onClick={() => {
+                                  if (activeDocsBreakout?.label) {
+                                    void focusToolsWindow(activeDocsBreakout.label);
+                                  } else {
+                                    void openDocumentBreakout();
+                                  }
+                                }}
+                                title={activeDocsBreakout ? "Focus the document window" : "Open this document in its own window"}
+                                type="button"
+                              >
+                                <span className="codicon codicon-multiple-windows" aria-hidden="true" />
+                                <span>{activeDocsBreakout ? "Focus window" : "Window"}</span>
+                              </ToolsGhostButton>
                               <ToolsGhostButton
                                 onClick={() => {
                                   setSkillEditor(null);
@@ -5170,7 +5653,7 @@ export default function ToolsWorkspaceView({
                           </SkillDocumentPageStack>
                         </SkillDocumentCanvas>
                       </SkillDocumentEditor>
-                    </>
+                    )
                   ) : (
                     <DocsCreateModal>
                       <DocsCreateHeader>
@@ -5694,6 +6177,27 @@ export default function ToolsWorkspaceView({
                           )}
                         </ScriptLogsPanel>
                       ) : scriptEditor ? (
+                        activeScriptsBreakout ? (
+                          <ToolsWindowBreakoutPlaceholder>
+                            <span className="codicon codicon-multiple-windows" aria-hidden="true" />
+                            <strong>{text(scriptEditor.title, "Script")} is open in its own window</strong>
+                            <p>The script editor is still live. Use the window or return it here.</p>
+                            <ToolsWindowBreakoutActions>
+                              <ToolsGhostButton
+                                onClick={() => void focusToolsWindow(activeScriptsBreakout.label)}
+                                type="button"
+                              >
+                                Focus window
+                              </ToolsGhostButton>
+                              <ToolsPrimaryButton
+                                onClick={() => void closeToolsWindow(activeScriptsBreakout.label)}
+                                type="button"
+                              >
+                                Return here
+                              </ToolsPrimaryButton>
+                            </ToolsWindowBreakoutActions>
+                          </ToolsWindowBreakoutPlaceholder>
+                        ) : (
                         <SkillDocumentEditor data-page-theme={skillEditorTheme} data-script-editor="true">
                           <SkillDocumentToolbar>
                             <SkillDocumentToolbarControls data-side="left">
@@ -5749,6 +6253,20 @@ export default function ToolsWorkspaceView({
                             </SkillDocumentToolbarControls>
                             <SkillDocumentToolbarControls data-side="right">
                               <SkillDocumentActions data-placement="toolbar">
+                                <ToolsGhostButton
+                                  onClick={() => {
+                                    if (activeScriptsBreakout?.label) {
+                                      void focusToolsWindow(activeScriptsBreakout.label);
+                                    } else {
+                                      void openScriptBreakout();
+                                    }
+                                  }}
+                                  title={activeScriptsBreakout ? "Focus the script window" : "Open this script in its own window"}
+                                  type="button"
+                                >
+                                  <span className="codicon codicon-multiple-windows" aria-hidden="true" />
+                                  <span>{activeScriptsBreakout ? "Focus window" : "Window"}</span>
+                                </ToolsGhostButton>
                                 <ToolsGhostButton
                                   onClick={() => {
                                     setScriptEditor(null);
@@ -5843,6 +6361,7 @@ export default function ToolsWorkspaceView({
                             </SkillDocumentPageStack>
                           </SkillDocumentCanvas>
                         </SkillDocumentEditor>
+                        )
                       ) : (
                         <DocsCreateModal>
                           <DocsCreateHeader>
@@ -6883,6 +7402,21 @@ const DocsField = styled.div`
     outline: none;
   }
 
+  select {
+    appearance: none;
+    -webkit-appearance: none;
+    padding-right: 30px;
+    cursor: pointer;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right 9px center;
+    background-size: 15px 15px;
+  }
+
+  select::-ms-expand {
+    display: none;
+  }
+
   input {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, monospace;
   }
@@ -7049,6 +7583,63 @@ const SkillDocumentEditor = styled.div`
     height: auto;
     max-height: none;
   }
+`;
+
+const ToolsWindowBreakoutPlaceholder = styled.div`
+  display: grid;
+  grid-row: 2;
+  place-content: center;
+  justify-items: center;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+  padding: 34px;
+  overflow: hidden;
+  color: var(--forge-text-muted, #7a8493);
+  text-align: center;
+  background:
+    radial-gradient(circle at 50% 22%, rgba(var(--forge-tint-rgb), 0.12), transparent 44%),
+    var(--tools-editor-bg, rgba(5, 7, 10, 0.88));
+
+  > .codicon {
+    display: inline-grid;
+    place-items: center;
+    width: 46px;
+    height: 46px;
+    border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.28);
+    border-radius: 12px;
+    color: var(--forge-tint-soft, #7db0ff);
+    background: rgba(var(--forge-tint-rgb), 0.14);
+    font-size: 22px;
+  }
+
+  strong {
+    max-width: min(460px, 100%);
+    overflow: hidden;
+    color: var(--forge-text-strong, #f6f8fb);
+    font-size: 15px;
+    font-weight: 900;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  p {
+    max-width: min(420px, 100%);
+    margin: 0;
+    color: var(--forge-text-muted, #8d96a6);
+    font-size: 12px;
+    font-weight: 650;
+    line-height: 1.45;
+  }
+`;
+
+const ToolsWindowBreakoutActions = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 4px;
 `;
 
 const SkillDocumentToolbar = styled.div`

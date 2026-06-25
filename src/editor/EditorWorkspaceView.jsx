@@ -15,6 +15,7 @@ import { CreateNewFolder } from "@styled-icons/material-rounded/CreateNewFolder"
 import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Description } from "@styled-icons/material-rounded/Description";
 import { DriveFileRenameOutline } from "@styled-icons/material-rounded/DriveFileRenameOutline";
+import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
 import { FileUpload } from "@styled-icons/material-rounded/FileUpload";
 import { Folder } from "@styled-icons/material-rounded/Folder";
 import { FolderOpen } from "@styled-icons/material-rounded/FolderOpen";
@@ -46,6 +47,7 @@ const ASSETS_MODE_STORAGE_KEY = "diffforge.editor.assets-mode.v1";
 const GEN_MODEL_STORAGE_KEY = "diffforge.editor.gen-model.v1";
 const GENERATIONS_FOLDER = "generations";
 const MEDIA_CONVERSION_EVENT = "diffforge-editor-media-conversion-progress";
+const EXPORT_PROGRESS_EVENT = "diffforge-editor-export-progress";
 
 const GEN_HISTORY_STORAGE_PREFIX = "diffforge.editor.gen-history.";
 const GEN_HISTORY_MAX = 100;
@@ -94,6 +96,12 @@ const MAX_PX_PER_SECOND = 600;
 const TRACK_GUTTER_PX = 120;
 const MIN_CLIP_MS = 200;
 const DEFAULT_FPS = 30;
+// The default two-lane layout; mirrors the backend editor_default_tracks(). Track
+// ids "video"/"audio" match the bare tags legacy clips carried.
+const DEFAULT_TRACKS = [
+  { id: "video", kind: "video", name: "Video", muted: false, gain: 1 },
+  { id: "audio", kind: "audio", name: "Audio", muted: false, gain: 1 },
+];
 const MAX_AUDIO_BUFFER_CACHE = 12;
 const UNDO_DEPTH = 100;
 const RANGE_SELECT_MIN_MS = 60;
@@ -101,11 +109,6 @@ const SNAP_THRESHOLD_PX = 8;
 const AUTOSCROLL_EDGE_PX = 48;
 const AUTOSCROLL_MAX_PX = 26;
 const RULER_TARGET_PX = 84;
-const NATIVE_VIDEO_DRIFT_CORRECTION_SECONDS = 0.6;
-const NATIVE_VIDEO_CORRECTION_INTERVAL_MS = 700;
-const NATIVE_VIDEO_START_GRACE_MS = 900;
-const NATIVE_VIDEO_STALL_MS = 900;
-const NATIVE_VIDEO_PROGRESS_EPSILON_SECONDS = 0.015;
 const RULER_NICE_STEPS_MS = [
   100, 200, 500, 1000, 2000, 5000, 10000, 15000, 30000, 60000, 120000, 300000, 600000, 900000,
   1800000, 3600000,
@@ -307,7 +310,9 @@ function normalizeClip(clip) {
   const outMs = Number(clip.outMs) || durationMs || 0;
   return {
     ...clip,
-    track: clip.track === "audio" ? "audio" : "video",
+    // `track` is a track id (the backend guarantees it references an existing
+    // track). Preserve it verbatim; only fall back when missing.
+    track: clip.track || "video",
     startMs: Math.max(0, Number(clip.startMs) || 0),
     inMs,
     durationMs,
@@ -315,6 +320,21 @@ function normalizeClip(clip) {
     gain: clip.gain == null ? 1 : Number(clip.gain),
     hasAudio: !!clip.hasAudio,
   };
+}
+
+// Normalize the doc's track list; fall back to the default lanes when absent.
+function normalizeTracks(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const tracks = list
+    .filter((t) => t && t.id)
+    .map((t) => ({
+      id: String(t.id),
+      kind: t.kind === "audio" ? "audio" : "video",
+      name: t.name || (t.kind === "audio" ? "Audio" : "Video"),
+      muted: !!t.muted,
+      gain: t.gain == null ? 1 : Number(t.gain),
+    }));
+  return tracks.length ? tracks : DEFAULT_TRACKS.map((t) => ({ ...t }));
 }
 
 function isMediaPath(path) {
@@ -623,13 +643,12 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   const [genView, setGenView] = useState("form"); // "form" | "history"
   const [genHistory, setGenHistory] = useState(() => loadGenHistory(projectId));
   const [clips, setClips] = useState([]);
+  const [tracks, setTracks] = useState(DEFAULT_TRACKS); // ordered lanes (top-first)
   const [probes, setProbes] = useState({});
   const [thumbs, setThumbs] = useState({});
   const [playheadMs, setPlayheadMs] = useState(0);
   const [previewUrl, setPreviewUrl] = useState("");
-  const [decodedPreviewKey, setDecodedPreviewKey] = useState("");
   const [previewBusy, setPreviewBusy] = useState(false);
-  const [nativeVideoFailedKey, setNativeVideoFailedKey] = useState("");
   const [importBusy, setImportBusy] = useState(false);
   const [dropActive, setDropActive] = useState(false);
   const [playing, setPlaying] = useState(false);
@@ -649,6 +668,8 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   const [historyState, setHistoryState] = useState({ canUndo: false, canRedo: false });
   const [mediaDrag, setMediaDrag] = useState(null); // { item, x, y } ghost while dragging media to the timeline
   const [mediaToDelete, setMediaToDelete] = useState(null); // media item pending delete confirmation
+  // Export job: null=idle, else { jobId, phase, status, progress, message, result }.
+  const [exportJob, setExportJob] = useState(null);
 
   // Persist the resizable layout across project opens / tab switches.
   const layoutStorage = useMemo(
@@ -682,13 +703,10 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   const autoScrollRef = useRef(0); // active edge-autoscroll velocity (px/frame)
   const autoScrollRafRef = useRef(0);
   const conversionCleanupTimersRef = useRef(new Map());
-  const previewVideoRef = useRef(null);
-  const nativeVideoSyncRef = useRef({ key: "", run: -1, lastCorrectionAt: 0, ignoreProgressUntil: 0 });
-  const playbackVideoTimeRef = useRef(0);
 
   // The committed document (last server state) + in-session undo/redo of
   // committed snapshots. `clips` is the live working copy (may diverge mid-drag).
-  const committedRef = useRef([]);
+  const committedRef = useRef({ clips: [], tracks: DEFAULT_TRACKS });
   const revisionRef = useRef(0);
   const undoStackRef = useRef([]);
   const redoStackRef = useRef([]);
@@ -697,6 +715,7 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   // Refs mirroring fast-changing state so the lifetime listeners + key handler
   // read fresh values without re-subscribing.
   const clipsRef = useRef([]);
+  const tracksRef = useRef(DEFAULT_TRACKS);
   const playheadRef = useRef(0);
   const playingRef = useRef(false);
   const effectiveTotalMsRef = useRef(0);
@@ -719,6 +738,8 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   useEffect(() => {
     return () => {
       mountedRef.current = false;
+      decodeInFlightRef.current = false;
+      pendingFrameRef.current = null;
       for (const timer of conversionCleanupTimersRef.current.values()) {
         window.clearTimeout(timer);
       }
@@ -882,8 +903,10 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
         setProject(loaded);
         const rawClips = Array.isArray(loaded?.timeline?.clips) ? loaded.timeline.clips : [];
         const normalized = rawClips.map(normalizeClip);
+        const normalizedTracks = normalizeTracks(loaded?.timeline?.tracks);
         setClips(normalized);
-        committedRef.current = normalized;
+        setTracks(normalizedTracks);
+        committedRef.current = { clips: normalized, tracks: normalizedTracks };
         revisionRef.current = Number(loaded?.timeline?.revision) || 0;
         const s = loaded?.timeline?.settings || {};
         setSettings({
@@ -996,292 +1019,131 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     return targets;
   }, []);
 
-  // The video clip under the playhead (timeline mode). On overlap the latest-placed
-  // (highest startMs) wins, matching NLE convention.
-  const activeVideoClip = useMemo(() => {
-    if (previewSource.kind !== "timeline") {
-      return null;
-    }
-    let best = null;
-    for (const clip of clips) {
-      if (clip.track !== "video") {
-        continue;
-      }
-      const start = clip.startMs ?? 0;
-      if (playheadMs >= start && playheadMs < start + clipLengthMs(clip)) {
-        if (!best || start >= (best.startMs ?? 0)) {
-          best = clip;
-        }
-      }
-    }
-    return best;
-  }, [clips, playheadMs, previewSource]);
-
-  const playbackVideoSource = useMemo(() => {
-    if (previewSource.kind === "asset") {
-      if (!previewSource.path) {
-        return null;
-      }
-      const durationMs = Math.max(0, Number(previewSource.durationMs) || 0);
-      return {
-        key: `asset:${previewSource.path}`,
-        src: convertFileSrc(previewSource.path),
-        startMs: 0,
-        inMs: 0,
-        outMs: durationMs,
-      };
-    }
-    if (!activeVideoClip?.mediaPath) {
-      return null;
-    }
-    const inMs = Math.max(0, Number(activeVideoClip.inMs) || 0);
-    const explicitOutMs = Math.max(0, Number(activeVideoClip.outMs ?? activeVideoClip.durationMs) || 0);
-    const outMs = explicitOutMs > inMs ? explicitOutMs : inMs + clipLengthMs(activeVideoClip);
-    return {
-      key: `clip:${activeVideoClip.id}:${activeVideoClip.mediaPath}:${inMs}:${outMs}`,
-      src: convertFileSrc(activeVideoClip.mediaPath),
-      startMs: Math.max(0, Number(activeVideoClip.startMs) || 0),
-      inMs,
-      outMs,
-    };
-  }, [previewSource, activeVideoClip]);
-
-  const playbackVideoTimeMs = useMemo(() => {
-    if (!playbackVideoSource) {
-      return 0;
-    }
-    const relativeMs = previewSource.kind === "asset" ? playheadMs : playheadMs - playbackVideoSource.startMs;
-    const targetMs = playbackVideoSource.inMs + Math.max(0, relativeMs);
-    const upperMs =
-      playbackVideoSource.outMs > playbackVideoSource.inMs
-        ? Math.max(playbackVideoSource.inMs, playbackVideoSource.outMs - 8)
-        : targetMs;
-    return Math.min(upperMs, Math.max(playbackVideoSource.inMs, targetMs));
-  }, [playbackVideoSource, playheadMs, previewSource.kind]);
-
-  const nativeVideoFailed = !!playbackVideoSource && nativeVideoFailedKey === playbackVideoSource.key;
-  const nativeVideoActive = playing && !!playbackVideoSource && !nativeVideoFailed;
-  const markNativeVideoFailed = useCallback((key) => {
-    if (key) {
-      setNativeVideoFailedKey((current) => (current === key ? current : key));
-    }
-  }, []);
-
-  // The frame the viewer should show, quantized to the fps grid so the backend
-  // frame cache hits on replay/scrub-back and decode requests dedupe.
-  const previewFrame = useMemo(() => {
-    if (nativeVideoActive) {
-      return null;
-    }
+  // The preview layers under the playhead, quantized to the fps grid (so the
+  // backend frame cache hits). One layer per VIDEO track that covers the playhead
+  // (top clip wins on overlap), ordered BOTTOM-first for compositing; or the single
+  // previewed asset. With 0/1 layer the viewer decodes a single frame; with 2+ it
+  // composites them into one frame backend-side.
+  const previewLayers = useMemo(() => {
     const fps = settings.fps || DEFAULT_FPS;
     const frameMs = 1000 / Math.max(1, fps);
     const quant = (t) => Math.max(0, Math.round(t / frameMs) * frameMs);
-    const clampFrameTime = (timeMs, inMs = 0, outMs = 0) => {
+    const clampFrameTime = (timeMs, inMs, outMs) => {
       const lower = Math.max(0, inMs);
       const upper = outMs > lower ? Math.max(lower, outMs - frameMs) : Math.max(lower, timeMs);
       return Math.min(upper, Math.max(lower, timeMs));
     };
     if (previewSource.kind === "asset") {
       if (!previewSource.path) {
-        return null;
+        return [];
       }
       const cap = previewSource.durationMs ? Math.max(0, previewSource.durationMs - frameMs) : playheadMs;
-      return {
-        path: previewSource.path,
-        timeMs: clampFrameTime(quant(Math.min(playheadMs, cap)), 0, previewSource.durationMs || 0),
-      };
+      return [
+        {
+          path: previewSource.path,
+          timeMs: clampFrameTime(quant(Math.min(playheadMs, cap)), 0, previewSource.durationMs || 0),
+        },
+      ];
     }
-    if (activeVideoClip) {
-      const inMs = Math.max(0, Number(activeVideoClip.inMs) || 0);
-      const explicitOutMs = Math.max(0, Number(activeVideoClip.outMs ?? activeVideoClip.durationMs) || 0);
-      const outMs = explicitOutMs > inMs ? explicitOutMs : inMs + clipLengthMs(activeVideoClip);
-      return {
-        path: activeVideoClip.mediaPath,
-        timeMs: clampFrameTime(
-          quant(playheadMs - (activeVideoClip.startMs ?? 0) + inMs),
-          inMs,
-          outMs,
-        ),
-      };
-    }
-    return null;
-  }, [previewSource, activeVideoClip, playheadMs, settings.fps, nativeVideoActive]);
-
-  const previewKey = previewFrame ? `${previewFrame.path}|${previewFrame.timeMs}` : "";
-  const previewStillCurrent = !!previewKey && decodedPreviewKey === previewKey && !!previewUrl;
-  const previewVideoVisible =
-    !!playbackVideoSource && !nativeVideoFailed && (nativeVideoActive || (!!previewKey && !previewStillCurrent));
-
-  useEffect(() => {
-    const video = previewVideoRef.current;
-    if (!video || !playbackVideoSource || nativeVideoFailed) {
-      return undefined;
-    }
-    let cancelled = false;
-    const targetSeconds = Math.max(0, playbackVideoTimeMs / 1000);
-    const syncVideo = () => {
-      if (cancelled) {
-        return;
-      }
-      const syncState = nativeVideoSyncRef.current;
-      const syncReset = syncState.key !== playbackVideoSource.key || syncState.run !== playbackRun;
-      if (syncReset) {
-        syncState.key = playbackVideoSource.key;
-        syncState.run = playbackRun;
-        syncState.lastCorrectionAt = 0;
-        syncState.ignoreProgressUntil = 0;
-      }
-      const duration = Number.isFinite(video.duration) ? video.duration : 0;
-      const boundedSeconds = duration > 0 ? Math.min(targetSeconds, Math.max(0, duration - 0.008)) : targetSeconds;
-      const drift = Math.abs((Number.isFinite(video.currentTime) ? video.currentTime : 0) - boundedSeconds);
-      const now = performance.now();
-      const shouldCorrect =
-        !playing || syncReset || drift > NATIVE_VIDEO_DRIFT_CORRECTION_SECONDS;
-      const canCorrect =
-        !playing
-        || syncReset
-        || now - syncState.lastCorrectionAt >= NATIVE_VIDEO_CORRECTION_INTERVAL_MS;
-      if (shouldCorrect && canCorrect) {
-        try {
-          video.currentTime = boundedSeconds;
-          syncState.lastCorrectionAt = now;
-          syncState.ignoreProgressUntil = now + 250;
-        } catch {
-          // Some WebViews reject seeks before metadata is ready; the next sync fixes it.
+    const videoTracks = tracks.filter((t) => t.kind === "video");
+    const layers = [];
+    // Bottom-first: iterate the lane list in reverse (doc order is top-first).
+    for (let i = videoTracks.length - 1; i >= 0; i -= 1) {
+      const trackId = videoTracks[i].id;
+      let best = null;
+      for (const clip of clips) {
+        if (clip.track !== trackId) {
+          continue;
+        }
+        const start = clip.startMs ?? 0;
+        if (playheadMs >= start && playheadMs < start + clipLengthMs(clip)) {
+          if (!best || start >= (best.startMs ?? 0)) {
+            best = clip;
+          }
         }
       }
-      video.muted = true;
-      video.playsInline = true;
-      if (playing) {
-        if (video.paused) {
-          const promise = video.play();
-          promise?.catch?.((error) => {
-            if (!cancelled && error?.name !== "AbortError") {
-              markNativeVideoFailed(playbackVideoSource.key);
-            }
-          });
-        }
-      } else if (!video.paused) {
-        video.pause();
+      if (best && best.mediaPath) {
+        const inMs = Math.max(0, Number(best.inMs) || 0);
+        const explicitOutMs = Math.max(0, Number(best.outMs ?? best.durationMs) || 0);
+        const outMs = explicitOutMs > inMs ? explicitOutMs : inMs + clipLengthMs(best);
+        layers.push({
+          path: best.mediaPath,
+          timeMs: clampFrameTime(quant(playheadMs - (best.startMs ?? 0) + inMs), inMs, outMs),
+        });
       }
-    };
-    if (video.readyState >= 1) {
-      syncVideo();
-    } else {
-      video.addEventListener("loadedmetadata", syncVideo, { once: true });
     }
-    return () => {
-      cancelled = true;
-      video.removeEventListener("loadedmetadata", syncVideo);
-    };
-  }, [playbackVideoSource, playbackVideoTimeMs, playbackRun, playing, nativeVideoFailed, markNativeVideoFailed]);
+    return layers;
+  }, [previewSource, clips, tracks, playheadMs, settings.fps]);
 
-  useEffect(() => {
-    if (!playing || !playbackVideoSource || nativeVideoFailed) {
-      return undefined;
-    }
-    const video = previewVideoRef.current;
-    if (!video) {
-      return undefined;
-    }
-    const key = playbackVideoSource.key;
-    let cancelled = false;
-    let raf = 0;
-    let lastVideoSeconds = Number.isFinite(video.currentTime) ? video.currentTime : 0;
-    let lastProgressAt = performance.now();
-    const startedAt = lastProgressAt;
-    const watch = () => {
-      if (cancelled || nativeVideoFailedKey === key) {
-        return;
-      }
-      const now = performance.now();
-      const currentSeconds = Number.isFinite(video.currentTime) ? video.currentTime : 0;
-      const seekCorrectionActive = now < (nativeVideoSyncRef.current.ignoreProgressUntil || 0);
-      if (
-        !seekCorrectionActive
-        && !video.seeking
-        && Math.abs(currentSeconds - lastVideoSeconds) >= NATIVE_VIDEO_PROGRESS_EPSILON_SECONDS
-      ) {
-        lastVideoSeconds = currentSeconds;
-        lastProgressAt = now;
-      } else if (seekCorrectionActive) {
-        lastVideoSeconds = currentSeconds;
-      }
-      const expectedSeconds = Math.max(0, playbackVideoTimeRef.current / 1000);
-      const playheadStillMoving =
-        playingRef.current && playheadRef.current < Math.max(0, effectiveTotalMsRef.current - 80);
-      const startupGraceElapsed = now - startedAt >= NATIVE_VIDEO_START_GRACE_MS;
-      const stalledLongEnough = now - lastProgressAt >= NATIVE_VIDEO_STALL_MS;
-      const visiblyBehind = expectedSeconds - currentSeconds > NATIVE_VIDEO_DRIFT_CORRECTION_SECONDS;
-      if (startupGraceElapsed && stalledLongEnough && visiblyBehind && playheadStillMoving && !video.ended) {
-        markNativeVideoFailed(key);
-        return;
-      }
-      raf = window.requestAnimationFrame(watch);
-    };
-    raf = window.requestAnimationFrame(watch);
-    return () => {
-      cancelled = true;
-      window.cancelAnimationFrame(raf);
-    };
-  }, [playing, playbackVideoSource?.key, nativeVideoFailed, nativeVideoFailedKey, markNativeVideoFailed]);
+  const previewKey = previewLayers.length
+    ? previewLayers.map((l) => `${l.path}|${l.timeMs}`).join("~")
+    : "";
 
-  // Decode still/scrub preview frames. Live transport playback uses the native
-  // video element above, so the backend decoder is not hammered every RAF tick.
-  // A SINGLE in-flight decode chases the latest target (coalescing), and a
-  // completed decode is never discarded.
+  // Decode preview frames for both scrub AND live playback. A SINGLE in-flight
+  // decode chases the latest target (coalescing). One layer → editor_decode_frame;
+  // multiple → editor_decode_composite_frame (backend stacks them).
   useEffect(() => {
-    // A token bumps on source changes/clears; in-flight decodes for a previous
-    // file must not paint, while same-file frames are allowed to land during
-    // decoded playback so the viewport never waits forever for "latest".
-    const tokenSource = previewFrame?.path || "";
+    // A token bumps when the source file SET changes; in-flight decodes for a
+    // previous set must not paint, while same-set frames may land during playback.
+    const tokenSource = previewLayers.map((l) => l.path).join("|");
     if (previewTokenSourceRef.current !== tokenSource) {
       previewTokenSourceRef.current = tokenSource;
       previewTokenRef.current += 1;
     }
-    if (!previewFrame) {
+    if (!previewLayers.length) {
       pendingFrameRef.current = null;
-      if (!nativeVideoActive) {
-        setPreviewUrl("");
-        setDecodedPreviewKey("");
-      }
+      setPreviewUrl("");
       setPreviewBusy(false);
       return;
     }
-    pendingFrameRef.current = previewFrame;
+    pendingFrameRef.current = previewLayers;
     if (decodeInFlightRef.current) {
       return; // the running loop will pick up the newer target
     }
     decodeInFlightRef.current = true;
     setPreviewBusy(true);
     (async () => {
-      while (pendingFrameRef.current && mountedRef.current) {
-        const target = pendingFrameRef.current;
-        pendingFrameRef.current = null;
-        const myToken = previewTokenRef.current;
-        try {
-          const targetKey = `${target.path}|${target.timeMs}`;
-          const frame = await invoke("editor_decode_frame", {
-            path: target.path,
-            timeMs: Math.round(target.timeMs),
-          });
-          if (mountedRef.current && previewTokenRef.current === myToken) {
-            setPreviewUrl(frame?.dataUrl || "");
-            setDecodedPreviewKey(targetKey);
-          }
-        } catch {
-          if (mountedRef.current && previewTokenRef.current === myToken) {
-            setPreviewUrl("");
-            setDecodedPreviewKey(`${target.path}|${target.timeMs}`);
+      // try/finally guarantees the in-flight flag + busy state always reset, even
+      // if a decode throws — otherwise the loop could strand decodeInFlightRef and
+      // freeze the preview on "Decoding…".
+      try {
+        while (pendingFrameRef.current && mountedRef.current) {
+          const target = pendingFrameRef.current;
+          pendingFrameRef.current = null;
+          const myToken = previewTokenRef.current;
+          try {
+            let url = "";
+            if (target.length === 1) {
+              const frame = await invoke("editor_decode_frame", {
+                path: target[0].path,
+                timeMs: Math.round(target[0].timeMs),
+              });
+              url = frame?.dataUrl || "";
+            } else {
+              const frame = await invoke("editor_decode_composite_frame", {
+                layers: target.map((l) => ({ path: l.path, timeMs: Math.round(l.timeMs) })),
+                width: settingsRef.current.width || 1280,
+                height: settingsRef.current.height || 720,
+              });
+              url = frame?.dataUrl || "";
+            }
+            if (mountedRef.current && previewTokenRef.current === myToken) {
+              setPreviewUrl(url);
+            }
+          } catch {
+            if (mountedRef.current && previewTokenRef.current === myToken) {
+              setPreviewUrl("");
+            }
           }
         }
-      }
-      decodeInFlightRef.current = false;
-      if (mountedRef.current) {
-        setPreviewBusy(false);
+      } finally {
+        decodeInFlightRef.current = false;
+        if (mountedRef.current) {
+          setPreviewBusy(false);
+        }
       }
     })();
-  }, [previewKey, nativeVideoActive]);
+  }, [previewKey]);
 
   // ---------------------------------------------------------------- audio engine
 
@@ -1392,9 +1254,13 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
                 track: "audio",
               },
             ]
-          : clipsRef.current.filter(
-              (clip) => clip.track === "audio" || (clip.track === "video" && clip.hasAudio),
-            );
+          : clipsRef.current.filter((clip) => {
+              const track = tracksRef.current.find((t) => t.id === clip.track);
+              if (!track || track.muted) {
+                return false;
+              }
+              return track.kind === "audio" || (track.kind === "video" && clip.hasAudio);
+            });
       // Pre-decode every needed buffer before scheduling so the anchor matches the
       // playhead at schedule time (no backward jump).
       const buffers = await Promise.all(
@@ -1431,7 +1297,9 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
         const src = ctx.createBufferSource();
         src.buffer = buffer;
         const gainNode = ctx.createGain();
-        gainNode.gain.value = clip.gain == null ? 1 : clip.gain;
+        const clipTrack = tracksRef.current.find((t) => t.id === clip.track);
+        const trackGain = clipTrack && clipTrack.gain != null ? clipTrack.gain : 1;
+        gainNode.gain.value = (clip.gain == null ? 1 : clip.gain) * trackGain;
         src.connect(gainNode).connect(ctx.destination);
         try {
           src.start(baseCtxTime + playDelaySec, offsetSec, playDurSec);
@@ -1492,7 +1360,6 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     effectiveTotalMs,
     startAudioPlayback,
     stopAudioPlayback,
-    playbackVideoSource?.key,
   ]);
 
   // Click a media tile's play button: load it into the viewer and play it.
@@ -1610,9 +1477,11 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   const applyResult = useCallback((result) => {
     const rawClips = Array.isArray(result?.timeline?.clips) ? result.timeline.clips : [];
     const normalized = rawClips.map(normalizeClip);
-    committedRef.current = normalized;
+    const normalizedTracks = normalizeTracks(result?.timeline?.tracks);
+    committedRef.current = { clips: normalized, tracks: normalizedTracks };
     revisionRef.current = Number(result?.revision) || revisionRef.current;
     setClips(normalized);
+    setTracks(normalizedTracks);
     setLoadError("");
     // Prune selection refs that point at clips which no longer exist.
     const ids = new Set(normalized.map((c) => c.id));
@@ -1637,7 +1506,8 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
       }
       if (writeBusyRef.current) {
         // A write is already in flight; drop this edit but keep state consistent.
-        setClips(committedRef.current);
+        setClips(committedRef.current.clips);
+        setTracks(committedRef.current.tracks);
         return;
       }
       writeBusyRef.current = true;
@@ -1653,7 +1523,8 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
         syncHistoryState();
       } catch (error) {
         // Rejected: revert the working copy to the committed baseline.
-        setClips(committedRef.current);
+        setClips(committedRef.current.clips);
+        setTracks(committedRef.current.tracks);
         setLoadError(getErrorMessage(error, "Edit was rejected."));
       } finally {
         writeBusyRef.current = false;
@@ -1677,7 +1548,10 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     const current = committedRef.current;
     writeBusyRef.current = true;
     try {
-      const result = await invoke("editor_save_timeline", { id: projectId, timeline: { clips: prev } });
+      const result = await invoke("editor_save_timeline", {
+        id: projectId,
+        timeline: { clips: prev.clips, tracks: prev.tracks },
+      });
       undoStackRef.current.pop();
       redoStackRef.current.push(current);
       applyResult(result);
@@ -1697,7 +1571,10 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     const current = committedRef.current;
     writeBusyRef.current = true;
     try {
-      const result = await invoke("editor_save_timeline", { id: projectId, timeline: { clips: next } });
+      const result = await invoke("editor_save_timeline", {
+        id: projectId,
+        timeline: { clips: next.clips, tracks: next.tracks },
+      });
       redoStackRef.current.pop();
       undoStackRef.current.push(current);
       applyResult(result);
@@ -1717,16 +1594,17 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
       }
       const probe = probes[item.path];
       const durationMs = Math.max(MIN_CLIP_MS, Math.round(probe?.durationMs || 5000));
-      const track = item.kind === "audio" ? "audio" : "video";
-      const trackEnd = committedRef.current
-        .filter((clip) => clip.track === track)
+      const kind = item.kind === "audio" ? "audio" : "video";
+      const targetTrack = (tracksRef.current.find((t) => t.kind === kind) || {}).id || kind;
+      const trackEnd = (committedRef.current.clips || [])
+        .filter((clip) => clip.track === targetTrack)
         .reduce((max, clip) => Math.max(max, (clip.startMs ?? 0) + clipLengthMs(clip)), 0);
       commitOps([
         {
           type: "place_clip",
           mediaPath: item.path,
-          track,
-          kind: track,
+          track: targetTrack,
+          kind,
           startMs: trackEnd,
           inMs: 0,
           outMs: durationMs,
@@ -1737,6 +1615,109 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     },
     [probes, commitOps],
   );
+
+  // Track operations (all go through the one commit path so they're undoable).
+  const addTrack = useCallback((kind) => {
+    commitRef.current?.([{ type: "add_track", kind: kind === "audio" ? "audio" : "video" }]);
+  }, []);
+  const removeTrack = useCallback((trackId) => {
+    commitRef.current?.([{ type: "remove_track", trackId }]);
+  }, []);
+  const toggleTrackMute = useCallback((trackId, muted) => {
+    commitRef.current?.([{ type: "set_track_mute", trackId, muted: !!muted }]);
+  }, []);
+
+  // Publish the live editor context (open project, exposed selection, playhead,
+  // tracks, generation form) so the terminal orchestrator's editor_control MCP can
+  // read it. Playhead is snapshotted from the ref (excluded from deps) so playback
+  // doesn't spam this; selection/clip/track/tool changes drive the publish.
+  useEffect(() => {
+    if (loadState !== "ready") {
+      return;
+    }
+    const context = {
+      projectId,
+      revision: revisionRef.current,
+      playheadMs: Math.round(playheadRef.current),
+      tool,
+      selection,
+      activeClipId,
+      selectedClipIds,
+      tracks: tracks.map((t) => ({ id: t.id, kind: t.kind, name: t.name, muted: t.muted })),
+      generation: { modelId: genModelId, format: genFormat },
+    };
+    invoke("editor_publish_context", { context }).catch(() => {});
+  }, [loadState, projectId, tool, selection, activeClipId, selectedClipIds, tracks, genModelId, genFormat]);
+
+  // Export the whole timeline to a WebM (VP9 + Opus) on disk. Progress streams via
+  // EXPORT_PROGRESS_EVENT; the resolved value carries the final output path.
+  const startExport = useCallback(() => {
+    if (exportJob && exportJob.status === "running") {
+      return;
+    }
+    const jobId =
+      typeof crypto !== "undefined" && crypto.randomUUID
+        ? crypto.randomUUID()
+        : `exp-${Date.now()}-${Math.round(Math.random() * 1e6)}`;
+    setExportJob({ jobId, phase: "preparing", status: "running", progress: 0, message: "Starting…", result: null });
+    invoke("editor_export_timeline", { id: projectId, jobId, options: {} })
+      .then((result) => {
+        if (!mountedRef.current) {
+          return;
+        }
+        setExportJob((cur) =>
+          cur && cur.jobId === jobId
+            ? { ...cur, status: "done", progress: 1, phase: "done", result }
+            : cur,
+        );
+      })
+      .catch((error) => {
+        if (!mountedRef.current) {
+          return;
+        }
+        setExportJob((cur) =>
+          cur && cur.jobId === jobId
+            ? { ...cur, status: "failed", message: getErrorMessage(error, "Export failed.") }
+            : cur,
+        );
+      });
+  }, [exportJob, projectId]);
+
+  useEffect(() => {
+    let unlisten = null;
+    let active = true;
+    (async () => {
+      const fn = await listen(EXPORT_PROGRESS_EVENT, (event) => {
+        const p = event.payload || {};
+        setExportJob((cur) => {
+          if (!cur || cur.jobId !== p.jobId) {
+            return cur;
+          }
+          if (cur.status === "done" || cur.status === "failed") {
+            return cur; // a terminal status (from the invoke result) wins.
+          }
+          return {
+            ...cur,
+            phase: p.phase || cur.phase,
+            status: p.status === "done" ? "running" : p.status || cur.status,
+            progress: typeof p.progress === "number" ? p.progress : cur.progress,
+            message: p.message || cur.message,
+          };
+        });
+      });
+      if (active) {
+        unlisten = fn;
+      } else {
+        fn();
+      }
+    })();
+    return () => {
+      active = false;
+      if (unlisten) {
+        unlisten();
+      }
+    };
+  }, []);
 
   const removeClip = useCallback(
     (clipId) => {
@@ -2172,9 +2153,9 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
   // keyboard handler read fresh values without re-subscribing.
   useLayoutEffect(() => {
     clipsRef.current = clips;
+    tracksRef.current = tracks;
     playheadRef.current = playheadMs;
     playingRef.current = playing;
-    playbackVideoTimeRef.current = playbackVideoTimeMs;
     effectiveTotalMsRef.current = effectiveTotalMs;
     selectionRef.current = selection;
     activeClipRef.current = activeClipId;
@@ -2437,7 +2418,14 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
         }
         const rect = lane.getBoundingClientRect();
         const startMs = Math.max(0, Math.round(pxToMs(event.clientX - rect.left, ppsRef.current)));
-        const track = item.kind === "audio" ? "audio" : "video";
+        const kind = item.kind === "audio" ? "audio" : "video";
+        // Drop onto the hit lane when its kind matches the media; otherwise the
+        // first track of the media's kind.
+        const laneTrack = tracksRef.current.find((t) => t.id === lane.dataset.laneTrack);
+        const track =
+          laneTrack && laneTrack.kind === kind
+            ? laneTrack.id
+            : (tracksRef.current.find((t) => t.kind === kind) || {}).id || kind;
         const probe = probesRef.current[item.path];
         const durationMs = Math.max(MIN_CLIP_MS, Math.round(probe?.durationMs || 5000));
         commitRef.current?.([
@@ -2445,7 +2433,7 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
             type: "place_clip",
             mediaPath: item.path,
             track,
-            kind: track,
+            kind,
             startMs,
             inMs: 0,
             outMs: durationMs,
@@ -2461,17 +2449,47 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
       }
       const commit = commitRef.current;
       if (!commit) {
-        setClips(committedRef.current);
+        setClips(committedRef.current.clips);
         return;
       }
       const ops = [];
       if (drag.type === "move") {
         const ids = drag.groupOrig ? Object.keys(drag.groupOrig) : [drag.clipId];
+        // A single-clip move may also change lane: drop onto a compatible track.
+        let targetTrackId = null;
+        if (!drag.groupOrig) {
+          const el =
+            typeof document !== "undefined"
+              ? document.elementFromPoint(event.clientX, event.clientY)
+              : null;
+          const lane = el && el.closest ? el.closest("[data-lane-track]") : null;
+          if (lane) {
+            const laneTrack = tracksRef.current.find((t) => t.id === lane.dataset.laneTrack);
+            const movingClip = clipsRef.current.find((c) => c.id === drag.clipId);
+            const movingTrack = movingClip
+              ? tracksRef.current.find((t) => t.id === movingClip.track)
+              : null;
+            if (
+              laneTrack &&
+              movingTrack &&
+              laneTrack.kind === movingTrack.kind &&
+              laneTrack.id !== movingClip.track
+            ) {
+              targetTrackId = laneTrack.id;
+            }
+          }
+        }
         for (const id of ids) {
           const clip = clipsRef.current.find((c) => c.id === id);
           const orig = drag.groupOrig ? drag.groupOrig[id] : drag.origStart;
-          if (clip && Math.round(clip.startMs) !== Math.round(orig)) {
-            ops.push({ type: "move_clip", clipId: id, startMs: Math.round(clip.startMs) });
+          const movedX = clip && Math.round(clip.startMs) !== Math.round(orig);
+          const movedLane = targetTrackId && id === drag.clipId;
+          if (clip && (movedX || movedLane)) {
+            const op = { type: "move_clip", clipId: id, startMs: Math.round(clip.startMs) };
+            if (movedLane) {
+              op.track = targetTrackId;
+            }
+            ops.push(op);
           }
         }
       } else if (drag.type === "trim-left") {
@@ -2497,7 +2515,7 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
       if (ops.length) {
         commit(ops);
       } else {
-        setClips(committedRef.current);
+        setClips(committedRef.current.clips);
       }
     };
 
@@ -3037,8 +3055,8 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     }
     if (param.type === "enum") {
       return (
-        <GenField key={param.key}>
-          <GenLabel>{param.label}</GenLabel>
+        <GenInlineField key={param.key}>
+          <GenInlineLabel>{param.label}</GenInlineLabel>
           <GenEnumRow>
             {param.values.map((option) => (
               <GenEnumButton
@@ -3052,13 +3070,13 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
               </GenEnumButton>
             ))}
           </GenEnumRow>
-        </GenField>
+        </GenInlineField>
       );
     }
     if (param.type === "int") {
       return (
-        <GenField key={param.key}>
-          <GenLabel>{param.label}</GenLabel>
+        <GenInlineField key={param.key}>
+          <GenInlineLabel>{param.label}</GenInlineLabel>
           <GenNumberInput
             max={param.max}
             min={param.min}
@@ -3067,7 +3085,7 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
             type="number"
             value={value ?? ""}
           />
-        </GenField>
+        </GenInlineField>
       );
     }
     if (param.type === "image") {
@@ -3147,129 +3165,119 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
     ];
     const videoModels = GENERATION_MODELS.filter((m) => m.capabilities.some((c) => c.endsWith("video")));
     const modes = genModel.capabilities;
+    const inHistory = genView === "history";
 
     return (
       <GenPanelFill>
-        <GenHeader>
-          <GenTitle>
-            <AutoAwesome aria-hidden="true" />
-            <span>Generate</span>
-          </GenTitle>
-          <GenHeaderActions>
-            <ToolButton
-              aria-label="Generation history"
-              data-active={genView === "history" ? "true" : "false"}
-              onClick={() => setGenView((view) => (view === "history" ? "form" : "history"))}
-              title="Generation history"
-              type="button"
-            >
-              <History aria-hidden="true" />
-            </ToolButton>
-          </GenHeaderActions>
-        </GenHeader>
-
-        {genView === "history" ? (
-          <>
-            <GenHistoryScroll ref={genHistoryScrollRef}>
-              {genHistory.length === 0 ? (
-                <FolderEmpty>
-                  <History aria-hidden="true" />
-                  <span>No generations yet</span>
-                  <small>Generations you create appear here, newest at the bottom.</small>
-                </FolderEmpty>
-              ) : (
-                genHistory.map((item) => (
-                  <GenHistoryItem key={item.id} item={item} onBeginDrag={beginMediaDrag} />
-                ))
-              )}
-            </GenHistoryScroll>
-            <GenSubmitBar>
-              <GenResultsLink onClick={openGenerationsFolder} type="button">
-                View generations
+        {inHistory ? (
+          <GenHistoryScroll ref={genHistoryScrollRef}>
+            <GenHistoryTop>
+              <GenResultsLink onClick={openGenerationsFolder} type="button" title="Open the generations folder">
+                Open generations folder
               </GenResultsLink>
-              <SecondaryButton onClick={() => setGenView("form")} type="button">
-                <ButtonIcon as={AutoAwesome} aria-hidden="true" />
-                <span>New generation</span>
-              </SecondaryButton>
-            </GenSubmitBar>
-          </>
+            </GenHistoryTop>
+            {genHistory.length === 0 ? (
+              <FolderEmpty>
+                <History aria-hidden="true" />
+                <span>No generations yet</span>
+                <small>Generations you create appear here, newest at the bottom.</small>
+              </FolderEmpty>
+            ) : (
+              genHistory.map((item) => (
+                <GenHistoryItem key={item.id} item={item} onBeginDrag={beginMediaDrag} />
+              ))
+            )}
+          </GenHistoryScroll>
         ) : (
-          <>
-            <GenForm>
-              <GenField>
-                <GenLabel>Format</GenLabel>
-                <GenEnumRow>
+          <GenForm>
+            <GenInlineField>
+              <GenInlineLabel>Format</GenInlineLabel>
+              <GenEnumRow>
+                <GenEnumButton
+                  data-active={genFormat === "video" ? "true" : "false"}
+                  onClick={() => setGenFormat("video")}
+                  type="button"
+                >
+                  Video
+                </GenEnumButton>
+                <GenEnumButton disabled title="Coming soon" type="button">
+                  Image · soon
+                </GenEnumButton>
+              </GenEnumRow>
+            </GenInlineField>
+
+            <GenInlineField>
+              <GenInlineLabel>Model</GenInlineLabel>
+              <GenEnumRow>
+                {videoModels.map((model) => (
                   <GenEnumButton
-                    data-active={genFormat === "video" ? "true" : "false"}
-                    onClick={() => setGenFormat("video")}
+                    key={model.id}
+                    data-active={genModelId === model.id ? "true" : "false"}
+                    onClick={() => selectGenModel(model.id)}
                     type="button"
                   >
-                    Video
+                    {model.label}
                   </GenEnumButton>
-                  <GenEnumButton disabled title="Coming soon" type="button">
-                    Image · soon
-                  </GenEnumButton>
-                </GenEnumRow>
-              </GenField>
+                ))}
+              </GenEnumRow>
+            </GenInlineField>
 
-              <GenField>
-                <GenLabel>Model</GenLabel>
+            {modes.length > 1 && (
+              <GenInlineField>
+                <GenInlineLabel>Input</GenInlineLabel>
                 <GenEnumRow>
-                  {videoModels.map((model) => (
+                  {modes.map((cap) => (
                     <GenEnumButton
-                      key={model.id}
-                      data-active={genModelId === model.id ? "true" : "false"}
-                      onClick={() => selectGenModel(model.id)}
+                      key={cap}
+                      data-active={genMode === cap ? "true" : "false"}
+                      onClick={() => selectGenMode(cap)}
                       type="button"
                     >
-                      {model.label}
+                      {GEN_CAPABILITY_LABELS[cap] || cap}
                     </GenEnumButton>
                   ))}
                 </GenEnumRow>
-              </GenField>
+              </GenInlineField>
+            )}
 
-              {modes.length > 1 && (
-                <GenField>
-                  <GenLabel>Input</GenLabel>
-                  <GenEnumRow>
-                    {modes.map((cap) => (
-                      <GenEnumButton
-                        key={cap}
-                        data-active={genMode === cap ? "true" : "false"}
-                        onClick={() => selectGenMode(cap)}
-                        type="button"
-                      >
-                        {GEN_CAPABILITY_LABELS[cap] || cap}
-                      </GenEnumButton>
-                    ))}
-                  </GenEnumRow>
-                </GenField>
-              )}
+            {orderedBasic.map((param) => renderGenField(param))}
 
-              {orderedBasic.map((param) => renderGenField(param))}
-
-              {advanced.length > 0 && (
-                <GenAdvanced>
-                  <GenAdvancedToggle onClick={() => setGenAdvancedOpen((open) => !open)} type="button">
-                    {genAdvancedOpen ? "▾ Advanced" : "▸ Advanced"}
-                  </GenAdvancedToggle>
-                  {genAdvancedOpen && advanced.map((param) => renderGenField(param))}
-                </GenAdvanced>
-              )}
-
-              {genError && <InlineError>{genError}</InlineError>}
-            </GenForm>
-            <GenSubmitBar>
-              <GenResultsLink onClick={openGenerationsFolder} type="button" title="Open the generations folder">
-                View generations
-              </GenResultsLink>
-              <PrimaryButton disabled={genBusy || !valid} onClick={requestGenerate} type="button">
-                <ButtonIcon as={AutoAwesome} aria-hidden="true" />
-                <span>{genBusy ? "Generating…" : "Generate"}</span>
-              </PrimaryButton>
-            </GenSubmitBar>
-          </>
+            {advanced.length > 0 && (
+              <GenAdvanced>
+                <GenAdvancedToggle onClick={() => setGenAdvancedOpen((open) => !open)} type="button">
+                  {genAdvancedOpen ? "▾ Advanced" : "▸ Advanced"}
+                </GenAdvancedToggle>
+                {genAdvancedOpen && advanced.map((param) => renderGenField(param))}
+              </GenAdvanced>
+            )}
+          </GenForm>
         )}
+
+        {!inHistory && genError && <GenFloatingError role="alert">{genError}</GenFloatingError>}
+
+        <GenDock>
+          <GenHistoryPill
+            aria-label="Generation history"
+            data-active={inHistory ? "true" : "false"}
+            onClick={() => setGenView((view) => (view === "history" ? "form" : "history"))}
+            title="Generation history"
+            type="button"
+          >
+            <History aria-hidden="true" />
+            <span>History</span>
+          </GenHistoryPill>
+          {inHistory ? (
+            <GenFab onClick={() => setGenView("form")} type="button">
+              <AutoAwesome aria-hidden="true" />
+              <span>New</span>
+            </GenFab>
+          ) : (
+            <GenFab disabled={genBusy || !valid} onClick={requestGenerate} type="button">
+              <AutoAwesome aria-hidden="true" />
+              <span>{genBusy ? "Generating…" : "Generate"}</span>
+            </GenFab>
+          )}
+        </GenDock>
       </GenPanelFill>
     );
   };
@@ -3281,6 +3289,15 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
           <ArrowBack aria-hidden="true" />
         </BackButton>
         <WorkbenchTitle title={project?.name}>{project?.name}</WorkbenchTitle>
+        <ExportButton
+          disabled={totalMs <= 0 || (exportJob && exportJob.status === "running")}
+          onClick={startExport}
+          title="Export the timeline to WebM"
+          type="button"
+        >
+          <ButtonIcon as={FileDownload} aria-hidden="true" />
+          <span>{exportJob && exportJob.status === "running" ? "Exporting…" : "Export"}</span>
+        </ExportButton>
       </WorkbenchHeader>
 
       {loadError && <InlineError>{loadError}</InlineError>}
@@ -3364,21 +3381,7 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
               </ViewerSourceBar>
             )}
             <ViewerFrame>
-              {previewVideoVisible && playbackVideoSource ? (
-                <PreviewVideo
-                  key={playbackVideoSource.key}
-                  ref={previewVideoRef}
-                  aria-label="Playing preview"
-                  controls={false}
-                  disablePictureInPicture
-                  muted
-                  onError={() => markNativeVideoFailed(playbackVideoSource.key)}
-                  playsInline
-                  poster={previewUrl || undefined}
-                  preload="auto"
-                  src={playbackVideoSource.src}
-                />
-              ) : previewUrl ? (
+              {previewUrl ? (
                 <PreviewImg alt="Preview frame" src={previewUrl} />
               ) : (
                 <ViewerEmpty>
@@ -3466,6 +3469,23 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
                 >
                   <DeleteOutline aria-hidden="true" />
                 </ToolButton>
+                <ToolDivider />
+                <ToolButton
+                  aria-label="Add video track"
+                  onClick={() => addTrack("video")}
+                  title="Add video track"
+                  type="button"
+                >
+                  <Movie aria-hidden="true" />
+                </ToolButton>
+                <ToolButton
+                  aria-label="Add audio track"
+                  onClick={() => addTrack("audio")}
+                  title="Add audio track"
+                  type="button"
+                >
+                  <GraphicEq aria-hidden="true" />
+                </ToolButton>
               </TimelineTools>
               <ZoomControl>
                 <ZoomSlider
@@ -3492,30 +3512,54 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
                   </TimelineRulerTrack>
                 </TimelineRuler>
 
-                {["video", "audio"].map((track) => (
-                  <TimelineTrack key={track}>
-                    <TimelineTrackLabel>
-                      <TrackIcon as={track === "video" ? Movie : GraphicEq} aria-hidden="true" />
-                      <span>{track === "video" ? "Video" : "Audio"}</span>
+                {tracks.map((track) => (
+                  <TimelineTrack key={track.id}>
+                    <TimelineTrackLabel data-kind={track.kind}>
+                      <TrackIcon as={track.kind === "video" ? Movie : GraphicEq} aria-hidden="true" />
+                      <TrackName title={track.name}>{track.name}</TrackName>
+                      <TrackControls>
+                        <TrackCtlButton
+                          aria-label={track.muted ? `Unmute ${track.name}` : `Mute ${track.name}`}
+                          data-on={track.muted ? "true" : "false"}
+                          onClick={() => toggleTrackMute(track.id, !track.muted)}
+                          title={track.muted ? "Unmute" : "Mute"}
+                          type="button"
+                        >
+                          {track.muted ? "M" : "m"}
+                        </TrackCtlButton>
+                        {tracks.length > 1 && (
+                          <TrackCtlButton
+                            aria-label={`Remove ${track.name}`}
+                            onClick={() => removeTrack(track.id)}
+                            title="Remove track"
+                            type="button"
+                          >
+                            <Close aria-hidden="true" />
+                          </TrackCtlButton>
+                        )}
+                      </TrackControls>
                     </TimelineTrackLabel>
                     <TimelineLane
-                      data-track={track}
-                      data-lane-track={track}
+                      data-track={track.kind}
+                      data-lane-track={track.id}
+                      data-muted={track.muted ? "true" : "false"}
                       data-tool={tool}
                       onPointerDown={beginRangeSelect}
                       style={{ width: `${timelineWidthPx}px`, "--sec-px": `${pxPerSecond}px` }}
                     >
-                      {clips.filter((clip) => clip.track === track).length === 0 && (
+                      {clips.filter((clip) => clip.track === track.id).length === 0 && (
                         <TimelineLanePlaceholder>
-                          {track === "video" ? "Add video clips from the media panel" : "Add audio from the media panel"}
+                          {track.kind === "video"
+                            ? "Add video clips from the media panel"
+                            : "Add audio from the media panel"}
                         </TimelineLanePlaceholder>
                       )}
                       {clips
-                        .filter((clip) => clip.track === track)
+                        .filter((clip) => clip.track === track.id)
                         .map((clip) => (
                           <TimelineClip
                             key={clip.id}
-                            data-track={track}
+                            data-track={track.kind}
                             data-tool={tool}
                             data-active={activeClipId === clip.id ? "true" : "false"}
                             data-selected={selectedClipIds.includes(clip.id) ? "true" : "false"}
@@ -3609,6 +3653,64 @@ function ProjectWorkbench({ projectId, onBack, onMissing }) {
           <Movie aria-hidden="true" />
           <span>{mediaDrag.item.name}</span>
         </MediaDragGhost>
+      )}
+
+      {exportJob && (
+        <DialogScrim
+          onMouseDown={() => {
+            if (exportJob.status !== "running") {
+              setExportJob(null);
+            }
+          }}
+        >
+          <DialogCard onMouseDown={(event) => event.stopPropagation()} role="dialog" aria-modal="true">
+            <DialogHeader>
+              <div>
+                <PanelKicker>Export</PanelKicker>
+                <PanelHeading>
+                  {exportJob.status === "done"
+                    ? "Export complete"
+                    : exportJob.status === "failed"
+                      ? "Export failed"
+                      : "Exporting timeline…"}
+                </PanelHeading>
+              </div>
+              {exportJob.status !== "running" && (
+                <DialogClose aria-label="Close" onClick={() => setExportJob(null)} type="button">
+                  <Close aria-hidden="true" />
+                </DialogClose>
+              )}
+            </DialogHeader>
+            <DialogBody>
+              {exportJob.status === "failed" ? (
+                <span>{exportJob.message || "The export could not be completed."}</span>
+              ) : exportJob.status === "done" ? (
+                <>
+                  Saved to <strong>exports/{exportJob.result?.name}</strong>
+                  {exportJob.result?.durationMs
+                    ? ` · ${formatDuration(exportJob.result.durationMs)} · ${exportJob.result.width}×${exportJob.result.height}`
+                    : ""}
+                  .
+                </>
+              ) : (
+                <>
+                  <ExportPhase>{exportJob.message || "Working…"}</ExportPhase>
+                  <ExportProgressTrack>
+                    <ExportProgressFill style={{ width: `${Math.round((exportJob.progress || 0) * 100)}%` }} />
+                  </ExportProgressTrack>
+                  <ExportPercent>{Math.round((exportJob.progress || 0) * 100)}%</ExportPercent>
+                </>
+              )}
+            </DialogBody>
+            {exportJob.status !== "running" && (
+              <DialogActions>
+                <PrimaryButton onClick={() => setExportJob(null)} type="button">
+                  <span>Done</span>
+                </PrimaryButton>
+              </DialogActions>
+            )}
+          </DialogCard>
+        </DialogScrim>
       )}
 
       {mediaToDelete && (
@@ -4391,7 +4493,7 @@ const BackButton = styled.button`
 
 const WorkbenchTitle = styled.h2`
   margin: 0;
-  max-width: calc(100% - 80px);
+  max-width: calc(100% - 200px);
   font-size: 13px;
   font-weight: 700;
   color: var(--forge-text);
@@ -4399,6 +4501,68 @@ const WorkbenchTitle = styled.h2`
   text-overflow: ellipsis;
   white-space: nowrap;
   text-align: center;
+`;
+
+const ExportButton = styled.button`
+  position: absolute;
+  right: 8px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 10px;
+  border: 1px solid var(--forge-border-strong);
+  border-radius: 6px;
+  background: var(--forge-surface-control);
+  color: var(--forge-text-soft);
+  font-size: 12px;
+  font-weight: 600;
+  transition: border-color 150ms ease, color 150ms ease;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: var(--forge-accent-selected-border);
+    color: var(--forge-text);
+  }
+
+  &:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+`;
+
+const ExportPhase = styled.div`
+  font-size: 12.5px;
+  color: var(--forge-text-soft);
+  margin-bottom: 8px;
+`;
+
+const ExportProgressTrack = styled.div`
+  width: 100%;
+  height: 6px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.12);
+`;
+
+const ExportProgressFill = styled.div`
+  height: 100%;
+  border-radius: inherit;
+  background: rgb(var(--forge-accent-rgb));
+  transition: width 160ms ease;
+`;
+
+const ExportPercent = styled.div`
+  margin-top: 6px;
+  font-size: 11.5px;
+  font-weight: 700;
+  color: var(--forge-text-muted);
 `;
 
 const WorkbenchBody = styled.div`
@@ -4956,6 +5120,7 @@ const MediaPanelFill = styled.div`
 `;
 
 const GenPanelFill = styled.div`
+  position: relative;
   display: flex;
   flex-direction: column;
   flex: 1 1 auto;
@@ -5057,37 +5222,132 @@ const ConversionPercent = styled.span`
 
 /* ------------------------------------------------------------ generation form */
 
-const GenHeader = styled.div`
-  flex: 0 0 auto;
+/* Floating dock pinned over the scroll surface (replaces the old top + bottom bars). */
+const GenDock = styled.div`
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 5;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 10px 12px;
-  border-bottom: 1px solid var(--forge-border);
+  justify-content: space-between;
+  gap: 10px;
+  padding: 12px;
+  pointer-events: none;
 `;
 
-const GenTitle = styled.span`
+const GenHistoryPill = styled.button`
+  pointer-events: auto;
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
-  font-weight: 700;
-  letter-spacing: 0.02em;
-  text-transform: uppercase;
+  padding: 7px 12px;
+  border: 1px solid var(--forge-border-strong);
+  border-radius: 999px;
+  background: var(--forge-surface-raised);
   color: var(--forge-text-soft);
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 6px 18px rgba(2, 4, 8, 0.4);
+  backdrop-filter: blur(6px);
+  transition:
+    border-color var(--ed-anim-hover) ease,
+    color var(--ed-anim-hover) ease,
+    background var(--ed-anim-hover) ease;
 
   svg {
     width: 15px;
     height: 15px;
-    color: var(--forge-accent-soft);
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    border-color: var(--forge-accent-selected-border);
+  }
+
+  &[data-active="true"] {
+    border-color: var(--forge-accent);
+    color: var(--forge-text);
+    background: rgba(var(--forge-accent-rgb), 0.18);
   }
 `;
 
-const GenHeaderActions = styled.div`
-  display: flex;
+const GenFab = styled.button`
+  pointer-events: auto;
+  display: inline-flex;
   align-items: center;
-  gap: 4px;
-  margin-left: auto;
+  gap: 8px;
+  padding: 9px 16px;
+  border: none;
+  border-radius: 999px;
+  background: var(--forge-blue);
+  color: #ffffff;
+  font-size: 13px;
+  font-weight: 760;
+  letter-spacing: 0.01em;
+  box-shadow: 0 8px 22px rgba(var(--forge-accent-rgb), 0.4);
+  transition:
+    transform var(--ed-anim-hover) ease,
+    box-shadow var(--ed-anim-hover) ease,
+    opacity var(--ed-anim-hover) ease;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  &:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 10px 26px rgba(var(--forge-accent-rgb), 0.5);
+  }
+
+  &:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+    box-shadow: none;
+  }
+`;
+
+const GenFloatingError = styled.div`
+  position: absolute;
+  left: 12px;
+  right: 12px;
+  bottom: 60px;
+  z-index: 6;
+  padding: 8px 11px;
+  border: 1px solid var(--forge-red);
+  border-radius: 9px;
+  background: rgba(239, 107, 107, 0.14);
+  color: var(--forge-text);
+  font-size: 12px;
+  font-weight: 600;
+  box-shadow: 0 6px 18px rgba(2, 4, 8, 0.4);
+  backdrop-filter: blur(6px);
+`;
+
+const GenInlineField = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  animation: ${popIn} 160ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+`;
+
+const GenInlineLabel = styled.span`
+  flex: 0 0 auto;
+  min-width: 62px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--forge-text-muted);
+`;
+
+const GenHistoryTop = styled.div`
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 2px;
 `;
 
 const GenHistoryScroll = styled.div`
@@ -5097,7 +5357,7 @@ const GenHistoryScroll = styled.div`
   display: flex;
   flex-direction: column;
   gap: 10px;
-  padding: 12px;
+  padding: 12px 12px 72px;
 `;
 
 const GenHistoryCard = styled.div`
@@ -5183,8 +5443,8 @@ const GenForm = styled.div`
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  padding: 12px;
+  gap: 10px;
+  padding: 12px 12px 72px;
 `;
 
 const GenField = styled.div`
@@ -5244,12 +5504,12 @@ const GenEnumRow = styled.div`
 `;
 
 const GenEnumButton = styled.button`
-  padding: 6px 12px;
+  padding: 5px 10px;
   border: 1px solid var(--forge-border-strong);
   border-radius: 8px;
   background: var(--forge-surface-control);
   color: var(--forge-text-soft);
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
   transition:
@@ -5437,7 +5697,7 @@ const GenRefAdd = styled.button`
 const GenAdvanced = styled.div`
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 10px;
 `;
 
 const GenAdvancedToggle = styled.button`
@@ -5454,16 +5714,6 @@ const GenAdvancedToggle = styled.button`
   &:hover {
     color: var(--forge-text);
   }
-`;
-
-const GenSubmitBar = styled.div`
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  padding: 10px 12px;
-  border-top: 1px solid var(--forge-border);
 `;
 
 const GenResultsLink = styled.button`
@@ -5572,12 +5822,6 @@ const ViewerFrame = styled.div`
 `;
 
 const PreviewImg = styled.img`
-  max-width: 100%;
-  max-height: 100%;
-  object-fit: contain;
-`;
-
-const PreviewVideo = styled.video`
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
@@ -5868,11 +6112,58 @@ const TrackIcon = styled.span`
   display: inline-flex;
   width: 16px;
   height: 16px;
+  flex: 0 0 auto;
   color: var(--forge-text-muted);
 
   svg {
     width: 100%;
     height: 100%;
+  }
+`;
+
+const TrackName = styled.span`
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const TrackControls = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: 0 0 auto;
+`;
+
+const TrackCtlButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--forge-border-strong);
+  border-radius: 5px;
+  background: var(--forge-surface-control);
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  transition: color 150ms ease, border-color 150ms ease, background 150ms ease;
+
+  svg {
+    width: 11px;
+    height: 11px;
+  }
+
+  &:hover {
+    color: var(--forge-text);
+    border-color: var(--forge-accent-selected-border);
+  }
+
+  &[data-on="true"] {
+    color: #f0b232;
+    border-color: rgba(240, 178, 50, 0.5);
   }
 `;
 

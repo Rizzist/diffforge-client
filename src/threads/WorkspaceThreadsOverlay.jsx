@@ -217,9 +217,7 @@ const DrawerToggle = styled.button`
   border-radius: 999px;
   color: #d6d6d6;
   background: rgba(45, 45, 45, 0.96);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.045),
-    0 10px 22px rgba(0, 0, 0, 0.32);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.28);
   transition:
     border-color 130ms ease,
     color 130ms ease,

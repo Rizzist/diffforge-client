@@ -339,7 +339,6 @@ import {
   ButtonMicIcon,
   ButtonHubIcon,
   ButtonCheckIcon,
-  FileChevronIcon,
   FileExpandIcon,
   FileFolderTreeIcon,
   FileDocumentIcon
@@ -2089,7 +2088,6 @@ function WorkspaceTerminal({
 }) {
   const containerRef = useRef(null);
   const restartMenuRef = useRef(null);
-  const shellLauncherMenuRef = useRef(null);
   const shellLauncherInputRef = useRef(null);
   const resizeControllerRef = useRef(null);
   const windowBreakoutHostedRef = useRef(windowBreakoutHosted);
@@ -2216,7 +2214,6 @@ function WorkspaceTerminal({
   const [shellLauncherAgentId, setShellLauncherAgentId] = useState(SHELL_LAUNCHER_MODE_TERMINAL);
   const [shellLauncherDraft, setShellLauncherDraft] = useState("");
   const [shellLauncherError, setShellLauncherError] = useState("");
-  const [shellLauncherMenuOpen, setShellLauncherMenuOpen] = useState(false);
   const [shellLauncherSending, setShellLauncherSending] = useState(false);
   const [shellLauncherLaunchedAgentId, setShellLauncherLaunchedAgentId] = useState("");
   const [terminalUiComposerFocusToken, setTerminalUiComposerFocusToken] = useState(0);
@@ -2310,7 +2307,6 @@ function WorkspaceTerminal({
     setShellLauncherAgentId(SHELL_LAUNCHER_MODE_TERMINAL);
     setShellLauncherDraft("");
     setShellLauncherError("");
-    setShellLauncherMenuOpen(false);
     setShellLauncherSending(false);
     setShellLauncherLaunchedAgentId("");
   }, [isGenericTerminal]);
@@ -3265,7 +3261,6 @@ function WorkspaceTerminal({
       setShellLauncherLaunchedAgentId("");
     }
     setShellLauncherAgentId(nextId);
-    setShellLauncherMenuOpen(false);
     if (nextId !== SHELL_LAUNCHER_MODE_TERMINAL) {
       terminalUiViewActiveRef.current = true;
       setTerminalUiViewActive(true);
@@ -5242,7 +5237,11 @@ function WorkspaceTerminal({
         attachDeferredWebglRef.current?.("terminal_activated");
         // Resizes are skipped while a pane's surface is hidden; activation is
         // the reveal path, so reconcile any size drift now.
-        resizeControllerRef.current?.schedule("terminal_activated", 0);
+        resizeControllerRef.current?.schedule("terminal_activated", 0, {
+          force: true,
+          forceNative: true,
+          nativeDelayMs: 0,
+        });
       }
       return undefined;
     }
@@ -5314,41 +5313,6 @@ function WorkspaceTerminal({
       document.removeEventListener("keydown", handleRestartMenuKeyDown, true);
     };
   }, [restartRoleMenuOpen]);
-
-  useEffect(() => {
-    if (!shellLauncherMenuOpen) {
-      return undefined;
-    }
-
-    const handleShellLauncherMenuPointerDown = (event) => {
-      const menu = shellLauncherMenuRef.current;
-
-      if (
-        menu
-        && typeof Node !== "undefined"
-        && event.target instanceof Node
-        && menu.contains(event.target)
-      ) {
-        return;
-      }
-
-      setShellLauncherMenuOpen(false);
-    };
-
-    const handleShellLauncherMenuKeyDown = (event) => {
-      if (event.key === "Escape") {
-        setShellLauncherMenuOpen(false);
-      }
-    };
-
-    document.addEventListener("pointerdown", handleShellLauncherMenuPointerDown, true);
-    document.addEventListener("keydown", handleShellLauncherMenuKeyDown, true);
-
-    return () => {
-      document.removeEventListener("pointerdown", handleShellLauncherMenuPointerDown, true);
-      document.removeEventListener("keydown", handleShellLauncherMenuKeyDown, true);
-    };
-  }, [shellLauncherMenuOpen]);
 
   const materializeFreshThreadForTerminalSession = useCallback((target = {}) => {
     const targetWorkspaceId = String(target.workspaceId || workspace?.id || "").trim();
@@ -7249,7 +7213,11 @@ function WorkspaceTerminal({
         // that rebuilds the texture atlas and TIOCSWINSZ-nudges the PTY into a
         // repaint. Refresh afterwards to flush whatever lands in the buffer.
         if (!previousProbe) {
-          void resizeController?.resizeNow("blank_startup_probe", { force: true });
+          void resizeController?.resizeNow("blank_startup_probe", {
+            force: true,
+            forceNative: true,
+            nativeDelayMs: 0,
+          });
           refreshTerminalRenderer("blank_startup_probe", {
             outputBytes,
             outputChunks,
@@ -7263,7 +7231,11 @@ function WorkspaceTerminal({
           return;
         }
 
-        void resizeController?.resizeNow("blank_startup_watch", { force: true });
+        void resizeController?.resizeNow("blank_startup_watch", {
+          force: true,
+          forceNative: true,
+          nativeDelayMs: 0,
+        });
         refreshTerminalRenderer("blank_startup_watch", {
           outputBytes,
           outputChunks,
@@ -10389,7 +10361,11 @@ function WorkspaceTerminal({
           // Best effort: the DOM renderer has no atlas and older builds may not
           // expose this; the forced resize/refresh below still recovers paint.
         }
-        void resizeController?.resizeNow(reason, { force: true });
+        void resizeController?.resizeNow(reason, {
+          force: true,
+          forceNative: true,
+          nativeDelayMs: 0,
+        });
         refreshTerminalRenderer(reason);
         if (terminalActiveRef.current === true) {
           attachDeferredWebglRef.current?.(reason);
@@ -13288,7 +13264,12 @@ function WorkspaceTerminal({
 
           setPaneStage("running", "Agent Running", "Terminal is connected.");
           revealPrewarmPtyOutput(`${reason}_agent_started`, TERMINAL_PREWARM_PTY_REVEAL_SETTLE_MS);
-          resizeController?.resizeNow("agent_launch_done");
+          resizeController?.resizeNow("agent_launch_done", {
+            force: true,
+            forceNative: true,
+            nativeDelayMs: 0,
+          });
+          refreshTerminalRenderer("agent_launch_done");
           scheduleBlankStartupWatch("agent_launch_done");
           scheduleCodingAgentInputReady(`${reason}_agent_started`);
         };
@@ -13524,6 +13505,7 @@ function WorkspaceTerminal({
             resizeController?.resizeNow("generic_shell_open_settled", {
               force: true,
               forceNative: true,
+              nativeDelayMs: 0,
             });
           }
           scheduleCodingAgentInputReady("terminal_open_done");
@@ -13552,7 +13534,12 @@ function WorkspaceTerminal({
           threadId: startupThreadId,
           workspaceId: workspace?.id || "",
         });
-        resizeController?.resizeNow("terminal_open_done");
+        resizeController?.resizeNow("terminal_open_done", {
+          force: true,
+          forceNative: true,
+          nativeDelayMs: 0,
+        });
+        refreshTerminalRenderer("terminal_open_done");
         scheduleInitialHeadlessOutputReplay("terminal_open_done");
 
         scheduleWebglAttach("idle", TERMINAL_WEBGL_IDLE_DELAY_MS);
@@ -16018,90 +16005,6 @@ function WorkspaceTerminal({
                 {terminalRailAgentLabel}
               </TerminalAgentLabel>
             </>
-          )}
-          {isGenericTerminal && !terminalChromeDocked && (
-            <TerminalRestartMenu
-              data-terminal-control="true"
-              ref={shellLauncherMenuRef}
-              style={{ marginLeft: 3 }}
-            >
-              <TerminalRestartButton
-                aria-expanded={shellLauncherMenuOpen ? "true" : "false"}
-                aria-haspopup="menu"
-                aria-label="Choose terminal mode"
-                disabled={terminalClosed || terminalClosing}
-                onClick={() => setShellLauncherMenuOpen((isOpen) => !isOpen)}
-                style={{
-                  width: "auto",
-                  minWidth: 104,
-                  height: 22,
-                  gap: 6,
-                  padding: "0 8px",
-                  border: "1px solid rgba(148, 163, 184, 0.22)",
-                  borderRadius: 999,
-                  background: shellLauncherSelectedAgentId === SHELL_LAUNCHER_MODE_TERMINAL
-                    ? "rgba(148, 163, 184, 0.1)"
-                    : "rgba(242, 194, 78, 0.12)",
-                }}
-                title={`Terminal mode: ${shellLauncherSelectedOption.label}`}
-                type="button"
-              >
-                <span
-                  style={{
-                    display: "inline-block",
-                    maxWidth: 92,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {shellLauncherSelectedOption.label}
-                </span>
-                <FileChevronIcon
-                  aria-hidden="true"
-                  style={{
-                    width: 14,
-                    height: 14,
-                    transform: shellLauncherMenuOpen ? "rotate(-90deg)" : "rotate(90deg)",
-                  }}
-                />
-              </TerminalRestartButton>
-              <TerminalRestartDropdown
-                data-open={shellLauncherMenuOpen ? "true" : "false"}
-                role="menu"
-                style={{ left: 0, right: "auto", minWidth: 190 }}
-              >
-                {SHELL_LAUNCHER_AGENT_OPTIONS.map((option) => {
-                  const optionSelected = option.id === shellLauncherSelectedAgentId;
-                  const optionReady = shellLauncherAgentReady(agentStatuses, option.id);
-                  return (
-                    <TerminalRestartOption
-                      data-role={option.id}
-                      data-selected={optionSelected ? "true" : "false"}
-                      disabled={!optionReady}
-                      key={option.id}
-                      onClick={() => chooseShellLauncherAgent(option.id)}
-                      role="menuitem"
-                      title={optionReady ? option.label : `${option.label}: ${shellLauncherAgentStatusLabel(agentStatuses, option.id)}`}
-                      type="button"
-                    >
-                      <strong>{option.label}</strong>
-                      <span
-                        style={{
-                          flex: "0 0 auto",
-                          color: "var(--forge-text-muted)",
-                          fontSize: 10,
-                          fontWeight: 800,
-                          lineHeight: 1,
-                        }}
-                      >
-                        {shellLauncherAgentStatusLabel(agentStatuses, option.id)}
-                      </span>
-                    </TerminalRestartOption>
-                  );
-                })}
-              </TerminalRestartDropdown>
-            </TerminalRestartMenu>
           )}
           {!terminalChromeDocked && (
             <>

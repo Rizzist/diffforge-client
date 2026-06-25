@@ -4034,9 +4034,7 @@ export const AppGlobalScriptButton = styled.button`
   border: 1px solid color-mix(in srgb, var(--script-button-color, #ffffff) 18%, transparent);
   border-radius: 7px;
   color: var(--script-button-color, #ffffff);
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.025), rgba(0, 0, 0, 0.08)),
-    var(--script-button-bg, #07101d);
+  background: var(--script-button-bg, #07101d);
   box-shadow: none;
   font-size: 11px;
   font-weight: 600;
@@ -4082,9 +4080,7 @@ export const AppGlobalScriptButton = styled.button`
   &:hover,
   &:focus-visible {
     border-color: color-mix(in srgb, var(--script-button-color, #ffffff) 42%, transparent);
-    background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(0, 0, 0, 0.04)),
-      color-mix(in srgb, var(--script-button-bg, #07101d) 88%, var(--script-button-color, #ffffff));
+    background: color-mix(in srgb, var(--script-button-bg, #07101d) 88%, var(--script-button-color, #ffffff));
     outline: none;
   }
 
@@ -4466,6 +4462,86 @@ export const LoopspaceGraphEdges = styled.svg`
   }
 `;
 
+const loopspaceRuntimeSignalPulse = keyframes`
+  0%, 100% {
+    box-shadow:
+      0 0 0 3px color-mix(in srgb, var(--loopspace-signal-color, #86efac) 18%, transparent),
+      0 0 18px color-mix(in srgb, var(--loopspace-signal-color, #86efac) 34%, transparent);
+  }
+  50% {
+    box-shadow:
+      0 0 0 6px color-mix(in srgb, var(--loopspace-signal-color, #86efac) 10%, transparent),
+      0 0 28px color-mix(in srgb, var(--loopspace-signal-color, #86efac) 48%, transparent);
+  }
+`;
+
+export const LoopspaceRuntimeSignalLayer = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 6;
+  overflow: visible;
+  pointer-events: none;
+`;
+
+export const LoopspaceRuntimeSignalDot = styled.div`
+  --loopspace-signal-color: #86efac;
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(2, 6, 23, 0.94);
+  border-radius: 999px;
+  background: var(--loopspace-signal-color);
+  pointer-events: none;
+  transform: translate3d(
+    calc(var(--loopspace-signal-x, 0px) - 50%),
+    calc(var(--loopspace-signal-y, 0px) - 50%),
+    0
+  );
+  transition:
+    transform 90ms linear,
+    opacity 180ms ease;
+  animation: ${loopspaceRuntimeSignalPulse} 1.25s ease-in-out infinite;
+
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 4px;
+    border-radius: inherit;
+    background: rgba(255, 255, 255, 0.62);
+  }
+
+  &[data-tone="active"] {
+    --loopspace-signal-color: #67e8f9;
+  }
+
+  &[data-tone="queued"] {
+    --loopspace-signal-color: #facc15;
+  }
+
+  &[data-tone="paused"] {
+    --loopspace-signal-color: #c084fc;
+    animation-duration: 1.9s;
+  }
+
+  &[data-tone="error"] {
+    --loopspace-signal-color: #fb7185;
+    animation-duration: 900ms;
+  }
+
+  &[data-tone="good"] {
+    --loopspace-signal-color: #34d399;
+    opacity: 0.72;
+    animation: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+    transition: none;
+  }
+`;
+
 const loopspaceActiveEdge = keyframes`
   from { stroke-dashoffset: 18; }
   to { stroke-dashoffset: 0; }
@@ -4539,7 +4615,7 @@ export const LoopspaceGraphNode = styled.div`
   &[data-kind="cron"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="webhook"] { --loop-node-accent: 45, 212, 191; }
   &[data-kind="manual"] { --loop-node-accent: 251, 191, 36; }
-  &[data-kind="send_message"] { --loop-node-accent: 45, 212, 191; }
+  &[data-kind="send_message"] { --loop-node-accent: 148, 163, 184; }
   &[data-kind="document_read"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="document_write"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="asset_read"] { --loop-node-accent: 45, 212, 191; }
@@ -4593,6 +4669,14 @@ export const LoopspaceGraphNode = styled.div`
     box-shadow:
       0 0 0 1px rgba(134, 239, 172, 0.18),
       0 0 26px rgba(134, 239, 172, 0.18),
+      0 18px 48px rgba(0, 0, 0, 0.42);
+  }
+
+  &[data-kind="send_message"][data-runtime] {
+    border-color: rgba(148, 163, 184, 0.58);
+    box-shadow:
+      0 0 0 1px rgba(148, 163, 184, 0.12),
+      0 0 24px rgba(148, 163, 184, 0.12),
       0 18px 48px rgba(0, 0, 0, 0.42);
   }
 
@@ -4920,6 +5004,136 @@ export const LoopspaceGraphNodeDeviceDot = styled.i`
   }
 `;
 
+export const LoopspaceGraphNodeStateBadge = styled.div`
+  position: absolute;
+  top: 48px;
+  right: calc(var(--loopspace-output-gutter, 92px) + 10px);
+  z-index: 5;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  max-width: 190px;
+  min-height: 26px;
+  padding: 4px 7px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 8px;
+  color: rgba(226, 232, 240, 0.92);
+  background:
+    linear-gradient(135deg, rgba(148, 163, 184, 0.14), rgba(255, 255, 255, 0.035)),
+    rgba(5, 8, 12, 0.82);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 255, 255, 0.025),
+    0 10px 22px rgba(0, 0, 0, 0.28);
+  font-size: 10px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  pointer-events: auto;
+  text-transform: uppercase;
+
+  &::before {
+    content: "";
+    flex: none;
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.9);
+    box-shadow: 0 0 0 3px rgba(148, 163, 184, 0.14);
+  }
+
+  > span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &[data-tone="queued"] {
+    border-color: rgba(250, 204, 21, 0.34);
+    color: rgba(254, 240, 138, 0.94);
+  }
+
+  &[data-tone="queued"]::before {
+    background: #facc15;
+    box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.15);
+  }
+
+  &[data-tone="active"] {
+    border-color: rgba(125, 211, 252, 0.38);
+    color: rgba(186, 230, 253, 0.94);
+  }
+
+  &[data-tone="active"]::before {
+    border: 2px solid rgba(125, 211, 252, 0.95);
+    border-top-color: transparent;
+    background: transparent;
+    box-shadow: 0 0 0 3px rgba(125, 211, 252, 0.12);
+    animation: loopspace-message-step-spin 780ms linear infinite;
+  }
+
+  &[data-tone="good"] {
+    border-color: rgba(134, 239, 172, 0.36);
+    color: rgba(187, 247, 208, 0.95);
+  }
+
+  &[data-tone="good"]::before {
+    background: #34d399;
+    box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.16);
+  }
+
+  &[data-tone="error"] {
+    border-color: rgba(251, 113, 133, 0.38);
+    color: rgba(254, 202, 202, 0.95);
+  }
+
+  &[data-tone="error"]::before {
+    background: #fb7185;
+    box-shadow: 0 0 0 3px rgba(251, 113, 133, 0.15);
+  }
+
+  &[data-tone="paused"] {
+    border-color: rgba(216, 180, 254, 0.38);
+    color: rgba(233, 213, 255, 0.95);
+  }
+
+  &[data-tone="paused"]::before {
+    background: #c084fc;
+    box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.16);
+  }
+`;
+
+export const LoopspaceGraphNodeResumeButton = styled.button`
+  display: inline-grid;
+  min-width: 54px;
+  height: 20px;
+  place-items: center;
+  margin-left: 2px;
+  padding: 0 7px;
+  border: 1px solid rgba(216, 180, 254, 0.42);
+  border-radius: 6px;
+  color: rgba(255, 255, 255, 0.94);
+  background: rgba(88, 28, 135, 0.5);
+  cursor: pointer;
+  font: inherit;
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  pointer-events: auto;
+  text-transform: uppercase;
+  transition: border-color 0.12s ease, box-shadow 0.12s ease, transform 0.12s ease;
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    outline: none;
+    border-color: rgba(233, 213, 255, 0.78);
+    box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.14);
+    transform: translateY(-1px);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.52;
+  }
+`;
+
 export const LoopspaceGraphNodeTimer = styled.span`
   display: inline-flex;
   align-items: center;
@@ -5147,7 +5361,7 @@ export const LoopspaceGraphDocumentPicker = styled.div`
   pointer-events: auto;
 
   &[data-mode="write"] {
-    grid-template-rows: auto auto minmax(0, 1fr) auto;
+    grid-template-rows: auto auto auto auto minmax(0, 1fr);
   }
 `;
 
@@ -5174,6 +5388,56 @@ export const LoopspaceGraphDocumentSearch = styled.input`
 
   &::placeholder {
     color: rgba(248, 250, 252, 0.36);
+  }
+`;
+
+export const LoopspaceGraphDocumentOperationSelect = styled.select`
+  width: 100%;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid rgba(var(--loop-node-accent), 0.26);
+  border-radius: 7px;
+  color: #f8fafc;
+  background: rgba(2, 6, 8, 0.74);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 780;
+  letter-spacing: 0;
+  outline: none;
+
+  &:focus {
+    border-color: rgba(var(--loop-node-accent), 0.62);
+    box-shadow: 0 0 0 2px rgba(var(--loop-node-accent), 0.12);
+  }
+`;
+
+export const LoopspaceGraphDocumentTemplateInput = styled.textarea`
+  width: 100%;
+  min-width: 0;
+  min-height: 42px;
+  max-height: 88px;
+  padding: 6px 8px;
+  border: 1px solid rgba(var(--loop-node-accent), 0.24);
+  border-radius: 7px;
+  color: #f8fafc;
+  background: rgba(2, 6, 8, 0.74);
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 690;
+  line-height: 1.25;
+  letter-spacing: 0;
+  outline: none;
+  resize: vertical;
+  user-select: text;
+  -webkit-user-select: text;
+
+  &:focus {
+    border-color: rgba(var(--loop-node-accent), 0.62);
+    box-shadow: 0 0 0 2px rgba(var(--loop-node-accent), 0.12);
+  }
+
+  &::placeholder {
+    color: rgba(248, 250, 252, 0.34);
   }
 `;
 
@@ -5981,11 +6245,23 @@ export const LoopspaceGraphMessageSettingsSelect = styled.select`
   border: 1px solid rgba(var(--loop-node-accent), 0.24);
   border-radius: 7px;
   color: #f8fafc;
-  background: rgba(2, 6, 8, 0.78);
+  background-color: rgba(2, 6, 8, 0.78);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 8px center;
+  background-size: 13px 13px;
+  color-scheme: dark;
   font: inherit;
   font-size: 10px;
   font-weight: 820;
   outline: none;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+
+  &::-ms-expand {
+    display: none;
+  }
 
   &:focus {
     border-color: rgba(var(--loop-node-accent), 0.6);
@@ -6389,6 +6665,49 @@ export const LoopspaceGraphZoomReadout = styled.span`
   letter-spacing: 0;
 `;
 
+export const LoopspaceGraphSaveBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 24px;
+  padding: 0 8px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 7px;
+  color: rgba(226, 232, 240, 0.72);
+  background: rgba(15, 23, 42, 0.56);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  span {
+    width: 6px;
+    height: 6px;
+    border-radius: 999px;
+    background: currentColor;
+    box-shadow: 0 0 0 3px rgba(226, 232, 240, 0.06);
+  }
+
+  &[data-state="saving"] {
+    border-color: rgba(125, 211, 252, 0.24);
+    color: rgba(186, 230, 253, 0.88);
+    background: rgba(8, 47, 73, 0.42);
+  }
+
+  &[data-state="queued"] {
+    border-color: rgba(253, 224, 71, 0.24);
+    color: rgba(254, 240, 138, 0.88);
+    background: rgba(113, 63, 18, 0.36);
+  }
+
+  &[data-state="error"] {
+    border-color: rgba(252, 165, 165, 0.3);
+    color: rgba(254, 202, 202, 0.92);
+    background: rgba(127, 29, 29, 0.4);
+  }
+`;
+
 export const LoopspaceGraphNavHud = styled.div`
   position: absolute;
   right: 14px;
@@ -6561,7 +6880,7 @@ export const LoopspaceGraphPaletteCard = styled.div`
   user-select: none;
 
   &[data-kind="send_message"] {
-    --loop-palette-accent: 45, 212, 191;
+    --loop-palette-accent: 148, 163, 184;
   }
 
   &[data-kind="device"] {
@@ -7070,6 +7389,10 @@ export const LoopspaceRuntimePanelEventRow = styled.div`
     border-left-color: rgba(250, 204, 21, 0.74);
   }
 
+  &[data-tone="paused"] {
+    border-left-color: rgba(192, 132, 252, 0.78);
+  }
+
   &[data-selected="true"] {
     background: rgba(96, 165, 250, 0.1);
   }
@@ -7266,6 +7589,13 @@ export const LoopspaceRuntimePanelResumeButton = styled.button`
   &:disabled {
     cursor: default;
     opacity: 0.42;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible {
+    border-color: rgba(255, 231, 161, 0.55);
+    background: rgba(255, 209, 102, 0.18);
+    outline: none;
   }
 `;
 
@@ -13980,12 +14310,12 @@ export const AudioBarRecordButton = styled.button`
   align-items: center;
   justify-content: center;
   padding: 0;
-  border: 1px solid rgba(230, 236, 245, 0.18);
+  border: 1px solid var(--forge-border-strong);
   border-radius: 50%;
   background:
     radial-gradient(circle at 30% 18%, rgba(var(--forge-accent-soft-rgb), 0.14), transparent 55%),
-    linear-gradient(180deg, rgba(37, 42, 49, 0.97), rgba(12, 15, 19, 0.98));
-  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.42);
+    var(--forge-surface-control);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.32);
   cursor: pointer;
   transition: transform 130ms ease, border-color 130ms ease;
 
@@ -17425,14 +17755,14 @@ export const WorkspaceSettingsInput = styled(SetupInput)`
 export const WorkspaceSettingsSelect = styled(WorkspaceSettingsInput).attrs({ as: "select" })`
   min-height: 40px;
   padding: 0 38px 0 12px;
-  border-color: rgba(125, 160, 205, 0.24);
+  border-color: var(--forge-border-strong);
   color: #f4f7fa;
-  background:
-    linear-gradient(180deg, rgba(255, 255, 255, 0.065), rgba(255, 255, 255, 0.016)),
-    rgba(12, 17, 24, 0.96);
-  box-shadow:
-    0 10px 24px rgba(0, 0, 0, 0.18),
-    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+  background-color: rgba(13, 17, 23, 0.92);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+  background-size: 16px 16px;
+  box-shadow: none;
   color-scheme: dark;
   cursor: pointer;
   font-weight: 720;
@@ -17452,22 +17782,14 @@ export const WorkspaceSettingsSelect = styled(WorkspaceSettingsInput).attrs({ as
   }
 
   &:hover {
-    border-color: rgba(125, 160, 205, 0.38);
-    background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.075), rgba(255, 255, 255, 0.02)),
-      rgba(16, 22, 31, 0.98);
-    box-shadow:
-      0 12px 28px rgba(0, 0, 0, 0.22),
-      inset 0 1px 0 rgba(255, 255, 255, 0.09);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
+    background-color: rgba(16, 22, 31, 0.98);
   }
 
   &:focus {
-    border-color: rgba(125, 160, 205, 0.62);
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.44);
     outline: none;
-    box-shadow:
-      0 0 0 3px rgba(125, 160, 205, 0.14),
-      0 12px 28px rgba(0, 0, 0, 0.22),
-      inset 0 1px 0 rgba(255, 255, 255, 0.09);
+    box-shadow: 0 0 0 3px rgba(var(--forge-accent-rgb), 0.12);
   }
 
   option,
@@ -17484,31 +17806,20 @@ export const WorkspaceSettingsSelect = styled(WorkspaceSettingsInput).attrs({ as
   html[data-forge-theme="light"] & {
     border-color: rgba(0, 0, 0, 0.13);
     color: #1d1d1f;
-    background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(250, 250, 252, 0.96)),
-      #ffffff;
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.06),
-      inset 0 1px 0 rgba(255, 255, 255, 0.98);
+    background-color: #ffffff;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%230066cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
+    box-shadow: none;
     color-scheme: light;
   }
 
   html[data-forge-theme="light"] &:hover {
     border-color: rgba(0, 102, 204, 0.28);
-    background:
-      linear-gradient(180deg, rgba(255, 255, 255, 1), rgba(245, 245, 247, 0.98)),
-      #fafafc;
-    box-shadow:
-      0 2px 6px rgba(0, 0, 0, 0.08),
-      inset 0 1px 0 rgba(255, 255, 255, 1);
+    background-color: #fafafc;
   }
 
   html[data-forge-theme="light"] &:focus {
     border-color: var(--forge-blue-soft);
-    box-shadow:
-      0 0 0 3px rgba(0, 113, 227, 0.16),
-      0 2px 6px rgba(0, 0, 0, 0.08),
-      inset 0 1px 0 rgba(255, 255, 255, 1);
+    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.16);
   }
 
   html[data-forge-theme="light"] option,

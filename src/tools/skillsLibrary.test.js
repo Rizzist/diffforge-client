@@ -6,6 +6,7 @@ import {
   accountDocumentRequestFromSkill,
   accountDocumentUnitsFromPayload,
   mergeSkillUnits,
+  normalizedDocumentKind,
   skillSlug,
   skillsFromUnits,
   skillsToSkillUnits,
@@ -42,6 +43,21 @@ test("skills normalize from unit metadata", () => {
   assert.equal(skills[0].syncStatus, "local_pending");
 });
 
+test("legacy instruction document metadata normalizes as document", () => {
+  assert.equal(normalizedDocumentKind("instruction"), "document");
+  assert.equal(normalizedDocumentKind("", "instructions"), "document");
+
+  const [unit] = skillsFromUnits([{
+    content_md: "Legacy instructions",
+    doc_id: "legacy_instruction",
+    document_kind: "instruction",
+    title: "Legacy Instruction",
+  }]);
+
+  assert.equal(unit.documentKind, "document");
+  assert.equal(unit.source, "document");
+});
+
 test("document save requests mark inline content as intentional", () => {
   const request = accountDocumentRequestFromSkill({
     content: "",
@@ -51,6 +67,26 @@ test("document save requests mark inline content as intentional", () => {
 
   assert.equal(request.document.has_content_payload, true);
   assert.equal(request.document.content_md, "");
+});
+
+test("document save requests can explicitly allow local draft conflicts", () => {
+  const defaultRequest = accountDocumentRequestFromSkill({
+    content: "Draft",
+    draftPath: "/tmp/Draft.md",
+    id: "draft",
+    title: "Draft",
+  }, { local_only: true });
+  const conflictRequest = accountDocumentRequestFromSkill({
+    content: "Draft",
+    draftPath: "/tmp/Draft.md",
+    id: "draft",
+    title: "Draft",
+  }, { allow_conflict: true, local_only: true });
+
+  assert.equal(defaultRequest.allow_conflict, undefined);
+  assert.equal(defaultRequest.local_only, true);
+  assert.equal(conflictRequest.allow_conflict, true);
+  assert.equal(conflictRequest.local_only, true);
 });
 
 test("document payload parsing preserves empty local content when projection follows", () => {

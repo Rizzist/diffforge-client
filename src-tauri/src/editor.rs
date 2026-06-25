@@ -15,7 +15,7 @@ use matroska_demuxer::{Frame as MkvFrame, MatroskaFile, TrackType};
 use shiguredo_libvpx::{Decoder as VpxDecoder, DecoderCodec, DecoderConfig};
 use yuvutils_rs::{yuv420_to_rgba, YuvPlanarImage, YuvRange, YuvStandardMatrix};
 
-const EDITOR_SCHEMA_VERSION: u32 = 2;
+const EDITOR_SCHEMA_VERSION: u32 = 3;
 const EDITOR_THUMBNAIL_MAX_DIM: u32 = 320;
 const EDITOR_MIN_CLIP_MS: u64 = 200;
 const EDITOR_FRAME_CACHE_CAP: usize = 32;
@@ -38,6 +38,95 @@ fn editor_default_height() -> u32 {
 }
 fn editor_default_gain() -> f64 {
     1.0
+}
+
+/// The default two-lane layout for a brand-new (or legacy v2) project: one video
+/// track on top, one audio track below. Track ids "video"/"audio" match the bare
+/// track tags legacy clips carried, so migration is a no-op for existing clips.
+fn editor_default_tracks() -> Vec<EditorTrack> {
+    vec![
+        EditorTrack {
+            id: "video".to_string(),
+            kind: "video".to_string(),
+            name: "Video".to_string(),
+            muted: false,
+            gain: 1.0,
+        },
+        EditorTrack {
+            id: "audio".to_string(),
+            kind: "audio".to_string(),
+            name: "Audio".to_string(),
+            muted: false,
+            gain: 1.0,
+        },
+    ]
+}
+
+/// A generated lane name for a new track of `kind` ("Video", "Video 2", ...).
+fn editor_track_default_name(tracks: &[EditorTrack], kind: &str) -> String {
+    let count = tracks.iter().filter(|t| t.kind == kind).count();
+    let base = if kind == "audio" { "Audio" } else { "Video" };
+    if count == 0 {
+        base.to_string()
+    } else {
+        format!("{base} {}", count + 1)
+    }
+}
+
+/// Guarantee a usable track list: default lanes when empty, a synthesized track for
+/// any clip referencing an unknown track id (legacy "video"/"audio" tags), and at
+/// least one video + one audio lane so the UI always has both.
+fn editor_normalize_tracks(doc: &mut EditorTimelineDoc) {
+    if doc.tracks.is_empty() {
+        doc.tracks = editor_default_tracks();
+    }
+    let referenced: Vec<(String, String)> = doc
+        .clips
+        .iter()
+        .filter(|c| !doc.tracks.iter().any(|t| t.id == c.track))
+        .map(|c| {
+            let kind = if c.track == "audio" || c.source.kind == "audio" {
+                "audio".to_string()
+            } else {
+                "video".to_string()
+            };
+            (c.track.clone(), kind)
+        })
+        .collect();
+    for (id, kind) in referenced {
+        if doc.tracks.iter().any(|t| t.id == id) {
+            continue;
+        }
+        let name = editor_track_default_name(&doc.tracks, &kind);
+        doc.tracks.push(EditorTrack {
+            id,
+            kind,
+            name,
+            muted: false,
+            gain: 1.0,
+        });
+    }
+    if !doc.tracks.iter().any(|t| t.kind == "video") {
+        doc.tracks.insert(
+            0,
+            EditorTrack {
+                id: "video".to_string(),
+                kind: "video".to_string(),
+                name: "Video".to_string(),
+                muted: false,
+                gain: 1.0,
+            },
+        );
+    }
+    if !doc.tracks.iter().any(|t| t.kind == "audio") {
+        doc.tracks.push(EditorTrack {
+            id: "audio".to_string(),
+            kind: "audio".to_string(),
+            name: "Audio".to_string(),
+            muted: false,
+            gain: 1.0,
+        });
+    }
 }
 
 fn editor_default_timeline() -> Value {
@@ -98,18 +187,49 @@ struct EditorClip {
     gain: f64,
 }
 
+/// A timeline track (lane). The vector order in the doc IS the visual top-to-bottom
+/// lane order. For video compositing, tracks earlier in the list render ON TOP of
+/// later ones; audio tracks are all summed.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EditorTrack {
+    id: String,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    muted: bool,
+    #[serde(default = "editor_default_gain")]
+    gain: f64,
+}
+
 /// The canonical, persisted timeline document. `revision` increments on every
 /// committed mutation (drives change events / undo, no concurrency enforcement
-/// in this step).
-#[derive(Serialize, Deserialize, Clone, Default)]
+/// in this step). `tracks` is the ordered lane list; each clip's `track` is a
+/// track id.
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct EditorTimelineDoc {
     #[serde(default)]
     revision: u64,
     #[serde(default)]
     settings: EditorTimelineSettings,
+    #[serde(default = "editor_default_tracks")]
+    tracks: Vec<EditorTrack>,
     #[serde(default)]
     clips: Vec<EditorClip>,
+}
+
+impl Default for EditorTimelineDoc {
+    fn default() -> Self {
+        Self {
+            revision: 0,
+            settings: EditorTimelineSettings::default(),
+            tracks: editor_default_tracks(),
+            clips: Vec::new(),
+        }
+    }
 }
 
 /// Returned by every validated write (apply_ops / save_timeline): the new
@@ -441,11 +561,24 @@ fn editor_doc_from_value(timeline: &Value, dir: &Path) -> EditorTimelineDoc {
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    EditorTimelineDoc {
+    let tracks = timeline
+        .get("tracks")
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| serde_json::from_value::<EditorTrack>(v.clone()).ok())
+                .filter(|t| !t.id.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut doc = EditorTimelineDoc {
         revision,
         settings,
+        tracks,
         clips,
-    }
+    };
+    editor_normalize_tracks(&mut doc);
+    doc
 }
 
 fn editor_doc_to_value(doc: &EditorTimelineDoc) -> Value {
@@ -476,6 +609,7 @@ fn editor_doc_to_enriched(doc: &EditorTimelineDoc, dir: &Path) -> Value {
     json!({
         "revision": doc.revision,
         "settings": serde_json::to_value(&doc.settings).unwrap_or_else(|_| json!({})),
+        "tracks": serde_json::to_value(&doc.tracks).unwrap_or_else(|_| json!([])),
         "clips": doc.clips.iter().map(|c| editor_clip_to_enriched(c, dir)).collect::<Vec<_>>(),
     })
 }
@@ -484,13 +618,22 @@ fn editor_doc_to_enriched(doc: &EditorTimelineDoc, dir: &Path) -> Value {
 /// media, overlaps, out > source duration).
 fn editor_validate_doc(doc: &EditorTimelineDoc, dir: &Path) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
+    let mut track_ids = std::collections::HashSet::new();
+    for track in &doc.tracks {
+        if track.id.is_empty() {
+            return Err("Track with empty id".to_string());
+        }
+        if !track_ids.insert(track.id.clone()) {
+            return Err(format!("Duplicate track id: {}", track.id));
+        }
+    }
     let mut ids = std::collections::HashSet::new();
     for clip in &doc.clips {
         if !ids.insert(clip.id.clone()) {
             return Err(format!("Duplicate clip id: {}", clip.id));
         }
-        if clip.track != "video" && clip.track != "audio" {
-            return Err(format!("Invalid track: {}", clip.track));
+        if !track_ids.contains(&clip.track) {
+            return Err(format!("Clip {} references unknown track {}", clip.id, clip.track));
         }
         if clip.in_ms >= clip.out_ms {
             return Err(format!("Clip {} has an empty or inverted range", clip.id));
@@ -508,16 +651,16 @@ fn editor_validate_doc(doc: &EditorTimelineDoc, dir: &Path) -> Result<Vec<String
             warnings.push(format!("Missing media for clip {}", clip.id));
         }
     }
-    for track in ["video", "audio"] {
+    for track in &doc.tracks {
         let mut ranges: Vec<(u64, u64)> = doc
             .clips
             .iter()
-            .filter(|c| c.track == track)
+            .filter(|c| c.track == track.id)
             .map(|c| (c.start_ms, c.start_ms + c.out_ms.saturating_sub(c.in_ms)))
             .collect();
         ranges.sort_by_key(|r| r.0);
         if ranges.windows(2).any(|w| w[1].0 < w[0].1) {
-            warnings.push(format!("Overlapping clips on the {track} track"));
+            warnings.push(format!("Overlapping clips on track {}", track.name));
         }
     }
     Ok(warnings)
@@ -604,7 +747,20 @@ fn editor_apply_one_op(doc: &mut EditorTimelineDoc, op: &Value, dir: &Path) -> R
         "place_clip" => {
             let media_path = editor_json_str(op, "mediaPath")
                 .ok_or_else(|| "place_clip missing mediaPath".to_string())?;
-            let track = editor_json_str(op, "track").unwrap_or_else(|| "video".to_string());
+            let kind = editor_json_str(op, "kind")
+                .filter(|k| !k.is_empty())
+                .unwrap_or_else(|| "video".to_string());
+            // Default to the first track of the matching kind when no track id is given.
+            let track = editor_json_str(op, "track")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    let want = if kind == "audio" { "audio" } else { "video" };
+                    doc.tracks
+                        .iter()
+                        .find(|t| t.kind == want)
+                        .map(|t| t.id.clone())
+                        .unwrap_or_else(|| want.to_string())
+                });
             let (media_ref, external) = editor_media_ref_for(&media_path, dir);
             let duration_ms = editor_json_u64(op, "durationMs");
             let in_ms = editor_json_u64(op, "inMs");
@@ -622,11 +778,11 @@ fn editor_apply_one_op(doc: &mut EditorTimelineDoc, op: &Value, dir: &Path) -> R
                 id: editor_json_str(op, "id")
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-                track: track.clone(),
+                track,
                 source: EditorClipSource {
                     media_ref,
                     external,
-                    kind: editor_json_str(op, "kind").unwrap_or(track),
+                    kind,
                     duration_ms,
                     has_audio: editor_json_bool(op, "hasAudio"),
                 },
@@ -641,10 +797,14 @@ fn editor_apply_one_op(doc: &mut EditorTimelineDoc, op: &Value, dir: &Path) -> R
                 .ok_or_else(|| "move_clip missing clipId".to_string())?;
             let start_ms = editor_json_u64(op, "startMs");
             let track = editor_json_str(op, "track");
+            let track_valid = track
+                .as_ref()
+                .map(|t| doc.tracks.iter().any(|tr| &tr.id == t))
+                .unwrap_or(false);
             if let Some(c) = doc.clips.iter_mut().find(|c| c.id == clip_id) {
                 c.start_ms = start_ms;
-                if let Some(t) = track {
-                    if t == "video" || t == "audio" {
+                if track_valid {
+                    if let Some(t) = track {
                         c.track = t;
                     }
                 }
@@ -714,6 +874,75 @@ fn editor_apply_one_op(doc: &mut EditorTimelineDoc, op: &Value, dir: &Path) -> R
                         clip.start_ms = clip.start_ms.saturating_sub(gap);
                     }
                 }
+            }
+        }
+        "add_track" => {
+            let kind = editor_json_str(op, "kind")
+                .filter(|k| k == "audio" || k == "video")
+                .unwrap_or_else(|| "video".to_string());
+            let id = editor_json_str(op, "id")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("{}-{}", kind, uuid::Uuid::new_v4().simple()));
+            if doc.tracks.iter().any(|t| t.id == id) {
+                return Err(format!("Track id already exists: {id}"));
+            }
+            let name = editor_json_str(op, "name")
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| editor_track_default_name(&doc.tracks, &kind));
+            // New video tracks go on top (index 0 → top lane / top layer); new audio
+            // tracks go to the bottom of the lane stack.
+            let insert_at = if kind == "video" { 0 } else { doc.tracks.len() };
+            doc.tracks.insert(
+                insert_at,
+                EditorTrack {
+                    id,
+                    kind,
+                    name,
+                    muted: false,
+                    gain: 1.0,
+                },
+            );
+        }
+        "remove_track" => {
+            let track_id = editor_json_str(op, "trackId")
+                .ok_or_else(|| "remove_track missing trackId".to_string())?;
+            doc.clips.retain(|c| c.track != track_id);
+            doc.tracks.retain(|t| t.id != track_id);
+            // Re-establish the video+audio invariant if a kind was emptied.
+            editor_normalize_tracks(doc);
+        }
+        "reorder_track" => {
+            let track_id = editor_json_str(op, "trackId")
+                .ok_or_else(|| "reorder_track missing trackId".to_string())?;
+            let to_index = editor_json_u64(op, "toIndex") as usize;
+            if let Some(pos) = doc.tracks.iter().position(|t| t.id == track_id) {
+                let track = doc.tracks.remove(pos);
+                let idx = to_index.min(doc.tracks.len());
+                doc.tracks.insert(idx, track);
+            }
+        }
+        "rename_track" => {
+            let track_id = editor_json_str(op, "trackId")
+                .ok_or_else(|| "rename_track missing trackId".to_string())?;
+            let name = editor_json_str(op, "name").unwrap_or_default();
+            if let Some(t) = doc.tracks.iter_mut().find(|t| t.id == track_id) {
+                t.name = name;
+            }
+        }
+        "set_track_mute" => {
+            let track_id = editor_json_str(op, "trackId")
+                .ok_or_else(|| "set_track_mute missing trackId".to_string())?;
+            let muted = editor_json_bool(op, "muted");
+            if let Some(t) = doc.tracks.iter_mut().find(|t| t.id == track_id) {
+                t.muted = muted;
+            }
+        }
+        "set_track_gain" => {
+            let track_id = editor_json_str(op, "trackId")
+                .ok_or_else(|| "set_track_gain missing trackId".to_string())?;
+            let gain = editor_json_f64(op, "gain", 1.0).clamp(0.0, 4.0);
+            if let Some(t) = doc.tracks.iter_mut().find(|t| t.id == track_id) {
+                t.gain = gain;
             }
         }
         other => return Err(format!("Unknown op: {other}")),
@@ -991,6 +1220,7 @@ fn editor_apply_ops(id: String, ops: Vec<Value>) -> Result<EditorApplyResult, St
     for op in &ops {
         editor_apply_one_op(&mut doc, op, &dir)?;
     }
+    editor_normalize_tracks(&mut doc);
     let warnings = editor_validate_doc(&doc, &dir)?;
     doc.revision = base_revision.wrapping_add(1);
     project.timeline = editor_doc_to_value(&doc);

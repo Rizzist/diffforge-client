@@ -2355,11 +2355,29 @@ function nudgeStripRailForClientX(rail, clientX) {
   }
 }
 
+function uniqueAssetPaths(...values) {
+  const paths = [];
+  values.flat().forEach((value) => {
+    const path = text(value);
+    if (path && !paths.includes(path)) paths.push(path);
+  });
+  return paths;
+}
+
 function moveStripItemToIndex(items, path, targetIndex) {
   const fromIndex = items.findIndex((item) => assetLocalPath(item) === path);
   if (fromIndex < 0) return items;
   const next = items.slice();
   const [item] = next.splice(fromIndex, 1);
+  next.splice(clampIndex(targetIndex, 0, next.length), 0, item);
+  return next;
+}
+
+function insertStripItemAtIndex(items, item, targetIndex, aliases = []) {
+  const paths = new Set(uniqueAssetPaths(assetLocalPath(item), aliases));
+  if (!paths.size) return items;
+  const withoutItem = items.filter((current) => !paths.has(assetLocalPath(current)));
+  const next = withoutItem.slice();
   next.splice(clampIndex(targetIndex, 0, next.length), 0, item);
   return next;
 }
@@ -2395,6 +2413,7 @@ function StripSnipTile({
   onReorderMove,
   onReorderStart,
   railRef,
+  stripOrigin,
 }) {
   const itemLocalPath = assetLocalPath(item);
   const [localPath, setLocalPath] = useState(itemLocalPath);
@@ -2481,15 +2500,22 @@ function StripSnipTile({
     setBusy(true);
     setLaunching(true);
     try {
-      await invoke("snipping_open_snip_float", { path: localPath, focused: false });
-      onOpened(localPath);
+      const result = await invoke("snipping_open_snip_float", {
+        path: localPath,
+        focused: false,
+        stripAfterPath: stripOrigin?.afterPath || "",
+        stripBeforePath: stripOrigin?.beforePath || "",
+        stripIndex: Number.isFinite(stripOrigin?.index) ? stripOrigin.index : null,
+      });
+      const openedPath = text(result?.path || result?.localPath || result?.local_path, localPath);
+      onOpened(openedPath, { item, origin: stripOrigin, originalPath: localPath });
     } catch (error) {
       if (mountedRef.current) setLaunching(false);
       showStatus(error?.message || String(error || "Unable to pin snip preview."));
     } finally {
       if (mountedRef.current) setBusy(false);
     }
-  }, [busy, localPath, onOpened, showStatus]);
+  }, [busy, item, localPath, onOpened, showStatus, stripOrigin]);
 
   const runAction = useCallback(async (action) => {
     if (!localPath || busy) return;
@@ -2556,10 +2582,13 @@ function StripSnipTile({
     if (!localPath || busy || event.button !== 0 || event.target.closest("button")) return;
     const rail = railRef?.current;
     const railRect = rail?.getBoundingClientRect();
+    const rect = event.currentTarget.getBoundingClientRect();
     event.preventDefault();
     event.currentTarget.setPointerCapture?.(event.pointerId);
     dragRef.current = {
       pointerId: event.pointerId,
+      grabOffsetX: event.clientX - rect.left,
+      grabOffsetY: event.clientY - rect.top,
       startX: event.clientX,
       startY: event.clientY,
       railBottom: railRect?.bottom ?? 0,
@@ -2622,12 +2651,23 @@ function StripSnipTile({
     setBusy(true);
     setLaunching(true);
     invoke("snipping_open_snip_float_for_drag", {
+      grabOffsetX: Math.max(0, Math.min(STRIP_TILE_WIDTH_PX, drag.grabOffsetX)),
+      grabOffsetY: Math.max(0, Math.min(STRIP_TILE_HEIGHT_PX, drag.grabOffsetY)),
       path: localPath,
-      x: event.screenX - 60,
-      y: event.screenY - 37,
+      stripAfterPath: stripOrigin?.afterPath || "",
+      stripBeforePath: stripOrigin?.beforePath || "",
+      stripIndex: Number.isFinite(stripOrigin?.index) ? stripOrigin.index : null,
+      x: event.screenX - Math.max(0, Math.min(STRIP_TILE_WIDTH_PX, drag.grabOffsetX)),
+      y: event.screenY - Math.max(0, Math.min(STRIP_TILE_HEIGHT_PX, drag.grabOffsetY)),
     })
-      .then(() => {
-        onOpened(localPath);
+      .then((result) => {
+        const openedPath = text(result?.path || result?.localPath || result?.local_path, localPath);
+        onOpened(openedPath, {
+          dragStarted: result?.dragStarted === true,
+          item,
+          origin: stripOrigin,
+          originalPath: localPath,
+        });
       })
       .catch((error) => {
         if (mountedRef.current) setLaunching(false);
@@ -2641,6 +2681,7 @@ function StripSnipTile({
       });
   }, [
     busy,
+    item,
     localPath,
     onDragActivityChange,
     onOpened,
@@ -2649,6 +2690,7 @@ function StripSnipTile({
     onReorderStart,
     railRef,
     showStatus,
+    stripOrigin,
   ]);
 
   if (!localPath) return null;
@@ -2782,8 +2824,11 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
   const dragGrabRef = useRef(0);
   const [viewport, setViewport] = useState({ scrollLeft: 0, width: 0 });
   const railRef = useRef(null);
+  const itemsRef = useRef([]);
   const orderRef = useRef([]);
   const pendingDockRef = useRef(null);
+  const floatedStripItemsRef = useRef(new Map());
+  const restoredStripItemsRef = useRef(new Map());
   const cursorRef = useRef(null);
   const hasMoreRef = useRef(true);
   const loadingPageRef = useRef(false);
@@ -2793,19 +2838,54 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
   const updateItemsFromServer = useCallback((incomingItems, { reset = false } = {}) => {
     setItems((current) => {
       const incoming = Array.isArray(incomingItems) ? incomingItems : [];
-      const base = reset ? [] : current;
+      const serverSeen = new Set();
+      incoming.forEach((item) => {
+        const path = assetLocalPath(item);
+        if (path) serverSeen.add(path);
+      });
+      const visibleIncoming = incoming.filter((item) => {
+        const path = assetLocalPath(item);
+        return !path || !floatedStripItemsRef.current.has(path);
+      });
+      const base = reset
+        ? []
+        : current.filter((item) => {
+            const path = assetLocalPath(item);
+            return !path || !floatedStripItemsRef.current.has(path);
+          });
       const seen = new Set(base.map((item) => assetLocalPath(item)).filter(Boolean));
       const merged = reset
-        ? incoming
+        ? visibleIncoming
         : [
             ...base,
-            ...incoming.filter((item) => {
+            ...visibleIncoming.filter((item) => {
               const path = assetLocalPath(item);
               if (!path || seen.has(path)) return false;
               seen.add(path);
               return true;
             }),
           ];
+      merged.forEach((item) => {
+        const path = assetLocalPath(item);
+        if (path) seen.add(path);
+      });
+      restoredStripItemsRef.current.forEach((restore, restoreKey) => {
+        const restorePaths = uniqueAssetPaths(
+          assetLocalPath(restore?.item),
+          restore?.path,
+          restore?.originalPath,
+          restore?.paths || [],
+        );
+        const path = restorePaths[0];
+        if (!path) return;
+        if (restorePaths.some((restorePath) => serverSeen.has(restorePath))) {
+          restoredStripItemsRef.current.delete(restoreKey);
+          return;
+        }
+        if (seen.has(path)) return;
+        merged.push(restore.item || { path, localPath: path, local_path: path });
+        seen.add(path);
+      });
       let nextItems = applyStripOrder(merged, orderRef.current);
       const pendingDock = pendingDockRef.current;
       if (pendingDock?.path && nextItems.some((item) => assetLocalPath(item) === pendingDock.path)) {
@@ -2886,6 +2966,10 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
   const refresh = useCallback((showLoading = false) => {
     loadPage({ reset: true, showLoading });
   }, [loadPage]);
+
+  useEffect(() => {
+    itemsRef.current = items;
+  }, [items]);
 
   const loadMoreIfNeeded = useCallback(() => {
     const rail = railRef.current;
@@ -3001,14 +3085,44 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
         return;
       }
       const rail = railRef.current;
+      const currentItems = itemsRef.current;
+      const currentOrder = currentItems.map((item) => assetLocalPath(item)).filter(Boolean);
       const clientX = Number(payload.clientX);
-      const index = Number.isFinite(clientX)
-        ? stripIndexForClientX(rail, clientX, items.length)
-        : items.length;
+      const payloadIndex = Number(payload.index ?? payload.stripIndex ?? payload.strip_index);
+      const orderWithoutPath = currentOrder.filter((orderedPath) => orderedPath !== path);
+      const beforePath = text(payload.beforePath || payload.before_path);
+      const afterPath = text(payload.afterPath || payload.after_path);
+      let index = Number.isFinite(payloadIndex)
+        ? clampIndex(Math.round(payloadIndex), 0, currentItems.length)
+        : Number.isFinite(clientX)
+        ? stripIndexForClientX(rail, clientX, currentItems.length)
+        : currentItems.length;
+      if (beforePath && orderWithoutPath.includes(beforePath)) {
+        index = orderWithoutPath.indexOf(beforePath) + 1;
+      } else if (afterPath && orderWithoutPath.includes(afterPath)) {
+        index = orderWithoutPath.indexOf(afterPath);
+      }
       if (Number.isFinite(clientX)) {
         nudgeStripRailForClientX(rail, clientX);
       }
       if (payload.docked === true) {
+        const restore = floatedStripItemsRef.current.get(path);
+        const restorePaths = uniqueAssetPaths(
+          path,
+          restore?.path,
+          restore?.originalPath,
+          restore?.paths || [],
+        );
+        if (restore?.item) {
+          restoredStripItemsRef.current.set(path, {
+            ...restore,
+            afterPath: afterPath || restore.afterPath,
+            beforePath: beforePath || restore.beforePath,
+            index,
+            paths: restorePaths,
+          });
+          restorePaths.forEach((restorePath) => floatedStripItemsRef.current.delete(restorePath));
+        }
         pendingDockRef.current = { path, index };
         orderRef.current = [
           ...orderRef.current.filter((orderedPath) => orderedPath !== path).slice(0, index),
@@ -3016,6 +3130,14 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
           ...orderRef.current.filter((orderedPath) => orderedPath !== path).slice(index),
         ];
         setNativeDrag({ docking: true, index, path });
+        if (restore?.item) {
+          setItems((current) => {
+            const next = insertStripItemAtIndex(current, restore.item, index, restorePaths);
+            orderRef.current = orderPathsForItems(next);
+            return next;
+          });
+        }
+        refresh(false);
         return;
       }
       if (payload.done === true || payload.over === false) {
@@ -3036,7 +3158,7 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
       cancelled = true;
       unlisten();
     };
-  }, [items.length]);
+  }, [items.length, refresh]);
 
   const onWheel = useCallback((event) => {
     const rail = railRef.current;
@@ -3059,8 +3181,40 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
   }, [loadMoreIfNeeded, updateViewport]);
 
   const removePath = useCallback((path) => {
-    orderRef.current = orderRef.current.filter((orderedPath) => orderedPath !== path);
-    setItems((current) => current.filter((item) => assetLocalPath(item) !== path));
+    const restore = floatedStripItemsRef.current.get(path) || restoredStripItemsRef.current.get(path);
+    const paths = uniqueAssetPaths(path, restore?.path, restore?.originalPath, restore?.paths || []);
+    paths.forEach((nextPath) => {
+      floatedStripItemsRef.current.delete(nextPath);
+      restoredStripItemsRef.current.delete(nextPath);
+    });
+    orderRef.current = orderRef.current.filter((orderedPath) => !paths.includes(orderedPath));
+    setItems((current) => current.filter((item) => !paths.includes(assetLocalPath(item))));
+  }, []);
+
+  const markOpenedPath = useCallback((path, details = {}) => {
+    const openedPath = text(path);
+    if (!openedPath) return;
+    const origin = details.origin || {};
+    const originalPath = text(details.originalPath || assetLocalPath(details.item), openedPath);
+    const paths = uniqueAssetPaths(openedPath, originalPath);
+    const itemSnapshot = details.item
+      ? { ...details.item, path: openedPath, localPath: openedPath, local_path: openedPath }
+      : { path: openedPath, localPath: openedPath, local_path: openedPath };
+    const restore = {
+      afterPath: text(origin.afterPath),
+      beforePath: text(origin.beforePath),
+      index: Number.isFinite(origin.index) ? origin.index : 0,
+      item: itemSnapshot,
+      originalPath,
+      path: openedPath,
+      paths,
+    };
+    paths.forEach((nextPath) => {
+      floatedStripItemsRef.current.set(nextPath, restore);
+      restoredStripItemsRef.current.delete(nextPath);
+    });
+    orderRef.current = orderRef.current.filter((orderedPath) => !paths.includes(orderedPath));
+    setItems((current) => current.filter((item) => !paths.includes(assetLocalPath(item))));
   }, []);
 
   // Canvas-space X (matching each tile's translateX) for a pointer position.
@@ -3194,11 +3348,20 @@ export function SnippingRecentStrip({ onContentReady, onDragActivityChange, refr
                     item={entry.item}
                     onChanged={removePath}
                     onDragActivityChange={onDragActivityChange}
-                    onOpened={removePath}
+                    onOpened={markOpenedPath}
                     onReorderEnd={endReorder}
                     onReorderMove={reorderPath}
                     onReorderStart={startReorder}
                     railRef={railRef}
+                    stripOrigin={(() => {
+                      const path = assetLocalPath(entry.item);
+                      const itemIndex = items.findIndex((item) => assetLocalPath(item) === path);
+                      return {
+                        afterPath: itemIndex >= 0 ? assetLocalPath(items[itemIndex + 1]) : "",
+                        beforePath: itemIndex > 0 ? assetLocalPath(items[itemIndex - 1]) : "",
+                        index: itemIndex >= 0 ? itemIndex : index,
+                      };
+                    })()}
                   />
                 )}
               </StripVirtualItem>

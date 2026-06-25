@@ -184,7 +184,7 @@ const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED: bool = false;
 const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOG_FILE: &str = "audio-widget-bottom-bar.jsonl";
 const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOGGING_ENABLED: bool = false;
 const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOG_FILE: &str = "audio-widget-bubble-position.jsonl";
-const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED: bool = true;
+const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED: bool = false;
 const SNIPPING_AREA_CURSOR_DEBUG_LOG_FILE: &str = "snipping-area-cursor.jsonl";
 const APP_SHUTDOWN_PROGRESS_EVENT: &str = "forge-app-shutdown-progress";
 const APP_CLOSE_REQUESTED_EVENT: &str = "forge-app-close-requested";
@@ -2479,6 +2479,7 @@ include!("local_scripts.rs");
 include!("assets.rs");
 include!("agent_sessions.rs");
 include!("terminals.rs");
+include!("tools_window.rs");
 include!("api.rs");
 include!("activity_overlay.rs");
 include!("todo_dispatch.rs");
@@ -2490,6 +2491,8 @@ include!("handsfree_audio.rs");
 include!("voice_text_rules.rs");
 include!("snipping.rs");
 include!("editor.rs");
+include!("editor_export.rs");
+include!("editor_control.rs");
 
 fn diagnostic_log_path(file_name: &str) -> PathBuf {
     let tauri_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -4648,6 +4651,7 @@ pub fn run() {
         .manage(WindowsTerminalDiagnosticState::new())
         .manage(CloudMcpState::new())
         .manage(AppControlMcpState::new())
+        .manage(EditorSelectionStore::new())
         .manage(DeveloperProcessMonitorState::new())
         .manage(AudioState {
             download_lock: Arc::new(Mutex::new(())),
@@ -4811,6 +4815,10 @@ pub fn run() {
             editor_decode_frame,
             editor_waveform,
             editor_decode_audio_pcm,
+            editor_export_timeline,
+            editor_decode_composite_frame,
+            editor_publish_context,
+            editor_get_published_context,
             workspace_threads_read,
             workspace_threads_persist,
             workspace_threads_persist_delta,
@@ -5118,6 +5126,9 @@ pub fn run() {
             terminal_window_open,
             terminal_window_close,
             terminal_window_focus,
+            tools_window_open,
+            tools_window_close,
+            tools_window_focus,
             terminal_pane_runtime_info,
             terminal_live_sessions,
             coordination::tauri_commands::coordination_init,
