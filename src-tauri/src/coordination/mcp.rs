@@ -332,9 +332,8 @@ pub fn ensure_shared_daemon_for_paths(repo_path: &Path, db_path: &Path) -> Resul
         shutdown: Arc::new(AtomicBool::new(false)),
     };
 
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| format!("Unable to configure shared MCP daemon listener: {error}"))?;
+    // Blocking accept: stop_shared_daemon_info() pokes the endpoint on shutdown
+    // to wake the thread, avoiding a 10 Hz non-blocking accept/sleep busy-poll.
     let installed = {
         let mut guard = daemons
             .lock()
@@ -468,6 +467,9 @@ fn shared_daemon_registry_key(repo_path_text: &str) -> String {
 
 fn stop_shared_daemon_info(info: SharedMcpDaemonInfo, reason: &str) -> Result<Value, String> {
     info.shutdown.store(true, Ordering::SeqCst);
+    // Wake the blocking accept() so the listener thread observes the shutdown
+    // flag immediately instead of lingering until the next real connection.
+    let _ = TcpStream::connect(&info.endpoint);
     let info_file_removed = remove_shared_daemon_info_file(&info.info_path);
 
     if let Ok(kernel) =
@@ -544,21 +546,18 @@ fn run_shared_daemon_listener(
     db_path: String,
     shutdown: Arc<AtomicBool>,
 ) {
-    while !shutdown.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                if stream.set_nonblocking(false).is_err() {
-                    continue;
-                }
+    for stream in listener.incoming() {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        match stream {
+            Ok(stream) => {
                 let token = token.clone();
                 let repo_path = repo_path.clone();
                 let db_path = db_path.clone();
                 thread::spawn(move || {
                     let _ = handle_shared_daemon_connection(stream, token, repo_path, db_path);
                 });
-            }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(100));
             }
             Err(_) => break,
         }

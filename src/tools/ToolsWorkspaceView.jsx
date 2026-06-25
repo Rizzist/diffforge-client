@@ -73,6 +73,23 @@ const SKILL_DOCUMENT_CANVAS_INLINE_GUTTER_PX = 48;
 const SKILL_DOCUMENT_CANVAS_VERTICAL_GUTTER_PX = 112;
 const SKILL_DOCUMENT_MIN_SCALE = 0.38;
 const SKILL_DOCUMENT_MAX_SCALE = 1.35;
+const SKILL_DOCUMENT_PAGE_PADDING_TOP_PX = 52;
+const SKILL_DOCUMENT_PAGE_PADDING_INLINE_PX = 58;
+const SKILL_DOCUMENT_PAGE_PADDING_BOTTOM_PX = 76;
+const SKILL_DOCUMENT_TITLE_FONT_SIZE_PX = 30;
+const SKILL_DOCUMENT_TITLE_LINE_HEIGHT = 1.18;
+const SKILL_DOCUMENT_TITLE_PADDING_BOTTOM_PX = 7;
+const SKILL_DOCUMENT_BODY_MARGIN_TOP_PX = 24;
+const SKILL_DOCUMENT_BODY_BLEED_PX = 20;
+const SKILL_DOCUMENT_BODY_PADDING_INLINE_PX = 10;
+const SKILL_DOCUMENT_BODY_PADDING_TOP_PX = 8;
+const SKILL_DOCUMENT_BODY_PADDING_BOTTOM_PX = 24;
+const SKILL_DOCUMENT_BODY_FONT_SIZE_PX = 15;
+const SKILL_DOCUMENT_BODY_LINE_HEIGHT = 1.72;
+const SCRIPT_DOCUMENT_BODY_FONT_SCALE = 0.9;
+const SCRIPT_DOCUMENT_BODY_LINE_HEIGHT = 1.62;
+const SKILL_DOCUMENT_BODY_AVERAGE_CHAR_WIDTH_EM = 0.55;
+const SCRIPT_DOCUMENT_BODY_AVERAGE_CHAR_WIDTH_EM = 0.585;
 const DOCUMENT_TYPE_OPTIONS = [
   { id: "skill", label: "Skill", collection: "documents", extension: "md" },
   { id: "architecture", label: "Architecture", collection: "documents", extension: "arch" },
@@ -207,6 +224,181 @@ function roundedDocumentPx(value, min = 0) {
   return `${Math.round(safeValue)}px`;
 }
 
+function skillDocumentLayoutMetrics(scale, { firstPage = false, script = false } = {}) {
+  const safeScale = clampSkillDocumentScale(scale);
+  const pageWidth = SKILL_DOCUMENT_A4_WIDTH_PX * safeScale;
+  const pageHeight = SKILL_DOCUMENT_A4_HEIGHT_PX * safeScale;
+  const paddingTop = Math.max(20, SKILL_DOCUMENT_PAGE_PADDING_TOP_PX * safeScale);
+  const paddingInline = Math.max(22, SKILL_DOCUMENT_PAGE_PADDING_INLINE_PX * safeScale);
+  const paddingBottom = Math.max(26, SKILL_DOCUMENT_PAGE_PADDING_BOTTOM_PX * safeScale);
+  const titleFontSize = Math.max(16, SKILL_DOCUMENT_TITLE_FONT_SIZE_PX * safeScale);
+  const titlePaddingBottom = Math.max(4, SKILL_DOCUMENT_TITLE_PADDING_BOTTOM_PX * safeScale);
+  const bodyMarginTop = firstPage ? Math.max(10, SKILL_DOCUMENT_BODY_MARGIN_TOP_PX * safeScale) : 0;
+  const bodyBleed = Math.max(4, SKILL_DOCUMENT_BODY_BLEED_PX * safeScale);
+  const bodyPaddingInline = Math.max(4, SKILL_DOCUMENT_BODY_PADDING_INLINE_PX * safeScale);
+  const bodyPaddingTop = Math.max(4, SKILL_DOCUMENT_BODY_PADDING_TOP_PX * safeScale);
+  const bodyPaddingBottom = Math.max(10, SKILL_DOCUMENT_BODY_PADDING_BOTTOM_PX * safeScale);
+  const baseBodyFontSize = Math.max(10, SKILL_DOCUMENT_BODY_FONT_SIZE_PX * safeScale);
+  const bodyFontSize = script ? baseBodyFontSize * SCRIPT_DOCUMENT_BODY_FONT_SCALE : baseBodyFontSize;
+  const bodyLineHeight = bodyFontSize * (script ? SCRIPT_DOCUMENT_BODY_LINE_HEIGHT : SKILL_DOCUMENT_BODY_LINE_HEIGHT);
+  const titleBlockHeight = firstPage
+    ? titleFontSize * SKILL_DOCUMENT_TITLE_LINE_HEIGHT + titlePaddingBottom + 1 + bodyMarginTop
+    : 0;
+  const bodyHeight = Math.max(1, pageHeight - paddingTop - paddingBottom - 2 - titleBlockHeight);
+  const bodyContentHeight = Math.max(1, bodyHeight - bodyPaddingTop - bodyPaddingBottom);
+  const bodyContentWidth = Math.max(
+    1,
+    pageWidth - paddingInline * 2 + bodyBleed - bodyPaddingInline * 2,
+  );
+  const averageCharWidth = Math.max(
+    1,
+    bodyFontSize * (script ? SCRIPT_DOCUMENT_BODY_AVERAGE_CHAR_WIDTH_EM : SKILL_DOCUMENT_BODY_AVERAGE_CHAR_WIDTH_EM),
+  );
+  return {
+    bodyFontSize: baseBodyFontSize,
+    bodyMarginTop,
+    bodyPaddingBottom,
+    bodyPaddingInline,
+    bodyPaddingTop,
+    columns: Math.max(12, Math.floor(bodyContentWidth / averageCharWidth)),
+    pageHeight,
+    pageWidth,
+    paddingBottom,
+    paddingInline,
+    paddingTop,
+    rows: Math.max(1, Math.floor(bodyContentHeight / bodyLineHeight)),
+    safeScale,
+    titleFontSize,
+    titlePaddingBottom,
+  };
+}
+
+function editorVisualRows(content, columns, { preserveWords = true } = {}) {
+  const source = String(content ?? "");
+  const safeColumns = Math.max(8, Number.parseInt(columns, 10) || 80);
+  if (!source.length) {
+    return [{ start: 0, end: 0 }];
+  }
+  const rows = [];
+  let offset = 0;
+  while (offset <= source.length) {
+    const newlineIndex = source.indexOf("\n", offset);
+    const lineEnd = newlineIndex === -1 ? source.length : newlineIndex;
+    if (lineEnd === offset) {
+      rows.push({
+        start: offset,
+        end: newlineIndex === -1 ? lineEnd : lineEnd + 1,
+      });
+    } else {
+      let chunkStart = offset;
+      while (chunkStart < lineEnd) {
+        let chunkEnd = Math.min(lineEnd, chunkStart + safeColumns);
+        if (preserveWords && chunkEnd < lineEnd) {
+          for (let index = chunkEnd; index > chunkStart + 1; index -= 1) {
+            if (/\s/u.test(source.charAt(index - 1))) {
+              chunkEnd = index;
+              break;
+            }
+          }
+        }
+        rows.push({
+          start: chunkStart,
+          end: chunkEnd === lineEnd && newlineIndex !== -1 ? lineEnd + 1 : chunkEnd,
+        });
+        chunkStart = chunkEnd;
+      }
+    }
+    if (newlineIndex === -1) break;
+    offset = newlineIndex + 1;
+    if (offset === source.length) {
+      rows.push({ start: source.length, end: source.length });
+      break;
+    }
+  }
+  return rows;
+}
+
+function paginateEditorText(content, { scale = 1, script = false } = {}) {
+  const source = String(content ?? "");
+  const firstPageMetrics = skillDocumentLayoutMetrics(scale, { firstPage: true, script });
+  const continuationMetrics = skillDocumentLayoutMetrics(scale, { firstPage: false, script });
+  const rows = editorVisualRows(
+    source,
+    Math.min(firstPageMetrics.columns, continuationMetrics.columns),
+    { preserveWords: !script },
+  );
+  if (!source.length) {
+    return [{
+      capacityRows: firstPageMetrics.rows,
+      end: 0,
+      firstPage: true,
+      index: 0,
+      start: 0,
+      text: "",
+      usedRows: 1,
+    }];
+  }
+
+  const pages = [];
+  let pageStart = 0;
+  let pageIndex = 0;
+  let pageRows = 0;
+  let pageCapacity = firstPageMetrics.rows;
+
+  rows.forEach((row) => {
+    if (pageRows >= pageCapacity && row.start > pageStart) {
+      pages.push({
+        capacityRows: pageCapacity,
+        end: row.start,
+        firstPage: pageIndex === 0,
+        index: pageIndex,
+        start: pageStart,
+        text: source.slice(pageStart, row.start),
+        usedRows: pageRows,
+      });
+      pageIndex += 1;
+      pageStart = row.start;
+      pageRows = 0;
+      pageCapacity = continuationMetrics.rows;
+    }
+    pageRows += 1;
+  });
+
+  pages.push({
+    capacityRows: pageCapacity,
+    end: source.length,
+    firstPage: pageIndex === 0,
+    index: pageIndex,
+    start: pageStart,
+    text: source.slice(pageStart),
+    usedRows: Math.max(1, pageRows),
+  });
+  return pages;
+}
+
+function replaceEditorPageContent(content, page, pageContent) {
+  const source = String(content ?? "");
+  const start = Math.max(0, Math.min(source.length, Number(page?.start) || 0));
+  const end = Math.max(start, Math.min(source.length, Number(page?.end) || start));
+  return `${source.slice(0, start)}${String(pageContent ?? "")}${source.slice(end)}`;
+}
+
+function editorPageSelectionSegments(content, selection, page) {
+  if (!selection?.active || !page) return null;
+  const source = String(content ?? "");
+  const pageStart = Math.max(0, Math.min(source.length, Number(page.start) || 0));
+  const pageEnd = Math.max(pageStart, Math.min(source.length, Number(page.end) || pageStart));
+  const selectionStart = Math.max(pageStart, Math.min(pageEnd, Number(selection.start) || 0));
+  const selectionEnd = Math.max(selectionStart, Math.min(pageEnd, Number(selection.end) || selectionStart));
+  if (selectionEnd <= selectionStart) return null;
+  return {
+    active: true,
+    after: source.slice(selectionEnd, pageEnd),
+    before: source.slice(pageStart, selectionStart),
+    selected: source.slice(selectionStart, selectionEnd),
+  };
+}
+
 function workspaceContextMenuPosition(event, container, menuWidth = 190, menuHeight = 96) {
   const margin = 8;
   const rect = container?.getBoundingClientRect?.();
@@ -228,45 +420,25 @@ function documentInlineContent(document) {
   return String(document?.content ?? document?.content_md ?? document?.contentMd ?? document?.body ?? "");
 }
 
-function skillDocumentPageStyle(scale, pageCount = 1) {
-  const safeScale = clampSkillDocumentScale(scale);
-  const safePageCount = Math.max(1, Math.min(64, Number.parseInt(pageCount, 10) || 1));
-  const pageHeight = SKILL_DOCUMENT_A4_HEIGHT_PX * safeScale;
-  const totalPageHeight = pageHeight * safePageCount;
-  const paddingTop = Math.max(20, 52 * safeScale);
-  const paddingBottom = Math.max(26, 76 * safeScale);
-  const titleFontSize = Math.max(16, 30 * safeScale);
-  const titlePaddingBottom = Math.max(4, 7 * safeScale);
-  const bodyMarginTop = Math.max(10, 24 * safeScale);
-  const bodyMinHeight = Math.max(
-    180,
-    totalPageHeight
-      - paddingTop
-      - paddingBottom
-      - titleFontSize * 1.18
-      - titlePaddingBottom
-      - bodyMarginTop
-      - 10,
-  );
+function skillDocumentPageStyle(scale) {
+  const metrics = skillDocumentLayoutMetrics(scale, { firstPage: true });
   return {
-    "--skill-document-page-scale": String(safeScale),
-    "--skill-document-page-count": String(safePageCount),
-    "--skill-document-page-width": roundedDocumentPx(SKILL_DOCUMENT_A4_WIDTH_PX * safeScale),
-    "--skill-document-page-height": roundedDocumentPx(SKILL_DOCUMENT_A4_HEIGHT_PX * safeScale),
-    "--skill-document-total-page-height": roundedDocumentPx(totalPageHeight),
-    "--skill-document-page-padding-top": roundedDocumentPx(paddingTop),
-    "--skill-document-page-padding-inline": roundedDocumentPx(58 * safeScale, 22),
-    "--skill-document-page-padding-bottom": roundedDocumentPx(paddingBottom),
-    "--skill-document-title-font-size": roundedDocumentPx(titleFontSize),
-    "--skill-document-title-padding-bottom": roundedDocumentPx(titlePaddingBottom),
-    "--skill-document-body-margin-top": roundedDocumentPx(bodyMarginTop),
-    "--skill-document-body-margin-left": roundedDocumentPx(-10 * safeScale, -20),
-    "--skill-document-body-bleed": roundedDocumentPx(20 * safeScale),
-    "--skill-document-body-padding-inline": roundedDocumentPx(10 * safeScale, 4),
-    "--skill-document-body-padding-top": roundedDocumentPx(8 * safeScale, 4),
-    "--skill-document-body-padding-bottom": roundedDocumentPx(24 * safeScale, 10),
-    "--skill-document-body-font-size": roundedDocumentPx(15 * safeScale, 10),
-    "--skill-document-body-min-height": roundedDocumentPx(bodyMinHeight, 180),
+    "--skill-document-page-scale": String(metrics.safeScale),
+    "--skill-document-page-gap": roundedDocumentPx(34 * metrics.safeScale, 18),
+    "--skill-document-page-width": roundedDocumentPx(metrics.pageWidth),
+    "--skill-document-page-height": roundedDocumentPx(metrics.pageHeight),
+    "--skill-document-page-padding-top": roundedDocumentPx(metrics.paddingTop),
+    "--skill-document-page-padding-inline": roundedDocumentPx(metrics.paddingInline),
+    "--skill-document-page-padding-bottom": roundedDocumentPx(metrics.paddingBottom),
+    "--skill-document-title-font-size": roundedDocumentPx(metrics.titleFontSize),
+    "--skill-document-title-padding-bottom": roundedDocumentPx(metrics.titlePaddingBottom),
+    "--skill-document-body-margin-top": roundedDocumentPx(metrics.bodyMarginTop),
+    "--skill-document-body-margin-left": roundedDocumentPx(-10 * metrics.safeScale, -20),
+    "--skill-document-body-bleed": roundedDocumentPx(SKILL_DOCUMENT_BODY_BLEED_PX * metrics.safeScale, 4),
+    "--skill-document-body-padding-inline": roundedDocumentPx(metrics.bodyPaddingInline),
+    "--skill-document-body-padding-top": roundedDocumentPx(metrics.bodyPaddingTop),
+    "--skill-document-body-padding-bottom": roundedDocumentPx(metrics.bodyPaddingBottom),
+    "--skill-document-body-font-size": roundedDocumentPx(metrics.bodyFontSize, 10),
   };
 }
 
@@ -283,6 +455,19 @@ function documentFileName(document) {
   const suffix = `.${extension}`;
   const leaf = id.split("/").filter(Boolean).pop() || id;
   return leaf.toLowerCase().endsWith(suffix.toLowerCase()) ? leaf : `${leaf}${suffix}`;
+}
+
+function documentDisplayTitle(document, fallback = "Untitled document") {
+  const explicit = text(document?.title || document?.name || document?.label);
+  if (explicit) return text(explicit.replace(/\.(?:md|markdown|arch)$/iu, ""), fallback);
+  const source = text(document?.fileName || document?.file_name)
+    || normalizedDocumentPath(document?.pathKey || document?.path_key || document?.filePath || document?.file_path)
+    || text(document?.documentKey || document?.document_key)
+    || text(document?.id || document?.documentId || document?.document_id)
+    || text(fallback);
+  const cleaned = source.startsWith("draft:") ? source.slice("draft:".length) : source;
+  const leaf = cleaned.split(/[\\/]/u).filter(Boolean).pop() || cleaned;
+  return text(leaf.replace(/\.(?:md|markdown|arch)$/iu, ""), fallback);
 }
 
 function documentPreviewLine(document) {
@@ -728,13 +913,13 @@ function documentIsFolderRow(document) {
 function documentEditorDraft(document) {
   const option = documentTypeOption(document?.documentKind || document?.source, document?.collection);
   const content = documentInlineContent(document);
-  const title = text(document?.title || document?.name || document?.id);
+  const title = documentDisplayTitle(document);
   const isDraft = Boolean(document?.isDraft || document?.draft || text(document?.syncStatus || document?.sync_status) === "draft");
   return {
 	    assetId: text(document?.assetId || document?.asset_id),
 	    baseContentHash: text(document?.baseContentHash || document?.base_content_hash),
 	    baseContent: isDraft ? String(document?.baseContent ?? "") : content,
-	    baseTitle: isDraft ? text(document?.baseTitle, title) : title,
+	    baseTitle: isDraft ? documentDisplayTitle({ title: document?.baseTitle }, title) : title,
 	    canonicalLocalPath: text(document?.canonicalLocalPath || document?.canonical_local_path),
 	    collection: option.collection,
 	    content,
@@ -3164,7 +3349,7 @@ export default function ToolsWorkspaceView({
 	        mergedDraftKeys.add(draftKey || accountDocumentStorageKey(draftForSavedRow) || text(draftForSavedRow.id));
 	      }
 	      const fileName = documentFileName(skill);
-      const displayName = text(skill.title, fileName);
+      const displayName = documentDisplayTitle(skill, fileName.replace(/\.(?:md|markdown|arch)$/iu, ""));
       const pathKey = normalizedDocumentPath(skill.pathKey || skill.path_key || skill.filePath || skill.file_path || key);
       const parentPathKey = normalizedDocumentPath(skill.parentPathKey || skill.parent_path_key || skill.folderPath || skill.folder_path || pathKey.split("/").slice(0, -1).join("/"));
       ensureFolder(parentPathKey);
@@ -3214,7 +3399,7 @@ export default function ToolsWorkspaceView({
 	      const storageKey = accountDocumentStorageKey(draft) || text(draft.id);
 	      if (mergedDraftKeys.has(draftKey) || mergedDraftKeys.has(storageKey)) return;
 	      const fileName = documentFileName(draft);
-	      const displayName = text(draft.title, fileName);
+	      const displayName = documentDisplayTitle(draft, fileName.replace(/\.(?:md|markdown|arch)$/iu, ""));
 	      const pathKey = normalizedDocumentPath(draft.pathKey || draft.path_key || draft.filePath || draft.file_path || fileName);
 	      const parentPathKey = normalizedDocumentPath(draft.parentPathKey || draft.parent_path_key || draft.folderPath || draft.folder_path || pathKey.split("/").slice(0, -1).join("/"));
 	      ensureFolder(parentPathKey);
@@ -3571,22 +3756,13 @@ export default function ToolsWorkspaceView({
   const skillEditorBusy = skillsState === "saving" || skillsState === "savingLocal";
   const skillEditorReadOnly = selectedDocumentRefreshing || skillEditorBusy;
   const skillEditorOpen = Boolean(skillEditor);
-  const skillEditorLayout = useMemo(() => {
-    const content = String(skillEditor?.content || "");
-    const estimatedLines = content.split("\n").reduce((total, line) => {
-      return total + Math.max(1, Math.ceil(line.length / 82));
-    }, 0);
-    const rows = Math.max(1, Math.min(4000, estimatedLines + 4));
-    return {
-      pageCount: Math.max(1, Math.ceil(rows / 34)),
-      rows,
-    };
-  }, [skillEditor?.content]);
-  const skillEditorRows = skillEditorLayout.rows;
-  const skillEditorPageCount = skillEditorLayout.pageCount;
   const skillDocumentMetricsStyle = useMemo(
-    () => skillDocumentPageStyle(skillDocumentScale, skillEditorPageCount),
-    [skillDocumentScale, skillEditorPageCount],
+    () => skillDocumentPageStyle(skillDocumentScale),
+    [skillDocumentScale],
+  );
+  const skillEditorPages = useMemo(
+    () => paginateEditorText(skillEditor?.content || "", { scale: skillDocumentScale }),
+    [skillDocumentScale, skillEditor?.content],
   );
   const appControlDocumentContext = useMemo(() => {
     const content = String(skillEditor?.content || "");
@@ -3834,13 +4010,10 @@ export default function ToolsWorkspaceView({
       top: terminal.scrollHeight,
     });
   }, []);
-  const scriptEditorRows = useMemo(() => {
-    const content = String(scriptEditor?.content || "");
-    const estimatedLines = content.split("\n").reduce((total, line) => {
-      return total + Math.max(1, Math.ceil(line.length / 86));
-    }, 0);
-    return Math.max(1, Math.min(280, estimatedLines + 4));
-  }, [scriptEditor?.content]);
+  const scriptEditorPages = useMemo(
+    () => paginateEditorText(scriptEditor?.content || "", { scale: skillDocumentScale, script: true }),
+    [scriptEditor?.content, skillDocumentScale],
+  );
   const preservedScriptEditorSelection = useMemo(() => {
     if (!scriptEditor || !lastScriptSelection) return null;
     const content = String(scriptEditor.content || "");
@@ -4442,29 +4615,22 @@ export default function ToolsWorkspaceView({
     }
     return documentSelectionSegments(content, lastDocumentSelection);
   }, [skillEditor, lastDocumentSelection]);
-  const scrollScriptDocumentCanvas = useCallback((event) => {
-    const canvas = scriptDocumentCanvasRef.current;
-    if (!canvas) return;
-    event.preventDefault();
-    event.stopPropagation();
-    canvas.scrollTop += event.deltaY;
-    canvas.scrollLeft += event.deltaX;
-  }, []);
-  const updateSkillEditorSelection = useCallback((event) => {
+  const updateSkillEditorSelection = useCallback((event, pageOffset = 0) => {
     const target = event?.target;
     const start = Number(target?.selectionStart);
     const end = Number(target?.selectionEnd);
     if (!Number.isFinite(start) || !Number.isFinite(end)) {
       return;
     }
+    const offset = Math.max(0, Number(pageOffset) || 0);
     const updatedAtMs = Date.now();
     const eventType = text(event?.type);
     const suppressPreserve = eventType === "blur"
       && updatedAtMs - documentSelectionClearAtRef.current < 400;
     const nextSelection = {
       direction: text(target?.selectionDirection),
-      end,
-      start,
+      end: offset + end,
+      start: offset + start,
       updatedAtMs,
     };
     setSkillEditorSelection({
@@ -4492,21 +4658,22 @@ export default function ToolsWorkspaceView({
       setLastDocumentSelection(null);
     }
   }, [skillEditor]);
-  const updateScriptEditorSelection = useCallback((event) => {
+  const updateScriptEditorSelection = useCallback((event, pageOffset = 0) => {
     const target = event?.target;
     const start = Number(target?.selectionStart);
     const end = Number(target?.selectionEnd);
     if (!Number.isFinite(start) || !Number.isFinite(end)) {
       return;
     }
+    const offset = Math.max(0, Number(pageOffset) || 0);
     const updatedAtMs = Date.now();
     const eventType = text(event?.type);
     const suppressPreserve = eventType === "blur"
       && updatedAtMs - scriptSelectionClearAtRef.current < 400;
     const nextSelection = {
       direction: text(target?.selectionDirection),
-      end,
-      start,
+      end: offset + end,
+      start: offset + start,
       updatedAtMs,
     };
     setScriptEditorSelection({ ...nextSelection });
@@ -4532,6 +4699,27 @@ export default function ToolsWorkspaceView({
       setLastScriptSelection(null);
     }
   }, [scriptEditor]);
+  const updateSkillEditorPageContent = useCallback((page, pageContent, event) => {
+    lastHumanDocumentEditAtRef.current = Date.now();
+    updateSkillEditorSelection(event, page.start);
+    setSkillEditor((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        content: replaceEditorPageContent(current.content, page, pageContent),
+      };
+    });
+  }, [updateSkillEditorSelection]);
+  const updateScriptEditorPageContent = useCallback((page, pageContent, event) => {
+    updateScriptEditorSelection(event, page.start);
+    setScriptEditor((current) => {
+      if (!current) return current;
+      return {
+        ...current,
+        content: replaceEditorPageContent(current.content, page, pageContent),
+      };
+    });
+  }, [updateScriptEditorSelection]);
   useEffect(() => {
     if ((!skillEditorOpen && !scriptsEditorOpen) || typeof window === "undefined") return undefined;
     const canvas = section === "scripts"
@@ -4929,44 +5117,57 @@ export default function ToolsWorkspaceView({
                               <span>Refreshing document</span>
                             </SkillDocumentRefreshOverlay>
                           )}
-                          <SkillDocumentPage onPointerDownCapture={clearDocumentSelection}>
-	                            <SkillDocumentTitleInput
-	                              aria-label="Document name"
-	                              readOnly={skillEditorReadOnly}
-	                              onChange={(event) => {
-	                                lastHumanDocumentEditAtRef.current = Date.now();
-	                                setSkillEditor((current) => ({ ...current, title: event.target.value }));
-	                              }}
-	                              placeholder="doc_name"
-	                              value={skillEditor.title}
-                            />
-                            <SkillDocumentBodyStack>
-                              {preservedSkillEditorSelection?.active && (
-                                <SkillDocumentSelectionOverlay aria-hidden="true">
-                                  <span>{preservedSkillEditorSelection.before}</span>
-                                  <SkillDocumentSelectionMark>{preservedSkillEditorSelection.selected}</SkillDocumentSelectionMark>
-                                  <span>{preservedSkillEditorSelection.after}</span>
-                                </SkillDocumentSelectionOverlay>
-                              )}
-                              <ToolsSkillsEditor
-                                aria-label="Document content"
-	                                readOnly={skillEditorReadOnly}
-	                                onChange={(event) => {
-	                                  lastHumanDocumentEditAtRef.current = Date.now();
-	                                  updateSkillEditorSelection(event);
-	                                  setSkillEditor((current) => ({ ...current, content: event.target.value }));
-	                                }}
-                                onBlur={updateSkillEditorSelection}
-                                onKeyUp={updateSkillEditorSelection}
-                                onMouseUp={updateSkillEditorSelection}
-                                onSelect={updateSkillEditorSelection}
-                                placeholder={skillEditor.extension === "arch" ? "title System_Map" : "# Notes"}
-                                rows={skillEditorRows}
-                                spellCheck={false}
-                                value={skillEditor.content}
-                              />
-                            </SkillDocumentBodyStack>
-                          </SkillDocumentPage>
+                          <SkillDocumentPageStack>
+                            {skillEditorPages.map((page) => {
+                              const pageSelection = editorPageSelectionSegments(
+                                skillEditor.content,
+                                preservedSkillEditorSelection,
+                                page,
+                              );
+                              return (
+                                <SkillDocumentPage
+                                  data-first-page={page.firstPage ? "true" : "false"}
+                                  key={`document-page-${page.index}`}
+                                  onPointerDownCapture={clearDocumentSelection}
+                                >
+                                  {page.firstPage && (
+                                    <SkillDocumentTitleInput
+                                      aria-label="Document name"
+                                      readOnly={skillEditorReadOnly}
+                                      onChange={(event) => {
+                                        lastHumanDocumentEditAtRef.current = Date.now();
+                                        setSkillEditor((current) => ({ ...current, title: event.target.value }));
+                                      }}
+                                      placeholder="doc_name"
+                                      value={skillEditor.title}
+                                    />
+                                  )}
+                                  <SkillDocumentBodyStack data-first-page={page.firstPage ? "true" : "false"}>
+                                    {pageSelection?.active && (
+                                      <SkillDocumentSelectionOverlay aria-hidden="true">
+                                        <span>{pageSelection.before}</span>
+                                        <SkillDocumentSelectionMark>{pageSelection.selected}</SkillDocumentSelectionMark>
+                                        <span>{pageSelection.after}</span>
+                                      </SkillDocumentSelectionOverlay>
+                                    )}
+                                    <ToolsSkillsEditor
+                                      aria-label={`Document content page ${page.index + 1}`}
+                                      onBlur={(event) => updateSkillEditorSelection(event, page.start)}
+                                      onChange={(event) => updateSkillEditorPageContent(page, event.target.value, event)}
+                                      onKeyUp={(event) => updateSkillEditorSelection(event, page.start)}
+                                      onMouseUp={(event) => updateSkillEditorSelection(event, page.start)}
+                                      onSelect={(event) => updateSkillEditorSelection(event, page.start)}
+                                      placeholder={page.firstPage ? (skillEditor.extension === "arch" ? "title System_Map" : "# Notes") : ""}
+                                      readOnly={skillEditorReadOnly}
+                                      rows={page.capacityRows}
+                                      spellCheck={false}
+                                      value={page.text}
+                                    />
+                                  </SkillDocumentBodyStack>
+                                </SkillDocumentPage>
+                              );
+                            })}
+                          </SkillDocumentPageStack>
                         </SkillDocumentCanvas>
                       </SkillDocumentEditor>
                     </>
@@ -5592,41 +5793,54 @@ export default function ToolsWorkspaceView({
                             </SkillDocumentToolbarControls>
                           </SkillDocumentToolbar>
                           <SkillDocumentCanvas ref={scriptDocumentCanvasRef} style={skillDocumentMetricsStyle}>
-                            <SkillDocumentPage onPointerDownCapture={clearScriptSelection}>
-                              <SkillDocumentTitleInput
-                                aria-label="Script name"
-                                onChange={(event) => setScriptEditor((current) => ({ ...current, title: event.target.value }))}
-                                placeholder="script_name"
-                                readOnly={scriptEditorReadOnly}
-                                value={scriptEditor.title}
-                              />
-                              <SkillDocumentBodyStack>
-                                {preservedScriptEditorSelection?.active && (
-                                  <ScriptSelectionOverlay aria-hidden="true">
-                                    <span>{preservedScriptEditorSelection.before}</span>
-                                    <SkillDocumentSelectionMark>{preservedScriptEditorSelection.selected}</SkillDocumentSelectionMark>
-                                    <span>{preservedScriptEditorSelection.after}</span>
-                                  </ScriptSelectionOverlay>
-                                )}
-                                <ToolsScriptEditor
-                                  aria-label="Script content"
-                                  onBlur={updateScriptEditorSelection}
-                                  onChange={(event) => {
-                                    updateScriptEditorSelection(event);
-                                    setScriptEditor((current) => ({ ...current, content: event.target.value }));
-                                  }}
-                                  onKeyUp={updateScriptEditorSelection}
-                                  onMouseUp={updateScriptEditorSelection}
-                                  onSelect={updateScriptEditorSelection}
-                                  onWheelCapture={scrollScriptDocumentCanvas}
-                                  placeholder="#!/usr/bin/env zsh"
-                                  readOnly={scriptEditorReadOnly}
-                                  rows={scriptEditorRows}
-                                  spellCheck={false}
-                                  value={scriptEditor.content}
-                                />
-                              </SkillDocumentBodyStack>
-                            </SkillDocumentPage>
+                            <SkillDocumentPageStack>
+                              {scriptEditorPages.map((page) => {
+                                const pageSelection = editorPageSelectionSegments(
+                                  scriptEditor.content,
+                                  preservedScriptEditorSelection,
+                                  page,
+                                );
+                                return (
+                                  <SkillDocumentPage
+                                    data-first-page={page.firstPage ? "true" : "false"}
+                                    key={`script-page-${page.index}`}
+                                    onPointerDownCapture={clearScriptSelection}
+                                  >
+                                    {page.firstPage && (
+                                      <SkillDocumentTitleInput
+                                        aria-label="Script name"
+                                        onChange={(event) => setScriptEditor((current) => ({ ...current, title: event.target.value }))}
+                                        placeholder="script_name"
+                                        readOnly={scriptEditorReadOnly}
+                                        value={scriptEditor.title}
+                                      />
+                                    )}
+                                    <SkillDocumentBodyStack data-first-page={page.firstPage ? "true" : "false"}>
+                                      {pageSelection?.active && (
+                                        <ScriptSelectionOverlay aria-hidden="true">
+                                          <span>{pageSelection.before}</span>
+                                          <SkillDocumentSelectionMark>{pageSelection.selected}</SkillDocumentSelectionMark>
+                                          <span>{pageSelection.after}</span>
+                                        </ScriptSelectionOverlay>
+                                      )}
+                                      <ToolsScriptEditor
+                                        aria-label={`Script content page ${page.index + 1}`}
+                                        onBlur={(event) => updateScriptEditorSelection(event, page.start)}
+                                        onChange={(event) => updateScriptEditorPageContent(page, event.target.value, event)}
+                                        onKeyUp={(event) => updateScriptEditorSelection(event, page.start)}
+                                        onMouseUp={(event) => updateScriptEditorSelection(event, page.start)}
+                                        onSelect={(event) => updateScriptEditorSelection(event, page.start)}
+                                        placeholder={page.firstPage ? "#!/usr/bin/env zsh" : ""}
+                                        readOnly={scriptEditorReadOnly}
+                                        rows={page.capacityRows}
+                                        spellCheck={false}
+                                        value={page.text}
+                                      />
+                                    </SkillDocumentBodyStack>
+                                  </SkillDocumentPage>
+                                );
+                              })}
+                            </SkillDocumentPageStack>
                           </SkillDocumentCanvas>
                         </SkillDocumentEditor>
                       ) : (
@@ -6948,6 +7162,14 @@ const SkillDocumentCanvas = styled.div`
   background: var(--skill-editor-desk);
 `;
 
+const SkillDocumentPageStack = styled.div`
+  display: grid;
+  justify-items: center;
+  gap: var(--skill-document-page-gap, 34px);
+  width: min-content;
+  max-width: 100%;
+`;
+
 const SkillDocumentRefreshOverlay = styled.div`
   display: inline-flex;
   position: sticky;
@@ -6971,30 +7193,30 @@ const SkillDocumentRefreshOverlay = styled.div`
 
 const SkillDocumentPage = styled.div`
   display: grid;
+  grid-template-rows: minmax(0, 1fr);
   align-content: start;
   box-sizing: border-box;
   width: var(--skill-document-page-width, 794px);
-  min-height: var(--skill-document-total-page-height, var(--skill-document-page-height, 1123px));
+  height: var(--skill-document-page-height, 1123px);
+  min-height: var(--skill-document-page-height, 1123px);
+  max-height: var(--skill-document-page-height, 1123px);
   padding:
     var(--skill-document-page-padding-top, 52px)
     var(--skill-document-page-padding-inline, 58px)
     var(--skill-document-page-padding-bottom, 76px);
   border: 1px solid var(--skill-editor-page-border);
   border-radius: 4px;
+  overflow: hidden;
   color: var(--skill-editor-page-text);
-  background:
-    repeating-linear-gradient(
-      to bottom,
-      transparent 0,
-      transparent calc(var(--skill-document-page-height, 1123px) - 1px),
-      var(--skill-editor-page-rule) calc(var(--skill-document-page-height, 1123px) - 1px),
-      var(--skill-editor-page-rule) var(--skill-document-page-height, 1123px)
-    ),
-    var(--skill-editor-page);
+  background: var(--skill-editor-page);
   box-shadow: var(--skill-editor-page-shadow);
   transition:
     filter 140ms ease,
     opacity 140ms ease;
+
+  &[data-first-page="true"] {
+    grid-template-rows: max-content minmax(0, 1fr);
+  }
 
   ${SkillDocumentEditor}[data-refreshing="true"] & {
     filter: grayscale(0.28);
@@ -7028,11 +7250,17 @@ const SkillDocumentTitleInput = styled.input`
 const SkillDocumentBodyStack = styled.div`
   position: relative;
   display: grid;
+  grid-template-rows: minmax(0, 1fr);
+  align-self: stretch;
   width: calc(100% + var(--skill-document-body-bleed, 20px));
   min-width: 0;
-  min-height: var(--skill-document-body-min-height, 900px);
-  margin-top: var(--skill-document-body-margin-top, 24px);
+  min-height: 0;
+  margin-top: 0;
   margin-left: var(--skill-document-body-margin-left, -10px);
+
+  &[data-first-page="true"] {
+    margin-top: var(--skill-document-body-margin-top, 24px);
+  }
 
   > * {
     grid-area: 1 / 1;
@@ -7045,7 +7273,8 @@ const SkillDocumentSelectionOverlay = styled.div`
   box-sizing: border-box;
   width: 100%;
   min-width: 0;
-  min-height: var(--skill-document-body-min-height, 900px);
+  min-height: 0;
+  height: 100%;
   padding:
     var(--skill-document-body-padding-top, 8px)
     var(--skill-document-body-padding-inline, 10px)
@@ -7076,7 +7305,8 @@ const ToolsSkillsEditor = styled.textarea`
   box-sizing: border-box;
   width: 100%;
   min-width: 0;
-  min-height: var(--skill-document-body-min-height, 900px);
+  min-height: 0;
+  height: 100%;
   padding:
     var(--skill-document-body-padding-top, 8px)
     var(--skill-document-body-padding-inline, 10px)
@@ -7091,8 +7321,7 @@ const ToolsSkillsEditor = styled.textarea`
   font-weight: 520;
   line-height: 1.72;
   outline: none;
-  overflow-y: auto;
-  overflow-x: hidden;
+  overflow: hidden;
   resize: none;
   transition:
     background 140ms ease,

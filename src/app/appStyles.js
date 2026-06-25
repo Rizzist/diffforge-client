@@ -3702,7 +3702,15 @@ export const BlankWorkspace = styled.section`
     background: linear-gradient(90deg, transparent, rgba(125, 160, 205, 0.026), transparent);
     content: "";
     opacity: 0.72;
-    animation: ${quietSweep} 7s ease-in-out infinite;
+    /* One-shot sweep on enter instead of an infinite loop, so an idle blank
+       workspace stops driving continuous compositor repaints. */
+    animation: ${quietSweep} 7s ease-in-out both;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &::after {
+      animation: none;
+    }
   }
 
   &[data-motion="exiting"] {

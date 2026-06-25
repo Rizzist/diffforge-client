@@ -30,7 +30,9 @@ const OVERVIEW_FINISHED_CARD_LIMIT = 8;
 const OVERVIEW_FINISHED_WINDOW_MS = 24 * 60 * 60 * 1000;
 // Event-driven refreshes lead; the interval is a safety net so the overlay
 // window converges even if a tauri event never reaches it.
-const OVERVIEW_REFRESH_INTERVAL_MS = 5_000;
+// Event listeners (real changes + window-show) drive convergence; this interval
+// is only a safety net, so it can be coarse (was 5s).
+const OVERVIEW_REFRESH_INTERVAL_MS = 15_000;
 // Just-finished work (todo or transfer reaching done/failed/stopped) stays
 // pinned with the active items briefly before settling into history.
 const ACTIVE_FINISH_PIN_MS = 5_000;
@@ -2366,7 +2368,7 @@ export function ActivityOverlayPanel({ embedded = false }) {
       onMouseDown={embedded ? undefined : dragOverlayWindow}
     >
       <OverlayHeader data-tauri-drag-region={embedded ? undefined : true}>
-        <HeaderDot data-live={hasWork ? "true" : "false"} data-tone={statusToneName} />
+        <HeaderDot data-live={hasActive || hasLiveDictation ? "true" : "false"} data-tone={statusToneName} />
         <HeaderTitle>Activity</HeaderTitle>
         {syncBadge ? (
           <ActivitySyncBadge

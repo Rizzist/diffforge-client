@@ -60,6 +60,10 @@ const SNIPPING_SCREEN_CAPTURE_KIT_FRAME_WAIT_MS: u64 = 25;
 const SNIPPING_SCREEN_CAPTURE_KIT_FIRST_FRAME_TIMEOUT_MS: u64 = 750;
 #[cfg(target_os = "macos")]
 const SNIPPING_SCREEN_CAPTURE_KIT_QUEUE_DEPTH: isize = 8;
+#[cfg(windows)]
+const SNIPPING_WINDOWS_GRAPHICS_CAPTURE_FRAME_WAIT_MS: u64 = 25;
+#[cfg(windows)]
+const SNIPPING_WINDOWS_GRAPHICS_CAPTURE_FIRST_FRAME_TIMEOUT_MS: u64 = 750;
 const SNIPPING_WARM_CAPTURE_FRAME_MAX_AGE_MS: u64 = 750;
 const SNIPPING_WARM_CAPTURE_RESTART_MIN_MS: u64 = 2_000;
 const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
@@ -6196,6 +6200,814 @@ fn snipping_recording_loop_inner_screen_capture_kit(
     .map_err(SnippingScreenCaptureKitRecordingError::Runtime)
 }
 
+#[cfg(windows)]
+struct SnippingWindowsGraphicsCaptureFrame {
+    bgra: Vec<u8>,
+    width: u32,
+    height: u32,
+    pts_ns: u64,
+}
+
+#[cfg(windows)]
+enum SnippingWindowsGraphicsCaptureEvent {
+    Frame(SnippingWindowsGraphicsCaptureFrame),
+    Error(String),
+    CaptureClosed(String),
+}
+
+#[cfg(windows)]
+struct SnippingWindowsGraphicsCaptureEventSlot {
+    event: StdMutex<Option<SnippingWindowsGraphicsCaptureEvent>>,
+    condvar: std::sync::Condvar,
+}
+
+#[cfg(windows)]
+impl SnippingWindowsGraphicsCaptureEventSlot {
+    fn new() -> Self {
+        Self {
+            event: StdMutex::new(None),
+            condvar: std::sync::Condvar::new(),
+        }
+    }
+
+    fn send_frame(&self, frame: SnippingWindowsGraphicsCaptureFrame) {
+        let Ok(mut event) = self.event.lock() else {
+            return;
+        };
+        if matches!(
+            event.as_ref(),
+            Some(SnippingWindowsGraphicsCaptureEvent::Error(_))
+                | Some(SnippingWindowsGraphicsCaptureEvent::CaptureClosed(_))
+        ) {
+            return;
+        }
+        *event = Some(SnippingWindowsGraphicsCaptureEvent::Frame(frame));
+        self.condvar.notify_one();
+    }
+
+    fn send_control(&self, next_event: SnippingWindowsGraphicsCaptureEvent) {
+        let Ok(mut event) = self.event.lock() else {
+            return;
+        };
+        *event = Some(next_event);
+        self.condvar.notify_one();
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> Option<SnippingWindowsGraphicsCaptureEvent> {
+        let mut event = self.event.lock().ok()?;
+        if event.is_none() {
+            let wait_result = self.condvar.wait_timeout(event, timeout).ok()?;
+            event = wait_result.0;
+        }
+        event.take()
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone)]
+struct SnippingWindowsGraphicsCaptureConfig {
+    events: Arc<SnippingWindowsGraphicsCaptureEventSlot>,
+    stop: Arc<AtomicBool>,
+    frame_x: u32,
+    frame_y: u32,
+    frame_width: u32,
+    frame_height: u32,
+}
+
+#[cfg(windows)]
+struct SnippingWindowsGraphicsCaptureHandler {
+    config: SnippingWindowsGraphicsCaptureConfig,
+}
+
+#[cfg(windows)]
+impl windows_capture::capture::GraphicsCaptureApiHandler for SnippingWindowsGraphicsCaptureHandler {
+    type Flags = SnippingWindowsGraphicsCaptureConfig;
+    type Error = String;
+
+    fn new(
+        ctx: windows_capture::capture::Context<Self::Flags>,
+    ) -> Result<Self, Self::Error> {
+        Ok(Self { config: ctx.flags })
+    }
+
+    fn on_frame_arrived(
+        &mut self,
+        frame: &mut windows_capture::frame::Frame<'_>,
+        capture_control: windows_capture::graphics_capture_api::InternalCaptureControl,
+    ) -> Result<(), Self::Error> {
+        if self.config.stop.load(Ordering::Acquire) {
+            capture_control.stop();
+            return Ok(());
+        }
+
+        match snipping_windows_graphics_capture_copy_bgra_frame(
+            frame,
+            self.config.frame_x,
+            self.config.frame_y,
+            self.config.frame_width,
+            self.config.frame_height,
+        ) {
+            Ok(frame) => self.config.events.send_frame(frame),
+            Err(error) => {
+                self.config
+                    .events
+                    .send_control(SnippingWindowsGraphicsCaptureEvent::Error(error));
+                capture_control.stop();
+                return Ok(());
+            }
+        }
+
+        if self.config.stop.load(Ordering::Acquire) {
+            capture_control.stop();
+        }
+        Ok(())
+    }
+
+    fn on_closed(&mut self) -> Result<(), Self::Error> {
+        self.config.events.send_control(
+            SnippingWindowsGraphicsCaptureEvent::CaptureClosed(
+                "Windows Graphics Capture item was closed.".to_string(),
+            ),
+        );
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+type SnippingWindowsGraphicsCaptureControl =
+    windows_capture::capture::CaptureControl<SnippingWindowsGraphicsCaptureHandler, String>;
+
+#[cfg(windows)]
+enum SnippingWindowsGraphicsCaptureRecordingError {
+    Setup(String),
+    Runtime(String),
+}
+
+#[cfg(windows)]
+impl SnippingWindowsGraphicsCaptureRecordingError {
+    fn message(&self) -> &str {
+        match self {
+            Self::Setup(error) | Self::Runtime(error) => error,
+        }
+    }
+}
+
+#[cfg(windows)]
+fn snipping_windows_graphics_capture_copy_bgra_frame(
+    frame: &mut windows_capture::frame::Frame<'_>,
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+) -> Result<SnippingWindowsGraphicsCaptureFrame, String> {
+    let captured_width = frame.width();
+    let captured_height = frame.height();
+    if captured_width == 0 || captured_height == 0 {
+        return Err("Windows Graphics Capture returned an empty frame.".to_string());
+    }
+    if frame.color_format() != windows_capture::settings::ColorFormat::Bgra8 {
+        return Err(format!(
+            "Windows Graphics Capture returned {:?} frames instead of BGRA.",
+            frame.color_format()
+        ));
+    }
+
+    if width == 0 || height == 0 {
+        return Err("Windows Graphics Capture crop area is empty.".to_string());
+    }
+    let crop_right = x
+        .checked_add(width)
+        .ok_or_else(|| "Windows Graphics Capture crop area is too large.".to_string())?;
+    let crop_bottom = y
+        .checked_add(height)
+        .ok_or_else(|| "Windows Graphics Capture crop area is too large.".to_string())?;
+    if crop_right > captured_width || crop_bottom > captured_height {
+        return Err(format!(
+            "Windows Graphics Capture frame {}x{} does not contain requested crop {}x{} at {},{}.",
+            captured_width, captured_height, width, height, x, y
+        ));
+    }
+
+    let mut buffer = if x == 0
+        && y == 0
+        && width == captured_width
+        && height == captured_height
+    {
+        frame
+            .buffer()
+            .map_err(|error| format!("Unable to read Windows Graphics Capture frame: {error}"))?
+    } else {
+        frame
+            .buffer_crop(x, y, crop_right, crop_bottom)
+            .map_err(|error| format!("Unable to crop Windows Graphics Capture frame: {error}"))?
+    };
+    let width = buffer.width();
+    let height = buffer.height();
+    let bgra = buffer
+        .as_nopadding_buffer()
+        .map_err(|error| {
+            format!("Unable to copy Windows Graphics Capture frame bytes: {error}")
+        })?
+        .to_vec();
+    let pts_ns = if frame.timestamp().Duration >= 0 {
+        u64::try_from(frame.timestamp().Duration)
+            .ok()
+            .and_then(|duration_100ns| duration_100ns.checked_mul(100))
+            .unwrap_or_else(|| current_time_ms().saturating_mul(1_000_000))
+    } else {
+        current_time_ms().saturating_mul(1_000_000)
+    };
+
+    Ok(SnippingWindowsGraphicsCaptureFrame {
+        bgra,
+        width,
+        height,
+        pts_ns,
+    })
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SnippingWindowsGraphicsCaptureMonitorRect {
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+}
+
+#[cfg(windows)]
+fn snipping_windows_graphics_capture_monitor_rect(
+    monitor: &windows_capture::monitor::Monitor,
+) -> Option<SnippingWindowsGraphicsCaptureMonitorRect> {
+    let mut info = windows_sys::Win32::Graphics::Gdi::MONITORINFO {
+        cbSize: std::mem::size_of::<windows_sys::Win32::Graphics::Gdi::MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let ok = unsafe {
+        windows_sys::Win32::Graphics::Gdi::GetMonitorInfoW(
+            monitor.as_raw_hmonitor(),
+            std::ptr::addr_of_mut!(info),
+        )
+    };
+    if ok == 0 {
+        return None;
+    }
+    let width = info.rcMonitor.right.checked_sub(info.rcMonitor.left)?;
+    let height = info.rcMonitor.bottom.checked_sub(info.rcMonitor.top)?;
+    Some(SnippingWindowsGraphicsCaptureMonitorRect {
+        x: info.rcMonitor.left,
+        y: info.rcMonitor.top,
+        width: u32::try_from(width).ok()?,
+        height: u32::try_from(height).ok()?,
+    })
+}
+
+#[cfg(windows)]
+fn snipping_windows_graphics_capture_name_score(
+    monitor: &SnippingAreaMonitor,
+    candidate: Option<&str>,
+) -> i32 {
+    let Some(local_name) = monitor
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return 0;
+    };
+    let Some(candidate) = candidate.map(str::trim).filter(|value| !value.is_empty()) else {
+        return 0;
+    };
+    if candidate.eq_ignore_ascii_case(local_name) {
+        return 32;
+    }
+    let local_lower = local_name.to_ascii_lowercase();
+    let candidate_lower = candidate.to_ascii_lowercase();
+    if candidate_lower.contains(&local_lower) || local_lower.contains(&candidate_lower) {
+        return 12;
+    }
+    0
+}
+
+#[cfg(windows)]
+fn snipping_windows_graphics_capture_monitor_score(
+    candidate: &windows_capture::monitor::Monitor,
+    monitor: &SnippingAreaMonitor,
+) -> i32 {
+    let mut score = 0;
+    if let Some(rect) = snipping_windows_graphics_capture_monitor_rect(candidate) {
+        if rect.x == monitor.x
+            && rect.y == monitor.y
+            && rect.width == monitor.width
+            && rect.height == monitor.height
+        {
+            score += 1_000;
+        } else {
+            if rect.x == monitor.x && rect.y == monitor.y {
+                score += 400;
+            }
+            if rect.width == monitor.width && rect.height == monitor.height {
+                score += 100;
+            }
+        }
+    }
+    if let Ok(name) = candidate.name() {
+        score += snipping_windows_graphics_capture_name_score(monitor, Some(&name));
+    }
+    if let Ok(device_name) = candidate.device_name() {
+        score += snipping_windows_graphics_capture_name_score(monitor, Some(&device_name));
+    }
+    if let Ok(device_string) = candidate.device_string() {
+        score += snipping_windows_graphics_capture_name_score(monitor, Some(&device_string));
+    }
+    let candidate_width = candidate.width().ok();
+    let candidate_height = candidate.height().ok();
+    if candidate_width == Some(monitor.capture_width)
+        && candidate_height == Some(monitor.capture_height)
+    {
+        score += 10;
+    } else if candidate_width == Some(monitor.width) && candidate_height == Some(monitor.height) {
+        score += 8;
+    }
+    if monitor.primary
+        && windows_capture::monitor::Monitor::primary()
+            .ok()
+            .is_some_and(|primary| primary == *candidate)
+    {
+        score += 4;
+    }
+    score
+}
+
+#[cfg(windows)]
+fn snipping_windows_graphics_capture_monitor_for_area_monitor(
+    monitor: &SnippingAreaMonitor,
+) -> Result<windows_capture::monitor::Monitor, String> {
+    let monitors = windows_capture::monitor::Monitor::enumerate()
+        .map_err(|error| format!("Unable to list Windows capture monitors: {error}"))?;
+    if monitors.is_empty() {
+        return Err("Windows Graphics Capture found no monitors.".to_string());
+    }
+    if monitors.len() == 1 {
+        return Ok(monitors[0]);
+    }
+
+    let mut best: Option<(i32, windows_capture::monitor::Monitor)> = None;
+    let mut tied_best = false;
+    for candidate in monitors {
+        let score = snipping_windows_graphics_capture_monitor_score(&candidate, monitor);
+        match best.as_ref().map(|(best_score, _)| *best_score) {
+            None => best = Some((score, candidate)),
+            Some(best_score) if score > best_score => {
+                best = Some((score, candidate));
+                tied_best = false;
+            }
+            Some(best_score) if score == best_score => {
+                tied_best = true;
+            }
+            Some(_) => {}
+        }
+    }
+    let Some((score, candidate)) = best else {
+        return Err("Windows Graphics Capture found no monitors.".to_string());
+    };
+    if tied_best {
+        return Err("Windows Graphics Capture found multiple equally likely monitors.".to_string());
+    }
+    if score >= 50 {
+        return Ok(candidate);
+    }
+    Err("Windows Graphics Capture could not confidently match the selected monitor.".to_string())
+}
+
+#[cfg(windows)]
+fn snipping_windows_graphics_capture_stop(
+    control: &mut Option<SnippingWindowsGraphicsCaptureControl>,
+) -> Result<(), String> {
+    let Some(control) = control.take() else {
+        return Ok(());
+    };
+    control
+        .stop()
+        .map_err(|error| format!("Unable to stop Windows Graphics Capture recording: {error}"))
+}
+
+#[cfg(windows)]
+fn snipping_windows_graphics_capture_settings(
+    capture_monitor: windows_capture::monitor::Monitor,
+    config: SnippingWindowsGraphicsCaptureConfig,
+    compatibility_mode: bool,
+) -> windows_capture::settings::Settings<
+    SnippingWindowsGraphicsCaptureConfig,
+    windows_capture::monitor::Monitor,
+> {
+    let (
+        cursor_capture_settings,
+        draw_border_settings,
+        minimum_update_interval_settings,
+    ) = if compatibility_mode {
+        (
+            windows_capture::settings::CursorCaptureSettings::Default,
+            windows_capture::settings::DrawBorderSettings::Default,
+            windows_capture::settings::MinimumUpdateIntervalSettings::Default,
+        )
+    } else {
+        (
+            windows_capture::settings::CursorCaptureSettings::WithCursor,
+            windows_capture::settings::DrawBorderSettings::WithoutBorder,
+            windows_capture::settings::MinimumUpdateIntervalSettings::Custom(Duration::from_nanos(
+                SNIPPING_RECORDING_TIMESTAMP_NS_PER_SECOND
+                    / u64::from(SNIPPING_RECORDING_TARGET_FPS.max(1)),
+            )),
+        )
+    };
+    windows_capture::settings::Settings::new(
+        capture_monitor,
+        cursor_capture_settings,
+        draw_border_settings,
+        windows_capture::settings::SecondaryWindowSettings::Default,
+        minimum_update_interval_settings,
+        windows_capture::settings::DirtyRegionSettings::Default,
+        windows_capture::settings::ColorFormat::Bgra8,
+        config,
+    )
+}
+
+#[cfg(windows)]
+fn snipping_windows_graphics_capture_start(
+    capture_monitor: windows_capture::monitor::Monitor,
+    config: SnippingWindowsGraphicsCaptureConfig,
+) -> Result<(SnippingWindowsGraphicsCaptureControl, &'static str), String> {
+    let preferred_settings =
+        snipping_windows_graphics_capture_settings(capture_monitor, config.clone(), false);
+    match <SnippingWindowsGraphicsCaptureHandler as windows_capture::capture::GraphicsCaptureApiHandler>::start_free_threaded(preferred_settings) {
+        Ok(control) => Ok((control, "preferred")),
+        Err(preferred_error) => {
+            log_terminal_status_event(
+                "backend.snipping.recording.wgc_settings_fallback",
+                json!({
+                    "from": "preferred",
+                    "to": "compatible",
+                    "error": preferred_error.to_string(),
+                }),
+            );
+            log_snipping_area_cursor_debug_event(
+                "native.recording_wgc_settings_fallback",
+                json!({
+                    "from": "preferred",
+                    "to": "compatible",
+                    "error": preferred_error.to_string(),
+                }),
+            );
+            let compatible_settings =
+                snipping_windows_graphics_capture_settings(capture_monitor, config, true);
+            <SnippingWindowsGraphicsCaptureHandler as windows_capture::capture::GraphicsCaptureApiHandler>::start_free_threaded(compatible_settings)
+                .map(|control| (control, "compatible"))
+                .map_err(|compatible_error| {
+                    format!(
+                        "Unable to start Windows Graphics Capture recording: preferred settings failed: {preferred_error}; compatible settings failed: {compatible_error}"
+                    )
+                })
+        }
+    }
+}
+
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn snipping_recording_loop_inner_windows_graphics_capture(
+    app: &AppHandle,
+    session: &SnippingRecordingSession,
+    monitor: &SnippingAreaMonitor,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    frame_x: u32,
+    frame_y: u32,
+    frame_width: u32,
+    frame_height: u32,
+    reason: &str,
+    shortcut: &str,
+) -> Result<(), SnippingWindowsGraphicsCaptureRecordingError> {
+    let recording_fps = SNIPPING_RECORDING_TARGET_FPS;
+    let capture_monitor = snipping_windows_graphics_capture_monitor_for_area_monitor(monitor)
+        .map_err(SnippingWindowsGraphicsCaptureRecordingError::Setup)?;
+    let capture_monitor_name = capture_monitor.name().ok();
+    let capture_monitor_device_name = capture_monitor.device_name().ok();
+    let capture_monitor_width = capture_monitor.width().ok();
+    let capture_monitor_height = capture_monitor.height().ok();
+    let events = Arc::new(SnippingWindowsGraphicsCaptureEventSlot::new());
+    let config = SnippingWindowsGraphicsCaptureConfig {
+        events: events.clone(),
+        stop: session.stop.clone(),
+        frame_x,
+        frame_y,
+        frame_width,
+        frame_height,
+    };
+    let (capture_control, settings_mode) =
+        snipping_windows_graphics_capture_start(capture_monitor, config)
+            .map_err(SnippingWindowsGraphicsCaptureRecordingError::Setup)?;
+    log_terminal_status_event(
+        "backend.snipping.recording.wgc_config",
+        json!({
+            "monitor": {
+                "name": monitor.name.as_deref(),
+                "primary": monitor.primary,
+                "x": monitor.x,
+                "y": monitor.y,
+                "width": monitor.width,
+                "height": monitor.height,
+                "capture_x": monitor.capture_x,
+                "capture_y": monitor.capture_y,
+                "capture_width": monitor.capture_width,
+                "capture_height": monitor.capture_height,
+                "scale_factor": monitor.scale_factor,
+            },
+            "capture_monitor": {
+                "name": capture_monitor_name,
+                "device_name": capture_monitor_device_name,
+                "width": capture_monitor_width,
+                "height": capture_monitor_height,
+            },
+            "source_rect": {
+                "x": source_x,
+                "y": source_y,
+                "width": source_width,
+                "height": source_height,
+            },
+            "frame_rect": {
+                "x": frame_x,
+                "y": frame_y,
+                "width": frame_width,
+                "height": frame_height,
+            },
+            "output_width": session.width,
+            "output_height": session.height,
+            "fps": recording_fps,
+            "settings_mode": settings_mode,
+        }),
+    );
+    log_snipping_area_cursor_debug_event(
+        "native.recording_wgc_config",
+        json!({
+            "frame_rect": {
+                "x": frame_x,
+                "y": frame_y,
+                "width": frame_width,
+                "height": frame_height,
+            },
+            "output_width": session.width,
+            "output_height": session.height,
+            "fps": recording_fps,
+            "settings_mode": settings_mode,
+        }),
+    );
+
+    let mut capture_control = Some(capture_control);
+    let (mut encoder, mut segment, video_track) =
+        match snipping_open_recording_segment(session, recording_fps) {
+            Ok(value) => value,
+            Err(error) => {
+                let _ = snipping_windows_graphics_capture_stop(&mut capture_control);
+                return Err(SnippingWindowsGraphicsCaptureRecordingError::Runtime(error));
+            }
+        };
+    log_terminal_status_event(
+        "backend.snipping.recording.started",
+        json!({
+            "backend": "windows_graphics_capture",
+            "fps": recording_fps,
+            "capture_fps": recording_fps,
+            "target_fps": SNIPPING_RECORDING_TARGET_FPS,
+            "width": session.width,
+            "height": session.height,
+            "source_width": source_width,
+            "source_height": source_height,
+            "frame_width": frame_width,
+            "frame_height": frame_height,
+            "max_output_pixels": SNIPPING_RECORDING_MAX_OUTPUT_PIXELS,
+            "settings_mode": settings_mode,
+        }),
+    );
+    log_snipping_area_cursor_debug_event(
+        "native.recording_started",
+        json!({
+            "backend": "windows_graphics_capture",
+            "fps": recording_fps,
+            "capture_fps": recording_fps,
+            "width": session.width,
+            "height": session.height,
+            "source_width": source_width,
+            "source_height": source_height,
+            "path": session.target_path.display().to_string(),
+            "settings_mode": settings_mode,
+        }),
+    );
+
+    let mut sample_count = 0_u64;
+    let mut first_frame_epoch_ns = None;
+    let mut next_output_frame_index = 0_u64;
+    let mut pending_vp9_pts_ns = VecDeque::new();
+    let mut yuv_frame = Vec::new();
+    let mut last_yuv_frame = Vec::new();
+    let mut recording_scaler: Option<(u32, u32, SnippingRecordingScaler)> = None;
+    let mut recording_started_at_ms = None;
+    let mut capture_stopped = false;
+    let first_frame_wait_started = Instant::now();
+    let write_result = (|| -> Result<(), String> {
+        while !session.stop.load(Ordering::Acquire) {
+            let Some(event) = events.recv_timeout(Duration::from_millis(
+                SNIPPING_WINDOWS_GRAPHICS_CAPTURE_FRAME_WAIT_MS,
+            )) else {
+                if sample_count == 0
+                    && pending_vp9_pts_ns.is_empty()
+                    && last_yuv_frame.is_empty()
+                    && !session.stop.load(Ordering::Acquire)
+                    && first_frame_wait_started.elapsed()
+                        >= Duration::from_millis(
+                            SNIPPING_WINDOWS_GRAPHICS_CAPTURE_FIRST_FRAME_TIMEOUT_MS,
+                        )
+                {
+                    return Err(format!(
+                        "Windows Graphics Capture did not deliver a recording frame within {} ms.",
+                        SNIPPING_WINDOWS_GRAPHICS_CAPTURE_FIRST_FRAME_TIMEOUT_MS
+                    ));
+                }
+                continue;
+            };
+            let frame = match event {
+                SnippingWindowsGraphicsCaptureEvent::Frame(frame) => frame,
+                SnippingWindowsGraphicsCaptureEvent::Error(error) => {
+                    if sample_count == 0 && last_yuv_frame.is_empty() {
+                        return Err(error);
+                    }
+                    log_terminal_status_event(
+                        "backend.snipping.recording.capture_ended",
+                        json!({
+                            "backend": "windows_graphics_capture",
+                            "sample_count": sample_count,
+                            "pending_frames": pending_vp9_pts_ns.len(),
+                            "error": error,
+                        }),
+                    );
+                    break;
+                }
+                SnippingWindowsGraphicsCaptureEvent::CaptureClosed(error) => {
+                    if sample_count > 0
+                        || !pending_vp9_pts_ns.is_empty()
+                        || !last_yuv_frame.is_empty()
+                    {
+                        log_terminal_status_event(
+                            "backend.snipping.recording.capture_ended",
+                            json!({
+                                "backend": "windows_graphics_capture",
+                                "sample_count": sample_count,
+                                "pending_frames": pending_vp9_pts_ns.len(),
+                                "error": error,
+                            }),
+                        );
+                        break;
+                    }
+                    return Err(error);
+                }
+            };
+            recording_started_at_ms.get_or_insert_with(current_time_ms);
+            let first_epoch_ns = *first_frame_epoch_ns.get_or_insert(frame.pts_ns);
+            let elapsed_ns = frame.pts_ns.saturating_sub(first_epoch_ns);
+            let mut target_frame_index =
+                snipping_recording_frame_index_for_elapsed_ns(elapsed_ns, recording_fps);
+            if target_frame_index < next_output_frame_index {
+                target_frame_index = next_output_frame_index;
+            }
+            let needs_scaler = recording_scaler
+                .as_ref()
+                .is_none_or(|(width, height, _)| *width != frame.width || *height != frame.height);
+            if needs_scaler {
+                recording_scaler = Some((
+                    frame.width,
+                    frame.height,
+                    SnippingRecordingScaler::new(
+                        frame.width,
+                        frame.height,
+                        session.width,
+                        session.height,
+                    )?,
+                ));
+            }
+            let scaler = recording_scaler
+                .as_ref()
+                .map(|(_, _, scaler)| scaler)
+                .ok_or_else(|| {
+                    "Unable to initialize Windows Graphics Capture scaler.".to_string()
+                })?;
+            scaler.write_i420(&frame.bgra, &mut yuv_frame)?;
+            while next_output_frame_index < target_frame_index {
+                if last_yuv_frame.is_empty() {
+                    break;
+                }
+                snipping_encode_recording_yuv_frame(
+                    &mut encoder,
+                    &mut segment,
+                    video_track,
+                    &mut pending_vp9_pts_ns,
+                    &mut sample_count,
+                    &last_yuv_frame,
+                    session.width,
+                    session.height,
+                    next_output_frame_index,
+                    recording_fps,
+                )?;
+                next_output_frame_index = next_output_frame_index.saturating_add(1);
+            }
+            snipping_encode_recording_yuv_frame(
+                &mut encoder,
+                &mut segment,
+                video_track,
+                &mut pending_vp9_pts_ns,
+                &mut sample_count,
+                &yuv_frame,
+                session.width,
+                session.height,
+                target_frame_index,
+                recording_fps,
+            )?;
+            next_output_frame_index = target_frame_index.saturating_add(1);
+            std::mem::swap(&mut last_yuv_frame, &mut yuv_frame);
+        }
+        if let Err(error) = snipping_windows_graphics_capture_stop(&mut capture_control) {
+            log_terminal_status_event(
+                "backend.snipping.recording.wgc_stop_error",
+                json!({ "error": error }),
+            );
+            return Err(error);
+        }
+        capture_stopped = true;
+        if !last_yuv_frame.is_empty() {
+            let final_duration_ms = recording_started_at_ms
+                .map(|started_at_ms| snipping_recording_duration_ms_since(session, started_at_ms))
+                .unwrap_or(0);
+            let final_frame_count = snipping_recording_frame_index_for_elapsed_ns(
+                final_duration_ms.saturating_mul(1_000_000),
+                recording_fps,
+            );
+            while next_output_frame_index < final_frame_count {
+                snipping_encode_recording_yuv_frame(
+                    &mut encoder,
+                    &mut segment,
+                    video_track,
+                    &mut pending_vp9_pts_ns,
+                    &mut sample_count,
+                    &last_yuv_frame,
+                    session.width,
+                    session.height,
+                    next_output_frame_index,
+                    recording_fps,
+                )?;
+                next_output_frame_index = next_output_frame_index.saturating_add(1);
+            }
+        }
+        encoder
+            .finish()
+            .map_err(|error| format!("Unable to finalize recording encoder: {error}"))?;
+        snipping_write_pending_vp9_frames(
+            &mut encoder,
+            &mut segment,
+            video_track,
+            &mut pending_vp9_pts_ns,
+            &mut sample_count,
+        )?;
+        if !pending_vp9_pts_ns.is_empty() {
+            return Err("VP9 encoder finished with unwritten video frames.".to_string());
+        }
+        if sample_count == 0 {
+            return Err("Recording stopped before any frames were captured.".to_string());
+        }
+        Ok(())
+    })();
+
+    if !capture_stopped {
+        let _ = snipping_windows_graphics_capture_stop(&mut capture_control);
+    }
+    if let Err(error) = write_result {
+        drop(segment);
+        let _ = fs::remove_file(&session.tmp_path);
+        return Err(SnippingWindowsGraphicsCaptureRecordingError::Runtime(error));
+    }
+    let duration_ms = recording_started_at_ms
+        .map(|started_at_ms| snipping_recording_duration_ms_since(session, started_at_ms))
+        .unwrap_or_else(|| snipping_recording_duration_ms(session));
+    snipping_finalize_recording_segment(
+        app,
+        session,
+        segment,
+        duration_ms,
+        reason.to_string(),
+        shortcut.to_string(),
+    )
+    .map_err(SnippingWindowsGraphicsCaptureRecordingError::Runtime)
+}
+
 #[cfg(target_os = "macos")]
 #[allow(clippy::too_many_arguments)]
 fn snipping_recording_loop_inner(
@@ -6270,7 +7082,85 @@ fn snipping_recording_loop_inner(
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn snipping_recording_loop_inner(
+    app: &AppHandle,
+    session: &SnippingRecordingSession,
+    monitor: SnippingAreaMonitor,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
+    frame_x: u32,
+    frame_y: u32,
+    frame_width: u32,
+    frame_height: u32,
+    reason: String,
+    shortcut: String,
+) -> Result<(), String> {
+    match snipping_recording_loop_inner_windows_graphics_capture(
+        app,
+        session,
+        &monitor,
+        source_x,
+        source_y,
+        source_width,
+        source_height,
+        frame_x,
+        frame_y,
+        frame_width,
+        frame_height,
+        &reason,
+        &shortcut,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let fallback_stage = match &error {
+                SnippingWindowsGraphicsCaptureRecordingError::Setup(_) => "setup",
+                SnippingWindowsGraphicsCaptureRecordingError::Runtime(_) => "runtime",
+            };
+            let error_message = error.message().to_string();
+            if fallback_stage != "setup" && session.stop.load(Ordering::Acquire) {
+                return Err(error_message);
+            }
+            let _ = fs::remove_file(&session.tmp_path);
+            log_terminal_status_event(
+                "backend.snipping.recording.wgc_fallback",
+                json!({
+                    "stage": fallback_stage,
+                    "error": error_message.clone(),
+                    "fallback": "scap",
+                }),
+            );
+            log_snipping_area_cursor_debug_event(
+                "native.recording_wgc_fallback",
+                json!({
+                    "stage": fallback_stage,
+                    "error": error_message.clone(),
+                    "fallback": "scap",
+                }),
+            );
+            snipping_recording_loop_inner_scap(
+                app,
+                session,
+                monitor,
+                source_x,
+                source_y,
+                source_width,
+                source_height,
+                frame_x,
+                frame_y,
+                frame_width,
+                frame_height,
+                reason,
+                shortcut,
+            )
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 #[allow(clippy::too_many_arguments)]
 fn snipping_recording_loop_inner(
     app: &AppHandle,
@@ -6757,27 +7647,17 @@ fn snipping_recording_area_from_selection(
     }
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn snipping_recording_area_from_selection(
-    monitor: &SnippingAreaMonitor,
+fn snipping_recording_area_from_physical_selection(
+    frame_width: u32,
+    frame_height: u32,
     selection_x: u32,
     selection_y: u32,
     selection_width: u32,
     selection_height: u32,
 ) -> SnippingRecordingArea {
-    let frame_width = monitor
-        .snapshot_width
-        .max(monitor.width)
-        .max(monitor.capture_width)
-        .max(1);
-    let frame_height = monitor
-        .snapshot_height
-        .max(monitor.height)
-        .max(monitor.capture_height)
-        .max(1);
     let (x, y, width, height) = snipping_even_recording_rect(
-        frame_width,
-        frame_height,
+        frame_width.max(1),
+        frame_height.max(1),
         selection_x,
         selection_y,
         selection_width,
@@ -6796,6 +7676,34 @@ fn snipping_recording_area_from_selection(
         output_width,
         output_height,
     }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn snipping_recording_area_from_selection(
+    monitor: &SnippingAreaMonitor,
+    selection_x: u32,
+    selection_y: u32,
+    selection_width: u32,
+    selection_height: u32,
+) -> SnippingRecordingArea {
+    let frame_width = monitor
+        .snapshot_width
+        .max(monitor.width)
+        .max(monitor.capture_width)
+        .max(1);
+    let frame_height = monitor
+        .snapshot_height
+        .max(monitor.height)
+        .max(monitor.capture_height)
+        .max(1);
+    snipping_recording_area_from_physical_selection(
+        frame_width,
+        frame_height,
+        selection_x,
+        selection_y,
+        selection_width,
+        selection_height,
+    )
 }
 
 fn snipping_start_area_recording_for(
@@ -13390,6 +14298,24 @@ mod snipping_recording_webm_tests {
                 area.frame_height
             ),
             (200, 100, 800, 600)
+        );
+    }
+
+    #[test]
+    fn recording_physical_selection_keeps_windows_area_inside_frame() {
+        let area = snipping_recording_area_from_physical_selection(1920, 1080, 101, 51, 2484, 1616);
+
+        assert_eq!((area.source_x, area.source_y), (101, 51));
+        assert_eq!((area.frame_x, area.frame_y), (101, 51));
+        assert_eq!(area.source_width % 2, 0);
+        assert_eq!(area.source_height % 2, 0);
+        assert_eq!(area.frame_width, area.source_width);
+        assert_eq!(area.frame_height, area.source_height);
+        assert!(area.frame_x.saturating_add(area.frame_width) <= 1920);
+        assert!(area.frame_y.saturating_add(area.frame_height) <= 1080);
+        assert!(
+            u64::from(area.output_width).saturating_mul(u64::from(area.output_height))
+                <= SNIPPING_RECORDING_MAX_OUTPUT_PIXELS
         );
     }
 

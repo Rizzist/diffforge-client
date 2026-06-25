@@ -79,12 +79,15 @@ fn backend_cpu_attribution_enabled() -> bool {
     if !BACKEND_CPU_ATTRIBUTION_ENABLED {
         return false;
     }
+    // Default OFF: this instrumentation does a pair of Mach thread_info syscalls on
+    // every instrumented span and writes a JSON snapshot to disk every 5s, so it must
+    // not run in normal use. Re-enable on demand with DIFFFORGE_BACKEND_CPU_ATTRIBUTION=1.
     env::var("DIFFFORGE_BACKEND_CPU_ATTRIBUTION")
         .map(|value| {
             let value = value.trim().to_ascii_lowercase();
             !matches!(value.as_str(), "0" | "false" | "off" | "no")
         })
-        .unwrap_or(true)
+        .unwrap_or(false)
 }
 
 fn backend_cpu_attribution_now_ms() -> u64 {

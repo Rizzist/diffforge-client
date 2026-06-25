@@ -282,6 +282,54 @@ test("draft watcher payloads create visible drafts without an active editor draf
   }
 });
 
+test("draft titles normalize file-name fallbacks without markdown extensions", () => {
+  clearWorkspaceToolsDocumentDraft();
+  try {
+    setWorkspaceToolsDocumentDraft({
+      content: "Title should not flicker.",
+      documentKey: "draft:Docs/Rustfeatures.md",
+      filePath: "Docs/Rustfeatures.md",
+      id: "Docs/Rustfeatures.md",
+      pathKey: "Docs/Rustfeatures.md",
+    });
+
+    const draft = getWorkspaceToolsDocumentDraft();
+    assert.equal(draft.title, "Rustfeatures");
+  } finally {
+    clearWorkspaceToolsDocumentDraft();
+  }
+});
+
+test("draft discard events clear drafts stored under a different identity key", () => {
+  clearWorkspaceToolsDocumentDraft();
+  try {
+    setWorkspaceToolsDocumentDraft({
+      content: "Published content.",
+      documentKey: "draft:Rustfeatures.md",
+      draftId: "draft-rust",
+      draftPath: "/tmp/drafts/draft-rust/Rustfeatures.md",
+      pathKey: "Rustfeatures.md",
+      title: "Rustfeatures",
+    });
+
+    const applied = applyWorkspaceToolsDocumentDraftEventPayload({
+      deleted: true,
+      discarded: true,
+      draft_id: "draft-rust",
+      draft_path: "/tmp/drafts/draft-rust/Rustfeatures.md",
+      event_kind: "doc.draft.discarded",
+      file_path: "Rustfeatures.md",
+      kind: "account_document_draft_discarded",
+      path_key: "Rustfeatures.md",
+    });
+
+    assert.equal(applied, true);
+    assert.equal(getWorkspaceToolsDocumentDrafts().length, 0);
+  } finally {
+    clearWorkspaceToolsDocumentDraft();
+  }
+});
+
 test("metadata-only document updates preserve pending local saves", () => {
   const current = skillsFromUnits([{
     content_hash: "old-hash",

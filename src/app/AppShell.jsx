@@ -32970,6 +32970,16 @@ export default function App() {
       document.content ?? document.content_md ?? document.contentMd ?? document.body ?? "",
     );
     const appControlDocumentHasInlineContent = (document = {}) => appControlDocumentContent(document).length > 0;
+    const appControlDocumentDisplayTitle = (document = {}, fallback = "Document") => {
+      const explicit = String(document.title || document.name || document.label || "").trim();
+      if (explicit) return explicit.replace(/\.(?:md|markdown|arch)$/iu, "").trim() || explicit;
+      const source = String(document.fileName || document.file_name || "").trim()
+        || normalizedDocumentPath(document.pathKey || document.path_key || document.filePath || document.file_path)
+        || String(document.documentKey || document.document_key || document.doc_id || document.document_id || document.id || fallback).trim();
+      const cleaned = source.startsWith("draft:") ? source.slice("draft:".length) : source;
+      const leaf = cleaned.split(/[\\/]/u).filter(Boolean).pop() || cleaned;
+      return String(leaf || fallback).replace(/\.(?:md|markdown|arch)$/iu, "").trim() || fallback;
+    };
     const appControlDocumentSummary = (document = {}, options = {}) => {
       const rowType = appControlDocumentRowType(document);
       const documentKind = normalizedDocumentKind(
@@ -33013,7 +33023,7 @@ export default function App() {
 	        row_type: rowType,
 	        source: String(document.source || documentKind).trim(),
 	        sync_status: String(document.syncStatus || document.sync_status || "").trim(),
-	        title: String(document.title || document.name || document.label || document.id || fileName).trim(),
+	        title: appControlDocumentDisplayTitle(document, fileName),
 	        updated_at: String(document.updatedAt || document.updated_at || document.localSavedAt || document.local_saved_at || "").trim(),
 	      };
 	      const draftPath = String(document.draftPath || document.draft_path || "").trim();
@@ -33153,6 +33163,24 @@ export default function App() {
         source: "workspace_tools_store",
       };
     };
+    const appControlVerboseReplyRequested = (input = {}) => appControlBooleanValue(
+      input.include_state
+        ?? input.includeState
+        ?? input.include_inventory
+        ?? input.includeInventory
+        ?? input.verbose
+        ?? input.debug,
+      false,
+    );
+    const appControlInventorySummary = (inventory = {}) => ({
+      count: Number(inventory.count || inventory.document_count || 0),
+      document_count: Number(inventory.document_count || inventory.count || 0),
+      folder_count: Number(inventory.folder_count || 0),
+      item_count: Number(inventory.item_count || 0),
+      refreshed: inventory.refreshed === true,
+      source: String(inventory.source || "workspace_tools_store"),
+      version: Number(inventory.version || 0),
+    });
     const hydrateAppControlDocument = async (document) => {
       const result = await invoke("cloud_mcp_hydrate_account_document", {
         request: accountDocumentHydrateRequestFromSkill(document),
@@ -33239,14 +33267,10 @@ export default function App() {
 	          || base.path_key
 	          || base.file_path,
 	      );
-	      const title = String(
-	        input.title
-	          || input.name
-	          || base.title
-	          || requestedFileName
-	          || localPathFileName?.replace(/\.(?:md|markdown|arch)$/iu, "")
-	          || "Document",
-	      ).trim() || "Document";
+	      const title = appControlDocumentDisplayTitle({
+	        ...base,
+	        title: input.title || input.name || base.title || requestedFileName || localPathFileName,
+	      });
 	      if (!filePath) {
 	        const fileName = requestedFileName || `${title.replace(/\.(?:md|markdown|arch)$/iu, "")}.${extension}`;
 	        filePath = requestedFolderPath ? `${requestedFolderPath}/${fileName}` : fileName;
@@ -33814,12 +33838,26 @@ export default function App() {
 		            selectedKey: String(input.selectedKey || input.selected_key || "").trim(),
 		            syncStatus: "draft",
 		          });
+		          const verboseReply = appControlVerboseReplyRequested(input);
+		          const compactResult = {
+		            ok: result?.ok !== false,
+		            base_content_hash: String(result?.base_content_hash || preparedDocument?.base_content_hash || ""),
+		            canonical_local_path: String(result?.canonical_local_path || preparedDocument?.canonical_local_path || ""),
+		            draft_id: String(result?.draft_id || preparedDocument?.draft_id || ""),
+		            draft_path: String(result?.draft_path || preparedDocument?.draft_path || ""),
+		            path_key: normalizedDocumentPath(result?.path_key || preparedDocument?.path_key || preparedDocument?.file_path),
+		          };
 		          sendAppControlReply(requestId, {
 		            ok: result?.ok !== false,
 		            data: {
-		              document: appControlDocumentSummary(preparedDocument, { includeContent: true }),
-		              result,
-		              state: buildAppControlState(),
+		              document: appControlDocumentSummary(preparedDocument, { includeContent: false }),
+		              result: verboseReply ? result : compactResult,
+		              ...(verboseReply ? {
+		                inventory,
+		                state: buildAppControlState(),
+		              } : {
+		                inventory: appControlInventorySummary(inventory),
+		              }),
 		            },
 		          });
 		          return;
@@ -33912,7 +33950,7 @@ export default function App() {
 		          );
 		          await refreshWorkspaceToolsAccountSkills({ force: true }).catch(() => undefined);
 		          if (shouldPromoteDraft) {
-		            clearWorkspaceToolsDocumentDraft(
+		            clearWorkspaceToolsDocumentDraft([
 		              draftPath
 		                || draftId
 		                || String(saveRequest.document.document_key || saveRequest.document.documentKey || "").trim()
@@ -33920,15 +33958,33 @@ export default function App() {
 		                || String(document?.documentKey || document?.document_key || "").trim()
 		                || accountDocumentStorageKey(document)
 		                || String(document?.id || "").trim(),
-		            );
+		              input,
+		              document,
+		              saveRequest.document,
+		              result?.document,
+		              result,
+		            ]);
 		          }
+		          const verboseReply = appControlVerboseReplyRequested(input);
+		          const finalInventory = await buildAppControlDocsInventory({ includeContent: false, include_content: false });
+		          const compactResult = {
+		            ok: result?.ok !== false,
+		            base_content_hash: String(result?.base_content_hash || saveRequest.document.base_content_hash || ""),
+		            cloud_synced: result?.cloud_synced === true,
+		            draft_id: String(result?.draft_id || draftId || ""),
+		            draft_path: String(result?.draft_path || draftPath || ""),
+		            draft_saved: result?.draft_saved === true || shouldPromoteDraft,
+		            local_saved: result?.local_saved === true,
+		            mode: saveRequest.mode,
+		          };
 		          sendAppControlReply(requestId, {
 		            ok: result?.ok !== false,
 	            data: {
-	              inventory: await buildAppControlDocsInventory({ includeContent: false, include_content: false }),
+	              document: appControlDocumentSummary(result?.document || saveRequest.document, { includeContent: false }),
+	              inventory: verboseReply ? finalInventory : appControlInventorySummary(finalInventory),
 	              mode: saveRequest.mode,
-	              result,
-	              state: buildAppControlState(),
+	              result: verboseReply ? result : compactResult,
+	              ...(verboseReply ? { state: buildAppControlState() } : {}),
 	            },
 	          });
 	          return;
@@ -34590,13 +34646,18 @@ export default function App() {
               },
             }));
           }
+          const verboseReply = appControlVerboseReplyRequested(input);
           sendAppControlReply(requestId, {
             ok: result?.ok !== false,
             data: {
               checkpointProgress,
               parentStatus,
-              result,
-              state: buildAppControlState(),
+              result: verboseReply ? result : {
+                ok: result?.ok !== false,
+                sent: result?.sent === true,
+                status: result?.status || parentStatus,
+              },
+              ...(verboseReply ? { state: buildAppControlState() } : {}),
             },
           });
           return;

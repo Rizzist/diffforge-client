@@ -4243,6 +4243,7 @@ dependencies = [
  "uuid",
  "webm",
  "window-vibrancy",
+ "windows-capture",
  "windows-sys 0.61.2",
  "yuvutils-rs",
  "zip",

@@ -56,6 +56,32 @@ function text(value, fallback = "") {
   return normalized || fallback;
 }
 
+function documentDisplayLeaf(value) {
+  const raw = text(value);
+  if (!raw) return "";
+  const cleaned = raw.startsWith("draft:") ? raw.slice("draft:".length) : raw;
+  const leaf = cleaned.split(/[\\/]/u).filter(Boolean).pop() || cleaned;
+  return leaf.replace(/\.(?:md|markdown|arch)$/iu, "").trim();
+}
+
+function workspaceToolsDocumentDraftTitle(draft) {
+  const explicit = text(draft?.title || draft?.name || draft?.label);
+  if (explicit) return explicit.replace(/\.(?:md|markdown|arch)$/iu, "").trim() || explicit;
+  return documentDisplayLeaf(
+    draft?.fileName
+      || draft?.file_name
+      || draft?.pathKey
+      || draft?.path_key
+      || draft?.filePath
+      || draft?.file_path
+      || draft?.documentKey
+      || draft?.document_key
+      || draft?.doc_id
+      || draft?.document_id
+      || draft?.id,
+  );
+}
+
 function clonePlainObject(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   try {
@@ -141,7 +167,7 @@ function ensureWorkspaceToolsDocumentDraftLoaded() {
 
 function normalizeWorkspaceToolsDocumentDraft(draft) {
   if (!draft || typeof draft !== "object" || Array.isArray(draft)) return null;
-  const title = text(draft.title || draft.name || draft.id);
+  const title = workspaceToolsDocumentDraftTitle(draft);
   const content = String(draft.content ?? draft.content_md ?? draft.contentMd ?? draft.body ?? "");
   const documentKey = text(draft.documentKey || draft.document_key || accountDocumentStorageKey(draft) || draft.id);
   if (!documentKey && !title && !content) return null;
@@ -208,6 +234,48 @@ function workspaceToolsDocumentDraftIdentity(draft) {
     draftId: text(draft.draftId || draft.draft_id),
     draftPath: text(draft.draftPath || draft.draft_path),
   };
+}
+
+function workspaceToolsDocumentDraftClearCandidates(input) {
+  const values = [];
+  const add = (value) => {
+    const raw = text(value);
+    if (!raw) return;
+    values.push(raw);
+    const withoutDraftPrefix = raw.startsWith("draft:") ? raw.slice("draft:".length) : raw;
+    if (withoutDraftPrefix && withoutDraftPrefix !== raw) values.push(withoutDraftPrefix);
+    const leaf = raw.split(/[\\/]/u).filter(Boolean).pop();
+    if (leaf && leaf !== raw) values.push(leaf);
+  };
+  const visit = (value) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value === "object") {
+      [
+        value.documentKey,
+        value.document_key,
+        accountDocumentStorageKey(value),
+        value.pathKey,
+        value.path_key,
+        value.filePath,
+        value.file_path,
+        value.doc_id,
+        value.document_id,
+        value.id,
+        value.draftPath,
+        value.draft_path,
+        value.draftId,
+        value.draft_id,
+      ].forEach(add);
+      return;
+    }
+    add(value);
+  };
+  visit(input);
+  return Array.from(new Set(values));
 }
 
 export function workspaceToolsDocumentDraftIdentityMatches(currentDraft, incomingDraft) {
@@ -499,8 +567,12 @@ export function applyWorkspaceToolsDocumentDraftEventPayload(payload) {
     if (!key) return;
     const current = workspaceToolsStore.documentDrafts.get(key);
     if (accountDocumentDraftEventClearsDraft(payload, matchingDraft)) {
-      workspaceToolsStore.documentDrafts.delete(key);
-      if (workspaceToolsStore.activeDocumentDraftKey === key) {
+      for (const [currentKey, currentDraft] of workspaceToolsStore.documentDrafts.entries()) {
+        if (currentKey === key || workspaceToolsDocumentDraftIdentityMatches(currentDraft, matchingDraft)) {
+          workspaceToolsStore.documentDrafts.delete(currentKey);
+        }
+      }
+      if (!workspaceToolsStore.documentDrafts.has(workspaceToolsStore.activeDocumentDraftKey)) {
         workspaceToolsStore.activeDocumentDraftKey = Array.from(workspaceToolsStore.documentDrafts.keys()).at(-1) || "";
       }
       return;
@@ -717,22 +789,27 @@ export function setWorkspaceToolsDocumentDraft(draft, options = {}) {
 export function clearWorkspaceToolsDocumentDraft(documentKey = "") {
   ensureWorkspaceToolsDocumentDraftLoaded();
   if (!workspaceToolsStore.documentDrafts.size) return;
-  const requestedKey = text(documentKey);
+  const requestedKeys = workspaceToolsDocumentDraftClearCandidates(documentKey);
   const previousKey = JSON.stringify(Array.from(workspaceToolsStore.documentDrafts.entries()));
-  if (!requestedKey) {
+  if (!requestedKeys.length) {
     workspaceToolsStore.documentDrafts.clear();
     workspaceToolsStore.activeDocumentDraftKey = "";
   } else {
     for (const [key, current] of workspaceToolsStore.documentDrafts.entries()) {
-      if (
+      const matched = requestedKeys.some((requestedKey) => (
         key === requestedKey
-        || workspaceToolsDocumentDraftIdentityMatches(current, { documentKey: requestedKey })
-        || workspaceToolsDocumentDraftIdentityMatches(current, { document_key: requestedKey })
-        || workspaceToolsDocumentDraftIdentityMatches(current, { draftPath: requestedKey })
-        || workspaceToolsDocumentDraftIdentityMatches(current, { draft_path: requestedKey })
-        || workspaceToolsDocumentDraftIdentityMatches(current, { draftId: requestedKey })
-        || workspaceToolsDocumentDraftIdentityMatches(current, { draft_id: requestedKey })
-      ) {
+          || workspaceToolsDocumentDraftIdentityMatches(current, { documentKey: requestedKey })
+          || workspaceToolsDocumentDraftIdentityMatches(current, { document_key: requestedKey })
+          || workspaceToolsDocumentDraftIdentityMatches(current, { pathKey: requestedKey })
+          || workspaceToolsDocumentDraftIdentityMatches(current, { path_key: requestedKey })
+          || workspaceToolsDocumentDraftIdentityMatches(current, { filePath: requestedKey })
+          || workspaceToolsDocumentDraftIdentityMatches(current, { file_path: requestedKey })
+          || workspaceToolsDocumentDraftIdentityMatches(current, { draftPath: requestedKey })
+          || workspaceToolsDocumentDraftIdentityMatches(current, { draft_path: requestedKey })
+          || workspaceToolsDocumentDraftIdentityMatches(current, { draftId: requestedKey })
+          || workspaceToolsDocumentDraftIdentityMatches(current, { draft_id: requestedKey })
+      ));
+      if (matched) {
         workspaceToolsStore.documentDrafts.delete(key);
       }
     }

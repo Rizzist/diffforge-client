@@ -203,7 +203,7 @@ const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
 const TERMINAL_TODO_PLAN_UPDATED_EVENT: &str = "forge-terminal-todo-plan-updated";
 const WORKSPACE_NOTIFICATION_EVENT: &str = "diffforge:workspace-notification-event";
 const MAIN_WINDOW_CURSOR_EVENT: &str = "forge-main-window-cursor";
-const MAIN_WINDOW_CURSOR_POLL_MS: u64 = 33;
+const MAIN_WINDOW_CURSOR_POLL_MS: u64 = 50;
 const MAIN_WINDOW_CURSOR_IDLE_POLL_MS: u64 = 250;
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
 const AUDIO_WIDGET_ERROR_WINDOW_LABEL: &str = "audio-widget-error";
@@ -4320,7 +4320,10 @@ fn start_main_window_cursor_watcher(app: &AppHandle) {
                 last_snapshot = Some(snapshot);
             }
 
-            sleep(Duration::from_millis(if visible {
+            // Only poll at the fast hover cadence when the window is the active
+            // (visible AND focused) window. A visible-but-unfocused/background
+            // window drops to the slow idle cadence instead of waking ~20-30x/sec.
+            sleep(Duration::from_millis(if visible && focused {
                 MAIN_WINDOW_CURSOR_POLL_MS
             } else {
                 MAIN_WINDOW_CURSOR_IDLE_POLL_MS

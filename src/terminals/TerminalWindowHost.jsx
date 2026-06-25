@@ -250,6 +250,7 @@ export default function TerminalWindowHost() {
     let reattachTimer = 0;
     let detachResize = () => {};
     let detachPushToTalkGuard = () => {};
+    let detachFocusBlink = () => {};
 
     const fitTerminal = () => {
       if (disposed || !term) {
@@ -407,6 +408,27 @@ export default function TerminalWindowHost() {
       term.open(container);
       detachPushToTalkGuard = guardXtermDuringPushToTalk(term);
 
+      // Pause the cursor-blink repaint while this detached window is unfocused
+      // or hidden instead of blinking continuously regardless of focus.
+      const syncCursorBlink = () => {
+        const focused = typeof document === "undefined"
+          ? true
+          : !document.hidden
+            && (typeof document.hasFocus !== "function" || document.hasFocus());
+        if (term && term.options.cursorBlink !== focused) {
+          term.options.cursorBlink = focused;
+        }
+      };
+      window.addEventListener("focus", syncCursorBlink);
+      window.addEventListener("blur", syncCursorBlink);
+      document.addEventListener("visibilitychange", syncCursorBlink);
+      detachFocusBlink = () => {
+        window.removeEventListener("focus", syncCursorBlink);
+        window.removeEventListener("blur", syncCursorBlink);
+        document.removeEventListener("visibilitychange", syncCursorBlink);
+      };
+      syncCursorBlink();
+
       term.onData((data) => {
         invoke("terminal_write", { paneId, data }).catch(() => {});
       });
@@ -434,6 +456,7 @@ export default function TerminalWindowHost() {
       }
       detachResize();
       detachPushToTalkGuard();
+      detachFocusBlink();
       try {
         socket?.close();
       } catch {

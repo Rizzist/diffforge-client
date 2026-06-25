@@ -2165,6 +2165,14 @@ function WorkspaceTerminal({
     cursorBlink: null,
     disableStdin: null,
   });
+  // Tracks whether the app window is focused/visible so the xterm cursor-blink
+  // repaint loop can pause while the window sits in the background.
+  const windowFocusedRef = useRef(
+    typeof document === "undefined"
+      ? true
+      : !document.hidden
+        && (typeof document.hasFocus !== "function" || document.hasFocus()),
+  );
   const attachDeferredWebglRef = useRef(null);
   const terminalOutputWorkerSessionRef = useRef(null);
   const terminalOutputFlushNowRef = useRef(null);
@@ -3153,7 +3161,7 @@ function WorkspaceTerminal({
       terminal.options.disableStdin = disableStdin;
     }
     if (previousState.cursorBlink !== acceptsInteractiveInput) {
-      terminal.options.cursorBlink = acceptsInteractiveInput;
+      terminal.options.cursorBlink = acceptsInteractiveInput && windowFocusedRef.current;
     }
     // Breakout-hosted panes stay on the full budget: they can be read in
     // their own window while inactive in the grid.
@@ -3167,6 +3175,37 @@ function WorkspaceTerminal({
     if (!acceptsInteractiveInput && previousState.acceptsInteractiveInput !== false) {
       terminal.blur?.();
     }
+  }, []);
+  useEffect(() => {
+    // Pause the xterm cursor-blink repaint whenever the app window is unfocused
+    // or hidden; only an active, focused, non-parked terminal should run it.
+    const syncWindowFocus = () => {
+      const focused = typeof document === "undefined"
+        ? true
+        : !document.hidden
+          && (typeof document.hasFocus !== "function" || document.hasFocus());
+      if (windowFocusedRef.current === focused) {
+        return;
+      }
+      windowFocusedRef.current = focused;
+      const terminal = xtermRef.current;
+      if (!terminal) {
+        return;
+      }
+      const wantBlink = Boolean(terminalInteractiveStateRef.current.acceptsInteractiveInput)
+        && focused;
+      if (terminal.options.cursorBlink !== wantBlink) {
+        terminal.options.cursorBlink = wantBlink;
+      }
+    };
+    window.addEventListener("focus", syncWindowFocus);
+    window.addEventListener("blur", syncWindowFocus);
+    document.addEventListener("visibilitychange", syncWindowFocus);
+    return () => {
+      window.removeEventListener("focus", syncWindowFocus);
+      window.removeEventListener("blur", syncWindowFocus);
+      document.removeEventListener("visibilitychange", syncWindowFocus);
+    };
   }, []);
   const focusTerminalKeyboardInput = useCallback((force = false) => {
     if (!force && !terminalActiveRef.current) {
@@ -5965,7 +6004,7 @@ function WorkspaceTerminal({
       // prompt into the composer.
       altClickMovesCursor: false,
       convertEol: false,
-      cursorBlink: terminalActiveRef.current && !parkedPromptRef.current,
+      cursorBlink: terminalActiveRef.current && !parkedPromptRef.current && windowFocusedRef.current,
       cursorStyle: "block",
       customGlyphs: true,
       disableStdin: Boolean(parkedPromptRef.current),
