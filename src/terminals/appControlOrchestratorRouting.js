@@ -1,0 +1,280 @@
+export const LOOPSPACE_AUTOMATION_APP_CONTROL_MAX_TERMINALS = 3;
+
+function appControlRoutingDetailSources(detail = {}) {
+  const event = detail?.event && typeof detail.event === "object" ? detail.event : {};
+  const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+  const dispatchSource = detail?.dispatchSource && typeof detail.dispatchSource === "object" ? detail.dispatchSource : {};
+  const dispatchTarget = detail?.dispatchTarget && typeof detail.dispatchTarget === "object" ? detail.dispatchTarget : {};
+  return [detail, event, payload, dispatchSource, dispatchTarget];
+}
+
+function appControlRoutingDetailValue(detail = {}, keys = []) {
+  for (const source of appControlRoutingDetailSources(detail)) {
+    for (const key of keys) {
+      const value = source?.[key];
+      if (value === undefined || value === null) {
+        continue;
+      }
+      const text = String(value).trim();
+      if (text) {
+        return value;
+      }
+    }
+  }
+  return "";
+}
+
+function appControlRoutingDetailString(detail = {}, keys = []) {
+  return String(appControlRoutingDetailValue(detail, keys) || "").trim();
+}
+
+function appControlRoutingDetailInteger(detail = {}, keys = []) {
+  const value = appControlRoutingDetailValue(detail, keys);
+  if (value === "" || value === null || value === undefined) {
+    return null;
+  }
+  const number = Number.parseInt(value, 10);
+  return Number.isInteger(number) ? number : null;
+}
+
+function appControlRoutingDetailBoolean(detail = {}, keys = [], fallback = true) {
+  const value = appControlRoutingDetailValue(detail, keys);
+  if (value === "" || value === null || value === undefined) {
+    return fallback;
+  }
+  if (typeof value === "boolean") {
+    return value;
+  }
+  const text = String(value).trim().toLowerCase();
+  if (["0", "false", "no", "off", "disabled"].includes(text)) {
+    return false;
+  }
+  if (["1", "true", "yes", "on", "enabled"].includes(text)) {
+    return true;
+  }
+  return fallback;
+}
+
+function clampLoopspaceAutomationMaxTotal(value) {
+  const number = Number.parseInt(value, 10);
+  if (!Number.isInteger(number)) {
+    return LOOPSPACE_AUTOMATION_APP_CONTROL_MAX_TERMINALS;
+  }
+  return Math.max(1, Math.min(LOOPSPACE_AUTOMATION_APP_CONTROL_MAX_TERMINALS, number));
+}
+
+function normalizeTerminalIndexes(indexes = [], maxTerminalCount = 4) {
+  const safeMaxTerminalCount = Math.max(1, Number.parseInt(maxTerminalCount, 10) || 1);
+  const normalized = [];
+  for (const value of Array.isArray(indexes) ? indexes : []) {
+    const index = Number.parseInt(value, 10);
+    if (
+      Number.isInteger(index)
+      && index >= 0
+      && index < safeMaxTerminalCount
+      && !normalized.includes(index)
+    ) {
+      normalized.push(index);
+    }
+  }
+  return normalized.length ? normalized : [0];
+}
+
+export function isLoopspaceAutomationAppControlMessage(detail = {}) {
+  const sourceKind = appControlRoutingDetailString(detail, [
+    "source_kind",
+    "sourceKind",
+    "kind",
+    "cause",
+  ]).toLowerCase();
+  if (sourceKind === "loopspace_runtime" || sourceKind === "cloud_loopspace_runtime") {
+    return true;
+  }
+
+  const source = appControlRoutingDetailString(detail, ["source", "reason"]).toLowerCase();
+  if (source === "cloud_loopspace_runtime" || source === "loopspace_runtime") {
+    return true;
+  }
+
+  return Boolean(
+    appControlRoutingDetailString(detail, ["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"])
+      || appControlRoutingDetailString(detail, ["loopspaceId", "loopspace_id"])
+      || appControlRoutingDetailString(detail, ["triggerRunId", "trigger_run_id"]),
+  );
+}
+
+export function appControlMessageHasExplicitTerminalTarget(detail = {}) {
+  return Boolean(
+    appControlRoutingDetailString(detail, [
+      "targetTerminalId",
+      "target_terminal_id",
+      "terminalId",
+      "terminal_id",
+      "paneId",
+      "pane_id",
+    ])
+      || Number.isInteger(appControlRoutingDetailInteger(detail, [
+        "targetTerminalIndex",
+        "target_terminal_index",
+        "terminalIndex",
+        "terminal_index",
+      ]))
+      || appControlRoutingDetailString(detail, [
+        "targetTerminalName",
+        "target_terminal_name",
+        "targetTerminalNickname",
+        "target_terminal_nickname",
+        "terminalName",
+        "terminal_name",
+        "terminalNickname",
+        "terminal_nickname",
+        "targetName",
+        "target_name",
+        "name",
+      ])
+      || appControlRoutingDetailString(detail, [
+        "targetThreadId",
+        "target_thread_id",
+        "threadId",
+        "thread_id",
+      ]),
+  );
+}
+
+export function loopspaceAutomationAutoSpawnEnabled(detail = {}) {
+  return appControlRoutingDetailBoolean(detail, [
+    "orchestratorAutoSpawn",
+    "orchestrator_auto_spawn",
+    "autoSpawnOrchestrator",
+    "auto_spawn_orchestrator",
+  ], true);
+}
+
+export function getLoopspaceAutomationAutoSpawnMaxTotal(detail = {}) {
+  const explicitMaxTotal = appControlRoutingDetailInteger(detail, [
+    "orchestratorAutoSpawnMaxTotal",
+    "orchestrator_auto_spawn_max_total",
+    "maxAutoPoolSize",
+    "max_auto_pool_size",
+  ]);
+  if (Number.isInteger(explicitMaxTotal)) {
+    return clampLoopspaceAutomationMaxTotal(explicitMaxTotal);
+  }
+
+  const explicitAdditional = appControlRoutingDetailInteger(detail, [
+    "orchestratorAutoSpawnMaxAdditional",
+    "orchestrator_auto_spawn_max_additional",
+    "maxAdditionalOrchestrators",
+    "max_additional_orchestrators",
+  ]);
+  if (Number.isInteger(explicitAdditional)) {
+    return clampLoopspaceAutomationMaxTotal(explicitAdditional + 1);
+  }
+
+  return LOOPSPACE_AUTOMATION_APP_CONTROL_MAX_TERMINALS;
+}
+
+export function selectLoopspaceAutomationAppControlTerminal({
+  indexes = [],
+  rolesByIndex = {},
+  targetRole = "",
+  preferredIndex = null,
+  maxAutoTerminalCount = LOOPSPACE_AUTOMATION_APP_CONTROL_MAX_TERMINALS,
+  maxTerminalCount = 4,
+  isTerminalBusy = () => false,
+  getQueueDepth = () => 0,
+} = {}) {
+  const safeMaxTerminalCount = Math.max(1, Number.parseInt(maxTerminalCount, 10) || 1);
+  const safeMaxAutoTerminalCount = Math.max(
+    1,
+    Math.min(
+      safeMaxTerminalCount,
+      LOOPSPACE_AUTOMATION_APP_CONTROL_MAX_TERMINALS,
+      Number.parseInt(maxAutoTerminalCount, 10) || LOOPSPACE_AUTOMATION_APP_CONTROL_MAX_TERMINALS,
+    ),
+  );
+  const currentIndexes = normalizeTerminalIndexes(indexes, safeMaxTerminalCount);
+  const requestedRole = String(targetRole || "").trim().toLowerCase();
+  const preferredTerminalIndex = Number.parseInt(preferredIndex, 10);
+  const terminalStates = currentIndexes.map((index) => {
+    const queueDepth = Math.max(0, Number.parseInt(getQueueDepth(index), 10) || 0);
+    const busy = Boolean(isTerminalBusy(index));
+    return {
+      busy,
+      index,
+      load: queueDepth + (busy ? 1 : 0),
+      queueDepth,
+      role: String(rolesByIndex?.[index] || "").trim().toLowerCase(),
+    };
+  });
+  const idleStates = terminalStates.filter((state) => !state.busy && state.queueDepth === 0);
+  const idleRoleMatch = requestedRole
+    ? idleStates.find((state) => state.role === requestedRole)
+    : null;
+  if (idleRoleMatch) {
+    return {
+      autoSpawned: false,
+      maxAutoPoolSize: safeMaxAutoTerminalCount,
+      orchestratorPoolSize: currentIndexes.length,
+      reason: "idle_role_match",
+      terminalIndex: idleRoleMatch.index,
+    };
+  }
+
+  const idlePreferred = Number.isInteger(preferredTerminalIndex)
+    ? idleStates.find((state) => state.index === preferredTerminalIndex)
+    : null;
+  if (idlePreferred) {
+    return {
+      autoSpawned: false,
+      maxAutoPoolSize: safeMaxAutoTerminalCount,
+      orchestratorPoolSize: currentIndexes.length,
+      reason: "idle_preferred",
+      terminalIndex: idlePreferred.index,
+    };
+  }
+
+  const idleAny = idleStates[0] || null;
+  if (idleAny) {
+    return {
+      autoSpawned: false,
+      maxAutoPoolSize: safeMaxAutoTerminalCount,
+      orchestratorPoolSize: currentIndexes.length,
+      reason: "idle_available",
+      terminalIndex: idleAny.index,
+    };
+  }
+
+  if (currentIndexes.length < safeMaxAutoTerminalCount) {
+    for (let index = 0; index < safeMaxTerminalCount; index += 1) {
+      if (!currentIndexes.includes(index)) {
+        return {
+          autoSpawned: true,
+          maxAutoPoolSize: safeMaxAutoTerminalCount,
+          orchestratorPoolSize: currentIndexes.length + 1,
+          previousPoolSize: currentIndexes.length,
+          reason: "auto_spawn_loopspace_automation",
+          terminalIndex: index,
+        };
+      }
+    }
+  }
+
+  const leastLoaded = terminalStates
+    .slice()
+    .sort((left, right) => (
+      left.load - right.load
+        || left.queueDepth - right.queueDepth
+        || left.index - right.index
+    ))[0];
+
+  return {
+    autoSpawned: false,
+    maxAutoPoolSize: safeMaxAutoTerminalCount,
+    orchestratorPoolSize: currentIndexes.length,
+    queueDepth: leastLoaded?.queueDepth || 0,
+    reason: "least_loaded_queue",
+    shouldQueue: true,
+    terminalIndex: leastLoaded?.index ?? currentIndexes[0] ?? 0,
+  };
+}

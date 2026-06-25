@@ -1,12 +1,18 @@
+import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import "@vscode/codicons/dist/codicon.css";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 
 import { GlobalStyle } from "../app/appStyles.js";
 import {
   TOOLS_WINDOW_CLOSED_EVENT,
+  TOOLS_WINDOW_AGENT_COMPANION_CLOSE,
+  TOOLS_WINDOW_AGENT_COMPANION_EVENT,
+  TOOLS_WINDOW_AGENT_COMPANION_FOCUS,
+  TOOLS_WINDOW_AGENT_COMPANION_OPEN,
   TOOLS_WINDOW_CONTROL_CLOSE,
   TOOLS_WINDOW_CONTROL_DELETE,
   TOOLS_WINDOW_CONTROL_DISCARD,
@@ -32,9 +38,13 @@ const TOOLS_WINDOW_THEMES = [
 const A4_WIDTH = 794;
 const A4_HEIGHT = 1123;
 const PAGE_MIN_SCALE = 0.42;
-const PAGE_MAX_SCALE = 1.18;
+const PAGE_MAX_SCALE = 2.2;
 const PAGE_INLINE_GUTTER = 68;
 const PAGE_VERTICAL_GUTTER = 176;
+const ZOOM_FACTOR_MIN = 0.52;
+const ZOOM_FACTOR_MAX = 2.8;
+const ZOOM_STEP = 1.14;
+const ZOOM_WHEEL_INTENSITY = 0.0014;
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -48,6 +58,19 @@ function normalizedMode(value) {
 function normalizedWindowTheme(value, fallback = "dark") {
   const normalized = text(value).toLowerCase();
   return TOOLS_WINDOW_THEMES.some((theme) => theme.id === normalized) ? normalized : fallback;
+}
+
+function metaIsHtmlDocument(meta) {
+  const kind = text(meta?.documentKind || meta?.document_kind || meta?.source || meta?.kind).toLowerCase();
+  const extension = text(meta?.extension || meta?.ext).trim().replace(/^\./u, "").toLowerCase();
+  const mimeType = text(meta?.mimeType || meta?.mime_type).toLowerCase();
+  const path = text(meta?.pathKey || meta?.path_key || meta?.documentKey || meta?.document_key).toLowerCase();
+  return kind === "html"
+    || extension === "html"
+    || extension === "htm"
+    || mimeType.startsWith("text/html")
+    || path.endsWith(".html")
+    || path.endsWith(".htm");
 }
 
 function parseToolsWindowParams() {
@@ -111,6 +134,14 @@ function pageMetrics(scale, script = false) {
     safeScale,
     titleFontSize,
   };
+}
+
+function clampZoomFactor(value) {
+  return Math.max(ZOOM_FACTOR_MIN, Math.min(ZOOM_FACTOR_MAX, Number(value) || 1));
+}
+
+function clampPageScale(value) {
+  return Math.max(PAGE_MIN_SCALE, Math.min(PAGE_MAX_SCALE, Number(value) || 1));
 }
 
 function visualRows(content, columns, preserveWords = true) {
@@ -236,9 +267,12 @@ export default function ToolsWindowHost() {
   const currentWindow = useMemo(() => getCurrentWindow(), []);
   const [meta, setMeta] = useState(null);
   const [theme, setTheme] = useState(() => readStoredTheme(params.mode, params.theme));
-  const [scale, setScale] = useState(0.78);
+  const [fitScale, setFitScale] = useState(0.78);
+  const [zoomFactor, setZoomFactor] = useState(1);
+  const [maximized, setMaximized] = useState(false);
   const [localTitle, setLocalTitle] = useState(params.title);
   const [localContent, setLocalContent] = useState("");
+  const [localError, setLocalError] = useState("");
   const canvasRef = useRef(null);
   const lastLocalEditAtRef = useRef(0);
   const pendingContentRef = useRef("");
@@ -265,6 +299,25 @@ export default function ToolsWindowHost() {
     }).catch(() => {});
   }, [params.key, params.mode, params.windowId]);
 
+  const sendAgentCompanion = useCallback((action) => {
+    emit(TOOLS_WINDOW_AGENT_COMPANION_EVENT, {
+      action,
+      key: params.key,
+      mode: params.mode,
+      title: localTitle,
+      windowId: params.windowId,
+    }).catch(() => {});
+  }, [localTitle, params.key, params.mode, params.windowId]);
+
+  useEffect(() => () => {
+    emit(TOOLS_WINDOW_AGENT_COMPANION_EVENT, {
+      action: TOOLS_WINDOW_AGENT_COMPANION_CLOSE,
+      key: params.key,
+      mode: params.mode,
+      windowId: params.windowId,
+    }).catch(() => {});
+  }, [params.key, params.mode, params.windowId]);
+
   useEffect(() => {
     let disposed = false;
     let unlisten = () => {};
@@ -274,6 +327,9 @@ export default function ToolsWindowHost() {
       const nextContent = String(nextMeta.content ?? "");
       const nextTitle = text(nextMeta.title, params.title);
       setMeta(nextMeta);
+      if (nextMeta.error) {
+        setLocalError("");
+      }
       setLocalTitle((current) => (
         Date.now() - lastLocalEditAtRef.current < 350 && current !== nextTitle
           ? current
@@ -331,7 +387,7 @@ export default function ToolsWindowHost() {
       const widthScale = Math.max(PAGE_MIN_SCALE, (bounds.width - PAGE_INLINE_GUTTER) / A4_WIDTH);
       const heightScale = Math.max(PAGE_MIN_SCALE, (bounds.height - PAGE_VERTICAL_GUTTER) / A4_HEIGHT);
       const nextScale = Math.min(PAGE_MAX_SCALE, widthScale, heightScale);
-      setScale((current) => (Math.abs(current - nextScale) < 0.005 ? current : nextScale));
+      setFitScale((current) => (Math.abs(current - nextScale) < 0.005 ? current : nextScale));
     };
     const schedule = () => {
       if (frame) window.cancelAnimationFrame(frame);
@@ -346,7 +402,7 @@ export default function ToolsWindowHost() {
       observer?.disconnect();
       window.removeEventListener("resize", schedule);
     };
-  }, []);
+  }, [maximized]);
 
   const sendControl = useCallback((control, extra = {}) => {
     emit(TOOLS_WINDOW_CONTROL_EVENT, {
@@ -366,10 +422,6 @@ export default function ToolsWindowHost() {
     sendControl(TOOLS_WINDOW_CONTROL_UPDATE, patch);
   }, [sendControl]);
 
-  const closeWindow = useCallback(() => {
-    currentWindow.close().catch(() => {});
-  }, [currentWindow]);
-
   const returnToMain = useCallback(() => {
     sendControl(TOOLS_WINDOW_CONTROL_RETURN);
     currentWindow.close().catch(() => {});
@@ -379,18 +431,75 @@ export default function ToolsWindowHost() {
     sendControl(TOOLS_WINDOW_CONTROL_FOCUS_MAIN);
   }, [sendControl]);
 
+  const openHtmlInBrowser = useCallback(async () => {
+    if (!metaIsHtmlDocument(meta)) return;
+    try {
+      setLocalError("");
+      await invoke("open_html_document_in_browser", {
+        content: localContent,
+        title: text(localTitle, "document"),
+      });
+    } catch (error) {
+      setLocalError(error instanceof Error ? error.message : String(error || "Unable to open HTML document in the browser."));
+    }
+  }, [localContent, localTitle, meta]);
+
+  const toggleMaximized = useCallback(async () => {
+    const nextMaximized = !maximized;
+    try {
+      if (typeof currentWindow.setSimpleFullscreen === "function") {
+        await currentWindow.setSimpleFullscreen(nextMaximized);
+      } else if (nextMaximized) {
+        await currentWindow.maximize();
+      } else {
+        await currentWindow.unmaximize();
+      }
+    } catch {
+      if (nextMaximized) {
+        await currentWindow.maximize().catch(() => {});
+      } else {
+        await currentWindow.unmaximize().catch(() => {});
+      }
+    }
+    setMaximized(nextMaximized);
+    sendAgentCompanion(nextMaximized
+      ? TOOLS_WINDOW_AGENT_COMPANION_OPEN
+      : TOOLS_WINDOW_AGENT_COMPANION_CLOSE);
+  }, [currentWindow, maximized, sendAgentCompanion]);
+
+  const zoomIn = useCallback(() => {
+    setZoomFactor((current) => clampZoomFactor(current * ZOOM_STEP));
+  }, []);
+
+  const zoomOut = useCallback(() => {
+    setZoomFactor((current) => clampZoomFactor(current / ZOOM_STEP));
+  }, []);
+
+  const resetZoom = useCallback(() => {
+    setZoomFactor(1);
+  }, []);
+
+  const handleCanvasWheel = useCallback((event) => {
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    const delta = Number(event.deltaY || 0);
+    setZoomFactor((current) => clampZoomFactor(current * Math.exp(-delta * ZOOM_WHEEL_INTENSITY)));
+  }, []);
+
   const mode = params.mode;
   const isScript = mode === "scripts";
-  const pages = useMemo(() => paginateContent(localContent, scale, isScript), [isScript, localContent, scale]);
+  const pageScale = useMemo(() => clampPageScale(fitScale * zoomFactor), [fitScale, zoomFactor]);
+  const pages = useMemo(() => paginateContent(localContent, pageScale, isScript), [isScript, localContent, pageScale]);
   const busy = Boolean(meta?.busy);
   const readOnly = Boolean(meta?.readOnly);
   const title = text(localTitle, isScript ? "Script" : "Document");
   const subtitle = text(meta?.subtitle || meta?.pathKey || meta?.documentKey || meta?.scriptKey);
+  const zoomLabel = `${Math.round(pageScale * 100)}%`;
 
   return (
     <>
       <GlobalStyle />
-      <ToolsWindowShell data-theme={theme}>
+      <ToolsWindowShell data-maximized={maximized ? "true" : "false"} data-mode={mode} data-theme={theme}>
         <ToolsWindowTitleBar
           data-tauri-drag-region="true"
           onPointerDown={(event) => {
@@ -402,12 +511,67 @@ export default function ToolsWindowHost() {
             <strong>{isScript ? "Script" : "Document"}</strong>
             <span>{subtitle || title}</span>
           </ToolsWindowIdentity>
+          <ToolsWindowDocumentActions data-tools-window-control="true">
+            <ToolsWindowButton onClick={() => sendControl(TOOLS_WINDOW_CONTROL_CLOSE)} type="button">
+              Close
+            </ToolsWindowButton>
+            {!isScript && metaIsHtmlDocument(meta) ? (
+              <ToolsWindowButton onClick={() => void openHtmlInBrowser()} type="button">
+                Browser
+              </ToolsWindowButton>
+            ) : null}
+            {!isScript && meta?.dirty ? (
+              <ToolsWindowButton disabled={busy} onClick={() => sendControl(TOOLS_WINDOW_CONTROL_DISCARD)} type="button">
+                Discard changes
+              </ToolsWindowButton>
+            ) : null}
+            <ToolsWindowButton
+              data-danger="true"
+              disabled={busy || readOnly || !meta?.canDelete}
+              onClick={() => sendControl(TOOLS_WINDOW_CONTROL_DELETE)}
+              type="button"
+            >
+              Delete
+            </ToolsWindowButton>
+            <ToolsWindowButton
+              disabled={busy || readOnly || !text(localTitle)}
+              onClick={() => sendControl(TOOLS_WINDOW_CONTROL_SAVE_LOCAL)}
+              type="button"
+            >
+              {busy && meta?.state === "savingLocal" ? "Saving locally..." : "Save Local"}
+            </ToolsWindowButton>
+            {isScript ? (
+              <ToolsWindowPrimaryButton
+                disabled={busy || !text(localTitle)}
+                onClick={() => sendControl(TOOLS_WINDOW_CONTROL_RUN)}
+                type="button"
+              >
+                {meta?.running ? "Queue run" : "Run"}
+              </ToolsWindowPrimaryButton>
+            ) : (
+              <ToolsWindowPrimaryButton
+                disabled={busy || readOnly || !text(localTitle)}
+                onClick={() => sendControl(TOOLS_WINDOW_CONTROL_SAVE_PUSH)}
+                type="button"
+              >
+                {busy && meta?.state === "saving" ? "Saving..." : "Save"}
+              </ToolsWindowPrimaryButton>
+            )}
+          </ToolsWindowDocumentActions>
           <ToolsWindowTopActions>
             <ToolsWindowTopButton data-tools-window-control="true" onClick={focusMain} type="button">Focus main</ToolsWindowTopButton>
             <ToolsWindowTopButton data-tools-window-control="true" onClick={returnToMain} type="button">Return</ToolsWindowTopButton>
-            <ToolsWindowCloseButton aria-label="Close window" data-tools-window-control="true" onClick={closeWindow} type="button">
-              <span className="codicon codicon-close" aria-hidden="true" />
-            </ToolsWindowCloseButton>
+            <ToolsWindowIconButton
+              aria-label={maximized ? "Exit full screen" : "Enter full screen"}
+              aria-pressed={maximized ? "true" : "false"}
+              data-active={maximized ? "true" : undefined}
+              data-tools-window-control="true"
+              onClick={toggleMaximized}
+              title={maximized ? "Exit full screen" : "Full screen"}
+              type="button"
+            >
+              <span className={`codicon ${maximized ? "codicon-chrome-restore" : "codicon-chrome-maximize"}`} aria-hidden="true" />
+            </ToolsWindowIconButton>
           </ToolsWindowTopActions>
         </ToolsWindowTitleBar>
 
@@ -425,114 +589,130 @@ export default function ToolsWindowHost() {
               </ToolsWindowThemeButton>
             ))}
           </ToolsWindowThemeSwitch>
+          <ToolsWindowZoomControls aria-label="Page zoom">
+            <ToolsWindowIconButton
+              aria-label="Zoom out"
+              data-tools-window-control="true"
+              disabled={pageScale <= PAGE_MIN_SCALE + 0.001}
+              onClick={zoomOut}
+              type="button"
+            >
+              <span className="codicon codicon-zoom-out" aria-hidden="true" />
+            </ToolsWindowIconButton>
+            <ToolsWindowZoomValue onClick={resetZoom} title="Reset zoom" type="button">
+              {zoomLabel}
+            </ToolsWindowZoomValue>
+            <ToolsWindowIconButton
+              aria-label="Zoom in"
+              data-tools-window-control="true"
+              disabled={pageScale >= PAGE_MAX_SCALE - 0.001}
+              onClick={zoomIn}
+              type="button"
+            >
+              <span className="codicon codicon-zoom-in" aria-hidden="true" />
+            </ToolsWindowIconButton>
+          </ToolsWindowZoomControls>
           <ToolsWindowStatus data-tone={meta?.dirty ? "draft" : busy ? "busy" : "ready"}>
             {meta?.dirty ? "Draft" : busy ? "Working" : "Ready"}
           </ToolsWindowStatus>
         </ToolsWindowToolbar>
 
-        {meta?.error ? <ToolsWindowError role="alert">{String(meta.error)}</ToolsWindowError> : null}
+        {meta?.error || localError ? <ToolsWindowError role="alert">{String(meta?.error || localError)}</ToolsWindowError> : null}
 
-        <ToolsWindowCanvas ref={canvasRef} style={pageStyle(scale, isScript)}>
-          {meta ? (
-            <ToolsWindowPageStack>
-              {pages.map((page) => (
-                <ToolsWindowPage data-first-page={page.firstPage ? "true" : "false"} key={page.index}>
-                  {page.firstPage ? (
-                    <ToolsWindowTitleInput
-                      aria-label={isScript ? "Script name" : "Document name"}
+        <ToolsWindowMain data-agent-dock={maximized ? "true" : "false"}>
+          <ToolsWindowCanvas
+            onWheel={handleCanvasWheel}
+            ref={canvasRef}
+            style={pageStyle(pageScale, isScript)}
+          >
+            {meta ? (
+              <ToolsWindowPageStack>
+                {pages.map((page) => (
+                  <ToolsWindowPage data-first-page={page.firstPage ? "true" : "false"} key={page.index}>
+                    {page.firstPage ? (
+                      <ToolsWindowTitleInput
+                        aria-label={isScript ? "Script name" : "Document name"}
+                        onChange={(event) => {
+                          const nextTitle = event.target.value;
+                          setLocalTitle(nextTitle);
+                          updateOwner({ title: nextTitle });
+                        }}
+                        placeholder={isScript ? "script_name" : "document_name"}
+                        readOnly={readOnly}
+                        value={localTitle}
+                      />
+                    ) : null}
+                    <ToolsWindowBodyTextarea
+                      aria-label={`${isScript ? "Script" : "Document"} content page ${page.index + 1}`}
                       onChange={(event) => {
-                        const nextTitle = event.target.value;
-                        setLocalTitle(nextTitle);
-                        updateOwner({ title: nextTitle });
+                        const nextContent = replacePageContent(localContent, page, event.target.value);
+                        setLocalContent(nextContent);
+                        updateOwner({ content: nextContent });
                       }}
-                      placeholder={isScript ? "script_name" : "document_name"}
+                      placeholder={page.firstPage ? (isScript ? "#!/usr/bin/env zsh" : "# Notes") : ""}
                       readOnly={readOnly}
-                      value={localTitle}
+                      rows={page.capacityRows}
+                      spellCheck={false}
+                      value={page.text}
                     />
-                  ) : null}
-                  <ToolsWindowBodyTextarea
-                    aria-label={`${isScript ? "Script" : "Document"} content page ${page.index + 1}`}
-                    onChange={(event) => {
-                      const nextContent = replacePageContent(localContent, page, event.target.value);
-                      setLocalContent(nextContent);
-                      updateOwner({ content: nextContent });
-                    }}
-                    placeholder={page.firstPage ? (isScript ? "#!/usr/bin/env zsh" : "# Notes") : ""}
-                    readOnly={readOnly}
-                    rows={page.capacityRows}
-                    spellCheck={false}
-                    value={page.text}
-                  />
-                </ToolsWindowPage>
-              ))}
-            </ToolsWindowPageStack>
-          ) : (
-            <ToolsWindowEmpty>
-              <strong>Connecting to Tools</strong>
-              <span>Waiting for the main Diff Forge window to provide the editor state.</span>
-              <ToolsWindowTopButton onClick={requestMeta} type="button">Retry</ToolsWindowTopButton>
-            </ToolsWindowEmpty>
-          )}
-        </ToolsWindowCanvas>
-
-        <ToolsWindowActionBar>
-          <ToolsWindowButton onClick={() => sendControl(TOOLS_WINDOW_CONTROL_CLOSE)} type="button">
-            Close
-          </ToolsWindowButton>
-          {!isScript && meta?.dirty ? (
-            <ToolsWindowButton disabled={busy} onClick={() => sendControl(TOOLS_WINDOW_CONTROL_DISCARD)} type="button">
-              Discard changes
-            </ToolsWindowButton>
+                  </ToolsWindowPage>
+                ))}
+              </ToolsWindowPageStack>
+            ) : (
+              <ToolsWindowEmpty>
+                <strong>Connecting to Tools</strong>
+                <span>Waiting for the main Diff Forge window to provide the editor state.</span>
+                <ToolsWindowTopButton onClick={requestMeta} type="button">Retry</ToolsWindowTopButton>
+              </ToolsWindowEmpty>
+            )}
+          </ToolsWindowCanvas>
+          {maximized ? (
+            <ToolsWindowAgentDock>
+              <ToolsWindowAgentDockHeader>
+                <strong>Agent</strong>
+                <span>Terminal orchestrator</span>
+              </ToolsWindowAgentDockHeader>
+              <ToolsWindowAgentDockStatus>
+                <span />
+                <strong>Companion</strong>
+              </ToolsWindowAgentDockStatus>
+              <ToolsWindowAgentDockActions>
+                <ToolsWindowTopButton
+                  data-tools-window-control="true"
+                  onClick={() => sendAgentCompanion(TOOLS_WINDOW_AGENT_COMPANION_FOCUS)}
+                  type="button"
+                >
+                  Focus
+                </ToolsWindowTopButton>
+                <ToolsWindowTopButton
+                  data-tools-window-control="true"
+                  onClick={() => sendAgentCompanion(TOOLS_WINDOW_AGENT_COMPANION_OPEN)}
+                  type="button"
+                >
+                  Open
+                </ToolsWindowTopButton>
+              </ToolsWindowAgentDockActions>
+            </ToolsWindowAgentDock>
           ) : null}
-          <ToolsWindowButton
-            data-danger="true"
-            disabled={busy || readOnly || !meta?.canDelete}
-            onClick={() => sendControl(TOOLS_WINDOW_CONTROL_DELETE)}
-            type="button"
-          >
-            Delete
-          </ToolsWindowButton>
-          <ToolsWindowButton
-            disabled={busy || readOnly || !text(localTitle)}
-            onClick={() => sendControl(TOOLS_WINDOW_CONTROL_SAVE_LOCAL)}
-            type="button"
-          >
-            {busy && meta?.state === "savingLocal" ? "Saving locally..." : "Save Local"}
-          </ToolsWindowButton>
-          {isScript ? (
-            <ToolsWindowPrimaryButton
-              disabled={busy || !text(localTitle)}
-              onClick={() => sendControl(TOOLS_WINDOW_CONTROL_RUN)}
-              type="button"
-            >
-              {meta?.running ? "Queue run" : "Run"}
-            </ToolsWindowPrimaryButton>
-          ) : (
-            <ToolsWindowPrimaryButton
-              disabled={busy || readOnly || !text(localTitle)}
-              onClick={() => sendControl(TOOLS_WINDOW_CONTROL_SAVE_PUSH)}
-              type="button"
-            >
-              {busy && meta?.state === "saving" ? "Saving..." : "Save"}
-            </ToolsWindowPrimaryButton>
-          )}
-        </ToolsWindowActionBar>
+        </ToolsWindowMain>
       </ToolsWindowShell>
     </>
   );
 }
 
 const ToolsWindowShell = styled.main`
-  --tools-window-bg: #050607;
-  --tools-window-panel: rgba(13, 15, 18, 0.94);
-  --tools-window-page-bg: #090805;
-  --tools-window-page-border: rgba(255, 209, 102, 0.16);
-  --tools-window-text: #fff6df;
-  --tools-window-muted: rgba(230, 236, 245, 0.58);
-  --tools-window-accent: #ffd166;
-  --tools-window-accent-rgb: 255, 209, 102;
+  --tools-window-bg: #121314;
+  --tools-window-panel: rgba(28, 29, 31, 0.96);
+  --tools-window-page-bg: #202124;
+  --tools-window-page-border: rgba(232, 234, 237, 0.14);
+  --tools-window-page-shadow: 0 24px 70px rgba(0, 0, 0, 0.34);
+  --tools-window-text: #e8eaed;
+  --tools-window-muted: rgba(232, 234, 237, 0.58);
+  --tools-window-accent: #8ab4f8;
+  --tools-window-accent-rgb: 138, 180, 248;
+  --tools-window-danger: #f28b82;
   display: grid;
-  grid-template-rows: auto auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto auto auto minmax(0, 1fr);
   width: 100vw;
   height: 100vh;
   overflow: hidden;
@@ -540,7 +720,8 @@ const ToolsWindowShell = styled.main`
   border-radius: 12px;
   color: var(--tools-window-text);
   background:
-    radial-gradient(circle at 50% -12%, rgba(var(--tools-window-accent-rgb), 0.12), transparent 42%),
+    radial-gradient(circle at 50% -14%, rgba(var(--tools-window-accent-rgb), 0.12), transparent 40%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.025), transparent 180px),
     var(--tools-window-bg);
   clip-path: inset(0 round 12px);
 
@@ -554,12 +735,15 @@ const ToolsWindowShell = styled.main`
   }
 
   &[data-theme="gold"] {
-    --tools-window-bg: #120c04;
-    --tools-window-panel: rgba(27, 19, 8, 0.94);
-    --tools-window-page-bg: #0b0803;
-    --tools-window-page-border: rgba(255, 209, 102, 0.24);
-    --tools-window-accent: #facc15;
-    --tools-window-accent-rgb: 250, 204, 21;
+    --tools-window-bg: #050607;
+    --tools-window-panel: rgba(13, 15, 18, 0.94);
+    --tools-window-page-bg: #090805;
+    --tools-window-page-border: rgba(255, 209, 102, 0.16);
+    --tools-window-page-shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+    --tools-window-text: #fff6df;
+    --tools-window-muted: rgba(230, 236, 245, 0.58);
+    --tools-window-accent: #ffd166;
+    --tools-window-accent-rgb: 255, 209, 102;
   }
 
   &[data-theme="light"] {
@@ -567,6 +751,7 @@ const ToolsWindowShell = styled.main`
     --tools-window-panel: rgba(255, 255, 255, 0.94);
     --tools-window-page-bg: #ffffff;
     --tools-window-page-border: rgba(20, 34, 52, 0.16);
+    --tools-window-page-shadow: 0 24px 58px rgba(20, 34, 52, 0.16);
     --tools-window-text: #172033;
     --tools-window-muted: rgba(23, 32, 51, 0.58);
     --tools-window-accent: #315fbd;
@@ -575,15 +760,19 @@ const ToolsWindowShell = styled.main`
 `;
 
 const ToolsWindowTitleBar = styled.header`
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(140px, 0.48fr) minmax(240px, 1.6fr) max-content;
   min-width: 0;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
   padding: 10px 12px 8px;
   border-bottom: 1px solid rgba(var(--tools-window-accent-rgb), 0.11);
   background: rgba(0, 0, 0, 0.2);
   user-select: none;
+
+  @media (max-width: 920px) {
+    grid-template-columns: minmax(120px, 1fr) max-content;
+  }
 `;
 
 const ToolsWindowIdentity = styled.div`
@@ -610,7 +799,9 @@ const ToolsWindowIdentity = styled.div`
 const ToolsWindowTopActions = styled.div`
   display: inline-flex;
   align-items: center;
+  justify-content: flex-end;
   gap: 7px;
+  min-width: 0;
 `;
 
 const ToolsWindowTopButton = styled.button`
@@ -630,23 +821,52 @@ const ToolsWindowTopButton = styled.button`
     border-color: rgba(var(--tools-window-accent-rgb), 0.38);
     background: rgba(var(--tools-window-accent-rgb), 0.15);
   }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
 `;
 
-const ToolsWindowCloseButton = styled(ToolsWindowTopButton)`
+const ToolsWindowIconButton = styled(ToolsWindowTopButton)`
   display: inline-grid;
   width: 30px;
   min-width: 30px;
   padding: 0;
   place-items: center;
+
+  &[data-active="true"] {
+    border-color: rgba(var(--tools-window-accent-rgb), 0.42);
+    background: rgba(var(--tools-window-accent-rgb), 0.18);
+  }
 `;
 
 const ToolsWindowToolbar = styled.div`
-  display: flex;
+  display: grid;
+  grid-template-columns: max-content minmax(150px, 1fr) max-content;
   align-items: center;
-  justify-content: space-between;
   gap: 10px;
   padding: 10px 14px;
   border-bottom: 1px solid rgba(var(--tools-window-accent-rgb), 0.1);
+
+  @media (max-width: 760px) {
+    grid-template-columns: 1fr;
+    justify-items: start;
+  }
+`;
+
+const ToolsWindowDocumentActions = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  max-width: 100%;
+
+  @media (max-width: 920px) {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
 `;
 
 const ToolsWindowThemeSwitch = styled.div`
@@ -700,6 +920,42 @@ const ToolsWindowStatus = styled.div`
   }
 `;
 
+const ToolsWindowZoomControls = styled.div`
+  display: inline-flex;
+  align-items: center;
+  justify-self: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 3px;
+  border: 1px solid rgba(var(--tools-window-accent-rgb), 0.14);
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.14);
+
+  @media (max-width: 760px) {
+    justify-self: start;
+  }
+`;
+
+const ToolsWindowZoomValue = styled.button`
+  min-width: 58px;
+  min-height: 28px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 7px;
+  color: var(--tools-window-muted);
+  background: transparent;
+  font-size: 11px;
+  font-weight: 860;
+  cursor: pointer;
+
+  &:hover,
+  &:focus-visible {
+    color: var(--tools-window-text);
+    background: rgba(var(--tools-window-accent-rgb), 0.1);
+    outline: none;
+  }
+`;
+
 const ToolsWindowError = styled.div`
   margin: 8px 14px 0;
   padding: 9px 11px;
@@ -716,6 +972,19 @@ const ToolsWindowCanvas = styled.section`
   min-height: 0;
   overflow: auto;
   padding: 34px;
+  overscroll-behavior: contain;
+`;
+
+const ToolsWindowMain = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+
+  &[data-agent-dock="true"] {
+    grid-template-columns: minmax(0, 1fr) clamp(230px, 18vw, 320px);
+  }
 `;
 
 const ToolsWindowPageStack = styled.div`
@@ -738,7 +1007,7 @@ const ToolsWindowPage = styled.article`
   border: 1px solid var(--tools-window-page-border);
   border-radius: 8px;
   background: var(--tools-window-page-bg);
-  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.28);
+  box-shadow: var(--tools-window-page-shadow);
 `;
 
 const ToolsWindowTitleInput = styled.input`
@@ -769,12 +1038,17 @@ const ToolsWindowBodyTextarea = styled.textarea`
   border: 0;
   color: var(--tools-window-text);
   background: transparent;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-size: var(--tools-window-body-font-size);
-  font-weight: 650;
+  font-weight: 560;
   line-height: var(--tools-window-body-line-height);
   letter-spacing: 0;
   overflow: hidden;
+
+  ${ToolsWindowShell}[data-mode="scripts"] & {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    font-weight: 650;
+  }
 
   ${ToolsWindowShell}:not([data-theme="light"]) &::placeholder {
     color: rgba(230, 236, 245, 0.32);
@@ -799,30 +1073,84 @@ const ToolsWindowEmpty = styled.div`
   }
 `;
 
-const ToolsWindowActionBar = styled.footer`
-  display: flex;
+const ToolsWindowAgentDock = styled.aside`
+  display: grid;
+  align-content: start;
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+  padding: 14px;
+  border-left: 1px solid rgba(var(--tools-window-accent-rgb), 0.13);
+  overflow: hidden auto;
+  background:
+    radial-gradient(circle at 50% 0%, rgba(var(--tools-window-accent-rgb), 0.12), transparent 42%),
+    color-mix(in srgb, var(--tools-window-panel) 92%, black);
+`;
+
+const ToolsWindowAgentDockHeader = styled.div`
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+
+  strong {
+    color: var(--tools-window-text);
+    font-size: 13px;
+    font-weight: 900;
+  }
+
+  span {
+    overflow: hidden;
+    color: var(--tools-window-muted);
+    font-size: 11px;
+    font-weight: 760;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+const ToolsWindowAgentDockStatus = styled.div`
+  display: inline-flex;
   align-items: center;
-  justify-content: flex-end;
-  gap: 9px;
-  padding: 11px 14px 13px;
-  border-top: 1px solid rgba(var(--tools-window-accent-rgb), 0.13);
-  background: var(--tools-window-panel);
+  width: fit-content;
+  gap: 8px;
+  min-height: 28px;
+  padding: 0 10px;
+  border: 1px solid rgba(134, 239, 172, 0.24);
+  border-radius: 999px;
+  color: #bbf7d0;
+  background: rgba(20, 83, 45, 0.2);
+  font-size: 11px;
+  font-weight: 850;
+
+  span {
+    width: 8px;
+    height: 8px;
+    border-radius: 999px;
+    background: #86efac;
+    box-shadow: 0 0 0 4px rgba(134, 239, 172, 0.12);
+  }
+`;
+
+const ToolsWindowAgentDockActions = styled.div`
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 `;
 
 const ToolsWindowButton = styled.button`
-  min-height: 34px;
-  padding: 0 13px;
+  min-height: 30px;
+  padding: 0 11px;
   border: 1px solid rgba(var(--tools-window-accent-rgb), 0.18);
   border-radius: 8px;
   color: var(--tools-window-text);
   background: rgba(0, 0, 0, 0.14);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 840;
   cursor: pointer;
 
   &[data-danger="true"] {
-    border-color: rgba(248, 113, 113, 0.28);
-    color: #fecaca;
+    border-color: color-mix(in srgb, var(--tools-window-danger) 35%, transparent);
+    color: color-mix(in srgb, var(--tools-window-danger) 82%, var(--tools-window-text));
   }
 
   &:disabled {
@@ -839,11 +1167,10 @@ const ToolsWindowButton = styled.button`
 `;
 
 const ToolsWindowPrimaryButton = styled(ToolsWindowButton)`
-  color: #1f1604;
   border-color: rgba(var(--tools-window-accent-rgb), 0.42);
   background: var(--tools-window-accent);
+  color: #07111f;
 
-  ${ToolsWindowShell}[data-theme="navy"] &,
   ${ToolsWindowShell}[data-theme="light"] & {
     color: #ffffff;
   }

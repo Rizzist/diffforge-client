@@ -25,16 +25,21 @@ export function normalizedDocumentCollection() {
 export function normalizedDocumentKind(value, collection = "documents") {
   const normalized = text(value).toLowerCase();
   if (["arch", "architecture", "architectures", "graph", "graphs"].includes(normalized)) return "architecture";
+  if (["html", "htm", "webpage", "web_page", "web-page"].includes(normalized)) return "html";
   if (["skill", "skills"].includes(normalized)) return "skill";
-  if (["generic", "document", "documents", "doc", "docs"].includes(normalized)) return "document";
+  if (["generic", "document", "documents", "doc", "docs", "markdown", "md"].includes(normalized)) return "document";
   const rawCollection = text(collection).toLowerCase();
   if (["arch", "architecture", "architectures", "graph", "graphs"].includes(rawCollection)) return "architecture";
+  if (["html", "htm", "webpage", "web_page", "web-page"].includes(rawCollection)) return "html";
   if (["skill", "skills"].includes(rawCollection)) return "skill";
   return "document";
 }
 
 export function documentExtensionForKind(kind, collection = "documents") {
-  return normalizedDocumentKind(kind, collection) === "architecture" ? "arch" : "md";
+  const normalized = normalizedDocumentKind(kind, collection);
+  if (normalized === "architecture") return "arch";
+  if (normalized === "html") return "html";
+  return "md";
 }
 
 export function normalizedDocumentPath(value) {
@@ -46,10 +51,41 @@ export function normalizedDocumentPath(value) {
     .join("/");
 }
 
+function documentHasHtmlSignal(value = {}) {
+  const extension = text(value?.extension || value?.ext || value?.file_extension)
+    .replace(/^\./u, "")
+    .toLowerCase();
+  if (extension === "html" || extension === "htm") return true;
+  const mimeType = text(value?.mimeType || value?.mime_type).toLowerCase();
+  if (mimeType.startsWith("text/html") || mimeType === "application/xhtml+xml") return true;
+  const path = normalizedDocumentPath(
+    value?.filePath
+      || value?.file_path
+      || value?.pathKey
+      || value?.path_key
+      || value?.fileName
+      || value?.file_name
+      || value?.localPath
+      || value?.local_path
+      || value?.draftPath
+      || value?.draft_path,
+  ).toLowerCase();
+  return path.endsWith(".html") || path.endsWith(".htm");
+}
+
+function documentKindFromParts(value = {}, collection = "documents") {
+  const documentKind = normalizedDocumentKind(
+    value?.documentKind || value?.document_kind || value?.source || value?.kind || value?.type,
+    collection,
+  );
+  if (documentKind === "document" && documentHasHtmlSignal(value)) return "html";
+  return documentKind;
+}
+
 export function normalizedDocumentId(value) {
   const parts = normalizedDocumentPath(value).split("/").filter(Boolean);
   if (!parts.length) return "";
-  const last = parts.pop().replace(/\.(?:md|markdown|arch)$/iu, "").trim();
+  const last = parts.pop().replace(/\.(?:md|markdown|arch|html|htm)$/iu, "").trim();
   if (last) parts.push(last);
   return parts.join("/");
 }
@@ -64,12 +100,19 @@ function documentRowType(row) {
 
 function documentFileNameFromParts(row, extension = "md") {
   const explicit = normalizedDocumentPath(row?.file_name).split("/").filter(Boolean).pop() || "";
-  if (explicit) return `${explicit.replace(/\.(?:md|markdown|arch)$/iu, "")}.${extension}`;
+  if (explicit) return `${explicit.replace(/\.(?:md|markdown|arch|html|htm)$/iu, "")}.${extension}`;
   const pathName = normalizedDocumentPath(row?.file_path || row?.path_key).split("/").filter(Boolean).pop() || "";
-  if (pathName) return `${pathName.replace(/\.(?:md|markdown|arch)$/iu, "")}.${extension}`;
+  if (pathName) return `${pathName.replace(/\.(?:md|markdown|arch|html|htm)$/iu, "")}.${extension}`;
   const id = normalizedDocumentId(row?.doc_id || row?.document_id || row?.id || row?.title || "document");
   const leaf = id.split("/").filter(Boolean).pop() || "document";
   return `${leaf}.${extension}`;
+}
+
+export function documentMimeTypeForKind(kind, collection = "documents") {
+  const extension = documentExtensionForKind(kind, collection);
+  if (extension === "arch") return "text/vnd.diffforge.arch";
+  if (extension === "html") return "text/html";
+  return "text/markdown";
 }
 
 function documentFilePathFromParts(row, extension = "md") {
@@ -162,10 +205,7 @@ export function skillSlug(title, existingIds = new Set()) {
 export function skillFromUnit(unit) {
   const rowType = documentRowType(unit);
   const collection = normalizedDocumentCollection();
-  const documentKind = normalizedDocumentKind(
-    unit?.document_kind || unit?.kind || unit?.type,
-    unit?.collection || unit?.document_collection || unit?.source || collection,
-  );
+  const documentKind = documentKindFromParts(unit, unit?.collection || unit?.document_collection || unit?.source || collection);
   const extension = text(unit?.extension || unit?.ext, documentExtensionForKind(documentKind, collection));
   const folderPath = normalizedDocumentPath(unit?.folder_path || unit?.parent_path_key);
   const filePath = rowType === "folder"
@@ -322,7 +362,7 @@ export function skillsToSkillUnits(skills) {
       content_md: String(skill?.content || "").trim(),
       doc_id: normalizedDocumentId(skill?.id || skill?.pathKey || skill?.filePath),
       document_id: normalizedDocumentId(skill?.id || skill?.pathKey || skill?.filePath),
-      document_kind: normalizedDocumentKind(skill?.documentKind || skill?.source, skill?.collection || skill?.source),
+      document_kind: documentKindFromParts(skill, skill?.collection || skill?.source),
       entry_kind: "document",
       file_name: text(skill?.fileName || skill?.file_name),
       file_path: normalizedDocumentPath(skill?.filePath || skill?.file_path || skill?.pathKey || skill?.path_key),
@@ -356,10 +396,7 @@ export function accountDocumentUnitFromRow(row, removed = false) {
     || row.has_content === true
     || row.has_content_payload === true
     || row.hydrated === true;
-  const documentKind = normalizedDocumentKind(
-    row.document_kind || row.kind || row.type,
-    row.collection || row.document_collection || row.source || collection,
-  );
+  const documentKind = documentKindFromParts(row, row.collection || row.document_collection || row.source || collection);
   const extension = text(row.extension || row.ext, documentExtensionForKind(documentKind, collection));
   const filePath = rowType === "folder"
     ? normalizedDocumentPath(row.file_path || row.path_key || row.folder_path || row.id)
@@ -494,7 +531,8 @@ export function accountDocumentUnitsFromPayload(payload) {
           });
           return;
         }
-        const extension = text(op[10]) === "text/vnd.diffforge.arch" ? "arch" : "md";
+        const mime = text(op[10]).toLowerCase();
+        const extension = mime === "text/vnd.diffforge.arch" ? "arch" : mime === "text/html" ? "html" : "md";
         const id = normalizedDocumentId(rawId);
         if (!id) return;
         const filePath = documentFilePathFromParts({ file_path: op[14], id }, extension);
@@ -636,17 +674,16 @@ export function accountDocumentRequestFromSkill(skill, { allow_conflict = false,
       local_only: Boolean(local_only),
     };
   }
-  const documentKind = normalizedDocumentKind(skill?.documentKind || skill?.source, collection);
+  const documentKind = documentKindFromParts(skill, collection);
   const extension = text(skill?.extension, documentExtensionForKind(documentKind, collection));
   const filePath = documentFilePathFromParts(skill, extension);
   const pathKey = normalizedDocumentPath(skill?.pathKey || skill?.path_key || filePath);
   const parentPathKey = normalizedDocumentPath(skill?.parentPathKey || skill?.parent_path_key || pathKey.split("/").slice(0, -1).join("/"));
   const fileName = documentFileNameFromParts({ ...skill, file_path: pathKey }, extension);
   const id = normalizedDocumentId(skill?.id || skill?.doc_id || skill?.document_id || pathKey) || skillSlug(skill?.title || "document");
-  const mimeType = text(
-    skill?.mimeType,
-    extension === "arch" ? "text/vnd.diffforge.arch" : "text/markdown",
-  );
+  const mimeType = documentKind === "html" || documentKind === "architecture"
+    ? documentMimeTypeForKind(documentKind, collection)
+    : text(skill?.mimeType || skill?.mime_type, documentMimeTypeForKind(documentKind, collection));
   const document = {
     allow_empty_overwrite: skill?.allowEmptyOverwrite === true || skill?.allow_empty_overwrite === true,
     asset_id: text(skill?.assetId),
@@ -691,7 +728,7 @@ export function accountDocumentRequestFromSkill(skill, { allow_conflict = false,
 
 export function accountDocumentHydrateRequestFromSkill(skill) {
   const collection = normalizedDocumentCollection();
-  const documentKind = normalizedDocumentKind(skill?.documentKind || skill?.source, collection);
+  const documentKind = documentKindFromParts(skill, collection);
   const extension = text(skill?.extension, documentExtensionForKind(documentKind, collection));
   const filePath = documentFilePathFromParts(skill, extension);
   const pathKey = normalizedDocumentPath(skill?.pathKey || skill?.path_key || filePath);
@@ -715,7 +752,9 @@ export function accountDocumentHydrateRequestFromSkill(skill) {
     folder_path: parentPathKey,
     id,
     local_path: text(skill?.localPath || skill?.local_path),
-    mime_type: text(skill?.mimeType || skill?.mime_type),
+    mime_type: documentKind === "html" || documentKind === "architecture"
+      ? documentMimeTypeForKind(documentKind, collection)
+      : text(skill?.mimeType || skill?.mime_type),
     name: text(skill?.title || skill?.name, id),
     parent_folder_id: parentPathKey,
     parent_path_key: parentPathKey,

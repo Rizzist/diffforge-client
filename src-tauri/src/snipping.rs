@@ -38,6 +38,10 @@ static SNIPPING_AREA_BEGIN_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SNIPPING_AREA_CURSOR_DEBUG_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static SNIPPING_AREA_CURSOR_DEBUG_LAST_MOUSE_LOG_MS: AtomicU64 = AtomicU64::new(0);
 const SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS: u64 = 80;
+#[cfg(target_os = "macos")]
+const SNIPPING_MACOS_FINDER_RESTART_SETTLE_MS: u64 = 160;
+#[cfg(target_os = "macos")]
+const SNIPPING_MACOS_CREATE_DESKTOP_ABSENT: &str = "__diffforge_absent__";
 const SNIPPING_SCAP_CAPTURE_FPS: u32 = 60;
 const SNIPPING_SCAP_WARM_CAPTURE_FPS: u32 = 30;
 const SNIPPING_SCAP_CAPTURE_TIMEOUT_MS: u64 = 4_500;
@@ -1234,9 +1238,9 @@ fn snipping_desktop_icons_marker_path(app: &AppHandle) -> Result<PathBuf, String
     Ok(app_data_dir.join(SNIPPING_DESKTOP_ICONS_MARKER_FILE))
 }
 
-// Only the Windows/Linux screen-side hides leave state worth a crash marker;
-// macOS hides capture-side and changes nothing on the system.
-#[cfg(any(windows, target_os = "linux"))]
+// Screen-side hides leave state worth a crash marker so a later app launch can
+// undo exactly what this process changed.
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 fn snipping_write_desktop_icons_marker(app: &AppHandle, marker: &SnippingDesktopIconsMarker) {
     let Ok(path) = snipping_desktop_icons_marker_path(app) else {
         return;
@@ -1256,24 +1260,76 @@ fn snipping_take_desktop_icons_marker(app: &AppHandle) -> Option<SnippingDesktop
     serde_json::from_str::<SnippingDesktopIconsMarker>(&contents).ok()
 }
 
-/// Undoes the Finder CreateDesktop toggle an older build's crash marker may
-/// have left behind. The scap-backed macOS path does not mutate Finder state.
 #[cfg(target_os = "macos")]
-fn snipping_macos_restore_finder_desktop_icons() {
-    let wrote = Command::new("defaults")
+fn snipping_macos_finder_create_desktop_value() -> Option<String> {
+    let output = Command::new("defaults")
+        .args(["read", "com.apple.finder", "CreateDesktop"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_macos_finder_create_desktop_is_hidden(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "0" | "false" | "no"
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_macos_write_finder_create_desktop(visible: bool) -> bool {
+    Command::new("defaults")
         .args([
             "write",
             "com.apple.finder",
             "CreateDesktop",
             "-bool",
-            "true",
+            if visible { "true" } else { "false" },
         ])
         .status()
         .map(|status| status.success())
-        .unwrap_or(false);
-    if wrote {
-        // Finder only re-evaluates CreateDesktop on relaunch.
-        let _ = Command::new("killall").arg("Finder").status();
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_macos_delete_finder_create_desktop() -> bool {
+    Command::new("defaults")
+        .args(["delete", "com.apple.finder", "CreateDesktop"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_macos_restart_finder_for_desktop_icons() {
+    // Finder only re-evaluates CreateDesktop on relaunch.
+    let _ = Command::new("killall").arg("Finder").status();
+    thread::sleep(Duration::from_millis(
+        SNIPPING_MACOS_FINDER_RESTART_SETTLE_MS,
+    ));
+}
+
+#[cfg(target_os = "macos")]
+fn snipping_macos_restore_finder_desktop_icons(previous_value: &str) {
+    let previous_value = previous_value.trim();
+    let restored = if previous_value == SNIPPING_MACOS_CREATE_DESKTOP_ABSENT {
+        snipping_macos_delete_finder_create_desktop()
+    } else {
+        let visible = previous_value.is_empty()
+            || !snipping_macos_finder_create_desktop_is_hidden(previous_value);
+        snipping_macos_write_finder_create_desktop(visible)
+    };
+    if restored {
+        snipping_macos_restart_finder_for_desktop_icons();
     }
 }
 
@@ -1450,10 +1506,37 @@ fn snipping_desktop_icons_hide_platform(app: &AppHandle) -> bool {
     true
 }
 
-// macOS shares the no-op screen-side hide with unsupported platforms. scap's
-// public target metadata does not expose enough Finder window ownership/layer
-// data to recreate the previous capture-side desktop-icon exclusion here.
-#[cfg(not(any(windows, target_os = "linux")))]
+#[cfg(target_os = "macos")]
+fn snipping_desktop_icons_hide_platform(app: &AppHandle) -> bool {
+    let previous_value = snipping_macos_finder_create_desktop_value();
+    if previous_value
+        .as_deref()
+        .is_some_and(snipping_macos_finder_create_desktop_is_hidden)
+    {
+        // The user already keeps desktop icons hidden; do not claim ownership
+        // or restore them later.
+        return false;
+    }
+
+    let marker = SnippingDesktopIconsMarker {
+        entries: vec![SnippingDesktopIconsRestoreEntry {
+            kind: "macos-finder".to_string(),
+            schema: "com.apple.finder".to_string(),
+            key: "CreateDesktop".to_string(),
+            value: previous_value.unwrap_or_else(|| SNIPPING_MACOS_CREATE_DESKTOP_ABSENT.to_string()),
+        }],
+    };
+    snipping_write_desktop_icons_marker(app, &marker);
+
+    if !snipping_macos_write_finder_create_desktop(false) {
+        let _ = snipping_take_desktop_icons_marker(app);
+        return false;
+    }
+    snipping_macos_restart_finder_for_desktop_icons();
+    true
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
 fn snipping_desktop_icons_hide_platform(_app: &AppHandle) -> bool {
     false
 }
@@ -1463,7 +1546,7 @@ fn snipping_desktop_icons_restore_entries(entries: &[SnippingDesktopIconsRestore
         match entry.kind.as_str() {
             #[cfg(target_os = "macos")]
             "macos-finder" => {
-                snipping_macos_restore_finder_desktop_icons();
+                snipping_macos_restore_finder_desktop_icons(&entry.value);
             }
             #[cfg(windows)]
             "windows-defview" => {
@@ -1500,9 +1583,7 @@ fn snipping_should_hide_desktop_icons(app: &AppHandle) -> bool {
 }
 
 /// Hides desktop icon clutter ahead of a capture when the setting is on.
-/// Screen-side hiding only exists on Windows/Linux; macOS filters the icon
-/// windows out of the capture itself, so this no-ops there. No-ops when
-/// icons are already hidden (by the user or an in-flight snip).
+/// No-ops when icons are already hidden by the user or an in-flight snip.
 fn snipping_hide_desktop_icons_for_capture(app: &AppHandle) {
     if !snipping_should_hide_desktop_icons(app) {
         return;
@@ -3637,7 +3718,7 @@ fn snipping_capture_monitor_full_image(
     monitor: &SnippingAreaMonitor,
     exclude_desktop_icons: bool,
 ) -> Result<image::RgbaImage, String> {
-    let warm_capture_allowed = !exclude_desktop_icons || cfg!(target_os = "macos");
+    let warm_capture_allowed = !exclude_desktop_icons;
     if warm_capture_allowed {
         if let Some(image) = snipping_warm_capture_frame_for_monitor(app, monitor, 0) {
             return Ok(image);
@@ -3677,7 +3758,7 @@ fn snipping_capture_area_image(
     monitor: &SnippingAreaMonitor,
     request: &SnippingAreaSelectionRequest,
 ) -> Result<image::RgbaImage, String> {
-    snipping_hide_area_overlay(app);
+    snipping_hide_area_overlay_for_capture(app);
     snipping_hide_desktop_icons_for_capture(app);
     let capture_ready_at_ms = current_time_ms();
     thread::sleep(Duration::from_millis(
@@ -3690,7 +3771,6 @@ fn snipping_capture_area_image(
         capture_ready_at_ms,
     )
     .and_then(|image| snipping_crop_area_frame_by_request(&image, request));
-    snipping_restore_desktop_icons_after_capture(app);
     result
 }
 
@@ -9657,7 +9737,9 @@ fn snipping_begin_area_for(
                 .into_iter()
                 .map(|(_, label, monitor, image)| (label, monitor, Some(image))),
         );
+        snipping_restore_desktop_icons_after_capture(app);
     } else {
+        snipping_hide_desktop_icons_for_capture(app);
         ordered.reserve(monitors.len());
         for (index, mut monitor) in monitors.into_iter().enumerate() {
             monitor.snapshot_width = 0;
@@ -9704,7 +9786,10 @@ fn snipping_begin_area_for(
         return Err(error);
     }
 
-    snipping_replace_area_sessions(app, sessions)?;
+    if let Err(error) = snipping_replace_area_sessions(app, sessions) {
+        snipping_restore_desktop_icons_after_capture(app);
+        return Err(error);
+    }
     #[cfg(target_os = "macos")]
     {
         SNIPPING_AREA_SESSION_ACTIVE.store(true, Ordering::Release);
@@ -9954,6 +10039,7 @@ fn snipping_refreeze_area_snapshot_for_space_change(app: &AppHandle) {
     thread::spawn(move || {
         // Let the Space transition animation settle before re-capturing.
         thread::sleep(Duration::from_millis(260));
+        snipping_hide_desktop_icons_for_capture(&app);
         for label in labels {
             let Some(window) = app.get_webview_window(&label) else {
                 continue;
@@ -9975,6 +10061,7 @@ fn snipping_refreeze_area_snapshot_for_space_change(app: &AppHandle) {
             }
             snipping_store_area_snapshot_backdrop(&app, &label, image);
         }
+        snipping_restore_desktop_icons_after_capture(&app);
     });
 }
 
@@ -10094,7 +10181,15 @@ fn snipping_cancel_area_snip_for(app: &AppHandle) -> Result<Value, String> {
     }))
 }
 
+fn snipping_hide_area_overlay_for_capture(app: &AppHandle) {
+    snipping_hide_area_overlay_with_desktop_restore(app, false);
+}
+
 fn snipping_hide_area_overlay(app: &AppHandle) {
+    snipping_hide_area_overlay_with_desktop_restore(app, true);
+}
+
+fn snipping_hide_area_overlay_with_desktop_restore(app: &AppHandle, restore_desktop_icons: bool) {
     log_snipping_area_cursor_debug_event(
         "native.hide_overlay_begin",
         json!({
@@ -10116,9 +10211,11 @@ fn snipping_hide_area_overlay(app: &AppHandle) {
     }
     #[cfg(target_os = "macos")]
     snipping_restore_default_cursor_now();
-    // Windows/Linux hide the real desktop icons for the whole area session;
-    // teardown (finish, cancel, Escape) is where they come back.
-    snipping_restore_desktop_icons_after_capture(app);
+    if restore_desktop_icons {
+        // Live area sessions hide real desktop icons for the whole selection;
+        // teardown (finish, cancel, Escape) is where they come back.
+        snipping_restore_desktop_icons_after_capture(app);
+    }
     log_snipping_area_cursor_debug_event(
         "native.hide_overlay_done",
         json!({

@@ -340,6 +340,7 @@ import {
   LoopspaceGraphNode,
   LoopspaceGraphNodeIcon,
   LoopspaceGraphNodeText,
+  LoopspaceGraphNodeTitleRow,
   LoopspaceGraphNodeOutputPorts,
   LoopspaceGraphNodeOutputPort,
   LoopspaceGraphNodeSelectButton,
@@ -383,6 +384,9 @@ import {
   LoopspaceGraphMessageSettingsGrid,
   LoopspaceGraphMessageSettingsField,
   LoopspaceGraphMessageSettingsSelect,
+  LoopspaceGraphMessageSettingsTabButton,
+  LoopspaceGraphMessageSettingsTabList,
+  LoopspaceGraphMessageSettingsTabPanel,
   LoopspaceGraphMessageSubnodeToolbar,
   LoopspaceGraphMessageSubnodeButton,
   LoopspaceGraphMessageSubnodeList,
@@ -417,11 +421,26 @@ import {
   LoopspaceRuntimePanelEmpty,
   LoopspaceRuntimePanelGrid,
   LoopspaceRuntimePanelNodeCard,
-  LoopspaceRuntimePanelEventList,
-  LoopspaceRuntimePanelEventRow,
+  LoopspaceRuntimePanelSettingsAction,
+  LoopspaceRuntimePanelSettingsHeader,
+  LoopspaceRuntimePanelSettingsInspector,
+  LoopspaceRuntimePanelSettingsList,
+  LoopspaceRuntimePanelSettingsMain,
+  LoopspaceRuntimePanelSettingsRow,
   LoopspaceRuntimePanelResumeButton,
+  LoopspaceRuntimeDetail,
+  LoopspaceRuntimeDetailGrid,
+  LoopspaceRuntimeDetailHeader,
+  LoopspaceRuntimeDetailMessage,
+  LoopspaceRuntimeStatusPill,
+  LoopspaceRuntimeTimeline,
+  LoopspaceRuntimeTimelineList,
+  LoopspaceRuntimeTimelineMain,
+  LoopspaceRuntimeTimelineMeta,
+  LoopspaceRuntimeTimelineRow,
   LoopspaceRuntimeConsole,
   LoopspaceRuntimeConsoleDetail,
+  LoopspaceRuntimeConsoleIcon,
   LoopspaceRuntimeConsoleLoader,
   LoopspaceRuntimeConsoleRow,
   LoopspaceRuntimeError,
@@ -1213,11 +1232,110 @@ function loopspaceRuntimeEventTone(event) {
   return "neutral";
 }
 
-function loopspaceRuntimeEventKindLabel(event) {
-  const kind = String(event?.kind || event?.eventKind || "").trim();
-  if (!kind) return "runtime";
-  const [head, tail] = kind.split(".");
-  return (tail || head || "runtime").replace(/_/g, " ");
+function loopspaceRuntimeEventTimelineIcon(event) {
+  const status = normalizeLoopspaceNodeRuntimeStatus(loopspaceRuntimeEventStatus(event));
+  const severity = String(event?.severity || "").trim().toLowerCase();
+  const haystack = [
+    status,
+    severity,
+    event?.kind,
+    event?.eventKind,
+    event?.message,
+  ].join(" ").toLowerCase();
+  if (status === "success" || /\b(completed|complete|success|succeeded)\b/.test(haystack)) return "completed";
+  if (status === "interrupted" || status === "resume_ready" || /\b(interrupted|interrupt|resume_ready)\b/.test(haystack)) return "interrupted";
+  if (status === "failed" || /\b(failed|failure|error|denied|cancelled)\b/.test(haystack)) return "failed";
+  if (status === "running" || status === "queued" || status === "resume_requested" || /\b(running|queued|dispatch|sent)\b/.test(haystack)) return "running";
+  return "neutral";
+}
+
+function loopspaceRuntimeTimelineIconForStatus(status) {
+  const normalized = normalizeLoopspaceNodeRuntimeStatus(status);
+  if (normalized === "success") return "completed";
+  if (normalized === "failed") return "failed";
+  if (normalized === "interrupted" || normalized === "resume_ready") return "interrupted";
+  if (normalized === "queued") return "queued";
+  if (normalized === "running" || normalized === "resume_requested") return "running";
+  return "neutral";
+}
+
+function loopspaceRuntimeNodeKindLabel(node = null, trigger = null) {
+  if (trigger || node?.triggerId) {
+    return loopspaceTriggerTypeLabel(String(trigger?.type || node?.triggerType || node?.trigger_type || "manual").trim().toLowerCase());
+  }
+  switch (String(node?.nodeKind || node?.kind || "").trim()) {
+    case "send_message":
+      return "Send message";
+    case "run_script":
+      return "Run script";
+    case "document_read":
+      return "Document read";
+    case "document_write":
+      return "Document write";
+    case "asset_read":
+      return "Asset read";
+    case "asset_write":
+      return "Asset write";
+    case "device":
+      return "Device";
+    default:
+      return String(node?.role || node?.nodeKind || node?.kind || "Loop runtime").replace(/_/g, " ");
+  }
+}
+
+function loopspaceRuntimeNodeTitle(node = null, trigger = null) {
+  const kindLabel = loopspaceRuntimeNodeKindLabel(node, trigger);
+  if (!node) return kindLabel;
+  if (trigger?.name) return String(trigger.name).trim();
+  if (node.nodeKind === "run_script") {
+    return String(
+      node.label
+        || loopspaceGraphPropValue(node.props, ["script_name", "scriptName", "name"])
+        || kindLabel,
+    ).trim();
+  }
+  if (node.nodeKind === "send_message") {
+    return String(node.label || kindLabel).trim();
+  }
+  return String(node.label || kindLabel).trim();
+}
+
+function loopspaceRuntimeStatusSentence(title, status) {
+  const safeTitle = String(title || "Loop runtime").trim();
+  switch (normalizeLoopspaceNodeRuntimeStatus(status)) {
+    case "queued":
+      return `${safeTitle} is queued.`;
+    case "running":
+      return `${safeTitle} is running.`;
+    case "success":
+      return `${safeTitle} completed.`;
+    case "failed":
+      return `${safeTitle} failed.`;
+    case "interrupted":
+      return `${safeTitle} was interrupted.`;
+    case "resume_ready":
+      return `${safeTitle} is ready to resume.`;
+    case "resume_requested":
+      return `${safeTitle} is resuming.`;
+    default:
+      return `${safeTitle} updated.`;
+  }
+}
+
+function loopspaceRuntimeFriendlyMessage(event, title, status) {
+  const fallback = loopspaceRuntimeStatusSentence(title, status);
+  const message = String(event?.message || event?.status || "").trim();
+  if (!message) return fallback;
+  const replacements = [
+    loopspaceRuntimeEventNodeId(event),
+    loopspaceRuntimeEventRunId(event),
+    loopspaceRuntimeEventEdgeId(event),
+  ].filter(Boolean);
+  let cleaned = message;
+  replacements.forEach((token) => {
+    cleaned = cleaned.split(token).join(title || "Loop runtime");
+  });
+  return cleaned.trim() || fallback;
 }
 
 function formatLoopspaceRuntimeConsoleTime(value) {
@@ -1282,16 +1400,6 @@ function formatLoopspaceCountdown(targetMs, nowMs = Date.now()) {
 
 function loopspaceRuntimeField(row, keys, fallback = "") {
   return appControlText(row, keys) || fallback;
-}
-
-function loopspaceRuntimeStatusTone(status) {
-  const normalized = String(status || "").trim().toLowerCase();
-  if (["success", "completed", "done"].includes(normalized)) return "good";
-  if (["resume_ready", "interrupted"].includes(normalized)) return "paused";
-  if (["error", "failed", "timeout", "cancelled"].includes(normalized)) return "error";
-  if (["queued", "awaiting_device", "pending"].includes(normalized)) return "queued";
-  if (["running", "active", "dispatching", "resume_requested"].includes(normalized)) return "active";
-  return "neutral";
 }
 
 function normalizeLoopspaceNodeRuntimeStatus(status) {
@@ -5293,12 +5401,15 @@ const LOOPSPACE_GRAPH_MESSAGE_STEP_GAP = 30;
 const LOOPSPACE_GRAPH_MESSAGE_STEP_COLLISION_GAP = 16;
 const LOOPSPACE_GRAPH_MESSAGE_STEP_FLOW_INSET = 8;
 const LOOPSPACE_GRAPH_MESSAGE_FLOW_MIN_HEIGHT = 118;
-const LOOPSPACE_GRAPH_MESSAGE_SETTINGS_MIN_WIDTH = 840;
-const LOOPSPACE_GRAPH_MESSAGE_SETTINGS_MIN_HEIGHT = 360;
 const LOOPSPACE_RUNTIME_PANEL_DEFAULT_HEIGHT = 174;
 const LOOPSPACE_RUNTIME_PANEL_MIN_HEIGHT = 88;
 const LOOPSPACE_RUNTIME_PANEL_MIN_GRAPH_HEIGHT = 160;
 const LOOPSPACE_RUNTIME_LOG_PAGE_SIZE = 30;
+const LOOPSPACE_RUNTIME_SETTINGS_PANEL_HEIGHT = 340;
+const LOOPSPACE_RUNTIME_SETTINGS_CARD_WIDTH = 260;
+const LOOPSPACE_RUNTIME_SETTINGS_CARD_GAP = 10;
+const LOOPSPACE_RUNTIME_SETTINGS_GRID_PADDING = 8;
+const LOOPSPACE_RUNTIME_SETTINGS_GRID_OVERSCAN = 2;
 
 function clampLoopspaceGraphZoom(value) {
   return Math.min(LOOPSPACE_GRAPH_MAX_ZOOM, Math.max(LOOPSPACE_GRAPH_MIN_ZOOM, Number(value) || 1));
@@ -7537,6 +7648,10 @@ function LoopspaceRuntimeView({
   const [runtimePanelHeight, setRuntimePanelHeight] = useState(LOOPSPACE_RUNTIME_PANEL_DEFAULT_HEIGHT);
   const [runtimePanelResizing, setRuntimePanelResizing] = useState(false);
   const [runtimePanelAutoScroll, setRuntimePanelAutoScroll] = useState(true);
+  const [settingsPanelScrollTop, setSettingsPanelScrollTop] = useState(0);
+  const [settingsPanelViewportHeight, setSettingsPanelViewportHeight] = useState(LOOPSPACE_RUNTIME_PANEL_DEFAULT_HEIGHT);
+  const [settingsPanelViewportWidth, setSettingsPanelViewportWidth] = useState(LOOPSPACE_RUNTIME_SETTINGS_CARD_WIDTH + (LOOPSPACE_RUNTIME_SETTINGS_GRID_PADDING * 2));
+  const [selectedRuntimeRowId, setSelectedRuntimeRowId] = useState("");
   const [selectedHistoryRunId, setSelectedHistoryRunId] = useState("");
   const [runtimeSignalFrameMs, setRuntimeSignalFrameMs] = useState(() => Date.now());
   const [timerNowMs, setTimerNowMs] = useState(() => Date.now());
@@ -7564,7 +7679,8 @@ function LoopspaceRuntimeView({
   const [pendingGraphNodeIds, setPendingGraphNodeIds] = useState(() => new Set());
   const [nodeSizes, setNodeSizes] = useState({});
   const [documentContextSearchByNode, setDocumentContextSearchByNode] = useState({});
-  const [sendMessageSettingsNodeId, setSendMessageSettingsNodeId] = useState("");
+  const [settingsNodeId, setSettingsNodeId] = useState("");
+  const [sendMessageSettingsTab, setSendMessageSettingsTab] = useState("model");
   const [sendMessageSettingsDrafts, setSendMessageSettingsDrafts] = useState({});
   const [sendMessageCheckpointDragPositions, setSendMessageCheckpointDragPositions] = useState({});
   const [sendMessageCheckpointLayoutPriorityId, setSendMessageCheckpointLayoutPriorityId] = useState("");
@@ -7642,7 +7758,6 @@ function LoopspaceRuntimeView({
 
   const recordGraphNodeSize = useCallback((nodeId, element) => {
     if (!element) return;
-    if (element.getAttribute?.("data-settings-open") === "true") return;
     const nodeKind = element.getAttribute?.("data-kind");
     const isResourceContextNode = nodeKind === "document_read"
       || nodeKind === "document_write"
@@ -8083,6 +8198,11 @@ function LoopspaceRuntimeView({
     setNodeDragPositions({});
     setSendMessageCheckpointDragPositions({});
     setSendMessageCheckpointLayoutPriorityId("");
+    setSettingsNodeId("");
+    setSendMessageSettingsDrafts({});
+    setSendMessageSettingsTab("model");
+    setSettingsPanelScrollTop(0);
+    setSelectedRuntimeRowId("");
     setManualTriggerRunPendingId("");
     setGraphSaveState("idle");
     setPendingGraphNodeIds(new Set());
@@ -8253,6 +8373,17 @@ function LoopspaceRuntimeView({
     return map;
   }, [parsedGraph.nodes]);
 
+  useEffect(() => {
+    if (!settingsNodeId || graphNodeLookup.has(settingsNodeId)) return;
+    setSettingsNodeId("");
+    setSendMessageSettingsDrafts((current) => {
+      if (!Object.prototype.hasOwnProperty.call(current, settingsNodeId)) return current;
+      const next = { ...current };
+      delete next[settingsNodeId];
+      return next;
+    });
+  }, [graphNodeLookup, settingsNodeId]);
+
   const graphNodeLayouts = useMemo(() => {
     const map = new Map();
     const childCountByParentId = new Map();
@@ -8308,19 +8439,12 @@ function LoopspaceRuntimeView({
           ...layout,
           height: Math.max(layout.height, flowBounds.requiredNodeHeight || layout.height),
         };
-        if (sendMessageSettingsNodeId === node.id) {
-          layout = {
-            ...layout,
-            height: Math.max(layout.height, LOOPSPACE_GRAPH_MESSAGE_SETTINGS_MIN_HEIGHT),
-            width: Math.max(layout.width, LOOPSPACE_GRAPH_MESSAGE_SETTINGS_MIN_WIDTH),
-          };
-        }
       }
       map.set(node.id, layout);
       map.set(loopspaceGraphNodeIdFromLabel(node.label), layout);
     });
     visibleGraphNodes.forEach((node) => {
-      if (node.nodeKind !== "send_message" || sendMessageSettingsNodeId === node.id) return;
+      if (node.nodeKind !== "send_message") return;
       const parentLayout = map.get(node.id);
       if (!parentLayout) return;
       const children = parsedGraph.nodes
@@ -8370,7 +8494,7 @@ function LoopspaceRuntimeView({
       });
     });
     return map;
-  }, [nodeDragPositions, nodeSizes, parsedGraph.nodes, sendMessageCheckpointDragPositions, sendMessageCheckpointLayoutPriorityId, sendMessageSettingsNodeId, visibleGraphNodes]);
+  }, [nodeDragPositions, nodeSizes, parsedGraph.nodes, sendMessageCheckpointDragPositions, sendMessageCheckpointLayoutPriorityId, visibleGraphNodes]);
 
   const drainGraphSaveQueue = useCallback(async () => {
     if (graphSaveInFlightRef.current) return;
@@ -8702,10 +8826,41 @@ function LoopspaceRuntimeView({
     }));
   }, []);
 
+  const openLoopspaceGraphNodeSettings = useCallback((node) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!nodeId) return;
+    const surfaceHeight = runtimeSurfaceRef.current?.getBoundingClientRect?.().height || 0;
+    setRuntimePanelExpanded(true);
+    setRuntimePanelTab("settings");
+    setRuntimePanelHeight((current) => clampLoopspaceRuntimePanelHeight(
+      Math.max(Number(current) || 0, LOOPSPACE_RUNTIME_SETTINGS_PANEL_HEIGHT),
+      surfaceHeight,
+    ));
+    setSettingsNodeId(nodeId);
+    setSettingsPanelScrollTop(0);
+    if (node.nodeKind === "send_message") {
+      setSendMessageSettingsTab("model");
+      const draft = loopspaceSendMessageDraftFromNode(node, loopspaceAgentLaunchDefaultsRef.current);
+      setSendMessageSettingsDrafts((current) => (
+        Object.prototype.hasOwnProperty.call(current, nodeId)
+          ? current
+          : {
+              ...current,
+              [nodeId]: draft,
+            }
+      ));
+    }
+    window.requestAnimationFrame(() => {
+      if (runtimePanelBodyRef.current) {
+        runtimePanelBodyRef.current.scrollTop = 0;
+      }
+    });
+  }, []);
+
   const cancelSendMessageSettings = useCallback((nodeId) => {
     const key = String(nodeId || "").trim();
     if (!key) return;
-    setSendMessageSettingsNodeId((current) => (current === key ? "" : current));
+    setSettingsNodeId((current) => (current === key ? "" : current));
     setSendMessageSettingsDrafts((current) => {
       if (!Object.prototype.hasOwnProperty.call(current, key)) return current;
       const next = { ...current };
@@ -8727,7 +8882,7 @@ function LoopspaceRuntimeView({
         target_agent_id: normalized.target_agent_id,
       },
     });
-    setSendMessageSettingsNodeId("");
+    setSettingsNodeId("");
     setSendMessageSettingsDrafts((current) => {
       const next = { ...current };
       delete next[nodeId];
@@ -9253,8 +9408,11 @@ function LoopspaceRuntimeView({
     event?.currentTarget?.releasePointerCapture?.(gesture.pointerId);
     if (moved && position) {
       void commitGraphNodePosition(gesture.nodeId, position);
+    } else if (!moved && runtimePanelTab === "settings") {
+      const node = graphNodeLookup.get(gesture.nodeId);
+      if (node) openLoopspaceGraphNodeSettings(node);
     }
-  }, [commitGraphNodePosition]);
+  }, [commitGraphNodePosition, graphNodeLookup, openLoopspaceGraphNodeSettings, runtimePanelTab]);
 
   const startGraphConnection = useCallback((event, node, portId = "out") => {
     if (busy || !node?.id) return;
@@ -10046,6 +10204,245 @@ function LoopspaceRuntimeView({
     () => buildLoopspaceNodeRuntimeStateMap(visibleRuntimeEvents, runtimeHead),
     [runtimeHead, visibleRuntimeEvents],
   );
+  const currentRunRuntimeEvents = useMemo(() => {
+    if (!runtimeHeadRunId) return visibleRuntimeEvents;
+    return visibleRuntimeEvents.filter((event) => {
+      const eventRunId = loopspaceRuntimeEventRunId(event);
+      return !eventRunId || eventRunId === runtimeHeadRunId;
+    });
+  }, [runtimeHeadRunId, visibleRuntimeEvents]);
+  const runtimeTimelineStateByNodeId = useMemo(
+    () => buildLoopspaceNodeRuntimeStateMap(currentRunRuntimeEvents, runtimeHead),
+    [currentRunRuntimeEvents, runtimeHead],
+  );
+  const runtimeTimelineRows = useMemo(() => {
+    const rows = [];
+    runtimeTimelineStateByNodeId.forEach((state, nodeId) => {
+      const node = graphNodeLookup.get(nodeId) || null;
+      const trigger = node?.triggerId ? triggerById.get(node.triggerId) : null;
+      const status = normalizeLoopspaceNodeRuntimeStatus(state.status) || state.status || "running";
+      const title = loopspaceRuntimeNodeTitle(node, trigger);
+      const kindLabel = loopspaceRuntimeNodeKindLabel(node, trigger);
+      const nodeDeviceId = node ? String(loopspaceGraphPropValue(node.props, ["device_id", "deviceId"]) || "").trim() : "";
+      const nodeDevice = nodeDeviceId ? loopspaceGraphDeviceLookup.get(nodeDeviceId.toLowerCase()) : null;
+      const scriptKey = node?.nodeKind === "run_script"
+        ? String(
+          loopspaceGraphPropValue(node.props, ["script_id", "scriptId"])
+            || loopspaceGraphPropValue(node.props, ["path_key", "pathKey"])
+            || "",
+        ).trim()
+        : "";
+      const scriptOption = scriptKey
+        ? loopspaceGraphScriptOptions.find((option) => (
+          loopspaceGraphScriptOptionKey(option) === scriptKey
+          || option.path_key === scriptKey
+          || option.script_id === scriptKey
+        ))
+        : null;
+      const targetLabel = String(
+        loopspaceGraphPropValue(node?.props, ["device_label", "deviceLabel"])
+          || scriptOption?.device_label
+          || nodeDevice?.displayName
+          || nodeDevice?.display_name
+          || nodeDevice?.device_label
+          || nodeDevice?.deviceLabel
+          || nodeDevice?.device_name
+          || nodeDevice?.deviceName
+          || nodeDevice?.name
+          || "",
+      ).trim();
+      const scriptLabel = node?.nodeKind === "run_script"
+        ? String(
+          loopspaceGraphPropValue(node.props, ["script_name", "scriptName"])
+            || scriptOption?.script_name
+            || scriptOption?.label
+            || "",
+        ).trim()
+        : "";
+      const timeMs = loopspaceRuntimeTimestampMs(state.event) || loopspaceRuntimeTimestampMs(state.details) || 0;
+      const statusLabel = loopspaceNodeRuntimeStatusLabel(status) || String(status || "Active").replace(/_/g, " ");
+      const message = loopspaceRuntimeFriendlyMessage(state.event, title, status);
+      const subtitle = [
+        kindLabel,
+        scriptLabel && scriptLabel !== title ? scriptLabel : "",
+        targetLabel ? `on ${targetLabel}` : "",
+      ].filter(Boolean).join(" - ");
+      rows.push({
+        canResume: node?.nodeKind === "send_message" && loopspaceRuntimeStateCanResume(state),
+        configurable: node && ["asset_read", "asset_write", "document_read", "document_write", "send_message"].includes(node.nodeKind),
+        detailRows: [
+          ["Type", kindLabel],
+          targetLabel ? ["Target", targetLabel] : null,
+          scriptLabel && scriptLabel !== title ? ["Script", scriptLabel] : null,
+          timeMs ? ["Updated", formatLoopspaceRuntimeTime(timeMs) || formatLoopspaceRuntimeConsoleTime(timeMs)] : null,
+          state.runId ? ["Run ID", state.runId] : null,
+          nodeId ? ["Node ID", nodeId] : null,
+          state.edgeId ? ["Edge ID", state.edgeId] : null,
+        ].filter(Boolean),
+        icon: loopspaceRuntimeTimelineIconForStatus(status),
+        id: `node:${nodeId}`,
+        message,
+        node,
+        nodeId,
+        runId: state.runId || "",
+        sortValue: state.sortValue || timeMs || 0,
+        sourceMessage: String(state.event?.message || "").trim(),
+        status,
+        statusLabel,
+        subtitle,
+        timeMs,
+        title,
+        tone: loopspaceNodeRuntimeStatusTone(status),
+      });
+    });
+    if (!rows.length && runtimeHead) {
+      const status = normalizeLoopspaceNodeRuntimeStatus(runtimeHeadStatus) || runtimeHeadStatus || "running";
+      const timeMs = loopspaceRuntimeTimestampMs(runtimeHead);
+      rows.push({
+        canResume: false,
+        configurable: false,
+        detailRows: [
+          ["Type", "Loop runtime"],
+          timeMs ? ["Updated", formatLoopspaceRuntimeTime(timeMs) || formatLoopspaceRuntimeConsoleTime(timeMs)] : null,
+          runtimeHeadRunId ? ["Run ID", runtimeHeadRunId] : null,
+          runtimeHeadNodeId ? ["Node ID", runtimeHeadNodeId] : null,
+          runtimeHeadEdgeId ? ["Edge ID", runtimeHeadEdgeId] : null,
+        ].filter(Boolean),
+        icon: loopspaceRuntimeTimelineIconForStatus(status),
+        id: `head:${runtimeHeadRunId || runtimeHeadNodeId || "runtime"}`,
+        message: loopspaceRuntimeFriendlyMessage(runtimeHead, "Loop runtime", status),
+        node: null,
+        nodeId: runtimeHeadNodeId,
+        runId: runtimeHeadRunId,
+        sortValue: loopspaceRuntimeEventSortValue(runtimeHead) || timeMs || 0,
+        sourceMessage: String(runtimeHead?.message || "").trim(),
+        status,
+        statusLabel: loopspaceNodeRuntimeStatusLabel(status) || String(status || "Active").replace(/_/g, " "),
+        subtitle: "Loop runtime",
+        timeMs,
+        title: "Loop runtime",
+        tone: loopspaceNodeRuntimeStatusTone(status),
+      });
+    }
+    return rows.sort((left, right) => (
+      (left.sortValue || 0) - (right.sortValue || 0)
+      || String(left.title).localeCompare(String(right.title))
+    ));
+  }, [
+    graphNodeLookup,
+    loopspaceGraphDeviceLookup,
+    loopspaceGraphScriptOptions,
+    runtimeHead,
+    runtimeHeadEdgeId,
+    runtimeHeadNodeId,
+    runtimeHeadRunId,
+    runtimeHeadStatus,
+    runtimeTimelineStateByNodeId,
+    triggerById,
+  ]);
+  const selectedRuntimeRow = useMemo(() => (
+    runtimeTimelineRows.find((row) => row.id === selectedRuntimeRowId)
+      || runtimeTimelineRows[runtimeTimelineRows.length - 1]
+      || null
+  ), [runtimeTimelineRows, selectedRuntimeRowId]);
+  const selectedRuntimeNodeId = selectedRuntimeRow?.nodeId || "";
+  const settingsPanelRows = useMemo(() => (
+    visibleGraphNodes.map((node, index) => {
+      const trigger = node.triggerId ? triggerById.get(node.triggerId) : null;
+      const triggerType = node.triggerId
+        ? String(trigger?.type || node.triggerType || node.trigger_type || "manual").trim().toLowerCase()
+        : "";
+      const kindLabel = node.triggerId
+        ? loopspaceTriggerTypeLabel(triggerType || "manual")
+        : node.nodeKind === "send_message"
+          ? "Send message"
+          : node.nodeKind === "run_script"
+            ? "Run script"
+            : node.nodeKind === "document_read"
+              ? "Document read"
+              : node.nodeKind === "document_write"
+                ? "Document write"
+                : node.nodeKind === "asset_read"
+                  ? "Asset read"
+                  : node.nodeKind === "asset_write"
+                    ? "Asset write"
+                    : node.nodeKind === "device"
+                      ? "Device"
+                      : String(node.role || node.nodeKind || "Graph node").trim();
+      const runtimeState = runtimeStateByNodeId.get(node.id);
+      const title = String(
+        trigger?.name
+          || node.label
+          || kindLabel
+          || `Node ${index + 1}`,
+      ).trim();
+      const subtitle = [
+        kindLabel,
+        node.id && node.id !== title ? node.id : "",
+        runtimeState?.label || "",
+      ].filter(Boolean).join(" - ");
+      return {
+        configurable: [
+          "asset_read",
+          "asset_write",
+          "document_read",
+          "document_write",
+          "send_message",
+        ].includes(node.nodeKind),
+        id: node.id || `node-${index}`,
+        kind: node.triggerId ? triggerType : node.nodeKind || node.role || "loop",
+        node,
+        runtimeTone: runtimeState?.tone || "",
+        subtitle,
+        title,
+      };
+    })
+  ), [runtimeStateByNodeId, triggerById, visibleGraphNodes]);
+  const selectedSettingsNode = settingsNodeId ? graphNodeLookup.get(settingsNodeId) || null : null;
+  const settingsPanelAvailableWidth = Math.max(
+    1,
+    settingsPanelViewportWidth - (LOOPSPACE_RUNTIME_SETTINGS_GRID_PADDING * 2),
+  );
+  const settingsPanelColumnCount = Math.max(
+    1,
+    Math.floor(
+      (settingsPanelAvailableWidth + LOOPSPACE_RUNTIME_SETTINGS_CARD_GAP)
+        / (LOOPSPACE_RUNTIME_SETTINGS_CARD_WIDTH + LOOPSPACE_RUNTIME_SETTINGS_CARD_GAP),
+    ),
+  );
+  const settingsPanelCardWidth = settingsPanelColumnCount === 1
+    ? Math.max(1, Math.min(LOOPSPACE_RUNTIME_SETTINGS_CARD_WIDTH, settingsPanelAvailableWidth))
+    : LOOPSPACE_RUNTIME_SETTINGS_CARD_WIDTH;
+  const settingsPanelCardHeight = Math.max(126, Math.round(settingsPanelCardWidth / 1.618));
+  const settingsPanelGridStride = settingsPanelCardHeight + LOOPSPACE_RUNTIME_SETTINGS_CARD_GAP;
+  const settingsPanelGridRowCount = Math.ceil(settingsPanelRows.length / settingsPanelColumnCount);
+  const settingsPanelListHeight = Math.max(
+    0,
+    settingsPanelRows.length
+      ? (settingsPanelGridRowCount * settingsPanelCardHeight)
+        + ((settingsPanelGridRowCount - 1) * LOOPSPACE_RUNTIME_SETTINGS_CARD_GAP)
+        + (LOOPSPACE_RUNTIME_SETTINGS_GRID_PADDING * 2)
+      : 0,
+  );
+  const settingsPanelFirstGridRow = Math.max(
+    0,
+    Math.floor(settingsPanelScrollTop / settingsPanelGridStride) - LOOPSPACE_RUNTIME_SETTINGS_GRID_OVERSCAN,
+  );
+  const settingsPanelVisibleGridRowCount = Math.max(
+    1,
+    Math.ceil((settingsPanelViewportHeight || runtimePanelHeight) / settingsPanelGridStride)
+      + (LOOPSPACE_RUNTIME_SETTINGS_GRID_OVERSCAN * 2),
+  );
+  const settingsPanelFirstIndex = settingsPanelFirstGridRow * settingsPanelColumnCount;
+  const settingsPanelVisibleCount = settingsPanelVisibleGridRowCount * settingsPanelColumnCount;
+  const visibleSettingsPanelRows = selectedSettingsNode
+    ? []
+    : settingsPanelRows
+      .slice(settingsPanelFirstIndex, settingsPanelFirstIndex + settingsPanelVisibleCount)
+      .map((row, offset) => ({
+        index: settingsPanelFirstIndex + offset,
+        row,
+      }));
   const sendMessageCheckpointProgressByKey = useMemo(
     () => buildLoopspaceCheckpointProgressMap(
       visibleRuntimeEvents,
@@ -10235,6 +10632,11 @@ function LoopspaceRuntimeView({
   const selectedRuntimeEvent = useMemo(() => (
     visibleRuntimeEvents.find((event) => event.id === selectedHistoryRunId) || null
   ), [selectedHistoryRunId, visibleRuntimeEvents]);
+  useEffect(() => {
+    if (!selectedRuntimeRowId) return;
+    if (runtimeTimelineRows.some((row) => row.id === selectedRuntimeRowId)) return;
+    setSelectedRuntimeRowId("");
+  }, [runtimeTimelineRows, selectedRuntimeRowId]);
   const runtimeHeadNode = runtimeHeadNodeId ? graphNodeLookup.get(runtimeHeadNodeId) : null;
   const runtimeHeadResumeState = runtimeHeadNodeId
     ? (runtimeStateByNodeId.get(runtimeHeadNodeId) || {
@@ -10339,7 +10741,16 @@ function LoopspaceRuntimeView({
   }, [loopspaceId, refreshLoopspaceLogs, scopedRuntimeEvents, runtimeEventsHasMoreBefore]);
 
   const onRuntimePanelScroll = useCallback((event) => {
-    if (runtimePanelTab !== "logs") return;
+    if (runtimePanelTab === "settings") {
+      const body = event.currentTarget;
+      if (body) {
+        setSettingsPanelScrollTop(body.scrollTop);
+        setSettingsPanelViewportHeight(body.clientHeight);
+        setSettingsPanelViewportWidth(body.clientWidth);
+      }
+      return;
+    }
+    if (runtimePanelTab !== "logs" && runtimePanelTab !== "runtime") return;
     const body = event.currentTarget;
     if (!body) return;
     const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 36;
@@ -10349,7 +10760,7 @@ function LoopspaceRuntimeView({
     if (nearBottom && !runtimePanelAutoScroll) {
       setRuntimePanelAutoScroll(true);
     }
-    if (body.scrollTop < 28) {
+    if (runtimePanelTab === "logs" && body.scrollTop < 28) {
       void loadOlderRuntimeEvents();
     }
   }, [loadOlderRuntimeEvents, runtimePanelAutoScroll, runtimePanelTab]);
@@ -10357,19 +10768,421 @@ function LoopspaceRuntimeView({
   useLayoutEffect(() => {
     if (!runtimePanelExpanded || !runtimePanelAutoScroll) return;
     const panelBody = runtimePanelBodyRef.current;
-    if (!panelBody || runtimePanelTab === "nodes") return;
+    if (!panelBody || runtimePanelTab === "nodes" || runtimePanelTab === "settings") return;
     if (runtimePanelTab === "logs" && runtimeEventsPaginationRef.current.loading) return;
-    panelBody.scrollTop = runtimePanelTab === "logs" ? panelBody.scrollHeight : 0;
+    panelBody.scrollTop = (runtimePanelTab === "logs" || runtimePanelTab === "runtime") ? panelBody.scrollHeight : 0;
   }, [
     currentRuntimeSegments.length,
     logs.length,
     runtimeEvents.length,
     runtimeHeadRunId,
+    runtimeTimelineRows.length,
     runtimePanelAutoScroll,
     runtimePanelExpanded,
     runtimePanelTab,
     selectedHistoryRunId,
   ]);
+
+  useLayoutEffect(() => {
+    if (!runtimePanelExpanded || runtimePanelTab !== "settings") return;
+    const panelBody = runtimePanelBodyRef.current;
+    if (!panelBody) return;
+    setSettingsPanelViewportHeight(panelBody.clientHeight);
+    setSettingsPanelViewportWidth(panelBody.clientWidth);
+    setSettingsPanelScrollTop(selectedSettingsNode ? 0 : panelBody.scrollTop);
+  }, [
+    runtimePanelExpanded,
+    runtimePanelHeight,
+    runtimePanelTab,
+    selectedSettingsNode,
+    settingsPanelRows.length,
+  ]);
+
+  const renderSelectedSettingsPanel = () => {
+    const node = selectedSettingsNode;
+    if (!node) return null;
+    const row = settingsPanelRows.find((item) => item.id === node.id) || null;
+    const kindLabel = row?.subtitle?.split(" - ")[0] || row?.kind || node.nodeKind || "Node";
+    const title = row?.title || node.label || kindLabel;
+    const closeSettings = () => setSettingsNodeId("");
+    const renderSettingsHeader = (subtitle = kindLabel) => (
+      <LoopspaceRuntimePanelSettingsHeader>
+        <LoopspaceRuntimePanelSettingsAction
+          aria-label="Back to graph node settings"
+          onClick={closeSettings}
+          title="Back"
+          type="button"
+        >
+          <ButtonBackIcon aria-hidden="true" />
+        </LoopspaceRuntimePanelSettingsAction>
+        <LoopspaceRuntimePanelSettingsMain>
+          <strong>{title}</strong>
+          <span>{subtitle}</span>
+        </LoopspaceRuntimePanelSettingsMain>
+      </LoopspaceRuntimePanelSettingsHeader>
+    );
+    const isSettingsDocumentReadNode = node.nodeKind === "document_read";
+    const isSettingsDocumentWriteNode = node.nodeKind === "document_write";
+    const isSettingsAssetReadNode = node.nodeKind === "asset_read";
+    const isSettingsAssetWriteNode = node.nodeKind === "asset_write";
+    const isSettingsDocumentContextNode = isSettingsDocumentReadNode || isSettingsDocumentWriteNode;
+    const isSettingsAssetContextNode = isSettingsAssetReadNode || isSettingsAssetWriteNode;
+    const selectedResourceSearch = String(documentContextSearchByNode[node.id] || "");
+    if (isSettingsDocumentContextNode) {
+      const refs = loopspaceGraphDocumentRefsFromProps(node.props);
+      const createName = String(loopspaceGraphPropValue(node.props, ["create_name", "createName", "name"]) || "").trim();
+      return (
+        <LoopspaceRuntimePanelSettingsInspector data-kind={node.nodeKind}>
+          {renderSettingsHeader(isSettingsDocumentWriteNode ? "Writable docs" : "Readable docs")}
+          <LoopspaceGraphMessageSettingsPanel
+            data-layout="resource"
+            onPointerDown={(event) => event.stopPropagation()}
+            onWheel={(event) => event.stopPropagation()}
+          >
+            <LoopspaceGraphMessageSettingsSection data-column="resource" data-grow="true">
+              <LoopspaceDocumentContextPicker
+                busy={busy}
+                contentTemplate={isSettingsDocumentWriteNode ? loopspaceGraphPropValue(node.props, [
+                  "content_template",
+                  "contentTemplate",
+                  "template",
+                  "body_template",
+                  "bodyTemplate",
+                ]) : ""}
+                createName={createName}
+                mode={isSettingsDocumentWriteNode ? "write" : "read"}
+                onContentTemplateChange={(value) => void updateDocumentWriteContentTemplate(node, value)}
+                onCreateNameChange={(value) => void updateResourceContextCreateName(node, value)}
+                onOperationChange={(value) => void updateDocumentWriteOperation(node, value)}
+                onRefsChange={(nextRefs) => void updateDocumentContextNodeRefs(node, nextRefs)}
+                operation={isSettingsDocumentWriteNode ? loopspaceGraphPropValue(node.props, [
+                  "operation",
+                  "write_operation",
+                  "writeOperation",
+                  "document_operation",
+                  "documentOperation",
+                ]) : "append"}
+                options={loopspaceGraphDocumentOptions}
+                refs={refs}
+                search={selectedResourceSearch}
+                setSearch={(value) => setDocumentContextSearchByNode((current) => ({
+                  ...current,
+                  [node.id]: value,
+                }))}
+              />
+            </LoopspaceGraphMessageSettingsSection>
+          </LoopspaceGraphMessageSettingsPanel>
+        </LoopspaceRuntimePanelSettingsInspector>
+      );
+    }
+    if (isSettingsAssetContextNode) {
+      const refs = loopspaceGraphAssetRefsFromProps(node.props);
+      const createName = String(loopspaceGraphPropValue(node.props, ["create_name", "createName", "name"]) || "").trim();
+      return (
+        <LoopspaceRuntimePanelSettingsInspector data-kind={node.nodeKind}>
+          {renderSettingsHeader(isSettingsAssetWriteNode ? "Writable assets" : "Readable assets")}
+          <LoopspaceGraphMessageSettingsPanel
+            data-layout="resource"
+            onPointerDown={(event) => event.stopPropagation()}
+            onWheel={(event) => event.stopPropagation()}
+          >
+            <LoopspaceGraphMessageSettingsSection data-column="resource" data-grow="true">
+              <LoopspaceAssetContextPicker
+                busy={busy}
+                createName={createName}
+                mode={isSettingsAssetWriteNode ? "write" : "read"}
+                onCreateNameChange={(value) => void updateResourceContextCreateName(node, value)}
+                onOperationChange={(value) => void updateAssetWriteOperation(node, value)}
+                onRefsChange={(nextRefs) => void updateAssetContextNodeRefs(node, nextRefs)}
+                operation={isSettingsAssetWriteNode ? loopspaceGraphPropValue(node.props, [
+                  "operation",
+                  "write_operation",
+                  "writeOperation",
+                  "asset_operation",
+                  "assetOperation",
+                ]) : "add_version"}
+                options={loopspaceGraphAssetOptions}
+                refs={refs}
+                search={selectedResourceSearch}
+                setSearch={(value) => setDocumentContextSearchByNode((current) => ({
+                  ...current,
+                  [node.id]: value,
+                }))}
+              />
+            </LoopspaceGraphMessageSettingsSection>
+          </LoopspaceGraphMessageSettingsPanel>
+        </LoopspaceRuntimePanelSettingsInspector>
+      );
+    }
+    if (node.nodeKind !== "send_message") {
+      return (
+        <LoopspaceRuntimePanelSettingsInspector data-kind={row?.kind || node.nodeKind || "loop"}>
+          {renderSettingsHeader()}
+          <LoopspaceRuntimePanelEmpty>
+            <strong>No settings</strong>
+            <span>{kindLabel}</span>
+          </LoopspaceRuntimePanelEmpty>
+        </LoopspaceRuntimePanelSettingsInspector>
+      );
+    }
+
+    const sendMessageNodeDraft = loopspaceSendMessageDraftFromNode(node, agentLaunchDefaults);
+    const sendMessageDraft = Object.prototype.hasOwnProperty.call(sendMessageSettingsDrafts, node.id)
+      ? normalizeLoopspaceSendMessageDraft(sendMessageSettingsDrafts[node.id], agentLaunchDefaults)
+      : sendMessageNodeDraft;
+    const sendMessageDraftPrompt = sendMessageDraft?.prompt || "";
+    const sendMessageModelOptions = getAgentLaunchModelOptions(sendMessageDraft.target_agent_id);
+    const sendMessageModelOptionValues = new Set(sendMessageModelOptions.map((option) => option.value));
+    const sendMessageEffortOptions = getAgentLaunchEffortOptions(
+      sendMessageDraft.target_agent_id,
+      sendMessageDraft.model,
+    );
+    const sendMessageSpeedOptions = getAgentLaunchSpeedOptions(
+      sendMessageDraft.target_agent_id,
+      sendMessageDraft.model,
+    );
+    const sendMessageCheckpoints = parsedGraph.nodes.filter((item) => (
+      String(loopspaceGraphPropValue(item.props, ["parent_id", "parentId", "parent"]) || "").trim() === node.id
+    ));
+	    const sendMessageSteps = sendMessageCheckpoints
+	      .filter(loopspaceGraphNodeIsMessageStep)
+	      .map((item, itemIndex) => ({ item, itemIndex }))
+      .sort((left, right) => {
+        const orderDelta = loopspaceGraphStepOrder(left.item, left.itemIndex + 1)
+          - loopspaceGraphStepOrder(right.item, right.itemIndex + 1);
+        return orderDelta
+          || loopspaceGraphStepTitle(left.item, left.itemIndex).localeCompare(
+            loopspaceGraphStepTitle(right.item, right.itemIndex),
+	          );
+	      });
+	    const activeSendMessageSettingsTab = ["model", "prompt", "steps"].includes(sendMessageSettingsTab)
+	      ? sendMessageSettingsTab
+	      : "model";
+	    const sendMessageSettingsTabs = [
+	      { id: "model", label: "Model" },
+	      { id: "prompt", label: "Prompt" },
+	      { id: "steps", label: "Steps" },
+	    ];
+
+	    return (
+	      <LoopspaceRuntimePanelSettingsInspector data-kind="send_message">
+	        {renderSettingsHeader("Send message")}
+	        <LoopspaceGraphMessageSettingsPanel
+	          data-layout="tabs"
+	          onPointerDown={(event) => event.stopPropagation()}
+	          onWheel={(event) => event.stopPropagation()}
+	        >
+	          <LoopspaceGraphMessageSettingsTabList aria-label="Send message settings sections" role="tablist">
+	            {sendMessageSettingsTabs.map((tab) => (
+	              <LoopspaceGraphMessageSettingsTabButton
+	                aria-selected={activeSendMessageSettingsTab === tab.id}
+	                data-active={activeSendMessageSettingsTab === tab.id ? "true" : undefined}
+	                key={tab.id}
+	                onClick={() => setSendMessageSettingsTab(tab.id)}
+	                role="tab"
+	                type="button"
+	              >
+	                {tab.label}
+	              </LoopspaceGraphMessageSettingsTabButton>
+	            ))}
+	          </LoopspaceGraphMessageSettingsTabList>
+	          <LoopspaceGraphMessageSettingsTabPanel role="tabpanel">
+	            {activeSendMessageSettingsTab === "model" ? (
+	              <LoopspaceGraphMessageSettingsSection data-column="model">
+	                <LoopspaceGraphMessageSettingsGrid>
+	                  <LoopspaceGraphMessageSettingsField>
+	                    <span>Agent</span>
+	                    <LoopspaceGraphMessageSettingsSelect
+	                      disabled={busy}
+	                      onChange={(event) => {
+	                        const targetAgentId = normalizeLoopspaceSendMessageAgentId(event.target.value);
+	                        const launchDefault = getAgentLaunchDefault(targetAgentId, agentLaunchDefaults);
+	                        updateSendMessageSettingsDraft(node.id, {
+	                          model: launchDefault.model,
+	                          reasoning_effort: launchDefault.effort,
+	                          speed: launchDefault.speed,
+	                          target_agent_id: targetAgentId,
+	                        });
+	                      }}
+	                      value={sendMessageDraft.target_agent_id}
+	                    >
+	                      {LOOPSPACE_SEND_MESSAGE_AGENT_OPTIONS.map((agent) => (
+	                        <option key={agent.id} value={agent.id}>{agent.label}</option>
+	                      ))}
+	                    </LoopspaceGraphMessageSettingsSelect>
+	                  </LoopspaceGraphMessageSettingsField>
+	                  <LoopspaceGraphMessageSettingsField>
+	                    <span>Model</span>
+	                    <LoopspaceGraphMessageSettingsSelect
+	                      disabled={busy}
+	                      onChange={(event) => {
+	                        const model = cleanAgentLaunchModelId(event.target.value, sendMessageDraft.model);
+	                        const resolved = resolveAgentLaunchDefaultForModel(
+	                          sendMessageDraft.target_agent_id,
+	                          agentLaunchDefaults,
+	                          model,
+	                        );
+	                        updateSendMessageSettingsDraft(node.id, {
+	                          model: resolved.model,
+	                          reasoning_effort: resolved.effort,
+	                          speed: resolved.speed,
+	                        });
+	                      }}
+	                      value={sendMessageDraft.model}
+	                    >
+	                      {!sendMessageModelOptionValues.has(sendMessageDraft.model) ? (
+	                        <option value={sendMessageDraft.model}>{sendMessageDraft.model}</option>
+	                      ) : null}
+	                      {sendMessageModelOptions.map((modelOption) => (
+	                        <option key={modelOption.value} value={modelOption.value}>{modelOption.label}</option>
+	                      ))}
+	                    </LoopspaceGraphMessageSettingsSelect>
+	                  </LoopspaceGraphMessageSettingsField>
+	                  <LoopspaceGraphMessageSettingsField>
+	                    <span>Thinking</span>
+	                    <LoopspaceGraphMessageSettingsSelect
+	                      disabled={busy}
+	                      onChange={(event) => updateSendMessageSettingsDraft(node.id, {
+	                        reasoning_effort: event.target.value,
+	                      })}
+	                      value={sendMessageDraft.reasoning_effort}
+	                    >
+	                      {sendMessageEffortOptions.map((effortOption) => (
+	                        <option key={effortOption.value} value={effortOption.value}>{effortOption.label}</option>
+	                      ))}
+	                    </LoopspaceGraphMessageSettingsSelect>
+	                  </LoopspaceGraphMessageSettingsField>
+	                  <LoopspaceGraphMessageSettingsField>
+	                    <span>Speed</span>
+	                    <LoopspaceGraphMessageSettingsSelect
+	                      disabled={busy || sendMessageSpeedOptions.length <= 1}
+	                      onChange={(event) => updateSendMessageSettingsDraft(node.id, {
+	                        speed: event.target.value,
+	                      })}
+	                      value={sendMessageDraft.speed}
+	                    >
+	                      {sendMessageSpeedOptions.map((speedOption) => (
+	                        <option key={speedOption.value} value={speedOption.value}>{speedOption.label}</option>
+	                      ))}
+	                    </LoopspaceGraphMessageSettingsSelect>
+	                  </LoopspaceGraphMessageSettingsField>
+	                </LoopspaceGraphMessageSettingsGrid>
+	              </LoopspaceGraphMessageSettingsSection>
+	            ) : null}
+	            {activeSendMessageSettingsTab === "prompt" ? (
+	              <LoopspaceGraphMessageSettingsSection data-column="prompt" data-grow="true">
+	                <LoopspaceGraphMessagePrompt
+	                  aria-label={`Prompt for ${node.label}`}
+	                  disabled={busy}
+	                  onChange={(event) => updateSendMessageSettingsDraft(node.id, {
+	                    prompt: event.target.value,
+	                  })}
+	                  placeholder="Optional prompt. Leave empty to send the default loop message."
+	                  value={sendMessageDraftPrompt}
+	                />
+	              </LoopspaceGraphMessageSettingsSection>
+	            ) : null}
+	            {activeSendMessageSettingsTab === "steps" ? (
+	              <LoopspaceGraphMessageSettingsSection data-column="steps">
+	                <LoopspaceGraphMessageSubnodeToolbar>
+	                  <LoopspaceGraphMessageSubnodeButton
+	                    disabled={busy}
+	                    onClick={() => {
+	                      void addSendMessageStep(node);
+	                    }}
+	                    type="button"
+	                  >
+	                    + Step
+	                  </LoopspaceGraphMessageSubnodeButton>
+	                </LoopspaceGraphMessageSubnodeToolbar>
+	                <LoopspaceGraphMessageSubnodeList aria-label="Message steps" data-orientation="horizontal">
+	                  {sendMessageSteps.length ? sendMessageSteps.map(({ item: checkpoint }, checkpointIndex) => {
+	                    const stepTitle = loopspaceGraphStepTitle(checkpoint, checkpointIndex);
+	                    const stepDescription = loopspaceGraphStepDescription(checkpoint);
+	                    return (
+	                      <LoopspaceGraphMessageSubnodeItem data-mode="step" key={checkpoint.id}>
+	                        <LoopspaceGraphMessageSubnodeMain>
+	                          <LoopspaceGraphMessageStepHeader>
+	                            <LoopspaceGraphMessageStepNumber>{checkpointIndex + 1}</LoopspaceGraphMessageStepNumber>
+	                            <LoopspaceGraphMessageStepInput
+	                              aria-label={`Title for step ${checkpointIndex + 1}`}
+	                              disabled={busy}
+	                              onBlur={(event) => {
+	                                const nextTitle = event.target.value;
+	                                if (nextTitle !== stepTitle) {
+	                                  void updateSendMessageStep(checkpoint, { title: nextTitle });
+	                                }
+	                              }}
+	                              onKeyDown={(event) => {
+	                                if (event.key === "Enter") {
+	                                  event.preventDefault();
+	                                  event.currentTarget.blur();
+	                                }
+	                              }}
+	                              placeholder={`Step ${checkpointIndex + 1}`}
+	                              defaultValue={stepTitle}
+	                            />
+	                          </LoopspaceGraphMessageStepHeader>
+	                          <LoopspaceGraphMessageStepDescription
+	                            aria-label={`Description for step ${checkpointIndex + 1}`}
+	                            disabled={busy}
+	                            onBlur={(event) => {
+	                              const description = event.target.value;
+	                              if (description !== stepDescription) {
+	                                void updateSendMessageStep(checkpoint, { description });
+	                              }
+	                            }}
+	                            placeholder="Describe what the agent should complete at this checkpoint."
+	                            defaultValue={stepDescription}
+	                          />
+	                        </LoopspaceGraphMessageSubnodeMain>
+	                        <button
+	                          aria-label={`Remove ${stepTitle || "step"}`}
+	                          disabled={busy}
+	                          onClick={() => {
+	                            void detachGraphNodeFromLoop(checkpoint);
+	                          }}
+	                          type="button"
+	                        >
+	                          <ButtonCloseIcon aria-hidden="true" />
+	                        </button>
+	                      </LoopspaceGraphMessageSubnodeItem>
+	                    );
+	                  }) : (
+	                    <LoopspaceGraphMessageSubnodeItem data-empty="true">
+	                      <LoopspaceGraphNodeText>
+	                        <strong>No steps yet</strong>
+	                        <span>Add internal checkpoints for this message.</span>
+	                      </LoopspaceGraphNodeText>
+	                    </LoopspaceGraphMessageSubnodeItem>
+	                  )}
+	                </LoopspaceGraphMessageSubnodeList>
+	              </LoopspaceGraphMessageSettingsSection>
+	            ) : null}
+	          </LoopspaceGraphMessageSettingsTabPanel>
+	          <LoopspaceGraphMessageSettingsActions>
+	            <LoopspaceGraphMessageSaveButton
+	              disabled={busy}
+	              onClick={() => {
+	                void saveSendMessageSettings(node, sendMessageDraft);
+	              }}
+	              type="button"
+	            >
+	              Save
+	            </LoopspaceGraphMessageSaveButton>
+	            <LoopspaceGraphMessageSaveButton
+	              data-variant="secondary"
+	              disabled={busy}
+	              onClick={() => cancelSendMessageSettings(node.id)}
+	              type="button"
+	            >
+	              Cancel
+	            </LoopspaceGraphMessageSaveButton>
+	          </LoopspaceGraphMessageSettingsActions>
+	        </LoopspaceGraphMessageSettingsPanel>
+      </LoopspaceRuntimePanelSettingsInspector>
+    );
+  };
 
   const graphSaveStateLabel = graphSaveState === "saving"
     ? "Saving"
@@ -10566,27 +11379,11 @@ function LoopspaceRuntimeView({
                 const sendMessageRuntimeTone = sendMessageRuntimeState?.tone || "neutral";
                 const sendMessageCanResume = isSendMessageRegion
                   && loopspaceRuntimeStateCanResume(sendMessageRuntimeState);
-                const nodeVisualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
-                const isSizedGraphNode = Boolean(nodeVisualDefaults.sized);
-                const sendMessageSettingsOpen = isSendMessageRegion && sendMessageSettingsNodeId === node.id;
-                const sendMessageNodeDraft = isSendMessageRegion
-                  ? loopspaceSendMessageDraftFromNode(node, agentLaunchDefaults)
-                  : null;
-                const sendMessageDraft = isSendMessageRegion
-                  && Object.prototype.hasOwnProperty.call(sendMessageSettingsDrafts, node.id)
-                  ? normalizeLoopspaceSendMessageDraft(sendMessageSettingsDrafts[node.id], agentLaunchDefaults)
-                  : sendMessageNodeDraft;
-                const sendMessageDraftPrompt = sendMessageDraft?.prompt || "";
-                const sendMessageModelOptions = isSendMessageRegion
-                  ? getAgentLaunchModelOptions(sendMessageDraft.target_agent_id)
-                  : [];
-                const sendMessageModelOptionValues = new Set(sendMessageModelOptions.map((option) => option.value));
-                const sendMessageEffortOptions = isSendMessageRegion
-                  ? getAgentLaunchEffortOptions(sendMessageDraft.target_agent_id, sendMessageDraft.model)
-                  : [];
-                const sendMessageSpeedOptions = isSendMessageRegion
-                  ? getAgentLaunchSpeedOptions(sendMessageDraft.target_agent_id, sendMessageDraft.model)
-                  : [];
+	                const nodeVisualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
+	                const isSizedGraphNode = Boolean(nodeVisualDefaults.sized);
+	                const hasGraphNodeSettings = isSendMessageRegion || isResourceContextNode;
+	                const nodeSettingsSelected = hasGraphNodeSettings && settingsNodeId === node.id && runtimePanelTab === "settings";
+	                const sendMessageSettingsOpen = false;
                 const sendMessageCheckpoints = isSendMessageRegion
                   ? parsedGraph.nodes.filter((item) => (
                     String(loopspaceGraphPropValue(item.props, ["parent_id", "parentId", "parent"]) || "").trim() === node.id
@@ -10731,7 +11528,8 @@ function LoopspaceRuntimeView({
                     data-dragging={nodeDragPositions[node.id] ? "true" : undefined}
                     data-pending={pendingGraphNodeIds.has(node.id) ? "true" : undefined}
                     data-runtime={isRuntimeNode ? String(runtimeHead?.status || "active") : undefined}
-                    data-settings-open={sendMessageSettingsOpen ? "true" : undefined}
+	                    data-settings-open={nodeSettingsSelected ? "true" : undefined}
+                    data-runtime-selected={selectedRuntimeNodeId === node.id ? "true" : undefined}
                     data-document-drop-target={documentDropTargetNodeId === node.id ? "true" : undefined}
                     data-explicit-height={isResourceContextNode && loopspaceGraphPropValue(node.props, ["h", "height"]) ? "true" : undefined}
                     key={node.id}
@@ -10788,12 +11586,38 @@ function LoopspaceRuntimeView({
 	                        />
 	                      );
 	                    })}
-                    <LoopspaceGraphNodeIcon>
-                      <Icon aria-hidden="true" />
-                    </LoopspaceGraphNodeIcon>
-                    <LoopspaceGraphNodeText>
-                      <strong>{nodeTitle}</strong>
-                      {nodeSubtitle ? <span>{nodeSubtitle}</span> : null}
+	                    <LoopspaceGraphNodeIcon>
+	                      <Icon aria-hidden="true" />
+	                    </LoopspaceGraphNodeIcon>
+	                    <LoopspaceGraphNodeText>
+	                      <LoopspaceGraphNodeTitleRow>
+	                        <strong>{nodeTitle}</strong>
+	                        {isSendMessageRegion && sendMessageRuntimeLabel ? (
+	                          <LoopspaceGraphNodeStateBadge
+	                            data-tone={sendMessageRuntimeTone}
+	                            onPointerDown={(event) => event.stopPropagation()}
+	                            title={sendMessageRuntimeLabel}
+	                          >
+	                            <span>{sendMessageRuntimeLabel}</span>
+	                            {sendMessageCanResume ? (
+	                              <LoopspaceGraphNodeResumeButton
+	                                aria-label={`Resume ${nodeTitle}`}
+	                                disabled={busy}
+	                                onClick={(event) => {
+	                                  event.stopPropagation();
+	                                  resumeSendMessageNode(node, sendMessageRuntimeState);
+	                                }}
+	                                onPointerDown={(event) => event.stopPropagation()}
+	                                title="Resume this interrupted send message"
+	                                type="button"
+	                              >
+	                                Resume
+	                              </LoopspaceGraphNodeResumeButton>
+	                            ) : null}
+	                          </LoopspaceGraphNodeStateBadge>
+	                        ) : null}
+	                      </LoopspaceGraphNodeTitleRow>
+	                      {nodeSubtitle ? <span>{nodeSubtitle}</span> : null}
                       {cronCountdown ? (
                         <LoopspaceGraphNodeTimer>
                           <Schedule aria-hidden="true" />
@@ -10917,62 +11741,27 @@ function LoopspaceRuntimeView({
                           }))}
                         />
                       ) : null}
-                    </LoopspaceGraphNodeText>
-                    {node.nodeKind === "send_message" ? (
-                      <>
-                        {sendMessageRuntimeLabel ? (
-                          <LoopspaceGraphNodeStateBadge
-                            data-tone={sendMessageRuntimeTone}
-                            onPointerDown={(event) => event.stopPropagation()}
-                            title={sendMessageRuntimeLabel}
-                          >
-                            <span>{sendMessageRuntimeLabel}</span>
-                            {sendMessageCanResume ? (
-                              <LoopspaceGraphNodeResumeButton
-                                aria-label={`Resume ${nodeTitle}`}
-                                disabled={busy}
-                                onClick={(event) => {
-                                  event.stopPropagation();
-                                  resumeSendMessageNode(node, sendMessageRuntimeState);
-                                }}
-                                onPointerDown={(event) => event.stopPropagation()}
-                                title="Resume this interrupted send message"
-                                type="button"
-                              >
-                                Resume
-                              </LoopspaceGraphNodeResumeButton>
-                            ) : null}
-                          </LoopspaceGraphNodeStateBadge>
-                        ) : null}
-                        <LoopspaceGraphMessageSettingsButton
-                          aria-label={sendMessageSettingsOpen ? "Cancel send message settings" : "Open send message settings"}
-                          data-open={sendMessageSettingsOpen ? "true" : undefined}
-                          disabled={busy}
-                          onClick={(event) => {
-                            event.stopPropagation();
-                            if (sendMessageSettingsOpen) {
-                              cancelSendMessageSettings(node.id);
-                              return;
-                            }
-                            setSendMessageSettingsDrafts((current) => ({
-                              ...current,
-                              [node.id]: sendMessageNodeDraft,
-                            }));
-                            setSendMessageSettingsNodeId(node.id);
-                          }}
-                          onPointerDown={(event) => event.stopPropagation()}
-                          title={sendMessageSettingsOpen ? "Cancel settings changes" : "Send message settings"}
-                          type="button"
-                        >
-                          {sendMessageSettingsOpen ? (
-                            <ButtonCloseIcon aria-hidden="true" />
-                          ) : (
-                            <ButtonSettingsIcon aria-hidden="true" />
-                          )}
-                        </LoopspaceGraphMessageSettingsButton>
-	                        <LoopspaceGraphMessageRegion
-	                          data-open={sendMessageSettingsOpen ? "true" : undefined}
-	                          style={sendMessageFlowBounds && sendMessageFlowOrigin ? {
+		                    </LoopspaceGraphNodeText>
+	                    {hasGraphNodeSettings ? (
+	                      <LoopspaceGraphMessageSettingsButton
+	                        aria-label={`Open ${nodeTitle} settings`}
+	                        data-open={nodeSettingsSelected ? "true" : undefined}
+	                        disabled={busy}
+	                        onClick={(event) => {
+	                          event.stopPropagation();
+	                          openLoopspaceGraphNodeSettings(node);
+	                        }}
+	                        onPointerDown={(event) => event.stopPropagation()}
+	                        title={`${nodeTitle} settings`}
+	                        type="button"
+	                      >
+	                        <ButtonSettingsIcon aria-hidden="true" />
+	                      </LoopspaceGraphMessageSettingsButton>
+	                    ) : null}
+		                    {node.nodeKind === "send_message" ? (
+		                      <>
+			                        <LoopspaceGraphMessageRegion
+		                          style={sendMessageFlowBounds && sendMessageFlowOrigin ? {
 	                            "--loopspace-message-flow-height": `${sendMessageFlowBounds.height}px`,
 	                            "--loopspace-message-flow-origin-x": `${sendMessageFlowOrigin.x}px`,
 	                            "--loopspace-message-flow-origin-y": `${sendMessageFlowOrigin.y}px`,
@@ -11510,11 +12299,12 @@ function LoopspaceRuntimeView({
             {runtimePanelExpanded ? (
               <LoopspaceRuntimePanelHeader>
                 <LoopspaceRuntimePanelTabs aria-label="Loop runtime panel" role="tablist">
-                  {[
-                    ["runtime", "Runtime"],
-                    ["nodes", "Nodes"],
-                    ["logs", "Logs"],
-                  ].map(([tabId, label]) => (
+	                  {[
+	                    ["runtime", "Runtime"],
+	                    ["nodes", "Nodes"],
+	                    ["settings", "Settings"],
+	                    ["logs", "Logs"],
+	                  ].map(([tabId, label]) => (
                     <LoopspaceRuntimePanelTab
                       aria-selected={runtimePanelTab === tabId}
                       data-active={runtimePanelTab === tabId ? "true" : undefined}
@@ -11530,7 +12320,7 @@ function LoopspaceRuntimeView({
                     </LoopspaceRuntimePanelTab>
                   ))}
                 </LoopspaceRuntimePanelTabs>
-                {runtimePanelTab === "nodes" ? null : (
+	                {runtimePanelTab === "nodes" || runtimePanelTab === "settings" ? null : (
                   <LoopspaceRuntimePanelAutoScroll
                     aria-pressed={runtimePanelAutoScroll}
                     data-enabled={runtimePanelAutoScroll ? "true" : "false"}
@@ -11574,36 +12364,103 @@ function LoopspaceRuntimeView({
             {runtimePanelExpanded ? (
               <LoopspaceRuntimePanelBody data-tab={runtimePanelTab} onScroll={onRuntimePanelScroll} ref={runtimePanelBodyRef}>
                 {runtimePanelTab === "runtime" ? (
-                  runtimeHead ? (
-                    <LoopspaceRuntimePanelEventList>
-                      <LoopspaceRuntimePanelEventRow data-tone={loopspaceRuntimeStatusTone(runtimeHeadStatus)}>
-                        <span>{formatLoopspaceRuntimeTime(runtimeHead?.updatedAtMs || runtimeHead?.updated_at_ms || runtimeHead?.createdAtMs || runtimeHead?.created_at_ms) || "now"}</span>
-                        <strong>{runtimeHeadStatus || "active"}</strong>
-                        <em>{runtimeHeadNodeId || runtimeHeadRunId || "Loop runtime"}</em>
-                        {runtimeHeadCanResume ? (
-                          <LoopspaceRuntimePanelResumeButton
-                            disabled={busy}
-                            onClick={() => resumeSendMessageNode(runtimeHeadNode, runtimeHeadResumeState)}
-                            title="Resume this interrupted send message"
-                            type="button"
-                          >
-                            Resume
-                          </LoopspaceRuntimePanelResumeButton>
+                  runtimeTimelineRows.length ? (
+                    <LoopspaceRuntimeTimeline>
+                      <LoopspaceRuntimeTimelineList aria-label="Live runtime timeline">
+                        {runtimeTimelineRows.map((row) => {
+                          const selected = selectedRuntimeRow?.id === row.id;
+                          return (
+                            <LoopspaceRuntimeTimelineRow
+                              aria-current={selected ? "true" : undefined}
+                              data-selected={selected ? "true" : undefined}
+                              data-tone={row.tone}
+                              key={row.id}
+                              onClick={() => setSelectedRuntimeRowId(row.id)}
+                              onKeyDown={(rowEvent) => {
+                                if (rowEvent.key === "Enter" || rowEvent.key === " ") {
+                                  rowEvent.preventDefault();
+                                  setSelectedRuntimeRowId(row.id);
+                                }
+                              }}
+                              role="button"
+                              tabIndex={0}
+                            >
+                              <LoopspaceRuntimeConsoleIcon data-icon={row.icon}>
+                                {row.icon === "completed" ? (
+                                  <ButtonCheckIcon aria-hidden="true" />
+                                ) : row.icon === "failed" || row.icon === "interrupted" ? (
+                                  <ButtonCloseIcon aria-hidden="true" />
+                                ) : row.icon === "running" || row.icon === "queued" ? (
+                                  <PendingIcon aria-hidden="true" />
+                                ) : (
+                                  <PlayArrow aria-hidden="true" />
+                                )}
+                              </LoopspaceRuntimeConsoleIcon>
+                              <LoopspaceRuntimeTimelineMain>
+                                <strong>{row.title}</strong>
+                                <span>{row.subtitle || row.message}</span>
+                              </LoopspaceRuntimeTimelineMain>
+                              <LoopspaceRuntimeTimelineMeta>
+                                <span>{formatLoopspaceRuntimeConsoleTime(row.timeMs)}</span>
+                                <LoopspaceRuntimeStatusPill data-tone={row.tone}>
+                                  {row.statusLabel}
+                                </LoopspaceRuntimeStatusPill>
+                              </LoopspaceRuntimeTimelineMeta>
+                            </LoopspaceRuntimeTimelineRow>
+                          );
+                        })}
+                      </LoopspaceRuntimeTimelineList>
+                      <LoopspaceRuntimeDetail data-tone={selectedRuntimeRow?.tone || "neutral"}>
+                        <LoopspaceRuntimeDetailHeader>
+                          <div>
+                            <strong>{selectedRuntimeRow?.title || "Loop runtime"}</strong>
+                            <span>{selectedRuntimeRow?.message || "Waiting for runtime activity."}</span>
+                          </div>
+                          <LoopspaceRuntimeStatusPill data-tone={selectedRuntimeRow?.tone || "neutral"}>
+                            {selectedRuntimeRow?.statusLabel || "Runtime"}
+                          </LoopspaceRuntimeStatusPill>
+                          {selectedRuntimeRow?.canResume ? (
+                            <LoopspaceRuntimePanelResumeButton
+                              disabled={busy}
+                              onClick={() => resumeSendMessageNode(selectedRuntimeRow.node, runtimeStateByNodeId.get(selectedRuntimeRow.nodeId))}
+                              title="Resume this interrupted send message"
+                              type="button"
+                            >
+                              Resume
+                            </LoopspaceRuntimePanelResumeButton>
+                          ) : null}
+                          {selectedRuntimeRow?.configurable ? (
+                            <LoopspaceRuntimePanelResumeButton
+                              disabled={busy}
+                              onClick={() => openLoopspaceGraphNodeSettings(selectedRuntimeRow.node)}
+                              title="Open node settings"
+                              type="button"
+                            >
+                              Settings
+                            </LoopspaceRuntimePanelResumeButton>
+                          ) : null}
+                        </LoopspaceRuntimeDetailHeader>
+                        <LoopspaceRuntimeDetailGrid>
+                          {(selectedRuntimeRow?.detailRows || []).map(([label, value]) => (
+                            <Fragment key={label}>
+                              <span>{label}</span>
+                              <strong>{value}</strong>
+                            </Fragment>
+                          ))}
+                          {currentRuntimeSegments.length ? (
+                            <Fragment>
+                              <span>Log segments</span>
+                              <strong>{currentRuntimeSegments.length}</strong>
+                            </Fragment>
+                          ) : null}
+                        </LoopspaceRuntimeDetailGrid>
+                        {selectedRuntimeRow?.sourceMessage ? (
+                          <LoopspaceRuntimeDetailMessage>
+                            {selectedRuntimeRow.sourceMessage}
+                          </LoopspaceRuntimeDetailMessage>
                         ) : null}
-                      </LoopspaceRuntimePanelEventRow>
-                      {currentRuntimeSegments.map((segment, index) => {
-                        const segmentId = loopspaceRuntimeField(segment, ["segment_id", "segmentId"], `segment-${index + 1}`);
-                        const segmentHash = loopspaceRuntimeField(segment, ["content_hash", "contentHash"]);
-                        const segmentRunId = loopspaceRuntimeField(segment, ["run_id", "runId"]);
-                        return (
-                          <LoopspaceRuntimePanelEventRow data-tone="neutral" key={`${segmentId}-${index}`}>
-                            <span>{formatLoopspaceRuntimeTime(segment?.createdAtMs || segment?.created_at_ms) || "segment"}</span>
-                            <strong>{segmentId}</strong>
-                            <em>{[segmentRunId, segmentHash ? `hash ${segmentHash.slice(0, 10)}` : ""].filter(Boolean).join(" - ") || "Runtime log segment"}</em>
-                          </LoopspaceRuntimePanelEventRow>
-                        );
-                      })}
-                    </LoopspaceRuntimePanelEventList>
+                      </LoopspaceRuntimeDetail>
+                    </LoopspaceRuntimeTimeline>
                   ) : (
                     <LoopspaceRuntimePanelEmpty>
                       <strong>No active run</strong>
@@ -11611,7 +12468,7 @@ function LoopspaceRuntimeView({
                     </LoopspaceRuntimePanelEmpty>
                   )
                 ) : runtimePanelTab === "nodes" ? (
-                  <LoopspaceRuntimePanelGrid>
+	                  <LoopspaceRuntimePanelGrid>
                     {runtimePanelNodeTemplates.map((template) => {
                       const PaletteIcon = template.id === "run_script"
                         ? Terminal
@@ -11646,8 +12503,80 @@ function LoopspaceRuntimeView({
                         </LoopspaceRuntimePanelNodeCard>
                       );
                     })}
-                  </LoopspaceRuntimePanelGrid>
-                ) : visibleRuntimeEvents.length ? (
+	                  </LoopspaceRuntimePanelGrid>
+	                ) : runtimePanelTab === "settings" ? (
+	                  selectedSettingsNode ? (
+	                    renderSelectedSettingsPanel()
+	                  ) : settingsPanelRows.length ? (
+	                    <LoopspaceRuntimePanelSettingsList
+	                      aria-label="Graph node settings"
+	                      style={{
+	                        "--loopspace-settings-list-height": `${settingsPanelListHeight}px`,
+	                      }}
+		                    >
+		                      {visibleSettingsPanelRows.map(({ row, index }) => {
+		                        const settingsCardColumn = index % settingsPanelColumnCount;
+		                        const settingsCardRow = Math.floor(index / settingsPanelColumnCount);
+		                        const SettingsIcon = row.kind === "send_message"
+		                          ? AdsClick
+	                          : row.kind === "run_script"
+	                            ? Terminal
+	                            : row.kind === "asset_read" || row.kind === "asset_write"
+	                              ? PermMedia
+	                              : row.kind === "manual" || row.kind === "cron" || row.kind === "webhook"
+	                                ? loopspaceTriggerTypeIcon(row.kind || "manual")
+	                                : AccountTree;
+	                        return (
+	                          <LoopspaceRuntimePanelSettingsRow
+	                            data-active={settingsNodeId === row.id ? "true" : undefined}
+	                            data-kind={row.kind || "loop"}
+	                            data-runtime={row.runtimeTone || undefined}
+	                            key={row.id}
+	                            onClick={() => openLoopspaceGraphNodeSettings(row.node)}
+	                            onKeyDown={(event) => {
+	                              if (event.key === "Enter" || event.key === " ") {
+	                                event.preventDefault();
+	                                openLoopspaceGraphNodeSettings(row.node);
+	                              }
+		                            }}
+		                            role="button"
+		                            style={{
+		                              "--loopspace-settings-card-height": `${settingsPanelCardHeight}px`,
+		                              "--loopspace-settings-card-width": `${settingsPanelCardWidth}px`,
+		                              "--loopspace-settings-card-x": `${LOOPSPACE_RUNTIME_SETTINGS_GRID_PADDING + (settingsCardColumn * (settingsPanelCardWidth + LOOPSPACE_RUNTIME_SETTINGS_CARD_GAP))}px`,
+		                              "--loopspace-settings-card-y": `${LOOPSPACE_RUNTIME_SETTINGS_GRID_PADDING + (settingsCardRow * settingsPanelGridStride)}px`,
+		                            }}
+	                            tabIndex={0}
+	                          >
+	                            <LoopspaceGraphPaletteIcon>
+	                              <SettingsIcon aria-hidden="true" />
+	                            </LoopspaceGraphPaletteIcon>
+	                            <LoopspaceRuntimePanelSettingsMain>
+	                              <strong>{row.title}</strong>
+	                              <span>{row.subtitle}</span>
+	                            </LoopspaceRuntimePanelSettingsMain>
+	                            <LoopspaceRuntimePanelSettingsAction
+	                              aria-label={`Open settings for ${row.title}`}
+	                              onClick={(event) => {
+	                                event.stopPropagation();
+	                                openLoopspaceGraphNodeSettings(row.node);
+	                              }}
+	                              title="Settings"
+	                              type="button"
+	                            >
+	                              <ButtonSettingsIcon aria-hidden="true" />
+	                            </LoopspaceRuntimePanelSettingsAction>
+	                          </LoopspaceRuntimePanelSettingsRow>
+	                        );
+	                      })}
+	                    </LoopspaceRuntimePanelSettingsList>
+	                  ) : (
+	                    <LoopspaceRuntimePanelEmpty>
+	                      <strong>No graph nodes</strong>
+	                      <span>Add nodes from the library.</span>
+	                    </LoopspaceRuntimePanelEmpty>
+	                  )
+	                ) : visibleRuntimeEvents.length ? (
                   <LoopspaceRuntimeConsole aria-live="polite">
                     {runtimeEventsHasMoreBefore || runtimeEventsLoadingMore ? (
                       <LoopspaceRuntimeConsoleLoader
@@ -11661,18 +12590,20 @@ function LoopspaceRuntimeView({
                         {runtimeEventsLoadingMore ? "Loading previous events..." : "Older events"}
                       </LoopspaceRuntimeConsoleLoader>
                     ) : null}
-                    {visibleRuntimeEvents.map((event) => {
-                      const selected = selectedRuntimeEvent?.id === event.id;
-                      const detailsText = selected
-                        ? JSON.stringify(event.details && Object.keys(event.details).length ? event.details : event, null, 2)
-                        : "";
+	                    {visibleRuntimeEvents.map((event) => {
+	                      const selected = selectedRuntimeEvent?.id === event.id;
+	                      const timelineIcon = loopspaceRuntimeEventTimelineIcon(event);
+	                      const detailsText = selected
+	                        ? JSON.stringify(event.details && Object.keys(event.details).length ? event.details : event, null, 2)
+	                        : "";
                       return (
                         <Fragment key={event.id}>
                           <LoopspaceRuntimeConsoleRow
                             aria-expanded={selected}
-                            data-clickable="true"
-                            data-selected={selected ? "true" : undefined}
-                            data-tone={loopspaceRuntimeEventTone(event)}
+	                            data-clickable="true"
+	                            data-icon={timelineIcon}
+	                            data-selected={selected ? "true" : undefined}
+	                            data-tone={loopspaceRuntimeEventTone(event)}
                             onClick={() => setSelectedHistoryRunId((current) => (current === event.id ? "" : event.id))}
                             onKeyDown={(rowEvent) => {
                               if (rowEvent.key === "Enter" || rowEvent.key === " ") {
@@ -11680,13 +12611,23 @@ function LoopspaceRuntimeView({
                                 setSelectedHistoryRunId((current) => (current === event.id ? "" : event.id));
                               }
                             }}
-                            role="button"
-                            tabIndex={0}
-                          >
-                            <span>{formatLoopspaceRuntimeConsoleTime(event.createdAtMs)}</span>
-                            <strong>{loopspaceRuntimeEventKindLabel(event)}</strong>
-                            <em>{event.message || event.status || "Runtime event"}</em>
-                          </LoopspaceRuntimeConsoleRow>
+	                            role="button"
+	                            tabIndex={0}
+	                          >
+	                            <LoopspaceRuntimeConsoleIcon data-icon={timelineIcon}>
+	                              {timelineIcon === "completed" ? (
+	                                <ButtonCheckIcon aria-hidden="true" />
+	                              ) : timelineIcon === "failed" || timelineIcon === "interrupted" ? (
+	                                <ButtonCloseIcon aria-hidden="true" />
+	                              ) : timelineIcon === "running" ? (
+	                                <PendingIcon aria-hidden="true" />
+	                              ) : (
+	                                <PlayArrow aria-hidden="true" />
+	                              )}
+	                            </LoopspaceRuntimeConsoleIcon>
+	                            <span>{formatLoopspaceRuntimeConsoleTime(event.createdAtMs)}</span>
+	                            <em>{event.message || event.status || "Runtime event"}</em>
+	                          </LoopspaceRuntimeConsoleRow>
                           {selected ? (
                             <LoopspaceRuntimeConsoleDetail>
                               {detailsText}

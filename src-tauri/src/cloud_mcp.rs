@@ -21042,9 +21042,7 @@ fn cloud_mcp_direct_route_pending_error(route: &Value) -> Option<String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    if initializing
-        || waiting
-        || cloud_mcp_route_state_is_provisioning(route_state, backend_status)
+    if initializing || waiting || cloud_mcp_route_state_is_provisioning(route_state, backend_status)
     {
         return Some(format!(
             "Cloud MCP route pending: route_state={route_state}; backend_status={backend_status}; retry_after_ms={retry_after_ms}"
@@ -21278,12 +21276,14 @@ fn cloud_mcp_direct_target_from_broker_route(
         .and_then(Value::as_str)
         .map(str::to_string)?;
     let preferred = if endpoint_path == "/v1/voice/ws" {
-        route.get("voiceWebsocketUrl")
+        route
+            .get("voiceWebsocketUrl")
             .or_else(|| route.get("voice_websocket_url"))
             .or_else(|| route.get("websocketUrl"))
             .or_else(|| route.get("websocket_url"))
     } else {
-        route.get("websocketUrl")
+        route
+            .get("websocketUrl")
             .or_else(|| route.get("websocket_url"))
             .or_else(|| route.get("appWebsocketUrl"))
             .or_else(|| route.get("app_websocket_url"))
@@ -28496,7 +28496,7 @@ fn cloud_mcp_normalize_account_document_folder_path(raw: &str) -> String {
 
 fn cloud_mcp_account_document_strip_extension(raw: &str) -> String {
     let mut value = raw.trim().trim_matches(['/', '\\']).replace('\\', "/");
-    for suffix in [".markdown", ".md", ".arch"] {
+    for suffix in [".markdown", ".html", ".htm", ".md", ".arch"] {
         if value.to_ascii_lowercase().ends_with(suffix) && value.len() > suffix.len() {
             value.truncate(value.len() - suffix.len());
             break;
@@ -28513,6 +28513,8 @@ fn cloud_mcp_normalize_account_document_id(raw: &str) -> String {
 fn cloud_mcp_account_document_file_extension(extension: &str) -> String {
     if extension.eq_ignore_ascii_case("arch") {
         "arch".to_string()
+    } else if extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm") {
+        "html".to_string()
     } else {
         "md".to_string()
     }
@@ -28632,6 +28634,11 @@ fn cloud_mcp_account_document_kind(input: &Value, extension: &str) -> String {
                     | "arch"
                     | "graph"
                     | "graphs"
+                    | "html"
+                    | "htm"
+                    | "webpage"
+                    | "web_page"
+                    | "web-page"
                     | "instruction"
                     | "instructions"
                     | "generic"
@@ -28655,9 +28662,13 @@ fn cloud_mcp_account_document_kind(input: &Value, extension: &str) -> String {
         "architecture" | "architectures" | "arch" | "graph" | "graphs" => {
             "architecture".to_string()
         }
+        "html" | "htm" | "webpage" | "web_page" | "web-page" => "html".to_string(),
         "instruction" | "instructions" => "instruction".to_string(),
         "generic" | "document" | "documents" | "doc" | "docs" => "document".to_string(),
         _ if extension.eq_ignore_ascii_case("arch") => "architecture".to_string(),
+        _ if extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm") => {
+            "html".to_string()
+        }
         _ => "document".to_string(),
     }
 }
@@ -28723,9 +28734,16 @@ fn cloud_mcp_account_document_extension(input: &Value, _collection: &str) -> Str
         })
         .or_else(|| {
             cloud_mcp_payload_text(input, &["mime_type"]).and_then(|mime| {
-                let mime = mime.trim().to_ascii_lowercase();
+                let mime = mime
+                    .split(';')
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_ascii_lowercase();
                 if mime == "text/markdown" || mime == "text/x-markdown" {
                     Some("md".to_string())
+                } else if mime == "text/html" || mime == "application/xhtml+xml" {
+                    Some("html".to_string())
                 } else {
                     None
                 }
@@ -28737,6 +28755,7 @@ fn cloud_mcp_account_document_extension(input: &Value, _collection: &str) -> Str
         .to_ascii_lowercase();
     match explicit.as_str() {
         "arch" => "arch".to_string(),
+        "html" | "htm" => "html".to_string(),
         "md" | "markdown" => "md".to_string(),
         _ => "md".to_string(),
     }
@@ -28745,6 +28764,8 @@ fn cloud_mcp_account_document_extension(input: &Value, _collection: &str) -> Str
 fn cloud_mcp_account_document_mime_for_extension(extension: &str) -> &'static str {
     if extension.eq_ignore_ascii_case("arch") {
         "text/vnd.diffforge.arch"
+    } else if extension.eq_ignore_ascii_case("html") || extension.eq_ignore_ascii_case("htm") {
+        "text/html"
     } else if extension.eq_ignore_ascii_case("md") {
         "text/markdown"
     } else {
@@ -29955,7 +29976,7 @@ fn cloud_mcp_recover_account_document_files(input: &Value) -> Vec<Value> {
                     .and_then(|value| value.to_str())
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                if !matches!(extension.as_str(), "md" | "arch") {
+                if !matches!(extension.as_str(), "md" | "arch" | "html" | "htm") {
                     continue;
                 }
                 let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
@@ -30136,7 +30157,7 @@ fn cloud_mcp_account_document_draft_watched_path(root: &Path, path: &Path) -> Op
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    matches!(extension.as_str(), "md" | "arch").then(|| path.to_path_buf())
+    matches!(extension.as_str(), "md" | "arch" | "html" | "htm").then(|| path.to_path_buf())
 }
 
 fn cloud_mcp_account_document_watched_path(root: &Path, path: &Path) -> Option<PathBuf> {
@@ -30165,7 +30186,7 @@ fn cloud_mcp_account_document_watched_path(root: &Path, path: &Path) -> Option<P
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !matches!(extension.as_str(), "md" | "arch") {
+    if !matches!(extension.as_str(), "md" | "arch" | "html" | "htm") {
         if !path.exists() && extension.is_empty() {
             return Some(path.to_path_buf());
         }
@@ -30325,7 +30346,10 @@ fn cloud_mcp_account_document_draft_payload_for_path(draft_path: &Path) -> Resul
         object.insert("file_name".to_string(), json!(file_name.clone()));
         object.insert("file_path".to_string(), json!(file_path.clone()));
         object.insert("path_key".to_string(), json!(path_key.clone()));
-        object.insert("parent_path_key".to_string(), json!(parent_path_key.clone()));
+        object.insert(
+            "parent_path_key".to_string(),
+            json!(parent_path_key.clone()),
+        );
         object.insert("doc_id".to_string(), json!(document_id.clone()));
         object.insert("document_id".to_string(), json!(document_id.clone()));
         object.insert("id".to_string(), json!(document_id.clone()));
@@ -30941,8 +30965,16 @@ fn cloud_mcp_account_document_from_op(op: &Value) -> Option<Value> {
         .get(10)
         .and_then(Value::as_str)
         .and_then(|mime| {
+            let mime = mime
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase();
             if mime == "text/vnd.diffforge.arch" {
                 Some("arch")
+            } else if mime == "text/html" {
+                Some("html")
             } else {
                 None
             }
@@ -31764,8 +31796,9 @@ async fn cloud_mcp_hydrate_account_document_one(
     let extension = cloud_mcp_account_document_extension(&request, &collection);
     let (_, _, _, request_file_path, request_path_key, _) =
         cloud_mcp_account_document_path_fields(&request, &document_id, &extension);
-    let mut row = cloud_mcp_account_document_row_from_cache(&scope_key, &collection, &request_path_key)
-        .unwrap_or_else(|| request.clone());
+    let mut row =
+        cloud_mcp_account_document_row_from_cache(&scope_key, &collection, &request_path_key)
+            .unwrap_or_else(|| request.clone());
     if !row.is_object() {
         row = request.clone();
     }
@@ -32246,7 +32279,19 @@ async fn cloud_mcp_delete_account_document_folder(
 
 fn cloud_mcp_account_document_draft_identity(
     document: &Value,
-) -> Result<(String, String, String, String, String, PathBuf, PathBuf, String), String> {
+) -> Result<
+    (
+        String,
+        String,
+        String,
+        String,
+        String,
+        PathBuf,
+        PathBuf,
+        String,
+    ),
+    String,
+> {
     let scope_key = cloud_mcp_account_document_scope_key(document);
     let collection = cloud_mcp_account_document_collection(document);
     let document_id = cloud_mcp_account_document_id(document);
@@ -32312,30 +32357,57 @@ fn cloud_mcp_account_document_base_hash(
 ) -> String {
     cloud_mcp_payload_text(
         request,
-        &["base_content_hash", "baseContentHash", "base_hash", "baseHash"],
+        &[
+            "base_content_hash",
+            "baseContentHash",
+            "base_hash",
+            "baseHash",
+        ],
     )
     .or_else(|| {
         cloud_mcp_payload_text(
             document,
-            &["base_content_hash", "baseContentHash", "base_hash", "baseHash"],
+            &[
+                "base_content_hash",
+                "baseContentHash",
+                "base_hash",
+                "baseHash",
+            ],
         )
     })
     .or_else(|| {
         cloud_mcp_payload_text(document, &["content_hash", "contentHash", "sha256", "hash"])
     })
-    .or_else(|| cloud_mcp_file_sha256_and_size(canonical_path).ok().map(|(hash, _)| hash))
+    .or_else(|| {
+        cloud_mcp_file_sha256_and_size(canonical_path)
+            .ok()
+            .map(|(hash, _)| hash)
+    })
     .unwrap_or_else(|| cloud_mcp_account_document_content_hash_text(fallback_content))
 }
 
-fn cloud_mcp_account_document_explicit_base_hash(request: &Value, document: &Value) -> Option<String> {
+fn cloud_mcp_account_document_explicit_base_hash(
+    request: &Value,
+    document: &Value,
+) -> Option<String> {
     cloud_mcp_payload_text(
         request,
-        &["base_content_hash", "baseContentHash", "base_hash", "baseHash"],
+        &[
+            "base_content_hash",
+            "baseContentHash",
+            "base_hash",
+            "baseHash",
+        ],
     )
     .or_else(|| {
         cloud_mcp_payload_text(
             document,
-            &["base_content_hash", "baseContentHash", "base_hash", "baseHash"],
+            &[
+                "base_content_hash",
+                "baseContentHash",
+                "base_hash",
+                "baseHash",
+            ],
         )
     })
 }
@@ -32352,20 +32424,20 @@ fn cloud_mcp_refuse_empty_account_document_overwrite_if_needed(
         return Ok(());
     }
     let empty_hash = cloud_mcp_account_document_content_hash_text("");
-    let cached_non_empty =
-        cloud_mcp_account_document_row_from_cache(scope_key, collection, path_key).is_some_and(
-            |existing| {
-                let existing_hash =
-                    cloud_mcp_account_document_row_text(&existing, &["content_hash", "sha256"]);
-                let existing_size = existing
-                    .get("size_bytes")
-                    .and_then(Value::as_i64)
-                    .unwrap_or_default();
-                existing_size > 0
-                    || (!existing_hash.trim().is_empty()
-                        && !existing_hash.trim().eq_ignore_ascii_case(&empty_hash))
-            },
-        );
+    let cached_non_empty = cloud_mcp_account_document_row_from_cache(
+        scope_key, collection, path_key,
+    )
+    .is_some_and(|existing| {
+        let existing_hash =
+            cloud_mcp_account_document_row_text(&existing, &["content_hash", "sha256"]);
+        let existing_size = existing
+            .get("size_bytes")
+            .and_then(Value::as_i64)
+            .unwrap_or_default();
+        existing_size > 0
+            || (!existing_hash.trim().is_empty()
+                && !existing_hash.trim().eq_ignore_ascii_case(&empty_hash))
+    });
     let file_non_empty = if canonical_path.is_file() {
         let (current_hash, current_size) = cloud_mcp_file_sha256_and_size(canonical_path)?;
         current_size > 0 || !current_hash.eq_ignore_ascii_case(&empty_hash)
@@ -32387,8 +32459,16 @@ async fn cloud_mcp_prepare_account_document_draft(request: Value) -> Result<Valu
     if cloud_mcp_account_document_entry_kind(&document) == "folder" {
         return Err("Account document drafts are only supported for documents.".to_string());
     }
-    let (scope_key, collection, document_id, file_path, path_key, canonical_path, computed_draft_path, draft_id) =
-        cloud_mcp_account_document_draft_identity(&document)?;
+    let (
+        scope_key,
+        collection,
+        document_id,
+        file_path,
+        path_key,
+        canonical_path,
+        computed_draft_path,
+        draft_id,
+    ) = cloud_mcp_account_document_draft_identity(&document)?;
     let draft_path =
         cloud_mcp_account_document_requested_draft_path(&request, &document, &computed_draft_path)?;
     let reuse_existing = cloud_mcp_payload_bool(&request, &["reuse_existing"], true)
@@ -32420,11 +32500,11 @@ async fn cloud_mcp_prepare_account_document_draft(request: Value) -> Result<Valu
     if let Some(object) = draft_document.as_object_mut() {
         object.insert("draft".to_string(), json!(true));
         object.insert("is_draft".to_string(), json!(true));
+        object.insert("draft_id".to_string(), json!(draft_id.clone()));
         object.insert(
-            "draft_id".to_string(),
-            json!(draft_id.clone()),
+            "draft_path".to_string(),
+            json!(draft_path.display().to_string()),
         );
-        object.insert("draft_path".to_string(), json!(draft_path.display().to_string()));
         object.insert(
             "canonical_local_path".to_string(),
             json!(canonical_path.display().to_string()),
@@ -32469,8 +32549,16 @@ async fn cloud_mcp_save_account_document_draft(
     if cloud_mcp_account_document_entry_kind(&document) == "folder" {
         return Err("Account document drafts are only supported for documents.".to_string());
     }
-    let (scope_key, collection, document_id, file_path, path_key, canonical_path, computed_draft_path, draft_id) =
-        cloud_mcp_account_document_draft_identity(&document)?;
+    let (
+        scope_key,
+        collection,
+        document_id,
+        file_path,
+        path_key,
+        canonical_path,
+        computed_draft_path,
+        draft_id,
+    ) = cloud_mcp_account_document_draft_identity(&document)?;
     let draft_path =
         cloud_mcp_account_document_requested_draft_path(&request, &document, &computed_draft_path)?;
     let content = fs::read_to_string(&draft_path).map_err(|error| {
@@ -32497,8 +32585,8 @@ async fn cloud_mcp_save_account_document_draft(
                 .to_string(),
         );
     }
-    let base_content_hash =
-        explicit_base_content_hash.unwrap_or_else(|| cloud_mcp_account_document_content_hash_text(""));
+    let base_content_hash = explicit_base_content_hash
+        .unwrap_or_else(|| cloud_mcp_account_document_content_hash_text(""));
     if !base_content_hash.trim().is_empty() && canonical_path.is_file() && !allow_conflict {
         let (current_hash, _) = cloud_mcp_file_sha256_and_size(&canonical_path)?;
         if !current_hash.eq_ignore_ascii_case(base_content_hash.trim()) {
@@ -32572,7 +32660,10 @@ async fn cloud_mcp_save_account_document_draft(
     }
     if let Some(object) = result.as_object_mut() {
         object.insert("draft_saved".to_string(), json!(true));
-        object.insert("draft_path".to_string(), json!(draft_path.display().to_string()));
+        object.insert(
+            "draft_path".to_string(),
+            json!(draft_path.display().to_string()),
+        );
         object.insert("base_content_hash".to_string(), json!(base_content_hash));
     }
     Ok(result)
@@ -32615,7 +32706,10 @@ async fn cloud_mcp_discard_account_document_draft(
         "discarded": true,
         "existed": existed,
     });
-    let _ = app.emit(CLOUD_MCP_ACCOUNT_DOCUMENT_DRAFT_UPDATED_EVENT, result.clone());
+    let _ = app.emit(
+        CLOUD_MCP_ACCOUNT_DOCUMENT_DRAFT_UPDATED_EVENT,
+        result.clone(),
+    );
     Ok(result)
 }
 
@@ -32686,6 +32780,8 @@ async fn cloud_mcp_save_account_document(
             .unwrap_or_else(|| {
                 if extension == "arch" {
                     "document.arch"
+                } else if extension == "html" {
+                    "document.html"
                 } else {
                     "document.md"
                 }
@@ -33498,6 +33594,7 @@ fn cloud_mcp_asset_mime_for_path(path: &Path) -> String {
         "tar" => "application/x-tar",
         "gz" => "application/gzip",
         "json" => "application/json",
+        "html" | "htm" => "text/html",
         "txt" | "md" => "text/plain",
         _ => "application/octet-stream",
     }
@@ -33505,7 +33602,13 @@ fn cloud_mcp_asset_mime_for_path(path: &Path) -> String {
 }
 
 fn cloud_mcp_asset_extension_for_mime(mime: &str) -> Option<&'static str> {
-    match mime.trim().to_ascii_lowercase().as_str() {
+    let mime = mime
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
         "image/png" => Some("png"),
         "image/jpeg" | "image/jpg" => Some("jpg"),
         "image/gif" => Some("gif"),
@@ -33519,6 +33622,7 @@ fn cloud_mcp_asset_extension_for_mime(mime: &str) -> Option<&'static str> {
         "application/pdf" => Some("pdf"),
         "application/zip" => Some("zip"),
         "application/json" => Some("json"),
+        "text/html" => Some("html"),
         "text/plain" => Some("txt"),
         _ => None,
     }
@@ -46153,8 +46257,8 @@ mod cloud_mcp_tests {
         cloud_mcp_write_account_document_file(&canonical, original_content).unwrap();
         let original_hash = format!("{:x}", Sha256::digest(original_content.as_bytes()));
 
-        let result = tauri::async_runtime::block_on(cloud_mcp_prepare_account_document_draft(
-            json!({
+        let result =
+            tauri::async_runtime::block_on(cloud_mcp_prepare_account_document_draft(json!({
                 "document": {
                     "scope_key": "Personal Account",
                     "collection": "documents",
@@ -46166,9 +46270,8 @@ mod cloud_mcp_tests {
                 },
                 "local_only": true,
                 "reuse_existing": false,
-            }),
-        ))
-        .unwrap();
+            })))
+            .unwrap();
         let draft_path = PathBuf::from(result["draft_path"].as_str().unwrap());
 
         assert!(draft_path.starts_with(
@@ -46203,8 +46306,8 @@ mod cloud_mcp_tests {
         let path_key = "Projects/Nested/DraftSource.md";
         let draft_content = "# Nested Draft\n";
 
-        let result = tauri::async_runtime::block_on(cloud_mcp_prepare_account_document_draft(
-            json!({
+        let result =
+            tauri::async_runtime::block_on(cloud_mcp_prepare_account_document_draft(json!({
                 "document": {
                     "scope_key": scope_key,
                     "collection": collection,
@@ -46215,15 +46318,11 @@ mod cloud_mcp_tests {
                 },
                 "local_only": true,
                 "reuse_existing": false,
-            }),
-        ))
-        .unwrap();
+            })))
+            .unwrap();
         let draft_id = cloud_mcp_account_document_draft_id_for(scope_key, collection, path_key);
         let expected_draft_path = cloud_mcp_account_document_draft_path_for_file_path(
-            scope_key,
-            collection,
-            path_key,
-            &draft_id,
+            scope_key, collection, path_key, &draft_id,
         )
         .unwrap();
 
@@ -46234,7 +46333,10 @@ mod cloud_mcp_tests {
             result["draft_path"],
             json!(expected_draft_path.display().to_string())
         );
-        assert_eq!(fs::read_to_string(expected_draft_path).unwrap(), draft_content);
+        assert_eq!(
+            fs::read_to_string(expected_draft_path).unwrap(),
+            draft_content
+        );
 
         let _ = fs::remove_dir_all(data_root);
         let _ = fs::remove_dir_all(cache_root);
@@ -46253,12 +46355,9 @@ mod cloud_mcp_tests {
         let scope_key = "Personal Account";
         let collection = "documents";
         let path_key = "Projects/DraftSource.md";
-        let canonical = cloud_mcp_account_document_local_path_for_file_path(
-            scope_key,
-            collection,
-            path_key,
-        )
-        .unwrap();
+        let canonical =
+            cloud_mcp_account_document_local_path_for_file_path(scope_key, collection, path_key)
+                .unwrap();
         let original_content = "# Original\n";
         let draft_content = "# Draft\n\nExternal write.\n";
         cloud_mcp_write_account_document_file(&canonical, original_content).unwrap();
@@ -46280,10 +46379,7 @@ mod cloud_mcp_tests {
         cloud_mcp_store_account_document_metadata(&row).unwrap();
         let draft_id = cloud_mcp_account_document_draft_id_for(scope_key, collection, path_key);
         let draft_path = cloud_mcp_account_document_draft_path_for_file_path(
-            scope_key,
-            collection,
-            path_key,
-            &draft_id,
+            scope_key, collection, path_key, &draft_id,
         )
         .unwrap();
         cloud_mcp_write_account_document_file(&draft_path, draft_content).unwrap();
@@ -46300,10 +46396,16 @@ mod cloud_mcp_tests {
 
         assert_eq!(payload["kind"], json!("account_document_draft_updated"));
         assert_eq!(payload["event_kind"], json!("doc.draft"));
-        assert_eq!(payload["contract"], json!(CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT));
+        assert_eq!(
+            payload["contract"],
+            json!(CLOUD_MCP_ACCOUNT_DOCUMENTS_CONTRACT)
+        );
         assert_eq!(payload["c"], json!("doc.draft"));
         assert_eq!(payload["d"], json!("documents"));
-        assert_eq!(payload["draft_path"], json!(draft_path.display().to_string()));
+        assert_eq!(
+            payload["draft_path"],
+            json!(draft_path.display().to_string())
+        );
         assert_eq!(payload["draft_id"], json!(draft_id));
         assert_eq!(payload["path_key"], json!(path_key));
         assert_eq!(payload["file_path"], json!(path_key));
@@ -46318,7 +46420,10 @@ mod cloud_mcp_tests {
             json!(draft_content.as_bytes().len() as i64)
         );
         assert_eq!(payload["document"]["sync_status"], json!("draft"));
-        assert_eq!(payload["document"]["local_path"], json!(canonical.display().to_string()));
+        assert_eq!(
+            payload["document"]["local_path"],
+            json!(canonical.display().to_string())
+        );
 
         let cached =
             cloud_mcp_account_document_row_from_cache(scope_key, collection, path_key).unwrap();
@@ -46382,33 +46487,20 @@ mod cloud_mcp_tests {
         let scope_key = "Personal Account";
         let collection = "documents";
         let path_key = "Guarded.md";
-        let canonical = cloud_mcp_account_document_local_path_for_file_path(
-            scope_key,
-            collection,
-            path_key,
-        )
-        .unwrap();
+        let canonical =
+            cloud_mcp_account_document_local_path_for_file_path(scope_key, collection, path_key)
+                .unwrap();
         cloud_mcp_write_account_document_file(&canonical, "# Keep me\n").unwrap();
 
         let result = cloud_mcp_refuse_empty_account_document_overwrite_if_needed(
-            "",
-            false,
-            scope_key,
-            collection,
-            path_key,
-            &canonical,
+            "", false, scope_key, collection, path_key, &canonical,
         );
 
         assert!(result
             .unwrap_err()
             .contains("Refusing to overwrite a non-empty account document"));
         assert!(cloud_mcp_refuse_empty_account_document_overwrite_if_needed(
-            "",
-            true,
-            scope_key,
-            collection,
-            path_key,
-            &canonical,
+            "", true, scope_key, collection, path_key, &canonical,
         )
         .is_ok());
 

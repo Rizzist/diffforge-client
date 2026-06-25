@@ -6,6 +6,7 @@ import styled, { keyframes } from "styled-components";
 
 import {
   ButtonRefreshIcon,
+  ButtonBrowserIcon,
   FileDisclosure,
   FileContextMenu,
   FileContextMenuItem,
@@ -36,6 +37,7 @@ import {
   accountDocumentStorageKey,
   accountDocumentUnitsFromPayload,
   documentExtensionForKind,
+  documentMimeTypeForKind,
   mergeSkillUnits,
   normalizedDocumentCollection,
   normalizedDocumentKind,
@@ -109,6 +111,7 @@ const SCRIPT_DOCUMENT_BODY_AVERAGE_CHAR_WIDTH_EM = 0.585;
 const DOCUMENT_TYPE_OPTIONS = [
   { id: "skill", label: "Skill", collection: "documents", extension: "md" },
   { id: "architecture", label: "Architecture", collection: "documents", extension: "arch" },
+  { id: "html", label: "HTML", collection: "documents", extension: "html" },
   { id: "document", label: "Document", collection: "documents", extension: "md" },
 ];
 const SCRIPT_SHELL_OPTIONS = [
@@ -228,6 +231,13 @@ function documentSelectionSegments(content, selection) {
 function documentTypeOption(value, collection = "documents") {
   const kind = normalizedDocumentKind(value, collection);
   return DOCUMENT_TYPE_OPTIONS.find((entry) => entry.id === kind) || DOCUMENT_TYPE_OPTIONS[0];
+}
+
+function documentIsHtml(editor) {
+  const kind = normalizedDocumentKind(editor?.documentKind || editor?.source, editor?.collection);
+  const extension = text(editor?.extension, documentExtensionForKind(kind, editor?.collection)).toLowerCase();
+  const mimeType = text(editor?.mimeType || editor?.mime_type).toLowerCase();
+  return kind === "html" || extension === "html" || extension === "htm" || mimeType.startsWith("text/html");
 }
 
 function documentTypeLabel(value, collection = "documents") {
@@ -481,7 +491,7 @@ function documentFileName(document) {
 
 function documentDisplayTitle(document, fallback = "Untitled document") {
   const explicit = text(document?.title || document?.name || document?.label);
-  if (explicit) return text(explicit.replace(/\.(?:md|markdown|arch)$/iu, ""), fallback);
+  if (explicit) return text(explicit.replace(/\.(?:md|markdown|arch|html|htm)$/iu, ""), fallback);
   const source = text(document?.fileName || document?.file_name)
     || normalizedDocumentPath(document?.pathKey || document?.path_key || document?.filePath || document?.file_path)
     || text(document?.documentKey || document?.document_key)
@@ -489,7 +499,7 @@ function documentDisplayTitle(document, fallback = "Untitled document") {
     || text(fallback);
   const cleaned = source.startsWith("draft:") ? source.slice("draft:".length) : source;
   const leaf = cleaned.split(/[\\/]/u).filter(Boolean).pop() || cleaned;
-  return text(leaf.replace(/\.(?:md|markdown|arch)$/iu, ""), fallback);
+  return text(leaf.replace(/\.(?:md|markdown|arch|html|htm)$/iu, ""), fallback);
 }
 
 function documentPreviewLine(document) {
@@ -515,7 +525,7 @@ function documentPathMetadata(document) {
   const idParts = idPath.split("/").filter(Boolean);
   const leaf = idParts.pop() || "document";
   const folderPath = normalizedDocumentPath(document?.folderPath || document?.folder_path || document?.parentPathKey || document?.parent_path_key || idParts.join("/"));
-  const fileName = `${leaf.replace(/\.(?:md|markdown|arch)$/iu, "")}.${extension}`;
+  const fileName = `${leaf.replace(/\.(?:md|markdown|arch|html|htm)$/iu, "")}.${extension}`;
   const filePath = folderPath ? `${folderPath}/${fileName}` : fileName;
   return {
     fileName,
@@ -952,8 +962,9 @@ function documentEditorDraft(document) {
 	    documentKind: option.id,
 	    draft: isDraft,
 	    draftId: text(document?.draftId || document?.draft_id),
-	    draftPath: text(document?.draftPath || document?.draft_path),
-	    extension: text(document?.extension, option.extension),
+		    draftPath: text(document?.draftPath || document?.draft_path),
+		    extension: text(document?.extension, option.extension),
+    mimeType: text(document?.mimeType || document?.mime_type, documentMimeTypeForKind(option.id, option.collection)),
     fileName: text(document?.fileName || document?.file_name),
     filePath: normalizedDocumentPath(document?.filePath || document?.file_path),
     folderId: normalizedDocumentPath(document?.folderId || document?.folder_id),
@@ -1058,8 +1069,9 @@ function editorDraftSnapshot(editor, selectedKey = "", selectedDocument = null) 
     ...pathMeta,
     collection: normalizedDocumentCollection(),
     documentKey: documentDraftKey({ ...editor, ...pathMeta }),
-    documentKind,
-    draft: true,
+	    documentKind,
+    mimeType: documentMimeTypeForKind(documentKind),
+	    draft: true,
     isDraft: true,
     rowType: "document",
     selectedKey: text(selectedKey),
@@ -3589,8 +3601,8 @@ export default function ToolsWorkspaceView({
     const existingIds = new Set(skillsLibrary.skills
       .filter((entry) => !documentIsFolderRow(entry))
       .flatMap((entry) => [
-        normalizedDocumentPath(entry.id),
-        normalizedDocumentPath(entry.pathKey || entry.path_key || entry.filePath || entry.file_path).replace(/\.(?:md|markdown|arch)$/iu, ""),
+	        normalizedDocumentPath(entry.id),
+	        normalizedDocumentPath(entry.pathKey || entry.path_key || entry.filePath || entry.file_path).replace(/\.(?:md|markdown|arch|html|htm)$/iu, ""),
       ])
       .filter(Boolean));
     const docId = skillSlug(folderPath ? `${folderPath}/${requestedName}` : requestedName, existingIds);
@@ -3604,14 +3616,15 @@ export default function ToolsWorkspaceView({
     });
     setSelectedSkillKey("");
     const draftEditor = {
-      baseContent: "",
-      collection: option.collection,
-      content: "",
-      contentHash: "",
-      documentKey: documentDraftKey({ id: docId, ...pathMeta }),
-      documentKind: option.id,
-      draft: true,
-      extension: option.extension,
+	      baseContent: "",
+	      collection: option.collection,
+	      content: "",
+	      contentHash: "",
+	      documentKey: documentDraftKey({ id: docId, ...pathMeta }),
+	      documentKind: option.id,
+	      draft: true,
+	      extension: option.extension,
+      mimeType: documentMimeTypeForKind(option.id, option.collection),
       ...pathMeta,
       id: docId,
       isDraft: true,
@@ -4278,15 +4291,16 @@ export default function ToolsWorkspaceView({
       ...(skillEditor || {
         assetId: "",
         baseContent: "",
-        collection: option.collection,
-        content: "",
-        contentHash: "",
-        documentKey: draftId,
-        documentKind: option.id,
-        extension: option.extension,
-        id: draftId,
-        localPath: "",
-        source: option.id,
+	        collection: option.collection,
+	        content: "",
+	        contentHash: "",
+	        documentKey: draftId,
+	        documentKind: option.id,
+	        extension: option.extension,
+	        id: draftId,
+	        localPath: "",
+        mimeType: documentMimeTypeForKind(option.id, option.collection),
+	        source: option.id,
         title: draftId,
       }),
     };
@@ -4299,10 +4313,11 @@ export default function ToolsWorkspaceView({
     }
     if (requestedKind) {
       const nextOption = documentTypeOption(requestedKind);
-      nextEditor.collection = nextOption.collection;
-      nextEditor.documentKind = nextOption.id;
-      nextEditor.source = nextOption.id;
-      nextEditor.extension = requestedExtension || nextOption.extension;
+	      nextEditor.collection = nextOption.collection;
+	      nextEditor.documentKind = nextOption.id;
+	      nextEditor.source = nextOption.id;
+	      nextEditor.extension = requestedExtension || nextOption.extension;
+      nextEditor.mimeType = documentMimeTypeForKind(nextOption.id, nextOption.collection);
     } else if (requestedExtension) {
       nextEditor.extension = requestedExtension.replace(/^\./u, "").toLowerCase() || nextEditor.extension;
     }
@@ -4325,7 +4340,14 @@ export default function ToolsWorkspaceView({
     if (hasContentPatch) {
       nextEditor.content = requestedContent;
     }
-    const nextDocumentKind = normalizedDocumentKind(nextEditor.documentKind || nextEditor.source, nextEditor.collection);
+    let nextDocumentKind = normalizedDocumentKind(nextEditor.documentKind || nextEditor.source, nextEditor.collection);
+    if (nextDocumentKind === "document" && documentIsHtml(nextEditor)) {
+      nextDocumentKind = "html";
+    }
+    if (nextDocumentKind === "html") {
+      nextEditor.extension = "html";
+      nextEditor.mimeType = documentMimeTypeForKind("html");
+    }
     const nextPathMeta = documentPathMetadata({
       ...nextEditor,
       documentKind: nextDocumentKind,
@@ -4719,11 +4741,13 @@ export default function ToolsWorkspaceView({
       busy: skillEditorBusy || selectedDocumentRefreshing,
       canDelete: Boolean(skillEditor?.id || skillEditorDocumentKey),
       content: String(skillEditor?.content || ""),
-      dirty: skillEditorHasDraftChanges,
-      documentKey: skillEditorDocumentKey,
-      error: skillsError,
-      extension: text(skillEditor?.extension),
-      key: breakout.key,
+	      dirty: skillEditorHasDraftChanges,
+      documentKind: normalizedDocumentKind(skillEditor?.documentKind || skillEditor?.source, skillEditor?.collection),
+	      documentKey: skillEditorDocumentKey,
+	      error: skillsError,
+	      extension: text(skillEditor?.extension),
+	      key: breakout.key,
+      mimeType: text(skillEditor?.mimeType || skillEditor?.mime_type),
       mode: "docs",
       pathKey: normalizedDocumentPath(skillEditor?.pathKey || skillEditor?.path_key || skillEditor?.filePath || skillEditor?.file_path),
       readOnly: skillEditorReadOnly,
@@ -4802,6 +4826,19 @@ export default function ToolsWorkspaceView({
     skillEditorDocumentKey,
     skillEditorTheme,
   ]);
+
+  const openSkillEditorHtmlInBrowser = useCallback(async () => {
+    if (!skillEditor || !documentIsHtml(skillEditor)) return;
+    try {
+      setSkillsError("");
+      await invoke("open_html_document_in_browser", {
+        content: String(skillEditor.content || ""),
+        title: text(skillEditor.title || skillEditor.fileName || skillEditor.file_name, "document"),
+      });
+    } catch (error) {
+      setSkillsError(getErrorMessage(error, "Unable to open HTML document in the browser."));
+    }
+  }, [skillEditor]);
 
   const openScriptBreakout = useCallback(async () => {
     if (!scriptEditor) return;
@@ -5544,12 +5581,22 @@ export default function ToolsWorkspaceView({
                                 title={activeDocsBreakout ? "Focus the document window" : "Open this document in its own window"}
                                 type="button"
                               >
-                                <span className="codicon codicon-multiple-windows" aria-hidden="true" />
-                                <span>{activeDocsBreakout ? "Focus window" : "Window"}</span>
-                              </ToolsGhostButton>
-                              <ToolsGhostButton
-                                onClick={() => {
-                                  setSkillEditor(null);
+	                                <span className="codicon codicon-multiple-windows" aria-hidden="true" />
+	                                <span>{activeDocsBreakout ? "Focus window" : "Window"}</span>
+	                              </ToolsGhostButton>
+                              {documentIsHtml(skillEditor) && (
+                                <ToolsGhostButton
+                                  onClick={() => void openSkillEditorHtmlInBrowser()}
+                                  title="Open HTML in the default browser"
+                                  type="button"
+                                >
+                                  <ButtonBrowserIcon aria-hidden="true" />
+                                  <span>Browser</span>
+                                </ToolsGhostButton>
+                              )}
+	                              <ToolsGhostButton
+	                                onClick={() => {
+	                                  setSkillEditor(null);
                                   setSelectedSkillKey("");
                                 }}
                                 type="button"

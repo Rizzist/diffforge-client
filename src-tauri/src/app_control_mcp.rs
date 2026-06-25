@@ -218,29 +218,30 @@ async fn handle_app_control_mcp_bridge_connection(
             .or_else(|| request.input.get("includeContent"))
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let response = match local_scripts_list(Some(json!({ "include_content": include_content }))).await {
-            Ok(result) => {
-                let scripts = result.get("scripts").cloned().unwrap_or_else(|| json!([]));
-                let count = scripts.as_array().map(|scripts| scripts.len()).unwrap_or(0);
-                let root = result.get("root").cloned().unwrap_or_else(|| json!(""));
-                json!({
-                    "ok": true,
-                    "data": {
-                        "count": count,
-                        "inventory": result,
-                        "root": root,
-                        "scripts": scripts,
+        let response =
+            match local_scripts_list(Some(json!({ "include_content": include_content }))).await {
+                Ok(result) => {
+                    let scripts = result.get("scripts").cloned().unwrap_or_else(|| json!([]));
+                    let count = scripts.as_array().map(|scripts| scripts.len()).unwrap_or(0);
+                    let root = result.get("root").cloned().unwrap_or_else(|| json!(""));
+                    json!({
+                        "ok": true,
+                        "data": {
+                            "count": count,
+                            "inventory": result,
+                            "root": root,
+                            "scripts": scripts,
+                        },
+                    })
+                }
+                Err(error) => json!({
+                    "ok": false,
+                    "error": {
+                        "code": "local_scripts_list_failed",
+                        "message": error,
                     },
-                })
-            }
-            Err(error) => json!({
-                "ok": false,
-                "error": {
-                    "code": "local_scripts_list_failed",
-                    "message": error,
-                },
-            }),
-        };
+                }),
+            };
         write_app_control_mcp_bridge_response(&mut stream, response).await?;
         return Ok(());
     }
@@ -248,7 +249,10 @@ async fn handle_app_control_mcp_bridge_connection(
     if request.tool == "get_script" {
         let response = match local_scripts_read(request.input).await {
             Ok(result) => {
-                let script = result.get("script").cloned().unwrap_or_else(|| result.clone());
+                let script = result
+                    .get("script")
+                    .cloned()
+                    .unwrap_or_else(|| result.clone());
                 json!({
                     "ok": true,
                     "data": {
@@ -316,8 +320,7 @@ async fn handle_app_control_mcp_bridge_connection(
     }
 
     let ui_timeout_ms = app_control_mcp_tool_timeout_ms(&request.tool);
-    let response = match timeout(Duration::from_millis(ui_timeout_ms), receiver).await
-    {
+    let response = match timeout(Duration::from_millis(ui_timeout_ms), receiver).await {
         Ok(Ok(value)) => value,
         Ok(Err(_)) => json!({
             "ok": false,
@@ -739,15 +742,15 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_selected_document",
-            "description": "Create or patch the currently selected Tools document or unsaved draft inside Diff Forge. Use this for make/create skill, create a draft, modify/delete highlighted selection, rewrite selected text, edit instruction, or update architecture requests. Send the full updated content/content_md when changing text. Default to mode=draft unless the user asks for local save or publish. Never write legacy account-skills.md.",
+            "description": "Create or patch the currently selected Tools document or unsaved draft inside Diff Forge. Use this for make/create skill, HTML page, create a draft, modify/delete highlighted selection, rewrite selected text, or update architecture requests. Send the full updated content/content_md when changing text. Default to mode=draft unless the user asks for local save or publish. Never write legacy account-skills.md.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "title": {"type": "string", "description": "New document title/name."},
-                    "content": {"type": "string", "description": "Full markdown or architecture content to place in the editor."},
-                    "content_md": {"type": "string", "description": "Full markdown content to place in the editor."},
-                    "document_kind": {"type": "string", "description": "skill, architecture, instruction, or document."},
-                    "extension": {"type": "string", "description": "md or arch."},
+                    "content": {"type": "string", "description": "Full markdown, architecture, or HTML content to place in the editor."},
+                    "content_md": {"type": "string", "description": "Full document content to place in the editor."},
+                    "document_kind": {"type": "string", "description": "skill, architecture, html, or document."},
+                    "extension": {"type": "string", "description": "md, arch, or html."},
                     "mode": {"type": "string", "description": "draft, local, publish, push, sync, or save. draft updates the editor without persisting."},
                     "save": {"type": "boolean", "description": "When true, save after applying the patch. mode controls local vs publish."}
                 },

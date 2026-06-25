@@ -4229,6 +4229,7 @@ export function SnippingAnnotationEditorWindow() {
   const imageRef = useRef(null);
   const draftRef = useRef(null);
   const drawingRef = useRef(false);
+  const annotationPointerIdRef = useRef(null);
   const editorClosingRef = useRef(false);
   // Autosave chain: the first save of an original returns the new edited-copy
   // path; every later autosave for that original updates the same copy in
@@ -4286,6 +4287,10 @@ export function SnippingAnnotationEditorWindow() {
   // close button when it is.
   const [floatOpen, setFloatOpen] = useState(false);
   const annotations = annotationsByPath[activePath] || [];
+  const selectedAnnotation = selectedIndex >= 0 && selectedIndex < annotations.length
+    ? annotations[selectedIndex]
+    : null;
+  const selectedAnnotationLabel = selectedAnnotation ? annotationLabel(selectedAnnotation) : "";
   const hasCrop = annotations.some((annotation) => annotation.type === "crop");
   const imageReady = !activeIsVideo && imageLoadState === "ready" && canvasSize.width > 0 && canvasSize.height > 0;
   const mediaReady = activeIsVideo ? imageLoadState === "ready" : imageReady;
@@ -4420,6 +4425,7 @@ export function SnippingAnnotationEditorWindow() {
   const beginEditorDispose = useCallback(() => {
     editorClosingRef.current = true;
     setEditorClosing(true);
+    annotationPointerIdRef.current = null;
     drawingRef.current = false;
     draftRef.current = null;
     imageRef.current = null;
@@ -4687,21 +4693,39 @@ export function SnippingAnnotationEditorWindow() {
     drawCanvas();
   }, [drawCanvas]);
 
+  const deleteSelectedAnnotation = useCallback(() => {
+    if (selectedIndex < 0 || selectedIndex >= annotations.length) return;
+    const label = annotationLabel(annotations[selectedIndex]);
+    updateActiveAnnotations((current) => current.filter((_, itemIndex) => itemIndex !== selectedIndex));
+    setSelectedIndex(-1);
+    setHoverIndex(-1);
+    setStatus(`Deleted ${label}`);
+  }, [annotations, selectedIndex, updateActiveAnnotations]);
+
   // Escape always returns to the select tool (and clears any selection), from
-  // any drawing tool. Typing in the text-label editor keeps its own Escape.
+  // any drawing tool. Delete/Backspace removes the selected annotation unless
+  // a text field owns the keystroke.
   useEffect(() => {
     if (activeIsVideo) return undefined;
     const onKeyDown = (event) => {
-      if (event.key !== "Escape") return;
+      const key = event.key;
+      if (key !== "Escape" && key !== "Delete" && key !== "Backspace") return;
       const target = event.target;
       const tag = String(target?.tagName || "").toUpperCase();
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target?.isContentEditable) return;
-      setTool("select");
-      setSelectedIndex(-1);
+      if (key === "Escape") {
+        setTool("select");
+        setSelectedIndex(-1);
+        return;
+      }
+      if (selectedIndex >= 0 && selectedIndex < annotations.length) {
+        event.preventDefault();
+        deleteSelectedAnnotation();
+      }
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [activeIsVideo]);
+  }, [activeIsVideo, annotations.length, deleteSelectedAnnotation, selectedIndex]);
 
   // Leaving the select tool clears the selection and the move/resize cursor.
   useEffect(() => {
@@ -4716,6 +4740,7 @@ export function SnippingAnnotationEditorWindow() {
   useEffect(() => {
     setSelectedIndex(-1);
     selectDragRef.current = null;
+    annotationPointerIdRef.current = null;
   }, [activePath]);
 
   // Keep the selection in range when annotations are removed (undo / erase).
@@ -4818,6 +4843,26 @@ export function SnippingAnnotationEditorWindow() {
     setHoverIndex(-1);
   }, [updateActiveAnnotations]);
 
+  const captureAnnotationPointer = useCallback((event) => {
+    annotationPointerIdRef.current = event.pointerId;
+    try {
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+    } catch {
+      // Pointer capture can fail if the event target is already detached.
+    }
+  }, []);
+
+  const releaseAnnotationPointer = useCallback((event) => {
+    const pointerId = annotationPointerIdRef.current;
+    annotationPointerIdRef.current = null;
+    if (pointerId === null || pointerId === undefined) return;
+    try {
+      event?.currentTarget?.releasePointerCapture?.(pointerId);
+    } catch {
+      // Some browsers auto-release on pointerup/cancel.
+    }
+  }, []);
+
   const beginDraw = useCallback((event) => {
     if (event.button !== 0 || !imageReady || !canvasSize.width || !canvasSize.height) return;
     event.preventDefault();
@@ -4832,6 +4877,7 @@ export function SnippingAnnotationEditorWindow() {
       if (selectedIndex >= 0 && selectedIndex < annotations.length) {
         const handleId = selectHandleAtPoint(annotations[selectedIndex], point, tolerance);
         if (handleId) {
+          captureAnnotationPointer(event);
           selectDragRef.current = {
             mode: "resize",
             index: selectedIndex,
@@ -4845,6 +4891,7 @@ export function SnippingAnnotationEditorWindow() {
       // 2) Otherwise select the topmost annotation under the cursor and move it.
       const hitIndex = context ? annotationAtPoint(annotations, point, context) : -1;
       if (hitIndex >= 0 && annotationIsSelectable(annotations[hitIndex])) {
+        captureAnnotationPointer(event);
         setSelectedIndex(hitIndex);
         selectDragRef.current = {
           mode: "move",
@@ -4859,6 +4906,7 @@ export function SnippingAnnotationEditorWindow() {
       return;
     }
     if (tool === "eraser") {
+      captureAnnotationPointer(event);
       erasingRef.current = true;
       erasedCountRef.current = 0;
       eraseAtPoint(point);
@@ -4905,10 +4953,11 @@ export function SnippingAnnotationEditorWindow() {
           }
             : tool === "crop" ? { ...base, type: "crop" }
               : { ...base, type: "shape", shape: shapeKind, mode: shapeMode };
+    captureAnnotationPointer(event);
     draftRef.current = annotation;
     drawingRef.current = true;
     setDraft(annotation);
-  }, [annotations, blurPower, blurStrategy, canvasSize.height, canvasSize.width, color, commitTextEditor, eraseAtPoint, fitScale, imageReady, numberRadiusPx, openTextEditor, pointFromEvent, selectedIndex, shapeKind, shapeMode, strokeWidth, tool, updateActiveAnnotations, zoom]);
+  }, [annotations, blurPower, blurStrategy, canvasSize.height, canvasSize.width, captureAnnotationPointer, color, commitTextEditor, eraseAtPoint, fitScale, imageReady, numberRadiusPx, openTextEditor, pointFromEvent, selectedIndex, shapeKind, shapeMode, strokeWidth, tool, updateActiveAnnotations, zoom]);
 
   const updateDraw = useCallback((event) => {
     if (!drawingRef.current || !draftRef.current) return;
@@ -4966,9 +5015,21 @@ export function SnippingAnnotationEditorWindow() {
     }
   }, [annotations, updateActiveAnnotations]);
 
-  const handleCanvasMouseMove = useCallback((event) => {
+  const handleCanvasPointerMove = useCallback((event) => {
+    const activePointerId = annotationPointerIdRef.current;
+    if (activePointerId !== null && activePointerId !== undefined && event.pointerId !== activePointerId) return;
+    if (activePointerId !== null && activePointerId !== undefined) {
+      event.preventDefault();
+    }
     const point = pointFromEvent(event);
-    cursorRef.current = { x: point.x, y: point.y, inside: true };
+    const canvasRect = canvasRef.current?.getBoundingClientRect();
+    const inside = canvasRect
+      ? event.clientX >= canvasRect.left
+        && event.clientX <= canvasRect.right
+        && event.clientY >= canvasRect.top
+        && event.clientY <= canvasRect.bottom
+      : true;
+    cursorRef.current = { x: point.x, y: point.y, inside };
     if (tool === "select") {
       const canvas = canvasRef.current;
       const drag = selectDragRef.current;
@@ -5010,11 +5071,35 @@ export function SnippingAnnotationEditorWindow() {
     setHoverIndex(context ? annotationAtPoint(annotations, point, context) : -1);
   }, [annotations, eraseAtPoint, fitScale, pointFromEvent, selectedIndex, tool, updateActiveAnnotations, updateDraw, zoom]);
 
-  const handleCanvasMouseLeave = useCallback(() => {
+  const handleCanvasPointerLeave = useCallback(() => {
     cursorRef.current = { ...cursorRef.current, inside: false };
-    setHoverIndex(-1);
+    if (annotationPointerIdRef.current === null || annotationPointerIdRef.current === undefined) {
+      setHoverIndex(-1);
+    }
+  }, []);
+
+  const handleCanvasPointerUp = useCallback((event) => {
+    const activePointerId = annotationPointerIdRef.current;
+    if (activePointerId !== null && activePointerId !== undefined && event.pointerId !== activePointerId) return;
+    event.preventDefault();
     finishDraw();
-  }, [finishDraw]);
+    releaseAnnotationPointer(event);
+  }, [finishDraw, releaseAnnotationPointer]);
+
+  const handleCanvasPointerCancel = useCallback((event) => {
+    const activePointerId = annotationPointerIdRef.current;
+    if (activePointerId === null || activePointerId === undefined) return;
+    if (event.pointerId !== activePointerId) return;
+    releaseAnnotationPointer(event);
+    selectDragRef.current = null;
+    erasingRef.current = false;
+    erasedCountRef.current = 0;
+    drawingRef.current = false;
+    draftRef.current = null;
+    setDraft(null);
+    setHoverIndex(-1);
+    setStatus("Canceled");
+  }, [releaseAnnotationPointer]);
 
   // ⌘C/⌘X over an annotation copies/cuts the topmost one under the cursor;
   // ⌘V pastes the clipboard centered on the current cursor position (or
@@ -5392,10 +5477,11 @@ export function SnippingAnnotationEditorWindow() {
                     <canvas
                       aria-label="Snip annotation canvas"
                       data-ready={imageReady ? "true" : "false"}
-                      onMouseDown={beginDraw}
-                      onMouseLeave={handleCanvasMouseLeave}
-                      onMouseMove={handleCanvasMouseMove}
-                      onMouseUp={finishDraw}
+                      onPointerCancel={handleCanvasPointerCancel}
+                      onPointerDown={beginDraw}
+                      onPointerLeave={handleCanvasPointerLeave}
+                      onPointerMove={handleCanvasPointerMove}
+                      onPointerUp={handleCanvasPointerUp}
                       ref={canvasRef}
                       style={canvasSize.width > 0 ? { width: displayWidth, height: displayHeight } : undefined}
                     />
@@ -5449,9 +5535,8 @@ export function SnippingAnnotationEditorWindow() {
                 })()}
               </>
             )}
-            {/* Creation tools stay on the left rail; the act-on-the-result
-                buttons live top-right (under the batch strip when several
-                images are selected) where they are quickest to reach. */}
+            {/* Creation tools stay on the left rail; asset-level actions sit
+                centered above the image; selected-object actions live right. */}
             <EditorActionCluster aria-label="Annotation actions">
               {!activeIsVideo && (
                 <>
@@ -5497,6 +5582,24 @@ export function SnippingAnnotationEditorWindow() {
                 )}
               </EditorToolButton>
             </EditorActionCluster>
+            {!activeIsVideo && (
+              <EditorSelectionActionCluster
+                aria-hidden={selectedAnnotation ? undefined : "true"}
+                aria-label="Selected annotation actions"
+                data-visible={selectedAnnotation ? "true" : "false"}
+              >
+                <EditorSelectionLabel>{selectedAnnotationLabel || "No selection"}</EditorSelectionLabel>
+                <EditorToolButton
+                  aria-label={selectedAnnotation ? `Delete ${selectedAnnotationLabel}` : "Delete selected annotation"}
+                  disabled={!selectedAnnotation}
+                  onClick={deleteSelectedAnnotation}
+                  title={selectedAnnotation ? `Delete ${selectedAnnotationLabel}` : "Select an annotation to delete"}
+                  type="button"
+                >
+                  <Delete aria-hidden="true" />
+                </EditorToolButton>
+              </EditorSelectionActionCluster>
+            )}
             {/* Style + contextual options live in one bottom pill: colors and
                 stroke size are always one click away, and the active tool
                 appends its own controls (shape kind/fill, blur strategy and
@@ -6889,22 +6992,71 @@ const EditorFloatingRail = styled.nav`
   }
 `;
 
-// Act-on-the-result buttons (undo / clear / copy) hug the stage's top-right
-// corner as a horizontal glass pill — directly under the batch strip when
-// one is showing, and always one short reach from the canvas.
+// Asset-level actions sit top-center so the right edge can belong to the
+// currently selected annotation.
 const EditorActionCluster = styled.nav`
   position: absolute;
   top: 8px;
-  right: 8px;
+  left: 50%;
+  z-index: 7;
   display: flex;
   align-items: center;
   gap: 2px;
+  max-width: calc(100% - 224px);
+  overflow-x: auto;
+  overflow-y: hidden;
   padding: 3px 4px;
   border: 1px solid var(--snip-ui-border);
   border-radius: 999px;
   background: var(--snip-ui-panel);
   backdrop-filter: blur(14px);
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  transform: translateX(-50%);
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+`;
+
+const EditorSelectionActionCluster = styled.nav`
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 7;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  max-width: min(240px, calc(100% - 96px));
+  padding: 3px 4px 3px 10px;
+  border: 1px solid var(--snip-ui-border);
+  border-radius: 999px;
+  background: var(--snip-ui-panel);
+  backdrop-filter: blur(14px);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease;
+
+  &[data-visible="true"] {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+`;
+
+const EditorSelectionLabel = styled.span`
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  color: rgba(248, 250, 252, 0.84);
+  font-size: 11px;
+  font-weight: 820;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 `;
 
 const EditorRailDivider = styled.span`

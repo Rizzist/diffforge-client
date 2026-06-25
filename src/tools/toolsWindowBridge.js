@@ -4,6 +4,7 @@ export const TOOLS_WINDOW_META_EVENT = "forge-tools-window-meta";
 export const TOOLS_WINDOW_META_REQUEST_EVENT = "forge-tools-window-meta-request";
 export const TOOLS_WINDOW_CONTROL_EVENT = "forge-tools-window-control";
 export const TOOLS_WINDOW_CLOSED_EVENT = "forge-tools-window-closed";
+export const TOOLS_WINDOW_AGENT_COMPANION_EVENT = "forge-tools-window-agent-companion";
 
 export const TOOLS_WINDOW_CONTROL_CLOSE = "close";
 export const TOOLS_WINDOW_CONTROL_DELETE = "delete";
@@ -14,3 +15,7 @@ export const TOOLS_WINDOW_CONTROL_RUN = "run";
 export const TOOLS_WINDOW_CONTROL_SAVE_LOCAL = "save_local";
 export const TOOLS_WINDOW_CONTROL_SAVE_PUSH = "save_push";
 export const TOOLS_WINDOW_CONTROL_UPDATE = "update";
+
+export const TOOLS_WINDOW_AGENT_COMPANION_CLOSE = "close";
+export const TOOLS_WINDOW_AGENT_COMPANION_FOCUS = "focus";
+export const TOOLS_WINDOW_AGENT_COMPANION_OPEN = "open";

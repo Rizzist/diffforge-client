@@ -71,7 +71,7 @@ test("graph contract exposes document and asset resource ports", () => {
   );
   assert.deepEqual(
     loopspaceGraphOutputPortsForNode(stepNode).map((port) => port.id),
-    ["docs", "assets"],
+    ["success", "docs", "assets"],
   );
 });
 
@@ -127,6 +127,58 @@ test("graph contract accepts legal flow and document ports", () => {
       toPort: "in",
     }).ok,
     true,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(triggerNode, assetWriteNode, {
+      fromPort: "out",
+      toPort: "in",
+    }).ok,
+    true,
+  );
+});
+
+test("graph contract accepts completed send-message step edges to action nodes", () => {
+  const nodeById = new Map([
+    [sendMessageNode.id, sendMessageNode],
+    [runScriptNode.id, runScriptNode],
+    [stepNode.id, stepNode],
+    [orphanStepNode.id, orphanStepNode],
+    [wrongParentStepNode.id, wrongParentStepNode],
+  ]);
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(stepNode, runScriptNode, {
+      fromPort: "success",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    true,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(stepNode, {
+      ...sendMessageNode,
+      id: "send-message-follow-up",
+    }, {
+      fromPort: "success",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    true,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(orphanStepNode, runScriptNode, {
+      fromPort: "success",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    false,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(wrongParentStepNode, runScriptNode, {
+      fromPort: "success",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    false,
   );
 });
 
@@ -194,6 +246,14 @@ test("graph contract accepts document context edges for send-message steps only"
     }).ok,
     false,
   );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(stepNode, documentWriteNode, {
+      fromPort: "success",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    false,
+  );
 });
 
 test("graph contract accepts asset context edges for send-message steps only", () => {
@@ -256,6 +316,30 @@ test("graph contract accepts asset context edges for send-message steps only", (
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(assetWriteNode, missingParentStepNode, {
       fromPort: "assets",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    false,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(sendMessageNode, assetWriteNode, {
+      fromPort: "exec",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    false,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(sendMessageNode, assetWriteNode, {
+      fromPort: "success",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    false,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(runScriptNode, assetWriteNode, {
+      fromPort: "exec",
       nodeById,
       toPort: "in",
     }).ok,
@@ -389,6 +473,36 @@ edge step-mqruul0w-r330x.assets -> asset-write-mqruul0w-r330x.in [id: edge-step-
   const validation = validateDfBlueprintSource(source);
 
   assert.equal(validation.ok, true, validation.errors.join("\n"));
+});
+
+test("dfblueprint validation accepts completed substep edges to actions", () => {
+  const source = `dfblueprint "Completed step graph"
+format diffforge.dfblueprint.v1
+direction right
+node "Send message" [id: send-message-mqruul0w-r330x, kind: send_message, role: action]
+node "Create assets" [id: step-mqruul0w-r330x, kind: step, role: checkpoint, parent_id: send-message-mqruul0w-r330x]
+node "Run script" [id: run-script-mqruul0w-r330x, kind: run_script, role: action]
+node "Follow up" [id: send-message-follow-up, kind: send_message, role: action]
+edge step-mqruul0w-r330x.success -> run-script-mqruul0w-r330x.in [id: edge-step-script, branch: success]
+edge step-mqruul0w-r330x.success -> send-message-follow-up.in [id: edge-step-message, branch: success]
+`;
+  const validation = validateDfBlueprintSource(source);
+
+  assert.equal(validation.ok, true, validation.errors.join("\n"));
+});
+
+test("dfblueprint validation rejects action execution branches to asset write", () => {
+  const source = `dfblueprint "Invalid asset write branch"
+format diffforge.dfblueprint.v1
+direction right
+node "Send message" [id: send-message-mqruul0w-r330x, kind: send_message, role: action]
+node "Write assets" [id: asset-write-mqruul0w-r330x, kind: asset_write, role: context]
+edge send-message-mqruul0w-r330x.exec -> asset-write-mqruul0w-r330x.in [id: edge-send-asset-write, branch: exec]
+`;
+  const validation = validateDfBlueprintSource(source);
+
+  assert.equal(validation.ok, false);
+  assert.match(validation.errors.join("\n"), /Asset write nodes/);
 });
 
 test("graph ast validation accepts asset context edges to internal steps", () => {

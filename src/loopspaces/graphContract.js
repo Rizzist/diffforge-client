@@ -19,6 +19,20 @@ const EXECUTION_OUTPUT_PORTS = [
   OUTPUT_PORTS_BY_ID.interrupt,
 ];
 
+const STEP_OUTPUT_PORTS = [
+  OUTPUT_PORTS_BY_ID.success,
+  OUTPUT_PORTS_BY_ID.docs,
+  OUTPUT_PORTS_BY_ID.assets,
+];
+
+const EXECUTION_OUTPUT_PORT_IDS = new Set([
+  "exec",
+  "success",
+  "failure",
+  "interrupt",
+  "out",
+]);
+
 export const LOOPSPACE_GRAPH_NODE_TEMPLATES = [
   {
     description: "Attach read-only document context to a runtime step.",
@@ -133,7 +147,7 @@ export const LOOPSPACE_GRAPH_NODE_CONTRACTS = {
   step: {
     inputs: [INPUT_PORTS_BY_ID.in],
     internal: true,
-    outputs: [OUTPUT_PORTS_BY_ID.docs, OUTPUT_PORTS_BY_ID.assets],
+    outputs: STEP_OUTPUT_PORTS,
     role: "checkpoint",
     visual: { height: 30, width: 160 },
   },
@@ -268,6 +282,13 @@ export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = 
   const fromKind = normalizeLoopspaceGraphNodeKind(fromNode);
   const toKind = normalizeLoopspaceGraphNodeKind(toNode);
   const nodeLookup = options.nodeById || options.nodeLookup || options.nodes || null;
+  const isSendMessageSubstepSuccessEdge = (
+    fromKind === "step"
+      && (toKind === "run_script" || toKind === "send_message")
+      && fromPort === "success"
+      && toPort === "in"
+      && graphContractIsSendMessageSubstep(fromNode, nodeLookup)
+  );
   const isResourceStepContextEdge = (
     fromKind === "document_read"
       && toKind === "step"
@@ -305,8 +326,18 @@ export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = 
       && toPort === "in"
       && graphContractIsSendMessageSubstep(toNode, nodeLookup)
   );
-  if ((fromContract.internal || toContract.internal) && !isResourceStepContextEdge) {
+  if ((fromContract.internal || toContract.internal) && !isResourceStepContextEdge && !isSendMessageSubstepSuccessEdge) {
     return { error: "Internal send-message steps cannot be connected as graph nodes.", ok: false };
+  }
+  if (
+    toKind === "asset_write"
+      && (fromKind === "run_script" || fromKind === "send_message")
+      && EXECUTION_OUTPUT_PORT_IDS.has(fromPort)
+  ) {
+    return {
+      error: "Asset write nodes must be connected from a send-message step asset output, not an action execution branch.",
+      ok: false,
+    };
   }
   if (!loopspaceGraphNodeHasOutputPort(fromNode, fromPort, { allowLegacy: options.allowLegacy })) {
     return {

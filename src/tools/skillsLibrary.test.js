@@ -5,6 +5,8 @@ import {
   accountDocumentHydrateRequestFromSkill,
   accountDocumentRequestFromSkill,
   accountDocumentUnitsFromPayload,
+  documentExtensionForKind,
+  documentMimeTypeForKind,
   mergeSkillUnits,
   normalizedDocumentKind,
   skillSlug,
@@ -46,6 +48,7 @@ test("skills normalize from unit metadata", () => {
 test("legacy instruction document metadata normalizes as document", () => {
   assert.equal(normalizedDocumentKind("instruction"), "document");
   assert.equal(normalizedDocumentKind("", "instructions"), "document");
+  assert.equal(normalizedDocumentKind("markdown"), "document");
 
   const [unit] = skillsFromUnits([{
     content_md: "Legacy instructions",
@@ -56,6 +59,45 @@ test("legacy instruction document metadata normalizes as document", () => {
 
   assert.equal(unit.documentKind, "document");
   assert.equal(unit.source, "document");
+});
+
+test("html document metadata preserves html extension and mime type", () => {
+  assert.equal(normalizedDocumentKind("html"), "html");
+  assert.equal(normalizedDocumentKind("webpage"), "html");
+  assert.equal(documentExtensionForKind("html"), "html");
+  assert.equal(documentMimeTypeForKind("html"), "text/html");
+
+  const [unit] = skillsFromUnits([{
+    content_md: "<!doctype html><title>Preview</title>",
+    doc_id: "preview",
+    document_kind: "html",
+    file_path: "previews/preview.html",
+    mime_type: "text/html",
+    title: "Preview",
+  }]);
+
+  assert.equal(unit.documentKind, "html");
+  assert.equal(unit.source, "html");
+  assert.equal(unit.extension, "html");
+  assert.equal(unit.fileName, "preview.html");
+  assert.equal(unit.mimeType, "text/html");
+
+  const request = accountDocumentRequestFromSkill(unit);
+  assert.equal(request.document.document_kind, "html");
+  assert.equal(request.document.file_name, "preview.html");
+  assert.equal(request.document.mime_type, "text/html");
+
+  const extensionOnlyRequest = accountDocumentRequestFromSkill({
+    content: "<!doctype html><title>Extension Only</title>",
+    documentKind: "document",
+    extension: "html",
+    id: "extension-only",
+    mimeType: "text/markdown",
+    title: "Extension Only",
+  });
+  assert.equal(extensionOnlyRequest.document.document_kind, "html");
+  assert.equal(extensionOnlyRequest.document.extension, "html");
+  assert.equal(extensionOnlyRequest.document.mime_type, "text/html");
 });
 
 test("document save requests mark inline content as intentional", () => {

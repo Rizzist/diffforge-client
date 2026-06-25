@@ -89,6 +89,7 @@ const MAX_FORGE_MODEL_LENGTH: usize = 80;
 const MAX_FORGE_IMAGES: usize = 4;
 const MAX_FORGE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FORGE_IMAGE_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+const MAX_HTML_DOCUMENT_OPEN_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TODO_TEXT_ATTACHMENT_BYTES: usize = 256 * 1024;
 const TERMINAL_DEFAULT_COLS: u16 = 80;
 const TERMINAL_DEFAULT_ROWS: u16 = 24;
@@ -168,7 +169,7 @@ const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
 /// Flip to trace the cloud sync/connect loop into logs/cloud-sync.jsonl:
 /// every connection-state note, ws phase change, route resolution, open
 /// attempt (with durations), disconnect reason, and outbox depth.
-const CLOUD_SYNC_LOGGING_ENABLED: bool = true;
+const CLOUD_SYNC_LOGGING_ENABLED: bool = false;
 const CLOUD_SYNC_LOG_FILE: &str = "cloud-sync.jsonl";
 const TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED: bool = false;
 const TERMINAL_CRASH_FORENSICS_LOG_FILE: &str = "terminal-crash-forensics.jsonl";
@@ -3871,6 +3872,100 @@ async fn local_workspaces_store(
     .map_err(|error| format!("Unable to store local workspace catalog: {error}"))?
 }
 
+fn html_document_preview_file_name(title: Option<String>) -> String {
+    let stem = title
+        .as_deref()
+        .unwrap_or("document")
+        .trim()
+        .trim_end_matches(".html")
+        .trim_end_matches(".htm")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.') {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches(['.', '_', '-'])
+        .chars()
+        .take(80)
+        .collect::<String>();
+    let stem = if stem.is_empty() {
+        "document".to_string()
+    } else {
+        stem
+    };
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{stem}-{nanos}.html")
+}
+
+fn open_path_with_default_browser(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let mut command = {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    };
+
+    #[cfg(target_os = "windows")]
+    let mut command = {
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", ""]).arg(path);
+        command
+    };
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let mut command = {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Unable to open HTML document in the default browser: {error}"))
+}
+
+#[tauri::command]
+async fn open_html_document_in_browser(
+    app: AppHandle,
+    title: Option<String>,
+    content: String,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let bytes = content.as_bytes();
+        if bytes.len() > MAX_HTML_DOCUMENT_OPEN_BYTES {
+            return Err(format!(
+                "HTML document preview is too large to open safely ({} bytes).",
+                bytes.len()
+            ));
+        }
+        let preview_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|error| format!("Unable to resolve app data directory: {error}"))?
+            .join("html-document-previews");
+        fs::create_dir_all(&preview_dir)
+            .map_err(|error| format!("Unable to create HTML preview directory: {error}"))?;
+        let preview_path = preview_dir.join(html_document_preview_file_name(title));
+        fs::write(&preview_path, bytes)
+            .map_err(|error| format!("Unable to write HTML preview: {error}"))?;
+        open_path_with_default_browser(&preview_path)?;
+        Ok(json!({
+            "ok": true,
+            "path": preview_path.display().to_string(),
+        }))
+    })
+    .await
+    .map_err(|error| format!("Unable to open HTML document: {error}"))?
+}
+
 fn local_workspace_catalog_text(value: &Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key).and_then(Value::as_str))
@@ -4772,6 +4867,7 @@ pub fn run() {
             desktop_auth_sign_out,
             local_workspaces_load,
             local_workspaces_store,
+            open_html_document_in_browser,
             app_local_state_load,
             app_local_state_store,
             app_local_state_merge_command,

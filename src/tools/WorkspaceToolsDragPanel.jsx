@@ -34,12 +34,14 @@ const SEND_STORAGE_PREFIX = "diffforge.workspaceTools.sendOnDrop";
 const DOC_KIND_LABELS = {
   architecture: "Architecture",
   document: "Document",
+  html: "HTML",
   skill: "Skill",
 };
 
 const DOC_KIND_ICONS = {
   architecture: Architecture,
   document: Article,
+  html: Article,
   skill: Psychology,
 };
 
@@ -205,7 +207,9 @@ export default function WorkspaceToolsDragPanel({
     event.dataTransfer.effectAllowed = "copy";
   }, [sendOnDrop]);
 
-  const visibleDocs = filter === "all" ? docs : docs.filter((entry) => entry.kind === filter);
+  const visibleDocs = filter === "all"
+    ? docs
+    : docs.filter((entry) => entry.kind === filter || (filter === "document" && entry.kind === "html"));
 
   return (
     <Panel aria-label="Draggable workspace docs">

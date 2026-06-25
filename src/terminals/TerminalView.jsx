@@ -96,10 +96,22 @@ import {
 import GitWorkspaceView from "../git/GitWorkspaceView.jsx";
 import PlansWorkspaceView from "../plans/PlansWorkspaceView.jsx";
 import WorkspaceToolsDragPanel from "../tools/WorkspaceToolsDragPanel.jsx";
+import {
+  TOOLS_WINDOW_AGENT_COMPANION_CLOSE,
+  TOOLS_WINDOW_AGENT_COMPANION_EVENT,
+  TOOLS_WINDOW_AGENT_COMPANION_OPEN,
+} from "../tools/toolsWindowBridge.js";
 import { WORKSPACE_TOOL_TODO_DRAG_MIME } from "../tools/workspaceToolDragTypes.js";
 import { warmWorkspaceTools } from "../tools/workspaceToolsStore.js";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 import { logTerminalStatus } from "./terminalStatusLog.js";
+import {
+  appControlMessageHasExplicitTerminalTarget,
+  getLoopspaceAutomationAutoSpawnMaxTotal,
+  isLoopspaceAutomationAppControlMessage,
+  loopspaceAutomationAutoSpawnEnabled,
+  selectLoopspaceAutomationAppControlTerminal,
+} from "./appControlOrchestratorRouting.js";
 import {
   terminalActivityStatusIsBusy,
   terminalActivityStatusIsPaused,
@@ -16760,14 +16772,19 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       const contextIndex = Number(context?.terminalIndex);
       const status = String(context?.lastRemoteStatus || "").trim().toLowerCase();
       if (
-	        Number.isInteger(contextIndex)
-	        && contextIndex === safeIndex
-	        && !["completed", "failed", "interrupted", "resume_ready"].includes(status)
-	      ) {
-	        return true;
-	      }
+        Number.isInteger(contextIndex)
+        && contextIndex === safeIndex
+        && !["completed", "failed", "interrupted", "resume_ready"].includes(status)
+      ) {
+        return true;
+      }
     }
     return false;
+  }, []);
+  const getAppControlAgentSendQueueDepth = useCallback((terminalIndex) => {
+    const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
+    const queue = appControlAgentSendQueuesByIndexRef.current.get(safeIndex);
+    return Array.isArray(queue) ? queue.length : 0;
   }, []);
   const startAppControlAgentPendingPrompt = useCallback((terminalIndex, pendingPrompt, options = {}) => {
     const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
@@ -16804,6 +16821,12 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       ...pendingPrompt,
       remoteCommand: nextRemoteCommand,
     };
+    const queueDepth = Math.max(0, Number.parseInt(options.queueDepth, 10) || 0);
+    const maxAutoPoolSize = Math.max(0, Number.parseInt(options.maxAutoPoolSize, 10) || 0);
+    const orchestratorPoolSize = Math.max(0, Number.parseInt(options.orchestratorPoolSize, 10) || 0);
+    const routingReason = String(options.routingReason || remoteCommand.routingReason || "").trim();
+    const autoSpawned = Boolean(options.autoSpawned || remoteCommand.orchestratorAutoSpawned);
+    const loopspaceAutomation = Boolean(options.loopspaceAutomation || remoteCommand.loopspaceAutomation);
     appControlAgentThreadIdsRef.current.set(safeIndex, threadId);
     appControlAgentRemoteCommandsByPromptIdRef.current.set(promptId, nextRemoteCommand);
     setAppControlAgentTerminalIndexes((current) => {
@@ -16838,10 +16861,15 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       agentId: role,
       commandId: remoteCommand.commandId || "",
       commandKind: remoteCommand.commandKind || "terminal_orchestrator_send_message",
+      autoSpawned,
+      loopspaceAutomation,
+      maxAutoPoolSize,
+      orchestratorPoolSize,
       paneId,
       promptId,
-      queueDepth: Number(options.queueDepth || 0),
+      queueDepth,
       recoveryAttempt,
+      routingReason,
       targetTerminalIndex: safeIndex,
       textLength: String(pendingPrompt.text || pendingPrompt.message || "").length,
       threadId,
@@ -16853,25 +16881,30 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       "running",
       options.message || "Preparing terminal orchestrator message.",
       {
-	        agentId: role,
-	        commandId: remoteCommand.commandId || "",
-	        commandKind: remoteCommand.commandKind || "terminal_orchestrator_send_message",
-	        loopRuntimeEdgeId: remoteCommand.loopRuntimeEdgeId || "",
-	        loopRuntimeNodeId: remoteCommand.loopRuntimeNodeId || "",
-	        loopRuntimeRunId: remoteCommand.loopRuntimeRunId || "",
-	        loopspaceId: remoteCommand.loopspaceId || "",
-	        paneId,
-	        promptId,
-	        queueDepth: Number(options.queueDepth || 0),
-	        recoveryAttempt,
-	        resumeRequested: Boolean(remoteCommand.resumeRequested),
-	        targetTerminalIndex: safeIndex,
-	        targetThreadId: threadId,
-	        textPreview: remoteCommand.textPreview || "",
-	        triggerId: remoteCommand.triggerId || "",
-	        triggerRunId: remoteCommand.triggerRunId || "",
-	      },
-	    );
+        agentId: role,
+        commandId: remoteCommand.commandId || "",
+        commandKind: remoteCommand.commandKind || "terminal_orchestrator_send_message",
+        loopRuntimeEdgeId: remoteCommand.loopRuntimeEdgeId || "",
+        loopRuntimeNodeId: remoteCommand.loopRuntimeNodeId || "",
+        loopRuntimeRunId: remoteCommand.loopRuntimeRunId || "",
+        loopspaceId: remoteCommand.loopspaceId || "",
+        autoSpawned,
+        loopspaceAutomation,
+        maxAutoPoolSize,
+        orchestratorPoolSize,
+        paneId,
+        promptId,
+        queueDepth,
+        recoveryAttempt,
+        resumeRequested: Boolean(remoteCommand.resumeRequested),
+        routingReason,
+        targetTerminalIndex: safeIndex,
+        targetThreadId: threadId,
+        textPreview: remoteCommand.textPreview || "",
+        triggerId: remoteCommand.triggerId || "",
+        triggerRunId: remoteCommand.triggerRunId || "",
+      },
+    );
   }, [
     getAppControlAgentThreadId,
     recordAppControlRemoteCommandStatus,
@@ -17553,14 +17586,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       return;
     }
 
-    const currentIndexes = appControlAgentTerminalIndexesRef.current.length
-      ? appControlAgentTerminalIndexesRef.current
-      : [0];
-    let terminalIndex = resolveAppControlAgentTerminalIndex(detail);
-    if (!currentIndexes.includes(terminalIndex) && currentIndexes.length >= APP_CONTROL_AGENT_MAX_TERMINAL_COUNT) {
-      terminalIndex = currentIndexes[0] || 0;
-    }
-    const paneId = getAppControlAgentPaneId(terminalIndex);
     const rawAgentId = appControlRemoteDetailString(detail, [
       "targetAgentId",
       "target_agent_id",
@@ -17569,6 +17594,50 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     ]);
     const normalizedRole = normalizeAppControlAgentRole(rawAgentId);
     const role = normalizedRole === "generic" ? APP_CONTROL_AGENT_DEFAULT_ROLE : normalizedRole;
+    const currentIndexes = (appControlAgentTerminalIndexesRef.current.length
+      ? appControlAgentTerminalIndexesRef.current
+      : [0]).slice();
+    const loopspaceAutomation = isLoopspaceAutomationAppControlMessage(detail);
+    const explicitTerminalTarget = appControlMessageHasExplicitTerminalTarget(detail);
+    const loopspaceAutoSpawn = loopspaceAutomation
+      && !explicitTerminalTarget
+      && loopspaceAutomationAutoSpawnEnabled(detail);
+    const maxAutoPoolSize = loopspaceAutoSpawn
+      ? getLoopspaceAutomationAutoSpawnMaxTotal(detail)
+      : 0;
+    const initialTerminalIndex = resolveAppControlAgentTerminalIndex(detail);
+    let terminalIndex = initialTerminalIndex;
+    let terminalSelection = {
+      autoSpawned: false,
+      maxAutoPoolSize,
+      orchestratorPoolSize: currentIndexes.includes(terminalIndex)
+        ? currentIndexes.length
+        : Math.min(currentIndexes.length + 1, APP_CONTROL_AGENT_MAX_TERMINAL_COUNT),
+      reason: explicitTerminalTarget ? "explicit_terminal_target" : "default_terminal_target",
+      terminalIndex,
+    };
+    if (loopspaceAutoSpawn) {
+      terminalSelection = selectLoopspaceAutomationAppControlTerminal({
+        getQueueDepth: getAppControlAgentSendQueueDepth,
+        indexes: currentIndexes,
+        isTerminalBusy: appControlAgentTerminalHasActiveRemoteCommand,
+        maxAutoTerminalCount: maxAutoPoolSize,
+        maxTerminalCount: APP_CONTROL_AGENT_MAX_TERMINAL_COUNT,
+        preferredIndex: initialTerminalIndex,
+        rolesByIndex: appControlAgentRolesByIndex,
+        targetRole: role,
+      });
+      terminalIndex = terminalSelection.terminalIndex;
+    } else if (!currentIndexes.includes(terminalIndex) && currentIndexes.length >= APP_CONTROL_AGENT_MAX_TERMINAL_COUNT) {
+      terminalIndex = currentIndexes[0] || 0;
+      terminalSelection = {
+        ...terminalSelection,
+        orchestratorPoolSize: currentIndexes.length,
+        reason: "terminal_limit_fallback",
+        terminalIndex,
+      };
+    }
+    const paneId = getAppControlAgentPaneId(terminalIndex);
     const threadId = appControlRemoteDetailString(detail, [
       "targetThreadId",
       "target_thread_id",
@@ -17585,37 +17654,42 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       "prompt_id",
     ]) || commandId;
     const createdAt = new Date().toISOString();
-	    const remoteCommand = {
-	      agentId: role,
-	      commandId,
-	      commandKind,
-	      checkpointPlan,
-	      event: remoteEvent,
-	      loopRuntimeEdgeId: appControlRemoteDetailString(detail, ["loopRuntimeEdgeId", "loop_runtime_edge_id", "edgeId", "edge_id"]),
-	      loopRuntimeNodeId: appControlRemoteDetailString(detail, ["loopRuntimeNodeId", "loop_runtime_node_id", "nodeId", "node_id"]),
-	      loopRuntimeRunId: appControlRemoteDetailString(detail, ["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"]),
-	      loopspaceId: appControlRemoteDetailString(detail, ["loopspaceId", "loopspace_id"]),
-	      message: text,
-	      model: appControlRemoteDetailString(detail, ["model", "modelId", "model_id", "requestedModel"]),
-	      paneId,
-	      promptId,
-	      reasoningEffort: appControlRemoteDetailString(detail, [
-	        "reasoningEffort",
-	        "reasoning_effort",
-	        "effort",
-	        "requestedReasoningEffort",
-	      ]),
-	      resumeRequested: Boolean(detail.resume || detail.resumeRequested || detail.resume_requested),
-	      speed: appControlRemoteDetailString(detail, ["speed", "serviceTier", "service_tier", "requestedSpeed"]),
-	      targetTerminalId: appControlRemoteDetailString(detail, ["targetTerminalId", "target_terminal_id", "terminalId", "terminal_id"]),
-	      targetTerminalName: appControlRemoteDetailString(detail, ["targetTerminalName", "target_terminal_name", "terminalName", "terminal_name"]),
-	      text,
-	      terminalIndex,
-	      textPreview: text.slice(0, 200),
-	      threadId,
-	      triggerId: appControlRemoteDetailString(detail, ["triggerId", "trigger_id"]),
-	      triggerRunId: appControlRemoteDetailString(detail, ["triggerRunId", "trigger_run_id"]),
-	    };
+    const remoteCommand = {
+      agentId: role,
+      commandId,
+      commandKind,
+      checkpointPlan,
+      event: remoteEvent,
+      loopRuntimeEdgeId: appControlRemoteDetailString(detail, ["loopRuntimeEdgeId", "loop_runtime_edge_id", "edgeId", "edge_id"]),
+      loopRuntimeNodeId: appControlRemoteDetailString(detail, ["loopRuntimeNodeId", "loop_runtime_node_id", "nodeId", "node_id"]),
+      loopRuntimeRunId: appControlRemoteDetailString(detail, ["loopRuntimeRunId", "loop_runtime_run_id", "runId", "run_id"]),
+      loopspaceId: appControlRemoteDetailString(detail, ["loopspaceId", "loopspace_id"]),
+      loopspaceAutomation,
+      message: text,
+      model: appControlRemoteDetailString(detail, ["model", "modelId", "model_id", "requestedModel"]),
+      maxAutoPoolSize: terminalSelection.maxAutoPoolSize || 0,
+      orchestratorAutoSpawned: Boolean(terminalSelection.autoSpawned),
+      orchestratorPoolSize: terminalSelection.orchestratorPoolSize || currentIndexes.length,
+      paneId,
+      promptId,
+      reasoningEffort: appControlRemoteDetailString(detail, [
+        "reasoningEffort",
+        "reasoning_effort",
+        "effort",
+        "requestedReasoningEffort",
+      ]),
+      resumeRequested: Boolean(detail.resume || detail.resumeRequested || detail.resume_requested),
+      routingReason: terminalSelection.reason || "",
+      speed: appControlRemoteDetailString(detail, ["speed", "serviceTier", "service_tier", "requestedSpeed"]),
+      targetTerminalId: appControlRemoteDetailString(detail, ["targetTerminalId", "target_terminal_id", "terminalId", "terminal_id"]),
+      targetTerminalName: appControlRemoteDetailString(detail, ["targetTerminalName", "target_terminal_name", "terminalName", "terminal_name"]),
+      text,
+      terminalIndex,
+      textPreview: text.slice(0, 200),
+      threadId,
+      triggerId: appControlRemoteDetailString(detail, ["triggerId", "trigger_id"]),
+      triggerRunId: appControlRemoteDetailString(detail, ["triggerRunId", "trigger_run_id"]),
+    };
     const pendingPrompt = {
       createdAt,
       deliveryMode: "terminal-confirmed",
@@ -17644,42 +17718,66 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         },
       }]);
       appControlAgentSendQueuesByIndexRef.current.set(terminalIndex, nextQueue);
+      const queuedStatusMessage = loopspaceAutoSpawn && terminalSelection.reason === "least_loaded_queue"
+        ? "All loopspace automation terminal orchestrators are busy; queued behind the least-loaded orchestrator."
+        : "Queued behind an active terminal orchestrator message.";
       logTerminalStatus("frontend.app_control.remote_send_message_waiting", {
         agentId: role,
         commandId,
         commandKind,
+        autoSpawned: false,
+        loopspaceAutomation,
+        maxAutoPoolSize: terminalSelection.maxAutoPoolSize || 0,
+        orchestratorPoolSize: terminalSelection.orchestratorPoolSize || currentIndexes.length,
         paneId,
         promptId,
         queueDepth: nextQueue.length,
+        routingReason: terminalSelection.reason || "",
         targetTerminalIndex: terminalIndex,
         textLength: text.length,
         threadId,
         workspaceId: APP_CONTROL_AGENT_WORKSPACE.id,
       });
-      void recordAppControlRemoteCommandStatus(remoteEvent, "queued", "Queued behind an active terminal orchestrator message.", {
-	        agentId: role,
-	        commandId,
-	        commandKind,
-	        loopRuntimeEdgeId: remoteCommand.loopRuntimeEdgeId || "",
-	        loopRuntimeNodeId: remoteCommand.loopRuntimeNodeId || "",
-	        loopRuntimeRunId: remoteCommand.loopRuntimeRunId || "",
-	        loopspaceId: remoteCommand.loopspaceId || "",
-	        paneId,
-	        promptId,
-	        queueDepth: nextQueue.length,
-	        resumeRequested: Boolean(remoteCommand.resumeRequested),
-	        targetTerminalIndex: terminalIndex,
-	        targetThreadId: threadId,
-	        textPreview: text.slice(0, 200),
-	        triggerId: remoteCommand.triggerId || "",
-	        triggerRunId: remoteCommand.triggerRunId || "",
-	      });
+      void recordAppControlRemoteCommandStatus(remoteEvent, "queued", queuedStatusMessage, {
+        agentId: role,
+        commandId,
+        commandKind,
+        loopRuntimeEdgeId: remoteCommand.loopRuntimeEdgeId || "",
+        loopRuntimeNodeId: remoteCommand.loopRuntimeNodeId || "",
+        loopRuntimeRunId: remoteCommand.loopRuntimeRunId || "",
+        loopspaceId: remoteCommand.loopspaceId || "",
+        autoSpawned: false,
+        loopspaceAutomation,
+        maxAutoPoolSize: terminalSelection.maxAutoPoolSize || 0,
+        orchestratorPoolSize: terminalSelection.orchestratorPoolSize || currentIndexes.length,
+        paneId,
+        promptId,
+        queueDepth: nextQueue.length,
+        resumeRequested: Boolean(remoteCommand.resumeRequested),
+        routingReason: terminalSelection.reason || "",
+        targetTerminalIndex: terminalIndex,
+        targetThreadId: threadId,
+        textPreview: text.slice(0, 200),
+        triggerId: remoteCommand.triggerId || "",
+        triggerRunId: remoteCommand.triggerRunId || "",
+      });
       return;
     }
 
-    startAppControlAgentPendingPrompt(terminalIndex, pendingPrompt);
+    startAppControlAgentPendingPrompt(terminalIndex, pendingPrompt, {
+      autoSpawned: Boolean(terminalSelection.autoSpawned),
+      loopspaceAutomation,
+      maxAutoPoolSize: terminalSelection.maxAutoPoolSize || 0,
+      message: terminalSelection.autoSpawned
+        ? "Started an additional terminal orchestrator for loopspace automation."
+        : undefined,
+      orchestratorPoolSize: terminalSelection.orchestratorPoolSize || currentIndexes.length,
+      routingReason: terminalSelection.reason || "",
+    });
   }, [
+    appControlAgentRolesByIndex,
     appControlAgentTerminalHasActiveRemoteCommand,
+    getAppControlAgentSendQueueDepth,
     getAppControlAgentThreadId,
     recordAppControlRemoteCommandStatus,
     resolveAppControlAgentTerminalIndex,
@@ -17843,6 +17941,49 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     appControlAgentRolesByIndex,
     appControlAgentTerminalIndexes,
   ]);
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(TOOLS_WINDOW_AGENT_COMPANION_EVENT, (event) => {
+      if (disposed) return;
+      const action = String(event?.payload?.action || TOOLS_WINDOW_AGENT_COMPANION_OPEN).trim()
+        || TOOLS_WINDOW_AGENT_COMPANION_OPEN;
+      const activeTerminal = appControlAgentTerminals.find((terminal) => terminal.paneId === activeAppControlAgentPaneId)
+        || appControlAgentTerminals[0]
+        || null;
+      if (!activeTerminal?.paneId) return;
+      if (action === TOOLS_WINDOW_AGENT_COMPANION_CLOSE) {
+        invoke("terminal_window_close", { paneId: activeTerminal.paneId }).catch(() => {});
+        return;
+      }
+      void (async () => {
+        const focused = await invoke("terminal_window_focus", { paneId: activeTerminal.paneId }).catch(() => false);
+        if (focused) return;
+        await invoke("terminal_window_open", {
+          agentKind: activeTerminal.role,
+          agentLabel: APP_CONTROL_AGENT_LABELS[activeTerminal.role] || "Agent",
+          colorSlot: getTerminalAgentColorSlot(activeTerminal.terminalIndex),
+          height: 720,
+          paneId: activeTerminal.paneId,
+          theme: document.documentElement?.dataset?.forgeTheme || "",
+          title: "Terminal Orchestrator",
+          width: 520,
+        }).catch(() => {});
+      })();
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [activeAppControlAgentPaneId, appControlAgentTerminals]);
   const appControlAgentPanelMinSize = getTerminalPaneMinSizePercent(appControlAgentTerminalCount);
   const appControlAgentPanelDefaultSize = `${100 / Math.max(1, appControlAgentTerminalCount)}%`;
   const orchestratorDeviceRows = useMemo(
@@ -21587,6 +21728,49 @@ function TerminalView({
     : `${TODO_QUEUE_RESTORED_MIN_WIDTH_PX}px`;
   const todoQueuePanelMaxSize = todoQueuePaneMinimized ? todoQueueMinimizedSize : 70;
   const terminalGridPanelMinSize = todoQueuePaneMinimized ? 72 : 30;
+  useEffect(() => {
+    if (effectiveTodoQueueVisible && !todoQueuePaneMinimized) {
+      return undefined;
+    }
+    let disposed = false;
+    let unlisten = () => {};
+    listen(TOOLS_WINDOW_AGENT_COMPANION_EVENT, (event) => {
+      if (disposed) return;
+      const action = String(event?.payload?.action || TOOLS_WINDOW_AGENT_COMPANION_OPEN).trim()
+        || TOOLS_WINDOW_AGENT_COMPANION_OPEN;
+      const paneId = getAppControlAgentPaneId(0);
+      if (action === TOOLS_WINDOW_AGENT_COMPANION_CLOSE) {
+        invoke("terminal_window_close", { paneId }).catch(() => {});
+        return;
+      }
+      void (async () => {
+        const focused = await invoke("terminal_window_focus", { paneId }).catch(() => false);
+        if (focused) return;
+        await invoke("terminal_window_open", {
+          agentKind: APP_CONTROL_AGENT_DEFAULT_ROLE,
+          agentLabel: APP_CONTROL_AGENT_LABELS[APP_CONTROL_AGENT_DEFAULT_ROLE] || "Agent",
+          colorSlot: getTerminalAgentColorSlot(0),
+          height: 720,
+          paneId,
+          theme: document.documentElement?.dataset?.forgeTheme || "",
+          title: "Terminal Orchestrator",
+          width: 520,
+        }).catch(() => {});
+      })();
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [effectiveTodoQueueVisible, todoQueuePaneMinimized]);
   const fullscreenTransitionTimerRef = useRef(0);
   const terminalBreakoutTransitionTimerRef = useRef(0);
   const terminalBreakoutPanStateRef = useRef(null);
