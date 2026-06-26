@@ -1909,6 +1909,7 @@ fn cleanup_terminal_instance_with_context(
         session_mode: _,
         metadata,
         runtime: _,
+        app_control_mcp_requested: _,
     } = instance;
     let metadata_fields = terminal_metadata_forensics_json(&metadata);
     log_terminal_crash_forensics_event(
@@ -5365,6 +5366,11 @@ async fn terminal_open(
                 app_control_args,
             )?;
         }
+        launch_env_vars = terminal_env_vars_with_opencode_coordination_config(
+            launch_provider_id,
+            &launch_env_vars,
+            terminal_coordination.as_ref(),
+        )?;
 
         let warm_pty = match create_agent_terminal_pty(
             size,
@@ -5423,6 +5429,7 @@ async fn terminal_open(
         terminal_coordination.clone(),
         effective_session_mode,
         terminal_metadata,
+        app_control_mcp_requested,
     );
     let runtime_snapshot = terminal_runtime_apply_opened(
         &instance,
@@ -5920,6 +5927,26 @@ async fn terminal_recover_crashed_sessions(roots: Option<Vec<String>>) -> Result
     terminal_recover_crashed_sessions_report(roots)
 }
 
+// Resolves the app-control orchestrator MCP launch (command + args) for a pane
+// that was opened with it requested. Returns None when not requested. Used by
+// the deferred/resume agent-start paths so app-control survives a relaunch the
+// same way `terminal_open` wires it on first launch.
+async fn resolve_app_control_mcp_launch(
+    app: &AppHandle,
+    requested: bool,
+) -> Result<Option<(String, Vec<String>)>, String> {
+    if !requested {
+        return Ok(None);
+    }
+    let app_control_state = app.state::<AppControlMcpState>();
+    let endpoint =
+        app_control_mcp_endpoint_for_state(app.clone(), app_control_state.inner()).await?;
+    Ok(Some((
+        app_control_mcp_command(),
+        app_control_mcp_args_for_endpoint(&endpoint),
+    )))
+}
+
 #[tauri::command]
 async fn terminal_start_agent(
     app: AppHandle,
@@ -6008,13 +6035,23 @@ async fn terminal_start_agent(
         Some(instance.metadata.workspace_id.as_str()),
         instance.metadata.terminal_index,
     );
-    let launch_args = terminal_args_with_codex_mcp_identity(
+    let mut launch_args = terminal_args_with_codex_mcp_identity(
         definition.id,
         &args,
         instance.coordination.as_ref(),
         &pane_id,
         instance.id,
     );
+    let app_control_mcp_launch =
+        resolve_app_control_mcp_launch(&app, instance.app_control_mcp_requested).await?;
+    if let Some((app_control_command, app_control_args)) = app_control_mcp_launch.as_ref() {
+        launch_args = terminal_args_with_app_control_mcp_identity(
+            definition.id,
+            &launch_args,
+            app_control_command,
+            app_control_args,
+        )?;
+    }
     validate_terminal_agent_launch_args_for_platform(definition.id, &launch_args)?;
     let mut coordination_env_vars = instance
         .coordination
@@ -6031,8 +6068,21 @@ async fn terminal_start_agent(
         activity_transport.as_ref(),
     );
     coordination_env_vars.extend(cloud_mcp_runtime_env_vars(cloud_mcp_state.inner()).await?);
-    let launch_env_vars =
+    let mut launch_env_vars =
         terminal_env_vars_with_opencode_tui_config(definition.id, &coordination_env_vars)?;
+    if let Some((app_control_command, app_control_args)) = app_control_mcp_launch.as_ref() {
+        launch_env_vars = terminal_env_vars_with_app_control_mcp_identity(
+            definition.id,
+            &launch_env_vars,
+            app_control_command,
+            app_control_args,
+        )?;
+    }
+    let launch_env_vars = terminal_env_vars_with_opencode_coordination_config(
+        definition.id,
+        &launch_env_vars,
+        instance.coordination.as_ref(),
+    )?;
     let input = terminal_agent_start_input_with_env_in_directory(
         &command_path,
         &launch_args,
@@ -6292,13 +6342,49 @@ async fn start_terminal_agent_in_prepared_pty(
             Some(instance.metadata.workspace_id.as_str()),
             instance.metadata.terminal_index,
         );
-        let launch_args = terminal_args_with_codex_mcp_identity(
+        let mut launch_args = terminal_args_with_codex_mcp_identity(
             definition.id,
             &args,
             instance.coordination.as_ref(),
             &pane_id,
             instance.id,
         );
+        let app_control_mcp_launch =
+            match resolve_app_control_mcp_launch(&app, instance.app_control_mcp_requested).await {
+                Ok(value) => value,
+                Err(error) => {
+                    return TerminalStartAgentPaneResult {
+                        pane_id,
+                        instance_id: Some(instance.id),
+                        model: None,
+                        model_source: None,
+                        started: false,
+                        skipped: false,
+                        message: error,
+                    };
+                }
+            };
+        if let Some((app_control_command, app_control_args)) = app_control_mcp_launch.as_ref() {
+            match terminal_args_with_app_control_mcp_identity(
+                definition.id,
+                &launch_args,
+                app_control_command,
+                app_control_args,
+            ) {
+                Ok(next) => launch_args = next,
+                Err(error) => {
+                    return TerminalStartAgentPaneResult {
+                        pane_id,
+                        instance_id: Some(instance.id),
+                        model: None,
+                        model_source: None,
+                        started: false,
+                        skipped: false,
+                        message: error,
+                    };
+                }
+            }
+        }
         if let Err(error) =
             validate_terminal_agent_launch_args_for_platform(definition.id, &launch_args)
         {
@@ -6382,6 +6468,49 @@ async fn start_terminal_agent_in_prepared_pty(
                     };
                 }
             };
+        let launch_env_vars = if let Some((app_control_command, app_control_args)) =
+            app_control_mcp_launch.as_ref()
+        {
+            match terminal_env_vars_with_app_control_mcp_identity(
+                definition.id,
+                &launch_env_vars,
+                app_control_command,
+                app_control_args,
+            ) {
+                Ok(env_vars) => env_vars,
+                Err(error) => {
+                    return TerminalStartAgentPaneResult {
+                        pane_id,
+                        instance_id: Some(instance.id),
+                        model: None,
+                        model_source: None,
+                        started: false,
+                        skipped: false,
+                        message: error,
+                    };
+                }
+            }
+        } else {
+            launch_env_vars
+        };
+        let launch_env_vars = match terminal_env_vars_with_opencode_coordination_config(
+            definition.id,
+            &launch_env_vars,
+            instance.coordination.as_ref(),
+        ) {
+            Ok(env_vars) => env_vars,
+            Err(error) => {
+                return TerminalStartAgentPaneResult {
+                    pane_id,
+                    instance_id: Some(instance.id),
+                    model: None,
+                    model_source: None,
+                    started: false,
+                    skipped: false,
+                    message: error,
+                };
+            }
+        };
         let input = terminal_agent_start_input_with_env_in_directory(
             &command_path,
             &launch_args,
@@ -13796,6 +13925,267 @@ async fn terminal_window_focus(app: AppHandle, pane_id: String) -> Result<bool, 
     Ok(true)
 }
 
+// === Cross-window terminal drag-and-drop ===
+//
+// When a terminal is popped into its own native window (Window Breakout), the
+// main window's DOM-based drop detection cannot see it: separate webviews do
+// not share a document, so `elementFromPoint` and HTML5 drag events stop at the
+// main window edge. To let todo/doc drags land on a popped-out terminal we run
+// a short-lived watcher while a drag is active. It reads the OS cursor position
+// in screen space (independent of which window has focus), hit-tests every open
+// breakout terminal window, highlights the one under the cursor, and reports
+// the resolved terminal index back to the main window. The main window owns the
+// payload and commits the drop by terminal index — the PTY lives in the main
+// process, so index routing reaches a pane in any window. Reuses the same
+// cross-platform mouse-button probe as the snip-preview drag system.
+const TERMINAL_DRAG_MOVE_EVENT: &str = "forge-terminal-drag-move";
+const TERMINAL_DRAG_RELEASE_EVENT: &str = "forge-terminal-drag-release";
+const TERMINAL_DRAG_TARGET_EVENT: &str = "forge-terminal-drag-target";
+const TERMINAL_DRAG_POLL_MS: u64 = 16;
+const TERMINAL_DRAG_MOVE_THROTTLE_MS: u64 = 40;
+// Hard backstop so a watcher can never spin forever if the end signal is lost
+// (e.g. the main window crashes mid-drag). No real drag runs this long.
+const TERMINAL_DRAG_MAX_MS: u64 = 120_000;
+
+#[derive(Clone)]
+struct TerminalDragTarget {
+    label: String,
+    terminal_index: i64,
+}
+
+struct TerminalDragSession {
+    generation: u64,
+    targets: Vec<TerminalDragTarget>,
+}
+
+static TERMINAL_DRAG_SESSION: OnceLock<StdMutex<Option<TerminalDragSession>>> = OnceLock::new();
+static TERMINAL_DRAG_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn terminal_drag_session_slot() -> &'static StdMutex<Option<TerminalDragSession>> {
+    TERMINAL_DRAG_SESSION.get_or_init(|| StdMutex::new(None))
+}
+
+#[derive(Deserialize)]
+struct TerminalDragTargetInput {
+    #[serde(rename = "paneId")]
+    pane_id: String,
+    #[serde(rename = "terminalIndex")]
+    terminal_index: i64,
+}
+
+/// True when the physical-pixel screen cursor sits inside this window's outer
+/// rect and the window is actually on screen.
+fn terminal_drag_cursor_in_window(app: &AppHandle, label: &str, cursor: (f64, f64)) -> bool {
+    let Some(window) = app.get_webview_window(label) else {
+        return false;
+    };
+    if !window.is_visible().unwrap_or(false) {
+        return false;
+    }
+    let (Ok(position), Ok(size)) = (window.outer_position(), window.outer_size()) else {
+        return false;
+    };
+    let left = f64::from(position.x);
+    let top = f64::from(position.y);
+    let right = left + f64::from(size.width);
+    let bottom = top + f64::from(size.height);
+    cursor.0 >= left && cursor.0 <= right && cursor.1 >= top && cursor.1 <= bottom
+}
+
+/// The breakout terminal window under the cursor, if any. There is no portable
+/// Tauri z-order query, so when overlapping windows both contain the cursor we
+/// prefer the focused one (the window the user is most likely looking at);
+/// otherwise the first match in list order wins.
+fn terminal_drag_hit_test(
+    app: &AppHandle,
+    targets: &[TerminalDragTarget],
+) -> Option<(String, i64)> {
+    let cursor = app.cursor_position().ok()?;
+    let point = (cursor.x, cursor.y);
+    let mut first_match: Option<(String, i64)> = None;
+    for target in targets {
+        if !terminal_drag_cursor_in_window(app, &target.label, point) {
+            continue;
+        }
+        let focused = app
+            .get_webview_window(&target.label)
+            .and_then(|window| window.is_focused().ok())
+            .unwrap_or(false);
+        if focused {
+            return Some((target.label.clone(), target.terminal_index));
+        }
+        if first_match.is_none() {
+            first_match = Some((target.label.clone(), target.terminal_index));
+        }
+    }
+    first_match
+}
+
+fn terminal_drag_set_highlight(app: &AppHandle, label: &str, active: bool) {
+    let _ = app.emit_to(label, TERMINAL_DRAG_TARGET_EVENT, json!({ "active": active }));
+}
+
+fn terminal_drag_take_session() -> Option<TerminalDragSession> {
+    terminal_drag_session_slot()
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+}
+
+fn terminal_drag_clear(app: &AppHandle) {
+    if let Some(session) = terminal_drag_take_session() {
+        for target in &session.targets {
+            terminal_drag_set_highlight(app, &target.label, false);
+        }
+    }
+}
+
+fn terminal_drag_spawn_watcher(app: AppHandle, generation: u64) {
+    tauri::async_runtime::spawn(async move {
+        let button_state_supported = snipping_mouse_button_state_supported();
+        let started_ms = terminal_now_ms();
+        let mut active_label: Option<String> = None;
+        let mut last_index: Option<i64> = None;
+        let mut last_emit_ms: u64 = 0;
+        // Clears this watcher's lingering highlight before it exits for any
+        // reason (supersede, end, backstop), so a breakout window never gets
+        // stuck showing "Drop here".
+        let clear_active = |active_label: &Option<String>| {
+            if let Some(label) = active_label {
+                terminal_drag_set_highlight(&app, label, false);
+            }
+        };
+        loop {
+            sleep(Duration::from_millis(TERMINAL_DRAG_POLL_MS)).await;
+
+            // Backstop: never outlive the main window or a sane drag duration.
+            if app.get_webview_window("main").is_none()
+                || terminal_now_ms().saturating_sub(started_ms) > TERMINAL_DRAG_MAX_MS
+            {
+                clear_active(&active_label);
+                if let Ok(mut guard) = terminal_drag_session_slot().lock() {
+                    if guard.as_ref().map(|session| session.generation) == Some(generation) {
+                        *guard = None;
+                    }
+                }
+                return;
+            }
+
+            // Bail the moment a newer session supersedes this one or the drag ends.
+            let targets = {
+                let guard = match terminal_drag_session_slot().lock() {
+                    Ok(guard) => guard,
+                    Err(_) => {
+                        clear_active(&active_label);
+                        return;
+                    }
+                };
+                match guard.as_ref() {
+                    Some(session) if session.generation == generation => session.targets.clone(),
+                    _ => {
+                        clear_active(&active_label);
+                        return;
+                    }
+                }
+            };
+
+            // Where the platform can answer "is the button still down?", resolve
+            // the drop the instant it releases. Where it cannot (Linux), the main
+            // window's own dragend/pointerup ends the session via the end command.
+            if button_state_supported && !snipping_left_mouse_button_pressed() {
+                let final_index = terminal_drag_hit_test(&app, &targets).map(|(_, index)| index);
+                if let Some(ref label) = active_label {
+                    terminal_drag_set_highlight(&app, label, false);
+                }
+                let _ = app.emit_to(
+                    "main",
+                    TERMINAL_DRAG_RELEASE_EVENT,
+                    json!({ "terminalIndex": final_index }),
+                );
+                if let Ok(mut guard) = terminal_drag_session_slot().lock() {
+                    if guard.as_ref().map(|session| session.generation) == Some(generation) {
+                        *guard = None;
+                    }
+                }
+                return;
+            }
+
+            let matched = terminal_drag_hit_test(&app, &targets);
+            let matched_label = matched.as_ref().map(|(label, _)| label.clone());
+            let matched_index = matched.as_ref().map(|(_, index)| *index);
+
+            if matched_label != active_label {
+                if let Some(ref label) = active_label {
+                    terminal_drag_set_highlight(&app, label, false);
+                }
+                if let Some(ref label) = matched_label {
+                    terminal_drag_set_highlight(&app, label, true);
+                }
+                active_label = matched_label.clone();
+            }
+
+            let now_ms = terminal_now_ms();
+            if matched_index != last_index
+                || now_ms.saturating_sub(last_emit_ms) >= TERMINAL_DRAG_MOVE_THROTTLE_MS
+            {
+                let _ = app.emit_to(
+                    "main",
+                    TERMINAL_DRAG_MOVE_EVENT,
+                    json!({
+                        "terminalIndex": matched_index,
+                        "overBreakout": matched_index.is_some(),
+                    }),
+                );
+                last_index = matched_index;
+                last_emit_ms = now_ms;
+            }
+        }
+    });
+}
+
+/// Starts the cross-window drag watcher for the supplied breakout terminal
+/// windows. A no-op (and an immediate highlight clear) when no terminals are
+/// popped out — the in-grid case needs no watcher.
+#[tauri::command]
+async fn terminal_drag_session_begin(
+    app: AppHandle,
+    targets: Vec<TerminalDragTargetInput>,
+) -> Result<(), String> {
+    let resolved: Vec<TerminalDragTarget> = targets
+        .into_iter()
+        .filter(|target| !target.pane_id.trim().is_empty())
+        .map(|target| TerminalDragTarget {
+            label: terminal_window_label(&target.pane_id),
+            terminal_index: target.terminal_index,
+        })
+        .collect();
+
+    if resolved.is_empty() {
+        terminal_drag_clear(&app);
+        return Ok(());
+    }
+
+    let generation = TERMINAL_DRAG_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    {
+        let mut guard = terminal_drag_session_slot()
+            .lock()
+            .map_err(|_| "terminal drag state poisoned".to_string())?;
+        *guard = Some(TerminalDragSession {
+            generation,
+            targets: resolved,
+        });
+    }
+    terminal_drag_spawn_watcher(app, generation);
+    Ok(())
+}
+
+/// Ends the active drag watcher and clears any breakout-window highlight.
+#[tauri::command]
+async fn terminal_drag_session_end(app: AppHandle) -> Result<(), String> {
+    terminal_drag_clear(&app);
+    Ok(())
+}
+
 #[tauri::command]
 async fn terminal_pane_runtime_info(
     state: State<'_, TerminalState>,
@@ -17132,6 +17522,54 @@ mod terminal_tests {
         assert!(!env_vars
             .iter()
             .any(|(key, _)| key == OPENCODE_TUI_CONFIG_ENV));
+    }
+
+    #[test]
+    fn opencode_coordination_config_registers_activity_plugin() {
+        let env_vars = terminal_env_vars_with_opencode_coordination_config("opencode", &[], None)
+            .expect("opencode config injection should succeed");
+
+        // The activity-hook binary must be advertised to the plugin.
+        assert!(env_vars
+            .iter()
+            .any(|(key, value)| key == "DIFFFORGE_OPENCODE_ACTIVITY_HOOK_BIN" && !value.is_empty()));
+
+        let config_text = env_vars
+            .iter()
+            .rev()
+            .find_map(|(key, value)| (key == "OPENCODE_CONFIG_CONTENT").then_some(value))
+            .expect("inline opencode config should be set");
+        let config: Value = serde_json::from_str(config_text).unwrap();
+
+        // The generated plugin file is registered and exists on disk.
+        let plugins = config["plugin"].as_array().expect("plugin array present");
+        let plugin_path = plugins
+            .iter()
+            .find_map(|value| value.as_str())
+            .expect("plugin path registered");
+        assert!(plugin_path.ends_with("diffforge-activity-plugin.js"));
+        let plugin_body = fs::read_to_string(plugin_path).expect("plugin file written");
+        assert!(plugin_body.contains("--diff-forge-activity-hook"));
+        assert!(plugin_body.contains("session.idle"));
+
+        // Without coordination there is no MCP block or permission override.
+        assert!(config.get("mcp").is_none());
+        assert!(config.get("permission").is_none());
+    }
+
+    #[test]
+    fn non_opencode_coordination_config_is_untouched() {
+        let env_vars = terminal_env_vars_with_opencode_coordination_config(
+            "claude",
+            &[("COORDINATION_ENABLED".to_string(), "1".to_string())],
+            None,
+        )
+        .unwrap();
+        assert_eq!(env_vars.len(), 1);
+        assert!(!env_vars
+            .iter()
+            .any(|(key, _)| key == "OPENCODE_CONFIG_CONTENT"
+                || key == "DIFFFORGE_OPENCODE_ACTIVITY_HOOK_BIN"));
     }
 
     #[test]

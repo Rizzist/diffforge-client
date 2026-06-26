@@ -985,6 +985,18 @@ fn tokenomics_scan_usage_for_mode(
         "source": "codex_token_count_jsonl",
     }));
 
+    let opencode_result = tokenomics_scan_opencode_db(&conn, scan_mode)?;
+    scanned_files += opencode_result.files_scanned;
+    inserted_events += opencode_result.inserted_events;
+    sources.push(json!({
+        "provider": "opencode",
+        "agent_kind": "opencode",
+        "files_scanned": opencode_result.files_scanned,
+        "inserted_events": opencode_result.inserted_events,
+        "status": opencode_result.status,
+        "source": "opencode_db_cost",
+    }));
+
     for source in tokenomics_sources() {
         tokenomics_reconcile_provider_scanner_version(
             &conn,
@@ -1763,16 +1775,9 @@ fn tokenomics_sources() -> Vec<TokenomicsSource> {
             roots: vec![home.join(".claude").join("projects")],
             account: None,
         });
-        sources.push(TokenomicsSource {
-            provider: "opencode",
-            agent_kind: "opencode",
-            roots: vec![
-                home.join(".local").join("share").join("opencode"),
-                home.join(".config").join("opencode"),
-                home.join(".opencode"),
-            ],
-            account: None,
-        });
+        // OpenCode usage lives in opencode.db (SQLite), not JSONL — it is
+        // ingested by the dedicated `tokenomics_scan_opencode_db` scanner
+        // instead of this generic file-source loop (mirrors Codex).
     }
     // Additional Claude account profiles: each isolated CLAUDE_CONFIG_DIR
     // keeps its own transcript tree, so without these roots every non-default
@@ -1891,6 +1896,10 @@ fn tokenomics_provider_account(provider: &str, agent_kind: &str) -> TokenomicsPr
             .map(|home| home.join(".codex").join("auth.json"))
             .and_then(tokenomics_read_json_file),
         "claude" => tokenomics_claude_auth_value(),
+        "opencode" => opencode_data_home()
+            .into_iter()
+            .map(|home| home.join("auth.json"))
+            .find_map(tokenomics_read_json_file),
         _ => None,
     };
     tokenomics_provider_account_from_auth(
@@ -2061,8 +2070,39 @@ fn tokenomics_provider_account_display_label(
         ("anthropic", "claude") => {
             tokenomics_claude_account_display_label(auth_value, account_suffix)
         }
+        ("opencode", "opencode") => {
+            tokenomics_opencode_account_display_label(auth_value, account_suffix)
+        }
         _ => None,
     }
+}
+
+// OpenCode has no email, so tag the account with the same short key fingerprint
+// the account card shows (cloud_mcp_short_hash of the API key) — e.g.
+// "OpenCode dd384c077918" — so the usage filter chip and the account card line up.
+fn tokenomics_opencode_account_display_label(
+    auth_value: &Value,
+    account_suffix: &str,
+) -> Option<String> {
+    let key = auth_value
+        .get("opencode-go")
+        .and_then(|entry| entry.get("key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .or_else(|| {
+            auth_value.as_object().and_then(|providers| {
+                providers
+                    .values()
+                    .filter_map(|entry| entry.get("key").and_then(Value::as_str).map(str::trim))
+                    .find(|key| !key.is_empty())
+            })
+        });
+    let tag = key
+        .map(cloud_mcp_short_hash)
+        .filter(|tag| !tag.is_empty())
+        .unwrap_or_else(|| account_suffix.to_string());
+    Some(format!("OpenCode {tag}"))
 }
 
 fn tokenomics_codex_account_display_label(
@@ -2164,8 +2204,29 @@ fn tokenomics_provider_account_key_identifiers(
     match (provider, agent_kind) {
         ("openai", "codex") => tokenomics_codex_account_key_identifiers(auth_value),
         ("anthropic", "claude") => tokenomics_claude_account_key_identifiers(auth_value),
+        ("opencode", "opencode") => tokenomics_opencode_account_key_identifiers(auth_value),
         _ => tokenomics_generic_account_key_identifiers(auth_value),
     }
+}
+
+fn tokenomics_opencode_account_key_identifiers(auth_value: &Value) -> Vec<String> {
+    // OpenCode auth has no email; identity is the configured API key (preferring
+    // the Go plan key), hashed so the raw `sk-` key never lands in the key.
+    let key = auth_value
+        .get("opencode-go")
+        .and_then(|entry| entry.get("key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .or_else(|| {
+            auth_value.as_object().and_then(|providers| {
+                providers
+                    .values()
+                    .filter_map(|entry| entry.get("key").and_then(Value::as_str).map(str::trim))
+                    .find(|key| !key.is_empty())
+            })
+        });
+    key.map(|key| vec![tokenomics_hash(key)]).unwrap_or_default()
 }
 
 fn tokenomics_generic_account_key_identifiers(auth_value: &Value) -> Vec<String> {
@@ -5369,6 +5430,257 @@ fn tokenomics_upsert_scan_day(
         })
     })?;
     Ok(())
+}
+
+const TOKENOMICS_OPENCODE_SCANNER_VERSION: &str = "opencode-db-cost-v1";
+
+fn tokenomics_opencode_usage_number(value: Option<&Value>, key: &str) -> i64 {
+    value
+        .and_then(|object| object.get(key))
+        .map(|number| {
+            number
+                .as_i64()
+                .or_else(|| number.as_f64().map(|value| value.round() as i64))
+                .unwrap_or(0)
+        })
+        .unwrap_or(0)
+}
+
+/// Builds a usage event from one OpenCode assistant message. Unlike the generic
+/// extractor, this trusts OpenCode's own per-message `cost` (USD) rather than a
+/// pricing-table estimate (OpenCode runs arbitrary models, so no table applies).
+fn tokenomics_opencode_event_from_message(
+    message_id: &str,
+    time_created_ms: i64,
+    data: &Value,
+    provider_account: &TokenomicsProviderAccount,
+    billing_scope: TokenomicsBillingScope,
+    device_id: String,
+) -> Option<TokenomicsUsageEvent> {
+    let tokens = data.get("tokens");
+    let cache = tokens.and_then(|tokens| tokens.get("cache"));
+    let input_tokens = tokenomics_opencode_usage_number(tokens, "input");
+    // Reasoning is generated output; fold it into output tokens.
+    let output_tokens = tokenomics_opencode_usage_number(tokens, "output")
+        + tokenomics_opencode_usage_number(tokens, "reasoning");
+    let cache_read_tokens = tokenomics_opencode_usage_number(cache, "read");
+    let cache_write_tokens = tokenomics_opencode_usage_number(cache, "write");
+    let total_tokens = tokenomics_opencode_usage_number(tokens, "total")
+        .max(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens);
+
+    let cost_usd = data.get("cost").and_then(Value::as_f64).unwrap_or(0.0);
+    let estimated_cost_microusd = (cost_usd * 1_000_000.0).round().max(0.0) as i64;
+    if total_tokens <= 0 && estimated_cost_microusd <= 0 {
+        return None;
+    }
+
+    let model_id = data
+        .get("modelID")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let provider_id = data
+        .get("providerID")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let model = match (provider_id, model_id) {
+        (Some(provider_id), Some(model_id)) => Some(format!("{provider_id}/{model_id}")),
+        (None, Some(model_id)) => Some(model_id.to_string()),
+        _ => None,
+    };
+
+    let seconds = (time_created_ms / 1000).max(0) as u64;
+    let (bucket_day, bucket_hour) = tokenomics_utc_hour_bucket_from_unix(seconds);
+    let (year, month, day, hour, minute, second) = tokenomics_utc_datetime_from_unix(seconds);
+    let created_at = Some(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ));
+
+    Some(TokenomicsUsageEvent {
+        id: tokenomics_hash(&format!("opencode:{message_id}")),
+        device_id,
+        provider: "opencode".to_string(),
+        agent_kind: "opencode".to_string(),
+        model,
+        subscription_key: Some(provider_account.key.clone()),
+        provider_account_key: Some(provider_account.key.clone()),
+        provider_account_label: Some(provider_account.label.clone()),
+        billing_scope_type: billing_scope.scope_type,
+        billing_team_id: billing_scope.team_id,
+        billing_scope_source: billing_scope.source,
+        workspace_id: None,
+        repo_path: None,
+        source_kind: "opencode_db".to_string(),
+        source_path: None,
+        bucket_day,
+        bucket_hour,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_write_tokens,
+        total_tokens,
+        estimated_cost_microusd,
+        created_at,
+        observed_at: tokenomics_now_iso_like(),
+    })
+}
+
+/// Ingests OpenCode usage from opencode.db (per-message cost + tokens) into the
+/// shared rollup pipeline. Idempotent: events carry a stable id derived from the
+/// message id, so `tokenomics_insert_event`'s INSERT OR IGNORE dedupes re-scans.
+fn tokenomics_scan_opencode_db(
+    conn: &rusqlite::Connection,
+    scan_mode: TokenomicsScanMode,
+) -> Result<TokenomicsScanResult, String> {
+    let Some(db_path) = opencode_db_path() else {
+        return Ok(TokenomicsScanResult {
+            files_scanned: 0,
+            inserted_events: 0,
+            status: "not_found",
+        });
+    };
+    let provider_account = tokenomics_provider_account("opencode", "opencode");
+    // No identifiable account (no auth.json key) → don't ingest, so cost never
+    // lands in cumulative totals without a matching, attributable account row.
+    if provider_account.key.ends_with(":unknown") {
+        return Ok(TokenomicsScanResult {
+            files_scanned: 0,
+            inserted_events: 0,
+            status: "no_account",
+        });
+    }
+    tokenomics_reconcile_provider_account_label(conn, "opencode", "opencode", &provider_account)?;
+    tokenomics_upsert_provider_account(
+        conn,
+        tokenomics_local_device_id().as_str(),
+        "opencode",
+        "opencode",
+        &provider_account.key,
+        Some(&provider_account.label),
+        &tokenomics_current_billing_scope(),
+        "opencode_db_scan",
+    )?;
+
+    let Ok(opencode_conn) = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ) else {
+        return Ok(TokenomicsScanResult {
+            files_scanned: 0,
+            inserted_events: 0,
+            status: "open_failed",
+        });
+    };
+
+    let now_unix = tokenomics_unix_now();
+    // Incremental cursor: the newest message already ingested. Realtime scans
+    // (every ~60s) then read only messages past the cursor instead of re-reading
+    // the whole hour each tick; a small overlap + INSERT OR IGNORE keep it safe.
+    // Backfill stays a full 30-day net so gaps (app closed) are always closed.
+    let cursor_secs: i64 = conn
+        .query_row(
+            "SELECT COALESCE(MAX(created_at), '') FROM tokenomics_usage_events \
+             WHERE provider='opencode' AND agent_kind='opencode'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|value| tokenomics_timestamp_unix(&value))
+        .map(|value| value as i64)
+        .unwrap_or(0);
+    const TOKENOMICS_OPENCODE_CURSOR_OVERLAP_SECS: i64 = 5 * 60;
+    let realtime_floor_ms =
+        (now_unix.saturating_sub(TOKENOMICS_REALTIME_LOOKBACK_SECS) as i64).saturating_mul(1000);
+    let backfill_floor_ms =
+        (now_unix.saturating_sub(TOKENOMICS_INITIAL_BACKFILL_DAYS * 86_400) as i64)
+            .saturating_mul(1000);
+    let window_start_ms = if scan_mode.is_realtime() {
+        if cursor_secs > 0 {
+            // Incremental: only read past the cursor (with a small overlap),
+            // never older than the 1-hour realtime floor.
+            let cursor_ms =
+                (cursor_secs - TOKENOMICS_OPENCODE_CURSOR_OVERLAP_SECS).saturating_mul(1000);
+            realtime_floor_ms.max(cursor_ms)
+        } else {
+            // Nothing ingested yet — do an initial catch-up over the backfill
+            // window so existing (and sparse/older) OpenCode usage is picked up
+            // by the first periodic scan, not only an on-demand backfill. This
+            // is what surfaces the account as a usage filter on first run.
+            backfill_floor_ms
+        }
+    } else {
+        backfill_floor_ms
+    };
+    let device_id = tokenomics_local_device_id();
+    let billing_scope = tokenomics_current_billing_scope();
+
+    // Read all assistant messages in-window (not just billed ones) so free /
+    // local-model token usage is captured too; the event builder drops rows
+    // with neither tokens nor cost.
+    let mut statement = match opencode_conn.prepare(
+        "SELECT id, time_created, data FROM message \
+         WHERE json_extract(data,'$.role')='assistant' AND time_created >= ?1 \
+         ORDER BY time_created",
+    ) {
+        Ok(statement) => statement,
+        Err(_) => {
+            return Ok(TokenomicsScanResult {
+                files_scanned: 0,
+                inserted_events: 0,
+                status: "query_failed",
+            });
+        }
+    };
+    let rows = match statement.query_map(rusqlite::params![window_start_ms], |row| {
+        Ok((
+            row.get::<_, String>(0).unwrap_or_default(),
+            row.get::<_, i64>(1).unwrap_or_default(),
+            row.get::<_, String>(2).unwrap_or_default(),
+        ))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => {
+            return Ok(TokenomicsScanResult {
+                files_scanned: 0,
+                inserted_events: 0,
+                status: "query_failed",
+            });
+        }
+    };
+
+    let mut inserted = 0usize;
+    for row in rows.flatten() {
+        let (message_id, time_created_ms, data_text) = row;
+        let Ok(data) = serde_json::from_str::<Value>(&data_text) else {
+            continue;
+        };
+        if let Some(event) = tokenomics_opencode_event_from_message(
+            &message_id,
+            time_created_ms,
+            &data,
+            &provider_account,
+            billing_scope.clone(),
+            device_id.clone(),
+        ) {
+            if tokenomics_insert_event(conn, &event)? {
+                inserted += 1;
+            }
+        }
+    }
+
+    tokenomics_reconcile_provider_scanner_version(
+        conn,
+        "opencode",
+        "opencode",
+        TOKENOMICS_OPENCODE_SCANNER_VERSION,
+    )?;
+
+    Ok(TokenomicsScanResult {
+        files_scanned: 1,
+        inserted_events: inserted,
+        status: "ok",
+    })
 }
 
 fn tokenomics_scan_codex_state_db(
@@ -11690,6 +12002,10 @@ fn tokenomics_provider_limits(
         }
     }
 
+    // OpenCode has no usage-limit API and users track spend via their own
+    // plugins, so it intentionally emits no live limit gauges. OpenCode usage is
+    // surfaced through the token-usage rollups (tokenomics_scan_opencode_db).
+
     let local_device_id = tokenomics_local_device_id();
     tokenomics_tag_provider_limit_devices(&mut limits, &local_device_id);
     let active_account_keys = tokenomics_active_provider_account_key_map(&limits);
@@ -13305,6 +13621,146 @@ fn tokenomics_query_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<V
 #[cfg(test)]
 mod tokenomics_tests {
     use super::*;
+
+    static TOKENOMICS_OPENCODE_TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    #[test]
+    fn opencode_db_scanner_ingests_cost_and_is_idempotent() {
+        let _guard = TOKENOMICS_OPENCODE_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let dir = tokenomics_test_temp_path("opencode-scan", "dir");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("auth.json"),
+            r#"{"opencode-go":{"type":"api","key":"sk-scan-key"}}"#,
+        )
+        .unwrap();
+        let now_ms = (tokenomics_unix_now() as i64) * 1000;
+        {
+            let oc = rusqlite::Connection::open(dir.join("opencode.db")).unwrap();
+            oc.execute_batch(
+                "CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);",
+            )
+            .unwrap();
+            oc.execute(
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![
+                    "m1", "s1", now_ms - 5000,
+                    r#"{"role":"assistant","providerID":"opencode-go","modelID":"glm-5.2","cost":0.012,"tokens":{"input":1000,"output":20,"reasoning":5,"total":1033,"cache":{"read":8,"write":0}}}"#
+                ],
+            )
+            .unwrap();
+            // A free/local-model assistant message (no cost, real tokens) must
+            // still be ingested for token-usage completeness.
+            oc.execute(
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![
+                    "m2", "s1", now_ms - 4000,
+                    r#"{"role":"assistant","providerID":"opencode","modelID":"free-model","cost":0,"tokens":{"input":100,"output":10,"total":110}}"#
+                ],
+            )
+            .unwrap();
+            // An OLDER billed message (5h, beyond the 1h realtime floor). A
+            // first-run realtime scan must still catch it (initial catch-up over
+            // the backfill window) — this is what surfaces sparse OpenCode usage.
+            oc.execute(
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?1,?2,?3,?4)",
+                rusqlite::params![
+                    "m_old", "s1", now_ms - 5 * 60 * 60 * 1000,
+                    r#"{"role":"assistant","providerID":"opencode-go","modelID":"glm-5.2","cost":0.006,"tokens":{"input":500,"output":5,"total":505}}"#
+                ],
+            )
+            .unwrap();
+            // A user message (no usage) must be skipped.
+            oc.execute(
+                "INSERT INTO message (id, session_id, time_created, data) VALUES (?1,?2,?3,?4)",
+                rusqlite::params!["m3", "s1", now_ms - 3000, r#"{"role":"user"}"#],
+            )
+            .unwrap();
+        }
+
+        let previous = env::var_os("OPENCODE_DATA_DIR");
+        env::set_var("OPENCODE_DATA_DIR", &dir);
+
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+
+        // First scan is Realtime with no cursor → initial catch-up must ingest
+        // the recent, free, AND the 5h-old message.
+        let result = tokenomics_scan_opencode_db(&conn, TokenomicsScanMode::Realtime).unwrap();
+        assert_eq!(result.inserted_events, 3, "realtime first-run catch-up ingests all usage");
+
+        let (count, cost_micro, input, output): (i64, i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(SUM(estimated_cost_microusd),0), \
+                 COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0) \
+                 FROM tokenomics_usage_events WHERE provider='opencode'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(cost_micro, 18_000, "0.012 + 0.006 USD billed -> 18000 microusd");
+        assert_eq!(input, 1600, "1000 + 100 free + 500 old");
+        assert_eq!(output, 40, "(20+5) + 10 free + 5 old");
+
+        // Re-scan (realtime cursor path) must be idempotent — the cursor narrows
+        // the read window, INSERT OR IGNORE dedupes the overlap.
+        let again = tokenomics_scan_opencode_db(&conn, TokenomicsScanMode::Realtime).unwrap();
+        assert_eq!(again.inserted_events, 0);
+        let count_after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM tokenomics_usage_events", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count_after, 3);
+
+        match previous {
+            Some(value) => env::set_var("OPENCODE_DATA_DIR", value),
+            None => env::remove_var("OPENCODE_DATA_DIR"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn opencode_account_label_uses_short_key_fingerprint_tag() {
+        let _guard = TOKENOMICS_OPENCODE_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let dir = tokenomics_test_temp_path("opencode-label", "dir");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("auth.json"),
+            r#"{"opencode-go":{"type":"api","key":"sk-label-key"}}"#,
+        )
+        .unwrap();
+
+        let previous = env::var_os("OPENCODE_DATA_DIR");
+        env::set_var("OPENCODE_DATA_DIR", &dir);
+
+        // The account's display label is a short tag of the key fingerprint
+        // (same hash the accounts panel shows) so the usage filter chip and the
+        // account card line up — not the generic "OpenCode account <suffix>".
+        let account = tokenomics_provider_account("opencode", "opencode");
+        assert!(account.key.starts_with("opencode:opencode:"));
+        assert!(!account.key.ends_with(":unknown"));
+        let expected_tag = cloud_mcp_short_hash("sk-label-key");
+        assert_eq!(account.label, format!("OpenCode {expected_tag}"));
+        assert_ne!(account.label, "OpenCode account");
+
+        match previous {
+            Some(value) => env::set_var("OPENCODE_DATA_DIR", value),
+            None => env::remove_var("OPENCODE_DATA_DIR"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     fn tokenomics_test_current_hour_bucket() -> String {
         tokenomics_utc_hour_bucket_from_unix(tokenomics_unix_now()).1

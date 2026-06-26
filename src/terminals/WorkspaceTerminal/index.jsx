@@ -15257,7 +15257,11 @@ function WorkspaceTerminal({
   const pointerTodoDropVisible = Boolean(todoDropActive && todoDropTarget) && !terminalClosed && !terminalClosing;
   const nativeTodoDropVisible = terminalDropActive && !terminalClosed && !terminalClosing;
   const todoDropOverlayVisible = pointerTodoDropVisible || nativeTodoDropVisible;
-  const todoDropOverlayTarget = nativeTodoDropVisible || Boolean(todoDropTarget);
+  // The bright "Drop here" target highlight is strictly coordinate-driven: it
+  // shows only when the central resolver names this terminal the drop target.
+  // The flaky HTML5 dragenter flag (terminalDropActive) can stick or fire over
+  // empty space, so it only drives the faint overlay box, never the target.
+  const todoDropOverlayTarget = pointerTodoDropVisible;
   const todoDropOverlayUnsupportedMessage = todoDropOverlayTarget
     ? String(todoDropUnsupportedMessage || "").trim()
     : "";

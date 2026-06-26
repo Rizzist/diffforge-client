@@ -19,6 +19,8 @@ import {
   WORKSPACE_TOOL_DOC_DRAG_KIND,
   WORKSPACE_TOOL_DOC_DRAG_MIME,
   WORKSPACE_TOOL_TODO_DRAG_MIME,
+  clearActiveWorkspaceToolDrag,
+  setActiveWorkspaceToolDrag,
 } from "./workspaceToolDragTypes.js";
 
 const FILTERS = [
@@ -205,7 +207,14 @@ export default function WorkspaceToolsDragPanel({
     }));
     event.dataTransfer.setData("text/plain", payload.text);
     event.dataTransfer.effectAllowed = "copy";
+    // Stash the payload so a drop onto a separate breakout terminal window can
+    // be committed by the main window without re-reading dataTransfer.
+    setActiveWorkspaceToolDrag({ text: payload.text, send: payload.send_on_drop });
   }, [sendOnDrop]);
+
+  const handleDragEnd = useCallback(() => {
+    clearActiveWorkspaceToolDrag();
+  }, []);
 
   const visibleDocs = filter === "all"
     ? docs
@@ -255,6 +264,7 @@ export default function WorkspaceToolsDragPanel({
                   draggable
                   key={`doc:${entry.key || entry.title}`}
                   onDragStart={(event) => handleDragStart(event, entry)}
+                  onDragEnd={handleDragEnd}
                   role="listitem"
                   title={sendOnDrop
                     ? "Drag onto a terminal to send, or onto a graph to attach"

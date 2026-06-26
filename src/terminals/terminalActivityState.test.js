@@ -19,6 +19,8 @@ test("hook-managed terminal agent ids are normalized in one helper", () => {
   assert.equal(terminalAgentUsesActivityHooks("codex"), true);
   assert.equal(terminalAgentUsesActivityHooks("claude"), true);
   assert.equal(terminalAgentUsesActivityHooks(" Claude "), true);
+  assert.equal(terminalAgentUsesActivityHooks("opencode"), true);
+  assert.equal(terminalAgentUsesActivityHooks(" OpenCode "), true);
   assert.equal(terminalAgentUsesActivityHooks("code x"), false);
   assert.equal(terminalAgentUsesActivityHooks("generic"), false);
 });

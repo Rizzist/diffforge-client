@@ -40123,7 +40123,14 @@ export default function App() {
         && (
           (
             lifecycleEvent.type === "message-submitted"
-            && lifecycleEvent.source === "bigview-submit"
+            && (
+              lifecycleEvent.source === "bigview-submit"
+              // OpenCode's live hooks come from an injected plugin that may be
+              // absent (older OpenCode, plugin load failure). Unlike Claude/Codex
+              // it has no always-on native hook, so poll the transcript on every
+              // submit as the no-plugin safety net (restores pre-hook behavior).
+              || lifecycleAgentId === "opencode"
+            )
           )
           || lifecycleEvent.type === "provider-turn-completed"
           || lifecycleEvent.type === "provider-turn-error"

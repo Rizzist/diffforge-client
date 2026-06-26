@@ -528,9 +528,88 @@ pub(crate) fn agent_session_last_model(
     let transcript = match provider {
         AgentProvider::Claude => claude_session_transcript_path(session_id)?,
         AgentProvider::Codex => codex_session_transcript_path(session_id)?,
-        AgentProvider::OpenCode => return None,
+        // OpenCode stores its session in opencode.db rather than a JSONL
+        // transcript, so the tail-scan above does not apply.
+        AgentProvider::OpenCode => return opencode_session_last_model(session_id),
     };
     jsonl_tail_last_model(&transcript)
+}
+
+/// Builds an OpenCode `--model` value (`providerID/modelID`) from a value that
+/// carries the model. Handles both the assistant message shape
+/// (`{modelID, providerID}`) and the session column shape (`{id, providerID}`).
+fn opencode_model_from_value(value: &Value) -> Option<String> {
+    let model_id = first_value_string(&[
+        value.get("modelID"),
+        value.get("model_id"),
+        value.get("id"),
+        value.get("model"),
+    ]);
+    let model_id = model_id.trim();
+    if model_id.is_empty() {
+        return None;
+    }
+    let provider_id = first_value_string(&[value.get("providerID"), value.get("provider_id")]);
+    let provider_id = provider_id.trim();
+    if provider_id.is_empty() {
+        Some(model_id.to_string())
+    } else {
+        Some(format!("{provider_id}/{model_id}"))
+    }
+}
+
+/// Recovers the model an OpenCode session last used, mirroring the JSONL
+/// tail-scan for Claude/Codex. Prefers the most recent assistant message's
+/// model (captures in-session `/model` switches), falling back to the
+/// `session.model` column.
+fn opencode_session_last_model(session_id: &str) -> Option<String> {
+    let session_id = clean_codex_id(session_id);
+    if session_id.is_empty() {
+        return None;
+    }
+    let db_path = opencode_db_path()?;
+    let connection = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+
+    if let Ok(mut statement) = connection.prepare(
+        "select data from message where session_id = ?1 order by time_created desc, id desc limit 200",
+    ) {
+        if let Ok(mut rows) = statement.query(rusqlite::params![session_id]) {
+            while let Ok(Some(row)) = rows.next() {
+                let data: String = row.get(0).unwrap_or_default();
+                let Ok(value) = serde_json::from_str::<Value>(&data) else {
+                    continue;
+                };
+                if value.get("role").and_then(Value::as_str) != Some("assistant") {
+                    continue;
+                }
+                if let Some(model) = opencode_model_from_value(&value) {
+                    return Some(model);
+                }
+            }
+        }
+    }
+
+    if let Ok(mut statement) =
+        connection.prepare("select model from session where id = ?1 limit 1")
+    {
+        if let Ok(mut rows) = statement.query(rusqlite::params![session_id]) {
+            if let Ok(Some(row)) = rows.next() {
+                if let Ok(model) = row.get::<_, String>(0) {
+                    if let Ok(value) = serde_json::from_str::<Value>(&model) {
+                        if let Some(model) = opencode_model_from_value(&value) {
+                            return Some(model);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn sort_rollouts_newest_first(files: &mut [PathBuf]) {
@@ -1898,6 +1977,153 @@ mod agent_sessions_tests {
         env::temp_dir().join(format!("{name}-{suffix}"))
     }
 
+    fn opencode_step_finish(data: Value) -> CodexThreadTranscriptMessage {
+        let messages = opencode_part_message("msg1", "assistant", "part1", "2024-01-01T00:00:00Z", &data);
+        assert_eq!(messages.len(), 1, "step-finish yields one message: {data}");
+        messages.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn opencode_step_finish_classifies_on_structured_fields_only() {
+        // Normal finish reasons synthesize the task_complete marker.
+        for reason in ["stop", "tool-calls", "length"] {
+            let message =
+                opencode_step_finish(json!({"type": "step-finish", "reason": reason}));
+            assert_eq!(message.kind, "task_complete", "reason {reason} completes the turn");
+        }
+        // The message-level `finish` mirror is also honored.
+        let message = opencode_step_finish(json!({"type": "step-finish", "finish": "stop"}));
+        assert_eq!(message.kind, "task_complete");
+
+        // R5: free-form `summary` prose must NOT be classified — only the
+        // structured finish-reason fields drive error/interrupted routing.
+        let message = opencode_step_finish(
+            json!({"type": "step-finish", "summary": "cancelled the timer and stopped"}),
+        );
+        assert_eq!(
+            message.kind, "task_complete",
+            "free-text summary must not be read as an interrupt"
+        );
+
+        // Structured error / abort reasons route away from completion.
+        let message = opencode_step_finish(json!({"type": "step-finish", "reason": "error"}));
+        assert_eq!(message.kind, "error");
+        assert!(message.id.ends_with("step-error"));
+
+        let message = opencode_step_finish(json!({"type": "step-finish", "reason": "aborted"}));
+        assert_eq!(message.kind, "error");
+        assert!(message.id.ends_with("step-interrupted"));
+    }
+
+    #[test]
+    fn opencode_model_value_formats_provider_and_model() {
+        // Assistant message shape.
+        assert_eq!(
+            opencode_model_from_value(&json!({"modelID": "glm-5.2", "providerID": "opencode-go"})),
+            Some("opencode-go/glm-5.2".to_string())
+        );
+        // Session column shape.
+        assert_eq!(
+            opencode_model_from_value(&json!({"id": "glm-5.2", "providerID": "opencode-go"})),
+            Some("opencode-go/glm-5.2".to_string())
+        );
+        // No provider → bare model id.
+        assert_eq!(
+            opencode_model_from_value(&json!({"modelID": "glm-5.2"})),
+            Some("glm-5.2".to_string())
+        );
+        // No model → None.
+        assert_eq!(opencode_model_from_value(&json!({"providerID": "opencode-go"})), None);
+        assert_eq!(opencode_model_from_value(&json!({})), None);
+    }
+
+    static OPENCODE_DB_TEST_LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
+
+    #[test]
+    fn opencode_session_last_model_prefers_latest_assistant_then_session_column() {
+        let _guard = OPENCODE_DB_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let dir = unique_test_dir("opencode-model-db");
+        fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("opencode.db");
+        {
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE session (id TEXT PRIMARY KEY, model TEXT);
+                     CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);",
+                )
+                .unwrap();
+            // Session column has an older model; the latest assistant message
+            // switched to a newer one and must win.
+            connection
+                .execute(
+                    "INSERT INTO session (id, model) VALUES (?1, ?2)",
+                    rusqlite::params![
+                        "ses_1",
+                        r#"{"id":"glm-5.1","providerID":"opencode-go"}"#
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "msg_old", "ses_1", 100i64,
+                        r#"{"role":"assistant","modelID":"glm-5.1","providerID":"opencode-go"}"#
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO message (id, session_id, time_created, data) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "msg_new", "ses_1", 200i64,
+                        r#"{"role":"assistant","modelID":"kimi-k2","providerID":"fireworks-ai"}"#
+                    ],
+                )
+                .unwrap();
+            // A session with no assistant messages falls back to its column.
+            connection
+                .execute(
+                    "INSERT INTO session (id, model) VALUES (?1, ?2)",
+                    rusqlite::params![
+                        "ses_2",
+                        r#"{"id":"glm-5.2","providerID":"opencode-go"}"#
+                    ],
+                )
+                .unwrap();
+        }
+
+        let previous = env::var_os("OPENCODE_DATA_DIR");
+        env::set_var("OPENCODE_DATA_DIR", &dir);
+
+        assert_eq!(
+            opencode_session_last_model("ses_1"),
+            Some("fireworks-ai/kimi-k2".to_string()),
+            "latest assistant message model should win"
+        );
+        assert_eq!(
+            opencode_session_last_model("ses_2"),
+            Some("opencode-go/glm-5.2".to_string()),
+            "session column is the fallback when there are no messages"
+        );
+        assert_eq!(opencode_session_last_model("missing"), None);
+        assert_eq!(
+            agent_session_last_model(AgentProvider::OpenCode, "ses_1"),
+            Some("fireworks-ai/kimi-k2".to_string())
+        );
+
+        match previous {
+            Some(value) => env::set_var("OPENCODE_DATA_DIR", value),
+            None => env::remove_var("OPENCODE_DATA_DIR"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn codex_resume_sanitizer_removes_only_unresumable_image_response_items() {
         let image_event = json!({
@@ -2986,18 +3212,51 @@ fn opencode_part_message(
             }]
         }
         "step-finish" => {
-            let reason = first_value_string(&[data.get("reason"), data.get("summary")]);
+            // OpenCode/AI-SDK records the finish reason on the step part as
+            // `reason` (e.g. "stop", "tool-calls", "length"); some versions also
+            // mirror it on the assistant message as `finish`. A normal turn end
+            // ("stop"/"tool-calls"/"length") must synthesize a `task_complete`
+            // marker so the turn settles to idle even without the live hook.
+            // Classification runs ONLY on the structured finish-reason fields —
+            // `summary` is free-form prose used for display text only, so a
+            // summary like "cancelled the timer" must not be read as an
+            // interrupt.
+            let finish_reason = first_value_string(&[
+                data.get("reason"),
+                data.get("finish"),
+                data.get("finishReason"),
+            ]);
+            let display_text = if finish_reason.trim().is_empty() {
+                first_value_string(&[data.get("summary")])
+            } else {
+                finish_reason.clone()
+            };
+            let reason_key = finish_reason.to_lowercase();
             let reason_is_error =
-                reason.to_lowercase().contains("error") || reason.to_lowercase().contains("fail");
+                reason_key.contains("error") || reason_key.contains("fail");
+            let reason_is_interrupted = reason_key.contains("abort")
+                || reason_key.contains("cancel")
+                || reason_key.contains("interrupt");
             if reason_is_error {
                 vec![transcript_error_message(
                     format!("opencode-{message_id}-{part_id}-step-error"),
                     "opencode",
                     timestamp,
-                    if reason.trim().is_empty() {
+                    if display_text.trim().is_empty() {
                         "OpenCode turn failed"
                     } else {
-                        reason.as_str()
+                        display_text.as_str()
+                    },
+                )]
+            } else if reason_is_interrupted {
+                vec![transcript_error_message(
+                    format!("opencode-{message_id}-{part_id}-step-interrupted"),
+                    "opencode",
+                    timestamp,
+                    if display_text.trim().is_empty() {
+                        "OpenCode turn interrupted"
+                    } else {
+                        display_text.as_str()
                     },
                 )]
             } else {
@@ -3005,7 +3264,7 @@ fn opencode_part_message(
                     format!("opencode-{message_id}-{part_id}-task-complete"),
                     "opencode",
                     timestamp,
-                    reason,
+                    display_text,
                 )]
             }
         }
@@ -3392,12 +3651,29 @@ fn parse_opencode_session(
         messages = messages[messages.len() - max_messages..].to_vec();
     }
 
+    // OpenCode normally summarizes a session title itself, but a brand-new
+    // session can be empty before it does. Fall back to the first user message
+    // (Codex uses session_index.jsonl; Claude uses ai-title/summary).
+    let title = clean_codex_title(_title, "");
+    let title = if title.trim().is_empty() {
+        messages
+            .iter()
+            .find(|message| message.role == "user" && !message.text.trim().is_empty())
+            .map(|message| {
+                let first_line = message.text.lines().next().unwrap_or_default();
+                clean_codex_title(first_line.chars().take(80).collect::<String>(), "")
+            })
+            .unwrap_or_default()
+    } else {
+        title
+    };
+
     Ok((
         CodexRolloutMeta {
             session_id: clean_codex_id(session_id),
             cwd: cwd.to_string(),
             latest_timestamp,
-            title: clean_codex_title(_title, ""),
+            title,
         },
         messages,
     ))

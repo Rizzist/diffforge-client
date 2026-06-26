@@ -47,6 +47,10 @@ export const TERMINAL_WINDOW_CLOSED_EVENT = "forge-terminal-window-closed";
 
 const TERMINAL_WINDOW_RESIZE_DEBOUNCE_MS = 90;
 const TERMINAL_WINDOW_REATTACH_DELAY_MS = 1200;
+// Emitted by the Rust drag watcher to this window's label while a todo/doc drag
+// hovers it, so the popped-out terminal shows the same "Drop here" affordance as
+// an in-grid terminal. The main window owns the payload and commits on release.
+const TERMINAL_DRAG_TARGET_EVENT = "forge-terminal-drag-target";
 
 const HostShell = styled.div`
   display: grid;
@@ -63,6 +67,33 @@ const HostShell = styled.div`
     border-color: rgba(24, 34, 48, 0.16);
     background: ${TERMINAL_LIGHT_THEME.background};
   }
+`;
+
+const HostDropOverlay = styled.div`
+  position: absolute;
+  inset: 10px;
+  z-index: 40;
+  display: grid;
+  place-items: center;
+  pointer-events: none;
+  border: 2px dotted rgba(138, 216, 255, 0.94);
+  border-radius: 14px;
+  background: rgba(2, 8, 14, 0.54);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 173, 124, 0.24),
+    0 0 32px rgba(138, 216, 255, 0.12);
+`;
+
+const HostDropOverlayLabel = styled.div`
+  padding: 8px 12px;
+  border: 1px solid rgba(138, 216, 255, 0.3);
+  border-radius: 999px;
+  color: #e9f8ff;
+  background: linear-gradient(135deg, rgba(6, 16, 26, 0.96), rgba(28, 16, 10, 0.92));
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
 `;
 
 const HostTerminalSurface = styled.div`
@@ -165,6 +196,7 @@ export default function TerminalWindowHost() {
   const [status, setStatus] = useState("connecting");
   const [statusDetail, setStatusDetail] = useState("");
   const [restartMenuOpen, setRestartMenuOpen] = useState(false);
+  const [dropTargetActive, setDropTargetActive] = useState(false);
   const [meta, setMeta] = useState(() => ({
     agentKind: params.agentKind,
     agentLabel: params.agentLabel,
@@ -220,6 +252,33 @@ export default function TerminalWindowHost() {
       unlisten();
     };
   }, [paneId]);
+
+  // Cross-window drop affordance: the Rust watcher targets this window's label
+  // directly, so every event here is meant for this window.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(TERMINAL_DRAG_TARGET_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      setDropTargetActive(Boolean(event.payload?.active));
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      setDropTargetActive(false);
+      unlisten();
+    };
+  }, []);
 
   useEffect(() => {
     if (!restartMenuOpen) {
@@ -505,7 +564,24 @@ export default function TerminalWindowHost() {
   const agentTitle = meta.agentTitle || meta.agentLabel || title;
 
   return (
-    <HostShell>
+    <HostShell
+      onDragOver={(event) => {
+        // The OS may deliver a doc drag's dragover here; accept it so the cursor
+        // reads as droppable. The actual commit is owned by the main window
+        // (via the Rust release signal), so this window never reads the payload.
+        if (dropTargetActive) {
+          event.preventDefault();
+          if (event.dataTransfer) {
+            event.dataTransfer.dropEffect = "copy";
+          }
+        }
+      }}
+      onDrop={(event) => {
+        if (dropTargetActive) {
+          event.preventDefault();
+        }
+      }}
+    >
       {/* This window's root returns before the main app mounts GlobalStyle;
           without it box-sizing stays content-box and the header pill
           (width: 100% + padding) overflows, clipping the right-edge close
@@ -638,6 +714,11 @@ export default function TerminalWindowHost() {
             </strong>
             {statusDetail && <span>{statusDetail}</span>}
           </HostNotice>
+        )}
+        {dropTargetActive && (
+          <HostDropOverlay>
+            <HostDropOverlayLabel>Drop here</HostDropOverlayLabel>
+          </HostDropOverlay>
         )}
       </HostTerminalSurface>
     </HostShell>

@@ -44,6 +44,7 @@ const PROVIDERS = [
   { id: "all", label: "All", match: () => true },
   { id: "codex", label: "Codex", match: (row) => providerKey(row) === "codex" },
   { id: "claude", label: "Claude", match: (row) => providerKey(row) === "claude" },
+  { id: "opencode", label: "OpenCode", match: (row) => providerKey(row) === "opencode" },
 ];
 
 const PROVIDER_LABELS = {
@@ -64,9 +65,10 @@ const PROVIDER_ACCENTS = {
   all: "#60a5fa",
   codex: "#60a5fa",
   claude: "#fb923c",
+  opencode: "#34d399",
 };
 
-const PROVIDER_ACCOUNT_FILTER_PROVIDERS = ["codex", "claude"];
+const PROVIDER_ACCOUNT_FILTER_PROVIDERS = ["codex", "claude", "opencode"];
 const TOKENOMICS_PROVIDER_ACCOUNT_FILTER_NONE = "__none__";
 
 const AGENT_ACCOUNTS_CHANGED_EVENT = "agent-accounts-changed";
@@ -605,23 +607,24 @@ function AgentAccountsManager() {
         <strong>Agent accounts</strong>
         <span>Sign into another account in any terminal — it’s captured here automatically.</span>
       </AgentAccountsHeader>
-      {["claude", "codex"].map((kind) => {
+      {["claude", "codex", "opencode"].map((kind) => {
         const entry = accounts[kind];
         if (!entry) {
           return null;
         }
+        const kindLabel = PROVIDER_LABELS[kind] || kind;
         const profiles = collapseAgentProfilesByEmail(entry.profiles);
         return (
           <Fragment key={kind}>
             <AgentAccountsRow>
               <AgentAccountsKindRow>
                 <AgentAccountsKindLabel>
-                  {kind === "claude" ? "Claude" : "Codex"}
+                  {kindLabel}
                 </AgentAccountsKindLabel>
                 <AgentAccountAddButton
-                  aria-label={`Add ${kind === "claude" ? "Claude" : "Codex"} account`}
+                  aria-label={`Add ${kindLabel} account`}
                   onClick={() => beginLogin(kind)}
-                  title={`Open the ${kind === "claude" ? "Claude Code" : "Codex"} login in a terminal to add another account`}
+                  title={`Open the ${kindLabel} login in a terminal to add another account`}
                   type="button"
                 >
                   +
@@ -746,7 +749,7 @@ function AgentAccountsManager() {
       })}
       {loginPendingKind ? (
         <AgentAccountLoginHint role="status">
-          {`Finish signing in inside the ${loginPendingKind === "claude" ? "Claude Code" : "Codex"} terminal that just opened — the account appears here automatically.`}
+          {`Finish signing in inside the ${PROVIDER_LABELS[loginPendingKind] || "agent"} terminal that just opened — the account appears here automatically.`}
         </AgentAccountLoginHint>
       ) : null}
       {actionError ? <TokenomicsError>{actionError}</TokenomicsError> : null}
@@ -799,6 +802,7 @@ function tokenomicsProviderProfileAccountKey(providerId, profileId) {
   if (!cleanProfileId || cleanProfileId === "default") return "";
   if (providerId === "claude") return `anthropic:claude:profile:${cleanProfileId}`;
   if (providerId === "codex") return `openai:codex:profile:${cleanProfileId}`;
+  if (providerId === "opencode") return `opencode:opencode:profile:${cleanProfileId}`;
   return "";
 }
 
@@ -3315,6 +3319,9 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const credits = creditSnapshotHasMeaningfulData(billingStatus?.credits)
     ? normalizeCreditWallet(billingStatus.credits) || {}
     : {};
+  // OpenCode is intentionally excluded from live limit gauges — OpenCode Go has
+  // no usage API, and users track spend via their own plugins. OpenCode usage is
+  // surfaced through the token-usage charts/account cards below, not estimates.
   const providerLimitGroups = useMemo(() => (
     ["codex", "claude"].map((providerId) => {
       const providerAccountKey = limitAccountKeyForDisplay(
@@ -3408,7 +3415,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
               />
             ))}
           </ProviderLimitGrid>
-        ) : (
+        ) : selectedProvider === "opencode" ? null : (
           <>
             <PlanStatusLine>
               <strong>{planStatusTitle(fiveHour, selectedProvider)}</strong>
@@ -3548,7 +3555,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
                 <strong>{item.percent}%</strong>
               </ModelRow>
             )) : (
-              <TokenomicsEmpty>Usage populates automatically after using Codex or Claude Code.</TokenomicsEmpty>
+              <TokenomicsEmpty>Usage populates automatically after using Codex, Claude Code, or OpenCode.</TokenomicsEmpty>
             )}
           </ModelList>
         </UsageCard>

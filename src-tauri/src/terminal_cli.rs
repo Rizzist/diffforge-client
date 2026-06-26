@@ -1023,6 +1023,14 @@ fn terminal_env_vars_with_app_control_mcp_identity(
         instructions_array.push(Value::String(instruction_path));
     }
 
+    // The app-control orchestrator drives the terminal, so auto-approve its
+    // tools like Codex/Claude do. Coordinated terminals set the same block
+    // later (identical value), so this composes cleanly.
+    config_object.insert(
+        "permission".to_string(),
+        opencode_auto_approval_permission_value(),
+    );
+
     set_terminal_env_var(&mut next, OPENCODE_CONFIG_CONTENT_ENV, &config.to_string());
     Ok(next)
 }
@@ -2893,6 +2901,22 @@ mod terminal_cli_tests {
     use super::*;
 
     #[test]
+    fn opencode_image_support_prefers_vision_over_text_only_family() {
+        // Vision variants of otherwise text-only families are image-capable.
+        assert_eq!(
+            opencode_model_supports_images("llama-3.2-90b-vision-instruct"),
+            Some(true)
+        );
+        assert_eq!(opencode_model_supports_images("deepseek-vl2"), Some(true));
+        // Plain text-only families remain unsupported.
+        assert_eq!(opencode_model_supports_images("llama-3.3-70b"), Some(false));
+        assert_eq!(opencode_model_supports_images("deepseek-v3"), Some(false));
+        // Known vision + unknown models.
+        assert_eq!(opencode_model_supports_images("gpt-4o"), Some(true));
+        assert_eq!(opencode_model_supports_images("glm-5.2"), None);
+    }
+
+    #[test]
     fn claude_guard_settings_use_valid_claude_hook_events() {
         let coordination = TerminalCoordinationSession {
             repo_path: "/repo".to_string(),
@@ -3041,6 +3065,10 @@ mod terminal_cli_tests {
             config["mcp"][APP_CONTROL_MCP_SERVER_NAME]["command"][0].as_str(),
             Some("diff-forge")
         );
+        // The orchestrator drives the terminal, so it auto-approves its tools
+        // even without a coordination session.
+        assert_eq!(config["permission"]["edit"].as_str(), Some("allow"));
+        assert_eq!(config["permission"]["bash"].as_str(), Some("allow"));
     }
 
     #[test]
@@ -3587,6 +3615,296 @@ fn terminal_env_vars_with_opencode_tui_config(
             .to_string_lossy()
             .to_string(),
     ));
+    Ok(next)
+}
+
+const OPENCODE_ACTIVITY_HOOK_BIN_ENV: &str = "DIFFFORGE_OPENCODE_ACTIVITY_HOOK_BIN";
+
+// OpenCode plugin that bridges OpenCode's lifecycle events to the Diff Forge
+// activity hook CLI, exactly like the Claude (settings.json) and Codex
+// (hooks.json) hooks do. OpenCode does not run command hooks natively, but it
+// loads JS plugins (see `@opencode-ai/plugin`); a plugin may spawn processes,
+// so we shell out to `<bin> --diff-forge-activity-hook --provider opencode`
+// with the same JSON-on-stdin contract the other harnesses use. The hook CLI
+// reads pane/instance/workspace/transport identity from the env vars the app
+// already stamps on every managed terminal (see terminal_activity_env_vars),
+// so this needs no per-event identity wiring. Emitting `Stop` on
+// `session.idle` is what lets a finished OpenCode turn settle to idle instead
+// of being swept to "interrupted".
+const DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS: &str = r#"// Diff Forge managed OpenCode activity plugin. Auto-generated — do not edit.
+import { spawn } from "node:child_process";
+
+const HOOK_BIN = process.env.DIFFFORGE_OPENCODE_ACTIVITY_HOOK_BIN || "";
+const PROVIDER = "opencode";
+
+function emit(payload) {
+  if (!HOOK_BIN) return;
+  try {
+    const child = spawn(HOOK_BIN, ["--diff-forge-activity-hook", "--provider", PROVIDER], {
+      stdio: ["pipe", "ignore", "ignore"],
+      windowsHide: true,
+    });
+    child.on("error", () => {});
+    child.stdin.on("error", () => {});
+    child.stdin.end(JSON.stringify(payload || {}));
+  } catch {}
+}
+
+function pickText(parts) {
+  if (!Array.isArray(parts)) return "";
+  for (const part of parts) {
+    const text = part && (part.text != null ? part.text : part.content);
+    if (typeof text === "string" && text.trim()) return text.trim();
+  }
+  return "";
+}
+
+function eventSessionId(event) {
+  const props = (event && event.properties) || {};
+  return (
+    props.sessionID
+    || props.session_id
+    || (props.info && (props.info.sessionID || props.info.id))
+    || (props.session && props.session.id)
+    || ""
+  );
+}
+
+export const DiffForgeActivityPlugin = async () => {
+  // Track which sessions have an in-flight turn so a stray, startup, duplicate,
+  // or child/sub-agent `session.idle` cannot settle the wrong turn: we only
+  // emit `Stop` for a session we actually observed a prompt for. Keyed by
+  // session id (not a single flag) because OpenCode fires session.idle for
+  // sub-sessions too.
+  const activeSessions = new Set();
+  return {
+    "chat.message": async (input, output) => {
+      const sessionId = (input && input.sessionID) || "";
+      activeSessions.add(sessionId);
+      emit({
+        hook_event_name: "UserPromptSubmit",
+        session_id: sessionId,
+        prompt: pickText(output && output.parts),
+      });
+    },
+    "tool.execute.before": async (input, output) => {
+      emit({
+        hook_event_name: "PreToolUse",
+        session_id: (input && input.sessionID) || "",
+        tool_name: (input && input.tool) || "",
+        tool_use_id: (input && input.callID) || "",
+        tool_input: (output && output.args) || {},
+      });
+    },
+    "tool.execute.after": async (input) => {
+      emit({
+        hook_event_name: "PostToolUse",
+        session_id: (input && input.sessionID) || "",
+        tool_name: (input && input.tool) || "",
+        tool_use_id: (input && input.callID) || "",
+      });
+    },
+    "permission.ask": async (input) => {
+      // Fires only when OpenCode actually needs a decision (auto-allowed tools
+      // never ask), so surface it as a manual-approval attention event. We do
+      // not touch `output` — OpenCode's own permission config decides.
+      emit({
+        hook_event_name: "PermissionRequest",
+        session_id: (input && input.sessionID) || "",
+        manual_approval_required: true,
+        permission_request_id: (input && input.id) || "",
+        tool_use_id: (input && input.callID) || "",
+        tool_name: (input && input.type) || "",
+        description: (input && input.title) || "",
+      });
+    },
+    event: async ({ event }) => {
+      const type = (event && event.type) || "";
+      const sessionId = eventSessionId(event);
+      if (type === "session.idle") {
+        if (!activeSessions.has(sessionId)) return;
+        activeSessions.delete(sessionId);
+        emit({ hook_event_name: "Stop", session_id: sessionId });
+      } else if (type === "session.error") {
+        activeSessions.delete(sessionId);
+        emit({ hook_event_name: "StopFailure", session_id: sessionId });
+      }
+    },
+  };
+};
+
+export default DiffForgeActivityPlugin;
+"#;
+
+fn diffforge_opencode_activity_plugin_path() -> PathBuf {
+    env::temp_dir()
+        .join("diffforge-opencode")
+        .join("diffforge-activity-plugin.js")
+}
+
+fn ensure_diffforge_opencode_activity_plugin() -> Result<PathBuf, String> {
+    let path = diffforge_opencode_activity_plugin_path();
+    let Some(parent) = path.parent() else {
+        return Err("Unable to prepare OpenCode plugin path.".to_string());
+    };
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("Unable to prepare OpenCode plugin directory: {error}"))?;
+    if fs::read_to_string(&path).ok().as_deref() != Some(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS) {
+        fs::write(&path, DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS)
+            .map_err(|error| format!("Unable to write OpenCode plugin: {error}"))?;
+    }
+    Ok(path)
+}
+
+// Coarse auto-approval for Diff Forge-driven OpenCode terminals (coordinated
+// agents + the app-control orchestrator), mirroring Codex's per-tool approve /
+// Claude's acceptEdits. OpenCode's `permission` schema is coarse, so allow the
+// edit/bash/webfetch/external-directory buckets the app drives. Plain
+// (non-managed) terminals never receive this.
+fn opencode_auto_approval_permission_value() -> Value {
+    json!({
+        "edit": "allow",
+        "bash": "allow",
+        "webfetch": "allow",
+        "external_directory": "allow"
+    })
+}
+
+fn diff_forge_opencode_activity_hook_bin(
+    coordination: Option<&TerminalCoordinationSession>,
+) -> String {
+    if let Some(coordination) = coordination {
+        let command = coordination.mcp_command.trim();
+        if !command.is_empty() {
+            return command.to_string();
+        }
+    }
+    env::current_exe()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| "diff-forge".to_string())
+}
+
+// Injects Diff Forge's OpenCode integration into the inline `OPENCODE_CONFIG_CONTENT`
+// the app already uses (it merges with the user's own config). For every managed
+// OpenCode terminal this registers the activity plugin (Phase 2, live status). For
+// coordinated terminals it also wires the coordination-kernel + workspace-mcp-gateway
+// MCP servers and auto-approval permissions (Phase 3), matching the Claude/Codex
+// coordination launch parity. Composes with other writers of the same env var
+// (e.g. app-control) by reading the existing config and merging.
+fn terminal_env_vars_with_opencode_coordination_config(
+    provider_id: &str,
+    env_vars: &[(String, String)],
+    coordination: Option<&TerminalCoordinationSession>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut next = env_vars.to_vec();
+    if !provider_id.to_ascii_lowercase().contains("opencode") {
+        return Ok(next);
+    }
+
+    let plugin_path = ensure_diffforge_opencode_activity_plugin()?
+        .to_string_lossy()
+        .to_string();
+    set_terminal_env_var(
+        &mut next,
+        OPENCODE_ACTIVITY_HOOK_BIN_ENV,
+        &diff_forge_opencode_activity_hook_bin(coordination),
+    );
+
+    let existing_config = next
+        .iter()
+        .rev()
+        .find_map(|(key, value)| (key == OPENCODE_CONFIG_CONTENT_ENV).then(|| value.trim()))
+        .filter(|value| !value.is_empty());
+    let mut config = if let Some(existing_config) = existing_config {
+        serde_json::from_str::<Value>(existing_config)
+            .map_err(|error| format!("Invalid OpenCode inline config JSON: {error}"))?
+    } else {
+        json!({})
+    };
+    let Some(config_object) = config.as_object_mut() else {
+        return Err("OpenCode inline config must be a JSON object.".to_string());
+    };
+    config_object
+        .entry("$schema".to_string())
+        .or_insert_with(|| Value::String("https://opencode.ai/config.json".to_string()));
+
+    if !config_object
+        .get("plugin")
+        .map_or(true, |value| value.is_array())
+    {
+        return Err("OpenCode inline config field `plugin` must be a JSON array.".to_string());
+    }
+    let plugin_array = config_object
+        .entry("plugin".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    let Some(plugin_array) = plugin_array.as_array_mut() else {
+        return Err("Unable to prepare OpenCode plugin list.".to_string());
+    };
+    if !plugin_array
+        .iter()
+        .any(|value| value.as_str() == Some(plugin_path.as_str()))
+    {
+        plugin_array.push(Value::String(plugin_path));
+    }
+
+    if let Some(coordination) = coordination {
+        let coordination_args = terminal_coordination_proxy_args(coordination);
+        let gateway_args =
+            terminal_workspace_gateway_args_from_coordination_args(&coordination_args);
+
+        if !config_object
+            .get("mcp")
+            .map_or(true, |value| value.is_object())
+        {
+            return Err("OpenCode inline config field `mcp` must be a JSON object.".to_string());
+        }
+        let mcp_servers = config_object
+            .entry("mcp".to_string())
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        let Some(mcp_servers) = mcp_servers.as_object_mut() else {
+            return Err("Unable to prepare OpenCode MCP config.".to_string());
+        };
+
+        let mut coordination_command = vec![Value::String(coordination.mcp_command.clone())];
+        coordination_command.extend(coordination_args.iter().cloned().map(Value::String));
+        mcp_servers.insert(
+            "coordination-kernel".to_string(),
+            json!({
+                "type": "local",
+                "command": coordination_command,
+                "enabled": true,
+                "environment": {
+                    "COORDINATION_ENABLED": "1",
+                    "COORDINATION_MCP_ALWAYS_ON": "1"
+                }
+            }),
+        );
+
+        let mut gateway_command = vec![Value::String(coordination.mcp_command.clone())];
+        gateway_command.extend(gateway_args.iter().cloned().map(Value::String));
+        mcp_servers.insert(
+            "workspace-mcp-gateway".to_string(),
+            json!({
+                "type": "local",
+                "command": gateway_command,
+                "enabled": true,
+                "environment": {
+                    "COORDINATION_ENABLED": "1",
+                    "DIFFFORGE_WORKSPACE_MCP_GATEWAY": "1"
+                }
+            }),
+        );
+
+        // Auto-approval parity: keep coordinated turns from blocking on tool
+        // approvals (mirrors Codex --dangerously-bypass / Claude acceptEdits).
+        config_object.insert(
+            "permission".to_string(),
+            opencode_auto_approval_permission_value(),
+        );
+    }
+
+    set_terminal_env_var(&mut next, OPENCODE_CONFIG_CONTENT_ENV, &config.to_string());
     Ok(next)
 }
 
@@ -4238,24 +4556,9 @@ fn opencode_model_supports_images(model: &str) -> Option<bool> {
         return None;
     }
 
-    let text_only_markers = [
-        "gpt-3.5",
-        "o1-mini",
-        "o3-mini",
-        "deepseek",
-        "codestral",
-        "devstral",
-        "llama",
-        "qwen-coder",
-        "kimi",
-    ];
-    if text_only_markers
-        .iter()
-        .any(|marker| normalized.contains(marker))
-    {
-        return Some(false);
-    }
-
+    // Vision markers are checked first: a vision variant of an otherwise
+    // text-only family (e.g. `llama-3.2-90b-vision`, `deepseek-vl2`) is
+    // image-capable and must not be short-circuited by the family token below.
     let vision_markers = [
         "gpt-4o",
         "gpt-4.1",
@@ -4285,6 +4588,24 @@ fn opencode_model_supports_images(model: &str) -> Option<bool> {
         || normalized.ends_with(":vl")
     {
         return Some(true);
+    }
+
+    let text_only_markers = [
+        "gpt-3.5",
+        "o1-mini",
+        "o3-mini",
+        "deepseek",
+        "codestral",
+        "devstral",
+        "llama",
+        "qwen-coder",
+        "kimi",
+    ];
+    if text_only_markers
+        .iter()
+        .any(|marker| normalized.contains(marker))
+    {
+        return Some(false);
     }
 
     None

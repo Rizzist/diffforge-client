@@ -24597,9 +24597,15 @@ fn cloud_mcp_terminal_output_looks_ready(text: &str) -> bool {
 }
 
 fn cloud_mcp_agent_uses_activity_hooks(agent_id: &str) -> bool {
+    // Keep in sync with the frontend `TERMINAL_ACTIVITY_HOOK_AGENT_KINDS`
+    // (terminalActivityState.js). OpenCode owns its turn state through the
+    // injected activity plugin, so it must emit the synthetic
+    // `provider-turn-started` on app/queue-dispatched prompts (immediate
+    // "thinking" highlight) and skip the text-scraping output observer that
+    // would otherwise fire premature/duplicate turn-complete cues.
     matches!(
         agent_id.trim().to_ascii_lowercase().as_str(),
-        "claude" | "codex"
+        "claude" | "codex" | "opencode"
     )
 }
 
@@ -46016,6 +46022,18 @@ mod cloud_mcp_tests {
     use super::*;
 
     static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    #[test]
+    fn activity_hook_agents_match_frontend_set() {
+        // Must stay in sync with TERMINAL_ACTIVITY_HOOK_AGENT_KINDS in
+        // terminalActivityState.js so OpenCode's plugin owns turn state.
+        assert!(cloud_mcp_agent_uses_activity_hooks("claude"));
+        assert!(cloud_mcp_agent_uses_activity_hooks("codex"));
+        assert!(cloud_mcp_agent_uses_activity_hooks("opencode"));
+        assert!(cloud_mcp_agent_uses_activity_hooks(" OpenCode "));
+        assert!(!cloud_mcp_agent_uses_activity_hooks("shell"));
+        assert!(!cloud_mcp_agent_uses_activity_hooks("generic"));
+    }
 
     fn assert_account_document_snake_only(value: &Value) {
         fn visit(value: &Value, path: &str) {

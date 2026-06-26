@@ -85,7 +85,9 @@ const AGENT_RUN_TIMEOUT_SECS: u64 = 120;
 const AGENT_THREAD_TURN_TIMEOUT_SECS: u64 = 30 * 60;
 const AGENT_LOGOUT_TIMEOUT_SECS: u64 = 30;
 const MAX_FORGE_PROMPT_LENGTH: usize = 12_000;
-const MAX_FORGE_MODEL_LENGTH: usize = 80;
+// Long enough for OpenCode `providerID/modelID` ids, whose model segment can
+// itself be a slash path (e.g. `fireworks-ai/accounts/fireworks/routers/...`).
+const MAX_FORGE_MODEL_LENGTH: usize = 128;
 const MAX_FORGE_IMAGES: usize = 4;
 const MAX_FORGE_IMAGE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_FORGE_IMAGE_TOTAL_BYTES: usize = 8 * 1024 * 1024;
@@ -1039,6 +1041,10 @@ struct TerminalInstance {
     session_mode: TerminalSessionMode,
     metadata: TerminalInstanceMetadata,
     runtime: Arc<StdMutex<TerminalRuntimeSnapshot>>,
+    // Whether this pane was opened with the app-control orchestrator MCP. Kept
+    // so deferred/resume agent starts can re-inject app-control (and its
+    // auto-approval) the same way the initial open does.
+    app_control_mcp_requested: bool,
 }
 
 #[derive(Default)]
@@ -1356,6 +1362,7 @@ impl TerminalInstance {
         coordination: Option<TerminalCoordinationSession>,
         session_mode: TerminalSessionMode,
         metadata: TerminalInstanceMetadata,
+        app_control_mcp_requested: bool,
     ) -> (Self, Box<dyn Read + Send>) {
         let WarmPty {
             child,
@@ -1382,6 +1389,7 @@ impl TerminalInstance {
                 session_mode,
                 metadata,
                 runtime: Arc::new(StdMutex::new(TerminalRuntimeSnapshot::opened_idle(None))),
+                app_control_mcp_requested,
             },
             reader,
         )
@@ -5225,6 +5233,8 @@ pub fn run() {
             terminal_window_open,
             terminal_window_close,
             terminal_window_focus,
+            terminal_drag_session_begin,
+            terminal_drag_session_end,
             tools_window_open,
             tools_window_close,
             tools_window_focus,

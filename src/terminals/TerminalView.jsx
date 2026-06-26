@@ -194,6 +194,16 @@ import {
   WORKSPACE_FILE_POINTER_DROP_EVENT,
   workspaceFileToComposerAttachment,
 } from "./WorkspaceTerminal/threadRuntime.js";
+import {
+  clearActiveWorkspaceToolDrag,
+  getActiveWorkspaceToolDrag,
+} from "../tools/workspaceToolDragTypes.js";
+
+// Cross-window drag bridge (Rust -> main window). Emitted by the terminal drag
+// watcher in src-tauri/src/terminals.rs while a drag is active and at least one
+// terminal is hosted in its own breakout window.
+const TERMINAL_DRAG_MOVE_EVENT = "forge-terminal-drag-move";
+const TERMINAL_DRAG_RELEASE_EVENT = "forge-terminal-drag-release";
 
 const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
 const TERMINAL_BREAKOUT_TRANSITION_MS = 260;
@@ -21622,6 +21632,8 @@ function TerminalView({
     ? terminalWorkspaceLogicalIndexes
     : [];
   const logicalTerminalIndexSignature = logicalTerminalIndexes.join(",");
+  const logicalTerminalIndexesRef = useRef(logicalTerminalIndexes);
+  logicalTerminalIndexesRef.current = logicalTerminalIndexes;
   const normalizedTerminalWorkspaceCoordinationTargets = useMemo(
     () => normalizeTerminalCoordinationTargets(terminalWorkspaceCoordinationTargets),
     [terminalWorkspaceCoordinationTargets],
@@ -21799,6 +21811,17 @@ function TerminalView({
   const terminalPanelsRef = useRef(null);
   const todoQueuePanelRef = useRef(null);
   const todoDragStateRef = useRef(null);
+  // Cross-window drag: index of the breakout-window terminal currently under
+  // the cursor (null when over the main window or nothing). Set from the Rust
+  // drag watcher; suppresses the in-grid highlight while a breakout window owns
+  // the drag. Ref-only — the grid highlight is cleared imperatively, so no
+  // render needs to read it.
+  const crossWindowDragTargetIndexRef = useRef(null);
+  const terminalDragSessionActiveRef = useRef(false);
+  // The active pointer-todo drag exposes its commit/cancel here so a Rust-driven
+  // release (cursor over a breakout window, where pointerup never reaches the
+  // main window) can finish the same drag the in-window pointerup would.
+  const pointerDragCommitRef = useRef(null);
   const todoQueueItemsRef = useRef([]);
   const todoQueuePendingItemsRef = useRef({});
   const todoQueuePendingTimersRef = useRef(new Map());
@@ -22529,6 +22552,13 @@ function TerminalView({
 
     return getWorkspaceTerminalPaneId(terminalWorkspace?.id, terminalIndex, paneAgentId);
   }, [getTerminalAgent, getTerminalRole, terminalWorkspace?.id]);
+  const isTerminalIndexWindowBreakoutHosted = useCallback((terminalIndex) => {
+    if (!Number.isInteger(terminalIndex)) {
+      return false;
+    }
+    const paneId = getTerminalPaneId(terminalIndex);
+    return Boolean(paneId && windowBreakoutPanesRef.current?.[paneId]);
+  }, [getTerminalPaneId]);
   const terminalParkedPromptListenerStateRef = useRef({
     getTerminalPaneId,
     logicalTerminalIndexes,
@@ -22635,6 +22665,14 @@ function TerminalView({
       return null;
     }
 
+    // A terminal hosted in its own breakout window only leaves a placeholder in
+    // the grid. Dropping on the placeholder must never resolve a target — the
+    // real window is resolved by the cross-window watcher instead, so the
+    // placeholder reads as empty space and never false-highlights.
+    if (isTerminalIndexWindowBreakoutHosted(surfaceSlotIndex)) {
+      return null;
+    }
+
     if (terminalBreakoutLayoutActive) {
       const targetTerminalIndex = getTodoDropTargetFromPoint({
         clientX,
@@ -22657,11 +22695,15 @@ function TerminalView({
       rects: getTerminalHitTestRects(),
       terminalIndexes: visibleTabTerminalIndexes,
     });
+    if (isTerminalIndexWindowBreakoutHosted(targetTerminalIndex)) {
+      return null;
+    }
     return targetTerminalIndex === surfaceSlotIndex ? targetTerminalIndex : null;
   }, [
     fullscreenActive,
     fullscreenTerminalIndex,
     getTerminalHitTestRects,
+    isTerminalIndexWindowBreakoutHosted,
     logicalTerminalIndexes,
     terminalBreakoutLayoutActive,
     visibleTabTerminalIndexes,
@@ -32958,6 +33000,59 @@ function TerminalView({
     }
   }, [queueTodoQueueItem, todoQueueItems]);
 
+  // Starts the Rust cross-window drag watcher for any terminals currently
+  // hosted in their own breakout windows. No-op when nothing is popped out, so
+  // the common (all-in-grid) drag never touches the watcher.
+  const ensureTerminalDragSession = useCallback(() => {
+    if (terminalDragSessionActiveRef.current) {
+      return;
+    }
+    const panes = windowBreakoutPanesRef.current || {};
+    const targets = [];
+    for (const terminalIndex of logicalTerminalIndexesRef.current || []) {
+      const paneId = getTerminalPaneId(terminalIndex);
+      if (paneId && panes[paneId]) {
+        targets.push({ paneId, terminalIndex });
+      }
+    }
+    if (!targets.length) {
+      return;
+    }
+    terminalDragSessionActiveRef.current = true;
+    invoke("terminal_drag_session_begin", { targets }).catch(() => {});
+  }, [getTerminalPaneId]);
+
+  const endTerminalDragSession = useCallback(() => {
+    crossWindowDragTargetIndexRef.current = null;
+    if (!terminalDragSessionActiveRef.current) {
+      return;
+    }
+    terminalDragSessionActiveRef.current = false;
+    invoke("terminal_drag_session_end", {}).catch(() => {});
+  }, []);
+
+  // Single idempotent commit used by every release path (in-window drop,
+  // in-window pointerup, and the Rust cross-window release). Each underlying
+  // path consumes its own drag state, so a second call is a harmless no-op.
+  const commitTerminalDragToIndex = useCallback((targetTerminalIndex) => {
+    if (!Number.isInteger(targetTerminalIndex)) {
+      return false;
+    }
+    const pointerCommit = pointerDragCommitRef.current;
+    if (pointerCommit && todoDragStateRef.current) {
+      pointerCommit(targetTerminalIndex);
+      return true;
+    }
+    const tool = getActiveWorkspaceToolDrag();
+    const text = normalizeTodoQueueText(tool?.text);
+    if (text) {
+      addWorkspaceToolTodo(text, { send: Boolean(tool?.send), targetTerminalIndex });
+      clearActiveWorkspaceToolDrag();
+      return true;
+    }
+    return false;
+  }, [addWorkspaceToolTodo]);
+
   // OS file drags (Finder, etc.): the Tauri webview intercepts native file
   // drags, so DOM drop events never carry files. Route the webview's
   // drag-drop stream through the same targets as snip previews — todo cards,
@@ -35699,10 +35794,14 @@ function TerminalView({
 
     const cancelDrag = () => {
       updateTodoDragState(null);
+      pointerDragCommitRef.current = null;
+      endTerminalDragSession();
     };
 
     const commitDrag = (targetTerminalIndex) => {
       const currentDrag = todoDragStateRef.current;
+      pointerDragCommitRef.current = null;
+      endTerminalDragSession();
       if (!currentDrag) {
         return;
       }
@@ -36009,6 +36108,12 @@ function TerminalView({
       event.preventDefault();
 
       const targetTerminalIndex = resolveDropTarget(event.clientX, event.clientY);
+      if (Number.isInteger(targetTerminalIndex)) {
+        // The pointer is genuinely over the main grid; drop any stale
+        // cross-window target so a release here can't mis-route to a breakout
+        // window the cursor already left (Rust's null move can lag a frame).
+        crossWindowDragTargetIndexRef.current = null;
+      }
       updateTodoDragState({
         ...currentDrag,
         targetTerminalIndex,
@@ -36024,7 +36129,14 @@ function TerminalView({
       }
 
       event.preventDefault();
-      commitDrag(resolveDropTarget(event.clientX, event.clientY));
+      // If the cursor is over a breakout window (tracked by the Rust watcher),
+      // commit there; otherwise fall back to the in-grid hit-test.
+      const crossTarget = crossWindowDragTargetIndexRef.current;
+      commitDrag(
+        Number.isInteger(crossTarget)
+          ? crossTarget
+          : resolveDropTarget(event.clientX, event.clientY),
+      );
     };
 
     const handlePointerCancel = (event) => {
@@ -36035,6 +36147,11 @@ function TerminalView({
 
       cancelDrag();
     };
+
+    // Expose the live commit so a Rust cross-window release can finish this same
+    // drag, and start the cross-window watcher if any terminal is popped out.
+    pointerDragCommitRef.current = commitDrag;
+    ensureTerminalDragSession();
 
     window.addEventListener("pointermove", handlePointerMove, { passive: false });
     window.addEventListener("pointerup", handlePointerUp, { passive: false });
@@ -36047,9 +36164,13 @@ function TerminalView({
       window.removeEventListener("pointermove", handlePointerMove);
       window.removeEventListener("pointerup", handlePointerUp);
       window.removeEventListener("pointercancel", handlePointerCancel);
+      pointerDragCommitRef.current = null;
+      endTerminalDragSession();
     };
   }, [
     clearTodoQueueItemPending,
+    endTerminalDragSession,
+    ensureTerminalDragSession,
     getTerminalImageInputSupport,
     getTerminalRole,
     getTerminalPaneId,
@@ -36065,6 +36186,63 @@ function TerminalView({
     updateTodoQueueItems,
     updateTodoDragState,
   ]);
+
+  // Cross-window drag bridge: the Rust watcher reports which breakout terminal
+  // window (if any) is under the cursor, and signals release where the platform
+  // can read the mouse button. The main window owns the payload and commits.
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners = [];
+    const register = (eventName, handler) => {
+      listen(eventName, handler)
+        .then((unlisten) => {
+          if (disposed) {
+            unlisten();
+            return;
+          }
+          unlisteners.push(unlisten);
+        })
+        .catch(() => {});
+    };
+
+    register(TERMINAL_DRAG_MOVE_EVENT, (event) => {
+      const rawIndex = event?.payload?.terminalIndex;
+      const targetIndex = Number.isInteger(rawIndex) ? rawIndex : null;
+      if (crossWindowDragTargetIndexRef.current === targetIndex) {
+        return;
+      }
+      crossWindowDragTargetIndexRef.current = targetIndex;
+      if (targetIndex !== null) {
+        // A breakout window owns the cursor; the main grid must not highlight.
+        setNativeTerminalDropTargetIndex(null);
+        const currentDrag = todoDragStateRef.current;
+        if (currentDrag && currentDrag.targetTerminalIndex !== null) {
+          updateTodoDragState({ ...currentDrag, targetTerminalIndex: null });
+        }
+      }
+    });
+
+    register(TERMINAL_DRAG_RELEASE_EVENT, (event) => {
+      const rawIndex = event?.payload?.terminalIndex;
+      const targetIndex = Number.isInteger(rawIndex) ? rawIndex : null;
+      if (targetIndex !== null) {
+        commitTerminalDragToIndex(targetIndex);
+      }
+      endTerminalDragSession();
+    });
+
+    return () => {
+      disposed = true;
+      while (unlisteners.length) {
+        const unlisten = unlisteners.pop();
+        try {
+          unlisten?.();
+        } catch {
+          /* listener already detached */
+        }
+      }
+    };
+  }, [commitTerminalDragToIndex, endTerminalDragSession, updateTodoDragState]);
 
   useEffect(() => {
     if (!workspaceFileDragActive) {
@@ -36181,6 +36359,15 @@ function TerminalView({
 
     const handleTerminalNativeDropClear = () => {
       setNativeTerminalDropTargetIndex(null);
+      // dragend fires on the source even when the drop landed over a separate
+      // breakout window (where no in-main drop event reaches us). If the cursor
+      // was over a breakout window, commit there from the stashed payload.
+      const crossTarget = crossWindowDragTargetIndexRef.current;
+      if (Number.isInteger(crossTarget)) {
+        commitTerminalDragToIndex(crossTarget);
+      }
+      clearActiveWorkspaceToolDrag();
+      endTerminalDragSession();
     };
     const handleTerminalNativeDragLeave = (event) => {
       if (event.relatedTarget) {
@@ -36195,6 +36382,15 @@ function TerminalView({
       const hasNativeTodoTransfer = isTerminalNativeTodoDropTransfer(event.dataTransfer);
       if (!hasWorkspaceFileTransfer && !activeWorkspaceFile && !hasNativeTodoTransfer) {
         return;
+      }
+
+      // Spin up the cross-window watcher only for drags whose payload was
+      // stashed at drag start (docs). Other native-todo transfers (e.g.
+      // architecture graphs) can't be committed cross-window, so they must not
+      // arm the watcher or show a breakout highlight they can't honor. No-op
+      // when nothing is broken out.
+      if (hasNativeTodoTransfer && getActiveWorkspaceToolDrag()) {
+        ensureTerminalDragSession();
       }
 
       const targetTerminalIndex = resolveTerminalDropTarget(event.clientX, event.clientY);
@@ -36230,6 +36426,13 @@ function TerminalView({
       const hasWorkspaceFileTransfer = isWorkspaceFileDragTransfer(event.dataTransfer);
       const hasNativeTodoTransfer = isTerminalNativeTodoDropTransfer(event.dataTransfer);
       if (!hasWorkspaceFileTransfer && !activeWorkspaceFile && !hasNativeTodoTransfer) {
+        return;
+      }
+
+      // A breakout window owns the cursor: the cross-window release (or the
+      // trailing dragend) commits there. Skip the in-grid DOM drop so the same
+      // drag can never be committed twice.
+      if (Number.isInteger(crossWindowDragTargetIndexRef.current)) {
         return;
       }
 
@@ -36270,6 +36473,10 @@ function TerminalView({
           types: Array.from(event.dataTransfer?.types || []),
           workspaceId: terminalWorkspace?.id || "",
         });
+        // In-grid drop already committed; drop the stashed payload so the
+        // trailing dragend does not re-commit it cross-window.
+        clearActiveWorkspaceToolDrag();
+        endTerminalDragSession();
         return;
       }
 
@@ -36300,6 +36507,9 @@ function TerminalView({
     };
   }, [
     addWorkspaceToolTodo,
+    commitTerminalDragToIndex,
+    endTerminalDragSession,
+    ensureTerminalDragSession,
     hasVisibleWorkspaceTerminalPanes,
     queueWorkspaceFileForTerminalIndex,
     resolveTerminalDropTarget,

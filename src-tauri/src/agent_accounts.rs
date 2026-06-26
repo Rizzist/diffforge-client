@@ -39,7 +39,46 @@ fn agent_accounts_supported_kind(kind: &str) -> Option<&'static str> {
     if normalized.contains("codex") || normalized == "console" {
         return Some("codex");
     }
+    if normalized.contains("opencode") {
+        return Some("opencode");
+    }
     None
+}
+
+/// OpenCode's auth.json is provider-keyed API keys with no email, so derive a
+/// stable non-secret identity from the configured key (preferring the Go plan
+/// key). This lets the email-keyed multi-account machinery dedupe/pin OpenCode
+/// accounts the same way it does Claude/Codex.
+fn agent_accounts_opencode_identity_from_auth(auth: &Value) -> String {
+    let key = auth
+        .get("opencode-go")
+        .and_then(|entry| entry.get("key"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .or_else(|| {
+            auth.as_object().and_then(|providers| {
+                providers
+                    .values()
+                    .filter_map(|entry| entry.get("key").and_then(Value::as_str).map(str::trim))
+                    .find(|key| !key.is_empty())
+            })
+        });
+    match key {
+        Some(key) => format!("opencode-go-{}", cloud_mcp_short_hash(key)),
+        None => String::new(),
+    }
+}
+
+/// Canonical OpenCode data home (where auth.json + opencode.db live). Prefers an
+/// existing candidate, else the first by OpenCode's own resolution order.
+fn agent_accounts_opencode_default_home() -> Option<PathBuf> {
+    let candidates = opencode_data_home();
+    candidates
+        .iter()
+        .find(|path| path.exists())
+        .cloned()
+        .or_else(|| candidates.into_iter().next())
 }
 
 fn agent_accounts_registry_read() -> Value {
@@ -85,6 +124,9 @@ fn agent_accounts_default_home(kind: &str) -> Option<PathBuf> {
         .map(PathBuf::from)?;
     Some(match kind {
         "claude" => home.join(".claude"),
+        "opencode" => {
+            return agent_accounts_opencode_default_home();
+        }
         _ => home.join(".codex"),
     })
 }
@@ -122,6 +164,29 @@ fn agent_accounts_profile_identity(kind: &str, dir: Option<&Path>) -> Value {
                 });
             let auth_ready = !email.is_empty() || credentials_present;
             json!({ "email": email, "authReady": auth_ready })
+        }
+        "opencode" => {
+            let auth_path = match dir {
+                Some(dir) => dir.join("auth.json"),
+                None => match agent_accounts_default_home("opencode") {
+                    Some(home) => home.join("auth.json"),
+                    None => return json!({ "email": "", "authReady": false }),
+                },
+            };
+            let auth = fs::read_to_string(&auth_path)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<Value>(&raw).ok());
+            // The synthetic "email" is a stable key fingerprint, which the
+            // dedupe/capture machinery treats as the account identity.
+            let identity = auth
+                .as_ref()
+                .map(agent_accounts_opencode_identity_from_auth)
+                .unwrap_or_default();
+            let auth_ready = auth
+                .as_ref()
+                .and_then(Value::as_object)
+                .is_some_and(|providers| !providers.is_empty());
+            json!({ "email": identity, "authReady": auth_ready })
         }
         _ => {
             let auth_path = match dir {
@@ -181,6 +246,7 @@ fn agent_accounts_codex_email_from_auth(auth: &Value) -> String {
 fn agent_accounts_login_command(kind: &str, dir: &str) -> String {
     match kind {
         "claude" => format!("CLAUDE_CONFIG_DIR=\"{dir}\" claude"),
+        "opencode" => format!("OPENCODE_DATA_DIR=\"{dir}\" opencode auth login"),
         _ => format!("CODEX_HOME=\"{dir}\" codex login"),
     }
 }
@@ -899,6 +965,13 @@ pub(crate) fn agent_accounts_apply_spawn_env(
                 dir.to_string_lossy().to_string(),
             ));
         }
+        "opencode" => {
+            let Some(dir) = agent_accounts_active_profile_dir(kind) else {
+                return;
+            };
+            env_vars.retain(|(key, _)| key != "OPENCODE_DATA_DIR");
+            env_vars.push(("OPENCODE_DATA_DIR".to_string(), dir));
+        }
         _ => {
             let Some(dir) = agent_accounts_active_profile_dir(kind) else {
                 return;
@@ -1024,6 +1097,15 @@ fn agent_accounts_snapshot_refresh(kind: &str, dir: &Path) {
             let settings_destination = dir.join("settings.json");
             if !settings_destination.exists() {
                 let _ = fs::copy(default_home.join("settings.json"), &settings_destination);
+            }
+        }
+        "opencode" => {
+            agent_accounts_copy_if_newer(&default_home.join("auth.json"), &dir.join("auth.json"));
+            for config_name in ["config.json", "opencode.json", "opencode.jsonc"] {
+                let destination = dir.join(config_name);
+                if !destination.exists() {
+                    let _ = fs::copy(default_home.join(config_name), &destination);
+                }
             }
         }
         _ => {
@@ -1158,7 +1240,7 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
         .spawn(move || {
             let capture_all = || {
                 let _span = BackendCpuSpan::new("agent_accounts.capture_all");
-                for kind in ["claude", "codex"] {
+                for kind in ["claude", "codex", "opencode"] {
                     if agent_accounts_capture_kind(kind) {
                         let _ = app.emit(
                             AGENT_ACCOUNTS_CHANGED_EVENT,
@@ -1180,7 +1262,7 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
             let (tx, rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
             let mut watcher = notify::recommended_watcher(tx).ok();
             if let Some(watcher) = watcher.as_mut() {
-                for kind in ["claude", "codex"] {
+                for kind in ["claude", "codex", "opencode"] {
                     if let Some(dir) = agent_accounts_default_home(kind) {
                         let _ = notify::Watcher::watch(
                             watcher,
@@ -1426,20 +1508,11 @@ fn agent_accounts_launch_profile_login_terminal(
     profile_id: &str,
 ) -> Result<(), String> {
     let (dir, is_default) = agent_accounts_profile_login_target(kind, profile_id)?;
+    let provider = agent_accounts_provider_for_kind(kind);
     if is_default {
-        let provider = if kind == "claude" {
-            AgentProvider::Claude
-        } else {
-            AgentProvider::Codex
-        };
         return launch_account_login_terminal(provider);
     }
 
-    let provider = if kind == "claude" {
-        AgentProvider::Claude
-    } else {
-        AgentProvider::Codex
-    };
     let definition = agent_definition(provider);
     let binary = npm_global_executable_path(definition)
         .map(|path| path.to_string_lossy().to_string())
@@ -1450,12 +1523,24 @@ fn agent_accounts_launch_profile_login_terminal(
             vec!["/login"],
             vec![("CLAUDE_CONFIG_DIR".to_string(), dir_text)],
         ),
+        "opencode" => (
+            vec!["auth", "login"],
+            vec![("OPENCODE_DATA_DIR".to_string(), dir_text)],
+        ),
         _ => (
             vec!["login"],
             vec![("CODEX_HOME".to_string(), dir_text)],
         ),
     };
     run_login_terminal_with_env(definition.label, &binary, &args, &env_vars)
+}
+
+fn agent_accounts_provider_for_kind(kind: &str) -> AgentProvider {
+    match kind {
+        "claude" => AgentProvider::Claude,
+        "opencode" => AgentProvider::OpenCode,
+        _ => AgentProvider::Codex,
+    }
 }
 
 #[tauri::command]
@@ -1467,6 +1552,7 @@ async fn agent_accounts_state() -> Result<Value, String> {
             "agents": {
                 "claude": agent_accounts_kind_state(&registry, "claude"),
                 "codex": agent_accounts_kind_state(&registry, "codex"),
+                "opencode": agent_accounts_kind_state(&registry, "opencode"),
             }
         }))
     })
@@ -1725,15 +1811,18 @@ async fn agent_accounts_pane_profiles() -> Result<Value, String> {
         .unwrap_or_default();
     let (claude_active, claude_label) = agent_accounts_launch_profile_label("claude");
     let (codex_active, codex_label) = agent_accounts_launch_profile_label("codex");
+    let (opencode_active, opencode_label) = agent_accounts_launch_profile_label("opencode");
     let auth = json!({
         "claude": agent_accounts_kind_auth_statuses(&registry, "claude"),
         "codex": agent_accounts_kind_auth_statuses(&registry, "codex"),
+        "opencode": agent_accounts_kind_auth_statuses(&registry, "opencode"),
     });
     Ok(json!({
         "panes": panes,
         "active": {
             "claude": { "profileId": claude_active, "profileLabel": claude_label },
             "codex": { "profileId": codex_active, "profileLabel": codex_label },
+            "opencode": { "profileId": opencode_active, "profileLabel": opencode_label },
         },
         "auth": auth,
     }))
@@ -1785,7 +1874,8 @@ mod agent_accounts_tests {
         assert_eq!(agent_accounts_supported_kind("Claude Code"), Some("claude"));
         assert_eq!(agent_accounts_supported_kind("codex"), Some("codex"));
         assert_eq!(agent_accounts_supported_kind("console"), Some("codex"));
-        assert_eq!(agent_accounts_supported_kind("opencode"), None);
+        assert_eq!(agent_accounts_supported_kind("opencode"), Some("opencode"));
+        assert_eq!(agent_accounts_supported_kind("OpenCode"), Some("opencode"));
         assert_eq!(agent_accounts_supported_kind("generic"), None);
     }
 

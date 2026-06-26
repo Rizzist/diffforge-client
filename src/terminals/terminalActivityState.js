@@ -78,7 +78,7 @@ const TERMINAL_ACTIVITY_CLOSED_STATES = new Set([
   "terminated",
 ]);
 
-const TERMINAL_ACTIVITY_HOOK_AGENT_KINDS = new Set(["claude", "codex"]);
+const TERMINAL_ACTIVITY_HOOK_AGENT_KINDS = new Set(["claude", "codex", "opencode"]);
 
 function normalizeActivityText(value, fallback = "") {
   const text = String(value || "")
