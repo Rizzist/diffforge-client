@@ -1692,9 +1692,13 @@ export function workspaceTodoItemsForDeviceWorkspace(workspaceTodos, selection =
 }
 
 export function todoQueueDeviceSelectionIsLocalEditable(selection, currentWorkspaceId = "") {
+  const selectionWorkspaceId = normalizeWorkspaceId(selection?.workspaceId);
+  const safeCurrentWorkspaceId = normalizeWorkspaceId(currentWorkspaceId);
   return Boolean(
     selection?.isLocal
       && selection.deviceKind === TODO_QUEUE_DEVICE_KIND_DESKTOP
-      && normalizeWorkspaceId(selection.workspaceId) === normalizeWorkspaceId(currentWorkspaceId),
+      && selectionWorkspaceId
+      && safeCurrentWorkspaceId
+      && selectionWorkspaceId === safeCurrentWorkspaceId,
   );
 }

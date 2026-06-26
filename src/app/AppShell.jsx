@@ -31531,12 +31531,20 @@ export default function App() {
         if (cancelled) {
           return;
         }
-        invoke("cloud_mcp_get_status").then((status) => {
+        invoke("cloud_mcp_get_cached_workspace_todos", {}).then((workspaceTodos) => {
           if (cancelled) return;
-          setCloudWorkspaceProgress((current) => normalizeCloudWorkspaceProgress(
-            cloudWorkspaceProgressFromRuntimeStatus(status),
-            current,
-          ));
+          const nextWorkspaceTodos = workspaceTodos && typeof workspaceTodos === "object"
+            ? workspaceTodos
+            : null;
+          setCloudWorkspaceProgress((current) => normalizeCloudWorkspaceProgress({
+            ...current,
+            detail: current.detail || "Refreshing workspace todos.",
+            stage: current.stage || "workspace_socket",
+            status: current.status || "active",
+            title: current.title || "Cloud workspace",
+            updatedAt: Date.now(),
+            workspaceTodos: nextWorkspaceTodos,
+          }, current));
         }).catch(() => {});
       }, 80);
     };

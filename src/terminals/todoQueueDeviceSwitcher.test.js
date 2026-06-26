@@ -1030,4 +1030,9 @@ test("only local device current workspace selections are editable", () => {
     isLocal: false,
     workspaceId: "ws-local",
   }, "ws-local"), false);
+  assert.equal(todoQueueDeviceSelectionIsLocalEditable({
+    deviceKind: "desktop",
+    isLocal: true,
+    workspaceId: "",
+  }, ""), false);
 });
