@@ -21042,7 +21042,11 @@ fn cloud_mcp_direct_route_pending_error(route: &Value) -> Option<String> {
         .and_then(Value::as_bool)
         .unwrap_or(false);
 
-    if initializing || waiting || cloud_mcp_route_state_is_provisioning(route_state, backend_status)
+    let route_state_waiting = route_state.trim().eq_ignore_ascii_case("waiting");
+    if initializing
+        || waiting
+        || route_state_waiting
+        || cloud_mcp_route_state_is_provisioning(route_state, backend_status)
     {
         return Some(format!(
             "Cloud MCP route pending: route_state={route_state}; backend_status={backend_status}; retry_after_ms={retry_after_ms}"
@@ -21153,7 +21157,8 @@ fn cloud_mcp_route_state_is_provisioning(route_state: &str, backend_status: &str
     let backend_status = backend_status.trim().to_ascii_lowercase();
     matches!(
         route_state.as_str(),
-        "assignment_booting"
+        "waiting"
+            | "assignment_booting"
             | "dns_propagating"
             | "route_not_configured"
             | "route_not_browser_ready"
@@ -21167,6 +21172,7 @@ fn cloud_mcp_route_error_runtime_status(error: &str) -> Option<&'static str> {
     let error = error.to_ascii_lowercase();
     if error.contains("route pending")
         || error.contains("route_initializing")
+        || error.contains("route_state=waiting")
         || error.contains("assignment_booting")
         || error.contains("dns_propagating")
         || error.contains("route_not_configured")
@@ -47595,6 +47601,26 @@ mod cloud_mcp_tests {
         assert_eq!(
             cloud_mcp_route_initializing_poll_delay(no_hint),
             Duration::from_millis(CLOUD_MCP_ROUTE_INITIALIZING_DEFAULT_POLL_MS)
+        );
+
+        let waiting_route = json!({
+            "ok": false,
+            "route_state": "waiting",
+            "retry_after_ms": 5000
+        });
+        let waiting_error = cloud_mcp_direct_route_pending_error(&waiting_route)
+            .expect("waiting routes should stay retryable");
+        assert_eq!(
+            cloud_mcp_route_error_runtime_status(&waiting_error),
+            Some("route_initializing")
+        );
+        assert_eq!(cloud_mcp_route_error_retry_after_ms(&waiting_error), Some(5000));
+
+        let legacy_waiting_error =
+            "Cloud MCP route rejected: route_state=waiting; route rejected";
+        assert_eq!(
+            cloud_mcp_route_error_runtime_status(legacy_waiting_error),
+            Some("route_initializing")
         );
     }
 
