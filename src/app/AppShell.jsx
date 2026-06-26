@@ -14,11 +14,16 @@ import "@vscode/codicons/dist/codicon.css";
 import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
 import { AdsClick } from "@styled-icons/material-rounded/AdsClick";
 import { Devices } from "@styled-icons/material-rounded/Devices";
+import { ErrorOutline } from "@styled-icons/material-rounded/ErrorOutline";
 import { History } from "@styled-icons/material-rounded/History";
+import { HourglassEmpty } from "@styled-icons/material-rounded/HourglassEmpty";
 import { KeyboardArrowDown } from "@styled-icons/material-rounded/KeyboardArrowDown";
+import { PauseCircle } from "@styled-icons/material-rounded/PauseCircle";
 import { PermMedia } from "@styled-icons/material-rounded/PermMedia";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
+import { RadioButtonChecked } from "@styled-icons/material-rounded/RadioButtonChecked";
 import { Schedule } from "@styled-icons/material-rounded/Schedule";
+import { Send } from "@styled-icons/material-rounded/Send";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Webhook } from "@styled-icons/material-rounded/Webhook";
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
@@ -659,8 +664,6 @@ import {
   SettingsHint,
   SettingsIdentityGrid,
   SettingsIdentityItem,
-  SettingsRepoCard,
-  SettingsRepoGrid,
   CreditUsageTrack,
   CreditUsageFill,
   LowCreditWarningToast,
@@ -702,6 +705,7 @@ import {
   ButtonBackIcon,
   ButtonLoginIcon,
   ButtonBrowserIcon,
+  ButtonWebIcon,
   ButtonAssetsIcon,
   ButtonCloseIcon,
   ButtonDarkModeIcon,
@@ -1225,7 +1229,7 @@ function mergeLoopspaceRuntimeEventRows(existing, incoming, replace = false) {
 function loopspaceRuntimeEventTone(event) {
   const severity = String(event?.severity || "").toLowerCase();
   const status = String(event?.status || "").toLowerCase();
-  if (["error", "failed", "failure", "interrupted", "cancelled"].some((item) => severity === item || status === item)) return "error";
+  if (["error", "failed", "failure", "interrupted", "cancelled", "canceled", "aborted"].some((item) => severity === item || status === item)) return "error";
   if (["warn", "warning", "blocked", "awaiting_device"].some((item) => severity === item || status === item)) return "queued";
   if (["good", "success", "succeeded", "completed", "complete"].some((item) => severity === item || status === item)) return "good";
   if (["running", "queued", "dispatched"].includes(status)) return "active";
@@ -1238,14 +1242,41 @@ function loopspaceRuntimeEventTimelineIcon(event) {
   const haystack = [
     status,
     severity,
+    event?.status,
+    event?.kind,
+    event?.eventKind,
+    event?.message,
+  ].join(" ").toLowerCase();
+  if (/\b(cancelled|canceled|aborted)\b/.test(haystack)) return "cancelled";
+  if (status === "success" || /\b(completed|complete|success|succeeded)\b/.test(haystack)) return "completed";
+  if (status === "failed" || /\b(failed|failure|error|denied)\b/.test(haystack)) return "failed";
+  if (status === "resume_ready" || /\b(resume_ready|resume ready|resumable)\b/.test(haystack)) return "resume-ready";
+  if (status === "interrupted" || /\b(interrupted|interrupt|timed out|timeout)\b/.test(haystack)) return "interrupted";
+  if (status === "queued" || /\b(queued|queue|pending|waiting)\b/.test(haystack)) return "queued";
+  if (status === "resume_requested" || /\b(resuming|resume requested|resume_requested)\b/.test(haystack)) return "resuming";
+  if (status === "running" || /\b(running|dispatch|sent|started|active|processing)\b/.test(haystack)) return "running";
+  return "neutral";
+}
+
+function loopspaceRuntimeLogIcon(event) {
+  const status = normalizeLoopspaceNodeRuntimeStatus(loopspaceRuntimeEventStatus(event));
+  const severity = String(event?.severity || "").trim().toLowerCase();
+  const haystack = [
+    status,
+    severity,
+    event?.status,
     event?.kind,
     event?.eventKind,
     event?.message,
   ].join(" ").toLowerCase();
   if (status === "success" || /\b(completed|complete|success|succeeded)\b/.test(haystack)) return "completed";
-  if (status === "interrupted" || status === "resume_ready" || /\b(interrupted|interrupt|resume_ready)\b/.test(haystack)) return "interrupted";
-  if (status === "failed" || /\b(failed|failure|error|denied|cancelled)\b/.test(haystack)) return "failed";
-  if (status === "running" || status === "queued" || status === "resume_requested" || /\b(running|queued|dispatch|sent)\b/.test(haystack)) return "running";
+  if (/\b(cancelled|canceled|aborted)\b/.test(haystack)) return "cancelled";
+  if (status === "failed" || /\b(failed|failure|error|denied)\b/.test(haystack)) return "failed";
+  if (status === "interrupted" || status === "resume_ready" || /\b(interrupted|interrupt|resume_ready|resume ready)\b/.test(haystack)) return "interrupted";
+  if (/\b(sent|send|dispatch sent|dispatched)\b/.test(haystack)) return "sent";
+  if (/\b(trigger|manual|webhook|cron|followed|branch)\b/.test(haystack)) return "trigger";
+  if (status === "queued" || /\b(queued|queue|pending|waiting)\b/.test(haystack)) return "queued";
+  if (status === "running" || status === "resume_requested" || /\b(running|run|started|active|processing)\b/.test(haystack)) return "running";
   return "neutral";
 }
 
@@ -1253,9 +1284,11 @@ function loopspaceRuntimeTimelineIconForStatus(status) {
   const normalized = normalizeLoopspaceNodeRuntimeStatus(status);
   if (normalized === "success") return "completed";
   if (normalized === "failed") return "failed";
-  if (normalized === "interrupted" || normalized === "resume_ready") return "interrupted";
+  if (normalized === "interrupted") return "interrupted";
+  if (normalized === "resume_ready") return "resume-ready";
   if (normalized === "queued") return "queued";
-  if (normalized === "running" || normalized === "resume_requested") return "running";
+  if (normalized === "resume_requested") return "resuming";
+  if (normalized === "running") return "running";
   return "neutral";
 }
 
@@ -1512,6 +1545,24 @@ function loopspaceRuntimeEventStatus(event) {
     if (status) return status;
   }
   return "";
+}
+
+function loopspaceRuntimeEventStatusLabel(event, fallback = "Runtime event", options = {}) {
+  const rawStatus = loopspaceRuntimeField(event, ["status", "state", "runStatus", "run_status"])
+    || loopspaceRuntimeField(event?.details, ["status", "state", "parentStatus", "parent_status"])
+    || "";
+  const rawLabel = String(rawStatus || "")
+    .trim()
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ");
+  if (options.preferRaw && rawLabel) return rawLabel;
+  const normalized = loopspaceRuntimeEventStatus(event);
+  const normalizedLabel = loopspaceNodeRuntimeStatusLabel(normalized);
+  if (normalizedLabel) return normalizedLabel;
+  return rawLabel || String(loopspaceRuntimeField(event, ["kind", "eventKind", "event_kind"]) || fallback)
+    .trim()
+    .replace(/[._-]+/g, " ")
+    .replace(/\s+/g, " ");
 }
 
 function loopspaceRuntimeEventSortValue(event) {
@@ -5406,10 +5457,17 @@ const LOOPSPACE_RUNTIME_PANEL_MIN_HEIGHT = 88;
 const LOOPSPACE_RUNTIME_PANEL_MIN_GRAPH_HEIGHT = 160;
 const LOOPSPACE_RUNTIME_LOG_PAGE_SIZE = 30;
 const LOOPSPACE_RUNTIME_SETTINGS_PANEL_HEIGHT = 340;
-const LOOPSPACE_RUNTIME_SETTINGS_CARD_WIDTH = 260;
+const LOOPSPACE_RUNTIME_SETTINGS_CARD_WIDTH = 220;
 const LOOPSPACE_RUNTIME_SETTINGS_CARD_GAP = 10;
 const LOOPSPACE_RUNTIME_SETTINGS_GRID_PADDING = 8;
 const LOOPSPACE_RUNTIME_SETTINGS_GRID_OVERSCAN = 2;
+const LOOPSPACE_GRAPH_STEP_RESOURCE_PORT_ID = "resources";
+const LOOPSPACE_GRAPH_STEP_RESOURCE_OUTPUT_PORT = {
+  id: LOOPSPACE_GRAPH_STEP_RESOURCE_PORT_ID,
+  label: "RESOURCES",
+  tone: "asset",
+};
+const LOOPSPACE_GRAPH_STEP_RESOURCE_BRANCH_PORT_IDS = new Set(["assets", "docs"]);
 
 function clampLoopspaceGraphZoom(value) {
   return Math.min(LOOPSPACE_GRAPH_MAX_ZOOM, Math.max(LOOPSPACE_GRAPH_MIN_ZOOM, Number(value) || 1));
@@ -5475,6 +5533,40 @@ const LOOPSPACE_MESSAGE_STEP_NODE_KINDS = new Set(["checkpoint", "message_step",
 function loopspaceGraphNodeIsMessageStep(node) {
   const kind = String(node?.nodeKind || node?.kind || "").trim().toLowerCase();
   return LOOPSPACE_MESSAGE_STEP_NODE_KINDS.has(kind);
+}
+
+function loopspaceGraphNodeKindId(node) {
+  return String(node?.nodeKind || node?.node_kind || node?.kind || node?.role || "").trim().toLowerCase();
+}
+
+function loopspaceGraphDisplayedOutputPortIdForNode(node, portId = "") {
+  const safePortId = String(portId || "").trim().toLowerCase();
+  if (
+    loopspaceGraphNodeIsMessageStep(node)
+    && LOOPSPACE_GRAPH_STEP_RESOURCE_BRANCH_PORT_IDS.has(safePortId)
+  ) {
+    return LOOPSPACE_GRAPH_STEP_RESOURCE_PORT_ID;
+  }
+  return safePortId;
+}
+
+function loopspaceGraphStoredOutputPortForConnection(fromNode, toNode, portId = "") {
+  const safePortId = String(portId || "").trim().toLowerCase();
+  if (safePortId !== LOOPSPACE_GRAPH_STEP_RESOURCE_PORT_ID || !loopspaceGraphNodeIsMessageStep(fromNode)) {
+    return safePortId;
+  }
+  const toKind = loopspaceGraphNodeKindId(toNode);
+  if (toKind === "document_write") return "docs";
+  if (toKind === "asset_write") return "assets";
+  return "";
+}
+
+function loopspaceGraphOutputPortIdsForDisconnect(portId = "") {
+  const safePortId = String(portId || "").trim().toLowerCase();
+  if (safePortId === LOOPSPACE_GRAPH_STEP_RESOURCE_PORT_ID) {
+    return [...LOOPSPACE_GRAPH_STEP_RESOURCE_BRANCH_PORT_IDS];
+  }
+  return safePortId ? [safePortId] : [];
 }
 
 function loopspaceGraphStepOrder(node, fallback = 0) {
@@ -5724,7 +5816,7 @@ function loopspaceGraphMessageFlowNodeInputPoint(flowNode) {
 }
 
 function loopspaceGraphMessageFlowNodeFlowOutputPoint(flowNode) {
-  const outputPorts = loopspaceGraphOutputPortsForNode(flowNode?.item);
+  const outputPorts = loopspaceGraphDisplayedOutputPortsForNode(flowNode?.item);
   return {
     x: flowNode.layout.x + flowNode.layout.width,
     y: flowNode.layout.y + loopspaceGraphMessageFlowNodePortY(flowNode.layout, 0, outputPorts.length),
@@ -6472,11 +6564,25 @@ function loopspaceGraphOutputPortsForNode(node) {
   });
 }
 
+function loopspaceGraphDisplayedOutputPortsForNode(node) {
+  const ports = loopspaceGraphOutputPortsForNode(node);
+  if (!loopspaceGraphNodeIsMessageStep(node)) return ports;
+  const hasResourceOutput = ports.some((port) => LOOPSPACE_GRAPH_STEP_RESOURCE_BRANCH_PORT_IDS.has(port.id));
+  return [
+    ...ports.filter((port) => !LOOPSPACE_GRAPH_STEP_RESOURCE_BRANCH_PORT_IDS.has(port.id)),
+    ...(hasResourceOutput ? [LOOPSPACE_GRAPH_STEP_RESOURCE_OUTPUT_PORT] : []),
+  ];
+}
+
 function loopspaceGraphInputPortsForNode(node) {
   return contractLoopspaceGraphInputPortsForNode(node);
 }
 
 function loopspaceGraphOutputPortForId(node, portId = "") {
+  const safePortId = String(portId || "").trim().toLowerCase();
+  if (safePortId === LOOPSPACE_GRAPH_STEP_RESOURCE_PORT_ID && loopspaceGraphNodeIsMessageStep(node)) {
+    return LOOPSPACE_GRAPH_STEP_RESOURCE_OUTPUT_PORT;
+  }
   return contractLoopspaceGraphOutputPortForId(node, portId);
 }
 
@@ -6658,14 +6764,16 @@ function loopspaceGraphInputPoint(layout, node = null, portId = "in") {
 }
 
 function loopspaceGraphOutputPoint(layout, node = null, portId = "out") {
-  const ports = loopspaceGraphOutputPortsForNode(node);
-  const index = Math.max(0, ports.findIndex((port) => port.id === String(portId || "").trim()));
+  const safePortId = String(portId || "").trim().toLowerCase();
+  const displayedPortId = loopspaceGraphDisplayedOutputPortIdForNode(node, safePortId);
+  const ports = loopspaceGraphDisplayedOutputPortsForNode(node);
+  const index = Math.max(0, ports.findIndex((port) => port.id === displayedPortId));
   const safeIndex = index >= 0 ? index : 0;
   const portCount = Math.max(1, ports.length);
   const outputPortYById = layout?.outputPortYById && typeof layout.outputPortYById === "object"
     ? layout.outputPortYById
     : {};
-  const explicitPortY = outputPortYById[String(portId || "").trim()];
+  const explicitPortY = outputPortYById[displayedPortId] ?? outputPortYById[safePortId];
   if (Number.isFinite(explicitPortY)) {
     return {
       x: layout.x + layout.width,
@@ -9095,14 +9203,16 @@ function LoopspaceRuntimeView({
     const safeNodeId = String(nodeId || "").trim();
     if (!safeNodeId || busy) return;
     const source = graphSourceRef.current || graphSource;
-    const port = String(portId || "").trim();
+    const portIds = new Set(loopspaceGraphOutputPortIdsForDisconnect(portId));
+    const hasPortFilter = portIds.size > 0;
     let nextSource = source;
     parseDfBlueprintSource(source).edges
       .filter((edge) => {
         if (side === "input") {
-          return edge.to === safeNodeId && (!port || String(edge.toPort || "") === port);
+          const inputPort = String(portId || "").trim();
+          return edge.to === safeNodeId && (!inputPort || String(edge.toPort || "") === inputPort);
         }
-        return edge.from === safeNodeId && (!port || String(edge.fromPort || "") === port);
+        return edge.from === safeNodeId && (!hasPortFilter || portIds.has(String(edge.fromPort || "").trim().toLowerCase()));
       })
       .forEach((edge) => {
         nextSource = loopspaceGraphSourceWithoutEdge(nextSource, edge.id);
@@ -9116,8 +9226,13 @@ function LoopspaceRuntimeView({
     const toNode = graphNodeLookup.get(String(toId || "").trim());
     const safeToPort = String(toPort || "in").trim() || "in";
     if (!fromNode || !toNode || fromNode.id === toNode.id || busy) return;
+    const safeFromPort = loopspaceGraphStoredOutputPortForConnection(fromNode, toNode, fromPort);
+    if (!safeFromPort) {
+      setRuntimeError("Resource outputs connect to document write or asset write nodes.");
+      return;
+    }
     const validation = validateLoopspaceGraphEdgeCandidate(fromNode, toNode, {
-      fromPort,
+      fromPort: safeFromPort,
       nodeById: graphNodeLookup,
       toPort: safeToPort,
     });
@@ -9126,7 +9241,7 @@ function LoopspaceRuntimeView({
       return;
     }
     const source = graphSourceRef.current || graphSource;
-    const nextSource = loopspaceGraphSourceWithEdge(source, fromNode, toNode, fromPort, safeToPort);
+    const nextSource = loopspaceGraphSourceWithEdge(source, fromNode, toNode, safeFromPort, safeToPort);
     if (nextSource === source) return;
     await commitLoopspaceGraphSource(nextSource, "Unable to connect graph nodes.");
   }, [busy, commitLoopspaceGraphSource, graphNodeLookup, graphSource]);
@@ -9682,6 +9797,18 @@ function LoopspaceRuntimeView({
     applyGraphViewport({ x: 0, y: 0 }, 1);
   }, [applyGraphViewport]);
 
+  const centerLoopspaceGraphOnNode = useCallback((node) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!nodeId) return;
+    const visibleIndex = visibleGraphNodes.findIndex((item) => item.id === nodeId);
+    const layout = graphNodeLayouts.get(nodeId) || loopspaceGraphNodeLayout(node, Math.max(0, visibleIndex));
+    const zoom = canvasZoomRef.current || 1;
+    applyGraphViewport({
+      x: -((layout.x + (layout.width / 2)) * zoom),
+      y: -((layout.y + (layout.height / 2)) * zoom),
+    }, zoom);
+  }, [applyGraphViewport, graphNodeLayouts, visibleGraphNodes]);
+
   const onGraphPointerDown = useCallback((event) => {
     if (event.button !== 0) return;
     const target = event.target;
@@ -10211,16 +10338,22 @@ function LoopspaceRuntimeView({
       return !eventRunId || eventRunId === runtimeHeadRunId;
     });
   }, [runtimeHeadRunId, visibleRuntimeEvents]);
-  const runtimeTimelineStateByNodeId = useMemo(
-    () => buildLoopspaceNodeRuntimeStateMap(currentRunRuntimeEvents, runtimeHead),
-    [currentRunRuntimeEvents, runtimeHead],
-  );
   const runtimeTimelineRows = useMemo(() => {
-    const rows = [];
-    runtimeTimelineStateByNodeId.forEach((state, nodeId) => {
+    const rows = currentRunRuntimeEvents.map((event, eventIndex) => {
+      const nodeId = loopspaceRuntimeEventNodeId(event);
       const node = graphNodeLookup.get(nodeId) || null;
-      const trigger = node?.triggerId ? triggerById.get(node.triggerId) : null;
-      const status = normalizeLoopspaceNodeRuntimeStatus(state.status) || state.status || "running";
+      const eventTriggerId = loopspaceRuntimeField(event, ["triggerId", "trigger_id"])
+        || loopspaceRuntimeField(event?.details, ["triggerId", "trigger_id"]);
+      const trigger = node?.triggerId
+        ? triggerById.get(node.triggerId)
+        : eventTriggerId
+          ? triggerById.get(eventTriggerId)
+          : null;
+      const normalizedStatus = loopspaceRuntimeEventStatus(event);
+      const rawStatus = loopspaceRuntimeField(event, ["status", "state"])
+        || loopspaceRuntimeField(event?.details, ["status", "state", "parentStatus", "parent_status"])
+        || "";
+      const status = normalizedStatus || rawStatus || "event";
       const title = loopspaceRuntimeNodeTitle(node, trigger);
       const kindLabel = loopspaceRuntimeNodeKindLabel(node, trigger);
       const nodeDeviceId = node ? String(loopspaceGraphPropValue(node.props, ["device_id", "deviceId"]) || "").trim() : "";
@@ -10249,6 +10382,8 @@ function LoopspaceRuntimeView({
           || nodeDevice?.device_name
           || nodeDevice?.deviceName
           || nodeDevice?.name
+          || loopspaceRuntimeField(event, ["targetTerminalName", "target_terminal_name", "deviceLabel", "device_label"])
+          || loopspaceRuntimeField(event?.details, ["targetTerminalName", "target_terminal_name", "deviceLabel", "device_label"])
           || "",
       ).trim();
       const scriptLabel = node?.nodeKind === "run_script"
@@ -10259,41 +10394,45 @@ function LoopspaceRuntimeView({
             || "",
         ).trim()
         : "";
-      const timeMs = loopspaceRuntimeTimestampMs(state.event) || loopspaceRuntimeTimestampMs(state.details) || 0;
-      const statusLabel = loopspaceNodeRuntimeStatusLabel(status) || String(status || "Active").replace(/_/g, " ");
-      const message = loopspaceRuntimeFriendlyMessage(state.event, title, status);
+      const timeMs = loopspaceRuntimeTimestampMs(event) || 0;
+      const runId = loopspaceRuntimeEventRunId(event);
+      const edgeId = loopspaceRuntimeEventEdgeId(event);
+      const sortValue = loopspaceRuntimeEventSortValue(event) || timeMs || eventIndex;
+      const statusLabel = loopspaceRuntimeEventStatusLabel(event, "Event");
+      const message = loopspaceRuntimeFriendlyMessage(event, title, status);
       const subtitle = [
         kindLabel,
         scriptLabel && scriptLabel !== title ? scriptLabel : "",
         targetLabel ? `on ${targetLabel}` : "",
       ].filter(Boolean).join(" - ");
-      rows.push({
-        canResume: node?.nodeKind === "send_message" && loopspaceRuntimeStateCanResume(state),
+      return {
+        canResume: node?.nodeKind === "send_message" && loopspaceRuntimeStateCanResume({ details: event?.details, event, status }),
         configurable: node && ["asset_read", "asset_write", "document_read", "document_write", "send_message"].includes(node.nodeKind),
         detailRows: [
           ["Type", kindLabel],
           targetLabel ? ["Target", targetLabel] : null,
           scriptLabel && scriptLabel !== title ? ["Script", scriptLabel] : null,
           timeMs ? ["Updated", formatLoopspaceRuntimeTime(timeMs) || formatLoopspaceRuntimeConsoleTime(timeMs)] : null,
-          state.runId ? ["Run ID", state.runId] : null,
+          runId ? ["Run ID", runId] : null,
           nodeId ? ["Node ID", nodeId] : null,
-          state.edgeId ? ["Edge ID", state.edgeId] : null,
+          edgeId ? ["Edge ID", edgeId] : null,
+          event?.id ? ["Event ID", event.id] : null,
         ].filter(Boolean),
-        icon: loopspaceRuntimeTimelineIconForStatus(status),
-        id: `node:${nodeId}`,
+        icon: loopspaceRuntimeEventTimelineIcon(event),
+        id: `event:${event?.id || `${nodeId || "runtime"}:${sortValue}`}`,
         message,
         node,
         nodeId,
-        runId: state.runId || "",
-        sortValue: state.sortValue || timeMs || 0,
-        sourceMessage: String(state.event?.message || "").trim(),
+        runId,
+        sortValue,
+        sourceMessage: String(event?.message || "").trim(),
         status,
         statusLabel,
         subtitle,
         timeMs,
         title,
-        tone: loopspaceNodeRuntimeStatusTone(status),
-      });
+        tone: normalizedStatus ? loopspaceNodeRuntimeStatusTone(normalizedStatus) : loopspaceRuntimeEventTone(event),
+      };
     });
     if (!rows.length && runtimeHead) {
       const status = normalizeLoopspaceNodeRuntimeStatus(runtimeHeadStatus) || runtimeHeadStatus || "running";
@@ -10326,9 +10465,10 @@ function LoopspaceRuntimeView({
     }
     return rows.sort((left, right) => (
       (left.sortValue || 0) - (right.sortValue || 0)
-      || String(left.title).localeCompare(String(right.title))
+      || String(left.id).localeCompare(String(right.id))
     ));
   }, [
+    currentRunRuntimeEvents,
     graphNodeLookup,
     loopspaceGraphDeviceLookup,
     loopspaceGraphScriptOptions,
@@ -10337,7 +10477,6 @@ function LoopspaceRuntimeView({
     runtimeHeadNodeId,
     runtimeHeadRunId,
     runtimeHeadStatus,
-    runtimeTimelineStateByNodeId,
     triggerById,
   ]);
   const selectedRuntimeRow = useMemo(() => (
@@ -10413,7 +10552,7 @@ function LoopspaceRuntimeView({
   const settingsPanelCardWidth = settingsPanelColumnCount === 1
     ? Math.max(1, Math.min(LOOPSPACE_RUNTIME_SETTINGS_CARD_WIDTH, settingsPanelAvailableWidth))
     : LOOPSPACE_RUNTIME_SETTINGS_CARD_WIDTH;
-  const settingsPanelCardHeight = Math.max(126, Math.round(settingsPanelCardWidth / 1.618));
+  const settingsPanelCardHeight = Math.max(108, Math.round(settingsPanelCardWidth / 1.9));
   const settingsPanelGridStride = settingsPanelCardHeight + LOOPSPACE_RUNTIME_SETTINGS_CARD_GAP;
   const settingsPanelGridRowCount = Math.ceil(settingsPanelRows.length / settingsPanelColumnCount);
   const settingsPanelListHeight = Math.max(
@@ -10805,8 +10944,8 @@ function LoopspaceRuntimeView({
     const kindLabel = row?.subtitle?.split(" - ")[0] || row?.kind || node.nodeKind || "Node";
     const title = row?.title || node.label || kindLabel;
     const closeSettings = () => setSettingsNodeId("");
-    const renderSettingsHeader = (subtitle = kindLabel) => (
-      <LoopspaceRuntimePanelSettingsHeader>
+    const renderSettingsHeader = (subtitle = kindLabel, trailing = null) => (
+      <LoopspaceRuntimePanelSettingsHeader data-trailing={trailing ? "true" : undefined}>
         <LoopspaceRuntimePanelSettingsAction
           aria-label="Back to graph node settings"
           onClick={closeSettings}
@@ -10819,6 +10958,7 @@ function LoopspaceRuntimeView({
           <strong>{title}</strong>
           <span>{subtitle}</span>
         </LoopspaceRuntimePanelSettingsMain>
+        {trailing}
       </LoopspaceRuntimePanelSettingsHeader>
     );
     const isSettingsDocumentReadNode = node.nodeKind === "document_read";
@@ -10963,29 +11103,31 @@ function LoopspaceRuntimeView({
 	      { id: "prompt", label: "Prompt" },
 	      { id: "steps", label: "Steps" },
 	    ];
+    const sendMessageSettingsTabList = (
+      <LoopspaceGraphMessageSettingsTabList aria-label="Send message settings sections" role="tablist">
+        {sendMessageSettingsTabs.map((tab) => (
+          <LoopspaceGraphMessageSettingsTabButton
+            aria-selected={activeSendMessageSettingsTab === tab.id}
+            data-active={activeSendMessageSettingsTab === tab.id ? "true" : undefined}
+            key={tab.id}
+            onClick={() => setSendMessageSettingsTab(tab.id)}
+            role="tab"
+            type="button"
+          >
+            {tab.label}
+          </LoopspaceGraphMessageSettingsTabButton>
+        ))}
+      </LoopspaceGraphMessageSettingsTabList>
+    );
 
 	    return (
 	      <LoopspaceRuntimePanelSettingsInspector data-kind="send_message">
-	        {renderSettingsHeader("Send message")}
+	        {renderSettingsHeader("Send message", sendMessageSettingsTabList)}
 	        <LoopspaceGraphMessageSettingsPanel
 	          data-layout="tabs"
 	          onPointerDown={(event) => event.stopPropagation()}
 	          onWheel={(event) => event.stopPropagation()}
 	        >
-	          <LoopspaceGraphMessageSettingsTabList aria-label="Send message settings sections" role="tablist">
-	            {sendMessageSettingsTabs.map((tab) => (
-	              <LoopspaceGraphMessageSettingsTabButton
-	                aria-selected={activeSendMessageSettingsTab === tab.id}
-	                data-active={activeSendMessageSettingsTab === tab.id ? "true" : undefined}
-	                key={tab.id}
-	                onClick={() => setSendMessageSettingsTab(tab.id)}
-	                role="tab"
-	                type="button"
-	              >
-	                {tab.label}
-	              </LoopspaceGraphMessageSettingsTabButton>
-	            ))}
-	          </LoopspaceGraphMessageSettingsTabList>
 	          <LoopspaceGraphMessageSettingsTabPanel role="tabpanel">
 	            {activeSendMessageSettingsTab === "model" ? (
 	              <LoopspaceGraphMessageSettingsSection data-column="model">
@@ -11084,22 +11226,11 @@ function LoopspaceRuntimeView({
 	            ) : null}
 	            {activeSendMessageSettingsTab === "steps" ? (
 	              <LoopspaceGraphMessageSettingsSection data-column="steps">
-	                <LoopspaceGraphMessageSubnodeToolbar>
-	                  <LoopspaceGraphMessageSubnodeButton
-	                    disabled={busy}
-	                    onClick={() => {
-	                      void addSendMessageStep(node);
-	                    }}
-	                    type="button"
-	                  >
-	                    + Step
-	                  </LoopspaceGraphMessageSubnodeButton>
-	                </LoopspaceGraphMessageSubnodeToolbar>
-	                <LoopspaceGraphMessageSubnodeList aria-label="Message steps" data-orientation="horizontal">
-	                  {sendMessageSteps.length ? sendMessageSteps.map(({ item: checkpoint }, checkpointIndex) => {
-	                    const stepTitle = loopspaceGraphStepTitle(checkpoint, checkpointIndex);
-	                    const stepDescription = loopspaceGraphStepDescription(checkpoint);
-	                    return (
+		                <LoopspaceGraphMessageSubnodeList aria-label="Message steps" data-orientation="horizontal">
+		                  {sendMessageSteps.map(({ item: checkpoint }, checkpointIndex) => {
+		                    const stepTitle = loopspaceGraphStepTitle(checkpoint, checkpointIndex);
+		                    const stepDescription = loopspaceGraphStepDescription(checkpoint);
+		                    return (
 	                      <LoopspaceGraphMessageSubnodeItem data-mode="step" key={checkpoint.id}>
 	                        <LoopspaceGraphMessageSubnodeMain>
 	                          <LoopspaceGraphMessageStepHeader>
@@ -11146,21 +11277,41 @@ function LoopspaceRuntimeView({
 	                        >
 	                          <ButtonCloseIcon aria-hidden="true" />
 	                        </button>
-	                      </LoopspaceGraphMessageSubnodeItem>
-	                    );
-	                  }) : (
-	                    <LoopspaceGraphMessageSubnodeItem data-empty="true">
-	                      <LoopspaceGraphNodeText>
-	                        <strong>No steps yet</strong>
-	                        <span>Add internal checkpoints for this message.</span>
-	                      </LoopspaceGraphNodeText>
-	                    </LoopspaceGraphMessageSubnodeItem>
-	                  )}
-	                </LoopspaceGraphMessageSubnodeList>
+		                      </LoopspaceGraphMessageSubnodeItem>
+		                    );
+		                  })}
+		                  <LoopspaceGraphMessageSubnodeItem
+		                    aria-label="Create new message step"
+		                    as="button"
+		                    data-action="add"
+		                    data-empty={sendMessageSteps.length ? undefined : "true"}
+		                    disabled={busy}
+		                    onClick={() => {
+		                      void addSendMessageStep(node);
+		                    }}
+		                    type="button"
+		                  >
+		                      <LoopspaceGraphNodeText>
+		                        <strong>New step</strong>
+		                        <span>Add an internal checkpoint for this message.</span>
+		                      </LoopspaceGraphNodeText>
+		                    </LoopspaceGraphMessageSubnodeItem>
+		                </LoopspaceGraphMessageSubnodeList>
 	              </LoopspaceGraphMessageSettingsSection>
 	            ) : null}
 	          </LoopspaceGraphMessageSettingsTabPanel>
 	          <LoopspaceGraphMessageSettingsActions>
+	            {activeSendMessageSettingsTab === "steps" ? (
+	              <LoopspaceGraphMessageSubnodeButton
+	                disabled={busy}
+	                onClick={() => {
+	                  void addSendMessageStep(node);
+	                }}
+	                type="button"
+	              >
+	                + Step
+	              </LoopspaceGraphMessageSubnodeButton>
+	            ) : null}
 	            <LoopspaceGraphMessageSaveButton
 	              disabled={busy}
 	              onClick={() => {
@@ -12002,7 +12153,7 @@ function LoopspaceRuntimeView({
                                 const stepTitle = loopspaceGraphMessageChildTitle(stepNode, itemIndex);
 	                                const stepSubtitle = loopspaceGraphMessageChildSubtitle(stepNode, itemIndex);
 		                                const flowInputPorts = loopspaceGraphInputPortsForNode(stepNode);
-		                                const flowOutputPorts = loopspaceGraphOutputPortsForNode(stepNode);
+		                                const flowOutputPorts = loopspaceGraphDisplayedOutputPortsForNode(stepNode);
                                 const flowPortY = (portIndex, portCount) => `${loopspaceGraphMessageFlowNodePortY(
                                   stepLayout,
                                   portIndex,
@@ -12071,7 +12222,12 @@ function LoopspaceRuntimeView({
                                       <LoopspaceGraphMessageFlowNodePort
                                         aria-label={`Connect ${port.label} output from ${stepTitle}`}
                                         as="button"
-                                        data-active={pendingConnection?.fromId === stepNode.id && pendingConnection?.fromPort === port.id ? "true" : undefined}
+                                        data-active={
+                                          pendingConnection?.fromId === stepNode.id
+                                          && loopspaceGraphDisplayedOutputPortIdForNode(stepNode, pendingConnection?.fromPort) === port.id
+                                            ? "true"
+                                            : undefined
+                                        }
                                         data-loopspace-graph-port="true"
                                         data-side="output"
                                         key={port.id}
@@ -12385,13 +12541,21 @@ function LoopspaceRuntimeView({
                               role="button"
                               tabIndex={0}
                             >
-                              <LoopspaceRuntimeConsoleIcon data-icon={row.icon}>
+                              <LoopspaceRuntimeConsoleIcon data-animated="true" data-icon={row.icon}>
                                 {row.icon === "completed" ? (
                                   <ButtonCheckIcon aria-hidden="true" />
-                                ) : row.icon === "failed" || row.icon === "interrupted" ? (
+                                ) : row.icon === "failed" ? (
+                                  <ErrorOutline aria-hidden="true" />
+                                ) : row.icon === "cancelled" ? (
                                   <ButtonCloseIcon aria-hidden="true" />
-                                ) : row.icon === "running" || row.icon === "queued" ? (
+                                ) : row.icon === "interrupted" || row.icon === "resume-ready" ? (
+                                  <PauseCircle aria-hidden="true" />
+                                ) : row.icon === "queued" ? (
+                                  <HourglassEmpty aria-hidden="true" />
+                                ) : row.icon === "running" ? (
                                   <PendingIcon aria-hidden="true" />
+                                ) : row.icon === "resuming" ? (
+                                  <Send aria-hidden="true" />
                                 ) : (
                                   <PlayArrow aria-hidden="true" />
                                 )}
@@ -12532,12 +12696,12 @@ function LoopspaceRuntimeView({
 	                            data-kind={row.kind || "loop"}
 	                            data-runtime={row.runtimeTone || undefined}
 	                            key={row.id}
-	                            onClick={() => openLoopspaceGraphNodeSettings(row.node)}
-	                            onKeyDown={(event) => {
-	                              if (event.key === "Enter" || event.key === " ") {
-	                                event.preventDefault();
-	                                openLoopspaceGraphNodeSettings(row.node);
-	                              }
+		                            onClick={() => centerLoopspaceGraphOnNode(row.node)}
+		                            onKeyDown={(event) => {
+		                              if (event.key === "Enter" || event.key === " ") {
+		                                event.preventDefault();
+		                                centerLoopspaceGraphOnNode(row.node);
+		                              }
 		                            }}
 		                            role="button"
 		                            style={{
@@ -12555,15 +12719,18 @@ function LoopspaceRuntimeView({
 	                              <strong>{row.title}</strong>
 	                              <span>{row.subtitle}</span>
 	                            </LoopspaceRuntimePanelSettingsMain>
-	                            <LoopspaceRuntimePanelSettingsAction
-	                              aria-label={`Open settings for ${row.title}`}
-	                              onClick={(event) => {
-	                                event.stopPropagation();
-	                                openLoopspaceGraphNodeSettings(row.node);
-	                              }}
-	                              title="Settings"
-	                              type="button"
-	                            >
+		                            <LoopspaceRuntimePanelSettingsAction
+		                              aria-label={`Open settings for ${row.title}`}
+		                              onClick={(event) => {
+		                                event.stopPropagation();
+		                                openLoopspaceGraphNodeSettings(row.node);
+		                              }}
+		                              onKeyDown={(event) => {
+		                                event.stopPropagation();
+		                              }}
+		                              title="Settings"
+		                              type="button"
+		                            >
 	                              <ButtonSettingsIcon aria-hidden="true" />
 	                            </LoopspaceRuntimePanelSettingsAction>
 	                          </LoopspaceRuntimePanelSettingsRow>
@@ -12592,7 +12759,8 @@ function LoopspaceRuntimeView({
                     ) : null}
 	                    {visibleRuntimeEvents.map((event) => {
 	                      const selected = selectedRuntimeEvent?.id === event.id;
-	                      const timelineIcon = loopspaceRuntimeEventTimelineIcon(event);
+	                      const logIcon = loopspaceRuntimeLogIcon(event);
+	                      const eventStatusLabel = loopspaceRuntimeEventStatusLabel(event, "Event", { preferRaw: true });
 	                      const detailsText = selected
 	                        ? JSON.stringify(event.details && Object.keys(event.details).length ? event.details : event, null, 2)
 	                        : "";
@@ -12601,7 +12769,6 @@ function LoopspaceRuntimeView({
                           <LoopspaceRuntimeConsoleRow
                             aria-expanded={selected}
 	                            data-clickable="true"
-	                            data-icon={timelineIcon}
 	                            data-selected={selected ? "true" : undefined}
 	                            data-tone={loopspaceRuntimeEventTone(event)}
                             onClick={() => setSelectedHistoryRunId((current) => (current === event.id ? "" : event.id))}
@@ -12614,18 +12781,29 @@ function LoopspaceRuntimeView({
 	                            role="button"
 	                            tabIndex={0}
 	                          >
-	                            <LoopspaceRuntimeConsoleIcon data-icon={timelineIcon}>
-	                              {timelineIcon === "completed" ? (
-	                                <ButtonCheckIcon aria-hidden="true" />
-	                              ) : timelineIcon === "failed" || timelineIcon === "interrupted" ? (
-	                                <ButtonCloseIcon aria-hidden="true" />
-	                              ) : timelineIcon === "running" ? (
-	                                <PendingIcon aria-hidden="true" />
-	                              ) : (
+	                            <LoopspaceRuntimeConsoleIcon data-icon={logIcon}>
+	                              {logIcon === "sent" ? (
+	                                <Send aria-hidden="true" />
+	                              ) : logIcon === "trigger" ? (
+	                                <AdsClick aria-hidden="true" />
+	                              ) : logIcon === "running" ? (
 	                                <PlayArrow aria-hidden="true" />
+	                              ) : logIcon === "queued" ? (
+	                                <HourglassEmpty aria-hidden="true" />
+	                              ) : logIcon === "completed" ? (
+	                                <ButtonCheckIcon aria-hidden="true" />
+	                              ) : logIcon === "failed" ? (
+	                                <ErrorOutline aria-hidden="true" />
+	                              ) : logIcon === "cancelled" ? (
+	                                <ButtonCloseIcon aria-hidden="true" />
+	                              ) : logIcon === "interrupted" ? (
+	                                <PauseCircle aria-hidden="true" />
+	                              ) : (
+	                                <RadioButtonChecked aria-hidden="true" />
 	                              )}
 	                            </LoopspaceRuntimeConsoleIcon>
 	                            <span>{formatLoopspaceRuntimeConsoleTime(event.createdAtMs)}</span>
+	                            <strong>{eventStatusLabel}</strong>
 	                            <em>{event.message || event.status || "Runtime event"}</em>
 	                          </LoopspaceRuntimeConsoleRow>
                           {selected ? (
@@ -16140,22 +16318,6 @@ function getWorkspaceCoordinationTargetsForRoot(targetsByRoot, rootDirectory) {
   return workspaceRootCoordinationTargetRecord(safeRoot)?.targets || [];
 }
 
-function getCloudSqliteResetCheckpointMessage(data) {
-  const backups = Array.isArray(data?.backups) ? data.backups : [];
-  const updatedBackupCount = backups.filter((backup) => backup?.ok && !backup?.skipped).length;
-  const backgroundCheckpoint = data?.background_checkpoint || data?.backgroundCheckpoint || {};
-  if (backgroundCheckpoint?.queued) {
-    return "queued cloud checkpoint refresh";
-  }
-  if (backgroundCheckpoint?.error) {
-    return "could not queue cloud checkpoint refresh";
-  }
-  if (updatedBackupCount > 0) {
-    return "refreshed cloud checkpoint";
-  }
-  return "cloud checkpoint refresh skipped";
-}
-
 function isWindowsSystemRootDirectory(value) {
   const cleaned = cleanWorkspaceRootDirectory(value)
     .replace(/\\/g, "/")
@@ -18612,19 +18774,6 @@ export default function App() {
   const workspaceToolMainPanelRef = useRef(null);
   const appControlLoopspaceCheckpointPlansByRunIdRef = useRef(new Map());
   const appScriptsShelfRef = useRef(null);
-  const [cloudSqliteResetState, setCloudSqliteResetState] = useState("idle");
-  const [cloudSqliteResetMessage, setCloudSqliteResetMessage] = useState("");
-  const [cloudSqliteResetError, setCloudSqliteResetError] = useState("");
-  const [cloudSqliteResetSelectedWorkspaceId, setCloudSqliteResetSelectedWorkspaceId] = useState("");
-  const [cloudSqliteResetSelectedRepoKeys, setCloudSqliteResetSelectedRepoKeys] = useState({});
-  const [cloudRepoCatalogState, setCloudRepoCatalogState] = useState("idle");
-  const [cloudRepoCatalog, setCloudRepoCatalog] = useState(null);
-  const [cloudRepoCatalogError, setCloudRepoCatalogError] = useState("");
-  const [cloudRepoCatalogBusyRepoId, setCloudRepoCatalogBusyRepoId] = useState("");
-  const [cloudRepoCatalogDismissedIds, setCloudRepoCatalogDismissedIds] = useState({});
-  const [tokenomicsCloudResetState, setTokenomicsCloudResetState] = useState("idle");
-  const [tokenomicsCloudResetMessage, setTokenomicsCloudResetMessage] = useState("");
-  const [tokenomicsCloudResetError, setTokenomicsCloudResetError] = useState("");
   const [cloudWorkspaceProgress, setCloudWorkspaceProgress] = useState(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
   const [cloudDesktopDeviceProfile, setCloudDesktopDeviceProfile] = useState(null);
   const [dismissedLowCreditWarningKey, setDismissedLowCreditWarningKey] = useState(
@@ -30599,162 +30748,6 @@ export default function App() {
     selectedWorkspace && workspaceLifecycleSettings.defaultWorkspaceId === selectedWorkspace.id,
   );
   const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
-  const cloudSqliteResetWorkspaces = useMemo(() => {
-    const resetWorkspaces = [];
-    const seen = new Set();
-    workspaces.forEach((workspace) => {
-      const workspaceId = String(workspace?.id || "").trim();
-      if (!workspaceId) {
-        return;
-      }
-      if (seen.has(workspaceId)) {
-        return;
-      }
-      seen.add(workspaceId);
-      const workspaceRoot = (
-        getWorkspaceRootDirectory(workspaceSettings, workspaceId)
-        || defaultWorkingDirectory
-        || ""
-      );
-      resetWorkspaces.push({
-        workspaceId,
-        workspaceName: String(workspace?.name || workspaceId).trim(),
-        workspaceRoot: cleanWorkspaceRootDirectory(workspaceRoot),
-      });
-    });
-    return resetWorkspaces;
-  }, [
-    defaultWorkingDirectory,
-    workspaceSettings,
-    workspaces,
-  ]);
-  const cloudSqliteResetWorkspace = useMemo(() => {
-    const selectedResetWorkspaceId = String(cloudSqliteResetSelectedWorkspaceId || "").trim();
-    const workspaceIdMatches = (workspace, workspaceId) => (
-      String(workspace?.workspaceId || "").trim() === String(workspaceId || "").trim()
-    );
-    return (
-      cloudSqliteResetWorkspaces.find((workspace) => workspaceIdMatches(workspace, selectedResetWorkspaceId))
-      || cloudSqliteResetWorkspaces.find((workspace) => workspaceIdMatches(workspace, selectedWorkspace?.id))
-      || cloudSqliteResetWorkspaces.find((workspace) => workspaceIdMatches(workspace, activatedWorkspace?.id))
-      || cloudSqliteResetWorkspaces.find((workspace) => workspaceIdMatches(workspace, defaultWorkspace?.id))
-      || cloudSqliteResetWorkspaces[0]
-      || null
-    );
-  }, [
-    activatedWorkspace?.id,
-    cloudSqliteResetSelectedWorkspaceId,
-    cloudSqliteResetWorkspaces,
-    defaultWorkspace?.id,
-    selectedWorkspace?.id,
-  ]);
-  const cloudSqliteResetWorkspaceId = String(cloudSqliteResetWorkspace?.workspaceId || "").trim();
-  const cloudSqliteResetWorkspaceName = String(cloudSqliteResetWorkspace?.workspaceName || "").trim();
-  const cloudSqliteResetWorkspaceRoot = cleanWorkspaceRootDirectory(
-    cloudSqliteResetWorkspace?.workspaceRoot || "",
-  );
-  const cloudSqliteResetRepoCards = useMemo(() => {
-    if (!cloudSqliteResetWorkspaceId || !cloudSqliteResetWorkspaceRoot) {
-      return [];
-    }
-    if (!getWorkspaceRootGitRepository(workspaceSettings, cloudSqliteResetWorkspaceId)) {
-      return [];
-    }
-    const repoIdentity = getWorkspaceRootIdentity(cloudSqliteResetWorkspaceRoot);
-    const repoLabel = cloudSqliteResetWorkspaceRoot
-      .split(/[\\/]/u)
-      .filter(Boolean)
-      .pop() || cloudSqliteResetWorkspaceRoot;
-    return [{
-      key: `${cloudSqliteResetWorkspaceId}:${repoIdentity}`,
-      repoIdentity,
-      repoLabel,
-      repoPath: cloudSqliteResetWorkspaceRoot,
-      relativePath: "",
-      target: {
-        hasGit: true,
-        isWorkspaceRoot: true,
-        repoPath: cloudSqliteResetWorkspaceRoot,
-      },
-    }];
-  }, [
-    cloudSqliteResetWorkspaceId,
-    cloudSqliteResetWorkspaceRoot,
-    workspaceSettings,
-  ]);
-  const cloudSqliteResetSelectedRepoCards = useMemo(() => (
-    cloudSqliteResetRepoCards.filter((card) => Boolean(cloudSqliteResetSelectedRepoKeys?.[card.key]))
-  ), [cloudSqliteResetRepoCards, cloudSqliteResetSelectedRepoKeys]);
-  const cloudSqliteResetSelectedRepoCount = cloudSqliteResetSelectedRepoCards.length;
-  const cloudOrphanRepos = useMemo(() => {
-    const repos = Array.isArray(cloudRepoCatalog?.repos) ? cloudRepoCatalog.repos : [];
-    return repos.filter((repo) => {
-      const repoId = String(repo?.repo_id || repo?.repoId || "").trim();
-      if (!repoId || cloudRepoCatalogDismissedIds?.[repoId]) {
-        return false;
-      }
-      return Boolean(repo?.orphan);
-    });
-  }, [cloudRepoCatalog, cloudRepoCatalogDismissedIds]);
-  const isCloudSqliteResetting = cloudSqliteResetState.endsWith("_resetting")
-    || cloudSqliteResetState === "resetting";
-  const isCloudSqliteRepoResetting = cloudSqliteResetState === "repo_resetting"
-    || cloudSqliteResetState === "resetting";
-  const isCloudSqliteWorkspaceResetting = cloudSqliteResetState === "workspace_resetting";
-  const cloudSqliteRepoResetDisabled = isCloudSqliteResetting
-    || !cloudSqliteResetWorkspaceId
-    || cloudSqliteResetSelectedRepoCount === 0;
-  const cloudSqliteWorkspaceResetDisabled = isCloudSqliteResetting
-    || !cloudSqliteResetWorkspaceId
-    || !cloudSqliteResetWorkspaceRoot;
-  const isTokenomicsCloudResetting = tokenomicsCloudResetState === "resetting";
-  const tokenomicsCloudResetDisabled = isTokenomicsCloudResetting
-    || authState !== "authenticated"
-    || !accountIsPaid;
-  useEffect(() => {
-    const nextWorkspaceId = cloudSqliteResetWorkspace?.workspaceId || "";
-    if (nextWorkspaceId !== cloudSqliteResetSelectedWorkspaceId) {
-      setCloudSqliteResetSelectedWorkspaceId(nextWorkspaceId);
-    }
-  }, [cloudSqliteResetSelectedWorkspaceId, cloudSqliteResetWorkspace?.workspaceId]);
-  useEffect(() => {
-    const validKeys = new Set(cloudSqliteResetRepoCards.map((card) => card.key));
-    setCloudSqliteResetSelectedRepoKeys((current) => {
-      const next = {};
-      Object.keys(current || {}).forEach((key) => {
-        if (validKeys.has(key)) {
-          next[key] = true;
-        }
-      });
-      const currentKeys = Object.keys(current || {}).sort();
-      const nextKeys = Object.keys(next).sort();
-      if (
-        currentKeys.length === nextKeys.length
-        && currentKeys.every((key, index) => key === nextKeys[index])
-      ) {
-        return current;
-      }
-      return next;
-    });
-  }, [cloudSqliteResetRepoCards]);
-  const toggleCloudSqliteResetRepoCard = useCallback((repoKey) => {
-    if (isCloudSqliteResetting) {
-      return;
-    }
-    const key = String(repoKey || "").trim();
-    if (!key) {
-      return;
-    }
-    setCloudSqliteResetSelectedRepoKeys((current) => {
-      const next = { ...(current || {}) };
-      if (next[key]) {
-        delete next[key];
-      } else {
-        next[key] = true;
-      }
-      return next;
-    });
-  }, [isCloudSqliteResetting]);
   const activeAppTheme = normalizeAppTheme(appAppearanceSettings.theme);
   const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && selectedWorkspace);
   const workspaceGitPullSelectedPaths = useMemo(
@@ -31240,209 +31233,6 @@ export default function App() {
     : {};
   const activatedArchitectureRepositoryScanState = activatedWorkspaceGraphState.architectureRepositoryScanState || "idle";
   const activatedArchitectureRepositoryScanSnapshot = activatedWorkspaceGraphState.architectureRepositoryScanSnapshot || null;
-
-  const resetSelectedRepoServerStates = useCallback(async () => {
-    setCloudSqliteResetMessage("");
-    setCloudSqliteResetError("");
-
-    if (!cloudSqliteResetWorkspaceId || cloudSqliteResetSelectedRepoCards.length === 0) {
-      setCloudSqliteResetError("Select at least one repository before resetting server state.");
-      return;
-    }
-
-    const repoCount = cloudSqliteResetSelectedRepoCards.length;
-    const confirmed = window.confirm(
-      `Reset server state for ${repoCount} selected repositor${repoCount === 1 ? "y" : "ies"} in ${cloudSqliteResetWorkspaceName || "this workspace"}? Devices, billing history, and tokenomics are preserved.`,
-    );
-    if (!confirmed) {
-      return;
-    }
-
-    setCloudSqliteResetState("repo_resetting");
-    try {
-      const checkpointMessages = [];
-      const failures = [];
-      let completedCount = 0;
-      for (const [repoIndex, repoCard] of cloudSqliteResetSelectedRepoCards.entries()) {
-        setCloudSqliteResetMessage(
-          `Resetting ${repoCard.repoLabel} (${repoIndex + 1}/${repoCount})...`,
-        );
-        try {
-          const response = await invoke("cloud_mcp_reset_server_state", {
-            repoPath: repoCard.repoPath,
-            workspaceId: cloudSqliteResetWorkspaceId,
-            workspaceName: cloudSqliteResetWorkspaceName || null,
-            resetScope: "repo",
-          });
-          checkpointMessages.push(getCloudSqliteResetCheckpointMessage(unwrapCloudCommandData(response, {})));
-          completedCount += 1;
-        } catch (error) {
-          failures.push(`${repoCard.repoLabel}: ${getErrorMessage(error, "reset failed")}`);
-        }
-      }
-      const checkpointMessage = checkpointMessages.find((message) => message === "queued cloud checkpoint refresh")
-        || checkpointMessages.find((message) => message === "refreshed cloud checkpoint")
-        || checkpointMessages[0]
-        || "cloud checkpoint refresh skipped";
-      if (completedCount > 0) {
-        setCloudSqliteResetMessage(
-          `Server state reset complete for ${completedCount}/${repoCount} repositor${repoCount === 1 ? "y" : "ies"}; ${checkpointMessage}. Devices, billing, and tokenomics were preserved.`,
-        );
-      } else {
-        setCloudSqliteResetMessage("");
-      }
-      if (failures.length > 0) {
-        setCloudSqliteResetError(`Some repositories failed to reset — ${failures.join("; ")}`);
-      }
-    } catch (error) {
-      setCloudSqliteResetError(getErrorMessage(error, "Unable to reset selected repositories."));
-    } finally {
-      setCloudSqliteResetState("idle");
-    }
-  }, [
-    cloudSqliteResetSelectedRepoCards,
-    cloudSqliteResetWorkspaceId,
-    cloudSqliteResetWorkspaceName,
-  ]);
-
-  const loadCloudRepoCatalog = useCallback(async () => {
-    setCloudRepoCatalogState("loading");
-    setCloudRepoCatalogError("");
-    try {
-      const response = await invoke("cloud_mcp_account_repo_catalog");
-      const data = unwrapCloudCommandData(response, {});
-      setCloudRepoCatalog(data && typeof data === "object" ? data : {});
-      setCloudRepoCatalogState("ready");
-    } catch (error) {
-      setCloudRepoCatalogError(getErrorMessage(error, "Unable to load the cloud repo catalog."));
-      setCloudRepoCatalogState("error");
-    }
-  }, []);
-
-  const deleteOrphanCloudRepo = useCallback(async (repo) => {
-    const repoId = String(repo?.repo_id || repo?.repoId || "").trim();
-    if (!repoId) {
-      return;
-    }
-    const repoLabel = String(
-      repo?.git_repo_display_name || repo?.gitRepoDisplayName || repoId,
-    ).trim();
-    const stateTotal = Number(repo?.state_total ?? repo?.stateTotal ?? 0) || 0;
-    const confirmed = window.confirm(
-      `Delete "${repoLabel}" from the cloud? ${stateTotal} stored row${stateTotal === 1 ? "" : "s"} of repo state and its registration will be removed. Devices, billing, and tokenomics are preserved. Local files are not touched.`,
-    );
-    if (!confirmed) {
-      return;
-    }
-    // Cloud artifacts are keyed by workspace, so target the workspace this
-    // repo was last recorded under rather than the currently selected one.
-    const recordedWorkspaceId = (Array.isArray(repo?.workspaces) ? repo.workspaces : [])
-      .map((workspace) => String(workspace?.workspace_id || workspace?.workspaceId || "").trim())
-      .find(Boolean)
-      || cloudSqliteResetWorkspaceId;
-    setCloudRepoCatalogBusyRepoId(repoId);
-    setCloudRepoCatalogError("");
-    try {
-      await invoke("cloud_mcp_reset_server_state", {
-        repoPath: cloudSqliteResetWorkspaceRoot || defaultWorkingDirectoryRef.current || "",
-        workspaceId: recordedWorkspaceId || cloudSqliteResetWorkspaceId,
-        workspaceName: null,
-        resetScope: "repo_delete",
-        repoIdOverride: repoId,
-      });
-      setCloudRepoCatalog((current) => {
-        if (!current || !Array.isArray(current.repos)) {
-          return current;
-        }
-        return {
-          ...current,
-          repos: current.repos.filter((entry) => (
-            String(entry?.repo_id || entry?.repoId || "").trim() !== repoId
-          )),
-        };
-      });
-    } catch (error) {
-      setCloudRepoCatalogError(getErrorMessage(error, `Unable to delete ${repoLabel} from the cloud.`));
-    } finally {
-      setCloudRepoCatalogBusyRepoId("");
-    }
-  }, [
-    cloudSqliteResetWorkspaceId,
-    cloudSqliteResetWorkspaceRoot,
-  ]);
-
-  const dismissOrphanCloudRepo = useCallback((repoId) => {
-    const key = String(repoId || "").trim();
-    if (!key) {
-      return;
-    }
-    setCloudRepoCatalogDismissedIds((current) => ({ ...(current || {}), [key]: true }));
-  }, []);
-
-  const resetWorkspaceServerState = useCallback(async () => {
-    setCloudSqliteResetMessage("");
-    setCloudSqliteResetError("");
-
-    if (!cloudSqliteResetWorkspaceId || !cloudSqliteResetWorkspaceRoot) {
-      setCloudSqliteResetError("Choose a workspace before resetting workspace server state.");
-      return;
-    }
-
-    const confirmed = window.confirm(
-      `Reset workspace server state for ${cloudSqliteResetWorkspaceName || "this workspace"}? Workspace todos and plans are cleared. Devices, billing history, and tokenomics are preserved.`,
-    );
-    if (!confirmed) {
-      return;
-    }
-
-    setCloudSqliteResetState("workspace_resetting");
-    try {
-      const response = await invoke("cloud_mcp_reset_server_state", {
-        repoPath: cloudSqliteResetWorkspaceRoot,
-        workspaceId: cloudSqliteResetWorkspaceId,
-        workspaceName: cloudSqliteResetWorkspaceName || null,
-        resetScope: "workspace",
-      });
-      const data = unwrapCloudCommandData(response, {});
-      const checkpointMessage = getCloudSqliteResetCheckpointMessage(data);
-      setCloudSqliteResetMessage(
-        `Workspace server state reset complete for ${cloudSqliteResetWorkspaceName || "workspace"}; ${checkpointMessage}. Devices, billing, and tokenomics were preserved.`,
-      );
-    } catch (error) {
-      setCloudSqliteResetError(getErrorMessage(error, "Unable to reset workspace server state."));
-    } finally {
-      setCloudSqliteResetState("idle");
-    }
-  }, [
-    cloudSqliteResetWorkspaceId,
-    cloudSqliteResetWorkspaceName,
-    cloudSqliteResetWorkspaceRoot,
-  ]);
-
-  const resetCurrentDeviceTokenomicsCloud = useCallback(async () => {
-    setTokenomicsCloudResetMessage("");
-    setTokenomicsCloudResetError("");
-
-    if (authState !== "authenticated" || !accountIsPaid) {
-      setTokenomicsCloudResetError("Sign in with an active paid account before resetting cloud Tokenomics.");
-      return;
-    }
-
-    const confirmed = window.confirm("Reset cloud Tokenomics for this device only and resync?");
-    if (!confirmed) {
-      return;
-    }
-
-    setTokenomicsCloudResetState("resetting");
-    try {
-      await invoke("cloud_mcp_reset_device_tokenomics");
-      setTokenomicsCloudResetMessage("Device Tokenomics reset; full resync queued.");
-    } catch (error) {
-      setTokenomicsCloudResetError(getErrorMessage(error, "Unable to reset this device's cloud Tokenomics."));
-    } finally {
-      setTokenomicsCloudResetState("idle");
-    }
-  }, [authState, user]);
 
   useEffect(() => {
     if (!hasSelectedWorkspace && SELECTED_WORKSPACE_DETAIL_VIEWS.has(activeView)) {
@@ -42368,7 +42158,7 @@ export default function App() {
                           title="Web"
                           type="button"
                         >
-                          <ButtonBrowserIcon aria-hidden="true" />
+                          <ButtonWebIcon aria-hidden="true" />
                           <span>Web</span>
                         </RailActionButton>
                         <RailActionButton
@@ -43541,211 +43331,6 @@ export default function App() {
                       </AccountCard>
 
                     </AccountSettingsPanel>
-
-                    <AccountSettingsPanel>
-                    <PanelHeaderRow>
-                      <div>
-                        <PanelKicker>Cloud maintenance</PanelKicker>
-                        <PanelHeading>Server state reset</PanelHeading>
-                      </div>
-                    </PanelHeaderRow>
-
-                    <AccountCard data-tone="orange">
-                      <AccountCardHeader>
-                        <div>
-                          <SettingsLabel>Reset</SettingsLabel>
-                          <SettingsValue>Reset server state</SettingsValue>
-                          <SettingsHint>
-                            Clear cloud runtime state for a repository or workspace while preserving devices, billing, and tokenomics.
-                          </SettingsHint>
-                        </div>
-                        <AgentReadyPill data-tone="orange">
-                          {isCloudSqliteResetting ? (
-                            <PendingIcon aria-hidden="true" />
-                          ) : (
-                            <ButtonRefreshIcon aria-hidden="true" />
-                          )}
-                          <span>{isCloudSqliteResetting ? "Resetting" : "Preserved"}</span>
-                        </AgentReadyPill>
-                      </AccountCardHeader>
-
-                      <SetupField>
-                        <SettingsLabel>Workspace</SettingsLabel>
-                        <WorkspaceSettingsSelectShell>
-                          <WorkspaceSettingsSelect
-                            disabled={isCloudSqliteResetting || cloudSqliteResetWorkspaces.length === 0}
-                            onChange={(event) => {
-                              setCloudSqliteResetSelectedWorkspaceId(event.target.value);
-                              setCloudSqliteResetSelectedRepoKeys({});
-                            }}
-                            value={cloudSqliteResetWorkspaceId}
-                          >
-                            {cloudSqliteResetWorkspaces.length === 0 ? (
-                              <option value="">No workspaces found</option>
-                            ) : cloudSqliteResetWorkspaces.filter(Boolean).map((workspace) => (
-                              <option key={workspace.workspaceId} value={workspace.workspaceId}>
-                                {workspace.workspaceName}
-                              </option>
-                            ))}
-                          </WorkspaceSettingsSelect>
-                          <WorkspaceSettingsSelectIcon aria-hidden="true" />
-                        </WorkspaceSettingsSelectShell>
-                        <SettingsHint>
-                          {cloudSqliteResetWorkspaceRoot || "Add or sync a workspace to reset its server state."}
-                        </SettingsHint>
-                      </SetupField>
-
-                      <SetupField>
-                        <SettingsLabel>Repositories</SettingsLabel>
-                        {cloudSqliteResetRepoCards.length > 0 ? (
-                          <SettingsRepoGrid>
-                            {cloudSqliteResetRepoCards.map((repoCard) => {
-                              const selected = Boolean(cloudSqliteResetSelectedRepoKeys?.[repoCard.key]);
-                              return (
-                                <SettingsRepoCard
-                                  data-selected={selected ? "true" : "false"}
-                                  disabled={isCloudSqliteResetting}
-                                  key={repoCard.key}
-                                  onClick={() => toggleCloudSqliteResetRepoCard(repoCard.key)}
-                                  type="button"
-                                >
-                                  {selected ? <ButtonCheckIcon aria-hidden="true" /> : <ButtonCodeIcon aria-hidden="true" />}
-                                  <strong>{repoCard.repoLabel}</strong>
-                                  <span>{repoCard.relativePath || repoCard.repoPath}</span>
-                                </SettingsRepoCard>
-                              );
-                            })}
-                          </SettingsRepoGrid>
-                        ) : (
-                          <SettingsHint>
-                            No repositories cached for this workspace yet. Open the workspace to refresh the scan.
-                          </SettingsHint>
-                        )}
-                      </SetupField>
-
-                      {cloudSqliteResetError && <FormMessage $state="error">{cloudSqliteResetError}</FormMessage>}
-                      {cloudSqliteResetMessage && (
-                        <AgentInstallMessage data-tone="success">
-                          {cloudSqliteResetMessage}
-                        </AgentInstallMessage>
-                      )}
-
-                      <AccountCardFooter>
-                        <SettingsHint>
-                          {cloudSqliteResetSelectedRepoCount > 0
-                            ? `${cloudSqliteResetSelectedRepoCount} repositor${cloudSqliteResetSelectedRepoCount === 1 ? "y" : "ies"} selected.`
-                            : "Select repository cards to reset repo server state."}
-                        </SettingsHint>
-                        <PrimaryDangerButton
-                          disabled={cloudSqliteRepoResetDisabled}
-                          onClick={resetSelectedRepoServerStates}
-                          type="button"
-                        >
-                          {isCloudSqliteRepoResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                          <span>{isCloudSqliteRepoResetting ? "Resetting..." : "Reset selected repos"}</span>
-                        </PrimaryDangerButton>
-                      </AccountCardFooter>
-                      <AccountCardFooter>
-                        <SettingsHint>
-                          Workspace reset clears workspace todos and plans; devices, billing, and tokenomics stay preserved.
-                        </SettingsHint>
-                        <PrimaryDangerButton
-                          disabled={cloudSqliteWorkspaceResetDisabled}
-                          onClick={resetWorkspaceServerState}
-                          type="button"
-                        >
-                          {isCloudSqliteWorkspaceResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                          <span>{isCloudSqliteWorkspaceResetting ? "Resetting..." : "Reset workspace state"}</span>
-                        </PrimaryDangerButton>
-                      </AccountCardFooter>
-                      <SetupField>
-                        <SettingsLabel>Cloud repos without a workspace</SettingsLabel>
-                        {cloudRepoCatalogState === "idle" ? (
-                          <SettingsHint>
-                            Load the account repo catalog to find cloud repo state that no
-                            workspace references, then keep or delete each repo.
-                          </SettingsHint>
-                        ) : null}
-                        {cloudRepoCatalogState === "ready" && cloudOrphanRepos.length === 0 ? (
-                          <SettingsHint>
-                            All cloud repo state is attached to a workspace.
-                          </SettingsHint>
-                        ) : null}
-                        {cloudOrphanRepos.map((repo) => {
-                          const repoId = String(repo?.repo_id || repo?.repoId || "").trim();
-                          const repoLabel = String(
-                            repo?.git_repo_display_name || repo?.gitRepoDisplayName || repoId,
-                          ).trim();
-                          const stateTotal = Number(repo?.state_total ?? repo?.stateTotal ?? 0) || 0;
-                          const lastWorkspaceName = (Array.isArray(repo?.workspaces) ? repo.workspaces : [])
-                            .map((workspace) => String(workspace?.workspace_name || workspace?.workspaceName || "").trim())
-                            .find(Boolean);
-                          const isBusy = cloudRepoCatalogBusyRepoId === repoId;
-                          return (
-                            <AccountCardFooter key={repoId}>
-                              <SettingsHint>
-                                {repoLabel}
-                                {lastWorkspaceName ? ` — last seen in "${lastWorkspaceName}"` : ""}
-                                {` · ${stateTotal} stored row${stateTotal === 1 ? "" : "s"}`}
-                              </SettingsHint>
-                              <SecondaryButton
-                                disabled={isBusy}
-                                onClick={() => dismissOrphanCloudRepo(repoId)}
-                                type="button"
-                              >
-                                <span>Keep</span>
-                              </SecondaryButton>
-                              <PrimaryDangerButton
-                                disabled={Boolean(cloudRepoCatalogBusyRepoId)}
-                                onClick={() => deleteOrphanCloudRepo(repo)}
-                                type="button"
-                              >
-                                {isBusy ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                                <span>{isBusy ? "Deleting..." : "Delete from cloud"}</span>
-                              </PrimaryDangerButton>
-                            </AccountCardFooter>
-                          );
-                        })}
-                        {cloudRepoCatalogError && <FormMessage $state="error">{cloudRepoCatalogError}</FormMessage>}
-                        <AccountCardFooter>
-                          <SettingsHint>
-                            {cloudRepoCatalogState === "ready"
-                              ? `${cloudOrphanRepos.length} unattached repo${cloudOrphanRepos.length === 1 ? "" : "s"} in the cloud.`
-                              : "Repos synced to the cloud but missing from every workspace."}
-                          </SettingsHint>
-                          <SecondaryButton
-                            disabled={cloudRepoCatalogState === "loading"}
-                            onClick={loadCloudRepoCatalog}
-                            type="button"
-                          >
-                            {cloudRepoCatalogState === "loading" ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                            <span>{cloudRepoCatalogState === "loading" ? "Loading..." : cloudRepoCatalogState === "ready" ? "Refresh cloud repos" : "Load cloud repos"}</span>
-                          </SecondaryButton>
-                        </AccountCardFooter>
-                      </SetupField>
-
-                      <AccountCardFooter>
-                        <SettingsHint>
-                          Tokenomics: reset this device only, then resync.
-                        </SettingsHint>
-                        <PrimaryDangerButton
-                          disabled={tokenomicsCloudResetDisabled}
-                          onClick={resetCurrentDeviceTokenomicsCloud}
-                          type="button"
-                        >
-                          {isTokenomicsCloudResetting ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                          <span>{isTokenomicsCloudResetting ? "Resetting..." : "Reset Tokenomics"}</span>
-                        </PrimaryDangerButton>
-                      </AccountCardFooter>
-                      {tokenomicsCloudResetError && <FormMessage $state="error">{tokenomicsCloudResetError}</FormMessage>}
-                      {tokenomicsCloudResetMessage && (
-                        <AgentInstallMessage data-tone="success">
-                          {tokenomicsCloudResetMessage}
-                        </AgentInstallMessage>
-                      )}
-                    </AccountCard>
-                  </AccountSettingsPanel>
-
                   <AccountSettingsPanel>
                     <PanelHeaderRow>
                       <div>

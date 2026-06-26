@@ -1,6 +1,5 @@
-import { LogicalPosition, LogicalSize } from "@tauri-apps/api/dpi";
-import { Webview } from "@tauri-apps/api/webview";
-import { getCurrentWindow } from "@tauri-apps/api/window";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
@@ -14,6 +13,8 @@ import { Search } from "@styled-icons/material-rounded/Search";
 const DEFAULT_WEB_URL = "https://www.google.com";
 const SEARCH_URL = "https://www.google.com/search?q=";
 const LOCAL_HOST_PATTERN = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?(?:[/?#]|$)/i;
+const WORKSPACE_WEBVIEW_LOAD_EVENT = "workspace-webview-load";
+const NATIVE_LOAD_TIMEOUT_MS = 12000;
 
 function hasTauriRuntime() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
@@ -81,49 +82,17 @@ function hostForUrl(url) {
   }
 }
 
-function waitForWebviewCreated(webview) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    let unlistenCreated = null;
-    let unlistenError = null;
-    const timeout = window.setTimeout(() => {
-      finish("created");
-    }, 5000);
-
-    const cleanup = () => {
-      window.clearTimeout(timeout);
-      if (typeof unlistenCreated === "function") {
-        unlistenCreated();
-      }
-      if (typeof unlistenError === "function") {
-        unlistenError();
-      }
-    };
-
-    const finish = (kind, payload) => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      cleanup();
-      if (kind === "error") {
-        reject(payload);
-      } else {
-        resolve();
-      }
-    };
-
-    Promise.resolve(webview.once("tauri://created", () => finish("created")))
-      .then((unlisten) => {
-        unlistenCreated = unlisten;
-      })
-      .catch((error) => finish("error", error));
-    Promise.resolve(webview.once("tauri://error", (event) => finish("error", event?.payload || event)))
-      .then((unlisten) => {
-        unlistenError = unlisten;
-      })
-      .catch((error) => finish("error", error));
-  });
+function viewportNativeRect(viewport) {
+  if (!viewport) {
+    return null;
+  }
+  const rect = viewport.getBoundingClientRect();
+  return {
+    height: Math.max(0, Math.round(rect.height)),
+    width: Math.max(0, Math.round(rect.width)),
+    x: Math.max(0, Math.round(rect.left)),
+    y: Math.max(0, Math.round(rect.top)),
+  };
 }
 
 export default function WebWorkspaceView({ workspace }) {
@@ -135,9 +104,11 @@ export default function WebWorkspaceView({ workspace }) {
   const [nativeEnabled, setNativeEnabled] = useState(() => hasTauriRuntime());
   const [nativeStatus, setNativeStatus] = useState("idle");
   const viewportRef = useRef(null);
-  const nativeWebviewRef = useRef(null);
+  const nativeLabelRef = useRef("");
   const nativeGenerationRef = useRef(0);
   const nativeRectRef = useRef("");
+  const nativeStatusRef = useRef("idle");
+  const nativeTimeoutRef = useRef(0);
   const mountedRef = useRef(false);
 
   const currentUrl = history[historyIndex] || DEFAULT_WEB_URL;
@@ -156,42 +127,67 @@ export default function WebWorkspaceView({ workspace }) {
     setAddressValue(currentUrl);
   }, [currentUrl]);
 
-  const closeNativeWebview = useCallback(async () => {
-    const webview = nativeWebviewRef.current;
-    nativeWebviewRef.current = null;
-    nativeRectRef.current = "";
-    nativeGenerationRef.current += 1;
-    if (!webview) {
-      return;
+  useEffect(() => {
+    nativeStatusRef.current = nativeStatus;
+  }, [nativeStatus]);
+
+  const clearNativeLoadTimeout = useCallback(() => {
+    if (nativeTimeoutRef.current) {
+      window.clearTimeout(nativeTimeoutRef.current);
+      nativeTimeoutRef.current = 0;
     }
-    await webview.hide().catch(() => {});
-    await webview.close().catch(() => {});
   }, []);
 
-  const fitNativeWebview = useCallback(async (webview = nativeWebviewRef.current) => {
+  const closeNativeWebview = useCallback(async (label = nativeLabelRef.current) => {
+    clearNativeLoadTimeout();
+    const safeLabel = String(label || "").trim();
+    if (nativeLabelRef.current === safeLabel) {
+      nativeLabelRef.current = "";
+    }
+    nativeRectRef.current = "";
+    nativeGenerationRef.current += 1;
+    if (!safeLabel || !hasTauriRuntime()) {
+      return;
+    }
+    await invoke("workspace_webview_close", { label: safeLabel }).catch(() => {});
+  }, [clearNativeLoadTimeout]);
+
+  const fitNativeWebview = useCallback(async (label = nativeLabelRef.current, visible = nativeStatusRef.current === "ready") => {
     const viewport = viewportRef.current;
-    if (!webview || !viewport || !nativeEnabled) {
+    const safeLabel = String(label || "").trim();
+    if (!safeLabel || !viewport || !nativeEnabled || !hasTauriRuntime()) {
       return false;
     }
 
-    const rect = viewport.getBoundingClientRect();
-    const width = Math.max(0, Math.round(rect.width));
-    const height = Math.max(0, Math.round(rect.height));
-    const x = Math.max(0, Math.round(rect.left));
-    const y = Math.max(0, Math.round(rect.top));
-
-    if (width < 24 || height < 24) {
-      await webview.hide().catch(() => {});
+    const rect = viewportNativeRect(viewport);
+    if (!rect) {
       return false;
     }
 
-    const rectKey = `${x}:${y}:${width}:${height}`;
+    if (rect.width < 24 || rect.height < 24) {
+      await invoke("workspace_webview_fit", {
+        height: rect.height,
+        label: safeLabel,
+        visible: false,
+        width: rect.width,
+        x: rect.x,
+        y: rect.y,
+      }).catch(() => {});
+      return false;
+    }
+
+    const rectKey = `${rect.x}:${rect.y}:${rect.width}:${rect.height}:${visible ? "show" : "hide"}`;
     if (nativeRectRef.current !== rectKey) {
       nativeRectRef.current = rectKey;
-      await webview.setPosition(new LogicalPosition(x, y));
-      await webview.setSize(new LogicalSize(width, height));
+      await invoke("workspace_webview_fit", {
+        height: rect.height,
+        label: safeLabel,
+        visible,
+        width: rect.width,
+        x: rect.x,
+        y: rect.y,
+      });
     }
-    await webview.show().catch(() => {});
     return true;
   }, [nativeEnabled]);
 
@@ -205,62 +201,109 @@ export default function WebWorkspaceView({ workspace }) {
       return false;
     }
 
-    const rect = viewport.getBoundingClientRect();
-    if (rect.width < 24 || rect.height < 24) {
+    const rect = viewportNativeRect(viewport);
+    if (!rect || rect.width < 24 || rect.height < 24) {
       return false;
     }
 
     const generation = nativeGenerationRef.current + 1;
     nativeGenerationRef.current = generation;
-    const previousWebview = nativeWebviewRef.current;
-    nativeWebviewRef.current = null;
-    nativeRectRef.current = "";
-    if (previousWebview) {
-      await previousWebview.hide().catch(() => {});
-      await previousWebview.close().catch(() => {});
-    }
-
-    const width = Math.max(24, Math.round(rect.width));
-    const height = Math.max(24, Math.round(rect.height));
+    const previousLabel = nativeLabelRef.current;
     const label = webviewLabelForWorkspace(workspace, generation);
+    nativeLabelRef.current = label;
+    nativeRectRef.current = "";
+    clearNativeLoadTimeout();
+    if (previousLabel) {
+      await invoke("workspace_webview_close", { label: previousLabel }).catch(() => {});
+    }
 
     if (mountedRef.current) {
       setNativeStatus("loading");
     }
 
+    nativeTimeoutRef.current = window.setTimeout(() => {
+      if (!mountedRef.current || nativeGenerationRef.current !== generation || nativeLabelRef.current !== label) {
+        return;
+      }
+      nativeLabelRef.current = "";
+      nativeRectRef.current = "";
+      setNativeStatus("fallback");
+      setNativeEnabled(false);
+      void invoke("workspace_webview_close", { label }).catch(() => {});
+    }, NATIVE_LOAD_TIMEOUT_MS);
+
     try {
-      const webview = new Webview(getCurrentWindow(), label, {
+      await invoke("workspace_webview_open", {
+        height: rect.height,
+        label,
         url: targetUrl,
-        x: Math.max(0, Math.round(rect.left)),
-        y: Math.max(0, Math.round(rect.top)),
-        width,
-        height,
-        dragDropEnabled: false,
-        focus: false,
+        width: rect.width,
+        x: rect.x,
+        y: rect.y,
       });
-      nativeWebviewRef.current = webview;
-      await waitForWebviewCreated(webview);
-
-      if (!mountedRef.current || nativeGenerationRef.current !== generation) {
-        await webview.hide().catch(() => {});
-        await webview.close().catch(() => {});
-        return false;
-      }
-
-      await fitNativeWebview(webview);
-      if (mountedRef.current) {
-        setNativeStatus("ready");
-      }
       return true;
     } catch {
       if (mountedRef.current && nativeGenerationRef.current === generation) {
-        nativeWebviewRef.current = null;
+        clearNativeLoadTimeout();
+        nativeLabelRef.current = "";
         setNativeStatus("fallback");
         setNativeEnabled(false);
       }
       return false;
     }
-  }, [fitNativeWebview, nativeEnabled, workspace]);
+  }, [clearNativeLoadTimeout, nativeEnabled, workspace]);
+
+  const retryNativeOnNavigation = useCallback(() => {
+    if (hasTauriRuntime()) {
+      setNativeEnabled(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!hasTauriRuntime()) {
+      return undefined;
+    }
+
+    let disposed = false;
+    let unlistenLoad = null;
+    listen(WORKSPACE_WEBVIEW_LOAD_EVENT, (event) => {
+      const payload = event?.payload || {};
+      const label = String(payload.label || "").trim();
+      if (!label || label !== nativeLabelRef.current) {
+        return;
+      }
+
+      const loadEvent = String(payload.event || "").trim().toLowerCase();
+      if (loadEvent === "started") {
+        nativeStatusRef.current = "loading";
+        setNativeStatus("loading");
+        void fitNativeWebview(label, false).catch(() => {});
+        return;
+      }
+
+      if (loadEvent === "finished") {
+        clearNativeLoadTimeout();
+        nativeStatusRef.current = "ready";
+        setNativeStatus("ready");
+        void fitNativeWebview(label, true).catch(() => {});
+      }
+    })
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenLoad = unlisten;
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      if (typeof unlistenLoad === "function") {
+        unlistenLoad();
+      }
+    };
+  }, [clearNativeLoadTimeout, fitNativeWebview]);
 
   useEffect(() => {
     if (!nativeEnabled) {
@@ -321,6 +364,7 @@ export default function WebWorkspaceView({ workspace }) {
   }, [fitNativeWebview, nativeEnabled]);
 
   const navigateTo = useCallback((targetUrl) => {
+    retryNativeOnNavigation();
     setHistory((previous) => {
       const base = previous.slice(0, historyIndex + 1);
       if (base[base.length - 1] === targetUrl) {
@@ -330,7 +374,7 @@ export default function WebWorkspaceView({ workspace }) {
     });
     setHistoryIndex((history[historyIndex] || "") === targetUrl ? historyIndex : historyIndex + 1);
     setReloadKey((key) => key + 1);
-  }, [history, historyIndex]);
+  }, [history, historyIndex, retryNativeOnNavigation]);
 
   const handleSubmit = useCallback((event) => {
     event.preventDefault();
@@ -345,18 +389,21 @@ export default function WebWorkspaceView({ workspace }) {
 
   const goBack = useCallback(() => {
     setAddressError("");
+    retryNativeOnNavigation();
     setHistoryIndex((index) => Math.max(0, index - 1));
-  }, []);
+  }, [retryNativeOnNavigation]);
 
   const goForward = useCallback(() => {
     setAddressError("");
+    retryNativeOnNavigation();
     setHistoryIndex((index) => Math.min(history.length - 1, index + 1));
-  }, [history.length]);
+  }, [history.length, retryNativeOnNavigation]);
 
   const refresh = useCallback(() => {
     setAddressError("");
+    retryNativeOnNavigation();
     setReloadKey((key) => key + 1);
-  }, []);
+  }, [retryNativeOnNavigation]);
 
   const openCurrentExternally = useCallback(() => {
     openUrl(currentUrl).catch(() => {

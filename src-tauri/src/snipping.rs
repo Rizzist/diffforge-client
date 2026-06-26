@@ -61,7 +61,7 @@ const SNIPPING_SCREEN_CAPTURE_KIT_STOP_TIMEOUT_MS: u64 = 1_500;
 #[cfg(target_os = "macos")]
 const SNIPPING_SCREEN_CAPTURE_KIT_FRAME_WAIT_MS: u64 = 25;
 #[cfg(target_os = "macos")]
-const SNIPPING_SCREEN_CAPTURE_KIT_FIRST_FRAME_TIMEOUT_MS: u64 = 750;
+const SNIPPING_SCREEN_CAPTURE_KIT_FIRST_FRAME_TIMEOUT_MS: u64 = 2_500;
 #[cfg(target_os = "macos")]
 const SNIPPING_SCREEN_CAPTURE_KIT_QUEUE_DEPTH: isize = 8;
 #[cfg(windows)]
@@ -2305,7 +2305,9 @@ fn set_snipping_hide_desktop_icons_for(
     if !request.enabled {
         // Never leave icons hidden when the user turns the feature off
         // mid-capture.
-        snipping_restore_desktop_icons_after_capture(app);
+        if !snipping_recording_active(app) {
+            snipping_restore_desktop_icons_after_capture(app);
+        }
     }
     emit_snipping_shortcuts_changed(app);
     snipping_status_for(app)
@@ -5507,6 +5509,7 @@ fn snipping_recording_loop(
     }
     snipping_clear_recording_if_current(&app, &session_id);
     snipping_hide_recording_controls(&app);
+    snipping_restore_desktop_icons_after_capture(&app);
     snipping_start_warm_capture_if_ready(&app);
 }
 
@@ -5890,6 +5893,19 @@ fn snipping_screen_capture_kit_display_for_monitor(
 }
 
 #[cfg(target_os = "macos")]
+fn snipping_screen_capture_kit_should_exclude_window_title(title: &str) -> bool {
+    matches!(
+        title.trim(),
+        SNIPPING_RECORDING_CONTROLS_TITLE
+            | "Snipping"
+            | "Snip"
+            | "Recent Snips"
+            | "Annotate Snip"
+            | "Annotate Assets"
+    )
+}
+
+#[cfg(target_os = "macos")]
 fn snipping_screen_capture_kit_excluded_windows(
     content: &cidre_sc::ShareableContent,
 ) -> cidre::arc::R<cidre_ns::Array<cidre_sc::Window>> {
@@ -5899,7 +5915,9 @@ fn snipping_screen_capture_kit_excluded_windows(
         .filter(|window| {
             window
                 .title()
-                .is_some_and(|title| title.to_string().trim() == SNIPPING_RECORDING_CONTROLS_TITLE)
+                .is_some_and(|title| {
+                    snipping_screen_capture_kit_should_exclude_window_title(&title.to_string())
+                })
         })
         .map(CidreRetain::retained)
         .collect::<Vec<_>>();
@@ -7847,7 +7865,8 @@ fn snipping_start_area_recording_for(
     snipping_stop_warm_capture(app);
     let setup_result = (|| -> Result<(), String> {
         snipping_clear_area_sessions(app)?;
-        snipping_hide_area_overlay(app);
+        snipping_hide_area_overlay_for_capture(app);
+        snipping_hide_desktop_icons_for_capture(app);
         thread::sleep(Duration::from_millis(
             SNIPPING_CAPTURE_HIDE_OVERLAY_DELAY_MS,
         ));
@@ -7855,6 +7874,7 @@ fn snipping_start_area_recording_for(
     })();
     if let Err(error) = setup_result {
         snipping_hide_recording_controls(app);
+        snipping_restore_desktop_icons_after_capture(app);
         snipping_start_warm_capture_if_ready(app);
         return Err(error);
     }
@@ -7877,6 +7897,7 @@ fn snipping_start_area_recording_for(
             .map_err(|_| "Unable to lock screen recording state.".to_string())?;
         if guard.is_some() {
             snipping_hide_recording_controls(app);
+            snipping_restore_desktop_icons_after_capture(app);
             snipping_start_warm_capture_if_ready(app);
             return Err("A screen recording is already in progress.".to_string());
         }
@@ -8041,6 +8062,7 @@ fn snipping_open_annotation_editor_for_paths(
             .map(|(open_label, open_paths)| (open_label.clone(), open_paths.clone()));
         if let Some((existing_label, existing_paths)) = existing {
             if let Some(window) = app.get_webview_window(&existing_label) {
+                snipping_set_window_capture_exclusion(&window, true);
                 snipping_unminimize_window_now(&window, "focus_existing_editor_unminimize");
                 snipping_show_window_now(&window, "focus_existing_editor_show");
                 snipping_focus_window_now(&window, "focus_existing_editor_focus");
@@ -8146,6 +8168,7 @@ fn snipping_open_annotation_editor_for_paths(
     .shadow(true)
     .build()
     .map_err(|error| format!("Unable to create annotation editor window: {error}"))?;
+    snipping_set_window_capture_exclusion(&window, true);
     {
         let editor_paths = app.state::<SnippingState>().editor_paths.clone();
         let label_for_destroy = label.clone();
@@ -9408,6 +9431,18 @@ fn snipping_area_session_active(app: &AppHandle) -> bool {
         .unwrap_or(false)
 }
 
+fn snipping_area_sessions_include_recording(app: &AppHandle) -> bool {
+    app.state::<SnippingState>()
+        .active_area_sessions
+        .lock()
+        .map(|guard| {
+            guard
+                .values()
+                .any(|session| session.mode == SnippingAreaMode::Recording)
+        })
+        .unwrap_or(false)
+}
+
 struct SnippingAreaBeginGuard {
     generation: u64,
 }
@@ -10035,6 +10070,7 @@ fn snipping_refreeze_area_snapshot_for_space_change(app: &AppHandle) {
     if labels.is_empty() {
         return;
     }
+    let keep_desktop_icons_hidden = snipping_area_sessions_include_recording(app);
     let app = app.clone();
     thread::spawn(move || {
         // Let the Space transition animation settle before re-capturing.
@@ -10061,7 +10097,11 @@ fn snipping_refreeze_area_snapshot_for_space_change(app: &AppHandle) {
             }
             snipping_store_area_snapshot_backdrop(&app, &label, image);
         }
-        snipping_restore_desktop_icons_after_capture(&app);
+        if keep_desktop_icons_hidden {
+            snipping_hide_desktop_icons_for_capture(&app);
+        } else {
+            snipping_restore_desktop_icons_after_capture(&app);
+        }
     });
 }
 
@@ -10211,7 +10251,7 @@ fn snipping_hide_area_overlay_with_desktop_restore(app: &AppHandle, restore_desk
     }
     #[cfg(target_os = "macos")]
     snipping_restore_default_cursor_now();
-    if restore_desktop_icons {
+    if restore_desktop_icons && !snipping_recording_active(app) {
         // Live area sessions hide real desktop icons for the whole selection;
         // teardown (finish, cancel, Escape) is where they come back.
         snipping_restore_desktop_icons_after_capture(app);
@@ -12550,6 +12590,7 @@ fn snipping_build_preview_window(
     .shadow(true)
     .build()
     .map_err(|error| format!("Unable to create snip preview window: {error}"))?;
+    snipping_set_window_capture_exclusion(&window, true);
     #[cfg(target_os = "macos")]
     snipping_preview_apply_macos_space_style(&window);
     // Dragging a preview out of the bottom-left column (or closing one) frees
@@ -12809,6 +12850,7 @@ fn snipping_open_snip_preview_window_for_with_size(
         if let Some(existing) = app.get_webview_window(&existing_label) {
             let was_visible = existing.is_visible().unwrap_or(false);
             let _ = existing.set_size(tauri::LogicalSize::new(width, height));
+            snipping_set_window_capture_exclusion(&existing, true);
             if explicit_position.is_some() || !was_visible {
                 snipping_position_preview_window(app, &existing, explicit_position);
             }
@@ -12838,6 +12880,7 @@ fn snipping_open_snip_preview_window_for_with_size(
     if let Some(window) = snipping_take_pooled_preview_window(app) {
         let pooled_label = window.label().to_string();
         let _ = window.set_size(tauri::LogicalSize::new(width, height));
+        snipping_set_window_capture_exclusion(&window, true);
         snipping_position_preview_window(app, &window, explicit_position);
         if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
             paths.insert(pooled_label.clone(), path_string.clone());
@@ -13336,6 +13379,7 @@ fn snipping_close_snip_strip(app: AppHandle) -> Result<(), String> {
 
 fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     if let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) {
+        snipping_set_window_capture_exclusion(&window, true);
         return Some(window);
     }
     let window = WebviewWindowBuilder::new(
@@ -13361,6 +13405,7 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     .visible(false)
     .build()
     .ok()?;
+    snipping_set_window_capture_exclusion(&window, true);
     {
         let app_for_focus = app.clone();
         window.on_window_event(move |event| {

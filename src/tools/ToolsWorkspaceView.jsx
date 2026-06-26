@@ -91,6 +91,10 @@ const SKILL_DOCUMENT_CANVAS_INLINE_GUTTER_PX = 48;
 const SKILL_DOCUMENT_CANVAS_VERTICAL_GUTTER_PX = 112;
 const SKILL_DOCUMENT_MIN_SCALE = 0.38;
 const SKILL_DOCUMENT_MAX_SCALE = 1.35;
+const SKILL_DOCUMENT_ZOOM_FACTOR_MIN = 0.52;
+const SKILL_DOCUMENT_ZOOM_FACTOR_MAX = 2.8;
+const SKILL_DOCUMENT_ZOOM_STEP = 1.14;
+const SKILL_DOCUMENT_ZOOM_WHEEL_INTENSITY = 0.0014;
 const SKILL_DOCUMENT_PAGE_PADDING_TOP_PX = 52;
 const SKILL_DOCUMENT_PAGE_PADDING_INLINE_PX = 58;
 const SKILL_DOCUMENT_PAGE_PADDING_BOTTOM_PX = 76;
@@ -248,6 +252,12 @@ function clampSkillDocumentScale(value) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return 1;
   return Math.min(SKILL_DOCUMENT_MAX_SCALE, Math.max(SKILL_DOCUMENT_MIN_SCALE, numeric));
+}
+
+function clampSkillDocumentZoomFactor(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 1;
+  return Math.min(SKILL_DOCUMENT_ZOOM_FACTOR_MAX, Math.max(SKILL_DOCUMENT_ZOOM_FACTOR_MIN, numeric));
 }
 
 function roundedDocumentPx(value, min = 0) {
@@ -1734,7 +1744,11 @@ export default function ToolsWorkspaceView({
   });
   const skillDocumentCanvasRef = useRef(null);
   const docsWorkspaceSurfaceRef = useRef(null);
-  const [skillDocumentScale, setSkillDocumentScale] = useState(1);
+  const [skillDocumentFitScale, setSkillDocumentFitScale] = useState(1);
+  const [skillDocumentZoomFactor, setSkillDocumentZoomFactor] = useState(1);
+  const skillDocumentFitScaleRef = useRef(1);
+  const skillDocumentScaleRef = useRef(1);
+  const skillDocumentZoomFactorRef = useRef(1);
   const docsExplorerPanelRef = useRef(null);
   const [docsExplorerCollapsed, setDocsExplorerCollapsed] = useState(false);
   const [docsExplorerSize, setDocsExplorerSize] = useState("238px");
@@ -3854,6 +3868,11 @@ export default function ToolsWorkspaceView({
   const skillEditorBusy = skillsState === "saving" || skillsState === "savingLocal";
   const skillEditorReadOnly = selectedDocumentRefreshing || skillEditorBusy;
   const skillEditorOpen = Boolean(skillEditor);
+  const skillDocumentScale = useMemo(
+    () => clampSkillDocumentScale(skillDocumentFitScale * skillDocumentZoomFactor),
+    [skillDocumentFitScale, skillDocumentZoomFactor],
+  );
+  const skillDocumentZoomLabel = `${Math.round(skillDocumentScale * 100)}%`;
   const skillDocumentMetricsStyle = useMemo(
     () => skillDocumentPageStyle(skillDocumentScale),
     [skillDocumentScale],
@@ -5206,6 +5225,73 @@ export default function ToolsWorkspaceView({
       };
     });
   }, [updateScriptEditorSelection]);
+
+  useEffect(() => {
+    skillDocumentFitScaleRef.current = skillDocumentFitScale;
+    skillDocumentScaleRef.current = skillDocumentScale;
+    skillDocumentZoomFactorRef.current = skillDocumentZoomFactor;
+  }, [skillDocumentFitScale, skillDocumentScale, skillDocumentZoomFactor]);
+
+  const adjustSkillDocumentZoom = useCallback((nextZoomValue, anchor = null) => {
+    const previousZoom = skillDocumentZoomFactorRef.current;
+    const nextZoom = clampSkillDocumentZoomFactor(
+      typeof nextZoomValue === "function" ? nextZoomValue(previousZoom) : nextZoomValue,
+    );
+    if (Math.abs(nextZoom - previousZoom) < 0.001) return;
+
+    const canvas = section === "scripts"
+      ? scriptDocumentCanvasRef.current
+      : skillDocumentCanvasRef.current;
+    const previousScale = skillDocumentScaleRef.current;
+    const nextScale = clampSkillDocumentScale(skillDocumentFitScaleRef.current * nextZoom);
+    const bounds = canvas?.getBoundingClientRect?.();
+    const anchorX = bounds && Number.isFinite(anchor?.clientX)
+      ? anchor.clientX - bounds.left
+      : bounds
+        ? bounds.width / 2
+        : 0;
+    const anchorY = bounds && Number.isFinite(anchor?.clientY)
+      ? anchor.clientY - bounds.top
+      : bounds
+        ? bounds.height / 2
+        : 0;
+    const previousScrollLeft = canvas?.scrollLeft || 0;
+    const previousScrollTop = canvas?.scrollTop || 0;
+
+    setSkillDocumentZoomFactor(nextZoom);
+
+    if (!canvas || !Number.isFinite(previousScale) || previousScale <= 0 || !Number.isFinite(nextScale)) {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      const ratio = nextScale / previousScale;
+      canvas.scrollLeft = ((previousScrollLeft + anchorX) * ratio) - anchorX;
+      canvas.scrollTop = ((previousScrollTop + anchorY) * ratio) - anchorY;
+    });
+  }, [section]);
+
+  const zoomOutSkillDocument = useCallback(() => {
+    adjustSkillDocumentZoom((current) => current / SKILL_DOCUMENT_ZOOM_STEP);
+  }, [adjustSkillDocumentZoom]);
+
+  const zoomInSkillDocument = useCallback(() => {
+    adjustSkillDocumentZoom((current) => current * SKILL_DOCUMENT_ZOOM_STEP);
+  }, [adjustSkillDocumentZoom]);
+
+  const resetSkillDocumentZoom = useCallback(() => {
+    adjustSkillDocumentZoom(1);
+  }, [adjustSkillDocumentZoom]);
+
+  const handleSkillDocumentCanvasWheel = useCallback((event) => {
+    if (!event.ctrlKey && !event.metaKey) return;
+    event.preventDefault();
+    const delta = Number(event.deltaY || 0);
+    adjustSkillDocumentZoom(
+      (current) => current * Math.exp(-delta * SKILL_DOCUMENT_ZOOM_WHEEL_INTENSITY),
+      event,
+    );
+  }, [adjustSkillDocumentZoom]);
+
   useEffect(() => {
     if ((!skillEditorOpen && !scriptsEditorOpen) || typeof window === "undefined") return undefined;
     const canvas = section === "scripts"
@@ -5222,7 +5308,7 @@ export default function ToolsWorkspaceView({
       const widthScale = availableWidth / SKILL_DOCUMENT_A4_WIDTH_PX;
       const heightScale = availableHeight / SKILL_DOCUMENT_A4_HEIGHT_PX;
       const nextScale = clampSkillDocumentScale(Math.min(widthScale, heightScale));
-      setSkillDocumentScale((current) => (
+      setSkillDocumentFitScale((current) => (
         Math.abs(current - nextScale) < 0.005 ? current : nextScale
       ));
     };
@@ -5567,6 +5653,33 @@ export default function ToolsWorkspaceView({
                                 </SkillDocumentThemeButton>
                               ))}
                             </SkillDocumentThemeSwitch>
+                            <SkillDocumentZoomControls aria-label="Document zoom">
+                              <SkillDocumentZoomButton
+                                aria-label="Zoom document out"
+                                disabled={skillDocumentScale <= SKILL_DOCUMENT_MIN_SCALE + 0.001}
+                                onClick={zoomOutSkillDocument}
+                                title="Zoom out"
+                                type="button"
+                              >
+                                <span className="codicon codicon-zoom-out" aria-hidden="true" />
+                              </SkillDocumentZoomButton>
+                              <SkillDocumentZoomValue
+                                onClick={resetSkillDocumentZoom}
+                                title="Reset zoom"
+                                type="button"
+                              >
+                                {skillDocumentZoomLabel}
+                              </SkillDocumentZoomValue>
+                              <SkillDocumentZoomButton
+                                aria-label="Zoom document in"
+                                disabled={skillDocumentScale >= SKILL_DOCUMENT_MAX_SCALE - 0.001}
+                                onClick={zoomInSkillDocument}
+                                title="Zoom in"
+                                type="button"
+                              >
+                                <span className="codicon codicon-zoom-in" aria-hidden="true" />
+                              </SkillDocumentZoomButton>
+                            </SkillDocumentZoomControls>
                           </SkillDocumentToolbarControls>
                           <SkillDocumentToolbarControls data-side="right">
                             <SkillDocumentActions data-placement="toolbar">
@@ -5640,7 +5753,11 @@ export default function ToolsWorkspaceView({
                             </SkillDocumentActions>
                           </SkillDocumentToolbarControls>
                         </SkillDocumentToolbar>
-                        <SkillDocumentCanvas ref={skillDocumentCanvasRef} style={skillDocumentMetricsStyle}>
+                        <SkillDocumentCanvas
+                          onWheel={handleSkillDocumentCanvasWheel}
+                          ref={skillDocumentCanvasRef}
+                          style={skillDocumentMetricsStyle}
+                        >
                           {selectedDocumentRefreshing && (
                             <SkillDocumentRefreshOverlay role="status">
                               <DocsExplorerSpinner aria-hidden="true" />
@@ -6261,6 +6378,33 @@ export default function ToolsWorkspaceView({
                                   </SkillDocumentThemeButton>
                                 ))}
                               </SkillDocumentThemeSwitch>
+                              <SkillDocumentZoomControls aria-label="Script zoom">
+                                <SkillDocumentZoomButton
+                                  aria-label="Zoom script out"
+                                  disabled={skillDocumentScale <= SKILL_DOCUMENT_MIN_SCALE + 0.001}
+                                  onClick={zoomOutSkillDocument}
+                                  title="Zoom out"
+                                  type="button"
+                                >
+                                  <span className="codicon codicon-zoom-out" aria-hidden="true" />
+                                </SkillDocumentZoomButton>
+                                <SkillDocumentZoomValue
+                                  onClick={resetSkillDocumentZoom}
+                                  title="Reset zoom"
+                                  type="button"
+                                >
+                                  {skillDocumentZoomLabel}
+                                </SkillDocumentZoomValue>
+                                <SkillDocumentZoomButton
+                                  aria-label="Zoom script in"
+                                  disabled={skillDocumentScale >= SKILL_DOCUMENT_MAX_SCALE - 0.001}
+                                  onClick={zoomInSkillDocument}
+                                  title="Zoom in"
+                                  type="button"
+                                >
+                                  <span className="codicon codicon-zoom-in" aria-hidden="true" />
+                                </SkillDocumentZoomButton>
+                              </SkillDocumentZoomControls>
                               <ScriptColorField title="Workspace button background">
                                 <span>Work BG</span>
                                 <input
@@ -6357,7 +6501,11 @@ export default function ToolsWorkspaceView({
                               </SkillDocumentActions>
                             </SkillDocumentToolbarControls>
                           </SkillDocumentToolbar>
-                          <SkillDocumentCanvas ref={scriptDocumentCanvasRef} style={skillDocumentMetricsStyle}>
+                          <SkillDocumentCanvas
+                            onWheel={handleSkillDocumentCanvasWheel}
+                            ref={scriptDocumentCanvasRef}
+                            style={skillDocumentMetricsStyle}
+                          >
                             <SkillDocumentPageStack>
                               {scriptEditorPages.map((page) => {
                                 const pageSelection = editorPageSelectionSegments(
@@ -7779,6 +7927,66 @@ const SkillDocumentThemeButton = styled.button`
   }
 `;
 
+const SkillDocumentZoomControls = styled.div`
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--tools-border, rgba(230, 236, 245, 0.12));
+  border-radius: 8px;
+  background: var(--tools-control-bg);
+`;
+
+const SkillDocumentZoomButton = styled.button`
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  color: var(--forge-text-muted, #7a8493);
+  background: transparent;
+  cursor: pointer;
+
+  &:hover:not(:disabled),
+  &:focus-visible:not(:disabled) {
+    color: var(--forge-text, #f4f7fa);
+    background: rgba(var(--forge-accent-soft-rgb), 0.12);
+    outline: none;
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.38;
+  }
+
+  .codicon {
+    font-size: 14px;
+  }
+`;
+
+const SkillDocumentZoomValue = styled.button`
+  min-width: 48px;
+  height: 24px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 6px;
+  color: var(--forge-text-muted, #7a8493);
+  background: transparent;
+  font-size: 10px;
+  font-weight: 820;
+  cursor: pointer;
+
+  &:hover,
+  &:focus-visible {
+    color: var(--forge-text, #f4f7fa);
+    background: rgba(var(--forge-accent-soft-rgb), 0.12);
+    outline: none;
+  }
+`;
+
 const SkillDocumentCanvas = styled.div`
   display: grid;
   position: relative;
@@ -7791,7 +7999,7 @@ const SkillDocumentCanvas = styled.div`
   min-width: 0;
   min-height: 0;
   contain: layout paint;
-  overflow-x: hidden;
+  overflow-x: auto;
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: 24px 24px max(72px, var(--skill-document-page-padding-bottom, 76px));
@@ -7805,7 +8013,7 @@ const SkillDocumentPageStack = styled.div`
   justify-items: center;
   gap: var(--skill-document-page-gap, 34px);
   width: min-content;
-  max-width: 100%;
+  max-width: none;
 `;
 
 const SkillDocumentRefreshOverlay = styled.div`

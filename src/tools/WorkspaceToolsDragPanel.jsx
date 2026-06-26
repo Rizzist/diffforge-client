@@ -399,6 +399,8 @@ const ItemsScroll = styled.div`
   align-content: start;
   min-height: 0;
   overflow-y: auto;
+  padding-top: 3px;
+  scroll-padding-top: 3px;
   scrollbar-width: thin;
 `;
 

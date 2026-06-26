@@ -27,6 +27,7 @@ import { Hub } from "@styled-icons/material-rounded/Hub";
 import { Key } from "@styled-icons/material-rounded/Key";
 import { KeyboardDoubleArrowLeft } from "@styled-icons/material-rounded/KeyboardDoubleArrowLeft";
 import { KeyboardDoubleArrowRight } from "@styled-icons/material-rounded/KeyboardDoubleArrowRight";
+import { Language } from "@styled-icons/material-rounded/Language";
 import { LightMode } from "@styled-icons/material-rounded/LightMode";
 import { Login } from "@styled-icons/material-rounded/Login";
 import { Logout } from "@styled-icons/material-rounded/Logout";
@@ -6184,7 +6185,7 @@ export const LoopspaceGraphMessageSettingsPanel = styled.div`
 
   &[data-layout="tabs"] {
     grid-template-columns: minmax(0, 1fr);
-    grid-template-rows: auto minmax(0, 1fr) auto;
+    grid-template-rows: minmax(0, 1fr) auto;
   }
 
   &[data-layout="resource"] {
@@ -6288,7 +6289,7 @@ export const LoopspaceGraphMessageSettingsSection = styled.div`
   }
 
   ${LoopspaceGraphMessageSettingsPanel}[data-layout="tabs"] &[data-column="steps"] {
-    grid-template-rows: auto minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
   }
 
   ${LoopspaceGraphMessageSettingsPanel}[data-layout="resource"] & {
@@ -6435,13 +6436,15 @@ export const LoopspaceGraphMessageSubnodeList = styled.div`
   }
 
   &[data-orientation="horizontal"] {
+    box-sizing: border-box;
     display: flex;
-    align-items: stretch;
+    align-items: flex-start;
     gap: 8px;
     overflow-x: auto;
     overflow-y: hidden;
     padding-right: 0;
-    padding-bottom: 4px;
+    padding-bottom: 18px;
+    scrollbar-gutter: stable;
   }
 `;
 
@@ -6464,14 +6467,54 @@ export const LoopspaceGraphMessageSubnodeItem = styled.div`
     border-style: dashed;
   }
 
+  &[data-action="add"] {
+    grid-template-columns: minmax(0, 1fr);
+    place-items: center;
+    border-style: dashed;
+    border-color: rgba(var(--loop-node-accent), 0.34);
+    color: rgba(248, 250, 252, 0.78);
+    background:
+      linear-gradient(135deg, rgba(var(--loop-node-accent), 0.1), rgba(255, 255, 255, 0.025)),
+      rgba(2, 6, 8, 0.34);
+    cursor: pointer;
+    font: inherit;
+    text-align: center;
+  }
+
+  &[data-action="add"] ${LoopspaceGraphNodeText} {
+    align-content: center;
+    justify-items: center;
+    text-align: center;
+  }
+
   ${LoopspaceGraphMessageSubnodeList}[data-orientation="horizontal"] & {
     flex: 0 0 min(320px, 78vw);
-    min-height: 100%;
+    min-height: calc(100% - 18px);
+  }
+
+  ${LoopspaceGraphMessageSubnodeList}[data-orientation="horizontal"] &[data-action="add"] {
+    flex-basis: min(220px, 64vw);
   }
 
   ${LoopspaceGraphMessageSubnodeList}[data-orientation="horizontal"] &[data-empty="true"] {
-    flex-basis: min(420px, 88vw);
+    flex-basis: min(320px, 88vw);
     min-height: 92px;
+  }
+
+  &[data-action="add"]:hover,
+  &[data-action="add"]:focus-visible {
+    outline: none;
+    border-color: rgba(var(--loop-node-accent), 0.56);
+    color: #ffffff;
+    background:
+      linear-gradient(135deg, rgba(var(--loop-node-accent), 0.16), rgba(255, 255, 255, 0.04)),
+      rgba(5, 10, 14, 0.58);
+    box-shadow: 0 0 0 2px rgba(var(--loop-node-accent), 0.08);
+  }
+
+  &[data-action="add"]:disabled {
+    cursor: not-allowed;
+    opacity: 0.48;
   }
 
   > button {
@@ -7494,7 +7537,7 @@ export const LoopspaceRuntimePanelSettingsList = styled.div`
 export const LoopspaceRuntimePanelSettingsMain = styled.div`
   display: grid;
   align-content: start;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
   min-height: 0;
 
@@ -7502,7 +7545,7 @@ export const LoopspaceRuntimePanelSettingsMain = styled.div`
     min-width: 0;
     overflow: hidden;
     color: rgba(248, 250, 252, 0.92);
-    font-size: 13px;
+    font-size: 12px;
     font-weight: 880;
     line-height: 1.14;
     text-overflow: ellipsis;
@@ -7514,13 +7557,13 @@ export const LoopspaceRuntimePanelSettingsMain = styled.div`
     overflow: hidden;
     color: rgba(248, 250, 252, 0.52);
     display: -webkit-box;
-    font-size: 10.5px;
+    font-size: 9.5px;
     font-weight: 720;
     line-height: 1.26;
     text-overflow: ellipsis;
     white-space: normal;
     -webkit-box-orient: vertical;
-    -webkit-line-clamp: 3;
+    -webkit-line-clamp: 2;
   }
 `;
 
@@ -7565,13 +7608,13 @@ export const LoopspaceRuntimePanelSettingsRow = styled.div`
   left: var(--loopspace-settings-card-x, 8px);
   box-sizing: border-box;
   display: grid;
-  grid-template-columns: 40px minmax(0, 1fr) 30px;
+  grid-template-columns: 32px minmax(0, 1fr) 28px;
   align-items: start;
-  gap: 11px;
-  width: var(--loopspace-settings-card-width, 260px);
-  height: var(--loopspace-settings-card-height, 161px);
+  gap: 9px;
+  width: var(--loopspace-settings-card-width, 220px);
+  height: var(--loopspace-settings-card-height, 116px);
   min-width: 0;
-  padding: 12px;
+  padding: 10px;
   border: 1px solid rgba(var(--loop-settings-accent), 0.22);
   border-radius: 8px;
   color: #f8fafc;
@@ -7592,15 +7635,15 @@ export const LoopspaceRuntimePanelSettingsRow = styled.div`
   &[data-kind="asset_write"] { --loop-settings-accent: 45, 212, 191; }
 
   ${LoopspaceGraphPaletteIcon} {
-    width: 40px;
-    height: 40px;
+    width: 32px;
+    height: 32px;
     border-color: rgba(var(--loop-settings-accent), 0.28);
     color: rgba(248, 250, 252, 0.82);
     background: rgba(var(--loop-settings-accent), 0.12);
 
     svg {
-      width: 20px;
-      height: 20px;
+      width: 17px;
+      height: 17px;
     }
   }
 
@@ -7619,10 +7662,10 @@ export const LoopspaceRuntimePanelSettingsRow = styled.div`
 
   &[data-runtime]::after {
     position: absolute;
-    top: 13px;
-    right: 54px;
-    width: 8px;
-    height: 8px;
+    top: 11px;
+    right: 48px;
+    width: 7px;
+    height: 7px;
     border-radius: 999px;
     background: rgba(var(--loop-settings-accent), 0.9);
     box-shadow: 0 0 10px rgba(var(--loop-settings-accent), 0.32);
@@ -7667,6 +7710,32 @@ export const LoopspaceRuntimePanelSettingsHeader = styled.div`
   gap: 9px;
   min-width: 0;
   min-height: 30px;
+
+  &[data-trailing="true"] {
+    grid-template-columns: 28px minmax(0, 1fr) auto;
+  }
+
+  > ${LoopspaceGraphMessageSettingsTabList} {
+    justify-self: end;
+    max-width: 100%;
+  }
+
+  @media (max-width: 760px) {
+    &[data-trailing="true"] {
+      grid-template-columns: 28px minmax(72px, 1fr) minmax(0, auto);
+    }
+
+    > ${LoopspaceGraphMessageSettingsTabList} {
+      justify-self: end;
+      max-width: min(100%, 52vw);
+      overflow-x: auto;
+    }
+
+    > ${LoopspaceGraphMessageSettingsTabList} ${LoopspaceGraphMessageSettingsTabButton} {
+      min-width: 64px;
+      padding: 0 8px;
+    }
+  }
 `;
 
 export const LoopspaceRuntimePanelEventList = styled.div`
@@ -7804,6 +7873,7 @@ export const LoopspaceRuntimeConsoleIcon = styled.span`
   display: grid;
   width: 22px;
   height: 22px;
+  isolation: isolate;
   place-items: center;
   border: 1px solid rgba(148, 163, 184, 0.42);
   border-radius: 999px;
@@ -7816,6 +7886,8 @@ export const LoopspaceRuntimeConsoleIcon = styled.span`
     0 0 14px rgba(148, 163, 184, 0.12);
 
   svg {
+    position: relative;
+    z-index: 1;
     width: 13px;
     height: 13px;
   }
@@ -7826,10 +7898,6 @@ export const LoopspaceRuntimeConsoleIcon = styled.span`
     box-shadow:
       0 0 0 3px rgba(5, 6, 8, 0.96),
       0 0 16px rgba(125, 211, 252, 0.18);
-  }
-
-  &[data-icon="running"] svg {
-    animation: loopspaceRuntimeTimelineSpin 820ms linear infinite;
   }
 
   &[data-icon="queued"] {
@@ -7843,12 +7911,56 @@ export const LoopspaceRuntimeConsoleIcon = styled.span`
       0 0 16px rgba(250, 204, 21, 0.14);
   }
 
+  &[data-icon="sent"] {
+    border-color: rgba(96, 165, 250, 0.62);
+    color: rgba(191, 219, 254, 0.96);
+    background:
+      linear-gradient(135deg, rgba(96, 165, 250, 0.16), rgba(255, 255, 255, 0.025)),
+      #07101c;
+    box-shadow:
+      0 0 0 3px rgba(5, 6, 8, 0.96),
+      0 0 16px rgba(96, 165, 250, 0.14);
+  }
+
+  &[data-icon="trigger"] {
+    border-color: rgba(255, 209, 102, 0.62);
+    color: rgba(255, 246, 223, 0.96);
+    background:
+      linear-gradient(135deg, rgba(255, 209, 102, 0.16), rgba(255, 255, 255, 0.025)),
+      #140f05;
+    box-shadow:
+      0 0 0 3px rgba(5, 6, 8, 0.96),
+      0 0 16px rgba(255, 209, 102, 0.14);
+  }
+
   &[data-icon="completed"] {
     border-color: rgba(74, 222, 128, 0.58);
     color: rgba(187, 247, 208, 0.95);
     background:
       linear-gradient(135deg, rgba(74, 222, 128, 0.18), rgba(255, 255, 255, 0.025)),
       #06110c;
+  }
+
+  &[data-icon="resuming"] {
+    border-color: rgba(45, 212, 191, 0.62);
+    color: rgba(153, 246, 228, 0.96);
+    background:
+      linear-gradient(135deg, rgba(45, 212, 191, 0.17), rgba(255, 255, 255, 0.025)),
+      #061312;
+    box-shadow:
+      0 0 0 3px rgba(5, 6, 8, 0.96),
+      0 0 16px rgba(45, 212, 191, 0.14);
+  }
+
+  &[data-icon="resume-ready"] {
+    border-color: rgba(216, 180, 254, 0.68);
+    color: rgba(243, 232, 255, 0.98);
+    background:
+      linear-gradient(135deg, rgba(216, 180, 254, 0.2), rgba(255, 255, 255, 0.025)),
+      #160b22;
+    box-shadow:
+      0 0 0 3px rgba(5, 6, 8, 0.96),
+      0 0 16px rgba(216, 180, 254, 0.14);
   }
 
   &[data-icon="failed"] {
@@ -7859,6 +7971,14 @@ export const LoopspaceRuntimeConsoleIcon = styled.span`
       #150707;
   }
 
+  &[data-icon="cancelled"] {
+    border-color: rgba(251, 146, 60, 0.68);
+    color: rgba(255, 237, 213, 0.98);
+    background:
+      linear-gradient(135deg, rgba(251, 146, 60, 0.2), rgba(255, 255, 255, 0.025)),
+      #170b03;
+  }
+
   &[data-icon="interrupted"] {
     border-color: rgba(192, 132, 252, 0.68);
     color: rgba(233, 213, 255, 0.96);
@@ -7867,14 +7987,319 @@ export const LoopspaceRuntimeConsoleIcon = styled.span`
       #12091b;
   }
 
-  @keyframes loopspaceRuntimeTimelineSpin {
+  &[data-animated="true"]::before,
+  &[data-animated="true"]::after {
+    position: absolute;
+    border-radius: inherit;
+    content: "";
+    pointer-events: none;
+  }
+
+  &[data-animated="true"]::before {
+    inset: -4px;
+    z-index: -1;
+    border: 1px solid rgba(148, 163, 184, 0.22);
+    opacity: 0.72;
+  }
+
+  &[data-animated="true"][data-icon="running"]::before {
+    border-color: rgba(125, 211, 252, 0.42);
+    border-top-color: rgba(186, 230, 253, 0.98);
+    animation: loopspaceRuntimeIconRunning 920ms linear infinite;
+  }
+
+  &[data-animated="true"][data-icon="running"]::after {
+    inset: -7px;
+    border: 1px solid rgba(125, 211, 252, 0.18);
+    animation: loopspaceRuntimeIconRunningHalo 1.45s ease-in-out infinite;
+  }
+
+  &[data-animated="true"][data-icon="queued"]::before {
+    border-style: dashed;
+    border-color: rgba(250, 204, 21, 0.72);
+    animation: loopspaceRuntimeIconQueued 1.05s steps(2, end) infinite;
+  }
+
+  &[data-animated="true"][data-icon="queued"]::after {
+    inset: -8px;
+    border: 1px dotted rgba(250, 204, 21, 0.18);
+    animation: loopspaceRuntimeIconQueuedDots 1.4s ease-in-out infinite;
+  }
+
+  &[data-animated="true"][data-icon="completed"]::before {
+    border-color: rgba(74, 222, 128, 0.52);
+    animation: loopspaceRuntimeIconCompleted 1.8s ease-out infinite;
+  }
+
+  &[data-animated="true"][data-icon="completed"]::after {
+    inset: -9px;
+    border: 1px solid rgba(74, 222, 128, 0.14);
+    animation: loopspaceRuntimeIconCompletedHalo 1.8s ease-out infinite;
+  }
+
+  &[data-animated="true"][data-icon="failed"] {
+    animation: loopspaceRuntimeIconFailedShake 1.1s ease-in-out infinite;
+  }
+
+  &[data-animated="true"][data-icon="failed"]::before {
+    border-color: rgba(248, 113, 113, 0.78);
+    animation: loopspaceRuntimeIconFailedFlash 1.1s ease-in-out infinite;
+  }
+
+  &[data-animated="true"][data-icon="interrupted"]::before {
+    border-color: rgba(192, 132, 252, 0.7);
+    animation: loopspaceRuntimeIconInterrupted 1.25s step-end infinite;
+  }
+
+  &[data-animated="true"][data-icon="interrupted"]::after {
+    inset: 4px;
+    border-left: 2px solid rgba(233, 213, 255, 0.82);
+    border-right: 2px solid rgba(233, 213, 255, 0.82);
+    border-radius: 1px;
+    animation: loopspaceRuntimeIconPauseBars 1.25s step-end infinite;
+  }
+
+  &[data-animated="true"][data-icon="cancelled"]::before {
+    border-color: rgba(251, 146, 60, 0.72);
+    animation: loopspaceRuntimeIconCancelled 1.2s ease-in-out infinite;
+  }
+
+  &[data-animated="true"][data-icon="cancelled"]::after {
+    top: 50%;
+    left: -5px;
+    z-index: 2;
+    width: 32px;
+    height: 2px;
+    border-radius: 999px;
+    background: rgba(255, 237, 213, 0.92);
+    transform: rotate(-38deg) scaleX(0.76);
+    animation: loopspaceRuntimeIconCancelSlash 1.2s ease-in-out infinite;
+  }
+
+  &[data-animated="true"][data-icon="resume-ready"]::before {
+    border-color: rgba(216, 180, 254, 0.66);
+    animation: loopspaceRuntimeIconResumeReady 1.55s ease-in-out infinite;
+  }
+
+  &[data-animated="true"][data-icon="resuming"]::before {
+    border-color: rgba(45, 212, 191, 0.34);
+    border-right-color: rgba(153, 246, 228, 0.98);
+    animation: loopspaceRuntimeIconResuming 1.05s cubic-bezier(0.5, 0, 0.2, 1) infinite;
+  }
+
+  &[data-animated="true"][data-icon="resuming"]::after {
+    inset: -8px;
+    border: 1px solid rgba(45, 212, 191, 0.16);
+    animation: loopspaceRuntimeIconResumingWake 1.05s ease-out infinite;
+  }
+
+  &[data-animated="true"][data-icon="neutral"]::before {
+    animation: loopspaceRuntimeIconNeutral 1.9s ease-in-out infinite;
+  }
+
+  @keyframes loopspaceRuntimeIconRunning {
     to {
       transform: rotate(360deg);
     }
   }
 
+  @keyframes loopspaceRuntimeIconRunningHalo {
+    0%,
+    100% {
+      opacity: 0.24;
+      transform: scale(0.92);
+    }
+
+    50% {
+      opacity: 0.72;
+      transform: scale(1.08);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconQueued {
+    0%,
+    100% {
+      opacity: 0.42;
+      transform: rotate(0deg) scale(0.96);
+    }
+
+    50% {
+      opacity: 0.92;
+      transform: rotate(45deg) scale(1.06);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconQueuedDots {
+    0%,
+    100% {
+      opacity: 0.18;
+      transform: scale(0.9);
+    }
+
+    50% {
+      opacity: 0.58;
+      transform: scale(1.05);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconCompleted {
+    0% {
+      opacity: 0.85;
+      transform: scale(0.86);
+    }
+
+    45% {
+      opacity: 0.28;
+      transform: scale(1.2);
+    }
+
+    100% {
+      opacity: 0;
+      transform: scale(1.36);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconCompletedHalo {
+    0%,
+    100% {
+      opacity: 0.16;
+      transform: scale(0.96);
+    }
+
+    35% {
+      opacity: 0.48;
+      transform: scale(1.08);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconFailedShake {
+    0%,
+    100% {
+      transform: translateX(0);
+    }
+
+    20% {
+      transform: translateX(-1px);
+    }
+
+    40% {
+      transform: translateX(1px);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconFailedFlash {
+    0%,
+    100% {
+      opacity: 0.3;
+      transform: scale(0.96);
+    }
+
+    38% {
+      opacity: 0.95;
+      transform: scale(1.08);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconInterrupted {
+    0%,
+    52%,
+    100% {
+      opacity: 0.38;
+      transform: scale(0.98);
+    }
+
+    24% {
+      opacity: 0.92;
+      transform: scale(1.1);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconPauseBars {
+    0%,
+    52%,
+    100% {
+      opacity: 0;
+    }
+
+    24% {
+      opacity: 0.9;
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconCancelled {
+    0%,
+    100% {
+      opacity: 0.34;
+      transform: scale(1);
+    }
+
+    45% {
+      opacity: 0.86;
+      transform: scale(1.1);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconCancelSlash {
+    0%,
+    100% {
+      opacity: 0.42;
+      transform: rotate(-38deg) scaleX(0.64);
+    }
+
+    45% {
+      opacity: 1;
+      transform: rotate(-38deg) scaleX(1);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconResumeReady {
+    0%,
+    100% {
+      opacity: 0.36;
+      transform: scale(0.94);
+    }
+
+    50% {
+      opacity: 0.88;
+      transform: scale(1.12);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconResuming {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconResumingWake {
+    0% {
+      opacity: 0.58;
+      transform: scale(0.78);
+    }
+
+    100% {
+      opacity: 0;
+      transform: scale(1.26);
+    }
+  }
+
+  @keyframes loopspaceRuntimeIconNeutral {
+    0%,
+    100% {
+      opacity: 0.24;
+      transform: scale(0.96);
+    }
+
+    50% {
+      opacity: 0.5;
+      transform: scale(1.06);
+    }
+  }
+
   @media (prefers-reduced-motion: reduce) {
-    &[data-icon="running"] svg {
+    &[data-animated="true"],
+    &[data-animated="true"]::before,
+    &[data-animated="true"]::after {
       animation: none;
     }
   }
@@ -7883,7 +8308,7 @@ export const LoopspaceRuntimeConsoleIcon = styled.span`
 export const LoopspaceRuntimeConsoleRow = styled.div`
   position: relative;
   display: grid;
-  grid-template-columns: 22px 82px minmax(0, 1fr);
+  grid-template-columns: 22px 82px minmax(86px, 0.2fr) minmax(0, 1fr);
   align-items: center;
   gap: 9px;
   min-width: 0;
@@ -7918,6 +8343,26 @@ export const LoopspaceRuntimeConsoleRow = styled.div`
     background: rgba(127, 29, 29, 0.12);
   }
 
+  &[data-tone="good"] strong {
+    color: rgba(190, 242, 100, 0.9);
+  }
+
+  &[data-tone="active"] strong {
+    color: rgba(186, 230, 253, 0.9);
+  }
+
+  &[data-tone="queued"] strong {
+    color: rgba(254, 240, 138, 0.92);
+  }
+
+  &[data-tone="error"] strong {
+    color: rgba(254, 202, 202, 0.92);
+  }
+
+  &[data-tone="paused"] strong {
+    color: rgba(233, 213, 255, 0.92);
+  }
+
   span,
   strong,
   em {
@@ -7931,6 +8376,14 @@ export const LoopspaceRuntimeConsoleRow = styled.div`
     color: rgba(148, 163, 184, 0.78);
     font-size: 10px;
     font-weight: 720;
+  }
+
+  strong {
+    color: rgba(255, 231, 161, 0.86);
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.01em;
+    text-transform: uppercase;
   }
 
   em {
@@ -21174,6 +21627,10 @@ export const ButtonLoginIcon = styled(Login)`
 `;
 
 export const ButtonBrowserIcon = styled(OpenInBrowser)`
+  ${buttonIconSize}
+`;
+
+export const ButtonWebIcon = styled(Language)`
   ${buttonIconSize}
 `;
 
