@@ -1161,7 +1161,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "queue_todo",
-            "description": "Queue a todo/prompt into a workspace terminal queue from the terminal orchestrator. Pass workspaceId or workspaceName plus text/prompt/message/body/title/task. Omit terminal selectors for the next available terminal, or pass terminalIndex, paneId, targetTerminalId, targetThreadId, or targetTerminalName for a specific terminal. Optional agent/targetAgentId constrains to claude, codex, opencode, or shell. By default this activates the workspace so its queue can receive the item; set openWorkspace=false to avoid switching views.",
+            "description": "Queue a todo/prompt into a workspace terminal queue from the terminal orchestrator. Pass workspaceId or workspaceName plus text/prompt/message/body/title/task. Omit terminal selectors for the next available terminal, or pass terminalIndex, paneId, targetTerminalId, targetThreadId, or targetTerminalName for a specific coding-agent terminal. Optional agent/targetAgentId constrains to claude, codex, or opencode; shell terminals are not queueable. By default this activates the workspace so its queue can receive the item; set openWorkspace=false to avoid switching views.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

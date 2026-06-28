@@ -29,10 +29,12 @@ test("null terminal prompt sources are treated as idle", () => {
 test("stale thread thinking cannot make a Rust-idle completed turn working", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
+      activityStatus: "idle",
       inputReady: false,
       status: "active",
     },
     providerBinding: {
+      activityStatus: "idle",
       inputReady: false,
       status: "active",
     },
@@ -557,7 +559,7 @@ test("pending session acceptance keeps a running turn active despite lifecycle i
   assert.equal(groundTruth.terminalWorkState, "running");
 });
 
-test("Rust live active terminal without a busy signal is sendable", () => {
+test("hook-managed live active terminal without hook readiness stays starting", () => {
   const groundTruth = getThreadTerminalGroundTruth({
     liveTerminal: {
       inputReady: false,
@@ -586,8 +588,11 @@ test("Rust live active terminal without a busy signal is sendable", () => {
     },
   });
 
-  assert.equal(groundTruth.effectiveActivityStatus, "idle");
-  assert.equal(groundTruth.effectiveLatestTurnState, "completed");
-  assert.equal(groundTruth.completedTurnLooksSendable, true);
-  assert.equal(groundTruth.agentInputReady, true);
+  assert.equal(groundTruth.rawLiveActivityStatus, "idle");
+  assert.equal(groundTruth.hookManagedImplicitStartup, true);
+  assert.equal(groundTruth.effectiveActivityStatus, "starting");
+  assert.equal(groundTruth.effectiveLatestTurnState, "running");
+  assert.equal(groundTruth.completedTurnLooksSendable, false);
+  assert.equal(groundTruth.agentInputReady, false);
+  assert.equal(groundTruth.terminalWorkState, "running");
 });

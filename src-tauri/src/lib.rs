@@ -997,7 +997,14 @@ struct TerminalRuntimeSnapshot {
 }
 
 impl TerminalRuntimeSnapshot {
-    fn opened_idle(provider_session_id: Option<String>) -> Self {
+    fn opened_with_state(
+        provider_session_id: Option<String>,
+        source: &str,
+        status: &str,
+        activity_status: &str,
+        command_phase: &str,
+        input_ready: bool,
+    ) -> Self {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
@@ -1005,22 +1012,44 @@ impl TerminalRuntimeSnapshot {
         let now = crate::coordination::kernel::now_rfc3339();
         let native_session_id = provider_session_id.clone();
         Self {
-            status: "active".to_string(),
-            activity_status: "idle".to_string(),
-            command_phase: "ready".to_string(),
-            input_ready: true,
-            input_ready_at: Some(now.clone()),
-            prompt_ready_at: Some(now),
+            status: status.to_string(),
+            activity_status: activity_status.to_string(),
+            command_phase: command_phase.to_string(),
+            input_ready,
+            input_ready_at: input_ready.then_some(now.clone()),
+            prompt_ready_at: input_ready.then_some(now),
             completed_at: None,
             provider_session_id,
             native_session_id,
             provider_turn_id: None,
             turn_id: None,
-            source: "terminal-open".to_string(),
+            source: source.to_string(),
             event_type: "opened".to_string(),
             hook_event_name: "TerminalOpen".to_string(),
             updated_at_ms: now_ms,
         }
+    }
+
+    fn opened_idle(provider_session_id: Option<String>) -> Self {
+        Self::opened_with_state(
+            provider_session_id,
+            "terminal-open",
+            "active",
+            "idle",
+            "ready",
+            true,
+        )
+    }
+
+    fn opened_starting(provider_session_id: Option<String>, source: &str) -> Self {
+        Self::opened_with_state(
+            provider_session_id,
+            source,
+            "starting",
+            "starting",
+            "starting",
+            false,
+        )
     }
 }
 
@@ -1372,6 +1401,14 @@ impl TerminalInstance {
             size,
         } = warm_pty;
 
+        let initial_runtime = if cloud_mcp_agent_uses_activity_hooks(&metadata.agent_id)
+            || cloud_mcp_agent_uses_activity_hooks(&metadata.agent_kind)
+        {
+            TerminalRuntimeSnapshot::opened_starting(None, "terminal-created")
+        } else {
+            TerminalRuntimeSnapshot::opened_idle(None)
+        };
+
         (
             Self {
                 id,
@@ -1388,7 +1425,7 @@ impl TerminalInstance {
                 coordination,
                 session_mode,
                 metadata,
-                runtime: Arc::new(StdMutex::new(TerminalRuntimeSnapshot::opened_idle(None))),
+                runtime: Arc::new(StdMutex::new(initial_runtime)),
                 app_control_mcp_requested,
             },
             reader,
@@ -5142,7 +5179,6 @@ pub fn run() {
             diffforge_save_untracked_text_asset,
             todo_dispatch_receipts_get,
             todo_dispatch_receipt_record,
-            todo_dispatch_receipts_import,
             todo_dispatch_notify_queue_drained,
             todo_dispatch_queue_sync,
             todo_dispatch_settle_terminal_input_ready,
@@ -5154,8 +5190,11 @@ pub fn run() {
             todo_dispatch_queue_get,
             todo_store_snapshot,
             todo_store_history,
+            todo_store_create,
+            todo_store_update,
             todo_store_delete,
             todo_store_cancel,
+            todo_store_queue_all,
             todo_store_set_status,
             todo_read_image_data_url,
             agent_accounts_state,

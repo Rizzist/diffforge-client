@@ -346,10 +346,14 @@ fn terminal_runtime_apply_opened(
     provider_session_id: Option<&str>,
     source: &str,
 ) -> TerminalRuntimeSnapshot {
-    let mut snapshot = TerminalRuntimeSnapshot::opened_idle(terminal_clean_provider_session_id(
-        provider_session_id,
-    ));
-    snapshot.source = source.to_string();
+    let provider_session_id = terminal_clean_provider_session_id(provider_session_id);
+    let snapshot = if cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_id)
+        || cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_kind)
+    {
+        TerminalRuntimeSnapshot::opened_starting(provider_session_id, source)
+    } else {
+        TerminalRuntimeSnapshot::opened_idle(provider_session_id)
+    };
     if let Ok(mut runtime) = instance.runtime.lock() {
         *runtime = snapshot.clone();
     }
@@ -540,6 +544,12 @@ fn terminal_projection_execution_phase(
     let turn = terminal_projection_text(turn_status, "");
     let lifecycle = terminal_projection_text(terminal_lifecycle, "");
 
+    if matches!(activity.as_str(), "starting" | "prewarmed")
+        || matches!(status.as_str(), "starting" | "prewarmed")
+        || command_phase == "starting"
+    {
+        return "starting";
+    }
     if lifecycle == "offline" || activity == "offline" || status == "offline" {
         return "offline";
     }
@@ -611,6 +621,7 @@ fn terminal_projection_execution_phase(
 
 fn terminal_projection_rail_state(execution_phase: &str, fallback: &str) -> String {
     match terminal_projection_text(execution_phase, "").as_str() {
+        "starting" | "prewarmed" => "starting".to_string(),
         "offline" | "closed" | "closing" | "exited" => {
             terminal_projection_text(execution_phase, "closed")
         }
@@ -675,8 +686,14 @@ fn terminal_project_runtime(
     let raw_activity = terminal_projection_text(&runtime.activity_status, "");
     let raw_event_type = terminal_projection_text(&runtime.event_type, "");
     let raw_command_phase = terminal_projection_text(&runtime.command_phase, "");
+    let raw_status = terminal_projection_text(&runtime.status, "");
     let status = if terminal_lifecycle == "closed" {
         "closed".to_string()
+    } else if matches!(raw_activity.as_str(), "starting" | "prewarmed")
+        || matches!(raw_status.as_str(), "starting" | "prewarmed")
+        || raw_command_phase == "starting"
+    {
+        "starting".to_string()
     } else if raw_event_type == "provider_turn_interrupted"
         || matches!(raw_command_phase.as_str(), "cancelled" | "canceled" | "interrupted")
         || matches!(raw_activity.as_str(), "cancelled" | "canceled" | "interrupted")
@@ -3854,8 +3871,75 @@ fn spawn_terminal_reader(
     output_channel: Channel<InvokeResponseBody>,
     prefer_output_transport: bool,
     cloud_output_observer_enabled: bool,
+    rust_readiness_observer_enabled: bool,
     mut reader: Box<dyn Read + Send>,
 ) {
+    fn terminal_headless_tail_has_prompt_marker(
+        headless_output: &Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
+    ) -> bool {
+        let Ok(output) = headless_output.lock() else {
+            return false;
+        };
+        let tail = output.tail.iter().copied().collect::<Vec<_>>();
+        if tail.is_empty() {
+            return false;
+        }
+        let text = String::from_utf8_lossy(&tail);
+        let cleaned = cloud_mcp_clean_terminal_state_text(&text);
+        !cleaned.is_empty()
+            && !cloud_mcp_terminal_output_has_working_indicator(&cleaned)
+            && cloud_mcp_terminal_output_has_prompt_marker(&cleaned)
+    }
+
+    async fn observe_terminal_startup_prompt_ready(
+        app: AppHandle,
+        terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
+        cloud_mcp_state: CloudMcpState,
+        pane_id: String,
+        instance_id: u64,
+    ) {
+        let Some(instance) =
+            terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
+        else {
+            return;
+        };
+        if !cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_id)
+            && !cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_kind)
+        {
+            return;
+        }
+        let runtime = terminal_runtime_snapshot(&instance);
+        if runtime.input_ready {
+            return;
+        }
+        let runtime_status = terminal_projection_text(&runtime.status, "");
+        let runtime_activity = terminal_projection_text(&runtime.activity_status, "");
+        let runtime_phase = terminal_projection_text(&runtime.command_phase, "");
+        if !matches!(runtime_status.as_str(), "starting" | "prewarmed")
+            && !matches!(runtime_activity.as_str(), "starting" | "prewarmed")
+            && runtime_phase != "starting"
+        {
+            return;
+        }
+
+        process_terminal_activity_hook_event(
+            &app,
+            &terminals,
+            &cloud_mcp_state,
+            &pane_id,
+            instance_id,
+            &instance,
+            &json!({
+                "hookEventName": "Stop",
+                "provider": instance.metadata.agent_kind.clone(),
+                "source": "backend-startup-prompt-ready",
+                "timestamp": crate::coordination::kernel::now_rfc3339(),
+            }),
+            "backend-startup-prompt-ready",
+        )
+        .await;
+    }
+
     fn send_terminal_output_frame(
         app: &AppHandle,
         chunk: Vec<u8>,
@@ -3907,6 +3991,7 @@ fn spawn_terminal_reader(
     }
 
     let reader_pane_id = pane_id.clone();
+    let startup_prompt_ready_observed = Arc::new(AtomicBool::new(false));
 
     log_terminal_crash_forensics_event(
         "backend.terminal_reader.spawn",
@@ -4195,6 +4280,28 @@ fn spawn_terminal_reader(
                     let chunk = &buffer[..bytes_read];
                     if let Ok(mut headless_output) = headless_output.lock() {
                         headless_output.append(chunk);
+                    }
+                    if rust_readiness_observer_enabled
+                        && !startup_prompt_ready_observed.load(Ordering::Acquire)
+                        && terminal_headless_tail_has_prompt_marker(&headless_output)
+                        && startup_prompt_ready_observed
+                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok()
+                    {
+                        let readiness_app = app.clone();
+                        let readiness_terminals = Arc::clone(&terminals);
+                        let readiness_cloud_state = cloud_mcp_state.clone();
+                        let readiness_pane_id = reader_pane_id.clone();
+                        tauri::async_runtime::spawn(async move {
+                            observe_terminal_startup_prompt_ready(
+                                readiness_app,
+                                readiness_terminals,
+                                readiness_cloud_state,
+                                readiness_pane_id,
+                                instance_id,
+                            )
+                            .await;
+                        });
                     }
                     if !auth_failure_marked
                         && agent_accounts_observe_terminal_auth_output(
@@ -5493,6 +5600,9 @@ async fn terminal_open(
     let cloud_output_observer_enabled =
         !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_id)
             && !cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_kind);
+    let rust_readiness_observer_enabled =
+        cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_id)
+            || cloud_mcp_agent_uses_activity_hooks(&terminal_metadata_for_log.agent_kind);
     spawn_terminal_reader(
         app.clone(),
         Arc::clone(&state.terminals),
@@ -5505,6 +5615,7 @@ async fn terminal_open(
         output_channel,
         prefer_output_transport,
         cloud_output_observer_enabled,
+        rust_readiness_observer_enabled,
         reader,
     );
     spawn_terminal_activity_hook_watcher(
@@ -5586,6 +5697,7 @@ async fn terminal_open(
         }),
     );
 
+    let projected_runtime = terminal_project_runtime(&terminal_metadata_for_log, &runtime_snapshot, false);
     Ok(TerminalOpenResult {
         pane_id,
         instance_id,
@@ -5654,7 +5766,7 @@ async fn terminal_open(
         command_phase: runtime_snapshot.command_phase,
         input_ready: runtime_snapshot.input_ready,
         input_ready_at: runtime_snapshot.input_ready_at,
-        terminal_work_state: "complete".to_string(),
+        terminal_work_state: projected_runtime.terminal_work_state,
     })
 }
 
@@ -6615,7 +6727,6 @@ async fn terminal_start_agent_many(
             "Cannot start more than {MAX_TERMINAL_START_AGENT_BATCH} terminal agents at once."
         ));
     }
-    require_cloud_mcp_connected_state(cloud_mcp_state.inner()).await?;
 
     let mut join_set = tokio::task::JoinSet::new();
 
@@ -15489,6 +15600,20 @@ mod terminal_tests {
         assert_eq!(projected.terminal_work_state, "complete");
         assert_eq!(projected.execution_phase, "idle");
         assert_eq!(projected.native_rail_state, "idle");
+    }
+
+    #[test]
+    fn terminal_projection_preserves_starting_until_readiness_event() {
+        let runtime = TerminalRuntimeSnapshot::opened_starting(None, "test");
+
+        let projected =
+            terminal_project_runtime(&terminal_projection_test_metadata(), &runtime, false);
+
+        assert_eq!(projected.readiness, "busy");
+        assert_eq!(projected.terminal_status, "starting");
+        assert_eq!(projected.terminal_work_state, "running");
+        assert_eq!(projected.execution_phase, "starting");
+        assert_eq!(projected.native_rail_state, "starting");
     }
 
     #[test]

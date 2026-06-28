@@ -244,8 +244,8 @@ function providerBindingsHaveNativeSession(providerBindings) {
   ));
 }
 
-function normalizeLiveTerminalActivityStatus(liveTerminal) {
-  const explicit = cleanText(
+function explicitLiveTerminalActivityStatus(liveTerminal) {
+  return cleanText(
     liveTerminal?.activityStatus
       || liveTerminal?.activity_status
       || liveTerminal?.nativeRailState
@@ -253,6 +253,10 @@ function normalizeLiveTerminalActivityStatus(liveTerminal) {
       || liveTerminal?.terminalWorkState
       || liveTerminal?.terminal_work_state,
   ).toLowerCase();
+}
+
+function normalizeLiveTerminalActivityStatus(liveTerminal) {
+  const explicit = explicitLiveTerminalActivityStatus(liveTerminal);
   if (explicit) {
     return explicit;
   }
@@ -333,17 +337,30 @@ export function getThreadTerminalGroundTruth({
   const latestTurnState = cleanText(latestTurn?.state).toLowerCase();
   const terminalStatus = cleanText(liveTerminal?.status).toLowerCase();
   const providerActivityStatus = "";
-  const liveActivityStatus = normalizeLiveTerminalActivityStatus(liveTerminal);
-  const activityStatus = liveActivityStatus;
-  const parkedStatus = [activityStatus].find((status) => (
-    PARKED_TERMINAL_STATUSES.has(status)
-  )) || "";
-  const terminalIsParked = Boolean(parkedStatus);
+  const rawLiveActivityStatus = normalizeLiveTerminalActivityStatus(liveTerminal);
+  const liveActivityStatusExplicit = Boolean(explicitLiveTerminalActivityStatus(liveTerminal));
   const providerBindings = thread?.providerBindings
     && typeof thread.providerBindings === "object"
     && !Array.isArray(thread.providerBindings)
     ? thread.providerBindings
     : {};
+  const recordedAgentInputReady = Boolean(liveTerminal?.inputReady || providerBinding?.inputReady);
+  const hookManagedAgent = terminalAgentUsesActivityHooks(targetRole)
+    || terminalAgentUsesActivityHooks(liveTerminal?.agentId || liveTerminal?.agent_id)
+    || terminalAgentUsesActivityHooks(providerBinding?.agentId || providerBinding?.agent_id);
+  const hookManagedImplicitStartup = Boolean(
+    hookManagedAgent
+      && liveTerminal
+      && !liveActivityStatusExplicit
+      && !recordedAgentInputReady
+      && terminalActivityStatusIsSendable(rawLiveActivityStatus)
+  );
+  const liveActivityStatus = hookManagedImplicitStartup ? "starting" : rawLiveActivityStatus;
+  const activityStatus = liveActivityStatus;
+  const parkedStatus = [activityStatus].find((status) => (
+    PARKED_TERMINAL_STATUSES.has(status)
+  )) || "";
+  const terminalIsParked = Boolean(parkedStatus);
   const messageCount = normalizeMessageCount(thread?.messageCount);
   const hasMessages = Array.isArray(thread?.messages) && thread.messages.length > 0;
   const hasProjectionEvents = Array.isArray(thread?.projectionEvents) && thread.projectionEvents.length > 0;
@@ -360,7 +377,6 @@ export function getThreadTerminalGroundTruth({
       && !hasNativeSession
   );
 
-  const recordedAgentInputReady = Boolean(liveTerminal?.inputReady || providerBinding?.inputReady);
   const inputReadyAt = cleanText(
     liveTerminal?.inputReadyAt
       || providerBinding?.inputReadyAt
@@ -375,9 +391,6 @@ export function getThreadTerminalGroundTruth({
   const terminalLooksActive = terminalActivityStatusIsBusy(activityStatus);
   const terminalLooksSendable = terminalActivityStatusIsSendable(activityStatus);
   const liveTerminalLooksSendable = terminalActivityStatusIsSendable(liveActivityStatus);
-  const hookManagedAgent = terminalAgentUsesActivityHooks(targetRole)
-    || terminalAgentUsesActivityHooks(liveTerminal?.agentId || liveTerminal?.agent_id)
-    || terminalAgentUsesActivityHooks(providerBinding?.agentId || providerBinding?.agent_id);
   const hasLoadedTerminalRuntime = Boolean(
     liveTerminal
       && (
@@ -387,6 +400,11 @@ export function getThreadTerminalGroundTruth({
         || liveTerminalLooksSendable
       )
   );
+  const hasHookRuntimeSession = Boolean(
+    hasNativeSession
+      || hasTranscriptSession
+      || cleanText(providerBinding?.nativeSessionId || providerBinding?.native_session_id)
+  );
   const inputReadyIsFreshForTurn = Boolean(
     recordedAgentInputReady
       && inputReadyAtMs > 0
@@ -395,6 +413,7 @@ export function getThreadTerminalGroundTruth({
   const restoredRunningTurnLooksIdle = Boolean(
     latestTurnState === "running"
       && hookManagedAgent
+      && hasHookRuntimeSession
       && hasLoadedTerminalRuntime
       && terminalLooksSendable
       && liveTerminalLooksSendable
@@ -525,14 +544,18 @@ export function getThreadTerminalGroundTruth({
     effectiveLatestTurnState,
     hasNativeSession,
     hasPendingPrompt,
+    hookManagedAgent,
+    hookManagedImplicitStartup,
     inputReadyAt,
     inputReadyAtMs,
     inputReadyIsFreshForTurn,
     latestTurnState,
     liveActivityStatus,
+    liveActivityStatusExplicit,
     messageCount,
     orphanRunningLooksIdle,
     promptSubmissionPending,
+    rawLiveActivityStatus,
     recordedAgentInputReady,
     requiresAgentInputReady,
     restoredRunningTurnLooksIdle,

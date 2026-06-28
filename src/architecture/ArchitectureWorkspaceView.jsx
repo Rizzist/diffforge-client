@@ -440,9 +440,7 @@ const ARCHITECTURE_SELECTED_GRAPH_REFRESH_MS = 450;
 const ARCHITECTURE_CLOUD_UPDATED_EVENT = "cloud-mcp-workspace-architectures-updated";
 const ARCHITECTURE_FILE_WRITE_SUPPRESSION_MS = 7000;
 const ARCHITECTURE_REMOTE_TODO_QUEUE_EVENT = "diffforge:remote-todo-queue";
-const ARCHITECTURE_TODO_QUEUE_STORAGE_PREFIX = "diffforge.todoQueue.v1";
 const ARCHITECTURE_TODO_QUEUE_SOURCE = "next-remote-control";
-const ARCHITECTURE_TODO_QUEUE_MAX_ITEMS = 120;
 const ARCHITECTURE_AGENT_EDIT_MARKERS_STORAGE_PREFIX = "diffforge.architectureAgentEdits.v1";
 const ARCHITECTURE_AGENT_EDIT_MARKER_MAX_ITEMS = 80;
 const ARCHITECTURE_AGENT_EDIT_MARKER_MAX_AGE_MS = 36 * 60 * 60 * 1000;
@@ -4433,33 +4431,6 @@ function architectureValidateSemanticGraph(graph, nodes, edges) {
   return warnings.slice(0, 8);
 }
 
-function architectureTodoQueueStorageKey(workspaceId) {
-  const safeWorkspaceId = text(workspaceId);
-  return safeWorkspaceId ? `${ARCHITECTURE_TODO_QUEUE_STORAGE_PREFIX}.${safeWorkspaceId}` : "";
-}
-
-function architectureReadStoredTodoQueueItems(storageKey) {
-  if (!storageKey || typeof window === "undefined" || !window.localStorage) return [];
-  try {
-    const parsed = JSON.parse(window.localStorage.getItem(storageKey) || "[]");
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
-  }
-}
-
-function architectureWriteStoredTodoQueueItems(storageKey, items) {
-  if (!storageKey || typeof window === "undefined" || !window.localStorage) return;
-  try {
-    window.localStorage.setItem(
-      storageKey,
-      JSON.stringify(items.slice(-ARCHITECTURE_TODO_QUEUE_MAX_ITEMS)),
-    );
-  } catch {
-    // Local queue persistence is best effort; the live event still covers mounted terminal views.
-  }
-}
-
 function architectureNormalizedIdentityText(value) {
   return text(value).replace(/\\/g, "/").replace(/\/+$/u, "").toLowerCase();
 }
@@ -4648,13 +4619,6 @@ function architectureQueueAgentTodo({
     id: commandId,
     kind: "todo",
     ...safeTargetFields,
-    queueState: {
-      phase: "queued",
-      queuedAt: now,
-      source: ARCHITECTURE_TODO_QUEUE_SOURCE,
-      state: "queued",
-      updatedAt: now,
-    },
     remoteCommand: {
       ...(selectedRun ? { architectureRun: selectedRun } : {}),
       architectureGraph,
@@ -4677,12 +4641,6 @@ function architectureQueueAgentTodo({
     }),
     workspaceId: safeWorkspaceId,
   };
-  const storageKey = architectureTodoQueueStorageKey(safeWorkspaceId);
-  if (storageKey) {
-    const currentItems = architectureReadStoredTodoQueueItems(storageKey)
-      .filter((candidate) => text(candidate?.id) !== commandId);
-    architectureWriteStoredTodoQueueItems(storageKey, currentItems.concat([item]));
-  }
   if (typeof window !== "undefined" && typeof window.dispatchEvent === "function") {
     window.dispatchEvent(new CustomEvent(ARCHITECTURE_REMOTE_TODO_QUEUE_EVENT, {
       detail: {
@@ -5575,11 +5533,9 @@ export default function ArchitectureWorkspaceView({
 	      return finishedPlanRefs.has(planRef) ? taskWithCompletedTerminalPlan(task) : task;
 	    });
 	  }, [finishedPlanRefs, tasks]);
-  // Todos History reads ONE Rust door: todo_store_history merges the local
-  // queue ledger (listed/queued/running AND retained finished rows — works
-  // offline) with the cloud mirror's rows (peer devices, LLM titles, full
-  // lifecycle), deduped per logical todo and tombstone-gated. No more
-  // cross-replica merging in the webview.
+  // Todos History reads ONE Rust door: todo_store_history returns the local
+  // Rust queue ledger (listed/queued/running AND retained finished rows),
+  // deduped per logical todo and tombstone-gated.
   const [localTodoItems, setLocalTodoItems] = useState([]);
   useEffect(() => {
     const workspaceId = text(activeWorkspaceId);
@@ -5607,9 +5563,8 @@ export default function ArchitectureWorkspaceView({
         });
     };
     refreshLocalTodos();
-    // Store mutations (deletes, cancels, sweeps, direct captures) and mirror
-    // updates (cloud echoes, peer devices) must show instantly; the interval
-    // is only a safety net for missed events.
+    // Store mutations (creates, deletes, cancels, sweeps, direct captures) are
+    // the only todo refresh signal. Rust emits this event for every mutation.
     listen("todo-store-changed", (event) => {
       if (cancelled) return;
       const eventWorkspaceId = String(event?.payload?.workspaceId || "").trim();
@@ -5623,20 +5578,8 @@ export default function ArchitectureWorkspaceView({
       }
       unlisteners.push(unlisten);
     }).catch(() => {});
-    listen("cloud-mcp-workspace-todos-updated", () => {
-      if (cancelled) return;
-      refreshLocalTodos();
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlisteners.push(unlisten);
-    }).catch(() => {});
-    const intervalId = window.setInterval(refreshLocalTodos, 2500);
     return () => {
       cancelled = true;
-      window.clearInterval(intervalId);
       unlisteners.forEach((unlisten) => unlisten());
     };
   }, [activeWorkspaceId]);
@@ -9625,6 +9568,7 @@ function TodosHistoryPanel({
         action,
         commandId: item.commandId,
         dispatchId: item.dispatchId,
+        item: item.raw || null,
         itemId: text(item.raw?.id),
         promptEventId: item.promptEventId,
         requestId,
@@ -9655,6 +9599,7 @@ function TodosHistoryPanel({
       commandId: String(item.commandId || "").trim() || null,
       dispatchId: String(item.dispatchId || "").trim() || null,
     };
+    const todoItemPayload = item.raw || null;
     const queueTargetIndex = Number(extra.targetTerminalIndex);
     const request = action === "cancel"
       ? invoke("todo_store_cancel", {
@@ -9666,6 +9611,7 @@ function TodosHistoryPanel({
         ? invoke("todo_store_set_status", {
           workspaceId,
           ...todoRefs,
+          item: todoItemPayload,
           status: "listed",
           reason: "todo_history_unqueue",
         })
@@ -9673,6 +9619,7 @@ function TodosHistoryPanel({
           ? invoke("todo_store_set_status", {
             workspaceId,
             ...todoRefs,
+            item: todoItemPayload,
             status: "queued",
             reason: action === "queue" ? "todo_history_queue" : "todo_history_retarget",
             targetTerminalIndex: Number.isInteger(queueTargetIndex) ? queueTargetIndex : null,
@@ -13057,6 +13004,7 @@ const ArchitectureEdgeLabel = styled.div`
 `;
 
 const HistoryPane = styled.div`
+  container-type: inline-size;
   display: grid;
   align-content: start;
   grid-template-rows: auto minmax(0, 1fr);
@@ -13108,11 +13056,16 @@ const TimelineSummary = styled.span`
 
 const HistorySplit = styled.div`
   display: grid;
-  grid-template-columns: minmax(420px, 0.95fr) minmax(340px, 1.05fr);
+  grid-template-columns: minmax(170px, 0.82fr) minmax(0, 1.18fr);
   gap: 12px;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+
+  @container (max-width: 640px) {
+    grid-template-columns: 1fr;
+    overflow: auto;
+  }
 
   @media (max-width: 920px) {
     grid-template-columns: 1fr;
@@ -13438,12 +13391,15 @@ const TimelineTimes = styled.div`
 `;
 
 const TaskDetails = styled.aside`
+  box-sizing: border-box;
   display: grid;
   align-content: start;
   gap: 10px;
   min-width: 0;
+  max-width: 100%;
   min-height: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 14px;
   border: 1px solid rgba(148, 163, 184, 0.14);
   border-radius: 8px;
@@ -13456,15 +13412,26 @@ const TaskDetailsHeader = styled.header`
   justify-content: space-between;
   gap: 12px;
   min-width: 0;
+
+  > div {
+    min-width: 0;
+  }
+
+  @container (max-width: 520px) {
+    flex-direction: column;
+    gap: 7px;
+  }
 `;
 
 const TaskDetailsHeaderActions = styled.div`
   display: flex;
   flex: 0 0 auto;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: flex-end;
   gap: 7px;
   min-width: 0;
+  max-width: 100%;
 `;
 
 const TaskDetailsUpdated = styled.span`
@@ -13543,6 +13510,7 @@ const TaskMetaStrip = styled.div`
 
 const TaskMetaChip = styled.div`
   display: inline-flex;
+  flex: 1 1 92px;
   align-items: baseline;
   gap: 6px;
   min-width: 0;
@@ -13825,13 +13793,16 @@ const TodoDeviceCard = styled.div`
   }
 
   strong {
+    flex: 1 1 auto;
     color: rgba(241, 245, 249, 0.94);
     font-size: 12px;
     font-weight: 850;
   }
 
   em {
+    flex: 0 1 auto;
     margin-left: auto;
+    max-width: 50%;
     color: rgba(203, 213, 225, 0.7);
     font-size: 10px;
     font-style: normal;

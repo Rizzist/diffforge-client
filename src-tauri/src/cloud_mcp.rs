@@ -9710,12 +9710,6 @@ async fn cloud_mcp_set_global_ws_phase(
     }
 }
 
-async fn require_cloud_mcp_connected_state(
-    state: &CloudMcpState,
-) -> Result<CloudMcpStatus, String> {
-    cloud_mcp_connected_or_connect(state).await
-}
-
 async fn cloud_mcp_start_global_ws(state: &CloudMcpState) {
     cloud_mcp_spawn_global_ws(state);
 }
@@ -24479,7 +24473,7 @@ pub(crate) async fn cloud_mcp_mark_terminal_closed(
     runtime.terminal_contexts.remove(&terminal_key);
 }
 
-fn cloud_mcp_clean_terminal_state_text(text: &str) -> String {
+pub(crate) fn cloud_mcp_clean_terminal_state_text(text: &str) -> String {
     let mut cleaned = String::with_capacity(text.len().min(2400));
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
@@ -24521,15 +24515,19 @@ fn cloud_mcp_clean_terminal_state_text(text: &str) -> String {
     cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn cloud_mcp_terminal_output_has_working_indicator(cleaned_text: &str) -> bool {
+pub(crate) fn cloud_mcp_terminal_output_has_working_indicator(cleaned_text: &str) -> bool {
     let lower = cleaned_text.to_lowercase();
     lower.contains("working (")
         || lower.contains("esc to interrupt")
         || lower.contains("context refresh")
 }
 
-fn cloud_mcp_terminal_output_has_prompt_marker(cleaned_text: &str) -> bool {
+pub(crate) fn cloud_mcp_terminal_output_has_prompt_marker(cleaned_text: &str) -> bool {
     cleaned_text.contains('›')
+        || cleaned_text.contains('❯')
+        || cleaned_text.contains('❱')
+        || cleaned_text.contains("\n> ")
+        || cleaned_text.contains("\r> ")
 }
 
 fn cloud_mcp_terminal_output_looks_active(text: &str) -> bool {
@@ -24596,7 +24594,7 @@ fn cloud_mcp_terminal_output_looks_ready(text: &str) -> bool {
         || cloud_mcp_terminal_output_has_prompt_marker(&cleaned)
 }
 
-fn cloud_mcp_agent_uses_activity_hooks(agent_id: &str) -> bool {
+pub(crate) fn cloud_mcp_agent_uses_activity_hooks(agent_id: &str) -> bool {
     // Keep in sync with the frontend `TERMINAL_ACTIVITY_HOOK_AGENT_KINDS`
     // (terminalActivityState.js). OpenCode owns its turn state through the
     // injected activity plugin, so it must emit the synthetic
@@ -45053,43 +45051,6 @@ fn cloud_mcp_todo_mirror_workspace_todos_from_store(
     let conn = cloud_mcp_open_todo_mirror_conn().ok()?;
     let _ = cloud_mcp_todo_mirror_reconcile_conn(&conn);
     cloud_mcp_todo_mirror_workspace_todos_from_conn(&conn, repo_id, workspace_id)
-}
-
-/// Mirror rows for the Todos History view: unlike the workspace-todos
-/// snapshot (which hides terminal statuses so finished todos can't leak back
-/// into live queues), history needs the FULL lifecycle — completed, failed,
-/// cancelled, timed-out, interrupted — and only true delete-ish rows stay
-/// hidden. Todo rows only; dispatch rows are status events, not todos.
-pub(crate) fn cloud_mcp_todo_mirror_history_items(workspace_id: &str, limit: usize) -> Vec<Value> {
-    let workspace_id = workspace_id.trim();
-    if workspace_id.is_empty() {
-        return Vec::new();
-    }
-    let Ok(conn) = cloud_mcp_open_todo_mirror_conn() else {
-        return Vec::new();
-    };
-    let _ = cloud_mcp_todo_mirror_reconcile_conn(&conn);
-    let Ok(mut statement) = conn.prepare(
-        "SELECT row_json FROM workspace_todo_mirror_rows
-         WHERE row_kind='todo'
-           AND (workspace_id=?1 OR origin_workspace_id=?1 OR target_workspace_id=?1)
-           AND status NOT IN ('deleted', 'removed', 'rejected', 'skipped',
-                              'duplicate_ignored', 'released')
-         ORDER BY last_seen_ms DESC, updated_at DESC
-         LIMIT ?2",
-    ) else {
-        return Vec::new();
-    };
-    let Ok(mapped) = statement.query_map(
-        rusqlite::params![workspace_id, limit.max(1) as i64],
-        |row| row.get::<_, String>(0),
-    ) else {
-        return Vec::new();
-    };
-    mapped
-        .flatten()
-        .filter_map(|row_json| serde_json::from_str::<Value>(&row_json).ok())
-        .collect()
 }
 
 /// DiffForge generates aliased ids for one logical todo: the todo id, its

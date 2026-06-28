@@ -1138,6 +1138,7 @@ const TERMINAL_CODING_AGENT_READY_RECONCILE_QUIET_MS = 850;
 const TERMINAL_CODING_AGENT_READY_RECONCILE_RETRY_MS = 350;
 const TERMINAL_CODING_AGENT_READY_RECONCILE_MAX_MS = 12000;
 const TERMINAL_PREWARM_PTY_REVEAL_SETTLE_MS = 520;
+const TERMINAL_PREWARM_AGENT_DIRECT_OPEN_TIMEOUT_MS = 12000;
 const TERMINAL_THREAD_PROMPT_READY_ACTIVITY_MS = 250;
 const TERMINAL_THREAD_PROMPT_READY_EARLY_MIN_MS = 120;
 const TERMINAL_THREAD_PROMPT_READY_MIN_MS = 450;
@@ -2197,6 +2198,7 @@ function WorkspaceTerminal({
     getWorkspaceThreadComposerAttachmentSnapshot,
   );
   const [terminalState, setTerminalState] = useState(agent ? "starting" : "blocked");
+  const terminalStateRef = useRef(agent ? "starting" : "blocked");
   const [terminalStartupUnblocked, setTerminalStartupUnblocked] = useState(Boolean(startupReady));
   const [terminalError, setTerminalError] = useState("");
   const [terminalStatus, setTerminalStatus] = useState(() => ({
@@ -2221,6 +2223,9 @@ function WorkspaceTerminal({
   useEffect(() => {
     terminalUiViewActiveRef.current = terminalUiViewActive;
   }, [terminalUiViewActive]);
+  useEffect(() => {
+    terminalStateRef.current = terminalState;
+  }, [terminalState]);
   useEffect(() => {
     warmTerminalInputTransport();
   }, []);
@@ -2268,7 +2273,9 @@ function WorkspaceTerminal({
   const terminalThreadId = thread?.id || "";
   const terminalThreadSlotKey = thread?.slotKey
     || String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
-  const terminalThreadActivityStatus = "idle";
+  const terminalAgentKind = getTerminalAgentKind(paneAgentId);
+  const terminalUsesActivityHooks = !isGenericTerminal && terminalAgentUsesActivityHooks(terminalAgentKind);
+  const terminalThreadActivityStatus = terminalUsesActivityHooks ? "starting" : "idle";
   const terminalThreadIdRef = useRef(terminalThreadId);
   const terminalThreadSlotKeyRef = useRef(terminalThreadSlotKey);
   const terminalThreadActivityStatusRef = useRef(terminalThreadActivityStatus);
@@ -2283,8 +2290,6 @@ function WorkspaceTerminal({
   const terminalThreadLastActiveOutputLifecycleAtRef = useRef(0);
   const pendingThreadStartingLifecycleRef = useRef(null);
   const threadsViewSelectedThreadRef = useRef(null);
-  const terminalAgentKind = getTerminalAgentKind(paneAgentId);
-  const terminalUsesActivityHooks = !isGenericTerminal && terminalAgentUsesActivityHooks(terminalAgentKind);
   const shellLauncherSelectedAgentId = normalizeShellLauncherAgentId(shellLauncherAgentId);
   const shellLauncherSelectedOption = getShellLauncherAgentOption(shellLauncherSelectedAgentId);
   const shellLauncherSelectedReady = shellLauncherAgentReady(agentStatuses, shellLauncherSelectedAgentId);
@@ -2388,6 +2393,13 @@ function WorkspaceTerminal({
     workspaceId: workspace?.id || "",
     ...fields,
   });
+  const normalizeTerminalEpochActivityStatus = (activityStatus = "idle", agentId = terminalAgentKind) => {
+    const nextStatus = String(activityStatus || "idle").trim().toLowerCase() || "idle";
+    if (nextStatus === "idle" && terminalAgentUsesActivityHooks(agentId)) {
+      return "starting";
+    }
+    return nextStatus;
+  };
   const setTerminalAudioInputTarget = useCallback((active, instanceId = terminalInstanceIdRef.current || 0, reason = "terminal_audio_target") => {
     const safeInstanceId = Number(instanceId || 0);
     if (!paneId || !safeInstanceId) {
@@ -2412,15 +2424,17 @@ function WorkspaceTerminal({
   }, [paneId, terminalIndex, workspace?.id]);
   const resetTerminalReadinessForEpoch = ({
     activityStatus = "idle",
+    agentId = terminalAgentKind,
     instanceId = terminalInstanceIdRef.current,
     reason = "terminal_epoch_reset",
     threadId = terminalThreadIdRef.current,
   } = {}) => {
+    const nextActivityStatus = normalizeTerminalEpochActivityStatus(activityStatus, agentId);
     terminalThreadThinkingSinceRef.current = 0;
     terminalThreadSubmittedPromptRef.current = null;
     terminalThreadLastReadyAtMsRef.current = 0;
     terminalThreadLastWorkStartedAtRef.current = 0;
-    terminalThreadActivityStatusRef.current = String(activityStatus || "idle").trim().toLowerCase() || "idle";
+    terminalThreadActivityStatusRef.current = nextActivityStatus;
     terminalRuntimeActivityStatusRef.current = terminalThreadActivityStatusRef.current;
     setTerminalRuntimeActivityStatus((current) => (
       current === terminalRuntimeActivityStatusRef.current
@@ -5388,12 +5402,10 @@ function WorkspaceTerminal({
     };
     resetTerminalReadinessForEpoch({
       activityStatus: "idle",
+      agentId: detail.agentId || terminalAgentKind,
       instanceId: 0,
       reason: "restart_empty_terminal_session",
       threadId: nextThreadId,
-    });
-    markTerminalThreadActivityStatus("idle", {
-      reason: "restart_empty_terminal_session",
     });
     logThreadBridgeDiagnostic("frontend.thread_restart_empty_session", {
       currentThreadId: thread?.id || "",
@@ -5805,6 +5817,7 @@ function WorkspaceTerminal({
     let sawFirstVisibleOutput = false;
     let prewarmPtyOutputGateActive = false;
     let prewarmPtyRevealTimer = 0;
+    let prewarmAgentDirectOpenTimer = 0;
     let prewarmPtyDroppedBytes = 0;
     let prewarmPtyDroppedChunks = 0;
     let outputBytes = 0;
@@ -10536,17 +10549,7 @@ function WorkspaceTerminal({
             startLine,
           };
         };
-        const shouldAttemptTerminalReadyReconcile = () => Boolean(
-          terminalUsesActivityHooks
-            && !isGenericTerminal
-            && !isDisposed
-            && hasOpenPty
-            && !parkedPromptRef.current
-            && (
-              terminalThreadSubmittedPromptRef.current
-              || String(terminalThreadActivityStatusRef.current || "").trim().toLowerCase() === "thinking"
-            )
-        );
+        const shouldAttemptTerminalReadyReconcile = () => false;
         const runTerminalReadyReconcile = (reason, sequence) => {
           if (sequence !== terminalReadyReconcileSequence || !shouldAttemptTerminalReadyReconcile()) {
             return;
@@ -13233,6 +13236,60 @@ function WorkspaceTerminal({
         const openKind = isGenericTerminal || shouldPrewarmShell ? "prewarm-pty" : agent.id;
         const openProvider = isGenericTerminal ? null : agent.id;
         let agentStartedInCurrentPty = isGenericTerminal || !shouldPrewarmShell;
+        const clearPrewarmAgentDirectOpenTimer = () => {
+          if (!prewarmAgentDirectOpenTimer) {
+            return;
+          }
+
+          window.clearTimeout(prewarmAgentDirectOpenTimer);
+          startupWatchTimers.delete(prewarmAgentDirectOpenTimer);
+          prewarmAgentDirectOpenTimer = 0;
+        };
+        const schedulePrewarmAgentDirectOpenFallback = (reason = "prewarm_waiting_for_agent_start") => {
+          if (!shouldPrewarmShell || isDisposed || agentStartedInCurrentPty || terminalClosingRef.current) {
+            return;
+          }
+
+          clearPrewarmAgentDirectOpenTimer();
+          prewarmAgentDirectOpenTimer = window.setTimeout(() => {
+            const timer = prewarmAgentDirectOpenTimer;
+            startupWatchTimers.delete(timer);
+            prewarmAgentDirectOpenTimer = 0;
+
+            if (
+              isDisposed
+              || !hasOpenPty
+              || agentStartedInCurrentPty
+              || terminalClosingRef.current
+              || terminalClosed
+              || terminalStateRef.current !== "prewarmed"
+            ) {
+              return;
+            }
+
+            if (!agentLaunchReadyRef.current) {
+              schedulePrewarmAgentDirectOpenFallback("agent_launch_not_ready");
+              return;
+            }
+
+            logTerminalStatus("frontend.terminal_lifecycle.prewarm_direct_open_fallback", {
+              agentId: terminalAgentKind,
+              delayMs: TERMINAL_PREWARM_AGENT_DIRECT_OPEN_TIMEOUT_MS,
+              paneId,
+              reason,
+              startupThreadId: startupThreadId || "",
+              terminalIndex,
+              workspaceId: workspace?.id || "",
+            });
+            restartWithEmptyTerminalSession({
+              agentId: terminalAgentKind,
+              nextThreadId: startupThreadId || undefined,
+              reason: "prewarm_agent_start_timeout",
+              statusDetail: "Starting the coding agent directly.",
+            });
+          }, TERMINAL_PREWARM_AGENT_DIRECT_OPEN_TIMEOUT_MS);
+          startupWatchTimers.add(prewarmAgentDirectOpenTimer);
+        };
         if (shouldPrewarmShell) {
           hidePrewarmPtyOutput("terminal_open_prewarm");
         } else {
@@ -13257,6 +13314,7 @@ function WorkspaceTerminal({
           }
 
           agentStartedInCurrentPty = true;
+          clearPrewarmAgentDirectOpenTimer();
           startupWatchTimers.forEach((timer) => window.clearTimeout(timer));
           startupWatchTimers.clear();
           setPaneStage("starting", "Starting Agent", "Attaching the prepared terminal.");
@@ -13413,7 +13471,10 @@ function WorkspaceTerminal({
             : startupThreadProviderSessionId || "",
         ).trim();
         const openedNativeSessionId = String(openResult?.nativeSessionId || openedProviderSessionId).trim();
-        const openedActivityStatus = String(openResult?.activityStatus || "idle").trim() || "idle";
+        const openedActivityStatus = normalizeTerminalEpochActivityStatus(
+          openResult?.activityStatus || "idle",
+          terminalAgentKind,
+        );
         const openedCommandPhase = String(openResult?.commandPhase || "ready").trim() || "ready";
         const backendOpenedModel = String(openResult?.model || "").trim();
         const backendOpenedModelSource = String(openResult?.modelSource || "").trim();
@@ -13423,11 +13484,17 @@ function WorkspaceTerminal({
             ? startupThreadProviderModelSource || "request"
             : backendOpenedModelSource || startupThreadProviderModelSource
           : "";
-        const openedInputReady = typeof openResult?.inputReady === "boolean"
-          ? openResult.inputReady
-          : !shouldPrewarmShell;
+        const openedInputReady = terminalUsesActivityHooks
+          ? false
+          : typeof openResult?.inputReady === "boolean"
+            ? openResult.inputReady
+            : !shouldPrewarmShell;
         const openedInputReadyAt = String(openResult?.inputReadyAt || "").trim()
           || (openedInputReady ? new Date().toISOString() : "");
+        const rawOpenedTerminalWorkState = String(openResult?.terminalWorkState || "").trim();
+        const openedTerminalWorkState = openedInputReady
+          ? rawOpenedTerminalWorkState || "complete"
+          : "running";
         logThreadBridgeDiagnostic("frontend.terminal_open.emit_opened_lifecycle", {
           agentId: agent?.id || terminalAgentKind,
           coordinationSessionPresent: Boolean(openResult?.sessionId),
@@ -13474,9 +13541,9 @@ function WorkspaceTerminal({
           sessionMode: openResult?.sessionMode || sessionModeForThisStart,
           fileAuthority: openResult?.fileAuthority || "",
           slotKey: openResult?.slotKey || terminalThreadSlotKeyRef.current,
-          status: shouldPrewarmShell ? "starting" : "active",
-          statusTruth: openResult?.terminalWorkState || "complete",
-          terminalWorkState: openResult?.terminalWorkState || "complete",
+          status: openedInputReady ? "active" : "starting",
+          statusTruth: openedTerminalWorkState,
+          terminalWorkState: openedTerminalWorkState,
           terminalIndex,
           threadId: startupThreadId,
           type: "opened",
@@ -13655,9 +13722,14 @@ function WorkspaceTerminal({
         }
 
         if (shouldPrewarmShell) {
+          let startedPrewarmedAgent = false;
           if (agentLaunchReadyRef.current && agentLaunchEpochRef.current > 0) {
             lastAgentLaunchEpochRef.current = agentLaunchEpochRef.current;
             startAgentInCurrentPty("prewarm_ready_after_gate", agentLaunchEpochRef.current);
+            startedPrewarmedAgent = true;
+          }
+          if (!startedPrewarmedAgent) {
+            schedulePrewarmAgentDirectOpenFallback("prewarm_shell_waiting_for_agent_start");
           }
 
           return;
@@ -13717,6 +13789,10 @@ function WorkspaceTerminal({
       if (prewarmPtyRevealTimer) {
         window.clearTimeout(prewarmPtyRevealTimer);
         prewarmPtyRevealTimer = 0;
+      }
+      if (prewarmAgentDirectOpenTimer) {
+        window.clearTimeout(prewarmAgentDirectOpenTimer);
+        prewarmAgentDirectOpenTimer = 0;
       }
       startupMetricTimers.forEach((timer) => window.clearTimeout(timer));
       startupMetricTimers.clear();
@@ -15432,6 +15508,7 @@ function WorkspaceTerminal({
       terminalThreadSlotKeyRef.current = String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1);
       resetTerminalReadinessForEpoch({
         activityStatus: "idle",
+        agentId: nextRoleId,
         instanceId: 0,
         reason: "terminal_restart_role_change",
         threadId: nextThreadId,
@@ -15949,16 +16026,26 @@ function WorkspaceTerminal({
   const shellLauncherRailAgentTitle = isGenericTerminal
     ? `Shell terminal mode: ${shellLauncherSelectedOption.label}`
     : terminalRailAgentTitle;
+  const shellTerminalRailStateLabel = terminalClosed
+    ? "closed"
+    : terminalClosing
+      ? "closing"
+      : terminalState === "starting"
+        ? "starting"
+        : terminalState === "error"
+          ? "error"
+          : "terminal";
   const shellLauncherRailStateLabel = isGenericTerminal
-    && shellLauncherSelectedAgentId !== SHELL_LAUNCHER_MODE_TERMINAL
-      ? shellLauncherSending
-        ? "launching"
-        : shellLauncherHasLaunched
-          ? "running"
-          : shellLauncherSelectedReady
-            ? "ready"
-            : shellLauncherSelectedStatus
-      : terminalStateDebugLabel;
+    ? shellLauncherSelectedAgentId !== SHELL_LAUNCHER_MODE_TERMINAL
+        ? shellLauncherSending
+          ? "launching"
+          : shellLauncherHasLaunched
+            ? "running"
+            : shellLauncherSelectedReady
+              ? "ready"
+              : shellLauncherSelectedStatus
+        : shellTerminalRailStateLabel
+    : terminalStateDebugLabel;
   const shellLauncherRailDotStyle = isGenericTerminal
     && shellLauncherSelectedAgentId !== SHELL_LAUNCHER_MODE_TERMINAL
       ? {

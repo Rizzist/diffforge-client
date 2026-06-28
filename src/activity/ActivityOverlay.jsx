@@ -8,7 +8,6 @@ import { accountAssetFanoutFromValue } from "../assets/accountAssetV2.js";
 export const ACTIVITY_OVERLAY_HASH = "#/activity-overlay";
 export const ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY = "diffforge.activityOverlay.context";
 
-const CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT = "cloud-mcp-workspace-todos-updated";
 const CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT = "cloud-mcp-account-assets-updated";
 const CLOUD_MCP_WORKSPACE_ASSETS_UPDATED_EVENT = "cloud-mcp-workspace-assets-updated";
 const CLOUD_MCP_SYNC_STATUS_EVENT = "cloud-mcp-sync-status";
@@ -41,8 +40,6 @@ const ACTIVE_FINISH_PIN_MS = 5_000;
 const TRANSFER_HISTORY_CARD_LIMIT = 10;
 const EXIT_CELEBRATE_MS = 1400;
 const EXIT_COLLAPSE_MS = 380;
-const TERMINAL_TODO_WINDOW_MS = 20000;
-const WORKSPACE_TODOS_CACHE_KEY = "diffforge.activityOverlay.workspaceTodos";
 
 function runOverlayWindowAction(action) {
   try {
@@ -101,68 +98,8 @@ function readActivityOverlayContext() {
   }
 }
 
-function storageKeyPart(value) {
-  return text(value, "none")
-    .replace(/[^\w.-]/gu, "_")
-    .slice(0, 120) || "none";
-}
-
-function workspaceTodosCacheKey(context = {}) {
-  return `${WORKSPACE_TODOS_CACHE_KEY}.${storageKeyPart(context.repoPath)}.${storageKeyPart(context.workspaceId)}`;
-}
-
 function activityOverlayContextKey(context = {}) {
   return `${text(context.repoPath)}\n${text(context.workspaceId)}`;
-}
-
-function readCachedWorkspaceTodos(context = {}) {
-  if (typeof window === "undefined") {
-    return {};
-  }
-  try {
-    return jsonObject(window.localStorage.getItem(workspaceTodosCacheKey(context))) || {};
-  } catch {
-    return {};
-  }
-}
-
-// Last-known overview snapshot (small: capped todo rows, 180-char texts) so
-// a freshly booted overlay webview paints real cards on its very first
-// frame; the live fetch then converges it.
-const TODO_OVERVIEW_CACHE_KEY = "diffforge.activityOverlay.todoOverview";
-
-function readCachedTodoOverview() {
-  if (typeof window === "undefined") {
-    return null;
-  }
-  try {
-    return jsonObject(JSON.parse(window.localStorage.getItem(TODO_OVERVIEW_CACHE_KEY) || "null"));
-  } catch {
-    return null;
-  }
-}
-
-function writeCachedTodoOverview(overview) {
-  if (typeof window === "undefined" || !jsonObject(overview)) {
-    return;
-  }
-  try {
-    window.localStorage.setItem(TODO_OVERVIEW_CACHE_KEY, JSON.stringify(overview));
-  } catch {
-    // Snapshot cache is best-effort; the live fetch remains authoritative.
-  }
-}
-
-function writeCachedWorkspaceTodos(value, context = {}) {
-  const workspaceTodos = jsonObject(value);
-  if (typeof window === "undefined" || !workspaceTodos) {
-    return;
-  }
-  try {
-    window.localStorage.setItem(workspaceTodosCacheKey(context), JSON.stringify(workspaceTodos));
-  } catch {
-    // Cache hydration is best-effort; the Rust mirror remains the source of truth.
-  }
 }
 
 function numberValue(value, fallback = 0) {
@@ -398,111 +335,6 @@ function statusProgress(status, fallback = 42) {
   return fallback;
 }
 
-function workspaceTodosFromStatus(status) {
-  const data = dataValue(status);
-  const liveRuntime = jsonObject(data.liveRuntimeStatus || data.live_runtime_status) || {};
-  return jsonObject(
-    data.workspaceTodos
-      || data.workspace_todos
-      || liveRuntime.workspaceTodos
-      || liveRuntime.workspace_todos,
-  ) || {};
-}
-
-function collectionItems(collection) {
-  if (Array.isArray(collection)) {
-    return collection.filter(Boolean);
-  }
-  const object = jsonObject(collection);
-  if (!object) {
-    return [];
-  }
-  if (Array.isArray(object.items)) {
-    return object.items.filter(Boolean);
-  }
-  if (Array.isArray(object.todos)) {
-    return object.todos.filter(Boolean);
-  }
-  if (Array.isArray(object.dispatches)) {
-    return object.dispatches.filter(Boolean);
-  }
-  return [];
-}
-
-function collectionWorkspaceId(entry) {
-  return firstText(
-    entry?.workspaceId,
-    entry?.workspace_id,
-    entry?.observerWorkspaceId,
-    entry?.observer_workspace_id,
-    entry?.targetWorkspaceId,
-    entry?.target_workspace_id,
-  );
-}
-
-function collectionsByWorkspace(collection, workspaceId = "") {
-  const safeWorkspaceId = text(workspaceId);
-  if (Array.isArray(collection)) {
-    return collection
-      .filter((entry) => !safeWorkspaceId || collectionWorkspaceId(entry) === safeWorkspaceId)
-      .flatMap((entry) => collectionItems(entry));
-  }
-  const object = jsonObject(collection);
-  if (!object) {
-    return [];
-  }
-  if (safeWorkspaceId) {
-    const direct = object[safeWorkspaceId] || object[safeWorkspaceId.toLowerCase()];
-    if (direct) {
-      return collectionItems(direct);
-    }
-    return Object.values(object)
-      .filter((entry) => collectionWorkspaceId(entry) === safeWorkspaceId)
-      .flatMap((entry) => collectionItems(entry));
-  }
-  return Object.values(object).flatMap((entry) => collectionItems(entry));
-}
-
-function workspaceIdsForTodoItem(item, kind = "todo") {
-  const common = [
-    item?.workspaceId,
-    item?.workspace_id,
-    item?.observerWorkspaceId,
-    item?.observer_workspace_id,
-    item?.todoWorkspaceId,
-    item?.todo_workspace_id,
-    item?.originWorkspaceId,
-    item?.origin_workspace_id,
-  ];
-  if (kind === "dispatch") {
-    return [
-      item?.targetWorkspaceId,
-      item?.target_workspace_id,
-      ...common,
-    ].map(text).filter(Boolean);
-  }
-  return common.map(text).filter(Boolean);
-}
-
-function todoItemMatchesWorkspace(item, workspaceId, kind = "todo") {
-  const safeWorkspaceId = text(workspaceId);
-  if (!safeWorkspaceId) {
-    return false;
-  }
-  return workspaceIdsForTodoItem(item, kind).some((candidate) => candidate === safeWorkspaceId);
-}
-
-function workspaceTodoCollection(workspaceTodos, directKeys, byWorkspaceKeys, workspaceId = "", kind = "todo") {
-  const safeWorkspaceId = text(workspaceId);
-  if (!safeWorkspaceId) {
-    return [];
-  }
-  const direct = directKeys.flatMap((key) => collectionItems(workspaceTodos?.[key]));
-  const byWorkspace = byWorkspaceKeys.flatMap((key) => collectionsByWorkspace(workspaceTodos?.[key], safeWorkspaceId));
-  const items = byWorkspace.length ? byWorkspace : direct;
-  return items.filter((item) => todoItemMatchesWorkspace(jsonObject(item) || {}, safeWorkspaceId, kind));
-}
-
 function todoIdentity(item, fallback) {
   return firstText(
     item?.todoId,
@@ -592,112 +424,6 @@ function todoUpdatedAt(item) {
   );
 }
 
-function todoRawStatusText(item) {
-  return text(
-    item?.dispatchStatus
-      || item?.dispatch_status
-      || item?.todoStatus
-      || item?.todo_status
-      || item?.cloudStatus
-      || item?.cloud_status
-      || item?.status
-      || item?.state,
-  );
-}
-
-function todoLifecycleRank(status) {
-  const key = statusKey(status, "");
-  if (["done", "failed", "stopped"].includes(key)) {
-    return 3;
-  }
-  if (["active", "paused"].includes(key)) {
-    return 2;
-  }
-  if (key === "queued") {
-    return 1;
-  }
-  return 0;
-}
-
-function todoStatusUpdatedAt(item) {
-  return recentTimestamp(
-    item?.todoStatusUpdatedAt,
-    item?.todo_status_updated_at,
-    item?.statusUpdatedAt,
-    item?.status_updated_at,
-  ) || recentTimestamp(
-    item?.updatedAt,
-    item?.updated_at,
-  );
-}
-
-function todoSettledEvidence(item) {
-  const candidates = [
-    { status: "done", at: firstText(item?.todoCompletedAt, item?.todo_completed_at, item?.completedAt, item?.completed_at) },
-    { status: "stopped", at: firstText(item?.todoCancelledAt, item?.todo_cancelled_at, item?.cancelledAt, item?.cancelled_at, item?.canceledAt, item?.canceled_at) },
-    { status: "failed", at: firstText(item?.todoFailedAt, item?.todo_failed_at, item?.failedAt, item?.failed_at) },
-    { status: "stopped", at: firstText(item?.todoInterruptedAt, item?.todo_interrupted_at, item?.interruptedAt, item?.interrupted_at) },
-    { status: "stopped", at: firstText(item?.todoTimedOutAt, item?.todo_timed_out_at, item?.timedOutAt, item?.timed_out_at, item?.timeoutAt, item?.timeout_at) },
-  ];
-  return candidates
-    .map((candidate) => ({ ...candidate, atMs: timestampMs(candidate.at) }))
-    .filter((candidate) => candidate.at)
-    .sort((left, right) => (right.atMs || 0) - (left.atMs || 0))[0] || null;
-}
-
-function todoLifecycleStatus(item, fallback = "listed") {
-  const rawText = todoRawStatusText(item);
-  const status = statusKey(rawText || fallback, fallback);
-  const evidence = todoSettledEvidence(item);
-  if (!evidence) {
-    return status;
-  }
-  const evidenceRank = todoLifecycleRank(evidence.status);
-  const statusRank = rawText ? todoLifecycleRank(status) : 0;
-  if (!evidenceRank || evidenceRank <= statusRank) {
-    return status;
-  }
-  const statusAt = todoStatusUpdatedAt(item);
-  if (!rawText || !statusAt || !evidence.atMs || evidence.atMs >= statusAt) {
-    return evidence.status;
-  }
-  return status;
-}
-
-function todoDisplayStatus(item, fallback = "listed") {
-  const status = todoLifecycleStatus(item, fallback);
-  if (status === "queued") {
-    return "queued";
-  }
-  if (status === "listed") {
-    return "listed";
-  }
-  return "";
-}
-
-function isLocalTodo(item) {
-  const source = text(item?.sourceKind || item?.source_kind || item?.source || item?.origin).toLowerCase();
-  const mode = text(item?.mode || item?.queueMode || item?.queue_mode || item?.dispatchMode || item?.dispatch_mode).toLowerCase();
-  if (
-    source.includes("remote")
-    || source.includes("dispatch")
-    || mode.includes("remote")
-    || mode.includes("dispatch")
-  ) {
-    return false;
-  }
-  return !(
-    item?.remoteCommand
-    || item?.remote_command
-    || item?.dispatchId
-    || item?.dispatch_id
-    || item?.todoDispatchId
-    || item?.todo_dispatch_id
-    || item?.targetDeviceId
-    || item?.target_device_id
-  );
-}
-
 function uniqueCards(cards, limit = CARD_LIMIT) {
   const byId = new Map();
   cards.filter(Boolean).forEach((card, index) => {
@@ -738,9 +464,7 @@ function todoCardFromItem(item, index, status, options = {}) {
 
 /// Authoritative todo cards from the Rust queue stores (`todo_dispatch_overview`):
 /// running, queued, AND listed todos render with zero cloud dependency — the
-/// store is the headless source of truth, the cloud mirror below only adds
-/// peer-device rows. Card ids share the mirror's `todo-` scheme so the same
-/// logical todo dedupes to the Rust row.
+/// store is the headless source of truth.
 function normalizeOverviewTodoCards(overview) {
   const cards = [];
   jsonArray(overview?.workspaces).forEach((workspace) => {
@@ -807,117 +531,6 @@ function normalizeOverviewTodoCards(overview) {
       });
   });
   return uniqueCards(cards);
-}
-
-function collectOverviewTodoIdentities(overview) {
-  const identities = new Set();
-  jsonArray(overview?.workspaces).forEach((workspace) => {
-    jsonArray(workspace?.items).forEach((item, index) => {
-      const object = jsonObject(item) || {};
-      [
-        todoIdentity(object, index),
-        object.commandId,
-        object.command_id,
-        object.dispatchId,
-        object.dispatch_id,
-        object.todoDispatchId,
-        object.todo_dispatch_id,
-      ]
-        .map(text)
-        .filter(Boolean)
-        .forEach((identity) => identities.add(identity));
-    });
-  });
-  return identities;
-}
-
-function normalizeTodoCards(status, workspaceId = "") {
-  const workspaceTodos = workspaceTodosFromStatus(status);
-  const listedCards = workspaceTodoCollection(
-    workspaceTodos,
-    ["items", "todos"],
-    ["itemsByWorkspace", "items_by_workspace", "todosByWorkspace", "todos_by_workspace"],
-    workspaceId,
-    "todo",
-  ).map((item, index) => {
-    const object = jsonObject(item) || {};
-    const status = todoDisplayStatus(object, "listed");
-    if (status !== "listed") {
-      return null;
-    }
-    return todoCardFromItem(object, index, status, {
-      fallbackTitle: "Listed todo",
-      lane: "todo",
-    });
-  });
-
-  const queuedCards = workspaceTodoCollection(
-    workspaceTodos,
-    ["dispatches", "todoDispatches", "todo_dispatches"],
-    ["dispatchesByWorkspace", "dispatches_by_workspace", "todoDispatchesByWorkspace", "todo_dispatches_by_workspace"],
-    workspaceId,
-    "dispatch",
-  ).map((item, index) => {
-    const object = jsonObject(item) || {};
-    const status = todoDisplayStatus(object, "queued");
-    if (status !== "queued") {
-      return null;
-    }
-    return todoCardFromItem(object, index, status, {
-      fallbackTitle: "Queued todo",
-      lane: "todo-dispatch",
-    });
-  });
-
-  return uniqueCards(
-    [...queuedCards, ...listedCards].filter(Boolean),
-  );
-}
-
-function todoTerminalStatus(item) {
-  const status = todoLifecycleStatus(item, "");
-  if (["done", "failed", "stopped"].includes(status)) {
-    return status;
-  }
-  return "";
-}
-
-/// Recently terminal todos (done/failed/cancelled/interrupted) so the
-/// overlay can play the matching exit animation when an active row leaves.
-function normalizeTerminalTodoStates(status) {
-  const workspaceTodos = workspaceTodosFromStatus(status);
-  const states = new Map();
-  const record = (item) => {
-    const object = jsonObject(item) || {};
-    const terminal = todoTerminalStatus(object);
-    if (!terminal) {
-      return;
-    }
-    const updatedAt = todoUpdatedAt(object);
-    if (!updatedAt || Date.now() - updatedAt > TERMINAL_TODO_WINDOW_MS) {
-      return;
-    }
-    const id = todoIdentity(object, "");
-    if (id) {
-      states.set(`todo-${id}`, terminal);
-      states.set(`todo-dispatch-${id}`, terminal);
-    }
-  };
-  workspaceTodoCollection(
-    workspaceTodos,
-    ["items", "todos"],
-    ["itemsByWorkspace", "items_by_workspace", "todosByWorkspace", "todos_by_workspace"],
-    "",
-    "todo",
-  ).forEach(record);
-  workspaceTodoCollection(
-    workspaceTodos,
-    ["dispatches", "todoDispatches", "todo_dispatches"],
-    ["dispatchesByWorkspace", "dispatches_by_workspace", "todoDispatchesByWorkspace", "todo_dispatches_by_workspace"],
-    "",
-    "dispatch",
-  ).forEach(record);
-  return states;
 }
 
 function assetLibraryTransfers(value) {
@@ -1609,11 +1222,10 @@ function useActivityOverlayContext() {
 
 function useActivityOverlayData(context) {
   const [state, setState] = useState(() => ({
-    cachedWorkspaceTodos: readCachedWorkspaceTodos(context),
     cloudStatus: null,
     errors: [],
     library: null,
-    todoOverview: readCachedTodoOverview(),
+    todoOverview: null,
     updatedAt: 0,
   }));
   const contextRef = useRef(context);
@@ -1639,7 +1251,6 @@ function useActivityOverlayData(context) {
         overviewPendingRef.current = false;
         try {
           const overview = await invoke("todo_dispatch_overview");
-          writeCachedTodoOverview(overview);
           setState((current) => ({
             ...current,
             todoOverview: overview,
@@ -1659,7 +1270,6 @@ function useActivityOverlayData(context) {
     contextKeyRef.current = activityOverlayContextKey(context);
     setState((current) => ({
       ...current,
-      cachedWorkspaceTodos: readCachedWorkspaceTodos(context),
       updatedAt: Date.now(),
     }));
   }, [context.repoPath, context.workspaceId]);
@@ -1672,34 +1282,6 @@ function useActivityOverlayData(context) {
     refreshInFlightRef.current = true;
     const refreshContext = contextRef.current || {};
     const refreshContextKey = activityOverlayContextKey(refreshContext);
-    // The overlay always shows every active workspace; the mirror call is
-    // intentionally unscoped.
-    const cachedTodosPromise = invoke("cloud_mcp_get_cached_workspace_todos", {})
-      .then((value) => {
-        if (contextKeyRef.current !== refreshContextKey) {
-          return null;
-        }
-        const cachedWorkspaceTodos = jsonObject(value) || {};
-        writeCachedWorkspaceTodos(cachedWorkspaceTodos, refreshContext);
-        setState((current) => ({
-          ...current,
-          cachedWorkspaceTodos,
-          errors: current.errors.filter((entry) => entry !== "todos"),
-          updatedAt: Date.now(),
-        }));
-        return cachedWorkspaceTodos;
-      })
-      .catch(() => {
-        if (contextKeyRef.current !== refreshContextKey) {
-          return null;
-        }
-        setState((current) => ({
-          ...current,
-          errors: Array.from(new Set([...current.errors, "todos"])),
-          updatedAt: Date.now(),
-        }));
-        return null;
-      });
     try {
       const [cloudStatusResult, libraryResult, todoOverviewResult] = await Promise.allSettled([
         invoke("cloud_mcp_get_status"),
@@ -1711,18 +1293,11 @@ function useActivityOverlayData(context) {
         // and listed todos render from here with no cloud round trip.
         invoke("todo_dispatch_overview"),
       ]);
-      const refreshedWorkspaceTodos = await cachedTodosPromise;
       if (contextKeyRef.current !== refreshContextKey) {
         return;
       }
-      if (todoOverviewResult.status === "fulfilled") {
-        writeCachedTodoOverview(todoOverviewResult.value);
-      }
       setState((current) => {
         const errors = [];
-        if (!refreshedWorkspaceTodos) {
-          errors.push("todos");
-        }
         if (cloudStatusResult.status === "rejected") {
           errors.push("cloud");
         }
@@ -1730,17 +1305,8 @@ function useActivityOverlayData(context) {
           errors.push("assets");
         }
         const cloudStatus = cloudStatusResult.status === "fulfilled" ? cloudStatusResult.value : current.cloudStatus;
-        const cloudWorkspaceTodos = cloudStatusResult.status === "fulfilled"
-          ? workspaceTodosFromStatus(cloudStatus)
-          : {};
-        const nextWorkspaceTodos = refreshedWorkspaceTodos
-          || (Object.keys(cloudWorkspaceTodos).length
-            ? cloudWorkspaceTodos
-            : current.cachedWorkspaceTodos);
-        writeCachedWorkspaceTodos(nextWorkspaceTodos, refreshContext);
         return {
           ...current,
-          cachedWorkspaceTodos: nextWorkspaceTodos,
           cloudStatus,
           errors,
           library: libraryResult.status === "fulfilled" ? libraryResult.value : current.library,
@@ -1796,7 +1362,6 @@ function useActivityOverlayData(context) {
       }
     };
 
-    void addListener(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, { onEvent: refreshTodoOverview });
     // Rust store mutations (direct captures, queue syncs, settlements,
     // deletes, sweeps) drive the authoritative todo cards; the fast path
     // updates them instantly, the debounced full refresh converges the rest.
@@ -1971,25 +1536,12 @@ export function ActivityOverlayPanel({ embedded = false }) {
   const context = useActivityOverlayContext();
   const data = useActivityOverlayData(context);
   const todoCards = useMemo(() => {
-    // Rust queue stores lead (running/queued/listed, headless truth); the
-    // cloud mirror only adds peer-device rows behind them. Mirror cards for
-    // a todo the store already knows drop by todo identity, even after the
-    // store's completed card ages out of the short finished window.
-    const overviewCards = normalizeOverviewTodoCards(data.todoOverview);
-    const storeIdentities = collectOverviewTodoIdentities(data.todoOverview);
-    overviewCards
-      .map((card) => String(card.id).replace(/^todo-/, ""))
-      .filter(Boolean)
-      .forEach((identity) => storeIdentities.add(identity));
-    const mirrorCards = normalizeTodoCards({ workspaceTodos: data.cachedWorkspaceTodos }, "")
-      .filter((card) => !storeIdentities.has(
-        String(card.id).replace(/^todo-dispatch-/, "").replace(/^todo-/, ""),
-      ));
-    return uniqueCards([...overviewCards, ...mirrorCards]);
-  }, [data.cachedWorkspaceTodos, data.todoOverview]);
+    // The Activity widget's todo rows come from the Rust queue overview only.
+    return normalizeOverviewTodoCards(data.todoOverview);
+  }, [data.todoOverview]);
   const terminalTodoStates = useMemo(
-    () => normalizeTerminalTodoStates({ workspaceTodos: data.cachedWorkspaceTodos }),
-    [data.cachedWorkspaceTodos],
+    () => new Map(),
+    [],
   );
   const transferCards = useMemo(
     () => normalizeTransferCards(data.library),

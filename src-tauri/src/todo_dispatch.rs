@@ -1,12 +1,11 @@
 // Rust-owned todo dispatch ledger.
 //
-// This module is the authoritative store for remote-command receipts (the
-// ledger the webview previously kept in localStorage), plus the lifecycle
-// logic that must survive without a visible window: remote intake recording,
+// This module is the authoritative store for remote-command receipts and the
+// lifecycle logic that must survive without a visible window: remote intake recording,
 // hook-driven settlement of submitted prompts, queue-drain detection, and
-// native notifications. The webview remains the submission actuator and a
-// renderer; every state transition flows through here so a background process
-// can run the full loop later.
+// native notifications. The webview mirrors state and requests mutations;
+// hook-managed todo submission is actuated here so the same path runs in
+// foreground, background, and startup recovery.
 
 const TODO_DISPATCH_RECEIPTS_UPDATED_EVENT: &str = "todo-dispatch-receipts-updated";
 const TODO_DISPATCH_QUEUE_DRAINED_EVENT: &str = "todo-dispatch-queue-drained";
@@ -63,8 +62,8 @@ pub(crate) fn todo_dispatch_is_app_control_terminal_surface(
             .eq_ignore_ascii_case(TODO_DISPATCH_APP_CONTROL_PANE_ID)
 }
 
-/// Mirrors the frontend localStorage key sanitization so the ledger and the
-/// webview mirror always agree on workspace identity.
+/// Keeps ledger filenames aligned with the workspace identity normalization
+/// used by webview callers.
 fn todo_dispatch_safe_workspace_id(workspace_id: &str) -> String {
     let safe = workspace_id
         .trim()
@@ -117,6 +116,28 @@ fn todo_dispatch_normalize_status(value: &str) -> String {
         "timeout" => "timed_out".to_string(),
         "parked" | "resume_ready" | "resume_requested" => "paused".to_string(),
         other => other.to_string(),
+    }
+}
+
+fn todo_store_normalize_lifecycle_status(value: &str) -> String {
+    let status = value.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    match status.as_str() {
+        "queued" | "pending" | "requested" => "queued".to_string(),
+        "sending" | "submitted" | "running" | "dispatching" | "in_flight" | "active"
+        | "processing" => "running".to_string(),
+        "complete" | "completed" | "done" | "finished" | "success" => "completed".to_string(),
+        "cancelled" | "canceled" => "cancelled".to_string(),
+        "paused" | "parked" | "resume_ready" | "resume_requested" | "needs_input"
+        | "awaiting_input" => "paused".to_string(),
+        "interrupted" | "aborted" => "interrupted".to_string(),
+        "timed_out" | "timeout" | "expired" => "timed_out".to_string(),
+        "failed" | "failure" | "error" | "blocked" | "rejected" => "failed".to_string(),
+        "deleted" | "removed" => "deleted".to_string(),
+        "listed" | "list" | "in_list" | "ready" | "released" | "unqueued" | "unqueue"
+        | "terminal_closed" | "terminal_unavailable" | "target_terminal_closed"
+        | "target_terminal_unavailable" | "terminal_instance_changed"
+        | "terminal_thread_changed" => "listed".to_string(),
+        _ => String::new(),
     }
 }
 
@@ -636,8 +657,10 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                     "at": chrono_like_now_iso(),
                 }),
             );
-            // Cloud convergence only when the webview cannot own it; a live
-            // webview pushes a fresher snapshot from its own queue state.
+            // The Rust queue store changed first; mounted webviews refresh from
+            // `todo_store_snapshot`, while background mode can still publish the
+            // local snapshot without needing a visible window.
+            todo_store_emit_changed(app, &workspace_id, "remote_todo_intake", "store");
             if !todo_dispatch_webview_dispatcher_active() {
                 todo_dispatch_push_queue_snapshot(
                     app,
@@ -679,6 +702,31 @@ fn todo_dispatch_normalize_activity_hook_event_type(value: &str) -> String {
     value.trim().to_ascii_lowercase().replace(['_', ' '], "-")
 }
 
+fn todo_dispatch_activity_hook_should_wake_queue(
+    payload: &TerminalActivityHookPayload,
+    event_type: &str,
+) -> bool {
+    if payload.workspace_id.trim().is_empty() {
+        return false;
+    }
+    if payload.input_ready {
+        return true;
+    }
+    if matches!(
+        event_type,
+        "provider-turn-completed" | "provider-turn-error" | "provider-turn-interrupted"
+    ) {
+        return true;
+    }
+    if terminal_projection_state_is_idle(&payload.activity_status)
+        || terminal_projection_state_is_idle(&payload.terminal_status)
+    {
+        return true;
+    }
+    payload.readiness.trim().eq_ignore_ascii_case("ready")
+        && payload.terminal_work_state.trim().eq_ignore_ascii_case("complete")
+}
+
 /// Observe terminal activity hook lifecycle payloads at their Rust emit site.
 /// Handles: attention notifications (approval / user input required) and
 /// settlement of submitted receipts on provider turn completion.
@@ -689,6 +737,9 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
     todo_dispatch_update_terminal_runtime(payload);
     todo_dispatch_note_startup_reconciliation_evidence(app, "activity_hook");
     let event_type = todo_dispatch_normalize_activity_hook_event_type(&payload.event_type);
+    if todo_dispatch_activity_hook_should_wake_queue(payload, &event_type) {
+        todo_dispatch_wake_background_dispatcher(app.clone());
+    }
 
     let needs_attention = payload.manual_approval_required
         || payload.terminal_is_prompting_user
@@ -900,10 +951,9 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
 
 // ---------------------------------------------------------------------------
 // Background dispatcher readiness: queue snapshots, terminal runtime
-// registry, webview dispatcher lease, backend prompt submission, and the
-// replay journal. The Rust dispatcher stays dormant while the webview
-// heartbeats (it owns dispatch when alive); once background mode hides or
-// destroys the window, Rust takes over queued-todo submission seamlessly.
+// registry, backend prompt submission, and the replay journal. Rust owns
+// queued-todo submission in foreground and background; the webview only
+// mirrors store state and asks Rust for explicit user mutations.
 // ---------------------------------------------------------------------------
 
 const TODO_DISPATCH_DISPATCHER_LEASE_MS: u64 = 15_000;
@@ -913,9 +963,11 @@ const TODO_DISPATCH_JOURNAL_MAX_ENTRIES: usize = 200;
 const TODO_DISPATCH_STARTUP_RECONCILE_EVENT: &str = "todo-dispatch-startup-reconcile";
 const TODO_DISPATCH_STARTUP_RECONCILE_MS: u64 = 45_000;
 const TODO_DISPATCH_STARTUP_RECONCILE_MIN_MS: u64 = 1_500;
+const TODO_STORE_DRAFT_TEXT_MAX_CHARS: usize = 2_000_000;
 
 static TODO_DISPATCH_WEBVIEW_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
 static TODO_DISPATCH_TERMINAL_RUNTIME: OnceLock<StdMutex<HashMap<String, Value>>> = OnceLock::new();
+static TODO_DISPATCH_BACKEND_TICK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 static TODO_DISPATCH_STARTUP_RECONCILE_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 static TODO_DISPATCH_STARTUP_RECONCILE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 static TODO_DISPATCH_STARTUP_RECONCILE_OBSERVED_MS: AtomicU64 = AtomicU64::new(0);
@@ -942,6 +994,11 @@ fn todo_dispatch_data_workspace_files(kind: &str) -> Vec<PathBuf> {
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
         .collect()
+}
+
+fn todo_dispatch_workspace_is_deleted(workspace_id: &str) -> bool {
+    let workspace_id = workspace_id.trim();
+    !workspace_id.is_empty() && cloud_mcp_deleted_workspace_ids().contains(workspace_id)
 }
 
 fn todo_dispatch_queue_read(path: &Path) -> Value {
@@ -1617,7 +1674,10 @@ fn todo_store_item_status(item: &Value) -> String {
 }
 
 fn todo_store_item_explicit_status(item: &Value) -> String {
-    todo_dispatch_text(item, &["todoStatus", "todo_status", "status"]).to_ascii_lowercase()
+    todo_store_normalize_lifecycle_status(&todo_dispatch_text(
+        item,
+        &["todoStatus", "todo_status", "cloudStatus", "cloud_status", "status"],
+    ))
 }
 
 fn todo_store_item_status_stamp_ms(item: &Value) -> u64 {
@@ -1798,11 +1858,93 @@ fn todo_store_canonicalize_settled_evidence(item: &mut Value) -> bool {
     true
 }
 
+fn todo_store_canonicalize_status_fields(item: &mut Value) -> bool {
+    let status = todo_store_item_status(item);
+    if status.is_empty() {
+        return false;
+    }
+    let reason = todo_dispatch_text(
+        item,
+        &[
+            "reason",
+            "todoStatusReason",
+            "todo_status_reason",
+            "statusReason",
+            "status_reason",
+        ],
+    );
+    let status_updated_at = todo_dispatch_text(
+        item,
+        &[
+            "todoStatusUpdatedAt",
+            "todo_status_updated_at",
+            "statusUpdatedAt",
+            "status_updated_at",
+            "updatedAt",
+            "updated_at",
+            "createdAt",
+            "created_at",
+        ],
+    );
+    let Some(object) = item.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in ["todoStatus", "status"] {
+        if object.get(key).and_then(Value::as_str) != Some(status.as_str()) {
+            object.insert(key.to_string(), json!(status.clone()));
+            changed = true;
+        }
+    }
+    if !status_updated_at.is_empty() {
+        if object.get("todoStatusUpdatedAt").and_then(Value::as_str) != Some(status_updated_at.as_str())
+        {
+            object.insert("todoStatusUpdatedAt".to_string(), json!(status_updated_at.clone()));
+            changed = true;
+        }
+        let has_updated_at = object
+            .get("updatedAt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| !value.is_empty());
+        if !has_updated_at {
+            object.insert("updatedAt".to_string(), json!(status_updated_at));
+            changed = true;
+        }
+    }
+    if !reason.is_empty() {
+        if object.get("todoStatusReason").and_then(Value::as_str) != Some(reason.as_str()) {
+            object.insert("todoStatusReason".to_string(), json!(reason.clone()));
+            changed = true;
+        }
+        if object.get("statusReason").and_then(Value::as_str) != Some(reason.as_str()) {
+            object.insert("statusReason".to_string(), json!(reason));
+            changed = true;
+        }
+    }
+    changed
+}
+
+fn todo_store_strip_legacy_queue_state(item: &mut Value) -> bool {
+    let Some(object) = item.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    for key in ["queueState", "queue_state"] {
+        if object.remove(key).is_some() {
+            changed = true;
+        }
+    }
+    changed
+}
+
 fn todo_store_canonicalize_settled_items(items: Vec<Value>) -> Vec<Value> {
     items
         .into_iter()
         .map(|mut item| {
+            todo_store_strip_legacy_queue_state(&mut item);
             todo_store_canonicalize_settled_evidence(&mut item);
+            todo_store_canonicalize_status_fields(&mut item);
             item
         })
         .collect()
@@ -1821,16 +1963,33 @@ fn todo_store_item_pane_id(item: &Value) -> String {
 }
 
 fn todo_store_set_item_status(item: &mut Value, status: &str, reason: &str) {
+    let status = todo_store_normalize_lifecycle_status(status);
+    if status.is_empty() {
+        return;
+    }
     let now_iso = chrono_like_now_iso();
     if let Some(object) = item.as_object_mut() {
-        object.insert("todoStatus".to_string(), json!(status));
-        object.insert("status".to_string(), json!(status));
+        object.insert("todoStatus".to_string(), json!(status.clone()));
+        object.insert("status".to_string(), json!(status.clone()));
         object.insert("todoStatusReason".to_string(), json!(reason));
         object.insert("statusReason".to_string(), json!(reason));
         object.insert("todoStatusUpdatedAt".to_string(), json!(now_iso.clone()));
         object.insert("updatedAt".to_string(), json!(now_iso.clone()));
         object.insert("updatedAtMs".to_string(), json!(todo_dispatch_now_ms()));
-        match status {
+        object.insert("lifecycleOwner".to_string(), json!("rust"));
+        object.insert("rustOwned".to_string(), json!(true));
+        object.remove("queueState");
+        object.remove("queue_state");
+        match status.as_str() {
+            "queued" => {
+                object
+                    .entry("queuedAt".to_string())
+                    .or_insert_with(|| json!(now_iso.clone()));
+                object
+                    .entry("queued_at".to_string())
+                    .or_insert_with(|| json!(now_iso));
+            }
+            "listed" => {}
             "completed" => {
                 object.insert("todoCompletedAt".to_string(), json!(now_iso.clone()));
                 object.insert("completedAt".to_string(), json!(now_iso));
@@ -2596,6 +2755,14 @@ async fn todo_store_snapshot(workspace_id: String) -> Result<Value, String> {
         if workspace_id.is_empty() {
             return Err("workspace_id is required.".to_string());
         }
+        if todo_dispatch_workspace_is_deleted(&workspace_id) {
+            return Ok(json!({
+                "workspaceId": workspace_id,
+                "items": [],
+                "tombstonedIds": [],
+                "updatedAtMs": todo_dispatch_now_ms(),
+            }));
+        }
         let tombstoned = todo_store_tombstone_ids(&workspace_id);
         let snapshot = todo_dispatch_data_path("queues", &workspace_id)
             .map(|path| todo_dispatch_queue_read(&path))
@@ -2616,6 +2783,358 @@ async fn todo_store_snapshot(workspace_id: String) -> Result<Value, String> {
     })
     .await
     .map_err(|error| format!("Todo store snapshot worker failed: {error}"))?
+}
+
+fn todo_store_normalize_draft_text(value: &str, max_chars: usize) -> String {
+    value
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .trim()
+        .chars()
+        .take(max_chars)
+        .collect()
+}
+
+fn todo_store_draft_text(draft: &Value, keys: &[&str], max_chars: usize) -> String {
+    todo_store_normalize_draft_text(&todo_dispatch_text(draft, keys), max_chars)
+}
+
+fn todo_store_draft_images(draft: &Value) -> Vec<Value> {
+    let mut images = draft
+        .get("images")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|image| image.is_object())
+        .collect::<Vec<_>>();
+    if let Some(image) = draft.get("image").filter(|image| image.is_object()) {
+        images.insert(0, image.clone());
+    }
+    images
+}
+
+fn todo_store_draft_note(draft: &Value) -> Option<Value> {
+    let note = draft.get("note").filter(|note| note.is_object())?;
+    let title = todo_store_draft_text(note, &["title", "name"], TODO_STORE_DRAFT_TEXT_MAX_CHARS);
+    let text = todo_store_draft_text(
+        note,
+        &["text", "body", "content"],
+        TODO_STORE_DRAFT_TEXT_MAX_CHARS,
+    );
+    if title.is_empty() && text.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "title": title,
+        "text": text,
+    }))
+}
+
+fn todo_store_insert_if_present(
+    target: &mut serde_json::Map<String, Value>,
+    draft: &Value,
+    target_key: &str,
+    source_keys: &[&str],
+) {
+    for key in source_keys {
+        if let Some(value) = draft.get(*key).filter(|value| !value.is_null()) {
+            target.insert(target_key.to_string(), value.clone());
+            return;
+        }
+    }
+}
+
+fn todo_store_build_created_item(
+    workspace_id: &str,
+    draft: &Value,
+    reason: &str,
+) -> Result<Value, String> {
+    let text = todo_store_draft_text(
+        draft,
+        &["text", "body", "title"],
+        TODO_STORE_DRAFT_TEXT_MAX_CHARS,
+    );
+    let images = todo_store_draft_images(draft);
+    let note = todo_store_draft_note(draft);
+    if text.is_empty() && images.is_empty() && note.is_none() {
+        return Err("Todo text, image, or note is required.".to_string());
+    }
+
+    let now_iso = chrono_like_now_iso();
+    let now_ms = todo_dispatch_now_ms();
+    let id = format!("todo-{}-{}", now_ms, uuid::Uuid::new_v4());
+    let kind = todo_dispatch_text(draft, &["kind", "type"]);
+    let kind = if kind.is_empty() { "todo".to_string() } else { kind };
+    let source = todo_dispatch_text(draft, &["source", "sourceKind", "source_kind"]);
+    let source = if source.is_empty() {
+        "tui-todo-auto-queue".to_string()
+    } else {
+        source
+    };
+    let requested_status = todo_store_normalize_lifecycle_status(&todo_dispatch_text(
+        draft,
+        &["todoStatus", "todo_status", "status"],
+    ));
+    let status = if requested_status.is_empty() {
+        "listed".to_string()
+    } else {
+        requested_status
+    };
+
+    let mut object = serde_json::Map::new();
+    object.insert("createdAt".to_string(), json!(now_iso.clone()));
+    object.insert("deviceId".to_string(), json!(todo_dispatch_text(draft, &["deviceId", "device_id"])));
+    object.insert("id".to_string(), json!(id.clone()));
+    object.insert("kind".to_string(), json!(kind));
+    object.insert("lifecycleOwner".to_string(), json!("rust"));
+    object.insert("rustOwned".to_string(), json!(true));
+    object.insert("source".to_string(), json!(source));
+    object.insert("status".to_string(), json!(status.clone()));
+    object.insert("statusReason".to_string(), json!(reason));
+    object.insert("text".to_string(), json!(text));
+    object.insert("todoId".to_string(), json!(id));
+    object.insert("todoStatus".to_string(), json!(status));
+    object.insert("todoStatusReason".to_string(), json!(reason));
+    object.insert("todoStatusUpdatedAt".to_string(), json!(now_iso.clone()));
+    object.insert("updatedAt".to_string(), json!(now_iso));
+    object.insert("updatedAtMs".to_string(), json!(now_ms));
+    object.insert("workspaceId".to_string(), json!(workspace_id));
+
+    if let Some(image) = images.first() {
+        object.insert("image".to_string(), image.clone());
+    }
+    if images.len() > 1 {
+        object.insert("images".to_string(), json!(images));
+    }
+    if let Some(note) = note {
+        object.insert("note".to_string(), note);
+    }
+
+    for (target_key, source_keys) in [
+        ("title", &["title", "name"][..]),
+        (
+            "planTask",
+            &["planTask", "plan_task"][..],
+        ),
+        (
+            "remoteCommand",
+            &["remoteCommand", "remote_command"][..],
+        ),
+        (
+            "inputs",
+            &["inputs", "todoInputs", "todo_inputs"][..],
+        ),
+        ("model", &["model", "modelId", "model_id"][..]),
+        (
+            "modelId",
+            &["modelId", "model_id", "model"][..],
+        ),
+        (
+            "effort",
+            &["effort", "reasoningEffort", "reasoning_effort"][..],
+        ),
+        (
+            "reasoningEffort",
+            &["reasoningEffort", "reasoning_effort", "effort"][..],
+        ),
+        ("speed", &["speed"][..]),
+        (
+            "targetAgentId",
+            &["targetAgentId", "target_agent_id", "targetRole", "target_role"][..],
+        ),
+        (
+            "targetAgentLabel",
+            &["targetAgentLabel", "target_agent_label"][..],
+        ),
+        (
+            "targetTerminalId",
+            &["targetTerminalId", "target_terminal_id", "terminalId", "terminal_id", "paneId", "pane_id"][..],
+        ),
+        (
+            "targetTerminalIndex",
+            &["targetTerminalIndex", "target_terminal_index", "terminalIndex", "terminal_index"][..],
+        ),
+        (
+            "targetTerminalName",
+            &["targetTerminalName", "target_terminal_name", "terminalName", "terminal_name"][..],
+        ),
+        (
+            "targetThreadId",
+            &["targetThreadId", "target_thread_id", "threadId", "thread_id"][..],
+        ),
+        (
+            "targetColorSlot",
+            &["targetColorSlot", "target_color_slot", "colorSlot", "color_slot"][..],
+        ),
+        (
+            "targetTerminalColor",
+            &["targetTerminalColor", "target_terminal_color", "terminalColor", "terminal_color"][..],
+        ),
+    ] {
+        todo_store_insert_if_present(&mut object, draft, target_key, source_keys);
+    }
+
+    if draft.get("targetExplicit").and_then(Value::as_bool) == Some(true)
+        || draft.get("explicitTarget").and_then(Value::as_bool) == Some(true)
+        || draft.get("userPinnedTarget").and_then(Value::as_bool) == Some(true)
+    {
+        object.insert("targetExplicit".to_string(), json!(true));
+        object.insert("explicitTarget".to_string(), json!(true));
+        object.insert("userPinnedTarget".to_string(), json!(true));
+    }
+
+    let mut item = Value::Object(object);
+    todo_store_canonicalize_status_fields(&mut item);
+    Ok(item)
+}
+
+#[tauri::command]
+async fn todo_store_create(
+    app: AppHandle,
+    workspace_id: String,
+    draft: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("workspace_id is required.".to_string());
+    }
+    if todo_dispatch_workspace_is_deleted(&workspace_id) {
+        return Err("workspace has been deleted.".to_string());
+    }
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "todo_store_create".to_string());
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let item = todo_store_build_created_item(&workspace_id, &draft, &reason)?;
+        let item_id = todo_store_item_sync_id(&item);
+        if item_id.is_empty() {
+            return Err("Created todo is missing an id.".to_string());
+        }
+        let tombstoned = todo_store_tombstone_ids(&workspace_id);
+        if todo_store_item_is_tombstoned(&item, &tombstoned) {
+            return Err("Created todo id is tombstoned.".to_string());
+        }
+
+        let mut items = todo_dispatch_data_path("queues", &workspace_id)
+            .map(|path| {
+                todo_dispatch_queue_read(&path)
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
+        items.retain(|candidate| !todo_store_item_matches_id(candidate, &item_id));
+        items.push(item.clone());
+        todo_dispatch_queue_write(&workspace_id, &items);
+        todo_store_push_items(&app, &workspace_id, vec![item.clone()], &reason);
+        todo_store_emit_changed(&app, &workspace_id, &reason, "store");
+        if todo_store_item_status(&item) == "queued" {
+            todo_dispatch_wake_background_dispatcher(app.clone());
+        }
+        Ok(json!({
+            "ok": true,
+            "workspaceId": workspace_id,
+            "item": item,
+        }))
+    })
+    .await
+    .map_err(|error| format!("Todo store create worker failed: {error}"))?
+}
+
+fn todo_store_apply_update_patch(item: &mut Value, patch: &Value) -> bool {
+    let Some(object) = item.as_object_mut() else {
+        return false;
+    };
+    let mut changed = false;
+    let text_patch = patch
+        .get("text")
+        .or_else(|| patch.get("body"))
+        .or_else(|| patch.get("title"));
+    if let Some(value) = text_patch {
+        let text = todo_store_normalize_draft_text(
+            value.as_str().unwrap_or_default(),
+            TODO_STORE_DRAFT_TEXT_MAX_CHARS,
+        );
+        if object.get("text").and_then(Value::as_str) != Some(text.as_str()) {
+            object.insert("text".to_string(), json!(text));
+            changed = true;
+        }
+    }
+    if changed {
+        let now_iso = chrono_like_now_iso();
+        object.insert("updatedAt".to_string(), json!(now_iso));
+        object.insert("updatedAtMs".to_string(), json!(todo_dispatch_now_ms()));
+    }
+    changed
+}
+
+#[tauri::command]
+async fn todo_store_update(
+    app: AppHandle,
+    workspace_id: String,
+    todo_id: String,
+    patch: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("workspace_id is required.".to_string());
+    }
+    let todo_id = todo_id.trim().to_string();
+    if todo_id.is_empty() {
+        return Err("todo_id is required.".to_string());
+    }
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "todo_store_update".to_string());
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let tombstoned = todo_store_tombstone_ids(&workspace_id);
+        if tombstoned.contains(&todo_id) {
+            return Err("Todo id is tombstoned.".to_string());
+        }
+        let Some(path) = todo_dispatch_data_path("queues", &workspace_id) else {
+            return Err("Todo store path is unavailable.".to_string());
+        };
+        let mut items = todo_dispatch_queue_read(&path)
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut updated_item: Option<Value> = None;
+        for item in items.iter_mut() {
+            if !todo_store_item_matches_id(item, &todo_id) {
+                continue;
+            }
+            if todo_store_item_is_tombstoned(item, &tombstoned) {
+                return Err("Todo id is tombstoned.".to_string());
+            }
+            todo_store_apply_update_patch(item, &patch);
+            todo_store_canonicalize_settled_evidence(item);
+            todo_store_canonicalize_status_fields(item);
+            updated_item = Some(item.clone());
+            break;
+        }
+        let Some(item) = updated_item else {
+            return Err("Todo was not found in the Rust store.".to_string());
+        };
+        todo_dispatch_queue_write(&workspace_id, &items);
+        todo_store_push_items(&app, &workspace_id, vec![item.clone()], &reason);
+        todo_store_emit_changed(&app, &workspace_id, &reason, "store");
+        Ok(json!({
+            "ok": true,
+            "workspaceId": workspace_id,
+            "item": item,
+        }))
+    })
+    .await
+    .map_err(|error| format!("Todo store update worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -2842,11 +3361,23 @@ fn todo_store_apply_target_fields(
     if clear_target {
         for key in [
             "targetColorSlot",
+            "target_color_slot",
             "targetTerminalColor",
+            "target_terminal_color",
             "targetTerminalId",
+            "target_terminal_id",
             "targetTerminalIndex",
+            "target_terminal_index",
             "targetTerminalName",
+            "target_terminal_name",
             "targetThreadId",
+            "target_thread_id",
+            "targetExplicit",
+            "target_explicit",
+            "explicitTarget",
+            "explicit_target",
+            "userPinnedTarget",
+            "user_pinned_target",
         ] {
             object.remove(key);
         }
@@ -2854,6 +3385,9 @@ fn todo_store_apply_target_fields(
     }
     if let Some(index) = target_terminal_index {
         object.insert("targetTerminalIndex".to_string(), json!(index));
+        object.insert("targetExplicit".to_string(), json!(true));
+        object.insert("explicitTarget".to_string(), json!(true));
+        object.insert("userPinnedTarget".to_string(), json!(true));
     }
     for (key, value) in [
         ("targetTerminalId", target_terminal_id),
@@ -2862,6 +3396,11 @@ fn todo_store_apply_target_fields(
     ] {
         if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
             object.insert(key.to_string(), json!(value));
+            if key != "targetAgentId" {
+                object.insert("targetExplicit".to_string(), json!(true));
+                object.insert("explicitTarget".to_string(), json!(true));
+                object.insert("userPinnedTarget".to_string(), json!(true));
+            }
         }
     }
 }
@@ -2874,6 +3413,7 @@ async fn todo_store_set_status(
     todo_id: Option<String>,
     command_id: Option<String>,
     dispatch_id: Option<String>,
+    item: Option<Value>,
     status: String,
     reason: Option<String>,
     target_terminal_index: Option<i64>,
@@ -2886,10 +3426,19 @@ async fn todo_store_set_status(
     if workspace_id.is_empty() {
         return Err("workspace_id is required.".to_string());
     }
-    let status = status.trim().to_ascii_lowercase();
+    let status = todo_store_normalize_lifecycle_status(&status);
     if !matches!(
         status.as_str(),
-        "listed" | "queued" | "cancelled" | "interrupted" | "completed" | "failed"
+        "listed"
+            | "queued"
+            | "running"
+            | "paused"
+            | "cancelled"
+            | "interrupted"
+            | "completed"
+            | "failed"
+            | "timed_out"
+            | "deleted"
     ) {
         return Err(format!("Unsupported todo status: {status}"));
     }
@@ -2906,6 +3455,7 @@ async fn todo_store_set_status(
     if refs.is_empty() {
         return Err("A todo id, command id, or dispatch id is required.".to_string());
     }
+    let item_payload = item.filter(|value| value.is_object());
 
     tauri::async_runtime::spawn_blocking(move || {
         let clear_target = clear_target.unwrap_or(false);
@@ -2950,6 +3500,7 @@ async fn todo_store_set_status(
                     .find_map(|reference| {
                         cloud_mcp_todo_mirror_correction_item(&workspace_id, reference)
                     })
+                    .or_else(|| item_payload.clone())
                     .unwrap_or_else(|| {
                         json!({
                             "id": refs[0],
@@ -2958,24 +3509,56 @@ async fn todo_store_set_status(
                             "workspaceId": workspace_id,
                         })
                     });
+                if let Some(object) = item.as_object_mut() {
+                    object
+                        .entry("id".to_string())
+                        .or_insert_with(|| json!(refs[0].clone()));
+                    object
+                        .entry("todoId".to_string())
+                        .or_insert_with(|| json!(refs[0].clone()));
+                    object
+                        .entry("kind".to_string())
+                        .or_insert_with(|| json!("todo"));
+                    object.insert("workspaceId".to_string(), json!(workspace_id.clone()));
+                }
                 todo_store_set_item_status(&mut item, &status, &reason);
                 apply_targets(&mut item);
                 item
             }
         };
+        if matched_item.is_none() {
+            if let Some(path) = todo_dispatch_data_path("queues", &workspace_id) {
+                let mut items = todo_dispatch_queue_read(&path)
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                items.retain(|candidate| {
+                    !refs
+                        .iter()
+                        .any(|reference| todo_store_item_matches_id(candidate, reference))
+                });
+                items.push(correction.clone());
+                todo_dispatch_queue_write(&workspace_id, &items);
+            }
+        }
         todo_store_push_corrections(&app, &workspace_id, vec![correction.clone()], &reason);
         todo_store_enqueue_item_todo_sync_commit(
             &app,
             &workspace_id,
-            correction,
+            correction.clone(),
             &reason,
             "rust-diffforge-todo-store",
         );
         todo_store_emit_changed(&app, &workspace_id, &reason, "store");
+        if status == "queued" {
+            todo_dispatch_wake_background_dispatcher(app.clone());
+        }
         Ok(json!({
             "ok": true,
             "workspaceId": workspace_id,
             "status": status,
+            "item": correction,
             "matchedInStore": matched_item.is_some(),
         }))
     })
@@ -2983,63 +3566,207 @@ async fn todo_store_set_status(
     .map_err(|error| format!("Todo store set-status worker failed: {error}"))?
 }
 
+fn todo_store_queue_all_apply_core(
+    mut stored_items: Vec<Value>,
+    requested_items: Vec<Value>,
+    workspace_id: &str,
+    reason: &str,
+) -> (Vec<Value>, Vec<Value>) {
+    let mut corrections = Vec::new();
+    let mut queued_ids = HashSet::new();
+
+    for requested_item in requested_items {
+        if !requested_item.is_object() {
+            continue;
+        }
+        let item_id = todo_store_item_sync_id(&requested_item);
+        if item_id.is_empty() || queued_ids.contains(&item_id) {
+            continue;
+        }
+        let text = todo_dispatch_backend_item_text(&requested_item);
+        if text.is_empty() || todo_dispatch_backend_item_has_image_attachment(&requested_item) {
+            continue;
+        }
+        queued_ids.insert(item_id.clone());
+
+        let mut updated = None;
+        for stored_item in &mut stored_items {
+            if !todo_store_item_matches_id(stored_item, &item_id) {
+                continue;
+            }
+            let status = todo_store_item_status(stored_item);
+            if matches!(
+                status.as_str(),
+                "queued" | "running" | "completed" | "deleted"
+            ) {
+                updated = Some(stored_item.clone());
+                break;
+            }
+            todo_store_set_item_status(stored_item, "queued", reason);
+            todo_store_apply_target_fields(stored_item, true, None, None, None, None);
+            updated = Some(stored_item.clone());
+            break;
+        }
+        if updated.is_none() {
+            let mut item = requested_item.clone();
+            if let Some(object) = item.as_object_mut() {
+                object.insert("id".to_string(), json!(item_id.clone()));
+                object
+                    .entry("todoId".to_string())
+                    .or_insert_with(|| json!(item_id.clone()));
+                object
+                    .entry("kind".to_string())
+                    .or_insert_with(|| json!("todo"));
+                object.insert("workspaceId".to_string(), json!(workspace_id));
+            }
+            todo_store_set_item_status(&mut item, "queued", reason);
+            todo_store_apply_target_fields(&mut item, true, None, None, None, None);
+            stored_items.push(item.clone());
+            updated = Some(item);
+        }
+        if let Some(item) = updated {
+            if todo_store_item_status(&item) == "queued" {
+                corrections.push(item);
+            }
+        }
+    }
+
+    (stored_items, corrections)
+}
+
+#[tauri::command]
+async fn todo_store_queue_all(
+    app: AppHandle,
+    workspace_id: String,
+    items: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("workspace_id is required.".to_string());
+    }
+    let requested_items = items.as_array().cloned().unwrap_or_default();
+    if requested_items.is_empty() {
+        return Ok(json!({
+            "ok": true,
+            "workspaceId": workspace_id,
+            "queuedCount": 0,
+            "items": [],
+        }));
+    }
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "todo_store_queue_all".to_string());
+
+    let tick_lock = TODO_DISPATCH_BACKEND_TICK_LOCK.get_or_init(|| Mutex::new(()));
+    let _tick_guard = tick_lock.lock().await;
+
+    let result = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        let workspace_id = workspace_id.clone();
+        let reason = reason.clone();
+        move || {
+            let stored_items = todo_dispatch_data_path("queues", &workspace_id)
+                .map(|path| {
+                    todo_dispatch_queue_read(&path)
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let (stored_items, corrections) = todo_store_queue_all_apply_core(
+                stored_items,
+                requested_items,
+                &workspace_id,
+                &reason,
+            );
+
+            if !corrections.is_empty() {
+                todo_dispatch_queue_write(&workspace_id, &stored_items);
+                todo_store_push_corrections(&app, &workspace_id, corrections.clone(), &reason);
+                for item in &corrections {
+                    todo_store_enqueue_item_todo_sync_commit(
+                        &app,
+                        &workspace_id,
+                        item.clone(),
+                        &reason,
+                        "rust-diffforge-todo-store",
+                    );
+                }
+                todo_store_emit_changed(&app, &workspace_id, &reason, "store");
+            }
+
+            Ok::<Value, String>(json!({
+                "ok": true,
+                "workspaceId": workspace_id,
+                "queuedCount": corrections.len(),
+                "items": corrections,
+            }))
+        }
+    })
+    .await
+    .map_err(|error| format!("Todo store queue-all worker failed: {error}"))??;
+
+    todo_dispatch_wake_background_dispatcher(app.clone());
+    Ok(result)
+}
+
 /// Standing orphan sweep: running/sending rows that nothing is actually
 /// driving flip to `interrupted` instead of haunting every view forever.
-/// Queue-store items are only swept while no webview owns the queue (a live
-/// webview manages its own items); stale device-local mirror rows are healed
-/// regardless, because nothing else will ever settle them.
+/// Rust owns queue-store settlement in foreground and background; stale
+/// device-local mirror rows are healed too, because nothing else will ever
+/// settle them.
 async fn todo_store_orphan_sweep_tick(app: &AppHandle) {
-    let webview_alive = todo_dispatch_webview_dispatcher_active();
     let now_ms = todo_dispatch_now_ms();
 
-    if !webview_alive {
-        for path in todo_dispatch_data_workspace_files("queues") {
-            let snapshot = todo_dispatch_queue_read(&path);
-            let workspace_id = snapshot
-                .get("workspaceId")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or_default()
-                .to_string();
-            if workspace_id.is_empty() {
-                continue;
-            }
-            let file_age_ms = now_ms.saturating_sub(
-                snapshot
-                    .get("updatedAtMs")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0),
-            );
-            if file_age_ms < TODO_STORE_ORPHAN_AFTER_MS {
-                continue;
-            }
-            let mut items = snapshot
-                .get("items")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let mut flipped = Vec::new();
-            for item in items.iter_mut() {
-                let status = todo_store_item_status(item);
-                if !TODO_STORE_ACTIVE_RUN_STATUSES.contains(&status.as_str()) {
-                    continue;
-                }
-                let pane_id = todo_store_item_pane_id(item);
-                // A pane mid-turn (inputReady == false) is legitimately busy;
-                // everything else (idle pane, dead pane, no pane) is orphaned.
-                if !pane_id.is_empty() && todo_dispatch_pane_input_ready(&pane_id) == Some(false) {
-                    continue;
-                }
-                todo_store_set_item_status(item, "interrupted", "todo_store_orphan_sweep");
-                flipped.push(item.clone());
-            }
-            if flipped.is_empty() {
-                continue;
-            }
-            todo_dispatch_queue_write(&workspace_id, &items);
-            todo_store_push_corrections(app, &workspace_id, flipped, "todo_store_orphan_sweep");
-            todo_store_emit_changed(app, &workspace_id, "todo_store_orphan_sweep", "store");
+    for path in todo_dispatch_data_workspace_files("queues") {
+        let snapshot = todo_dispatch_queue_read(&path);
+        let workspace_id = snapshot
+            .get("workspaceId")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        if workspace_id.is_empty() {
+            continue;
         }
+        let file_age_ms = now_ms.saturating_sub(
+            snapshot
+                .get("updatedAtMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        );
+        if file_age_ms < TODO_STORE_ORPHAN_AFTER_MS {
+            continue;
+        }
+        let mut items = snapshot
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut flipped = Vec::new();
+        for item in items.iter_mut() {
+            let status = todo_store_item_status(item);
+            if !TODO_STORE_ACTIVE_RUN_STATUSES.contains(&status.as_str()) {
+                continue;
+            }
+            let pane_id = todo_store_item_pane_id(item);
+            // A pane mid-turn (inputReady == false) is legitimately busy;
+            // everything else (idle pane, dead pane, no pane) is orphaned.
+            if !pane_id.is_empty() && todo_dispatch_pane_input_ready(&pane_id) == Some(false) {
+                continue;
+            }
+            todo_store_set_item_status(item, "interrupted", "todo_store_orphan_sweep");
+            flipped.push(item.clone());
+        }
+        if flipped.is_empty() {
+            continue;
+        }
+        todo_dispatch_queue_write(&workspace_id, &items);
+        todo_store_push_corrections(app, &workspace_id, flipped, "todo_store_orphan_sweep");
+        todo_store_emit_changed(app, &workspace_id, "todo_store_orphan_sweep", "store");
     }
 
     // Device-local mirror rows stuck running/sending that the queue store no
@@ -3068,7 +3795,7 @@ async fn todo_store_orphan_sweep_tick(app: &AppHandle) {
             })
             .unwrap_or(false);
         if tracked {
-            // The queue-store pass above (or the live webview) owns this row.
+            // The queue-store pass above owns this row.
             continue;
         }
         todo_store_set_item_status(&mut item, "interrupted", "todo_store_orphan_sweep");
@@ -3109,9 +3836,8 @@ const TODO_STORE_SWEEP_REASONS: [&str; 3] = [
 const TODO_STORE_SWEPT_ACTIVE_STATUSES: [&str; 5] =
     ["queued", "sending", "submitted", "running", "dispatching"];
 
-/// Sweep flips are sticky against stale replicas: a webview snapshot loaded
-/// from localStorage before the startup/orphan sweep ran still claims
-/// queued/running for items the store already settled. An incoming active
+/// Sweep flips are sticky against stale replicas: a stale webview snapshot may
+/// still claim queued/running for items the store already settled. An incoming active
 /// claim only wins over a sweep-settled row when its status timestamp is
 /// strictly newer than the flip (a real user re-queue stamps a fresh one).
 fn todo_store_keep_settled_sweep_flips_core(
@@ -3167,9 +3893,8 @@ fn todo_store_keep_settled_sweep_flips_core(
 // The queue store retains settled rows (completed/cancelled/failed/
 // interrupted/timed_out) so finished todos stay visible in Todos History
 // without any cloud round trip, and `todo_store_history` is the single read
-// door the history view uses: queue-store rows (device truth, leading) merged
-// with cloud-mirror rows (peer devices, titled rows), deduped by the todo's
-// whole id family so one logical todo is always one history entry.
+// door the history view uses: queue-store rows only, deduped by the todo's whole
+// id family so one logical todo is always one history entry.
 // ---------------------------------------------------------------------------
 
 const TODO_STORE_SETTLED_RETENTION_STATUSES: [&str; 5] = [
@@ -3305,14 +4030,172 @@ fn todo_dispatch_parse_iso_ms(value: &str) -> Option<u64> {
 /// Lifecycle progress rank for the forward-only status rule on Rust-owned
 /// rows: listed (or missing) < queued < running family < settled family.
 fn todo_store_status_rank(status: &str) -> u8 {
-    match status {
+    let status = todo_store_normalize_lifecycle_status(status);
+    match status.as_str() {
         "queued" => 1,
-        "sending" | "dispatching" | "running" => 2,
-        "completed" | "cancelled" | "failed" | "interrupted" | "timed_out" | "deleted" | "done" => {
-            3
-        }
+        "paused" | "running" => 2,
+        "completed" | "cancelled" | "failed" | "interrupted" | "timed_out" | "deleted" => 3,
         _ => 0,
     }
+}
+
+fn todo_store_clear_lifecycle_fields(object: &mut serde_json::Map<String, Value>) {
+    for key in [
+        "queueState",
+        "queue_state",
+        "queuedAt",
+        "queued_at",
+        "todoCompletedAt",
+        "todo_completed_at",
+        "completedAt",
+        "completed_at",
+        "todoCancelledAt",
+        "todo_cancelled_at",
+        "cancelledAt",
+        "cancelled_at",
+        "canceledAt",
+        "canceled_at",
+        "todoPausedAt",
+        "todo_paused_at",
+        "pausedAt",
+        "paused_at",
+        "todoFailedAt",
+        "todo_failed_at",
+        "failedAt",
+        "failed_at",
+        "todoInterruptedAt",
+        "todo_interrupted_at",
+        "interruptedAt",
+        "interrupted_at",
+        "todoTimedOutAt",
+        "todo_timed_out_at",
+        "timedOutAt",
+        "timed_out_at",
+        "timeoutAt",
+        "timeout_at",
+        "todoDeletedAt",
+        "todo_deleted_at",
+        "deletedAt",
+        "deleted_at",
+    ] {
+        object.remove(key);
+    }
+}
+
+fn todo_store_force_webview_snapshot_listed(item: &mut Value) {
+    let stamp = todo_dispatch_text(
+        item,
+        &[
+            "updatedAt",
+            "updated_at",
+            "todoStatusUpdatedAt",
+            "todo_status_updated_at",
+            "createdAt",
+            "created_at",
+        ],
+    );
+    let stamp = if stamp.is_empty() {
+        chrono_like_now_iso()
+    } else {
+        stamp
+    };
+    if let Some(object) = item.as_object_mut() {
+        todo_store_clear_lifecycle_fields(object);
+        object.insert("todoStatus".to_string(), json!("listed"));
+        object.insert("status".to_string(), json!("listed"));
+        object.insert(
+            "todoStatusReason".to_string(),
+            json!("webview_snapshot_lifecycle_ignored"),
+        );
+        object.insert(
+            "statusReason".to_string(),
+            json!("webview_snapshot_lifecycle_ignored"),
+        );
+        object.insert("todoStatusUpdatedAt".to_string(), json!(stamp.clone()));
+        object.insert("updatedAt".to_string(), json!(stamp));
+        object.remove("rustOwned");
+        object.remove("rust_owned");
+        object.remove("lifecycleOwner");
+        object.remove("lifecycle_owner");
+    }
+}
+
+fn todo_store_copy_lifecycle_fields_from_stored(stored: &Value, item: &mut Value) {
+    let Some(object) = item.as_object_mut() else {
+        return;
+    };
+    todo_store_clear_lifecycle_fields(object);
+    for key in [
+        "todoStatus",
+        "status",
+        "todoStatusReason",
+        "statusReason",
+        "todoStatusUpdatedAt",
+        "updatedAt",
+        "updatedAtMs",
+        "lifecycleOwner",
+        "rustOwned",
+        "queuedAt",
+        "queued_at",
+        "todoCompletedAt",
+        "completedAt",
+        "todoCancelledAt",
+        "cancelledAt",
+        "todoPausedAt",
+        "pausedAt",
+        "todoFailedAt",
+        "failedAt",
+        "todoInterruptedAt",
+        "interruptedAt",
+        "todoTimedOutAt",
+        "timedOutAt",
+        "todoDeletedAt",
+        "deletedAt",
+        "targetAgentId",
+        "targetColorSlot",
+        "targetTerminalColor",
+        "targetTerminalId",
+        "targetTerminalIndex",
+        "targetThreadId",
+        "targetExplicit",
+        "explicitTarget",
+        "userPinnedTarget",
+    ] {
+        match stored.get(key).filter(|value| !value.is_null()) {
+            Some(value) => {
+                object.insert(key.to_string(), value.clone());
+            }
+            None => {
+                object.remove(key);
+            }
+        }
+    }
+    object.insert("lifecycleOwner".to_string(), json!("rust"));
+    object.insert("rustOwned".to_string(), json!(true));
+}
+
+fn todo_store_sanitize_webview_snapshot_lifecycle(
+    stored_items: &[Value],
+    items: Vec<Value>,
+) -> Vec<Value> {
+    items
+        .into_iter()
+        .map(|mut item| {
+            let item_id = todo_store_item_sync_id(&item);
+            let stored = stored_items
+                .iter()
+                .find(|candidate| todo_store_item_matches_id(candidate, &item_id));
+            if let Some(stored) = stored.filter(|stored| todo_store_item_is_rust_owned(stored)) {
+                todo_store_copy_lifecycle_fields_from_stored(stored, &mut item);
+                return item;
+            }
+            let incoming_status = todo_store_item_status(&item);
+            if !incoming_status.is_empty() && incoming_status != "listed" {
+                todo_store_force_webview_snapshot_listed(&mut item);
+            }
+            item
+        })
+        .collect()
 }
 
 fn todo_store_apply_newer_store_status_core(
@@ -3346,6 +4229,13 @@ fn todo_store_apply_newer_store_status_core(
             if stored_status.is_empty() {
                 return item;
             }
+            let stored_is_rust_owned = todo_store_item_is_rust_owned(&stored);
+            if stored_is_rust_owned {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("rustOwned".to_string(), json!(true));
+                    object.insert("lifecycleOwner".to_string(), json!("rust"));
+                }
+            }
             let stored_at = todo_dispatch_text(&stored, &["todoStatusUpdatedAt"]);
             let incoming_at = todo_dispatch_text(&item, &["todoStatusUpdatedAt"]);
             // Both sides stamp identical 24-char ISO; lexicographic compare
@@ -3360,7 +4250,7 @@ fn todo_store_apply_newer_store_status_core(
             // these rows only happen through the Rust doors
             // (todo_store_set_status / settlement), which write the store
             // directly with a fresh stamp.
-            let store_wins_by_rank = todo_store_item_is_rust_owned(&stored)
+            let store_wins_by_rank = stored_is_rust_owned
                 && todo_store_status_rank(&todo_store_item_status(&item))
                     < todo_store_status_rank(&stored_status);
             if !store_wins_by_stamp && !store_wins_by_rank {
@@ -3421,7 +4311,15 @@ fn todo_store_apply_newer_store_status_core(
 /// renderer for these, not the owner — its full-snapshot sync must never be
 /// able to erase one it doesn't know about.
 fn todo_store_item_is_rust_owned(item: &Value) -> bool {
+    if item.get("rustOwned").and_then(Value::as_bool) == Some(true)
+        || todo_dispatch_text(item, &["lifecycleOwner", "lifecycle_owner"]) == "rust"
+    {
+        return true;
+    }
     let source = todo_dispatch_text(item, &["source", "sourceKind", "source_kind"]);
+    if source == "rust-diffforge-todo-store" || source == "rust-ui-draft" {
+        return true;
+    }
     // "terminal_direct" is the Rust capture's own source; the webview's
     // prompt-submit bridge materializes the SAME item id with its
     // "tui-terminal-direct-input" source, and its full-snapshot echo replaces
@@ -3490,10 +4388,9 @@ fn todo_store_retain_settled_items_core(
     items
 }
 
-/// One history list per workspace: queue-store rows lead (device truth),
-/// mirror rows add peer-device todos and display enrichment (LLM titles,
-/// device names). Anything tombstoned anywhere on this device is dropped no
-/// matter which replica still carries it.
+/// One history list per workspace. Queue-store rows are device truth; the
+/// optional mirror vector exists only for tests/future imports and never acts
+/// as a frontend source. Anything tombstoned anywhere on this device is dropped.
 fn todo_store_history_merge(
     queue_items: Vec<Value>,
     mirror_items: Vec<Value>,
@@ -3565,15 +4462,22 @@ fn todo_store_history_merge(
     merged
 }
 
-/// The single read door for the Todos History view: every todo this workspace
-/// knows about — listed, queued, running, AND finished — local-first, with
-/// peer-device rows from the cloud mirror, one entry per logical todo.
+/// The single read door for the Todos History view: every Rust-store todo this
+/// workspace knows about — listed, queued, running, AND retained finished rows —
+/// one entry per logical todo.
 #[tauri::command]
 async fn todo_store_history(workspace_id: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let workspace_id = workspace_id.trim().to_string();
         if workspace_id.is_empty() {
             return Err("workspace_id is required.".to_string());
+        }
+        if todo_dispatch_workspace_is_deleted(&workspace_id) {
+            return Ok(json!({
+                "workspaceId": workspace_id,
+                "items": [],
+                "updatedAtMs": todo_dispatch_now_ms(),
+            }));
         }
         let tombstoned = todo_store_all_tombstone_ids();
         let queue_items = todo_dispatch_data_path("queues", &workspace_id)
@@ -3585,9 +4489,7 @@ async fn todo_store_history(workspace_id: String) -> Result<Value, String> {
                     .unwrap_or_default()
             })
             .unwrap_or_default();
-        let mirror_items =
-            cloud_mcp_todo_mirror_history_items(&workspace_id, TODO_STORE_HISTORY_MAX_ITEMS);
-        let items = todo_store_history_merge(queue_items, mirror_items, &tombstoned);
+        let items = todo_store_history_merge(queue_items, Vec::new(), &tombstoned);
         Ok(json!({
             "workspaceId": workspace_id,
             "items": items,
@@ -3900,7 +4802,7 @@ fn todo_dispatch_queue_mark_settled(
         }
     }
     // The webview's visible queue consumes completed items; journal the prune
-    // so a webview that mounts later drops its localStorage copy. The store
+    // so a webview that mounts later drops its stale visible copy. The store
     // row itself stays (history retention) — the prune entry only governs the
     // webview list, and the next queue sync keeps settled rows via the
     // retention merge.
@@ -4249,6 +5151,200 @@ mod todo_store_tests {
     }
 
     #[test]
+    fn backend_ready_gate_rejects_starting_even_with_input_ready() {
+        let entry = json!({
+            "agentId": "codex",
+            "inputReady": true,
+            "readiness": "ready",
+            "terminalStatus": "starting",
+            "terminalWorkState": "running",
+        });
+
+        assert!(!todo_dispatch_backend_ready_entry_allows_submit(&entry));
+    }
+
+    #[test]
+    fn backend_ready_gate_accepts_only_idle_ready_terminal() {
+        let entry = json!({
+            "activityStatus": "idle",
+            "agentId": "codex",
+            "inputReady": true,
+            "readiness": "ready",
+            "terminalStatus": "idle",
+            "terminalWorkState": "complete",
+        });
+
+        assert!(todo_dispatch_backend_ready_entry_allows_submit(&entry));
+    }
+
+    #[test]
+    fn backend_ready_gate_rejects_shell_terminal() {
+        let entry = json!({
+            "activityStatus": "idle",
+            "agentId": "shell",
+            "agentKind": "shell",
+            "inputReady": true,
+            "readiness": "ready",
+            "terminalStatus": "idle",
+            "terminalWorkState": "complete",
+        });
+
+        assert!(!todo_dispatch_backend_ready_entry_allows_submit(&entry));
+    }
+
+    #[test]
+    fn backend_ready_entries_sort_by_terminal_index_then_pane() {
+        let mut entries = vec![
+            json!({ "paneId": "pane-z", "terminalIndex": 2 }),
+            json!({ "paneId": "pane-b", "terminalIndex": 1 }),
+            json!({ "paneId": "pane-a", "terminalIndex": 1 }),
+        ];
+
+        todo_dispatch_sort_backend_ready_entries(&mut entries);
+
+        let pane_ids = entries
+            .iter()
+            .map(|entry| todo_dispatch_text(entry, &["paneId"]))
+            .collect::<Vec<_>>();
+        assert_eq!(pane_ids, vec!["pane-a", "pane-b", "pane-z"]);
+    }
+
+    #[test]
+    fn backend_dispatcher_rejects_image_todos() {
+        assert!(!todo_dispatch_backend_item_dispatchable(&json!({
+            "id": "todo-image-1",
+            "imageDataUrl": "data:image/png;base64,AAAA",
+            "status": "queued",
+            "text": "look at this",
+            "todoStatus": "queued",
+        })));
+    }
+
+    #[test]
+    fn queue_all_does_not_demote_running_item() {
+        let mut running_item = json!({
+            "id": "todo-running-queue-all",
+            "kind": "todo",
+            "status": "running",
+            "text": "already claimed",
+            "todoStatus": "running",
+            "workspaceId": "workspace-a",
+        });
+        todo_store_set_item_status(
+            &mut running_item,
+            "running",
+            "todo_queue_backend_dispatch_claim",
+        );
+
+        let (items, corrections) = todo_store_queue_all_apply_core(
+            vec![running_item],
+            vec![json!({
+                "id": "todo-running-queue-all",
+                "kind": "todo",
+                "status": "listed",
+                "text": "already claimed",
+                "todoStatus": "listed",
+                "workspaceId": "workspace-a",
+            })],
+            "workspace-a",
+            "todo_store_queue_all",
+        );
+
+        assert!(corrections.is_empty());
+        assert_eq!(items.len(), 1);
+        assert_eq!(todo_store_item_status(&items[0]), "running");
+    }
+
+    #[test]
+    fn webview_snapshot_cannot_create_queued_lifecycle() {
+        let items = todo_store_sanitize_webview_snapshot_lifecycle(
+            &[],
+            vec![json!({
+                "id": "todo-js-queued",
+                "kind": "todo",
+                "queuedAt": "2026-06-28T00:00:00.000Z",
+                "status": "queued",
+                "text": "queued from js snapshot",
+                "todoStatus": "queued",
+            })],
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(todo_store_item_status(&items[0]), "listed");
+        assert!(items[0].get("queuedAt").is_none());
+    }
+
+    #[test]
+    fn webview_snapshot_preserves_rust_owned_running_lifecycle() {
+        let mut stored = json!({
+            "id": "todo-rust-running",
+            "kind": "todo",
+            "status": "running",
+            "text": "rust owns me",
+            "todoStatus": "running",
+        });
+        todo_store_set_item_status(&mut stored, "running", "todo_queue_backend_dispatch_claim");
+        let items = todo_store_sanitize_webview_snapshot_lifecycle(
+            &[stored],
+            vec![json!({
+                "id": "todo-rust-running",
+                "kind": "todo",
+                "status": "listed",
+                "text": "rust owns me",
+                "todoStatus": "listed",
+            })],
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(todo_store_item_status(&items[0]), "running");
+        assert_eq!(items[0]["lifecycleOwner"], "rust");
+    }
+
+    #[test]
+    fn immediate_backend_prepare_rejects_existing_running_item() {
+        let workspace_id = format!("test-immediate-claim-{}", todo_dispatch_now_ms());
+        let Some(path) = todo_dispatch_data_path("queues", &workspace_id) else {
+            panic!("queue path available");
+        };
+        todo_dispatch_queue_write(
+            &workspace_id,
+            &[json!({
+                "id": "todo-claim-1",
+                "status": "running",
+                "text": "already running",
+                "todoStatus": "running",
+            })],
+        );
+
+        let result = todo_dispatch_prepare_immediate_backend_item(
+            &workspace_id,
+            json!({
+                "id": "todo-claim-1",
+                "status": "queued",
+                "text": "already running",
+                "todoStatus": "queued",
+            }),
+            &json!({
+                "paneId": "pane-1",
+                "terminalIndex": 0,
+                "threadId": "thread-1",
+            }),
+            Some("prompt-1"),
+        );
+
+        assert_eq!(result.unwrap_err(), "todo_already_in_flight");
+        let snapshot = todo_dispatch_queue_read(&path);
+        let items = snapshot
+            .get("items")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(items.len(), 1);
+        assert_eq!(todo_store_item_status(&items[0]), "running");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn item_matcher_covers_id_and_command_id_and_rejects_empty() {
         let item = json!({
             "id": "item-1",
@@ -4403,6 +5499,8 @@ mod todo_store_tests {
     fn status_setter_stamps_both_field_families_and_timestamps() {
         let mut item = json!({
             "id": "item-1",
+            "queueState": { "phase": "sending" },
+            "queue_state": { "phase": "queued" },
             "todoStatus": "running",
             "status": "running",
         });
@@ -4413,6 +5511,101 @@ mod todo_store_tests {
         assert_eq!(item["statusReason"], "todo_history_cancel");
         assert!(item["updatedAtMs"].as_u64().unwrap() > 0);
         assert!(item["updatedAt"].as_str().unwrap().ends_with('Z'));
+        assert!(item.get("queueState").is_none());
+        assert!(item.get("queue_state").is_none());
+    }
+
+    #[test]
+    fn queue_snapshot_canonicalization_strips_js_queue_state() {
+        let items = todo_store_canonicalize_settled_items(vec![json!({
+            "id": "item-1",
+            "queueState": { "phase": "sending" },
+            "queue_state": { "phase": "queued" },
+            "status": "running",
+        })]);
+        assert_eq!(items.len(), 1);
+        assert!(items[0].get("queueState").is_none());
+        assert!(items[0].get("queue_state").is_none());
+        assert_eq!(items[0]["status"], "running");
+    }
+
+    #[test]
+    fn lifecycle_status_aliases_normalize_in_rust() {
+        assert_eq!(todo_store_normalize_lifecycle_status("done"), "completed");
+        assert_eq!(
+            todo_store_normalize_lifecycle_status("in-flight"),
+            "running"
+        );
+        assert_eq!(todo_store_normalize_lifecycle_status("timeout"), "timed_out");
+        assert_eq!(
+            todo_store_normalize_lifecycle_status("terminal unavailable"),
+            "listed"
+        );
+        assert_eq!(todo_store_normalize_lifecycle_status("unknown"), "");
+    }
+
+    #[test]
+    fn draft_create_builds_rust_owned_canonical_item() {
+        let item = todo_store_build_created_item(
+            "workspace-1",
+            &json!({
+                "deviceId": "device-1",
+                "note": { "title": " Context ", "body": " Use the cache " },
+                "planTask": { "taskId": "task-1", "title": "Ship task" },
+                "status": "done",
+                "targetExplicit": true,
+                "targetTerminalIndex": 2,
+                "text": " ship\r\nit ",
+                "title": "Ship it",
+            }),
+            "todo_queue_draft_submitted",
+        )
+        .expect("draft should create");
+
+        assert!(item["id"].as_str().unwrap().starts_with("todo-"));
+        assert_eq!(item["text"], "ship\nit");
+        assert_eq!(item["workspaceId"], "workspace-1");
+        assert_eq!(item["deviceId"], "device-1");
+        assert_eq!(item["source"], "tui-todo-auto-queue");
+        assert_eq!(item["rustOwned"], true);
+        assert_eq!(item["lifecycleOwner"], "rust");
+        assert_eq!(item["todoStatus"], "completed");
+        assert_eq!(item["status"], "completed");
+        assert_eq!(item["todoStatusReason"], "todo_queue_draft_submitted");
+        assert_eq!(item["statusReason"], "todo_queue_draft_submitted");
+        assert_eq!(item["note"]["title"], "Context");
+        assert_eq!(item["note"]["text"], "Use the cache");
+        assert_eq!(item["planTask"]["taskId"], "task-1");
+        assert_eq!(item["title"], "Ship it");
+        assert_eq!(item["targetExplicit"], true);
+        assert_eq!(item["targetTerminalIndex"], 2);
+        assert!(item["todoStatusUpdatedAt"].as_str().unwrap().ends_with('Z'));
+    }
+
+    #[test]
+    fn update_patch_changes_text_without_restamping_status() {
+        let mut item = json!({
+            "id": "todo-1",
+            "lifecycleOwner": "rust",
+            "rustOwned": true,
+            "status": "listed",
+            "text": "old text",
+            "todoStatus": "listed",
+            "todoStatusReason": "todo_queue_draft_submitted",
+            "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+        });
+        assert!(todo_store_apply_update_patch(
+            &mut item,
+            &json!({ "text": " new\r\ntext " }),
+        ));
+        todo_store_canonicalize_status_fields(&mut item);
+        assert_eq!(item["text"], "new\ntext");
+        assert_eq!(item["todoStatus"], "listed");
+        assert_eq!(item["status"], "listed");
+        assert_eq!(item["todoStatusReason"], "todo_queue_draft_submitted");
+        assert_eq!(item["todoStatusUpdatedAt"], "2026-06-11T10:00:00.000Z");
+        assert!(item["updatedAt"].as_str().unwrap().ends_with('Z'));
+        assert_ne!(item["updatedAt"], "2026-06-11T10:00:00.000Z");
     }
 
     #[test]
@@ -4624,9 +5817,32 @@ mod todo_store_tests {
     }
 
     #[test]
+    fn rust_owned_marker_survives_same_status_webview_echo() {
+        let stored = vec![json!({
+            "id": "todo-rust-created",
+            "lifecycleOwner": "rust",
+            "rustOwned": true,
+            "source": "tui-todo-auto-queue",
+            "todoStatus": "listed",
+            "todoStatusUpdatedAt": "2026-06-11T10:00:00.000Z",
+        })];
+        let incoming = vec![json!({
+            "id": "todo-rust-created",
+            "source": "tui-todo-auto-queue",
+            "todoStatus": "listed",
+            "todoStatusUpdatedAt": "2026-06-11T10:05:00.000Z",
+        })];
+        let merged = todo_store_apply_newer_store_status_core(&stored, incoming);
+        assert_eq!(todo_store_item_status(&merged[0]), "listed");
+        assert_eq!(merged[0]["rustOwned"], true);
+        assert_eq!(merged[0]["lifecycleOwner"], "rust");
+        assert!(todo_store_item_is_rust_owned(&merged[0]));
+    }
+
+    #[test]
     fn rust_owned_forward_transition_from_webview_is_accepted() {
-        // queued → running through the webview dispatcher is a legitimate
-        // forward flip; the rank rule only blocks backward movement.
+        // queued → running is a legitimate forward flip; the rank rule only
+        // blocks backward movement.
         let stored = vec![json!({
             "id": "remote-1",
             "todoStatus": "queued",
@@ -5727,9 +6943,9 @@ fn todo_dispatch_push_queue_snapshot(
 }
 
 /// Headless remote todo delete: applied directly to the Rust queue store so
-/// the lever works with the window closed; the journal entry reconciles the
-/// webview's localStorage mirror on restore. Idempotent next to the webview
-/// path (both remove the same id).
+/// the lever works with the window closed; the journal entry reconciles any
+/// mounted webview replica. Idempotent next to the webview path (both remove
+/// the same id).
 pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) {
     let command_kind =
         todo_dispatch_text(event, &["command_kind", "commandKind", "action", "command"])
@@ -5854,6 +7070,7 @@ async fn todo_dispatch_queue_sync(
             .unwrap_or_default();
         let stored_items = todo_store_canonicalize_settled_items(stored_items);
         let previous_items = stored_items.clone();
+        let items = todo_store_sanitize_webview_snapshot_lifecycle(&stored_items, items);
         let items = todo_store_keep_settled_sweep_flips_core(stored_items.clone(), items);
         // Status LWW: deliberate flips made through the store (history
         // Queue/Unqueue/retarget) outrank stale webview claims by stamp.
@@ -5930,6 +7147,13 @@ async fn todo_dispatch_queue_get(workspace_id: String) -> Result<Value, String> 
         if workspace_id.is_empty() {
             return Err("workspace_id is required.".to_string());
         }
+        if todo_dispatch_workspace_is_deleted(&workspace_id) {
+            return Ok(json!({
+                "workspaceId": workspace_id,
+                "items": [],
+                "updatedAtMs": todo_dispatch_now_ms(),
+            }));
+        }
         let snapshot = todo_dispatch_data_path("queues", &workspace_id)
             .map(|path| todo_dispatch_queue_read(&path))
             .unwrap_or_else(|| json!({}));
@@ -5976,6 +7200,7 @@ async fn todo_dispatch_overview() -> Result<Value, String> {
         let mut running = 0usize;
         let mut queued = 0usize;
         let mut listed = 0usize;
+        let deleted_workspace_ids = cloud_mcp_deleted_workspace_ids();
         for path in todo_dispatch_data_workspace_files("queues") {
             let snapshot = todo_dispatch_queue_read(&path);
             let workspace_id = snapshot
@@ -5985,6 +7210,9 @@ async fn todo_dispatch_overview() -> Result<Value, String> {
                 .unwrap_or_default()
                 .to_string();
             if workspace_id.is_empty() {
+                continue;
+            }
+            if deleted_workspace_ids.contains(&workspace_id) {
                 continue;
             }
             let tombstoned = todo_store_tombstone_ids(&workspace_id);
@@ -6084,6 +7312,13 @@ fn todo_dispatch_backend_agent_id(value: &str) -> String {
     normalized
 }
 
+fn todo_dispatch_backend_agent_is_queueable(value: &str) -> bool {
+    matches!(
+        todo_dispatch_backend_agent_id(value).as_str(),
+        "codex" | "claude" | "opencode"
+    )
+}
+
 fn todo_dispatch_backend_agent_value(value: &Value, keys: &[&str]) -> String {
     todo_dispatch_backend_agent_id(&todo_dispatch_text(value, keys))
 }
@@ -6104,6 +7339,14 @@ fn todo_dispatch_backend_target_agent(item: &Value, target: &Value) -> String {
     .map(|value| todo_dispatch_backend_agent_id(&value))
     .find(|value| !value.is_empty())
     .unwrap_or_default()
+}
+
+fn todo_dispatch_backend_entry_agent_is_queueable(entry: &Value) -> bool {
+    let agent = todo_dispatch_backend_agent_value(
+        entry,
+        &["agentId", "agent_id", "agentKind", "agent_kind", "provider"],
+    );
+    !agent.is_empty() && todo_dispatch_backend_agent_is_queueable(&agent)
 }
 
 fn todo_dispatch_backend_submit_sequence(item: &Value, target: &Value) -> &'static str {
@@ -6157,6 +7400,11 @@ mod todo_dispatch_backend_tests {
         assert_eq!(todo_dispatch_backend_agent_id("Claude Code"), "claude");
         assert_eq!(todo_dispatch_backend_agent_id("open-code"), "opencode");
         assert_eq!(todo_dispatch_backend_agent_id("OpenAI Codex"), "codex");
+        assert!(todo_dispatch_backend_agent_is_queueable("OpenAI Codex"));
+        assert!(todo_dispatch_backend_agent_is_queueable("Claude Code"));
+        assert!(todo_dispatch_backend_agent_is_queueable("open-code"));
+        assert!(!todo_dispatch_backend_agent_is_queueable("shell"));
+        assert!(!todo_dispatch_backend_agent_is_queueable("generic"));
 
         let codex_item =
             json!({ "id": "todo-codex", "text": "ship it", "targetAgentId": "OpenAI Codex" });
@@ -6281,6 +7529,110 @@ mod todo_dispatch_backend_tests {
             todo_dispatch_core_terminal_ready_for_submit(&runtime, &projected, false),
             Some(false),
         );
+    }
+
+    fn activity_hook_payload(
+        workspace_id: &str,
+        event_type: &str,
+        activity_status: &str,
+        terminal_status: &str,
+        readiness: &str,
+        terminal_work_state: &str,
+        input_ready: bool,
+    ) -> TerminalActivityHookPayload {
+        TerminalActivityHookPayload {
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            workspace_id: workspace_id.to_string(),
+            workspace_name: "Workspace".to_string(),
+            terminal_index: Some(0),
+            thread_id: "thread-1".to_string(),
+            agent_id: "codex".to_string(),
+            agent_kind: "codex".to_string(),
+            agent_type: "codex".to_string(),
+            agent_display_name: "Codex".to_string(),
+            display_name: "Codex".to_string(),
+            terminal_name: "Codex".to_string(),
+            terminal_nickname: "Cy".to_string(),
+            provider: "codex".to_string(),
+            event_type: event_type.to_string(),
+            hook_event_name: event_type.to_string(),
+            source: "test".to_string(),
+            status: activity_status.to_string(),
+            activity_status: activity_status.to_string(),
+            command_phase: terminal_work_state.to_string(),
+            execution_phase: terminal_work_state.to_string(),
+            native_rail_state: terminal_status.to_string(),
+            native_rail_label: terminal_status.to_string(),
+            readiness: readiness.to_string(),
+            terminal_lifecycle: "open".to_string(),
+            terminal_status: terminal_status.to_string(),
+            terminal_work_state: terminal_work_state.to_string(),
+            turn_status: "completed".to_string(),
+            session_state: "session_attached".to_string(),
+            input_ready,
+            input_ready_at: input_ready.then(|| "2026-06-19T00:00:00Z".to_string()),
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: Some("provider-session-1".to_string()),
+            native_session_id: Some("native-session-1".to_string()),
+            provider_turn_id: None,
+            turn_id: None,
+            transcript_path: None,
+            cwd: None,
+            user_message: None,
+            message: None,
+            tool_name: None,
+            tool_use_id: None,
+            approval_id: None,
+            permission_prompt_id: None,
+            permission_request_id: None,
+            permission_mode: None,
+            manual_prompt_source: None,
+            manual_approval_required: false,
+            provider_blocked_for_user: false,
+            terminal_is_prompting_user: false,
+            prompting_user_kind: None,
+            prompting_user_source: None,
+            prompting_user_confidence: None,
+            prompting_user_text: None,
+            hook_health_status: "healthy".to_string(),
+            hook_health_event: "ready".to_string(),
+            hook_health_observed_at_ms: 1,
+            hook_timestamp_ms: 1,
+            observed_at_ms: 1,
+            completion_evidence: String::new(),
+        }
+    }
+
+    #[test]
+    fn activity_hook_ready_idle_state_wakes_queue_dispatcher() {
+        let payload = activity_hook_payload(
+            "workspace-a",
+            "provider-turn-completed",
+            "idle",
+            "idle",
+            "ready",
+            "complete",
+            false,
+        );
+        let event_type = todo_dispatch_normalize_activity_hook_event_type(&payload.event_type);
+
+        assert!(todo_dispatch_activity_hook_should_wake_queue(
+            &payload,
+            &event_type
+        ));
+    }
+
+    #[test]
+    fn activity_hook_empty_workspace_does_not_wake_queue_dispatcher() {
+        let payload = activity_hook_payload("", "provider-turn-completed", "idle", "idle", "ready", "complete", true);
+        let event_type = todo_dispatch_normalize_activity_hook_event_type(&payload.event_type);
+
+        assert!(!todo_dispatch_activity_hook_should_wake_queue(
+            &payload,
+            &event_type
+        ));
     }
 
     #[test]
@@ -6424,6 +7776,18 @@ fn todo_dispatch_prepare_immediate_backend_item(
         let mut replaced = false;
         for existing in &mut items {
             if todo_store_item_matches_id(existing, &item_id) {
+                let existing_status = todo_store_item_status(existing);
+                if matches!(
+                    existing_status.as_str(),
+                    "running" | "sending" | "submitted" | "dispatching"
+                ) {
+                    return Err("todo_already_in_flight".to_string());
+                }
+                if TODO_STORE_SETTLED_RETENTION_STATUSES.contains(&existing_status.as_str())
+                    || existing_status == "deleted"
+                {
+                    return Err("todo_already_settled".to_string());
+                }
                 *existing = item.clone();
                 replaced = true;
                 break;
@@ -6468,6 +7832,14 @@ async fn todo_dispatch_backend_core_ready_entries(
         if metadata.workspace_id.trim() != workspace_id {
             continue;
         }
+        let metadata_agent = if metadata.agent_id.trim().is_empty() {
+            &metadata.agent_kind
+        } else {
+            &metadata.agent_id
+        };
+        if !todo_dispatch_backend_agent_is_queueable(metadata_agent) {
+            continue;
+        }
         let runtime = terminal_runtime_snapshot(&instance);
         let is_parked = parked.contains(&(pane_id.clone(), instance.id));
         let projected = terminal_project_runtime(&metadata, &runtime, is_parked);
@@ -6499,6 +7871,7 @@ async fn todo_dispatch_backend_core_ready_entries(
             "workspaceName": metadata.workspace_name.clone(),
         }));
     }
+    todo_dispatch_sort_backend_ready_entries(&mut entries);
     entries
 }
 
@@ -6510,17 +7883,74 @@ fn todo_dispatch_backend_registry_ready_entries(
     let Ok(map) = registry.lock() else {
         return Vec::new();
     };
-    map.values()
+    let mut entries = map
+        .values()
         .filter(|entry| {
             entry.get("workspaceId").and_then(Value::as_str) == Some(workspace_id)
                 && entry.get("inputReady").and_then(Value::as_bool) == Some(true)
+                && todo_dispatch_backend_entry_agent_is_queueable(entry)
+                && todo_dispatch_backend_ready_entry_allows_submit(entry)
                 && entry
                     .get("paneId")
                     .and_then(Value::as_str)
                     .is_some_and(|pane| !busy.contains(pane))
         })
         .cloned()
-        .collect::<Vec<_>>()
+        .collect::<Vec<_>>();
+    todo_dispatch_sort_backend_ready_entries(&mut entries);
+    entries
+}
+
+fn todo_dispatch_backend_ready_entry_allows_submit(entry: &Value) -> bool {
+    if !todo_dispatch_backend_entry_agent_is_queueable(entry) {
+        return false;
+    }
+    let readiness = terminal_projection_text(&todo_dispatch_text(entry, &["readiness"]), "");
+    let status = terminal_projection_text(
+        &todo_dispatch_text(entry, &["terminalStatus", "terminal_status", "status"]),
+        "",
+    );
+    let activity = terminal_projection_text(
+        &todo_dispatch_text(entry, &["activityStatus", "activity_status"]),
+        "",
+    );
+    let work_state = terminal_projection_text(
+        &todo_dispatch_text(entry, &["terminalWorkState", "terminal_work_state"]),
+        "",
+    );
+    if terminal_projection_state_is_busy(&status)
+        || terminal_projection_state_is_busy(&activity)
+        || terminal_projection_state_is_paused(&status)
+        || terminal_projection_state_is_paused(&activity)
+        || terminal_projection_state_is_error(&status)
+        || terminal_projection_state_is_error(&activity)
+        || terminal_projection_state_is_closed(&status)
+        || terminal_projection_state_is_closed(&activity)
+        || matches!(readiness.as_str(), "busy" | "closing" | "closed" | "error" | "needs_input")
+        || matches!(work_state.as_str(), "running" | "prompting_user" | "closed" | "error")
+    {
+        return false;
+    }
+    readiness.is_empty() || matches!(readiness.as_str(), "ready" | "input_ready")
+}
+
+fn todo_dispatch_sort_backend_ready_entries(entries: &mut [Value]) {
+    entries.sort_by(|left, right| {
+        let left_index = left
+            .get("terminalIndex")
+            .or_else(|| left.get("terminal_index"))
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MAX);
+        let right_index = right
+            .get("terminalIndex")
+            .or_else(|| right.get("terminal_index"))
+            .and_then(Value::as_i64)
+            .unwrap_or(i64::MAX);
+        left_index.cmp(&right_index).then_with(|| {
+            todo_dispatch_text(left, &["paneId", "pane_id"])
+                .cmp(&todo_dispatch_text(right, &["paneId", "pane_id"]))
+        })
+    });
 }
 
 async fn todo_dispatch_backend_pick_target(
@@ -6606,6 +8036,95 @@ async fn todo_dispatch_backend_pick_target(
     matched.cloned()
 }
 
+fn todo_dispatch_backend_try_claim_item(
+    workspace_id: &str,
+    item: &Value,
+    target: &Value,
+) -> Option<Value> {
+    let item_id = todo_store_item_sync_id(item);
+    if item_id.is_empty() {
+        return None;
+    }
+    let path = todo_dispatch_data_path("queues", workspace_id)?;
+    let snapshot = todo_dispatch_queue_read(&path);
+    let mut items = snapshot
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut claimed = None;
+    for entry in &mut items {
+        if !todo_store_item_matches_id(entry, &item_id) || todo_store_item_status(entry) != "queued" {
+            continue;
+        }
+        todo_store_set_item_status(entry, "running", "todo_queue_backend_dispatch_claim");
+        if let Some(object) = entry.as_object_mut() {
+            if let Some(pane_id) = target
+                .get("paneId")
+                .or_else(|| target.get("pane_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                object.insert("targetTerminalId".to_string(), json!(pane_id));
+                object.insert("paneId".to_string(), json!(pane_id));
+            }
+            if let Some(terminal_index) = target.get("terminalIndex").cloned() {
+                object.insert("targetTerminalIndex".to_string(), terminal_index);
+            }
+            if let Some(thread_id) = target
+                .get("threadId")
+                .or_else(|| target.get("thread_id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                object.insert("targetThreadId".to_string(), json!(thread_id));
+                object.insert("threadId".to_string(), json!(thread_id));
+            }
+        }
+        claimed = Some(entry.clone());
+        break;
+    }
+    if claimed.is_some() {
+        todo_dispatch_queue_write(workspace_id, &items);
+    }
+    claimed
+}
+
+fn todo_dispatch_backend_release_claim(workspace_id: &str, item: &Value, reason: &str) {
+    let item_id = todo_store_item_sync_id(item);
+    if item_id.is_empty() {
+        return;
+    }
+    let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
+        return;
+    };
+    let snapshot = todo_dispatch_queue_read(&path);
+    let mut items = snapshot
+        .get("items")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut changed = false;
+    for entry in &mut items {
+        if !todo_store_item_matches_id(entry, &item_id) {
+            continue;
+        }
+        if todo_store_item_status(entry) == "running"
+            && todo_dispatch_text(entry, &["todoStatusReason", "statusReason"])
+                == "todo_queue_backend_dispatch_claim"
+        {
+            todo_store_set_item_status(entry, "queued", reason);
+            changed = true;
+        }
+        break;
+    }
+    if changed {
+        todo_dispatch_queue_write(workspace_id, &items);
+    }
+}
+
 async fn todo_dispatch_backend_submit(
     app: &AppHandle,
     workspace_id: &str,
@@ -6645,6 +8164,32 @@ async fn todo_dispatch_backend_submit(
     }) else {
         return false;
     };
+    let instance_agent = todo_dispatch_backend_agent_id(&instance.metadata.agent_id);
+    let requested_agent = todo_dispatch_backend_target_agent(item, target);
+    if !todo_dispatch_backend_agent_is_queueable(&instance_agent) {
+        log_terminal_status_event(
+            "backend.todo_dispatch.backend_submit_unsupported_agent_skip",
+            json!({
+                "instance_agent": instance_agent,
+                "pane_id": pane_id,
+                "requested_agent": requested_agent,
+                "workspace_id": workspace_id,
+            }),
+        );
+        return false;
+    }
+    if !requested_agent.is_empty() && requested_agent != instance_agent {
+        log_terminal_status_event(
+            "backend.todo_dispatch.backend_submit_agent_mismatch_skip",
+            json!({
+                "instance_agent": instance_agent,
+                "pane_id": pane_id,
+                "requested_agent": requested_agent,
+                "workspace_id": workspace_id,
+            }),
+        );
+        return false;
+    }
     if todo_dispatch_pane_input_ready_authoritative(app, &pane_id, target_instance_id).await
         != Some(true)
     {
@@ -6948,6 +8493,8 @@ async fn todo_dispatch_backend_submit_now(
     if todo_dispatch_startup_reconcile_active() {
         return Err("startup_reconciliation_active".to_string());
     }
+    let tick_lock = TODO_DISPATCH_BACKEND_TICK_LOCK.get_or_init(|| Mutex::new(()));
+    let _tick_guard = tick_lock.lock().await;
 
     let item = tauri::async_runtime::spawn_blocking({
         let workspace_id = workspace_id.clone();
@@ -6965,8 +8512,17 @@ async fn todo_dispatch_backend_submit_now(
     .await
     .map_err(|error| format!("Todo backend submit worker failed: {error}"))??;
 
-    let submitted = todo_dispatch_backend_submit(&app, &workspace_id, &item, &target).await;
+    let Some(claimed_item) = todo_dispatch_backend_try_claim_item(&workspace_id, &item, &target)
+    else {
+        return Err("todo_dispatch_claim_failed".to_string());
+    };
+    let submitted = todo_dispatch_backend_submit(&app, &workspace_id, &claimed_item, &target).await;
     if !submitted {
+        todo_dispatch_backend_release_claim(
+            &workspace_id,
+            &claimed_item,
+            "todo_queue_backend_submit_failed_requeue",
+        );
         let pane_id = todo_dispatch_text(&target, &["paneId", "pane_id", "targetTerminalId"]);
         let target_instance_id = target
             .get("instanceId")
@@ -6984,13 +8540,23 @@ async fn todo_dispatch_backend_submit_now(
 
     Ok(json!({
         "ok": true,
-        "itemId": todo_store_item_sync_id(&item),
+        "itemId": todo_store_item_sync_id(&claimed_item),
         "promptEventId": prompt_event_id.unwrap_or_default(),
         "workspaceId": workspace_id,
     }))
 }
 
 async fn todo_dispatch_backend_tick(app: &AppHandle) {
+    let tick_lock = TODO_DISPATCH_BACKEND_TICK_LOCK.get_or_init(|| Mutex::new(()));
+    let Ok(_tick_guard) = tick_lock.try_lock() else {
+        log_terminal_status_event(
+            "backend.todo_dispatch.backend_tick_skip",
+            json!({
+                "reason": "dispatch_already_running",
+            }),
+        );
+        return;
+    };
     if todo_dispatch_startup_reconcile_active() {
         log_terminal_status_event(
             "backend.todo_dispatch.backend_tick_wait",
@@ -7035,8 +8601,19 @@ async fn todo_dispatch_backend_tick(app: &AppHandle) {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            if todo_dispatch_backend_submit(app, &workspace_id, &item, &target).await {
+            let Some(claimed_item) =
+                todo_dispatch_backend_try_claim_item(&workspace_id, &item, &target)
+            else {
+                continue;
+            };
+            if todo_dispatch_backend_submit(app, &workspace_id, &claimed_item, &target).await {
                 busy.insert(pane_id);
+            } else {
+                todo_dispatch_backend_release_claim(
+                    &workspace_id,
+                    &claimed_item,
+                    "todo_queue_backend_submit_failed_requeue",
+                );
             }
         }
     }
@@ -7044,7 +8621,7 @@ async fn todo_dispatch_backend_tick(app: &AppHandle) {
 
 pub(crate) fn todo_dispatch_wake_background_dispatcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
-        sleep(Duration::from_millis(250)).await;
+        sleep(Duration::from_millis(25)).await;
         if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
             return;
         }
@@ -7052,26 +8629,14 @@ pub(crate) fn todo_dispatch_wake_background_dispatcher(app: AppHandle) {
     });
 }
 
-/// Dormant while the webview dispatcher heartbeats; takes over queued-todo
-/// submission when the webview goes silent (background/windowless mode).
+/// Rust-owned queued-todo dispatcher. Most work is event-woken; this periodic
+/// tick catches missed readiness events without polling aggressively.
 pub(crate) fn todo_dispatch_start_background_dispatcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
         loop {
             sleep(Duration::from_millis(TODO_DISPATCH_BACKEND_TICK_MS)).await;
             if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
                 continue;
-            }
-            let heartbeat = TODO_DISPATCH_WEBVIEW_HEARTBEAT_MS.load(Ordering::Acquire);
-            let now = todo_dispatch_now_ms();
-            if !app_is_in_background_mode() {
-                if heartbeat == 0 {
-                    // No webview dispatcher has ever announced itself this
-                    // session; stay dormant until background mode hands over.
-                    continue;
-                }
-                if now.saturating_sub(heartbeat) < TODO_DISPATCH_DISPATCHER_LEASE_MS {
-                    continue;
-                }
             }
             todo_dispatch_backend_tick(&app).await;
         }
@@ -7200,57 +8765,6 @@ async fn todo_dispatch_receipt_record(
     })
     .await
     .map_err(|error| format!("Todo dispatch record worker failed: {error}"))?
-}
-
-/// One-time legacy import: merges the webview's localStorage receipts into the
-/// Rust store, newest `updatedAtMs` wins per command id.
-#[tauri::command]
-async fn todo_dispatch_receipts_import(
-    app: AppHandle,
-    workspace_id: String,
-    receipts: Value,
-) -> Result<Value, String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        let now_ms = todo_dispatch_now_ms();
-        let current = todo_dispatch_load(&workspace_id);
-        let mut next = current.clone();
-        let mut imported = 0usize;
-        if let (Some(target), Some(incoming)) = (next.as_object_mut(), receipts.as_object()) {
-            for (key, receipt) in incoming {
-                let Some(normalized) = todo_dispatch_normalize_receipt(key, receipt, now_ms) else {
-                    continue;
-                };
-                let incoming_updated = normalized
-                    .get("updatedAtMs")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                let existing_updated = target
-                    .get(key)
-                    .and_then(|existing| existing.get("updatedAtMs"))
-                    .and_then(Value::as_u64)
-                    .unwrap_or(0);
-                if incoming_updated > existing_updated {
-                    target.insert(key.clone(), normalized);
-                    imported += 1;
-                }
-            }
-        }
-        let next = todo_dispatch_prune(&next, now_ms);
-        if imported > 0 {
-            todo_dispatch_save(&workspace_id, &next);
-            let _ = app.emit(
-                TODO_DISPATCH_RECEIPTS_UPDATED_EVENT,
-                todo_dispatch_receipts_payload(&workspace_id, &next, "import"),
-            );
-        }
-        Ok(todo_dispatch_receipts_payload(
-            &workspace_id,
-            &next,
-            "import",
-        ))
-    })
-    .await
-    .map_err(|error| format!("Todo dispatch import worker failed: {error}"))?
 }
 
 /// Frontend-driven drain notification (covers local, receipt-less todos).

@@ -123,6 +123,146 @@ import TerminalView, {
   TODO_QUEUE_PANE_MODE_NORMAL,
   TodoQueuePanel,
 } from "../terminals/TerminalView.jsx";
+
+const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
+
+function normalizeAccountToolTodoItem(item, workspaceId = "") {
+  if (!item || typeof item !== "object") {
+    return null;
+  }
+  const id = String(item.id || item.todoId || item.todo_id || "").trim();
+  const text = String(
+    item.text
+      || item.todoText
+      || item.todo_text
+      || item.body
+      || item.title
+      || "",
+  ).trim();
+  if (!id || !text) {
+    return null;
+  }
+  const itemWorkspaceId = String(item.workspaceId || item.workspace_id || workspaceId || "").trim();
+  if (workspaceId && itemWorkspaceId && itemWorkspaceId !== workspaceId) {
+    return null;
+  }
+  const status = accountToolTodoStatus(item);
+  return {
+    ...item,
+    id,
+    kind: item.kind || item.type || "todo",
+    ...(status && status !== "listed" ? { status, todoStatus: status } : {}),
+    text,
+    workspaceId: itemWorkspaceId || workspaceId,
+  };
+}
+
+function normalizeAccountToolTodoItems(items, workspaceId = "") {
+  const keyed = new Map();
+  (Array.isArray(items) ? items : [])
+    .map((item) => normalizeAccountToolTodoItem(item, workspaceId))
+    .filter(Boolean)
+    .forEach((item) => {
+      keyed.set(item.id, item);
+    });
+  return [...keyed.values()].sort((left, right) => {
+    const leftMs = Number(left.updatedAtMs || Date.parse(left.updatedAt || left.createdAt || "") || 0);
+    const rightMs = Number(right.updatedAtMs || Date.parse(right.updatedAt || right.createdAt || "") || 0);
+    return leftMs - rightMs;
+  });
+}
+
+function normalizeAccountToolTodoStatus(value) {
+  const status = String(value || "").trim().toLowerCase().replace(/[-\s]+/g, "_");
+  if (!status) {
+    return "";
+  }
+  if (["queued", "pending", "requested"].includes(status)) {
+    return "queued";
+  }
+  if (["listed", "list", "in_list", "ready", "released", "unqueued", "unqueue"].includes(status)) {
+    return "listed";
+  }
+  if (["sending", "submitted", "running", "dispatching", "in_flight", "active", "processing"].includes(status)) {
+    return "running";
+  }
+  if (["complete", "completed", "done", "finished", "success"].includes(status)) {
+    return "completed";
+  }
+  if (["cancelled", "canceled"].includes(status)) {
+    return "cancelled";
+  }
+  if (["failed", "failure", "error", "blocked", "rejected"].includes(status)) {
+    return "failed";
+  }
+  if (["interrupted", "aborted"].includes(status)) {
+    return "interrupted";
+  }
+  if (["timed_out", "timeout", "expired"].includes(status)) {
+    return "timed_out";
+  }
+  if (["deleted", "removed"].includes(status)) {
+    return "deleted";
+  }
+  return status;
+}
+
+function accountToolTodoStatus(item) {
+  const explicitStatus = normalizeAccountToolTodoStatus(
+    item?.todoStatus || item?.todo_status || item?.status || "",
+  );
+  if (explicitStatus) {
+    return explicitStatus;
+  }
+  if (item?.todoFailedAt || item?.todo_failed_at || item?.failedAt || item?.failed_at) {
+    return "failed";
+  }
+  if (item?.todoTimedOutAt || item?.todo_timed_out_at || item?.timedOutAt || item?.timed_out_at || item?.timeoutAt || item?.timeout_at) {
+    return "timed_out";
+  }
+  if (item?.todoInterruptedAt || item?.todo_interrupted_at || item?.interruptedAt || item?.interrupted_at) {
+    return "interrupted";
+  }
+  if (item?.todoCancelledAt || item?.todo_cancelled_at || item?.cancelledAt || item?.cancelled_at || item?.canceledAt || item?.canceled_at) {
+    return "cancelled";
+  }
+  if (item?.todoCompletedAt || item?.todo_completed_at || item?.completedAt || item?.completed_at) {
+    return "completed";
+  }
+  return "";
+}
+
+function accountToolTodoIsComposerVisible(item) {
+  const status = accountToolTodoStatus(item);
+  return !status
+    || status === "listed"
+    || status === "queued"
+    || status === "cancelled"
+    || status === "interrupted"
+    || status === "timed_out"
+    || status === "failed";
+}
+
+function buildAccountToolComposerItems(items, workspaceId = "") {
+  return normalizeAccountToolTodoItems(items, workspaceId).filter(accountToolTodoIsComposerVisible);
+}
+
+function buildAccountToolPendingItems(items, workspaceId = "") {
+  return normalizeAccountToolTodoItems(items, workspaceId).reduce((pendingItems, item) => {
+    if (accountToolTodoStatus(item) !== "queued") {
+      return pendingItems;
+    }
+    pendingItems[item.id] = {
+      itemId: item.id,
+      phase: "queued",
+      reason: item.todoStatusReason || item.statusReason || "rust_store_queued",
+      source: item.source || "account-orchestrator",
+      state: "queued",
+      workspaceId: item.workspaceId || workspaceId || "",
+    };
+    return pendingItems;
+  }, {});
+}
 import {
   DFBLUEPRINT_SOURCE_FORMAT,
   addDfBlueprintNode,
@@ -2435,6 +2575,7 @@ const WORKSPACE_APP_STARTUP_MCP_INDEX_IDLE_DELAY_MS = 1600;
 const WORKSPACE_APP_STARTUP_WARMUP_STAGGER_MS = 350;
 const WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS = 5000;
 const WORKSPACE_ARCHITECTURE_GRAPH_LIST_PRELOAD_STAGGER_MS = 90;
+const WORKSPACE_AGENT_BATCH_RETRY_MS = 1500;
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
 const FILE_EXPLORER_DEFAULT_SIZE = 28;
 const FILE_EXPLORER_MIN_SIZE = 16;
@@ -17986,6 +18127,19 @@ function getPreparedWorkspaceTerminalRequestKey(request, launchKey = "") {
   ].join(":");
 }
 
+function preparedWorkspaceAgentStartResultIsConfirmed(result) {
+  if (result?.started === true) {
+    return true;
+  }
+
+  if (result?.skipped !== true) {
+    return false;
+  }
+
+  const message = String(result?.message || "").toLowerCase();
+  return message.includes("already") && message.includes("started");
+}
+
 function getPreparedWorkspaceThreadRestoreTimestamp(thread) {
   return [
     thread?.lastActiveAt,
@@ -18736,6 +18890,7 @@ export default function App() {
   const [workspaceToolRuntimeBridges, setWorkspaceToolRuntimeBridges] = useState({});
   const [accountToolDraft, setAccountToolDraft] = useState("");
   const [accountToolItems, setAccountToolItems] = useState([]);
+  const [accountToolError, setAccountToolError] = useState("");
   const [appScriptsLibrary, setAppScriptsLibrary] = useState({ root: "", scripts: [] });
   const [appScriptsState, setAppScriptsState] = useState("idle");
   const [appScriptRunResults, setAppScriptRunResults] = useState({});
@@ -18884,6 +19039,7 @@ export default function App() {
   const workspaceAgentBatchSentKeyRef = useRef("");
   const workspaceAgentBatchStartedSessionKeysRef = useRef(new Set());
   const workspaceAgentBatchInFlightSessionKeysRef = useRef(new Set());
+  const workspaceAgentBatchRetryTimerRef = useRef(0);
   const workspaceCloseInFlightRef = useRef(false);
   const workspaceCloseExpectedTotalRef = useRef(0);
   const appCloseConfirmStateRef = useRef(APP_CLOSE_CONFIRM_INITIAL_STATE);
@@ -20875,9 +21031,8 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    // Dispatcher ownership lease: while the webview heartbeats it owns todo
-    // dispatch; when the heartbeat stops (hidden/destroyed window in
-    // background mode), the Rust background dispatcher takes over.
+    // Foreground presence for remote app-control levers. Todo queue dispatch
+    // itself is Rust-owned in both foreground and background.
     const beat = () => {
       void invoke("todo_dispatch_dispatcher_heartbeat").catch(() => {});
     };
@@ -22014,6 +22169,14 @@ export default function App() {
     };
   }, []);
   const selectedWorkspace = findWorkspaceById(workspaces, selectedWorkspaceId);
+  const accountToolComposerItems = useMemo(
+    () => buildAccountToolComposerItems(accountToolItems, selectedWorkspace?.id || ""),
+    [accountToolItems, selectedWorkspace?.id],
+  );
+  const accountToolPendingItems = useMemo(
+    () => buildAccountToolPendingItems(accountToolComposerItems, selectedWorkspace?.id || ""),
+    [accountToolComposerItems, selectedWorkspace?.id],
+  );
   const activatedWorkspace = findWorkspaceById(workspaces, activatedWorkspaceId);
   const archivedWorkspaces = useMemo(
     () => archivedWorkspaceCatalog(workspaceCatalog),
@@ -22748,6 +22911,10 @@ export default function App() {
 
   useEffect(() => () => {
     window.cancelAnimationFrame(workspaceRailAnimationFrameRef.current);
+    if (workspaceAgentBatchRetryTimerRef.current) {
+      window.clearTimeout(workspaceAgentBatchRetryTimerRef.current);
+      workspaceAgentBatchRetryTimerRef.current = 0;
+    }
   }, []);
 
   const clearPreparedWorkspaceTerminals = useCallback((workspaceId) => {
@@ -30408,202 +30575,260 @@ export default function App() {
     || cloudDesktopDeviceProfile?.machine_id
     || cloudDesktopDeviceProfile?.machineId
     || "";
-  const recordAccountToolTodoLocalMirror = useCallback((item, status = "listed") => {
-    const workspaceId = String(selectedWorkspace?.id || "").trim();
-    const text = String(item?.text || "").trim();
-    if (!workspaceId || !text) {
-      return;
-    }
-    const todoId = String(item?.id || "").trim();
-    const workspaceName = selectedWorkspace?.name || selectedWorkspace?.workspaceName || "";
-    void invoke("cloud_mcp_request_workspace_todo_dispatch", {
-      dispatchKind: "local",
-      mode: status === "queued" ? "queued" : "listed",
-      reason: "account_tool_todo_local_mirror",
-      repoPath: selectedWorkspaceFileRoot || defaultWorkingDirectory || "",
-      target: {
-        target_device_id: accountToolTodoDeviceId,
-        targetDeviceId: accountToolTodoDeviceId,
-        target_workspace_id: workspaceId,
-        targetWorkspaceId: workspaceId,
-        target_workspace_name: workspaceName,
-        targetWorkspaceName: workspaceName,
-      },
-      todo: {
-        id: todoId,
-        todo_id: todoId,
-        todoId,
-        status,
-        text,
-        title: text.slice(0, 120),
-      },
-      workspaceId,
-      workspaceName,
-    }).catch(() => {});
-  }, [
-    accountToolTodoDeviceId,
-    defaultWorkingDirectory,
-    selectedWorkspace?.id,
-    selectedWorkspace?.name,
-    selectedWorkspace?.workspaceName,
-    selectedWorkspaceFileRoot,
-  ]);
-  const commitAccountToolTodoSync = useCallback((item, operation = "upsert", status = "listed") => {
-    const workspaceId = String(selectedWorkspace?.id || "").trim();
-    const todoId = String(item?.id || "").trim();
-    if (!workspaceId || !todoId) {
-      return;
-    }
-    const text = String(item?.text || "").trim();
-    const workspaceName = selectedWorkspace?.name || selectedWorkspace?.workspaceName || "";
-    const meta = {
-      source: "rust-diffforge-account-tool",
-      target_device_id: accountToolTodoDeviceId,
-      targetDeviceId: accountToolTodoDeviceId,
-      target_workspace_id: workspaceId,
-      targetWorkspaceId: workspaceId,
-      workspace_name: workspaceName,
-      workspaceName,
-      ...(text ? { title: text.slice(0, 120) } : {}),
-    };
-    const op = operation === "delete"
-      ? ["d", todoId, meta]
-      : ["u", todoId, status, text, meta];
-    void invoke("cloud_mcp_commit_workspace_todo_sync", {
-      payload: {
-        c: "todo.sync",
-        cid: `rust-account-tool-${operation}-${todoId}-${Date.now()}`,
-        device_id: accountToolTodoDeviceId,
-        deviceId: accountToolTodoDeviceId,
-        m: "commit",
-        ops: [op],
-        repo_path: selectedWorkspaceFileRoot || defaultWorkingDirectory || "",
-        source: "rust-diffforge-account-tool",
-        v: 2,
-        workspace_id: workspaceId,
-        workspaceId,
-        workspace_name: workspaceName,
-        workspaceName,
-      },
-    }).catch(() => {});
-  }, [
-    accountToolTodoDeviceId,
-    defaultWorkingDirectory,
-    selectedWorkspace?.id,
-    selectedWorkspace?.name,
-    selectedWorkspace?.workspaceName,
-    selectedWorkspaceFileRoot,
-  ]);
-  const submitAccountToolDraft = useCallback(() => {
-    const text = String(accountToolDraft || "").trim();
-    if (!text) {
+  const refreshAccountToolItemsFromRust = useCallback(async (workspaceId = selectedWorkspace?.id || "") => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    if (!safeWorkspaceId) {
+      setAccountToolItems([]);
       return [];
     }
-    const item = {
-      createdAt: new Date().toISOString(),
-      id: `account-orchestrator-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-      kind: "todo",
-      source: "account-orchestrator",
-      text,
-      workspaceId: selectedWorkspace?.id || "",
+    const snapshot = await invoke("todo_store_snapshot", { workspaceId: safeWorkspaceId });
+    const items = normalizeAccountToolTodoItems(snapshot?.items, safeWorkspaceId);
+    setAccountToolItems(items);
+    return items;
+  }, [selectedWorkspace?.id]);
+
+  useEffect(() => {
+    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    if (!workspaceId) {
+      setAccountToolItems([]);
+      return undefined;
+    }
+    let cancelled = false;
+    refreshAccountToolItemsFromRust(workspaceId)
+      .then(() => {
+        if (!cancelled) {
+          setAccountToolError("");
+        }
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          setAccountToolItems([]);
+          setAccountToolError(error?.message || String(error || "Unable to load todos"));
+        }
+      });
+    return () => {
+      cancelled = true;
     };
-    setAccountToolItems((items) => [...items, item]);
+  }, [refreshAccountToolItemsFromRust, selectedWorkspace?.id]);
+
+  useEffect(() => {
+    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    if (!workspaceId) {
+      return undefined;
+    }
+    let disposed = false;
+    let unlisten = null;
+    listen(TODO_STORE_CHANGED_TAURI_EVENT, (event) => {
+      const eventWorkspaceId = String(
+        event?.payload?.workspaceId
+          || event?.payload?.workspace_id
+          || "",
+      ).trim();
+      if (eventWorkspaceId && eventWorkspaceId !== workspaceId) {
+        return;
+      }
+      void refreshAccountToolItemsFromRust(workspaceId).catch((error) => {
+        setAccountToolError(error?.message || String(error || "Unable to refresh todos"));
+      });
+    }).then((dispose) => {
+      if (disposed) {
+        dispose();
+        return;
+      }
+      unlisten = dispose;
+    }).catch((error) => {
+      setAccountToolError(error?.message || String(error || "Unable to subscribe to todos"));
+    });
+    return () => {
+      disposed = true;
+      if (typeof unlisten === "function") {
+        unlisten();
+      }
+    };
+  }, [refreshAccountToolItemsFromRust, selectedWorkspace?.id]);
+
+  const submitAccountToolDraft = useCallback(async (options = {}) => {
+    const text = String(accountToolDraft || "").trim();
+    const images = Array.isArray(options?.images) ? options.images.filter(Boolean) : [];
+    const note = options?.note && typeof options.note === "object" ? options.note : null;
+    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    if ((!text && !images.length && !note) || !workspaceId) {
+      return [];
+    }
     setAccountToolDraft("");
-    recordAccountToolTodoLocalMirror(item, "listed");
-    commitAccountToolTodoSync(item, "upsert", "listed");
-    return [item];
+    setAccountToolError("");
+    try {
+      const result = await invoke("todo_store_create", {
+        draft: {
+          deviceId: accountToolTodoDeviceId,
+          ...(images.length ? { images } : {}),
+          kind: "todo",
+          ...(note ? { note } : {}),
+          source: "account-orchestrator",
+          text,
+          workspaceId,
+        },
+        reason: "account_tool_todo_submitted",
+        workspaceId,
+      });
+      const createdItem = normalizeAccountToolTodoItem(result?.item, workspaceId);
+      if (createdItem) {
+        setAccountToolItems((items) => normalizeAccountToolTodoItems([...items, createdItem], workspaceId));
+      }
+      void refreshAccountToolItemsFromRust(workspaceId).catch((error) => {
+        setAccountToolError(error?.message || String(error || "Unable to refresh todos"));
+      });
+      return createdItem ? [createdItem] : [];
+    } catch (error) {
+      setAccountToolDraft((currentDraft) => currentDraft || text);
+      setAccountToolError(error?.message || String(error || "Unable to create todo"));
+      return [];
+    }
   }, [
     accountToolDraft,
-    commitAccountToolTodoSync,
-    recordAccountToolTodoLocalMirror,
+    accountToolTodoDeviceId,
+    refreshAccountToolItemsFromRust,
     selectedWorkspace?.id,
   ]);
   const removeAccountToolTodo = useCallback((itemId) => {
     const todoId = String(itemId || "").trim();
-    if (!todoId) {
+    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    if (!todoId || !workspaceId) {
       return;
     }
-    setAccountToolItems((items) => items.filter((item) => item.id !== todoId));
-    commitAccountToolTodoSync({ id: todoId }, "delete", "deleted");
-  }, [commitAccountToolTodoSync]);
+    setAccountToolError("");
+    void invoke("todo_store_delete", {
+      reason: "account_tool_todo_deleted",
+      todoIds: [todoId],
+      workspaceId,
+    }).then(() => {
+      setAccountToolItems((items) => items.filter((item) => item.id !== todoId));
+      void refreshAccountToolItemsFromRust(workspaceId).catch((error) => {
+        setAccountToolError(error?.message || String(error || "Unable to refresh todos"));
+      });
+    }).catch((error) => {
+      setAccountToolError(error?.message || String(error || "Unable to delete todo"));
+    });
+  }, [refreshAccountToolItemsFromRust, selectedWorkspace?.id]);
   const updateAccountToolTodoText = useCallback((itemId, text) => {
     const todoId = String(itemId || "").trim();
     const nextText = String(text || "").trim();
-    if (!todoId || !nextText) {
+    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    if (!todoId || !workspaceId) {
       return;
     }
-    const nextItem = {
-      id: todoId,
-      kind: "todo",
-      source: "account-orchestrator",
-      text: nextText,
-      workspaceId: selectedWorkspace?.id || "",
-    };
-    setAccountToolItems((items) => {
-      const found = items.some((item) => item.id === todoId);
-      if (!found) {
-        return [...items, {
-          ...nextItem,
-          createdAt: new Date().toISOString(),
-        }];
+    if (!nextText) {
+      removeAccountToolTodo(todoId);
+      return;
+    }
+    setAccountToolError("");
+    void invoke("todo_store_update", {
+      patch: { text: nextText },
+      reason: "account_tool_todo_updated",
+      todoId,
+      workspaceId,
+    }).then((result) => {
+      const updatedItem = normalizeAccountToolTodoItem(result?.item, workspaceId);
+      if (updatedItem) {
+        setAccountToolItems((items) => normalizeAccountToolTodoItems(
+          [...items.filter((item) => item.id !== updatedItem.id), updatedItem],
+          workspaceId,
+        ));
       }
-      return items.map((item) => (
-        item.id === todoId ? { ...item, text: nextText } : item
-      ));
+      void refreshAccountToolItemsFromRust(workspaceId).catch((error) => {
+        setAccountToolError(error?.message || String(error || "Unable to refresh todos"));
+      });
+    }).catch((error) => {
+      setAccountToolError(error?.message || String(error || "Unable to update todo"));
     });
-    recordAccountToolTodoLocalMirror(nextItem, "listed");
-    commitAccountToolTodoSync(nextItem, "upsert", "listed");
   }, [
-    commitAccountToolTodoSync,
-    recordAccountToolTodoLocalMirror,
+    refreshAccountToolItemsFromRust,
+    removeAccountToolTodo,
+    selectedWorkspace?.id,
+  ]);
+  const setAccountToolTodoStatus = useCallback((itemId, status, reason, item = null) => {
+    const todoId = String(itemId || item?.id || "").trim();
+    const workspaceId = String(selectedWorkspace?.id || item?.workspaceId || item?.workspace_id || "").trim();
+    if (!todoId || !workspaceId) {
+      return;
+    }
+    const existingItem = normalizeAccountToolTodoItem(
+      item || accountToolItems.find((entry) => entry.id === todoId) || null,
+      workspaceId,
+    );
+    setAccountToolError("");
+    void invoke("todo_store_set_status", {
+      item: existingItem,
+      reason,
+      status,
+      todoId,
+      workspaceId,
+    }).then((result) => {
+      const updatedItem = normalizeAccountToolTodoItem(result?.item, workspaceId);
+      if (updatedItem) {
+        setAccountToolItems((items) => normalizeAccountToolTodoItems(
+          [...items.filter((entry) => entry.id !== updatedItem.id), updatedItem],
+          workspaceId,
+        ));
+      }
+      void refreshAccountToolItemsFromRust(workspaceId).catch((error) => {
+        setAccountToolError(error?.message || String(error || "Unable to refresh todos"));
+      });
+    }).catch((error) => {
+      setAccountToolError(error?.message || String(error || "Unable to update todo status"));
+    });
+  }, [
+    accountToolItems,
+    refreshAccountToolItemsFromRust,
     selectedWorkspace?.id,
   ]);
   const queueAccountToolTodo = useCallback((itemId, item = null) => {
-    const todoId = String(itemId || item?.id || "").trim();
-    if (!todoId) {
+    setAccountToolTodoStatus(itemId || item?.id, "queued", "account_tool_todo_queued", item);
+  }, [setAccountToolTodoStatus]);
+  const queueAllAccountToolTodos = useCallback(() => {
+    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    if (!workspaceId) {
       return;
     }
-    const existingItem = accountToolItems.find((entry) => entry.id === todoId) || null;
-    const sourceItem = item || existingItem || {};
-    const text = String(
-      sourceItem.text
-        || sourceItem.title
-        || sourceItem.todo_text
-        || sourceItem.todoText
-        || "",
-    ).trim();
-    if (!text) {
+    const queueableItems = accountToolComposerItems
+      .filter((item) => {
+        const itemId = String(item?.id || "").trim();
+        if (!itemId || !String(item?.text || "").trim()) {
+          return false;
+        }
+        const status = accountToolTodoStatus(item);
+        return !status || status === "listed";
+      });
+    if (!queueableItems.length) {
       return;
     }
-    const nextItem = {
-      ...sourceItem,
-      id: todoId,
-      kind: sourceItem.kind || "todo",
-      source: sourceItem.source || "account-orchestrator",
-      status: "queued",
-      text,
-      workspaceId: selectedWorkspace?.id || sourceItem.workspaceId || sourceItem.workspace_id || "",
-    };
-    setAccountToolItems((items) => {
-      const found = items.some((entry) => entry.id === todoId);
-      if (!found) {
-        return [...items, {
-          ...nextItem,
-          createdAt: nextItem.createdAt || new Date().toISOString(),
-        }];
+    setAccountToolError("");
+    void invoke("todo_store_queue_all", {
+      items: queueableItems,
+      reason: "account_tool_todo_queue_all",
+      workspaceId,
+    }).then((result) => {
+      const queuedItems = normalizeAccountToolTodoItems(result?.items, workspaceId);
+      if (queuedItems.length) {
+        setAccountToolItems((items) => normalizeAccountToolTodoItems(
+          [...items.filter((entry) => !queuedItems.some((queued) => queued.id === entry.id)), ...queuedItems],
+          workspaceId,
+        ));
       }
-      return items.map((entry) => (
-        entry.id === todoId ? { ...entry, ...nextItem } : entry
-      ));
+      void refreshAccountToolItemsFromRust(workspaceId).catch((error) => {
+        setAccountToolError(error?.message || String(error || "Unable to refresh todos"));
+      });
+    }).catch((error) => {
+      setAccountToolError(error?.message || String(error || "Unable to queue todos"));
     });
-    recordAccountToolTodoLocalMirror(nextItem, "queued");
-    commitAccountToolTodoSync(nextItem, "upsert", "queued");
   }, [
-    accountToolItems,
-    commitAccountToolTodoSync,
-    recordAccountToolTodoLocalMirror,
+    accountToolComposerItems,
+    refreshAccountToolItemsFromRust,
     selectedWorkspace?.id,
   ]);
+  const cancelAccountToolQueuedTodo = useCallback((itemId, item = null) => {
+    setAccountToolTodoStatus(itemId || item?.id, "listed", "account_tool_todo_unqueued", item);
+  }, [setAccountToolTodoStatus]);
 
   useLayoutEffect(() => {
     const element = workspaceToolLayoutRef.current;
@@ -41041,7 +41266,30 @@ export default function App() {
   const preparedWorkspaceTerminalAgentStartCount = preparedWorkspaceTerminalRequests.length;
 
   useEffect(() => {
+    const clearPreparedWorkspaceAgentBatchRetry = () => {
+      if (!workspaceAgentBatchRetryTimerRef.current) {
+        return;
+      }
+      window.clearTimeout(workspaceAgentBatchRetryTimerRef.current);
+      workspaceAgentBatchRetryTimerRef.current = 0;
+    };
+
+    const schedulePreparedWorkspaceAgentBatchRetry = (reason, fields = {}) => {
+      clearPreparedWorkspaceAgentBatchRetry();
+      logWorkspaceActivationTrace("workspace.open.agent_batch.retry_scheduled", activatedWorkspace?.id || "", {
+        delayMs: WORKSPACE_AGENT_BATCH_RETRY_MS,
+        launchKey: workspaceAgentLaunchKey,
+        reason,
+        ...fields,
+      });
+      workspaceAgentBatchRetryTimerRef.current = window.setTimeout(() => {
+        workspaceAgentBatchRetryTimerRef.current = 0;
+        setPreparedTerminalVersion((version) => version + 1);
+      }, WORKSPACE_AGENT_BATCH_RETRY_MS);
+    };
+
     if (workspaceDeactivationInFlightRef.current) {
+      clearPreparedWorkspaceAgentBatchRetry();
       logWorkspaceActivationTrace("workspace.open.agent_batch.skip", activatedWorkspace?.id || "", {
         reason: "workspace_deactivation_in_flight",
         workspaceDeactivationInFlight: workspaceDeactivationInFlightRef.current,
@@ -41063,6 +41311,7 @@ export default function App() {
       workspaceAgentBatchStartedSessionKeysRef.current.clear();
       workspaceAgentBatchInFlightSessionKeysRef.current.clear();
       setWorkspaceAgentBatchSentLaunchKey("");
+      clearPreparedWorkspaceAgentBatchRetry();
       return;
     }
 
@@ -41073,6 +41322,7 @@ export default function App() {
       workspaceAgentBatchStartedSessionKeysRef.current.clear();
       workspaceAgentBatchInFlightSessionKeysRef.current.clear();
       setWorkspaceAgentBatchSentLaunchKey("");
+      clearPreparedWorkspaceAgentBatchRetry();
     }
 
     if (!workspaceThreadsHydrated) {
@@ -41173,6 +41423,7 @@ export default function App() {
 
     workspaceAgentBatchInFlightKeyRef.current = workspaceAgentLaunchKey;
     workspaceAgentBatchWaitLogKeyRef.current = "";
+    clearPreparedWorkspaceAgentBatchRetry();
     pendingRequestKeys.forEach((requestKey) => {
       workspaceAgentBatchInFlightSessionKeysRef.current.add(requestKey);
     });
@@ -41219,31 +41470,91 @@ export default function App() {
     invoke("terminal_start_agent_many", { requests: pendingPreparedWorkspaceTerminalRequests })
       .then((result) => {
         const results = Array.isArray(result?.results) ? result.results : [];
+        const confirmedPaneResults = results
+          .map((paneResult) => {
+            if (!preparedWorkspaceAgentStartResultIsConfirmed(paneResult)) {
+              return null;
+            }
+
+            const request = pendingPreparedWorkspaceTerminalRequests.find((candidate) => (
+              candidate.paneId === paneResult.paneId
+              && Number(candidate.instanceId || 0) === Number(paneResult.instanceId || 0)
+            ));
+            if (!request) {
+              return null;
+            }
+
+            const requestKey = getPreparedWorkspaceTerminalRequestKey(request, workspaceAgentLaunchKey);
+            if (!requestKey) {
+              return null;
+            }
+
+            return { paneResult, request, requestKey };
+          })
+          .filter(Boolean);
+        const confirmedRequestKeys = new Set(confirmedPaneResults.map(({ requestKey }) => requestKey));
+        const unconfirmedRequests = pendingPreparedWorkspaceTerminalRequests.filter((request) => {
+          const requestKey = getPreparedWorkspaceTerminalRequestKey(request, workspaceAgentLaunchKey);
+          return !requestKey || !confirmedRequestKeys.has(requestKey);
+        });
         logWorkspaceActivationTrace("workspace.open.agent_batch.done", activatedWorkspace.id, {
+          confirmedCount: confirmedPaneResults.length,
           elapsedMs: Math.max(0, performance.now() - batchStartedAt),
           launchKey: workspaceAgentLaunchKey,
           requestCount: pendingPreparedWorkspaceTerminalRequests.length,
           resultCount: results.length,
           startedCount: results.filter((paneResult) => paneResult?.started).length,
+          unconfirmedCount: unconfirmedRequests.length,
         });
         logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_result", {
+          confirmedCount: confirmedPaneResults.length,
           launchKey: workspaceAgentLaunchKey,
           resultCount: results.length,
           startedCount: results.filter((paneResult) => paneResult?.started).length,
+          unconfirmedCount: unconfirmedRequests.length,
           workspaceId: activatedWorkspace.id,
         });
-        results.forEach((paneResult) => {
-          if (!paneResult?.started) {
-            return;
+        if (unconfirmedRequests.length > 0) {
+          pendingRequestKeys.forEach((requestKey) => {
+            workspaceAgentBatchInFlightSessionKeysRef.current.delete(requestKey);
+          });
+          if (workspaceAgentBatchInFlightSessionKeysRef.current.size === 0) {
+            workspaceAgentBatchInFlightKeyRef.current = "";
           }
+          logWorkspaceActivationTrace("workspace.open.agent_batch.partial", activatedWorkspace.id, {
+            confirmedCount: confirmedPaneResults.length,
+            elapsedMs: Math.max(0, performance.now() - batchStartedAt),
+            launchKey: workspaceAgentLaunchKey,
+            requestCount: pendingPreparedWorkspaceTerminalRequests.length,
+            resultCount: results.length,
+            unconfirmedCount: unconfirmedRequests.length,
+            unconfirmedRequests: unconfirmedRequests.map((request) => ({
+              instanceId: request.instanceId || "",
+              paneId: request.paneId || "",
+              provider: request.provider || "",
+              terminalIndex: request.terminalIndex ?? "",
+              threadId: request.threadId || "",
+              workspaceId: request.workspaceId || "",
+            })),
+          });
+          logBigViewSyncDiagnosticEvent("bigview.model_restore.batch_partial", {
+            confirmedCount: confirmedPaneResults.length,
+            launchKey: workspaceAgentLaunchKey,
+            requestCount: pendingPreparedWorkspaceTerminalRequests.length,
+            resultCount: results.length,
+            unconfirmedCount: unconfirmedRequests.length,
+            workspaceId: activatedWorkspace.id,
+          });
+          schedulePreparedWorkspaceAgentBatchRetry("partial_result", {
+            confirmedCount: confirmedPaneResults.length,
+            requestCount: pendingPreparedWorkspaceTerminalRequests.length,
+            resultCount: results.length,
+            unconfirmedCount: unconfirmedRequests.length,
+          });
+          return;
+        }
 
-          const request = pendingPreparedWorkspaceTerminalRequests.find((candidate) => (
-            candidate.paneId === paneResult.paneId
-            && Number(candidate.instanceId || 0) === Number(paneResult.instanceId || 0)
-          ));
-          if (!request) {
-            return;
-          }
+        confirmedPaneResults.forEach(({ paneResult, request }) => {
 
           const startedModel = String(paneResult.model || request.model || "").trim();
           const startedModelSourceRaw = String(paneResult.modelSource || "").trim();
@@ -41414,21 +41725,13 @@ export default function App() {
         });
         pendingRequestKeys.forEach((requestKey) => {
           workspaceAgentBatchInFlightSessionKeysRef.current.delete(requestKey);
-          workspaceAgentBatchStartedSessionKeysRef.current.add(requestKey);
         });
         if (workspaceAgentBatchInFlightSessionKeysRef.current.size === 0) {
           workspaceAgentBatchInFlightKeyRef.current = "";
         }
-        setWorkspaceAgentBatchSentLaunchKey(workspaceAgentLaunchKey);
-        setWorkspaceAgentLaunchEpoch((epoch) => epoch + 1);
-        preparedTerminalsRef.current.forEach((session, key) => {
-          if (pendingPreparedWorkspaceTerminalRequests.some((request) => (
-            request.paneId === session.paneId && request.instanceId === session.instanceId
-          ))) {
-            preparedTerminalsRef.current.delete(key);
-          }
+        schedulePreparedWorkspaceAgentBatchRetry("error", {
+          requestCount: pendingPreparedWorkspaceTerminalRequests.length,
         });
-        setPreparedTerminalVersion((version) => version + 1);
       });
   }, [
     activatedWorkspace?.id,
@@ -44068,13 +44371,17 @@ export default function App() {
                                     : []}
                                   defaultWorkingDirectory={defaultWorkingDirectory}
                                   deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
+                                  dropError={accountToolError}
                                   draft={accountToolDraft}
-                                  items={accountToolItems}
+                                  items={accountToolComposerItems}
                                   knownDevices={cloudWorkspaceProgress.knownDevices}
                                   localDesktopProfile={cloudDesktopDeviceProfile}
+                                  onBeginTodoDrag={selectedWorkspaceToolRuntimeBridge?.onBeginTodoDrag}
+                                  onCancelQueuedItem={cancelAccountToolQueuedTodo}
                                   onDraftChange={setAccountToolDraft}
                                   onMinimizePane={minimizeWorkspaceToolPane}
                                   onOpenWorkspaceSettings={openSelectedWorkspaceSettings}
+                                  onQueueAllItems={queueAllAccountToolTodos}
                                   onQueueItem={queueAccountToolTodo}
                                   onRemoveItem={removeAccountToolTodo}
                                   onSubmitDraft={submitAccountToolDraft}
@@ -44085,8 +44392,8 @@ export default function App() {
                                   onVoiceAgentToolCall={selectedWorkspaceToolRuntimeBridge?.onVoiceAgentToolCall}
                                   onVoicePlanServerResult={selectedWorkspaceToolRuntimeBridge?.onVoicePlanServerResult}
                                   paneMode={workspaceToolPaneMode}
-                                  pendingItems={{}}
-                                  queueItems={accountToolItems}
+                                  pendingItems={accountToolPendingItems}
+                                  queueItems={accountToolComposerItems}
                                   rootDirectory={selectedWorkspaceFileRoot || defaultWorkingDirectory}
                                   storageUsage={cloudWorkspaceProgress.storageUsage}
                                   terminalBreakoutActive={Boolean(selectedWorkspaceToolRuntimeBridge?.terminalBreakoutActive)}
