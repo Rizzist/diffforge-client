@@ -2498,7 +2498,7 @@ export const DashboardShell = styled.main`
 export const WorkspaceRail = styled.aside`
   display: grid;
   min-height: 0;
-  grid-template-rows: minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) minmax(0, max-content);
   gap: 10px;
   padding: 10px;
   border-right: 1px solid rgba(var(--forge-tint-soft-rgb), 0.14);
@@ -3372,8 +3372,14 @@ export const RailFooter = styled.div`
   display: grid;
   gap: 4px;
   min-height: 0;
+  max-height: 100%;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   padding-top: 8px;
+  padding-right: 2px;
   border-top: 1px solid var(--forge-border);
+  scrollbar-gutter: stable;
   background:
     linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.04), transparent),
     rgba(7, 9, 13, 0.7);
@@ -12798,9 +12804,9 @@ export const AudioTabBar = styled.div`
   display: grid;
   width: min(1080px, 100%);
   justify-self: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
-  padding: 10px 10px 8px;
+  padding: 8px 10px 7px;
   border: 1px solid var(--audio-border, var(--forge-border));
   border-radius: 8px;
   background:
@@ -12808,23 +12814,58 @@ export const AudioTabBar = styled.div`
     var(--audio-panel-bg-muted, rgba(7, 9, 13, 0.72));
 
   ${AudioHeroRow} {
+    grid-template-columns: 30px minmax(0, 1fr) auto;
+    gap: 8px;
     padding-bottom: 0;
     border-bottom: 0;
   }
 
+  ${AudioHeroRow} ${VaultPlaceholderIcon} {
+    width: 30px;
+    height: 30px;
+
+    svg {
+      width: 15px;
+      height: 15px;
+    }
+  }
+
+  ${AudioHeroRow} h2 {
+    margin-top: 1px;
+    font-size: 14px;
+  }
+
+  ${AudioHeroRow} p {
+    margin-top: 1px;
+    font-size: 11px;
+    line-height: 1.25;
+  }
+
+  ${AudioHeroRow} ${AudioStatePill} {
+    min-height: 22px;
+    padding: 0 7px;
+    font-size: 9.5px;
+  }
+
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
+  }
+
+  @media (max-width: 680px) {
+    ${AudioHeroRow} {
+      grid-template-columns: 30px minmax(0, 1fr);
+    }
   }
 `;
 
 export const AudioTabList = styled.div`
   display: grid;
   width: 100%;
-  grid-template-columns: repeat(auto-fit, minmax(116px, 1fr));
-  gap: 6px;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 3px;
   min-width: 0;
-  padding: 5px;
-  border-radius: 8px;
+  padding: 3px;
+  border-radius: 7px;
   background:
     linear-gradient(180deg, rgba(244, 247, 250, 0.026), rgba(244, 247, 250, 0.006)),
     var(--audio-panel-bg-soft, rgba(17, 22, 29, 0.58));
@@ -12833,22 +12874,30 @@ export const AudioTabList = styled.div`
     background: rgba(0, 102, 204, 0.035);
   }
 
-  @media (max-width: 520px) {
-    grid-template-columns: 1fr;
+  @media (max-width: 640px) {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+
+  @media (max-width: 380px) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 `;
 
 export const AudioTabButton = styled.button`
   min-width: 0;
-  min-height: 42px;
-  padding: 0 12px;
+  min-height: 30px;
+  padding: 0 7px;
   border: 1px solid transparent;
   border-radius: 6px;
+  overflow: hidden;
   color: var(--forge-text-muted);
   background: transparent;
-  font-size: 13px;
-  font-weight: 800;
+  font-size: 12px;
+  font-weight: 780;
+  line-height: 1;
   text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   transition:
     background 160ms ease,
     border-color 160ms ease,
@@ -12881,7 +12930,7 @@ export const AudioTabButton = styled.button`
       var(--audio-control-bg, rgba(21, 27, 35, 0.78));
     box-shadow:
       0 0 0 1px rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.12) inset,
-      0 8px 20px rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.08);
+      0 5px 14px rgba(var(--audio-accent-rgb, var(--forge-tint-rgb)), 0.06);
   }
 
   html[data-forge-theme="light"] &[aria-selected="true"] {
@@ -19613,12 +19662,12 @@ export const WorkspaceSettingsActions = styled.div`
 export const AgentSettingsPanel = styled.section`
   position: relative;
   display: grid;
-  gap: 12px;
+  gap: 10px;
   align-self: start;
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  padding: 14px;
+  padding: 12px;
   border: 1px solid var(--settings-border, var(--forge-border));
   border-radius: 8px;
   background:
@@ -19651,20 +19700,20 @@ export const AgentPanelActions = styled.div`
 
 export const AgentReadyPill = styled.div`
   display: inline-flex;
-  min-height: 40px;
+  min-height: 32px;
   align-items: center;
-  gap: 8px;
-  padding: 0 11px;
+  gap: 6px;
+  padding: 0 9px;
   border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-soft);
   background: var(--settings-control-bg, rgba(21, 27, 35, 0.72));
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 760;
 
   svg {
-    width: 17px;
-    height: 17px;
+    width: 15px;
+    height: 15px;
   }
 
   &[data-tone="blue"] {
@@ -19686,67 +19735,46 @@ export const AgentReadyPill = styled.div`
 
 export const AgentCardGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 248px), 1fr));
   align-items: start;
   gap: 10px;
   min-height: 0;
-
-  @media (max-width: 860px) {
-    grid-template-columns: 1fr;
-  }
 `;
 
 export const AgentCard = styled.section`
   position: relative;
   display: grid;
   align-content: start;
-  gap: 10px;
+  gap: 11px;
   min-height: 0;
   overflow: hidden;
-  padding: 12px;
+  padding: 14px 14px 14px 16px;
   border: 1px solid var(--settings-border-soft, var(--forge-border));
-  border-radius: 8px;
-  background:
-    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    var(--settings-panel-bg-soft, rgba(13, 17, 23, 0.78));
+  border-radius: 11px;
+  background: var(--settings-panel-bg-soft, rgba(13, 17, 23, 0.55));
   transition:
-    border-color 160ms ease,
-    background 160ms ease,
-    transform 160ms ease;
+    border-color 150ms ease,
+    background 150ms ease;
 
   &::before {
     position: absolute;
-    inset: 0 auto 0 0;
-    width: 3px;
-    background: rgba(230, 236, 245, 0.12);
+    inset: 6px auto 6px 0;
+    width: 2px;
+    border-radius: 0 2px 2px 0;
+    background: transparent;
     content: "";
   }
 
   &:hover {
     border-color: var(--settings-border-strong, var(--forge-border-strong));
-    background:
-      linear-gradient(180deg, rgba(244, 247, 250, 0.042), rgba(244, 247, 250, 0.014)),
-      var(--settings-control-bg-hover, rgba(17, 22, 29, 0.88));
   }
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
   }
 
-  html[data-forge-theme="light"] &:hover {
-    background: var(--forge-surface-control);
-  }
-
-  &[data-tone="ready"] {
-    border-color: rgba(60, 203, 127, 0.28);
-  }
-
   &[data-tone="ready"]::before {
     background: var(--forge-green);
-  }
-
-  &[data-tone="needsAuth"] {
-    border-color: rgba(223, 165, 90, 0.28);
   }
 
   &[data-tone="needsAuth"]::before {
@@ -19756,15 +19784,15 @@ export const AgentCard = styled.section`
 
 export const AgentCardHeader = styled.div`
   display: grid;
-  grid-template-columns: 32px minmax(0, 1fr);
+  grid-template-columns: 26px minmax(0, 1fr);
   align-items: center;
-  gap: 9px;
+  gap: 7px;
 `;
 
 export const AgentIcon = styled.span`
   display: grid;
-  width: 32px;
-  height: 32px;
+  width: 26px;
+  height: 26px;
   place-items: center;
   border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
@@ -19772,8 +19800,8 @@ export const AgentIcon = styled.span`
   background: rgba(var(--settings-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.04);
 
   svg {
-    width: 17px;
-    height: 17px;
+    width: 14px;
+    height: 14px;
   }
 
   &[data-tone="ready"] {
@@ -19793,17 +19821,17 @@ export const AgentName = styled.h3`
   margin: 0;
   overflow: hidden;
   color: var(--forge-text);
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 760;
   text-overflow: ellipsis;
   white-space: nowrap;
 `;
 
 export const AgentMeta = styled.p`
-  margin: 3px 0 0;
+  margin: 2px 0 0;
   overflow: hidden;
   color: var(--forge-text-muted);
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 650;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -19813,32 +19841,26 @@ export const AgentStatusText = styled.p`
   margin: 0;
   min-height: 0;
   color: var(--forge-text-soft);
-  font-size: 12px;
-  line-height: 1.45;
+  font-size: 11px;
+  line-height: 1.32;
 `;
 
 export const AgentInstallPanel = styled.div`
   display: grid;
   gap: 8px;
-  padding: 10px;
-  border: 1px solid var(--settings-border-soft, var(--forge-border));
-  border-radius: 8px;
-  background: var(--settings-panel-bg-muted, rgba(21, 27, 35, 0.42));
-
-  html[data-forge-theme="light"] & {
-    background: var(--forge-surface-control);
-  }
+  padding-top: 11px;
+  border-top: 1px solid var(--settings-border-soft, var(--forge-border));
 `;
 
 export const AgentInstallTopline = styled.div`
   display: flex;
   min-width: 0;
-  align-items: center;
+  align-items: baseline;
   justify-content: space-between;
   gap: 8px;
-  color: var(--forge-text);
-  font-size: 12px;
-  font-weight: 720;
+  color: var(--forge-text-soft);
+  font-size: 11px;
+  font-weight: 680;
 
   span {
     min-width: 0;
@@ -19850,31 +19872,30 @@ export const AgentInstallTopline = styled.div`
 
 export const AgentInstallBadge = styled.span`
   flex: 0 0 auto;
-  padding: 4px 7px;
-  border: 1px solid var(--settings-border-strong, rgba(125, 160, 205, 0.28));
-  border-radius: 999px;
-  color: var(--forge-text-soft);
-  background: rgba(var(--settings-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.08);
-  font-size: 10px;
-  font-weight: 760;
+  color: var(--forge-text-muted);
+  font-size: 9px;
+  font-weight: 720;
+  letter-spacing: 0.08em;
   text-transform: uppercase;
 `;
 
 export const AgentInstallHint = styled.p`
   margin: 0;
   color: var(--forge-text-muted);
-  font-size: 12px;
+  font-size: 10.5px;
   font-weight: 650;
-  line-height: 1.45;
+  line-height: 1.32;
 `;
 
 export const AgentInstallActions = styled.div`
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(132px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(106px, 1fr));
+  gap: 6px;
 
   button {
-    min-height: 36px;
+    min-height: 30px;
+    padding-inline: 9px;
+    font-size: 11px;
   }
 `;
 
@@ -19882,25 +19903,24 @@ export const AgentInstallCommand = styled.code`
   display: block;
   min-width: 0;
   overflow: hidden;
-  padding: 8px;
-  border: 1px solid var(--settings-border-soft, var(--forge-border));
-  border-radius: 8px;
-  color: var(--forge-text-soft);
-  background: var(--settings-panel-bg-muted, rgba(7, 9, 13, 0.54));
+  padding: 6px 9px;
+  border-radius: 7px;
+  color: var(--forge-text-muted);
+  background: var(--settings-panel-bg-muted, rgba(7, 9, 13, 0.4));
   font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
-  font-size: 11px;
+  font-size: 10px;
   text-overflow: ellipsis;
   white-space: nowrap;
 
   html[data-forge-theme="light"] & {
-    background: var(--forge-surface);
+    background: var(--forge-surface-control);
   }
 `;
 
 export const AgentLaunchDefaultsGrid = styled.div`
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
+  gap: 6px;
 
   @media (max-width: 640px) {
     grid-template-columns: 1fr;
@@ -19910,7 +19930,7 @@ export const AgentLaunchDefaultsGrid = styled.div`
 export const AgentLaunchField = styled.label`
   display: grid;
   min-width: 0;
-  gap: 5px;
+  gap: 4px;
 
   &[data-wide="true"] {
     grid-column: 1 / -1;
@@ -19919,26 +19939,26 @@ export const AgentLaunchField = styled.label`
 
 export const AgentPermissionHint = styled.p`
   margin: 0;
-  padding: 8px 9px;
+  padding: 6px 7px;
   border: 1px solid rgba(223, 165, 90, 0.28);
   border-radius: 8px;
   color: #e5bd83;
   background: rgba(223, 165, 90, 0.08);
-  font-size: 12px;
+  font-size: 10.5px;
   font-weight: 650;
-  line-height: 1.45;
+  line-height: 1.32;
 `;
 
 export const AgentInstallMessage = styled.p`
   margin: 0;
-  padding: 8px 9px;
+  padding: 6px 7px;
   border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 8px;
   color: var(--forge-text-soft);
   background: var(--settings-panel-bg-muted, rgba(21, 27, 35, 0.5));
-  font-size: 12px;
+  font-size: 10.5px;
   font-weight: 650;
-  line-height: 1.45;
+  line-height: 1.32;
   overflow-wrap: anywhere;
 
   &[data-tone="success"] {
@@ -19958,9 +19978,13 @@ export const AgentActions = styled.div`
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
+  padding-top: 11px;
+  border-top: 1px solid var(--settings-border-soft, var(--forge-border));
 
   button {
-    min-height: 36px;
+    min-height: 32px;
+    padding-inline: 10px;
+    font-size: 11px;
   }
 `;
 
@@ -21772,9 +21796,8 @@ export const WorkspaceCreateSurface = styled.div`
   height: 100%;
   min-width: 0;
   min-height: 0;
-  place-items: start center;
-  padding: 28px 24px;
-  overflow: auto;
+  place-items: stretch;
+  overflow: hidden;
   background:
     linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), transparent 22rem),
     var(--forge-shell-right-bg);
@@ -21782,11 +21805,16 @@ export const WorkspaceCreateSurface = styled.div`
 
 export const WorkspaceCreateCard = styled.form`
   display: grid;
-  width: min(720px, 100%);
-  gap: 18px;
-  padding: 22px;
-  border: 1px solid var(--forge-border);
-  border-radius: 14px;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  align-content: start;
+  gap: 14px;
+  overflow: auto;
+  padding: 20px 24px;
+  border: 0;
+  border-radius: 0;
   background: var(--forge-surface);
 `;
 
@@ -21940,8 +21968,8 @@ export const WorkspaceCreateDirChip = styled.button`
 
 export const WorkspaceCreateAgentGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 118px), 1fr));
+  gap: 7px;
 `;
 
 export const WorkspaceCreateAgentCard = styled.div`
@@ -21951,13 +21979,13 @@ export const WorkspaceCreateAgentCard = styled.div`
   grid-template-areas:
     "icon . status"
     "body body body"
-    ". . stepper";
+    "permission permission stepper";
   align-items: start;
-  gap: 8px 9px;
-  min-height: 116px;
-  padding: 10px 11px;
+  gap: 6px 7px;
+  min-height: 76px;
+  padding: 8px;
   border: 1px solid ${({ $active }) => ($active ? "rgba(138, 216, 255, 0.34)" : "var(--forge-border)")};
-  border-radius: 10px;
+  border-radius: 8px;
   background: ${({ $active }) => ($active ? "var(--forge-surface-selected)" : "var(--forge-surface-raised)")};
   transition: border-color 120ms ease, background 120ms ease;
 
@@ -21969,11 +21997,11 @@ export const WorkspaceCreateAgentCard = styled.div`
 export const WorkspaceCreateAgentIcon = styled.span`
   grid-area: icon;
   display: grid;
-  width: 38px;
-  height: 38px;
+  width: 28px;
+  height: 28px;
   place-items: center;
   border: 1px solid var(--forge-border);
-  border-radius: 9px;
+  border-radius: 7px;
   color: var(--forge-text);
   background: var(--forge-bg-deep);
 
@@ -22000,30 +22028,30 @@ export const WorkspaceCreateAgentIcon = styled.span`
 
   > svg {
     display: block;
-    max-width: 26px;
-    max-height: 26px;
+    max-width: 19px;
+    max-height: 19px;
   }
 `;
 
 export const WorkspaceCreateAgentCodexIcon = styled(CodexBrandGlyph)`
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   fill: currentColor;
 `;
 
 export const WorkspaceCreateAgentClaudeIcon = styled(ClaudeBrandGlyph)`
-  width: 24px;
-  height: 24px;
+  width: 19px;
+  height: 19px;
 `;
 
 export const WorkspaceCreateAgentTerminalIcon = styled(AgentTerminalGlyph)`
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
 `;
 
 export const WorkspaceCreateAgentOpenCodeIcon = styled.svg`
-  width: 22px;
-  height: 28px;
+  width: 16px;
+  height: 20px;
 `;
 
 export const WorkspaceCreateAgentBody = styled.div`
@@ -22039,9 +22067,9 @@ export const WorkspaceCreateAgentLabel = styled.div`
 
   > strong {
     color: var(--forge-text);
-    font-size: 12px;
+    font-size: 10.5px;
     font-weight: 800;
-    line-height: 1.12;
+    line-height: 1.08;
     overflow-wrap: anywhere;
     white-space: normal;
   }
@@ -22054,9 +22082,9 @@ export const WorkspaceCreateAgentStatus = styled.span`
   max-width: 100%;
   overflow: hidden;
   color: rgba(244, 247, 250, 0.58);
-  font-size: 10px;
+  font-size: 8.5px;
   font-weight: 800;
-  letter-spacing: 0.05em;
+  letter-spacing: 0.045em;
   line-height: 1.1;
   text-overflow: ellipsis;
   text-transform: uppercase;
@@ -22071,24 +22099,24 @@ export const WorkspaceCreateAgentStepper = styled.div`
   gap: 2px;
   justify-self: end;
   align-self: end;
-  min-width: 82px;
+  min-width: 66px;
   border: 1px solid var(--forge-border);
   border-radius: 999px;
   background: var(--forge-bg-deep);
 
   > strong {
-    min-width: 20px;
+    min-width: 16px;
     color: var(--forge-text);
     text-align: center;
-    font-size: 12.5px;
+    font-size: 11px;
     font-weight: 800;
   }
 `;
 
 export const WorkspaceCreateAgentStepButton = styled.button`
   display: grid;
-  width: 24px;
-  height: 24px;
+  width: 20px;
+  height: 20px;
   place-items: center;
   padding: 0;
   border: none;
@@ -22096,7 +22124,7 @@ export const WorkspaceCreateAgentStepButton = styled.button`
   color: var(--forge-text);
   background: transparent;
   cursor: pointer;
-  font-size: 14px;
+  font-size: 12px;
   font-weight: 800;
   line-height: 1;
 
@@ -22108,6 +22136,53 @@ export const WorkspaceCreateAgentStepButton = styled.button`
     cursor: default;
     opacity: 0.35;
   }
+`;
+
+export const WorkspaceCreateAgentPermission = styled.div`
+  grid-area: permission;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  align-self: end;
+  justify-self: start;
+  min-width: 74px;
+  max-width: 100%;
+  border: 1px solid var(--forge-border);
+  border-radius: 999px;
+  background: var(--forge-bg-deep);
+
+  &[data-tone="plan"] {
+    border-color: rgba(147, 197, 253, 0.32);
+    background: rgba(59, 130, 246, 0.1);
+  }
+
+  &[data-tone="ask"] {
+    border-color: rgba(250, 204, 21, 0.32);
+    background: rgba(202, 138, 4, 0.11);
+  }
+
+  &[data-tone="accept"] {
+    border-color: rgba(74, 222, 128, 0.3);
+    background: rgba(34, 197, 94, 0.1);
+  }
+
+  &[data-tone="bypass"] {
+    border-color: rgba(248, 113, 113, 0.34);
+    background: rgba(220, 38, 38, 0.12);
+  }
+`;
+
+export const WorkspaceCreateAgentPermissionLabel = styled.strong`
+  min-width: 30px;
+  max-width: 64px;
+  overflow: hidden;
+  color: var(--forge-text);
+  font-size: 9.5px;
+  font-weight: 850;
+  line-height: 1;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 `;
 
 export const WorkspaceCreatePreviewRow = styled.div`
@@ -22145,6 +22220,46 @@ export const WorkspaceCreateFooter = styled.div`
   justify-content: space-between;
   gap: 12px;
   flex-wrap: wrap;
+`;
+
+export const WorkspaceCreateCheckboxRow = styled.label`
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  max-width: 100%;
+  color: var(--forge-text);
+  font-size: 12px;
+  font-weight: 700;
+
+  > input {
+    flex: 0 0 auto;
+    width: 16px;
+    height: 16px;
+    margin: 1px 0 0;
+    accent-color: #7aa2ff;
+  }
+
+  > span {
+    display: grid;
+    min-width: 0;
+    gap: 2px;
+  }
+
+  strong {
+    font-size: 12px;
+    line-height: 1.15;
+  }
+
+  small {
+    color: rgba(244, 247, 250, 0.58);
+    font-size: 10.5px;
+    font-weight: 650;
+    line-height: 1.25;
+  }
+
+  &[data-disabled="true"] {
+    opacity: 0.68;
+  }
 `;
 
 export const WorkspaceArchiveList = styled.div`

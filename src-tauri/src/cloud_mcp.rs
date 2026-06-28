@@ -24523,11 +24523,22 @@ pub(crate) fn cloud_mcp_terminal_output_has_working_indicator(cleaned_text: &str
 }
 
 pub(crate) fn cloud_mcp_terminal_output_has_prompt_marker(cleaned_text: &str) -> bool {
+    let lower = cleaned_text.trim().to_ascii_lowercase();
+    let has_ascii_prompt_line = cleaned_text
+        .lines()
+        .rev()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            (!trimmed.is_empty()).then_some(trimmed)
+        })
+        .take(4)
+        .any(|line| line == ">" || line.starts_with("> "));
     cleaned_text.contains('›')
         || cleaned_text.contains('❯')
         || cleaned_text.contains('❱')
-        || cleaned_text.contains("\n> ")
-        || cleaned_text.contains("\r> ")
+        || has_ascii_prompt_line
+        || (lower.contains("ctrl+p commands")
+            && (lower.contains("opencode") || lower.contains("build ")))
 }
 
 fn cloud_mcp_terminal_output_looks_active(text: &str) -> bool {
@@ -45994,6 +46005,29 @@ mod cloud_mcp_tests {
         assert!(cloud_mcp_agent_uses_activity_hooks(" OpenCode "));
         assert!(!cloud_mcp_agent_uses_activity_hooks("shell"));
         assert!(!cloud_mcp_agent_uses_activity_hooks("generic"));
+    }
+
+    #[test]
+    fn prompt_marker_accepts_cleaned_ascii_prompt() {
+        assert!(cloud_mcp_terminal_output_has_prompt_marker("> "));
+        assert!(cloud_mcp_terminal_output_has_prompt_marker(
+            "previous output\n> "
+        ));
+    }
+
+    #[test]
+    fn prompt_marker_rejects_interior_ascii_arrows() {
+        assert!(!cloud_mcp_terminal_output_has_prompt_marker("foo > bar"));
+        assert!(!cloud_mcp_terminal_output_has_prompt_marker(
+            "previous output > "
+        ));
+    }
+
+    #[test]
+    fn prompt_marker_accepts_opencode_ready_footer() {
+        assert!(cloud_mcp_terminal_output_has_prompt_marker(
+            "Build · North Mini Code Free OpenCode Zen · high tab agents ctrl+p commands"
+        ));
     }
 
     fn assert_account_document_snake_only(value: &Value) {

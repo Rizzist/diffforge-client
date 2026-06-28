@@ -262,6 +262,42 @@ function metaMatches(meta, params) {
   return !params.key || !metaKey || metaKey === params.key;
 }
 
+function toolsWindowIsMacPlatform() {
+  if (typeof navigator === "undefined") {
+    return false;
+  }
+
+  return /mac|darwin/iu.test([
+    navigator.userAgentData?.platform,
+    navigator.platform,
+    navigator.userAgent,
+  ].filter(Boolean).join(" "));
+}
+
+async function readToolsWindowFrameState(currentWindow) {
+  const [isFullscreen, isMaximized] = await Promise.all([
+    currentWindow.isFullscreen(),
+    currentWindow.isMaximized(),
+  ]);
+  return {
+    expanded: Boolean(isFullscreen || isMaximized),
+    isFullscreen: Boolean(isFullscreen),
+    isMaximized: Boolean(isMaximized),
+  };
+}
+
+async function exitToolsWindowSimpleFullscreen(currentWindow) {
+  if (!toolsWindowIsMacPlatform() || typeof currentWindow.setSimpleFullscreen !== "function") {
+    return;
+  }
+
+  try {
+    await currentWindow.setSimpleFullscreen(false);
+  } catch {
+    // Only clears legacy simple-fullscreen state from older dev sessions.
+  }
+}
+
 export default function ToolsWindowHost() {
   const params = useMemo(parseToolsWindowParams, []);
   const currentWindow = useMemo(() => getCurrentWindow(), []);
@@ -308,6 +344,59 @@ export default function ToolsWindowHost() {
       windowId: params.windowId,
     }).catch(() => {});
   }, [localTitle, params.key, params.mode, params.windowId]);
+
+  const refreshWindowFrameState = useCallback(async () => {
+    try {
+      const frameState = await readToolsWindowFrameState(currentWindow);
+      setMaximized(frameState.expanded);
+      return frameState;
+    } catch {
+      return null;
+    }
+  }, [currentWindow]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlistenResize = null;
+    let unlistenFocus = null;
+    const refresh = () => {
+      if (!disposed) {
+        refreshWindowFrameState();
+      }
+    };
+
+    refresh();
+
+    currentWindow.onResized(refresh)
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenResize = unlisten;
+        }
+      })
+      .catch(() => {});
+
+    currentWindow.onFocusChanged(refresh)
+      .then((unlisten) => {
+        if (disposed) {
+          unlisten();
+        } else {
+          unlistenFocus = unlisten;
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      if (typeof unlistenResize === "function") {
+        unlistenResize();
+      }
+      if (typeof unlistenFocus === "function") {
+        unlistenFocus();
+      }
+    };
+  }, [currentWindow, refreshWindowFrameState]);
 
   useEffect(() => () => {
     emit(TOOLS_WINDOW_AGENT_COMPANION_EVENT, {
@@ -445,27 +534,33 @@ export default function ToolsWindowHost() {
   }, [localContent, localTitle, meta]);
 
   const toggleMaximized = useCallback(async () => {
-    const nextMaximized = !maximized;
+    const latestFrameState = await refreshWindowFrameState();
+    const isExpanded = latestFrameState?.expanded ?? maximized;
+    const nextMaximized = !isExpanded;
     try {
-      if (typeof currentWindow.setSimpleFullscreen === "function") {
-        await currentWindow.setSimpleFullscreen(nextMaximized);
-      } else if (nextMaximized) {
-        await currentWindow.maximize();
+      if (nextMaximized) {
+        await exitToolsWindowSimpleFullscreen(currentWindow);
+        await currentWindow.setFullscreen(true);
+      } else if (latestFrameState?.isFullscreen) {
+        await currentWindow.setFullscreen(false);
       } else {
-        await currentWindow.unmaximize();
+        await currentWindow.toggleMaximize();
       }
     } catch {
       if (nextMaximized) {
-        await currentWindow.maximize().catch(() => {});
+        await currentWindow.toggleMaximize().catch(() => {});
       } else {
-        await currentWindow.unmaximize().catch(() => {});
+        await currentWindow.setFullscreen(false).catch(() => {});
+        await currentWindow.toggleMaximize().catch(() => {});
       }
     }
-    setMaximized(nextMaximized);
-    sendAgentCompanion(nextMaximized
+    const finalFrameState = await refreshWindowFrameState();
+    const finalMaximized = finalFrameState?.expanded ?? nextMaximized;
+    setMaximized(finalMaximized);
+    sendAgentCompanion(finalMaximized
       ? TOOLS_WINDOW_AGENT_COMPANION_OPEN
       : TOOLS_WINDOW_AGENT_COMPANION_CLOSE);
-  }, [currentWindow, maximized, sendAgentCompanion]);
+  }, [currentWindow, maximized, refreshWindowFrameState, sendAgentCompanion]);
 
   const zoomIn = useCallback(() => {
     setZoomFactor((current) => clampZoomFactor(current * ZOOM_STEP));

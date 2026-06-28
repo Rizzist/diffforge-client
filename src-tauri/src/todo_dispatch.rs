@@ -562,6 +562,7 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
     // journal. A mounted TerminalView appends the same id itself and its next
     // queue sync rewrites the store — both paths converge on one item.
     {
+        let _store_guard = todo_dispatch_queue_store_guard();
         let queue_path = todo_dispatch_data_path("queues", &workspace_id);
         let tombstoned = todo_store_tombstone_ids(&workspace_id);
         let already_queued = tombstoned.contains(command_id.as_str())
@@ -968,9 +969,17 @@ const TODO_STORE_DRAFT_TEXT_MAX_CHARS: usize = 2_000_000;
 static TODO_DISPATCH_WEBVIEW_HEARTBEAT_MS: AtomicU64 = AtomicU64::new(0);
 static TODO_DISPATCH_TERMINAL_RUNTIME: OnceLock<StdMutex<HashMap<String, Value>>> = OnceLock::new();
 static TODO_DISPATCH_BACKEND_TICK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+static TODO_DISPATCH_QUEUE_STORE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TODO_DISPATCH_STARTUP_RECONCILE_STARTED_MS: AtomicU64 = AtomicU64::new(0);
 static TODO_DISPATCH_STARTUP_RECONCILE_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 static TODO_DISPATCH_STARTUP_RECONCILE_OBSERVED_MS: AtomicU64 = AtomicU64::new(0);
+
+fn todo_dispatch_queue_store_guard() -> std::sync::MutexGuard<'static, ()> {
+    TODO_DISPATCH_QUEUE_STORE_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn todo_dispatch_data_path(kind: &str, workspace_id: &str) -> Option<PathBuf> {
     let root = cloud_mcp_local_data_file_path("todo-dispatch")?.join(kind);
@@ -1012,7 +1021,9 @@ fn todo_dispatch_queue_write(workspace_id: &str, items: &[Value]) {
     let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
         return;
     };
-    let items = todo_store_canonicalize_settled_items(items.iter().cloned().collect());
+    let items = todo_store_dedupe_logical_items(todo_store_canonicalize_settled_items(
+        items.iter().cloned().collect(),
+    ));
     let snapshot = json!({
         "workspaceId": workspace_id,
         "items": items,
@@ -1161,39 +1172,73 @@ async fn todo_store_startup_reconcile_finalize_queues(app: &AppHandle) -> usize 
         if workspace_id.is_empty() {
             continue;
         }
-        let mut items = snapshot
+        let items = snapshot
             .get("items")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let mut corrections = Vec::new();
-        for index in 0..items.len() {
-            let item_snapshot = items[index].clone();
+        let mut planned_corrections = Vec::<(Value, String, String)>::new();
+        for item_snapshot in items {
             match todo_store_item_status(&item_snapshot).as_str() {
                 "queued" => {}
                 "sending" | "dispatching" => {
-                    todo_store_set_item_status(
-                        &mut items[index],
-                        "queued",
-                        "app_restart_requeued",
-                    );
-                    corrections.push(items[index].clone());
+                    planned_corrections.push((
+                        item_snapshot,
+                        "queued".to_string(),
+                        "app_restart_requeued".to_string(),
+                    ));
                 }
                 "submitted" | "running" => {
                     if todo_store_item_has_recovered_inflight(app, &item_snapshot).await {
                         continue;
                     }
-                    todo_store_set_item_status(&mut items[index], "interrupted", "app_restart");
-                    corrections.push(items[index].clone());
+                    planned_corrections.push((
+                        item_snapshot,
+                        "interrupted".to_string(),
+                        "app_restart".to_string(),
+                    ));
                 }
                 _ => {}
             }
         }
-        if corrections.is_empty() {
+        if planned_corrections.is_empty() {
             continue;
         }
+        let mut corrections = Vec::new();
+        {
+            let _store_guard = todo_dispatch_queue_store_guard();
+            let current_snapshot = todo_dispatch_queue_read(&path);
+            let mut current_items = current_snapshot
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for (planned_item, next_status, reason) in planned_corrections {
+                for item in &mut current_items {
+                    if !todo_store_items_share_identity(item, &planned_item) {
+                        continue;
+                    }
+                    let current_status = todo_store_item_status(item);
+                    let eligible = match next_status.as_str() {
+                        "queued" => matches!(current_status.as_str(), "sending" | "dispatching"),
+                        "interrupted" => {
+                            matches!(current_status.as_str(), "submitted" | "running")
+                        }
+                        _ => false,
+                    };
+                    if !eligible {
+                        continue;
+                    }
+                    todo_store_set_item_status(item, &next_status, &reason);
+                    corrections.push(item.clone());
+                }
+            }
+            if corrections.is_empty() {
+                continue;
+            }
+            todo_dispatch_queue_write(&workspace_id, &current_items);
+        }
         changed_count += corrections.len();
-        todo_dispatch_queue_write(&workspace_id, &items);
         todo_store_push_corrections(app, &workspace_id, corrections, "app_restart_reconcile");
         todo_store_emit_changed(app, &workspace_id, "app_restart_reconcile", "store");
     }
@@ -1209,18 +1254,14 @@ async fn todo_store_startup_reconcile_finalize_queues(app: &AppHandle) -> usize 
         }
         let tracked = todo_dispatch_data_path("queues", &workspace_id)
             .map(|path| {
+                let _store_guard = todo_dispatch_queue_store_guard();
                 todo_dispatch_queue_read(&path)
                     .get("items")
                     .and_then(Value::as_array)
                     .is_some_and(|items| {
-                        items.iter().any(|candidate| {
-                            let id = item
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .map(str::trim)
-                                .unwrap_or_default();
-                            todo_store_item_matches_id(candidate, id)
-                        })
+                        items
+                            .iter()
+                            .any(|candidate| todo_store_items_share_identity(candidate, &item))
                     })
             })
             .unwrap_or(false);
@@ -3019,6 +3060,7 @@ async fn todo_store_create(
             return Err("Created todo id is tombstoned.".to_string());
         }
 
+        let _store_guard = todo_dispatch_queue_store_guard();
         let mut items = todo_dispatch_data_path("queues", &workspace_id)
             .map(|path| {
                 todo_dispatch_queue_read(&path)
@@ -3095,6 +3137,7 @@ async fn todo_store_update(
         .unwrap_or_else(|| "todo_store_update".to_string());
 
     tauri::async_runtime::spawn_blocking(move || {
+        let _store_guard = todo_dispatch_queue_store_guard();
         let tombstoned = todo_store_tombstone_ids(&workspace_id);
         if tombstoned.contains(&todo_id) {
             return Err("Todo id is tombstoned.".to_string());
@@ -3155,7 +3198,10 @@ async fn todo_store_delete(
     let tombstoned = tauri::async_runtime::spawn_blocking({
         let app = app.clone();
         let workspace_id = workspace_id.clone();
-        move || todo_store_delete_internal(&app, &workspace_id, &todo_ids, &reason, "user_delete")
+        move || {
+            let _store_guard = todo_dispatch_queue_store_guard();
+            todo_store_delete_internal(&app, &workspace_id, &todo_ids, &reason, "user_delete")
+        }
     })
     .await
     .map_err(|error| format!("Todo store delete worker failed: {error}"))?;
@@ -3195,6 +3241,7 @@ async fn todo_store_cancel(
     }
 
     tauri::async_runtime::spawn_blocking(move || {
+        let _store_guard = todo_dispatch_queue_store_guard();
         let mut matched_item: Option<Value> = None;
         if let Some(path) = todo_dispatch_data_path("queues", &workspace_id) {
             let mut items = todo_dispatch_queue_read(&path)
@@ -3458,6 +3505,7 @@ async fn todo_store_set_status(
     let item_payload = item.filter(|value| value.is_object());
 
     tauri::async_runtime::spawn_blocking(move || {
+        let _store_guard = todo_dispatch_queue_store_guard();
         let clear_target = clear_target.unwrap_or(false);
         let apply_targets = |item: &mut Value| {
             todo_store_apply_target_fields(
@@ -3667,6 +3715,7 @@ async fn todo_store_queue_all(
         let workspace_id = workspace_id.clone();
         let reason = reason.clone();
         move || {
+            let _store_guard = todo_dispatch_queue_store_guard();
             let stored_items = todo_dispatch_data_path("queues", &workspace_id)
                 .map(|path| {
                     todo_dispatch_queue_read(&path)
@@ -3720,6 +3769,7 @@ async fn todo_store_queue_all(
 /// settle them.
 async fn todo_store_orphan_sweep_tick(app: &AppHandle) {
     let now_ms = todo_dispatch_now_ms();
+    let _store_guard = todo_dispatch_queue_store_guard();
 
     for path in todo_dispatch_data_workspace_files("queues") {
         let snapshot = todo_dispatch_queue_read(&path);
@@ -3923,6 +3973,12 @@ fn todo_store_history_item_tokens(item: &Value) -> Vec<String> {
         "todoDispatchId",
         "last_dispatch_id",
         "lastDispatchId",
+        "prompt_event_id",
+        "promptEventId",
+        "prompt_id",
+        "promptId",
+        "pending_prompt_id",
+        "pendingPromptId",
     ] {
         if let Some(value) = item
             .get(key)
@@ -3935,11 +3991,47 @@ fn todo_store_history_item_tokens(item: &Value) -> Vec<String> {
             }
         }
     }
+    for key in [
+        "identityTokens",
+        "identity_tokens",
+        "aliasIds",
+        "alias_ids",
+        "todoAliasIds",
+        "todo_alias_ids",
+    ] {
+        if let Some(values) = item.get(key).and_then(Value::as_array) {
+            for value in values {
+                if let Some(value) = value
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    if !tokens.iter().any(|token| token == value) {
+                        tokens.push(value.to_string());
+                    }
+                }
+            }
+        }
+    }
     let command_id = todo_dispatch_queue_item_command_id(item);
     if !command_id.is_empty() && !tokens.iter().any(|token| token == &command_id) {
         tokens.push(command_id);
     }
     tokens
+}
+
+fn todo_store_apply_identity_tokens(item: &mut Value, mut tokens: Vec<String>) {
+    for token in todo_store_history_item_tokens(item) {
+        if !tokens.iter().any(|existing| existing == &token) {
+            tokens.push(token);
+        }
+    }
+    if tokens.is_empty() {
+        return;
+    }
+    if let Some(object) = item.as_object_mut() {
+        object.insert("identityTokens".to_string(), json!(tokens));
+    }
 }
 
 /// Best-effort updated-at in epoch ms, accepting both the numeric stamps the
@@ -4160,6 +4252,10 @@ fn todo_store_copy_lifecycle_fields_from_stored(stored: &Value, item: &mut Value
         "targetExplicit",
         "explicitTarget",
         "userPinnedTarget",
+        "identityTokens",
+        "identity_tokens",
+        "aliasIds",
+        "alias_ids",
     ] {
         match stored.get(key).filter(|value| !value.is_null()) {
             Some(value) => {
@@ -4174,6 +4270,17 @@ fn todo_store_copy_lifecycle_fields_from_stored(stored: &Value, item: &mut Value
     object.insert("rustOwned".to_string(), json!(true));
 }
 
+fn todo_store_find_stored_logical_item<'a>(
+    stored_items: &'a [Value],
+    item: &Value,
+) -> Option<&'a Value> {
+    let item_id = todo_store_item_sync_id(item);
+    stored_items.iter().find(|candidate| {
+        todo_store_items_share_identity(candidate, item)
+            || (!item_id.is_empty() && todo_store_item_matches_id(candidate, &item_id))
+    })
+}
+
 fn todo_store_sanitize_webview_snapshot_lifecycle(
     stored_items: &[Value],
     items: Vec<Value>,
@@ -4181,10 +4288,7 @@ fn todo_store_sanitize_webview_snapshot_lifecycle(
     items
         .into_iter()
         .map(|mut item| {
-            let item_id = todo_store_item_sync_id(&item);
-            let stored = stored_items
-                .iter()
-                .find(|candidate| todo_store_item_matches_id(candidate, &item_id));
+            let stored = todo_store_find_stored_logical_item(stored_items, &item);
             if let Some(stored) = stored.filter(|stored| todo_store_item_is_rust_owned(stored)) {
                 todo_store_copy_lifecycle_fields_from_stored(stored, &mut item);
                 return item;
@@ -4208,19 +4312,7 @@ fn todo_store_apply_newer_store_status_core(
     items
         .into_iter()
         .map(|mut item| {
-            let item_id = item
-                .get("id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or_default()
-                .to_string();
-            if item_id.is_empty() {
-                return item;
-            }
-            let Some(stored) = stored_items
-                .iter()
-                .find(|candidate| todo_store_item_matches_id(candidate, &item_id))
-            else {
+            let Some(stored) = todo_store_find_stored_logical_item(stored_items, &item) else {
                 return item;
             };
             let mut stored = stored.clone();
@@ -4676,6 +4768,86 @@ fn todo_dispatch_prompt_identity_matches_single_value(
     false
 }
 
+fn todo_store_items_share_identity(left: &Value, right: &Value) -> bool {
+    let left_tokens = todo_store_history_item_tokens(left)
+        .into_iter()
+        .collect::<HashSet<_>>();
+    if left_tokens.is_empty() {
+        return false;
+    }
+    todo_store_history_item_tokens(right)
+        .iter()
+        .any(|token| left_tokens.contains(token))
+}
+
+fn todo_store_prefer_logical_item(existing: Value, candidate: Value) -> Value {
+    let existing_rank = todo_store_status_rank(&todo_store_item_status(&existing));
+    let candidate_rank = todo_store_status_rank(&todo_store_item_status(&candidate));
+    if candidate_rank != existing_rank {
+        return if candidate_rank > existing_rank {
+            candidate
+        } else {
+            existing
+        };
+    }
+    if todo_store_item_updated_ms(&candidate) >= todo_store_item_updated_ms(&existing) {
+        candidate
+    } else {
+        existing
+    }
+}
+
+fn todo_store_dedupe_logical_items(items: Vec<Value>) -> Vec<Value> {
+    let mut merged = Vec::<Option<Value>>::new();
+    let mut index_by_token = HashMap::<String, usize>::new();
+    for item in items {
+        let tokens = todo_store_history_item_tokens(&item);
+        let mut existing_indexes = tokens
+            .iter()
+            .filter_map(|token| index_by_token.get(token).copied())
+            .filter(|index| merged.get(*index).and_then(Option::as_ref).is_some())
+            .collect::<Vec<_>>();
+        existing_indexes.sort_unstable();
+        existing_indexes.dedup();
+        if let Some((&survivor_index, rest)) = existing_indexes.split_first() {
+            let mut all_tokens = tokens;
+            let mut preferred = item;
+            if let Some(existing) = merged
+                .get_mut(survivor_index)
+                .and_then(Option::take)
+            {
+                all_tokens.extend(todo_store_history_item_tokens(&existing));
+                preferred = todo_store_prefer_logical_item(existing, preferred);
+            }
+            for index in rest {
+                if let Some(existing) = merged.get_mut(*index).and_then(Option::take) {
+                    all_tokens.extend(todo_store_history_item_tokens(&existing));
+                    preferred = todo_store_prefer_logical_item(preferred, existing);
+                }
+            }
+            todo_store_apply_identity_tokens(&mut preferred, all_tokens.clone());
+            if let Some(slot) = merged.get_mut(survivor_index) {
+                *slot = Some(preferred);
+            }
+            if let Some(preferred) = merged[survivor_index].as_ref() {
+                for token in todo_store_history_item_tokens(preferred) {
+                    index_by_token.insert(token, survivor_index);
+                }
+            }
+            for token in all_tokens {
+                index_by_token.insert(token, survivor_index);
+            }
+            continue;
+        }
+        let index = merged.len();
+        for token in tokens {
+            index_by_token.insert(token, index);
+        }
+        merged.push(Some(item));
+    }
+    merged.into_iter().flatten().collect()
+}
+
 fn todo_dispatch_active_queue_item_ids_for_pane_matching(
     workspace_id: &str,
     pane_id: &str,
@@ -4730,6 +4902,7 @@ fn todo_dispatch_queue_mark_settled(
     let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
         return;
     };
+    let _store_guard = todo_dispatch_queue_store_guard();
     let snapshot = todo_dispatch_queue_read(&path);
     let Some(items) = snapshot.get("items").and_then(Value::as_array).cloned() else {
         return;
@@ -5253,6 +5426,136 @@ mod todo_store_tests {
         assert!(corrections.is_empty());
         assert_eq!(items.len(), 1);
         assert_eq!(todo_store_item_status(&items[0]), "running");
+    }
+
+    #[test]
+    fn logical_dedupe_prefers_running_alias_over_stale_queued_copy() {
+        let mut running_item = json!({
+            "id": "todo-alias-1",
+            "kind": "todo",
+            "status": "running",
+            "text": "do the thing",
+            "todoStatus": "running",
+            "workspaceId": "workspace-a",
+        });
+        todo_store_set_item_status(
+            &mut running_item,
+            "running",
+            "todo_queue_backend_dispatch_claim",
+        );
+        let queued_copy = json!({
+            "id": "todo-alias-1",
+            "kind": "todo",
+            "status": "queued",
+            "text": "do the thing",
+            "todoStatus": "queued",
+            "workspaceId": "workspace-a",
+        });
+
+        let items = todo_store_dedupe_logical_items(vec![queued_copy, running_item]);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(todo_store_item_status(&items[0]), "running");
+    }
+
+    #[test]
+    fn logical_identity_includes_prompt_event_aliases() {
+        let queued_copy = json!({
+            "id": "todo-local-copy",
+            "promptEventId": "prompt-abc",
+            "status": "queued",
+            "text": "same prompt",
+            "todoStatus": "queued",
+        });
+        let running_copy = json!({
+            "id": "todo-rust-copy",
+            "prompt_event_id": "prompt-abc",
+            "status": "running",
+            "text": "same prompt",
+            "todoStatus": "running",
+        });
+
+        assert!(todo_store_items_share_identity(&queued_copy, &running_copy));
+        let items = todo_store_dedupe_logical_items(vec![queued_copy, running_copy]);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(todo_store_item_status(&items[0]), "running");
+    }
+
+    #[test]
+    fn logical_dedupe_collapses_transitive_alias_family() {
+        let mut running_copy = json!({
+            "id": "todo-rust-copy",
+            "promptEventId": "prompt-abc",
+            "status": "running",
+            "text": "same prompt",
+            "todoStatus": "running",
+        });
+        todo_store_set_item_status(
+            &mut running_copy,
+            "running",
+            "todo_queue_backend_dispatch_claim",
+        );
+        let queued_copy = json!({
+            "id": "todo-command-copy",
+            "commandId": "command-xyz",
+            "status": "queued",
+            "text": "same prompt",
+            "todoStatus": "queued",
+        });
+        let bridge_copy = json!({
+            "id": "todo-bridge-copy",
+            "prompt_event_id": "prompt-abc",
+            "command_id": "command-xyz",
+            "status": "listed",
+            "text": "same prompt",
+            "todoStatus": "listed",
+        });
+
+        let items = todo_store_dedupe_logical_items(vec![running_copy, queued_copy, bridge_copy]);
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(todo_store_item_status(&items[0]), "running");
+        let tokens = todo_store_history_item_tokens(&items[0]);
+        assert!(tokens.iter().any(|token| token == "prompt-abc"));
+        assert!(tokens.iter().any(|token| token == "command-xyz"));
+        assert!(tokens.iter().any(|token| token == "todo-command-copy"));
+    }
+
+    #[test]
+    fn webview_snapshot_preserves_rust_owned_running_alias_lifecycle() {
+        let mut stored = json!({
+            "id": "todo-rust-copy",
+            "kind": "todo",
+            "promptEventId": "prompt-abc",
+            "rustOwned": true,
+            "lifecycleOwner": "rust",
+            "status": "running",
+            "text": "same prompt",
+            "todoStatus": "running",
+        });
+        todo_store_set_item_status(
+            &mut stored,
+            "running",
+            "todo_queue_backend_dispatch_claim",
+        );
+        let items = todo_store_sanitize_webview_snapshot_lifecycle(
+            &[stored],
+            vec![json!({
+                "id": "todo-ui-alias",
+                "kind": "todo",
+                "prompt_event_id": "prompt-abc",
+                "status": "listed",
+                "text": "same prompt",
+                "todoStatus": "listed",
+            })],
+        );
+
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], "todo-ui-alias");
+        assert_eq!(todo_store_item_status(&items[0]), "running");
+        assert_eq!(items[0]["rustOwned"], true);
+        assert_eq!(items[0]["lifecycleOwner"], "rust");
     }
 
     #[test]
@@ -6499,6 +6802,7 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
             .is_none();
     let mut capture_item = item.clone();
     if let Some(path) = todo_dispatch_data_path("queues", workspace_id) {
+        let _store_guard = todo_dispatch_queue_store_guard();
         let mut items = todo_dispatch_queue_read(&path)
             .get("items")
             .and_then(Value::as_array)
@@ -6969,6 +7273,7 @@ pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) 
     // One funnel for every delete: tombstone, queue-store removal, and journal.
     // The removed legacy Cloud push was idempotent, but todo.sync/todo.content
     // now own account convergence.
+    let _store_guard = todo_dispatch_queue_store_guard();
     todo_store_delete_internal(
         app,
         &workspace_id,
@@ -7033,6 +7338,7 @@ async fn todo_dispatch_queue_sync(
     removed_ids: Option<Vec<String>>,
 ) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        let _store_guard = todo_dispatch_queue_store_guard();
         let workspace_id = workspace_id.trim().to_string();
         if workspace_id.is_empty() {
             return Err("workspace_id is required.".to_string());
@@ -7767,6 +8073,7 @@ fn todo_dispatch_prepare_immediate_backend_item(
     todo_store_set_item_status(&mut item, "queued", "todo_queue_backend_submit_requested");
 
     if let Some(path) = todo_dispatch_data_path("queues", workspace_id) {
+        let _store_guard = todo_dispatch_queue_store_guard();
         let snapshot = todo_dispatch_queue_read(&path);
         let mut items = snapshot
             .get("items")
@@ -8045,6 +8352,7 @@ fn todo_dispatch_backend_try_claim_item(
     if item_id.is_empty() {
         return None;
     }
+    let _store_guard = todo_dispatch_queue_store_guard();
     let path = todo_dispatch_data_path("queues", workspace_id)?;
     let snapshot = todo_dispatch_queue_read(&path);
     let mut items = snapshot
@@ -8054,7 +8362,7 @@ fn todo_dispatch_backend_try_claim_item(
         .unwrap_or_default();
     let mut claimed = None;
     for entry in &mut items {
-        if !todo_store_item_matches_id(entry, &item_id) || todo_store_item_status(entry) != "queued" {
+        if !todo_store_items_share_identity(entry, item) || todo_store_item_status(entry) != "queued" {
             continue;
         }
         todo_store_set_item_status(entry, "running", "todo_queue_backend_dispatch_claim");
@@ -8083,8 +8391,9 @@ fn todo_dispatch_backend_try_claim_item(
                 object.insert("threadId".to_string(), json!(thread_id));
             }
         }
-        claimed = Some(entry.clone());
-        break;
+        if claimed.is_none() {
+            claimed = Some(entry.clone());
+        }
     }
     if claimed.is_some() {
         todo_dispatch_queue_write(workspace_id, &items);
@@ -8097,6 +8406,7 @@ fn todo_dispatch_backend_release_claim(workspace_id: &str, item: &Value, reason:
     if item_id.is_empty() {
         return;
     }
+    let _store_guard = todo_dispatch_queue_store_guard();
     let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
         return;
     };
@@ -8108,7 +8418,7 @@ fn todo_dispatch_backend_release_claim(workspace_id: &str, item: &Value, reason:
         .unwrap_or_default();
     let mut changed = false;
     for entry in &mut items {
-        if !todo_store_item_matches_id(entry, &item_id) {
+        if !todo_store_items_share_identity(entry, item) {
             continue;
         }
         if todo_store_item_status(entry) == "running"
@@ -8118,7 +8428,6 @@ fn todo_dispatch_backend_release_claim(workspace_id: &str, item: &Value, reason:
             todo_store_set_item_status(entry, "queued", reason);
             changed = true;
         }
-        break;
     }
     if changed {
         todo_dispatch_queue_write(workspace_id, &items);
@@ -8383,13 +8692,14 @@ async fn todo_dispatch_backend_submit(
     // webview see the dispatch.
     let mut running_item = None;
     if let Some(path) = todo_dispatch_data_path("queues", workspace_id) {
+        let _store_guard = todo_dispatch_queue_store_guard();
         let snapshot = todo_dispatch_queue_read(&path);
         if let Some(items) = snapshot.get("items").and_then(Value::as_array) {
             let next_items = items
                 .iter()
                 .cloned()
                 .map(|mut entry| {
-                    if entry.get("id").and_then(Value::as_str) == Some(item_id.as_str()) {
+                    if todo_store_items_share_identity(&entry, item) {
                         todo_store_set_item_status(
                             &mut entry,
                             "running",

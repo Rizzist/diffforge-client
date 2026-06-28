@@ -1555,6 +1555,14 @@ pub(crate) fn ensure_workspace_git_ready_for_late_coordination(root: &Path) -> R
     ensure_workspace_git_ready_for_coordination(root).map(|_| ())
 }
 
+#[tauri::command]
+async fn workspace_initialize_git(repo_path: String) -> Result<WorkspaceGitBootstrap, String> {
+    let root = resolve_workspace_root_directory(Some(repo_path.as_str()))?;
+    tauri::async_runtime::spawn_blocking(move || ensure_workspace_git_ready_for_coordination(&root))
+        .await
+        .map_err(|error| format!("Workspace Git setup task failed: {error}"))?
+}
+
 fn ensure_workspace_git_identity(root: &Path) -> Result<(), String> {
     let has_name = run_git_text(
         root,

@@ -897,6 +897,9 @@ import {
   WorkspaceCreateAgentStatus,
   WorkspaceCreateAgentStepper,
   WorkspaceCreateAgentStepButton,
+  WorkspaceCreateAgentPermission,
+  WorkspaceCreateAgentPermissionLabel,
+  WorkspaceCreateCheckboxRow,
   WorkspaceCreateFooter,
   WorkspaceArchiveList,
   WorkspaceArchiveRow,
@@ -13012,6 +13015,33 @@ function expandWorkspaceCreateAgentCounts(roleOptions, agentCounts) {
   ));
 }
 
+const WORKSPACE_AGENT_PERMISSION_PLAN = "plan";
+const WORKSPACE_AGENT_PERMISSION_ASK = "ask";
+const WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS = "accept_edits";
+const WORKSPACE_AGENT_PERMISSION_BYPASS = "bypass";
+const WORKSPACE_AGENT_PERMISSION_OPTIONS = [
+  {
+    label: "Plan",
+    tone: "plan",
+    value: WORKSPACE_AGENT_PERMISSION_PLAN,
+  },
+  {
+    label: "Ask",
+    tone: "ask",
+    value: WORKSPACE_AGENT_PERMISSION_ASK,
+  },
+  {
+    label: "Accept",
+    tone: "accept",
+    value: WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS,
+  },
+  {
+    label: "Bypass",
+    tone: "bypass",
+    value: WORKSPACE_AGENT_PERMISSION_BYPASS,
+  },
+];
+
 function WorkspaceCreateAgentGlyph({ roleId }) {
   if (roleId === "codex") {
     return <WorkspaceCreateAgentCodexIcon aria-hidden="true" />;
@@ -13037,10 +13067,12 @@ function WorkspaceCreateAgentGlyph({ roleId }) {
 
 function WorkspaceAgentCountCards({
   agentStatuses = [],
+  agentPermissions = {},
   counts = {},
   disabled = false,
   minimumTotal = 0,
   onAdjust,
+  onPermissionCycle,
   roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
   totalCount = 0,
 }) {
@@ -13063,6 +13095,8 @@ function WorkspaceAgentCountCards({
         const agentState = getWorkspaceCreateAgentState(option, agent);
         const count = Math.max(0, Number(counts[option.id]) || 0);
         const unavailable = !agentState.available;
+        const canPickPermission = !disabled && !unavailable && isWorkspacePermissionAgentRole(option.id);
+        const permissionOption = getWorkspaceAgentPermissionOption(agentPermissions?.[option.id]);
         const canRemoveAgent = !disabled && count > 0 && totalCount > minimumTotal;
         const canAddAgent = !disabled
           && agentState.available
@@ -13084,6 +13118,34 @@ function WorkspaceAgentCountCards({
                 <strong>{option.label}</strong>
               </WorkspaceCreateAgentLabel>
             </WorkspaceCreateAgentBody>
+            {isWorkspacePermissionAgentRole(option.id) && (
+              <WorkspaceCreateAgentPermission
+                aria-label={`${option.label} permission mode`}
+                data-tone={permissionOption.tone}
+              >
+                <WorkspaceCreateAgentStepButton
+                  aria-label={`Previous ${option.label} permission mode`}
+                  disabled={!canPickPermission}
+                  onClick={() => onPermissionCycle?.(option.id, -1)}
+                  title="Previous permission mode"
+                  type="button"
+                >
+                  &lt;
+                </WorkspaceCreateAgentStepButton>
+                <WorkspaceCreateAgentPermissionLabel title={`${option.label} permission mode: ${permissionOption.label}`}>
+                  {permissionOption.label}
+                </WorkspaceCreateAgentPermissionLabel>
+                <WorkspaceCreateAgentStepButton
+                  aria-label={`Next ${option.label} permission mode`}
+                  disabled={!canPickPermission}
+                  onClick={() => onPermissionCycle?.(option.id, 1)}
+                  title="Next permission mode"
+                  type="button"
+                >
+                  &gt;
+                </WorkspaceCreateAgentStepButton>
+              </WorkspaceCreateAgentPermission>
+            )}
             <WorkspaceCreateAgentStepper>
               <WorkspaceCreateAgentStepButton
                 aria-label={`Remove one ${option.label} terminal`}
@@ -13142,6 +13204,8 @@ function WorkspaceCreatePanel({
   const [browseError, setBrowseError] = useState("");
   const [cdDraft, setCdDraft] = useState("");
   const [agentCounts, setAgentCounts] = useState({});
+  const [agentPermissions, setAgentPermissions] = useState({});
+  const [initializeGitDraft, setInitializeGitDraft] = useState(false);
   const [panelView, setPanelView] = useState("create");
   const browseSeqRef = useRef(0);
   const browseRef = useRef(null);
@@ -13186,6 +13250,8 @@ function WorkspaceCreatePanel({
     setBrowseError("");
     setPanelView("create");
     setAgentCounts(fallbackRole ? { [fallbackRole]: 1 } : {});
+    setAgentPermissions(normalizeWorkspaceAgentPermissions(null, roleOptions));
+    setInitializeGitDraft(false);
     void browseTo(rootDraft || defaultWorkingDirectory || "");
     // Reset only when the panel opens; rootDraft changes are handled below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -13292,6 +13358,16 @@ function WorkspaceCreatePanel({
     });
   }, [installedAgentById, roleOptions]);
 
+  const cycleAgentPermission = useCallback((roleId, delta) => {
+    if (!isWorkspacePermissionAgentRole(roleId)) {
+      return;
+    }
+    setAgentPermissions((current) => ({
+      ...normalizeWorkspaceAgentPermissions(current, roleOptions),
+      [roleId]: cycleWorkspaceAgentPermissionMode(current?.[roleId], delta),
+    }));
+  }, [roleOptions]);
+
   const availableAgentCounts = useMemo(() => {
     const counts = {};
     roleOptions.forEach((option) => {
@@ -13308,6 +13384,10 @@ function WorkspaceCreatePanel({
   const terminalRoles = useMemo(
     () => expandWorkspaceCreateAgentCounts(roleOptions, availableAgentCounts),
     [availableAgentCounts, roleOptions],
+  );
+  const availableAgentPermissions = useMemo(
+    () => normalizeWorkspaceAgentPermissions(agentPermissions, roleOptions),
+    [agentPermissions, roleOptions],
   );
 
   useEffect(() => {
@@ -13332,6 +13412,14 @@ function WorkspaceCreatePanel({
 
   const currentDirectory = browse?.workingDirectory || rootDraft || defaultWorkingDirectory || "";
   const rootEligible = browse ? browse.rootEligible !== false : true;
+  const currentRootIsGitRepository = Boolean(browse?.gitRepository || browse?.git_repository);
+  const initializeGitChecked = currentRootIsGitRepository || initializeGitDraft;
+  const initializeGitDisabled = Boolean(
+    creating
+      || !currentDirectory
+      || !rootEligible
+      || currentRootIsGitRepository,
+  );
   const canCreate = Boolean(
     !creating
       && workspaceName.trim()
@@ -13438,7 +13526,12 @@ function WorkspaceCreatePanel({
           if (!canCreate) {
             return;
           }
-          onSubmit(event, terminalRoles);
+          onSubmit(
+            event,
+            terminalRoles,
+            availableAgentPermissions,
+            !currentRootIsGitRepository && initializeGitChecked,
+          );
         }}
       >
         <WorkspaceCreateHeader>
@@ -13572,6 +13665,22 @@ function WorkspaceCreatePanel({
               <span>App directory</span>
             </SecondaryButton>
           </WorkspaceCreateFooter>
+          <WorkspaceCreateCheckboxRow data-disabled={initializeGitDisabled ? "true" : undefined}>
+            <input
+              checked={initializeGitChecked}
+              disabled={initializeGitDisabled}
+              onChange={(event) => setInitializeGitDraft(event.target.checked)}
+              type="checkbox"
+            />
+            <span>
+              <strong>Initialize Git</strong>
+              <small>
+                {currentRootIsGitRepository
+                  ? "Already a Git repository."
+                  : "Enabled if it is not a Git repo."}
+              </small>
+            </span>
+          </WorkspaceCreateCheckboxRow>
         </WorkspaceCreateSection>
 
         <WorkspaceCreateSection>
@@ -13582,9 +13691,11 @@ function WorkspaceCreatePanel({
           </SettingsHint>
           <WorkspaceAgentCountCards
             agentStatuses={agentStatuses}
+            agentPermissions={availableAgentPermissions}
             counts={availableAgentCounts}
             disabled={creating}
             onAdjust={adjustAgentCount}
+            onPermissionCycle={cycleAgentPermission}
             roleOptions={roleOptions}
             totalCount={terminalRoles.length}
           />
@@ -16763,6 +16874,117 @@ function getReadyWorkspaceTerminalAgent(agentStatuses, role) {
   return getReadyAgent(agentStatuses, roleId);
 }
 
+function isWorkspacePermissionAgentRole(role) {
+  return normalizeWorkspaceTerminalRole(role, WORKSPACE_TERMINAL_ROLE_GENERIC)
+    !== WORKSPACE_TERMINAL_ROLE_GENERIC;
+}
+
+function normalizeWorkspaceAgentPermissionMode(
+  value,
+  fallback = WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS,
+) {
+  const rawMode = String(value || "").trim().toLowerCase();
+  const mode = rawMode
+    .replace(/[\s-]+/g, "_")
+    .replace(/^acceptedits$/, WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS);
+
+  if (WORKSPACE_AGENT_PERMISSION_OPTIONS.some((option) => option.value === mode)) {
+    return mode;
+  }
+
+  if (mode === "accept" || mode === "accept_edits" || mode === "accepteds" || mode === "acceptedits") {
+    return WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS;
+  }
+  if (mode === "ask_each_time" || mode === "ask_each") {
+    return WORKSPACE_AGENT_PERMISSION_ASK;
+  }
+  if (mode === "bypass_permissions" || mode === "bypasspermissions") {
+    return WORKSPACE_AGENT_PERMISSION_BYPASS;
+  }
+
+  return WORKSPACE_AGENT_PERMISSION_OPTIONS.some((option) => option.value === fallback)
+    ? fallback
+    : WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS;
+}
+
+function normalizeWorkspaceAgentPermissions(
+  value,
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+  fallback = WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS,
+) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+
+  return Object.fromEntries(
+    roleOptions
+      .filter((option) => isWorkspacePermissionAgentRole(option.id))
+      .map((option) => [
+        option.id,
+        normalizeWorkspaceAgentPermissionMode(source[option.id], fallback),
+      ]),
+  );
+}
+
+function getWorkspaceAgentPermissions(
+  workspaceSettings,
+  workspaceId,
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+) {
+  return normalizeWorkspaceAgentPermissions(
+    workspaceSettings?.[workspaceId]?.agentPermissions,
+    roleOptions,
+  );
+}
+
+function getWorkspaceAgentPermissionMode(
+  workspaceSettings,
+  workspaceId,
+  role,
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+) {
+  const roleId = normalizeWorkspaceTerminalRole(role, WORKSPACE_TERMINAL_ROLE_GENERIC, roleOptions);
+  if (!isWorkspacePermissionAgentRole(roleId)) {
+    return "";
+  }
+  return getWorkspaceAgentPermissions(workspaceSettings, workspaceId, roleOptions)[roleId]
+    || WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS;
+}
+
+function getWorkspaceAgentPermissionOption(mode) {
+  const normalizedMode = normalizeWorkspaceAgentPermissionMode(mode);
+  return WORKSPACE_AGENT_PERMISSION_OPTIONS.find((option) => option.value === normalizedMode)
+    || WORKSPACE_AGENT_PERMISSION_OPTIONS.find((option) => option.value === WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS)
+    || WORKSPACE_AGENT_PERMISSION_OPTIONS[0];
+}
+
+function cycleWorkspaceAgentPermissionMode(mode, delta = 1) {
+  const currentMode = normalizeWorkspaceAgentPermissionMode(mode);
+  const currentIndex = Math.max(
+    0,
+    WORKSPACE_AGENT_PERMISSION_OPTIONS.findIndex((option) => option.value === currentMode),
+  );
+  const nextIndex = (
+    currentIndex
+    + Number(delta || 0)
+    + WORKSPACE_AGENT_PERMISSION_OPTIONS.length
+  ) % WORKSPACE_AGENT_PERMISSION_OPTIONS.length;
+
+  return WORKSPACE_AGENT_PERMISSION_OPTIONS[nextIndex]?.value
+    || WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS;
+}
+
+function areWorkspaceAgentPermissionsEqual(
+  left,
+  right,
+  roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+) {
+  const leftPermissions = normalizeWorkspaceAgentPermissions(left, roleOptions);
+  const rightPermissions = normalizeWorkspaceAgentPermissions(right, roleOptions);
+
+  return roleOptions
+    .filter((option) => isWorkspacePermissionAgentRole(option.id))
+    .every((option) => leftPermissions[option.id] === rightPermissions[option.id]);
+}
+
 function NetworkingInspector({
   diagnostics,
   error = "",
@@ -17035,6 +17257,9 @@ function normalizeWorkspaceSettings(value) {
         const terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
         const terminalRoles = normalizeWorkspaceTerminalRoles(settings?.terminalRoles, terminalCount);
         const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
+        const agentPermissions = normalizeWorkspaceAgentPermissions(settings?.agentPermissions);
+        const hasCustomAgentPermissions = Object.values(agentPermissions)
+          .some((mode) => mode !== WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS);
         const rootWasEmptyAtSelection = Boolean(settings?.rootWasEmptyAtSelection);
         const rootGitRepositoryKnown = Object.prototype.hasOwnProperty.call(settings || {}, "rootGitRepository");
         const rootGitRepository = Boolean(settings?.rootGitRepository);
@@ -17051,6 +17276,7 @@ function normalizeWorkspaceSettings(value) {
             !rootDirectory
             && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
             && !hasCustomTerminalRoles
+            && !hasCustomAgentPermissions
             && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
           )
         ) {
@@ -17067,6 +17293,7 @@ function normalizeWorkspaceSettings(value) {
             gitWorktreesEnabled,
             terminalCount,
             terminalRoles,
+            agentPermissions,
           },
         ];
       })
@@ -18124,6 +18351,7 @@ function getPreparedWorkspaceTerminalRequestKey(request, launchKey = "") {
     String(request.model || ""),
     String(request.reasoningEffort || ""),
     String(request.speed || ""),
+    String(request.permissionMode || ""),
   ].join(":");
 }
 
@@ -18664,6 +18892,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const hasAgentSessionMode = Object.prototype.hasOwnProperty.call(nextValues, "agentSessionMode");
   const hasTerminalCount = Object.prototype.hasOwnProperty.call(nextValues, "terminalCount");
   const hasTerminalRoles = Object.prototype.hasOwnProperty.call(nextValues, "terminalRoles");
+  const hasAgentPermissions = Object.prototype.hasOwnProperty.call(nextValues, "agentPermissions");
   const cleanedRootDirectory = cleanWorkspaceRootDirectory(
     hasRootDirectory ? nextValues.rootDirectory : currentSettings.rootDirectory,
   ).slice(0, MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH);
@@ -18699,6 +18928,11 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     fallbackRole,
   );
   const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
+  const agentPermissions = normalizeWorkspaceAgentPermissions(
+    hasAgentPermissions ? nextValues.agentPermissions : currentSettings.agentPermissions,
+  );
+  const hasCustomAgentPermissions = Object.values(agentPermissions)
+    .some((mode) => mode !== WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS);
   const agentSessionMode = hasAgentSessionMode
     ? normalizeAgentSessionMode(
       nextValues.agentSessionMode,
@@ -18718,6 +18952,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     !rootDirectory
     && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
     && !hasCustomTerminalRoles
+    && !hasCustomAgentPermissions
     && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
   ) {
     delete nextSettings[workspaceId];
@@ -18732,6 +18967,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     gitWorktreesEnabled,
     terminalCount,
     terminalRoles,
+    agentPermissions,
   };
 
   return nextSettings;
@@ -18840,7 +19076,9 @@ export default function App() {
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
   const [workspaceTerminalCountDraft, setWorkspaceTerminalCountDraft] = useState("1");
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
+  const [workspaceAgentPermissionsDraft, setWorkspaceAgentPermissionsDraft] = useState({});
   const [workspaceAgentSessionModeDraft, setWorkspaceAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
+  const [workspaceInitializeGitDraft, setWorkspaceInitializeGitDraft] = useState(false);
   const [workspaceUnsafeModeArmed, setWorkspaceUnsafeModeArmed] = useState(false);
   const [workspaceSettings, setWorkspaceSettings] = useState(readWorkspaceSettings);
   const [workspaceThreads, setWorkspaceThreads] = useState(readWorkspaceThreads);
@@ -22353,7 +22591,9 @@ export default function App() {
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
     setWorkspaceTerminalRolesDraft(["codex"]);
+    setWorkspaceAgentPermissionsDraft(normalizeWorkspaceAgentPermissions(null));
     setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
+    setWorkspaceInitializeGitDraft(false);
     setWorkspaceUnsafeModeArmed(false);
     setWorkspaceRootDraft("");
     setWorkspaceSettingsState("idle");
@@ -22422,7 +22662,9 @@ export default function App() {
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
     setWorkspaceTerminalRolesDraft(["codex"]);
+    setWorkspaceAgentPermissionsDraft(normalizeWorkspaceAgentPermissions(null));
     setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
+    setWorkspaceInitializeGitDraft(false);
     setWorkspaceUnsafeModeArmed(false);
     setWorkspaceSettingsState("idle");
     setWorkspaceSettingsError("");
@@ -25305,7 +25547,12 @@ export default function App() {
     setSelectedWorkspaceId("");
   }, [workspaceSyncState]);
 
-  const createFirstWorkspace = useCallback(async (event, requestedTerminalRoles = null) => {
+  const createFirstWorkspace = useCallback(async (
+    event,
+    requestedTerminalRoles = null,
+    requestedAgentPermissions = null,
+    requestedInitializeGit = false,
+  ) => {
     event.preventDefault();
 
     const name = workspaceName;
@@ -25340,7 +25587,7 @@ export default function App() {
       const rootDirectory = normalizedRoot?.workingDirectory || "";
       const rootIdentity = normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory);
       const rootWasEmptyAtSelection = Boolean(normalizedRoot?.emptyDirectory);
-      const rootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
+      let rootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
 
       if (!rootDirectory) {
         throw new Error("Workspace root directory was not returned by validation.");
@@ -25355,6 +25602,11 @@ export default function App() {
 
       if (duplicateWorkspace) {
         throw new Error(`That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`);
+      }
+
+      if (requestedInitializeGit && !rootGitRepository) {
+        await invoke("workspace_initialize_git", { repoPath: rootDirectory });
+        rootGitRepository = true;
       }
 
       // Local-first create: mint the id here, commit the row instantly, and
@@ -25378,10 +25630,15 @@ export default function App() {
       const terminalRoles = Array.isArray(requestedTerminalRoles) && requestedTerminalRoles.length
         ? requestedTerminalRoles.slice(0, MAX_WORKSPACE_TERMINAL_COUNT)
         : null;
+      const agentPermissions = normalizeWorkspaceAgentPermissions(
+        requestedAgentPermissions,
+        WORKSPACE_TERMINAL_ROLE_OPTIONS,
+      );
       const nextWorkspaceSettings = updateWorkspaceLocalSettings(workspaceSettingsRef.current, workspace.id, {
         rootDirectory,
         rootWasEmptyAtSelection,
         rootGitRepository,
+        agentPermissions,
         ...(terminalRoles
           ? { terminalCount: terminalRoles.length, terminalRoles }
           : {}),
@@ -25497,7 +25754,21 @@ export default function App() {
     const currentRootDirectory = getWorkspaceRootDirectory(workspaceSettings, selectedWorkspace.id);
     const cleanedRoot = cleanWorkspaceRootDirectory(currentRootDirectory);
     const currentAgentSessionMode = getWorkspaceAgentSessionMode(workspaceSettings, selectedWorkspace.id);
-    const requestedAgentSessionMode = normalizeAgentSessionMode(workspaceAgentSessionModeDraft);
+    const requestedAgentSessionMode = normalizeAgentSessionMode(workspaceAgentSessionModeDraft, false, true);
+    const agentPermissions = normalizeWorkspaceAgentPermissions(
+      workspaceAgentPermissionsDraft,
+      workspaceTerminalRoleOptions,
+    );
+    const currentAgentPermissions = getWorkspaceAgentPermissions(
+      workspaceSettings,
+      selectedWorkspace.id,
+      workspaceTerminalRoleOptions,
+    );
+    const agentPermissionsChanged = !areWorkspaceAgentPermissionsEqual(
+      currentAgentPermissions,
+      agentPermissions,
+      workspaceTerminalRoleOptions,
+    );
     const currentTerminalCount = getWorkspaceTerminalCount(workspaceSettings, selectedWorkspace.id);
     const currentTerminalRoles = getWorkspaceTerminalRoles(
       workspaceSettings,
@@ -25534,7 +25805,19 @@ export default function App() {
 
     try {
       const rootDirectory = cleanedRoot;
-      const rootGitRepository = getWorkspaceRootGitRepository(workspaceSettings, selectedWorkspace.id);
+      let rootGitRepository = getWorkspaceRootGitRepository(workspaceSettings, selectedWorkspace.id);
+      const shouldInitializeGit = Boolean(
+        rootDirectory
+          && !rootGitRepository
+          && (
+            workspaceInitializeGitDraft
+            || requestedAgentSessionMode === AGENT_SESSION_MODE_WORKTREE
+          ),
+      );
+      if (shouldInitializeGit) {
+        await invoke("workspace_initialize_git", { repoPath: rootDirectory });
+        rootGitRepository = true;
+      }
       const agentSessionMode = normalizeAgentSessionMode(
         requestedAgentSessionMode,
         false,
@@ -25580,7 +25863,7 @@ export default function App() {
         nextTerminalIndexSet.has(terminalIndex)
         && currentTerminalRoles[index] !== nextTerminalRoleByIndex.get(terminalIndex)
       ));
-      const terminalIndexesToClose = rootChanged || gitWorktreesChanged
+      const terminalIndexesToClose = rootChanged || gitWorktreesChanged || agentPermissionsChanged
         ? currentTerminalIndexes
         : Array.from(new Set([
           ...removedTerminalIndexes,
@@ -25589,7 +25872,7 @@ export default function App() {
       let nextWorkspace = selectedWorkspace;
 
 
-      if (rootChanged || gitWorktreesChanged) {
+      if (rootChanged || gitWorktreesChanged || agentPermissionsChanged) {
         clearPreparedWorkspaceTerminals(selectedWorkspace.id);
         workspaceAgentLaunchKeyRef.current = "";
         workspaceAgentBatchInFlightKeyRef.current = "";
@@ -25608,7 +25891,11 @@ export default function App() {
               agentId: getWorkspaceTerminalPaneAgentId(currentTerminalRoles[previousIndex] || activeAgent),
               nextTerminalCount: terminalCount,
               previousTerminalCount: currentTerminalCount,
-              reason: rootChanged ? "settings_root_change" : "settings_worktree_policy_change",
+              reason: rootChanged
+                ? "settings_root_change"
+                : gitWorktreesChanged
+                  ? "settings_worktree_policy_change"
+                  : "settings_permission_change",
               terminalIndex,
               waitForCleanup: WORKSPACE_SETTINGS_WAIT_FOR_TERMINAL_CLEANUP,
               workspaceId: selectedWorkspace.id,
@@ -25717,13 +26004,14 @@ export default function App() {
           gitWorktreesEnabled,
           terminalCount,
           terminalRoles,
+          agentPermissions,
         });
         workspaceSettingsRef.current = nextSettings;
         persistWorkspaceSettings(nextSettings);
         return nextSettings;
       });
 
-      if (rootChanged || gitWorktreesChanged || terminalCount !== currentTerminalCount || terminalRolesChanged) {
+      if (rootChanged || gitWorktreesChanged || agentPermissionsChanged || terminalCount !== currentTerminalCount || terminalRolesChanged) {
         const nextDisplayRows = getWorkspaceDisplayTerminalRows(
           workspaceTerminalDisplayLayoutsRef.current,
           selectedWorkspace.id,
@@ -25749,7 +26037,9 @@ export default function App() {
       setWorkspaceRootDraft(rootDirectory);
       setWorkspaceTerminalCountDraft(String(terminalCount));
       setWorkspaceTerminalRolesDraft(terminalRoles);
+      setWorkspaceAgentPermissionsDraft(agentPermissions);
       setWorkspaceAgentSessionModeDraft(agentSessionMode);
+      setWorkspaceInitializeGitDraft(false);
       setWorkspaceUnsafeModeArmed(false);
       setWorkspaceSettingsState("idle");
       setWorkspaceSettingsMessage("Workspace settings saved.");
@@ -25770,6 +26060,8 @@ export default function App() {
     expireDesktopSession,
     workspaceNameDraft,
     workspaceAgentSessionModeDraft,
+    workspaceAgentPermissionsDraft,
+    workspaceInitializeGitDraft,
     workspaceTerminalCountDraft,
     workspaceTerminalRolesDraft,
     workspaceSettings,
@@ -26830,7 +27122,7 @@ export default function App() {
     }
   }, [setSignedOut]);
 
-  const toggleWindowSize = useCallback(() => {
+  const toggleWindowZoom = useCallback(() => {
     runWindowAction(async () => {
       const appWindow = getSafeCurrentWindow();
 
@@ -26851,6 +27143,29 @@ export default function App() {
     });
   }, [refreshWindowFrameState, windowFrameState.isFullscreen]);
 
+  const toggleWindowControlSize = useCallback(() => {
+    runWindowAction(async () => {
+      const appWindow = getSafeCurrentWindow();
+
+      if (!appWindow) {
+        return;
+      }
+
+      const latestFrameState = await refreshWindowFrameState(appWindow);
+      const isFullscreen = latestFrameState?.isFullscreen ?? windowFrameState.isFullscreen;
+
+      if (isFullscreen) {
+        await appWindow.setFullscreen(false);
+      } else if (getWindowControlPlatform() === "macos") {
+        await appWindow.setFullscreen(true);
+      } else {
+        await appWindow.toggleMaximize();
+      }
+
+      await refreshWindowFrameState(appWindow);
+    });
+  }, [refreshWindowFrameState, windowFrameState.isFullscreen]);
+
   const handleTitleBarMouseDown = useCallback((event) => {
     if (event.button !== 0 || event.target.closest("[data-window-control]")) {
       return;
@@ -26859,7 +27174,7 @@ export default function App() {
     event.preventDefault();
 
     if (event.detail === 2) {
-      toggleWindowSize();
+      toggleWindowZoom();
       return;
     }
 
@@ -26870,7 +27185,7 @@ export default function App() {
     }
 
     runWindowAction(() => getSafeCurrentWindow()?.startDragging());
-  }, [toggleWindowSize, windowFrameState.isFullscreen, windowFrameState.isMaximized]);
+  }, [toggleWindowZoom, windowFrameState.isFullscreen, windowFrameState.isMaximized]);
 
   const handleWindowResizeEdgeMouseDown = useCallback((event) => {
     if (event.button !== 0) {
@@ -26916,8 +27231,8 @@ export default function App() {
 
   const toggleMaximizeWindow = useCallback((event) => {
     event.stopPropagation();
-    toggleWindowSize();
-  }, [toggleWindowSize]);
+    toggleWindowControlSize();
+  }, [toggleWindowControlSize]);
 
   const enterBackgroundMode = useCallback((event) => {
     event?.stopPropagation?.();
@@ -27834,6 +28149,7 @@ export default function App() {
   useEffect(() => {
     let isMounted = true;
     let unlistenResize = null;
+    let unlistenFocus = null;
     const appWindow = getSafeCurrentWindow();
 
     if (!appWindow) {
@@ -27865,11 +28181,25 @@ export default function App() {
       })
       .catch(() => {});
 
+    appWindow.onFocusChanged(refresh)
+      .then((unlisten) => {
+        if (!isMounted && typeof unlisten === "function") {
+          unlisten();
+          return;
+        }
+
+        unlistenFocus = unlisten;
+      })
+      .catch(() => {});
+
     return () => {
       isMounted = false;
 
       if (typeof unlistenResize === "function") {
         unlistenResize();
+      }
+      if (typeof unlistenFocus === "function") {
+        unlistenFocus();
       }
     };
   }, [applyWindowFrameState]);
@@ -28408,6 +28738,23 @@ export default function App() {
   const selectedWorkspaceAgentSessionMode = selectedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceAgentSessionMode(workspaceSettings, selectedWorkspace.id)
     : AGENT_SESSION_MODE_COORDINATED;
+  const selectedWorkspaceAgentPermissions = useMemo(
+    () => (
+      selectedWorkspace && !shouldShowWorkspaceSetup
+        ? getWorkspaceAgentPermissions(
+          workspaceSettings,
+          selectedWorkspace.id,
+          workspaceTerminalRoleOptions,
+        )
+        : normalizeWorkspaceAgentPermissions(null, workspaceTerminalRoleOptions)
+    ),
+    [
+      selectedWorkspace?.id,
+      shouldShowWorkspaceSetup,
+      workspaceSettings,
+      workspaceTerminalRoleOptions,
+    ],
+  );
   const selectedWorkspaceRootGitRepository = selectedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceRootGitRepository(workspaceSettings, selectedWorkspace.id)
     : false;
@@ -28442,6 +28789,23 @@ export default function App() {
       workspaceSettings,
     ],
   );
+  const activatedWorkspaceAgentPermissions = useMemo(
+    () => (
+      activatedWorkspace && !shouldShowWorkspaceSetup
+        ? getWorkspaceAgentPermissions(
+          workspaceSettings,
+          activatedWorkspace.id,
+          workspaceTerminalRoleOptions,
+        )
+        : normalizeWorkspaceAgentPermissions(null, workspaceTerminalRoleOptions)
+    ),
+    [
+      activatedWorkspace?.id,
+      shouldShowWorkspaceSetup,
+      workspaceSettings,
+      workspaceTerminalRoleOptions,
+    ],
+  );
   const activatedWorkspaceLogicalTerminalIndexes = useMemo(
     () => (
       activatedWorkspace && !shouldShowWorkspaceSetup
@@ -28463,6 +28827,12 @@ export default function App() {
   workspaceCloseExpectedTotalRef.current = activatedWorkspaceLogicalTerminalCount;
   const activatedWorkspaceTerminalRoleEntries = useMemo(
     () => activatedWorkspaceLogicalTerminalIndexes.map((terminalIndex, index) => ({
+      permissionMode: getWorkspaceAgentPermissionMode(
+        { active: { agentPermissions: activatedWorkspaceAgentPermissions } },
+        "active",
+        activatedWorkspaceTerminalRoles[index] || activatedWorkspaceTerminalRoles[terminalIndex],
+        workspaceTerminalRoleOptions,
+      ),
       role: normalizeWorkspaceTerminalRole(
         activatedWorkspaceTerminalRoles[index] || activatedWorkspaceTerminalRoles[terminalIndex],
         workspaceTerminalFallbackRole,
@@ -28472,6 +28842,7 @@ export default function App() {
     })),
     [
       activatedWorkspaceLogicalTerminalIndexes,
+      activatedWorkspaceAgentPermissions,
       activatedWorkspaceTerminalRoles,
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
@@ -28495,6 +28866,11 @@ export default function App() {
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
   ]);
+  const activatedWorkspaceTerminalPermissionsByIndex = useMemo(() => (
+    Object.fromEntries(activatedWorkspaceTerminalRoleEntries.map(({ permissionMode, terminalIndex }) => (
+      [terminalIndex, permissionMode || ""]
+    )))
+  ), [activatedWorkspaceTerminalRoleEntries]);
   const activatedWorkspaceThreadsByIndex = useMemo(() => (
     activatedWorkspace
       ? getWorkspaceThreadsByTerminalIndex(
@@ -28611,12 +28987,23 @@ export default function App() {
           workspaceTerminalFallbackRole,
           workspaceTerminalRoleOptions,
         );
+        const agentPermissions = getWorkspaceAgentPermissions(
+          workspaceSettings,
+          runtimeWorkspace.id,
+          workspaceTerminalRoleOptions,
+        );
         const logicalTerminalIndexes = getWorkspaceLogicalTerminalIndexes(
           workspaceTerminalLogicalIndexes,
           runtimeWorkspace.id,
           terminalCount,
         );
         const terminalRoleEntries = logicalTerminalIndexes.map((terminalIndex, index) => ({
+          permissionMode: getWorkspaceAgentPermissionMode(
+            { active: { agentPermissions } },
+            "active",
+            terminalRoles[index] || terminalRoles[terminalIndex],
+            workspaceTerminalRoleOptions,
+          ),
           role: normalizeWorkspaceTerminalRole(
             terminalRoles[index] || terminalRoles[terminalIndex],
             workspaceTerminalFallbackRole,
@@ -28633,6 +29020,9 @@ export default function App() {
             workspaceTerminalFallbackRole,
             workspaceTerminalRoleOptions,
           )]
+        )));
+        const terminalPermissionsByIndex = Object.fromEntries(terminalRoleEntries.map(({ permissionMode, terminalIndex }) => (
+          [terminalIndex, permissionMode || ""]
         )));
         const threadsByIndex = getWorkspaceThreadsByTerminalIndex(
           workspaceThreads,
@@ -28669,6 +29059,7 @@ export default function App() {
             terminalRoles[0] || workspaceTerminalFallbackRole,
           ),
           terminalRenderAgentsByIndex,
+          terminalPermissionsByIndex,
           terminalsByIndex,
           terminalRolesByIndex,
           threadsByIndex,
@@ -30025,7 +30416,9 @@ export default function App() {
     ? [
       activatedWorkspace.id,
       activatedWorkspaceTerminalWorkingDirectory,
-      activatedWorkspaceAgentTerminalEntries.map(({ role, terminalIndex }) => `${terminalIndex}:${role}`).join(","),
+      activatedWorkspaceAgentTerminalEntries.map(({ permissionMode, role, terminalIndex }) => (
+        `${terminalIndex}:${role}:${permissionMode || ""}`
+      )).join(","),
     ].join(":")
     : "";
   useEffect(() => {
@@ -30462,6 +30855,7 @@ export default function App() {
       }
 
       const nextBridge = {
+        onBeginTodoDrag: bridge.onBeginTodoDrag,
         onToggleTerminalBreakout: bridge.onToggleTerminalBreakout,
         onToggleWindowBreakout: bridge.onToggleWindowBreakout,
         onVoiceAgentToolCall: bridge.onVoiceAgentToolCall,
@@ -30473,6 +30867,7 @@ export default function App() {
       const previousBridge = currentBridges[safeWorkspaceId] || null;
       if (
         previousBridge
+        && previousBridge.onBeginTodoDrag === nextBridge.onBeginTodoDrag
         && previousBridge.onToggleTerminalBreakout === nextBridge.onToggleTerminalBreakout
         && previousBridge.onToggleWindowBreakout === nextBridge.onToggleWindowBreakout
         && previousBridge.onVoiceAgentToolCall === nextBridge.onVoiceAgentToolCall
@@ -41159,6 +41554,7 @@ export default function App() {
         model: session.model || "",
         needsAgentStart: session.needsAgentStart === true,
         paneId: session.paneId,
+        permissionMode: session.permissionMode || "",
         providerSessionId: session.providerSessionId || "",
         threadId: session.threadId || "",
         terminalIndex: session.terminalIndex,
@@ -41171,6 +41567,7 @@ export default function App() {
         instanceId: session.instanceId || "",
         needsAgentStart: session.needsAgentStart === true,
         paneId: session.paneId || "",
+        permissionMode: session.permissionMode || "",
         preparedCount: preparedTerminalsRef.current.size,
         terminalIndex: session.terminalIndex,
         threadId: session.threadId || "",
@@ -41198,6 +41595,9 @@ export default function App() {
 
     const terminalRoleByIndex = new Map(activatedWorkspaceAgentTerminalEntries.map(({ role, terminalIndex }) => (
       [terminalIndex, normalizeWorkspaceTerminalRole(role, activeAgent)]
+    )));
+    const terminalPermissionByIndex = new Map(activatedWorkspaceAgentTerminalEntries.map(({ permissionMode, terminalIndex }) => (
+      [terminalIndex, permissionMode || ""]
     )));
 
     return Array.from(preparedTerminalsRef.current.values())
@@ -41241,6 +41641,7 @@ export default function App() {
           modelSource,
           needsAgentStart: session.needsAgentStart === true,
           paneId: session.paneId,
+          permissionMode: terminalPermissionByIndex.get(session.terminalIndex) || session.permissionMode || "",
           provider: session.agentId,
           providerSessionId,
           reasoningEffort: launchOptions.effort || "",
@@ -41411,6 +41812,7 @@ export default function App() {
             instanceId: session.instanceId || "",
             needsAgentStart: session.needsAgentStart === true,
             paneId: session.paneId || "",
+            permissionMode: session.permissionMode || "",
             provider: session.provider || "",
             terminalIndex: session.terminalIndex ?? "",
             threadId: session.threadId || "",
@@ -41442,6 +41844,7 @@ export default function App() {
         instanceId: request.instanceId || "",
         model: request.model || "",
         paneId: request.paneId || "",
+        permissionMode: request.permissionMode || "",
         provider: request.provider || "",
         speed: request.speed || "",
         terminalIndex: request.terminalIndex ?? "",
@@ -41458,6 +41861,7 @@ export default function App() {
         instanceId: request.instanceId || "",
         model: request.model || "",
         paneId: request.paneId || "",
+        permissionMode: request.permissionMode || "",
         provider: request.provider || "",
         speed: request.speed || "",
         terminalIndex: request.terminalIndex ?? "",
@@ -41531,6 +41935,7 @@ export default function App() {
             unconfirmedRequests: unconfirmedRequests.map((request) => ({
               instanceId: request.instanceId || "",
               paneId: request.paneId || "",
+              permissionMode: request.permissionMode || "",
               provider: request.provider || "",
               terminalIndex: request.terminalIndex ?? "",
               threadId: request.threadId || "",
@@ -41573,6 +41978,7 @@ export default function App() {
             requestModel: request.model || "",
             requestModelSource: request.modelSource || "",
             paneId: paneResult.paneId || request.paneId || "",
+            permissionMode: request.permissionMode || "",
             provider: request.provider || "",
             speed: request.speed || "",
             terminalIndex: request.terminalIndex ?? "",
@@ -41587,6 +41993,7 @@ export default function App() {
             modelSource: startedModelSource,
             requestModel: request.model || "",
             paneId: paneResult.paneId || request.paneId || "",
+            permissionMode: request.permissionMode || "",
             provider: request.provider || "",
             terminalIndex: request.terminalIndex ?? "",
             threadId: request.threadId || "",
@@ -41630,6 +42037,7 @@ export default function App() {
               instanceId: paneResult.instanceId || "",
               model: request.model || "",
               paneId: paneResult.paneId || "",
+              permissionMode: request.permissionMode || "",
               provider: request.provider || "",
               providerSessionIdPresent: Boolean(request.providerSessionId),
               terminalIndex: request.terminalIndex ?? "",
@@ -41642,6 +42050,7 @@ export default function App() {
                 instanceId: paneResult.instanceId || "",
                 model: request.model || "",
                 paneId: paneResult.paneId || "",
+                permissionMode: request.permissionMode || "",
                 provider: request.provider || "",
                 terminalIndex: request.terminalIndex ?? "",
                 threadId: request.threadId || "",
@@ -41656,6 +42065,7 @@ export default function App() {
                   instanceId: paneResult.instanceId || "",
                   model: request.model || "",
                   paneId: paneResult.paneId || "",
+                  permissionMode: request.permissionMode || "",
                   provider: request.provider || "",
                   terminalIndex: request.terminalIndex ?? "",
                   threadId: request.threadId || "",
@@ -41680,6 +42090,7 @@ export default function App() {
               hasProviderSessionId: Boolean(request.providerSessionId),
               instanceId: paneResult.instanceId || request.instanceId || "",
               paneId: paneResult.paneId || request.paneId || "",
+              permissionMode: request.permissionMode || "",
               provider: request.provider || "",
               reason: !request.model
                 ? "missing_model"
@@ -41759,7 +42170,12 @@ export default function App() {
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     ));
+    setWorkspaceAgentPermissionsDraft(selectedWorkspace ? selectedWorkspaceAgentPermissions : normalizeWorkspaceAgentPermissions(
+      null,
+      workspaceTerminalRoleOptions,
+    ));
     setWorkspaceAgentSessionModeDraft(normalizeAgentSessionMode(selectedWorkspaceAgentSessionMode));
+    setWorkspaceInitializeGitDraft(false);
     setWorkspaceUnsafeModeArmed(false);
     setWorkspaceRootDraft(selectedWorkspaceRootDirectory);
     setWorkspaceSettingsError("");
@@ -41770,6 +42186,7 @@ export default function App() {
     selectedWorkspace?.name,
     selectedWorkspaceRootDirectory,
     selectedWorkspaceAgentSessionMode,
+    selectedWorkspaceAgentPermissions,
     selectedWorkspaceTerminalCount,
     selectedWorkspaceTerminalRoles,
     workspaceTerminalFallbackRole,
@@ -41904,8 +42321,16 @@ export default function App() {
         ? "Validating this device before showing your workspace."
         : "Finishing the desktop handoff.";
   const windowControlPlatform = getWindowControlPlatform();
-  const isWindowExpanded = windowFrameState.isFullscreen || windowFrameState.isMaximized;
-  const windowResizeLabel = isWindowExpanded ? "Restore" : windowControlPlatform === "macos" ? "Zoom" : "Maximize";
+  const isWindowFrameExpanded = windowFrameState.isFullscreen || windowFrameState.isMaximized;
+  const windowResizeActive = windowFrameState.isFullscreen
+    || (windowControlPlatform !== "macos" && windowFrameState.isMaximized);
+  const windowResizeLabel = windowFrameState.isFullscreen
+    ? "Exit Full Screen"
+    : windowControlPlatform === "macos"
+      ? "Enter Full Screen"
+      : windowFrameState.isMaximized
+        ? "Restore"
+        : "Maximize";
   const workspaceCloseReportedClosed = normalizeCloseCount(workspaceCloseState.closed);
   const workspaceCloseTotalKnown = workspaceCloseState.terminalTotalKnown === true;
   const workspaceCloseTotal = Math.max(normalizeCloseCount(workspaceCloseState.total), workspaceCloseReportedClosed);
@@ -41973,6 +42398,9 @@ export default function App() {
   const workspaceSettingsAgentCounts = useMemo(() => (
     getWorkspaceTerminalRoleCountMap(workspaceSettingsTerminalRoles, workspaceTerminalRoleOptions)
   ), [workspaceSettingsTerminalRoles, workspaceTerminalRoleOptions]);
+  const workspaceSettingsAgentPermissions = useMemo(() => (
+    normalizeWorkspaceAgentPermissions(workspaceAgentPermissionsDraft, workspaceTerminalRoleOptions)
+  ), [workspaceAgentPermissionsDraft, workspaceTerminalRoleOptions]);
   const updateWorkspaceSettingsAgentCount = useCallback((roleId, delta) => {
     const nextRoles = adjustWorkspaceAgentCardRoles(
       workspaceSettingsTerminalRoles,
@@ -41989,6 +42417,32 @@ export default function App() {
     workspaceSettingsTerminalRoles,
     workspaceTerminalRoleOptions,
   ]);
+  const cycleWorkspaceSettingsAgentPermission = useCallback((roleId, delta) => {
+    if (!isWorkspacePermissionAgentRole(roleId)) {
+      return;
+    }
+    setWorkspaceAgentPermissionsDraft((current) => ({
+      ...normalizeWorkspaceAgentPermissions(current, workspaceTerminalRoleOptions),
+      [roleId]: cycleWorkspaceAgentPermissionMode(current?.[roleId], delta),
+    }));
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+  }, [workspaceTerminalRoleOptions]);
+  const workspaceSettingsSafeModeRequiresGit = Boolean(
+    selectedWorkspace
+      && !selectedWorkspaceRootGitRepository
+      && workspaceAgentSessionModeDraft === AGENT_SESSION_MODE_WORKTREE,
+  );
+  const workspaceSettingsInitializeGitChecked = Boolean(
+    selectedWorkspaceRootGitRepository
+      || workspaceSettingsSafeModeRequiresGit
+      || workspaceInitializeGitDraft,
+  );
+  const workspaceSettingsInitializeGitDisabled = Boolean(
+    isWorkspaceSettingsBusy
+      || selectedWorkspaceRootGitRepository
+      || workspaceSettingsSafeModeRequiresGit,
+  );
   const isWorkspaceStartupOverlayVisible = shouldShowStartupPhases && workspaceState !== "ready";
   const settingsPermissionsAreLoading = settingsPermissionState.status === "loading";
   const settingsAudioInputPermission = settingsPermissionState.audioInput;
@@ -42045,7 +42499,7 @@ export default function App() {
   return (
     <>
       <GlobalStyle />
-      <AppFrame data-platform={windowControlPlatform} data-window-expanded={isWindowExpanded}>
+      <AppFrame data-platform={windowControlPlatform} data-window-expanded={isWindowFrameExpanded}>
         <WindowTitleBar
           data-platform={windowControlPlatform}
           onMouseDown={handleTitleBarMouseDown}
@@ -42136,7 +42590,7 @@ export default function App() {
               title={windowResizeLabel}
               type="button"
             >
-              {isWindowExpanded ? (
+              {windowResizeActive ? (
                 <TitleRestoreIcon aria-hidden="true" />
               ) : (
                 <TitleMaximizeIcon aria-hidden="true" />
@@ -42682,6 +43136,7 @@ export default function App() {
                             workspaceToolPortalTarget={null}
                             terminalWorkspace={runtimeWorkspace}
                             terminalRenderAgentsByIndex={runtimeDescriptor.terminalRenderAgentsByIndex}
+                            terminalPermissionsByIndex={runtimeDescriptor.terminalPermissionsByIndex}
                             terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}
                             terminalWorkspaceRootWasEmptyAtSelection={runtimeDescriptor.rootWasEmptyAtSelection}
                             terminalWorkspaceWorkingDirectory={runtimeDescriptor.workingDirectory}
@@ -42812,7 +43267,9 @@ export default function App() {
                         onDeleteArchivedWorkspace={deleteWorkspaceFromForge}
                         onClose={closeCreateWorkspaceModal}
                         onRestoreArchivedWorkspace={restoreArchivedWorkspace}
-                        onSubmit={(event, terminalRoles) => createFirstWorkspace(event, terminalRoles)}
+                        onSubmit={(event, terminalRoles, agentPermissions, initializeGit) => (
+                          createFirstWorkspace(event, terminalRoles, agentPermissions, initializeGit)
+                        )}
                         roleOptions={WORKSPACE_TERMINAL_ROLE_OPTIONS}
                         rootDraft={newWorkspaceRootDraft}
                         setRootDraft={setNewWorkspaceRootDraft}
@@ -43016,6 +43473,28 @@ export default function App() {
                                 <WorkspaceCreatePathBadge $tone="good">git</WorkspaceCreatePathBadge>
                               )}
                             </WorkspaceCreatePathBar>
+                            <WorkspaceCreateCheckboxRow data-disabled={workspaceSettingsInitializeGitDisabled ? "true" : undefined}>
+                              <input
+                                checked={workspaceSettingsInitializeGitChecked}
+                                disabled={workspaceSettingsInitializeGitDisabled}
+                                onChange={(event) => {
+                                  setWorkspaceInitializeGitDraft(event.target.checked);
+                                  setWorkspaceSettingsError("");
+                                  setWorkspaceSettingsMessage("");
+                                }}
+                                type="checkbox"
+                              />
+                              <span>
+                                <strong>Initialize Git</strong>
+                                <small>
+                                  {selectedWorkspaceRootGitRepository
+                                    ? "Already a Git repository."
+                                    : workspaceSettingsSafeModeRequiresGit
+                                      ? "Required for Safe mode worktrees."
+                                      : "Enabled if it is not a Git repo."}
+                                </small>
+                              </span>
+                            </WorkspaceCreateCheckboxRow>
                           </WorkspaceCreateSection>
 
                           <WorkspaceCreateSection>
@@ -43026,10 +43505,12 @@ export default function App() {
                             </SettingsHint>
                             <WorkspaceAgentCountCards
                               agentStatuses={agentStatuses}
+                              agentPermissions={workspaceSettingsAgentPermissions}
                               counts={workspaceSettingsAgentCounts}
                               disabled={isWorkspaceSettingsBusy}
                               minimumTotal={MIN_WORKSPACE_TERMINAL_COUNT}
                               onAdjust={updateWorkspaceSettingsAgentCount}
+                              onPermissionCycle={cycleWorkspaceSettingsAgentPermission}
                               roleOptions={workspaceTerminalRoleOptions}
                               totalCount={workspaceSettingsTerminalRoles.length}
                             />
@@ -43043,9 +43524,7 @@ export default function App() {
                               can conflict, and cannot pause or resume.
                             </SettingsHint>
                             <AgentSafetyModeGroup aria-label="Agent safety mode" role="radiogroup">
-                              {AGENT_SESSION_MODE_OPTIONS.filter((option) => (
-                                option.value !== AGENT_SESSION_MODE_WORKTREE || selectedWorkspaceSafeModeAvailable
-                              )).map((option) => {
+                              {AGENT_SESSION_MODE_OPTIONS.map((option) => {
                                 const active = workspaceAgentSessionModeDraft === option.value;
                                 const needsConfirm = option.value === AGENT_SESSION_MODE_DIRECT && !active;
                                 return (
@@ -43259,7 +43738,7 @@ export default function App() {
                   <AgentSettingsPanel>
                     <PanelHeaderRow>
                       <div>
-                        <PanelKicker>Terminal providers</PanelKicker>
+                        <PanelKicker>Terminal harnesses</PanelKicker>
                         <PanelHeading>Codex, Claude Code, and OpenCode</PanelHeading>
                       </div>
                       <AgentPanelActions>
@@ -43391,7 +43870,7 @@ export default function App() {
                                   <AgentInstallBadge>Update</AgentInstallBadge>
                                 </AgentInstallTopline>
                                 <AgentInstallHint>
-                                  Updates use your global npm prefix. Permission errors usually mean old package folders were created by an elevated process or are still locked.
+                                  Updates run against your global npm prefix.
                                 </AgentInstallHint>
                                 <AgentInstallActions>
                                   <SecondaryButton
@@ -44020,7 +44499,10 @@ export default function App() {
                       viewMotion={viewMotion}
                     />
                   ) : selectedWorkspace ? (
-                    <WebWorkspaceView workspace={selectedWorkspace} />
+                    <WebWorkspaceView
+                      isActive={activeView === "web" && visibleView === "web" && viewMotion !== "exiting"}
+                      workspace={selectedWorkspace}
+                    />
                   ) : (
                     <WorkspaceIdleState detail="Select a workspace to open the web view." viewMotion={viewMotion} />
                   )}

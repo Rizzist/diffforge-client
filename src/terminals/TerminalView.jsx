@@ -15856,6 +15856,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   const appControlAgentDragRef = useRef(null);
   const todoItemElementsRef = useRef(new Map());
   const todoDragGestureRef = useRef(null);
+  const todoDragSuppressedClickRef = useRef("");
   const todoReorderDragRef = useRef(null);
   const draftTextAreaRef = useRef(null);
   const editingTextAreaRef = useRef(null);
@@ -18821,6 +18822,14 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     gesture.started = true;
     const clientX = Number(pointerEvent?.clientX ?? gesture.lastX ?? gesture.clientX ?? 0);
     const clientY = Number(pointerEvent?.clientY ?? gesture.lastY ?? gesture.clientY ?? 0);
+    if (gesture.suppressClickOnStart) {
+      todoDragSuppressedClickRef.current = gesture.itemId;
+      window.setTimeout(() => {
+        if (todoDragSuppressedClickRef.current === gesture.itemId) {
+          todoDragSuppressedClickRef.current = "";
+        }
+      }, 600);
+    }
     clearPendingTodoDragGesture();
     todoReorderDragRef.current = {
       itemId: gesture.itemId,
@@ -18834,18 +18843,20 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     });
   }, [clearPendingTodoDragGesture, onBeginTodoDrag]);
 
-  const handlePointerDown = useCallback((event, item) => {
-    if (!todoSelectionEditable) {
+  const handlePointerDown = useCallback((event, item, options = {}) => {
+    if (!todoSelectionEditable || typeof onBeginTodoDrag !== "function") {
       return;
     }
+    const allowControlTarget = Boolean(options.allowControlTarget);
+    const preserveClick = Boolean(options.preserveClick);
     if (
       event.button !== 0
       || event.detail > 1
       || editingItemId === item?.id
       || pendingItems[item?.id]
-      || event.target?.closest?.("[data-todo-control='true']")
+      || (!allowControlTarget && event.target?.closest?.("[data-todo-control='true']"))
     ) {
-      if (pendingItems[item?.id]) {
+      if (pendingItems[item?.id] && !preserveClick) {
         event.preventDefault();
         event.stopPropagation();
       }
@@ -18859,20 +18870,25 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     const note = getTodoQueueItemNote(item);
     const planTask = getTodoQueueItemPlanTask(item);
     if (!terminalText && !images.length && !note) {
-      event.preventDefault();
+      if (!preserveClick) {
+        event.preventDefault();
+      }
       return;
     }
 
-    const sourceRect = getPlainDomRect(event.currentTarget?.getBoundingClientRect?.());
+    const sourceElement = options.sourceElement || event.currentTarget;
+    const sourceRect = getPlainDomRect(sourceElement?.getBoundingClientRect?.());
     if (!sourceRect) {
       return;
     }
 
-    event.preventDefault();
-    event.stopPropagation();
+    if (!preserveClick) {
+      event.preventDefault();
+      event.stopPropagation();
+    }
     clearPendingTodoDragGesture();
     try {
-      event.currentTarget?.setPointerCapture?.(event.pointerId);
+      sourceElement?.setPointerCapture?.(event.pointerId);
     } catch {
       /* Pointer capture is best-effort; capture-phase window listeners still carry the drag. */
     }
@@ -18908,10 +18924,11 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       lastY: event.clientY,
       pointerId: event.pointerId,
       sidebarRect,
-      sourceElement: event.currentTarget,
+      sourceElement,
       startX: event.clientX,
       startY: event.clientY,
       started: false,
+      suppressClickOnStart: preserveClick,
       timerId: 0,
     };
 
@@ -18963,6 +18980,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     beginPendingTodoDragGesture,
     clearPendingTodoDragGesture,
     editingItemId,
+    onBeginTodoDrag,
     pendingItems,
     todoSelectionEditable,
     workspaceId,
@@ -20002,6 +20020,10 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                             onClick={(event) => {
                               event.preventDefault();
                               event.stopPropagation();
+                              if (todoDragSuppressedClickRef.current === item.id) {
+                                todoDragSuppressedClickRef.current = "";
+                                return;
+                              }
                               if (isQueued) {
                                 onCancelQueuedItem?.(item.id);
                                 return;
@@ -20011,8 +20033,14 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                               }
                             }}
                             onPointerDown={(event) => {
-                              event.preventDefault();
-                              event.stopPropagation();
+                              if (isPending) {
+                                return;
+                              }
+                              handlePointerDown(event, item, {
+                                allowControlTarget: true,
+                                preserveClick: true,
+                                sourceElement: event.currentTarget?.closest?.("[data-todo-card='true']"),
+                              });
                             }}
                             title={actionTitle}
                             type="button"
@@ -20799,6 +20827,7 @@ function TerminalView({
   storageUsage = null,
   terminalWorkspace,
   terminalRenderAgentsByIndex = {},
+  terminalPermissionsByIndex = {},
   terminalRolesByIndex = {},
   terminalThreadsByIndex = {},
   terminalWorkspaceCoordinationTargets = [],
@@ -21747,6 +21776,9 @@ function TerminalView({
   const getTerminalRole = useCallback((terminalIndex) => (
     terminalRolesByIndex[terminalIndex] || getTerminalAgent(terminalIndex)?.id || ""
   ), [getTerminalAgent, terminalRolesByIndex]);
+  const getTerminalPermissionMode = useCallback((terminalIndex) => (
+    terminalPermissionsByIndex[terminalIndex] || ""
+  ), [terminalPermissionsByIndex]);
   const getTerminalThread = useCallback((terminalIndex) => (
     terminalThreadsByIndex[terminalIndex] || null
   ), [terminalThreadsByIndex]);
@@ -21867,8 +21899,21 @@ function TerminalView({
       return null;
     }
 
+    const hitTestRects = getTerminalHitTestRects();
+    const visibleTargetIndex = getTodoDropTargetFromPoint({
+      clientX,
+      clientY,
+      containerRect,
+      fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
+      rects: hitTestRects,
+      terminalIndexes: terminalBreakoutLayoutActive ? logicalTerminalIndexes : visibleTabTerminalIndexes,
+    });
     const surfaceSlotIndex = getTerminalSurfaceSlotIndexFromPoint(clientX, clientY, logicalTerminalIndexes);
-    if (!Number.isInteger(surfaceSlotIndex)) {
+    const candidateSurfaceSlotIndex = Number.isInteger(surfaceSlotIndex)
+      ? surfaceSlotIndex
+      : visibleTargetIndex;
+
+    if (!Number.isInteger(candidateSurfaceSlotIndex)) {
       return null;
     }
 
@@ -21876,7 +21921,7 @@ function TerminalView({
     // the grid. Dropping on the placeholder must never resolve a target — the
     // real window is resolved by the cross-window watcher instead, so the
     // placeholder reads as empty space and never false-highlights.
-    if (isTerminalIndexWindowBreakoutHosted(surfaceSlotIndex)) {
+    if (isTerminalIndexWindowBreakoutHosted(candidateSurfaceSlotIndex)) {
       return null;
     }
 
@@ -21886,26 +21931,21 @@ function TerminalView({
         clientY,
         containerRect,
         fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
-        rects: getTerminalHitTestRects(),
-        terminalIndexes: [surfaceSlotIndex],
+        rects: hitTestRects,
+        terminalIndexes: [candidateSurfaceSlotIndex],
       });
-      return targetTerminalIndex === surfaceSlotIndex ? surfaceSlotIndex : null;
+      return targetTerminalIndex === candidateSurfaceSlotIndex ? candidateSurfaceSlotIndex : null;
     }
 
     // Tab groups share one rect per row, so only the visible tab of each
     // group may receive todo/file drops.
-    const targetTerminalIndex = getTodoDropTargetFromPoint({
-      clientX,
-      clientY,
-      containerRect,
-      fullscreenTerminalIndex: fullscreenActive ? fullscreenTerminalIndex : null,
-      rects: getTerminalHitTestRects(),
-      terminalIndexes: visibleTabTerminalIndexes,
-    });
-    if (isTerminalIndexWindowBreakoutHosted(targetTerminalIndex)) {
+    if (isTerminalIndexWindowBreakoutHosted(visibleTargetIndex)) {
       return null;
     }
-    return targetTerminalIndex === surfaceSlotIndex ? targetTerminalIndex : null;
+    if (Number.isInteger(surfaceSlotIndex) && visibleTargetIndex !== surfaceSlotIndex) {
+      return null;
+    }
+    return Number.isInteger(visibleTargetIndex) ? visibleTargetIndex : null;
   }, [
     fullscreenActive,
     fullscreenTerminalIndex,
@@ -34027,6 +34067,7 @@ function TerminalView({
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
                 onPopOutTerminalWindow={popOutTerminalWindowForIndex}
                 prewarmShell={shouldPrewarmWorkspaceTerminals}
+                permissionMode={getTerminalPermissionMode(terminalIndex)}
                 startupReady={terminalStartupReady}
                 terminalBreakoutActive={terminalBreakoutLayoutActive}
                 terminalCount={terminalWorkspaceLogicalTerminalCount}
@@ -34191,6 +34232,7 @@ function TerminalView({
       onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
       onPopOutTerminalWindow={popOutTerminalWindowForIndex}
       prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
+      permissionMode={getTerminalPermissionMode(logicalTerminalIndexes[0] || 0)}
       startupReady={terminalStartupReady}
       terminalBreakoutActive={false}
       terminalCount={terminalWorkspaceLogicalTerminalCount}

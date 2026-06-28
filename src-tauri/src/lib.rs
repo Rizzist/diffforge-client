@@ -1878,6 +1878,7 @@ struct TerminalOpenRequest {
     model: Option<String>,
     reasoning_effort: Option<String>,
     speed: Option<String>,
+    permission_mode: Option<String>,
     plain_shell: Option<bool>,
     fresh_session: Option<bool>,
     preserve_coordination_session: Option<bool>,
@@ -1909,6 +1910,7 @@ struct TerminalStartAgentRequest {
     model: Option<String>,
     reasoning_effort: Option<String>,
     speed: Option<String>,
+    permission_mode: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -5235,6 +5237,7 @@ pub fn run() {
             workspace_git_file_diff,
             workspace_git_generate_commit_message,
             workspace_git_commit_and_push,
+            workspace_initialize_git,
             terminal_open,
             terminal_record_provider_session,
             terminal_start_agent,

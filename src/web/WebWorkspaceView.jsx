@@ -20,6 +20,14 @@ function hasTauriRuntime() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
 }
 
+function nativeErrorMessage(error, fallback) {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+  const message = String(error || "").trim();
+  return message || fallback;
+}
+
 function normalizeWebInput(value) {
   const raw = String(value || "").trim();
   if (!raw) {
@@ -87,21 +95,39 @@ function viewportNativeRect(viewport) {
     return null;
   }
   const rect = viewport.getBoundingClientRect();
+  const surfaceRect = viewport.closest("[data-workspace-web-surface]")?.getBoundingClientRect?.() || null;
+  const bounds = {
+    bottom: Math.max(0, window.innerHeight || 0),
+    left: 0,
+    right: Math.max(0, window.innerWidth || 0),
+    top: 0,
+  };
+  if (surfaceRect) {
+    bounds.bottom = Math.min(bounds.bottom, surfaceRect.bottom);
+    bounds.left = Math.max(bounds.left, surfaceRect.left);
+    bounds.right = Math.min(bounds.right, surfaceRect.right);
+    bounds.top = Math.max(bounds.top, surfaceRect.top);
+  }
+  const left = Math.max(bounds.left, rect.left);
+  const top = Math.max(bounds.top, rect.top);
+  const right = Math.min(bounds.right, rect.right);
+  const bottom = Math.min(bounds.bottom, rect.bottom);
   return {
-    height: Math.max(0, Math.round(rect.height)),
-    width: Math.max(0, Math.round(rect.width)),
-    x: Math.max(0, Math.round(rect.left)),
-    y: Math.max(0, Math.round(rect.top)),
+    height: Math.max(0, Math.round(bottom - top)),
+    width: Math.max(0, Math.round(right - left)),
+    x: Math.max(0, Math.round(left)),
+    y: Math.max(0, Math.round(top)),
   };
 }
 
-export default function WebWorkspaceView({ workspace }) {
+export default function WebWorkspaceView({ isActive = true, workspace }) {
   const [history, setHistory] = useState(() => [DEFAULT_WEB_URL]);
   const [historyIndex, setHistoryIndex] = useState(0);
   const [addressValue, setAddressValue] = useState(DEFAULT_WEB_URL);
   const [addressError, setAddressError] = useState("");
   const [reloadKey, setReloadKey] = useState(0);
   const [nativeEnabled, setNativeEnabled] = useState(() => hasTauriRuntime());
+  const [nativeError, setNativeError] = useState("");
   const [nativeStatus, setNativeStatus] = useState("idle");
   const viewportRef = useRef(null);
   const nativeLabelRef = useRef("");
@@ -115,6 +141,7 @@ export default function WebWorkspaceView({ workspace }) {
   const currentHost = useMemo(() => hostForUrl(currentUrl), [currentUrl]);
   const canGoBack = historyIndex > 0;
   const canGoForward = historyIndex < history.length - 1;
+  const nativeRuntimeAvailable = hasTauriRuntime();
 
   useEffect(() => {
     mountedRef.current = true;
@@ -176,23 +203,24 @@ export default function WebWorkspaceView({ workspace }) {
       return false;
     }
 
-    const rectKey = `${rect.x}:${rect.y}:${rect.width}:${rect.height}:${visible ? "show" : "hide"}`;
+    const shouldShow = Boolean(visible && isActive);
+    const rectKey = `${rect.x}:${rect.y}:${rect.width}:${rect.height}:${shouldShow ? "show" : "hide"}`;
     if (nativeRectRef.current !== rectKey) {
       nativeRectRef.current = rectKey;
       await invoke("workspace_webview_fit", {
         height: rect.height,
         label: safeLabel,
-        visible,
+        visible: shouldShow,
         width: rect.width,
         x: rect.x,
         y: rect.y,
       });
     }
     return true;
-  }, [nativeEnabled]);
+  }, [isActive, nativeEnabled]);
 
   const openNativeWebview = useCallback(async (targetUrl) => {
-    if (!nativeEnabled || !hasTauriRuntime()) {
+    if (!isActive || !nativeEnabled || !hasTauriRuntime()) {
       return false;
     }
 
@@ -218,6 +246,7 @@ export default function WebWorkspaceView({ workspace }) {
     }
 
     if (mountedRef.current) {
+      setNativeError("");
       setNativeStatus("loading");
     }
 
@@ -227,7 +256,9 @@ export default function WebWorkspaceView({ workspace }) {
       }
       nativeLabelRef.current = "";
       nativeRectRef.current = "";
-      setNativeStatus("fallback");
+      nativeStatusRef.current = "error";
+      setNativeStatus("error");
+      setNativeError("The embedded web view did not finish loading.");
       setNativeEnabled(false);
       void invoke("workspace_webview_close", { label }).catch(() => {});
     }, NATIVE_LOAD_TIMEOUT_MS);
@@ -242,20 +273,35 @@ export default function WebWorkspaceView({ workspace }) {
         y: rect.y,
       });
       return true;
-    } catch {
+    } catch (error) {
       if (mountedRef.current && nativeGenerationRef.current === generation) {
         clearNativeLoadTimeout();
         nativeLabelRef.current = "";
-        setNativeStatus("fallback");
+        nativeStatusRef.current = "error";
+        setNativeStatus("error");
+        setNativeError(nativeErrorMessage(error, "Unable to open the embedded web view."));
         setNativeEnabled(false);
       }
       return false;
     }
-  }, [clearNativeLoadTimeout, nativeEnabled, workspace]);
+  }, [clearNativeLoadTimeout, isActive, nativeEnabled, workspace]);
 
   const retryNativeOnNavigation = useCallback(() => {
     if (hasTauriRuntime()) {
+      setNativeError("");
+      setNativeStatus((status) => (status === "error" ? "idle" : status));
       setNativeEnabled(true);
+    }
+  }, []);
+
+  const retryNativeWebview = useCallback(() => {
+    setAddressError("");
+    setNativeError("");
+    nativeStatusRef.current = "idle";
+    setNativeStatus("idle");
+    if (hasTauriRuntime()) {
+      setNativeEnabled(true);
+      setReloadKey((key) => key + 1);
     }
   }, []);
 
@@ -275,17 +321,21 @@ export default function WebWorkspaceView({ workspace }) {
 
       const loadEvent = String(payload.event || "").trim().toLowerCase();
       if (loadEvent === "started") {
+        const wasReady = nativeStatusRef.current === "ready";
         nativeStatusRef.current = "loading";
         setNativeStatus("loading");
-        void fitNativeWebview(label, false).catch(() => {});
+        if (!wasReady || !isActive) {
+          void fitNativeWebview(label, false).catch(() => {});
+        }
         return;
       }
 
       if (loadEvent === "finished") {
         clearNativeLoadTimeout();
         nativeStatusRef.current = "ready";
+        setNativeError("");
         setNativeStatus("ready");
-        void fitNativeWebview(label, true).catch(() => {});
+        void fitNativeWebview(label, isActive).catch(() => {});
       }
     })
       .then((unlisten) => {
@@ -303,9 +353,14 @@ export default function WebWorkspaceView({ workspace }) {
         unlistenLoad();
       }
     };
-  }, [clearNativeLoadTimeout, fitNativeWebview]);
+  }, [clearNativeLoadTimeout, fitNativeWebview, isActive]);
 
   useEffect(() => {
+    if (!isActive) {
+      void closeNativeWebview();
+      return undefined;
+    }
+
     if (!nativeEnabled) {
       void closeNativeWebview();
       return undefined;
@@ -321,14 +376,14 @@ export default function WebWorkspaceView({ workspace }) {
     return () => {
       disposed = true;
     };
-  }, [closeNativeWebview, currentUrl, nativeEnabled, openNativeWebview, reloadKey]);
+  }, [closeNativeWebview, currentUrl, isActive, nativeEnabled, openNativeWebview, reloadKey]);
 
   useEffect(() => () => {
     void closeNativeWebview();
   }, [closeNativeWebview]);
 
   useEffect(() => {
-    if (!nativeEnabled) {
+    if (!nativeEnabled || !isActive) {
       return undefined;
     }
 
@@ -361,7 +416,7 @@ export default function WebWorkspaceView({ workspace }) {
       window.removeEventListener("resize", scheduleFit);
       window.cancelAnimationFrame(frameHandle);
     };
-  }, [fitNativeWebview, nativeEnabled]);
+  }, [fitNativeWebview, isActive, nativeEnabled]);
 
   const navigateTo = useCallback((targetUrl) => {
     retryNativeOnNavigation();
@@ -412,7 +467,7 @@ export default function WebWorkspaceView({ workspace }) {
   }, [currentUrl]);
 
   return (
-    <WebSurface aria-label="Workspace web">
+    <WebSurface aria-label="Workspace web" data-workspace-web-surface="true">
       <WebToolbar>
         <WebNavControls>
           <WebIconButton
@@ -467,7 +522,7 @@ export default function WebWorkspaceView({ workspace }) {
         </WebAddressForm>
 
         <WebRightControls>
-          <WebHostPill data-status={nativeStatus}>
+          <WebHostPill data-status={nativeEnabled ? nativeStatus : "error"}>
             <Language aria-hidden="true" />
             <span>{currentHost}</span>
           </WebHostPill>
@@ -485,10 +540,31 @@ export default function WebWorkspaceView({ workspace }) {
       {addressError ? <WebInlineError role="alert">{addressError}</WebInlineError> : null}
 
       <WebViewport ref={viewportRef}>
-        {nativeEnabled ? (
-          <NativeWebviewBackdrop data-status={nativeStatus}>
+        {nativeRuntimeAvailable ? (
+          <NativeWebviewBackdrop data-status={nativeEnabled ? nativeStatus : "error"}>
             <Language aria-hidden="true" />
-            <span>{nativeStatus === "loading" ? "Loading" : currentHost}</span>
+            <span>
+              {!nativeEnabled && nativeError
+                ? "Web view unavailable"
+                : nativeStatus === "loading"
+                  ? "Loading"
+                  : currentHost}
+            </span>
+            {!nativeEnabled && nativeError ? (
+              <NativeWebviewFallback role="alert">
+                <small>{nativeError}</small>
+                <NativeWebviewActions>
+                  <NativeWebviewActionButton onClick={retryNativeWebview} type="button">
+                    <Refresh aria-hidden="true" />
+                    <span>Retry</span>
+                  </NativeWebviewActionButton>
+                  <NativeWebviewActionButton onClick={openCurrentExternally} type="button">
+                    <OpenInNew aria-hidden="true" />
+                    <span>Open External</span>
+                  </NativeWebviewActionButton>
+                </NativeWebviewActions>
+              </NativeWebviewFallback>
+            ) : null}
           </NativeWebviewBackdrop>
         ) : (
           <WebFrame
@@ -691,6 +767,11 @@ const WebHostPill = styled.div`
     color: var(--web-green);
   }
 
+  &[data-status="error"] {
+    border-color: rgba(255, 155, 155, 0.28);
+    color: var(--web-danger);
+  }
+
   svg {
     flex: 0 0 auto;
     width: 16px;
@@ -741,9 +822,65 @@ const NativeWebviewBackdrop = styled.div`
     color: var(--web-blue);
   }
 
+  &[data-status="error"] {
+    color: var(--web-danger);
+  }
+
   svg {
     width: 32px;
     height: 32px;
+  }
+`;
+
+const NativeWebviewFallback = styled.div`
+  display: grid;
+  width: min(420px, calc(100% - 32px));
+  justify-items: center;
+  gap: 12px;
+  color: var(--web-muted);
+  text-align: center;
+
+  small {
+    color: var(--web-muted);
+    font-size: 12px;
+    font-weight: 680;
+    line-height: 1.45;
+  }
+`;
+
+const NativeWebviewActions = styled.div`
+  display: inline-flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+`;
+
+const NativeWebviewActionButton = styled.button`
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 11px;
+  border: 1px solid var(--web-border);
+  border-radius: 7px;
+  color: var(--web-text);
+  background: var(--web-panel-strong);
+  font-size: 12px;
+  font-weight: 760;
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  &:hover {
+    border-color: rgba(104, 163, 255, 0.34);
+    color: #ffffff;
+    background: rgba(104, 163, 255, 0.1);
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: var(--web-text);
   }
 `;
 

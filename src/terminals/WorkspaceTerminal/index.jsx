@@ -2061,6 +2061,7 @@ function WorkspaceTerminal({
   onToggleFullscreenTerminal,
   onPopOutTerminalWindow,
   prewarmShell = false,
+  permissionMode = "",
   startupReady = true,
   showDockedDragHandle = false,
   terminalBreakoutActive = false,
@@ -5722,6 +5723,7 @@ function WorkspaceTerminal({
       : { effort: "", speed: "" };
     const startupThreadProviderEffort = startupThreadProviderLaunch.effort || "";
     const startupThreadProviderSpeed = startupThreadProviderLaunch.speed || "";
+    const startupPermissionMode = isGenericTerminal ? "" : String(permissionMode || "").trim();
     const startupThreadId = terminalThreadIdRef.current;
     const startupSlotKey = forceFreshSessionForThisStart
       ? String(Math.max(0, Number.parseInt(terminalIndex, 10) || 0) + 1)
@@ -13397,6 +13399,7 @@ function WorkspaceTerminal({
               model: startupThreadProviderModel,
               reasoningEffort: startupThreadProviderEffort,
               speed: startupThreadProviderSpeed,
+              permissionMode: startupPermissionMode,
               plainShell: isGenericTerminal,
               preserveCoordinationSession: preserveCoordinationForThisStart,
               sessionMode: sessionModeForThisStart,
@@ -13509,6 +13512,7 @@ function WorkspaceTerminal({
           startupThreadProviderModelSource,
           startupThreadProviderEffort,
           startupThreadProviderSpeed,
+          startupPermissionMode,
           startupThreadId: startupThreadId || "",
           startupThreadProviderSessionPresent: Boolean(startupThreadProviderSessionId),
           backendProviderSessionPresent: Boolean(openedProviderSessionId),
@@ -13594,6 +13598,7 @@ function WorkspaceTerminal({
           needsAgentStart: shouldPrewarmShell,
           paneId,
           providerSessionId: openedProviderSessionId || openedNativeSessionId || startupThreadProviderSessionId,
+          permissionMode: startupPermissionMode,
           ready: true,
           reasoningEffort: startupThreadProviderEffort,
           speed: startupThreadProviderSpeed,
@@ -13821,6 +13826,7 @@ function WorkspaceTerminal({
         instanceId: terminalInstanceId,
         paneId,
         providerSessionId: startupThreadProviderSessionId,
+        permissionMode: String(permissionMode || "").trim(),
         ready: false,
         terminalIndex,
         threadId: startupThreadId,

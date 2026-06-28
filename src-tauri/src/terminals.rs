@@ -5,6 +5,9 @@ fn terminal_now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+const TERMINAL_STARTING_IDLE_BUFFER_MS: u64 = 5_000;
+const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
+
 #[cfg(windows)]
 fn terminal_windows_build_number() -> Option<u32> {
     use windows_sys::Wdk::System::SystemServices::RtlGetVersion;
@@ -144,6 +147,7 @@ struct TerminalProviderLaunchOptions {
     model: Option<String>,
     reasoning_effort: Option<String>,
     speed: Option<String>,
+    permission_mode: Option<String>,
 }
 
 #[derive(Clone, Default)]
@@ -152,6 +156,7 @@ struct TerminalProviderResolvedLaunchOptions {
     model_source: Option<String>,
     reasoning_effort: Option<String>,
     speed: Option<String>,
+    permission_mode: Option<String>,
 }
 
 fn terminal_normalize_launch_keyword(value: Option<String>) -> Option<String> {
@@ -412,6 +417,36 @@ fn terminal_runtime_apply_activity_payload(
         *runtime = snapshot.clone();
     }
     snapshot
+}
+
+fn terminal_runtime_snapshot_is_starting(runtime: &TerminalRuntimeSnapshot) -> bool {
+    matches!(
+        terminal_projection_text(&runtime.status, "").as_str(),
+        "starting" | "prewarmed"
+    ) || matches!(
+        terminal_projection_text(&runtime.activity_status, "").as_str(),
+        "starting" | "prewarmed"
+    ) || terminal_projection_text(&runtime.command_phase, "") == "starting"
+}
+
+fn terminal_runtime_startup_idle_fingerprint(runtime: &TerminalRuntimeSnapshot) -> Value {
+    json!({
+        "status": runtime.status,
+        "activity_status": runtime.activity_status,
+        "command_phase": runtime.command_phase,
+        "input_ready": runtime.input_ready,
+        "input_ready_at": runtime.input_ready_at,
+        "prompt_ready_at": runtime.prompt_ready_at,
+        "completed_at": runtime.completed_at,
+        "provider_session_id": runtime.provider_session_id,
+        "native_session_id": runtime.native_session_id,
+        "provider_turn_id": runtime.provider_turn_id,
+        "turn_id": runtime.turn_id,
+        "source": runtime.source,
+        "event_type": runtime.event_type,
+        "hook_event_name": runtime.hook_event_name,
+        "updated_at_ms": runtime.updated_at_ms,
+    })
 }
 
 fn terminal_projection_text(value: &str, fallback: &str) -> String {
@@ -1117,6 +1152,8 @@ fn terminal_launch(
         resolved_launch.model.as_deref(),
         launch_options.speed,
     )?;
+    resolved_launch.permission_mode =
+        terminal_normalize_permission_mode(launch_options.permission_mode)?;
     terminal_append_provider_launch_args(provider, &mut args, &resolved_launch);
 
     Ok((
@@ -3884,11 +3921,13 @@ fn spawn_terminal_reader(
         if tail.is_empty() {
             return false;
         }
-        let text = String::from_utf8_lossy(&tail);
+        let start = tail.len().saturating_sub(TERMINAL_STARTUP_READY_SCAN_BYTES);
+        let text = String::from_utf8_lossy(&tail[start..]);
         let cleaned = cloud_mcp_clean_terminal_state_text(&text);
         !cleaned.is_empty()
             && !cloud_mcp_terminal_output_has_working_indicator(&cleaned)
-            && cloud_mcp_terminal_output_has_prompt_marker(&cleaned)
+            && (cloud_mcp_terminal_output_has_prompt_marker(&text)
+                || cloud_mcp_terminal_output_has_prompt_marker(&cleaned))
     }
 
     async fn observe_terminal_startup_prompt_ready(
@@ -5134,6 +5173,7 @@ async fn terminal_open(
         model: request.model,
         reasoning_effort: request.reasoning_effort,
         speed: request.speed,
+        permission_mode: request.permission_mode,
     };
     let plain_shell =
         terminal_request_is_plain_shell(&kind, provider.as_deref(), request.plain_shell);
@@ -5426,6 +5466,7 @@ async fn terminal_open(
             launch_provider_id,
             &args,
             terminal_coordination.as_ref(),
+            resolved_launch.permission_mode.as_deref(),
             &pane_id,
             instance_id,
         );
@@ -5477,6 +5518,7 @@ async fn terminal_open(
             launch_provider_id,
             &launch_env_vars,
             terminal_coordination.as_ref(),
+            resolved_launch.permission_mode.as_deref(),
         )?;
 
         let warm_pty = match create_agent_terminal_pty(
@@ -6151,6 +6193,7 @@ async fn terminal_start_agent(
         definition.id,
         &args,
         instance.coordination.as_ref(),
+        launch.permission_mode.as_deref(),
         &pane_id,
         instance.id,
     );
@@ -6194,6 +6237,7 @@ async fn terminal_start_agent(
         definition.id,
         &launch_env_vars,
         instance.coordination.as_ref(),
+        launch.permission_mode.as_deref(),
     )?;
     let input = terminal_agent_start_input_with_env_in_directory(
         &command_path,
@@ -6386,6 +6430,20 @@ async fn start_terminal_agent_in_prepared_pty(
             };
         }
     };
+    resolved_launch.permission_mode = match terminal_normalize_permission_mode(request.permission_mode) {
+        Ok(permission_mode) => permission_mode,
+        Err(error) => {
+            return TerminalStartAgentPaneResult {
+                pane_id,
+                instance_id,
+                model: None,
+                model_source: None,
+                started: false,
+                skipped: true,
+                message: error,
+            };
+        }
+    };
     terminal_append_provider_launch_args(provider, &mut args, &resolved_launch);
 
     if instance_id.is_some_and(|expected_id| expected_id != instance.id) {
@@ -6458,6 +6516,7 @@ async fn start_terminal_agent_in_prepared_pty(
             definition.id,
             &args,
             instance.coordination.as_ref(),
+            resolved_launch.permission_mode.as_deref(),
             &pane_id,
             instance.id,
         );
@@ -6609,6 +6668,7 @@ async fn start_terminal_agent_in_prepared_pty(
             definition.id,
             &launch_env_vars,
             instance.coordination.as_ref(),
+            resolved_launch.permission_mode.as_deref(),
         ) {
             Ok(env_vars) => env_vars,
             Err(error) => {
@@ -11122,55 +11182,50 @@ async fn handle_terminal_activity_hook_event(
     Ok(())
 }
 
-async fn process_terminal_activity_hook_event(
+fn terminal_activity_hook_startup_idle_candidate(event: &Value) -> bool {
+    terminal_activity_hook_bool(
+        event,
+        &[
+            "startupIdleCandidate",
+            "startup_idle_candidate",
+            "sessionIdleWithoutPrompt",
+            "session_idle_without_prompt",
+        ],
+    )
+}
+
+fn terminal_activity_hook_startup_idle_buffered(event: &Value) -> bool {
+    terminal_activity_hook_bool(
+        event,
+        &[
+            "startupIdleBuffered",
+            "startup_idle_buffered",
+            "startingIdleBuffered",
+            "starting_idle_buffered",
+        ],
+    )
+}
+
+fn terminal_activity_payload_is_idle_ready(payload: &TerminalActivityHookPayload) -> bool {
+    payload.input_ready
+        && (terminal_projection_state_is_idle(&payload.activity_status)
+            || terminal_projection_state_is_idle(&payload.status)
+            || matches!(
+                terminal_projection_text(&payload.command_phase, "").as_str(),
+                "completed" | "complete" | "done"
+            ))
+}
+
+fn apply_terminal_activity_hook_payload(
     app: &AppHandle,
     terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
     cloud_mcp_state: &CloudMcpState,
-    pane_id: &str,
-    instance_id: u64,
     instance: &TerminalInstance,
     event: &Value,
+    payload: TerminalActivityHookPayload,
+    architecture_payload: Option<TerminalArchitectureActivityPayload>,
     source: &str,
 ) {
-    let architecture_payload = terminal_architecture_activity_payload(instance, event);
-    let Some(payload) = terminal_activity_hook_payload(instance, event) else {
-        if let Some(payload) = architecture_payload {
-            let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
-        }
-        let hook_event_name = terminal_activity_hook_string(
-            event,
-            &[
-                "hookEventName",
-                "hook_event_name",
-                "eventName",
-                "event_name",
-            ],
-        )
-        .unwrap_or_default();
-        if terminal_activity_hook_non_lifecycle_is_expected(&hook_event_name) {
-            return;
-        }
-        let event_keys = event
-            .as_object()
-            .map(|object| object.keys().take(16).cloned().collect::<Vec<_>>())
-            .unwrap_or_default();
-        log_terminal_status_event(
-            "backend.terminal_activity_hook.unmapped",
-            json!({
-                "event_keys": event_keys,
-                "hook_event_name": clean_terminal_diagnostic_log_text(&hook_event_name),
-                "instance_id": instance_id,
-                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                "reason": if hook_event_name.is_empty() {
-                    "missing_hook_event_name"
-                } else {
-                    "unsupported_hook_event_name"
-                },
-                "source": source,
-            }),
-        );
-        return;
-    };
     let runtime_snapshot = terminal_runtime_apply_activity_payload(instance, &payload);
     log_terminal_status_event(
         "backend.terminal_activity_hook.lifecycle",
@@ -11235,6 +11290,149 @@ async fn process_terminal_activity_hook_event(
     if let Some(payload) = architecture_payload {
         let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
     }
+}
+
+async fn process_terminal_activity_hook_event(
+    app: &AppHandle,
+    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    cloud_mcp_state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    instance: &TerminalInstance,
+    event: &Value,
+    source: &str,
+) {
+    let architecture_payload = terminal_architecture_activity_payload(instance, event);
+    let Some(payload) = terminal_activity_hook_payload(instance, event) else {
+        if let Some(payload) = architecture_payload {
+            let _ = app.emit(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, payload);
+        }
+        let hook_event_name = terminal_activity_hook_string(
+            event,
+            &[
+                "hookEventName",
+                "hook_event_name",
+                "eventName",
+                "event_name",
+            ],
+        )
+        .unwrap_or_default();
+        if terminal_activity_hook_non_lifecycle_is_expected(&hook_event_name) {
+            return;
+        }
+        let event_keys = event
+            .as_object()
+            .map(|object| object.keys().take(16).cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.unmapped",
+            json!({
+                "event_keys": event_keys,
+                "hook_event_name": clean_terminal_diagnostic_log_text(&hook_event_name),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "reason": if hook_event_name.is_empty() {
+                    "missing_hook_event_name"
+                } else {
+                    "unsupported_hook_event_name"
+                },
+                "source": source,
+            }),
+        );
+        return;
+    };
+    let current_runtime = terminal_runtime_snapshot(instance);
+    let current_runtime_is_starting = terminal_runtime_snapshot_is_starting(&current_runtime);
+    if terminal_activity_hook_startup_idle_candidate(event) && !current_runtime_is_starting {
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.startup_idle_candidate_ignored",
+            json!({
+                "hook_event_name": payload.hook_event_name.clone(),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "reason": "runtime_not_starting",
+                "source": source,
+            }),
+        );
+        return;
+    }
+    if !terminal_activity_hook_startup_idle_buffered(event)
+        && current_runtime_is_starting
+        && terminal_activity_payload_is_idle_ready(&payload)
+    {
+        let scheduled_runtime_fingerprint =
+            terminal_runtime_startup_idle_fingerprint(&current_runtime);
+        let app = app.clone();
+        let terminals = Arc::clone(terminals);
+        let cloud_mcp_state = cloud_mcp_state.clone();
+        let pane_id = pane_id.to_string();
+        let mut buffered_event = event.clone();
+        if let Some(object) = buffered_event.as_object_mut() {
+            object.insert("startupIdleBuffered".to_string(), json!(true));
+        }
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.startup_idle_buffered",
+            json!({
+                "buffer_ms": TERMINAL_STARTING_IDLE_BUFFER_MS,
+                "hook_event_name": payload.hook_event_name.clone(),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "source": source,
+            }),
+        );
+        tauri::async_runtime::spawn(async move {
+            sleep(Duration::from_millis(TERMINAL_STARTING_IDLE_BUFFER_MS)).await;
+            let Some(current_instance) =
+                terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
+            else {
+                return;
+            };
+            let runtime = terminal_runtime_snapshot(&current_instance);
+            if !terminal_runtime_snapshot_is_starting(&runtime)
+                || runtime.input_ready
+                || terminal_runtime_startup_idle_fingerprint(&runtime)
+                    != scheduled_runtime_fingerprint
+            {
+                log_terminal_status_event(
+                    "backend.terminal_activity_hook.startup_idle_buffer_cancelled",
+                    json!({
+                        "instance_id": instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "reason": "runtime_changed",
+                    }),
+                );
+                return;
+            }
+            let Some(delayed_payload) =
+                terminal_activity_hook_payload(&current_instance, &buffered_event)
+            else {
+                return;
+            };
+            let delayed_architecture_payload =
+                terminal_architecture_activity_payload(&current_instance, &buffered_event);
+            apply_terminal_activity_hook_payload(
+                &app,
+                &terminals,
+                &cloud_mcp_state,
+                &current_instance,
+                &buffered_event,
+                delayed_payload,
+                delayed_architecture_payload,
+                "startup-idle-buffer",
+            );
+        });
+        return;
+    }
+    apply_terminal_activity_hook_payload(
+        app,
+        terminals,
+        cloud_mcp_state,
+        instance,
+        event,
+        payload,
+        architecture_payload,
+        source,
+    );
 }
 
 fn spawn_terminal_activity_hook_watcher(
@@ -16194,6 +16392,7 @@ mod terminal_tests {
             "codex",
             &["--model".to_string(), "gpt-5.2".to_string()],
             Some(&coordination),
+            None,
             "pane-auto",
             42,
         );
@@ -16209,7 +16408,9 @@ mod terminal_tests {
         assert!(!args
             .iter()
             .any(|arg| arg == "--dangerously-bypass-hook-trust"));
-        assert!(!args.iter().any(|arg| arg == "--sandbox"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "workspace-write"]));
         assert!(!args.iter().any(|arg| arg == "--cd"));
         assert!(args
             .iter()
@@ -16277,6 +16478,7 @@ mod terminal_tests {
             "codex",
             &[],
             Some(&coordination),
+            None,
             "pane-auto",
             42,
         );
@@ -16448,6 +16650,7 @@ mod terminal_tests {
             "codex",
             &["--model".to_string(), "gpt-5.2".to_string()],
             Some(&coordination),
+            None,
             "pane-auto",
             42,
         );
@@ -16533,12 +16736,12 @@ mod terminal_tests {
                 "--dangerously-skip-permissions".to_string(),
             ],
             Some(&coordination),
+            None,
             "pane-auto",
             42,
         );
 
-        assert!(args.windows(2).any(|pair| pair == ["--add-dir", "/"]));
-        assert!(!args
+        assert!(args
             .windows(2)
             .any(|pair| pair == ["--add-dir", coordination.repo_path.as_str()]));
         assert!(!args
@@ -16570,13 +16773,13 @@ mod terminal_tests {
         }
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed == "Edit(//**)"));
+            .any(|allowed| allowed == format!("Edit({}/**)", coordination.repo_path)));
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed == "Write(//**)"));
+            .any(|allowed| allowed == format!("Write({}/**)", coordination.repo_path)));
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed == "NotebookEdit(//**)"));
+            .any(|allowed| allowed == format!("NotebookEdit({}/**)", coordination.repo_path)));
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Bash"));
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Write"));
         let mcp_config = args
@@ -16629,7 +16832,7 @@ mod terminal_tests {
         );
         assert_eq!(
             settings["sandbox"]["filesystem"]["allowWrite"][0].as_str(),
-            Some("/")
+            Some(coordination.repo_path.as_str())
         );
         let hook_commands = settings["hooks"]["PreToolUse"]
             .as_array()
@@ -16656,7 +16859,7 @@ mod terminal_tests {
     }
 
     #[test]
-    fn coordinated_claude_direct_edit_allows_full_filesystem_edits() {
+    fn coordinated_claude_direct_edit_scopes_edits_to_workspace() {
         let direct_root = terminal_test_directory("claude_direct_edit_args");
         let direct_root_text = direct_root.display().to_string();
         let mut coordination = terminal_test_coordination("claude_direct_edit_kernel");
@@ -16681,12 +16884,12 @@ mod terminal_tests {
                 "bypassPermissions".to_string(),
             ],
             Some(&coordination),
+            None,
             "pane-direct",
             43,
         );
 
-        assert!(args.windows(2).any(|pair| pair == ["--add-dir", "/"]));
-        assert!(!args
+        assert!(args
             .windows(2)
             .any(|pair| pair == ["--add-dir", direct_root_text.as_str()]));
         assert!(args
@@ -16709,7 +16912,7 @@ mod terminal_tests {
                 .is_some_and(|hooks| !hooks.is_empty())));
         assert_eq!(
             settings["sandbox"]["filesystem"]["allowWrite"][0].as_str(),
-            Some("/")
+            Some(direct_root_text.as_str())
         );
         assert!(!settings_arg.contains("--diff-forge-write-guard"));
         let allowed_tools = args
@@ -16721,18 +16924,18 @@ mod terminal_tests {
             .unwrap();
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed == "Edit(//**)"));
+            .any(|allowed| allowed == format!("Edit({direct_root_text}/**)")));
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed == "Write(//**)"));
+            .any(|allowed| allowed == format!("Write({direct_root_text}/**)")));
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed == "NotebookEdit(//**)"));
+            .any(|allowed| allowed == format!("NotebookEdit({direct_root_text}/**)")));
         assert!(!allowed_tools.split(',').any(|allowed| allowed == "Bash"));
     }
 
     #[test]
-    fn coordinated_claude_general_worker_allows_full_filesystem_edits() {
+    fn coordinated_claude_general_worker_scopes_edits_to_workspace() {
         let mut coordination = terminal_test_coordination("claude_general_worker_args");
         let repo = PathBuf::from(&coordination.repo_path);
         fs::write(repo.join("README.md"), "initial\n").unwrap();
@@ -16774,12 +16977,12 @@ mod terminal_tests {
                 "bypassPermissions".to_string(),
             ],
             Some(&coordination),
+            None,
             "pane-general",
             44,
         );
 
-        assert!(args.windows(2).any(|pair| pair == ["--add-dir", "/"]));
-        assert!(!args
+        assert!(args
             .windows(2)
             .any(|pair| pair == ["--add-dir", repo_text.as_str()]));
         assert!(!args
@@ -16799,7 +17002,7 @@ mod terminal_tests {
         let settings: Value = serde_json::from_str(settings_arg).unwrap();
         assert_eq!(
             settings["sandbox"]["filesystem"]["allowWrite"][0].as_str(),
-            Some("/")
+            Some(repo_text.as_str())
         );
         let allowed_tools = args
             .windows(2)
@@ -16810,16 +17013,13 @@ mod terminal_tests {
             .unwrap();
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed == "Edit(//**)"));
+            .any(|allowed| allowed == format!("Edit({repo_text}/**)")));
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed == "Write(//**)"));
+            .any(|allowed| allowed == format!("Write({repo_text}/**)")));
         assert!(allowed_tools
             .split(',')
-            .any(|allowed| allowed == "NotebookEdit(//**)"));
-        assert!(!allowed_tools
-            .split(',')
-            .any(|allowed| allowed.contains(&format!("{}/**", repo_text))));
+            .any(|allowed| allowed == format!("NotebookEdit({repo_text}/**)")));
     }
 
     #[test]
@@ -17542,6 +17742,7 @@ mod terminal_tests {
             "codex",
             &["--model".to_string(), "gpt-5.4".to_string()],
             None,
+            None,
             "pane-auto",
             42,
         );
@@ -17555,6 +17756,7 @@ mod terminal_tests {
         let args = terminal_args_with_codex_mcp_identity(
             "codex",
             &["--disable".to_string(), "apps".to_string()],
+            None,
             None,
             "pane-auto",
             42,
@@ -17580,6 +17782,7 @@ mod terminal_tests {
                 "apps".to_string(),
             ],
             Some(&coordination),
+            None,
             "pane-auto",
             42,
         );
@@ -17651,7 +17854,7 @@ mod terminal_tests {
 
     #[test]
     fn opencode_coordination_config_registers_activity_plugin() {
-        let env_vars = terminal_env_vars_with_opencode_coordination_config("opencode", &[], None)
+        let env_vars = terminal_env_vars_with_opencode_coordination_config("opencode", &[], None, None)
             .expect("opencode config injection should succeed");
 
         // The activity-hook binary must be advertised to the plugin.
@@ -17687,6 +17890,7 @@ mod terminal_tests {
         let env_vars = terminal_env_vars_with_opencode_coordination_config(
             "claude",
             &[("COORDINATION_ENABLED".to_string(), "1".to_string())],
+            None,
             None,
         )
         .unwrap();
@@ -17760,6 +17964,7 @@ mod terminal_tests {
             "codex",
             &base,
             Some(&coordination),
+            None,
             "pane-auto",
             42,
         );
@@ -17798,14 +18003,14 @@ mod terminal_tests {
             .any(|arg| arg == "--dangerously-bypass-hook-trust"));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--sandbox", "danger-full-access"]));
+            .any(|pair| pair == ["--sandbox", "workspace-write"]));
         assert!(!args
             .windows(2)
             .any(|pair| pair == ["--cd", "/tmp/custom-cwd"]));
     }
 
     #[test]
-    fn coordinated_codex_activity_launch_uses_full_filesystem_access() {
+    fn coordinated_codex_activity_launch_uses_workspace_write_access() {
         let mut coordination = terminal_test_coordination("codex_activity_args");
         coordination.env_vars.push((
             "COORDINATION_AGENT_BRANCH_ROOT".to_string(),
@@ -17828,6 +18033,7 @@ mod terminal_tests {
             "codex",
             &["--model".to_string(), "gpt-5.4".to_string()],
             Some(&coordination),
+            None,
             "pane-activity",
             7,
         );
@@ -17841,6 +18047,162 @@ mod terminal_tests {
         assert!(args.windows(2).any(|pair| pair == ["--enable", "hooks"]));
         assert!(args
             .windows(2)
-            .any(|pair| pair == ["--sandbox", "danger-full-access"]));
+            .any(|pair| pair == ["--sandbox", "workspace-write"]));
+    }
+
+    #[test]
+    fn coordinated_codex_permission_modes_map_to_launch_flags() {
+        let coordination = terminal_test_coordination("codex_permission_modes");
+        let launch_args = |mode: Option<&str>| {
+            terminal_args_with_codex_mcp_identity(
+                "codex",
+                &[
+                    "--ask-for-approval".to_string(),
+                    "on-request".to_string(),
+                    "--sandbox".to_string(),
+                    "read-only".to_string(),
+                    "--dangerously-bypass-approvals-and-sandbox".to_string(),
+                ],
+                Some(&coordination),
+                mode,
+                "pane-permissions",
+                11,
+            )
+        };
+
+        let plan_args = launch_args(Some("plan"));
+        assert!(plan_args
+            .windows(2)
+            .any(|pair| pair == ["--ask-for-approval", "never"]));
+        assert!(plan_args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "read-only"]));
+        assert!(!plan_args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+
+        let ask_args = launch_args(Some("ask"));
+        assert!(ask_args
+            .windows(2)
+            .any(|pair| pair == ["--ask-for-approval", "on-request"]));
+        assert!(ask_args
+            .windows(2)
+            .any(|pair| pair == ["--sandbox", "workspace-write"]));
+
+        let bypass_args = launch_args(Some("bypass"));
+        assert!(bypass_args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!bypass_args
+            .iter()
+            .any(|arg| arg == "--ask-for-approval" || arg == "--sandbox"));
+    }
+
+    #[test]
+    fn coordinated_claude_permission_modes_scope_workspace_authority() {
+        let coordination = terminal_test_coordination("claude_permission_modes");
+        let launch_args = |mode: Option<&str>| {
+            terminal_args_with_codex_mcp_identity(
+                "claude",
+                &[
+                    "--allowedTools".to_string(),
+                    "Write,Bash".to_string(),
+                    "--permission-mode".to_string(),
+                    "bypassPermissions".to_string(),
+                ],
+                Some(&coordination),
+                mode,
+                "pane-permissions",
+                12,
+            )
+        };
+
+        let workspace_glob = format!("{}/**", coordination.repo_path);
+        let plan_args = launch_args(Some("plan"));
+        let plan_tools = plan_args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--allowedTools").then_some(pair[1].as_str()))
+            .unwrap();
+        assert!(plan_args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "plan"]));
+        assert!(!plan_tools.contains("Write("));
+        let plan_settings: Value = serde_json::from_str(
+            plan_args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--settings").then_some(pair[1].as_str()))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(plan_settings["permissions"]["allow"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            plan_settings["sandbox"]["filesystem"]["allowWrite"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
+
+        let accept_args = launch_args(Some("accept_edits"));
+        let accept_tools = accept_args
+            .windows(2)
+            .find_map(|pair| (pair[0] == "--allowedTools").then_some(pair[1].as_str()))
+            .unwrap();
+        assert!(accept_args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "acceptEdits"]));
+        assert!(accept_tools.contains(&format!("Write({workspace_glob})")));
+        assert!(accept_tools.contains(&format!("Edit({workspace_glob})")));
+
+        let bypass_args = launch_args(Some("bypass"));
+        assert!(bypass_args
+            .windows(2)
+            .any(|pair| pair == ["--permission-mode", "bypassPermissions"]));
+        assert!(!bypass_args.iter().any(|arg| arg == "--allowedTools"));
+        let bypass_settings: Value = serde_json::from_str(
+            bypass_args
+                .windows(2)
+                .find_map(|pair| (pair[0] == "--settings").then_some(pair[1].as_str()))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            bypass_settings["disableBypassPermissionsMode"].as_str(),
+            Some("allow")
+        );
+    }
+
+    #[test]
+    fn coordinated_opencode_permission_modes_map_to_inline_config() {
+        let coordination = terminal_test_coordination("opencode_permission_modes");
+        let permission_for = |mode: Option<&str>| -> Value {
+            let env_vars =
+                terminal_env_vars_with_opencode_coordination_config("opencode", &[], Some(&coordination), mode)
+                    .expect("opencode coordination config should be generated");
+            let config_text = env_vars
+                .iter()
+                .rev()
+                .find_map(|(key, value)| (key == "OPENCODE_CONFIG_CONTENT").then_some(value))
+                .expect("inline opencode config should be set");
+            serde_json::from_str::<Value>(config_text).unwrap()["permission"].clone()
+        };
+
+        assert_eq!(permission_for(Some("plan"))["edit"].as_str(), Some("deny"));
+        assert_eq!(permission_for(Some("plan"))["bash"].as_str(), Some("deny"));
+        assert_eq!(permission_for(Some("ask"))["edit"].as_str(), Some("ask"));
+        assert_eq!(permission_for(Some("ask"))["external_directory"].as_str(), Some("ask"));
+        assert_eq!(
+            permission_for(Some("accept_edits"))["edit"].as_str(),
+            Some("allow")
+        );
+        assert_eq!(
+            permission_for(Some("accept_edits"))["external_directory"].as_str(),
+            Some("deny")
+        );
+        assert_eq!(permission_for(Some("bypass"))["bash"].as_str(), Some("allow"));
+        assert_eq!(
+            permission_for(Some("bypass"))["external_directory"].as_str(),
+            Some("allow")
+        );
     }
 }

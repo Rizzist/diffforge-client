@@ -89,16 +89,10 @@ fn workspace_webview_open(
     )
     .accept_first_mouse(true)
     .disable_drag_drop_handler()
-    .on_page_load(move |webview, payload| {
+    .on_page_load(move |_webview, payload| {
         let event_name = match payload.event() {
-            tauri::webview::PageLoadEvent::Started => {
-                let _ = webview.hide();
-                "started"
-            }
-            tauri::webview::PageLoadEvent::Finished => {
-                let _ = webview.show();
-                "finished"
-            }
+            tauri::webview::PageLoadEvent::Started => "started",
+            tauri::webview::PageLoadEvent::Finished => "finished",
         };
         let _ = event_app.emit(
             "workspace-webview-load",

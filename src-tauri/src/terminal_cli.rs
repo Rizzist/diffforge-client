@@ -672,6 +672,7 @@ fn terminal_args_with_codex_mcp_identity(
     provider_id: &str,
     args: &[String],
     coordination: Option<&TerminalCoordinationSession>,
+    permission_mode: Option<&str>,
     _pane_id: &str,
     _instance_id: u64,
 ) -> Vec<String> {
@@ -708,6 +709,7 @@ fn terminal_args_with_codex_mcp_identity(
             &mut next,
             codex_profile.as_deref(),
             codex_bypass_hook_trust,
+            permission_mode,
         );
 
         append_codex_mcp_server_config_args(
@@ -744,7 +746,12 @@ fn terminal_args_with_codex_mcp_identity(
         next.push("shell_environment_policy.inherit=all".to_string());
     }
     if is_claude {
-        apply_claude_coordinated_auto_approval_args(&mut next, coordination, &coordination_args);
+        apply_claude_coordinated_auto_approval_args(
+            &mut next,
+            coordination,
+            &coordination_args,
+            permission_mode,
+        );
     }
     next
 }
@@ -1220,6 +1227,36 @@ fn terminal_workspace_gateway_args_from_coordination_args(args: &[String]) -> Ve
     gateway_args
 }
 
+const TERMINAL_PERMISSION_MODE_PLAN: &str = "plan";
+const TERMINAL_PERMISSION_MODE_ASK: &str = "ask";
+const TERMINAL_PERMISSION_MODE_ACCEPT_EDITS: &str = "accept_edits";
+const TERMINAL_PERMISSION_MODE_BYPASS: &str = "bypass";
+
+fn terminal_normalize_permission_mode(value: Option<String>) -> Result<Option<String>, String> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let mode = value
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_");
+    if mode.is_empty() || mode == "default" {
+        return Ok(None);
+    }
+
+    let normalized = match mode.as_str() {
+        "plan" | "plan_mode" => TERMINAL_PERMISSION_MODE_PLAN,
+        "ask" | "ask_each" | "ask_each_time" | "default" => TERMINAL_PERMISSION_MODE_ASK,
+        "accept" | "accept_edit" | "accept_edits" | "acceptedits" => {
+            TERMINAL_PERMISSION_MODE_ACCEPT_EDITS
+        }
+        "bypass" | "bypass_permissions" | "bypasspermissions" => TERMINAL_PERMISSION_MODE_BYPASS,
+        _ => return Err("Agent permission mode is invalid.".to_string()),
+    };
+
+    Ok(Some(normalized.to_string()))
+}
+
 fn terminal_coordination_env_value(
     coordination: &TerminalCoordinationSession,
     key: &str,
@@ -1233,8 +1270,25 @@ fn terminal_full_filesystem_root() -> &'static str {
     "/"
 }
 
-fn claude_all_files_permission_glob() -> &'static str {
-    "//**"
+fn claude_workspace_permission_root(coordination: &TerminalCoordinationSession) -> String {
+    let root = coordination.repo_path.trim();
+    if root.is_empty() {
+        terminal_full_filesystem_root().to_string()
+    } else {
+        root.to_string()
+    }
+}
+
+fn claude_workspace_permission_glob(coordination: &TerminalCoordinationSession) -> String {
+    let root = claude_workspace_permission_root(coordination)
+        .replace('\\', "/")
+        .trim_end_matches('/')
+        .to_string();
+    if root.is_empty() || root == "/" {
+        "//**".to_string()
+    } else {
+        format!("{root}/**")
+    }
 }
 
 fn apply_codex_terminal_display_args(args: &mut Vec<String>) {
@@ -1247,27 +1301,36 @@ fn apply_codex_coordinated_auto_approval_args(
     args: &mut Vec<String>,
     codex_profile: Option<&str>,
     bypass_hook_trust: bool,
+    permission_mode: Option<&str>,
 ) {
+    let permission_mode = permission_mode.unwrap_or(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS);
     strip_terminal_arg_option(args, "--ask-for-approval", "-a", true);
-    args.push("--ask-for-approval".to_string());
-    args.push("never".to_string());
     strip_terminal_arg_option(args, "--profile", "-p", true);
     if let Some(profile) = codex_profile.filter(|value| !value.trim().is_empty()) {
         args.insert(0, profile.to_string());
         args.insert(0, "--profile".to_string());
     }
 
-    // Coordinated Codex sessions should inherit the user's normal filesystem
-    // reach. Coordination records activity, but it no longer gates file IO.
     strip_terminal_arg_option(args, "--sandbox", "-s", true);
-    args.push("--sandbox".to_string());
-    args.push("danger-full-access".to_string());
     strip_terminal_arg_option(
         args,
         "--dangerously-bypass-approvals-and-sandbox",
         "",
         false,
     );
+    if permission_mode == TERMINAL_PERMISSION_MODE_BYPASS {
+        args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+    } else {
+        let (approval, sandbox) = match permission_mode {
+            TERMINAL_PERMISSION_MODE_PLAN => ("never", "read-only"),
+            TERMINAL_PERMISSION_MODE_ASK => ("on-request", "workspace-write"),
+            _ => ("never", "workspace-write"),
+        };
+        args.push("--ask-for-approval".to_string());
+        args.push(approval.to_string());
+        args.push("--sandbox".to_string());
+        args.push(sandbox.to_string());
+    }
     strip_terminal_arg_option(args, "--dangerously-bypass-hook-trust", "", false);
     strip_terminal_arg_option_value(args, "--enable", "", "apps");
     strip_terminal_arg_option_value(args, "--disable", "", "apps");
@@ -1351,18 +1414,22 @@ fn apply_claude_coordinated_auto_approval_args(
     args: &mut Vec<String>,
     coordination: &TerminalCoordinationSession,
     coordination_args: &[String],
+    permission_mode: Option<&str>,
 ) {
+    let permission_mode = permission_mode.unwrap_or(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS);
     strip_terminal_arg_option(args, "--dangerously-skip-permissions", "", false);
     strip_terminal_arg_option(args, "--allow-dangerously-skip-permissions", "", false);
 
     strip_terminal_arg_option(args, "--add-dir", "", true);
     args.push("--add-dir".to_string());
-    args.push(terminal_full_filesystem_root().to_string());
+    args.push(claude_workspace_permission_root(coordination));
 
     strip_terminal_arg_option(args, "--allowedTools", "", true);
     strip_terminal_arg_option(args, "--allowed-tools", "", true);
-    args.push("--allowedTools".to_string());
-    args.push(claude_auto_approved_tools_arg(coordination));
+    if permission_mode != TERMINAL_PERMISSION_MODE_BYPASS {
+        args.push("--allowedTools".to_string());
+        args.push(claude_allowed_tools_arg(coordination, permission_mode));
+    }
 
     strip_terminal_arg_option(args, "--mcp-config", "", true);
     args.push("--mcp-config".to_string());
@@ -1373,11 +1440,14 @@ fn apply_claude_coordinated_auto_approval_args(
 
     strip_terminal_arg_option(args, "--permission-mode", "", true);
     args.push("--permission-mode".to_string());
-    args.push("acceptEdits".to_string());
+    args.push(claude_permission_mode_arg(permission_mode).to_string());
 
     strip_terminal_arg_option(args, "--settings", "", true);
     args.push("--settings".to_string());
-    args.push(claude_write_authority_guard_settings(coordination));
+    args.push(claude_write_authority_guard_settings(
+        coordination,
+        permission_mode,
+    ));
 
     strip_terminal_arg_option(args, "--setting-sources", "", true);
 
@@ -1392,15 +1462,29 @@ fn apply_claude_managed_mcp_isolation_args(args: &mut Vec<String>) {
     }
 }
 
-fn claude_auto_approved_tools_arg(coordination: &TerminalCoordinationSession) -> String {
+fn claude_permission_mode_arg(permission_mode: &str) -> &'static str {
+    match permission_mode {
+        TERMINAL_PERMISSION_MODE_PLAN => "plan",
+        TERMINAL_PERMISSION_MODE_ASK => "default",
+        TERMINAL_PERMISSION_MODE_BYPASS => "bypassPermissions",
+        _ => "acceptEdits",
+    }
+}
+
+fn claude_allowed_tools_arg(
+    coordination: &TerminalCoordinationSession,
+    permission_mode: &str,
+) -> String {
     let mut tools = ["Read", "Glob", "Grep", "LS"]
         .into_iter()
         .map(str::to_string)
         .collect::<Vec<_>>();
-    let all_files = claude_all_files_permission_glob();
-    tools.push(format!("Edit({all_files})"));
-    tools.push(format!("Write({all_files})"));
-    tools.push(format!("NotebookEdit({all_files})"));
+    if permission_mode == TERMINAL_PERMISSION_MODE_ACCEPT_EDITS {
+        let workspace_files = claude_workspace_permission_glob(coordination);
+        tools.push(format!("Edit({workspace_files})"));
+        tools.push(format!("Write({workspace_files})"));
+        tools.push(format!("NotebookEdit({workspace_files})"));
+    }
     tools.extend(
         crate::coordination::mcp::TOOL_NAMES
             .iter()
@@ -1434,21 +1518,32 @@ fn claude_auto_approved_tools_arg(coordination: &TerminalCoordinationSession) ->
     tools.join(",")
 }
 
-fn claude_write_authority_guard_settings(coordination: &TerminalCoordinationSession) -> String {
-    let all_files = claude_all_files_permission_glob();
-    let allowed_permissions = vec![
-        format!("Edit({all_files})"),
-        format!("Write({all_files})"),
-        format!("NotebookEdit({all_files})"),
-    ];
-    let sandbox_write_roots = vec![terminal_full_filesystem_root().to_string()];
+fn claude_write_authority_guard_settings(
+    coordination: &TerminalCoordinationSession,
+    permission_mode: &str,
+) -> String {
+    let workspace_files = claude_workspace_permission_glob(coordination);
+    let allowed_permissions = if permission_mode == TERMINAL_PERMISSION_MODE_ACCEPT_EDITS {
+        vec![
+            format!("Edit({workspace_files})"),
+            format!("Write({workspace_files})"),
+            format!("NotebookEdit({workspace_files})"),
+        ]
+    } else {
+        Vec::new()
+    };
+    let sandbox_write_roots = if permission_mode == TERMINAL_PERMISSION_MODE_PLAN {
+        Vec::new()
+    } else {
+        vec![claude_workspace_permission_root(coordination)]
+    };
     let activity_command = diff_forge_activity_hook_command(coordination, "claude");
     let deny_rules: Vec<String> = Vec::new();
 
     let mut settings = json!({
-        "disableBypassPermissionsMode": "disable",
+        "disableBypassPermissionsMode": if permission_mode == TERMINAL_PERMISSION_MODE_BYPASS { "allow" } else { "disable" },
         "permissions": {
-            "defaultMode": "acceptEdits",
+            "defaultMode": claude_permission_mode_arg(permission_mode),
             "allow": allowed_permissions,
             "deny": deny_rules
         },
@@ -2851,6 +2946,18 @@ fn diff_forge_activity_hook_record(
         "terminal_is_prompting_user",
         "terminalIsPromptingUser",
     ]);
+    let startup_idle_candidate = hook_bool(&[
+        "startupIdleCandidate",
+        "startup_idle_candidate",
+        "sessionIdleWithoutPrompt",
+        "session_idle_without_prompt",
+    ]);
+    let startup_idle_buffered = hook_bool(&[
+        "startupIdleBuffered",
+        "startup_idle_buffered",
+        "startingIdleBuffered",
+        "starting_idle_buffered",
+    ]);
     let plan_update = diff_forge_native_plan_update(&tool_name, tool_input, hook_input);
     json!({
         "timestampMs": current_time_ms(),
@@ -2892,6 +2999,12 @@ fn diff_forge_activity_hook_record(
         "requiresUserInput": requires_user_input,
         "promptingUser": prompting_user,
         "terminalIsPromptingUser": prompting_user,
+        "startupIdleCandidate": startup_idle_candidate,
+        "startup_idle_candidate": startup_idle_candidate,
+        "sessionIdleWithoutPrompt": startup_idle_candidate,
+        "session_idle_without_prompt": startup_idle_candidate,
+        "startupIdleBuffered": startup_idle_buffered,
+        "startup_idle_buffered": startup_idle_buffered,
         "description": if description.is_empty() { user_prompt } else { description },
     })
 }
@@ -2929,7 +3042,10 @@ mod terminal_cli_tests {
             env_vars: Vec::new(),
         };
 
-        let settings = claude_write_authority_guard_settings(&coordination);
+        let settings = claude_write_authority_guard_settings(
+            &coordination,
+            TERMINAL_PERMISSION_MODE_ACCEPT_EDITS,
+        );
 
         // Claude Code rejects unknown hook events with a startup settings
         // warning; keep this to Claude's documented event set.
@@ -3163,6 +3279,7 @@ mod terminal_cli_tests {
                 "transcriptPath": "/tmp/session.jsonl",
                 "userPrompt": "ship it",
                 "manualApprovalRequired": true,
+                "sessionIdleWithoutPrompt": true,
                 "approvalId": "approval-123",
                 "promptingUserKind": "approval",
                 "toolInput": {
@@ -3177,6 +3294,10 @@ mod terminal_cli_tests {
         assert_eq!(record["transcriptPath"], "/tmp/session.jsonl");
         assert_eq!(record["prompt"], "ship it");
         assert_eq!(record["manualApprovalRequired"], true);
+        assert_eq!(record["startupIdleCandidate"], true);
+        assert_eq!(record["startup_idle_candidate"], true);
+        assert_eq!(record["sessionIdleWithoutPrompt"], true);
+        assert_eq!(record["session_idle_without_prompt"], true);
         assert_eq!(record["approvalId"], "approval-123");
         assert_eq!(record["promptingUserKind"], "approval");
     }
@@ -3721,10 +3842,39 @@ export const DiffForgeActivityPlugin = async () => {
     event: async ({ event }) => {
       const type = (event && event.type) || "";
       const sessionId = eventSessionId(event);
+      const props = (event && event.properties) || {};
+      if (type === "message.updated" || type === "message.created") {
+        const message = props.message || props.info || {};
+        const role = String(message.role || message.type || "").toLowerCase();
+        if (role === "user") {
+          activeSessions.add(sessionId);
+          emit({
+            hook_event_name: "UserPromptSubmit",
+            session_id: sessionId,
+            prompt: pickText(message.parts || message.content || []),
+          });
+        }
+      }
+      if (type === "permission.asked") {
+        emit({
+          hook_event_name: "PermissionRequest",
+          session_id: sessionId,
+          manual_approval_required: true,
+          permission_request_id: props.id || props.permissionID || "",
+          tool_use_id: props.callID || props.toolCallID || "",
+          tool_name: props.type || props.tool || "",
+          description: props.title || props.description || "",
+        });
+      }
       if (type === "session.idle") {
-        if (!activeSessions.has(sessionId)) return;
+        const hadActiveSession = activeSessions.has(sessionId);
         activeSessions.delete(sessionId);
-        emit({ hook_event_name: "Stop", session_id: sessionId });
+        emit({
+          hook_event_name: "Stop",
+          session_id: sessionId,
+          startup_idle_candidate: !hadActiveSession,
+          session_idle_without_prompt: !hadActiveSession,
+        });
       } else if (type === "session.error") {
         activeSessions.delete(sessionId);
         emit({ hook_event_name: "StopFailure", session_id: sessionId });
@@ -3761,13 +3911,37 @@ fn ensure_diffforge_opencode_activity_plugin() -> Result<PathBuf, String> {
 // Claude's acceptEdits. OpenCode's `permission` schema is coarse, so allow the
 // edit/bash/webfetch/external-directory buckets the app drives. Plain
 // (non-managed) terminals never receive this.
+fn opencode_permission_value(permission_mode: Option<&str>) -> Value {
+    match permission_mode.unwrap_or(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS) {
+        TERMINAL_PERMISSION_MODE_PLAN => json!({
+            "edit": "deny",
+            "bash": "deny",
+            "webfetch": "ask",
+            "external_directory": "deny"
+        }),
+        TERMINAL_PERMISSION_MODE_ASK => json!({
+            "edit": "ask",
+            "bash": "ask",
+            "webfetch": "ask",
+            "external_directory": "ask"
+        }),
+        TERMINAL_PERMISSION_MODE_BYPASS => json!({
+            "edit": "allow",
+            "bash": "allow",
+            "webfetch": "allow",
+            "external_directory": "allow"
+        }),
+        _ => json!({
+            "edit": "allow",
+            "bash": "ask",
+            "webfetch": "ask",
+            "external_directory": "deny"
+        }),
+    }
+}
+
 fn opencode_auto_approval_permission_value() -> Value {
-    json!({
-        "edit": "allow",
-        "bash": "allow",
-        "webfetch": "allow",
-        "external_directory": "allow"
-    })
+    opencode_permission_value(Some(TERMINAL_PERMISSION_MODE_BYPASS))
 }
 
 fn diff_forge_opencode_activity_hook_bin(
@@ -3796,6 +3970,7 @@ fn terminal_env_vars_with_opencode_coordination_config(
     provider_id: &str,
     env_vars: &[(String, String)],
     coordination: Option<&TerminalCoordinationSession>,
+    permission_mode: Option<&str>,
 ) -> Result<Vec<(String, String)>, String> {
     let mut next = env_vars.to_vec();
     if !provider_id.to_ascii_lowercase().contains("opencode") {
@@ -3900,7 +4075,7 @@ fn terminal_env_vars_with_opencode_coordination_config(
         // approvals (mirrors Codex --dangerously-bypass / Claude acceptEdits).
         config_object.insert(
             "permission".to_string(),
-            opencode_auto_approval_permission_value(),
+            opencode_permission_value(permission_mode),
         );
     }
 
@@ -5874,6 +6049,7 @@ fn run_agent_thread_turn_for_context(
                     &mut args,
                     coordination,
                     &coordination_args,
+                    None,
                 );
             }
             (args, None)

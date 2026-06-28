@@ -1805,6 +1805,10 @@ function formatInteger(value) {
   return new Intl.NumberFormat().format(Number(value) || 0);
 }
 
+function countAudioHistoryCharacters(text) {
+  return Array.from(String(text || "")).length;
+}
+
 function formatAudioProviderLabel(provider) {
   if (provider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
     return "Deepgram";
@@ -2087,7 +2091,7 @@ function extractRemainingForgeCredits(billing) {
   return null;
 }
 
-function formatAudioHistoryMeta(entry, variant) {
+function formatAudioHistoryMeta(entry, variant, entryText) {
   const pieces = [];
   const source = String(entry?.source || "").trim();
   const timingBreakdown = formatAudioHistoryTimingBreakdown(
@@ -2099,6 +2103,7 @@ function formatAudioHistoryMeta(entry, variant) {
     Number(entry?.latencyMs || 0) > 0 ? entry.latencyMs : entry?.audioMs,
   );
   const wordCount = Number(entry?.wordCount || 0);
+  const characterCount = countAudioHistoryCharacters(entryText);
   const language = String(entry?.language || "").trim();
 
   if (source) {
@@ -2109,6 +2114,9 @@ function formatAudioHistoryMeta(entry, variant) {
   }
   if (wordCount > 0) {
     pieces.push(`${formatInteger(wordCount)} ${wordCount === 1 ? "word" : "words"}`);
+  }
+  if (characterCount > 0) {
+    pieces.push(`${formatInteger(characterCount)} ${characterCount === 1 ? "char" : "chars"}`);
   }
   if (language) {
     pieces.push(language);
@@ -2324,7 +2332,7 @@ function buildAudioHistoryRows(history, selectedVariantIds) {
       entryKey,
       entryText,
       index,
-      meta: formatAudioHistoryMeta(entry, variant),
+      meta: formatAudioHistoryMeta(entry, variant, entryText),
       providerLabel: formatAudioProviderLabel(entry?.provider),
       snippetChanges,
       timestamp: formatHistoryTimestamp(entry?.createdAt),
