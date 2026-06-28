@@ -101,6 +101,19 @@ export function formatCostTitle(microusd) {
   return `$${value.toFixed(2)}`;
 }
 
+export function paceMultiplierFromDelta(paceDeltaPercent) {
+  const delta = finiteNumber(paceDeltaPercent);
+  if (delta == null) return null;
+  const multiplier = (delta + 100) / 100;
+  return Number.isFinite(multiplier) ? Math.max(0, multiplier) : null;
+}
+
+export function formatPaceMultiplier(value) {
+  const multiplier = finiteNumber(value);
+  if (multiplier == null) return "";
+  return `${trimDecimal(Math.max(0, multiplier), 2)}x`;
+}
+
 export function rowTotal(row) {
   return numeric(row?.total, row?.total_tokens, row?.totalTokens);
 }

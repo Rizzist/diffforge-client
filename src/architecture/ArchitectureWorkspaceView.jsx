@@ -89,6 +89,9 @@ import {
   FileTreeMessage,
   FileTreeEmpty,
   PanelKicker,
+  WorkspaceCreateAgentClaudeIcon,
+  WorkspaceCreateAgentCodexIcon,
+  WorkspaceCreateAgentOpenCodeIcon,
 } from "../app/appStyles.js";
 import {
   buildSnippingAnnotationTargetFields,
@@ -5515,7 +5518,7 @@ export default function ArchitectureWorkspaceView({
   const activeWorkspaceId = workspace?.id || "";
   const activeWorkspaceName = workspace?.name || "";
   const repoPath = activeWorkspaceId ? rootDirectory || defaultWorkingDirectory || "" : "";
-  const [viewMode, setViewMode] = useState("todoHistory");
+  const [viewMode, setViewMode] = useState("sessionHistory");
   const [localArchitectureSnapshot, setLocalArchitectureSnapshot] = useState(architectureSnapshot);
 	  const [finishPlanState, setFinishPlanState] = useState({ error: "", planRef: "" });
 	  const [finishedPlanRefs, setFinishedPlanRefs] = useState(() => new Set());
@@ -5587,10 +5590,61 @@ export default function ArchitectureWorkspaceView({
     () => architectureTodoHistoryItemsFromWorkspaceTodos(null, activeWorkspaceId, visibleTasks, localTodoItems),
     [activeWorkspaceId, localTodoItems, visibleTasks],
   );
+  const [sessionHistoryItems, setSessionHistoryItems] = useState([]);
+  const [sessionHistoryState, setSessionHistoryState] = useState("idle");
+  const [sessionHistoryError, setSessionHistoryError] = useState("");
+  useEffect(() => {
+    const workspaceId = text(activeWorkspaceId);
+    if (!workspaceId) {
+      setSessionHistoryItems([]);
+      setSessionHistoryState("idle");
+      setSessionHistoryError("");
+      return undefined;
+    }
+    let cancelled = false;
+    const unlisteners = [];
+    const rootDirectoryForStore = repoPath || rootDirectory || defaultWorkingDirectory || "";
+    const refreshSessionHistory = () => {
+      setSessionHistoryState((state) => (state === "ready" ? "refreshing" : "loading"));
+      invoke("workspace_agent_session_history_list", {
+        request: {
+          limit: 200,
+          rootDirectory: rootDirectoryForStore || null,
+          workspaceId,
+        },
+      })
+        .then((result) => {
+          if (cancelled) return;
+          setSessionHistoryItems(jsonArray(result?.items));
+          setSessionHistoryError("");
+          setSessionHistoryState("ready");
+        })
+        .catch((error) => {
+          if (cancelled) return;
+          setSessionHistoryError(String(error?.message || error || "Unable to load session history."));
+          setSessionHistoryState("error");
+        });
+    };
+    refreshSessionHistory();
+    listen("workspace-agent-session-history-changed", (event) => {
+      if (cancelled) return;
+      const eventWorkspaceId = String(event?.payload?.workspaceId || "").trim();
+      if (!eventWorkspaceId || eventWorkspaceId === workspaceId) {
+        refreshSessionHistory();
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlisteners.push(unlisten);
+    }).catch(() => {});
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((unlisten) => unlisten());
+    };
+  }, [activeWorkspaceId, defaultWorkingDirectory, repoPath, rootDirectory]);
   const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
-  const toolbarMeta = viewMode === "scannedResult"
-    ? `Scanned Result · architecture scan · ${repoLabel}`
-    : `Todos History · ${todoHistoryItems.length} todo${todoHistoryItems.length === 1 ? "" : "s"} · ${tasks.length} task${tasks.length === 1 ? "" : "s"} · workspace: ${repoLabel} · live`;
   const visibleArchitectureError = architectureCloudMcpNoiseError(architectureError) ? "" : architectureError;
 
   useEffect(() => {
@@ -5646,21 +5700,27 @@ export default function ArchitectureWorkspaceView({
       <ArchitectureToolbar>
         <ViewToggleGroup aria-label="Architecture view mode">
           <ViewToggleButton
+            data-active={viewMode === "sessionHistory" ? "true" : "false"}
+            onClick={() => setViewMode("sessionHistory")}
+            type="button"
+          >
+            Session History
+          </ViewToggleButton>
+          <ViewToggleButton
             data-active={viewMode === "todoHistory" ? "true" : "false"}
             onClick={() => setViewMode("todoHistory")}
             type="button"
           >
-            Todos History
+            Todo History
           </ViewToggleButton>
           <ViewToggleButton
             data-active={viewMode === "scannedResult" ? "true" : "false"}
             onClick={() => setViewMode("scannedResult")}
             type="button"
           >
-            Scanned Result
+            Scan Result
           </ViewToggleButton>
         </ViewToggleGroup>
-        <ToolbarMeta>{toolbarMeta}</ToolbarMeta>
       </ArchitectureToolbar>
 
       {viewMode === "scannedResult" ? (
@@ -5669,7 +5729,7 @@ export default function ArchitectureWorkspaceView({
           scan={architectureRepositoryScanSnapshot}
           state={architectureRepositoryScanState}
         />
-      ) : (
+      ) : viewMode === "todoHistory" ? (
         <TodosHistoryPanel
           deviceDirectory={todoDeviceDirectory}
           finishPlanError={finishPlanState.error}
@@ -5680,6 +5740,13 @@ export default function ArchitectureWorkspaceView({
           repoLabel={repoLabel}
           terminalOptions={workspaceTerminalOptions}
           workspaceId={activeWorkspaceId}
+        />
+      ) : (
+        <SessionHistoryPanel
+          error={sessionHistoryError}
+          items={sessionHistoryItems}
+          repoLabel={repoLabel}
+          state={sessionHistoryState}
         />
       )}
       {visibleArchitectureError && (
@@ -9509,6 +9576,133 @@ function TodoHistoryTargetSelect({ item, onSelect, terminalOptions = [], value }
   );
 }
 
+function sessionHistoryAgentKey(item) {
+  const raw = text(item?.agentId || item?.agent_id || item?.provider || item?.agentKind || item?.agent_kind).toLowerCase();
+  if (raw.includes("claude")) return "claude";
+  if (raw.includes("opencode") || raw.includes("open-code")) return "opencode";
+  if (raw.includes("codex") || raw.includes("openai") || raw.includes("open-ai")) return "codex";
+  return raw || "terminal";
+}
+
+function sessionHistoryAgentLabel(item) {
+  switch (sessionHistoryAgentKey(item)) {
+    case "claude":
+      return "Claude Code";
+    case "opencode":
+      return "OpenCode";
+    case "codex":
+      return "OpenAI Codex";
+    default:
+      return text(item?.provider || item?.agentId || item?.agent_id, "Coding agent");
+  }
+}
+
+function sessionHistoryModelLabel(item) {
+  return text(item?.modelId || item?.model_id, "Unknown model");
+}
+
+function sessionHistoryStatusKind(item) {
+  const raw = text(item?.status).toLowerCase();
+  if (["idle", "ready", "done", "complete", "completed", "finished"].includes(raw)) return "done";
+  if (["running", "thinking", "busy", "active", "starting", "initializing", "warming"].includes(raw)) return "active";
+  if (["queued", "pending"].includes(raw)) return "queued";
+  if (["error", "failed", "crashed"].includes(raw)) return "blocked";
+  return "parked";
+}
+
+function sessionHistoryStatusLabel(item) {
+  const raw = text(item?.status);
+  if (!raw) return "Recorded";
+  return raw
+    .split(/[-_\s]+/u)
+    .filter(Boolean)
+    .map((part) => `${part.charAt(0).toUpperCase()}${part.slice(1)}`)
+    .join(" ");
+}
+
+function sessionHistoryTitle(item) {
+  return text(
+    item?.title || item?.providerSessionId || item?.provider_session_id || item?.threadId || item?.thread_id,
+    sessionHistoryAgentLabel(item),
+  );
+}
+
+function SessionHistoryProviderIcon({ item }) {
+  const agentKey = sessionHistoryAgentKey(item);
+  if (agentKey === "claude") {
+    return <WorkspaceCreateAgentClaudeIcon aria-hidden="true" />;
+  }
+  if (agentKey === "opencode") {
+    return (
+      <WorkspaceCreateAgentOpenCodeIcon
+        aria-hidden="true"
+        fill="none"
+        viewBox="0 0 24 30"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <path d="M18 24H6V12H18V24Z" fill="#4B4646" />
+        <path d="M18 6H6V24H18V6ZM24 30H0V0H24V30Z" fill="#F1ECEC" />
+      </WorkspaceCreateAgentOpenCodeIcon>
+    );
+  }
+  if (agentKey === "codex") {
+    return <WorkspaceCreateAgentCodexIcon aria-hidden="true" />;
+  }
+  return <Terminal aria-hidden="true" />;
+}
+
+function SessionHistoryPanel({ error = "", items = [], repoLabel = "", state = "idle" }) {
+  const hasItems = items.length > 0;
+  const loading = state === "loading";
+  return (
+    <HistoryPane>
+      <TimelineHeader>
+        <div>
+          <TimelineKicker>Session history</TimelineKicker>
+          <TimelineTitle>{repoLabel}</TimelineTitle>
+        </div>
+        <TimelineSummary>
+          {loading && !hasItems ? "Loading" : `${items.length} session${items.length === 1 ? "" : "s"}`}
+        </TimelineSummary>
+      </TimelineHeader>
+      {error && <ArchitectureError>{error}</ArchitectureError>}
+      {hasItems ? (
+        <SessionHistoryList aria-label="Session history list">
+          {items.map((item, index) => {
+            const createdMs = parseTimeMs(item?.createdAtMs ?? item?.created_at_ms);
+            const latestMs = parseTimeMs(item?.latestAtMs ?? item?.latest_at_ms);
+            const statusKind = sessionHistoryStatusKind(item);
+            const id = text(item?.id, `session-${index}`);
+            return (
+              <SessionHistoryCard data-agent={sessionHistoryAgentKey(item)} key={id}>
+                <SessionHistoryIcon aria-hidden="true">
+                  <SessionHistoryProviderIcon item={item} />
+                </SessionHistoryIcon>
+                <SessionHistoryContent>
+                  <SessionHistoryCardTop>
+                    <div>
+                      <SessionHistoryAgent>{sessionHistoryAgentLabel(item)}</SessionHistoryAgent>
+                      <SessionHistoryTitle>{sessionHistoryTitle(item)}</SessionHistoryTitle>
+                    </div>
+                    <StatusPill data-status={statusKind}>{sessionHistoryStatusLabel(item)}</StatusPill>
+                  </SessionHistoryCardTop>
+                  <SessionHistoryMeta>
+                    <span title={sessionHistoryModelLabel(item)}>{sessionHistoryModelLabel(item)}</span>
+                    <span>created {formatRelativeTimeMs(createdMs) || formatTime(createdMs) || "unknown"}</span>
+                    <span>latest {formatRelativeTimeMs(latestMs) || formatTime(latestMs) || "unknown"}</span>
+                  </SessionHistoryMeta>
+                </SessionHistoryContent>
+              </SessionHistoryCard>
+            );
+          })}
+        </SessionHistoryList>
+      ) : (
+        <EmptyState>{loading ? "Loading session history..." : "No session history recorded yet."}</EmptyState>
+      )}
+    </HistoryPane>
+  );
+}
+
 function TodosHistoryPanel({
   deviceDirectory = null,
   finishPlanError = "",
@@ -10280,7 +10474,10 @@ const ArchitectureToolbar = styled.div`
 
 const ViewToggleGroup = styled.div`
   display: inline-flex;
+  flex: 0 0 auto;
   gap: 2px;
+  max-width: 100%;
+  overflow-x: auto;
   padding: 2px;
   border: 1px solid var(--forge-border);
   border-radius: 7px;
@@ -10288,6 +10485,7 @@ const ViewToggleGroup = styled.div`
 `;
 
 const ViewToggleButton = styled.button`
+  flex: 0 0 auto;
   min-height: 24px;
   padding: 0 10px;
   border: 0;
@@ -10298,21 +10496,12 @@ const ViewToggleButton = styled.button`
   font-size: 11px;
   font-weight: 850;
   cursor: pointer;
+  white-space: nowrap;
 
   &[data-active="true"] {
     color: var(--forge-text);
     background: rgba(148, 163, 184, 0.14);
   }
-`;
-
-const ToolbarMeta = styled.span`
-  min-width: 0;
-  overflow: hidden;
-  color: var(--forge-text-muted);
-  font-size: 11px;
-  font-weight: 800;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 `;
 
 const ArchitectureError = styled.div`
@@ -13070,6 +13259,126 @@ const HistorySplit = styled.div`
   @media (max-width: 920px) {
     grid-template-columns: 1fr;
     overflow: auto;
+  }
+`;
+
+const SessionHistoryList = styled.div`
+  display: grid;
+  align-content: start;
+  gap: 8px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding-right: 2px;
+`;
+
+const SessionHistoryCard = styled.article`
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 8px;
+  background: rgba(2, 6, 23, 0.28);
+
+  &[data-agent="codex"] {
+    border-color: rgba(96, 165, 250, 0.18);
+  }
+
+  &[data-agent="claude"] {
+    border-color: rgba(248, 176, 92, 0.22);
+  }
+
+  &[data-agent="opencode"] {
+    border-color: rgba(167, 139, 250, 0.2);
+  }
+`;
+
+const SessionHistoryIcon = styled.div`
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  border-radius: 8px;
+  color: rgba(226, 232, 240, 0.92);
+  background: rgba(15, 23, 42, 0.48);
+
+  svg {
+    display: block;
+    max-width: 20px;
+    max-height: 22px;
+  }
+`;
+
+const SessionHistoryContent = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+`;
+
+const SessionHistoryCardTop = styled.div`
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+
+  > div {
+    min-width: 0;
+  }
+`;
+
+const SessionHistoryAgent = styled.div`
+  overflow: hidden;
+  color: rgba(148, 163, 184, 0.9);
+  font-size: 9.5px;
+  font-weight: 850;
+  letter-spacing: 0.04em;
+  text-overflow: ellipsis;
+  text-transform: uppercase;
+  white-space: nowrap;
+`;
+
+const SessionHistoryTitle = styled.strong`
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: rgba(248, 250, 252, 0.96);
+  font-size: 13px;
+  font-weight: 860;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const SessionHistoryMeta = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: rgba(148, 163, 184, 0.82);
+  font-size: 10px;
+  font-weight: 720;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span:first-child {
+    color: rgba(191, 219, 254, 0.9);
+    font-weight: 840;
+  }
+
+  @media (max-width: 700px) {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 3px;
   }
 `;
 

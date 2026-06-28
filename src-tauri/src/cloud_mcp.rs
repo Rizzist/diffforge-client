@@ -14515,7 +14515,6 @@ async fn cloud_mcp_apply_account_sync_resume_response(
                 );
             }
         }
-        cloud_mcp_apply_account_sync_resume_remote_commands(state, &todos, reason).await;
     }
     if let Some(assets) = cloud_mcp_account_sync_resume_domain(
         response,
@@ -14692,19 +14691,29 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
         }
         if !cloud_mcp_claim_remote_command_receipt(state, &event).await {
             duplicate += 1;
-            let _ = cloud_mcp_send_remote_command_status_event(
-                state,
-                &event,
-                "duplicate_ignored",
-                "Duplicate remote command ignored by desktop.",
-                None,
-            )
-            .await;
             continue;
         }
         let _ = app.emit(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, event.clone());
-        todo_dispatch_record_remote_intake(&app, &event);
-        todo_dispatch_apply_remote_delete(&app, &event);
+        let intake_outcome = todo_dispatch_record_remote_intake(&app, &event);
+        if let Some(outcome) = intake_outcome.as_ref() {
+            let status = cloud_mcp_payload_text(outcome, &["status"]).unwrap_or_default();
+            let message = cloud_mcp_payload_text(outcome, &["message"]).unwrap_or_default();
+            let details = outcome.get("details");
+            let _ = cloud_mcp_send_remote_command_status_event(
+                state, &event, &status, &message, details,
+            )
+            .await;
+        }
+        let delete_outcome = todo_dispatch_apply_remote_delete(&app, &event);
+        if let Some(outcome) = delete_outcome.as_ref() {
+            let status = cloud_mcp_payload_text(outcome, &["status"]).unwrap_or_default();
+            let message = cloud_mcp_payload_text(outcome, &["message"]).unwrap_or_default();
+            let details = outcome.get("details");
+            let _ = cloud_mcp_send_remote_command_status_event(
+                state, &event, &status, &message, details,
+            )
+            .await;
+        }
         cloud_mcp_apply_remote_workspace_lever(&app, state, &event);
         cloud_mcp_apply_remote_terminal_lever(&app, state, &event);
         cloud_mcp_apply_remote_agent_lever(&app, state, &event);
@@ -15938,12 +15947,18 @@ fn cloud_mcp_remote_command_receipt_key(event: &Value) -> Option<String> {
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspace_id"]))
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "workspaceId"]))
         .unwrap_or_default();
+    let intent_id = cloud_mcp_payload_text(event, &["intent_id"])
+        .or_else(|| cloud_mcp_payload_text(event, &["intentId"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "intent_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["payload", "intentId"]))
+        .unwrap_or_default();
     Some(format!(
-        "{}::{}::{}::{}",
+        "{}::{}::{}::{}::{}",
         client_id.trim(),
         workspace_id.trim(),
         command_kind.trim(),
-        command_id
+        command_id,
+        intent_id.trim()
     ))
 }
 
@@ -16150,6 +16165,14 @@ async fn cloud_mcp_send_remote_command_status_event(
             .or_else(|| cloud_mcp_payload_text(event, &["commandKind"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "command_kind"]))
             .or_else(|| cloud_mcp_payload_text(event, &["payload", "commandKind"])),
+        "intent_id": cloud_mcp_payload_text(event, &["intent_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["intentId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "intent_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "intentId"])),
+        "intentId": cloud_mcp_payload_text(event, &["intent_id"])
+            .or_else(|| cloud_mcp_payload_text(event, &["intentId"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "intent_id"]))
+            .or_else(|| cloud_mcp_payload_text(event, &["payload", "intentId"])),
         "loop_runtime_run_id": cloud_mcp_payload_text(event, &["loop_runtime_run_id"])
             .or_else(|| cloud_mcp_payload_text(event, &["loopRuntimeRunId"]))
             .or_else(|| cloud_mcp_payload_text(event, &["run_id"]))
@@ -16585,8 +16608,34 @@ async fn cloud_mcp_start_remote_command_listener(
                 .await;
                 continue;
             }
-            todo_dispatch_record_remote_intake(&app, &event);
-            todo_dispatch_apply_remote_delete(&app, &event);
+            let intake_outcome = todo_dispatch_record_remote_intake(&app, &event);
+            if let Some(outcome) = intake_outcome.as_ref() {
+                let status = cloud_mcp_payload_text(outcome, &["status"]).unwrap_or_default();
+                let message = cloud_mcp_payload_text(outcome, &["message"]).unwrap_or_default();
+                let details = outcome.get("details");
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state_clone,
+                    &event,
+                    &status,
+                    &message,
+                    details,
+                )
+                .await;
+            }
+            let delete_outcome = todo_dispatch_apply_remote_delete(&app, &event);
+            if let Some(outcome) = delete_outcome.as_ref() {
+                let status = cloud_mcp_payload_text(outcome, &["status"]).unwrap_or_default();
+                let message = cloud_mcp_payload_text(outcome, &["message"]).unwrap_or_default();
+                let details = outcome.get("details");
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state_clone,
+                    &event,
+                    &status,
+                    &message,
+                    details,
+                )
+                .await;
+            }
             cloud_mcp_apply_remote_workspace_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event);
             cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event);
@@ -17895,6 +17944,16 @@ fn cloud_mcp_remote_command_is_rust_owned(event: &Value) -> bool {
             | "terminal_status"
             | "terminal_output"
             | "terminal_activity_status"
+            | "todo_create"
+            | "create_todo"
+            | "workspace_todo_create"
+            | "todo_update"
+            | "update_todo"
+            | "workspace_todo_update"
+            | "todo_delete"
+            | "delete_todo"
+            | "workspace_todo_delete"
+            | "remote_todo_delete"
             | "upload_asset"
             | "asset_upload"
             | "download_asset"
@@ -39614,12 +39673,19 @@ fn cloud_mcp_todo_sync_compact_payload(op: &Value) -> Value {
 
 fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
     fn source_is_todo_sync(source: &Value) -> bool {
-        let kind = cloud_mcp_payload_text(source, &["c", "kind", "event_kind", "eventKind"])
-            .or_else(|| cloud_mcp_payload_text(source, &["contract"]))
+        let channel = cloud_mcp_payload_text(source, &["c"])
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        kind == "todo.sync" || kind == "diffforge.todo.sync.v2"
+        let kind = cloud_mcp_payload_text(source, &["kind", "event_kind", "eventKind"])
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        let contract = cloud_mcp_payload_text(source, &["contract"])
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase();
+        channel == "todo.sync" || kind == "todo.sync" || contract == "diffforge.todo.sync.v2"
     }
 
     let mut entries = Vec::new();
@@ -39653,13 +39719,13 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
                     .trim()
                     .to_ascii_lowercase()
             };
-            let legacy_indexed_shape = op
+            let v2_indexed_shape = op
                 .as_array()
                 .and_then(|items| items.get(1))
                 .map(|value| value.is_number())
                 .unwrap_or(false);
             let compact_payload = cloud_mcp_todo_sync_compact_payload(op);
-            let seq = if legacy_indexed_shape {
+            let seq = if v2_indexed_shape {
                 cloud_mcp_todo_sync_op_u64(op, 1, &["aseq", "server_seq", "serverSeq", "seq"])
             } else {
                 cloud_mcp_payload_text(source, &["aseq", "server_seq", "serverSeq", "seq"])
@@ -39675,11 +39741,11 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
             };
             let todo_id = cloud_mcp_todo_sync_op_text(
                 op,
-                if legacy_indexed_shape { 2 } else { 1 },
+                if v2_indexed_shape { 2 } else { 1 },
                 &["todo_id", "todoId", "id", "i"],
             )
             .unwrap_or_default();
-            let source_device_id = if legacy_indexed_shape {
+            let source_device_id = if v2_indexed_shape {
                 cloud_mcp_todo_sync_op_text(
                     op,
                     3,
@@ -39740,7 +39806,7 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
                 })
             }
             .unwrap_or_default();
-            let source_workspace_id = if legacy_indexed_shape {
+            let source_workspace_id = if v2_indexed_shape {
                 cloud_mcp_todo_sync_op_text(
                     op,
                     4,
@@ -39823,7 +39889,7 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
                 }));
                 continue;
             }
-            let status = if legacy_indexed_shape {
+            let status = if v2_indexed_shape {
                 cloud_mcp_todo_sync_op_text(op, 5, &["status", "todo_status", "todoStatus", "s"])
                     .unwrap_or_else(|| "listed".to_string())
             } else if matches!(code.as_str(), "s" | "send" | "q" | "queue") {
@@ -39843,7 +39909,7 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
             let content_hash =
                 cloud_mcp_todo_sync_op_text(op, 6, &["content_hash", "contentHash", "h"])
                     .unwrap_or_default();
-            let text = if legacy_indexed_shape {
+            let text = if v2_indexed_shape {
                 cloud_mcp_todo_sync_payload_value(
                     &compact_payload,
                     "t",
@@ -40490,8 +40556,8 @@ fn cloud_mcp_apply_account_todo_delta_conn(
     let mut result = CloudMcpAccountTodoDeltaApplyResult {
         scope_key: scope_key.clone(),
         account_id: event_account_id.clone(),
-        highest_seq: cloud_mcp_account_todo_delta_seq(event, event, None),
-        cursor: cloud_mcp_account_todo_delta_cursor(event, event, None),
+        highest_seq: 0,
+        cursor: String::new(),
         ..Default::default()
     };
     let mut mirror_rows = Vec::new();
@@ -40520,12 +40586,6 @@ fn cloud_mcp_apply_account_todo_delta_conn(
         ) {
             result.skipped_local_echo += 1;
             continue;
-        }
-        if event_seq > result.highest_seq {
-            result.highest_seq = event_seq;
-        }
-        if !cursor.trim().is_empty() && cursor > result.cursor {
-            result.cursor = cursor.clone();
         }
         let account_id = cloud_mcp_payload_text(
             &normalized,
@@ -40560,6 +40620,12 @@ fn cloud_mcp_apply_account_todo_delta_conn(
         )? {
             CloudMcpAccountTodoCacheWrite::Applied => {
                 result.applied += 1;
+                if event_seq > result.highest_seq {
+                    result.highest_seq = event_seq;
+                }
+                if !cursor.trim().is_empty() && cursor > result.cursor {
+                    result.cursor = cursor.clone();
+                }
                 if deleted {
                     result.deleted += 1;
                     if !removed_todo_ids.iter().any(|id| id == &todo_id) {
@@ -40778,6 +40844,8 @@ async fn cloud_mcp_apply_account_todo_inbound_event(
                     "cursor": result.cursor.clone(),
                 }));
             }
+            cloud_mcp_apply_account_sync_resume_remote_commands(state, event, "todo_sync_inbound")
+                .await;
             let _ = cloud_mcp_send_account_todo_delta_ack(state, &result, event_kind).await;
             Ok(result)
         }
@@ -47627,10 +47695,12 @@ mod cloud_mcp_tests {
             cloud_mcp_route_error_runtime_status(&waiting_error),
             Some("route_initializing")
         );
-        assert_eq!(cloud_mcp_route_error_retry_after_ms(&waiting_error), Some(5000));
+        assert_eq!(
+            cloud_mcp_route_error_retry_after_ms(&waiting_error),
+            Some(5000)
+        );
 
-        let legacy_waiting_error =
-            "Cloud MCP route rejected: route_state=waiting; route rejected";
+        let legacy_waiting_error = "Cloud MCP route rejected: route_state=waiting; route rejected";
         assert_eq!(
             cloud_mcp_route_error_runtime_status(legacy_waiting_error),
             Some("route_initializing")
@@ -49438,6 +49508,43 @@ mod cloud_mcp_tests {
             cloud_mcp_account_todo_sync_state_from_conn(&conn, "account:account-1", "").unwrap();
         assert_eq!(sync_state.last_applied_seq, 20);
         assert_eq!(sync_state.cursor, "cursor-20");
+    }
+
+    #[test]
+    fn account_todo_delta_does_not_advance_cursor_without_applied_entries() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
+        let malformed = json!({
+            "kind": "todo.sync",
+            "contract": "diffforge.todo.sync.v2",
+            "c": "todo.sync",
+            "m": "delta",
+            "accountId": "account-1",
+            "aseq": 30,
+            "cursor": "cursor-30",
+            "ops": [
+                ["u", 30, "", "peer-device", "workspace-peer", "listed", "", {
+                    "t": "missing todo id"
+                }]
+            ]
+        });
+
+        let result = cloud_mcp_apply_account_todo_delta_conn(
+            &conn,
+            "test",
+            Some("https://cloud.example"),
+            &malformed,
+            "local-device",
+        )
+        .unwrap();
+
+        assert_eq!(result.applied, 0);
+        assert_eq!(result.highest_seq, 0);
+        assert_eq!(result.cursor, "");
+        let sync_state =
+            cloud_mcp_account_todo_sync_state_from_conn(&conn, "account:account-1", "").unwrap();
+        assert_eq!(sync_state.last_applied_seq, 0);
+        assert_eq!(sync_state.cursor, "");
     }
 
     #[test]

@@ -205,6 +205,7 @@ const TERMINAL_DRAG_RELEASE_EVENT = "forge-terminal-drag-release";
 const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
 const TERMINAL_BREAKOUT_TRANSITION_MS = 260;
 const TERMINAL_BREAKOUT_STORAGE_PREFIX = "diffforge.terminalBreakout.v1";
+const TERMINAL_DOCUMENT_PANEL_ID = "workspace-document-panel";
 const TERMINAL_BREAKOUT_PHASE_GRID = "grid";
 const TERMINAL_BREAKOUT_PHASE_BREAKING_OUT = "breaking-out";
 const TERMINAL_BREAKOUT_PHASE_CANVAS = "canvas";
@@ -248,6 +249,12 @@ const TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT = Object.freeze({
   width: 360,
   x: 18,
   y: 52,
+});
+const TERMINAL_BREAKOUT_DOCUMENT_WINDOW_DEFAULT_LAYOUT = Object.freeze({
+  height: 420,
+  width: 380,
+  x: 18,
+  y: 68,
 });
 const TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_MIN_WIDTH = 280;
 const TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_MARGIN = 10;
@@ -2569,6 +2576,62 @@ const TerminalBreakoutArchitectureDetailGrid = styled.dl`
   html[data-forge-theme="light"] & {
     border-top-color: rgba(15, 23, 42, 0.08);
     color: #334155;
+  }
+`;
+
+const TerminalBreakoutDocumentWindow = styled(TerminalSurfaceSlot)`
+  z-index: var(--terminal-slot-z, 130);
+  background: transparent;
+`;
+
+const TerminalBreakoutDocumentFrame = styled.div`
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 8px;
+  color: rgba(241, 245, 249, 0.94);
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(2, 6, 12, 0.96)),
+    rgba(0, 0, 0, 0.94);
+  box-shadow:
+    0 22px 48px rgba(0, 0, 0, 0.36),
+    inset 0 1px 0 rgba(255, 255, 255, 0.055);
+  overflow: hidden;
+  backdrop-filter: blur(18px) saturate(135%);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    color: #1f2937;
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 252, 0.92)),
+      rgba(255, 255, 255, 0.94);
+    box-shadow:
+      0 22px 44px rgba(15, 23, 42, 0.14),
+      inset 0 1px 0 rgba(255, 255, 255, 0.78);
+  }
+`;
+
+const TerminalBreakoutDocumentBody = styled(TerminalBreakoutArchitectureBody)`
+  flex: 1 1 auto;
+  gap: 8px;
+  min-height: 0;
+  max-height: none;
+`;
+
+const TerminalBreakoutDocumentContent = styled.pre`
+  min-width: 0;
+  margin: 0;
+  color: rgba(226, 232, 240, 0.9);
+  font: 650 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+
+  html[data-forge-theme="light"] & {
+    color: #263244;
   }
 `;
 
@@ -8028,6 +8091,7 @@ const TodoDragPreviewText = styled.div`
 `;
 
 const TERMINAL_PANEL_ANCHOR_SELECTOR = "[data-terminal-panel-anchor='true']";
+const TERMINAL_DOCUMENT_PANEL_ANCHOR_SELECTOR = "[data-terminal-document-panel-anchor='true']";
 
 function releasePointerCaptureIfHeld(element, pointerId) {
   if (!element || pointerId === undefined || pointerId === null) {
@@ -9445,6 +9509,23 @@ function clampTerminalBreakoutArchitectureWindowLayout(layout, containerRect = n
   };
 }
 
+function normalizeWorkspaceDocumentPanelEntry(entry) {
+  const source = entry && typeof entry === "object" ? entry : {};
+  const title = normalizeTodoQueueText(source.title || source.name || source.id || "Document")
+    .slice(0, 160) || "Document";
+  const typeLabel = normalizeTodoQueueText(source.typeLabel || source.kind || "Document")
+    .slice(0, 80) || "Document";
+  return {
+    body: normalizeTodoQueueMultilineText(source.body || source.content || "", 50000),
+    id: normalizeTodoQueueText(source.id || source.key || title).slice(0, 220),
+    kind: normalizeTodoQueueText(source.kind || "document").slice(0, 80),
+    localPath: normalizeTodoQueueText(source.localPath || source.local_path || "").slice(0, 600),
+    pathKey: normalizeTodoQueueText(source.pathKey || source.path_key || "").slice(0, 600),
+    title,
+    typeLabel,
+  };
+}
+
 function terminalBreakoutPlanEventText(payload, keys) {
   const refs = payload?.refs || {};
   const nestedPayload = payload?.payload || {};
@@ -9688,6 +9769,51 @@ function buildSpreadBreakoutPlacements({
     maxZ,
     placements: nextPlacements,
   };
+}
+
+function getTerminalBreakoutMaxZ(...placementGroups) {
+  return placementGroups
+    .flatMap((group) => Object.values(group || {}))
+    .map((placement) => Number.parseInt(placement?.z, 10) || 0)
+    .reduce((maxValue, z) => Math.max(maxValue, z), 0);
+}
+
+function buildTerminalBreakoutDocumentPlacement({
+  existingPlacement = null,
+  terminalPlacements = {},
+  terminalScale = TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE,
+} = {}) {
+  const normalizedExisting = normalizeBreakoutPlacement(existingPlacement);
+  if (normalizedExisting) {
+    return normalizedExisting;
+  }
+
+  const scale = clampBreakoutTerminalScale(terminalScale);
+  const width = TERMINAL_BREAKOUT_DOCUMENT_WINDOW_DEFAULT_LAYOUT.width;
+  const height = TERMINAL_BREAKOUT_DOCUMENT_WINDOW_DEFAULT_LAYOUT.height;
+  const terminalBounds = getBreakoutPlacementBounds(terminalPlacements, scale);
+  const x = terminalBounds
+    ? terminalBounds.minX - ((width * scale) + TERMINAL_BREAKOUT_MIN_GAP_X)
+    : TERMINAL_BREAKOUT_DOCUMENT_WINDOW_DEFAULT_LAYOUT.x;
+  const y = terminalBounds
+    ? terminalBounds.minY
+    : TERMINAL_BREAKOUT_DOCUMENT_WINDOW_DEFAULT_LAYOUT.y;
+  return {
+    height,
+    width,
+    x,
+    y,
+    z: getTerminalBreakoutMaxZ(terminalPlacements) + 1,
+  };
+}
+
+function breakoutPlacementsWithDocumentPanel(placements, documentPlacement = null, enabled = false) {
+  const normalizedDocumentPlacement = enabled
+    ? normalizeBreakoutPlacement(documentPlacement)
+    : null;
+  return normalizedDocumentPlacement
+    ? { ...(placements || {}), document: normalizedDocumentPlacement }
+    : placements;
 }
 
 function getBreakoutScreenRect(
@@ -15653,6 +15779,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   onDraftChange = noopWorkspaceToolHandler,
   onDispatchTodoToTarget,
   onMinimizePane = noopWorkspaceToolHandler,
+  onOpenDocumentPanel = null,
   onOpenWorkspaceSettings,
   onQueueAllItems,
   onQueueItem,
@@ -15683,6 +15810,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   workspace,
   workspaceError = "",
   workspaceId,
+  documentPanelEnabled = false,
   workspaceScopedTabsEnabled = true,
   workspaceTodos = null,
   workspaces = [],
@@ -19712,9 +19840,10 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
         <WorkspaceToolSurface data-tool="tools">
           <WorkspaceToolsDragPanel
             coordinationTargets={coordinationTargets}
-            onAddToolTodo={onAddToolTodo}
-            rootDirectory={rootDirectory}
-            workspaceId={workspace?.id || ""}
+            documentPanelEnabled={documentPanelEnabled}
+            onOpenDocumentPanel={onOpenDocumentPanel}
+            rootDirectory={rootDirectory || defaultWorkingDirectory}
+            workspaceId={workspace?.id || workspaceId || ""}
           />
         </WorkspaceToolSurface>
       ) : activeWorkspaceTool === "triggers" && loopspacesModeActive ? (
@@ -20867,6 +20996,7 @@ function TerminalView({
   workspaceSyncState,
   workspaceThreadRestoreReady = true,
   workspaceTerminalAgentLaunchReady,
+  workspaceDocumentPanelEnabled = false,
   workspaceTerminalRenderAgent,
   workspaceScopedToolTabsEnabled = true,
   workspaceToolPaneMode = "",
@@ -20915,6 +21045,7 @@ function TerminalView({
   const [terminalLayoutRects, setTerminalLayoutRects] = useState({});
   const [terminalPanelRect, setTerminalPanelRect] = useState(null);
   const [terminalDragState, setTerminalDragState] = useState(null);
+  const [terminalDocumentPanelRect, setTerminalDocumentPanelRect] = useState(null);
   const [terminalBreakoutPhase, setTerminalBreakoutPhase] = useState(TERMINAL_BREAKOUT_PHASE_GRID);
   const [windowBreakoutPanes, setWindowBreakoutPanes] = useState({});
   const windowBreakoutPanesRef = useRef(windowBreakoutPanes);
@@ -20930,9 +21061,15 @@ function TerminalView({
   const [terminalBreakoutArchitectureWindowLayout, setTerminalBreakoutArchitectureWindowLayout] = useState(
     TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT,
   );
+  const [terminalBreakoutDocumentPanel, setTerminalBreakoutDocumentPanel] = useState(null);
+  const [terminalBreakoutDocumentWindowDragging, setTerminalBreakoutDocumentWindowDragging] = useState(false);
+  const [terminalBreakoutDocumentWindowLayout, setTerminalBreakoutDocumentWindowLayout] = useState(
+    TERMINAL_BREAKOUT_DOCUMENT_WINDOW_DEFAULT_LAYOUT,
+  );
   const [terminalBreakoutViewport, setTerminalBreakoutViewport] = useState(TERMINAL_BREAKOUT_DEFAULT_VIEWPORT);
   const [terminalBreakoutTerminalScale, setTerminalBreakoutTerminalScale] = useState(TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE);
   const [terminalBreakoutPanning, setTerminalBreakoutPanning] = useState(false);
+  const workspaceDocumentPanelAvailable = Boolean(workspaceDocumentPanelEnabled);
   const activeDisplayRows = terminalDragState?.previewRows || displayTerminalRows;
   const activeDisplayRowsSignature = serializeTerminalRows(activeDisplayRows);
   const terminalDragActive = Boolean(terminalDragState);
@@ -20954,7 +21091,7 @@ function TerminalView({
   const [todoQueuePendingItems, setTodoQueuePendingItems] = useState({});
   const [todoQueueDispatchRevision, setTodoQueueDispatchRevision] = useState(0);
   const [todoDispatchStartupReconcileActive, setTodoDispatchStartupReconcileActive] = useState(true);
-  const [todoQueuePaneMode, setTodoQueuePaneMode] = useState(TODO_QUEUE_PANE_MODE_MINIMIZED);
+  const [todoQueuePaneMode, setTodoQueuePaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
   const [appBackgroundMode, setAppBackgroundMode] = useState(false);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
   const workspaceToolPortaled = Boolean(workspaceToolPortalTarget);
@@ -21046,6 +21183,10 @@ function TerminalView({
   const terminalBreakoutArchitectureWindowDragCleanupRef = useRef(null);
   const terminalBreakoutArchitectureWindowDragRef = useRef(null);
   const terminalBreakoutArchitectureWindowAutoOpenSignatureRef = useRef("");
+  const terminalBreakoutDocumentWindowDragCleanupRef = useRef(null);
+  const terminalBreakoutDocumentWindowDragRef = useRef(null);
+  const terminalBreakoutDocumentWindowLayoutRef = useRef(TERMINAL_BREAKOUT_DOCUMENT_WINDOW_DEFAULT_LAYOUT);
+  const workspaceDocumentPanelAvailableRef = useRef(false);
   const terminalBreakoutBackgroundCanvasRef = useRef(null);
   const terminalBreakoutBackgroundDrawRef = useRef(null);
   const terminalBreakoutPlacementsRef = useRef({});
@@ -21060,6 +21201,7 @@ function TerminalView({
   const layoutMeasureFrameRef = useRef(0);
   const terminalDragCleanupRef = useRef(null);
   const terminalDragStateRef = useRef(null);
+  const terminalDocumentPanelRectRef = useRef(null);
   const terminalLayoutRectsRef = useRef({});
   const terminalPanelRectRef = useRef(null);
   const terminalGridPanelRef = useRef(null);
@@ -21113,6 +21255,7 @@ function TerminalView({
   const [cloudDesktopDeviceId, setCloudDesktopDeviceId] = useState("");
   todoQueueItemsRef.current = todoQueueItems;
   terminalBreakoutPhaseRef.current = terminalBreakoutPhase;
+  terminalBreakoutDocumentWindowLayoutRef.current = terminalBreakoutDocumentWindowLayout;
   terminalBreakoutPlacementsRef.current = terminalBreakoutPlacements;
   terminalBreakoutTerminalScaleRef.current = terminalBreakoutTerminalScale;
   terminalBreakoutViewportRef.current = terminalBreakoutViewport;
@@ -22931,6 +23074,98 @@ function TerminalView({
     stopTerminalBreakoutArchitectureWindowDrag,
   ]);
 
+  const stopTerminalBreakoutDocumentWindowDrag = useCallback(() => {
+    terminalBreakoutDocumentWindowDragCleanupRef.current?.();
+    terminalBreakoutDocumentWindowDragCleanupRef.current = null;
+    terminalBreakoutDocumentWindowDragRef.current = null;
+    setTerminalBreakoutDocumentWindowDragging(false);
+  }, []);
+
+  const beginTerminalBreakoutDocumentWindowDrag = useCallback((event) => {
+    if (event.button !== 0 || !terminalBreakoutLayoutActive) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    stopTerminalBreakoutDocumentWindowDrag();
+
+    const startLayout = normalizeBreakoutPlacement(terminalBreakoutDocumentWindowLayout)
+      || buildTerminalBreakoutDocumentPlacement({
+        terminalPlacements: terminalBreakoutPlacementsRef.current,
+        terminalScale: terminalBreakoutTerminalScaleRef.current,
+      });
+    const viewport = normalizeBreakoutViewport(terminalBreakoutViewportRef.current);
+    const nextStartLayout = {
+      ...startLayout,
+      z: getTerminalBreakoutMaxZ(
+        terminalBreakoutPlacementsRef.current,
+        { document: startLayout },
+      ) + 1,
+    };
+    setTerminalBreakoutDocumentWindowLayout(nextStartLayout);
+    terminalBreakoutDocumentWindowLayoutRef.current = nextStartLayout;
+    const pointerId = event.pointerId;
+    terminalBreakoutDocumentWindowDragRef.current = {
+      pointerId,
+      startClientX: Number(event.clientX || 0),
+      startClientY: Number(event.clientY || 0),
+      startLayout: nextStartLayout,
+      startViewport: viewport,
+    };
+    setTerminalBreakoutDocumentWindowDragging(true);
+
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+
+    const handlePointerMove = (moveEvent) => {
+      const dragState = terminalBreakoutDocumentWindowDragRef.current;
+      if (!dragState || moveEvent.pointerId !== dragState.pointerId) {
+        return;
+      }
+      moveEvent.preventDefault();
+      const viewport = normalizeBreakoutViewport(dragState.startViewport);
+      const zoom = Math.max(0.001, viewport.zoom);
+      const nextLayout = {
+        ...dragState.startLayout,
+        x: dragState.startLayout.x + ((Number(moveEvent.clientX || 0) - dragState.startClientX) / zoom),
+        y: dragState.startLayout.y + ((Number(moveEvent.clientY || 0) - dragState.startClientY) / zoom),
+      };
+      setTerminalBreakoutDocumentWindowLayout(nextLayout);
+      terminalBreakoutDocumentWindowLayoutRef.current = nextLayout;
+    };
+
+    const handlePointerUp = (upEvent) => {
+      if (
+        terminalBreakoutDocumentWindowDragRef.current
+        && upEvent.pointerId !== terminalBreakoutDocumentWindowDragRef.current.pointerId
+      ) {
+        return;
+      }
+      stopTerminalBreakoutDocumentWindowDrag();
+    };
+
+    window.addEventListener("pointermove", handlePointerMove, { passive: false });
+    window.addEventListener("pointerup", handlePointerUp, { passive: true });
+    window.addEventListener("pointercancel", handlePointerUp, { passive: true });
+    terminalBreakoutDocumentWindowDragCleanupRef.current = () => {
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+    };
+  }, [
+    stopTerminalBreakoutDocumentWindowDrag,
+    terminalBreakoutLayoutActive,
+    terminalBreakoutDocumentWindowLayout,
+  ]);
+
+  useEffect(() => stopTerminalBreakoutDocumentWindowDrag, [
+    stopTerminalBreakoutDocumentWindowDrag,
+  ]);
+
   useEffect(() => {
     if (!terminalBreakoutLayoutActive || !terminalBreakoutArchitectureSignature) {
       return;
@@ -24594,10 +24829,25 @@ function TerminalView({
       };
     });
 
+    const documentPanelElement = root.querySelector(TERMINAL_DOCUMENT_PANEL_ANCHOR_SELECTOR);
+    const documentPanelDomRect = documentPanelElement?.getBoundingClientRect?.();
+    const nextDocumentPanelRect = documentPanelDomRect
+      ? {
+        height: documentPanelDomRect.height,
+        left: documentPanelDomRect.left - rootRect.left,
+        top: documentPanelDomRect.top - rootRect.top,
+        width: documentPanelDomRect.width,
+      }
+      : null;
+
     terminalLayoutRectsRef.current = nextRects;
+    terminalDocumentPanelRectRef.current = nextDocumentPanelRect;
     terminalPanelRectRef.current = nextPanelRect;
     setTerminalLayoutRects((currentRects) => (
       areRectMapsEqual(currentRects, nextRects) ? currentRects : nextRects
+    ));
+    setTerminalDocumentPanelRect((currentRect) => (
+      areRectsEqual(currentRect, nextDocumentPanelRect) ? currentRect : nextDocumentPanelRect
     ));
     setTerminalPanelRect((currentRect) => (
       areRectsEqual(currentRect, nextPanelRect) ? currentRect : nextPanelRect
@@ -25547,7 +25797,7 @@ function TerminalView({
 
   useLayoutEffect(() => {
     measureTerminalLayout();
-  }, [activeDisplayRowsSignature, fullscreenActive, measureTerminalLayout]);
+  }, [activeDisplayRowsSignature, fullscreenActive, measureTerminalLayout, workspaceDocumentPanelAvailable]);
 
   useEffect(() => {
     const root = terminalPanelsRef.current;
@@ -25560,9 +25810,12 @@ function TerminalView({
     root.querySelectorAll(TERMINAL_PANEL_ANCHOR_SELECTOR).forEach((element) => {
       observer.observe(element);
     });
+    root.querySelectorAll(TERMINAL_DOCUMENT_PANEL_ANCHOR_SELECTOR).forEach((element) => {
+      observer.observe(element);
+    });
 
     return () => observer.disconnect();
-  }, [activeDisplayRowsSignature, scheduleMeasureTerminalLayout]);
+  }, [activeDisplayRowsSignature, scheduleMeasureTerminalLayout, workspaceDocumentPanelAvailable]);
 
   useEffect(() => {
     window.addEventListener("resize", scheduleMeasureTerminalLayout);
@@ -25709,10 +25962,26 @@ function TerminalView({
     measureTerminalLayout();
     clearTerminalBreakoutTransitionTimer();
     const { placements } = buildCurrentBreakoutPlacements({ preserveExisting: true });
+    const documentPlacement = workspaceDocumentPanelAvailable
+      ? buildTerminalBreakoutDocumentPlacement({
+        existingPlacement: terminalBreakoutDocumentWindowLayoutRef.current,
+        terminalPlacements: placements,
+        terminalScale: terminalBreakoutTerminalScaleRef.current,
+      })
+      : null;
+    if (documentPlacement) {
+      setTerminalBreakoutDocumentWindowLayout(documentPlacement);
+      terminalBreakoutDocumentWindowLayoutRef.current = documentPlacement;
+    }
+    const fitPlacements = breakoutPlacementsWithDocumentPanel(
+      placements,
+      documentPlacement,
+      workspaceDocumentPanelAvailable,
+    );
     updateTerminalBreakoutPlacements(placements);
     setTerminalBreakoutViewportState(getBreakoutFitViewport(
       terminalPanelRectRef.current,
-      placements,
+      fitPlacements,
       TERMINAL_BREAKOUT_DEFAULT_ZOOM,
       terminalBreakoutTerminalScaleRef.current,
     ));
@@ -25733,6 +26002,7 @@ function TerminalView({
     setTerminalBreakoutViewportState,
     terminalWorkspace?.id,
     updateTerminalBreakoutPlacements,
+    workspaceDocumentPanelAvailable,
   ]);
 
   const closeTerminalBreakout = useCallback(() => {
@@ -25764,6 +26034,78 @@ function TerminalView({
 
     closeTerminalBreakout();
   }, [closeTerminalBreakout, openTerminalBreakout]);
+
+  const openWorkspaceDocumentPanel = useCallback((entry) => {
+    if (!workspaceDocumentPanelAvailable) {
+      return;
+    }
+    setTerminalBreakoutDocumentPanel(normalizeWorkspaceDocumentPanelEntry(entry));
+    const documentPlacement = buildTerminalBreakoutDocumentPlacement({
+      existingPlacement: terminalBreakoutDocumentWindowLayoutRef.current,
+      terminalPlacements: terminalBreakoutPlacementsRef.current,
+      terminalScale: terminalBreakoutTerminalScaleRef.current,
+    });
+    const nextPlacement = {
+      ...documentPlacement,
+      z: getTerminalBreakoutMaxZ(
+        terminalBreakoutPlacementsRef.current,
+        { document: documentPlacement },
+      ) + 1,
+    };
+    setTerminalBreakoutDocumentWindowLayout(nextPlacement);
+    terminalBreakoutDocumentWindowLayoutRef.current = nextPlacement;
+    if (terminalBreakoutPhaseRef.current === TERMINAL_BREAKOUT_PHASE_GRID) {
+      openTerminalBreakout();
+      return;
+    }
+    setTerminalBreakoutViewportState(getBreakoutFitViewport(
+      terminalPanelRectRef.current,
+      breakoutPlacementsWithDocumentPanel(
+        terminalBreakoutPlacementsRef.current,
+        nextPlacement,
+        true,
+      ),
+      null,
+      terminalBreakoutTerminalScaleRef.current,
+    ));
+  }, [
+    openTerminalBreakout,
+    setTerminalBreakoutViewportState,
+    workspaceDocumentPanelAvailable,
+  ]);
+
+  useEffect(() => {
+    if (!workspaceDocumentPanelAvailable) {
+      setTerminalBreakoutDocumentPanel(null);
+    }
+  }, [workspaceDocumentPanelAvailable]);
+
+  useEffect(() => {
+    const wasAvailable = workspaceDocumentPanelAvailableRef.current;
+    workspaceDocumentPanelAvailableRef.current = workspaceDocumentPanelAvailable;
+    if (!workspaceDocumentPanelAvailable || wasAvailable) {
+      return;
+    }
+    const documentPlacement = buildTerminalBreakoutDocumentPlacement({
+      existingPlacement: null,
+      terminalPlacements: terminalBreakoutPlacementsRef.current,
+      terminalScale: terminalBreakoutTerminalScaleRef.current,
+    });
+    setTerminalBreakoutDocumentWindowLayout(documentPlacement);
+    terminalBreakoutDocumentWindowLayoutRef.current = documentPlacement;
+    if (terminalBreakoutPhaseRef.current !== TERMINAL_BREAKOUT_PHASE_GRID) {
+      setTerminalBreakoutViewportState(getBreakoutFitViewport(
+        terminalPanelRectRef.current,
+        breakoutPlacementsWithDocumentPanel(
+          terminalBreakoutPlacementsRef.current,
+          documentPlacement,
+          true,
+        ),
+        null,
+        terminalBreakoutTerminalScaleRef.current,
+      ));
+    }
+  }, [setTerminalBreakoutViewportState, workspaceDocumentPanelAvailable]);
 
   useEffect(() => {
     windowBreakoutPanesRef.current = windowBreakoutPanes;
@@ -26007,10 +26349,26 @@ function TerminalView({
     }
 
     const { placements } = buildCurrentBreakoutPlacements({ preserveExisting: false });
+    const documentPlacement = workspaceDocumentPanelAvailable
+      ? buildTerminalBreakoutDocumentPlacement({
+        existingPlacement: null,
+        terminalPlacements: placements,
+        terminalScale: terminalBreakoutTerminalScaleRef.current,
+      })
+      : null;
+    if (documentPlacement) {
+      setTerminalBreakoutDocumentWindowLayout(documentPlacement);
+      terminalBreakoutDocumentWindowLayoutRef.current = documentPlacement;
+    }
+    const fitPlacements = breakoutPlacementsWithDocumentPanel(
+      placements,
+      documentPlacement,
+      workspaceDocumentPanelAvailable,
+    );
     updateTerminalBreakoutPlacements(placements);
     setTerminalBreakoutViewportState(getBreakoutFitViewport(
       terminalPanelRectRef.current,
-      placements,
+      fitPlacements,
       TERMINAL_BREAKOUT_DEFAULT_ZOOM,
       terminalBreakoutTerminalScaleRef.current,
     ));
@@ -26019,17 +26377,23 @@ function TerminalView({
     setTerminalBreakoutViewportState,
     terminalBreakoutVisible,
     updateTerminalBreakoutPlacements,
+    workspaceDocumentPanelAvailable,
   ]);
 
   const fitTerminalBreakoutCanvas = useCallback(() => {
     const panelRect = terminalPanelRectRef.current;
+    const fitPlacements = breakoutPlacementsWithDocumentPanel(
+      terminalBreakoutPlacementsRef.current,
+      terminalBreakoutDocumentWindowLayoutRef.current,
+      workspaceDocumentPanelAvailable,
+    );
     setTerminalBreakoutViewportState(getBreakoutFitViewport(
       panelRect,
-      terminalBreakoutPlacementsRef.current,
+      fitPlacements,
       null,
       terminalBreakoutTerminalScaleRef.current,
     ));
-  }, [setTerminalBreakoutViewportState]);
+  }, [setTerminalBreakoutViewportState, workspaceDocumentPanelAvailable]);
 
   const zoomTerminalBreakoutCanvas = useCallback((factor, anchor = {}) => {
     const panelRect = terminalPanelRectRef.current;
@@ -31511,6 +31875,7 @@ function TerminalView({
 
     onWorkspaceToolRuntimeBridgeChange(workspaceId, {
       onBeginTodoDrag: handleWorkspaceToolBeginTodoDrag,
+      onOpenDocumentPanel: openWorkspaceDocumentPanel,
       onToggleTerminalBreakout: toggleTerminalBreakout,
       onToggleWindowBreakout: toggleWindowBreakout,
       onVoiceAgentToolCall: handleVoiceAgentToolCall,
@@ -31527,6 +31892,7 @@ function TerminalView({
     handleVoiceAgentToolCall,
     handleVoicePlanServerResult,
     onWorkspaceToolRuntimeBridgeChange,
+    openWorkspaceDocumentPanel,
     terminalBreakoutVisible,
     terminalWorkspace?.id,
     toggleTerminalBreakout,
@@ -33558,6 +33924,64 @@ function TerminalView({
     terminalPanelRect,
   ]);
 
+  const getDocumentPanelSlotStyle = useCallback(() => {
+    const placement = normalizeBreakoutPlacement(terminalBreakoutDocumentWindowLayout);
+    const viewport = normalizeBreakoutViewport(terminalBreakoutViewport);
+
+    if (!terminalBreakoutLayoutActive) {
+      const rect = terminalDocumentPanelRect;
+      if (!rect) {
+        return {
+          "--terminal-slot-height": "0px",
+          "--terminal-slot-inverse-scale": "1",
+          "--terminal-slot-scale": "1",
+          "--terminal-slot-width": "0px",
+          "--terminal-slot-x": "0px",
+          "--terminal-slot-y": "0px",
+        };
+      }
+      return {
+        "--terminal-slot-height": `${Math.max(0, rect.height || 0)}px`,
+        "--terminal-slot-inverse-scale": "1",
+        "--terminal-slot-scale": "1",
+        "--terminal-slot-width": `${Math.max(0, rect.width || 0)}px`,
+        "--terminal-slot-x": `${rect.left || 0}px`,
+        "--terminal-slot-y": `${rect.top || 0}px`,
+        "--terminal-slot-z": 130,
+      };
+    }
+
+    if (!placement) {
+      return {
+        "--terminal-slot-height": "0px",
+        "--terminal-slot-inverse-scale": "1",
+        "--terminal-slot-scale": "1",
+        "--terminal-slot-width": "0px",
+        "--terminal-slot-x": "0px",
+        "--terminal-slot-y": "0px",
+      };
+    }
+
+    const zoom = Math.max(0.001, viewport.zoom);
+    const scale = clampBreakoutTerminalScale(terminalBreakoutTerminalScale);
+    const effectiveScale = Math.max(0.001, zoom * scale);
+    return {
+      "--terminal-slot-height": `${Math.max(0, placement.height || 0)}px`,
+      "--terminal-slot-inverse-scale": `${1 / effectiveScale}`,
+      "--terminal-slot-scale": `${effectiveScale}`,
+      "--terminal-slot-width": `${Math.max(0, placement.width || 0)}px`,
+      "--terminal-slot-x": `${((placement.x || 0) * zoom) + viewport.x}px`,
+      "--terminal-slot-y": `${((placement.y || 0) * zoom) + viewport.y}px`,
+      "--terminal-slot-z": placement.z || 1,
+    };
+  }, [
+    terminalDocumentPanelRect,
+    terminalBreakoutDocumentWindowLayout,
+    terminalBreakoutLayoutActive,
+    terminalBreakoutTerminalScale,
+    terminalBreakoutViewport,
+  ]);
+
   const todoDragOverDropTarget = Boolean(
     todoDragActive && Number.isInteger(todoDragState?.targetTerminalIndex),
   );
@@ -33567,6 +33991,7 @@ function TerminalView({
   const todoDragHasPreview = Boolean(todoDragImages.length || todoDragNote);
   const terminalBreakoutCanvasInteracting = Boolean(
     terminalBreakoutPanning
+      || terminalBreakoutDocumentWindowDragging
       || terminalDragState?.mode === "canvas"
       || terminalDragState?.mode === "canvas-resize",
   );
@@ -33585,53 +34010,82 @@ function TerminalView({
         data-breakout-visible={terminalBreakoutVisible ? "true" : "false"}
       >
         <ResizePanelGroup
-          id={`workspace-terminal-rows-${terminalWorkspace.id}`}
-          orientation="vertical"
+          id={`workspace-terminal-layout-${terminalWorkspace.id}`}
+          orientation="horizontal"
         >
-          {activeDisplayRows.map((row, rowOrderIndex) => (
-            <Fragment key={`row-${row.rowIndex}`}>
-              {rowOrderIndex > 0 && (
-                <ResizeHandle
-                  data-direction="vertical"
-                />
-              )}
+          {workspaceDocumentPanelAvailable && (
+            <>
               <ResizePanel
-                data-terminal-row="true"
-                defaultSize={`${100 / activeDisplayRows.length}%`}
-                id={`workspace-terminal-row-${terminalWorkspace.id}-${row.rowIndex}`}
-                minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
+                data-terminal-document-panel-column="true"
+                defaultSize="28%"
+                id={`workspace-document-panel-${terminalWorkspace.id}`}
+                minSize="20%"
               >
-                <ResizePanelGroup
-                  id={`workspace-terminal-row-cols-${terminalWorkspace.id}-${row.rowIndex}`}
-                  orientation="horizontal"
-                >
-                  {row.terminalIndexes.map((terminalIndex, columnOrderIndex) => (
-                    <Fragment key={`${terminalWorkspace.id}-${terminalIndex}`}>
-                      {columnOrderIndex > 0 && (
-                        <ResizeHandle
-                          data-direction="horizontal"
-                        />
-                      )}
-                      <ResizePanel
-                        data-terminal-column="true"
-                        defaultSize={`${100 / row.terminalIndexes.length}%`}
-                        id={`workspace-terminal-pane-${terminalWorkspace.id}-${row.rowIndex}-${terminalIndex}`}
-                        minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
-                      >
-                        <TerminalPanelAnchor
-                          data-terminal-drag-placeholder={
-                            terminalDragState?.mode !== "canvas" && terminalDragState?.terminalIndex === terminalIndex ? "true" : undefined
-                          }
-                          data-terminal-index={terminalIndex}
-                          data-terminal-panel-anchor="true"
-                        />
-                      </ResizePanel>
-                    </Fragment>
-                  ))}
-                </ResizePanelGroup>
+                <TerminalPanelAnchor
+                  data-terminal-document-panel-anchor="true"
+                />
               </ResizePanel>
-            </Fragment>
-          ))}
+              <ResizeHandle
+                data-direction="horizontal"
+              />
+            </>
+          )}
+          <ResizePanel
+            data-terminal-grid-column="true"
+            defaultSize={workspaceDocumentPanelAvailable ? "72%" : "100%"}
+            id={`workspace-terminal-grid-${terminalWorkspace.id}`}
+            minSize={workspaceDocumentPanelAvailable ? "35%" : "100%"}
+          >
+            <ResizePanelGroup
+              id={`workspace-terminal-rows-${terminalWorkspace.id}`}
+              orientation="vertical"
+            >
+              {activeDisplayRows.map((row, rowOrderIndex) => (
+                <Fragment key={`row-${row.rowIndex}`}>
+                  {rowOrderIndex > 0 && (
+                    <ResizeHandle
+                      data-direction="vertical"
+                    />
+                  )}
+                  <ResizePanel
+                    data-terminal-row="true"
+                    defaultSize={`${100 / activeDisplayRows.length}%`}
+                    id={`workspace-terminal-row-${terminalWorkspace.id}-${row.rowIndex}`}
+                    minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
+                  >
+                    <ResizePanelGroup
+                      id={`workspace-terminal-row-cols-${terminalWorkspace.id}-${row.rowIndex}`}
+                      orientation="horizontal"
+                    >
+                      {row.terminalIndexes.map((terminalIndex, columnOrderIndex) => (
+                        <Fragment key={`${terminalWorkspace.id}-${terminalIndex}`}>
+                          {columnOrderIndex > 0 && (
+                            <ResizeHandle
+                              data-direction="horizontal"
+                            />
+                          )}
+                          <ResizePanel
+                            data-terminal-column="true"
+                            defaultSize={`${100 / row.terminalIndexes.length}%`}
+                            id={`workspace-terminal-pane-${terminalWorkspace.id}-${row.rowIndex}-${terminalIndex}`}
+                            minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
+                          >
+                            <TerminalPanelAnchor
+                              data-terminal-drag-placeholder={
+                                terminalDragState?.mode !== "canvas" && terminalDragState?.terminalIndex === terminalIndex ? "true" : undefined
+                              }
+                              data-terminal-index={terminalIndex}
+                              data-terminal-panel-anchor="true"
+                            />
+                          </ResizePanel>
+                        </Fragment>
+                      ))}
+                    </ResizePanelGroup>
+                  </ResizePanel>
+                </Fragment>
+              ))}
+            </ResizePanelGroup>
+          </ResizePanel>
         </ResizePanelGroup>
       </TerminalGridScaffold>
       <TerminalBreakoutCanvas
@@ -34123,6 +34577,70 @@ function TerminalView({
             </TerminalSurfaceSlot>
           );
         })}
+        {!fullscreenActive
+          && workspaceDocumentPanelAvailable
+          && (terminalBreakoutLayoutActive || terminalDocumentPanelRect) && (
+          <TerminalBreakoutDocumentWindow
+            aria-label={`Document panel: ${terminalBreakoutDocumentPanel?.title || "Documents"}`}
+            data-terminal-control="true"
+            data-terminal-document-panel="true"
+            onPointerDown={(event) => event.stopPropagation()}
+            style={getDocumentPanelSlotStyle()}
+          >
+            <TerminalBreakoutDocumentFrame>
+              <TerminalBreakoutArchitectureHeader
+                data-dragging={terminalBreakoutDocumentWindowDragging ? "true" : "false"}
+                onPointerDown={beginTerminalBreakoutDocumentWindowDrag}
+              >
+                <TerminalBreakoutArchitectureTitleStack>
+                  <TerminalBreakoutArchitectureKicker>
+                    Document Panel
+                  </TerminalBreakoutArchitectureKicker>
+                  <TerminalBreakoutArchitectureTitle title={terminalBreakoutDocumentPanel?.title || "Documents"}>
+                    {terminalBreakoutDocumentPanel?.title || "Documents"}
+                  </TerminalBreakoutArchitectureTitle>
+                </TerminalBreakoutArchitectureTitleStack>
+                <TerminalBreakoutArchitectureHeaderActions>
+                  <TerminalBreakoutArchitectureStatus data-status="ready">
+                    {terminalBreakoutDocumentPanel?.typeLabel || "Ready"}
+                  </TerminalBreakoutArchitectureStatus>
+                  {terminalBreakoutDocumentPanel && (
+                    <TerminalBreakoutArchitectureCloseButton
+                      aria-label="Clear document panel"
+                      onClick={(event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        setTerminalBreakoutDocumentPanel(null);
+                      }}
+                      onPointerDown={(event) => event.stopPropagation()}
+                      title="Clear document panel"
+                      type="button"
+                    >
+                      <Close aria-hidden="true" />
+                    </TerminalBreakoutArchitectureCloseButton>
+                  )}
+                </TerminalBreakoutArchitectureHeaderActions>
+              </TerminalBreakoutArchitectureHeader>
+              <TerminalBreakoutDocumentBody>
+                <TerminalBreakoutArchitectureSummary>
+                  <TerminalBreakoutArchitectureHeadline title={terminalBreakoutDocumentPanel?.title || "Documents"}>
+                    {terminalBreakoutDocumentPanel?.title || "Documents"}
+                  </TerminalBreakoutArchitectureHeadline>
+                  {(terminalBreakoutDocumentPanel?.localPath || terminalBreakoutDocumentPanel?.pathKey) && (
+                    <TerminalBreakoutArchitectureSubline
+                      title={terminalBreakoutDocumentPanel.localPath || terminalBreakoutDocumentPanel.pathKey}
+                    >
+                      {terminalBreakoutDocumentPanel.localPath || terminalBreakoutDocumentPanel.pathKey}
+                    </TerminalBreakoutArchitectureSubline>
+                  )}
+                </TerminalBreakoutArchitectureSummary>
+                <TerminalBreakoutDocumentContent>
+                  {terminalBreakoutDocumentPanel?.body || "No document selected."}
+                </TerminalBreakoutDocumentContent>
+              </TerminalBreakoutDocumentBody>
+            </TerminalBreakoutDocumentFrame>
+          </TerminalBreakoutDocumentWindow>
+        )}
       </TerminalSurfaceLayer>
       {terminalBreakoutControlsVisible && (
         <TerminalBreakoutTopBar data-terminal-control="true">
@@ -34271,6 +34789,7 @@ function TerminalView({
         coordinationTargets={normalizedTerminalWorkspaceCoordinationTargets}
         defaultWorkingDirectory={defaultWorkingDirectory}
         deviceLiveState={deviceLiveState}
+        documentPanelEnabled={workspaceDocumentPanelEnabled}
         dispatchTargets={workspaceTodoDispatchTargets}
         draft={todoQueueDraft}
         dropError={todoDropError}
@@ -34291,6 +34810,7 @@ function TerminalView({
         onDraftChange={setTodoQueueDraft}
         onDispatchTodoToTarget={dispatchTodoQueueItemToTarget}
         onMinimizePane={minimizeTodoQueuePane}
+        onOpenDocumentPanel={openWorkspaceDocumentPanel}
         onOpenWorkspaceSettings={onOpenWorkspaceSettings}
         onAddToolTodo={addWorkspaceToolTodo}
         onQueueAllItems={queueAllTodoQueueItems}

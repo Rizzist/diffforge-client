@@ -473,6 +473,24 @@ fn terminal_runtime_snapshot_is_busy_turn(runtime: &TerminalRuntimeSnapshot) -> 
         )
 }
 
+fn terminal_prompt_ready_recovery_allowed(
+    metadata: &TerminalInstanceMetadata,
+    runtime: &TerminalRuntimeSnapshot,
+) -> bool {
+    if terminal_runtime_snapshot_is_starting(runtime) {
+        return true;
+    }
+
+    // Claude Code can keep prompt-looking rows visible while a turn is still
+    // active. For Claude, real Stop hooks are the only non-startup completion
+    // authority; output-tail prompt markers are only safe for startup recovery.
+    if terminal_metadata_is_claude(metadata) {
+        return false;
+    }
+
+    terminal_runtime_snapshot_is_busy_turn(runtime)
+}
+
 fn terminal_runtime_startup_idle_fingerprint(runtime: &TerminalRuntimeSnapshot) -> Value {
     json!({
         "status": runtime.status,
@@ -980,6 +998,16 @@ fn terminal_record_workspace_provider_session_binding(
     if let Some(app) = app.as_ref() {
         terminal_emit_provider_session_binding(app, &binding, None);
     }
+    let history_status = terminal_runtime_snapshot(instance).activity_status;
+    terminal_record_workspace_agent_session_history(
+        app.clone(),
+        instance,
+        None,
+        None,
+        &history_status,
+        format!("{source}:provider-session"),
+        None,
+    );
     let root_directory = terminal_provider_session_binding_root(instance);
     let emit_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -994,6 +1022,135 @@ fn terminal_record_workspace_provider_session_binding(
             }
             Err(error) => log_terminal_status_event(
                 "backend.terminal_provider_session.binding_record_error",
+                json!({
+                    "error": clean_terminal_diagnostic_log_text(&error),
+                    "source": source,
+                }),
+            ),
+        }
+    });
+}
+
+fn terminal_workspace_agent_session_history_id(instance: &TerminalInstance) -> String {
+    instance
+        .coordination
+        .as_ref()
+        .map(|coordination| coordination.session_id.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| format!("terminal:{}:{}", instance.metadata.pane_id, instance.id))
+}
+
+fn terminal_workspace_agent_session_slot_key(
+    instance: &TerminalInstance,
+    override_slot_key: Option<&str>,
+) -> String {
+    override_slot_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            instance
+                .coordination
+                .as_ref()
+                .and_then(|coordination| terminal_coordination_env_value(coordination, "COORDINATION_SLOT_KEY"))
+        })
+        .unwrap_or_default()
+}
+
+fn terminal_workspace_agent_session_title(instance: &TerminalInstance) -> String {
+    let metadata = &instance.metadata;
+    [
+        metadata.terminal_nickname.as_str(),
+        metadata.terminal_name.as_str(),
+        metadata.agent_kind.as_str(),
+        metadata.agent_id.as_str(),
+    ]
+    .into_iter()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .unwrap_or("Coding agent session")
+    .to_string()
+}
+
+fn terminal_emit_workspace_agent_session_history_changed(
+    app: &AppHandle,
+    record: &WorkspaceAgentSessionHistoryRecord,
+    recorded: Option<bool>,
+) {
+    let mut payload = serde_json::to_value(record).unwrap_or_else(|_| json!({}));
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("type".to_string(), json!("workspace-agent-session-history"));
+        object.insert("recorded".to_string(), json!(recorded));
+        object.insert("workspaceId".to_string(), json!(record.workspace_id.clone()));
+        object.insert("sessionHistoryId".to_string(), json!(record.id.clone()));
+    }
+    let _ = app.emit(WORKSPACE_AGENT_SESSION_HISTORY_CHANGED_EVENT, payload);
+}
+
+fn terminal_record_workspace_agent_session_history(
+    app: Option<AppHandle>,
+    instance: &TerminalInstance,
+    model_id: Option<&str>,
+    model_source: Option<&str>,
+    status: &str,
+    source: impl Into<String>,
+    slot_key_override: Option<&str>,
+) {
+    let source = source.into();
+    let metadata = instance.metadata.clone();
+    if metadata.workspace_id.trim().is_empty() {
+        return;
+    }
+    let runtime = terminal_runtime_snapshot(instance);
+    let coordination_session_id = instance
+        .coordination
+        .as_ref()
+        .map(|coordination| coordination.session_id.clone())
+        .unwrap_or_default();
+    let record = WorkspaceAgentSessionHistoryRecord {
+        id: terminal_workspace_agent_session_history_id(instance),
+        workspace_id: metadata.workspace_id,
+        workspace_name: metadata.workspace_name,
+        coordination_session_id,
+        provider_session_id: runtime.provider_session_id.clone().unwrap_or_default(),
+        native_session_id: runtime
+            .native_session_id
+            .clone()
+            .or(runtime.provider_session_id.clone())
+            .unwrap_or_default(),
+        agent_id: metadata.agent_id,
+        provider: metadata.agent_kind,
+        model_id: model_id.unwrap_or_default().trim().to_string(),
+        model_source: model_source.unwrap_or_default().trim().to_string(),
+        thread_id: metadata.thread_id,
+        pane_id: metadata.pane_id,
+        terminal_instance_id: Some(instance.id),
+        terminal_index: metadata.terminal_index.map(i64::from),
+        slot_key: terminal_workspace_agent_session_slot_key(instance, slot_key_override),
+        cwd: instance.working_directory.to_string_lossy().to_string(),
+        status: status.trim().to_string(),
+        title: terminal_workspace_agent_session_title(instance),
+        source: source.clone(),
+        observed_at_ms: Some(terminal_now_ms()),
+        created_at_ms: None,
+    };
+    if let Some(app) = app.as_ref() {
+        terminal_emit_workspace_agent_session_history_changed(app, &record, None);
+    }
+    let root_directory = terminal_provider_session_binding_root(instance);
+    let emit_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        match workspace_agent_session_history_upsert_blocking(
+            Some(root_directory.as_str()),
+            record.clone(),
+        ) {
+            Ok(recorded) => {
+                if let Some(app) = emit_app.as_ref() {
+                    terminal_emit_workspace_agent_session_history_changed(app, &record, Some(recorded));
+                }
+            }
+            Err(error) => log_terminal_status_event(
+                "backend.workspace_agent_session_history.record_error",
                 json!({
                     "error": clean_terminal_diagnostic_log_text(&error),
                     "source": source,
@@ -1689,6 +1846,13 @@ fn terminal_metadata_is_opencode(metadata: &TerminalInstanceMetadata) -> bool {
     let agent_kind = metadata.agent_kind.trim().to_ascii_lowercase();
 
     agent_id.contains("opencode") || agent_kind.contains("opencode")
+}
+
+fn terminal_metadata_is_claude(metadata: &TerminalInstanceMetadata) -> bool {
+    let agent_id = metadata.agent_id.trim().to_ascii_lowercase();
+    let agent_kind = metadata.agent_kind.trim().to_ascii_lowercase();
+
+    agent_id.contains("claude") || agent_kind.contains("claude")
 }
 
 fn terminal_metadata_is_codex(metadata: &TerminalInstanceMetadata) -> bool {
@@ -4003,7 +4167,7 @@ fn spawn_terminal_reader(
             return;
         }
         let startup_ready = terminal_runtime_snapshot_is_starting(&runtime);
-        if !startup_ready && !terminal_runtime_snapshot_is_busy_turn(&runtime) {
+        if !terminal_prompt_ready_recovery_allowed(&instance.metadata, &runtime) {
             return;
         }
         if !startup_ready {
@@ -4022,8 +4186,7 @@ fn spawn_terminal_reader(
                     };
                 runtime = terminal_runtime_snapshot(&instance);
                 if runtime.input_ready
-                    || (!terminal_runtime_snapshot_is_starting(&runtime)
-                        && !terminal_runtime_snapshot_is_busy_turn(&runtime))
+                    || !terminal_prompt_ready_recovery_allowed(&instance.metadata, &runtime)
                 {
                     return;
                 }
@@ -5686,6 +5849,15 @@ async fn terminal_open(
         requested_provider_session_id.as_deref(),
         "terminal-open",
     );
+    terminal_record_workspace_agent_session_history(
+        Some(app.clone()),
+        &instance,
+        resolved_launch.model.as_deref(),
+        resolved_launch.model_source.as_deref(),
+        &runtime_snapshot.activity_status,
+        "terminal_open",
+        Some(terminal_slot_key.as_str()),
+    );
     if let (Some(coordination), Some(provider_session_id)) = (
         terminal_coordination.clone(),
         requested_provider_session_id.clone(),
@@ -6816,6 +6988,15 @@ async fn start_terminal_agent_in_prepared_pty(
                     &instance,
                     resume_session_id.as_deref(),
                     "terminal-start-agent",
+                );
+                terminal_record_workspace_agent_session_history(
+                    Some(app.clone()),
+                    &instance,
+                    resolved_launch.model.as_deref(),
+                    resolved_launch.model_source.as_deref(),
+                    "starting",
+                    "terminal_start_agent",
+                    None,
                 );
                 if let (Some(coordination), Some(provider_session_id)) =
                     (instance.coordination.clone(), resume_session_id.clone())
@@ -10177,6 +10358,30 @@ fn terminal_activity_hook_bool(event: &Value, keys: &[&str]) -> bool {
         .any(|key| event.get(*key).and_then(Value::as_bool).unwrap_or(false))
 }
 
+fn terminal_activity_hook_value_has_entries(event: &Value, keys: &[&str]) -> bool {
+    keys.iter().any(|key| match event.get(*key) {
+        Some(Value::Array(items)) => !items.is_empty(),
+        Some(Value::Object(object)) => !object.is_empty(),
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Number(_)) => true,
+        _ => false,
+    })
+}
+
+fn terminal_activity_hook_claude_stop_has_background_work(event: &Value) -> bool {
+    terminal_activity_hook_bool(event, &["stopHookActive", "stop_hook_active"])
+        || terminal_activity_hook_value_has_entries(
+            event,
+            &[
+                "backgroundTasks",
+                "background_tasks",
+                "sessionCrons",
+                "session_crons",
+            ],
+        )
+}
+
 fn terminal_activity_hook_status_key(event: &Value, keys: &[&str]) -> Option<String> {
     terminal_activity_hook_string(event, keys).map(|value| terminal_activity_hook_name_key(&value))
 }
@@ -10721,6 +10926,7 @@ fn terminal_activity_hook_payload(
         ],
     )?;
     let manual_prompt = terminal_activity_hook_manual_prompt(&hook_event_name, event);
+    let metadata = instance.metadata.clone();
     let (event_type, activity_status, status, command_phase, input_ready, completion_evidence) =
         if manual_prompt.is_some() {
             (
@@ -10736,18 +10942,33 @@ fn terminal_activity_hook_payload(
                 if let Some((event_type, activity_status, status, command_phase, input_ready)) =
                     terminal_activity_hook_lifecycle_kind(&hook_event_name)
                 {
-                    (
-                        event_type,
-                        activity_status,
-                        status,
-                        command_phase,
-                        input_ready,
-                        if input_ready {
-                            "cli_hook_stop"
-                        } else {
-                            "cli_hook_prompt_submit"
-                        },
-                    )
+                    let hook_key = terminal_activity_hook_name_key(&hook_event_name);
+                    let claude_stop_has_background_work = hook_key == "stop"
+                        && terminal_metadata_is_claude(&metadata)
+                        && terminal_activity_hook_claude_stop_has_background_work(event);
+                    if claude_stop_has_background_work {
+                        (
+                            "provider-turn-background-active",
+                            "thinking",
+                            "active",
+                            "background_running",
+                            false,
+                            "cli_hook_stop_background_active",
+                        )
+                    } else {
+                        (
+                            event_type,
+                            activity_status,
+                            status,
+                            command_phase,
+                            input_ready,
+                            if input_ready {
+                                "cli_hook_stop"
+                            } else {
+                                "cli_hook_prompt_submit"
+                            },
+                        )
+                    }
                 } else {
                     terminal_activity_hook_activity_kind(&hook_event_name, event)?
                 };
@@ -10760,7 +10981,6 @@ fn terminal_activity_hook_payload(
                 evidence,
             )
         };
-    let metadata = instance.metadata.clone();
     let now_ms = terminal_now_ms();
     let event_time_ms = event
         .get("timestampMs")
@@ -11352,6 +11572,17 @@ fn apply_terminal_activity_hook_payload(
     tauri::async_runtime::spawn(async move {
         cloud_mcp_sync_terminal_activity_hook_delta(&cloud_state, &cloud_payload).await;
     });
+    if payload.provider_session_id.is_none() {
+        terminal_record_workspace_agent_session_history(
+            Some(app.clone()),
+            instance,
+            None,
+            None,
+            &payload.activity_status,
+            "terminal_activity_hook",
+            None,
+        );
+    }
     if let Some(provider_session_id) = payload
         .provider_session_id
         .as_deref()
@@ -15942,8 +16173,28 @@ mod terminal_tests {
             hook_event_name: "BackendPromptSubmit".to_string(),
             updated_at_ms: 1,
         };
+        let codex_metadata = terminal_projection_test_metadata();
+        let mut claude_metadata = codex_metadata.clone();
+        claude_metadata.agent_id = "claude".to_string();
+        claude_metadata.agent_kind = "claude".to_string();
 
         assert!(terminal_runtime_snapshot_is_busy_turn(&runtime));
+        assert!(terminal_prompt_ready_recovery_allowed(
+            &codex_metadata,
+            &runtime
+        ));
+        assert!(!terminal_prompt_ready_recovery_allowed(
+            &claude_metadata,
+            &runtime
+        ));
+
+        runtime.status = "starting".to_string();
+        runtime.activity_status = "starting".to_string();
+        runtime.command_phase = "starting".to_string();
+        assert!(terminal_prompt_ready_recovery_allowed(
+            &claude_metadata,
+            &runtime
+        ));
 
         runtime.input_ready = true;
         runtime.activity_status = "idle".to_string();
@@ -15958,6 +16209,24 @@ mod terminal_tests {
         runtime.activity_status = "error".to_string();
         runtime.command_phase = "failed".to_string();
         assert!(!terminal_runtime_snapshot_is_busy_turn(&runtime));
+    }
+
+    #[test]
+    fn claude_stop_background_metadata_blocks_ready_completion() {
+        assert!(terminal_activity_hook_claude_stop_has_background_work(&json!({
+            "stopHookActive": true,
+        })));
+        assert!(terminal_activity_hook_claude_stop_has_background_work(&json!({
+            "backgroundTasks": [{ "id": "task-1" }],
+        })));
+        assert!(terminal_activity_hook_claude_stop_has_background_work(&json!({
+            "session_crons": [{ "id": "cron-1" }],
+        })));
+        assert!(!terminal_activity_hook_claude_stop_has_background_work(&json!({
+            "stopHookActive": false,
+            "backgroundTasks": [],
+            "sessionCrons": [],
+        })));
     }
 
     #[test]

@@ -2832,6 +2832,12 @@ fn diff_forge_activity_hook_record(
                 .unwrap_or(false)
         })
     };
+    let hook_value = |keys: &[&str]| -> Value {
+        keys.iter()
+            .find_map(|key| hook_input.get(*key))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
     let tool_bool = |keys: &[&str]| -> bool {
         keys.iter().any(|key| {
             tool_input
@@ -2990,6 +2996,9 @@ fn diff_forge_activity_hook_record(
         "startingIdleBuffered",
         "starting_idle_buffered",
     ]);
+    let stop_hook_active = hook_bool(&["stopHookActive", "stop_hook_active"]);
+    let background_tasks = hook_value(&["backgroundTasks", "background_tasks"]);
+    let session_crons = hook_value(&["sessionCrons", "session_crons"]);
     let plan_update = diff_forge_native_plan_update(&tool_name, tool_input, hook_input);
     json!({
         "timestampMs": current_time_ms(),
@@ -3037,6 +3046,12 @@ fn diff_forge_activity_hook_record(
         "session_idle_without_prompt": startup_idle_candidate,
         "startupIdleBuffered": startup_idle_buffered,
         "startup_idle_buffered": startup_idle_buffered,
+        "stopHookActive": stop_hook_active,
+        "stop_hook_active": stop_hook_active,
+        "backgroundTasks": background_tasks.clone(),
+        "background_tasks": background_tasks,
+        "sessionCrons": session_crons.clone(),
+        "session_crons": session_crons,
         "description": if description.is_empty() { user_prompt } else { description },
     })
 }
@@ -3327,6 +3342,9 @@ mod terminal_cli_tests {
                 "userPrompt": "ship it",
                 "manualApprovalRequired": true,
                 "sessionIdleWithoutPrompt": true,
+                "stopHookActive": true,
+                "backgroundTasks": [{ "id": "task-1" }],
+                "sessionCrons": [{ "id": "cron-1" }],
                 "approvalId": "approval-123",
                 "promptingUserKind": "approval",
                 "toolInput": {
@@ -3345,6 +3363,12 @@ mod terminal_cli_tests {
         assert_eq!(record["startup_idle_candidate"], true);
         assert_eq!(record["sessionIdleWithoutPrompt"], true);
         assert_eq!(record["session_idle_without_prompt"], true);
+        assert_eq!(record["stopHookActive"], true);
+        assert_eq!(record["stop_hook_active"], true);
+        assert_eq!(record["backgroundTasks"][0]["id"], "task-1");
+        assert_eq!(record["background_tasks"][0]["id"], "task-1");
+        assert_eq!(record["sessionCrons"][0]["id"], "cron-1");
+        assert_eq!(record["session_crons"][0]["id"], "cron-1");
         assert_eq!(record["approvalId"], "approval-123");
         assert_eq!(record["promptingUserKind"], "approval");
     }

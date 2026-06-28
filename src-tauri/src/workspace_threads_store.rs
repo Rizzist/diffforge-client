@@ -72,6 +72,77 @@ struct WorkspaceThreadsPersistResult {
     saved: usize,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceAgentSessionHistoryListRequest {
+    workspace_id: String,
+    root_directory: Option<String>,
+    limit: Option<usize>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceAgentSessionHistoryItem {
+    id: String,
+    workspace_id: String,
+    workspace_name: String,
+    workspace_root: String,
+    coordination_session_id: String,
+    provider_session_id: String,
+    native_session_id: String,
+    agent_id: String,
+    provider: String,
+    model_id: String,
+    model_source: String,
+    thread_id: String,
+    pane_id: String,
+    terminal_instance_id: Option<u64>,
+    terminal_index: Option<i64>,
+    slot_key: String,
+    cwd: String,
+    status: String,
+    title: String,
+    source: String,
+    created_at_ms: u64,
+    latest_at_ms: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceAgentSessionHistoryListResult {
+    generated_at_ms: u64,
+    workspace_id: String,
+    root_directory: String,
+    db_path: String,
+    items: Vec<WorkspaceAgentSessionHistoryItem>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceAgentSessionHistoryRecord {
+    id: String,
+    workspace_id: String,
+    workspace_name: String,
+    coordination_session_id: String,
+    provider_session_id: String,
+    native_session_id: String,
+    agent_id: String,
+    provider: String,
+    model_id: String,
+    model_source: String,
+    thread_id: String,
+    pane_id: String,
+    terminal_instance_id: Option<u64>,
+    terminal_index: Option<i64>,
+    slot_key: String,
+    cwd: String,
+    status: String,
+    title: String,
+    source: String,
+    observed_at_ms: Option<u64>,
+    created_at_ms: Option<u64>,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkspaceThreadProviderSessionBinding {
@@ -127,7 +198,10 @@ fn workspace_threads_clean_agent_id(value: &str) -> Option<String> {
         "claude"
     } else if normalized.contains("opencode") || normalized.contains("open-code") {
         "opencode"
-    } else if normalized.contains("codex") {
+    } else if normalized.contains("codex")
+        || normalized.contains("openai")
+        || normalized.contains("open-ai")
+    {
         "codex"
     } else {
         normalized.as_str()
@@ -150,6 +224,22 @@ fn workspace_threads_clean_provider_session_id(value: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+fn workspace_threads_now_millis_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn workspace_threads_clean_optional_text(value: &str, max_len: usize) -> String {
+    value
+        .trim()
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(max_len)
+        .collect()
 }
 
 fn workspace_threads_store_db_path(root: &Path) -> Result<PathBuf, String> {
@@ -229,12 +319,245 @@ fn workspace_threads_open_store(
             CREATE INDEX IF NOT EXISTS idx_workspace_thread_provider_session_binding_session
                 ON workspace_thread_provider_session_binding(provider_session_id);
             CREATE INDEX IF NOT EXISTS idx_workspace_thread_provider_session_binding_workspace
-                ON workspace_thread_provider_session_binding(workspace_id);",
+                ON workspace_thread_provider_session_binding(workspace_id);
+            CREATE TABLE IF NOT EXISTS workspace_agent_session_history (
+                id TEXT PRIMARY KEY NOT NULL,
+                workspace_id TEXT NOT NULL,
+                workspace_root TEXT NOT NULL,
+                workspace_name TEXT NOT NULL DEFAULT '',
+                coordination_session_id TEXT NOT NULL DEFAULT '',
+                provider_session_id TEXT NOT NULL DEFAULT '',
+                native_session_id TEXT NOT NULL DEFAULT '',
+                agent_id TEXT NOT NULL,
+                provider TEXT NOT NULL DEFAULT '',
+                model_id TEXT NOT NULL DEFAULT '',
+                model_source TEXT NOT NULL DEFAULT '',
+                thread_id TEXT NOT NULL DEFAULT '',
+                pane_id TEXT NOT NULL DEFAULT '',
+                terminal_instance_id INTEGER,
+                terminal_index INTEGER,
+                slot_key TEXT NOT NULL DEFAULT '',
+                cwd TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                title TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT '',
+                created_at_ms INTEGER NOT NULL,
+                latest_at_ms INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_workspace_agent_session_history_workspace_latest
+                ON workspace_agent_session_history(workspace_id, latest_at_ms);
+            CREATE INDEX IF NOT EXISTS idx_workspace_agent_session_history_provider_session
+                ON workspace_agent_session_history(workspace_id, provider_session_id);
+            CREATE INDEX IF NOT EXISTS idx_workspace_agent_session_history_coordination
+                ON workspace_agent_session_history(coordination_session_id);
+            CREATE INDEX IF NOT EXISTS idx_workspace_agent_session_history_thread_agent
+                ON workspace_agent_session_history(workspace_id, thread_id, agent_id);",
         )
         .map_err(|error| {
             format!("Unable to initialize workspace threads SQLite schema: {error}")
         })?;
     Ok((connection, root, db_path))
+}
+
+fn workspace_agent_session_history_upsert_blocking(
+    root_directory: Option<&str>,
+    record: WorkspaceAgentSessionHistoryRecord,
+) -> Result<bool, String> {
+    let workspace_id = workspace_threads_clean_workspace_id(&record.workspace_id)?;
+    let Some(id) = workspace_threads_clean_thread_id(&record.id) else {
+        return Ok(false);
+    };
+    let Some(agent_id) = workspace_threads_clean_agent_id(&record.agent_id) else {
+        return Ok(false);
+    };
+    let provider = workspace_threads_clean_agent_id(&record.provider)
+        .unwrap_or_else(|| agent_id.clone());
+    let observed_at_ms = record
+        .observed_at_ms
+        .unwrap_or_else(workspace_threads_now_millis_u64);
+    let created_at_ms = record.created_at_ms.unwrap_or(observed_at_ms);
+    let now = workspace_threads_now_millis();
+    let (connection, root, _) = workspace_threads_open_store(root_directory, true)?;
+    let root_display = workspace_path_display(&root);
+    let terminal_instance_id = record.terminal_instance_id.map(|value| value as i64);
+    let title = workspace_threads_clean_optional_text(&record.title, 240);
+    let status = workspace_threads_clean_optional_text(&record.status, 64);
+
+    connection
+        .execute(
+            "INSERT INTO workspace_agent_session_history (
+                id,
+                workspace_id,
+                workspace_root,
+                workspace_name,
+                coordination_session_id,
+                provider_session_id,
+                native_session_id,
+                agent_id,
+                provider,
+                model_id,
+                model_source,
+                thread_id,
+                pane_id,
+                terminal_instance_id,
+                terminal_index,
+                slot_key,
+                cwd,
+                status,
+                title,
+                source,
+                created_at_ms,
+                latest_at_ms,
+                created_at,
+                updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23)
+            ON CONFLICT(id) DO UPDATE SET
+                workspace_id = excluded.workspace_id,
+                workspace_root = excluded.workspace_root,
+                workspace_name = CASE WHEN excluded.workspace_name != '' THEN excluded.workspace_name ELSE workspace_agent_session_history.workspace_name END,
+                coordination_session_id = CASE WHEN excluded.coordination_session_id != '' THEN excluded.coordination_session_id ELSE workspace_agent_session_history.coordination_session_id END,
+                provider_session_id = CASE WHEN excluded.provider_session_id != '' THEN excluded.provider_session_id ELSE workspace_agent_session_history.provider_session_id END,
+                native_session_id = CASE WHEN excluded.native_session_id != '' THEN excluded.native_session_id ELSE workspace_agent_session_history.native_session_id END,
+                agent_id = excluded.agent_id,
+                provider = CASE WHEN excluded.provider != '' THEN excluded.provider ELSE workspace_agent_session_history.provider END,
+                model_id = CASE WHEN excluded.model_id != '' THEN excluded.model_id ELSE workspace_agent_session_history.model_id END,
+                model_source = CASE WHEN excluded.model_source != '' THEN excluded.model_source ELSE workspace_agent_session_history.model_source END,
+                thread_id = CASE WHEN excluded.thread_id != '' THEN excluded.thread_id ELSE workspace_agent_session_history.thread_id END,
+                pane_id = CASE WHEN excluded.pane_id != '' THEN excluded.pane_id ELSE workspace_agent_session_history.pane_id END,
+                terminal_instance_id = COALESCE(excluded.terminal_instance_id, workspace_agent_session_history.terminal_instance_id),
+                terminal_index = COALESCE(excluded.terminal_index, workspace_agent_session_history.terminal_index),
+                slot_key = CASE WHEN excluded.slot_key != '' THEN excluded.slot_key ELSE workspace_agent_session_history.slot_key END,
+                cwd = CASE WHEN excluded.cwd != '' THEN excluded.cwd ELSE workspace_agent_session_history.cwd END,
+                status = CASE WHEN excluded.status != '' THEN excluded.status ELSE workspace_agent_session_history.status END,
+                title = CASE WHEN excluded.title != '' THEN excluded.title ELSE workspace_agent_session_history.title END,
+                source = CASE WHEN excluded.source != '' THEN excluded.source ELSE workspace_agent_session_history.source END,
+                created_at_ms = CASE WHEN workspace_agent_session_history.created_at_ms <= excluded.created_at_ms THEN workspace_agent_session_history.created_at_ms ELSE excluded.created_at_ms END,
+                latest_at_ms = CASE WHEN excluded.latest_at_ms >= workspace_agent_session_history.latest_at_ms THEN excluded.latest_at_ms ELSE workspace_agent_session_history.latest_at_ms END,
+                updated_at = excluded.updated_at",
+            rusqlite::params![
+                id,
+                workspace_id,
+                root_display,
+                workspace_threads_clean_optional_text(&record.workspace_name, 256),
+                workspace_threads_clean_optional_text(&record.coordination_session_id, 256),
+                workspace_threads_clean_provider_session_id(&record.provider_session_id).unwrap_or_default(),
+                workspace_threads_clean_provider_session_id(&record.native_session_id).unwrap_or_default(),
+                agent_id,
+                provider,
+                workspace_threads_clean_optional_text(&record.model_id, 160),
+                workspace_threads_clean_optional_text(&record.model_source, 80),
+                workspace_threads_clean_optional_text(&record.thread_id, 512),
+                workspace_threads_clean_optional_text(&record.pane_id, 256),
+                terminal_instance_id,
+                record.terminal_index,
+                workspace_threads_clean_optional_text(&record.slot_key, 128),
+                workspace_threads_clean_optional_text(&record.cwd, 2048),
+                status,
+                title,
+                workspace_threads_clean_optional_text(&record.source, 128),
+                created_at_ms as i64,
+                observed_at_ms as i64,
+                now,
+            ],
+        )
+        .map_err(|error| format!("Unable to persist workspace session history: {error}"))?;
+    Ok(true)
+}
+
+fn workspace_agent_session_history_list_blocking(
+    request: WorkspaceAgentSessionHistoryListRequest,
+) -> Result<WorkspaceAgentSessionHistoryListResult, String> {
+    let workspace_id = workspace_threads_clean_workspace_id(&request.workspace_id)?;
+    let limit = request.limit.unwrap_or(200).clamp(1, 500);
+    let (connection, root, db_path) =
+        workspace_threads_open_store(request.root_directory.as_deref(), true)?;
+    let root_display = workspace_path_display(&root);
+    let db_path_display = workspace_path_display(&db_path);
+    let mut statement = connection
+        .prepare(
+            "SELECT
+                id,
+                workspace_id,
+                workspace_name,
+                workspace_root,
+                coordination_session_id,
+                provider_session_id,
+                native_session_id,
+                agent_id,
+                provider,
+                model_id,
+                model_source,
+                thread_id,
+                pane_id,
+                terminal_instance_id,
+                terminal_index,
+                slot_key,
+                cwd,
+                status,
+                title,
+                source,
+                created_at_ms,
+                latest_at_ms
+            FROM workspace_agent_session_history
+            WHERE workspace_id = ?1
+            ORDER BY latest_at_ms DESC, created_at_ms DESC, id DESC
+            LIMIT ?2",
+        )
+        .map_err(|error| format!("Unable to prepare workspace session history read: {error}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![workspace_id.as_str(), limit as i64], |row| {
+            let terminal_instance_id = row
+                .get::<_, Option<i64>>(13)?
+                .and_then(|value| u64::try_from(value).ok());
+            let created_at_ms = row
+                .get::<_, i64>(20)
+                .ok()
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(0);
+            let latest_at_ms = row
+                .get::<_, i64>(21)
+                .ok()
+                .and_then(|value| u64::try_from(value).ok())
+                .unwrap_or(created_at_ms);
+            Ok(WorkspaceAgentSessionHistoryItem {
+                id: row.get(0)?,
+                workspace_id: row.get(1)?,
+                workspace_name: row.get(2)?,
+                workspace_root: row.get(3)?,
+                coordination_session_id: row.get(4)?,
+                provider_session_id: row.get(5)?,
+                native_session_id: row.get(6)?,
+                agent_id: row.get(7)?,
+                provider: row.get(8)?,
+                model_id: row.get(9)?,
+                model_source: row.get(10)?,
+                thread_id: row.get(11)?,
+                pane_id: row.get(12)?,
+                terminal_instance_id,
+                terminal_index: row.get(14)?,
+                slot_key: row.get(15)?,
+                cwd: row.get(16)?,
+                status: row.get(17)?,
+                title: row.get(18)?,
+                source: row.get(19)?,
+                created_at_ms,
+                latest_at_ms,
+            })
+        })
+        .map_err(|error| format!("Unable to read workspace session history rows: {error}"))?;
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|error| format!("Unable to read workspace session history row: {error}"))?);
+    }
+    Ok(WorkspaceAgentSessionHistoryListResult {
+        generated_at_ms: workspace_threads_now_millis_u64(),
+        workspace_id,
+        root_directory: root_display,
+        db_path: db_path_display,
+        items,
+    })
 }
 
 fn workspace_threads_collect_thread_entries(value: Option<Value>) -> Vec<(String, Value)> {
@@ -1128,6 +1451,17 @@ async fn workspace_threads_persist_delta(
         .map_err(|error| format!("Workspace threads delta persist worker failed: {error}"))?
 }
 
+#[tauri::command]
+async fn workspace_agent_session_history_list(
+    request: WorkspaceAgentSessionHistoryListRequest,
+) -> Result<WorkspaceAgentSessionHistoryListResult, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace_agent_session_history_list_blocking(request)
+    })
+    .await
+    .map_err(|error| format!("Workspace session history read worker failed: {error}"))?
+}
+
 #[cfg(test)]
 mod workspace_threads_store_tests {
     use super::*;
@@ -1208,6 +1542,137 @@ mod workspace_threads_store_tests {
                 .and_then(Value::as_str),
             Some("gpt-5.5")
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_agent_session_history_round_trips_by_workspace() {
+        let root = unique_workspace_threads_test_root("agent-session-history");
+        fs::create_dir_all(&root).expect("create workspace root");
+        let root_text = root.to_string_lossy().to_string();
+
+        let recorded = workspace_agent_session_history_upsert_blocking(
+            Some(root_text.as_str()),
+            WorkspaceAgentSessionHistoryRecord {
+                agent_id: "openai".to_string(),
+                coordination_session_id: "coord-session-1".to_string(),
+                created_at_ms: Some(1000),
+                cwd: root_text.clone(),
+                id: "session-history-1".to_string(),
+                model_id: "gpt-5.5".to_string(),
+                model_source: "launch".to_string(),
+                native_session_id: "".to_string(),
+                observed_at_ms: Some(2000),
+                pane_id: "pane-session-history".to_string(),
+                provider: "openai".to_string(),
+                provider_session_id: "".to_string(),
+                slot_key: "slot-a".to_string(),
+                source: "terminal-open".to_string(),
+                status: "starting".to_string(),
+                terminal_index: Some(2),
+                terminal_instance_id: Some(42),
+                thread_id: "thread-session-history".to_string(),
+                title: "Ada".to_string(),
+                workspace_id: "workspace-session-history".to_string(),
+                workspace_name: "Session History".to_string(),
+            },
+        )
+        .expect("record session history");
+        assert!(recorded);
+
+        let other_recorded = workspace_agent_session_history_upsert_blocking(
+            Some(root_text.as_str()),
+            WorkspaceAgentSessionHistoryRecord {
+                agent_id: "claude".to_string(),
+                coordination_session_id: "coord-other".to_string(),
+                created_at_ms: Some(1000),
+                cwd: root_text.clone(),
+                id: "session-history-other".to_string(),
+                model_id: "sonnet".to_string(),
+                model_source: "launch".to_string(),
+                native_session_id: "".to_string(),
+                observed_at_ms: Some(2000),
+                pane_id: "pane-other".to_string(),
+                provider: "claude".to_string(),
+                provider_session_id: "".to_string(),
+                slot_key: "slot-b".to_string(),
+                source: "terminal-open".to_string(),
+                status: "idle".to_string(),
+                terminal_index: Some(3),
+                terminal_instance_id: Some(43),
+                thread_id: "thread-other".to_string(),
+                title: "Other".to_string(),
+                workspace_id: "workspace-other".to_string(),
+                workspace_name: "Other".to_string(),
+            },
+        )
+        .expect("record other workspace session history");
+        assert!(other_recorded);
+
+        let result =
+            workspace_agent_session_history_list_blocking(WorkspaceAgentSessionHistoryListRequest {
+                limit: Some(50),
+                root_directory: Some(root_text.clone()),
+                workspace_id: "workspace-session-history".to_string(),
+            })
+            .expect("list session history");
+        assert_eq!(result.items.len(), 1);
+        let item = &result.items[0];
+        assert_eq!(item.id, "session-history-1");
+        assert_eq!(item.agent_id, "codex");
+        assert_eq!(item.model_id, "gpt-5.5");
+        assert_eq!(item.status, "starting");
+        assert_eq!(item.created_at_ms, 1000);
+        assert_eq!(item.latest_at_ms, 2000);
+        assert_eq!(item.terminal_index, Some(2));
+
+        let updated = workspace_agent_session_history_upsert_blocking(
+            Some(root_text.as_str()),
+            WorkspaceAgentSessionHistoryRecord {
+                agent_id: "codex".to_string(),
+                coordination_session_id: "coord-session-1".to_string(),
+                created_at_ms: None,
+                cwd: root_text.clone(),
+                id: "session-history-1".to_string(),
+                model_id: "".to_string(),
+                model_source: "".to_string(),
+                native_session_id: "codex-native-123".to_string(),
+                observed_at_ms: Some(3000),
+                pane_id: "pane-session-history".to_string(),
+                provider: "codex".to_string(),
+                provider_session_id: "codex-provider-123".to_string(),
+                slot_key: "".to_string(),
+                source: "provider-session".to_string(),
+                status: "idle".to_string(),
+                terminal_index: None,
+                terminal_instance_id: None,
+                thread_id: "thread-session-history".to_string(),
+                title: "".to_string(),
+                workspace_id: "workspace-session-history".to_string(),
+                workspace_name: "".to_string(),
+            },
+        )
+        .expect("update session history");
+        assert!(updated);
+
+        let result =
+            workspace_agent_session_history_list_blocking(WorkspaceAgentSessionHistoryListRequest {
+                limit: Some(50),
+                root_directory: Some(root_text.clone()),
+                workspace_id: "workspace-session-history".to_string(),
+            })
+            .expect("list updated session history");
+        assert_eq!(result.items.len(), 1);
+        let item = &result.items[0];
+        assert_eq!(item.model_id, "gpt-5.5");
+        assert_eq!(item.provider_session_id, "codex-provider-123");
+        assert_eq!(item.native_session_id, "codex-native-123");
+        assert_eq!(item.status, "idle");
+        assert_eq!(item.title, "Ada");
+        assert_eq!(item.created_at_ms, 1000);
+        assert_eq!(item.latest_at_ms, 3000);
+        assert_eq!(item.terminal_index, Some(2));
 
         let _ = fs::remove_dir_all(root);
     }

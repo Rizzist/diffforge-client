@@ -941,6 +941,7 @@ import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceVie
 import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
+import AccountDevicesView from "../devices/AccountDevicesView.jsx";
 import BackgroundMonitorWindow from "../background/BackgroundMonitorWindow.jsx";
 import { useAccountAssetsLibrary } from "../assets/useAccountAssetsLibrary.js";
 import { useUntrackedAssetsLibrary } from "../assets/useUntrackedAssetsLibrary.js";
@@ -1025,7 +1026,7 @@ const WORKSPACE_TAB_VIEW_BY_ID = {
   history: "architecture",
 };
 const WORKSPACE_TAB_IDS = new Set(Object.keys(WORKSPACE_TAB_VIEW_BY_ID));
-const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "snipping", "audio", "editor", "tokenomics", "settings"]);
+const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "devices", "assets", "snipping", "audio", "editor", "tokenomics", "settings"]);
 const DEVICE_LEVEL_APP_VIEW_IDS = new Set([...ACCOUNT_APP_VIEW_IDS, "architectures", "mcps", "clis", "scripts"]);
 const APP_SCRIPT_LEGACY_WORKSPACE_BUTTON_COLOR = "#1f3f7a";
 const APP_SCRIPT_LEGACY_LOOPSPACE_BUTTON_COLOR = "#4b3512";
@@ -2059,6 +2060,9 @@ function normalizeWorkspaceTabId(value) {
   if (normalized === "file" || normalized === "workspace_files") {
     return "files";
   }
+  if (normalized === "doc" || normalized === "docs" || normalized === "document" || normalized === "workspace_docs" || normalized === "workspace_documents") {
+    return DEFAULT_WORKSPACE_VIEW;
+  }
   if (normalized === "browser" || normalized === "workspace_web" || normalized === "workspace_browser") {
     return "web";
   }
@@ -2075,6 +2079,9 @@ function normalizeAccountAppViewId(value) {
   }
   if (normalized === "asset") {
     return "assets";
+  }
+  if (normalized === "device" || normalized === "machines" || normalized === "account_devices") {
+    return "devices";
   }
   if (normalized === "snippet" || normalized === "snippets" || normalized === "voice_snippets") {
     return "audio";
@@ -3807,6 +3814,9 @@ const MCP_TEXT_LIMIT = 12000;
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH = 2048;
 const MIN_WORKSPACE_TERMINAL_COUNT = 1;
 const MAX_WORKSPACE_TERMINAL_COUNT = 24;
+const MIN_WORKSPACE_DOCUMENT_COUNT = 0;
+const MAX_WORKSPACE_DOCUMENT_COUNT = 1;
+const DEFAULT_WORKSPACE_DOCUMENT_COUNT = 0;
 const WORKSPACE_TERMINAL_PRIMARY_COLUMNS = 2;
 const WORKSPACE_TERMINAL_WIDE_START_INDEX = 4;
 const WORKSPACE_TERMINAL_WIDE_COLUMNS = 4;
@@ -7010,6 +7020,198 @@ function loopspaceGraphRuntimeSignalPoint({
   };
 }
 
+const LOOPSPACE_RUNTIME_SIGNAL_ACTIVE_STATUSES = new Set([
+  "queued",
+  "running",
+  "resume_ready",
+  "resume_requested",
+]);
+const LOOPSPACE_RUNTIME_SIGNAL_STICKY_STATUSES = new Set([
+  "failed",
+  "interrupted",
+  "resume_ready",
+]);
+const LOOPSPACE_RUNTIME_SIGNAL_SUCCESS_VISIBLE_MS = 6500;
+const LOOPSPACE_RUNTIME_SIGNAL_FRAME_MS = 80;
+
+function useDocumentVisible() {
+  const [documentVisible, setDocumentVisible] = useState(() => (
+    typeof document === "undefined" || document.visibilityState !== "hidden"
+  ));
+
+  useEffect(() => {
+    if (typeof document === "undefined") return undefined;
+    const updateDocumentVisible = () => {
+      setDocumentVisible(document.visibilityState !== "hidden");
+    };
+    updateDocumentVisible();
+    document.addEventListener("visibilitychange", updateDocumentVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", updateDocumentVisible);
+    };
+  }, []);
+
+  return documentVisible;
+}
+
+function LoopspaceCronCountdownBadge({
+  nextDueAtMs,
+  visible = true,
+}) {
+  const documentVisible = useDocumentVisible();
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  const targetMs = Number(nextDueAtMs || 0);
+  const enabled = visible
+    && documentVisible
+    && Number.isFinite(targetMs)
+    && targetMs > 0;
+
+  useEffect(() => {
+    if (!enabled || typeof window === "undefined") return undefined;
+    const refresh = () => setNowMs(Date.now());
+    refresh();
+    const timer = window.setInterval(refresh, 1000);
+    return () => window.clearInterval(timer);
+  }, [enabled, targetMs]);
+
+  if (!visible || !Number.isFinite(targetMs) || targetMs <= 0) {
+    return null;
+  }
+
+  const countdown = formatLoopspaceCountdown(targetMs, nowMs);
+  if (!countdown) {
+    return null;
+  }
+
+  return (
+    <LoopspaceGraphNodeTimer>
+      <Schedule aria-hidden="true" />
+      <span>Next {countdown}</span>
+    </LoopspaceGraphNodeTimer>
+  );
+}
+
+function LoopspaceRuntimeSignalOverlay({
+  edgeLookup = null,
+  nodeLayouts = null,
+  nodeLookup = null,
+  runtimeHead = null,
+  runtimeHeadNodeId = "",
+  runtimeHeadRunId = "",
+  runtimeHeadStatus = "",
+  runtimeSignalStatus = "",
+  visible = true,
+}) {
+  const documentVisible = useDocumentVisible();
+  const [frameMs, setFrameMs] = useState(() => Date.now());
+  const [successVisible, setSuccessVisible] = useState(false);
+  const canPaint = visible && documentVisible;
+  const activeRuntimeStatus = LOOPSPACE_RUNTIME_SIGNAL_ACTIVE_STATUSES.has(runtimeSignalStatus);
+  const runtimeSignalUpdatedAtMs = loopspaceRuntimeTimestampMs(runtimeHead);
+  const successCurrentlyVisible = runtimeSignalStatus === "success"
+    && runtimeSignalUpdatedAtMs > 0
+    && Date.now() - runtimeSignalUpdatedAtMs < LOOPSPACE_RUNTIME_SIGNAL_SUCCESS_VISIBLE_MS;
+  const runtimeHeadEdgeId = loopspaceRuntimeField(runtimeHead, [
+    "edge_id",
+    "edgeId",
+    "loop_runtime_edge_id",
+    "loopRuntimeEdgeId",
+  ]);
+
+  useEffect(() => {
+    if (
+      !canPaint
+      || runtimeSignalStatus !== "success"
+      || runtimeSignalUpdatedAtMs <= 0
+      || typeof window === "undefined"
+    ) {
+      setSuccessVisible(false);
+      return undefined;
+    }
+
+    const remainingMs = LOOPSPACE_RUNTIME_SIGNAL_SUCCESS_VISIBLE_MS
+      - Math.max(0, Date.now() - runtimeSignalUpdatedAtMs);
+    if (remainingMs <= 0) {
+      setSuccessVisible(false);
+      return undefined;
+    }
+
+    setSuccessVisible(true);
+    const timer = window.setTimeout(() => setSuccessVisible(false), remainingMs);
+    return () => window.clearTimeout(timer);
+  }, [canPaint, runtimeSignalStatus, runtimeSignalUpdatedAtMs]);
+
+  const runtimeSignalVisible = Boolean(
+    canPaint
+      && runtimeHead
+      && runtimeSignalStatus
+      && (
+        activeRuntimeStatus
+        || successCurrentlyVisible
+        || successVisible
+        || LOOPSPACE_RUNTIME_SIGNAL_STICKY_STATUSES.has(runtimeSignalStatus)
+      ),
+  );
+
+  useEffect(() => {
+    if (
+      !runtimeSignalVisible
+      || !activeRuntimeStatus
+      || !runtimeHeadEdgeId
+      || typeof window === "undefined"
+    ) {
+      return undefined;
+    }
+
+    const refresh = () => setFrameMs(Date.now());
+    refresh();
+    const timer = window.setInterval(refresh, LOOPSPACE_RUNTIME_SIGNAL_FRAME_MS);
+    return () => window.clearInterval(timer);
+  }, [activeRuntimeStatus, runtimeHeadEdgeId, runtimeSignalVisible]);
+
+  const runtimeSignalPoint = useMemo(() => {
+    if (!runtimeSignalVisible || !nodeLayouts || !nodeLookup) return null;
+    return loopspaceGraphRuntimeSignalPoint({
+      edgeLookup,
+      frameMs,
+      nodeId: runtimeHeadNodeId,
+      nodeLookup,
+      nodeLayouts,
+      runtimeHead,
+      status: runtimeSignalStatus,
+    });
+  }, [
+    edgeLookup,
+    frameMs,
+    nodeLayouts,
+    nodeLookup,
+    runtimeHead,
+    runtimeHeadNodeId,
+    runtimeSignalStatus,
+    runtimeSignalVisible,
+  ]);
+
+  if (!runtimeSignalPoint) {
+    return null;
+  }
+
+  const runtimeSignalTone = loopspaceNodeRuntimeStatusTone(runtimeSignalStatus);
+
+  return (
+    <LoopspaceRuntimeSignalLayer aria-label="Loop runtime signal">
+      <LoopspaceRuntimeSignalDot
+        data-status={runtimeSignalStatus}
+        data-tone={runtimeSignalTone}
+        style={{
+          "--loopspace-signal-x": `${runtimeSignalPoint.x}px`,
+          "--loopspace-signal-y": `${runtimeSignalPoint.y}px`,
+        }}
+        title={`${loopspaceNodeRuntimeStatusLabel(runtimeSignalStatus) || runtimeHeadStatus || "Runtime signal"}${runtimeHeadRunId ? ` - ${runtimeHeadRunId}` : ""}`}
+      />
+    </LoopspaceRuntimeSignalLayer>
+  );
+}
+
 function loopspaceGraphNodeIsResourceContextNode(node) {
   return node?.nodeKind === "document_read"
     || node?.nodeKind === "document_write"
@@ -7909,6 +8111,7 @@ function LoopspaceRuntimeView({
   localDesktopProfile = null,
   localScripts = [],
   loopspace,
+  visible = true,
 }) {
   const [runtimePanelTab, setRuntimePanelTab] = useState("runtime");
   const [runtimePanelExpanded, setRuntimePanelExpanded] = useState(true);
@@ -7920,8 +8123,6 @@ function LoopspaceRuntimeView({
   const [settingsPanelViewportWidth, setSettingsPanelViewportWidth] = useState(LOOPSPACE_RUNTIME_SETTINGS_CARD_WIDTH + (LOOPSPACE_RUNTIME_SETTINGS_GRID_PADDING * 2));
   const [selectedRuntimeRowId, setSelectedRuntimeRowId] = useState("");
   const [selectedHistoryRunId, setSelectedHistoryRunId] = useState("");
-  const [runtimeSignalFrameMs, setRuntimeSignalFrameMs] = useState(() => Date.now());
-  const [timerNowMs, setTimerNowMs] = useState(() => Date.now());
   const [triggers, setTriggers] = useState([]);
   const [logs, setLogs] = useState([]);
   const [runtimeEvents, setRuntimeEvents] = useState([]);
@@ -8100,13 +8301,6 @@ function LoopspaceRuntimeView({
     nodeResizeObserverRef.current?.disconnect?.();
     nodeResizeObserverRef.current = null;
     nodeElementsRef.current = new Map();
-  }, []);
-
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      setTimerNowMs(Date.now());
-    }, 1000);
-    return () => window.clearInterval(timer);
   }, []);
 
   const resolveGraphSaveIdleWaiters = useCallback((value) => {
@@ -10410,49 +10604,7 @@ function LoopspaceRuntimeView({
   const runtimeHeadEdgeId = loopspaceRuntimeField(runtimeHead, ["edge_id", "edgeId", "loop_runtime_edge_id", "loopRuntimeEdgeId"]);
   const runtimeHeadStatus = loopspaceRuntimeField(runtimeHead, ["status"], runtimeHead ? "active" : "");
   const runtimeSignalStatus = normalizeLoopspaceNodeRuntimeStatus(runtimeHeadStatus) || (runtimeHead ? "running" : "");
-  const activeRuntimeStatus = ["queued", "running", "resume_ready", "resume_requested"].includes(runtimeSignalStatus);
-  const runtimeSignalUpdatedAtMs = loopspaceRuntimeTimestampMs(runtimeHead);
-  const runtimeSignalFinalVisible = runtimeSignalStatus === "success"
-    && runtimeSignalUpdatedAtMs > 0
-    && timerNowMs - runtimeSignalUpdatedAtMs < 6500;
-  const runtimeSignalVisible = Boolean(
-    runtimeHead
-      && runtimeSignalStatus
-      && (
-        activeRuntimeStatus
-        || runtimeSignalFinalVisible
-        || ["failed", "interrupted", "resume_ready"].includes(runtimeSignalStatus)
-      ),
-  );
-  useEffect(() => {
-    if (!runtimeSignalVisible || !activeRuntimeStatus || !runtimeHeadEdgeId) return undefined;
-    const timer = window.setInterval(() => {
-      setRuntimeSignalFrameMs(Date.now());
-    }, 80);
-    return () => window.clearInterval(timer);
-  }, [activeRuntimeStatus, runtimeHeadEdgeId, runtimeSignalVisible]);
-  const runtimeSignalPoint = useMemo(() => {
-    if (!runtimeSignalVisible) return null;
-    return loopspaceGraphRuntimeSignalPoint({
-      edgeLookup: graphEdgeLookup,
-      frameMs: runtimeSignalFrameMs,
-      nodeId: runtimeHeadNodeId,
-      nodeLookup: graphNodeLookup,
-      nodeLayouts: graphNodeLayouts,
-      runtimeHead,
-      status: runtimeSignalStatus,
-    });
-  }, [
-    graphEdgeLookup,
-    graphNodeLayouts,
-    graphNodeLookup,
-    runtimeHead,
-    runtimeHeadNodeId,
-    runtimeSignalFrameMs,
-    runtimeSignalStatus,
-    runtimeSignalVisible,
-  ]);
-  const runtimeSignalTone = loopspaceNodeRuntimeStatusTone(runtimeSignalStatus);
+  const activeRuntimeStatus = LOOPSPACE_RUNTIME_SIGNAL_ACTIVE_STATUSES.has(runtimeSignalStatus);
   const currentRuntimeSegments = useMemo(() => {
     const runId = runtimeHeadRunId;
     return safeCloudMcpArray(runtimeSegments).filter((segment) => {
@@ -11789,9 +11941,6 @@ function LoopspaceRuntimeView({
                       },
                     ]
                   : [];
-                const cronCountdown = node.triggerId && nodeTriggerType === "cron"
-                  ? formatLoopspaceCountdown(trigger?.nextDueAtMs, timerNowMs)
-                  : "";
                 const nodeTitle = node.nodeKind === "run_script"
                   ? "Run script"
                   : node.nodeKind === "device"
@@ -11928,11 +12077,11 @@ function LoopspaceRuntimeView({
 	                        ) : null}
 	                      </LoopspaceGraphNodeTitleRow>
 	                      {nodeSubtitle ? <span>{nodeSubtitle}</span> : null}
-                      {cronCountdown ? (
-                        <LoopspaceGraphNodeTimer>
-                          <Schedule aria-hidden="true" />
-                          <span>Next {cronCountdown}</span>
-                        </LoopspaceGraphNodeTimer>
+                      {node.triggerId && nodeTriggerType === "cron" ? (
+                        <LoopspaceCronCountdownBadge
+                          nextDueAtMs={trigger?.nextDueAtMs}
+                          visible={visible}
+                        />
                       ) : null}
                       {isManualTriggerNode ? (
                         <LoopspaceGraphTriggerRunButton
@@ -12471,19 +12620,17 @@ function LoopspaceRuntimeView({
                   />
                 ) : null}
               </LoopspaceGraphEdges>
-              {runtimeSignalPoint ? (
-                <LoopspaceRuntimeSignalLayer aria-label="Loop runtime signal">
-                  <LoopspaceRuntimeSignalDot
-                    data-status={runtimeSignalStatus}
-                    data-tone={runtimeSignalTone}
-                    style={{
-                      "--loopspace-signal-x": `${runtimeSignalPoint.x}px`,
-                      "--loopspace-signal-y": `${runtimeSignalPoint.y}px`,
-                    }}
-                    title={`${loopspaceNodeRuntimeStatusLabel(runtimeSignalStatus) || runtimeHeadStatus || "Runtime signal"}${runtimeHeadRunId ? ` - ${runtimeHeadRunId}` : ""}`}
-                  />
-                </LoopspaceRuntimeSignalLayer>
-              ) : null}
+              <LoopspaceRuntimeSignalOverlay
+                edgeLookup={graphEdgeLookup}
+                nodeLayouts={graphNodeLayouts}
+                nodeLookup={graphNodeLookup}
+                runtimeHead={runtimeHead}
+                runtimeHeadNodeId={runtimeHeadNodeId}
+                runtimeHeadRunId={runtimeHeadRunId}
+                runtimeHeadStatus={runtimeHeadStatus}
+                runtimeSignalStatus={runtimeSignalStatus}
+                visible={visible}
+              />
 		              {graphDragGhost?.node ? (() => {
 		                const node = graphDragGhost.node;
                 const nodeLayout = loopspaceGraphNodeLayout(node, 0);
@@ -13080,12 +13227,12 @@ function WorkspaceCreateAgentGlyph({ roleId }) {
   return <WorkspaceCreateAgentTerminalIcon aria-hidden="true" />;
 }
 
-const WORKSPACE_SUPPLEMENTAL_HARNESS_CARDS = [
+const WORKSPACE_PANEL_CARDS = [
   {
     id: "document",
     label: "Document",
     statusLabel: "ready",
-    active: true,
+    maxCount: MAX_WORKSPACE_DOCUMENT_COUNT,
   },
   {
     id: "video-editor",
@@ -13113,17 +13260,17 @@ const WORKSPACE_SUPPLEMENTAL_HARNESS_CARDS = [
   },
 ];
 
-function WorkspaceSupplementalHarnessGlyph({ cardId }) {
-  if (cardId === "document") {
+function WorkspacePanelGlyph({ panelId }) {
+  if (panelId === "document") {
     return <FileDocumentIcon aria-hidden="true" />;
   }
-  if (cardId === "video-editor") {
+  if (panelId === "video-editor") {
     return <ButtonEditorIcon aria-hidden="true" />;
   }
-  if (cardId === "pcb-design") {
+  if (panelId === "pcb-design") {
     return <ButtonProcessIcon aria-hidden="true" />;
   }
-  if (cardId === "touch-whiteboard") {
+  if (panelId === "touch-whiteboard") {
     return <ButtonWhiteboardIcon aria-hidden="true" />;
   }
   return <ButtonHubIcon aria-hidden="true" />;
@@ -13233,25 +13380,67 @@ function WorkspaceAgentCountCards({
           </WorkspaceCreateAgentCard>
         );
       })}
-      {WORKSPACE_SUPPLEMENTAL_HARNESS_CARDS.map((card) => (
-        <WorkspaceCreateAgentCard
-          $active={card.active}
-          aria-label={`${card.label} harness ${card.statusLabel}`}
-          data-harness-card="true"
-          data-unavailable={card.unavailable ? "true" : undefined}
-          key={card.id}
-        >
-          <WorkspaceCreateAgentIcon data-agent={card.id}>
-            <WorkspaceSupplementalHarnessGlyph cardId={card.id} />
-          </WorkspaceCreateAgentIcon>
-          <WorkspaceCreateAgentStatus>{card.statusLabel}</WorkspaceCreateAgentStatus>
-          <WorkspaceCreateAgentBody>
-            <WorkspaceCreateAgentLabel>
-              <strong>{card.label}</strong>
-            </WorkspaceCreateAgentLabel>
-          </WorkspaceCreateAgentBody>
-        </WorkspaceCreateAgentCard>
-      ))}
+    </WorkspaceCreateAgentGrid>
+  );
+}
+
+function WorkspacePanelCountCards({
+  counts = {},
+  disabled = false,
+  onAdjust,
+}) {
+  return (
+    <WorkspaceCreateAgentGrid>
+      {WORKSPACE_PANEL_CARDS.map((card) => {
+        const count = card.id === "document"
+          ? normalizeWorkspaceDocumentCount(counts.document ?? counts.documents)
+          : 0;
+        const unavailable = Boolean(card.unavailable);
+        const maxCount = Math.max(0, Number(card.maxCount) || 0);
+        const canRemovePanel = !disabled && !unavailable && count > MIN_WORKSPACE_DOCUMENT_COUNT;
+        const canAddPanel = !disabled && !unavailable && count < maxCount;
+
+        return (
+          <WorkspaceCreateAgentCard
+            $active={count > 0}
+            aria-label={`${card.label} panel ${card.statusLabel}`}
+            data-panel-card="true"
+            data-unavailable={card.unavailable ? "true" : undefined}
+            key={card.id}
+          >
+            <WorkspaceCreateAgentIcon data-agent={card.id}>
+              <WorkspacePanelGlyph panelId={card.id} />
+            </WorkspaceCreateAgentIcon>
+            <WorkspaceCreateAgentStatus>{card.statusLabel}</WorkspaceCreateAgentStatus>
+            <WorkspaceCreateAgentBody>
+              <WorkspaceCreateAgentLabel>
+                <strong>{card.label}</strong>
+              </WorkspaceCreateAgentLabel>
+            </WorkspaceCreateAgentBody>
+            {!unavailable && maxCount > 0 && (
+              <WorkspaceCreateAgentStepper data-agent-control="stepper">
+                <WorkspaceCreateAgentStepButton
+                  aria-label={`Remove ${card.label} panel`}
+                  disabled={!canRemovePanel}
+                  onClick={() => onAdjust?.(card.id, -1)}
+                  type="button"
+                >
+                  -
+                </WorkspaceCreateAgentStepButton>
+                <strong>{count}</strong>
+                <WorkspaceCreateAgentStepButton
+                  aria-label={`Add ${card.label} panel`}
+                  disabled={!canAddPanel}
+                  onClick={() => onAdjust?.(card.id, 1)}
+                  type="button"
+                >
+                  +
+                </WorkspaceCreateAgentStepButton>
+              </WorkspaceCreateAgentStepper>
+            )}
+          </WorkspaceCreateAgentCard>
+        );
+      })}
     </WorkspaceCreateAgentGrid>
   );
 }
@@ -13288,6 +13477,7 @@ function WorkspaceCreatePanel({
   const [browseError, setBrowseError] = useState("");
   const [cdDraft, setCdDraft] = useState("");
   const [agentCounts, setAgentCounts] = useState({});
+  const [panelCounts, setPanelCounts] = useState({ document: DEFAULT_WORKSPACE_DOCUMENT_COUNT });
   const [agentPermissions, setAgentPermissions] = useState({});
   const [agentSessionModeDraft, setAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
   const [initializeGitDraft, setInitializeGitDraft] = useState(false);
@@ -13336,6 +13526,7 @@ function WorkspaceCreatePanel({
     setBrowseError("");
     setPanelView("create");
     setAgentCounts(fallbackRole ? { [fallbackRole]: 1 } : {});
+    setPanelCounts({ document: DEFAULT_WORKSPACE_DOCUMENT_COUNT });
     setAgentPermissions(normalizeWorkspaceAgentPermissions(null, roleOptions));
     setAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
     setInitializeGitDraft(false);
@@ -13456,6 +13647,23 @@ function WorkspaceCreatePanel({
     }));
   }, [roleOptions]);
 
+  const adjustPanelCount = useCallback((panelId, delta) => {
+    if (panelId !== "document") {
+      return;
+    }
+    setPanelCounts((current) => {
+      const currentValue = normalizeWorkspaceDocumentCount(current.document);
+      const nextValue = Math.min(
+        MAX_WORKSPACE_DOCUMENT_COUNT,
+        Math.max(MIN_WORKSPACE_DOCUMENT_COUNT, currentValue + Number(delta || 0)),
+      );
+      if (nextValue === currentValue) {
+        return current;
+      }
+      return { ...current, document: nextValue };
+    });
+  }, []);
+
   const availableAgentCounts = useMemo(() => {
     const counts = {};
     roleOptions.forEach((option) => {
@@ -13477,6 +13685,9 @@ function WorkspaceCreatePanel({
     () => normalizeWorkspaceAgentPermissions(agentPermissions, roleOptions),
     [agentPermissions, roleOptions],
   );
+  const availablePanelCounts = useMemo(() => ({
+    document: normalizeWorkspaceDocumentCount(panelCounts.document),
+  }), [panelCounts.document]);
 
   useEffect(() => {
     if (!visible) {
@@ -13623,6 +13834,7 @@ function WorkspaceCreatePanel({
             availableAgentPermissions,
             !currentRootIsGitRepository && initializeGitChecked,
             agentSessionModeDraft,
+            availablePanelCounts,
           );
         }}
       >
@@ -13822,7 +14034,6 @@ function WorkspaceCreatePanel({
           <SettingsLabel>Coding harnesses</SettingsLabel>
           <SettingsHint>
             Pick how many terminal-backed harnesses open with this workspace.
-            Additional harness cards appear alongside them.
           </SettingsHint>
           <WorkspaceAgentCountCards
             agentStatuses={agentStatuses}
@@ -13836,11 +14047,25 @@ function WorkspaceCreatePanel({
           />
         </WorkspaceCreateSection>
 
+        <WorkspaceCreateSection>
+          <SettingsLabel>Panels</SettingsLabel>
+          <SettingsHint>
+            Pick non-terminal workspace panels. Documents can be off or one terminal-side panel.
+          </SettingsHint>
+          <WorkspacePanelCountCards
+            counts={availablePanelCounts}
+            disabled={creating}
+            onAdjust={adjustPanelCount}
+          />
+        </WorkspaceCreateSection>
+
         {workspaceError && <FormMessage $state="error">{workspaceError}</FormMessage>}
 
         <WorkspaceCreateFooter>
           <SettingsHint>
-            {terminalRoles.length} terminal{terminalRoles.length === 1 ? "" : "s"} will open in {getDirectoryName(currentDirectory) || "the chosen folder"}.
+            {terminalRoles.length} terminal{terminalRoles.length === 1 ? "" : "s"}
+            {availablePanelCounts.document ? " and 1 document panel" : ""}
+            {" "}will open in {getDirectoryName(currentDirectory) || "the chosen folder"}.
           </SettingsHint>
           <PrimaryButton disabled={!canCreate} type="submit">
             <ButtonAddIcon aria-hidden="true" />
@@ -16845,6 +17070,31 @@ function normalizeWorkspaceTerminalCount(value) {
   return Math.min(MAX_WORKSPACE_TERMINAL_COUNT, Math.max(MIN_WORKSPACE_TERMINAL_COUNT, count));
 }
 
+function normalizeWorkspaceDocumentCount(value) {
+  if (value === true) {
+    return MAX_WORKSPACE_DOCUMENT_COUNT;
+  }
+  if (value === false || value === null) {
+    return MIN_WORKSPACE_DOCUMENT_COUNT;
+  }
+
+  const count = Number.parseInt(value, 10);
+
+  if (!Number.isFinite(count)) {
+    return DEFAULT_WORKSPACE_DOCUMENT_COUNT;
+  }
+
+  return Math.min(MAX_WORKSPACE_DOCUMENT_COUNT, Math.max(MIN_WORKSPACE_DOCUMENT_COUNT, count));
+}
+
+function getWorkspaceDocumentCount(workspaceSettings, workspaceId) {
+  const settings = workspaceSettings?.[workspaceId];
+  if (!settings || !Object.prototype.hasOwnProperty.call(settings, "documentsCount")) {
+    return DEFAULT_WORKSPACE_DOCUMENT_COUNT;
+  }
+  return normalizeWorkspaceDocumentCount(settings.documentsCount);
+}
+
 function getWorkspaceTerminalRoleIds(roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS) {
   return new Set(roleOptions.map((role) => role.id));
 }
@@ -17392,6 +17642,11 @@ function normalizeWorkspaceSettings(value) {
         const terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
         const terminalRoles = normalizeWorkspaceTerminalRoles(settings?.terminalRoles, terminalCount);
         const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
+        const hasDocumentsCount = Object.prototype.hasOwnProperty.call(settings || {}, "documentsCount");
+        const documentsCount = hasDocumentsCount
+          ? normalizeWorkspaceDocumentCount(settings.documentsCount)
+          : DEFAULT_WORKSPACE_DOCUMENT_COUNT;
+        const hasDefaultDocumentsCount = documentsCount === DEFAULT_WORKSPACE_DOCUMENT_COUNT;
         const agentPermissions = normalizeWorkspaceAgentPermissions(settings?.agentPermissions);
         const hasCustomAgentPermissions = Object.values(agentPermissions)
           .some((mode) => mode !== WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS);
@@ -17411,6 +17666,7 @@ function normalizeWorkspaceSettings(value) {
             !rootDirectory
             && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
             && !hasCustomTerminalRoles
+            && hasDefaultDocumentsCount
             && !hasCustomAgentPermissions
             && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
           )
@@ -17428,6 +17684,7 @@ function normalizeWorkspaceSettings(value) {
             gitWorktreesEnabled,
             terminalCount,
             terminalRoles,
+            documentsCount,
             agentPermissions,
           },
         ];
@@ -19027,6 +19284,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const hasAgentSessionMode = Object.prototype.hasOwnProperty.call(nextValues, "agentSessionMode");
   const hasTerminalCount = Object.prototype.hasOwnProperty.call(nextValues, "terminalCount");
   const hasTerminalRoles = Object.prototype.hasOwnProperty.call(nextValues, "terminalRoles");
+  const hasDocumentsCount = Object.prototype.hasOwnProperty.call(nextValues, "documentsCount");
   const hasAgentPermissions = Object.prototype.hasOwnProperty.call(nextValues, "agentPermissions");
   const cleanedRootDirectory = cleanWorkspaceRootDirectory(
     hasRootDirectory ? nextValues.rootDirectory : currentSettings.rootDirectory,
@@ -19063,6 +19321,14 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     fallbackRole,
   );
   const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
+  const documentsCount = normalizeWorkspaceDocumentCount(
+    hasDocumentsCount
+      ? nextValues.documentsCount
+      : Object.prototype.hasOwnProperty.call(currentSettings, "documentsCount")
+        ? currentSettings.documentsCount
+        : DEFAULT_WORKSPACE_DOCUMENT_COUNT,
+  );
+  const hasDefaultDocumentsCount = documentsCount === DEFAULT_WORKSPACE_DOCUMENT_COUNT;
   const agentPermissions = normalizeWorkspaceAgentPermissions(
     hasAgentPermissions ? nextValues.agentPermissions : currentSettings.agentPermissions,
   );
@@ -19087,6 +19353,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     !rootDirectory
     && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
     && !hasCustomTerminalRoles
+    && hasDefaultDocumentsCount
     && !hasCustomAgentPermissions
     && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
   ) {
@@ -19102,6 +19369,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     gitWorktreesEnabled,
     terminalCount,
     terminalRoles,
+    documentsCount,
     agentPermissions,
   };
 
@@ -19211,6 +19479,7 @@ export default function App() {
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
   const [workspaceTerminalCountDraft, setWorkspaceTerminalCountDraft] = useState("1");
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
+  const [workspaceDocumentCountDraft, setWorkspaceDocumentCountDraft] = useState(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
   const [workspaceAgentPermissionsDraft, setWorkspaceAgentPermissionsDraft] = useState({});
   const [workspaceAgentSessionModeDraft, setWorkspaceAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
   const [workspaceInitializeGitDraft, setWorkspaceInitializeGitDraft] = useState(false);
@@ -19258,9 +19527,10 @@ export default function App() {
   const [workspaceGitPullPrompt, setWorkspaceGitPullPrompt] = useState(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
   const [workspaceGitRepositoryPreloads, setWorkspaceGitRepositoryPreloads] = useState({});
   const [workspaceGitSnapshotPreloads, setWorkspaceGitSnapshotPreloads] = useState({});
-  const [workspaceToolPaneMode, setWorkspaceToolPaneMode] = useState(TODO_QUEUE_PANE_MODE_MINIMIZED);
+  const [workspaceToolPaneMode, setWorkspaceToolPaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
   const [workspaceToolLayoutWidth, setWorkspaceToolLayoutWidth] = useState(0);
   const [workspaceToolRuntimeBridges, setWorkspaceToolRuntimeBridges] = useState({});
+  const [pendingWorkspaceDocumentPanelOpen, setPendingWorkspaceDocumentPanelOpen] = useState(null);
   const [accountToolDraft, setAccountToolDraft] = useState("");
   const [accountToolItems, setAccountToolItems] = useState([]);
   const [accountToolError, setAccountToolError] = useState("");
@@ -22726,6 +22996,7 @@ export default function App() {
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
     setWorkspaceTerminalRolesDraft(["codex"]);
+    setWorkspaceDocumentCountDraft(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
     setWorkspaceAgentPermissionsDraft(normalizeWorkspaceAgentPermissions(null));
     setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
     setWorkspaceInitializeGitDraft(false);
@@ -22797,6 +23068,7 @@ export default function App() {
     setWorkspaceNameDraft("");
     setWorkspaceTerminalCountDraft("1");
     setWorkspaceTerminalRolesDraft(["codex"]);
+    setWorkspaceDocumentCountDraft(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
     setWorkspaceAgentPermissionsDraft(normalizeWorkspaceAgentPermissions(null));
     setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
     setWorkspaceInitializeGitDraft(false);
@@ -25688,6 +25960,7 @@ export default function App() {
     requestedAgentPermissions = null,
     requestedInitializeGit = false,
     requestedAgentSessionMode = AGENT_SESSION_MODE_COORDINATED,
+    requestedPanelCounts = null,
   ) => {
     event.preventDefault();
 
@@ -25776,6 +26049,9 @@ export default function App() {
       const terminalRoles = Array.isArray(requestedTerminalRoles) && requestedTerminalRoles.length
         ? requestedTerminalRoles.slice(0, MAX_WORKSPACE_TERMINAL_COUNT)
         : null;
+      const documentsCount = normalizeWorkspaceDocumentCount(
+        requestedPanelCounts?.document ?? requestedPanelCounts?.documents,
+      );
       const agentPermissions = normalizeWorkspaceAgentPermissions(
         requestedAgentPermissions,
         WORKSPACE_TERMINAL_ROLE_OPTIONS,
@@ -25785,6 +26061,7 @@ export default function App() {
         rootWasEmptyAtSelection,
         rootGitRepository,
         agentSessionMode,
+        documentsCount,
         agentPermissions,
         ...(terminalRoles
           ? { terminalCount: terminalRoles.length, terminalRoles }
@@ -25892,6 +26169,7 @@ export default function App() {
 
     const workspaceNameValue = workspaceNameDraft;
     const terminalCount = normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft);
+    const documentsCount = normalizeWorkspaceDocumentCount(workspaceDocumentCountDraft);
     const terminalRoles = normalizeWorkspaceTerminalRoles(
       workspaceTerminalRolesDraft,
       terminalCount,
@@ -26151,6 +26429,7 @@ export default function App() {
           gitWorktreesEnabled,
           terminalCount,
           terminalRoles,
+          documentsCount,
           agentPermissions,
         });
         workspaceSettingsRef.current = nextSettings;
@@ -26183,6 +26462,7 @@ export default function App() {
       setWorkspaceNameDraft(nextWorkspace.name);
       setWorkspaceRootDraft(rootDirectory);
       setWorkspaceTerminalCountDraft(String(terminalCount));
+      setWorkspaceDocumentCountDraft(String(documentsCount));
       setWorkspaceTerminalRolesDraft(terminalRoles);
       setWorkspaceAgentPermissionsDraft(agentPermissions);
       setWorkspaceAgentSessionModeDraft(agentSessionMode);
@@ -26206,6 +26486,7 @@ export default function App() {
     authState,
     expireDesktopSession,
     workspaceNameDraft,
+    workspaceDocumentCountDraft,
     workspaceAgentSessionModeDraft,
     workspaceAgentPermissionsDraft,
     workspaceInitializeGitDraft,
@@ -28853,6 +29134,10 @@ export default function App() {
   const selectedWorkspaceTerminalCount = selectedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceTerminalCount(workspaceSettings, selectedWorkspace.id)
     : MIN_WORKSPACE_TERMINAL_COUNT;
+  const selectedWorkspaceDocumentCount = selectedWorkspace && !shouldShowWorkspaceSetup
+    ? getWorkspaceDocumentCount(workspaceSettings, selectedWorkspace.id)
+    : DEFAULT_WORKSPACE_DOCUMENT_COUNT;
+  const selectedWorkspaceDocumentsEnabled = selectedWorkspaceDocumentCount > 0;
   const activatedWorkspaceTerminalCount = activatedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceTerminalCount(workspaceSettings, activatedWorkspace.id)
     : MIN_WORKSPACE_TERMINAL_COUNT;
@@ -30951,7 +31236,12 @@ export default function App() {
       : "No workspace selected.";
   const workspaceToolPaneHasWidth = workspaceToolLayoutWidth === 0
     || workspaceToolLayoutWidth >= WORKSPACE_TOOL_VISIBLE_MIN_WIDTH;
-  const workspaceToolPaneVisible = workspaceToolPaneHasWidth;
+  const workspaceToolPaneAvailable = Boolean(
+    selectedWorkspace
+      && visibleView === DEFAULT_WORKSPACE_VIEW
+      && !shouldShowWorkspaceSetup,
+  );
+  const workspaceToolPaneVisible = workspaceToolPaneAvailable && workspaceToolPaneHasWidth;
   const workspaceToolPaneMinimized = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
   const workspaceToolPaneFullscreen = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
   const workspaceToolMinimizedSize = workspaceToolLayoutWidth > 0
@@ -30981,10 +31271,44 @@ export default function App() {
   const workspaceMainPanelMinSize = workspaceToolPaneVisible
     ? workspaceToolPaneMinimized ? 72 : 30
     : 100;
-  const shouldRenderAccountToolPanel = true;
+  const shouldRenderAccountToolPanel = workspaceToolPaneAvailable;
   const selectedWorkspaceToolRuntimeBridge = selectedWorkspace?.id
     ? workspaceToolRuntimeBridges[selectedWorkspace.id] || null
     : null;
+  const selectedWorkspaceOpenDocumentPanel = selectedWorkspaceToolRuntimeBridge?.onOpenDocumentPanel;
+  const openSelectedWorkspaceDocumentPanel = useCallback((entry) => {
+    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    if (typeof selectedWorkspaceOpenDocumentPanel === "function") {
+      selectedWorkspaceOpenDocumentPanel(entry);
+      return;
+    }
+    if (workspaceId) {
+      setPendingWorkspaceDocumentPanelOpen({ entry, workspaceId });
+    }
+  }, [selectedWorkspace?.id, selectedWorkspaceOpenDocumentPanel]);
+
+  useEffect(() => {
+    if (!pendingWorkspaceDocumentPanelOpen) {
+      return;
+    }
+
+    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    if (pendingWorkspaceDocumentPanelOpen.workspaceId !== workspaceId) {
+      setPendingWorkspaceDocumentPanelOpen(null);
+      return;
+    }
+    if (typeof selectedWorkspaceOpenDocumentPanel !== "function") {
+      return;
+    }
+
+    selectedWorkspaceOpenDocumentPanel(pendingWorkspaceDocumentPanelOpen.entry);
+    setPendingWorkspaceDocumentPanelOpen(null);
+  }, [
+    pendingWorkspaceDocumentPanelOpen,
+    selectedWorkspace?.id,
+    selectedWorkspaceOpenDocumentPanel,
+  ]);
+
   const updateWorkspaceToolRuntimeBridge = useCallback((workspaceId, bridge) => {
     const safeWorkspaceId = String(workspaceId || "").trim();
     if (!safeWorkspaceId) {
@@ -31003,6 +31327,7 @@ export default function App() {
 
       const nextBridge = {
         onBeginTodoDrag: bridge.onBeginTodoDrag,
+        onOpenDocumentPanel: bridge.onOpenDocumentPanel,
         onToggleTerminalBreakout: bridge.onToggleTerminalBreakout,
         onToggleWindowBreakout: bridge.onToggleWindowBreakout,
         onVoiceAgentToolCall: bridge.onVoiceAgentToolCall,
@@ -31015,6 +31340,7 @@ export default function App() {
       if (
         previousBridge
         && previousBridge.onBeginTodoDrag === nextBridge.onBeginTodoDrag
+        && previousBridge.onOpenDocumentPanel === nextBridge.onOpenDocumentPanel
         && previousBridge.onToggleTerminalBreakout === nextBridge.onToggleTerminalBreakout
         && previousBridge.onToggleWindowBreakout === nextBridge.onToggleWindowBreakout
         && previousBridge.onVoiceAgentToolCall === nextBridge.onVoiceAgentToolCall
@@ -42324,6 +42650,7 @@ export default function App() {
   useEffect(() => {
     setWorkspaceNameDraft(selectedWorkspace?.name || "");
     setWorkspaceTerminalCountDraft(String(selectedWorkspace ? selectedWorkspaceTerminalCount : MIN_WORKSPACE_TERMINAL_COUNT));
+    setWorkspaceDocumentCountDraft(String(selectedWorkspace ? selectedWorkspaceDocumentCount : DEFAULT_WORKSPACE_DOCUMENT_COUNT));
     setWorkspaceTerminalRolesDraft(selectedWorkspace ? selectedWorkspaceTerminalRoles : normalizeWorkspaceTerminalRoles(
       [],
       MIN_WORKSPACE_TERMINAL_COUNT,
@@ -42347,6 +42674,7 @@ export default function App() {
     selectedWorkspaceRootDirectory,
     selectedWorkspaceAgentSessionMode,
     selectedWorkspaceAgentPermissions,
+    selectedWorkspaceDocumentCount,
     selectedWorkspaceTerminalCount,
     selectedWorkspaceTerminalRoles,
     workspaceTerminalFallbackRole,
@@ -42561,6 +42889,9 @@ export default function App() {
   const workspaceSettingsAgentPermissions = useMemo(() => (
     normalizeWorkspaceAgentPermissions(workspaceAgentPermissionsDraft, workspaceTerminalRoleOptions)
   ), [workspaceAgentPermissionsDraft, workspaceTerminalRoleOptions]);
+  const workspaceSettingsPanelCounts = useMemo(() => ({
+    document: normalizeWorkspaceDocumentCount(workspaceDocumentCountDraft),
+  }), [workspaceDocumentCountDraft]);
   const updateWorkspaceSettingsAgentCount = useCallback((roleId, delta) => {
     const nextRoles = adjustWorkspaceAgentCardRoles(
       workspaceSettingsTerminalRoles,
@@ -42588,6 +42919,21 @@ export default function App() {
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
   }, [workspaceTerminalRoleOptions]);
+  const updateWorkspaceSettingsPanelCount = useCallback((panelId, delta) => {
+    if (panelId !== "document") {
+      return;
+    }
+    setWorkspaceDocumentCountDraft((current) => {
+      const currentValue = normalizeWorkspaceDocumentCount(current);
+      const nextValue = Math.min(
+        MAX_WORKSPACE_DOCUMENT_COUNT,
+        Math.max(MIN_WORKSPACE_DOCUMENT_COUNT, currentValue + Number(delta || 0)),
+      );
+      return String(nextValue);
+    });
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+  }, []);
   const workspaceSettingsSafeModeRequiresGit = Boolean(
     selectedWorkspace
       && !selectedWorkspaceRootGitRepository
@@ -43118,6 +43464,17 @@ export default function App() {
                         <span>Tools</span>
                       </RailActionButton>
                       <RailActionButton
+                        aria-label="Devices"
+                        data-active={activeView === "devices"}
+                        data-scope="global"
+                        onClick={() => showView("devices")}
+                        title="Devices"
+                        type="button"
+                      >
+                        <Devices aria-hidden="true" />
+                        <span>Devices</span>
+                      </RailActionButton>
+                      <RailActionButton
                         aria-label="Assets"
                         data-active={activeView === "assets"}
                         data-scope="global"
@@ -43291,6 +43648,7 @@ export default function App() {
                             storageUsage={cloudWorkspaceProgress.storageUsage}
                             workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
                             workspaceScopedToolTabsEnabled={Boolean(selectedWorkspace)}
+                            workspaceDocumentPanelEnabled={getWorkspaceDocumentCount(workspaceSettings, runtimeWorkspace.id) > 0}
                             workspaceToolPaneMode={workspaceToolPaneMode}
                             workspaceToolPaneVisible={workspaceToolPaneVisible}
                             workspaceToolPortalTarget={null}
@@ -43384,6 +43742,7 @@ export default function App() {
                           localScripts={appScriptsLibrary.scripts}
                           loopspace={selectedLoopspace}
                           onBack={unselectLoopspace}
+                          visible={visibleView === DEFAULT_WORKSPACE_VIEW && loopspacesModeActive}
                         />
                       ) : (
                         <WorkspaceIdleState
@@ -43427,8 +43786,8 @@ export default function App() {
                         onDeleteArchivedWorkspace={deleteWorkspaceFromForge}
                         onClose={closeCreateWorkspaceModal}
                         onRestoreArchivedWorkspace={restoreArchivedWorkspace}
-                        onSubmit={(event, terminalRoles, agentPermissions, initializeGit, agentSessionMode) => (
-                          createFirstWorkspace(event, terminalRoles, agentPermissions, initializeGit, agentSessionMode)
+                        onSubmit={(event, terminalRoles, agentPermissions, initializeGit, agentSessionMode, panelCounts) => (
+                          createFirstWorkspace(event, terminalRoles, agentPermissions, initializeGit, agentSessionMode, panelCounts)
                         )}
                         roleOptions={WORKSPACE_TERMINAL_ROLE_OPTIONS}
                         rootDraft={newWorkspaceRootDraft}
@@ -43661,7 +44020,6 @@ export default function App() {
                             <SettingsLabel>Coding harnesses</SettingsLabel>
                             <SettingsHint>
                               Pick how many terminal-backed harnesses open with this workspace.
-                              Additional harness cards appear alongside them.
                             </SettingsHint>
                             <WorkspaceAgentCountCards
                               agentStatuses={agentStatuses}
@@ -43673,6 +44031,18 @@ export default function App() {
                               onPermissionCycle={cycleWorkspaceSettingsAgentPermission}
                               roleOptions={workspaceTerminalRoleOptions}
                               totalCount={workspaceSettingsTerminalRoles.length}
+                            />
+                          </WorkspaceCreateSection>
+
+                          <WorkspaceCreateSection>
+                            <SettingsLabel>Panels</SettingsLabel>
+                            <SettingsHint>
+                              Pick non-terminal workspace panels. Documents can be off or one terminal-side panel.
+                            </SettingsHint>
+                            <WorkspacePanelCountCards
+                              counts={workspaceSettingsPanelCounts}
+                              disabled={isWorkspaceSettingsBusy}
+                              onAdjust={updateWorkspaceSettingsPanelCount}
                             />
                           </WorkspaceCreateSection>
 
@@ -44724,6 +45094,24 @@ export default function App() {
                     workspaces={assetWorkspaceOptions}
                   />
                 </ForgeWorkspace>
+              ) : visibleView === "devices" ? (
+                <ForgeWorkspace aria-label="Account Devices" data-motion={viewMotion}>
+                  <AccountDevicesView
+                    accountLabel={
+                      user?.displayName
+                      || user?.display_name
+                      || user?.name
+                      || user?.email
+                      || activeScope?.label
+                      || "Account"
+                    }
+                    connectedDevices={cloudWorkspaceProgress.connectedDevices}
+                    deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
+                    knownDevices={cloudWorkspaceProgress.knownDevices}
+                    localDesktopProfile={cloudDesktopDeviceProfile}
+                    workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
+                  />
+                </ForgeWorkspace>
               ) : visibleView === "assets" ? (
                 <ForgeWorkspace aria-label="Account Assets" data-motion={viewMotion}>
                   <AccountAssetsView
@@ -45013,6 +45401,7 @@ export default function App() {
                                     : []}
                                   defaultWorkingDirectory={defaultWorkingDirectory}
                                   deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
+                                  documentPanelEnabled={selectedWorkspaceDocumentsEnabled}
                                   dropError={accountToolError}
                                   draft={accountToolDraft}
                                   items={accountToolComposerItems}
@@ -45022,6 +45411,9 @@ export default function App() {
                                   onCancelQueuedItem={cancelAccountToolQueuedTodo}
                                   onDraftChange={setAccountToolDraft}
                                   onMinimizePane={minimizeWorkspaceToolPane}
+                                  onOpenDocumentPanel={selectedWorkspaceDocumentsEnabled
+                                    ? openSelectedWorkspaceDocumentPanel
+                                    : null}
                                   onOpenWorkspaceSettings={openSelectedWorkspaceSettings}
                                   onQueueAllItems={queueAllAccountToolTodos}
                                   onQueueItem={queueAccountToolTodo}

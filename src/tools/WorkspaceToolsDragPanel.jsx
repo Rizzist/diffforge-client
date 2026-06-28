@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Architecture } from "@styled-icons/material-rounded/Architecture";
 import { Article } from "@styled-icons/material-rounded/Article";
+import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { Psychology } from "@styled-icons/material-rounded/Psychology";
 import styled from "styled-components";
 import {
@@ -149,6 +150,8 @@ function docDragPayload(entry, sendOnDrop) {
  */
 export default function WorkspaceToolsDragPanel({
   coordinationTargets = [],
+  documentPanelEnabled = false,
+  onOpenDocumentPanel = null,
   rootDirectory = "",
   workspaceId = "",
 }) {
@@ -216,6 +219,14 @@ export default function WorkspaceToolsDragPanel({
     clearActiveWorkspaceToolDrag();
   }, []);
 
+  const handleOpenDocument = useCallback((event, entry) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (typeof onOpenDocumentPanel === "function") {
+      onOpenDocumentPanel(entry);
+    }
+  }, [onOpenDocumentPanel]);
+
   const visibleDocs = filter === "all"
     ? docs
     : docs.filter((entry) => entry.kind === filter || (filter === "document" && entry.kind === "html"));
@@ -266,10 +277,19 @@ export default function WorkspaceToolsDragPanel({
                   onDragStart={(event) => handleDragStart(event, entry)}
                   onDragEnd={handleDragEnd}
                   role="listitem"
-                  title={sendOnDrop
-                    ? "Drag onto a terminal to send, or onto a graph to attach"
-                    : "Drag onto a terminal, graph, or document node"}
                 >
+                  {documentPanelEnabled && (
+                    <DocCardOpenButton
+                      aria-label={`Open ${entry.title}`}
+                      onClick={(event) => handleOpenDocument(event, entry)}
+                      onPointerDown={(event) => event.stopPropagation()}
+                      title="Open beside terminals"
+                      type="button"
+                    >
+                      <OpenInNew aria-hidden="true" />
+                      Open
+                    </DocCardOpenButton>
+                  )}
                   <DocCardContent>
                     <DocCardIcon aria-hidden="true" data-kind={entry.kind}>
                       <KindIcon />
@@ -460,6 +480,59 @@ const DocCard = styled.div`
       linear-gradient(135deg, rgba(var(--forge-tint-rgb), 0.08), transparent 46%),
       #ffffff;
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.8);
+  }
+`;
+
+const DocCardOpenButton = styled.button`
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 2;
+  display: inline-flex;
+  min-height: 22px;
+  align-items: center;
+  gap: 4px;
+  padding: 0 7px;
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.28);
+  border-radius: 999px;
+  color: #ffffff;
+  background: rgba(8, 12, 18, 0.82);
+  box-shadow: 0 8px 18px rgba(0, 0, 0, 0.22);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 850;
+  line-height: 1;
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(-2px);
+  transition:
+    opacity 120ms ease,
+    transform 120ms ease,
+    border-color 120ms ease,
+    background 120ms ease;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
+
+  &:hover,
+  &:focus-visible {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.46);
+    background: rgba(var(--forge-tint-rgb), 0.28);
+  }
+
+  ${DocCard}:hover &,
+  ${DocCard}:focus-within & {
+    opacity: 1;
+    pointer-events: auto;
+    transform: translateY(0);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+    background: rgba(255, 255, 255, 0.92);
+    box-shadow: 0 8px 18px rgba(15, 23, 42, 0.12);
   }
 `;
 

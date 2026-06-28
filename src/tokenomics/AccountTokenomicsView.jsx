@@ -11,10 +11,12 @@ import {
   formatCredits,
   formatCost,
   formatCostTitle,
+  formatPaceMultiplier,
   formatTokenTitle,
   formatTokens,
   normalizeCreditWallet,
   numeric,
+  paceMultiplierFromDelta,
   rowActivityTokens,
   rowCache,
   rowCost,
@@ -3106,6 +3108,8 @@ function LimitMetricCard({ icon: Icon, limit, title }) {
   const paceText = paceDelta == null
     ? "No data"
     : `${paceDelta > 0 ? "▲" : "▼"}${Math.abs(paceDelta)}%`;
+  const paceMultiplier = paceMultiplierFromDelta(paceDelta);
+  const paceMultiplierText = paceMultiplier == null ? "" : formatPaceMultiplier(paceMultiplier);
   const progressLabel = displayKind === "remaining" ? `${title} remaining` : `${title} used`;
   return (
     <LimitCard tone={statusTone(limit.remainingPercent, limit.paceDelta, limit.paceStatus)}>
@@ -3128,7 +3132,16 @@ function LimitMetricCard({ icon: Icon, limit, title }) {
       </ProgressTrack>
       <MetricFoot>
         <span>{limit.resetLabel}</span>
-        <strong>{limit.statusLabel}</strong>
+        <strong>
+          {paceMultiplierText ? (
+            <PaceMultiplier
+              title={`Current pace ${paceMultiplierText}`}
+            >
+              [{paceMultiplierText}]
+            </PaceMultiplier>
+          ) : null}
+          {limit.statusLabel}
+        </strong>
       </MetricFoot>
     </LimitCard>
   );
@@ -4093,19 +4106,28 @@ const MetricFoot = styled.div`
   }
 
   strong {
-    flex: 0 0 auto;
-    min-width: max-content;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: 62%;
     overflow: visible;
     color: var(--tone);
     font-weight: 900;
     line-height: 1.15;
     text-align: right;
-    white-space: nowrap;
+    white-space: normal;
+    overflow-wrap: anywhere;
   }
 
   html[data-forge-theme="light"] & {
     color: #64748b;
   }
+`;
+
+const PaceMultiplier = styled.b`
+  display: inline-block;
+  margin-right: 4px;
+  color: currentColor;
+  font-weight: 950;
 `;
 
 const ChartCard = styled.div`

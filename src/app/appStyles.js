@@ -17156,17 +17156,17 @@ export const McpSwitchButton = styled.button`
 
 export const AgentSafetyModeGroup = styled.div`
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(min(100%, 178px), 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
   min-width: 0;
+  width: 100%;
 `;
 
 export const AgentSafetyModeButton = styled.button`
   display: grid;
   gap: 5px;
   min-width: 0;
-  min-height: 76px;
-  aspect-ratio: 1.618 / 1;
+  min-height: 72px;
   align-content: center;
   padding: 10px 12px;
   border: 1px solid var(--forge-border);
@@ -17179,17 +17179,21 @@ export const AgentSafetyModeButton = styled.button`
   cursor: pointer;
 
   strong {
+    min-width: 0;
     font-size: 12.5px;
     font-weight: 780;
     line-height: 1.1;
+    overflow-wrap: anywhere;
   }
 
   em {
+    min-width: 0;
     font-size: 10.5px;
     font-style: normal;
     font-weight: 600;
     line-height: 1.25;
     color: var(--forge-text-muted);
+    overflow-wrap: anywhere;
   }
 
   &[data-active="true"][data-tone="safe"] {

@@ -200,6 +200,8 @@ const TERMINAL_INPUT_ERROR_EVENT: &str = "forge-terminal-input-error";
 const TERMINAL_PROMPT_SUBMITTED_EVENT: &str = "forge-terminal-prompt-submitted";
 const TERMINAL_ACTIVITY_HOOK_EVENT: &str = "forge-terminal-activity-hook";
 const TERMINAL_PROVIDER_SESSION_BOUND_EVENT: &str = "forge-terminal-provider-session-bound";
+const WORKSPACE_AGENT_SESSION_HISTORY_CHANGED_EVENT: &str =
+    "workspace-agent-session-history-changed";
 const TERMINAL_ARCHITECTURE_ACTIVITY_EVENT: &str = "diffforge:terminal-architecture-activity";
 const TERMINAL_OUTPUT_STATE_EVENT: &str = "forge-terminal-output-state";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
@@ -4968,6 +4970,7 @@ pub fn run() {
             workspace_threads_read,
             workspace_threads_persist,
             workspace_threads_persist_delta,
+            workspace_agent_session_history_list,
             architecture_repositories,
             architecture_scanned_result,
             architecture_graphs_list,

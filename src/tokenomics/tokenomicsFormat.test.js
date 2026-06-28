@@ -8,9 +8,11 @@ import {
   formatCredits,
   formatCost,
   formatCostTitle,
+  formatPaceMultiplier,
   formatTokenTitle,
   formatTokens,
   normalizeCreditWallet,
+  paceMultiplierFromDelta,
   rowActivityTokens,
   rowCache,
   rowInput,
@@ -35,6 +37,15 @@ test("cost formatting uses readable comma-grouped dollars", () => {
   assert.equal(formatCost(49_000_000), "$49");
   assert.equal(formatCost(4_515_000_000), "$4,515");
   assert.equal(formatCostTitle(4_515_000_000), "$4,515");
+});
+
+test("pace multiplier formatting derives speed from projected delta", () => {
+  assert.equal(paceMultiplierFromDelta(-50), 0.5);
+  assert.equal(paceMultiplierFromDelta(0), 1);
+  assert.equal(paceMultiplierFromDelta(51), 1.51);
+  assert.equal(formatPaceMultiplier(0.5), "0.5x");
+  assert.equal(formatPaceMultiplier(1.51), "1.51x");
+  assert.equal(formatPaceMultiplier(2), "2x");
 });
 
 test("row helpers read backend rollup fields", () => {

@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   TODO_QUEUE_DEVICE_KIND_MOBILE,
   buildAccountLiveDeviceRows,
+  buildDevicesGraphModel,
   buildTodoQueueDeviceWorkspaceOptions,
   todoQueueDeviceSelectionIsLocalEditable,
   workspaceTodoItemsForDeviceWorkspace,
@@ -1012,6 +1013,103 @@ test("workspaceTodos filtering ignores null device selections", () => {
   }, null);
 
   assert.deepEqual(items, []);
+});
+
+test("devices graph model preserves device, workspace, terminal, tool, and todo status", () => {
+  const graph = buildDevicesGraphModel({
+    deviceLiveState: {
+      account_device_live_state_snapshot: {
+        account_name: "Acme Corp",
+        devices: {
+          "desktop-local": {
+            device_id: "desktop-local",
+            device_name: "Local Mac",
+            form_factor: "desktop",
+            native_connected: true,
+            platform: "macos",
+            status: "connected",
+            web_connected: true,
+            workspaces: {
+              "ws-app": {
+                mcps: [{ status: "ready" }],
+                servers: [{ status: "running" }],
+                terminals: [
+                  { activity_status: "running", terminal_index: 0 },
+                  { activity_status: "idle", terminal_index: 1 },
+                ],
+                workspace_active: true,
+                workspace_id: "ws-app",
+                workspace_name: "mobile-app",
+                workspace_status: "active",
+              },
+            },
+          },
+          "studio-pc": {
+            device_id: "studio-pc",
+            device_name: "Studio PC",
+            form_factor: "pc",
+            native_connected: false,
+            status: "offline",
+            web_connected: false,
+            workspaces: {
+              "ws-infra": {
+                workspace_id: "ws-infra",
+                workspace_name: "infra-tools",
+                workspace_status: "idle",
+              },
+            },
+          },
+        },
+      },
+    },
+    localProfile: {
+      device_id: "desktop-local",
+      device_name: "Local Mac",
+      form_factor: "desktop",
+      platform: "macos",
+    },
+    workspaceTodos: {
+      itemsByWorkspace: {
+        "ws-app": [
+          {
+            deviceId: "desktop-local",
+            status: "listed",
+            text: "Build graph",
+            todoId: "todo-1",
+            workspaceId: "ws-app",
+          },
+          {
+            deviceId: "desktop-local",
+            status: "deleted",
+            text: "Discarded",
+            todoId: "todo-2",
+            workspaceId: "ws-app",
+          },
+        ],
+      },
+    },
+  });
+
+  assert.equal(graph.account.name, "Acme Corp");
+  assert.equal(graph.totals.deviceCount, 2);
+  assert.equal(graph.totals.workspaceCount, 2);
+  assert.equal(graph.totals.terminalCount, 2);
+  assert.equal(graph.totals.toolCount, 2);
+  assert.equal(graph.totals.todoCount, 1);
+  const localDevice = graph.devices.find((device) => device.deviceId === "desktop-local");
+  assert.equal(localDevice.isLocal, true);
+  assert.equal(localDevice.liveState, "live");
+  assert.equal(localDevice.nativeConnected, true);
+  assert.equal(localDevice.webConnected, true);
+  assert.equal(localDevice.workspaceCount, 1);
+  assert.equal(localDevice.workspaces[0].status, "active");
+  assert.equal(localDevice.workspaces[0].terminalCount, 2);
+  assert.equal(localDevice.workspaces[0].terminalStatusCounts.busy, 1);
+  assert.equal(localDevice.workspaces[0].toolCount, 2);
+  assert.equal(localDevice.workspaces[0].todoCount, 1);
+  const remoteDevice = graph.devices.find((device) => device.deviceId === "studio-pc");
+  assert.equal(remoteDevice.liveState, "offline");
+  assert.equal(remoteDevice.workspaces[0].status, "idle");
 });
 
 test("only local device current workspace selections are editable", () => {
