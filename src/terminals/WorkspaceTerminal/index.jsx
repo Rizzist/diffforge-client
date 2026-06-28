@@ -17,6 +17,7 @@ import {
 import {
   TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL,
   TERMINAL_WINDOW_CONTROL_EVENT,
+  TERMINAL_WINDOW_CONTROL_FONT_SIZE,
   TERMINAL_WINDOW_CONTROL_FULLSCREEN,
   TERMINAL_WINDOW_CONTROL_RESTART_AS,
   TERMINAL_WINDOW_CONTROL_SPLIT_HORIZONTAL,
@@ -2150,6 +2151,15 @@ function WorkspaceTerminal({
       writeStoredTerminalFontSize(workspace?.id, terminalIndex, next);
       return next;
     });
+  }, [terminalIndex, workspace?.id]);
+  const setTerminalFontSizeFromWindow = useCallback((fontSize) => {
+    const next = clampTerminalFontSize(fontSize);
+    if (terminalFontSizeRef.current === next) {
+      return;
+    }
+    terminalFontSizeRef.current = next;
+    writeStoredTerminalFontSize(workspace?.id, terminalIndex, next);
+    setTerminalFontSize(next);
   }, [terminalIndex, workspace?.id]);
   const terminalInstanceIdRef = useRef(0);
   const agentLaunchEpochRef = useRef(agentLaunchEpoch);
@@ -15896,6 +15906,9 @@ function WorkspaceTerminal({
         case TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL:
           closeTerminal();
           break;
+        case TERMINAL_WINDOW_CONTROL_FONT_SIZE:
+          setTerminalFontSizeFromWindow(event.payload?.fontSize);
+          break;
         case TERMINAL_WINDOW_CONTROL_RESTART_AS:
           restartTerminalAs(String(event.payload?.roleId || "") || undefined);
           break;
@@ -15934,6 +15947,7 @@ function WorkspaceTerminal({
     closeTerminal,
     paneId,
     restartTerminalAs,
+    setTerminalFontSizeFromWindow,
     splitTerminalHorizontal,
     splitTerminalVertical,
     toggleTerminalFullscreen,

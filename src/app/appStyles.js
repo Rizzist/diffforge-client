@@ -16,6 +16,7 @@ import { CropSquare } from "@styled-icons/material-rounded/CropSquare";
 import { KeyboardDoubleArrowDown as TitleBackgroundGlyph } from "@styled-icons/material-rounded/KeyboardDoubleArrowDown";
 import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Description } from "@styled-icons/material-rounded/Description";
+import { Draw } from "@styled-icons/material-rounded/Draw";
 import { DragIndicator } from "@styled-icons/material-rounded/DragIndicator";
 import { DarkMode } from "@styled-icons/material-rounded/DarkMode";
 import { ErrorOutline } from "@styled-icons/material-rounded/ErrorOutline";
@@ -17155,16 +17156,19 @@ export const McpSwitchButton = styled.button`
 
 export const AgentSafetyModeGroup = styled.div`
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 6px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 178px), 1fr));
+  gap: 8px;
   min-width: 0;
 `;
 
 export const AgentSafetyModeButton = styled.button`
   display: grid;
-  gap: 3px;
+  gap: 5px;
   min-width: 0;
-  padding: 8px 10px;
+  min-height: 76px;
+  aspect-ratio: 1.618 / 1;
+  align-content: center;
+  padding: 10px 12px;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   color: var(--forge-text-soft);
@@ -17175,14 +17179,16 @@ export const AgentSafetyModeButton = styled.button`
   cursor: pointer;
 
   strong {
-    font-size: 12px;
+    font-size: 12.5px;
     font-weight: 780;
+    line-height: 1.1;
   }
 
   em {
     font-size: 10.5px;
     font-style: normal;
     font-weight: 600;
+    line-height: 1.25;
     color: var(--forge-text-muted);
   }
 
@@ -21746,6 +21752,10 @@ export const ButtonEditorIcon = styled(Movie)`
   ${buttonIconSize}
 `;
 
+export const ButtonWhiteboardIcon = styled(Draw)`
+  ${buttonIconSize}
+`;
+
 export const ButtonHubIcon = styled(Hub)`
   ${buttonIconSize}
 `;
@@ -21973,16 +21983,18 @@ export const WorkspaceCreateAgentGrid = styled.div`
 `;
 
 export const WorkspaceCreateAgentCard = styled.div`
+  container-type: inline-size;
   display: grid;
   grid-template-columns: auto minmax(0, 1fr) auto;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto auto;
   grid-template-areas:
     "icon . status"
     "body body body"
-    "permission permission stepper";
+    "permission permission permission"
+    "stepper stepper stepper";
   align-items: start;
   gap: 6px 7px;
-  min-height: 76px;
+  min-height: 102px;
   padding: 8px;
   border: 1px solid ${({ $active }) => ($active ? "rgba(138, 216, 255, 0.34)" : "var(--forge-border)")};
   border-radius: 8px;
@@ -21991,6 +22003,31 @@ export const WorkspaceCreateAgentCard = styled.div`
 
   &[data-unavailable="true"] {
     opacity: 0.55;
+  }
+
+  [data-agent-control="permission"],
+  [data-agent-control="stepper"] {
+    width: 100%;
+    justify-self: stretch;
+  }
+
+  @container (min-width: 172px) {
+    grid-template-rows: auto minmax(0, 1fr) auto;
+    grid-template-areas:
+      "icon . status"
+      "body body body"
+      "permission permission stepper";
+    min-height: 76px;
+
+    [data-agent-control="permission"] {
+      width: auto;
+      justify-self: start;
+    }
+
+    [data-agent-control="stepper"] {
+      width: auto;
+      justify-self: end;
+    }
   }
 `;
 
@@ -22024,6 +22061,36 @@ export const WorkspaceCreateAgentIcon = styled.span`
   &[data-agent="opencode"] {
     background: rgba(241, 236, 236, 0.07);
     border-color: rgba(241, 236, 236, 0.2);
+  }
+
+  &[data-agent="document"] {
+    color: #9bdcff;
+    background: rgba(14, 165, 233, 0.1);
+    border-color: rgba(14, 165, 233, 0.28);
+  }
+
+  &[data-agent="video-editor"] {
+    color: #f9a8d4;
+    background: rgba(236, 72, 153, 0.1);
+    border-color: rgba(236, 72, 153, 0.26);
+  }
+
+  &[data-agent="pcb-design"] {
+    color: #a7f3d0;
+    background: rgba(16, 185, 129, 0.1);
+    border-color: rgba(16, 185, 129, 0.26);
+  }
+
+  &[data-agent="simulator-3d"] {
+    color: #fde68a;
+    background: rgba(245, 158, 11, 0.1);
+    border-color: rgba(245, 158, 11, 0.25);
+  }
+
+  &[data-agent="touch-whiteboard"] {
+    color: #f8fafc;
+    background: rgba(148, 163, 184, 0.12);
+    border-color: rgba(203, 213, 225, 0.28);
   }
 
   > svg {
@@ -22096,10 +22163,10 @@ export const WorkspaceCreateAgentStepper = styled.div`
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
+  justify-content: space-between;
   gap: 2px;
-  justify-self: end;
   align-self: end;
-  min-width: 66px;
+  min-width: 0;
   border: 1px solid var(--forge-border);
   border-radius: 999px;
   background: var(--forge-bg-deep);
@@ -22142,10 +22209,10 @@ export const WorkspaceCreateAgentPermission = styled.div`
   grid-area: permission;
   display: inline-flex;
   align-items: center;
+  justify-content: space-between;
   gap: 2px;
   align-self: end;
-  justify-self: start;
-  min-width: 74px;
+  min-width: 0;
   max-width: 100%;
   border: 1px solid var(--forge-border);
   border-radius: 999px;

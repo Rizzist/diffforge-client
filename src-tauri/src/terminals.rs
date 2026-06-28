@@ -6,6 +6,7 @@ fn terminal_now_ms() -> u64 {
 }
 
 const TERMINAL_STARTING_IDLE_BUFFER_MS: u64 = 5_000;
+const TERMINAL_PROMPT_READY_BUSY_DEBOUNCE_MS: u64 = 750;
 const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
 
 #[cfg(windows)]
@@ -427,6 +428,49 @@ fn terminal_runtime_snapshot_is_starting(runtime: &TerminalRuntimeSnapshot) -> b
         terminal_projection_text(&runtime.activity_status, "").as_str(),
         "starting" | "prewarmed"
     ) || terminal_projection_text(&runtime.command_phase, "") == "starting"
+}
+
+fn terminal_runtime_snapshot_is_busy_turn(runtime: &TerminalRuntimeSnapshot) -> bool {
+    let status = terminal_projection_text(&runtime.status, "");
+    let activity = terminal_projection_text(&runtime.activity_status, "");
+    let command_phase = terminal_projection_text(&runtime.command_phase, "");
+    let event_type = terminal_projection_text(&runtime.event_type, "");
+    let hook_event_name = terminal_projection_text(&runtime.hook_event_name, "");
+
+    if runtime.input_ready
+        || terminal_projection_state_is_error(&status)
+        || terminal_projection_state_is_error(&activity)
+        || terminal_projection_state_is_paused(&status)
+        || terminal_projection_state_is_paused(&activity)
+        || terminal_projection_state_is_closed(&status)
+        || terminal_projection_state_is_finished(&activity)
+        || matches!(command_phase.as_str(), "completed" | "complete" | "done")
+    {
+        return false;
+    }
+
+    terminal_projection_state_is_busy(&status)
+        || terminal_projection_state_is_busy(&activity)
+        || terminal_projection_state_is_busy(&command_phase)
+        || matches!(
+            event_type.as_str(),
+            "message_submitted"
+                | "message-submitted"
+                | "provider_turn_started"
+                | "provider-turn-started"
+                | "agent_output"
+                | "agent-output"
+                | "pending_prompt_sent"
+                | "pending-prompt-sent"
+        )
+        || matches!(
+            hook_event_name.as_str(),
+            "backendpromptsubmit"
+                | "userpromptsubmit"
+                | "userpromptsubmitted"
+                | "promptsubmit"
+                | "promptsubmitted"
+        )
 }
 
 fn terminal_runtime_startup_idle_fingerprint(runtime: &TerminalRuntimeSnapshot) -> Value {
@@ -2956,7 +3000,11 @@ fn workspace_git_fetch(root: &Path) -> Result<String, String> {
     }
 }
 
-fn workspace_git_pull_candidate_summary(root: &Path, workspace_root: &Path) -> Value {
+fn workspace_git_pull_candidate_summary(
+    root: &Path,
+    workspace_root: &Path,
+    fetch_remote: bool,
+) -> Value {
     let branch = workspace_git_current_branch(root);
     let upstream = workspace_git_upstream(root);
     let files = workspace_git_status_files(root);
@@ -2964,12 +3012,14 @@ fn workspace_git_pull_candidate_summary(root: &Path, workspace_root: &Path) -> V
     let dirty = !files.is_empty();
     let operation_state = workspace_git_operation_state(root);
     let operation_clean = operation_state["clean"].as_bool().unwrap_or(false);
-    let (fetch_ok, fetch_error) = if upstream.trim().is_empty() || !operation_clean {
-        (false, String::new())
+    let (fetch_ok, fetch_error, fetch_skipped) = if upstream.trim().is_empty() || !operation_clean {
+        (false, String::new(), false)
+    } else if !fetch_remote {
+        (true, String::new(), true)
     } else {
         match workspace_git_fetch(root) {
-            Ok(_) => (true, String::new()),
-            Err(error) => (false, error),
+            Ok(_) => (true, String::new(), false),
+            Err(error) => (false, error, false),
         }
     };
     let (ahead, behind) = workspace_git_ahead_behind(root, &upstream);
@@ -3023,6 +3073,7 @@ fn workspace_git_pull_candidate_summary(root: &Path, workspace_root: &Path) -> V
         "statusCounts": counts,
         "fetchOk": fetch_ok,
         "fetchError": fetch_error,
+        "fetchSkipped": fetch_skipped,
         "pullable": pullable,
         "selected": pullable,
         "reason": reason,
@@ -3254,11 +3305,12 @@ async fn workspace_git_pull_candidates(
     workspace_id: Option<String>,
     workspace_name: Option<String>,
     refresh: Option<bool>,
+    fetch_remote: Option<bool>,
 ) -> Result<Value, String> {
     ensure_app_not_shutting_down("workspace Git pull check")?;
     let workspace_root = resolve_workspace_root_directory(Some(&repo_path))?;
     let force_refresh = refresh.unwrap_or(false);
-    let mut topology = if force_refresh {
+    let topology = if force_refresh {
         terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await
     } else {
         terminal_workspace_topology_cached_scan(
@@ -3268,10 +3320,6 @@ async fn workspace_git_pull_candidates(
         )
         .await
     };
-    if !force_refresh && topology.cache_status == "missing" {
-        topology =
-            terminal_workspace_topology_scan_for_launch(state.inner(), &workspace_root).await;
-    }
     let cache = json!({
         "key": topology.cache_key,
         "status": topology.cache_status,
@@ -3281,10 +3329,13 @@ async fn workspace_git_pull_candidates(
     });
     let repos = workspace_git_discovered_repositories(&workspace_root, &topology.mounts);
     let workspace_root_for_worker = workspace_root.clone();
+    let fetch_remote = fetch_remote.unwrap_or(false);
     let repositories = tauri::async_runtime::spawn_blocking(move || {
         repos
             .into_iter()
-            .map(|repo| workspace_git_pull_candidate_summary(&repo, &workspace_root_for_worker))
+            .map(|repo| {
+                workspace_git_pull_candidate_summary(&repo, &workspace_root_for_worker, fetch_remote)
+            })
             .collect::<Vec<_>>()
     })
     .await
@@ -3930,35 +3981,87 @@ fn spawn_terminal_reader(
                 || cloud_mcp_terminal_output_has_prompt_marker(&cleaned))
     }
 
-    async fn observe_terminal_startup_prompt_ready(
+    async fn observe_terminal_prompt_ready(
         app: AppHandle,
         terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
         cloud_mcp_state: CloudMcpState,
         pane_id: String,
         instance_id: u64,
     ) {
-        let Some(instance) =
-            terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
-        else {
-            return;
-        };
+        let mut instance =
+            match terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await {
+                Some(instance) => instance,
+                None => return,
+            };
         if !cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_id)
             && !cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_kind)
         {
             return;
         }
-        let runtime = terminal_runtime_snapshot(&instance);
+        let mut runtime = terminal_runtime_snapshot(&instance);
         if runtime.input_ready {
             return;
         }
-        let runtime_status = terminal_projection_text(&runtime.status, "");
-        let runtime_activity = terminal_projection_text(&runtime.activity_status, "");
-        let runtime_phase = terminal_projection_text(&runtime.command_phase, "");
-        if !matches!(runtime_status.as_str(), "starting" | "prewarmed")
-            && !matches!(runtime_activity.as_str(), "starting" | "prewarmed")
-            && runtime_phase != "starting"
-        {
+        let startup_ready = terminal_runtime_snapshot_is_starting(&runtime);
+        if !startup_ready && !terminal_runtime_snapshot_is_busy_turn(&runtime) {
             return;
+        }
+        if !startup_ready {
+            let busy_age_ms = terminal_now_ms().saturating_sub(runtime.updated_at_ms);
+            if busy_age_ms < TERMINAL_PROMPT_READY_BUSY_DEBOUNCE_MS {
+                sleep(Duration::from_millis(
+                    TERMINAL_PROMPT_READY_BUSY_DEBOUNCE_MS.saturating_sub(busy_age_ms),
+                ))
+                .await;
+                instance =
+                    match terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id)
+                        .await
+                    {
+                        Some(instance) => instance,
+                        None => return,
+                    };
+                runtime = terminal_runtime_snapshot(&instance);
+                if runtime.input_ready
+                    || (!terminal_runtime_snapshot_is_starting(&runtime)
+                        && !terminal_runtime_snapshot_is_busy_turn(&runtime))
+                {
+                    return;
+                }
+            }
+        }
+
+        let recovery_source = if terminal_runtime_snapshot_is_starting(&runtime) {
+            "backend-startup-prompt-ready"
+        } else {
+            "backend-output-prompt-ready"
+        };
+        let mut event = json!({
+            "hookEventName": "Stop",
+            "provider": instance.metadata.agent_kind.clone(),
+            "source": recovery_source,
+            "timestamp": crate::coordination::kernel::now_rfc3339(),
+        });
+        if let Some(object) = event.as_object_mut() {
+            if let Some(provider_session_id) = runtime
+                .provider_session_id
+                .as_deref()
+                .or(runtime.native_session_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                object.insert("sessionId".to_string(), json!(provider_session_id));
+                object.insert("providerSessionId".to_string(), json!(provider_session_id));
+                object.insert("nativeSessionId".to_string(), json!(provider_session_id));
+            }
+            if let Some(turn_id) = runtime
+                .turn_id
+                .as_deref()
+                .or(runtime.provider_turn_id.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                object.insert("turnId".to_string(), json!(turn_id));
+            }
         }
 
         process_terminal_activity_hook_event(
@@ -3968,13 +4071,8 @@ fn spawn_terminal_reader(
             &pane_id,
             instance_id,
             &instance,
-            &json!({
-                "hookEventName": "Stop",
-                "provider": instance.metadata.agent_kind.clone(),
-                "source": "backend-startup-prompt-ready",
-                "timestamp": crate::coordination::kernel::now_rfc3339(),
-            }),
-            "backend-startup-prompt-ready",
+            &event,
+            recovery_source,
         )
         .await;
     }
@@ -4030,7 +4128,7 @@ fn spawn_terminal_reader(
     }
 
     let reader_pane_id = pane_id.clone();
-    let startup_prompt_ready_observed = Arc::new(AtomicBool::new(false));
+    let prompt_ready_observer_in_flight = Arc::new(AtomicBool::new(false));
 
     log_terminal_crash_forensics_event(
         "backend.terminal_reader.spawn",
@@ -4321,9 +4419,8 @@ fn spawn_terminal_reader(
                         headless_output.append(chunk);
                     }
                     if rust_readiness_observer_enabled
-                        && !startup_prompt_ready_observed.load(Ordering::Acquire)
                         && terminal_headless_tail_has_prompt_marker(&headless_output)
-                        && startup_prompt_ready_observed
+                        && prompt_ready_observer_in_flight
                             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
                             .is_ok()
                     {
@@ -4331,8 +4428,10 @@ fn spawn_terminal_reader(
                         let readiness_terminals = Arc::clone(&terminals);
                         let readiness_cloud_state = cloud_mcp_state.clone();
                         let readiness_pane_id = reader_pane_id.clone();
+                        let readiness_observer_in_flight =
+                            Arc::clone(&prompt_ready_observer_in_flight);
                         tauri::async_runtime::spawn(async move {
-                            observe_terminal_startup_prompt_ready(
+                            observe_terminal_prompt_ready(
                                 readiness_app,
                                 readiness_terminals,
                                 readiness_cloud_state,
@@ -4340,6 +4439,7 @@ fn spawn_terminal_reader(
                                 instance_id,
                             )
                             .await;
+                            readiness_observer_in_flight.store(false, Ordering::Release);
                         });
                     }
                     if !auth_failure_marked
@@ -5469,6 +5569,7 @@ async fn terminal_open(
             resolved_launch.permission_mode.as_deref(),
             &pane_id,
             instance_id,
+            activity_transport.as_ref(),
         );
         let app_control_mcp_launch = if app_control_mcp_requested {
             let endpoint =
@@ -6196,6 +6297,7 @@ async fn terminal_start_agent(
         launch.permission_mode.as_deref(),
         &pane_id,
         instance.id,
+        activity_transport.as_ref(),
     );
     let app_control_mcp_launch =
         resolve_app_control_mcp_launch(&app, instance.app_control_mcp_requested).await?;
@@ -6512,6 +6614,28 @@ async fn start_terminal_agent_in_prepared_pty(
             Some(instance.metadata.workspace_id.as_str()),
             instance.metadata.terminal_index,
         );
+        let terminal_state = app.state::<TerminalState>();
+        let activity_transport = match terminal_activity_transport_for_terminal(
+            app.clone(),
+            terminal_state.inner(),
+            &pane_id,
+            instance.id,
+        )
+        .await
+        {
+            Ok(endpoint) => Some(endpoint),
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.terminal_activity_transport.start_error",
+                    json!({
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "instance_id": instance.id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    }),
+                );
+                None
+            }
+        };
         let mut launch_args = terminal_args_with_codex_mcp_identity(
             definition.id,
             &args,
@@ -6519,6 +6643,7 @@ async fn start_terminal_agent_in_prepared_pty(
             resolved_launch.permission_mode.as_deref(),
             &pane_id,
             instance.id,
+            activity_transport.as_ref(),
         );
         let app_control_mcp_launch =
             match resolve_app_control_mcp_launch(&app, instance.app_control_mcp_requested).await {
@@ -6569,28 +6694,6 @@ async fn start_terminal_agent_in_prepared_pty(
                 message: error,
             };
         }
-        let terminal_state = app.state::<TerminalState>();
-        let activity_transport = match terminal_activity_transport_for_terminal(
-            app.clone(),
-            terminal_state.inner(),
-            &pane_id,
-            instance.id,
-        )
-        .await
-        {
-            Ok(endpoint) => Some(endpoint),
-            Err(error) => {
-                log_terminal_status_event(
-                    "backend.terminal_activity_transport.start_error",
-                    json!({
-                        "error": clean_terminal_diagnostic_log_text(&error),
-                        "instance_id": instance.id,
-                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                    }),
-                );
-                None
-            }
-        };
         let mut coordination_env_vars = instance
             .coordination
             .as_ref()
@@ -14132,6 +14235,8 @@ async fn terminal_window_open(
     agent_label: Option<String>,
     color_slot: Option<String>,
     theme: Option<String>,
+    workspace_id: Option<String>,
+    terminal_index: Option<i64>,
     width: Option<f64>,
     height: Option<f64>,
 ) -> Result<(), String> {
@@ -14159,6 +14264,7 @@ async fn terminal_window_open(
         ("agentLabel", agent_label),
         ("colorSlot", color_slot),
         ("theme", theme),
+        ("workspaceId", workspace_id),
     ] {
         let Some(value) = value else {
             continue;
@@ -14171,6 +14277,9 @@ async fn terminal_window_open(
             "&{key}={}",
             percent_encode_query_component(&trimmed)
         ));
+    }
+    if let Some(terminal_index) = terminal_index.filter(|value| *value >= 0) {
+        url.push_str(&format!("&terminalIndex={terminal_index}"));
     }
 
     // Open at the pane's current grid size so the terminal carries its exact
@@ -15815,6 +15924,43 @@ mod terminal_tests {
     }
 
     #[test]
+    fn terminal_prompt_ready_recovery_only_targets_busy_turns() {
+        let mut runtime = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: Some("2026-06-19T00:00:00Z".to_string()),
+            completed_at: None,
+            provider_session_id: Some("session-1".to_string()),
+            native_session_id: Some("session-1".to_string()),
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            source: "backend:prompt-submitted".to_string(),
+            event_type: "provider-turn-started".to_string(),
+            hook_event_name: "BackendPromptSubmit".to_string(),
+            updated_at_ms: 1,
+        };
+
+        assert!(terminal_runtime_snapshot_is_busy_turn(&runtime));
+
+        runtime.input_ready = true;
+        runtime.activity_status = "idle".to_string();
+        runtime.command_phase = "completed".to_string();
+        assert!(!terminal_runtime_snapshot_is_busy_turn(&runtime));
+
+        runtime.input_ready = false;
+        runtime.activity_status = "paused".to_string();
+        runtime.command_phase = "awaiting_permission".to_string();
+        assert!(!terminal_runtime_snapshot_is_busy_turn(&runtime));
+
+        runtime.activity_status = "error".to_string();
+        runtime.command_phase = "failed".to_string();
+        assert!(!terminal_runtime_snapshot_is_busy_turn(&runtime));
+    }
+
+    #[test]
     fn activity_hook_provider_session_id_accepts_provider_aliases() {
         assert_eq!(
             terminal_activity_hook_provider_session_id(&json!({
@@ -16395,6 +16541,7 @@ mod terminal_tests {
             None,
             "pane-auto",
             42,
+            None,
         );
 
         assert!(args
@@ -16481,6 +16628,7 @@ mod terminal_tests {
             None,
             "pane-auto",
             42,
+            None,
         );
 
         assert!(args
@@ -16653,6 +16801,7 @@ mod terminal_tests {
             None,
             "pane-auto",
             42,
+            None,
         );
 
         assert!(args.windows(2).any(|pair| pair == ["--disable", "apps"]));
@@ -16739,6 +16888,7 @@ mod terminal_tests {
             None,
             "pane-auto",
             42,
+            None,
         );
 
         assert!(args
@@ -16887,6 +17037,7 @@ mod terminal_tests {
             None,
             "pane-direct",
             43,
+            None,
         );
 
         assert!(args
@@ -16980,6 +17131,7 @@ mod terminal_tests {
             None,
             "pane-general",
             44,
+            None,
         );
 
         assert!(args
@@ -17745,6 +17897,7 @@ mod terminal_tests {
             None,
             "pane-auto",
             42,
+            None,
         );
 
         assert!(args.iter().any(|arg| arg == "--no-alt-screen"));
@@ -17760,6 +17913,7 @@ mod terminal_tests {
             None,
             "pane-auto",
             42,
+            None,
         );
 
         assert_eq!(
@@ -17785,6 +17939,7 @@ mod terminal_tests {
             None,
             "pane-auto",
             42,
+            None,
         );
 
         assert!(!args.windows(2).any(|pair| pair == ["--enable", "apps"]));
@@ -17967,6 +18122,7 @@ mod terminal_tests {
             None,
             "pane-auto",
             42,
+            None,
         );
 
         assert_eq!(
@@ -18036,6 +18192,7 @@ mod terminal_tests {
             None,
             "pane-activity",
             7,
+            None,
         );
 
         assert!(args
@@ -18067,6 +18224,7 @@ mod terminal_tests {
                 mode,
                 "pane-permissions",
                 11,
+                None,
             )
         };
 
@@ -18114,6 +18272,7 @@ mod terminal_tests {
                 mode,
                 "pane-permissions",
                 12,
+                None,
             )
         };
 

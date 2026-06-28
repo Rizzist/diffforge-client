@@ -65,6 +65,15 @@ function historyFileLabel(file) {
 }
 
 const WORKING_TREE_HISTORY_KEY = "__working_tree_changes__";
+const REPOSITORY_PRELOAD_LOADING_STALE_MS = 15000;
+
+function repositoryPreloadLoadingStale(preload, nowMs = Date.now()) {
+  if (!preload || preload.state !== "loading") {
+    return false;
+  }
+  const requestedAtMs = numberValue(preload.requestedAtMs || preload.generatedAtMs);
+  return requestedAtMs > 0 && nowMs - requestedAtMs >= REPOSITORY_PRELOAD_LOADING_STALE_MS;
+}
 
 function filePathName(path) {
   const normalized = text(path);
@@ -467,6 +476,7 @@ export default function GitWorkspaceView({
   const preloadSignature = [
     repositoriesPreload?.checkKey || "",
     repositoriesPreload?.state || "",
+    Number(repositoriesPreload?.requestedAtMs) || 0,
     Number(repositoriesPreload?.generatedAtMs) || 0,
     Array.isArray(repositoriesPreload?.repositories) ? repositoriesPreload.repositories.length : -1,
     repositoriesPreload?.error || "",
@@ -544,12 +554,12 @@ export default function GitWorkspaceView({
     workspaceId,
   ]);
 
-  const refreshRepositories = useCallback(() => {
+  const refreshRepositories = useCallback((options = {}) => {
     if (typeof onRefreshRepositories !== "function" || !rootDirectory || !workspaceId) {
       return Promise.resolve(null);
     }
     return onRefreshRepositories({
-      refresh: true,
+      refresh: options.refresh === true,
       rootDirectory,
       workspaceId,
       workspaceName: workspace?.name || "",
@@ -557,7 +567,29 @@ export default function GitWorkspaceView({
   }, [onRefreshRepositories, rootDirectory, workspace?.name, workspaceId]);
 
   useEffect(() => {
-    if (preloadMatches || typeof onRefreshRepositories !== "function" || !rootDirectory || !workspaceId) {
+    if (!preloadMatches || !repositoriesPreload || repositoriesPreload.state !== "loading") {
+      return undefined;
+    }
+    const requestedAtMs = numberValue(repositoriesPreload.requestedAtMs || repositoriesPreload.generatedAtMs);
+    if (!requestedAtMs || repositoryPreloadLoadingStale(repositoriesPreload)) {
+      return undefined;
+    }
+    const delayMs = Math.max(0, REPOSITORY_PRELOAD_LOADING_STALE_MS - (Date.now() - requestedAtMs));
+    const timer = window.setTimeout(() => {
+      void refreshRepositories();
+    }, delayMs);
+    return () => window.clearTimeout(timer);
+  }, [preloadMatches, preloadSignature, refreshRepositories, repositoriesPreload]);
+
+  useEffect(() => {
+    const shouldRecoverStaleLoading = preloadMatches
+      && repositoryPreloadLoadingStale(repositoriesPreload);
+    if (
+      (preloadMatches && !shouldRecoverStaleLoading)
+      || typeof onRefreshRepositories !== "function"
+      || !rootDirectory
+      || !workspaceId
+    ) {
       return undefined;
     }
     let cancelled = false;
@@ -729,7 +761,7 @@ export default function GitWorkspaceView({
       setCommitNotice(result?.pushed
         ? `Committed and pushed ${shortSha(result?.commitSha)}.`
         : `Committed ${shortSha(result?.commitSha)}.${result?.pushError ? ` Push failed: ${result.pushError}` : ""}`);
-      await refreshRepositories();
+      await refreshRepositories({ refresh: true });
     } catch (error) {
       setCommitError(error?.message || String(error || "Unable to commit and push."));
     } finally {

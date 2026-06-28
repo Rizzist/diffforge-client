@@ -7257,14 +7257,14 @@ const TodoQueueItemPendingSpinner = styled.div`
     width: 2px;
     height: 5px;
     border-radius: 999px;
-    background: var(--forge-tint-soft);
+    background: var(--todo-agent-color, var(--forge-tint-soft));
     opacity: calc(0.26 + (var(--todo-spinner-index, 0) * 0.085));
     transform: rotate(calc(var(--todo-spinner-index, 0) * 45deg)) translateY(-1px);
     transform-origin: 1px 7px;
   }
 
   html[data-forge-theme="light"] & span {
-    background: var(--forge-tint);
+    background: var(--todo-agent-color, var(--forge-tint));
   }
 `;
 
@@ -12260,27 +12260,24 @@ function buildTodoQueueAgentModelCommand(agentId, model, reasoningEffort) {
 function getTodoQueueTargetTerminalName(item) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
-  const readDirectTarget = !queueMeta || queueTargetExplicit;
-  const directTargetTerminalName = readDirectTarget
-    ? normalizeTodoTerminalName(
-      item?.targetTerminalName
-        || item?.target_terminal_name
-        || item?.terminalName
-        || item?.terminal_name
-        || item?.targetName
-        || item?.target_name
-        || item?.remoteCommand?.targetTerminalName
-        || item?.remoteCommand?.target_terminal_name
-        || item?.remoteCommand?.terminalName
-        || item?.remoteCommand?.terminal_name
-        || item?.remoteCommand?.targetName
-        || item?.remoteCommand?.target_name
-        || item?.remote_command?.target_terminal_name
-        || item?.remote_command?.terminal_name
-        || item?.remote_command?.target_name
-        || "",
-    )
-    : "";
+  const directTargetTerminalName = normalizeTodoTerminalName(
+    item?.targetTerminalName
+      || item?.target_terminal_name
+      || item?.terminalName
+      || item?.terminal_name
+      || item?.targetName
+      || item?.target_name
+      || item?.remoteCommand?.targetTerminalName
+      || item?.remoteCommand?.target_terminal_name
+      || item?.remoteCommand?.terminalName
+      || item?.remoteCommand?.terminal_name
+      || item?.remoteCommand?.targetName
+      || item?.remoteCommand?.target_name
+      || item?.remote_command?.target_terminal_name
+      || item?.remote_command?.terminal_name
+      || item?.remote_command?.target_name
+      || "",
+  );
   const queueTargetTerminalName = queueTargetExplicit
     ? normalizeTodoTerminalName(
       queueMeta?.targetTerminalName
@@ -12298,27 +12295,24 @@ function getTodoQueueTargetTerminalName(item) {
 function getTodoQueueTargetTerminalId(item) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
-  const readDirectTarget = !queueMeta || queueTargetExplicit;
-  const directTargetTerminalId = readDirectTarget
-    ? normalizeTodoTerminalIdentity(
-      item?.targetTerminalId
-        || item?.target_terminal_id
-        || item?.terminalId
-        || item?.terminal_id
-        || item?.paneId
-        || item?.pane_id
-        || item?.remoteCommand?.targetTerminalId
-        || item?.remoteCommand?.target_terminal_id
-        || item?.remoteCommand?.terminalId
-        || item?.remoteCommand?.terminal_id
-        || item?.remoteCommand?.paneId
-        || item?.remoteCommand?.pane_id
-        || item?.remote_command?.target_terminal_id
-        || item?.remote_command?.terminal_id
-        || item?.remote_command?.pane_id
-        || "",
-    )
-    : "";
+  const directTargetTerminalId = normalizeTodoTerminalIdentity(
+    item?.targetTerminalId
+      || item?.target_terminal_id
+      || item?.terminalId
+      || item?.terminal_id
+      || item?.paneId
+      || item?.pane_id
+      || item?.remoteCommand?.targetTerminalId
+      || item?.remoteCommand?.target_terminal_id
+      || item?.remoteCommand?.terminalId
+      || item?.remoteCommand?.terminal_id
+      || item?.remoteCommand?.paneId
+      || item?.remoteCommand?.pane_id
+      || item?.remote_command?.target_terminal_id
+      || item?.remote_command?.terminal_id
+      || item?.remote_command?.pane_id
+      || "",
+  );
   const queueTargetTerminalId = queueTargetExplicit
     ? normalizeTodoTerminalIdentity(
       queueMeta?.targetTerminalId
@@ -12342,22 +12336,19 @@ function getTodoQueueTargetTerminalId(item) {
 function getTodoQueueTargetThreadId(item) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
-  const readDirectTarget = !queueMeta || queueTargetExplicit;
-  const directTargetThreadId = readDirectTarget
-    ? normalizeTodoTerminalIdentity(
-      item?.targetThreadId
-        || item?.target_thread_id
-        || item?.threadId
-        || item?.thread_id
-        || item?.remoteCommand?.targetThreadId
-        || item?.remoteCommand?.target_thread_id
-        || item?.remoteCommand?.threadId
-        || item?.remoteCommand?.thread_id
-        || item?.remote_command?.target_thread_id
-        || item?.remote_command?.thread_id
-        || "",
-    )
-    : "";
+  const directTargetThreadId = normalizeTodoTerminalIdentity(
+    item?.targetThreadId
+      || item?.target_thread_id
+      || item?.threadId
+      || item?.thread_id
+      || item?.remoteCommand?.targetThreadId
+      || item?.remoteCommand?.target_thread_id
+      || item?.remoteCommand?.threadId
+      || item?.remoteCommand?.thread_id
+      || item?.remote_command?.target_thread_id
+      || item?.remote_command?.thread_id
+      || "",
+  );
   const queueTargetThreadId = queueTargetExplicit
     ? normalizeTodoTerminalIdentity(
       queueMeta?.targetThreadId
@@ -12373,20 +12364,17 @@ function getTodoQueueTargetThreadId(item) {
 function getTodoQueueTargetTerminalIndex(item) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
-  const readDirectTarget = !queueMeta || queueTargetExplicit;
   const directIndex = normalizeTodoTerminalIndex(
-    readDirectTarget
-      ? item?.targetTerminalIndex
-        ?? item?.target_terminal_index
-        ?? item?.terminalIndex
-        ?? item?.terminal_index
-        ?? item?.remoteCommand?.targetTerminalIndex
-        ?? item?.remoteCommand?.target_terminal_index
-        ?? item?.remoteCommand?.terminalIndex
-        ?? item?.remoteCommand?.terminal_index
-        ?? item?.remote_command?.target_terminal_index
-        ?? item?.remote_command?.terminal_index
-      : undefined,
+    item?.targetTerminalIndex
+      ?? item?.target_terminal_index
+      ?? item?.terminalIndex
+      ?? item?.terminal_index
+      ?? item?.remoteCommand?.targetTerminalIndex
+      ?? item?.remoteCommand?.target_terminal_index
+      ?? item?.remoteCommand?.terminalIndex
+      ?? item?.remoteCommand?.terminal_index
+      ?? item?.remote_command?.target_terminal_index
+      ?? item?.remote_command?.terminal_index,
   );
   if (directIndex !== null) {
     return directIndex;
@@ -12404,49 +12392,47 @@ function getTodoQueueTargetTerminalIndex(item) {
   }
 
   const colorSlot = normalizeTerminalColorSlot(
-    readDirectTarget
-      ? item?.targetColorSlot
-        ?? item?.target_color_slot
-        ?? item?.terminalColorSlot
-        ?? item?.terminal_color_slot
-        ?? item?.colorSlot
-        ?? item?.color_slot
-        ?? item?.remoteCommand?.targetColorSlot
-        ?? item?.remoteCommand?.target_color_slot
-        ?? item?.remoteCommand?.terminalColorSlot
-        ?? item?.remoteCommand?.terminal_color_slot
-        ?? item?.remoteCommand?.colorSlot
-        ?? item?.remoteCommand?.color_slot
-        ?? item?.remote_command?.target_color_slot
-        ?? item?.remote_command?.terminal_color_slot
-        ?? item?.remote_command?.color_slot
-      : queueTargetExplicit
+    item?.targetColorSlot
+      ?? item?.target_color_slot
+      ?? item?.terminalColorSlot
+      ?? item?.terminal_color_slot
+      ?? item?.colorSlot
+      ?? item?.color_slot
+      ?? item?.remoteCommand?.targetColorSlot
+      ?? item?.remoteCommand?.target_color_slot
+      ?? item?.remoteCommand?.terminalColorSlot
+      ?? item?.remoteCommand?.terminal_color_slot
+      ?? item?.remoteCommand?.colorSlot
+      ?? item?.remoteCommand?.color_slot
+      ?? item?.remote_command?.target_color_slot
+      ?? item?.remote_command?.terminal_color_slot
+      ?? item?.remote_command?.color_slot
+      ?? (queueTargetExplicit
         ? queueMeta?.targetColorSlot
           ?? queueMeta?.target_color_slot
           ?? queueMeta?.terminalColorSlot
           ?? queueMeta?.terminal_color_slot
           ?? queueMeta?.colorSlot
           ?? queueMeta?.color_slot
-        : undefined,
+        : undefined),
   );
   const hasTerminalColor = Boolean(normalizeTerminalHexColor(
-    readDirectTarget
-      ? item?.targetTerminalColor
-        || item?.target_terminal_color
-        || item?.terminalColor
-        || item?.terminal_color
-        || item?.remoteCommand?.targetTerminalColor
-        || item?.remoteCommand?.target_terminal_color
-        || item?.remoteCommand?.terminalColor
-        || item?.remoteCommand?.terminal_color
-        || item?.remote_command?.target_terminal_color
-        || item?.remote_command?.terminal_color
-      : queueTargetExplicit
+    item?.targetTerminalColor
+      || item?.target_terminal_color
+      || item?.terminalColor
+      || item?.terminal_color
+      || item?.remoteCommand?.targetTerminalColor
+      || item?.remoteCommand?.target_terminal_color
+      || item?.remoteCommand?.terminalColor
+      || item?.remoteCommand?.terminal_color
+      || item?.remote_command?.target_terminal_color
+      || item?.remote_command?.terminal_color
+      || (queueTargetExplicit
         ? queueMeta?.targetTerminalColor
           || queueMeta?.target_terminal_color
           || queueMeta?.terminalColor
           || queueMeta?.terminal_color
-        : "",
+        : ""),
   ));
   return hasTerminalColor ? colorSlot : null;
 }
@@ -12454,26 +12440,23 @@ function getTodoQueueTargetTerminalIndex(item) {
 function getTodoQueueTargetColorSlot(item) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
-  const readDirectTarget = !queueMeta || queueTargetExplicit;
-  const directColorSlot = readDirectTarget
-    ? normalizeTerminalColorSlot(
-      item?.targetColorSlot
-        ?? item?.target_color_slot
-        ?? item?.terminalColorSlot
-        ?? item?.terminal_color_slot
-        ?? item?.colorSlot
-        ?? item?.color_slot
-        ?? item?.remoteCommand?.targetColorSlot
-        ?? item?.remoteCommand?.target_color_slot
-        ?? item?.remoteCommand?.terminalColorSlot
-        ?? item?.remoteCommand?.terminal_color_slot
-        ?? item?.remoteCommand?.colorSlot
-        ?? item?.remoteCommand?.color_slot
-        ?? item?.remote_command?.target_color_slot
-        ?? item?.remote_command?.terminal_color_slot
-        ?? item?.remote_command?.color_slot,
-    )
-    : null;
+  const directColorSlot = normalizeTerminalColorSlot(
+    item?.targetColorSlot
+      ?? item?.target_color_slot
+      ?? item?.terminalColorSlot
+      ?? item?.terminal_color_slot
+      ?? item?.colorSlot
+      ?? item?.color_slot
+      ?? item?.remoteCommand?.targetColorSlot
+      ?? item?.remoteCommand?.target_color_slot
+      ?? item?.remoteCommand?.terminalColorSlot
+      ?? item?.remoteCommand?.terminal_color_slot
+      ?? item?.remoteCommand?.colorSlot
+      ?? item?.remoteCommand?.color_slot
+      ?? item?.remote_command?.target_color_slot
+      ?? item?.remote_command?.terminal_color_slot
+      ?? item?.remote_command?.color_slot,
+  );
   if (directColorSlot !== null) {
     return directColorSlot;
   }
@@ -12493,20 +12476,17 @@ function getTodoQueueTargetColorSlot(item) {
 function getTodoQueueTargetTerminalColor(item) {
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
-  const readDirectTarget = !queueMeta || queueTargetExplicit;
   const candidates = [
-    ...(readDirectTarget ? [
-      item?.targetTerminalColor,
-      item?.target_terminal_color,
-      item?.terminalColor,
-      item?.terminal_color,
-      item?.remoteCommand?.targetTerminalColor,
-      item?.remoteCommand?.target_terminal_color,
-      item?.remoteCommand?.terminalColor,
-      item?.remoteCommand?.terminal_color,
-      item?.remote_command?.target_terminal_color,
-      item?.remote_command?.terminal_color,
-    ] : []),
+    item?.targetTerminalColor,
+    item?.target_terminal_color,
+    item?.terminalColor,
+    item?.terminal_color,
+    item?.remoteCommand?.targetTerminalColor,
+    item?.remoteCommand?.target_terminal_color,
+    item?.remoteCommand?.terminalColor,
+    item?.remoteCommand?.terminal_color,
+    item?.remote_command?.target_terminal_color,
+    item?.remote_command?.terminal_color,
     ...(queueTargetExplicit ? [
       queueMeta?.targetTerminalColor,
       queueMeta?.target_terminal_color,
@@ -17249,6 +17229,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           colorSlot: getTerminalAgentColorSlot(activeTerminal.terminalIndex),
           height: 720,
           paneId: activeTerminal.paneId,
+          terminalIndex: activeTerminal.terminalIndex,
           theme: document.documentElement?.dataset?.forgeTheme || "",
           title: "Terminal Orchestrator",
           width: 520,
@@ -21038,6 +21019,7 @@ function TerminalView({
           colorSlot: getTerminalAgentColorSlot(0),
           height: 720,
           paneId,
+          terminalIndex: 0,
           theme: document.documentElement?.dataset?.forgeTheme || "",
           title: "Terminal Orchestrator",
           width: 520,
@@ -25809,11 +25791,13 @@ function TerminalView({
       colorSlot: getTerminalAgentColorSlot(terminalIndex),
       height: rect?.height || null,
       paneId,
+      terminalIndex,
       theme: document.documentElement?.dataset?.forgeTheme || "",
       title: getTerminalWindowTitle(terminalIndex),
       width: rect?.width || null,
+      workspaceId: terminalWorkspace?.id || "",
     });
-  }, [getTerminalAgent, getTerminalWindowTitle]);
+  }, [getTerminalAgent, getTerminalWindowTitle, terminalWorkspace?.id]);
 
   // Individual pop-out: one grid terminal becomes its own native window (the
   // pane-level button next to the UI View toggle). Same machinery as the

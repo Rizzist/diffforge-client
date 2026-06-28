@@ -8,6 +8,7 @@ export const TERMINAL_WINDOW_META_REQUEST_EVENT = "forge-terminal-window-meta-re
 export const TERMINAL_WINDOW_CONTROL_EVENT = "forge-terminal-window-control";
 
 export const TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL = "close-terminal";
+export const TERMINAL_WINDOW_CONTROL_FONT_SIZE = "font-size";
 export const TERMINAL_WINDOW_CONTROL_RESTART_AS = "restart-as";
 export const TERMINAL_WINDOW_CONTROL_SPLIT_HORIZONTAL = "split-horizontal";
 export const TERMINAL_WINDOW_CONTROL_SPLIT_VERTICAL = "split-vertical";

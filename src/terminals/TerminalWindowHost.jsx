@@ -32,6 +32,7 @@ import { guardXtermDuringPushToTalk } from "./xtermPushToTalkGuard.js";
 import {
   TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL,
   TERMINAL_WINDOW_CONTROL_EVENT,
+  TERMINAL_WINDOW_CONTROL_FONT_SIZE,
   TERMINAL_WINDOW_CONTROL_FULLSCREEN,
   TERMINAL_WINDOW_CONTROL_RESTART_AS,
   TERMINAL_WINDOW_CONTROL_SPLIT_HORIZONTAL,
@@ -47,6 +48,10 @@ export const TERMINAL_WINDOW_CLOSED_EVENT = "forge-terminal-window-closed";
 
 const TERMINAL_WINDOW_RESIZE_DEBOUNCE_MS = 90;
 const TERMINAL_WINDOW_REATTACH_DELAY_MS = 1200;
+const TERMINAL_WINDOW_FONT_SIZE_DEFAULT = 12;
+const TERMINAL_WINDOW_FONT_SIZE_MIN = 8;
+const TERMINAL_WINDOW_FONT_SIZE_MAX = 24;
+const TERMINAL_WINDOW_FONT_SIZE_STEP = 1;
 // Emitted by the Rust drag watcher to this window's label while a todo/doc drag
 // hovers it, so the popped-out terminal shows the same "Drop here" affordance as
 // an in-grid terminal. The main window owns the payload and commits on release.
@@ -151,8 +156,10 @@ function parseTerminalWindowParams() {
       agentLabel: "Terminal",
       colorSlot: "",
       paneId: "",
+      terminalIndex: 0,
       theme: "",
       title: "Terminal",
+      workspaceId: "",
     };
   }
 
@@ -165,9 +172,77 @@ function parseTerminalWindowParams() {
     agentLabel: params.get("agentLabel") || params.get("title") || "Terminal",
     colorSlot: params.get("colorSlot") || "",
     paneId: params.get("paneId") || "",
+    terminalIndex: Number.parseInt(params.get("terminalIndex") || "0", 10) || 0,
     theme: params.get("theme") || "",
     title: params.get("title") || "Terminal",
+    workspaceId: params.get("workspaceId") || "",
   };
+}
+
+function clampTerminalWindowFontSize(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size)) {
+    return TERMINAL_WINDOW_FONT_SIZE_DEFAULT;
+  }
+  return Math.min(
+    TERMINAL_WINDOW_FONT_SIZE_MAX,
+    Math.max(TERMINAL_WINDOW_FONT_SIZE_MIN, Math.round(size)),
+  );
+}
+
+function terminalWindowFontSizeStorageKey(workspaceId, terminalIndex, paneId) {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  if (safeWorkspaceId) {
+    return `diffforge.terminal.fontSize.v1:${safeWorkspaceId}:${Number(terminalIndex) || 0}`;
+  }
+  return `diffforge.terminal.window.fontSize.v1:${String(paneId || "pane").trim()}`;
+}
+
+function readStoredTerminalWindowFontSize(workspaceId, terminalIndex, paneId) {
+  try {
+    const stored = window.localStorage.getItem(
+      terminalWindowFontSizeStorageKey(workspaceId, terminalIndex, paneId),
+    );
+    if (stored === null || stored === "") {
+      return TERMINAL_WINDOW_FONT_SIZE_DEFAULT;
+    }
+    return clampTerminalWindowFontSize(stored);
+  } catch {
+    return TERMINAL_WINDOW_FONT_SIZE_DEFAULT;
+  }
+}
+
+function writeStoredTerminalWindowFontSize(workspaceId, terminalIndex, paneId, size) {
+  try {
+    const key = terminalWindowFontSizeStorageKey(workspaceId, terminalIndex, paneId);
+    if (clampTerminalWindowFontSize(size) === TERMINAL_WINDOW_FONT_SIZE_DEFAULT) {
+      window.localStorage.removeItem(key);
+    } else {
+      window.localStorage.setItem(key, String(clampTerminalWindowFontSize(size)));
+    }
+  } catch {
+    // Font size persistence is convenience state only.
+  }
+}
+
+function ButtonFontMinusIcon(props) {
+  return (
+    <svg fill="none" height="12" viewBox="0 0 24 24" width="12" xmlns="http://www.w3.org/2000/svg" {...props}>
+      <path d="M4 19 10.5 5h1L18 19" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.4" />
+      <path d="M6.6 14.4h8.8" stroke="currentColor" strokeLinecap="round" strokeWidth="2.4" />
+      <path d="M16 8h6" stroke="currentColor" strokeLinecap="round" strokeWidth="2.4" />
+    </svg>
+  );
+}
+
+function ButtonFontPlusIcon(props) {
+  return (
+    <svg fill="none" height="12" viewBox="0 0 24 24" width="12" xmlns="http://www.w3.org/2000/svg" {...props}>
+      <path d="M3 19 9.5 5h1L16 19" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.4" />
+      <path d="M5.6 14.4h8.8" stroke="currentColor" strokeLinecap="round" strokeWidth="2.4" />
+      <path d="M19 5v6M16 8h6" stroke="currentColor" strokeLinecap="round" strokeWidth="2.4" />
+    </svg>
+  );
 }
 
 function base64ToUint8Array(value) {
@@ -190,13 +265,19 @@ function base64ToUint8Array(value) {
  */
 export default function TerminalWindowHost() {
   const params = useMemo(parseTerminalWindowParams, []);
-  const { paneId, theme, title } = params;
+  const { paneId, terminalIndex, theme, title, workspaceId } = params;
   const containerRef = useRef(null);
+  const xtermRef = useRef(null);
+  const fitTerminalRef = useRef(() => {});
   const restartMenuRef = useRef(null);
   const [status, setStatus] = useState("connecting");
   const [statusDetail, setStatusDetail] = useState("");
   const [restartMenuOpen, setRestartMenuOpen] = useState(false);
   const [dropTargetActive, setDropTargetActive] = useState(false);
+  const [terminalFontSize, setTerminalFontSize] = useState(
+    () => readStoredTerminalWindowFontSize(workspaceId, terminalIndex, paneId),
+  );
+  const terminalFontSizeRef = useRef(terminalFontSize);
   const [meta, setMeta] = useState(() => ({
     agentKind: params.agentKind,
     agentLabel: params.agentLabel,
@@ -207,6 +288,43 @@ export default function TerminalWindowHost() {
     roleOptions: [],
     stateLabel: "",
   }));
+
+  useEffect(() => {
+    terminalFontSizeRef.current = terminalFontSize;
+    const term = xtermRef.current;
+    if (!term || term.options.fontSize === terminalFontSize) {
+      return;
+    }
+    term.options.fontSize = terminalFontSize;
+    const applyFit = () => fitTerminalRef.current?.();
+    if (typeof window.requestAnimationFrame === "function") {
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(applyFit);
+      });
+    } else {
+      applyFit();
+    }
+  }, [terminalFontSize]);
+
+  const adjustTerminalFontSize = useCallback((delta) => {
+    const current = terminalFontSizeRef.current;
+    const next = clampTerminalWindowFontSize(
+      (Number(current) || TERMINAL_WINDOW_FONT_SIZE_DEFAULT) + delta,
+    );
+    if (next === current) {
+      return;
+    }
+    terminalFontSizeRef.current = next;
+    writeStoredTerminalWindowFontSize(workspaceId, terminalIndex, paneId, next);
+    if (paneId) {
+      emit(TERMINAL_WINDOW_CONTROL_EVENT, {
+        control: TERMINAL_WINDOW_CONTROL_FONT_SIZE,
+        fontSize: next,
+        paneId,
+      }).catch(() => {});
+    }
+    setTerminalFontSize(next);
+  }, [paneId, terminalIndex, workspaceId]);
 
   useEffect(() => {
     document.documentElement.dataset.terminalWindow = "true";
@@ -330,6 +448,7 @@ export default function TerminalWindowHost() {
         rows: measurement.rows,
       }).catch(() => {});
     };
+    fitTerminalRef.current = fitTerminal;
 
     const scheduleFit = () => {
       if (resizeTimer) {
@@ -457,13 +576,14 @@ export default function TerminalWindowHost() {
         fastScrollModifier: "alt",
         fastScrollSensitivity: 5,
         fontFamily: "\"Cascadia Mono\", \"SFMono-Regular\", Consolas, monospace",
-        fontSize: 12,
+        fontSize: terminalFontSizeRef.current,
         lineHeight: 1.0,
         macOptionIsMeta: true,
         scrollback: 10000,
         smoothScrollDuration: 0,
         theme: isLightTheme ? TERMINAL_LIGHT_THEME : TERMINAL_DARK_THEME,
       });
+      xtermRef.current = term;
       term.open(container);
       detachPushToTalkGuard = guardXtermDuringPushToTalk(term);
 
@@ -525,6 +645,12 @@ export default function TerminalWindowHost() {
         term?.dispose();
       } catch {
         // Renderer teardown is best-effort.
+      }
+      if (xtermRef.current === term) {
+        xtermRef.current = null;
+      }
+      if (fitTerminalRef.current === fitTerminal) {
+        fitTerminalRef.current = () => {};
       }
     };
   }, [paneId]);
@@ -641,6 +767,24 @@ export default function TerminalWindowHost() {
             type="button"
           >
             <ButtonBrowserIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Decrease terminal font size"
+            disabled={terminalFontSize <= TERMINAL_WINDOW_FONT_SIZE_MIN}
+            onClick={() => adjustTerminalFontSize(-TERMINAL_WINDOW_FONT_SIZE_STEP)}
+            title={`Decrease terminal font size (${terminalFontSize}px)`}
+            type="button"
+          >
+            <ButtonFontMinusIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Increase terminal font size"
+            disabled={terminalFontSize >= TERMINAL_WINDOW_FONT_SIZE_MAX}
+            onClick={() => adjustTerminalFontSize(TERMINAL_WINDOW_FONT_SIZE_STEP)}
+            title={`Increase terminal font size (${terminalFontSize}px)`}
+            type="button"
+          >
+            <ButtonFontPlusIcon aria-hidden="true" />
           </TerminalRestartButton>
           <TerminalRestartButton
             aria-label="Split terminal horizontally"

@@ -861,10 +861,12 @@ import {
   ButtonKeyIcon,
   ButtonMicIcon,
   ButtonNotificationIcon,
+  ButtonProcessIcon,
   ButtonPrivacyIcon,
   ButtonSecurityIcon,
   ButtonSnippingIcon,
   ButtonEditorIcon,
+  ButtonWhiteboardIcon,
   ButtonHubIcon,
   ButtonCheckIcon,
   ButtonRailCollapseIcon,
@@ -2137,6 +2139,18 @@ function workspaceGitPullPromptCheckKey(workspaceId, rootDirectory) {
   return `${workspaceId}:${getWorkspaceRootIdentity(rootDirectory)}`;
 }
 
+const WORKSPACE_GIT_REPOSITORY_PRELOAD_TIMEOUT_MS = 12000;
+const WORKSPACE_GIT_REPOSITORY_PRELOAD_LOADING_STALE_MS = 15000;
+
+function workspaceGitRepositoryPreloadLoadingFresh(preload, nowMs = Date.now()) {
+  if (!preload || preload.state !== "loading") {
+    return false;
+  }
+  const requestedAtMs = Number(preload.requestedAtMs || preload.generatedAtMs) || 0;
+  return requestedAtMs > 0
+    && nowMs - requestedAtMs < WORKSPACE_GIT_REPOSITORY_PRELOAD_LOADING_STALE_MS;
+}
+
 function normalizeWorkspaceGitPullRepository(repository) {
   const path = String(repository?.path || "").trim();
   const name = String(repository?.name || "").trim() || getDirectoryName(path) || "repository";
@@ -2158,6 +2172,7 @@ function normalizeWorkspaceGitPullRepository(repository) {
     operationState: repository?.operationState || null,
     fetchOk: Boolean(repository?.fetchOk),
     fetchError: String(repository?.fetchError || "").trim(),
+    fetchSkipped: Boolean(repository?.fetchSkipped || repository?.fetch_skipped),
     reason: String(repository?.reason || "").trim(),
     pullable: Boolean(repository?.pullable),
   };
@@ -13065,6 +13080,55 @@ function WorkspaceCreateAgentGlyph({ roleId }) {
   return <WorkspaceCreateAgentTerminalIcon aria-hidden="true" />;
 }
 
+const WORKSPACE_SUPPLEMENTAL_HARNESS_CARDS = [
+  {
+    id: "document",
+    label: "Document",
+    statusLabel: "ready",
+    active: true,
+  },
+  {
+    id: "video-editor",
+    label: "Video Editor",
+    statusLabel: "coming soon",
+    unavailable: true,
+  },
+  {
+    id: "pcb-design",
+    label: "PCB Design",
+    statusLabel: "coming soon",
+    unavailable: true,
+  },
+  {
+    id: "simulator-3d",
+    label: "3D Simulator",
+    statusLabel: "coming soon",
+    unavailable: true,
+  },
+  {
+    id: "touch-whiteboard",
+    label: "Touch Whiteboard",
+    statusLabel: "coming soon",
+    unavailable: true,
+  },
+];
+
+function WorkspaceSupplementalHarnessGlyph({ cardId }) {
+  if (cardId === "document") {
+    return <FileDocumentIcon aria-hidden="true" />;
+  }
+  if (cardId === "video-editor") {
+    return <ButtonEditorIcon aria-hidden="true" />;
+  }
+  if (cardId === "pcb-design") {
+    return <ButtonProcessIcon aria-hidden="true" />;
+  }
+  if (cardId === "touch-whiteboard") {
+    return <ButtonWhiteboardIcon aria-hidden="true" />;
+  }
+  return <ButtonHubIcon aria-hidden="true" />;
+}
+
 function WorkspaceAgentCountCards({
   agentStatuses = [],
   agentPermissions = {},
@@ -13121,6 +13185,7 @@ function WorkspaceAgentCountCards({
             {isWorkspacePermissionAgentRole(option.id) && (
               <WorkspaceCreateAgentPermission
                 aria-label={`${option.label} permission mode`}
+                data-agent-control="permission"
                 data-tone={permissionOption.tone}
               >
                 <WorkspaceCreateAgentStepButton
@@ -13146,7 +13211,7 @@ function WorkspaceAgentCountCards({
                 </WorkspaceCreateAgentStepButton>
               </WorkspaceCreateAgentPermission>
             )}
-            <WorkspaceCreateAgentStepper>
+            <WorkspaceCreateAgentStepper data-agent-control="stepper">
               <WorkspaceCreateAgentStepButton
                 aria-label={`Remove one ${option.label} terminal`}
                 disabled={!canRemoveAgent}
@@ -13168,6 +13233,25 @@ function WorkspaceAgentCountCards({
           </WorkspaceCreateAgentCard>
         );
       })}
+      {WORKSPACE_SUPPLEMENTAL_HARNESS_CARDS.map((card) => (
+        <WorkspaceCreateAgentCard
+          $active={card.active}
+          aria-label={`${card.label} harness ${card.statusLabel}`}
+          data-harness-card="true"
+          data-unavailable={card.unavailable ? "true" : undefined}
+          key={card.id}
+        >
+          <WorkspaceCreateAgentIcon data-agent={card.id}>
+            <WorkspaceSupplementalHarnessGlyph cardId={card.id} />
+          </WorkspaceCreateAgentIcon>
+          <WorkspaceCreateAgentStatus>{card.statusLabel}</WorkspaceCreateAgentStatus>
+          <WorkspaceCreateAgentBody>
+            <WorkspaceCreateAgentLabel>
+              <strong>{card.label}</strong>
+            </WorkspaceCreateAgentLabel>
+          </WorkspaceCreateAgentBody>
+        </WorkspaceCreateAgentCard>
+      ))}
     </WorkspaceCreateAgentGrid>
   );
 }
@@ -13205,7 +13289,9 @@ function WorkspaceCreatePanel({
   const [cdDraft, setCdDraft] = useState("");
   const [agentCounts, setAgentCounts] = useState({});
   const [agentPermissions, setAgentPermissions] = useState({});
+  const [agentSessionModeDraft, setAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
   const [initializeGitDraft, setInitializeGitDraft] = useState(false);
+  const [unsafeModeArmed, setUnsafeModeArmed] = useState(false);
   const [panelView, setPanelView] = useState("create");
   const browseSeqRef = useRef(0);
   const browseRef = useRef(null);
@@ -13251,7 +13337,9 @@ function WorkspaceCreatePanel({
     setPanelView("create");
     setAgentCounts(fallbackRole ? { [fallbackRole]: 1 } : {});
     setAgentPermissions(normalizeWorkspaceAgentPermissions(null, roleOptions));
+    setAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
     setInitializeGitDraft(false);
+    setUnsafeModeArmed(false);
     void browseTo(rootDraft || defaultWorkingDirectory || "");
     // Reset only when the panel opens; rootDraft changes are handled below.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -13413,12 +13501,15 @@ function WorkspaceCreatePanel({
   const currentDirectory = browse?.workingDirectory || rootDraft || defaultWorkingDirectory || "";
   const rootEligible = browse ? browse.rootEligible !== false : true;
   const currentRootIsGitRepository = Boolean(browse?.gitRepository || browse?.git_repository);
-  const initializeGitChecked = currentRootIsGitRepository || initializeGitDraft;
+  const createSafeModeRequiresGit = !currentRootIsGitRepository
+    && agentSessionModeDraft === AGENT_SESSION_MODE_WORKTREE;
+  const initializeGitChecked = currentRootIsGitRepository || createSafeModeRequiresGit || initializeGitDraft;
   const initializeGitDisabled = Boolean(
     creating
       || !currentDirectory
       || !rootEligible
-      || currentRootIsGitRepository,
+      || currentRootIsGitRepository
+      || createSafeModeRequiresGit,
   );
   const canCreate = Boolean(
     !creating
@@ -13531,6 +13622,7 @@ function WorkspaceCreatePanel({
             terminalRoles,
             availableAgentPermissions,
             !currentRootIsGitRepository && initializeGitChecked,
+            agentSessionModeDraft,
           );
         }}
       >
@@ -13677,6 +13769,8 @@ function WorkspaceCreatePanel({
               <small>
                 {currentRootIsGitRepository
                   ? "Already a Git repository."
+                  : createSafeModeRequiresGit
+                    ? "Required for Safe mode worktrees."
                   : "Enabled if it is not a Git repo."}
               </small>
             </span>
@@ -13684,10 +13778,51 @@ function WorkspaceCreatePanel({
         </WorkspaceCreateSection>
 
         <WorkspaceCreateSection>
-          <SettingsLabel>Coding agents</SettingsLabel>
+          <SettingsLabel>Agent safety mode</SettingsLabel>
           <SettingsHint>
-            Pick how many of each agent open with this workspace. Drag the
-            counts up for parallel agents of the same kind.
+            Coordinated is the default: agents edit the repo directly with file locking and terminal pause/resume.
+            Safe adds isolated worktrees with patch submission. Full removes every rail: agents edit immediately,
+            can conflict, and cannot pause or resume.
+          </SettingsHint>
+          <AgentSafetyModeGroup aria-label="Agent safety mode" role="radiogroup">
+            {AGENT_SESSION_MODE_OPTIONS.map((option) => {
+              const active = agentSessionModeDraft === option.value;
+              const needsConfirm = option.value === AGENT_SESSION_MODE_DIRECT && !active;
+              return (
+                <AgentSafetyModeButton
+                  aria-checked={active}
+                  data-active={active ? "true" : "false"}
+                  data-tone={option.tone}
+                  disabled={creating}
+                  key={option.value}
+                  onClick={() => {
+                    if (needsConfirm && !unsafeModeArmed) {
+                      setUnsafeModeArmed(true);
+                      return;
+                    }
+                    setUnsafeModeArmed(false);
+                    setAgentSessionModeDraft(option.value);
+                  }}
+                  role="radio"
+                  type="button"
+                >
+                  <strong>
+                    {option.value === AGENT_SESSION_MODE_DIRECT && unsafeModeArmed && !active
+                      ? "Confirm Full"
+                      : option.label}
+                  </strong>
+                  <em>{option.description}</em>
+                </AgentSafetyModeButton>
+              );
+            })}
+          </AgentSafetyModeGroup>
+        </WorkspaceCreateSection>
+
+        <WorkspaceCreateSection>
+          <SettingsLabel>Coding harnesses</SettingsLabel>
+          <SettingsHint>
+            Pick how many terminal-backed harnesses open with this workspace.
+            Additional harness cards appear alongside them.
           </SettingsHint>
           <WorkspaceAgentCountCards
             agentStatuses={agentStatuses}
@@ -18562,8 +18697,8 @@ const AGENT_SESSION_MODE_OPTIONS = [
     value: AGENT_SESSION_MODE_COORDINATED,
   },
   {
-    description: "Direct edits, no safety rails",
-    label: "Direct",
+    description: "Full access, no safety rails",
+    label: "Full",
     tone: "unsafe",
     value: AGENT_SESSION_MODE_DIRECT,
   },
@@ -25552,6 +25687,7 @@ export default function App() {
     requestedTerminalRoles = null,
     requestedAgentPermissions = null,
     requestedInitializeGit = false,
+    requestedAgentSessionMode = AGENT_SESSION_MODE_COORDINATED,
   ) => {
     event.preventDefault();
 
@@ -25588,6 +25724,11 @@ export default function App() {
       const rootIdentity = normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory);
       const rootWasEmptyAtSelection = Boolean(normalizedRoot?.emptyDirectory);
       let rootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
+      const initialAgentSessionMode = normalizeAgentSessionMode(
+        requestedAgentSessionMode,
+        false,
+        true,
+      );
 
       if (!rootDirectory) {
         throw new Error("Workspace root directory was not returned by validation.");
@@ -25604,10 +25745,15 @@ export default function App() {
         throw new Error(`That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`);
       }
 
-      if (requestedInitializeGit && !rootGitRepository) {
+      if ((requestedInitializeGit || initialAgentSessionMode === AGENT_SESSION_MODE_WORKTREE) && !rootGitRepository) {
         await invoke("workspace_initialize_git", { repoPath: rootDirectory });
         rootGitRepository = true;
       }
+      const agentSessionMode = normalizeAgentSessionMode(
+        initialAgentSessionMode,
+        false,
+        rootGitRepository,
+      );
 
       // Local-first create: mint the id here, commit the row instantly, and
       // let the cloud workspace catalog ack + registration run in background.
@@ -25638,6 +25784,7 @@ export default function App() {
         rootDirectory,
         rootWasEmptyAtSelection,
         rootGitRepository,
+        agentSessionMode,
         agentPermissions,
         ...(terminalRoles
           ? { terminalCount: terminalRoles.length, terminalRoles }
@@ -25677,7 +25824,7 @@ export default function App() {
       void invoke("local_workspaces_store", { scopeKey, workspaces: nextCatalog }).catch(() => {});
       void invoke("coordination_bootstrap_workspace", {
         repoPath: rootDirectory,
-        agentSessionMode: AGENT_SESSION_MODE_COORDINATED,
+        agentSessionMode,
       }).catch(() => {});
 
       workspaceTerminalsSyncKeyRef.current = "";
@@ -31411,6 +31558,7 @@ export default function App() {
     workspaceName = "",
   } = {}) => {
     const checkKey = workspaceGitPullPromptCheckKey(workspaceId, rootDirectory);
+    const requestedAtMs = Date.now();
 
     if (!checkKey) {
       return {
@@ -31431,17 +31579,23 @@ export default function App() {
         rootDirectory,
         checkKey,
         repositories: current[checkKey]?.repositories || [],
+        requestedAtMs,
         error: "",
       },
     }));
 
     try {
-      const response = await invoke("workspace_git_pull_candidates", {
-        repoPath: rootDirectory,
-        workspaceId,
-        workspaceName,
-        refresh,
-      });
+      const response = await withTimeout(
+        invoke("workspace_git_pull_candidates", {
+          repoPath: rootDirectory,
+          workspaceId,
+          workspaceName,
+          refresh,
+          fetchRemote: false,
+        }),
+        WORKSPACE_GIT_REPOSITORY_PRELOAD_TIMEOUT_MS,
+        "Git repository check timed out.",
+      );
       const allRepositories = Array.isArray(response?.repositories)
         ? response.repositories
           .map(normalizeWorkspaceGitPullRepository)
@@ -31460,6 +31614,7 @@ export default function App() {
           repositories: allRepositories,
           cache: response?.cache || null,
           generatedAtMs: Number(response?.generatedAtMs) || Date.now(),
+          requestedAtMs,
           error: "",
         },
       }));
@@ -31482,6 +31637,7 @@ export default function App() {
           rootDirectory,
           checkKey,
           repositories: current[checkKey]?.repositories || [],
+          requestedAtMs,
           error: errorMessage,
         },
       }));
@@ -31696,6 +31852,10 @@ export default function App() {
     const rootDirectory = activatedWorkspaceTerminalWorkingDirectory || "";
     const checkKey = workspaceGitPullPromptCheckKey(workspaceId, rootDirectory);
     const existingPreload = checkKey ? workspaceGitRepositoryPreloads[checkKey] : null;
+    const existingPreloadLoadingFresh = workspaceGitRepositoryPreloadLoadingFresh(existingPreload);
+    const existingPreloadReady = existingPreload?.state === "ready";
+    const currentCheckStillFresh = workspaceGitPullPromptCheckRef.current === checkKey
+      && existingPreloadLoadingFresh;
 
     if (
       authState !== "authenticated"
@@ -31710,9 +31870,9 @@ export default function App() {
 
     if (
       !checkKey
-        || workspaceGitPullPromptCheckRef.current === checkKey
-        || existingPreload?.state === "loading"
-        || existingPreload?.state === "ready"
+      || currentCheckStillFresh
+      || existingPreloadLoadingFresh
+      || existingPreloadReady
     ) {
       return undefined;
     }
@@ -43267,8 +43427,8 @@ export default function App() {
                         onDeleteArchivedWorkspace={deleteWorkspaceFromForge}
                         onClose={closeCreateWorkspaceModal}
                         onRestoreArchivedWorkspace={restoreArchivedWorkspace}
-                        onSubmit={(event, terminalRoles, agentPermissions, initializeGit) => (
-                          createFirstWorkspace(event, terminalRoles, agentPermissions, initializeGit)
+                        onSubmit={(event, terminalRoles, agentPermissions, initializeGit, agentSessionMode) => (
+                          createFirstWorkspace(event, terminalRoles, agentPermissions, initializeGit, agentSessionMode)
                         )}
                         roleOptions={WORKSPACE_TERMINAL_ROLE_OPTIONS}
                         rootDraft={newWorkspaceRootDraft}
@@ -43498,10 +43658,10 @@ export default function App() {
                           </WorkspaceCreateSection>
 
                           <WorkspaceCreateSection>
-                            <SettingsLabel>Coding agents</SettingsLabel>
+                            <SettingsLabel>Coding harnesses</SettingsLabel>
                             <SettingsHint>
-                              Pick how many of each agent open with this workspace. Drag the
-                              counts up for parallel agents of the same kind.
+                              Pick how many terminal-backed harnesses open with this workspace.
+                              Additional harness cards appear alongside them.
                             </SettingsHint>
                             <WorkspaceAgentCountCards
                               agentStatuses={agentStatuses}
@@ -43520,7 +43680,7 @@ export default function App() {
                             <SettingsLabel>Agent safety mode</SettingsLabel>
                             <SettingsHint>
                               Coordinated is the default: agents edit the repo directly with file locking and terminal pause/resume.
-                              Safe adds isolated worktrees with patch submission. Direct removes every rail: agents edit immediately,
+                              Safe adds isolated worktrees with patch submission. Full removes every rail: agents edit immediately,
                               can conflict, and cannot pause or resume.
                             </SettingsHint>
                             <AgentSafetyModeGroup aria-label="Agent safety mode" role="radiogroup">
@@ -43540,7 +43700,7 @@ export default function App() {
                                       if (needsConfirm && !workspaceUnsafeModeArmed) {
                                         setWorkspaceUnsafeModeArmed(true);
                                         setWorkspaceSettingsMessage(
-                                          "Direct mode disables worktrees, locking, and pause/resume. Click Direct again to confirm.",
+                                          "Full mode disables worktrees, locking, and pause/resume. Click Full again to confirm.",
                                         );
                                         return;
                                       }
@@ -43552,7 +43712,7 @@ export default function App() {
                                   >
                                     <strong>
                                       {option.value === AGENT_SESSION_MODE_DIRECT && workspaceUnsafeModeArmed && !active
-                                        ? "Confirm Direct"
+                                        ? "Confirm Full"
                                         : option.label}
                                     </strong>
                                     <em>{option.description}</em>

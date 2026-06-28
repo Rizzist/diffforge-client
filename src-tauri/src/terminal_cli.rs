@@ -673,8 +673,9 @@ fn terminal_args_with_codex_mcp_identity(
     args: &[String],
     coordination: Option<&TerminalCoordinationSession>,
     permission_mode: Option<&str>,
-    _pane_id: &str,
-    _instance_id: u64,
+    pane_id: &str,
+    instance_id: u64,
+    activity_transport: Option<&TerminalActivityTransportEndpoint>,
 ) -> Vec<String> {
     let mut next = args.to_vec();
     let provider_id = provider_id.to_ascii_lowercase();
@@ -751,6 +752,13 @@ fn terminal_args_with_codex_mcp_identity(
             coordination,
             &coordination_args,
             permission_mode,
+            pane_id,
+            instance_id,
+            terminal_coordination_env_value(coordination, "COORDINATION_WORKSPACE_ID").as_deref(),
+            terminal_coordination_env_value(coordination, "DIFFFORGE_TERMINAL_INDEX")
+                .as_deref()
+                .and_then(|value| value.parse::<u16>().ok()),
+            activity_transport,
         );
     }
     next
@@ -1415,6 +1423,11 @@ fn apply_claude_coordinated_auto_approval_args(
     coordination: &TerminalCoordinationSession,
     coordination_args: &[String],
     permission_mode: Option<&str>,
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: Option<&str>,
+    terminal_index: Option<u16>,
+    activity_transport: Option<&TerminalActivityTransportEndpoint>,
 ) {
     let permission_mode = permission_mode.unwrap_or(TERMINAL_PERMISSION_MODE_ACCEPT_EDITS);
     strip_terminal_arg_option(args, "--dangerously-skip-permissions", "", false);
@@ -1447,6 +1460,11 @@ fn apply_claude_coordinated_auto_approval_args(
     args.push(claude_write_authority_guard_settings(
         coordination,
         permission_mode,
+        pane_id,
+        instance_id,
+        workspace_id,
+        terminal_index,
+        activity_transport,
     ));
 
     strip_terminal_arg_option(args, "--setting-sources", "", true);
@@ -1521,6 +1539,11 @@ fn claude_allowed_tools_arg(
 fn claude_write_authority_guard_settings(
     coordination: &TerminalCoordinationSession,
     permission_mode: &str,
+    pane_id: &str,
+    instance_id: u64,
+    workspace_id: Option<&str>,
+    terminal_index: Option<u16>,
+    activity_transport: Option<&TerminalActivityTransportEndpoint>,
 ) -> String {
     let workspace_files = claude_workspace_permission_glob(coordination);
     let allowed_permissions = if permission_mode == TERMINAL_PERMISSION_MODE_ACCEPT_EDITS {
@@ -1537,7 +1560,15 @@ fn claude_write_authority_guard_settings(
     } else {
         vec![claude_workspace_permission_root(coordination)]
     };
-    let activity_command = diff_forge_activity_hook_command(coordination, "claude");
+    let activity_command = diff_forge_scoped_activity_hook_command(
+        coordination,
+        "claude",
+        pane_id,
+        instance_id,
+        workspace_id,
+        terminal_index,
+        activity_transport,
+    );
     let deny_rules: Vec<String> = Vec::new();
 
     let mut settings = json!({
@@ -1642,31 +1673,6 @@ fn claude_write_authority_guard_settings(
     settings.to_string()
 }
 
-fn diff_forge_activity_hook_command(
-    coordination: &TerminalCoordinationSession,
-    provider: &str,
-) -> String {
-    let command_path = coordination.mcp_command.as_str();
-
-    #[cfg(windows)]
-    {
-        format!(
-            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& {} --diff-forge-activity-hook --provider {}\"",
-            quote_powershell_literal(command_path),
-            quote_powershell_literal(provider),
-        )
-    }
-
-    #[cfg(not(windows))]
-    {
-        format!(
-            "{} --diff-forge-activity-hook --provider {}",
-            quote_shell_literal(command_path),
-            quote_shell_literal(provider),
-        )
-    }
-}
-
 fn diff_forge_scoped_activity_hook_command(
     coordination: &TerminalCoordinationSession,
     provider: &str,
@@ -1674,6 +1680,7 @@ fn diff_forge_scoped_activity_hook_command(
     instance_id: u64,
     workspace_id: Option<&str>,
     terminal_index: Option<u16>,
+    activity_transport: Option<&TerminalActivityTransportEndpoint>,
 ) -> String {
     let command_path = coordination.mcp_command.as_str();
     let events_path = terminal_activity_events_path(pane_id, instance_id);
@@ -1685,11 +1692,20 @@ fn diff_forge_scoped_activity_hook_command(
     let workspace_id = workspace_id.unwrap_or_default();
     let events_path = events_path.to_string_lossy().to_string();
     let debug_path = debug_path.to_string_lossy().to_string();
+    let transport_args: Vec<(&'static str, String)> = activity_transport
+        .map(|endpoint| {
+            vec![
+                ("--transport-host", endpoint.host.clone()),
+                ("--transport-port", endpoint.port.to_string()),
+                ("--transport-token", endpoint.token.clone()),
+            ]
+        })
+        .unwrap_or_default();
 
     #[cfg(windows)]
     {
-        format!(
-            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& {} --diff-forge-activity-hook --provider {} --pane-id {} --instance-id {} --workspace-id {} --terminal-index {} --events-path {} --debug-path {}\"",
+        let mut command = format!(
+            "powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"& {} --diff-forge-activity-hook --provider {} --pane-id {} --instance-id {} --workspace-id {} --terminal-index {} --events-path {} --debug-path {}",
             quote_powershell_literal(command_path),
             quote_powershell_literal(provider),
             quote_powershell_literal(pane_id),
@@ -1698,12 +1714,20 @@ fn diff_forge_scoped_activity_hook_command(
             quote_powershell_literal(&terminal_index),
             quote_powershell_literal(&events_path),
             quote_powershell_literal(&debug_path),
-        )
+        );
+        for (key, value) in transport_args {
+            command.push(' ');
+            command.push_str(key);
+            command.push(' ');
+            command.push_str(&quote_powershell_literal(&value));
+        }
+        command.push('"');
+        command
     }
 
     #[cfg(not(windows))]
     {
-        format!(
+        let mut command = format!(
             "{} --diff-forge-activity-hook --provider {} --pane-id {} --instance-id {} --workspace-id {} --terminal-index {} --events-path {} --debug-path {}",
             quote_shell_literal(command_path),
             quote_shell_literal(provider),
@@ -1713,7 +1737,14 @@ fn diff_forge_scoped_activity_hook_command(
             quote_shell_literal(&terminal_index),
             quote_shell_literal(&events_path),
             quote_shell_literal(&debug_path),
-        )
+        );
+        for (key, value) in transport_args {
+            command.push(' ');
+            command.push_str(key);
+            command.push(' ');
+            command.push_str(&quote_shell_literal(&value));
+        }
+        command
     }
 }
 
@@ -1897,6 +1928,7 @@ fn refresh_codex_activity_hook_profile_for_terminal(
         instance_id,
         workspace_id,
         terminal_index,
+        None,
     );
     let removed_write_guards = remove_codex_write_guard_hooks_from_json(&mut hooks_json);
     let replaced = replace_activity_hook_commands_in_json(&mut hooks_json, scoped_command.as_str());
@@ -3045,6 +3077,11 @@ mod terminal_cli_tests {
         let settings = claude_write_authority_guard_settings(
             &coordination,
             TERMINAL_PERMISSION_MODE_ACCEPT_EDITS,
+            "pane-claude",
+            99,
+            Some("workspace-claude"),
+            Some(3),
+            None,
         );
 
         // Claude Code rejects unknown hook events with a startup settings
@@ -3056,6 +3093,16 @@ mod terminal_cli_tests {
         assert!(settings.contains("\"Stop\""));
         assert!(settings.contains("\"PostToolUse\""));
         assert!(settings.contains("\"SubagentStop\""));
+        assert!(settings.contains("--pane-id"));
+        assert!(settings.contains("pane-claude"));
+        assert!(settings.contains("--instance-id"));
+        assert!(settings.contains("99"));
+        assert!(settings.contains("--workspace-id"));
+        assert!(settings.contains("workspace-claude"));
+        assert!(settings.contains("--terminal-index"));
+        assert!(settings.contains("3"));
+        assert!(settings.contains("--events-path"));
+        assert!(settings.contains("--debug-path"));
     }
 
     #[test]
@@ -6049,6 +6096,14 @@ fn run_agent_thread_turn_for_context(
                     &mut args,
                     coordination,
                     &coordination_args,
+                    None,
+                    "",
+                    0,
+                    terminal_coordination_env_value(coordination, "COORDINATION_WORKSPACE_ID")
+                        .as_deref(),
+                    terminal_coordination_env_value(coordination, "DIFFFORGE_TERMINAL_INDEX")
+                        .as_deref()
+                        .and_then(|value| value.parse::<u16>().ok()),
                     None,
                 );
             }
