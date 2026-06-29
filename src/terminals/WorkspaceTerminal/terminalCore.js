@@ -67,6 +67,7 @@ export const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT = "forge-terminal-audio-input-re
 export const TERMINAL_INPUT_HOT_EVENT = "diffforge:terminal-input-hot";
 export const TERMINAL_INPUT_EVENT = "forge-terminal-input";
 export const TERMINAL_INPUT_ERROR_EVENT = "forge-terminal-input-error";
+export const TERMINAL_FORK_REQUESTED_EVENT = "forge-terminal-fork-requested";
 export const TERMINAL_PROMPT_SUBMITTED_EVENT = "forge-terminal-prompt-submitted";
 export const WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT = "diffforge:workspace-thread-prompt-accepted";
 export const TERMINAL_ACTIVITY_HOOK_EVENT = "forge-terminal-activity-hook";

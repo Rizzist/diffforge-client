@@ -105,6 +105,30 @@ function cleanText(value, fallback = "") {
   return text || fallback;
 }
 
+function cleanTextArray(...values) {
+  const result = [];
+  const append = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach(append);
+      return;
+    }
+    if (value == null) {
+      return;
+    }
+    const text = cleanText(value);
+    if (!text) {
+      return;
+    }
+    text
+      .split(",")
+      .map((entry) => cleanText(entry))
+      .filter(Boolean)
+      .forEach((entry) => result.push(entry));
+  };
+  values.forEach(append);
+  return Array.from(new Set(result));
+}
+
 export function getWorkspaceThreadDetailVisibilityKey({ workspaceId = "", threadId = "" } = {}) {
   const safeWorkspaceId = cleanText(workspaceId);
   const safeThreadId = cleanText(threadId);
@@ -2775,6 +2799,10 @@ function normalizeActiveTerminal(value) {
     return null;
   }
 
+  const providerSessionId = cleanText(value.providerSessionId || value.provider_session_id || value.nativeSessionId || value.native_session_id || value.sessionId);
+  const nativeSessionId = cleanText(value.nativeSessionId || value.native_session_id || value.providerSessionId || value.provider_session_id || value.sessionId);
+  const sessionId = cleanText(value.sessionId || value.session_id || providerSessionId || nativeSessionId);
+
   return {
     activityStatus: normalizeThreadActivityStatus(value.activityStatus || value.activity_status),
     agentId: cleanAgentId(value.agentId || value.currentAgent),
@@ -2792,15 +2820,30 @@ function normalizeActiveTerminal(value) {
     ...promptingUserFields(value),
     displayName: workspaceTerminalNicknameFromRecord(value),
     fileAuthority: cleanText(value.fileAuthority || value.coordination?.fileAuthority),
+    forkFromProviderSessionId: cleanText(
+      value.forkFromProviderSessionId
+        || value.fork_from_provider_session_id
+        || value.forkedFromProviderSessionId
+        || value.forked_from_provider_session_id
+        || value.parentProviderSessionId
+        || value.parent_provider_session_id,
+    ),
     nativeRailState: cleanText(value.nativeRailState || value.native_rail_state),
     provider: cleanAgentDisplayName(value.provider),
-    providerSessionId: cleanText(value.providerSessionId || value.provider_session_id || value.nativeSessionId || value.native_session_id || value.sessionId),
-    nativeSessionId: cleanText(value.nativeSessionId || value.native_session_id || value.providerSessionId || value.provider_session_id || value.sessionId),
+    providerSessionId,
+    nativeSessionId,
+    relatedProviderSessionIds: cleanTextArray(
+      value.relatedProviderSessionIds,
+      value.related_provider_session_ids,
+      value.relatedSessionIds,
+      value.related_session_ids,
+    ),
+    sharedHistoryId: cleanText(value.sharedHistoryId || value.shared_history_id || value.historyGroupId || value.history_group_id),
     slotKey: cleanText(value.slotKey, defaultSlotKey(terminalIndex)),
     status: safeStatus,
     turnStatus: cleanText(value.turnStatus || value.turn_status),
     sessionMode: cleanText(value.sessionMode || value.coordination?.sessionMode),
-    sessionId: cleanText(value.sessionId || value.session_id || value.providerSessionId || value.provider_session_id || value.nativeSessionId || value.native_session_id),
+    sessionId,
     terminalName: workspaceTerminalNicknameFromRecord(value),
     terminalNickname: workspaceTerminalNicknameFromRecord(value),
     terminalIndex,
@@ -2870,6 +2913,15 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
     ),
     modelSource: cleanText(binding.modelSource, fallback.modelSource),
     modelUpdatedAt: cleanText(binding.modelUpdatedAt, fallback.modelUpdatedAt),
+    forkFromProviderSessionId: cleanText(
+      binding.forkFromProviderSessionId
+        || binding.fork_from_provider_session_id
+        || binding.forkedFromProviderSessionId
+        || binding.forked_from_provider_session_id
+        || binding.parentProviderSessionId
+        || binding.parent_provider_session_id,
+      fallback.forkFromProviderSessionId || fallback.fork_from_provider_session_id,
+    ),
     nativeSessionId: cleanText(binding.nativeSessionId, fallback.nativeSessionId),
     nativeSessionKind: cleanText(binding.nativeSessionKind, fallback.nativeSessionKind || "session"),
     nativeSessionSource: cleanText(binding.nativeSessionSource, fallback.nativeSessionSource),
@@ -2885,6 +2937,19 @@ function normalizeProviderBinding(value, agentId, fallback = {}, options = {}) {
     nativeSessionTitleUpdatedAt: cleanText(binding.nativeSessionTitleUpdatedAt, fallback.nativeSessionTitleUpdatedAt),
     nativeSessionUpdatedAt: cleanText(binding.nativeSessionUpdatedAt, fallback.nativeSessionUpdatedAt),
     provider: cleanAgentDisplayName(binding.provider, fallback.provider),
+    relatedProviderSessionIds: cleanTextArray(
+      binding.relatedProviderSessionIds,
+      binding.related_provider_session_ids,
+      fallback.relatedProviderSessionIds,
+      fallback.related_provider_session_ids,
+    ),
+    sharedHistoryId: cleanText(
+      binding.sharedHistoryId
+        || binding.shared_history_id
+        || binding.historyGroupId
+        || binding.history_group_id,
+      fallback.sharedHistoryId || fallback.shared_history_id || fallback.historyGroupId || fallback.history_group_id,
+    ),
     status: options.stripLiveBindings && ["active", "starting"].includes(safeStatus) ? "idle" : safeStatus,
     displayName: terminalNicknameFromSources(
       binding.displayName,
@@ -3082,6 +3147,16 @@ function normalizeThread(thread, workspaceId, options = {}) {
     archivedAt: cleanText(thread.archivedAt),
     createdAt,
     currentAgent,
+    forkFromProviderSessionId: cleanText(
+      thread.forkFromProviderSessionId
+        || thread.fork_from_provider_session_id
+        || thread.forkedFromProviderSessionId
+        || thread.forked_from_provider_session_id
+        || thread.parentProviderSessionId
+        || thread.parent_provider_session_id,
+      normalizedProviderBindings[currentAgent]?.forkFromProviderSessionId
+        || normalizedProviderBindings[currentAgent]?.fork_from_provider_session_id,
+    ),
     id,
     lastActiveAt: cleanText(thread.lastActiveAt, updatedAt),
     lastMessageAt: cleanText(thread.lastMessageAt),
@@ -3093,8 +3168,22 @@ function normalizeThread(thread, workspaceId, options = {}) {
     pinnedAt: cleanText(thread.pinnedAt),
     projectionEvents,
     preferredAgent,
+    relatedProviderSessionIds: cleanTextArray(
+      thread.relatedProviderSessionIds,
+      thread.related_provider_session_ids,
+      normalizedProviderBindings[currentAgent]?.relatedProviderSessionIds,
+      normalizedProviderBindings[currentAgent]?.related_provider_session_ids,
+    ),
     freshSessionStartedAt: options.stripLiveBindings ? "" : cleanText(thread.freshSessionStartedAt),
     sessionName: storedSessionName || storedTitle || fallbackTitle,
+    sharedHistoryId: cleanText(
+      thread.sharedHistoryId
+        || thread.shared_history_id
+        || thread.historyGroupId
+        || thread.history_group_id,
+      normalizedProviderBindings[currentAgent]?.sharedHistoryId
+        || normalizedProviderBindings[currentAgent]?.shared_history_id,
+    ),
     slotKey: cleanText(
       thread.slotKey,
       terminalIndex == null ? `thread-${safeKey(id, "detached")}` : defaultSlotKey(terminalIndex),
@@ -3955,6 +4044,21 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
       || event.native_session_id,
   );
   const eventSessionId = cleanText(event.sessionId || event.session_id);
+  const eventForkFromProviderSessionId = cleanText(
+    event.forkFromProviderSessionId
+      || event.fork_from_provider_session_id
+      || event.forkedFromProviderSessionId
+      || event.forked_from_provider_session_id
+      || event.parentProviderSessionId
+      || event.parent_provider_session_id,
+  );
+  const eventSharedHistoryId = cleanText(event.sharedHistoryId || event.shared_history_id || event.historyGroupId || event.history_group_id);
+  const eventRelatedProviderSessionIds = cleanTextArray(
+    event.relatedProviderSessionIds,
+    event.related_provider_session_ids,
+    event.relatedSessionIds,
+    event.related_session_ids,
+  );
   const sessionIdentityCleared = event.providerSessionIdCleared === true
     || event.provider_session_id_cleared === true
     || event.nativeSessionIdCleared === true
@@ -4006,6 +4110,11 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     commandPhase: event.commandPhase || event.command_phase || existing.commandPhase || existing.command_phase,
     displayName: terminalNickname,
     executionPhase: event.executionPhase || event.execution_phase || existing.executionPhase || existing.execution_phase,
+    forkFromProviderSessionId: clearSessionIdentity && !eventForkFromProviderSessionId
+      ? ""
+      : eventForkFromProviderSessionId
+        || existing.forkFromProviderSessionId
+        || existing.fork_from_provider_session_id,
     inputReady,
     inputReadyAt,
     inputReadyConfidence,
@@ -4032,6 +4141,14 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
         || event.provider_session_id
         || existing.nativeSessionId
         || existing.native_session_id,
+    relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+      ? eventRelatedProviderSessionIds
+      : cleanTextArray(existing.relatedProviderSessionIds, existing.related_provider_session_ids),
+    sharedHistoryId: clearSessionIdentity && !eventSharedHistoryId
+      ? ""
+      : eventSharedHistoryId
+        || existing.sharedHistoryId
+        || existing.shared_history_id,
     slotKey: event.slotKey || existing.slotKey || defaultSlotKey(terminalIndex),
     status: options.status || event.status || existing.status || "active",
     turnStatus: event.turnStatus || event.turn_status || existing.turnStatus || existing.turn_status,
@@ -4186,6 +4303,27 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     ? status
     : "active";
   const eventType = cleanText(event.type).toLowerCase();
+  const sessionIdentityCleared = event.providerSessionIdCleared === true
+    || event.provider_session_id_cleared === true
+    || event.nativeSessionIdCleared === true
+    || event.native_session_id_cleared === true
+    || event.sessionIdCleared === true
+    || event.session_id_cleared === true;
+  const eventForkFromProviderSessionId = cleanText(
+    event.forkFromProviderSessionId
+      || event.fork_from_provider_session_id
+      || event.forkedFromProviderSessionId
+      || event.forked_from_provider_session_id
+      || event.parentProviderSessionId
+      || event.parent_provider_session_id,
+  );
+  const eventSharedHistoryId = cleanText(event.sharedHistoryId || event.shared_history_id || event.historyGroupId || event.history_group_id);
+  const eventRelatedProviderSessionIds = cleanTextArray(
+    event.relatedProviderSessionIds,
+    event.related_provider_session_ids,
+    event.relatedSessionIds,
+    event.related_session_ids,
+  );
   const terminalBinding = normalizeTerminalBinding({
     instanceId: event.instanceId ?? activeTerminal?.instanceId,
     paneId: event.paneId || activeTerminal?.paneId,
@@ -4264,7 +4402,29 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     lastActiveAt: now,
     lastMessageAt: options.incrementMessageCount ? now : existing.lastMessageAt,
     messageCount: nextMessageCount,
+    forkFromProviderSessionId: sessionIdentityCleared && !eventForkFromProviderSessionId
+      ? ""
+      : eventForkFromProviderSessionId
+        || activeTerminal?.forkFromProviderSessionId
+        || activeTerminal?.fork_from_provider_session_id
+        || existing.forkFromProviderSessionId
+        || existing.fork_from_provider_session_id,
     provider: event.provider || activeTerminal?.provider,
+    relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+      ? eventRelatedProviderSessionIds
+      : cleanTextArray(
+        activeTerminal?.relatedProviderSessionIds,
+        activeTerminal?.related_provider_session_ids,
+        existing.relatedProviderSessionIds,
+        existing.related_provider_session_ids,
+      ),
+    sharedHistoryId: sessionIdentityCleared && !eventSharedHistoryId
+      ? ""
+      : eventSharedHistoryId
+        || activeTerminal?.sharedHistoryId
+        || activeTerminal?.shared_history_id
+        || existing.sharedHistoryId
+        || existing.shared_history_id,
     status: safeStatus,
     displayName: terminalNickname,
     terminalName: terminalNickname,
@@ -4312,14 +4472,35 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
       lastActiveAt: now,
       lastMessageAt: options.incrementMessageCount ? now : providerBinding?.lastMessageAt || existing.lastMessageAt,
       messageCount: nextMessageCount,
+      forkFromProviderSessionId: sessionIdentityCleared && !eventForkFromProviderSessionId
+        ? ""
+        : eventForkFromProviderSessionId
+          || providerBinding?.forkFromProviderSessionId
+          || providerBinding?.fork_from_provider_session_id,
       ...hookHealthFields(activeTerminal, providerBinding),
       modelId: cleanModelId(event.modelId || event.model, providerBinding?.modelId),
       modelSource: cleanModelId(event.modelId || event.model) ? cleanText(event.modelSource, "user") : providerBinding?.modelSource,
       modelUpdatedAt: cleanModelId(event.modelId || event.model) ? now : providerBinding?.modelUpdatedAt || "",
-      nativeSessionId: cleanText(event.nativeSessionId, providerBinding?.nativeSessionId),
-      nativeSessionKind: cleanText(event.nativeSessionKind, providerBinding?.nativeSessionKind || "session"),
-      nativeSessionSource: cleanText(event.nativeSessionSource, providerBinding?.nativeSessionSource),
-      nativeSessionUpdatedAt: event.nativeSessionId ? now : providerBinding?.nativeSessionUpdatedAt || "",
+      nativeSessionId: sessionIdentityCleared
+        ? ""
+        : cleanText(event.nativeSessionId, providerBinding?.nativeSessionId),
+      nativeSessionKind: sessionIdentityCleared
+        ? ""
+        : cleanText(event.nativeSessionKind, providerBinding?.nativeSessionKind || "session"),
+      nativeSessionSource: sessionIdentityCleared
+        ? ""
+        : cleanText(event.nativeSessionSource, providerBinding?.nativeSessionSource),
+      nativeSessionUpdatedAt: sessionIdentityCleared
+        ? ""
+        : event.nativeSessionId ? now : providerBinding?.nativeSessionUpdatedAt || "",
+      relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+        ? eventRelatedProviderSessionIds
+        : cleanTextArray(providerBinding?.relatedProviderSessionIds, providerBinding?.related_provider_session_ids),
+      sharedHistoryId: sessionIdentityCleared && !eventSharedHistoryId
+        ? ""
+        : eventSharedHistoryId
+          || providerBinding?.sharedHistoryId
+          || providerBinding?.shared_history_id,
       displayName: terminalNickname,
       status: safeStatus,
       terminalName: terminalNickname,
@@ -4334,6 +4515,11 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     activityStatus,
     coordination,
     currentAgent: agentId,
+    forkFromProviderSessionId: sessionIdentityCleared && !eventForkFromProviderSessionId
+      ? ""
+      : eventForkFromProviderSessionId
+        || existing.forkFromProviderSessionId
+        || existing.fork_from_provider_session_id,
     lastActiveAt: now,
     lastMessageAt: options.incrementMessageCount ? now : existing.lastMessageAt,
     materialized: true,
@@ -4342,8 +4528,16 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     latestTurn,
     preferredAgent: cleanAgentId(event.preferredAgent || existing.preferredAgent || agentId),
     providerBindings,
+    relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+      ? eventRelatedProviderSessionIds
+      : cleanTextArray(existing.relatedProviderSessionIds, existing.related_provider_session_ids),
     displayName: terminalNickname,
     sessionName: eventSessionName || existingSessionName || eventTitle || existingTitle,
+    sharedHistoryId: sessionIdentityCleared && !eventSharedHistoryId
+      ? ""
+      : eventSharedHistoryId
+        || existing.sharedHistoryId
+        || existing.shared_history_id,
     slotKey: cleanText(event.slotKey || activeTerminal?.slotKey, existing.slotKey),
     status: safeStatus,
     terminalBinding,
@@ -4351,6 +4545,7 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
     terminalNickname,
     terminalIndex,
     title: eventTitle || existingTitle || existingSessionName || defaultThreadTitle(terminalIndex, agentId),
+    transcriptSessionId: sessionIdentityCleared ? "" : existing.transcriptSessionId,
     updatedAt: now,
   };
 
@@ -4359,7 +4554,20 @@ function bindExistingThreadToTerminal(entry, threadId, event = {}, options = {})
       ...entry.terminals[terminalKey],
       agentId,
       displayName: terminalNickname,
+      forkFromProviderSessionId: sessionIdentityCleared && !eventForkFromProviderSessionId
+        ? ""
+        : eventForkFromProviderSessionId
+          || entry.terminals[terminalKey].forkFromProviderSessionId
+          || entry.terminals[terminalKey].fork_from_provider_session_id,
       lastActiveAt: now,
+      relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+        ? eventRelatedProviderSessionIds
+        : cleanTextArray(entry.terminals[terminalKey].relatedProviderSessionIds, entry.terminals[terminalKey].related_provider_session_ids),
+      sharedHistoryId: sessionIdentityCleared && !eventSharedHistoryId
+        ? ""
+        : eventSharedHistoryId
+          || entry.terminals[terminalKey].sharedHistoryId
+          || entry.terminals[terminalKey].shared_history_id,
       status: safeStatus,
       terminalName: terminalNickname,
       terminalNickname,
@@ -5493,6 +5701,22 @@ export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
       || event.sessionId
       || event.session_id,
   );
+  const forkFromProviderSessionId = cleanText(
+    event.forkFromProviderSessionId
+      || event.fork_from_provider_session_id
+      || event.forkedFromProviderSessionId
+      || event.forked_from_provider_session_id
+      || event.parentProviderSessionId
+      || event.parent_provider_session_id,
+  );
+  const sharedHistoryId = cleanText(event.sharedHistoryId || event.shared_history_id || event.historyGroupId || event.history_group_id);
+  const relatedProviderSessionIds = cleanTextArray(
+    event.relatedProviderSessionIds,
+    event.related_provider_session_ids,
+    event.relatedSessionIds,
+    event.related_session_ids,
+    forkFromProviderSessionId,
+  );
   if (!workspaceId || !isThreadAgentId(agentId) || !nativeSessionId) {
     return state || {};
   }
@@ -5540,6 +5764,7 @@ export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
       createdAt: now,
       currentAgent: agentId,
       displayName: terminalNickname,
+      forkFromProviderSessionId,
       id: threadId,
       lastActiveAt: now,
       lastMessageAt: "",
@@ -5551,7 +5776,9 @@ export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
       preferredAgent: agentId,
       projectionEvents: [],
       providerBindings: {},
+      relatedProviderSessionIds,
       sessionName: title,
+      sharedHistoryId,
       slotKey: cleanText(event.slotKey, defaultSlotKey(terminalIndex)),
       status: cleanText(event.status, "active"),
       terminalBinding: null,
@@ -5580,11 +5807,14 @@ export function applyWorkspaceThreadProviderSessionBinding(state, event = {}) {
     activityStatus: inheritedActivityStatus || event.activityStatus,
     activity_status: inheritedActivityStatus || event.activity_status,
     agentId,
+    forkFromProviderSessionId,
     nativeSessionId,
     nativeSessionKind: cleanText(event.nativeSessionKind || event.native_session_kind, "session"),
     nativeSessionSource: cleanText(event.nativeSessionSource || event.native_session_source || event.source, "rust-session-binding"),
     providerSessionId: nativeSessionId,
+    relatedProviderSessionIds,
     sessionId: event.sessionId || event.session_id || nativeSessionId,
+    sharedHistoryId,
     status: event.status || "active",
     terminalIndex,
     threadId,
@@ -5613,6 +5843,22 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
       || event.native_session_id
       || event.providerSessionId
       || event.provider_session_id,
+  );
+  const forkFromProviderSessionId = cleanText(
+    event.forkFromProviderSessionId
+      || event.fork_from_provider_session_id
+      || event.forkedFromProviderSessionId
+      || event.forked_from_provider_session_id
+      || event.parentProviderSessionId
+      || event.parent_provider_session_id,
+  );
+  const sharedHistoryId = cleanText(event.sharedHistoryId || event.shared_history_id || event.historyGroupId || event.history_group_id);
+  const relatedProviderSessionIds = cleanTextArray(
+    event.relatedProviderSessionIds,
+    event.related_provider_session_ids,
+    event.relatedSessionIds,
+    event.related_session_ids,
+    forkFromProviderSessionId,
   );
   if (!workspaceId || !threadId || !isThreadAgentId(agentId) || !nativeSessionId) {
     return state || {};
@@ -5688,6 +5934,7 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
     modelId: modelId || providerBindings[agentId]?.modelId || "",
     modelSource: modelId ? cleanText(event.modelSource, "session") : providerBindings[agentId]?.modelSource || "",
     modelUpdatedAt: modelId ? now : providerBindings[agentId]?.modelUpdatedAt || "",
+    forkFromProviderSessionId: forkFromProviderSessionId || providerBindings[agentId]?.forkFromProviderSessionId || "",
     nativeSessionId,
     nativeSessionKind: cleanText(event.nativeSessionKind, "session"),
     nativeSessionSource: cleanText(event.nativeSessionSource, "terminal-output"),
@@ -5699,6 +5946,10 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
       ? now
       : providerBindings[agentId]?.nativeSessionTitleUpdatedAt || "",
     nativeSessionUpdatedAt: now,
+    relatedProviderSessionIds: relatedProviderSessionIds.length
+      ? relatedProviderSessionIds
+      : cleanTextArray(providerBindings[agentId]?.relatedProviderSessionIds),
+    sharedHistoryId: sharedHistoryId || providerBindings[agentId]?.sharedHistoryId || "",
     terminalBinding: sessionTerminalBinding || providerBindings[agentId]?.terminalBinding || existing.terminalBinding || null,
     updatedAt: now,
   };
@@ -5730,7 +5981,12 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
       paneId: event.paneId || terminal.paneId,
       provider: event.provider || terminal.provider,
       providerSessionId: nativeSessionId,
+      forkFromProviderSessionId: forkFromProviderSessionId || terminal.forkFromProviderSessionId,
+      relatedProviderSessionIds: relatedProviderSessionIds.length
+        ? relatedProviderSessionIds
+        : cleanTextArray(terminal.relatedProviderSessionIds),
       sessionId: event.sessionId || event.session_id || nativeSessionId,
+      sharedHistoryId: sharedHistoryId || terminal.sharedHistoryId,
       terminalIndex: normalizeTerminalIndex(
         event.terminalIndex
           ?? terminal.terminalIndex
@@ -5759,6 +6015,11 @@ export function updateWorkspaceThreadProviderSession(state, event = {}) {
         [threadId]: {
           ...existing,
           providerBindings,
+          forkFromProviderSessionId: forkFromProviderSessionId || existing.forkFromProviderSessionId || "",
+          relatedProviderSessionIds: relatedProviderSessionIds.length
+            ? relatedProviderSessionIds
+            : cleanTextArray(existing.relatedProviderSessionIds),
+          sharedHistoryId: sharedHistoryId || existing.sharedHistoryId || "",
           sessionName: nativeSessionTitle || existing.sessionName,
           terminalBinding: effectiveTerminalBinding,
           terminalIndex: effectiveTerminalBinding?.terminalIndex ?? existing.terminalIndex,
@@ -6259,6 +6520,22 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
     event.provider,
     existingProviderBindingForAgent?.provider,
   );
+  const eventForkFromProviderSessionId = cleanText(
+    event.forkFromProviderSessionId
+      || event.fork_from_provider_session_id
+      || event.forkedFromProviderSessionId
+      || event.forked_from_provider_session_id
+      || event.parentProviderSessionId
+      || event.parent_provider_session_id,
+  );
+  const eventSharedHistoryId = cleanText(event.sharedHistoryId || event.shared_history_id || event.historyGroupId || event.history_group_id);
+  const eventRelatedProviderSessionIds = cleanTextArray(
+    event.relatedProviderSessionIds,
+    event.related_provider_session_ids,
+    event.relatedSessionIds,
+    event.related_session_ids,
+    eventForkFromProviderSessionId,
+  );
   const shouldClearPendingPrompt = event.clearPendingPrompt !== false;
   let providerBindings = normalizeProviderBindings(
     existing.providerBindings,
@@ -6289,6 +6566,7 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       inputReady,
       inputReadyAt,
       inputReadyConfidence,
+      forkFromProviderSessionId: eventForkFromProviderSessionId || providerBindings[agentId].forkFromProviderSessionId || "",
       ...hookHealthFields(event, providerBindings[agentId]),
       ...providerPromptingFields,
       modelId: cleanModelId(event.modelId || event.model, providerBindings[agentId].modelId),
@@ -6299,6 +6577,10 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       nativeSessionSource: cleanText(event.nativeSessionSource, providerBindings[agentId].nativeSessionSource || "provider-turn"),
       nativeSessionUpdatedAt: cleanText(event.nativeSessionId || event.providerSessionId) ? now : providerBindings[agentId].nativeSessionUpdatedAt,
       provider: eventProvider,
+      relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+        ? eventRelatedProviderSessionIds
+        : cleanTextArray(providerBindings[agentId].relatedProviderSessionIds),
+      sharedHistoryId: eventSharedHistoryId || providerBindings[agentId].sharedHistoryId || "",
       status: cleanText(event.status, existing.status || providerBindings[agentId].status || "active"),
       updatedAt: now,
     };
@@ -6328,6 +6610,7 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
       ...terminalPromptingFields,
       nativeRailState: cleanText(event.nativeRailState || event.native_rail_state, terminals[terminalKey].nativeRailState),
       provider: cleanAgentDisplayName(event.provider, terminals[terminalKey].provider),
+      forkFromProviderSessionId: eventForkFromProviderSessionId || terminals[terminalKey].forkFromProviderSessionId || "",
       providerSessionId: cleanText(
         event.providerSessionId || event.provider_session_id || event.nativeSessionId,
         terminals[terminalKey].providerSessionId,
@@ -6336,10 +6619,14 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
         event.nativeSessionId || event.native_session_id || event.providerSessionId || event.provider_session_id,
         terminals[terminalKey].nativeSessionId,
       ),
+      relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+        ? eventRelatedProviderSessionIds
+        : cleanTextArray(terminals[terminalKey].relatedProviderSessionIds),
       sessionId: cleanText(
         event.sessionId || event.session_id || event.providerSessionId || event.provider_session_id || event.nativeSessionId || event.native_session_id,
         terminals[terminalKey].sessionId,
       ),
+      sharedHistoryId: eventSharedHistoryId || terminals[terminalKey].sharedHistoryId || "",
       turnStatus: cleanText(event.turnStatus || event.turn_status, terminals[terminalKey].turnStatus),
       updatedAt: now,
     };
@@ -6365,6 +6652,11 @@ export function appendWorkspaceThreadProjectionEvents(state, event = {}) {
           pendingPrompt: shouldClearPendingPrompt ? null : existing.pendingPrompt,
           projectionEvents,
           providerBindings,
+          forkFromProviderSessionId: eventForkFromProviderSessionId || existing.forkFromProviderSessionId || "",
+          relatedProviderSessionIds: eventRelatedProviderSessionIds.length
+            ? eventRelatedProviderSessionIds
+            : cleanTextArray(existing.relatedProviderSessionIds),
+          sharedHistoryId: eventSharedHistoryId || existing.sharedHistoryId || "",
           status: cleanText(event.status, existing.status || "active"),
           transcriptSessionId: cleanText(event.providerSessionId || event.nativeSessionId, existing.transcriptSessionId),
           updatedAt: now,

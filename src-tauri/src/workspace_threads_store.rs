@@ -90,6 +90,8 @@ struct WorkspaceAgentSessionHistoryItem {
     coordination_session_id: String,
     provider_session_id: String,
     native_session_id: String,
+    fork_from_provider_session_id: String,
+    shared_history_id: String,
     agent_id: String,
     provider: String,
     model_id: String,
@@ -127,6 +129,8 @@ struct WorkspaceAgentSessionHistoryRecord {
     coordination_session_id: String,
     provider_session_id: String,
     native_session_id: String,
+    fork_from_provider_session_id: String,
+    shared_history_id: String,
     agent_id: String,
     provider: String,
     model_id: String,
@@ -152,6 +156,8 @@ struct WorkspaceThreadProviderSessionBinding {
     agent_id: String,
     provider_session_id: String,
     native_session_id: String,
+    fork_from_provider_session_id: String,
+    shared_history_id: String,
     native_session_kind: String,
     native_session_source: String,
     pane_id: String,
@@ -247,6 +253,29 @@ fn workspace_agent_session_history_record_session_id(
         .or_else(|| workspace_threads_clean_provider_session_id(&record.native_session_id))
 }
 
+fn workspace_agent_session_history_shared_history_id(
+    workspace_id: &str,
+    agent_id: &str,
+    provider_session_id: &str,
+    fork_from_provider_session_id: &str,
+) -> String {
+    let Some(workspace_id) = workspace_threads_clean_workspace_id(workspace_id).ok() else {
+        return String::new();
+    };
+    let Some(agent_id) = workspace_threads_clean_agent_id(agent_id) else {
+        return String::new();
+    };
+    let root_session_id = workspace_threads_clean_provider_session_id(fork_from_provider_session_id)
+        .or_else(|| workspace_threads_clean_provider_session_id(provider_session_id));
+    let Some(root_session_id) = root_session_id else {
+        return String::new();
+    };
+    format!("history:{workspace_id}:{agent_id}:{root_session_id}")
+        .chars()
+        .take(512)
+        .collect()
+}
+
 fn workspace_agent_session_history_item_session_id(
     item: &WorkspaceAgentSessionHistoryItem,
 ) -> Option<String> {
@@ -328,6 +357,14 @@ fn workspace_agent_session_history_merge_item(
         &mut current.native_session_id,
         candidate.native_session_id.clone(),
     );
+    workspace_agent_session_history_merge_text(
+        &mut current.fork_from_provider_session_id,
+        candidate.fork_from_provider_session_id.clone(),
+    );
+    workspace_agent_session_history_merge_text(
+        &mut current.shared_history_id,
+        candidate.shared_history_id.clone(),
+    );
     workspace_agent_session_history_merge_text(&mut current.model_id, candidate.model_id.clone());
     workspace_agent_session_history_merge_text(
         &mut current.model_source,
@@ -400,6 +437,29 @@ fn workspace_threads_now_millis() -> String {
         .unwrap_or_else(|_| "0".to_string())
 }
 
+fn workspace_threads_add_column_if_missing(
+    connection: &rusqlite::Connection,
+    table: &str,
+    column: &str,
+    definition: &str,
+) -> Result<(), String> {
+    let mut statement = connection
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(|error| format!("Unable to inspect {table} schema: {error}"))?;
+    let columns = statement
+        .query_map([], |row| row.get::<_, String>(1))
+        .map_err(|error| format!("Unable to read {table} schema: {error}"))?
+        .flatten()
+        .collect::<Vec<_>>();
+    if columns.iter().any(|name| name == column) {
+        return Ok(());
+    }
+    connection
+        .execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"), [])
+        .map_err(|error| format!("Unable to add {table}.{column}: {error}"))?;
+    Ok(())
+}
+
 fn workspace_threads_open_store(
     root_directory: Option<&str>,
     create: bool,
@@ -469,6 +529,8 @@ fn workspace_threads_open_store(
                 coordination_session_id TEXT NOT NULL DEFAULT '',
                 provider_session_id TEXT NOT NULL DEFAULT '',
                 native_session_id TEXT NOT NULL DEFAULT '',
+                fork_from_provider_session_id TEXT NOT NULL DEFAULT '',
+                shared_history_id TEXT NOT NULL DEFAULT '',
                 agent_id TEXT NOT NULL,
                 provider TEXT NOT NULL DEFAULT '',
                 model_id TEXT NOT NULL DEFAULT '',
@@ -499,6 +561,28 @@ fn workspace_threads_open_store(
         .map_err(|error| {
             format!("Unable to initialize workspace threads SQLite schema: {error}")
         })?;
+    workspace_threads_add_column_if_missing(
+        &connection,
+        "workspace_agent_session_history",
+        "fork_from_provider_session_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    workspace_threads_add_column_if_missing(
+        &connection,
+        "workspace_agent_session_history",
+        "shared_history_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    connection
+        .execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_workspace_agent_session_history_fork_parent
+                ON workspace_agent_session_history(workspace_id, fork_from_provider_session_id);
+            CREATE INDEX IF NOT EXISTS idx_workspace_agent_session_history_shared
+                ON workspace_agent_session_history(workspace_id, shared_history_id);",
+        )
+        .map_err(|error| {
+            format!("Unable to initialize workspace session fork indexes: {error}")
+        })?;
     Ok((connection, root, db_path))
 }
 
@@ -517,6 +601,9 @@ fn workspace_agent_session_history_upsert_blocking(
             .unwrap_or_default();
     let native_session_id =
         workspace_threads_clean_provider_session_id(&record.native_session_id).unwrap_or_default();
+    let fork_from_provider_session_id =
+        workspace_threads_clean_provider_session_id(&record.fork_from_provider_session_id)
+            .unwrap_or_default();
     let visible_session_id = workspace_agent_session_history_record_session_id(&record);
     if !visible_session_id.as_deref().is_some_and(|session_id| {
         workspace_agent_session_history_session_id_is_visible(&provider, session_id)
@@ -541,6 +628,20 @@ fn workspace_agent_session_history_upsert_blocking(
     let terminal_instance_id = record.terminal_instance_id.map(|value| value as i64);
     let title = workspace_threads_clean_optional_text(&record.title, 240);
     let status = workspace_threads_clean_optional_text(&record.status, 64);
+    let shared_history_id = workspace_threads_clean_optional_text(
+        if record.shared_history_id.trim().is_empty() {
+            workspace_agent_session_history_shared_history_id(
+                &workspace_id,
+                &provider,
+                visible_session_id.as_deref().unwrap_or_default(),
+                &fork_from_provider_session_id,
+            )
+        } else {
+            record.shared_history_id.clone()
+        }
+        .as_str(),
+        512,
+    );
 
     connection
         .execute(
@@ -552,6 +653,8 @@ fn workspace_agent_session_history_upsert_blocking(
                 coordination_session_id,
                 provider_session_id,
                 native_session_id,
+                fork_from_provider_session_id,
+                shared_history_id,
                 agent_id,
                 provider,
                 model_id,
@@ -569,7 +672,7 @@ fn workspace_agent_session_history_upsert_blocking(
                 latest_at_ms,
                 created_at,
                 updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?23)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?25)
             ON CONFLICT(id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 workspace_root = excluded.workspace_root,
@@ -577,6 +680,8 @@ fn workspace_agent_session_history_upsert_blocking(
                 coordination_session_id = CASE WHEN excluded.coordination_session_id != '' THEN excluded.coordination_session_id ELSE workspace_agent_session_history.coordination_session_id END,
                 provider_session_id = CASE WHEN excluded.provider_session_id != '' THEN excluded.provider_session_id ELSE workspace_agent_session_history.provider_session_id END,
                 native_session_id = CASE WHEN excluded.native_session_id != '' THEN excluded.native_session_id ELSE workspace_agent_session_history.native_session_id END,
+                fork_from_provider_session_id = CASE WHEN excluded.fork_from_provider_session_id != '' THEN excluded.fork_from_provider_session_id ELSE workspace_agent_session_history.fork_from_provider_session_id END,
+                shared_history_id = CASE WHEN excluded.shared_history_id != '' THEN excluded.shared_history_id ELSE workspace_agent_session_history.shared_history_id END,
                 agent_id = excluded.agent_id,
                 provider = CASE WHEN excluded.provider != '' THEN excluded.provider ELSE workspace_agent_session_history.provider END,
                 model_id = CASE WHEN excluded.model_id != '' THEN excluded.model_id ELSE workspace_agent_session_history.model_id END,
@@ -601,6 +706,8 @@ fn workspace_agent_session_history_upsert_blocking(
                 workspace_threads_clean_optional_text(&record.coordination_session_id, 256),
                 provider_session_id,
                 native_session_id,
+                fork_from_provider_session_id,
+                shared_history_id,
                 agent_id,
                 provider,
                 workspace_threads_clean_optional_text(&record.model_id, 160),
@@ -746,6 +853,8 @@ fn workspace_agent_session_history_list_blocking(
                 coordination_session_id,
                 provider_session_id,
                 native_session_id,
+                fork_from_provider_session_id,
+                shared_history_id,
                 agent_id,
                 provider,
                 model_id,
@@ -780,15 +889,15 @@ fn workspace_agent_session_history_list_blocking(
             rusqlite::params![workspace_id.as_str(), limit as i64],
             |row| {
                 let terminal_instance_id = row
-                    .get::<_, Option<i64>>(13)?
+                    .get::<_, Option<i64>>(15)?
                     .and_then(|value| u64::try_from(value).ok());
                 let created_at_ms = row
-                    .get::<_, i64>(20)
+                    .get::<_, i64>(22)
                     .ok()
                     .and_then(|value| u64::try_from(value).ok())
                     .unwrap_or(0);
                 let latest_at_ms = row
-                    .get::<_, i64>(21)
+                    .get::<_, i64>(23)
                     .ok()
                     .and_then(|value| u64::try_from(value).ok())
                     .unwrap_or(created_at_ms);
@@ -800,20 +909,22 @@ fn workspace_agent_session_history_list_blocking(
                     coordination_session_id: row.get(4)?,
                     provider_session_id: row.get(5)?,
                     native_session_id: row.get(6)?,
-                    agent_id: row.get(7)?,
-                    provider: row.get(8)?,
-                    model_id: row.get(9)?,
-                    model_source: row.get(10)?,
-                    thread_id: row.get(11)?,
-                    pane_id: row.get(12)?,
+                    fork_from_provider_session_id: row.get(7)?,
+                    shared_history_id: row.get(8)?,
+                    agent_id: row.get(9)?,
+                    provider: row.get(10)?,
+                    model_id: row.get(11)?,
+                    model_source: row.get(12)?,
+                    thread_id: row.get(13)?,
+                    pane_id: row.get(14)?,
                     terminal_instance_id,
-                    terminal_index: row.get(14)?,
-                    slot_key: row.get(15)?,
-                    cwd: row.get(16)?,
-                    status: row.get(17)?,
-                    title: row.get(18)?,
+                    terminal_index: row.get(16)?,
+                    slot_key: row.get(17)?,
+                    cwd: row.get(18)?,
+                    status: row.get(19)?,
+                    title: row.get(20)?,
                     first_user_message: String::new(),
-                    source: row.get(19)?,
+                    source: row.get(21)?,
                     created_at_ms,
                     latest_at_ms,
                 })
@@ -1181,6 +1292,19 @@ fn workspace_threads_apply_provider_session_binding(state: &mut Value, binding: 
             "native_session_id",
         ],
     );
+    let fork_from_provider_session_id = workspace_threads_binding_text(
+        binding,
+        &[
+            "forkFromProviderSessionId",
+            "fork_from_provider_session_id",
+            "forkedFromProviderSessionId",
+            "forked_from_provider_session_id",
+        ],
+    );
+    let shared_history_id = workspace_threads_binding_text(
+        binding,
+        &["sharedHistoryId", "shared_history_id", "historyGroupId", "history_group_id"],
+    );
     if workspace_id.is_empty()
         || thread_id.is_empty()
         || agent_id.is_empty()
@@ -1269,6 +1393,15 @@ fn workspace_threads_apply_provider_session_binding(state: &mut Value, binding: 
         "transcriptSessionId".to_string(),
         json!(provider_session_id.clone()),
     );
+    if !fork_from_provider_session_id.is_empty() {
+        thread.insert(
+            "forkFromProviderSessionId".to_string(),
+            json!(fork_from_provider_session_id.clone()),
+        );
+    }
+    if !shared_history_id.is_empty() {
+        thread.insert("sharedHistoryId".to_string(), json!(shared_history_id.clone()));
+    }
     thread.insert("transcriptStatus".to_string(), json!("ready"));
     thread.insert("updatedAt".to_string(), json!(now.clone()));
     if let Some(index) = terminal_index {
@@ -1307,6 +1440,15 @@ fn workspace_threads_apply_provider_session_binding(state: &mut Value, binding: 
     );
     binding_object.insert("nativeSessionUpdatedAt".to_string(), json!(now));
     binding_object.insert("providerSessionId".to_string(), json!(provider_session_id));
+    if !fork_from_provider_session_id.is_empty() {
+        binding_object.insert(
+            "forkFromProviderSessionId".to_string(),
+            json!(fork_from_provider_session_id),
+        );
+    }
+    if !shared_history_id.is_empty() {
+        binding_object.insert("sharedHistoryId".to_string(), json!(shared_history_id));
+    }
     if !provider.is_empty() {
         binding_object.insert("provider".to_string(), json!(provider));
     }
@@ -1792,6 +1934,7 @@ mod workspace_threads_store_tests {
             WorkspaceThreadProviderSessionBinding {
                 agent_id: "codex".to_string(),
                 cwd: root_text.clone(),
+                fork_from_provider_session_id: "".to_string(),
                 instance_id: Some(42),
                 model_id: "gpt-5.5".to_string(),
                 native_session_id: "codex-session-12345678".to_string(),
@@ -1802,6 +1945,7 @@ mod workspace_threads_store_tests {
                 provider: "codex".to_string(),
                 provider_session_id: "codex-session-12345678".to_string(),
                 session_title: "Codex".to_string(),
+                shared_history_id: "".to_string(),
                 source: "terminal-output".to_string(),
                 terminal_index: Some(1),
                 thread_id: "thread-session-binding".to_string(),
@@ -1855,6 +1999,7 @@ mod workspace_threads_store_tests {
             WorkspaceThreadProviderSessionBinding {
                 agent_id: "codex".to_string(),
                 cwd: root_text.clone(),
+                fork_from_provider_session_id: "".to_string(),
                 instance_id: Some(43),
                 model_id: "gpt-5.5".to_string(),
                 native_session_id: "codex-session-12345678".to_string(),
@@ -1865,6 +2010,7 @@ mod workspace_threads_store_tests {
                 provider: "codex".to_string(),
                 provider_session_id: "codex-session-12345678".to_string(),
                 session_title: "Codex".to_string(),
+                shared_history_id: "".to_string(),
                 source: "terminal-output".to_string(),
                 terminal_index: Some(2),
                 thread_id: "thread-session-binding-next".to_string(),
@@ -1929,6 +2075,7 @@ mod workspace_threads_store_tests {
                 coordination_session_id: "coord-session-1".to_string(),
                 created_at_ms: Some(1000),
                 cwd: root_text.clone(),
+                fork_from_provider_session_id: "".to_string(),
                 id: "session-history-1".to_string(),
                 model_id: "gpt-5.5".to_string(),
                 model_source: "launch".to_string(),
@@ -1937,6 +2084,7 @@ mod workspace_threads_store_tests {
                 pane_id: "pane-session-history".to_string(),
                 provider: "openai".to_string(),
                 provider_session_id: "".to_string(),
+                shared_history_id: "".to_string(),
                 slot_key: "slot-a".to_string(),
                 source: "terminal-open".to_string(),
                 status: "starting".to_string(),
@@ -1961,6 +2109,7 @@ mod workspace_threads_store_tests {
                 coordination_session_id: "coord-other".to_string(),
                 created_at_ms: Some(1000),
                 cwd: root_text.clone(),
+                fork_from_provider_session_id: "".to_string(),
                 id: "session-history-other".to_string(),
                 model_id: "sonnet".to_string(),
                 model_source: "launch".to_string(),
@@ -1969,6 +2118,7 @@ mod workspace_threads_store_tests {
                 pane_id: "pane-other".to_string(),
                 provider: "claude".to_string(),
                 provider_session_id: "".to_string(),
+                shared_history_id: "".to_string(),
                 slot_key: "slot-b".to_string(),
                 source: "terminal-open".to_string(),
                 status: "idle".to_string(),
@@ -2000,6 +2150,7 @@ mod workspace_threads_store_tests {
                 coordination_session_id: "coord-session-1".to_string(),
                 created_at_ms: Some(1000),
                 cwd: root_text.clone(),
+                fork_from_provider_session_id: "".to_string(),
                 id: "session-history-1".to_string(),
                 model_id: "gpt-5.5".to_string(),
                 model_source: "launch".to_string(),
@@ -2008,6 +2159,7 @@ mod workspace_threads_store_tests {
                 pane_id: "pane-session-history".to_string(),
                 provider: "codex".to_string(),
                 provider_session_id: "codex-provider-123".to_string(),
+                shared_history_id: "".to_string(),
                 slot_key: "".to_string(),
                 source: "provider-session".to_string(),
                 status: "idle".to_string(),
@@ -2056,6 +2208,7 @@ mod workspace_threads_store_tests {
                 coordination_session_id: "coord-session-duplicate".to_string(),
                 created_at_ms: Some(500),
                 cwd: root_text.clone(),
+                fork_from_provider_session_id: "".to_string(),
                 id: "different-history-id-for-same-provider-session".to_string(),
                 model_id: "gpt-5.5".to_string(),
                 model_source: "launch".to_string(),
@@ -2064,6 +2217,7 @@ mod workspace_threads_store_tests {
                 pane_id: "pane-session-history-duplicate".to_string(),
                 provider: "openai".to_string(),
                 provider_session_id: "codex-provider-123".to_string(),
+                shared_history_id: "".to_string(),
                 slot_key: "slot-duplicate".to_string(),
                 source: "terminal_activity_hook:provider-session".to_string(),
                 status: "idle".to_string(),
@@ -2098,6 +2252,7 @@ mod workspace_threads_store_tests {
                 coordination_session_id: "coord-opencode".to_string(),
                 created_at_ms: Some(3000),
                 cwd: root_text.clone(),
+                fork_from_provider_session_id: "".to_string(),
                 id: "session-history-opencode-invalid".to_string(),
                 model_id: "anthropic/claude-sonnet-4-5".to_string(),
                 model_source: "launch".to_string(),
@@ -2106,6 +2261,7 @@ mod workspace_threads_store_tests {
                 pane_id: "pane-opencode".to_string(),
                 provider: "opencode".to_string(),
                 provider_session_id: "019f0cd7-1347-7273-b20f-e959c3772a01".to_string(),
+                shared_history_id: "".to_string(),
                 slot_key: "slot-opencode".to_string(),
                 source: "terminal-open".to_string(),
                 status: "starting".to_string(),

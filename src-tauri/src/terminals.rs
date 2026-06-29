@@ -173,6 +173,30 @@ fn terminal_provider_resume_args(
     }
 }
 
+fn terminal_provider_fork_args(
+    provider: AgentProvider,
+    provider_session_id: Option<&str>,
+) -> Vec<String> {
+    let Some(session_id) = terminal_clean_provider_session_id(provider_session_id) else {
+        return Vec::new();
+    };
+
+    match provider {
+        AgentProvider::Codex => vec!["fork".to_string(), session_id],
+        AgentProvider::Claude => {
+            vec!["--resume".to_string(), session_id, "--fork-session".to_string()]
+        }
+        AgentProvider::OpenCode => vec!["--session".to_string(), session_id, "--fork".to_string()],
+    }
+}
+
+fn terminal_provider_session_fork_error(provider: AgentProvider) -> String {
+    format!(
+        "Unable to fork this {} session because it is not available locally.",
+        agent_definition(provider).label
+    )
+}
+
 fn terminal_resolve_provider_resume_session(
     provider: AgentProvider,
     requested_resume_session_id: Option<String>,
@@ -423,16 +447,25 @@ fn terminal_runtime_snapshot(instance: &TerminalInstance) -> TerminalRuntimeSnap
 fn terminal_runtime_apply_opened(
     instance: &TerminalInstance,
     provider_session_id: Option<&str>,
+    fork_from_provider_session_id: Option<&str>,
     source: &str,
 ) -> TerminalRuntimeSnapshot {
     let provider_session_id =
         terminal_recordable_provider_session_id_for_metadata(&instance.metadata, provider_session_id);
+    let fork_from_provider_session_id = terminal_recordable_provider_session_id_for_metadata(
+        &instance.metadata,
+        fork_from_provider_session_id,
+    );
     let snapshot = if cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_id)
         || cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_kind)
     {
-        TerminalRuntimeSnapshot::opened_starting(provider_session_id, source)
+        let mut snapshot = TerminalRuntimeSnapshot::opened_starting(provider_session_id, source);
+        snapshot.fork_from_provider_session_id = fork_from_provider_session_id;
+        snapshot
     } else {
-        TerminalRuntimeSnapshot::opened_idle(provider_session_id)
+        let mut snapshot = TerminalRuntimeSnapshot::opened_idle(provider_session_id);
+        snapshot.fork_from_provider_session_id = fork_from_provider_session_id;
+        snapshot
     };
     if let Ok(mut runtime) = instance.runtime.lock() {
         *runtime = snapshot.clone();
@@ -483,6 +516,11 @@ fn terminal_runtime_apply_activity_payload(
             previous.native_session_id.as_deref(),
         )
     });
+    let fork_from_provider_session_id = terminal_recordable_provider_session_id_for_metadata(
+        &instance.metadata,
+        payload.fork_from_provider_session_id.as_deref(),
+    )
+    .or(previous.fork_from_provider_session_id);
     let snapshot = TerminalRuntimeSnapshot {
         status: payload.status.clone(),
         activity_status: payload.activity_status.clone(),
@@ -493,6 +531,7 @@ fn terminal_runtime_apply_activity_payload(
         completed_at: payload.completed_at.clone(),
         provider_session_id,
         native_session_id,
+        fork_from_provider_session_id,
         provider_turn_id: payload
             .provider_turn_id
             .clone()
@@ -591,6 +630,7 @@ fn terminal_runtime_startup_idle_fingerprint(runtime: &TerminalRuntimeSnapshot) 
         "completed_at": runtime.completed_at,
         "provider_session_id": runtime.provider_session_id,
         "native_session_id": runtime.native_session_id,
+        "fork_from_provider_session_id": runtime.fork_from_provider_session_id,
         "provider_turn_id": runtime.provider_turn_id,
         "turn_id": runtime.turn_id,
         "source": runtime.source,
@@ -1035,12 +1075,22 @@ fn terminal_provider_session_binding_payload(
     let metadata = instance.metadata.clone();
     let provider_session_id =
         terminal_recordable_provider_session_id_for_metadata(&metadata, Some(provider_session_id))?;
+    let runtime = terminal_runtime_snapshot(instance);
+    let fork_from_provider_session_id = runtime.fork_from_provider_session_id.clone().unwrap_or_default();
+    let shared_history_id = terminal_workspace_shared_history_id(
+        &metadata.workspace_id,
+        &metadata.agent_kind,
+        &provider_session_id,
+        Some(fork_from_provider_session_id.as_str()).filter(|value| !value.trim().is_empty()),
+    );
     Some(WorkspaceThreadProviderSessionBinding {
         workspace_id: metadata.workspace_id,
         thread_id: metadata.thread_id,
         agent_id: metadata.agent_id,
         provider_session_id: provider_session_id.clone(),
         native_session_id: provider_session_id,
+        fork_from_provider_session_id,
+        shared_history_id,
         native_session_kind: "session".to_string(),
         native_session_source: source.to_string(),
         pane_id: metadata.pane_id,
@@ -1145,6 +1195,30 @@ fn terminal_workspace_agent_session_history_id(instance: &TerminalInstance) -> S
         .unwrap_or_else(|| format!("terminal:{}:{}", instance.metadata.pane_id, instance.id))
 }
 
+fn terminal_workspace_shared_history_id(
+    workspace_id: &str,
+    agent_id: &str,
+    provider_session_id: &str,
+    fork_from_provider_session_id: Option<&str>,
+) -> String {
+    let workspace_id = workspace_id.trim();
+    let agent_id =
+        terminal_normalize_agent_kind(Some(agent_id)).unwrap_or_else(|| agent_id.trim().to_string());
+    let root_session_id = fork_from_provider_session_id
+        .and_then(|value| terminal_clean_provider_session_id(Some(value)))
+        .or_else(|| terminal_clean_provider_session_id(Some(provider_session_id)));
+    let Some(root_session_id) = root_session_id else {
+        return String::new();
+    };
+    if workspace_id.is_empty() || agent_id.trim().is_empty() {
+        return String::new();
+    }
+    format!("history:{workspace_id}:{agent_id}:{root_session_id}")
+        .chars()
+        .take(512)
+        .collect()
+}
+
 fn terminal_workspace_agent_session_slot_key(
     instance: &TerminalInstance,
     override_slot_key: Option<&str>,
@@ -1226,11 +1300,21 @@ fn terminal_record_workspace_agent_session_history(
         .unwrap_or_default();
     let record = WorkspaceAgentSessionHistoryRecord {
         id: terminal_workspace_agent_session_history_id(instance),
-        workspace_id: metadata.workspace_id,
+        workspace_id: metadata.workspace_id.clone(),
         workspace_name: metadata.workspace_name,
         coordination_session_id,
-        provider_session_id: provider_session_id.unwrap_or_default(),
-        native_session_id: native_session_id.unwrap_or_default(),
+        provider_session_id: provider_session_id.clone().unwrap_or_default(),
+        native_session_id: native_session_id.clone().unwrap_or_default(),
+        fork_from_provider_session_id: runtime.fork_from_provider_session_id.clone().unwrap_or_default(),
+        shared_history_id: terminal_workspace_shared_history_id(
+            &metadata.workspace_id,
+            &metadata.agent_kind,
+            provider_session_id
+                .as_deref()
+                .or(native_session_id.as_deref())
+                .unwrap_or_default(),
+            runtime.fork_from_provider_session_id.as_deref(),
+        ),
         agent_id: metadata.agent_id,
         provider: metadata.agent_kind,
         model_id: model_id.unwrap_or_default().trim().to_string(),
@@ -1282,6 +1366,21 @@ fn terminal_runtime_has_provider_session(instance: &TerminalInstance) -> bool {
         .as_deref()
         .map(str::trim)
         .is_some_and(|value| !value.is_empty())
+}
+
+fn terminal_current_recordable_provider_session_id(
+    instance: &TerminalInstance,
+) -> Option<String> {
+    let runtime = terminal_runtime_snapshot(instance);
+    runtime
+        .provider_session_id
+        .or(runtime.native_session_id)
+        .and_then(|session_id| {
+            terminal_recordable_provider_session_id_for_metadata(
+                &instance.metadata,
+                Some(&session_id),
+            )
+        })
 }
 
 fn spawn_terminal_codex_session_discovery(
@@ -1402,6 +1501,7 @@ fn terminal_launch(
     provider: Option<String>,
     launch_options: TerminalProviderLaunchOptions,
     provider_session_id: Option<String>,
+    fork_from_provider_session_id: Option<String>,
     working_directory: &str,
 ) -> Result<(
     Vec<String>,
@@ -1416,15 +1516,38 @@ fn terminal_launch(
     let requested_resume_session_id = provider_session_id
         .as_deref()
         .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
-    let (resume_session_id, codex_resume_home) =
-        terminal_resolve_provider_resume_session(provider, requested_resume_session_id, working_directory);
-    let mut args = terminal_provider_resume_args(provider, resume_session_id.as_deref());
+    let requested_fork_session_id = fork_from_provider_session_id
+        .as_deref()
+        .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
+    let is_fork_launch = requested_fork_session_id.is_some();
+    let (source_session_id, codex_resume_home) = if is_fork_launch {
+        let (session_id, codex_resume_home) = terminal_resolve_provider_resume_session(
+            provider,
+            requested_fork_session_id,
+            working_directory,
+        );
+        let Some(session_id) = session_id else {
+            return Err(terminal_provider_session_fork_error(provider));
+        };
+        (Some(session_id), codex_resume_home)
+    } else {
+        terminal_resolve_provider_resume_session(
+            provider,
+            requested_resume_session_id,
+            working_directory,
+        )
+    };
+    let mut args = if is_fork_launch {
+        terminal_provider_fork_args(provider, source_session_id.as_deref())
+    } else {
+        terminal_provider_resume_args(provider, source_session_id.as_deref())
+    };
 
     // When resuming, the session transcript knows the exact model that was
     // active when the session closed — including in-session `/model`
     // switches the stored binding never saw. Prefer it over the caller's
     // default so a reopened terminal continues on the same model.
-    let session_model = resume_session_id
+    let session_model = source_session_id
         .as_deref()
         .and_then(|session_id| agent_session_last_model(provider, session_id))
         .and_then(|model| normalize_forge_model(Some(model)).ok().flatten());
@@ -1467,7 +1590,7 @@ fn terminal_launch(
         definition.label.to_string(),
         codex_resume_home,
         resolved_launch,
-        resume_session_id,
+        if is_fork_launch { None } else { source_session_id },
     ))
 }
 
@@ -1825,6 +1948,7 @@ async fn write_to_active_terminal_audio_input_target(
         target.pane_id.clone(),
         target.instance_id,
         data.to_string(),
+        None,
         None,
         None,
         None,
@@ -2590,6 +2714,7 @@ struct TerminalLiveSessionSummary {
     completed_at: Option<String>,
     provider_session_id: Option<String>,
     native_session_id: Option<String>,
+    fork_from_provider_session_id: Option<String>,
     provider_turn_id: Option<String>,
     turn_id: Option<String>,
     runtime_source: String,
@@ -5537,6 +5662,9 @@ async fn terminal_open(
     let provider_session_id = request.provider_session_id;
     let requested_provider_session_id =
         terminal_clean_provider_session_id(provider_session_id.as_deref());
+    let fork_from_provider_session_id = request.fork_from_provider_session_id;
+    let requested_fork_provider_session_id =
+        terminal_clean_provider_session_id(fork_from_provider_session_id.as_deref());
     let launch_options = TerminalProviderLaunchOptions {
         model: request.model,
         reasoning_effort: request.reasoning_effort,
@@ -5545,6 +5673,9 @@ async fn terminal_open(
     };
     let plain_shell =
         terminal_request_is_plain_shell(&kind, provider.as_deref(), request.plain_shell);
+    if plain_shell && requested_fork_provider_session_id.is_some() {
+        return Err("Shell terminals do not have provider sessions to fork.".to_string());
+    }
     let fresh_session = request.fresh_session.unwrap_or(false) && !plain_shell;
     let working_directory_request = request.working_directory;
     let workspace_root_was_empty_at_selection = request
@@ -5599,6 +5730,7 @@ async fn terminal_open(
             "output_transport": prefer_output_transport,
             "app_control_mcp_requested": app_control_mcp_requested,
             "provider_session_id_present": requested_provider_session_id.is_some(),
+            "fork_from_provider_session_id_present": requested_fork_provider_session_id.is_some(),
         }),
     );
 
@@ -5674,7 +5806,11 @@ async fn terminal_open(
             "Prepared PTY".to_string(),
             None,
             TerminalProviderResolvedLaunchOptions::default(),
-            requested_provider_session_id.clone(),
+            if requested_fork_provider_session_id.is_some() {
+                None
+            } else {
+                requested_provider_session_id.clone()
+            },
         )
     } else {
         terminal_launch(
@@ -5682,6 +5818,7 @@ async fn terminal_open(
             provider,
             launch_options,
             requested_provider_session_id.clone(),
+            requested_fork_provider_session_id.clone(),
             &working_directory_text,
         )?
     };
@@ -5960,6 +6097,7 @@ async fn terminal_open(
     let runtime_snapshot = terminal_runtime_apply_opened(
         &instance,
         effective_provider_session_id.as_deref(),
+        requested_fork_provider_session_id.as_deref(),
         "terminal-open",
     );
     terminal_record_workspace_agent_session_history(
@@ -6003,6 +6141,17 @@ async fn terminal_open(
             "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
         }),
     );
+    let runtime_shared_history_id = Some(terminal_workspace_shared_history_id(
+        &terminal_metadata_for_log.workspace_id,
+        &terminal_metadata_for_log.agent_kind,
+        runtime_snapshot
+            .provider_session_id
+            .as_deref()
+            .or(runtime_snapshot.native_session_id.as_deref())
+            .unwrap_or_default(),
+        runtime_snapshot.fork_from_provider_session_id.as_deref(),
+    ))
+    .filter(|value| !value.trim().is_empty());
     cloud_mcp_mark_terminal_opened(
         cloud_mcp_state.inner(),
         &pane_id,
@@ -6012,6 +6161,8 @@ async fn terminal_open(
         effective_session_mode,
         &terminal_metadata_for_log,
         runtime_snapshot.provider_session_id.as_deref(),
+        runtime_snapshot.fork_from_provider_session_id.as_deref(),
+        runtime_shared_history_id.as_deref(),
         "terminal_open",
     )
     .await;
@@ -6185,6 +6336,8 @@ async fn terminal_open(
             .unwrap_or_else(|| effective_session_mode.file_authority().to_string()),
         provider_session_id: runtime_snapshot.provider_session_id.clone(),
         native_session_id: runtime_snapshot.native_session_id.clone(),
+        fork_from_provider_session_id: runtime_snapshot.fork_from_provider_session_id.clone(),
+        shared_history_id: runtime_shared_history_id,
         requested_provider_session_id,
         model: resolved_launch.model,
         model_source: resolved_launch.model_source,
@@ -6727,6 +6880,12 @@ async fn start_terminal_agent_in_prepared_pty(
         .provider_session_id
         .as_deref()
         .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
+    let requested_fork_session_id = request
+        .fork_from_provider_session_id
+        .as_deref()
+        .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
+    let is_fork_launch = requested_fork_session_id.is_some();
+    let fork_source_for_runtime = requested_fork_session_id.clone();
 
     let Some(instance) = ({
         let terminals = terminals.read().await;
@@ -6742,14 +6901,41 @@ async fn start_terminal_agent_in_prepared_pty(
             message: "Terminal session is not running.".to_string(),
         };
     };
-    let working_directory_text = instance.working_directory.to_string_lossy().to_string();
-    let (resume_session_id, codex_resume_home) =
-        terminal_resolve_provider_resume_session(provider, requested_resume_session_id, &working_directory_text);
-    let mut args = terminal_provider_resume_args(provider, resume_session_id.as_deref());
+    let working_directory_text = terminal_provider_session_binding_root(&instance);
+    let (source_session_id, codex_resume_home) = if is_fork_launch {
+        let (session_id, codex_resume_home) = terminal_resolve_provider_resume_session(
+            provider,
+            requested_fork_session_id,
+            &working_directory_text,
+        );
+        let Some(session_id) = session_id else {
+            return TerminalStartAgentPaneResult {
+                pane_id,
+                instance_id: Some(instance.id),
+                model: None,
+                model_source: None,
+                started: false,
+                skipped: true,
+                message: terminal_provider_session_fork_error(provider),
+            };
+        };
+        (Some(session_id), codex_resume_home)
+    } else {
+        terminal_resolve_provider_resume_session(
+            provider,
+            requested_resume_session_id,
+            &working_directory_text,
+        )
+    };
+    let mut args = if is_fork_launch {
+        terminal_provider_fork_args(provider, source_session_id.as_deref())
+    } else {
+        terminal_provider_resume_args(provider, source_session_id.as_deref())
+    };
 
     // Resumed sessions continue on the exact model they last used; the
     // transcript outranks the caller's default (it sees `/model` switches).
-    let session_model = resume_session_id
+    let session_model = source_session_id
         .as_deref()
         .and_then(|session_id| agent_session_last_model(provider, session_id))
         .and_then(|model| normalize_forge_model(Some(model)).ok().flatten());
@@ -7101,9 +7287,15 @@ async fn start_terminal_agent_in_prepared_pty(
         match write_agent_start_input_to_writer(writer.as_mut(), &input, "terminal agent launch") {
             Ok(()) => {
                 *agent_started_guard = true;
+                let effective_provider_session_id = if is_fork_launch {
+                    None
+                } else {
+                    source_session_id.clone()
+                };
                 terminal_runtime_apply_opened(
                     &instance,
-                    resume_session_id.as_deref(),
+                    effective_provider_session_id.as_deref(),
+                    fork_source_for_runtime.as_deref(),
                     "terminal-start-agent",
                 );
                 terminal_record_workspace_agent_session_history(
@@ -7116,7 +7308,7 @@ async fn start_terminal_agent_in_prepared_pty(
                     None,
                 );
                 if let (Some(coordination), Some(provider_session_id)) =
-                    (instance.coordination.clone(), resume_session_id.clone())
+                    (instance.coordination.clone(), effective_provider_session_id.clone())
                 {
                     terminal_record_coordination_provider_session_id(
                         coordination,
@@ -10040,6 +10232,78 @@ fn emit_terminal_input_error(
     );
 }
 
+async fn terminal_preview_submitted_prompt(
+    instance: &TerminalInstance,
+    data: &str,
+) -> Option<String> {
+    let gate = instance.input_gate.lock().await;
+    let mut preview = gate.clone();
+    terminal_observe_input_gate_submitted_prompt(&mut preview, data)
+}
+
+fn terminal_prompt_is_app_fork_command(prompt: &str) -> bool {
+    prompt.replace('\u{00a0}', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .eq_ignore_ascii_case("fork")
+}
+
+fn emit_terminal_fork_requested(
+    app: &AppHandle,
+    instance: &TerminalInstance,
+    provider_session_id: String,
+) {
+    let payload = TerminalForkRequestedPayload {
+        pane_id: instance.metadata.pane_id.clone(),
+        instance_id: instance.id,
+        workspace_id: instance.metadata.workspace_id.clone(),
+        terminal_index: instance.metadata.terminal_index,
+        thread_id: instance.metadata.thread_id.clone(),
+        agent_id: instance.metadata.agent_id.clone(),
+        agent_kind: instance.metadata.agent_kind.clone(),
+        provider_session_id,
+    };
+    let _ = app.emit(TERMINAL_FORK_REQUESTED_EVENT, payload);
+}
+
+async fn terminal_try_emit_app_fork_request(
+    app: &AppHandle,
+    instance: &TerminalInstance,
+    pane_id: &str,
+    thread_id: Option<&str>,
+    data: &str,
+    source: &str,
+) -> bool {
+    let Some(prompt) = terminal_preview_submitted_prompt(instance, data).await else {
+        return false;
+    };
+    if !terminal_prompt_is_app_fork_command(&prompt) {
+        return false;
+    }
+
+    let Some(provider_session_id) = terminal_current_recordable_provider_session_id(instance) else {
+        return false;
+    };
+
+    let (_observed_prompt, input_gate_before, input_gate_after) =
+        terminal_observe_submitted_prompt(instance, data).await;
+    log_terminal_status_event(
+        "backend.terminal_write.fork_command_intercepted",
+        json!({
+            "input_gate_after": input_gate_after,
+            "input_gate_before": input_gate_before,
+            "instance_id": instance.id,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "provider_session_id_present": true,
+            "source": source,
+            "thread_id": thread_id.unwrap_or_default(),
+        }),
+    );
+    emit_terminal_fork_requested(app, instance, provider_session_id);
+    true
+}
+
 fn terminal_prompt_submitted_should_emit_synthetic_activity(
     metadata: &TerminalInstanceMetadata,
     prompt_source: &str,
@@ -10081,6 +10345,8 @@ fn emit_terminal_prompt_submitted_activity_started(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+    let fork_from_provider_session_id =
+        terminal_runtime_snapshot(instance).fork_from_provider_session_id;
     let thread_id = thread_id_override
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -10096,6 +10362,7 @@ fn emit_terminal_prompt_submitted_activity_started(
         completed_at: None,
         provider_session_id: None,
         native_session_id: None,
+        fork_from_provider_session_id: fork_from_provider_session_id.clone(),
         provider_turn_id: prompt_event_id.clone(),
         turn_id: prompt_event_id.clone(),
         source: "backend:prompt-submitted".to_string(),
@@ -10140,6 +10407,7 @@ fn emit_terminal_prompt_submitted_activity_started(
         completed_at: None,
         provider_session_id: None,
         native_session_id: None,
+        fork_from_provider_session_id,
         provider_turn_id: prompt_event_id.clone(),
         turn_id: prompt_event_id,
         transcript_path: None,
@@ -11162,6 +11430,7 @@ fn terminal_activity_hook_payload(
     let permission_request_id = manual_prompt
         .as_ref()
         .and_then(|prompt| prompt.permission_request_id.clone());
+    let current_runtime = terminal_runtime_snapshot(instance);
     let projected_runtime = terminal_project_runtime(
         &metadata,
         &TerminalRuntimeSnapshot {
@@ -11174,6 +11443,7 @@ fn terminal_activity_hook_payload(
             completed_at: completed_at.clone(),
             provider_session_id: provider_session_id.clone(),
             native_session_id: provider_session_id.clone(),
+            fork_from_provider_session_id: current_runtime.fork_from_provider_session_id.clone(),
             provider_turn_id: provider_turn_id.clone(),
             turn_id: provider_turn_id.clone(),
             source: if manual_prompt.is_some() {
@@ -11228,6 +11498,7 @@ fn terminal_activity_hook_payload(
         completed_at,
         provider_session_id: provider_session_id.clone(),
         native_session_id: provider_session_id.clone(),
+        fork_from_provider_session_id: current_runtime.fork_from_provider_session_id,
         provider_turn_id: provider_turn_id.clone(),
         turn_id: provider_turn_id,
         transcript_path: terminal_activity_hook_string(
@@ -12129,6 +12400,7 @@ fn spawn_terminal_input_queue_worker(
                 payload.todo_action,
                 payload.todo_resume_requested,
                 payload.thread_id,
+                payload.app_fork_enabled,
                 true,
             )
             .await;
@@ -12911,6 +13183,7 @@ async fn terminal_write_inner(
     todo_action: Option<String>,
     todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
+    app_fork_enabled: Option<bool>,
     _realtime_write: bool,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
@@ -12971,6 +13244,21 @@ async fn terminal_write_inner(
                 "thread_id": thread_id.as_deref().unwrap_or_default(),
             }),
         );
+    }
+    if app_fork_enabled.unwrap_or(false) {
+        let fork_preview_data = normalize_terminal_enter_sequences_for_pty(data.clone());
+        if terminal_try_emit_app_fork_request(
+            &app,
+            &instance,
+            &pane_id,
+            thread_id.as_deref(),
+            &fork_preview_data,
+            "terminal_write",
+        )
+        .await
+        {
+            return Ok(());
+        }
     }
     if prompt_submission_requested {
         if let Some(coordination) = instance.coordination.clone() {
@@ -13613,6 +13901,7 @@ async fn terminal_write(
     todo_action: Option<String>,
     todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
+    app_fork_enabled: Option<bool>,
 ) -> Result<(), String> {
     terminal_write_inner(
         app,
@@ -13632,9 +13921,41 @@ async fn terminal_write(
         todo_action,
         todo_resume_requested,
         thread_id,
+        app_fork_enabled,
         false,
     )
     .await
+}
+
+#[tauri::command]
+async fn terminal_request_fork(
+    app: AppHandle,
+    state: State<'_, TerminalState>,
+    pane_id: String,
+    instance_id: Option<u64>,
+) -> Result<(), String> {
+    validate_terminal_pane_id(&pane_id)?;
+    let Some(instance) = get_terminal_instance_if_current(state.inner(), &pane_id, instance_id).await?
+    else {
+        return Err("Terminal session is not running.".to_string());
+    };
+    let Some(provider_session_id) = terminal_current_recordable_provider_session_id(&instance) else {
+        return Err("This terminal does not have a provider session to fork yet.".to_string());
+    };
+
+    log_terminal_status_event(
+        "backend.terminal_request_fork.accepted",
+        json!({
+            "agent_kind": clean_terminal_diagnostic_log_text(&instance.metadata.agent_kind),
+            "instance_id": instance.id,
+            "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+            "provider_session_id_present": true,
+            "thread_id": clean_terminal_diagnostic_log_text(&instance.metadata.thread_id),
+            "workspace_id": clean_terminal_diagnostic_log_text(&instance.metadata.workspace_id),
+        }),
+    );
+    emit_terminal_fork_requested(&app, &instance, provider_session_id);
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -13706,6 +14027,7 @@ async fn terminal_write_realtime(
     todo_action: Option<String>,
     todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
+    app_fork_enabled: Option<bool>,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
     if data.len() > MAX_TERMINAL_WRITE_BYTES {
@@ -13736,6 +14058,7 @@ async fn terminal_write_realtime(
             todo_action,
             todo_resume_requested,
             thread_id,
+            app_fork_enabled,
             true,
         )
         .await
@@ -15085,6 +15408,7 @@ async fn terminal_live_sessions(
             completed_at: runtime.completed_at,
             provider_session_id: runtime.provider_session_id,
             native_session_id: runtime.native_session_id,
+            fork_from_provider_session_id: runtime.fork_from_provider_session_id,
             provider_turn_id: runtime.provider_turn_id,
             turn_id: runtime.turn_id,
             runtime_source: runtime.source,
@@ -15165,6 +15489,40 @@ mod terminal_tests {
             vec!["--session".to_string(), "opencode-session-1".to_string()]
         );
         assert!(terminal_provider_resume_args(AgentProvider::Codex, Some("   ")).is_empty());
+    }
+
+    #[test]
+    fn provider_fork_args_are_provider_specific() {
+        assert_eq!(
+            terminal_provider_fork_args(AgentProvider::Codex, Some("codex-session-1")),
+            vec!["fork".to_string(), "codex-session-1".to_string()]
+        );
+        assert_eq!(
+            terminal_provider_fork_args(AgentProvider::Claude, Some("claude-session-1")),
+            vec![
+                "--resume".to_string(),
+                "claude-session-1".to_string(),
+                "--fork-session".to_string(),
+            ]
+        );
+        assert_eq!(
+            terminal_provider_fork_args(AgentProvider::OpenCode, Some("opencode-session-1")),
+            vec![
+                "--session".to_string(),
+                "opencode-session-1".to_string(),
+                "--fork".to_string(),
+            ]
+        );
+        assert!(terminal_provider_fork_args(AgentProvider::Codex, Some("   ")).is_empty());
+    }
+
+    #[test]
+    fn app_fork_prompt_matcher_is_exact() {
+        assert!(terminal_prompt_is_app_fork_command("fork"));
+        assert!(terminal_prompt_is_app_fork_command("  fork  "));
+        assert!(terminal_prompt_is_app_fork_command("FORK"));
+        assert!(!terminal_prompt_is_app_fork_command("/fork"));
+        assert!(!terminal_prompt_is_app_fork_command("fork please"));
     }
 
     #[test]
@@ -16244,6 +16602,7 @@ mod terminal_tests {
             completed_at: None,
             provider_session_id: None,
             native_session_id: None,
+            fork_from_provider_session_id: None,
             provider_turn_id: Some("turn-1".to_string()),
             turn_id: Some("turn-1".to_string()),
             source: "test".to_string(),
@@ -16302,6 +16661,7 @@ mod terminal_tests {
             completed_at: None,
             provider_session_id: Some("session-1".to_string()),
             native_session_id: Some("session-1".to_string()),
+            fork_from_provider_session_id: None,
             provider_turn_id: Some("turn-1".to_string()),
             turn_id: Some("turn-1".to_string()),
             source: "backend:prompt-submitted".to_string(),

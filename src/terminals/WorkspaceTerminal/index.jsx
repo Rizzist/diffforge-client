@@ -18,6 +18,7 @@ import {
   TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL,
   TERMINAL_WINDOW_CONTROL_EVENT,
   TERMINAL_WINDOW_CONTROL_FONT_SIZE,
+  TERMINAL_WINDOW_CONTROL_FORK,
   TERMINAL_WINDOW_CONTROL_FULLSCREEN,
   TERMINAL_WINDOW_CONTROL_RESTART_AS,
   TERMINAL_WINDOW_CONTROL_SPLIT_HORIZONTAL,
@@ -430,6 +431,7 @@ import {
   TERMINAL_INPUT_BATCH_MS,
   TERMINAL_INPUT_EVENT,
   TERMINAL_INPUT_ERROR_EVENT,
+  TERMINAL_FORK_REQUESTED_EVENT,
   TERMINAL_INPUT_HOT_EVENT,
   TERMINAL_MAX_COLS,
   TERMINAL_MAX_ROWS,
@@ -723,6 +725,7 @@ function invokeTerminalInputPayload(payload) {
     data: payload?.data || "",
     instanceId: payload?.instanceId,
     paneId: payload?.paneId,
+    appForkEnabled: payload?.appForkEnabled === true,
     promptEventId: payload?.promptEventId,
     promptEventRevision: payload?.promptEventRevision,
     promptEventSource: payload?.promptEventSource,
@@ -2055,6 +2058,7 @@ function WorkspaceTerminal({
   onRecheckAgents,
   onBeginTerminalDrag,
   onCreateWorkspaceThreadTerminal,
+  onForkTerminal,
   onSplitTerminal,
   onSelectWorkspaceThread,
   onToggleWorkspaceThreadPinned,
@@ -2198,6 +2202,9 @@ function WorkspaceTerminal({
   const preserveCoordinationOnNextOpenRef = useRef(false);
   const forceFreshSessionOnNextOpenRef = useRef(false);
   const providerSessionOverrideOnNextOpenRef = useRef("");
+  const forkFromProviderSessionOnNextOpenRef = useRef("");
+  const forkTerminalActionRef = useRef(null);
+  const canRequestForkTerminalRef = useRef(false);
   const parkedPromptRef = useRef(null);
   const cancellingParkedPromptKeysRef = useRef(new Set());
   const threadComposerDraftsRef = useRef(getWorkspaceThreadComposerDraftStore());
@@ -5710,7 +5717,13 @@ function WorkspaceTerminal({
     const providerSessionOverrideForThisStart = forceFreshSessionForThisStart
       ? ""
       : String(providerSessionOverrideOnNextOpenRef.current || "").trim();
-    const startupThreadProviderSessionId = forceFreshSessionForThisStart
+    const forkFromProviderSessionIdForThisStart = forceFreshSessionForThisStart
+      ? ""
+      : String(forkFromProviderSessionOnNextOpenRef.current || "").trim();
+    const startupThreadProviderSessionId = (
+      forceFreshSessionForThisStart
+      || forkFromProviderSessionIdForThisStart
+    )
       ? ""
       : providerSessionOverrideForThisStart || threadProviderSessionId;
     const startupDefaultLaunch = isGenericTerminal
@@ -5747,6 +5760,7 @@ function WorkspaceTerminal({
     preserveCoordinationOnNextOpenRef.current = false;
     forceFreshSessionOnNextOpenRef.current = false;
     providerSessionOverrideOnNextOpenRef.current = "";
+    forkFromProviderSessionOnNextOpenRef.current = "";
     if (forceFreshSessionForThisStart) {
       terminalThreadSlotKeyRef.current = startupSlotKey;
     }
@@ -11487,6 +11501,7 @@ function WorkspaceTerminal({
               paneId,
               instanceId: terminalInstanceId,
               data,
+              appForkEnabled: canRequestForkTerminalRef.current === true && hasOpenPty,
               promptEventId: promptEventId || undefined,
               promptEventRevision: Number.isFinite(promptEventRevision) ? promptEventRevision : undefined,
               promptEventSource: promptEventSource || undefined,
@@ -12509,12 +12524,30 @@ function WorkspaceTerminal({
               syncCurrentTerminalComposerDraft(terminalSubmittedInputText);
             }
             const promptTextAtSubmit = submitPromptResolution.promptText;
+            const submittedTerminalCommand = String(promptTextAtSubmit || "").trim().toLowerCase();
             const isControlHistoryPrompt = isTerminalControlHistoryPrompt(promptTextAtSubmit);
+            const isAppForkCommandSubmit = Boolean(
+              terminalSubmittedInputHasText
+              && submittedTerminalCommand === "fork"
+              && !isGenericTerminal
+              && canRequestForkTerminalRef.current,
+            );
             const shouldSuppressSubmitLifecycle = Boolean(
               isControlHistoryPrompt
               || isControlViewportPrompt
               || isControlSuppressedScreenSubmit
+              || isAppForkCommandSubmit
             );
+            if (isAppForkCommandSubmit) {
+              logBigViewSyncDiagnosticEvent("tui.text.fork_command_defer_to_backend", {
+                agentId: terminalAgentKind,
+                instanceId: terminalInstanceId,
+                paneId,
+                terminalIndex,
+                threadId: terminalThreadIdRef.current || "",
+                workspaceId: workspace?.id || "",
+              });
+            }
             if (
               terminalSubmittedInputHasText
               && promptTextAtSubmit
@@ -12606,7 +12639,9 @@ function WorkspaceTerminal({
                 instanceId: terminalInstanceId,
                 paneId,
                 promptResolutionSource: submitPromptResolution.source,
-                reason: isControlViewportPrompt
+                reason: isAppForkCommandSubmit
+                  ? "app_fork_command"
+                  : isControlViewportPrompt
                   ? "control_viewport_prompt"
                   : isControlSuppressedScreenSubmit
                     ? "control_ui_suppressed_screen_reconciled"
@@ -13417,6 +13452,7 @@ function WorkspaceTerminal({
               provider: openProvider,
               freshSession: forceFreshSessionForThisStart,
               providerSessionId: startupThreadProviderSessionId,
+              forkFromProviderSessionId: forkFromProviderSessionIdForThisStart,
               model: startupThreadProviderModel,
               reasoningEffort: startupThreadProviderEffort,
               speed: startupThreadProviderSpeed,
@@ -13495,6 +13531,17 @@ function WorkspaceTerminal({
             : startupThreadProviderSessionId || "",
         ).trim();
         const openedNativeSessionId = String(openResult?.nativeSessionId || openedProviderSessionId).trim();
+        const openedForkFromProviderSessionId = String(
+          openResult?.forkFromProviderSessionId
+            || openResult?.fork_from_provider_session_id
+            || forkFromProviderSessionIdForThisStart
+            || "",
+        ).trim();
+        const openedSharedHistoryId = String(
+          openResult?.sharedHistoryId
+            || openResult?.shared_history_id
+            || "",
+        ).trim();
         const openedActivityStatus = normalizeTerminalEpochActivityStatus(
           openResult?.activityStatus || "idle",
           terminalAgentKind,
@@ -13527,6 +13574,7 @@ function WorkspaceTerminal({
           preserveCoordinationForThisStart,
           sessionMode: openResult?.sessionMode || sessionModeForThisStart,
           providerSessionOverridePresent: Boolean(providerSessionOverrideForThisStart),
+          forkFromProviderSessionPresent: Boolean(openedForkFromProviderSessionId),
           openedProviderModel,
           openedProviderModelSource,
           startupThreadProviderModel: startupThreadProviderModel || "",
@@ -13557,12 +13605,16 @@ function WorkspaceTerminal({
           modelSource: openedProviderModelSource,
           reasoningEffort: startupThreadProviderEffort,
           speed: startupThreadProviderSpeed,
+          forkFromProviderSessionId: openedForkFromProviderSessionId,
           nativeSessionId: openedNativeSessionId,
+          nativeSessionIdCleared: Boolean(openedForkFromProviderSessionId),
           nativeSessionKind: openedNativeSessionId ? "session" : "",
           nativeSessionSource: openedNativeSessionId ? "session-restore" : "",
           paneId,
           providerSessionId: openedProviderSessionId || openedNativeSessionId,
+          providerSessionIdCleared: Boolean(openedForkFromProviderSessionId),
           sessionId: openResult?.sessionId || "",
+          sharedHistoryId: openedSharedHistoryId,
           sessionMode: openResult?.sessionMode || sessionModeForThisStart,
           fileAuthority: openResult?.fileAuthority || "",
           slotKey: openResult?.slotKey || terminalThreadSlotKeyRef.current,
@@ -13618,7 +13670,9 @@ function WorkspaceTerminal({
           model: startupThreadProviderModel,
           needsAgentStart: shouldPrewarmShell,
           paneId,
+          forkFromProviderSessionId: openedForkFromProviderSessionId,
           providerSessionId: openedProviderSessionId || openedNativeSessionId,
+          sharedHistoryId: openedSharedHistoryId,
           permissionMode: startupPermissionMode,
           ready: true,
           reasoningEffort: startupThreadProviderEffort,
@@ -13846,6 +13900,7 @@ function WorkspaceTerminal({
         agentId: agent?.id || "",
         instanceId: terminalInstanceId,
         paneId,
+        forkFromProviderSessionId: forkFromProviderSessionIdForThisStart,
         providerSessionId: startupThreadProviderSessionId,
         permissionMode: String(permissionMode || "").trim(),
         ready: false,
@@ -15585,6 +15640,23 @@ function WorkspaceTerminal({
     && (terminalHorizontalSplitAllowed || terminalVerticalSplitAllowed);
   const canSplitTerminalHorizontally = canSplitTerminal && terminalHorizontalSplitAllowed;
   const canSplitTerminalVertically = canSplitTerminal && terminalVerticalSplitAllowed;
+  const forkSourceProviderSessionId = String(threadProviderSessionId || "").trim();
+  const canRequestForkTerminal = !threadsViewActive
+    && !isGenericTerminal
+    && !terminalClosed
+    && !terminalClosing
+    && typeof onForkTerminal === "function"
+    && terminalCount < normalizedTerminalSplitLimit;
+  const canForkTerminal = canRequestForkTerminal && terminalState === "running";
+  const forkTerminalTitle = isGenericTerminal
+    ? "Shell terminals do not have provider sessions to fork"
+    : threadsViewActive
+      ? "Exit threads view to fork"
+      : terminalCount >= normalizedTerminalSplitLimit
+        ? "Terminal limit reached"
+        : terminalState === "running"
+          ? "Fork this session"
+          : "Terminal must be running to fork";
   const canOpenTerminalUiView = !threadsViewActive
     && !terminalClosed
     && !terminalClosing
@@ -15783,6 +15855,222 @@ function WorkspaceTerminal({
   const splitTerminalVertical = useCallback(() => {
     splitTerminal("horizontal");
   }, [splitTerminal]);
+  const forkTerminalHere = useCallback((providerSessionIdOverride = "") => {
+    const sourceProviderSessionId = String(
+      providerSessionIdOverride || forkSourceProviderSessionId || "",
+    ).trim();
+    if (!canRequestForkTerminal || !sourceProviderSessionId) {
+      return;
+    }
+
+    const currentThreadId = terminalThreadIdRef.current || thread?.id || "";
+    const result = onForkTerminal?.({
+      agentId: terminalAgentKind,
+      forkFromProviderSessionId: sourceProviderSessionId,
+      model: threadProviderModel,
+      paneId,
+      providerSessionId: sourceProviderSessionId,
+      role: terminalAgentKind,
+      sessionTitle: thread?.sessionName || thread?.title || "Original session",
+      source: "terminal_fork_original",
+      terminalIndex,
+      threadId: currentThreadId,
+      workspaceId: workspace?.id || "",
+    });
+
+    if (!result) {
+      return;
+    }
+
+    setRestartRoleMenuOpen(false);
+    setTerminalClosed(false);
+    setTerminalClosing(false);
+    terminalClosingRef.current = false;
+    preserveCoordinationOnNextCleanupRef.current = false;
+    preserveCoordinationOnNextOpenRef.current = false;
+    forceFreshSessionOnNextOpenRef.current = false;
+    providerSessionOverrideOnNextOpenRef.current = "";
+    forkFromProviderSessionOnNextOpenRef.current = sourceProviderSessionId;
+    resetTerminalReadinessForEpoch({
+      activityStatus: "idle",
+      agentId: terminalAgentKind,
+      instanceId: 0,
+      reason: "terminal_fork_here",
+      threadId: currentThreadId,
+    });
+    onThreadTerminalLifecycle?.({
+      activityStatus: "idle",
+      agentId: terminalAgentKind,
+      commandPhase: "starting",
+      forkFromProviderSessionId: sourceProviderSessionId,
+      inputReady: false,
+      instanceId: terminalInstanceIdRef.current || undefined,
+      nativeSessionId: "",
+      nativeSessionIdCleared: true,
+      nativeSessionKind: "",
+      nativeSessionSource: "",
+      paneId,
+      providerSessionId: "",
+      providerSessionIdCleared: true,
+      status: "starting",
+      statusTruth: "running",
+      terminalIndex,
+      terminalWorkState: "running",
+      threadId: currentThreadId,
+      type: "opened",
+      workspaceId: workspace?.id || "",
+    });
+    logThreadBridgeDiagnostic("frontend.terminal_fork_here", {
+      agentId: terminalAgentKind,
+      paneId,
+      providerSessionPresent: true,
+      terminalIndex,
+      threadId: currentThreadId,
+      workspaceId: workspace?.id || "",
+    });
+    setTerminalState("starting");
+    setTerminalError("");
+    setTerminalLaunchInfo(null);
+    setParkedPrompt(null);
+    parkedPromptRef.current = null;
+    setTerminalStatus({
+      detail: "Starting a fork from the current provider session.",
+      title: "Forking Session",
+      visible: true,
+    });
+    setRestartKey((key) => key + 1);
+  }, [
+    canRequestForkTerminal,
+    forkSourceProviderSessionId,
+    onForkTerminal,
+    onThreadTerminalLifecycle,
+    paneId,
+    terminalAgentKind,
+    terminalIndex,
+    thread?.id,
+    thread?.sessionName,
+    thread?.title,
+    threadProviderModel,
+    workspace?.id,
+  ]);
+  const requestForkTerminal = useCallback(() => {
+    if (!canForkTerminal) {
+      return;
+    }
+
+    const currentInstanceId = terminalInstanceIdRef.current || 0;
+    invoke("terminal_request_fork", {
+      paneId,
+      instanceId: currentInstanceId || undefined,
+    })
+      .then(() => {
+        logBigViewSyncDiagnosticEvent("tui.text.fork_button_backend_requested", {
+          agentId: terminalAgentKind,
+          instanceId: currentInstanceId,
+          paneId,
+          terminalIndex,
+          threadId: terminalThreadIdRef.current || "",
+          workspaceId: workspace?.id || "",
+        });
+      })
+      .catch((error) => {
+        setTerminalError(getErrorMessage(error, "Unable to fork this session right now."));
+        logBigViewSyncDiagnosticEvent("tui.text.fork_button_backend_error", {
+          agentId: terminalAgentKind,
+          instanceId: currentInstanceId,
+          message: error?.message || String(error || ""),
+          paneId,
+          terminalIndex,
+          threadId: terminalThreadIdRef.current || "",
+          workspaceId: workspace?.id || "",
+        });
+      });
+  }, [
+    canForkTerminal,
+    paneId,
+    terminalAgentKind,
+    terminalIndex,
+    workspace?.id,
+  ]);
+  useEffect(() => {
+    canRequestForkTerminalRef.current = canRequestForkTerminal;
+    forkTerminalActionRef.current = forkTerminalHere;
+  }, [
+    canRequestForkTerminal,
+    forkTerminalHere,
+  ]);
+  useEffect(() => {
+    if (!paneId) {
+      return undefined;
+    }
+
+    let disposed = false;
+    let unlisten = () => {};
+    listen(TERMINAL_FORK_REQUESTED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+
+      const payload = event.payload || {};
+      if (String(payload.paneId || "") !== paneId) {
+        return;
+      }
+
+      const eventInstanceId = Number(payload.instanceId || 0);
+      const currentInstanceId = Number(terminalInstanceIdRef.current || 0);
+      if (eventInstanceId && currentInstanceId && eventInstanceId !== currentInstanceId) {
+        return;
+      }
+
+      const providerSessionId = String(payload.providerSessionId || "").trim();
+      if (
+        !canRequestForkTerminalRef.current
+        || !providerSessionId
+        || typeof forkTerminalActionRef.current !== "function"
+      ) {
+        setTerminalError("Unable to fork this session right now.");
+        logBigViewSyncDiagnosticEvent("tui.text.fork_command_backend_unavailable", {
+          agentId: terminalAgentKind,
+          instanceId: currentInstanceId,
+          paneId,
+          providerSessionPresent: Boolean(providerSessionId),
+          terminalIndex,
+          threadId: terminalThreadIdRef.current || "",
+          workspaceId: workspace?.id || "",
+        });
+        return;
+      }
+
+      logBigViewSyncDiagnosticEvent("tui.text.fork_command_backend_event", {
+        agentId: terminalAgentKind,
+        instanceId: currentInstanceId,
+        paneId,
+        providerSessionPresent: Boolean(payload.providerSessionId),
+        terminalIndex,
+        threadId: terminalThreadIdRef.current || "",
+        workspaceId: workspace?.id || "",
+      });
+      forkTerminalActionRef.current(providerSessionId);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [
+    paneId,
+    terminalAgentKind,
+    terminalIndex,
+    workspace?.id,
+  ]);
   const toggleTerminalFullscreen = useCallback(() => {
     if (terminalClosed || terminalClosing) {
       return;
@@ -15855,6 +16143,7 @@ function WorkspaceTerminal({
       agentKind: terminalAgentKind,
       agentLabel: terminalRailAgentLabel,
       agentTitle: terminalRailAgentTitle,
+      canFork: canForkTerminal,
       canOpenUiView: canOpenTerminalUiView,
       canSplit: canSplitTerminal,
       colorSlot: getTerminalAgentColorSlot(terminalIndex),
@@ -15920,6 +16209,9 @@ function WorkspaceTerminal({
         case TERMINAL_WINDOW_CONTROL_FONT_SIZE:
           setTerminalFontSizeFromWindow(event.payload?.fontSize);
           break;
+        case TERMINAL_WINDOW_CONTROL_FORK:
+          requestForkTerminal();
+          break;
         case TERMINAL_WINDOW_CONTROL_RESTART_AS:
           restartTerminalAs(String(event.payload?.roleId || "") || undefined);
           break;
@@ -15957,6 +16249,7 @@ function WorkspaceTerminal({
   }, [
     closeTerminal,
     paneId,
+    requestForkTerminal,
     restartTerminalAs,
     setTerminalFontSizeFromWindow,
     splitTerminalHorizontal,
@@ -16223,6 +16516,15 @@ function WorkspaceTerminal({
             type="button"
           >
             <ButtonFontPlusIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Fork terminal session"
+            disabled={!canForkTerminal}
+            onClick={requestForkTerminal}
+            title={forkTerminalTitle}
+            type="button"
+          >
+            <ButtonForgeIcon aria-hidden="true" />
           </TerminalRestartButton>
           {(!terminalChromeDocked || terminalSplitModeId !== "both") && (
             <>

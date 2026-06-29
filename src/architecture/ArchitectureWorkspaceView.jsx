@@ -9701,11 +9701,21 @@ function sessionHistoryRowKey(item, index = 0) {
 }
 
 function sessionHistoryExactSessionValues(value) {
-  return [
+  const values = [
     value?.providerSessionId,
     value?.provider_session_id,
     value?.nativeSessionId,
     value?.native_session_id,
+    value?.forkFromProviderSessionId,
+    value?.fork_from_provider_session_id,
+    value?.forkedFromProviderSessionId,
+    value?.forked_from_provider_session_id,
+    value?.sharedHistoryId,
+    value?.shared_history_id,
+    value?.historyGroupId,
+    value?.history_group_id,
+    value?.relatedProviderSessionIds,
+    value?.related_provider_session_ids,
     value?.currentProviderSessionId,
     value?.current_provider_session_id,
     value?.currentNativeSessionId,
@@ -9714,7 +9724,20 @@ function sessionHistoryExactSessionValues(value) {
     value?.transcript_session_id,
     value?.sessionId,
     value?.session_id,
-  ]
+  ];
+  const flattened = [];
+  const append = (entry) => {
+    if (Array.isArray(entry)) {
+      entry.forEach(append);
+      return;
+    }
+    const cleaned = text(entry);
+    if (cleaned) {
+      cleaned.split(",").map((item) => text(item)).filter(Boolean).forEach((item) => flattened.push(item));
+    }
+  };
+  values.forEach(append);
+  return flattened
     .map((entry) => text(entry))
     .filter(Boolean);
 }

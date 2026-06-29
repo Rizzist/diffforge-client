@@ -197,6 +197,7 @@ const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progre
 const TERMINAL_AUDIO_INPUT_REFOCUS_EVENT: &str = "forge-terminal-audio-input-refocus";
 const TERMINAL_INPUT_EVENT: &str = "forge-terminal-input";
 const TERMINAL_INPUT_ERROR_EVENT: &str = "forge-terminal-input-error";
+const TERMINAL_FORK_REQUESTED_EVENT: &str = "forge-terminal-fork-requested";
 const TERMINAL_PROMPT_SUBMITTED_EVENT: &str = "forge-terminal-prompt-submitted";
 const TERMINAL_ACTIVITY_HOOK_EVENT: &str = "forge-terminal-activity-hook";
 const TERMINAL_PROVIDER_SESSION_BOUND_EVENT: &str = "forge-terminal-provider-session-bound";
@@ -990,6 +991,7 @@ struct TerminalRuntimeSnapshot {
     completed_at: Option<String>,
     provider_session_id: Option<String>,
     native_session_id: Option<String>,
+    fork_from_provider_session_id: Option<String>,
     provider_turn_id: Option<String>,
     turn_id: Option<String>,
     source: String,
@@ -1023,6 +1025,7 @@ impl TerminalRuntimeSnapshot {
             completed_at: None,
             provider_session_id,
             native_session_id,
+            fork_from_provider_session_id: None,
             provider_turn_id: None,
             turn_id: None,
             source: source.to_string(),
@@ -1371,7 +1374,7 @@ struct TerminalParkedPromptPayload {
     workspace_name: Option<String>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TerminalInputGate {
     current_line: String,
     current_line_user_touched: bool,
@@ -1877,6 +1880,7 @@ struct TerminalOpenRequest {
     agent_kind: Option<String>,
     provider: Option<String>,
     provider_session_id: Option<String>,
+    fork_from_provider_session_id: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
     speed: Option<String>,
@@ -1909,6 +1913,7 @@ struct TerminalStartAgentRequest {
     instance_id: Option<u64>,
     provider: String,
     provider_session_id: Option<String>,
+    fork_from_provider_session_id: Option<String>,
     model: Option<String>,
     reasoning_effort: Option<String>,
     speed: Option<String>,
@@ -1954,6 +1959,8 @@ struct TerminalOpenResult {
     file_authority: String,
     provider_session_id: Option<String>,
     native_session_id: Option<String>,
+    fork_from_provider_session_id: Option<String>,
+    shared_history_id: Option<String>,
     requested_provider_session_id: Option<String>,
     model: Option<String>,
     model_source: Option<String>,
@@ -2000,6 +2007,7 @@ struct TerminalInputEventPayload {
     pane_id: String,
     instance_id: Option<u64>,
     data: String,
+    app_fork_enabled: Option<bool>,
     prompt_event_id: Option<String>,
     prompt_event_revision: Option<u64>,
     prompt_event_source: Option<String>,
@@ -2011,6 +2019,19 @@ struct TerminalInputEventPayload {
     todo_action: Option<String>,
     todo_resume_requested: Option<bool>,
     thread_id: Option<String>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalForkRequestedPayload {
+    pane_id: String,
+    instance_id: u64,
+    workspace_id: String,
+    terminal_index: Option<u16>,
+    thread_id: String,
+    agent_id: String,
+    agent_kind: String,
+    provider_session_id: String,
 }
 
 #[derive(Serialize, Clone)]
@@ -2089,6 +2110,7 @@ struct TerminalActivityHookPayload {
     completed_at: Option<String>,
     provider_session_id: Option<String>,
     native_session_id: Option<String>,
+    fork_from_provider_session_id: Option<String>,
     provider_turn_id: Option<String>,
     turn_id: Option<String>,
     transcript_path: Option<String>,
@@ -5231,6 +5253,7 @@ pub fn run() {
             set_terminal_audio_route_gate,
             terminal_write_to_audio_input_target,
             terminal_write,
+            terminal_request_fork,
             terminal_input_transport_endpoint,
             terminal_output_transport_endpoint,
             app_control_mcp_reply,

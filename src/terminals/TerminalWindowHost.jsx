@@ -11,6 +11,7 @@ import {
   ButtonBrowserIcon,
   ButtonCloseIcon,
   ButtonDragIcon,
+  ButtonForgeIcon,
   ButtonFullscreenIcon,
   ButtonRefreshIcon,
   ButtonSplitHorizontalIcon,
@@ -34,6 +35,7 @@ import {
   TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL,
   TERMINAL_WINDOW_CONTROL_EVENT,
   TERMINAL_WINDOW_CONTROL_FONT_SIZE,
+  TERMINAL_WINDOW_CONTROL_FORK,
   TERMINAL_WINDOW_CONTROL_FULLSCREEN,
   TERMINAL_WINDOW_CONTROL_RESTART_AS,
   TERMINAL_WINDOW_CONTROL_SPLIT_HORIZONTAL,
@@ -301,6 +303,7 @@ export default function TerminalWindowHost() {
     agentKind: params.agentKind,
     agentLabel: params.agentLabel,
     agentTitle: params.agentLabel,
+    canFork: false,
     canOpenUiView: false,
     canSplit: true,
     colorSlot: params.colorSlot,
@@ -804,6 +807,15 @@ export default function TerminalWindowHost() {
             type="button"
           >
             <ButtonFontPlusIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Fork terminal session"
+            disabled={!meta.canFork}
+            onClick={() => sendControl(TERMINAL_WINDOW_CONTROL_FORK)}
+            title={meta.canFork ? "Fork this session" : "Waiting for provider session id"}
+            type="button"
+          >
+            <ButtonForgeIcon aria-hidden="true" />
           </TerminalRestartButton>
           <TerminalRestartButton
             aria-label="Split terminal horizontally"

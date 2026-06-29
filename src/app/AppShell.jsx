@@ -3817,6 +3817,9 @@ const DEFAULT_WORKSPACE_DOCUMENT_COUNT = 0;
 const MIN_WORKSPACE_WEB_PANEL_COUNT = 0;
 const MAX_WORKSPACE_WEB_PANEL_COUNT = 8;
 const DEFAULT_WORKSPACE_WEB_PANEL_COUNT = 0;
+const MIN_WORKSPACE_PCB_COUNT = 0;
+const MAX_WORKSPACE_PCB_COUNT = 6;
+const DEFAULT_WORKSPACE_PCB_COUNT = 0;
 const WORKSPACE_TERMINAL_PRIMARY_COLUMNS = 2;
 const WORKSPACE_TERMINAL_WIDE_START_INDEX = 4;
 const WORKSPACE_TERMINAL_WIDE_COLUMNS = 4;
@@ -13244,6 +13247,7 @@ const WORKSPACE_PANEL_CARDS = [
     id: "pcb-design",
     label: "PCB Design",
     statusLabel: "ready",
+    maxCount: MAX_WORKSPACE_PCB_COUNT,
   },
   {
     id: "simulator-3d",
@@ -13480,7 +13484,7 @@ function WorkspaceCreatePanel({
   const [browseError, setBrowseError] = useState("");
   const [cdDraft, setCdDraft] = useState("");
   const [agentCounts, setAgentCounts] = useState({});
-  const [panelCounts, setPanelCounts] = useState({ document: DEFAULT_WORKSPACE_DOCUMENT_COUNT, web: DEFAULT_WORKSPACE_WEB_PANEL_COUNT });
+  const [panelCounts, setPanelCounts] = useState({ document: DEFAULT_WORKSPACE_DOCUMENT_COUNT, web: DEFAULT_WORKSPACE_WEB_PANEL_COUNT, "pcb-design": DEFAULT_WORKSPACE_PCB_COUNT });
   const [agentPermissions, setAgentPermissions] = useState({});
   const [agentSessionModeDraft, setAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
   const [initializeGitDraft, setInitializeGitDraft] = useState(false);
@@ -13674,6 +13678,17 @@ function WorkspaceCreatePanel({
         }
         return { ...current, web: nextValue };
       });
+      return;
+    }
+    if (panelId === "pcb-design") {
+      setPanelCounts((current) => {
+        const currentValue = normalizeWorkspacePcbCount(current["pcb-design"]);
+        const nextValue = normalizeWorkspacePcbCount(currentValue + Number(delta || 0));
+        if (nextValue === currentValue) {
+          return current;
+        }
+        return { ...current, "pcb-design": nextValue };
+      });
     }
   }, []);
 
@@ -13701,7 +13716,8 @@ function WorkspaceCreatePanel({
   const availablePanelCounts = useMemo(() => ({
     document: normalizeWorkspaceDocumentCount(panelCounts.document),
     web: normalizeWorkspaceWebPanelCount(panelCounts.web),
-  }), [panelCounts.document, panelCounts.web]);
+    "pcb-design": normalizeWorkspacePcbCount(panelCounts["pcb-design"]),
+  }), [panelCounts.document, panelCounts.web, panelCounts["pcb-design"]]);
 
   useEffect(() => {
     if (!visible) {
@@ -14064,7 +14080,7 @@ function WorkspaceCreatePanel({
         <WorkspaceCreateSection>
           <SettingsLabel>Panels</SettingsLabel>
           <SettingsHint>
-            Pick non-terminal workspace panels. Web panels open in the terminals grid and can be driven, split, and popped out.
+            Pick non-terminal workspace panels. Web panels open in the terminals grid; PCB design panels open in the PCB tab. You can add or remove either later too.
           </SettingsHint>
           <WorkspacePanelCountCards
             counts={availablePanelCounts}
@@ -16014,6 +16030,26 @@ function cleanAppCloseText(value, fallback = "") {
   return text || fallback;
 }
 
+function cleanAppCloseTextArray(...values) {
+  const result = [];
+  const append = (value) => {
+    if (Array.isArray(value)) {
+      value.forEach(append);
+      return;
+    }
+    if (value == null) {
+      return;
+    }
+    cleanAppCloseText(value)
+      .split(",")
+      .map((entry) => cleanAppCloseText(entry))
+      .filter(Boolean)
+      .forEach((entry) => result.push(entry));
+  };
+  values.forEach(append);
+  return Array.from(new Set(result));
+}
+
 function terminalNameGenericKey(value) {
   return String(value || "")
     .trim()
@@ -16169,6 +16205,27 @@ function normalizeTerminalLiveSessionsPayload(payload) {
             || session.sessionId
             || session.session_id,
         );
+        const forkFromProviderSessionId = cleanAppCloseText(
+          session.forkFromProviderSessionId
+            || session.fork_from_provider_session_id
+            || session.forkedFromProviderSessionId
+            || session.forked_from_provider_session_id
+            || session.parentProviderSessionId
+            || session.parent_provider_session_id,
+        );
+        const sharedHistoryId = cleanAppCloseText(
+          session.sharedHistoryId
+            || session.shared_history_id
+            || session.historyGroupId
+            || session.history_group_id,
+        );
+        const relatedProviderSessionIds = cleanAppCloseTextArray(
+          session.relatedProviderSessionIds,
+          session.related_provider_session_ids,
+          session.relatedSessionIds,
+          session.related_session_ids,
+          forkFromProviderSessionId,
+        ).filter((sessionId) => sessionId !== providerSessionId);
         const sessionAgentId = cleanAppCloseText(
           session.agentId || session.agent_id || session.agentKind || session.agent_kind,
         );
@@ -16194,6 +16251,8 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           displayName: terminalName,
           executionPhase,
           fileAuthority: cleanAppCloseText(session.fileAuthority || session.file_authority),
+          forkFromProviderSessionId,
+          fork_from_provider_session_id: forkFromProviderSessionId,
           hasActiveTask: session.hasActiveTask === true || session.has_active_task === true || Boolean(activeTask),
           instanceId,
           inputReady: session.inputReady === true || session.input_ready === true,
@@ -16207,12 +16266,16 @@ function normalizeTerminalLiveSessionsPayload(payload) {
           parkedPrompt,
           providerSessionId,
           provider_session_id: providerSessionId,
+          relatedProviderSessionIds,
+          related_provider_session_ids: relatedProviderSessionIds,
           readiness,
           runtimeUpdatedAtMs: normalizeCloseCount(session.runtimeUpdatedAtMs || session.runtime_updated_at_ms),
           sessionId: providerSessionId,
           session_id: providerSessionId,
           sessionMode: cleanAppCloseText(session.sessionMode || session.session_mode),
           sessionState: cleanAppCloseText(session.sessionState || session.session_state),
+          sharedHistoryId,
+          shared_history_id: sharedHistoryId,
           status: terminalStatus,
           surfaceKind: cleanAppCloseText(session.surfaceKind || session.surface_kind),
           targetTerminalId,
@@ -17132,12 +17195,28 @@ function normalizeWorkspaceDocumentCount(value) {
   return Math.min(MAX_WORKSPACE_DOCUMENT_COUNT, Math.max(MIN_WORKSPACE_DOCUMENT_COUNT, count));
 }
 
+function normalizeWorkspacePcbCount(value) {
+  const count = Number.parseInt(value, 10);
+  if (!Number.isFinite(count)) {
+    return DEFAULT_WORKSPACE_PCB_COUNT;
+  }
+  return Math.min(MAX_WORKSPACE_PCB_COUNT, Math.max(MIN_WORKSPACE_PCB_COUNT, count));
+}
+
 function getWorkspaceDocumentCount(workspaceSettings, workspaceId) {
   const settings = workspaceSettings?.[workspaceId];
   if (!settings || !Object.prototype.hasOwnProperty.call(settings, "documentsCount")) {
     return DEFAULT_WORKSPACE_DOCUMENT_COUNT;
   }
   return normalizeWorkspaceDocumentCount(settings.documentsCount);
+}
+
+function getWorkspacePcbCount(workspaceSettings, workspaceId) {
+  const settings = workspaceSettings?.[workspaceId];
+  if (!settings || !Object.prototype.hasOwnProperty.call(settings, "pcbCount")) {
+    return DEFAULT_WORKSPACE_PCB_COUNT;
+  }
+  return normalizeWorkspacePcbCount(settings.pcbCount);
 }
 
 function getWorkspaceTerminalRoleIds(roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS) {
@@ -17692,6 +17771,11 @@ function normalizeWorkspaceSettings(value) {
           ? normalizeWorkspaceDocumentCount(settings.documentsCount)
           : DEFAULT_WORKSPACE_DOCUMENT_COUNT;
         const hasDefaultDocumentsCount = documentsCount === DEFAULT_WORKSPACE_DOCUMENT_COUNT;
+        const hasPcbCount = Object.prototype.hasOwnProperty.call(settings || {}, "pcbCount");
+        const pcbCount = hasPcbCount
+          ? normalizeWorkspacePcbCount(settings.pcbCount)
+          : DEFAULT_WORKSPACE_PCB_COUNT;
+        const hasDefaultPcbCount = pcbCount === DEFAULT_WORKSPACE_PCB_COUNT;
         const paneKinds = normalizeWorkspacePaneKinds(settings?.paneKinds);
         const hasWebPanes = workspacePaneKindsHasWeb(paneKinds);
         const agentPermissions = normalizeWorkspaceAgentPermissions(settings?.agentPermissions);
@@ -17714,6 +17798,7 @@ function normalizeWorkspaceSettings(value) {
             && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
             && !hasCustomTerminalRoles
             && hasDefaultDocumentsCount
+            && hasDefaultPcbCount
             && !hasWebPanes
             && !hasCustomAgentPermissions
             && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
@@ -17733,6 +17818,7 @@ function normalizeWorkspaceSettings(value) {
             terminalCount,
             terminalRoles,
             documentsCount,
+            pcbCount,
             ...(hasWebPanes ? { paneKinds } : {}),
             agentPermissions,
           },
@@ -18789,6 +18875,7 @@ function getPreparedWorkspaceTerminalRequestKey(request, launchKey = "") {
     String(request.threadId || ""),
     String(request.provider || ""),
     String(request.providerSessionId || ""),
+    String(request.forkFromProviderSessionId || ""),
     String(request.model || ""),
     String(request.reasoningEffort || ""),
     String(request.speed || ""),
@@ -19420,6 +19507,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const hasTerminalCount = Object.prototype.hasOwnProperty.call(nextValues, "terminalCount");
   const hasTerminalRoles = Object.prototype.hasOwnProperty.call(nextValues, "terminalRoles");
   const hasDocumentsCount = Object.prototype.hasOwnProperty.call(nextValues, "documentsCount");
+  const hasPcbCount = Object.prototype.hasOwnProperty.call(nextValues, "pcbCount");
   const hasPaneKinds = Object.prototype.hasOwnProperty.call(nextValues, "paneKinds");
   const hasAgentPermissions = Object.prototype.hasOwnProperty.call(nextValues, "agentPermissions");
   const cleanedRootDirectory = cleanWorkspaceRootDirectory(
@@ -19465,6 +19553,14 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
         : DEFAULT_WORKSPACE_DOCUMENT_COUNT,
   );
   const hasDefaultDocumentsCount = documentsCount === DEFAULT_WORKSPACE_DOCUMENT_COUNT;
+  const pcbCount = normalizeWorkspacePcbCount(
+    hasPcbCount
+      ? nextValues.pcbCount
+      : Object.prototype.hasOwnProperty.call(currentSettings, "pcbCount")
+        ? currentSettings.pcbCount
+        : DEFAULT_WORKSPACE_PCB_COUNT,
+  );
+  const hasDefaultPcbCount = pcbCount === DEFAULT_WORKSPACE_PCB_COUNT;
   const paneKinds = normalizeWorkspacePaneKinds(
     hasPaneKinds ? nextValues.paneKinds : currentSettings.paneKinds,
   );
@@ -19494,6 +19590,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
     && !hasCustomTerminalRoles
     && hasDefaultDocumentsCount
+    && hasDefaultPcbCount
     && !hasWebPanes
     && !hasCustomAgentPermissions
     && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
@@ -19511,6 +19608,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     terminalCount,
     terminalRoles,
     documentsCount,
+    pcbCount,
     ...(hasWebPanes ? { paneKinds } : {}),
     agentPermissions,
   };
@@ -26199,6 +26297,7 @@ export default function App() {
       const documentsCount = normalizeWorkspaceDocumentCount(
         requestedPanelCounts?.document ?? requestedPanelCounts?.documents,
       );
+      const pcbCount = normalizeWorkspacePcbCount(requestedPanelCounts?.["pcb-design"]);
       const webPanelCount = normalizeWorkspaceWebPanelCount(requestedPanelCounts?.web);
       // Web panes occupy slots after the terminal slots. Their terminalRoles entry
       // is a never-read placeholder; paneKinds marks them so the grid renders a
@@ -26228,6 +26327,7 @@ export default function App() {
         rootGitRepository,
         agentSessionMode,
         documentsCount,
+        pcbCount,
         agentPermissions,
         ...(seededTerminalRoles
           ? { terminalCount: seededTerminalRoles.length, terminalRoles: seededTerminalRoles }
@@ -29436,6 +29536,9 @@ export default function App() {
     ? getWorkspaceDocumentCount(workspaceSettings, selectedWorkspace.id)
     : DEFAULT_WORKSPACE_DOCUMENT_COUNT;
   const selectedWorkspaceDocumentsEnabled = selectedWorkspaceDocumentCount > 0;
+  const selectedWorkspacePcbCount = selectedWorkspace && !shouldShowWorkspaceSetup
+    ? getWorkspacePcbCount(workspaceSettings, selectedWorkspace.id)
+    : DEFAULT_WORKSPACE_PCB_COUNT;
   const activatedWorkspaceTerminalCount = activatedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceTerminalCount(workspaceSettings, activatedWorkspace.id)
     : MIN_WORKSPACE_TERMINAL_COUNT;
@@ -42613,11 +42716,13 @@ export default function App() {
         agentId: session.agentId || "",
         agentStarted: session.agentStarted === true,
         instanceId: session.instanceId,
+        forkFromProviderSessionId: session.forkFromProviderSessionId || "",
         model: session.model || "",
         needsAgentStart: session.needsAgentStart === true,
         paneId: session.paneId,
         permissionMode: session.permissionMode || "",
         providerSessionId: session.providerSessionId || "",
+        sharedHistoryId: session.sharedHistoryId || "",
         threadId: session.threadId || "",
         terminalIndex: session.terminalIndex,
         workspaceId: session.workspaceId || "",
@@ -42625,6 +42730,7 @@ export default function App() {
       logWorkspaceActivationTrace("workspace.open.prepared_terminal.ready", session.workspaceId || "", {
         agentId: session.agentId || "",
         agentStarted: session.agentStarted === true,
+        hasForkFromProviderSessionId: Boolean(session.forkFromProviderSessionId),
         hasProviderSessionId: Boolean(session.providerSessionId),
         instanceId: session.instanceId || "",
         needsAgentStart: session.needsAgentStart === true,
@@ -42679,11 +42785,14 @@ export default function App() {
           thread,
           session.agentId,
         );
+        const forkFromProviderSessionId = String(session.forkFromProviderSessionId || "").trim();
         const providerSessionId = String(
-          session.providerSessionId
-            || providerBinding?.nativeSessionId
-            || thread?.transcriptSessionId
-            || "",
+          forkFromProviderSessionId
+            ? ""
+            : session.providerSessionId
+              || providerBinding?.nativeSessionId
+              || thread?.transcriptSessionId
+              || "",
         ).trim();
         const storedModel = String(session.model || providerBinding?.modelId || "").trim();
         const launchOptions = resolveWorkspaceAgentLaunchOptions({
@@ -42699,6 +42808,7 @@ export default function App() {
         return {
           instanceId: session.instanceId,
           agentStarted: session.agentStarted === true,
+          forkFromProviderSessionId,
           model,
           modelSource,
           needsAgentStart: session.needsAgentStart === true,
@@ -42707,6 +42817,7 @@ export default function App() {
           provider: session.agentId,
           providerSessionId,
           reasoningEffort: launchOptions.effort || "",
+          sharedHistoryId: session.sharedHistoryId || providerBinding?.sharedHistoryId || thread?.sharedHistoryId || "",
           speed: launchOptions.speed || "",
           threadId: thread?.id || session.threadId || "",
           terminalIndex: session.terminalIndex,
@@ -43062,15 +43173,20 @@ export default function App() {
           });
 
           const requestedStartProviderSessionId = String(request.providerSessionId || "").trim();
-          const startedProviderSessionId = String(request.provider || "").trim().toLowerCase() === "opencode"
+          const forkFromProviderSessionId = String(request.forkFromProviderSessionId || "").trim();
+          const shouldSuppressOpenCodeAliasSession = String(request.provider || "").trim().toLowerCase() === "opencode"
             && requestedStartProviderSessionId
-            && !requestedStartProviderSessionId.startsWith("ses_")
+            && !requestedStartProviderSessionId.startsWith("ses_");
+          const startedProviderSessionId = forkFromProviderSessionId
             ? ""
-            : requestedStartProviderSessionId;
+            : shouldSuppressOpenCodeAliasSession
+              ? ""
+              : requestedStartProviderSessionId;
           const terminalLifecycleEvent = {
             activityStatus: "idle",
             agentId: request.provider,
             commandPhase: "ready",
+            forkFromProviderSessionId,
             inputReady: true,
             inputReadyAt: new Date().toISOString(),
             inputReadyConfidence: "terminal-start-agent",
@@ -43078,10 +43194,13 @@ export default function App() {
             model: startedModel,
             modelSource: startedModelSource,
             nativeSessionId: startedProviderSessionId,
+            nativeSessionIdCleared: Boolean(forkFromProviderSessionId),
             nativeSessionKind: startedProviderSessionId ? "session" : "",
             nativeSessionSource: startedProviderSessionId ? "session-restore" : "",
             paneId: paneResult.paneId,
             providerSessionId: startedProviderSessionId,
+            providerSessionIdCleared: Boolean(forkFromProviderSessionId),
+            sharedHistoryId: request.sharedHistoryId || "",
             status: "active",
             statusTruth: "complete",
             terminalIndex: request.terminalIndex,
@@ -44637,7 +44756,7 @@ export default function App() {
                           <WorkspaceCreateSection>
                             <SettingsLabel>Panels</SettingsLabel>
                             <SettingsHint>
-                              Pick non-terminal workspace panels. Web panels open in the terminals grid and can be driven, split, and popped out.
+                              Pick non-terminal workspace panels. Web panels open in the terminals grid; PCB design panels open in the PCB tab. You can add or remove either later too.
                             </SettingsHint>
                             <WorkspacePanelCountCards
                               counts={workspaceSettingsPanelCounts}
@@ -45726,6 +45845,7 @@ export default function App() {
                     />
                   ) : selectedWorkspace ? (
                     <PcbView
+                      initialPanelCount={selectedWorkspacePcbCount}
                       rootDirectory={selectedWorkspaceFileRoot}
                       workspace={selectedWorkspace}
                     />

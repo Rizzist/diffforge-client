@@ -10855,12 +10855,32 @@ function getVoiceAgentHighlightSessionSummaryRefs(summary) {
 	      summary?.provider_session_id,
 	      summary?.nativeSessionId,
 	      summary?.native_session_id,
+	      summary?.forkFromProviderSessionId,
+	      summary?.fork_from_provider_session_id,
+	      summary?.forkedFromProviderSessionId,
+	      summary?.forked_from_provider_session_id,
+	      summary?.sharedHistoryId,
+	      summary?.shared_history_id,
+	      summary?.historyGroupId,
+	      summary?.history_group_id,
+	      summary?.relatedProviderSessionIds,
+	      summary?.related_provider_session_ids,
 	      summary?.sessionId,
 	      summary?.session_id,
 	      session?.providerSessionId,
 	      session?.provider_session_id,
 	      session?.nativeSessionId,
 	      session?.native_session_id,
+	      session?.forkFromProviderSessionId,
+	      session?.fork_from_provider_session_id,
+	      session?.forkedFromProviderSessionId,
+	      session?.forked_from_provider_session_id,
+	      session?.sharedHistoryId,
+	      session?.shared_history_id,
+	      session?.historyGroupId,
+	      session?.history_group_id,
+	      session?.relatedProviderSessionIds,
+	      session?.related_provider_session_ids,
 	      session?.sessionId,
 	      session?.session_id,
     ),
@@ -14205,11 +14225,30 @@ function getTodoQueueAgentSessionMetadata(item = {}) {
     }
   };
   textField("providerSessionId", "provider_session_id", "sessionId", "session_id");
+  textField(
+    "forkFromProviderSessionId",
+    "fork_from_provider_session_id",
+    "forkedFromProviderSessionId",
+    "forked_from_provider_session_id",
+    "parentProviderSessionId",
+    "parent_provider_session_id",
+  );
+  textField("sharedHistoryId", "shared_history_id", "historyGroupId", "history_group_id");
   textField("terminalId", "terminal_id", "targetTerminalId", "target_terminal_id", "paneId", "pane_id");
   textField("terminalInstanceId", "terminal_instance_id", "targetTerminalInstanceId", "target_terminal_instance_id", "instanceId", "instance_id");
   textField("threadId", "thread_id", "targetThreadId", "target_thread_id");
   textField("agentKind", "agent_kind", "agentType", "agent_type", "targetAgentId", "target_agent_id");
   textField("provider", "provider");
+  const relatedProviderSessionIds = getVoiceAgentHighlightStringValues(
+    item?.relatedProviderSessionIds,
+    item?.related_provider_session_ids,
+    item?.relatedSessionIds,
+    item?.related_session_ids,
+    metadata.forkFromProviderSessionId,
+  ).filter((sessionId) => sessionId && sessionId !== metadata.providerSessionId);
+  if (relatedProviderSessionIds.length) {
+    metadata.relatedProviderSessionIds = relatedProviderSessionIds;
+  }
   const terminalIndex = Number(
     item?.terminalIndex
       ?? item?.terminal_index
@@ -14226,6 +14265,18 @@ function getTodoQueueAgentSessionCloudFields(item = {}) {
   const metadata = getTodoQueueAgentSessionMetadata(item);
   return {
     ...(metadata.providerSessionId ? { providerSessionId: metadata.providerSessionId, provider_session_id: metadata.providerSessionId } : {}),
+    ...(metadata.forkFromProviderSessionId ? {
+      forkFromProviderSessionId: metadata.forkFromProviderSessionId,
+      fork_from_provider_session_id: metadata.forkFromProviderSessionId,
+    } : {}),
+    ...(metadata.sharedHistoryId ? {
+      sharedHistoryId: metadata.sharedHistoryId,
+      shared_history_id: metadata.sharedHistoryId,
+    } : {}),
+    ...(metadata.relatedProviderSessionIds?.length ? {
+      relatedProviderSessionIds: metadata.relatedProviderSessionIds,
+      related_provider_session_ids: metadata.relatedProviderSessionIds,
+    } : {}),
     ...(metadata.terminalId ? { terminalId: metadata.terminalId, terminal_id: metadata.terminalId } : {}),
     ...(metadata.terminalInstanceId ? { terminalInstanceId: metadata.terminalInstanceId, terminal_instance_id: metadata.terminalInstanceId } : {}),
     ...(Number.isInteger(metadata.terminalIndex) ? { terminalIndex: metadata.terminalIndex, terminal_index: metadata.terminalIndex } : {}),
@@ -21780,8 +21831,11 @@ function TerminalView({
     const liveProviderSessionId = getProviderSessionId(liveTerminal);
     const liveMetadata = liveTerminal ? getTodoQueueAgentSessionMetadata({
       agentKind: liveTerminal.agentId || liveTerminal.agent_id || liveTerminal.agentType || liveTerminal.agent_type || "",
+      forkFromProviderSessionId: liveTerminal.forkFromProviderSessionId || liveTerminal.fork_from_provider_session_id || "",
       provider: liveTerminal.provider || "",
       providerSessionId: liveProviderSessionId,
+      relatedProviderSessionIds: liveTerminal.relatedProviderSessionIds || liveTerminal.related_provider_session_ids || [],
+      sharedHistoryId: liveTerminal.sharedHistoryId || liveTerminal.shared_history_id || "",
       terminalId: liveTerminal.paneId || liveTerminal.pane_id || liveTerminal.terminalId || liveTerminal.terminal_id || "",
       terminalIndex: targetTerminalIndex,
       terminalInstanceId: liveTerminal.instanceId || liveTerminal.instance_id || "",
@@ -26304,6 +26358,40 @@ function TerminalView({
       workspaceId: terminalWorkspace?.id || "",
     });
   }, [splitWorkspaceTerminal, terminalWorkspace?.id]);
+
+  const handleForkTerminal = useCallback(({
+    model = "",
+    providerSessionId = "",
+    role = "",
+    sessionTitle = "",
+    terminalIndex,
+    workspaceId = "",
+  } = {}) => {
+    const targetWorkspaceId = String(workspaceId || terminalWorkspace?.id || "").trim();
+    const sourceProviderSessionId = String(providerSessionId || "").trim();
+    if (
+      !targetWorkspaceId
+      || !sourceProviderSessionId
+      || !addWorkspaceTerminal
+      || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT
+    ) {
+      return null;
+    }
+
+    return addWorkspaceTerminal({
+      model,
+      providerSessionId: sourceProviderSessionId,
+      role: role || getTerminalRole(terminalIndex),
+      sessionTitle: sessionTitle || "Original session",
+      source: "terminal_fork_original",
+      workspaceId: targetWorkspaceId,
+    });
+  }, [
+    addWorkspaceTerminal,
+    getTerminalRole,
+    logicalTerminalIndexes.length,
+    terminalWorkspace?.id,
+  ]);
 
   const updateTerminalBreakoutPlacements = useCallback((updater, terminalIndexesOverride = null) => {
     setTerminalBreakoutPlacements((currentPlacements) => {
@@ -31920,6 +32008,14 @@ function TerminalView({
       }) || null;
       const runtimeTerminal = todoQueueLiveTerminalsRef.current.get(terminalIndex) || null;
       const liveTerminal = runtimeTerminal || workspaceLiveTerminal || {};
+      const threadAgentId = normalizeTodoTerminalAgentId(
+        thread?.currentAgent
+          || thread?.agentId
+          || thread?.agent_id
+          || thread?.agentKind
+          || thread?.agent_kind
+          || "",
+      );
       const agentType = normalizeTodoTerminalAgentId(
         liveTerminal?.agentId
           || liveTerminal?.agent_id
@@ -31937,6 +32033,10 @@ function TerminalView({
           || workspaceLiveTerminal?.agent
           || getTerminalRole(terminalIndex),
       );
+      const providerBinding = thread?.providerBindings?.[agentType]
+        || thread?.providerBindings?.[threadAgentId]
+        || thread?.providerBindings?.[thread?.currentAgent]
+        || null;
       const terminalIds = new Set(getVoiceAgentHighlightStringValues(
         paneId,
         getVoiceAgentWorkspaceTerminalCanonicalIds(terminalWorkspace?.id, terminalIndex, agentType),
@@ -31960,14 +32060,59 @@ function TerminalView({
         liveTerminal?.provider_session_id,
         liveTerminal?.nativeSessionId,
         liveTerminal?.native_session_id,
+        liveTerminal?.forkFromProviderSessionId,
+        liveTerminal?.fork_from_provider_session_id,
+        liveTerminal?.forkedFromProviderSessionId,
+        liveTerminal?.forked_from_provider_session_id,
+        liveTerminal?.sharedHistoryId,
+        liveTerminal?.shared_history_id,
+        liveTerminal?.historyGroupId,
+        liveTerminal?.history_group_id,
+        liveTerminal?.relatedProviderSessionIds,
+        liveTerminal?.related_provider_session_ids,
         liveTerminal?.sessionId,
         liveTerminal?.session_id,
         workspaceLiveTerminal?.providerSessionId,
         workspaceLiveTerminal?.provider_session_id,
         workspaceLiveTerminal?.nativeSessionId,
         workspaceLiveTerminal?.native_session_id,
+        workspaceLiveTerminal?.forkFromProviderSessionId,
+        workspaceLiveTerminal?.fork_from_provider_session_id,
+        workspaceLiveTerminal?.forkedFromProviderSessionId,
+        workspaceLiveTerminal?.forked_from_provider_session_id,
+        workspaceLiveTerminal?.sharedHistoryId,
+        workspaceLiveTerminal?.shared_history_id,
+        workspaceLiveTerminal?.historyGroupId,
+        workspaceLiveTerminal?.history_group_id,
+        workspaceLiveTerminal?.relatedProviderSessionIds,
+        workspaceLiveTerminal?.related_provider_session_ids,
         workspaceLiveTerminal?.sessionId,
         workspaceLiveTerminal?.session_id,
+        thread?.id,
+        thread?.threadId,
+        thread?.thread_id,
+        thread?.transcriptSessionId,
+        thread?.transcript_session_id,
+        thread?.forkFromProviderSessionId,
+        thread?.fork_from_provider_session_id,
+        thread?.sharedHistoryId,
+        thread?.shared_history_id,
+        thread?.historyGroupId,
+        thread?.history_group_id,
+        thread?.relatedProviderSessionIds,
+        thread?.related_provider_session_ids,
+        providerBinding?.nativeSessionId,
+        providerBinding?.native_session_id,
+        providerBinding?.providerSessionId,
+        providerBinding?.provider_session_id,
+        providerBinding?.forkFromProviderSessionId,
+        providerBinding?.fork_from_provider_session_id,
+        providerBinding?.sharedHistoryId,
+        providerBinding?.shared_history_id,
+        providerBinding?.historyGroupId,
+        providerBinding?.history_group_id,
+        providerBinding?.relatedProviderSessionIds,
+        providerBinding?.related_provider_session_ids,
       ));
       const terminalNames = new Set(getVoiceAgentHighlightStringValues(
         getVoiceAgentHighlightTerminalNameValues(liveTerminal, workspaceLiveTerminal, thread),
@@ -32074,6 +32219,18 @@ function TerminalView({
       args.nativeSessionId,
       args.native_session_ids,
       args.nativeSessionIds,
+      args.fork_from_provider_session_id,
+      args.forkFromProviderSessionId,
+      args.forked_from_provider_session_id,
+      args.forkedFromProviderSessionId,
+      args.parent_provider_session_id,
+      args.parentProviderSessionId,
+      args.shared_history_id,
+      args.sharedHistoryId,
+      args.history_group_id,
+      args.historyGroupId,
+      args.related_provider_session_ids,
+      args.relatedProviderSessionIds,
       args.session_id,
       args.sessionId,
       args.session_ids,
@@ -32164,12 +32321,30 @@ function TerminalView({
         ).map((value) => value.toLowerCase());
         const itemSessionIds = getVoiceAgentHighlightStringValues(
           metadata.providerSessionId,
+          metadata.forkFromProviderSessionId,
+          metadata.sharedHistoryId,
+          metadata.relatedProviderSessionIds,
+          metadata.threadId,
           item?.providerSessionId,
           item?.provider_session_id,
           item?.nativeSessionId,
           item?.native_session_id,
+          item?.forkFromProviderSessionId,
+          item?.fork_from_provider_session_id,
+          item?.forkedFromProviderSessionId,
+          item?.forked_from_provider_session_id,
+          item?.sharedHistoryId,
+          item?.shared_history_id,
+          item?.historyGroupId,
+          item?.history_group_id,
+          item?.relatedProviderSessionIds,
+          item?.related_provider_session_ids,
           item?.sessionId,
           item?.session_id,
+          item?.threadId,
+          item?.thread_id,
+          item?.targetThreadId,
+          item?.target_thread_id,
         );
         candidates.forEach((candidate) => {
           const matchesTodoTarget = Boolean(
@@ -35349,6 +35524,7 @@ function TerminalView({
                 onArchiveWorkspaceThread={onArchiveWorkspaceThread}
                 onPreparedTerminalChange={handlePreparedTerminalChange}
                 onRecheckAgents={refreshAgentStatuses}
+                onForkTerminal={handleForkTerminal}
                 onSplitTerminal={handleSplitTerminal}
                 onSelectWorkspaceThread={handleSelectWorkspaceThreadFromTerminal}
                 onToggleWorkspaceThreadPinned={onToggleWorkspaceThreadPinned}

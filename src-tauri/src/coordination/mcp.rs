@@ -3418,7 +3418,8 @@ fn kernel_pcb_drc(kernel: &CoordinationKernel, input: &Value) -> Result<Value, S
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .ok_or_else(|| {
-            "pcb_drc requires board_path (workspace-relative path to a .board.tsx file).".to_string()
+            "pcb_drc requires board_path (workspace-relative path to a .board.tsx file)."
+                .to_string()
         })?;
     if board_path.starts_with('/') || board_path.split('/').any(|segment| segment == "..") {
         return Ok(api_error(
