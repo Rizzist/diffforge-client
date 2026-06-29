@@ -273,18 +273,6 @@ async fn handle_app_control_mcp_bridge_connection(
         return Ok(());
     }
 
-    if request.tool == "editor_control" {
-        let response = match editor_control_dispatch(&app, &request.input).await {
-            Ok(data) => json!({ "ok": true, "data": data }),
-            Err(error) => json!({
-                "ok": false,
-                "error": { "code": "editor_control_failed", "message": error },
-            }),
-        };
-        write_app_control_mcp_bridge_response(&mut stream, response).await?;
-        return Ok(());
-    }
-
     let request_id = format!(
         "app-control-mcp-{}",
         counter.fetch_add(1, Ordering::Relaxed)
@@ -1265,33 +1253,6 @@ fn app_control_mcp_tools() -> Vec<Value> {
                 "additionalProperties": true
             }
         }),
-        json!({
-            "name": "editor_control",
-            "description": "Control the Diff Forge video Editor token-efficiently via one action. Use action=get_context first to see the open project, the user's EXPOSED SELECTION (highlighted clips/region, playhead, active generation form), and the project list. Then: organize assets (list_media/create_folder/import_media/delete_media), edit the timeline (apply_ops — place_clip/move_clip/trim_clip/split_clip/remove_clip/delete_range/ripple_delete_range and tracks add_track/remove_track/rename_track/reorder_track/set_track_mute/set_track_gain; target the highlighted area using selection.startMs/endMs and activeClipId), generate (generate), or export to WebM (export). projectId defaults to the open project from get_context.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "action": {
-                        "type": "string",
-                        "enum": [
-                            "get_context", "get_selection", "list_projects", "get_project",
-                            "list_media", "create_folder", "import_media", "delete_media",
-                            "apply_ops", "generate", "export"
-                        ]
-                    },
-                    "projectId": {"type": "string", "description": "Target project id; defaults to the open project."},
-                    "subpath": {"type": "string", "description": "Media subfolder (for list_media/create_folder/import_media)."},
-                    "name": {"type": "string", "description": "Folder name (create_folder) or generation name (generate)."},
-                    "path": {"type": "string", "description": "Media path to delete (delete_media)."},
-                    "sources": {"type": "array", "items": {"type": "string"}, "description": "Absolute file paths to import (import_media)."},
-                    "ops": {"type": "array", "items": {"type": "object"}, "description": "Timeline ops batch (apply_ops)."},
-                    "source": {"type": "string", "description": "Optional start-image media path (generate)."},
-                    "options": {"type": "object", "description": "Export overrides: width/height/fps (export)."}
-                },
-                "required": ["action"],
-                "additionalProperties": true
-            }
-        }),
     ]
 }
 
@@ -1343,7 +1304,6 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "open_terminals",
         "close_terminals",
         "focus_terminal",
-        "editor_control",
     ]
     .contains(&tool)
     {
@@ -1399,11 +1359,7 @@ fn app_control_mcp_forward_to_app(
 }
 
 fn app_control_mcp_tool_timeout_ms(tool: &str) -> u64 {
-    if tool == "run_local_script"
-        || tool == "upload_asset"
-        || tool == "download_asset"
-        || tool == "editor_control"
-    {
+    if tool == "run_local_script" || tool == "upload_asset" || tool == "download_asset" {
         APP_CONTROL_MCP_SCRIPT_RUN_TIMEOUT_MS
     } else {
         APP_CONTROL_MCP_TIMEOUT_MS

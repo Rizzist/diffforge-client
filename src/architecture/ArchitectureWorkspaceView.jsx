@@ -9686,6 +9686,20 @@ function sessionHistoryMatchesSearch(item, query) {
   return terms.every((term) => haystack.includes(term) || fields.some((field) => field.startsWith(term)));
 }
 
+function sessionHistoryRowKey(item, index = 0) {
+  return text(
+    item?.id
+      || [
+        item?.workspaceId || item?.workspace_id,
+        sessionHistoryAgentKey(item),
+        item?.providerSessionId || item?.provider_session_id || item?.nativeSessionId || item?.native_session_id,
+        item?.createdAtMs || item?.created_at_ms,
+        item?.latestAtMs || item?.latest_at_ms,
+      ].map((part) => text(part)).filter(Boolean).join(":"),
+    `session-${index}`,
+  );
+}
+
 function sessionHistoryExactSessionValues(value) {
   return [
     value?.providerSessionId,
@@ -9802,7 +9816,7 @@ function SessionHistoryPanel({
     if (listRef.current) {
       listRef.current.scrollTop = 0;
     }
-  }, [items, searchQuery]);
+  }, [workspaceId, searchQuery]);
   useEffect(() => {
     const node = listRef.current;
     if (!node) return undefined;
@@ -9873,7 +9887,7 @@ function SessionHistoryPanel({
             const createdMs = parseTimeMs(item?.createdAtMs ?? item?.created_at_ms);
             const latestMs = parseTimeMs(item?.latestAtMs ?? item?.latest_at_ms);
             const statusKind = sessionHistoryStatusKind(item);
-            const id = text(item?.id, `session-${index}`);
+            const id = sessionHistoryRowKey(item, index);
             const terminalMatch = sessionHistoryFindTerminal(item, terminalOptions);
             const providerSessionId = sessionHistoryProviderSessionId(item);
             const sessionTitle = sessionHistoryTitle(item);
@@ -13599,20 +13613,24 @@ const SessionHistoryCard = styled.article`
   min-width: 0;
   padding: 10px;
   border: 1px solid rgba(148, 163, 184, 0.13);
+  border-left-width: 3px;
   border-radius: 8px;
   background: rgba(2, 6, 23, 0.28);
   overflow: hidden;
 
   &[data-agent="codex"] {
     border-color: rgba(96, 165, 250, 0.18);
+    border-left-color: rgba(96, 165, 250, 0.54);
   }
 
   &[data-agent="claude"] {
     border-color: rgba(248, 176, 92, 0.22);
+    border-left-color: rgba(248, 176, 92, 0.6);
   }
 
   &[data-agent="opencode"] {
     border-color: rgba(167, 139, 250, 0.2);
+    border-left-color: rgba(167, 139, 250, 0.58);
   }
 `;
 

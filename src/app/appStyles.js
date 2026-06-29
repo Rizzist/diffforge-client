@@ -33,7 +33,6 @@ import { LightMode } from "@styled-icons/material-rounded/LightMode";
 import { Login } from "@styled-icons/material-rounded/Login";
 import { Logout } from "@styled-icons/material-rounded/Logout";
 import { Memory } from "@styled-icons/material-rounded/Memory";
-import { Movie } from "@styled-icons/material-rounded/Movie";
 import { Mic } from "@styled-icons/material-rounded/Mic";
 import { MicOff } from "@styled-icons/material-rounded/MicOff";
 import { NotificationsActive } from "@styled-icons/material-rounded/NotificationsActive";
@@ -21752,10 +21751,6 @@ export const ButtonSnippingIcon = styled(ContentCut)`
   ${buttonIconSize}
 `;
 
-export const ButtonEditorIcon = styled(Movie)`
-  ${buttonIconSize}
-`;
-
 export const ButtonWhiteboardIcon = styled(Draw)`
   ${buttonIconSize}
 `;
@@ -22071,12 +22066,6 @@ export const WorkspaceCreateAgentIcon = styled.span`
     color: #9bdcff;
     background: rgba(14, 165, 233, 0.1);
     border-color: rgba(14, 165, 233, 0.28);
-  }
-
-  &[data-agent="video-editor"] {
-    color: #f9a8d4;
-    background: rgba(236, 72, 153, 0.1);
-    border-color: rgba(236, 72, 153, 0.26);
   }
 
   &[data-agent="pcb-design"] {

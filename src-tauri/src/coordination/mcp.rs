@@ -47,6 +47,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "complete_task",
     "submit_patch",
     "submit_patch_status",
+    "pcb_drc",
 ];
 const TERMINAL_SESSION_TOOL_NAMES: &[&str] = &[
     "start_task",
@@ -3322,6 +3323,7 @@ fn dispatch_tool_result(
         "start_task" => kernel_start_task(&kernel, &input),
         "architecture_context" => kernel_architecture_context(&kernel, &input),
         "architecture_list" => kernel_architecture_list(&kernel, &input),
+        "pcb_drc" => kernel_pcb_drc(&kernel, &input),
         "architecture_icon_reference" => kernel_architecture_icon_reference(&kernel, &input),
         "architecture_revision_list" => kernel_architecture_revision_list(&kernel, &input),
         "architecture_revision_read" => kernel_architecture_revision_read(&kernel, &input),
@@ -3403,6 +3405,51 @@ fn kernel_architecture_list(kernel: &CoordinationKernel, input: &Value) -> Resul
     Ok(api_ok(crate::architecture_graphs_list_value(
         architecture_tool_repo_path(kernel, input),
     )?))
+}
+
+// Headless PCB design-rule check for coding agents: compile a tscircuit board
+// file via the bundled node DRC helper and return only the terse error/warning
+// report, never the verbose circuit JSON.
+fn kernel_pcb_drc(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
+    let repo_path = architecture_tool_repo_path(kernel, input);
+    let board_path = input["board_path"]
+        .as_str()
+        .or_else(|| input["boardPath"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "pcb_drc requires board_path (workspace-relative path to a .board.tsx file).".to_string()
+        })?;
+    if board_path.starts_with('/') || board_path.split('/').any(|segment| segment == "..") {
+        return Ok(api_error(
+            "invalid_board_path",
+            "board_path must be a workspace-relative path inside the repo.",
+            json!({}),
+        ));
+    }
+    let board_abs = std::path::Path::new(&repo_path).join(board_path);
+    if !board_abs.exists() {
+        return Ok(api_error(
+            "board_not_found",
+            format!("No board file at {board_path}."),
+            json!({}),
+        ));
+    }
+    let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../scripts/pcb-drc.mjs");
+    let output = std::process::Command::new("node")
+        .arg(script)
+        .arg(&board_abs)
+        .output()
+        .map_err(|error| format!("Could not run the DRC compiler with node: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    let parsed: Value = serde_json::from_str(trimmed).map_err(|error| {
+        format!(
+            "DRC compiler did not return JSON ({error}). stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })?;
+    Ok(api_ok(parsed))
 }
 
 fn kernel_architecture_icon_reference(
@@ -5118,6 +5165,7 @@ fn tool_description(name: &str) -> String {
         "complete_task" => "Mark a started direct, activity, or remote task complete without submitting a git worktree patch. You must pass the task_id returned by start_task.".to_string(),
         "submit_patch" => "Queue the current task patch for asynchronous validation and safe local integration. Returns submit_job_id quickly; poll submit_patch_status for progress.".to_string(),
         "submit_patch_status" => "Check an asynchronous submit_patch job by submit_job_id, or the latest submit job for a task.".to_string(),
+        "pcb_drc" => "Compile a tscircuit PCB board file headlessly and return a terse design-rule report (errors and warnings only, never the full circuit JSON). Pass board_path, the workspace-relative path to a .board.tsx file. Use this to check a board after editing it: ok=false with an errors[] list of {type,message} means unresolved connections, missing components, or syntax errors; warnings[] flags unconnected pins and footprint mismatches.".to_string(),
         _ => format!("Diffforge local coordination tool: {name}"),
     }
 }
@@ -5401,6 +5449,14 @@ fn tool_input_schema(name: &str) -> Value {
                 "submit_job_id": {"type": "string", "description": "Preferred submit_job_id returned by submit_patch."},
                 "task_id": {"type": "string", "description": "Fallback: return the latest submit job for this task."}
             },
+            "additionalProperties": true
+        }),
+        "pcb_drc" => json!({
+            "type": "object",
+            "properties": {
+                "board_path": {"type": "string", "description": "Workspace-relative path to the tscircuit board file to check, e.g. hardware/blinky/blinky.board.tsx."}
+            },
+            "required": ["board_path"],
             "additionalProperties": true
         }),
         _ => json!({"type": "object", "additionalProperties": true}),

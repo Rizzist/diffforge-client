@@ -3948,6 +3948,35 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     event.agentDisplayName || event.agent_display_name || agentType,
     existing.agentDisplayName || existing.agent_display_name,
   );
+  const eventProviderSessionId = cleanText(
+    event.providerSessionId
+      || event.provider_session_id
+      || event.nativeSessionId
+      || event.native_session_id,
+  );
+  const eventSessionId = cleanText(event.sessionId || event.session_id);
+  const sessionIdentityCleared = event.providerSessionIdCleared === true
+    || event.provider_session_id_cleared === true
+    || event.nativeSessionIdCleared === true
+    || event.native_session_id_cleared === true
+    || event.sessionIdCleared === true
+    || event.session_id_cleared === true;
+  const openedNewTerminalGeneration = eventType === "opened"
+    && !openedExistingReadyInstance
+    && (
+      (
+        Number.isInteger(eventInstanceId)
+        && eventInstanceId > 0
+        && Number(existing.instanceId || 0) !== eventInstanceId
+      )
+      || (
+        nextThreadId
+        && displacedThreadId
+        && displacedThreadId !== nextThreadId
+      )
+    );
+  const clearSessionIdentity = sessionIdentityCleared
+    || (openedNewTerminalGeneration && !eventProviderSessionId && !eventSessionId);
   const terminalNickname = resolveWorkspaceTerminalNickname(
     entry,
     [
@@ -3987,29 +4016,35 @@ function upsertActiveTerminal(entry, event = {}, options = {}) {
     ...terminalPromptingFields,
     nativeRailState: event.nativeRailState || event.native_rail_state || existing.nativeRailState || existing.native_rail_state,
     provider: event.provider || existing.provider,
-    providerSessionId: event.providerSessionId
-      || event.provider_session_id
-      || event.nativeSessionId
-      || event.native_session_id
-      || existing.providerSessionId
-      || existing.provider_session_id,
-    nativeSessionId: event.nativeSessionId
-      || event.native_session_id
-      || event.providerSessionId
-      || event.provider_session_id
-      || existing.nativeSessionId
-      || existing.native_session_id,
+    providerSessionId: clearSessionIdentity
+      ? ""
+      : event.providerSessionId
+        || event.provider_session_id
+        || event.nativeSessionId
+        || event.native_session_id
+        || existing.providerSessionId
+        || existing.provider_session_id,
+    nativeSessionId: clearSessionIdentity
+      ? ""
+      : event.nativeSessionId
+        || event.native_session_id
+        || event.providerSessionId
+        || event.provider_session_id
+        || existing.nativeSessionId
+        || existing.native_session_id,
     slotKey: event.slotKey || existing.slotKey || defaultSlotKey(terminalIndex),
     status: options.status || event.status || existing.status || "active",
     turnStatus: event.turnStatus || event.turn_status || existing.turnStatus || existing.turn_status,
-    sessionId: event.sessionId
-      || event.session_id
-      || event.providerSessionId
-      || event.provider_session_id
-      || event.nativeSessionId
-      || event.native_session_id
-      || existing.sessionId
-      || existing.session_id,
+    sessionId: clearSessionIdentity
+      ? ""
+      : event.sessionId
+        || event.session_id
+        || event.providerSessionId
+        || event.provider_session_id
+        || event.nativeSessionId
+        || event.native_session_id
+        || existing.sessionId
+        || existing.session_id,
     terminalName: terminalNickname,
     terminalNickname,
     terminalIndex,

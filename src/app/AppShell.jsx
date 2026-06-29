@@ -865,7 +865,6 @@ import {
   ButtonPrivacyIcon,
   ButtonSecurityIcon,
   ButtonSnippingIcon,
-  ButtonEditorIcon,
   ButtonWhiteboardIcon,
   ButtonHubIcon,
   ButtonCheckIcon,
@@ -940,8 +939,8 @@ import {
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
 import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
+import PcbView from "../pcb/PcbView.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
-import AccountDevicesView from "../devices/AccountDevicesView.jsx";
 import BackgroundMonitorWindow from "../background/BackgroundMonitorWindow.jsx";
 import { useAccountAssetsLibrary } from "../assets/useAccountAssetsLibrary.js";
 import { useUntrackedAssetsLibrary } from "../assets/useUntrackedAssetsLibrary.js";
@@ -959,6 +958,7 @@ import AudioWorkspaceView, {
   AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT,
 } from "../audio/AudioWorkspaceView.jsx";
 import TerminalWindowHost, { TERMINAL_WINDOW_HASH } from "../terminals/TerminalWindowHost.jsx";
+import PcbWindowHost, { PCB_WINDOW_HASH } from "../pcb/PcbWindowHost.jsx";
 import SnippingWorkspaceView, {
   SnippingOverlayWindow,
   SnippingRecordingControlsWindow,
@@ -977,7 +977,6 @@ import SnippingQuickAccess, {
   SNIPPING_TOAST_HASH,
 } from "../snipping/SnippingQuickAccess.jsx";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
-import EditorWorkspaceView from "../editor/EditorWorkspaceView.jsx";
 
 const BRAND_NAME = "Diff Forge AI";
 const LAUNCH_MINIMUM_MS = 1400;
@@ -1017,16 +1016,17 @@ const APP_CONTROL_DOCUMENT_SELECTION_SNAPSHOT_TTL_MS = 5 * 60 * 1000;
 const MACOS_NOTIFICATIONS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.notifications";
 const MACOS_AUTOMATION_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation";
 const MACOS_FULL_DISK_ACCESS_SETTINGS_URL = "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles";
-const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "web", "architecture"]);
+const SELECTED_WORKSPACE_DETAIL_VIEWS = new Set(["files", "web", "architecture", "pcb"]);
 const GLOBAL_TOOLS_VIEWS = new Set(["tools", "architectures", "mcps", "clis", "scripts"]);
 const WORKSPACE_TAB_VIEW_BY_ID = {
   terminals: DEFAULT_WORKSPACE_VIEW,
   files: "files",
   web: "web",
+  pcb: "pcb",
   history: "architecture",
 };
 const WORKSPACE_TAB_IDS = new Set(Object.keys(WORKSPACE_TAB_VIEW_BY_ID));
-const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "devices", "assets", "snipping", "audio", "editor", "tokenomics", "settings"]);
+const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "snipping", "audio", "tokenomics", "settings"]);
 const DEVICE_LEVEL_APP_VIEW_IDS = new Set([...ACCOUNT_APP_VIEW_IDS, "architectures", "mcps", "clis", "scripts"]);
 const APP_SCRIPT_LEGACY_WORKSPACE_BUTTON_COLOR = "#1f3f7a";
 const APP_SCRIPT_LEGACY_LOOPSPACE_BUTTON_COLOR = "#4b3512";
@@ -2079,9 +2079,6 @@ function normalizeAccountAppViewId(value) {
   }
   if (normalized === "asset") {
     return "assets";
-  }
-  if (normalized === "device" || normalized === "machines" || normalized === "account_devices") {
-    return "devices";
   }
   if (normalized === "snippet" || normalized === "snippets" || normalized === "voice_snippets") {
     return "audio";
@@ -3817,6 +3814,9 @@ const MAX_WORKSPACE_TERMINAL_COUNT = 24;
 const MIN_WORKSPACE_DOCUMENT_COUNT = 0;
 const MAX_WORKSPACE_DOCUMENT_COUNT = 1;
 const DEFAULT_WORKSPACE_DOCUMENT_COUNT = 0;
+const MIN_WORKSPACE_WEB_PANEL_COUNT = 0;
+const MAX_WORKSPACE_WEB_PANEL_COUNT = 8;
+const DEFAULT_WORKSPACE_WEB_PANEL_COUNT = 0;
 const WORKSPACE_TERMINAL_PRIMARY_COLUMNS = 2;
 const WORKSPACE_TERMINAL_WIDE_START_INDEX = 4;
 const WORKSPACE_TERMINAL_WIDE_COLUMNS = 4;
@@ -13235,16 +13235,15 @@ const WORKSPACE_PANEL_CARDS = [
     maxCount: MAX_WORKSPACE_DOCUMENT_COUNT,
   },
   {
-    id: "video-editor",
-    label: "Video Editor",
-    statusLabel: "coming soon",
-    unavailable: true,
+    id: "web",
+    label: "Web",
+    statusLabel: "ready",
+    maxCount: MAX_WORKSPACE_WEB_PANEL_COUNT,
   },
   {
     id: "pcb-design",
     label: "PCB Design",
-    statusLabel: "coming soon",
-    unavailable: true,
+    statusLabel: "ready",
   },
   {
     id: "simulator-3d",
@@ -13264,8 +13263,8 @@ function WorkspacePanelGlyph({ panelId }) {
   if (panelId === "document") {
     return <FileDocumentIcon aria-hidden="true" />;
   }
-  if (panelId === "video-editor") {
-    return <ButtonEditorIcon aria-hidden="true" />;
+  if (panelId === "web") {
+    return <ButtonWebIcon aria-hidden="true" />;
   }
   if (panelId === "pcb-design") {
     return <ButtonProcessIcon aria-hidden="true" />;
@@ -13392,12 +13391,16 @@ function WorkspacePanelCountCards({
   return (
     <WorkspaceCreateAgentGrid>
       {WORKSPACE_PANEL_CARDS.map((card) => {
-        const count = card.id === "document"
-          ? normalizeWorkspaceDocumentCount(counts.document ?? counts.documents)
-          : 0;
         const unavailable = Boolean(card.unavailable);
         const maxCount = Math.max(0, Number(card.maxCount) || 0);
-        const canRemovePanel = !disabled && !unavailable && count > MIN_WORKSPACE_DOCUMENT_COUNT;
+        const rawCount = card.id === "document"
+          ? (counts.document ?? counts.documents)
+          : counts[card.id];
+        const parsedCount = Number.parseInt(rawCount, 10);
+        const count = unavailable
+          ? 0
+          : Math.min(maxCount, Math.max(0, Number.isFinite(parsedCount) ? parsedCount : 0));
+        const canRemovePanel = !disabled && !unavailable && count > 0;
         const canAddPanel = !disabled && !unavailable && count < maxCount;
 
         return (
@@ -13477,7 +13480,7 @@ function WorkspaceCreatePanel({
   const [browseError, setBrowseError] = useState("");
   const [cdDraft, setCdDraft] = useState("");
   const [agentCounts, setAgentCounts] = useState({});
-  const [panelCounts, setPanelCounts] = useState({ document: DEFAULT_WORKSPACE_DOCUMENT_COUNT });
+  const [panelCounts, setPanelCounts] = useState({ document: DEFAULT_WORKSPACE_DOCUMENT_COUNT, web: DEFAULT_WORKSPACE_WEB_PANEL_COUNT });
   const [agentPermissions, setAgentPermissions] = useState({});
   const [agentSessionModeDraft, setAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
   const [initializeGitDraft, setInitializeGitDraft] = useState(false);
@@ -13526,7 +13529,7 @@ function WorkspaceCreatePanel({
     setBrowseError("");
     setPanelView("create");
     setAgentCounts(fallbackRole ? { [fallbackRole]: 1 } : {});
-    setPanelCounts({ document: DEFAULT_WORKSPACE_DOCUMENT_COUNT });
+    setPanelCounts({ document: DEFAULT_WORKSPACE_DOCUMENT_COUNT, web: DEFAULT_WORKSPACE_WEB_PANEL_COUNT });
     setAgentPermissions(normalizeWorkspaceAgentPermissions(null, roleOptions));
     setAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
     setInitializeGitDraft(false);
@@ -13648,20 +13651,30 @@ function WorkspaceCreatePanel({
   }, [roleOptions]);
 
   const adjustPanelCount = useCallback((panelId, delta) => {
-    if (panelId !== "document") {
+    if (panelId === "document") {
+      setPanelCounts((current) => {
+        const currentValue = normalizeWorkspaceDocumentCount(current.document);
+        const nextValue = Math.min(
+          MAX_WORKSPACE_DOCUMENT_COUNT,
+          Math.max(MIN_WORKSPACE_DOCUMENT_COUNT, currentValue + Number(delta || 0)),
+        );
+        if (nextValue === currentValue) {
+          return current;
+        }
+        return { ...current, document: nextValue };
+      });
       return;
     }
-    setPanelCounts((current) => {
-      const currentValue = normalizeWorkspaceDocumentCount(current.document);
-      const nextValue = Math.min(
-        MAX_WORKSPACE_DOCUMENT_COUNT,
-        Math.max(MIN_WORKSPACE_DOCUMENT_COUNT, currentValue + Number(delta || 0)),
-      );
-      if (nextValue === currentValue) {
-        return current;
-      }
-      return { ...current, document: nextValue };
-    });
+    if (panelId === "web") {
+      setPanelCounts((current) => {
+        const currentValue = normalizeWorkspaceWebPanelCount(current.web);
+        const nextValue = normalizeWorkspaceWebPanelCount(currentValue + Number(delta || 0));
+        if (nextValue === currentValue) {
+          return current;
+        }
+        return { ...current, web: nextValue };
+      });
+    }
   }, []);
 
   const availableAgentCounts = useMemo(() => {
@@ -13687,7 +13700,8 @@ function WorkspaceCreatePanel({
   );
   const availablePanelCounts = useMemo(() => ({
     document: normalizeWorkspaceDocumentCount(panelCounts.document),
-  }), [panelCounts.document]);
+    web: normalizeWorkspaceWebPanelCount(panelCounts.web),
+  }), [panelCounts.document, panelCounts.web]);
 
   useEffect(() => {
     if (!visible) {
@@ -14050,7 +14064,7 @@ function WorkspaceCreatePanel({
         <WorkspaceCreateSection>
           <SettingsLabel>Panels</SettingsLabel>
           <SettingsHint>
-            Pick non-terminal workspace panels. Documents can be off or one terminal-side panel.
+            Pick non-terminal workspace panels. Web panels open in the terminals grid and can be driven, split, and popped out.
           </SettingsHint>
           <WorkspacePanelCountCards
             counts={availablePanelCounts}
@@ -14065,6 +14079,9 @@ function WorkspaceCreatePanel({
           <SettingsHint>
             {terminalRoles.length} terminal{terminalRoles.length === 1 ? "" : "s"}
             {availablePanelCounts.document ? " and 1 document panel" : ""}
+            {availablePanelCounts.web
+              ? ` and ${availablePanelCounts.web} web panel${availablePanelCounts.web === 1 ? "" : "s"}`
+              : ""}
             {" "}will open in {getDirectoryName(currentDirectory) || "the chosen folder"}.
           </SettingsHint>
           <PrimaryButton disabled={!canCreate} type="submit">
@@ -16369,6 +16386,15 @@ function buildRustTerminalAuthorityWorkspaces({
         turnStatus,
       }),
     );
+    const providerSessionId = String(
+      session.providerSessionId
+        || session.provider_session_id
+        || session.nativeSessionId
+        || session.native_session_id
+        || session.sessionId
+        || session.session_id
+        || "",
+    ).trim();
     grouped.get(workspaceId).terminals.push({
       agentId,
       agentKind: agentId,
@@ -16395,11 +16421,17 @@ function buildRustTerminalAuthorityWorkspaces({
       ...nativeRailFields,
       nativeConnected: workspaceRuntimeCommandable,
       native_connected: workspaceRuntimeCommandable,
+      nativeSessionId: providerSessionId,
+      native_session_id: providerSessionId,
       pane_id: session.paneId,
       paneId: session.paneId,
+      providerSessionId,
+      provider_session_id: providerSessionId,
       readiness,
       runtimeReadOnly: false,
       runtime_read_only: false,
+      sessionId: providerSessionId,
+      session_id: providerSessionId,
       sessionState: session.sessionState || "session_attached",
       session_state: session.sessionState || "session_attached",
       status: terminalStatus,
@@ -17660,6 +17692,8 @@ function normalizeWorkspaceSettings(value) {
           ? normalizeWorkspaceDocumentCount(settings.documentsCount)
           : DEFAULT_WORKSPACE_DOCUMENT_COUNT;
         const hasDefaultDocumentsCount = documentsCount === DEFAULT_WORKSPACE_DOCUMENT_COUNT;
+        const paneKinds = normalizeWorkspacePaneKinds(settings?.paneKinds);
+        const hasWebPanes = workspacePaneKindsHasWeb(paneKinds);
         const agentPermissions = normalizeWorkspaceAgentPermissions(settings?.agentPermissions);
         const hasCustomAgentPermissions = Object.values(agentPermissions)
           .some((mode) => mode !== WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS);
@@ -17680,6 +17714,7 @@ function normalizeWorkspaceSettings(value) {
             && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
             && !hasCustomTerminalRoles
             && hasDefaultDocumentsCount
+            && !hasWebPanes
             && !hasCustomAgentPermissions
             && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
           )
@@ -17698,6 +17733,7 @@ function normalizeWorkspaceSettings(value) {
             terminalCount,
             terminalRoles,
             documentsCount,
+            ...(hasWebPanes ? { paneKinds } : {}),
             agentPermissions,
           },
         ];
@@ -19115,6 +19151,65 @@ function getWorkspaceTerminalRoles(
   );
 }
 
+const WORKSPACE_PANE_KIND_WEB = "web";
+
+// paneKinds maps an integer terminal slot index -> a non-terminal pane kind
+// (currently only "web"). Slots without an entry are normal terminals. This rides
+// alongside terminalRoles without polluting the agent-role space.
+function normalizeWorkspacePaneKinds(value) {
+  const result = {};
+  if (!value || typeof value !== "object") {
+    return result;
+  }
+  const entries = Array.isArray(value)
+    ? value.map((kind, index) => [index, kind])
+    : Object.entries(value);
+  entries.forEach(([key, kind]) => {
+    const index = Number.parseInt(key, 10);
+    if (
+      Number.isInteger(index)
+      && index >= 0
+      && index < MAX_WORKSPACE_TERMINAL_COUNT
+      && String(kind) === WORKSPACE_PANE_KIND_WEB
+    ) {
+      result[index] = WORKSPACE_PANE_KIND_WEB;
+    }
+  });
+  return result;
+}
+
+function getWorkspacePaneKinds(workspaceSettings, workspaceId) {
+  return normalizeWorkspacePaneKinds(workspaceSettings?.[workspaceId]?.paneKinds);
+}
+
+function isWorkspaceWebPaneIndex(paneKinds, terminalIndex) {
+  return Boolean(paneKinds) && paneKinds[terminalIndex] === WORKSPACE_PANE_KIND_WEB;
+}
+
+function workspacePaneKindsHasWeb(paneKinds) {
+  return Boolean(paneKinds) && Object.keys(paneKinds).length > 0;
+}
+
+function workspacePaneKindsWebIndexes(paneKinds) {
+  return Object.entries(paneKinds || {})
+    .filter(([, kind]) => kind === WORKSPACE_PANE_KIND_WEB)
+    .map(([index]) => Number.parseInt(index, 10))
+    .filter((index) => Number.isInteger(index))
+    .sort((left, right) => left - right);
+}
+
+function getWorkspaceWebPaneIndexes(workspaceSettings, workspaceId) {
+  return workspacePaneKindsWebIndexes(getWorkspacePaneKinds(workspaceSettings, workspaceId));
+}
+
+function normalizeWorkspaceWebPanelCount(value) {
+  const count = Number.parseInt(value, 10);
+  if (!Number.isFinite(count)) {
+    return DEFAULT_WORKSPACE_WEB_PANEL_COUNT;
+  }
+  return Math.min(MAX_WORKSPACE_WEB_PANEL_COUNT, Math.max(MIN_WORKSPACE_WEB_PANEL_COUNT, count));
+}
+
 function normalizeWorkspaceTerminalSlotIndexes(indexes) {
   const usedIndexes = new Set();
 
@@ -19157,9 +19252,36 @@ function reconcileWorkspaceTerminalSlotIndexes(indexes, count) {
   return nextIndexes;
 }
 
+// Reconcile terminal slots while keeping a reserved set (e.g. web pane slots)
+// free so the two never collide. Used by saveWorkspaceSettings to reconcile the
+// terminal harness count without disturbing web panes that share the slot space.
+function reconcileWorkspaceTerminalSlotIndexesExcluding(indexes, count, excludeIndexes) {
+  const terminalCount = normalizeWorkspaceTerminalCount(count);
+  const exclude = new Set((excludeIndexes || []).map((index) => Number.parseInt(index, 10)));
+  const normalizedIndexes = normalizeWorkspaceTerminalSlotIndexes(indexes)
+    .filter((index) => !exclude.has(index));
+  const usedIndexes = new Set(normalizedIndexes);
+  const nextIndexes = normalizedIndexes.slice(0, terminalCount);
+
+  let nextIndex = 0;
+  while (nextIndexes.length < terminalCount && nextIndex < MAX_WORKSPACE_TERMINAL_COUNT) {
+    if (!usedIndexes.has(nextIndex) && !exclude.has(nextIndex)) {
+      usedIndexes.add(nextIndex);
+      nextIndexes.push(nextIndex);
+    }
+    nextIndex += 1;
+  }
+
+  return nextIndexes;
+}
+
 function getWorkspaceLogicalTerminalIndexes(workspaceTerminalLogicalIndexes, workspaceId, terminalCount) {
   if (Object.prototype.hasOwnProperty.call(workspaceTerminalLogicalIndexes || {}, workspaceId)) {
-    return reconcileWorkspaceTerminalSlotIndexes(workspaceTerminalLogicalIndexes[workspaceId], terminalCount);
+    const configuredIndexes = workspaceTerminalLogicalIndexes[workspaceId];
+    if (Array.isArray(configuredIndexes) && configuredIndexes.length === 0) {
+      return [];
+    }
+    return reconcileWorkspaceTerminalSlotIndexes(configuredIndexes, terminalCount);
   }
 
   return normalizeWorkspaceTerminalIndexes(undefined, terminalCount);
@@ -19298,6 +19420,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const hasTerminalCount = Object.prototype.hasOwnProperty.call(nextValues, "terminalCount");
   const hasTerminalRoles = Object.prototype.hasOwnProperty.call(nextValues, "terminalRoles");
   const hasDocumentsCount = Object.prototype.hasOwnProperty.call(nextValues, "documentsCount");
+  const hasPaneKinds = Object.prototype.hasOwnProperty.call(nextValues, "paneKinds");
   const hasAgentPermissions = Object.prototype.hasOwnProperty.call(nextValues, "agentPermissions");
   const cleanedRootDirectory = cleanWorkspaceRootDirectory(
     hasRootDirectory ? nextValues.rootDirectory : currentSettings.rootDirectory,
@@ -19342,6 +19465,10 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
         : DEFAULT_WORKSPACE_DOCUMENT_COUNT,
   );
   const hasDefaultDocumentsCount = documentsCount === DEFAULT_WORKSPACE_DOCUMENT_COUNT;
+  const paneKinds = normalizeWorkspacePaneKinds(
+    hasPaneKinds ? nextValues.paneKinds : currentSettings.paneKinds,
+  );
+  const hasWebPanes = workspacePaneKindsHasWeb(paneKinds);
   const agentPermissions = normalizeWorkspaceAgentPermissions(
     hasAgentPermissions ? nextValues.agentPermissions : currentSettings.agentPermissions,
   );
@@ -19367,6 +19494,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
     && !hasCustomTerminalRoles
     && hasDefaultDocumentsCount
+    && !hasWebPanes
     && !hasCustomAgentPermissions
     && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
   ) {
@@ -19383,6 +19511,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     terminalCount,
     terminalRoles,
     documentsCount,
+    ...(hasWebPanes ? { paneKinds } : {}),
     agentPermissions,
   };
 
@@ -19432,6 +19561,10 @@ export default function App() {
 
   if (window.location.hash.startsWith(TERMINAL_WINDOW_HASH)) {
     return <TerminalWindowHost />;
+  }
+
+  if (window.location.hash.startsWith(PCB_WINDOW_HASH)) {
+    return <PcbWindowHost />;
   }
 
   const {
@@ -26066,6 +26199,25 @@ export default function App() {
       const documentsCount = normalizeWorkspaceDocumentCount(
         requestedPanelCounts?.document ?? requestedPanelCounts?.documents,
       );
+      const webPanelCount = normalizeWorkspaceWebPanelCount(requestedPanelCounts?.web);
+      // Web panes occupy slots after the terminal slots. Their terminalRoles entry
+      // is a never-read placeholder; paneKinds marks them so the grid renders a
+      // WebPane (no PTY/agent) instead of a terminal.
+      let seededTerminalRoles = terminalRoles;
+      let seededPaneKinds = null;
+      if (webPanelCount > 0) {
+        const baseTerminalRoles = terminalRoles && terminalRoles.length ? terminalRoles : ["codex"];
+        const webStartIndex = baseTerminalRoles.length;
+        const combinedRoles = [
+          ...baseTerminalRoles,
+          ...Array.from({ length: webPanelCount }, () => "codex"),
+        ].slice(0, MAX_WORKSPACE_TERMINAL_COUNT);
+        seededTerminalRoles = combinedRoles;
+        seededPaneKinds = {};
+        for (let index = webStartIndex; index < combinedRoles.length; index += 1) {
+          seededPaneKinds[index] = WORKSPACE_PANE_KIND_WEB;
+        }
+      }
       const agentPermissions = normalizeWorkspaceAgentPermissions(
         requestedAgentPermissions,
         WORKSPACE_TERMINAL_ROLE_OPTIONS,
@@ -26077,9 +26229,10 @@ export default function App() {
         agentSessionMode,
         documentsCount,
         agentPermissions,
-        ...(terminalRoles
-          ? { terminalCount: terminalRoles.length, terminalRoles }
+        ...(seededTerminalRoles
+          ? { terminalCount: seededTerminalRoles.length, terminalRoles: seededTerminalRoles }
           : {}),
+        ...(seededPaneKinds ? { paneKinds: seededPaneKinds } : {}),
       });
       const currentLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
       const enabledWorkspaceIds = normalizeEnabledWorkspaceIds(currentLifecycleSettings.enabledWorkspaceIds);
@@ -26281,13 +26434,32 @@ export default function App() {
         selectedWorkspace.id,
         currentTerminalCount,
       );
+      // Web panes share the slot space but are managed live (not via this draft).
+      // Partition them out so the harness reconcile only touches terminal slots,
+      // then re-add the web slots when persisting. No web panes -> identical to
+      // the pre-existing terminal-only path.
+      const settingsPaneKinds = getWorkspacePaneKinds(workspaceSettings, selectedWorkspace.id);
+      const settingsWebIndexes = workspacePaneKindsWebIndexes(settingsPaneKinds);
+      const settingsWebIndexSet = new Set(settingsWebIndexes);
+      const settingsNonWebCurrentIndexes = currentTerminalIndexes.filter((index) => !settingsWebIndexSet.has(index));
       const rootChanged = false;
-      const nextTerminalIndexes = rootChanged
+      const nonWebNextIndexes = rootChanged
         ? getDefaultTerminalIndexes(terminalCount)
-        : reconcileWorkspaceTerminalSlotIndexes(currentTerminalIndexes, terminalCount);
+        : reconcileWorkspaceTerminalSlotIndexesExcluding(settingsNonWebCurrentIndexes, terminalCount, settingsWebIndexes);
+      const nonWebRoleByIndex = new Map(nonWebNextIndexes.map((slotIndex, index) => [slotIndex, terminalRoles[index]]));
+      const nextTerminalIndexes = [...nonWebNextIndexes, ...settingsWebIndexes];
+      const effectiveTerminalRoles = nextTerminalIndexes.map((slotIndex) => (
+        settingsWebIndexSet.has(slotIndex)
+          ? workspaceTerminalFallbackRole
+          : (nonWebRoleByIndex.get(slotIndex) || workspaceTerminalFallbackRole)
+      ));
+      const effectiveTerminalCount = nextTerminalIndexes.length;
+      const settingsStoredPaneKinds = Object.fromEntries(
+        settingsWebIndexes.map((slotIndex) => [slotIndex, WORKSPACE_PANE_KIND_WEB]),
+      );
       const nextTerminalIndexSet = new Set(nextTerminalIndexes);
       const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
-        [terminalIndex, terminalRoles[index]]
+        [terminalIndex, effectiveTerminalRoles[index]]
       )));
       const gitWorktreesChanged = agentSessionMode !== currentAgentSessionMode;
       const rootWasEmptyAtSelection = rootDirectory
@@ -26302,12 +26474,14 @@ export default function App() {
         nextTerminalIndexSet.has(terminalIndex)
         && currentTerminalRoles[index] !== nextTerminalRoleByIndex.get(terminalIndex)
       ));
-      const terminalIndexesToClose = rootChanged || gitWorktreesChanged || agentPermissionsChanged
+      const terminalIndexesToClose = (rootChanged || gitWorktreesChanged || agentPermissionsChanged
         ? currentTerminalIndexes
         : Array.from(new Set([
           ...removedTerminalIndexes,
           ...roleChangedTerminalIndexes,
-        ]));
+        ])))
+        // Web panes have no PTY/agent; never close them as terminals.
+        .filter((terminalIndex) => !settingsWebIndexSet.has(terminalIndex));
       let nextWorkspace = selectedWorkspace;
 
 
@@ -26441,9 +26615,10 @@ export default function App() {
           rootGitRepository,
           agentSessionMode,
           gitWorktreesEnabled,
-          terminalCount,
-          terminalRoles,
+          terminalCount: effectiveTerminalCount,
+          terminalRoles: effectiveTerminalRoles,
           documentsCount,
+          paneKinds: settingsStoredPaneKinds,
           agentPermissions,
         });
         workspaceSettingsRef.current = nextSettings;
@@ -26451,7 +26626,7 @@ export default function App() {
         return nextSettings;
       });
 
-      if (rootChanged || gitWorktreesChanged || agentPermissionsChanged || terminalCount !== currentTerminalCount || terminalRolesChanged) {
+      if (rootChanged || gitWorktreesChanged || agentPermissionsChanged || effectiveTerminalCount !== currentTerminalCount || terminalRolesChanged) {
         const nextDisplayRows = getWorkspaceDisplayTerminalRows(
           workspaceTerminalDisplayLayoutsRef.current,
           selectedWorkspace.id,
@@ -26575,6 +26750,8 @@ export default function App() {
       const roleIndex = currentIndexes.indexOf(index);
       return currentTerminalRoles[roleIndex] || workspaceTerminalFallbackRole;
     });
+    const nextPaneKinds = { ...getWorkspacePaneKinds(currentSettings, workspaceId) };
+    delete nextPaneKinds[removedTerminalIndex];
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
       [workspaceId]: nextIndexes,
@@ -26589,6 +26766,7 @@ export default function App() {
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
+      paneKinds: nextPaneKinds,
     });
     let clearedPreparedTerminal = false;
 
@@ -26694,6 +26872,14 @@ export default function App() {
       currentRoles[orderIndex] || workspaceTerminalFallbackRole,
     ]));
     const sourceRole = roleByIndex[terminalIndex] || workspaceTerminalFallbackRole;
+    const currentPaneKinds = getWorkspacePaneKinds(currentSettings, workspaceId);
+    const sourceIsWebPane = isWorkspaceWebPaneIndex(currentPaneKinds, terminalIndex);
+    const nextPaneKinds = { ...currentPaneKinds };
+    if (sourceIsWebPane) {
+      nextPaneKinds[nextTerminalIndex] = WORKSPACE_PANE_KIND_WEB;
+    } else {
+      delete nextPaneKinds[nextTerminalIndex];
+    }
     const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
     const nextDisplayRows = insertLogicalTerminalInDisplayRows(
       currentRows,
@@ -26709,6 +26895,7 @@ export default function App() {
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
+      paneKinds: nextPaneKinds,
     });
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
@@ -26782,6 +26969,8 @@ export default function App() {
       return null;
     }
 
+    workspaceTerminalExplicitEmptyRef.current.delete(workspaceId);
+
     const currentRoles = getWorkspaceTerminalRoles(
       currentSettings,
       workspaceId,
@@ -26812,6 +27001,8 @@ export default function App() {
     const nextTerminalRoles = nextIndexes.map((index) => (
       index === nextTerminalIndex ? nextRole : roleByIndex[index] || workspaceTerminalFallbackRole
     ));
+    const nextPaneKinds = { ...getWorkspacePaneKinds(currentSettings, workspaceId) };
+    delete nextPaneKinds[nextTerminalIndex];
     const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
     const nextDisplayRows = currentRows.length
       ? [...currentRows.map((row) => row.terminalIndexes.slice()), [nextTerminalIndex]]
@@ -26819,6 +27010,7 @@ export default function App() {
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
+      paneKinds: nextPaneKinds,
     });
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
@@ -26885,6 +27077,97 @@ export default function App() {
     };
   }, [
     defaultWorkingDirectory,
+    workspaceSettingsModalId,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+  ]);
+
+  // Append a new Web pane to the grid. Mirrors addWorkspaceTerminal's slot
+  // allocation but marks the slot kind "web" and creates no PTY/agent/thread.
+  const addWorkspaceWebPane = useCallback(({ workspaceId } = {}) => {
+    if (!workspaceId) {
+      return null;
+    }
+
+    const currentSettings = workspaceSettingsRef.current;
+    const currentLogicalIndexesByWorkspace = workspaceTerminalLogicalIndexesRef.current;
+    const currentDisplayLayouts = workspaceTerminalDisplayLayoutsRef.current;
+    const terminalCount = getWorkspaceTerminalCount(currentSettings, workspaceId);
+    const currentIndexes = getWorkspaceLogicalTerminalIndexes(
+      currentLogicalIndexesByWorkspace,
+      workspaceId,
+      terminalCount,
+    );
+
+    if (currentIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
+      return null;
+    }
+
+    let nextTerminalIndex = -1;
+    for (let index = 0; index < MAX_WORKSPACE_TERMINAL_COUNT; index += 1) {
+      if (!currentIndexes.includes(index)) {
+        nextTerminalIndex = index;
+        break;
+      }
+    }
+
+    if (nextTerminalIndex < 0) {
+      return null;
+    }
+
+    workspaceTerminalExplicitEmptyRef.current.delete(workspaceId);
+
+    const currentRoles = getWorkspaceTerminalRoles(
+      currentSettings,
+      workspaceId,
+      terminalCount,
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    );
+    const roleByIndex = Object.fromEntries(currentIndexes.map((index, orderIndex) => [
+      index,
+      currentRoles[orderIndex] || workspaceTerminalFallbackRole,
+    ]));
+    const nextIndexes = normalizeWorkspaceTerminalSlotIndexes([...currentIndexes, nextTerminalIndex]);
+    const nextTerminalCount = Math.min(MAX_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
+    const nextTerminalRoles = nextIndexes.map((index) => roleByIndex[index] || workspaceTerminalFallbackRole);
+    const nextPaneKinds = {
+      ...getWorkspacePaneKinds(currentSettings, workspaceId),
+      [nextTerminalIndex]: WORKSPACE_PANE_KIND_WEB,
+    };
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
+    const nextDisplayRows = currentRows.length
+      ? [...currentRows.map((row) => row.terminalIndexes.slice()), [nextTerminalIndex]]
+      : [[nextTerminalIndex]];
+    const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
+      terminalCount: nextTerminalCount,
+      terminalRoles: nextTerminalRoles,
+      paneKinds: nextPaneKinds,
+    });
+    const nextLogicalIndexesByWorkspace = {
+      ...currentLogicalIndexesByWorkspace,
+      [workspaceId]: nextIndexes,
+    };
+    const nextDisplayLayouts = {
+      ...currentDisplayLayouts,
+      [workspaceId]: nextDisplayRows,
+    };
+
+    workspaceSettingsRef.current = nextSettings;
+    workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
+    workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
+    setWorkspaceSettings(nextSettings);
+    setWorkspaceTerminalLogicalIndexes(nextLogicalIndexesByWorkspace);
+    setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
+    persistWorkspaceSettings(nextSettings);
+
+    if (workspaceSettingsModalId === workspaceId) {
+      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
+      setWorkspaceTerminalRolesDraft(nextTerminalRoles);
+    }
+
+    return { terminalIndex: nextTerminalIndex, workspaceId };
+  }, [
     workspaceSettingsModalId,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
@@ -27257,6 +27540,7 @@ export default function App() {
       nextIndexes = normalizeWorkspaceTerminalSlotIndexes([...nextIndexes, targetTerminalIndex]);
       roleIndex = nextIndexes.indexOf(targetTerminalIndex);
       nextTerminalCount = Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
+      workspaceTerminalExplicitEmptyRef.current.delete(workspaceId);
       const currentRows = getWorkspaceDisplayTerminalRows(
         currentDisplayLayouts,
         workspaceId,
@@ -29181,6 +29465,45 @@ export default function App() {
       workspaceSettings,
     ],
   );
+  // Web panes share the terminal slot space but must be excluded from the
+  // settings agent/harness accounting (they have no agent role). The "Coding
+  // harnesses" cards and drafts work with terminals-only counts; saveWorkspace-
+  // Settings re-adds the web slots when persisting.
+  const selectedWorkspaceWebPaneIndexes = useMemo(
+    () => (selectedWorkspace && !shouldShowWorkspaceSetup
+      ? getWorkspaceWebPaneIndexes(workspaceSettings, selectedWorkspace.id)
+      : []),
+    [selectedWorkspace?.id, shouldShowWorkspaceSetup, workspaceSettings],
+  );
+  const selectedWorkspaceWebPanelCount = selectedWorkspaceWebPaneIndexes.length;
+  const selectedWorkspaceSlotIndexes = useMemo(
+    () => (selectedWorkspace && !shouldShowWorkspaceSetup
+      ? getWorkspaceLogicalTerminalIndexes(
+        workspaceTerminalLogicalIndexes,
+        selectedWorkspace.id,
+        selectedWorkspaceTerminalCount,
+      )
+      : []),
+    [selectedWorkspace?.id, shouldShowWorkspaceSetup, workspaceTerminalLogicalIndexes, selectedWorkspaceTerminalCount],
+  );
+  const selectedWorkspaceTerminalOnlyRoles = useMemo(() => {
+    if (!selectedWorkspaceWebPaneIndexes.length) {
+      return selectedWorkspaceTerminalRoles;
+    }
+    const webSet = new Set(selectedWorkspaceWebPaneIndexes);
+    return selectedWorkspaceSlotIndexes
+      .map((slotIndex, position) => ({ slotIndex, role: selectedWorkspaceTerminalRoles[position] }))
+      .filter(({ slotIndex }) => !webSet.has(slotIndex))
+      .map(({ role }) => role || workspaceTerminalFallbackRole);
+  }, [
+    selectedWorkspaceSlotIndexes,
+    selectedWorkspaceTerminalRoles,
+    selectedWorkspaceWebPaneIndexes,
+    workspaceTerminalFallbackRole,
+  ]);
+  const selectedWorkspaceTerminalOnlyCount = selectedWorkspaceWebPaneIndexes.length
+    ? selectedWorkspaceTerminalOnlyRoles.length
+    : selectedWorkspaceTerminalCount;
   const selectedWorkspaceAgentSessionMode = selectedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceAgentSessionMode(workspaceSettings, selectedWorkspace.id)
     : AGENT_SESSION_MODE_COORDINATED;
@@ -29500,6 +29823,7 @@ export default function App() {
             : [],
           logicalTerminalCount: logicalTerminalIndexes.length,
           logicalTerminalIndexes,
+          paneKinds: getWorkspacePaneKinds(workspaceSettings, runtimeWorkspace.id),
           renderAgent: getReadyWorkspaceTerminalAgent(
             agentStatuses,
             terminalRoles[0] || workspaceTerminalFallbackRole,
@@ -42907,9 +43231,9 @@ export default function App() {
 
   useEffect(() => {
     setWorkspaceNameDraft(selectedWorkspace?.name || "");
-    setWorkspaceTerminalCountDraft(String(selectedWorkspace ? selectedWorkspaceTerminalCount : MIN_WORKSPACE_TERMINAL_COUNT));
+    setWorkspaceTerminalCountDraft(String(selectedWorkspace ? selectedWorkspaceTerminalOnlyCount : MIN_WORKSPACE_TERMINAL_COUNT));
     setWorkspaceDocumentCountDraft(String(selectedWorkspace ? selectedWorkspaceDocumentCount : DEFAULT_WORKSPACE_DOCUMENT_COUNT));
-    setWorkspaceTerminalRolesDraft(selectedWorkspace ? selectedWorkspaceTerminalRoles : normalizeWorkspaceTerminalRoles(
+    setWorkspaceTerminalRolesDraft(selectedWorkspace ? selectedWorkspaceTerminalOnlyRoles : normalizeWorkspaceTerminalRoles(
       [],
       MIN_WORKSPACE_TERMINAL_COUNT,
       workspaceTerminalFallbackRole,
@@ -42933,8 +43257,8 @@ export default function App() {
     selectedWorkspaceAgentSessionMode,
     selectedWorkspaceAgentPermissions,
     selectedWorkspaceDocumentCount,
-    selectedWorkspaceTerminalCount,
-    selectedWorkspaceTerminalRoles,
+    selectedWorkspaceTerminalOnlyCount,
+    selectedWorkspaceTerminalOnlyRoles,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
     workspaceSettingsModalId,
@@ -43149,7 +43473,8 @@ export default function App() {
   ), [workspaceAgentPermissionsDraft, workspaceTerminalRoleOptions]);
   const workspaceSettingsPanelCounts = useMemo(() => ({
     document: normalizeWorkspaceDocumentCount(workspaceDocumentCountDraft),
-  }), [workspaceDocumentCountDraft]);
+    web: selectedWorkspaceWebPanelCount,
+  }), [workspaceDocumentCountDraft, selectedWorkspaceWebPanelCount]);
   const updateWorkspaceSettingsAgentCount = useCallback((roleId, delta) => {
     const nextRoles = adjustWorkspaceAgentCardRoles(
       workspaceSettingsTerminalRoles,
@@ -43178,20 +43503,43 @@ export default function App() {
     setWorkspaceSettingsMessage("");
   }, [workspaceTerminalRoleOptions]);
   const updateWorkspaceSettingsPanelCount = useCallback((panelId, delta) => {
-    if (panelId !== "document") {
+    if (panelId === "document") {
+      setWorkspaceDocumentCountDraft((current) => {
+        const currentValue = normalizeWorkspaceDocumentCount(current);
+        const nextValue = Math.min(
+          MAX_WORKSPACE_DOCUMENT_COUNT,
+          Math.max(MIN_WORKSPACE_DOCUMENT_COUNT, currentValue + Number(delta || 0)),
+        );
+        return String(nextValue);
+      });
+      setWorkspaceSettingsError("");
+      setWorkspaceSettingsMessage("");
       return;
     }
-    setWorkspaceDocumentCountDraft((current) => {
-      const currentValue = normalizeWorkspaceDocumentCount(current);
-      const nextValue = Math.min(
-        MAX_WORKSPACE_DOCUMENT_COUNT,
-        Math.max(MIN_WORKSPACE_DOCUMENT_COUNT, currentValue + Number(delta || 0)),
-      );
-      return String(nextValue);
-    });
-    setWorkspaceSettingsError("");
-    setWorkspaceSettingsMessage("");
-  }, []);
+    if (panelId === "web") {
+      // Web panes are grid slots, so add/remove them live against the selected
+      // workspace (no draft); the stepper count reflects paneKinds directly.
+      if (!selectedWorkspace?.id) {
+        return;
+      }
+      const step = Number(delta || 0);
+      if (step > 0) {
+        addWorkspaceWebPane?.({ workspaceId: selectedWorkspace.id });
+      } else if (step < 0) {
+        const target = selectedWorkspaceWebPaneIndexes[selectedWorkspaceWebPaneIndexes.length - 1];
+        if (Number.isInteger(target)) {
+          closeWorkspaceTerminal({ workspaceId: selectedWorkspace.id, terminalIndex: target });
+        }
+      }
+      setWorkspaceSettingsError("");
+      setWorkspaceSettingsMessage("");
+    }
+  }, [
+    addWorkspaceWebPane,
+    closeWorkspaceTerminal,
+    selectedWorkspace?.id,
+    selectedWorkspaceWebPaneIndexes,
+  ]);
   const workspaceSettingsSafeModeRequiresGit = Boolean(
     selectedWorkspace
       && !selectedWorkspaceRootGitRepository
@@ -43698,6 +44046,16 @@ export default function App() {
                           <span>Web</span>
                         </RailActionButton>
                         <RailActionButton
+                          aria-label="PCB"
+                          data-active={activeView === "pcb"}
+                          onClick={() => showView("pcb")}
+                          title="PCB design"
+                          type="button"
+                        >
+                          <ButtonProcessIcon aria-hidden="true" />
+                          <span>PCB</span>
+                        </RailActionButton>
+                        <RailActionButton
                           aria-label="History"
                           data-active={activeView === "architecture"}
                           onClick={() => showView("architecture")}
@@ -43720,17 +44078,6 @@ export default function App() {
                       >
                         <ButtonHubIcon aria-hidden="true" />
                         <span>Tools</span>
-                      </RailActionButton>
-                      <RailActionButton
-                        aria-label="Devices"
-                        data-active={activeView === "devices"}
-                        data-scope="global"
-                        onClick={() => showView("devices")}
-                        title="Devices"
-                        type="button"
-                      >
-                        <Devices aria-hidden="true" />
-                        <span>Devices</span>
                       </RailActionButton>
                       <RailActionButton
                         aria-label="Assets"
@@ -43765,20 +44112,6 @@ export default function App() {
                         <ButtonMicIcon aria-hidden="true" />
                         <span>Audio</span>
                       </RailActionButton>
-                      {/* Editor nav button hidden for now (still reachable via showView("editor")). */}
-                      {false && (
-                        <RailActionButton
-                          aria-label="Editor"
-                          data-active={activeView === "editor"}
-                          data-scope="global"
-                          onClick={() => showView("editor")}
-                          title="Editor"
-                          type="button"
-                        >
-                          <ButtonEditorIcon aria-hidden="true" />
-                          <span>Editor</span>
-                        </RailActionButton>
-                      )}
                       <RailActionButton
                         aria-label="Tokenomics"
                         data-active={activeView === "tokenomics"}
@@ -43927,6 +44260,8 @@ export default function App() {
                             agentStatuses={agentStatuses}
                             agentStatusState={agentStatusState}
                             addWorkspaceTerminal={addWorkspaceTerminal}
+                            addWorkspaceWebPane={addWorkspaceWebPane}
+                            paneKinds={runtimeDescriptor.paneKinds}
                             closeWorkspaceTerminal={closeWorkspaceTerminal}
                             changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
                             createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
@@ -43951,6 +44286,7 @@ export default function App() {
                             onToggleWorkspaceThreadPinned={toggleWorkspaceThreadPinnedFromOverlay}
                             onRefreshGitRepositories={refreshWorkspaceGitRepositoryPreload}
                             onRefreshGitSnapshot={refreshWorkspaceGitSnapshotPreload}
+                            onOpenWorkspaceDocumentPanel={openSelectedWorkspaceDocumentPanel}
                             onCloseWorkspaceDocumentPanel={closeWorkspaceDocumentPanel}
                             onMinimizeWorkspaceToolPane={minimizeWorkspaceToolPane}
                             onRestoreWorkspaceToolPane={restoreWorkspaceToolPane}
@@ -44301,7 +44637,7 @@ export default function App() {
                           <WorkspaceCreateSection>
                             <SettingsLabel>Panels</SettingsLabel>
                             <SettingsHint>
-                              Pick non-terminal workspace panels. Documents can be off or one terminal-side panel.
+                              Pick non-terminal workspace panels. Web panels open in the terminals grid and can be driven, split, and popped out.
                             </SettingsHint>
                             <WorkspacePanelCountCards
                               counts={workspaceSettingsPanelCounts}
@@ -45376,23 +45712,26 @@ export default function App() {
                     <WorkspaceIdleState detail="Select a workspace to view task history." viewMotion={viewMotion} />
                   )}
                 </ForgeWorkspace>
-              ) : visibleView === "devices" ? (
-                <ForgeWorkspace aria-label="Account Devices" data-motion={viewMotion}>
-                  <AccountDevicesView
-                    accountLabel={
-                      user?.displayName
-                      || user?.display_name
-                      || user?.name
-                      || user?.email
-                      || activeScope?.label
-                      || "Account"
-                    }
-                    connectedDevices={cloudWorkspaceProgress.connectedDevices}
-                    deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
-                    knownDevices={cloudWorkspaceProgress.knownDevices}
-                    localDesktopProfile={cloudDesktopDeviceProfile}
-                    workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
-                  />
+              ) : visibleView === "pcb" ? (
+                <ForgeWorkspace aria-label="PCB design" data-motion={viewMotion}>
+                  {shouldShowWorkspaceSetup ? (
+                    <WorkspaceIdleState
+                      actionLabel="Create First Workspace"
+                      detail="Create a workspace before designing a PCB."
+                      flameActive={visibleView === "pcb" && !workspaceCreateModalOpen}
+                      onAction={openCreateWorkspaceModal}
+                      plan={billingPlanNameFromStatus(billingStatus, user)}
+                      title="No Workspaces Selected"
+                      viewMotion={viewMotion}
+                    />
+                  ) : selectedWorkspace ? (
+                    <PcbView
+                      rootDirectory={selectedWorkspaceFileRoot}
+                      workspace={selectedWorkspace}
+                    />
+                  ) : (
+                    <WorkspaceIdleState detail="Select a workspace to design a PCB." viewMotion={viewMotion} />
+                  )}
                 </ForgeWorkspace>
               ) : visibleView === "assets" ? (
                 <ForgeWorkspace aria-label="Account Assets" data-motion={viewMotion}>
@@ -45432,10 +45771,6 @@ export default function App() {
                     permissionAttentionId={snippingPermissionAttentionId}
                     captureAttention={snippingCaptureAttention}
                   />
-                </ForgeWorkspace>
-              ) : visibleView === "editor" ? (
-                <ForgeWorkspace aria-label="Editor" data-motion={viewMotion}>
-                  <EditorWorkspaceView defaultWorkingDirectory={defaultWorkingDirectory} />
                 </ForgeWorkspace>
               ) : visibleView === "audio" ? (
                 <ForgeWorkspace aria-label="Workspace audio" data-motion={viewMotion}>

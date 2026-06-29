@@ -57,6 +57,8 @@ const loadRootComponent = hash === "#/snipping-overlay"
   ? import("./terminals/TerminalWindowHost.jsx").then((module) => module.default)
   : hash.startsWith("#/tools-window")
   ? import("./tools/ToolsWindowHost.jsx").then((module) => module.default)
+  : hash.startsWith("#/web-panel")
+  ? import("./web/WebPanelHost.jsx").then((module) => module.default)
   : import("./App.jsx").then((module) => module.default);
 
 loadRootComponent.then((RootComponent) => {

@@ -69,12 +69,20 @@ fn workspace_webview_open(
     y: f64,
     width: f64,
     height: f64,
+    window_label: Option<String>,
 ) -> Result<(), String> {
     validate_workspace_webview_label(&label)?;
     let parsed_url = validate_workspace_webview_url(&url)?;
+    // Default to the main window, but allow a breakout window (e.g. the web panel
+    // pop-out) to host its own child webview by passing its own label.
+    let parent_label = window_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("main");
     let window = app
-        .get_window("main")
-        .ok_or_else(|| "Main window is unavailable.".to_string())?;
+        .get_window(parent_label)
+        .ok_or_else(|| "Host window is unavailable.".to_string())?;
 
     if let Some(existing) = workspace_webview_for_label(&app, &label) {
         let _ = existing.hide();
@@ -113,7 +121,12 @@ fn workspace_webview_open(
             tauri::LogicalSize::new(safe_width, safe_height),
         )
         .map_err(|error| format!("Unable to open workspace web view: {error}"))?;
-    let _ = webview.hide();
+    // The child webview is created already positioned over the viewport, so make it
+    // visible right away. Gating visibility on the page-load "finished" event is
+    // unreliable for child webviews on macOS and leaves the panel blank/black when
+    // the event never arrives.
+    let _ = webview.show();
+    let _ = webview.set_focus();
     Ok(())
 }
 

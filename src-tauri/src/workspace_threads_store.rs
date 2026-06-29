@@ -254,7 +254,9 @@ fn workspace_agent_session_history_item_session_id(
         .or_else(|| workspace_threads_clean_provider_session_id(&item.native_session_id))
 }
 
-fn workspace_agent_session_history_item_is_visible(item: &WorkspaceAgentSessionHistoryItem) -> bool {
+fn workspace_agent_session_history_item_is_visible(
+    item: &WorkspaceAgentSessionHistoryItem,
+) -> bool {
     let Some(agent_id) = workspace_threads_clean_agent_id(&item.agent_id)
         .or_else(|| workspace_threads_clean_agent_id(&item.provider))
     else {
@@ -264,6 +266,105 @@ fn workspace_agent_session_history_item_is_visible(item: &WorkspaceAgentSessionH
         return false;
     };
     workspace_agent_session_history_session_id_is_visible(&agent_id, &session_id)
+}
+
+fn workspace_agent_session_history_identity(
+    workspace_id: &str,
+    agent_id: &str,
+    session_id: &str,
+) -> Option<String> {
+    let workspace_id = workspace_threads_clean_workspace_id(workspace_id).ok()?;
+    let agent_id = workspace_threads_clean_agent_id(agent_id)?;
+    let session_id = workspace_threads_clean_provider_session_id(session_id)?;
+    workspace_agent_session_history_session_id_is_visible(&agent_id, &session_id)
+        .then(|| format!("{workspace_id}\n{agent_id}\n{session_id}"))
+}
+
+fn workspace_agent_session_history_record_id(
+    workspace_id: &str,
+    agent_id: &str,
+    session_id: &str,
+) -> String {
+    format!("session:{workspace_id}:{agent_id}:{session_id}")
+        .chars()
+        .take(512)
+        .collect()
+}
+
+fn workspace_agent_session_history_item_identity(
+    item: &WorkspaceAgentSessionHistoryItem,
+) -> Option<String> {
+    let agent_id = workspace_threads_clean_agent_id(&item.agent_id)
+        .or_else(|| workspace_threads_clean_agent_id(&item.provider))?;
+    let session_id = workspace_agent_session_history_item_session_id(item)?;
+    workspace_agent_session_history_identity(&item.workspace_id, &agent_id, &session_id)
+}
+
+fn workspace_agent_session_history_merge_text(current: &mut String, candidate: String) {
+    if current.trim().is_empty() && !candidate.trim().is_empty() {
+        *current = candidate;
+    }
+}
+
+fn workspace_agent_session_history_merge_item(
+    current: &mut WorkspaceAgentSessionHistoryItem,
+    candidate: WorkspaceAgentSessionHistoryItem,
+) {
+    current.created_at_ms = current.created_at_ms.min(candidate.created_at_ms);
+    current.latest_at_ms = current.latest_at_ms.max(candidate.latest_at_ms);
+    workspace_agent_session_history_merge_text(
+        &mut current.workspace_name,
+        candidate.workspace_name.clone(),
+    );
+    workspace_agent_session_history_merge_text(
+        &mut current.coordination_session_id,
+        candidate.coordination_session_id.clone(),
+    );
+    workspace_agent_session_history_merge_text(
+        &mut current.provider_session_id,
+        candidate.provider_session_id.clone(),
+    );
+    workspace_agent_session_history_merge_text(
+        &mut current.native_session_id,
+        candidate.native_session_id.clone(),
+    );
+    workspace_agent_session_history_merge_text(&mut current.model_id, candidate.model_id.clone());
+    workspace_agent_session_history_merge_text(
+        &mut current.model_source,
+        candidate.model_source.clone(),
+    );
+    workspace_agent_session_history_merge_text(&mut current.thread_id, candidate.thread_id.clone());
+    workspace_agent_session_history_merge_text(&mut current.pane_id, candidate.pane_id.clone());
+    workspace_agent_session_history_merge_text(&mut current.slot_key, candidate.slot_key.clone());
+    workspace_agent_session_history_merge_text(&mut current.cwd, candidate.cwd.clone());
+    workspace_agent_session_history_merge_text(&mut current.status, candidate.status.clone());
+    workspace_agent_session_history_merge_text(&mut current.title, candidate.title.clone());
+    workspace_agent_session_history_merge_text(&mut current.source, candidate.source.clone());
+    if current.terminal_instance_id.is_none() {
+        current.terminal_instance_id = candidate.terminal_instance_id;
+    }
+    if current.terminal_index.is_none() {
+        current.terminal_index = candidate.terminal_index;
+    }
+}
+
+fn workspace_agent_session_history_dedupe_items(
+    items: Vec<WorkspaceAgentSessionHistoryItem>,
+) -> Vec<WorkspaceAgentSessionHistoryItem> {
+    let mut deduped = Vec::<WorkspaceAgentSessionHistoryItem>::new();
+    let mut positions = HashMap::<String, usize>::new();
+    for item in items {
+        let Some(identity) = workspace_agent_session_history_item_identity(&item) else {
+            continue;
+        };
+        if let Some(index) = positions.get(&identity).copied() {
+            workspace_agent_session_history_merge_item(&mut deduped[index], item);
+            continue;
+        }
+        positions.insert(identity, deduped.len());
+        deduped.push(item);
+    }
+    deduped
 }
 
 fn workspace_threads_now_millis_u64() -> u64 {
@@ -406,25 +507,30 @@ fn workspace_agent_session_history_upsert_blocking(
     record: WorkspaceAgentSessionHistoryRecord,
 ) -> Result<bool, String> {
     let workspace_id = workspace_threads_clean_workspace_id(&record.workspace_id)?;
-    let Some(id) = workspace_threads_clean_thread_id(&record.id) else {
-        return Ok(false);
-    };
     let Some(agent_id) = workspace_threads_clean_agent_id(&record.agent_id) else {
         return Ok(false);
     };
-    let provider = workspace_threads_clean_agent_id(&record.provider)
-        .unwrap_or_else(|| agent_id.clone());
+    let provider =
+        workspace_threads_clean_agent_id(&record.provider).unwrap_or_else(|| agent_id.clone());
     let provider_session_id =
-        workspace_threads_clean_provider_session_id(&record.provider_session_id).unwrap_or_default();
+        workspace_threads_clean_provider_session_id(&record.provider_session_id)
+            .unwrap_or_default();
     let native_session_id =
         workspace_threads_clean_provider_session_id(&record.native_session_id).unwrap_or_default();
     let visible_session_id = workspace_agent_session_history_record_session_id(&record);
-    if !visible_session_id
-        .as_deref()
-        .is_some_and(|session_id| workspace_agent_session_history_session_id_is_visible(&provider, session_id))
-    {
+    if !visible_session_id.as_deref().is_some_and(|session_id| {
+        workspace_agent_session_history_session_id_is_visible(&provider, session_id)
+    }) {
         return Ok(false);
     }
+    let id = workspace_agent_session_history_record_id(
+        &workspace_id,
+        &provider,
+        visible_session_id.as_deref().unwrap_or_default(),
+    );
+    let Some(id) = workspace_threads_clean_thread_id(&id) else {
+        return Ok(false);
+    };
     let observed_at_ms = record
         .observed_at_ms
         .unwrap_or_else(workspace_threads_now_millis_u64);
@@ -555,10 +661,9 @@ fn workspace_agent_session_history_first_user_preview(
     )
     .ok()
     .and_then(|transcript| {
-        transcript
-            .messages
-            .into_iter()
-            .find(|message| message.role.eq_ignore_ascii_case("user") && !message.text.trim().is_empty())
+        transcript.messages.into_iter().find(|message| {
+            message.role.eq_ignore_ascii_case("user") && !message.text.trim().is_empty()
+        })
     })
     .map(|message| {
         clean_codex_title(
@@ -606,9 +711,7 @@ fn workspace_agent_session_history_preview_cache_key(
     Some(format!("{agent_id}\n{provider_session_id}\n{cwd}"))
 }
 
-fn workspace_agent_session_history_enrich_previews(
-    items: &mut [WorkspaceAgentSessionHistoryItem],
-) {
+fn workspace_agent_session_history_enrich_previews(items: &mut [WorkspaceAgentSessionHistoryItem]) {
     let mut previews = HashMap::<String, String>::new();
     for item in items.iter_mut() {
         let Some(key) = workspace_agent_session_history_preview_cache_key(item) else {
@@ -673,52 +776,58 @@ fn workspace_agent_session_history_list_blocking(
         )
         .map_err(|error| format!("Unable to prepare workspace session history read: {error}"))?;
     let rows = statement
-        .query_map(rusqlite::params![workspace_id.as_str(), limit as i64], |row| {
-            let terminal_instance_id = row
-                .get::<_, Option<i64>>(13)?
-                .and_then(|value| u64::try_from(value).ok());
-            let created_at_ms = row
-                .get::<_, i64>(20)
-                .ok()
-                .and_then(|value| u64::try_from(value).ok())
-                .unwrap_or(0);
-            let latest_at_ms = row
-                .get::<_, i64>(21)
-                .ok()
-                .and_then(|value| u64::try_from(value).ok())
-                .unwrap_or(created_at_ms);
-            Ok(WorkspaceAgentSessionHistoryItem {
-                id: row.get(0)?,
-                workspace_id: row.get(1)?,
-                workspace_name: row.get(2)?,
-                workspace_root: row.get(3)?,
-                coordination_session_id: row.get(4)?,
-                provider_session_id: row.get(5)?,
-                native_session_id: row.get(6)?,
-                agent_id: row.get(7)?,
-                provider: row.get(8)?,
-                model_id: row.get(9)?,
-                model_source: row.get(10)?,
-                thread_id: row.get(11)?,
-                pane_id: row.get(12)?,
-                terminal_instance_id,
-                terminal_index: row.get(14)?,
-                slot_key: row.get(15)?,
-                cwd: row.get(16)?,
-                status: row.get(17)?,
-                title: row.get(18)?,
-                first_user_message: String::new(),
-                source: row.get(19)?,
-                created_at_ms,
-                latest_at_ms,
-            })
-        })
+        .query_map(
+            rusqlite::params![workspace_id.as_str(), limit as i64],
+            |row| {
+                let terminal_instance_id = row
+                    .get::<_, Option<i64>>(13)?
+                    .and_then(|value| u64::try_from(value).ok());
+                let created_at_ms = row
+                    .get::<_, i64>(20)
+                    .ok()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or(0);
+                let latest_at_ms = row
+                    .get::<_, i64>(21)
+                    .ok()
+                    .and_then(|value| u64::try_from(value).ok())
+                    .unwrap_or(created_at_ms);
+                Ok(WorkspaceAgentSessionHistoryItem {
+                    id: row.get(0)?,
+                    workspace_id: row.get(1)?,
+                    workspace_name: row.get(2)?,
+                    workspace_root: row.get(3)?,
+                    coordination_session_id: row.get(4)?,
+                    provider_session_id: row.get(5)?,
+                    native_session_id: row.get(6)?,
+                    agent_id: row.get(7)?,
+                    provider: row.get(8)?,
+                    model_id: row.get(9)?,
+                    model_source: row.get(10)?,
+                    thread_id: row.get(11)?,
+                    pane_id: row.get(12)?,
+                    terminal_instance_id,
+                    terminal_index: row.get(14)?,
+                    slot_key: row.get(15)?,
+                    cwd: row.get(16)?,
+                    status: row.get(17)?,
+                    title: row.get(18)?,
+                    first_user_message: String::new(),
+                    source: row.get(19)?,
+                    created_at_ms,
+                    latest_at_ms,
+                })
+            },
+        )
         .map_err(|error| format!("Unable to read workspace session history rows: {error}"))?;
     let mut items = Vec::new();
     for row in rows {
-        items.push(row.map_err(|error| format!("Unable to read workspace session history row: {error}"))?);
+        items.push(
+            row.map_err(|error| format!("Unable to read workspace session history row: {error}"))?,
+        );
     }
     items.retain(workspace_agent_session_history_item_is_visible);
+    items = workspace_agent_session_history_dedupe_items(items);
     workspace_agent_session_history_enrich_previews(&mut items);
     Ok(WorkspaceAgentSessionHistoryListResult {
         generated_at_ms: workspace_threads_now_millis_u64(),
@@ -1038,6 +1147,16 @@ fn workspace_threads_record_provider_session_binding(
             ],
         )
         .map_err(|error| format!("Unable to persist provider session binding: {error}"))?;
+    connection
+        .execute(
+            "DELETE FROM workspace_thread_provider_session_binding
+            WHERE workspace_id = ?1
+                AND agent_id = ?2
+                AND provider_session_id = ?3
+                AND thread_id != ?4",
+            rusqlite::params![workspace_id, agent_id, provider_session_id, thread_id],
+        )
+        .map_err(|error| format!("Unable to prune duplicate provider session bindings: {error}"))?;
     Ok(true)
 }
 
@@ -1207,13 +1326,14 @@ fn workspace_threads_merge_provider_session_bindings(
             "SELECT binding_json
             FROM workspace_thread_provider_session_binding
             WHERE workspace_id = ?1
-            ORDER BY updated_at ASC",
+            ORDER BY updated_at DESC, thread_id DESC",
         )
         .map_err(|error| format!("Unable to prepare provider session binding read: {error}"))?;
     let mut rows = statement
         .query(rusqlite::params![workspace_id])
         .map_err(|error| format!("Unable to read provider session binding rows: {error}"))?;
 
+    let mut seen_provider_sessions = HashMap::<String, bool>::new();
     while let Some(row) = rows
         .next()
         .map_err(|error| format!("Unable to read provider session binding row: {error}"))?
@@ -1224,6 +1344,24 @@ fn workspace_threads_merge_provider_session_bindings(
         let Ok(binding) = serde_json::from_str::<Value>(&binding_text) else {
             continue;
         };
+        let agent_id = workspace_threads_binding_text(&binding, &["agentId", "agent_id"]);
+        let provider_session_id = workspace_threads_binding_text(
+            &binding,
+            &[
+                "providerSessionId",
+                "provider_session_id",
+                "nativeSessionId",
+                "native_session_id",
+            ],
+        );
+        let identity = format!("{agent_id}\n{provider_session_id}");
+        if agent_id.is_empty()
+            || provider_session_id.is_empty()
+            || seen_provider_sessions.contains_key(&identity)
+        {
+            continue;
+        }
+        seen_provider_sessions.insert(identity, true);
         workspace_threads_apply_provider_session_binding(state, &binding);
     }
 
@@ -1712,6 +1850,69 @@ mod workspace_threads_store_tests {
             Some("gpt-5.5")
         );
 
+        let duplicate_recorded = workspace_threads_record_provider_session_binding(
+            Some(root_text.as_str()),
+            WorkspaceThreadProviderSessionBinding {
+                agent_id: "codex".to_string(),
+                cwd: root_text.clone(),
+                instance_id: Some(43),
+                model_id: "gpt-5.5".to_string(),
+                native_session_id: "codex-session-12345678".to_string(),
+                native_session_kind: "session".to_string(),
+                native_session_source: "terminal-output".to_string(),
+                observed_at_ms: 2234,
+                pane_id: "pane-session-binding-next".to_string(),
+                provider: "codex".to_string(),
+                provider_session_id: "codex-session-12345678".to_string(),
+                session_title: "Codex".to_string(),
+                source: "terminal-output".to_string(),
+                terminal_index: Some(2),
+                thread_id: "thread-session-binding-next".to_string(),
+                workspace_id: "workspace-session-binding".to_string(),
+            },
+        )
+        .expect("record duplicate provider binding");
+        assert!(duplicate_recorded);
+        let (connection, _, _) =
+            workspace_threads_open_store(Some(root_text.as_str()), true).expect("open store");
+        let binding_count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*)
+                FROM workspace_thread_provider_session_binding
+                WHERE workspace_id = ?1 AND agent_id = ?2 AND provider_session_id = ?3",
+                rusqlite::params![
+                    "workspace-session-binding",
+                    "codex",
+                    "codex-session-12345678",
+                ],
+                |row| row.get(0),
+            )
+            .expect("count provider bindings");
+        assert_eq!(binding_count, 1);
+        let result = workspace_threads_read_blocking(WorkspaceThreadsReadRequest {
+            workspaces: vec![WorkspaceThreadsReadWorkspace {
+                root_directory: Some(root_text.clone()),
+                workspace_id: "workspace-session-binding".to_string(),
+            }],
+        })
+        .expect("read workspace threads after duplicate binding");
+        let state = result
+            .threads
+            .get("workspace-session-binding")
+            .expect("workspace state after duplicate binding");
+        assert_eq!(
+            state
+                .pointer("/terminalThreadIds/2")
+                .and_then(Value::as_str),
+            Some("thread-session-binding-next")
+        );
+        assert_eq!(
+            state
+                .pointer("/threads/thread-session-binding-next/transcriptSessionId")
+                .and_then(Value::as_str),
+            Some("codex-session-12345678")
+        );
+
         let _ = fs::remove_dir_all(root);
     }
 
@@ -1748,7 +1949,10 @@ mod workspace_threads_store_tests {
             },
         )
         .expect("record session history");
-        assert!(!recorded, "terminal-only rows without provider sessions are not history");
+        assert!(
+            !recorded,
+            "terminal-only rows without provider sessions are not history"
+        );
 
         let other_recorded = workspace_agent_session_history_upsert_blocking(
             Some(root_text.as_str()),
@@ -1779,13 +1983,14 @@ mod workspace_threads_store_tests {
         .expect("record other workspace session history");
         assert!(!other_recorded);
 
-        let result =
-            workspace_agent_session_history_list_blocking(WorkspaceAgentSessionHistoryListRequest {
+        let result = workspace_agent_session_history_list_blocking(
+            WorkspaceAgentSessionHistoryListRequest {
                 limit: Some(50),
                 root_directory: Some(root_text.clone()),
                 workspace_id: "workspace-session-history".to_string(),
-            })
-            .expect("list session history");
+            },
+        )
+        .expect("list session history");
         assert!(result.items.is_empty());
 
         let updated = workspace_agent_session_history_upsert_blocking(
@@ -1817,16 +2022,25 @@ mod workspace_threads_store_tests {
         .expect("update session history");
         assert!(updated);
 
-        let result =
-            workspace_agent_session_history_list_blocking(WorkspaceAgentSessionHistoryListRequest {
+        let result = workspace_agent_session_history_list_blocking(
+            WorkspaceAgentSessionHistoryListRequest {
                 limit: Some(50),
                 root_directory: Some(root_text.clone()),
                 workspace_id: "workspace-session-history".to_string(),
-            })
-            .expect("list updated session history");
+            },
+        )
+        .expect("list updated session history");
         assert_eq!(result.items.len(), 1);
         let item = &result.items[0];
         assert_eq!(item.model_id, "gpt-5.5");
+        assert_eq!(
+            item.id,
+            workspace_agent_session_history_record_id(
+                "workspace-session-history",
+                "codex",
+                "codex-provider-123"
+            )
+        );
         assert_eq!(item.provider_session_id, "codex-provider-123");
         assert_eq!(item.native_session_id, "codex-native-123");
         assert_eq!(item.status, "idle");
@@ -1834,6 +2048,48 @@ mod workspace_threads_store_tests {
         assert_eq!(item.created_at_ms, 1000);
         assert_eq!(item.latest_at_ms, 3000);
         assert_eq!(item.terminal_index, Some(2));
+
+        let duplicate_update = workspace_agent_session_history_upsert_blocking(
+            Some(root_text.as_str()),
+            WorkspaceAgentSessionHistoryRecord {
+                agent_id: "openai".to_string(),
+                coordination_session_id: "coord-session-duplicate".to_string(),
+                created_at_ms: Some(500),
+                cwd: root_text.clone(),
+                id: "different-history-id-for-same-provider-session".to_string(),
+                model_id: "gpt-5.5".to_string(),
+                model_source: "launch".to_string(),
+                native_session_id: "codex-native-123".to_string(),
+                observed_at_ms: Some(4000),
+                pane_id: "pane-session-history-duplicate".to_string(),
+                provider: "openai".to_string(),
+                provider_session_id: "codex-provider-123".to_string(),
+                slot_key: "slot-duplicate".to_string(),
+                source: "terminal_activity_hook:provider-session".to_string(),
+                status: "idle".to_string(),
+                terminal_index: Some(7),
+                terminal_instance_id: Some(77),
+                thread_id: "thread-session-history-duplicate".to_string(),
+                title: "Duplicate Ada".to_string(),
+                workspace_id: "workspace-session-history".to_string(),
+                workspace_name: "Session History".to_string(),
+            },
+        )
+        .expect("dedupe same provider session history");
+        assert!(duplicate_update);
+        let result = workspace_agent_session_history_list_blocking(
+            WorkspaceAgentSessionHistoryListRequest {
+                limit: Some(50),
+                root_directory: Some(root_text.clone()),
+                workspace_id: "workspace-session-history".to_string(),
+            },
+        )
+        .expect("list deduped session history");
+        assert_eq!(result.items.len(), 1);
+        let item = &result.items[0];
+        assert_eq!(item.provider_session_id, "codex-provider-123");
+        assert_eq!(item.created_at_ms, 500);
+        assert_eq!(item.latest_at_ms, 4000);
 
         let invalid_opencode = workspace_agent_session_history_upsert_blocking(
             Some(root_text.as_str()),
@@ -1863,15 +2119,100 @@ mod workspace_threads_store_tests {
         )
         .expect("reject invalid opencode session history");
         assert!(!invalid_opencode);
-        let result =
-            workspace_agent_session_history_list_blocking(WorkspaceAgentSessionHistoryListRequest {
+        let result = workspace_agent_session_history_list_blocking(
+            WorkspaceAgentSessionHistoryListRequest {
                 limit: Some(50),
                 root_directory: Some(root_text.clone()),
                 workspace_id: "workspace-session-history".to_string(),
-            })
-            .expect("list after invalid opencode session history");
+            },
+        )
+        .expect("list after invalid opencode session history");
         assert_eq!(result.items.len(), 1);
-        assert_eq!(result.items[0].id, "session-history-1");
+        assert_eq!(result.items[0].provider_session_id, "codex-provider-123");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_agent_session_history_list_dedupes_legacy_rows_by_session_id() {
+        let root = unique_workspace_threads_test_root("agent-session-history-legacy-dedupe");
+        fs::create_dir_all(&root).expect("create workspace root");
+        let root_text = root.to_string_lossy().to_string();
+        let (connection, root_path, _) =
+            workspace_threads_open_store(Some(root_text.as_str()), true).expect("open store");
+        let root_display = workspace_path_display(&root_path);
+        for (id, created_at_ms, latest_at_ms) in [
+            ("legacy-history-row-older", 1000i64, 2000i64),
+            ("legacy-history-row-newer", 3000i64, 5000i64),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO workspace_agent_session_history (
+                        id,
+                        workspace_id,
+                        workspace_root,
+                        workspace_name,
+                        coordination_session_id,
+                        provider_session_id,
+                        native_session_id,
+                        agent_id,
+                        provider,
+                        model_id,
+                        model_source,
+                        thread_id,
+                        pane_id,
+                        terminal_instance_id,
+                        terminal_index,
+                        slot_key,
+                        cwd,
+                        status,
+                        title,
+                        source,
+                        created_at_ms,
+                        latest_at_ms,
+                        created_at,
+                        updated_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?21)",
+                    rusqlite::params![
+                        id,
+                        "workspace-session-history",
+                        root_display,
+                        "Session History",
+                        "coord-legacy",
+                        "claude-session-legacy-123",
+                        "claude",
+                        "sonnet",
+                        "launch",
+                        format!("thread-{id}"),
+                        format!("pane-{id}"),
+                        42i64,
+                        2i64,
+                        "slot-legacy",
+                        root_text,
+                        "idle",
+                        "Second Prompt - Do Nothing",
+                        "terminal_activity_hook:provider-session",
+                        created_at_ms,
+                        latest_at_ms,
+                        workspace_threads_now_millis(),
+                    ],
+                )
+                .expect("insert legacy history row");
+        }
+
+        let result = workspace_agent_session_history_list_blocking(
+            WorkspaceAgentSessionHistoryListRequest {
+                limit: Some(50),
+                root_directory: Some(root.to_string_lossy().to_string()),
+                workspace_id: "workspace-session-history".to_string(),
+            },
+        )
+        .expect("list legacy session history");
+        assert_eq!(result.items.len(), 1);
+        let item = &result.items[0];
+        assert_eq!(item.provider_session_id, "claude-session-legacy-123");
+        assert_eq!(item.created_at_ms, 1000);
+        assert_eq!(item.latest_at_ms, 5000);
 
         let _ = fs::remove_dir_all(root);
     }

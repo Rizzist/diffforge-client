@@ -79,17 +79,11 @@ const CLOUD_MCP_CREDIT_METER_COORDINATION_TASK: &str = "coordination.task";
 const CLOUD_MCP_CREDIT_METER_TODO_CREATED: &str = "todo.created";
 const CLOUD_MCP_CREDIT_METER_PLAN_CREATED: &str = "plan.created";
 const CLOUD_MCP_CREDIT_METER_ASSET_TRANSFER: &str = "asset.transfer";
-const CLOUD_MCP_CREDIT_METER_EDITOR_MEDIA_CONVERSION_TRANSFER: &str =
-    "editor.media_conversion.transfer";
 const CLOUD_MCP_CREDIT_METER_RENAMES: &[(&str, &str)] = &[
     ("task_created", CLOUD_MCP_CREDIT_METER_COORDINATION_TASK),
     ("todo_created", CLOUD_MCP_CREDIT_METER_TODO_CREATED),
     ("plan_created", CLOUD_MCP_CREDIT_METER_PLAN_CREATED),
     ("asset_transfer_mb", CLOUD_MCP_CREDIT_METER_ASSET_TRANSFER),
-    (
-        "editor_media_conversion_transfer_mb",
-        CLOUD_MCP_CREDIT_METER_EDITOR_MEDIA_CONVERSION_TRANSFER,
-    ),
 ];
 const CLOUD_MCP_OUTBOX_DB_FILE: &str = "cloud-sync-outbox.sqlite";
 const CLOUD_MCP_OUTBOX_TABLE: &str = "cloud_sync_outbox";
@@ -1651,34 +1645,6 @@ fn cloud_mcp_record_diffforge_asset_transfer_credit(
         transfer_id,
         cloud_id,
         direction,
-        bytes,
-    )
-}
-
-fn cloud_mcp_record_diffforge_editor_media_conversion_transfer_credit(
-    job_id: &str,
-    direction: &str,
-    bytes: i64,
-) -> Result<i64, String> {
-    let job_id = job_id.trim();
-    if job_id.is_empty() {
-        return Ok(0);
-    }
-    let direction = direction.trim().to_ascii_lowercase();
-    let transfer_id = format!("editor-media-conversion-{job_id}-{direction}");
-    cloud_mcp_record_diffforge_transfer_credit(
-        CLOUD_MCP_CREDIT_METER_EDITOR_MEDIA_CONVERSION_TRANSFER,
-        "editor_media_conversion_transfer",
-        "Editor WebM Conversion Transfer",
-        "Editor WebM Conversion Transfer",
-        "editor_media_conversion_transfer_bytes",
-        "editor.media_conversion.transfer",
-        None,
-        None,
-        job_id,
-        &transfer_id,
-        "diffforge-editor-cloud-convert",
-        &direction,
         bytes,
     )
 }
@@ -48786,41 +48752,13 @@ mod cloud_mcp_tests {
             .unwrap(),
             0
         );
-        assert_eq!(
-            cloud_mcp_record_diffforge_editor_media_conversion_transfer_credit(
-                "editor-job-1",
-                "upload",
-                400_000,
-            )
-            .unwrap(),
-            0
-        );
-        assert_eq!(
-            cloud_mcp_record_diffforge_editor_media_conversion_transfer_credit(
-                "editor-job-1",
-                "download",
-                700_000,
-            )
-            .unwrap(),
-            1
-        );
-        assert_eq!(
-            cloud_mcp_record_diffforge_editor_media_conversion_transfer_credit(
-                "editor-job-1",
-                "download",
-                700_000,
-            )
-            .unwrap(),
-            0
-        );
-
         let summary = cloud_mcp_diffforge_credit_ledger_summary(20);
-        assert_eq!(summary["totalCredits"].as_i64(), Some(6));
-        assert_eq!(summary["transfer"]["totalBytes"].as_i64(), Some(2_200_000));
-        assert_eq!(summary["transfer"]["billedCredits"].as_i64(), Some(2));
+        assert_eq!(summary["totalCredits"].as_i64(), Some(5));
+        assert_eq!(summary["transfer"]["totalBytes"].as_i64(), Some(1_100_000));
+        assert_eq!(summary["transfer"]["billedCredits"].as_i64(), Some(1));
         assert_eq!(
             summary["transfer"]["remainderBytes"].as_i64(),
-            Some(200_000)
+            Some(100_000)
         );
 
         let by_meter = summary["byMeter"].as_array().unwrap();
@@ -48835,18 +48773,6 @@ mod cloud_mcp_tests {
         assert_eq!(meter_credits(CLOUD_MCP_CREDIT_METER_PLAN_CREATED), 1);
         assert_eq!(meter_credits(CLOUD_MCP_CREDIT_METER_COORDINATION_TASK), 1);
         assert_eq!(meter_credits(CLOUD_MCP_CREDIT_METER_ASSET_TRANSFER), 1);
-        assert_eq!(
-            meter_credits(CLOUD_MCP_CREDIT_METER_EDITOR_MEDIA_CONVERSION_TRANSFER),
-            1
-        );
-        let items = summary["items"].as_array().unwrap();
-        assert!(items.iter().any(|item| {
-            item["meter"].as_str() == Some(CLOUD_MCP_CREDIT_METER_EDITOR_MEDIA_CONVERSION_TRANSFER)
-                && item["reason"].as_str() == Some("Editor WebM Conversion Transfer")
-                && item["description"].as_str().is_some_and(|description| {
-                    description.contains("Editor WebM Conversion Transfer")
-                })
-        }));
 
         let merged = cloud_mcp_merge_diffforge_credit_ledger(
             json!({"credits": {"used_credits": 99}}),
@@ -48854,7 +48780,7 @@ mod cloud_mcp_tests {
         );
         assert_eq!(
             merged["credits"]["localMeteredUsedCredits"].as_i64(),
-            Some(6)
+            Some(5)
         );
         assert_eq!(
             merged["credits"]["usageHistory"].as_array().map(Vec::len),

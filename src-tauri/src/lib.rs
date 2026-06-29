@@ -2518,6 +2518,7 @@ include!("backend_cpu.rs");
 include!("workspace_files.rs");
 include!("workspace_threads_store.rs");
 include!("architectures.rs");
+include!("pcb.rs");
 include!("workspace_web.rs");
 include!("developer_processes.rs");
 include!("app_control_mcp.rs");
@@ -2530,6 +2531,7 @@ include!("assets.rs");
 include!("agent_sessions.rs");
 include!("terminals.rs");
 include!("tools_window.rs");
+include!("web_panel.rs");
 include!("api.rs");
 include!("activity_overlay.rs");
 include!("todo_dispatch.rs");
@@ -2540,9 +2542,6 @@ include!("audio_history.rs");
 include!("handsfree_audio.rs");
 include!("voice_text_rules.rs");
 include!("snipping.rs");
-include!("editor.rs");
-include!("editor_export.rs");
-include!("editor_control.rs");
 
 fn diagnostic_log_path(file_name: &str) -> PathBuf {
     let tauri_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -4795,7 +4794,6 @@ pub fn run() {
         .manage(WindowsTerminalDiagnosticState::new())
         .manage(CloudMcpState::new())
         .manage(AppControlMcpState::new())
-        .manage(EditorSelectionStore::new())
         .manage(DeveloperProcessMonitorState::new())
         .manage(AudioState {
             download_lock: Arc::new(Mutex::new(())),
@@ -4945,28 +4943,6 @@ pub fn run() {
             rename_workspace_entry,
             delete_workspace_entry,
             move_workspace_entry,
-            editor_list_projects,
-            editor_create_project,
-            editor_get_project,
-            editor_rename_project,
-            editor_delete_project,
-            editor_save_timeline,
-            editor_apply_ops,
-            editor_list_media,
-            editor_create_folder,
-            editor_import_media,
-            editor_convert_mp4_to_webm,
-            editor_stub_generation,
-            editor_delete_media,
-            editor_probe_media,
-            editor_thumbnail,
-            editor_decode_frame,
-            editor_waveform,
-            editor_decode_audio_pcm,
-            editor_export_timeline,
-            editor_decode_composite_frame,
-            editor_publish_context,
-            editor_get_published_context,
             workspace_threads_read,
             workspace_threads_persist,
             workspace_threads_persist_delta,
@@ -4983,6 +4959,12 @@ pub fn run() {
             architecture_global_root,
             architecture_named_root,
             architecture_graph_copy,
+            pcb_documents_list,
+            pcb_document_read,
+            pcb_document_create,
+            pcb_watch_start,
+            pcb_window_open,
+            pcb_window_close,
             delete_workspace_local_metadata,
             run_forge_prompt,
             agent_thread_turn_start,
@@ -5283,6 +5265,9 @@ pub fn run() {
             tools_window_open,
             tools_window_close,
             tools_window_focus,
+            web_panel_open,
+            web_panel_close,
+            web_panel_focus,
             terminal_pane_runtime_info,
             terminal_live_sessions,
             coordination::tauri_commands::coordination_init,

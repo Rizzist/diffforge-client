@@ -2072,6 +2072,7 @@ function WorkspaceTerminal({
   windowBreakoutHosted = false,
   terminalIndex = 0,
   terminalCount = 1,
+  draggablePaneCount = terminalCount,
   terminalRole = "",
   thread = null,
   threadsViewActive = false,
@@ -2271,6 +2272,11 @@ function WorkspaceTerminal({
     return () => observer.disconnect();
   }, [applyCurrentTerminalTheme]);
   const terminalChromeDocked = Boolean(dockedChrome);
+  const normalizedDraggablePaneCount = Math.max(
+    1,
+    Number.parseInt(draggablePaneCount, 10) || terminalCount || 1,
+  );
+  const canDragTerminalPane = terminalBreakoutActive || normalizedDraggablePaneCount > 1;
   const terminalRoleId = String(terminalRole || agent?.id || "").toLowerCase();
   const isGenericTerminal = terminalRoleId === "generic" || agent?.id === "generic";
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
@@ -5124,7 +5130,7 @@ function WorkspaceTerminal({
       || isFullscreen
       || event.button !== 0
       || (breakoutSurfaceDrag && !terminalBreakoutActive)
-      || (!terminalBreakoutActive && terminalCount <= 1)
+      || !canDragTerminalPane
     ) {
       return false;
     }
@@ -5154,13 +5160,13 @@ function WorkspaceTerminal({
     return true;
   }, [
     activateTerminalPane,
+    canDragTerminalPane,
     isFullscreen,
     onBeginTerminalDrag,
     paneId,
     terminalBreakoutActive,
     terminalClosed,
     terminalClosing,
-    terminalCount,
     terminalIndex,
     workspace?.id,
   ]);
@@ -16077,7 +16083,7 @@ function WorkspaceTerminal({
         "--terminal-slot-accent": shellLauncherHasLaunched ? "#3ccb7f" : "#f2c24e",
       }
       : undefined;
-  const showDockedTerminalDragHandle = terminalChromeDocked && showDockedDragHandle && terminalCount > 1;
+  const showDockedTerminalDragHandle = terminalChromeDocked && showDockedDragHandle && canDragTerminalPane;
   const terminalDragHandleVisible = !terminalChromeDocked || showDockedTerminalDragHandle;
 
   return (
@@ -16100,7 +16106,7 @@ function WorkspaceTerminal({
             <TerminalRestartButton
               aria-label="Drag terminal"
               data-terminal-drag-handle="true"
-              disabled={terminalClosed || terminalClosing || isFullscreen || (!terminalBreakoutActive && terminalCount <= 1)}
+              disabled={terminalClosed || terminalClosing || isFullscreen || !canDragTerminalPane}
               onPointerDown={beginTerminalDrag}
               title={isFullscreen ? "Exit fullscreen to reorder terminals" : "Drag terminal"}
               type="button"

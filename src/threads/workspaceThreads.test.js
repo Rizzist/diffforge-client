@@ -119,6 +119,67 @@ test("provider session binding attaches to the live terminal thread without a th
   assert.equal(nextEntry.terminals[1].activityStatus, "thinking");
 });
 
+test("fresh terminal open without provider session clears stale live terminal session ids", () => {
+  const workspaceId = "workspace-terminal-restart";
+  const threadId = "thread-terminal-restart";
+  const oldSessionId = "ses_old_provider";
+  const state = {
+    [workspaceId]: {
+      id: workspaceId,
+      terminalThreadIds: {
+        0: threadId,
+      },
+      terminals: {
+        0: {
+          activityStatus: "idle",
+          agentId: "opencode",
+          inputReady: true,
+          instanceId: 1,
+          nativeSessionId: oldSessionId,
+          paneId: "pane-terminal-restart",
+          providerSessionId: oldSessionId,
+          sessionId: oldSessionId,
+          status: "active",
+          terminalIndex: 0,
+          threadId,
+        },
+      },
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          currentAgent: "opencode",
+          id: threadId,
+          providerBindings: {},
+          status: "active",
+          terminalBinding: {
+            instanceId: 1,
+            paneId: "pane-terminal-restart",
+            terminalIndex: 0,
+          },
+          terminalIndex: 0,
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const nextState = updateWorkspaceActiveTerminal(state, {
+    agentId: "opencode",
+    instanceId: 2,
+    paneId: "pane-terminal-restart",
+    status: "active",
+    terminalIndex: 0,
+    type: "opened",
+    workspaceId,
+  });
+
+  const terminal = nextState[workspaceId].terminals[0];
+  assert.equal(terminal.instanceId, 2);
+  assert.equal(terminal.providerSessionId, "");
+  assert.equal(terminal.nativeSessionId, "");
+  assert.equal(terminal.sessionId, "");
+});
+
 test("session transcript completion settles the exact active running turn", () => {
   const workspaceId = "workspace-test";
   const threadId = "thread-test";

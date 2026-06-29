@@ -14,7 +14,6 @@ const DEFAULT_WEB_URL = "https://www.google.com";
 const SEARCH_URL = "https://www.google.com/search?q=";
 const LOCAL_HOST_PATTERN = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?(?:[/?#]|$)/i;
 const WORKSPACE_WEBVIEW_LOAD_EVENT = "workspace-webview-load";
-const NATIVE_LOAD_TIMEOUT_MS = 12000;
 
 function hasTauriRuntime() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
@@ -179,7 +178,7 @@ export default function WebWorkspaceView({ isActive = true, workspace }) {
     await invoke("workspace_webview_close", { label: safeLabel }).catch(() => {});
   }, [clearNativeLoadTimeout]);
 
-  const fitNativeWebview = useCallback(async (label = nativeLabelRef.current, visible = nativeStatusRef.current === "ready") => {
+  const fitNativeWebview = useCallback(async (label = nativeLabelRef.current, visible = isActive) => {
     const viewport = viewportRef.current;
     const safeLabel = String(label || "").trim();
     if (!safeLabel || !viewport || !nativeEnabled || !hasTauriRuntime()) {
@@ -250,19 +249,6 @@ export default function WebWorkspaceView({ isActive = true, workspace }) {
       setNativeStatus("loading");
     }
 
-    nativeTimeoutRef.current = window.setTimeout(() => {
-      if (!mountedRef.current || nativeGenerationRef.current !== generation || nativeLabelRef.current !== label) {
-        return;
-      }
-      nativeLabelRef.current = "";
-      nativeRectRef.current = "";
-      nativeStatusRef.current = "error";
-      setNativeStatus("error");
-      setNativeError("The embedded web view did not finish loading.");
-      setNativeEnabled(false);
-      void invoke("workspace_webview_close", { label }).catch(() => {});
-    }, NATIVE_LOAD_TIMEOUT_MS);
-
     try {
       await invoke("workspace_webview_open", {
         height: rect.height,
@@ -272,6 +258,9 @@ export default function WebWorkspaceView({ isActive = true, workspace }) {
         x: rect.x,
         y: rect.y,
       });
+      // The Rust side shows the webview immediately; make sure it is fitted and
+      // visible without waiting for the (unreliable) page-load "finished" event.
+      void fitNativeWebview(label, isActive).catch(() => {});
       return true;
     } catch (error) {
       if (mountedRef.current && nativeGenerationRef.current === generation) {
@@ -284,7 +273,7 @@ export default function WebWorkspaceView({ isActive = true, workspace }) {
       }
       return false;
     }
-  }, [clearNativeLoadTimeout, isActive, nativeEnabled, workspace]);
+  }, [clearNativeLoadTimeout, fitNativeWebview, isActive, nativeEnabled, workspace]);
 
   const retryNativeOnNavigation = useCallback(() => {
     if (hasTauriRuntime()) {
@@ -321,12 +310,11 @@ export default function WebWorkspaceView({ isActive = true, workspace }) {
 
       const loadEvent = String(payload.event || "").trim().toLowerCase();
       if (loadEvent === "started") {
-        const wasReady = nativeStatusRef.current === "ready";
         nativeStatusRef.current = "loading";
         setNativeStatus("loading");
-        if (!wasReady || !isActive) {
-          void fitNativeWebview(label, false).catch(() => {});
-        }
+        // Keep the webview visible while the next page loads so navigation and
+        // search results paint in place instead of flashing to a black panel.
+        void fitNativeWebview(label, isActive).catch(() => {});
         return;
       }
 
@@ -367,11 +355,23 @@ export default function WebWorkspaceView({ isActive = true, workspace }) {
     }
 
     let disposed = false;
-    window.requestAnimationFrame(() => {
-      if (!disposed) {
-        void openNativeWebview(currentUrl);
+    let attempts = 0;
+    const tryOpen = () => {
+      if (disposed) {
+        return;
       }
-    });
+      const viewport = viewportRef.current;
+      const rect = viewport ? viewportNativeRect(viewport) : null;
+      if (rect && rect.width >= 24 && rect.height >= 24) {
+        void openNativeWebview(currentUrl);
+        return;
+      }
+      attempts += 1;
+      if (attempts < 30) {
+        window.requestAnimationFrame(tryOpen);
+      }
+    };
+    window.requestAnimationFrame(tryOpen);
 
     return () => {
       disposed = true;
@@ -522,10 +522,6 @@ export default function WebWorkspaceView({ isActive = true, workspace }) {
         </WebAddressForm>
 
         <WebRightControls>
-          <WebHostPill data-status={nativeEnabled ? nativeStatus : "error"}>
-            <Language aria-hidden="true" />
-            <span>{currentHost}</span>
-          </WebHostPill>
           <WebIconButton
             aria-label="Open in browser"
             onClick={openCurrentExternally}
@@ -744,45 +740,6 @@ const WebSubmitButton = styled(WebIconButton)`
   svg {
     width: 17px;
     height: 17px;
-  }
-`;
-
-const WebHostPill = styled.div`
-  display: inline-flex;
-  max-width: 220px;
-  min-width: 0;
-  height: 30px;
-  align-items: center;
-  gap: 7px;
-  padding: 0 10px;
-  border: 1px solid var(--web-border);
-  border-radius: 7px;
-  color: var(--web-muted);
-  background: rgba(255, 255, 255, 0.035);
-  font-size: 12px;
-  font-weight: 720;
-
-  &[data-status="ready"] {
-    border-color: rgba(110, 231, 168, 0.28);
-    color: var(--web-green);
-  }
-
-  &[data-status="error"] {
-    border-color: rgba(255, 155, 155, 0.28);
-    color: var(--web-danger);
-  }
-
-  svg {
-    flex: 0 0 auto;
-    width: 16px;
-    height: 16px;
-  }
-
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
   }
 `;
 

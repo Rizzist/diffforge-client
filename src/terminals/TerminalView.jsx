@@ -21,6 +21,13 @@ import { ToggleOff } from "@styled-icons/material-rounded/ToggleOff";
 import { ToggleOn } from "@styled-icons/material-rounded/ToggleOn";
 import { Webhook } from "@styled-icons/material-rounded/Webhook";
 import { TERMINAL_WINDOW_CLOSED_EVENT } from "./TerminalWindowHost.jsx";
+import WebPane from "../web/WebPane.jsx";
+import { DEFAULT_WEB_URL } from "../web/webNative.js";
+import {
+  WEB_PANEL_CLOSED_EVENT,
+  WEB_PANEL_CONTROL_EVENT,
+  WEB_PANEL_CONTROL_NAVIGATE,
+} from "../web/webPanelBridge.js";
 import { ZoomIn } from "@styled-icons/material-rounded/ZoomIn";
 import { ZoomOut } from "@styled-icons/material-rounded/ZoomOut";
 import { North } from "@styled-icons/material-rounded/North";
@@ -40,6 +47,7 @@ import {
   ButtonHubIcon,
   ButtonRefreshIcon,
   DashboardTitle,
+  FileDocumentIcon,
   ForgeWorkspace,
   FormMessage,
   Kicker,
@@ -65,8 +73,13 @@ import {
   WorkspaceRootActions,
   WorkspaceRootChooser,
   WorkspaceSetupPanel,
+  WorkspaceCreateAgentClaudeIcon,
+  WorkspaceCreateAgentCodexIcon,
+  WorkspaceCreateAgentOpenCodeIcon,
+  WorkspaceCreateAgentTerminalIcon,
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
+import { PlanFlame } from "../app/PlanFlame.jsx";
 import {
   AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT,
   AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL,
@@ -215,6 +228,17 @@ const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
 const TERMINAL_BREAKOUT_TRANSITION_MS = 260;
 const TERMINAL_BREAKOUT_STORAGE_PREFIX = "diffforge.terminalBreakout.v1";
 const TERMINAL_DOCUMENT_PANEL_ID = "workspace-document-panel";
+const TERMINAL_EMPTY_AGENT_LAUNCHERS = Object.freeze([
+  { id: "codex", label: "Codex" },
+  { id: "claude", label: "Claude Code" },
+  { id: "opencode", label: "OpenCode" },
+  { id: "generic", label: "Shell" },
+]);
+const TERMINAL_EMPTY_PANEL_LAUNCHERS = Object.freeze([
+  { id: "docs", label: "Docs" },
+  { id: "canvas", label: "Terminal canvas" },
+  { id: "windows", label: "Window breakout" },
+]);
 const TERMINAL_BREAKOUT_PHASE_GRID = "grid";
 const TERMINAL_BREAKOUT_PHASE_BREAKING_OUT = "breaking-out";
 const TERMINAL_BREAKOUT_PHASE_CANVAS = "canvas";
@@ -1177,6 +1201,29 @@ const TERMINAL_TAB_AGENT_META = {
 
 function getTerminalTabAgentMeta(role) {
   return TERMINAL_TAB_AGENT_META[String(role || "").toLowerCase()] || TERMINAL_TAB_AGENT_META.generic;
+}
+
+function TerminalEmptyAgentLauncherGlyph({ roleId }) {
+  if (roleId === "codex") {
+    return <WorkspaceCreateAgentCodexIcon aria-hidden="true" />;
+  }
+  if (roleId === "claude") {
+    return <WorkspaceCreateAgentClaudeIcon aria-hidden="true" />;
+  }
+  if (roleId === "opencode") {
+    return (
+      <WorkspaceCreateAgentOpenCodeIcon
+        aria-hidden="true"
+        fill="none"
+        viewBox="0 0 24 30"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <path d="M18 24H6V12H18V24Z" fill="#4B4646" />
+        <path d="M18 6H6V24H18V6ZM24 30H0V0H24V30Z" fill="#F1ECEC" />
+      </WorkspaceCreateAgentOpenCodeIcon>
+    );
+  }
+  return <WorkspaceCreateAgentTerminalIcon aria-hidden="true" />;
 }
 
 const TerminalTabGroupShell = styled.div`
@@ -2626,6 +2673,170 @@ const TerminalDocumentPanelBody = styled.div`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
+`;
+
+const TerminalNoPanelsSurface = styled.div`
+  position: relative;
+  display: grid;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  place-items: center;
+  overflow: hidden;
+  background: #040507;
+
+  html[data-forge-theme="light"] & {
+    background: #f8fafc;
+  }
+`;
+
+const TerminalNoPanelsFlame = styled.div`
+  position: absolute;
+  inset: auto 0 0;
+  z-index: 0;
+  height: min(58vh, 420px);
+  pointer-events: none;
+`;
+
+const TerminalNoPanelsContent = styled.div`
+  position: relative;
+  z-index: 1;
+  display: grid;
+  width: min(360px, calc(100% - 36px));
+  justify-items: center;
+  gap: 14px;
+  padding: 24px 0 34px;
+  color: rgba(232, 238, 248, 0.94);
+
+  html[data-forge-theme="light"] & {
+    color: #172033;
+  }
+`;
+
+const TerminalNoPanelsTitle = styled.h2`
+  margin: 0;
+  color: currentColor;
+  font-size: 24px;
+  font-weight: 840;
+  line-height: 1.05;
+  letter-spacing: 0;
+`;
+
+const TerminalNoPanelsActions = styled.div`
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: 44px;
+  gap: 9px;
+  justify-content: center;
+  width: min-content;
+
+  &[data-secondary="true"] {
+    padding-top: 2px;
+    grid-auto-columns: 40px;
+  }
+`;
+
+const TerminalNoPanelsIconButton = styled.button`
+  display: inline-grid;
+  width: var(--terminal-empty-action-size, 44px);
+  height: var(--terminal-empty-action-size, 44px);
+  place-items: center;
+  border: 1px solid rgba(226, 232, 240, 0.18);
+  border-radius: 8px;
+  color: rgba(235, 241, 249, 0.9);
+  background: rgba(9, 12, 18, 0.78);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 10px 24px rgba(0, 0, 0, 0.24);
+  cursor: pointer;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    color 140ms ease,
+    opacity 140ms ease,
+    transform 140ms ease;
+
+  svg {
+    width: 20px;
+    height: 20px;
+    display: block;
+  }
+
+  &:hover:not(:disabled),
+  &:focus-visible:not(:disabled) {
+    border-color: rgba(123, 220, 157, 0.58);
+    color: #ffffff;
+    background: rgba(20, 28, 38, 0.92);
+    transform: translateY(-1px);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(123, 220, 157, 0.54);
+    outline-offset: 2px;
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.38;
+    transform: none;
+  }
+
+  &[data-secondary="true"] {
+    --terminal-empty-action-size: 40px;
+    color: rgba(203, 213, 225, 0.82);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.14);
+    color: #263244;
+    background: rgba(255, 255, 255, 0.86);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.7),
+      0 10px 24px rgba(15, 23, 42, 0.1);
+  }
+`;
+
+const WebPaneAddFloatingButton = styled.button`
+  position: absolute;
+  right: 14px;
+  bottom: 14px;
+  z-index: 72;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 12px;
+  border: 1px solid rgba(226, 232, 240, 0.16);
+  border-radius: 999px;
+  color: rgba(232, 238, 248, 0.9);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.08), rgba(255, 255, 255, 0.024)),
+    rgba(0, 0, 0, 0.72);
+  box-shadow: 0 10px 22px rgba(0, 0, 0, 0.28);
+  font-size: 12px;
+  font-weight: 760;
+  transition: border-color 150ms ease, opacity 150ms ease;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(104, 163, 255, 0.5);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.4;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1c2430;
+    background: linear-gradient(180deg, #ffffff, #f1f5fb);
+    border-color: #d4ddec;
+  }
 `;
 
 const TerminalBreakoutTopBar = styled.div`
@@ -21125,6 +21336,8 @@ function TerminalView({
   agentStatuses,
   agentStatusState,
   addWorkspaceTerminal,
+  addWorkspaceWebPane,
+  paneKinds = {},
   changeWorkspaceTerminalRole,
   closeWorkspaceTerminal,
   createWorkspaceThreadTerminal,
@@ -21138,6 +21351,7 @@ function TerminalView({
   onRestoreWorkspaceToolPane = null,
   onToggleFullscreenWorkspaceToolPane = null,
   onWorkspaceToolRuntimeBridgeChange = null,
+  onOpenWorkspaceDocumentPanel = null,
   onCloseWorkspaceDocumentPanel = null,
   handlePreparedTerminalChange,
   isAppClosing = false,
@@ -21228,6 +21442,18 @@ function TerminalView({
   const [windowBreakoutPanes, setWindowBreakoutPanes] = useState({});
   const windowBreakoutPanesRef = useRef(windowBreakoutPanes);
   const closeWindowBreakoutRef = useRef(null);
+  // Web panes that are currently popped out into their own window.
+  const [webBreakoutPanes, setWebBreakoutPanes] = useState({});
+  const webBreakoutPanesRef = useRef(webBreakoutPanes);
+  // Actual breakout-window labels keyed by paneId (the Rust label is hashed, so
+  // we cannot reconstruct it; capture it from web_panel_open for close/focus).
+  const webPanelLabelsRef = useRef({});
+  // Last known URL per web pane (from the in-grid pane and from breakout
+  // navigation) so the grid pane resumes there after the window returns.
+  const webPaneUrlsRef = useRef({});
+  // Bumped per pane when it returns from a breakout window so the in-grid
+  // WebPane remounts at the synced URL.
+  const [webPaneResumeNonces, setWebPaneResumeNonces] = useState({});
   const [terminalBreakoutPlacements, setTerminalBreakoutPlacements] = useState({});
   const [terminalBreakoutPlanSnapshots, setTerminalBreakoutPlanSnapshots] = useState({});
   const [terminalBreakoutPlanRefreshNonce, setTerminalBreakoutPlanRefreshNonce] = useState(0);
@@ -21272,6 +21498,8 @@ function TerminalView({
   ]);
   const activeDisplayRows = terminalDragState?.previewRows || documentPanelDisplayRows;
   const activeDisplayRowsSignature = serializeTerminalRows(activeDisplayRows, terminalPanelRowOptions);
+  const hasVisibleWorkspacePanels = hasWorkspaceTerminals && activeDisplayRows.length > 0;
+  const draggableWorkspacePaneCount = logicalTerminalIndexes.length + (workspaceDocumentPanelAvailable ? 1 : 0);
   const terminalDragActive = Boolean(terminalDragState);
   const fullscreenActive = Number.isInteger(fullscreenTerminalIndex)
     && logicalTerminalIndexes.includes(fullscreenTerminalIndex);
@@ -26285,6 +26513,48 @@ function TerminalView({
     workspaceDocumentPanelAvailable,
   ]);
 
+  const handleOpenEmptyStateTerminal = useCallback((role) => {
+    if (
+      !terminalWorkspace?.id
+      || !addWorkspaceTerminal
+      || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT
+    ) {
+      return;
+    }
+
+    const result = addWorkspaceTerminal({
+      role,
+      source: "terminal_empty_state",
+      workspaceId: terminalWorkspace.id,
+    });
+    const terminalIndex = Number.parseInt(result?.terminalIndex, 10);
+    if (!Number.isInteger(terminalIndex)) {
+      return;
+    }
+
+    setActiveTerminalPaneId(getWorkspaceTerminalPaneId(
+      terminalWorkspace.id,
+      terminalIndex,
+      result?.terminalRole || role,
+    ));
+  }, [
+    addWorkspaceTerminal,
+    logicalTerminalIndexes.length,
+    terminalWorkspace?.id,
+  ]);
+
+  const handleOpenEmptyStateDocsPanel = useCallback(() => {
+    if (!workspaceDocumentPanelAvailable && typeof onOpenWorkspaceDocumentPanel === "function") {
+      onOpenWorkspaceDocumentPanel({ source: "terminal_empty_state" });
+      return;
+    }
+    openWorkspaceDocumentPanel({ source: "terminal_empty_state" });
+  }, [
+    onOpenWorkspaceDocumentPanel,
+    openWorkspaceDocumentPanel,
+    workspaceDocumentPanelAvailable,
+  ]);
+
   useEffect(() => {
     if (!workspaceDocumentPanelAvailable) {
       setTerminalBreakoutDocumentPanel(null);
@@ -26363,6 +26633,10 @@ function TerminalView({
   useEffect(() => {
     windowBreakoutPanesRef.current = windowBreakoutPanes;
   }, [windowBreakoutPanes]);
+
+  useEffect(() => {
+    webBreakoutPanesRef.current = webBreakoutPanes;
+  }, [webBreakoutPanes]);
 
   const windowBreakoutActive = Object.keys(windowBreakoutPanes).length > 0;
 
@@ -26539,6 +26813,143 @@ function TerminalView({
       })
       .catch(() => {});
   }, [openTerminalWindowForIndex]);
+
+  // ---- Web pane breakout (its own in-app browser window) ----
+
+  const rememberWebPaneUrl = useCallback((paneId, url) => {
+    const safePaneId = String(paneId || "").trim();
+    const safeUrl = String(url || "").trim();
+    if (safePaneId && safeUrl) {
+      webPaneUrlsRef.current = { ...webPaneUrlsRef.current, [safePaneId]: safeUrl };
+    }
+  }, []);
+
+  const popOutWebPanelForIndex = useCallback(async (terminalIndex, paneId, url) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId || webBreakoutPanesRef.current[safePaneId]) {
+      return;
+    }
+    const targetUrl = String(url || webPaneUrlsRef.current[safePaneId] || DEFAULT_WEB_URL);
+    rememberWebPaneUrl(safePaneId, targetUrl);
+    try {
+      const rect = terminalLayoutRectsRef.current?.[terminalIndex] || null;
+      const result = await invoke("web_panel_open", {
+        height: rect?.height || null,
+        paneId: safePaneId,
+        theme: document.documentElement?.dataset?.forgeTheme || "",
+        title: "Web",
+        url: targetUrl,
+        width: rect?.width || null,
+      });
+      const label = String(result?.label || "").trim();
+      if (label) {
+        webPanelLabelsRef.current = { ...webPanelLabelsRef.current, [safePaneId]: label };
+      }
+      setWebBreakoutPanes((current) => ({ ...current, [safePaneId]: true }));
+    } catch {
+      // If the window fails to open, the pane simply stays in the grid.
+    }
+  }, [rememberWebPaneUrl]);
+
+  const returnWebPanelToGrid = useCallback((paneId) => {
+    const safePaneId = String(paneId || "").trim();
+    const label = webPanelLabelsRef.current[safePaneId];
+    if (!label) {
+      return;
+    }
+    // The closed-event listener performs the grid cleanup once the window dies.
+    invoke("web_panel_close", { label }).catch(() => {});
+  }, []);
+
+  const focusWebPanel = useCallback((terminalIndex, paneId) => {
+    const safePaneId = String(paneId || "").trim();
+    const label = webPanelLabelsRef.current[safePaneId];
+    if (!label) {
+      return;
+    }
+    invoke("web_panel_focus", { label }).catch(() => {});
+  }, []);
+
+  // A web breakout window closing returns the pane to the grid and bumps its
+  // resume nonce so the in-grid WebPane remounts at the last URL.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(WEB_PANEL_CLOSED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const paneId = String(event.payload?.paneId || "").trim();
+      if (!paneId) {
+        return;
+      }
+      if (webPanelLabelsRef.current[paneId]) {
+        const nextLabels = { ...webPanelLabelsRef.current };
+        delete nextLabels[paneId];
+        webPanelLabelsRef.current = nextLabels;
+      }
+      setWebBreakoutPanes((current) => {
+        if (!current[paneId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[paneId];
+        return next;
+      });
+      setWebPaneResumeNonces((current) => ({
+        ...current,
+        [paneId]: (current[paneId] || 0) + 1,
+      }));
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, []);
+
+  // Track navigations inside a breakout window so the grid resumes there.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(WEB_PANEL_CONTROL_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const control = String(payload.control || "").trim();
+      const paneId = String(payload.paneId || "").trim();
+      if (!paneId) {
+        return;
+      }
+      if (control === WEB_PANEL_CONTROL_NAVIGATE) {
+        rememberWebPaneUrl(paneId, payload.url);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [rememberWebPaneUrl]);
 
   // A breakout window closing (its close button, OS close, or our toggle)
   // returns the pane to the grid and re-asserts the grid's PTY size.
@@ -26776,6 +27187,14 @@ function TerminalView({
 
     setTerminalBreakoutPanning(true);
   }, [scheduleTerminalBreakoutViewportFrame, stopTerminalBreakoutPan, terminalBreakoutVisible]);
+
+  const handleAddWebPane = useCallback(() => {
+    if (!terminalWorkspace?.id || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
+      return;
+    }
+    addWorkspaceWebPane?.({ workspaceId: terminalWorkspace.id });
+    measureTerminalLayout();
+  }, [addWorkspaceWebPane, logicalTerminalIndexes.length, measureTerminalLayout, terminalWorkspace?.id]);
 
   const handleAddTerminalToBreakout = useCallback(() => {
     if (!terminalWorkspace?.id || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
@@ -34391,7 +34810,7 @@ function TerminalView({
       || terminalDragState?.mode === "canvas"
       || terminalDragState?.mode === "canvas-resize",
   );
-  const terminalWorkspaceContent = hasVisibleWorkspaceTerminalPanes ? (
+  const terminalWorkspaceContent = hasVisibleWorkspacePanels ? (
     <WorkspaceTerminalPanels
       data-terminal-breakout={terminalBreakoutVisible ? "true" : "false"}
       data-terminal-dragging={terminalDragActive ? "true" : "false"}
@@ -34582,6 +35001,65 @@ function TerminalView({
             && !draggingThisTerminal
             && tabVisibilityByTerminal.get(terminalIndex) === false;
           const slotTabMeta = getTerminalTabAgentMeta(getTerminalRole(terminalIndex));
+          const isWebPane = paneKinds?.[terminalIndex] === "web";
+          if (isWebPane) {
+            return (
+              <TerminalSurfaceSlot
+                data-terminal-active={terminalActive ? "true" : "false"}
+                data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
+                data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
+                data-terminal-hidden={hasMeasuredRect ? "false" : "true"}
+                data-terminal-index={terminalIndex}
+                data-terminal-surface-slot="true"
+                data-terminal-tab-hidden={tabHidden ? "true" : "false"}
+                data-terminal-web-pane="true"
+                key={`${terminalWorkspace.id}-${terminalIndex}`}
+                style={getTerminalSlotStyle(terminalIndex)}
+              >
+                <WebPane
+                  key={`web-${terminalPaneId}-${webPaneResumeNonces[terminalPaneId] || 0}`}
+                  terminalIndex={terminalIndex}
+                  paneId={terminalPaneId}
+                  workspaceId={terminalWorkspace?.id || ""}
+                  initialUrl={webPaneUrlsRef.current[terminalPaneId] || DEFAULT_WEB_URL}
+                  isActive={isWorkspaceSurfaceVisible && !tabHidden}
+                  isFullscreen={fullscreenThisTerminal}
+                  fullscreenActive={fullscreenActive}
+                  dragActive={terminalDragActive}
+                  poppedOut={Boolean(webBreakoutPanes[terminalPaneId])}
+                  onDragHandlePointerDown={(event, index, pid) => {
+                    if (event.button !== 0) {
+                      return;
+                    }
+                    const slotEl = event.currentTarget.closest("[data-terminal-surface-slot]");
+                    const surfaceEl = event.currentTarget.closest("[data-workspace-web-surface]") || slotEl;
+                    if (!surfaceEl) {
+                      return;
+                    }
+                    event.preventDefault();
+                    event.stopPropagation();
+                    handleBeginTerminalDrag({
+                      clientX: event.clientX,
+                      clientY: event.clientY,
+                      paneId: pid,
+                      panelRect: getPlainDomRect(slotEl?.getBoundingClientRect?.()),
+                      pointerId: event.pointerId,
+                      surfaceRect: getPlainDomRect(surfaceEl?.getBoundingClientRect?.()),
+                      terminalIndex: index,
+                      workspaceId: terminalWorkspace?.id || "",
+                    });
+                  }}
+                  onSplit={handleSplitTerminal}
+                  onToggleFullscreen={(index, pid) => handleToggleFullscreenTerminal({ paneId: pid, terminalIndex: index })}
+                  onClose={(index) => closeWorkspaceTerminal({ workspaceId: terminalWorkspace?.id || "", terminalIndex: index })}
+                  onPopOut={popOutWebPanelForIndex}
+                  onReturnFromBreakout={(index, pid) => returnWebPanelToGrid(pid)}
+                  onFocusBreakout={focusWebPanel}
+                  onNavigate={(url) => rememberWebPaneUrl(terminalPaneId, url)}
+                />
+              </TerminalSurfaceSlot>
+            );
+          }
           return (
             <TerminalSurfaceSlot
               data-terminal-active={terminalActive ? "true" : "false"}
@@ -34858,6 +35336,7 @@ function TerminalView({
                 agentStatuses={agentStatuses}
                 agentStatusError={agentStatusError}
                 agentStatusState={agentStatusState}
+                draggablePaneCount={draggableWorkspacePaneCount}
                 fullscreenState={fullscreenState}
                 isActive={terminalActive}
                 isFullscreen={fullscreenThisTerminal}
@@ -35037,6 +35516,23 @@ function TerminalView({
           </TerminalBreakoutDocumentWindow>
         )}
       </TerminalSurfaceLayer>
+      {!terminalBreakoutLayoutActive && !fullscreenActive && hasVisibleWorkspaceTerminalPanes && (
+        <WebPaneAddFloatingButton
+          aria-label="Add web panel"
+          data-terminal-control="true"
+          disabled={!addWorkspaceWebPane || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT}
+          onClick={handleAddWebPane}
+          title={
+            logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT
+              ? "Panel limit reached"
+              : "Add web panel"
+          }
+          type="button"
+        >
+          <DeviceWebIcon aria-hidden="true" />
+          <span>Web</span>
+        </WebPaneAddFloatingButton>
+      )}
       {terminalBreakoutControlsVisible && (
         <TerminalBreakoutTopBar data-terminal-control="true">
           <TerminalBreakoutButton
@@ -35051,6 +35547,19 @@ function TerminalView({
             type="button"
           >
             <ButtonAddIcon aria-hidden="true" />
+          </TerminalBreakoutButton>
+          <TerminalBreakoutButton
+            aria-label="Add web panel to canvas"
+            disabled={!addWorkspaceWebPane || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT}
+            onClick={handleAddWebPane}
+            title={
+              logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT
+                ? "Panel limit reached"
+                : "Add web panel"
+            }
+            type="button"
+          >
+            <DeviceWebIcon aria-hidden="true" />
           </TerminalBreakoutButton>
           <TerminalBreakoutTopBarDivider aria-hidden="true" />
           <TerminalBreakoutButton
@@ -35100,62 +35609,84 @@ function TerminalView({
         </TerminalBreakoutTopBar>
       )}
     </WorkspaceTerminalPanels>
-  ) : !hasWorkspaceTerminals ? (
-    <WorkspaceTerminal
-      key={`${terminalWorkspace?.id || "empty"}-${logicalTerminalIndexes[0] || 0}`}
-      agent={terminalWorkspace ? workspaceTerminalRenderAgent : null}
-      agentLaunchEpoch={workspaceAgentLaunchEpoch}
-      agentLaunchDefaults={agentLaunchDefaults}
-      agentLaunchReady={workspaceTerminalAgentLaunchReady}
-      agentStatuses={agentStatuses}
-      agentStatusError={agentStatusError}
-      agentStatusState={agentStatusState}
-      fullscreenState="idle"
-      isActive={activePaneId === getTerminalPaneId(logicalTerminalIndexes[0] || 0)}
-      isFullscreen={false}
-      onActivateTerminal={handleActivateTerminalPane}
-      onChangeTerminalRole={changeWorkspaceTerminalRole}
-      onCloseTerminal={closeWorkspaceTerminal}
-      onCreateWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
-      onOpenSettings={showSettingsView}
-      onArchiveWorkspaceThread={onArchiveWorkspaceThread}
-      onPreparedTerminalChange={handlePreparedTerminalChange}
-      onRecheckAgents={refreshAgentStatuses}
-      onSplitTerminal={handleSplitTerminal}
-      onSelectWorkspaceThread={handleSelectWorkspaceThreadFromTerminal}
-      onToggleWorkspaceThreadPinned={onToggleWorkspaceThreadPinned}
-      onWorkspaceThreadsViewStateChange={onWorkspaceThreadsViewStateChange}
-        onThreadTerminalLifecycle={handleWorkspaceTerminalLifecycle}
-      onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
-      onPopOutTerminalWindow={popOutTerminalWindowForIndex}
-      prewarmShell={terminalWorkspace ? shouldPrewarmWorkspaceTerminals : false}
-      permissionMode={getTerminalPermissionMode(logicalTerminalIndexes[0] || 0)}
-      startupReady={terminalStartupReady}
-      terminalBreakoutActive={false}
-      terminalCount={terminalWorkspaceLogicalTerminalCount}
-      terminalIndex={logicalTerminalIndexes[0] || 0}
-      terminalRole={getTerminalRole(logicalTerminalIndexes[0] || 0)}
-      terminalSelectionMode="pointerdown"
-      thread={getTerminalThread(logicalTerminalIndexes[0] || 0)}
-      threadsViewActive={false}
-      todoDropActive={todoDragActive || workspaceFileDragActive || nativeTerminalDropActive}
-      todoDropTarget={
-        todoDragState?.targetTerminalIndex === (logicalTerminalIndexes[0] || 0)
-          || workspaceFileDragState?.targetTerminalIndex === (logicalTerminalIndexes[0] || 0)
-          || nativeTerminalDropTargetIndex === (logicalTerminalIndexes[0] || 0)
-      }
-      todoDropUnsupportedMessage={todoDragState?.targetTerminalIndex === (logicalTerminalIndexes[0] || 0)
-        ? getTerminalTodoDropUnsupportedMessage(logicalTerminalIndexes[0] || 0)
-        : ""}
-      workingDirectory={terminalWorkspaceWorkingDirectory}
-      workspace={terminalWorkspace}
-      workspaceError={workspaceError}
-      workspaceRootWasEmptyAtSelection={terminalWorkspaceRootWasEmptyAtSelection}
-      workspaceThreads={workspaceThreads}
-      workspaces={workspaces}
-      selectedWorkspaceThreadId={selectedWorkspaceThreadId}
-    />
-  ) : null;
+  ) : (
+    <TerminalNoPanelsSurface aria-label="No terminals">
+      <TerminalNoPanelsFlame aria-hidden="true">
+        <PlanFlame active plan="free" />
+      </TerminalNoPanelsFlame>
+      <TerminalNoPanelsContent>
+        <TerminalNoPanelsTitle>No terminals</TerminalNoPanelsTitle>
+        <TerminalNoPanelsActions aria-label="Open terminal type">
+          {TERMINAL_EMPTY_AGENT_LAUNCHERS.map((launcher) => {
+            const status = launcher.id === "generic"
+              ? null
+              : (Array.isArray(agentStatuses) ? agentStatuses : [])
+                .find((agentStatus) => agentStatus?.id === launcher.id);
+            const agentUnavailable = launcher.id !== "generic"
+              && status
+              && (!status.installed || !status.authenticated);
+            const limitReached = logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT;
+            const disabled = !terminalWorkspace?.id || !addWorkspaceTerminal || limitReached || agentUnavailable;
+            const title = !terminalWorkspace?.id
+              ? "Select a workspace"
+              : limitReached
+                ? "Terminal limit reached"
+                : agentUnavailable
+                  ? `${launcher.label} unavailable`
+                  : `Open ${launcher.label}`;
+
+            return (
+              <TerminalNoPanelsIconButton
+                aria-label={`Open ${launcher.label}`}
+                disabled={disabled}
+                key={launcher.id}
+                onClick={() => handleOpenEmptyStateTerminal(launcher.id)}
+                title={title}
+                type="button"
+              >
+                <TerminalEmptyAgentLauncherGlyph roleId={launcher.id} />
+              </TerminalNoPanelsIconButton>
+            );
+          })}
+        </TerminalNoPanelsActions>
+        <TerminalNoPanelsActions aria-label="Open panel type" data-secondary="true">
+          {TERMINAL_EMPTY_PANEL_LAUNCHERS.map((launcher) => {
+            const docsPanel = launcher.id === "docs";
+            const docsEnabled = Boolean(
+              terminalWorkspace?.id
+                && (workspaceDocumentPanelAvailable || typeof onOpenWorkspaceDocumentPanel === "function"),
+            );
+            const disabled = docsPanel ? !docsEnabled : true;
+            const title = docsPanel
+              ? docsEnabled
+                ? "Open Docs panel"
+                : "Docs panel unavailable"
+              : `${launcher.label} requires a terminal`;
+
+            return (
+              <TerminalNoPanelsIconButton
+                aria-label={docsPanel ? "Open Docs panel" : launcher.label}
+                data-secondary="true"
+                disabled={disabled}
+                key={launcher.id}
+                onClick={docsPanel ? handleOpenEmptyStateDocsPanel : undefined}
+                title={title}
+                type="button"
+              >
+                {docsPanel ? (
+                  <FileDocumentIcon aria-hidden="true" />
+                ) : launcher.id === "canvas" ? (
+                  <ButtonFullscreenIcon aria-hidden="true" />
+                ) : (
+                  <ButtonHubIcon aria-hidden="true" />
+                )}
+              </TerminalNoPanelsIconButton>
+            );
+          })}
+        </TerminalNoPanelsActions>
+      </TerminalNoPanelsContent>
+    </TerminalNoPanelsSurface>
+  );
 
   const workspaceToolPaneContent = effectiveTodoQueueVisible ? (
     todoQueuePaneMinimized ? (
@@ -35369,7 +35900,7 @@ function TerminalView({
           data-workspace-tool-pane-mode={effectiveTodoQueuePaneMode}
           ref={terminalWorkspaceMainRef}
         >
-          {hasVisibleWorkspaceTerminalPanes ? (
+          {hasVisibleWorkspacePanels ? (
             <ResizePanelGroup
               id={`workspace-terminal-main-${terminalWorkspace.id}`}
               orientation="horizontal"
