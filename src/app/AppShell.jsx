@@ -14758,11 +14758,24 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
     deviceLiveState,
     12,
   ).filter((device) => Boolean(device.connected || device.nativeConnected || device.webConnected));
-  const workspaceTodos = progress?.workspaceTodos && typeof progress.workspaceTodos === "object"
+  const progressWorkspaceTodos = progress?.workspaceTodos && typeof progress.workspaceTodos === "object"
     ? progress.workspaceTodos
+    : null;
+  const workspaceTodosUnknown = Boolean(
+    progressWorkspaceTodos
+      && (
+        progressWorkspaceTodos.known === false
+        || progressWorkspaceTodos.accepted?.authoritative_empty === false
+          && progressWorkspaceTodos.accepted?.last_known === true
+          && !Array.isArray(progressWorkspaceTodos.items)
+          && !Array.isArray(progressWorkspaceTodos.accepted?.items)
+      ),
+  );
+  const workspaceTodos = progressWorkspaceTodos && !workspaceTodosUnknown
+    ? progressWorkspaceTodos
     : previous?.workspaceTodos && typeof previous.workspaceTodos === "object"
       ? previous.workspaceTodos
-      : null;
+      : progressWorkspaceTodos || null;
   const storageUsage = progress?.storageUsage && typeof progress.storageUsage === "object"
     ? progress.storageUsage
     : previous?.storageUsage && typeof previous.storageUsage === "object"
@@ -19512,6 +19525,7 @@ export default function App() {
   // captured at the switch-back moment so the terminal grid can show WHICH
   // terminals produced the badge/SFX that pulled the user back.
   const [workspaceTerminalNotificationAttention, setWorkspaceTerminalNotificationAttention] = useState({});
+  const [workspaceTerminalFocusRequest, setWorkspaceTerminalFocusRequest] = useState(null);
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
   const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(readWorkspaceRailCollapsed);
   const [workspaceRailNativeHoverKey, setWorkspaceRailNativeHoverKey] = useState("");
@@ -30072,10 +30086,39 @@ export default function App() {
       .map((terminal) => {
         const terminalIndex = Number(terminal?.terminalIndex ?? terminal?.terminal_index);
         if (!Number.isInteger(terminalIndex)) return null;
+        const providerSessionId = String(
+          terminal?.providerSessionId
+            || terminal?.provider_session_id
+            || terminal?.nativeSessionId
+            || terminal?.native_session_id
+            || terminal?.sessionId
+            || terminal?.session_id
+            || "",
+        ).trim();
+        const coordinationSessionId = String(
+          terminal?.coordinationSessionId
+            || terminal?.coordination_session_id
+            || terminal?.coordination?.sessionId
+            || terminal?.coordination?.session_id
+            || "",
+        ).trim();
+        const terminalStatus = String(
+          terminal?.status
+            || terminal?.terminalStatus
+            || terminal?.terminal_status
+            || "",
+        ).trim();
+        const terminalLifecycle = String(
+          terminal?.terminalLifecycle
+            || terminal?.terminal_lifecycle
+            || "",
+        ).trim();
         return {
           agentId: String(terminal?.agentId || terminal?.agent_id || "").trim(),
           agentLabel: String(terminal?.agentLabel || terminal?.agentDisplayName || "").trim(),
           color: String(terminal?.color || "").trim(),
+          connected: terminal?.connected === false ? false : true,
+          coordinationSessionId,
           label: String(
             terminal?.terminalNickname
               || terminal?.terminalName
@@ -30083,13 +30126,179 @@ export default function App() {
               || terminal?.agentDisplayName
               || "",
           ).trim() || `Terminal ${terminalIndex + 1}`,
+          nativeConnected: terminal?.nativeConnected === false || terminal?.native_connected === false ? false : true,
+          nativeSessionId: providerSessionId,
           paneId: String(terminal?.paneId || terminal?.pane_id || "").trim(),
+          providerSessionId,
+          sessionId: providerSessionId,
+          status: terminalStatus,
           terminalIndex,
+          terminalInstanceId: Number(terminal?.terminalInstanceId ?? terminal?.terminal_instance_id) || null,
+          terminalLifecycle,
+          terminalStatus,
           threadId: String(terminal?.threadId || terminal?.thread_id || "").trim(),
         };
       })
       .filter(Boolean);
   }, [selectedWorkspaceId, workspaceTerminalsWorkspaces]);
+
+  const requestWorkspaceTerminalFocus = useCallback((request = {}) => {
+    const workspaceId = String(request.workspaceId || selectedWorkspaceIdRef.current || "").trim();
+    if (!workspaceId) {
+      return false;
+    }
+    const activated = requestWorkspaceActivation(workspaceId, request.reason || "session_history_terminal_focus");
+    if (!activated) {
+      return false;
+    }
+    const terminalIndex = Number.parseInt(request.terminalIndex ?? request.terminal_index, 10);
+    const providerSessionId = String(
+      request.providerSessionId
+        || request.provider_session_id
+        || request.nativeSessionId
+        || request.native_session_id
+        || request.sessionId
+        || request.session_id
+        || request.coordinationSessionId
+        || request.coordination_session_id
+        || "",
+    ).trim();
+    setWorkspaceTerminalFocusRequest({
+      id: `${Date.now()}:${Math.random().toString(16).slice(2)}`,
+      highlight: request.highlight !== false,
+      paneId: String(request.paneId || request.pane_id || "").trim(),
+      providerSessionId,
+      reason: request.reason || "session_history_terminal_focus",
+      sessionId: providerSessionId,
+      terminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : null,
+      workspaceId,
+    });
+    return true;
+  }, [requestWorkspaceActivation]);
+
+  const goToSessionHistoryTerminal = useCallback(({ item = null, terminal = null, workspaceId = "" } = {}) => {
+    const targetWorkspaceId = String(
+      workspaceId
+        || item?.workspaceId
+        || item?.workspace_id
+        || selectedWorkspaceIdRef.current
+        || "",
+    ).trim();
+    if (!targetWorkspaceId || !terminal) {
+      return false;
+    }
+    const terminalIndex = Number.parseInt(terminal?.terminalIndex ?? terminal?.terminal_index, 10);
+    const terminalRole = normalizeWorkspaceTerminalRole(
+      terminal?.agentId
+        || terminal?.agent_id
+        || item?.agentId
+        || item?.agent_id
+        || item?.provider
+        || "",
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    );
+    const paneId = String(terminal?.paneId || terminal?.pane_id || "").trim()
+      || (Number.isInteger(terminalIndex)
+        ? getWorkspaceTerminalPaneId(
+          targetWorkspaceId,
+          terminalIndex,
+          getWorkspaceTerminalPaneAgentId(terminalRole),
+        )
+        : "");
+    const providerSessionId = String(
+      item?.providerSessionId
+        || item?.provider_session_id
+        || item?.nativeSessionId
+        || item?.native_session_id
+        || item?.sessionId
+        || item?.session_id
+        || item?.coordinationSessionId
+        || item?.coordination_session_id
+        || terminal?.providerSessionId
+        || terminal?.provider_session_id
+        || terminal?.nativeSessionId
+        || terminal?.native_session_id
+        || terminal?.sessionId
+        || terminal?.session_id
+        || terminal?.coordinationSessionId
+        || terminal?.coordination_session_id
+        || "",
+    ).trim();
+    return requestWorkspaceTerminalFocus({
+      paneId,
+      providerSessionId,
+      reason: "session_history_goto_terminal",
+      terminalIndex,
+      workspaceId: targetWorkspaceId,
+    });
+  }, [
+    requestWorkspaceTerminalFocus,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+  ]);
+
+  const openSessionHistoryTerminal = useCallback(({ item = null, providerSessionId = "", workspaceId = "" } = {}) => {
+    const targetWorkspaceId = String(
+      workspaceId
+        || item?.workspaceId
+        || item?.workspace_id
+        || selectedWorkspaceIdRef.current
+        || "",
+    ).trim();
+    const targetProviderSessionId = String(
+      providerSessionId
+        || item?.providerSessionId
+        || item?.provider_session_id
+        || item?.nativeSessionId
+        || item?.native_session_id
+        || item?.sessionId
+        || item?.session_id
+        || "",
+    ).trim();
+    if (!targetWorkspaceId || !targetProviderSessionId) {
+      setWorkspaceError("No provider session id was recorded for this history row.");
+      return false;
+    }
+    const role = normalizeWorkspaceTerminalRole(
+      item?.agentId
+        || item?.agent_id
+        || item?.provider
+        || "",
+      workspaceTerminalFallbackRole,
+      workspaceTerminalRoleOptions,
+    );
+    const added = addWorkspaceTerminal({
+      model: String(item?.modelId || item?.model_id || "").trim(),
+      providerSessionId: targetProviderSessionId,
+      role,
+      sessionTitle: String(item?.title || "").trim(),
+      source: "session_history_open_terminal",
+      title: String(item?.title || "").trim(),
+      workspaceId: targetWorkspaceId,
+    });
+    if (!added || !Number.isInteger(added.terminalIndex)) {
+      setWorkspaceError(`Terminal limit reached. Diff Forge supports up to ${MAX_WORKSPACE_TERMINAL_COUNT} workspace terminals.`);
+      return false;
+    }
+    const paneId = getWorkspaceTerminalPaneId(
+      targetWorkspaceId,
+      added.terminalIndex,
+      getWorkspaceTerminalPaneAgentId(added.terminalRole || role),
+    );
+    return requestWorkspaceTerminalFocus({
+      paneId,
+      providerSessionId: targetProviderSessionId,
+      reason: "session_history_open_terminal",
+      terminalIndex: added.terminalIndex,
+      workspaceId: targetWorkspaceId,
+    });
+  }, [
+    addWorkspaceTerminal,
+    requestWorkspaceTerminalFocus,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+  ]);
   useEffect(() => {
     workspaceTerminalsWorkspacesRef.current = workspaceTerminalsWorkspaces;
   }, [workspaceTerminalsWorkspaces]);
@@ -31278,14 +31487,52 @@ export default function App() {
   const selectedWorkspaceOpenDocumentPanel = selectedWorkspaceToolRuntimeBridge?.onOpenDocumentPanel;
   const openSelectedWorkspaceDocumentPanel = useCallback((entry) => {
     const workspaceId = String(selectedWorkspace?.id || "").trim();
+    if (!workspaceId) {
+      return;
+    }
+    if (!selectedWorkspaceDocumentsEnabled) {
+      setWorkspaceSettings((settings) => {
+        const nextSettings = updateWorkspaceLocalSettings(settings, workspaceId, {
+          documentsCount: MAX_WORKSPACE_DOCUMENT_COUNT,
+        });
+        workspaceSettingsRef.current = nextSettings;
+        persistWorkspaceSettings(nextSettings);
+        return nextSettings;
+      });
+      setPendingWorkspaceDocumentPanelOpen({ entry, workspaceId });
+      return;
+    }
     if (typeof selectedWorkspaceOpenDocumentPanel === "function") {
       selectedWorkspaceOpenDocumentPanel(entry);
       return;
     }
-    if (workspaceId) {
-      setPendingWorkspaceDocumentPanelOpen({ entry, workspaceId });
+    setPendingWorkspaceDocumentPanelOpen({ entry, workspaceId });
+  }, [
+    selectedWorkspace?.id,
+    selectedWorkspaceDocumentsEnabled,
+    selectedWorkspaceOpenDocumentPanel,
+  ]);
+
+  const closeWorkspaceDocumentPanel = useCallback((workspaceId) => {
+    const safeWorkspaceId = String(workspaceId || "").trim();
+    if (!safeWorkspaceId) {
+      return;
     }
-  }, [selectedWorkspace?.id, selectedWorkspaceOpenDocumentPanel]);
+    setWorkspaceSettings((settings) => {
+      const nextSettings = updateWorkspaceLocalSettings(settings, safeWorkspaceId, {
+        documentsCount: MIN_WORKSPACE_DOCUMENT_COUNT,
+      });
+      workspaceSettingsRef.current = nextSettings;
+      persistWorkspaceSettings(nextSettings);
+      return nextSettings;
+    });
+    setPendingWorkspaceDocumentPanelOpen((pending) => (
+      pending?.workspaceId === safeWorkspaceId ? null : pending
+    ));
+    if (workspaceSettingsModalId === safeWorkspaceId) {
+      setWorkspaceDocumentCountDraft(String(MIN_WORKSPACE_DOCUMENT_COUNT));
+    }
+  }, [workspaceSettingsModalId]);
 
   useEffect(() => {
     if (!pendingWorkspaceDocumentPanelOpen) {
@@ -31297,6 +31544,9 @@ export default function App() {
       setPendingWorkspaceDocumentPanelOpen(null);
       return;
     }
+    if (!selectedWorkspaceDocumentsEnabled) {
+      return;
+    }
     if (typeof selectedWorkspaceOpenDocumentPanel !== "function") {
       return;
     }
@@ -31306,6 +31556,7 @@ export default function App() {
   }, [
     pendingWorkspaceDocumentPanelOpen,
     selectedWorkspace?.id,
+    selectedWorkspaceDocumentsEnabled,
     selectedWorkspaceOpenDocumentPanel,
   ]);
 
@@ -43693,6 +43944,7 @@ export default function App() {
                             onToggleWorkspaceThreadPinned={toggleWorkspaceThreadPinnedFromOverlay}
                             onRefreshGitRepositories={refreshWorkspaceGitRepositoryPreload}
                             onRefreshGitSnapshot={refreshWorkspaceGitSnapshotPreload}
+                            onCloseWorkspaceDocumentPanel={closeWorkspaceDocumentPanel}
                             onMinimizeWorkspaceToolPane={minimizeWorkspaceToolPane}
                             onRestoreWorkspaceToolPane={restoreWorkspaceToolPane}
                             onToggleFullscreenWorkspaceToolPane={toggleFullscreenWorkspaceToolPane}
@@ -43716,6 +43968,11 @@ export default function App() {
                             workspaceSyncState={workspaceSyncState}
                             workspaceThreadRestoreReady={workspaceThreadsHydrated}
                             workspaceNotificationAttention={workspaceTerminalNotificationAttention[runtimeWorkspace.id] || null}
+                            workspaceTerminalFocusRequest={
+                              workspaceTerminalFocusRequest?.workspaceId === runtimeWorkspace.id
+                                ? workspaceTerminalFocusRequest
+                                : null
+                            }
                             workspaceTerminalAgentLaunchReady={runtimeAgentLaunchReady}
                             workspaceTerminalRenderAgent={runtimeDescriptor.renderAgent}
                             workspaceThreads={workspaceThreads}
@@ -45054,8 +45311,10 @@ export default function App() {
                       architectureState={selectedWorkspaceGraphState.architectureState || "idle"}
                       connectedDevices={cloudWorkspaceProgress.connectedDevices}
                       knownDevices={cloudWorkspaceProgress.knownDevices}
+                      onGoToSessionTerminal={goToSessionHistoryTerminal}
                       onArchitectureGraphListRefresh={refreshSelectedWorkspaceArchitectureGraphList}
                       onArchitectureSelectionChange={updateSelectedWorkspaceArchitectureSelection}
+                      onOpenSessionTerminal={openSessionHistoryTerminal}
                       workspace={selectedWorkspace}
                       workspaceTerminalOptions={selectedWorkspaceTerminalOptions}
                       workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
@@ -45411,9 +45670,7 @@ export default function App() {
                                   onCancelQueuedItem={cancelAccountToolQueuedTodo}
                                   onDraftChange={setAccountToolDraft}
                                   onMinimizePane={minimizeWorkspaceToolPane}
-                                  onOpenDocumentPanel={selectedWorkspaceDocumentsEnabled
-                                    ? openSelectedWorkspaceDocumentPanel
-                                    : null}
+                                  onOpenDocumentPanel={openSelectedWorkspaceDocumentPanel}
                                   onOpenWorkspaceSettings={openSelectedWorkspaceSettings}
                                   onQueueAllItems={queueAllAccountToolTodos}
                                   onQueueItem={queueAccountToolTodo}

@@ -2632,8 +2632,8 @@ fn todo_dispatch_todo_sync_commit_payload(
     };
     let text = todo_dispatch_backend_item_text_for_sync(item);
     let title = text.chars().take(120).collect::<String>();
-    let updated_at = todo_store_item_updated_at(item, &now_iso);
-    let created_at = todo_store_item_created_at(item, &updated_at);
+    let created_at = todo_store_item_created_at(item, &now_iso);
+    let updated_at = todo_store_item_updated_at(item, &created_at);
     let item_source = todo_dispatch_text(item, &["source", "source_kind", "sourceKind"]);
     let source_kind = if item_source.is_empty() {
         source.to_string()
@@ -2732,6 +2732,12 @@ fn todo_dispatch_todo_sync_commit_payload(
                 "reason",
             ],
         ),
+        "text": text,
+        "body": text,
+        "todo_text": text,
+        "todoText": text,
+        "todo_id": todo_id,
+        "todoId": todo_id,
         "title": title,
         "updated_at": updated_at,
         "updatedAt": updated_at,
@@ -2777,6 +2783,7 @@ fn todo_dispatch_todo_sync_commit_payload(
     todo_dispatch_copy_todo_input_aliases(item, &mut meta);
     Some(json!({
         "c": "todo.sync",
+        "contract": "diffforge.todo.live_state.v1",
         "cid": format!("rust-todo-dispatch-{todo_id}-{status}-{rust_todo_seq}"),
         "device_id": device_id,
         "deviceId": device_id,
@@ -2787,11 +2794,11 @@ fn todo_dispatch_todo_sync_commit_payload(
         "rustTodoSeq": rust_todo_seq,
         "m": "commit",
         "ops": [
-            ["u", todo_id, status, text, meta],
+            ["u", 0, todo_id, device_id, workspace_id, status, "", meta],
         ],
         "repo_path": repo_path,
         "source": source,
-        "v": 2,
+        "v": 1,
         "workspace_id": workspace_id,
         "workspaceId": workspace_id,
         "workspace_name": workspace_name,
@@ -2847,7 +2854,11 @@ fn todo_dispatch_delete_todo_sync_commit_payload(
             let rust_todo_seq = todo_store_next_authority_seq(workspace_id, todo_id, &attempt_id);
             json!([
                 "d",
+                0,
                 todo_id,
+                device_id,
+                workspace_id,
+                "deleted",
                 {
                     "rust_authoritative": true,
                     "rustAuthoritative": true,
@@ -2880,6 +2891,7 @@ fn todo_dispatch_delete_todo_sync_commit_payload(
         .collect::<Vec<_>>();
     Some(json!({
         "c": "todo.sync",
+        "contract": "diffforge.todo.live_state.v1",
         "cid": format!("rust-todo-delete-{workspace_id}-{}", todo_dispatch_now_ms()),
         "device_id": device_id,
         "deviceId": device_id,
@@ -2889,7 +2901,7 @@ fn todo_dispatch_delete_todo_sync_commit_payload(
         "m": "commit",
         "ops": ops,
         "source": "rust-diffforge-todo-store",
-        "v": 2,
+        "v": 1,
         "workspace_id": workspace_id,
         "workspaceId": workspace_id,
     }))
@@ -3089,7 +3101,7 @@ fn todo_store_push_items(app: &AppHandle, workspace_id: &str, items: Vec<Value>,
     );
 }
 
-/// Local-only removal marker: `todo.sync`/`todo.content` own account sync now,
+/// Local-only removal marker: `todo.live_state`/`todo.content` own account sync now,
 /// so this no longer writes legacy workspace todo events.
 fn todo_store_push_removals(
     app: &AppHandle,
@@ -3124,7 +3136,7 @@ fn todo_store_push_corrections(
     }
     // Client-authoritative: stamp the corrected statuses onto the local
     // mirror so every view settles instantly. Account sync is handled by
-    // todo.sync/todo.content rather than the retired workspace todo events.
+    // todo.live_state/todo.content rather than the retired workspace todo events.
     if cloud_mcp_todo_mirror_apply_local_corrections(&items) > 0 {
         let _ = app.emit(
             CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT,
@@ -3192,8 +3204,8 @@ pub(crate) fn todo_store_delete_internal(
     // Client-authoritative: purge the local mirror right away so every view
     // converges instantly; the cloud removal below syncs in the background.
     let purged = cloud_mcp_todo_mirror_purge_todo_ids(&all_ids);
-    if !tombstoned.is_empty() {
-        todo_store_enqueue_delete_todo_sync_commit(app, workspace_id, &tombstoned, reason, origin);
+    if !all_ids.is_empty() {
+        todo_store_enqueue_delete_todo_sync_commit(app, workspace_id, &all_ids, reason, origin);
     }
     todo_store_push_removals(app, workspace_id, all_ids, reason);
     todo_store_emit_changed(app, workspace_id, reason, "store");
@@ -7935,7 +7947,7 @@ pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) 
         }));
     }
     // One funnel for accepted deletes: tombstone, queue-store removal, journal,
-    // and Rust-authoritative todo.sync delete.
+    // and Rust-authoritative todo.live_state delete.
     let removed = todo_store_delete_internal(
         app,
         &workspace_id,
@@ -8672,10 +8684,11 @@ mod todo_dispatch_backend_tests {
         .expect("running payload");
 
         assert_eq!(payload["c"].as_str(), Some("todo.sync"));
-        assert_eq!(payload["ops"][0][1].as_str(), Some("todo-running-1"));
-        assert_eq!(payload["ops"][0][2].as_str(), Some("running"));
+        assert_eq!(payload["ops"][0][1].as_i64(), Some(0));
+        assert_eq!(payload["ops"][0][2].as_str(), Some("todo-running-1"));
+        assert_eq!(payload["ops"][0][5].as_str(), Some("running"));
         assert_eq!(
-            payload["ops"][0][4]["reason"].as_str(),
+            payload["ops"][0][7]["reason"].as_str(),
             Some("todo_queue_backend_submit")
         );
 

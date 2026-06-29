@@ -3667,8 +3667,11 @@ fn cloud_mcp_todo_sync_op_idempotency_fragment(op: &Value, index: usize) -> Opti
         .filter(|value| !value.is_empty())
         .unwrap_or("u")
         .to_ascii_lowercase();
+    let v2_indexed = op_array.get(1).is_some_and(|value| value.is_number());
+    let todo_id_index = if v2_indexed { 2 } else { 1 };
+    let status_index = if v2_indexed { 5 } else { 2 };
     let todo_id = op_array
-        .get(1)
+        .get(todo_id_index)
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -3679,7 +3682,7 @@ fn cloud_mcp_todo_sync_op_idempotency_fragment(op: &Value, index: usize) -> Opti
         "deleted".to_string()
     } else {
         op_array
-            .get(2)
+            .get(status_index)
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -3688,12 +3691,16 @@ fn cloud_mcp_todo_sync_op_idempotency_fragment(op: &Value, index: usize) -> Opti
             .unwrap_or_else(|| "upsert".to_string())
     };
     let metadata = if is_delete {
-        op_array.get(2)
+        if v2_indexed {
+            op_array.get(6)
+        } else {
+            op_array.get(2)
+        }
     } else {
         op_array
-            .get(4)
+            .get(7)
             .filter(|value| value.is_object())
-            .or_else(|| op_array.get(7).filter(|value| value.is_object()))
+            .or_else(|| op_array.get(4).filter(|value| value.is_object()))
     };
     let rust_todo_seq = metadata
         .and_then(|value| {
@@ -3736,7 +3743,7 @@ fn cloud_mcp_todo_sync_outbox_idempotency_key(
     payload_hash: &str,
     coalesce_key: Option<&str>,
 ) -> Option<String> {
-    if !event_kind.trim().eq_ignore_ascii_case("todo.sync")
+    if !event_kind.trim().eq_ignore_ascii_case("todo.live_state")
         && !payload
             .get("c")
             .and_then(Value::as_str)
@@ -3744,7 +3751,7 @@ fn cloud_mcp_todo_sync_outbox_idempotency_key(
         && !payload
             .get("kind")
             .and_then(Value::as_str)
-            .is_some_and(|value| value.trim().eq_ignore_ascii_case("todo.sync"))
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("todo.live_state"))
     {
         return None;
     }
@@ -3795,7 +3802,7 @@ fn cloud_mcp_todo_sync_outbox_idempotency_key(
     }
     let coalesce = coalesce_key.unwrap_or_default();
     Some(format!(
-        "todo.sync:{device_id}:{workspace_id}:{cid}:{ops_fragment}:{coalesce}:{payload_hash}"
+        "todo.live_state:{device_id}:{workspace_id}:{cid}:{ops_fragment}:{coalesce}:{payload_hash}"
     ))
 }
 
@@ -6026,7 +6033,7 @@ fn cloud_mcp_task_event_removed_outbox_response(event_kind: &str) -> Value {
 
 fn cloud_mcp_outbox_priority_for_event(event_kind: &str) -> u8 {
     match event_kind.trim().to_ascii_lowercase().as_str() {
-        "todo.sync"
+        "todo.live_state"
         | "doc.sync"
         | "doc.content"
         | "loopspaces.sync"
@@ -14374,7 +14381,8 @@ fn cloud_mcp_account_sync_resume_todo_domain(reason: &str) -> Value {
     json!({
         "c": "todo.sync",
         "m": if last_applied_seq > 0 { "delta" } else { "hello" },
-        "v": 2,
+        "v": 1,
+        "contract": "diffforge.todo.live_state.v1",
         "aseq": last_applied_seq,
         "dseq": 0,
         "cursor": cursor,
@@ -14489,7 +14497,7 @@ async fn cloud_mcp_apply_account_sync_resume_response(
         response,
         &["todos", "todo", "account_todos", "accountTodos"],
     ) {
-        match cloud_mcp_apply_account_todo_inbound_event(state, "todo.sync", &todos).await {
+        match cloud_mcp_apply_account_todo_inbound_event(state, "todo.live_state", &todos).await {
             Ok(result) => {
                 let _ =
                     cloud_mcp_send_account_todo_delta_ack(state, &result, "account_sync_resume")
@@ -15306,7 +15314,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         return;
     }
     let direct_account_todo_delta = cloud_mcp_is_account_todo_delta_event_kind(&direct_kind)
-        || matches!(direct_request_kind.as_str(), "todo.sync");
+        || matches!(direct_request_kind.as_str(), "todo.live_state");
     if direct_account_todo_delta {
         if message.get("ok").and_then(Value::as_bool) == Some(false) {
             return;
@@ -15320,7 +15328,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         {
             return;
         }
-        let event_kind = cloud_mcp_account_todo_event_kind(&event, "todo.sync");
+        let event_kind = cloud_mcp_account_todo_event_kind(&event, "todo.live_state");
         match cloud_mcp_apply_account_todo_inbound_event(state, &event_kind, &event).await {
             Ok(result) => {
                 let suppress_local_echo = result.applied == 0
@@ -18150,7 +18158,7 @@ fn cloud_mcp_is_tokenomics_delta_signal_event(event_kind: &str) -> bool {
 fn cloud_mcp_is_workspace_todo_wake_event(event_kind: &str, _event: &Value) -> bool {
     if matches!(
         event_kind,
-        "todo.sync"
+        "todo.live_state"
             | "account_todo_delta"
             | "workspace_todo_upserted"
             | "workspace_todo_deleted"
@@ -22277,7 +22285,7 @@ async fn cloud_mcp_send_event_now(
         );
         return Ok(response);
     }
-    if event_kind.trim().eq_ignore_ascii_case("todo.sync") {
+    if event_kind.trim().eq_ignore_ascii_case("todo.live_state") {
         if cloud_mcp_todo_sync_payload_is_app_control(payload) {
             log_terminal_status_event(
                 "backend.cloud_mcp.todo_sync_app_control_outbox_skip",
@@ -22291,11 +22299,11 @@ async fn cloud_mcp_send_event_now(
                 "reason": "app_control_terminal",
             }));
         }
-        let response = cloud_mcp_ws_request(state, "todo.sync", payload).await?;
+        let response = cloud_mcp_ws_request(state, "todo.live_state", payload).await?;
         cloud_mcp_update_todo_mirror_from_response(
             state,
             "todo_sync_outbox_response",
-            "todo.sync",
+            "todo.live_state",
             payload,
             &response,
         )
@@ -25760,7 +25768,36 @@ async fn cloud_mcp_get_cached_workspace_todos(
     } else {
         None
     };
-    Ok(scoped.or(fallback).unwrap_or_else(|| json!({})))
+    Ok(scoped.or(fallback).unwrap_or_else(|| {
+        json!({
+            "kind": "todo.live_state",
+            "contract": "diffforge.todo.live_state.v1",
+            "known": false,
+            "stale": true,
+            "accepted": {
+                "items": [],
+                "server_seq": 0,
+                "serverSeq": 0,
+                "snapshot_epoch": 0,
+                "snapshotEpoch": 0,
+                "last_known": true,
+                "lastKnown": true,
+                "authoritative_empty": false,
+                "authoritativeEmpty": false,
+            },
+            "intents": {
+                "pending": [],
+                "delivered": [],
+                "rejected": [],
+            },
+            "cursors": {
+                "accepted_server_seq": 0,
+                "acceptedServerSeq": 0,
+                "intent_server_seq": 0,
+                "intentServerSeq": 0,
+            },
+        })
+    }))
 }
 
 async fn cloud_mcp_get_billing_status_for_state(state: &CloudMcpState) -> Result<Value, String> {
@@ -36185,7 +36222,7 @@ async fn cloud_mcp_archive_workspace_todos(
     if workspace_id.is_empty() {
         return Err("Workspace todo archive requires a workspace id.".to_string());
     }
-    // Local state is removed immediately; todo.sync/todo.content own account
+    // Local state is removed immediately; todo.live_state/todo.content own account
     // convergence for recreated workspaces.
     let purged_mirror_rows = cloud_mcp_todo_mirror_purge_workspace(&workspace_id).unwrap_or(0);
     let device_profile = cloud_mcp_desktop_device_profile();
@@ -39392,7 +39429,10 @@ fn cloud_mcp_account_todo_event_kind(value: &Value, fallback: &str) -> String {
 }
 
 fn cloud_mcp_is_account_todo_delta_event_kind(event_kind: &str) -> bool {
-    matches!(event_kind.trim().to_ascii_lowercase().as_str(), "todo.sync")
+    matches!(
+        event_kind.trim().to_ascii_lowercase().as_str(),
+        "todo.live_state"
+    )
 }
 
 fn cloud_mcp_is_account_todo_inbound_event_kind(event_kind: &str) -> bool {
@@ -39650,6 +39690,12 @@ fn cloud_mcp_todo_sync_compact_payload(op: &Value) -> Value {
         .cloned()
         .or_else(|| {
             op.as_array()
+                .and_then(|items| items.get(6))
+                .filter(|value| value.is_object())
+                .cloned()
+        })
+        .or_else(|| {
+            op.as_array()
                 .and_then(|items| items.get(5))
                 .filter(|value| value.is_object())
                 .cloned()
@@ -39685,7 +39731,9 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
             .unwrap_or_default()
             .trim()
             .to_ascii_lowercase();
-        channel == "todo.sync" || kind == "todo.sync" || contract == "diffforge.todo.sync.v2"
+        channel == "todo.sync"
+            || kind == "todo.live_state"
+            || contract == "diffforge.todo.live_state.v1"
     }
 
     let mut entries = Vec::new();
@@ -39702,6 +39750,15 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
             continue;
         }
         let Some(ops) = source.get("ops").and_then(Value::as_array) else {
+            let accepted_items = source
+                .get("accepted")
+                .and_then(|accepted| accepted.get("items"))
+                .or_else(|| source.get("items"))
+                .or_else(|| source.get("current"))
+                .and_then(Value::as_array);
+            if let Some(items) = accepted_items {
+                entries.extend(items.iter().filter(|item| item.is_object()).cloned());
+            }
             continue;
         };
         for op in ops {
@@ -40679,9 +40736,9 @@ async fn cloud_mcp_send_account_todo_delta_ack(
     let auth = cloud_mcp_ws_auth_object(state).await?;
     let device_profile = cloud_mcp_desktop_device_profile();
     let envelope = json!({
-        "kind": "todo.sync",
+        "kind": "todo.live_state",
         "id": format!("account-todo-delta-ack-{}-{}", now, uuid::Uuid::new_v4()),
-        "contract": "diffforge.todo.sync.v2",
+        "contract": "diffforge.todo.live_state.v1",
         "control": true,
         "control_frame": true,
         "controlFrame": true,
@@ -40694,7 +40751,7 @@ async fn cloud_mcp_send_account_todo_delta_ack(
         "request": {
             "c": "todo.sync",
             "m": "ack",
-            "v": 2,
+            "v": 1,
             "control": true,
             "control_frame": true,
             "controlFrame": true,
@@ -40721,7 +40778,7 @@ async fn cloud_mcp_send_account_todo_delta_ack(
         },
         "sent_at_ms": now,
         "sentAtMs": now,
-        "type": "todo.sync",
+        "type": "todo.live_state",
     });
     let count = cloud_mcp_sync_payload_count(&envelope);
     let bytes = cloud_mcp_sync_payload_bytes(&envelope);
@@ -40733,7 +40790,7 @@ async fn cloud_mcp_send_account_todo_delta_ack(
         bytes,
         true,
         cloud_mcp_sync_activity_size_class("active", count, bytes, "todos"),
-        "todo.sync",
+        "todo.live_state",
     );
     let send_result = match state.global_ws_tx.lock().await.as_ref().cloned() {
         Some(tx) => tx
@@ -40796,11 +40853,11 @@ async fn cloud_mcp_apply_account_todo_inbound_event(
         bytes,
         true,
         cloud_mcp_sync_activity_size_class("applying", count, bytes, "todos"),
-        &format!("todo.sync:{event_kind}"),
+        &format!("todo.live_state:{event_kind}"),
     );
     let result = cloud_mcp_apply_account_todo_delta_conn(
         &conn,
-        "todo.sync",
+        "todo.live_state",
         Some(&base_url),
         event,
         &local_device_id,
@@ -40826,10 +40883,10 @@ async fn cloud_mcp_apply_account_todo_inbound_event(
             );
             if result.mirror_changed {
                 let _ = state.global_ws_events.send(json!({
-                    "kind": "todo.sync",
-                    "event_kind": "todo.sync",
-                    "eventKind": "todo.sync",
-                    "contract": "diffforge.todo.sync.v2",
+                    "kind": "todo.live_state",
+                    "event_kind": "todo.live_state",
+                    "eventKind": "todo.live_state",
+                    "contract": "diffforge.todo.live_state.v1",
                     "mirror_changed": true,
                     "mirrorChanged": true,
                     "source": "rust-diffforge-account-todo-sync",
@@ -45561,7 +45618,7 @@ async fn cloud_mcp_commit_workspace_todo_sync(
         ));
     }
 
-    cloud_mcp_ws_request(state.inner(), "todo.sync", &request_value).await
+    cloud_mcp_ws_request(state.inner(), "todo.live_state", &request_value).await
 }
 
 fn cloud_mcp_prepare_workspace_todo_sync_request(payload: Value) -> Value {
@@ -45571,9 +45628,12 @@ fn cloud_mcp_prepare_workspace_todo_sync_request(payload: Value) -> Value {
         .entry("c".to_string())
         .or_insert_with(|| json!("todo.sync"));
     request
+        .entry("contract".to_string())
+        .or_insert_with(|| json!("diffforge.todo.live_state.v1"));
+    request
         .entry("m".to_string())
         .or_insert_with(|| json!("commit"));
-    request.entry("v".to_string()).or_insert_with(|| json!(2));
+    request.entry("v".to_string()).or_insert_with(|| json!(1));
     request
         .entry("source".to_string())
         .or_insert_with(|| json!("rust-diffforge-account-tool"));
@@ -45611,9 +45671,14 @@ fn cloud_mcp_workspace_todo_sync_delete_ids(request_value: &Value) -> Vec<String
             if !matches!(code.as_str(), "d" | "del" | "delete" | "rm") {
                 continue;
             }
-            let mut todo_id = op
+            let v2_indexed = op
                 .as_array()
                 .and_then(|items| items.get(1))
+                .is_some_and(|value| value.is_number());
+            let todo_id_index = if v2_indexed { 2 } else { 1 };
+            let mut todo_id = op
+                .as_array()
+                .and_then(|items| items.get(todo_id_index))
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .trim()
@@ -45709,8 +45774,8 @@ pub(crate) async fn cloud_mcp_enqueue_workspace_todo_sync_commit(
             }),
         );
         return cloud_mcp_background_sync_ack(
-            "todo.sync",
-            "todo.sync",
+            "todo.live_state",
+            "todo.live_state",
             reason,
             json!({
                 "queued": false,
@@ -45726,7 +45791,7 @@ pub(crate) async fn cloud_mcp_enqueue_workspace_todo_sync_commit(
     cloud_mcp_update_todo_mirror_from_response(
         state,
         "todo_sync_local_commit",
-        "todo.sync",
+        "todo.live_state",
         &request_value,
         &request_value,
     )
@@ -45737,20 +45802,20 @@ pub(crate) async fn cloud_mcp_enqueue_workspace_todo_sync_commit(
         &["cid", "client_request_id", "clientRequestId"],
     )
     .unwrap_or_else(|| format!("todo-sync-{}", cloud_mcp_now_ms()));
-    let key = format!("todo.sync:{workspace_id}:{cid}");
+    let key = format!("todo.live_state:{workspace_id}:{cid}");
     cloud_mcp_enqueue_background_sync(
         state,
         key,
-        "todo.sync",
+        "todo.live_state",
         request_value,
-        cloud_mcp_outbox_priority_for_event("todo.sync"),
+        cloud_mcp_outbox_priority_for_event("todo.live_state"),
         reason.to_string(),
     )
     .await;
 
     cloud_mcp_background_sync_ack(
-        "todo.sync",
-        "todo.sync",
+        "todo.live_state",
+        "todo.live_state",
         reason,
         json!({
             "queued": true,
@@ -49176,8 +49241,8 @@ mod cloud_mcp_tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let delta = json!({
-            "kind": "todo.sync",
-            "contract": "diffforge.todo.sync.v2",
+            "kind": "todo.live_state",
+            "contract": "diffforge.todo.live_state.v1",
             "c": "todo.sync",
             "m": "delta",
             "accountId": "account-1",
@@ -49244,8 +49309,8 @@ mod cloud_mcp_tests {
         assert_eq!(mirror_count, 1);
 
         let delete_delta = json!({
-            "kind": "todo.sync",
-            "contract": "diffforge.todo.sync.v2",
+            "kind": "todo.live_state",
+            "contract": "diffforge.todo.live_state.v1",
             "c": "todo.sync",
             "m": "delta",
             "accountId": "account-1",
@@ -49288,8 +49353,8 @@ mod cloud_mcp_tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let delta = json!({
-            "kind": "todo.sync",
-            "contract": "diffforge.todo.sync.v2",
+            "kind": "todo.live_state",
+            "contract": "diffforge.todo.live_state.v1",
             "c": "todo.sync",
             "m": "delta",
             "accountId": "account-1",
@@ -49336,8 +49401,8 @@ mod cloud_mcp_tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let delta = json!({
-            "kind": "todo.sync",
-            "contract": "diffforge.todo.sync.v2",
+            "kind": "todo.live_state",
+            "contract": "diffforge.todo.live_state.v1",
             "c": "todo.sync",
             "m": "push",
             "accountId": "account-1",
@@ -49389,8 +49454,8 @@ mod cloud_mcp_tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let delta = json!({
-            "kind": "todo.sync",
-            "contract": "diffforge.todo.sync.v2",
+            "kind": "todo.live_state",
+            "contract": "diffforge.todo.live_state.v1",
             "c": "todo.sync",
             "m": "delta",
             "accountId": "account-1",
@@ -49447,8 +49512,8 @@ mod cloud_mcp_tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let newer = json!({
-            "kind": "todo.sync",
-            "contract": "diffforge.todo.sync.v2",
+            "kind": "todo.live_state",
+            "contract": "diffforge.todo.live_state.v1",
             "c": "todo.sync",
             "m": "delta",
             "accountId": "account-1",
@@ -49471,8 +49536,8 @@ mod cloud_mcp_tests {
         .unwrap();
 
         let older = json!({
-            "kind": "todo.sync",
-            "contract": "diffforge.todo.sync.v2",
+            "kind": "todo.live_state",
+            "contract": "diffforge.todo.live_state.v1",
             "c": "todo.sync",
             "m": "delta",
             "accountId": "account-1",
@@ -49515,8 +49580,8 @@ mod cloud_mcp_tests {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         cloud_mcp_todo_mirror_init_conn(&conn).unwrap();
         let malformed = json!({
-            "kind": "todo.sync",
-            "contract": "diffforge.todo.sync.v2",
+            "kind": "todo.live_state",
+            "contract": "diffforge.todo.live_state.v1",
             "c": "todo.sync",
             "m": "delta",
             "accountId": "account-1",
@@ -49580,15 +49645,15 @@ mod cloud_mcp_tests {
     }
 
     #[test]
-    fn todo_sync_outbox_rows_are_high_priority() {
+    fn todo_live_state_outbox_rows_are_high_priority() {
         assert_eq!(
-            cloud_mcp_outbox_priority_for_event("todo.sync"),
+            cloud_mcp_outbox_priority_for_event("todo.live_state"),
             CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH
         );
     }
 
     #[test]
-    fn todo_sync_idempotency_key_tracks_cid_op_and_rust_seq() {
+    fn todo_live_state_idempotency_key_tracks_cid_op_and_rust_seq() {
         let upsert = json!({
             "c": "todo.sync",
             "cid": "cid-1",
@@ -49627,25 +49692,25 @@ mod cloud_mcp_tests {
         });
 
         let upsert_key = cloud_mcp_outbox_idempotency_key(
-            "todo.sync",
+            "todo.live_state",
             &upsert,
             "hash-upsert",
-            Some("todo.sync:workspace-a:cid-1"),
+            Some("todo.live_state:workspace-a:cid-1"),
         );
         let edited_key = cloud_mcp_outbox_idempotency_key(
-            "todo.sync",
+            "todo.live_state",
             &edited,
             "hash-edited",
-            Some("todo.sync:workspace-a:cid-1"),
+            Some("todo.live_state:workspace-a:cid-1"),
         );
         let deleted_key = cloud_mcp_outbox_idempotency_key(
-            "todo.sync",
+            "todo.live_state",
             &deleted,
             "hash-deleted",
-            Some("todo.sync:workspace-a:cid-1"),
+            Some("todo.live_state:workspace-a:cid-1"),
         );
 
-        assert!(upsert_key.starts_with("todo.sync:device-a:workspace-a:cid-1:"));
+        assert!(upsert_key.starts_with("todo.live_state:device-a:workspace-a:cid-1:"));
         assert!(upsert_key.contains("0:u:todo-1:listed:7"));
         assert!(edited_key.contains("0:u:todo-1:listed:8"));
         assert!(deleted_key.contains("0:d:todo-1:deleted:9"));

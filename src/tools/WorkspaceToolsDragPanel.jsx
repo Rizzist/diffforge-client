@@ -121,6 +121,14 @@ function docCardEntry(entry) {
   };
 }
 
+export function workspaceDocumentPanelEntryFromRow(entry) {
+  return docCardEntry(entry);
+}
+
+export function workspaceDocumentPanelRowIsFolder(entry) {
+  return documentIsFolder(entry);
+}
+
 function docTodoText(entry) {
   const body = text(entry.body).slice(0, 4000);
   return body
@@ -230,6 +238,7 @@ export default function WorkspaceToolsDragPanel({
   const visibleDocs = filter === "all"
     ? docs
     : docs.filter((entry) => entry.kind === filter || (filter === "document" && entry.kind === "html"));
+  const documentOpenAvailable = Boolean(documentPanelEnabled || typeof onOpenDocumentPanel === "function");
 
   return (
     <Panel aria-label="Draggable workspace docs">
@@ -278,7 +287,7 @@ export default function WorkspaceToolsDragPanel({
                   onDragEnd={handleDragEnd}
                   role="listitem"
                 >
-                  {documentPanelEnabled && (
+                  {documentOpenAvailable && (
                     <DocCardOpenButton
                       aria-label={`Open ${entry.title}`}
                       onClick={(event) => handleOpenDocument(event, entry)}

@@ -5512,6 +5512,8 @@ export default function ArchitectureWorkspaceView({
   knownDevices = [],
   onArchitectureGraphListRefresh = null,
   onArchitectureSelectionChange = null,
+  onGoToSessionTerminal = null,
+  onOpenSessionTerminal = null,
   workspace,
   workspaceTerminalOptions = [],
 }) {
@@ -5745,8 +5747,12 @@ export default function ArchitectureWorkspaceView({
         <SessionHistoryPanel
           error={sessionHistoryError}
           items={sessionHistoryItems}
+          onGoToTerminal={onGoToSessionTerminal}
+          onOpenTerminal={onOpenSessionTerminal}
           repoLabel={repoLabel}
           state={sessionHistoryState}
+          terminalOptions={workspaceTerminalOptions}
+          workspaceId={activeWorkspaceId}
         />
       )}
       {visibleArchitectureError && (
@@ -9621,10 +9627,85 @@ function sessionHistoryStatusLabel(item) {
 }
 
 function sessionHistoryTitle(item) {
+  const storedTitle = text(item?.title);
+  const fallbackTitle = ["agent", "coding agent session"].includes(storedTitle.toLowerCase()) ? "" : storedTitle;
   return text(
-    item?.title || item?.providerSessionId || item?.provider_session_id || item?.threadId || item?.thread_id,
+    item?.firstUserMessage
+      || item?.first_user_message
+      || item?.initialUserMessage
+      || item?.initial_user_message
+      || item?.promptPreview
+      || item?.prompt_preview
+      || fallbackTitle
+      || item?.providerSessionId
+      || item?.provider_session_id
+      || item?.threadId
+      || item?.thread_id,
     sessionHistoryAgentLabel(item),
   );
+}
+
+function sessionHistoryExactSessionValues(value) {
+  return [
+    value?.providerSessionId,
+    value?.provider_session_id,
+    value?.nativeSessionId,
+    value?.native_session_id,
+    value?.currentProviderSessionId,
+    value?.current_provider_session_id,
+    value?.currentNativeSessionId,
+    value?.current_native_session_id,
+    value?.transcriptSessionId,
+    value?.transcript_session_id,
+    value?.sessionId,
+    value?.session_id,
+  ]
+    .map((entry) => text(entry))
+    .filter(Boolean);
+}
+
+function sessionHistoryAgentMatches(item, terminal) {
+  const itemAgent = sessionHistoryAgentKey(item);
+  const terminalAgent = sessionHistoryAgentKey({
+    agentId: terminal?.agentId || terminal?.agent_id || terminal?.agentKind || terminal?.agent_kind,
+    provider: terminal?.provider || terminal?.agentId || terminal?.agent_id || terminal?.agentKind || terminal?.agent_kind,
+  });
+  return !itemAgent || !terminalAgent || itemAgent === terminalAgent;
+}
+
+function sessionHistoryProviderSessionId(item) {
+  return sessionHistoryExactSessionValues(item)[0] || "";
+}
+
+function sessionHistoryTerminalConnected(terminal) {
+  if (!terminal) return false;
+  if (terminal.connected === false || terminal.nativeConnected === false || terminal.native_connected === false) {
+    return false;
+  }
+  const status = text(
+    terminal.status
+      || terminal.terminalStatus
+      || terminal.terminal_status
+      || terminal.terminalLifecycle
+      || terminal.terminal_lifecycle,
+  ).toLowerCase();
+  return !["closed", "closing", "disconnected", "exited", "offline", "terminated"].includes(status);
+}
+
+function sessionHistoryFindTerminal(item, terminalOptions = []) {
+  const itemSessionIds = new Set(sessionHistoryExactSessionValues(item));
+  if (!itemSessionIds.size) {
+    return null;
+  }
+  return terminalOptions.find((terminal) => {
+    if (!sessionHistoryTerminalConnected(terminal)) {
+      return false;
+    }
+    if (!sessionHistoryAgentMatches(item, terminal)) {
+      return false;
+    }
+    return sessionHistoryExactSessionValues(terminal).some((sessionId) => itemSessionIds.has(sessionId));
+  }) || null;
 }
 
 function SessionHistoryProviderIcon({ item }) {
@@ -9651,7 +9732,16 @@ function SessionHistoryProviderIcon({ item }) {
   return <Terminal aria-hidden="true" />;
 }
 
-function SessionHistoryPanel({ error = "", items = [], repoLabel = "", state = "idle" }) {
+function SessionHistoryPanel({
+  error = "",
+  items = [],
+  onGoToTerminal = null,
+  onOpenTerminal = null,
+  repoLabel = "",
+  state = "idle",
+  terminalOptions = [],
+  workspaceId = "",
+}) {
   const hasItems = items.length > 0;
   const loading = state === "loading";
   return (
@@ -9673,6 +9763,9 @@ function SessionHistoryPanel({ error = "", items = [], repoLabel = "", state = "
             const latestMs = parseTimeMs(item?.latestAtMs ?? item?.latest_at_ms);
             const statusKind = sessionHistoryStatusKind(item);
             const id = text(item?.id, `session-${index}`);
+            const terminalMatch = sessionHistoryFindTerminal(item, terminalOptions);
+            const providerSessionId = sessionHistoryProviderSessionId(item);
+            const sessionTitle = sessionHistoryTitle(item);
             return (
               <SessionHistoryCard data-agent={sessionHistoryAgentKey(item)} key={id}>
                 <SessionHistoryIcon aria-hidden="true">
@@ -9682,9 +9775,43 @@ function SessionHistoryPanel({ error = "", items = [], repoLabel = "", state = "
                   <SessionHistoryCardTop>
                     <div>
                       <SessionHistoryAgent>{sessionHistoryAgentLabel(item)}</SessionHistoryAgent>
-                      <SessionHistoryTitle>{sessionHistoryTitle(item)}</SessionHistoryTitle>
+                      <SessionHistoryTitle title={sessionTitle}>{sessionTitle}</SessionHistoryTitle>
                     </div>
-                    <StatusPill data-status={statusKind}>{sessionHistoryStatusLabel(item)}</StatusPill>
+                    <SessionHistoryCardTopActions>
+                      <StatusPill data-status={statusKind}>{sessionHistoryStatusLabel(item)}</StatusPill>
+                      {terminalMatch ? (
+                        <SessionHistoryActionButton
+                          aria-label={`Go-to this terminal tab for ${sessionTitle}`}
+                          data-variant="goto"
+                          onClick={() => onGoToTerminal?.({
+                            item,
+                            terminal: terminalMatch,
+                            workspaceId,
+                          })}
+                          title={`Go to ${terminalMatch.label || "terminal"} and highlight it`}
+                          type="button"
+                        >
+                          <Terminal aria-hidden="true" />
+                          <span>Go-to this terminal tab</span>
+                        </SessionHistoryActionButton>
+                      ) : (
+                        <SessionHistoryActionButton
+                          aria-label={`Open terminal for ${sessionTitle}`}
+                          data-variant="open"
+                          disabled={!providerSessionId}
+                          onClick={() => onOpenTerminal?.({
+                            item,
+                            providerSessionId,
+                            workspaceId,
+                          })}
+                          title={providerSessionId ? "Open this session in a terminal" : "No provider session id recorded"}
+                          type="button"
+                        >
+                          <Add aria-hidden="true" />
+                          <span>Open</span>
+                        </SessionHistoryActionButton>
+                      )}
+                    </SessionHistoryCardTopActions>
                   </SessionHistoryCardTop>
                   <SessionHistoryMeta>
                     <span title={sessionHistoryModelLabel(item)}>{sessionHistoryModelLabel(item)}</span>
@@ -13328,6 +13455,75 @@ const SessionHistoryCardTop = styled.div`
 
   > div {
     min-width: 0;
+  }
+
+  @media (max-width: 760px) {
+    align-items: stretch;
+    flex-direction: column;
+  }
+`;
+
+const SessionHistoryCardTopActions = styled.div`
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+  gap: 6px;
+  justify-content: flex-end;
+  min-width: 0;
+
+  @media (max-width: 760px) {
+    justify-content: space-between;
+  }
+`;
+
+const SessionHistoryActionButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  max-width: 190px;
+  min-height: 26px;
+  min-width: 0;
+  padding: 0 8px;
+  border: 1px solid rgba(125, 211, 252, 0.24);
+  border-radius: 7px;
+  color: rgba(226, 242, 255, 0.94);
+  background: rgba(14, 116, 144, 0.18);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 860;
+  line-height: 1;
+  white-space: nowrap;
+
+  svg {
+    flex: 0 0 auto;
+    width: 14px;
+    height: 14px;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  &[data-variant="open"] {
+    border-color: rgba(134, 239, 172, 0.2);
+    background: rgba(22, 101, 52, 0.18);
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(125, 211, 252, 0.5);
+    background: rgba(14, 116, 144, 0.3);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.45;
+  }
+
+  @media (max-width: 760px) {
+    max-width: 100%;
   }
 `;
 

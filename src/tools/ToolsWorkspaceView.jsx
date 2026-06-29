@@ -89,9 +89,9 @@ const SKILL_DOCUMENT_A4_WIDTH_PX = 794;
 const SKILL_DOCUMENT_A4_HEIGHT_PX = 1123;
 const SKILL_DOCUMENT_CANVAS_INLINE_GUTTER_PX = 48;
 const SKILL_DOCUMENT_CANVAS_VERTICAL_GUTTER_PX = 112;
-const SKILL_DOCUMENT_MIN_SCALE = 0.38;
+const SKILL_DOCUMENT_MIN_SCALE = 0.25;
 const SKILL_DOCUMENT_MAX_SCALE = 1.35;
-const SKILL_DOCUMENT_ZOOM_FACTOR_MIN = 0.52;
+const SKILL_DOCUMENT_ZOOM_FACTOR_MIN = 0.34;
 const SKILL_DOCUMENT_ZOOM_FACTOR_MAX = 2.8;
 const SKILL_DOCUMENT_ZOOM_STEP = 1.14;
 const SKILL_DOCUMENT_ZOOM_WHEEL_INTENSITY = 0.0014;
@@ -1529,6 +1529,10 @@ function ToolsHydrationProgress({ placement = "panel", progress }) {
 }
 
 export default function ToolsWorkspaceView({
+  embeddedDocsOpenRequest = null,
+  embeddedDocsPanel = false,
+  embeddedDocsWindowOpenRequest = null,
+  onEmbeddedDocsSelectionChange = null,
   onAppControlContextChange = null,
   onAppControlDocumentActions = null,
   onAppControlScriptActions = null,
@@ -1540,14 +1544,15 @@ export default function ToolsWorkspaceView({
   sharedScriptRunResults = {},
   workspaces = [],
 }) {
-  const [section, setSection] = useState(() => normalizedSectionId(initialSection));
+  const [section, setSection] = useState(() => normalizedSectionId(embeddedDocsPanel ? "docs" : initialSection));
   const [toolsWindowBreakouts, setToolsWindowBreakouts] = useState({});
   const toolsWindowBreakoutsRef = useRef(toolsWindowBreakouts);
+  const embeddedDocsWindowOpenHandledRef = useRef("");
 
   useEffect(() => {
-    const nextSection = normalizedSectionId(initialSection);
+    const nextSection = normalizedSectionId(embeddedDocsPanel ? "docs" : initialSection);
     setSection((current) => (current === nextSection ? current : nextSection));
-  }, [initialSection]);
+  }, [embeddedDocsPanel, initialSection]);
 
   useEffect(() => {
     toolsWindowBreakoutsRef.current = toolsWindowBreakouts;
@@ -3574,9 +3579,45 @@ export default function ToolsWorkspaceView({
     };
     pushFolder("");
     return { files: docs, rows };
-	  }, [documentDrafts, hydratingDocKeys, skillsHydration.state, skillsHydration.visible, skillsLibrary.skills, skillsQuery]);
+  }, [documentDrafts, hydratingDocKeys, skillsHydration.state, skillsHydration.visible, skillsLibrary.skills, skillsQuery]);
   const docFileRows = docsExplorerModel.files;
   const docsExplorerRows = docsExplorerModel.rows;
+
+  useEffect(() => {
+    if (!embeddedDocsPanel || !embeddedDocsOpenRequest) {
+      return;
+    }
+
+    const requestKey = text(
+      embeddedDocsOpenRequest.key
+        || embeddedDocsOpenRequest.id
+        || embeddedDocsOpenRequest.documentKey
+        || embeddedDocsOpenRequest.document_key
+        || embeddedDocsOpenRequest.pathKey
+        || embeddedDocsOpenRequest.path_key,
+    );
+    if (!requestKey) {
+      return;
+    }
+
+    const matchedRow = docFileRows.find((row) => (
+      row.key === requestKey
+        || row.key === `library:${requestKey}`
+        || row.savedStorageKey === requestKey
+        || row.storageKey === requestKey
+        || accountDocumentStorageKey(row) === requestKey
+        || row.id === requestKey
+        || row.pathKey === requestKey
+        || row.filePath === requestKey
+    ));
+    if (!matchedRow) {
+      return;
+    }
+
+    setSelectedSkillKey(matchedRow.key);
+    setSkillEditor(documentEditorDraft(matchedRow));
+    onEmbeddedDocsSelectionChange?.(matchedRow);
+  }, [docFileRows, embeddedDocsOpenRequest, embeddedDocsPanel, onEmbeddedDocsSelectionChange]);
 
   const defaultSkillRows = useMemo(() => {
     const query = text(templateQuery).toLowerCase();
@@ -4846,6 +4887,61 @@ export default function ToolsWorkspaceView({
     skillEditorTheme,
   ]);
 
+  useEffect(() => {
+    if (!embeddedDocsPanel || !embeddedDocsWindowOpenRequest) {
+      return;
+    }
+
+    const requestId = text(
+      embeddedDocsWindowOpenRequest.requestId
+        || embeddedDocsWindowOpenRequest.key
+        || embeddedDocsWindowOpenRequest.id,
+    );
+    if (!requestId || embeddedDocsWindowOpenHandledRef.current === requestId) {
+      return;
+    }
+    if (!skillEditor) {
+      return;
+    }
+
+    const requestKey = text(
+      embeddedDocsWindowOpenRequest.key
+        || embeddedDocsWindowOpenRequest.documentKey
+        || embeddedDocsWindowOpenRequest.document_key
+        || embeddedDocsWindowOpenRequest.id
+        || embeddedDocsWindowOpenRequest.pathKey
+        || embeddedDocsWindowOpenRequest.path_key,
+    );
+    const editorKeys = [
+      skillEditorDocumentKey,
+      selectedSkillKey,
+      accountDocumentStorageKey(skillEditor),
+      skillEditor.id,
+      skillEditor.pathKey,
+      skillEditor.path_key,
+      skillEditor.filePath,
+      skillEditor.file_path,
+    ].map(text).filter(Boolean);
+    const matchesSelectedDocument = !requestKey || editorKeys.some((key) => (
+      key === requestKey
+        || key === `library:${requestKey}`
+        || requestKey === `library:${key}`
+    ));
+    if (!matchesSelectedDocument) {
+      return;
+    }
+
+    embeddedDocsWindowOpenHandledRef.current = requestId;
+    void openDocumentBreakout();
+  }, [
+    embeddedDocsPanel,
+    embeddedDocsWindowOpenRequest,
+    openDocumentBreakout,
+    selectedSkillKey,
+    skillEditor,
+    skillEditorDocumentKey,
+  ]);
+
   const openSkillEditorHtmlInBrowser = useCallback(async () => {
     if (!skillEditor || !documentIsHtml(skillEditor)) return;
     try {
@@ -5107,6 +5203,9 @@ export default function ToolsWorkspaceView({
 
   const docsCreateMode = !skillEditor;
   const showDocsTemplatesPane = docsCreateMode && !rightToolsOrchestratorOpen;
+  const embeddedDocsShowExplorer = embeddedDocsPanel ? !skillEditor : !docsExplorerCollapsed;
+  const embeddedDocsShowEditor = !embeddedDocsPanel || Boolean(skillEditor);
+  const embeddedDocsShowTemplates = !embeddedDocsPanel && showDocsTemplatesPane;
   const preservedSkillEditorSelection = useMemo(() => {
     if (!skillEditor || !lastDocumentSelection) return null;
     const content = String(skillEditor.content || "");
@@ -5332,7 +5431,12 @@ export default function ToolsWorkspaceView({
   }, [scriptDocumentCanvasRef, scriptsEditorOpen, section, skillEditorOpen]);
 
   return (
-    <ToolsHubShell aria-label="Global toolkit" data-section={section}>
+    <ToolsHubShell
+      aria-label={embeddedDocsPanel ? "Workspace document panel" : "Global toolkit"}
+      data-embedded-docs-panel={embeddedDocsPanel ? "true" : undefined}
+      data-section={section}
+    >
+      {!embeddedDocsPanel && (
       <ToolsHubHeader>
         <ToolsSectionNav aria-label="Tool sections" role="tablist">
           {SECTIONS.map((entry) => (
@@ -5349,6 +5453,7 @@ export default function ToolsWorkspaceView({
           ))}
         </ToolsSectionNav>
       </ToolsHubHeader>
+      )}
 
       {section === "mcps" && (
         <ToolsMcpPane aria-label="MCP settings">
@@ -5389,11 +5494,12 @@ export default function ToolsWorkspaceView({
             {section === "docs" && (
               <DocsWorkspaceSurface
                 aria-label="Docs workspace"
-                data-docs-explorer-collapsed={docsExplorerCollapsed ? "true" : "false"}
+                data-docs-embedded-panel={embeddedDocsPanel ? "true" : undefined}
+                data-docs-explorer-collapsed={!embeddedDocsShowExplorer ? "true" : "false"}
                 ref={docsWorkspaceSurfaceRef}
-                style={{ "--docs-explorer-offset": docsExplorerCollapsed ? "0px" : docsExplorerSize }}
+                style={{ "--docs-explorer-offset": !embeddedDocsShowExplorer ? "0px" : docsExplorerSize }}
               >
-                {docsExplorerCollapsed && (
+                {!embeddedDocsPanel && docsExplorerCollapsed && (
                   <DocsExplorerRestoreButton
                     aria-label="Show document explorer"
                     onClick={expandDocsExplorer}
@@ -5406,22 +5512,22 @@ export default function ToolsWorkspaceView({
                 )}
                 <DocsWorkspaceGrid
                   data-surface="files"
-                  data-show-explorer={docsExplorerCollapsed ? "false" : "true"}
-                  data-show-templates={showDocsTemplatesPane ? "true" : "false"}
-                  key={`${docsCreateMode ? "docs-create" : "docs-edit"}-${docsExplorerCollapsed ? "explorer-hidden" : "explorer-visible"}-${showDocsTemplatesPane ? "templates-visible" : "templates-hidden"}`}
+                  data-show-explorer={embeddedDocsShowExplorer ? "true" : "false"}
+                  data-show-templates={embeddedDocsShowTemplates ? "true" : "false"}
+                  key={`${embeddedDocsPanel ? "embedded" : "full"}-${docsCreateMode ? "docs-create" : "docs-edit"}-${embeddedDocsShowExplorer ? "explorer-visible" : "explorer-hidden"}-${embeddedDocsShowTemplates ? "templates-visible" : "templates-hidden"}`}
                   orientation="horizontal"
                 >
-                  {!docsExplorerCollapsed && (
+                  {embeddedDocsShowExplorer && (
                     <>
                       <ResizePanel
                         data-surface="files"
-                        defaultSize={docsExplorerSize}
-                        groupResizeBehavior="preserve-pixel-size"
+                        defaultSize={embeddedDocsPanel ? "100%" : docsExplorerSize}
+                        groupResizeBehavior={embeddedDocsPanel ? undefined : "preserve-pixel-size"}
                         id="docs-explorer"
-                        maxSize="360px"
-                        minSize="184px"
-                        onResize={syncDocsExplorerCollapsedState}
-                        panelRef={docsExplorerPanelRef}
+                        maxSize={embeddedDocsPanel ? undefined : "360px"}
+                        minSize={embeddedDocsPanel ? "100%" : "184px"}
+                        onResize={embeddedDocsPanel ? undefined : syncDocsExplorerCollapsedState}
+                        panelRef={embeddedDocsPanel ? undefined : docsExplorerPanelRef}
                       >
                         <DocsFilesPane
                           aria-label="Document files"
@@ -5435,6 +5541,7 @@ export default function ToolsWorkspaceView({
                             });
                           }}
                     >
+                      {!embeddedDocsPanel && (
                       <FileExplorerHeader>
                         <div>
                           <PanelKicker>Explorer</PanelKicker>
@@ -5462,6 +5569,7 @@ export default function ToolsWorkspaceView({
                           </FileIconButton>
                         </FileExplorerActions>
                       </FileExplorerHeader>
+                      )}
                       <>
                           <DocsRootPath title="Account documents">account-documents / personal</DocsRootPath>
                           <DocsExplorerSearchInput
@@ -5546,9 +5654,11 @@ export default function ToolsWorkspaceView({
                                               : row;
                                           setSelectedSkillKey(text(row.draftSelectedKey || row.selectedKey));
                                           setSkillEditor(documentEditorDraft(draftDocument));
+                                          onEmbeddedDocsSelectionChange?.(draftDocument);
                                         } else {
                                           setSelectedSkillKey(row.key);
                                           setSkillEditor(documentEditorDraft(row));
+                                          onEmbeddedDocsSelectionChange?.(row);
                                         }
                                       }}
                                       title={[row.displayName, row.pathKey, text(row.localPath)].filter(Boolean).join(" · ")}
@@ -5600,14 +5710,18 @@ export default function ToolsWorkspaceView({
                         </DocsFilesPane>
                       </ResizePanel>
 
-                      <ResizeHandle data-direction="horizontal" data-surface="files" />
+                      {!embeddedDocsPanel && (
+                        <ResizeHandle data-direction="horizontal" data-surface="files" />
+                      )}
                     </>
                   )}
 
+                  {embeddedDocsShowEditor && (
                   <ResizePanel
                     data-surface="files"
+                    defaultSize={embeddedDocsPanel ? "100%" : undefined}
                     id="docs-editor"
-                    minSize="360px"
+                    minSize={embeddedDocsPanel ? "100%" : "360px"}
                   >
                     <DocsCenterPane aria-label="Document editor">
                   {skillsError && <ToolsError role="alert">{skillsError}</ToolsError>}
@@ -5635,106 +5749,119 @@ export default function ToolsWorkspaceView({
                     ) : (
                       <SkillDocumentEditor
                         aria-busy={selectedDocumentRefreshing ? "true" : "false"}
+                        data-embedded-docs-panel={embeddedDocsPanel ? "true" : undefined}
                         data-page-theme={skillEditorTheme}
                         data-refreshing={selectedDocumentRefreshing ? "true" : "false"}
                       >
-                        <SkillDocumentToolbar>
-                          <SkillDocumentToolbarControls data-side="left">
-                            <SkillDocumentThemeSwitch aria-label="Document editor page theme">
-                              {["dark", "light"].map((theme) => (
-                                <SkillDocumentThemeButton
-                                  aria-pressed={skillEditorTheme === theme}
-                                  data-active={skillEditorTheme === theme ? "true" : "false"}
-                                  key={theme}
-                                  onClick={() => setSkillEditorTheme(theme)}
+                        <SkillDocumentToolbar data-embedded-docs-panel={embeddedDocsPanel ? "true" : undefined}>
+                          {!embeddedDocsPanel && (
+                            <SkillDocumentToolbarControls data-side="left">
+                              <SkillDocumentThemeSwitch aria-label="Document editor page theme">
+                                {["dark", "light"].map((theme) => (
+                                  <SkillDocumentThemeButton
+                                    aria-pressed={skillEditorTheme === theme}
+                                    data-active={skillEditorTheme === theme ? "true" : "false"}
+                                    key={theme}
+                                    onClick={() => setSkillEditorTheme(theme)}
+                                    type="button"
+                                  >
+                                    {theme === "dark" ? "Dark" : "Light"}
+                                  </SkillDocumentThemeButton>
+                                ))}
+                              </SkillDocumentThemeSwitch>
+                              <SkillDocumentZoomControls aria-label="Document zoom">
+                                <SkillDocumentZoomButton
+                                  aria-label="Zoom document out"
+                                  disabled={skillDocumentScale <= SKILL_DOCUMENT_MIN_SCALE + 0.001}
+                                  onClick={zoomOutSkillDocument}
+                                  title="Zoom out"
                                   type="button"
                                 >
-                                  {theme === "dark" ? "Dark" : "Light"}
-                                </SkillDocumentThemeButton>
-                              ))}
-                            </SkillDocumentThemeSwitch>
-                            <SkillDocumentZoomControls aria-label="Document zoom">
-                              <SkillDocumentZoomButton
-                                aria-label="Zoom document out"
-                                disabled={skillDocumentScale <= SKILL_DOCUMENT_MIN_SCALE + 0.001}
-                                onClick={zoomOutSkillDocument}
-                                title="Zoom out"
-                                type="button"
-                              >
-                                <span className="codicon codicon-zoom-out" aria-hidden="true" />
-                              </SkillDocumentZoomButton>
-                              <SkillDocumentZoomValue
-                                onClick={resetSkillDocumentZoom}
-                                title="Reset zoom"
-                                type="button"
-                              >
-                                {skillDocumentZoomLabel}
-                              </SkillDocumentZoomValue>
-                              <SkillDocumentZoomButton
-                                aria-label="Zoom document in"
-                                disabled={skillDocumentScale >= SKILL_DOCUMENT_MAX_SCALE - 0.001}
-                                onClick={zoomInSkillDocument}
-                                title="Zoom in"
-                                type="button"
-                              >
-                                <span className="codicon codicon-zoom-in" aria-hidden="true" />
-                              </SkillDocumentZoomButton>
-                            </SkillDocumentZoomControls>
-                          </SkillDocumentToolbarControls>
-                          <SkillDocumentToolbarControls data-side="right">
-                            <SkillDocumentActions data-placement="toolbar">
+                                  <span className="codicon codicon-zoom-out" aria-hidden="true" />
+                                </SkillDocumentZoomButton>
+                                <SkillDocumentZoomValue
+                                  onClick={resetSkillDocumentZoom}
+                                  title="Reset zoom"
+                                  type="button"
+                                >
+                                  {skillDocumentZoomLabel}
+                                </SkillDocumentZoomValue>
+                                <SkillDocumentZoomButton
+                                  aria-label="Zoom document in"
+                                  disabled={skillDocumentScale >= SKILL_DOCUMENT_MAX_SCALE - 0.001}
+                                  onClick={zoomInSkillDocument}
+                                  title="Zoom in"
+                                  type="button"
+                                >
+                                  <span className="codicon codicon-zoom-in" aria-hidden="true" />
+                                </SkillDocumentZoomButton>
+                              </SkillDocumentZoomControls>
+                            </SkillDocumentToolbarControls>
+                          )}
+                          <SkillDocumentToolbarControls
+                            data-embedded-actions={embeddedDocsPanel ? "true" : undefined}
+                            data-side="right"
+                          >
+                            <SkillDocumentActions
+                              data-embedded-docs-panel={embeddedDocsPanel ? "true" : undefined}
+                              data-placement="toolbar"
+                            >
+                              {!embeddedDocsPanel && (
+                                <>
+                                  <ToolsGhostButton
+                                    onClick={() => {
+                                      if (activeDocsBreakout?.label) {
+                                        void focusToolsWindow(activeDocsBreakout.label);
+                                      } else {
+                                        void openDocumentBreakout();
+                                      }
+                                    }}
+                                    title={activeDocsBreakout ? "Focus the document window" : "Open this document in its own window"}
+                                    type="button"
+                                  >
+	                                  <span className="codicon codicon-multiple-windows" aria-hidden="true" />
+	                                  <span>{activeDocsBreakout ? "Focus window" : "Window"}</span>
+	                                </ToolsGhostButton>
+                                  {documentIsHtml(skillEditor) && (
+                                    <ToolsGhostButton
+                                      onClick={() => void openSkillEditorHtmlInBrowser()}
+                                      title="Open HTML in the default browser"
+                                      type="button"
+                                    >
+                                      <ButtonBrowserIcon aria-hidden="true" />
+                                      <span>Browser</span>
+                                    </ToolsGhostButton>
+                                  )}
+	                                <ToolsGhostButton
+	                                  onClick={() => {
+	                                    setSkillEditor(null);
+                                      setSelectedSkillKey("");
+                                    }}
+                                    type="button"
+                                  >
+                                    Close
+                                  </ToolsGhostButton>
+                                  {skillEditorHasDraftChanges && (
+                                    <ToolsGhostButton
+                                      disabled={skillEditorBusy}
+                                      onClick={discardSkillEditorDraft}
+                                      title={savedDocumentForEditor ? "Discard draft changes and return to the saved document" : "Clear this unsaved draft"}
+                                      type="button"
+                                    >
+                                      {savedDocumentForEditor ? "Discard changes" : "Clear draft"}
+                                    </ToolsGhostButton>
+                                  )}
+                                </>
+                              )}
+                              {(embeddedDocsPanel || skillEditor.id) && (
                               <ToolsGhostButton
-                                onClick={() => {
-                                  if (activeDocsBreakout?.label) {
-                                    void focusToolsWindow(activeDocsBreakout.label);
-                                  } else {
-                                    void openDocumentBreakout();
-                                  }
-                                }}
-                                title={activeDocsBreakout ? "Focus the document window" : "Open this document in its own window"}
+                                data-danger="true"
+                                disabled={skillEditorReadOnly || !skillEditor.id}
+                                onClick={() => removeDocument(skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id)}
                                 type="button"
                               >
-	                                <span className="codicon codicon-multiple-windows" aria-hidden="true" />
-	                                <span>{activeDocsBreakout ? "Focus window" : "Window"}</span>
-	                              </ToolsGhostButton>
-                              {documentIsHtml(skillEditor) && (
-                                <ToolsGhostButton
-                                  onClick={() => void openSkillEditorHtmlInBrowser()}
-                                  title="Open HTML in the default browser"
-                                  type="button"
-                                >
-                                  <ButtonBrowserIcon aria-hidden="true" />
-                                  <span>Browser</span>
-                                </ToolsGhostButton>
-                              )}
-	                              <ToolsGhostButton
-	                                onClick={() => {
-	                                  setSkillEditor(null);
-                                  setSelectedSkillKey("");
-                                }}
-                                type="button"
-                              >
-                                Close
+                                Delete
                               </ToolsGhostButton>
-                              {skillEditorHasDraftChanges && (
-                                <ToolsGhostButton
-                                  disabled={skillEditorBusy}
-                                  onClick={discardSkillEditorDraft}
-                                  title={savedDocumentForEditor ? "Discard draft changes and return to the saved document" : "Clear this unsaved draft"}
-                                  type="button"
-                                >
-                                  {savedDocumentForEditor ? "Discard changes" : "Clear draft"}
-                                </ToolsGhostButton>
-                              )}
-                              {skillEditor.id && (
-                                <ToolsGhostButton
-                                  data-danger="true"
-                                  disabled={skillEditorReadOnly}
-                                  onClick={() => removeDocument(skillEditor.documentKey || accountDocumentStorageKey(skillEditor) || skillEditor.id)}
-                                  type="button"
-                                >
-                                  Delete
-                                </ToolsGhostButton>
                               )}
                               <ToolsGhostButton
                                 disabled={!text(skillEditor.title) || skillEditorReadOnly}
@@ -5905,8 +6032,9 @@ export default function ToolsWorkspaceView({
                   )}
                     </DocsCenterPane>
                   </ResizePanel>
+                  )}
 
-                  {showDocsTemplatesPane && (
+                  {embeddedDocsShowTemplates && (
                     <>
                       <ResizeHandle data-direction="horizontal" data-surface="files" />
                       <ResizePanel
@@ -6871,6 +6999,10 @@ const ToolsHubShell = styled.section`
     --tools-doc-desk: linear-gradient(180deg, #eef2f7, #dbe3ed);
     --tools-doc-page: #fffdf8;
     --tools-doc-page-border: rgba(29, 29, 31, 0.14);
+  }
+
+  &[data-embedded-docs-panel="true"] {
+    grid-template-rows: minmax(0, 1fr);
   }
 `;
 
@@ -7857,6 +7989,16 @@ const SkillDocumentToolbar = styled.div`
     padding-left: 132px;
   }
 
+  &[data-embedded-docs-panel="true"] {
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 48px;
+    padding: 8px 10px;
+  }
+
+  [data-docs-embedded-panel="true"] & {
+    padding-left: 10px;
+  }
+
   @media (max-width: 760px) {
     [data-docs-explorer-collapsed="true"] & {
       padding-left: 10px;
@@ -7891,6 +8033,11 @@ const SkillDocumentToolbarControls = styled.div`
     justify-self: stretch;
     width: 100%;
     overflow: hidden;
+  }
+
+  &[data-embedded-actions="true"] {
+    flex: 1 1 100%;
+    justify-content: stretch;
   }
 `;
 
@@ -8618,6 +8765,20 @@ const SkillDocumentActions = styled.div`
     min-width: max-content;
     padding: 0 12px;
     white-space: nowrap;
+  }
+
+  &[data-embedded-docs-panel="true"] {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    width: 100%;
+    gap: 8px;
+  }
+
+  &[data-embedded-docs-panel="true"] button {
+    width: 100%;
+    min-width: 0;
+    justify-content: center;
+    padding: 0 8px;
   }
 `;
 

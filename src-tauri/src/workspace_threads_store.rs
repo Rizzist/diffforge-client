@@ -102,6 +102,7 @@ struct WorkspaceAgentSessionHistoryItem {
     cwd: String,
     status: String,
     title: String,
+    first_user_message: String,
     source: String,
     created_at_ms: u64,
     latest_at_ms: u64,
@@ -466,6 +467,113 @@ fn workspace_agent_session_history_upsert_blocking(
     Ok(true)
 }
 
+const WORKSPACE_AGENT_SESSION_HISTORY_PREVIEW_CHARS: usize = 96;
+const WORKSPACE_AGENT_SESSION_HISTORY_TRANSCRIPT_LIMIT: usize = 160;
+
+fn workspace_agent_session_history_first_user_preview(
+    item: &WorkspaceAgentSessionHistoryItem,
+) -> String {
+    let Some(agent_id) = workspace_threads_clean_agent_id(&item.agent_id)
+        .or_else(|| workspace_threads_clean_agent_id(&item.provider))
+    else {
+        return String::new();
+    };
+    let Some(provider_session_id) = workspace_threads_clean_provider_session_id(
+        if item.provider_session_id.trim().is_empty() {
+            &item.native_session_id
+        } else {
+            &item.provider_session_id
+        },
+    ) else {
+        return String::new();
+    };
+    let cwd = if item.cwd.trim().is_empty() {
+        item.workspace_root.trim()
+    } else {
+        item.cwd.trim()
+    };
+    if cwd.is_empty() {
+        return String::new();
+    }
+
+    read_agent_thread_transcript(
+        &agent_id,
+        &provider_session_id,
+        cwd,
+        Some(item.workspace_id.as_str()),
+        WORKSPACE_AGENT_SESSION_HISTORY_TRANSCRIPT_LIMIT,
+    )
+    .ok()
+    .and_then(|transcript| {
+        transcript
+            .messages
+            .into_iter()
+            .find(|message| message.role.eq_ignore_ascii_case("user") && !message.text.trim().is_empty())
+    })
+    .map(|message| {
+        clean_codex_title(
+            message
+                .text
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+            "",
+        )
+    })
+    .map(|preview| {
+        if preview.chars().count() > WORKSPACE_AGENT_SESSION_HISTORY_PREVIEW_CHARS {
+            format!(
+                "{}...",
+                truncate_chars(&preview, WORKSPACE_AGENT_SESSION_HISTORY_PREVIEW_CHARS - 3).trim()
+            )
+        } else {
+            preview
+        }
+    })
+    .unwrap_or_default()
+}
+
+fn workspace_agent_session_history_preview_cache_key(
+    item: &WorkspaceAgentSessionHistoryItem,
+) -> Option<String> {
+    let agent_id = workspace_threads_clean_agent_id(&item.agent_id)
+        .or_else(|| workspace_threads_clean_agent_id(&item.provider))?;
+    let provider_session_id = workspace_threads_clean_provider_session_id(
+        if item.provider_session_id.trim().is_empty() {
+            &item.native_session_id
+        } else {
+            &item.provider_session_id
+        },
+    )?;
+    let cwd = if item.cwd.trim().is_empty() {
+        item.workspace_root.trim()
+    } else {
+        item.cwd.trim()
+    };
+    if cwd.is_empty() {
+        return None;
+    }
+    Some(format!("{agent_id}\n{provider_session_id}\n{cwd}"))
+}
+
+fn workspace_agent_session_history_enrich_previews(
+    items: &mut [WorkspaceAgentSessionHistoryItem],
+) {
+    let mut previews = HashMap::<String, String>::new();
+    for item in items.iter_mut() {
+        let Some(key) = workspace_agent_session_history_preview_cache_key(item) else {
+            continue;
+        };
+        if let Some(preview) = previews.get(&key) {
+            item.first_user_message = preview.clone();
+            continue;
+        }
+        let preview = workspace_agent_session_history_first_user_preview(item);
+        item.first_user_message = preview.clone();
+        previews.insert(key, preview);
+    }
+}
+
 fn workspace_agent_session_history_list_blocking(
     request: WorkspaceAgentSessionHistoryListRequest,
 ) -> Result<WorkspaceAgentSessionHistoryListResult, String> {
@@ -541,6 +649,7 @@ fn workspace_agent_session_history_list_blocking(
                 cwd: row.get(16)?,
                 status: row.get(17)?,
                 title: row.get(18)?,
+                first_user_message: String::new(),
                 source: row.get(19)?,
                 created_at_ms,
                 latest_at_ms,
@@ -551,6 +660,7 @@ fn workspace_agent_session_history_list_blocking(
     for row in rows {
         items.push(row.map_err(|error| format!("Unable to read workspace session history row: {error}"))?);
     }
+    workspace_agent_session_history_enrich_previews(&mut items);
     Ok(WorkspaceAgentSessionHistoryListResult {
         generated_at_ms: workspace_threads_now_millis_u64(),
         workspace_id,

@@ -31,6 +31,8 @@ import styled, { keyframes } from "styled-components";
 
 import {
   ButtonAddIcon,
+  ButtonCloseIcon,
+  ButtonDragIcon,
   ButtonForgeIcon,
   ButtonFolderIcon,
   ButtonFullscreenExitIcon,
@@ -52,6 +54,12 @@ import {
   SetupField,
   SetupHeader,
   SetupInput,
+  TerminalAgentLabel,
+  TerminalCloseButton,
+  TerminalRailControls,
+  TerminalRailIdentity,
+  TerminalRestartButton,
+  TerminalRestartPill,
   TitleMinimizeIcon,
   TitleRestoreIcon,
   WorkspaceRootActions,
@@ -95,6 +103,7 @@ import {
 } from "../threads/workspaceThreads";
 import GitWorkspaceView from "../git/GitWorkspaceView.jsx";
 import PlansWorkspaceView from "../plans/PlansWorkspaceView.jsx";
+import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
 import WorkspaceToolsDragPanel from "../tools/WorkspaceToolsDragPanel.jsx";
 import {
   TOOLS_WINDOW_AGENT_COMPANION_CLOSE,
@@ -2584,55 +2593,39 @@ const TerminalBreakoutDocumentWindow = styled(TerminalSurfaceSlot)`
   background: transparent;
 `;
 
-const TerminalBreakoutDocumentFrame = styled.div`
+const TerminalDocumentPanelShell = styled.div`
   display: flex;
   width: 100%;
   height: 100%;
   min-width: 0;
   min-height: 0;
   flex-direction: column;
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 8px;
-  color: rgba(241, 245, 249, 0.94);
-  background:
-    linear-gradient(180deg, rgba(15, 23, 42, 0.92), rgba(2, 6, 12, 0.96)),
-    rgba(0, 0, 0, 0.94);
-  box-shadow:
-    0 22px 48px rgba(0, 0, 0, 0.36),
-    inset 0 1px 0 rgba(255, 255, 255, 0.055);
   overflow: hidden;
-  backdrop-filter: blur(18px) saturate(135%);
+  background: #020304;
 
   html[data-forge-theme="light"] & {
-    border-color: rgba(15, 23, 42, 0.12);
-    color: #1f2937;
-    background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.96), rgba(248, 250, 252, 0.92)),
-      rgba(255, 255, 255, 0.94);
-    box-shadow:
-      0 22px 44px rgba(15, 23, 42, 0.14),
-      inset 0 1px 0 rgba(255, 255, 255, 0.78);
+    background: #ffffff;
   }
 `;
 
-const TerminalBreakoutDocumentBody = styled(TerminalBreakoutArchitectureBody)`
-  flex: 1 1 auto;
-  gap: 8px;
-  min-height: 0;
-  max-height: none;
+const TerminalDocumentPanelHeader = styled(TerminalRestartPill)`
+  flex-wrap: nowrap;
 `;
 
-const TerminalBreakoutDocumentContent = styled.pre`
+const TerminalDocumentPanelIdentity = styled(TerminalRailIdentity)`
   min-width: 0;
-  margin: 0;
-  color: rgba(226, 232, 240, 0.9);
-  font: 650 11px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-  overflow-wrap: anywhere;
-  white-space: pre-wrap;
+`;
 
-  html[data-forge-theme="light"] & {
-    color: #263244;
-  }
+const TerminalDocumentPanelTitle = styled(TerminalAgentLabel)`
+  max-width: min(18rem, 42cqi);
+  font-size: 12px;
+`;
+
+const TerminalDocumentPanelBody = styled.div`
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
 `;
 
 const TerminalBreakoutTopBar = styled.div`
@@ -9515,10 +9508,24 @@ function normalizeWorkspaceDocumentPanelEntry(entry) {
     .slice(0, 160) || "Document";
   const typeLabel = normalizeTodoQueueText(source.typeLabel || source.kind || "Document")
     .slice(0, 80) || "Document";
+  const key = normalizeTodoQueueText(
+    source.key
+      || source.documentKey
+      || source.document_key
+      || source.storageKey
+      || source.storage_key
+      || source.savedStorageKey
+      || source.saved_storage_key
+      || source.id
+      || source.pathKey
+      || source.path_key
+      || title,
+  ).slice(0, 600);
   return {
     body: normalizeTodoQueueMultilineText(source.body || source.content || "", 50000),
     id: normalizeTodoQueueText(source.id || source.key || title).slice(0, 220),
     kind: normalizeTodoQueueText(source.kind || "document").slice(0, 80),
+    key,
     localPath: normalizeTodoQueueText(source.localPath || source.local_path || "").slice(0, 600),
     pathKey: normalizeTodoQueueText(source.pathKey || source.path_key || "").slice(0, 600),
     title,
@@ -14509,9 +14516,17 @@ function buildTodoQueueTodoSyncCommitPayload(syncPayload, {
       ...baseMeta,
       created_at: item.createdAt || item.created_at || nowIso,
       createdAt: item.createdAt || item.created_at || nowIso,
+      id: todoId,
       kind: item.kind || "todo",
       reason: item.reason || item.todoStatusReason || item.statusReason || syncPayload.reason || "todo_queue_sync",
+      status,
+      text,
+      body: text,
       title: String(item.title || text).slice(0, 120),
+      todo_id: todoId,
+      todoId,
+      todo_text: text,
+      todoText: text,
       updated_at: item.updatedAt || item.updated_at || nowIso,
       updatedAt: item.updatedAt || item.updated_at || nowIso,
       ...(queuedAt ? { queued_at: queuedAt, queuedAt } : {}),
@@ -14573,16 +14588,26 @@ function buildTodoQueueTodoSyncCommitPayload(syncPayload, {
       meta.todo_input_count = inputCount;
     }
     if (["deleted", "removed", "archived"].includes(status)) {
-      ops.push(["d", todoId, meta]);
+      ops.push(["d", 0, todoId, safeDeviceId, safeWorkspaceId, "deleted", {
+        ...meta,
+        status: "deleted",
+      }]);
       return;
     }
-    ops.push(["u", todoId, status, text, meta]);
+    ops.push(["u", 0, todoId, safeDeviceId, safeWorkspaceId, status, "", meta]);
   });
 
   (Array.isArray(syncPayload.removedTodoIds) ? syncPayload.removedTodoIds : []).forEach((todoId) => {
     const safeTodoId = String(todoId || "").trim();
     if (safeTodoId) {
-      ops.push(["d", safeTodoId, { ...baseMeta, reason: syncPayload.reason || "todo_removed" }]);
+      ops.push(["d", 0, safeTodoId, safeDeviceId, safeWorkspaceId, "deleted", {
+        ...baseMeta,
+        id: safeTodoId,
+        reason: syncPayload.reason || "todo_removed",
+        status: "deleted",
+        todo_id: safeTodoId,
+        todoId: safeTodoId,
+      }]);
     }
   });
 
@@ -14593,6 +14618,7 @@ function buildTodoQueueTodoSyncCommitPayload(syncPayload, {
   return {
     c: "todo.sync",
     cid: `rust-terminal-todos-${safeWorkspaceId}-${Date.now()}`,
+    contract: "diffforge.todo.live_state.v1",
     device_id: safeDeviceId,
     deviceId: safeDeviceId,
     did: safeDeviceId,
@@ -14600,7 +14626,7 @@ function buildTodoQueueTodoSyncCommitPayload(syncPayload, {
     ops,
     repo_path: repoPath || "",
     source,
-    v: 2,
+    v: 1,
     workspace_id: safeWorkspaceId,
     workspaceId: safeWorkspaceId,
     workspace_name: workspaceName || "",
@@ -20963,6 +20989,7 @@ function TerminalView({
   onRestoreWorkspaceToolPane = null,
   onToggleFullscreenWorkspaceToolPane = null,
   onWorkspaceToolRuntimeBridgeChange = null,
+  onCloseWorkspaceDocumentPanel = null,
   handlePreparedTerminalChange,
   isAppClosing = false,
   isWorkspaceRuntimeVisible = true,
@@ -20996,6 +21023,7 @@ function TerminalView({
   workspaceSyncState,
   workspaceThreadRestoreReady = true,
   workspaceTerminalAgentLaunchReady,
+  workspaceTerminalFocusRequest = null,
   workspaceDocumentPanelEnabled = false,
   workspaceTerminalRenderAgent,
   workspaceScopedToolTabsEnabled = true,
@@ -21062,6 +21090,8 @@ function TerminalView({
     TERMINAL_BREAKOUT_ARCHITECTURE_WINDOW_DEFAULT_LAYOUT,
   );
   const [terminalBreakoutDocumentPanel, setTerminalBreakoutDocumentPanel] = useState(null);
+  const [terminalDocumentPanelMaximized, setTerminalDocumentPanelMaximized] = useState(false);
+  const [terminalDocumentPanelWindowRequest, setTerminalDocumentPanelWindowRequest] = useState(null);
   const [terminalBreakoutDocumentWindowDragging, setTerminalBreakoutDocumentWindowDragging] = useState(false);
   const [terminalBreakoutDocumentWindowLayout, setTerminalBreakoutDocumentWindowLayout] = useState(
     TERMINAL_BREAKOUT_DOCUMENT_WINDOW_DEFAULT_LAYOUT,
@@ -23318,7 +23348,11 @@ function TerminalView({
       const coordination = liveTerminal?.coordination || {};
       const activeTask = liveTerminal?.activeTask || liveTerminal?.active_task || {};
       const sessionId = String(
-        liveTerminal?.sessionId
+        liveTerminal?.providerSessionId
+          || liveTerminal?.provider_session_id
+          || liveTerminal?.nativeSessionId
+          || liveTerminal?.native_session_id
+          || liveTerminal?.sessionId
           || liveTerminal?.session_id
           || coordination.sessionId
           || coordination.session_id
@@ -26040,6 +26074,7 @@ function TerminalView({
       return;
     }
     setTerminalBreakoutDocumentPanel(normalizeWorkspaceDocumentPanelEntry(entry));
+    setTerminalDocumentPanelMaximized(false);
     const documentPlacement = buildTerminalBreakoutDocumentPlacement({
       existingPlacement: terminalBreakoutDocumentWindowLayoutRef.current,
       terminalPlacements: terminalBreakoutPlacementsRef.current,
@@ -26054,22 +26089,19 @@ function TerminalView({
     };
     setTerminalBreakoutDocumentWindowLayout(nextPlacement);
     terminalBreakoutDocumentWindowLayoutRef.current = nextPlacement;
-    if (terminalBreakoutPhaseRef.current === TERMINAL_BREAKOUT_PHASE_GRID) {
-      openTerminalBreakout();
-      return;
+    if (terminalBreakoutPhaseRef.current !== TERMINAL_BREAKOUT_PHASE_GRID) {
+      setTerminalBreakoutViewportState(getBreakoutFitViewport(
+        terminalPanelRectRef.current,
+        breakoutPlacementsWithDocumentPanel(
+          terminalBreakoutPlacementsRef.current,
+          nextPlacement,
+          true,
+        ),
+        null,
+        terminalBreakoutTerminalScaleRef.current,
+      ));
     }
-    setTerminalBreakoutViewportState(getBreakoutFitViewport(
-      terminalPanelRectRef.current,
-      breakoutPlacementsWithDocumentPanel(
-        terminalBreakoutPlacementsRef.current,
-        nextPlacement,
-        true,
-      ),
-      null,
-      terminalBreakoutTerminalScaleRef.current,
-    ));
   }, [
-    openTerminalBreakout,
     setTerminalBreakoutViewportState,
     workspaceDocumentPanelAvailable,
   ]);
@@ -26077,8 +26109,50 @@ function TerminalView({
   useEffect(() => {
     if (!workspaceDocumentPanelAvailable) {
       setTerminalBreakoutDocumentPanel(null);
+      setTerminalDocumentPanelMaximized(false);
     }
   }, [workspaceDocumentPanelAvailable]);
+
+  const handleDocumentPanelSelectionChange = useCallback((entry) => {
+    if (!entry) {
+      return;
+    }
+    setTerminalBreakoutDocumentPanel(normalizeWorkspaceDocumentPanelEntry(entry));
+  }, []);
+
+  const closeWorkspaceDocumentPanel = useCallback((event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    setTerminalBreakoutDocumentPanel(null);
+    setTerminalDocumentPanelMaximized(false);
+    if (terminalWorkspace?.id && typeof onCloseWorkspaceDocumentPanel === "function") {
+      onCloseWorkspaceDocumentPanel(terminalWorkspace.id);
+    }
+  }, [onCloseWorkspaceDocumentPanel, terminalWorkspace?.id]);
+
+  const toggleWorkspaceDocumentPanelMaximized = useCallback((event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    setTerminalDocumentPanelMaximized((maximized) => !maximized);
+  }, []);
+
+  const openWorkspaceDocumentPanelWindow = useCallback((event) => {
+    event?.preventDefault?.();
+    event?.stopPropagation?.();
+    const documentKey = normalizeTodoQueueText(
+      terminalBreakoutDocumentPanel?.key
+        || terminalBreakoutDocumentPanel?.documentKey
+        || terminalBreakoutDocumentPanel?.id
+        || terminalBreakoutDocumentPanel?.pathKey,
+    );
+    if (!documentKey) {
+      return;
+    }
+    setTerminalDocumentPanelWindowRequest({
+      key: documentKey,
+      requestId: `${documentKey}:${Date.now()}`,
+    });
+  }, [terminalBreakoutDocumentPanel]);
 
   useEffect(() => {
     const wasAvailable = workspaceDocumentPanelAvailableRef.current;
@@ -33039,6 +33113,68 @@ function TerminalView({
     handleActivateTerminalPane({ paneId: getTerminalPaneId(terminalIndex) });
   }, [activateTerminalTabInRows, activeDisplayRows, getTerminalPaneId, handleActivateTerminalPane]);
 
+  const workspaceTerminalFocusRequestSeenRef = useRef("");
+  useEffect(() => {
+    const request = workspaceTerminalFocusRequest;
+    const requestId = String(request?.id || "").trim();
+    if (!request || !requestId || workspaceTerminalFocusRequestSeenRef.current === requestId) {
+      return;
+    }
+    const workspaceId = String(request.workspaceId || request.workspace_id || "").trim();
+    if (workspaceId && workspaceId !== terminalWorkspace?.id) {
+      return;
+    }
+    const requestedPaneId = String(request.paneId || request.pane_id || "").trim();
+    const requestedSessionId = String(
+      request.providerSessionId
+        || request.provider_session_id
+        || request.nativeSessionId
+        || request.native_session_id
+        || request.sessionId
+        || request.session_id
+        || "",
+    ).trim();
+    let terminalIndex = Number.parseInt(request.terminalIndex ?? request.terminal_index, 10);
+    if (!Number.isInteger(terminalIndex) && requestedPaneId) {
+      terminalIndex = logicalTerminalIndexes.find((index) => getTerminalPaneId(index) === requestedPaneId);
+    }
+    if (!Number.isInteger(terminalIndex) && requestedSessionId) {
+      terminalIndex = findTerminalIndexForSessionOrTask({ sessionId: requestedSessionId });
+    }
+    if (!Number.isInteger(terminalIndex) || !logicalTerminalIndexes.includes(terminalIndex)) {
+      return;
+    }
+    const paneId = requestedPaneId || getTerminalPaneId(terminalIndex);
+    if (!paneId) {
+      return;
+    }
+    workspaceTerminalFocusRequestSeenRef.current = requestId;
+    selectTerminalTab(terminalIndex);
+    window.requestAnimationFrame(() => {
+      window.dispatchEvent(new CustomEvent(TERMINAL_FOCUS_REQUEST_EVENT, {
+        detail: {
+          paneId,
+          reason: request.reason || "session_history_terminal_focus",
+          terminalIndex,
+        },
+      }));
+      if (request.highlight !== false) {
+        triggerTerminalHighlightFlash(paneId, {
+          durationMs: request.durationMs || request.duration_ms,
+        });
+      }
+    });
+  }, [
+    findTerminalIndexForSessionOrTask,
+    getTerminalPaneId,
+    logicalTerminalIndexSignature,
+    logicalTerminalIndexes,
+    selectTerminalTab,
+    terminalWorkspace?.id,
+    triggerTerminalHighlightFlash,
+    workspaceTerminalFocusRequest,
+  ]);
+
   useEffect(() => {
     const handleAppControlTerminalFocus = (event) => {
       const detail = event?.detail || {};
@@ -33063,6 +33199,11 @@ function TerminalView({
           terminalIndex,
         },
       }));
+      if (detail.highlight === true || detail.flash === true) {
+        triggerTerminalHighlightFlash(paneId, {
+          durationMs: detail.durationMs || detail.duration_ms,
+        });
+      }
     };
 
     window.addEventListener(APP_CONTROL_TERMINAL_FOCUS_EVENT, handleAppControlTerminalFocus);
@@ -33075,6 +33216,7 @@ function TerminalView({
     logicalTerminalIndexes,
     selectTerminalTab,
     terminalWorkspace?.id,
+    triggerTerminalHighlightFlash,
   ]);
 
   // Tabs select on click and start the grid drag (with live preview) once the
@@ -33928,6 +34070,18 @@ function TerminalView({
     const placement = normalizeBreakoutPlacement(terminalBreakoutDocumentWindowLayout);
     const viewport = normalizeBreakoutViewport(terminalBreakoutViewport);
 
+    if (terminalDocumentPanelMaximized && terminalPanelRect) {
+      return {
+        "--terminal-slot-height": `${Math.max(0, terminalPanelRect.height || 0)}px`,
+        "--terminal-slot-inverse-scale": "1",
+        "--terminal-slot-scale": "1",
+        "--terminal-slot-width": `${Math.max(0, terminalPanelRect.width || 0)}px`,
+        "--terminal-slot-x": "0px",
+        "--terminal-slot-y": "0px",
+        "--terminal-slot-z": 245,
+      };
+    }
+
     if (!terminalBreakoutLayoutActive) {
       const rect = terminalDocumentPanelRect;
       if (!rect) {
@@ -33980,6 +34134,8 @@ function TerminalView({
     terminalBreakoutLayoutActive,
     terminalBreakoutTerminalScale,
     terminalBreakoutViewport,
+    terminalDocumentPanelMaximized,
+    terminalPanelRect,
   ]);
 
   const todoDragOverDropTarget = Boolean(
@@ -34581,64 +34737,80 @@ function TerminalView({
           && workspaceDocumentPanelAvailable
           && (terminalBreakoutLayoutActive || terminalDocumentPanelRect) && (
           <TerminalBreakoutDocumentWindow
-            aria-label={`Document panel: ${terminalBreakoutDocumentPanel?.title || "Documents"}`}
+            aria-label="Documents"
             data-terminal-control="true"
             data-terminal-document-panel="true"
+            data-terminal-document-panel-maximized={terminalDocumentPanelMaximized ? "true" : undefined}
             onPointerDown={(event) => event.stopPropagation()}
             style={getDocumentPanelSlotStyle()}
           >
-            <TerminalBreakoutDocumentFrame>
-              <TerminalBreakoutArchitectureHeader
-                data-dragging={terminalBreakoutDocumentWindowDragging ? "true" : "false"}
-                onPointerDown={beginTerminalBreakoutDocumentWindowDrag}
-              >
-                <TerminalBreakoutArchitectureTitleStack>
-                  <TerminalBreakoutArchitectureKicker>
-                    Document Panel
-                  </TerminalBreakoutArchitectureKicker>
-                  <TerminalBreakoutArchitectureTitle title={terminalBreakoutDocumentPanel?.title || "Documents"}>
-                    {terminalBreakoutDocumentPanel?.title || "Documents"}
-                  </TerminalBreakoutArchitectureTitle>
-                </TerminalBreakoutArchitectureTitleStack>
-                <TerminalBreakoutArchitectureHeaderActions>
-                  <TerminalBreakoutArchitectureStatus data-status="ready">
-                    {terminalBreakoutDocumentPanel?.typeLabel || "Ready"}
-                  </TerminalBreakoutArchitectureStatus>
-                  {terminalBreakoutDocumentPanel && (
-                    <TerminalBreakoutArchitectureCloseButton
-                      aria-label="Clear document panel"
-                      onClick={(event) => {
-                        event.preventDefault();
-                        event.stopPropagation();
-                        setTerminalBreakoutDocumentPanel(null);
-                      }}
-                      onPointerDown={(event) => event.stopPropagation()}
-                      title="Clear document panel"
-                      type="button"
-                    >
-                      <Close aria-hidden="true" />
-                    </TerminalBreakoutArchitectureCloseButton>
-                  )}
-                </TerminalBreakoutArchitectureHeaderActions>
-              </TerminalBreakoutArchitectureHeader>
-              <TerminalBreakoutDocumentBody>
-                <TerminalBreakoutArchitectureSummary>
-                  <TerminalBreakoutArchitectureHeadline title={terminalBreakoutDocumentPanel?.title || "Documents"}>
-                    {terminalBreakoutDocumentPanel?.title || "Documents"}
-                  </TerminalBreakoutArchitectureHeadline>
-                  {(terminalBreakoutDocumentPanel?.localPath || terminalBreakoutDocumentPanel?.pathKey) && (
-                    <TerminalBreakoutArchitectureSubline
-                      title={terminalBreakoutDocumentPanel.localPath || terminalBreakoutDocumentPanel.pathKey}
-                    >
-                      {terminalBreakoutDocumentPanel.localPath || terminalBreakoutDocumentPanel.pathKey}
-                    </TerminalBreakoutArchitectureSubline>
-                  )}
-                </TerminalBreakoutArchitectureSummary>
-                <TerminalBreakoutDocumentContent>
-                  {terminalBreakoutDocumentPanel?.body || "No document selected."}
-                </TerminalBreakoutDocumentContent>
-              </TerminalBreakoutDocumentBody>
-            </TerminalBreakoutDocumentFrame>
+            <TerminalDocumentPanelShell>
+              <TerminalDocumentPanelHeader data-terminal-control="true">
+                <TerminalDocumentPanelIdentity>
+                  <TerminalRestartButton
+                    aria-label="Drag Docs panel"
+                    data-terminal-drag-handle="true"
+                    disabled={!terminalBreakoutLayoutActive}
+                    onPointerDown={beginTerminalBreakoutDocumentWindowDrag}
+                    title={terminalBreakoutLayoutActive ? "Drag Docs panel" : "Open terminal breakout to drag the Docs panel"}
+                    type="button"
+                  >
+                    <ButtonDragIcon aria-hidden="true" />
+                  </TerminalRestartButton>
+                  <TerminalDocumentPanelTitle title="Docs">
+                    Docs
+                  </TerminalDocumentPanelTitle>
+                </TerminalDocumentPanelIdentity>
+                <TerminalRailControls data-rail-row="secondary">
+                  <TerminalRestartButton
+                    aria-label="Open selected document in its own window"
+                    disabled={!terminalBreakoutDocumentPanel?.key && !terminalBreakoutDocumentPanel?.id}
+                    onClick={openWorkspaceDocumentPanelWindow}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    title={terminalBreakoutDocumentPanel?.key || terminalBreakoutDocumentPanel?.id
+                      ? "Open selected document in its own window"
+                      : "Select a document first"}
+                    type="button"
+                  >
+                    <OpenInNew aria-hidden="true" />
+                  </TerminalRestartButton>
+                  <TerminalRestartButton
+                    aria-label={terminalDocumentPanelMaximized ? "Restore Docs panel" : "Maximize Docs panel"}
+                    onClick={toggleWorkspaceDocumentPanelMaximized}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    title={terminalDocumentPanelMaximized ? "Restore Docs panel" : "Maximize Docs panel"}
+                    type="button"
+                  >
+                    {terminalDocumentPanelMaximized ? (
+                      <ButtonFullscreenExitIcon aria-hidden="true" />
+                    ) : (
+                      <ButtonFullscreenIcon aria-hidden="true" />
+                    )}
+                  </TerminalRestartButton>
+                  <TerminalCloseButton
+                    aria-label="Close Docs panel"
+                    onClick={closeWorkspaceDocumentPanel}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    title="Close Docs panel"
+                    type="button"
+                  >
+                    <ButtonCloseIcon aria-hidden="true" />
+                  </TerminalCloseButton>
+                </TerminalRailControls>
+              </TerminalDocumentPanelHeader>
+              <TerminalDocumentPanelBody>
+                <ToolsWorkspaceView
+                  defaultWorkingDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
+                  embeddedDocsOpenRequest={terminalBreakoutDocumentPanel}
+                  embeddedDocsPanel
+                  embeddedDocsWindowOpenRequest={terminalDocumentPanelWindowRequest}
+                  initialSection="docs"
+                  onEmbeddedDocsSelectionChange={handleDocumentPanelSelectionChange}
+                  rightToolsOrchestratorOpen
+                  workspaces={workspaces}
+                />
+              </TerminalDocumentPanelBody>
+            </TerminalDocumentPanelShell>
           </TerminalBreakoutDocumentWindow>
         )}
       </TerminalSurfaceLayer>

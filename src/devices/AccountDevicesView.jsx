@@ -1,4 +1,5 @@
 import { AccountTree } from "@styled-icons/material-rounded/AccountTree";
+import { Close as CloseIcon } from "@styled-icons/material-rounded/Close";
 import { DesktopWindows } from "@styled-icons/material-rounded/DesktopWindows";
 import { Devices } from "@styled-icons/material-rounded/Devices";
 import { Dns } from "@styled-icons/material-rounded/Dns";
@@ -8,8 +9,8 @@ import { RadioButtonChecked } from "@styled-icons/material-rounded/RadioButtonCh
 import { SettingsEthernet } from "@styled-icons/material-rounded/SettingsEthernet";
 import { Storage } from "@styled-icons/material-rounded/Storage";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
-import { useMemo } from "react";
-import styled from "styled-components";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
+import styled, { keyframes } from "styled-components";
 import {
   TODO_QUEUE_DEVICE_KIND_MOBILE,
   buildDevicesGraphModel,
@@ -33,12 +34,6 @@ function statusLabel(status, fallback = "Unknown") {
   if (tone === "offline") return "Offline";
   if (tone === "idle") return "Idle";
   return fallback;
-}
-
-function workspaceStatusLabel(status) {
-  const tone = statusTone(status);
-  if (tone === "live") return "Active";
-  return statusLabel(tone);
 }
 
 function plural(value, singular, pluralLabel = `${singular}s`) {
@@ -78,22 +73,121 @@ function deviceSubtitle(device) {
   ].filter(Boolean).join(" - ") || "Device";
 }
 
-function terminalSummaryLabel(workspace) {
-  const counts = workspace?.terminalStatusCounts || {};
-  const busy = Number(counts.busy) || 0;
-  const waiting = Number(counts.waiting) || 0;
-  const error = Number(counts.error) || 0;
-  if (error) return `${error} terminal${error === 1 ? "" : "s"} need attention`;
-  if (busy) return `${busy} terminal${busy === 1 ? "" : "s"} busy`;
-  if (waiting) return `${waiting} terminal${waiting === 1 ? "" : "s"} waiting`;
-  return plural(workspace?.terminalCount, "terminal");
+const DEVICE_GRAPH_BASE_WIDTH = 980;
+const DEVICE_GRAPH_BASE_HEIGHT = 620;
+const DEVICE_NODE_WIDTH = 264;
+const DEVICE_NODE_HEIGHT = 96;
+const DEVICE_NODE_SPACING = 340;
+const DEVICE_RING_INNER_RADIUS = 340;
+const DEVICE_RING_GAP = 330;
+const DEVICE_GRAPH_MARGIN = 72;
+
+function deviceGraphAngle(index, count, ringIndex) {
+  if (count === 1) return -90;
+  if (count === 2) return 180 + index * 180;
+  return -90 + (ringIndex % 2 ? 180 / count : 0) + (360 / count) * index;
 }
 
-function GraphDeviceCard({ device }) {
+function deviceRingCapacity(radius) {
+  return Math.max(1, Math.floor((2 * Math.PI * radius) / DEVICE_NODE_SPACING));
+}
+
+function buildDeviceGraphLayout(deviceCount) {
+  const total = Math.max(0, Number(deviceCount) || 0);
+  const rings = [];
+  let remaining = total;
+  let radius = DEVICE_RING_INNER_RADIUS;
+
+  while (remaining > 0) {
+    const capacity = deviceRingCapacity(radius);
+    const count = Math.min(remaining, capacity);
+    rings.push({ count, radius });
+    remaining -= count;
+    radius += DEVICE_RING_GAP;
+  }
+
+  const outerRadius = rings.length ? rings[rings.length - 1].radius : DEVICE_RING_INNER_RADIUS;
+  const width = Math.max(
+    DEVICE_GRAPH_BASE_WIDTH,
+    Math.ceil((outerRadius + DEVICE_NODE_WIDTH / 2 + DEVICE_GRAPH_MARGIN) * 2),
+  );
+  const height = Math.max(
+    DEVICE_GRAPH_BASE_HEIGHT,
+    Math.ceil((outerRadius + DEVICE_NODE_HEIGHT / 2 + DEVICE_GRAPH_MARGIN) * 2),
+  );
+  const centerX = width / 2;
+  const centerY = height / 2;
+  const nodes = [];
+
+  rings.forEach((ring, ringIndex) => {
+    for (let ringNodeIndex = 0; ringNodeIndex < ring.count; ringNodeIndex += 1) {
+      const angle = deviceGraphAngle(ringNodeIndex, ring.count, ringIndex);
+      const radians = (angle * Math.PI) / 180;
+      nodes.push({
+        angle,
+        ring: ringIndex,
+        x: centerX + Math.cos(radians) * ring.radius,
+        y: centerY + Math.sin(radians) * ring.radius,
+      });
+    }
+  });
+
+  return {
+    centerX,
+    centerY,
+    height,
+    nodes,
+    width,
+  };
+}
+
+function SyncPackets({ inboundPathId, outboundPathId, index, selected, status }) {
+  const tone = statusTone(status);
+  const duration = tone === "syncing" ? 2.65 : tone === "live" ? 3.45 : 5.8;
+  const delay = (index % 7) * 0.29;
+
+  return (
+    <>
+      <SyncPacketGroup
+        data-direction="outbound"
+        data-selected={selected ? "true" : "false"}
+        data-status={tone}
+      >
+        <SyncPacketHalo r="8.5" />
+        <SyncPacketCore r="2.8" />
+        <SyncPacketTray d="M -5 -4.2H5V4.2H-5ZM-4.6 -0.3h2.8l1.1 1.4H.7l1.1 -1.4h2.8" />
+        <animateMotion begin={`${delay}s`} dur={`${duration}s`} repeatCount="indefinite">
+          <mpath href={`#${outboundPathId}`} />
+        </animateMotion>
+      </SyncPacketGroup>
+      <SyncPacketGroup
+        data-direction="inbound"
+        data-selected={selected ? "true" : "false"}
+        data-status={tone}
+      >
+        <SyncPacketHalo r="7.5" />
+        <SyncPacketCore r="2.6" />
+        <SyncPacketTray d="M -5 -4.2H5V4.2H-5ZM-4.6 -0.3h2.8l1.1 1.4H.7l1.1 -1.4h2.8" />
+        <animateMotion begin={`${delay + duration / 2}s`} dur={`${duration + 0.65}s`} repeatCount="indefinite">
+          <mpath href={`#${inboundPathId}`} />
+        </animateMotion>
+      </SyncPacketGroup>
+    </>
+  );
+}
+
+function GraphDeviceCard({ device, onSelect, selected }) {
   const DeviceIcon = deviceIconFor(device);
   const deviceTone = statusTone(device.liveState);
   return (
-    <DeviceNode data-status={deviceTone}>
+    <DeviceNode
+      aria-label={`Show details for ${device.deviceName}`}
+      aria-pressed={selected ? "true" : "false"}
+      data-selected={selected ? "true" : "false"}
+      data-status={deviceTone}
+      onClick={onSelect}
+      type="button"
+    >
       <DeviceIconWrap data-kind={device.deviceKind}>
         <DeviceIcon aria-hidden="true" />
       </DeviceIconWrap>
@@ -116,37 +210,74 @@ function GraphDeviceCard({ device }) {
   );
 }
 
-function GraphWorkspaceCard({ workspace }) {
-  const tone = statusTone(workspace.status);
+function GraphDetailSheet({ accountName, detail, graph, onClose }) {
+  if (!detail) {
+    return null;
+  }
+
+  const isAccount = detail.type === "account";
+  const device = detail.device;
+  const Icon = isAccount ? AccountTree : deviceIconFor(device);
+  const status = isAccount ? graph.account.status : device.liveState;
+  const tone = statusTone(status);
+  const title = isAccount ? accountName : device.deviceName;
+  const subtitle = isAccount
+    ? `${plural(graph.totals.deviceCount, "device")} - ${plural(graph.totals.liveDeviceCount, "live device")}`
+    : deviceSubtitle(device);
+  const metrics = isAccount ? [
+    { Icon: Devices, label: "Devices", value: graph.totals.deviceCount },
+    { Icon: RadioButtonChecked, label: "Live", value: graph.totals.liveDeviceCount },
+    { Icon: Storage, label: "Workspaces", value: graph.totals.workspaceCount },
+    { Icon: Terminal, label: "Terminals", value: graph.totals.terminalCount },
+  ] : [
+    { Icon: Storage, label: "Workspaces", value: device.workspaceCount },
+    { Icon: Terminal, label: "Terminals", value: device.terminalCount },
+    { Icon: Dns, label: "Todos", value: device.todoCount },
+    { Icon: SettingsEthernet, label: "Tools", value: device.toolCount },
+  ];
+
   return (
-    <WorkspaceNode data-status={tone}>
-      <WorkspaceNodeTop>
-        <WorkspaceIconWrap data-status={tone}>
-          <Storage aria-hidden="true" />
-        </WorkspaceIconWrap>
-        <WorkspaceTitleBlock>
-          <WorkspaceTitle title={workspace.name}>{workspace.name}</WorkspaceTitle>
-          <WorkspaceMeta title={terminalSummaryLabel(workspace)}>
-            {terminalSummaryLabel(workspace)}
-          </WorkspaceMeta>
-        </WorkspaceTitleBlock>
-        <WorkspaceStatus data-status={tone}>{workspaceStatusLabel(workspace.status)}</WorkspaceStatus>
-      </WorkspaceNodeTop>
-      <WorkspaceStats>
-        <WorkspaceStat title="Todos">
-          <Dns aria-hidden="true" />
-          <span>{workspace.todoCount}</span>
-        </WorkspaceStat>
-        <WorkspaceStat title="Terminals">
-          <Terminal aria-hidden="true" />
-          <span>{workspace.terminalCount}</span>
-        </WorkspaceStat>
-        <WorkspaceStat title="MCPs and servers">
-          <SettingsEthernet aria-hidden="true" />
-          <span>{workspace.toolCount}</span>
-        </WorkspaceStat>
-      </WorkspaceStats>
-    </WorkspaceNode>
+    <GraphDetailDock aria-label={`${title} details`} role="dialog">
+      <GraphDetailHero>
+        <GraphDetailIcon data-status={tone}>
+          <Icon aria-hidden="true" />
+        </GraphDetailIcon>
+        <GraphDetailCopy>
+          <GraphDetailTitleRow>
+            <GraphDetailTitle title={title}>{title}</GraphDetailTitle>
+            <StatusPill data-status={tone}>{statusLabel(status, "Idle")}</StatusPill>
+          </GraphDetailTitleRow>
+          <GraphDetailMeta title={subtitle}>{subtitle}</GraphDetailMeta>
+          {!isAccount ? (
+            <DeviceSurfaceRow aria-label={`${device.deviceName} surfaces`}>
+              <SurfacePill data-active={device.nativeConnected ? "true" : "false"}>
+                <RadioButtonChecked aria-hidden="true" />
+                <span>Native</span>
+              </SurfacePill>
+              <SurfacePill data-active={device.webConnected ? "true" : "false"}>
+                <SettingsEthernet aria-hidden="true" />
+                <span>Web</span>
+              </SurfacePill>
+              <GraphDetailId title={device.deviceId}>{device.deviceId}</GraphDetailId>
+            </DeviceSurfaceRow>
+          ) : (
+            <GraphDetailId>{plural(graph.totals.todoCount, "todo")} - {plural(graph.totals.toolCount, "tool")}</GraphDetailId>
+          )}
+        </GraphDetailCopy>
+        <GraphDetailClose aria-label="Close details" onClick={onClose} title="Close details" type="button">
+          <CloseIcon aria-hidden="true" />
+        </GraphDetailClose>
+      </GraphDetailHero>
+      <GraphDetailMetrics>
+        {metrics.map(({ Icon: MetricIcon, label, value }) => (
+          <GraphDetailMetric key={label}>
+            <MetricIcon aria-hidden="true" />
+            <span>{label}</span>
+            <strong>{value}</strong>
+          </GraphDetailMetric>
+        ))}
+      </GraphDetailMetrics>
+    </GraphDetailDock>
   );
 }
 
@@ -158,6 +289,20 @@ export default function AccountDevicesView({
   localDesktopProfile = null,
   workspaceTodos = null,
 }) {
+  const rawGraphId = useId();
+  const [selectedGraphNode, setSelectedGraphNode] = useState(null);
+  const [graphPanning, setGraphPanning] = useState(false);
+  const graphViewportRef = useRef(null);
+  const graphPanRef = useRef({
+    active: false,
+    moved: false,
+    pointerId: null,
+    scrollLeft: 0,
+    scrollTop: 0,
+    startX: 0,
+    startY: 0,
+  });
+  const suppressGraphClickRef = useRef(false);
   const graph = useMemo(() => buildDevicesGraphModel({
     connectedDevices,
     deviceLiveState,
@@ -173,6 +318,109 @@ export default function AccountDevicesView({
   ]);
   const accountName = accountLabel || graph.account.name || "Account";
   const hasDevices = graph.devices.length > 0;
+  const selectedGraphDevice = selectedGraphNode?.type === "device"
+    ? graph.devices.find((device) => device.deviceId === selectedGraphNode.id)
+    : null;
+  const selectedDetail = selectedGraphNode?.type === "account"
+    ? { type: "account" }
+    : selectedGraphDevice ? { type: "device", device: selectedGraphDevice } : null;
+  const accountSelected = selectedGraphNode?.type === "account";
+  const graphIdPrefix = `devices-graph-${rawGraphId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const graphLayout = useMemo(() => buildDeviceGraphLayout(graph.devices.length), [graph.devices.length]);
+
+  useEffect(() => {
+    const viewport = graphViewportRef.current;
+    if (!viewport || !hasDevices) {
+      return undefined;
+    }
+
+    const centerTimer = window.setTimeout(() => {
+      viewport.scrollLeft = Math.max(0, (viewport.scrollWidth - viewport.clientWidth) / 2);
+      viewport.scrollTop = Math.max(0, (viewport.scrollHeight - viewport.clientHeight) / 2);
+    }, 0);
+
+    return () => window.clearTimeout(centerTimer);
+  }, [graph.devices.length, graphLayout.height, graphLayout.width, hasDevices]);
+
+  const selectGraphNode = (node) => {
+    if (suppressGraphClickRef.current) {
+      return;
+    }
+    setSelectedGraphNode(node);
+  };
+
+  const endGraphPan = (event) => {
+    const state = graphPanRef.current;
+    if (!state.active || state.pointerId !== event.pointerId) {
+      return;
+    }
+
+    graphPanRef.current = {
+      active: false,
+      moved: false,
+      pointerId: null,
+      scrollLeft: 0,
+      scrollTop: 0,
+      startX: 0,
+      startY: 0,
+    };
+    setGraphPanning(false);
+    if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    if (state.moved) {
+      suppressGraphClickRef.current = true;
+      window.setTimeout(() => {
+        suppressGraphClickRef.current = false;
+      }, 0);
+    }
+  };
+
+  const beginGraphPan = (event) => {
+    if (!hasDevices || (event.pointerType === "mouse" && event.button !== 0)) {
+      return;
+    }
+
+    const viewport = graphViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    graphPanRef.current = {
+      active: true,
+      moved: false,
+      pointerId: event.pointerId,
+      scrollLeft: viewport.scrollLeft,
+      scrollTop: viewport.scrollTop,
+      startX: event.clientX,
+      startY: event.clientY,
+    };
+    setGraphPanning(true);
+    event.currentTarget.setPointerCapture?.(event.pointerId);
+  };
+
+  const moveGraphPan = (event) => {
+    const state = graphPanRef.current;
+    if (!state.active || state.pointerId !== event.pointerId) {
+      return;
+    }
+
+    const viewport = graphViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    const deltaX = event.clientX - state.startX;
+    const deltaY = event.clientY - state.startY;
+    if (Math.abs(deltaX) > 3 || Math.abs(deltaY) > 3) {
+      graphPanRef.current.moved = true;
+    }
+
+    viewport.scrollLeft = state.scrollLeft - deltaX;
+    viewport.scrollTop = state.scrollTop - deltaY;
+    event.preventDefault();
+  };
 
   return (
     <DevicesSurface>
@@ -204,41 +452,101 @@ export default function AccountDevicesView({
         </DevicesSummary>
       </DevicesHeader>
 
-      <GraphViewport data-empty={hasDevices ? "false" : "true"}>
+      <GraphViewport
+        data-empty={hasDevices ? "false" : "true"}
+        data-panning={graphPanning ? "true" : "false"}
+        onPointerCancel={endGraphPan}
+        onPointerDown={beginGraphPan}
+        onPointerMove={moveGraphPan}
+        onPointerUp={endGraphPan}
+        ref={graphViewportRef}
+      >
         {hasDevices ? (
-          <GraphCanvas>
-            <AccountNodeWrap>
-              <AccountNode data-status={statusTone(graph.account.status)}>
-                <AccountBadge>{accountInitials(accountName)}</AccountBadge>
-                <AccountMain>
-                  <AccountName title={accountName}>{accountName}</AccountName>
-                  <AccountMeta>
-                    {plural(graph.totals.workspaceCount, "workspace")} - {plural(graph.totals.todoCount, "todo")}
-                  </AccountMeta>
-                </AccountMain>
-                <StatusPill data-status={statusTone(graph.account.status)}>
-                  {statusLabel(graph.account.status, "Idle")}
-                </StatusPill>
-              </AccountNode>
-            </AccountNodeWrap>
-            <GraphRail aria-hidden="true" />
-            <DeviceGrid data-count={graph.devices.length}>
-              {graph.devices.map((device) => (
-                <DeviceLane key={device.deviceId}>
-                  <GraphDeviceCard device={device} />
-                  <WorkspaceStack>
-                    {device.workspaces.length ? device.workspaces.map((workspace) => (
-                      <GraphWorkspaceCard key={`${device.deviceId}:${workspace.id}`} workspace={workspace} />
-                    )) : (
-                      <WorkspaceEmpty>
-                        <Storage aria-hidden="true" />
-                        <span>No workspaces</span>
-                      </WorkspaceEmpty>
-                    )}
-                  </WorkspaceStack>
-                </DeviceLane>
-              ))}
-            </DeviceGrid>
+          <GraphCanvas style={{ height: `${graphLayout.height}px`, width: `${graphLayout.width}px` }}>
+            <DeviceGraphStage aria-label="Account device graph">
+              <DeviceGraphLinks
+                aria-hidden="true"
+                preserveAspectRatio="none"
+                viewBox={`0 0 ${graphLayout.width} ${graphLayout.height}`}
+              >
+                <defs>
+                  {graph.devices.map((device, index) => {
+                    const position = graphLayout.nodes[index];
+                    const pathKey = `${graphIdPrefix}-${index}`;
+                    return (
+                      <g key={`paths-${device.deviceId}`}>
+                        <path
+                          d={`M ${graphLayout.centerX} ${graphLayout.centerY} L ${position.x} ${position.y}`}
+                          id={`${pathKey}-outbound`}
+                        />
+                        <path
+                          d={`M ${position.x} ${position.y} L ${graphLayout.centerX} ${graphLayout.centerY}`}
+                          id={`${pathKey}-inbound`}
+                        />
+                      </g>
+                    );
+                  })}
+                </defs>
+                {graph.devices.map((device, index) => {
+                  const position = graphLayout.nodes[index];
+                  const selected = selectedGraphNode?.type === "device" && selectedGraphNode.id === device.deviceId;
+                  const pathKey = `${graphIdPrefix}-${index}`;
+                  return (
+                    <g key={`line-${device.deviceId}`}>
+                      <DeviceGraphPath
+                        d={`M ${graphLayout.centerX} ${graphLayout.centerY} L ${position.x} ${position.y}`}
+                        data-selected={selected ? "true" : "false"}
+                        data-status={statusTone(device.liveState)}
+                      />
+                      <SyncPackets
+                        inboundPathId={`${pathKey}-inbound`}
+                        index={index}
+                        outboundPathId={`${pathKey}-outbound`}
+                        selected={selected}
+                        status={device.liveState}
+                      />
+                    </g>
+                  );
+                })}
+              </DeviceGraphLinks>
+              <AccountNodeWrap>
+                <AccountNode
+                  aria-label={`Show details for ${accountName}`}
+                  aria-pressed={accountSelected ? "true" : "false"}
+                  data-selected={accountSelected ? "true" : "false"}
+                  data-status={statusTone(graph.account.status)}
+                  onClick={() => selectGraphNode({ id: "account", type: "account" })}
+                  type="button"
+                >
+                  <AccountBadge>{accountInitials(accountName)}</AccountBadge>
+                  <AccountMain>
+                    <AccountName title={accountName}>{accountName}</AccountName>
+                    <AccountMeta>
+                      {plural(graph.totals.workspaceCount, "workspace")} - {plural(graph.totals.todoCount, "todo")}
+                    </AccountMeta>
+                  </AccountMain>
+                  <StatusPill data-status={statusTone(graph.account.status)}>
+                    {statusLabel(graph.account.status, "Idle")}
+                  </StatusPill>
+                </AccountNode>
+              </AccountNodeWrap>
+              {graph.devices.map((device, index) => {
+                const position = graphLayout.nodes[index];
+                const selected = selectedGraphNode?.type === "device" && selectedGraphNode.id === device.deviceId;
+                return (
+                  <DeviceNodeWrap
+                    key={device.deviceId}
+                    style={{ left: `${position.x}px`, top: `${position.y}px` }}
+                  >
+                    <GraphDeviceCard
+                      device={device}
+                      onSelect={() => selectGraphNode({ id: device.deviceId, type: "device" })}
+                      selected={selected}
+                    />
+                  </DeviceNodeWrap>
+                );
+              })}
+            </DeviceGraphStage>
           </GraphCanvas>
         ) : (
           <DevicesEmptyState>
@@ -248,11 +556,78 @@ export default function AccountDevicesView({
           </DevicesEmptyState>
         )}
       </GraphViewport>
+      <GraphDetailSheet
+        accountName={accountName}
+        detail={selectedDetail}
+        graph={graph}
+        onClose={() => setSelectedGraphNode(null)}
+      />
     </DevicesSurface>
   );
 }
 
+const syncLineFlow = keyframes`
+  from {
+    stroke-dashoffset: 0;
+  }
+
+  to {
+    stroke-dashoffset: -44;
+  }
+`;
+
+const packetTwinkle = keyframes`
+  0%,
+  100% {
+    opacity: 0.48;
+  }
+
+  48% {
+    opacity: 0.96;
+  }
+`;
+
+const accountFieldPulse = keyframes`
+  0%,
+  100% {
+    opacity: 0.2;
+    transform: translate(-50%, -50%) scale(0.88);
+  }
+
+  50% {
+    opacity: 0.62;
+    transform: translate(-50%, -50%) scale(1.08);
+  }
+`;
+
+const accountNodePulse = keyframes`
+  0%,
+  100% {
+    opacity: 0.26;
+    transform: scale(0.98);
+  }
+
+  50% {
+    opacity: 0.72;
+    transform: scale(1.02);
+  }
+`;
+
+const deviceNodeSpeak = keyframes`
+  0%,
+  100% {
+    opacity: 0.18;
+    transform: scale(0.98);
+  }
+
+  50% {
+    opacity: 0.74;
+    transform: scale(1.03);
+  }
+`;
+
 const DevicesSurface = styled.section`
+  position: relative;
   display: grid;
   min-width: 0;
   min-height: 0;
@@ -362,42 +737,198 @@ const SummaryMetric = styled.div`
 `;
 
 const GraphViewport = styled.div`
+  position: relative;
   min-width: 0;
   min-height: 0;
-  overflow: auto;
+  overflow: hidden;
   overscroll-behavior: contain;
-`;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
 
-const GraphCanvas = styled.div`
-  display: grid;
-  min-width: min(100%, 760px);
-  min-height: 100%;
-  grid-template-rows: auto 38px minmax(0, 1fr);
-  align-content: start;
-  padding: 24px clamp(16px, 3vw, 38px) 34px;
-  box-sizing: border-box;
-`;
+  &[data-panning="true"] {
+    cursor: grabbing;
+  }
 
-const AccountNodeWrap = styled.div`
-  position: relative;
-  display: grid;
-  justify-items: center;
-  min-width: 0;
-
-  &::after {
-    position: absolute;
-    top: 100%;
-    left: 50%;
-    width: 1px;
-    height: 39px;
-    background: linear-gradient(180deg, rgba(var(--forge-tint-soft-rgb), 0.42), rgba(144, 155, 170, 0.18));
-    content: "";
+  &::-webkit-scrollbar {
+    display: none;
   }
 `;
 
-const AccountNode = styled.div`
+const GraphCanvas = styled.div`
+  position: relative;
+  display: block;
+  width: 980px;
+  min-width: ${DEVICE_GRAPH_BASE_WIDTH}px;
+  height: 620px;
+  min-height: ${DEVICE_GRAPH_BASE_HEIGHT}px;
+  box-sizing: border-box;
+`;
+
+const DeviceGraphStage = styled.div`
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-height: 520px;
+  border: 1px solid rgba(144, 155, 170, 0.08);
+  border-radius: 8px;
+  background:
+    radial-gradient(circle at 50% 50%, rgba(var(--forge-tint-rgb), 0.12), transparent 23%),
+    linear-gradient(90deg, rgba(144, 155, 170, 0.035) 1px, transparent 1px),
+    linear-gradient(180deg, rgba(144, 155, 170, 0.03) 1px, transparent 1px);
+  background-size: auto, 72px 72px, 72px 72px;
+  overflow: hidden;
+  isolation: isolate;
+
+  &::before {
+    position: absolute;
+    inset: 50%;
+    z-index: 0;
+    width: 340px;
+    height: 340px;
+    border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.14);
+    border-radius: 999px;
+    content: "";
+    pointer-events: none;
+    transform: translate(-50%, -50%);
+    animation: ${accountFieldPulse} 4.8s ease-in-out infinite;
+  }
+
+  html[data-forge-theme="light"] & {
+    background:
+      radial-gradient(circle at 50% 50%, rgba(var(--forge-tint-rgb), 0.08), transparent 25%),
+      linear-gradient(90deg, rgba(15, 23, 42, 0.05) 1px, transparent 1px),
+      linear-gradient(180deg, rgba(15, 23, 42, 0.045) 1px, transparent 1px);
+    background-size: auto, 72px 72px, 72px 72px;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &::before {
+      animation: none;
+    }
+  }
+`;
+
+const DeviceGraphLinks = styled.svg`
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+  pointer-events: none;
+`;
+
+const DeviceGraphPath = styled.path`
+  fill: none;
+  stroke: rgba(144, 155, 170, 0.24);
+  stroke-dasharray: 9 13;
+  stroke-linecap: round;
+  stroke-width: 1.1;
+  vector-effect: non-scaling-stroke;
+  animation: ${syncLineFlow} 5.6s linear infinite;
+
+  &[data-status="live"] {
+    stroke: rgba(var(--forge-tint-soft-rgb), 0.46);
+  }
+
+  &[data-status="syncing"] {
+    stroke: rgba(223, 165, 90, 0.56);
+    animation-duration: 3.8s;
+  }
+
+  &[data-status="offline"] {
+    opacity: 0.34;
+    animation-duration: 8s;
+  }
+
+  &[data-selected="true"] {
+    stroke: rgba(var(--forge-tint-soft-rgb), 0.82);
+    stroke-width: 1.45;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+`;
+
+const SyncPacketGroup = styled.g`
+  color: var(--forge-tint-soft);
+  opacity: 0.64;
+  filter: drop-shadow(0 0 7px rgba(var(--forge-tint-rgb), 0.48));
+  animation: ${packetTwinkle} 1.8s ease-in-out infinite;
+
+  &[data-direction="inbound"] {
+    color: var(--forge-green);
+  }
+
+  &[data-status="syncing"] {
+    color: var(--forge-amber);
+    opacity: 0.82;
+    animation-duration: 1.25s;
+  }
+
+  &[data-status="offline"] {
+    opacity: 0.18;
+    filter: none;
+  }
+
+  &[data-selected="true"] {
+    opacity: 1;
+    filter: drop-shadow(0 0 10px rgba(var(--forge-tint-rgb), 0.68));
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    display: none;
+    animation: none;
+  }
+`;
+
+const SyncPacketHalo = styled.circle`
+  fill: currentColor;
+  opacity: 0.15;
+`;
+
+const SyncPacketCore = styled.circle`
+  fill: currentColor;
+  opacity: 0.9;
+`;
+
+const SyncPacketTray = styled.path`
+  fill: rgba(3, 5, 8, 0.78);
+  stroke: currentColor;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  stroke-width: 0.9;
+  vector-effect: non-scaling-stroke;
+
+  html[data-forge-theme="light"] & {
+    fill: rgba(248, 250, 252, 0.86);
+  }
+`;
+
+const DeviceNodeWrap = styled.div`
+  position: absolute;
+  z-index: 2;
+  width: ${DEVICE_NODE_WIDTH}px;
+  transform: translate(-50%, -50%);
+`;
+
+const AccountNodeWrap = styled.div`
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  top: 50%;
   display: grid;
-  width: min(100%, 380px);
+  width: clamp(280px, 34vw, 390px);
+  min-width: 0;
+  transform: translate(-50%, -50%);
+`;
+
+const AccountNode = styled.button`
+  appearance: none;
+  position: relative;
+  display: grid;
+  width: 100%;
   min-width: 0;
   grid-template-columns: 42px minmax(0, 1fr) auto;
   align-items: center;
@@ -409,6 +940,41 @@ const AccountNode = styled.div`
     linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.12), rgba(var(--forge-tint-rgb), 0.035)),
     var(--forge-surface);
   box-shadow: 0 14px 34px rgba(0, 0, 0, 0.22);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  overflow: hidden;
+  text-align: left;
+
+  &::before {
+    position: absolute;
+    inset: -2px;
+    border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.18);
+    border-radius: inherit;
+    content: "";
+    opacity: 0.52;
+    pointer-events: none;
+    animation: ${accountNodePulse} 3.2s ease-in-out infinite;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &::before {
+      animation: none;
+    }
+  }
+
+  &[data-selected="true"],
+  &:hover {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.58);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.18), rgba(var(--forge-tint-rgb), 0.06)),
+      var(--forge-surface);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(var(--forge-tint-soft-rgb), 0.72);
+    outline-offset: 4px;
+  }
 
   html[data-forge-theme="light"] & {
     box-shadow: 0 12px 26px rgba(15, 23, 42, 0.08);
@@ -468,63 +1034,11 @@ const AccountMeta = styled.span`
   white-space: nowrap;
 `;
 
-const GraphRail = styled.div`
-  position: relative;
-  display: block;
-  min-height: 38px;
-
-  &::before {
-    position: absolute;
-    left: 8%;
-    right: 8%;
-    top: 100%;
-    height: 1px;
-    background: linear-gradient(90deg, transparent, rgba(144, 155, 170, 0.28), transparent);
-    content: "";
-  }
-`;
-
-const DeviceGrid = styled.div`
+const DeviceNode = styled.button`
+  appearance: none;
   position: relative;
   display: grid;
-  min-width: 0;
-  grid-template-columns: repeat(auto-fit, minmax(238px, 1fr));
-  gap: clamp(14px, 2.2vw, 24px);
-  align-items: start;
-`;
-
-const DeviceLane = styled.section`
-  position: relative;
-  display: grid;
-  min-width: 0;
-  align-content: start;
-  gap: 10px;
-
-  &::before {
-    position: absolute;
-    left: 50%;
-    top: -38px;
-    width: 1px;
-    height: 38px;
-    background: rgba(144, 155, 170, 0.24);
-    content: "";
-  }
-
-  &::after {
-    position: absolute;
-    left: 15px;
-    top: 62px;
-    bottom: 20px;
-    width: 1px;
-    background: linear-gradient(180deg, rgba(144, 155, 170, 0.24), rgba(144, 155, 170, 0.08));
-    content: "";
-    pointer-events: none;
-  }
-`;
-
-const DeviceNode = styled.div`
-  position: relative;
-  display: grid;
+  width: 100%;
   min-width: 0;
   grid-template-columns: 38px minmax(0, 1fr) auto;
   align-items: center;
@@ -535,11 +1049,64 @@ const DeviceNode = styled.div`
   background:
     linear-gradient(180deg, rgba(230, 236, 245, 0.048), rgba(230, 236, 245, 0.015)),
     var(--forge-surface-raised);
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
   z-index: 1;
+  min-height: ${DEVICE_NODE_HEIGHT}px;
+  overflow: hidden;
+
+  &::after {
+    position: absolute;
+    inset: -1px;
+    border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.16);
+    border-radius: inherit;
+    content: "";
+    opacity: 0;
+    pointer-events: none;
+    transform: scale(0.98);
+  }
 
   &[data-status="live"] {
     border-color: rgba(var(--forge-tint-soft-rgb), 0.38);
     box-shadow: inset 0 0 0 1px rgba(var(--forge-tint-soft-rgb), 0.08);
+  }
+
+  &[data-selected="true"] {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.72);
+    box-shadow:
+      inset 0 0 0 1px rgba(var(--forge-tint-soft-rgb), 0.16),
+      0 0 0 3px rgba(var(--forge-tint-rgb), 0.1);
+  }
+
+  &[data-status="live"]::after,
+  &[data-status="syncing"]::after {
+    opacity: 1;
+    animation: ${deviceNodeSpeak} 2.8s ease-in-out infinite;
+  }
+
+  &[data-status="syncing"]::after {
+    border-color: rgba(223, 165, 90, 0.22);
+    animation-duration: 1.8s;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &::after {
+      animation: none;
+    }
+  }
+
+  &:hover {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.52);
+    background:
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.075), rgba(230, 236, 245, 0.018)),
+      var(--forge-surface-raised);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(var(--forge-tint-soft-rgb), 0.72);
+    outline-offset: 3px;
   }
 
   &[data-status="offline"] {
@@ -672,179 +1239,207 @@ const StatusPill = styled.span`
   }
 `;
 
-const WorkspaceStack = styled.div`
-  position: relative;
+const GraphDetailDock = styled.aside`
+  position: absolute;
+  z-index: 30;
+  right: clamp(18px, 3vw, 42px);
+  bottom: 20px;
+  left: clamp(18px, 3vw, 42px);
   display: grid;
-  min-width: 0;
-  gap: 8px;
-  padding-left: 30px;
-`;
-
-const WorkspaceNode = styled.div`
-  position: relative;
-  display: grid;
-  min-width: 0;
-  gap: 9px;
-  padding: 9px;
-  border: 1px solid var(--forge-border);
+  gap: 12px;
+  max-height: min(42vh, 260px);
+  overflow: auto;
+  padding: 14px;
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.26);
   border-radius: 8px;
   background:
-    linear-gradient(180deg, rgba(230, 236, 245, 0.035), rgba(230, 236, 245, 0.012)),
-    rgba(13, 17, 23, 0.72);
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.08), rgba(230, 236, 245, 0.02)),
+    var(--forge-surface);
+  box-shadow: 0 -18px 40px rgba(0, 0, 0, 0.24);
+  pointer-events: auto;
 
-  &::before {
-    position: absolute;
-    top: 50%;
-    left: -15px;
-    width: 15px;
-    height: 1px;
-    background: rgba(144, 155, 170, 0.22);
-    content: "";
+  html[data-forge-theme="light"] & {
+    box-shadow: 0 -16px 34px rgba(15, 23, 42, 0.08);
   }
+`;
+
+const GraphDetailHero = styled.div`
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 42px minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
+
+  @media (max-width: 620px) {
+    grid-template-columns: 38px minmax(0, 1fr) auto;
+  }
+`;
+
+const GraphDetailIcon = styled.div`
+  display: grid;
+  width: 42px;
+  height: 42px;
+  place-items: center;
+  border: 1px solid var(--forge-border);
+  border-radius: 8px;
+  color: var(--forge-text-soft);
+  background: var(--forge-bg-deep);
 
   &[data-status="live"] {
-    border-color: rgba(60, 203, 127, 0.28);
+    border-color: rgba(60, 203, 127, 0.32);
+    color: var(--forge-green);
+    background: rgba(60, 203, 127, 0.09);
   }
 
   &[data-status="syncing"] {
-    border-color: rgba(223, 165, 90, 0.28);
+    border-color: rgba(223, 165, 90, 0.32);
+    color: var(--forge-amber);
+    background: rgba(223, 165, 90, 0.09);
   }
 
-  html[data-forge-theme="light"] & {
-    background: var(--forge-surface);
+  &[data-status="error"] {
+    border-color: rgba(239, 107, 107, 0.32);
+    color: var(--forge-red);
+    background: rgba(239, 107, 107, 0.09);
+  }
+
+  svg {
+    width: 22px;
+    height: 22px;
   }
 `;
 
-const WorkspaceNodeTop = styled.div`
+const GraphDetailCopy = styled.div`
   display: grid;
   min-width: 0;
-  grid-template-columns: 30px minmax(0, 1fr) auto;
+  gap: 6px;
+`;
+
+const GraphDetailTitleRow = styled.div`
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
   align-items: center;
   gap: 8px;
 `;
 
-const WorkspaceIconWrap = styled.div`
+const GraphDetailTitle = styled.strong`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--forge-text);
+  font-size: 15px;
+  font-weight: 800;
+  letter-spacing: 0;
+  line-height: 1.15;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const GraphDetailMeta = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  color: var(--forge-text-muted);
+  font-size: 11px;
+  font-weight: 680;
+  letter-spacing: 0;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const GraphDetailId = styled.span`
+  display: inline-flex;
+  min-width: 0;
+  max-width: min(340px, 100%);
+  align-items: center;
+  overflow: hidden;
+  padding: 3px 7px;
+  border: 1px solid rgba(144, 155, 170, 0.18);
+  border-radius: 999px;
+  color: var(--forge-text-muted);
+  background: rgba(230, 236, 245, 0.026);
+  font-size: 9px;
+  font-weight: 720;
+  letter-spacing: 0;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const GraphDetailClose = styled.button`
+  appearance: none;
   display: grid;
-  width: 30px;
-  height: 30px;
+  width: 32px;
+  height: 32px;
   place-items: center;
   border: 1px solid var(--forge-border);
   border-radius: 8px;
   color: var(--forge-text-muted);
-  background: var(--forge-bg-deep);
+  background: rgba(230, 236, 245, 0.026);
+  cursor: pointer;
 
   svg {
-    width: 17px;
-    height: 17px;
+    width: 18px;
+    height: 18px;
   }
 
-  &[data-status="live"] {
-    border-color: rgba(60, 203, 127, 0.28);
-    color: var(--forge-green);
-    background: rgba(60, 203, 127, 0.08);
+  &:hover {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.38);
+    color: var(--forge-text);
+    background: rgba(var(--forge-tint-rgb), 0.09);
   }
 
-  &[data-status="syncing"] {
-    border-color: rgba(223, 165, 90, 0.28);
-    color: var(--forge-amber);
-    background: rgba(223, 165, 90, 0.08);
+  &:focus-visible {
+    outline: 2px solid rgba(var(--forge-tint-soft-rgb), 0.72);
+    outline-offset: 2px;
   }
 `;
 
-const WorkspaceTitleBlock = styled.div`
+const GraphDetailMetrics = styled.div`
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+
+  @media (max-width: 760px) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+`;
+
+const GraphDetailMetric = styled.div`
   display: grid;
   min-width: 0;
-  gap: 3px;
-`;
-
-const WorkspaceTitle = styled.strong`
-  min-width: 0;
-  overflow: hidden;
-  color: var(--forge-text);
-  font-size: 12px;
-  font-weight: 760;
-  letter-spacing: 0;
-  line-height: 1.12;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-`;
-
-const WorkspaceMeta = styled.span`
-  min-width: 0;
-  overflow: hidden;
-  color: var(--forge-text-muted);
-  font-size: 10px;
-  font-weight: 650;
-  letter-spacing: 0;
-  line-height: 1.1;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-`;
-
-const WorkspaceStatus = styled(StatusPill)`
-  min-width: 48px;
-  max-width: 72px;
-  padding: 4px 7px;
-  font-size: 9px;
-`;
-
-const WorkspaceStats = styled.div`
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 5px;
-`;
-
-const WorkspaceStat = styled.span`
-  display: inline-flex;
-  min-width: 0;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  padding: 5px 6px;
-  border: 1px solid rgba(144, 155, 170, 0.14);
-  border-radius: 7px;
-  color: var(--forge-text-soft);
-  background: rgba(230, 236, 245, 0.022);
-  font-size: 10px;
-  font-weight: 760;
-  letter-spacing: 0;
-  line-height: 1;
-
-  svg {
-    width: 13px;
-    height: 13px;
-    color: var(--forge-text-muted);
-  }
-`;
-
-const WorkspaceEmpty = styled.div`
-  position: relative;
-  display: inline-flex;
-  min-width: 0;
+  grid-template-columns: 16px minmax(0, 1fr) auto;
   align-items: center;
   gap: 7px;
   padding: 9px;
-  border: 1px dashed rgba(144, 155, 170, 0.2);
+  border: 1px solid rgba(144, 155, 170, 0.14);
   border-radius: 8px;
-  color: var(--forge-text-muted);
-  background: rgba(230, 236, 245, 0.014);
-  font-size: 11px;
-  font-weight: 700;
-  letter-spacing: 0;
-
-  &::before {
-    position: absolute;
-    top: 50%;
-    left: -15px;
-    width: 15px;
-    height: 1px;
-    background: rgba(144, 155, 170, 0.16);
-    content: "";
-  }
+  background: rgba(230, 236, 245, 0.02);
 
   svg {
     width: 16px;
     height: 16px;
+    color: var(--forge-text-muted);
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 10px;
+    font-weight: 720;
+    letter-spacing: 0;
+    line-height: 1;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  strong {
+    color: var(--forge-text);
+    font-size: 13px;
+    font-weight: 820;
+    letter-spacing: 0;
+    line-height: 1;
   }
 `;
 

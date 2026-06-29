@@ -4,6 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { Terminal as XTerm } from "@xterm/xterm";
+import "@xterm/xterm/css/xterm.css";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 
 import {
@@ -119,6 +120,24 @@ const HostTerminalSurface = styled.div`
 
   .xterm .xterm-viewport {
     background: transparent;
+  }
+
+  .xterm-helper-textarea {
+    position: absolute !important;
+    left: -10000px !important;
+    top: 0 !important;
+    width: 0 !important;
+    height: 0 !important;
+    min-width: 0 !important;
+    min-height: 0 !important;
+    padding: 0 !important;
+    border: 0 !important;
+    outline: 0 !important;
+    opacity: 0 !important;
+    color: transparent !important;
+    background: transparent !important;
+    resize: none !important;
+    overflow: hidden !important;
   }
 `;
 
