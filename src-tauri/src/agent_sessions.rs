@@ -2125,6 +2125,90 @@ mod agent_sessions_tests {
     }
 
     #[test]
+    fn opencode_resume_resolution_requires_existing_workspace_session() {
+        let _guard = OPENCODE_DB_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+
+        let dir = unique_test_dir("opencode-resume-db");
+        let workspace = dir.join("workspace");
+        let other_workspace = dir.join("other-workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&other_workspace).unwrap();
+        let db_path = dir.join("opencode.db");
+        {
+            let connection = rusqlite::Connection::open(&db_path).unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TABLE session (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        directory TEXT NOT NULL,
+                        time_updated INTEGER NOT NULL
+                    );",
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO session (id, title, directory, time_updated) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "ses_native_12345678",
+                        "OpenCode native session",
+                        workspace.to_string_lossy().to_string(),
+                        200i64,
+                    ],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO session (id, title, directory, time_updated) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![
+                        "ses_other_12345678",
+                        "Other workspace session",
+                        other_workspace.to_string_lossy().to_string(),
+                        300i64,
+                    ],
+                )
+                .unwrap();
+        }
+
+        let previous = env::var_os("OPENCODE_DATA_DIR");
+        env::set_var("OPENCODE_DATA_DIR", &dir);
+
+        assert_eq!(
+            resolve_opencode_resume_session(
+                "ses_native_12345678",
+                workspace.to_string_lossy().as_ref()
+            )
+            .as_deref(),
+            Ok("ses_native_12345678")
+        );
+        assert!(
+            resolve_opencode_resume_session(
+                "019f0cd7-1347-7273-b20f-e959c3772a01",
+                workspace.to_string_lossy().as_ref()
+            )
+            .is_err(),
+            "coordination/turn UUIDs must not be treated as OpenCode session ids"
+        );
+        assert!(
+            resolve_opencode_resume_session(
+                "ses_other_12345678",
+                workspace.to_string_lossy().as_ref()
+            )
+            .is_err(),
+            "session history for a different workspace must not be resumed in this cwd"
+        );
+
+        match previous {
+            Some(value) => env::set_var("OPENCODE_DATA_DIR", value),
+            None => env::remove_var("OPENCODE_DATA_DIR"),
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn codex_resume_sanitizer_removes_only_unresumable_image_response_items() {
         let image_event = json!({
             "type": "event_msg",
@@ -3333,6 +3417,21 @@ fn find_opencode_session(
     }
 
     Err("No OpenCode session matched this thread session.".to_string())
+}
+
+fn resolve_opencode_resume_session(provider_session_id: &str, cwd: &str) -> Result<String, String> {
+    let (session_id, _, session_cwd, _) = find_opencode_session(provider_session_id, cwd)?;
+    let session_id = clean_codex_id(session_id);
+    if session_id.trim().is_empty() {
+        return Err("OpenCode session row has no resumable session id.".to_string());
+    }
+    if !cwd.trim().is_empty()
+        && !session_cwd.trim().is_empty()
+        && !agent_paths_match(&session_cwd, cwd)
+    {
+        return Err("OpenCode session belongs to a different workspace path.".to_string());
+    }
+    Ok(session_id)
 }
 
 fn discover_codex_session_by_prompt(

@@ -227,6 +227,45 @@ fn workspace_threads_clean_provider_session_id(value: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
+fn workspace_agent_session_history_session_id_is_visible(agent_id: &str, session_id: &str) -> bool {
+    let Some(agent_id) = workspace_threads_clean_agent_id(agent_id) else {
+        return false;
+    };
+    let Some(session_id) = workspace_threads_clean_provider_session_id(session_id) else {
+        return false;
+    };
+    if agent_id == "opencode" {
+        return session_id.starts_with("ses_");
+    }
+    true
+}
+
+fn workspace_agent_session_history_record_session_id(
+    record: &WorkspaceAgentSessionHistoryRecord,
+) -> Option<String> {
+    workspace_threads_clean_provider_session_id(&record.provider_session_id)
+        .or_else(|| workspace_threads_clean_provider_session_id(&record.native_session_id))
+}
+
+fn workspace_agent_session_history_item_session_id(
+    item: &WorkspaceAgentSessionHistoryItem,
+) -> Option<String> {
+    workspace_threads_clean_provider_session_id(&item.provider_session_id)
+        .or_else(|| workspace_threads_clean_provider_session_id(&item.native_session_id))
+}
+
+fn workspace_agent_session_history_item_is_visible(item: &WorkspaceAgentSessionHistoryItem) -> bool {
+    let Some(agent_id) = workspace_threads_clean_agent_id(&item.agent_id)
+        .or_else(|| workspace_threads_clean_agent_id(&item.provider))
+    else {
+        return false;
+    };
+    let Some(session_id) = workspace_agent_session_history_item_session_id(item) else {
+        return false;
+    };
+    workspace_agent_session_history_session_id_is_visible(&agent_id, &session_id)
+}
+
 fn workspace_threads_now_millis_u64() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -375,6 +414,17 @@ fn workspace_agent_session_history_upsert_blocking(
     };
     let provider = workspace_threads_clean_agent_id(&record.provider)
         .unwrap_or_else(|| agent_id.clone());
+    let provider_session_id =
+        workspace_threads_clean_provider_session_id(&record.provider_session_id).unwrap_or_default();
+    let native_session_id =
+        workspace_threads_clean_provider_session_id(&record.native_session_id).unwrap_or_default();
+    let visible_session_id = workspace_agent_session_history_record_session_id(&record);
+    if !visible_session_id
+        .as_deref()
+        .is_some_and(|session_id| workspace_agent_session_history_session_id_is_visible(&provider, session_id))
+    {
+        return Ok(false);
+    }
     let observed_at_ms = record
         .observed_at_ms
         .unwrap_or_else(workspace_threads_now_millis_u64);
@@ -443,8 +493,8 @@ fn workspace_agent_session_history_upsert_blocking(
                 root_display,
                 workspace_threads_clean_optional_text(&record.workspace_name, 256),
                 workspace_threads_clean_optional_text(&record.coordination_session_id, 256),
-                workspace_threads_clean_provider_session_id(&record.provider_session_id).unwrap_or_default(),
-                workspace_threads_clean_provider_session_id(&record.native_session_id).unwrap_or_default(),
+                provider_session_id,
+                native_session_id,
                 agent_id,
                 provider,
                 workspace_threads_clean_optional_text(&record.model_id, 160),
@@ -610,6 +660,14 @@ fn workspace_agent_session_history_list_blocking(
                 latest_at_ms
             FROM workspace_agent_session_history
             WHERE workspace_id = ?1
+                AND (TRIM(provider_session_id) != '' OR TRIM(native_session_id) != '')
+                AND (
+                    (
+                        LOWER(agent_id) NOT LIKE '%opencode%'
+                        AND LOWER(provider) NOT LIKE '%opencode%'
+                    )
+                    OR COALESCE(NULLIF(TRIM(provider_session_id), ''), TRIM(native_session_id)) LIKE 'ses_%'
+                )
             ORDER BY latest_at_ms DESC, created_at_ms DESC, id DESC
             LIMIT ?2",
         )
@@ -660,6 +718,7 @@ fn workspace_agent_session_history_list_blocking(
     for row in rows {
         items.push(row.map_err(|error| format!("Unable to read workspace session history row: {error}"))?);
     }
+    items.retain(workspace_agent_session_history_item_is_visible);
     workspace_agent_session_history_enrich_previews(&mut items);
     Ok(WorkspaceAgentSessionHistoryListResult {
         generated_at_ms: workspace_threads_now_millis_u64(),
@@ -1689,7 +1748,7 @@ mod workspace_threads_store_tests {
             },
         )
         .expect("record session history");
-        assert!(recorded);
+        assert!(!recorded, "terminal-only rows without provider sessions are not history");
 
         let other_recorded = workspace_agent_session_history_upsert_blocking(
             Some(root_text.as_str()),
@@ -1718,7 +1777,7 @@ mod workspace_threads_store_tests {
             },
         )
         .expect("record other workspace session history");
-        assert!(other_recorded);
+        assert!(!other_recorded);
 
         let result =
             workspace_agent_session_history_list_blocking(WorkspaceAgentSessionHistoryListRequest {
@@ -1727,26 +1786,18 @@ mod workspace_threads_store_tests {
                 workspace_id: "workspace-session-history".to_string(),
             })
             .expect("list session history");
-        assert_eq!(result.items.len(), 1);
-        let item = &result.items[0];
-        assert_eq!(item.id, "session-history-1");
-        assert_eq!(item.agent_id, "codex");
-        assert_eq!(item.model_id, "gpt-5.5");
-        assert_eq!(item.status, "starting");
-        assert_eq!(item.created_at_ms, 1000);
-        assert_eq!(item.latest_at_ms, 2000);
-        assert_eq!(item.terminal_index, Some(2));
+        assert!(result.items.is_empty());
 
         let updated = workspace_agent_session_history_upsert_blocking(
             Some(root_text.as_str()),
             WorkspaceAgentSessionHistoryRecord {
                 agent_id: "codex".to_string(),
                 coordination_session_id: "coord-session-1".to_string(),
-                created_at_ms: None,
+                created_at_ms: Some(1000),
                 cwd: root_text.clone(),
                 id: "session-history-1".to_string(),
-                model_id: "".to_string(),
-                model_source: "".to_string(),
+                model_id: "gpt-5.5".to_string(),
+                model_source: "launch".to_string(),
                 native_session_id: "codex-native-123".to_string(),
                 observed_at_ms: Some(3000),
                 pane_id: "pane-session-history".to_string(),
@@ -1755,12 +1806,12 @@ mod workspace_threads_store_tests {
                 slot_key: "".to_string(),
                 source: "provider-session".to_string(),
                 status: "idle".to_string(),
-                terminal_index: None,
-                terminal_instance_id: None,
+                terminal_index: Some(2),
+                terminal_instance_id: Some(42),
                 thread_id: "thread-session-history".to_string(),
-                title: "".to_string(),
+                title: "Ada".to_string(),
                 workspace_id: "workspace-session-history".to_string(),
-                workspace_name: "".to_string(),
+                workspace_name: "Session History".to_string(),
             },
         )
         .expect("update session history");
@@ -1783,6 +1834,44 @@ mod workspace_threads_store_tests {
         assert_eq!(item.created_at_ms, 1000);
         assert_eq!(item.latest_at_ms, 3000);
         assert_eq!(item.terminal_index, Some(2));
+
+        let invalid_opencode = workspace_agent_session_history_upsert_blocking(
+            Some(root_text.as_str()),
+            WorkspaceAgentSessionHistoryRecord {
+                agent_id: "opencode".to_string(),
+                coordination_session_id: "coord-opencode".to_string(),
+                created_at_ms: Some(3000),
+                cwd: root_text.clone(),
+                id: "session-history-opencode-invalid".to_string(),
+                model_id: "anthropic/claude-sonnet-4-5".to_string(),
+                model_source: "launch".to_string(),
+                native_session_id: "019f0cd7-1347-7273-b20f-e959c3772a01".to_string(),
+                observed_at_ms: Some(4000),
+                pane_id: "pane-opencode".to_string(),
+                provider: "opencode".to_string(),
+                provider_session_id: "019f0cd7-1347-7273-b20f-e959c3772a01".to_string(),
+                slot_key: "slot-opencode".to_string(),
+                source: "terminal-open".to_string(),
+                status: "starting".to_string(),
+                terminal_index: Some(4),
+                terminal_instance_id: Some(44),
+                thread_id: "thread-opencode".to_string(),
+                title: "Mia".to_string(),
+                workspace_id: "workspace-session-history".to_string(),
+                workspace_name: "Session History".to_string(),
+            },
+        )
+        .expect("reject invalid opencode session history");
+        assert!(!invalid_opencode);
+        let result =
+            workspace_agent_session_history_list_blocking(WorkspaceAgentSessionHistoryListRequest {
+                limit: Some(50),
+                root_directory: Some(root_text.clone()),
+                workspace_id: "workspace-session-history".to_string(),
+            })
+            .expect("list after invalid opencode session history");
+        assert_eq!(result.items.len(), 1);
+        assert_eq!(result.items[0].id, "session-history-1");
 
         let _ = fs::remove_dir_all(root);
     }

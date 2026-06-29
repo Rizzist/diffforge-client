@@ -131,3 +131,21 @@ test("codex native session id parser accepts session metadata output", () => {
     "codexSessionId_12345678",
   );
 });
+
+test("opencode native session parser only accepts native ses ids", () => {
+  assert.equal(
+    extractNativeSessionIdFromOutput(
+      "opencode",
+      "opencode --session ses_0f32849b3ffeGn2tL6DnSIUCsZ",
+    ),
+    "ses_0f32849b3ffeGn2tL6DnSIUCsZ",
+  );
+
+  assert.equal(
+    extractNativeSessionIdFromOutput(
+      "opencode",
+      "opencode --session 019f0cd7-1347-7273-b20f-e959c3772a01",
+    ),
+    "",
+  );
+});

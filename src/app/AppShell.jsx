@@ -19541,7 +19541,7 @@ export default function App() {
   const [workspaceGitPullPrompt, setWorkspaceGitPullPrompt] = useState(WORKSPACE_GIT_PULL_PROMPT_INITIAL_STATE);
   const [workspaceGitRepositoryPreloads, setWorkspaceGitRepositoryPreloads] = useState({});
   const [workspaceGitSnapshotPreloads, setWorkspaceGitSnapshotPreloads] = useState({});
-  const [workspaceToolPaneMode, setWorkspaceToolPaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
+  const [workspaceToolPaneMode, setWorkspaceToolPaneMode] = useState(TODO_QUEUE_PANE_MODE_MINIMIZED);
   const [workspaceToolLayoutWidth, setWorkspaceToolLayoutWidth] = useState(0);
   const [workspaceToolRuntimeBridges, setWorkspaceToolRuntimeBridges] = useState({});
   const [pendingWorkspaceDocumentPanelOpen, setPendingWorkspaceDocumentPanelOpen] = useState(null);
@@ -31445,12 +31445,13 @@ export default function App() {
       : "No workspace selected.";
   const workspaceToolPaneHasWidth = workspaceToolLayoutWidth === 0
     || workspaceToolLayoutWidth >= WORKSPACE_TOOL_VISIBLE_MIN_WIDTH;
+  const settingsViewVisible = visibleView === "settings";
+  const globalToolsViewVisible = GLOBAL_TOOLS_VIEWS.has(visibleView);
   const workspaceToolPaneAvailable = Boolean(
     selectedWorkspace
-      && visibleView === DEFAULT_WORKSPACE_VIEW
       && !shouldShowWorkspaceSetup,
   );
-  const workspaceToolPaneVisible = workspaceToolPaneAvailable && workspaceToolPaneHasWidth;
+  const workspaceToolPaneVisible = workspaceToolPaneAvailable;
   const workspaceToolPaneMinimized = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
   const workspaceToolPaneFullscreen = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
   const workspaceToolMinimizedSize = workspaceToolLayoutWidth > 0
@@ -31975,8 +31976,8 @@ export default function App() {
   }, [authState]);
 
   useEffect(() => {
-    if (!workspaceToolPaneHasWidth && workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN) {
-      setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
+    if (!workspaceToolPaneHasWidth && workspaceToolPaneMode !== TODO_QUEUE_PANE_MODE_MINIMIZED) {
+      setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_MINIMIZED);
     }
   }, [workspaceToolPaneHasWidth, workspaceToolPaneMode]);
 
@@ -42736,6 +42737,12 @@ export default function App() {
             threadId: request.threadId || "",
           });
 
+          const requestedStartProviderSessionId = String(request.providerSessionId || "").trim();
+          const startedProviderSessionId = String(request.provider || "").trim().toLowerCase() === "opencode"
+            && requestedStartProviderSessionId
+            && !requestedStartProviderSessionId.startsWith("ses_")
+            ? ""
+            : requestedStartProviderSessionId;
           const terminalLifecycleEvent = {
             activityStatus: "idle",
             agentId: request.provider,
@@ -42746,11 +42753,11 @@ export default function App() {
             instanceId: paneResult.instanceId,
             model: startedModel,
             modelSource: startedModelSource,
-            nativeSessionId: request.providerSessionId || "",
-            nativeSessionKind: request.providerSessionId ? "session" : "",
-            nativeSessionSource: request.providerSessionId ? "session-restore" : "",
+            nativeSessionId: startedProviderSessionId,
+            nativeSessionKind: startedProviderSessionId ? "session" : "",
+            nativeSessionSource: startedProviderSessionId ? "session-restore" : "",
             paneId: paneResult.paneId,
-            providerSessionId: request.providerSessionId || "",
+            providerSessionId: startedProviderSessionId,
             status: "active",
             statusTruth: "complete",
             terminalIndex: request.terminalIndex,
@@ -44450,8 +44457,11 @@ export default function App() {
                   aria-hidden={visibleView === DEFAULT_WORKSPACE_VIEW}
                   data-visible={visibleView !== DEFAULT_WORKSPACE_VIEW}
                 >
-              {visibleView === "settings" ? (
-                <SettingsPage data-motion={viewMotion}>
+                  <WorkspaceRuntimeLayer
+                    aria-hidden={!settingsViewVisible}
+                    data-visible={settingsViewVisible}
+                  >
+                <SettingsPage data-motion={settingsViewVisible ? viewMotion : "entered"}>
                   <SettingsTabNav aria-label="Settings sections">
                     <SettingsTabButton
                       data-active={settingsTab === SETTINGS_TAB_GENERAL ? "true" : undefined}
@@ -45249,6 +45259,49 @@ export default function App() {
                     </AccountSettingsPanel>
                   )}
                 </SettingsPage>
+                  </WorkspaceRuntimeLayer>
+                  <WorkspaceRuntimeLayer
+                    aria-hidden={!globalToolsViewVisible}
+                    data-visible={globalToolsViewVisible}
+                  >
+                    <ForgeWorkspace
+                      aria-label="Global toolkit"
+                      data-motion={globalToolsViewVisible ? viewMotion : "entered"}
+                    >
+                      <ToolsWorkspaceView
+                        architectures={{
+                          catalog: architectureHub.catalog,
+                          catalogError: architectureHub.error,
+                          catalogState: architectureHub.state,
+                          graphLists: architectureHubGraphLists,
+                          hydration: architectureHubHydration,
+                          onCopyGraph: copyArchitectureHubGraph,
+                          onGraphListRefresh: refreshArchitectureHubGraphList,
+                          onRefreshCatalog: refreshArchitectureHubCatalog,
+                          onSelectionChange: updateArchitectureHubSelection,
+                          resolveRepoSyncContext: resolveArchitectureHubSyncContext,
+                          selectedGraphId: architectureHubGraphState.architectureSelectedGraphId,
+                          selectedRepoPath: architectureHubGraphState.architectureSelectedRepoPath,
+                          workspaceDispatchTargets: workspaceTerminalDispatchTargets,
+                        }}
+                        defaultWorkingDirectory={defaultWorkingDirectory}
+                        initialSection={globalToolsViewVisible ? visibleView : "tools"}
+                        onAppControlContextChange={handleAppControlContextChange}
+                        onAppControlDocumentActions={registerAppControlDocumentActions}
+                        onAppControlScriptActions={registerAppControlScriptActions}
+                        onLocalScriptsChanged={refreshAppScripts}
+                        rightToolsOrchestratorOpen={
+                          globalToolsViewVisible && workspaceToolPaneVisible && !workspaceToolPaneMinimized
+                        }
+                        scriptLogFocusRequest={appScriptLogFocusRequest}
+                        sharedScriptRunResults={appScriptRunResults}
+                        surfaceActive={globalToolsViewVisible}
+                        workspaces={assetWorkspaceOptions}
+                      />
+                    </ForgeWorkspace>
+                  </WorkspaceRuntimeLayer>
+              {settingsViewVisible || globalToolsViewVisible ? (
+                null
               ) : visibleView === "files" ? (
                 <ForgeWorkspace aria-label="Workspace files" data-motion={viewMotion} data-surface="files">
                   {shouldShowWorkspaceSetup ? (
@@ -45322,36 +45375,6 @@ export default function App() {
                   ) : (
                     <WorkspaceIdleState detail="Select a workspace to view task history." viewMotion={viewMotion} />
                   )}
-                </ForgeWorkspace>
-              ) : GLOBAL_TOOLS_VIEWS.has(visibleView) ? (
-                <ForgeWorkspace aria-label="Global toolkit" data-motion={viewMotion}>
-                  <ToolsWorkspaceView
-                    architectures={{
-                      catalog: architectureHub.catalog,
-                      catalogError: architectureHub.error,
-                      catalogState: architectureHub.state,
-                      graphLists: architectureHubGraphLists,
-                      hydration: architectureHubHydration,
-                      onCopyGraph: copyArchitectureHubGraph,
-                      onGraphListRefresh: refreshArchitectureHubGraphList,
-                      onRefreshCatalog: refreshArchitectureHubCatalog,
-                      onSelectionChange: updateArchitectureHubSelection,
-                      resolveRepoSyncContext: resolveArchitectureHubSyncContext,
-                      selectedGraphId: architectureHubGraphState.architectureSelectedGraphId,
-                      selectedRepoPath: architectureHubGraphState.architectureSelectedRepoPath,
-                      workspaceDispatchTargets: workspaceTerminalDispatchTargets,
-                    }}
-                    defaultWorkingDirectory={defaultWorkingDirectory}
-                    initialSection={GLOBAL_TOOLS_VIEWS.has(visibleView) ? visibleView : "tools"}
-                    onAppControlContextChange={handleAppControlContextChange}
-                    onAppControlDocumentActions={registerAppControlDocumentActions}
-                    onAppControlScriptActions={registerAppControlScriptActions}
-                    onLocalScriptsChanged={refreshAppScripts}
-                    rightToolsOrchestratorOpen={workspaceToolPaneVisible && !workspaceToolPaneMinimized}
-                    scriptLogFocusRequest={appScriptLogFocusRequest}
-                    sharedScriptRunResults={appScriptRunResults}
-                    workspaces={assetWorkspaceOptions}
-                  />
                 </ForgeWorkspace>
               ) : visibleView === "devices" ? (
                 <ForgeWorkspace aria-label="Account Devices" data-motion={viewMotion}>
@@ -45625,10 +45648,10 @@ export default function App() {
                           {shouldRenderAccountToolPanel ? (
                             <>
                               {workspaceToolPaneMinimized ? (
-                                <WorkspaceAppToolMinimizedRail aria-label="App docs minimized">
+                                <WorkspaceAppToolMinimizedRail aria-label="App tools minimized">
                                   <WorkspaceAppToolRailControls>
                                     <WorkspaceAppToolRailButton
-                                      aria-label="Unminimize app docs"
+                                      aria-label="Unminimize app tools"
                                       onClick={restoreWorkspaceToolPane}
                                       title="Unminimize"
                                       type="button"
@@ -45636,7 +45659,7 @@ export default function App() {
                                       <TitleRestoreIcon aria-hidden="true" />
                                     </WorkspaceAppToolRailButton>
                                   </WorkspaceAppToolRailControls>
-                                  <WorkspaceAppToolRailLabel>Docs</WorkspaceAppToolRailLabel>
+                                  <WorkspaceAppToolRailLabel>Tools</WorkspaceAppToolRailLabel>
                                 </WorkspaceAppToolMinimizedRail>
                               ) : null}
                               <div

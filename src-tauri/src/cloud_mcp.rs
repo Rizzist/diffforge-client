@@ -153,8 +153,8 @@ const CLOUD_MCP_TOKENOMICS_DAY_SYNC_STATE_TABLE: &str = "tokenomics_v2_day_sync_
 const CLOUD_MCP_TOKENOMICS_DAY_MS: i64 = 86_400_000;
 const CLOUD_MCP_TOKENOMICS_SYNC_LOOKBACK_DAYS: i64 = 30;
 const CLOUD_MCP_TOKENOMICS_CONTRACT: &str = "diffforge.tokenomics.v3";
-const CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL: &str = "tokenomics.device.v3";
-const CLOUD_MCP_TOKENOMICS_SYNC_SCHEMA_VERSION: u64 = 3;
+const CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL: &str = "tokenomics.device.graph_facts.v1";
+const CLOUD_MCP_TOKENOMICS_SYNC_SCHEMA_VERSION: u64 = 4;
 const CLOUD_MCP_TOKENOMICS_DELTA_AVAILABLE_EVENT: &str = "tokenomics_delta_available";
 const CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT: &str = "tokenomics_device_delta";
 const CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT: &str = "tokenomics_device_snapshot";
@@ -2665,10 +2665,10 @@ fn cloud_mcp_tokenomics_day_sync_decision(
     billing_scope_key: &str,
     day_start_ms: i64,
     content_hash: &str,
-    force_resync: bool,
+    force_send: bool,
 ) -> Result<CloudMcpTokenomicsDaySyncDecision, String> {
     let conn = cloud_mcp_open_outbox_conn()?;
-    if force_resync {
+    if force_send {
         return Ok(CloudMcpTokenomicsDaySyncDecision::Enqueue);
     }
     let state = cloud_mcp_tokenomics_day_sync_state_from_conn(
@@ -2809,7 +2809,7 @@ fn cloud_mcp_tokenomics_day_packet_idempotency_key(
     day_key: &str,
     content_hash: &str,
 ) -> String {
-    format!("tokenomics:v3:{billing_scope_key}:{device_id}:day:{day_key}:{content_hash}")
+    format!("tokenomics:v4:{billing_scope_key}:{device_id}:day:{day_key}:{content_hash}")
 }
 
 fn cloud_mcp_tokenomics_mark_day_acked_from_payload(
@@ -6999,6 +6999,17 @@ fn cloud_mcp_tokenomics_timestamp_ms(value: &str) -> Option<i64> {
     )
 }
 
+fn cloud_mcp_tokenomics_numeric_timestamp_ms(value: i64) -> Option<i64> {
+    if value <= 0 {
+        return None;
+    }
+    if value < 1_000_000_000_000 {
+        value.checked_mul(1000)
+    } else {
+        Some(value)
+    }
+}
+
 fn cloud_mcp_tokenomics_bucket_start_ms(row: &Value) -> Option<i64> {
     cloud_mcp_payload_i64(row, &["bucket_start_ms", "bucketStartMs"]).or_else(|| {
         cloud_mcp_payload_text(row, &["bucket_start", "bucketStart"])
@@ -7024,21 +7035,6 @@ fn cloud_mcp_tokenomics_summary_array(summary: &Value, keys: &[&str]) -> Vec<Val
         .find_map(|key| summary.get(*key).and_then(Value::as_array))
         .map(|rows| rows.to_vec())
         .unwrap_or_default()
-}
-
-fn cloud_mcp_tokenomics_sorted_values(values: &[Value]) -> Vec<Value> {
-    let mut keyed = values
-        .iter()
-        .cloned()
-        .map(|value| {
-            (
-                cloud_mcp_outbox_payload_hash(&cloud_mcp_tokenomics_stable_hash_value(&value)),
-                value,
-            )
-        })
-        .collect::<Vec<_>>();
-    keyed.sort_by(|left, right| left.0.cmp(&right.0));
-    keyed.into_iter().map(|(_, value)| value).collect()
 }
 
 fn cloud_mcp_tokenomics_stable_hash_value(value: &Value) -> Value {
@@ -7100,21 +7096,34 @@ fn cloud_mcp_tokenomics_stable_hash_value(value: &Value) -> Value {
 
 fn cloud_mcp_tokenomics_day_content_hash(
     hourly_rows: &[Value],
-    provider_accounts: &[Value],
     limits: &[Value],
     latest_windows: &[Value],
     limit_samples: &[Value],
-    device_aliases: &Value,
 ) -> String {
     let hourly_summary = json!({ "hourly": hourly_rows });
-    let hourly_groups = cloud_mcp_tokenomics_hourly_groups(&hourly_summary, 0);
+    let account_summary = json!({
+        "limits": limits,
+        "latest_windows": latest_windows,
+    });
+    let limit_sample_summary = json!({ "limit_samples": limit_samples });
     cloud_mcp_outbox_payload_hash(&cloud_mcp_tokenomics_stable_hash_value(&json!({
-        "hourly_groups": cloud_mcp_tokenomics_sorted_values(&hourly_groups),
-        "provider_accounts": cloud_mcp_tokenomics_sorted_values(provider_accounts),
-        "limits": cloud_mcp_tokenomics_sorted_values(limits),
-        "latest_windows": cloud_mcp_tokenomics_sorted_values(latest_windows),
-        "limit_samples": cloud_mcp_tokenomics_sorted_values(limit_samples),
-        "device_aliases": device_aliases,
+        "device_day_usage": cloud_mcp_tokenomics_device_day_usage(
+            &hourly_summary,
+            "",
+            0,
+            "",
+            "",
+            0,
+        ),
+        "account_usage_snapshot": cloud_mcp_tokenomics_account_usage_snapshot(&account_summary, 0),
+        "limit_sample_day": cloud_mcp_tokenomics_limit_sample_day(
+            &limit_sample_summary,
+            "",
+            0,
+            "",
+            "",
+            0,
+        ),
     })))
 }
 
@@ -7134,6 +7143,24 @@ fn cloud_mcp_tokenomics_limit_sample_ms(row: &Value, fallback_ms: u64) -> Option
             "updatedAtMs",
         ],
     )
+    .or_else(|| {
+        cloud_mcp_payload_i64(
+            row,
+            &[
+                "sample_at_unix",
+                "sampleAtUnix",
+                "sample_observed_at_unix",
+                "sampleObservedAtUnix",
+                "limit_observed_at_unix",
+                "limitObservedAtUnix",
+                "observed_at_unix",
+                "observedAtUnix",
+                "updated_at_unix",
+                "updatedAtUnix",
+            ],
+        )
+        .and_then(cloud_mcp_tokenomics_numeric_timestamp_ms)
+    })
     .or_else(|| {
         cloud_mcp_payload_text(
             row,
@@ -7182,14 +7209,6 @@ fn cloud_mcp_tokenomics_day_buckets(
         rows_by_day.entry(day_start_ms).or_default().push(row);
     }
 
-    let provider_accounts =
-        cloud_mcp_tokenomics_summary_array(summary, &["provider_accounts", "providerAccounts"])
-            .into_iter()
-            .filter(|row| {
-                let key = cloud_mcp_tokenomics_provider_account_key(row);
-                !cloud_mcp_tokenomics_provider_account_key_is_unknown(&key)
-            })
-            .collect::<Vec<_>>();
     let limits = cloud_mcp_tokenomics_summary_array(summary, &["limits"])
         .into_iter()
         .filter(|row| {
@@ -7223,17 +7242,8 @@ fn cloud_mcp_tokenomics_day_buckets(
             .or_default()
             .push(row);
     }
-    let device_aliases = summary
-        .get("device_aliases")
-        .or_else(|| summary.get("deviceAliases"))
-        .cloned()
-        .unwrap_or_else(|| json!([]));
-
     if rows_by_day.is_empty()
-        && (!limits.is_empty()
-            || !latest_windows.is_empty()
-            || !provider_accounts.is_empty()
-            || !limit_samples_by_day.is_empty())
+        && (!limits.is_empty() || !latest_windows.is_empty() || !limit_samples_by_day.is_empty())
     {
         rows_by_day.entry(current_day_start).or_default();
     }
@@ -7249,25 +7259,6 @@ fn cloud_mcp_tokenomics_day_buckets(
             hourly_rows.sort_by(|left, right| {
                 cloud_mcp_outbox_payload_hash(left).cmp(&cloud_mcp_outbox_payload_hash(right))
             });
-            let account_keys = hourly_rows
-                .iter()
-                .map(cloud_mcp_tokenomics_provider_account_key)
-                .collect::<HashSet<_>>();
-            let provider_accounts_for_day = if account_keys.is_empty() {
-                if day_start_ms == current_day_start {
-                    provider_accounts.clone()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                provider_accounts
-                    .iter()
-                    .filter(|row| {
-                        account_keys.contains(&cloud_mcp_tokenomics_provider_account_key(row))
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            };
             let limits_for_day = if day_start_ms == current_day_start {
                 limits.clone()
             } else {
@@ -7283,11 +7274,9 @@ fn cloud_mcp_tokenomics_day_buckets(
                 .unwrap_or_default();
             let content_hash = cloud_mcp_tokenomics_day_content_hash(
                 &hourly_rows,
-                &provider_accounts_for_day,
                 &limits_for_day,
                 &latest_windows_for_day,
                 &limit_samples_for_day,
-                &device_aliases,
             );
             let day_key = cloud_mcp_tokenomics_day_key(day_start_ms);
             let mut object = serde_json::Map::new();
@@ -7295,9 +7284,9 @@ fn cloud_mcp_tokenomics_day_buckets(
                 "known".to_string(),
                 json!(
                     !hourly_rows.is_empty()
-                        || !provider_accounts_for_day.is_empty()
                         || !limits_for_day.is_empty()
                         || !latest_windows_for_day.is_empty()
+                        || !limit_samples_for_day.is_empty()
                 ),
             );
             object.insert(
@@ -7317,22 +7306,17 @@ fn cloud_mcp_tokenomics_day_buckets(
             }
             object.insert("hourly_count".to_string(), json!(hourly_rows.len()));
             object.insert(
-                "provider_account_count".to_string(),
-                json!(provider_accounts_for_day.len()),
-            );
-            object.insert(
                 "latest_window_count".to_string(),
                 json!(latest_windows_for_day.len()),
             );
-            object.insert("hourly".to_string(), json!(hourly_rows));
             object.insert(
-                "provider_accounts".to_string(),
-                json!(provider_accounts_for_day),
+                "limit_sample_count".to_string(),
+                json!(limit_samples_for_day.len()),
             );
+            object.insert("hourly".to_string(), json!(hourly_rows));
             object.insert("latest_windows".to_string(), json!(latest_windows_for_day));
             object.insert("limit_samples".to_string(), json!(limit_samples_for_day));
             object.insert("limits".to_string(), json!(limits_for_day));
-            object.insert("device_aliases".to_string(), device_aliases.clone());
             CloudMcpTokenomicsDayBucket {
                 day_start_ms,
                 day_key,
@@ -7351,10 +7335,24 @@ fn cloud_mcp_tokenomics_observed_ms(row: &Value, fallback_ms: u64) -> i64 {
             "observedAtMs",
             "updated_at_ms",
             "updatedAtMs",
-            "sample_at_unix",
-            "sampleAtUnix",
+            "sample_at_ms",
+            "sampleAtMs",
         ],
     )
+    .or_else(|| {
+        cloud_mcp_payload_i64(
+            row,
+            &[
+            "sample_at_unix",
+            "sampleAtUnix",
+                "observed_at_unix",
+                "observedAtUnix",
+                "updated_at_unix",
+                "updatedAtUnix",
+            ],
+        )
+        .and_then(cloud_mcp_tokenomics_numeric_timestamp_ms)
+    })
     .or_else(|| {
         cloud_mcp_payload_text(
             row,
@@ -7372,6 +7370,346 @@ fn cloud_mcp_tokenomics_observed_ms(row: &Value, fallback_ms: u64) -> i64 {
         .and_then(|value| cloud_mcp_tokenomics_timestamp_ms(&value))
     })
     .unwrap_or(fallback_ms.min(i64::MAX as u64) as i64)
+}
+
+fn cloud_mcp_tokenomics_present_value(row: &Value, keys: &[&str]) -> Option<Value> {
+    keys.iter().find_map(|key| {
+        row.get(*key)
+            .filter(|value| match value {
+                Value::String(text) => !text.trim().is_empty(),
+                _ => !value.is_null(),
+            })
+            .cloned()
+    })
+}
+
+fn cloud_mcp_tokenomics_insert_present(
+    object: &mut serde_json::Map<String, Value>,
+    compact_key: &str,
+    row: &Value,
+    keys: &[&str],
+) {
+    if let Some(value) = cloud_mcp_tokenomics_present_value(row, keys) {
+        object.insert(compact_key.to_string(), value);
+    }
+}
+
+fn cloud_mcp_tokenomics_limit_window_snapshot(
+    row: &Value,
+    window_kind: &str,
+    reset_at_ms: i64,
+    now_ms: u64,
+) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert("wk".to_string(), json!(window_kind));
+    object.insert(
+        "up".to_string(),
+        row.get("used_percent")
+            .or_else(|| row.get("usedPercent"))
+            .or_else(|| row.get("limit_used_percent"))
+            .or_else(|| row.get("limitUsedPercent"))
+            .or_else(|| row.get("used"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "rp".to_string(),
+        row.get("remaining_percent")
+            .or_else(|| row.get("remainingPercent"))
+            .or_else(|| row.get("remaining"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    object.insert("ram".to_string(), json!(reset_at_ms));
+    object.insert(
+        "o".to_string(),
+        json!(cloud_mcp_tokenomics_observed_ms(row, now_ms)),
+    );
+    object.insert(
+        "src".to_string(),
+        json!(
+            cloud_mcp_payload_text(row, &["source", "limit_source", "limitSource"])
+                .unwrap_or_else(|| "provider_usage_api".to_string())
+        ),
+    );
+    object.insert(
+        "cf".to_string(),
+        json!(
+            cloud_mcp_payload_text(row, &["confidence", "pace_confidence", "paceConfidence"])
+                .unwrap_or_else(|| "live".to_string())
+        ),
+    );
+    object.insert(
+        "act".to_string(),
+        row.get("active_provider_account")
+            .or_else(|| row.get("activeProviderAccount"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "pwk",
+        row,
+        &["provider_window_kind", "providerWindowKind"],
+    );
+    cloud_mcp_tokenomics_insert_present(&mut object, "lb", row, &["label"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "pd", row, &["plan_detected", "planDetected"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "pn", row, &["plan_name", "planName"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "ps", row, &["plan_source", "planSource"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "ls", row, &["limit_source", "limitSource"]);
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "lsk",
+        row,
+        &["limit_source_kind", "limitSourceKind"],
+    );
+    cloud_mcp_tokenomics_insert_present(&mut object, "u", row, &["used"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "al", row, &["allowance"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "au", row, &["allowance_unit", "allowanceUnit"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "rem", row, &["remaining"]);
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "dp",
+        row,
+        &["display_percent", "displayPercent", "limit_display_percent", "limitDisplayPercent"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "dpk",
+        row,
+        &[
+            "display_percent_kind",
+            "displayPercentKind",
+            "limit_display_percent_kind",
+            "limitDisplayPercentKind",
+        ],
+    );
+    cloud_mcp_tokenomics_insert_present(&mut object, "sl", row, &["status_label", "statusLabel"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "rl", row, &["reset_label", "resetLabel"]);
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "ra",
+        row,
+        &["reset_at", "resetAt", "limit_resets_at", "limitResetsAt"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "ras",
+        row,
+        &["reset_after_seconds", "resetAfterSeconds"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "lws",
+        row,
+        &["limit_window_seconds", "limitWindowSeconds"],
+    );
+    cloud_mcp_tokenomics_insert_present(&mut object, "ce", row, &["client_estimated", "clientEstimated"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "lr", row, &["limit_reached", "limitReached"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "aw", row, &["allowed"]);
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "prp",
+        row,
+        &["provider_reported_percent", "providerReportedPercent"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "prd",
+        row,
+        &["provider_reported_direction", "providerReportedDirection"],
+    );
+    cloud_mcp_tokenomics_insert_present(&mut object, "ap", row, &["agent_profile_id", "agentProfileId"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "uat", row, &["updated_at", "updatedAt"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "lka", row, &["last_known_at", "lastKnownAt"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "rpnts", row, &["rate_points", "ratePoints"]);
+
+    cloud_mcp_tokenomics_insert_present(&mut object, "pst", row, &["pace_status", "paceStatus"]);
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "pdp",
+        row,
+        &["pace_delta_percent", "paceDeltaPercent"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "pebr",
+        row,
+        &["pace_exhausts_before_reset", "paceExhaustsBeforeReset"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "peup",
+        row,
+        &["pace_expected_used_percent", "paceExpectedUsedPercent"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "pwep",
+        row,
+        &["pace_window_elapsed_percent", "paceWindowElapsedPercent"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "ppup",
+        row,
+        &["pace_projected_used_percent", "paceProjectedUsedPercent"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "ppes",
+        row,
+        &["pace_projected_exhaustion_seconds", "paceProjectedExhaustionSeconds"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "ppea",
+        row,
+        &["pace_projected_exhaustion_at", "paceProjectedExhaustionAt"],
+    );
+    cloud_mcp_tokenomics_insert_present(&mut object, "prs", row, &["pace_reset_at", "paceResetAt"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "pstr", row, &["pace_strategy", "paceStrategy"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "pcf", row, &["pace_confidence", "paceConfidence"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "psc", row, &["pace_sample_count", "paceSampleCount"]);
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "psw",
+        row,
+        &["pace_sample_window_seconds", "paceSampleWindowSeconds"],
+    );
+    cloud_mcp_tokenomics_insert_present(&mut object, "pla", row, &["pace_last_sample_at", "paceLastSampleAt"]);
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "plup",
+        row,
+        &["pace_last_sample_used_percent", "paceLastSampleUsedPercent"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "pts",
+        row,
+        &["pace_trajectory_status", "paceTrajectoryStatus"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "ptdp",
+        row,
+        &["pace_trajectory_delta_percent", "paceTrajectoryDeltaPercent"],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "ptpup",
+        row,
+        &[
+            "pace_trajectory_projected_used_percent",
+            "paceTrajectoryProjectedUsedPercent",
+        ],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "ptpes",
+        row,
+        &[
+            "pace_trajectory_projected_exhaustion_seconds",
+            "paceTrajectoryProjectedExhaustionSeconds",
+        ],
+    );
+    cloud_mcp_tokenomics_insert_present(
+        &mut object,
+        "ptpea",
+        row,
+        &[
+            "pace_trajectory_projected_exhaustion_at",
+            "paceTrajectoryProjectedExhaustionAt",
+        ],
+    );
+
+    Value::Object(object)
+}
+
+fn cloud_mcp_tokenomics_limit_sample_snapshot(sample: &Value) -> Value {
+    let mut object = serde_json::Map::new();
+    object.insert(
+        "a".to_string(),
+        json!(cloud_mcp_tokenomics_provider_account_key(sample)),
+    );
+    object.insert(
+        "p".to_string(),
+        json!(
+            cloud_mcp_payload_text(sample, &["provider"])
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+    );
+    object.insert(
+        "g".to_string(),
+        json!(
+            cloud_mcp_payload_text(sample, &["agent_kind", "agentKind"])
+                .unwrap_or_else(|| "unknown".to_string())
+        ),
+    );
+    object.insert(
+        "wk".to_string(),
+        json!(
+            cloud_mcp_payload_text(sample, &["window", "window_kind", "windowKind", "limit_kind", "limitKind"])
+                .unwrap_or_else(|| "session_5h".to_string())
+        ),
+    );
+    object.insert(
+        "sbm".to_string(),
+        json!(
+            cloud_mcp_payload_i64(sample, &["sample_bucket_start_ms", "sampleBucketStartMs"])
+                .unwrap_or(0)
+        ),
+    );
+    object.insert(
+        "up".to_string(),
+        sample
+            .get("used_percent")
+            .or_else(|| sample.get("usedPercent"))
+            .or_else(|| sample.get("used"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "rp".to_string(),
+        sample
+            .get("remaining_percent")
+            .or_else(|| sample.get("remainingPercent"))
+            .or_else(|| sample.get("remaining"))
+            .cloned()
+            .unwrap_or(Value::Null),
+    );
+    object.insert(
+        "ram".to_string(),
+        json!(cloud_mcp_payload_i64(sample, &["reset_at_ms", "resetAtMs"]).unwrap_or(0)),
+    );
+    object.insert(
+        "o".to_string(),
+        json!(cloud_mcp_payload_i64(sample, &["observed_at_ms", "observedAtMs"]).unwrap_or(0)),
+    );
+    object.insert(
+        "src".to_string(),
+        json!(
+            cloud_mcp_payload_text(sample, &["source", "limit_source", "limitSource"])
+                .unwrap_or_else(|| "provider_usage_api".to_string())
+        ),
+    );
+    object.insert(
+        "cf".to_string(),
+        json!(
+            cloud_mcp_payload_text(sample, &["confidence", "pace_confidence", "paceConfidence"])
+                .unwrap_or_else(|| "sampled".to_string())
+        ),
+    );
+    cloud_mcp_tokenomics_insert_present(&mut object, "l", sample, &["provider_account_label", "providerAccountLabel", "label"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "ras", sample, &["reset_after_seconds", "resetAfterSeconds"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "lws", sample, &["limit_window_seconds", "limitWindowSeconds"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "pst", sample, &["pace_status", "paceStatus"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "pdp", sample, &["pace_delta_percent", "paceDeltaPercent"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "sat", sample, &["sample_at", "sampleAt"]);
+    cloud_mcp_tokenomics_insert_present(&mut object, "sau", sample, &["sample_at_unix", "sampleAtUnix"]);
+    Value::Object(object)
 }
 
 fn cloud_mcp_tokenomics_provider_account_key(row: &Value) -> String {
@@ -7574,20 +7912,26 @@ fn cloud_mcp_tokenomics_hourly_groups(summary: &Value, now_ms: u64) -> Vec<Value
             .unwrap_or(0)
             .max(0);
             let provider_account_key = cloud_mcp_tokenomics_provider_account_key(row);
-            if cloud_mcp_tokenomics_provider_account_key_is_unknown(&provider_account_key) {
-                continue;
-            }
-            let model = cloud_mcp_payload_text(row, &["model"]).unwrap_or_default();
-            let attribution = "token_based";
-            let row_key =
-                [provider_account_key.as_str(), model.as_str(), attribution].join("\u{1f}");
-            let rows_by_identity = grouped.entry(bucket_start_ms).or_default();
-            let aggregate = rows_by_identity.entry(row_key).or_insert_with(|| {
-                json!({
-                    "provider_account_key": provider_account_key,
-                    "provider": provider,
-                    "agent_kind": agent_kind,
-                    "model": model,
+              if cloud_mcp_tokenomics_provider_account_key_is_unknown(&provider_account_key) {
+                  continue;
+              }
+              let model = cloud_mcp_payload_text(row, &["model"]).unwrap_or_default();
+              let provider_account_label = cloud_mcp_payload_text(
+                  row,
+                  &["provider_account_label", "providerAccountLabel", "label"],
+              )
+              .unwrap_or_default();
+              let attribution = "token_based";
+              let row_key =
+                  [provider_account_key.as_str(), model.as_str(), attribution].join("\u{1f}");
+              let rows_by_identity = grouped.entry(bucket_start_ms).or_default();
+              let aggregate = rows_by_identity.entry(row_key).or_insert_with(|| {
+                  json!({
+                      "provider_account_key": provider_account_key,
+                      "provider_account_label": provider_account_label,
+                      "provider": provider,
+                      "agent_kind": agent_kind,
+                      "model": model,
                     "input": 0,
                     "output": 0,
                     "cache_read": 0,
@@ -7650,55 +7994,6 @@ fn cloud_mcp_tokenomics_hourly_groups(summary: &Value, now_ms: u64) -> Vec<Value
         .collect()
 }
 
-fn cloud_mcp_tokenomics_windows(summary: &Value, now_ms: u64) -> Vec<Value> {
-    let mut windows = Vec::new();
-    if let Some(rows) = summary.get("limits").and_then(Value::as_array) {
-        for row in rows {
-            let window = cloud_mcp_payload_text(
-                row,
-                &["window_kind", "windowKind", "limit_kind", "limitKind"],
-            )
-            .unwrap_or_else(|| "session_5h".to_string());
-            if window != "5_hour" && window != "session_5h" && window != "weekly" {
-                continue;
-            }
-            let normalized_window = if window == "5_hour" {
-                "session_5h"
-            } else {
-                window.as_str()
-            };
-            let provider_account_key = cloud_mcp_tokenomics_provider_account_key(row);
-            if cloud_mcp_tokenomics_provider_account_key_is_unknown(&provider_account_key) {
-                continue;
-            }
-            let reset_at_ms = cloud_mcp_payload_i64(row, &["reset_at_ms", "resetAtMs"])
-                .or_else(|| {
-                    cloud_mcp_payload_text(
-                        row,
-                        &["reset_at", "resetAt", "limit_resets_at", "limitResetsAt"],
-                    )
-                    .and_then(|value| cloud_mcp_tokenomics_timestamp_ms(&value))
-                })
-                .unwrap_or(0);
-            windows.push(json!({
-                "provider_account_key": provider_account_key,
-                "provider": cloud_mcp_payload_text(row, &["provider"]).unwrap_or_else(|| "unknown".to_string()),
-                "agent_kind": cloud_mcp_payload_text(row, &["agent_kind", "agentKind"]).unwrap_or_else(|| "unknown".to_string()),
-                "window": normalized_window,
-                "used_percent": row.get("used_percent").or_else(|| row.get("usedPercent")).or_else(|| row.get("limit_used_percent")).or_else(|| row.get("limitUsedPercent")).cloned().unwrap_or(Value::Null),
-                "remaining_percent": row.get("remaining_percent").or_else(|| row.get("remainingPercent")).cloned().unwrap_or(Value::Null),
-                "reset_at_ms": reset_at_ms,
-                "resetAtMs": reset_at_ms,
-                "observed_at_ms": cloud_mcp_tokenomics_observed_ms(row, now_ms),
-                "observedAtMs": cloud_mcp_tokenomics_observed_ms(row, now_ms),
-                "source": cloud_mcp_payload_text(row, &["limit_source", "limitSource", "source"]).unwrap_or_else(|| "provider_usage_api".to_string()),
-                "confidence": cloud_mcp_payload_text(row, &["confidence", "pace_confidence", "paceConfidence"]).unwrap_or_else(|| "live".to_string())
-            }));
-        }
-    }
-    windows
-}
-
 fn cloud_mcp_tokenomics_limit_samples(summary: &Value, now_ms: u64) -> Vec<Value> {
     let mut samples = Vec::new();
     for row in cloud_mcp_tokenomics_summary_array(summary, &["limit_samples", "limitSamples"]) {
@@ -7753,6 +8048,9 @@ fn cloud_mcp_tokenomics_limit_samples(summary: &Value, now_ms: u64) -> Vec<Value
             .and_then(|value| cloud_mcp_tokenomics_timestamp_ms(&value))
         })
         .unwrap_or_else(|| cloud_mcp_tokenomics_day_start_ms(observed_at_ms));
+        let sample_at_unix = cloud_mcp_payload_i64(&row, &["sample_at_unix", "sampleAtUnix"])
+            .or_else(|| Some(observed_at_ms / 1000));
+        let sample_at = cloud_mcp_payload_text(&row, &["sample_at", "sampleAt"]);
         samples.push(json!({
             "provider_account_key": provider_account_key,
             "provider_account_label": cloud_mcp_payload_text(&row, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
@@ -7763,15 +8061,269 @@ fn cloud_mcp_tokenomics_limit_samples(summary: &Value, now_ms: u64) -> Vec<Value
             "remaining_percent": row.get("remaining_percent").or_else(|| row.get("remainingPercent")).or_else(|| row.get("remaining")).cloned().unwrap_or(Value::Null),
             "reset_at_ms": reset_at_ms,
             "resetAtMs": reset_at_ms,
+            "reset_after_seconds": row.get("reset_after_seconds").or_else(|| row.get("resetAfterSeconds")).cloned().unwrap_or(Value::Null),
+            "resetAfterSeconds": row.get("reset_after_seconds").or_else(|| row.get("resetAfterSeconds")).cloned().unwrap_or(Value::Null),
+            "limit_window_seconds": row.get("limit_window_seconds").or_else(|| row.get("limitWindowSeconds")).cloned().unwrap_or(Value::Null),
+            "limitWindowSeconds": row.get("limit_window_seconds").or_else(|| row.get("limitWindowSeconds")).cloned().unwrap_or(Value::Null),
             "observed_at_ms": observed_at_ms,
             "observedAtMs": observed_at_ms,
+            "sample_at": sample_at.clone().unwrap_or_default(),
+            "sampleAt": sample_at.unwrap_or_default(),
+            "sample_at_unix": sample_at_unix,
+            "sampleAtUnix": sample_at_unix,
             "sample_bucket_start_ms": sample_bucket_start_ms,
             "sampleBucketStartMs": sample_bucket_start_ms,
+            "pace_status": row.get("pace_status").or_else(|| row.get("paceStatus")).cloned().unwrap_or(Value::Null),
+            "paceStatus": row.get("pace_status").or_else(|| row.get("paceStatus")).cloned().unwrap_or(Value::Null),
+            "pace_delta_percent": row.get("pace_delta_percent").or_else(|| row.get("paceDeltaPercent")).cloned().unwrap_or(Value::Null),
+            "paceDeltaPercent": row.get("pace_delta_percent").or_else(|| row.get("paceDeltaPercent")).cloned().unwrap_or(Value::Null),
             "source": cloud_mcp_payload_text(&row, &["limit_source", "limitSource", "source"]).unwrap_or_else(|| "provider_usage_api".to_string()),
             "confidence": cloud_mcp_payload_text(&row, &["confidence", "pace_confidence", "paceConfidence"]).unwrap_or_else(|| "sampled".to_string())
         }));
     }
-    samples
+      samples
+  }
+
+fn cloud_mcp_tokenomics_window_kind(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "5_hour" | "5-hour" | "5h" | "five_hour" | "five-hour" | "session_5h" => {
+            Some("session_5h")
+        }
+        "weekly" | "week" => Some("weekly"),
+        _ => None,
+    }
+}
+
+fn cloud_mcp_tokenomics_compact_account_meta(row: &Value) -> Value {
+    let key = cloud_mcp_tokenomics_provider_account_key(row);
+    json!({
+        "k": key,
+        "p": cloud_mcp_payload_text(row, &["provider"]).unwrap_or_else(|| "unknown".to_string()),
+        "g": cloud_mcp_payload_text(row, &["agent_kind", "agentKind"]).unwrap_or_else(|| "unknown".to_string()),
+        "l": cloud_mcp_payload_text(row, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
+    })
+}
+
+fn cloud_mcp_tokenomics_device_day_usage(
+    summary: &Value,
+    device_id: &str,
+    day_start_ms: i64,
+    day_key: &str,
+    content_hash: &str,
+    now_ms: u64,
+) -> Option<Value> {
+    let mut groups = cloud_mcp_tokenomics_hourly_groups(summary, now_ms);
+    groups.sort_by_key(|group| cloud_mcp_payload_i64(group, &["bucket_start_ms", "bucketStartMs"]).unwrap_or(0));
+    if groups.iter().all(|group| {
+        group
+            .get("rows")
+            .and_then(Value::as_array)
+            .map_or(true, Vec::is_empty)
+    })
+    {
+        return None;
+    }
+
+    let mut account_keys = std::collections::BTreeMap::<String, String>::new();
+    let mut account_meta = std::collections::BTreeMap::<String, Value>::new();
+    let mut model_keys = std::collections::BTreeMap::<String, String>::new();
+    for group in &groups {
+        for row in group
+            .get("rows")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let account_key = cloud_mcp_tokenomics_provider_account_key(row);
+            if cloud_mcp_tokenomics_provider_account_key_is_unknown(&account_key) {
+                continue;
+            }
+            let account_id = if let Some(id) = account_keys.get(&account_key) {
+                id.clone()
+            } else {
+                let id = format!("a{}", account_keys.len());
+                account_keys.insert(account_key.clone(), id.clone());
+                id
+            };
+            account_meta
+                .entry(account_id)
+                .or_insert_with(|| cloud_mcp_tokenomics_compact_account_meta(row));
+
+            let model = cloud_mcp_payload_text(row, &["model"]).unwrap_or_default();
+            if !model.trim().is_empty() && !model_keys.contains_key(&model) {
+                let id = format!("m{}", model_keys.len());
+                model_keys.insert(model, id);
+            }
+        }
+    }
+    let model_ids_by_name = model_keys.clone();
+    let models = model_keys
+        .into_iter()
+        .map(|(model, id)| (id, json!(model)))
+        .collect::<serde_json::Map<_, _>>();
+
+    let mut hours = Vec::new();
+    let mut row_count = 0usize;
+    for group in groups {
+        let hour_start_ms =
+            cloud_mcp_payload_i64(&group, &["bucket_start_ms", "bucketStartMs"]).unwrap_or(0);
+        if hour_start_ms <= 0 {
+            continue;
+        }
+        let hour_index = hour_start_ms
+            .saturating_sub(day_start_ms)
+            .checked_div(60 * 60 * 1000)
+            .unwrap_or(0)
+            .clamp(0, 23);
+        let mut rows = Vec::new();
+        for row in group
+            .get("rows")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let account_key = cloud_mcp_tokenomics_provider_account_key(row);
+            let Some(account_id) = account_keys.get(&account_key) else {
+                continue;
+            };
+            let model = cloud_mcp_payload_text(row, &["model"]).unwrap_or_default();
+            let model_id = model_ids_by_name.get(&model).cloned().unwrap_or_default();
+            let mut compact = serde_json::Map::new();
+            compact.insert("a".to_string(), json!(account_id));
+            if !model_id.is_empty() {
+                compact.insert("m".to_string(), json!(model_id));
+            }
+            compact.insert(
+                "k".to_string(),
+                json!(
+                    cloud_mcp_payload_text(row, &["attribution", "attribution_kind", "attributionKind"])
+                        .unwrap_or_else(|| "token_based".to_string())
+                ),
+            );
+            compact.insert("i".to_string(), json!(cloud_mcp_payload_i64(row, &["input", "input_tokens", "inputTokens"]).unwrap_or(0)));
+            compact.insert("o".to_string(), json!(cloud_mcp_payload_i64(row, &["output", "output_tokens", "outputTokens"]).unwrap_or(0)));
+            compact.insert("cr".to_string(), json!(cloud_mcp_payload_i64(row, &["cache_read", "cache_read_tokens", "cacheReadTokens"]).unwrap_or(0)));
+            compact.insert("cw".to_string(), json!(cloud_mcp_payload_i64(row, &["cache_write", "cache_write_tokens", "cacheWriteTokens"]).unwrap_or(0)));
+            compact.insert("t".to_string(), json!(cloud_mcp_payload_i64(row, &["total", "total_tokens", "totalTokens"]).unwrap_or(0)));
+            compact.insert("c".to_string(), json!(cloud_mcp_payload_i64(row, &["estimated_cost_microusd", "estimatedCostMicrousd", "provider_cost_microusd", "providerCostMicrousd", "cost"]).unwrap_or(0)));
+            compact.insert("e".to_string(), json!(cloud_mcp_payload_i64(row, &["events", "event_count", "eventCount"]).unwrap_or(0)));
+            rows.push(Value::Object(compact));
+        }
+        if rows.is_empty() {
+            continue;
+        }
+        row_count = row_count.saturating_add(rows.len());
+        hours.push(json!({
+            "h": hour_index,
+            "b": hour_start_ms,
+            "r": rows,
+        }));
+    }
+    if hours.is_empty() {
+        return None;
+    }
+    let hour_count = hours.len();
+    Some(json!({
+        "k": "device_day_usage",
+        "did": device_id,
+        "d": day_start_ms,
+        "day": day_key,
+        "h": content_hash,
+        "a": account_meta,
+        "mo": models,
+        "hrs": hours,
+        "hc": hour_count,
+        "rc": row_count,
+    }))
+}
+
+fn cloud_mcp_tokenomics_account_usage_snapshot(summary: &Value, now_ms: u64) -> Option<Value> {
+    let mut accounts = std::collections::BTreeMap::<String, Value>::new();
+    for key in ["latest_windows", "latestWindows", "limits"] {
+        for row in cloud_mcp_tokenomics_summary_array(summary, &[key]) {
+            let account_key = cloud_mcp_tokenomics_provider_account_key(&row);
+            if cloud_mcp_tokenomics_provider_account_key_is_unknown(&account_key) {
+                continue;
+            }
+            let raw_window = cloud_mcp_payload_text(
+                &row,
+                &["window", "window_kind", "windowKind", "limit_kind", "limitKind"],
+            )
+            .unwrap_or_else(|| "session_5h".to_string());
+            let Some(window_kind) = cloud_mcp_tokenomics_window_kind(&raw_window) else {
+                continue;
+            };
+            let reset_at_ms = cloud_mcp_payload_i64(&row, &["reset_at_ms", "resetAtMs"])
+                .or_else(|| {
+                    cloud_mcp_payload_text(
+                        &row,
+                        &["reset_at", "resetAt", "limit_resets_at", "limitResetsAt"],
+                    )
+                    .and_then(|value| cloud_mcp_tokenomics_timestamp_ms(&value))
+                })
+                .unwrap_or(0);
+            let account_entry = accounts.entry(account_key.clone()).or_insert_with(|| {
+                json!({
+                    "k": account_key,
+                    "p": cloud_mcp_payload_text(&row, &["provider"]).unwrap_or_else(|| "unknown".to_string()),
+                    "g": cloud_mcp_payload_text(&row, &["agent_kind", "agentKind"]).unwrap_or_else(|| "unknown".to_string()),
+                    "l": cloud_mcp_payload_text(&row, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
+                    "w": {},
+                })
+            });
+            if let Some(object) = account_entry.as_object_mut() {
+                let windows = object
+                    .entry("w".to_string())
+                    .or_insert_with(|| json!({}));
+                if let Some(windows_object) = windows.as_object_mut() {
+                    windows_object.insert(
+                        window_kind.to_string(),
+                        cloud_mcp_tokenomics_limit_window_snapshot(
+                            &row,
+                            window_kind,
+                            reset_at_ms,
+                            now_ms,
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    if accounts.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "k": "account_device_usage_snapshot",
+        "o": now_ms,
+        "a": accounts,
+    }))
+}
+
+fn cloud_mcp_tokenomics_limit_sample_day(
+    summary: &Value,
+    device_id: &str,
+    day_start_ms: i64,
+    day_key: &str,
+    content_hash: &str,
+    now_ms: u64,
+) -> Option<Value> {
+    let mut rows = Vec::new();
+    for sample in cloud_mcp_tokenomics_limit_samples(summary, now_ms) {
+        rows.push(cloud_mcp_tokenomics_limit_sample_snapshot(&sample));
+    }
+    if rows.is_empty() {
+        return None;
+    }
+    let sample_count = rows.len();
+    Some(json!({
+        "k": "limit_sample_day",
+        "did": device_id,
+        "d": day_start_ms,
+        "day": day_key,
+        "h": content_hash,
+        "s": rows,
+        "sc": sample_count,
+    }))
 }
 
 fn cloud_mcp_compact_tokenomics_device(device: &Value) -> Value {
@@ -7782,91 +8334,6 @@ fn cloud_mcp_compact_tokenomics_device(device: &Value) -> Value {
         "p": cloud_mcp_payload_text(device, &["platform"]).unwrap_or_default(),
         "f": cloud_mcp_payload_text(device, &["form_factor", "formFactor"]).unwrap_or_default(),
         "k": cloud_mcp_payload_text(device, &["client_kind", "clientKind"]).unwrap_or_default(),
-    })
-}
-
-fn cloud_mcp_compact_tokenomics_provider_account(account: &Value) -> Value {
-    let account_key = cloud_mcp_tokenomics_provider_account_key(account);
-    json!({
-        "a": account_key,
-        "l": cloud_mcp_payload_text(account, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
-        "p": cloud_mcp_payload_text(account, &["provider"]).unwrap_or_else(|| "unknown".to_string()),
-        "g": cloud_mcp_payload_text(account, &["agent_kind", "agentKind"]).unwrap_or_else(|| "unknown".to_string()),
-        "cf": cloud_mcp_payload_text(account, &["identity_confidence", "identityConfidence", "confidence"]).unwrap_or_else(|| "usage".to_string()),
-        "src": cloud_mcp_payload_text(account, &["attribution_source", "attributionSource", "source"]).unwrap_or_default(),
-        "fs": cloud_mcp_payload_text(account, &["first_seen_at", "firstSeenAt"]).unwrap_or_default(),
-        "ls": cloud_mcp_payload_text(account, &["last_seen_at", "lastSeenAt", "updated_at", "updatedAt"]).unwrap_or_default(),
-    })
-}
-
-fn cloud_mcp_compact_tokenomics_hourly_row(row: &Value) -> Value {
-    json!({
-        "a": cloud_mcp_tokenomics_provider_account_key(row),
-        "l": cloud_mcp_payload_text(row, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
-        "p": cloud_mcp_payload_text(row, &["provider"]).unwrap_or_else(|| "unknown".to_string()),
-        "g": cloud_mcp_payload_text(row, &["agent_kind", "agentKind"]).unwrap_or_else(|| "unknown".to_string()),
-        "m": cloud_mcp_payload_text(row, &["model"]).unwrap_or_default(),
-        "k": cloud_mcp_payload_text(row, &["attribution", "attribution_kind", "attributionKind"]).unwrap_or_else(|| "token_based".to_string()),
-        "v": cloud_mcp_payload_text(row, &["coverage"]).unwrap_or_else(|| "device_local".to_string()),
-        "i": cloud_mcp_payload_i64(row, &["input", "input_tokens", "inputTokens"]).unwrap_or(0),
-        "o": cloud_mcp_payload_i64(row, &["output", "output_tokens", "outputTokens"]).unwrap_or(0),
-        "r": cloud_mcp_payload_i64(row, &["cache_read", "cache_read_tokens", "cacheReadTokens"]).unwrap_or(0),
-        "w": cloud_mcp_payload_i64(row, &["cache_write", "cache_write_tokens", "cacheWriteTokens"]).unwrap_or(0),
-        "t": cloud_mcp_payload_i64(row, &["total", "total_tokens", "totalTokens"]).unwrap_or(0),
-        "c": cloud_mcp_payload_i64(row, &["estimated_cost_microusd", "estimatedCostMicrousd", "provider_cost_microusd", "providerCostMicrousd", "cost"]).unwrap_or(0),
-        "e": cloud_mcp_payload_i64(row, &["events", "event_count", "eventCount"]).unwrap_or(0),
-    })
-}
-
-fn cloud_mcp_compact_tokenomics_hourly_group(group: &Value) -> Value {
-    let rows = group
-        .get("rows")
-        .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .map(cloud_mcp_compact_tokenomics_hourly_row)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    json!({
-        "b": cloud_mcp_payload_i64(group, &["bucket_start_ms", "bucketStartMs"]).unwrap_or(0),
-        "g": cloud_mcp_payload_i64(group, &["group_generation", "groupGeneration", "generation"]).unwrap_or(0),
-        "h": cloud_mcp_payload_text(group, &["group_hash", "groupHash"]).unwrap_or_default(),
-        "o": cloud_mcp_payload_i64(group, &["observed_at_ms", "observedAtMs"]).unwrap_or(0),
-        "r": rows,
-    })
-}
-
-fn cloud_mcp_compact_tokenomics_window(window: &Value) -> Value {
-    json!({
-        "a": cloud_mcp_tokenomics_provider_account_key(window),
-        "l": cloud_mcp_payload_text(window, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
-        "p": cloud_mcp_payload_text(window, &["provider"]).unwrap_or_else(|| "unknown".to_string()),
-        "g": cloud_mcp_payload_text(window, &["agent_kind", "agentKind"]).unwrap_or_else(|| "unknown".to_string()),
-        "wk": cloud_mcp_payload_text(window, &["window", "window_kind", "windowKind", "limit_kind", "limitKind"]).unwrap_or_else(|| "session_5h".to_string()),
-        "up": window.get("used_percent").or_else(|| window.get("usedPercent")).or_else(|| window.get("used")).cloned().unwrap_or(Value::Null),
-        "rp": window.get("remaining_percent").or_else(|| window.get("remainingPercent")).or_else(|| window.get("remaining")).cloned().unwrap_or(Value::Null),
-        "ram": cloud_mcp_payload_i64(window, &["reset_at_ms", "resetAtMs"]).unwrap_or(0),
-        "o": cloud_mcp_payload_i64(window, &["observed_at_ms", "observedAtMs"]).unwrap_or(0),
-        "src": cloud_mcp_payload_text(window, &["source", "limit_source", "limitSource"]).unwrap_or_else(|| "provider_usage_api".to_string()),
-        "cf": cloud_mcp_payload_text(window, &["confidence", "pace_confidence", "paceConfidence"]).unwrap_or_else(|| "live".to_string()),
-    })
-}
-
-fn cloud_mcp_compact_tokenomics_limit_sample(sample: &Value) -> Value {
-    json!({
-        "a": cloud_mcp_tokenomics_provider_account_key(sample),
-        "l": cloud_mcp_payload_text(sample, &["provider_account_label", "providerAccountLabel", "label"]).unwrap_or_default(),
-        "p": cloud_mcp_payload_text(sample, &["provider"]).unwrap_or_else(|| "unknown".to_string()),
-        "g": cloud_mcp_payload_text(sample, &["agent_kind", "agentKind"]).unwrap_or_else(|| "unknown".to_string()),
-        "wk": cloud_mcp_payload_text(sample, &["window", "window_kind", "windowKind", "limit_kind", "limitKind"]).unwrap_or_else(|| "session_5h".to_string()),
-        "up": sample.get("used_percent").or_else(|| sample.get("usedPercent")).or_else(|| sample.get("used")).cloned().unwrap_or(Value::Null),
-        "rp": sample.get("remaining_percent").or_else(|| sample.get("remainingPercent")).or_else(|| sample.get("remaining")).cloned().unwrap_or(Value::Null),
-        "ram": cloud_mcp_payload_i64(sample, &["reset_at_ms", "resetAtMs"]).unwrap_or(0),
-        "o": cloud_mcp_payload_i64(sample, &["observed_at_ms", "observedAtMs"]).unwrap_or(0),
-        "sbm": cloud_mcp_payload_i64(sample, &["sample_bucket_start_ms", "sampleBucketStartMs", "bucket_start_ms", "bucketStartMs"]).unwrap_or(0),
-        "src": cloud_mcp_payload_text(sample, &["source", "limit_source", "limitSource"]).unwrap_or_else(|| "provider_usage_api".to_string()),
-        "cf": cloud_mcp_payload_text(sample, &["confidence", "pace_confidence", "paceConfidence"]).unwrap_or_else(|| "sampled".to_string()),
     })
 }
 
@@ -7899,16 +8366,65 @@ fn cloud_mcp_tokenomics_device_packet_payload(
     let local_sync_cursor = cloud_mcp_tokenomics_cursor_from_summary(summary)
         .unwrap_or_else(|| sync_state.local_cursor.clone());
     let now_ms = cloud_mcp_now_ms();
-    let provider_accounts = cloud_mcp_tokenomics_provider_accounts(summary, now_ms);
-    let hourly_groups = cloud_mcp_tokenomics_hourly_groups(summary, now_ms);
-    let windows = cloud_mcp_tokenomics_windows(summary, now_ms);
-    let limit_samples = cloud_mcp_tokenomics_limit_samples(summary, now_ms);
-    let hourly_count = hourly_groups
-        .iter()
-        .filter_map(|group| group.get("rows").and_then(Value::as_array).map(Vec::len))
-        .sum::<usize>();
-    let window_count = windows.len();
-    let limit_sample_count = limit_samples.len();
+    let packet_day_start_ms = packet_bucket
+        .map(|bucket| bucket.day_start_ms)
+        .or_else(|| cloud_mcp_tokenomics_day_start_from_value(summary))
+        .unwrap_or(0);
+    let packet_day_key = packet_bucket
+        .map(|bucket| bucket.day_key.clone())
+        .or_else(|| cloud_mcp_payload_text(summary, &["sync_day", "syncDay", "sd"]))
+        .unwrap_or_else(|| {
+            if packet_day_start_ms > 0 {
+                cloud_mcp_tokenomics_day_key(packet_day_start_ms)
+            } else {
+                String::new()
+            }
+        });
+    let packet_content_hash = packet_bucket
+        .map(|bucket| bucket.content_hash.clone())
+        .or_else(|| cloud_mcp_tokenomics_day_content_hash_from_value(summary))
+        .unwrap_or_default();
+    let device_day_usage = (packet_day_start_ms > 0)
+        .then(|| {
+            cloud_mcp_tokenomics_device_day_usage(
+                summary,
+                &device_id,
+                packet_day_start_ms,
+                &packet_day_key,
+                &packet_content_hash,
+                now_ms,
+            )
+        })
+        .flatten();
+    let account_usage_snapshot = cloud_mcp_tokenomics_account_usage_snapshot(summary, now_ms);
+    let limit_sample_day = (packet_day_start_ms > 0)
+        .then(|| {
+            cloud_mcp_tokenomics_limit_sample_day(
+                summary,
+                &device_id,
+                packet_day_start_ms,
+                &packet_day_key,
+                &packet_content_hash,
+                now_ms,
+            )
+        })
+        .flatten();
+    let hourly_count = device_day_usage
+        .as_ref()
+        .and_then(|value| value.get("rc").and_then(Value::as_u64))
+        .unwrap_or(0) as usize;
+    let hour_bucket_count = device_day_usage
+        .as_ref()
+        .and_then(|value| value.get("hc").and_then(Value::as_u64))
+        .unwrap_or(0) as usize;
+    let account_snapshot_count = account_usage_snapshot
+        .as_ref()
+        .and_then(|value| value.get("a").and_then(Value::as_object).map(|rows| rows.len()))
+        .unwrap_or(0);
+    let limit_sample_count = limit_sample_day
+        .as_ref()
+        .and_then(|value| value.get("sc").and_then(Value::as_u64))
+        .unwrap_or(0) as usize;
     let snapshot = event_kind == CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT;
     let compact_kind = if snapshot { "snapshot" } else { "delta" };
     let mut payload = json!({
@@ -7920,7 +8436,6 @@ fn cloud_mcp_tokenomics_device_packet_payload(
         "bst": billing_scope_type,
         "sk": billing_scope_key,
         "tid": team_id,
-        "as": true,
         "d": cloud_mcp_compact_tokenomics_device(device_profile),
         "did": device_id.clone(),
         "r": reason,
@@ -7933,15 +8448,23 @@ fn cloud_mcp_tokenomics_device_packet_payload(
         "blc": sync_state.local_cursor.clone(),
         "lc": local_sync_cursor.clone(),
         "dc": now_ms,
-        "pa": provider_accounts.iter().map(cloud_mcp_compact_tokenomics_provider_account).collect::<Vec<_>>(),
-        "hg": hourly_groups.iter().map(cloud_mcp_compact_tokenomics_hourly_group).collect::<Vec<_>>(),
-        "w": windows.iter().map(cloud_mcp_compact_tokenomics_window).collect::<Vec<_>>(),
-        "ls": limit_samples.iter().map(cloud_mcp_compact_tokenomics_limit_sample).collect::<Vec<_>>(),
         "hc": hourly_count,
-        "wc": window_count,
+        "hbc": hour_bucket_count,
+        "asc": account_snapshot_count,
         "lsc": limit_sample_count,
         "tms": now_ms,
     });
+    if let Some(object) = payload.as_object_mut() {
+        if let Some(value) = device_day_usage {
+            object.insert("du".to_string(), value);
+        }
+        if let Some(value) = account_usage_snapshot {
+            object.insert("aus".to_string(), value);
+        }
+        if let Some(value) = limit_sample_day {
+            object.insert("lsd".to_string(), value);
+        }
+    }
     if let Some(bucket) = packet_bucket {
         if let Some(object) = payload.as_object_mut() {
             object.insert("sb".to_string(), json!("day"));
@@ -7965,7 +8488,7 @@ fn cloud_mcp_tokenomics_device_packet_payload(
     }
     Ok(cloud_mcp_tokenomics_payload_with_hash(
         payload,
-        format!("tokenomics:v3:{billing_scope_key}:{device_id}:{event_kind}:{device_seq}"),
+        format!("tokenomics:v4:{billing_scope_key}:{device_id}:{event_kind}:{device_seq}"),
     ))
 }
 
@@ -8317,7 +8840,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             &tokenomics_scope_key,
             bucket.day_start_ms,
             &bucket.content_hash,
-            force_resync,
+            force_full || force_resync,
         ) {
             Ok(decision) => decision,
             Err(error) => {
@@ -42212,6 +42735,33 @@ pub(crate) fn cloud_mcp_todo_mirror_correction_item(
     }))
 }
 
+pub(crate) fn cloud_mcp_todo_mirror_lookup_todo_item(
+    workspace_id: &str,
+    todo_id: &str,
+) -> Option<Value> {
+    let workspace_id = workspace_id.trim();
+    let todo_id = todo_id.trim();
+    if workspace_id.is_empty() || todo_id.is_empty() {
+        return None;
+    }
+    let conn = cloud_mcp_open_todo_mirror_conn().ok()?;
+    if cloud_mcp_todo_mirror_init_conn(&conn).is_err() {
+        return None;
+    }
+    let row_json: String = conn
+        .query_row(
+            "SELECT row_json FROM workspace_todo_mirror_rows
+             WHERE row_kind = 'todo'
+               AND (workspace_id = ?1 OR origin_workspace_id = ?1 OR target_workspace_id = ?1)
+               AND (todo_id = ?2 OR command_id = ?2 OR dispatch_id = ?2)
+             ORDER BY mirror_updated_at_ms DESC LIMIT 1",
+            rusqlite::params![workspace_id, todo_id],
+            |row| row.get(0),
+        )
+        .ok()?;
+    serde_json::from_str::<Value>(&row_json).ok()
+}
+
 /// Device-local mirror rows stuck in running/sending older than the cutoff —
 /// the zombie class nothing will ever settle. Returns (workspace_id, minimal
 /// item) pairs ready for a status-correction push.
@@ -49741,7 +50291,9 @@ mod cloud_mcp_tests {
     }
 
     #[test]
-    fn tokenomics_v3_device_packet_carries_sequence_hash_and_cursors() {
+    fn tokenomics_v4_device_packet_carries_graph_facts_sequence_hash_and_cursors() {
+        let day_start_ms = cloud_mcp_tokenomics_timestamp_ms("2026-06-15T00:00:00Z").unwrap();
+        let day_key = cloud_mcp_tokenomics_day_key(day_start_ms);
         let summary = json!({
             "sync_cursor": "2026-06-15T10:00:00Z",
             "hourly": [{
@@ -49749,11 +50301,74 @@ mod cloud_mcp_tests {
                 "provider": "openai",
                 "agent_kind": "codex",
                 "provider_account_key": "openai:codex:pro",
-                "bucket_start": "2026-06-15T10",
+                "provider_account_label": "Codex Pro",
+                "model": "gpt-5.5",
+                "bucket_start": "2026-06-15T10:00:00Z",
                 "total_tokens": 42,
                 "updated_at": "2026-06-15T10:00:00Z"
             }],
-            "limit_samples": []
+            "limits": [{
+                "provider": "openai",
+                "agent_kind": "codex",
+                "provider_account_key": "openai:codex:pro",
+                "provider_account_label": "Codex Pro",
+                "window_kind": "weekly",
+                "provider_window_kind": "weekly",
+                "used_percent": 22,
+                "remaining_percent": 78,
+                "plan_detected": true,
+                "plan_name": "Codex Pro",
+                "plan_source": "codex_usage_api",
+                "limit_source": "codex_usage_api",
+                "allowance": 100,
+                "allowance_unit": "percent",
+                "display_percent": 78,
+                "display_percent_kind": "remaining",
+                "status_label": "Safe at current pace",
+                "reset_label": "Resets in 2d",
+                "reset_after_seconds": 172800,
+                "limit_window_seconds": 604800,
+                "pace_status": "on_pace",
+                "pace_delta_percent": -18,
+                "pace_projected_used_percent": 82,
+                "pace_projected_exhaustion_seconds": null,
+                "pace_projected_exhaustion_at": null,
+                "pace_strategy": "sample_trajectory",
+                "pace_confidence": "live",
+                "pace_sample_count": 4,
+                "pace_sample_window_seconds": 3600,
+                "pace_last_sample_at": "2026-06-15T10:00:00Z",
+                "pace_last_sample_used_percent": 22,
+                "rate_points": [{"at": "2026-06-15T10:00:00Z", "used_percent": 22}],
+                "active_provider_account": true
+            }],
+            "latest_windows": [{
+                "provider": "openai",
+                "agent_kind": "codex",
+                "provider_account_key": "openai:codex:pro",
+                "provider_account_label": "Codex Pro",
+                "window_kind": "weekly",
+                "used_percent": 7,
+                "plan_name": "Stale persisted row",
+                "reset_after_seconds": 60
+            }],
+            "limit_samples": [{
+                "provider": "openai",
+                "agent_kind": "codex",
+                "provider_account_key": "openai:codex:pro",
+                "provider_account_label": "Codex Pro",
+                "window_kind": "weekly",
+                "sample_at": "2026-06-15T10:00:00Z",
+                "sample_at_unix": 1781517600,
+                "sample_bucket_start_ms": day_start_ms,
+                "observed_at_ms": day_start_ms,
+                "used_percent": 22,
+                "remaining_percent": 78,
+                "reset_after_seconds": 172800,
+                "limit_window_seconds": 604800,
+                "pace_status": "on_pace",
+                "pace_delta_percent": -18
+            }]
         });
         let device = json!({
             "device_id": "device-a",
@@ -49773,6 +50388,11 @@ mod cloud_mcp_tests {
             last_payload_hash: "previous-hash".to_string(),
             last_idempotency_key: "previous-idempotency".to_string(),
         };
+        let bucket = CloudMcpTokenomicsPacketBucket {
+            day_start_ms,
+            day_key: day_key.clone(),
+            content_hash: "content-hash-a".to_string(),
+        };
 
         let packet = cloud_mcp_tokenomics_device_packet_payload(
             &summary,
@@ -49785,12 +50405,20 @@ mod cloud_mcp_tests {
             CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
             "unit_test",
             false,
-            None,
+            Some(&bucket),
         )
         .unwrap();
 
         assert_eq!(packet["c"].as_str(), Some(CLOUD_MCP_TOKENOMICS_CONTRACT));
         assert_eq!(packet["m"].as_str(), Some("delta"));
+        assert_eq!(
+            packet["sp"].as_str(),
+            Some(CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL)
+        );
+        assert_eq!(
+            packet["sv"].as_u64(),
+            Some(CLOUD_MCP_TOKENOMICS_SYNC_SCHEMA_VERSION)
+        );
         assert!(packet.get("event_kind").is_none());
         assert_eq!(packet["ds"].as_u64(), Some(7));
         assert_eq!(packet["ads"].as_u64(), Some(6));
@@ -49801,12 +50429,67 @@ mod cloud_mcp_tests {
         assert!(packet.get("payload_hash").is_none());
         assert!(packet.get("payloadHash").is_none());
         assert!(packet.get("idempotency_key").is_none());
-        assert!(packet["pid"]
-            .as_str()
-            .unwrap()
-            .starts_with("tokenomics:v3:personal:device-a:tokenomics_device_delta:7:"));
+        let expected_idempotency_key =
+            format!("tokenomics:v4:personal:device-a:day:{day_key}:content-hash-a");
+        assert_eq!(
+            packet["pid"].as_str(),
+            Some(expected_idempotency_key.as_str())
+        );
         assert_eq!(packet["hc"].as_u64(), Some(1));
-        assert_eq!(packet["hg"][0]["r"].as_array().map(Vec::len), Some(1));
+        assert_eq!(packet["hbc"].as_u64(), Some(1));
+        assert_eq!(packet["asc"].as_u64(), Some(1));
+        assert_eq!(packet["lsc"].as_u64(), Some(1));
+        assert_eq!(packet["du"]["k"].as_str(), Some("device_day_usage"));
+        assert_eq!(
+            packet["du"]["hrs"][0]["r"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            packet["du"]["a"]["a0"]["k"].as_str(),
+            Some("openai:codex:pro")
+        );
+        assert_eq!(packet["du"]["mo"]["m0"].as_str(), Some("gpt-5.5"));
+        assert_eq!(
+            packet["aus"]["a"]["openai:codex:pro"]["w"]["weekly"]["up"].as_i64(),
+            Some(22)
+        );
+        let weekly = &packet["aus"]["a"]["openai:codex:pro"]["w"]["weekly"];
+        assert_eq!(weekly["pn"].as_str(), Some("Codex Pro"));
+        assert_eq!(weekly["pd"].as_bool(), Some(true));
+        assert_eq!(weekly["ps"].as_str(), Some("codex_usage_api"));
+        assert_eq!(weekly["ls"].as_str(), Some("codex_usage_api"));
+        assert_eq!(weekly["al"].as_i64(), Some(100));
+        assert_eq!(weekly["au"].as_str(), Some("percent"));
+        assert_eq!(weekly["dp"].as_i64(), Some(78));
+        assert_eq!(weekly["dpk"].as_str(), Some("remaining"));
+        assert_eq!(weekly["sl"].as_str(), Some("Safe at current pace"));
+        assert_eq!(weekly["rl"].as_str(), Some("Resets in 2d"));
+        assert_eq!(weekly["ras"].as_i64(), Some(172800));
+        assert_eq!(weekly["lws"].as_i64(), Some(604800));
+        assert_eq!(weekly["pst"].as_str(), Some("on_pace"));
+        assert_eq!(weekly["pdp"].as_i64(), Some(-18));
+        assert_eq!(weekly["ppup"].as_i64(), Some(82));
+        assert_eq!(weekly["pstr"].as_str(), Some("sample_trajectory"));
+        assert_eq!(weekly["pcf"].as_str(), Some("live"));
+        assert_eq!(weekly["psc"].as_i64(), Some(4));
+        assert_eq!(weekly["psw"].as_i64(), Some(3600));
+        assert_eq!(weekly["pla"].as_str(), Some("2026-06-15T10:00:00Z"));
+        assert_eq!(weekly["plup"].as_i64(), Some(22));
+        assert_eq!(weekly["act"].as_bool(), Some(true));
+        assert_eq!(weekly["rpnts"].as_array().map(Vec::len), Some(1));
+        assert_eq!(packet["lsd"]["s"].as_array().map(Vec::len), Some(1));
+        let sample = &packet["lsd"]["s"][0];
+        assert_eq!(sample["l"].as_str(), Some("Codex Pro"));
+        assert_eq!(sample["ras"].as_i64(), Some(172800));
+        assert_eq!(sample["lws"].as_i64(), Some(604800));
+        assert_eq!(sample["pst"].as_str(), Some("on_pace"));
+        assert_eq!(sample["pdp"].as_i64(), Some(-18));
+        assert_eq!(sample["sat"].as_str(), Some("2026-06-15T10:00:00Z"));
+        assert_eq!(sample["sau"].as_i64(), Some(1781517600));
+        assert!(packet.get("pa").is_none());
+        assert!(packet.get("hg").is_none());
+        assert!(packet.get("w").is_none());
+        assert!(packet.get("ls").is_none());
         assert!(packet.get("providerAccounts").is_none());
         assert!(packet.get("hourlyGroups").is_none());
         assert!(packet.get("deviceAliases").is_none());
@@ -49887,6 +50570,13 @@ mod cloud_mcp_tests {
             ..CloudMcpTokenomicsSyncState::default()
         };
 
+        let day_start_ms = cloud_mcp_tokenomics_timestamp_ms("2026-06-16T00:00:00Z").unwrap();
+        let day_key = cloud_mcp_tokenomics_day_key(day_start_ms);
+        let bucket = CloudMcpTokenomicsPacketBucket {
+            day_start_ms,
+            day_key,
+            content_hash: "known-only-hash".to_string(),
+        };
         let packet = cloud_mcp_tokenomics_device_packet_payload(
             &summary,
             &device,
@@ -49898,30 +50588,32 @@ mod cloud_mcp_tests {
             CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
             "unit_test",
             false,
-            None,
+            Some(&bucket),
         )
         .unwrap();
-        let provider_accounts = packet["pa"].as_array().unwrap();
-        assert_eq!(provider_accounts.len(), 1);
-        assert_eq!(provider_accounts[0]["a"].as_str(), Some("openai:codex:pro"));
+        assert!(packet.get("pa").is_none());
+        assert!(packet.get("hg").is_none());
+        assert!(packet.get("w").is_none());
+        assert!(packet.get("ls").is_none());
         assert_eq!(packet["hc"].as_u64(), Some(1));
-        assert_eq!(packet["wc"].as_u64(), Some(1));
+        assert_eq!(packet["asc"].as_u64(), Some(1));
         assert_eq!(
-            packet["hg"][0]["r"][0]["a"].as_str(),
+            packet["du"]["hrs"][0]["r"].as_array().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            packet["du"]["a"]["a0"]["k"].as_str(),
             Some("openai:codex:pro")
         );
+        assert!(packet["aus"]["a"].get("openai:codex:unknown").is_none());
+        assert!(packet["aus"]["a"].get("openai:codex:pro").is_some());
 
         let buckets = cloud_mcp_tokenomics_day_buckets(
             &summary,
             cloud_mcp_tokenomics_timestamp_ms("2026-06-16T12:00:00Z").unwrap() as u64,
         );
         assert_eq!(buckets.len(), 1);
-        assert_eq!(
-            buckets[0].summary["provider_accounts"]
-                .as_array()
-                .map(Vec::len),
-            Some(1)
-        );
+        assert!(buckets[0].summary.get("provider_accounts").is_none());
         assert_eq!(
             buckets[0].summary["latest_windows"]
                 .as_array()
@@ -50109,8 +50801,8 @@ mod cloud_mcp_tests {
 
         assert_eq!(packet["sdm"].as_i64(), Some(day_start_ms));
         assert_eq!(packet["h"].as_str(), Some("content-hash-a"));
-        let expected_idempotency_key =
-            format!("tokenomics:v3:personal:device-a:day:{day_key}:content-hash-a");
+          let expected_idempotency_key =
+              format!("tokenomics:v4:personal:device-a:day:{day_key}:content-hash-a");
         assert_eq!(
             packet["pid"].as_str(),
             Some(expected_idempotency_key.as_str())
@@ -50142,15 +50834,65 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn tokenomics_force_full_requeues_acked_day_packet() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let cache_root = test_cloud_root("diffforge-tokenomics-force-full-cache");
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let day_start_ms = cloud_mcp_tokenomics_timestamp_ms("2026-06-16T00:00:00Z").unwrap();
+        let day_key = cloud_mcp_tokenomics_day_key(day_start_ms);
+        let content_hash = "content-hash-a";
+        let idempotency_key =
+            cloud_mcp_tokenomics_day_packet_idempotency_key("personal", "device-a", &day_key, content_hash);
+        let source_payload = json!({
+            "did": "device-a",
+            "sk": "personal",
+            "sdm": day_start_ms,
+            "h": content_hash,
+            "ph": content_hash,
+            "pid": idempotency_key,
+            "ds": 7
+        });
+        assert!(cloud_mcp_tokenomics_mark_day_acked_from_payload(
+            Some(&source_payload),
+            &json!({
+                "did": "device-a",
+                "sk": "personal",
+                "server_cursor": "server-cursor"
+            })
+        )
+        .unwrap());
+
+        assert!(matches!(
+            cloud_mcp_tokenomics_day_sync_decision(
+                "device-a",
+                "personal",
+                day_start_ms,
+                content_hash,
+                false
+            )
+            .unwrap(),
+            CloudMcpTokenomicsDaySyncDecision::CurrentAcked
+        ));
+        assert!(matches!(
+            cloud_mcp_tokenomics_day_sync_decision(
+                "device-a",
+                "personal",
+                day_start_ms,
+                content_hash,
+                true
+            )
+            .unwrap(),
+            CloudMcpTokenomicsDaySyncDecision::Enqueue
+        ));
+
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
     fn tokenomics_day_content_hash_ignores_scan_time_fields() {
-        let provider_accounts = vec![json!({
-            "provider": "openai",
-            "agent_kind": "codex",
-            "provider_account_key": "openai:codex:pro",
-            "provider_account_label": "Codex Pro",
-            "updated_at": "2026-06-16T10:00:00Z",
-            "last_seen_at": "2026-06-16T10:00:00Z"
-        })];
         let first_hourly = vec![json!({
             "device_id": "device-a",
             "provider": "openai",
@@ -50194,30 +50936,24 @@ mod cloud_mcp_tests {
             "updated_at": "2026-06-16T11:00:00Z"
         })];
 
-        let first = cloud_mcp_tokenomics_day_content_hash(
-            &first_hourly,
-            &provider_accounts,
-            &[],
-            &[],
-            &[],
-            &json!([]),
-        );
-        let second = cloud_mcp_tokenomics_day_content_hash(
-            &second_hourly,
-            &provider_accounts,
-            &[],
-            &[],
-            &[],
-            &json!([]),
-        );
-        let changed = cloud_mcp_tokenomics_day_content_hash(
-            &changed_hourly,
-            &provider_accounts,
-            &[],
-            &[],
-            &[],
-            &json!([]),
-        );
+          let first = cloud_mcp_tokenomics_day_content_hash(
+              &first_hourly,
+              &[],
+              &[],
+              &[],
+          );
+          let second = cloud_mcp_tokenomics_day_content_hash(
+              &second_hourly,
+              &[],
+              &[],
+              &[],
+          );
+          let changed = cloud_mcp_tokenomics_day_content_hash(
+              &changed_hourly,
+              &[],
+              &[],
+              &[],
+          );
 
         assert_eq!(first, second);
         assert_ne!(first, changed);

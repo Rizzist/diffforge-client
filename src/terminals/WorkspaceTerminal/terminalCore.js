@@ -504,8 +504,8 @@ export function extractNativeSessionIdFromOutput(agentId, text) {
       ]
       : agentId === "opencode"
         ? [
-          /\bopencode(?:\.cmd|\.exe)?\s+(?:--session|-s)\s+([^\s"'`]+)/i,
-          /\bsession\s+id\s*[:=]\s*([0-9a-zA-Z_-]{8,})/i,
+          /\bopencode(?:\.cmd|\.exe)?\s+(?:--session|-s)\s+(ses_[0-9a-zA-Z_-]{8,})/i,
+          /\bsession\s+id\s*[:=]\s*(ses_[0-9a-zA-Z_-]{8,})/i,
         ]
         : [];
 

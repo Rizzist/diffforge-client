@@ -6084,21 +6084,15 @@ fn run_agent_thread_turn_for_context(
     let working_directory = resolve_workspace_root_directory(request.working_directory.as_deref())?;
     let working_directory_text = working_directory.to_string_lossy().to_string();
     let mut launch_env_vars = env_vars.to_vec();
-    let launch_provider_session_id = if matches!(provider, AgentProvider::Codex)
-        && !requested_provider_session_id.is_empty()
-    {
-        match resolve_codex_resume_session(&requested_provider_session_id, &working_directory_text)
-        {
-            Ok((session_id, home)) => {
-                let _ = prepare_codex_rollout_for_resume(&session_id, &working_directory_text);
-                apply_codex_resume_home_env(&mut launch_env_vars, &home.to_string_lossy());
-                session_id
-            }
-            Err(_) => String::new(),
-        }
-    } else {
-        requested_provider_session_id.clone()
-    };
+    let (launch_provider_session_id, codex_resume_home) = terminal_resolve_provider_resume_session(
+        provider,
+        terminal_clean_provider_session_id(Some(&requested_provider_session_id)),
+        &working_directory_text,
+    );
+    if let Some(home) = codex_resume_home.as_deref() {
+        apply_codex_resume_home_env(&mut launch_env_vars, home);
+    }
+    let launch_provider_session_id = launch_provider_session_id.unwrap_or_default();
     let mut output_path = None;
     let (args, stdin_text) = match provider {
         AgentProvider::Codex => {
@@ -6113,7 +6107,7 @@ fn run_agent_thread_turn_for_context(
         }
         AgentProvider::Claude => {
             let mut args =
-                build_claude_turn_args(model.as_deref(), &requested_provider_session_id, prompt);
+                build_claude_turn_args(model.as_deref(), &launch_provider_session_id, prompt);
             if let Some(coordination) = coordination {
                 let coordination_args = terminal_coordination_proxy_args(coordination);
                 apply_claude_coordinated_auto_approval_args(
@@ -6136,7 +6130,7 @@ fn run_agent_thread_turn_for_context(
         AgentProvider::OpenCode => (
             build_opencode_turn_args(
                 model.as_deref(),
-                &requested_provider_session_id,
+                &launch_provider_session_id,
                 prompt,
                 &working_directory,
             ),
@@ -6197,7 +6191,7 @@ fn run_agent_thread_turn_for_context(
             output
         },
         provider_session_id: if parsed_session_id.is_empty() {
-            requested_provider_session_id.clone()
+            launch_provider_session_id
         } else {
             parsed_session_id
         },

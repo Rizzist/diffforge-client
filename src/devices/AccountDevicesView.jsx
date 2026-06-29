@@ -9,7 +9,7 @@ import { RadioButtonChecked } from "@styled-icons/material-rounded/RadioButtonCh
 import { SettingsEthernet } from "@styled-icons/material-rounded/SettingsEthernet";
 import { Storage } from "@styled-icons/material-rounded/Storage";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
-import { useEffect, useId, useMemo, useRef, useState } from "react";
+import { useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 import {
   TODO_QUEUE_DEVICE_KIND_MOBILE,
@@ -81,6 +81,13 @@ const DEVICE_NODE_SPACING = 340;
 const DEVICE_RING_INNER_RADIUS = 340;
 const DEVICE_RING_GAP = 330;
 const DEVICE_GRAPH_MARGIN = 72;
+const DEVICE_GRAPH_VIEW_PADDING = 32;
+const DEVICE_GRAPH_ZOOM_MIN = 0.08;
+const DEVICE_GRAPH_ZOOM_MAX = 2.4;
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
 
 function deviceGraphAngle(index, count, ringIndex) {
   if (count === 1) return -90;
@@ -138,6 +145,36 @@ function buildDeviceGraphLayout(deviceCount) {
     height,
     nodes,
     width,
+  };
+}
+
+function graphFitZoom(layout, viewportSize) {
+  if (!viewportSize.width || !viewportSize.height) {
+    return 1;
+  }
+
+  const availableWidth = Math.max(1, viewportSize.width - DEVICE_GRAPH_VIEW_PADDING * 2);
+  const availableHeight = Math.max(1, viewportSize.height - DEVICE_GRAPH_VIEW_PADDING * 2);
+  return clampNumber(
+    Math.min(1, availableWidth / layout.width, availableHeight / layout.height),
+    DEVICE_GRAPH_ZOOM_MIN,
+    DEVICE_GRAPH_ZOOM_MAX,
+  );
+}
+
+function graphViewportMetrics(layout, viewportSize, zoom) {
+  const scaledWidth = layout.width * zoom;
+  const scaledHeight = layout.height * zoom;
+  const frameWidth = Math.max(viewportSize.width || 0, scaledWidth + DEVICE_GRAPH_VIEW_PADDING * 2);
+  const frameHeight = Math.max(viewportSize.height || 0, scaledHeight + DEVICE_GRAPH_VIEW_PADDING * 2);
+
+  return {
+    frameHeight,
+    frameWidth,
+    offsetX: Math.max(DEVICE_GRAPH_VIEW_PADDING, (frameWidth - scaledWidth) / 2),
+    offsetY: Math.max(DEVICE_GRAPH_VIEW_PADDING, (frameHeight - scaledHeight) / 2),
+    scaledHeight,
+    scaledWidth,
   };
 }
 
@@ -292,6 +329,8 @@ export default function AccountDevicesView({
   const rawGraphId = useId();
   const [selectedGraphNode, setSelectedGraphNode] = useState(null);
   const [graphPanning, setGraphPanning] = useState(false);
+  const [graphZoom, setGraphZoom] = useState(1);
+  const [graphViewportSize, setGraphViewportSize] = useState({ height: 0, width: 0 });
   const graphViewportRef = useRef(null);
   const graphPanRef = useRef({
     active: false,
@@ -302,6 +341,8 @@ export default function AccountDevicesView({
     startX: 0,
     startY: 0,
   });
+  const graphUserZoomedRef = useRef(false);
+  const pendingZoomAnchorRef = useRef(null);
   const suppressGraphClickRef = useRef(false);
   const graph = useMemo(() => buildDevicesGraphModel({
     connectedDevices,
@@ -327,20 +368,75 @@ export default function AccountDevicesView({
   const accountSelected = selectedGraphNode?.type === "account";
   const graphIdPrefix = `devices-graph-${rawGraphId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
   const graphLayout = useMemo(() => buildDeviceGraphLayout(graph.devices.length), [graph.devices.length]);
+  const fitZoom = useMemo(
+    () => graphFitZoom(graphLayout, graphViewportSize),
+    [graphLayout, graphViewportSize],
+  );
+  const graphMetrics = useMemo(
+    () => graphViewportMetrics(graphLayout, graphViewportSize, graphZoom),
+    [graphLayout, graphViewportSize, graphZoom],
+  );
 
   useEffect(() => {
     const viewport = graphViewportRef.current;
-    if (!viewport || !hasDevices) {
+    if (!viewport) {
       return undefined;
     }
 
-    const centerTimer = window.setTimeout(() => {
+    const updateViewportSize = () => {
+      const width = viewport.clientWidth;
+      const height = viewport.clientHeight;
+      setGraphViewportSize((current) => (
+        current.width === width && current.height === height ? current : { height, width }
+      ));
+    };
+
+    updateViewportSize();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateViewportSize);
+      return () => window.removeEventListener("resize", updateViewportSize);
+    }
+
+    const observer = new ResizeObserver(updateViewportSize);
+    observer.observe(viewport);
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
+    if (!hasDevices || graphUserZoomedRef.current) {
+      return;
+    }
+
+    setGraphZoom(fitZoom);
+  }, [fitZoom, hasDevices]);
+
+  useLayoutEffect(() => {
+    const viewport = graphViewportRef.current;
+    if (!viewport || !hasDevices) {
+      return;
+    }
+
+    const pendingAnchor = pendingZoomAnchorRef.current;
+    if (pendingAnchor && pendingAnchor.zoom === graphZoom) {
+      viewport.scrollLeft = pendingAnchor.graphX * graphZoom + graphMetrics.offsetX - pendingAnchor.anchorX;
+      viewport.scrollTop = pendingAnchor.graphY * graphZoom + graphMetrics.offsetY - pendingAnchor.anchorY;
+      pendingZoomAnchorRef.current = null;
+      return;
+    }
+
+    if (!graphUserZoomedRef.current) {
       viewport.scrollLeft = Math.max(0, (viewport.scrollWidth - viewport.clientWidth) / 2);
       viewport.scrollTop = Math.max(0, (viewport.scrollHeight - viewport.clientHeight) / 2);
-    }, 0);
-
-    return () => window.clearTimeout(centerTimer);
-  }, [graph.devices.length, graphLayout.height, graphLayout.width, hasDevices]);
+    }
+  }, [
+    graph.devices.length,
+    graphMetrics.frameHeight,
+    graphMetrics.frameWidth,
+    graphMetrics.offsetX,
+    graphMetrics.offsetY,
+    graphZoom,
+    hasDevices,
+  ]);
 
   const selectGraphNode = (node) => {
     if (suppressGraphClickRef.current) {
@@ -422,6 +518,47 @@ export default function AccountDevicesView({
     event.preventDefault();
   };
 
+  const zoomGraphAtPoint = (event) => {
+    if (!hasDevices) {
+      return;
+    }
+
+    const viewport = graphViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+
+    event.preventDefault();
+    const rect = viewport.getBoundingClientRect();
+    const anchorX = event.clientX - rect.left;
+    const anchorY = event.clientY - rect.top;
+    const graphX = (viewport.scrollLeft + anchorX - graphMetrics.offsetX) / graphZoom;
+    const graphY = (viewport.scrollTop + anchorY - graphMetrics.offsetY) / graphZoom;
+    const modeMultiplier = event.deltaMode === 1
+      ? 16
+      : event.deltaMode === 2 ? Math.max(1, viewport.clientHeight) : 1;
+    const normalizedDelta = event.deltaY * modeMultiplier;
+    const nextZoom = clampNumber(
+      graphZoom * Math.exp(-normalizedDelta * 0.0012),
+      DEVICE_GRAPH_ZOOM_MIN,
+      DEVICE_GRAPH_ZOOM_MAX,
+    );
+
+    if (nextZoom === graphZoom) {
+      return;
+    }
+
+    graphUserZoomedRef.current = true;
+    pendingZoomAnchorRef.current = {
+      anchorX,
+      anchorY,
+      graphX,
+      graphY,
+      zoom: nextZoom,
+    };
+    setGraphZoom(nextZoom);
+  };
+
   return (
     <DevicesSurface>
       <DevicesHeader>
@@ -459,95 +596,104 @@ export default function AccountDevicesView({
         onPointerDown={beginGraphPan}
         onPointerMove={moveGraphPan}
         onPointerUp={endGraphPan}
+        onWheel={zoomGraphAtPoint}
         ref={graphViewportRef}
       >
         {hasDevices ? (
-          <GraphCanvas style={{ height: `${graphLayout.height}px`, width: `${graphLayout.width}px` }}>
-            <DeviceGraphStage aria-label="Account device graph">
-              <DeviceGraphLinks
-                aria-hidden="true"
-                preserveAspectRatio="none"
-                viewBox={`0 0 ${graphLayout.width} ${graphLayout.height}`}
-              >
-                <defs>
+          <GraphFrame style={{ height: `${graphMetrics.frameHeight}px`, width: `${graphMetrics.frameWidth}px` }}>
+            <GraphCanvas
+              style={{
+                height: `${graphLayout.height}px`,
+                transform: `translate(${graphMetrics.offsetX}px, ${graphMetrics.offsetY}px) scale(${graphZoom})`,
+                width: `${graphLayout.width}px`,
+              }}
+            >
+              <DeviceGraphStage aria-label="Account device graph">
+                <DeviceGraphLinks
+                  aria-hidden="true"
+                  preserveAspectRatio="none"
+                  viewBox={`0 0 ${graphLayout.width} ${graphLayout.height}`}
+                >
+                  <defs>
+                    {graph.devices.map((device, index) => {
+                      const position = graphLayout.nodes[index];
+                      const pathKey = `${graphIdPrefix}-${index}`;
+                      return (
+                        <g key={`paths-${device.deviceId}`}>
+                          <path
+                            d={`M ${graphLayout.centerX} ${graphLayout.centerY} L ${position.x} ${position.y}`}
+                            id={`${pathKey}-outbound`}
+                          />
+                          <path
+                            d={`M ${position.x} ${position.y} L ${graphLayout.centerX} ${graphLayout.centerY}`}
+                            id={`${pathKey}-inbound`}
+                          />
+                        </g>
+                      );
+                    })}
+                  </defs>
                   {graph.devices.map((device, index) => {
                     const position = graphLayout.nodes[index];
+                    const selected = selectedGraphNode?.type === "device" && selectedGraphNode.id === device.deviceId;
                     const pathKey = `${graphIdPrefix}-${index}`;
                     return (
-                      <g key={`paths-${device.deviceId}`}>
-                        <path
+                      <g key={`line-${device.deviceId}`}>
+                        <DeviceGraphPath
                           d={`M ${graphLayout.centerX} ${graphLayout.centerY} L ${position.x} ${position.y}`}
-                          id={`${pathKey}-outbound`}
+                          data-selected={selected ? "true" : "false"}
+                          data-status={statusTone(device.liveState)}
                         />
-                        <path
-                          d={`M ${position.x} ${position.y} L ${graphLayout.centerX} ${graphLayout.centerY}`}
-                          id={`${pathKey}-inbound`}
+                        <SyncPackets
+                          inboundPathId={`${pathKey}-inbound`}
+                          index={index}
+                          outboundPathId={`${pathKey}-outbound`}
+                          selected={selected}
+                          status={device.liveState}
                         />
                       </g>
                     );
                   })}
-                </defs>
+                </DeviceGraphLinks>
+                <AccountNodeWrap>
+                  <AccountNode
+                    aria-label={`Show details for ${accountName}`}
+                    aria-pressed={accountSelected ? "true" : "false"}
+                    data-selected={accountSelected ? "true" : "false"}
+                    data-status={statusTone(graph.account.status)}
+                    onClick={() => selectGraphNode({ id: "account", type: "account" })}
+                    type="button"
+                  >
+                    <AccountBadge>{accountInitials(accountName)}</AccountBadge>
+                    <AccountMain>
+                      <AccountName title={accountName}>{accountName}</AccountName>
+                      <AccountMeta>
+                        {plural(graph.totals.workspaceCount, "workspace")} - {plural(graph.totals.todoCount, "todo")}
+                      </AccountMeta>
+                    </AccountMain>
+                    <StatusPill data-status={statusTone(graph.account.status)}>
+                      {statusLabel(graph.account.status, "Idle")}
+                    </StatusPill>
+                  </AccountNode>
+                </AccountNodeWrap>
                 {graph.devices.map((device, index) => {
                   const position = graphLayout.nodes[index];
                   const selected = selectedGraphNode?.type === "device" && selectedGraphNode.id === device.deviceId;
-                  const pathKey = `${graphIdPrefix}-${index}`;
                   return (
-                    <g key={`line-${device.deviceId}`}>
-                      <DeviceGraphPath
-                        d={`M ${graphLayout.centerX} ${graphLayout.centerY} L ${position.x} ${position.y}`}
-                        data-selected={selected ? "true" : "false"}
-                        data-status={statusTone(device.liveState)}
-                      />
-                      <SyncPackets
-                        inboundPathId={`${pathKey}-inbound`}
-                        index={index}
-                        outboundPathId={`${pathKey}-outbound`}
+                    <DeviceNodeWrap
+                      key={device.deviceId}
+                      style={{ left: `${position.x}px`, top: `${position.y}px` }}
+                    >
+                      <GraphDeviceCard
+                        device={device}
+                        onSelect={() => selectGraphNode({ id: device.deviceId, type: "device" })}
                         selected={selected}
-                        status={device.liveState}
                       />
-                    </g>
+                    </DeviceNodeWrap>
                   );
                 })}
-              </DeviceGraphLinks>
-              <AccountNodeWrap>
-                <AccountNode
-                  aria-label={`Show details for ${accountName}`}
-                  aria-pressed={accountSelected ? "true" : "false"}
-                  data-selected={accountSelected ? "true" : "false"}
-                  data-status={statusTone(graph.account.status)}
-                  onClick={() => selectGraphNode({ id: "account", type: "account" })}
-                  type="button"
-                >
-                  <AccountBadge>{accountInitials(accountName)}</AccountBadge>
-                  <AccountMain>
-                    <AccountName title={accountName}>{accountName}</AccountName>
-                    <AccountMeta>
-                      {plural(graph.totals.workspaceCount, "workspace")} - {plural(graph.totals.todoCount, "todo")}
-                    </AccountMeta>
-                  </AccountMain>
-                  <StatusPill data-status={statusTone(graph.account.status)}>
-                    {statusLabel(graph.account.status, "Idle")}
-                  </StatusPill>
-                </AccountNode>
-              </AccountNodeWrap>
-              {graph.devices.map((device, index) => {
-                const position = graphLayout.nodes[index];
-                const selected = selectedGraphNode?.type === "device" && selectedGraphNode.id === device.deviceId;
-                return (
-                  <DeviceNodeWrap
-                    key={device.deviceId}
-                    style={{ left: `${position.x}px`, top: `${position.y}px` }}
-                  >
-                    <GraphDeviceCard
-                      device={device}
-                      onSelect={() => selectGraphNode({ id: device.deviceId, type: "device" })}
-                      selected={selected}
-                    />
-                  </DeviceNodeWrap>
-                );
-              })}
-            </DeviceGraphStage>
-          </GraphCanvas>
+              </DeviceGraphStage>
+            </GraphCanvas>
+          </GraphFrame>
         ) : (
           <DevicesEmptyState>
             <AccountTree aria-hidden="true" />
@@ -755,14 +901,24 @@ const GraphViewport = styled.div`
   }
 `;
 
-const GraphCanvas = styled.div`
+const GraphFrame = styled.div`
   position: relative;
+  min-width: 100%;
+  min-height: 100%;
+`;
+
+const GraphCanvas = styled.div`
+  position: absolute;
+  top: 0;
+  left: 0;
   display: block;
   width: 980px;
   min-width: ${DEVICE_GRAPH_BASE_WIDTH}px;
   height: 620px;
   min-height: ${DEVICE_GRAPH_BASE_HEIGHT}px;
   box-sizing: border-box;
+  transform-origin: 0 0;
+  will-change: transform;
 `;
 
 const DeviceGraphStage = styled.div`

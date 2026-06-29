@@ -10045,23 +10045,28 @@ fn tokenomics_sync_delta_from_conn_with_limit_sampling(
     let retired_account_keys = tokenomics_retired_provider_account_keys();
     let mut provider_accounts = tokenomics_provider_account_rows(conn, clean_since, scope_filter)?;
     tokenomics_retain_active_account_rows(&mut provider_accounts, &retired_account_keys);
-    let mut latest_windows = tokenomics_latest_window_rows(conn, clean_since, scope_filter)?;
-    tokenomics_retain_active_account_rows(&mut latest_windows, &retired_account_keys);
-    let sync_cursor = hourly
-        .iter()
-        .chain(provider_accounts.iter())
-        .chain(latest_windows.iter())
-        .filter_map(|row| row.get("updated_at").and_then(Value::as_str))
-        .max()
-        .map(ToOwned::to_owned)
-        .or_else(|| clean_since.map(ToOwned::to_owned));
-    let hourly_count = hourly.len();
-    let provider_account_count = provider_accounts.len();
-    let latest_window_count = latest_windows.len();
-    let aliases = tokenomics_local_device_aliases(conn)?;
-    Ok(json!({
-        "known": hourly_count > 0 || provider_account_count > 0 || latest_window_count > 0,
-        "source": "rust_local_tokenomics_sqlite_delta_v2",
+      let mut latest_windows = tokenomics_latest_window_rows(conn, clean_since, scope_filter)?;
+      tokenomics_retain_active_account_rows(&mut latest_windows, &retired_account_keys);
+      let mut limit_samples =
+          tokenomics_provider_limit_sample_sync_rows(conn, clean_since, scope_filter)?;
+      tokenomics_retain_active_account_rows(&mut limit_samples, &retired_account_keys);
+      let sync_cursor = hourly
+          .iter()
+          .chain(provider_accounts.iter())
+          .chain(latest_windows.iter())
+          .chain(limit_samples.iter())
+          .filter_map(|row| row.get("updated_at").and_then(Value::as_str))
+          .max()
+          .map(ToOwned::to_owned)
+          .or_else(|| clean_since.map(ToOwned::to_owned));
+      let hourly_count = hourly.len();
+      let provider_account_count = provider_accounts.len();
+      let latest_window_count = latest_windows.len();
+      let limit_sample_count = limit_samples.len();
+      let aliases = tokenomics_local_device_aliases(conn)?;
+      Ok(json!({
+          "known": hourly_count > 0 || provider_account_count > 0 || latest_window_count > 0 || limit_sample_count > 0,
+          "source": "rust_local_tokenomics_sqlite_delta_v2",
         "schema_version": "tokenomics_v2",
         "updated_at": tokenomics_now_iso_like(),
         "current_device_id": tokenomics_local_device_id(),
@@ -10070,18 +10075,22 @@ fn tokenomics_sync_delta_from_conn_with_limit_sampling(
         "device_aliases": aliases.clone(),
         "deviceAliases": aliases,
         "hourly_count": hourly_count,
-        "provider_account_count": provider_account_count,
-        "providerAccountCount": provider_account_count,
-        "latest_window_count": latest_window_count,
-        "latestWindowCount": latest_window_count,
-        "hourly": hourly,
-        "provider_accounts": provider_accounts.clone(),
-        "providerAccounts": provider_accounts,
-        "latest_windows": latest_windows.clone(),
-        "latestWindows": latest_windows,
-        "limits": limits,
-    }))
-}
+          "provider_account_count": provider_account_count,
+          "providerAccountCount": provider_account_count,
+          "latest_window_count": latest_window_count,
+          "latestWindowCount": latest_window_count,
+          "limit_sample_count": limit_sample_count,
+          "limitSampleCount": limit_sample_count,
+          "hourly": hourly,
+          "provider_accounts": provider_accounts.clone(),
+          "providerAccounts": provider_accounts,
+          "latest_windows": latest_windows.clone(),
+          "latestWindows": latest_windows,
+          "limit_samples": limit_samples.clone(),
+          "limitSamples": limit_samples,
+          "limits": limits,
+      }))
+  }
 
 fn tokenomics_store_cloud_provider_limits(
     conn: &rusqlite::Connection,
@@ -14273,6 +14282,7 @@ mod tokenomics_tests {
     fn tokenomics_summary_separates_same_provider_accounts() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
+        let created_at = tokenomics_test_current_hour_bucket();
 
         for (account_key, account_label, input_tokens) in [
             ("openai:codex:personal", "Codex personal", 10_i64),
@@ -14286,7 +14296,7 @@ mod tokenomics_tests {
                     "provider_account_key": account_key,
                     "provider_account_label": account_label,
                     "model": "gpt-5.5",
-                    "created_at": "2026-05-30T05:00:00Z",
+                    "created_at": created_at.as_str(),
                     "input_tokens": input_tokens,
                     "output_tokens": 1,
                 }),
@@ -14714,6 +14724,7 @@ mod tokenomics_tests {
     fn tokenomics_account_sync_rollups_preserve_scope_and_include_unknown() {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         tokenomics_prepare_db(&conn).unwrap();
+        let created_at = tokenomics_test_current_hour_bucket();
 
         for usage in [
             json!({
@@ -14724,7 +14735,7 @@ mod tokenomics_tests {
                 "billing_scope_type": "personal",
                 "billing_scope_source": "test",
                 "model": "gpt-5.5",
-                "created_at": "2026-05-30T05:00:00Z",
+                "created_at": created_at.as_str(),
                 "input_tokens": 5,
             }),
             json!({
@@ -14736,7 +14747,7 @@ mod tokenomics_tests {
                 "billing_team_id": "team-a",
                 "billing_scope_source": "test",
                 "model": "gpt-5.5",
-                "created_at": "2026-05-30T06:00:00Z",
+                "created_at": created_at.as_str(),
                 "input_tokens": 7,
             }),
             json!({
@@ -14745,7 +14756,7 @@ mod tokenomics_tests {
                 "provider_account_key": "openai:codex:stable-account",
                 "provider_account_label": "Codex stable",
                 "model": "gpt-5.5",
-                "created_at": "2026-05-30T07:00:00Z",
+                "created_at": created_at.as_str(),
                 "input_tokens": 3,
             }),
         ] {

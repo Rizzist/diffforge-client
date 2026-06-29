@@ -1542,12 +1542,14 @@ export default function ToolsWorkspaceView({
   rightToolsOrchestratorOpen = false,
   scriptLogFocusRequest = null,
   sharedScriptRunResults = {},
+  surfaceActive = true,
   workspaces = [],
 }) {
   const [section, setSection] = useState(() => normalizedSectionId(embeddedDocsPanel ? "docs" : initialSection));
   const [toolsWindowBreakouts, setToolsWindowBreakouts] = useState({});
   const toolsWindowBreakoutsRef = useRef(toolsWindowBreakouts);
   const embeddedDocsWindowOpenHandledRef = useRef("");
+  const surfaceIsActive = Boolean(surfaceActive);
 
   useEffect(() => {
     const nextSection = normalizedSectionId(embeddedDocsPanel ? "docs" : initialSection);
@@ -4257,7 +4259,19 @@ export default function ToolsWorkspaceView({
     selectedScriptKey,
   ]);
 
-  const activeAppControlContext = section === "scripts" ? appControlScriptContext : appControlDocumentContext;
+  const activeAppControlContext = useMemo(() => {
+    if (!surfaceIsActive) {
+      return {
+        active: false,
+        section: "",
+        surface: "tools",
+        type: "tools_context",
+        updatedAtMs: Date.now(),
+      };
+    }
+
+    return section === "scripts" ? appControlScriptContext : appControlDocumentContext;
+  }, [appControlDocumentContext, appControlScriptContext, section, surfaceIsActive]);
 
   useEffect(() => {
     if (typeof onAppControlContextChange !== "function") return;
@@ -5532,6 +5546,7 @@ export default function ToolsWorkspaceView({
                         <DocsFilesPane
                           aria-label="Document files"
                           data-collapsed="false"
+                          data-embedded-docs-panel={embeddedDocsPanel ? "true" : undefined}
                           onContextMenu={(event) => {
                             if (event.defaultPrevented) return;
                             openDocsContextMenu(event, {
@@ -7371,6 +7386,10 @@ const DocsFilesPane = styled(FileExplorerPane)`
   border-right: 0;
   contain: layout paint;
 
+  &[data-embedded-docs-panel="true"] {
+    grid-template-rows: auto auto minmax(0, 1fr) auto;
+  }
+
   &[data-collapsed="true"] {
     grid-template-rows: auto minmax(0, 1fr);
   }
@@ -7503,6 +7522,12 @@ const DocsExplorerFooterButton = styled.button`
     color: var(--forge-accent-soft, #7db0ff);
     background: var(--files-vscode-hover);
     outline: none;
+  }
+
+  ${DocsFilesPane}[data-embedded-docs-panel="true"] & {
+    flex-basis: 104px;
+    height: 28px;
+    max-height: 28px;
   }
 `;
 

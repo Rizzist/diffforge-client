@@ -6022,7 +6022,12 @@ function WorkspaceTerminal({
     let providerSessionCaptureBuffer = "";
     let providerSessionErrorBuffer = "";
     let providerSessionCaptureMissesLogged = 0;
-    let capturedProviderSessionId = startupThreadProviderSessionId || "";
+    const startupCapturedProviderSessionId = terminalAgentKind === "opencode"
+      && startupThreadProviderSessionId
+      && !startupThreadProviderSessionId.startsWith("ses_")
+      ? ""
+      : startupThreadProviderSessionId || "";
+    let capturedProviderSessionId = startupCapturedProviderSessionId;
     let invalidProviderSessionEmitted = false;
     const emitInvalidProviderSession = (sessionId, message, source = "terminal-output") => {
       const invalidSessionId = String(sessionId || "").trim();
@@ -13607,7 +13612,7 @@ function WorkspaceTerminal({
           model: startupThreadProviderModel,
           needsAgentStart: shouldPrewarmShell,
           paneId,
-          providerSessionId: openedProviderSessionId || openedNativeSessionId || startupThreadProviderSessionId,
+          providerSessionId: openedProviderSessionId || openedNativeSessionId,
           permissionMode: startupPermissionMode,
           ready: true,
           reasoningEffort: startupThreadProviderEffort,

@@ -128,6 +128,36 @@ fn terminal_clean_provider_session_id(value: Option<&str>) -> Option<String> {
         .map(str::to_string)
 }
 
+fn terminal_provider_session_id_is_recordable_for_agent(
+    agent_id: &str,
+    agent_kind: &str,
+    provider_session_id: &str,
+) -> bool {
+    let provider_session_id = provider_session_id.trim();
+    if provider_session_id.is_empty() {
+        return false;
+    }
+    let normalized_agent = terminal_normalize_agent_kind(Some(agent_kind))
+        .or_else(|| terminal_normalize_agent_kind(Some(agent_id)));
+    if normalized_agent.as_deref() == Some("opencode") {
+        return provider_session_id.starts_with("ses_");
+    }
+    true
+}
+
+fn terminal_recordable_provider_session_id_for_metadata(
+    metadata: &TerminalInstanceMetadata,
+    provider_session_id: Option<&str>,
+) -> Option<String> {
+    let provider_session_id = terminal_clean_provider_session_id(provider_session_id)?;
+    terminal_provider_session_id_is_recordable_for_agent(
+        &metadata.agent_id,
+        &metadata.agent_kind,
+        &provider_session_id,
+    )
+    .then_some(provider_session_id)
+}
+
 fn terminal_provider_resume_args(
     provider: AgentProvider,
     provider_session_id: Option<&str>,
@@ -140,6 +170,49 @@ fn terminal_provider_resume_args(
         AgentProvider::Codex => vec!["resume".to_string(), session_id],
         AgentProvider::Claude => vec!["--resume".to_string(), session_id],
         AgentProvider::OpenCode => vec!["--session".to_string(), session_id],
+    }
+}
+
+fn terminal_resolve_provider_resume_session(
+    provider: AgentProvider,
+    requested_resume_session_id: Option<String>,
+    working_directory: &str,
+) -> (Option<String>, Option<String>) {
+    let Some(requested_session_id) = requested_resume_session_id else {
+        return (None, None);
+    };
+
+    match provider {
+        AgentProvider::Codex => match resolve_codex_resume_session(&requested_session_id, working_directory) {
+            Ok((session_id, home)) => {
+                let _ = prepare_codex_rollout_for_resume(&session_id, working_directory);
+                (Some(session_id), Some(home.to_string_lossy().to_string()))
+            }
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.terminal_provider_session.resume_drop",
+                    json!({
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "provider": "codex",
+                    }),
+                );
+                (None, None)
+            }
+        },
+        AgentProvider::Claude => (Some(requested_session_id), None),
+        AgentProvider::OpenCode => match resolve_opencode_resume_session(&requested_session_id, working_directory) {
+            Ok(session_id) => (Some(session_id), None),
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.terminal_provider_session.resume_drop",
+                    json!({
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "provider": "opencode",
+                    }),
+                );
+                (None, None)
+            }
+        },
     }
 }
 
@@ -352,7 +425,8 @@ fn terminal_runtime_apply_opened(
     provider_session_id: Option<&str>,
     source: &str,
 ) -> TerminalRuntimeSnapshot {
-    let provider_session_id = terminal_clean_provider_session_id(provider_session_id);
+    let provider_session_id =
+        terminal_recordable_provider_session_id_for_metadata(&instance.metadata, provider_session_id);
     let snapshot = if cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_id)
         || cloud_mcp_agent_uses_activity_hooks(&instance.metadata.agent_kind)
     {
@@ -371,7 +445,10 @@ fn terminal_runtime_apply_provider_session_id(
     provider_session_id: &str,
     source: &str,
 ) -> Option<TerminalRuntimeSnapshot> {
-    let provider_session_id = terminal_clean_provider_session_id(Some(provider_session_id))?;
+    let provider_session_id = terminal_recordable_provider_session_id_for_metadata(
+        &instance.metadata,
+        Some(provider_session_id),
+    )?;
     let mut runtime = instance.runtime.lock().ok()?;
     runtime.provider_session_id = Some(provider_session_id);
     runtime.native_session_id = runtime.provider_session_id.clone();
@@ -385,15 +462,27 @@ fn terminal_runtime_apply_activity_payload(
     payload: &TerminalActivityHookPayload,
 ) -> TerminalRuntimeSnapshot {
     let previous = terminal_runtime_snapshot(instance);
-    let provider_session_id = payload
-        .provider_session_id
-        .clone()
-        .or(previous.provider_session_id.clone());
-    let native_session_id = payload
-        .native_session_id
-        .clone()
-        .or(provider_session_id.clone())
-        .or(previous.native_session_id.clone());
+    let provider_session_id = terminal_recordable_provider_session_id_for_metadata(
+        &instance.metadata,
+        payload.provider_session_id.as_deref(),
+    )
+    .or_else(|| {
+        terminal_recordable_provider_session_id_for_metadata(
+            &instance.metadata,
+            previous.provider_session_id.as_deref(),
+        )
+    });
+    let native_session_id = terminal_recordable_provider_session_id_for_metadata(
+        &instance.metadata,
+        payload.native_session_id.as_deref(),
+    )
+    .or(provider_session_id.clone())
+    .or_else(|| {
+        terminal_recordable_provider_session_id_for_metadata(
+            &instance.metadata,
+            previous.native_session_id.as_deref(),
+        )
+    });
     let snapshot = TerminalRuntimeSnapshot {
         status: payload.status.clone(),
         activity_status: payload.activity_status.clone(),
@@ -884,6 +973,21 @@ fn terminal_record_coordination_provider_session_id(
     source: impl Into<String>,
 ) {
     let source = source.into();
+    if !terminal_provider_session_id_is_recordable_for_agent(
+        &coordination.agent_id,
+        &coordination.agent_kind,
+        &provider_session_id,
+    ) {
+        log_terminal_status_event(
+            "backend.terminal_provider_session.record_skip",
+            json!({
+                "provider": coordination.agent_kind,
+                "reason": "invalid-provider-session-id",
+                "source": source.clone(),
+            }),
+        );
+        return;
+    }
     tauri::async_runtime::spawn_blocking(
         move || match crate::coordination::CoordinationKernel::open(
             &coordination.repo_path,
@@ -928,8 +1032,9 @@ fn terminal_provider_session_binding_payload(
     provider_session_id: &str,
     source: &str,
 ) -> Option<WorkspaceThreadProviderSessionBinding> {
-    let provider_session_id = terminal_clean_provider_session_id(Some(provider_session_id))?;
     let metadata = instance.metadata.clone();
+    let provider_session_id =
+        terminal_recordable_provider_session_id_for_metadata(&metadata, Some(provider_session_id))?;
     Some(WorkspaceThreadProviderSessionBinding {
         workspace_id: metadata.workspace_id,
         thread_id: metadata.thread_id,
@@ -1102,6 +1207,18 @@ fn terminal_record_workspace_agent_session_history(
         return;
     }
     let runtime = terminal_runtime_snapshot(instance);
+    let provider_session_id = terminal_recordable_provider_session_id_for_metadata(
+        &metadata,
+        runtime.provider_session_id.as_deref(),
+    );
+    let native_session_id = terminal_recordable_provider_session_id_for_metadata(
+        &metadata,
+        runtime.native_session_id.as_deref(),
+    )
+    .or(provider_session_id.clone());
+    if provider_session_id.is_none() && native_session_id.is_none() {
+        return;
+    }
     let coordination_session_id = instance
         .coordination
         .as_ref()
@@ -1112,12 +1229,8 @@ fn terminal_record_workspace_agent_session_history(
         workspace_id: metadata.workspace_id,
         workspace_name: metadata.workspace_name,
         coordination_session_id,
-        provider_session_id: runtime.provider_session_id.clone().unwrap_or_default(),
-        native_session_id: runtime
-            .native_session_id
-            .clone()
-            .or(runtime.provider_session_id.clone())
-            .unwrap_or_default(),
+        provider_session_id: provider_session_id.unwrap_or_default(),
+        native_session_id: native_session_id.unwrap_or_default(),
         agent_id: metadata.agent_id,
         provider: metadata.agent_kind,
         model_id: model_id.unwrap_or_default().trim().to_string(),
@@ -1290,30 +1403,21 @@ fn terminal_launch(
     launch_options: TerminalProviderLaunchOptions,
     provider_session_id: Option<String>,
     working_directory: &str,
-) -> Result<(Vec<String>, Vec<String>, String, Option<String>, TerminalProviderResolvedLaunchOptions), String> {
+) -> Result<(
+    Vec<String>,
+    Vec<String>,
+    String,
+    Option<String>,
+    TerminalProviderResolvedLaunchOptions,
+    Option<String>,
+), String> {
     let provider = terminal_launch_provider(kind, provider.as_deref())?;
     let definition = agent_definition(provider);
     let requested_resume_session_id = provider_session_id
         .as_deref()
         .and_then(|session_id| terminal_clean_provider_session_id(Some(session_id)));
-    let mut codex_resume_home = None;
-    let resume_session_id =
-        if matches!(provider, AgentProvider::Codex) && requested_resume_session_id.is_some() {
-            requested_resume_session_id
-                .as_deref()
-                .and_then(|session_id| {
-                    match resolve_codex_resume_session(session_id, working_directory) {
-                        Ok((session_id, home)) => {
-                            let _ = prepare_codex_rollout_for_resume(&session_id, working_directory);
-                            codex_resume_home = Some(home.to_string_lossy().to_string());
-                            Some(session_id)
-                        }
-                        Err(_) => None,
-                    }
-                })
-        } else {
-            requested_resume_session_id
-        };
+    let (resume_session_id, codex_resume_home) =
+        terminal_resolve_provider_resume_session(provider, requested_resume_session_id, working_directory);
     let mut args = terminal_provider_resume_args(provider, resume_session_id.as_deref());
 
     // When resuming, the session transcript knows the exact model that was
@@ -1363,6 +1467,7 @@ fn terminal_launch(
         definition.label.to_string(),
         codex_resume_home,
         resolved_launch,
+        resume_session_id,
     ))
 }
 
@@ -5555,13 +5660,21 @@ async fn terminal_open(
     let mut coordination_context: Option<crate::coordination::models::TerminalCoordinationContext> =
         None;
 
-    let (command_candidates, args, label, codex_resume_home, resolved_launch) = if is_prewarm_pty || plain_shell {
+    let (
+        command_candidates,
+        args,
+        label,
+        codex_resume_home,
+        resolved_launch,
+        effective_provider_session_id,
+    ) = if is_prewarm_pty || plain_shell {
         (
             Vec::new(),
             Vec::new(),
             "Prepared PTY".to_string(),
             None,
             TerminalProviderResolvedLaunchOptions::default(),
+            requested_provider_session_id.clone(),
         )
     } else {
         terminal_launch(
@@ -5846,7 +5959,7 @@ async fn terminal_open(
     );
     let runtime_snapshot = terminal_runtime_apply_opened(
         &instance,
-        requested_provider_session_id.as_deref(),
+        effective_provider_session_id.as_deref(),
         "terminal-open",
     );
     terminal_record_workspace_agent_session_history(
@@ -5860,7 +5973,7 @@ async fn terminal_open(
     );
     if let (Some(coordination), Some(provider_session_id)) = (
         terminal_coordination.clone(),
-        requested_provider_session_id.clone(),
+        effective_provider_session_id.clone(),
     ) {
         terminal_record_coordination_provider_session_id(
             coordination,
@@ -6114,6 +6227,29 @@ async fn terminal_record_provider_session(
         .is_some_and(|expected_id| expected_id != instance.id)
     {
         return Err("Terminal session was replaced before provider session record.".to_string());
+    }
+    if !terminal_provider_session_id_is_recordable_for_agent(
+        &instance.metadata.agent_id,
+        &instance.metadata.agent_kind,
+        &provider_session_id,
+    ) {
+        log_terminal_status_event(
+            "backend.terminal_provider_session.record_skip",
+            json!({
+                "agent_kind": instance.metadata.agent_kind.clone(),
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&request.pane_id),
+                "reason": "invalid-provider-session-id",
+                "source": source.clone(),
+            }),
+        );
+        return Ok(TerminalProviderSessionRecordResult {
+            pane_id: request.pane_id,
+            instance_id: instance.id,
+            provider_session_id,
+            recorded: false,
+            source,
+        });
     }
 
     terminal_runtime_apply_provider_session_id(&instance, &provider_session_id, &source);
@@ -6607,27 +6743,8 @@ async fn start_terminal_agent_in_prepared_pty(
         };
     };
     let working_directory_text = instance.working_directory.to_string_lossy().to_string();
-    let mut codex_resume_home = None;
-    let resume_session_id =
-        if matches!(provider, AgentProvider::Codex) && requested_resume_session_id.is_some() {
-            requested_resume_session_id
-                .as_deref()
-                .and_then(|session_id| {
-                    match resolve_codex_resume_session(session_id, &working_directory_text) {
-                        Ok((session_id, home)) => {
-                            let _ = prepare_codex_rollout_for_resume(
-                                &session_id,
-                                &working_directory_text,
-                            );
-                            codex_resume_home = Some(home.to_string_lossy().to_string());
-                            Some(session_id)
-                        }
-                        Err(_) => None,
-                    }
-                })
-        } else {
-            requested_resume_session_id
-        };
+    let (resume_session_id, codex_resume_home) =
+        terminal_resolve_provider_resume_session(provider, requested_resume_session_id, &working_directory_text);
     let mut args = terminal_provider_resume_args(provider, resume_session_id.as_deref());
 
     // Resumed sessions continue on the exact model they last used; the
@@ -11586,9 +11703,9 @@ fn apply_terminal_activity_hook_payload(
     if let Some(provider_session_id) = payload
         .provider_session_id
         .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
+        .and_then(|value| {
+            terminal_recordable_provider_session_id_for_metadata(&instance.metadata, Some(value))
+        })
     {
         terminal_record_workspace_provider_session_binding(
             Some(app.clone()),
@@ -15048,6 +15165,25 @@ mod terminal_tests {
             vec!["--session".to_string(), "opencode-session-1".to_string()]
         );
         assert!(terminal_provider_resume_args(AgentProvider::Codex, Some("   ")).is_empty());
+    }
+
+    #[test]
+    fn opencode_provider_session_recording_requires_native_session_id() {
+        assert!(terminal_provider_session_id_is_recordable_for_agent(
+            "opencode",
+            "opencode",
+            "ses_0f32849b3ffeGn2tL6DnSIUCsZ",
+        ));
+        assert!(!terminal_provider_session_id_is_recordable_for_agent(
+            "opencode",
+            "opencode",
+            "019f0cd7-1347-7273-b20f-e959c3772a01",
+        ));
+        assert!(terminal_provider_session_id_is_recordable_for_agent(
+            "codex",
+            "codex",
+            "019f0cd7-1347-7273-b20f-e959c3772a01",
+        ));
     }
 
     #[test]

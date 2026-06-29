@@ -48,6 +48,7 @@ import { Person } from "@styled-icons/material-rounded/Person";
 import { Public } from "@styled-icons/material-rounded/Public";
 import { Route } from "@styled-icons/material-rounded/Route";
 import { Schema } from "@styled-icons/material-rounded/Schema";
+import { Search } from "@styled-icons/material-rounded/Search";
 import { Security } from "@styled-icons/material-rounded/Security";
 import { Settings } from "@styled-icons/material-rounded/Settings";
 import { Storage } from "@styled-icons/material-rounded/Storage";
@@ -5610,7 +5611,7 @@ export default function ArchitectureWorkspaceView({
       setSessionHistoryState((state) => (state === "ready" ? "refreshing" : "loading"));
       invoke("workspace_agent_session_history_list", {
         request: {
-          limit: 200,
+          limit: 500,
           rootDirectory: rootDirectoryForStore || null,
           workspaceId,
         },
@@ -9627,8 +9628,6 @@ function sessionHistoryStatusLabel(item) {
 }
 
 function sessionHistoryTitle(item) {
-  const storedTitle = text(item?.title);
-  const fallbackTitle = ["agent", "coding agent session"].includes(storedTitle.toLowerCase()) ? "" : storedTitle;
   return text(
     item?.firstUserMessage
       || item?.first_user_message
@@ -9636,13 +9635,55 @@ function sessionHistoryTitle(item) {
       || item?.initial_user_message
       || item?.promptPreview
       || item?.prompt_preview
-      || fallbackTitle
       || item?.providerSessionId
       || item?.provider_session_id
+      || item?.nativeSessionId
+      || item?.native_session_id
       || item?.threadId
       || item?.thread_id,
     sessionHistoryAgentLabel(item),
   );
+}
+
+function sessionHistorySearchFields(item) {
+  return [
+    sessionHistoryTitle(item),
+    item?.firstUserMessage,
+    item?.first_user_message,
+    sessionHistoryAgentLabel(item),
+    sessionHistoryAgentKey(item),
+    sessionHistoryModelLabel(item),
+    item?.modelSource,
+    item?.model_source,
+    sessionHistoryStatusLabel(item),
+    item?.status,
+    item?.provider,
+    item?.agentId,
+    item?.agent_id,
+    item?.providerSessionId,
+    item?.provider_session_id,
+    item?.nativeSessionId,
+    item?.native_session_id,
+    item?.threadId,
+    item?.thread_id,
+    item?.source,
+    item?.cwd,
+    item?.workspaceName,
+    item?.workspace_name,
+  ]
+    .map((value) => text(value).toLowerCase())
+    .filter(Boolean);
+}
+
+function sessionHistoryMatchesSearch(item, query) {
+  const terms = text(query)
+    .toLowerCase()
+    .split(/\s+/u)
+    .filter(Boolean);
+  if (!terms.length) return true;
+  const fields = sessionHistorySearchFields(item);
+  const haystack = fields.join("\n");
+  return terms.every((term) => haystack.includes(term) || fields.some((field) => field.startsWith(term)));
 }
 
 function sessionHistoryExactSessionValues(value) {
@@ -9732,6 +9773,10 @@ function SessionHistoryProviderIcon({ item }) {
   return <Terminal aria-hidden="true" />;
 }
 
+const SESSION_HISTORY_ROW_HEIGHT = 84;
+const SESSION_HISTORY_ROW_GAP = 8;
+const SESSION_HISTORY_OVERSCAN = 6;
+
 function SessionHistoryPanel({
   error = "",
   items = [],
@@ -9742,23 +9787,89 @@ function SessionHistoryPanel({
   terminalOptions = [],
   workspaceId = "",
 }) {
-  const hasItems = items.length > 0;
+  const [searchQuery, setSearchQuery] = useState("");
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
+  const listRef = useRef(null);
+  const filteredItems = useMemo(
+    () => items.filter((item) => sessionHistoryMatchesSearch(item, searchQuery)),
+    [items, searchQuery],
+  );
+  const hasItems = filteredItems.length > 0;
+  const hasAnyItems = items.length > 0;
+  useEffect(() => {
+    setScrollTop(0);
+    if (listRef.current) {
+      listRef.current.scrollTop = 0;
+    }
+  }, [items, searchQuery]);
+  useEffect(() => {
+    const node = listRef.current;
+    if (!node) return undefined;
+    const updateHeight = () => setViewportHeight(node.clientHeight || 0);
+    updateHeight();
+    if (typeof ResizeObserver === "undefined") {
+      window.addEventListener("resize", updateHeight);
+      return () => window.removeEventListener("resize", updateHeight);
+    }
+    const observer = new ResizeObserver(updateHeight);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, [hasItems]);
   const loading = state === "loading";
+  const searchActive = text(searchQuery).length > 0;
+  const rowStride = SESSION_HISTORY_ROW_HEIGHT + SESSION_HISTORY_ROW_GAP;
+  const visibleHeight = viewportHeight || 560;
+  const startIndex = Math.max(0, Math.floor(scrollTop / rowStride) - SESSION_HISTORY_OVERSCAN);
+  const endIndex = Math.min(
+    filteredItems.length,
+    startIndex + Math.ceil(visibleHeight / rowStride) + SESSION_HISTORY_OVERSCAN * 2,
+  );
+  const virtualItems = filteredItems.slice(startIndex, endIndex);
+  const totalListHeight = Math.max(0, filteredItems.length * rowStride - SESSION_HISTORY_ROW_GAP);
   return (
     <HistoryPane>
-      <TimelineHeader>
-        <div>
-          <TimelineKicker>Session history</TimelineKicker>
-          <TimelineTitle>{repoLabel}</TimelineTitle>
-        </div>
-        <TimelineSummary>
-          {loading && !hasItems ? "Loading" : `${items.length} session${items.length === 1 ? "" : "s"}`}
-        </TimelineSummary>
-      </TimelineHeader>
+      <SessionHistoryHeaderBlock>
+        <TimelineHeader>
+          <div>
+            <TimelineKicker>Session history</TimelineKicker>
+            <TimelineTitle>{repoLabel}</TimelineTitle>
+          </div>
+          <TimelineSummary>
+            {loading && !hasAnyItems
+              ? "Loading"
+              : searchActive
+                ? `${filteredItems.length} of ${items.length} session${items.length === 1 ? "" : "s"}`
+                : `${items.length} session${items.length === 1 ? "" : "s"}`}
+          </TimelineSummary>
+        </TimelineHeader>
+        {(hasAnyItems || searchActive) && (
+          <SessionHistoryControls>
+            <SessionHistorySearchBox>
+              <Search aria-hidden="true" />
+              <input
+                aria-label="Search session history"
+                autoComplete="off"
+                onChange={(event) => setSearchQuery(event.target.value)}
+                placeholder="Search sessions"
+                type="search"
+                value={searchQuery}
+              />
+            </SessionHistorySearchBox>
+          </SessionHistoryControls>
+        )}
+      </SessionHistoryHeaderBlock>
       {error && <ArchitectureError>{error}</ArchitectureError>}
       {hasItems ? (
-        <SessionHistoryList aria-label="Session history list">
-          {items.map((item, index) => {
+        <SessionHistoryList
+          aria-label="Session history list"
+          onScroll={(event) => setScrollTop(event.currentTarget.scrollTop)}
+          ref={listRef}
+          role="list"
+        >
+          <SessionHistoryVirtualSpacer style={{ height: totalListHeight }}>
+          {virtualItems.map((item, virtualIndex) => {
+            const index = startIndex + virtualIndex;
             const createdMs = parseTimeMs(item?.createdAtMs ?? item?.created_at_ms);
             const latestMs = parseTimeMs(item?.latestAtMs ?? item?.latest_at_ms);
             const statusKind = sessionHistoryStatusKind(item);
@@ -9767,64 +9878,76 @@ function SessionHistoryPanel({
             const providerSessionId = sessionHistoryProviderSessionId(item);
             const sessionTitle = sessionHistoryTitle(item);
             return (
-              <SessionHistoryCard data-agent={sessionHistoryAgentKey(item)} key={id}>
-                <SessionHistoryIcon aria-hidden="true">
-                  <SessionHistoryProviderIcon item={item} />
-                </SessionHistoryIcon>
-                <SessionHistoryContent>
-                  <SessionHistoryCardTop>
-                    <div>
-                      <SessionHistoryAgent>{sessionHistoryAgentLabel(item)}</SessionHistoryAgent>
-                      <SessionHistoryTitle title={sessionTitle}>{sessionTitle}</SessionHistoryTitle>
-                    </div>
-                    <SessionHistoryCardTopActions>
-                      <StatusPill data-status={statusKind}>{sessionHistoryStatusLabel(item)}</StatusPill>
-                      {terminalMatch ? (
-                        <SessionHistoryActionButton
-                          aria-label={`Go-to this terminal tab for ${sessionTitle}`}
-                          data-variant="goto"
-                          onClick={() => onGoToTerminal?.({
-                            item,
-                            terminal: terminalMatch,
-                            workspaceId,
-                          })}
-                          title={`Go to ${terminalMatch.label || "terminal"} and highlight it`}
-                          type="button"
-                        >
-                          <Terminal aria-hidden="true" />
-                          <span>Go-to this terminal tab</span>
-                        </SessionHistoryActionButton>
-                      ) : (
-                        <SessionHistoryActionButton
-                          aria-label={`Open terminal for ${sessionTitle}`}
-                          data-variant="open"
-                          disabled={!providerSessionId}
-                          onClick={() => onOpenTerminal?.({
-                            item,
-                            providerSessionId,
-                            workspaceId,
-                          })}
-                          title={providerSessionId ? "Open this session in a terminal" : "No provider session id recorded"}
-                          type="button"
-                        >
-                          <Add aria-hidden="true" />
-                          <span>Open</span>
-                        </SessionHistoryActionButton>
-                      )}
-                    </SessionHistoryCardTopActions>
-                  </SessionHistoryCardTop>
-                  <SessionHistoryMeta>
-                    <span title={sessionHistoryModelLabel(item)}>{sessionHistoryModelLabel(item)}</span>
-                    <span>created {formatRelativeTimeMs(createdMs) || formatTime(createdMs) || "unknown"}</span>
-                    <span>latest {formatRelativeTimeMs(latestMs) || formatTime(latestMs) || "unknown"}</span>
-                  </SessionHistoryMeta>
-                </SessionHistoryContent>
-              </SessionHistoryCard>
+              <SessionHistoryVirtualRow
+                key={id}
+                style={{ transform: `translateY(${index * rowStride}px)` }}
+              >
+                <SessionHistoryCard data-agent={sessionHistoryAgentKey(item)} role="listitem">
+                  <SessionHistoryIcon aria-hidden="true">
+                    <SessionHistoryProviderIcon item={item} />
+                  </SessionHistoryIcon>
+                  <SessionHistoryContent>
+                    <SessionHistoryCardTop>
+                      <div>
+                        <SessionHistoryAgent>{sessionHistoryAgentLabel(item)}</SessionHistoryAgent>
+                        <SessionHistoryTitle title={sessionTitle}>{sessionTitle}</SessionHistoryTitle>
+                      </div>
+                      <SessionHistoryCardTopActions>
+                        <StatusPill data-status={statusKind}>{sessionHistoryStatusLabel(item)}</StatusPill>
+                        {terminalMatch ? (
+                          <SessionHistoryActionButton
+                            aria-label={`Go-to this terminal tab for ${sessionTitle}`}
+                            data-variant="goto"
+                            onClick={() => onGoToTerminal?.({
+                              item,
+                              terminal: terminalMatch,
+                              workspaceId,
+                            })}
+                            title={`Go to ${terminalMatch.label || "terminal"} and highlight it`}
+                            type="button"
+                          >
+                            <Terminal aria-hidden="true" />
+                            <span>Go-to this terminal tab</span>
+                          </SessionHistoryActionButton>
+                        ) : (
+                          <SessionHistoryActionButton
+                            aria-label={`Open terminal for ${sessionTitle}`}
+                            data-variant="open"
+                            disabled={!providerSessionId}
+                            onClick={() => onOpenTerminal?.({
+                              item,
+                              providerSessionId,
+                              workspaceId,
+                            })}
+                            title={providerSessionId ? "Open this session in a terminal" : "No provider session id recorded"}
+                            type="button"
+                          >
+                            <Add aria-hidden="true" />
+                            <span>Open</span>
+                          </SessionHistoryActionButton>
+                        )}
+                      </SessionHistoryCardTopActions>
+                    </SessionHistoryCardTop>
+                    <SessionHistoryMeta>
+                      <span title={sessionHistoryModelLabel(item)}>{sessionHistoryModelLabel(item)}</span>
+                      <span>created {formatRelativeTimeMs(createdMs) || formatTime(createdMs) || "unknown"}</span>
+                      <span>latest {formatRelativeTimeMs(latestMs) || formatTime(latestMs) || "unknown"}</span>
+                    </SessionHistoryMeta>
+                  </SessionHistoryContent>
+                </SessionHistoryCard>
+              </SessionHistoryVirtualRow>
             );
           })}
+          </SessionHistoryVirtualSpacer>
         </SessionHistoryList>
       ) : (
-        <EmptyState>{loading ? "Loading session history..." : "No session history recorded yet."}</EmptyState>
+        <EmptyState>
+          {loading
+            ? "Loading session history..."
+            : searchActive
+              ? "No sessions match that search."
+              : "No session history recorded yet."}
+        </EmptyState>
       )}
     </HistoryPane>
   );
@@ -13370,6 +13493,60 @@ const TimelineSummary = styled.span`
   font-weight: 820;
 `;
 
+const SessionHistoryHeaderBlock = styled.div`
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+`;
+
+const SessionHistoryControls = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+`;
+
+const SessionHistorySearchBox = styled.label`
+  position: relative;
+  display: block;
+  width: min(360px, 100%);
+  min-width: 0;
+
+  svg {
+    position: absolute;
+    top: 50%;
+    left: 10px;
+    width: 15px;
+    height: 15px;
+    color: rgba(148, 163, 184, 0.72);
+    pointer-events: none;
+    transform: translateY(-50%);
+  }
+
+  input {
+    width: 100%;
+    box-sizing: border-box;
+    min-height: 34px;
+    padding: 0 12px 0 32px;
+    border: 1px solid rgba(148, 163, 184, 0.16);
+    border-radius: 8px;
+    color: rgba(241, 245, 249, 0.94);
+    background: rgba(2, 6, 23, 0.28);
+    font-size: 12px;
+    font-weight: 760;
+    outline: none;
+  }
+
+  input::placeholder {
+    color: rgba(148, 163, 184, 0.58);
+  }
+
+  input:focus {
+    border-color: rgba(var(--forge-accent-rgb), 0.52);
+    box-shadow: 0 0 0 2px rgba(var(--forge-accent-rgb), 0.12);
+  }
+`;
+
 const HistorySplit = styled.div`
   display: grid;
   grid-template-columns: minmax(170px, 0.82fr) minmax(0, 1.18fr);
@@ -13390,13 +13567,26 @@ const HistorySplit = styled.div`
 `;
 
 const SessionHistoryList = styled.div`
-  display: grid;
-  align-content: start;
-  gap: 8px;
+  position: relative;
+  display: block;
   min-width: 0;
   min-height: 0;
   overflow: auto;
   padding-right: 2px;
+`;
+
+const SessionHistoryVirtualSpacer = styled.div`
+  position: relative;
+  min-width: 0;
+`;
+
+const SessionHistoryVirtualRow = styled.div`
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 2px;
+  height: 84px;
+  will-change: transform;
 `;
 
 const SessionHistoryCard = styled.article`
@@ -13404,11 +13594,14 @@ const SessionHistoryCard = styled.article`
   grid-template-columns: 34px minmax(0, 1fr);
   align-items: center;
   gap: 10px;
+  box-sizing: border-box;
+  height: 84px;
   min-width: 0;
   padding: 10px;
   border: 1px solid rgba(148, 163, 184, 0.13);
   border-radius: 8px;
   background: rgba(2, 6, 23, 0.28);
+  overflow: hidden;
 
   &[data-agent="codex"] {
     border-color: rgba(96, 165, 250, 0.18);
@@ -13458,8 +13651,8 @@ const SessionHistoryCardTop = styled.div`
   }
 
   @media (max-width: 760px) {
-    align-items: stretch;
-    flex-direction: column;
+    align-items: flex-start;
+    flex-direction: row;
   }
 `;
 

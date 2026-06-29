@@ -2088,6 +2088,59 @@ fn todo_store_item_explicit_status(item: &Value) -> String {
     ))
 }
 
+fn todo_store_status_is_hard_delete_eligible(status: &str) -> bool {
+    matches!(
+        todo_store_normalize_lifecycle_status(status).as_str(),
+        "" | "listed" | "queued"
+    )
+}
+
+fn todo_store_status_is_terminal_touched(status: &str) -> bool {
+    matches!(
+        todo_store_normalize_lifecycle_status(status).as_str(),
+        "running" | "paused" | "completed" | "failed" | "cancelled" | "interrupted" | "timed_out"
+    )
+}
+
+fn todo_store_item_has_terminal_touch_evidence(item: &Value) -> bool {
+    if todo_store_status_is_terminal_touched(&todo_store_item_status(item)) {
+        return true;
+    }
+    !todo_dispatch_text(
+        item,
+        &[
+            "lastDispatchId",
+            "last_dispatch_id",
+            "dispatchId",
+            "dispatch_id",
+            "submittedAt",
+            "submitted_at",
+            "sentAt",
+            "sent_at",
+            "startedAt",
+            "started_at",
+            "runningAt",
+            "running_at",
+            "completedAt",
+            "completed_at",
+            "failedAt",
+            "failed_at",
+            "interruptedAt",
+            "interrupted_at",
+            "cancelledAt",
+            "cancelled_at",
+            "timedOutAt",
+            "timed_out_at",
+        ],
+    )
+    .is_empty()
+}
+
+fn todo_store_item_hard_delete_eligible(item: &Value) -> bool {
+    todo_store_status_is_hard_delete_eligible(&todo_store_item_status(item))
+        && !todo_store_item_has_terminal_touch_evidence(item)
+}
+
 fn todo_store_item_status_stamp_ms(item: &Value) -> u64 {
     let stamp = todo_dispatch_text(
         item,
@@ -2806,11 +2859,89 @@ fn todo_dispatch_todo_sync_commit_payload(
     }))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TodoStoreDeleteMode {
+    Hard,
+    Tombstone,
+}
+
+impl TodoStoreDeleteMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hard => "hard",
+            Self::Tombstone => "tombstone",
+        }
+    }
+
+    fn op_status(self) -> &'static str {
+        match self {
+            Self::Hard => "removed",
+            Self::Tombstone => "deleted",
+        }
+    }
+}
+
+fn todo_store_delete_mode_from_text(value: &str) -> Option<TodoStoreDeleteMode> {
+    match value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' '], "_")
+        .as_str()
+    {
+        "hard" | "permanent" | "permanent_delete" | "purge" => Some(TodoStoreDeleteMode::Hard),
+        "tombstone" | "soft" | "legacy" | "deleted" | "delete" => {
+            Some(TodoStoreDeleteMode::Tombstone)
+        }
+        _ => None,
+    }
+}
+
+fn todo_dispatch_remote_delete_mode(event: &Value) -> Option<TodoStoreDeleteMode> {
+    todo_store_delete_mode_from_text(&todo_dispatch_text(
+        event,
+        &[
+            "delete_mode",
+            "deleteMode",
+            "deletion_mode",
+            "deletionMode",
+        ],
+    ))
+}
+
+fn todo_store_delete_references_hard_eligible(reference_items: &[Value]) -> bool {
+    !reference_items.is_empty()
+        && reference_items
+            .iter()
+            .all(todo_store_item_hard_delete_eligible)
+}
+
+fn todo_store_classify_delete_mode(
+    reference_items: &[Value],
+    requested_delete_mode: Option<TodoStoreDeleteMode>,
+) -> TodoStoreDeleteMode {
+    if requested_delete_mode == Some(TodoStoreDeleteMode::Tombstone) {
+        return TodoStoreDeleteMode::Tombstone;
+    }
+    if todo_store_delete_references_hard_eligible(reference_items) {
+        TodoStoreDeleteMode::Hard
+    } else {
+        TodoStoreDeleteMode::Tombstone
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TodoStoreDeleteResult {
+    pub(crate) removed_ids: Vec<String>,
+    pub(crate) hard_deleted_ids: Vec<String>,
+    pub(crate) tombstoned_ids: Vec<String>,
+}
+
 fn todo_dispatch_delete_todo_sync_commit_payload(
     workspace_id: &str,
     todo_ids: &[String],
     reason: &str,
     origin: &str,
+    delete_mode: TodoStoreDeleteMode,
 ) -> Option<Value> {
     let safe_todo_ids = todo_ids
         .iter()
@@ -2846,6 +2977,8 @@ fn todo_dispatch_delete_todo_sync_commit_payload(
         return None;
     }
     let deleted_at = chrono_like_now_iso();
+    let delete_mode_str = delete_mode.as_str();
+    let op_status = delete_mode.op_status();
     let ops = safe_todo_ids
         .iter()
         .map(|todo_id| {
@@ -2858,7 +2991,7 @@ fn todo_dispatch_delete_todo_sync_commit_payload(
                 todo_id,
                 device_id,
                 workspace_id,
-                "deleted",
+                op_status,
                 {
                     "rust_authoritative": true,
                     "rustAuthoritative": true,
@@ -2881,6 +3014,8 @@ fn todo_dispatch_delete_todo_sync_commit_payload(
                     "targetWorkspaceId": workspace_id,
                     "deleted_at": deleted_at,
                     "deletedAt": deleted_at,
+                    "delete_mode": delete_mode_str,
+                    "deleteMode": delete_mode_str,
                     "delete_reason": reason,
                     "deleteReason": reason,
                     "origin": origin,
@@ -2913,9 +3048,15 @@ fn todo_store_enqueue_delete_todo_sync_commit(
     todo_ids: &[String],
     reason: &str,
     origin: &str,
+    delete_mode: TodoStoreDeleteMode,
 ) {
-    let Some(payload) =
-        todo_dispatch_delete_todo_sync_commit_payload(workspace_id, todo_ids, reason, origin)
+    let Some(payload) = todo_dispatch_delete_todo_sync_commit_payload(
+        workspace_id,
+        todo_ids,
+        reason,
+        origin,
+        delete_mode,
+    )
     else {
         return;
     };
@@ -2937,6 +3078,7 @@ fn todo_store_enqueue_delete_todo_sync_commit(
             "backend.todo_store.delete_todo_sync_commit_queued",
             json!({
                 "reason": reason,
+                "deleteMode": delete_mode.as_str(),
                 "response": response,
                 "workspace_id": workspace_id,
             }),
@@ -3151,33 +3293,70 @@ fn todo_store_push_corrections(
     todo_store_push_items(app, &workspace_id, items, reason);
 }
 
-/// Tombstone + queue-store removal + journal update in one
-/// place. Every delete path (history view, webview list, remote lever) funnels
-/// here so a deleted todo can never come back from any replica.
+/// Queue-store removal + journal update in one place. Unsent listed/queued
+/// todos are hard-deleted; terminal-touched todos still get tombstones so
+/// execution history cannot be resurrected by a stale replica.
 pub(crate) fn todo_store_delete_internal(
     app: &AppHandle,
     workspace_id: &str,
     todo_ids: &[String],
     reason: &str,
     origin: &str,
-) -> Vec<String> {
-    let tombstoned = todo_store_add_tombstones(workspace_id, todo_ids, reason, origin);
+) -> TodoStoreDeleteResult {
+    todo_store_delete_internal_with_mode(app, workspace_id, todo_ids, reason, origin, None)
+}
+
+fn todo_store_delete_internal_with_mode(
+    app: &AppHandle,
+    workspace_id: &str,
+    todo_ids: &[String],
+    reason: &str,
+    origin: &str,
+    requested_delete_mode: Option<TodoStoreDeleteMode>,
+) -> TodoStoreDeleteResult {
     let all_ids = todo_ids
         .iter()
         .map(|id| id.trim().to_string())
         .filter(|id| !id.is_empty())
         .collect::<Vec<_>>();
     if all_ids.is_empty() {
-        return tombstoned;
+        return TodoStoreDeleteResult::default();
     }
-    if let Some(path) = todo_dispatch_data_path("queues", workspace_id) {
-        let items = todo_dispatch_queue_read(&path)
-            .get("items")
-            .and_then(Value::as_array)
+    let mut hard_deleted_ids = Vec::new();
+    let mut tombstone_candidate_ids = Vec::new();
+    let mut next_items = None;
+    let queue_path = todo_dispatch_data_path("queues", workspace_id);
+    let items = queue_path
+        .as_deref()
+        .map(|path| {
+            todo_dispatch_queue_read(path)
+                .get("items")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        })
+        .unwrap_or_default();
+    for todo_id in &all_ids {
+        let matching_items = items
+            .iter()
+            .filter(|item| todo_store_item_matches_id(item, todo_id))
             .cloned()
-            .unwrap_or_default();
+            .collect::<Vec<_>>();
+        let reference_items = if matching_items.is_empty() {
+            cloud_mcp_todo_mirror_lookup_todo_item(workspace_id, todo_id)
+                .into_iter()
+                .collect::<Vec<_>>()
+        } else {
+            matching_items
+        };
+        match todo_store_classify_delete_mode(&reference_items, requested_delete_mode) {
+            TodoStoreDeleteMode::Hard => hard_deleted_ids.push(todo_id.clone()),
+            TodoStoreDeleteMode::Tombstone => tombstone_candidate_ids.push(todo_id.clone()),
+        }
+    }
+    if queue_path.is_some() {
         let before = items.len();
-        let next_items = items
+        let filtered_items = items
             .into_iter()
             .filter(|item| {
                 !all_ids
@@ -3185,17 +3364,25 @@ pub(crate) fn todo_store_delete_internal(
                     .any(|id| todo_store_item_matches_id(item, id))
             })
             .collect::<Vec<_>>();
-        if next_items.len() != before {
-            todo_dispatch_queue_write(workspace_id, &next_items);
+        if filtered_items.len() != before {
+            next_items = Some(filtered_items);
         }
     }
+    let tombstoned_ids =
+        todo_store_add_tombstones(workspace_id, &tombstone_candidate_ids, reason, origin);
+    if let Some(next_items) = next_items {
+        todo_dispatch_queue_write(workspace_id, &next_items);
+    }
     for todo_id in &all_ids {
+        let hard_deleted = hard_deleted_ids.iter().any(|id| id == todo_id);
         todo_dispatch_journal_append(
             workspace_id,
             json!({
-                "kind": "remote_todo_deleted",
+                "kind": if hard_deleted { "remote_todo_hard_deleted" } else { "remote_todo_deleted" },
                 "itemId": todo_id,
                 "at": chrono_like_now_iso(),
+                "deleteMode": if hard_deleted { "hard" } else { "tombstone" },
+                "delete_mode": if hard_deleted { "hard" } else { "tombstone" },
                 "reason": reason,
                 "origin": origin,
             }),
@@ -3204,10 +3391,27 @@ pub(crate) fn todo_store_delete_internal(
     // Client-authoritative: purge the local mirror right away so every view
     // converges instantly; the cloud removal below syncs in the background.
     let purged = cloud_mcp_todo_mirror_purge_todo_ids(&all_ids);
-    if !all_ids.is_empty() {
-        todo_store_enqueue_delete_todo_sync_commit(app, workspace_id, &all_ids, reason, origin);
+    if !hard_deleted_ids.is_empty() {
+        todo_store_enqueue_delete_todo_sync_commit(
+            app,
+            workspace_id,
+            &hard_deleted_ids,
+            reason,
+            origin,
+            TodoStoreDeleteMode::Hard,
+        );
     }
-    todo_store_push_removals(app, workspace_id, all_ids, reason);
+    if !tombstoned_ids.is_empty() {
+        todo_store_enqueue_delete_todo_sync_commit(
+            app,
+            workspace_id,
+            &tombstoned_ids,
+            reason,
+            origin,
+            TodoStoreDeleteMode::Tombstone,
+        );
+    }
+    todo_store_push_removals(app, workspace_id, all_ids.clone(), reason);
     todo_store_emit_changed(app, workspace_id, reason, "store");
     if purged > 0 {
         let _ = app.emit(
@@ -3219,7 +3423,11 @@ pub(crate) fn todo_store_delete_internal(
             }),
         );
     }
-    tombstoned
+    TodoStoreDeleteResult {
+        removed_ids: all_ids,
+        hard_deleted_ids,
+        tombstoned_ids,
+    }
 }
 
 #[tauri::command]
@@ -3660,7 +3868,7 @@ async fn todo_store_delete(
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| "todo_store_delete".to_string());
-    let tombstoned = tauri::async_runtime::spawn_blocking({
+    let result = tauri::async_runtime::spawn_blocking({
         let app = app.clone();
         let workspace_id = workspace_id.clone();
         move || {
@@ -3670,7 +3878,12 @@ async fn todo_store_delete(
     })
     .await
     .map_err(|error| format!("Todo store delete worker failed: {error}"))?;
-    Ok(json!({ "workspaceId": workspace_id, "tombstonedIds": tombstoned }))
+    Ok(json!({
+        "workspaceId": workspace_id,
+        "deletedIds": result.removed_ids,
+        "hardDeletedIds": result.hard_deleted_ids,
+        "tombstonedIds": result.tombstoned_ids,
+    }))
 }
 
 /// Cancel with a guaranteed outcome. If the todo's pane is mid-turn and a
@@ -6304,6 +6517,71 @@ mod todo_store_tests {
     }
 
     #[test]
+    fn hard_delete_eligibility_allows_only_unsent_items() {
+        let listed = json!({ "id": "todo-listed", "status": "listed" });
+        let queued =
+            json!({ "id": "todo-queued", "status": "queued", "targetTerminalId": "pane-a" });
+        let running = json!({ "id": "todo-running", "status": "running" });
+        let dispatched = json!({
+            "id": "todo-dispatched",
+            "status": "queued",
+            "lastDispatchId": "dispatch-1"
+        });
+        let completed = json!({ "id": "todo-completed", "status": "completed" });
+
+        assert!(todo_store_item_hard_delete_eligible(&listed));
+        assert!(todo_store_item_hard_delete_eligible(&queued));
+        assert!(!todo_store_item_hard_delete_eligible(&running));
+        assert!(!todo_store_item_hard_delete_eligible(&dispatched));
+        assert!(!todo_store_item_hard_delete_eligible(&completed));
+    }
+
+    #[test]
+    fn delete_classifier_preserves_explicit_tombstone_mode() {
+        let listed = vec![json!({ "id": "todo-listed", "status": "listed" })];
+
+        assert_eq!(
+            todo_store_classify_delete_mode(&listed, None),
+            TodoStoreDeleteMode::Hard
+        );
+        assert_eq!(
+            todo_store_classify_delete_mode(&listed, Some(TodoStoreDeleteMode::Tombstone)),
+            TodoStoreDeleteMode::Tombstone
+        );
+        assert_eq!(
+            todo_store_classify_delete_mode(&listed, Some(TodoStoreDeleteMode::Hard)),
+            TodoStoreDeleteMode::Hard
+        );
+        assert_eq!(
+            todo_store_classify_delete_mode(&[], None),
+            TodoStoreDeleteMode::Tombstone
+        );
+    }
+
+    #[test]
+    fn delete_classifier_handles_mirror_only_listed_rows() {
+        let mirror_only = vec![json!({
+            "todo_id": "todo-mirror-only",
+            "status": "listed",
+            "workspace_id": "workspace-a",
+        })];
+        let dispatched = vec![json!({
+            "todo_id": "todo-dispatched",
+            "status": "queued",
+            "lastDispatchId": "dispatch-1",
+        })];
+
+        assert_eq!(
+            todo_store_classify_delete_mode(&mirror_only, None),
+            TodoStoreDeleteMode::Hard
+        );
+        assert_eq!(
+            todo_store_classify_delete_mode(&dispatched, None),
+            TodoStoreDeleteMode::Tombstone
+        );
+    }
+
+    #[test]
     fn draft_create_builds_rust_owned_canonical_item() {
         let item = todo_store_build_created_item(
             "workspace-1",
@@ -7696,6 +7974,7 @@ fn todo_dispatch_push_queue_snapshot(
             &removed_todo_ids,
             reason,
             "todo_dispatch_push_queue_snapshot",
+            TodoStoreDeleteMode::Tombstone,
         );
     }
     log_terminal_status_event(
@@ -7892,6 +8171,8 @@ pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) 
         }));
     };
     let expected_status = todo_dispatch_remote_delete_expected_status(event);
+    let requested_delete_mode =
+        todo_dispatch_remote_delete_mode(event).unwrap_or(TodoStoreDeleteMode::Tombstone);
     let current_status = todo_store_item_status(&item);
     let current_status = if current_status.is_empty() {
         "listed".to_string()
@@ -7908,7 +8189,8 @@ pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) 
             current_status == value && todo_dispatch_remote_delete_binding_matches(&item, event)
         }
     };
-    let terminal_state = matches!(
+    let terminal_state = todo_store_item_has_terminal_touch_evidence(&item)
+        || matches!(
         current_status.as_str(),
         "running"
             | "sending"
@@ -7946,21 +8228,27 @@ pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) 
             "details": details,
         }));
     }
-    // One funnel for accepted deletes: tombstone, queue-store removal, journal,
-    // and Rust-authoritative todo.live_state delete.
-    let removed = todo_store_delete_internal(
+    // One funnel for accepted deletes: hard-delete unsent rows, tombstone
+    // terminal-touched rows, update the queue store, and sync Rust truth.
+    let delete_result = todo_store_delete_internal_with_mode(
         app,
         &workspace_id,
         &[todo_id.clone()],
         "remote_todo_delete",
         "remote_command",
+        Some(requested_delete_mode),
     );
     Some(json!({
         "status": "completed",
         "message": "Remote todo delete was accepted by Rust.",
         "details": {
             "reason": "accepted",
-            "removed": removed,
+            "deleteMode": requested_delete_mode.as_str(),
+            "delete_mode": requested_delete_mode.as_str(),
+            "removed": delete_result.removed_ids,
+            "deletedIds": delete_result.removed_ids,
+            "hardDeletedIds": delete_result.hard_deleted_ids,
+            "tombstonedIds": delete_result.tombstoned_ids,
             "workspace_id": workspace_id,
             "workspaceId": workspace_id,
             "todo_id": todo_id,
@@ -8040,10 +8328,14 @@ async fn todo_dispatch_queue_sync(
             .map(|id| id.trim().to_string())
             .filter(|id| !id.is_empty())
             .collect::<Vec<_>>();
+        let mut locally_removed_ids = Vec::new();
         if !removed_ids.is_empty() {
-            todo_store_delete_internal(&app, &workspace_id, &removed_ids, &reason, "webview_sync");
+            let delete_result =
+                todo_store_delete_internal(&app, &workspace_id, &removed_ids, &reason, "webview_sync");
+            locally_removed_ids.extend(delete_result.removed_ids);
         }
-        let tombstoned = todo_store_tombstone_ids(&workspace_id);
+        let mut tombstoned = todo_store_tombstone_ids(&workspace_id);
+        tombstoned.extend(locally_removed_ids);
         let items = items
             .as_array()
             .cloned()
