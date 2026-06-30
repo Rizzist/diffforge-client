@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+set -eu
+
+if [ -n "${DIFFFORGE_APP_BINARY:-}" ] && [ -x "${DIFFFORGE_APP_BINARY}" ]; then
+  exec "${DIFFFORGE_APP_BINARY}" "$@"
+fi
+
+for candidate in \
+  /usr/bin/rust-diffforge \
+  /usr/lib/diffforge/rust-diffforge \
+  "/usr/lib/Diff Forge AI/rust-diffforge" \
+  "/opt/Diff Forge AI/rust-diffforge"
+do
+  if [ -x "$candidate" ]; then
+    exec "$candidate" "$@"
+  fi
+done
+
+echo "Diff Forge executable was not found. Reinstall Diff Forge AI." >&2
+exit 127

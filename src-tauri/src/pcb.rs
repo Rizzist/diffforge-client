@@ -296,6 +296,15 @@ const PCB_WINDOW_LABEL_PREFIX: &str = "pcb-window-";
 const PCB_WINDOW_CLOSED_EVENT: &str = "pcb-window-closed";
 const PCB_WINDOW_DEFAULT_WIDTH: f64 = 900.0;
 const PCB_WINDOW_DEFAULT_HEIGHT: f64 = 680.0;
+const PCB_PANEL_LABEL_PREFIX: &str = "pcb-panel-";
+const PCB_PANEL_CLOSED_EVENT: &str = "pcb-panel-closed";
+const PCB_PANEL_DEFAULT_WIDTH: f64 = 900.0;
+const PCB_PANEL_DEFAULT_HEIGHT: f64 = 680.0;
+
+#[derive(serde::Serialize)]
+struct PcbPanelOpenResult {
+    label: String,
+}
 
 fn pcb_window_label(board_path: &str) -> String {
     let safe = board_path
@@ -310,6 +319,155 @@ fn pcb_window_label(board_path: &str) -> String {
         .take(160)
         .collect::<String>();
     format!("{PCB_WINDOW_LABEL_PREFIX}{safe}")
+}
+
+fn pcb_panel_safe_label_part(value: &str, fallback: &str) -> String {
+    let safe = value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .take(96)
+        .collect::<String>();
+    if safe.is_empty() {
+        fallback.to_string()
+    } else {
+        safe
+    }
+}
+
+fn pcb_panel_label(workspace_id: &str, pane_id: &str) -> String {
+    format!(
+        "{PCB_PANEL_LABEL_PREFIX}{}-{}",
+        pcb_panel_safe_label_part(workspace_id, "workspace"),
+        pcb_panel_safe_label_part(pane_id, "pane")
+    )
+}
+
+fn emit_pcb_panel_closed(app: &tauri::AppHandle, workspace_id: &str, pane_id: &str, window_id: &str) {
+    let _ = app.emit(
+        PCB_PANEL_CLOSED_EVENT,
+        serde_json::json!({
+            "paneId": pane_id,
+            "windowId": window_id,
+            "workspaceId": workspace_id,
+        }),
+    );
+}
+
+#[tauri::command]
+async fn pcb_panel_open(
+    app: tauri::AppHandle,
+    repo_path: String,
+    workspace_id: String,
+    pane_id: String,
+    theme: Option<String>,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> Result<PcbPanelOpenResult, String> {
+    let workspace_text = workspace_id.trim().chars().take(512).collect::<String>();
+    let pane_text = pane_id.trim().chars().take(512).collect::<String>();
+    if workspace_text.is_empty() {
+        return Err("PCB panel workspace id is required.".to_string());
+    }
+    if pane_text.is_empty() {
+        return Err("PCB panel pane id is required.".to_string());
+    }
+
+    let (root, hardware) = pcb_hardware_root(repo_path.as_str())?;
+    std::fs::create_dir_all(&hardware)
+        .map_err(|error| format!("Unable to create hardware directory: {error}"))?;
+    let repo_text = root.to_string_lossy().to_string();
+    let theme_text = theme
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let theme_text = if theme_text == "light" { "light" } else { "dark" };
+    let label = pcb_panel_label(&workspace_text, &pane_text);
+
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.show();
+        let _ = window.set_focus();
+        return Ok(PcbPanelOpenResult { label });
+    }
+
+    let window_width = width
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.clamp(480.0, 2400.0))
+        .unwrap_or(PCB_PANEL_DEFAULT_WIDTH);
+    let window_height = height
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .map(|value| value.clamp(360.0, 1600.0))
+        .unwrap_or(PCB_PANEL_DEFAULT_HEIGHT);
+
+    let url = format!(
+        "index.html#/pcb-window?mode=panel&paneId={}&repoPath={}&theme={}&windowId={}&workspaceId={}",
+        percent_encode_query_component(&pane_text),
+        percent_encode_query_component(&repo_text),
+        percent_encode_query_component(theme_text),
+        percent_encode_query_component(&label),
+        percent_encode_query_component(&workspace_text),
+    );
+
+    let window = WebviewWindowBuilder::new(&app, label.clone(), WebviewUrl::App(url.into()))
+        .title("PCB - Diff Forge")
+        .inner_size(window_width, window_height)
+        .min_inner_size(480.0, 360.0)
+        .resizable(true)
+        .decorations(false)
+        .focused(true)
+        .accept_first_mouse(true)
+        .transparent(true)
+        .background_color(Color(2, 3, 4, 255))
+        .shadow(true)
+        .build()
+        .map_err(|error| format!("Unable to create PCB panel window: {error}"))?;
+
+    let app_for_events = app.clone();
+    let workspace_for_events = workspace_text.clone();
+    let pane_for_events = pane_text.clone();
+    let label_for_events = label.clone();
+    window.on_window_event(move |event| {
+        if matches!(event, tauri::WindowEvent::Destroyed) {
+            emit_pcb_panel_closed(
+                &app_for_events,
+                &workspace_for_events,
+                &pane_for_events,
+                &label_for_events,
+            );
+        }
+    });
+
+    Ok(PcbPanelOpenResult { label })
+}
+
+#[tauri::command]
+async fn pcb_panel_focus(app: tauri::AppHandle, workspace_id: String, pane_id: String) -> Result<bool, String> {
+    let label = pcb_panel_label(&workspace_id, &pane_id);
+    let Some(window) = app.get_webview_window(&label) else {
+        return Ok(false);
+    };
+    let _ = window.show();
+    let _ = window.set_focus();
+    Ok(true)
+}
+
+#[tauri::command]
+async fn pcb_panel_close(app: tauri::AppHandle, workspace_id: String, pane_id: String) -> Result<(), String> {
+    let workspace_text = workspace_id.trim().to_string();
+    let pane_text = pane_id.trim().to_string();
+    let label = pcb_panel_label(&workspace_text, &pane_text);
+    if let Some(window) = app.get_webview_window(&label) {
+        let _ = window.close();
+    } else {
+        emit_pcb_panel_closed(&app, &workspace_text, &pane_text, &label);
+    }
+    Ok(())
 }
 
 #[tauri::command]

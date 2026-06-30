@@ -72,6 +72,8 @@ const DEFAULT_API_TIMEOUT_SECS: u64 = 10;
 const AUTH_EXCHANGE_TIMEOUT_SECS: u64 = 10;
 const SESSION_VALIDATE_TIMEOUT_SECS: u64 = 5;
 const LOGOUT_TIMEOUT_SECS: u64 = 5;
+const DEVICE_AUTH_START_TIMEOUT_SECS: u64 = 10;
+const DEVICE_AUTH_POLL_TIMEOUT_SECS: u64 = 10;
 const AGENT_STATUS_TIMEOUT_SECS: u64 = 6;
 const AGENT_UPDATE_CHECK_TIMEOUT_SECS: u64 = 3;
 // Coding-agent npm packages ship multi-hundred-MB native binaries (Claude
@@ -4987,6 +4989,9 @@ pub fn run() {
             pcb_document_read,
             pcb_document_create,
             pcb_watch_start,
+            pcb_panel_open,
+            pcb_panel_focus,
+            pcb_panel_close,
             pcb_window_open,
             pcb_window_close,
             delete_workspace_local_metadata,

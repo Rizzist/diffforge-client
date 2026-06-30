@@ -99,6 +99,7 @@ import {
   normalizeSnippingDispatchTargets,
 } from "../snipping/snippingAnnotationTargets.js";
 import { sanitizeTerminalColor } from "../terminals/terminalColors.js";
+import AppSelect from "../app/AppSelect.jsx";
 
 function text(value, fallback = "") {
   const normalized = String(value ?? "").trim();
@@ -6955,20 +6956,21 @@ function ArchitecturesPanel({
           </FileRootPath>
           <ArchitectureNavControls>
             {repositories.length > 1 && (
-              <ArchitectureRootPicker
-                aria-label="Architecture root"
-                onChange={(event) => handleRepoSelection(event.target.value)}
-                value={selectedRepoPath}
-              >
-                {repositories.map((repo, index) => {
-                  const repoPathValue = architectureRepoPathFromEntry(repo);
-                  return (
-                    <option key={repo.id || repoPathValue || `repo-${index}`} value={repoPathValue}>
-                      {repo.name || architectureFileNameFromPath(repoPathValue) || repoPathValue}
-                    </option>
-                  );
-                })}
-              </ArchitectureRootPicker>
+              <ArchitectureRootPickerWrap>
+                <AppSelect
+                  aria-label="Architecture root"
+                  onChange={(value) => handleRepoSelection(value)}
+                  options={repositories.map((repo) => {
+                    const repoPathValue = architectureRepoPathFromEntry(repo);
+                    return {
+                      value: repoPathValue,
+                      label: repo.name || architectureFileNameFromPath(repoPathValue) || repoPathValue,
+                    };
+                  })}
+                  placeholder="Architecture root"
+                  value={selectedRepoPath}
+                />
+              </ArchitectureRootPickerWrap>
             )}
             {creatingFolder && (
               <ArchitectureFolderCreateForm
@@ -7697,26 +7699,30 @@ function ArchitectureGraphEditorView({
                     >
                       {target.label}
                     </ArchitectureRunButton>
-                    <ArchitectureRunSelect
-                      aria-label={`${target.label} environment`}
-                      disabled={dirty || saveState === "saving" || !agentDispatchReady}
-                      onChange={(event) => updateRunSelection(target.id, { env: event.target.value })}
-                      value={selection.env}
-                    >
-                      {target.envs.map((env) => (
-                        <option key={env} value={env}>{architectureTitleFromSlug(env, env)}</option>
-                      ))}
-                    </ArchitectureRunSelect>
-                    <ArchitectureRunSelect
-                      aria-label={`${target.label} mode`}
-                      disabled={dirty || saveState === "saving" || !agentDispatchReady}
-                      onChange={(event) => updateRunSelection(target.id, { mode: event.target.value })}
-                      value={selection.mode}
-                    >
-                      {target.modes.map((mode) => (
-                        <option key={mode} value={mode}>{architectureTitleFromSlug(mode, mode)}</option>
-                      ))}
-                    </ArchitectureRunSelect>
+                    <ArchitectureRunSelectWrap>
+                      <AppSelect
+                        aria-label={`${target.label} environment`}
+                        isDisabled={dirty || saveState === "saving" || !agentDispatchReady}
+                        onChange={(value) => updateRunSelection(target.id, { env: value })}
+                        options={target.envs.map((env) => ({
+                          value: env,
+                          label: architectureTitleFromSlug(env, env),
+                        }))}
+                        value={selection.env}
+                      />
+                    </ArchitectureRunSelectWrap>
+                    <ArchitectureRunSelectWrap>
+                      <AppSelect
+                        aria-label={`${target.label} mode`}
+                        isDisabled={dirty || saveState === "saving" || !agentDispatchReady}
+                        onChange={(value) => updateRunSelection(target.id, { mode: value })}
+                        options={target.modes.map((mode) => ({
+                          value: mode,
+                          label: architectureTitleFromSlug(mode, mode),
+                        }))}
+                        value={selection.mode}
+                      />
+                    </ArchitectureRunSelectWrap>
                   </ArchitectureRunTargetControl>
                 );
               })}
@@ -9816,14 +9822,7 @@ function sessionHistoryFindExactTerminal(item, terminalOptions = []) {
   }) || null;
 }
 
-function sessionHistoryChatSyncStatus(item, terminalMatch = null) {
-  if (terminalMatch) {
-    return {
-      label: "Live",
-      status: "live",
-      title: `Live in ${terminalMatch.label || "terminal"}`,
-    };
-  }
+function sessionHistoryChatSyncStatus(item) {
   const sync = item?.chatSync || item?.chat_sync || {};
   const rawStatus = text(sync.status || sync.state || sync.syncStatus || sync.sync_status, "waiting").toLowerCase();
   const status = ["live", "waiting", "syncing", "synced", "failed"].includes(rawStatus)
@@ -9835,10 +9834,10 @@ function sessionHistoryChatSyncStatus(item, terminalMatch = null) {
         : "waiting";
   const labels = {
     failed: "Failed",
-    live: "Live",
+    live: "Live sync",
     synced: "Synced",
     syncing: "Syncing",
-    waiting: "Waiting",
+    waiting: "Not synced",
   };
   const pending = Number(sync.pendingPacketCount ?? sync.pending_packet_count ?? 0) || 0;
   const syncing = Number(sync.syncingPacketCount ?? sync.syncing_packet_count ?? 0) || 0;
@@ -9854,8 +9853,12 @@ function sessionHistoryChatSyncStatus(item, terminalMatch = null) {
   if (acked || total) parts.push(`${acked}/${total || acked} records`);
   const lastError = text(sync.lastError || sync.last_error);
   if (lastError) parts.push(lastError);
+  const rawLabel = text(sync.label);
+  const normalizedRawLabel = rawLabel.toLowerCase();
   return {
-    label: text(sync.label, labels[status]),
+    label: rawLabel && !["live", "waiting"].includes(normalizedRawLabel)
+      ? rawLabel
+      : labels[status],
     status,
     title: parts.length ? parts.join(" · ") : labels[status],
   };
@@ -10019,10 +10022,9 @@ function SessionHistoryPanel({
             const index = startIndex + virtualIndex;
             const createdMs = parseTimeMs(item?.createdAtMs ?? item?.created_at_ms);
             const latestMs = parseTimeMs(item?.latestAtMs ?? item?.latest_at_ms);
-            const statusKind = sessionHistoryStatusKind(item);
             const id = sessionHistoryRowKey(item, index);
             const terminalMatch = sessionHistoryFindExactTerminal(item, terminalOptions);
-            const syncBadge = sessionHistoryChatSyncStatus(item, terminalMatch);
+            const syncBadge = sessionHistoryChatSyncStatus(item);
             const providerSessionId = sessionHistoryProviderSessionId(item);
             const forkParentSessionId = sessionHistoryForkParentSessionId(item);
             const hasForkParentRow = Boolean(forkParentSessionId && items.some((candidate) => (
@@ -10045,59 +10047,61 @@ function SessionHistoryPanel({
                         <SessionHistoryTitle title={sessionTitle}>{sessionTitle}</SessionHistoryTitle>
                       </div>
                       <SessionHistoryCardTopActions>
-                        <StatusPill data-status={statusKind}>{sessionHistoryStatusLabel(item)}</StatusPill>
-                        <SessionHistorySyncBadge data-status={syncBadge.status} title={syncBadge.title}>
-                          {syncBadge.label}
-                        </SessionHistorySyncBadge>
-                        {forkParentSessionId && (
-                          <SessionHistoryActionButton
-                            aria-label={`Show fork parent for ${sessionTitle}`}
-                            data-variant="fork"
-                            disabled={!hasForkParentRow}
-                            onClick={() => scrollToSession(forkParentSessionId, sessionHistoryAgentKey(item))}
-                            title={hasForkParentRow ? "Scroll to the session this was forked from" : "Fork parent is not in this history list"}
-                            type="button"
-                          >
-                            <Hub aria-hidden="true" />
-                            <span>Fork</span>
-                          </SessionHistoryActionButton>
-                        )}
-                        {terminalMatch ? (
-                          <SessionHistoryActionButton
-                            aria-label={`Go-to this terminal tab for ${sessionTitle}`}
-                            data-variant="goto"
-                            onClick={() => onGoToTerminal?.({
-                              item,
-                              terminal: terminalMatch,
-                              workspaceId,
-                            })}
-                            title={`Go to ${terminalMatch.label || "terminal"} and highlight it`}
-                            type="button"
-                          >
-                            <Terminal aria-hidden="true" />
-                            <span>Go-to</span>
-                          </SessionHistoryActionButton>
-                        ) : (
-                          <SessionHistoryActionButton
-                            aria-label={`Open terminal for ${sessionTitle}`}
-                            data-variant="open"
-                            disabled={!providerSessionId}
-                            onClick={() => onOpenTerminal?.({
-                              item,
-                              providerSessionId,
-                              workspaceId,
-                            })}
-                            title={providerSessionId ? "Open this session in a terminal" : "No provider session id recorded"}
-                            type="button"
-                          >
-                            <Add aria-hidden="true" />
-                            <span>Open</span>
-                          </SessionHistoryActionButton>
-                        )}
+                        <SessionHistoryActionGroup>
+                          {forkParentSessionId && (
+                            <SessionHistoryActionButton
+                              aria-label={`Show fork parent for ${sessionTitle}`}
+                              data-variant="fork"
+                              disabled={!hasForkParentRow}
+                              onClick={() => scrollToSession(forkParentSessionId, sessionHistoryAgentKey(item))}
+                              title={hasForkParentRow ? "Scroll to the session this was forked from" : "Fork parent is not in this history list"}
+                              type="button"
+                            >
+                              <Hub aria-hidden="true" />
+                              <span>Fork</span>
+                            </SessionHistoryActionButton>
+                          )}
+                          {terminalMatch ? (
+                            <SessionHistoryActionButton
+                              aria-label={`Go to active terminal for ${sessionTitle}`}
+                              data-variant="goto"
+                              onClick={() => onGoToTerminal?.({
+                                item,
+                                terminal: terminalMatch,
+                                workspaceId,
+                              })}
+                              title={`Go to active terminal ${terminalMatch.label || "terminal"} and highlight it`}
+                              type="button"
+                            >
+                              <Terminal aria-hidden="true" />
+                              <span>Go to active terminal</span>
+                            </SessionHistoryActionButton>
+                          ) : (
+                            <SessionHistoryActionButton
+                              aria-label={`Open terminal for ${sessionTitle}`}
+                              data-variant="open"
+                              disabled={!providerSessionId}
+                              onClick={() => onOpenTerminal?.({
+                                item,
+                                providerSessionId,
+                                workspaceId,
+                              })}
+                              title={providerSessionId ? "Open this session in a terminal" : "No provider session id recorded"}
+                              type="button"
+                            >
+                              <Add aria-hidden="true" />
+                              <span>Open</span>
+                            </SessionHistoryActionButton>
+                          )}
+                        </SessionHistoryActionGroup>
                       </SessionHistoryCardTopActions>
                     </SessionHistoryCardTop>
                     <SessionHistoryMeta>
                       <span title={sessionHistoryModelLabel(item)}>{sessionHistoryModelLabel(item)}</span>
+                      <SessionHistorySyncBadge data-status={syncBadge.status} title={syncBadge.title}>
+                        <Sync aria-hidden="true" />
+                        <span>{syncBadge.label}</span>
+                      </SessionHistorySyncBadge>
                       <span>created {formatRelativeTimeMs(createdMs) || formatTime(createdMs) || "unknown"}</span>
                       <span>latest {formatRelativeTimeMs(latestMs) || formatTime(latestMs) || "unknown"}</span>
                     </SessionHistoryMeta>
@@ -11003,35 +11007,10 @@ const ArchitectureNavControls = styled.div`
   background: var(--files-vscode-sidebar);
 `;
 
-const ArchitectureRootPicker = styled.select`
+const ArchitectureRootPickerWrap = styled.div`
   width: calc(100% - 16px);
   min-width: 0;
-  height: 24px;
   margin: 4px 8px 6px;
-  padding: 0 22px 0 8px;
-  border: 1px solid var(--files-vscode-border);
-  border-radius: 4px;
-  color: var(--files-vscode-text);
-  background-color: var(--files-vscode-editor);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 6px center;
-  background-size: 13px 13px;
-  color-scheme: dark;
-  font: inherit;
-  font-size: 12px;
-  outline: none;
-  cursor: pointer;
-  appearance: none;
-  -webkit-appearance: none;
-
-  &::-ms-expand {
-    display: none;
-  }
-
-  &:focus {
-    border-color: var(--files-vscode-focus);
-  }
 `;
 
 const ArchitectureNavBottomActions = styled.div`
@@ -12550,35 +12529,10 @@ const ArchitectureRunButton = styled.button`
   }
 `;
 
-const ArchitectureRunSelect = styled.select`
-  max-width: 112px;
+const ArchitectureRunSelectWrap = styled.div`
   min-width: 76px;
-  height: 24px;
-  padding: 0 20px 0 8px;
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 999px;
-  color: rgba(226, 232, 240, 0.84);
-  background-color: rgba(15, 23, 42, 0.92);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 6px center;
-  background-size: 12px 12px;
-  color-scheme: dark;
-  font: inherit;
-  font-size: 9px;
-  font-weight: 820;
-  outline: none;
-  cursor: pointer;
-  appearance: none;
-  -webkit-appearance: none;
-
-  &::-ms-expand {
-    display: none;
-  }
-
-  &:disabled {
-    cursor: default;
-  }
+  max-width: 112px;
+  flex: 0 0 auto;
 `;
 
 const ArchitectureAgentEditStatus = styled.div`
@@ -13829,18 +13783,27 @@ const SessionHistoryCardTop = styled.div`
 `;
 
 const SessionHistoryCardTopActions = styled.div`
-  display: flex;
-  align-items: center;
+  display: grid;
+  align-content: start;
+  align-items: start;
   flex: 0 0 auto;
-  flex-wrap: wrap;
-  gap: 6px;
-  justify-content: flex-end;
-  max-width: min(48%, 380px);
+  gap: 7px;
+  justify-items: end;
+  max-width: min(48%, 430px);
   min-width: 0;
 
   @media (max-width: 760px) {
-    justify-content: space-between;
+    justify-items: stretch;
   }
+`;
+
+const SessionHistoryActionGroup = styled.div`
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  min-width: 0;
 `;
 
 const SessionHistoryActionButton = styled.button`
@@ -13848,7 +13811,7 @@ const SessionHistoryActionButton = styled.button`
   align-items: center;
   justify-content: center;
   gap: 5px;
-  max-width: 190px;
+  max-width: 220px;
   min-height: 26px;
   min-width: 0;
   padding: 0 8px;
@@ -13879,6 +13842,15 @@ const SessionHistoryActionButton = styled.button`
     background: rgba(22, 101, 52, 0.18);
   }
 
+  &[data-variant="goto"] {
+    border-color: rgba(96, 165, 250, 0.36);
+    color: rgba(219, 234, 254, 0.98);
+    background: linear-gradient(180deg, rgba(37, 99, 235, 0.32), rgba(14, 116, 144, 0.2));
+    box-shadow:
+      inset 0 0 0 1px rgba(147, 197, 253, 0.08),
+      0 0 0 1px rgba(37, 99, 235, 0.05);
+  }
+
   &[data-variant="fork"] {
     border-color: rgba(251, 191, 36, 0.22);
     color: rgba(254, 243, 199, 0.94);
@@ -13888,6 +13860,11 @@ const SessionHistoryActionButton = styled.button`
   &:hover:not(:disabled) {
     border-color: rgba(125, 211, 252, 0.5);
     background: rgba(14, 116, 144, 0.3);
+  }
+
+  &[data-variant="goto"]:hover:not(:disabled) {
+    border-color: rgba(147, 197, 253, 0.58);
+    background: linear-gradient(180deg, rgba(37, 99, 235, 0.44), rgba(14, 116, 144, 0.3));
   }
 
   &:disabled {
@@ -13901,19 +13878,37 @@ const SessionHistoryActionButton = styled.button`
 `;
 
 const SessionHistorySyncBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
   flex: 0 0 auto;
-  min-width: 52px;
-  padding: 2px 6px;
+  max-width: 118px;
+  min-width: 70px;
+  min-height: 20px;
+  padding: 0 6px;
   border: 1px solid rgba(148, 163, 184, 0.13);
   border-radius: 6px;
   color: rgba(203, 213, 225, 0.72);
   background: rgba(51, 65, 85, 0.1);
   font-size: 8px;
   font-weight: 880;
-  line-height: 1.05;
+  line-height: 1;
   text-align: center;
   text-transform: uppercase;
   white-space: nowrap;
+
+  svg {
+    flex: 0 0 auto;
+    width: 12px;
+    height: 12px;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 
   &[data-status="live"] {
     border-color: rgba(45, 212, 191, 0.2);
@@ -13978,14 +13973,14 @@ const SessionHistoryMeta = styled.div`
   font-size: 10px;
   font-weight: 720;
 
-  span {
+  > span:not(${SessionHistorySyncBadge}) {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
-  span:first-child {
+  > span:first-child {
     color: rgba(191, 219, 254, 0.9);
     font-weight: 840;
   }

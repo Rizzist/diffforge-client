@@ -1,24 +1,46 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import runframeBootstrapUrl from "./pcbRunframeBootstrap.js?url";
+import runframeStandaloneUrl from "@tscircuit/runframe/standalone?url";
 
-// tscircuit tab ids → the labels the user thinks in: schematic = Circuits,
-// pcb = Wiring, cad = 3D. RunFrame renders the tab UI + pan/zoom/rotate controls.
-export const PCB_TABS = ["schematic", "pcb", "cad"];
+export const PCB_VIEW_TABS = [
+  { id: "pcb", label: "PCB" },
+  { id: "schematic", label: "Schematic" },
+  { id: "cad", label: "3D" },
+  { id: "assembly", label: "Assembly" },
+  { id: "pinout", label: "Pinout" },
+  { id: "analog_simulation", label: "Simulation" },
+  { id: "bom", label: "BOM" },
+  { id: "circuit_json", label: "JSON" },
+  { id: "errors", label: "Errors" },
+  { id: "render_log", label: "Render Log" },
+  { id: "solvers", label: "Solvers" },
+];
+export const PCB_TABS = PCB_VIEW_TABS.map((tab) => tab.id);
 export const PCB_STORE_CHANGED_EVENT = "pcb-store-changed";
 
-// RunFrame's dependency tree (eval worker, sucrase, spice/3d/pcb solvers …) does
-// not bundle through the app's Vite build, and loading it as a CDN module into
-// the host React tree triggers a dual-React hooks crash. So we render it inside
-// an isolated iframe that pulls RunFrame + its whole tree from esm.sh and uses
-// its own React instance. The board source is streamed in over postMessage, so
-// edits live-reload without reloading the frame.
-const RUNFRAME_VERSION = "0.0.2130";
-const REACT_VERSION = "19.2.4";
+function normalizePcbTab(tab) {
+  return PCB_TABS.includes(tab) ? tab : "pcb";
+}
 
-function buildSrcDoc(defaultTab) {
-  const safeTab = PCB_TABS.includes(defaultTab) ? defaultTab : "pcb";
+function escapeHtmlAttribute(value) {
+  return String(value || "")
+    .replace(/&/g, "&amp;")
+    .replace(/"/g, "&quot;");
+}
+
+function escapeScriptData(value) {
+  return String(value || "").replace(/<\/script/giu, "<\\/script");
+}
+
+function buildSrcDoc(defaultTab, source) {
+  const safeTab = normalizePcbTab(defaultTab);
+  const bootstrapUrl = escapeHtmlAttribute(runframeBootstrapUrl);
+  const runframeUrl = escapeHtmlAttribute(runframeStandaloneUrl);
+  const tabAttr = escapeHtmlAttribute(safeTab);
+  const sourceText = escapeScriptData(source);
   return `<!doctype html>
 <html>
   <head>
@@ -26,46 +48,17 @@ function buildSrcDoc(defaultTab) {
     <style>
       html, body, #root { height: 100%; margin: 0; background: #07101d; }
       #status { color: #94a3b8; font: 12px system-ui, sans-serif; padding: 16px; }
+      #root [role="tablist"].rf-h-9 { display: none !important; }
+      body[data-diffforge-pcb-frame="true"] #root > div > div > .rf-flex.rf-flex-col.rf-h-full > .rf-flex.rf-items-center.rf-gap-2.rf-p-2.rf-pb-0 {
+        display: none !important;
+      }
     </style>
   </head>
-  <body>
+  <body data-diffforge-pcb-frame="true">
     <div id="root"><div id="status">Loading renderer…</div></div>
-    <script type="module">
-      const VER = ${JSON.stringify(REACT_VERSION)};
-      const RF = ${JSON.stringify(RUNFRAME_VERSION)};
-      const TAB = ${JSON.stringify(safeTab)};
-      try {
-        const React = (await import("https://esm.sh/react@" + VER)).default;
-        const { createRoot } = await import("https://esm.sh/react-dom@" + VER + "/client?deps=react@" + VER);
-        const { RunFrame } = await import(
-          "https://esm.sh/@tscircuit/runframe@" + RF + "/runner?deps=react@" + VER + ",react-dom@" + VER
-        );
-        const root = createRoot(document.getElementById("root"));
-        let lastCode = "";
-        function renderCode(code) {
-          lastCode = code;
-          root.render(
-            React.createElement(RunFrame, {
-              fsMap: { "main.tsx": code },
-              entrypoint: "main.tsx",
-              availableTabs: ["schematic", "pcb", "cad"],
-              defaultTab: TAB,
-            }),
-          );
-        }
-        window.addEventListener("message", (event) => {
-          const data = event.data;
-          if (data && data.type === "pcb:code" && typeof data.code === "string") {
-            renderCode(data.code);
-          }
-        });
-        window.parent.postMessage({ type: "pcb:ready" }, "*");
-      } catch (err) {
-        const status = document.getElementById("status");
-        if (status) status.textContent = "Renderer failed to load: " + err;
-        window.parent.postMessage({ type: "pcb:error", message: String(err) }, "*");
-      }
-    </script>
+    <script type="tscircuit-tsx" data-file-path="main.tsx">${sourceText}</script>
+    <script src="${bootstrapUrl}" data-default-tab="${tabAttr}"></script>
+    <script src="${runframeUrl}"></script>
   </body>
 </html>`;
 }
@@ -81,6 +74,11 @@ const PanelShell = styled.section`
   border: 1px solid rgba(148, 163, 184, 0.16);
   border-radius: 10px;
   overflow: hidden;
+
+  &[data-embedded="true"] {
+    border: 0;
+    border-radius: 0;
+  }
 
   &[data-active="true"] {
     border-color: rgba(16, 185, 129, 0.4);
@@ -139,6 +137,63 @@ const PanelBody = styled.div`
   display: flex;
 `;
 
+const ViewTabRail = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex: 0 0 auto;
+  min-width: 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+  background: rgba(3, 7, 18, 0.88);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
+
+  &::-webkit-scrollbar {
+    height: 6px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: rgba(148, 163, 184, 0.35);
+    border-radius: 999px;
+  }
+`;
+
+const ViewTabButton = styled.button`
+  appearance: none;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(15, 23, 42, 0.56);
+  color: #aeb7c8;
+  border-radius: 6px;
+  height: 24px;
+  padding: 0 8px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  cursor: pointer;
+
+  &:hover {
+    border-color: rgba(147, 197, 253, 0.45);
+    color: #eef4ff;
+    background: rgba(30, 41, 59, 0.86);
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(96, 165, 250, 0.62);
+    background: rgba(37, 99, 235, 0.22);
+    color: #dbeafe;
+    box-shadow: inset 0 0 0 1px rgba(147, 197, 253, 0.18);
+  }
+`;
+
 const BoardFrame = styled.iframe`
   flex: 1 1 auto;
   min-height: 0;
@@ -164,20 +219,29 @@ const PanelMessage = styled.div`
 
 export default function PcbPanel({
   board,
+  embedded = false,
   repoPath,
   defaultTab = "pcb",
   isActive = false,
   onActivate,
   onClose,
   onPopOut,
+  showHeader = true,
 }) {
   const boardPath = board?.path || "";
+  const defaultTabId = normalizePcbTab(defaultTab);
+  const [activeTab, setActiveTab] = useState(defaultTabId);
   const [source, setSource] = useState(null);
   const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
-  const iframeRef = useRef(null);
-  const frameReadyRef = useRef(false);
-  const srcDoc = useMemo(() => buildSrcDoc(defaultTab), [defaultTab]);
+  const srcDoc = useMemo(
+    () => (typeof source === "string" ? buildSrcDoc(activeTab, source) : ""),
+    [activeTab, source],
+  );
+
+  useEffect(() => {
+    setActiveTab(defaultTabId);
+  }, [boardPath, defaultTabId]);
 
   const readSource = useCallback(() => {
     if (!repoPath || !boardPath) {
@@ -230,79 +294,60 @@ export default function PcbPanel({
     };
   }, [boardPath, readSource]);
 
-  const postSource = useCallback((code) => {
-    const frame = iframeRef.current;
-    if (frame && frame.contentWindow && typeof code === "string") {
-      frame.contentWindow.postMessage({ type: "pcb:code", code }, "*");
-    }
-  }, []);
-
-  // Bridge: forward the board source once the frame signals it's ready, and on
-  // every subsequent source change.
-  useEffect(() => {
-    function handleMessage(event) {
-      if (event.source !== iframeRef.current?.contentWindow) {
-        return;
-      }
-      const data = event.data;
-      if (data?.type === "pcb:ready") {
-        frameReadyRef.current = true;
-        if (source != null) {
-          postSource(source);
-        }
-      } else if (data?.type === "pcb:error") {
-        setError(String(data.message || "Renderer error"));
-      }
-    }
-    window.addEventListener("message", handleMessage);
-    return () => window.removeEventListener("message", handleMessage);
-  }, [source, postSource]);
-
-  useEffect(() => {
-    if (frameReadyRef.current && source != null) {
-      postSource(source);
-    }
-  }, [source, postSource]);
-
-  // A reloaded frame (srcDoc change) must re-handshake before we post again.
-  const handleFrameLoad = useCallback(() => {
-    frameReadyRef.current = false;
-  }, []);
-
   return (
-    <PanelShell data-active={isActive ? "true" : "false"} onMouseDown={onActivate}>
-      <PanelHeader>
-        <PanelTitle title={boardPath}>{board?.name || "PCB"}</PanelTitle>
-        <PanelActions>
-          {onPopOut ? (
-            <HeaderButton
-              aria-label="Open in new window"
-              onClick={() => onPopOut(board)}
-              title="Open in new window"
-              type="button"
-            >
-              ⤢
-            </HeaderButton>
-          ) : null}
-          {onClose ? (
-            <HeaderButton
-              aria-label="Close board"
-              onClick={() => onClose(board)}
-              title="Close"
-              type="button"
-            >
-              ×
-            </HeaderButton>
-          ) : null}
-        </PanelActions>
-      </PanelHeader>
+    <PanelShell
+      data-active={isActive ? "true" : "false"}
+      data-embedded={embedded ? "true" : undefined}
+      onMouseDown={onActivate}
+    >
+      {showHeader ? (
+        <PanelHeader>
+          <PanelTitle title={boardPath}>{board?.name || "PCB"}</PanelTitle>
+          <PanelActions>
+            {onPopOut ? (
+              <HeaderButton
+                aria-label="Open in new window"
+                onClick={() => onPopOut(board)}
+                title="Open in new window"
+                type="button"
+              >
+                ⤢
+              </HeaderButton>
+            ) : null}
+            {onClose ? (
+              <HeaderButton
+                aria-label="Close board"
+                onClick={() => onClose(board)}
+                title="Close"
+                type="button"
+              >
+                ×
+              </HeaderButton>
+            ) : null}
+          </PanelActions>
+        </PanelHeader>
+      ) : null}
+      <ViewTabRail aria-label="PCB view selector">
+        {PCB_VIEW_TABS.map((tab) => (
+          <ViewTabButton
+            aria-pressed={activeTab === tab.id}
+            data-active={activeTab === tab.id ? "true" : undefined}
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            title={tab.label}
+            type="button"
+          >
+            {tab.label}
+          </ViewTabButton>
+        ))}
+      </ViewTabRail>
       <PanelBody>
         {status === "error" ? (
           <PanelMessage data-tone="error">Could not load board: {error}</PanelMessage>
+        ) : source == null ? (
+          <PanelMessage>Loading board…</PanelMessage>
         ) : (
           <BoardFrame
-            onLoad={handleFrameLoad}
-            ref={iframeRef}
             sandbox="allow-scripts allow-same-origin allow-downloads allow-popups"
             srcDoc={srcDoc}
             title={`PCB board ${board?.name || ""}`}

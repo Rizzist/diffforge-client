@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+app_path="/Applications/Diff Forge AI.app"
+cli_target="${app_path}/Contents/MacOS/rust-diffforge"
+link_path="/usr/local/bin/diffforge"
+
+if [ ! -x "$cli_target" ]; then
+  echo "Diff Forge executable was not found at ${cli_target}" >&2
+  exit 1
+fi
+
+mkdir -p /usr/local/bin
+ln -sfn "$cli_target" "$link_path"
+chmod 0755 "$cli_target"
+exit 0

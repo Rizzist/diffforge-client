@@ -3,7 +3,6 @@ import styled from "styled-components";
 import { ArrowBack } from "@styled-icons/material-rounded/ArrowBack";
 import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
 import { Close } from "@styled-icons/material-rounded/Close";
-import { DragIndicator } from "@styled-icons/material-rounded/DragIndicator";
 import { Fullscreen } from "@styled-icons/material-rounded/Fullscreen";
 import { FullscreenExit } from "@styled-icons/material-rounded/FullscreenExit";
 import { Language } from "@styled-icons/material-rounded/Language";
@@ -11,6 +10,14 @@ import { LayoutSplit } from "@styled-icons/bootstrap/LayoutSplit";
 import { LayoutRow } from "@styled-icons/remix-line/LayoutRow";
 import { Refresh } from "@styled-icons/material-rounded/Refresh";
 
+import {
+  ButtonDragIcon,
+  TerminalCloseButton,
+  TerminalRailControls,
+  TerminalRailIdentity,
+  TerminalRestartButton,
+  TerminalRestartPill,
+} from "../app/appStyles.js";
 import {
   DEFAULT_WEB_URL,
   hostForUrl,
@@ -38,6 +45,7 @@ export default function WebPane({
   fullscreenActive = false,
   dragActive = false,
   poppedOut = false,
+  webviewObscured = false,
   onDragHandlePointerDown,
   onSplit,
   onToggleFullscreen,
@@ -75,6 +83,7 @@ export default function WebPane({
     isActive
     && !dragActive
     && !poppedOut
+    && !webviewObscured
     && (!fullscreenActive || isFullscreen),
   );
 
@@ -133,19 +142,74 @@ export default function WebPane({
 
   return (
     <WebPaneSurface data-workspace-web-surface="true" data-active={isActive ? "true" : undefined}>
-      <WebPaneRail>
-        <WebPaneIdentity
-          aria-label="Move web panel"
-          data-terminal-drag-handle="true"
-          onPointerDown={(event) => onDragHandlePointerDown?.(event, terminalIndex, paneId)}
-          title="Drag to move"
-          type="button"
-        >
-          <DragIndicator aria-hidden="true" />
-          <Language aria-hidden="true" />
-          <span>{currentHost}</span>
+      <WebPaneRail data-terminal-control="true">
+        <WebPaneIdentity>
+          <WebPaneDragButton
+            aria-label="Drag web panel"
+            data-terminal-drag-handle="true"
+            onPointerDown={(event) => onDragHandlePointerDown?.(event, terminalIndex, paneId)}
+            title={isFullscreen ? "Exit fullscreen to reorder panels" : "Drag web panel"}
+            type="button"
+          >
+            <ButtonDragIcon aria-hidden="true" />
+          </WebPaneDragButton>
         </WebPaneIdentity>
-        <WebPaneRailControls>
+        <WebPaneNav onSubmit={handleSubmit}>
+          <WebPaneIconButton
+            aria-label="Back"
+            disabled={!canGoBack}
+            onClick={goBack}
+            title="Back"
+            type="button"
+          >
+            <ArrowBack aria-hidden="true" />
+          </WebPaneIconButton>
+          <WebPaneIconButton
+            aria-label="Forward"
+            disabled={!canGoForward}
+            onClick={goForward}
+            title="Forward"
+            type="button"
+          >
+            <ArrowForward aria-hidden="true" />
+          </WebPaneIconButton>
+          <WebPaneIconButton
+            aria-label="Refresh"
+            onClick={refresh}
+            title="Refresh"
+            type="button"
+          >
+            <Refresh aria-hidden="true" />
+          </WebPaneIconButton>
+          <WebPaneAddressInput
+            aria-label="Search or enter URL"
+            autoCapitalize="none"
+            autoComplete="off"
+            autoCorrect="off"
+            inputMode="url"
+            onChange={(event) => {
+              setAddressValue(event.target.value);
+              if (addressError) {
+                setAddressError("");
+              }
+            }}
+            placeholder="Search or enter URL"
+            spellCheck="false"
+            value={addressValue}
+          />
+        </WebPaneNav>
+        <WebPaneRailControls data-rail-row="primary">
+          <WebPaneCloseButton
+            aria-label="Close web panel"
+            data-tone="close"
+            onClick={() => onClose?.(terminalIndex, paneId)}
+            title="Close"
+            type="button"
+          >
+            <Close aria-hidden="true" />
+          </WebPaneCloseButton>
+        </WebPaneRailControls>
+        <WebPaneRailControls data-rail-row="secondary">
           <WebPaneIconButton
             aria-label="Split right"
             onClick={() => onSplit?.({ direction: "vertical", terminalIndex, paneId })}
@@ -178,62 +242,8 @@ export default function WebPane({
           >
             {isFullscreen ? <FullscreenExit aria-hidden="true" /> : <Fullscreen aria-hidden="true" />}
           </WebPaneIconButton>
-          <WebPaneIconButton
-            aria-label="Close web panel"
-            data-tone="close"
-            onClick={() => onClose?.(terminalIndex, paneId)}
-            title="Close"
-            type="button"
-          >
-            <Close aria-hidden="true" />
-          </WebPaneIconButton>
         </WebPaneRailControls>
       </WebPaneRail>
-
-      <WebPaneNav onSubmit={handleSubmit}>
-        <WebPaneIconButton
-          aria-label="Back"
-          disabled={!canGoBack}
-          onClick={goBack}
-          title="Back"
-          type="button"
-        >
-          <ArrowBack aria-hidden="true" />
-        </WebPaneIconButton>
-        <WebPaneIconButton
-          aria-label="Forward"
-          disabled={!canGoForward}
-          onClick={goForward}
-          title="Forward"
-          type="button"
-        >
-          <ArrowForward aria-hidden="true" />
-        </WebPaneIconButton>
-        <WebPaneIconButton
-          aria-label="Refresh"
-          onClick={refresh}
-          title="Refresh"
-          type="button"
-        >
-          <Refresh aria-hidden="true" />
-        </WebPaneIconButton>
-        <WebPaneAddressInput
-          aria-label="Search or enter URL"
-          autoCapitalize="none"
-          autoComplete="off"
-          autoCorrect="off"
-          inputMode="url"
-          onChange={(event) => {
-            setAddressValue(event.target.value);
-            if (addressError) {
-              setAddressError("");
-            }
-          }}
-          placeholder="Search or enter URL"
-          spellCheck="false"
-          value={addressValue}
-        />
-      </WebPaneNav>
 
       {addressError ? <WebPaneInlineError role="alert">{addressError}</WebPaneInlineError> : null}
 
@@ -262,11 +272,11 @@ export default function WebPane({
 
 const WebPaneSurface = styled.section`
   --web-bg: #030405;
-  --web-panel: #080b10;
+  --web-panel: #0b0e14;
   --web-panel-strong: #0d121a;
-  --web-border: #1d2530;
-  --web-text: #d5dbe4;
-  --web-muted: #87919f;
+  --web-border: rgba(226, 232, 240, 0.08);
+  --web-text: rgba(255, 255, 255, 0.82);
+  --web-muted: rgba(226, 232, 240, 0.62);
   --web-blue: #68a3ff;
   --web-danger: #ff9b9b;
 
@@ -279,127 +289,68 @@ const WebPaneSurface = styled.section`
   overflow: hidden;
   color: var(--web-text);
   background: var(--web-bg);
-  border-radius: 10px;
+  border-radius: 0;
   border: 1px solid var(--web-border);
 
   html[data-forge-theme="light"] & {
     --web-bg: #ffffff;
-    --web-panel: #f5f7fb;
+    --web-panel: #eef1f5;
     --web-panel-strong: #ffffff;
-    --web-border: #dce3ee;
-    --web-text: #1c2430;
-    --web-muted: #687488;
+    --web-border: rgba(24, 34, 48, 0.12);
+    --web-text: rgba(48, 54, 68, 0.82);
+    --web-muted: rgba(48, 54, 68, 0.58);
     --web-blue: #0066cc;
     --web-danger: #b42318;
   }
 `;
 
-const WebPaneRail = styled.header`
-  display: grid;
-  min-width: 0;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 6px 5px 4px;
-  border-bottom: 1px solid var(--web-border);
+const WebPaneRail = styled(TerminalRestartPill)`
+  border-bottom-color: var(--web-border);
   background: var(--web-panel);
 `;
 
-const WebPaneIdentity = styled.button`
-  display: inline-flex;
+const WebPaneIdentity = styled(TerminalRailIdentity)`
+  flex: 0 0 auto;
   min-width: 0;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 6px;
-  border: 0;
-  border-radius: 6px;
-  color: var(--web-muted);
-  background: transparent;
-  cursor: grab;
-  font-size: 12px;
-  font-weight: 700;
-
-  &:active {
-    cursor: grabbing;
-  }
-
-  svg {
-    flex: 0 0 auto;
-    width: 15px;
-    height: 15px;
-  }
-
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
 `;
 
-const WebPaneRailControls = styled.div`
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-`;
-
-const WebPaneIconButton = styled.button`
-  display: grid;
-  width: 28px;
-  height: 28px;
-  place-items: center;
-  border: 1px solid transparent;
-  border-radius: 6px;
+const WebPaneDragButton = styled(TerminalRestartButton)`
   color: var(--web-text);
-  background: transparent;
-  transition: border-color 150ms ease, background 150ms ease, color 150ms ease, opacity 150ms ease;
+`;
 
-  svg {
-    width: 16px;
-    height: 16px;
-  }
+const WebPaneRailControls = styled(TerminalRailControls)``;
 
-  &:hover:not(:disabled) {
-    border-color: var(--web-border);
-    background: rgba(255, 255, 255, 0.06);
-  }
+const WebPaneIconButton = styled(TerminalRestartButton)`
+  color: var(--web-text);
 
   html[data-forge-theme="light"] &:hover:not(:disabled) {
-    background: rgba(0, 102, 204, 0.08);
-  }
-
-  &[data-tone="close"]:hover:not(:disabled) {
-    color: var(--web-danger);
-  }
-
-  &:disabled {
-    cursor: default;
-    opacity: 0.36;
+    color: var(--forge-text, #1d2430);
   }
 `;
 
 const WebPaneNav = styled.form`
-  display: grid;
-  min-width: 0;
-  grid-template-columns: auto auto auto minmax(0, 1fr);
+  display: flex;
+  min-width: min(100%, 220px);
   align-items: center;
-  gap: 4px;
-  padding: 5px 8px;
-  border-bottom: 1px solid var(--web-border);
-  background: var(--web-panel);
+  flex: 999 1 260px;
+  gap: 2px;
+  order: 1;
+  padding: 0;
+  border: 0;
+  background: transparent;
 `;
 
 const WebPaneAddressInput = styled.input`
-  min-width: 0;
-  width: 100%;
-  height: 28px;
-  padding: 0 10px;
+  min-width: 72px;
+  flex: 1 1 120px;
+  height: 24px;
+  padding: 0 9px;
   border: 1px solid var(--web-border);
   border-radius: 7px;
   outline: 0;
   color: var(--web-text);
   background: var(--web-panel-strong);
-  font-size: 12px;
+  font-size: 11px;
   font-weight: 600;
 
   &::placeholder {
@@ -411,7 +362,14 @@ const WebPaneAddressInput = styled.input`
   }
 `;
 
+const WebPaneCloseButton = styled(TerminalCloseButton)`
+  &[data-tone="close"]:hover:not(:disabled) {
+    color: var(--web-danger);
+  }
+`;
+
 const WebPaneInlineError = styled.div`
+  grid-row: 2;
   padding: 5px 12px;
   color: var(--web-danger);
   background: rgba(120, 24, 24, 0.18);
@@ -420,6 +378,7 @@ const WebPaneInlineError = styled.div`
 `;
 
 const WebPaneViewport = styled.div`
+  grid-row: 3;
   position: relative;
   min-width: 0;
   min-height: 0;

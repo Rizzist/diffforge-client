@@ -448,8 +448,7 @@ export default function GitWorkspaceView({
   const preloadMatches = Boolean(
     repositoriesPreload
       && repositoriesPreload.workspaceId === workspaceId
-      && repositoriesPreload.rootDirectory === rootDirectory
-      && Array.isArray(repositoriesPreload.repositories),
+      && repositoriesPreload.rootDirectory === rootDirectory,
   );
   const snapshotsPreloadMatches = Boolean(
     snapshotsPreload
@@ -566,6 +565,15 @@ export default function GitWorkspaceView({
     });
   }, [onRefreshRepositories, rootDirectory, workspace?.name, workspaceId]);
 
+  const handleRetryRepositories = useCallback(() => {
+    setRepositoriesState("loading");
+    setRepositoriesError("");
+    void refreshRepositories({ refresh: true }).catch((error) => {
+      setRepositoriesError(error?.message || String(error || "Unable to load Git repositories."));
+      setRepositoriesState("error");
+    });
+  }, [refreshRepositories]);
+
   useEffect(() => {
     if (!preloadMatches || !repositoriesPreload || repositoriesPreload.state !== "loading") {
       return undefined;
@@ -626,12 +634,19 @@ export default function GitWorkspaceView({
       if (current && nextRepositories.some((repo) => repo.path === current)) return current;
       return nextRepositories[0]?.path || "";
     });
-    setRepositoriesState(repositoriesPreload?.state === "error"
-      ? "error"
-      : repositoriesPreload?.state === "loading"
-        ? "loading"
-        : "ready");
-  }, [preloadMatches, preloadSignature, repositoriesPreload]);
+    if (repositoriesPreload?.state === "error") {
+      setRepositoriesState("error");
+    } else if (
+      repositoriesPreload?.state === "loading"
+      && repositoryPreloadLoadingStale(repositoriesPreload)
+      && typeof onRefreshRepositories !== "function"
+    ) {
+      setRepositoriesError("Git repository check timed out.");
+      setRepositoriesState("error");
+    } else {
+      setRepositoriesState(repositoriesPreload?.state === "loading" ? "loading" : "ready");
+    }
+  }, [onRefreshRepositories, preloadMatches, preloadSignature, repositoriesPreload]);
 
   useEffect(() => {
     if (preloadMatches) {
@@ -916,7 +931,21 @@ export default function GitWorkspaceView({
 
       {!repositories.length && (
         <GitEmpty>
-          {repositoriesState === "loading" ? "Loading repositories..." : "No Git repositories found in this workspace."}
+          <span>
+            {repositoriesState === "loading"
+              ? "Loading repositories..."
+              : repositoriesState === "error"
+                ? "Unable to load Git repositories."
+                : "No Git repositories found in this workspace."}
+          </span>
+          {repositoriesState === "error" && typeof onRefreshRepositories === "function" ? (
+            <GitEmptyAction
+              onClick={handleRetryRepositories}
+              type="button"
+            >
+              Retry
+            </GitEmptyAction>
+          ) : null}
         </GitEmpty>
       )}
 
@@ -1674,12 +1703,29 @@ const GitNotice = styled.div`
 const GitEmpty = styled.div`
   display: grid;
   min-height: 42px;
+  gap: 8px;
   place-items: center;
   padding: 12px;
   color: var(--git-vscode-text-muted);
   font-size: 12px;
   font-weight: 400;
   text-align: center;
+`;
+
+const GitEmptyAction = styled.button`
+  border: 1px solid var(--git-vscode-border);
+  border-radius: 6px;
+  padding: 5px 10px;
+  color: var(--git-vscode-text);
+  background: var(--git-card-bg);
+  font: inherit;
+  font-weight: 650;
+  cursor: pointer;
+
+  &:hover {
+    border-color: rgba(125, 176, 255, 0.45);
+    background: var(--git-vscode-hover);
+  }
 `;
 
 const GitTreeEmpty = styled.div`

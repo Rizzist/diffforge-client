@@ -60,7 +60,25 @@
         "silent": true
       },
       "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "installer/windows/diffforge-cli-path.nsh",
         "installerIcon": "icons/icon.ico"
+      }
+    },
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/bin/diffforge": "installer/linux/diffforge"
+        },
+        "postInstallScript": "installer/linux/postinstall.sh",
+        "postRemoveScript": "installer/linux/postremove.sh"
+      },
+      "rpm": {
+        "files": {
+          "/usr/bin/diffforge": "installer/linux/diffforge"
+        },
+        "postInstallScript": "installer/linux/postinstall.sh",
+        "postRemoveScript": "installer/linux/postremove.sh"
       }
     },
     "macOS": {

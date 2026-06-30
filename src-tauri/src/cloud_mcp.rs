@@ -6095,6 +6095,13 @@ fn cloud_mcp_agent_chat_mark_session_acked_from_payload(
         .or_else(|| payload.get("totalRecordCount"))
         .and_then(Value::as_u64)
         .unwrap_or(records.len() as u64) as i64;
+    let response_session_record_count = response
+        .get("session_record_count")
+        .or_else(|| response.get("sessionRecordCount"))
+        .or_else(|| response.get("record_count"))
+        .or_else(|| response.get("recordCount"))
+        .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|count| count as i64)))
+        .unwrap_or(total_record_count);
     let content_hash = cloud_mcp_payload_text(payload, &["content_hash", "contentHash", "ch"])
         .unwrap_or_default();
     let payload_hash = cloud_mcp_payload_text(payload, &["payload_hash", "payloadHash", "ph"])
@@ -6111,6 +6118,28 @@ fn cloud_mcp_agent_chat_mark_session_acked_from_payload(
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("Unable to start agent chat sync ack transaction: {error}"))?;
     let result = (|| -> Result<bool, String> {
+        if records.is_empty()
+            && total_record_count > 0
+            && response_session_record_count < total_record_count
+        {
+            conn.execute(
+                &format!(
+                    "DELETE FROM {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}
+                     WHERE scope_key=?1 AND device_id=?2 AND workspace_id=?3 AND provider=?4 AND session_id=?5"
+                ),
+                rusqlite::params![scope_key, device_id, workspace_id, provider, session_id],
+            )
+            .map_err(|error| format!("Unable to clear stale agent chat record sync ack state: {error}"))?;
+            conn.execute(
+                &format!(
+                    "DELETE FROM {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}
+                     WHERE scope_key=?1 AND device_id=?2 AND workspace_id=?3 AND provider=?4 AND session_id=?5"
+                ),
+                rusqlite::params![scope_key, device_id, workspace_id, provider, session_id],
+            )
+            .map_err(|error| format!("Unable to clear stale agent chat session sync ack state: {error}"))?;
+            return Ok(false);
+        }
         conn.execute(
             &format!(
                 "INSERT INTO {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}(
@@ -6205,6 +6234,7 @@ fn cloud_mcp_agent_chat_mark_session_acked_from_payload(
 
 fn cloud_mcp_outbox_mark_acked(row: &CloudMcpOutboxRow, response: &Value) -> Result<(), String> {
     let mut agent_chat_payload = None::<Value>;
+    let mut agent_chat_repair_pending = false;
     if cloud_mcp_tokenomics_device_packet_kind(&row.event_kind) {
         if let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) {
             let _ = cloud_mcp_tokenomics_persist_ingest_ack(Some(&payload), response);
@@ -6215,7 +6245,19 @@ fn cloud_mcp_outbox_mark_acked(row: &CloudMcpOutboxRow, response: &Value) -> Res
     }
     if row.event_kind == CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT {
         if let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) {
-            let _ = cloud_mcp_agent_chat_mark_session_acked_from_payload(Some(&payload), response);
+            let ack_recorded =
+                cloud_mcp_agent_chat_mark_session_acked_from_payload(Some(&payload), response)
+                    .unwrap_or(false);
+            if !ack_recorded && cloud_mcp_agent_chat_sync_response_accepted(response) {
+                agent_chat_repair_pending = true;
+                if let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get() {
+                    agent_chat_repair_pending = agent_chat_session_sync_spawn_from_payload_repair(
+                        app.clone(),
+                        &payload,
+                        "agent_chat_ack_repair",
+                    );
+                }
+            }
             agent_chat_payload = Some(payload);
         }
     }
@@ -6264,7 +6306,10 @@ fn cloud_mcp_outbox_mark_acked(row: &CloudMcpOutboxRow, response: &Value) -> Res
     .map_err(|error| format!("Unable to delete acked Cloud sync outbox row: {error}"))?;
     cloud_mcp_emit_sync_status(None);
     if let Some(payload) = agent_chat_payload.as_ref() {
-        cloud_mcp_emit_agent_chat_session_sync_status_changed(payload, "synced");
+        cloud_mcp_emit_agent_chat_session_sync_status_changed(
+            payload,
+            if agent_chat_repair_pending { "waiting" } else { "synced" },
+        );
     }
     Ok(())
 }
@@ -15641,13 +15686,13 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
             )
             .await;
         }
-        cloud_mcp_apply_remote_workspace_lever(&app, state, &event);
-        cloud_mcp_apply_remote_terminal_lever(&app, state, &event);
-        cloud_mcp_apply_remote_agent_lever(&app, state, &event);
-        cloud_mcp_apply_remote_asset_lever(&app, state, &event);
-        cloud_mcp_apply_remote_local_script_lever(&app, state, &event);
-        cloud_mcp_apply_remote_device_lever(&app, state, &event);
-        if !cloud_mcp_remote_command_is_rust_owned(&event) {
+        let remote_lever_handled = cloud_mcp_apply_remote_workspace_lever(&app, state, &event)
+            || cloud_mcp_apply_remote_terminal_lever(&app, state, &event)
+            || cloud_mcp_apply_remote_agent_lever(&app, state, &event)
+            || cloud_mcp_apply_remote_asset_lever(&app, state, &event)
+            || cloud_mcp_apply_remote_local_script_lever(&app, state, &event)
+            || cloud_mcp_apply_remote_device_lever(&app, state, &event);
+        if !remote_lever_handled && !cloud_mcp_remote_command_is_rust_owned(&event) {
             let _ = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
         }
         applied += 1;
@@ -17029,6 +17074,7 @@ async fn cloud_mcp_send_remote_command_status_event(
         status,
         "blocked"
             | "completed"
+            | "dropped"
             | "failed"
             | "rejected"
             | "cancelled"
@@ -17563,13 +17609,14 @@ async fn cloud_mcp_start_remote_command_listener(
                 )
                 .await;
             }
-            cloud_mcp_apply_remote_workspace_lever(&app, &state_clone, &event);
-            cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event);
-            cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event);
-            cloud_mcp_apply_remote_asset_lever(&app, &state_clone, &event);
-            cloud_mcp_apply_remote_local_script_lever(&app, &state_clone, &event);
-            cloud_mcp_apply_remote_device_lever(&app, &state_clone, &event);
-            if cloud_mcp_remote_command_is_rust_owned(&event) {
+            let remote_lever_handled =
+                cloud_mcp_apply_remote_workspace_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_asset_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_local_script_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_device_lever(&app, &state_clone, &event);
+            if remote_lever_handled || cloud_mcp_remote_command_is_rust_owned(&event) {
                 continue;
             }
             let emit_result = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
@@ -17599,9 +17646,13 @@ async fn cloud_mcp_start_remote_command_listener(
 /// deactivate-if-idle tears the runtime down natively; activate is recorded
 /// as a pending intent the webview consumes on its next foreground launch
 /// (terminal/agent startup is inherently a foreground concern today).
-fn cloud_mcp_apply_remote_workspace_lever(app: &AppHandle, state: &CloudMcpState, event: &Value) {
+fn cloud_mcp_apply_remote_workspace_lever(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) -> bool {
     if todo_dispatch_webview_dispatcher_active() {
-        return;
+        return false;
     }
     let command_kind =
         cloud_mcp_payload_text(event, &["command_kind", "commandKind", "action", "command"])
@@ -17611,7 +17662,7 @@ fn cloud_mcp_apply_remote_workspace_lever(app: &AppHandle, state: &CloudMcpState
     let workspace_id =
         cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"]).unwrap_or_default();
     if workspace_id.is_empty() {
-        return;
+        return false;
     }
     match command_kind.as_str() {
         "workspace_activate" | "activate_workspace" | "open_workspace" | "workspace_open" => {
@@ -17638,6 +17689,7 @@ fn cloud_mcp_apply_remote_workspace_lever(app: &AppHandle, state: &CloudMcpState
                 )
                 .await;
             });
+            true
         }
         "terminal_relaunch_agent"
         | "relaunch_terminal_agent"
@@ -17660,6 +17712,7 @@ fn cloud_mcp_apply_remote_workspace_lever(app: &AppHandle, state: &CloudMcpState
                 )
                 .await;
             });
+            true
         }
         "workspace_deactivate_if_idle"
         | "deactivate_workspace_if_idle"
@@ -17702,8 +17755,9 @@ fn cloud_mcp_apply_remote_workspace_lever(app: &AppHandle, state: &CloudMcpState
                 )
                 .await;
             });
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -17795,7 +17849,11 @@ pub(crate) fn cloud_mcp_start_agent_inventory_watcher(app: AppHandle, state: Clo
 /// alive — an open webview handles the same commands itself with richer UI
 /// state. Replies with running → completed/failed and re-probes the
 /// inventory afterwards so cloud and any later webview converge.
-fn cloud_mcp_apply_remote_agent_lever(app: &AppHandle, state: &CloudMcpState, event: &Value) {
+fn cloud_mcp_apply_remote_agent_lever(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) -> bool {
     let command_kind =
         cloud_mcp_payload_text(event, &["command_kind", "commandKind", "action", "command"])
             .unwrap_or_default()
@@ -17805,12 +17863,12 @@ fn cloud_mcp_apply_remote_agent_lever(app: &AppHandle, state: &CloudMcpState, ev
         "agent_install" | "install_agent" | "cli_install" => "install",
         "agent_update" | "update_agent" | "cli_update" => "update",
         "agent_uninstall" | "uninstall_agent" | "cli_uninstall" => "uninstall",
-        _ => return,
+        _ => return false,
     };
     // Install/update are lease-gated: an open webview runs them itself with
     // richer UI state. Uninstall has no webview path, so Rust always owns it.
     if action != "uninstall" && todo_dispatch_webview_dispatcher_active() {
-        return;
+        return false;
     }
     let provider = cloud_mcp_payload_text(
         event,
@@ -17894,9 +17952,10 @@ fn cloud_mcp_apply_remote_agent_lever(app: &AppHandle, state: &CloudMcpState, ev
         )
         .await;
     });
+    true
 }
 
-fn cloud_mcp_defer_remote_command_for_foreground(app: &AppHandle, event: &Value) {
+fn cloud_mcp_defer_remote_command_for_foreground(app: &AppHandle, event: &Value) -> Vec<Value> {
     let current = app_local_state_read(app, "remote-intents");
     let mut pending = current
         .get("pendingRemoteCommands")
@@ -17904,15 +17963,17 @@ fn cloud_mcp_defer_remote_command_for_foreground(app: &AppHandle, event: &Value)
         .cloned()
         .unwrap_or_default();
     pending.push(event.clone());
+    let mut dropped = Vec::new();
     if pending.len() > 8 {
         let overflow = pending.len() - 8;
-        pending.drain(0..overflow);
+        dropped.extend(pending.drain(0..overflow));
     }
     let _ = app_local_state_merge(
         app,
         "remote-intents",
         &json!({ "pendingRemoteCommands": pending }),
     );
+    dropped
 }
 
 fn cloud_mcp_terminal_agent_identity(value: &str) -> String {
@@ -18028,9 +18089,13 @@ fn cloud_mcp_presence_terminal_is_idle(terminal: &Value) -> bool {
 /// command for the next foreground session, because agent
 /// relaunch orchestration lives in the webview. Lease-gated: an open webview
 /// owns all of these itself.
-fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState, event: &Value) {
+fn cloud_mcp_apply_remote_terminal_lever(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) -> bool {
     if todo_dispatch_webview_dispatcher_active() {
-        return;
+        return false;
     }
     let command_kind =
         cloud_mcp_payload_text(event, &["command_kind", "commandKind", "action", "command"])
@@ -18056,6 +18121,12 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
         // foreground session.
         "terminal_open" | "open_terminal" | "open_terminals" | "terminal_spawn"
         | "spawn_terminals" => "defer_open",
+        "agent_chat_session_open"
+        | "open_agent_chat_session"
+        | "session_open"
+        | "open_session"
+        | "resume_agent_chat_session"
+        | "resume_session" => "defer_session_open",
         "todo_requeue" | "requeue_todo" | "todo_retry" | "retry_todo" => "defer_requeue",
         "todo_queue" | "queue_todo" | "workspace_todo_queue" => "defer_queue",
         "todo_unqueue"
@@ -18074,7 +18145,10 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
         | "return_terminal_to_grid"
         | "close_terminal_window"
         | "terminal_window_close" => "defer_window",
-        _ => return,
+        "workspace_panel_close" | "close_workspace_panel" | "panel_close" | "close_panel" => {
+            "defer_panel_close"
+        }
+        _ => return false,
     };
     let workspace_id =
         cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"]).unwrap_or_default();
@@ -18126,10 +18200,12 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
             action.as_str(),
             "relaunch"
                 | "defer_open"
+                | "defer_session_open"
                 | "defer_requeue"
                 | "defer_queue"
                 | "defer_unqueue"
                 | "defer_window"
+                | "defer_panel_close"
         ) {
             if action == "relaunch" && target_terminal_id.is_empty() {
                 let _ = cloud_mcp_send_remote_command_status_event(
@@ -18153,10 +18229,23 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
                 .await;
                 return;
             }
-            cloud_mcp_defer_remote_command_for_foreground(&app, &event);
+            let dropped = cloud_mcp_defer_remote_command_for_foreground(&app, &event);
+            for dropped_event in dropped {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &dropped_event,
+                    "dropped",
+                    "Queued remote command was dropped because the foreground replay queue is full.",
+                    None,
+                )
+                .await;
+            }
             let deferred_message = match action.as_str() {
                 "defer_open" => {
                     "Terminal open queued; it completes when the desktop window next opens."
+                }
+                "defer_session_open" => {
+                    "Session open queued; it completes when the desktop window next opens."
                 }
                 "defer_requeue" => {
                     "Todo requeue queued; it completes when the desktop window next opens."
@@ -18169,6 +18258,9 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
                 }
                 "defer_window" => {
                     "Terminal window breakout queued; it completes when the desktop window next opens."
+                }
+                "defer_panel_close" => {
+                    "Workspace panel close queued; it completes when the desktop window next opens."
                 }
                 _ => "Terminal relaunch queued; it completes when the desktop window next opens.",
             };
@@ -18370,6 +18462,7 @@ fn cloud_mcp_apply_remote_terminal_lever(app: &AppHandle, state: &CloudMcpState,
         // remains cached, so dashboards drop the closed terminals quickly.
         cloud_mcp_emit_sync_status(None);
     });
+    true
 }
 
 /// Shows an OS-native notification (Notification Center on macOS, toast on
@@ -18395,7 +18488,11 @@ fn cloud_mcp_show_native_notification(
 /// managed asset paths live on the target device. Cloud/voice sends only ids and
 /// metadata; this function resolves the local library row and performs the
 /// upload/download through the existing asset endpoints.
-fn cloud_mcp_apply_remote_asset_lever(app: &AppHandle, state: &CloudMcpState, event: &Value) {
+fn cloud_mcp_apply_remote_asset_lever(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) -> bool {
     let command_kind =
         cloud_mcp_payload_text(event, &["command_kind", "commandKind", "action", "command"])
             .unwrap_or_default()
@@ -18404,7 +18501,7 @@ fn cloud_mcp_apply_remote_asset_lever(app: &AppHandle, state: &CloudMcpState, ev
     let action = match command_kind.as_str() {
         "upload_asset" | "asset_upload" => "upload",
         "download_asset" | "asset_download" => "download",
-        _ => return,
+        _ => return false,
     };
     let asset_id = cloud_mcp_payload_text(event, &["asset_id", "assetId", "id"])
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "asset_id"]))
@@ -18491,6 +18588,7 @@ fn cloud_mcp_apply_remote_asset_lever(app: &AppHandle, state: &CloudMcpState, ev
             }
         }
     });
+    true
 }
 
 /// Local script execution is device-owned. Cloud and voice route only script
@@ -18500,7 +18598,7 @@ fn cloud_mcp_apply_remote_local_script_lever(
     app: &AppHandle,
     state: &CloudMcpState,
     event: &Value,
-) {
+) -> bool {
     let command_kind =
         cloud_mcp_payload_text(event, &["command_kind", "commandKind", "action", "command"])
             .unwrap_or_default()
@@ -18510,7 +18608,7 @@ fn cloud_mcp_apply_remote_local_script_lever(
         command_kind.as_str(),
         "local_script_run" | "run_local_script" | "script_run" | "run_script"
     ) {
-        return;
+        return false;
     }
     let script_id = cloud_mcp_payload_text(event, &["script_id", "scriptId", "id"])
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "script_id"]))
@@ -18669,6 +18767,7 @@ fn cloud_mcp_apply_remote_local_script_lever(
             }
         }
     });
+    true
 }
 
 /// Device-level levers Rust always owns, with or without the webview: window
@@ -18677,7 +18776,11 @@ fn cloud_mcp_apply_remote_local_script_lever(
 /// remote-command listener stays silent on these kinds, so this function is
 /// the single reply path. Plan release is cloud-owned and answered here only
 /// so a stray desktop-routed command does not hang.
-fn cloud_mcp_apply_remote_device_lever(app: &AppHandle, state: &CloudMcpState, event: &Value) {
+fn cloud_mcp_apply_remote_device_lever(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) -> bool {
     let command_kind =
         cloud_mcp_payload_text(event, &["command_kind", "commandKind", "action", "command"])
             .unwrap_or_default()
@@ -18698,7 +18801,7 @@ fn cloud_mcp_apply_remote_device_lever(app: &AppHandle, state: &CloudMcpState, e
         "plan_release_stage" | "release_plan_stage" | "plan_release" | "release_stage" => {
             "plan_release"
         }
-        _ => return,
+        _ => return false,
     };
     let app = app.clone();
     let state = state.clone();
@@ -18838,6 +18941,7 @@ fn cloud_mcp_apply_remote_device_lever(app: &AppHandle, state: &CloudMcpState, e
             _ => {}
         }
     });
+    true
 }
 
 fn cloud_mcp_remote_command_is_rust_owned(event: &Value) -> bool {
@@ -19554,21 +19658,24 @@ fn cloud_mcp_desktop_device_profile() -> Value {
             let device_id = cloud_mcp_stable_desktop_device_id(&device_name, platform);
             let (device_key_id, device_public_key) =
                 cloud_mcp_stable_desktop_device_key_metadata(&device_id);
-            json!({
-                "device_id": device_id,
-                "device_name": device_name,
-                "machine_name": device_name,
-                "hostname": device_name,
+	            json!({
+	                "device_id": device_id,
+	                "device_name": device_name,
+	                "machine_name": device_name,
+	                "hostname": device_name,
                 "device_key_id": device_key_id,
                 "device_public_key": device_public_key,
                 "device_key_algorithm": "sha256-local-anchor-v1",
-                "platform": platform,
-                "os": platform,
-                "form_factor": "desktop",
-                "device_type": "pc",
-                "client_kind": "client",
-                "client_type": "rust_desktop",
-                "connection_source": "rust-diffforge",
+	                "platform": platform,
+	                "os": platform,
+	                "architecture": env::consts::ARCH,
+	                "app_version": env!("CARGO_PKG_VERSION"),
+	                "build_channel": if cfg!(debug_assertions) { "dev" } else { "stable" },
+	                "form_factor": "desktop",
+	                "device_type": "pc",
+	                "client_kind": "client",
+	                "client_type": "rust_desktop",
+	                "connection_source": "rust-diffforge",
             })
         })
         .clone()
@@ -23700,6 +23807,45 @@ fn cloud_mcp_workspace_terminal_items(workspace: &Value) -> Vec<Value> {
     cloud_mcp_payload_items(workspace, &["terminals"], 64)
 }
 
+fn cloud_mcp_workspace_panel_items(workspace: &Value) -> Vec<Value> {
+    let direct = cloud_mcp_payload_items(workspace, &["panels", "workspace_panels", "workspacePanels"], 64);
+    if !direct.is_empty() {
+        return direct;
+    }
+    cloud_mcp_workspace_terminal_items(workspace)
+        .into_iter()
+        .filter(|item| cloud_mcp_workspace_panel_kind(item).is_some())
+        .collect()
+}
+
+fn cloud_mcp_workspace_panel_kind(panel: &Value) -> Option<String> {
+    let kind = cloud_mcp_payload_text(
+        panel,
+        &[
+            "panel_type",
+            "panelType",
+            "pane_kind",
+            "paneKind",
+            "panel_kind",
+            "panelKind",
+            "surface_kind",
+            "surfaceKind",
+            "kind",
+            "role",
+        ],
+    )?
+    .trim()
+    .to_ascii_lowercase()
+    .replace('_', "-");
+    match kind.as_str() {
+        "web" | "browser" | "chrome" | "workspace-web" | "workspace-browser" | "web-panel" => {
+            Some("web".to_string())
+        }
+        "pcb" | "pcb-panel" | "pcb-design" | "workspace-pcb" => Some("pcb".to_string()),
+        _ => None,
+    }
+}
+
 fn cloud_mcp_workspace_server_items(workspace: &Value) -> Vec<Value> {
     let direct = cloud_mcp_payload_items(workspace, &["mcps", "servers"], 128);
     if !direct.is_empty() {
@@ -27508,6 +27654,9 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             .iter()
             .enumerate()
             .filter_map(|(index, terminal)| {
+                if cloud_mcp_workspace_panel_kind(terminal).is_some() {
+                    return None;
+                }
                 if cloud_mcp_terminal_value_is_device_orchestrator(terminal) {
                     if let Some(normalized) = cloud_mcp_normalize_device_terminal_orchestrator(
                         terminal,
@@ -27744,6 +27893,121 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                 }))
             })
             .collect::<Vec<_>>();
+        let panels = cloud_mcp_workspace_panel_items(workspace)
+            .iter()
+            .enumerate()
+            .filter_map(|(index, panel)| {
+                if !panel.is_object() {
+                    return None;
+                }
+                let panel_kind = cloud_mcp_workspace_panel_kind(panel)?;
+                let slot_index = panel
+                    .get("slot_index")
+                    .or_else(|| panel.get("slotIndex"))
+                    .or_else(|| panel.get("terminal_index"))
+                    .or_else(|| panel.get("terminalIndex"))
+                    .or_else(|| panel.get("index"))
+                    .and_then(Value::as_i64)
+                    .unwrap_or(index as i64)
+                    .clamp(0, 255);
+                let display_name = cloud_mcp_payload_text(
+                    panel,
+                    &[
+                        "display_name",
+                        "displayName",
+                        "panel_name",
+                        "panelName",
+                        "title",
+                        "label",
+                        "name",
+                    ],
+                )
+                .unwrap_or_else(|| {
+                    if panel_kind == "pcb" {
+                        "PCB".to_string()
+                    } else {
+                        "Web".to_string()
+                    }
+                });
+                let panel_id = cloud_mcp_payload_text(
+                    panel,
+                    &[
+                        "panel_id",
+                        "panelId",
+                        "target_panel_id",
+                        "targetPanelId",
+                        "pane_id",
+                        "paneId",
+                        "id",
+                    ],
+                )
+                .unwrap_or_else(|| {
+                    format!("workspace-panel-{}-{}-{}", workspace_id, panel_kind, slot_index)
+                });
+                let status = cloud_mcp_payload_text(panel, &["status", "state", "lifecycle"])
+                    .unwrap_or_else(|| {
+                        if workspace_active {
+                            "open".to_string()
+                        } else {
+                            "closed".to_string()
+                        }
+                    });
+                Some(json!({
+                    "active": panel
+                        .get("active")
+                        .cloned()
+                        .unwrap_or_else(|| json!(workspace_active)),
+                    "commandable": panel
+                        .get("commandable")
+                        .cloned()
+                        .unwrap_or_else(|| workspace
+                            .get("commandable")
+                            .cloned()
+                            .unwrap_or(Value::Null)),
+                    "connected": panel
+                        .get("connected")
+                        .cloned()
+                        .unwrap_or_else(|| json!(workspace_active)),
+                    "display_name": display_name.clone(),
+                    "displayName": display_name.clone(),
+                    "kind": panel_kind.clone(),
+                    "lifecycle": status.clone(),
+                    "native_connected": panel
+                        .get("native_connected")
+                        .or_else(|| panel.get("nativeConnected"))
+                        .cloned()
+                        .unwrap_or_else(|| json!(workspace_active)),
+                    "nativeConnected": panel
+                        .get("native_connected")
+                        .or_else(|| panel.get("nativeConnected"))
+                        .cloned()
+                        .unwrap_or_else(|| json!(workspace_active)),
+                    "pane_id": panel_id.clone(),
+                    "paneId": panel_id.clone(),
+                    "pane_kind": panel_kind.clone(),
+                    "paneKind": panel_kind.clone(),
+                    "panel_id": panel_id.clone(),
+                    "panelId": panel_id.clone(),
+                    "panel_kind": panel_kind.clone(),
+                    "panelKind": panel_kind.clone(),
+                    "panel_name": display_name.clone(),
+                    "panelName": display_name,
+                    "panel_type": panel_kind.clone(),
+                    "panelType": panel_kind.clone(),
+                    "slot_index": slot_index,
+                    "slotIndex": slot_index,
+                    "status": status,
+                    "surface_kind": panel_kind.clone(),
+                    "surfaceKind": panel_kind.clone(),
+                    "target_panel_id": panel_id.clone(),
+                    "targetPanelId": panel_id,
+                    "terminal_index": slot_index,
+                    "terminalIndex": slot_index,
+                    "terminal_kind": "workspace_panel",
+                    "terminalKind": "workspace_panel",
+                }))
+            })
+            .collect::<Vec<_>>();
 
         let (workspace_runtime_seq, workspace_runtime_epoch) =
             cloud_mcp_workspace_runtime_ordering(state.inner(), workspace);
@@ -27766,6 +28030,8 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                 .unwrap_or_default();
         let terminal_list_authoritative = true;
         let terminal_list_empty_authoritative = terminals.is_empty();
+        let panel_list_authoritative = true;
+        let panel_list_empty_authoritative = panels.is_empty();
         let terminal_clear_reason = if terminal_list_empty_authoritative
             && requested_terminal_clear_reason.trim().is_empty()
         {
@@ -27801,6 +28067,13 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                 .get("commandable")
                 .cloned()
                 .unwrap_or(Value::Null),
+            "panel_count": panels.len(),
+            "panelCount": panels.len(),
+            "panel_list_empty_authoritative": panel_list_empty_authoritative,
+            "panelListEmptyAuthoritative": panel_list_empty_authoritative,
+            "panel_list_authoritative": panel_list_authoritative,
+            "panelListAuthoritative": panel_list_authoritative,
+            "panels": panels,
             "servers": servers.clone(),
             "mcps": servers,
             "terminals": terminals,
@@ -27812,6 +28085,16 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         .map(|workspace| {
             workspace
                 .get("terminals")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or_default()
+        })
+        .sum::<usize>();
+    let panel_count = normalized_workspaces
+        .iter()
+        .map(|workspace| {
+            workspace
+                .get("panels")
                 .and_then(Value::as_array)
                 .map(Vec::len)
                 .unwrap_or_default()
@@ -27869,6 +28152,8 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         "skipped_archived_workspace_count": skipped_archived_count,
         "skippedArchivedWorkspaceCount": skipped_archived_count,
         "terminal_count": terminal_count,
+        "panel_count": panel_count,
+        "panelCount": panel_count,
         "terminal_orchestrator_count": terminal_orchestrator_count,
         "terminalOrchestratorCount": terminal_orchestrator_count,
         "terminal_orchestrators": normalized_terminal_orchestrators.clone(),

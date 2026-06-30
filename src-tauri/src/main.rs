@@ -48,6 +48,10 @@ fn main() {
         }
         return;
     }
+    if args.get(1).map(String::as_str) == Some("auth") {
+        let auth_args = args.drain(2..).collect::<Vec<_>>();
+        std::process::exit(rust_diffforge_lib::run_desktop_auth_cli(&auth_args));
+    }
     if args.get(1).map(String::as_str) == Some("--snipping-capture-helper") {
         let helper_args = args.drain(2..).collect::<Vec<_>>();
         std::process::exit(rust_diffforge_lib::run_snipping_capture_helper(

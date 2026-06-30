@@ -100,6 +100,68 @@ async fn read_api_response(
     Err(api_error.to_string())
 }
 
+fn read_blocking_api_response(
+    response: reqwest::blocking::Response,
+    fallback_message: &str,
+) -> Result<Value, String> {
+    let status = response.status();
+    let response_text = response
+        .text()
+        .map_err(|error| format!("Unable to read Diff Forge AI API response: {error}"))?;
+    let response_body = if response_text.trim().is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_str::<Value>(&response_text) {
+            Ok(body) => body,
+            Err(error) => {
+                return Err(non_json_api_response_message(
+                    status,
+                    fallback_message,
+                    error,
+                ));
+            }
+        }
+    };
+
+    if status.is_success() {
+        return Ok(response_body);
+    }
+
+    let api_error = response_body
+        .get("error")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_message);
+
+    Err(api_error.to_string())
+}
+
+fn blocking_http_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
+    reqwest::blocking::Client::builder()
+        .timeout(timeout)
+        .user_agent("Diff Forge AI Desktop/0.1.0")
+        .build()
+        .map_err(|error| format!("Unable to prepare backend request: {error}"))
+}
+
+fn read_blocking_api_body(
+    response: reqwest::blocking::Response,
+    fallback_message: &str,
+) -> Result<(reqwest::StatusCode, Value), String> {
+    let status = response.status();
+    let response_text = response
+        .text()
+        .map_err(|error| format!("Unable to read Diff Forge AI API response: {error}"))?;
+    let response_body = if response_text.trim().is_empty() {
+        json!({})
+    } else {
+        serde_json::from_str::<Value>(&response_text).map_err(|error| {
+            non_json_api_response_message(status, fallback_message, error)
+        })?
+    };
+
+    Ok((status, response_body))
+}
+
 #[tauri::command]
 async fn backend_ping() -> Result<BackendStatus, String> {
     let endpoint = api_endpoint("hello");
@@ -1025,12 +1087,15 @@ fn desktop_auth_login_url(state: &str) -> String {
         desktop_auth_callback_scheme().to_string(),
     ));
     let device_profile = cloud_mcp_desktop_device_profile();
-    for (key, path) in [
-        ("desktopDeviceId", &["device_id", "deviceId"][..]),
-        ("desktopDeviceName", &["device_name", "deviceName", "machine_name", "machineName"][..]),
-        ("desktopPlatform", &["platform", "os"][..]),
-        ("desktopFormFactor", &["form_factor", "formFactor", "device_type", "deviceType"][..]),
-    ] {
+	    for (key, path) in [
+	        ("desktopDeviceId", &["device_id", "deviceId"][..]),
+	        ("desktopDeviceName", &["device_name", "deviceName", "machine_name", "machineName"][..]),
+	        ("desktopPlatform", &["platform", "os"][..]),
+	        ("desktopFormFactor", &["form_factor", "formFactor", "device_type", "deviceType"][..]),
+	        ("desktopAppVersion", &["app_version", "appVersion"][..]),
+	        ("desktopArchitecture", &["architecture", "arch"][..]),
+	        ("desktopBuildChannel", &["build_channel", "buildChannel"][..]),
+	    ] {
         if let Some(value) = cloud_mcp_payload_text(&device_profile, path) {
             pairs.push((key.to_string(), value));
         }
@@ -1496,6 +1561,425 @@ async fn logout_desktop_session(token: String) -> Result<Value, String> {
         .map_err(|error| format!("Unable to sign out desktop session: {error}"))?;
 
     read_api_response(response, "Unable to sign out desktop session.").await
+}
+
+fn start_desktop_device_authorization_blocking(device: Value) -> Result<Value, String> {
+    let client = blocking_http_client(Duration::from_secs(DEVICE_AUTH_START_TIMEOUT_SECS))?;
+    let response = client
+        .post(api_endpoint("desktop/device-codes"))
+        .json(&json!({ "device": device }))
+        .send()
+        .map_err(|error| format!("Unable to start device sign in: {error}"))?;
+
+    read_blocking_api_response(response, "Unable to start device sign in.")
+}
+
+fn poll_desktop_device_authorization_blocking(device_code: &str) -> Result<Value, String> {
+    validate_auth_value("Device auth code", device_code)?;
+
+    let client = blocking_http_client(Duration::from_secs(DEVICE_AUTH_POLL_TIMEOUT_SECS))?;
+    let response = client
+        .post(api_endpoint("desktop/device-codes/token"))
+        .json(&json!({ "deviceCode": device_code }))
+        .send()
+        .map_err(|error| format!("Unable to check device sign in: {error}"))?;
+    let (status, body) =
+        read_blocking_api_body(response, "Unable to check device sign in.")?;
+
+    if status.as_u16() >= 500 {
+        let error = body
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("Unable to check device sign in.");
+        return Err(error.to_string());
+    }
+
+    Ok(body)
+}
+
+fn validate_desktop_session_blocking(token: &str) -> Result<Value, String> {
+    validate_auth_value("Desktop session", token)?;
+
+    let client = blocking_http_client(Duration::from_secs(SESSION_VALIDATE_TIMEOUT_SECS))?;
+    let response = client
+        .get(api_endpoint("desktop/session"))
+        .bearer_auth(token)
+        .send()
+        .map_err(|error| format!("Unable to validate desktop session: {error}"))?;
+
+    read_blocking_api_response(response, "Desktop session expired.")
+}
+
+fn logout_desktop_session_blocking(token: &str) -> Result<Value, String> {
+    validate_auth_value("Desktop session", token)?;
+
+    let client = blocking_http_client(Duration::from_secs(LOGOUT_TIMEOUT_SECS))?;
+    let response = client
+        .delete(api_endpoint("desktop/session"))
+        .bearer_auth(token)
+        .send()
+        .map_err(|error| format!("Unable to sign out desktop session: {error}"))?;
+
+    read_blocking_api_response(response, "Unable to sign out desktop session.")
+}
+
+fn desktop_auth_cli_home_dir() -> Option<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("USERPROFILE").map(PathBuf::from))
+}
+
+fn desktop_auth_cli_app_data_dir() -> Result<PathBuf, String> {
+    if cfg!(target_os = "windows") {
+        if let Some(appdata) = env::var_os("APPDATA").map(PathBuf::from) {
+            return Ok(appdata.join("ai.diffforge.desktop"));
+        }
+        if let Some(home) = desktop_auth_cli_home_dir() {
+            return Ok(home
+                .join("AppData")
+                .join("Roaming")
+                .join("ai.diffforge.desktop"));
+        }
+    } else if cfg!(target_os = "macos") {
+        if let Some(home) = desktop_auth_cli_home_dir() {
+            return Ok(home
+                .join("Library")
+                .join("Application Support")
+                .join("ai.diffforge.desktop"));
+        }
+    } else {
+        if let Some(data_home) = env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+            return Ok(data_home.join("ai.diffforge.desktop"));
+        }
+        if let Some(home) = desktop_auth_cli_home_dir() {
+            return Ok(home
+                .join(".local")
+                .join("share")
+                .join("ai.diffforge.desktop"));
+        }
+    }
+
+    Err("Unable to resolve Diff Forge app data directory.".to_string())
+}
+
+fn desktop_auth_cli_state_path() -> Result<PathBuf, String> {
+    let state_dir = desktop_auth_cli_app_data_dir()?.join("app-state");
+    fs::create_dir_all(&state_dir)
+        .map_err(|error| format!("Unable to create auth state directory: {error}"))?;
+    Ok(state_dir.join(format!("{DESKTOP_AUTH_STATE_KEY}.json")))
+}
+
+fn desktop_auth_cli_read_snapshot() -> Value {
+    let Ok(path) = desktop_auth_cli_state_path() else {
+        return desktop_auth_snapshot_from_raw(json!(null));
+    };
+    let raw = fs::read_to_string(path).ok();
+    let value = raw
+        .as_deref()
+        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+        .unwrap_or(json!(null));
+    desktop_auth_snapshot_from_raw(value)
+}
+
+fn desktop_auth_cli_write_snapshot(snapshot: Value) -> Result<Value, String> {
+    let path = desktop_auth_cli_state_path()?;
+    let snapshot = desktop_auth_snapshot_from_raw(snapshot);
+    let serialized = serde_json::to_vec_pretty(&snapshot)
+        .map_err(|error| format!("Unable to serialize auth state: {error}"))?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, serialized)
+        .map_err(|error| format!("Unable to write auth state: {error}"))?;
+    fs::rename(&temp_path, &path)
+        .map_err(|error| format!("Unable to finalize auth state: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o600));
+    }
+    Ok(snapshot)
+}
+
+fn desktop_auth_cli_clear_snapshot() -> Result<Value, String> {
+    desktop_auth_cli_write_snapshot(desktop_auth_signed_out_snapshot(
+        DESKTOP_AUTH_DEFAULT_MESSAGE,
+        "",
+        true,
+    ))
+}
+
+fn desktop_auth_cli_gui_available() -> bool {
+    cfg!(target_os = "macos")
+        || cfg!(target_os = "windows")
+        || env::var_os("DISPLAY").is_some()
+        || env::var_os("WAYLAND_DISPLAY").is_some()
+}
+
+fn desktop_auth_cli_device_metadata(login_method: &str) -> Value {
+    let mut device = cloud_mcp_desktop_device_profile();
+    let gui_available = desktop_auth_cli_gui_available();
+    if let Some(object) = device.as_object_mut() {
+        object.insert("login_method".to_string(), json!(login_method));
+        object.insert("app_version".to_string(), json!(env!("CARGO_PKG_VERSION")));
+        object.insert("architecture".to_string(), json!(env::consts::ARCH));
+        object.insert(
+            "form_factor".to_string(),
+            json!(if gui_available { "desktop" } else { "headless" }),
+        );
+        object.insert(
+            "device_type".to_string(),
+            json!(if gui_available { "pc" } else { "server" }),
+        );
+        object.insert(
+            "capabilities".to_string(),
+            json!([
+                if gui_available { "gui" } else { "headless" },
+                "terminal",
+                "cloud_sync"
+            ]),
+        );
+    }
+    device
+}
+
+fn desktop_auth_cli_snapshot_from_session(session: Value) -> Result<Value, String> {
+    let token = desktop_auth_extract_session_token(&session)?;
+    let user = desktop_auth_extract_session_user(&session)?;
+    desktop_auth_cli_write_snapshot(json!({
+        "status": "authenticated",
+        "stage": "authenticated",
+        "message": "Signed in from the command line.",
+        "error": "",
+        "token": token,
+        "user": user,
+        "pendingState": "",
+        "billingStatus": Value::Null,
+    }))
+}
+
+fn desktop_auth_cli_token() -> Option<String> {
+    desktop_auth_snapshot_token(&desktop_auth_cli_read_snapshot())
+}
+
+fn desktop_auth_cli_user_label(snapshot: &Value) -> String {
+    snapshot
+        .get("user")
+        .and_then(|user| {
+            desktop_auth_text(user, &["email"])
+                .or_else(|| desktop_auth_text(user, &["name"]))
+                .or_else(|| desktop_auth_text(user, &["id"]))
+        })
+        .unwrap_or_else(|| "Diff Forge account".to_string())
+}
+
+fn desktop_auth_cli_status() -> i32 {
+    let Some(token) = desktop_auth_cli_token() else {
+        println!("Signed out.");
+        return 1;
+    };
+
+    match validate_desktop_session_blocking(&token) {
+        Ok(session) => match desktop_auth_cli_snapshot_from_session({
+            let mut next = session.clone();
+            next["token"] = json!(token);
+            next
+        }) {
+            Ok(snapshot) => {
+                println!("Signed in as {}.", desktop_auth_cli_user_label(&snapshot));
+                0
+            }
+            Err(error) => {
+                eprintln!("Signed in, but unable to refresh local auth state: {error}");
+                1
+            }
+        },
+        Err(error) => {
+            eprintln!("Saved session is not valid: {error}");
+            let _ = desktop_auth_cli_clear_snapshot();
+            1
+        }
+    }
+}
+
+fn desktop_auth_cli_logout() -> i32 {
+    if let Some(token) = desktop_auth_cli_token() {
+        let _ = logout_desktop_session_blocking(&token);
+    }
+
+    match desktop_auth_cli_clear_snapshot() {
+        Ok(_) => {
+            println!("Signed out.");
+            0
+        }
+        Err(error) => {
+            eprintln!("Unable to clear local auth state: {error}");
+            1
+        }
+    }
+}
+
+fn desktop_auth_cli_login(args: &[String]) -> i32 {
+    let force = args.iter().any(|arg| arg == "--force");
+    if !force {
+        if let Some(token) = desktop_auth_cli_token() {
+            if let Ok(session) = validate_desktop_session_blocking(&token) {
+                let mut next = session.clone();
+                next["token"] = json!(token);
+                if let Ok(snapshot) = desktop_auth_cli_snapshot_from_session(next) {
+                    println!(
+                        "Already signed in as {}. Run `diffforge auth logout` to switch accounts.",
+                        desktop_auth_cli_user_label(&snapshot)
+                    );
+                    return 0;
+                }
+            }
+        }
+    }
+
+    let authorization = match start_desktop_device_authorization_blocking(
+        desktop_auth_cli_device_metadata("device_code"),
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+    let device_code = authorization
+        .get("deviceCode")
+        .or_else(|| authorization.get("device_code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let user_code = authorization
+        .get("userCode")
+        .or_else(|| authorization.get("user_code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let verification_uri = authorization
+        .get("verificationUri")
+        .or_else(|| authorization.get("verification_uri"))
+        .and_then(Value::as_str)
+        .unwrap_or("https://diffforge.ai/device");
+    let verification_uri_complete = authorization
+        .get("verificationUriComplete")
+        .or_else(|| authorization.get("verification_uri_complete"))
+        .and_then(Value::as_str)
+        .unwrap_or(verification_uri);
+    let mut interval = authorization
+        .get("interval")
+        .and_then(Value::as_u64)
+        .unwrap_or(5)
+        .clamp(2, 30);
+    let expires_in = authorization
+        .get("expiresIn")
+        .or_else(|| authorization.get("expires_in"))
+        .and_then(Value::as_u64)
+        .unwrap_or(600);
+
+    if device_code.is_empty() || user_code.is_empty() {
+        eprintln!("Device sign in did not return a usable code.");
+        return 1;
+    }
+
+    println!("Open: {verification_uri}");
+    println!("Code: {user_code}");
+    if verification_uri_complete != verification_uri {
+        println!("Direct link: {verification_uri_complete}");
+    }
+    println!("Waiting for approval...");
+
+    let deadline = Instant::now() + Duration::from_secs(expires_in.saturating_add(30));
+    while Instant::now() < deadline {
+        thread::sleep(Duration::from_secs(interval));
+        let poll = match poll_desktop_device_authorization_blocking(&device_code) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!("{error}");
+                return 1;
+            }
+        };
+        let status = poll
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        match status {
+            "authorized" => match desktop_auth_cli_snapshot_from_session(poll) {
+                Ok(snapshot) => {
+                    println!("Signed in as {}.", desktop_auth_cli_user_label(&snapshot));
+                    return 0;
+                }
+                Err(error) => {
+                    eprintln!("Unable to save desktop session: {error}");
+                    return 1;
+                }
+            },
+            "authorization_pending" => {
+                interval = poll
+                    .get("interval")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(interval)
+                    .clamp(2, 30);
+            }
+            "slow_down" => {
+                interval = poll
+                    .get("interval")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(interval.saturating_add(5))
+                    .clamp(2, 60);
+            }
+            "access_denied" => {
+                eprintln!("Device sign in was denied.");
+                return 1;
+            }
+            "expired_token" => {
+                eprintln!("Device sign in expired. Run `diffforge auth login` again.");
+                return 1;
+            }
+            _ => {
+                let error = poll
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Device sign in failed.");
+                eprintln!("{error}");
+                return 1;
+            }
+        }
+    }
+
+    eprintln!("Device sign in timed out. Run `diffforge auth login` again.");
+    1
+}
+
+fn desktop_auth_cli_help() {
+    println!("Diff Forge authentication");
+    println!();
+    println!("Usage:");
+    println!("  diffforge auth login [--force]");
+    println!("  diffforge auth status");
+    println!("  diffforge auth logout");
+    println!("  diffforge auth help");
+    println!();
+    println!("`auth login` works in GUI and headless terminals. It prints a device code");
+    println!("that can be approved from any signed-in browser at https://diffforge.ai/device.");
+}
+
+pub fn run_desktop_auth_cli(args: &[String]) -> i32 {
+    let command = args.first().map(String::as_str).unwrap_or("help");
+    match command {
+        "login" => desktop_auth_cli_login(&args[1..]),
+        "status" => desktop_auth_cli_status(),
+        "logout" | "signout" | "sign-out" => desktop_auth_cli_logout(),
+        "help" | "--help" | "-h" => {
+            desktop_auth_cli_help();
+            0
+        }
+        other => {
+            eprintln!("Unknown auth command: {other}");
+            desktop_auth_cli_help();
+            2
+        }
+    }
 }
 
 #[cfg(test)]

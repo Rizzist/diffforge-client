@@ -27,6 +27,7 @@ import {
   ResizePanel,
   ResizePanelGroup,
 } from "../app/appStyles.js";
+import AppSelect from "../app/AppSelect.jsx";
 import McpsWorkspaceView from "../mcps/McpsWorkspaceView.jsx";
 import { CLI_CATALOG, cliInstallManager } from "./cliCatalog.js";
 import { SKILLS_CATALOG, skillCliBinary, skillCliIcon } from "./skillsCatalog.js";
@@ -6012,27 +6013,25 @@ export default function ToolsWorkspaceView({
                         {text(newDocDraft.createKind, "document") === "folder" ? (
                           <DocsField>
                             <label htmlFor="tools-doc-create-kind">Create</label>
-                            <select
+                            <AppSelect
                               id="tools-doc-create-kind"
-                              onChange={(event) => setNewDocDraft((current) => ({ ...current, createKind: event.target.value }))}
+                              onChange={(value) => setNewDocDraft((current) => ({ ...current, createKind: value }))}
+                              options={[
+                                { value: "folder", label: "Folder" },
+                                { value: "document", label: "Document" },
+                              ]}
                               value={text(newDocDraft.createKind, "document")}
-                            >
-                              <option value="folder">Folder</option>
-                              <option value="document">Document</option>
-                            </select>
+                            />
                           </DocsField>
                         ) : (
                           <DocsField>
                             <label htmlFor="tools-doc-type">Type</label>
-                            <select
+                            <AppSelect
                               id="tools-doc-type"
-                              onChange={(event) => setNewDocDraft((current) => ({ ...current, type: event.target.value }))}
+                              onChange={(value) => setNewDocDraft((current) => ({ ...current, type: value }))}
+                              options={DOCUMENT_TYPE_OPTIONS.map((option) => ({ value: option.id, label: option.label }))}
                               value={newDocDraft.type}
-                            >
-                              {DOCUMENT_TYPE_OPTIONS.map((option) => (
-                                <option key={option.id} value={option.id}>{option.label}</option>
-                              ))}
-                            </select>
+                            />
                           </DocsField>
                         )}
                       </DocsCreateFields>
@@ -6734,15 +6733,12 @@ export default function ToolsWorkspaceView({
                             </DocsField>
                             <DocsField>
                               <label htmlFor="tools-script-shell">Shell</label>
-                              <select
+                              <AppSelect
                                 id="tools-script-shell"
-                                onChange={(event) => setNewScriptDraft((current) => ({ ...current, shell: event.target.value }))}
+                                onChange={(value) => setNewScriptDraft((current) => ({ ...current, shell: value }))}
+                                options={SCRIPT_SHELL_OPTIONS.map((option) => ({ value: option.id, label: option.label }))}
                                 value={newScriptDraft.shell}
-                              >
-                                {SCRIPT_SHELL_OPTIONS.map((option) => (
-                                  <option key={option.id} value={option.id}>{option.label}</option>
-                                ))}
-                              </select>
+                              />
                             </DocsField>
                             <ScriptColorCreateField>
                               <label htmlFor="tools-script-workspace-button-color">Work BG</label>

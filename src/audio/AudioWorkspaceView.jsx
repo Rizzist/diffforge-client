@@ -272,7 +272,6 @@ import {
   AudioRecorderActions,
   AudioDevicePanel,
   AudioDeviceHeader,
-  AudioDeviceSelect,
   AudioCloudField,
   AudioCloudInput,
   AudioInputHeaderControls,
@@ -282,7 +281,6 @@ import {
   AudioInputMuteButton,
   AudioInputPill,
   AudioInputPillIconButton,
-  AudioInputPillSelect,
   AudioRecorderOptionRow,
   AudioShortcutGrid,
   AudioShortcutCard,
@@ -516,6 +514,7 @@ import {
   FileFolderTreeIcon,
   FileDocumentIcon
 } from "../app/appStyles";
+import AppSelect from "../app/AppSelect.jsx";
 import { playNotificationSfx } from "../notifications/notificationSfx";
 
 export const AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT = "forge-audio-model-download-progress";
@@ -4318,8 +4317,7 @@ export default function AudioWorkspaceView({
     notifyAudioSettingsChanged("deepgram-key");
   }, []);
 
-  const updateDeepgramLanguage = useCallback((event) => {
-    const nextLanguage = event.target.value;
+  const updateDeepgramLanguage = useCallback((nextLanguage) => {
     setDeepgramLanguage(nextLanguage);
     writeDeepgramLanguage(nextLanguage);
     notifyAudioSettingsChanged("deepgram-language");
@@ -4778,22 +4776,17 @@ export default function AudioWorkspaceView({
             >
               <ButtonMicIcon aria-hidden="true" />
             </AudioInputMicButton>
-            <AudioInputPillSelect
-              aria-label="Microphone input source"
-              disabled={audioInputState === "checking" || audioInputState === "starting"}
-              onChange={selectAudioInputDevice}
-              value={audioInputDeviceId}
-            >
-              {audioInputDevices.length ? (
-                audioInputDevices.map((device, index) => (
-                  <option key={`${device.deviceId || "default"}-${index}`} value={device.deviceId}>
-                    {device.label}
-                  </option>
-                ))
-              ) : (
-                <option value="default">Default microphone</option>
-              )}
-            </AudioInputPillSelect>
+            <div style={{ flex: "1 1 auto", minWidth: 0 }}>
+              <AppSelect
+                aria-label="Microphone input source"
+                isDisabled={audioInputState === "checking" || audioInputState === "starting"}
+                onChange={(value) => selectAudioInputDevice({ target: { value } })}
+                options={audioInputDevices.length
+                  ? audioInputDevices.map((device) => ({ value: device.deviceId, label: device.label }))
+                  : [{ value: "default", label: "Default microphone" }]}
+                value={audioInputDeviceId}
+              />
+            </div>
             <AudioInputMeter
               aria-hidden="true"
               data-active={audioInputState === "previewing"}
@@ -4961,17 +4954,15 @@ export default function AudioWorkspaceView({
             {(isCloudMode || isForgeMode) && (
               <AudioCloudField>
                 Language
-                <AudioDeviceSelect
-                  aria-label="Transcription language"
-                  onChange={updateDeepgramLanguage}
-                  value={deepgramLanguage}
-                >
-                  {DEEPGRAM_LANGUAGE_OPTIONS.map((option) => (
-                    <option key={option.value} value={option.value}>
-                      {option.label}
-                    </option>
-                  ))}
-                </AudioDeviceSelect>
+                <div style={{ width: "100%" }}>
+                  <AppSelect
+                    aria-label="Transcription language"
+                    onChange={updateDeepgramLanguage}
+                    options={DEEPGRAM_LANGUAGE_OPTIONS}
+                    placeholder="English"
+                    value={deepgramLanguage}
+                  />
+                </div>
               </AudioCloudField>
             )}
             {isCloudMode && (

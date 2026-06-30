@@ -1555,16 +1555,14 @@ fn agent_chat_session_sync_spawn_from_result(
                     &record_for_emit,
                     Some(recorded),
                 );
-                if recorded {
-                    agent_chat_session_sync_spawn(
-                        app_for_task,
-                        agent_id,
-                        provider_session_id,
-                        result.cwd,
-                        context,
-                        reason,
-                    );
-                }
+                agent_chat_session_sync_spawn(
+                    app_for_task,
+                    agent_id,
+                    provider_session_id,
+                    result.cwd,
+                    context,
+                    reason,
+                );
             }
             Err(error) => {
                 log_terminal_status_event(
@@ -1638,6 +1636,70 @@ fn agent_chat_session_sync_spawn_from_history_record(
         context,
         reason,
     );
+}
+
+fn agent_chat_session_sync_spawn_from_payload_repair(
+    app: AppHandle,
+    payload: &Value,
+    reason: &'static str,
+) -> bool {
+    let provider = cloud_mcp_payload_text(payload, &["provider", "agent_kind", "agentKind"])
+        .unwrap_or_default();
+    let provider_session_id = cloud_mcp_payload_text(
+        payload,
+        &["provider_session_id", "providerSessionId", "session_id", "sessionId"],
+    )
+    .unwrap_or_default();
+    let workspace_id = cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"])
+        .unwrap_or_default();
+    if provider.trim().is_empty()
+        || provider_session_id.trim().is_empty()
+        || workspace_id.trim().is_empty()
+    {
+        return false;
+    }
+    let context = AgentChatSessionSyncContext {
+        workspace_id,
+        workspace_name: cloud_mcp_payload_text(payload, &["workspace_name", "workspaceName"])
+            .unwrap_or_default(),
+        thread_id: cloud_mcp_payload_text(payload, &["thread_id", "threadId"]).unwrap_or_default(),
+        pane_id: cloud_mcp_payload_text(payload, &["pane_id", "paneId"]).unwrap_or_default(),
+        terminal_instance_id: payload
+            .get("terminal_instance_id")
+            .or_else(|| payload.get("terminalInstanceId"))
+            .and_then(Value::as_u64),
+        terminal_index: payload
+            .get("terminal_index")
+            .or_else(|| payload.get("terminalIndex"))
+            .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|number| number as i64))),
+        model_id: cloud_mcp_payload_text(payload, &["model_id", "modelId", "model"])
+            .unwrap_or_default(),
+        model_source: String::new(),
+        session_mode: cloud_mcp_payload_text(payload, &["session_mode", "sessionMode"])
+            .unwrap_or_default(),
+        file_authority: cloud_mcp_payload_text(payload, &["file_authority", "fileAuthority"])
+            .unwrap_or_default(),
+        coordination_mode: cloud_mcp_payload_text(payload, &["coordination_mode", "coordinationMode"])
+            .unwrap_or_default(),
+        status: "waiting".to_string(),
+        source: "agent_chat_ack_repair".to_string(),
+        shared_history_id: cloud_mcp_payload_text(payload, &["shared_history_id", "sharedHistoryId"])
+            .unwrap_or_default(),
+        fork_from_provider_session_id: cloud_mcp_payload_text(
+            payload,
+            &[
+                "fork_from_provider_session_id",
+                "forkFromProviderSessionId",
+                "fork_from_session_id",
+                "forkFromSessionId",
+            ],
+        )
+        .unwrap_or_default(),
+    };
+    let cwd = cloud_mcp_payload_text(payload, &["cwd", "workspace_root", "workspaceRoot"])
+        .unwrap_or_default();
+    agent_chat_session_sync_spawn(app, provider, provider_session_id, cwd, context, reason);
+    true
 }
 
 #[cfg(test)]

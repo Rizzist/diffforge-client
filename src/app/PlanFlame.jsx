@@ -382,7 +382,6 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
     let frame = 0;
     let frameTimer = 0;
     let isIntersecting = true;
-    let windowFocused = typeof document.hasFocus === "function" ? document.hasFocus() : true;
     let resizeObserver = null;
     let intersectionObserver = null;
     const reduceMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches;
@@ -505,9 +504,9 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
       }
 
       // Only paint when the flame can actually be seen: reduced-motion off,
-      // page visible, window focused, and the canvas intersecting the
-      // viewport. This keeps the animation faithful while never burning the
-      // GPU on a flame nobody is looking at.
+      // page visible, and the canvas intersecting the viewport. Terminal focus
+      // can move through native/input surfaces without hiding the page, so it
+      // should not pause the flame.
       function shouldRender() {
         return (
           !reduceMotion
@@ -556,18 +555,6 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
         }
       }
 
-      function handleWindowFocus() {
-        windowFocused = true;
-        if (reportedReady) {
-          startRendering();
-        }
-      }
-
-      function handleWindowBlur() {
-        windowFocused = false;
-        stopRendering();
-      }
-
       if (typeof ResizeObserver !== "undefined") {
         resizeObserver = new ResizeObserver((entries) => {
           const rect = entries[entries.length - 1]?.contentRect;
@@ -597,8 +584,6 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
         });
         intersectionObserver.observe(canvas);
       }
-      window.addEventListener("focus", handleWindowFocus);
-      window.addEventListener("blur", handleWindowBlur);
       document.addEventListener("visibilitychange", handleVisibilityChange);
       measure();
 
@@ -609,8 +594,6 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
       return () => {
         stopRendering();
         document.removeEventListener("visibilitychange", handleVisibilityChange);
-        window.removeEventListener("focus", handleWindowFocus);
-        window.removeEventListener("blur", handleWindowBlur);
         if (intersectionObserver) {
           intersectionObserver.disconnect();
         }

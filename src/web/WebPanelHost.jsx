@@ -4,12 +4,20 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { ArrowBack } from "@styled-icons/material-rounded/ArrowBack";
 import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
-import { Close } from "@styled-icons/material-rounded/Close";
 import { Language } from "@styled-icons/material-rounded/Language";
+import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { Refresh } from "@styled-icons/material-rounded/Refresh";
-import { SubdirectoryArrowLeft } from "@styled-icons/material-rounded/SubdirectoryArrowLeft";
 
-import { GlobalStyle } from "../app/appStyles.js";
+import {
+  ButtonCloseIcon,
+  ButtonDragIcon,
+  GlobalStyle,
+  TerminalCloseButton,
+  TerminalRailControls,
+  TerminalRailIdentity,
+  TerminalRestartButton,
+  TerminalRestartPill,
+} from "../app/appStyles.js";
 import {
   DEFAULT_WEB_URL,
   hostForUrl,
@@ -136,69 +144,108 @@ export default function WebPanelHost() {
     reload();
   }, [reload]);
 
+  const startWindowDrag = useCallback((event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    currentWindow.startDragging().catch(() => {});
+  }, [currentWindow]);
+
+  const startChromeDrag = useCallback((event) => {
+    if (
+      event.button !== 0
+      || event.target?.closest?.("button, input, textarea, select, a, [contenteditable='true']")
+    ) {
+      return;
+    }
+    event.preventDefault();
+    event.stopPropagation();
+    currentWindow.startDragging().catch(() => {});
+  }, [currentWindow]);
+
   const returnToGrid = useCallback(() => {
     emit(WEB_PANEL_CONTROL_EVENT, {
       control: WEB_PANEL_CONTROL_RETURN,
       paneId: params.paneId,
       url: currentUrl,
       windowId: windowLabel,
-    }).catch(() => {});
-    currentWindow.close().catch(() => {});
+    })
+      .catch(() => {})
+      .finally(() => {
+        currentWindow.close().catch(() => {});
+      });
   }, [currentUrl, currentWindow, params.paneId, windowLabel]);
 
   return (
     <HostSurface data-workspace-web-surface="true">
       <GlobalStyle />
-      <HostTitleBar
-        data-tauri-drag-region="true"
-        onPointerDown={(event) => {
-          if (event.button === 0 && event.target === event.currentTarget) {
-            currentWindow.startDragging().catch(() => {});
-          }
-        }}
-      >
-        <HostTitleIdentity data-tauri-drag-region="true">
-          <Language aria-hidden="true" />
-          <span>{currentHost}</span>
-        </HostTitleIdentity>
-        <HostTitleActions>
-          <HostTextButton onClick={returnToGrid} title="Return this page to the grid" type="button">
-            <SubdirectoryArrowLeft aria-hidden="true" />
-            <span>Return to grid</span>
-          </HostTextButton>
-          <HostIconButton aria-label="Close" onClick={() => currentWindow.close().catch(() => {})} title="Close" type="button">
-            <Close aria-hidden="true" />
-          </HostIconButton>
-        </HostTitleActions>
-      </HostTitleBar>
+      <HostChrome data-terminal-control="true">
+        <HostTopRail
+          data-tauri-drag-region="true"
+          data-terminal-control="true"
+          onPointerDown={startChromeDrag}
+        >
+          <HostRailIdentity data-tauri-drag-region="true">
+            <HostIconButton
+              aria-label="Move web window"
+              data-terminal-drag-handle="true"
+              onPointerDown={startWindowDrag}
+              title="Move window"
+              type="button"
+            >
+              <ButtonDragIcon aria-hidden="true" />
+            </HostIconButton>
+          </HostRailIdentity>
 
-      <HostNav onSubmit={handleSubmit}>
-        <HostIconButton aria-label="Back" disabled={!canGoBack} onClick={goBack} title="Back" type="button">
-          <ArrowBack aria-hidden="true" />
-        </HostIconButton>
-        <HostIconButton aria-label="Forward" disabled={!canGoForward} onClick={goForward} title="Forward" type="button">
-          <ArrowForward aria-hidden="true" />
-        </HostIconButton>
-        <HostIconButton aria-label="Refresh" onClick={refresh} title="Refresh" type="button">
-          <Refresh aria-hidden="true" />
-        </HostIconButton>
-        <HostAddressInput
-          aria-label="Search or enter URL"
-          autoCapitalize="none"
-          autoComplete="off"
-          autoCorrect="off"
-          inputMode="url"
-          onChange={(event) => {
-            setAddressValue(event.target.value);
-            if (addressError) {
-              setAddressError("");
-            }
-          }}
-          placeholder="Search or enter URL"
-          spellCheck="false"
-          value={addressValue}
-        />
-      </HostNav>
+          <HostRailControls data-rail-row="secondary">
+            <HostIconButton
+              aria-label="Return web panel to the app"
+              aria-pressed="true"
+              data-active="true"
+              onClick={returnToGrid}
+              title="Return to app"
+              type="button"
+            >
+              <OpenInNew aria-hidden="true" />
+            </HostIconButton>
+            <HostCloseButton aria-label="Close" onClick={() => currentWindow.close().catch(() => {})} title="Close" type="button">
+              <ButtonCloseIcon aria-hidden="true" />
+            </HostCloseButton>
+          </HostRailControls>
+        </HostTopRail>
+
+        <HostNavRow>
+          <HostNav onSubmit={handleSubmit}>
+            <HostIconButton aria-label="Back" disabled={!canGoBack} onClick={goBack} title="Back" type="button">
+              <ArrowBack aria-hidden="true" />
+            </HostIconButton>
+            <HostIconButton aria-label="Forward" disabled={!canGoForward} onClick={goForward} title="Forward" type="button">
+              <ArrowForward aria-hidden="true" />
+            </HostIconButton>
+            <HostIconButton aria-label="Refresh" onClick={refresh} title="Refresh" type="button">
+              <Refresh aria-hidden="true" />
+            </HostIconButton>
+            <HostAddressInput
+              aria-label="Search or enter URL"
+              autoCapitalize="none"
+              autoComplete="off"
+              autoCorrect="off"
+              inputMode="url"
+              onChange={(event) => {
+                setAddressValue(event.target.value);
+                if (addressError) {
+                  setAddressError("");
+                }
+              }}
+              placeholder="Search or enter URL"
+              spellCheck="false"
+              value={addressValue}
+            />
+          </HostNav>
+        </HostNavRow>
+      </HostChrome>
 
       {addressError ? <HostInlineError role="alert">{addressError}</HostInlineError> : null}
 
@@ -242,117 +289,86 @@ const HostSurface = styled.section`
   }
 `;
 
-const HostTitleBar = styled.div`
+const HostChrome = styled.header`
+  position: relative;
+  z-index: 80;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  height: 38px;
-  padding: 0 8px 0 12px;
+  width: 100%;
+  min-width: 0;
+  grid-template-rows: auto auto;
   border-bottom: 1px solid var(--web-border);
   background: var(--web-panel);
 `;
 
-const HostTitleIdentity = styled.div`
-  display: inline-flex;
+const HostTopRail = styled(TerminalRestartPill)`
+  min-height: 30px;
+  padding: 3px 8px;
+  border-bottom-color: rgba(226, 232, 240, 0.06);
+  background: transparent;
+
+  html[data-forge-theme="light"] & {
+    border-bottom-color: rgba(24, 34, 48, 0.1);
+    background: transparent;
+  }
+`;
+
+const HostRailIdentity = styled(TerminalRailIdentity)`
+  flex: 0 1 auto;
   min-width: 0;
-  align-items: center;
-  gap: 7px;
   color: var(--web-muted);
-  font-size: 12px;
-  font-weight: 720;
 
   svg {
     flex: 0 0 auto;
-    width: 15px;
-    height: 15px;
-  }
-
-  span {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    width: 14px;
+    height: 14px;
   }
 `;
 
-const HostTitleActions = styled.div`
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-`;
+const HostRailControls = styled(TerminalRailControls)``;
 
-const HostIconButton = styled.button`
-  display: grid;
-  width: 28px;
-  height: 28px;
-  place-items: center;
-  border: 1px solid transparent;
-  border-radius: 6px;
+const HostIconButton = styled(TerminalRestartButton)`
   color: var(--web-text);
-  background: transparent;
 
-  svg {
-    width: 16px;
-    height: 16px;
-  }
-
-  &:hover:not(:disabled) {
-    border-color: var(--web-border);
-    background: rgba(255, 255, 255, 0.06);
-  }
-
-  &:disabled {
-    cursor: default;
-    opacity: 0.36;
+  html[data-forge-theme="light"] &:hover:not(:disabled),
+  html[data-forge-theme="light"] &:focus-visible {
+    color: var(--forge-text, #1d2430);
   }
 `;
 
-const HostTextButton = styled.button`
-  display: inline-flex;
+const HostCloseButton = styled(TerminalCloseButton)``;
+
+const HostNavRow = styled.div`
+  display: flex;
+  min-width: 0;
+  min-height: 34px;
   align-items: center;
-  gap: 6px;
-  height: 28px;
-  padding: 0 10px;
-  border: 1px solid var(--web-border);
-  border-radius: 7px;
-  color: var(--web-text);
-  background: var(--web-panel-strong);
-  font-size: 12px;
-  font-weight: 720;
-
-  svg {
-    width: 15px;
-    height: 15px;
-  }
-
-  &:hover {
-    border-color: var(--web-blue);
-    color: var(--web-blue);
-  }
+  padding: 4px 8px 5px;
+  background: var(--web-panel);
 `;
 
 const HostNav = styled.form`
-  display: grid;
-  grid-template-columns: auto auto auto minmax(0, 1fr);
+  display: flex;
+  width: 100%;
+  min-width: 0;
   align-items: center;
+  flex: 1 1 auto;
   gap: 4px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--web-border);
-  background: var(--web-panel);
+  padding: 0;
+  border: 0;
+  background: transparent;
 `;
 
 const HostAddressInput = styled.input`
   min-width: 0;
-  width: 100%;
-  height: 30px;
-  padding: 0 12px;
+  flex: 1 1 auto;
+  height: 26px;
+  padding: 0 9px;
   border: 1px solid var(--web-border);
-  border-radius: 8px;
+  border-radius: 7px;
   outline: 0;
   color: var(--web-text);
   background: var(--web-panel-strong);
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 600;
 
   &::placeholder {
@@ -365,6 +381,7 @@ const HostAddressInput = styled.input`
 `;
 
 const HostInlineError = styled.div`
+  grid-row: 2;
   padding: 6px 12px;
   color: var(--web-danger);
   background: rgba(120, 24, 24, 0.18);
@@ -373,6 +390,7 @@ const HostInlineError = styled.div`
 `;
 
 const HostViewport = styled.div`
+  grid-row: 3;
   position: relative;
   min-width: 0;
   min-height: 0;

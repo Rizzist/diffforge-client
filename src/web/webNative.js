@@ -124,6 +124,18 @@ export function viewportNativeRect(viewport) {
   };
 }
 
+function webviewOpenKey({ parentWindowLabel, reloadKey, scopeParts, url }) {
+  const scopeKey = (Array.isArray(scopeParts) ? scopeParts : [scopeParts])
+    .filter((part) => part !== null && part !== undefined && part !== "")
+    .join("\u001f");
+  return [
+    String(parentWindowLabel || ""),
+    scopeKey,
+    String(url || ""),
+    String(reloadKey || 0),
+  ].join("\u001e");
+}
+
 // Thin invoke wrappers around the Rust commands.
 export async function invokeWebviewOpen({ label, url, rect, parentWindowLabel }) {
   await invoke("workspace_webview_open", {
@@ -177,11 +189,13 @@ export function useNativeWebview({
 
   const labelRef = useRef("");
   const generationRef = useRef(0);
+  const openKeyRef = useRef("");
   const rectKeyRef = useRef("");
   const visibleRef = useRef(visible);
   const onNavigateRef = useRef(onNavigate);
   const onErrorRef = useRef(onError);
   const mountedRef = useRef(false);
+  const fitBurstCleanupRef = useRef(null);
 
   visibleRef.current = visible;
   onNavigateRef.current = onNavigate;
@@ -196,7 +210,7 @@ export function useNativeWebview({
     };
   }, []);
 
-  const fit = useCallback((label, nextVisible) => {
+  const fit = useCallback((label, nextVisible, options = {}) => {
     const viewport = viewportRef.current;
     const safeLabel = String(label || "").trim();
     if (!safeLabel || !viewport || !hasTauriRuntime()) {
@@ -207,21 +221,78 @@ export function useNativeWebview({
       return;
     }
     if (rect.width < MIN_NATIVE_DIMENSION || rect.height < MIN_NATIVE_DIMENSION) {
+      rectKeyRef.current = "";
       void invokeWebviewFit({ label: safeLabel, rect, visible: false }).catch(() => {});
       return;
     }
     const shouldShow = Boolean(nextVisible);
     const rectKey = `${rect.x}:${rect.y}:${rect.width}:${rect.height}:${shouldShow ? "show" : "hide"}`;
-    if (rectKeyRef.current !== rectKey) {
+    if (options.force === true || rectKeyRef.current !== rectKey) {
       rectKeyRef.current = rectKey;
       void invokeWebviewFit({ label: safeLabel, rect, visible: shouldShow }).catch(() => {});
     }
   }, [viewportRef]);
 
+  const stopFitBurst = useCallback(() => {
+    fitBurstCleanupRef.current?.();
+    fitBurstCleanupRef.current = null;
+  }, []);
+
+  const scheduleFitBurst = useCallback((label, nextVisible, options = {}) => {
+    stopFitBurst();
+    const safeLabel = String(label || "").trim();
+    if (!safeLabel) {
+      return () => {};
+    }
+
+    const frameCount = Number.isFinite(Number(options.frames))
+      ? Math.max(1, Number(options.frames))
+      : 18;
+    const delayMs = Array.isArray(options.delays)
+      ? options.delays
+      : [0, 32, 80, 160, 320];
+    const timeoutIds = new Set();
+    let disposed = false;
+    let frameHandle = 0;
+    let framesRun = 0;
+
+    const run = () => {
+      if (disposed) {
+        return;
+      }
+      fit(safeLabel, nextVisible, { force: true });
+      framesRun += 1;
+      if (framesRun < frameCount) {
+        frameHandle = window.requestAnimationFrame(run);
+      }
+    };
+
+    frameHandle = window.requestAnimationFrame(run);
+    delayMs.forEach((delay) => {
+      const timeoutId = window.setTimeout(() => {
+        timeoutIds.delete(timeoutId);
+        fit(safeLabel, nextVisible, { force: true });
+      }, Math.max(0, Number(delay) || 0));
+      timeoutIds.add(timeoutId);
+    });
+
+    const cleanup = () => {
+      disposed = true;
+      if (frameHandle) {
+        window.cancelAnimationFrame(frameHandle);
+      }
+      timeoutIds.forEach((timeoutId) => window.clearTimeout(timeoutId));
+      timeoutIds.clear();
+    };
+    fitBurstCleanupRef.current = cleanup;
+    return cleanup;
+  }, [fit, stopFitBurst]);
+
   const closeCurrent = useCallback(() => {
     const label = labelRef.current;
     labelRef.current = "";
     rectKeyRef.current = "";
+    openKeyRef.current = "";
     generationRef.current += 1;
     if (label) {
       void invokeWebviewClose(label);
@@ -235,8 +306,24 @@ export function useNativeWebview({
       return undefined;
     }
 
+    const openKey = webviewOpenKey({ parentWindowLabel, reloadKey, scopeParts, url });
+
+    if (!visible) {
+      fit(labelRef.current, false, { force: true });
+      scheduleFitBurst(labelRef.current, false, { delays: [80], frames: 2 });
+      return undefined;
+    }
+
+    if (labelRef.current && openKeyRef.current === openKey) {
+      fit(labelRef.current, true, { force: true });
+      scheduleFitBurst(labelRef.current, true, { delays: [80, 180], frames: 3 });
+      return undefined;
+    }
+
     let disposed = false;
     let attempts = 0;
+    let stableRectKey = "";
+    let stableRectFrames = 0;
 
     const openNow = async () => {
       const viewport = viewportRef.current;
@@ -253,12 +340,17 @@ export function useNativeWebview({
       const previousLabel = labelRef.current;
       const label = webviewLabel(scopeParts, generation);
       labelRef.current = label;
+      openKeyRef.current = openKey;
       rectKeyRef.current = "";
 
       if (previousLabel) {
         await invokeWebviewClose(previousLabel);
       }
       if (disposed || generationRef.current !== generation) {
+        if (generationRef.current === generation && labelRef.current === label) {
+          labelRef.current = "";
+          openKeyRef.current = "";
+        }
         return;
       }
 
@@ -269,12 +361,15 @@ export function useNativeWebview({
       try {
         await invokeWebviewOpen({ label, url, rect, parentWindowLabel });
         if (disposed || generationRef.current !== generation) {
+          fit(label, visibleRef.current, { force: true });
           return;
         }
-        fit(label, visibleRef.current);
+        fit(label, visibleRef.current, { force: true });
+        scheduleFitBurst(label, visibleRef.current, { delays: [80, 180, 320], frames: 4 });
       } catch (error) {
         if (!disposed && generationRef.current === generation) {
           labelRef.current = "";
+          openKeyRef.current = "";
           if (mountedRef.current) {
             setStatus("error");
           }
@@ -290,8 +385,17 @@ export function useNativeWebview({
       const viewport = viewportRef.current;
       const rect = viewport ? viewportNativeRect(viewport) : null;
       if (rect && rect.width >= MIN_NATIVE_DIMENSION && rect.height >= MIN_NATIVE_DIMENSION) {
-        void openNow();
-        return;
+        const nextRectKey = `${rect.x}:${rect.y}:${rect.width}:${rect.height}`;
+        if (nextRectKey === stableRectKey) {
+          stableRectFrames += 1;
+        } else {
+          stableRectKey = nextRectKey;
+          stableRectFrames = 1;
+        }
+        if (stableRectFrames >= 2) {
+          void openNow();
+          return;
+        }
       }
       attempts += 1;
       if (attempts < 30) {
@@ -304,12 +408,13 @@ export function useNativeWebview({
     return () => {
       disposed = true;
     };
-  }, [runtimeEnabled, url, reloadKey, parentWindowLabel, viewportRef, scopeParts, fit, closeCurrent]);
+  }, [runtimeEnabled, url, reloadKey, parentWindowLabel, viewportRef, scopeParts, fit, scheduleFitBurst, closeCurrent, visible]);
 
   // Re-fit (and show/hide) whenever visibility flips.
   useEffect(() => {
-    fit(labelRef.current, visible);
-  }, [fit, visible]);
+    fit(labelRef.current, visible, { force: true });
+    scheduleFitBurst(labelRef.current, visible, { delays: [80, 180], frames: visible ? 3 : 2 });
+  }, [fit, scheduleFitBurst, visible]);
 
   // Keep fitted on container/window resize, and re-show after a visibility flip
   // (e.g. when a pane drag ends) via a short rAF burst.
@@ -321,24 +426,31 @@ export function useNativeWebview({
     let burstCount = 0;
     const scheduleFit = () => {
       window.cancelAnimationFrame(frameHandle);
-      frameHandle = window.requestAnimationFrame(() => fit(labelRef.current, visibleRef.current));
+      frameHandle = window.requestAnimationFrame(() => fit(labelRef.current, visibleRef.current, { force: true }));
     };
     const burstFit = () => {
       scheduleFit();
       burstCount += 1;
-      if (burstCount < 18) {
+      if (burstCount < 6) {
         frameHandle = window.requestAnimationFrame(burstFit);
       }
     };
     const observer = new ResizeObserver(scheduleFit);
-    if (viewportRef.current) {
-      observer.observe(viewportRef.current);
+    const viewport = viewportRef.current;
+    if (viewport) {
+      observer.observe(viewport);
+      const surface = viewport.closest("[data-workspace-web-surface]");
+      if (surface && surface !== viewport) {
+        observer.observe(surface);
+      }
     }
     window.addEventListener("resize", scheduleFit);
+    window.addEventListener("scroll", scheduleFit, true);
     frameHandle = window.requestAnimationFrame(burstFit);
     return () => {
       observer.disconnect();
       window.removeEventListener("resize", scheduleFit);
+      window.removeEventListener("scroll", scheduleFit, true);
       window.cancelAnimationFrame(frameHandle);
     };
   }, [fit, runtimeEnabled, viewportRef, visible]);
@@ -359,12 +471,14 @@ export function useNativeWebview({
       const loadEvent = String(payload.event || "").trim().toLowerCase();
       if (loadEvent === "started") {
         setStatus("loading");
-        fit(labelRef.current, visibleRef.current);
+        fit(labelRef.current, visibleRef.current, { force: true });
+        scheduleFitBurst(labelRef.current, visibleRef.current, { delays: [100], frames: 2 });
         return;
       }
       if (loadEvent === "finished") {
         setStatus("ready");
-        fit(labelRef.current, visibleRef.current);
+        fit(labelRef.current, visibleRef.current, { force: true });
+        scheduleFitBurst(labelRef.current, visibleRef.current, { delays: [80, 180], frames: 3 });
         const loadedUrl = String(payload.url || "").trim();
         if (loadedUrl) {
           onNavigateRef.current?.(loadedUrl);
@@ -385,12 +499,13 @@ export function useNativeWebview({
         unlisten();
       }
     };
-  }, [fit]);
+  }, [fit, scheduleFitBurst]);
 
   // Close on unmount.
   useEffect(() => () => {
+    stopFitBurst();
     closeCurrent();
-  }, [closeCurrent]);
+  }, [closeCurrent, stopFitBurst]);
 
   const reload = useCallback(() => {
     setStatus("loading");

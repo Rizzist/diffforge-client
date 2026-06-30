@@ -2719,6 +2719,7 @@ export const WorkspaceList = styled.div`
   padding-right: 2px;
 
   ${WorkspaceRail}[data-collapsed="true"] & {
+    display: none;
     padding-right: 0;
   }
 `;
@@ -5423,26 +5424,6 @@ export const LoopspaceGraphDocumentSearch = styled.input`
   }
 `;
 
-export const LoopspaceGraphDocumentOperationSelect = styled.select`
-  width: 100%;
-  min-width: 0;
-  padding: 6px 8px;
-  border: 1px solid rgba(var(--loop-node-accent), 0.26);
-  border-radius: 7px;
-  color: #f8fafc;
-  background: rgba(2, 6, 8, 0.74);
-  font: inherit;
-  font-size: 10.5px;
-  font-weight: 780;
-  letter-spacing: 0;
-  outline: none;
-
-  &:focus {
-    border-color: rgba(var(--loop-node-accent), 0.62);
-    box-shadow: 0 0 0 2px rgba(var(--loop-node-accent), 0.12);
-  }
-`;
-
 export const LoopspaceGraphDocumentTemplateInput = styled.textarea`
   width: 100%;
   min-width: 0;
@@ -6353,43 +6334,6 @@ export const LoopspaceGraphMessageSettingsField = styled.label`
     font-weight: 820;
     letter-spacing: 0.08em;
     text-transform: uppercase;
-  }
-`;
-
-export const LoopspaceGraphMessageSettingsSelect = styled.select`
-  width: 100%;
-  min-width: 0;
-  min-height: 28px;
-  padding: 0 26px 0 8px;
-  border: 1px solid rgba(var(--loop-node-accent), 0.24);
-  border-radius: 7px;
-  color: #f8fafc;
-  background-color: rgba(2, 6, 8, 0.78);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 8px center;
-  background-size: 13px 13px;
-  color-scheme: dark;
-  font: inherit;
-  font-size: 10px;
-  font-weight: 820;
-  outline: none;
-  cursor: pointer;
-  appearance: none;
-  -webkit-appearance: none;
-
-  &::-ms-expand {
-    display: none;
-  }
-
-  &:focus {
-    border-color: rgba(var(--loop-node-accent), 0.6);
-    box-shadow: 0 0 0 2px rgba(var(--loop-node-accent), 0.14);
-  }
-
-  &:disabled {
-    cursor: not-allowed;
-    opacity: 0.52;
   }
 `;
 
@@ -12286,109 +12230,7 @@ export const AudioDeviceControls = styled.div`
   }
 `;
 
-export const AudioDeviceSelect = styled.select`
-  min-width: 0;
-  min-height: 36px;
-  padding: 0 34px 0 10px;
-  border: 1px solid var(--audio-border-soft, var(--forge-border));
-  border-radius: 8px;
-  color: var(--forge-text);
-  background-color: var(--audio-control-bg, rgba(21, 27, 35, 0.78));
-  background-image:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.012));
-  background-position: right 10px center, 0 0;
-  background-repeat: no-repeat, repeat;
-  background-size: 16px 16px, auto;
-  color-scheme: dark;
-  cursor: pointer;
-  font-size: 12px;
-  font-weight: 700;
-  text-transform: none;
-  appearance: none;
-  -webkit-appearance: none;
 
-  &::-ms-expand {
-    display: none;
-  }
-
-  &:hover:not(:disabled) {
-    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.32));
-    background-color: var(--audio-control-bg-hover, rgba(24, 31, 42, 0.84));
-  }
-
-  &:focus {
-    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.44));
-    outline: none;
-    box-shadow: 0 0 0 3px rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.12);
-  }
-
-  html[data-forge-theme="light"] & {
-    border-color: var(--forge-border);
-    background-color: var(--forge-surface);
-    background-image:
-      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%230066cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E"),
-      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(250, 250, 252, 0.96));
-    color-scheme: light;
-  }
-
-  html[data-forge-theme="light"] &:hover:not(:disabled) {
-    border-color: rgba(0, 102, 204, 0.22);
-    background-color: var(--forge-surface-control);
-  }
-
-  html[data-forge-theme="light"] &:focus {
-    border-color: var(--forge-blue-soft);
-    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.14);
-  }
-
-  option,
-  optgroup {
-    color: #f4f7fa;
-    background: #0d1117;
-  }
-
-  html[data-forge-theme="light"] option,
-  html[data-forge-theme="light"] optgroup {
-    color: #1d1d1f;
-    background: #ffffff;
-  }
-
-  &:disabled {
-    color: var(--forge-text-muted);
-    cursor: not-allowed;
-    opacity: 0.72;
-  }
-`;
-
-/* Borderless variant that sits flush inside the input-source capsule. */
-export const AudioInputPillSelect = styled(AudioDeviceSelect)`
-  min-height: 34px;
-  border-color: transparent;
-  background-color: transparent;
-  background-image:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  background-position: right 8px center;
-  background-repeat: no-repeat;
-  background-size: 16px 16px;
-
-  &:hover:not(:disabled) {
-    border-color: var(--audio-border-strong, rgba(125, 160, 205, 0.24));
-    background-color: var(--audio-control-bg-hover, rgba(24, 31, 42, 0.6));
-  }
-
-  html[data-forge-theme="light"] & {
-    border-color: transparent;
-    background-color: transparent;
-    background-image:
-      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%230066cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  }
-
-  html[data-forge-theme="light"] &:hover:not(:disabled) {
-    border-color: rgba(0, 102, 204, 0.18);
-    background-color: var(--forge-surface-control);
-  }
-`;
 
 const audioInputBarFlow = keyframes`
   0%,
@@ -18961,117 +18803,6 @@ export const WorkspaceSettingsInput = styled(SetupInput)`
   font-size: 13px;
 `;
 
-export const WorkspaceSettingsSelect = styled(WorkspaceSettingsInput).attrs({ as: "select" })`
-  min-height: 40px;
-  padding: 0 38px 0 12px;
-  border-color: var(--forge-border-strong);
-  color: #f4f7fa;
-  background-color: rgba(13, 17, 23, 0.92);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%23b6c0cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 12px center;
-  background-size: 16px 16px;
-  box-shadow: none;
-  color-scheme: dark;
-  cursor: pointer;
-  font-weight: 720;
-  line-height: 1;
-  text-overflow: ellipsis;
-  transition:
-    border-color 160ms ease,
-    background-color 160ms ease,
-    box-shadow 160ms ease,
-    color 160ms ease;
-  white-space: nowrap;
-  appearance: none;
-  -webkit-appearance: none;
-
-  &::-ms-expand {
-    display: none;
-  }
-
-  &:hover {
-    border-color: rgba(var(--forge-accent-soft-rgb), 0.34);
-    background-color: rgba(16, 22, 31, 0.98);
-  }
-
-  &:focus {
-    border-color: rgba(var(--forge-accent-soft-rgb), 0.44);
-    outline: none;
-    box-shadow: 0 0 0 3px rgba(var(--forge-accent-rgb), 0.12);
-  }
-
-  option,
-  optgroup {
-    color: #f4f7fa;
-    background: #0d1117;
-    background-image: none;
-  }
-
-  option[value=""] {
-    color: #b6c0cc;
-  }
-
-  html[data-forge-theme="light"] & {
-    border-color: rgba(0, 0, 0, 0.13);
-    color: #1d1d1f;
-    background-color: #ffffff;
-    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%230066cc' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");
-    box-shadow: none;
-    color-scheme: light;
-  }
-
-  html[data-forge-theme="light"] &:hover {
-    border-color: rgba(0, 102, 204, 0.28);
-    background-color: #fafafc;
-  }
-
-  html[data-forge-theme="light"] &:focus {
-    border-color: var(--forge-blue-soft);
-    box-shadow: 0 0 0 3px rgba(0, 113, 227, 0.16);
-  }
-
-  html[data-forge-theme="light"] option,
-  html[data-forge-theme="light"] optgroup {
-    color: #1d1d1f;
-    background: #ffffff;
-    background-image: none;
-  }
-
-  html[data-forge-theme="light"] option[value=""] {
-    color: #6e6e73;
-  }
-`;
-
-export const WorkspaceSettingsSelectShell = styled.div`
-  position: relative;
-  width: 100%;
-  min-width: 0;
-`;
-
-export const WorkspaceSettingsSelectIcon = styled(ExpandMore)`
-  position: absolute;
-  top: 50%;
-  right: 10px;
-  width: 22px;
-  height: 22px;
-  color: #b6c0cc;
-  pointer-events: none;
-  transform: translateY(-50%);
-  transition: color 160ms ease;
-
-  ${WorkspaceSettingsSelectShell}:hover & {
-    color: #d4dbe4;
-  }
-
-  html[data-forge-theme="light"] & {
-    color: #0066cc;
-  }
-
-  html[data-forge-theme="light"] ${WorkspaceSettingsSelectShell}:hover & {
-    color: #0057b8;
-  }
-`;
 
 export const WorkspaceNumberInput = styled(WorkspaceSettingsInput)`
   width: 100%;

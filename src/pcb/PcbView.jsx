@@ -3,6 +3,7 @@ import styled from "styled-components";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { invoke } from "@tauri-apps/api/core";
 import PcbPanel from "./PcbPanel.jsx";
+import AppSelect from "../app/AppSelect.jsx";
 
 const STORAGE_PREFIX = "diffforge.pcb.slots.";
 
@@ -178,22 +179,65 @@ const ChooserClose = styled.button`
   }
 `;
 
-const BoardPicker = styled.select`
-  appearance: auto;
-  background: #0b1626;
-  color: #cbd5f5;
+const BoardPickerWrap = styled.div`
+  width: 240px;
+  max-width: 100%;
+`;
+
+const ChooserCreateForm = styled.form`
+  display: grid;
+  width: min(280px, 100%);
+  gap: 8px;
+`;
+
+const ChooserInput = styled.input`
+  min-width: 0;
+  min-height: 34px;
+  padding: 0 11px;
   border: 1px solid rgba(148, 163, 184, 0.24);
   border-radius: 7px;
+  outline: 0;
+  color: rgba(241, 245, 249, 0.94);
+  background: rgba(2, 6, 12, 0.82);
   font-size: 12px;
-  padding: 5px 8px;
-  max-width: 240px;
+  font-weight: 750;
+
+  &:focus {
+    border-color: rgba(16, 185, 129, 0.55);
+    box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.14);
+  }
+`;
+
+const ChooserCreateActions = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+`;
+
+const ChooserCancelButton = styled.button`
+  min-height: 30px;
+  padding: 0 12px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  border-radius: 7px;
+  color: rgba(203, 213, 225, 0.84);
+  background: rgba(15, 23, 42, 0.54);
+  font-size: 12px;
+  font-weight: 780;
+  cursor: pointer;
+
+  &:hover:not(:disabled) {
+    border-color: rgba(148, 163, 184, 0.34);
+    color: rgba(241, 245, 249, 0.94);
+  }
 `;
 
 // Inline chooser shown in an empty panel: create a new design or open one.
 function PcbSlotChooser({ available, busy, repoPath, onCreate, onSelect, onClose }) {
+  const [creating, setCreating] = useState(false);
+  const [draftName, setDraftName] = useState("blinky");
+  const inputRef = useRef(null);
   const handlePick = useCallback(
-    (event) => {
-      const path = event.target.value;
+    (path) => {
       if (!path) {
         return;
       }
@@ -205,6 +249,35 @@ function PcbSlotChooser({ available, busy, repoPath, onCreate, onSelect, onClose
     [available, onSelect],
   );
 
+  useEffect(() => {
+    if (!creating) {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      inputRef.current?.focus?.();
+      inputRef.current?.select?.();
+    });
+  }, [creating]);
+
+  const handleCreate = useCallback((event) => {
+    event.preventDefault();
+    const cleanName = String(draftName || "").trim();
+    if (!cleanName) {
+      return;
+    }
+    Promise.resolve(onCreate?.(cleanName))
+      .then(() => {
+        setCreating(false);
+        setDraftName("blinky");
+      })
+      .catch(() => {});
+  }, [draftName, onCreate]);
+
+  const options = useMemo(
+    () => available.map((board) => ({ value: board.path, label: board.name || board.path })),
+    [available],
+  );
+
   return (
     <ChooserShell>
       {onClose ? (
@@ -214,17 +287,38 @@ function PcbSlotChooser({ available, busy, repoPath, onCreate, onSelect, onClose
       ) : null}
       <ChooserTitle>PCB design</ChooserTitle>
       <ChooserHint>Create a new board or open an existing design.</ChooserHint>
-      <ToolbarButton disabled={busy || !repoPath} onClick={onCreate} type="button">
-        + New board
-      </ToolbarButton>
-      <BoardPicker defaultValue="" disabled={!available.length} onChange={handlePick}>
-        <option value="">{available.length ? "Open existing design…" : "No saved designs yet"}</option>
-        {available.map((board) => (
-          <option key={board.path} value={board.path}>
-            {board.name || board.path}
-          </option>
-        ))}
-      </BoardPicker>
+      {creating ? (
+        <ChooserCreateForm onSubmit={handleCreate}>
+          <ChooserInput
+            aria-label="PCB board name"
+            disabled={busy}
+            onChange={(event) => setDraftName(event.target.value)}
+            ref={inputRef}
+            value={draftName}
+          />
+          <ChooserCreateActions>
+            <ToolbarButton disabled={busy || !repoPath || !draftName.trim()} type="submit">
+              Create board
+            </ToolbarButton>
+            <ChooserCancelButton disabled={busy} onClick={() => setCreating(false)} type="button">
+              Cancel
+            </ChooserCancelButton>
+          </ChooserCreateActions>
+        </ChooserCreateForm>
+      ) : (
+        <ToolbarButton disabled={busy || !repoPath} onClick={() => setCreating(true)} type="button">
+          + New board
+        </ToolbarButton>
+      )}
+      <BoardPickerWrap>
+        <AppSelect
+          isDisabled={!available.length}
+          onChange={handlePick}
+          options={options}
+          placeholder={available.length ? "Open existing design…" : "No saved designs yet"}
+          value={null}
+        />
+      </BoardPickerWrap>
     </ChooserShell>
   );
 }
@@ -307,24 +401,23 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
   }, []);
 
   const createInSlot = useCallback(
-    (key) => {
+    (key, name) => {
       if (!repoPath) {
-        return;
-      }
-      const name = window.prompt("New PCB board name", "blinky");
-      if (!name) {
-        return;
+        return Promise.resolve(null);
       }
       setBusy(true);
       setError("");
-      invoke("pcb_document_create", { repoPath, name })
+      return invoke("pcb_document_create", { repoPath, name })
         .then((doc) => {
           if (doc?.path) {
             bindSlot(key, { path: doc.path, name: doc.name });
           }
           refreshList();
         })
-        .catch((err) => setError(String(err)))
+        .catch((err) => {
+          setError(String(err));
+          throw err;
+        })
         .finally(() => setBusy(false));
     },
     [repoPath, bindSlot, refreshList],
@@ -394,7 +487,7 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
                       available={available}
                       busy={busy}
                       onClose={slots.length > 1 ? () => closeSlot(slot.key) : null}
-                      onCreate={() => createInSlot(slot.key)}
+                      onCreate={(name) => createInSlot(slot.key, name)}
                       onSelect={(board) => bindSlot(slot.key, board)}
                       repoPath={repoPath}
                     />

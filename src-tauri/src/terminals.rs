@@ -1327,13 +1327,11 @@ fn terminal_record_workspace_agent_session_history(
             Ok(recorded) => {
                 if let Some(app) = emit_app.as_ref() {
                     terminal_emit_workspace_agent_session_history_changed(app, &record, Some(recorded));
-                    if recorded {
-                        agent_chat_session_sync_spawn_from_history_record(
-                            app.clone(),
-                            record.clone(),
-                            "terminal_session_history",
-                        );
-                    }
+                    agent_chat_session_sync_spawn_from_history_record(
+                        app.clone(),
+                        record.clone(),
+                        "terminal_session_history",
+                    );
                 }
             }
             Err(error) => log_terminal_status_event(
@@ -2909,6 +2907,10 @@ fn workspace_git_repo_key(path: &Path) -> String {
         .unwrap_or_else(|_| normalized_path_key(path))
 }
 
+fn workspace_git_path_same_or_child(path: &Path, parent: &Path) -> bool {
+    normalized_path_key_is_same_or_child(&workspace_git_repo_key(path), &workspace_git_repo_key(parent))
+}
+
 fn workspace_git_run_owned(
     root: &Path,
     args: Vec<String>,
@@ -3306,7 +3308,9 @@ fn workspace_git_discovered_repositories(
     };
 
     if let Some(top_level) = workspace_git_top_level(workspace_root) {
-        if top_level.starts_with(workspace_root) {
+        if workspace_git_path_same_or_child(&top_level, workspace_root)
+            || workspace_git_path_same_or_child(workspace_root, &top_level)
+        {
             push_repo(top_level);
         }
     } else if workspace_is_exact_git_root(workspace_root) {
@@ -15641,6 +15645,46 @@ mod terminal_tests {
         ));
         fs::create_dir_all(&directory).unwrap();
         directory
+    }
+
+    #[test]
+    fn workspace_git_discovery_includes_enclosing_repo_for_nested_workspace() {
+        let repo = terminal_test_repo_with_commit("git_discovery_enclosing_repo");
+        let nested_workspace = repo.join("packages").join("app");
+        fs::create_dir_all(&nested_workspace).unwrap();
+
+        let repositories = workspace_git_discovered_repositories(&nested_workspace, &[]);
+
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(workspace_git_repo_key(&repositories[0]), workspace_git_repo_key(&repo));
+    }
+
+    #[test]
+    fn workspace_git_discovery_includes_repo_under_workspace() {
+        let workspace = terminal_test_directory("git_discovery_child_repo");
+        let repo = workspace.join("packages").join("app");
+        fs::create_dir_all(&repo).unwrap();
+        terminal_test_git(&repo, &["init"]);
+
+        let repositories = workspace_git_discovered_repositories(
+            &workspace,
+            &[WorkspaceProjectMount {
+                mount_id: "packages/app".to_string(),
+                workspace_relative_path: "packages/app".to_string(),
+                project_root: workspace_path_display(&repo),
+                project_name: "app".to_string(),
+                project_kind: "git_repo".to_string(),
+                mount_kind: "project".to_string(),
+                parent_mount_id: Some("packages".to_string()),
+                mount_depth: 2,
+                has_git: true,
+                has_agents: false,
+                root_path: repo.clone(),
+            }],
+        );
+
+        assert_eq!(repositories.len(), 1);
+        assert_eq!(workspace_git_repo_key(&repositories[0]), workspace_git_repo_key(&repo));
     }
 
     fn terminal_test_task_guard_identity(
