@@ -44,6 +44,7 @@ export default function WebPane({
   isFullscreen = false,
   fullscreenActive = false,
   dragActive = false,
+  layoutKey = "",
   poppedOut = false,
   webviewObscured = false,
   onDragHandlePointerDown,
@@ -97,6 +98,7 @@ export default function WebPane({
   }, [onNavigate]);
 
   const { reload } = useNativeWebview({
+    layoutKey,
     viewportRef,
     url: currentUrl,
     visible,

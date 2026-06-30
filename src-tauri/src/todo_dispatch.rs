@@ -46,6 +46,27 @@ fn todo_dispatch_text(value: &Value, keys: &[&str]) -> String {
     String::new()
 }
 
+fn todo_dispatch_i64(value: &Value, keys: &[&str]) -> Option<i64> {
+    let payload = value.get("payload").filter(|nested| nested.is_object());
+    for key in keys {
+        for source in [Some(value), payload].into_iter().flatten() {
+            if let Some(number) = source.get(*key).and_then(Value::as_i64) {
+                return Some(number);
+            }
+            if let Some(number) = source
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .and_then(|text| text.parse::<i64>().ok())
+            {
+                return Some(number);
+            }
+        }
+    }
+    None
+}
+
 fn todo_dispatch_nested_text(value: &Value, keys: &[&str], containers: &[&str]) -> String {
     let direct = todo_dispatch_text(value, keys);
     if !direct.is_empty() {
@@ -547,14 +568,29 @@ fn todo_dispatch_remote_intake_field_matches(item: &Value, keys: &[&str], expect
     todo_dispatch_text(item, keys).trim() == expected
 }
 
+fn todo_dispatch_remote_intake_i64_field_matches(
+    item: &Value,
+    keys: &[&str],
+    expected: Option<i64>,
+) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    todo_dispatch_i64(item, keys) == Some(expected)
+}
+
 fn todo_dispatch_remote_intake_already_current(
     item: &Value,
     text: &str,
     status: &str,
     todo_id: &str,
     target_terminal_id: &str,
+    target_terminal_index: Option<i64>,
+    target_terminal_name: &str,
     target_thread_id: &str,
     target_agent_id: &str,
+    target_color_slot: Option<i64>,
+    target_terminal_color: &str,
 ) -> bool {
     if todo_store_item_status(item) != status {
         return false;
@@ -572,6 +608,14 @@ fn todo_dispatch_remote_intake_already_current(
         item,
         &["targetTerminalId", "target_terminal_id", "paneId", "pane_id"],
         target_terminal_id,
+    ) && todo_dispatch_remote_intake_i64_field_matches(
+        item,
+        &["targetTerminalIndex", "target_terminal_index", "terminalIndex", "terminal_index"],
+        target_terminal_index,
+    ) && todo_dispatch_remote_intake_field_matches(
+        item,
+        &["targetTerminalName", "target_terminal_name", "terminalName", "terminal_name"],
+        target_terminal_name,
     ) && todo_dispatch_remote_intake_field_matches(
         item,
         &["targetThreadId", "target_thread_id", "threadId", "thread_id"],
@@ -580,6 +624,14 @@ fn todo_dispatch_remote_intake_already_current(
         item,
         &["targetAgentId", "target_agent_id", "agentId", "agent_id"],
         target_agent_id,
+    ) && todo_dispatch_remote_intake_i64_field_matches(
+        item,
+        &["targetColorSlot", "target_color_slot", "colorSlot", "color_slot"],
+        target_color_slot,
+    ) && todo_dispatch_remote_intake_field_matches(
+        item,
+        &["targetTerminalColor", "target_terminal_color", "terminalColor", "terminal_color"],
+        target_terminal_color,
     )
 }
 
@@ -608,6 +660,10 @@ fn todo_dispatch_remote_intake_success_outcome(
             "targetDeviceId": todo_dispatch_text(event, &["target_device_id", "targetDeviceId", "todo_device_id", "todoDeviceId", "device_id", "deviceId"]),
             "target_workspace_id": workspace_id,
             "targetWorkspaceId": workspace_id,
+            "target_terminal_id": todo_dispatch_text(event, &["target_terminal_id", "targetTerminalId", "terminal_id", "terminalId", "pane_id", "paneId"]),
+            "targetTerminalId": todo_dispatch_text(event, &["target_terminal_id", "targetTerminalId", "terminal_id", "terminalId", "pane_id", "paneId"]),
+            "target_terminal_index": todo_dispatch_i64(event, &["target_terminal_index", "targetTerminalIndex", "terminal_index", "terminalIndex"]),
+            "targetTerminalIndex": todo_dispatch_i64(event, &["target_terminal_index", "targetTerminalIndex", "terminal_index", "terminalIndex"]),
             "intent_id": todo_dispatch_text(event, &["intent_id", "intentId"]),
             "intentId": todo_dispatch_text(event, &["intent_id", "intentId"]),
             "origin_client_id": todo_dispatch_text(event, &["origin_client_id", "originClientId", "client_id", "clientId"]),
@@ -750,12 +806,58 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                 todo_dispatch_text(event, &["speed", "service_tier", "serviceTier"]);
             let target_terminal_id =
                 todo_dispatch_text(event, &["target_terminal_id", "targetTerminalId"]);
+            let target_terminal_index = todo_dispatch_i64(
+                event,
+                &[
+                    "target_terminal_index",
+                    "targetTerminalIndex",
+                    "terminal_index",
+                    "terminalIndex",
+                ],
+            );
+            let target_terminal_name = todo_dispatch_text(
+                event,
+                &[
+                    "target_terminal_name",
+                    "targetTerminalName",
+                    "terminal_name",
+                    "terminalName",
+                    "target_name",
+                    "targetName",
+                ],
+            );
             let target_thread_id =
                 todo_dispatch_text(event, &["target_thread_id", "targetThreadId"]);
             let target_agent_id = todo_dispatch_text(
                 event,
                 &["target_agent_id", "targetAgentId", "agent_id", "agentId"],
             );
+            let target_color_slot = todo_dispatch_i64(
+                event,
+                &[
+                    "target_color_slot",
+                    "targetColorSlot",
+                    "color_slot",
+                    "colorSlot",
+                ],
+            );
+            let target_terminal_color = todo_dispatch_text(
+                event,
+                &[
+                    "target_terminal_color",
+                    "targetTerminalColor",
+                    "terminal_color",
+                    "terminalColor",
+                    "color",
+                ],
+            );
+            let target_explicit = !target_terminal_id.is_empty()
+                || target_terminal_index.is_some()
+                || !target_terminal_name.is_empty()
+                || !target_thread_id.is_empty()
+                || !target_agent_id.is_empty()
+                || target_color_slot.is_some()
+                || !target_terminal_color.is_empty();
             if let Some(path) = queue_path.as_deref() {
                 let mut items = todo_dispatch_queue_read(path)
                     .get("items")
@@ -779,8 +881,12 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                             intake_status,
                             &todo_id,
                             &target_terminal_id,
+                            target_terminal_index,
+                            &target_terminal_name,
                             &target_thread_id,
                             &target_agent_id,
+                            target_color_slot,
+                            &target_terminal_color,
                         ) {
                             changed_item = Some(existing.clone());
                             changed_kind = "remote_todo_already_current";
@@ -802,6 +908,15 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         json!(target_terminal_id.clone()),
                                     );
                                 }
+                                if let Some(index) = target_terminal_index {
+                                    object.insert("targetTerminalIndex".to_string(), json!(index));
+                                }
+                                if !target_terminal_name.is_empty() {
+                                    object.insert(
+                                        "targetTerminalName".to_string(),
+                                        json!(target_terminal_name.clone()),
+                                    );
+                                }
                                 if !target_thread_id.is_empty() {
                                     object.insert(
                                         "targetThreadId".to_string(),
@@ -813,6 +928,18 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         "targetAgentId".to_string(),
                                         json!(target_agent_id.clone()),
                                     );
+                                }
+                                if let Some(color_slot) = target_color_slot {
+                                    object.insert("targetColorSlot".to_string(), json!(color_slot));
+                                }
+                                if !target_terminal_color.is_empty() {
+                                    object.insert(
+                                        "targetTerminalColor".to_string(),
+                                        json!(target_terminal_color.clone()),
+                                    );
+                                }
+                                if target_explicit {
+                                    object.insert("targetExplicit".to_string(), json!(true));
                                 }
                                 if !todo_id.is_empty() {
                                     object.insert("todoId".to_string(), json!(todo_id.clone()));
@@ -855,6 +982,44 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                     remote_object
                                         .insert("commandId".to_string(), json!(command_id.clone()));
                                     remote_object.insert("todoId".to_string(), json!(todo_id.clone()));
+                                    if !target_terminal_id.is_empty() {
+                                        remote_object.insert(
+                                            "targetTerminalId".to_string(),
+                                            json!(target_terminal_id.clone()),
+                                        );
+                                    }
+                                    if let Some(index) = target_terminal_index {
+                                        remote_object
+                                            .insert("targetTerminalIndex".to_string(), json!(index));
+                                    }
+                                    if !target_terminal_name.is_empty() {
+                                        remote_object.insert(
+                                            "targetTerminalName".to_string(),
+                                            json!(target_terminal_name.clone()),
+                                        );
+                                    }
+                                    if !target_thread_id.is_empty() {
+                                        remote_object.insert(
+                                            "targetThreadId".to_string(),
+                                            json!(target_thread_id.clone()),
+                                        );
+                                    }
+                                    if !target_agent_id.is_empty() {
+                                        remote_object.insert(
+                                            "targetAgentId".to_string(),
+                                            json!(target_agent_id.clone()),
+                                        );
+                                    }
+                                    if let Some(color_slot) = target_color_slot {
+                                        remote_object
+                                            .insert("targetColorSlot".to_string(), json!(color_slot));
+                                    }
+                                    if !target_terminal_color.is_empty() {
+                                        remote_object.insert(
+                                            "targetTerminalColor".to_string(),
+                                            json!(target_terminal_color.clone()),
+                                        );
+                                    }
                                     remote_object.insert(
                                         "originClientId".to_string(),
                                         json!(origin_client_id.clone()),
@@ -914,8 +1079,13 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                         "updatedAt": now_iso,
                         "workspaceId": workspace_id,
                         "targetTerminalId": target_terminal_id,
+                        "targetTerminalIndex": target_terminal_index,
+                        "targetTerminalName": target_terminal_name,
                         "targetThreadId": target_thread_id,
                         "targetAgentId": target_agent_id,
+                        "targetColorSlot": target_color_slot,
+                        "targetTerminalColor": target_terminal_color,
+                        "targetExplicit": target_explicit,
                         "originClientId": origin_client_id,
                         "origin_client_id": origin_client_id,
                         "originDeviceId": origin_device_id,
@@ -932,6 +1102,13 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                         "remoteCommand": {
                             "commandId": command_id,
                             "todoId": todo_id,
+                            "targetTerminalId": target_terminal_id,
+                            "targetTerminalIndex": target_terminal_index,
+                            "targetTerminalName": target_terminal_name,
+                            "targetThreadId": target_thread_id,
+                            "targetAgentId": target_agent_id,
+                            "targetColorSlot": target_color_slot,
+                            "targetTerminalColor": target_terminal_color,
                             "originClientId": origin_client_id,
                             "originDeviceId": origin_device_id,
                             "originWorkspaceId": origin_workspace_id,

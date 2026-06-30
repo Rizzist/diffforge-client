@@ -192,7 +192,6 @@ const AUDIO_WIDGET_BUBBLE_POSITION_DEBUG_LOG_FILE: &str = "audio-widget-bubble-p
 const SNIPPING_AREA_CURSOR_DEBUG_LOGGING_ENABLED: bool = false;
 const SNIPPING_AREA_CURSOR_DEBUG_LOG_FILE: &str = "snipping-area-cursor.jsonl";
 const APP_SHUTDOWN_PROGRESS_EVENT: &str = "forge-app-shutdown-progress";
-const APP_CLOSE_REQUESTED_EVENT: &str = "forge-app-close-requested";
 const APP_SHUTDOWN_TOTAL_STEPS: u8 = 6;
 const DEEP_LINK_NEW_URL_EVENT: &str = "deep-link://new-url";
 const TERMINAL_CLOSE_ALL_PROGRESS_EVENT: &str = "forge-terminal-close-all-progress";
@@ -3408,6 +3407,7 @@ async fn deactivate_workspace_runtime(
     repo_path: Option<String>,
     reason: Option<String>,
     workspace_id: Option<String>,
+    publish_cloud_snapshot: Option<bool>,
 ) -> Result<Value, String> {
     let started_at = Instant::now();
     let reason = reason
@@ -3512,14 +3512,16 @@ async fn deactivate_workspace_runtime(
         }),
     );
 
-    if let Some(workspace_id) = workspace_id.as_deref() {
-        let cloud_mcp_state = app.state::<CloudMcpState>();
-        cloud_mcp_publish_workspace_deactivated_snapshot(
-            cloud_mcp_state.inner(),
-            workspace_id,
-            &reason,
-        )
-        .await;
+    if publish_cloud_snapshot.unwrap_or(true) {
+        if let Some(workspace_id) = workspace_id.as_deref() {
+            let cloud_mcp_state = app.state::<CloudMcpState>();
+            cloud_mcp_publish_workspace_deactivated_snapshot(
+                cloud_mcp_state.inner(),
+                workspace_id,
+                &reason,
+            )
+            .await;
+        }
     }
 
     let errors = [terminal_error, mcp_error]
@@ -4390,6 +4392,21 @@ async fn close_app_after_terminal_shutdown(
     force_exit_result
 }
 
+fn start_backend_app_shutdown(app: AppHandle, window_label: String) -> Result<(), String> {
+    let _ = begin_app_shutdown();
+    let force_exit_result = schedule_app_force_exit(app.clone(), window_label.clone());
+
+    if APP_CLOSE_SHUTDOWN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return force_exit_result;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        run_backend_app_shutdown(app, window_label).await;
+    });
+
+    force_exit_result
+}
+
 fn restore_main_window(app: &AppHandle) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -5115,6 +5132,7 @@ pub fn run() {
             cloud_mcp_sync_agent_installations,
             cloud_mcp_sync_device_workspaces_snapshot,
             cloud_mcp_delete_workspace,
+            cloud_mcp_delete_agent_chat_session,
             cloud_mcp_sync_tokenomics_state,
             cloud_mcp_schedule_tokenomics_sync,
             cloud_mcp_reset_device_tokenomics,
@@ -5376,47 +5394,13 @@ pub fn run() {
 
                 if phase == APP_SHUTDOWN_PHASE_RUNNING {
                     api.prevent_exit();
-                    let emit_result = app.emit(
-                        APP_CLOSE_REQUESTED_EVENT,
-                        json!({
-                            "reason": "app_exit_requested",
-                            "source": "tauri_exit_requested",
-                        }),
-                    );
-
-                    if emit_result.is_err() {
-                        let _ = begin_app_shutdown();
-                        let _ = schedule_app_force_exit(app.clone(), "main".to_string());
-
-                        if APP_CLOSE_SHUTDOWN_IN_FLIGHT
-                            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                        {
-                            let app_for_shutdown = app.clone();
-                            tauri::async_runtime::spawn(async move {
-                                run_backend_app_shutdown(app_for_shutdown, "main".to_string())
-                                    .await;
-                            });
-                        }
-                    }
-
+                    let _ = start_backend_app_shutdown(app.clone(), "main".to_string());
                     return;
                 }
 
                 if phase < APP_SHUTDOWN_PHASE_EXITING {
                     api.prevent_exit();
-                    let _ = schedule_app_force_exit(app.clone(), "main".to_string());
-
-                    if APP_CLOSE_SHUTDOWN_IN_FLIGHT
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                    {
-                        let app_for_shutdown = app.clone();
-                        tauri::async_runtime::spawn(async move {
-                            run_backend_app_shutdown(app_for_shutdown, "main".to_string()).await;
-                        });
-                    }
-
+                    let _ = start_backend_app_shutdown(app.clone(), "main".to_string());
                     return;
                 }
 

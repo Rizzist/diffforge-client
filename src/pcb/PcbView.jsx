@@ -2,24 +2,42 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import styled from "styled-components";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { invoke } from "@tauri-apps/api/core";
-import PcbPanel from "./PcbPanel.jsx";
+import { listen } from "@tauri-apps/api/event";
+import PcbPanel, { PCB_STORE_CHANGED_EVENT } from "./PcbPanel.jsx";
 import AppSelect from "../app/AppSelect.jsx";
 
 const STORAGE_PREFIX = "diffforge.pcb.slots.";
 
+function normalizeRepoIdentity(repoPath) {
+  return String(repoPath || "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+}
+
+function slotStorageKey(workspaceId, repoPath) {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  const repoIdentity = normalizeRepoIdentity(repoPath);
+  return safeWorkspaceId && repoIdentity
+    ? `${STORAGE_PREFIX}${encodeURIComponent(safeWorkspaceId)}.${encodeURIComponent(repoIdentity)}`
+    : "";
+}
+
 // A slot is one panel in the grid: bound to a board (path) or empty (path: null,
 // shows the create/select chooser).
-function loadSlots(workspaceId) {
-  if (!workspaceId) {
+function loadSlots(workspaceId, repoPath) {
+  const key = slotStorageKey(workspaceId, repoPath);
+  if (!key) {
     return [];
   }
   try {
-    const raw = window.localStorage.getItem(STORAGE_PREFIX + workspaceId);
-    const parsed = raw ? JSON.parse(raw) : [];
-    if (!Array.isArray(parsed)) {
+    const raw = window.localStorage.getItem(key);
+    const parsed = raw ? JSON.parse(raw) : {};
+    const slots = Array.isArray(parsed) ? parsed : parsed?.slots;
+    if (parsed?.repoPath && normalizeRepoIdentity(parsed.repoPath) !== normalizeRepoIdentity(repoPath)) {
       return [];
     }
-    return parsed
+    if (!Array.isArray(slots)) {
+      return [];
+    }
+    return slots
       .filter((slot) => slot && typeof slot === "object")
       .map((slot) => ({ path: typeof slot.path === "string" ? slot.path : null }));
   } catch {
@@ -27,14 +45,18 @@ function loadSlots(workspaceId) {
   }
 }
 
-function saveSlots(workspaceId, slots) {
-  if (!workspaceId) {
+function saveSlots(workspaceId, repoPath, slots) {
+  const key = slotStorageKey(workspaceId, repoPath);
+  if (!key) {
     return;
   }
   try {
     window.localStorage.setItem(
-      STORAGE_PREFIX + workspaceId,
-      JSON.stringify(slots.map((slot) => ({ path: slot.path }))),
+      key,
+      JSON.stringify({
+        repoPath: normalizeRepoIdentity(repoPath),
+        slots: slots.map((slot) => ({ path: slot.path })),
+      }),
     );
   } catch {
     /* persistence is best-effort */
@@ -332,7 +354,9 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const restoredFor = useRef("");
+  const skipPersistFor = useRef("");
   const slotSeq = useRef(0);
+  const restoreKey = useMemo(() => slotStorageKey(workspaceId, repoPath), [repoPath, workspaceId]);
 
   const makeSlot = useCallback((path = null) => {
     slotSeq.current += 1;
@@ -357,26 +381,62 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
     refreshList();
   }, [repoPath, refreshList]);
 
+  useEffect(() => {
+    if (!repoPath) {
+      return undefined;
+    }
+    let disposed = false;
+    let unlisten = () => {};
+    listen(PCB_STORE_CHANGED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const eventRepo = normalizeRepoIdentity(event?.payload?.repoPath);
+      if (eventRepo && eventRepo !== normalizeRepoIdentity(repoPath)) {
+        return;
+      }
+      refreshList();
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [refreshList, repoPath]);
+
   // Restore slots for this workspace; otherwise seed empty slots from the
   // create-modal count (at least one so the view is never blank).
   useEffect(() => {
-    if (!workspaceId || restoredFor.current === workspaceId) {
+    if (!restoreKey || restoredFor.current === restoreKey) {
       return;
     }
-    restoredFor.current = workspaceId;
-    const restored = loadSlots(workspaceId).map((slot) => makeSlot(slot.path));
+    restoredFor.current = restoreKey;
+    skipPersistFor.current = restoreKey;
+    const restored = loadSlots(workspaceId, repoPath).map((slot) => makeSlot(slot.path));
     const seedCount = Math.max(1, Number(initialPanelCount) || 0);
     const next = restored.length ? restored : Array.from({ length: seedCount }, () => makeSlot());
     setSlots(next);
     setActiveKey(next[0]?.key || "");
-  }, [workspaceId, initialPanelCount, makeSlot]);
+  }, [workspaceId, initialPanelCount, makeSlot, repoPath, restoreKey]);
 
   // Persist slots whenever they change.
   useEffect(() => {
-    if (restoredFor.current === workspaceId) {
-      saveSlots(workspaceId, slots);
+    if (!restoreKey || restoredFor.current !== restoreKey) {
+      return;
     }
-  }, [workspaceId, slots]);
+    if (skipPersistFor.current === restoreKey) {
+      skipPersistFor.current = "";
+      return;
+    }
+    saveSlots(workspaceId, repoPath, slots);
+  }, [repoPath, restoreKey, slots, workspaceId]);
 
   const addSlot = useCallback(() => {
     setSlots((current) => {

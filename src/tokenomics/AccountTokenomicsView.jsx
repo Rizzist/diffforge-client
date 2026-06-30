@@ -449,6 +449,35 @@ function useAgentAccountsState() {
   return { accounts, refresh };
 }
 
+function tokenomicsAgentCredentialProfileSignature(profile = {}) {
+  const identity = profile?.identity || {};
+  const authStatus = profile?.authStatus || {};
+  return [
+    String(profile?.id || "").trim(),
+    profile?.isActive ? "active" : "inactive",
+    normalizeTokenomicsEmail(identity?.email || profile?.email),
+    identity?.authReady ? "auth-ready" : "auth-missing",
+    authStatus?.needsLogin ? "needs-login" : "login-ok",
+    String(authStatus?.reason || "").trim(),
+  ].join("~");
+}
+
+function tokenomicsAgentCredentialSignature(agentAccounts) {
+  if (!agentAccounts || typeof agentAccounts !== "object") return "";
+  return PROVIDER_ACCOUNT_FILTER_PROVIDERS.map((providerId) => {
+    const entry = agentAccounts?.[providerId] || {};
+    const profiles = Array.isArray(entry?.profiles) ? entry.profiles : [];
+    const profileParts = profiles
+      .map((profile) => tokenomicsAgentCredentialProfileSignature(profile))
+      .sort();
+    return [
+      providerId,
+      String(entry?.activeProfileId || "").trim(),
+      profileParts.join("|"),
+    ].join(":");
+  }).join("||");
+}
+
 function collapseAgentProfilesByEmail(profiles = []) {
   const byEmail = new Map();
   const visible = [];
@@ -808,6 +837,12 @@ function tokenomicsProviderProfileAccountKey(providerId, profileId) {
   return "";
 }
 
+function tokenomicsProfileIdFromAccountKey(providerId, accountKey) {
+  const clean = String(accountKey || "").trim();
+  const prefix = tokenomicsProviderProfileAccountKey(providerId, "__profile__").replace("__profile__", "");
+  return prefix && clean.startsWith(prefix) ? clean.slice(prefix.length).trim() : "";
+}
+
 function normalizeTokenomicsAliasLabel(value, providerId = "") {
   let label = normalizeProviderAccountLabel(value)
     .replace(/[·•]/gu, " ")
@@ -852,6 +887,10 @@ function tokenomicsProfileLabelCandidates(profile = {}, providerId = "") {
   labels.delete("");
   labels.delete("default");
   return [...labels];
+}
+
+function tokenomicsRowAgentProfileId(row = {}) {
+  return String(row?.agent_profile_id || row?.agentProfileId || "").trim();
 }
 
 function tokenomicsAccountLabelScore(label, providerId = "") {
@@ -1213,6 +1252,7 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
     groups,
     byKey: new Map(),
     byLabel: new Map(),
+    byProfileId: new Map(),
     activeByProvider: new Map(),
     providerGroupCount: new Map(),
   };
@@ -1225,6 +1265,10 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
       const group = tokenomicsEnsureAccountGroup(groups, providerId, email);
       const label = profile?.alias || (!profile?.isDefault ? profile?.label : "") || tokenomicsEmailLocalPart(email) || email;
       group.label = preferredTokenomicsAccountLabel(label, group.label, providerId);
+      const profileId = String(profile?.id || "").trim();
+      if (profileId) {
+        index.byProfileId.set(tokenomicsIndexKey(providerId, profileId), group);
+      }
       tokenomicsAddGroupKey(index, group, tokenomicsProviderProfileAccountKey(providerId, profile?.id));
       tokenomicsProfileLabelCandidates(profile, providerId).forEach((candidate) => {
         tokenomicsAddGroupLabel(index, group, candidate);
@@ -1240,6 +1284,32 @@ function buildTokenomicsAccountIdentityIndex(agentAccounts) {
   return groups.size ? index : null;
 }
 
+function tokenomicsCurrentProfileIdsByProvider(agentAccounts) {
+  if (!agentAccounts || typeof agentAccounts !== "object") return null;
+  return PROVIDER_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
+    const profiles = Array.isArray(agentAccounts?.[providerId]?.profiles)
+      ? agentAccounts[providerId].profiles
+      : [];
+    acc[providerId] = new Set(
+      profiles
+        .map((profile) => String(profile?.id || "").trim())
+        .filter(Boolean),
+    );
+    return acc;
+  }, {});
+}
+
+function tokenomicsRowReferencesRemovedProfile(row, currentProfileIdsByProvider) {
+  const providerId = providerKey(row);
+  const profileId = tokenomicsRowAgentProfileId(row)
+    || tokenomicsProfileIdFromAccountKey(providerId, rowProviderAccountKey(row));
+  if (!profileId || profileId === "default") return false;
+  if (!currentProfileIdsByProvider) return true;
+  const currentIds = currentProfileIdsByProvider[providerId];
+  if (!currentIds) return false;
+  return Boolean(profileId && !currentIds.has(profileId));
+}
+
 function tokenomicsResolveAccountGroup(row, index) {
   if (!index) return null;
   const providerId = providerKey(row);
@@ -1247,6 +1317,14 @@ function tokenomicsResolveAccountGroup(row, index) {
   const key = rowProviderAccountKey(row);
   const byKey = index.byKey.get(tokenomicsIndexKey(providerId, key));
   if (byKey) return byKey;
+  const profileId = tokenomicsRowAgentProfileId(row);
+  if (profileId) {
+    const byProfileId = index.byProfileId.get(tokenomicsIndexKey(providerId, profileId));
+    if (byProfileId) return byProfileId;
+    const profileKey = tokenomicsProviderProfileAccountKey(providerId, profileId);
+    const byProfileKey = index.byKey.get(tokenomicsIndexKey(providerId, profileKey));
+    if (byProfileKey) return byProfileKey;
+  }
   if (tokenomicsAccountRowIsActive(row)) {
     const active = index.activeByProvider.get(providerId);
     if (active) return active;
@@ -2455,9 +2533,10 @@ function modelBreakdown(modelRows, selectedProvider, selectedAccountKeys, select
     }));
 }
 
-function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "all", selectedScopeKey = "all") {
+function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "all", selectedScopeKey = "all", agentAccounts = null) {
   if (selectedProvider === "all") return [];
   const provider = PROVIDERS.find((item) => item.id === selectedProvider) || PROVIDERS[0];
+  const currentProfileIds = tokenomicsCurrentProfileIdsByProvider(agentAccounts);
   const usageRows = accountRowsForDisplay(summary);
   const accountRows = summaryArray(summary, "provider_accounts", "providerAccounts");
   const limitRows = limitRowsForDisplay(summary);
@@ -2467,6 +2546,7 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
     ...limitRows,
   ].filter((row) => (
     provider.match(row)
+      && !tokenomicsRowReferencesRemovedProfile(row, currentProfileIds)
       && (selectedDeviceId === "all" || !rowDeviceId(row) || rowDeviceId(row) === selectedDeviceId)
       && (selectedScopeKey === "all" || rowScopeKey(row) === selectedScopeKey)
   ));
@@ -2498,9 +2578,9 @@ function providerAccountOptions(summary, selectedProvider, selectedDeviceId = "a
   return [{ key: "all", label: "All" }, ...accounts];
 }
 
-function providerAccountOptionsByProvider(summary, selectedDeviceId = "all", selectedScopeKey = "all") {
+function providerAccountOptionsByProvider(summary, selectedDeviceId = "all", selectedScopeKey = "all", agentAccounts = null) {
   return PROVIDER_ACCOUNT_FILTER_PROVIDERS.reduce((acc, providerId) => {
-    acc[providerId] = providerAccountOptions(summary, providerId, selectedDeviceId, selectedScopeKey);
+    acc[providerId] = providerAccountOptions(summary, providerId, selectedDeviceId, selectedScopeKey, agentAccounts);
     return acc;
   }, {});
 }
@@ -2732,6 +2812,7 @@ const tokenomicsStore = {
   loadedOnce: false,
   loadPromise: null,
   liveLimitsPromise: null,
+  liveLimitsForcedRefreshQueued: false,
   liveLimitsLastAt: 0,
   hotTailPromise: null,
   hotTailLastAt: 0,
@@ -2828,6 +2909,7 @@ function resetTokenomicsStoreForAccount(accountKey) {
   tokenomicsStore.loadedOnce = false;
   tokenomicsStore.loadPromise = null;
   tokenomicsStore.liveLimitsPromise = null;
+  tokenomicsStore.liveLimitsForcedRefreshQueued = false;
   tokenomicsStore.liveLimitsLastAt = 0;
   tokenomicsStore.hotTailPromise = null;
   tokenomicsStore.hotTailLastAt = 0;
@@ -2864,10 +2946,24 @@ function ensureTokenomicsProgressListener() {
     });
 }
 
-function refreshTokenomicsLiveLimits({ force = false, syncLimitChanges = false } = {}) {
+function refreshTokenomicsLiveLimits({ force = false, forceProviderRefresh = false, syncLimitChanges = false } = {}) {
   const now = Date.now();
   const requestEpoch = tokenomicsStore.requestEpoch;
   if (tokenomicsStore.liveLimitsPromise) {
+    if (forceProviderRefresh) {
+      tokenomicsStore.liveLimitsForcedRefreshQueued = true;
+      return tokenomicsStore.liveLimitsPromise.finally(() => {
+        if (tokenomicsStore.requestEpoch !== requestEpoch || !tokenomicsStore.liveLimitsForcedRefreshQueued) {
+          return tokenomicsStore.state.summary;
+        }
+        tokenomicsStore.liveLimitsForcedRefreshQueued = false;
+        return refreshTokenomicsLiveLimits({
+          force: true,
+          forceProviderRefresh: true,
+          syncLimitChanges,
+        });
+      });
+    }
     return tokenomicsStore.liveLimitsPromise;
   }
   if (!force && now - tokenomicsStore.liveLimitsLastAt < TOKENOMICS_LIVE_LIMIT_REFRESH_INTERVAL_MS) {
@@ -2875,7 +2971,9 @@ function refreshTokenomicsLiveLimits({ force = false, syncLimitChanges = false }
   }
 
   tokenomicsStore.liveLimitsLastAt = now;
-  tokenomicsStore.liveLimitsPromise = invoke("tokenomics_get_live_limits")
+  tokenomicsStore.liveLimitsPromise = invoke("tokenomics_get_live_limits", {
+    forceProviderRefresh,
+  })
     .then((limitsSummary) => {
       if (tokenomicsStore.requestEpoch === requestEpoch) {
         mergeSummaryIntoTokenomicsStore(limitsSummary || {}, { syncLimitChanges });
@@ -3176,6 +3274,11 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
   const [usageRateWindowKind, setUsageRateWindowKind] = useState("5_hour");
   const { accounts: agentAccounts } = useAgentAccountsState();
+  const agentCredentialSignature = useMemo(
+    () => tokenomicsAgentCredentialSignature(agentAccounts),
+    [agentAccounts],
+  );
+  const lastAgentCredentialSignatureRef = useRef("");
 
   const refresh = useCallback(async ({ scan = false, resync = false } = {}) => {
     await loadTokenomicsStore({ scan, force: true, resync });
@@ -3210,6 +3313,20 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     };
   }, []);
 
+  useEffect(() => {
+    if (!agentCredentialSignature) return;
+    const previousSignature = lastAgentCredentialSignatureRef.current;
+    lastAgentCredentialSignatureRef.current = agentCredentialSignature;
+    if (!previousSignature || previousSignature === agentCredentialSignature) return;
+    void refreshTokenomicsLiveLimits({
+      force: true,
+      forceProviderRefresh: true,
+      syncLimitChanges: true,
+    }).finally(() => {
+      void refreshTokenomicsSummaryIfStale({ force: true });
+    });
+  }, [agentCredentialSignature]);
+
   const visibleSummary = useMemo(
     () => canonicalizeTokenomicsAccountSummary(summaryForMappedNativeDevices(summary), agentAccounts),
     [agentAccounts, summary],
@@ -3236,8 +3353,8 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
       : accountKeyForProvider(providerAccountKeys, selectedProvider)
   ), [providerAccountKeys, selectedProvider]);
   const accountOptionsByProvider = useMemo(
-    () => providerAccountOptionsByProvider(visibleSummary, selectedDeviceId, selectedScopeKey),
-    [visibleSummary, selectedDeviceId, selectedScopeKey],
+    () => providerAccountOptionsByProvider(visibleSummary, selectedDeviceId, selectedScopeKey, agentAccounts),
+    [agentAccounts, visibleSummary, selectedDeviceId, selectedScopeKey],
   );
   const accountOptionGroups = useMemo(
     () => providerAccountOptionGroups(accountOptionsByProvider, selectedProvider),

@@ -1,7 +1,6 @@
 import { ChevronLeft } from "@styled-icons/material-rounded/ChevronLeft";
 import { ChevronRight } from "@styled-icons/material-rounded/ChevronRight";
 import { Close } from "@styled-icons/material-rounded/Close";
-import { DeleteOutline } from "@styled-icons/material-rounded/DeleteOutline";
 import { Edit } from "@styled-icons/fa-regular/Edit";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Search } from "@styled-icons/material-rounded/Search";
@@ -13,7 +12,6 @@ import { getThreadTerminalGroundTruth } from "./threadTerminalGroundTruth.js";
 import WorkspaceThreadDetail from "./WorkspaceThreadDetail.jsx";
 import {
   getWorkspaceThreadAgentLabel,
-  getWorkspaceThreadCanArchive,
   getWorkspaceThreadCanPin,
   getWorkspaceThreadIsPinned,
   getWorkspaceThreadLabel,
@@ -909,61 +907,6 @@ const ThreadStatusSlot = styled.span`
   justify-self: end;
 `;
 
-const ThreadArchiveButton = styled.button`
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-  display: grid;
-  width: 18px;
-  height: 18px;
-  flex: 0 0 auto;
-  place-items: center;
-  padding: 0;
-  border: 0;
-  border-radius: 7px;
-  color: rgba(244, 244, 244, 0.72);
-  background: rgba(58, 58, 58, 0.98);
-  opacity: 0;
-  transition:
-    background 130ms ease,
-    color 130ms ease,
-    opacity 130ms ease;
-
-  ${ThreadRow}:hover &,
-  ${ThreadRow}:focus-within & {
-    opacity: 1;
-  }
-
-  &:hover {
-    color: #ffd6d6;
-    background: rgba(239, 107, 107, 0.14);
-  }
-
-  html[data-forge-theme="light"] & {
-    color: var(--thread-rail-muted);
-    background: rgba(255, 255, 255, 0.88);
-    box-shadow:
-      0 1px 2px rgba(0, 0, 0, 0.08),
-      inset 0 1px 0 rgba(255, 255, 255, 0.96);
-  }
-
-  html[data-forge-theme="light"] &:hover {
-    color: var(--thread-red);
-    background: rgba(180, 35, 24, 0.08);
-  }
-
-  &:focus-visible {
-    opacity: 1;
-    outline: 2px solid rgba(248, 113, 113, 0.48);
-    outline-offset: 1px;
-  }
-
-  svg {
-    width: 12px;
-    height: 12px;
-  }
-`;
-
 const TerminalStateDot = styled.span`
   width: 6px;
   height: 6px;
@@ -1228,7 +1171,6 @@ function getThreadState(thread, entry) {
           : "idle";
 
   return {
-    canArchive: getWorkspaceThreadCanArchive(thread),
     canPin: getWorkspaceThreadCanPin(thread),
     isLive: Boolean(isActiveTerminal),
     isNonSessionActive: threadViewState === THREAD_VIEW_STATE.LIVE_NO_SESSION,
@@ -1353,7 +1295,6 @@ function WorkspaceThreadsOverlay({
   agentStatuses,
   composerAttachments,
   composerDrafts,
-  onArchiveThread,
   onClose,
   onActiveThreadChange,
   onCreateChat,
@@ -1578,11 +1519,6 @@ function WorkspaceThreadsOverlay({
       selectedWorkspaceId: workspaceId,
     });
     onSelectThread?.(workspaceId, threadId);
-  };
-  const archiveThread = (event, workspaceId, threadId) => {
-    event.preventDefault();
-    event.stopPropagation();
-    onArchiveThread?.(workspaceId, threadId);
   };
   const togglePinnedThread = (event, workspaceId, threadId) => {
     event.preventDefault();
@@ -1827,7 +1763,6 @@ function WorkspaceThreadsOverlay({
                         const isSelected = visibleActiveWorkspaceId === workspace.id
                           && visibleActiveThreadId === thread.id;
                         const {
-                          canArchive,
                           canPin,
                           isLive,
                           isNonSessionActive,
@@ -1841,7 +1776,6 @@ function WorkspaceThreadsOverlay({
                         return (
                           <ThreadRow
                             data-can-pin={canPin ? "true" : "false"}
-                            data-can-archive={canArchive ? "true" : "false"}
                             data-pinned={pinned ? "true" : "false"}
                             data-selected={isSelected ? "true" : "false"}
                             key={thread.id}
@@ -1888,23 +1822,13 @@ function WorkspaceThreadsOverlay({
                               </ThreadRowText>
                             </ThreadSelectButton>
                             <ThreadStatusSlot>
-                          <TerminalStateDot
-                            aria-hidden="true"
-                            data-live={isLive ? "true" : "false"}
-                            data-nosession={isNonSessionActive ? "true" : "false"}
-                            data-state={state}
-                            data-view-state={threadViewState}
-                          />
-                              {canArchive ? (
-                                <ThreadArchiveButton
-                                  aria-label={`Archive ${label}`}
-                                  onClick={(event) => archiveThread(event, workspace.id, thread.id)}
-                                  title="Archive thread"
-                                  type="button"
-                                >
-                                  <DeleteOutline aria-hidden="true" />
-                                </ThreadArchiveButton>
-                              ) : null}
+                              <TerminalStateDot
+                                aria-hidden="true"
+                                data-live={isLive ? "true" : "false"}
+                                data-nosession={isNonSessionActive ? "true" : "false"}
+                                data-state={state}
+                                data-view-state={threadViewState}
+                              />
                             </ThreadStatusSlot>
                           </ThreadRow>
                         );

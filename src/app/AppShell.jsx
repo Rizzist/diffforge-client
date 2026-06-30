@@ -318,7 +318,6 @@ import {
   WORKSPACE_NOTIFICATION_EVENT,
 } from "../notifications/workspaceNotifications";
 import {
-  archiveWorkspaceThread,
   appendWorkspaceThreadProjectionEvents,
   applyWorkspaceThreadProviderSessionBinding,
   bindWorkspaceThreadTerminal,
@@ -327,6 +326,7 @@ import {
   clearWorkspaceThreadPendingPrompt,
   createWorkspaceThreadId,
   diagnoseWorkspaceThreadSessionTranscriptHydration,
+  deleteWorkspaceThread,
   ensureWorkspaceThreadsForTerminalIndexes,
   getWorkspaceThreadForTerminalIndex,
   getWorkspaceThreadCanArchive,
@@ -3865,9 +3865,6 @@ const DEFAULT_WORKSPACE_WEB_PANEL_COUNT = 0;
 const MIN_WORKSPACE_PCB_COUNT = 0;
 const MAX_WORKSPACE_PCB_COUNT = 4;
 const DEFAULT_WORKSPACE_PCB_COUNT = 0;
-const WORKSPACE_TERMINAL_PRIMARY_COLUMNS = 2;
-const WORKSPACE_TERMINAL_WIDE_START_INDEX = 4;
-const WORKSPACE_TERMINAL_WIDE_COLUMNS = 4;
 const TERMINAL_DEFAULT_COLS = 80;
 const TERMINAL_DEFAULT_ROWS = 24;
 const TERMINAL_MIN_COLS = 20;
@@ -14116,6 +14113,37 @@ function WorkspacePanelCountCards({
   );
 }
 
+function scrollWorkspaceHorizontalStripFromWheel(strip, event) {
+  if (!strip || strip.scrollWidth <= strip.clientWidth) {
+    return false;
+  }
+
+  const deltaX = Number(event.deltaX) || 0;
+  const deltaY = Number(event.deltaY) || 0;
+  const rawDelta = deltaX !== 0 ? deltaX : deltaY;
+  if (!rawDelta) {
+    return false;
+  }
+
+  const scale = event.deltaMode === 1
+    ? 18
+    : event.deltaMode === 2
+      ? strip.clientWidth
+      : 1;
+  const previousLeft = strip.scrollLeft;
+  const maxLeft = Math.max(0, strip.scrollWidth - strip.clientWidth);
+  const nextLeft = Math.max(0, Math.min(maxLeft, previousLeft + rawDelta * scale));
+
+  if (nextLeft === previousLeft) {
+    return false;
+  }
+
+  strip.scrollLeft = nextLeft;
+  event.preventDefault();
+  event.stopPropagation();
+  return true;
+}
+
 
 /**
  * Inline create-workspace panel rendered in the main area right of the
@@ -14156,6 +14184,7 @@ function WorkspaceCreatePanel({
   const [panelView, setPanelView] = useState("create");
   const browseSeqRef = useRef(0);
   const browseRef = useRef(null);
+  const directoryStripRef = useRef(null);
   const creating = workspaceSyncState === "creating";
   const archiveBusy = ["archiving", "restoring", "deleting", "saving"].includes(workspaceArchiveState);
   const archivedRows = Array.isArray(archivedWorkspaces) ? archivedWorkspaces : [];
@@ -14237,31 +14266,23 @@ function WorkspaceCreatePanel({
     });
   }, [browseTo, cdDraft, defaultWorkingDirectory, rootDraft]);
 
-  const handleDirectoryStripWheel = useCallback((event) => {
-    const strip = event.currentTarget;
-    if (!strip || strip.scrollWidth <= strip.clientWidth) {
-      return;
+  useEffect(() => {
+    if (!visible || panelView !== "create") {
+      return undefined;
     }
 
-    const rawDelta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
-      ? event.deltaX
-      : event.deltaY;
-    if (!rawDelta) {
-      return;
+    const strip = directoryStripRef.current;
+    if (!strip) {
+      return undefined;
     }
 
-    const scale = event.deltaMode === 1
-      ? 18
-      : event.deltaMode === 2
-        ? strip.clientWidth
-        : 1;
-    const previousLeft = strip.scrollLeft;
-    strip.scrollLeft += rawDelta * scale;
-    if (strip.scrollLeft !== previousLeft) {
-      event.preventDefault();
-      event.stopPropagation();
-    }
-  }, []);
+    const handleWheel = (event) => {
+      scrollWorkspaceHorizontalStripFromWheel(strip, event);
+    };
+
+    strip.addEventListener("wheel", handleWheel, { passive: false });
+    return () => strip.removeEventListener("wheel", handleWheel);
+  }, [panelView, visible]);
 
   const installedAgentById = useMemo(() => {
     const byId = new Map();
@@ -14614,7 +14635,7 @@ function WorkspaceCreatePanel({
           </WorkspaceCreateCdForm>
           <WorkspaceCreateDirGrid
             aria-label="Subdirectories"
-            onWheel={handleDirectoryStripWheel}
+            ref={directoryStripRef}
             tabIndex={0}
           >
             {browse?.parentDirectory && (
@@ -20908,8 +20929,19 @@ function normalizeWorkspaceDisplayTerminalRows(layoutRows, terminalIndexes) {
   const normalizedRows = rows.length
     ? rows
     : getTerminalPanelRows(logicalIndexes).map((row) => row.terminalIndexes);
+  const balancedRows = getTerminalPanelRows(logicalIndexes).map((row) => row.terminalIndexes);
+  const shouldRebalanceRows = logicalIndexes.length > 1
+    && (
+      normalizedRows.some((rowIndexes) => rowIndexes.length > 3)
+      || normalizedRows.every((rowIndexes) => rowIndexes.length <= 1)
+      || (
+        normalizedRows.length > balancedRows.length
+        && normalizedRows.slice(1).every((rowIndexes) => rowIndexes.length <= 1)
+      )
+    );
+  const displayRows = shouldRebalanceRows ? balancedRows : normalizedRows;
 
-  return normalizedRows.map((terminalIndexes, rowIndex) => ({
+  return displayRows.map((terminalIndexes, rowIndex) => ({
     rowIndex,
     terminalIndexes,
   }));
@@ -26526,6 +26558,7 @@ export default function App() {
       try {
         await withTimeout(
           invoke("deactivate_workspace_runtime", {
+            publishCloudSnapshot: false,
             repoPath,
             reason: "workspace_delete",
             workspaceId: targetWorkspaceId,
@@ -26546,19 +26579,6 @@ export default function App() {
         });
       } catch (error) {
         warnings.push(`Live-state cleanup warning: ${getErrorMessage(error, "Unable to notify cloud live state.")}`);
-      }
-
-      try {
-        // Local todo state is removed with the workspace; the cloud keeps
-        // tombstoned rows so a recreated workspace with the same name or
-        // identity never re-imports ghost todos.
-        await invoke("cloud_mcp_archive_workspace_todos", {
-          workspaceId: targetWorkspaceId,
-          workspaceName,
-          reason: "workspace_removed",
-        });
-      } catch (error) {
-        warnings.push(`Todo cleanup warning: ${getErrorMessage(error, "Unable to archive workspace todos.")}`);
       }
 
       try {
@@ -28207,8 +28227,12 @@ export default function App() {
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     );
-    const currentRootDirectory = getWorkspaceRootDirectory(workspaceSettings, selectedWorkspace.id);
-    const cleanedRoot = cleanWorkspaceRootDirectory(currentRootDirectory);
+    const currentRootDirectory = cleanWorkspaceRootDirectory(
+      getWorkspaceRootDirectory(workspaceSettings, selectedWorkspace.id),
+    );
+    const requestedRoot = cleanWorkspaceRootDirectory(workspaceRootDraft)
+      || currentRootDirectory
+      || cleanWorkspaceRootDirectory(defaultWorkingDirectory);
     const currentAgentSessionMode = getWorkspaceAgentSessionMode(workspaceSettings, selectedWorkspace.id);
     const requestedAgentSessionMode = normalizeAgentSessionMode(workspaceAgentSessionModeDraft, false, true);
     const agentPermissions = normalizeWorkspaceAgentPermissions(
@@ -28249,7 +28273,12 @@ export default function App() {
       return;
     }
 
-    if (cleanedRoot.length > MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH) {
+    if (!requestedRoot) {
+      setWorkspaceSettingsError("Choose a workspace root directory.");
+      return;
+    }
+
+    if (requestedRoot.length > MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH) {
       setWorkspaceSettingsError("Root directory path is too long.");
       return;
     }
@@ -28259,8 +28288,16 @@ export default function App() {
     setWorkspaceSettingsMessage("");
 
     try {
-      const rootDirectory = cleanedRoot;
-      let rootGitRepository = getWorkspaceRootGitRepository(workspaceSettings, selectedWorkspace.id);
+      const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRoot });
+      const rootDirectory = normalizedRoot?.workingDirectory || "";
+      const rootIdentity = normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory);
+      const rootChanged = getWorkspaceRootIdentity(rootDirectory) !== getWorkspaceRootIdentity(currentRootDirectory);
+      let rootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
+
+      if (!rootDirectory) {
+        throw new Error("Workspace root directory was not returned by validation.");
+      }
+
       const shouldInitializeGit = Boolean(
         rootDirectory
           && !rootGitRepository
@@ -28323,7 +28360,6 @@ export default function App() {
         desiredPcbPanelCount,
       );
       const keptPanelIndexes = workspacePaneKindsIndexes(settingsStoredPaneKinds);
-      const rootChanged = false;
       const terminalNextIndexes = rootChanged
         ? reconcileWorkspaceTerminalSlotIndexesExcluding(getDefaultTerminalIndexes(terminalCount), terminalCount, keptPanelIndexes)
         : reconcileWorkspaceTerminalSlotIndexesExcluding(settingsTerminalCurrentIndexes, terminalCount, keptPanelIndexes);
@@ -28362,14 +28398,19 @@ export default function App() {
       const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
         [terminalIndex, effectiveTerminalRoles[index]]
       )));
-      const persistedDisplayRows = getWorkspaceDisplayTerminalRows(
-        workspaceTerminalDisplayLayoutsRef.current,
-        selectedWorkspace.id,
-        nextTerminalIndexes,
-      ).map((row) => row.terminalIndexes.slice());
+      const layoutPaneCountChanged = effectiveTerminalCount !== currentTerminalCount;
+      const persistedDisplayRows = layoutPaneCountChanged
+        ? getDefaultWorkspaceDisplayTerminalRows(nextTerminalIndexes)
+        : getWorkspaceDisplayTerminalRows(
+          workspaceTerminalDisplayLayoutsRef.current,
+          selectedWorkspace.id,
+          nextTerminalIndexes,
+        ).map((row) => row.terminalIndexes.slice());
       const gitWorktreesChanged = agentSessionMode !== currentAgentSessionMode;
       const rootWasEmptyAtSelection = rootDirectory
-        ? getWorkspaceRootWasEmptyAtSelection(workspaceSettings, selectedWorkspace.id)
+        ? rootChanged
+          ? Boolean(normalizedRoot?.emptyDirectory)
+          : getWorkspaceRootWasEmptyAtSelection(workspaceSettings, selectedWorkspace.id)
         : false;
       const previousMcpRepoPath = currentRootDirectory || defaultWorkingDirectory;
       const nextMcpRepoPath = rootDirectory || defaultWorkingDirectory;
@@ -28489,27 +28530,32 @@ export default function App() {
         });
       }
 
-      if (workspaceNameValue !== selectedWorkspace.name) {
-        // Local-first rename: commit instantly; the cloud catalog upsert acks
-        // in the background and broadcasts the change to other devices.
-        const renamedAtIso = new Date().toISOString();
+      const catalogRootDirectory = cleanWorkspaceRootDirectory(selectedWorkspace.rootDirectory || "");
+      const catalogRootIdentity = selectedWorkspace.rootIdentity || getWorkspaceRootIdentity(catalogRootDirectory);
+      const rootMetadataChanged = rootDirectory !== catalogRootDirectory || rootIdentity !== catalogRootIdentity;
+      if (workspaceNameValue !== selectedWorkspace.name || rootMetadataChanged) {
+        // Local-first metadata update: commit instantly; the cloud catalog upsert
+        // acks in the background and broadcasts the change to other devices.
+        const updatedAtIso = new Date().toISOString();
         nextWorkspace = {
           ...selectedWorkspace,
           name: workspaceNameValue,
-          updatedAt: renamedAtIso,
+          rootDirectory,
+          rootIdentity,
+          updatedAt: updatedAtIso,
           syncState: "pending",
         };
-        const renamedCatalog = (Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [])
+        const updatedCatalog = (Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [])
           .map((workspace) => (workspace.id === nextWorkspace.id ? { ...workspace, ...nextWorkspace } : workspace));
-        const renamedWorkspaces = visibleWorkspaceCatalog(renamedCatalog);
-        workspaceCatalogRef.current = renamedCatalog;
-        setWorkspaceCatalog(renamedCatalog);
-        workspacesRef.current = renamedWorkspaces;
-        setWorkspaces(renamedWorkspaces);
-        const renameScopeKey = activeAccountScopeKey;
+        const updatedWorkspaces = visibleWorkspaceCatalog(updatedCatalog);
+        workspaceCatalogRef.current = updatedCatalog;
+        setWorkspaceCatalog(updatedCatalog);
+        workspacesRef.current = updatedWorkspaces;
+        setWorkspaces(updatedWorkspaces);
+        const updateScopeKey = activeAccountScopeKey;
         void invoke("local_workspaces_store", {
-          scopeKey: renameScopeKey,
-          workspaces: renamedCatalog,
+          scopeKey: updateScopeKey,
+          workspaces: updatedCatalog,
         }).catch(() => {});
         workspaceTerminalsSyncKeyRef.current = "";
       }
@@ -28581,6 +28627,7 @@ export default function App() {
     authState,
     expireDesktopSession,
     workspaceNameDraft,
+    workspaceRootDraft,
     workspaceDocumentCountDraft,
     workspaceWebPanelCountDraft,
     workspacePcbCountDraft,
@@ -28666,10 +28713,7 @@ export default function App() {
       ...currentLogicalIndexesByWorkspace,
       [workspaceId]: nextIndexes,
     };
-    const nextDisplayRows = removeLogicalTerminalFromDisplayRows(
-      getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes),
-      removedTerminalIndex,
-    );
+    const nextDisplayRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
     const nextDisplayLayouts = {
       ...currentDisplayLayouts,
       [workspaceId]: nextDisplayRows,
@@ -28974,10 +29018,7 @@ export default function App() {
     ));
     const nextPaneKinds = { ...getWorkspacePaneKinds(currentSettings, workspaceId) };
     delete nextPaneKinds[nextTerminalIndex];
-    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
-    const nextDisplayRows = currentRows.length
-      ? [...currentRows.map((row) => row.terminalIndexes.slice()), [nextTerminalIndex]]
-      : [[nextTerminalIndex]];
+    const nextDisplayRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
@@ -29118,10 +29159,7 @@ export default function App() {
     };
     const nextWebPanelCount = workspacePaneKindsWebIndexes(nextPaneKinds).length;
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
-    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
-    const nextDisplayRows = currentRows.length
-      ? [...currentRows.map((row) => row.terminalIndexes.slice()), [nextTerminalIndex]]
-      : [[nextTerminalIndex]];
+    const nextDisplayRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
@@ -29336,17 +29374,7 @@ export default function App() {
       index === nextTerminalIndex ? agentId : roleByIndex[index] || workspaceTerminalFallbackRole
     ));
     const nextPaneKinds = getWorkspacePaneKinds(currentSettings, workspaceId);
-    const sourceTerminalIndex = Number.parseInt(request.sourceTerminalIndex, 10);
-    const layoutSourceIndex = currentIndexes.includes(sourceTerminalIndex)
-      ? sourceTerminalIndex
-      : currentIndexes[currentIndexes.length - 1] ?? nextTerminalIndex;
-    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
-    const nextDisplayRows = insertLogicalTerminalInDisplayRows(
-      currentRows,
-      layoutSourceIndex,
-      nextTerminalIndex,
-      "vertical",
-    );
+    const nextDisplayRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
@@ -29561,16 +29589,9 @@ export default function App() {
       roleIndex = nextIndexes.indexOf(targetTerminalIndex);
       nextTerminalCount = Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
       workspaceTerminalExplicitEmptyRef.current.delete(workspaceId);
-      const currentRows = getWorkspaceDisplayTerminalRows(
-        currentDisplayLayouts,
-        workspaceId,
-        currentIndexes,
-      );
       nextDisplayLayouts = {
         ...currentDisplayLayouts,
-        [workspaceId]: currentRows.length
-          ? [...currentRows.map((row) => row.terminalIndexes.slice()), [targetTerminalIndex]]
-          : [[targetTerminalIndex]],
+        [workspaceId]: getDefaultWorkspaceDisplayTerminalRows(nextIndexes),
       };
     }
 
@@ -29787,17 +29808,7 @@ export default function App() {
       addedIndexes.includes(index) ? agentId : roleByIndex[index] || workspaceTerminalFallbackRole
     ));
     const nextPaneKinds = getWorkspacePaneKinds(currentSettings, workspaceId);
-    const currentRows = getWorkspaceDisplayTerminalRows(
-      currentDisplayLayouts,
-      workspaceId,
-      currentIndexes,
-    );
-    const nextRows = currentRows.length
-      ? currentRows.map((row) => row.terminalIndexes.slice())
-      : currentIndexes.map((index) => [index]);
-    addedIndexes.forEach((index) => {
-      nextRows.push([index]);
-    });
+    const nextRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextRoles,
@@ -29860,6 +29871,12 @@ export default function App() {
     setWorkspaceError("");
   }, [defaultWorkingDirectory]);
 
+  const useDefaultWorkspaceRoot = useCallback(() => {
+    setWorkspaceRootDraft(defaultWorkingDirectory);
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+  }, [defaultWorkingDirectory]);
+
   const chooseNewWorkspaceRootDirectory = useCallback(async () => {
     setWorkspaceError("");
 
@@ -29878,6 +29895,27 @@ export default function App() {
       setWorkspaceError(getErrorMessage(error, "Unable to choose root directory."));
     }
   }, []);
+
+  const chooseWorkspaceRootDirectory = useCallback(async () => {
+    setWorkspaceSettingsError("");
+    setWorkspaceSettingsMessage("");
+
+    try {
+      const selected = await openDialog({
+        directory: true,
+        multiple: false,
+        title: "Choose workspace root directory",
+      });
+      const selectedPath = Array.isArray(selected) ? selected[0] : selected;
+
+      if (typeof selectedPath === "string" && selectedPath.trim()) {
+        setWorkspaceRootDraft(selectedPath);
+      }
+    } catch (error) {
+      setWorkspaceSettingsError(getErrorMessage(error, "Unable to choose root directory."));
+    }
+  }, []);
+
 
   const logout = useCallback(async () => {
     authFlowIdRef.current += 1;
@@ -39266,7 +39304,22 @@ export default function App() {
       if (!workspace) {
         throw new Error("No matching workspace was found.");
       }
-      const kind = normalizeAppControlPanelKind(input.kind || input.panelKind || input.panel_kind) || "web";
+      const hasPcbPanelIntent = Boolean(
+        input.create
+          || input.new
+          || input.newBoard
+          || input.new_board
+          || input.name
+          || input.boardPath
+          || input.board_path
+          || input.boardName
+          || input.board_name
+          || input.path
+          || input.filePath
+          || input.file_path,
+      );
+      const kind = normalizeAppControlPanelKind(input.kind || input.panelKind || input.panel_kind)
+        || (hasPcbPanelIntent ? "pcb" : "web");
       showAppControlWorkspaceTerminals(workspace, "app_control_mcp_open_panel");
       const bridge = getAppControlWorkspaceBridge(workspace);
       if (typeof bridge?.openWorkspacePanel === "function") {
@@ -39309,6 +39362,15 @@ export default function App() {
       if (!result || !Number.isInteger(result.terminalIndex)) {
         throw new Error("Workspace panel limit reached.");
       }
+      const pendingBoardPath = String(
+        input.boardPath
+          || input.board_path
+          || input.path
+          || input.filePath
+          || input.file_path
+          || "",
+      ).trim();
+      const pendingBoardName = String(input.boardName || input.board_name || "").trim();
       const pendingAction = kind === "web" && (input.url || input.search || input.query)
         ? {
           action: input.search || input.query ? "search" : "navigate",
@@ -39327,7 +39389,16 @@ export default function App() {
             terminalIndex: result.terminalIndex,
             workspaceId: workspace.id,
           }
-          : null;
+          : kind === "pcb" && (pendingBoardPath || pendingBoardName)
+            ? {
+              action: "select",
+              boardName: pendingBoardName,
+              boardPath: pendingBoardPath,
+              kind,
+              terminalIndex: result.terminalIndex,
+              workspaceId: workspace.id,
+            }
+            : null;
       if (pendingAction) {
         window.setTimeout(() => {
           const nextBridge = workspaceToolRuntimeBridgesRef.current[workspace.id] || null;
@@ -41922,7 +41993,7 @@ export default function App() {
       return;
     }
     if (!getWorkspaceThreadCanArchive(thread)) {
-      logWorkspaceThreadDiagnosticEvent("frontend.thread_archive.skip", {
+      logWorkspaceThreadDiagnosticEvent("frontend.thread_delete.skip", {
         reason: "no_provider_session",
         threadId: safeThreadId,
         workspaceId: safeWorkspaceId,
@@ -41933,6 +42004,19 @@ export default function App() {
     const agentId = String(thread.currentAgent || "").trim().toLowerCase();
     const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
     const terminalBinding = providerBinding?.terminalBinding || thread.terminalBinding || null;
+    const providerSessionId = String(
+      providerBinding?.nativeSessionId
+        || providerBinding?.providerSessionId
+        || thread.transcriptSessionId
+        || "",
+    ).trim();
+    const agentChatSessionId = String(
+      providerBinding?.agentChatSessionId
+        || providerBinding?.agent_chat_session_id
+        || thread.agentChatSessionId
+        || thread.agent_chat_session_id
+        || "",
+    ).trim();
     const terminalIndex = Number.parseInt(
       terminalBinding?.terminalIndex ?? thread.terminalIndex,
       10,
@@ -41949,7 +42033,7 @@ export default function App() {
     const freshSessionStartedAt = new Date().toISOString();
 
     setWorkspaceThreads((threads) => {
-      let nextThreads = archiveWorkspaceThread(threads, safeWorkspaceId, safeThreadId);
+      let nextThreads = deleteWorkspaceThread(threads, safeWorkspaceId, safeThreadId);
       if (shouldResetTerminal) {
         nextThreads = materializeWorkspaceThreadForTerminal(nextThreads, {
           agentId: agentId || "codex",
@@ -41958,7 +42042,7 @@ export default function App() {
           instanceId: terminalBinding.instanceId,
           paneId: terminalBinding.paneId,
           repoPath: thread.coordination?.worktreePath || "",
-          source: "thread-archive-reset",
+          source: "thread-delete-reset",
           status: "starting",
           terminalIndex,
           threadId: nextThreadId,
@@ -41969,6 +42053,31 @@ export default function App() {
       }
       return nextThreads;
     });
+
+    if (providerSessionId || agentChatSessionId) {
+      const workspace = findWorkspaceById(workspaceCatalogRef.current, safeWorkspaceId)
+        || findWorkspaceById(workspacesRef.current, safeWorkspaceId)
+        || null;
+      void invoke("cloud_mcp_delete_agent_chat_session", {
+        workspaceId: safeWorkspaceId,
+        workspaceName: workspace?.name || "",
+        provider: agentId || providerBinding?.agentId || thread.currentAgent || "codex",
+        providerSessionId,
+        agentChatSessionId,
+        threadId: safeThreadId,
+        paneId: terminalBinding?.paneId || thread.paneId || "",
+        reason: "thread_session_deleted",
+      }).catch((error) => {
+        logWorkspaceThreadDiagnosticEvent("frontend.thread_session_delete.failed", {
+          message: getErrorMessage(error, "Unable to delete agent chat session from cloud."),
+          provider: agentId || providerBinding?.agentId || thread.currentAgent || "",
+          providerSessionIdPresent: Boolean(providerSessionId),
+          agentChatSessionIdPresent: Boolean(agentChatSessionId),
+          threadId: safeThreadId,
+          workspaceId: safeWorkspaceId,
+        });
+      });
+    }
 
     if (shouldResetTerminal) {
       window.setTimeout(() => {
@@ -46828,7 +46937,6 @@ export default function App() {
                     </RailHeader>
                     <WorkspaceList
                       aria-hidden={workspaceRailCollapsed ? "true" : undefined}
-                      hidden={workspaceRailCollapsed}
                     >
                       {loopspacesModeActive ? (
                         <>
@@ -47585,10 +47693,29 @@ export default function App() {
                               <WorkspaceCreatePathText title={workspaceRootDraft || selectedWorkspaceRootDisplay}>
                                 {workspaceRootDraft || selectedWorkspaceRootDisplay || defaultWorkingDirectory || "Choose project root"}
                               </WorkspaceCreatePathText>
-                              {selectedWorkspaceRootGitRepository && (
+                              {selectedWorkspaceRootGitRepository
+                                && getWorkspaceRootIdentity(workspaceRootDraft || selectedWorkspaceRootDisplay) === getWorkspaceRootIdentity(selectedWorkspaceRootDirectory) && (
                                 <WorkspaceCreatePathBadge $tone="good">git</WorkspaceCreatePathBadge>
                               )}
                             </WorkspaceCreatePathBar>
+                            <WorkspaceCreateFooter>
+                              <SecondaryButton
+                                disabled={isWorkspaceSettingsBusy}
+                                onClick={chooseWorkspaceRootDirectory}
+                                type="button"
+                              >
+                                <ButtonFolderIcon aria-hidden="true" />
+                                <span>Browse...</span>
+                              </SecondaryButton>
+                              <SecondaryButton
+                                disabled={!defaultWorkingDirectory || isWorkspaceSettingsBusy}
+                                onClick={useDefaultWorkspaceRoot}
+                                type="button"
+                              >
+                                <ButtonFolderIcon aria-hidden="true" />
+                                <span>App directory</span>
+                              </SecondaryButton>
+                            </WorkspaceCreateFooter>
                             <WorkspaceCreateCheckboxRow data-disabled={workspaceSettingsInitializeGitDisabled ? "true" : undefined}>
                               <input
                                 checked={workspaceSettingsInitializeGitChecked}

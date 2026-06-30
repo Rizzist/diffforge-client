@@ -1199,7 +1199,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "open_panel",
-            "description": "Open a workspace panel in the selected workspace by default. Kinds: docs, web, pcb. Web may accept url/search; PCB may accept create/name.",
+            "description": "Open a workspace panel in the selected workspace by default. Kinds: docs, web, pcb. Web may accept url/search; PCB may accept create/name or boardPath/boardName to switch to an existing board.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1208,7 +1208,9 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "kind": {"type": "string", "description": "docs, web, or pcb."},
                     "url": {"type": "string", "description": "Initial web URL or search text for web panels."},
                     "search": {"type": "string", "description": "Search text for web panels."},
-                    "name": {"type": "string", "description": "Optional board name for PCB create/open flows."},
+                    "name": {"type": "string", "description": "Optional board name for PCB create flows."},
+                    "boardPath": {"type": "string", "description": "Repo-relative PCB board path to open or switch to, for example hardware/blinky/blinky.board.tsx."},
+                    "boardName": {"type": "string", "description": "Existing PCB board name to open or switch to."},
                     "focus": {"type": "boolean", "description": "When true or omitted, show/focus the panel after opening."},
                     "includeState": {"type": "boolean"}
                 },
@@ -1234,7 +1236,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "panel_action",
-            "description": "Perform a bounded action on a live workspace panel. Web supports navigate/search/reload/back/forward/focus/open/return/screenshot; PCB supports create/refresh/focus/open/return; Docs supports focus/open/close/context. Screenshot focuses the target panel, then saves a native full-screen capture through Snipping.",
+            "description": "Perform a bounded action on a live workspace panel. Web supports navigate/search/reload/back/forward/focus/open/return/screenshot; PCB supports create/select/open-board/refresh/focus/open/return; Docs supports focus/open/close/context. Screenshot focuses the target panel, then saves a native full-screen capture through Snipping.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1244,11 +1246,13 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "panelId": {"type": "string"},
                     "terminalIndex": {"type": "integer", "minimum": 0},
                     "kind": {"type": "string", "description": "docs, web, pcb, or terminal."},
-                    "action": {"type": "string", "description": "navigate, search, reload, back, forward, screenshot, create, refresh, focus, open, return, close, or context."},
+                    "action": {"type": "string", "description": "navigate, search, reload, back, forward, screenshot, create, select, open-board, refresh, focus, open, return, close, or context."},
                     "url": {"type": "string"},
                     "search": {"type": "string"},
                     "query": {"type": "string"},
                     "name": {"type": "string"},
+                    "boardPath": {"type": "string", "description": "Repo-relative PCB board path for select/open-board/switch actions."},
+                    "boardName": {"type": "string", "description": "PCB board name for select/open-board/switch actions."},
                     "args": {"type": "object", "additionalProperties": true},
                     "includeState": {"type": "boolean"}
                 },

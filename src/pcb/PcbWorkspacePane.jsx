@@ -1,42 +1,59 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
 import AppSelect from "../app/AppSelect.jsx";
-import PcbPanel from "./PcbPanel.jsx";
+import PcbPanel, { PCB_STORE_CHANGED_EVENT } from "./PcbPanel.jsx";
 
 const PCB_GRID_SLOT_STORAGE_PREFIX = "diffforge.pcb.gridPaneSlot.";
 
-function storageKeyForPane(workspaceId, paneId) {
+function normalizeRepoIdentity(repoPath) {
+  return String(repoPath || "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+}
+
+function storageSegment(value) {
+  return encodeURIComponent(String(value || "").trim());
+}
+
+function storageKeyForPane(workspaceId, paneId, repoPath) {
   const safeWorkspaceId = String(workspaceId || "").trim();
   const safePaneId = String(paneId || "").trim();
-  return safeWorkspaceId && safePaneId
-    ? `${PCB_GRID_SLOT_STORAGE_PREFIX}${safeWorkspaceId}.${safePaneId}`
+  const repoIdentity = normalizeRepoIdentity(repoPath);
+  return safeWorkspaceId && safePaneId && repoIdentity
+    ? `${PCB_GRID_SLOT_STORAGE_PREFIX}${storageSegment(safeWorkspaceId)}.${storageSegment(repoIdentity)}.${storageSegment(safePaneId)}`
     : "";
 }
 
-function readStoredBoardPath(workspaceId, paneId) {
-  const key = storageKeyForPane(workspaceId, paneId);
+function readStoredBoardPath(workspaceId, paneId, repoPath) {
+  const key = storageKeyForPane(workspaceId, paneId, repoPath);
   if (!key) {
     return "";
   }
   try {
     const raw = window.localStorage.getItem(key);
     const parsed = raw ? JSON.parse(raw) : null;
+    const repoIdentity = normalizeRepoIdentity(repoPath);
+    if (parsed?.repoPath && normalizeRepoIdentity(parsed.repoPath) !== repoIdentity) {
+      return "";
+    }
     return typeof parsed?.path === "string" ? parsed.path : "";
   } catch {
     return "";
   }
 }
 
-function writeStoredBoardPath(workspaceId, paneId, boardPath) {
-  const key = storageKeyForPane(workspaceId, paneId);
+function writeStoredBoardPath(workspaceId, paneId, repoPath, boardPath) {
+  const key = storageKeyForPane(workspaceId, paneId, repoPath);
   if (!key) {
     return;
   }
   try {
     if (boardPath) {
-      window.localStorage.setItem(key, JSON.stringify({ path: boardPath }));
+      window.localStorage.setItem(key, JSON.stringify({
+        path: boardPath,
+        repoPath: normalizeRepoIdentity(repoPath),
+      }));
     } else {
       window.localStorage.removeItem(key);
     }
@@ -198,6 +215,18 @@ const PaneError = styled.div`
   line-height: 1.35;
 `;
 
+const CreatePickerWrap = styled.div`
+  min-width: 0;
+`;
+
+const CreateLabel = styled.div`
+  color: rgba(203, 213, 225, 0.78);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0;
+  text-transform: uppercase;
+`;
+
 export default function PcbWorkspacePane({
   controlCommand = null,
   createRequestNonce = 0,
@@ -210,6 +239,7 @@ export default function PcbWorkspacePane({
   workspaceId = "",
 }) {
   const [availableBoards, setAvailableBoards] = useState([]);
+  const [boardListReady, setBoardListReady] = useState(false);
   const [selectedBoardPath, setSelectedBoardPath] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -218,20 +248,45 @@ export default function PcbWorkspacePane({
   const createInputRef = useRef(null);
   const controlCommandSeenRef = useRef(0);
   const restoredKeyRef = useRef("");
+  const skipPersistForKeyRef = useRef("");
   const createRequestSeenRef = useRef(0);
   const refreshRequestSeenRef = useRef(0);
+  const boardListSeqRef = useRef(0);
+  const repoIdentity = useMemo(() => normalizeRepoIdentity(repoPath), [repoPath]);
+  const storageKey = useMemo(
+    () => storageKeyForPane(workspaceId, paneId, repoPath),
+    [paneId, repoPath, workspaceId],
+  );
 
   const refreshBoardList = useCallback(() => {
     if (!repoPath) {
+      boardListSeqRef.current += 1;
       setAvailableBoards([]);
-      return;
+      setBoardListReady(false);
+      return Promise.resolve([]);
     }
-    invoke("pcb_documents_list", { repoPath })
+    const requestSeq = boardListSeqRef.current + 1;
+    boardListSeqRef.current = requestSeq;
+    setBoardListReady(false);
+    return invoke("pcb_documents_list", { repoPath })
       .then((result) => {
-        setAvailableBoards(Array.isArray(result?.boards) ? result.boards : []);
+        if (boardListSeqRef.current !== requestSeq) {
+          return [];
+        }
+        const boards = Array.isArray(result?.boards) ? result.boards : [];
+        setAvailableBoards(boards);
+        setBoardListReady(true);
         setError("");
+        return boards;
       })
-      .catch((err) => setError(String(err)));
+      .catch((err) => {
+        if (boardListSeqRef.current !== requestSeq) {
+          return [];
+        }
+        setBoardListReady(false);
+        setError(String(err));
+        throw err;
+      });
   }, [repoPath]);
 
   useEffect(() => {
@@ -239,23 +294,58 @@ export default function PcbWorkspacePane({
       return;
     }
     invoke("pcb_watch_start", { repoPath }).catch(() => {});
-    refreshBoardList();
+    refreshBoardList().catch(() => {});
   }, [repoPath, refreshBoardList]);
 
   useEffect(() => {
-    const storageKey = storageKeyForPane(workspaceId, paneId);
     if (!storageKey || restoredKeyRef.current === storageKey) {
       return;
     }
     restoredKeyRef.current = storageKey;
-    setSelectedBoardPath(readStoredBoardPath(workspaceId, paneId));
-  }, [paneId, workspaceId]);
+    skipPersistForKeyRef.current = storageKey;
+    setSelectedBoardPath(readStoredBoardPath(workspaceId, paneId, repoPath));
+  }, [paneId, repoPath, storageKey, workspaceId]);
 
   useEffect(() => {
-    if (restoredKeyRef.current === storageKeyForPane(workspaceId, paneId)) {
-      writeStoredBoardPath(workspaceId, paneId, selectedBoardPath);
+    if (!storageKey || restoredKeyRef.current !== storageKey) {
+      return;
     }
-  }, [paneId, selectedBoardPath, workspaceId]);
+    if (skipPersistForKeyRef.current === storageKey) {
+      skipPersistForKeyRef.current = "";
+      return;
+    }
+    writeStoredBoardPath(workspaceId, paneId, repoPath, selectedBoardPath);
+  }, [paneId, repoPath, selectedBoardPath, storageKey, workspaceId]);
+
+  useEffect(() => {
+    if (!repoPath) {
+      return undefined;
+    }
+    let disposed = false;
+    let unlisten = () => {};
+    listen(PCB_STORE_CHANGED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const eventRepo = normalizeRepoIdentity(event?.payload?.repoPath);
+      if (eventRepo && eventRepo !== repoIdentity) {
+        return;
+      }
+      refreshBoardList().catch(() => {});
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [refreshBoardList, repoIdentity, repoPath]);
 
   const boardNameForPath = useCallback(
     (boardPath) => availableBoards.find((board) => board.path === boardPath)?.name || boardPath,
@@ -283,11 +373,54 @@ export default function PcbWorkspacePane({
     [availableBoards],
   );
 
+  useEffect(() => {
+    if (!boardListReady || !selectedBoardPath) {
+      return;
+    }
+    if (!availableBoards.some((board) => board.path === selectedBoardPath)) {
+      setSelectedBoardPath("");
+    }
+  }, [availableBoards, boardListReady, selectedBoardPath]);
+
+  const selectBoardPath = useCallback((boardPath, options = {}) => {
+    const cleanPath = String(boardPath || "").trim();
+    if (!cleanPath) {
+      return;
+    }
+    setError("");
+    if (options.refreshFirst) {
+      setBoardListReady(false);
+    }
+    setSelectedBoardPath(cleanPath);
+    if (options.closeChooser) {
+      setCreating(false);
+    }
+  }, []);
+
+  const selectBoardByName = useCallback((boardName, boards = availableBoards) => {
+    const cleanName = String(boardName || "").trim().toLowerCase();
+    if (!cleanName) {
+      return false;
+    }
+    const match = (Array.isArray(boards) ? boards : []).find((board) => (
+      String(board.name || "").trim().toLowerCase() === cleanName
+      || String(board.id || "").trim().toLowerCase() === cleanName
+      || String(board.path || "").trim().toLowerCase() === cleanName
+    ));
+    if (!match?.path) {
+      return false;
+    }
+    selectBoardPath(match.path, { closeChooser: true });
+    return true;
+  }, [availableBoards, selectBoardPath]);
+
   const openCreateBoard = useCallback((initialName = "") => {
     if (!repoPath || busy) {
       return;
     }
-    const cleanInitialName = String(initialName || "").trim();
+    const cleanInitialName = initialName && typeof initialName === "object"
+      ? ""
+      : String(initialName || "").trim();
     setError("");
     if (cleanInitialName) {
       setDraftName(cleanInitialName);
@@ -319,9 +452,10 @@ export default function PcbWorkspacePane({
     invoke("pcb_document_create", { repoPath, name: cleanName })
       .then((doc) => {
         if (doc?.path) {
+          setBoardListReady(false);
           setSelectedBoardPath(doc.path);
         }
-        refreshBoardList();
+        refreshBoardList().catch(() => {});
         setCreating(false);
         setDraftName("blinky");
       })
@@ -349,7 +483,7 @@ export default function PcbWorkspacePane({
       return;
     }
     refreshRequestSeenRef.current = nonce;
-    refreshBoardList();
+    refreshBoardList().catch(() => {});
   }, [refreshBoardList, refreshRequestNonce]);
 
   useEffect(() => {
@@ -368,17 +502,56 @@ export default function PcbWorkspacePane({
       }
       return;
     }
+    if (["select", "switch", "switch-board", "open-board", "open-existing"].includes(action)) {
+      const requestedPath = String(
+        controlCommand?.boardPath
+          || controlCommand?.board_path
+          || controlCommand?.path
+          || controlCommand?.filePath
+          || controlCommand?.file_path
+          || "",
+      ).trim();
+      if (requestedPath) {
+        selectBoardPath(requestedPath, { closeChooser: true, refreshFirst: true });
+        refreshBoardList().catch(() => {});
+        return;
+      }
+      const requestedName = String(
+        controlCommand?.boardName
+          || controlCommand?.board_name
+          || controlCommand?.name
+          || "",
+      ).trim();
+      if (requestedName) {
+        if (!selectBoardByName(requestedName)) {
+          refreshBoardList()
+            .then((boards) => {
+              if (!selectBoardByName(requestedName, boards)) {
+                setError(`Board "${requestedName}" was not found in this workspace.`);
+              }
+            })
+            .catch(() => {});
+        }
+        return;
+      }
+      setCreating(true);
+      return;
+    }
     if (action === "refresh" || action === "reload") {
-      refreshBoardList();
+      refreshBoardList().catch(() => {});
     }
-  }, [controlCommand, createBoardWithName, openCreateBoard, refreshBoardList]);
+  }, [
+    controlCommand,
+    createBoardWithName,
+    openCreateBoard,
+    refreshBoardList,
+    selectBoardByName,
+    selectBoardPath,
+  ]);
 
-  const selectBoardPath = useCallback((boardPath) => {
-    const cleanPath = String(boardPath || "").trim();
-    if (cleanPath) {
-      setSelectedBoardPath(cleanPath);
-    }
-  }, []);
+  const selectBoardFromPicker = useCallback((boardPath) => {
+    selectBoardPath(boardPath, { closeChooser: true });
+  }, [selectBoardPath]);
 
   return (
     <PaneSurface data-workspace-pcb-surface="true">
@@ -388,6 +561,7 @@ export default function PcbWorkspacePane({
             board={selectedBoard}
             embedded
             isActive={isActive}
+            key={`${repoIdentity}:${selectedBoard.path}`}
             repoPath={repoPath}
             showHeader={false}
           />
@@ -396,7 +570,7 @@ export default function PcbWorkspacePane({
             <EmptyCard>
               <EmptyTitle>PCB design</EmptyTitle>
               <EmptyHint>Create a board or open an existing design in this panel.</EmptyHint>
-              <PaneButton disabled={busy || !repoPath} onClick={openCreateBoard} type="button">
+              <PaneButton disabled={busy || !repoPath} onClick={() => openCreateBoard()} type="button">
                 + New board
               </PaneButton>
               <AppSelect
@@ -413,7 +587,19 @@ export default function PcbWorkspacePane({
         {creating ? (
           <CreateOverlay>
             <CreateCard as="form" onSubmit={submitCreateBoard}>
-              <EmptyTitle>New PCB board</EmptyTitle>
+              <EmptyTitle>PCB board</EmptyTitle>
+              <EmptyHint>Create a new board or switch to an existing design.</EmptyHint>
+              <CreateLabel>Existing boards</CreateLabel>
+              <CreatePickerWrap>
+                <AppSelect
+                  isDisabled={!availableBoards.length || busy}
+                  onChange={selectBoardFromPicker}
+                  options={boardOptions}
+                  placeholder={availableBoards.length ? "Switch board" : "No saved designs yet"}
+                  value={selectedBoardPath || null}
+                />
+              </CreatePickerWrap>
+              <CreateLabel>New board</CreateLabel>
               <CreateInput
                 aria-label="PCB board name"
                 disabled={busy}

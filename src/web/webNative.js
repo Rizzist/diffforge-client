@@ -179,6 +179,7 @@ export function useNativeWebview({
   url,
   visible = true,
   enabled = true,
+  layoutKey = "",
   parentWindowLabel,
   scopeParts,
   onNavigate,
@@ -416,6 +417,24 @@ export function useNativeWebview({
     scheduleFitBurst(labelRef.current, visible, { delays: [80, 180], frames: visible ? 3 : 2 });
   }, [fit, scheduleFitBurst, visible]);
 
+  // Native child webviews do not inherit CSS transforms from their DOM
+  // placeholders. Fullscreen/restore and grid reflow move the pane with
+  // transforms, so force-fit through those transitions and once they settle.
+  useEffect(() => {
+    if (!runtimeEnabled) {
+      return undefined;
+    }
+    const label = labelRef.current;
+    if (!label) {
+      return undefined;
+    }
+    fit(label, visibleRef.current, { force: true });
+    return scheduleFitBurst(label, visibleRef.current, {
+      delays: [0, 32, 80, 160, 240, 360],
+      frames: 18,
+    });
+  }, [fit, layoutKey, runtimeEnabled, scheduleFitBurst]);
+
   // Keep fitted on container/window resize, and re-show after a visibility flip
   // (e.g. when a pane drag ends) via a short rAF burst.
   useEffect(() => {
@@ -454,6 +473,55 @@ export function useNativeWebview({
       window.cancelAnimationFrame(frameHandle);
     };
   }, [fit, runtimeEnabled, viewportRef, visible]);
+
+  useEffect(() => {
+    if (!runtimeEnabled) {
+      return undefined;
+    }
+    const viewport = viewportRef.current;
+    if (!viewport) {
+      return undefined;
+    }
+    const targets = [
+      viewport,
+      viewport.closest("[data-workspace-web-surface]"),
+      viewport.closest("[data-terminal-surface-slot]"),
+    ].filter((target, index, list) => target && list.indexOf(target) === index);
+    if (!targets.length) {
+      return undefined;
+    }
+    const scheduleTransitionFit = () => {
+      const label = labelRef.current;
+      if (!label) {
+        return;
+      }
+      fit(label, visibleRef.current, { force: true });
+      scheduleFitBurst(label, visibleRef.current, {
+        delays: [0, 48, 120, 220, 360],
+        frames: 12,
+      });
+    };
+    const events = [
+      "animationend",
+      "animationstart",
+      "transitioncancel",
+      "transitionend",
+      "transitionrun",
+      "transitionstart",
+    ];
+    targets.forEach((target) => {
+      events.forEach((eventName) => {
+        target.addEventListener(eventName, scheduleTransitionFit);
+      });
+    });
+    return () => {
+      targets.forEach((target) => {
+        events.forEach((eventName) => {
+          target.removeEventListener(eventName, scheduleTransitionFit);
+        });
+      });
+    };
+  }, [fit, runtimeEnabled, scheduleFitBurst, viewportRef]);
 
   // Track page-load events for the current webview to drive status + navigations.
   useEffect(() => {

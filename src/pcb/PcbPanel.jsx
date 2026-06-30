@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -20,6 +20,11 @@ export const PCB_VIEW_TABS = [
 ];
 export const PCB_TABS = PCB_VIEW_TABS.map((tab) => tab.id);
 export const PCB_STORE_CHANGED_EVENT = "pcb-store-changed";
+const PCB_SET_ACTIVE_TAB_MESSAGE = "diffforge:pcb:set-active-tab";
+
+function normalizeRepoIdentity(repoPath) {
+  return String(repoPath || "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+}
 
 function normalizePcbTab(tab) {
   return PCB_TABS.includes(tab) ? tab : "pcb";
@@ -234,26 +239,55 @@ export default function PcbPanel({
   const [source, setSource] = useState(null);
   const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
+  const frameRef = useRef(null);
+  const readSeqRef = useRef(0);
   const srcDoc = useMemo(
-    () => (typeof source === "string" ? buildSrcDoc(activeTab, source) : ""),
-    [activeTab, source],
+    () => (typeof source === "string" ? buildSrcDoc(defaultTabId, source) : ""),
+    [defaultTabId, source],
   );
+
+  const sendActiveTabToFrame = useCallback((tab = activeTab) => {
+    const targetWindow = frameRef.current?.contentWindow;
+    if (!targetWindow) {
+      return;
+    }
+    targetWindow.postMessage({
+      source: "diffforge-pcb-panel",
+      tab: normalizePcbTab(tab),
+      type: PCB_SET_ACTIVE_TAB_MESSAGE,
+    }, "*");
+  }, [activeTab]);
 
   useEffect(() => {
     setActiveTab(defaultTabId);
   }, [boardPath, defaultTabId]);
 
+  useEffect(() => {
+    if (typeof source !== "string") {
+      return;
+    }
+    sendActiveTabToFrame(activeTab);
+  }, [activeTab, sendActiveTabToFrame, source]);
+
   const readSource = useCallback(() => {
+    const readSeq = readSeqRef.current + 1;
+    readSeqRef.current = readSeq;
     if (!repoPath || !boardPath) {
       return;
     }
     invoke("pcb_document_read", { repoPath, boardPath })
       .then((doc) => {
+        if (readSeqRef.current !== readSeq) {
+          return;
+        }
         setSource(typeof doc?.source === "string" ? doc.source : "");
         setStatus("ready");
         setError("");
       })
       .catch((err) => {
+        if (readSeqRef.current !== readSeq) {
+          return;
+        }
         setError(String(err));
         setStatus("error");
       });
@@ -274,6 +308,10 @@ export default function PcbPanel({
     let cancelled = false;
     listen(PCB_STORE_CHANGED_EVENT, (event) => {
       const paths = event?.payload?.paths;
+      const eventRepo = normalizeRepoIdentity(event?.payload?.repoPath);
+      if (eventRepo && eventRepo !== normalizeRepoIdentity(repoPath)) {
+        return;
+      }
       if (Array.isArray(paths) && paths.includes(boardPath)) {
         readSource();
       }
@@ -348,6 +386,8 @@ export default function PcbPanel({
           <PanelMessage>Loading board…</PanelMessage>
         ) : (
           <BoardFrame
+            onLoad={() => sendActiveTabToFrame(activeTab)}
+            ref={frameRef}
             sandbox="allow-scripts allow-same-origin allow-downloads allow-popups"
             srcDoc={srcDoc}
             title={`PCB board ${board?.name || ""}`}

@@ -20,9 +20,6 @@ import {
   TERMINAL_SUBMIT_DIAGNOSTIC_SNAPSHOT_REQUEST_EVENT,
   TODO_DRAG_MIME,
   WORKSPACE_TERMINAL_PANE_PREFIX,
-  WORKSPACE_TERMINAL_PRIMARY_COLUMNS,
-  WORKSPACE_TERMINAL_WIDE_COLUMNS,
-  WORKSPACE_TERMINAL_WIDE_START_INDEX,
   WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT,
   getTerminalAgentKind,
   logThreadBridgeDiagnostic,
@@ -160,34 +157,28 @@ export function getTerminalPanelRows(terminalIndexes) {
     ? terminalIndexes
     : getDefaultTerminalIndexes(terminalIndexes);
   const visibleIndexes = indexes.length ? indexes : getDefaultTerminalIndexes(MIN_WORKSPACE_TERMINAL_COUNT);
-  const rows = new Map();
+  const rowCount = Math.max(1, Math.ceil(visibleIndexes.length / 3));
+  const baseRowSize = Math.floor(visibleIndexes.length / rowCount);
+  const largerRowCount = visibleIndexes.length % rowCount;
+  const rows = [];
+  let indexCursor = 0;
 
-  visibleIndexes.forEach((terminalIndex) => {
-    const safeIndex = Math.max(0, Number.parseInt(terminalIndex, 10) || 0);
-    const isPrimarySlot = safeIndex < WORKSPACE_TERMINAL_WIDE_START_INDEX;
-    const rowIndex = isPrimarySlot
-      ? Math.floor(safeIndex / WORKSPACE_TERMINAL_PRIMARY_COLUMNS)
-      : Math.floor(WORKSPACE_TERMINAL_WIDE_START_INDEX / WORKSPACE_TERMINAL_PRIMARY_COLUMNS)
-        + Math.floor((safeIndex - WORKSPACE_TERMINAL_WIDE_START_INDEX) / WORKSPACE_TERMINAL_WIDE_COLUMNS);
-    const columnIndex = isPrimarySlot
-      ? safeIndex % WORKSPACE_TERMINAL_PRIMARY_COLUMNS
-      : (safeIndex - WORKSPACE_TERMINAL_WIDE_START_INDEX) % WORKSPACE_TERMINAL_WIDE_COLUMNS;
+  for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+    const rowSize = baseRowSize + (rowIndex < largerRowCount ? 1 : 0);
+    const rowIndexes = visibleIndexes
+      .slice(indexCursor, indexCursor + rowSize)
+      .map((terminalIndex) => Math.max(0, Number.parseInt(terminalIndex, 10) || 0));
 
-    if (!rows.has(rowIndex)) {
-      rows.set(rowIndex, []);
+    if (rowIndexes.length) {
+      rows.push({
+        rowIndex: rows.length,
+        terminalIndexes: rowIndexes,
+      });
     }
+    indexCursor += rowSize;
+  }
 
-    rows.get(rowIndex).push({ columnIndex, terminalIndex: safeIndex });
-  });
-
-  return Array.from(rows.entries())
-    .sort(([leftRow], [rightRow]) => leftRow - rightRow)
-    .map(([rowIndex, rowTerminals]) => ({
-      rowIndex,
-      terminalIndexes: rowTerminals
-        .sort((left, right) => left.columnIndex - right.columnIndex)
-        .map(({ terminalIndex }) => terminalIndex),
-    }));
+  return rows;
 }
 
 export function normalizeTerminalDimension(value, fallback, minimum, maximum) {

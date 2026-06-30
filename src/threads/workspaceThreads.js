@@ -7061,6 +7061,62 @@ export function archiveWorkspaceThread(state, workspaceId, threadId) {
   };
 }
 
+export function deleteWorkspaceThread(state, workspaceId, threadId) {
+  const safeWorkspaceId = cleanText(workspaceId);
+  const safeThreadId = cleanText(threadId);
+  if (!safeWorkspaceId || !safeThreadId) {
+    return state || {};
+  }
+
+  const currentState = getWorkspaceThreadsStateObject(state);
+  const sourceEntry = currentState[safeWorkspaceId];
+  const entry = sourceEntry ? cloneWorkspaceEntryForMutation(sourceEntry, safeWorkspaceId) : null;
+  if (!entry) {
+    return state || {};
+  }
+
+  const activeThread = entry.threads[safeThreadId];
+  const archivedThread = entry.archivedThreads[safeThreadId];
+  if (!activeThread && !archivedThread) {
+    return state || {};
+  }
+
+  delete entry.threads[safeThreadId];
+  delete entry.archivedThreads[safeThreadId];
+  forgetThreadEverywhere(entry, safeThreadId);
+  entry.threadOrder = entry.threadOrder.filter((candidateId) => candidateId !== safeThreadId);
+  entry.archivedThreadOrder = entry.archivedThreadOrder
+    .filter((candidateId) => candidateId !== safeThreadId);
+  Object.entries(entry.terminals).forEach(([terminalKey, terminal]) => {
+    if (terminal.threadId === safeThreadId) {
+      entry.terminals[terminalKey] = {
+        ...terminal,
+        threadId: "",
+        updatedAt: nowIso(),
+      };
+    }
+  });
+  if (entry.activeThreadId === safeThreadId) {
+    entry.activeThreadId = entry.threadOrder[0] || "";
+  }
+  if (entry.threadsView?.selectedThreadId === safeThreadId) {
+    entry.threadsView = {
+      ...normalizeThreadsViewState(entry.threadsView, {
+        selectedThreadId: entry.activeThreadId,
+        selectedWorkspaceId: safeWorkspaceId,
+      }),
+      newChatActive: false,
+      selectedThreadId: entry.activeThreadId || "",
+      selectedWorkspaceId: safeWorkspaceId,
+    };
+  }
+
+  return {
+    ...currentState,
+    [safeWorkspaceId]: entry,
+  };
+}
+
 export function toggleWorkspaceThreadPinned(state, workspaceId, threadId) {
   const safeWorkspaceId = cleanText(workspaceId);
   const safeThreadId = cleanText(threadId);

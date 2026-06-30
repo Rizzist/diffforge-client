@@ -154,10 +154,14 @@ async fn tokenomics_get_summary(app: AppHandle) -> Result<Value, String> {
 }
 
 #[tauri::command]
-async fn tokenomics_get_live_limits(app: AppHandle) -> Result<Value, String> {
+async fn tokenomics_get_live_limits(
+    app: AppHandle,
+    force_provider_refresh: Option<bool>,
+) -> Result<Value, String> {
+    let force_provider_refresh = force_provider_refresh.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
         let _span = BackendCpuSpan::new("tokenomics.command.get_live_limits");
-        tokenomics_cached_live_limits_for(&app)
+        tokenomics_cached_live_limits_for(&app, force_provider_refresh)
     })
     .await
     .map_err(|error| format!("Unable to join Tokenomics live limits: {error}"))?
@@ -880,7 +884,14 @@ fn tokenomics_ensure_column(
 }
 
 fn tokenomics_live_limits_snapshot_from_conn(conn: &rusqlite::Connection) -> Result<Value, String> {
-    let mut limits = tokenomics_provider_limits(conn, false, false, false)?;
+    tokenomics_live_limits_snapshot_from_conn_with_options(conn, false)
+}
+
+fn tokenomics_live_limits_snapshot_from_conn_with_options(
+    conn: &rusqlite::Connection,
+    force_provider_refresh: bool,
+) -> Result<Value, String> {
+    let mut limits = tokenomics_provider_limits(conn, false, false, force_provider_refresh, false)?;
     tokenomics_apply_provider_limit_sample_pacing(conn, &mut limits)?;
     let scan_index = tokenomics_scan_index_status(conn)?;
     Ok(json!({
@@ -1626,19 +1637,27 @@ fn tokenomics_cached_read_only_summary_for(
     Ok(summary)
 }
 
-fn tokenomics_cached_live_limits_for(app: &AppHandle) -> Result<Value, String> {
-    if let Ok(cache) = tokenomics_live_limits_cache().lock() {
-        if let Some(entry) = cache.as_ref() {
-            if entry.cached_at.elapsed()
-                < Duration::from_millis(TOKENOMICS_LIVE_LIMITS_CACHE_TTL_MS)
-            {
-                return Ok(entry.summary.clone());
+fn tokenomics_cached_live_limits_for(
+    app: &AppHandle,
+    force_provider_refresh: bool,
+) -> Result<Value, String> {
+    if !force_provider_refresh {
+        if let Ok(cache) = tokenomics_live_limits_cache().lock() {
+            if let Some(entry) = cache.as_ref() {
+                if entry.cached_at.elapsed()
+                    < Duration::from_millis(TOKENOMICS_LIVE_LIMITS_CACHE_TTL_MS)
+                {
+                    return Ok(entry.summary.clone());
+                }
             }
         }
     }
 
     let conn = tokenomics_open_db(app)?;
-    let summary = tokenomics_live_limits_snapshot_from_conn(&conn)?;
+    let summary = tokenomics_live_limits_snapshot_from_conn_with_options(
+        &conn,
+        force_provider_refresh,
+    )?;
     if let Ok(mut cache) = tokenomics_live_limits_cache().lock() {
         *cache = Some(TokenomicsLiveLimitsCacheEntry {
             cached_at: Instant::now(),
@@ -1709,7 +1728,7 @@ fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String
     // include_stale_provider_cache = false -> only stamp freshly observed %s
     //   (failed fetches yield unknown rows that the recorders skip).
     // reconcile_accounts = true -> keep provider-account identity current.
-    let mut limits = tokenomics_provider_limits(&conn, false, false, true)?;
+    let mut limits = tokenomics_provider_limits(&conn, false, false, false, true)?;
     let recorded_samples = tokenomics_record_provider_limit_samples(&conn, &limits)?;
     tokenomics_apply_provider_limit_sample_pacing(&conn, &mut limits)?;
     let recorded_windows = tokenomics_record_latest_windows(&conn, &limits)?;
@@ -10035,7 +10054,7 @@ fn tokenomics_sync_delta_from_conn_with_limit_sampling(
         .filter(|value| !value.is_empty());
     tokenomics_refresh_provider_accounts_from_usage(conn)?;
     let hourly = tokenomics_account_hourly_sync_rollups(conn, clean_since, scope_filter)?;
-    let mut limits = tokenomics_provider_limits(conn, false, false, true)?;
+    let mut limits = tokenomics_provider_limits(conn, false, false, false, true)?;
     if record_limit_samples {
         let _ = tokenomics_record_provider_limit_samples(conn, &limits);
     }
@@ -11804,6 +11823,7 @@ fn tokenomics_provider_limits(
     conn: &rusqlite::Connection,
     include_cloud_last_known: bool,
     include_stale_provider_cache: bool,
+    force_provider_refresh: bool,
     reconcile_accounts: bool,
 ) -> Result<Vec<Value>, String> {
     let mut limits = Vec::new();
@@ -11816,6 +11836,7 @@ fn tokenomics_provider_limits(
         &codex_plan,
         &codex_account,
         include_stale_provider_cache,
+        force_provider_refresh,
     ) {
         let codex_account = if reconcile_accounts {
             tokenomics_reconcile_codex_provider_account_from_usage(
@@ -11896,6 +11917,7 @@ fn tokenomics_provider_limits(
             &profile_plan,
             &profile_account,
             include_stale_provider_cache,
+            force_provider_refresh,
         ) {
             let profile_account = if reconcile_accounts {
                 tokenomics_reconcile_codex_provider_account_from_usage(
@@ -11925,7 +11947,12 @@ fn tokenomics_provider_limits(
     let claude_account = tokenomics_provider_account("anthropic", "claude");
     let _ = tokenomics_ensure_claude_statusline_collector(&claude_plan);
     if let Some(claude_usage) =
-        tokenomics_claude_live_usage(conn, &claude_account, include_stale_provider_cache)
+        tokenomics_claude_live_usage(
+            conn,
+            &claude_account,
+            include_stale_provider_cache,
+            force_provider_refresh,
+        )
     {
         let mut claude_limits =
             tokenomics_claude_live_limit_snapshots(&claude_plan, &claude_usage, &claude_account);
@@ -11996,6 +12023,7 @@ fn tokenomics_provider_limits(
             &access_token,
             &profile_account,
             include_stale_provider_cache,
+            force_provider_refresh,
         ) {
             let mut profile_limits = tokenomics_claude_live_limit_snapshots(
                 &profile_plan,
@@ -12430,6 +12458,7 @@ fn tokenomics_codex_live_usage(
     plan: &Value,
     provider_account: &TokenomicsProviderAccount,
     allow_stale_cache: bool,
+    force_provider_refresh: bool,
 ) -> Option<Value> {
     let access_token = plan
         .get("access_token")
@@ -12438,13 +12467,15 @@ fn tokenomics_codex_live_usage(
         .filter(|value| !value.is_empty())?;
     let cache_key = tokenomics_codex_usage_cache_key(provider_account);
     let now_unix = tokenomics_unix_now();
-    if let Ok(Some(cached)) = tokenomics_cached_codex_usage(
-        conn,
-        &cache_key,
-        now_unix,
-        TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS,
-    ) {
-        return Some(cached);
+    if !force_provider_refresh {
+        if let Ok(Some(cached)) = tokenomics_cached_codex_usage(
+            conn,
+            &cache_key,
+            now_unix,
+            TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS,
+        ) {
+            return Some(cached);
+        }
     }
     let fetched = tokenomics_fetch_codex_live_usage(access_token);
     if let Some(mut usage) = fetched {
@@ -12538,6 +12569,7 @@ fn tokenomics_claude_live_usage(
     conn: &rusqlite::Connection,
     provider_account: &TokenomicsProviderAccount,
     allow_stale_cache: bool,
+    force_provider_refresh: bool,
 ) -> Option<Value> {
     let access_token = tokenomics_claude_access_token()?;
     tokenomics_claude_live_usage_with_token(
@@ -12545,6 +12577,7 @@ fn tokenomics_claude_live_usage(
         &access_token,
         provider_account,
         allow_stale_cache,
+        force_provider_refresh,
     )
 }
 
@@ -12556,16 +12589,19 @@ fn tokenomics_claude_live_usage_with_token(
     access_token: &str,
     provider_account: &TokenomicsProviderAccount,
     allow_stale_cache: bool,
+    force_provider_refresh: bool,
 ) -> Option<Value> {
     let cache_key = tokenomics_claude_usage_cache_key(provider_account);
     let now_unix = tokenomics_unix_now();
-    if let Ok(Some(cached)) = tokenomics_cached_claude_usage(
-        conn,
-        &cache_key,
-        now_unix,
-        TOKENOMICS_CLAUDE_USAGE_CACHE_TTL_SECS,
-    ) {
-        return Some(cached);
+    if !force_provider_refresh {
+        if let Ok(Some(cached)) = tokenomics_cached_claude_usage(
+            conn,
+            &cache_key,
+            now_unix,
+            TOKENOMICS_CLAUDE_USAGE_CACHE_TTL_SECS,
+        ) {
+            return Some(cached);
+        }
     }
     let fetched = tokenomics_fetch_claude_live_usage(access_token);
     if let Some(mut usage) = fetched {

@@ -17780,6 +17780,7 @@ fn cloud_mcp_apply_remote_workspace_lever(
                     None,
                     Some("remote_control_headless".to_string()),
                     Some(workspace_id.clone()),
+                    Some(true),
                 )
                 .await;
                 let (status, message) = match result {
@@ -29425,6 +29426,9 @@ async fn cloud_mcp_delete_workspace(
         return Err("Workspace delete requires a workspace id.".to_string());
     }
     let deleted_ledger_inserted = cloud_mcp_remember_deleted_workspace_id(&workspace_id)?;
+    let purged_todo_mirror_rows = cloud_mcp_todo_mirror_purge_workspace(&workspace_id).unwrap_or(0);
+    let purged_agent_chat_sync_rows =
+        cloud_mcp_agent_chat_purge_workspace_local_sync_state(&workspace_id).unwrap_or(0);
 
     let root = resolve_workspace_root_directory(Some(&repo_path))?;
     let root_display = workspace_path_display(&root);
@@ -29523,19 +29527,9 @@ async fn cloud_mcp_delete_workspace(
         "ts_ms": cloud_mcp_now_ms(),
     });
 
-    let workspace_unregister_response = match cloud_mcp_ws_request_with_timeout(
-        state.inner(),
-        "workspace_unregister",
-        &payload,
-        Duration::from_secs(5),
-    )
-    .await
-    {
-        Ok(response) => json!({"ok": true, "response": response}),
-        Err(error) => json!({"ok": false, "error": error}),
-    };
-    cloud_mcp_publish_device_live_state_snapshot(state.inner(), "workspace_deleted").await;
-
+    let _ = state
+        .global_ws_events
+        .send(cloud_mcp_event_envelope("workspace_deleted", &payload));
     let response =
         cloud_mcp_post_event_endpoint(state.inner(), "workspace_deleted", &payload).await?;
     Ok(json!({
@@ -29547,7 +29541,119 @@ async fn cloud_mcp_delete_workspace(
         "removedMcpSnapshots": removed_mcp_snapshots,
         "removedCatalogSnapshots": removed_catalog_snapshots,
         "deletedWorkspaceSuppressed": deleted_ledger_inserted,
-        "workspaceUnregister": workspace_unregister_response,
+        "todoMirrorRowsPurged": purged_todo_mirror_rows,
+        "agentChatSyncRowsPurged": purged_agent_chat_sync_rows,
+        "serverResponse": response,
+    }))
+}
+
+#[tauri::command]
+async fn cloud_mcp_delete_agent_chat_session(
+    state: State<'_, CloudMcpState>,
+    workspace_id: String,
+    workspace_name: Option<String>,
+    provider: String,
+    provider_session_id: String,
+    agent_chat_session_id: Option<String>,
+    thread_id: Option<String>,
+    pane_id: Option<String>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    let workspace_id = workspace_id.trim().to_string();
+    if workspace_id.is_empty() {
+        return Err("Agent chat session delete requires a workspace id.".to_string());
+    }
+    let provider = provider.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if provider.is_empty() {
+        return Err("Agent chat session delete requires a provider.".to_string());
+    }
+    let provider_session_id = provider_session_id.trim().to_string();
+    let agent_chat_session_id = agent_chat_session_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default();
+    if provider_session_id.is_empty() && agent_chat_session_id.is_empty() {
+        return Err(
+            "Agent chat session delete requires a provider session id or cloud session id."
+                .to_string(),
+        );
+    }
+
+    let local_sync_rows =
+        cloud_mcp_agent_chat_purge_local_sync_state(
+            &workspace_id,
+            &provider,
+            &provider_session_id,
+            &agent_chat_session_id,
+        )
+        .unwrap_or(0);
+    let purged_mirror_rows = cloud_mcp_todo_mirror_purge_agent_chat_session(
+        &workspace_id,
+        &provider_session_id,
+        &agent_chat_session_id,
+    )
+    .unwrap_or(0);
+
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "agent_chat_session_delete".to_string());
+    let payload = json!({
+        "source": "rust-diffforge-agent-chat-session-delete",
+        "event_kind": "agent_chat_session_deleted",
+        "workspace_id": workspace_id,
+        "workspaceId": workspace_id,
+        "workspace_name": workspace_name.clone().unwrap_or_default(),
+        "workspaceName": workspace_name.unwrap_or_default(),
+        "provider": provider,
+        "agent_kind": provider,
+        "agentKind": provider,
+        "provider_session_id": provider_session_id,
+        "providerSessionId": provider_session_id,
+        "native_session_id": provider_session_id,
+        "nativeSessionId": provider_session_id,
+        "session_id": provider_session_id,
+        "sessionId": provider_session_id,
+        "agent_chat_session_id": agent_chat_session_id,
+        "agentChatSessionId": agent_chat_session_id,
+        "thread_id": thread_id.clone().unwrap_or_default(),
+        "threadId": thread_id.unwrap_or_default(),
+        "pane_id": pane_id.clone().unwrap_or_default(),
+        "paneId": pane_id.unwrap_or_default(),
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "deviceId": device_profile["device_id"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machineId": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "deviceName": device_profile["device_name"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "clientKind": device_profile["client_kind"].clone(),
+        "rust_authoritative": true,
+        "rustAuthoritative": true,
+        "delete_mode": "purge",
+        "deleteMode": "purge",
+        "reason": reason,
+        "summary": "Desktop agent chat session deleted from Diff Forge.",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+
+    let _ = state.global_ws_events.send(cloud_mcp_event_envelope(
+        "agent_chat_session_deleted",
+        &payload,
+    ));
+    let response =
+        cloud_mcp_post_event_endpoint(state.inner(), "agent_chat_session_deleted", &payload)
+            .await?;
+    Ok(json!({
+        "ok": true,
+        "workspaceId": payload["workspace_id"].clone(),
+        "provider": payload["provider"].clone(),
+        "providerSessionId": payload["provider_session_id"].clone(),
+        "agentChatSessionId": payload["agent_chat_session_id"].clone(),
+        "localSyncRowsPurged": local_sync_rows,
+        "todoMirrorRowsPurged": purged_mirror_rows,
         "serverResponse": response,
     }))
 }
@@ -37602,11 +37708,410 @@ fn cloud_mcp_todo_mirror_purge_workspace(workspace_id: &str) -> Result<usize, St
         .map_err(|error| format!("Unable to purge todo mirror rows for workspace: {error}"))?;
     removed += conn
         .execute(
+            "DELETE FROM workspace_todo_history_rows
+             WHERE workspace_id=?1 OR origin_workspace_id=?1 OR target_workspace_id=?1",
+            rusqlite::params![workspace_id],
+        )
+        .map_err(|error| format!("Unable to purge todo history rows for workspace: {error}"))?;
+    removed += conn
+        .execute(
             "DELETE FROM workspace_todo_mirror_snapshots WHERE workspace_id=?1",
             rusqlite::params![workspace_id],
         )
         .map_err(|error| format!("Unable to purge todo mirror snapshots for workspace: {error}"))?;
     Ok(removed)
+}
+
+fn cloud_mcp_json_contains_text(value: &Value, needle: &str) -> bool {
+    let needle = needle.trim();
+    if needle.is_empty() {
+        return false;
+    }
+    match value {
+        Value::String(text) => text.trim() == needle,
+        Value::Array(items) => items
+            .iter()
+            .any(|item| cloud_mcp_json_contains_text(item, needle)),
+        Value::Object(object) => object
+            .values()
+            .any(|item| cloud_mcp_json_contains_text(item, needle)),
+        _ => false,
+    }
+}
+
+fn cloud_mcp_supersede_workspace_outbox_rows(
+    conn: &rusqlite::Connection,
+    workspace_id: &str,
+    now: i64,
+) -> Result<usize, String> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Ok(0);
+    }
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT outbox_id, payload_json
+             FROM {CLOUD_MCP_OUTBOX_TABLE}
+             WHERE status IN ('queued', 'retrying', 'in_flight', 'dead_letter')
+               AND event_kind IN (
+                 'todo.live_state',
+                 'device_live_state_snapshot',
+                 'device_workspaces_snapshot',
+                 'workspace_registration',
+                 'workspace_registered',
+                 'workspace_synced',
+                 ?1
+               )"
+        ))
+        .map_err(|error| format!("Unable to inspect pending workspace outbox rows: {error}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("Unable to scan pending workspace outbox rows: {error}"))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    drop(statement);
+
+    let mut updated = 0usize;
+    for (outbox_id, payload_json) in rows {
+        let matches_workspace = serde_json::from_str::<Value>(&payload_json)
+            .ok()
+            .map(|value| cloud_mcp_json_contains_text(&value, workspace_id))
+            .unwrap_or_else(|| payload_json.contains(workspace_id));
+        if !matches_workspace {
+            continue;
+        }
+        updated += conn
+            .execute(
+                &format!(
+                    "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+                     SET status='superseded',
+                         last_error='workspace_deleted',
+                         updated_at_ms=?1
+                     WHERE outbox_id=?2
+                       AND status IN ('queued', 'retrying', 'in_flight', 'dead_letter')"
+                ),
+                rusqlite::params![now, outbox_id],
+            )
+            .map_err(|error| {
+                format!("Unable to supersede pending workspace outbox row: {error}")
+            })?;
+    }
+    Ok(updated)
+}
+
+fn cloud_mcp_supersede_agent_chat_session_todo_outbox_rows(
+    conn: &rusqlite::Connection,
+    workspace_id: &str,
+    _provider: &str,
+    session_id: &str,
+    agent_chat_session_id: &str,
+    now: i64,
+) -> Result<usize, String> {
+    let workspace_id = workspace_id.trim();
+    let session_id = session_id.trim();
+    let agent_chat_session_id = agent_chat_session_id.trim();
+    if workspace_id.is_empty() || (session_id.is_empty() && agent_chat_session_id.is_empty()) {
+        return Ok(0);
+    }
+    let identities = [session_id, agent_chat_session_id]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT outbox_id, payload_json
+             FROM {CLOUD_MCP_OUTBOX_TABLE}
+             WHERE status IN ('queued', 'retrying', 'in_flight', 'dead_letter')
+               AND event_kind IN (
+                 'todo.live_state',
+                 'workspace_todo_snapshot',
+                 'workspace_todo_upserted',
+                 'workspace_todo_dispatch_requested',
+                 'workspace_todo_dispatch_status',
+                 'workspace_todo_batch_dispatched'
+               )"
+        ))
+        .map_err(|error| {
+            format!("Unable to inspect pending session todo outbox rows: {error}")
+        })?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|error| format!("Unable to scan pending session todo outbox rows: {error}"))?
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>();
+    drop(statement);
+
+    let mut updated = 0usize;
+    for (outbox_id, payload_json) in rows {
+        let matches_session = serde_json::from_str::<Value>(&payload_json)
+            .ok()
+            .map(|value| {
+                cloud_mcp_json_contains_text(&value, workspace_id)
+                    && identities
+                        .iter()
+                        .any(|identity| cloud_mcp_json_contains_text(&value, identity))
+            })
+            .unwrap_or_else(|| {
+                payload_json.contains(workspace_id)
+                    && identities
+                        .iter()
+                        .any(|identity| payload_json.contains(identity))
+            });
+        if !matches_session {
+            continue;
+        }
+        updated += conn
+            .execute(
+                &format!(
+                    "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+                     SET status='superseded',
+                         last_error='agent_chat_session_deleted',
+                         updated_at_ms=?1
+                     WHERE outbox_id=?2
+                       AND status IN ('queued', 'retrying', 'in_flight', 'dead_letter')"
+                ),
+                rusqlite::params![now, outbox_id],
+            )
+            .map_err(|error| {
+                format!("Unable to supersede pending session todo outbox row: {error}")
+            })?;
+    }
+    Ok(updated)
+}
+
+fn cloud_mcp_todo_mirror_purge_agent_chat_session(
+    workspace_id: &str,
+    provider_session_id: &str,
+    agent_chat_session_id: &str,
+) -> Result<usize, String> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Ok(0);
+    }
+    let identities = [provider_session_id.trim(), agent_chat_session_id.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    if identities.is_empty() {
+        return Ok(0);
+    }
+
+    let conn = cloud_mcp_open_todo_mirror_conn()?;
+    let mut removed = 0usize;
+    for table in [
+        CLOUD_MCP_TODO_MIRROR_ROWS_TABLE,
+        CLOUD_MCP_TODO_HISTORY_ROWS_TABLE,
+    ] {
+        let mut statement = conn
+            .prepare(&format!(
+                "SELECT key, row_json
+                 FROM {table}
+                 WHERE workspace_id=?1 OR origin_workspace_id=?1 OR target_workspace_id=?1"
+            ))
+            .map_err(|error| format!("Unable to read todo mirror rows for session purge: {error}"))?;
+        let rows = statement
+            .query_map(rusqlite::params![workspace_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                format!("Unable to scan todo mirror rows for session purge: {error}")
+            })?
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        drop(statement);
+
+        for (key, row_json) in rows {
+            let matches_session = serde_json::from_str::<Value>(&row_json)
+                .ok()
+                .map(|value| {
+                    identities
+                        .iter()
+                        .any(|identity| cloud_mcp_json_contains_text(&value, identity))
+                })
+                .unwrap_or_else(|| identities.iter().any(|identity| row_json.contains(identity)));
+            if !matches_session {
+                continue;
+            }
+            removed += conn
+                .execute(
+                    &format!("DELETE FROM {table} WHERE key=?1"),
+                    rusqlite::params![key],
+                )
+                .map_err(|error| {
+                    format!("Unable to delete todo mirror row for session purge: {error}")
+                })?;
+        }
+    }
+    Ok(removed)
+}
+
+fn cloud_mcp_agent_chat_purge_local_sync_state(
+    workspace_id: &str,
+    provider: &str,
+    session_id: &str,
+    agent_chat_session_id: &str,
+) -> Result<usize, String> {
+    let workspace_id = workspace_id.trim();
+    let provider = provider.trim();
+    let session_id = session_id.trim();
+    let agent_chat_session_id = agent_chat_session_id.trim();
+    if workspace_id.is_empty()
+        || provider.is_empty()
+        || (session_id.is_empty() && agent_chat_session_id.is_empty())
+    {
+        return Ok(0);
+    }
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let now = cloud_mcp_now_ms() as i64;
+    conn.execute_batch("BEGIN IMMEDIATE")
+        .map_err(|error| format!("Unable to start agent chat purge transaction: {error}"))?;
+    let result = (|| -> Result<usize, String> {
+        let mut removed = 0usize;
+        if !session_id.is_empty() {
+            removed += conn
+                .execute(
+                    &format!(
+                        "DELETE FROM {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}
+                         WHERE workspace_id=?1 AND provider=?2 AND session_id=?3"
+                    ),
+                    rusqlite::params![workspace_id, provider, session_id],
+                )
+                .map_err(|error| format!("Unable to clear agent chat record sync state: {error}"))?;
+            removed += conn
+                .execute(
+                    &format!(
+                        "DELETE FROM {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}
+                         WHERE workspace_id=?1 AND provider=?2 AND session_id=?3"
+                    ),
+                    rusqlite::params![workspace_id, provider, session_id],
+                )
+                .map_err(|error| {
+                    format!("Unable to clear agent chat session sync state: {error}")
+                })?;
+        }
+        removed += conn
+            .execute(
+                &format!(
+                    "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+                     SET status='superseded',
+                         last_error='agent_chat_session_deleted',
+                         updated_at_ms=?1
+                     WHERE event_kind=?2
+                       AND status IN ('queued', 'retrying', 'in_flight', 'dead_letter')
+                       AND COALESCE(json_extract(payload_json, '$.workspace_id'), json_extract(payload_json, '$.workspaceId'), '')=?3
+                       AND COALESCE(json_extract(payload_json, '$.provider'), json_extract(payload_json, '$.agent_kind'), json_extract(payload_json, '$.agentKind'), '')=?4
+                       AND (
+                         (?5<>'' AND COALESCE(json_extract(payload_json, '$.session_id'), json_extract(payload_json, '$.sessionId'), json_extract(payload_json, '$.provider_session_id'), json_extract(payload_json, '$.providerSessionId'), '')=?5)
+                         OR (?6<>'' AND COALESCE(json_extract(payload_json, '$.agent_chat_session_id'), json_extract(payload_json, '$.agentChatSessionId'), '')=?6)
+                       )"
+                ),
+                rusqlite::params![
+                    now,
+                    CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT,
+                    workspace_id,
+                    provider,
+                    session_id,
+                    agent_chat_session_id
+                ],
+            )
+            .map_err(|error| {
+                format!("Unable to supersede pending agent chat session sync rows: {error}")
+            })?;
+        removed += cloud_mcp_supersede_agent_chat_session_todo_outbox_rows(
+            &conn,
+            workspace_id,
+            provider,
+            session_id,
+            agent_chat_session_id,
+            now,
+        )?;
+        Ok(removed)
+    })();
+    match result {
+        Ok(removed) => {
+            conn.execute_batch("COMMIT")
+                .map_err(|error| format!("Unable to commit agent chat purge transaction: {error}"))?;
+            Ok(removed)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn cloud_mcp_agent_chat_purge_workspace_local_sync_state(
+    workspace_id: &str,
+) -> Result<usize, String> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Ok(0);
+    }
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let now = cloud_mcp_now_ms() as i64;
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|error| {
+        format!("Unable to start workspace agent chat purge transaction: {error}")
+    })?;
+    let result = (|| -> Result<usize, String> {
+        let mut removed = conn
+            .execute(
+                &format!(
+                    "DELETE FROM {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}
+                     WHERE workspace_id=?1"
+                ),
+                rusqlite::params![workspace_id],
+            )
+            .map_err(|error| {
+                format!("Unable to clear workspace agent chat record sync state: {error}")
+            })?;
+        removed += conn
+            .execute(
+                &format!(
+                    "DELETE FROM {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}
+                     WHERE workspace_id=?1"
+                ),
+                rusqlite::params![workspace_id],
+            )
+            .map_err(|error| {
+                format!("Unable to clear workspace agent chat session sync state: {error}")
+            })?;
+        removed += conn
+            .execute(
+                &format!(
+                    "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+                     SET status='superseded',
+                         last_error='workspace_deleted',
+                         updated_at_ms=?1
+                     WHERE event_kind=?2
+                       AND status IN ('queued', 'retrying', 'in_flight', 'dead_letter')
+                       AND COALESCE(json_extract(payload_json, '$.workspace_id'), json_extract(payload_json, '$.workspaceId'), '')=?3"
+                ),
+                rusqlite::params![now, CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT, workspace_id],
+            )
+            .map_err(|error| {
+                format!("Unable to supersede pending workspace agent chat sync rows: {error}")
+            })?;
+        removed += cloud_mcp_supersede_workspace_outbox_rows(&conn, workspace_id, now)?;
+        Ok(removed)
+    })();
+    match result {
+        Ok(removed) => {
+            conn.execute_batch("COMMIT").map_err(|error| {
+                format!("Unable to commit workspace agent chat purge transaction: {error}")
+            })?;
+            Ok(removed)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
 }
 
 #[tauri::command]
@@ -41451,6 +41956,77 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
                 "sp",
                 &["speed", "service_tier", "serviceTier"],
             );
+            let target_terminal_id = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "tr",
+                &[
+                    "target_terminal_id",
+                    "targetTerminalId",
+                    "terminal_id",
+                    "terminalId",
+                    "pane_id",
+                    "paneId",
+                ],
+            );
+            let target_terminal_index = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "ti",
+                &[
+                    "target_terminal_index",
+                    "targetTerminalIndex",
+                    "terminal_index",
+                    "terminalIndex",
+                ],
+            );
+            let target_terminal_name = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "tn",
+                &[
+                    "target_terminal_name",
+                    "targetTerminalName",
+                    "terminal_name",
+                    "terminalName",
+                    "target_name",
+                    "targetName",
+                    "name",
+                ],
+            );
+            let target_thread_id = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "th",
+                &[
+                    "target_thread_id",
+                    "targetThreadId",
+                    "thread_id",
+                    "threadId",
+                ],
+            );
+            let target_agent_id = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "ta",
+                &[
+                    "target_agent_id",
+                    "targetAgentId",
+                    "agent_id",
+                    "agentId",
+                ],
+            );
+            let target_color_slot = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "cs",
+                &["target_color_slot", "targetColorSlot", "color_slot", "colorSlot"],
+            );
+            let target_terminal_color = cloud_mcp_todo_sync_payload_value(
+                &compact_payload,
+                "tc",
+                &[
+                    "target_terminal_color",
+                    "targetTerminalColor",
+                    "terminal_color",
+                    "terminalColor",
+                    "color",
+                ],
+            );
             let mut payload = serde_json::Map::new();
             payload.insert("id".to_string(), json!(todo_id.clone()));
             payload.insert("todo_id".to_string(), json!(todo_id.clone()));
@@ -41531,6 +42107,54 @@ fn cloud_mcp_todo_sync_entries_from_ops(value: &Value) -> Vec<Value> {
             }
             if !speed.is_null() {
                 payload.insert("speed".to_string(), speed);
+            }
+            if !target_terminal_id.is_null() {
+                payload.insert("target_terminal_id".to_string(), target_terminal_id.clone());
+                payload.insert("targetTerminalId".to_string(), target_terminal_id);
+            }
+            if !target_terminal_index.is_null() {
+                payload.insert(
+                    "target_terminal_index".to_string(),
+                    target_terminal_index.clone(),
+                );
+                payload.insert("targetTerminalIndex".to_string(), target_terminal_index);
+            }
+            if !target_terminal_name.is_null() {
+                payload.insert(
+                    "target_terminal_name".to_string(),
+                    target_terminal_name.clone(),
+                );
+                payload.insert("targetTerminalName".to_string(), target_terminal_name);
+            }
+            if !target_thread_id.is_null() {
+                payload.insert("target_thread_id".to_string(), target_thread_id.clone());
+                payload.insert("targetThreadId".to_string(), target_thread_id);
+            }
+            if !target_agent_id.is_null() {
+                payload.insert("target_agent_id".to_string(), target_agent_id.clone());
+                payload.insert("targetAgentId".to_string(), target_agent_id);
+            }
+            if !target_color_slot.is_null() {
+                payload.insert("target_color_slot".to_string(), target_color_slot.clone());
+                payload.insert("targetColorSlot".to_string(), target_color_slot);
+            }
+            if !target_terminal_color.is_null() {
+                payload.insert(
+                    "target_terminal_color".to_string(),
+                    target_terminal_color.clone(),
+                );
+                payload.insert("targetTerminalColor".to_string(), target_terminal_color);
+            }
+            if payload.contains_key("targetTerminalId")
+                || payload.contains_key("targetTerminalIndex")
+                || payload.contains_key("targetTerminalName")
+                || payload.contains_key("targetThreadId")
+                || payload.contains_key("targetAgentId")
+                || payload.contains_key("targetColorSlot")
+                || payload.contains_key("targetTerminalColor")
+            {
+                payload.insert("targetExplicit".to_string(), json!(true));
+                payload.insert("target_explicit".to_string(), json!(true));
             }
             if let Some(items) = inputs.as_array().filter(|items| !items.is_empty()) {
                 let inputs_value = Value::Array(items.clone());

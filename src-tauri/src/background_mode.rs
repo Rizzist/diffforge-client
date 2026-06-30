@@ -452,16 +452,13 @@ pub(crate) fn background_tray_create(app: &AppHandle) {
             }
             "diffforge-quit" => {
                 // Surface the main window so the shutdown progress and any
-                // active-terminal confirmation are visible, then reuse the
-                // existing close choreography.
+                // active-terminal progress are visible, then start backend
+                // shutdown directly. Routing this through the frontend close
+                // event is fragile if the close-options dialog is already
+                // open, because the webview intentionally ignores duplicate
+                // close requests while that dialog is active.
                 let _ = restore_main_window(app);
-                let _ = app.emit(
-                    APP_CLOSE_REQUESTED_EVENT,
-                    json!({
-                        "reason": "tray_quit",
-                        "source": "background_tray",
-                    }),
-                );
+                let _ = start_backend_app_shutdown(app.clone(), "main".to_string());
             }
             _ => {}
         })

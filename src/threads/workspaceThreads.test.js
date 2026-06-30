@@ -6,6 +6,7 @@ import {
   applyWorkspaceThreadProviderSessionBinding,
   bindWorkspaceThreadTerminal,
   clearWorkspaceThreadPendingPrompt,
+  deleteWorkspaceThread,
   getWorkspaceThreadForTerminalIndex,
   getWorkspaceThreadSelectionForLiveTerminal,
   getWorkspaceThreadTerminalNickname,
@@ -18,6 +19,66 @@ import {
   updateWorkspaceActiveTerminal,
   updateWorkspaceThreadProviderSession,
 } from "./workspaceThreads.js";
+
+test("deleteWorkspaceThread hard-removes active and archived thread state", () => {
+  const workspaceId = "workspace-delete-thread";
+  const threadId = "thread-delete";
+  const state = {
+    [workspaceId]: {
+      activeThreadId: threadId,
+      archivedThreadOrder: [threadId],
+      archivedThreads: {
+        [threadId]: {
+          id: threadId,
+          archivedAt: "2026-06-30T00:00:00.000Z",
+          currentAgent: "codex",
+          providerBindings: {
+            codex: {
+              nativeSessionId: "session-delete",
+            },
+          },
+        },
+      },
+      terminalThreadIds: {
+        0: threadId,
+      },
+      terminals: {
+        0: {
+          terminalIndex: 0,
+          threadId,
+        },
+      },
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          currentAgent: "codex",
+          providerBindings: {
+            codex: {
+              nativeSessionId: "session-delete",
+            },
+          },
+          terminalIndex: 0,
+        },
+      },
+      threadsView: {
+        selectedThreadId: threadId,
+        selectedWorkspaceId: workspaceId,
+      },
+    },
+  };
+
+  const next = deleteWorkspaceThread(state, workspaceId, threadId);
+  const entry = next[workspaceId];
+  assert.deepEqual(Object.keys(entry.threads), []);
+  assert.deepEqual(Object.keys(entry.archivedThreads), []);
+  assert.deepEqual(entry.threadOrder, []);
+  assert.deepEqual(entry.archivedThreadOrder, []);
+  assert.deepEqual(entry.terminalThreadIds, {});
+  assert.equal(entry.terminals[0].threadId, "");
+  assert.equal(entry.activeThreadId, "");
+  assert.equal(entry.threadsView.selectedThreadId, "");
+});
 
 test("provider session binding attaches to the live terminal thread without a thread id", () => {
   const workspaceId = "workspace-session-binding";

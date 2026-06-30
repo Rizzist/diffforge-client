@@ -242,6 +242,7 @@ const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
 const TERMINAL_BREAKOUT_TRANSITION_MS = 260;
 const TERMINAL_BREAKOUT_STORAGE_PREFIX = "diffforge.terminalBreakout.v1";
 const TERMINAL_DOCUMENT_PANEL_ID = "workspace-document-panel";
+const TERMINAL_GRID_MAX_BALANCED_COLUMNS = 3;
 const TERMINAL_EMPTY_AGENT_LAUNCHERS = Object.freeze([
   { id: "codex", label: "Codex" },
   { id: "claude", label: "Claude Code" },
@@ -8646,6 +8647,50 @@ function terminalPaneLayoutDomIdPart(value) {
     : String(value).replace(/[^\w.-]/g, "_") || "pane";
 }
 
+function normalizeTerminalWorkspaceRootIdentity(rootPath) {
+  return String(rootPath || "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+}
+
+function getBalancedTerminalPaneRowValues(paneKeys) {
+  const keys = Array.isArray(paneKeys) ? paneKeys.filter((paneKey) => paneKey !== null) : [];
+  if (!keys.length) {
+    return [];
+  }
+
+  const rowCount = Math.max(1, Math.ceil(keys.length / TERMINAL_GRID_MAX_BALANCED_COLUMNS));
+  const baseRowSize = Math.floor(keys.length / rowCount);
+  const largerRowCount = keys.length % rowCount;
+  const rows = [];
+  let keyCursor = 0;
+
+  for (let rowIndex = 0; rowIndex < rowCount; rowIndex += 1) {
+    const rowSize = baseRowSize + (rowIndex < largerRowCount ? 1 : 0);
+    const rowKeys = keys.slice(keyCursor, keyCursor + rowSize);
+    if (rowKeys.length) {
+      rows.push(rowKeys);
+    }
+    keyCursor += rowSize;
+  }
+
+  return rows;
+}
+
+function shouldRebalanceTerminalPaneRowValues(rowValues) {
+  const rows = Array.isArray(rowValues) ? rowValues.filter((row) => Array.isArray(row) && row.length) : [];
+  const paneCount = rows.reduce((count, row) => count + row.length, 0);
+  if (paneCount <= 1) {
+    return false;
+  }
+
+  const balancedRows = getBalancedTerminalPaneRowValues(rows.flat());
+  return rows.some((row) => row.length > TERMINAL_GRID_MAX_BALANCED_COLUMNS)
+    || rows.every((row) => row.length <= 1)
+    || (
+      rows.length > balancedRows.length
+      && rows.slice(1).every((row) => row.length <= 1)
+    );
+}
+
 function normalizeViewTerminalRows(rows, options = {}) {
   const {
     allowDocumentPanel = false,
@@ -8802,21 +8847,12 @@ function reconcileDocumentPanelRows({
   });
 
   if (!currentPanelRows.some((row) => row.terminalIndexes.includes(TERMINAL_DOCUMENT_PANEL_ID))) {
-    const rowsWithDocument = baseRows.map((row) => ({
-      ...row,
-      terminalIndexes: row.terminalIndexes.slice(),
-    }));
-    if (rowsWithDocument.length) {
-      rowsWithDocument[0].terminalIndexes.unshift(TERMINAL_DOCUMENT_PANEL_ID);
-    } else {
-      rowsWithDocument.push({
-        rowIndex: 0,
-        terminalIndexes: [TERMINAL_DOCUMENT_PANEL_ID],
-      });
-    }
-    return rowsWithDocument.map((row, rowIndex) => ({
+    return getBalancedTerminalPaneRowValues([
+      TERMINAL_DOCUMENT_PANEL_ID,
+      ...baseRows.flatMap((row) => row.terminalIndexes),
+    ]).map((terminalIndexes, rowIndex) => ({
       rowIndex,
-      terminalIndexes: row.terminalIndexes,
+      terminalIndexes,
     }));
   }
 
@@ -8864,7 +8900,11 @@ function reconcileDocumentPanelRows({
     }
   });
 
-  return nextRows.map((terminalIndexes, rowIndex) => ({
+  const displayRows = shouldRebalanceTerminalPaneRowValues(nextRows)
+    ? getBalancedTerminalPaneRowValues(nextRows.flat())
+    : nextRows;
+
+  return displayRows.map((terminalIndexes, rowIndex) => ({
     rowIndex,
     terminalIndexes,
   }));
@@ -21712,7 +21752,7 @@ function WorkspacePcbGridPane({
   const boardTitle = board?.name || "PCB";
   const splitTitle = paneLimitReached ? "Panel limit reached" : "Split PCB panel";
 
-  const createBoard = useCallback(() => {
+  const openBoardChooser = useCallback(() => {
     setCreateRequestNonce((nonce) => nonce + 1);
   }, []);
 
@@ -21752,10 +21792,10 @@ function WorkspacePcbGridPane({
         </TerminalPcbPanelIdentity>
         <TerminalRailControls data-rail-row="secondary">
           <TerminalRestartButton
-            aria-label="New PCB board"
+            aria-label="New or switch PCB board"
             disabled={!repoPath}
-            onClick={createBoard}
-            title={repoPath ? "New PCB board" : "Select a workspace folder first"}
+            onClick={openBoardChooser}
+            title={repoPath ? "New or switch PCB board" : "Select a workspace folder first"}
             type="button"
           >
             <ButtonAddIcon aria-hidden="true" />
@@ -21842,7 +21882,7 @@ function WorkspacePcbGridPane({
           </TerminalPcbBreakoutOverlay>
         ) : (
           <PcbWorkspacePane
-            key={`pcb-${paneId}-${resumeNonce}`}
+            key={`pcb-${paneId}-${repoPath}-${resumeNonce}`}
             controlCommand={controlCommand}
             createRequestNonce={createRequestNonce}
             isActive={isActive}
@@ -22020,6 +22060,7 @@ function TerminalView({
   const [pcbPaneCommands, setPcbPaneCommands] = useState({});
   const [pcbPaneBoards, setPcbPaneBoards] = useState({});
   const pcbPaneBoardsRef = useRef(pcbPaneBoards);
+  const pcbPaneRootScopeRef = useRef("");
   const [terminalBreakoutPlacements, setTerminalBreakoutPlacements] = useState({});
   const [terminalBreakoutPlanSnapshots, setTerminalBreakoutPlanSnapshots] = useState({});
   const [terminalBreakoutPlanRefreshNonce, setTerminalBreakoutPlanRefreshNonce] = useState(0);
@@ -22984,6 +23025,79 @@ function TerminalView({
 
     return getWorkspaceTerminalPaneId(terminalWorkspace?.id, terminalIndex, paneAgentId);
   }, [getTerminalAgent, getTerminalRole, terminalWorkspace?.id]);
+
+  useEffect(() => {
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    const rootIdentity = normalizeTerminalWorkspaceRootIdentity(
+      terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+    );
+    if (!workspaceId || !rootIdentity) {
+      pcbPaneRootScopeRef.current = "";
+      return;
+    }
+
+    const scopeKey = `${workspaceId}:${rootIdentity}`;
+    if (pcbPaneRootScopeRef.current === scopeKey) {
+      return;
+    }
+    const previousScopeKey = pcbPaneRootScopeRef.current;
+    pcbPaneRootScopeRef.current = scopeKey;
+    if (!previousScopeKey) {
+      return;
+    }
+
+    const pcbPaneIds = logicalTerminalIndexes
+      .filter((terminalIndex) => paneKinds?.[terminalIndex] === "pcb")
+      .map((terminalIndex) => getTerminalPaneId(terminalIndex))
+      .filter(Boolean);
+    if (!pcbPaneIds.length) {
+      return;
+    }
+    setPcbPaneBoards((current) => {
+      const next = { ...current };
+      pcbPaneIds.forEach((paneId) => {
+        delete next[paneId];
+      });
+      pcbPaneBoardsRef.current = next;
+      return next;
+    });
+    setPcbPaneCommands((current) => {
+      const next = { ...current };
+      pcbPaneIds.forEach((paneId) => {
+        delete next[paneId];
+      });
+      return next;
+    });
+    setPcbPaneResumeNonces((current) => {
+      const next = { ...current };
+      pcbPaneIds.forEach((paneId) => {
+        next[paneId] = (next[paneId] || 0) + 1;
+      });
+      return next;
+    });
+    const nextBreakouts = { ...pcbBreakoutPanesRef.current };
+    let removedBreakout = false;
+    pcbPaneIds.forEach((paneId) => {
+      if (!nextBreakouts[paneId]) {
+        return;
+      }
+      delete nextBreakouts[paneId];
+      removedBreakout = true;
+      invoke("pcb_panel_close", { paneId, workspaceId }).catch(() => {});
+    });
+    if (removedBreakout) {
+      pcbBreakoutPanesRef.current = nextBreakouts;
+      setPcbBreakoutPanes(nextBreakouts);
+    }
+  }, [
+    defaultWorkingDirectory,
+    getTerminalPaneId,
+    logicalTerminalIndexes,
+    paneKinds,
+    terminalWorkspace?.id,
+    terminalWorkspaceWorkingDirectory,
+  ]);
+
   const isTerminalIndexWindowBreakoutHosted = useCallback((terminalIndex) => {
     if (!Number.isInteger(terminalIndex)) {
       return false;
@@ -34208,8 +34322,28 @@ function TerminalView({
           url: target,
         });
       }
-    } else if (kind === "pcb" && (input.create || input.name)) {
-      sendPcbPaneCommand(paneId, { action: "create", name: input.name || "" });
+    } else if (kind === "pcb") {
+      const boardPath = String(
+        input.boardPath
+          || input.board_path
+          || input.path
+          || input.filePath
+          || input.file_path
+          || "",
+      ).trim();
+      const boardName = String(input.boardName || input.board_name || "").trim();
+      if (input.create || input.new || input.newBoard || input.new_board || input.name) {
+        sendPcbPaneCommand(paneId, {
+          action: "create",
+          name: input.name || boardName || "",
+        });
+      } else if (boardPath || boardName) {
+        sendPcbPaneCommand(paneId, {
+          action: "select",
+          boardName,
+          boardPath,
+        });
+      }
     }
     return {
       opened: true,
@@ -34305,12 +34439,38 @@ function TerminalView({
     if (action === "close") {
       return closeWorkspacePanelFromControl(input);
     }
-    const snapshot = buildWorkspacePanelSnapshots({ ...input, includeContext: true });
-    let panel = resolveWorkspaceControlPanel(input, snapshot);
-    if (!panel && ["navigate", "search", "open"].includes(action)) {
+    const explicitKind = normalizeWorkspaceControlPanelKind(input.kind || input.panelKind || input.panel_kind);
+    const inputBoardPath = input.boardPath
+      || input.board_path
+      || input.path
+      || input.filePath
+      || input.file_path
+      || "";
+    const inputBoardName = input.boardName || input.board_name || input.name || "";
+    const pcbCreateActions = ["create", "new", "new-board"];
+    const pcbSelectActions = ["select", "switch", "switch-board", "open-board", "open-existing"];
+    const actionHasPcbIntent = pcbCreateActions.includes(action)
+      || pcbSelectActions.includes(action)
+      || (action === "open" && Boolean(inputBoardPath || inputBoardName));
+    const requestedKind = explicitKind || (actionHasPcbIntent ? "pcb" : "");
+    const routedInput = requestedKind ? { ...input, kind: requestedKind } : input;
+    const snapshot = buildWorkspacePanelSnapshots({ ...routedInput, includeContext: true });
+    let panel = resolveWorkspaceControlPanel(routedInput, snapshot);
+    if (!panel && !requestedKind && ["navigate", "search", "open"].includes(action)) {
       return openWorkspacePanelFromControl({
         ...input,
         kind: input.kind || "web",
+      });
+    }
+    if (
+      !panel
+      && requestedKind === "pcb"
+      && (pcbCreateActions.includes(action) || pcbSelectActions.includes(action) || action === "open")
+    ) {
+      return openWorkspacePanelFromControl({
+        ...input,
+        create: pcbCreateActions.includes(action) ? true : input.create,
+        kind: "pcb",
       });
     }
     if (!panel) {
@@ -34334,14 +34494,30 @@ function TerminalView({
         throw new Error(`Unsupported web panel action: ${action}`);
       }
     } else if (panel.kind === "pcb") {
-      if (action === "open" || action === "popout" || action === "open-window") {
+      if (action === "open" && (inputBoardPath || inputBoardName)) {
+        sendPcbPaneCommand(panel.paneId, {
+          action: "select",
+          boardName: inputBoardName,
+          boardPath: inputBoardPath,
+        });
+      } else if (action === "open" || action === "popout" || action === "open-window") {
         void popOutPcbPanelForIndex(panel.terminalIndex, panel.paneId);
       } else if (action === "return" || action === "return-to-grid") {
         returnPcbPanelToGrid(panel.paneId);
-      } else if (["create", "new", "new-board", "refresh", "reload"].includes(action)) {
+      } else if (pcbCreateActions.includes(action)) {
         sendPcbPaneCommand(panel.paneId, {
-          action,
-          name: input.name || "",
+          action: "create",
+          name: input.name || input.boardName || input.board_name || "",
+        });
+      } else if (["refresh", "reload"].includes(action)) {
+        sendPcbPaneCommand(panel.paneId, {
+          action: "refresh",
+        });
+      } else if (pcbSelectActions.includes(action)) {
+        sendPcbPaneCommand(panel.paneId, {
+          action: "select",
+          boardName: inputBoardName,
+          boardPath: inputBoardPath,
         });
       } else {
         throw new Error(`Unsupported PCB panel action: ${action}`);
@@ -34370,6 +34546,7 @@ function TerminalView({
     getWorkspacePanelContextFromControl,
     openWorkspaceDocumentPanel,
     openWorkspacePanelFromControl,
+    normalizeWorkspaceControlPanelKind,
     popOutPcbPanelForIndex,
     popOutWebPanelForIndex,
     resolveWorkspaceControlPanel,
@@ -36886,6 +37063,9 @@ function TerminalView({
             || (terminalBreakoutLayoutActive && terminalBreakoutPlacements[terminalIndex])
             || draggingThisTerminal
             || fullscreenThisTerminal;
+          const slotRectForLayout = (terminalBreakoutLayoutActive && terminalBreakoutPlacements[terminalIndex])
+            || terminalLayoutRects[terminalIndex]
+            || (fullscreenThisTerminal ? terminalPanelRect : null);
           // Inactive tabs stay mounted (PTY preserved) but invisible: every
           // tab in a group shares the group's anchor rect.
           const tabHidden = !terminalBreakoutLayoutActive
@@ -36896,12 +37076,35 @@ function TerminalView({
           const isWebPane = paneKinds?.[terminalIndex] === "web";
           const isPcbPane = paneKinds?.[terminalIndex] === "pcb";
           if (isWebPane) {
+            const webSurfaceReady = hasMeasuredRect;
+            const webLayoutRect = slotRectForLayout ? {
+              height: Number(slotRectForLayout.height || 0),
+              left: Number(slotRectForLayout.left ?? slotRectForLayout.x ?? 0),
+              top: Number(slotRectForLayout.top ?? slotRectForLayout.y ?? 0),
+              width: Number(slotRectForLayout.width || 0),
+            } : null;
+            const webLayoutKey = [
+              terminalWorkspace?.id || "",
+              terminalPaneId,
+              webSurfaceReady ? "measured" : "unmeasured",
+              fullscreenState,
+              fullscreenThisTerminal ? "fullscreen" : "grid",
+              terminalBreakoutLayoutActive ? "breakout" : "stack",
+              tabHidden ? "tab-hidden" : "tab-visible",
+              webBreakoutPanes[terminalPaneId] ? "popped-out" : "in-grid",
+              webLayoutRect
+                ? `${Math.round(webLayoutRect.left)},${Math.round(webLayoutRect.top)},${Math.round(webLayoutRect.width)},${Math.round(webLayoutRect.height)}`
+                : "no-slot",
+              terminalPanelRect
+                ? `${Math.round(terminalPanelRect.width || 0)}x${Math.round(terminalPanelRect.height || 0)}`
+                : "no-panel",
+            ].join("|");
             return (
               <TerminalSurfaceSlot
                 data-terminal-active={terminalActive ? "true" : "false"}
                 data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
                 data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
-                data-terminal-hidden="false"
+                data-terminal-hidden={webSurfaceReady ? "false" : "true"}
                 data-terminal-index={terminalIndex}
                 data-terminal-surface-slot="true"
                 data-terminal-tab-hidden={tabHidden ? "true" : "false"}
@@ -36915,10 +37118,11 @@ function TerminalView({
                   paneId={terminalPaneId}
                   workspaceId={terminalWorkspace?.id || ""}
                   initialUrl={webPaneUrlsRef.current[terminalPaneId] || DEFAULT_WEB_URL}
-                  isActive={isWorkspaceSurfaceVisible && !tabHidden}
+                  isActive={isWorkspaceSurfaceVisible && !tabHidden && webSurfaceReady}
                   isFullscreen={fullscreenThisTerminal}
                   fullscreenActive={fullscreenActive}
                   dragActive={terminalDragActive}
+                  layoutKey={webLayoutKey}
                   poppedOut={Boolean(webBreakoutPanes[terminalPaneId])}
                   webviewObscured={workspaceWebviewObscured}
                   onDragHandlePointerDown={(event, index, pid) => {
