@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
-import { emit } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import {
@@ -19,6 +19,8 @@ import {
 import PcbPanel from "./PcbPanel.jsx";
 import PcbWorkspacePane from "./PcbWorkspacePane.jsx";
 import {
+  PCB_PANEL_COMMAND_EVENT,
+  PCB_PANEL_CONTROL_BOARD_CHANGE,
   PCB_PANEL_CONTROL_EVENT,
   PCB_PANEL_CONTROL_RETURN,
 } from "./pcbPanelBridge.js";
@@ -58,6 +60,7 @@ const WindowRoot = styled.div`
 // the workspace watcher running so edits live-reload here too.
 export default function PcbWindowHost() {
   const [params] = useState(parsePcbWindowParams);
+  const [panelCommand, setPanelCommand] = useState(null);
   const currentWindow = useMemo(() => getCurrentWindow(), []);
   const windowLabel = useMemo(() => {
     try {
@@ -117,6 +120,71 @@ export default function PcbWindowHost() {
       });
   }, [currentWindow, params.paneId, params.workspaceId, windowLabel]);
 
+  useEffect(() => {
+    if (!isPanelWindow || !params.paneId) {
+      return undefined;
+    }
+    let disposed = false;
+    let unlisten = () => {};
+    listen(PCB_PANEL_COMMAND_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const paneId = String(payload.paneId || payload.pane_id || "").trim();
+      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      const windowId = String(payload.windowId || payload.window_id || "").trim();
+      if (paneId && paneId !== params.paneId) {
+        return;
+      }
+      if (workspaceId && workspaceId !== params.workspaceId) {
+        return;
+      }
+      if (windowId && windowId !== windowLabel) {
+        return;
+      }
+      const action = String(payload.action || payload.command?.action || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+      if (action === "focus" || action === "open" || action === "popout" || action === "open-window") {
+        currentWindow.setFocus().catch(() => {});
+        return;
+      }
+      if (action === "return" || action === "return-to-grid") {
+        returnToGrid();
+        return;
+      }
+      setPanelCommand({
+        ...(payload.command || payload),
+        action,
+        nonce: Number(payload.nonce || payload.command?.nonce || 0) || Date.now() + Math.random(),
+      });
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [currentWindow, isPanelWindow, params.paneId, params.workspaceId, returnToGrid, windowLabel]);
+
+  const handlePanelBoardChange = useCallback((nextBoard) => {
+    if (!isPanelWindow || !params.paneId) {
+      return;
+    }
+    emit(PCB_PANEL_CONTROL_EVENT, {
+      board: nextBoard || null,
+      control: PCB_PANEL_CONTROL_BOARD_CHANGE,
+      paneId: params.paneId,
+      windowId: windowLabel,
+      workspaceId: params.workspaceId,
+    }).catch(() => {});
+  }, [isPanelWindow, params.paneId, params.workspaceId, windowLabel]);
+
   if (isPanelWindow) {
     return (
       <PanelWindowRoot data-workspace-pcb-panel-window="true">
@@ -161,7 +229,9 @@ export default function PcbWindowHost() {
         </PanelChrome>
         <PanelBody>
           <PcbWorkspacePane
+            controlCommand={panelCommand}
             isActive
+            onBoardChange={handlePanelBoardChange}
             paneId={params.paneId}
             repoPath={params.repoPath}
             workspaceId={params.workspaceId}

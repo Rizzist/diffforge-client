@@ -23808,9 +23808,13 @@ fn cloud_mcp_workspace_terminal_items(workspace: &Value) -> Vec<Value> {
 }
 
 fn cloud_mcp_workspace_panel_items(workspace: &Value) -> Vec<Value> {
-    let direct = cloud_mcp_payload_items(workspace, &["panels", "workspace_panels", "workspacePanels"], 64);
-    if !direct.is_empty() {
-        return direct;
+    for key in ["panels", "workspace_panels", "workspacePanels"] {
+        let Some(value) = workspace.get(key) else {
+            continue;
+        };
+        if value.is_array() || value.is_object() {
+            return cloud_mcp_payload_items(workspace, &[key], 64);
+        }
     }
     cloud_mcp_workspace_terminal_items(workspace)
         .into_iter()
@@ -23838,6 +23842,15 @@ fn cloud_mcp_workspace_panel_kind(panel: &Value) -> Option<String> {
     .to_ascii_lowercase()
     .replace('_', "-");
     match kind.as_str() {
+        "docs"
+        | "doc"
+        | "document"
+        | "documents"
+        | "workspace-docs"
+        | "workspace-document"
+        | "docs-panel"
+        | "document-panel"
+        | "documents-panel" => Some("docs".to_string()),
         "web" | "browser" | "chrome" | "workspace-web" | "workspace-browser" | "web-panel" => {
             Some("web".to_string())
         }
@@ -27910,6 +27923,11 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                     .and_then(Value::as_i64)
                     .unwrap_or(index as i64)
                     .clamp(0, 255);
+                let slot_index_value = if panel_kind == "docs" {
+                    Value::Null
+                } else {
+                    json!(slot_index)
+                };
                 let display_name = cloud_mcp_payload_text(
                     panel,
                     &[
@@ -27923,10 +27941,10 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                     ],
                 )
                 .unwrap_or_else(|| {
-                    if panel_kind == "pcb" {
-                        "PCB".to_string()
-                    } else {
-                        "Web".to_string()
+                    match panel_kind.as_str() {
+                        "docs" => "Docs".to_string(),
+                        "pcb" => "PCB".to_string(),
+                        _ => "Web".to_string(),
                     }
                 });
                 let panel_id = cloud_mcp_payload_text(
@@ -27942,7 +27960,11 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                     ],
                 )
                 .unwrap_or_else(|| {
-                    format!("workspace-panel-{}-{}-{}", workspace_id, panel_kind, slot_index)
+                    if panel_kind == "docs" {
+                        "workspace-document-panel".to_string()
+                    } else {
+                        format!("workspace-panel-{}-{}-{}", workspace_id, panel_kind, slot_index)
+                    }
                 });
                 let status = cloud_mcp_payload_text(panel, &["status", "state", "lifecycle"])
                     .unwrap_or_else(|| {
@@ -27994,15 +28016,15 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                     "panelName": display_name,
                     "panel_type": panel_kind.clone(),
                     "panelType": panel_kind.clone(),
-                    "slot_index": slot_index,
-                    "slotIndex": slot_index,
+                    "slot_index": slot_index_value.clone(),
+                    "slotIndex": slot_index_value.clone(),
                     "status": status,
                     "surface_kind": panel_kind.clone(),
                     "surfaceKind": panel_kind.clone(),
                     "target_panel_id": panel_id.clone(),
                     "targetPanelId": panel_id,
-                    "terminal_index": slot_index,
-                    "terminalIndex": slot_index,
+                    "terminal_index": slot_index_value.clone(),
+                    "terminalIndex": slot_index_value,
                     "terminal_kind": "workspace_panel",
                     "terminalKind": "workspace_panel",
                 }))
@@ -46169,6 +46191,26 @@ mod cloud_mcp_tests {
         assert!(cloud_mcp_agent_uses_activity_hooks(" OpenCode "));
         assert!(!cloud_mcp_agent_uses_activity_hooks("shell"));
         assert!(!cloud_mcp_agent_uses_activity_hooks("generic"));
+    }
+
+    #[test]
+    fn workspace_panels_empty_list_is_authoritative() {
+        let workspace = json!({
+            "panels": [],
+            "terminals": [{
+                "terminal_index": 0,
+                "terminal_kind": "workspace_panel",
+                "panel_kind": "web",
+            }],
+        });
+
+        assert!(cloud_mcp_workspace_panel_items(&workspace).is_empty());
+
+        let docs_panel = json!({ "kind": "docs-panel" });
+        assert_eq!(
+            cloud_mcp_workspace_panel_kind(&docs_panel).as_deref(),
+            Some("docs"),
+        );
     }
 
     #[test]

@@ -4604,9 +4604,10 @@ export default function ToolsWorkspaceView({
   }), [appControlDocumentContext, saveSkillEditor, skillEditor, updateSelectedDocumentFromAppControl]);
 
   useEffect(() => {
+    if (!surfaceIsActive) return undefined;
     if (typeof onAppControlDocumentActions !== "function") return undefined;
     return onAppControlDocumentActions(appControlDocumentActions);
-  }, [appControlDocumentActions, onAppControlDocumentActions]);
+  }, [appControlDocumentActions, onAppControlDocumentActions, surfaceIsActive]);
 
   const updateSelectedScriptFromAppControl = useCallback(async (input = {}) => {
     const hasOwn = (key) => Object.prototype.hasOwnProperty.call(input, key);
@@ -4778,9 +4779,10 @@ export default function ToolsWorkspaceView({
   }), [appControlScriptContext, runLocalScript, saveLocalScript, scriptEditor, updateSelectedScriptFromAppControl]);
 
   useEffect(() => {
+    if (!surfaceIsActive) return undefined;
     if (typeof onAppControlScriptActions !== "function") return undefined;
     return onAppControlScriptActions(appControlScriptActions);
-  }, [appControlScriptActions, onAppControlScriptActions]);
+  }, [appControlScriptActions, onAppControlScriptActions, surfaceIsActive]);
 
   const activeDocsBreakout = useMemo(() => (
     Object.values(toolsWindowBreakouts).find((breakout) => breakout?.mode === "docs") || null

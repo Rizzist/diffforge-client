@@ -542,6 +542,17 @@ fn app_control_mcp_tools() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "selected_context",
+            "description": "Alias for get_visible_context with selection snapshots enabled. Return the selected live document/script context from global Tools or a workspace Docs panel, including highlighted range metadata when available.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "includeContent": {"type": "boolean", "description": "When true, include any small in-memory draft preview the UI can safely expose."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
             "name": "list_docs",
             "description": "Return the account Tools documents inventory in the background without changing the visible tab, active view, selected document, or highlighted range. Use this for questions like how many docs exist, list docs, find a document by name/path, or compare docs while the user keeps working elsewhere.",
             "inputSchema": {
@@ -741,6 +752,23 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "extension": {"type": "string", "description": "md, arch, or html."},
                     "mode": {"type": "string", "description": "draft, local, publish, push, sync, or save. draft updates the editor without persisting."},
                     "save": {"type": "boolean", "description": "When true, save after applying the patch. mode controls local vs publish."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "selected_update",
+            "description": "Update the currently selected live editor item. Routes to update_selected_document for selected documents, including workspace Docs panels, or update_selected_script for selected local scripts.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "content": {"type": "string"},
+                    "content_md": {"type": "string"},
+                    "document_kind": {"type": "string"},
+                    "extension": {"type": "string"},
+                    "mode": {"type": "string"},
+                    "save": {"type": "boolean"}
                 },
                 "additionalProperties": true
             }
@@ -1120,6 +1148,115 @@ fn app_control_mcp_tools() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "list_panels",
+            "description": "List live workspace panels in the selected workspace by default, including Docs, Web, PCB, and terminal pane metadata. Use this before controlling a workspace panel when the pane id or selected workspace is unclear.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspaceId": {"type": "string"},
+                    "workspaceName": {"type": "string"},
+                    "kind": {"type": "string", "description": "Optional panel kind filter: docs, web, pcb, terminal, or all."},
+                    "includeContext": {"type": "boolean", "description": "When true, include compact kind-specific context such as current URL, selected board path, or selected document metadata."},
+                    "includeState": {"type": "boolean", "description": "When true, include broader app-control state."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "get_panel_context",
+            "description": "Return one live workspace panel context, defaulting to the active/selected panel in the selected workspace. Docs panels expose selected document/range metadata, PCB panels expose selected board paths, and Web panels expose current URL/search state.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspaceId": {"type": "string"},
+                    "workspaceName": {"type": "string"},
+                    "paneId": {"type": "string"},
+                    "panelId": {"type": "string"},
+                    "terminalIndex": {"type": "integer", "minimum": 0},
+                    "kind": {"type": "string", "description": "docs, web, pcb, or terminal."},
+                    "includeContent": {"type": "boolean", "description": "When true, include already-live editor content when available. Large or native webview content is not captured."},
+                    "includeState": {"type": "boolean"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "focus_panel",
+            "description": "Focus or reveal a live workspace panel by kind, pane id, panel id, or terminal index. Defaults to the selected workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspaceId": {"type": "string"},
+                    "workspaceName": {"type": "string"},
+                    "paneId": {"type": "string"},
+                    "panelId": {"type": "string"},
+                    "terminalIndex": {"type": "integer", "minimum": 0},
+                    "kind": {"type": "string", "description": "docs, web, pcb, or terminal."},
+                    "includeState": {"type": "boolean"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "open_panel",
+            "description": "Open a workspace panel in the selected workspace by default. Kinds: docs, web, pcb. Web may accept url/search; PCB may accept create/name.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspaceId": {"type": "string"},
+                    "workspaceName": {"type": "string"},
+                    "kind": {"type": "string", "description": "docs, web, or pcb."},
+                    "url": {"type": "string", "description": "Initial web URL or search text for web panels."},
+                    "search": {"type": "string", "description": "Search text for web panels."},
+                    "name": {"type": "string", "description": "Optional board name for PCB create/open flows."},
+                    "focus": {"type": "boolean", "description": "When true or omitted, show/focus the panel after opening."},
+                    "includeState": {"type": "boolean"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "close_panel",
+            "description": "Close a workspace panel by kind, pane id, panel id, or terminal index. Defaults to the selected workspace.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspaceId": {"type": "string"},
+                    "workspaceName": {"type": "string"},
+                    "paneId": {"type": "string"},
+                    "panelId": {"type": "string"},
+                    "terminalIndex": {"type": "integer", "minimum": 0},
+                    "kind": {"type": "string", "description": "docs, web, pcb, or terminal."},
+                    "includeState": {"type": "boolean"}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "panel_action",
+            "description": "Perform a bounded action on a live workspace panel. Web supports navigate/search/reload/back/forward/focus/open/return/screenshot; PCB supports create/refresh/focus/open/return; Docs supports focus/open/close/context. Screenshot focuses the target panel, then saves a native full-screen capture through Snipping.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "workspaceId": {"type": "string"},
+                    "workspaceName": {"type": "string"},
+                    "paneId": {"type": "string"},
+                    "panelId": {"type": "string"},
+                    "terminalIndex": {"type": "integer", "minimum": 0},
+                    "kind": {"type": "string", "description": "docs, web, pcb, or terminal."},
+                    "action": {"type": "string", "description": "navigate, search, reload, back, forward, screenshot, create, refresh, focus, open, return, close, or context."},
+                    "url": {"type": "string"},
+                    "search": {"type": "string"},
+                    "query": {"type": "string"},
+                    "name": {"type": "string"},
+                    "args": {"type": "object", "additionalProperties": true},
+                    "includeState": {"type": "boolean"}
+                },
+                "required": ["action"],
+                "additionalProperties": true
+            }
+        }),
+        json!({
             "name": "list_terminals",
             "description": "List workspace terminals, including their slot index, agent type, pane id, thread id, live status, and configured workspace.",
             "inputSchema": {
@@ -1274,6 +1411,7 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
     if ![
         "get_state",
         "get_visible_context",
+        "selected_context",
         "list_docs",
         "get_doc",
         "prepare_doc_draft",
@@ -1284,6 +1422,7 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "get_selection_context",
         "save_selected_document",
         "update_selected_document",
+        "selected_update",
         "save_selected_script",
         "update_selected_script",
         "run_selected_script",
@@ -1309,6 +1448,12 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "edit_loopspace_graph",
         "patch_loopspace_graph",
         "select_tab",
+        "list_panels",
+        "get_panel_context",
+        "focus_panel",
+        "open_panel",
+        "close_panel",
+        "panel_action",
         "list_terminals",
         "list_todo_targets",
         "list_workspace_todo_targets",

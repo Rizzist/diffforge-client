@@ -1,4 +1,4 @@
-import { emit } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
@@ -25,6 +25,7 @@ import {
   useNativeWebview,
 } from "./webNative.js";
 import {
+  WEB_PANEL_COMMAND_EVENT,
   WEB_PANEL_CONTROL_EVENT,
   WEB_PANEL_CONTROL_NAVIGATE,
   WEB_PANEL_CONTROL_RETURN,
@@ -177,6 +178,86 @@ export default function WebPanelHost() {
         currentWindow.close().catch(() => {});
       });
   }, [currentUrl, currentWindow, params.paneId, windowLabel]);
+
+  useEffect(() => {
+    if (!params.paneId) {
+      return undefined;
+    }
+    let disposed = false;
+    let unlisten = () => {};
+    listen(WEB_PANEL_COMMAND_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const paneId = String(payload.paneId || payload.pane_id || "").trim();
+      const windowId = String(payload.windowId || payload.window_id || "").trim();
+      if (paneId && paneId !== params.paneId) {
+        return;
+      }
+      if (windowId && windowId !== windowLabel) {
+        return;
+      }
+      const action = String(payload.action || payload.command?.action || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+      if (action === "navigate" || action === "search" || action === "open") {
+        const rawTarget = action === "search"
+          ? payload.search || payload.query || payload.url || payload.command?.search || payload.command?.query || payload.command?.url
+          : payload.url || payload.search || payload.query || payload.command?.url || payload.command?.search || payload.command?.query;
+        const targetUrl = normalizeWebInput(rawTarget);
+        if (!targetUrl) {
+          setAddressError("Enter a web address or search.");
+          return;
+        }
+        setAddressError("");
+        navigateTo(targetUrl);
+        currentWindow.setFocus().catch(() => {});
+        return;
+      }
+      if (action === "reload" || action === "refresh") {
+        refresh();
+        currentWindow.setFocus().catch(() => {});
+        return;
+      }
+      if (action === "back" || action === "go-back") {
+        goBack();
+        currentWindow.setFocus().catch(() => {});
+        return;
+      }
+      if (action === "forward" || action === "go-forward") {
+        goForward();
+        currentWindow.setFocus().catch(() => {});
+        return;
+      }
+      if (action === "focus" || action === "popout" || action === "open-window") {
+        currentWindow.setFocus().catch(() => {});
+        return;
+      }
+      if (action === "return" || action === "return-to-grid") {
+        returnToGrid();
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [
+    currentWindow,
+    goBack,
+    goForward,
+    navigateTo,
+    params.paneId,
+    refresh,
+    returnToGrid,
+    windowLabel,
+  ]);
 
   return (
     <HostSurface data-workspace-web-surface="true">

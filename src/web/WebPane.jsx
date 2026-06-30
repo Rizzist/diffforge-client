@@ -54,6 +54,7 @@ export default function WebPane({
   onReturnFromBreakout,
   onFocusBreakout,
   onNavigate,
+  controlCommand = null,
 }) {
   const startUrl = useMemo(() => normalizeWebInput(initialUrl) || DEFAULT_WEB_URL, [initialUrl]);
   const [history, setHistory] = useState(() => [startUrl]);
@@ -61,6 +62,7 @@ export default function WebPane({
   const [addressValue, setAddressValue] = useState(startUrl);
   const [addressError, setAddressError] = useState("");
   const viewportRef = useRef(null);
+  const controlCommandSeenRef = useRef(0);
 
   const currentUrl = history[historyIndex] || DEFAULT_WEB_URL;
   const currentHost = useMemo(() => hostForUrl(currentUrl), [currentUrl]);
@@ -139,6 +141,39 @@ export default function WebPane({
     setAddressError("");
     reload();
   }, [reload]);
+
+  useEffect(() => {
+    const nonce = Number(controlCommand?.nonce || 0);
+    if (!nonce || controlCommandSeenRef.current === nonce) {
+      return;
+    }
+    controlCommandSeenRef.current = nonce;
+    const action = String(controlCommand?.action || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+    if (action === "navigate" || action === "search" || action === "open") {
+      const rawTarget = action === "search"
+        ? controlCommand?.search || controlCommand?.query || controlCommand?.url
+        : controlCommand?.url || controlCommand?.search || controlCommand?.query;
+      const targetUrl = normalizeWebInput(rawTarget);
+      if (!targetUrl) {
+        setAddressError("Enter a web address or search.");
+        return;
+      }
+      setAddressError("");
+      navigateTo(targetUrl);
+      return;
+    }
+    if (action === "reload" || action === "refresh") {
+      refresh();
+      return;
+    }
+    if (action === "back" || action === "go-back") {
+      goBack();
+      return;
+    }
+    if (action === "forward" || action === "go-forward") {
+      goForward();
+    }
+  }, [controlCommand, goBack, goForward, navigateTo, refresh]);
 
   return (
     <WebPaneSurface data-workspace-web-surface="true" data-active={isActive ? "true" : undefined}>

@@ -7,6 +7,7 @@ export const WEB_PANEL_META_EVENT = "forge-web-panel-meta";
 export const WEB_PANEL_META_REQUEST_EVENT = "forge-web-panel-meta-request";
 export const WEB_PANEL_CONTROL_EVENT = "forge-web-panel-control";
 export const WEB_PANEL_CLOSED_EVENT = "forge-web-panel-closed";
+export const WEB_PANEL_COMMAND_EVENT = "forge-web-panel-command";
 
 // Controls the breakout window sends back to the main grid.
 export const WEB_PANEL_CONTROL_CLOSE = "close";

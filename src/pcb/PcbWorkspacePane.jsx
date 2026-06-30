@@ -199,7 +199,9 @@ const PaneError = styled.div`
 `;
 
 export default function PcbWorkspacePane({
+  controlCommand = null,
   createRequestNonce = 0,
+  createRequestName = "",
   isActive = true,
   onBoardChange = null,
   paneId = "",
@@ -214,6 +216,7 @@ export default function PcbWorkspacePane({
   const [creating, setCreating] = useState(false);
   const [draftName, setDraftName] = useState("blinky");
   const createInputRef = useRef(null);
+  const controlCommandSeenRef = useRef(0);
   const restoredKeyRef = useRef("");
   const createRequestSeenRef = useRef(0);
   const refreshRequestSeenRef = useRef(0);
@@ -280,11 +283,15 @@ export default function PcbWorkspacePane({
     [availableBoards],
   );
 
-  const openCreateBoard = useCallback(() => {
+  const openCreateBoard = useCallback((initialName = "") => {
     if (!repoPath || busy) {
       return;
     }
+    const cleanInitialName = String(initialName || "").trim();
     setError("");
+    if (cleanInitialName) {
+      setDraftName(cleanInitialName);
+    }
     setCreating(true);
   }, [busy, repoPath]);
 
@@ -298,12 +305,11 @@ export default function PcbWorkspacePane({
     });
   }, [creating]);
 
-  const submitCreateBoard = useCallback((event) => {
-    event?.preventDefault?.();
+  const createBoardWithName = useCallback((boardName) => {
     if (!repoPath || busy) {
       return;
     }
-    const cleanName = String(draftName || "").trim();
+    const cleanName = String(boardName || "").trim();
     if (!cleanName) {
       setError("Enter a board name.");
       return;
@@ -321,7 +327,12 @@ export default function PcbWorkspacePane({
       })
       .catch((err) => setError(String(err)))
       .finally(() => setBusy(false));
-  }, [busy, draftName, refreshBoardList, repoPath]);
+  }, [busy, refreshBoardList, repoPath]);
+
+  const submitCreateBoard = useCallback((event) => {
+    event?.preventDefault?.();
+    createBoardWithName(draftName);
+  }, [createBoardWithName, draftName]);
 
   useEffect(() => {
     const nonce = Number(createRequestNonce || 0);
@@ -329,8 +340,8 @@ export default function PcbWorkspacePane({
       return;
     }
     createRequestSeenRef.current = nonce;
-    openCreateBoard();
-  }, [createRequestNonce, openCreateBoard]);
+    openCreateBoard(createRequestName);
+  }, [createRequestName, createRequestNonce, openCreateBoard]);
 
   useEffect(() => {
     const nonce = Number(refreshRequestNonce || 0);
@@ -340,6 +351,27 @@ export default function PcbWorkspacePane({
     refreshRequestSeenRef.current = nonce;
     refreshBoardList();
   }, [refreshBoardList, refreshRequestNonce]);
+
+  useEffect(() => {
+    const nonce = Number(controlCommand?.nonce || 0);
+    if (!nonce || controlCommandSeenRef.current === nonce) {
+      return;
+    }
+    controlCommandSeenRef.current = nonce;
+    const action = String(controlCommand?.action || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+    if (action === "create" || action === "new" || action === "new-board") {
+      const requestedName = String(controlCommand?.name || controlCommand?.boardName || controlCommand?.board_name || "").trim();
+      if (requestedName) {
+        createBoardWithName(requestedName);
+      } else {
+        openCreateBoard();
+      }
+      return;
+    }
+    if (action === "refresh" || action === "reload") {
+      refreshBoardList();
+    }
+  }, [controlCommand, createBoardWithName, openCreateBoard, refreshBoardList]);
 
   const selectBoardPath = useCallback((boardPath) => {
     const cleanPath = String(boardPath || "").trim();

@@ -16582,8 +16582,14 @@ function buildRustTerminalAuthorityWorkspaces({
     if (!workspaceId || !enabledWorkspaceIds.has(workspaceId)) {
       return;
     }
-    const paneKinds = getWorkspacePaneKinds(workspaceSettings || {}, workspaceId);
-    if (!workspacePaneKindsHasPanels(paneKinds)) {
+    const configuredPanels = buildWorkspaceConfiguredPanelSnapshots({
+      workspaceCommandable: true,
+      workspaceId,
+      workspaceName: workspace?.name || workspaceId,
+      workspaceRuntimeEnabled: enabledWorkspaceIds.has(workspaceId),
+      workspaceSettings,
+    });
+    if (!configuredPanels.length) {
       return;
     }
     ensureWorkspaceGroup(workspaceId, {
@@ -16593,31 +16599,19 @@ function buildRustTerminalAuthorityWorkspaces({
   });
 
   grouped.forEach((workspace, workspaceId) => {
-    const paneKinds = getWorkspacePaneKinds(workspaceSettings || {}, workspaceId);
     const occupiedIndexes = new Set(
       workspace.terminals
         .map((terminal) => Number(terminal.terminalIndex ?? terminal.terminal_index))
         .filter((value) => Number.isInteger(value) && value >= 0),
     );
-    workspace.panels = Object.entries(paneKinds)
-      .map(([index, kind]) => [Number.parseInt(index, 10), kind])
-      .filter(([index, kind]) => (
-        Number.isInteger(index)
-          && index >= 0
-          && WORKSPACE_PANE_KINDS.has(kind)
-          && !occupiedIndexes.has(index)
-      ))
-      .map(([terminalIndex, kind]) => buildWorkspacePanelSnapshot({
-        kind,
-        terminalIndex,
-        workspaceCommandable: workspace.commandable,
-        workspaceId,
-        workspaceName: workspace.workspaceName || workspace.workspace_name || workspaceId,
-        workspaceRuntimeEnabled: workspace.workspaceActive === true || workspace.workspace_active === true,
-      }))
-      .sort((left, right) => (
-        Number(left.terminalIndex ?? 9999) - Number(right.terminalIndex ?? 9999)
-      ));
+    workspace.panels = buildWorkspaceConfiguredPanelSnapshots({
+      excludeTerminalIndexes: occupiedIndexes,
+      workspaceCommandable: workspace.commandable,
+      workspaceId,
+      workspaceName: workspace.workspaceName || workspace.workspace_name || workspaceId,
+      workspaceRuntimeEnabled: workspace.workspaceActive === true || workspace.workspace_active === true,
+      workspaceSettings,
+    });
     workspace.panelListEmptyAuthoritative = workspace.panels.length === 0;
     workspace.panel_list_empty_authoritative = workspace.panels.length === 0;
     workspace.panelClearReason = workspace.panels.length ? "" : "no_workspace_panels";
@@ -17309,6 +17303,10 @@ function normalizeWorkspacePcbCount(value) {
 
 function getWorkspaceDocumentCount(workspaceSettings, workspaceId) {
   const settings = workspaceSettings?.[workspaceId];
+  const paneRecords = normalizeWorkspacePaneRecords(settings?.panes, { workspaceId });
+  if (workspacePaneRecordsHasKind(paneRecords, WORKSPACE_PANE_KIND_DOCS)) {
+    return MAX_WORKSPACE_DOCUMENT_COUNT;
+  }
   if (!settings || !Object.prototype.hasOwnProperty.call(settings, "documentsCount")) {
     return DEFAULT_WORKSPACE_DOCUMENT_COUNT;
   }
@@ -17871,19 +17869,29 @@ function normalizeWorkspaceSettings(value) {
         const rootDirectory = isDisallowedWorkspaceRootDirectory(cleanedRootDirectory)
           ? ""
             : cleanedRootDirectory;
+        const inputPanes = normalizeWorkspacePaneRecords(settings?.panes, { workspaceId });
+        const inputPaneKinds = workspacePaneKindsFromPaneRecords(inputPanes);
+        const inputPaneSlotIndexes = workspacePaneRecordsSlotIndexes(inputPanes);
+        const inputHasPanes = Object.prototype.hasOwnProperty.call(settings || {}, "panes");
+        const inputHasDocsPane = workspacePaneRecordsHasKind(inputPanes, WORKSPACE_PANE_KIND_DOCS);
         let terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
         let terminalRoles = normalizeWorkspaceTerminalRoles(settings?.terminalRoles, terminalCount);
         const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
         const hasDocumentsCount = Object.prototype.hasOwnProperty.call(settings || {}, "documentsCount");
         const documentsCount = hasDocumentsCount
           ? normalizeWorkspaceDocumentCount(settings.documentsCount)
-          : DEFAULT_WORKSPACE_DOCUMENT_COUNT;
+          : inputHasDocsPane
+            ? MAX_WORKSPACE_DOCUMENT_COUNT
+            : DEFAULT_WORKSPACE_DOCUMENT_COUNT;
         const hasDefaultDocumentsCount = documentsCount === DEFAULT_WORKSPACE_DOCUMENT_COUNT;
         const hasPcbCount = Object.prototype.hasOwnProperty.call(settings || {}, "pcbCount");
         let pcbCount = hasPcbCount
           ? normalizeWorkspacePcbCount(settings.pcbCount)
           : DEFAULT_WORKSPACE_PCB_COUNT;
-        let paneKinds = normalizeWorkspacePaneKinds(settings?.paneKinds);
+        let paneKinds = {
+          ...normalizeWorkspacePaneKinds(settings?.paneKinds),
+          ...inputPaneKinds,
+        };
         const existingPcbPaneCount = workspacePaneKindsPcbIndexes(paneKinds).length;
         if (!hasPcbCount && existingPcbPaneCount > 0) {
           pcbCount = normalizeWorkspacePcbCount(existingPcbPaneCount);
@@ -17902,7 +17910,12 @@ function normalizeWorkspaceSettings(value) {
         const hasLogicalTerminalIndexes = Object.prototype.hasOwnProperty.call(settings || {}, "logicalTerminalIndexes");
         const logicalTerminalIndexes = hasLogicalTerminalIndexes
           ? normalizePersistedWorkspaceLogicalIndexes(settings.logicalTerminalIndexes, terminalCount, paneKinds)
-          : null;
+          : inputHasPanes
+            ? normalizeWorkspaceTerminalSlotIndexes([
+              ...inputPaneSlotIndexes,
+              ...workspacePaneKindsIndexes(paneKinds),
+            ])
+            : null;
         if (Array.isArray(logicalTerminalIndexes)) {
           terminalRoles = expandTerminalRolesForSlotIndexes(
             terminalRoles,
@@ -17917,6 +17930,16 @@ function normalizeWorkspaceSettings(value) {
           : null;
         const hasDefaultPcbCount = pcbCount === DEFAULT_WORKSPACE_PCB_COUNT;
         const hasPanelPanes = workspacePaneKindsHasPanels(paneKinds);
+        const paneRecordIndexes = Array.isArray(logicalTerminalIndexes)
+          ? logicalTerminalIndexes
+          : normalizeWorkspaceTerminalIndexes(undefined, terminalCount);
+        const panes = buildWorkspacePaneRecordsFromLayout({
+          documentsCount,
+          logicalTerminalIndexes: paneRecordIndexes,
+          paneKinds,
+          terminalRoles,
+          workspaceId,
+        });
         const agentPermissions = normalizeWorkspaceAgentPermissions(settings?.agentPermissions);
         const hasCustomAgentPermissions = Object.values(agentPermissions)
           .some((mode) => mode !== WORKSPACE_AGENT_PERMISSION_ACCEPT_EDITS);
@@ -17934,7 +17957,7 @@ function normalizeWorkspaceSettings(value) {
           !workspaceId
           || (
             !rootDirectory
-            && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
+            && terminalCount <= MIN_WORKSPACE_TERMINAL_COUNT
             && !hasCustomTerminalRoles
             && hasDefaultDocumentsCount
             && hasDefaultPcbCount
@@ -17958,6 +17981,7 @@ function normalizeWorkspaceSettings(value) {
             terminalRoles,
             documentsCount,
             pcbCount,
+            ...(panes.length ? { panes } : {}),
             ...(hasPanelPanes ? { paneKinds } : {}),
             ...(Array.isArray(logicalTerminalIndexes) ? { logicalTerminalIndexes } : {}),
             ...(Array.isArray(displayRows) ? { displayRows } : {}),
@@ -19379,12 +19403,315 @@ function getWorkspaceTerminalRoles(
   );
 }
 
+const WORKSPACE_PANE_KIND_TERMINAL = "terminal";
+const WORKSPACE_PANE_KIND_DOCS = "docs";
 const WORKSPACE_PANE_KIND_WEB = "web";
 const WORKSPACE_PANE_KIND_PCB = "pcb";
 const WORKSPACE_PANE_KINDS = new Set([
   WORKSPACE_PANE_KIND_WEB,
   WORKSPACE_PANE_KIND_PCB,
 ]);
+const WORKSPACE_SLOT_PANE_KINDS = new Set([
+  WORKSPACE_PANE_KIND_TERMINAL,
+  WORKSPACE_PANE_KIND_WEB,
+  WORKSPACE_PANE_KIND_PCB,
+]);
+const WORKSPACE_PANE_RECORD_KINDS = new Set([
+  WORKSPACE_PANE_KIND_TERMINAL,
+  WORKSPACE_PANE_KIND_DOCS,
+  WORKSPACE_PANE_KIND_WEB,
+  WORKSPACE_PANE_KIND_PCB,
+]);
+
+function normalizeWorkspacePaneKind(value, fallback = "") {
+  const normalizedKind = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+  if (!normalizedKind) {
+    return fallback;
+  }
+  if (["terminal", "term", "shell", "workspace-terminal", "agent-terminal", "coding-agent"].includes(normalizedKind)) {
+    return WORKSPACE_PANE_KIND_TERMINAL;
+  }
+  if (["document", "documents", "docs", "doc", "workspace-docs", "workspace-document", "docs-panel", "documents-panel", "document-panel"].includes(normalizedKind)) {
+    return WORKSPACE_PANE_KIND_DOCS;
+  }
+  if (["web", "browser", "chrome", "workspace-browser", "workspace-web", "web-panel"].includes(normalizedKind)) {
+    return WORKSPACE_PANE_KIND_WEB;
+  }
+  if (["pcb", "pcb-design", "pcb-panel", "workspace-pcb"].includes(normalizedKind)) {
+    return WORKSPACE_PANE_KIND_PCB;
+  }
+  return fallback;
+}
+
+function workspacePaneRecordKindLabel(kind) {
+  if (kind === WORKSPACE_PANE_KIND_DOCS) return "Docs";
+  if (kind === WORKSPACE_PANE_KIND_PCB) return "PCB";
+  if (kind === WORKSPACE_PANE_KIND_WEB) return "Web";
+  return "Terminal";
+}
+
+function getWorkspacePaneRecordId({
+  kind,
+  paneId = "",
+  terminalIndex,
+  terminalRole = WORKSPACE_TERMINAL_ROLE_GENERIC,
+  workspaceId,
+} = {}) {
+  const explicitPaneId = String(paneId || "").trim();
+  if (explicitPaneId) {
+    return explicitPaneId;
+  }
+  if (kind === WORKSPACE_PANE_KIND_DOCS) {
+    return "workspace-document-panel";
+  }
+  if (Number.isInteger(terminalIndex)) {
+    return getWorkspaceTerminalPaneId(
+      workspaceId,
+      terminalIndex,
+      getWorkspaceTerminalPaneAgentId(terminalRole || WORKSPACE_TERMINAL_ROLE_GENERIC),
+    );
+  }
+  return "";
+}
+
+function normalizeWorkspacePaneRecords(value, options = {}) {
+  const workspaceId = String(options.workspaceId || "").trim();
+  const candidates = Array.isArray(value)
+    ? value
+    : value && typeof value === "object"
+      ? Object.entries(value).map(([key, pane]) => (
+        pane && typeof pane === "object" && !Array.isArray(pane)
+          ? { id: key, ...pane }
+          : { id: key, kind: pane }
+      ))
+      : [];
+  const usedSlots = new Set();
+  const records = [];
+  let docsRecorded = false;
+
+  candidates.forEach((pane, order) => {
+    const source = pane && typeof pane === "object" && !Array.isArray(pane)
+      ? pane
+      : { kind: pane };
+    const kind = normalizeWorkspacePaneKind(
+      source.kind
+        || source.paneKind
+        || source.pane_kind
+        || source.panelKind
+        || source.panel_kind
+        || source.panelType
+        || source.panel_type
+        || source.surfaceKind
+        || source.surface_kind
+        || source.type
+        || source.role,
+    );
+    if (!WORKSPACE_PANE_RECORD_KINDS.has(kind)) {
+      return;
+    }
+
+    const rawSlotIndex = source.slotIndex
+      ?? source.slot_index
+      ?? source.terminalIndex
+      ?? source.terminal_index
+      ?? source.index;
+    const slotIndex = Number.parseInt(rawSlotIndex, 10);
+    const rawOrder = Number.parseInt(source.order ?? source.position ?? source.sortOrder ?? source.sort_order, 10);
+    const paneOrder = Number.isInteger(rawOrder) ? rawOrder : order;
+
+    if (kind === WORKSPACE_PANE_KIND_DOCS) {
+      if (docsRecorded) {
+        return;
+      }
+      docsRecorded = true;
+      const paneId = getWorkspacePaneRecordId({
+        kind,
+        paneId: source.paneId || source.pane_id || source.panelId || source.panel_id || source.id,
+        workspaceId,
+      });
+      records.push({
+        id: paneId,
+        kind,
+        order: paneOrder,
+        paneId,
+        pane_id: paneId,
+        panelId: paneId,
+        panel_id: paneId,
+        title: workspacePaneRecordKindLabel(kind),
+      });
+      return;
+    }
+
+    if (
+      !Number.isInteger(slotIndex)
+      || slotIndex < 0
+      || slotIndex >= MAX_WORKSPACE_TERMINAL_COUNT
+      || usedSlots.has(slotIndex)
+      || !WORKSPACE_SLOT_PANE_KINDS.has(kind)
+    ) {
+      return;
+    }
+
+    usedSlots.add(slotIndex);
+    const terminalRole = normalizeWorkspaceTerminalRole(
+      source.terminalRole || source.terminal_role || source.role || WORKSPACE_TERMINAL_ROLE_GENERIC,
+      WORKSPACE_TERMINAL_ROLE_GENERIC,
+    );
+    const paneId = getWorkspacePaneRecordId({
+      kind,
+      paneId: source.paneId || source.pane_id || source.panelId || source.panel_id || source.id,
+      terminalIndex: slotIndex,
+      terminalRole,
+      workspaceId,
+    });
+    records.push({
+      id: paneId,
+      kind,
+      order: paneOrder,
+      paneId,
+      pane_id: paneId,
+      panelId: paneId,
+      panel_id: paneId,
+      slotIndex,
+      slot_index: slotIndex,
+      terminalIndex: slotIndex,
+      terminal_index: slotIndex,
+      terminalRole,
+      terminal_role: terminalRole,
+      title: workspacePaneRecordKindLabel(kind),
+    });
+  });
+
+  return records.sort((left, right) => {
+    const leftOrder = Number(left.order ?? 0);
+    const rightOrder = Number(right.order ?? 0);
+    if (leftOrder !== rightOrder) {
+      return leftOrder - rightOrder;
+    }
+    const leftSlot = Number.isInteger(left.slotIndex) ? left.slotIndex : MAX_WORKSPACE_TERMINAL_COUNT + 1;
+    const rightSlot = Number.isInteger(right.slotIndex) ? right.slotIndex : MAX_WORKSPACE_TERMINAL_COUNT + 1;
+    return leftSlot - rightSlot;
+  });
+}
+
+function workspacePaneRecordsSlotIndexes(panes) {
+  return normalizeWorkspaceTerminalSlotIndexes(
+    (Array.isArray(panes) ? panes : [])
+      .map((pane) => pane?.slotIndex ?? pane?.slot_index ?? pane?.terminalIndex ?? pane?.terminal_index),
+  );
+}
+
+function workspacePaneKindsFromPaneRecords(panes) {
+  return Object.fromEntries(
+    (Array.isArray(panes) ? panes : [])
+      .map((pane) => {
+        const kind = normalizeWorkspacePaneKind(pane?.kind || pane?.paneKind || pane?.pane_kind);
+        const slotIndex = Number.parseInt(
+          pane?.slotIndex ?? pane?.slot_index ?? pane?.terminalIndex ?? pane?.terminal_index,
+          10,
+        );
+        return [slotIndex, kind];
+      })
+      .filter(([slotIndex, kind]) => (
+        Number.isInteger(slotIndex)
+        && slotIndex >= 0
+        && slotIndex < MAX_WORKSPACE_TERMINAL_COUNT
+        && WORKSPACE_PANE_KINDS.has(kind)
+      )),
+  );
+}
+
+function workspacePaneRecordsHasKind(panes, paneKind) {
+  return (Array.isArray(panes) ? panes : []).some((pane) => (
+    normalizeWorkspacePaneKind(pane?.kind || pane?.paneKind || pane?.pane_kind) === paneKind
+  ));
+}
+
+function buildWorkspacePaneRecord({
+  kind,
+  order = 0,
+  terminalIndex,
+  terminalRole = WORKSPACE_TERMINAL_ROLE_GENERIC,
+  workspaceId,
+} = {}) {
+  const paneKind = normalizeWorkspacePaneKind(kind, WORKSPACE_PANE_KIND_TERMINAL);
+  if (!WORKSPACE_PANE_RECORD_KINDS.has(paneKind)) {
+    return null;
+  }
+  const slotIndex = Number.parseInt(terminalIndex, 10);
+  if (paneKind !== WORKSPACE_PANE_KIND_DOCS && (
+    !Number.isInteger(slotIndex)
+    || slotIndex < 0
+    || slotIndex >= MAX_WORKSPACE_TERMINAL_COUNT
+  )) {
+    return null;
+  }
+  const normalizedRole = paneKind === WORKSPACE_PANE_KIND_DOCS
+    ? ""
+    : normalizeWorkspaceTerminalRole(terminalRole, WORKSPACE_TERMINAL_ROLE_GENERIC);
+  const paneId = getWorkspacePaneRecordId({
+    kind: paneKind,
+    terminalIndex: Number.isInteger(slotIndex) ? slotIndex : null,
+    terminalRole: normalizedRole || WORKSPACE_TERMINAL_ROLE_GENERIC,
+    workspaceId,
+  });
+  if (!paneId) {
+    return null;
+  }
+
+  return {
+    id: paneId,
+    kind: paneKind,
+    order,
+    paneId,
+    pane_id: paneId,
+    panelId: paneId,
+    panel_id: paneId,
+    ...(paneKind !== WORKSPACE_PANE_KIND_DOCS ? {
+      slotIndex,
+      slot_index: slotIndex,
+      terminalIndex: slotIndex,
+      terminal_index: slotIndex,
+      terminalRole: normalizedRole,
+      terminal_role: normalizedRole,
+    } : {}),
+    title: workspacePaneRecordKindLabel(paneKind),
+  };
+}
+
+function buildWorkspacePaneRecordsFromLayout({
+  documentsCount = DEFAULT_WORKSPACE_DOCUMENT_COUNT,
+  logicalTerminalIndexes,
+  paneKinds,
+  terminalRoles,
+  workspaceId,
+} = {}) {
+  const indexes = normalizeWorkspaceTerminalSlotIndexes(logicalTerminalIndexes);
+  const normalizedPaneKinds = normalizeWorkspacePaneKinds(paneKinds);
+  const roles = Array.isArray(terminalRoles) ? terminalRoles : [];
+  const records = indexes
+    .map((terminalIndex, index) => buildWorkspacePaneRecord({
+      kind: normalizedPaneKinds[terminalIndex] || WORKSPACE_PANE_KIND_TERMINAL,
+      order: index,
+      terminalIndex,
+      terminalRole: roles[index] || roles[terminalIndex] || WORKSPACE_TERMINAL_ROLE_GENERIC,
+      workspaceId,
+    }))
+    .filter(Boolean);
+
+  if (normalizeWorkspaceDocumentCount(documentsCount) > 0) {
+    const docsRecord = buildWorkspacePaneRecord({
+      kind: WORKSPACE_PANE_KIND_DOCS,
+      order: records.length,
+      workspaceId,
+    });
+    if (docsRecord) {
+      records.push(docsRecord);
+    }
+  }
+
+  return records;
+}
 
 // paneKinds maps an integer terminal slot index -> a non-terminal pane kind
 // ("web" or "pcb"). Slots without an entry are normal terminals. This rides
@@ -19399,12 +19726,7 @@ function normalizeWorkspacePaneKinds(value) {
     : Object.entries(value);
   entries.forEach(([key, kind]) => {
     const index = Number.parseInt(key, 10);
-    const normalizedKind = String(kind || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
-    const canonicalKind = ["browser", "chrome", "workspace-browser", "workspace-web", "web-panel"].includes(normalizedKind)
-      ? WORKSPACE_PANE_KIND_WEB
-      : ["pcb-design", "pcb-panel", "workspace-pcb"].includes(normalizedKind)
-        ? WORKSPACE_PANE_KIND_PCB
-        : String(kind);
+    const canonicalKind = normalizeWorkspacePaneKind(kind);
     if (
       Number.isInteger(index)
       && index >= 0
@@ -19418,7 +19740,51 @@ function normalizeWorkspacePaneKinds(value) {
 }
 
 function getWorkspacePaneKinds(workspaceSettings, workspaceId) {
-  return normalizeWorkspacePaneKinds(workspaceSettings?.[workspaceId]?.paneKinds);
+  const settings = workspaceSettings?.[workspaceId] || {};
+  return {
+    ...normalizeWorkspacePaneKinds(settings?.paneKinds),
+    ...workspacePaneKindsFromPaneRecords(
+      normalizeWorkspacePaneRecords(settings?.panes, { workspaceId }),
+    ),
+  };
+}
+
+function getWorkspacePaneRecords(workspaceSettings, workspaceId) {
+  const settings = workspaceSettings?.[workspaceId] || {};
+  const normalizedPanes = normalizeWorkspacePaneRecords(settings?.panes, { workspaceId });
+  const documentsCount = Object.prototype.hasOwnProperty.call(settings || {}, "documentsCount")
+    ? normalizeWorkspaceDocumentCount(settings.documentsCount)
+    : workspacePaneRecordsHasKind(normalizedPanes, WORKSPACE_PANE_KIND_DOCS)
+      ? MAX_WORKSPACE_DOCUMENT_COUNT
+      : DEFAULT_WORKSPACE_DOCUMENT_COUNT;
+  if (normalizedPanes.length) {
+    if (
+      documentsCount > 0
+      && !workspacePaneRecordsHasKind(normalizedPanes, WORKSPACE_PANE_KIND_DOCS)
+    ) {
+      const docsRecord = buildWorkspacePaneRecord({
+        kind: WORKSPACE_PANE_KIND_DOCS,
+        order: normalizedPanes.length,
+        workspaceId,
+      });
+      return docsRecord ? [...normalizedPanes, docsRecord] : normalizedPanes;
+    }
+    return normalizedPanes;
+  }
+
+  const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspaceId);
+  const paneKinds = normalizeWorkspacePaneKinds(settings?.paneKinds);
+  const logicalTerminalIndexes = Object.prototype.hasOwnProperty.call(settings || {}, "logicalTerminalIndexes")
+    ? normalizePersistedWorkspaceLogicalIndexes(settings.logicalTerminalIndexes, terminalCount, paneKinds)
+    : normalizeWorkspaceTerminalIndexes(undefined, terminalCount);
+  const terminalRoles = getWorkspaceTerminalRoles(workspaceSettings, workspaceId, terminalCount);
+  return buildWorkspacePaneRecordsFromLayout({
+    documentsCount,
+    logicalTerminalIndexes,
+    paneKinds,
+    terminalRoles,
+    workspaceId,
+  });
 }
 
 function workspacePaneKindsHasPanels(paneKinds) {
@@ -19433,16 +19799,25 @@ function workspacePaneKindLabel(kind) {
 
 function buildWorkspacePanelSnapshot({
   kind,
+  paneId,
   terminalIndex,
+  terminalRole = WORKSPACE_TERMINAL_ROLE_GENERIC,
   workspaceCommandable,
   workspaceId,
   workspaceName,
   workspaceRuntimeEnabled,
 }) {
   const safeIndex = Number.isInteger(terminalIndex) && terminalIndex >= 0 ? terminalIndex : 0;
-  const panelKind = WORKSPACE_PANE_KINDS.has(kind) ? kind : WORKSPACE_PANE_KIND_WEB;
-  const displayName = workspacePaneKindLabel(panelKind);
-  const panelId = `workspace-panel-${workspaceId}-${panelKind}-${safeIndex}`;
+  const panelKind = normalizeWorkspacePaneKind(kind, WORKSPACE_PANE_KIND_WEB);
+  const slotIndex = panelKind === WORKSPACE_PANE_KIND_DOCS ? null : safeIndex;
+  const displayName = workspacePaneRecordKindLabel(panelKind);
+  const panelId = getWorkspacePaneRecordId({
+    kind: panelKind,
+    paneId,
+    terminalIndex: slotIndex,
+    terminalRole,
+    workspaceId,
+  }) || `workspace-panel-${workspaceId}-${panelKind}-${safeIndex}`;
   const status = workspaceRuntimeEnabled ? "open" : "closed";
   return {
     active: workspaceRuntimeEnabled,
@@ -19466,15 +19841,15 @@ function buildWorkspacePanelSnapshot({
     panel_name: displayName,
     panelType: panelKind,
     panel_type: panelKind,
-    slotIndex: safeIndex,
-    slot_index: safeIndex,
+    slotIndex,
+    slot_index: slotIndex,
     status,
     surfaceKind: panelKind,
     surface_kind: panelKind,
     targetPanelId: panelId,
     target_panel_id: panelId,
-    terminalIndex: safeIndex,
-    terminal_index: safeIndex,
+    terminalIndex: slotIndex,
+    terminal_index: slotIndex,
     terminalKind: "workspace_panel",
     terminal_kind: "workspace_panel",
     title: displayName,
@@ -19483,6 +19858,52 @@ function buildWorkspacePanelSnapshot({
     workspaceName,
     workspace_name: workspaceName,
   };
+}
+
+function buildWorkspaceConfiguredPanelSnapshots({
+  excludeTerminalIndexes = new Set(),
+  workspaceCommandable,
+  workspaceId,
+  workspaceName,
+  workspaceRuntimeEnabled,
+  workspaceSettings,
+} = {}) {
+  const excluded = new Set(
+    Array.from(excludeTerminalIndexes || [])
+      .map((value) => Number.parseInt(value, 10))
+      .filter((value) => Number.isInteger(value)),
+  );
+  return getWorkspacePaneRecords(workspaceSettings || {}, workspaceId)
+    .map((pane) => {
+      const kind = normalizeWorkspacePaneKind(pane?.kind || pane?.paneKind || pane?.pane_kind);
+      if (kind === WORKSPACE_PANE_KIND_TERMINAL || !WORKSPACE_PANE_RECORD_KINDS.has(kind)) {
+        return null;
+      }
+      const terminalIndex = Number.parseInt(
+        pane?.terminalIndex ?? pane?.terminal_index ?? pane?.slotIndex ?? pane?.slot_index,
+        10,
+      );
+      if (
+        kind !== WORKSPACE_PANE_KIND_DOCS
+        && (!Number.isInteger(terminalIndex) || excluded.has(terminalIndex))
+      ) {
+        return null;
+      }
+      return buildWorkspacePanelSnapshot({
+        kind,
+        paneId: pane?.paneId || pane?.pane_id || pane?.panelId || pane?.panel_id || pane?.id,
+        terminalIndex,
+        terminalRole: pane?.terminalRole || pane?.terminal_role || WORKSPACE_TERMINAL_ROLE_GENERIC,
+        workspaceCommandable,
+        workspaceId,
+        workspaceName,
+        workspaceRuntimeEnabled,
+      });
+    })
+    .filter(Boolean)
+    .sort((left, right) => (
+      Number(left.terminalIndex ?? 9999) - Number(right.terminalIndex ?? 9999)
+    ));
 }
 
 function isWorkspacePanelPaneIndex(paneKinds, terminalIndex) {
@@ -19530,13 +19951,11 @@ function expandTerminalRolesForPaneKinds(terminalRoles, paneKinds, fallbackRole 
 }
 
 function expandTerminalRolesForSlotIndexes(terminalRoles, slotIndexes, fallbackRole = "codex") {
-  const nextRoles = Array.isArray(terminalRoles) ? terminalRoles.slice(0, MAX_WORKSPACE_TERMINAL_COUNT) : [];
   const indexes = normalizeWorkspaceTerminalSlotIndexes(slotIndexes);
-  const highestIndex = indexes.length ? indexes[indexes.length - 1] : -1;
-  const targetLength = Math.min(
-    MAX_WORKSPACE_TERMINAL_COUNT,
-    Math.max(nextRoles.length, highestIndex + 1),
-  );
+  const targetLength = Math.min(MAX_WORKSPACE_TERMINAL_COUNT, indexes.length);
+  const nextRoles = Array.isArray(terminalRoles)
+    ? terminalRoles.slice(0, targetLength)
+    : [];
 
   while (nextRoles.length < targetLength) {
     nextRoles.push(fallbackRole || "codex");
@@ -19643,10 +20062,10 @@ function reconcileWorkspaceTerminalSlotIndexesExcluding(indexes, count, excludeI
 function getWorkspaceLogicalTerminalIndexes(workspaceTerminalLogicalIndexes, workspaceId, terminalCount) {
   if (Object.prototype.hasOwnProperty.call(workspaceTerminalLogicalIndexes || {}, workspaceId)) {
     const configuredIndexes = workspaceTerminalLogicalIndexes[workspaceId];
-    if (Array.isArray(configuredIndexes) && configuredIndexes.length === 0) {
-      return [];
+    if (Array.isArray(configuredIndexes)) {
+      return normalizeWorkspaceTerminalSlotIndexes(configuredIndexes);
     }
-    return reconcileWorkspaceTerminalSlotIndexes(configuredIndexes, terminalCount);
+    return normalizeWorkspaceTerminalIndexes(undefined, terminalCount);
   }
 
   return normalizeWorkspaceTerminalIndexes(undefined, terminalCount);
@@ -19752,16 +20171,27 @@ function normalizePersistedWorkspaceDisplayRows(value, logicalTerminalIndexes) {
 function workspaceSettingsLogicalIndexLayouts(workspaceSettings = {}) {
   const layouts = {};
   Object.entries(workspaceSettings || {}).forEach(([workspaceId, settings]) => {
-    if (!Object.prototype.hasOwnProperty.call(settings || {}, "logicalTerminalIndexes")) {
+    const hasLogicalTerminalIndexes = Object.prototype.hasOwnProperty.call(settings || {}, "logicalTerminalIndexes");
+    const hasPanes = Object.prototype.hasOwnProperty.call(settings || {}, "panes");
+    if (!hasLogicalTerminalIndexes && !hasPanes) {
       return;
     }
-    const paneKinds = normalizeWorkspacePaneKinds(settings?.paneKinds);
+    const panes = normalizeWorkspacePaneRecords(settings?.panes, { workspaceId });
+    const paneKinds = {
+      ...normalizeWorkspacePaneKinds(settings?.paneKinds),
+      ...workspacePaneKindsFromPaneRecords(panes),
+    };
     const terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
-    const logicalIndexes = normalizePersistedWorkspaceLogicalIndexes(
-      settings.logicalTerminalIndexes,
-      terminalCount,
-      paneKinds,
-    );
+    const logicalIndexes = hasLogicalTerminalIndexes
+      ? normalizePersistedWorkspaceLogicalIndexes(
+        settings.logicalTerminalIndexes,
+        terminalCount,
+        paneKinds,
+      )
+      : normalizeWorkspaceTerminalSlotIndexes([
+        ...workspacePaneRecordsSlotIndexes(panes),
+        ...workspacePaneKindsIndexes(paneKinds),
+      ]);
     if (Array.isArray(logicalIndexes)) {
       layouts[workspaceId] = logicalIndexes;
     }
@@ -19775,13 +20205,24 @@ function workspaceSettingsDisplayLayouts(workspaceSettings = {}) {
     if (!Object.prototype.hasOwnProperty.call(settings || {}, "displayRows")) {
       return;
     }
-    const paneKinds = normalizeWorkspacePaneKinds(settings?.paneKinds);
+    const panes = normalizeWorkspacePaneRecords(settings?.panes, { workspaceId });
+    const paneKinds = {
+      ...normalizeWorkspacePaneKinds(settings?.paneKinds),
+      ...workspacePaneKindsFromPaneRecords(panes),
+    };
     const terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
     const logicalIndexes = normalizePersistedWorkspaceLogicalIndexes(
       settings?.logicalTerminalIndexes,
       terminalCount,
       paneKinds,
-    ) || normalizeWorkspaceTerminalIndexes(undefined, terminalCount);
+    ) || (
+      Object.prototype.hasOwnProperty.call(settings || {}, "panes")
+        ? normalizeWorkspaceTerminalSlotIndexes([
+          ...workspacePaneRecordsSlotIndexes(panes),
+          ...workspacePaneKindsIndexes(paneKinds),
+        ])
+        : normalizeWorkspaceTerminalIndexes(undefined, terminalCount)
+    );
     const displayRows = normalizePersistedWorkspaceDisplayRows(settings.displayRows, logicalIndexes);
     if (Array.isArray(displayRows)) {
       layouts[workspaceId] = displayRows;
@@ -19856,7 +20297,25 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const hasDocumentsCount = Object.prototype.hasOwnProperty.call(nextValues, "documentsCount");
   const hasPcbCount = Object.prototype.hasOwnProperty.call(nextValues, "pcbCount");
   const hasPaneKinds = Object.prototype.hasOwnProperty.call(nextValues, "paneKinds");
+  const hasPanes = Object.prototype.hasOwnProperty.call(nextValues, "panes");
   const hasAgentPermissions = Object.prototype.hasOwnProperty.call(nextValues, "agentPermissions");
+  const layoutTouched = hasPanes
+    || hasPaneKinds
+    || hasLogicalTerminalIndexes
+    || hasTerminalCount
+    || hasTerminalRoles
+    || hasPcbCount;
+  const inputPanes = normalizeWorkspacePaneRecords(
+    hasPanes
+      ? nextValues.panes
+      : layoutTouched
+        ? null
+        : currentSettings.panes,
+    { workspaceId },
+  );
+  const inputPaneKinds = workspacePaneKindsFromPaneRecords(inputPanes);
+  const inputPaneSlotIndexes = workspacePaneRecordsSlotIndexes(inputPanes);
+  const inputHasDocsPane = workspacePaneRecordsHasKind(inputPanes, WORKSPACE_PANE_KIND_DOCS);
   const cleanedRootDirectory = cleanWorkspaceRootDirectory(
     hasRootDirectory ? nextValues.rootDirectory : currentSettings.rootDirectory,
   ).slice(0, MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH);
@@ -19897,7 +20356,9 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
       ? nextValues.documentsCount
       : Object.prototype.hasOwnProperty.call(currentSettings, "documentsCount")
         ? currentSettings.documentsCount
-        : DEFAULT_WORKSPACE_DOCUMENT_COUNT,
+        : inputHasDocsPane
+          ? MAX_WORKSPACE_DOCUMENT_COUNT
+          : DEFAULT_WORKSPACE_DOCUMENT_COUNT,
   );
   const hasDefaultDocumentsCount = documentsCount === DEFAULT_WORKSPACE_DOCUMENT_COUNT;
   let pcbCount = normalizeWorkspacePcbCount(
@@ -19907,9 +20368,12 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
         ? currentSettings.pcbCount
         : DEFAULT_WORKSPACE_PCB_COUNT,
   );
-  let paneKinds = normalizeWorkspacePaneKinds(
-    hasPaneKinds ? nextValues.paneKinds : currentSettings.paneKinds,
-  );
+  let paneKinds = {
+    ...normalizeWorkspacePaneKinds(
+      hasPaneKinds ? nextValues.paneKinds : currentSettings.paneKinds,
+    ),
+    ...inputPaneKinds,
+  };
   const existingPcbPaneCount = workspacePaneKindsPcbIndexes(paneKinds).length;
   if (!hasPcbCount && existingPcbPaneCount > 0) {
     pcbCount = normalizeWorkspacePcbCount(existingPcbPaneCount);
@@ -19933,7 +20397,12 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
       terminalCount,
       paneKinds,
     )
-    : null;
+    : hasPanes
+      ? normalizeWorkspaceTerminalSlotIndexes([
+        ...inputPaneSlotIndexes,
+        ...workspacePaneKindsIndexes(paneKinds),
+      ])
+      : null;
   if (Array.isArray(logicalTerminalIndexes)) {
     terminalRoles = expandTerminalRolesForSlotIndexes(
       terminalRoles,
@@ -19952,6 +20421,16 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     : null;
   const hasDefaultPcbCount = pcbCount === DEFAULT_WORKSPACE_PCB_COUNT;
   const hasPanelPanes = workspacePaneKindsHasPanels(paneKinds);
+  const paneRecordIndexes = Array.isArray(logicalTerminalIndexes)
+    ? logicalTerminalIndexes
+    : normalizeWorkspaceTerminalIndexes(undefined, terminalCount);
+  const panes = buildWorkspacePaneRecordsFromLayout({
+    documentsCount,
+    logicalTerminalIndexes: paneRecordIndexes,
+    paneKinds,
+    terminalRoles,
+    workspaceId,
+  });
   const agentPermissions = normalizeWorkspaceAgentPermissions(
     hasAgentPermissions ? nextValues.agentPermissions : currentSettings.agentPermissions,
   );
@@ -19974,7 +20453,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
 
   if (
     !rootDirectory
-    && terminalCount === MIN_WORKSPACE_TERMINAL_COUNT
+    && terminalCount <= MIN_WORKSPACE_TERMINAL_COUNT
     && !hasCustomTerminalRoles
     && hasDefaultDocumentsCount
     && hasDefaultPcbCount
@@ -19996,6 +20475,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     terminalRoles,
     documentsCount,
     pcbCount,
+    ...(panes.length ? { panes } : {}),
     ...(hasPanelPanes ? { paneKinds } : {}),
     ...(Array.isArray(logicalTerminalIndexes) ? { logicalTerminalIndexes } : {}),
     ...(Array.isArray(displayRows) ? { displayRows } : {}),
@@ -20170,6 +20650,10 @@ export default function App() {
   const [accountWorkspaceToolTab, setAccountWorkspaceToolTab] = useState("orchestrator");
   const [workspaceToolLayoutWidth, setWorkspaceToolLayoutWidth] = useState(0);
   const [workspaceToolRuntimeBridges, setWorkspaceToolRuntimeBridges] = useState({});
+  const workspaceToolRuntimeBridgesRef = useRef(workspaceToolRuntimeBridges);
+  useEffect(() => {
+    workspaceToolRuntimeBridgesRef.current = workspaceToolRuntimeBridges;
+  }, [workspaceToolRuntimeBridges]);
   const [pendingWorkspaceDocumentPanelOpen, setPendingWorkspaceDocumentPanelOpen] = useState(null);
   const [accountToolDraft, setAccountToolDraft] = useState("");
   const [accountToolItems, setAccountToolItems] = useState([]);
@@ -20332,8 +20816,24 @@ export default function App() {
     const safeContext = context && typeof context === "object" && !Array.isArray(context)
       ? context
       : null;
+    const safeSurface = String(safeContext?.surface || "").trim().toLowerCase().replace(/_/g, "-");
+    const previousContext = appControlVisibleContextRef.current;
+    const previousSurface = String(previousContext?.surface || "").trim().toLowerCase().replace(/_/g, "-");
+    if (
+      safeContext?.active === false
+      && previousContext?.active !== false
+      && safeSurface
+      && previousSurface
+      && safeSurface !== previousSurface
+    ) {
+      return;
+    }
     appControlVisibleContextRef.current = safeContext;
-    if (safeContext?.surface === "tools" && safeContext.active !== false) {
+    const documentSurfaceActive = (
+      safeSurface === "tools" || safeSurface === "workspace-docs"
+    ) && safeContext?.active !== false;
+    const scriptSurfaceActive = safeSurface === "tools" && safeContext?.active !== false;
+    if (documentSurfaceActive || scriptSurfaceActive) {
       if (safeContext.document) {
         const capturedAtMs = Date.now();
         let snapshot = null;
@@ -20352,7 +20852,7 @@ export default function App() {
         appControlDocumentContextSnapshotRef.current = null;
         appControlDocumentSelectionSnapshotRef.current = null;
       }
-      if (safeContext.script) {
+      if (scriptSurfaceActive && safeContext.script) {
         const capturedAtMs = Date.now();
         let snapshot = null;
         try {
@@ -20371,12 +20871,18 @@ export default function App() {
         appControlScriptSelectionSnapshotRef.current = null;
       }
     }
-    if (!(safeContext?.surface === "tools" && safeContext.active !== false && safeContext.script)) {
+    if (!(scriptSurfaceActive && safeContext.script)) {
       appControlScriptContextSnapshotRef.current = null;
       appControlScriptSelectionSnapshotRef.current = null;
     }
+    if (!(documentSurfaceActive && safeContext?.document)) {
+      appControlDocumentContextSnapshotRef.current = null;
+      if (!(documentSurfaceActive && safeContext?.highlightedRange?.active === true)) {
+        appControlDocumentSelectionSnapshotRef.current = null;
+      }
+    }
     if (
-      safeContext?.surface === "tools"
+      documentSurfaceActive
       && safeContext?.document
       && safeContext?.highlightedRange?.active === true
     ) {
@@ -20400,7 +20906,7 @@ export default function App() {
       appControlDocumentSelectionSnapshotRef.current = snapshot;
     }
     if (
-      safeContext?.surface === "tools"
+      scriptSurfaceActive
       && safeContext?.script
       && safeContext?.highlightedRange?.active === true
     ) {
@@ -23647,8 +24153,14 @@ export default function App() {
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceSettingsModalId("");
-    setWorkspaceTerminalLogicalIndexes({});
-    setWorkspaceTerminalDisplayLayouts({});
+    {
+      const restoredLogicalLayouts = workspaceSettingsLogicalIndexLayouts(workspaceSettingsRef.current);
+      const restoredDisplayLayouts = workspaceSettingsDisplayLayouts(workspaceSettingsRef.current);
+      workspaceTerminalLogicalIndexesRef.current = restoredLogicalLayouts;
+      workspaceTerminalDisplayLayoutsRef.current = restoredDisplayLayouts;
+      setWorkspaceTerminalLogicalIndexes(restoredLogicalLayouts);
+      setWorkspaceTerminalDisplayLayouts(restoredDisplayLayouts);
+    }
     setCloudWorkspaceProgress(CLOUD_WORKSPACE_PROGRESS_INITIAL_STATE);
     agentInitialStatusUserRef.current = "";
     workspaceTerminalsSyncKeyRef.current = "";
@@ -23719,8 +24231,14 @@ export default function App() {
     setWorkspaceSettingsError("");
     setWorkspaceSettingsMessage("");
     setWorkspaceSettingsModalId("");
-    setWorkspaceTerminalLogicalIndexes({});
-    setWorkspaceTerminalDisplayLayouts({});
+    {
+      const restoredLogicalLayouts = workspaceSettingsLogicalIndexLayouts(workspaceSettingsRef.current);
+      const restoredDisplayLayouts = workspaceSettingsDisplayLayouts(workspaceSettingsRef.current);
+      workspaceTerminalLogicalIndexesRef.current = restoredLogicalLayouts;
+      workspaceTerminalDisplayLayoutsRef.current = restoredDisplayLayouts;
+      setWorkspaceTerminalLogicalIndexes(restoredLogicalLayouts);
+      setWorkspaceTerminalDisplayLayouts(restoredDisplayLayouts);
+    }
     agentInitialStatusUserRef.current = "";
     startupAgentFlowIdRef.current += 1;
     startupAgentSettingsPendingRef.current = false;
@@ -26991,6 +27509,11 @@ export default function App() {
       const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
         [terminalIndex, effectiveTerminalRoles[index]]
       )));
+      const persistedDisplayRows = getWorkspaceDisplayTerminalRows(
+        workspaceTerminalDisplayLayoutsRef.current,
+        selectedWorkspace.id,
+        nextTerminalIndexes,
+      ).map((row) => row.terminalIndexes.slice());
       const gitWorktreesChanged = agentSessionMode !== currentAgentSessionMode;
       const rootWasEmptyAtSelection = rootDirectory
         ? getWorkspaceRootWasEmptyAtSelection(workspaceSettings, selectedWorkspace.id)
@@ -27150,6 +27673,8 @@ export default function App() {
           documentsCount,
           pcbCount: effectivePcbCount,
           paneKinds: settingsStoredPaneKinds,
+          logicalTerminalIndexes: nextTerminalIndexes,
+          displayRows: persistedDisplayRows,
           agentPermissions,
         });
         workspaceSettingsRef.current = nextSettings;
@@ -27158,19 +27683,14 @@ export default function App() {
       });
 
       if (rootChanged || gitWorktreesChanged || agentPermissionsChanged || effectiveTerminalCount !== currentTerminalCount || terminalRolesChanged) {
-        const nextDisplayRows = getWorkspaceDisplayTerminalRows(
-          workspaceTerminalDisplayLayoutsRef.current,
-          selectedWorkspace.id,
-          nextTerminalIndexes,
-        ).map((row) => row.terminalIndexes.slice());
         const nextLogicalIndexesByWorkspace = {
           ...workspaceTerminalLogicalIndexes,
           [selectedWorkspace.id]: nextTerminalIndexes,
         };
         const nextDisplayLayouts = {
           ...workspaceTerminalDisplayLayoutsRef.current,
-          [selectedWorkspace.id]: nextDisplayRows.length
-            ? nextDisplayRows
+          [selectedWorkspace.id]: persistedDisplayRows.length
+            ? persistedDisplayRows
             : getDefaultWorkspaceDisplayTerminalRows(nextTerminalIndexes),
         };
         workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
@@ -31347,7 +31867,28 @@ export default function App() {
         ? activeWorkspaceIds.has(workspaceId)
         : Boolean(activeOverride);
       const terminals = presenceTerminalsByWorkspaceId.get(workspaceId) || [];
-      const panels = presencePanelsByWorkspaceId.get(workspaceId) || [];
+      const presencePanels = presencePanelsByWorkspaceId.get(workspaceId) || [];
+      const configuredPanels = buildWorkspaceConfiguredPanelSnapshots({
+        workspaceCommandable: workspaceActive,
+        workspaceId,
+        workspaceName: workspace?.name || workspaceId,
+        workspaceRuntimeEnabled: workspaceActive,
+        workspaceSettings,
+      });
+      const panelsById = new Map();
+      configuredPanels.forEach((panel) => {
+        const panelId = String(panel?.paneId || panel?.pane_id || panel?.panelId || panel?.panel_id || "").trim();
+        if (panelId) {
+          panelsById.set(panelId, panel);
+        }
+      });
+      presencePanels.forEach((panel) => {
+        const panelId = String(panel?.paneId || panel?.pane_id || panel?.panelId || panel?.panel_id || "").trim();
+        if (panelId) {
+          panelsById.set(panelId, panel);
+        }
+      });
+      const panels = Array.from(panelsById.values());
       const selected = String(selectedWorkspace?.id || "").trim() === workspaceId;
       const terminalListAuthoritative = true;
       const terminalListEmptyAuthoritative = terminals.length === 0;
@@ -32526,6 +33067,11 @@ export default function App() {
       }
 
       const nextBridge = {
+        closeWorkspacePanel: bridge.closeWorkspacePanel,
+        focusWorkspacePanel: bridge.focusWorkspacePanel,
+        getWorkspacePanelContext: bridge.getWorkspacePanelContext,
+        listWorkspacePanels: bridge.listWorkspacePanels,
+        openWorkspacePanel: bridge.openWorkspacePanel,
         onBeginTodoDrag: bridge.onBeginTodoDrag,
         onOpenDocumentPanel: bridge.onOpenDocumentPanel,
         onSelectWorkspaceTool: bridge.onSelectWorkspaceTool,
@@ -32533,6 +33079,7 @@ export default function App() {
         onToggleWindowBreakout: bridge.onToggleWindowBreakout,
         onVoiceAgentToolCall: bridge.onVoiceAgentToolCall,
         onVoicePlanServerResult: bridge.onVoicePlanServerResult,
+        runWorkspacePanelAction: bridge.runWorkspacePanelAction,
         terminalBreakoutActive: Boolean(bridge.terminalBreakoutActive),
         windowBreakoutActive: Boolean(bridge.windowBreakoutActive),
         workspaceId: safeWorkspaceId,
@@ -32540,6 +33087,11 @@ export default function App() {
       const previousBridge = currentBridges[safeWorkspaceId] || null;
       if (
         previousBridge
+        && previousBridge.closeWorkspacePanel === nextBridge.closeWorkspacePanel
+        && previousBridge.focusWorkspacePanel === nextBridge.focusWorkspacePanel
+        && previousBridge.getWorkspacePanelContext === nextBridge.getWorkspacePanelContext
+        && previousBridge.listWorkspacePanels === nextBridge.listWorkspacePanels
+        && previousBridge.openWorkspacePanel === nextBridge.openWorkspacePanel
         && previousBridge.onBeginTodoDrag === nextBridge.onBeginTodoDrag
         && previousBridge.onOpenDocumentPanel === nextBridge.onOpenDocumentPanel
         && previousBridge.onSelectWorkspaceTool === nextBridge.onSelectWorkspaceTool
@@ -32547,6 +33099,7 @@ export default function App() {
         && previousBridge.onToggleWindowBreakout === nextBridge.onToggleWindowBreakout
         && previousBridge.onVoiceAgentToolCall === nextBridge.onVoiceAgentToolCall
         && previousBridge.onVoicePlanServerResult === nextBridge.onVoicePlanServerResult
+        && previousBridge.runWorkspacePanelAction === nextBridge.runWorkspacePanelAction
         && previousBridge.terminalBreakoutActive === nextBridge.terminalBreakoutActive
         && previousBridge.windowBreakoutActive === nextBridge.windowBreakoutActive
       ) {
@@ -34965,7 +35518,6 @@ export default function App() {
         "panel_close",
         "close_panel",
       ].includes(normalizedKind)) {
-        const paneKinds = getWorkspacePaneKinds(workspaceSettingsRef.current, workspaceId);
         const targetPanelId = remoteCommandStringField(event, [
           "target_panel_id",
           "targetPanelId",
@@ -34988,23 +35540,23 @@ export default function App() {
             "terminal_index",
             "terminalIndex",
           ]);
-        let panelIndex = Number.isInteger(requestedPanelIndex)
-          && isWorkspacePanelPaneIndex(paneKinds, requestedPanelIndex)
-          ? requestedPanelIndex
-          : null;
-        if (panelIndex == null && targetPanelId) {
-          panelIndex = workspacePaneKindsIndexes(paneKinds).find((index) => (
-            buildWorkspacePanelSnapshot({
-              kind: paneKinds[index],
-              terminalIndex: index,
-              workspaceCommandable: true,
-              workspaceId,
-              workspaceName: targetWorkspace?.name || workspaceId,
-              workspaceRuntimeEnabled: true,
-            }).panelId === targetPanelId
-          )) ?? null;
-        }
-        if (panelIndex == null) {
+        const panelSnapshots = buildWorkspaceConfiguredPanelSnapshots({
+          workspaceCommandable: true,
+          workspaceId,
+          workspaceName: targetWorkspace?.name || workspaceId,
+          workspaceRuntimeEnabled: true,
+          workspaceSettings: workspaceSettingsRef.current,
+        });
+        const targetPanel = panelSnapshots.find((panel) => {
+          if (Number.isInteger(requestedPanelIndex) && panel.terminalIndex !== requestedPanelIndex) {
+            return false;
+          }
+          if (targetPanelId && panel.panelId !== targetPanelId && panel.paneId !== targetPanelId) {
+            return false;
+          }
+          return Number.isInteger(requestedPanelIndex) || targetPanelId;
+        }) || null;
+        if (!targetPanel) {
           await recordRemoteCommandStatus(event, "failed", "Target workspace panel was not found on this desktop.", {
             commandId,
             commandKind,
@@ -35014,15 +35566,19 @@ export default function App() {
           });
           return;
         }
-        closeWorkspaceTerminal({
-          terminalIndex: panelIndex,
-          workspaceId,
-        });
+        if (targetPanel.kind === WORKSPACE_PANE_KIND_DOCS) {
+          closeWorkspaceDocumentPanel(workspaceId);
+        } else {
+          closeWorkspaceTerminal({
+            terminalIndex: targetPanel.terminalIndex,
+            workspaceId,
+          });
+        }
         await syncRemoteControlState("remote_workspace_panel_closed");
         await recordRemoteCommandStatus(event, "completed", "Workspace panel closed from the web dashboard.", {
           commandId,
           commandKind,
-          panelIndex,
+          panelIndex: targetPanel.terminalIndex ?? null,
           targetPanelId,
           workspaceId,
         });
@@ -36730,6 +37286,11 @@ export default function App() {
         workspaceTerminalFallbackRole,
         workspaceTerminalRoleOptions,
       );
+      const paneKinds = getWorkspacePaneKinds(currentSettings, workspaceId);
+      const terminalRoleByIndex = new Map(logicalIndexes.map((terminalIndex, roleIndex) => [
+        terminalIndex,
+        terminalRoles[roleIndex] || workspaceTerminalFallbackRole,
+      ]));
       const presenceWorkspace = getAppControlPresenceWorkspace(workspaceId);
       const presenceTerminals = Array.isArray(presenceWorkspace?.terminals)
         ? presenceWorkspace.terminals
@@ -36737,17 +37298,21 @@ export default function App() {
       const presenceByIndex = new Map();
       presenceTerminals.forEach((terminal) => {
         const terminalIndex = appControlTerminalNumber(terminal, ["terminalIndex", "terminal_index", "index"]);
+        if (isWorkspacePanelPaneIndex(paneKinds, terminalIndex)) {
+          return;
+        }
         if (Number.isInteger(terminalIndex) && !presenceByIndex.has(terminalIndex)) {
           presenceByIndex.set(terminalIndex, terminal);
         }
       });
       const configuredPanes = new Set();
-      const configuredIndexes = new Set(logicalIndexes);
-      const terminals = logicalIndexes.map((terminalIndex, roleIndex) => {
+      const terminalIndexes = logicalIndexes.filter((terminalIndex) => !isWorkspacePanelPaneIndex(paneKinds, terminalIndex));
+      const configuredIndexes = new Set(terminalIndexes);
+      const terminals = terminalIndexes.map((terminalIndex) => {
         const terminal = summarizeAppControlTerminal({
           configured: true,
           presence: presenceByIndex.get(terminalIndex) || null,
-          role: terminalRoles[roleIndex] || workspaceTerminalFallbackRole,
+          role: terminalRoleByIndex.get(terminalIndex) || workspaceTerminalFallbackRole,
           terminalIndex,
           workspace,
         });
@@ -36757,6 +37322,9 @@ export default function App() {
       presenceTerminals.forEach((presence) => {
         const terminalIndex = appControlTerminalNumber(presence, ["terminalIndex", "terminal_index", "index"]);
         const paneId = appControlTerminalText(presence, ["paneId", "pane_id", "terminalId", "terminal_id"]);
+        if (isWorkspacePanelPaneIndex(paneKinds, terminalIndex)) {
+          return;
+        }
         if ((Number.isInteger(terminalIndex) && configuredIndexes.has(terminalIndex)) || (paneId && configuredPanes.has(paneId))) {
           return;
         }
@@ -36780,7 +37348,7 @@ export default function App() {
       });
 
       return {
-        configuredCount: logicalIndexes.length,
+        configuredCount: terminalIndexes.length,
         terminalLimit: MAX_WORKSPACE_TERMINAL_COUNT,
         terminals,
         totalTerminals: terminals.length,
@@ -37079,6 +37647,7 @@ export default function App() {
     });
     const compactAppControlTodoTerminal = (terminal, { verbose = false } = {}) => ({
       agent: terminal.agentId || terminal.role || "",
+      canQueue: true,
       configured: Boolean(terminal.configured),
       idle: Boolean(terminal.idle),
       index: Number.isInteger(terminal.terminalIndex) ? terminal.terminalIndex : null,
@@ -37356,6 +37925,10 @@ export default function App() {
       if (!snapshot?.document) {
         return null;
       }
+      const capturedAtMs = Number(snapshot.documentContextCapturedAtMs || snapshot.updatedAtMs || 0);
+      if (!Number.isFinite(capturedAtMs) || Date.now() - capturedAtMs > APP_CONTROL_DOCUMENT_SELECTION_SNAPSHOT_TTL_MS) {
+        return null;
+      }
       if (currentContext?.document) {
         const currentKey = appControlDocumentContextKey(currentContext);
         const snapshotKey = appControlDocumentContextKey(snapshot);
@@ -37480,12 +38053,23 @@ export default function App() {
     const buildAppControlVisibleContext = (input = {}, options = {}) => {
       const context = appControlVisibleContextRef.current;
       const toolsSurfaceVisible = GLOBAL_TOOLS_VIEWS.has(visibleView);
+      const contextSurface = String(context?.surface || "").trim().toLowerCase().replace(/_/g, "-");
+      const workspaceDocsSurfaceVisible = contextSurface === "workspace-docs"
+        && (visibleView === DEFAULT_WORKSPACE_VIEW || activeView === DEFAULT_WORKSPACE_VIEW)
+        && (
+          !context?.workspaceId
+          || context.workspaceId === selectedWorkspace?.id
+          || context.workspaceId === activatedWorkspace?.id
+        );
       const activeContext = context
         && typeof context === "object"
         && !Array.isArray(context)
-        && context.surface === "tools"
+        && (
+          (contextSurface === "tools" && toolsSurfaceVisible)
+          || workspaceDocsSurfaceVisible
+        )
         && context.active !== false
-        && toolsSurfaceVisible;
+        ;
       const includeContent = appControlBooleanValue(input.includeContent ?? input.include_content, false);
       const allowSelectionSnapshot = Boolean(options.allowSelectionSnapshot)
         && appControlBooleanValue(input.allowSelectionSnapshot ?? input.allow_selection_snapshot, true);
@@ -37553,6 +38137,334 @@ export default function App() {
         selection: context.highlightedRange || null,
       };
     };
+    const normalizeAppControlPanelKind = (...values) => {
+      for (const value of collectAppControlValues(...values)) {
+        const token = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+        if (["browser", "chrome", "workspace-browser", "workspace-web", "web-panel"].includes(token)) {
+          return "web";
+        }
+        if (["pcb", "pcb-design", "pcb-panel", "workspace-pcb", "board"].includes(token)) {
+          return "pcb";
+        }
+        if ([
+          "doc",
+          "docs",
+          "document",
+          "documents",
+          "workspace-docs",
+          "workspace-document",
+          "workspace-document-panel",
+          "docs-panel",
+          "document-panel",
+          "documents-panel",
+        ].includes(token)) {
+          return "docs";
+        }
+        if (["shell", "terminal", "term", "agent"].includes(token)) {
+          return "terminal";
+        }
+        if (token === "all" || token === "*") {
+          return "";
+        }
+      }
+      return "";
+    };
+    const getAppControlWorkspaceBridge = (workspace) => (
+      workspace?.id ? workspaceToolRuntimeBridgesRef.current[workspace.id] || null : null
+    );
+    const buildFallbackAppControlPanelInventory = (workspace, input = {}) => {
+      const panelKindFilter = normalizeAppControlPanelKind(input.kind || input.panelKind || input.panel_kind);
+      const includeContext = appControlBooleanValue(input.includeContext ?? input.include_context, false);
+      const workspaceSnapshot = buildAppControlTerminalSnapshot(workspace);
+      const workspaceId = workspace?.id || "";
+      const workspaceNameText = workspace?.name || "";
+      const panels = workspaceSnapshot.terminals
+        .filter((terminal) => !panelKindFilter || panelKindFilter === "terminal")
+        .map((terminal) => ({
+          active: false,
+          context: includeContext ? {
+            agentId: terminal.role || terminal.agentId || "",
+            agentLabel: terminal.agentLabel || "",
+            threadId: terminal.threadId || "",
+          } : undefined,
+          kind: "terminal",
+          open: Boolean(terminal.configured || terminal.live),
+          panelId: terminal.paneId,
+          panel_id: terminal.paneId,
+          paneId: terminal.paneId,
+          pane_id: terminal.paneId,
+          queueable: true,
+          terminalIndex: terminal.terminalIndex,
+          terminal_index: terminal.terminalIndex,
+          title: terminal.terminalName || terminal.agentLabel || "Terminal",
+          workspaceId,
+          workspace_id: workspaceId,
+          workspaceName: workspaceNameText,
+          workspace_name: workspaceNameText,
+        }));
+      buildWorkspaceConfiguredPanelSnapshots({
+        workspaceCommandable: false,
+        workspaceId,
+        workspaceName: workspaceNameText,
+        workspaceRuntimeEnabled: activeRuntimeWorkspaceIds.has(workspaceId),
+        workspaceSettings: workspaceSettingsRef.current,
+      }).forEach((panel) => {
+        if (panelKindFilter && panelKindFilter !== panel.kind) {
+          return;
+        }
+        panels.push({
+          ...panel,
+          context: includeContext ? {
+            kind: panel.kind,
+            liveBridgeAvailable: false,
+          } : undefined,
+          open: true,
+          queueable: false,
+        });
+      });
+      return {
+        liveBridgeAvailable: false,
+        panels: panels.map((panel) => (
+          panel.context === undefined
+            ? Object.fromEntries(Object.entries(panel).filter(([key]) => key !== "context"))
+            : panel
+        )),
+        workspace: workspaceSummary(workspace),
+      };
+    };
+    const listAppControlPanels = (input = {}) => {
+      const hasWorkspaceSelector = Boolean(
+        String(input.workspaceId || input.workspace_id || input.id || input.workspaceName || input.workspace_name || input.name || "").trim(),
+      );
+      const allWorkspaces = appControlBooleanValue(input.all, false);
+      const targetWorkspaces = allWorkspaces
+        ? workspaces
+        : hasWorkspaceSelector
+          ? [resolveWorkspaceForAppControl(input)].filter(Boolean)
+          : [selectedWorkspace || activatedWorkspace].filter(Boolean);
+      if (hasWorkspaceSelector && targetWorkspaces.length === 0) {
+        throw new Error("No matching workspace was found.");
+      }
+      const workspaceInventories = targetWorkspaces.map((workspace) => {
+        const bridge = getAppControlWorkspaceBridge(workspace);
+        if (typeof bridge?.listWorkspacePanels === "function") {
+          const result = bridge.listWorkspacePanels({
+            ...input,
+            workspaceId: workspace.id,
+            workspaceName: workspace.name || "",
+          });
+          if (result && typeof result === "object") {
+            return {
+              ...result,
+              liveBridgeAvailable: true,
+              workspace: result.workspace || workspaceSummary(workspace),
+            };
+          }
+        }
+        return buildFallbackAppControlPanelInventory(workspace, input);
+      });
+      return {
+        panels: workspaceInventories.flatMap((inventory) => Array.isArray(inventory.panels) ? inventory.panels : []),
+        workspaces: workspaceInventories,
+      };
+    };
+    const invokeAppControlPanelBridge = async (workspace, methodName, input = {}) => {
+      if (!workspace) {
+        throw new Error("No matching workspace was found.");
+      }
+      const activated = showAppControlWorkspaceTerminals(workspace, `app_control_mcp_${methodName}`);
+      const bridge = getAppControlWorkspaceBridge(workspace);
+      const method = bridge?.[methodName];
+      if (typeof method !== "function") {
+        throw new Error("The selected workspace terminals view is not ready to control live panels yet.");
+      }
+      const result = await method({
+        ...input,
+        workspaceId: workspace.id,
+        workspaceName: workspace.name || "",
+      });
+      return {
+        activated,
+        ...(result && typeof result === "object" ? result : { result }),
+        workspace: result?.workspace || workspaceSummary(workspace),
+      };
+    };
+    const openAppControlPanel = async (input = {}) => {
+      const workspace = resolveWorkspaceForAppControl(input);
+      if (!workspace) {
+        throw new Error("No matching workspace was found.");
+      }
+      const kind = normalizeAppControlPanelKind(input.kind || input.panelKind || input.panel_kind) || "web";
+      showAppControlWorkspaceTerminals(workspace, "app_control_mcp_open_panel");
+      const bridge = getAppControlWorkspaceBridge(workspace);
+      if (typeof bridge?.openWorkspacePanel === "function") {
+        return invokeAppControlPanelBridge(workspace, "openWorkspacePanel", {
+          ...input,
+          kind,
+        });
+      }
+      if (kind === "docs") {
+        if (getWorkspaceDocumentCount(workspaceSettingsRef.current, workspace.id) <= 0) {
+          setWorkspaceSettings((settings) => {
+            const nextSettings = updateWorkspaceLocalSettings(settings, workspace.id, {
+              documentsCount: MAX_WORKSPACE_DOCUMENT_COUNT,
+            });
+            workspaceSettingsRef.current = nextSettings;
+            persistWorkspaceSettings(nextSettings);
+            return nextSettings;
+          });
+        }
+        setPendingWorkspaceDocumentPanelOpen({
+          entry: input.document || input.entry || null,
+          workspaceId: workspace.id,
+        });
+        return {
+          opened: true,
+          panel: {
+            kind: "docs",
+            paneId: "workspace-document-panel",
+            panelId: "workspace-document-panel",
+            workspaceId: workspace.id,
+          },
+          workspace: workspaceSummary(workspace),
+        };
+      }
+      const addPane = kind === "pcb" ? addWorkspacePcbPane : kind === "web" ? addWorkspaceWebPane : null;
+      if (!addPane) {
+        throw new Error(`Unsupported workspace panel kind: ${kind}`);
+      }
+      const result = addPane({ workspaceId: workspace.id });
+      if (!result || !Number.isInteger(result.terminalIndex)) {
+        throw new Error("Workspace panel limit reached.");
+      }
+      const pendingAction = kind === "web" && (input.url || input.search || input.query)
+        ? {
+          action: input.search || input.query ? "search" : "navigate",
+          kind,
+          query: input.query,
+          search: input.search,
+          terminalIndex: result.terminalIndex,
+          url: input.url || input.search || input.query || "",
+          workspaceId: workspace.id,
+        }
+        : kind === "pcb" && (input.create || input.name)
+          ? {
+            action: "create",
+            kind,
+            name: input.name || "",
+            terminalIndex: result.terminalIndex,
+            workspaceId: workspace.id,
+          }
+          : null;
+      if (pendingAction) {
+        window.setTimeout(() => {
+          const nextBridge = workspaceToolRuntimeBridgesRef.current[workspace.id] || null;
+          nextBridge?.runWorkspacePanelAction?.(pendingAction);
+        }, 180);
+      }
+      return {
+        opened: true,
+        ...(pendingAction ? { pendingAction } : {}),
+        panel: {
+          kind,
+          terminalIndex: result.terminalIndex,
+          workspaceId: workspace.id,
+        },
+        workspace: workspaceSummary(workspace),
+      };
+    };
+    const getAppControlPanelContext = async (input = {}) => {
+      const workspace = resolveWorkspaceForAppControl(input);
+      const result = await invokeAppControlPanelBridge(workspace, "getWorkspacePanelContext", input);
+      if (result?.panel?.kind === "docs") {
+        const selectedContext = buildAppControlVisibleContext(input, { allowSelectionSnapshot: true });
+        return {
+          ...result,
+          selectedContext: selectedContext.context?.document ? selectedContext.context : null,
+        };
+      }
+      return result;
+    };
+    const focusAppControlPanel = (input = {}) => (
+      invokeAppControlPanelBridge(resolveWorkspaceForAppControl(input), "focusWorkspacePanel", input)
+    );
+    const closeAppControlPanel = async (input = {}) => {
+      const workspace = resolveWorkspaceForAppControl(input);
+      if (!workspace) {
+        throw new Error("No matching workspace was found.");
+      }
+      const bridge = getAppControlWorkspaceBridge(workspace);
+      if (typeof bridge?.closeWorkspacePanel === "function") {
+        return invokeAppControlPanelBridge(workspace, "closeWorkspacePanel", input);
+      }
+      const inventory = buildFallbackAppControlPanelInventory(workspace, { ...input, includeContext: true });
+      const kind = normalizeAppControlPanelKind(input.kind || input.panelKind || input.panel_kind);
+      const requestedIndex = Number.parseInt(input.terminalIndex ?? input.terminal_index ?? input.index, 10);
+      const paneId = String(input.paneId || input.pane_id || input.panelId || input.panel_id || "").trim();
+      const panel = inventory.panels.find((candidate) => {
+        if (kind && candidate.kind !== kind) return false;
+        if (Number.isInteger(requestedIndex) && candidate.terminalIndex !== requestedIndex) return false;
+        if (paneId && candidate.paneId !== paneId && candidate.panelId !== paneId) return false;
+        return kind || Number.isInteger(requestedIndex) || paneId;
+      }) || (kind ? inventory.panels.find((candidate) => candidate.kind === kind) : null);
+      if (!panel) {
+        throw new Error("No matching workspace panel was found.");
+      }
+      if (panel.kind === "docs") {
+        closeWorkspaceDocumentPanel(workspace.id);
+      } else if (Number.isInteger(panel.terminalIndex)) {
+        closeWorkspaceTerminal({ terminalIndex: panel.terminalIndex, workspaceId: workspace.id });
+      }
+      return {
+        closed: true,
+        panel,
+        workspace: workspaceSummary(workspace),
+      };
+    };
+	    const runAppControlPanelAction = async (input = {}) => {
+	      const action = String(input.action || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+	      if (["capture", "capture-screenshot", "screenshot", "screen-capture"].includes(action)) {
+	        const context = await getAppControlPanelContext({
+	          ...input,
+	          includeContext: true,
+	          include_context: true,
+	        });
+	        const focusResult = await focusAppControlPanel(input);
+	        const delayMs = Math.min(
+	          2000,
+	          Math.max(
+	            80,
+	            Number.parseInt(
+	              input.delayMs
+	                ?? input.delay_ms
+	                ?? input.captureDelayMs
+	                ?? input.capture_delay_ms
+	                ?? 180,
+	              10,
+	            ) || 180,
+	          ),
+	        );
+	        await waitMs(delayMs);
+	        const capture = await invoke("snipping_capture_screenshot", {
+	          request: { mode: "full" },
+	        });
+	        return {
+	          action,
+	          capture,
+	          captureMode: "full",
+	          captureScope: "screen",
+	          capture_delay_ms: delayMs,
+	          capture_mode: "full",
+	          capture_scope: "screen",
+	          focus: focusResult,
+	          ok: true,
+	          panel: focusResult?.panel || context?.panel || null,
+	          panels: context?.panels || [],
+	          workspace: context?.workspace || focusResult?.workspace || null,
+	        };
+	      }
+	      return invokeAppControlPanelBridge(resolveWorkspaceForAppControl(input), "runWorkspacePanelAction", input);
+	    };
     const appControlDocumentRowType = (document = {}) => {
       const entryKind = String(document.entry_kind || document.entryKind || "").trim().toLowerCase();
       if (entryKind === "folder" || entryKind === "document") return entryKind;
@@ -38179,6 +39091,13 @@ export default function App() {
         })),
         selectedWorkspace: selectedWorkspace ? workspaceSummary(selectedWorkspace) : null,
         activatedWorkspace: activatedWorkspace ? workspaceSummary(activatedWorkspace) : null,
+        workspacePanels: (() => {
+          try {
+            return listAppControlPanels({ includeContext: false });
+          } catch {
+            return { panels: [], workspaces: [] };
+          }
+        })(),
         workspaces: workspaces.map(workspaceSummary),
         availableTabs: [
           "terminals",
@@ -38297,11 +39216,11 @@ export default function App() {
           return;
         }
 
-        if (tool === "get_visible_context") {
+        if (tool === "get_visible_context" || tool === "selected_context") {
           sendAppControlReply(requestId, {
             ok: true,
             data: {
-              ...buildAppControlVisibleContext(input),
+              ...buildAppControlVisibleContext(input, { allowSelectionSnapshot: tool === "selected_context" }),
               state: buildAppControlState(),
             },
           });
@@ -38630,6 +39549,83 @@ export default function App() {
             ok: true,
             data: {
               ...buildAppControlSelectionContext(),
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
+        if (tool === "selected_update") {
+          const visibleContext = buildAppControlVisibleContext(input, { allowSelectionSnapshot: true });
+          const context = visibleContext.context || {};
+          if (!context.document && !context.script) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "no_selected_context",
+                message: "No live document or local script is selected in the visible app context.",
+              },
+              data: {
+                ...visibleContext,
+                state: buildAppControlState(),
+              },
+            });
+            return;
+          }
+          if (context.script && !context.document) {
+            const actions = appControlScriptActionsRef.current || {};
+            if (typeof actions.updateSelectedScript !== "function") {
+              sendAppControlReply(requestId, {
+                ok: false,
+                error: {
+                  code: "script_actions_unavailable",
+                  message: "The local script editor is not available.",
+                },
+                data: buildAppControlState(),
+              });
+              return;
+            }
+            const result = await actions.updateSelectedScript(input);
+            sendAppControlReply(requestId, {
+              ok: result?.ok !== false,
+              ...(result?.ok === false && result?.error ? { error: result.error } : {}),
+              data: {
+                result,
+                state: buildAppControlState(),
+              },
+            });
+            return;
+          }
+          const actions = appControlDocumentActionsRef.current || {};
+          if (typeof actions.updateSelectedDocument !== "function") {
+            const hiddenDraftResult = await updateHiddenAppControlDocumentDraft(input);
+            if (hiddenDraftResult) {
+              sendAppControlReply(requestId, {
+                ok: hiddenDraftResult?.ok !== false,
+                ...(hiddenDraftResult?.ok === false && hiddenDraftResult?.error ? { error: hiddenDraftResult.error } : {}),
+                data: {
+                  result: hiddenDraftResult,
+                  state: buildAppControlState(),
+                },
+              });
+              return;
+            }
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "document_actions_unavailable",
+                message: "The selected document editor is not available.",
+              },
+              data: buildAppControlState(),
+            });
+            return;
+          }
+          const result = await actions.updateSelectedDocument(input);
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            ...(result?.ok === false && result?.error ? { error: result.error } : {}),
+            data: {
+              result,
               state: buildAppControlState(),
             },
           });
@@ -39692,6 +40688,83 @@ export default function App() {
           return;
         }
 
+        if (tool === "list_panels") {
+          const includeState = appControlBooleanValue(input.includeState ?? input.include_state, false);
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...listAppControlPanels(input),
+              ...(includeState ? { state: buildAppControlState() } : {}),
+            },
+          });
+          return;
+        }
+
+        if (tool === "get_panel_context") {
+          const includeState = appControlBooleanValue(input.includeState ?? input.include_state, true);
+          const result = await getAppControlPanelContext(input);
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...result,
+              ...(includeState ? { state: buildAppControlState() } : {}),
+            },
+          });
+          return;
+        }
+
+        if (tool === "focus_panel") {
+          const includeState = appControlBooleanValue(input.includeState ?? input.include_state, true);
+          const result = await focusAppControlPanel(input);
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...result,
+              ...(includeState ? { state: buildAppControlState() } : {}),
+            },
+          });
+          return;
+        }
+
+        if (tool === "open_panel") {
+          const includeState = appControlBooleanValue(input.includeState ?? input.include_state, true);
+          const result = await openAppControlPanel(input);
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...result,
+              ...(includeState ? { state: buildAppControlState() } : {}),
+            },
+          });
+          return;
+        }
+
+        if (tool === "close_panel") {
+          const includeState = appControlBooleanValue(input.includeState ?? input.include_state, true);
+          const result = await closeAppControlPanel(input);
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...result,
+              ...(includeState ? { state: buildAppControlState() } : {}),
+            },
+          });
+          return;
+        }
+
+        if (tool === "panel_action") {
+          const includeState = appControlBooleanValue(input.includeState ?? input.include_state, true);
+          const result = await runAppControlPanelAction(input);
+          sendAppControlReply(requestId, {
+            ok: true,
+            data: {
+              ...result,
+              ...(includeState ? { state: buildAppControlState() } : {}),
+            },
+          });
+          return;
+        }
+
         if (tool === "list_terminals") {
           sendAppControlReply(requestId, {
             ok: true,
@@ -39817,12 +40890,15 @@ export default function App() {
       }
     };
   }, [
+    addWorkspacePcbPane,
     addWorkspaceTerminal,
+    addWorkspaceWebPane,
     activeView,
     activatedWorkspace,
     activatedWorkspaceId,
     agentStatuses,
     appAppearanceSettings.theme,
+    closeWorkspaceDocumentPanel,
     closeWorkspaceTerminal,
     deactivateWorkspace,
     defaultWorkingDirectory,
@@ -45246,6 +46322,8 @@ export default function App() {
                             manageWorkspaceAgents={manageWorkspaceAgents}
                             onShowWorkspaceTerminals={requestWorkspaceActivation}
                             onArchiveWorkspaceThread={archiveWorkspaceThreadFromOverlay}
+                            onAppControlContextChange={handleAppControlContextChange}
+                            onAppControlDocumentActions={registerAppControlDocumentActions}
                             onOpenWorkspaceSettings={openActivatedWorkspaceSettings}
                             onSelectWorkspaceThread={selectWorkspaceThreadInOverlay}
                             onToggleWorkspaceThreadPinned={toggleWorkspaceThreadPinnedFromOverlay}

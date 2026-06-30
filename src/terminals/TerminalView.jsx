@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Android as DeviceAndroidIcon } from "@styled-icons/fa-brands/Android";
 import { Apple as DeviceAppleIcon } from "@styled-icons/fa-brands/Apple";
@@ -24,12 +24,15 @@ import { TERMINAL_WINDOW_CLOSED_EVENT } from "./TerminalWindowHost.jsx";
 import WebPane from "../web/WebPane.jsx";
 import PcbWorkspacePane from "../pcb/PcbWorkspacePane.jsx";
 import {
+  PCB_PANEL_COMMAND_EVENT,
   PCB_PANEL_CLOSED_EVENT,
+  PCB_PANEL_CONTROL_BOARD_CHANGE,
   PCB_PANEL_CONTROL_EVENT,
   PCB_PANEL_CONTROL_RETURN,
 } from "../pcb/pcbPanelBridge.js";
 import { DEFAULT_WEB_URL } from "../web/webNative.js";
 import {
+  WEB_PANEL_COMMAND_EVENT,
   WEB_PANEL_CLOSED_EVENT,
   WEB_PANEL_CONTROL_EVENT,
   WEB_PANEL_CONTROL_NAVIGATE,
@@ -21680,11 +21683,13 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
 });
 
 function WorkspacePcbGridPane({
+  controlCommand = null,
   dragActive = false,
   fullscreenActive = false,
   isActive = false,
   isFullscreen = false,
   onClose = null,
+  onBoardChange = null,
   onDragHandlePointerDown = null,
   onFocusBreakout = null,
   onPopOut = null,
@@ -21712,6 +21717,11 @@ function WorkspacePcbGridPane({
   const refreshBoard = useCallback(() => {
     setRefreshRequestNonce((nonce) => nonce + 1);
   }, []);
+
+  const handleBoardChange = useCallback((nextBoard) => {
+    setBoard(nextBoard);
+    onBoardChange?.(nextBoard);
+  }, [onBoardChange]);
 
   return (
     <TerminalPcbPanelShell
@@ -21831,9 +21841,10 @@ function WorkspacePcbGridPane({
         ) : (
           <PcbWorkspacePane
             key={`pcb-${paneId}-${resumeNonce}`}
+            controlCommand={controlCommand}
             createRequestNonce={createRequestNonce}
             isActive={isActive}
-            onBoardChange={setBoard}
+            onBoardChange={handleBoardChange}
             paneId={paneId}
             refreshRequestNonce={refreshRequestNonce}
             repoPath={repoPath}
@@ -21883,6 +21894,8 @@ function TerminalView({
   gitSnapshotsPreload = null,
   onRefreshGitRepositories = null,
   onRefreshGitSnapshot = null,
+  onAppControlContextChange = null,
+  onAppControlDocumentActions = null,
   onMinimizeWorkspaceToolPane = null,
   onRestoreWorkspaceToolPane = null,
   onToggleFullscreenWorkspaceToolPane = null,
@@ -21993,12 +22006,16 @@ function TerminalView({
   // Bumped per pane when it returns from a breakout window so the in-grid
   // WebPane remounts at the synced URL.
   const [webPaneResumeNonces, setWebPaneResumeNonces] = useState({});
+  const [webPaneCommands, setWebPaneCommands] = useState({});
   // PCB panes popped out into their own native panel windows.
   const [pcbBreakoutPanes, setPcbBreakoutPanes] = useState({});
   const pcbBreakoutPanesRef = useRef(pcbBreakoutPanes);
   // Bumped per pane when the PCB window returns so the in-grid pane rereads
   // the selected board from shared pane storage.
   const [pcbPaneResumeNonces, setPcbPaneResumeNonces] = useState({});
+  const [pcbPaneCommands, setPcbPaneCommands] = useState({});
+  const [pcbPaneBoards, setPcbPaneBoards] = useState({});
+  const pcbPaneBoardsRef = useRef(pcbPaneBoards);
   const [terminalBreakoutPlacements, setTerminalBreakoutPlacements] = useState({});
   const [terminalBreakoutPlanSnapshots, setTerminalBreakoutPlanSnapshots] = useState({});
   const [terminalBreakoutPlanRefreshNonce, setTerminalBreakoutPlanRefreshNonce] = useState(0);
@@ -22302,6 +22319,7 @@ function TerminalView({
   terminalBreakoutPlacementsRef.current = terminalBreakoutPlacements;
   terminalBreakoutTerminalScaleRef.current = terminalBreakoutTerminalScale;
   terminalBreakoutViewportRef.current = terminalBreakoutViewport;
+  pcbPaneBoardsRef.current = pcbPaneBoards;
   const visibleTodoQueueItems = useMemo(() => (
     todoQueueItems.filter((item) => {
       // In-flight and finished work never renders as a queue card: running
@@ -27567,6 +27585,79 @@ function TerminalView({
     }
   }, []);
 
+  const sendWebPaneCommand = useCallback((paneId, command = {}) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return null;
+    }
+    const nextCommand = {
+      ...(command || {}),
+      nonce: Date.now() + Math.random(),
+    };
+    const targetUrl = nextCommand.url || nextCommand.search || nextCommand.query || "";
+    if (targetUrl) {
+      const normalizedUrl = normalizeWebInput(targetUrl);
+      if (normalizedUrl) {
+        rememberWebPaneUrl(safePaneId, normalizedUrl);
+        nextCommand.url = normalizedUrl;
+      }
+    }
+    if (webBreakoutPanesRef.current[safePaneId]) {
+      emit(WEB_PANEL_COMMAND_EVENT, {
+        ...nextCommand,
+        paneId: safePaneId,
+        windowId: webPanelLabelsRef.current[safePaneId] || "",
+      }).catch(() => {});
+      return nextCommand;
+    }
+    setWebPaneCommands((current) => ({
+      ...current,
+      [safePaneId]: nextCommand,
+    }));
+    return nextCommand;
+  }, [rememberWebPaneUrl]);
+
+  const sendPcbPaneCommand = useCallback((paneId, command = {}) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return null;
+    }
+    const nextCommand = {
+      ...(command || {}),
+      nonce: Date.now() + Math.random(),
+    };
+    if (pcbBreakoutPanesRef.current[safePaneId]) {
+      emit(PCB_PANEL_COMMAND_EVENT, {
+        ...nextCommand,
+        paneId: safePaneId,
+        windowId: "",
+        workspaceId: terminalWorkspace?.id || "",
+      }).catch(() => {});
+      return nextCommand;
+    }
+    setPcbPaneCommands((current) => ({
+      ...current,
+      [safePaneId]: nextCommand,
+    }));
+    return nextCommand;
+  }, [terminalWorkspace?.id]);
+
+  const recordPcbPaneBoard = useCallback((paneId, board) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return;
+    }
+    setPcbPaneBoards((current) => {
+      const next = { ...current };
+      if (board) {
+        next[safePaneId] = board;
+      } else {
+        delete next[safePaneId];
+      }
+      return next;
+    });
+  }, []);
+
   const popOutWebPanelForIndex = useCallback(async (terminalIndex, paneId, url) => {
     const safePaneId = String(paneId || "").trim();
     if (!safePaneId || webBreakoutPanesRef.current[safePaneId]) {
@@ -27855,6 +27946,10 @@ function TerminalView({
       if (!paneId) {
         return;
       }
+      if (control === PCB_PANEL_CONTROL_BOARD_CHANGE) {
+        recordPcbPaneBoard(paneId, payload.board || null);
+        return;
+      }
       if (control === PCB_PANEL_CONTROL_RETURN) {
         returnPcbPanelToGrid(paneId);
       }
@@ -27872,7 +27967,7 @@ function TerminalView({
       disposed = true;
       unlisten();
     };
-  }, [returnPcbPanelToGrid, terminalWorkspace?.id]);
+  }, [recordPcbPaneBoard, returnPcbPanelToGrid, terminalWorkspace?.id]);
 
   // A breakout window closing (its close button, OS close, or our toggle)
   // returns the pane to the grid and re-asserts the grid's PTY size.
@@ -33765,6 +33860,530 @@ function TerminalView({
     beginTodoDragBridgeRef.current?.(event);
   }, []);
 
+  const normalizeWorkspaceControlPanelKind = useCallback((value) => {
+    const token = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+    if (["browser", "chrome", "workspace-browser", "workspace-web", "web-panel"].includes(token)) {
+      return "web";
+    }
+    if (["pcb", "pcb-design", "pcb-panel", "workspace-pcb", "board"].includes(token)) {
+      return "pcb";
+    }
+    if ([
+      "doc",
+      "docs",
+      "document",
+      "documents",
+      "workspace-docs",
+      "workspace-document",
+      "workspace-document-panel",
+      "docs-panel",
+      "document-panel",
+      "documents-panel",
+    ].includes(token)) {
+      return "docs";
+    }
+    if (["shell", "terminal", "term", "agent"].includes(token)) {
+      return "terminal";
+    }
+    if (token === "all" || token === "*") {
+      return "";
+    }
+    return token;
+  }, []);
+
+  const workspaceControlBoolean = useCallback((value, fallback = false) => {
+    if (typeof value === "boolean") {
+      return value;
+    }
+    const text = String(value ?? "").trim().toLowerCase();
+    if (["1", "true", "yes", "y", "on"].includes(text)) {
+      return true;
+    }
+    if (["0", "false", "no", "n", "off"].includes(text)) {
+      return false;
+    }
+    return fallback;
+  }, []);
+
+  const buildWorkspacePanelSnapshots = useCallback((input = {}) => {
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    const workspaceNameText = String(terminalWorkspace?.name || workspaceName || "").trim();
+    const repoPath = terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "";
+    const filterKind = normalizeWorkspaceControlPanelKind(input.kind || input.panelKind || input.panel_kind);
+    const includeContext = workspaceControlBoolean(input.includeContext ?? input.include_context, false);
+    const includeState = workspaceControlBoolean(input.includeState ?? input.include_state, false);
+    const panels = [];
+    logicalTerminalIndexes.forEach((terminalIndex) => {
+      const paneKind = paneKinds?.[terminalIndex] === "web"
+        ? "web"
+        : paneKinds?.[terminalIndex] === "pcb"
+          ? "pcb"
+          : "terminal";
+      if (filterKind && paneKind !== filterKind) {
+        return;
+      }
+      const paneId = getTerminalPaneId(terminalIndex);
+      const thread = paneKind === "terminal" ? getTerminalThread(terminalIndex) : null;
+      const role = paneKind === "terminal" ? getTerminalRole(terminalIndex) : "";
+      const board = paneKind === "pcb" ? pcbPaneBoardsRef.current[paneId] || null : null;
+      const url = paneKind === "web" ? webPaneUrlsRef.current[paneId] || DEFAULT_WEB_URL : "";
+      const panel = {
+        active: activePaneId === paneId,
+        kind: paneKind,
+        open: true,
+        panelId: paneId,
+        panel_id: paneId,
+        paneId,
+        pane_id: paneId,
+        queueable: paneKind === "terminal",
+        terminalIndex,
+        terminal_index: terminalIndex,
+        title: paneKind === "web"
+          ? "Web"
+          : paneKind === "pcb"
+            ? board?.name || "PCB"
+            : getManagedAgentLabel(role || WORKSPACE_TERMINAL_ROLE_GENERIC),
+        workspaceId,
+        workspace_id: workspaceId,
+        workspaceName: workspaceNameText,
+        workspace_name: workspaceNameText,
+      };
+      if (includeContext || includeState) {
+        if (paneKind === "web") {
+          panel.context = {
+            poppedOut: Boolean(webBreakoutPanesRef.current[paneId]),
+            url,
+          };
+        } else if (paneKind === "pcb") {
+          panel.context = {
+            board,
+            boardName: board?.name || "",
+            boardPath: board?.path || "",
+            poppedOut: Boolean(pcbBreakoutPanesRef.current[paneId]),
+            repoPath,
+          };
+        } else {
+          panel.context = {
+            agentId: role,
+            agentLabel: getManagedAgentLabel(role || WORKSPACE_TERMINAL_ROLE_GENERIC),
+            threadId: thread?.id || "",
+          };
+        }
+      }
+      panels.push(panel);
+    });
+    if ((!filterKind || filterKind === "docs") && workspaceDocumentPanelAvailable) {
+      panels.push({
+        active: activePaneId === TERMINAL_DOCUMENT_PANEL_ID,
+        context: includeContext || includeState ? {
+          document: terminalBreakoutDocumentPanel || null,
+          maximized: Boolean(terminalDocumentPanelMaximized),
+          open: Boolean(workspaceDocumentPanelAvailable),
+        } : undefined,
+        kind: "docs",
+        open: Boolean(workspaceDocumentPanelAvailable),
+        panelId: TERMINAL_DOCUMENT_PANEL_ID,
+        panel_id: TERMINAL_DOCUMENT_PANEL_ID,
+        paneId: TERMINAL_DOCUMENT_PANEL_ID,
+        pane_id: TERMINAL_DOCUMENT_PANEL_ID,
+        queueable: false,
+        terminalIndex: null,
+        terminal_index: null,
+        title: "Docs",
+        workspaceId,
+        workspace_id: workspaceId,
+        workspaceName: workspaceNameText,
+        workspace_name: workspaceNameText,
+      });
+    }
+    return {
+      panels: panels.map((panel) => (
+        panel.context === undefined
+          ? Object.fromEntries(Object.entries(panel).filter(([key]) => key !== "context"))
+          : panel
+      )),
+      workspace: {
+        id: workspaceId,
+        name: workspaceNameText,
+        rootDirectory: repoPath,
+      },
+    };
+  }, [
+    activePaneId,
+    defaultWorkingDirectory,
+    getTerminalPaneId,
+    getTerminalRole,
+    getTerminalThread,
+    logicalTerminalIndexes,
+    normalizeWorkspaceControlPanelKind,
+    paneKinds,
+    terminalBreakoutDocumentPanel,
+    terminalDocumentPanelMaximized,
+    terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    terminalWorkspaceWorkingDirectory,
+    workspaceControlBoolean,
+    workspaceDocumentPanelAvailable,
+    workspaceName,
+  ]);
+
+  const resolveWorkspaceControlPanel = useCallback((input = {}, panelSnapshot = null) => {
+    const snapshot = panelSnapshot || buildWorkspacePanelSnapshots({ ...input, includeContext: true });
+    const requestedKind = normalizeWorkspaceControlPanelKind(input.kind || input.panelKind || input.panel_kind);
+    const requestedIndex = Number.parseInt(input.terminalIndex ?? input.terminal_index ?? input.index, 10);
+    const paneIds = [
+      input.paneId,
+      input.pane_id,
+      input.panelId,
+      input.panel_id,
+      input.id,
+    ].map((value) => String(value || "").trim()).filter(Boolean);
+    const hasExplicitPanelSelector = paneIds.length > 0 || Number.isInteger(requestedIndex);
+    const hasSelector = Boolean(requestedKind || paneIds.length || Number.isInteger(requestedIndex));
+    const panels = Array.isArray(snapshot?.panels) ? snapshot.panels : [];
+    const selected = panels.find((panel) => {
+      if (requestedKind && panel.kind !== requestedKind) {
+        return false;
+      }
+      if (Number.isInteger(requestedIndex) && panel.terminalIndex !== requestedIndex) {
+        return false;
+      }
+      if (paneIds.length && !paneIds.includes(panel.paneId) && !paneIds.includes(panel.panelId)) {
+        return false;
+      }
+      return requestedKind || Number.isInteger(requestedIndex) || paneIds.length;
+    });
+    if (selected) {
+      return selected;
+    }
+    if (requestedKind && !hasExplicitPanelSelector) {
+      return panels.find((panel) => panel.kind === requestedKind) || null;
+    }
+    if (!hasSelector) {
+      return panels.find((panel) => panel.active) || panels[0] || null;
+    }
+    return null;
+  }, [buildWorkspacePanelSnapshots, normalizeWorkspaceControlPanelKind]);
+
+  const focusWorkspacePanelFromControl = useCallback((input = {}) => {
+    const snapshot = buildWorkspacePanelSnapshots({ ...input, includeContext: true });
+    const panel = resolveWorkspaceControlPanel(input, snapshot);
+    if (!panel) {
+      const requestedKind = normalizeWorkspaceControlPanelKind(input.kind || input.panelKind || input.panel_kind);
+      if (requestedKind === "docs" && !workspaceDocumentPanelAvailable) {
+        setActiveTerminalPaneId(TERMINAL_DOCUMENT_PANEL_ID);
+        onOpenWorkspaceDocumentPanel?.(input.document || input.entry || null);
+        return {
+          focused: true,
+          pending: true,
+          panel: {
+            active: true,
+            kind: "docs",
+            open: false,
+            panelId: TERMINAL_DOCUMENT_PANEL_ID,
+            paneId: TERMINAL_DOCUMENT_PANEL_ID,
+            queueable: false,
+            terminalIndex: null,
+            title: "Docs",
+            workspaceId: terminalWorkspace?.id || "",
+            workspaceName: terminalWorkspace?.name || workspaceName || "",
+          },
+          workspace: snapshot.workspace,
+        };
+      }
+      throw new Error("No matching workspace panel was found.");
+    }
+    if (panel.kind === "docs") {
+      setActiveTerminalPaneId(TERMINAL_DOCUMENT_PANEL_ID);
+      if (!workspaceDocumentPanelAvailable) {
+        onOpenWorkspaceDocumentPanel?.();
+      } else {
+        openWorkspaceDocumentPanel();
+      }
+    } else if (Number.isInteger(panel.terminalIndex)) {
+      setActiveTerminalPaneId(panel.paneId);
+      if (panel.kind === "web" && webBreakoutPanesRef.current[panel.paneId]) {
+        focusWebPanel(panel.terminalIndex, panel.paneId);
+      } else if (panel.kind === "pcb" && pcbBreakoutPanesRef.current[panel.paneId]) {
+        focusPcbPanel(panel.terminalIndex, panel.paneId);
+      } else if (panel.kind === "terminal" && windowBreakoutPanesRef.current[panel.paneId]) {
+        focusTerminalWindow(panel.terminalIndex, panel.paneId);
+      }
+    }
+    return {
+      focused: true,
+      panel,
+      workspace: snapshot.workspace,
+    };
+  }, [
+    buildWorkspacePanelSnapshots,
+    focusPcbPanel,
+    focusTerminalWindow,
+    focusWebPanel,
+    normalizeWorkspaceControlPanelKind,
+    onOpenWorkspaceDocumentPanel,
+    openWorkspaceDocumentPanel,
+    resolveWorkspaceControlPanel,
+    terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    workspaceDocumentPanelAvailable,
+    workspaceName,
+  ]);
+
+  const openWorkspacePanelFromControl = useCallback((input = {}) => {
+    const kind = normalizeWorkspaceControlPanelKind(input.kind || input.panelKind || input.panel_kind || "web");
+    if (kind === "docs") {
+      const entry = input.document || input.entry || null;
+      setActiveTerminalPaneId(TERMINAL_DOCUMENT_PANEL_ID);
+      if (!workspaceDocumentPanelAvailable) {
+        onOpenWorkspaceDocumentPanel?.(entry);
+        return {
+          opened: true,
+          pending: true,
+          panel: {
+            active: true,
+            kind: "docs",
+            open: false,
+            panelId: TERMINAL_DOCUMENT_PANEL_ID,
+            panel_id: TERMINAL_DOCUMENT_PANEL_ID,
+            paneId: TERMINAL_DOCUMENT_PANEL_ID,
+            pane_id: TERMINAL_DOCUMENT_PANEL_ID,
+            queueable: false,
+            terminalIndex: null,
+            terminal_index: null,
+            title: "Docs",
+            workspaceId: terminalWorkspace?.id || "",
+            workspace_id: terminalWorkspace?.id || "",
+            workspaceName: terminalWorkspace?.name || workspaceName || "",
+            workspace_name: terminalWorkspace?.name || workspaceName || "",
+          },
+          workspace: {
+            id: terminalWorkspace?.id || "",
+            name: terminalWorkspace?.name || workspaceName || "",
+            rootDirectory: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+          },
+        };
+      }
+      openWorkspaceDocumentPanel(entry);
+      return focusWorkspacePanelFromControl({ ...input, kind: "docs" });
+    }
+    const addPane = kind === "pcb" ? addWorkspacePcbPane : kind === "web" ? addWorkspaceWebPane : null;
+    if (!addPane || !terminalWorkspace?.id) {
+      throw new Error("That workspace panel cannot be opened here.");
+    }
+    const result = addPane({ workspaceId: terminalWorkspace.id });
+    if (!result || !Number.isInteger(result.terminalIndex)) {
+      throw new Error("Workspace panel limit reached.");
+    }
+    const paneId = getTerminalPaneId(result.terminalIndex);
+    setActiveTerminalPaneId(paneId);
+    if (kind === "web") {
+      const target = input.url || input.search || input.query || "";
+      if (target) {
+        sendWebPaneCommand(paneId, {
+          action: input.search || input.query ? "search" : "navigate",
+          query: input.query,
+          search: input.search,
+          url: target,
+        });
+      }
+    } else if (kind === "pcb" && (input.create || input.name)) {
+      sendPcbPaneCommand(paneId, { action: "create", name: input.name || "" });
+    }
+    return {
+      opened: true,
+      panel: {
+        active: true,
+        kind,
+        open: true,
+        panelId: paneId,
+        panel_id: paneId,
+        paneId,
+        pane_id: paneId,
+        queueable: false,
+        terminalIndex: result.terminalIndex,
+        terminal_index: result.terminalIndex,
+        title: kind === "pcb" ? "PCB" : "Web",
+        workspaceId: terminalWorkspace.id,
+        workspace_id: terminalWorkspace.id,
+        workspaceName: terminalWorkspace.name || workspaceName || "",
+        workspace_name: terminalWorkspace.name || workspaceName || "",
+      },
+      workspace: {
+        id: terminalWorkspace.id,
+        name: terminalWorkspace.name || workspaceName || "",
+        rootDirectory: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+      },
+    };
+  }, [
+    addWorkspacePcbPane,
+    addWorkspaceWebPane,
+    defaultWorkingDirectory,
+    focusWorkspacePanelFromControl,
+    getTerminalPaneId,
+    normalizeWorkspaceControlPanelKind,
+    onOpenWorkspaceDocumentPanel,
+    openWorkspaceDocumentPanel,
+    sendPcbPaneCommand,
+    sendWebPaneCommand,
+    terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    terminalWorkspaceWorkingDirectory,
+    workspaceDocumentPanelAvailable,
+    workspaceName,
+  ]);
+
+  const closeWorkspacePanelFromControl = useCallback((input = {}) => {
+    const snapshot = buildWorkspacePanelSnapshots({ ...input, includeContext: true });
+    const panel = resolveWorkspaceControlPanel(input, snapshot);
+    if (!panel) {
+      throw new Error("No matching workspace panel was found.");
+    }
+    if (panel.kind === "docs") {
+      closeWorkspaceDocumentPanel();
+      setActiveTerminalPaneId((currentPaneId) => (
+        currentPaneId === TERMINAL_DOCUMENT_PANEL_ID ? "" : currentPaneId
+      ));
+    } else if (Number.isInteger(panel.terminalIndex)) {
+      closeWorkspaceTerminal({ workspaceId: terminalWorkspace?.id || "", terminalIndex: panel.terminalIndex });
+    }
+    return {
+      closed: true,
+      panel,
+      workspace: snapshot.workspace,
+    };
+  }, [
+    buildWorkspacePanelSnapshots,
+    closeWorkspaceDocumentPanel,
+    closeWorkspaceTerminal,
+    resolveWorkspaceControlPanel,
+    terminalWorkspace?.id,
+  ]);
+
+  const getWorkspacePanelContextFromControl = useCallback((input = {}) => {
+    const snapshot = buildWorkspacePanelSnapshots({ ...input, includeContext: true });
+    const panel = resolveWorkspaceControlPanel(input, snapshot);
+    if (!panel) {
+      throw new Error("No matching workspace panel was found.");
+    }
+    return {
+      panel,
+      panels: snapshot.panels,
+      workspace: snapshot.workspace,
+    };
+  }, [buildWorkspacePanelSnapshots, resolveWorkspaceControlPanel]);
+
+  const runWorkspacePanelActionFromControl = useCallback((input = {}) => {
+    const action = String(input.action || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
+    if (!action || action === "context" || action === "inspect") {
+      return getWorkspacePanelContextFromControl(input);
+    }
+    if (action === "focus") {
+      return focusWorkspacePanelFromControl(input);
+    }
+    if (action === "close") {
+      return closeWorkspacePanelFromControl(input);
+    }
+    const snapshot = buildWorkspacePanelSnapshots({ ...input, includeContext: true });
+    let panel = resolveWorkspaceControlPanel(input, snapshot);
+    if (!panel && ["navigate", "search", "open"].includes(action)) {
+      return openWorkspacePanelFromControl({
+        ...input,
+        kind: input.kind || "web",
+      });
+    }
+    if (!panel) {
+      throw new Error("No matching workspace panel was found.");
+    }
+    if (panel.kind === "web") {
+      if (action === "open" || action === "popout" || action === "open-window") {
+        void popOutWebPanelForIndex(panel.terminalIndex, panel.paneId, panel.context?.url || DEFAULT_WEB_URL);
+      } else if (action === "return" || action === "return-to-grid") {
+        returnWebPanelToGrid(panel.paneId, panel.context?.url || DEFAULT_WEB_URL);
+      } else if (["navigate", "search", "reload", "refresh", "back", "forward"].includes(action)) {
+        sendWebPaneCommand(panel.paneId, {
+          action,
+          query: input.query,
+          search: input.search,
+          url: input.url || input.search || input.query || "",
+        });
+      } else if (action === "screenshot" || action === "capture") {
+        throw new Error("Web panel screenshots are not available from this live bridge yet.");
+      } else {
+        throw new Error(`Unsupported web panel action: ${action}`);
+      }
+    } else if (panel.kind === "pcb") {
+      if (action === "open" || action === "popout" || action === "open-window") {
+        void popOutPcbPanelForIndex(panel.terminalIndex, panel.paneId);
+      } else if (action === "return" || action === "return-to-grid") {
+        returnPcbPanelToGrid(panel.paneId);
+      } else if (["create", "new", "new-board", "refresh", "reload"].includes(action)) {
+        sendPcbPaneCommand(panel.paneId, {
+          action,
+          name: input.name || "",
+        });
+      } else {
+        throw new Error(`Unsupported PCB panel action: ${action}`);
+      }
+    } else if (panel.kind === "docs") {
+      if (action === "open") {
+        return openWorkspacePanelFromControl({ ...input, kind: "docs" });
+      } else if (action === "return" || action === "refresh" || action === "reload") {
+        focusWorkspacePanelFromControl({ ...input, kind: "docs" });
+      } else {
+        throw new Error(`Unsupported Docs panel action: ${action}`);
+      }
+    } else {
+      throw new Error(`Unsupported panel action for ${panel.kind}: ${action}`);
+    }
+    return {
+      action,
+      ok: true,
+      panel,
+      workspace: snapshot.workspace,
+    };
+  }, [
+    buildWorkspacePanelSnapshots,
+    closeWorkspacePanelFromControl,
+    focusWorkspacePanelFromControl,
+    getWorkspacePanelContextFromControl,
+    openWorkspaceDocumentPanel,
+    openWorkspacePanelFromControl,
+    popOutPcbPanelForIndex,
+    popOutWebPanelForIndex,
+    resolveWorkspaceControlPanel,
+    returnPcbPanelToGrid,
+    returnWebPanelToGrid,
+    sendPcbPaneCommand,
+    sendWebPaneCommand,
+  ]);
+
+  const handleWorkspaceDocsAppControlContextChange = useCallback((context) => {
+    if (typeof onAppControlContextChange !== "function") {
+      return;
+    }
+    const safeContext = context && typeof context === "object" && !Array.isArray(context)
+      ? context
+      : {};
+    onAppControlContextChange({
+      ...safeContext,
+      active: safeContext.active !== false && isWorkspaceSurfaceVisible && workspaceDocumentPanelAvailable,
+      panelId: TERMINAL_DOCUMENT_PANEL_ID,
+      panelKind: "docs",
+      paneId: TERMINAL_DOCUMENT_PANEL_ID,
+      surface: "workspace-docs",
+      workspaceId: terminalWorkspace?.id || "",
+      workspaceName: terminalWorkspace?.name || workspaceName || "",
+    });
+  }, [
+    isWorkspaceSurfaceVisible,
+    onAppControlContextChange,
+    terminalWorkspace?.id,
+    terminalWorkspace?.name,
+    workspaceDocumentPanelAvailable,
+    workspaceName,
+  ]);
+
   useEffect(() => {
     const workspaceId = String(terminalWorkspace?.id || "").trim();
     if (!workspaceId || typeof onWorkspaceToolRuntimeBridgeChange !== "function") {
@@ -33772,6 +34391,11 @@ function TerminalView({
     }
 
     onWorkspaceToolRuntimeBridgeChange(workspaceId, {
+      closeWorkspacePanel: closeWorkspacePanelFromControl,
+      focusWorkspacePanel: focusWorkspacePanelFromControl,
+      getWorkspacePanelContext: getWorkspacePanelContextFromControl,
+      listWorkspacePanels: buildWorkspacePanelSnapshots,
+      openWorkspacePanel: openWorkspacePanelFromControl,
       onBeginTodoDrag: handleWorkspaceToolBeginTodoDrag,
       onOpenDocumentPanel: openWorkspaceDocumentPanel,
       onSelectWorkspaceTool: selectRuntimeWorkspaceToolTab,
@@ -33779,6 +34403,7 @@ function TerminalView({
       onToggleWindowBreakout: toggleWindowBreakout,
       onVoiceAgentToolCall: handleVoiceAgentToolCall,
       onVoicePlanServerResult: handleVoicePlanServerResult,
+      runWorkspacePanelAction: runWorkspacePanelActionFromControl,
       terminalBreakoutActive: terminalBreakoutVisible,
       windowBreakoutActive,
     });
@@ -33787,11 +34412,17 @@ function TerminalView({
       onWorkspaceToolRuntimeBridgeChange(workspaceId, null);
     };
   }, [
+    buildWorkspacePanelSnapshots,
+    closeWorkspacePanelFromControl,
+    focusWorkspacePanelFromControl,
+    getWorkspacePanelContextFromControl,
     handleWorkspaceToolBeginTodoDrag,
     handleVoiceAgentToolCall,
     handleVoicePlanServerResult,
     onWorkspaceToolRuntimeBridgeChange,
+    openWorkspacePanelFromControl,
     openWorkspaceDocumentPanel,
+    runWorkspacePanelActionFromControl,
     selectRuntimeWorkspaceToolTab,
     terminalBreakoutVisible,
     terminalWorkspace?.id,
@@ -36298,6 +36929,7 @@ function TerminalView({
                   onReturnFromBreakout={(index, pid) => returnWebPanelToGrid(pid)}
                   onFocusBreakout={focusWebPanel}
                   onNavigate={(url) => rememberWebPaneUrl(terminalPaneId, url)}
+                  controlCommand={webPaneCommands[terminalPaneId] || null}
                 />
               </TerminalSurfaceSlot>
             );
@@ -36324,7 +36956,9 @@ function TerminalView({
                   fullscreenActive={fullscreenActive}
                   isActive={isWorkspaceSurfaceVisible && !tabHidden}
                   isFullscreen={fullscreenThisTerminal}
+                  controlCommand={pcbPaneCommands[terminalPaneId] || null}
                   onClose={(index) => closeWorkspaceTerminal({ workspaceId: terminalWorkspace?.id || "", terminalIndex: index })}
+                  onBoardChange={(board) => recordPcbPaneBoard(terminalPaneId, board)}
                   onDragHandlePointerDown={(event, index, pid) => {
                     if (event.button !== 0) {
                       return;
@@ -36827,8 +37461,15 @@ function TerminalView({
                   embeddedDocsPanel
                   embeddedDocsWindowOpenRequest={terminalDocumentPanelWindowRequest}
                   initialSection="docs"
+                  onAppControlContextChange={handleWorkspaceDocsAppControlContextChange}
+                  onAppControlDocumentActions={
+                    isWorkspaceSurfaceVisible && workspaceDocumentPanelAvailable
+                      ? onAppControlDocumentActions
+                      : null
+                  }
                   onEmbeddedDocsSelectionChange={handleDocumentPanelSelectionChange}
                   rightToolsOrchestratorOpen
+                  surfaceActive={isWorkspaceSurfaceVisible && workspaceDocumentPanelAvailable}
                   workspaces={workspaces}
                 />
               </TerminalDocumentPanelBody>
