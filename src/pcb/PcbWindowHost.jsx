@@ -244,7 +244,13 @@ export default function PcbWindowHost() {
   return (
     <WindowRoot>
       <GlobalStyle />
-      <PcbPanel board={board} defaultTab={params.tab} isActive repoPath={params.repoPath} />
+      <PcbPanel
+        board={board}
+        defaultTab={params.tab}
+        isActive
+        repoPath={params.repoPath}
+        workspaceId={params.workspaceId}
+      />
     </WindowRoot>
   );
 }

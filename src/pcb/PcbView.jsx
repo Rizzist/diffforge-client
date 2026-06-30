@@ -367,10 +367,10 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
     if (!repoPath) {
       return;
     }
-    invoke("pcb_documents_list", { repoPath })
+    invoke("pcb_documents_list", { repoPath, workspaceId })
       .then((result) => setAvailable(Array.isArray(result?.boards) ? result.boards : []))
       .catch((err) => setError(String(err)));
-  }, [repoPath]);
+  }, [repoPath, workspaceId]);
 
   // Start the per-workspace filesystem watcher + load the board list.
   useEffect(() => {
@@ -392,7 +392,11 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
         return;
       }
       const eventRepo = normalizeRepoIdentity(event?.payload?.repoPath);
+      const eventWorkspace = String(event?.payload?.workspaceId || event?.payload?.workspace_id || "").trim();
       if (eventRepo && eventRepo !== normalizeRepoIdentity(repoPath)) {
+        return;
+      }
+      if (eventWorkspace && workspaceId && eventWorkspace !== workspaceId) {
         return;
       }
       refreshList();
@@ -409,7 +413,7 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
       disposed = true;
       unlisten();
     };
-  }, [refreshList, repoPath]);
+  }, [refreshList, repoPath, workspaceId]);
 
   // Restore slots for this workspace; otherwise seed empty slots from the
   // create-modal count (at least one so the view is never blank).
@@ -467,7 +471,7 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
       }
       setBusy(true);
       setError("");
-      return invoke("pcb_document_create", { repoPath, name })
+      return invoke("pcb_document_create", { repoPath, name, workspaceId })
         .then((doc) => {
           if (doc?.path) {
             bindSlot(key, { path: doc.path, name: doc.name });
@@ -480,7 +484,7 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
         })
         .finally(() => setBusy(false));
     },
-    [repoPath, bindSlot, refreshList],
+    [repoPath, bindSlot, refreshList, workspaceId],
   );
 
   const popOut = useCallback(
@@ -492,9 +496,10 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
         repoPath,
         boardPath: board.path,
         boardName: board.name || board.path,
+        workspaceId,
       }).catch((err) => setError(String(err)));
     },
-    [repoPath],
+    [repoPath, workspaceId],
   );
 
   const boardName = useCallback(
@@ -541,6 +546,7 @@ export default function PcbView({ workspace, rootDirectory, initialPanelCount = 
                       onClose={() => closeSlot(slot.key)}
                       onPopOut={popOut}
                       repoPath={repoPath}
+                      workspaceId={workspaceId}
                     />
                   ) : (
                     <PcbSlotChooser

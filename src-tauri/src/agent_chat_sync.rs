@@ -35,11 +35,56 @@ struct AgentChatSessionSyncSource {
 const AGENT_CHAT_SESSION_SYNC_TARGET_PACKET_BYTES: usize = 512 * 1024;
 const AGENT_CHAT_SESSION_SYNC_MAX_RECORDS_PER_PACKET: usize = 128;
 const AGENT_CHAT_SESSION_HISTORY_BACKFILL_LIMIT: usize = 100;
+const AGENT_CHAT_SESSION_HISTORY_BACKFILL_SPAWN_LIMIT: usize = 24;
 const AGENT_CHAT_SESSION_HISTORY_BACKFILL_INTERVAL_MS: u64 = 60_000;
 const AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS: u64 = 5 * 60_000;
+const AGENT_CHAT_SESSION_SYNC_BUILD_CONCURRENCY: usize = 4;
 
 static AGENT_CHAT_SESSION_HISTORY_BACKFILL_LAST: OnceLock<StdMutex<HashMap<String, u64>>> =
     OnceLock::new();
+static AGENT_CHAT_SESSION_HISTORY_SOURCE_FINGERPRINTS: OnceLock<
+    StdMutex<HashMap<String, AgentChatSessionHistorySourceFingerprint>>,
+> = OnceLock::new();
+static AGENT_CHAT_SESSION_SYNC_BUILD_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> =
+    OnceLock::new();
+
+#[derive(Clone, PartialEq, Eq)]
+struct AgentChatSessionHistorySourceFingerprint {
+    source_path: String,
+    modified_ms: u64,
+    len: u64,
+}
+
+fn agent_chat_session_sync_build_semaphore() -> Arc<tokio::sync::Semaphore> {
+    AGENT_CHAT_SESSION_SYNC_BUILD_SEMAPHORE
+        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(AGENT_CHAT_SESSION_SYNC_BUILD_CONCURRENCY)))
+        .clone()
+}
+
+fn agent_chat_session_history_source_fingerprints(
+) -> &'static StdMutex<HashMap<String, AgentChatSessionHistorySourceFingerprint>> {
+    AGENT_CHAT_SESSION_HISTORY_SOURCE_FINGERPRINTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn agent_chat_session_history_source_fingerprint_for_path(
+    path: &Path,
+) -> Option<AgentChatSessionHistorySourceFingerprint> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified_ms = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    Some(AgentChatSessionHistorySourceFingerprint {
+        source_path: path.to_string_lossy().to_string(),
+        modified_ms,
+        len: metadata.len(),
+    })
+}
 
 fn agent_chat_session_sync_provider(agent_id: &str) -> Option<&'static str> {
     match agent_id.trim().to_ascii_lowercase().as_str() {
@@ -1693,6 +1738,13 @@ fn agent_chat_session_sync_spawn(
 ) {
     let state = app.state::<CloudMcpState>().inner().clone();
     tauri::async_runtime::spawn(async move {
+        let _build_permit = match agent_chat_session_sync_build_semaphore()
+            .acquire_owned()
+            .await
+        {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
         let build_agent_id = agent_id.clone();
         let build_provider_session_id = provider_session_id.clone();
         let build_cwd = cwd.clone();
@@ -1986,6 +2038,94 @@ fn agent_chat_session_sync_history_item_record(
     }
 }
 
+fn agent_chat_session_sync_history_item_fully_synced(
+    item: &WorkspaceAgentSessionHistoryItem,
+) -> bool {
+    let sync = &item.chat_sync;
+    sync.status.trim().eq_ignore_ascii_case("synced")
+        && sync.acked_at_ms > 0
+        && (sync.record_total_count == 0 || sync.record_acked_count >= sync.record_total_count)
+}
+
+fn agent_chat_session_sync_history_fingerprint_key(
+    item: &WorkspaceAgentSessionHistoryItem,
+    provider: &str,
+    session_id: &str,
+) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        item.workspace_id.trim(),
+        provider.trim(),
+        session_id.trim(),
+        item.workspace_root.trim()
+    )
+}
+
+fn agent_chat_session_sync_history_item_source_fingerprint(
+    item: &WorkspaceAgentSessionHistoryItem,
+    provider: &str,
+    session_id: &str,
+) -> Option<AgentChatSessionHistorySourceFingerprint> {
+    match provider {
+        "claude" => {
+            let (path, _, _) = find_claude_session(session_id, item.cwd.as_str()).ok()?;
+            agent_chat_session_history_source_fingerprint_for_path(&path)
+        }
+        "codex" => {
+            let (path, _, _) = find_codex_rollout(session_id, item.cwd.as_str()).ok()?;
+            agent_chat_session_history_source_fingerprint_for_path(&path)
+        }
+        "opencode" => {
+            let path = opencode_db_path()?;
+            agent_chat_session_history_source_fingerprint_for_path(&path)
+        }
+        _ => None,
+    }
+}
+
+fn agent_chat_session_sync_history_item_skip_unchanged_verify(
+    item: &WorkspaceAgentSessionHistoryItem,
+) -> bool {
+    if !agent_chat_session_sync_history_item_fully_synced(item) {
+        return false;
+    }
+    let Some(provider) = workspace_threads_clean_agent_id(&item.provider)
+        .or_else(|| workspace_threads_clean_agent_id(&item.agent_id))
+    else {
+        return false;
+    };
+    let Some(session_id) = workspace_agent_session_history_item_session_id(item) else {
+        return false;
+    };
+    let Some(fingerprint) =
+        agent_chat_session_sync_history_item_source_fingerprint(item, &provider, &session_id)
+    else {
+        return false;
+    };
+    let key = agent_chat_session_sync_history_fingerprint_key(item, &provider, &session_id);
+    let ledger = agent_chat_session_history_source_fingerprints();
+    let Ok(mut entries) = ledger.lock() else {
+        return false;
+    };
+    let sync = &item.chat_sync;
+    let last_verified_at_ms = sync
+        .acked_at_ms
+        .max(sync.updated_at_ms)
+        .max(sync.last_enqueued_at_ms);
+    if fingerprint.modified_ms > 0
+        && last_verified_at_ms > 0
+        && fingerprint.modified_ms <= last_verified_at_ms
+    {
+        entries.insert(key, fingerprint);
+        return true;
+    }
+    let unchanged = entries
+        .get(&key)
+        .is_some_and(|previous| previous == &fingerprint);
+    entries.insert(key, fingerprint);
+    unchanged
+}
+
 fn agent_chat_session_sync_history_item_needs_backfill(
     item: &WorkspaceAgentSessionHistoryItem,
 ) -> bool {
@@ -2009,10 +2149,7 @@ fn agent_chat_session_sync_history_item_needs_backfill(
     {
         return false;
     }
-    if sync.status.trim().eq_ignore_ascii_case("synced")
-        && sync.acked_at_ms > 0
-        && (sync.record_total_count == 0 || sync.record_acked_count >= sync.record_total_count)
-    {
+    if agent_chat_session_sync_history_item_fully_synced(item) {
         let last_verified_at_ms = sync
             .acked_at_ms
             .max(sync.updated_at_ms)
@@ -2032,7 +2169,8 @@ fn agent_chat_session_sync_spawn_from_history_items(
     for item in items
         .iter()
         .filter(|item| agent_chat_session_sync_history_item_needs_backfill(item))
-        .take(AGENT_CHAT_SESSION_HISTORY_BACKFILL_LIMIT)
+        .filter(|item| !agent_chat_session_sync_history_item_skip_unchanged_verify(item))
+        .take(AGENT_CHAT_SESSION_HISTORY_BACKFILL_SPAWN_LIMIT)
     {
         agent_chat_session_sync_spawn_from_history_record(
             app.clone(),

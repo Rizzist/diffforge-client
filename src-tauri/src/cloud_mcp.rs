@@ -130,6 +130,7 @@ const CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS: u64 = 20;
 // Backstop sweep only — the notify_one() path handles real work immediately,
 // so this timed wake can be infrequent. 15s was 4 idle CPU wakes/min forever.
 const CLOUD_MCP_BACKGROUND_SYNC_IDLE_WAKE_MS: u64 = 60_000;
+const CLOUD_MCP_BACKGROUND_SYNC_EMPTY_IDLE_WAKE_MS: u64 = 5 * 60_000;
 const CLOUD_MCP_OUTBOX_STALE_IN_FLIGHT_MS: u64 = (CLOUD_MCP_SYNC_TIMEOUT_SECS + 15) * 1000;
 const CLOUD_MCP_APP_WS_FAST_LANE_ACK_TIMEOUT_MS: u64 = 10_000;
 const CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH: u8 = 0;
@@ -178,7 +179,6 @@ const CLOUD_MCP_TERMINAL_NICKNAMES: [&str; 50] = [
 ];
 
 const CLOUD_MCP_SYNC_STATUS_EVENT: &str = "cloud-mcp-sync-status";
-const CLOUD_MCP_SYNC_STATUS_MIN_EMIT_INTERVAL_MS: u64 = 300;
 const CLOUD_MCP_SYNC_ACTIVITY_LARGE_BYTES: u64 = 256 * 1024;
 const CLOUD_MCP_SYNC_ACTIVITY_LARGE_COUNT: usize = 8;
 const CLOUD_MCP_SYNC_ACTIVITY_BACKLOG_MS: u64 = 2_000;
@@ -208,6 +208,7 @@ static CLOUD_MCP_WS_LAST_PING_SENT_MS: AtomicU64 = AtomicU64::new(0);
 static CLOUD_MCP_WS_LAST_PONG_RECEIVED_MS: AtomicU64 = AtomicU64::new(0);
 static CLOUD_MCP_NETWORK_RECENT_FRAMES: OnceLock<StdMutex<VecDeque<Value>>> = OnceLock::new();
 static CLOUD_MCP_TOKENOMICS_SYNC_LOGS: OnceLock<StdMutex<VecDeque<Value>>> = OnceLock::new();
+static CLOUD_MCP_OUTBOX_KNOWN_EMPTY: AtomicBool = AtomicBool::new(false);
 
 static CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
 static CLOUD_MCP_BACKGROUND_EVENT_SENDER: OnceLock<
@@ -796,6 +797,7 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
         ))
         .await;
 
+        let mut tokenomics_sync_pending_after_offline = false;
         loop {
             if app_shutdown_requested() {
                 break;
@@ -804,25 +806,27 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
             // Stamp/scan runs off the async runtime: it opens SQLite and may
             // issue blocking HTTP for the live provider limits.
             let cycle_app = app.clone();
-            match tauri::async_runtime::spawn_blocking(move || {
+            let cycle_status = match tauri::async_runtime::spawn_blocking(move || {
                 tokenomics_run_periodic_sample_cycle(&cycle_app)
             })
             .await
             {
-                Ok(Ok(_status)) => {}
+                Ok(Ok(status)) => Some(status),
                 Ok(Err(error)) => {
                     log_terminal_status_event(
                         "backend.cloud_mcp.tokenomics_scheduler.cycle_error",
                         json!({ "error": clean_terminal_telemetry_text(&error) }),
                     );
+                    None
                 }
                 Err(error) => {
                     log_terminal_status_event(
                         "backend.cloud_mcp.tokenomics_scheduler.join_error",
                         json!({ "error": clean_terminal_telemetry_text(&error.to_string()) }),
                     );
+                    None
                 }
-            }
+            };
 
             if app_shutdown_requested() {
                 break;
@@ -831,7 +835,17 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
             // Best-effort outbound sync. Only attempt while a live connection
             // exists; offline cycles keep stamping locally and the next online
             // cycle flushes the accumulated delta since the sync cursor.
-            if CLOUD_MCP_GLOBAL_WS_LIVE.load(Ordering::Acquire) {
+            let tokenomics_local_delta = cycle_status.as_ref().is_some_and(|status| {
+                ["recorded_samples", "recorded_windows", "token_scan_inserted_events"]
+                    .iter()
+                    .any(|key| status.get(*key).and_then(Value::as_u64).unwrap_or(0) > 0)
+            });
+            let tokenomics_live = CLOUD_MCP_GLOBAL_WS_LIVE.load(Ordering::Acquire);
+            if tokenomics_local_delta && !tokenomics_live {
+                tokenomics_sync_pending_after_offline = true;
+            }
+            if tokenomics_live && (tokenomics_local_delta || tokenomics_sync_pending_after_offline)
+            {
                 let _ = cloud_mcp_enqueue_tokenomics_sync(
                     app.clone(),
                     &state,
@@ -840,6 +854,7 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
                     false,
                 )
                 .await;
+                tokenomics_sync_pending_after_offline = false;
             }
 
             // Gap measured from the end of this cycle to the start of the next.
@@ -2507,6 +2522,38 @@ fn cloud_mcp_outbox_recover_stale_in_flight() {
     }
 }
 
+fn cloud_mcp_outbox_note_may_have_work() {
+    CLOUD_MCP_OUTBOX_KNOWN_EMPTY.store(false, Ordering::Release);
+}
+
+fn cloud_mcp_outbox_note_known_empty(value: bool) {
+    CLOUD_MCP_OUTBOX_KNOWN_EMPTY.store(value, Ordering::Release);
+}
+
+fn cloud_mcp_outbox_known_empty() -> bool {
+    CLOUD_MCP_OUTBOX_KNOWN_EMPTY.load(Ordering::Acquire)
+}
+
+fn cloud_mcp_outbox_has_pending_rows() -> bool {
+    let Ok(conn) = cloud_mcp_open_outbox_conn() else {
+        return true;
+    };
+    conn.query_row(
+        &format!(
+            "SELECT EXISTS(
+               SELECT 1
+               FROM {CLOUD_MCP_OUTBOX_TABLE}
+               WHERE status IN ('queued', 'retrying', 'in_flight')
+               LIMIT 1
+             )"
+        ),
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| value != 0)
+    .unwrap_or(true)
+}
+
 fn cloud_mcp_tokenomics_device_packet_kind(event_kind: &str) -> bool {
     matches!(
         event_kind.trim(),
@@ -4118,6 +4165,7 @@ fn cloud_mcp_outbox_enqueue_event(
         ],
     )
     .map_err(|error| format!("Unable to enqueue Cloud sync outbox row for {reason}: {error}"))?;
+    cloud_mcp_outbox_note_may_have_work();
     let row = conn
         .query_row(
             &format!(
@@ -5798,11 +5846,8 @@ fn cloud_mcp_emit_sync_status(syncing_hint: Option<bool>) {
         let Ok(mut last) = CLOUD_MCP_SYNC_STATUS_LAST.lock() else {
             return;
         };
-        if let Some((last_fingerprint, last_emit_ms)) = last.as_ref() {
-            let same_class = last_fingerprint == &fingerprint;
-            if same_class
-                && now.saturating_sub(*last_emit_ms) < CLOUD_MCP_SYNC_STATUS_MIN_EMIT_INTERVAL_MS
-            {
+        if let Some((last_fingerprint, _last_emit_ms)) = last.as_ref() {
+            if last_fingerprint == &fingerprint {
                 return;
             }
         }
@@ -6443,6 +6488,9 @@ fn cloud_mcp_outbox_mark_retry(row: &CloudMcpOutboxRow, error: &str) -> Result<(
         ],
     )
     .map_err(|error| format!("Unable to mark Cloud sync outbox row retrying: {error}"))?;
+    if status == "retrying" {
+        cloud_mcp_outbox_note_may_have_work();
+    }
     cloud_mcp_emit_sync_status(None);
     if row.event_kind == CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT {
         if let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) {
@@ -6849,9 +6897,19 @@ const CLOUD_MCP_OUTBOX_AUTH_WAIT_RETRY_MS: u64 = 3_000;
 async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
     cloud_mcp_outbox_recover_stale_in_flight();
     loop {
-        tokio::select! {
-            _ = state.background_sync.notify.notified() => {}
-            _ = sleep(Duration::from_millis(CLOUD_MCP_BACKGROUND_SYNC_IDLE_WAKE_MS)) => {}
+        let idle_wake_ms = if cloud_mcp_outbox_known_empty() {
+            CLOUD_MCP_BACKGROUND_SYNC_EMPTY_IDLE_WAKE_MS
+        } else {
+            CLOUD_MCP_BACKGROUND_SYNC_IDLE_WAKE_MS
+        };
+        let idle_wake = tokio::select! {
+            _ = state.background_sync.notify.notified() => false,
+            _ = sleep(Duration::from_millis(idle_wake_ms)) => true,
+        };
+        if idle_wake
+            && cloud_mcp_outbox_known_empty()
+        {
+            continue;
         }
         sleep(Duration::from_millis(CLOUD_MCP_BACKGROUND_SYNC_DEBOUNCE_MS)).await;
 
@@ -6876,7 +6934,11 @@ async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
                 Ok(rows) => {
                     if !rows.is_empty() {
                         drained_any = true;
+                        cloud_mcp_outbox_note_may_have_work();
                         cloud_mcp_emit_sync_status(Some(true));
+                    } else {
+                        let pending = cloud_mcp_outbox_has_pending_rows();
+                        cloud_mcp_outbox_note_known_empty(!pending);
                     }
                     for row in rows {
                         if cloud_mcp_task_event_kind_removed(&row.event_kind) {

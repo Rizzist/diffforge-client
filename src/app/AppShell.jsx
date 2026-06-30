@@ -983,7 +983,10 @@ const CLOUD_MCP_AUTH_CONNECT_TIMEOUT_MESSAGE = "Cloud workspace connection timed
 const OPEN_BROWSER_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
-const BILLING_STATUS_REFRESH_MS = 60000;
+const BILLING_STATUS_REFRESH_MS = 5 * 60 * 1000;
+const BILLING_STATUS_EVENT_REFRESH_MIN_MS = 10 * 1000;
+const TODO_DISPATCH_HEARTBEAT_ACTIVE_MS = 5000;
+const TODO_DISPATCH_HEARTBEAT_IDLE_MS = 10000;
 const LOW_CREDIT_WARNING_STORAGE_KEY = "diffforge.lowCreditWarning.dismissed.v1";
 const LOW_CREDIT_WARNING_THRESHOLD = 1000;
 const LOGOUT_TIMEOUT_MS = 5000;
@@ -23479,12 +23482,17 @@ export default function App() {
     let debounceTimer = 0;
     const staggerTimers = new Set();
     const unlisteners = [];
+    const clearStaggerTimers = () => {
+      staggerTimers.forEach((timer) => window.clearTimeout(timer));
+      staggerTimers.clear();
+    };
 
     const runAutoRefresh = (sourceEvent = "") => {
       debounceTimer = 0;
       if (disposed) {
         return;
       }
+      clearStaggerTimers();
       const cloudAware = sourceEvent === "cloud-mcp-workspace-architectures-updated";
       void refreshArchitectureHubCatalog({ localOnly: !cloudAware, refresh: true });
       const cachedLists = {};
@@ -23518,6 +23526,7 @@ export default function App() {
       if (debounceTimer) {
         window.clearTimeout(debounceTimer);
       }
+      clearStaggerTimers();
       const sourceEvent = graphText(event?.event || event?.type);
       debounceTimer = window.setTimeout(() => runAutoRefresh(sourceEvent), 800);
     };
@@ -23537,8 +23546,7 @@ export default function App() {
       if (debounceTimer) {
         window.clearTimeout(debounceTimer);
       }
-      staggerTimers.forEach((timer) => window.clearTimeout(timer));
-      staggerTimers.clear();
+      clearStaggerTimers();
       unlisteners.forEach((unlisten) => unlisten());
     };
   }, [authState, refreshArchitectureHubCatalog, refreshArchitectureHubGraphList]);
@@ -23635,15 +23643,49 @@ export default function App() {
   useEffect(() => {
     // Foreground presence for remote app-control levers. Todo queue dispatch
     // itself is Rust-owned in both foreground and background.
+    let cancelled = false;
+    let timerId = 0;
     const beat = () => {
-      void invoke("todo_dispatch_dispatcher_heartbeat").catch(() => {});
+      if (!cancelled) {
+        void invoke("todo_dispatch_dispatcher_heartbeat").catch(() => {});
+      }
     };
-    beat();
-    const intervalId = window.setInterval(beat, 5000);
-    document.addEventListener("visibilitychange", beat);
+    const documentHidden = () => document.visibilityState === "hidden";
+    const schedule = () => {
+      window.clearTimeout(timerId);
+      if (documentHidden()) {
+        timerId = 0;
+        return;
+      }
+      const delay = readMainWindowFocusedFallback()
+        ? TODO_DISPATCH_HEARTBEAT_ACTIVE_MS
+        : TODO_DISPATCH_HEARTBEAT_IDLE_MS;
+      timerId = window.setTimeout(() => {
+        beat();
+        schedule();
+      }, delay);
+    };
+    const handlePresenceChange = () => {
+      if (documentHidden()) {
+        schedule();
+        return;
+      }
+      beat();
+      schedule();
+    };
+    if (!documentHidden()) {
+      beat();
+    }
+    schedule();
+    window.addEventListener("focus", handlePresenceChange);
+    window.addEventListener("blur", handlePresenceChange);
+    document.addEventListener("visibilitychange", handlePresenceChange);
     return () => {
-      window.clearInterval(intervalId);
-      document.removeEventListener("visibilitychange", beat);
+      cancelled = true;
+      window.clearTimeout(timerId);
+      window.removeEventListener("focus", handlePresenceChange);
+      window.removeEventListener("blur", handlePresenceChange);
+      document.removeEventListener("visibilitychange", handlePresenceChange);
     };
   }, []);
 
@@ -30940,20 +30982,52 @@ export default function App() {
     }
 
     let cancelled = false;
-    const refresh = async (quiet = false) => {
-      if (!cancelled) {
+    let lastRefreshAt = 0;
+    let unlistenSyncStatus = null;
+    const refresh = async (quiet = false, { force = false, minAgeMs = 0 } = {}) => {
+      if (!cancelled && (force || readMainWindowFocusedFallback())) {
+        const now = Date.now();
+        if (minAgeMs > 0 && lastRefreshAt > 0 && now - lastRefreshAt < minAgeMs) {
+          return;
+        }
+        lastRefreshAt = now;
         await refreshBillingStatus({ quiet });
       }
     };
+    const refreshOnForeground = () => {
+      void refresh(true, {
+        force: readMainWindowFocusedFallback(),
+      });
+    };
+    const refreshAfterSyncStatus = () => {
+      void refresh(true, {
+        force: readMainWindowFocusedFallback(),
+        minAgeMs: BILLING_STATUS_EVENT_REFRESH_MIN_MS,
+      });
+    };
 
-    refresh(false);
+    refresh(false, { force: true });
     const intervalId = window.setInterval(() => {
       refresh(true);
     }, BILLING_STATUS_REFRESH_MS);
+    window.addEventListener("focus", refreshOnForeground);
+    document.addEventListener("visibilitychange", refreshOnForeground);
+    listen("cloud-mcp-sync-status", refreshAfterSyncStatus).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlistenSyncStatus = unlisten;
+    }).catch(() => {});
 
     return () => {
       cancelled = true;
       window.clearInterval(intervalId);
+      window.removeEventListener("focus", refreshOnForeground);
+      document.removeEventListener("visibilitychange", refreshOnForeground);
+      if (typeof unlistenSyncStatus === "function") {
+        unlistenSyncStatus();
+      }
     };
   }, [authState, refreshBillingStatus]);
 

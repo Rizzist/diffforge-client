@@ -24,13 +24,18 @@ const TOKENOMICS_PROVIDER_API_PRICING_VERSION: &str = "claude-api-pricing-v1";
 const TOKENOMICS_INITIAL_BACKFILL_DAYS: u64 = 30;
 const TOKENOMICS_UNKNOWN_OFFSET_COVERAGE_START_UNIX: u64 = i64::MAX as u64;
 const TOKENOMICS_CODEX_USAGE_CACHE_KEY_PREFIX: &str = "codex_usage_api_cache:";
-const TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS: u64 = 10;
+const TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS: u64 = 5 * 60;
 const TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS: u64 = 7 * 24 * 60 * 60;
 const TOKENOMICS_CLAUDE_USAGE_CACHE_KEY_PREFIX: &str = "claude_usage_api_cache:";
-const TOKENOMICS_CLAUDE_USAGE_CACHE_TTL_SECS: u64 = 180;
+const TOKENOMICS_CLAUDE_USAGE_CACHE_TTL_SECS: u64 = 5 * 60;
 const TOKENOMICS_CLAUDE_USAGE_CACHE_STALE_SECS: u64 = 30 * 60;
 const TOKENOMICS_SUMMARY_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_LIVE_LIMITS_CACHE_TTL_MS: u64 = 60_000;
+const TOKENOMICS_PERIODIC_PROVIDER_REFRESH_INTERVAL_MS: u64 = 5 * 60 * 1000;
+const TOKENOMICS_PERIODIC_SOURCE_DISCOVERY_INTERVAL_MS: u64 = 5 * 60 * 1000;
+const TOKENOMICS_PERIODIC_FINGERPRINT_FILES_PER_ROOT: usize = 16;
+const TOKENOMICS_PERIODIC_SENTINEL_MAX_ENTRIES_PER_ROOT: usize = 512;
+const TOKENOMICS_PERIODIC_SENTINEL_MAX_DEPTH: usize = 3;
 const TOKENOMICS_SUMMARY_SNAPSHOT_CACHE_KEY_PREFIX: &str = "summary_snapshot_cache:";
 const TOKENOMICS_SCAN_PROGRESS_EVENT: &str = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_LOCAL_DEVICE_ALIASES_KEY: &str = "local_device_aliases";
@@ -43,6 +48,7 @@ static TOKENOMICS_SUMMARY_CACHE: OnceLock<StdMutex<Option<TokenomicsSummaryCache
     OnceLock::new();
 static TOKENOMICS_LIVE_LIMITS_CACHE: OnceLock<StdMutex<Option<TokenomicsLiveLimitsCacheEntry>>> =
     OnceLock::new();
+static TOKENOMICS_PERIODIC_GATE: OnceLock<StdMutex<TokenomicsPeriodicGateState>> = OnceLock::new();
 
 #[derive(Clone)]
 struct TokenomicsSummaryCacheEntry {
@@ -56,6 +62,30 @@ struct TokenomicsSummaryCacheEntry {
 struct TokenomicsLiveLimitsCacheEntry {
     cached_at: Instant,
     summary: Value,
+}
+
+#[derive(Clone, Default, PartialEq, Eq)]
+struct TokenomicsPeriodicInputFingerprint {
+    hash: String,
+    source_count: usize,
+    latest_modified_ms: u64,
+    total_bytes: u64,
+}
+
+#[derive(Default)]
+struct TokenomicsPeriodicGateState {
+    fingerprint: Option<TokenomicsPeriodicInputFingerprint>,
+    last_run_ms: u64,
+    known_paths: Vec<PathBuf>,
+    source_sentinel_hash: String,
+    last_discovery_ms: u64,
+}
+
+struct TokenomicsPeriodicGateDecision {
+    should_run: bool,
+    scan_inputs_changed: bool,
+    provider_refresh_due: bool,
+    fingerprint: TokenomicsPeriodicInputFingerprint,
 }
 
 use std::io::{BufRead as _, Seek as _};
@@ -1517,6 +1547,226 @@ fn tokenomics_live_limits_cache() -> &'static StdMutex<Option<TokenomicsLiveLimi
     TOKENOMICS_LIVE_LIMITS_CACHE.get_or_init(|| StdMutex::new(None))
 }
 
+fn tokenomics_periodic_gate() -> &'static StdMutex<TokenomicsPeriodicGateState> {
+    TOKENOMICS_PERIODIC_GATE.get_or_init(|| StdMutex::new(TokenomicsPeriodicGateState::default()))
+}
+
+fn tokenomics_metadata_modified_ms(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn tokenomics_metadata_kind(metadata: &fs::Metadata) -> &'static str {
+    if metadata.is_file() {
+        "file"
+    } else if metadata.is_dir() {
+        "dir"
+    } else {
+        "other"
+    }
+}
+
+fn tokenomics_add_metadata_fingerprint_part(parts: &mut Vec<String>, path: &Path) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    let modified_ms = tokenomics_metadata_modified_ms(&metadata);
+    let len = metadata.len();
+    let kind = tokenomics_metadata_kind(&metadata);
+    parts.push(format!("{}:{kind}:{modified_ms}:{len}", path.display()));
+}
+
+fn tokenomics_add_fingerprint_path(parts: &mut Vec<String>, path: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let modified_ms = tokenomics_metadata_modified_ms(&metadata);
+    let len = metadata.len();
+    parts.push(format!("{}:{modified_ms}:{len}", path.display()));
+    Some((modified_ms, len))
+}
+
+fn tokenomics_periodic_fingerprint_from_paths(paths: &[PathBuf]) -> TokenomicsPeriodicInputFingerprint {
+    let mut parts = Vec::new();
+    let mut latest_modified_ms = 0u64;
+    let mut total_bytes = 0u64;
+    let mut source_count = 0usize;
+
+    for path in paths {
+        if let Some((modified_ms, len)) = tokenomics_add_fingerprint_path(&mut parts, path) {
+            latest_modified_ms = latest_modified_ms.max(modified_ms);
+            total_bytes = total_bytes.saturating_add(len);
+            source_count = source_count.saturating_add(1);
+        }
+    }
+
+    parts.sort();
+    let hash = tokenomics_hash(&parts.join("\n"));
+    TokenomicsPeriodicInputFingerprint {
+        hash,
+        source_count,
+        latest_modified_ms,
+        total_bytes,
+    }
+}
+
+fn tokenomics_periodic_discover_input_paths() -> Vec<PathBuf> {
+    let _span = BackendCpuSpan::new("tokenomics.periodic_discover_inputs");
+    let mut paths = Vec::new();
+    let mut seen = HashSet::new();
+    let mut add_path = |path: PathBuf| {
+        if seen.insert(path.clone()) {
+            paths.push(path);
+        }
+    };
+    if let Some(home) = tokenomics_home_dir() {
+        add_path(home.join(".codex").join("state_5.sqlite"));
+    }
+    if let Some(path) = opencode_db_path() {
+        add_path(path);
+    }
+
+    for source in tokenomics_sources() {
+        for root in source.roots {
+            let candidates = tokenomics_collect_candidate_files_with_min_mtime(
+                &root,
+                TOKENOMICS_PERIODIC_FINGERPRINT_FILES_PER_ROOT,
+                None,
+            );
+            for path in candidates {
+                add_path(path);
+            }
+        }
+    }
+
+    paths
+}
+
+fn tokenomics_collect_periodic_sentinel_parts(
+    root: &Path,
+    depth: usize,
+    visited: &mut usize,
+    parts: &mut Vec<String>,
+) {
+    if depth > TOKENOMICS_PERIODIC_SENTINEL_MAX_DEPTH
+        || *visited >= TOKENOMICS_PERIODIC_SENTINEL_MAX_ENTRIES_PER_ROOT
+    {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return;
+    };
+    let mut entries = entries.flatten().collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        if *visited >= TOKENOMICS_PERIODIC_SENTINEL_MAX_ENTRIES_PER_ROOT {
+            break;
+        }
+        let path = entry.path();
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        *visited = (*visited).saturating_add(1);
+        let modified_ms = tokenomics_metadata_modified_ms(&metadata);
+        let len = metadata.len();
+        let kind = tokenomics_metadata_kind(&metadata);
+        parts.push(format!("{}:{kind}:{modified_ms}:{len}", path.display()));
+        if metadata.is_dir() {
+            tokenomics_collect_periodic_sentinel_parts(&path, depth + 1, visited, parts);
+        }
+    }
+}
+
+fn tokenomics_periodic_source_sentinel_hash() -> String {
+    let _span = BackendCpuSpan::new("tokenomics.periodic_source_sentinel");
+    let mut parts = Vec::new();
+    if let Some(home) = tokenomics_home_dir() {
+        tokenomics_add_metadata_fingerprint_part(&mut parts, &home.join(".codex"));
+        tokenomics_add_metadata_fingerprint_part(
+            &mut parts,
+            &home.join(".codex").join("state_5.sqlite"),
+        );
+    }
+    if let Some(path) = opencode_db_path() {
+        tokenomics_add_metadata_fingerprint_part(&mut parts, &path);
+        if let Some(parent) = path.parent() {
+            tokenomics_add_metadata_fingerprint_part(&mut parts, parent);
+        }
+    }
+    for source in tokenomics_sources() {
+        for root in source.roots {
+            tokenomics_add_metadata_fingerprint_part(&mut parts, &root);
+            let mut visited = 0usize;
+            tokenomics_collect_periodic_sentinel_parts(&root, 0, &mut visited, &mut parts);
+        }
+    }
+    parts.sort();
+    tokenomics_hash(&parts.join("\n"))
+}
+
+fn tokenomics_periodic_gate_decision() -> TokenomicsPeriodicGateDecision {
+    let _span = BackendCpuSpan::new("tokenomics.periodic_gate");
+    let now = current_time_ms();
+    let source_sentinel_hash = tokenomics_periodic_source_sentinel_hash();
+    let (previous_known_paths, previous_sentinel_hash, previous_discovery_ms) =
+        match tokenomics_periodic_gate().lock() {
+            Ok(state) => (
+                state.known_paths.clone(),
+                state.source_sentinel_hash.clone(),
+                state.last_discovery_ms,
+            ),
+            Err(_) => (Vec::new(), String::new(), 0),
+        };
+    let discovery_due = previous_discovery_ms == 0
+        || previous_sentinel_hash != source_sentinel_hash
+        || now.saturating_sub(previous_discovery_ms)
+            >= TOKENOMICS_PERIODIC_SOURCE_DISCOVERY_INTERVAL_MS;
+    let known_paths = if discovery_due {
+        tokenomics_periodic_discover_input_paths()
+    } else {
+        previous_known_paths
+    };
+    let fingerprint = tokenomics_periodic_fingerprint_from_paths(&known_paths);
+    let Ok(mut state) = tokenomics_periodic_gate().lock() else {
+        return TokenomicsPeriodicGateDecision {
+            should_run: true,
+            scan_inputs_changed: true,
+            provider_refresh_due: true,
+            fingerprint,
+        };
+    };
+
+    let scan_inputs_changed = state
+        .fingerprint
+        .as_ref()
+        .map(|previous| previous != &fingerprint)
+        .unwrap_or(true);
+    let provider_refresh_due = state.last_run_ms == 0
+        || now.saturating_sub(state.last_run_ms) >= TOKENOMICS_PERIODIC_PROVIDER_REFRESH_INTERVAL_MS;
+    let should_run = scan_inputs_changed || provider_refresh_due;
+    if discovery_due {
+        state.known_paths = known_paths;
+        state.source_sentinel_hash = source_sentinel_hash;
+        state.last_discovery_ms = now;
+    }
+    if should_run {
+        state.fingerprint = Some(fingerprint.clone());
+        state.last_run_ms = now;
+    }
+
+    TokenomicsPeriodicGateDecision {
+        should_run,
+        scan_inputs_changed,
+        provider_refresh_due,
+        fingerprint,
+    }
+}
+
 fn tokenomics_clear_summary_cache() {
     if let Ok(mut cache) = tokenomics_summary_cache().lock() {
         *cache = None;
@@ -1676,31 +1926,57 @@ fn tokenomics_cached_live_limits_for(
 /// server tokenomics is ignored for now, so only locally observed usage is
 /// recorded.
 fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String> {
-    let token_scan_summary = tokenomics_scan_realtime_usage_for(app);
-    let token_scan = match token_scan_summary.as_ref() {
-        Ok(summary)
-            if summary
-                .get("scan")
-                .and_then(|scan| scan.get("status"))
-                .and_then(Value::as_str)
-                == Some("already_running") =>
-        {
-            "already_running"
+    let _span = BackendCpuSpan::new("tokenomics.periodic_sample_cycle");
+    let gate = tokenomics_periodic_gate_decision();
+    if !gate.should_run {
+        return Ok(json!({
+            "token_scan": "skipped",
+            "recorded_samples": 0,
+            "recorded_windows": 0,
+            "token_scan_inserted_events": 0,
+            "limit_count": 0,
+            "skipped_reason": "inputs_unchanged",
+            "fingerprint": gate.fingerprint.hash,
+            "source_count": gate.fingerprint.source_count,
+            "latest_modified_ms": gate.fingerprint.latest_modified_ms,
+            "total_bytes": gate.fingerprint.total_bytes,
+        }));
+    }
+
+    let mut token_scan_inserted_events = 0usize;
+    let token_scan = if gate.scan_inputs_changed {
+        let token_scan_summary = tokenomics_scan_realtime_usage_for(app);
+        match token_scan_summary.as_ref() {
+            Ok(summary)
+                if summary
+                    .get("scan")
+                    .and_then(|scan| scan.get("status"))
+                    .and_then(Value::as_str)
+                    == Some("already_running") =>
+            {
+                "already_running"
+            }
+            Ok(summary) => {
+                token_scan_inserted_events = tokenomics_summary_inserted_events(summary);
+                "ok"
+            }
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.tokenomics.periodic_token_scan_failed",
+                    json!({ "error": error }),
+                );
+                "error"
+            }
         }
-        Ok(_) => "ok",
-        Err(error) => {
-            log_terminal_status_event(
-                "backend.tokenomics.periodic_token_scan_failed",
-                json!({ "error": error }),
-            );
-            "error"
-        }
+    } else {
+        "skipped_unchanged"
     };
     if token_scan == "already_running" {
         return Ok(json!({
             "token_scan": token_scan,
             "recorded_samples": 0,
             "recorded_windows": 0,
+            "token_scan_inserted_events": token_scan_inserted_events,
             "limit_count": 0,
             "skipped_reason": "scan_active",
         }));
@@ -1715,6 +1991,7 @@ fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String
                 "token_scan": "already_running",
                 "recorded_samples": 0,
                 "recorded_windows": 0,
+                "token_scan_inserted_events": token_scan_inserted_events,
                 "limit_count": 0,
                 "skipped_reason": "scan_active",
             }));
@@ -1742,7 +2019,14 @@ fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String
         "token_scan": token_scan,
         "recorded_samples": recorded_samples,
         "recorded_windows": recorded_windows,
+        "token_scan_inserted_events": token_scan_inserted_events,
         "limit_count": limits.len(),
+        "scan_inputs_changed": gate.scan_inputs_changed,
+        "provider_refresh_due": gate.provider_refresh_due,
+        "fingerprint": gate.fingerprint.hash,
+        "source_count": gate.fingerprint.source_count,
+        "latest_modified_ms": gate.fingerprint.latest_modified_ms,
+        "total_bytes": gate.fingerprint.total_bytes,
     }))
 }
 

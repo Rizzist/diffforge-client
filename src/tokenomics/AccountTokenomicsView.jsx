@@ -3142,22 +3142,40 @@ export function warmAccountTokenomics({ accountKey = "", scan = false } = {}) {
   return summaryPromise;
 }
 
+function tokenomicsViewCanRefresh() {
+  if (typeof document === "undefined") return true;
+  return document.visibilityState !== "hidden"
+    && (typeof document.hasFocus !== "function" || document.hasFocus());
+}
+
 function startTokenomicsViewPolling() {
   ensureTokenomicsProgressListener();
   tokenomicsStore.pollSubscriberCount += 1;
+  let disposed = false;
+  const refreshVisibleTokenomics = ({ force = false } = {}) => {
+    if (disposed || !tokenomicsViewCanRefresh()) {
+      return;
+    }
+    void refreshTokenomicsLiveLimits({ force, syncLimitChanges: true }).finally(() => {
+      void refreshTokenomicsSummaryIfStale();
+    });
+  };
   void loadTokenomicsStore({ background: true, force: false, summaryOnly: true }).finally(() => {
-    void refreshTokenomicsLiveLimits({ force: true, syncLimitChanges: true });
+    refreshVisibleTokenomics({ force: true });
   });
+  window.addEventListener("focus", refreshVisibleTokenomics);
+  document.addEventListener("visibilitychange", refreshVisibleTokenomics);
 
   if (!tokenomicsStore.pollInterval) {
     tokenomicsStore.pollInterval = window.setInterval(() => {
-      void refreshTokenomicsLiveLimits({ syncLimitChanges: true }).finally(() => {
-        void refreshTokenomicsSummaryIfStale();
-      });
+      refreshVisibleTokenomics();
     }, TOKENOMICS_VIEW_POLL_INTERVAL_MS);
   }
 
   return () => {
+    disposed = true;
+    window.removeEventListener("focus", refreshVisibleTokenomics);
+    document.removeEventListener("visibilitychange", refreshVisibleTokenomics);
     tokenomicsStore.pollSubscriberCount = Math.max(0, tokenomicsStore.pollSubscriberCount - 1);
     if (tokenomicsStore.pollSubscriberCount === 0 && tokenomicsStore.pollInterval) {
       window.clearInterval(tokenomicsStore.pollInterval);

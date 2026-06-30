@@ -49,6 +49,7 @@ import styled, { keyframes } from "styled-components";
 import {
   ButtonAddIcon,
   ButtonCloseIcon,
+  ButtonDeleteIcon,
   ButtonDragIcon,
   ButtonForgeIcon,
   ButtonFolderIcon,
@@ -21748,6 +21749,7 @@ function WorkspacePcbGridPane({
 }) {
   const [board, setBoard] = useState(null);
   const [createRequestNonce, setCreateRequestNonce] = useState(0);
+  const [deleteRequestNonce, setDeleteRequestNonce] = useState(0);
   const [refreshRequestNonce, setRefreshRequestNonce] = useState(0);
   const boardTitle = board?.name || "PCB";
   const splitTitle = paneLimitReached ? "Panel limit reached" : "Split PCB panel";
@@ -21758,6 +21760,10 @@ function WorkspacePcbGridPane({
 
   const refreshBoard = useCallback(() => {
     setRefreshRequestNonce((nonce) => nonce + 1);
+  }, []);
+
+  const deleteBoard = useCallback(() => {
+    setDeleteRequestNonce((nonce) => nonce + 1);
   }, []);
 
   const handleBoardChange = useCallback((nextBoard) => {
@@ -21808,6 +21814,15 @@ function WorkspacePcbGridPane({
             type="button"
           >
             <ButtonRefreshIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Delete PCB board"
+            disabled={!repoPath || !board?.path}
+            onClick={deleteBoard}
+            title={board?.path ? "Delete PCB board" : "Open a PCB board before deleting"}
+            type="button"
+          >
+            <ButtonDeleteIcon aria-hidden="true" />
           </TerminalRestartButton>
           <TerminalRestartButton
             aria-label="Split PCB panel horizontally"
@@ -21885,6 +21900,7 @@ function WorkspacePcbGridPane({
             key={`pcb-${paneId}-${repoPath}-${resumeNonce}`}
             controlCommand={controlCommand}
             createRequestNonce={createRequestNonce}
+            deleteRequestNonce={deleteRequestNonce}
             isActive={isActive}
             onBoardChange={handleBoardChange}
             paneId={paneId}
@@ -34449,8 +34465,10 @@ function TerminalView({
     const inputBoardName = input.boardName || input.board_name || input.name || "";
     const pcbCreateActions = ["create", "new", "new-board"];
     const pcbSelectActions = ["select", "switch", "switch-board", "open-board", "open-existing"];
+    const pcbDeleteActions = ["delete", "delete-board", "remove-board"];
     const actionHasPcbIntent = pcbCreateActions.includes(action)
       || pcbSelectActions.includes(action)
+      || pcbDeleteActions.includes(action)
       || (action === "open" && Boolean(inputBoardPath || inputBoardName));
     const requestedKind = explicitKind || (actionHasPcbIntent ? "pcb" : "");
     const routedInput = requestedKind ? { ...input, kind: requestedKind } : input;
@@ -34512,6 +34530,10 @@ function TerminalView({
       } else if (["refresh", "reload"].includes(action)) {
         sendPcbPaneCommand(panel.paneId, {
           action: "refresh",
+        });
+      } else if (pcbDeleteActions.includes(action)) {
+        sendPcbPaneCommand(panel.paneId, {
+          action: "delete",
         });
       } else if (pcbSelectActions.includes(action)) {
         sendPcbPaneCommand(panel.paneId, {

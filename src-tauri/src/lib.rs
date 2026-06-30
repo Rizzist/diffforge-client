@@ -212,7 +212,8 @@ const TERMINAL_TODO_PLAN_UPDATED_EVENT: &str = "forge-terminal-todo-plan-updated
 const WORKSPACE_NOTIFICATION_EVENT: &str = "diffforge:workspace-notification-event";
 const MAIN_WINDOW_CURSOR_EVENT: &str = "forge-main-window-cursor";
 const MAIN_WINDOW_CURSOR_POLL_MS: u64 = 50;
-const MAIN_WINDOW_CURSOR_IDLE_POLL_MS: u64 = 250;
+const MAIN_WINDOW_CURSOR_IDLE_POLL_MS: u64 = 500;
+const MAIN_WINDOW_CURSOR_HIDDEN_POLL_MS: u64 = 5_000;
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
 const AUDIO_WIDGET_ERROR_WINDOW_LABEL: &str = "audio-widget-error";
 const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
@@ -348,9 +349,9 @@ const AUDIO_CAPTURE_PREROLL_MS: u64 = 500;
 const AUDIO_STATS_INTERVAL_MS: u64 = 60;
 /// Cadence while the mic is only warm on standby (no recording, no realtime
 /// consumer). The always-open audio widget re-renders its meter on every emit,
-/// so a 17 fps stream of FFT/waveform updates burns the renderer for a preview
-/// nobody is watching. ~5 fps keeps a live level indicator without the storm.
-const AUDIO_STATS_STANDBY_INTERVAL_MS: u64 = 200;
+/// so standby uses a sparse keepalive level while active capture keeps the
+/// smooth meter cadence above.
+const AUDIO_STATS_STANDBY_INTERVAL_MS: u64 = 1_000;
 const AUDIO_INPUT_FREQUENCY_BAND_COUNT: usize = 24;
 const AUDIO_INPUT_FREQUENCY_WINDOW_SAMPLES: usize = 2048;
 const AUDIO_INPUT_FREQUENCY_MIN_HZ: f32 = 90.0;
@@ -4512,12 +4513,14 @@ fn start_main_window_cursor_watcher(app: &AppHandle) {
             // Only poll at the fast hover cadence when the window is the active
             // (visible AND focused) window. A visible-but-unfocused/background
             // window drops to the slow idle cadence instead of waking ~20-30x/sec.
-            sleep(Duration::from_millis(if visible && focused {
+            let cursor_poll_ms = if visible && focused {
                 MAIN_WINDOW_CURSOR_POLL_MS
-            } else {
+            } else if visible {
                 MAIN_WINDOW_CURSOR_IDLE_POLL_MS
-            }))
-            .await;
+            } else {
+                MAIN_WINDOW_CURSOR_HIDDEN_POLL_MS
+            };
+            sleep(Duration::from_millis(cursor_poll_ms)).await;
         }
     });
 }
@@ -4877,7 +4880,10 @@ pub fn run() {
                     &cloud_mcp_state,
                 )
                 .await;
-                if cloud_mcp_connect_state(&cloud_mcp_state).await.is_ok() {
+                let cloud_connected = cloud_mcp_connect_state(&cloud_mcp_state).await.is_ok();
+                if cloud_connected
+                    && env::var_os("DIFFFORGE_PREWARM_CLOUD_VOICE_ON_STARTUP").is_some()
+                {
                     let _ =
                         prewarm_cloud_voice_agent_stream_for_state(&cloud_mcp_state, true).await;
                 }
@@ -5005,6 +5011,7 @@ pub fn run() {
             pcb_documents_list,
             pcb_document_read,
             pcb_document_create,
+            pcb_document_delete,
             pcb_watch_start,
             pcb_panel_open,
             pcb_panel_focus,

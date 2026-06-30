@@ -142,6 +142,26 @@ const PaneButton = styled.button`
   }
 `;
 
+const DangerButton = styled(PaneButton)`
+  border-color: rgba(248, 113, 113, 0.42);
+  color: #fecaca;
+  background: rgba(127, 29, 29, 0.28);
+
+  &:hover:not(:disabled) {
+    background: rgba(127, 29, 29, 0.42);
+  }
+`;
+
+const SecondaryButton = styled(PaneButton)`
+  border-color: rgba(148, 163, 184, 0.24);
+  color: rgba(203, 213, 225, 0.88);
+  background: rgba(15, 23, 42, 0.54);
+
+  &:hover:not(:disabled) {
+    background: rgba(30, 41, 59, 0.78);
+  }
+`;
+
 const CreateOverlay = styled.div`
   position: absolute;
   inset: 0;
@@ -184,6 +204,12 @@ const CreateActions = styled.div`
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
+`;
+
+const CreateSecondaryRow = styled.div`
+  display: flex;
+  min-width: 0;
+  justify-content: flex-start;
 `;
 
 const CreateCancelButton = styled.button`
@@ -231,6 +257,7 @@ export default function PcbWorkspacePane({
   controlCommand = null,
   createRequestNonce = 0,
   createRequestName = "",
+  deleteRequestNonce = 0,
   isActive = true,
   onBoardChange = null,
   paneId = "",
@@ -244,12 +271,15 @@ export default function PcbWorkspacePane({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [creating, setCreating] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState(null);
+  const [deleting, setDeleting] = useState(false);
   const [draftName, setDraftName] = useState("blinky");
   const createInputRef = useRef(null);
   const controlCommandSeenRef = useRef(0);
   const restoredKeyRef = useRef("");
   const skipPersistForKeyRef = useRef("");
   const createRequestSeenRef = useRef(0);
+  const deleteRequestSeenRef = useRef(0);
   const refreshRequestSeenRef = useRef(0);
   const boardListSeqRef = useRef(0);
   const repoIdentity = useMemo(() => normalizeRepoIdentity(repoPath), [repoPath]);
@@ -268,7 +298,7 @@ export default function PcbWorkspacePane({
     const requestSeq = boardListSeqRef.current + 1;
     boardListSeqRef.current = requestSeq;
     setBoardListReady(false);
-    return invoke("pcb_documents_list", { repoPath })
+    return invoke("pcb_documents_list", { repoPath, workspaceId })
       .then((result) => {
         if (boardListSeqRef.current !== requestSeq) {
           return [];
@@ -287,7 +317,7 @@ export default function PcbWorkspacePane({
         setError(String(err));
         throw err;
       });
-  }, [repoPath]);
+  }, [repoPath, workspaceId]);
 
   useEffect(() => {
     if (!repoPath) {
@@ -328,7 +358,11 @@ export default function PcbWorkspacePane({
         return;
       }
       const eventRepo = normalizeRepoIdentity(event?.payload?.repoPath);
+      const eventWorkspace = String(event?.payload?.workspaceId || event?.payload?.workspace_id || "").trim();
       if (eventRepo && eventRepo !== repoIdentity) {
+        return;
+      }
+      if (eventWorkspace && workspaceId && eventWorkspace !== workspaceId) {
         return;
       }
       refreshBoardList().catch(() => {});
@@ -345,7 +379,7 @@ export default function PcbWorkspacePane({
       disposed = true;
       unlisten();
     };
-  }, [refreshBoardList, repoIdentity, repoPath]);
+  }, [refreshBoardList, repoIdentity, repoPath, workspaceId]);
 
   const boardNameForPath = useCallback(
     (boardPath) => availableBoards.find((board) => board.path === boardPath)?.name || boardPath,
@@ -367,6 +401,57 @@ export default function PcbWorkspacePane({
       onBoardChange(selectedBoard);
     }
   }, [onBoardChange, selectedBoard]);
+
+  const requestDeleteBoard = useCallback((target = null) => {
+    const nextTarget = target || selectedBoard;
+    if (!nextTarget?.path || deleting) {
+      return;
+    }
+    setError("");
+    setDeleteTarget(nextTarget);
+  }, [deleting, selectedBoard]);
+
+  const cancelDeleteBoard = useCallback(() => {
+    if (deleting) {
+      return;
+    }
+    setDeleteTarget(null);
+    setError("");
+  }, [deleting]);
+
+  const confirmDeleteBoard = useCallback(() => {
+    const target = deleteTarget;
+    if (!repoPath || !target?.path || deleting) {
+      return;
+    }
+    setDeleting(true);
+    setError("");
+    invoke("pcb_document_delete", {
+      boardPath: target.path,
+      repoPath,
+      workspaceId,
+    })
+      .then(() => {
+        setAvailableBoards((current) => current.filter((board) => board.path !== target.path));
+        setDeleteTarget(null);
+        setCreating(false);
+        if (selectedBoardPath === target.path) {
+          setSelectedBoardPath("");
+          writeStoredBoardPath(workspaceId, paneId, repoPath, "");
+        }
+        refreshBoardList().catch(() => {});
+      })
+      .catch((err) => setError(String(err)))
+      .finally(() => setDeleting(false));
+  }, [
+    deleteTarget,
+    deleting,
+    paneId,
+    refreshBoardList,
+    repoPath,
+    selectedBoardPath,
+    workspaceId,
+  ]);
 
   const boardOptions = useMemo(
     () => availableBoards.map((board) => ({ label: board.name || board.path, value: board.path })),
@@ -449,7 +534,7 @@ export default function PcbWorkspacePane({
     }
     setBusy(true);
     setError("");
-    invoke("pcb_document_create", { repoPath, name: cleanName })
+    invoke("pcb_document_create", { repoPath, name: cleanName, workspaceId })
       .then((doc) => {
         if (doc?.path) {
           setBoardListReady(false);
@@ -461,7 +546,7 @@ export default function PcbWorkspacePane({
       })
       .catch((err) => setError(String(err)))
       .finally(() => setBusy(false));
-  }, [busy, refreshBoardList, repoPath]);
+  }, [busy, refreshBoardList, repoPath, workspaceId]);
 
   const submitCreateBoard = useCallback((event) => {
     event?.preventDefault?.();
@@ -476,6 +561,19 @@ export default function PcbWorkspacePane({
     createRequestSeenRef.current = nonce;
     openCreateBoard(createRequestName);
   }, [createRequestName, createRequestNonce, openCreateBoard]);
+
+  useEffect(() => {
+    const nonce = Number(deleteRequestNonce || 0);
+    if (!nonce || deleteRequestSeenRef.current === nonce) {
+      return;
+    }
+    deleteRequestSeenRef.current = nonce;
+    if (selectedBoard) {
+      requestDeleteBoard(selectedBoard);
+    } else {
+      setError("Open a PCB board before deleting it.");
+    }
+  }, [deleteRequestNonce, requestDeleteBoard, selectedBoard]);
 
   useEffect(() => {
     const nonce = Number(refreshRequestNonce || 0);
@@ -539,12 +637,22 @@ export default function PcbWorkspacePane({
     }
     if (action === "refresh" || action === "reload") {
       refreshBoardList().catch(() => {});
+      return;
+    }
+    if (["delete", "delete-board", "remove-board"].includes(action)) {
+      if (selectedBoard) {
+        requestDeleteBoard(selectedBoard);
+      } else {
+        setError("Open a PCB board before deleting it.");
+      }
     }
   }, [
     controlCommand,
     createBoardWithName,
     openCreateBoard,
     refreshBoardList,
+    requestDeleteBoard,
+    selectedBoard,
     selectBoardByName,
     selectBoardPath,
   ]);
@@ -561,20 +669,21 @@ export default function PcbWorkspacePane({
             board={selectedBoard}
             embedded
             isActive={isActive}
-            key={`${repoIdentity}:${selectedBoard.path}`}
+            key={`${workspaceId}:${repoIdentity}:${selectedBoard.path}`}
             repoPath={repoPath}
             showHeader={false}
+            workspaceId={workspaceId}
           />
         ) : (
           <EmptyPane>
             <EmptyCard>
               <EmptyTitle>PCB design</EmptyTitle>
               <EmptyHint>Create a board or open an existing design in this panel.</EmptyHint>
-              <PaneButton disabled={busy || !repoPath} onClick={() => openCreateBoard()} type="button">
+              <PaneButton disabled={busy || deleting || !repoPath} onClick={() => openCreateBoard()} type="button">
                 + New board
               </PaneButton>
               <AppSelect
-                isDisabled={!availableBoards.length || busy}
+                isDisabled={!availableBoards.length || busy || deleting}
                 onChange={selectBoardPath}
                 options={boardOptions}
                 placeholder={availableBoards.length ? "Open existing design" : "No saved designs yet"}
@@ -592,17 +701,24 @@ export default function PcbWorkspacePane({
               <CreateLabel>Existing boards</CreateLabel>
               <CreatePickerWrap>
                 <AppSelect
-                  isDisabled={!availableBoards.length || busy}
+                  isDisabled={!availableBoards.length || busy || deleting}
                   onChange={selectBoardFromPicker}
                   options={boardOptions}
                   placeholder={availableBoards.length ? "Switch board" : "No saved designs yet"}
                   value={selectedBoardPath || null}
                 />
               </CreatePickerWrap>
+              {selectedBoard ? (
+                <CreateSecondaryRow>
+                  <DangerButton disabled={busy || deleting} onClick={() => requestDeleteBoard(selectedBoard)} type="button">
+                    Delete selected board
+                  </DangerButton>
+                </CreateSecondaryRow>
+              ) : null}
               <CreateLabel>New board</CreateLabel>
               <CreateInput
                 aria-label="PCB board name"
-                disabled={busy}
+                disabled={busy || deleting}
                 onChange={(event) => setDraftName(event.target.value)}
                 placeholder="Board name"
                 ref={createInputRef}
@@ -610,17 +726,36 @@ export default function PcbWorkspacePane({
               />
               {error ? <PaneError role="alert">{error}</PaneError> : null}
               <CreateActions>
-                <PaneButton disabled={busy || !repoPath} type="submit">
+                <PaneButton disabled={busy || deleting || !repoPath} type="submit">
                   Create board
                 </PaneButton>
                 <CreateCancelButton
-                  disabled={busy}
+                  disabled={busy || deleting}
                   onClick={() => {
                     setCreating(false);
                     setError("");
                   }}
                   type="button"
                 >
+                  Cancel
+                </CreateCancelButton>
+              </CreateActions>
+            </CreateCard>
+          </CreateOverlay>
+        ) : null}
+        {deleteTarget ? (
+          <CreateOverlay>
+            <CreateCard role="dialog" aria-modal="true" aria-labelledby="pcb-delete-title">
+              <EmptyTitle id="pcb-delete-title">Delete PCB board?</EmptyTitle>
+              <EmptyHint>
+                Delete {deleteTarget.name || deleteTarget.path} from this workspace. This removes the board file.
+              </EmptyHint>
+              {error ? <PaneError role="alert">{error}</PaneError> : null}
+              <CreateActions>
+                <DangerButton disabled={deleting || !repoPath} onClick={confirmDeleteBoard} type="button">
+                  {deleting ? "Deleting..." : "Delete board"}
+                </DangerButton>
+                <CreateCancelButton disabled={deleting} onClick={cancelDeleteBoard} type="button">
                   Cancel
                 </CreateCancelButton>
               </CreateActions>
