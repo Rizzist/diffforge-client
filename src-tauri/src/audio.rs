@@ -103,6 +103,8 @@ const FLOATING_SURFACE_LAYOUT_CHANGED_EVENT: &str = "forge-floating-layout-chang
 const AUDIO_WIDGET_BAR_HOVER_CHANGED_EVENT: &str = "forge-audio-widget-bar-hover-changed";
 const AUDIO_WIDGET_BUBBLE_HOVER_CHANGED_EVENT: &str = "forge-audio-widget-bubble-hover-changed";
 const AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT: &str = "forge-audio-dictation-raw-result";
+const AUDIO_FORGE_DICTATION_CLEANED_RESULT_EVENT: &str =
+    "forge-audio-dictation-cleaned-result";
 
 fn realtime_mic_holder_get(audio_state: &AudioState) -> RealtimeMicHolder {
     audio_state
@@ -3400,6 +3402,8 @@ fn handle_deepgram_realtime_text(
         text: transcript.to_string(),
         is_final,
         speech_final,
+        provider: "deepgram".to_string(),
+        history_id: String::new(),
     };
 
     if is_final {
@@ -10027,6 +10031,23 @@ struct ForgeDictationRawResultEvent {
     total_ms: u64,
 }
 
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ForgeDictationCleanedResultEvent {
+    history_id: String,
+    created_at: String,
+    text: String,
+    raw_text: String,
+    llm_cleaned: bool,
+    audio_seconds: i64,
+    cleanup_provider: String,
+    cleanup_model: String,
+    cleanup_ms: u64,
+    stt_ms: u64,
+    llm_ms: u64,
+    total_ms: u64,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 struct AudioTranscriptionPolishRequest {
@@ -10262,6 +10283,88 @@ fn forge_dictation_result_from_payload(
         llm_ms,
         total_ms,
     })
+}
+
+fn apply_forge_dictation_cleaned_payload(result: &mut ForgeDictationResult, frame: &Value) {
+    let cleaned_text = frame
+        .get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !cleaned_text.is_empty() {
+        result.text = cleaned_text;
+    }
+    let raw_text = frame
+        .get("raw_text")
+        .or_else(|| frame.get("rawText"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if !raw_text.is_empty() {
+        result.raw_text = raw_text;
+    }
+    result.llm_cleaned = frame
+        .get("llm_cleaned")
+        .or_else(|| frame.get("llmCleaned"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if let Some(provider) = [
+        "cleanup_provider",
+        "cleanupProvider",
+        "llm_cleanup_provider",
+        "llmCleanupProvider",
+    ]
+    .iter()
+    .find_map(|key| {
+        frame
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }) {
+        result.cleanup_provider = provider.to_string();
+    }
+    if let Some(model) = [
+        "cleanup_model",
+        "cleanupModel",
+        "llm_cleanup_model",
+        "llmCleanupModel",
+    ]
+    .iter()
+    .find_map(|key| {
+        frame
+            .get(*key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    }) {
+        result.cleanup_model = model.to_string();
+    }
+    result.cleanup_ms =
+        audio_payload_timing_u64(frame, &["cleanup_ms", "cleanupMs"]).unwrap_or(result.cleanup_ms);
+    result.stt_ms = audio_payload_timing_u64(
+        frame,
+        &[
+            "stt_ms",
+            "sttMs",
+            "finish_to_raw_ms",
+            "finishToRawMs",
+        ],
+    )
+    .unwrap_or(result.stt_ms);
+    result.llm_ms = audio_payload_timing_u64(frame, &["llm_ms", "llmMs"]).unwrap_or_else(|| {
+        if result.cleanup_ms > 0 {
+            result.cleanup_ms
+        } else {
+            result.llm_ms
+        }
+    });
+    result.total_ms =
+        audio_payload_timing_u64(frame, &["total_ms", "totalMs"]).unwrap_or_else(|| {
+            result.stt_ms.saturating_add(result.llm_ms)
+        });
 }
 
 /// How the dictation stream task reaches Diff Forge Cloud: a warm parked
@@ -10610,13 +10713,16 @@ async fn run_forge_dictation_stream(
     finished_tx: oneshot::Sender<Result<ForgeDictationResult, String>>,
 ) {
     let mut ready_tx = Some(ready_tx);
+    let mut finished_tx = Some(finished_tx);
     let fail = |ready_tx: &mut Option<oneshot::Sender<Result<(), String>>>,
-                finished_tx: oneshot::Sender<Result<ForgeDictationResult, String>>,
+                finished_tx: &mut Option<oneshot::Sender<Result<ForgeDictationResult, String>>>,
                 message: String| {
         if let Some(ready_tx) = ready_tx.take() {
             let _ = ready_tx.send(Err(message.clone()));
         }
-        let _ = finished_tx.send(Err(message));
+        if let Some(finished_tx) = finished_tx.take() {
+            let _ = finished_tx.send(Err(message));
+        }
     };
 
     let ws_stream = match connection {
@@ -10629,7 +10735,7 @@ async fn run_forge_dictation_stream(
                 match cloud_voice_agent_ws_request(&ws_target, auth_bearer.as_deref(), "", "") {
                     Ok(request) => request,
                     Err(error) => {
-                        fail(&mut ready_tx, finished_tx, error);
+                        fail(&mut ready_tx, &mut finished_tx, error);
                         return;
                     }
                 };
@@ -10642,7 +10748,7 @@ async fn run_forge_dictation_stream(
                 Err(error) => {
                     fail(
                         &mut ready_tx,
-                        finished_tx,
+                        &mut finished_tx,
                         format!("Unable to open cloud dictation WebSocket: {error}"),
                     );
                     return;
@@ -10658,7 +10764,7 @@ async fn run_forge_dictation_stream(
     {
         fail(
             &mut ready_tx,
-            finished_tx,
+            &mut finished_tx,
             format!("Unable to start cloud dictation stream: {error}"),
         );
         return;
@@ -10795,6 +10901,8 @@ async fn run_forge_dictation_stream(
                                             text: transcript,
                                             is_final,
                                             speech_final: is_final,
+                                            provider: "forge".to_string(),
+                                            history_id: history_id.clone(),
                                         },
                                     );
                                 }
@@ -10814,7 +10922,10 @@ async fn run_forge_dictation_stream(
                                     .and_then(Value::as_bool)
                                     .unwrap_or(false);
                                 match parsed {
-                                    Ok(mut result) if cleanup_pending => {
+                                    Ok(mut result) => {
+                                        if !cleanup_pending {
+                                            break Ok(result);
+                                        }
                                         if !result.cancelled && !result.raw_text.trim().is_empty() {
                                             let _ = app.emit(
                                                 AUDIO_FORGE_DICTATION_RAW_RESULT_EVENT,
@@ -10840,9 +10951,21 @@ async fn run_forge_dictation_stream(
                                                 },
                                             );
                                         }
-                                        // Raw transcript is in hand; give the
-                                        // cleaned follow-up frame a bounded
-                                        // window, then return raw as-is.
+                                        if let Some(finished_tx) = finished_tx.take() {
+                                            let _ = finished_tx.send(Ok(result.clone()));
+                                        }
+                                        log_audio_diagnostic_event(
+                                            "audio.forge_dictation.raw_returned",
+                                            json!({
+                                                "cleanup_pending": cleanup_pending,
+                                                "stt_ms": result.stt_ms,
+                                                "total_ms": result.total_ms,
+                                            }),
+                                        );
+                                        // The stop command is already resolved.
+                                        // Keep this task alive briefly so the
+                                        // streamed cleanup can update history
+                                        // without blocking paste/hotkey flow.
                                         let cleaned_wait_started = Instant::now();
                                         let wait_cap = tokio::time::Instant::now()
                                             + Duration::from_secs(CLOUD_DICTATION_CLEANED_WAIT_CAP_SECS);
@@ -10867,25 +10990,8 @@ async fn run_forge_dictation_stream(
                                                         .and_then(Value::as_str)
                                                         .unwrap_or_default();
                                                     if frame_kind == "voice_dictation_cleanup_delta" {
-                                                        // Streamed partial cleanup: surface it in
-                                                        // the live overlay and keep waiting — the
-                                                        // stream is alive, so extend the window.
-                                                        let partial = frame
-                                                            .get("text")
-                                                            .and_then(Value::as_str)
-                                                            .unwrap_or_default()
-                                                            .trim()
-                                                            .to_string();
-                                                        if !partial.is_empty() {
-                                                            let _ = app.emit(
-                                                                AUDIO_REALTIME_TRANSCRIPT_EVENT,
-                                                                DeepgramRealtimeTranscriptEvent {
-                                                                    text: partial,
-                                                                    is_final: false,
-                                                                    speech_final: false,
-                                                                },
-                                                            );
-                                                        }
+                                                        // Background cleanup is no longer tied to the
+                                                        // live overlay; a new take may already be using it.
                                                         deadline = tokio::time::Instant::now()
                                                             + Duration::from_secs(
                                                                 CLOUD_DICTATION_CLEANED_PROGRESS_EXTEND_SECS,
@@ -10895,87 +11001,36 @@ async fn run_forge_dictation_stream(
                                                     if frame_kind != "voice_dictation_cleaned" {
                                                         continue;
                                                     }
-                                                    let cleaned_text = frame
-                                                        .get("text")
-                                                        .and_then(Value::as_str)
-                                                        .unwrap_or_default()
-                                                        .trim()
-                                                        .to_string();
-                                                    if !cleaned_text.is_empty() {
-                                                        result.text = cleaned_text;
+                                                    apply_forge_dictation_cleaned_payload(
+                                                        &mut result,
+                                                        &frame,
+                                                    );
+                                                    if result.llm_cleaned
+                                                        && !result.cancelled
+                                                        && !result.text.trim().is_empty()
+                                                    {
+                                                        let _ = app.emit(
+                                                            AUDIO_FORGE_DICTATION_CLEANED_RESULT_EVENT,
+                                                            ForgeDictationCleanedResultEvent {
+                                                                history_id: history_id.clone(),
+                                                                created_at: history_created_at.clone(),
+                                                                text: result.text.clone(),
+                                                                raw_text: result.raw_text.clone(),
+                                                                llm_cleaned: result.llm_cleaned,
+                                                                audio_seconds: result.audio_seconds,
+                                                                cleanup_provider: result
+                                                                    .cleanup_provider
+                                                                    .clone(),
+                                                                cleanup_model: result
+                                                                    .cleanup_model
+                                                                    .clone(),
+                                                                cleanup_ms: result.cleanup_ms,
+                                                                stt_ms: result.stt_ms,
+                                                                llm_ms: result.llm_ms,
+                                                                total_ms: result.total_ms,
+                                                            },
+                                                        );
                                                     }
-                                                    result.llm_cleaned = frame
-                                                        .get("llm_cleaned")
-                                                        .and_then(Value::as_bool)
-                                                        .unwrap_or(false);
-                                                    if let Some(provider) = [
-                                                        "cleanup_provider",
-                                                        "cleanupProvider",
-                                                        "llm_cleanup_provider",
-                                                        "llmCleanupProvider",
-                                                    ]
-                                                    .iter()
-                                                    .find_map(|key| {
-                                                        frame
-                                                            .get(*key)
-                                                            .and_then(Value::as_str)
-                                                            .map(str::trim)
-                                                            .filter(|value| !value.is_empty())
-                                                    }) {
-                                                        result.cleanup_provider =
-                                                            provider.to_string();
-                                                    }
-                                                    if let Some(model) = [
-                                                        "cleanup_model",
-                                                        "cleanupModel",
-                                                        "llm_cleanup_model",
-                                                        "llmCleanupModel",
-                                                    ]
-                                                    .iter()
-                                                    .find_map(|key| {
-                                                        frame
-                                                            .get(*key)
-                                                            .and_then(Value::as_str)
-                                                            .map(str::trim)
-                                                            .filter(|value| !value.is_empty())
-                                                    }) {
-                                                        result.cleanup_model = model.to_string();
-                                                    }
-                                                    result.cleanup_ms = audio_payload_timing_u64(
-                                                        &frame,
-                                                        &["cleanup_ms", "cleanupMs"],
-                                                    )
-                                                    .unwrap_or(result.cleanup_ms);
-                                                    result.stt_ms = audio_payload_timing_u64(
-                                                        &frame,
-                                                        &[
-                                                            "stt_ms",
-                                                            "sttMs",
-                                                            "finish_to_raw_ms",
-                                                            "finishToRawMs",
-                                                        ],
-                                                    )
-                                                    .unwrap_or(result.stt_ms);
-                                                    result.llm_ms = audio_payload_timing_u64(
-                                                        &frame,
-                                                        &["llm_ms", "llmMs"],
-                                                    )
-                                                    .unwrap_or_else(|| {
-                                                        if result.cleanup_ms > 0 {
-                                                            result.cleanup_ms
-                                                        } else {
-                                                            result.llm_ms
-                                                        }
-                                                    });
-                                                    result.total_ms = audio_payload_timing_u64(
-                                                        &frame,
-                                                        &["total_ms", "totalMs"],
-                                                    )
-                                                    .unwrap_or_else(|| {
-                                                        result
-                                                            .stt_ms
-                                                            .saturating_add(result.llm_ms)
-                                                    });
                                                     log_audio_diagnostic_event(
                                                         "audio.forge_dictation.cleaned_received",
                                                         json!({
@@ -10997,7 +11052,7 @@ async fn run_forge_dictation_stream(
                                         }
                                         break Ok(result);
                                     }
-                                    other => break other,
+                                    Err(error) => break Err(error),
                                 }
                             }
                             "voice_dictation_error" => {
@@ -11041,7 +11096,9 @@ async fn run_forge_dictation_stream(
                 .map(|error| clean_whisper_local_audio_log_text(error)),
         }),
     );
-    let _ = finished_tx.send(result);
+    if let Some(finished_tx) = finished_tx.take() {
+        let _ = finished_tx.send(result);
+    }
     if stream_error.is_some() {
         forge_dictation_release_mic(&app, &audio_state).await;
     }
@@ -11551,42 +11608,45 @@ async fn stop_forge_dictation_transcription(
             "cancel": cancel,
         }),
     );
-    let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
     let session = {
-        let mut session_guard = audio_state.forge_dictation_stream.lock().await;
-        session_guard.take()
-    };
-    let Some(session) = session else {
-        log_audio_diagnostic_event("audio.forge_dictation.stop.inactive", json!({}));
-        return Ok(ForgeDictationResult {
-            text: String::new(),
-            raw_text: String::new(),
-            cancelled: cancel,
-            llm_cleaned: false,
-            audio_seconds: 0,
-            cleanup_provider: String::new(),
-            cleanup_model: String::new(),
-            cleanup_ms: 0,
-            stt_ms: 0,
-            llm_ms: 0,
-            total_ms: 0,
-        });
-    };
+        let _realtime_guard = audio_state.realtime_stream_lock.lock().await;
+        let session = {
+            let mut session_guard = audio_state.forge_dictation_stream.lock().await;
+            session_guard.take()
+        };
+        let Some(session) = session else {
+            log_audio_diagnostic_event("audio.forge_dictation.stop.inactive", json!({}));
+            return Ok(ForgeDictationResult {
+                text: String::new(),
+                raw_text: String::new(),
+                cancelled: cancel,
+                llm_cleaned: false,
+                audio_seconds: 0,
+                cleanup_provider: String::new(),
+                cleanup_model: String::new(),
+                cleanup_ms: 0,
+                stt_ms: 0,
+                llm_ms: 0,
+                total_ms: 0,
+            });
+        };
 
-    // Detach the mic BEFORE sending the finish control: detaching stops the
-    // capture thread and flushes its last frames into the audio channel, so
-    // when the stream task processes Finish, everything still queued IS the
-    // complete tail of the utterance. The other order raced the capture
-    // thread and clipped trailing words ("hey there can you hear me" losing
-    // everything after "can"). Release also hands the mic back to a voice
-    // agent session that lent it (mic arbitration); plain dictation just
-    // detaches.
-    forge_dictation_release_mic(&app, &audio_state).await;
-    let _ = session.control_tx.send(if cancel {
-        ForgeDictationControl::Cancel
-    } else {
-        ForgeDictationControl::Finish
-    });
+        // Detach the mic BEFORE sending the finish control: detaching stops the
+        // capture thread and flushes its last frames into the audio channel, so
+        // when the stream task processes Finish, everything still queued IS the
+        // complete tail of the utterance. The other order raced the capture
+        // thread and clipped trailing words ("hey there can you hear me" losing
+        // everything after "can"). Release also hands the mic back to a voice
+        // agent session that lent it (mic arbitration); plain dictation just
+        // detaches.
+        forge_dictation_release_mic(&app, &audio_state).await;
+        let _ = session.control_tx.send(if cancel {
+            ForgeDictationControl::Cancel
+        } else {
+            ForgeDictationControl::Finish
+        });
+        session
+    };
 
     let result = match timeout(
         Duration::from_secs(CLOUD_DICTATION_RESULT_TIMEOUT_SECS),

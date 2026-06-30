@@ -2518,6 +2518,8 @@ struct DeepgramRealtimeTranscriptEvent {
     text: String,
     is_final: bool,
     speech_final: bool,
+    provider: String,
+    history_id: String,
 }
 
 #[derive(Serialize, Clone)]
