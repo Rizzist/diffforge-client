@@ -430,11 +430,7 @@ pub(crate) fn background_tray_create(app: &AppHandle) {
                     let _ = snipping_stop_recording_for(app, "tray-menu");
                     return;
                 }
-                if app_is_in_background_mode() {
-                    app_exit_background_internal(app);
-                } else {
-                    let _ = restore_main_window(app);
-                }
+                present_main_window(app);
             }
             "diffforge-monitor" => {
                 if snipping_recording_active(app) {

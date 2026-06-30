@@ -2612,6 +2612,7 @@ const LOOPSPACE_CACHE_STORAGE_KEY = "diffforge.loopspaces.cache.v1";
 const APP_THEME_DARK = "dark";
 const APP_THEME_LIGHT = "light";
 const APP_THEME_DEFAULT = APP_THEME_DARK;
+const APP_STARTUP_LAUNCH_MODE_BACKGROUND = "background";
 const APP_SPACE_MODE_WORKSPACES = "workspaces";
 const APP_SPACE_MODE_LOOPSPACES = "loopspaces";
 const APP_SPACE_MODE_DEFAULT = APP_SPACE_MODE_WORKSPACES;
@@ -18842,6 +18843,33 @@ function normalizeAppAppearanceSettings(value) {
   };
 }
 
+function normalizeAppStartupLaunchMode(value) {
+  const mode = String(value || "").trim().toLowerCase();
+  return mode === APP_STARTUP_LAUNCH_MODE_BACKGROUND
+    ? APP_STARTUP_LAUNCH_MODE_BACKGROUND
+    : APP_STARTUP_LAUNCH_MODE_BACKGROUND;
+}
+
+function normalizeAppStartupSettings(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {
+      autostartEnabled: null,
+      defaulted: false,
+      enabled: true,
+      foregroundOnSecondLaunch: true,
+      launchMode: APP_STARTUP_LAUNCH_MODE_BACKGROUND,
+    };
+  }
+
+  return {
+    autostartEnabled: typeof value.autostartEnabled === "boolean" ? value.autostartEnabled : null,
+    defaulted: Boolean(value.defaulted),
+    enabled: typeof value.enabled === "boolean" ? value.enabled : true,
+    foregroundOnSecondLaunch: value.foregroundOnSecondLaunch !== false,
+    launchMode: normalizeAppStartupLaunchMode(value.launchMode),
+  };
+}
+
 function readAppAppearanceSettings() {
   try {
     const rawSettings = window.localStorage.getItem(APP_APPEARANCE_STORAGE_KEY);
@@ -21447,6 +21475,9 @@ export default function App() {
   const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(readWorkspaceRailCollapsed);
   const [workspaceRailNativeHoverKey, setWorkspaceRailNativeHoverKey] = useState("");
   const [appAppearanceSettings, setAppAppearanceSettings] = useState(readAppAppearanceSettings);
+  const [appStartupSettings, setAppStartupSettings] = useState(() => normalizeAppStartupSettings(null));
+  const [appStartupSettingsState, setAppStartupSettingsState] = useState("idle");
+  const [appStartupSettingsError, setAppStartupSettingsError] = useState("");
   const [workspaceTerminalLogicalIndexes, setWorkspaceTerminalLogicalIndexes] = useState(
     () => workspaceSettingsLogicalIndexLayouts(workspaceSettings),
   );
@@ -24747,6 +24778,32 @@ export default function App() {
   }, [appAppearanceSettings.theme, spaceMode]);
 
   useEffect(() => {
+    let cancelled = false;
+
+    setAppStartupSettingsState("loading");
+    invoke("app_startup_settings_state")
+      .then((settings) => {
+        if (cancelled) {
+          return;
+        }
+        setAppStartupSettings(normalizeAppStartupSettings(settings));
+        setAppStartupSettingsState("ready");
+        setAppStartupSettingsError("");
+      })
+      .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        setAppStartupSettingsState("error");
+        setAppStartupSettingsError(getErrorMessage(error, "Unable to load startup settings."));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
     if (!agentStatusCacheHitRef.current) {
       return;
     }
@@ -25646,6 +25703,34 @@ export default function App() {
       return nextSettings;
     });
   }, [spaceMode]);
+
+  const updateAppStartupEnabled = useCallback(async (enabled) => {
+    const nextEnabled = Boolean(enabled);
+    setAppStartupSettingsError("");
+    setAppStartupSettingsState("saving");
+    setAppStartupSettings((settings) => normalizeAppStartupSettings({
+      ...settings,
+      enabled: nextEnabled,
+    }));
+
+    try {
+      const nextSettings = await invoke("app_startup_settings_update", {
+        enabled: nextEnabled,
+        launchMode: APP_STARTUP_LAUNCH_MODE_BACKGROUND,
+      });
+      setAppStartupSettings(normalizeAppStartupSettings(nextSettings));
+      setAppStartupSettingsState("ready");
+    } catch (error) {
+      setAppStartupSettingsState("error");
+      setAppStartupSettingsError(getErrorMessage(error, "Unable to update startup settings."));
+      try {
+        const currentSettings = await invoke("app_startup_settings_state");
+        setAppStartupSettings(normalizeAppStartupSettings(currentSettings));
+      } catch {
+        setAppStartupSettings((settings) => normalizeAppStartupSettings(settings));
+      }
+    }
+  }, []);
 
   const cancelDeferredWorkspaceActivation = useCallback(() => {
     const pending = deferredWorkspaceActivationRef.current;
@@ -34669,6 +34754,19 @@ export default function App() {
   );
   const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
   const activeAppTheme = normalizeAppTheme(appAppearanceSettings.theme);
+  const appStartupEnabled = Boolean(appStartupSettings.enabled);
+  const appStartupBusy = appStartupSettingsState === "loading" || appStartupSettingsState === "saving";
+  const appStartupRegistered = appStartupSettings.autostartEnabled === true;
+  const appStartupStatusLabel = appStartupSettingsState === "loading"
+    ? "Checking"
+    : appStartupSettingsState === "saving"
+      ? "Saving"
+      : appStartupEnabled
+        ? appStartupRegistered
+          ? "On at login"
+          : "Needs attention"
+        : "Off";
+  const appStartupStatusTone = appStartupEnabled && appStartupRegistered ? "blue" : "orange";
   const isWorkspaceSettingsOpen = Boolean(workspaceSettingsModalId && selectedWorkspace);
   const workspaceGitPullSelectedPaths = useMemo(
     () => workspaceGitPullPrompt.repositories
@@ -48063,6 +48161,70 @@ export default function App() {
                           );
                         })}
                       </AppearanceThemeGrid>
+                    </AccountCard>
+                  </AccountSettingsPanel>
+
+                  <AccountSettingsPanel>
+                    <PanelHeaderRow>
+                      <div>
+                        <PanelKicker>Startup</PanelKicker>
+                        <PanelHeading>Auto-open Diff Forge</PanelHeading>
+                      </div>
+                      <AgentReadyPill data-tone={appStartupStatusTone}>
+                        <ButtonSettingsIcon aria-hidden="true" />
+                        <span>{appStartupStatusLabel}</span>
+                      </AgentReadyPill>
+                    </PanelHeaderRow>
+
+                    <AccountCard data-tone={appStartupEnabled ? "blue" : "orange"}>
+                      <AccountCardHeader>
+                        <div>
+                          <SettingsLabel>Open at login</SettingsLabel>
+                          <SettingsHint>
+                            Starts hidden in the background with tray and menu-bar services active.
+                          </SettingsHint>
+                        </div>
+                        <McpSwitchButton
+                          aria-checked={appStartupEnabled}
+                          aria-label={appStartupEnabled ? "Disable open at login" : "Enable open at login"}
+                          aria-pressed={appStartupEnabled ? "true" : "false"}
+                          disabled={appStartupBusy}
+                          onClick={() => {
+                            void updateAppStartupEnabled(!appStartupEnabled);
+                          }}
+                          role="switch"
+                          title={appStartupEnabled ? "Disable open at login" : "Enable open at login"}
+                          type="button"
+                        >
+                          <span aria-hidden="true" />
+                          {appStartupSettingsState === "loading"
+                            ? "Checking"
+                            : appStartupSettingsState === "saving"
+                              ? "Saving"
+                              : appStartupEnabled
+                                ? "On"
+                                : "Off"}
+                        </McpSwitchButton>
+                      </AccountCardHeader>
+
+                      <SettingsIdentityGrid>
+                        <SettingsIdentityItem>
+                          <span>Launch mode</span>
+                          <strong>Background</strong>
+                        </SettingsIdentityItem>
+                        <SettingsIdentityItem>
+                          <span>Registration</span>
+                          <strong>
+                            {appStartupSettings.autostartEnabled == null
+                              ? "Unknown"
+                              : appStartupRegistered
+                                ? "Enabled"
+                                : "Disabled"}
+                          </strong>
+                        </SettingsIdentityItem>
+                      </SettingsIdentityGrid>
+
+                      {appStartupSettingsError && <FormMessage $state="error">{appStartupSettingsError}</FormMessage>}
                     </AccountCard>
                   </AccountSettingsPanel>
 

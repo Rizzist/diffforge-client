@@ -27,6 +27,7 @@ use tauri::{
     utils::config::Color,
     AppHandle, Emitter, Listener, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
+use tauri_plugin_autostart::{MacosLauncher, ManagerExt as AutostartManagerExt};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 #[cfg(not(target_os = "macos"))]
 use tauri_plugin_notification::NotificationExt;
@@ -45,6 +46,9 @@ pub mod coordination;
 
 const DEFAULT_API_BASE_URL: &str = "https://diffforge.ai/api";
 const DEFAULT_WEB_LOGIN_URL: &str = "https://diffforge.ai/desktop/login";
+const STARTUP_SETTINGS_STATE_KEY: &str = "startup-settings";
+const STARTUP_LAUNCH_MODE_BACKGROUND: &str = "background";
+const STARTUP_BACKGROUND_ARG: &str = "--background-startup";
 
 fn api_base_url() -> String {
     DEFAULT_API_BASE_URL.to_string()
@@ -4375,6 +4379,199 @@ async fn app_local_state_merge_command(
     .map_err(|error| format!("App state merge worker failed: {error}"))?
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupSettings {
+    enabled: bool,
+    launch_mode: String,
+    foreground_on_second_launch: bool,
+}
+
+impl Default for StartupSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            launch_mode: STARTUP_LAUNCH_MODE_BACKGROUND.to_string(),
+            foreground_on_second_launch: true,
+        }
+    }
+}
+
+fn normalize_startup_launch_mode(value: Option<&str>) -> String {
+    match value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        STARTUP_LAUNCH_MODE_BACKGROUND => STARTUP_LAUNCH_MODE_BACKGROUND.to_string(),
+        _ => STARTUP_LAUNCH_MODE_BACKGROUND.to_string(),
+    }
+}
+
+fn startup_settings_from_value(value: &Value) -> (StartupSettings, bool) {
+    let Some(object) = value.as_object() else {
+        return (StartupSettings::default(), true);
+    };
+    let default_settings = StartupSettings::default();
+    let settings = StartupSettings {
+        enabled: object
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(default_settings.enabled),
+        launch_mode: normalize_startup_launch_mode(
+            object.get("launchMode").and_then(Value::as_str),
+        ),
+        foreground_on_second_launch: object
+            .get("foregroundOnSecondLaunch")
+            .and_then(Value::as_bool)
+            .unwrap_or(default_settings.foreground_on_second_launch),
+    };
+
+    (
+        settings,
+        !object.contains_key("enabled")
+            || !object.contains_key("launchMode")
+            || !object.contains_key("foregroundOnSecondLaunch"),
+    )
+}
+
+fn startup_settings_to_value(settings: &StartupSettings) -> Value {
+    json!({
+        "enabled": settings.enabled,
+        "launchMode": settings.launch_mode,
+        "foregroundOnSecondLaunch": settings.foreground_on_second_launch,
+    })
+}
+
+fn startup_settings_state_value(
+    settings: &StartupSettings,
+    autostart_enabled: Option<bool>,
+    defaulted: bool,
+) -> Value {
+    json!({
+        "enabled": settings.enabled,
+        "launchMode": settings.launch_mode,
+        "foregroundOnSecondLaunch": settings.foreground_on_second_launch,
+        "autostartEnabled": autostart_enabled,
+        "defaulted": defaulted,
+    })
+}
+
+fn startup_autostart_is_enabled(app: &AppHandle) -> Result<bool, String> {
+    app.autolaunch()
+        .is_enabled()
+        .map_err(|error| format!("Unable to read startup registration: {error}"))
+}
+
+fn startup_apply_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    let autostart = app.autolaunch();
+    if enabled {
+        autostart
+            .enable()
+            .map_err(|error| format!("Unable to enable startup registration: {error}"))
+    } else {
+        autostart
+            .disable()
+            .map_err(|error| format!("Unable to disable startup registration: {error}"))
+    }
+}
+
+fn startup_settings_read_or_seed(app: &AppHandle) -> Result<(StartupSettings, bool), String> {
+    let raw = app_local_state_read(app, STARTUP_SETTINGS_STATE_KEY);
+    let (settings, should_write) = startup_settings_from_value(&raw);
+    if should_write {
+        app_local_state_write(
+            app,
+            STARTUP_SETTINGS_STATE_KEY,
+            &startup_settings_to_value(&settings),
+        )?;
+    }
+    Ok((settings, should_write))
+}
+
+fn startup_settings_save_and_apply(
+    app: &AppHandle,
+    settings: StartupSettings,
+) -> Result<Value, String> {
+    app_local_state_write(
+        app,
+        STARTUP_SETTINGS_STATE_KEY,
+        &startup_settings_to_value(&settings),
+    )?;
+    startup_apply_autostart(app, settings.enabled)?;
+    Ok(startup_settings_state_value(
+        &settings,
+        startup_autostart_is_enabled(app).ok(),
+        false,
+    ))
+}
+
+fn startup_settings_initialize(app: &AppHandle) {
+    let Ok((settings, defaulted)) = startup_settings_read_or_seed(app) else {
+        log_terminal_status_event(
+            "backend.startup_settings.seed_error",
+            json!({ "state_key": STARTUP_SETTINGS_STATE_KEY }),
+        );
+        return;
+    };
+    if let Err(error) = startup_apply_autostart(app, settings.enabled) {
+        log_terminal_status_event(
+            "backend.startup_settings.autostart_error",
+            json!({
+                "enabled": settings.enabled,
+                "error": error,
+            }),
+        );
+        return;
+    }
+    log_terminal_status_event(
+        "backend.startup_settings.ready",
+        json!({
+            "enabled": settings.enabled,
+            "launchMode": settings.launch_mode,
+            "defaulted": defaulted,
+            "autostartEnabled": startup_autostart_is_enabled(app).ok(),
+        }),
+    );
+}
+
+fn startup_args_request_background(args: &[String]) -> bool {
+    args.iter()
+        .any(|arg| arg.trim().eq_ignore_ascii_case(STARTUP_BACKGROUND_ARG))
+}
+
+#[tauri::command]
+async fn app_startup_settings_state(app: AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (settings, defaulted) = startup_settings_read_or_seed(&app)?;
+        Ok(startup_settings_state_value(
+            &settings,
+            startup_autostart_is_enabled(&app).ok(),
+            defaulted,
+        ))
+    })
+    .await
+    .map_err(|error| format!("Startup settings worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn app_startup_settings_update(
+    app: AppHandle,
+    enabled: bool,
+    launch_mode: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (mut settings, _) = startup_settings_read_or_seed(&app)?;
+        settings.enabled = enabled;
+        settings.launch_mode = normalize_startup_launch_mode(launch_mode.as_deref());
+        settings.foreground_on_second_launch = true;
+        startup_settings_save_and_apply(&app, settings)
+    })
+    .await
+    .map_err(|error| format!("Startup settings worker failed: {error}"))?
+}
+
 #[tauri::command]
 async fn close_app_after_terminal_shutdown(
     app: AppHandle,
@@ -4427,6 +4624,20 @@ fn restore_main_window(app: &AppHandle) -> bool {
     }
 
     false
+}
+
+fn present_main_window(app: &AppHandle) {
+    if app_is_in_background_mode() {
+        app_exit_background_internal(app);
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    restore_main_window_after_reopen(app.clone(), false);
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = restore_main_window(app);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -4759,6 +4970,8 @@ pub fn run() {
     configure_safe_process_current_directory();
     install_app_panic_log_hook();
 
+    let startup_args = env::args().collect::<Vec<_>>();
+    let background_startup_requested = startup_args_request_background(&startup_args);
     let mut builder = tauri::Builder::default();
     let pty_pool = Arc::new(PtyPool::new());
     log_terminal_crash_forensics_event(
@@ -4802,14 +5015,12 @@ pub fn run() {
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             let deep_link_urls = deep_link_urls_from_args(&argv);
+            let background_startup = startup_args_request_background(&argv);
 
-            if app_is_in_background_mode() {
-                app_exit_background_internal(app);
+            if background_startup && deep_link_urls.is_empty() {
+                app_enter_background_internal(app);
             } else {
-                #[cfg(target_os = "macos")]
-                restore_main_window_after_reopen(app.clone(), false);
-                #[cfg(not(target_os = "macos"))]
-                restore_main_window(app);
+                present_main_window(app);
             }
 
             emit_deep_link_urls(app, deep_link_urls);
@@ -4860,6 +5071,10 @@ pub fn run() {
             whisper_engine: WhisperCliWarmCache::new(),
         })
         .manage(SnippingState::new())
+        .plugin(tauri_plugin_autostart::init(
+            MacosLauncher::LaunchAgent,
+            Some(vec![STARTUP_BACKGROUND_ARG]),
+        ))
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
@@ -4867,6 +5082,7 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(move |app| {
             pty_pool.ensure_warm_async();
+            startup_settings_initialize(app.handle());
             cloud_mcp_register_sync_status_app(app.handle());
             cloud_mcp_start_local_device_bridge();
             let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
@@ -4948,6 +5164,9 @@ pub fn run() {
                 }
             }
             start_main_window_cursor_watcher(app.handle());
+            if background_startup_requested {
+                app_enter_background_internal(app.handle());
+            }
 
             Ok(())
         })
@@ -4970,6 +5189,8 @@ pub fn run() {
             app_local_state_load,
             app_local_state_store,
             app_local_state_merge_command,
+            app_startup_settings_state,
+            app_startup_settings_update,
             agent_statuses,
             start_agent_login,
             start_agent_account_login,
@@ -5419,15 +5640,11 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen {
-                has_visible_windows,
+                has_visible_windows: _,
                 ..
             } = event
             {
-                if app_is_in_background_mode() {
-                    app_exit_background_internal(app);
-                } else {
-                    restore_main_window_after_reopen(app.clone(), has_visible_windows);
-                }
+                present_main_window(app);
             }
         });
 }

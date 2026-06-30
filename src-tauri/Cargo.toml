@@ -35,6 +35,7 @@ sysinfo = "0.39.1"
 tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "tray-icon", "unstable"] }
 tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "2"
+tauri-plugin-autostart = "2"
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-notification = "2"
 tauri-plugin-opener = "2"
