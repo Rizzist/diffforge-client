@@ -28,11 +28,18 @@ struct AgentChatSessionSyncSource {
     model_id: String,
     model_config: Value,
     records: Vec<Value>,
+    thread_detail_messages: Vec<Value>,
     total_record_count: usize,
 }
 
 const AGENT_CHAT_SESSION_SYNC_TARGET_PACKET_BYTES: usize = 512 * 1024;
 const AGENT_CHAT_SESSION_SYNC_MAX_RECORDS_PER_PACKET: usize = 128;
+const AGENT_CHAT_SESSION_HISTORY_BACKFILL_LIMIT: usize = 100;
+const AGENT_CHAT_SESSION_HISTORY_BACKFILL_INTERVAL_MS: u64 = 60_000;
+const AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS: u64 = 5 * 60_000;
+
+static AGENT_CHAT_SESSION_HISTORY_BACKFILL_LAST: OnceLock<StdMutex<HashMap<String, u64>>> =
+    OnceLock::new();
 
 fn agent_chat_session_sync_provider(agent_id: &str) -> Option<&'static str> {
     match agent_id.trim().to_ascii_lowercase().as_str() {
@@ -138,6 +145,267 @@ fn agent_chat_session_sync_messages_value(
         .into_iter()
         .map(agent_chat_session_sync_message_value)
         .collect()
+}
+
+fn agent_chat_session_sync_message_id(message: &Value, index: usize) -> String {
+    cloud_mcp_payload_text(message, &["id", "message_id", "messageId"])
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("message-{index}"))
+}
+
+fn agent_chat_session_sync_message_role(message: &Value) -> String {
+    cloud_mcp_payload_text(message, &["role"])
+        .unwrap_or_else(|| "message".to_string())
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn agent_chat_session_sync_message_kind(message: &Value) -> String {
+    cloud_mcp_payload_text(message, &["kind", "type"])
+        .unwrap_or_else(|| "message".to_string())
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn agent_chat_session_sync_message_turn_id(message: &Value) -> String {
+    cloud_mcp_payload_text(message, &["turnId", "turn_id"])
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn agent_chat_session_sync_message_status(message: &Value) -> String {
+    let status = cloud_mcp_payload_text(message, &["status"]).unwrap_or_default();
+    if !status.trim().is_empty() {
+        return status.trim().to_ascii_lowercase();
+    }
+    let kind = agent_chat_session_sync_message_kind(message);
+    if matches!(kind.as_str(), "error" | "tool_error") {
+        "error".to_string()
+    } else if matches!(kind.as_str(), "tool_call" | "tool_output" | "patch" | "file" | "reasoning") {
+        "complete".to_string()
+    } else {
+        String::new()
+    }
+}
+
+fn agent_chat_session_sync_group_status(messages: &[Value]) -> String {
+    if messages.iter().any(|message| agent_chat_session_sync_message_status(message) == "error") {
+        return "error".to_string();
+    }
+    if messages.iter().any(|message| agent_chat_session_sync_message_status(message) == "running") {
+        return "running".to_string();
+    }
+    "complete".to_string()
+}
+
+fn agent_chat_session_sync_group_title(messages: &[Value]) -> String {
+    if messages.len() == 1 {
+        return cloud_mcp_payload_text(&messages[0], &["title"])
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Activity".to_string());
+    }
+    format!("{} activities", messages.len())
+}
+
+fn agent_chat_session_sync_flush_activity_group(items: &mut Vec<Value>, group: &mut Vec<Value>) {
+    if group.is_empty() {
+        return;
+    }
+    let first_id = agent_chat_session_sync_message_id(&group[0], items.len());
+    let last_id = agent_chat_session_sync_message_id(group.last().unwrap_or(&group[0]), items.len());
+    let mut turn_id = agent_chat_session_sync_message_turn_id(&group[0]);
+    if turn_id.trim().is_empty() {
+        turn_id = agent_chat_session_sync_message_turn_id(group.last().unwrap_or(&group[0]));
+    }
+    let title = agent_chat_session_sync_group_title(group);
+    let status = agent_chat_session_sync_group_status(group);
+    let messages = std::mem::take(group);
+    items.push(json!({
+        "id": format!("activity-group-{first_id}-{last_id}"),
+        "type": "activity-group",
+        "itemType": "activityGroup",
+        "title": title,
+        "status": status,
+        "turnId": turn_id.as_str(),
+        "turn_id": turn_id.as_str(),
+        "messages": messages,
+    }));
+}
+
+fn agent_chat_session_sync_flush_assistant_block(
+    items: &mut Vec<Value>,
+    block_id: &mut String,
+    block_turn_id: &mut String,
+    block_items: &mut Vec<Value>,
+    activity_group: &mut Vec<Value>,
+) {
+    agent_chat_session_sync_flush_activity_group(block_items, activity_group);
+    if block_items.is_empty() {
+        block_id.clear();
+        block_turn_id.clear();
+        return;
+    }
+    let id = if block_id.trim().is_empty() {
+        format!("assistant-block-{}", items.len())
+    } else {
+        block_id.clone()
+    };
+    let turn_id = block_turn_id.clone();
+    let child_items = std::mem::take(block_items);
+    items.push(json!({
+        "id": id,
+        "type": "assistant-block",
+        "itemType": "assistantBlock",
+        "turnId": turn_id.as_str(),
+        "turn_id": turn_id.as_str(),
+        "items": child_items,
+    }));
+    block_id.clear();
+    block_turn_id.clear();
+}
+
+fn agent_chat_session_sync_thread_detail(
+    source: &AgentChatSessionSyncSource,
+    context: &AgentChatSessionSyncContext,
+    model_id: &str,
+    model_config: &Value,
+) -> Value {
+    let mut items = Vec::new();
+    let mut activity_group = Vec::new();
+    let mut assistant_block_id = String::new();
+    let mut assistant_block_turn_id = String::new();
+    let mut assistant_block_items = Vec::new();
+    let mut user_count = 0usize;
+    let mut assistant_count = 0usize;
+    let mut activity_count = 0usize;
+    let mut artifact_count = 0usize;
+
+    for (index, message) in source.thread_detail_messages.iter().enumerate() {
+        let role = agent_chat_session_sync_message_role(message);
+        let message_id = agent_chat_session_sync_message_id(message, index);
+        let turn_id = agent_chat_session_sync_message_turn_id(message);
+        let artifacts = message
+            .get("artifacts")
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0);
+        artifact_count = artifact_count.saturating_add(artifacts);
+        if role == "activity" || role == "assistant" {
+            if !assistant_block_turn_id.is_empty()
+                && !turn_id.is_empty()
+                && assistant_block_turn_id != turn_id
+            {
+                agent_chat_session_sync_flush_assistant_block(
+                    &mut items,
+                    &mut assistant_block_id,
+                    &mut assistant_block_turn_id,
+                    &mut assistant_block_items,
+                    &mut activity_group,
+                );
+            }
+            if assistant_block_id.trim().is_empty() {
+                assistant_block_id = format!("assistant-block-{message_id}");
+            }
+            if assistant_block_turn_id.trim().is_empty() && !turn_id.is_empty() {
+                assistant_block_turn_id = turn_id.clone();
+            }
+        }
+        if role == "activity" {
+            activity_count = activity_count.saturating_add(1);
+            activity_group.push(message.clone());
+            continue;
+        }
+
+        if role == "assistant" {
+            agent_chat_session_sync_flush_activity_group(&mut assistant_block_items, &mut activity_group);
+            assistant_count = assistant_count.saturating_add(1);
+            assistant_block_items.push(json!({
+                "id": message_id.as_str(),
+                "type": "message",
+                "itemType": "message",
+                "role": role.as_str(),
+                "turnId": turn_id.as_str(),
+                "turn_id": turn_id.as_str(),
+                "message": message,
+            }));
+            continue;
+        }
+
+        agent_chat_session_sync_flush_assistant_block(
+            &mut items,
+            &mut assistant_block_id,
+            &mut assistant_block_turn_id,
+            &mut assistant_block_items,
+            &mut activity_group,
+        );
+        if role == "user" {
+            user_count = user_count.saturating_add(1);
+        }
+        items.push(json!({
+            "id": message_id.as_str(),
+            "type": "message",
+            "itemType": "message",
+            "role": role.as_str(),
+            "turnId": turn_id.as_str(),
+            "turn_id": turn_id.as_str(),
+            "message": message,
+        }));
+    }
+    agent_chat_session_sync_flush_assistant_block(
+        &mut items,
+        &mut assistant_block_id,
+        &mut assistant_block_turn_id,
+        &mut assistant_block_items,
+        &mut activity_group,
+    );
+
+    json!({
+        "contract": "diffforge.thread_detail_view.v1",
+        "schemaVersion": 1,
+        "schema_version": 1,
+        "provider": source.provider.as_str(),
+        "sessionId": source.session_id.as_str(),
+        "session_id": source.session_id.as_str(),
+        "providerSessionId": source.session_id.as_str(),
+        "provider_session_id": source.session_id.as_str(),
+        "title": source.title.as_str(),
+        "cwd": source.cwd.as_str(),
+        "workspaceId": context.workspace_id.as_str(),
+        "workspace_id": context.workspace_id.as_str(),
+        "workspaceName": context.workspace_name.as_str(),
+        "workspace_name": context.workspace_name.as_str(),
+        "threadId": context.thread_id.as_str(),
+        "thread_id": context.thread_id.as_str(),
+        "paneId": context.pane_id.as_str(),
+        "pane_id": context.pane_id.as_str(),
+        "modelId": model_id,
+        "model_id": model_id,
+        "modelConfig": model_config,
+        "model_config": model_config,
+        "latestTimestamp": source.latest_timestamp.as_str(),
+        "latest_timestamp": source.latest_timestamp.as_str(),
+        "messages": source.thread_detail_messages.clone(),
+        "items": items,
+        "diffSummaries": [],
+        "diff_summaries": [],
+        "stats": {
+            "messageCount": source.thread_detail_messages.len(),
+            "message_count": source.thread_detail_messages.len(),
+            "userCount": user_count,
+            "user_count": user_count,
+            "assistantCount": assistant_count,
+            "assistant_count": assistant_count,
+            "activityCount": activity_count,
+            "activity_count": activity_count,
+            "artifactCount": artifact_count,
+            "artifact_count": artifact_count,
+            "fileCount": 0,
+            "file_count": 0,
+            "additions": 0,
+            "deletions": 0,
+        },
+    })
 }
 
 fn agent_chat_session_sync_find_text_deep(value: &Value, keys: &[&str], depth: usize) -> String {
@@ -441,6 +709,7 @@ fn agent_chat_session_sync_jsonl_source(
     let mut title = initial_meta.title;
     let mut latest_timestamp = initial_meta.latest_timestamp;
     let mut records = Vec::new();
+    let mut thread_detail_messages = Vec::new();
     let mut total_record_count = 0usize;
     let mut model_config = json!({});
 
@@ -534,6 +803,7 @@ fn agent_chat_session_sync_jsonl_source(
         } else {
             agent_chat_session_sync_codex_messages_for_line(line_index, &timestamp, &value)
         };
+        thread_detail_messages.extend(normalized_messages.iter().cloned());
         let record_kind = value
             .get("type")
             .and_then(Value::as_str)
@@ -579,6 +849,7 @@ fn agent_chat_session_sync_jsonl_source(
         model_id,
         model_config,
         records,
+        thread_detail_messages,
         total_record_count,
     })
 }
@@ -670,6 +941,7 @@ fn agent_chat_session_sync_opencode_source(
     }
 
     let mut records = Vec::new();
+    let mut thread_detail_messages = Vec::new();
     let mut total_record_count = 0usize;
     let mut latest_timestamp = opencode_timestamp(session_updated_at_ms);
     let session_raw =
@@ -751,6 +1023,7 @@ fn agent_chat_session_sync_opencode_source(
                 artifacts: Vec::new(),
             }])
         };
+        thread_detail_messages.extend(normalized_messages.iter().cloned());
         total_record_count = total_record_count.saturating_add(1);
         if let Some(record) = agent_chat_session_sync_record(
             acked,
@@ -813,6 +1086,7 @@ fn agent_chat_session_sync_opencode_source(
             &timestamp,
             &part_data,
         ));
+        thread_detail_messages.extend(normalized_messages.iter().cloned());
         total_record_count = total_record_count.saturating_add(1);
         if let Some(record) = agent_chat_session_sync_record(
             acked,
@@ -855,6 +1129,7 @@ fn agent_chat_session_sync_opencode_source(
         model_id,
         model_config,
         records,
+        thread_detail_messages,
         total_record_count,
     })
 }
@@ -970,6 +1245,15 @@ fn agent_chat_session_sync_record_chunks(records: Vec<Value>) -> Vec<Vec<Value>>
         chunks.push(current);
     }
     chunks
+}
+
+fn agent_chat_session_sync_reason_forces_metadata_probe(reason: &str) -> bool {
+    matches!(
+        reason,
+        "device_workspaces_snapshot_history_backfill"
+            | "workspace_session_history_list"
+            | "terminal_session_history"
+    )
 }
 
 fn agent_chat_session_sync_fill_text(target: &mut String, value: String) {
@@ -1199,6 +1483,9 @@ fn agent_chat_session_sync_payloads(
         );
     }
     let model_id = agent_chat_session_sync_latest_model_id(&model_config, &source.model_id);
+    let thread_detail =
+        agent_chat_session_sync_thread_detail(&source, &context, &model_id, &model_config);
+    let thread_detail_hash = agent_chat_session_sync_hash(&thread_detail);
     let metadata_hash = agent_chat_session_sync_hash(&json!({
         "provider": source.provider.as_str(),
         "session_id": source.session_id.as_str(),
@@ -1223,17 +1510,20 @@ fn agent_chat_session_sync_payloads(
         "fork_from_provider_session_id": context.fork_from_provider_session_id.as_str(),
         "model_id": model_id.as_str(),
         "model_config": model_config.clone(),
+        "thread_detail_hash": thread_detail_hash.as_str(),
     }));
+    let metadata_already_acked = agent_chat_session_sync_acked_session_content_hash(
+        &scope_key,
+        &device_id,
+        &workspace_id,
+        &source.provider,
+        &source.session_id,
+    )
+    .as_deref()
+        == Some(metadata_hash.as_str());
     if source.records.is_empty()
-        && agent_chat_session_sync_acked_session_content_hash(
-            &scope_key,
-            &device_id,
-            &workspace_id,
-            &source.provider,
-            &source.session_id,
-        )
-        .as_deref()
-            == Some(metadata_hash.as_str())
+        && metadata_already_acked
+        && !agent_chat_session_sync_reason_forces_metadata_probe(reason)
     {
         return Ok(Vec::new());
     }
@@ -1383,6 +1673,8 @@ fn agent_chat_session_sync_payloads(
             "modelId": model_id.clone(),
             "model_config": model_config.clone(),
             "modelConfig": model_config.clone(),
+            "thread_detail": thread_detail.clone(),
+            "threadDetail": thread_detail.clone(),
             "records": packet_records,
         });
         payloads.push(payload);
@@ -1638,6 +1930,197 @@ fn agent_chat_session_sync_spawn_from_history_record(
     );
 }
 
+fn agent_chat_session_sync_history_item_record(
+    item: &WorkspaceAgentSessionHistoryItem,
+) -> WorkspaceAgentSessionHistoryRecord {
+    let provider = workspace_threads_clean_agent_id(&item.provider)
+        .or_else(|| workspace_threads_clean_agent_id(&item.agent_id))
+        .unwrap_or_else(|| item.provider.clone());
+    let visible_session_id = workspace_agent_session_history_item_session_id(item)
+        .unwrap_or_else(|| item.provider_session_id.clone());
+    let shared_history_id = if item.shared_history_id.trim().is_empty() {
+        workspace_agent_session_history_shared_history_id(
+            &item.workspace_id,
+            &provider,
+            &visible_session_id,
+            &item.fork_from_provider_session_id,
+        )
+    } else {
+        item.shared_history_id.clone()
+    };
+    WorkspaceAgentSessionHistoryRecord {
+        id: item.id.clone(),
+        workspace_id: item.workspace_id.clone(),
+        workspace_name: item.workspace_name.clone(),
+        coordination_session_id: item.coordination_session_id.clone(),
+        provider_session_id: item.provider_session_id.clone(),
+        native_session_id: item.native_session_id.clone(),
+        fork_from_provider_session_id: item.fork_from_provider_session_id.clone(),
+        shared_history_id,
+        agent_id: item.agent_id.clone(),
+        provider,
+        model_id: item.model_id.clone(),
+        model_source: item.model_source.clone(),
+        session_mode: item.session_mode.clone(),
+        file_authority: item.file_authority.clone(),
+        coordination_mode: item.coordination_mode.clone(),
+        thread_id: item.thread_id.clone(),
+        pane_id: item.pane_id.clone(),
+        terminal_instance_id: item.terminal_instance_id,
+        terminal_index: item.terminal_index,
+        slot_key: item.slot_key.clone(),
+        cwd: if item.cwd.trim().is_empty() {
+            item.workspace_root.clone()
+        } else {
+            item.cwd.clone()
+        },
+        status: item.status.clone(),
+        title: item.title.clone(),
+        source: if item.source.trim().is_empty() {
+            "workspace_agent_session_history_backfill".to_string()
+        } else {
+            item.source.clone()
+        },
+        observed_at_ms: Some(current_time_ms()),
+        created_at_ms: Some(item.created_at_ms),
+    }
+}
+
+fn agent_chat_session_sync_history_item_needs_backfill(
+    item: &WorkspaceAgentSessionHistoryItem,
+) -> bool {
+    let Some(provider) = workspace_threads_clean_agent_id(&item.provider)
+        .or_else(|| workspace_threads_clean_agent_id(&item.agent_id))
+    else {
+        return false;
+    };
+    let Some(session_id) = workspace_agent_session_history_item_session_id(item) else {
+        return false;
+    };
+    if item.workspace_id.trim().is_empty()
+        || item.workspace_root.trim().is_empty()
+        || agent_chat_session_sync_provider(&provider).is_none()
+        || !workspace_agent_session_history_session_id_is_visible(&provider, &session_id)
+    {
+        return false;
+    }
+    let sync = &item.chat_sync;
+    if sync.pending_packet_count > 0 || sync.syncing_packet_count > 0 || sync.retrying_packet_count > 0
+    {
+        return false;
+    }
+    if sync.status.trim().eq_ignore_ascii_case("synced")
+        && sync.acked_at_ms > 0
+        && (sync.record_total_count == 0 || sync.record_acked_count >= sync.record_total_count)
+    {
+        let last_verified_at_ms = sync
+            .acked_at_ms
+            .max(sync.updated_at_ms)
+            .max(sync.last_enqueued_at_ms);
+        return current_time_ms().saturating_sub(last_verified_at_ms)
+            >= AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS;
+    }
+    true
+}
+
+fn agent_chat_session_sync_spawn_from_history_items(
+    app: AppHandle,
+    items: &[WorkspaceAgentSessionHistoryItem],
+    reason: &'static str,
+) -> usize {
+    let mut spawned = 0usize;
+    for item in items
+        .iter()
+        .filter(|item| agent_chat_session_sync_history_item_needs_backfill(item))
+        .take(AGENT_CHAT_SESSION_HISTORY_BACKFILL_LIMIT)
+    {
+        agent_chat_session_sync_spawn_from_history_record(
+            app.clone(),
+            agent_chat_session_sync_history_item_record(item),
+            reason,
+        );
+        spawned += 1;
+    }
+    spawned
+}
+
+fn agent_chat_session_sync_should_backfill_workspace(
+    workspace_id: &str,
+    root_directory: Option<&str>,
+) -> bool {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return false;
+    }
+    let key = format!("{}\n{}", workspace_id, root_directory.unwrap_or_default().trim());
+    let now = current_time_ms();
+    let ledger = AGENT_CHAT_SESSION_HISTORY_BACKFILL_LAST
+        .get_or_init(|| StdMutex::new(HashMap::new()));
+    let Ok(mut entries) = ledger.lock() else {
+        return true;
+    };
+    if entries
+        .get(&key)
+        .is_some_and(|last| now.saturating_sub(*last) < AGENT_CHAT_SESSION_HISTORY_BACKFILL_INTERVAL_MS)
+    {
+        return false;
+    }
+    entries.insert(key, now);
+    true
+}
+
+fn agent_chat_session_sync_backfill_workspace_history(
+    app: AppHandle,
+    workspace_id: String,
+    root_directory: Option<String>,
+    reason: &'static str,
+) {
+    if !agent_chat_session_sync_should_backfill_workspace(&workspace_id, root_directory.as_deref()) {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        let request = WorkspaceAgentSessionHistoryListRequest {
+            workspace_id,
+            root_directory,
+            limit: Some(AGENT_CHAT_SESSION_HISTORY_BACKFILL_LIMIT),
+        };
+        let result =
+            tauri::async_runtime::spawn_blocking(move || workspace_agent_session_history_list_blocking(request))
+                .await
+                .map_err(|error| format!("Workspace session history backfill read failed: {error}"))
+                .and_then(|value| value);
+        match result {
+            Ok(mut history) => {
+                workspace_agent_session_history_enrich_chat_sync(&mut history.items);
+                let queued = agent_chat_session_sync_spawn_from_history_items(
+                    app,
+                    &history.items,
+                    reason,
+                );
+                if queued > 0 {
+                    log_terminal_status_event(
+                        "backend.agent_chat_session_sync.history_backfill_queued",
+                        json!({
+                            "queued": queued,
+                            "reason": reason,
+                            "workspace_id": history.workspace_id,
+                        }),
+                    );
+                }
+            }
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.agent_chat_session_sync.history_backfill_error",
+                    json!({
+                        "error": clean_terminal_telemetry_text(&error),
+                        "reason": reason,
+                    }),
+                );
+            }
+        }
+    });
+}
+
 fn agent_chat_session_sync_spawn_from_payload_repair(
     app: AppHandle,
     payload: &Value,
@@ -1706,6 +2189,43 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
 mod agent_chat_session_sync_tests {
     use super::*;
 
+    fn test_history_item(
+        provider_session_id: &str,
+        chat_sync: WorkspaceAgentSessionHistoryChatSync,
+    ) -> WorkspaceAgentSessionHistoryItem {
+        WorkspaceAgentSessionHistoryItem {
+            id: format!("session:workspace-a:codex:{provider_session_id}"),
+            workspace_id: "workspace-a".to_string(),
+            workspace_name: "Workspace A".to_string(),
+            workspace_root: "/tmp/workspace-a".to_string(),
+            coordination_session_id: "coord-a".to_string(),
+            provider_session_id: provider_session_id.to_string(),
+            native_session_id: provider_session_id.to_string(),
+            fork_from_provider_session_id: String::new(),
+            shared_history_id: String::new(),
+            agent_id: "codex".to_string(),
+            provider: "codex".to_string(),
+            model_id: "gpt-5.5".to_string(),
+            model_source: "launch".to_string(),
+            session_mode: "direct".to_string(),
+            file_authority: "workspace".to_string(),
+            coordination_mode: "direct".to_string(),
+            thread_id: "thread-a".to_string(),
+            pane_id: "pane-a".to_string(),
+            terminal_instance_id: Some(42),
+            terminal_index: Some(0),
+            slot_key: "terminal:0".to_string(),
+            cwd: String::new(),
+            status: "idle".to_string(),
+            title: "Test session".to_string(),
+            first_user_message: String::new(),
+            chat_sync,
+            source: "test".to_string(),
+            created_at_ms: 10,
+            latest_at_ms: 20,
+        }
+    }
+
     #[test]
     fn agent_chat_session_sync_chunks_records_by_session_packet_limit() {
         let records = (0..=AGENT_CHAT_SESSION_SYNC_MAX_RECORDS_PER_PACKET)
@@ -1717,5 +2237,110 @@ mod agent_chat_session_sync_tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), AGENT_CHAT_SESSION_SYNC_MAX_RECORDS_PER_PACKET);
         assert_eq!(chunks[1].len(), 1);
+    }
+
+    #[test]
+    fn agent_chat_session_sync_thread_detail_uses_bigview_blocks() {
+        let source = AgentChatSessionSyncSource {
+            provider: "codex".to_string(),
+            source_kind: "jsonl".to_string(),
+            source_path: "/tmp/session.jsonl".to_string(),
+            session_id: "session-a".to_string(),
+            title: "Session A".to_string(),
+            cwd: "/tmp/workspace-a".to_string(),
+            latest_timestamp: "2026-06-30T00:00:00Z".to_string(),
+            model_id: "gpt-5.5".to_string(),
+            model_config: json!({}),
+            records: Vec::new(),
+            thread_detail_messages: vec![
+                json!({
+                    "id": "user-1",
+                    "role": "user",
+                    "text": "hello",
+                }),
+                json!({
+                    "id": "assistant-1",
+                    "role": "assistant",
+                    "text": "hi",
+                    "turnId": "turn-1",
+                }),
+                json!({
+                    "id": "tool-1",
+                    "role": "activity",
+                    "kind": "tool_call",
+                    "title": "Read file",
+                    "text": "src/main.rs",
+                    "turnId": "turn-1",
+                }),
+            ],
+            total_record_count: 0,
+        };
+        let context = AgentChatSessionSyncContext {
+            workspace_id: "workspace-a".to_string(),
+            workspace_name: "Workspace A".to_string(),
+            ..AgentChatSessionSyncContext::default()
+        };
+
+        let detail = agent_chat_session_sync_thread_detail(&source, &context, "gpt-5.5", &json!({}));
+        let items = detail["items"].as_array().expect("thread detail items");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], "message");
+        assert_eq!(items[1]["type"], "assistant-block");
+        assert_eq!(items[1]["turnId"], "turn-1");
+        assert_eq!(items[1]["items"][0]["type"], "message");
+        assert_eq!(items[1]["items"][1]["type"], "activity-group");
+        assert_eq!(items[1]["items"][1]["messages"][0]["id"], "tool-1");
+    }
+
+    #[test]
+    fn agent_chat_session_history_backfill_selects_only_unsynced_rows() {
+        let waiting = test_history_item("codex-session-a", WorkspaceAgentSessionHistoryChatSync::default());
+        assert!(agent_chat_session_sync_history_item_needs_backfill(&waiting));
+
+        let mut queued_sync = WorkspaceAgentSessionHistoryChatSync::default();
+        queued_sync.pending_packet_count = 1;
+        let queued = test_history_item("codex-session-b", queued_sync);
+        assert!(!agent_chat_session_sync_history_item_needs_backfill(&queued));
+
+        let mut fresh_synced_sync = WorkspaceAgentSessionHistoryChatSync::default();
+        fresh_synced_sync.status = "synced".to_string();
+        fresh_synced_sync.acked_at_ms = current_time_ms();
+        fresh_synced_sync.record_total_count = 2;
+        fresh_synced_sync.record_acked_count = 2;
+        let fresh_synced = test_history_item("codex-session-c", fresh_synced_sync);
+        assert!(!agent_chat_session_sync_history_item_needs_backfill(&fresh_synced));
+
+        let mut stale_synced_sync = WorkspaceAgentSessionHistoryChatSync::default();
+        stale_synced_sync.status = "synced".to_string();
+        stale_synced_sync.acked_at_ms =
+            current_time_ms().saturating_sub(AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS + 1);
+        stale_synced_sync.record_total_count = 2;
+        stale_synced_sync.record_acked_count = 2;
+        let stale_synced = test_history_item("codex-session-d", stale_synced_sync);
+        assert!(agent_chat_session_sync_history_item_needs_backfill(&stale_synced));
+
+        let unsupported = WorkspaceAgentSessionHistoryItem {
+            provider: "shell".to_string(),
+            agent_id: "shell".to_string(),
+            ..test_history_item("shell-session", WorkspaceAgentSessionHistoryChatSync::default())
+        };
+        assert!(!agent_chat_session_sync_history_item_needs_backfill(&unsupported));
+    }
+
+    #[test]
+    fn agent_chat_session_history_backfill_record_preserves_session_identity() {
+        let item = test_history_item("codex-session-identity", WorkspaceAgentSessionHistoryChatSync::default());
+
+        let record = agent_chat_session_sync_history_item_record(&item);
+
+        assert_eq!(record.provider, "codex");
+        assert_eq!(record.provider_session_id, "codex-session-identity");
+        assert_eq!(record.native_session_id, "codex-session-identity");
+        assert_eq!(record.cwd, "/tmp/workspace-a");
+        assert_eq!(
+            record.shared_history_id,
+            "history:workspace-a:codex:codex-session-identity"
+        );
     }
 }

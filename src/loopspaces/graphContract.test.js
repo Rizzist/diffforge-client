@@ -17,6 +17,7 @@ import {
 const triggerNode = { id: "trigger-1", kind: "trigger", label: "Kick" };
 const runScriptNode = { id: "run-script-1", kind: "run_script", label: "Run script" };
 const sendMessageNode = { id: "send-message-1", kind: "send_message", label: "Send message" };
+const dispatchTodosNode = { id: "dispatch-todos-1", kind: "dispatch_todos", label: "Dispatch todos" };
 const documentReadNode = { id: "doc-read-1", kind: "document_read", label: "Read docs" };
 const documentWriteNode = { id: "doc-write-1", kind: "document_write", label: "Write docs" };
 const assetReadNode = { id: "asset-read-1", kind: "asset_read", label: "Read assets" };
@@ -48,6 +49,10 @@ test("graph contract exposes execution branches for action nodes", () => {
   );
   assert.deepEqual(
     loopspaceGraphOutputPortsForNode(sendMessageNode).map((port) => port.id),
+    ["exec", "success", "failure", "interrupt"],
+  );
+  assert.deepEqual(
+    loopspaceGraphOutputPortsForNode(dispatchTodosNode).map((port) => port.id),
     ["exec", "success", "failure", "interrupt"],
   );
 });
@@ -115,6 +120,13 @@ test("graph contract accepts legal flow and document ports", () => {
     true,
   );
   assert.equal(
+    validateLoopspaceGraphEdgeCandidate(sendMessageNode, dispatchTodosNode, {
+      fromPort: "success",
+      toPort: "in",
+    }).ok,
+    true,
+  );
+  assert.equal(
     validateLoopspaceGraphEdgeCandidate(documentReadNode, sendMessageNode, {
       fromPort: "docs",
       toPort: "in",
@@ -141,6 +153,7 @@ test("graph contract accepts completed send-message step edges to action nodes",
   const nodeById = new Map([
     [sendMessageNode.id, sendMessageNode],
     [runScriptNode.id, runScriptNode],
+    [dispatchTodosNode.id, dispatchTodosNode],
     [stepNode.id, stepNode],
     [orphanStepNode.id, orphanStepNode],
     [wrongParentStepNode.id, wrongParentStepNode],
@@ -158,6 +171,14 @@ test("graph contract accepts completed send-message step edges to action nodes",
       ...sendMessageNode,
       id: "send-message-follow-up",
     }, {
+      fromPort: "success",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    true,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(stepNode, dispatchTodosNode, {
       fromPort: "success",
       nodeById,
       toPort: "in",
@@ -186,6 +207,7 @@ test("graph contract accepts document context edges for send-message steps only"
   const nodeById = new Map([
     [sendMessageNode.id, sendMessageNode],
     [runScriptNode.id, runScriptNode],
+    [dispatchTodosNode.id, dispatchTodosNode],
     [stepNode.id, stepNode],
     [orphanStepNode.id, orphanStepNode],
     [wrongParentStepNode.id, wrongParentStepNode],
@@ -260,6 +282,7 @@ test("graph contract accepts asset context edges for send-message steps only", (
   const nodeById = new Map([
     [sendMessageNode.id, sendMessageNode],
     [runScriptNode.id, runScriptNode],
+    [dispatchTodosNode.id, dispatchTodosNode],
     [stepNode.id, stepNode],
     [orphanStepNode.id, orphanStepNode],
     [wrongParentStepNode.id, wrongParentStepNode],
@@ -340,6 +363,14 @@ test("graph contract accepts asset context edges for send-message steps only", (
   assert.equal(
     validateLoopspaceGraphEdgeCandidate(runScriptNode, assetWriteNode, {
       fromPort: "exec",
+      nodeById,
+      toPort: "in",
+    }).ok,
+    false,
+  );
+  assert.equal(
+    validateLoopspaceGraphEdgeCandidate(dispatchTodosNode, assetWriteNode, {
+      fromPort: "success",
       nodeById,
       toPort: "in",
     }).ok,
@@ -643,6 +674,27 @@ test("graph patches do not create deprecated device nodes", () => {
   assert.equal(ast.nodes.some((node) => node.id === "send-message-added" && node.kind === "send_message"), true);
 });
 
+test("graph patches create dispatch todo nodes with targeting metadata", () => {
+  const patched = applyDfBlueprintPatchOperations("", [
+    {
+      op: "add_node",
+      id: "dispatch-qa",
+      kind: "dispatch_todos",
+      label: "Dispatch QA",
+      target_workspace_ids: "workspace-a, workspace-b",
+      target_terminal_id: "pane-1",
+      todo_lines: "Audit login\nFix regression",
+    },
+  ]);
+  const ast = parseDfBlueprintSource(patched);
+  const node = ast.nodes.find((item) => item.id === "dispatch-qa");
+
+  assert.equal(node?.kind, "dispatch_todos");
+  assert.equal(node?.props?.target_workspace_ids, "workspace-a, workspace-b");
+  assert.equal(node?.props?.target_terminal_id, "pane-1");
+  assert.equal(node?.props?.todo_lines, "Audit login\nFix regression");
+});
+
 test("graph contract keeps legacy device nodes readable", () => {
   const validation = validateLoopspaceGraphAst({
     nodes: [{ id: "device-local-mac", kind: "device", label: "Local Mac" }],
@@ -663,6 +715,14 @@ test("graph contract owns action node visual gutters", () => {
   });
   assert.equal(loopspaceGraphVisualDefaultsForNode(sendMessageNode).outputGutter, 92);
   assert.equal(loopspaceGraphVisualDefaultsForNode(sendMessageNode).width, 680);
+  assert.deepEqual(loopspaceGraphVisualDefaultsForNode(dispatchTodosNode), {
+    height: 178,
+    minHeight: 178,
+    minWidth: 420,
+    outputGutter: 104,
+    sized: true,
+    width: 420,
+  });
   assert.deepEqual(loopspaceGraphVisualDefaultsForNode(documentReadNode), {
     height: 128,
     minHeight: 128,

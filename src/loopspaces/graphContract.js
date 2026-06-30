@@ -70,6 +70,13 @@ export const LOOPSPACE_GRAPH_NODE_TEMPLATES = [
     role: "action",
   },
   {
+    description: "Queue numbered todos into selected workspace terminals.",
+    icon: "todos",
+    id: "dispatch_todos",
+    label: "Dispatch todos",
+    role: "action",
+  },
+  {
     description: "Send a prompt into a device terminal agent.",
     icon: "message",
     id: "send_message",
@@ -127,6 +134,20 @@ export const LOOPSPACE_GRAPH_NODE_CONTRACTS = {
       outputGutter: 112,
       sized: true,
       width: 360,
+    },
+  },
+  dispatch_todos: {
+    inputs: [INPUT_PORTS_BY_ID.in],
+    legacyOutputs: [OUTPUT_PORTS_BY_ID.out],
+    outputs: EXECUTION_OUTPUT_PORTS,
+    role: "action",
+    visual: {
+      height: 178,
+      minHeight: 178,
+      minWidth: 420,
+      outputGutter: 104,
+      sized: true,
+      width: 420,
     },
   },
   send_message: {
@@ -284,7 +305,7 @@ export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = 
   const nodeLookup = options.nodeById || options.nodeLookup || options.nodes || null;
   const isSendMessageSubstepSuccessEdge = (
     fromKind === "step"
-      && (toKind === "run_script" || toKind === "send_message")
+      && (toKind === "run_script" || toKind === "send_message" || toKind === "dispatch_todos")
       && fromPort === "success"
       && toPort === "in"
       && graphContractIsSendMessageSubstep(fromNode, nodeLookup)
@@ -331,7 +352,7 @@ export function validateLoopspaceGraphEdgeCandidate(fromNode, toNode, options = 
   }
   if (
     toKind === "asset_write"
-      && (fromKind === "run_script" || fromKind === "send_message")
+      && (fromKind === "run_script" || fromKind === "send_message" || fromKind === "dispatch_todos")
       && EXECUTION_OUTPUT_PORT_IDS.has(fromPort)
   ) {
     return {
@@ -393,7 +414,7 @@ function loopspaceGraphLegacyActionOutEdgeCounts(ast = {}) {
     const fromNode = nodeById.get(String(edge?.from || "").trim());
     const fromKind = normalizeLoopspaceGraphNodeKind(fromNode);
     const fromPort = String(edge?.fromPort || "").trim().toLowerCase();
-    if ((fromKind === "run_script" || fromKind === "send_message") && fromPort === "out") {
+    if ((fromKind === "run_script" || fromKind === "send_message" || fromKind === "dispatch_todos") && fromPort === "out") {
       const key = loopspaceGraphLegacyActionOutEdgeKey(edge);
       counts.set(key, (counts.get(key) || 0) + 1);
     }

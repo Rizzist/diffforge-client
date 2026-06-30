@@ -532,6 +532,9 @@ fn todo_dispatch_remote_command_is_queue_action(command_kind: &str) -> bool {
             | "terminal_send_message"
             | "orchestrator_send_message"
             | "loopspace_send_message"
+            | "dispatch_todos"
+            | "loopspace_dispatch_todos"
+            | "loopspace_workspace_todo_dispatch"
             | "send_message"
     )
 }
@@ -2761,9 +2764,17 @@ fn todo_dispatch_todo_sync_commit_payload(
         "targetWorkspaceId": workspace_id,
         "workspace_name": workspace_name,
         "workspaceName": workspace_name,
+        "batch_id": todo_dispatch_text(item, &["batchId", "batch_id", "todoBatchId", "todo_batch_id"]),
+        "batchId": todo_dispatch_text(item, &["batchId", "batch_id", "todoBatchId", "todo_batch_id"]),
         "created_at": created_at,
         "createdAt": created_at,
+        "dispatch_id": todo_dispatch_text(item, &["dispatchId", "dispatch_id", "todoDispatchId", "todo_dispatch_id"]),
+        "dispatchId": todo_dispatch_text(item, &["dispatchId", "dispatch_id", "todoDispatchId", "todo_dispatch_id"]),
         "kind": todo_dispatch_text(item, &["kind", "type"]),
+        "loop_runtime_node_id": todo_dispatch_text(item, &["loopRuntimeNodeId", "loop_runtime_node_id", "nodeId", "node_id"]),
+        "loopRuntimeNodeId": todo_dispatch_text(item, &["loopRuntimeNodeId", "loop_runtime_node_id", "nodeId", "node_id"]),
+        "loopspace_id": todo_dispatch_text(item, &["loopspaceId", "loopspace_id"]),
+        "loopspaceId": todo_dispatch_text(item, &["loopspaceId", "loopspace_id"]),
         "reason": reason,
         "status_reason": todo_dispatch_text(
             item,
@@ -2791,6 +2802,12 @@ fn todo_dispatch_todo_sync_commit_payload(
         "todoText": text,
         "todo_id": todo_id,
         "todoId": todo_id,
+        "todo_batch_id": todo_dispatch_text(item, &["todoBatchId", "todo_batch_id", "batchId", "batch_id"]),
+        "todoBatchId": todo_dispatch_text(item, &["todoBatchId", "todo_batch_id", "batchId", "batch_id"]),
+        "todo_number": todo_dispatch_text(item, &["todoNumber", "todo_number", "todoSequence", "todo_sequence"]),
+        "todoNumber": todo_dispatch_text(item, &["todoNumber", "todo_number", "todoSequence", "todo_sequence"]),
+        "todo_sequence": todo_dispatch_text(item, &["todoSequence", "todo_sequence", "todoNumber", "todo_number"]),
+        "todoSequence": todo_dispatch_text(item, &["todoSequence", "todo_sequence", "todoNumber", "todo_number"]),
         "title": title,
         "updated_at": updated_at,
         "updatedAt": updated_at,
@@ -3545,7 +3562,23 @@ fn todo_store_build_created_item(
 
     let now_iso = chrono_like_now_iso();
     let now_ms = todo_dispatch_now_ms();
-    let id = format!("todo-{}-{}", now_ms, uuid::Uuid::new_v4());
+    let requested_id = todo_dispatch_text(
+        draft,
+        &[
+            "id",
+            "todoId",
+            "todo_id",
+            "commandId",
+            "command_id",
+            "dispatchId",
+            "dispatch_id",
+        ],
+    );
+    let id = if requested_id.is_empty() {
+        format!("todo-{}-{}", now_ms, uuid::Uuid::new_v4())
+    } else {
+        requested_id
+    };
     let kind = todo_dispatch_text(draft, &["kind", "type"]);
     let kind = if kind.is_empty() {
         "todo".to_string()
@@ -3616,6 +3649,62 @@ fn todo_store_build_created_item(
             &["reasoningEffort", "reasoning_effort", "effort"][..],
         ),
         ("speed", &["speed"][..]),
+        (
+            "batchId",
+            &["batchId", "batch_id", "todoBatchId", "todo_batch_id"][..],
+        ),
+        (
+            "todoBatchId",
+            &["todoBatchId", "todo_batch_id", "batchId", "batch_id"][..],
+        ),
+        (
+            "todo_batch_id",
+            &["todo_batch_id", "todoBatchId", "batch_id", "batchId"][..],
+        ),
+        ("commandId", &["commandId", "command_id"][..]),
+        ("command_id", &["command_id", "commandId"][..]),
+        (
+            "dispatchId",
+            &["dispatchId", "dispatch_id", "todoDispatchId", "todo_dispatch_id"][..],
+        ),
+        (
+            "dispatch_id",
+            &["dispatch_id", "dispatchId", "todo_dispatch_id", "todoDispatchId"][..],
+        ),
+        (
+            "lastDispatchId",
+            &["lastDispatchId", "last_dispatch_id", "dispatchId", "dispatch_id"][..],
+        ),
+        (
+            "last_dispatch_id",
+            &["last_dispatch_id", "lastDispatchId", "dispatch_id", "dispatchId"][..],
+        ),
+        ("loopspaceId", &["loopspaceId", "loopspace_id"][..]),
+        ("loopspace_id", &["loopspace_id", "loopspaceId"][..]),
+        (
+            "loopRuntimeNodeId",
+            &["loopRuntimeNodeId", "loop_runtime_node_id", "nodeId", "node_id"][..],
+        ),
+        (
+            "loop_runtime_node_id",
+            &["loop_runtime_node_id", "loopRuntimeNodeId", "node_id", "nodeId"][..],
+        ),
+        (
+            "nodeId",
+            &["nodeId", "node_id", "loopRuntimeNodeId", "loop_runtime_node_id"][..],
+        ),
+        (
+            "todoNumber",
+            &["todoNumber", "todo_number", "todoSequence", "todo_sequence"][..],
+        ),
+        (
+            "todoSequence",
+            &["todoSequence", "todo_sequence", "todoNumber", "todo_number"][..],
+        ),
+        (
+            "todo_sequence",
+            &["todo_sequence", "todoSequence", "todo_number", "todoNumber"][..],
+        ),
         (
             "targetAgentId",
             &[
@@ -3759,6 +3848,388 @@ async fn todo_store_create(
     })
     .await
     .map_err(|error| format!("Todo store create worker failed: {error}"))?
+}
+
+fn todo_store_dispatch_batch_id_part(value: &str, fallback: &str) -> String {
+    let safe = value
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '_' | '.' | '-') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(96)
+        .collect::<String>();
+    if safe.is_empty() {
+        fallback.to_string()
+    } else {
+        safe
+    }
+}
+
+fn todo_store_dispatch_split_ids(value: &str) -> Vec<String> {
+    let mut seen = HashSet::new();
+    value
+        .split(|character| matches!(character, '\n' | '\r' | ',' | ';'))
+        .map(|part| part.trim().trim_matches('"').trim_matches('\'').to_string())
+        .filter(|part| !part.is_empty())
+        .filter(|part| seen.insert(part.clone()))
+        .collect()
+}
+
+fn todo_store_dispatch_array_field(value: &Value, keys: &[&str]) -> Option<Vec<Value>> {
+    let payload = value.get("payload").filter(|nested| nested.is_object());
+    for key in keys {
+        for source in [Some(value), payload].into_iter().flatten() {
+            if let Some(items) = source.get(*key).and_then(Value::as_array) {
+                return Some(items.clone());
+            }
+        }
+    }
+    None
+}
+
+fn todo_store_dispatch_workspace_ids(request: &Value) -> Vec<String> {
+    if let Some(items) = todo_store_dispatch_array_field(
+        request,
+        &[
+            "workspaceIds",
+            "workspace_ids",
+            "targetWorkspaceIds",
+            "target_workspace_ids",
+            "workspaces",
+        ],
+    ) {
+        let mut seen = HashSet::new();
+        return items
+            .into_iter()
+            .filter_map(|item| {
+                let id = if item.is_object() {
+                    todo_dispatch_text(
+                        &item,
+                        &["workspaceId", "workspace_id", "id", "targetWorkspaceId", "target_workspace_id"],
+                    )
+                } else {
+                    item.as_str().unwrap_or_default().trim().to_string()
+                };
+                (!id.is_empty() && seen.insert(id.clone())).then_some(id)
+            })
+            .collect();
+    }
+    todo_store_dispatch_split_ids(&todo_dispatch_text(
+        request,
+        &[
+            "workspaceIds",
+            "workspace_ids",
+            "targetWorkspaceIds",
+            "target_workspace_ids",
+            "workspaceId",
+            "workspace_id",
+            "targetWorkspaceId",
+            "target_workspace_id",
+        ],
+    ))
+}
+
+fn todo_store_dispatch_todo_drafts(request: &Value) -> Vec<Value> {
+    if let Some(items) = todo_store_dispatch_array_field(
+        request,
+        &["todoItems", "todo_items", "todos", "items"],
+    ) {
+        return items
+            .into_iter()
+            .filter_map(|item| {
+                if item.is_object() {
+                    Some(item)
+                } else {
+                    let text = item.as_str().unwrap_or_default().trim().to_string();
+                    (!text.is_empty()).then(|| json!({ "text": text }))
+                }
+            })
+            .collect();
+    }
+    let text = todo_dispatch_text(
+        request,
+        &[
+            "todoLines",
+            "todo_lines",
+            "todos",
+            "items",
+            "text",
+            "prompt",
+            "message",
+            "body",
+        ],
+    );
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| json!({ "text": line }))
+        .collect()
+}
+
+fn todo_store_dispatch_optional_i64(value: &Value, keys: &[&str]) -> Option<i64> {
+    let payload = value.get("payload").filter(|nested| nested.is_object());
+    for key in keys {
+        for source in [Some(value), payload].into_iter().flatten() {
+            if let Some(number) = source.get(*key).and_then(Value::as_i64) {
+                return Some(number);
+            }
+            if let Some(number) = source
+                .get(*key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .and_then(|text| text.parse::<i64>().ok())
+            {
+                return Some(number);
+            }
+        }
+    }
+    None
+}
+
+fn todo_store_dispatch_insert_text(
+    object: &mut serde_json::Map<String, Value>,
+    request: &Value,
+    target_key: &str,
+    source_keys: &[&str],
+) {
+    let value = todo_dispatch_text(request, source_keys);
+    if !value.is_empty() {
+        object.insert(target_key.to_string(), json!(value));
+    }
+}
+
+#[tauri::command]
+async fn todo_store_dispatch_loopspace_batch(
+    app: AppHandle,
+    request: Value,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    if !request.is_object() {
+        return Err("Dispatch request must be an object.".to_string());
+    }
+    let workspace_ids = todo_store_dispatch_workspace_ids(&request);
+    if workspace_ids.is_empty() {
+        return Err("Dispatch todos requires at least one workspace id.".to_string());
+    }
+    let todo_drafts = todo_store_dispatch_todo_drafts(&request);
+    if todo_drafts.is_empty() {
+        return Err("Dispatch todos requires at least one todo.".to_string());
+    }
+    let reason = reason
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "loopspace_dispatch_todos".to_string());
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let loopspace_id = todo_dispatch_text(&request, &["loopspaceId", "loopspace_id"]);
+        let node_id = todo_dispatch_text(
+            &request,
+            &["nodeId", "node_id", "loopRuntimeNodeId", "loop_runtime_node_id"],
+        );
+        let requested_batch_id = todo_dispatch_text(
+            &request,
+            &["todoBatchId", "todo_batch_id", "batchId", "batch_id"],
+        );
+        let batch_id = if requested_batch_id.is_empty() {
+            format!(
+                "loopspace-{}-{}-{}",
+                todo_store_dispatch_batch_id_part(&loopspace_id, "loop"),
+                todo_store_dispatch_batch_id_part(&node_id, "node"),
+                uuid::Uuid::new_v4()
+            )
+        } else {
+            requested_batch_id
+        };
+        let target_terminal_index = todo_store_dispatch_optional_i64(
+            &request,
+            &["targetTerminalIndex", "target_terminal_index", "terminalIndex", "terminal_index"],
+        );
+        let target_terminal_id = todo_dispatch_text(
+            &request,
+            &["targetTerminalId", "target_terminal_id", "terminalId", "terminal_id", "paneId", "pane_id"],
+        );
+
+        let mut base = serde_json::Map::new();
+        for (target_key, source_keys) in [
+            ("deviceId", &["deviceId", "device_id", "sourceDeviceId", "source_device_id"][..]),
+            ("targetDeviceId", &["targetDeviceId", "target_device_id", "deviceId", "device_id"][..]),
+            ("targetAgentId", &["targetAgentId", "target_agent_id", "agentId", "agent_id"][..]),
+            ("targetTerminalId", &["targetTerminalId", "target_terminal_id", "terminalId", "terminal_id", "paneId", "pane_id"][..]),
+            ("targetTerminalName", &["targetTerminalName", "target_terminal_name", "terminalName", "terminal_name"][..]),
+            ("targetThreadId", &["targetThreadId", "target_thread_id", "threadId", "thread_id"][..]),
+            ("model", &["model", "modelId", "model_id"][..]),
+            ("reasoningEffort", &["reasoningEffort", "reasoning_effort", "effort"][..]),
+            ("effort", &["effort", "reasoningEffort", "reasoning_effort"][..]),
+            ("speed", &["speed", "serviceTier", "service_tier"][..]),
+            ("loopspaceId", &["loopspaceId", "loopspace_id"][..]),
+            ("loopspace_id", &["loopspace_id", "loopspaceId"][..]),
+            ("loopRuntimeNodeId", &["loopRuntimeNodeId", "loop_runtime_node_id", "nodeId", "node_id"][..]),
+            ("loop_runtime_node_id", &["loop_runtime_node_id", "loopRuntimeNodeId", "node_id", "nodeId"][..]),
+            ("nodeId", &["nodeId", "node_id", "loopRuntimeNodeId", "loop_runtime_node_id"][..]),
+        ] {
+            todo_store_dispatch_insert_text(&mut base, &request, target_key, source_keys);
+        }
+        if let Some(index) = target_terminal_index {
+            base.insert("targetTerminalIndex".to_string(), json!(index));
+        }
+        if !target_terminal_id.is_empty() || target_terminal_index.is_some() {
+            base.insert("targetExplicit".to_string(), json!(true));
+            base.insert("explicitTarget".to_string(), json!(true));
+            base.insert("userPinnedTarget".to_string(), json!(true));
+        }
+        base.insert("batchId".to_string(), json!(batch_id.clone()));
+        base.insert("todoBatchId".to_string(), json!(batch_id.clone()));
+        base.insert("todo_batch_id".to_string(), json!(batch_id.clone()));
+        base.insert("kind".to_string(), json!("todo"));
+        base.insert("source".to_string(), json!("loopspace-dispatch-todos"));
+        base.insert("status".to_string(), json!("queued"));
+        base.insert("todoStatus".to_string(), json!("queued"));
+
+        let _store_guard = todo_dispatch_queue_store_guard();
+        let mut all_items = Vec::new();
+        let mut workspace_results = Vec::new();
+        let mut total_queued = 0usize;
+
+        for workspace_id in workspace_ids {
+            let workspace_id = workspace_id.trim().to_string();
+            if workspace_id.is_empty() || todo_dispatch_workspace_is_deleted(&workspace_id) {
+                continue;
+            }
+            let mut stored_items = todo_dispatch_data_path("queues", &workspace_id)
+                .map(|path| {
+                    todo_dispatch_queue_read(&path)
+                        .get("items")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default()
+                })
+                .unwrap_or_default();
+            let mut changed_items = Vec::new();
+            let mut result_items = Vec::new();
+
+            for (todo_index, todo_draft) in todo_drafts.iter().enumerate() {
+                let sequence = todo_index + 1;
+                let mut draft_object = base.clone();
+                if let Some(todo_object) = todo_draft.as_object() {
+                    for (key, value) in todo_object {
+                        draft_object.insert(key.clone(), value.clone());
+                    }
+                }
+                let requested_todo_id = todo_dispatch_text(
+                    &Value::Object(draft_object.clone()),
+                    &["id", "todoId", "todo_id", "commandId", "command_id"],
+                );
+                let todo_id = if requested_todo_id.is_empty() {
+                    format!(
+                        "{}-{}-{}",
+                        todo_store_dispatch_batch_id_part(&batch_id, "batch"),
+                        todo_store_dispatch_batch_id_part(&workspace_id, "workspace"),
+                        sequence
+                    )
+                } else {
+                    requested_todo_id
+                };
+                let dispatch_id = todo_dispatch_text(
+                    &Value::Object(draft_object.clone()),
+                    &["dispatchId", "dispatch_id", "todoDispatchId", "todo_dispatch_id"],
+                );
+                let dispatch_id = if dispatch_id.is_empty() {
+                    format!("{todo_id}-dispatch")
+                } else {
+                    dispatch_id
+                };
+                draft_object.insert("id".to_string(), json!(todo_id.clone()));
+                draft_object.insert("todoId".to_string(), json!(todo_id.clone()));
+                draft_object.insert("todo_id".to_string(), json!(todo_id.clone()));
+                draft_object.insert("commandId".to_string(), json!(todo_id.clone()));
+                draft_object.insert("command_id".to_string(), json!(todo_id.clone()));
+                draft_object.insert("dispatchId".to_string(), json!(dispatch_id.clone()));
+                draft_object.insert("dispatch_id".to_string(), json!(dispatch_id.clone()));
+                draft_object.insert("lastDispatchId".to_string(), json!(dispatch_id.clone()));
+                draft_object.insert("last_dispatch_id".to_string(), json!(dispatch_id));
+                draft_object.insert("targetWorkspaceId".to_string(), json!(workspace_id.clone()));
+                draft_object.insert("target_workspace_id".to_string(), json!(workspace_id.clone()));
+                draft_object.insert("workspaceId".to_string(), json!(workspace_id.clone()));
+                draft_object.insert("todoNumber".to_string(), json!(sequence));
+                draft_object.insert("todo_number".to_string(), json!(sequence));
+                draft_object.insert("todoSequence".to_string(), json!(sequence));
+                draft_object.insert("todo_sequence".to_string(), json!(sequence));
+
+                let mut item = todo_store_build_created_item(
+                    &workspace_id,
+                    &Value::Object(draft_object),
+                    &reason,
+                )?;
+                todo_store_set_item_status(&mut item, "queued", &reason);
+                let item_id = todo_store_item_sync_id(&item);
+                if item_id.is_empty() {
+                    continue;
+                }
+
+                let mut existing_index = None;
+                for (index, existing) in stored_items.iter().enumerate() {
+                    if todo_store_item_matches_id(existing, &item_id) {
+                        existing_index = Some(index);
+                        break;
+                    }
+                }
+                if let Some(index) = existing_index {
+                    let current_status = todo_store_item_status(&stored_items[index]);
+                    if matches!(
+                        current_status.as_str(),
+                        "running" | "completed" | "failed" | "cancelled" | "interrupted" | "timed_out" | "deleted"
+                    ) {
+                        result_items.push(stored_items[index].clone());
+                        all_items.push(stored_items[index].clone());
+                        continue;
+                    }
+                    stored_items[index] = item.clone();
+                } else {
+                    stored_items.push(item.clone());
+                }
+                changed_items.push(item.clone());
+                result_items.push(item.clone());
+                all_items.push(item);
+            }
+
+            if !changed_items.is_empty() {
+                todo_dispatch_queue_write(&workspace_id, &stored_items);
+                todo_store_push_items(&app, &workspace_id, changed_items.clone(), &reason);
+                todo_store_emit_changed(&app, &workspace_id, &reason, "loopspace_dispatch_todos");
+                total_queued += changed_items.len();
+            }
+            workspace_results.push(json!({
+                "workspaceId": workspace_id,
+                "queuedCount": changed_items.len(),
+                "items": result_items,
+            }));
+        }
+
+        if total_queued > 0 {
+            todo_dispatch_wake_background_dispatcher(app.clone());
+        }
+
+        Ok(json!({
+            "ok": true,
+            "batchId": batch_id.clone(),
+            "todoBatchId": batch_id.clone(),
+            "todo_batch_id": batch_id,
+            "queuedCount": total_queued,
+            "items": all_items,
+            "workspaces": workspace_results,
+        }))
+    })
+    .await
+    .map_err(|error| format!("Loopspace todo dispatch worker failed: {error}"))?
 }
 
 fn todo_store_apply_update_patch(item: &mut Value, patch: &Value) -> bool {

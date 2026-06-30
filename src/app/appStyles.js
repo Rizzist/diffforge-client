@@ -4624,6 +4624,7 @@ export const LoopspaceGraphNode = styled.div`
   &[data-kind="webhook"] { --loop-node-accent: 45, 212, 191; }
   &[data-kind="manual"] { --loop-node-accent: 251, 191, 36; }
   &[data-kind="send_message"] { --loop-node-accent: 148, 163, 184; }
+  &[data-kind="dispatch_todos"] { --loop-node-accent: 56, 189, 248; }
   &[data-kind="document_read"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="document_write"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="asset_read"] { --loop-node-accent: 45, 212, 191; }
@@ -4659,6 +4660,15 @@ export const LoopspaceGraphNode = styled.div`
     width: var(--loopspace-node-width, 360px);
     max-width: none;
     min-height: var(--loopspace-node-height, 132px);
+    padding-right: var(--loopspace-output-gutter);
+  }
+  &[data-kind="dispatch_todos"] {
+    --loopspace-output-gutter: var(--loopspace-node-output-gutter, 104px);
+    box-sizing: border-box;
+    width: var(--loopspace-node-width, 420px);
+    max-width: none;
+    min-height: var(--loopspace-node-height, 178px);
+    align-items: start;
     padding-right: var(--loopspace-output-gutter);
   }
   &[data-kind="document_read"],
@@ -4728,6 +4738,116 @@ export const LoopspaceGraphNode = styled.div`
       0 0 0 1px rgba(var(--loop-node-accent), 0.18),
       0 14px 38px rgba(0, 0, 0, 0.32);
   }
+`;
+
+export const LoopspaceDispatchTodoCarousel = styled.div`
+  display: grid;
+  gap: 5px;
+  width: 100%;
+  margin-top: 8px;
+`;
+
+export const LoopspaceDispatchTodoRow = styled.div`
+  display: grid;
+  grid-template-columns: 16px 24px minmax(0, 1fr);
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  height: 28px;
+  padding: 0 7px;
+  border: 1px solid rgba(var(--loop-node-accent), 0.18);
+  border-radius: 7px;
+  color: rgba(226, 232, 240, 0.78);
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 10px;
+  font-weight: 760;
+  line-height: 1;
+
+  &[data-current="true"] {
+    border-color: rgba(var(--loop-node-accent), 0.42);
+    color: rgba(248, 250, 252, 0.96);
+    background:
+      linear-gradient(135deg, rgba(var(--loop-node-accent), 0.16), rgba(255, 255, 255, 0.04)),
+      rgba(8, 13, 18, 0.88);
+  }
+
+  > span:last-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+`;
+
+export const LoopspaceDispatchTodoStatusDot = styled.i`
+  position: relative;
+  display: inline-grid;
+  width: 10px;
+  height: 10px;
+  place-items: center;
+  border: 1px solid rgba(148, 163, 184, 0.72);
+  border-radius: 999px;
+  background: transparent;
+
+  &[data-status="queued"] {
+    border-color: rgba(250, 204, 21, 0.8);
+    box-shadow: 0 0 0 3px rgba(250, 204, 21, 0.08);
+    animation: loopspace-dispatch-dot-pulse 1.15s ease-in-out infinite;
+  }
+
+  &[data-status="running"],
+  &[data-status="dispatching"] {
+    border-color: rgba(125, 211, 252, 0.95);
+    border-top-color: transparent;
+    box-shadow: 0 0 0 3px rgba(125, 211, 252, 0.1);
+    animation: loopspace-message-step-spin 780ms linear infinite;
+  }
+
+  &[data-status="success"],
+  &[data-status="completed"] {
+    border-color: rgba(52, 211, 153, 0.92);
+    background: #34d399;
+    box-shadow: 0 0 0 3px rgba(52, 211, 153, 0.12);
+  }
+
+  &[data-status="failed"],
+  &[data-status="timed_out"] {
+    border-color: rgba(251, 113, 133, 0.92);
+    background: #fb7185;
+    box-shadow: 0 0 0 3px rgba(251, 113, 133, 0.12);
+  }
+
+  &[data-status="interrupted"],
+  &[data-status="canceled"],
+  &[data-status="cancelled"] {
+    border-color: rgba(216, 180, 254, 0.9);
+    background: #c084fc;
+    box-shadow: 0 0 0 3px rgba(192, 132, 252, 0.12);
+  }
+
+  @keyframes loopspace-dispatch-dot-pulse {
+    0%, 100% { opacity: 0.52; transform: scale(0.86); }
+    50% { opacity: 1; transform: scale(1); }
+  }
+`;
+
+export const LoopspaceDispatchTodoNumber = styled.span`
+  color: rgba(var(--loop-node-accent), 0.88);
+  font-size: 9px;
+  font-weight: 900;
+  text-align: right;
+`;
+
+export const LoopspaceDispatchTodoEmpty = styled.div`
+  display: grid;
+  min-height: 56px;
+  place-items: center;
+  margin-top: 8px;
+  border: 1px dashed rgba(var(--loop-node-accent), 0.22);
+  border-radius: 7px;
+  color: rgba(226, 232, 240, 0.52);
+  font-size: 10px;
+  font-weight: 760;
 `;
 
 export const LoopspaceGraphNodeOutputPorts = styled.div`

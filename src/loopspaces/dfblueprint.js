@@ -394,6 +394,44 @@ export function createDfBlueprintNodeFromTemplate(template, position = null) {
       },
     };
   }
+  if (templateId === "dispatch_todos") {
+    const deviceLabel = safeText(template?.device_label || template?.target_device_label);
+    const visualDefaults = loopspaceGraphVisualDefaultsForNode("dispatch_todos");
+    return {
+      id: `${templateId}-${suffix}`,
+      icon: safeText(template?.icon, "todos"),
+      label: safeText(template?.label, "Dispatch todos"),
+      mode: safeText(template?.mode || template?.dispatch_mode || template?.send_mode, "queued"),
+      nodeKind: "dispatch_todos",
+      kind: "dispatch_todos",
+      role: safeText(template?.role, "action"),
+      triggerId: "",
+      hasPosition: Boolean(position),
+      x: position ? Math.round(Number(position.x) || 0) : 0,
+      y: position ? Math.round(Number(position.y) || 0) : 0,
+      props: {
+        device_id: deviceId || safeText(template?.target_device_id),
+        device_label: deviceLabel,
+        dispatch_mode: safeText(template?.dispatch_mode || template?.send_mode || template?.mode, "queued"),
+        enable_wait_ms: safeText(template?.enable_wait_ms || template?.enableWaitMs, "30000"),
+        h: safeText(template?.h || template?.height, String(visualDefaults.height || 178)),
+        model: safeText(template?.model),
+        reasoning_effort: safeText(template?.reasoning_effort || template?.effort),
+        speed: safeText(template?.speed),
+        target_agent_id: safeText(template?.target_agent_id || template?.agent_id, "codex"),
+        target_device_id: deviceId || safeText(template?.target_device_id),
+        target_device_label: deviceLabel,
+        target_terminal_id: safeText(template?.target_terminal_id),
+        target_terminal_index: safeText(template?.target_terminal_index),
+        target_terminal_name: safeText(template?.target_terminal_name),
+        target_thread_id: safeText(template?.target_thread_id),
+        target_workspace_ids: safeText(template?.target_workspace_ids || template?.workspace_ids || template?.workspace_id),
+        todo_batch_id: safeText(template?.todo_batch_id || template?.batch_id),
+        todo_lines: safeText(template?.todo_lines || template?.todos || template?.items || template?.prompt || template?.text),
+        w: safeText(template?.w || template?.width, String(visualDefaults.width || 420)),
+      },
+    };
+  }
   if (templateId === "document_read" || templateId === "document_write") {
     const mode = templateId === "document_read" ? "read" : "write";
     const label = safeText(template?.label, mode === "read" ? "Document read" : "Document write");
@@ -673,6 +711,18 @@ export function applyDfBlueprintPatchOperations(source, operations = [], options
         script_id: op.script_id,
         script_name: op.script_name,
         shell: op.shell,
+        dispatch_mode: op.dispatch_mode || op.dispatchMode || op.send_mode || op.sendMode,
+        enable_wait_ms: op.enable_wait_ms || op.enableWaitMs,
+        target_agent_id: op.target_agent_id || op.targetAgentId || op.agent_id || op.agentId,
+        target_device_id: op.target_device_id || op.targetDeviceId,
+        target_device_label: op.target_device_label || op.targetDeviceLabel,
+        target_terminal_id: op.target_terminal_id || op.targetTerminalId || op.terminal_id || op.terminalId || op.pane_id || op.paneId,
+        target_terminal_index: op.target_terminal_index || op.targetTerminalIndex || op.terminal_index || op.terminalIndex,
+        target_terminal_name: op.target_terminal_name || op.targetTerminalName || op.terminal_name || op.terminalName,
+        target_thread_id: op.target_thread_id || op.targetThreadId || op.thread_id || op.threadId,
+        target_workspace_ids: op.target_workspace_ids || op.targetWorkspaceIds || op.workspace_ids || op.workspaceIds || op.workspace_id || op.workspaceId,
+        todo_batch_id: op.todo_batch_id || op.todoBatchId || op.batch_id || op.batchId,
+        todo_lines: op.todo_lines || op.todoLines || op.todos || op.items || op.prompt || op.text,
         description: op.description || op.desc || op.details,
         asset_refs: op.asset_refs || op.assets,
         create_name: op.create_name || op.createName,

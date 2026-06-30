@@ -93,7 +93,7 @@ import {
   WorkspaceTerminalPanels,
 } from "../app/appStyles";
 import AppSelect from "../app/AppSelect.jsx";
-import { PlanFlame } from "../app/PlanFlame.jsx";
+import WorkspaceIdleState from "../app/WorkspaceIdleState.jsx";
 import {
   AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT,
   AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL,
@@ -249,10 +249,13 @@ const TERMINAL_EMPTY_AGENT_LAUNCHERS = Object.freeze([
   { id: "generic", label: "Shell" },
 ]);
 const TERMINAL_EMPTY_PANEL_LAUNCHERS = Object.freeze([
+  { id: "web", label: "Web" },
   { id: "docs", label: "Docs" },
+  { id: "pcb", label: "PCB" },
   { id: "canvas", label: "Terminal canvas" },
   { id: "windows", label: "Window breakout" },
 ]);
+const TERMINAL_FLAME_PLAN_KEYS = new Set(["free", "plus", "pro", "ultra"]);
 const TERMINAL_TOOLBOX_PANEL_LAUNCHERS = Object.freeze([
   { id: "web", label: "Web" },
   { id: "docs", label: "Docs" },
@@ -1224,6 +1227,31 @@ function getTerminalTabAgentMeta(role) {
   return TERMINAL_TAB_AGENT_META[String(role || "").toLowerCase()] || TERMINAL_TAB_AGENT_META.generic;
 }
 
+function normalizeTerminalFlamePlan(value, fallback = "free") {
+  const key = String(value || "").trim().toLowerCase();
+  if (TERMINAL_FLAME_PLAN_KEYS.has(key)) {
+    return key;
+  }
+  const fallbackKey = String(fallback || "").trim().toLowerCase();
+  return TERMINAL_FLAME_PLAN_KEYS.has(fallbackKey) ? fallbackKey : "free";
+}
+
+function terminalBillingPlanNameFromStatus(billingStatus, fallback = "free") {
+  const rawPlan = String(
+    billingStatus?.planName
+      || billingStatus?.plan_name
+      || billingStatus?.credits?.planName
+      || billingStatus?.credits?.plan_name
+      || "",
+  ).trim().toLowerCase();
+  if (TERMINAL_FLAME_PLAN_KEYS.has(rawPlan)) {
+    return rawPlan;
+  }
+
+  const status = String(billingStatus?.planStatus || billingStatus?.plan_status || "").trim().toLowerCase();
+  return status === "paid" ? "plus" : fallback;
+}
+
 function TerminalEmptyAgentLauncherGlyph({ roleId }) {
   if (roleId === "codex") {
     return <WorkspaceCreateAgentCodexIcon aria-hidden="true" />;
@@ -1258,6 +1286,13 @@ function TerminalToolboxPanelGlyph({ panelId }) {
     return <ButtonProcessIcon aria-hidden="true" />;
   }
   return <ButtonHubIcon aria-hidden="true" />;
+}
+
+function TerminalEmptyPanelLauncherGlyph({ panelId }) {
+  if (panelId === "canvas") {
+    return <ButtonFullscreenIcon aria-hidden="true" />;
+  }
+  return <TerminalToolboxPanelGlyph panelId={panelId} />;
 }
 
 const TerminalTabGroupShell = styled.div`
@@ -2808,52 +2843,19 @@ const TerminalPcbBreakoutButton = styled.button`
   }
 `;
 
-const TerminalNoPanelsSurface = styled.div`
-  position: relative;
-  display: grid;
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-  place-items: center;
-  overflow: hidden;
-  background: #040507;
-
-  html[data-forge-theme="light"] & {
-    background: #f8fafc;
-  }
-`;
-
-const TerminalNoPanelsFlame = styled.div`
-  position: absolute;
-  inset: auto 0 0;
-  z-index: 0;
-  height: min(58vh, 420px);
-  pointer-events: none;
-`;
-
 const TerminalNoPanelsContent = styled.div`
   position: relative;
   z-index: 1;
   display: grid;
-  width: min(360px, calc(100% - 36px));
+  width: min(360px, calc(100vw - 36px));
   justify-items: center;
   gap: 14px;
-  padding: 24px 0 34px;
+  margin-top: 2px;
   color: rgba(232, 238, 248, 0.94);
 
   html[data-forge-theme="light"] & {
     color: #172033;
   }
-`;
-
-const TerminalNoPanelsTitle = styled.h2`
-  margin: 0;
-  color: currentColor;
-  font-size: 24px;
-  font-weight: 840;
-  line-height: 1.05;
-  letter-spacing: 0;
 `;
 
 const TerminalNoPanelsActions = styled.div`
@@ -21903,6 +21905,7 @@ function TerminalView({
   onOpenWorkspaceDocumentPanel = null,
   onCloseWorkspaceDocumentPanel = null,
   onOpenWorkspacePcbPanel = null,
+  plan = "",
   handlePreparedTerminalChange,
   isAppClosing = false,
   isWorkspaceRuntimeVisible = true,
@@ -21950,6 +21953,7 @@ function TerminalView({
   useDefaultNewWorkspaceRoot = () => {},
 }) {
   const hasWorkspaceTerminals = Boolean(terminalWorkspace);
+  const terminalIdlePlan = normalizeTerminalFlamePlan(plan, terminalBillingPlanNameFromStatus(billingStatus));
   const terminalStartupReady = Boolean(
     (workspaceThreadRestoreReady || shouldPrewarmWorkspaceTerminals)
       && isWorkspaceRuntimeVisible
@@ -28287,6 +28291,23 @@ function TerminalView({
     addWorkspacePcbPane?.({ workspaceId: terminalWorkspace.id });
     measureTerminalLayout();
   }, [addWorkspacePcbPane, logicalTerminalIndexes.length, measureTerminalLayout, terminalWorkspace?.id]);
+
+  const handleOpenEmptyStateWebPanel = useCallback(() => {
+    handleAddWebPane();
+  }, [handleAddWebPane]);
+
+  const handleOpenEmptyStatePcbPanel = useCallback(() => {
+    if (!terminalWorkspace?.id) {
+      return;
+    }
+    if (typeof addWorkspacePcbPane === "function") {
+      handleAddPcbPane();
+      return;
+    }
+    if (typeof onOpenWorkspacePcbPanel === "function") {
+      onOpenWorkspacePcbPanel({ source: "terminal_empty_state", workspaceId: terminalWorkspace.id });
+    }
+  }, [addWorkspacePcbPane, handleAddPcbPane, onOpenWorkspacePcbPanel, terminalWorkspace?.id]);
 
   const handleOpenToolboxAgent = useCallback((role) => {
     openWorkspaceTerminalPane(role, "terminal_toolbox");
@@ -37651,12 +37672,15 @@ function TerminalView({
       )}
     </WorkspaceTerminalPanels>
   ) : (
-    <TerminalNoPanelsSurface aria-label="No terminals">
-      <TerminalNoPanelsFlame aria-hidden="true">
-        <PlanFlame active plan="free" />
-      </TerminalNoPanelsFlame>
-      <TerminalNoPanelsContent>
-        <TerminalNoPanelsTitle>No terminals</TerminalNoPanelsTitle>
+    <WorkspaceIdleState
+      ariaLabel="No terminals"
+      detail=""
+      flameActive={isWorkspaceSurfaceVisible}
+      plan={terminalIdlePlan}
+      title="No terminals"
+      viewMotion={viewMotion}
+    >
+      <TerminalNoPanelsContent data-terminal-control="true">
         <TerminalNoPanelsActions aria-label="Open terminal type">
           {TERMINAL_EMPTY_AGENT_LAUNCHERS.map((launcher) => {
             const status = launcher.id === "generic"
@@ -37692,41 +37716,66 @@ function TerminalView({
         </TerminalNoPanelsActions>
         <TerminalNoPanelsActions aria-label="Open panel type" data-secondary="true">
           {TERMINAL_EMPTY_PANEL_LAUNCHERS.map((launcher) => {
+            const limitReached = logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT;
+            const workspaceSelected = Boolean(terminalWorkspace?.id);
+            const webPanel = launcher.id === "web";
             const docsPanel = launcher.id === "docs";
+            const pcbPanel = launcher.id === "pcb";
+            const webEnabled = Boolean(workspaceSelected && addWorkspaceWebPane && !limitReached);
             const docsEnabled = Boolean(
-              terminalWorkspace?.id
+              workspaceSelected
                 && (workspaceDocumentPanelAvailable || typeof onOpenWorkspaceDocumentPanel === "function"),
             );
-            const disabled = docsPanel ? !docsEnabled : true;
-            const title = docsPanel
-              ? docsEnabled
-                ? "Open Docs panel"
-                : "Docs panel unavailable"
-              : `${launcher.label} requires a terminal`;
+            const pcbEnabled = Boolean(
+              workspaceSelected
+                && (typeof addWorkspacePcbPane === "function" || typeof onOpenWorkspacePcbPanel === "function")
+                && !limitReached,
+            );
+            const enabled = webPanel ? webEnabled : docsPanel ? docsEnabled : pcbPanel ? pcbEnabled : false;
+            const title = !workspaceSelected
+              ? "Select a workspace"
+              : limitReached && (webPanel || pcbPanel)
+                ? "Panel limit reached"
+                : webPanel
+                  ? webEnabled ? "Add web panel" : "Web panel unavailable"
+                  : docsPanel
+                    ? docsEnabled ? "Open Docs panel" : "Docs panel unavailable"
+                    : pcbPanel
+                      ? pcbEnabled ? "Add PCB panel" : "PCB panel unavailable"
+                      : `${launcher.label} requires a terminal`;
+            const handleClick = webPanel
+              ? handleOpenEmptyStateWebPanel
+              : docsPanel
+                ? handleOpenEmptyStateDocsPanel
+                : pcbPanel
+                  ? handleOpenEmptyStatePcbPanel
+                  : undefined;
 
             return (
               <TerminalNoPanelsIconButton
-                aria-label={docsPanel ? "Open Docs panel" : launcher.label}
+                aria-label={
+                  webPanel
+                    ? "Add web panel"
+                    : docsPanel
+                      ? "Open Docs panel"
+                      : pcbPanel
+                        ? "Add PCB panel"
+                        : launcher.label
+                }
                 data-secondary="true"
-                disabled={disabled}
+                disabled={!enabled}
                 key={launcher.id}
-                onClick={docsPanel ? handleOpenEmptyStateDocsPanel : undefined}
+                onClick={handleClick}
                 title={title}
                 type="button"
               >
-                {docsPanel ? (
-                  <FileDocumentIcon aria-hidden="true" />
-                ) : launcher.id === "canvas" ? (
-                  <ButtonFullscreenIcon aria-hidden="true" />
-                ) : (
-                  <ButtonHubIcon aria-hidden="true" />
-                )}
+                <TerminalEmptyPanelLauncherGlyph panelId={launcher.id} />
               </TerminalNoPanelsIconButton>
             );
           })}
         </TerminalNoPanelsActions>
       </TerminalNoPanelsContent>
-    </TerminalNoPanelsSurface>
+    </WorkspaceIdleState>
   );
 
   const workspaceToolPaneContent = effectiveTodoQueueVisible ? (

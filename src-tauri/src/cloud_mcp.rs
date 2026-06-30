@@ -5990,6 +5990,39 @@ fn cloud_mcp_agent_chat_response_bool(value: &Value, keys: &[&str]) -> Option<bo
     None
 }
 
+fn cloud_mcp_agent_chat_response_i64(value: &Value, keys: &[&str]) -> Option<i64> {
+    let candidates = [
+        Some(value),
+        value.get("data"),
+        value.get("payload"),
+        value.get("ack"),
+        value.get("result"),
+        value.get("stored"),
+        value.get("data").and_then(|data| data.get("payload")),
+        value.get("data").and_then(|data| data.get("ack")),
+        value.get("payload").and_then(|payload| payload.get("data")),
+        value.get("payload").and_then(|payload| payload.get("ack")),
+    ];
+    for candidate in candidates.into_iter().flatten() {
+        for key in keys {
+            if let Some(value) = candidate.get(*key) {
+                if let Some(number) = value
+                    .as_i64()
+                    .or_else(|| value.as_u64().map(|count| count as i64))
+                {
+                    return Some(number);
+                }
+                if let Some(text) = value.as_str() {
+                    if let Ok(number) = text.trim().parse::<i64>() {
+                        return Some(number);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn cloud_mcp_agent_chat_response_bool_matches(
     value: &Value,
     keys: &[&str],
@@ -6095,13 +6128,22 @@ fn cloud_mcp_agent_chat_mark_session_acked_from_payload(
         .or_else(|| payload.get("totalRecordCount"))
         .and_then(Value::as_u64)
         .unwrap_or(records.len() as u64) as i64;
-    let response_session_record_count = response
-        .get("session_record_count")
-        .or_else(|| response.get("sessionRecordCount"))
-        .or_else(|| response.get("record_count"))
-        .or_else(|| response.get("recordCount"))
-        .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|count| count as i64)))
-        .unwrap_or(total_record_count);
+    let response_session_record_count = cloud_mcp_agent_chat_response_i64(
+        response,
+        &[
+            "session_record_count",
+            "sessionRecordCount",
+            "record_count",
+            "recordCount",
+        ],
+    )
+    .unwrap_or_else(|| {
+        if records.is_empty() && total_record_count > 0 {
+            0
+        } else {
+            total_record_count
+        }
+    });
     let content_hash = cloud_mcp_payload_text(payload, &["content_hash", "contentHash", "ch"])
         .unwrap_or_default();
     let payload_hash = cloud_mcp_payload_text(payload, &["payload_hash", "payloadHash", "ph"])
@@ -23859,6 +23901,102 @@ fn cloud_mcp_workspace_panel_kind(panel: &Value) -> Option<String> {
     }
 }
 
+fn cloud_mcp_workspace_panel_is_last_known(panel: &Value) -> bool {
+    cloud_mcp_payload_bool(panel, &["last_known_runtime"], false)
+        || cloud_mcp_payload_bool(panel, &["lastKnownRuntime"], false)
+        || cloud_mcp_payload_bool(panel, &["runtime_read_only"], false)
+        || cloud_mcp_payload_bool(panel, &["runtimeReadOnly"], false)
+}
+
+fn cloud_mcp_workspace_panel_is_deleted(panel: &Value) -> bool {
+    cloud_mcp_payload_bool(panel, &["deleted"], false)
+        || cloud_mcp_payload_bool(panel, &["tombstoned"], false)
+        || cloud_mcp_payload_bool(panel, &["removed"], false)
+        || cloud_mcp_payload_bool(panel, &["hidden"], false)
+        || cloud_mcp_payload_text(panel, &["deleted_at", "deletedAt"]).is_some()
+        || cloud_mcp_payload_text(panel, &["removed_at", "removedAt"]).is_some()
+        || cloud_mcp_payload_text(panel, &["tombstoned_at", "tombstonedAt"]).is_some()
+}
+
+fn cloud_mcp_workspace_panel_is_current(panel: &Value, _workspace: &Value, workspace_active: bool) -> bool {
+    if cloud_mcp_workspace_panel_is_deleted(panel) {
+        return false;
+    }
+
+    let status = [
+        "display_status",
+        "displayStatus",
+        "status",
+        "state",
+        "lifecycle",
+    ]
+    .iter()
+    .filter_map(|key| panel.get(*key).and_then(Value::as_str))
+    .map(|text| text.trim().to_ascii_lowercase())
+    .filter(|text| !text.is_empty())
+    .collect::<Vec<_>>()
+    .join(" ");
+
+    if ["deleted", "hidden", "removed", "tombstone", "tombstoned"]
+        .iter()
+        .any(|token| status.contains(token))
+    {
+        return false;
+    }
+
+    if cloud_mcp_workspace_panel_is_last_known(panel) {
+        return true;
+    }
+
+    if !workspace_active {
+        return false;
+    }
+
+    if [
+        "closed",
+        "closing",
+        "deactivated",
+        "disabled",
+        "disconnected",
+        "exited",
+        "inactive",
+        "offline",
+        "terminated",
+    ]
+    .iter()
+    .any(|token| status.contains(token))
+    {
+        return false;
+    }
+
+    if cloud_mcp_payload_bool(panel, &["active"], false)
+        || cloud_mcp_payload_bool(panel, &["connected"], false)
+        || cloud_mcp_payload_bool(panel, &["native_connected"], false)
+        || cloud_mcp_payload_bool(panel, &["nativeConnected"], false)
+    {
+        return true;
+    }
+
+    if !status.is_empty() {
+        return [
+            "active",
+            "busy",
+            "connected",
+            "idle",
+            "loading",
+            "open",
+            "opening",
+            "ready",
+            "running",
+            "starting",
+        ]
+        .iter()
+        .any(|token| status.contains(token));
+    }
+
+    workspace_active
+}
+
 fn cloud_mcp_workspace_server_items(workspace: &Value) -> Vec<Value> {
     let direct = cloud_mcp_payload_items(workspace, &["mcps", "servers"], 128);
     if !direct.is_empty() {
@@ -27634,6 +27772,18 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         let workspace_name =
             cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"])
                 .unwrap_or_else(|| workspace_id.clone());
+        let workspace_root = cloud_mcp_payload_text(
+            workspace,
+            &[
+                "repo_path",
+                "repoPath",
+                "workspace_root",
+                "workspaceRoot",
+                "root_directory",
+                "rootDirectory",
+            ],
+        )
+        .unwrap_or_default();
         let workspace_selected = workspace
             .get("selected")
             .or_else(|| workspace.get("is_selected"))
@@ -27914,6 +28064,10 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                     return None;
                 }
                 let panel_kind = cloud_mcp_workspace_panel_kind(panel)?;
+                if !cloud_mcp_workspace_panel_is_current(panel, workspace, workspace_active) {
+                    return None;
+                }
+                let panel_last_known = cloud_mcp_workspace_panel_is_last_known(panel);
                 let slot_index = panel
                     .get("slot_index")
                     .or_else(|| panel.get("slotIndex"))
@@ -27978,7 +28132,8 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                     "active": panel
                         .get("active")
                         .cloned()
-                        .unwrap_or_else(|| json!(workspace_active)),
+                        .map(|value| if panel_last_known { json!(false) } else { value })
+                        .unwrap_or_else(|| json!(workspace_active && !panel_last_known)),
                     "commandable": panel
                         .get("commandable")
                         .cloned()
@@ -27989,7 +28144,8 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                     "connected": panel
                         .get("connected")
                         .cloned()
-                        .unwrap_or_else(|| json!(workspace_active)),
+                        .map(|value| if panel_last_known { json!(false) } else { value })
+                        .unwrap_or_else(|| json!(workspace_active && !panel_last_known)),
                     "display_name": display_name.clone(),
                     "displayName": display_name.clone(),
                     "kind": panel_kind.clone(),
@@ -27998,12 +28154,14 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                         .get("native_connected")
                         .or_else(|| panel.get("nativeConnected"))
                         .cloned()
-                        .unwrap_or_else(|| json!(workspace_active)),
+                        .map(|value| if panel_last_known { json!(false) } else { value })
+                        .unwrap_or_else(|| json!(workspace_active && !panel_last_known)),
                     "nativeConnected": panel
                         .get("native_connected")
                         .or_else(|| panel.get("nativeConnected"))
                         .cloned()
-                        .unwrap_or_else(|| json!(workspace_active)),
+                        .map(|value| if panel_last_known { json!(false) } else { value })
+                        .unwrap_or_else(|| json!(workspace_active && !panel_last_known)),
                     "pane_id": panel_id.clone(),
                     "paneId": panel_id.clone(),
                     "pane_kind": panel_kind.clone(),
@@ -28066,6 +28224,10 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             "workspace_active": workspace_active,
             "workspace_id": workspace_id,
             "workspace_name": workspace_name,
+            "repo_path": workspace_root.clone(),
+            "repoPath": workspace_root.clone(),
+            "workspace_root": workspace_root.clone(),
+            "workspaceRoot": workspace_root.clone(),
             "selected": workspace_selected,
             "workspace_selected": workspace_selected,
             "workspace_status": workspace_status,
@@ -28101,6 +28263,16 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             "terminals": terminals,
         });
         normalized_workspaces.push(workspace_value);
+        if let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get().cloned() {
+            if !workspace_root.trim().is_empty() {
+                agent_chat_session_sync_backfill_workspace_history(
+                    app,
+                    workspace_id.clone(),
+                    Some(workspace_root.clone()),
+                    "device_workspaces_snapshot_history_backfill",
+                );
+            }
+        }
     }
     let terminal_count = normalized_workspaces
         .iter()
@@ -46214,6 +46386,93 @@ mod cloud_mcp_tests {
     }
 
     #[test]
+    fn workspace_panel_visibility_drops_closed_deleted_current_panels() {
+        let workspace = json!({
+            "workspace_active": false,
+            "panels": []
+        });
+        let active_workspace = json!({
+            "workspace_active": true,
+            "panels": []
+        });
+        let closed_panel = json!({
+            "panel_kind": "pcb",
+            "status": "closed",
+        });
+        let active_panel = json!({
+            "panel_kind": "web",
+            "active": true,
+            "status": "open",
+        });
+        let connected_closed_panel = json!({
+            "panel_kind": "web",
+            "connected": true,
+            "status": "closed",
+        });
+        let last_known_panel = json!({
+            "panel_kind": "pcb",
+            "last_known_runtime": true,
+            "status": "closed",
+        });
+        let deleted_last_known_panel = json!({
+            "panel_kind": "web",
+            "deleted": true,
+            "last_known_runtime": true,
+            "status": "closed",
+        });
+        let status_deleted_last_known_panel = json!({
+            "panel_kind": "pcb",
+            "last_known_runtime": true,
+            "status": "deleted",
+        });
+        let workspace_last_known = json!({
+            "last_known_runtime": true,
+            "panels": []
+        });
+
+        assert!(!cloud_mcp_workspace_panel_is_current(
+            &closed_panel,
+            &workspace,
+            false
+        ));
+        assert!(!cloud_mcp_workspace_panel_is_current(
+            &active_panel,
+            &workspace,
+            false
+        ));
+        assert!(cloud_mcp_workspace_panel_is_current(
+            &active_panel,
+            &active_workspace,
+            true
+        ));
+        assert!(!cloud_mcp_workspace_panel_is_current(
+            &connected_closed_panel,
+            &workspace,
+            false
+        ));
+        assert!(cloud_mcp_workspace_panel_is_current(
+            &last_known_panel,
+            &workspace,
+            false
+        ));
+        assert!(!cloud_mcp_workspace_panel_is_current(
+            &deleted_last_known_panel,
+            &workspace,
+            false
+        ));
+        assert!(!cloud_mcp_workspace_panel_is_current(
+            &status_deleted_last_known_panel,
+            &workspace,
+            false
+        ));
+        assert!(!cloud_mcp_workspace_panel_is_current(
+            &closed_panel,
+            &workspace_last_known,
+            false
+        ));
+    }
+
+    #[test]
     fn prompt_marker_accepts_cleaned_ascii_prompt() {
         assert!(cloud_mcp_terminal_output_has_prompt_marker("> "));
         assert!(cloud_mcp_terminal_output_has_prompt_marker(
@@ -50360,6 +50619,97 @@ mod cloud_mcp_tests {
         });
 
         assert!(cloud_mcp_agent_chat_sync_response_accepted(&compact));
+    }
+
+    #[test]
+    fn agent_chat_metadata_ack_with_nested_zero_count_clears_stale_sync_state() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let root = test_cloud_root("agent-chat-stale-sync-repair");
+        let data_root = root.join("data");
+        let cache_root = root.join("cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let scope_key = "scope-a";
+        let device_id = "device-a";
+        let workspace_id = "workspace-a";
+        let provider = "codex";
+        let session_id = "session-a";
+        let conn = cloud_mcp_open_outbox_conn().unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}(
+                    scope_key, device_id, workspace_id, provider, session_id, source_kind, source_path,
+                    content_hash, payload_hash, idempotency_key, record_count,
+                    acked_at_ms, failed_at_ms, last_error, updated_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'test', '', 'content-a', 'payload-a', 'idem-a', 2, 100, 0, '', 100)"
+            ),
+            rusqlite::params![scope_key, device_id, workspace_id, provider, session_id],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}(
+                    scope_key, device_id, workspace_id, provider, session_id, record_key, record_hash,
+                    source_cursor, acked_at_ms, updated_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'record-a', 'hash-a', '', 100, 100)"
+            ),
+            rusqlite::params![scope_key, device_id, workspace_id, provider, session_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let payload = json!({
+            "scope_key": scope_key,
+            "device_id": device_id,
+            "workspace_id": workspace_id,
+            "provider": provider,
+            "session_id": session_id,
+            "total_record_count": 2,
+            "records": [],
+        });
+        let response = json!({
+            "ok": true,
+            "data": {
+                "c": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
+                "m": "ingest_ack",
+                "accepted": true,
+                "session_record_count": 0,
+            }
+        });
+
+        let recorded =
+            cloud_mcp_agent_chat_mark_session_acked_from_payload(Some(&payload), &response)
+                .unwrap();
+        assert!(!recorded);
+
+        let conn = cloud_mcp_open_outbox_conn().unwrap();
+        let session_rows: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}
+                     WHERE scope_key=?1 AND device_id=?2 AND workspace_id=?3 AND provider=?4 AND session_id=?5"
+                ),
+                rusqlite::params![scope_key, device_id, workspace_id, provider, session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let record_rows: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}
+                     WHERE scope_key=?1 AND device_id=?2 AND workspace_id=?3 AND provider=?4 AND session_id=?5"
+                ),
+                rusqlite::params![scope_key, device_id, workspace_id, provider, session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_rows, 0);
+        assert_eq!(record_rows, 0);
+        drop(conn);
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

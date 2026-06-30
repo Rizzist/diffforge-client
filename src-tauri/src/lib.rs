@@ -5210,6 +5210,7 @@ pub fn run() {
             todo_store_update,
             todo_store_delete,
             todo_store_cancel,
+            todo_store_dispatch_loopspace_batch,
             todo_store_queue_all,
             todo_store_set_status,
             todo_read_image_data_url,

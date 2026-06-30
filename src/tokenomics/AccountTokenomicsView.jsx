@@ -3731,10 +3731,11 @@ const TokenomicsPanel = styled.div`
 
 const ProviderTabs = styled.div`
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(4, minmax(0, 1fr));
   gap: 4px;
+  container-type: inline-size;
   min-width: 0;
-  padding: 4px;
+  padding: 3px;
   border: 1px solid rgba(148, 163, 184, 0.14);
   border-radius: 8px;
   background: rgba(2, 6, 12, 0.82);
@@ -3747,14 +3748,17 @@ const ProviderTabs = styled.div`
 
 const ProviderTab = styled.button`
   min-width: 0;
-  min-height: 30px;
+  min-height: 28px;
+  padding: 0 3px;
   border: 1px solid ${({ $active, $provider }) => ($active ? providerAccent($provider) : "transparent")};
   border-radius: 7px;
   color: ${({ $active, $provider }) => ($active ? providerAccent($provider) : "#9aa8bc")};
   background: ${({ $active, $provider }) => ($active ? `color-mix(in srgb, ${providerAccent($provider)} 18%, transparent)` : "transparent")};
   font: inherit;
-  font-size: clamp(10px, 2.4vw, 12px);
+  font-size: clamp(8px, 1.8vw, 12px);
+  font-size: clamp(8px, 2.1cqi, 12px);
   font-weight: 900;
+  letter-spacing: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

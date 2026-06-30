@@ -2359,13 +2359,20 @@ async fn workspace_threads_persist_delta(
 
 #[tauri::command]
 async fn workspace_agent_session_history_list(
+    app: AppHandle,
     request: WorkspaceAgentSessionHistoryListRequest,
 ) -> Result<WorkspaceAgentSessionHistoryListResult, String> {
-    tauri::async_runtime::spawn_blocking(move || {
+    let result = tauri::async_runtime::spawn_blocking(move || {
         workspace_agent_session_history_list_blocking(request)
     })
     .await
-    .map_err(|error| format!("Workspace session history read worker failed: {error}"))?
+    .map_err(|error| format!("Workspace session history read worker failed: {error}"))??;
+    agent_chat_session_sync_spawn_from_history_items(
+        app,
+        &result.items,
+        "workspace_session_history_list",
+    );
+    Ok(result)
 }
 
 #[cfg(test)]

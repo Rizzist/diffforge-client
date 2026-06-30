@@ -361,7 +361,6 @@ import {
   readDeepgramApiKey,
 } from "../audio/audioCapture";
 import {
-  AUTH_TILE_SIZE,
   GlobalStyle,
   AppFrame,
   WindowResizeEdges,
@@ -411,8 +410,6 @@ import {
   LaunchActions,
   LoginScreen,
   LoginLayout,
-  SquareField,
-  SquarePulse,
   BrandPanel,
   BrandMark,
   IntroCopy,
@@ -467,11 +464,6 @@ import {
   AppGlobalScriptButton,
   AppGlobalScriptRunStatus,
   WorkspaceRuntimeLayer,
-  WorkspaceIdleSurface,
-  WorkspaceIdlePanel,
-  WorkspaceIdleLogo,
-  WorkspaceIdleTitle,
-  WorkspaceIdleDetail,
   LoopspaceRuntimeSurface,
   LoopspaceRuntimeStage,
   LoopspaceGraphCanvas,
@@ -493,6 +485,11 @@ import {
   LoopspaceGraphNodeSelectDevice,
   LoopspaceGraphNodeDeviceBadge,
   LoopspaceGraphNodeDeviceDot,
+  LoopspaceDispatchTodoCarousel,
+  LoopspaceDispatchTodoEmpty,
+  LoopspaceDispatchTodoNumber,
+  LoopspaceDispatchTodoRow,
+  LoopspaceDispatchTodoStatusDot,
   LoopspaceGraphNodeTimer,
   LoopspaceGraphTriggerRunButton,
   LoopspaceGraphNodeSelectChevron,
@@ -905,7 +902,7 @@ import {
   WorkspaceArchiveActions,
   VIEW_TRANSITION_MS
 } from "./appStyles";
-import { PlanFlame } from "./PlanFlame.jsx";
+import WorkspaceIdleState, { AuthSquareBackdrop } from "./WorkspaceIdleState.jsx";
 import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
 import {
   accountDocumentHydrateRequestFromSkill,
@@ -5483,66 +5480,6 @@ function persistAgentStatusCache(statuses) {
 }
 
 let nextWorkspaceTerminalInstanceId = 1;
-const AUTH_TILE_COLUMNS = 64;
-const AUTH_TILE_ROWS = 24;
-const AUTH_TILE_BURSTS = Array.from({ length: 156 }, (_, index) => {
-  const col = (index * 9 + Math.floor(index / 4) * 5) % AUTH_TILE_COLUMNS;
-  const row = (index * 7 + Math.floor(index / 6) * 4) % AUTH_TILE_ROWS;
-  const delay = `${((index * 0.47) % 12).toFixed(1)}s`;
-  const duration = `${(7.2 + (index % 8) * 0.48).toFixed(1)}s`;
-  const peak = (0.2 + (index % 6) * 0.026).toFixed(3);
-
-  return [col, row, delay, duration, peak];
-});
-
-function AuthSquareBackdrop({ tone = "default" } = {}) {
-  return (
-    <SquareField aria-hidden="true" data-tone={tone}>
-      {AUTH_TILE_BURSTS.map(([col, row, delay, duration, peak]) => (
-        <SquarePulse
-          key={`${col}-${row}-${delay}`}
-          style={{
-            "--left": `${col * AUTH_TILE_SIZE}px`,
-            "--top": `${row * AUTH_TILE_SIZE}px`,
-            "--delay": delay,
-            "--duration": duration,
-            "--peak": peak,
-          }}
-        />
-      ))}
-    </SquareField>
-  );
-}
-
-function WorkspaceIdleState({
-  actionLabel = "",
-  detail = "No workspace selected.",
-  flameActive = true,
-  onAction = null,
-  plan = "",
-  title = BRAND_NAME,
-  viewMotion,
-}) {
-  return (
-    <WorkspaceIdleSurface aria-label="No workspace selected" data-motion={viewMotion}>
-      <AuthSquareBackdrop tone="quiet" />
-      {/* The signed-in plan rendered as its pricing-page flame tier. */}
-      <PlanFlame active={flameActive} plan={plan} showControls={Boolean(plan)} />
-      <WorkspaceIdlePanel>
-        <WorkspaceIdleLogo src="/logo.webp" alt="" />
-        <WorkspaceIdleTitle>{title}</WorkspaceIdleTitle>
-        <WorkspaceIdleDetail>{detail}</WorkspaceIdleDetail>
-        {actionLabel && typeof onAction === "function" && (
-          <PrimaryButton onClick={onAction} type="button">
-            <ButtonAddIcon aria-hidden="true" />
-            <span>{actionLabel}</span>
-          </PrimaryButton>
-        )}
-      </WorkspaceIdlePanel>
-    </WorkspaceIdleSurface>
-  );
-}
-
 
 function LoopspaceCreatePanel({
   loopspaceError,
@@ -6136,6 +6073,204 @@ function loopspaceSendMessageDraftFromNode(node, agentLaunchDefaults = null) {
       "agent",
     ]),
   }, agentLaunchDefaults);
+}
+
+function loopspaceDispatchTodosSplitList(value = "") {
+  const seen = new Set();
+  return String(value || "")
+    .split(/[\n,;]+/g)
+    .map((part) => part.trim().replace(/^["']|["']$/g, ""))
+    .filter(Boolean)
+    .filter((part) => {
+      if (seen.has(part)) return false;
+      seen.add(part);
+      return true;
+    });
+}
+
+function loopspaceDispatchTodosLinesFromText(value = "") {
+  return String(value || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function normalizeLoopspaceDispatchTodosDraft(value = {}, agentLaunchDefaults = null) {
+  const input = value && typeof value === "object" ? value : { todo_lines: String(value || "") };
+  return {
+    ...normalizeLoopspaceSendMessageLaunchSettings(input, agentLaunchDefaults),
+    device_id: String(input.device_id || input.deviceId || input.target_device_id || input.targetDeviceId || "").trim(),
+    device_label: String(input.device_label || input.deviceLabel || input.target_device_label || input.targetDeviceLabel || "").trim(),
+    dispatch_mode: String(input.dispatch_mode || input.dispatchMode || input.send_mode || input.sendMode || input.mode || "queued").trim() || "queued",
+    enable_wait_ms: String(input.enable_wait_ms || input.enableWaitMs || "30000").trim() || "30000",
+    target_terminal_id: String(input.target_terminal_id || input.targetTerminalId || input.terminal_id || input.terminalId || input.pane_id || input.paneId || "").trim(),
+    target_terminal_index: String(input.target_terminal_index || input.targetTerminalIndex || input.terminal_index || input.terminalIndex || "").trim(),
+    target_terminal_name: String(input.target_terminal_name || input.targetTerminalName || input.terminal_name || input.terminalName || "").trim(),
+    target_thread_id: String(input.target_thread_id || input.targetThreadId || input.thread_id || input.threadId || "").trim(),
+    target_workspace_ids: String(input.target_workspace_ids || input.targetWorkspaceIds || input.workspace_ids || input.workspaceIds || input.workspace_id || input.workspaceId || "").trim(),
+    todo_batch_id: String(input.todo_batch_id || input.todoBatchId || input.batch_id || input.batchId || "").trim(),
+    todo_lines: String(input.todo_lines || input.todoLines || input.todos || input.items || input.prompt || input.text || "").trim(),
+  };
+}
+
+function loopspaceDispatchTodosDraftFromNode(node, agentLaunchDefaults = null, loopspace = null) {
+  const props = node?.props || {};
+  return normalizeLoopspaceDispatchTodosDraft({
+    device_id: loopspaceGraphPropValue(props, ["device_id", "deviceId", "target_device_id", "targetDeviceId"]),
+    device_label: loopspaceGraphPropValue(props, ["device_label", "deviceLabel", "target_device_label", "targetDeviceLabel"]),
+    dispatch_mode: loopspaceGraphPropValue(props, ["dispatch_mode", "dispatchMode", "send_mode", "sendMode", "mode"]),
+    enable_wait_ms: loopspaceGraphPropValue(props, ["enable_wait_ms", "enableWaitMs"]),
+    model: loopspaceGraphPropValue(props, ["model", "model_id", "modelId"]),
+    reasoning_effort: loopspaceGraphPropValue(props, [
+      "reasoning_effort",
+      "reasoningEffort",
+      "effort",
+      "thinking_power",
+      "thinkingPower",
+    ]),
+    speed: loopspaceGraphPropValue(props, ["speed", "service_tier", "serviceTier"]),
+    target_agent_id: loopspaceGraphPropValue(props, [
+      "target_agent_id",
+      "targetAgentId",
+      "agent_id",
+      "agentId",
+      "agent",
+    ]),
+    target_terminal_id: loopspaceGraphPropValue(props, ["target_terminal_id", "targetTerminalId", "terminal_id", "terminalId", "pane_id", "paneId"]),
+    target_terminal_index: loopspaceGraphPropValue(props, ["target_terminal_index", "targetTerminalIndex", "terminal_index", "terminalIndex"]),
+    target_terminal_name: loopspaceGraphPropValue(props, ["target_terminal_name", "targetTerminalName", "terminal_name", "terminalName"]),
+    target_thread_id: loopspaceGraphPropValue(props, ["target_thread_id", "targetThreadId", "thread_id", "threadId"]),
+    target_workspace_ids: loopspaceGraphPropValue(props, [
+      "target_workspace_ids",
+      "targetWorkspaceIds",
+      "workspace_ids",
+      "workspaceIds",
+      "workspace_id",
+      "workspaceId",
+    ]) || loopspace?.workspaceId || loopspace?.workspace_id || "",
+    todo_batch_id: loopspaceGraphPropValue(props, ["todo_batch_id", "todoBatchId", "batch_id", "batchId"]),
+    todo_lines: loopspaceGraphPropValue(props, ["todo_lines", "todoLines", "todos", "items", "prompt", "text"]),
+  }, agentLaunchDefaults);
+}
+
+function loopspaceDispatchTodosSafeIdPart(value = "", fallback = "item") {
+  const safe = String(value || "")
+    .trim()
+    .replace(/[^a-zA-Z0-9_.-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 96);
+  return safe || fallback;
+}
+
+function loopspaceDispatchTodosBatchId(loopspaceId = "", node = null, draft = null) {
+  const explicit = String(
+    draft?.todo_batch_id
+      || loopspaceGraphPropValue(node?.props || {}, ["todo_batch_id", "todoBatchId", "batch_id", "batchId"])
+      || "",
+  ).trim();
+  if (explicit) return explicit;
+  return `loopspace-${loopspaceDispatchTodosSafeIdPart(loopspaceId, "loop")}-${loopspaceDispatchTodosSafeIdPart(node?.id, "node")}`;
+}
+
+function loopspaceWorkspaceTodoArraysFromSnapshot(value, depth = 0, rows = []) {
+  if (!value || depth > 5) return rows;
+  if (Array.isArray(value)) {
+    value.forEach((item) => loopspaceWorkspaceTodoArraysFromSnapshot(item, depth + 1, rows));
+    return rows;
+  }
+  if (typeof value !== "object") return rows;
+  const hasTodoIdentity = String(value.id || value.todoId || value.todo_id || "").trim();
+  const hasTodoText = String(value.text || value.todoText || value.todo_text || value.body || value.title || "").trim();
+  if (hasTodoIdentity && hasTodoText) {
+    rows.push(value);
+  }
+  [
+    "items",
+    "todos",
+    "rows",
+    "accepted",
+    "workspaceTodos",
+    "workspace_todos",
+  ].forEach((key) => {
+    if (value[key]) loopspaceWorkspaceTodoArraysFromSnapshot(value[key], depth + 1, rows);
+  });
+  return rows;
+}
+
+function loopspaceDispatchTodoItemBatchId(item = {}) {
+  return String(item.todoBatchId || item.todo_batch_id || item.batchId || item.batch_id || "").trim();
+}
+
+function loopspaceDispatchTodoItemNodeId(item = {}) {
+  return String(
+    item.loopRuntimeNodeId
+      || item.loop_runtime_node_id
+      || item.nodeId
+      || item.node_id
+      || "",
+  ).trim();
+}
+
+function loopspaceDispatchTodoItemSequence(item = {}, fallback = 0) {
+  const sequence = Number(
+    item.todoSequence
+      || item.todo_sequence
+      || item.todoNumber
+      || item.todo_number
+      || 0,
+  );
+  return Number.isFinite(sequence) && sequence > 0 ? sequence : fallback;
+}
+
+function loopspaceDispatchTodoStatus(item = {}) {
+  const status = accountToolTodoStatus(item) || normalizeAccountToolTodoStatus(item.status || item.todoStatus || item.todo_status || "");
+  return status === "completed" ? "success" : status === "cancelled" ? "canceled" : status || "queued";
+}
+
+function loopspaceDispatchTodoStatusTerminal(status = "") {
+  return ["success", "completed", "failed", "interrupted", "canceled", "cancelled", "timed_out", "deleted"].includes(
+    String(status || "").trim().toLowerCase(),
+  );
+}
+
+function loopspaceDispatchTodoCarouselRows(workspaceTodos, localItems, loopspaceId, node) {
+  const batchId = loopspaceDispatchTodosBatchId(loopspaceId, node);
+  const nodeId = String(node?.id || "").trim();
+  const byId = new Map();
+  [...(Array.isArray(localItems) ? localItems : []), ...loopspaceWorkspaceTodoArraysFromSnapshot(workspaceTodos)]
+    .map((item, index) => normalizeAccountToolTodoItem(item, item?.workspaceId || item?.workspace_id || ""))
+    .filter(Boolean)
+    .filter((item) => {
+      const itemBatchId = loopspaceDispatchTodoItemBatchId(item);
+      if (batchId && itemBatchId === batchId) return true;
+      return nodeId && loopspaceDispatchTodoItemNodeId(item) === nodeId;
+    })
+    .forEach((item, index) => {
+      byId.set(item.id, {
+        ...item,
+        displayStatus: loopspaceDispatchTodoStatus(item),
+        sequence: loopspaceDispatchTodoItemSequence(item, index + 1),
+      });
+    });
+  const items = [...byId.values()].sort((left, right) => (
+    (left.sequence || 0) - (right.sequence || 0)
+      || String(left.id).localeCompare(String(right.id))
+  ));
+  if (!items.length) return [];
+  const currentIndex = Math.max(0, items.findIndex((item) => !loopspaceDispatchTodoStatusTerminal(item.displayStatus)));
+  const activeIndex = currentIndex >= 0 ? currentIndex : items.length - 1;
+  return items
+    .map((item, index) => ({ item, index }))
+    .filter(({ index }) => Math.abs(index - activeIndex) <= 1)
+    .map(({ item, index }) => ({
+      current: index === activeIndex,
+      id: item.id,
+      number: item.sequence || index + 1,
+      status: item.displayStatus,
+      text: item.text,
+    }));
 }
 
 function loopspaceGraphNodeParentId(node) {
@@ -8160,7 +8295,9 @@ function LoopspaceRuntimeView({
   localDesktopProfile = null,
   localScripts = [],
   loopspace,
+  onActivateWorkspaceForTodoDispatch = null,
   visible = true,
+  workspaceTodos = null,
 }) {
   const [runtimePanelTab, setRuntimePanelTab] = useState("runtime");
   const [runtimePanelExpanded, setRuntimePanelExpanded] = useState(true);
@@ -8199,6 +8336,9 @@ function LoopspaceRuntimeView({
   const [settingsNodeId, setSettingsNodeId] = useState("");
   const [sendMessageSettingsTab, setSendMessageSettingsTab] = useState("model");
   const [sendMessageSettingsDrafts, setSendMessageSettingsDrafts] = useState({});
+  const [dispatchTodosSettingsDrafts, setDispatchTodosSettingsDrafts] = useState({});
+  const [dispatchTodosLocalItemsByBatch, setDispatchTodosLocalItemsByBatch] = useState({});
+  const [dispatchTodosPendingNodeId, setDispatchTodosPendingNodeId] = useState("");
   const [sendMessageCheckpointDragPositions, setSendMessageCheckpointDragPositions] = useState({});
   const [sendMessageCheckpointLayoutPriorityId, setSendMessageCheckpointLayoutPriorityId] = useState("");
   const [manualTriggerRunPendingId, setManualTriggerRunPendingId] = useState("");
@@ -8710,6 +8850,9 @@ function LoopspaceRuntimeView({
     setSendMessageCheckpointLayoutPriorityId("");
     setSettingsNodeId("");
     setSendMessageSettingsDrafts({});
+    setDispatchTodosSettingsDrafts({});
+    setDispatchTodosLocalItemsByBatch({});
+    setDispatchTodosPendingNodeId("");
     setSendMessageSettingsTab("model");
     setSettingsPanelScrollTop(0);
     setSelectedRuntimeRowId("");
@@ -8887,6 +9030,12 @@ function LoopspaceRuntimeView({
     if (!settingsNodeId || graphNodeLookup.has(settingsNodeId)) return;
     setSettingsNodeId("");
     setSendMessageSettingsDrafts((current) => {
+      if (!Object.prototype.hasOwnProperty.call(current, settingsNodeId)) return current;
+      const next = { ...current };
+      delete next[settingsNodeId];
+      return next;
+    });
+    setDispatchTodosSettingsDrafts((current) => {
       if (!Object.prototype.hasOwnProperty.call(current, settingsNodeId)) return current;
       const next = { ...current };
       delete next[settingsNodeId];
@@ -9336,6 +9485,168 @@ function LoopspaceRuntimeView({
     }));
   }, []);
 
+  const updateDispatchTodosNodeProps = useCallback(async (node, patch = {}) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy) return;
+    const nextSource = updateDfBlueprintNodeProps(graphSourceRef.current || graphSource, nodeId, patch);
+    await commitLoopspaceGraphSource(nextSource, "Unable to update dispatch todos node.");
+  }, [busy, commitLoopspaceGraphSource, graphSource, loopspaceId]);
+
+  const updateDispatchTodosSettingsDraft = useCallback((nodeId, patch = {}) => {
+    const key = String(nodeId || "").trim();
+    if (!key) return;
+    setDispatchTodosSettingsDrafts((current) => ({
+      ...current,
+      [key]: {
+        ...(current[key] && typeof current[key] === "object" ? current[key] : {}),
+        ...(patch && typeof patch === "object" ? patch : {}),
+      },
+    }));
+  }, []);
+
+  const cancelDispatchTodosSettings = useCallback((nodeId) => {
+    const key = String(nodeId || "").trim();
+    if (!key) return;
+    setSettingsNodeId((current) => (current === key ? "" : current));
+    setDispatchTodosSettingsDrafts((current) => {
+      if (!Object.prototype.hasOwnProperty.call(current, key)) return current;
+      const next = { ...current };
+      delete next[key];
+      return next;
+    });
+  }, []);
+
+  const saveDispatchTodosSettings = useCallback(async (node, draft) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!nodeId || busy) return;
+    const normalized = normalizeLoopspaceDispatchTodosDraft(draft, loopspaceAgentLaunchDefaultsRef.current);
+    const batchId = loopspaceDispatchTodosBatchId(loopspaceId, node, normalized);
+    await updateDispatchTodosNodeProps(node, {
+      props: {
+        device_id: normalized.device_id,
+        device_label: normalized.device_label,
+        dispatch_mode: normalized.dispatch_mode,
+        enable_wait_ms: normalized.enable_wait_ms,
+        model: normalized.model,
+        reasoning_effort: normalized.reasoning_effort,
+        speed: normalized.speed,
+        target_agent_id: normalized.target_agent_id,
+        target_device_id: normalized.device_id,
+        target_device_label: normalized.device_label,
+        target_terminal_id: normalized.target_terminal_id,
+        target_terminal_index: normalized.target_terminal_index,
+        target_terminal_name: normalized.target_terminal_name,
+        target_thread_id: normalized.target_thread_id,
+        target_workspace_ids: normalized.target_workspace_ids,
+        todo_batch_id: batchId,
+        todo_lines: normalized.todo_lines,
+      },
+    });
+    setSettingsNodeId("");
+    setDispatchTodosSettingsDrafts((current) => {
+      const next = { ...current };
+      delete next[nodeId];
+      return next;
+    });
+  }, [busy, loopspaceId, updateDispatchTodosNodeProps]);
+
+  const dispatchLoopspaceTodosNode = useCallback(async (node, draft) => {
+    const nodeId = String(node?.id || "").trim();
+    if (!loopspaceId || !nodeId || busy || dispatchTodosPendingNodeId) return;
+    const normalized = normalizeLoopspaceDispatchTodosDraft(draft, loopspaceAgentLaunchDefaultsRef.current);
+    const workspaceIds = loopspaceDispatchTodosSplitList(normalized.target_workspace_ids);
+    const todoLines = loopspaceDispatchTodosLinesFromText(normalized.todo_lines);
+    if (!workspaceIds.length) {
+      setRuntimeError("Choose at least one workspace before dispatching todos.");
+      return;
+    }
+    if (!todoLines.length) {
+      setRuntimeError("Add at least one todo before dispatching.");
+      return;
+    }
+    const batchId = loopspaceDispatchTodosBatchId(loopspaceId, node, normalized);
+    const targetTerminalIndex = Number.parseInt(normalized.target_terminal_index, 10);
+    setDispatchTodosPendingNodeId(nodeId);
+    setRuntimeError("");
+    try {
+      await updateDispatchTodosNodeProps(node, {
+        props: {
+          device_id: normalized.device_id,
+          device_label: normalized.device_label,
+          dispatch_mode: normalized.dispatch_mode,
+          enable_wait_ms: normalized.enable_wait_ms,
+          model: normalized.model,
+          reasoning_effort: normalized.reasoning_effort,
+          speed: normalized.speed,
+          target_agent_id: normalized.target_agent_id,
+          target_device_id: normalized.device_id,
+          target_device_label: normalized.device_label,
+          target_terminal_id: normalized.target_terminal_id,
+          target_terminal_index: normalized.target_terminal_index,
+          target_terminal_name: normalized.target_terminal_name,
+          target_thread_id: normalized.target_thread_id,
+          target_workspace_ids: normalized.target_workspace_ids,
+          todo_batch_id: batchId,
+          todo_lines: normalized.todo_lines,
+        },
+      });
+      const enableWaitMs = Number.parseInt(normalized.enable_wait_ms, 10);
+      if (typeof onActivateWorkspaceForTodoDispatch === "function") {
+        await onActivateWorkspaceForTodoDispatch({
+          source: "loopspace_dispatch_todos_node",
+          waitMs: Number.isFinite(enableWaitMs) && enableWaitMs > 0 ? enableWaitMs : 0,
+          workspaceIds,
+        });
+      }
+      const result = await invoke("todo_store_dispatch_loopspace_batch", {
+        reason: "loopspace_dispatch_todos_node",
+        request: {
+          batchId,
+          deviceId: normalized.device_id,
+          deviceLabel: normalized.device_label,
+          dispatchMode: normalized.dispatch_mode,
+          enableWaitMs: normalized.enable_wait_ms,
+          loopRuntimeNodeId: nodeId,
+          loopspaceId,
+          model: normalized.model,
+          nodeId,
+          reasoningEffort: normalized.reasoning_effort,
+          speed: normalized.speed,
+          targetAgentId: normalized.target_agent_id,
+          targetDeviceId: normalized.device_id,
+          targetDeviceLabel: normalized.device_label,
+          targetTerminalId: normalized.target_terminal_id,
+          ...(Number.isFinite(targetTerminalIndex) ? { targetTerminalIndex } : {}),
+          targetTerminalName: normalized.target_terminal_name,
+          targetThreadId: normalized.target_thread_id,
+          todoBatchId: batchId,
+          todoLines: normalized.todo_lines,
+          todos: todoLines,
+          workspaceIds,
+        },
+      });
+      const resultItems = Array.isArray(result?.items) ? result.items : [];
+      setDispatchTodosLocalItemsByBatch((current) => ({
+        ...current,
+        [batchId]: resultItems,
+      }));
+      setDispatchTodosSettingsDrafts((current) => {
+        if (!Object.prototype.hasOwnProperty.call(current, nodeId)) return current;
+        return {
+          ...current,
+          [nodeId]: {
+            ...current[nodeId],
+            todo_batch_id: batchId,
+          },
+        };
+      });
+    } catch (dispatchError) {
+      setRuntimeError(String(dispatchError || "Unable to dispatch todos."));
+    } finally {
+      setDispatchTodosPendingNodeId((current) => (current === nodeId ? "" : current));
+    }
+  }, [busy, dispatchTodosPendingNodeId, loopspaceId, onActivateWorkspaceForTodoDispatch, updateDispatchTodosNodeProps]);
+
   const openLoopspaceGraphNodeSettings = useCallback((node) => {
     const nodeId = String(node?.id || "").trim();
     if (!nodeId) return;
@@ -9352,6 +9663,21 @@ function LoopspaceRuntimeView({
       setSendMessageSettingsTab("model");
       const draft = loopspaceSendMessageDraftFromNode(node, loopspaceAgentLaunchDefaultsRef.current);
       setSendMessageSettingsDrafts((current) => (
+        Object.prototype.hasOwnProperty.call(current, nodeId)
+          ? current
+          : {
+              ...current,
+              [nodeId]: draft,
+          }
+      ));
+    }
+    if (node.nodeKind === "dispatch_todos") {
+      const draft = loopspaceDispatchTodosDraftFromNode(
+        node,
+        loopspaceAgentLaunchDefaultsRef.current,
+        loopspaceRef.current,
+      );
+      setDispatchTodosSettingsDrafts((current) => (
         Object.prototype.hasOwnProperty.call(current, nodeId)
           ? current
           : {
@@ -10767,7 +11093,14 @@ function LoopspaceRuntimeView({
       ].filter(Boolean).join(" - ");
       return {
         canResume: node?.nodeKind === "send_message" && loopspaceRuntimeStateCanResume({ details: event?.details, event, status }),
-        configurable: node && ["asset_read", "asset_write", "document_read", "document_write", "send_message"].includes(node.nodeKind),
+        configurable: node && [
+          "asset_read",
+          "asset_write",
+          "dispatch_todos",
+          "document_read",
+          "document_write",
+          "send_message",
+        ].includes(node.nodeKind),
         detailRows: [
           ["Type", kindLabel],
           targetLabel ? ["Target", targetLabel] : null,
@@ -10855,6 +11188,8 @@ function LoopspaceRuntimeView({
         ? loopspaceTriggerTypeLabel(triggerType || "manual")
         : node.nodeKind === "send_message"
           ? "Send message"
+          : node.nodeKind === "dispatch_todos"
+            ? "Dispatch todos"
           : node.nodeKind === "run_script"
             ? "Run script"
             : node.nodeKind === "document_read"
@@ -10884,6 +11219,7 @@ function LoopspaceRuntimeView({
         configurable: [
           "asset_read",
           "asset_write",
+          "dispatch_todos",
           "document_read",
           "document_write",
           "send_message",
@@ -11414,6 +11750,228 @@ function LoopspaceRuntimeView({
         </LoopspaceRuntimePanelSettingsInspector>
       );
     }
+    if (node.nodeKind === "dispatch_todos") {
+      const dispatchNodeDraft = loopspaceDispatchTodosDraftFromNode(node, agentLaunchDefaults, loopspace);
+      const dispatchDraft = Object.prototype.hasOwnProperty.call(dispatchTodosSettingsDrafts, node.id)
+        ? normalizeLoopspaceDispatchTodosDraft(dispatchTodosSettingsDrafts[node.id], agentLaunchDefaults)
+        : dispatchNodeDraft;
+      const dispatchModelOptions = getAgentLaunchModelOptions(dispatchDraft.target_agent_id);
+      const dispatchModelOptionValues = new Set(dispatchModelOptions.map((option) => option.value));
+      const dispatchEffortOptions = getAgentLaunchEffortOptions(
+        dispatchDraft.target_agent_id,
+        dispatchDraft.model,
+      );
+      const dispatchSpeedOptions = getAgentLaunchSpeedOptions(
+        dispatchDraft.target_agent_id,
+        dispatchDraft.model,
+      );
+      const dispatchPending = dispatchTodosPendingNodeId === node.id;
+      const dispatchWorkspaceCount = loopspaceDispatchTodosSplitList(dispatchDraft.target_workspace_ids).length;
+      const dispatchTodoCount = loopspaceDispatchTodosLinesFromText(dispatchDraft.todo_lines).length;
+      return (
+        <LoopspaceRuntimePanelSettingsInspector data-kind="dispatch_todos">
+          {renderSettingsHeader("Dispatch todos")}
+          <LoopspaceGraphMessageSettingsPanel
+            data-layout="tabs"
+            onPointerDown={(event) => event.stopPropagation()}
+            onWheel={(event) => event.stopPropagation()}
+          >
+            <LoopspaceGraphMessageSettingsTabPanel role="tabpanel">
+              <LoopspaceGraphMessageSettingsSection data-column="model">
+                <LoopspaceGraphMessageSettingsGrid>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Device</span>
+                    <AppSelect
+                      isDisabled={busy || dispatchPending}
+                      onChange={(value) => {
+                        const deviceId = String(value || "").trim();
+                        const device = loopspaceGraphDeviceOptions.find((option) => (
+                          option.id === deviceId || loopspaceGraphDeviceOptionMatches(option, deviceId)
+                        ));
+                        updateDispatchTodosSettingsDraft(node.id, {
+                          device_id: device?.id || "",
+                          device_label: device?.label || "",
+                        });
+                      }}
+                      options={[
+                        { value: "", label: "Current device" },
+                        ...loopspaceGraphDeviceOptions.map((device) => ({ value: device.id, label: device.label })),
+                      ]}
+                      value={dispatchDraft.device_id}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Workspaces</span>
+                    <LoopspaceGraphDocumentSearch
+                      aria-label="Target workspace ids"
+                      disabled={busy || dispatchPending}
+                      onChange={(event) => updateDispatchTodosSettingsDraft(node.id, {
+                        target_workspace_ids: event.target.value,
+                      })}
+                      placeholder="workspace-id, another-workspace"
+                      value={dispatchDraft.target_workspace_ids}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Terminal ID</span>
+                    <LoopspaceGraphDocumentSearch
+                      aria-label="Target terminal id"
+                      disabled={busy || dispatchPending}
+                      onChange={(event) => updateDispatchTodosSettingsDraft(node.id, {
+                        target_terminal_id: event.target.value,
+                      })}
+                      placeholder="Optional pane id"
+                      value={dispatchDraft.target_terminal_id}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Terminal name</span>
+                    <LoopspaceGraphDocumentSearch
+                      aria-label="Target terminal name"
+                      disabled={busy || dispatchPending}
+                      onChange={(event) => updateDispatchTodosSettingsDraft(node.id, {
+                        target_terminal_name: event.target.value,
+                      })}
+                      placeholder="Optional name"
+                      value={dispatchDraft.target_terminal_name}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Terminal index</span>
+                    <LoopspaceGraphDocumentSearch
+                      aria-label="Target terminal index"
+                      disabled={busy || dispatchPending}
+                      onChange={(event) => updateDispatchTodosSettingsDraft(node.id, {
+                        target_terminal_index: event.target.value,
+                      })}
+                      placeholder="Optional number"
+                      value={dispatchDraft.target_terminal_index}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Enable wait</span>
+                    <LoopspaceGraphDocumentSearch
+                      aria-label="Workspace enable wait milliseconds"
+                      disabled={busy || dispatchPending}
+                      onChange={(event) => updateDispatchTodosSettingsDraft(node.id, {
+                        enable_wait_ms: event.target.value,
+                      })}
+                      placeholder="30000"
+                      value={dispatchDraft.enable_wait_ms}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Agent</span>
+                    <AppSelect
+                      isDisabled={busy || dispatchPending}
+                      onChange={(value) => {
+                        const targetAgentId = normalizeLoopspaceSendMessageAgentId(value);
+                        const launchDefault = getAgentLaunchDefault(targetAgentId, agentLaunchDefaults);
+                        updateDispatchTodosSettingsDraft(node.id, {
+                          model: launchDefault.model,
+                          reasoning_effort: launchDefault.effort,
+                          speed: launchDefault.speed,
+                          target_agent_id: targetAgentId,
+                        });
+                      }}
+                      options={LOOPSPACE_SEND_MESSAGE_AGENT_OPTIONS.map((agent) => ({ value: agent.id, label: agent.label }))}
+                      value={dispatchDraft.target_agent_id}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Model</span>
+                    <AppSelect
+                      isDisabled={busy || dispatchPending}
+                      onChange={(value) => {
+                        const model = cleanAgentLaunchModelId(value, dispatchDraft.model);
+                        const resolved = resolveAgentLaunchDefaultForModel(
+                          dispatchDraft.target_agent_id,
+                          agentLaunchDefaults,
+                          model,
+                        );
+                        updateDispatchTodosSettingsDraft(node.id, {
+                          model: resolved.model,
+                          reasoning_effort: resolved.effort,
+                          speed: resolved.speed,
+                        });
+                      }}
+                      options={[
+                        ...(dispatchDraft.model && !dispatchModelOptionValues.has(dispatchDraft.model)
+                          ? [{ value: dispatchDraft.model, label: dispatchDraft.model }]
+                          : []),
+                        ...dispatchModelOptions.map((modelOption) => ({ value: modelOption.value, label: modelOption.label })),
+                      ]}
+                      value={dispatchDraft.model}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Thinking</span>
+                    <AppSelect
+                      isDisabled={busy || dispatchPending}
+                      onChange={(value) => updateDispatchTodosSettingsDraft(node.id, {
+                        reasoning_effort: value,
+                      })}
+                      options={dispatchEffortOptions.map((effortOption) => ({ value: effortOption.value, label: effortOption.label }))}
+                      value={dispatchDraft.reasoning_effort}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                  <LoopspaceGraphMessageSettingsField>
+                    <span>Speed</span>
+                    <AppSelect
+                      isDisabled={busy || dispatchPending || dispatchSpeedOptions.length <= 1}
+                      onChange={(value) => updateDispatchTodosSettingsDraft(node.id, {
+                        speed: value,
+                      })}
+                      options={dispatchSpeedOptions.map((speedOption) => ({ value: speedOption.value, label: speedOption.label }))}
+                      value={dispatchDraft.speed}
+                    />
+                  </LoopspaceGraphMessageSettingsField>
+                </LoopspaceGraphMessageSettingsGrid>
+              </LoopspaceGraphMessageSettingsSection>
+              <LoopspaceGraphMessageSettingsSection data-column="prompt" data-grow="true">
+                <LoopspaceGraphMessagePrompt
+                  aria-label={`Todos for ${node.label}`}
+                  disabled={busy || dispatchPending}
+                  onChange={(event) => updateDispatchTodosSettingsDraft(node.id, {
+                    todo_lines: event.target.value,
+                  })}
+                  placeholder="One todo per line"
+                  value={dispatchDraft.todo_lines}
+                />
+              </LoopspaceGraphMessageSettingsSection>
+            </LoopspaceGraphMessageSettingsTabPanel>
+            <LoopspaceGraphMessageSettingsActions>
+              <LoopspaceGraphMessageSubnodeButton
+                disabled={busy || dispatchPending || !dispatchWorkspaceCount || !dispatchTodoCount}
+                onClick={() => {
+                  void dispatchLoopspaceTodosNode(node, dispatchDraft);
+                }}
+                type="button"
+              >
+                {dispatchPending ? "Queueing..." : "Queue todos"}
+              </LoopspaceGraphMessageSubnodeButton>
+              <LoopspaceGraphMessageSaveButton
+                disabled={busy || dispatchPending}
+                onClick={() => {
+                  void saveDispatchTodosSettings(node, dispatchDraft);
+                }}
+                type="button"
+              >
+                Save
+              </LoopspaceGraphMessageSaveButton>
+              <LoopspaceGraphMessageSaveButton
+                data-variant="secondary"
+                disabled={busy || dispatchPending}
+                onClick={() => cancelDispatchTodosSettings(node.id)}
+                type="button"
+              >
+                Cancel
+              </LoopspaceGraphMessageSaveButton>
+            </LoopspaceGraphMessageSettingsActions>
+          </LoopspaceGraphMessageSettingsPanel>
+        </LoopspaceRuntimePanelSettingsInspector>
+      );
+    }
     if (node.nodeKind !== "send_message") {
       return (
         <LoopspaceRuntimePanelSettingsInspector data-kind={row?.kind || node.nodeKind || "loop"}>
@@ -11766,11 +12324,13 @@ function LoopspaceRuntimeView({
                     ? Devices
                     : node.nodeKind === "run_script"
                       ? Terminal
-                    : node.nodeKind === "send_message"
-                    ? AdsClick
-                    : node.nodeKind === "asset_read" || node.nodeKind === "asset_write"
-                    ? PermMedia
-                    : AccountTree;
+                      : node.nodeKind === "send_message"
+                        ? AdsClick
+                        : node.nodeKind === "dispatch_todos"
+                          ? Send
+                          : node.nodeKind === "asset_read" || node.nodeKind === "asset_write"
+                            ? PermMedia
+                            : AccountTree;
                 const isRuntimeNode = activeRuntimeStatus && String(runtimeHead?.currentNodeId || runtimeHead?.current_node_id || runtimeHead?.cursorNodeId || runtimeHead?.cursor_node_id || "") === node.id;
                 const nodeLayout = graphNodeLayouts.get(node.id) || loopspaceGraphNodeLayout(node, index);
                 const isManualTriggerNode = isTriggerNode && nodeTriggerType === "manual";
@@ -11868,6 +12428,37 @@ function LoopspaceRuntimeView({
                   ? String(loopspaceGraphPropValue(node.props, ["prompt", "message", "body", "instructions"]) || "")
                   : "";
                 const isSendMessageRegion = node.nodeKind === "send_message";
+                const isDispatchTodosNode = node.nodeKind === "dispatch_todos";
+                const dispatchTodosDraft = isDispatchTodosNode
+                  ? loopspaceDispatchTodosDraftFromNode(node, agentLaunchDefaults, loopspace)
+                  : null;
+                const dispatchTodosBatchId = isDispatchTodosNode
+                  ? loopspaceDispatchTodosBatchId(loopspaceId, node, dispatchTodosDraft)
+                  : "";
+                const dispatchTodosWorkspaceCount = isDispatchTodosNode
+                  ? loopspaceDispatchTodosSplitList(dispatchTodosDraft.target_workspace_ids).length
+                  : 0;
+                const dispatchTodosTodoCount = isDispatchTodosNode
+                  ? loopspaceDispatchTodosLinesFromText(dispatchTodosDraft.todo_lines).length
+                  : 0;
+                const dispatchTodosRows = isDispatchTodosNode
+                  ? loopspaceDispatchTodoCarouselRows(
+                    workspaceTodos,
+                    dispatchTodosLocalItemsByBatch[dispatchTodosBatchId] || [],
+                    loopspaceId,
+                    node,
+                  )
+                  : [];
+                const dispatchTodosPending = isDispatchTodosNode && dispatchTodosPendingNodeId === node.id;
+                const dispatchTodosTargetLabel = isDispatchTodosNode
+                  ? dispatchTodosDraft.target_terminal_id
+                    ? `Terminal ${dispatchTodosDraft.target_terminal_id}`
+                    : dispatchTodosDraft.target_terminal_name
+                      ? `Terminal ${dispatchTodosDraft.target_terminal_name}`
+                      : dispatchTodosWorkspaceCount
+                        ? `${dispatchTodosWorkspaceCount} workspace${dispatchTodosWorkspaceCount === 1 ? "" : "s"}`
+                        : "Choose workspaces"
+                  : "";
                 const sendMessageRuntimeState = isSendMessageRegion
                   ? runtimeStateByNodeId.get(node.id)
                   : null;
@@ -11877,7 +12468,7 @@ function LoopspaceRuntimeView({
                   && loopspaceRuntimeStateCanResume(sendMessageRuntimeState);
 	                const nodeVisualDefaults = contractLoopspaceGraphVisualDefaultsForNode(node);
 	                const isSizedGraphNode = Boolean(nodeVisualDefaults.sized);
-	                const hasGraphNodeSettings = isSendMessageRegion || isResourceContextNode;
+	                const hasGraphNodeSettings = isSendMessageRegion || isResourceContextNode || isDispatchTodosNode;
 	                const nodeSettingsSelected = hasGraphNodeSettings && settingsNodeId === node.id && runtimePanelTab === "settings";
 	                const sendMessageSettingsOpen = false;
                 const sendMessageCheckpoints = isSendMessageRegion
@@ -11979,6 +12570,8 @@ function LoopspaceRuntimeView({
                   ? "Run script"
                   : node.nodeKind === "device"
                     ? graphDeviceLabel
+                    : isDispatchTodosNode
+                      ? "Dispatch todos"
                     : isDocumentContextNode
                       ? (isDocumentReadNode ? "Document read" : "Document write")
                       : isAssetContextNode
@@ -11993,8 +12586,13 @@ function LoopspaceRuntimeView({
                       ].filter(Boolean).join(" - ")
                     : node.nodeKind === "run_script"
                       ? "Run script"
-                      : node.nodeKind === "send_message"
-                        ? "Send message"
+                    : node.nodeKind === "send_message"
+                      ? "Send message"
+                      : isDispatchTodosNode
+                        ? [
+                            dispatchTodosTodoCount ? `${dispatchTodosTodoCount} todo${dispatchTodosTodoCount === 1 ? "" : "s"}` : "Queued todos",
+                            dispatchTodosTargetLabel,
+                          ].filter(Boolean).join(" - ")
                         : isDocumentReadNode
                           ? "Readable docs"
                         : isDocumentWriteNode
@@ -12167,6 +12765,41 @@ function LoopspaceRuntimeView({
                           options={loopspaceGraphDeviceOptions}
                           selectedKey={sendMessageDeviceId}
                         />
+                      ) : null}
+                      {isDispatchTodosNode ? (
+                        <>
+                          <LoopspaceGraphNodeDeviceBadge
+                            title={[
+                              dispatchTodosTargetLabel,
+                              dispatchTodosDraft.device_label || dispatchTodosDraft.device_id,
+                              dispatchTodosDraft.target_agent_id,
+                            ].filter(Boolean).join(" - ")}
+                          >
+                            <Send aria-hidden="true" />
+                            <span>{dispatchTodosPending ? "Queueing" : dispatchTodosTargetLabel}</span>
+                          </LoopspaceGraphNodeDeviceBadge>
+                          {dispatchTodosRows.length ? (
+                            <LoopspaceDispatchTodoCarousel aria-label="Dispatched todo status">
+                              {dispatchTodosRows.map((row) => (
+                                <LoopspaceDispatchTodoRow
+                                  data-current={row.current ? "true" : undefined}
+                                  key={row.id}
+                                >
+                                  <LoopspaceDispatchTodoStatusDot
+                                    aria-label={row.status}
+                                    data-status={row.status}
+                                  />
+                                  <LoopspaceDispatchTodoNumber>{row.number}</LoopspaceDispatchTodoNumber>
+                                  <span>{row.text}</span>
+                                </LoopspaceDispatchTodoRow>
+                              ))}
+                            </LoopspaceDispatchTodoCarousel>
+                          ) : (
+                            <LoopspaceDispatchTodoEmpty>
+                              {dispatchTodosTodoCount ? "Ready to queue" : "No todos configured"}
+                            </LoopspaceDispatchTodoEmpty>
+                          )}
+                        </>
                       ) : null}
                       {node.nodeKind === "run_script" ? (
                         <LoopspaceGraphNodeDeviceBadge title={runScriptDeviceStatus ? `${runScriptDeviceLabel} - ${runScriptDeviceStatus}` : runScriptDeviceLabel}>
@@ -12622,7 +13255,7 @@ function LoopspaceRuntimeView({
                           data-tone={port.tone}
                           key={port.id}
                         >
-                          {node.nodeKind === "run_script" || node.nodeKind === "send_message" ? <span>{port.label}</span> : null}
+                          {node.nodeKind === "run_script" || node.nodeKind === "send_message" || node.nodeKind === "dispatch_todos" ? <span>{port.label}</span> : null}
                           <LoopspaceGraphNodePort
                             aria-label={`Connect ${port.label} from ${trigger?.name || node.label}`}
                             data-active={pendingConnection?.fromId === node.id && pendingConnection?.fromPort === port.id ? "true" : undefined}
@@ -12670,8 +13303,10 @@ function LoopspaceRuntimeView({
                   ? Devices
                   : node.nodeKind === "run_script"
                     ? Terminal
-                    : node.nodeKind === "send_message"
-                      ? AdsClick
+                  : node.nodeKind === "send_message"
+                    ? AdsClick
+                    : node.nodeKind === "dispatch_todos"
+                      ? Send
                       : node.nodeKind === "document_read" || node.nodeKind === "document_write"
                         ? AccountTree
                       : node.nodeKind === "asset_read" || node.nodeKind === "asset_write"
@@ -12701,7 +13336,7 @@ function LoopspaceRuntimeView({
                     </LoopspaceGraphNodeIcon>
                     <LoopspaceGraphNodeText>
                       <strong>{node.label || "Drop node"}</strong>
-                      <span>{node.nodeKind === "device" ? "Device" : node.nodeKind === "run_script" ? "Run script" : node.nodeKind === "send_message" ? "Send message region" : node.nodeKind === "document_read" || node.nodeKind === "document_write" ? "Document context" : node.nodeKind === "asset_read" || node.nodeKind === "asset_write" ? "Asset context" : "Pending drop"}</span>
+                      <span>{node.nodeKind === "device" ? "Device" : node.nodeKind === "run_script" ? "Run script" : node.nodeKind === "send_message" ? "Send message region" : node.nodeKind === "dispatch_todos" ? "Dispatch todos" : node.nodeKind === "document_read" || node.nodeKind === "document_write" ? "Document context" : node.nodeKind === "asset_read" || node.nodeKind === "asset_write" ? "Asset context" : "Pending drop"}</span>
                     </LoopspaceGraphNodeText>
                   </LoopspaceGraphNode>
                 );
@@ -12972,6 +13607,8 @@ function LoopspaceRuntimeView({
                         ? Terminal
                         : template.id === "send_message"
                           ? AdsClick
+                          : template.id === "dispatch_todos"
+                            ? Send
                           : template.id === "document_read" || template.id === "document_write"
                             ? AccountTree
                           : template.id === "asset_read" || template.id === "asset_write"
@@ -13017,6 +13654,8 @@ function LoopspaceRuntimeView({
 		                        const settingsCardRow = Math.floor(index / settingsPanelColumnCount);
 		                        const SettingsIcon = row.kind === "send_message"
 		                          ? AdsClick
+                              : row.kind === "dispatch_todos"
+                                ? Send
 	                          : row.kind === "run_script"
 	                            ? Terminal
 	                            : row.kind === "asset_read" || row.kind === "asset_write"
@@ -19797,6 +20436,76 @@ function workspacePaneKindLabel(kind) {
   return "Panel";
 }
 
+function workspacePanelSnapshotText(value) {
+  if (value === null || value === undefined) return "";
+  return String(value).trim();
+}
+
+function workspacePanelSnapshotBool(value) {
+  if (value === true) return true;
+  if (value === false || value === null || value === undefined) return false;
+  const text = workspacePanelSnapshotText(value).toLowerCase();
+  return text === "1" || text === "true" || text === "yes" || text === "on";
+}
+
+function workspacePanelSnapshotStatus(panel = {}) {
+  return workspacePanelSnapshotText(
+    panel.display_status
+      || panel.displayStatus
+      || panel.status
+      || panel.state
+      || panel.lifecycle,
+  ).toLowerCase();
+}
+
+function workspacePanelSnapshotDeleted(panel = {}) {
+  return workspacePanelSnapshotBool(panel.deleted)
+    || workspacePanelSnapshotBool(panel.tombstoned)
+    || workspacePanelSnapshotBool(panel.removed)
+    || workspacePanelSnapshotBool(panel.hidden)
+    || Boolean(workspacePanelSnapshotText(panel.deleted_at || panel.deletedAt))
+    || Boolean(workspacePanelSnapshotText(panel.removed_at || panel.removedAt))
+    || Boolean(workspacePanelSnapshotText(panel.tombstoned_at || panel.tombstonedAt));
+}
+
+function workspacePanelSnapshotLastKnown(panel = {}) {
+  return workspacePanelSnapshotBool(panel.last_known_runtime)
+    || workspacePanelSnapshotBool(panel.lastKnownRuntime)
+    || workspacePanelSnapshotBool(panel.runtime_read_only)
+    || workspacePanelSnapshotBool(panel.runtimeReadOnly);
+}
+
+function workspacePanelSnapshotCurrent(panel = {}, workspaceActive = false) {
+  if (workspacePanelSnapshotDeleted(panel)) {
+    return false;
+  }
+  const status = workspacePanelSnapshotStatus(panel);
+  if (["deleted", "hidden", "removed", "tombstone", "tombstoned"].some((token) => status.includes(token))) {
+    return false;
+  }
+  if (workspacePanelSnapshotLastKnown(panel)) {
+    return true;
+  }
+  if (!workspaceActive) {
+    return false;
+  }
+  if (["closed", "closing", "deactivated", "disabled", "disconnected", "exited", "inactive", "offline", "terminated"].some((token) => status.includes(token))) {
+    return false;
+  }
+  if (
+    workspacePanelSnapshotBool(panel.active)
+    || workspacePanelSnapshotBool(panel.connected)
+    || workspacePanelSnapshotBool(panel.native_connected)
+    || workspacePanelSnapshotBool(panel.nativeConnected)
+  ) {
+    return true;
+  }
+  if (status) {
+    return ["active", "busy", "connected", "idle", "loading", "open", "opening", "ready", "running", "starting"].some((token) => status.includes(token));
+  }
+  return Boolean(workspaceActive);
+}
+
 function buildWorkspacePanelSnapshot({
   kind,
   paneId,
@@ -19924,6 +20633,77 @@ function workspacePaneKindsWebIndexes(paneKinds) {
 
 function workspacePaneKindsPcbIndexes(paneKinds) {
   return workspacePaneKindsIndexes(paneKinds, WORKSPACE_PANE_KIND_PCB);
+}
+
+function getWorkspaceTerminalOnlyRolesForPaneKinds(
+  logicalIndexes,
+  terminalRoles,
+  paneKinds,
+  fallbackRole = "codex",
+) {
+  const indexes = normalizeWorkspaceTerminalSlotIndexes(logicalIndexes);
+  const roles = Array.isArray(terminalRoles) ? terminalRoles : [];
+  const panelIndexSet = new Set(workspacePaneKindsIndexes(paneKinds));
+
+  return indexes
+    .map((slotIndex, index) => ({
+      role: roles[index] || fallbackRole,
+      slotIndex,
+    }))
+    .filter(({ slotIndex }) => !panelIndexSet.has(slotIndex))
+    .map(({ role }) => role || fallbackRole);
+}
+
+function getWorkspaceDraftPanelPaneKinds(paneKinds, webPanelCount, pcbCount) {
+  const normalizedPaneKinds = normalizeWorkspacePaneKinds(paneKinds);
+  const nextPaneKinds = {};
+
+  workspacePaneKindsWebIndexes(normalizedPaneKinds)
+    .slice(0, normalizeWorkspaceWebPanelCount(webPanelCount))
+    .forEach((slotIndex) => {
+      nextPaneKinds[slotIndex] = WORKSPACE_PANE_KIND_WEB;
+    });
+  workspacePaneKindsPcbIndexes(normalizedPaneKinds)
+    .slice(0, normalizeWorkspacePcbCount(pcbCount))
+    .forEach((slotIndex) => {
+      nextPaneKinds[slotIndex] = WORKSPACE_PANE_KIND_PCB;
+    });
+
+  return nextPaneKinds;
+}
+
+function fillWorkspaceDraftPanelPaneKinds(paneKinds, usedIndexes, paneKind, targetCount) {
+  const nextPaneKinds = { ...normalizeWorkspacePaneKinds(paneKinds) };
+  const used = usedIndexes instanceof Set
+    ? usedIndexes
+    : new Set(
+      Array.from(usedIndexes || [])
+        .map((index) => Number.parseInt(index, 10))
+        .filter((index) => Number.isInteger(index)),
+    );
+  Object.keys(nextPaneKinds).forEach((index) => {
+    const slotIndex = Number.parseInt(index, 10);
+    if (Number.isInteger(slotIndex)) {
+      used.add(slotIndex);
+    }
+  });
+
+  const desiredCount = paneKind === WORKSPACE_PANE_KIND_PCB
+    ? normalizeWorkspacePcbCount(targetCount)
+    : normalizeWorkspaceWebPanelCount(targetCount);
+  let currentCount = workspacePaneKindsIndexes(nextPaneKinds, paneKind).length;
+  let nextSlotIndex = 0;
+
+  while (currentCount < desiredCount && nextSlotIndex < MAX_WORKSPACE_TERMINAL_COUNT) {
+    if (!used.has(nextSlotIndex)) {
+      nextPaneKinds[nextSlotIndex] = paneKind;
+      used.add(nextSlotIndex);
+      currentCount += 1;
+    }
+    nextSlotIndex += 1;
+  }
+
+  return nextPaneKinds;
 }
 
 function getWorkspaceWebPaneIndexes(workspaceSettings, workspaceId) {
@@ -20593,7 +21373,8 @@ export default function App() {
   const [workspaceTerminalCountDraft, setWorkspaceTerminalCountDraft] = useState("1");
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
   const [workspaceDocumentCountDraft, setWorkspaceDocumentCountDraft] = useState(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
-  const [, setWorkspacePcbCountDraft] = useState(String(DEFAULT_WORKSPACE_PCB_COUNT));
+  const [workspaceWebPanelCountDraft, setWorkspaceWebPanelCountDraft] = useState(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
+  const [workspacePcbCountDraft, setWorkspacePcbCountDraft] = useState(String(DEFAULT_WORKSPACE_PCB_COUNT));
   const [workspaceAgentPermissionsDraft, setWorkspaceAgentPermissionsDraft] = useState({});
   const [workspaceAgentSessionModeDraft, setWorkspaceAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
   const [workspaceInitializeGitDraft, setWorkspaceInitializeGitDraft] = useState(false);
@@ -24143,6 +24924,7 @@ export default function App() {
     setWorkspaceTerminalCountDraft("1");
     setWorkspaceTerminalRolesDraft(["codex"]);
     setWorkspaceDocumentCountDraft(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
+    setWorkspaceWebPanelCountDraft(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
     setWorkspacePcbCountDraft(String(DEFAULT_WORKSPACE_PCB_COUNT));
     setWorkspaceAgentPermissionsDraft(normalizeWorkspaceAgentPermissions(null));
     setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
@@ -24222,6 +25004,7 @@ export default function App() {
     setWorkspaceTerminalCountDraft("1");
     setWorkspaceTerminalRolesDraft(["codex"]);
     setWorkspaceDocumentCountDraft(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
+    setWorkspaceWebPanelCountDraft(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
     setWorkspacePcbCountDraft(String(DEFAULT_WORKSPACE_PCB_COUNT));
     setWorkspaceAgentPermissionsDraft(normalizeWorkspaceAgentPermissions(null));
     setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
@@ -24902,6 +25685,37 @@ export default function App() {
     updateWorkspaceLifecycleSettings,
     workspaces,
   ]);
+
+  const activateWorkspacesForLoopspaceTodoDispatch = useCallback(async ({
+    source = "loopspace_dispatch_todos",
+    waitMs = 30000,
+    workspaceIds = [],
+  } = {}) => {
+    const ids = Array.isArray(workspaceIds)
+      ? workspaceIds.map((id) => String(id || "").trim()).filter(Boolean)
+      : [];
+    if (!ids.length) {
+      return { activatedAny: false, workspaceIds: [] };
+    }
+    const enabledBefore = new Set(normalizeEnabledWorkspaceIds(
+      workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds,
+    ));
+    let activatedAny = false;
+    const activatedIds = [];
+    ids.forEach((workspaceId) => {
+      if (enabledBefore.has(workspaceId)) return;
+      if (activateWorkspace(workspaceId, source)) {
+        activatedAny = true;
+        activatedIds.push(workspaceId);
+        enabledBefore.add(workspaceId);
+      }
+    });
+    const delayMs = Math.max(0, Math.min(120000, Number(waitMs) || 0));
+    if (activatedAny && delayMs > 0) {
+      await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+    }
+    return { activatedAny, activatedIds, workspaceIds: ids };
+  }, [activateWorkspace]);
 
   const scheduleWorkspaceActivationAfterPaint = useCallback((workspaceId, source = "workspace_activation", trace = null) => {
     const safeWorkspaceId = String(workspaceId || "").trim();
@@ -27385,6 +28199,8 @@ export default function App() {
     const workspaceNameValue = workspaceNameDraft;
     const terminalCount = normalizeWorkspaceTerminalCount(workspaceTerminalCountDraft);
     const documentsCount = normalizeWorkspaceDocumentCount(workspaceDocumentCountDraft);
+    const webPanelCount = normalizeWorkspaceWebPanelCount(workspaceWebPanelCountDraft);
+    const pcbPanelCount = normalizeWorkspacePcbCount(workspacePcbCountDraft);
     const terminalRoles = normalizeWorkspaceTerminalRoles(
       workspaceTerminalRolesDraft,
       terminalCount,
@@ -27417,7 +28233,6 @@ export default function App() {
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     );
-    const terminalRolesChanged = !areWorkspaceTerminalRolesEqual(currentTerminalRoles, terminalRoles);
 
     if (authState !== "authenticated") {
       expireDesktopSession("Desktop session required to update workspace settings.");
@@ -27482,28 +28297,66 @@ export default function App() {
         selectedWorkspace.id,
         currentTerminalCount,
       );
-      // Panel panes share the slot space but are managed live (not via this
-      // draft). Partition them out so the harness reconcile only touches
-      // terminal slots, then re-add panel slots when persisting.
+      // Panel panes share the slot space. Preserve requested existing panel
+      // slots first, reconcile terminal slots around them, then allocate any
+      // additional draft panel panes into the remaining free slots.
       const settingsPaneKinds = getWorkspacePaneKinds(workspaceSettings, selectedWorkspace.id);
-      const settingsPanelIndexes = workspacePaneKindsIndexes(settingsPaneKinds);
-      const settingsPanelIndexSet = new Set(settingsPanelIndexes);
-      const settingsTerminalCurrentIndexes = currentTerminalIndexes.filter((index) => !settingsPanelIndexSet.has(index));
+      const currentPanelIndexes = workspacePaneKindsIndexes(settingsPaneKinds);
+      const currentPanelIndexSet = new Set(currentPanelIndexes);
+      const settingsTerminalCurrentIndexes = currentTerminalIndexes.filter((index) => !currentPanelIndexSet.has(index));
+      const currentTerminalRoleByIndex = new Map(currentTerminalIndexes.map((terminalIndex, index) => (
+        [terminalIndex, currentTerminalRoles[index] || workspaceTerminalFallbackRole]
+      )));
+      const currentTerminalOnlyRoles = settingsTerminalCurrentIndexes.map((terminalIndex) => (
+        currentTerminalRoleByIndex.get(terminalIndex) || workspaceTerminalFallbackRole
+      ));
+      const terminalRolesChanged = !areWorkspaceTerminalRolesEqual(currentTerminalOnlyRoles, terminalRoles);
+      const panelSlotCapacity = Math.max(0, MAX_WORKSPACE_TERMINAL_COUNT - terminalCount);
+      const desiredWebPanelCount = Math.min(webPanelCount, panelSlotCapacity);
+      const desiredPcbPanelCount = Math.min(
+        pcbPanelCount,
+        Math.max(0, panelSlotCapacity - desiredWebPanelCount),
+      );
+      let settingsStoredPaneKinds = getWorkspaceDraftPanelPaneKinds(
+        settingsPaneKinds,
+        desiredWebPanelCount,
+        desiredPcbPanelCount,
+      );
+      const keptPanelIndexes = workspacePaneKindsIndexes(settingsStoredPaneKinds);
       const rootChanged = false;
       const terminalNextIndexes = rootChanged
-        ? getDefaultTerminalIndexes(terminalCount)
-        : reconcileWorkspaceTerminalSlotIndexesExcluding(settingsTerminalCurrentIndexes, terminalCount, settingsPanelIndexes);
+        ? reconcileWorkspaceTerminalSlotIndexesExcluding(getDefaultTerminalIndexes(terminalCount), terminalCount, keptPanelIndexes)
+        : reconcileWorkspaceTerminalSlotIndexesExcluding(settingsTerminalCurrentIndexes, terminalCount, keptPanelIndexes);
       const terminalRoleByIndex = new Map(terminalNextIndexes.map((slotIndex, index) => [slotIndex, terminalRoles[index]]));
-      const nextTerminalIndexes = [...terminalNextIndexes, ...settingsPanelIndexes];
+      const usedDraftSlotIndexes = new Set([
+        ...terminalNextIndexes,
+        ...keptPanelIndexes,
+      ]);
+      settingsStoredPaneKinds = fillWorkspaceDraftPanelPaneKinds(
+        settingsStoredPaneKinds,
+        usedDraftSlotIndexes,
+        WORKSPACE_PANE_KIND_WEB,
+        desiredWebPanelCount,
+      );
+      settingsStoredPaneKinds = fillWorkspaceDraftPanelPaneKinds(
+        settingsStoredPaneKinds,
+        usedDraftSlotIndexes,
+        WORKSPACE_PANE_KIND_PCB,
+        desiredPcbPanelCount,
+      );
+      const settingsPanelIndexes = workspacePaneKindsIndexes(settingsStoredPaneKinds);
+      const settingsPanelIndexSet = new Set(settingsPanelIndexes);
+      const nextTerminalIndexes = normalizeWorkspaceTerminalSlotIndexes([
+        ...terminalNextIndexes,
+        ...settingsPanelIndexes,
+      ]);
       const effectiveTerminalRoles = nextTerminalIndexes.map((slotIndex) => (
         settingsPanelIndexSet.has(slotIndex)
           ? workspaceTerminalFallbackRole
           : (terminalRoleByIndex.get(slotIndex) || workspaceTerminalFallbackRole)
       ));
       const effectiveTerminalCount = nextTerminalIndexes.length;
-      const settingsStoredPaneKinds = Object.fromEntries(
-        settingsPanelIndexes.map((slotIndex) => [slotIndex, settingsPaneKinds[slotIndex]]),
-      );
+      const effectiveWebPanelCount = workspacePaneKindsWebIndexes(settingsStoredPaneKinds).length;
       const effectivePcbCount = workspacePaneKindsPcbIndexes(settingsStoredPaneKinds).length;
       const nextTerminalIndexSet = new Set(nextTerminalIndexes);
       const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
@@ -27520,21 +28373,21 @@ export default function App() {
         : false;
       const previousMcpRepoPath = currentRootDirectory || defaultWorkingDirectory;
       const nextMcpRepoPath = rootDirectory || defaultWorkingDirectory;
-      const removedTerminalIndexes = currentTerminalIndexes.filter((terminalIndex) => (
+      const removedTerminalIndexes = settingsTerminalCurrentIndexes.filter((terminalIndex) => (
         !nextTerminalIndexSet.has(terminalIndex)
       ));
-      const roleChangedTerminalIndexes = currentTerminalIndexes.filter((terminalIndex, index) => (
+      const roleChangedTerminalIndexes = settingsTerminalCurrentIndexes.filter((terminalIndex) => (
         nextTerminalIndexSet.has(terminalIndex)
-        && currentTerminalRoles[index] !== nextTerminalRoleByIndex.get(terminalIndex)
+        && currentTerminalRoleByIndex.get(terminalIndex) !== nextTerminalRoleByIndex.get(terminalIndex)
       ));
       const terminalIndexesToClose = (rootChanged || gitWorktreesChanged || agentPermissionsChanged
-        ? currentTerminalIndexes
+        ? settingsTerminalCurrentIndexes
         : Array.from(new Set([
           ...removedTerminalIndexes,
           ...roleChangedTerminalIndexes,
         ])))
         // Panel panes have no PTY/agent; never close them as terminals.
-        .filter((terminalIndex) => !settingsPanelIndexSet.has(terminalIndex));
+        .filter((terminalIndex) => !currentPanelIndexSet.has(terminalIndex));
       let nextWorkspace = selectedWorkspace;
 
 
@@ -27703,6 +28556,7 @@ export default function App() {
       setWorkspaceRootDraft(rootDirectory);
       setWorkspaceTerminalCountDraft(String(terminalCount));
       setWorkspaceDocumentCountDraft(String(documentsCount));
+      setWorkspaceWebPanelCountDraft(String(effectiveWebPanelCount));
       setWorkspacePcbCountDraft(String(effectivePcbCount));
       setWorkspaceTerminalRolesDraft(terminalRoles);
       setWorkspaceAgentPermissionsDraft(agentPermissions);
@@ -27728,6 +28582,8 @@ export default function App() {
     expireDesktopSession,
     workspaceNameDraft,
     workspaceDocumentCountDraft,
+    workspaceWebPanelCountDraft,
+    workspacePcbCountDraft,
     workspaceAgentSessionModeDraft,
     workspaceAgentPermissionsDraft,
     workspaceInitializeGitDraft,
@@ -27804,6 +28660,7 @@ export default function App() {
     });
     const nextPaneKinds = { ...getWorkspacePaneKinds(currentSettings, workspaceId) };
     delete nextPaneKinds[removedTerminalIndex];
+    const nextWebPanelCount = workspacePaneKindsWebIndexes(nextPaneKinds).length;
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
@@ -27847,8 +28704,15 @@ export default function App() {
     }
 
     if (workspaceSettingsModalId === workspaceId) {
-      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
-      setWorkspaceTerminalRolesDraft(nextTerminalRoles);
+      const nextTerminalOnlyRoles = getWorkspaceTerminalOnlyRolesForPaneKinds(
+        nextIndexes,
+        nextTerminalRoles,
+        nextPaneKinds,
+        workspaceTerminalFallbackRole,
+      );
+      setWorkspaceTerminalCountDraft(String(Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextTerminalOnlyRoles.length)));
+      setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
+      setWorkspaceWebPanelCountDraft(String(nextWebPanelCount));
       setWorkspacePcbCountDraft(String(nextPcbCount));
     }
   }, [
@@ -27938,6 +28802,8 @@ export default function App() {
     } else {
       delete nextPaneKinds[nextTerminalIndex];
     }
+    const nextWebPanelCount = workspacePaneKindsWebIndexes(nextPaneKinds).length;
+    const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
     const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
     const nextDisplayRows = insertLogicalTerminalInDisplayRows(
       currentRows,
@@ -27953,7 +28819,7 @@ export default function App() {
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
-      pcbCount: workspacePaneKindsPcbIndexes(nextPaneKinds).length,
+      pcbCount: nextPcbCount,
       paneKinds: nextPaneKinds,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
@@ -27976,8 +28842,16 @@ export default function App() {
     persistWorkspaceSettings(nextSettings);
 
     if (workspaceSettingsModalId === workspaceId) {
-      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
-      setWorkspaceTerminalRolesDraft(nextTerminalRoles);
+      const nextTerminalOnlyRoles = getWorkspaceTerminalOnlyRolesForPaneKinds(
+        nextIndexes,
+        nextTerminalRoles,
+        nextPaneKinds,
+        workspaceTerminalFallbackRole,
+      );
+      setWorkspaceTerminalCountDraft(String(Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextTerminalOnlyRoles.length)));
+      setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
+      setWorkspaceWebPanelCountDraft(String(nextWebPanelCount));
+      setWorkspacePcbCountDraft(String(nextPcbCount));
     }
   }, [
     workspaceSettingsModalId,
@@ -28013,25 +28887,6 @@ export default function App() {
       workspaceId,
       terminalCount,
     );
-
-    if (currentIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
-      return null;
-    }
-
-    let nextTerminalIndex = -1;
-    for (let index = 0; index < MAX_WORKSPACE_TERMINAL_COUNT; index += 1) {
-      if (!currentIndexes.includes(index)) {
-        nextTerminalIndex = index;
-        break;
-      }
-    }
-
-    if (nextTerminalIndex < 0) {
-      return null;
-    }
-
-    workspaceTerminalExplicitEmptyRef.current.delete(workspaceId);
-
     const currentRoles = getWorkspaceTerminalRoles(
       currentSettings,
       workspaceId,
@@ -28057,6 +28912,61 @@ export default function App() {
         || session_id
         || "",
     ).trim();
+    if (requestedProviderSessionId) {
+      const existingTerminal = currentIndexes
+        .map((terminalIndex) => {
+          const terminalRole = normalizeWorkspaceTerminalRole(
+            roleByIndex[terminalIndex] || nextRole,
+            workspaceTerminalFallbackRole,
+            workspaceTerminalRoleOptions,
+          );
+          const thread = resolvePreparedWorkspaceTerminalThread(workspaceThreadsRef.current, {
+            agentId: terminalRole,
+            terminalIndex,
+            workspaceId,
+          });
+          const threadProviderSessionId = getPreparedWorkspaceThreadProviderSessionId(thread, terminalRole);
+          if (threadProviderSessionId !== requestedProviderSessionId) {
+            return null;
+          }
+          return {
+            paneId: getWorkspaceTerminalPaneId(
+              workspaceId,
+              terminalIndex,
+              getWorkspaceTerminalPaneAgentId(terminalRole),
+            ),
+            providerSessionId: requestedProviderSessionId,
+            reused: true,
+            terminalIndex,
+            terminalRole,
+            threadId: thread?.id || createWorkspaceThreadId(workspaceId, terminalIndex),
+            workspaceId,
+          };
+        })
+        .find(Boolean);
+      if (existingTerminal) {
+        return existingTerminal;
+      }
+    }
+
+    if (currentIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
+      return null;
+    }
+
+    let nextTerminalIndex = -1;
+    for (let index = 0; index < MAX_WORKSPACE_TERMINAL_COUNT; index += 1) {
+      if (!currentIndexes.includes(index)) {
+        nextTerminalIndex = index;
+        break;
+      }
+    }
+
+    if (nextTerminalIndex < 0) {
+      return null;
+    }
+
+    workspaceTerminalExplicitEmptyRef.current.delete(workspaceId);
+
     const nextIndexes = normalizeWorkspaceTerminalSlotIndexes([...currentIndexes, nextTerminalIndex]);
     const nextTerminalCount = Math.min(MAX_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
     const nextTerminalRoles = nextIndexes.map((index) => (
@@ -28093,8 +29003,16 @@ export default function App() {
     persistWorkspaceSettings(nextSettings);
 
     if (workspaceSettingsModalId === workspaceId) {
-      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
-      setWorkspaceTerminalRolesDraft(nextTerminalRoles);
+      const nextTerminalOnlyRoles = getWorkspaceTerminalOnlyRolesForPaneKinds(
+        nextIndexes,
+        nextTerminalRoles,
+        nextPaneKinds,
+        workspaceTerminalFallbackRole,
+      );
+      setWorkspaceTerminalCountDraft(String(Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextTerminalOnlyRoles.length)));
+      setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
+      setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
+      setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
     }
 
     const restoredThreadId = requestedProviderSessionId && AGENT_PROVIDERS.some((provider) => provider.id === nextRole)
@@ -28198,6 +29116,7 @@ export default function App() {
       ...getWorkspacePaneKinds(currentSettings, workspaceId),
       [nextTerminalIndex]: paneKind,
     };
+    const nextWebPanelCount = workspacePaneKindsWebIndexes(nextPaneKinds).length;
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
     const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
     const nextDisplayRows = currentRows.length
@@ -28229,8 +29148,15 @@ export default function App() {
     persistWorkspaceSettings(nextSettings);
 
     if (workspaceSettingsModalId === workspaceId) {
-      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
-      setWorkspaceTerminalRolesDraft(nextTerminalRoles);
+      const nextTerminalOnlyRoles = getWorkspaceTerminalOnlyRolesForPaneKinds(
+        nextIndexes,
+        nextTerminalRoles,
+        nextPaneKinds,
+        workspaceTerminalFallbackRole,
+      );
+      setWorkspaceTerminalCountDraft(String(Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextTerminalOnlyRoles.length)));
+      setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
+      setWorkspaceWebPanelCountDraft(String(nextWebPanelCount));
       setWorkspacePcbCountDraft(String(nextPcbCount));
     }
 
@@ -28409,6 +29335,7 @@ export default function App() {
     const nextTerminalRoles = nextIndexes.map((index) => (
       index === nextTerminalIndex ? agentId : roleByIndex[index] || workspaceTerminalFallbackRole
     ));
+    const nextPaneKinds = getWorkspacePaneKinds(currentSettings, workspaceId);
     const sourceTerminalIndex = Number.parseInt(request.sourceTerminalIndex, 10);
     const layoutSourceIndex = currentIndexes.includes(sourceTerminalIndex)
       ? sourceTerminalIndex
@@ -28483,8 +29410,16 @@ export default function App() {
     persistWorkspaceSettings(nextSettings);
 
     if (workspaceSettingsModalId === workspaceId) {
-      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
-      setWorkspaceTerminalRolesDraft(nextTerminalRoles);
+      const nextTerminalOnlyRoles = getWorkspaceTerminalOnlyRolesForPaneKinds(
+        nextIndexes,
+        nextTerminalRoles,
+        nextPaneKinds,
+        workspaceTerminalFallbackRole,
+      );
+      setWorkspaceTerminalCountDraft(String(Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextTerminalOnlyRoles.length)));
+      setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
+      setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
+      setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
     }
 
     setWorkspaceThreads((threads) => materializeWorkspaceThreadForTerminal(threads, {
@@ -28665,6 +29600,7 @@ export default function App() {
     const nextRoles = nextIndexes.map((index) => (
       index === targetTerminalIndex ? nextRole : roleByIndex[index] || workspaceTerminalFallbackRole
     ));
+    const nextPaneKinds = getWorkspacePaneKinds(currentSettings, workspaceId);
     const nextDisplayRows = getWorkspaceDisplayTerminalRows(
       nextDisplayLayouts,
       workspaceId,
@@ -28690,8 +29626,16 @@ export default function App() {
     persistWorkspaceSettings(nextSettings);
 
     if (workspaceSettingsModalId === workspaceId) {
-      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
-      setWorkspaceTerminalRolesDraft(nextRoles);
+      const nextTerminalOnlyRoles = getWorkspaceTerminalOnlyRolesForPaneKinds(
+        nextIndexes,
+        nextRoles,
+        nextPaneKinds,
+        workspaceTerminalFallbackRole,
+      );
+      setWorkspaceTerminalCountDraft(String(Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextTerminalOnlyRoles.length)));
+      setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
+      setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
+      setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
     }
 
     if (roleThread?.id) {
@@ -28842,6 +29786,7 @@ export default function App() {
     const nextRoles = nextIndexes.map((index) => (
       addedIndexes.includes(index) ? agentId : roleByIndex[index] || workspaceTerminalFallbackRole
     ));
+    const nextPaneKinds = getWorkspacePaneKinds(currentSettings, workspaceId);
     const currentRows = getWorkspaceDisplayTerminalRows(
       currentDisplayLayouts,
       workspaceId,
@@ -28877,8 +29822,16 @@ export default function App() {
     persistWorkspaceSettings(nextSettings);
 
     if (workspaceSettingsModalId === workspaceId) {
-      setWorkspaceTerminalCountDraft(String(nextTerminalCount));
-      setWorkspaceTerminalRolesDraft(nextRoles);
+      const nextTerminalOnlyRoles = getWorkspaceTerminalOnlyRolesForPaneKinds(
+        nextIndexes,
+        nextRoles,
+        nextPaneKinds,
+        workspaceTerminalFallbackRole,
+      );
+      setWorkspaceTerminalCountDraft(String(Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextTerminalOnlyRoles.length)));
+      setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
+      setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
+      setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
     }
 
     const addedCount = addedIndexes.length;
@@ -30532,9 +31485,6 @@ export default function App() {
   const selectedWorkspaceDocumentsEnabled = Boolean(
     selectedWorkspace && selectedWorkspaceDocumentCount > 0,
   );
-  const selectedWorkspacePcbCount = selectedWorkspace && !shouldShowWorkspaceSetup
-    ? getWorkspacePcbCount(workspaceSettings, selectedWorkspace.id)
-    : DEFAULT_WORKSPACE_PCB_COUNT;
   const activatedWorkspaceTerminalCount = activatedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceTerminalCount(workspaceSettings, activatedWorkspace.id)
     : MIN_WORKSPACE_TERMINAL_COUNT;
@@ -31778,9 +32728,15 @@ export default function App() {
     workspaceTerminalsWorkspaces.forEach((presenceWorkspace) => {
       const presenceWorkspaceId = String(presenceWorkspace?.workspaceId || presenceWorkspace?.workspace_id || "").trim();
       if (presenceWorkspaceId && Array.isArray(presenceWorkspace?.panels)) {
+        const presenceWorkspaceActive = presenceWorkspace?.workspaceActive === true
+          || presenceWorkspace?.workspace_active === true
+          || presenceWorkspace?.active === true;
         presencePanelsByWorkspaceId.set(
           presenceWorkspaceId,
-          presenceWorkspace.panels.slice(0, 32).map((panel) => ({ ...panel })),
+          presenceWorkspace.panels
+            .slice(0, 32)
+            .map((panel) => ({ ...panel }))
+            .filter((panel) => workspacePanelSnapshotCurrent(panel, presenceWorkspaceActive)),
         );
       }
       if (!presenceWorkspaceId || !Array.isArray(presenceWorkspace?.terminals)) {
@@ -31876,18 +32832,22 @@ export default function App() {
         workspaceSettings,
       });
       const panelsById = new Map();
-      configuredPanels.forEach((panel) => {
-        const panelId = String(panel?.paneId || panel?.pane_id || panel?.panelId || panel?.panel_id || "").trim();
-        if (panelId) {
-          panelsById.set(panelId, panel);
-        }
-      });
-      presencePanels.forEach((panel) => {
-        const panelId = String(panel?.paneId || panel?.pane_id || panel?.panelId || panel?.panel_id || "").trim();
-        if (panelId) {
-          panelsById.set(panelId, panel);
-        }
-      });
+      configuredPanels
+        .filter((panel) => workspacePanelSnapshotCurrent(panel, workspaceActive))
+        .forEach((panel) => {
+          const panelId = String(panel?.paneId || panel?.pane_id || panel?.panelId || panel?.panel_id || "").trim();
+          if (panelId) {
+            panelsById.set(panelId, panel);
+          }
+        });
+      presencePanels
+        .filter((panel) => workspacePanelSnapshotCurrent(panel, workspaceActive))
+        .forEach((panel) => {
+          const panelId = String(panel?.paneId || panel?.pane_id || panel?.panelId || panel?.panel_id || "").trim();
+          if (panelId) {
+            panelsById.set(panelId, panel);
+          }
+        });
       const panels = Array.from(panelsById.values());
       const selected = String(selectedWorkspace?.id || "").trim() === workspaceId;
       const terminalListAuthoritative = true;
@@ -35891,7 +36851,8 @@ export default function App() {
           });
           return;
         }
-        const paneId = getWorkspaceTerminalPaneId(
+        const openedExisting = Boolean(added.reused);
+        const paneId = added.paneId || getWorkspaceTerminalPaneId(
           workspaceId,
           added.terminalIndex,
           getWorkspaceTerminalPaneAgentId(added.terminalRole || nextAgentId),
@@ -35899,19 +36860,29 @@ export default function App() {
         requestWorkspaceTerminalFocus({
           paneId,
           providerSessionId,
-          reason: "remote_control_agent_chat_session_open",
+          reason: openedExisting
+            ? "remote_control_agent_chat_session_reuse"
+            : "remote_control_agent_chat_session_open",
           terminalIndex: added.terminalIndex,
           workspaceId,
         });
-        await syncRemoteControlState("remote_agent_chat_session_open");
-        await recordRemoteCommandStatus(event, "completed", "Session terminal opened from the web dashboard.", {
+        await syncRemoteControlState(openedExisting
+          ? "remote_agent_chat_session_reuse"
+          : "remote_agent_chat_session_open");
+        await recordRemoteCommandStatus(
+          event,
+          "completed",
+          openedExisting
+            ? "Session already has a configured terminal; focused it."
+            : "Session terminal opened from the web dashboard.",
+          {
           agentChatSessionId,
           agentId: nextAgentId,
           commandId,
           commandKind,
           modelId,
-          openedExisting: false,
-          opened_existing: false,
+          openedExisting,
+          opened_existing: openedExisting,
           paneId,
           pane_id: paneId,
           providerSessionId,
@@ -35921,7 +36892,8 @@ export default function App() {
           threadId: added.threadId || "",
           thread_id: added.threadId || "",
           workspaceId,
-        });
+          },
+        );
         return;
       }
       if (["todo_requeue", "requeue_todo", "todo_retry", "retry_todo"].includes(normalizedKind)) {
@@ -40325,7 +41297,7 @@ export default function App() {
               result,
               source_format: DFBLUEPRINT_SOURCE_FORMAT,
               blueprint: parseDfBlueprintSource(String(result?.graph?.source || result?.graph?.sourceText || result?.graph?.source_text || "")),
-              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger with explicit trigger_type if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: triggers expose out; run_script/send_message expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Specify from_port/fromPort and to_port/toPort on connect operations, especially from action nodes. Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. document_write accepts operation append|replace|prepend|create_if_missing|delete and optional content_template for deterministic webhook/body writes without an agent. asset_write accepts operation add_version|replace|create_if_missing|delete and optional content_template for deterministic webhook/body assets without an agent. To guide a send-message substep, connect step.success -> run_script.in or send_message.in when a completed substep should start another action; connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation. Do not connect send_message.exec, send_message.success, run_script.exec, run_script.success, or other action execution branches directly into asset_write. add_node and update_node_props accept resource metadata as top-level fields or nested under props. Never invent standalone cron/manual/webhook trigger nodes.",
+              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger with explicit trigger_type if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: triggers expose out; run_script/send_message/dispatch_todos expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Specify from_port/fromPort and to_port/toPort on connect operations, especially from action nodes. Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, dispatch_todos, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. dispatch_todos uses target_workspace_ids and todo_lines, plus optional target_terminal_id, target_agent_id, model, reasoning_effort, and speed. document_write accepts operation append|replace|prepend|create_if_missing|delete and optional content_template for deterministic webhook/body writes without an agent. asset_write accepts operation add_version|replace|create_if_missing|delete and optional content_template for deterministic webhook/body assets without an agent. To guide a send-message substep, connect step.success -> run_script.in, send_message.in, or dispatch_todos.in when a completed substep should start another action; connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation. Do not connect send_message.exec, send_message.success, dispatch_todos.exec, dispatch_todos.success, run_script.exec, run_script.success, or other action execution branches directly into asset_write. add_node and update_node_props accept resource metadata as top-level fields or nested under props. Never invent standalone cron/manual/webhook trigger nodes.",
               loopspace: { id: loopspace.id, name: loopspace.name },
               state: buildAppControlState(),
             },
@@ -45248,7 +46220,8 @@ export default function App() {
     setWorkspaceNameDraft(selectedWorkspace?.name || "");
     setWorkspaceTerminalCountDraft(String(selectedWorkspace ? selectedWorkspaceTerminalOnlyCount : MIN_WORKSPACE_TERMINAL_COUNT));
     setWorkspaceDocumentCountDraft(String(selectedWorkspace ? selectedWorkspaceDocumentCount : DEFAULT_WORKSPACE_DOCUMENT_COUNT));
-    setWorkspacePcbCountDraft(String(selectedWorkspace ? selectedWorkspacePcbCount : DEFAULT_WORKSPACE_PCB_COUNT));
+    setWorkspaceWebPanelCountDraft(String(selectedWorkspace ? selectedWorkspaceWebPanelCount : DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
+    setWorkspacePcbCountDraft(String(selectedWorkspace ? selectedWorkspacePcbPanelCount : DEFAULT_WORKSPACE_PCB_COUNT));
     setWorkspaceTerminalRolesDraft(selectedWorkspace ? selectedWorkspaceTerminalOnlyRoles : normalizeWorkspaceTerminalRoles(
       [],
       MIN_WORKSPACE_TERMINAL_COUNT,
@@ -45273,7 +46246,8 @@ export default function App() {
     selectedWorkspaceAgentSessionMode,
     selectedWorkspaceAgentPermissions,
     selectedWorkspaceDocumentCount,
-    selectedWorkspacePcbCount,
+    selectedWorkspacePcbPanelCount,
+    selectedWorkspaceWebPanelCount,
     selectedWorkspaceTerminalOnlyCount,
     selectedWorkspaceTerminalOnlyRoles,
     workspaceTerminalFallbackRole,
@@ -45490,9 +46464,9 @@ export default function App() {
   ), [workspaceAgentPermissionsDraft, workspaceTerminalRoleOptions]);
   const workspaceSettingsPanelCounts = useMemo(() => ({
     document: normalizeWorkspaceDocumentCount(workspaceDocumentCountDraft),
-    web: selectedWorkspaceWebPanelCount,
-    "pcb-design": selectedWorkspacePcbPanelCount,
-  }), [workspaceDocumentCountDraft, selectedWorkspacePcbPanelCount, selectedWorkspaceWebPanelCount]);
+    web: normalizeWorkspaceWebPanelCount(workspaceWebPanelCountDraft),
+    "pcb-design": normalizeWorkspacePcbCount(workspacePcbCountDraft),
+  }), [workspaceDocumentCountDraft, workspacePcbCountDraft, workspaceWebPanelCountDraft]);
   const updateWorkspaceSettingsAgentCount = useCallback((roleId, delta) => {
     const nextRoles = adjustWorkspaceAgentCardRoles(
       workspaceSettingsTerminalRoles,
@@ -45535,48 +46509,23 @@ export default function App() {
       return;
     }
     if (panelId === "web") {
-      // Web panes are grid slots, so add/remove them live against the selected
-      // workspace (no draft); the stepper count reflects paneKinds directly.
-      if (!selectedWorkspace?.id) {
-        return;
-      }
-      const step = Number(delta || 0);
-      if (step > 0) {
-        addWorkspaceWebPane?.({ workspaceId: selectedWorkspace.id });
-      } else if (step < 0) {
-        const target = selectedWorkspaceWebPaneIndexes[selectedWorkspaceWebPaneIndexes.length - 1];
-        if (Number.isInteger(target)) {
-          closeWorkspaceTerminal({ workspaceId: selectedWorkspace.id, terminalIndex: target });
-        }
-      }
+      setWorkspaceWebPanelCountDraft((current) => {
+        const currentValue = normalizeWorkspaceWebPanelCount(current);
+        return String(normalizeWorkspaceWebPanelCount(currentValue + Number(delta || 0)));
+      });
       setWorkspaceSettingsError("");
       setWorkspaceSettingsMessage("");
       return;
     }
     if (panelId === "pcb-design") {
-      if (!selectedWorkspace?.id) {
-        return;
-      }
-      const step = Number(delta || 0);
-      if (step > 0) {
-        addWorkspacePcbPane?.({ workspaceId: selectedWorkspace.id });
-      } else if (step < 0) {
-        const target = selectedWorkspacePcbPaneIndexes[selectedWorkspacePcbPaneIndexes.length - 1];
-        if (Number.isInteger(target)) {
-          closeWorkspaceTerminal({ workspaceId: selectedWorkspace.id, terminalIndex: target });
-        }
-      }
+      setWorkspacePcbCountDraft((current) => {
+        const currentValue = normalizeWorkspacePcbCount(current);
+        return String(normalizeWorkspacePcbCount(currentValue + Number(delta || 0)));
+      });
       setWorkspaceSettingsError("");
       setWorkspaceSettingsMessage("");
     }
-  }, [
-    addWorkspacePcbPane,
-    addWorkspaceWebPane,
-    closeWorkspaceTerminal,
-    selectedWorkspace?.id,
-    selectedWorkspacePcbPaneIndexes,
-    selectedWorkspaceWebPaneIndexes,
-  ]);
+  }, []);
   const workspaceSettingsSafeModeRequiresGit = Boolean(
     selectedWorkspace
       && !selectedWorkspaceRootGitRepository
@@ -46332,6 +47281,7 @@ export default function App() {
                             onOpenWorkspaceDocumentPanel={openSelectedWorkspaceDocumentPanel}
                             onCloseWorkspaceDocumentPanel={closeWorkspaceDocumentPanel}
                             onOpenWorkspacePcbPanel={openSelectedWorkspacePcbPanel}
+                            plan={billingPlanNameFromStatus(billingStatus, user)}
                             onMinimizeWorkspaceToolPane={minimizeWorkspaceToolPane}
                             onRestoreWorkspaceToolPane={restoreWorkspaceToolPane}
                             onToggleFullscreenWorkspaceToolPane={toggleFullscreenWorkspaceToolPane}
@@ -46387,7 +47337,9 @@ export default function App() {
                           localScripts={appScriptsLibrary.scripts}
                           loopspace={selectedLoopspace}
                           onBack={unselectLoopspace}
+                          onActivateWorkspaceForTodoDispatch={activateWorkspacesForLoopspaceTodoDispatch}
                           visible={visibleView === DEFAULT_WORKSPACE_VIEW && loopspacesModeActive}
+                          workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
                         />
                       ) : (
                         <WorkspaceIdleState
