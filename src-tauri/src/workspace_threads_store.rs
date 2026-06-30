@@ -82,6 +82,44 @@ struct WorkspaceAgentSessionHistoryListRequest {
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+struct WorkspaceAgentSessionHistoryChatSync {
+    status: String,
+    label: String,
+    pending_packet_count: usize,
+    syncing_packet_count: usize,
+    retrying_packet_count: usize,
+    failed_packet_count: usize,
+    record_acked_count: usize,
+    record_total_count: usize,
+    acked_at_ms: u64,
+    failed_at_ms: u64,
+    updated_at_ms: u64,
+    last_enqueued_at_ms: u64,
+    last_error: String,
+}
+
+impl Default for WorkspaceAgentSessionHistoryChatSync {
+    fn default() -> Self {
+        Self {
+            status: "waiting".to_string(),
+            label: "Waiting".to_string(),
+            pending_packet_count: 0,
+            syncing_packet_count: 0,
+            retrying_packet_count: 0,
+            failed_packet_count: 0,
+            record_acked_count: 0,
+            record_total_count: 0,
+            acked_at_ms: 0,
+            failed_at_ms: 0,
+            updated_at_ms: 0,
+            last_enqueued_at_ms: 0,
+            last_error: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 struct WorkspaceAgentSessionHistoryItem {
     id: String,
     workspace_id: String,
@@ -96,6 +134,9 @@ struct WorkspaceAgentSessionHistoryItem {
     provider: String,
     model_id: String,
     model_source: String,
+    session_mode: String,
+    file_authority: String,
+    coordination_mode: String,
     thread_id: String,
     pane_id: String,
     terminal_instance_id: Option<u64>,
@@ -105,6 +146,7 @@ struct WorkspaceAgentSessionHistoryItem {
     status: String,
     title: String,
     first_user_message: String,
+    chat_sync: WorkspaceAgentSessionHistoryChatSync,
     source: String,
     created_at_ms: u64,
     latest_at_ms: u64,
@@ -135,6 +177,9 @@ struct WorkspaceAgentSessionHistoryRecord {
     provider: String,
     model_id: String,
     model_source: String,
+    session_mode: String,
+    file_authority: String,
+    coordination_mode: String,
     thread_id: String,
     pane_id: String,
     terminal_instance_id: Option<u64>,
@@ -370,6 +415,18 @@ fn workspace_agent_session_history_merge_item(
         &mut current.model_source,
         candidate.model_source.clone(),
     );
+    workspace_agent_session_history_merge_text(
+        &mut current.session_mode,
+        candidate.session_mode.clone(),
+    );
+    workspace_agent_session_history_merge_text(
+        &mut current.file_authority,
+        candidate.file_authority.clone(),
+    );
+    workspace_agent_session_history_merge_text(
+        &mut current.coordination_mode,
+        candidate.coordination_mode.clone(),
+    );
     workspace_agent_session_history_merge_text(&mut current.thread_id, candidate.thread_id.clone());
     workspace_agent_session_history_merge_text(&mut current.pane_id, candidate.pane_id.clone());
     workspace_agent_session_history_merge_text(&mut current.slot_key, candidate.slot_key.clone());
@@ -402,6 +459,47 @@ fn workspace_agent_session_history_dedupe_items(
         deduped.push(item);
     }
     deduped
+}
+
+fn workspace_agent_session_history_limit_with_fork_parents(
+    mut items: Vec<WorkspaceAgentSessionHistoryItem>,
+    limit: usize,
+) -> Vec<WorkspaceAgentSessionHistoryItem> {
+    if items.len() <= limit {
+        return items;
+    }
+    let remaining = items.split_off(limit);
+    let mut selected = items;
+    let mut selected_identities = selected
+        .iter()
+        .filter_map(workspace_agent_session_history_item_identity)
+        .collect::<HashSet<_>>();
+    let parent_identities = selected
+        .iter()
+        .filter_map(|item| {
+            let parent_session_id =
+                workspace_threads_clean_provider_session_id(&item.fork_from_provider_session_id)?;
+            let agent_id = workspace_threads_clean_agent_id(&item.agent_id)
+                .or_else(|| workspace_threads_clean_agent_id(&item.provider))?;
+            workspace_agent_session_history_identity(
+                &item.workspace_id,
+                &agent_id,
+                &parent_session_id,
+            )
+        })
+        .collect::<HashSet<_>>();
+    if parent_identities.is_empty() {
+        return selected;
+    }
+    for item in remaining {
+        let Some(identity) = workspace_agent_session_history_item_identity(&item) else {
+            continue;
+        };
+        if parent_identities.contains(&identity) && selected_identities.insert(identity) {
+            selected.push(item);
+        }
+    }
+    selected
 }
 
 fn workspace_threads_now_millis_u64() -> u64 {
@@ -535,6 +633,9 @@ fn workspace_threads_open_store(
                 provider TEXT NOT NULL DEFAULT '',
                 model_id TEXT NOT NULL DEFAULT '',
                 model_source TEXT NOT NULL DEFAULT '',
+                session_mode TEXT NOT NULL DEFAULT '',
+                file_authority TEXT NOT NULL DEFAULT '',
+                coordination_mode TEXT NOT NULL DEFAULT '',
                 thread_id TEXT NOT NULL DEFAULT '',
                 pane_id TEXT NOT NULL DEFAULT '',
                 terminal_instance_id INTEGER,
@@ -571,6 +672,24 @@ fn workspace_threads_open_store(
         &connection,
         "workspace_agent_session_history",
         "shared_history_id",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    workspace_threads_add_column_if_missing(
+        &connection,
+        "workspace_agent_session_history",
+        "session_mode",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    workspace_threads_add_column_if_missing(
+        &connection,
+        "workspace_agent_session_history",
+        "file_authority",
+        "TEXT NOT NULL DEFAULT ''",
+    )?;
+    workspace_threads_add_column_if_missing(
+        &connection,
+        "workspace_agent_session_history",
+        "coordination_mode",
         "TEXT NOT NULL DEFAULT ''",
     )?;
     connection
@@ -659,6 +778,9 @@ fn workspace_agent_session_history_upsert_blocking(
                 provider,
                 model_id,
                 model_source,
+                session_mode,
+                file_authority,
+                coordination_mode,
                 thread_id,
                 pane_id,
                 terminal_instance_id,
@@ -672,7 +794,7 @@ fn workspace_agent_session_history_upsert_blocking(
                 latest_at_ms,
                 created_at,
                 updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?25)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?28)
             ON CONFLICT(id) DO UPDATE SET
                 workspace_id = excluded.workspace_id,
                 workspace_root = excluded.workspace_root,
@@ -686,6 +808,9 @@ fn workspace_agent_session_history_upsert_blocking(
                 provider = CASE WHEN excluded.provider != '' THEN excluded.provider ELSE workspace_agent_session_history.provider END,
                 model_id = CASE WHEN excluded.model_id != '' THEN excluded.model_id ELSE workspace_agent_session_history.model_id END,
                 model_source = CASE WHEN excluded.model_source != '' THEN excluded.model_source ELSE workspace_agent_session_history.model_source END,
+                session_mode = CASE WHEN excluded.session_mode != '' THEN excluded.session_mode ELSE workspace_agent_session_history.session_mode END,
+                file_authority = CASE WHEN excluded.file_authority != '' THEN excluded.file_authority ELSE workspace_agent_session_history.file_authority END,
+                coordination_mode = CASE WHEN excluded.coordination_mode != '' THEN excluded.coordination_mode ELSE workspace_agent_session_history.coordination_mode END,
                 thread_id = CASE WHEN excluded.thread_id != '' THEN excluded.thread_id ELSE workspace_agent_session_history.thread_id END,
                 pane_id = CASE WHEN excluded.pane_id != '' THEN excluded.pane_id ELSE workspace_agent_session_history.pane_id END,
                 terminal_instance_id = COALESCE(excluded.terminal_instance_id, workspace_agent_session_history.terminal_instance_id),
@@ -712,6 +837,9 @@ fn workspace_agent_session_history_upsert_blocking(
                 provider,
                 workspace_threads_clean_optional_text(&record.model_id, 160),
                 workspace_threads_clean_optional_text(&record.model_source, 80),
+                workspace_threads_clean_optional_text(&record.session_mode, 80),
+                workspace_threads_clean_optional_text(&record.file_authority, 80),
+                workspace_threads_clean_optional_text(&record.coordination_mode, 80),
                 workspace_threads_clean_optional_text(&record.thread_id, 512),
                 workspace_threads_clean_optional_text(&record.pane_id, 256),
                 terminal_instance_id,
@@ -834,6 +962,327 @@ fn workspace_agent_session_history_enrich_previews(items: &mut [WorkspaceAgentSe
     }
 }
 
+#[derive(Default)]
+struct WorkspaceAgentSessionHistoryChatSyncAccumulator {
+    pending_packet_count: usize,
+    syncing_packet_count: usize,
+    retrying_packet_count: usize,
+    failed_packet_count: usize,
+    record_acked_count: usize,
+    record_total_count: usize,
+    acked_at_ms: u64,
+    failed_at_ms: u64,
+    updated_at_ms: u64,
+    last_enqueued_at_ms: u64,
+    last_error: String,
+}
+
+impl WorkspaceAgentSessionHistoryChatSyncAccumulator {
+    fn apply_outbox_row(
+        &mut self,
+        status: &str,
+        attempt_count: i64,
+        last_error: String,
+        created_at_ms: u64,
+        updated_at_ms: u64,
+        total_record_count: usize,
+    ) {
+        match status.trim().to_ascii_lowercase().as_str() {
+            "in_flight" => {
+                self.syncing_packet_count = self.syncing_packet_count.saturating_add(1);
+            }
+            "retrying" => {
+                self.retrying_packet_count = self.retrying_packet_count.saturating_add(1);
+            }
+            "dead_letter" | "rejected" => {
+                self.failed_packet_count = self.failed_packet_count.saturating_add(1);
+            }
+            "queued" if attempt_count > 0 => {
+                self.retrying_packet_count = self.retrying_packet_count.saturating_add(1);
+            }
+            "queued" => {
+                self.pending_packet_count = self.pending_packet_count.saturating_add(1);
+            }
+            _ => {}
+        }
+        self.last_enqueued_at_ms = self.last_enqueued_at_ms.max(created_at_ms);
+        self.updated_at_ms = self.updated_at_ms.max(updated_at_ms);
+        self.record_total_count = self.record_total_count.max(total_record_count);
+        if !last_error.trim().is_empty() {
+            self.last_error = last_error;
+        }
+    }
+
+    fn apply_session_state(
+        &mut self,
+        record_total_count: usize,
+        acked_at_ms: u64,
+        failed_at_ms: u64,
+        updated_at_ms: u64,
+        last_error: String,
+    ) {
+        self.record_total_count = self.record_total_count.max(record_total_count);
+        self.acked_at_ms = self.acked_at_ms.max(acked_at_ms);
+        self.failed_at_ms = self.failed_at_ms.max(failed_at_ms);
+        self.updated_at_ms = self.updated_at_ms.max(updated_at_ms);
+        if !last_error.trim().is_empty() {
+            self.last_error = last_error;
+        }
+    }
+
+    fn apply_record_ack_count(&mut self, record_acked_count: usize) {
+        self.record_acked_count = self.record_acked_count.max(record_acked_count);
+    }
+
+    fn into_chat_sync(self) -> WorkspaceAgentSessionHistoryChatSync {
+        let complete = self.acked_at_ms > 0
+            && (self.record_total_count == 0 || self.record_acked_count >= self.record_total_count);
+        let (status, label) = if self.syncing_packet_count > 0 || self.retrying_packet_count > 0 {
+            ("syncing", "Syncing")
+        } else if self.pending_packet_count > 0 {
+            ("waiting", "Waiting")
+        } else if self.failed_packet_count > 0 || self.failed_at_ms > 0 {
+            ("failed", "Failed")
+        } else if complete {
+            ("synced", "Synced")
+        } else {
+            ("waiting", "Waiting")
+        };
+        WorkspaceAgentSessionHistoryChatSync {
+            status: status.to_string(),
+            label: label.to_string(),
+            pending_packet_count: self.pending_packet_count,
+            syncing_packet_count: self.syncing_packet_count,
+            retrying_packet_count: self.retrying_packet_count,
+            failed_packet_count: self.failed_packet_count,
+            record_acked_count: self.record_acked_count,
+            record_total_count: self.record_total_count,
+            acked_at_ms: self.acked_at_ms,
+            failed_at_ms: self.failed_at_ms,
+            updated_at_ms: self.updated_at_ms,
+            last_enqueued_at_ms: self.last_enqueued_at_ms,
+            last_error: self.last_error,
+        }
+    }
+}
+
+fn workspace_agent_session_history_chat_sync_key(
+    workspace_id: &str,
+    provider: &str,
+    session_id: &str,
+) -> Option<String> {
+    let workspace_id = workspace_threads_clean_workspace_id(workspace_id).ok()?;
+    let provider = workspace_threads_clean_agent_id(provider)?;
+    let session_id = workspace_threads_clean_provider_session_id(session_id)?;
+    Some(format!("{workspace_id}\n{provider}\n{session_id}"))
+}
+
+fn workspace_agent_session_history_item_chat_sync_key(
+    item: &WorkspaceAgentSessionHistoryItem,
+) -> Option<String> {
+    let provider = workspace_threads_clean_agent_id(&item.provider)
+        .or_else(|| workspace_threads_clean_agent_id(&item.agent_id))?;
+    let session_id = workspace_agent_session_history_item_session_id(item)?;
+    workspace_agent_session_history_chat_sync_key(&item.workspace_id, &provider, &session_id)
+}
+
+fn workspace_agent_session_history_payload_chat_sync_key(payload: &Value) -> Option<String> {
+    let workspace_id = cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"])?;
+    let provider = cloud_mcp_payload_text(payload, &["provider", "agent_kind", "agentKind"])?;
+    let session_id =
+        cloud_mcp_payload_text(payload, &["session_id", "sessionId", "provider_session_id"])?;
+    workspace_agent_session_history_chat_sync_key(&workspace_id, &provider, &session_id)
+}
+
+fn workspace_agent_session_history_payload_scope_matches(
+    payload: &Value,
+    scope_key: &str,
+    device_id: &str,
+) -> bool {
+    let payload_scope_key = cloud_mcp_payload_text(payload, &["scope_key", "scopeKey"])
+        .unwrap_or_default();
+    let payload_device_id = cloud_mcp_payload_text(payload, &["device_id", "deviceId"])
+        .unwrap_or_default();
+    (payload_scope_key.is_empty() || payload_scope_key == scope_key)
+        && (payload_device_id.is_empty() || payload_device_id == device_id)
+}
+
+fn workspace_agent_session_history_enrich_chat_sync(items: &mut [WorkspaceAgentSessionHistoryItem]) {
+    let mut summaries = HashMap::<String, WorkspaceAgentSessionHistoryChatSyncAccumulator>::new();
+    for item in items.iter() {
+        if let Some(key) = workspace_agent_session_history_item_chat_sync_key(item) {
+            summaries.entry(key).or_default();
+        }
+    }
+    if summaries.is_empty() {
+        return;
+    }
+
+    let scope_key = cloud_mcp_process_account_scope_key();
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "desktop-primary".to_string());
+    let Ok(conn) = cloud_mcp_open_outbox_conn() else {
+        return;
+    };
+
+    if let Ok(mut statement) = conn.prepare(&format!(
+        "SELECT status, attempt_count, last_error, created_at_ms, updated_at_ms, payload_json
+         FROM {CLOUD_MCP_OUTBOX_TABLE}
+         WHERE event_kind=?1
+           AND status IN ('queued', 'retrying', 'in_flight', 'dead_letter', 'rejected')"
+    )) {
+        if let Ok(rows) = statement.query_map(
+            rusqlite::params![CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, i64>(1).unwrap_or(0),
+                    row.get::<_, String>(2).unwrap_or_default(),
+                    row.get::<_, i64>(3).unwrap_or(0).max(0) as u64,
+                    row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                    row.get::<_, String>(5).unwrap_or_default(),
+                ))
+            },
+        ) {
+            for row in rows.flatten() {
+                let (status, attempt_count, last_error, created_at_ms, updated_at_ms, payload_json) =
+                    row;
+                let Ok(payload) = serde_json::from_str::<Value>(&payload_json) else {
+                    continue;
+                };
+                if !workspace_agent_session_history_payload_scope_matches(
+                    &payload,
+                    &scope_key,
+                    &device_id,
+                ) {
+                    continue;
+                }
+                let Some(key) = workspace_agent_session_history_payload_chat_sync_key(&payload) else {
+                    continue;
+                };
+                let Some(summary) = summaries.get_mut(&key) else {
+                    continue;
+                };
+                let total_record_count = payload
+                    .get("total_record_count")
+                    .or_else(|| payload.get("totalRecordCount"))
+                    .and_then(Value::as_u64)
+                    .unwrap_or_else(|| {
+                        payload
+                            .get("record_count")
+                            .or_else(|| payload.get("recordCount"))
+                            .and_then(Value::as_u64)
+                            .unwrap_or_default()
+                    }) as usize;
+                summary.apply_outbox_row(
+                    &status,
+                    attempt_count,
+                    last_error,
+                    created_at_ms,
+                    updated_at_ms,
+                    total_record_count,
+                );
+            }
+        }
+    }
+
+    if let Ok(mut statement) = conn.prepare(&format!(
+        "SELECT workspace_id, provider, session_id, record_count, acked_at_ms, failed_at_ms, updated_at_ms, last_error
+         FROM {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}
+         WHERE scope_key=?1 AND device_id=?2"
+    )) {
+        if let Ok(rows) = statement.query_map(
+            rusqlite::params![scope_key.as_str(), device_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, String>(2).unwrap_or_default(),
+                    row.get::<_, i64>(3).unwrap_or(0).max(0) as usize,
+                    row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
+                    row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
+                    row.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
+                    row.get::<_, String>(7).unwrap_or_default(),
+                ))
+            },
+        ) {
+            for row in rows.flatten() {
+                let (
+                    workspace_id,
+                    provider,
+                    session_id,
+                    record_count,
+                    acked_at_ms,
+                    failed_at_ms,
+                    updated_at_ms,
+                    last_error,
+                ) = row;
+                let Some(key) = workspace_agent_session_history_chat_sync_key(
+                    &workspace_id,
+                    &provider,
+                    &session_id,
+                )
+                else {
+                    continue;
+                };
+                if let Some(summary) = summaries.get_mut(&key) {
+                    summary.apply_session_state(
+                        record_count,
+                        acked_at_ms,
+                        failed_at_ms,
+                        updated_at_ms,
+                        last_error,
+                    );
+                }
+            }
+        }
+    }
+
+    if let Ok(mut statement) = conn.prepare(&format!(
+        "SELECT workspace_id, provider, session_id, COUNT(*)
+         FROM {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}
+         WHERE scope_key=?1 AND device_id=?2 AND acked_at_ms>0
+         GROUP BY workspace_id, provider, session_id"
+    )) {
+        if let Ok(rows) = statement.query_map(
+            rusqlite::params![scope_key.as_str(), device_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, String>(2).unwrap_or_default(),
+                    row.get::<_, i64>(3).unwrap_or(0).max(0) as usize,
+                ))
+            },
+        ) {
+            for row in rows.flatten() {
+                let (workspace_id, provider, session_id, record_acked_count) = row;
+                let Some(key) = workspace_agent_session_history_chat_sync_key(
+                    &workspace_id,
+                    &provider,
+                    &session_id,
+                )
+                else {
+                    continue;
+                };
+                if let Some(summary) = summaries.get_mut(&key) {
+                    summary.apply_record_ack_count(record_acked_count);
+                }
+            }
+        }
+    }
+
+    for item in items.iter_mut() {
+        let Some(key) = workspace_agent_session_history_item_chat_sync_key(item) else {
+            continue;
+        };
+        if let Some(summary) = summaries.remove(&key) {
+            item.chat_sync = summary.into_chat_sync();
+        }
+    }
+}
+
 fn workspace_agent_session_history_list_blocking(
     request: WorkspaceAgentSessionHistoryListRequest,
 ) -> Result<WorkspaceAgentSessionHistoryListResult, String> {
@@ -859,6 +1308,9 @@ fn workspace_agent_session_history_list_blocking(
                 provider,
                 model_id,
                 model_source,
+                session_mode,
+                file_authority,
+                coordination_mode,
                 thread_id,
                 pane_id,
                 terminal_instance_id,
@@ -880,24 +1332,23 @@ fn workspace_agent_session_history_list_blocking(
                     )
                     OR COALESCE(NULLIF(TRIM(provider_session_id), ''), TRIM(native_session_id)) LIKE 'ses_%'
                 )
-            ORDER BY latest_at_ms DESC, created_at_ms DESC, id DESC
-            LIMIT ?2",
+            ORDER BY latest_at_ms DESC, created_at_ms DESC, id DESC",
         )
         .map_err(|error| format!("Unable to prepare workspace session history read: {error}"))?;
     let rows = statement
         .query_map(
-            rusqlite::params![workspace_id.as_str(), limit as i64],
+            rusqlite::params![workspace_id.as_str()],
             |row| {
                 let terminal_instance_id = row
-                    .get::<_, Option<i64>>(15)?
+                    .get::<_, Option<i64>>(18)?
                     .and_then(|value| u64::try_from(value).ok());
                 let created_at_ms = row
-                    .get::<_, i64>(22)
+                    .get::<_, i64>(25)
                     .ok()
                     .and_then(|value| u64::try_from(value).ok())
                     .unwrap_or(0);
                 let latest_at_ms = row
-                    .get::<_, i64>(23)
+                    .get::<_, i64>(26)
                     .ok()
                     .and_then(|value| u64::try_from(value).ok())
                     .unwrap_or(created_at_ms);
@@ -915,16 +1366,20 @@ fn workspace_agent_session_history_list_blocking(
                     provider: row.get(10)?,
                     model_id: row.get(11)?,
                     model_source: row.get(12)?,
-                    thread_id: row.get(13)?,
-                    pane_id: row.get(14)?,
+                    session_mode: row.get(13)?,
+                    file_authority: row.get(14)?,
+                    coordination_mode: row.get(15)?,
+                    thread_id: row.get(16)?,
+                    pane_id: row.get(17)?,
                     terminal_instance_id,
-                    terminal_index: row.get(16)?,
-                    slot_key: row.get(17)?,
-                    cwd: row.get(18)?,
-                    status: row.get(19)?,
-                    title: row.get(20)?,
+                    terminal_index: row.get(19)?,
+                    slot_key: row.get(20)?,
+                    cwd: row.get(21)?,
+                    status: row.get(22)?,
+                    title: row.get(23)?,
                     first_user_message: String::new(),
-                    source: row.get(21)?,
+                    chat_sync: WorkspaceAgentSessionHistoryChatSync::default(),
+                    source: row.get(24)?,
                     created_at_ms,
                     latest_at_ms,
                 })
@@ -939,6 +1394,8 @@ fn workspace_agent_session_history_list_blocking(
     }
     items.retain(workspace_agent_session_history_item_is_visible);
     items = workspace_agent_session_history_dedupe_items(items);
+    items = workspace_agent_session_history_limit_with_fork_parents(items, limit);
+    workspace_agent_session_history_enrich_chat_sync(&mut items);
     workspace_agent_session_history_enrich_previews(&mut items);
     Ok(WorkspaceAgentSessionHistoryListResult {
         generated_at_ms: workspace_threads_now_millis_u64(),
@@ -1923,6 +2380,79 @@ mod workspace_threads_store_tests {
         env::temp_dir().join(format!("diffforge-workspace-threads-{name}-{nanos}"))
     }
 
+    fn insert_workspace_agent_session_history_test_row(
+        connection: &rusqlite::Connection,
+        root_display: &str,
+        root_text: &str,
+        id: &str,
+        provider_session_id: &str,
+        fork_from_provider_session_id: &str,
+        created_at_ms: i64,
+        latest_at_ms: i64,
+        title: &str,
+    ) {
+        let coordination_session_id = format!("coord-{id}");
+        let thread_id = format!("thread-{id}");
+        let pane_id = format!("pane-{id}");
+        let slot_key = format!("slot-{id}");
+        connection
+            .execute(
+                "INSERT INTO workspace_agent_session_history (
+                    id,
+                    workspace_id,
+                    workspace_root,
+                    workspace_name,
+                    coordination_session_id,
+                    provider_session_id,
+                    native_session_id,
+                    fork_from_provider_session_id,
+                    shared_history_id,
+                    agent_id,
+                    provider,
+                    model_id,
+                    model_source,
+                    thread_id,
+                    pane_id,
+                    terminal_instance_id,
+                    terminal_index,
+                    slot_key,
+                    cwd,
+                    status,
+                    title,
+                    source,
+                    created_at_ms,
+                    latest_at_ms,
+                    created_at,
+                    updated_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, '', ?8, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?22)",
+                rusqlite::params![
+                    id,
+                    "workspace-session-history",
+                    root_display,
+                    "Session History",
+                    coordination_session_id,
+                    provider_session_id,
+                    fork_from_provider_session_id,
+                    "codex",
+                    "gpt-5.5",
+                    "launch",
+                    thread_id,
+                    pane_id,
+                    42i64,
+                    2i64,
+                    slot_key,
+                    root_text,
+                    "idle",
+                    title,
+                    "terminal_activity_hook:provider-session",
+                    created_at_ms,
+                    latest_at_ms,
+                    workspace_threads_now_millis(),
+                ],
+            )
+            .expect("insert session history test row");
+    }
+
     #[test]
     fn provider_session_binding_round_trips_without_prior_thread_state() {
         let root = unique_workspace_threads_test_root("provider-binding");
@@ -2079,6 +2609,9 @@ mod workspace_threads_store_tests {
                 id: "session-history-1".to_string(),
                 model_id: "gpt-5.5".to_string(),
                 model_source: "launch".to_string(),
+                session_mode: "general".to_string(),
+                file_authority: "task_scoped".to_string(),
+                coordination_mode: "bounded_direct_edit".to_string(),
                 native_session_id: "".to_string(),
                 observed_at_ms: Some(2000),
                 pane_id: "pane-session-history".to_string(),
@@ -2113,6 +2646,9 @@ mod workspace_threads_store_tests {
                 id: "session-history-other".to_string(),
                 model_id: "sonnet".to_string(),
                 model_source: "launch".to_string(),
+                session_mode: "general".to_string(),
+                file_authority: "task_scoped".to_string(),
+                coordination_mode: "bounded_direct_edit".to_string(),
                 native_session_id: "".to_string(),
                 observed_at_ms: Some(2000),
                 pane_id: "pane-other".to_string(),
@@ -2154,6 +2690,9 @@ mod workspace_threads_store_tests {
                 id: "session-history-1".to_string(),
                 model_id: "gpt-5.5".to_string(),
                 model_source: "launch".to_string(),
+                session_mode: "direct_edit".to_string(),
+                file_authority: "bounded_direct_edit".to_string(),
+                coordination_mode: "bounded_direct_edit".to_string(),
                 native_session_id: "codex-native-123".to_string(),
                 observed_at_ms: Some(3000),
                 pane_id: "pane-session-history".to_string(),
@@ -2185,6 +2724,9 @@ mod workspace_threads_store_tests {
         assert_eq!(result.items.len(), 1);
         let item = &result.items[0];
         assert_eq!(item.model_id, "gpt-5.5");
+        assert_eq!(item.session_mode, "direct_edit");
+        assert_eq!(item.file_authority, "bounded_direct_edit");
+        assert_eq!(item.coordination_mode, "bounded_direct_edit");
         assert_eq!(
             item.id,
             workspace_agent_session_history_record_id(
@@ -2212,6 +2754,9 @@ mod workspace_threads_store_tests {
                 id: "different-history-id-for-same-provider-session".to_string(),
                 model_id: "gpt-5.5".to_string(),
                 model_source: "launch".to_string(),
+                session_mode: "".to_string(),
+                file_authority: "".to_string(),
+                coordination_mode: "".to_string(),
                 native_session_id: "codex-native-123".to_string(),
                 observed_at_ms: Some(4000),
                 pane_id: "pane-session-history-duplicate".to_string(),
@@ -2256,6 +2801,9 @@ mod workspace_threads_store_tests {
                 id: "session-history-opencode-invalid".to_string(),
                 model_id: "anthropic/claude-sonnet-4-5".to_string(),
                 model_source: "launch".to_string(),
+                session_mode: "general".to_string(),
+                file_authority: "task_scoped".to_string(),
+                coordination_mode: "bounded_direct_edit".to_string(),
                 native_session_id: "019f0cd7-1347-7273-b20f-e959c3772a01".to_string(),
                 observed_at_ms: Some(4000),
                 pane_id: "pane-opencode".to_string(),
@@ -2369,6 +2917,106 @@ mod workspace_threads_store_tests {
         assert_eq!(item.provider_session_id, "claude-session-legacy-123");
         assert_eq!(item.created_at_ms, 1000);
         assert_eq!(item.latest_at_ms, 5000);
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn workspace_agent_session_history_list_limits_after_dedupe_and_keeps_fork_parent() {
+        let root = unique_workspace_threads_test_root("agent-session-history-limit-fork-parent");
+        fs::create_dir_all(&root).expect("create workspace root");
+        let root_text = root.to_string_lossy().to_string();
+        let (connection, root_path, _) =
+            workspace_threads_open_store(Some(root_text.as_str()), true).expect("open store");
+        let root_display = workspace_path_display(&root_path);
+
+        insert_workspace_agent_session_history_test_row(
+            &connection,
+            &root_display,
+            &root_text,
+            "legacy-child-row",
+            "codex-child-session",
+            "codex-parent-session",
+            3000,
+            9000,
+            "Child session",
+        );
+        insert_workspace_agent_session_history_test_row(
+            &connection,
+            &root_display,
+            &root_text,
+            "legacy-top-row-newer",
+            "codex-top-session",
+            "",
+            2000,
+            8000,
+            "Top session newer",
+        );
+        insert_workspace_agent_session_history_test_row(
+            &connection,
+            &root_display,
+            &root_text,
+            "legacy-top-row-older",
+            "codex-top-session",
+            "",
+            1000,
+            7000,
+            "Top session older",
+        );
+        insert_workspace_agent_session_history_test_row(
+            &connection,
+            &root_display,
+            &root_text,
+            "legacy-parent-row",
+            "codex-parent-session",
+            "",
+            500,
+            1000,
+            "Parent session",
+        );
+
+        let result = workspace_agent_session_history_list_blocking(
+            WorkspaceAgentSessionHistoryListRequest {
+                limit: Some(2),
+                root_directory: Some(root.to_string_lossy().to_string()),
+                workspace_id: "workspace-session-history".to_string(),
+            },
+        )
+        .expect("list limited fork history");
+        let provider_session_ids = result
+            .items
+            .iter()
+            .map(|item| item.provider_session_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            provider_session_ids,
+            vec![
+                "codex-child-session",
+                "codex-top-session",
+                "codex-parent-session"
+            ]
+        );
+        assert_eq!(
+            result
+                .items
+                .iter()
+                .filter(|item| item.provider_session_id == "codex-top-session")
+                .count(),
+            1
+        );
+        let top = result
+            .items
+            .iter()
+            .find(|item| item.provider_session_id == "codex-top-session")
+            .expect("top session");
+        assert_eq!(top.created_at_ms, 1000);
+        assert_eq!(top.latest_at_ms, 8000);
+        let child = result
+            .items
+            .iter()
+            .find(|item| item.provider_session_id == "codex-child-session")
+            .expect("child session");
+        assert_eq!(child.fork_from_provider_session_id, "codex-parent-session");
 
         let _ = fs::remove_dir_all(root);
     }

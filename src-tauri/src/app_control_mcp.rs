@@ -935,7 +935,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "create_loopspace_trigger",
-            "description": "Create a reusable Loopspace trigger inventory item. To put it in a graph, call patch_loopspace_graph with {op:'attach_trigger', trigger_id:'...'} after this succeeds.",
+            "description": "Create a reusable Loopspace trigger inventory item. Always pass trigger_type explicitly: cron, webhook, or manual. Webhook triggers are inbound and default to signed_hmac; use public_token only when the user explicitly asks for a public URL and public_webhook_confirmed=true. To put the trigger in a graph, call patch_loopspace_graph with {op:'attach_trigger', trigger_id:'...'} after this succeeds.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -970,6 +970,20 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "webhook_auth_mode": {"type": "string", "description": "signed_hmac or public_token."},
                     "webhook_signature_tolerance_sec": {"type": "integer", "description": "Signed webhook timestamp tolerance in seconds."},
                     "public_webhook_confirmed": {"type": "boolean", "description": "Required true when webhook_auth_mode is public_token."}
+                },
+                "additionalProperties": true
+            }
+        }),
+        json!({
+            "name": "delete_loopspace_trigger",
+            "description": "Delete a reusable Loopspace trigger inventory item by trigger_id or trigger_name. Use only when the user clearly asks to remove/delete a trigger. Removing inventory also removes the reusable trigger from the right-side Triggers tab; graph edits should use patch_loopspace_graph remove_node/remove_trigger when only detaching from one graph.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "trigger_id": {"type": "string"},
+                    "id": {"type": "string"},
+                    "trigger_name": {"type": "string"},
+                    "name": {"type": "string"}
                 },
                 "additionalProperties": true
             }
@@ -1038,7 +1052,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "update_loopspace_graph",
-            "description": "Replace a Loopspace graph document with full .dfblueprint source. The source field is required; prefer patch_loopspace_graph for small edits. Returns after the client hydrates the Cloud-accepted graph, unless queued/offline.",
+            "description": "Replace a Loopspace graph document with full .dfblueprint source. The source field is required; prefer patch_loopspace_graph for small edits. Call get_loopspace_graph and list_loopspace_triggers first. Trigger nodes must reference registered inventory ids; create missing triggers with create_loopspace_trigger, then attach by trigger_id. Edges must use explicit legal node.port endpoints: trigger.out, run_script/send_message exec|success|failure|interrupt, docs, assets, and target .in ports. Never create new action .out edges. Never connect action execution branches directly to asset_write. Returns after the client hydrates the Cloud-accepted graph, unless queued/offline.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1054,7 +1068,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "edit_loopspace_graph",
-            "description": "Alias for update_loopspace_graph. Replace a Loopspace graph document with full .dfblueprint source after reading the current graph. The source field is required.",
+            "description": "Alias for update_loopspace_graph. Replace a Loopspace graph document with full .dfblueprint source after reading the current graph and trigger inventory. The source field is required. Trigger nodes must reference registered inventory ids; create missing triggers first. Edges must use explicit legal node.port endpoints: trigger.out, run_script/send_message exec|success|failure|interrupt, docs, assets, and target .in ports. Never create new action .out edges. Never connect action execution branches directly to asset_write.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1070,7 +1084,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "patch_loopspace_graph",
-            "description": "Patch a Loopspace .dfblueprint graph without rewriting the whole source. Call get_loopspace_graph and list_loopspace_triggers first. Trigger graph nodes must reference inventory: use attach_trigger with trigger_id, or create_loopspace_trigger first. Do not invent standalone cron/manual/webhook nodes. For add_node, use supported node kinds: document_read, document_write, asset_read, asset_write, run_script, send_message, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message and run_script nodes. Edges are explicit node_id.port -> node_id.port connections. Resource ports: document_read/document_write expose docs; asset_read/asset_write expose assets. Use doc_refs for document selections, asset_refs for asset selections, h for resource node height, and target_mode for selection/create behavior. For send-message substep guidance, use document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for generated documents, and step.assets -> asset_write.in for generated assets. Write nodes may include create_name for a new/generated resource name. add_node and update_node_props accept resource metadata as top-level fields or nested under props.",
+            "description": "Patch a Loopspace .dfblueprint graph without rewriting the whole source. Call get_loopspace_graph and list_loopspace_triggers first. Trigger graph nodes must reference inventory: use attach_trigger with trigger_id, or create_loopspace_trigger first with explicit trigger_type. Do not invent standalone cron/manual/webhook nodes. For add_node, use supported node kinds: document_read, document_write, asset_read, asset_write, run_script, send_message, or step. Device nodes are legacy saved-graph compatibility only; target devices are selected on send_message and run_script nodes. Edges are explicit node_id.port -> node_id.port connections. Trigger nodes expose out; run_script/send_message expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; executable/resource targets generally accept in. Specify from_port/fromPort and to_port/toPort on connect operations, especially from action nodes. For send-message substeps, use step.success -> run_script.in or send_message.in when a completed substep should start another action. For substep resource guidance, use document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for generated documents, and step.assets -> asset_write.in for generated assets. Do not connect send_message.exec, send_message.success, run_script.exec, run_script.success, or other action execution branches directly into asset_write. Use doc_refs for document selections, asset_refs for asset selections, h for resource node height, and target_mode for selection/create behavior. Write nodes may include create_name for a new/generated resource name. add_node and update_node_props accept resource metadata as top-level fields or nested under props.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1081,7 +1095,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
                     "operations": {
                         "type": "array",
                         "items": {"type": "object", "additionalProperties": true},
-                        "description": "Examples: {op:'attach_trigger', trigger_id:'trigger-...', x:0, y:0}; {op:'add_node', id:'read_doc', kind:'document_read', label:'Read document'}; {op:'add_node', id:'make_asset', kind:'asset_write', label:'Create screenshot asset', create_name:'qa-screenshot.png'}; {op:'add_node', id:'message_agent', kind:'send_message', label:'Message agent'}; {op:'connect', from:'trigger-basic', to:'message_agent'}."
+                        "description": "Examples: {op:'attach_trigger', trigger_id:'trigger-...', x:0, y:0}; {op:'add_node', id:'read_doc', kind:'document_read', label:'Read document'}; {op:'add_node', id:'make_asset', kind:'asset_write', label:'Create screenshot asset', create_name:'qa-screenshot.png'}; {op:'add_node', id:'message_agent', kind:'send_message', label:'Message agent'}; {op:'connect', from:'trigger-basic', from_port:'out', to:'message_agent', to_port:'in'}; {op:'connect', from:'message_agent', from_port:'success', to:'next_message', to_port:'in'}."
                     },
                     "ops": {
                         "type": "array",
@@ -1093,7 +1107,7 @@ fn app_control_mcp_tools() -> Vec<Value> {
         }),
         json!({
             "name": "select_tab",
-            "description": "Switch the visible Diff Forge app tab. Supports terminals, files, history, tools, documents, mcps, clis, scripts, assets, audio, tokenomics, snipping, and settings.",
+            "description": "Switch the visible Diff Forge app tab. Supports terminals, files, history, tools, documents, mcps, clis, scripts, assets, audio, tokenomics, snipping, settings, and the Loopspaces-only right-side triggers tool tab.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1287,6 +1301,7 @@ fn app_control_mcp_call_tool(context: &AppControlMcpContext, tool: &str, input: 
         "list_loopspace_triggers",
         "create_loopspace_trigger",
         "update_loopspace_trigger",
+        "delete_loopspace_trigger",
         "run_loopspace_trigger",
         "record_loopspace_step_progress",
         "get_loopspace_graph",

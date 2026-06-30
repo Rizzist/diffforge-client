@@ -203,6 +203,7 @@ const TERMINAL_ACTIVITY_HOOK_EVENT: &str = "forge-terminal-activity-hook";
 const TERMINAL_PROVIDER_SESSION_BOUND_EVENT: &str = "forge-terminal-provider-session-bound";
 const WORKSPACE_AGENT_SESSION_HISTORY_CHANGED_EVENT: &str =
     "workspace-agent-session-history-changed";
+const AGENT_CHAT_SESSION_SYNC_STATUS_CHANGED_EVENT: &str = "agent-chat-session-sync-status-changed";
 const TERMINAL_ARCHITECTURE_ACTIVITY_EVENT: &str = "diffforge:terminal-architecture-activity";
 const TERMINAL_OUTPUT_STATE_EVENT: &str = "forge-terminal-output-state";
 const TERMINAL_PARKED_PROMPT_EVENT: &str = "forge-terminal-parked-prompt";
@@ -2551,6 +2552,7 @@ include!("cloud_mcp.rs");
 include!("local_scripts.rs");
 include!("assets.rs");
 include!("agent_sessions.rs");
+include!("agent_chat_sync.rs");
 include!("terminals.rs");
 include!("tools_window.rs");
 include!("web_panel.rs");

@@ -1077,11 +1077,11 @@ fn terminal_provider_session_binding_payload(
         terminal_recordable_provider_session_id_for_metadata(&metadata, Some(provider_session_id))?;
     let runtime = terminal_runtime_snapshot(instance);
     let fork_from_provider_session_id = runtime.fork_from_provider_session_id.clone().unwrap_or_default();
-    let shared_history_id = terminal_workspace_shared_history_id(
+    let shared_history_id = workspace_agent_session_history_shared_history_id(
         &metadata.workspace_id,
         &metadata.agent_kind,
         &provider_session_id,
-        Some(fork_from_provider_session_id.as_str()).filter(|value| !value.trim().is_empty()),
+        &fork_from_provider_session_id,
     );
     Some(WorkspaceThreadProviderSessionBinding {
         workspace_id: metadata.workspace_id,
@@ -1186,39 +1186,6 @@ fn terminal_record_workspace_provider_session_binding(
     });
 }
 
-fn terminal_workspace_agent_session_history_id(instance: &TerminalInstance) -> String {
-    instance
-        .coordination
-        .as_ref()
-        .map(|coordination| coordination.session_id.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| format!("terminal:{}:{}", instance.metadata.pane_id, instance.id))
-}
-
-fn terminal_workspace_shared_history_id(
-    workspace_id: &str,
-    agent_id: &str,
-    provider_session_id: &str,
-    fork_from_provider_session_id: Option<&str>,
-) -> String {
-    let workspace_id = workspace_id.trim();
-    let agent_id =
-        terminal_normalize_agent_kind(Some(agent_id)).unwrap_or_else(|| agent_id.trim().to_string());
-    let root_session_id = fork_from_provider_session_id
-        .and_then(|value| terminal_clean_provider_session_id(Some(value)))
-        .or_else(|| terminal_clean_provider_session_id(Some(provider_session_id)));
-    let Some(root_session_id) = root_session_id else {
-        return String::new();
-    };
-    if workspace_id.is_empty() || agent_id.trim().is_empty() {
-        return String::new();
-    }
-    format!("history:{workspace_id}:{agent_id}:{root_session_id}")
-        .chars()
-        .take(512)
-        .collect()
-}
-
 fn terminal_workspace_agent_session_slot_key(
     instance: &TerminalInstance,
     override_slot_key: Option<&str>,
@@ -1293,32 +1260,51 @@ fn terminal_record_workspace_agent_session_history(
     if provider_session_id.is_none() && native_session_id.is_none() {
         return;
     }
+    let visible_session_id = provider_session_id
+        .as_deref()
+        .or(native_session_id.as_deref())
+        .unwrap_or_default()
+        .to_string();
+    let canonical_history_id = workspace_agent_session_history_record_id(
+        &metadata.workspace_id,
+        &metadata.agent_kind,
+        &visible_session_id,
+    );
     let coordination_session_id = instance
         .coordination
         .as_ref()
         .map(|coordination| coordination.session_id.clone())
         .unwrap_or_default();
     let record = WorkspaceAgentSessionHistoryRecord {
-        id: terminal_workspace_agent_session_history_id(instance),
+        id: canonical_history_id,
         workspace_id: metadata.workspace_id.clone(),
         workspace_name: metadata.workspace_name,
         coordination_session_id,
         provider_session_id: provider_session_id.clone().unwrap_or_default(),
         native_session_id: native_session_id.clone().unwrap_or_default(),
         fork_from_provider_session_id: runtime.fork_from_provider_session_id.clone().unwrap_or_default(),
-        shared_history_id: terminal_workspace_shared_history_id(
+        shared_history_id: workspace_agent_session_history_shared_history_id(
             &metadata.workspace_id,
             &metadata.agent_kind,
             provider_session_id
                 .as_deref()
                 .or(native_session_id.as_deref())
                 .unwrap_or_default(),
-            runtime.fork_from_provider_session_id.as_deref(),
+            runtime.fork_from_provider_session_id.as_deref().unwrap_or_default(),
         ),
         agent_id: metadata.agent_id,
         provider: metadata.agent_kind,
         model_id: model_id.unwrap_or_default().trim().to_string(),
         model_source: model_source.unwrap_or_default().trim().to_string(),
+        session_mode: instance.session_mode.as_str().to_string(),
+        file_authority: instance.session_mode.file_authority().to_string(),
+        coordination_mode: instance
+            .coordination
+            .as_ref()
+            .and_then(|coordination| {
+                terminal_coordination_env_value(coordination, "COORDINATION_ENFORCEMENT_MODE")
+            })
+            .unwrap_or_default(),
         thread_id: metadata.thread_id,
         pane_id: metadata.pane_id,
         terminal_instance_id: Some(instance.id),
@@ -1331,9 +1317,6 @@ fn terminal_record_workspace_agent_session_history(
         observed_at_ms: Some(terminal_now_ms()),
         created_at_ms: None,
     };
-    if let Some(app) = app.as_ref() {
-        terminal_emit_workspace_agent_session_history_changed(app, &record, None);
-    }
     let root_directory = terminal_provider_session_binding_root(instance);
     let emit_app = app.clone();
     tauri::async_runtime::spawn_blocking(move || {
@@ -1344,6 +1327,13 @@ fn terminal_record_workspace_agent_session_history(
             Ok(recorded) => {
                 if let Some(app) = emit_app.as_ref() {
                     terminal_emit_workspace_agent_session_history_changed(app, &record, Some(recorded));
+                    if recorded {
+                        agent_chat_session_sync_spawn_from_history_record(
+                            app.clone(),
+                            record.clone(),
+                            "terminal_session_history",
+                        );
+                    }
                 }
             }
             Err(error) => log_terminal_status_event(
@@ -6141,7 +6131,7 @@ async fn terminal_open(
             "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
         }),
     );
-    let runtime_shared_history_id = Some(terminal_workspace_shared_history_id(
+    let runtime_shared_history_id = Some(workspace_agent_session_history_shared_history_id(
         &terminal_metadata_for_log.workspace_id,
         &terminal_metadata_for_log.agent_kind,
         runtime_snapshot
@@ -6149,7 +6139,10 @@ async fn terminal_open(
             .as_deref()
             .or(runtime_snapshot.native_session_id.as_deref())
             .unwrap_or_default(),
-        runtime_snapshot.fork_from_provider_session_id.as_deref(),
+        runtime_snapshot
+            .fork_from_provider_session_id
+            .as_deref()
+            .unwrap_or_default(),
     ))
     .filter(|value| !value.trim().is_empty());
     cloud_mcp_mark_terminal_opened(

@@ -5596,9 +5596,11 @@ export default function ArchitectureWorkspaceView({
   const [sessionHistoryItems, setSessionHistoryItems] = useState([]);
   const [sessionHistoryState, setSessionHistoryState] = useState("idle");
   const [sessionHistoryError, setSessionHistoryError] = useState("");
+  const sessionHistoryRefreshSeqRef = useRef(0);
   useEffect(() => {
     const workspaceId = text(activeWorkspaceId);
     if (!workspaceId) {
+      sessionHistoryRefreshSeqRef.current += 1;
       setSessionHistoryItems([]);
       setSessionHistoryState("idle");
       setSessionHistoryError("");
@@ -5608,6 +5610,8 @@ export default function ArchitectureWorkspaceView({
     const unlisteners = [];
     const rootDirectoryForStore = repoPath || rootDirectory || defaultWorkingDirectory || "";
     const refreshSessionHistory = () => {
+      const refreshSeq = sessionHistoryRefreshSeqRef.current + 1;
+      sessionHistoryRefreshSeqRef.current = refreshSeq;
       setSessionHistoryState((state) => (state === "ready" ? "refreshing" : "loading"));
       invoke("workspace_agent_session_history_list", {
         request: {
@@ -5617,19 +5621,32 @@ export default function ArchitectureWorkspaceView({
         },
       })
         .then((result) => {
-          if (cancelled) return;
+          if (cancelled || refreshSeq !== sessionHistoryRefreshSeqRef.current) return;
           setSessionHistoryItems(jsonArray(result?.items));
           setSessionHistoryError("");
           setSessionHistoryState("ready");
         })
         .catch((error) => {
-          if (cancelled) return;
+          if (cancelled || refreshSeq !== sessionHistoryRefreshSeqRef.current) return;
           setSessionHistoryError(String(error?.message || error || "Unable to load session history."));
           setSessionHistoryState("error");
         });
     };
     refreshSessionHistory();
     listen("workspace-agent-session-history-changed", (event) => {
+      if (cancelled) return;
+      const eventWorkspaceId = String(event?.payload?.workspaceId || "").trim();
+      if (!eventWorkspaceId || eventWorkspaceId === workspaceId) {
+        refreshSessionHistory();
+      }
+    }).then((unlisten) => {
+      if (cancelled) {
+        unlisten();
+        return;
+      }
+      unlisteners.push(unlisten);
+    }).catch(() => {});
+    listen("agent-chat-session-sync-status-changed", (event) => {
       if (cancelled) return;
       const eventWorkspaceId = String(event?.payload?.workspaceId || "").trim();
       if (!eventWorkspaceId || eventWorkspaceId === workspaceId) {
@@ -9655,6 +9672,12 @@ function sessionHistorySearchFields(item) {
     sessionHistoryModelLabel(item),
     item?.modelSource,
     item?.model_source,
+    item?.sessionMode,
+    item?.session_mode,
+    item?.fileAuthority,
+    item?.file_authority,
+    item?.coordinationMode,
+    item?.coordination_mode,
     sessionHistoryStatusLabel(item),
     item?.status,
     item?.provider,
@@ -9664,6 +9687,14 @@ function sessionHistorySearchFields(item) {
     item?.provider_session_id,
     item?.nativeSessionId,
     item?.native_session_id,
+    item?.forkFromProviderSessionId,
+    item?.fork_from_provider_session_id,
+    item?.sharedHistoryId,
+    item?.shared_history_id,
+    item?.chatSync?.status,
+    item?.chatSync?.label,
+    item?.chat_sync?.status,
+    item?.chat_sync?.label,
     item?.threadId,
     item?.thread_id,
     item?.source,
@@ -9700,22 +9731,12 @@ function sessionHistoryRowKey(item, index = 0) {
   );
 }
 
-function sessionHistoryExactSessionValues(value) {
+function sessionHistoryPrimarySessionValues(value) {
   const values = [
     value?.providerSessionId,
     value?.provider_session_id,
     value?.nativeSessionId,
     value?.native_session_id,
-    value?.forkFromProviderSessionId,
-    value?.fork_from_provider_session_id,
-    value?.forkedFromProviderSessionId,
-    value?.forked_from_provider_session_id,
-    value?.sharedHistoryId,
-    value?.shared_history_id,
-    value?.historyGroupId,
-    value?.history_group_id,
-    value?.relatedProviderSessionIds,
-    value?.related_provider_session_ids,
     value?.currentProviderSessionId,
     value?.current_provider_session_id,
     value?.currentNativeSessionId,
@@ -9737,9 +9758,18 @@ function sessionHistoryExactSessionValues(value) {
     }
   };
   values.forEach(append);
-  return flattened
-    .map((entry) => text(entry))
-    .filter(Boolean);
+  return Array.from(new Set(flattened.map((entry) => text(entry)).filter(Boolean)));
+}
+
+function sessionHistoryForkParentSessionId(item) {
+  return text(
+    item?.forkFromProviderSessionId
+      || item?.fork_from_provider_session_id
+      || item?.forkedFromProviderSessionId
+      || item?.forked_from_provider_session_id
+      || item?.parentProviderSessionId
+      || item?.parent_provider_session_id,
+  );
 }
 
 function sessionHistoryAgentMatches(item, terminal) {
@@ -9752,7 +9782,7 @@ function sessionHistoryAgentMatches(item, terminal) {
 }
 
 function sessionHistoryProviderSessionId(item) {
-  return sessionHistoryExactSessionValues(item)[0] || "";
+  return sessionHistoryPrimarySessionValues(item)[0] || "";
 }
 
 function sessionHistoryTerminalConnected(terminal) {
@@ -9770,8 +9800,8 @@ function sessionHistoryTerminalConnected(terminal) {
   return !["closed", "closing", "disconnected", "exited", "offline", "terminated"].includes(status);
 }
 
-function sessionHistoryFindTerminal(item, terminalOptions = []) {
-  const itemSessionIds = new Set(sessionHistoryExactSessionValues(item));
+function sessionHistoryFindExactTerminal(item, terminalOptions = []) {
+  const itemSessionIds = new Set(sessionHistoryPrimarySessionValues(item));
   if (!itemSessionIds.size) {
     return null;
   }
@@ -9782,8 +9812,60 @@ function sessionHistoryFindTerminal(item, terminalOptions = []) {
     if (!sessionHistoryAgentMatches(item, terminal)) {
       return false;
     }
-    return sessionHistoryExactSessionValues(terminal).some((sessionId) => itemSessionIds.has(sessionId));
+    return sessionHistoryPrimarySessionValues(terminal).some((sessionId) => itemSessionIds.has(sessionId));
   }) || null;
+}
+
+function sessionHistoryChatSyncStatus(item, terminalMatch = null) {
+  if (terminalMatch) {
+    return {
+      label: "Live",
+      status: "live",
+      title: `Live in ${terminalMatch.label || "terminal"}`,
+    };
+  }
+  const sync = item?.chatSync || item?.chat_sync || {};
+  const rawStatus = text(sync.status || sync.state || sync.syncStatus || sync.sync_status, "waiting").toLowerCase();
+  const status = ["live", "waiting", "syncing", "synced", "failed"].includes(rawStatus)
+    ? rawStatus
+    : rawStatus === "retrying" || rawStatus === "active"
+      ? "syncing"
+      : rawStatus === "done" || rawStatus === "acked"
+        ? "synced"
+        : "waiting";
+  const labels = {
+    failed: "Failed",
+    live: "Live",
+    synced: "Synced",
+    syncing: "Syncing",
+    waiting: "Waiting",
+  };
+  const pending = Number(sync.pendingPacketCount ?? sync.pending_packet_count ?? 0) || 0;
+  const syncing = Number(sync.syncingPacketCount ?? sync.syncing_packet_count ?? 0) || 0;
+  const retrying = Number(sync.retryingPacketCount ?? sync.retrying_packet_count ?? 0) || 0;
+  const failed = Number(sync.failedPacketCount ?? sync.failed_packet_count ?? 0) || 0;
+  const acked = Number(sync.recordAckedCount ?? sync.record_acked_count ?? 0) || 0;
+  const total = Number(sync.recordTotalCount ?? sync.record_total_count ?? 0) || 0;
+  const parts = [];
+  if (pending) parts.push(`${pending} waiting`);
+  if (syncing) parts.push(`${syncing} sending`);
+  if (retrying) parts.push(`${retrying} retrying`);
+  if (failed) parts.push(`${failed} failed`);
+  if (acked || total) parts.push(`${acked}/${total || acked} records`);
+  const lastError = text(sync.lastError || sync.last_error);
+  if (lastError) parts.push(lastError);
+  return {
+    label: text(sync.label, labels[status]),
+    status,
+    title: parts.length ? parts.join(" · ") : labels[status],
+  };
+}
+
+function sessionHistoryRowMatchesSession(item, sessionId, agentKey = "") {
+  const targetSessionId = text(sessionId);
+  if (!targetSessionId) return false;
+  if (agentKey && sessionHistoryAgentKey(item) !== agentKey) return false;
+  return sessionHistoryPrimarySessionValues(item).includes(targetSessionId);
 }
 
 function SessionHistoryProviderIcon({ item }) {
@@ -9810,7 +9892,7 @@ function SessionHistoryProviderIcon({ item }) {
   return <Terminal aria-hidden="true" />;
 }
 
-const SESSION_HISTORY_ROW_HEIGHT = 84;
+const SESSION_HISTORY_ROW_HEIGHT = 92;
 const SESSION_HISTORY_ROW_GAP = 8;
 const SESSION_HISTORY_OVERSCAN = 6;
 
@@ -9864,6 +9946,34 @@ function SessionHistoryPanel({
   );
   const virtualItems = filteredItems.slice(startIndex, endIndex);
   const totalListHeight = Math.max(0, filteredItems.length * rowStride - SESSION_HISTORY_ROW_GAP);
+  const scrollToSession = useCallback((sessionId, agentKey = "") => {
+    const targetSessionId = text(sessionId);
+    if (!targetSessionId) return false;
+    const scrollToIndex = (index) => {
+      if (index < 0) return false;
+      const nextTop = Math.max(0, index * rowStride);
+      setScrollTop(nextTop);
+      if (listRef.current) {
+        listRef.current.scrollTop = nextTop;
+      }
+      return true;
+    };
+    const visibleIndex = filteredItems.findIndex((candidate) => (
+      sessionHistoryRowMatchesSession(candidate, targetSessionId, agentKey)
+    ));
+    if (scrollToIndex(visibleIndex)) return true;
+    const allIndex = items.findIndex((candidate) => (
+      sessionHistoryRowMatchesSession(candidate, targetSessionId, agentKey)
+    ));
+    if (allIndex >= 0) {
+      setSearchQuery("");
+      window.setTimeout(() => {
+        scrollToIndex(allIndex);
+      }, 0);
+      return true;
+    }
+    return false;
+  }, [filteredItems, items, rowStride]);
   return (
     <HistoryPane>
       <SessionHistoryHeaderBlock>
@@ -9911,8 +10021,13 @@ function SessionHistoryPanel({
             const latestMs = parseTimeMs(item?.latestAtMs ?? item?.latest_at_ms);
             const statusKind = sessionHistoryStatusKind(item);
             const id = sessionHistoryRowKey(item, index);
-            const terminalMatch = sessionHistoryFindTerminal(item, terminalOptions);
+            const terminalMatch = sessionHistoryFindExactTerminal(item, terminalOptions);
+            const syncBadge = sessionHistoryChatSyncStatus(item, terminalMatch);
             const providerSessionId = sessionHistoryProviderSessionId(item);
+            const forkParentSessionId = sessionHistoryForkParentSessionId(item);
+            const hasForkParentRow = Boolean(forkParentSessionId && items.some((candidate) => (
+              sessionHistoryRowMatchesSession(candidate, forkParentSessionId, sessionHistoryAgentKey(item))
+            )));
             const sessionTitle = sessionHistoryTitle(item);
             return (
               <SessionHistoryVirtualRow
@@ -9931,6 +10046,22 @@ function SessionHistoryPanel({
                       </div>
                       <SessionHistoryCardTopActions>
                         <StatusPill data-status={statusKind}>{sessionHistoryStatusLabel(item)}</StatusPill>
+                        <SessionHistorySyncBadge data-status={syncBadge.status} title={syncBadge.title}>
+                          {syncBadge.label}
+                        </SessionHistorySyncBadge>
+                        {forkParentSessionId && (
+                          <SessionHistoryActionButton
+                            aria-label={`Show fork parent for ${sessionTitle}`}
+                            data-variant="fork"
+                            disabled={!hasForkParentRow}
+                            onClick={() => scrollToSession(forkParentSessionId, sessionHistoryAgentKey(item))}
+                            title={hasForkParentRow ? "Scroll to the session this was forked from" : "Fork parent is not in this history list"}
+                            type="button"
+                          >
+                            <Hub aria-hidden="true" />
+                            <span>Fork</span>
+                          </SessionHistoryActionButton>
+                        )}
                         {terminalMatch ? (
                           <SessionHistoryActionButton
                             aria-label={`Go-to this terminal tab for ${sessionTitle}`}
@@ -9944,7 +10075,7 @@ function SessionHistoryPanel({
                             type="button"
                           >
                             <Terminal aria-hidden="true" />
-                            <span>Go-to this terminal tab</span>
+                            <span>Go-to</span>
                           </SessionHistoryActionButton>
                         ) : (
                           <SessionHistoryActionButton
@@ -13622,7 +13753,7 @@ const SessionHistoryVirtualRow = styled.div`
   top: 0;
   left: 0;
   right: 2px;
-  height: 84px;
+  height: 92px;
   will-change: transform;
 `;
 
@@ -13632,7 +13763,7 @@ const SessionHistoryCard = styled.article`
   align-items: center;
   gap: 10px;
   box-sizing: border-box;
-  height: 84px;
+  height: 92px;
   min-width: 0;
   padding: 10px;
   border: 1px solid rgba(148, 163, 184, 0.13);
@@ -13701,8 +13832,10 @@ const SessionHistoryCardTopActions = styled.div`
   display: flex;
   align-items: center;
   flex: 0 0 auto;
+  flex-wrap: wrap;
   gap: 6px;
   justify-content: flex-end;
+  max-width: min(48%, 380px);
   min-width: 0;
 
   @media (max-width: 760px) {
@@ -13746,6 +13879,12 @@ const SessionHistoryActionButton = styled.button`
     background: rgba(22, 101, 52, 0.18);
   }
 
+  &[data-variant="fork"] {
+    border-color: rgba(251, 191, 36, 0.22);
+    color: rgba(254, 243, 199, 0.94);
+    background: rgba(146, 64, 14, 0.18);
+  }
+
   &:hover:not(:disabled) {
     border-color: rgba(125, 211, 252, 0.5);
     background: rgba(14, 116, 144, 0.3);
@@ -13758,6 +13897,52 @@ const SessionHistoryActionButton = styled.button`
 
   @media (max-width: 760px) {
     max-width: 100%;
+  }
+`;
+
+const SessionHistorySyncBadge = styled.span`
+  flex: 0 0 auto;
+  min-width: 52px;
+  padding: 2px 6px;
+  border: 1px solid rgba(148, 163, 184, 0.13);
+  border-radius: 6px;
+  color: rgba(203, 213, 225, 0.72);
+  background: rgba(51, 65, 85, 0.1);
+  font-size: 8px;
+  font-weight: 880;
+  line-height: 1.05;
+  text-align: center;
+  text-transform: uppercase;
+  white-space: nowrap;
+
+  &[data-status="live"] {
+    border-color: rgba(45, 212, 191, 0.2);
+    color: rgba(153, 246, 228, 0.82);
+    background: rgba(15, 118, 110, 0.14);
+  }
+
+  &[data-status="waiting"] {
+    border-color: rgba(56, 189, 248, 0.16);
+    color: rgba(186, 230, 253, 0.72);
+    background: rgba(8, 47, 73, 0.11);
+  }
+
+  &[data-status="syncing"] {
+    border-color: rgba(96, 165, 250, 0.2);
+    color: rgba(191, 219, 254, 0.78);
+    background: rgba(30, 64, 175, 0.13);
+  }
+
+  &[data-status="synced"] {
+    border-color: rgba(52, 211, 153, 0.16);
+    color: rgba(167, 243, 208, 0.76);
+    background: rgba(6, 78, 59, 0.11);
+  }
+
+  &[data-status="failed"] {
+    border-color: rgba(251, 113, 133, 0.18);
+    color: rgba(254, 205, 211, 0.76);
+    background: rgba(127, 29, 29, 0.12);
   }
 `;
 

@@ -15873,6 +15873,7 @@ function WorkspaceTerminal({
       role: terminalAgentKind,
       sessionTitle: thread?.sessionName || thread?.title || "Original session",
       source: "terminal_fork_original",
+      sourceWindowBreakoutHosted: windowBreakoutHosted,
       terminalIndex,
       threadId: currentThreadId,
       workspaceId: workspace?.id || "",
@@ -15924,6 +15925,7 @@ function WorkspaceTerminal({
       agentId: terminalAgentKind,
       paneId,
       providerSessionPresent: true,
+      sourceWindowBreakoutHosted: windowBreakoutHosted,
       terminalIndex,
       threadId: currentThreadId,
       workspaceId: workspace?.id || "",
@@ -15951,6 +15953,7 @@ function WorkspaceTerminal({
     thread?.sessionName,
     thread?.title,
     threadProviderModel,
+    windowBreakoutHosted,
     workspace?.id,
   ]);
   const requestForkTerminal = useCallback(() => {

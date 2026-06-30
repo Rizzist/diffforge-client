@@ -16280,10 +16280,22 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     ))
   ), [loopspacesModeActive, workspaceScopedTabsEnabled]);
   useEffect(() => {
-    if (!workspaceToolTabs.some((tool) => tool.id === activeWorkspaceTool)) {
+    const loopspaceToolAvailable = LOOPSPACE_ONLY_WORKSPACE_TOOL_TAB_IDS.has(activeWorkspaceTool)
+      && getForgeSpaceMode() === "loopspaces";
+    if (!workspaceToolTabs.some((tool) => tool.id === activeWorkspaceTool) && !loopspaceToolAvailable) {
       setActiveWorkspaceTool("orchestrator");
     }
   }, [activeWorkspaceTool, workspaceToolTabs]);
+  const selectWorkspaceToolTab = useCallback((toolId) => {
+    const safeToolId = String(toolId || "").trim();
+    const loopspaceToolAvailable = LOOPSPACE_ONLY_WORKSPACE_TOOL_TAB_IDS.has(safeToolId)
+      && getForgeSpaceMode() === "loopspaces";
+    if (!workspaceToolTabs.some((tool) => tool.id === safeToolId) && !loopspaceToolAvailable) {
+      return false;
+    }
+    setActiveWorkspaceTool(safeToolId);
+    return true;
+  }, [workspaceToolTabs]);
 
   // Prefetch account docs as soon as the orchestrator panel mounts so the Docs
   // tab opens instantly, never "loading".
@@ -21492,6 +21504,7 @@ function TerminalView({
   const [terminalBreakoutPhase, setTerminalBreakoutPhase] = useState(TERMINAL_BREAKOUT_PHASE_GRID);
   const [windowBreakoutPanes, setWindowBreakoutPanes] = useState({});
   const windowBreakoutPanesRef = useRef(windowBreakoutPanes);
+  const pendingForkWindowBreakoutPanesRef = useRef(new Map());
   const closeWindowBreakoutRef = useRef(null);
   // Web panes that are currently popped out into their own window.
   const [webBreakoutPanes, setWebBreakoutPanes] = useState({});
@@ -26361,14 +26374,17 @@ function TerminalView({
 
   const handleForkTerminal = useCallback(({
     model = "",
+    paneId = "",
     providerSessionId = "",
     role = "",
     sessionTitle = "",
+    sourceWindowBreakoutHosted = false,
     terminalIndex,
     workspaceId = "",
   } = {}) => {
     const targetWorkspaceId = String(workspaceId || terminalWorkspace?.id || "").trim();
     const sourceProviderSessionId = String(providerSessionId || "").trim();
+    const sourcePaneId = String(paneId || "").trim();
     if (
       !targetWorkspaceId
       || !sourceProviderSessionId
@@ -26378,7 +26394,7 @@ function TerminalView({
       return null;
     }
 
-    return addWorkspaceTerminal({
+    const addedTerminal = addWorkspaceTerminal({
       model,
       providerSessionId: sourceProviderSessionId,
       role: role || getTerminalRole(terminalIndex),
@@ -26386,6 +26402,35 @@ function TerminalView({
       source: "terminal_fork_original",
       workspaceId: targetWorkspaceId,
     });
+
+    if (!addedTerminal) {
+      return null;
+    }
+
+    const mirrorWindowBreakout = Boolean(
+      sourceWindowBreakoutHosted
+      || (sourcePaneId && windowBreakoutPanesRef.current?.[sourcePaneId]),
+    );
+    if (mirrorWindowBreakout) {
+      const addedTerminalIndex = Number.parseInt(addedTerminal.terminalIndex, 10);
+      if (Number.isInteger(addedTerminalIndex)) {
+        const addedTerminalRole = addedTerminal.terminalRole || role || getTerminalRole(terminalIndex);
+        const addedPaneId = getWorkspaceTerminalPaneId(
+          targetWorkspaceId,
+          addedTerminalIndex,
+          addedTerminalRole,
+        );
+        pendingForkWindowBreakoutPanesRef.current.set(addedPaneId, {
+          paneId: addedPaneId,
+          requestedAt: Date.now(),
+          sourcePaneId,
+          terminalIndex: addedTerminalIndex,
+          workspaceId: targetWorkspaceId,
+        });
+      }
+    }
+
+    return addedTerminal;
   }, [
     addWorkspaceTerminal,
     getTerminalRole,
@@ -26723,6 +26768,10 @@ function TerminalView({
   }, [windowBreakoutPanes]);
 
   useEffect(() => {
+    pendingForkWindowBreakoutPanesRef.current.clear();
+  }, [terminalWorkspace?.id]);
+
+  useEffect(() => {
     webBreakoutPanesRef.current = webBreakoutPanes;
   }, [webBreakoutPanes]);
 
@@ -26765,15 +26814,65 @@ function TerminalView({
   const popOutTerminalWindowForIndex = useCallback(async (terminalIndex, paneId) => {
     const safePaneId = String(paneId || "").trim();
     if (!safePaneId || windowBreakoutPanesRef.current[safePaneId]) {
-      return;
+      return false;
     }
     try {
       await openTerminalWindowForIndex(terminalIndex, safePaneId);
       setWindowBreakoutPanes((current) => ({ ...current, [safePaneId]: true }));
+      return true;
     } catch {
       // Panes that have not launched a PTY yet simply stay in the grid.
+      return false;
     }
   }, [openTerminalWindowForIndex]);
+
+  const openPendingForkWindowBreakout = useCallback((event = {}) => {
+    const paneId = String(event.paneId || event.pane_id || "").trim();
+    if (!paneId) {
+      return;
+    }
+
+    const pending = pendingForkWindowBreakoutPanesRef.current.get(paneId);
+    if (!pending) {
+      return;
+    }
+
+    const eventType = String(event.type || "").trim().toLowerCase();
+    if (
+      event.forgetTerminalThread === true
+      || eventType === "closed"
+      || eventType === "exited"
+      || eventType === "error"
+    ) {
+      pendingForkWindowBreakoutPanesRef.current.delete(paneId);
+      return;
+    }
+
+    const eventWorkspaceId = String(
+      event.workspaceId
+        || event.workspace_id
+        || terminalWorkspace?.id
+        || "",
+    ).trim();
+    if (pending.workspaceId && eventWorkspaceId && pending.workspaceId !== eventWorkspaceId) {
+      return;
+    }
+
+    const instanceId = Number(event.instanceId || event.instance_id || 0);
+    const terminalIndex = Number.parseInt(
+      event.terminalIndex ?? event.terminal_index ?? pending.terminalIndex,
+      10,
+    );
+    if (!Number.isInteger(terminalIndex) || instanceId <= 0) {
+      return;
+    }
+
+    pendingForkWindowBreakoutPanesRef.current.delete(paneId);
+    void popOutTerminalWindowForIndex(terminalIndex, paneId);
+  }, [
+    popOutTerminalWindowForIndex,
+    terminalWorkspace?.id,
+  ]);
 
   // Window Breakout: every grid terminal becomes its own native window. The
   // PTYs never restart; the windows attach as extra output subscribers, and
@@ -27081,7 +27180,8 @@ function TerminalView({
   // workspace switched, agent slot reassigned).
   useEffect(() => {
     const currentPaneIds = Object.keys(windowBreakoutPanesRef.current);
-    if (!currentPaneIds.length) {
+    const pendingPaneIds = Array.from(pendingForkWindowBreakoutPanesRef.current.keys());
+    if (!currentPaneIds.length && !pendingPaneIds.length) {
       return;
     }
 
@@ -27091,6 +27191,11 @@ function TerminalView({
     currentPaneIds.forEach((paneId) => {
       if (!validPaneIds.has(paneId)) {
         invoke("terminal_window_close", { paneId }).catch(() => {});
+      }
+    });
+    pendingPaneIds.forEach((paneId) => {
+      if (!validPaneIds.has(paneId)) {
+        pendingForkWindowBreakoutPanesRef.current.delete(paneId);
       }
     });
   }, [getTerminalPaneId, logicalTerminalIndexes]);
@@ -28911,6 +29016,7 @@ function TerminalView({
   ]);
 
   const handleWorkspaceTerminalLifecycle = useCallback((event) => {
+    openPendingForkWindowBreakout(event);
     recordTodoQueueTerminalLifecycle(event);
     materializeTerminalDirectTodoFromLifecycle(event);
     settleTerminalDirectTodoFromReadiness(event);
@@ -28918,6 +29024,7 @@ function TerminalView({
   }, [
     materializeTerminalDirectTodoFromLifecycle,
     onThreadTerminalLifecycle,
+    openPendingForkWindowBreakout,
     recordTodoQueueTerminalLifecycle,
     settleTerminalDirectTodoFromReadiness,
   ]);
@@ -32723,6 +32830,7 @@ function TerminalView({
     onWorkspaceToolRuntimeBridgeChange(workspaceId, {
       onBeginTodoDrag: handleWorkspaceToolBeginTodoDrag,
       onOpenDocumentPanel: openWorkspaceDocumentPanel,
+      onSelectWorkspaceTool: selectWorkspaceToolTab,
       onToggleTerminalBreakout: toggleTerminalBreakout,
       onToggleWindowBreakout: toggleWindowBreakout,
       onVoiceAgentToolCall: handleVoiceAgentToolCall,
@@ -32740,6 +32848,7 @@ function TerminalView({
     handleVoicePlanServerResult,
     onWorkspaceToolRuntimeBridgeChange,
     openWorkspaceDocumentPanel,
+    selectWorkspaceToolTab,
     terminalBreakoutVisible,
     terminalWorkspace?.id,
     toggleTerminalBreakout,

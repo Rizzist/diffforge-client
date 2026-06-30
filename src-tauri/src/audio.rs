@@ -9004,16 +9004,6 @@ async fn start_cloud_voice_agent_stream(
                 ],
                 "allowed_tools": ["create_plan", "open_coding_agents", "dispatch_remote_tasks", "device_control", "highlight_terminal"],
                 "context_sources": ["recent_agent_sessions"],
-                "recent_agent_session_limit": CLOUD_MCP_AGENT_SESSION_CONTEXT_LIMIT,
-                "agent_session_summary_policy": {
-                    "mode": "todos_with_cloud_llm_compression",
-                    "chunk_size": CLOUD_MCP_AGENT_SESSION_TODO_CHUNK_SIZE,
-                    "summary_item_limit": CLOUD_MCP_AGENT_SESSION_SUMMARY_ITEM_LIMIT,
-                    "recent_raw_todo_limit": CLOUD_MCP_AGENT_SESSION_RECENT_RAW_TODO_LIMIT,
-                    "compression": "cloud_llm",
-                    "open_coding_agents_accepts_context": true,
-                    "highlight_terminal_accepts_context": true,
-                },
                 "tool_choice": "auto",
                 "response_contract": {
                     "immediate_feedback_required": true,

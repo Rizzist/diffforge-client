@@ -2103,6 +2103,15 @@ function normalizeAppControlTabId(value) {
   if (!normalized) {
     return null;
   }
+  if (normalized === "trigger" || normalized === "triggers" || normalized === "loopspace_trigger" || normalized === "loopspace_triggers") {
+    return {
+      id: "triggers",
+      scope: "workspace-tool",
+      view: DEFAULT_WORKSPACE_VIEW,
+      requiredSpaceMode: "loopspaces",
+      workspaceTool: "triggers",
+    };
+  }
   const workspaceTab = normalizeWorkspaceTabId(normalized);
   if (workspaceTab) {
     return {
@@ -32007,6 +32016,7 @@ export default function App() {
       const nextBridge = {
         onBeginTodoDrag: bridge.onBeginTodoDrag,
         onOpenDocumentPanel: bridge.onOpenDocumentPanel,
+        onSelectWorkspaceTool: bridge.onSelectWorkspaceTool,
         onToggleTerminalBreakout: bridge.onToggleTerminalBreakout,
         onToggleWindowBreakout: bridge.onToggleWindowBreakout,
         onVoiceAgentToolCall: bridge.onVoiceAgentToolCall,
@@ -32020,6 +32030,7 @@ export default function App() {
         previousBridge
         && previousBridge.onBeginTodoDrag === nextBridge.onBeginTodoDrag
         && previousBridge.onOpenDocumentPanel === nextBridge.onOpenDocumentPanel
+        && previousBridge.onSelectWorkspaceTool === nextBridge.onSelectWorkspaceTool
         && previousBridge.onToggleTerminalBreakout === nextBridge.onToggleTerminalBreakout
         && previousBridge.onToggleWindowBreakout === nextBridge.onToggleWindowBreakout
         && previousBridge.onVoiceAgentToolCall === nextBridge.onVoiceAgentToolCall
@@ -35731,7 +35742,7 @@ export default function App() {
       if (rawName) {
         return workspaces.find((workspace) => String(workspace.name || "").trim().toLowerCase() === rawName) || null;
       }
-      return selectedWorkspace || null;
+      return selectedWorkspace || activatedWorkspace || null;
     };
     const collectAppControlValues = (...values) => {
       const collected = [];
@@ -37480,6 +37491,7 @@ export default function App() {
           "tokenomics",
           "snipping",
           "settings",
+          "triggers",
         ],
       };
     };
@@ -38262,6 +38274,50 @@ export default function App() {
           return;
         }
 
+        if (tool === "delete_loopspace_trigger") {
+          let triggerId = appControlText(input, ["trigger_id", "triggerId", "id"]);
+          const triggerName = appControlText(input, ["trigger_name", "triggerName", "name"]);
+          let trigger = null;
+          const rows = await getLoopspaceTriggerRowsForAppControl(true);
+          if (triggerId) {
+            trigger = rows.find((row) => row.id === triggerId) || null;
+          } else if (triggerName) {
+            const normalizedName = triggerName.toLowerCase();
+            trigger = rows.find((row) => row.name.toLowerCase() === normalizedName)
+              || rows.find((row) => row.id === triggerName)
+              || null;
+            triggerId = trigger?.id || "";
+          }
+          if (!triggerId) {
+            sendAppControlReply(requestId, {
+              ok: false,
+              error: {
+                code: "trigger_not_found",
+                message: "No matching Loopspace trigger was found.",
+              },
+              data: {
+                state: buildAppControlState(),
+                triggers: rows,
+              },
+            });
+            return;
+          }
+          const result = await invoke("cloud_mcp_delete_loopspace_trigger", {
+            triggerId,
+          });
+          sendAppControlReply(requestId, {
+            ok: result?.ok !== false,
+            data: {
+              result,
+              trigger: trigger || { id: triggerId },
+              triggerId,
+              triggers: appControlLoopspaceTriggerRows(result),
+              state: buildAppControlState(),
+            },
+          });
+          return;
+        }
+
         if (tool === "run_loopspace_trigger") {
           let triggerId = appControlText(input, ["triggerId", "trigger_id", "id"]);
           const triggerName = appControlText(input, ["triggerName", "trigger_name", "name"]);
@@ -38570,7 +38626,7 @@ export default function App() {
               result,
               source_format: DFBLUEPRINT_SOURCE_FORMAT,
               blueprint: parseDfBlueprintSource(String(result?.graph?.source || result?.graph?.sourceText || result?.graph?.source_text || "")),
-              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: run_script/send_message expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. document_write accepts operation append|replace|prepend|create_if_missing|delete and optional content_template for deterministic webhook/body writes without an agent. asset_write accepts operation add_version|replace|create_if_missing|delete and optional content_template for deterministic webhook/body assets without an agent. To guide a send-message substep, connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation. add_node and update_node_props accept resource metadata as top-level fields or nested under props. Never invent standalone cron/manual/webhook trigger nodes.",
+              instructions: "Loopspace graphs use .dfblueprint source. Prefer patch_loopspace_graph for small edits. Trigger nodes are references to trigger inventory only: call list_loopspace_triggers, use create_loopspace_trigger with explicit trigger_type if needed, then patch with attach_trigger and trigger_id. Edges must use legal node contract ports: triggers expose out; run_script/send_message expose exec, success, failure, interrupt; document_read/document_write expose docs; asset_read/asset_write expose assets; most executable targets accept in. Specify from_port/fromPort and to_port/toPort on connect operations, especially from action nodes. Supported add_node kinds are document_read, document_write, asset_read, asset_write, run_script, send_message, and step. Resource nodes use doc_refs or asset_refs for selected inputs, create_name for generated outputs, h for height, and target_mode for selection/create behavior. document_write accepts operation append|replace|prepend|create_if_missing|delete and optional content_template for deterministic webhook/body writes without an agent. asset_write accepts operation add_version|replace|create_if_missing|delete and optional content_template for deterministic webhook/body assets without an agent. To guide a send-message substep, connect step.success -> run_script.in or send_message.in when a completed substep should start another action; connect document_read.docs or document_write.docs -> step.in for readable document context, asset_read.assets or asset_write.assets -> step.in for readable asset context, step.docs -> document_write.in for document generation, and step.assets -> asset_write.in for asset generation. Do not connect send_message.exec, send_message.success, run_script.exec, run_script.success, or other action execution branches directly into asset_write. add_node and update_node_props accept resource metadata as top-level fields or nested under props. Never invent standalone cron/manual/webhook trigger nodes.",
               loopspace: { id: loopspace.id, name: loopspace.name },
               state: buildAppControlState(),
             },
@@ -38856,18 +38912,62 @@ export default function App() {
               });
               return;
             }
+          } else if (tab.scope === "workspace-tool") {
+            workspace = resolveWorkspaceForAppControl(input);
+            if (!workspace) {
+              sendAppControlReply(requestId, {
+                ok: false,
+                error: {
+                  code: "workspace_required",
+                  message: "A workspace runtime must be available before opening that tool tab.",
+                },
+                data: buildAppControlState(),
+              });
+              return;
+            }
+            if (!workspaceToolRuntimeBridges[workspace.id]) {
+              const activated = requestWorkspaceActivation(workspace.id, "app_control_mcp_tab");
+              if (!activated) {
+                sendAppControlReply(requestId, {
+                  ok: false,
+                  error: {
+                    code: "workspace_activation_blocked",
+                    message: "Workspace could not be selected for that tool tab.",
+                  },
+                  data: buildAppControlState(),
+                });
+                return;
+              }
+            }
+            if (tab.requiredSpaceMode === APP_SPACE_MODE_LOOPSPACES) {
+              enterLoopspacesMode("app_control_mcp_tab");
+              applyForgeThemePreference(appAppearanceSettings.theme, APP_SPACE_MODE_LOOPSPACES);
+            }
           }
           showView(tab.view, {
             immediate: true,
             telemetrySource: "app_control_mcp",
             telemetryWorkspaceId: workspace?.id || selectedWorkspaceId || "",
           });
+          let workspaceToolSelected = true;
+          if (tab.scope === "workspace-tool") {
+            setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
+            const bridge = workspace?.id ? workspaceToolRuntimeBridges[workspace.id] || null : null;
+            workspaceToolSelected = Boolean(bridge?.onSelectWorkspaceTool?.(tab.workspaceTool));
+          }
           sendAppControlReply(requestId, {
-            ok: true,
+            ok: workspaceToolSelected,
+            ...(workspaceToolSelected ? {} : {
+              error: {
+                code: "workspace_tool_tab_unavailable",
+                message: "The requested workspace tool tab is not available in the current workspace mode.",
+              },
+            }),
             data: {
               selectedTab: tab.id,
               view: tab.view,
               scope: tab.scope,
+              workspaceTool: tab.workspaceTool || "",
               workspace: workspace ? workspaceSummary(workspace) : null,
               state: buildAppControlState(),
             },
@@ -39005,9 +39105,11 @@ export default function App() {
     activatedWorkspace,
     activatedWorkspaceId,
     agentStatuses,
+    appAppearanceSettings.theme,
     closeWorkspaceTerminal,
     deactivateWorkspace,
     defaultWorkingDirectory,
+    enterLoopspacesMode,
     requestWorkspaceActivation,
     selectedWorkspace,
     selectedWorkspaceId,
@@ -39017,6 +39119,7 @@ export default function App() {
     workspaceSettings,
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
+    workspaceToolRuntimeBridges,
     workspaces,
     accountAssetsLibrary.refresh,
   ]);

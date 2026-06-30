@@ -4092,6 +4092,13 @@ async fn emit_agent_thread_transcript_watch_update(
             "workspaceId": context.workspace_id,
         }),
     );
+    agent_chat_session_sync_spawn_from_result(
+        app,
+        &context.agent_id,
+        &result,
+        agent_chat_session_sync_context_from_watch(&context),
+        "transcript_watch_update",
+    );
 }
 
 fn register_agent_thread_transcript_watch(
@@ -4231,6 +4238,17 @@ async fn agent_thread_session_discover(
     }?;
     promote_result_generated_image_artifacts(&mut result, workspace_id);
     emit_promoted_generated_asset_event(&app, &result, workspace_id, "session-discover");
+    agent_chat_session_sync_spawn_from_result(
+        app,
+        &agent_id,
+        &result,
+        AgentChatSessionSyncContext {
+            workspace_id: workspace_id.unwrap_or_default().to_string(),
+            source: "session-discover".to_string(),
+            ..AgentChatSessionSyncContext::default()
+        },
+        "session_discover",
+    );
     Ok(result)
 }
 
@@ -4261,6 +4279,17 @@ async fn agent_thread_transcript(
         request.workspace_id.as_deref(),
         "transcript-read",
     );
+    agent_chat_session_sync_spawn_from_result(
+        app,
+        &agent_id,
+        &result,
+        AgentChatSessionSyncContext {
+            workspace_id: request.workspace_id.unwrap_or_default(),
+            source: "transcript-read".to_string(),
+            ..AgentChatSessionSyncContext::default()
+        },
+        "transcript_read",
+    );
     Ok(result)
 }
 
@@ -4282,6 +4311,13 @@ async fn agent_thread_transcript_watch(
         &result,
         Some(context.workspace_id.as_str()).filter(|value| !value.trim().is_empty()),
         "transcript-watch-start",
+    );
+    agent_chat_session_sync_spawn_from_result(
+        app.clone(),
+        &context.agent_id,
+        &result,
+        agent_chat_session_sync_context_from_watch(&context),
+        "transcript_watch_start",
     );
     let _ = register_agent_thread_transcript_watch(&app, &request, &result);
     Ok(result)

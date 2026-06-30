@@ -310,6 +310,11 @@ export default function TerminalWindowHost() {
     roleOptions: [],
     stateLabel: "",
   }));
+  const metaRef = useRef(meta);
+
+  useEffect(() => {
+    metaRef.current = meta;
+  }, [meta]);
 
   useEffect(() => {
     terminalFontSizeRef.current = terminalFontSize;
@@ -631,7 +636,11 @@ export default function TerminalWindowHost() {
       syncCursorBlink();
 
       term.onData((data) => {
-        invoke("terminal_write", { paneId, data }).catch(() => {});
+        invoke("terminal_write", {
+          appForkEnabled: metaRef.current?.canFork === true,
+          paneId,
+          data,
+        }).catch(() => {});
       });
 
       window.addEventListener("resize", scheduleFit);
