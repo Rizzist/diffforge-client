@@ -342,7 +342,7 @@ export default function WebWorkspaceView({
     };
   }, [workspaceId]);
 
-  const submitAgentPrompt = useCallback(async ({ targetIds, targetTerminalIndexes, text }) => {
+  const submitAgentPrompt = useCallback(async ({ contextRefs, targetIds, targetTerminalIndexes, text }) => {
     const requestId = createPanelAgentPromptRequestId("web-tab-submit");
     let unlisten = () => {};
     return new Promise((resolve, reject) => {
@@ -378,6 +378,7 @@ export default function WebWorkspaceView({
           }
           unlisten = nextUnlisten;
           emit(PANEL_AGENT_PROMPT_SUBMIT_EVENT, {
+            contextRefs,
             panelKind: "web",
             paneId,
             requestId,

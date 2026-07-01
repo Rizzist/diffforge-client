@@ -8,6 +8,8 @@ export function parseTerminalStateTimestampMs(value) {
 
 const TERMINAL_ACTIVITY_THINKING_STATES = new Set([
   "busy",
+  "compacting",
+  "compaction",
   "delegating",
   "dispatched",
   "editing",
@@ -144,6 +146,7 @@ export function terminalReadinessFromPresenceStatus(status) {
 export function terminalTurnStatusFromActivityStatus(activityStatus, status = "") {
   const activity = normalizeActivityText(activityStatus, normalizeActivityText(status, "idle"));
   if (["cancelled", "canceled", "interrupted"].includes(activity)) return "interrupted";
+  if (activity === "compacting" || activity === "compaction") return "running";
   if (TERMINAL_ACTIVITY_THINKING_STATES.has(activity)) return "running";
   if (TERMINAL_ACTIVITY_ERROR_STATES.has(activity)) return "failed";
   if (TERMINAL_ACTIVITY_PAUSED_STATES.has(activity)) return "pending";
@@ -160,6 +163,8 @@ export function terminalCommandPhaseFromLifecycleEvent(eventType, fields = {}) {
   if (type === "pending_prompt_sent" || type === "pending-prompt-sent") return "submitted";
   if (type === "message_submitted" || type === "message-submitted") return "input_written";
   if (type === "provider_turn_started" || type === "provider-turn-started") return "running";
+  if (type === "provider_turn_compacting" || type === "provider-turn-compacting") return "compacting";
+  if (type === "context_compaction_started" || type === "context-compaction-started") return "compacting";
   if (type === "agent_output" || type === "agent-output") return "running";
   if (type === "provider_turn_completed" || type === "provider-turn-completed") return "completed";
   if (type === "provider_turn_interrupted" || type === "provider-turn-interrupted") return "interrupted";
@@ -190,6 +195,18 @@ export function terminalExecutionPhaseFromState(fields = {}) {
   if (lifecycle === "exited" || activity === "exited" || status === "exited") return "exited";
   if (["closed", "closing", "terminated"].includes(lifecycle) || ["closed", "closing", "terminated"].includes(status)) {
     return lifecycle === "closing" || status === "closing" ? "closing" : "closed";
+  }
+  if (
+    eventType === "provider_turn_compacting"
+      || eventType === "context_compaction_started"
+      || commandPhase === "compacting"
+      || commandPhase === "compaction"
+      || activity === "compacting"
+      || activity === "compaction"
+      || turn === "compacting"
+      || turn === "compaction"
+  ) {
+    return "compacting";
   }
   if (eventType === "provider_turn_interrupted" || turn === "interrupted") return "interrupted";
   if (turn === "cancelled" || turn === "canceled" || commandPhase === "cancelled" || commandPhase === "canceled") return "cancelled";
@@ -225,6 +242,7 @@ export function terminalRailStateFromExecutionPhase(executionPhase, fallback = "
   if (["offline", "closed", "closing", "exited"].includes(phase)) return phase;
   if (phase === "failed") return "error";
   if (phase === "needs_input" || phase === "paused" || phase === "parked" || phase === "resume_ready") return "paused";
+  if (phase === "compacting" || phase === "compaction") return "compacting";
   if (["queued", "submitted", "input_written", "accepted", "running", "cancelling"].includes(phase)) return "thinking";
   if (["cancelled", "canceled", "interrupted"].includes(phase)) return "interrupted";
   if (["completed", "complete", "done", "idle"].includes(phase)) return "idle";

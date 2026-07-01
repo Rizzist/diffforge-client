@@ -37,6 +37,7 @@ const LIVE_TERMINAL_STATUSES = new Set([
   "active",
   "closed",
   "closing",
+  "compacting",
   "error",
   "exited",
   "idle",
@@ -1299,6 +1300,8 @@ function normalizeThreadActivityStatus(value, fallback = "idle") {
   const status = cleanText(value, fallback).toLowerCase();
   return [
     "delegating",
+    "compacting",
+    "compaction",
     "editing",
     "error",
     "failed",
@@ -1322,6 +1325,7 @@ function normalizeThreadActivityStatus(value, fallback = "idle") {
 
 function normalizeThreadTurnState(value, fallback = "") {
   const state = cleanText(value, fallback).toLowerCase();
+  if (state === "compacting" || state === "compaction") return "running";
   return THREAD_TURN_STATES.has(state) ? state : "";
 }
 

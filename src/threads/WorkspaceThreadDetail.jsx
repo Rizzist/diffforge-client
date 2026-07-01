@@ -592,10 +592,6 @@ const ChatMessageFrame = styled.div`
 `;
 
 const MessageCopyButton = styled.button`
-  position: absolute;
-  bottom: -24px;
-  left: 3px;
-  z-index: 3;
   display: grid;
   width: 25px;
   height: 25px;
@@ -606,12 +602,53 @@ const MessageCopyButton = styled.button`
   color: var(--thread-muted);
   background: transparent;
   box-shadow: none;
-  opacity: 0;
-  pointer-events: none;
   transition:
     background 130ms ease,
-    color 130ms ease,
-    opacity 130ms ease;
+    color 130ms ease;
+
+  &[data-copied="true"] {
+    color: var(--thread-green);
+  }
+
+  &:hover {
+    color: var(--thread-fg);
+    background: var(--thread-accent);
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--thread-ring);
+    outline-offset: 2px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #626268;
+    background: transparent;
+    box-shadow: none;
+  }
+
+  html[data-forge-theme="light"] &:hover {
+    color: var(--thread-blue);
+    background: var(--thread-accent);
+  }
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+`;
+
+const MessageActionCluster = styled.div`
+  position: absolute;
+  bottom: -24px;
+  left: 3px;
+  z-index: 3;
+  display: inline-flex;
+  max-width: calc(100% - 16px);
+  align-items: center;
+  gap: 4px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 130ms ease;
 
   ${ChatMessageFrame}:hover &,
   ${ChatMessageFrame}:focus-within &,
@@ -631,37 +668,33 @@ const MessageCopyButton = styled.button`
     right: 10px;
     left: auto;
   }
+`;
 
-  &[data-copied="true"] {
-    color: var(--thread-green);
+const MessageStatusPill = styled.span`
+  display: inline-flex;
+  max-width: 120px;
+  align-items: center;
+  overflow: hidden;
+  border-radius: 999px;
+  padding: 3px 7px;
+  color: #ffdbba;
+  background: rgba(255, 179, 71, 0.15);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  &[data-status="cancelled"],
+  &[data-status="canceled"] {
+    color: #ffd3d3;
+    background: rgba(239, 107, 107, 0.15);
   }
 
-  &:hover {
-    color: var(--thread-fg);
-    background: var(--thread-accent);
-  }
-
-  &:focus-visible {
-    opacity: 1;
-    pointer-events: auto;
-    outline: 2px solid var(--thread-ring);
-    outline-offset: 2px;
-  }
-
-  html[data-forge-theme="light"] & {
-    color: #626268;
-    background: transparent;
-    box-shadow: none;
-  }
-
-  html[data-forge-theme="light"] &:hover {
-    color: var(--thread-blue);
-    background: var(--thread-accent);
-  }
-
-  svg {
-    width: 14px;
-    height: 14px;
+  &[data-status="failed"],
+  &[data-status="error"] {
+    color: #ffc9c6;
+    background: rgba(255, 91, 83, 0.16);
   }
 `;
 
@@ -2364,7 +2397,7 @@ const FILE_TOKEN_PATTERN = /((?:[A-Za-z]:[\\/])?(?:[A-Za-z0-9_.@ -]+[\\/])+[A-Za
 const THREAD_DIFF_SUMMARY_STORAGE_PREFIX = "diffforge.threadDiffSummary.v1";
 const THREAD_DIFF_POLL_INTERVAL_MS = 3500;
 const THREAD_DIFF_TERMINAL_STATES = new Set(["completed", "error", "interrupted", "cancelled", "canceled"]);
-const THREAD_DIFF_LIVE_STATES = new Set(["running", "thinking", "starting", "queued"]);
+const THREAD_DIFF_LIVE_STATES = new Set(["compacting", "compaction", "running", "thinking", "starting", "queued"]);
 const MARKDOWN_REMARK_PLUGINS = [remarkGfm];
 const PRISM_LANGUAGE_ALIASES = new Map([
   ["cjs", "javascript"],
@@ -4189,6 +4222,38 @@ function isSlashCommandPrompt(value) {
   return String(value || "").trimStart().startsWith("/");
 }
 
+function messageTextLooksLocalCommandEnvelope(value) {
+  const text = String(value || "").trim();
+  return Boolean(
+    text
+      && (
+        isSlashCommandPrompt(text)
+        || /<\/?local-command-[a-z-]+>/i.test(text)
+        || /<\/?command-(?:name|message|args)>/i.test(text)
+      ),
+  );
+}
+
+function isLocalCommandProjectionMessage(message) {
+  const marker = [
+    message?.kind,
+    message?.source,
+    message?.title,
+    message?.name,
+  ].map((value) => String(value || "").trim().toLowerCase()).join(" ");
+  if (marker.includes("local_command") || marker.includes("local-command")) {
+    return true;
+  }
+  if (marker.includes("command") && marker.includes("local")) {
+    return true;
+  }
+  const text = String(message?.text || message?.content || "").trim();
+  if (!messageTextLooksLocalCommandEnvelope(text)) {
+    return false;
+  }
+  return message?.role === "user" || marker.includes("command");
+}
+
 function getLatestTurnUserMessage(messages, turnId) {
   const safeTurnId = String(turnId || "").trim();
   return [...(Array.isArray(messages) ? messages : [])].reverse().find((message) => (
@@ -4211,7 +4276,7 @@ function buildActivityItems(thread, messages = [], groundTruth = null) {
     ? threadLooksEffectivelyThinking(groundTruth)
     : false;
   const latestTurnUserMessage = getLatestTurnUserMessage(messages, latestTurn?.turnId);
-  const latestTurnIsSlashCommand = isSlashCommandPrompt(latestTurnUserMessage?.text);
+  const latestTurnIsSlashCommand = isLocalCommandProjectionMessage(latestTurnUserMessage);
 
   if (latestTurnIsSlashCommand) {
     return items;
@@ -4538,6 +4603,46 @@ function getMessageCopyText(message) {
   ].filter(Boolean).join("\n");
 }
 
+function normalizeThreadMessageStatus(value) {
+  return String(value || "").trim().toLowerCase().replace(/[\s-]+/g, "_");
+}
+
+function getRecoverableThreadMessageStatus(message, thread) {
+  if (message?.role !== "user") {
+    return "";
+  }
+  const statusCandidates = [
+    message.status,
+    message.turnStatus,
+    message.turn_status,
+    message.lifecycleStatus,
+    message.lifecycle_status,
+  ];
+  const messageTurnId = getMessageTurnId(message);
+  if (messageTurnId && messageTurnId === String(thread?.latestTurn?.turnId || "")) {
+    statusCandidates.push(thread?.latestTurn?.state, thread?.status);
+  }
+  const status = statusCandidates
+    .map(normalizeThreadMessageStatus)
+    .find((candidate) => ["cancelled", "canceled", "interrupted", "failed", "error"].includes(candidate));
+  return status || "";
+}
+
+function threadMessageStatusLabel(status) {
+  switch (normalizeThreadMessageStatus(status)) {
+    case "cancelled":
+    case "canceled":
+      return "cancelled";
+    case "interrupted":
+      return "interrupted";
+    case "failed":
+    case "error":
+      return "failed";
+    default:
+      return "";
+  }
+}
+
 function getActivityCopyText(message) {
   const label = getToolCallLabel(message);
   const status = getActivityStatusLabel(message);
@@ -4836,7 +4941,7 @@ function MessageArtifactList({ artifacts }) {
 function isChatProjectionMessage(message) {
   const kind = String(message?.kind || "").trim().toLowerCase();
   const source = String(message?.source || "").trim().toLowerCase();
-  if (message?.role === "user" && isSlashCommandPrompt(message?.text)) {
+  if (isLocalCommandProjectionMessage(message)) {
     return false;
   }
   return kind !== "live_output" && source !== "terminal-live";
@@ -5116,7 +5221,10 @@ function ThreadMessage({
   isCopied = false,
   message,
   messageId,
+  onEditMessage,
   onCopyMessage,
+  onRedoMessage,
+  recoverableStatus = "",
   showCopy = true,
   workspace,
 }) {
@@ -5126,22 +5234,58 @@ function ThreadMessage({
 
   const copyText = getMessageCopyText(message);
   const canCopy = showCopy && Boolean(copyText);
+  const statusLabel = threadMessageStatusLabel(recoverableStatus);
+  const canRecover = message.role === "user" && Boolean(statusLabel && copyText);
   const copyTitle = isCopied ? "Copied" : "Copy";
   const messageArtifacts = getMessageArtifacts(message);
-  const copyButton = canCopy ? (
-    <MessageCopyButton
-      aria-label={copyTitle}
-      data-copied={isCopied ? "true" : "false"}
-      data-visible={copyAlwaysVisible ? "true" : "false"}
-      onClick={(event) => {
-        event.stopPropagation();
-        onCopyMessage?.(messageId, copyText);
-      }}
-      title={copyTitle}
-      type="button"
-    >
-      {isCopied ? <Check aria-hidden="true" /> : <ContentCopy aria-hidden="true" />}
-    </MessageCopyButton>
+  const actionCluster = (canCopy || canRecover) ? (
+    <MessageActionCluster data-visible={copyAlwaysVisible || canRecover ? "true" : "false"}>
+      {statusLabel ? (
+        <MessageStatusPill data-status={recoverableStatus}>
+          {statusLabel}
+        </MessageStatusPill>
+      ) : null}
+      {canRecover ? (
+        <>
+          <MessageCopyButton
+            aria-label="Redo message"
+            onClick={(event) => {
+              event.stopPropagation();
+              onRedoMessage?.(message, copyText);
+            }}
+            title="Redo message"
+            type="button"
+          >
+            <ArrowUpward aria-hidden="true" />
+          </MessageCopyButton>
+          <MessageCopyButton
+            aria-label="Edit and resend"
+            onClick={(event) => {
+              event.stopPropagation();
+              onEditMessage?.(message, copyText);
+            }}
+            title="Edit and resend"
+            type="button"
+          >
+            <Edit aria-hidden="true" />
+          </MessageCopyButton>
+        </>
+      ) : null}
+      {canCopy ? (
+        <MessageCopyButton
+          aria-label={copyTitle}
+          data-copied={isCopied ? "true" : "false"}
+          onClick={(event) => {
+            event.stopPropagation();
+            onCopyMessage?.(messageId, copyText);
+          }}
+          title={copyTitle}
+          type="button"
+        >
+          {isCopied ? <Check aria-hidden="true" /> : <ContentCopy aria-hidden="true" />}
+        </MessageCopyButton>
+      ) : null}
+    </MessageActionCluster>
   ) : null;
 
   if (message.role === "assistant") {
@@ -5149,7 +5293,7 @@ function ThreadMessage({
       <AssistantCell data-message-role="assistant">
         <AssistantPrefix aria-hidden="true">{"."}</AssistantPrefix>
         <ChatMessageFrame>
-          {copyButton}
+          {actionCluster}
           <MessageBody>
             <AssistantMarkdownContent message={message} workspace={workspace} />
             {messageArtifacts.length ? <MessageArtifactList artifacts={messageArtifacts} /> : null}
@@ -5167,7 +5311,7 @@ function ThreadMessage({
     <UserCell data-message-role="user">
       <UserPrefix aria-hidden="true">{"\u203a"}</UserPrefix>
       <ChatMessageFrame>
-        {copyButton}
+        {actionCluster}
         <MessageBody>
           <MessageText>
             <MessageTextContent message={message} workspace={workspace} />
@@ -5349,19 +5493,20 @@ function AssistantResponseBlock({
         undoing={undoingDiff}
       />
       {canCopy ? (
-        <MessageCopyButton
-          aria-label={copyTitle}
-          data-copied={isCopied ? "true" : "false"}
-          data-visible={copyAlwaysVisible ? "true" : "false"}
-          onClick={(event) => {
-            event.stopPropagation();
-            onCopyMessage?.(item.id, copyText);
-          }}
-          title={copyTitle}
-          type="button"
-        >
-          {isCopied ? <Check aria-hidden="true" /> : <ContentCopy aria-hidden="true" />}
-        </MessageCopyButton>
+        <MessageActionCluster data-visible={copyAlwaysVisible ? "true" : "false"}>
+          <MessageCopyButton
+            aria-label={copyTitle}
+            data-copied={isCopied ? "true" : "false"}
+            onClick={(event) => {
+              event.stopPropagation();
+              onCopyMessage?.(item.id, copyText);
+            }}
+            title={copyTitle}
+            type="button"
+          >
+            {isCopied ? <Check aria-hidden="true" /> : <ContentCopy aria-hidden="true" />}
+          </MessageCopyButton>
+        </MessageActionCluster>
       ) : null}
     </AssistantBlock>
   );
@@ -6299,6 +6444,81 @@ function WorkspaceThreadDetail({
     return true;
   };
 
+  const replaceComposerDraft = (nextValue, source = "thread_message_edit") => {
+    const nextDraft = String(nextValue || "");
+    const previousDraft = draft;
+    setError("");
+    setDraft(nextDraft);
+    onDraftInput?.({
+      nextValue: nextDraft,
+      previousValue: previousDraft,
+      source,
+      thread,
+      workspace,
+    });
+    window.setTimeout(() => {
+      const input = composerInputRef.current;
+      if (!input || input.disabled) {
+        return;
+      }
+      input.focus({ preventScroll: true });
+      const cursor = String(input.value || "").length;
+      try {
+        input.setSelectionRange(cursor, cursor);
+      } catch (_) {
+        // Some textarea implementations can reject selection during teardown.
+      }
+    }, 0);
+  };
+
+  const editMessageForResend = (message, text = "") => {
+    const nextText = String(text || getMessageCopyText(message) || "").trim();
+    if (!nextText) {
+      return;
+    }
+    replaceComposerDraft(nextText, "thread_message_edit_resend");
+  };
+
+  const redoMessage = async (message, text = "") => {
+    const nextText = String(text || getMessageCopyText(message) || "").trim();
+    if (!nextText || !thread || !canSubmit || sending) {
+      if (!canSubmit) {
+        setError("No active agent session is available for this thread.");
+      }
+      return;
+    }
+    setSending(true);
+    setError("");
+    try {
+      await onSubmitMessage?.({
+        message: nextText,
+        model: "",
+        thread,
+        workspace,
+      });
+      logBigViewSyncDiagnosticEvent("bigview.thread_message.redo", {
+        agentId: activeAgentId,
+        messageId: String(message?.id || ""),
+        messageLength: nextText.length,
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+    } catch (redoError) {
+      setError(redoError?.message || "Unable to resend message.");
+      logBigViewSyncDiagnosticEvent("bigview.thread_message.redo_error", {
+        agentId: activeAgentId,
+        message: redoError?.message || String(redoError || ""),
+        messageId: String(message?.id || ""),
+        surface: "thread_detail",
+        threadId: thread?.id || "",
+        workspaceId: workspace?.id || thread?.workspaceId || "",
+      });
+    } finally {
+      setSending(false);
+    }
+  };
+
   useEffect(() => {
     const handleWindowPasteCapture = (event) => {
       if (event.defaultPrevented) {
@@ -7149,7 +7369,10 @@ function WorkspaceThreadDetail({
                 key={item.id}
                 message={item.message}
                 messageId={item.id}
+                onEditMessage={editMessageForResend}
                 onCopyMessage={handleCopyMessage}
+                onRedoMessage={redoMessage}
+                recoverableStatus={getRecoverableThreadMessageStatus(item.message, thread)}
                 workspace={workspace}
               />
             )

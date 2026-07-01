@@ -708,11 +708,13 @@ const ACTIVITY_SYNC_CONNECTING_STATUSES = [
   "handshaking",
   "websocket_handshaking",
 ];
+const ACTIVITY_SYNC_RETRYING_STATUSES = [
+  "retrying",
+  "websocket_retrying",
+];
 const ACTIVITY_SYNC_OFFLINE_STATUSES = [
   "offline",
   "offline_permanent",
-  "retrying",
-  "websocket_retrying",
 ];
 
 function syncActivityDomainLabel(domain) {
@@ -942,6 +944,7 @@ function normalizeActivitySyncBadge(status) {
     "offline",
     "offline_permanent",
     "provisioning",
+    "retrying",
     "syncing",
   ].includes(rawConnection)
     ? rawConnection === "offline_permanent" ? "offline" : rawConnection
@@ -954,11 +957,13 @@ function normalizeActivitySyncBadge(status) {
         ? "provisioning"
         : ACTIVITY_SYNC_CONNECTING_STATUSES.includes(connectionStatus) || ACTIVITY_SYNC_CONNECTING_STATUSES.includes(rawStatus)
           ? "connecting"
-          : ACTIVITY_SYNC_OFFLINE_STATUSES.includes(connectionStatus) || ACTIVITY_SYNC_OFFLINE_STATUSES.includes(rawStatus)
-            ? "offline"
-            : ACTIVITY_SYNC_LOCAL_STATUSES.includes(connectionStatus) || ACTIVITY_SYNC_LOCAL_STATUSES.includes(rawStatus)
-              ? "local"
-              : "connecting");
+          : ACTIVITY_SYNC_RETRYING_STATUSES.includes(connectionStatus) || ACTIVITY_SYNC_RETRYING_STATUSES.includes(rawStatus)
+            ? "retrying"
+            : ACTIVITY_SYNC_OFFLINE_STATUSES.includes(connectionStatus) || ACTIVITY_SYNC_OFFLINE_STATUSES.includes(rawStatus)
+              ? "offline"
+              : ACTIVITY_SYNC_LOCAL_STATUSES.includes(connectionStatus) || ACTIVITY_SYNC_LOCAL_STATUSES.includes(rawStatus)
+                ? "local"
+                : "connecting");
   const state = connection === "connected"
     ? hasLargeActivity ? "syncing" : "live"
     : connection === "syncing"
@@ -976,6 +981,7 @@ function normalizeActivitySyncBadge(status) {
     local: "Local",
     offline: "Offline",
     provisioning: "Provisioning",
+    retrying: "Retrying",
     syncing: "Syncing",
   }[state] || "Connecting";
   const title = {
@@ -987,6 +993,7 @@ function normalizeActivitySyncBadge(status) {
     local: "Local workspace activity is available. Cloud sync has not connected yet.",
     offline: "Cloud sync is unavailable right now.",
     provisioning: "Your cloud workspace is starting.",
+    retrying: "Cloud sync lost the live connection and is retrying automatically.",
     syncing: directionSummary
       ? `Syncing ${directionSummary}.`
       : controlCount > 0
@@ -995,7 +1002,7 @@ function normalizeActivitySyncBadge(status) {
   }[state] || label;
   return {
     downCount,
-    indicator: ["connecting", "provisioning", "syncing"].includes(state) ? "spinner" : "dot",
+    indicator: ["connecting", "provisioning", "retrying", "syncing"].includes(state) ? "spinner" : "dot",
     label,
     state,
     title,

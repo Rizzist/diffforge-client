@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Select from "react-select";
 import styled from "styled-components";
+import { Close } from "@styled-icons/material-rounded/Close";
 import { Send } from "@styled-icons/material-rounded/Send";
 
 import {
@@ -52,6 +53,17 @@ function panelAgentColorAlpha(hex, alpha, fallback = "rgba(96, 165, 250, 0.18)")
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
+function compactTargetName(option) {
+  return String(
+    option?.short
+      || option?.terminalNickname
+      || option?.terminal_nickname
+      || option?.label
+      || option?.name
+      || "",
+  ).trim();
+}
+
 function targetOptionLabelRenderer(option, { context } = {}) {
   return (
     <TargetOptionLabel
@@ -62,24 +74,45 @@ function targetOptionLabelRenderer(option, { context } = {}) {
         <AgentHarnessIcon role={option.role} />
       </HarnessIcon>
       <TargetDot aria-hidden="true" />
-      <TargetName>{option.label}</TargetName>
+      <TargetName>{compactTargetName(option) || option.label}</TargetName>
     </TargetOptionLabel>
   );
+}
+
+function contextRefLabel(context) {
+  if (!context || typeof context !== "object") {
+    return "";
+  }
+  const element = String(context.element || context.tagName || context.tag_name || "element").trim();
+  const host = (() => {
+    try {
+      return new URL(context.url || "").host;
+    } catch {
+      return "";
+    }
+  })();
+  return [element, host].filter(Boolean).join(" on ");
 }
 
 const TARGET_SELECT_STYLES = {
   container: (base) => ({
     ...base,
+    display: "inline-block",
+    flex: "0 1 auto",
     minWidth: 0,
-    width: "100%",
+    maxWidth: "100%",
+    width: "fit-content",
   }),
   control: (base, state) => {
     const accent = state.getValue()?.[0]?.color || "";
     return {
       ...base,
-      height: 36,
-      minHeight: 36,
-      borderRadius: 8,
+      width: "fit-content",
+      maxWidth: "100%",
+      height: 22,
+      minHeight: 22,
+      padding: "0 2px",
+      borderRadius: 999,
       backgroundColor: state.isFocused
         ? "var(--panel-agent-picker-bg-focus)"
         : "var(--panel-agent-picker-bg)",
@@ -89,7 +122,7 @@ const TARGET_SELECT_STYLES = {
           ? "var(--panel-agent-picker-border-focus)"
           : "var(--panel-agent-picker-border)",
       boxShadow: state.isFocused
-        ? `0 0 0 3px ${accent ? panelAgentColorAlpha(accent, 0.12) : "rgba(96, 165, 250, 0.12)"}`
+        ? `0 0 0 2px ${accent ? panelAgentColorAlpha(accent, 0.12) : "rgba(96, 165, 250, 0.12)"}`
         : "none",
       cursor: "pointer",
       transition: "border-color 120ms ease, background-color 120ms ease, box-shadow 140ms ease",
@@ -100,68 +133,68 @@ const TARGET_SELECT_STYLES = {
   },
   valueContainer: (base) => ({
     ...base,
-    height: 34,
-    minHeight: 34,
+    width: "auto",
+    maxWidth: "100%",
+    height: 20,
+    minHeight: 20,
     flexWrap: "nowrap",
-    overflowX: "auto",
+    overflowX: "hidden",
     overflowY: "hidden",
-    padding: "3px 6px",
-    gap: 4,
+    padding: "0 1px 0 2px",
+    gap: 0,
   }),
   multiValue: (base, state) => ({
     ...base,
     minWidth: 0,
-    maxWidth: 178,
+    maxWidth: 112,
     flex: "0 0 auto",
     alignItems: "center",
-    border: `1px solid ${panelAgentColorAlpha(state.data?.color, 0.34, "rgba(148, 163, 184, 0.2)")}`,
+    margin: 0,
+    border: 0,
     borderRadius: 999,
-    backgroundColor: panelAgentColorAlpha(state.data?.color, 0.18, "rgba(15, 23, 42, 0.74)"),
+    backgroundColor: "transparent",
   }),
   multiValueLabel: (base) => ({
     ...base,
     minWidth: 0,
-    padding: "3px 5px 3px 7px",
+    padding: "0 3px",
     color: "var(--panel-agent-picker-text)",
-    fontSize: 11,
+    fontSize: 10.5,
     fontWeight: 800,
   }),
   multiValueRemove: (base) => ({
     ...base,
-    borderRadius: 999,
-    color: "var(--panel-agent-picker-muted)",
-    ":hover": {
-      color: "var(--panel-agent-picker-text-strong)",
-      backgroundColor: "rgba(248, 113, 113, 0.22)",
-    },
+    display: "none",
   }),
   placeholder: (base) => ({
     ...base,
     color: "var(--panel-agent-picker-placeholder)",
-    fontSize: 12,
+    fontSize: 10.5,
     fontWeight: 760,
   }),
   input: (base) => ({
     ...base,
     color: "var(--panel-agent-picker-text)",
-    fontSize: 12,
+    fontSize: 10.5,
     margin: 0,
     padding: 0,
   }),
   indicatorsContainer: (base) => ({
     ...base,
+    flex: "0 0 auto",
+    height: 20,
     alignSelf: "stretch",
   }),
   indicatorSeparator: () => ({ display: "none" }),
   clearIndicator: (base) => ({
     ...base,
-    padding: "0 3px",
+    padding: "0 1px",
     color: "var(--panel-agent-picker-muted)",
     ":hover": { color: "var(--panel-agent-picker-text-strong)" },
   }),
   dropdownIndicator: (base, state) => ({
     ...base,
-    padding: "0 8px 0 2px",
+    padding: "0 3px 0 1px",
     color: state.isFocused ? "var(--panel-agent-picker-text-strong)" : "var(--panel-agent-picker-muted)",
     transition: "color 120ms ease, transform 160ms ease",
     transform: state.selectProps.menuIsOpen ? "rotate(180deg)" : "none",
@@ -169,18 +202,23 @@ const TARGET_SELECT_STYLES = {
   }),
   menu: (base) => ({
     ...base,
+    left: 0,
+    right: "auto",
+    minWidth: 150,
+    width: "max-content",
+    maxWidth: "min(260px, calc(100vw - 32px))",
     zIndex: 80,
-    marginBottom: 8,
+    marginBottom: 6,
     overflow: "hidden",
     border: "1px solid var(--panel-agent-picker-menu-border)",
-    borderRadius: 8,
+    borderRadius: 14,
     backgroundColor: "var(--panel-agent-picker-menu-bg)",
-    boxShadow: "0 -10px 36px rgba(0, 0, 0, 0.36), 0 18px 48px rgba(0, 0, 0, 0.28)",
+    boxShadow: "0 -8px 26px rgba(0, 0, 0, 0.34), 0 10px 28px rgba(0, 0, 0, 0.22)",
   }),
   menuList: (base) => ({
     ...base,
-    maxHeight: 220,
-    padding: 5,
+    maxHeight: 136,
+    padding: 3,
   }),
   option: (base, state) => {
     const accent = state.data?.color || "";
@@ -188,9 +226,9 @@ const TARGET_SELECT_STYLES = {
       ...base,
       display: "flex",
       alignItems: "center",
-      minHeight: 34,
-      borderRadius: 7,
-      padding: "7px 9px",
+      minHeight: 28,
+      borderRadius: 11,
+      padding: "5px 7px",
       color: state.isSelected
         ? "var(--panel-agent-picker-text-strong)"
         : "var(--panel-agent-picker-text)",
@@ -208,16 +246,20 @@ const TARGET_SELECT_STYLES = {
   noOptionsMessage: (base) => ({
     ...base,
     color: "var(--panel-agent-picker-placeholder)",
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: 720,
+    padding: "7px 9px",
   }),
 };
 
 export default function PanelAgentPromptComposer({
   autoFocus = false,
+  contextRefs = [],
   defaultSelectedTargetIds = [],
   onClose = null,
+  onClearContext = null,
   onSubmit = null,
+  onTargetMenuOpenChange = null,
   panelKind = "panel",
   panelPaneId = "",
   targets = [],
@@ -235,17 +277,27 @@ export default function PanelAgentPromptComposer({
     [targets],
   );
   const targetOptions = useMemo(() => (
-    (Array.isArray(targets) ? targets : []).map((target) => ({
-      ...target,
-      color: target.color || "#8bb8ff",
-      label: target.label || `Agent ${target.terminalIndex + 1}`,
-      value: target.id,
-    }))
+    (Array.isArray(targets) ? targets : []).map((target) => {
+      const fallbackLabel = target.label || `Agent ${target.terminalIndex + 1}`;
+      const shortLabel = compactTargetName(target);
+      return {
+        ...target,
+        color: target.color || "#8bb8ff",
+        fullLabel: fallbackLabel,
+        label: shortLabel || fallbackLabel,
+        short: shortLabel,
+        value: target.id,
+      };
+    })
   ), [targets]);
   const selectedOptions = useMemo(() => {
     const selectedIdSet = new Set(selectedTargetIds);
     return targetOptions.filter((target) => selectedIdSet.has(target.id));
   }, [selectedTargetIds, targetOptions]);
+  const selectedContext = useMemo(() => (
+    Array.isArray(contextRefs) ? contextRefs.find((context) => context && typeof context === "object") || null : null
+  ), [contextRefs]);
+  const selectedContextLabel = useMemo(() => contextRefLabel(selectedContext), [selectedContext]);
 
   useEffect(() => {
     setSelectedTargetIds((current) => {
@@ -264,6 +316,10 @@ export default function PanelAgentPromptComposer({
     const frameId = window.requestAnimationFrame(() => inputRef.current?.focus?.());
     return () => window.cancelAnimationFrame(frameId);
   }, [autoFocus]);
+
+  useEffect(() => () => {
+    onTargetMenuOpenChange?.(false);
+  }, [onTargetMenuOpenChange]);
 
   const updateSelectedTargets = useCallback((options) => {
     setError("");
@@ -293,6 +349,7 @@ export default function PanelAgentPromptComposer({
     setError("");
     try {
       await onSubmit?.({
+        contextRefs,
         panelKind,
         panelPaneId,
         targetIds,
@@ -309,7 +366,7 @@ export default function PanelAgentPromptComposer({
     } finally {
       setSubmitting(false);
     }
-  }, [onClose, onSubmit, panelKind, panelPaneId, prompt, selectedTargetIds, submitting, targets, windowId]);
+  }, [contextRefs, onClose, onSubmit, panelKind, panelPaneId, prompt, selectedTargetIds, submitting, targets, windowId]);
 
   const targetCount = Array.isArray(targets) ? targets.length : 0;
   const selectedCount = selectedTargetIds.length;
@@ -320,52 +377,73 @@ export default function PanelAgentPromptComposer({
       data-terminal-control="true"
       onSubmit={submitPrompt}
     >
-      <TargetPickerFrame>
-        {targetCount ? (
-          <Select
-            aria-label="Terminal agents"
-            closeMenuOnSelect={false}
-            formatOptionLabel={targetOptionLabelRenderer}
-            hideSelectedOptions={false}
-            isClearable
-            isDisabled={submitting}
-            isMulti
-            isSearchable={false}
-            menuPlacement="top"
-            noOptionsMessage={() => "No coding agents open"}
-            onChange={updateSelectedTargets}
-            options={targetOptions}
-            placeholder="Choose agents"
-            styles={TARGET_SELECT_STYLES}
-            value={selectedOptions}
-          />
-        ) : (
-          <EmptyTargets>No coding agents open</EmptyTargets>
-        )}
-      </TargetPickerFrame>
-      <PromptRow>
-        <PromptInput
-          aria-label="Prompt"
-          disabled={submitting || !targetCount}
-          onChange={(event) => {
-            setPrompt(event.target.value);
-            if (error) {
-              setError("");
-            }
-          }}
-          onKeyDown={(event) => {
-            if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
-              submitPrompt(event);
-            }
-            if (event.key === "Escape") {
-              onClose?.();
-            }
-          }}
-          placeholder={targetCount ? "Prompt selected agents" : "Open a coding-agent terminal first"}
-          ref={inputRef}
-          rows={2}
-          value={prompt}
-        />
+      <PromptInput
+        aria-label="Prompt"
+        disabled={submitting || !targetCount}
+        onChange={(event) => {
+          setPrompt(event.target.value);
+          if (error) {
+            setError("");
+          }
+        }}
+        onKeyDown={(event) => {
+          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+            submitPrompt(event);
+          }
+          if (event.key === "Escape") {
+            onClose?.();
+          }
+        }}
+        placeholder={targetCount ? "Prompt selected agents" : "Open a coding-agent terminal first"}
+        ref={inputRef}
+        rows={1}
+        value={prompt}
+      />
+      {selectedContext ? (
+        <ContextChipRow>
+          <ContextChip title={selectedContextLabel || "Selected web element"}>
+            <ContextChipKind>Element</ContextChipKind>
+            <ContextChipText>{selectedContextLabel || "Selected web element"}</ContextChipText>
+            {typeof onClearContext === "function" ? (
+              <ContextChipButton
+                aria-label="Clear selected web element"
+                disabled={submitting}
+                onClick={onClearContext}
+                title="Clear selected web element"
+                type="button"
+              >
+                <Close aria-hidden="true" />
+              </ContextChipButton>
+            ) : null}
+          </ContextChip>
+        </ContextChipRow>
+      ) : null}
+      <ComposerFooter>
+        <TargetPickerFrame>
+          {targetCount ? (
+            <Select
+              aria-label="Terminal agents"
+              closeMenuOnSelect={false}
+              formatOptionLabel={targetOptionLabelRenderer}
+              hideSelectedOptions={false}
+              isClearable={false}
+              isDisabled={submitting}
+              isMulti
+              isSearchable={false}
+              menuPlacement="top"
+              noOptionsMessage={() => "No coding agents open"}
+              onChange={updateSelectedTargets}
+              onMenuClose={() => onTargetMenuOpenChange?.(false)}
+              onMenuOpen={() => onTargetMenuOpenChange?.(true)}
+              options={targetOptions}
+              placeholder="Agents"
+              styles={TARGET_SELECT_STYLES}
+              value={selectedOptions}
+            />
+          ) : (
+            <EmptyTargets>No agents</EmptyTargets>
+          )}
+        </TargetPickerFrame>
         <SendButton
           aria-label="Send prompt"
           disabled={submitting || !targetCount || !selectedCount || !prompt.trim()}
@@ -374,7 +452,7 @@ export default function PanelAgentPromptComposer({
         >
           <Send aria-hidden="true" />
         </SendButton>
-      </PromptRow>
+      </ComposerFooter>
       {error ? <ComposerError role="alert">{error}</ComposerError> : null}
     </ComposerShell>
   );
@@ -396,21 +474,28 @@ const ComposerShell = styled.form`
   --panel-agent-picker-text-strong: #ffffff;
 
   position: absolute;
-  left: 10px;
-  right: 10px;
-  bottom: 10px;
+  left: 50%;
+  bottom: 12px;
+  transform: translateX(-50%);
   z-index: 42;
   display: grid;
+  width: min(760px, calc(100% - 24px));
   min-width: 0;
-  gap: 8px;
-  padding: 10px;
-  border: 1px solid rgba(148, 163, 184, 0.24);
-  border-radius: 8px;
-  background: rgba(6, 10, 18, 0.94);
+  grid-template-columns: minmax(0, 1fr);
+  gap: 3px;
+  padding: 5px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 24px;
+  background: rgba(6, 10, 18, 0.82);
   box-shadow:
-    0 18px 44px rgba(0, 0, 0, 0.34),
+    0 12px 34px rgba(0, 0, 0, 0.3),
     inset 0 1px 0 rgba(255, 255, 255, 0.04);
   backdrop-filter: blur(14px);
+
+  @media (max-width: 620px) {
+    width: calc(100% - 16px);
+    padding: 5px;
+  }
 
   html[data-forge-theme="light"] & {
     --panel-agent-picker-bg: rgba(248, 250, 252, 0.82);
@@ -428,53 +513,134 @@ const ComposerShell = styled.form`
     --panel-agent-picker-text-strong: rgba(15, 23, 42, 0.96);
 
     border-color: rgba(24, 34, 48, 0.16);
-    background: rgba(255, 255, 255, 0.94);
+    background: rgba(255, 255, 255, 0.88);
     box-shadow:
-      0 18px 44px rgba(24, 34, 48, 0.16),
+      0 12px 34px rgba(24, 34, 48, 0.14),
       inset 0 1px 0 rgba(255, 255, 255, 0.7);
   }
 `;
 
 const TargetPickerFrame = styled.div`
-  display: block;
+  display: inline-flex;
+  flex: 0 1 auto;
   min-width: 0;
+  max-width: calc(100% - 36px);
+  width: auto;
+`;
+
+const ContextChipRow = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-start;
+`;
+
+const ContextChip = styled.div`
+  display: inline-flex;
+  max-width: min(360px, 100%);
+  min-width: 0;
+  height: 20px;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 3px 2px 7px;
+  border: 1px solid rgba(52, 211, 153, 0.28);
+  border-radius: 999px;
+  color: rgba(209, 250, 229, 0.94);
+  background: rgba(6, 78, 59, 0.2);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(5, 150, 105, 0.24);
+    color: rgba(6, 95, 70, 0.96);
+    background: rgba(209, 250, 229, 0.72);
+  }
+`;
+
+const ContextChipKind = styled.span`
+  flex: 0 0 auto;
+  color: currentColor;
+  font-size: 9.5px;
+  font-weight: 860;
+  letter-spacing: 0;
+  text-transform: uppercase;
+  opacity: 0.78;
+`;
+
+const ContextChipText = styled.span`
+  min-width: 0;
+  overflow: hidden;
+  font-size: 10.5px;
+  font-weight: 780;
+  letter-spacing: 0;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+`;
+
+const ContextChipButton = styled.button`
+  appearance: none;
+  display: inline-flex;
+  width: 17px;
+  height: 17px;
+  flex: 0 0 auto;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  border-radius: 999px;
+  color: currentColor;
+  background: rgba(255, 255, 255, 0.1);
+  cursor: pointer;
+
+  svg {
+    width: 12px;
+    height: 12px;
+  }
+
+  &:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.18);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.5;
+  }
 `;
 
 const TargetOptionLabel = styled.span`
   display: inline-flex;
   min-width: 0;
   align-items: center;
-  gap: 6px;
+  gap: 5px;
   color: currentColor;
 
   &[data-context="value"] {
-    gap: 5px;
+    gap: 4px;
   }
 `;
 
 const HarnessIcon = styled.span`
   display: inline-flex;
-  width: 16px;
-  height: 16px;
+  width: 13px;
+  height: 13px;
   align-items: center;
   justify-content: center;
   flex: 0 0 auto;
   color: currentColor;
 
   svg {
-    width: 15px;
-    height: 15px;
+    width: 12px;
+    height: 12px;
   }
 
   &[data-role="opencode"] svg {
-    width: 12px;
-    height: 15px;
+    width: 9px;
+    height: 12px;
   }
 `;
 
 const TargetDot = styled.span`
-  width: 8px;
-  height: 8px;
+  width: 6px;
+  height: 6px;
   flex: 0 0 auto;
   border: 1px solid rgba(255, 255, 255, 0.44);
   border-radius: 999px;
@@ -485,7 +651,7 @@ const TargetDot = styled.span`
 const TargetName = styled.span`
   min-width: 0;
   overflow: hidden;
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 820;
   letter-spacing: 0;
   line-height: 1;
@@ -494,41 +660,48 @@ const TargetName = styled.span`
 `;
 
 const EmptyTargets = styled.span`
-  min-height: 28px;
+  min-height: 22px;
   display: inline-flex;
+  width: auto;
   align-items: center;
+  padding: 0 8px;
+  border: 1px solid var(--panel-agent-picker-border);
+  border-radius: 999px;
+  background: var(--panel-agent-picker-bg);
   color: rgba(148, 163, 184, 0.86);
   font-size: 11px;
   font-weight: 780;
+  white-space: nowrap;
 `;
 
-const PromptRow = styled.div`
-  display: grid;
+const ComposerFooter = styled.div`
+  display: flex;
   min-width: 0;
-  grid-template-columns: minmax(0, 1fr) 34px;
-  gap: 8px;
-  align-items: end;
+  gap: 6px;
+  align-items: center;
+  justify-content: space-between;
 `;
 
 const PromptInput = styled.textarea`
   width: 100%;
   min-width: 0;
-  max-height: 120px;
-  min-height: 42px;
-  resize: vertical;
-  padding: 8px 10px;
+  max-height: 54px;
+  min-height: 30px;
+  resize: none;
+  padding: 6px 11px;
   border: 1px solid rgba(148, 163, 184, 0.2);
-  border-radius: 7px;
+  border-radius: 999px;
   outline: 0;
   color: rgba(241, 245, 249, 0.94);
-  background: rgba(2, 6, 12, 0.86);
-  font-size: 12px;
+  background: rgba(2, 6, 12, 0.72);
+  font-size: 11px;
   font-weight: 650;
-  line-height: 1.35;
+  line-height: 15px;
+  overflow-y: auto;
 
   &:focus {
     border-color: rgba(96, 165, 250, 0.58);
-    box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.13);
+    box-shadow: 0 0 0 2px rgba(96, 165, 250, 0.13);
   }
 
   &::placeholder {
@@ -549,19 +722,21 @@ const PromptInput = styled.textarea`
 const SendButton = styled.button`
   appearance: none;
   display: inline-flex;
-  width: 34px;
-  height: 34px;
+  width: 30px;
+  height: 30px;
+  flex: 0 0 30px;
   align-items: center;
   justify-content: center;
+  margin-left: auto;
   border: 1px solid rgba(96, 165, 250, 0.38);
-  border-radius: 8px;
+  border-radius: 999px;
   color: rgba(219, 234, 254, 0.96);
   background: rgba(37, 99, 235, 0.28);
   cursor: pointer;
 
   svg {
-    width: 17px;
-    height: 17px;
+    width: 15px;
+    height: 15px;
   }
 
   &:hover:not(:disabled) {
@@ -576,7 +751,9 @@ const SendButton = styled.button`
 `;
 
 const ComposerError = styled.div`
+  grid-column: 1 / -1;
   min-width: 0;
+  padding: 0 12px 2px;
   color: #fca5a5;
   font-size: 11px;
   font-weight: 760;

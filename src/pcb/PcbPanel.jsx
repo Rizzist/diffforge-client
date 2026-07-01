@@ -4,7 +4,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { createCircuitWebWorker } from "@tscircuit/eval/worker";
 import evalWebWorkerBlobUrl from "@tscircuit/eval/blob-url";
-import runframePreviewBootstrapUrl from "./pcbRunframePreviewBootstrap.js?url";
+import manifoldModuleUrl from "manifold-3d/manifold.js?url";
+import manifoldWasmUrl from "manifold-3d/manifold.wasm?url";
 import runframeStandalonePreviewUrl from "@tscircuit/runframe/standalone-preview?url";
 
 export const PCB_VIEW_TABS = [
@@ -25,6 +26,162 @@ export const PCB_STORE_CHANGED_EVENT = "pcb-store-changed";
 const PCB_MAIN_FILE_PATH = "main.tsx";
 const PCB_RENDER_TIMEOUT_MS = 30000;
 
+function serializeJavaScriptLiteral(value) {
+  return String(JSON.stringify(value) ?? "null")
+    .replace(/\u2028/g, "\\u2028")
+    .replace(/\u2029/g, "\\u2029");
+}
+
+function buildRunframePreviewBootstrapSource({
+  circuitJson,
+  previewProps,
+  manifoldModuleUrl,
+  manifoldWasmUrl,
+}) {
+  const embeddedCircuitJson = serializeJavaScriptLiteral(normalizeCircuitJsonPayload(circuitJson));
+  const embeddedPreviewProps = serializeJavaScriptLiteral(sanitizeRunframePreviewProps(previewProps));
+  const embeddedManifoldModuleUrl = serializeJavaScriptLiteral(manifoldModuleUrl);
+  const embeddedManifoldWasmUrl = serializeJavaScriptLiteral(manifoldWasmUrl);
+
+  return PCB_RUNFRAME_PREVIEW_BOOTSTRAP_SOURCE
+    .replace(
+      "(function () {",
+      `(function () {\n  var embeddedCircuitJson = ${embeddedCircuitJson};\n  var embeddedPreviewProps = ${embeddedPreviewProps};\n  var embeddedManifoldModuleUrl = ${embeddedManifoldModuleUrl};\n  var embeddedManifoldWasmUrl = ${embeddedManifoldWasmUrl};`,
+    )
+    .replace(
+      `  window.CIRCUIT_JSON = normalizeCircuitJson(readJsonScript("circuit-json", []));
+  window.CIRCUIT_JSON_PREVIEW_PROPS = sanitizePreviewProps(readJsonScript("preview-props", {}));`,
+      `  window.CIRCUIT_JSON = normalizeCircuitJson(embeddedCircuitJson);
+  window.CIRCUIT_JSON_PREVIEW_PROPS = sanitizePreviewProps(embeddedPreviewProps);`,
+    );
+}
+
+const PCB_RUNFRAME_PREVIEW_BOOTSTRAP_SOURCE = `
+(function () {
+  var noopScriptUrl = null;
+  function readJsonScript(id, fallback) {
+    var element = document.getElementById(id);
+    if (!element) {
+      return fallback;
+    }
+    try {
+      return JSON.parse(element.textContent || "");
+    } catch (error) {
+      console.error("Failed to parse PCB preview payload", error);
+      return fallback;
+    }
+  }
+  function normalizeCircuitJson(value) {
+    if (Array.isArray(value)) {
+      return value;
+    }
+    if (Array.isArray(value && value.circuitJson)) {
+      return value.circuitJson;
+    }
+    if (Array.isArray(value && value.circuit_json)) {
+      return value.circuit_json;
+    }
+    if (Array.isArray(value && value.elements)) {
+      return value.elements;
+    }
+    return [];
+  }
+  function sanitizePreviewProps(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      return {};
+    }
+    delete value.circuitJson;
+    delete value.circuit_json;
+    delete value.elements;
+    return value;
+  }
+  function isPostpigUrl(value) {
+    try {
+      return new URL(String(value), window.location.href).hostname === "postpig.tscircuit.com";
+    } catch {
+      return false;
+    }
+  }
+  function getNoopScriptUrl() {
+    if (!noopScriptUrl) {
+      noopScriptUrl = URL.createObjectURL(new Blob([""], { type: "text/javascript" }));
+    }
+    return noopScriptUrl;
+  }
+  var originalFetch = window.fetch && window.fetch.bind(window);
+  if (originalFetch) {
+    window.fetch = function (input, init) {
+      var target = typeof input === "string" ? input : input && input.url;
+      if (isPostpigUrl(target)) {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      return originalFetch(input, init);
+    };
+  }
+  if (navigator.sendBeacon) {
+    var originalSendBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function (url, data) {
+      if (isPostpigUrl(url)) {
+        return true;
+      }
+      return originalSendBeacon(url, data);
+    };
+  }
+  if (window.XMLHttpRequest) {
+    var originalOpen = window.XMLHttpRequest.prototype.open;
+    var originalSend = window.XMLHttpRequest.prototype.send;
+    window.XMLHttpRequest.prototype.open = function (method, url) {
+      this.__diffforgeBlockedPostpig = isPostpigUrl(url);
+      return originalOpen.apply(this, arguments);
+    };
+    window.XMLHttpRequest.prototype.send = function () {
+      if (this.__diffforgeBlockedPostpig) {
+        return;
+      }
+      return originalSend.apply(this, arguments);
+    };
+  }
+  if (window.HTMLScriptElement) {
+    var srcDescriptor = Object.getOwnPropertyDescriptor(window.HTMLScriptElement.prototype, "src");
+    var originalSetAttribute = window.HTMLScriptElement.prototype.setAttribute;
+    if (srcDescriptor && srcDescriptor.set && srcDescriptor.get) {
+      Object.defineProperty(window.HTMLScriptElement.prototype, "src", {
+        configurable: true,
+        enumerable: srcDescriptor.enumerable,
+        get: function () {
+          return srcDescriptor.get.call(this);
+        },
+        set: function (value) {
+          return srcDescriptor.set.call(this, isPostpigUrl(value) ? getNoopScriptUrl() : value);
+        },
+      });
+    }
+    window.HTMLScriptElement.prototype.setAttribute = function (name, value) {
+      if (String(name).toLowerCase() === "src" && isPostpigUrl(value)) {
+        return originalSetAttribute.call(this, name, getNoopScriptUrl());
+      }
+      return originalSetAttribute.apply(this, arguments);
+    };
+  }
+  if (!window.ManifoldModule) {
+    window.ManifoldModule = function () {
+      return import(embeddedManifoldModuleUrl).then(function (module) {
+        if (!module || typeof module.default !== "function") {
+          throw new Error("Local Manifold module did not export a default initializer.");
+        }
+        return module.default({
+          locateFile: function (path) {
+            return String(path).endsWith(".wasm") ? embeddedManifoldWasmUrl : path;
+          },
+        });
+      });
+    };
+  }
+  window.CIRCUIT_JSON = normalizeCircuitJson(readJsonScript("circuit-json", []));
+  window.CIRCUIT_JSON_PREVIEW_PROPS = sanitizePreviewProps(readJsonScript("preview-props", {}));
+})();
+`;
+
 let pcbRenderQueue = Promise.resolve();
 
 function enqueuePcbRender(task) {
@@ -41,18 +198,36 @@ function escapeHtmlAttribute(value) {
     .replace(/>/g, "&gt;");
 }
 
-function escapeScriptData(value) {
-  return String(value || "")
-    .replace(/<\/script/gi, "<\\/script")
-    .replace(/<!--/g, "<\\!--");
-}
-
 function normalizeRepoIdentity(repoPath) {
   return String(repoPath || "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
 }
 
 function normalizePcbTab(tab) {
   return PCB_TABS.includes(tab) ? tab : "pcb";
+}
+
+function normalizeCircuitJsonPayload(value) {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  if (Array.isArray(value?.circuitJson)) {
+    return value.circuitJson;
+  }
+  if (Array.isArray(value?.circuit_json)) {
+    return value.circuit_json;
+  }
+  if (Array.isArray(value?.elements)) {
+    return value.elements;
+  }
+  return [];
+}
+
+function sanitizeRunframePreviewProps(value) {
+  const props = { ...(value || {}) };
+  delete props.circuitJson;
+  delete props.circuit_json;
+  delete props.elements;
+  return props;
 }
 
 function getErrorMessage(error) {
@@ -95,8 +270,6 @@ function withTimeout(promise, label, timeoutMs = PCB_RENDER_TIMEOUT_MS) {
 
 function buildPreviewSrcDoc({
   bootstrapUrl,
-  circuitJson,
-  previewProps,
   scriptUrl,
 }) {
   return `<!doctype html>
@@ -124,8 +297,6 @@ function buildPreviewSrcDoc({
   </head>
   <body>
     <div id="root"></div>
-    <script id="circuit-json" type="application/json">${escapeScriptData(JSON.stringify(circuitJson || []))}</script>
-    <script id="preview-props" type="application/json">${escapeScriptData(JSON.stringify(previewProps || {}))}</script>
     <script src="${escapeHtmlAttribute(bootstrapUrl)}"></script>
     <script src="${escapeHtmlAttribute(scriptUrl)}"></script>
   </body>
@@ -344,6 +515,7 @@ export default function PcbPanel({
   const [activeTab, setActiveTab] = useState(defaultTabId);
   const [source, setSource] = useState(null);
   const [circuitJson, setCircuitJson] = useState(null);
+  const [runframePreviewBootstrapUrl, setRunframePreviewBootstrapUrl] = useState("");
   const [renderLog, setRenderLog] = useState(null);
   const [solverEvents, setSolverEvents] = useState([]);
   const [renderStatus, setRenderStatus] = useState("idle");
@@ -382,20 +554,38 @@ export default function PcbPanel({
     solverEvents,
   }), [activeTab, board?.name, boardPath, fsMap, renderError, renderLog, renderStatus, solverEvents, source]);
   const previewSrcDoc = useMemo(() => {
-    if (!circuitJson) {
+    if (!circuitJson || !runframePreviewBootstrapUrl) {
       return "";
     }
     return buildPreviewSrcDoc({
       bootstrapUrl: runframePreviewBootstrapUrl,
-      circuitJson,
-      previewProps,
       scriptUrl: runframeStandalonePreviewUrl,
     });
-  }, [circuitJson, previewProps]);
+  }, [circuitJson, runframePreviewBootstrapUrl]);
 
   useEffect(() => {
     setActiveTab(defaultTabId);
   }, [boardPath, defaultTabId]);
+
+  useEffect(() => {
+    if (!circuitJson) {
+      setRunframePreviewBootstrapUrl("");
+      return undefined;
+    }
+    const bootstrapUrl = URL.createObjectURL(new Blob(
+      [buildRunframePreviewBootstrapSource({
+        circuitJson,
+        previewProps,
+        manifoldModuleUrl,
+        manifoldWasmUrl,
+      })],
+      { type: "text/javascript" },
+    ));
+    setRunframePreviewBootstrapUrl(bootstrapUrl);
+    return () => {
+      URL.revokeObjectURL(bootstrapUrl);
+    };
+  }, [circuitJson, previewProps]);
 
   const readSource = useCallback(() => {
     const readSeq = readSeqRef.current + 1;
@@ -536,7 +726,7 @@ export default function PcbPanel({
         const settled = runWorkerStep(worker.renderUntilSettled(), "settling PCB render");
         const initialCircuitJson = await runWorkerStep(worker.getCircuitJson(), "reading initial PCB JSON");
         if (isCurrent()) {
-          setCircuitJson(initialCircuitJson);
+          setCircuitJson(normalizeCircuitJsonPayload(initialCircuitJson));
           updateRenderLog((previous) => ({
             ...previous,
             progress: Math.max(previous.progress || 0, 0.55),
@@ -545,7 +735,7 @@ export default function PcbPanel({
         await settled;
         const finalCircuitJson = await runWorkerStep(worker.getCircuitJson(), "reading final PCB JSON");
         if (isCurrent()) {
-          setCircuitJson(finalCircuitJson);
+          setCircuitJson(normalizeCircuitJsonPayload(finalCircuitJson));
           setRenderStatus("ready");
           setRenderError("");
           updateRenderLog((previous) => ({
@@ -680,7 +870,7 @@ export default function PcbPanel({
           <PanelMessage>Loading board…</PanelMessage>
         ) : renderStatus === "error" && !circuitJson ? (
           <PanelMessage data-tone="error">Could not render board: {renderError}</PanelMessage>
-        ) : !circuitJson ? (
+        ) : !circuitJson || !previewSrcDoc ? (
           <PanelMessage>Rendering board…</PanelMessage>
         ) : (
           <RunFrameSurface>

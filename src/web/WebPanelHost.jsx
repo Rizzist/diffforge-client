@@ -2,6 +2,7 @@ import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
+import { AdsClick } from "@styled-icons/material-rounded/AdsClick";
 import { ArrowBack } from "@styled-icons/material-rounded/ArrowBack";
 import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
 import { Language } from "@styled-icons/material-rounded/Language";
@@ -21,10 +22,13 @@ import {
 } from "../app/appStyles.js";
 import {
   DEFAULT_WEB_URL,
+  hasTauriRuntime,
   hostForUrl,
   normalizeWebInput,
   useNativeWebview,
 } from "./webNative.js";
+import { useWebAgentPromptOverlay } from "./webAgentPromptOverlay.js";
+import { useWebElementPicker } from "./webElementPicker.js";
 import {
   WEB_PANEL_COMMAND_EVENT,
   WEB_PANEL_CONTROL_EVENT,
@@ -45,7 +49,8 @@ import {
   normalizePanelAgentPromptTargets,
 } from "../terminals/panelAgentPromptBridge.js";
 
-const PANEL_AGENT_PROMPT_WEBVIEW_BOTTOM_INSET = 164;
+const PANEL_AGENT_PROMPT_WEBVIEW_BOTTOM_INSET = 118;
+const PANEL_AGENT_PROMPT_MENU_WEBVIEW_BOTTOM_INSET = 224;
 
 function parseWebPanelParams() {
   if (typeof window === "undefined") {
@@ -80,6 +85,7 @@ export default function WebPanelHost() {
   const [addressValue, setAddressValue] = useState(params.url);
   const [addressError, setAddressError] = useState("");
   const [agentPromptOpen, setAgentPromptOpen] = useState(false);
+  const [agentPromptTargetMenuOpen, setAgentPromptTargetMenuOpen] = useState(false);
   const [agentPromptActivityItems, setAgentPromptActivityItems] = useState([]);
   const [agentPromptTargets, setAgentPromptTargets] = useState([]);
   const [defaultAgentPromptTargetIds, setDefaultAgentPromptTargetIds] = useState([]);
@@ -99,6 +105,12 @@ export default function WebPanelHost() {
     setAddressValue(currentUrl);
   }, [currentUrl]);
 
+  useEffect(() => {
+    if (!agentPromptOpen) {
+      setAgentPromptTargetMenuOpen(false);
+    }
+  }, [agentPromptOpen]);
+
   const scopeParts = useMemo(() => [params.paneId || "pane"], [params.paneId]);
 
   const emitNavigate = useCallback((url) => {
@@ -116,18 +128,41 @@ export default function WebPanelHost() {
   const handleLoadedUrl = useCallback((loadedUrl) => {
     if (loadedUrl) {
       setAddressValue(loadedUrl);
+      setHistory((previous) => {
+        const activeIndex = Math.min(Math.max(historyIndex, 0), Math.max(0, previous.length - 1));
+        if ((previous[activeIndex] || "") === loadedUrl) {
+          return previous;
+        }
+        return [...previous.slice(0, activeIndex + 1), loadedUrl];
+      });
+      setHistoryIndex((index) => ((history[index] || "") === loadedUrl ? index : index + 1));
       emitNavigate(loadedUrl);
     }
-  }, [emitNavigate]);
+  }, [emitNavigate, history, historyIndex]);
 
-  const { reload } = useNativeWebview({
+  const nativeAgentPromptOverlayActive = Boolean(agentPromptOpen && hasTauriRuntime());
+
+  const { evaluate, reload } = useNativeWebview({
     viewportRef,
     url: currentUrl,
     visible: true,
     parentWindowLabel: windowLabel,
     scopeParts,
-    viewportInsetBottom: agentPromptOpen ? PANEL_AGENT_PROMPT_WEBVIEW_BOTTOM_INSET : 0,
+    viewportInsetBottom: agentPromptOpen && !nativeAgentPromptOverlayActive
+      ? agentPromptTargetMenuOpen
+        ? PANEL_AGENT_PROMPT_MENU_WEBVIEW_BOTTOM_INSET
+        : PANEL_AGENT_PROMPT_WEBVIEW_BOTTOM_INSET
+      : 0,
     onNavigate: handleLoadedUrl,
+  });
+
+  const webElementPicker = useWebElementPicker({
+    currentUrl,
+    enabled: agentPromptOpen,
+    evaluate,
+    panelKind: "web",
+    paneId: params.paneId,
+    workspaceId: params.workspaceId,
   });
 
   const requestAgentPromptTargets = useCallback(() => {
@@ -241,7 +276,7 @@ export default function WebPanelHost() {
     };
   }, [params.workspaceId, windowLabel]);
 
-  const submitAgentPrompt = useCallback(async ({ targetIds, targetTerminalIndexes, text }) => {
+  const submitAgentPrompt = useCallback(async ({ contextRefs, targetIds, targetTerminalIndexes, text }) => {
     const requestId = createPanelAgentPromptRequestId("web-panel-submit");
     let unlisten = () => {};
     return new Promise((resolve, reject) => {
@@ -280,6 +315,7 @@ export default function WebPanelHost() {
           } else {
             unlisten = nextUnlisten;
             emit(PANEL_AGENT_PROMPT_SUBMIT_EVENT, {
+              contextRefs,
               panelKind: "web",
               paneId: params.paneId,
               requestId,
@@ -302,6 +338,18 @@ export default function WebPanelHost() {
         });
     });
   }, [params.paneId, params.workspaceId, windowLabel]);
+
+  const webAgentPromptOverlay = useWebAgentPromptOverlay({
+    contextRefs: webElementPicker.contextRefs,
+    defaultSelectedTargetIds: defaultAgentPromptTargetIds,
+    enabled: nativeAgentPromptOverlayActive,
+    evaluate,
+    onClearContext: webElementPicker.clearSelection,
+    onClose: () => setAgentPromptOpen(false),
+    onSubmit: submitAgentPrompt,
+    targets: agentPromptTargets,
+    windowId: windowLabel,
+  });
 
   const navigateTo = useCallback((targetUrl) => {
     setHistory((previous) => {
@@ -488,6 +536,18 @@ export default function WebPanelHost() {
             >
               <ButtonBotIcon aria-hidden="true" />
             </HostIconButton>
+            {agentPromptOpen ? (
+              <HostIconButton
+                aria-label="Select web element"
+                aria-pressed={webElementPicker.armed || webElementPicker.contextRefs.length ? "true" : "false"}
+                data-active={webElementPicker.armed || webElementPicker.contextRefs.length ? "true" : undefined}
+                onClick={webElementPicker.togglePicker}
+                title="Select web element"
+                type="button"
+              >
+                <AdsClick aria-hidden="true" />
+              </HostIconButton>
+            ) : null}
             <HostIconButton
               aria-label="Return web panel to the app"
               aria-pressed="true"
@@ -542,17 +602,23 @@ export default function WebPanelHost() {
           <Language aria-hidden="true" />
           <span>{currentHost}</span>
         </HostBackdrop>
-        {agentPromptOpen ? (
+        {agentPromptOpen && !webAgentPromptOverlay.active ? (
           <PanelAgentPromptComposer
             autoFocus
+            contextRefs={webElementPicker.contextRefs}
             defaultSelectedTargetIds={defaultAgentPromptTargetIds}
+            onClearContext={webElementPicker.clearSelection}
             onClose={() => setAgentPromptOpen(false)}
             onSubmit={submitAgentPrompt}
+            onTargetMenuOpenChange={setAgentPromptTargetMenuOpen}
             panelKind="web"
             panelPaneId={params.paneId}
             targets={agentPromptTargets}
             windowId={windowLabel}
           />
+        ) : null}
+        {agentPromptOpen && webElementPicker.error ? (
+          <HostPickerError role="alert">{webElementPicker.error}</HostPickerError>
         ) : null}
       </HostViewport>
     </HostSurface>
@@ -712,5 +778,27 @@ const HostBackdrop = styled.div`
   svg {
     width: 30px;
     height: 30px;
+  }
+`;
+
+const HostPickerError = styled.div`
+  position: absolute;
+  right: 12px;
+  bottom: 78px;
+  z-index: 43;
+  max-width: min(360px, calc(100% - 24px));
+  padding: 6px 9px;
+  border: 1px solid rgba(252, 165, 165, 0.28);
+  border-radius: 999px;
+  color: #fecaca;
+  background: rgba(69, 10, 10, 0.76);
+  font-size: 11px;
+  font-weight: 760;
+  line-height: 1.2;
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.28);
+
+  html[data-forge-theme="light"] & {
+    color: #991b1b;
+    background: rgba(254, 226, 226, 0.9);
   }
 `;

@@ -179,6 +179,18 @@ export async function invokeWebviewClose(label) {
   await invoke("workspace_webview_close", { label: safeLabel }).catch(() => {});
 }
 
+export async function invokeWebviewEval({ label, script, expectResult = true }) {
+  const safeLabel = String(label || "").trim();
+  if (!safeLabel) {
+    throw new Error("Workspace web view is unavailable.");
+  }
+  return invoke("workspace_webview_eval", {
+    expectResult,
+    label: safeLabel,
+    script,
+  });
+}
+
 // useNativeWebview manages one native child webview positioned over `viewportRef`,
 // showing `url`, visible when `visible` is true. It re-opens when `url` (or the
 // reload counter) changes, keeps fitted on resize via a ResizeObserver + a short
@@ -310,6 +322,18 @@ export function useNativeWebview({
       void invokeWebviewClose(label);
     }
   }, []);
+
+  const evaluate = useCallback((script, options = {}) => {
+    const label = labelRef.current;
+    if (!runtimeEnabled || !label) {
+      return Promise.reject(new Error("Workspace web view is unavailable."));
+    }
+    return invokeWebviewEval({
+      expectResult: options.expectResult !== false,
+      label,
+      script,
+    });
+  }, [runtimeEnabled]);
 
   // Open (or re-open) the webview when the url / reload counter / parent changes.
   useEffect(() => {
@@ -591,5 +615,5 @@ export function useNativeWebview({
     setReloadKey((key) => key + 1);
   }, []);
 
-  return { status, reload };
+  return { status, reload, evaluate };
 }

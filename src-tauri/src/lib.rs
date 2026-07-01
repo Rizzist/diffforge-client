@@ -3,7 +3,7 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     env, fs,
-    io::{Read, SeekFrom, Write},
+    io::{BufRead, Read, SeekFrom, Write},
     net::ToSocketAddrs,
     path::{Component, Path, PathBuf},
     process::{Command, Stdio},
@@ -174,10 +174,10 @@ const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
 const TERMINAL_STATUS_LOGGING_ENABLED: bool = false;
 const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
-/// Flip to trace the cloud sync/connect loop into logs/cloud-sync.jsonl:
+/// Persist the cloud sync/connect loop into logs/cloud-sync.jsonl:
 /// every connection-state note, ws phase change, route resolution, open
 /// attempt (with durations), disconnect reason, and outbox depth.
-const CLOUD_SYNC_LOGGING_ENABLED: bool = false;
+const CLOUD_SYNC_LOGGING_ENABLED: bool = true;
 const CLOUD_SYNC_LOG_FILE: &str = "cloud-sync.jsonl";
 const TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED: bool = false;
 const TERMINAL_CRASH_FORENSICS_LOG_FILE: &str = "terminal-crash-forensics.jsonl";
@@ -3300,6 +3300,7 @@ fn install_app_panic_log_hook() {
                 "thread_name": clean_terminal_telemetry_text(&thread_name),
             });
             log_terminal_crash_forensics_event("backend.app_panic", fields.clone());
+            log_cloud_sync_event("backend.app_panic", fields.clone());
             log_audio_diagnostic_event("app.panic", fields);
             previous_hook(panic_info);
         }));
@@ -5257,6 +5258,7 @@ pub fn run() {
             open_html_document_in_browser,
             workspace_webview_open,
             workspace_webview_fit,
+            workspace_webview_eval,
             workspace_webview_close,
             app_local_state_load,
             app_local_state_store,

@@ -656,6 +656,8 @@ fn terminal_projection_state_is_busy(value: &str) -> bool {
     matches!(
         terminal_projection_text(value, "").as_str(),
         "busy"
+            | "compacting"
+            | "compaction"
             | "delegating"
             | "dispatched"
             | "editing"
@@ -716,6 +718,13 @@ fn terminal_projection_state_is_finished(value: &str) -> bool {
     )
 }
 
+fn terminal_projection_state_is_compacting(value: &str) -> bool {
+    matches!(
+        terminal_projection_text(value, "").as_str(),
+        "compacting" | "compaction"
+    )
+}
+
 fn terminal_projection_readiness(status: &str) -> &'static str {
     let status = terminal_projection_text(status, "idle");
     if terminal_projection_state_is_busy(&status) {
@@ -740,6 +749,8 @@ fn terminal_projection_turn_status(activity_status: &str, status: &str) -> &'sta
     );
     if matches!(activity.as_str(), "cancelled" | "canceled" | "interrupted") {
         "interrupted"
+    } else if terminal_projection_state_is_compacting(&activity) {
+        "running"
     } else if terminal_projection_state_is_busy(&activity) {
         "running"
     } else if terminal_projection_state_is_error(&activity) {
@@ -790,6 +801,15 @@ fn terminal_projection_execution_phase(
         } else {
             "closed"
         };
+    }
+    if matches!(
+        event_type.as_str(),
+        "provider_turn_compacting" | "context_compaction_started"
+    ) || terminal_projection_state_is_compacting(&command_phase)
+        || terminal_projection_state_is_compacting(&activity)
+        || terminal_projection_state_is_compacting(&turn)
+    {
+        return "compacting";
     }
     if event_type == "provider_turn_interrupted" || turn == "interrupted" {
         return "interrupted";
@@ -853,6 +873,7 @@ fn terminal_projection_rail_state(execution_phase: &str, fallback: &str) -> Stri
         }
         "failed" => "error".to_string(),
         "needs_input" | "paused" | "parked" | "resume_ready" => "paused".to_string(),
+        "compacting" | "compaction" => "compacting".to_string(),
         "queued" | "submitted" | "input_written" | "accepted" | "running" | "cancelling" => {
             "thinking".to_string()
         }
@@ -925,6 +946,13 @@ fn terminal_project_runtime(
         || matches!(raw_activity.as_str(), "cancelled" | "canceled" | "interrupted")
     {
         "interrupted".to_string()
+    } else if matches!(
+        raw_event_type.as_str(),
+        "provider_turn_compacting" | "context_compaction_started"
+    ) || terminal_projection_state_is_compacting(&raw_activity)
+        || terminal_projection_state_is_compacting(&raw_command_phase)
+    {
+        "compacting".to_string()
     } else if parked || terminal_projection_state_is_paused(&raw_activity) {
         "paused".to_string()
     } else if terminal_projection_state_is_error(&raw_activity)
@@ -10755,28 +10783,88 @@ fn terminal_activity_hook_bool(event: &Value, keys: &[&str]) -> bool {
         .any(|key| event.get(*key).and_then(Value::as_bool).unwrap_or(false))
 }
 
-fn terminal_activity_hook_value_has_entries(event: &Value, keys: &[&str]) -> bool {
-    keys.iter().any(|key| match event.get(*key) {
-        Some(Value::Array(items)) => !items.is_empty(),
-        Some(Value::Object(object)) => !object.is_empty(),
-        Some(Value::String(value)) => !value.trim().is_empty(),
-        Some(Value::Bool(value)) => *value,
-        Some(Value::Number(_)) => true,
+fn terminal_activity_hook_background_status_is_active(status: &str) -> bool {
+    let status = terminal_activity_hook_name_key(status);
+    matches!(
+        status.as_str(),
+        "active"
+            | "busy"
+            | "dispatching"
+            | "executing"
+            | "inprogress"
+            | "pending"
+            | "processing"
+            | "queued"
+            | "running"
+            | "starting"
+            | "working"
+    )
+}
+
+fn terminal_activity_hook_background_value_is_active(value: &Value) -> bool {
+    match value {
+        Value::Bool(value) => *value,
+        Value::String(value) => terminal_activity_hook_background_status_is_active(value),
+        Value::Number(number) => number.as_i64().is_some_and(|value| value > 0),
+        Value::Array(items) => items
+            .iter()
+            .any(terminal_activity_hook_background_value_is_active),
+        Value::Object(object) => {
+            for key in [
+                "status",
+                "state",
+                "phase",
+                "commandPhase",
+                "command_phase",
+                "activityStatus",
+                "activity_status",
+                "turnStatus",
+                "turn_status",
+            ] {
+                if let Some(value) = object.get(key) {
+                    match value {
+                        Value::String(status)
+                            if terminal_activity_hook_background_status_is_active(status) =>
+                        {
+                            return true;
+                        }
+                        Value::Bool(flag) if *flag => return true,
+                        _ => {}
+                    }
+                }
+            }
+            [
+                "active",
+                "busy",
+                "inProgress",
+                "in_progress",
+                "pending",
+                "queued",
+                "running",
+            ]
+            .iter()
+            .any(|key| object.get(*key).and_then(Value::as_bool).unwrap_or(false))
+        }
         _ => false,
-    })
+    }
+}
+
+fn terminal_activity_hook_background_field_is_active(event: &Value, keys: &[&str]) -> bool {
+    keys.iter()
+        .filter_map(|key| event.get(*key))
+        .any(terminal_activity_hook_background_value_is_active)
 }
 
 fn terminal_activity_hook_claude_stop_has_background_work(event: &Value) -> bool {
-    terminal_activity_hook_bool(event, &["stopHookActive", "stop_hook_active"])
-        || terminal_activity_hook_value_has_entries(
-            event,
-            &[
-                "backgroundTasks",
-                "background_tasks",
-                "sessionCrons",
-                "session_crons",
-            ],
-        )
+    terminal_activity_hook_background_field_is_active(
+        event,
+        &[
+            "backgroundTasks",
+            "background_tasks",
+            "sessionCrons",
+            "session_crons",
+        ],
+    )
 }
 
 fn terminal_activity_hook_status_key(event: &Value, keys: &[&str]) -> Option<String> {
@@ -11092,6 +11180,30 @@ fn terminal_activity_hook_activity_kind(
             false,
             "cli_hook_tool_complete",
         )),
+        "posttoolusefailure" => Some((
+            "provider-tool-failed",
+            "thinking",
+            "active",
+            "tool_failed",
+            false,
+            "cli_hook_tool_failed",
+        )),
+        "posttoolbatch" => Some((
+            "provider-tool-batch-completed",
+            "thinking",
+            "active",
+            "tool_completed",
+            false,
+            "cli_hook_tool_batch",
+        )),
+        "messagedisplay" | "assistantmessagedisplay" | "assistantmessagedelta" => Some((
+            "provider-message-displayed",
+            "thinking",
+            "active",
+            "message_delta",
+            false,
+            "cli_hook_message_display",
+        )),
         "permissionrequest" => Some((
             "provider-permission-requested",
             "paused",
@@ -11116,6 +11228,22 @@ fn terminal_activity_hook_activity_kind(
             false,
             "cli_hook_subagent_complete",
         )),
+        "taskcreated" => Some((
+            "provider-task-created",
+            "subagent_running",
+            "active",
+            "subagent_running",
+            false,
+            "cli_hook_task_created",
+        )),
+        "taskcompleted" => Some((
+            "provider-task-completed",
+            "thinking",
+            "active",
+            "subagent_completed",
+            false,
+            "cli_hook_task_completed",
+        )),
         _ => None,
     }
 }
@@ -11123,7 +11251,18 @@ fn terminal_activity_hook_activity_kind(
 fn terminal_activity_hook_non_lifecycle_is_expected(hook_event_name: &str) -> bool {
     matches!(
         terminal_activity_hook_name_key(hook_event_name).as_str(),
-        "pretooluse" | "posttooluse" | "subagentstart" | "subagentstop"
+        "assistantmessagedelta"
+            | "assistantmessagedisplay"
+            | "messagedisplay"
+            | "permissionrequest"
+            | "posttoolbatch"
+            | "posttooluse"
+            | "posttoolusefailure"
+            | "pretooluse"
+            | "subagentstart"
+            | "subagentstop"
+            | "taskcompleted"
+            | "taskcreated"
     )
 }
 
@@ -11401,9 +11540,14 @@ fn terminal_activity_hook_payload(
     let user_message = terminal_activity_hook_string(
         event,
         &[
+            "assistantMessage",
+            "assistant_message",
+            "content",
+            "delta",
             "prompt",
             "userPrompt",
             "user_prompt",
+            "text",
             "message",
             "description",
             "lastMessage",
@@ -16761,20 +16905,39 @@ mod terminal_tests {
 
     #[test]
     fn claude_stop_background_metadata_blocks_ready_completion() {
-        assert!(terminal_activity_hook_claude_stop_has_background_work(&json!({
+        assert!(!terminal_activity_hook_claude_stop_has_background_work(&json!({
             "stopHookActive": true,
         })));
         assert!(terminal_activity_hook_claude_stop_has_background_work(&json!({
-            "backgroundTasks": [{ "id": "task-1" }],
+            "backgroundTasks": [{ "id": "task-1", "status": "running" }],
         })));
         assert!(terminal_activity_hook_claude_stop_has_background_work(&json!({
-            "session_crons": [{ "id": "cron-1" }],
+            "session_crons": [{ "id": "cron-1", "state": "queued" }],
+        })));
+        assert!(!terminal_activity_hook_claude_stop_has_background_work(&json!({
+            "backgroundTasks": [{ "id": "task-1", "status": "completed" }],
+            "session_crons": [{ "id": "cron-1", "state": "done" }],
         })));
         assert!(!terminal_activity_hook_claude_stop_has_background_work(&json!({
             "stopHookActive": false,
             "backgroundTasks": [],
             "sessionCrons": [],
         })));
+    }
+
+    #[test]
+    fn provider_display_and_extended_tool_hooks_are_mapped() {
+        assert_eq!(
+            terminal_activity_hook_activity_kind("MessageDisplay", &json!({}))
+                .map(|value| value.0),
+            Some("provider-message-displayed")
+        );
+        assert_eq!(
+            terminal_activity_hook_activity_kind("PostToolUseFailure", &json!({}))
+                .map(|value| value.0),
+            Some("provider-tool-failed")
+        );
+        assert!(terminal_activity_hook_non_lifecycle_is_expected("TaskCompleted"));
     }
 
     #[test]

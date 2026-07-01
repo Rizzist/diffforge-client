@@ -129,6 +129,7 @@ import {
 import {
   createWorkspaceThreadId,
   getWorkspaceThreadProviderBinding,
+  getWorkspaceThreadTerminalNickname,
 } from "../threads/workspaceThreads";
 import GitWorkspaceView from "../git/GitWorkspaceView.jsx";
 import PlansWorkspaceView from "../plans/PlansWorkspaceView.jsx";
@@ -151,6 +152,8 @@ import {
   PANEL_AGENT_PROMPT_SUBMIT_EVENT,
   PANEL_AGENT_PROMPT_TARGETS_EVENT,
   PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT,
+  formatPanelAgentPromptContextNote,
+  normalizePanelAgentPromptContextRefs,
   normalizePanelAgentPromptActivityItems,
   normalizePanelAgentPromptTargets,
 } from "./panelAgentPromptBridge.js";
@@ -387,18 +390,12 @@ const TODO_QUEUE_ATTEMPT_ONLY_TARGET_REASONS = new Set([
   "todo_queue_backend_submit_requested",
 ]);
 const TODO_QUEUE_ACTIVE_PANEL_HIDDEN_STATUSES = new Set([
-  "cancelled",
-  "canceled",
   "completed",
   "deleted",
   "duplicate_ignored",
-  "failed",
-  "interrupted",
-  "paused",
   "removed",
   "running",
   "sending",
-  "timed_out",
 ]);
 const TERMINAL_FULLSCREEN_DEFAULT_MOTION = {
   originScaleX: 1,
@@ -5453,8 +5450,16 @@ const OrchestratorHistoryTurnStatus = styled.div`
     color: #ff9b73;
   }
 
+  &[data-status="interrupted"] {
+    color: #ffbf7a;
+  }
+
   html[data-forge-theme="light"] &[data-status="cancelled"] {
     color: #b45309;
+  }
+
+  html[data-forge-theme="light"] &[data-status="interrupted"] {
+    color: #92400e;
   }
 `;
 
@@ -5480,7 +5485,8 @@ const OrchestratorHistoryTranscript = styled.div`
     background: #242424;
   }
 
-  &[data-cancelled="true"] {
+  &[data-cancelled="true"],
+  &[data-interrupted="true"] {
     border-color: rgba(255, 149, 103, 0.18);
     color: rgba(255, 220, 202, 0.8);
     background:
@@ -5503,7 +5509,8 @@ const OrchestratorHistoryTranscript = styled.div`
     background: #eeeeee;
   }
 
-  html[data-forge-theme="light"] &[data-cancelled="true"] {
+  html[data-forge-theme="light"] &[data-cancelled="true"],
+  html[data-forge-theme="light"] &[data-interrupted="true"] {
     border-color: rgba(180, 83, 9, 0.16);
     color: rgba(91, 50, 15, 0.74);
     background: rgba(255, 247, 237, 0.92);
@@ -8215,6 +8222,47 @@ const TodoQueueStatusPill = styled.span`
   html[data-forge-theme="light"] & {
     color: #495466;
     background: rgba(0, 0, 0, 0.06);
+  }
+`;
+
+const TodoQueueRecoverActions = styled.div`
+  display: inline-flex;
+  width: max-content;
+  max-width: 100%;
+  align-items: center;
+  gap: 4px;
+`;
+
+const TodoQueueRecoverButton = styled.button`
+  display: inline-grid;
+  width: 23px;
+  height: 23px;
+  place-items: center;
+  padding: 0;
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.28);
+  border-radius: 7px;
+  color: #e8eef8;
+  background: rgba(255, 255, 255, 0.06);
+  cursor: pointer;
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+
+  &:hover {
+    border-color: rgba(var(--forge-tint-rgb), 0.55);
+    background: rgba(var(--forge-tint-rgb), 0.16);
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(var(--forge-tint-rgb), 0.72);
+    outline-offset: 2px;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1d1d1f;
+    background: rgba(0, 0, 0, 0.04);
   }
 `;
 
@@ -11693,6 +11741,12 @@ function getVoiceHistoryTurnStatus(item) {
   if (llmStatus === "cancelled" || llmStatus === "canceled") {
     return "Cancelled";
   }
+  if (llmStatus === "interrupted" || llmStatus === "interrupt") {
+    return "Interrupted";
+  }
+  if (llmStatus === "compacting" || llmStatus === "compaction") {
+    return "Compacting";
+  }
   if (llmStatus === "failed" || llmStatus === "error") {
     return "Failed";
   }
@@ -11752,6 +11806,10 @@ function normalizeOrchestratorVoiceHistoryItem(item) {
 
   const id = String(item.id || "").trim();
   const transcript = normalizeVoiceHistoryText(item.transcript);
+  const retryText = normalizeVoiceHistoryText(
+    item.retryText || item.recoverableText || item.transcript,
+    12000,
+  );
   const llmFeedback = normalizeVoiceHistoryText(item.llmFeedback, 1600);
   const llmError = normalizeVoiceHistoryText(item.llmError, 1600);
   const queuedText = normalizeVoiceHistoryText(item.queuedText, 600);
@@ -11775,6 +11833,7 @@ function normalizeOrchestratorVoiceHistoryItem(item) {
     ...(plan ? { plan } : {}),
     queued: Boolean(item.queued),
     queuedText,
+    ...(retryText ? { recoverableText: retryText, retryText } : {}),
     source: String(item.source || "").trim().slice(0, 32),
     engine: String(item.engine || "").trim().slice(0, 24),
     toolCalls,
@@ -16804,7 +16863,9 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   const editingTextAreaRef = useRef(null);
   const todoListRef = useRef(null);
   const orchestratorHistoryScrollRef = useRef(null);
+  const orchestratorChatInputRef = useRef(null);
   const skipEditBlurCommitRef = useRef(false);
+  const queueAfterEditItemIdRef = useRef("");
   const [todoDeviceSelectionId, setTodoDeviceSelectionId] = useState("");
   const [todoDevicePickerExpanded, setTodoDevicePickerExpanded] = useState(false);
   const [todoDeviceSelectionRevealed, setTodoDeviceSelectionRevealed] = useState(false);
@@ -19415,9 +19476,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     }
   }, [clearAllVoiceHistoryTurnTimeouts, resetOrchestratorFastResponseGate, startOrchestratorVoiceMonitor]);
 
-  const handleOrchestratorChatSubmit = useCallback(async (event) => {
-    event?.preventDefault?.();
-    const text = orchestratorChatDraft.trim();
+  const submitOrchestratorChatText = useCallback(async (rawText) => {
+    const text = String(rawText || "").trim();
     if (
       !text
       || orchestratorChatSubmitting
@@ -19486,7 +19546,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     clearAllVoiceHistoryTurnTimeouts,
     getCloudVoiceAgentRequestContext,
     markVoiceHistoryTurnTerminal,
-    orchestratorChatDraft,
     orchestratorChatSubmitting,
     orchestratorPanelWorkspaceId,
     orchestratorVoiceState,
@@ -19494,6 +19553,40 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     scheduleVoiceHistoryTurnTimeout,
     updateVoiceHistoryTurn,
   ]);
+
+  const handleOrchestratorChatSubmit = useCallback(async (event) => {
+    event?.preventDefault?.();
+    await submitOrchestratorChatText(orchestratorChatDraft);
+  }, [orchestratorChatDraft, submitOrchestratorChatText]);
+
+  const getOrchestratorHistoryRetryText = useCallback((item) => (
+    normalizeVoiceHistoryText(item?.recoverableText || item?.retryText || item?.transcript, 12000)
+  ), []);
+
+  const redoOrchestratorHistoryTurn = useCallback((item) => {
+    const text = getOrchestratorHistoryRetryText(item);
+    if (!text) {
+      return;
+    }
+    void submitOrchestratorChatText(text);
+  }, [getOrchestratorHistoryRetryText, submitOrchestratorChatText]);
+
+  const editOrchestratorHistoryTurn = useCallback((item) => {
+    const text = getOrchestratorHistoryRetryText(item);
+    if (!text) {
+      return;
+    }
+    setOrchestratorChatDraft(text);
+    window.setTimeout(() => {
+      const input = orchestratorChatInputRef.current;
+      input?.focus?.({ preventScroll: true });
+      try {
+        input?.setSelectionRange?.(text.length, text.length);
+      } catch {
+        // Some textarea implementations can reject selection during teardown.
+      }
+    }, 0);
+  }, [getOrchestratorHistoryRetryText]);
 
   const handleOrchestratorChatKeyDown = useCallback((event) => {
     if (event.key !== "Enter" || event.shiftKey) {
@@ -19657,7 +19750,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     };
   }, [onSubmitDraft, todoSelectionEditable, workspaceId]);
 
-  const beginItemEdit = useCallback((item) => {
+  const beginItemEdit = useCallback((item, options = {}) => {
     if (!todoSelectionEditable) {
       return;
     }
@@ -19669,9 +19762,11 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     setEditingItemId(item.id);
     setEditingDraft(text);
     skipEditBlurCommitRef.current = false;
+    queueAfterEditItemIdRef.current = options.queueAfterCommit ? item.id : "";
   }, [pendingItems, todoSelectionEditable]);
 
   const clearItemEdit = useCallback(() => {
+    queueAfterEditItemIdRef.current = "";
     setEditingItemId("");
     setEditingDraft("");
   }, []);
@@ -19681,10 +19776,31 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       return;
     }
 
-    onUpdateItem?.(editingItemId, editingDraft);
+    const nextText = normalizeTodoQueueText(editingDraft);
+    const shouldQueueAfterEdit = queueAfterEditItemIdRef.current === editingItemId;
+    const existingItem = items.find((item) => item?.id === editingItemId) || null;
+    onUpdateItem?.(editingItemId, nextText);
+    queueAfterEditItemIdRef.current = "";
     skipEditBlurCommitRef.current = true;
     clearItemEdit();
-  }, [clearItemEdit, editingDraft, editingItemId, onUpdateItem, todoSelectionEditable]);
+    if (shouldQueueAfterEdit && existingItem && nextText && !pendingItems[editingItemId]) {
+      window.setTimeout(() => {
+        onQueueItem?.(editingItemId, {
+          ...existingItem,
+          text: nextText,
+        });
+      }, 0);
+    }
+  }, [
+    clearItemEdit,
+    editingDraft,
+    editingItemId,
+    items,
+    onQueueItem,
+    onUpdateItem,
+    pendingItems,
+    todoSelectionEditable,
+  ]);
 
   const handleItemEditBlur = useCallback(() => {
     if (skipEditBlurCommitRef.current) {
@@ -19710,6 +19826,24 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     event.preventDefault();
     commitItemEdit();
   }, [clearItemEdit, commitItemEdit]);
+
+  const handleRecoverableRedo = useCallback((event, item) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!todoSelectionEditable || !item?.id || pendingItems[item.id]) {
+      return;
+    }
+    onQueueItem?.(item.id, item);
+  }, [onQueueItem, pendingItems, todoSelectionEditable]);
+
+  const handleRecoverableEditAndSend = useCallback((event, item) => {
+    event.preventDefault();
+    event.stopPropagation();
+    if (!todoSelectionEditable || !item?.id || pendingItems[item.id]) {
+      return;
+    }
+    beginItemEdit(item, { queueAfterCommit: true });
+  }, [beginItemEdit, pendingItems, todoSelectionEditable]);
 
   const focusDraftTextArea = useCallback(() => {
     draftTextAreaRef.current?.focus?.();
@@ -20913,6 +21047,12 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                     const hasPreview = Boolean(images.length || note);
                     const recoverableStatus = getTodoQueueRecoverableStatus(item);
                     const recoverableStatusLabel = todoQueueRecoverableStatusLabel(recoverableStatus);
+                    const canRecoverTodo = Boolean(
+                      recoverableStatusLabel
+                        && !itemReadOnly
+                        && !isPending
+                        && normalizeTodoQueueText(item.text),
+                    );
                     const mirrorStatusLabel = itemReadOnly && item.displayStatusLabel
                       ? item.displayStatusLabel
                       : "";
@@ -21135,6 +21275,34 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                                 {recoverableStatusLabel}
                               </TodoQueueStatusPill>
                             )}
+                            {!isEditing && canRecoverTodo && (
+                              <TodoQueueRecoverActions data-todo-control="true">
+                                <TodoQueueRecoverButton
+                                  aria-label="Redo todo"
+                                  onClick={(event) => handleRecoverableRedo(event, item)}
+                                  onPointerDown={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                  }}
+                                  title="Redo todo"
+                                  type="button"
+                                >
+                                  <PlayArrow aria-hidden="true" />
+                                </TodoQueueRecoverButton>
+                                <TodoQueueRecoverButton
+                                  aria-label="Edit and send todo"
+                                  onClick={(event) => handleRecoverableEditAndSend(event, item)}
+                                  onPointerDown={(event) => {
+                                    event.preventDefault();
+                                    event.stopPropagation();
+                                  }}
+                                  title="Edit and send"
+                                  type="button"
+                                >
+                                  <Edit aria-hidden="true" />
+                                </TodoQueueRecoverButton>
+                              </TodoQueueRecoverActions>
+                            )}
                             {!isEditing && !recoverableStatusLabel && mirrorStatusLabel && (
                               <TodoQueueStatusPill data-todo-status={item.displayStatus || "listed"}>
                                 {mirrorStatusLabel}
@@ -21338,7 +21506,11 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                       {orchestratorVoiceHistoryItems.map((item) => {
                         const status = getVoiceHistoryTurnStatus(item);
                         const cancelled = status === "Cancelled";
-                        const pending = status === "Pending" || status === "Thinking";
+                        const interrupted = status === "Interrupted";
+                        const stopped = cancelled || interrupted;
+                        const pending = status === "Pending" || status === "Thinking" || status === "Compacting";
+                        const retryText = getOrchestratorHistoryRetryText(item);
+                        const canRetry = stopped && Boolean(retryText) && !orchestratorChatBusy;
                         const llmPending = Boolean(
                           item.transcriptFinal
                             && !item.llmFeedback
@@ -21356,6 +21528,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                         return (
                           <OrchestratorHistoryTurn
                             data-cancelled={cancelled ? "true" : undefined}
+                            data-interrupted={interrupted ? "true" : undefined}
                             data-pending={pending ? "true" : undefined}
                             key={item.id}
                           >
@@ -21367,7 +21540,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                                 {item.engine === "gpt_realtime" ? "GPT-Realtime" : "Pipeline"}
                               </OrchestratorHistoryEngineChip>
                               <OrchestratorHistoryTurnStatusChip
-                                data-tone={cancelled || status === "Failed" || status === "Timed out"
+                                data-tone={stopped || status === "Failed" || status === "Timed out"
                                   ? "bad"
                                   : status === "Done" || status === "Planned"
                                     ? "good"
@@ -21380,15 +21553,44 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                               <OrchestratorHistoryUserMessage>
                                 <OrchestratorHistoryTranscript
                                   data-cancelled={cancelled ? "true" : undefined}
+                                  data-interrupted={interrupted ? "true" : undefined}
                                   data-pending={pending ? "true" : undefined}
                                 >
                                   {item.transcript}
                                 </OrchestratorHistoryTranscript>
                                 <OrchestratorHistoryMessageActions data-align="right">
-                                  {cancelled && (
-                                    <OrchestratorHistoryTurnStatus data-status="cancelled">
-                                      Cancelled
+                                  {stopped && (
+                                    <OrchestratorHistoryTurnStatus data-status={cancelled ? "cancelled" : "interrupted"}>
+                                      {cancelled ? "Cancelled" : "Interrupted"}
                                     </OrchestratorHistoryTurnStatus>
+                                  )}
+                                  {canRetry && (
+                                    <>
+                                      <OrchestratorHistoryCopyButton
+                                        aria-label="Redo message"
+                                        onClick={(event) => {
+                                          event.preventDefault();
+                                          event.stopPropagation();
+                                          redoOrchestratorHistoryTurn(item);
+                                        }}
+                                        title="Redo message"
+                                        type="button"
+                                      >
+                                        <PlayArrow aria-hidden="true" />
+                                      </OrchestratorHistoryCopyButton>
+                                      <OrchestratorHistoryCopyButton
+                                        aria-label="Edit and resend"
+                                        onClick={(event) => {
+                                          event.preventDefault();
+                                          event.stopPropagation();
+                                          editOrchestratorHistoryTurn(item);
+                                        }}
+                                        title="Edit and resend"
+                                        type="button"
+                                      >
+                                        <Edit aria-hidden="true" />
+                                      </OrchestratorHistoryCopyButton>
+                                    </>
                                   )}
                                   {userTime && (
                                     <OrchestratorHistoryMessageTime>{userTime}</OrchestratorHistoryMessageTime>
@@ -21722,6 +21924,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                       onChange={(event) => setOrchestratorChatDraft(event.target.value)}
                       onKeyDown={handleOrchestratorChatKeyDown}
                       placeholder="Message orchestrator"
+                      ref={orchestratorChatInputRef}
                       rows={1}
                       spellCheck="true"
                       value={orchestratorChatDraft}
@@ -22449,12 +22652,10 @@ function TerminalView({
   pcbPaneBoardsRef.current = pcbPaneBoards;
   const visibleTodoQueueItems = useMemo(() => (
     todoQueueItems.filter((item) => {
-      // In-flight and finished work never renders as a queue card: running
-      // items show on their terminal (and in Todos History), completed items
-      // live in Todos History only. Filtering by lifecycle status here makes
-      // that independent of pending-state attachment timing — direct-typed
-      // prompts used to flash as a card in the race between the Rust capture
-      // adoption and the prompt-submitted handler attaching pending state.
+      // In-flight and completed work does not render as a queue card; recoverable
+      // stopped work stays visible so it can be redone or edited and sent again.
+      // Filtering by lifecycle status here makes that independent of pending
+      // attachment timing.
       const lifecycleStatus = getTodoQueueCanonicalLifecycleStatus(item);
       if (TODO_QUEUE_ACTIVE_PANEL_HIDDEN_STATUSES.has(lifecycleStatus)) {
         return false;
@@ -33120,16 +33321,23 @@ function TerminalView({
         const meta = getTerminalTabAgentMeta(role);
         const colorSlot = getTerminalAgentColorSlot(terminalIndex);
         const color = terminalColorForSlot(colorSlot);
-        const label = `${meta.label} ${terminalIndex + 1}`;
+        const thread = getTerminalThread(terminalIndex);
+        const providerBinding = getWorkspaceThreadProviderBinding(thread, role);
+        const terminalNickname = normalizeTodoTerminalName(
+          getWorkspaceThreadTerminalNickname(thread, providerBinding, null),
+        );
+        const fallbackLabel = `${meta.label} ${terminalIndex + 1}`;
+        const label = terminalNickname || fallbackLabel;
+        const short = terminalNickname || meta.short;
         return {
           color,
           id: String(terminalIndex),
           label,
           paneId,
           role,
-          short: meta.short,
+          short,
           terminalIndex,
-          title: `${label} (${paneId})`,
+          title: `${label}${terminalNickname ? ` · ${fallbackLabel}` : ""} (${paneId})`,
         };
       })
       .filter(Boolean)
@@ -33137,6 +33345,7 @@ function TerminalView({
     getTerminalAgent,
     getTerminalPaneId,
     getTerminalRole,
+    getTerminalThread,
     logicalTerminalIndexes,
     paneKinds,
   ]);
@@ -33179,6 +33388,7 @@ function TerminalView({
   }, []);
 
   const submitPanelAgentPrompt = useCallback(async ({
+    contextRefs = [],
     panelKind = "panel",
     panelPaneId = "",
     targetIds = [],
@@ -33217,8 +33427,11 @@ function TerminalView({
       throw new Error("Choose at least one coding agent.");
     }
     const workspaceId = terminalWorkspace?.id || "";
+    const normalizedContextRefs = normalizePanelAgentPromptContextRefs(contextRefs);
+    const contextNote = formatPanelAgentPromptContextNote(normalizedContextRefs);
     const drafts = uniqueIndexes.map((terminalIndex) => ({
       deviceId: cloudDesktopDeviceId || "",
+      ...(contextNote ? { note: contextNote } : {}),
       panelKind,
       source: TODO_QUEUE_SOURCE_PANEL_AGENT_PROMPT,
       text: cleanText,
@@ -33264,6 +33477,7 @@ function TerminalView({
       });
     });
     logTerminalStatus("frontend.panel_agent_prompt.submitted", {
+      contextRefCount: normalizedContextRefs.length,
       itemCount: createdItems.length,
       panelKind,
       targetTerminalIndexes: uniqueIndexes,
@@ -33497,6 +33711,7 @@ function TerminalView({
       }
       const requestId = String(payload.requestId || payload.request_id || "").trim();
       submitPanelAgentPrompt({
+        contextRefs: payload.contextRefs || payload.context_refs || payload.contextRef || payload.context_ref || [],
         panelPaneId: payload.panelPaneId || payload.panel_pane_id || payload.paneId || payload.pane_id || "",
         panelKind: payload.panelKind || payload.panel_kind || "panel",
         targetIds: payload.targetIds || payload.target_ids || [],

@@ -1584,7 +1584,7 @@ function normalizeLoopspaceNodeRuntimeStatus(status) {
   if (["resume_requested", "resuming", "resumed"].includes(normalized)) return "resume_requested";
   if (["interrupted", "interrupt", "cancelled", "canceled", "timed_out", "timeout", "aborted"].includes(normalized)) return "interrupted";
   if (["queued", "pending", "awaiting_device", "waiting"].includes(normalized)) return "queued";
-  if (["active", "dispatching", "processing", "running", "started", "submitted", "thinking", "working"].includes(normalized)) return "running";
+  if (["active", "compacting", "compaction", "dispatching", "processing", "running", "started", "submitted", "thinking", "working"].includes(normalized)) return "running";
   return "";
 }
 
@@ -15317,17 +15317,20 @@ function cloudWorkspaceProgressFromRuntimeStatus(status) {
   }
 
   if (["websocket_retrying", "retrying", "offline", "offline_permanent"].includes(statusKey)) {
+    const retrying = ["websocket_retrying", "retrying"].includes(statusKey);
     return {
       connectedDevices,
-      detail: statusKey === "offline_permanent"
-        ? "Offline mode is active. Local workspace features remain available until you reconnect."
-        : "Cloud sync is unavailable right now. Local workspace features remain available.",
+      detail: retrying
+        ? "Cloud sync lost the live connection and is retrying automatically. Local workspace features remain available."
+        : statusKey === "offline_permanent"
+          ? "Offline mode is active. Local workspace features remain available until you reconnect."
+          : "Cloud sync is unavailable right now. Local workspace features remain available.",
       deviceLiveState,
       knownDevices,
       stage: "cloud_instance",
-      status: "warn",
+      status: retrying ? "active" : "warn",
       storageUsage,
-      title: "Offline",
+      title: retrying ? "Retrying" : "Offline",
       workspaceTodos,
     };
   }
@@ -15583,10 +15586,12 @@ const CLOUD_SYNC_SYNCING_STATUSES = [
   "handshaking",
   "websocket_handshaking",
 ];
-const CLOUD_SYNC_OFFLINE_STATUSES = [
-  "offline",
+const CLOUD_SYNC_RETRYING_STATUSES = [
   "retrying",
   "websocket_retrying",
+];
+const CLOUD_SYNC_OFFLINE_STATUSES = [
+  "offline",
 ];
 const CLOUD_SYNC_PERMANENT_OFFLINE_STATUSES = [
   "offline_permanent",
@@ -15835,11 +15840,13 @@ function cloudSyncStatusFromRuntimeStatus(status) {
             ? "provisioning"
             : CLOUD_SYNC_SYNCING_STATUSES.includes(statusKey) || CLOUD_SYNC_SYNCING_STATUSES.includes(rawStatus)
               ? "syncing"
-              : CLOUD_SYNC_OFFLINE_STATUSES.includes(statusKey) || CLOUD_SYNC_OFFLINE_STATUSES.includes(rawStatus)
-                ? "offline"
-                : CLOUD_SYNC_LOCAL_STATUSES.includes(statusKey) || CLOUD_SYNC_LOCAL_STATUSES.includes(rawStatus)
-                  ? "local"
-                  : "connecting",
+              : CLOUD_SYNC_RETRYING_STATUSES.includes(statusKey) || CLOUD_SYNC_RETRYING_STATUSES.includes(rawStatus)
+                ? "retrying"
+                : CLOUD_SYNC_OFFLINE_STATUSES.includes(statusKey) || CLOUD_SYNC_OFFLINE_STATUSES.includes(rawStatus)
+                  ? "offline"
+                  : CLOUD_SYNC_LOCAL_STATUSES.includes(statusKey) || CLOUD_SYNC_LOCAL_STATUSES.includes(rawStatus)
+                    ? "local"
+                    : "connecting",
     ...activity,
     syncing: connected && activity.syncing,
     updatedAtMs: Date.now(),
@@ -15859,6 +15866,7 @@ function normalizeCloudSyncStatusEvent(payload) {
     "offline",
     "offline_permanent",
     "provisioning",
+    "retrying",
     "syncing",
   ].includes(rawConnection)
     ? rawConnection
@@ -16074,6 +16082,21 @@ function networkItemErrorText(item) {
       || item?.metadata?.message,
   );
   return error === "recovered stale in-flight outbox row" ? "" : error;
+}
+
+function networkErrorLogText(entry) {
+  if (!entry || typeof entry !== "object") return "";
+  const phase = networkString(entry.phase || entry.eventKind || entry.event_kind || entry.kind);
+  const message = networkItemErrorText(entry) || networkItemErrorText(entry.details);
+  let details = "";
+  if (entry.details && typeof entry.details === "object") {
+    try {
+      details = JSON.stringify(entry.details);
+    } catch {
+      details = "";
+    }
+  }
+  return [phase, message, details].filter(Boolean).join(" - ");
 }
 
 function networkSyncLogStage(entry) {
@@ -16573,6 +16596,7 @@ function normalizeNetworkingDiagnostics(payload, syncStatus = null) {
     retryingCount: networkNumber(outbox.retryingCount ?? outbox.retrying_count ?? status.outboxRetryingCount ?? status.outbox_retrying_count),
     deadLetterCount: networkNumber(outbox.deadLetterCount ?? outbox.dead_letter_count ?? status.outboxDeadLetterCount ?? status.outbox_dead_letter_count),
     syncActivity,
+    errorLog: networkList(payload?.errors || payload?.errorLog || payload?.error_log || status.errors),
     tokenomicsSyncLog: networkList(tokenomics.syncLog || tokenomics.sync_log || payload?.tokenomicsSyncLog || payload?.tokenomics_sync_log),
     upCount: networkNumber(syncActivity.upCount ?? syncActivity.up_count ?? status.syncUpCount ?? status.sync_up_count ?? syncStatus?.upCount),
     downCount: networkNumber(syncActivity.downCount ?? syncActivity.down_count ?? status.syncDownCount ?? status.sync_down_count ?? syncStatus?.downCount),
@@ -18300,11 +18324,12 @@ function NetworkingInspector({
   const errorRows = Array.from(new Set([
     error,
     normalized.connection.error,
+    ...normalized.errorLog.map(networkErrorLogText),
     ...normalized.activities.map(networkItemErrorText),
     ...normalized.outboxRows.map(networkItemErrorText),
     ...normalized.inboxRecent.map(networkItemErrorText),
     ...normalized.outboundRecent.map(networkItemErrorText),
-  ].filter(Boolean))).slice(0, 10);
+  ].filter(Boolean)));
   const tokenomicsLogRows = normalized.tokenomicsSyncLog.slice(0, 12);
   const bottomLogCount = errorRows.length + tokenomicsLogRows.length;
 
@@ -30324,7 +30349,7 @@ export default function App() {
       const presenceBusyStatus = presenceStatuses.find((status) => (
         terminalActivityStatusIsBusy(status)
           || terminalActivityStatusIsPaused(status)
-          || ["awaiting_input", "busy", "needs_input", "parked", "paused", "queued", "resume_ready", "resume_requested", "running", "submitted", "thinking", "working"].includes(status)
+          || ["awaiting_input", "busy", "compacting", "compaction", "needs_input", "parked", "paused", "queued", "resume_ready", "resume_requested", "running", "submitted", "thinking", "working"].includes(status)
       ));
       const presenceIdleStatus = presenceStatuses.find((status) => (
         terminalActivityStatusIsSendable(status)
@@ -30374,7 +30399,7 @@ export default function App() {
           || ["idle", "ready"].includes(visibleStatus)
       );
       const isWorking = !presenceSaysIdle && Boolean(
-        ["thinking", "working", "running", "busy"].includes(visibleStatus)
+        ["compacting", "compaction", "thinking", "working", "running", "busy"].includes(visibleStatus)
           || readiness === "busy"
           || (
             Boolean(session.hasActiveTask || session.activeTask)
@@ -34284,8 +34309,8 @@ export default function App() {
     setNetworkingDiagnosticsState("loading");
     setNetworkingDiagnosticsError("");
     try {
-      // reconnect_now clears perma-offline and restarts the full 10s/30s/3min
-      // cycle from scratch, even if we were parked in permanent offline mode.
+      // reconnect_now clears offline/permanent-offline mode and restarts the
+      // 10s/30s/3min retry cycle from scratch.
       const status = await invoke("cloud_mcp_reconnect_now");
       setCloudSyncStatus(cloudSyncStatusFromRuntimeStatus(status));
       await refreshNetworkingDiagnostics({ quiet: true });
@@ -36108,7 +36133,7 @@ export default function App() {
       const busyStatus = statuses.find((status) => (
         terminalActivityStatusIsBusy(status)
           || terminalActivityStatusIsPaused(status)
-          || ["busy", "needs_input", "parked", "paused", "queued", "resume_ready", "resume_requested", "running", "submitted", "thinking", "working"].includes(status)
+          || ["busy", "compacting", "compaction", "needs_input", "parked", "paused", "queued", "resume_ready", "resume_requested", "running", "submitted", "thinking", "working"].includes(status)
       ));
       if (busyStatus) {
         return { idle: false, reason: busyStatus };
@@ -38312,7 +38337,7 @@ export default function App() {
       const busyStatus = statuses.find((status) => (
         terminalActivityStatusIsBusy(status)
           || terminalActivityStatusIsPaused(status)
-          || ["busy", "needs_input", "parked", "paused", "queued", "resume_ready", "resume_requested", "running", "submitted", "thinking", "working"].includes(status)
+          || ["busy", "compacting", "compaction", "needs_input", "parked", "paused", "queued", "resume_ready", "resume_requested", "running", "submitted", "thinking", "working"].includes(status)
       ));
       if (busyStatus) {
         return { idle: false, reason: busyStatus };
@@ -44255,7 +44280,7 @@ export default function App() {
       || lifecycleEvent.type === "thread-starting"
       || (
         lifecycleEvent.type === "agent-output"
-        && ["delegating", "subagent", "subagent_running", "thinking", "tool", "tool_running", "running"].includes(String(
+        && ["compacting", "compaction", "delegating", "subagent", "subagent_running", "thinking", "tool", "tool_running", "running"].includes(String(
           lifecycleEvent.activityStatus || lifecycleEvent.status || "",
         ).trim().toLowerCase())
       )
@@ -46629,6 +46654,7 @@ export default function App() {
             "offline",
             "offline_permanent",
             "provisioning",
+            "retrying",
             "syncing",
           ].includes(cloudSyncConnection)
           ? cloudSyncConnection
@@ -46650,6 +46676,7 @@ export default function App() {
     offline: "Offline",
     offline_permanent: "Offline",
     provisioning: "Initializing",
+    retrying: "Retrying",
     syncing: "Syncing",
     upgrade: "Upgrade",
   }[cloudSyncPillState] || "";
@@ -46666,6 +46693,7 @@ export default function App() {
     offline_permanent:
       "Offline mode. Auto-reconnect has stopped — click to retry connecting.",
     provisioning: "Your cloud workspace is initializing. Local workspace features remain available.",
+    retrying: "Cloud sync lost the live connection and is retrying automatically. Local workspace features remain available.",
     syncing: cloudSyncDirectionSummary
       ? `Syncing ${cloudSyncDirectionSummary}.`
       : cloudSyncControlCount > 0
@@ -46965,7 +46993,7 @@ export default function App() {
                 {cloudSyncPillState === "upgrade" ? null : (
                   <WindowSyncPillIndicator
                     aria-hidden="true"
-                    data-variant={["connecting", "provisioning", "syncing"].includes(cloudSyncPillState) ? "spinner" : "dot"}
+                    data-variant={["connecting", "provisioning", "retrying", "syncing"].includes(cloudSyncPillState) ? "spinner" : "dot"}
                   />
                 )}
                 <span>{cloudSyncPillLabel}</span>

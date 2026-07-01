@@ -12,6 +12,9 @@ fn validate_workspace_webview_label(label: &str) -> Result<(), String> {
     }
 }
 
+const WORKSPACE_WEBVIEW_EVAL_MAX_SCRIPT_BYTES: usize = 160 * 1024;
+const WORKSPACE_WEBVIEW_EVAL_TIMEOUT_MS: u64 = 2_500;
+
 fn close_workspace_webviews(app: &AppHandle) -> Result<usize, String> {
     let mut closed = 0;
     let mut errors = Vec::new();
@@ -58,6 +61,54 @@ fn validate_workspace_webview_url(url: &str) -> Result<tauri::Url, String> {
         "http" | "https" => Ok(parsed),
         _ => Err("Workspace web views only support http and https URLs.".to_string()),
     }
+}
+
+#[tauri::command]
+async fn workspace_webview_eval(
+    app: AppHandle,
+    label: String,
+    script: String,
+    expect_result: Option<bool>,
+) -> Result<Value, String> {
+    validate_workspace_webview_label(&label)?;
+    if script.trim().is_empty() {
+        return Err("Web view script is required.".to_string());
+    }
+    if script.len() > WORKSPACE_WEBVIEW_EVAL_MAX_SCRIPT_BYTES {
+        return Err("Web view script is too large.".to_string());
+    }
+    let webview = workspace_webview_for_label(&app, &label)
+        .ok_or_else(|| "Workspace web view is unavailable.".to_string())?;
+
+    if expect_result == Some(false) {
+        webview
+            .eval(script)
+            .map_err(|error| format!("Unable to evaluate workspace web view script: {error}"))?;
+        return Ok(json!({ "ok": true }));
+    }
+
+    let (sender, receiver) = oneshot::channel::<String>();
+    let sender = Arc::new(StdMutex::new(Some(sender)));
+    let callback_sender = sender.clone();
+    webview
+        .eval_with_callback(script, move |result| {
+            if let Ok(mut guard) = callback_sender.lock() {
+                if let Some(sender) = guard.take() {
+                    let _ = sender.send(result);
+                }
+            }
+        })
+        .map_err(|error| format!("Unable to evaluate workspace web view script: {error}"))?;
+
+    let raw = timeout(
+        Duration::from_millis(WORKSPACE_WEBVIEW_EVAL_TIMEOUT_MS),
+        receiver,
+    )
+    .await
+    .map_err(|_| "Timed out reading workspace web view script result.".to_string())?
+    .map_err(|_| "Workspace web view script result was canceled.".to_string())?;
+
+    Ok(serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({ "value": raw })))
 }
 
 #[tauri::command]
