@@ -4555,6 +4555,8 @@ fn spawn_terminal_reader(
             let mut stats_slow_observer_schedules: u64 = 0;
             let mut stats_total_observer_schedule_ms = 0.0f64;
             let mut stats_max_observer_schedule_ms = 0.0f64;
+            let mut cloud_output_seq: u64 = 0;
+            let mut cloud_output_total_bytes: u64 = 0;
             let mut forensics_started_at = Instant::now();
             let mut forensics_frames: u64 = 0;
             let mut forensics_source_chunks: u64 = 0;
@@ -4621,6 +4623,19 @@ fn spawn_terminal_reader(
                 let frame_bytes = frame.len();
                 pending_started_at = None;
                 pending_source_chunks = 0;
+                let cloud_from_total_bytes = cloud_output_total_bytes;
+                cloud_output_total_bytes =
+                    cloud_output_total_bytes.saturating_add(frame_bytes as u64);
+                cloud_output_seq = cloud_output_seq.saturating_add(1);
+                cloud_mcp_publish_terminal_output_delta(
+                    &output_cloud_mcp_state,
+                    &output_pane_id,
+                    instance_id,
+                    cloud_output_seq,
+                    cloud_from_total_bytes,
+                    cloud_output_total_bytes,
+                    &frame,
+                );
 
                 let (sent, send_ms, observer_schedule_ms) = send_terminal_output_frame(
                     &output_app,

@@ -40,6 +40,7 @@ const TOKENOMICS_SUMMARY_SNAPSHOT_CACHE_KEY_PREFIX: &str = "summary_snapshot_cac
 const TOKENOMICS_SCAN_PROGRESS_EVENT: &str = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_LOCAL_DEVICE_ALIASES_KEY: &str = "local_device_aliases";
 const TOKENOMICS_CLOUD_PROVIDER_LIMITS_KEY: &str = "cloud_provider_limits";
+const TOKENOMICS_LIMITS_CHANGED_SYNC_REASON: &str = "tokenomics_limits_changed";
 const TOKENOMICS_DEVICE_IDENTITIES_KEY: &str = "device_identities";
 const TOKENOMICS_CLOUD_ACCOUNT_SYNC_CURSOR_KEY_PREFIX: &str = "cloud_account_sync_cursor:";
 static TOKENOMICS_SCAN_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -214,15 +215,26 @@ async fn tokenomics_get_summary(app: AppHandle) -> Result<Value, String> {
 #[tauri::command]
 async fn tokenomics_get_live_limits(
     app: AppHandle,
+    state: State<'_, CloudMcpState>,
     force_provider_refresh: Option<bool>,
 ) -> Result<Value, String> {
     let force_provider_refresh = force_provider_refresh.unwrap_or(false);
-    tauri::async_runtime::spawn_blocking(move || {
+    let limits_app = app.clone();
+    let summary = tauri::async_runtime::spawn_blocking(move || {
         let _span = BackendCpuSpan::new("tokenomics.command.get_live_limits");
-        tokenomics_cached_live_limits_for(&app, force_provider_refresh)
+        tokenomics_cached_live_limits_for(&limits_app, force_provider_refresh)
     })
     .await
-    .map_err(|error| format!("Unable to join Tokenomics live limits: {error}"))?
+    .map_err(|error| format!("Unable to join Tokenomics live limits: {error}"))??;
+    tokenomics_enqueue_usage_sync_if_needed(
+        app,
+        state.inner(),
+        &summary,
+        TOKENOMICS_LIMITS_CHANGED_SYNC_REASON,
+        false,
+    )
+    .await;
+    Ok(summary)
 }
 
 #[tauri::command]
@@ -1589,6 +1601,20 @@ fn tokenomics_summary_inserted_events(summary: &Value) -> usize {
         .unwrap_or_default()
 }
 
+fn tokenomics_summary_recorded_limit_rows(summary: &Value) -> usize {
+    let recorded_samples = summary
+        .get("recorded_samples")
+        .or_else(|| summary.get("recordedSamples"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let recorded_windows = summary
+        .get("recorded_windows")
+        .or_else(|| summary.get("recordedWindows"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    recorded_samples.saturating_add(recorded_windows) as usize
+}
+
 fn tokenomics_summary_cache() -> &'static StdMutex<Option<TokenomicsSummaryCacheEntry>> {
     TOKENOMICS_SUMMARY_CACHE.get_or_init(|| StdMutex::new(None))
 }
@@ -1947,7 +1973,15 @@ fn tokenomics_cached_live_limits_for(
                 if entry.cached_at.elapsed()
                     < Duration::from_millis(TOKENOMICS_LIVE_LIMITS_CACHE_TTL_MS)
                 {
-                    return Ok(entry.summary.clone());
+                    let mut summary = entry.summary.clone();
+                    if let Some(object) = summary.as_object_mut() {
+                        object.insert("cached".to_string(), json!(true));
+                        object.insert("recorded_samples".to_string(), json!(0));
+                        object.insert("recordedSamples".to_string(), json!(0));
+                        object.insert("recorded_windows".to_string(), json!(0));
+                        object.insert("recordedWindows".to_string(), json!(0));
+                    }
+                    return Ok(summary);
                 }
             }
         }
@@ -2099,7 +2133,8 @@ async fn tokenomics_enqueue_usage_sync_if_needed(
     force_full: bool,
 ) {
     let inserted_events = tokenomics_summary_inserted_events(summary);
-    if inserted_events == 0 && !force_full {
+    let recorded_limit_rows = tokenomics_summary_recorded_limit_rows(summary);
+    if inserted_events == 0 && recorded_limit_rows == 0 && !force_full {
         return;
     }
     let _ = cloud_mcp_enqueue_tokenomics_sync(
@@ -2116,6 +2151,7 @@ async fn tokenomics_enqueue_usage_sync_if_needed(
             "reason": reason,
             "force_full": force_full,
             "inserted_events": inserted_events,
+            "recorded_limit_rows": recorded_limit_rows,
         }),
     );
 }

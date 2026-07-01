@@ -15,6 +15,7 @@ export const WEB_SEARCH_URL = "https://www.google.com/search?q=";
 export const WORKSPACE_WEBVIEW_LOAD_EVENT = "workspace-webview-load";
 
 const LOCAL_HOST_PATTERN = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?(?:[/?#]|$)/i;
+const MIN_NATIVE_DIMENSION = 24;
 
 export function hasTauriRuntime() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
@@ -94,10 +95,14 @@ export function webviewLabel(scopeParts = [], sequence = 0) {
 // the nearest [data-workspace-web-surface] ancestor and the window bounds. These
 // coordinates match what add_child/set_position expect (relative to the parent
 // window's content area).
-export function viewportNativeRect(viewport) {
+export function viewportNativeRect(viewport, options = {}) {
   if (!viewport) {
     return null;
   }
+  const insetBottom = Math.max(
+    0,
+    Math.round(Number(options?.insetBottom ?? options?.bottomInset ?? 0) || 0),
+  );
   const rect = viewport.getBoundingClientRect();
   const surfaceRect = viewport.closest("[data-workspace-web-surface]")?.getBoundingClientRect?.() || null;
   const bounds = {
@@ -115,7 +120,13 @@ export function viewportNativeRect(viewport) {
   const left = Math.max(bounds.left, rect.left);
   const top = Math.max(bounds.top, rect.top);
   const right = Math.min(bounds.right, rect.right);
-  const bottom = Math.min(bounds.bottom, rect.bottom);
+  const rawBottom = Math.min(bounds.bottom, rect.bottom);
+  const heightBeforeInset = Math.max(0, rawBottom - top);
+  const effectiveInsetBottom = Math.min(
+    insetBottom,
+    Math.max(0, heightBeforeInset - MIN_NATIVE_DIMENSION),
+  );
+  const bottom = rawBottom - effectiveInsetBottom;
   return {
     height: Math.max(0, Math.round(bottom - top)),
     width: Math.max(0, Math.round(right - left)),
@@ -168,8 +179,6 @@ export async function invokeWebviewClose(label) {
   await invoke("workspace_webview_close", { label: safeLabel }).catch(() => {});
 }
 
-const MIN_NATIVE_DIMENSION = 24;
-
 // useNativeWebview manages one native child webview positioned over `viewportRef`,
 // showing `url`, visible when `visible` is true. It re-opens when `url` (or the
 // reload counter) changes, keeps fitted on resize via a ResizeObserver + a short
@@ -182,6 +191,7 @@ export function useNativeWebview({
   layoutKey = "",
   parentWindowLabel,
   scopeParts,
+  viewportInsetBottom = 0,
   onNavigate,
   onError,
 }) {
@@ -203,6 +213,7 @@ export function useNativeWebview({
   onErrorRef.current = onError;
 
   const runtimeEnabled = Boolean(enabled) && hasTauriRuntime();
+  const safeViewportInsetBottom = Math.max(0, Math.round(Number(viewportInsetBottom) || 0));
 
   useEffect(() => {
     mountedRef.current = true;
@@ -217,7 +228,7 @@ export function useNativeWebview({
     if (!safeLabel || !viewport || !hasTauriRuntime()) {
       return;
     }
-    const rect = viewportNativeRect(viewport);
+    const rect = viewportNativeRect(viewport, { insetBottom: safeViewportInsetBottom });
     if (!rect) {
       return;
     }
@@ -232,7 +243,7 @@ export function useNativeWebview({
       rectKeyRef.current = rectKey;
       void invokeWebviewFit({ label: safeLabel, rect, visible: shouldShow }).catch(() => {});
     }
-  }, [viewportRef]);
+  }, [safeViewportInsetBottom, viewportRef]);
 
   const stopFitBurst = useCallback(() => {
     fitBurstCleanupRef.current?.();
@@ -331,7 +342,7 @@ export function useNativeWebview({
       if (!viewport) {
         return;
       }
-      const rect = viewportNativeRect(viewport);
+      const rect = viewportNativeRect(viewport, { insetBottom: safeViewportInsetBottom });
       if (!rect || rect.width < MIN_NATIVE_DIMENSION || rect.height < MIN_NATIVE_DIMENSION) {
         return;
       }
@@ -384,7 +395,7 @@ export function useNativeWebview({
         return;
       }
       const viewport = viewportRef.current;
-      const rect = viewport ? viewportNativeRect(viewport) : null;
+      const rect = viewport ? viewportNativeRect(viewport, { insetBottom: safeViewportInsetBottom }) : null;
       if (rect && rect.width >= MIN_NATIVE_DIMENSION && rect.height >= MIN_NATIVE_DIMENSION) {
         const nextRectKey = `${rect.x}:${rect.y}:${rect.width}:${rect.height}`;
         if (nextRectKey === stableRectKey) {
@@ -409,7 +420,7 @@ export function useNativeWebview({
     return () => {
       disposed = true;
     };
-  }, [runtimeEnabled, url, reloadKey, parentWindowLabel, viewportRef, scopeParts, fit, scheduleFitBurst, closeCurrent, visible]);
+  }, [runtimeEnabled, url, reloadKey, parentWindowLabel, viewportRef, scopeParts, fit, scheduleFitBurst, closeCurrent, visible, safeViewportInsetBottom]);
 
   // Re-fit (and show/hide) whenever visibility flips.
   useEffect(() => {

@@ -28,6 +28,8 @@ import {
 import PanelAgentPromptActivity from "../terminals/PanelAgentPromptActivity.jsx";
 import PanelAgentPromptComposer from "../terminals/PanelAgentPromptComposer.jsx";
 
+const PANEL_AGENT_PROMPT_WEBVIEW_BOTTOM_INSET = 164;
+
 function PopOutGlyph(props) {
   return (
     <svg fill="none" height="13" viewBox="0 0 24 24" width="13" xmlns="http://www.w3.org/2000/svg" {...props}>
@@ -49,6 +51,7 @@ export default function WebPane({
   dragActive = false,
   layoutKey = "",
   poppedOut = false,
+  breakoutReturnUrl = "",
   webviewObscured = false,
   onDragHandlePointerDown,
   onSplit,
@@ -58,11 +61,20 @@ export default function WebPane({
   onReturnFromBreakout,
   onFocusBreakout,
   onNavigate,
+  onAgentPromptOpenChange,
   controlCommand = null,
   defaultPanelAgentPromptTargetIds = [],
+  panelKind = "web",
   panelAgentPromptActivityItems = [],
   onSubmitPanelAgentPrompt = null,
   panelAgentPromptTargets = [],
+  scopeParts: providedScopeParts = null,
+  showAgentPromptControl = true,
+  showCloseButton = true,
+  showDragHandle = true,
+  showFullscreenControl = true,
+  showPopOutControl = true,
+  showSplitControls = true,
 }) {
   const startUrl = useMemo(() => normalizeWebInput(initialUrl) || DEFAULT_WEB_URL, [initialUrl]);
   const [history, setHistory] = useState(() => [startUrl]);
@@ -82,10 +94,30 @@ export default function WebPane({
     setAddressValue(currentUrl);
   }, [currentUrl]);
 
-  const scopeParts = useMemo(
-    () => [workspaceId, `idx${terminalIndex}`],
-    [workspaceId, terminalIndex],
-  );
+  useEffect(() => {
+    onAgentPromptOpenChange?.(agentPromptOpen);
+  }, [agentPromptOpen, onAgentPromptOpenChange]);
+
+  useEffect(() => {
+    if (!showAgentPromptControl && agentPromptOpen) {
+      setAgentPromptOpen(false);
+    }
+  }, [agentPromptOpen, showAgentPromptControl]);
+
+  const scopeParts = useMemo(() => {
+    const explicitParts = (Array.isArray(providedScopeParts) ? providedScopeParts : [])
+      .map((part) => String(part || "").trim())
+      .filter(Boolean);
+    if (explicitParts.length) {
+      return explicitParts;
+    }
+    const fallbackParts = [
+      workspaceId ? String(workspaceId).trim() : "",
+      terminalIndex !== undefined && terminalIndex !== null ? `idx${terminalIndex}` : "",
+      !workspaceId && paneId ? String(paneId).trim() : "",
+    ].filter(Boolean);
+    return fallbackParts.length ? fallbackParts : ["web-pane"];
+  }, [paneId, providedScopeParts, terminalIndex, workspaceId]);
 
   // A native child webview composites on top of the DOM, so it must be hidden
   // while a pane drag is in flight (it can't follow the placeholder), while the
@@ -95,7 +127,6 @@ export default function WebPane({
     && !dragActive
     && !poppedOut
     && !webviewObscured
-    && !agentPromptOpen
     && (!fullscreenActive || isFullscreen),
   );
 
@@ -112,6 +143,7 @@ export default function WebPane({
     url: currentUrl,
     visible,
     scopeParts,
+    viewportInsetBottom: agentPromptOpen ? PANEL_AGENT_PROMPT_WEBVIEW_BOTTOM_INSET : 0,
     onNavigate: handleLoadedUrl,
   });
 
@@ -186,20 +218,32 @@ export default function WebPane({
     }
   }, [controlCommand, goBack, goForward, navigateTo, refresh]);
 
+  const dragHandleVisible = showDragHandle && typeof onDragHandlePointerDown === "function";
+  const closeButtonVisible = showCloseButton && typeof onClose === "function";
+  const agentPromptControlVisible = showAgentPromptControl;
+  const splitControlsVisible = showSplitControls && typeof onSplit === "function";
+  const popOutControlVisible = showPopOutControl && typeof onPopOut === "function";
+  const fullscreenControlVisible = showFullscreenControl && typeof onToggleFullscreen === "function";
+  const effectiveBreakoutReturnUrl = normalizeWebInput(breakoutReturnUrl)
+    || String(breakoutReturnUrl || "").trim()
+    || currentUrl;
+
   return (
     <WebPaneSurface data-workspace-web-surface="true" data-active={isActive ? "true" : undefined}>
       <WebPaneRail data-terminal-control="true">
-        <WebPaneIdentity>
-          <WebPaneDragButton
-            aria-label="Drag web panel"
-            data-terminal-drag-handle="true"
-            onPointerDown={(event) => onDragHandlePointerDown?.(event, terminalIndex, paneId)}
-            title={isFullscreen ? "Exit fullscreen to reorder panels" : "Drag web panel"}
-            type="button"
-          >
-            <ButtonDragIcon aria-hidden="true" />
-          </WebPaneDragButton>
-        </WebPaneIdentity>
+        {dragHandleVisible ? (
+          <WebPaneIdentity>
+            <WebPaneDragButton
+              aria-label="Drag web panel"
+              data-terminal-drag-handle="true"
+              onPointerDown={(event) => onDragHandlePointerDown?.(event, terminalIndex, paneId)}
+              title={isFullscreen ? "Exit fullscreen to reorder panels" : "Drag web panel"}
+              type="button"
+            >
+              <ButtonDragIcon aria-hidden="true" />
+            </WebPaneDragButton>
+          </WebPaneIdentity>
+        ) : null}
         <WebPaneNav onSubmit={handleSubmit}>
           <WebPaneIconButton
             aria-label="Back"
@@ -244,67 +288,81 @@ export default function WebPane({
             value={addressValue}
           />
         </WebPaneNav>
-        <WebPaneRailControls data-rail-row="primary">
-          <WebPaneCloseButton
-            aria-label="Close web panel"
-            data-tone="close"
-            onClick={() => onClose?.(terminalIndex, paneId)}
-            title="Close"
-            type="button"
-          >
-            <Close aria-hidden="true" />
-          </WebPaneCloseButton>
-        </WebPaneRailControls>
+        {closeButtonVisible ? (
+          <WebPaneRailControls data-rail-row="primary">
+            <WebPaneCloseButton
+              aria-label="Close web panel"
+              data-tone="close"
+              onClick={() => onClose?.(terminalIndex, paneId)}
+              title="Close"
+              type="button"
+            >
+              <Close aria-hidden="true" />
+            </WebPaneCloseButton>
+          </WebPaneRailControls>
+        ) : null}
         <WebPaneRailControls data-rail-row="secondary">
-          <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
-          <WebPaneIconButton
-            aria-label="Prompt terminal agents"
-            aria-pressed={agentPromptOpen ? "true" : "false"}
-            data-active={agentPromptOpen ? "true" : undefined}
-            onClick={() => setAgentPromptOpen((open) => !open)}
-            title="Prompt terminal agents"
-            type="button"
-          >
-            <ButtonBotIcon aria-hidden="true" />
-          </WebPaneIconButton>
-          <WebPaneIconButton
-            aria-label="Split right"
-            onClick={() => onSplit?.({ direction: "vertical", terminalIndex, paneId })}
-            title="Split right"
-            type="button"
-          >
-            <LayoutSplit aria-hidden="true" />
-          </WebPaneIconButton>
-          <WebPaneIconButton
-            aria-label="Split down"
-            onClick={() => onSplit?.({ direction: "horizontal", terminalIndex, paneId })}
-            title="Split down"
-            type="button"
-          >
-            <LayoutRow aria-hidden="true" />
-          </WebPaneIconButton>
-          <WebPaneIconButton
-            aria-label="Open in window"
-            onClick={() => onPopOut?.(terminalIndex, paneId, currentUrl)}
-            title="Open in window"
-            type="button"
-          >
-            <PopOutGlyph aria-hidden="true" />
-          </WebPaneIconButton>
-          <WebPaneIconButton
-            aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
-            onClick={() => onToggleFullscreen?.(terminalIndex, paneId)}
-            title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
-            type="button"
-          >
-            {isFullscreen ? <FullscreenExit aria-hidden="true" /> : <Fullscreen aria-hidden="true" />}
-          </WebPaneIconButton>
+          {agentPromptControlVisible ? (
+            <>
+              <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
+              <WebPaneIconButton
+                aria-label="Prompt terminal agents"
+                aria-pressed={agentPromptOpen ? "true" : "false"}
+                data-active={agentPromptOpen ? "true" : undefined}
+                onClick={() => setAgentPromptOpen((open) => !open)}
+                title="Prompt terminal agents"
+                type="button"
+              >
+                <ButtonBotIcon aria-hidden="true" />
+              </WebPaneIconButton>
+            </>
+          ) : null}
+          {splitControlsVisible ? (
+            <>
+              <WebPaneIconButton
+                aria-label="Split right"
+                onClick={() => onSplit?.({ direction: "vertical", terminalIndex, paneId })}
+                title="Split right"
+                type="button"
+              >
+                <LayoutSplit aria-hidden="true" />
+              </WebPaneIconButton>
+              <WebPaneIconButton
+                aria-label="Split down"
+                onClick={() => onSplit?.({ direction: "horizontal", terminalIndex, paneId })}
+                title="Split down"
+                type="button"
+              >
+                <LayoutRow aria-hidden="true" />
+              </WebPaneIconButton>
+            </>
+          ) : null}
+          {popOutControlVisible ? (
+            <WebPaneIconButton
+              aria-label="Open in window"
+              onClick={() => onPopOut?.(terminalIndex, paneId, currentUrl)}
+              title="Open in window"
+              type="button"
+            >
+              <PopOutGlyph aria-hidden="true" />
+            </WebPaneIconButton>
+          ) : null}
+          {fullscreenControlVisible ? (
+            <WebPaneIconButton
+              aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+              onClick={() => onToggleFullscreen?.(terminalIndex, paneId)}
+              title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+              type="button"
+            >
+              {isFullscreen ? <FullscreenExit aria-hidden="true" /> : <Fullscreen aria-hidden="true" />}
+            </WebPaneIconButton>
+          ) : null}
         </WebPaneRailControls>
       </WebPaneRail>
 
       {addressError ? <WebPaneInlineError role="alert">{addressError}</WebPaneInlineError> : null}
 
-      <WebPaneViewport ref={viewportRef}>
+      <WebPaneViewport data-agent-prompt-open={agentPromptOpen ? "true" : undefined} ref={viewportRef}>
         <WebPaneBackdrop>
           <Language aria-hidden="true" />
           <span>{currentHost}</span>
@@ -313,22 +371,26 @@ export default function WebPane({
           <WebPaneBreakoutOverlay>
             <strong>Opened in window</strong>
             <WebPaneBreakoutActions>
-              <WebPaneOverlayButton onClick={() => onFocusBreakout?.(terminalIndex, paneId)} type="button">
-                Focus window
-              </WebPaneOverlayButton>
-              <WebPaneOverlayButton data-tone="primary" onClick={() => onReturnFromBreakout?.(terminalIndex, paneId)} type="button">
-                Return to grid
-              </WebPaneOverlayButton>
+              {typeof onFocusBreakout === "function" ? (
+                <WebPaneOverlayButton onClick={() => onFocusBreakout?.(terminalIndex, paneId, effectiveBreakoutReturnUrl)} type="button">
+                  Focus window
+                </WebPaneOverlayButton>
+              ) : null}
+              {typeof onReturnFromBreakout === "function" ? (
+                <WebPaneOverlayButton data-tone="primary" onClick={() => onReturnFromBreakout?.(terminalIndex, paneId, effectiveBreakoutReturnUrl)} type="button">
+                  Return to grid
+                </WebPaneOverlayButton>
+              ) : null}
             </WebPaneBreakoutActions>
           </WebPaneBreakoutOverlay>
         ) : null}
-        {agentPromptOpen ? (
+        {agentPromptOpen && agentPromptControlVisible ? (
           <PanelAgentPromptComposer
             autoFocus
             defaultSelectedTargetIds={defaultPanelAgentPromptTargetIds}
             onClose={() => setAgentPromptOpen(false)}
             onSubmit={onSubmitPanelAgentPrompt}
-            panelKind="web"
+            panelKind={panelKind}
             panelPaneId={paneId}
             targets={panelAgentPromptTargets}
           />

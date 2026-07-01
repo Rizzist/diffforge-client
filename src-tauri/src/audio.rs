@@ -4972,9 +4972,6 @@ const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLE_MS: u64 = 500;
 #[cfg(target_os = "macos")]
 const AUDIO_WIDGET_BOTTOM_BAR_FRAME_EPSILON: f64 = 0.5;
 #[cfg(target_os = "macos")]
-const MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_MS: u64 = 2_500;
-
-#[cfg(target_os = "macos")]
 static AUDIO_WIDGET_MACOS_SPACE_OBSERVER_STARTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static AUDIO_WIDGET_BAR_HOVER_MONITORS_STARTED: AtomicBool = AtomicBool::new(false);
@@ -5296,8 +5293,13 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
                             None,
                             json!({ "notification": notification_name }),
                         );
-                        macos_clear_active_space_full_monitor_sticky("workspace_notification");
-                        audio_widget_schedule_stored_bottom_bar_reposition(&callback_app);
+                        let should_clear_full_monitor_sticky =
+                            notification_name == "NSWorkspaceActiveSpaceDidChangeNotification"
+                                || notification_name == "NSApplicationDidChangeScreenParametersNotification";
+                        if should_clear_full_monitor_sticky {
+                            macos_clear_active_space_full_monitor_sticky("workspace_or_screen_change");
+                            audio_widget_schedule_stored_bottom_bar_reposition(&callback_app);
+                        }
                     });
                 },
             );
@@ -7474,13 +7476,12 @@ fn macos_resolve_active_space_full_monitor_bounds_for_screen_on_main_thread(
 
         ax_probe = macos_frontmost_ax_fullscreen_probe(current_pid);
         if let Some(fullscreen) = ax_probe.fullscreen {
-            use_full_monitor_bounds = fullscreen;
-            source = if fullscreen {
-                "frontmost_ax_fullscreen"
-            } else {
-                "frontmost_ax_not_fullscreen"
-            };
-            return;
+            if fullscreen {
+                use_full_monitor_bounds = true;
+                source = "frontmost_ax_fullscreen";
+                return;
+            }
+            source = "frontmost_ax_not_fullscreen";
         }
 
         if presentation_fullscreen {
@@ -7503,16 +7504,13 @@ fn macos_resolve_active_space_full_monitor_bounds_for_screen_on_main_thread(
         }
     });
     if use_full_monitor_bounds {
-        MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.store(
-            current_time_ms().saturating_add(MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_MS),
-            Ordering::Release,
-        );
+        MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.store(u64::MAX, Ordering::Release);
     } else {
         if matches!(ax_probe.fullscreen, Some(false)) {
             MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.store(0, Ordering::Release);
         }
         let sticky_until = MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.load(Ordering::Acquire);
-        if sticky_until > current_time_ms() {
+        if sticky_until == u64::MAX || sticky_until > current_time_ms() {
             use_full_monitor_bounds = true;
             source = "sticky_full_monitor";
             sticky_applied = true;

@@ -15781,12 +15781,11 @@ export const AudioBarIdleLine = styled.span`
 
 export const AudioBarCancelButton = styled.button`
   display: inline-flex;
-  width: 28px;
-  height: 28px;
+  width: 22px;
+  height: 22px;
   flex: none;
   align-items: center;
   justify-content: center;
-  margin: -3px;
   padding: 0;
   border: 0;
   border-radius: 50%;

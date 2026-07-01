@@ -149,6 +149,7 @@ const CLOUD_MCP_TOKENOMICS_SYNC_SCHEMA_VERSION: u64 = 4;
 const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT: &str = "agent_chat_session_sync";
 const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT: &str = "diffforge.agent_chat_sessions.v1";
 const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_SCHEMA_VERSION: u64 = 1;
+const CLOUD_MCP_TERMINAL_OUTPUT_CONTRACT: &str = "diffforge.termout.v1";
 const CLOUD_MCP_TOKENOMICS_DELTA_AVAILABLE_EVENT: &str = "tokenomics_delta_available";
 const CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT: &str = "tokenomics_device_delta";
 const CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT: &str = "tokenomics_device_snapshot";
@@ -474,6 +475,7 @@ struct CloudMcpState {
     global_ws_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Value>>>>,
     global_ws_pending: Arc<Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
+    terminal_output_stream_subscriptions: Arc<StdMutex<HashSet<String>>>,
     remote_command_listener_started: Arc<AtomicBool>,
     remote_command_receipts: Arc<Mutex<HashMap<String, u64>>>,
     tokenomics_wake_receipts: Arc<Mutex<HashMap<String, u64>>>,
@@ -729,6 +731,7 @@ impl CloudMcpState {
             global_ws_tx: Arc::new(Mutex::new(None)),
             global_ws_pending: Arc::new(Mutex::new(HashMap::new())),
             global_ws_events,
+            terminal_output_stream_subscriptions: Arc::new(StdMutex::new(HashSet::new())),
             remote_command_listener_started: Arc::new(AtomicBool::new(false)),
             remote_command_receipts: Arc::new(Mutex::new(HashMap::new())),
             tokenomics_wake_receipts: Arc::new(Mutex::new(HashMap::new())),
@@ -11747,6 +11750,9 @@ async fn cloud_mcp_clear_global_ws_sender_if_current(
     if !cleared {
         return;
     }
+    if let Ok(mut subscriptions) = state.terminal_output_stream_subscriptions.lock() {
+        subscriptions.clear();
+    }
 
     if state.global_ws_registration_blocked.load(Ordering::SeqCst) {
         let message = {
@@ -11827,6 +11833,9 @@ async fn cloud_mcp_mark_global_ws_disconnected_inner(
     let message = clean_terminal_telemetry_text(error);
     log_cloud_sync_event("ws.disconnected", json!({ "error": message }));
     state.global_ws_epoch.fetch_add(1, Ordering::SeqCst);
+    if let Ok(mut subscriptions) = state.terminal_output_stream_subscriptions.lock() {
+        subscriptions.clear();
+    }
     {
         let mut runtime = state.inner.lock().await;
         runtime.connected = false;
@@ -16307,6 +16316,9 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         cloud_mcp_payload_text(&message, &["event_kind", "eventKind", "kind"]).unwrap_or_default();
     let direct_request_kind =
         cloud_mcp_payload_text(&message, &["request_kind", "requestKind"]).unwrap_or_default();
+    if cloud_mcp_handle_terminal_output_subscription(state, &message, &direct_kind) {
+        return;
+    }
     if cloud_mcp_is_account_asset_wake_event(&direct_kind, &message) {
         let event = message
             .get("data")
@@ -16514,6 +16526,9 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        if cloud_mcp_handle_terminal_output_subscription(state, &event, &event_kind) {
+            return;
+        }
         if event_kind == "account_device_live_state_snapshot" {
             cloud_mcp_cache_account_device_live_state_snapshot(state, &event).await;
         }
@@ -23719,6 +23734,199 @@ fn cloud_mcp_event_envelope(event_kind: &str, payload: &Value) -> Value {
         object.retain(|_, value| !value.is_null());
     }
     envelope
+}
+
+fn cloud_mcp_terminal_output_message_kind(message: &Value) -> String {
+    cloud_mcp_payload_text(message, &["k", "kind", "type", "event_kind", "eventKind"])
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn cloud_mcp_terminal_output_message_stream_key(message: &Value) -> Option<String> {
+    if let Some(stream_key) = cloud_mcp_payload_text(message, &["sk", "stream_key", "streamKey"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(stream_key);
+    }
+    let device_id = cloud_mcp_payload_text(message, &["d", "device_id", "deviceId"])?;
+    let workspace_id = cloud_mcp_payload_text(message, &["w", "workspace_id", "workspaceId"])?;
+    let pane_id = cloud_mcp_payload_text(
+        message,
+        &[
+            "p",
+            "pane_id",
+            "paneId",
+            "terminal_id",
+            "terminalId",
+            "target_terminal_id",
+            "targetTerminalId",
+        ],
+    )?;
+    let instance_id = cloud_mcp_payload_text(
+        message,
+        &[
+            "i",
+            "terminal_instance_id",
+            "terminalInstanceId",
+            "instance_id",
+            "instanceId",
+        ],
+    )
+    .unwrap_or_default();
+    if instance_id.trim().is_empty() {
+        Some(format!("{device_id}:{workspace_id}:{pane_id}"))
+    } else {
+        Some(format!(
+            "{device_id}:{workspace_id}:{pane_id}:{}",
+            instance_id.trim()
+        ))
+    }
+}
+
+fn cloud_mcp_handle_terminal_output_subscription(
+    state: &CloudMcpState,
+    message: &Value,
+    fallback_kind: &str,
+) -> bool {
+    let kind = {
+        let direct = cloud_mcp_terminal_output_message_kind(message);
+        if direct.is_empty() {
+            fallback_kind.trim().to_ascii_lowercase()
+        } else {
+            direct
+        }
+    };
+    let contract = cloud_mcp_payload_text(message, &["contract", "c"]).unwrap_or_default();
+    if contract != CLOUD_MCP_TERMINAL_OUTPUT_CONTRACT
+        && !matches!(
+            kind.as_str(),
+            "term.sub" | "terminal_output_subscribe" | "term.unsub" | "terminal_output_unsubscribe"
+        )
+    {
+        return false;
+    }
+    let Some(stream_key) = cloud_mcp_terminal_output_message_stream_key(message) else {
+        return true;
+    };
+    let active = !(matches!(kind.as_str(), "term.unsub" | "terminal_output_unsubscribe")
+        || message.get("active").and_then(Value::as_bool) == Some(false));
+    let mut count = 0usize;
+    if let Ok(mut subscriptions) = state.terminal_output_stream_subscriptions.lock() {
+        if active {
+            subscriptions.insert(stream_key.clone());
+        } else {
+            subscriptions.remove(&stream_key);
+        }
+        count = subscriptions.len();
+    }
+    log_cloud_sync_event(
+        "terminal_output.subscription",
+        json!({
+            "active": active,
+            "stream_key": stream_key,
+            "subscription_count": count,
+        }),
+    );
+    true
+}
+
+fn cloud_mcp_terminal_output_stream_is_subscribed(
+    state: &CloudMcpState,
+    stream_key: &str,
+) -> bool {
+    state
+        .terminal_output_stream_subscriptions
+        .lock()
+        .map(|subscriptions| subscriptions.contains(stream_key) || subscriptions.contains("*"))
+        .unwrap_or(false)
+}
+
+fn cloud_mcp_terminal_output_has_subscriptions(state: &CloudMcpState) -> bool {
+    state
+        .terminal_output_stream_subscriptions
+        .lock()
+        .map(|subscriptions| !subscriptions.is_empty())
+        .unwrap_or(false)
+}
+
+fn cloud_mcp_terminal_output_stream_key(
+    device_id: &str,
+    workspace_id: &str,
+    pane_id: &str,
+    instance_id: u64,
+) -> String {
+    format!("{device_id}:{workspace_id}:{pane_id}:{instance_id}")
+}
+
+pub(crate) fn cloud_mcp_publish_terminal_output_delta(
+    state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    seq: u64,
+    from_total_bytes: u64,
+    total_bytes: u64,
+    chunk: &[u8],
+) {
+    if chunk.is_empty() {
+        return;
+    }
+    if !cloud_mcp_terminal_output_has_subscriptions(state) {
+        return;
+    }
+    let state = state.clone();
+    let pane_id = pane_id.to_string();
+    let chunk = chunk.to_vec();
+    tauri::async_runtime::spawn(async move {
+        let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
+            return;
+        };
+        let terminal_key = cloud_mcp_terminal_key(&pane_id, instance_id);
+        let context = {
+            let runtime = state.inner.lock().await;
+            runtime.terminal_contexts.get(&terminal_key).cloned()
+        };
+        let Some(context) = context else {
+            return;
+        };
+        let device_profile = cloud_mcp_desktop_device_profile();
+        let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+            .unwrap_or_else(|| "desktop-primary".to_string());
+        let stream_key = cloud_mcp_terminal_output_stream_key(
+            &device_id,
+            &context.workspace_id,
+            &pane_id,
+            instance_id,
+        );
+        if !cloud_mcp_terminal_output_stream_is_subscribed(&state, &stream_key) {
+            return;
+        }
+        let Ok(auth) = cloud_mcp_ws_auth_object(&state).await else {
+            return;
+        };
+        let envelope = json!({
+            "v": 1,
+            "k": "o",
+            "kind": "term.out",
+            "contract": CLOUD_MCP_TERMINAL_OUTPUT_CONTRACT,
+            "auth": auth,
+            "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+            "id": format!("termout-{seq}"),
+            "sk": stream_key,
+            "q": seq,
+            "f": from_total_bytes,
+            "n": total_bytes,
+            "b": general_purpose::STANDARD.encode(chunk),
+        });
+        if tx.send(envelope).is_err() {
+            cloud_mcp_mark_global_ws_disconnected(
+                &state,
+                "Cloud MCP app websocket terminal-output sender is closed.",
+            )
+            .await;
+        }
+    });
 }
 
 fn cloud_mcp_post_log_context(

@@ -3087,6 +3087,16 @@ function refreshTokenomicsSummaryIfStale({ force = false } = {}) {
   return loadTokenomicsStore({ force: true, summaryOnly: true });
 }
 
+function refreshVisibleTokenomicsLimits({ force = false, forceProviderRefresh = false } = {}) {
+  if (!tokenomicsViewCanRefresh()) {
+    return Promise.resolve(tokenomicsStore.state.summary);
+  }
+  return refreshTokenomicsLiveLimits({ force, forceProviderRefresh, syncLimitChanges: true })
+    .finally(() => {
+      void refreshTokenomicsSummaryIfStale();
+    });
+}
+
 function refreshTokenomicsHotTail({ force = false } = {}) {
   const now = Date.now();
   const requestEpoch = tokenomicsStore.requestEpoch;
@@ -3154,7 +3164,7 @@ function loadTokenomicsStore({
   tokenomicsStore.loadPromise = (async () => {
     try {
       if (shouldScan) {
-        void refreshTokenomicsLiveLimits();
+        void refreshTokenomicsLiveLimits({ force: true, syncLimitChanges: true });
       }
 
       const next = forceResync
@@ -3241,17 +3251,12 @@ function startTokenomicsViewPolling() {
   ensureTokenomicsProgressListener();
   tokenomicsStore.pollSubscriberCount += 1;
   let disposed = false;
-  const refreshVisibleTokenomics = ({ force = false } = {}) => {
-    if (disposed || !tokenomicsViewCanRefresh()) {
-      return;
-    }
-    void refreshTokenomicsLiveLimits({ force, syncLimitChanges: true }).finally(() => {
-      void refreshTokenomicsSummaryIfStale();
-    });
+  const refreshVisibleTokenomics = ({ force = false, forceProviderRefresh = false } = {}) => {
+    if (disposed) return;
+    void refreshVisibleTokenomicsLimits({ force, forceProviderRefresh });
   };
-  void loadTokenomicsStore({ background: true, force: false, summaryOnly: true }).finally(() => {
-    refreshVisibleTokenomics({ force: true });
-  });
+  refreshVisibleTokenomics({ force: true });
+  void loadTokenomicsStore({ background: true, force: false, summaryOnly: true });
   window.addEventListener("focus", refreshVisibleTokenomics);
   document.addEventListener("visibilitychange", refreshVisibleTokenomics);
 
@@ -3281,7 +3286,7 @@ function tokenomicsLoadingLabel(status, summary, progress) {
   if (phase === "complete") return "Finalizing usage";
   if (phase === "catch_up") return "Catching up usage";
   if (phase === "day_start" || phase === "backfill_start") return "Scanning usage by day";
-  return status === "scanning" || !summary ? "Scanning usage" : "Loading usage";
+  return status === "scanning" ? "Scanning usage" : "Loading usage";
 }
 
 function tokenomicsLoadingDetail(progress) {
@@ -3408,6 +3413,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
 
   useEffect(() => {
     resetTokenomicsStoreForAccount(accountKey);
+    void refreshVisibleTokenomicsLimits({ force: true, forceProviderRefresh: true });
     void loadTokenomicsStore({ background: true, force: false, summaryOnly: true });
   }, [accountKey]);
 

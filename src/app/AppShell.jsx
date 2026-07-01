@@ -20962,14 +20962,7 @@ function normalizeWorkspaceDisplayTerminalRows(layoutRows, terminalIndexes) {
     : getTerminalPanelRows(logicalIndexes).map((row) => row.terminalIndexes);
   const balancedRows = getTerminalPanelRows(logicalIndexes).map((row) => row.terminalIndexes);
   const shouldRebalanceRows = logicalIndexes.length > 1
-    && (
-      normalizedRows.some((rowIndexes) => rowIndexes.length > 3)
-      || normalizedRows.every((rowIndexes) => rowIndexes.length <= 1)
-      || (
-        normalizedRows.length > balancedRows.length
-        && normalizedRows.slice(1).every((rowIndexes) => rowIndexes.length <= 1)
-      )
-    );
+    && normalizedRows.some((rowIndexes) => rowIndexes.length > 3);
   const displayRows = shouldRebalanceRows ? balancedRows : normalizedRows;
 
   return displayRows.map((terminalIndexes, rowIndex) => ({

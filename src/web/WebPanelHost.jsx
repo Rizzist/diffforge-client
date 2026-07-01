@@ -45,6 +45,8 @@ import {
   normalizePanelAgentPromptTargets,
 } from "../terminals/panelAgentPromptBridge.js";
 
+const PANEL_AGENT_PROMPT_WEBVIEW_BOTTOM_INSET = 164;
+
 function parseWebPanelParams() {
   if (typeof window === "undefined") {
     return { paneId: "", url: DEFAULT_WEB_URL, theme: "dark", windowId: "", workspaceId: "" };
@@ -121,9 +123,10 @@ export default function WebPanelHost() {
   const { reload } = useNativeWebview({
     viewportRef,
     url: currentUrl,
-    visible: !agentPromptOpen,
+    visible: true,
     parentWindowLabel: windowLabel,
     scopeParts,
+    viewportInsetBottom: agentPromptOpen ? PANEL_AGENT_PROMPT_WEBVIEW_BOTTOM_INSET : 0,
     onNavigate: handleLoadedUrl,
   });
 
@@ -534,7 +537,7 @@ export default function WebPanelHost() {
 
       {addressError ? <HostInlineError role="alert">{addressError}</HostInlineError> : null}
 
-      <HostViewport ref={viewportRef}>
+      <HostViewport data-agent-prompt-open={agentPromptOpen ? "true" : undefined} ref={viewportRef}>
         <HostBackdrop>
           <Language aria-hidden="true" />
           <span>{currentHost}</span>

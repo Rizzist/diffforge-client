@@ -530,7 +530,6 @@ export default function PcbPanel({
         });
 
         await runWorkerStep(worker.executeWithFsMap({
-          entrypoint: PCB_MAIN_FILE_PATH,
           fsMap,
           mainComponentPath: PCB_MAIN_FILE_PATH,
         }), "executing PCB source");

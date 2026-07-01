@@ -1,420 +1,437 @@
+import { invoke } from "@tauri-apps/api/core";
+import { emit, listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import styled from "styled-components";
-import { ArrowBack } from "@styled-icons/material-rounded/ArrowBack";
-import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
-import { Language } from "@styled-icons/material-rounded/Language";
-import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
-import { Refresh } from "@styled-icons/material-rounded/Refresh";
-import { Search } from "@styled-icons/material-rounded/Search";
 
 import {
-  TerminalRailControls,
-  TerminalRestartButton,
-  TerminalRestartPill,
-} from "../app/appStyles.js";
+  PANEL_AGENT_PROMPT_ACTIVITY_EVENT,
+  PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT,
+  PANEL_AGENT_PROMPT_RESULT_EVENT,
+  PANEL_AGENT_PROMPT_SUBMIT_EVENT,
+  PANEL_AGENT_PROMPT_TARGETS_EVENT,
+  PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT,
+  createPanelAgentPromptRequestId,
+  normalizePanelAgentPromptActivityItems,
+  normalizePanelAgentPromptTargets,
+} from "../terminals/panelAgentPromptBridge.js";
+import WebPane from "./WebPane.jsx";
+import { DEFAULT_WEB_URL, normalizeWebInput } from "./webNative.js";
 import {
-  DEFAULT_WEB_URL,
-  hasTauriRuntime,
-  hostForUrl,
-  nativeErrorMessage,
-  normalizeWebInput,
-  useNativeWebview,
-} from "./webNative.js";
+  WEB_PANEL_CLOSED_EVENT,
+  WEB_PANEL_CONTROL_EVENT,
+  WEB_PANEL_CONTROL_NAVIGATE,
+  WEB_PANEL_CONTROL_RETURN,
+} from "./webPanelBridge.js";
+
+function workspaceWebTabPaneId(workspaceId) {
+  const safeWorkspaceId = String(workspaceId || "").trim();
+  return `workspace-web-tab-${safeWorkspaceId || "workspace"}`;
+}
+
+function fallbackOpenExternal(url) {
+  const targetUrl = normalizeWebInput(url) || DEFAULT_WEB_URL;
+  openUrl(targetUrl).catch(() => {
+    window.open(targetUrl, "_blank", "noopener,noreferrer");
+  });
+}
 
 export default function WebWorkspaceView({
   isActive = true,
   webviewObscured = false,
   workspace,
 }) {
-  const [history, setHistory] = useState(() => [DEFAULT_WEB_URL]);
-  const [historyIndex, setHistoryIndex] = useState(0);
-  const [addressValue, setAddressValue] = useState(DEFAULT_WEB_URL);
-  const [addressError, setAddressError] = useState("");
-  const [nativeError, setNativeError] = useState("");
-  const viewportRef = useRef(null);
-  const historyIndexRef = useRef(historyIndex);
-
-  historyIndexRef.current = historyIndex;
-
-  const currentUrl = history[historyIndex] || DEFAULT_WEB_URL;
-  const currentHost = useMemo(() => hostForUrl(currentUrl), [currentUrl]);
-  const canGoBack = historyIndex > 0;
-  const canGoForward = historyIndex < history.length - 1;
-  const nativeRuntimeAvailable = hasTauriRuntime();
-  const nativeVisible = Boolean(isActive && !webviewObscured);
-  const nativeScopeParts = useMemo(
-    () => [workspace?.id || "workspace-tab", "workspace-web-tab"],
-    [workspace?.id],
+  const workspaceId = String(workspace?.id || "").trim();
+  const paneId = useMemo(() => workspaceWebTabPaneId(workspaceId), [workspaceId]);
+  const scopeParts = useMemo(
+    () => [workspaceId || "workspace-tab", "workspace-web-tab"],
+    [workspaceId],
   );
 
-  useEffect(() => {
-    setAddressValue(currentUrl);
-  }, [currentUrl]);
+  const [currentUrl, setCurrentUrl] = useState(DEFAULT_WEB_URL);
+  const [poppedOut, setPoppedOut] = useState(false);
+  const [popoutLabel, setPopoutLabel] = useState("");
+  const [resumeNonce, setResumeNonce] = useState(0);
+  const [agentPromptActivityItems, setAgentPromptActivityItems] = useState([]);
+  const [agentPromptTargets, setAgentPromptTargets] = useState([]);
+  const [defaultAgentPromptTargetIds, setDefaultAgentPromptTargetIds] = useState([]);
 
-  const handleLoadedUrl = useCallback((loadedUrl) => {
-    const safeUrl = String(loadedUrl || "").trim();
+  const agentPromptTargetsRequestIdRef = useRef("");
+  const lastUrlRef = useRef(DEFAULT_WEB_URL);
+  const poppedOutRef = useRef(false);
+  const popoutLabelRef = useRef("");
+  const previousPaneIdRef = useRef(paneId);
+
+  const rememberUrl = useCallback((url) => {
+    const safeUrl = normalizeWebInput(url) || String(url || "").trim();
     if (!safeUrl) {
       return;
     }
-    setAddressValue(safeUrl);
-    setHistory((previous) => previous.map((url, index) => (
-      index === historyIndexRef.current ? safeUrl : url
-    )));
+    lastUrlRef.current = safeUrl;
+    setCurrentUrl(safeUrl);
   }, []);
 
-  const { reload, status: nativeStatus } = useNativeWebview({
-    viewportRef,
-    url: currentUrl,
-    visible: nativeVisible,
-    enabled: true,
-    scopeParts: nativeScopeParts,
-    onNavigate: handleLoadedUrl,
-    onError: (error) => {
-      setNativeError(nativeErrorMessage(error, "Unable to open the embedded web view."));
-    },
-  });
+  const clearBreakout = useCallback((url) => {
+    if (url) {
+      rememberUrl(url);
+    }
+    const wasPoppedOut = poppedOutRef.current || Boolean(popoutLabelRef.current);
+    poppedOutRef.current = false;
+    popoutLabelRef.current = "";
+    setPoppedOut(false);
+    setPopoutLabel("");
+    if (wasPoppedOut) {
+      setResumeNonce((nonce) => nonce + 1);
+    }
+  }, [rememberUrl]);
 
-  const navigateTo = useCallback((targetUrl) => {
-    setNativeError("");
-    setHistory((previous) => {
-      const base = previous.slice(0, historyIndex + 1);
-      if (base[base.length - 1] === targetUrl) {
-        return base;
-      }
-      return [...base, targetUrl];
-    });
-    setHistoryIndex((index) => ((history[index] || "") === targetUrl ? index : index + 1));
-  }, [history, historyIndex]);
-
-  const handleSubmit = useCallback((event) => {
-    event.preventDefault();
-    const targetUrl = normalizeWebInput(addressValue);
-    if (!targetUrl) {
-      setAddressError("Enter a web address or search.");
+  useEffect(() => {
+    if (previousPaneIdRef.current === paneId) {
       return;
     }
-    setAddressError("");
-    navigateTo(targetUrl);
-  }, [addressValue, navigateTo]);
+    const previousLabel = popoutLabelRef.current;
+    if (previousLabel) {
+      invoke("web_panel_close", { label: previousLabel }).catch(() => {});
+    }
+    previousPaneIdRef.current = paneId;
+    lastUrlRef.current = DEFAULT_WEB_URL;
+    poppedOutRef.current = false;
+    popoutLabelRef.current = "";
+    agentPromptTargetsRequestIdRef.current = "";
+    setCurrentUrl(DEFAULT_WEB_URL);
+    setPoppedOut(false);
+    setPopoutLabel("");
+    setAgentPromptActivityItems([]);
+    setAgentPromptTargets([]);
+    setDefaultAgentPromptTargetIds([]);
+    setResumeNonce((nonce) => nonce + 1);
+  }, [paneId]);
 
-  const goBack = useCallback(() => {
-    setAddressError("");
-    setNativeError("");
-    setHistoryIndex((index) => Math.max(0, index - 1));
+  useEffect(() => () => {
+    const label = popoutLabelRef.current;
+    if (label) {
+      invoke("web_panel_close", { label }).catch(() => {});
+    }
   }, []);
 
-  const goForward = useCallback(() => {
-    setAddressError("");
-    setNativeError("");
-    setHistoryIndex((index) => Math.min(history.length - 1, index + 1));
-  }, [history.length]);
+  const popOutWebTab = useCallback(async (_terminalIndex, _paneId, url) => {
+    const targetUrl = normalizeWebInput(url || lastUrlRef.current) || DEFAULT_WEB_URL;
+    rememberUrl(targetUrl);
+    if (popoutLabelRef.current) {
+      invoke("web_panel_focus", { label: popoutLabelRef.current }).catch(() => {});
+      return;
+    }
+    try {
+      const result = await invoke("web_panel_open", {
+        height: null,
+        paneId,
+        theme: document.documentElement?.dataset?.forgeTheme || "",
+        title: "Web",
+        url: targetUrl,
+        width: null,
+        workspaceId,
+      });
+      const label = String(result?.label || "").trim();
+      if (label) {
+        popoutLabelRef.current = label;
+        setPopoutLabel(label);
+      }
+      poppedOutRef.current = true;
+      setPoppedOut(true);
+    } catch {
+      fallbackOpenExternal(targetUrl);
+    }
+  }, [paneId, rememberUrl, workspaceId]);
 
-  const refresh = useCallback(() => {
-    setAddressError("");
-    setNativeError("");
-    reload();
-  }, [reload]);
+  const focusWebTabPopout = useCallback(() => {
+    const label = popoutLabelRef.current || popoutLabel;
+    if (label) {
+      invoke("web_panel_focus", { label }).catch(() => {});
+    }
+  }, [popoutLabel]);
 
-  const openCurrentExternally = useCallback(() => {
-    openUrl(currentUrl).catch(() => {
-      window.open(currentUrl, "_blank", "noopener,noreferrer");
+  const returnWebTabPopout = useCallback((_terminalIndex, _paneId, url) => {
+    const label = popoutLabelRef.current || popoutLabel;
+    const returnUrl = normalizeWebInput(url)
+      || String(url || "").trim()
+      || lastUrlRef.current
+      || DEFAULT_WEB_URL;
+    clearBreakout(returnUrl);
+    if (label) {
+      invoke("web_panel_close", { label }).catch(() => {});
+    }
+  }, [clearBreakout, popoutLabel]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(WEB_PANEL_CLOSED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const eventPaneId = String(payload.paneId || payload.pane_id || "").trim();
+      const eventWindowId = String(payload.windowId || payload.window_id || "").trim();
+      if (eventPaneId && eventPaneId !== paneId) {
+        return;
+      }
+      if (!eventPaneId && eventWindowId && eventWindowId !== popoutLabelRef.current) {
+        return;
+      }
+      if (!eventPaneId && !eventWindowId) {
+        return;
+      }
+      clearBreakout(payload.url);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [clearBreakout, paneId]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(WEB_PANEL_CONTROL_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const eventPaneId = String(payload.paneId || payload.pane_id || "").trim();
+      if (eventPaneId !== paneId) {
+        return;
+      }
+      const control = String(payload.control || "").trim();
+      if (control === WEB_PANEL_CONTROL_NAVIGATE) {
+        rememberUrl(payload.url);
+        return;
+      }
+      if (control === WEB_PANEL_CONTROL_RETURN) {
+        returnWebTabPopout(null, paneId, payload.url);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [paneId, rememberUrl, returnWebTabPopout]);
+
+  const requestAgentPromptTargets = useCallback(() => {
+    const requestId = createPanelAgentPromptRequestId("web-tab-targets");
+    agentPromptTargetsRequestIdRef.current = requestId;
+    emit(PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT, {
+      panelKind: "web",
+      paneId,
+      requestId,
+      workspaceId,
+    }).catch(() => {});
+  }, [paneId, workspaceId]);
+
+  const requestAgentPromptActivity = useCallback(() => {
+    emit(PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT, {
+      panelKind: "web",
+      paneId,
+      workspaceId,
+    }).catch(() => {});
+  }, [paneId, workspaceId]);
+
+  useEffect(() => {
+    requestAgentPromptActivity();
+  }, [requestAgentPromptActivity]);
+
+  const handleAgentPromptOpenChange = useCallback((open) => {
+    if (!open) {
+      return;
+    }
+    requestAgentPromptTargets();
+    requestAgentPromptActivity();
+  }, [requestAgentPromptActivity, requestAgentPromptTargets]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(PANEL_AGENT_PROMPT_ACTIVITY_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const payloadPaneId = String(payload.paneId || payload.pane_id || payload.panelPaneId || payload.panel_pane_id || "").trim();
+      if (!payloadPaneId || payloadPaneId !== paneId) {
+        return;
+      }
+      const payloadWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      if (payloadWorkspaceId && workspaceId && payloadWorkspaceId !== workspaceId) {
+        return;
+      }
+      setAgentPromptActivityItems(normalizePanelAgentPromptActivityItems(payload.items));
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [paneId, workspaceId]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(PANEL_AGENT_PROMPT_TARGETS_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const requestId = String(payload.requestId || payload.request_id || "").trim();
+      if (requestId && requestId !== agentPromptTargetsRequestIdRef.current) {
+        return;
+      }
+      const payloadWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      if (payloadWorkspaceId && workspaceId && payloadWorkspaceId !== workspaceId) {
+        return;
+      }
+      setAgentPromptTargets(normalizePanelAgentPromptTargets(payload.targets));
+      setDefaultAgentPromptTargetIds(
+        (Array.isArray(payload.defaultSelectedTargetIds)
+          ? payload.defaultSelectedTargetIds
+          : Array.isArray(payload.default_selected_target_ids)
+            ? payload.default_selected_target_ids
+            : []
+        ).map((id) => String(id || "").trim()).filter(Boolean),
+      );
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [workspaceId]);
+
+  const submitAgentPrompt = useCallback(async ({ targetIds, targetTerminalIndexes, text }) => {
+    const requestId = createPanelAgentPromptRequestId("web-tab-submit");
+    let unlisten = () => {};
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        settled = true;
+        unlisten();
+      };
+      const timeoutId = window.setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        cleanup();
+        reject(new Error("Timed out sending prompt."));
+      }, 15000);
+      listen(PANEL_AGENT_PROMPT_RESULT_EVENT, (event) => {
+        const payload = event?.payload || {};
+        if (String(payload.requestId || payload.request_id || "").trim() !== requestId) {
+          return;
+        }
+        window.clearTimeout(timeoutId);
+        cleanup();
+        if (payload.ok === true) {
+          resolve(payload);
+        } else {
+          reject(new Error(String(payload.error || "Unable to send prompt.")));
+        }
+      })
+        .then((nextUnlisten) => {
+          if (settled) {
+            nextUnlisten();
+            return;
+          }
+          unlisten = nextUnlisten;
+          emit(PANEL_AGENT_PROMPT_SUBMIT_EVENT, {
+            panelKind: "web",
+            paneId,
+            requestId,
+            targetIds,
+            targetTerminalIndexes,
+            text,
+            workspaceId,
+          }).catch((error) => {
+            window.clearTimeout(timeoutId);
+            cleanup();
+            reject(error);
+          });
+        })
+        .catch((error) => {
+          window.clearTimeout(timeoutId);
+          cleanup();
+          reject(error);
+        });
     });
-  }, [currentUrl]);
+  }, [paneId, workspaceId]);
+
+  const layoutKey = [
+    paneId,
+    isActive ? "active" : "inactive",
+    webviewObscured ? "obscured" : "clear",
+    poppedOut ? "popped-out" : "in-tab",
+    resumeNonce,
+  ].join("|");
 
   return (
-    <WebSurface aria-label="Workspace web" data-workspace-web-surface="true">
-      <WebToolbar data-terminal-control="true">
-        <WebNavControls data-rail-row="secondary">
-          <WebIconButton
-            aria-label="Back"
-            disabled={!canGoBack}
-            onClick={goBack}
-            title="Back"
-            type="button"
-          >
-            <ArrowBack aria-hidden="true" />
-          </WebIconButton>
-          <WebIconButton
-            aria-label="Forward"
-            disabled={!canGoForward}
-            onClick={goForward}
-            title="Forward"
-            type="button"
-          >
-            <ArrowForward aria-hidden="true" />
-          </WebIconButton>
-          <WebIconButton
-            aria-label="Refresh"
-            onClick={refresh}
-            title="Refresh"
-            type="button"
-          >
-            <Refresh aria-hidden="true" />
-          </WebIconButton>
-        </WebNavControls>
-
-        <WebAddressForm onSubmit={handleSubmit}>
-          <SearchIcon aria-hidden="true" />
-          <WebAddressInput
-            aria-label="Search or enter URL"
-            autoCapitalize="none"
-            autoComplete="off"
-            autoCorrect="off"
-            inputMode="url"
-            onChange={(event) => {
-              setAddressValue(event.target.value);
-              if (addressError) {
-                setAddressError("");
-              }
-            }}
-            placeholder="Search or enter URL"
-            spellCheck="false"
-            value={addressValue}
-          />
-          <WebSubmitButton aria-label="Go" title="Go" type="submit">
-            <ArrowForward aria-hidden="true" />
-          </WebSubmitButton>
-        </WebAddressForm>
-
-        <WebRightControls data-rail-row="primary">
-          <WebIconButton
-            aria-label="Open in browser"
-            onClick={openCurrentExternally}
-            title="Open in browser"
-            type="button"
-          >
-            <OpenInNew aria-hidden="true" />
-          </WebIconButton>
-        </WebRightControls>
-      </WebToolbar>
-
-      {addressError ? <WebInlineError role="alert">{addressError}</WebInlineError> : null}
-
-      <WebViewport ref={viewportRef}>
-        {nativeRuntimeAvailable ? (
-          <NativeWebviewBackdrop data-status={nativeError ? "error" : nativeStatus}>
-            <Language aria-hidden="true" />
-            <span>
-              {nativeError
-                ? "Web view unavailable"
-                : nativeStatus === "loading"
-                  ? "Loading"
-                  : currentHost}
-            </span>
-            {nativeError ? (
-              <NativeWebviewFallback role="alert">
-                <small>{nativeError}</small>
-                <NativeWebviewActions>
-                  <NativeWebviewActionButton onClick={refresh} type="button">
-                    <Refresh aria-hidden="true" />
-                    <span>Retry</span>
-                  </NativeWebviewActionButton>
-                  <NativeWebviewActionButton onClick={openCurrentExternally} type="button">
-                    <OpenInNew aria-hidden="true" />
-                    <span>Open External</span>
-                  </NativeWebviewActionButton>
-                </NativeWebviewActions>
-              </NativeWebviewFallback>
-            ) : null}
-          </NativeWebviewBackdrop>
-        ) : (
-          <WebFrame
-            key={currentUrl}
-            referrerPolicy="strict-origin-when-cross-origin"
-            sandbox="allow-downloads allow-forms allow-modals allow-popups allow-popups-to-escape-sandbox allow-presentation allow-same-origin allow-scripts"
-            src={currentUrl}
-            title="Workspace web view"
-          />
-        )}
-      </WebViewport>
-    </WebSurface>
+    <WebPane
+      key={`web-tab-${paneId}-${resumeNonce}`}
+      breakoutReturnUrl={currentUrl}
+      defaultPanelAgentPromptTargetIds={defaultAgentPromptTargetIds}
+      initialUrl={currentUrl}
+      isActive={isActive}
+      layoutKey={layoutKey}
+      onAgentPromptOpenChange={handleAgentPromptOpenChange}
+      onFocusBreakout={focusWebTabPopout}
+      onNavigate={rememberUrl}
+      onPopOut={popOutWebTab}
+      onReturnFromBreakout={returnWebTabPopout}
+      onSubmitPanelAgentPrompt={submitAgentPrompt}
+      paneId={paneId}
+      panelAgentPromptActivityItems={agentPromptActivityItems}
+      panelAgentPromptTargets={agentPromptTargets}
+      poppedOut={poppedOut}
+      scopeParts={scopeParts}
+      showCloseButton={false}
+      showDragHandle={false}
+      showFullscreenControl={false}
+      showSplitControls={false}
+      webviewObscured={webviewObscured}
+      workspaceId={workspaceId}
+    />
   );
 }
-
-const WebSurface = styled.section`
-  --web-bg: #030405;
-  --web-panel: #0b0e14;
-  --web-panel-strong: #0d121a;
-  --web-border: rgba(226, 232, 240, 0.08);
-  --web-text: rgba(255, 255, 255, 0.82);
-  --web-muted: rgba(226, 232, 240, 0.62);
-  --web-blue: #68a3ff;
-  --web-danger: #ff9b9b;
-
-  display: grid;
-  width: 100%;
-  height: 100%;
-  min-width: 0;
-  min-height: 0;
-  grid-template-rows: auto auto minmax(0, 1fr);
-  overflow: hidden;
-  color: var(--web-text);
-  background: var(--web-bg);
-
-  html[data-forge-theme="light"] & {
-    --web-bg: #ffffff;
-    --web-panel: #eef1f5;
-    --web-panel-strong: #ffffff;
-    --web-border: rgba(24, 34, 48, 0.12);
-    --web-text: rgba(48, 54, 68, 0.82);
-    --web-muted: rgba(48, 54, 68, 0.58);
-    --web-blue: #0066cc;
-    --web-danger: #b42318;
-  }
-`;
-
-const WebToolbar = styled(TerminalRestartPill)`
-  border-bottom-color: var(--web-border);
-  background: var(--web-panel);
-`;
-
-const WebNavControls = styled(TerminalRailControls)`
-  order: 0;
-`;
-
-const WebRightControls = styled(TerminalRailControls)``;
-
-const WebIconButton = styled(TerminalRestartButton)`
-  color: var(--web-text);
-
-  html[data-forge-theme="light"] &:hover:not(:disabled),
-  html[data-forge-theme="light"] &:focus-visible {
-    color: var(--forge-text, #1d2430);
-  }
-`;
-
-const WebAddressForm = styled.form`
-  display: flex;
-  min-width: min(100%, 220px);
-  align-items: center;
-  flex: 999 1 320px;
-  gap: 5px;
-  order: 1;
-  height: 24px;
-  padding: 0 5px 0 8px;
-  border: 1px solid var(--web-border);
-  border-radius: 8px;
-  background: var(--web-panel-strong);
-`;
-
-const SearchIcon = styled(Search)`
-  width: 14px;
-  height: 14px;
-  color: var(--web-muted);
-`;
-
-const WebAddressInput = styled.input`
-  min-width: 0;
-  flex: 1 1 120px;
-  height: 20px;
-  padding: 0;
-  border: 0;
-  outline: 0;
-  color: var(--web-text);
-  background: transparent;
-  font-size: 11px;
-  font-weight: 650;
-
-  &::placeholder {
-    color: var(--web-muted);
-  }
-`;
-
-const WebSubmitButton = styled(WebIconButton)`
-  width: 20px;
-  height: 20px;
-  min-width: 20px;
-  color: var(--web-blue);
-`;
-
-const WebInlineError = styled.div`
-  grid-row: 2;
-  padding: 5px 12px;
-  color: var(--web-danger);
-  background: rgba(120, 24, 24, 0.18);
-  font-size: 12px;
-  font-weight: 700;
-`;
-
-const WebViewport = styled.div`
-  grid-row: 3;
-  position: relative;
-  min-width: 0;
-  min-height: 0;
-  overflow: hidden;
-  background: var(--web-bg);
-`;
-
-const WebFrame = styled.iframe`
-  width: 100%;
-  height: 100%;
-  border: 0;
-  background: #ffffff;
-`;
-
-const NativeWebviewBackdrop = styled.div`
-  position: absolute;
-  inset: 0;
-  display: grid;
-  place-items: center;
-  align-content: center;
-  gap: 10px;
-  color: var(--web-muted);
-  font-size: 12px;
-  font-weight: 700;
-
-  svg {
-    width: 28px;
-    height: 28px;
-  }
-
-  &[data-status="error"] {
-    color: var(--web-danger);
-  }
-`;
-
-const NativeWebviewFallback = styled.div`
-  display: grid;
-  max-width: 420px;
-  gap: 12px;
-  justify-items: center;
-  padding: 0 20px;
-  text-align: center;
-
-  small {
-    color: var(--web-muted);
-    font-size: 12px;
-    line-height: 1.45;
-  }
-`;
-
-const NativeWebviewActions = styled.div`
-  display: inline-flex;
-  flex-wrap: wrap;
-  justify-content: center;
-  gap: 8px;
-`;
-
-const NativeWebviewActionButton = styled.button`
-  display: inline-flex;
-  min-height: 30px;
-  align-items: center;
-  gap: 6px;
-  padding: 0 12px;
-  border: 1px solid var(--web-border);
-  border-radius: 7px;
-  color: var(--web-text);
-  background: var(--web-panel-strong);
-  font-size: 12px;
-  font-weight: 740;
-
-  svg {
-    width: 14px;
-    height: 14px;
-  }
-
-  &:hover {
-    border-color: var(--web-blue);
-  }
-`;

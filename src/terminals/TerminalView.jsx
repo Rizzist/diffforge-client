@@ -257,6 +257,7 @@ const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
 const TERMINAL_BREAKOUT_TRANSITION_MS = 260;
 const TERMINAL_BREAKOUT_STORAGE_PREFIX = "diffforge.terminalBreakout.v1";
 const TERMINAL_DOCUMENT_PANEL_ID = "workspace-document-panel";
+const TERMINAL_DOCUMENT_PANEL_KIND = "docs";
 const TERMINAL_GRID_MAX_BALANCED_COLUMNS = 3;
 const TERMINAL_EMPTY_AGENT_LAUNCHERS = Object.freeze([
   { id: "codex", label: "Codex" },
@@ -2749,7 +2750,15 @@ const TerminalDocumentPanelShell = styled.div`
   }
 `;
 
-const TerminalDocumentPanelHeader = styled(TerminalRestartPill)``;
+const TerminalDocumentPanelHeader = styled(TerminalRestartPill)`
+  [data-rail-row="secondary"] {
+    max-width: 100%;
+    flex: 1 1 220px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    row-gap: 1px;
+  }
+`;
 
 const TerminalDocumentPanelIdentity = styled(TerminalRailIdentity)`
   min-width: 0;
@@ -2761,6 +2770,7 @@ const TerminalDocumentPanelTitle = styled(TerminalAgentLabel)`
 `;
 
 const TerminalDocumentPanelBody = styled.div`
+  position: relative;
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
@@ -2783,7 +2793,13 @@ const TerminalPcbPanelShell = styled.div`
 `;
 
 const TerminalPcbPanelHeader = styled(TerminalRestartPill)`
-  flex-wrap: nowrap;
+  [data-rail-row="secondary"] {
+    max-width: 100%;
+    flex: 1 1 220px;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    row-gap: 1px;
+  }
 `;
 
 const TerminalPcbPanelIdentity = styled(TerminalRailIdentity)`
@@ -8702,18 +8718,7 @@ function getBalancedTerminalPaneRowValues(paneKeys) {
 
 function shouldRebalanceTerminalPaneRowValues(rowValues) {
   const rows = Array.isArray(rowValues) ? rowValues.filter((row) => Array.isArray(row) && row.length) : [];
-  const paneCount = rows.reduce((count, row) => count + row.length, 0);
-  if (paneCount <= 1) {
-    return false;
-  }
-
-  const balancedRows = getBalancedTerminalPaneRowValues(rows.flat());
-  return rows.some((row) => row.length > TERMINAL_GRID_MAX_BALANCED_COLUMNS)
-    || rows.every((row) => row.length <= 1)
-    || (
-      rows.length > balancedRows.length
-      && rows.slice(1).every((row) => row.length <= 1)
-    );
+  return rows.some((row) => row.length > TERMINAL_GRID_MAX_BALANCED_COLUMNS);
 }
 
 function normalizeViewTerminalRows(rows, options = {}) {
@@ -22142,6 +22147,7 @@ function TerminalView({
   const [terminalBreakoutDocumentPanel, setTerminalBreakoutDocumentPanel] = useState(null);
   const [terminalDocumentPanelMaximized, setTerminalDocumentPanelMaximized] = useState(false);
   const [terminalDocumentPanelWindowRequest, setTerminalDocumentPanelWindowRequest] = useState(null);
+  const [documentPanelAgentPromptOpen, setDocumentPanelAgentPromptOpen] = useState(false);
   const [terminalBreakoutDocumentWindowDragging, setTerminalBreakoutDocumentWindowDragging] = useState(false);
   const [terminalBreakoutDocumentWindowLayout, setTerminalBreakoutDocumentWindowLayout] = useState(
     TERMINAL_BREAKOUT_DOCUMENT_WINDOW_DEFAULT_LAYOUT,
@@ -22150,6 +22156,12 @@ function TerminalView({
   const [terminalBreakoutTerminalScale, setTerminalBreakoutTerminalScale] = useState(TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE);
   const [terminalBreakoutPanning, setTerminalBreakoutPanning] = useState(false);
   const workspaceDocumentPanelAvailable = Boolean(workspaceDocumentPanelEnabled);
+  useEffect(() => {
+    if (!workspaceDocumentPanelAvailable) {
+      setDocumentPanelAgentPromptOpen(false);
+    }
+  }, [workspaceDocumentPanelAvailable]);
+
   const documentPanelDisplayRows = useMemo(() => reconcileDocumentPanelRows({
     currentRows: terminalDocumentPanelRows,
     documentPanelAvailable: workspaceDocumentPanelAvailable,
@@ -33091,7 +33103,7 @@ function TerminalView({
   const panelAgentPromptTargets = useMemo(() => (
     logicalTerminalIndexes
       .map((terminalIndex) => {
-        if (paneKinds?.[terminalIndex] === "web" || paneKinds?.[terminalIndex] === "pcb") {
+        if (String(paneKinds?.[terminalIndex] || "").trim()) {
           return null;
         }
         const role = resolveTodoQueueTerminalAgentRole(
@@ -38223,6 +38235,22 @@ function TerminalView({
                   </TerminalDocumentPanelTitle>
                 </TerminalDocumentPanelIdentity>
                 <TerminalRailControls data-rail-row="secondary">
+                  <PanelAgentPromptActivity
+                    items={panelAgentPromptActivityItems.filter((item) => (
+                      String(item.panelPaneId || "").trim() === TERMINAL_DOCUMENT_PANEL_ID
+                    ))}
+                  />
+                  <TerminalRestartButton
+                    aria-label="Prompt terminal agents"
+                    aria-pressed={documentPanelAgentPromptOpen ? "true" : "false"}
+                    data-active={documentPanelAgentPromptOpen ? "true" : undefined}
+                    onClick={() => setDocumentPanelAgentPromptOpen((open) => !open)}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    title="Prompt terminal agents"
+                    type="button"
+                  >
+                    <ButtonBotIcon aria-hidden="true" />
+                  </TerminalRestartButton>
                   <TerminalRestartButton
                     aria-label="Open selected document in its own window"
                     disabled={!terminalBreakoutDocumentPanel?.key && !terminalBreakoutDocumentPanel?.id}
@@ -38277,6 +38305,17 @@ function TerminalView({
                   surfaceActive={isWorkspaceSurfaceVisible && workspaceDocumentPanelAvailable}
                   workspaces={workspaces}
                 />
+                {documentPanelAgentPromptOpen ? (
+                  <PanelAgentPromptComposer
+                    autoFocus
+                    defaultSelectedTargetIds={defaultPanelAgentPromptTargetIds}
+                    onClose={() => setDocumentPanelAgentPromptOpen(false)}
+                    onSubmit={submitPanelAgentPrompt}
+                    panelKind={TERMINAL_DOCUMENT_PANEL_KIND}
+                    panelPaneId={TERMINAL_DOCUMENT_PANEL_ID}
+                    targets={panelAgentPromptTargets}
+                  />
+                ) : null}
               </TerminalDocumentPanelBody>
             </TerminalDocumentPanelShell>
           </TerminalBreakoutDocumentWindow>

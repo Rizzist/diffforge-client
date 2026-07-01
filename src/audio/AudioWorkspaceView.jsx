@@ -6054,6 +6054,7 @@ export function AudioWidgetWindow() {
   const audioBufferStartRef = useRef(null);
   const audioCaptureTeardownRef = useRef(null);
   const pushToTalkDownRef = useRef(false);
+  const suppressPushToTalkUntilReleaseRef = useRef(false);
   const recordingRunRef = useRef(0);
   const stopAfterStartRef = useRef(false);
   const forgeVoiceStartPendingRunRef = useRef(0);
@@ -8561,15 +8562,18 @@ export function AudioWidgetWindow() {
     const audioMs = Number(result?.audioMs || 0);
 
     if (!rawText || (audioMs > 0 && audioMs < AUDIO_CANCEL_SALVAGE_MIN_AUDIO_MS)) {
-      return;
+      return false;
     }
 
     const pipeline = applyVoiceTextPipeline(rawText, peekVoiceTextRules());
     const text = (pipeline.text || "").trim() || rawText;
+    const forgeHistory = provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
+      ? forgeDictationHistoryRef.current
+      : null;
     const entry = {
       audioMs,
-      createdAt: new Date().toISOString(),
-      id: `${Date.now()}`,
+      createdAt: result?.createdAt || forgeHistory?.createdAt || new Date().toISOString(),
+      id: String(result?.id || result?.historyId || forgeHistory?.id || Date.now()),
       latencyMs: Number(result?.latencyMs || 0),
       language: provider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL ? "" : readDeepgramLanguage(),
       provider,
@@ -8598,7 +8602,7 @@ export function AudioWidgetWindow() {
       }).catch(() => {});
       refreshWidgetHistory();
       await invoke("insert_handsfree_transcribed_text", { text }).catch(() => {});
-      return;
+      return true;
     }
 
     await publishAudioTranscriptionResult({
@@ -8606,6 +8610,7 @@ export function AudioWidgetWindow() {
       status: AUDIO_TRANSCRIPTION_STATUS_CANCELLED,
     }).catch(() => {});
     refreshWidgetHistory();
+    return true;
   }, [refreshWidgetHistory]);
 
   const dismissCancelNotice = useCallback(() => {
@@ -8773,7 +8778,12 @@ export function AudioWidgetWindow() {
           setMessage("Capturing final audio");
           await waitForAudioPostBuffer(DEEPGRAM_RELEASE_POST_BUFFER_MS);
           if (recordingRunRef.current !== recordingRunId) {
-            throw new Error("Deepgram transcription canceled.");
+            const realtimeResult = await invoke("stop_deepgram_realtime_transcription").catch(() => null);
+            const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
+            return {
+              ...(realtimeResult || {}),
+              audioMs: Number(captureResult?.audioMs || realtimeResult?.audioMs || 0),
+            };
           }
           setMessage("Closing Deepgram stream");
           const realtimeResult = await invoke("stop_deepgram_realtime_transcription");
@@ -8794,7 +8804,18 @@ export function AudioWidgetWindow() {
           setMessage("Capturing final audio");
           await waitForAudioPostBuffer(FORGE_RELEASE_POST_BUFFER_MS);
           if (recordingRunRef.current !== recordingRunId) {
-            throw new Error("Diff Forge Cloud dictation canceled.");
+            const dictationResult = await invoke("stop_forge_dictation_transcription", {
+              request: { cancel: true },
+            }).catch(() => null);
+            const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
+            return {
+              ...(dictationResult || {}),
+              audioMs: Number(
+                captureResult?.audioMs
+                || Number(dictationResult?.audioSeconds || 0) * 1000
+                || 0,
+              ),
+            };
           }
           setMessage("Finishing in Diff Forge Cloud");
           const dictationResult = await invoke("stop_forge_dictation_transcription", {
@@ -8881,11 +8902,13 @@ export function AudioWidgetWindow() {
       if (recordingRunRef.current !== recordingRunId) {
         try {
           if (cancelSalvageRunRef.current === recordingRunId) {
-            cancelSalvageRunRef.current = 0;
-            await publishCancelledTranscript(
+            const published = await publishCancelledTranscript(
               { ...result, latencyMs: Math.max(0, Date.now() - submittedAt) },
               currentProvider,
             );
+            if (published && cancelSalvageRunRef.current === recordingRunId) {
+              cancelSalvageRunRef.current = 0;
+            }
           }
         } finally {
           await audioBuffer?.close?.().catch(() => {});
@@ -9057,6 +9080,9 @@ export function AudioWidgetWindow() {
     const currentState = widgetStateRef.current;
     const audioBuffer = audioBufferRef.current;
     const recordingRunId = recordingRunRef.current;
+    if (pushToTalkDownRef.current) {
+      suppressPushToTalkUntilReleaseRef.current = true;
+    }
     recordingRunRef.current += 1;
     pushToTalkDownRef.current = false;
     stopAfterStartRef.current = false;
@@ -9115,6 +9141,7 @@ export function AudioWidgetWindow() {
         return;
       }
 
+      const cancelledAt = Date.now();
       if (salvage) {
         // Let the in-flight transcription finish detached; the invalidated
         // stopRecording run publishes it as cancelled instead of inserting.
@@ -9167,17 +9194,44 @@ export function AudioWidgetWindow() {
       }
 
       if (
-        audioBuffer
-        && (
-          currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
-          || currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
-          || currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT
-        )
+        currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+        || currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
       ) {
-        trackAudioCaptureTeardown((async () => {
-          await audioBuffer.finishCapture({ decode: false }).catch(() => null);
-          await audioBuffer?.close?.().catch(() => {});
+        const providerStop = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD
+          ? invoke("stop_deepgram_realtime_transcription").catch(() => null)
+          : invoke("stop_forge_dictation_transcription", {
+            request: { cancel: true },
+          }).catch(() => null);
+        const captureFinish = audioBuffer
+          ? (async () => {
+            const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
+            await audioBuffer?.close?.().catch(() => {});
+            return captureResult;
+          })()
+          : Promise.resolve(null);
+        const cancelTeardown = trackAudioCaptureTeardown((async () => {
+          const [providerResult, captureResult] = await Promise.all([providerStop, captureFinish]);
+          if (salvage && cancelSalvageRunRef.current === recordingRunId) {
+            const published = await publishCancelledTranscript(
+              {
+                ...(providerResult || {}),
+                audioMs: Number(
+                  captureResult?.audioMs
+                  || providerResult?.audioMs
+                  || Number(providerResult?.audioSeconds || 0) * 1000
+                  || 0,
+                ),
+                latencyMs: Math.max(0, Date.now() - cancelledAt),
+              },
+              currentProvider,
+            );
+            if (published && cancelSalvageRunRef.current === recordingRunId) {
+              cancelSalvageRunRef.current = 0;
+            }
+          }
+          return captureResult;
         })());
+        void cancelTeardown;
       }
 
       resetWidgetToStartState();
@@ -9209,49 +9263,30 @@ export function AudioWidgetWindow() {
         const partialText = localWhisperPartialTextRef.current.trim();
         const audioMs = recordingStartedAt > 0 ? Math.max(0, Date.now() - recordingStartedAt) : 0;
         localWhisperPartialSessionIdRef.current = "";
+        localWhisperPartialHistoryIdRef.current = "";
+        localWhisperPartialFailedRef.current = false;
+        localWhisperPartialTextRef.current = "";
+        if (partialText) {
+          void publishCancelledTranscript(
+            {
+              audioMs,
+              latencyMs: Math.max(0, Date.now() - submittedAt),
+              partial: true,
+              text: partialText,
+            },
+            AUDIO_TRANSCRIPTION_PROVIDER_LOCAL,
+          );
+        }
+        trackAudioCaptureTeardown((async () => {
+          await Promise.all([
+            invoke("cancel_whisper_transcription").catch(() => {}),
+            cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {}),
+          ]);
+          await audioBuffer.finishCapture({ decode: false }).catch(() => null);
+          await audioBuffer?.close?.().catch(() => {});
+        })());
         resetWidgetToStartState();
         setMessage(partialText ? "Cancelled, saving to history" : "Cancelled");
-        const partialTeardown = trackAudioCaptureTeardown((async () => {
-          try {
-            const partialResult = await stopLocalWhisperPartialTranscription({
-              sessionId: partialSessionId,
-            });
-            await audioBuffer?.close?.().catch(() => {});
-            return {
-              partialResult,
-              type: "partial",
-            };
-          } catch {
-            const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
-            await cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
-            await audioBuffer?.close?.().catch(() => {});
-            return {
-              captureResult,
-              type: "fallback",
-            };
-          }
-        })());
-        void (async () => {
-          const salvageResult = await partialTeardown;
-          if (salvageResult?.type === "partial") {
-            const partialResult = salvageResult.partialResult || {};
-            const text = String(partialResult.text || partialText || "").trim();
-            if (!text) {
-              return;
-            }
-            publishCancelledTranscript(
-              {
-                ...(partialResult || {}),
-                audioMs: Number(partialResult?.audioMs || audioMs || 0),
-                latencyMs: Math.max(0, Date.now() - submittedAt),
-                text,
-              },
-              AUDIO_TRANSCRIPTION_PROVIDER_LOCAL,
-            );
-          } else {
-            salvageLocalCancelledCapture(salvageResult?.captureResult, captureStats);
-          }
-        })();
         return;
       }
       const captureTeardown = trackAudioCaptureTeardown((async () => {
@@ -9266,45 +9301,54 @@ export function AudioWidgetWindow() {
 
       void (async () => {
         if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
-          const [realtimeResult, captureResult] = await Promise.all([
-            invoke("stop_deepgram_realtime_transcription").catch(() => null),
-            captureTeardown,
-          ]);
-          publishCancelledTranscript(
-            {
-              ...(realtimeResult || {}),
-              audioMs: Number(captureResult?.audioMs || realtimeResult?.audioMs || 0),
-              latencyMs: Math.max(0, Date.now() - submittedAt),
-            },
-            AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
-          );
+          void trackAudioCaptureTeardown((async () => {
+            const [realtimeResult, captureResult] = await Promise.all([
+              invoke("stop_deepgram_realtime_transcription").catch(() => null),
+              captureTeardown,
+            ]);
+            await publishCancelledTranscript(
+              {
+                ...(realtimeResult || {}),
+                audioMs: Number(captureResult?.audioMs || realtimeResult?.audioMs || 0),
+                latencyMs: Math.max(0, Date.now() - submittedAt),
+              },
+              AUDIO_TRANSCRIPTION_PROVIDER_CLOUD,
+            );
+            return captureResult;
+          })());
         } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
           // Cancelled cloud dictation still returns the transcript so far.
-          const [dictationResult, captureResult] = await Promise.all([
-            invoke("stop_forge_dictation_transcription", {
-              request: { cancel: true },
-            }).catch(() => null),
-            captureTeardown,
-          ]);
-          publishCancelledTranscript(
-            {
-              ...(dictationResult || {}),
-              audioMs: Number(
-                captureResult?.audioMs
-                || Number(dictationResult?.audioSeconds || 0) * 1000
-                || 0,
-              ),
-              latencyMs: Math.max(0, Date.now() - submittedAt),
-            },
-            AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
-          );
+          void trackAudioCaptureTeardown((async () => {
+            const [dictationResult, captureResult] = await Promise.all([
+              invoke("stop_forge_dictation_transcription", {
+                request: { cancel: true },
+              }).catch(() => null),
+              captureTeardown,
+            ]);
+            await publishCancelledTranscript(
+              {
+                ...(dictationResult || {}),
+                audioMs: Number(
+                  captureResult?.audioMs
+                  || Number(dictationResult?.audioSeconds || 0) * 1000
+                  || 0,
+                ),
+                latencyMs: Math.max(0, Date.now() - submittedAt),
+              },
+              AUDIO_TRANSCRIPTION_PROVIDER_FORGE,
+            );
+            return captureResult;
+          })());
         } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
-          await Promise.all([
-            stopCloudVoiceAgentStream(getForgeVoiceControlRequest()).catch(() => {}),
-            captureTeardown,
-          ]);
-          await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
-          forgeVoiceTtsPlayerRef.current = null;
+          void trackAudioCaptureTeardown((async () => {
+            const [, captureResult] = await Promise.all([
+              stopCloudVoiceAgentStream(getForgeVoiceControlRequest()).catch(() => {}),
+              captureTeardown,
+            ]);
+            await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
+            forgeVoiceTtsPlayerRef.current = null;
+            return captureResult;
+          })());
         } else {
           const captureResult = await captureTeardown;
           salvageLocalCancelledCapture(captureResult, captureStats);
@@ -9322,11 +9366,12 @@ export function AudioWidgetWindow() {
     if (localPartialSessionIdForCancel) {
       localWhisperPartialSessionIdRef.current = "";
     }
-    // closeWarmBuffer detaches the buffer ref synchronously, so an immediate
-    // new take never races the close running in the background.
-    void closeWarmBuffer().catch(() => {});
+    localWhisperPartialHistoryIdRef.current = "";
+    localWhisperPartialFailedRef.current = false;
+    localWhisperPartialTextRef.current = "";
     resetWidgetToStartState();
-    void (async () => {
+    trackAudioCaptureTeardown((async () => {
+      await closeWarmBuffer().catch(() => {});
       if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
         await invoke("stop_deepgram_realtime_transcription").catch(() => {});
       } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE) {
@@ -9340,11 +9385,10 @@ export function AudioWidgetWindow() {
           await cancelLocalWhisperPartialTranscription({
             sessionId: localPartialSessionIdForCancel,
           }).catch(() => {});
-        } else {
-          await invoke("cancel_whisper_transcription").catch(() => {});
         }
+        await invoke("cancel_whisper_transcription").catch(() => {});
       }
-    })();
+    })());
   }, [closeWarmBuffer, getForgeVoiceControlRequest, publishCancelledTranscript, recordingStartedAt, resetWidgetToStartState, salvageLocalCancelledCapture, showCancelNotice, trackAudioCaptureTeardown]);
 
   // "Finish and paste" from the bottom bar: stop the active take (locked or
@@ -9962,10 +10006,19 @@ export function AudioWidgetWindow() {
     }
 
     if (payload?.pressed || payload?.phase === "pressed") {
+      if (suppressPushToTalkUntilReleaseRef.current) {
+        return;
+      }
       handleRecorderShortcutPressed();
       return;
     }
 
+    if (suppressPushToTalkUntilReleaseRef.current) {
+      suppressPushToTalkUntilReleaseRef.current = false;
+      pushToTalkDownRef.current = false;
+      stopAfterStartRef.current = false;
+      return;
+    }
     handleRecorderShortcutReleased();
   }, [clearHybridPendingDiscard, handleRecorderShortcutPressed, handleRecorderShortcutReleased]);
 
@@ -10043,6 +10096,11 @@ export function AudioWidgetWindow() {
       }
 
       event.preventDefault();
+      if (suppressPushToTalkUntilReleaseRef.current) {
+        event.stopPropagation();
+        event.stopImmediatePropagation?.();
+        return;
+      }
       handleRecorderShortcutPressed();
     };
 
@@ -10052,6 +10110,14 @@ export function AudioWidgetWindow() {
       }
 
       event.preventDefault();
+      if (suppressPushToTalkUntilReleaseRef.current) {
+        event.stopPropagation();
+        event.stopImmediatePropagation?.();
+        suppressPushToTalkUntilReleaseRef.current = false;
+        pushToTalkDownRef.current = false;
+        stopAfterStartRef.current = false;
+        return;
+      }
       handleRecorderShortcutReleased();
     };
 
@@ -10115,7 +10181,10 @@ export function AudioWidgetWindow() {
           return;
         }
 
-        if (status.pressed || status.phase === "pressed") {
+        if (
+          (status.pressed || status.phase === "pressed")
+          && !suppressPushToTalkUntilReleaseRef.current
+        ) {
           handleRecorderShortcutPressed();
         }
       })
@@ -10305,7 +10374,9 @@ export function AudioWidgetWindow() {
         onClick={(event) => {
           event.preventDefault();
           event.stopPropagation();
-          dismissCancelNotice();
+          if (event.detail === 0) {
+            dismissCancelNotice();
+          }
         }}
         onMouseDown={(event) => {
           event.preventDefault();
@@ -10314,6 +10385,7 @@ export function AudioWidgetWindow() {
         onPointerDown={(event) => {
           event.preventDefault();
           event.stopPropagation();
+          dismissCancelNotice();
         }}
         title="Dismiss now"
         type="button"
@@ -10427,7 +10499,9 @@ export function AudioWidgetWindow() {
                 onClick={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
-                  cancelRecording();
+                  if (event.detail === 0) {
+                    cancelRecording();
+                  }
                 }}
                 onMouseDown={(event) => {
                   event.preventDefault();
@@ -10436,6 +10510,7 @@ export function AudioWidgetWindow() {
                 onPointerDown={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
+                  cancelRecording();
                 }}
                 title="Cancel: stop without pasting. The transcript is still saved to History."
                 type="button"
@@ -10563,7 +10638,9 @@ export function AudioWidgetWindow() {
             onClick={(event) => {
               event.preventDefault();
               event.stopPropagation();
-              cancelRecording();
+              if (event.detail === 0) {
+                cancelRecording();
+              }
             }}
             onMouseDown={(event) => {
               event.preventDefault();
@@ -10572,6 +10649,7 @@ export function AudioWidgetWindow() {
             onPointerDown={(event) => {
               event.preventDefault();
               event.stopPropagation();
+              cancelRecording();
             }}
             title="Cancel (transcript is saved to history)"
             type="button"
