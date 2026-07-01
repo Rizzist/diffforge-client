@@ -22,6 +22,9 @@ for (const key of ["log", "info", "debug", "warn"]) {
 
 function emit(obj) {
   process.stdout.write(JSON.stringify(obj));
+  if (obj?.ok === false) {
+    process.exitCode = 1;
+  }
 }
 
 async function main() {

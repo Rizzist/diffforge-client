@@ -2088,6 +2088,15 @@ struct TerminalPromptSubmittedPayload {
     prompt: String,
 }
 
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct TerminalActivityHookPromptOption {
+    id: String,
+    label: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<String>,
+}
+
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct TerminalActivityHookPayload {
@@ -2133,12 +2142,20 @@ struct TerminalActivityHookPayload {
     cwd: Option<String>,
     user_message: Option<String>,
     message: Option<String>,
+    live_text_delta: Option<String>,
+    live_text_snapshot: Option<String>,
+    live_text_kind: Option<String>,
     tool_name: Option<String>,
     tool_use_id: Option<String>,
     approval_id: Option<String>,
     permission_prompt_id: Option<String>,
     permission_request_id: Option<String>,
     permission_mode: Option<String>,
+    prompt_id: Option<String>,
+    prompt_kind: Option<String>,
+    prompt_default_option: Option<String>,
+    prompt_ttl_ms: Option<u64>,
+    prompt_options: Vec<TerminalActivityHookPromptOption>,
     manual_prompt_source: Option<String>,
     manual_approval_required: bool,
     provider_blocked_for_user: bool,
@@ -4649,16 +4666,7 @@ async fn close_app_after_terminal_shutdown(
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
     let window_label = window.label().to_string();
-    let _ = begin_app_shutdown();
-    let force_exit_result = schedule_app_force_exit(app.clone(), window_label.clone());
-
-    if APP_CLOSE_SHUTDOWN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        return force_exit_result;
-    }
-
-    run_backend_app_shutdown(app, window_label).await;
-
-    force_exit_result
+    start_backend_app_shutdown(app, window_label)
 }
 
 fn start_backend_app_shutdown(app: AppHandle, window_label: String) -> Result<(), String> {
@@ -5307,6 +5315,7 @@ pub fn run() {
             pcb_document_read,
             pcb_document_create,
             pcb_document_delete,
+            pcb_vendor_fetch,
             pcb_watch_start,
             pcb_panel_open,
             pcb_panel_focus,

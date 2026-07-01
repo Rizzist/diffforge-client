@@ -3897,6 +3897,27 @@ fn agent_thread_cloud_artifacts(value: &Value) -> Vec<CodexThreadTranscriptArtif
         .unwrap_or_default()
 }
 
+fn agent_thread_cloud_message_role(value: &Value, fallback_kind: &str) -> String {
+    let role = cloud_mcp_payload_text(value, &["role"])
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if matches!(role.as_str(), "assistant" | "user" | "system" | "tool" | "activity") {
+        return role;
+    }
+    let kind = fallback_kind.trim().to_ascii_lowercase();
+    if kind.contains("terminal")
+        || kind.contains("termout")
+        || kind.contains("output")
+        || kind.contains("stdout")
+        || kind.contains("stderr")
+        || kind.contains("log")
+    {
+        return "activity".to_string();
+    }
+    "activity".to_string()
+}
+
 fn agent_thread_cloud_message_from_value(
     value: &Value,
     agent_id: &str,
@@ -3910,7 +3931,7 @@ fn agent_thread_cloud_message_from_value(
             message.id = fallback_id.clone();
         }
         if message.role.trim().is_empty() {
-            message.role = "assistant".to_string();
+            message.role = agent_thread_cloud_message_role(value, &message.kind);
         }
         if message.kind.trim().is_empty() {
             message.kind = "message".to_string();
@@ -3940,10 +3961,11 @@ fn agent_thread_cloud_message_from_value(
         return None;
     }
 
+    let role = agent_thread_cloud_message_role(value, &kind);
     Some(CodexThreadTranscriptMessage {
         id: cloud_mcp_payload_text(value, &["id", "messageId", "message_id"])
             .unwrap_or(fallback_id),
-        role: cloud_mcp_payload_text(value, &["role"]).unwrap_or_else(|| "assistant".to_string()),
+        role,
         kind,
         text,
         title,

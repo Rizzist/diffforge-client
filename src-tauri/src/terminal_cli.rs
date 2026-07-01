@@ -1668,6 +1668,83 @@ fn claude_write_authority_guard_settings(
                     ]
                 }
             ],
+            "PostToolUseFailure": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "PostToolBatch": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "PermissionRequest": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "PermissionDenied": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "Notification": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "Elicitation": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "ElicitationResult": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
             "SubagentStart": [
                 {
                     "hooks": [
@@ -2125,10 +2202,20 @@ fn ensure_codex_activity_hooks(value: &mut Value, scoped_command: &str) -> usize
     let mut added = 0usize;
     for event_name in [
         "UserPromptSubmit",
+        "MessageDisplay",
+        "PreCompact",
+        "PostCompact",
         "Stop",
+        "StopFailure",
         "PreToolUse",
         "PostToolUse",
+        "PostToolUseFailure",
+        "PostToolBatch",
         "PermissionRequest",
+        "PermissionDenied",
+        "Notification",
+        "Elicitation",
+        "ElicitationResult",
         "SubagentStart",
         "SubagentStop",
     ] {
@@ -2913,6 +3000,12 @@ fn diff_forge_activity_hook_record(
             .cloned()
             .unwrap_or(Value::Null)
     };
+    let tool_value = |keys: &[&str]| -> Value {
+        keys.iter()
+            .find_map(|key| tool_input.get(*key))
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
     let hook_text_value = |keys: &[&str]| -> String {
         keys.iter()
             .find_map(|key| {
@@ -2960,7 +3053,7 @@ fn diff_forge_activity_hook_record(
         tool_string(&["agent_type", "agentType", "subagent_type", "subagentType"]),
     ]);
     let agent_transcript_path = hook_string(&["agent_transcript_path", "agentTranscriptPath"]);
-    let last_message = hook_string(&[
+    let last_message = hook_text_value(&[
         "last_assistant_message",
         "lastAssistantMessage",
         "last_message",
@@ -3035,8 +3128,28 @@ fn diff_forge_activity_hook_record(
         tool_string(&["permission_prompt_id", "permissionPromptId"]),
     ]);
     let permission_request_id = first_string(vec![
-        hook_string(&["permission_request_id", "permissionRequestId"]),
-        tool_string(&["permission_request_id", "permissionRequestId"]),
+        hook_string(&[
+            "permission_request_id",
+            "permissionRequestId",
+            "prompt_id",
+            "promptId",
+            "question_id",
+            "questionId",
+            "selection_id",
+            "selectionId",
+            "id",
+        ]),
+        tool_string(&[
+            "permission_request_id",
+            "permissionRequestId",
+            "prompt_id",
+            "promptId",
+            "question_id",
+            "questionId",
+            "selection_id",
+            "selectionId",
+            "id",
+        ]),
     ]);
     let permission_status = first_string(vec![
         hook_string(&["permission_status", "permissionStatus"]),
@@ -3084,12 +3197,22 @@ fn diff_forge_activity_hook_record(
             "promptingUserText",
             "prompting_text",
             "promptingText",
+            "question",
+            "title",
+            "description",
+            "message",
+            "prompt",
         ]),
         tool_string(&[
             "prompting_user_text",
             "promptingUserText",
             "prompting_text",
             "promptingText",
+            "question",
+            "title",
+            "description",
+            "message",
+            "prompt",
         ]),
     ]);
     let manual_approval_required =
@@ -3126,6 +3249,95 @@ fn diff_forge_activity_hook_record(
     let stop_hook_active = hook_bool(&["stopHookActive", "stop_hook_active"]);
     let background_tasks = hook_value(&["backgroundTasks", "background_tasks"]);
     let session_crons = hook_value(&["sessionCrons", "session_crons"]);
+    let prompt_options = {
+        let value = hook_value(&[
+            "promptOptions",
+            "prompt_options",
+            "options",
+            "choices",
+            "actions",
+            "decisions",
+        ]);
+        if value.is_null() {
+            tool_value(&[
+                "promptOptions",
+                "prompt_options",
+                "options",
+                "choices",
+                "actions",
+                "decisions",
+            ])
+        } else {
+            value
+        }
+    };
+    let prompt_default_option = first_string(vec![
+        hook_string(&[
+            "promptDefaultOption",
+            "prompt_default_option",
+            "defaultOption",
+            "default_option",
+            "defaultDecision",
+            "default_decision",
+            "default",
+        ]),
+        tool_string(&[
+            "promptDefaultOption",
+            "prompt_default_option",
+            "defaultOption",
+            "default_option",
+            "defaultDecision",
+            "default_decision",
+            "default",
+        ]),
+    ]);
+    let prompt_ttl_ms = {
+        let value = hook_value(&[
+            "promptTtlMs",
+            "prompt_ttl_ms",
+            "ttlMs",
+            "ttl_ms",
+            "timeoutMs",
+            "timeout_ms",
+        ]);
+        if value.is_null() {
+            tool_value(&[
+                "promptTtlMs",
+                "prompt_ttl_ms",
+                "ttlMs",
+                "ttl_ms",
+                "timeoutMs",
+                "timeout_ms",
+            ])
+        } else {
+            value
+        }
+    };
+    let prompt_ttl_ms_string = first_string(vec![
+        hook_string(&[
+            "promptTtlMs",
+            "prompt_ttl_ms",
+            "ttlMs",
+            "ttl_ms",
+            "timeoutMs",
+            "timeout_ms",
+        ]),
+        tool_string(&[
+            "promptTtlMs",
+            "prompt_ttl_ms",
+            "ttlMs",
+            "ttl_ms",
+            "timeoutMs",
+            "timeout_ms",
+        ]),
+    ]);
+    let prompt_ttl_ms_value = if !prompt_ttl_ms.is_null() {
+        prompt_ttl_ms.clone()
+    } else if prompt_ttl_ms_string.trim().is_empty() {
+        Value::Null
+    } else {
+        Value::String(prompt_ttl_ms_string)
+    };
     let plan_update = diff_forge_native_plan_update(&tool_name, tool_input, hook_input);
     json!({
         "timestampMs": current_time_ms(),
@@ -3146,7 +3358,8 @@ fn diff_forge_activity_hook_record(
         "agentType": agent_type,
         "agentTranscriptPath": agent_transcript_path,
         "assistantMessage": assistant_message,
-        "lastMessage": last_message,
+        "lastMessage": last_message.clone(),
+        "lastAssistantMessage": last_message,
         "message": display_message,
         "prompt": user_prompt.clone(),
         "toolName": tool_name,
@@ -3163,6 +3376,12 @@ fn diff_forge_activity_hook_record(
         "promptingUserKind": prompting_user_kind,
         "promptingUserSource": prompting_user_source,
         "promptingUserText": prompting_user_text,
+        "promptOptions": prompt_options.clone(),
+        "prompt_options": prompt_options,
+        "promptDefaultOption": prompt_default_option.clone(),
+        "prompt_default_option": prompt_default_option,
+        "promptTtlMs": prompt_ttl_ms_value.clone(),
+        "prompt_ttl_ms": prompt_ttl_ms_value,
         "manualApprovalRequired": manual_approval_required,
         "providerBlockedForUser": provider_blocked_for_user,
         "requiresUserInput": requires_user_input,
@@ -3202,6 +3421,45 @@ mod terminal_cli_tests {
         // Known vision + unknown models.
         assert_eq!(opencode_model_supports_images("gpt-4o"), Some(true));
         assert_eq!(opencode_model_supports_images("glm-5.2"), None);
+    }
+
+    #[test]
+    fn activity_hook_record_preserves_prompt_options() {
+        let record = diff_forge_activity_hook_record(
+            "opencode",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hookEventName": "UserPromptRequired",
+                "prompting_user_kind": "selection",
+                "prompting_user_text": "Choose what to do",
+                "prompt_default_option": "Use existing config",
+                "prompt_ttl_ms": 45000,
+                "prompt_options": [
+                    { "value": "Use existing config", "label": "Use existing config" },
+                    { "value": "Create-new", "label": "Create new" }
+                ]
+            }),
+        );
+
+        assert_eq!(
+            record.get("promptingUserKind").and_then(Value::as_str),
+            Some("selection")
+        );
+        assert_eq!(
+            record.get("promptDefaultOption").and_then(Value::as_str),
+            Some("Use existing config")
+        );
+        assert_eq!(record.get("promptTtlMs").and_then(Value::as_u64), Some(45000));
+        assert_eq!(
+            record
+                .get("promptOptions")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(2)
+        );
     }
 
     #[test]
@@ -4073,6 +4331,12 @@ export const DiffForgeActivityPlugin = async () => {
         tool_use_id: (input && input.callID) || "",
         tool_name: (input && input.type) || "",
         description: (input && input.title) || "",
+        prompt_default_option: "deny",
+        prompt_options: [
+          ["allow_once", "Allow once"],
+          ["deny", "Deny"],
+          ["park", "Park todo"]
+        ],
       });
     },
     event: async ({ event }) => {
@@ -4126,6 +4390,25 @@ export const DiffForgeActivityPlugin = async () => {
           tool_use_id: props.callID || props.toolCallID || "",
           tool_name: props.type || props.tool || "",
           description: props.title || props.description || "",
+          prompt_default_option: "deny",
+          prompt_options: [
+            ["allow_once", "Allow once"],
+            ["deny", "Deny"],
+            ["park", "Park todo"]
+          ],
+        });
+      }
+      if (type === "question.ask" || type === "question.asked" || type === "selection.ask" || type === "selection.asked") {
+        const promptId = props.id || props.questionID || props.questionId || props.promptID || props.promptId || props.selectionID || props.selectionId || "";
+        emit({
+          hook_event_name: "UserPromptRequired",
+          session_id: sessionId,
+          requires_user_input: true,
+          provider_blocked_for_user: true,
+          permission_request_id: promptId || (sessionId ? `${type}:${sessionId}:${Date.now()}` : `${type}:${Date.now()}`),
+          prompting_user_kind: type.startsWith("selection.") ? "selection" : "question",
+          prompting_user_text: props.title || props.question || props.description || "",
+          prompt_options: props.options || props.choices || props.actions || [],
         });
       }
       if (type === "session.idle") {

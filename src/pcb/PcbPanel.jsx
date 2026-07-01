@@ -33,7 +33,10 @@ const PCB_PARTS_ENGINE_FETCH_HOSTS = new Set([
   "modelcdn.tscircuit.com",
   "kicad-mod-cache.tscircuit.com",
 ]);
-const PCB_PARTS_ENGINE_CACHE_PREFIX = "diffforge:pcb:parts-engine:v1:";
+const PCB_PARTS_ENGINE_CACHE_PREFIX = "diffforge:pcb:parts-engine:v2:";
+const PCB_VENDOR_RESPONSE_CACHE_PREFIX = "diffforge:pcb:vendor-response:v1:";
+const PCB_VENDOR_RESPONSE_CACHE_MAX_CHARS = 1_500_000;
+const PCB_EASYEDA_PROXY_ENDPOINT_URL = "https://easyeda.com/api/diffforge-proxy";
 const PCB_PARTS_ENGINE_FETCH_RETRY_SYMBOL = Symbol.for("diffforge.pcb.partsEngineFetchRetry");
 const PCB_EVAL_WORKER_POLYFILL_SOURCE = `
 (function () {
@@ -158,8 +161,211 @@ function isPcbPartsEngineFetch(input) {
   }
 }
 
+function shouldPreferNativePcbPartsEngineFetch(input) {
+  const inputUrl = getFetchInputUrl(input);
+  if (!inputUrl) {
+    return false;
+  }
+  try {
+    const url = new URL(inputUrl, window.location.href);
+    return url.hostname === "easyeda.com" && url.pathname.startsWith("/api/");
+  } catch {
+    return false;
+  }
+}
+
 function shouldRetryPcbPartsEngineResponse(response) {
   return response?.status === 408 || response?.status === 425 || response?.status === 429 || response?.status >= 500;
+}
+
+function mergeFetchHeaders(input, init) {
+  const headers = {};
+  try {
+    if (input && typeof input === "object" && input.headers) {
+      new Headers(input.headers).forEach((value, key) => {
+        headers[key] = value;
+      });
+    }
+  } catch {}
+  try {
+    if (init?.headers) {
+      new Headers(init.headers).forEach((value, key) => {
+        headers[key] = value;
+      });
+    }
+  } catch {}
+  return headers;
+}
+
+function getHeaderValue(headers, name) {
+  const wanted = String(name || "").toLowerCase();
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (String(key).toLowerCase() === wanted) {
+      return value;
+    }
+  }
+  return "";
+}
+
+function deleteHeader(headers, name) {
+  const wanted = String(name || "").toLowerCase();
+  for (const key of Object.keys(headers || {})) {
+    if (String(key).toLowerCase() === wanted) {
+      delete headers[key];
+    }
+  }
+}
+
+function setHeaderIfPresent(headers, name, value) {
+  if (value == null || value === "") {
+    return;
+  }
+  headers[name] = value;
+}
+
+async function getNativeFetchBody(init) {
+  const body = init?.body;
+  if (body == null) {
+    return undefined;
+  }
+  if (typeof body === "string") {
+    return body;
+  }
+  if (body instanceof URLSearchParams) {
+    return body.toString();
+  }
+  if (body instanceof Blob) {
+    return body.text();
+  }
+  if (body instanceof ArrayBuffer) {
+    return new TextDecoder().decode(body);
+  }
+  if (ArrayBuffer.isView(body)) {
+    return new TextDecoder().decode(body);
+  }
+  return String(body);
+}
+
+function normalizePcbVendorFetchRequest({ body, headers, method, url }) {
+  const requestHeaders = { ...(headers || {}) };
+  const targetUrl = getHeaderValue(requestHeaders, "x-target-url");
+  if (targetUrl) {
+    const senderOrigin = getHeaderValue(requestHeaders, "x-sender-origin");
+    const senderReferer = getHeaderValue(requestHeaders, "x-sender-referer");
+    const senderUserAgent = getHeaderValue(requestHeaders, "x-sender-user-agent");
+    const senderCookie = getHeaderValue(requestHeaders, "x-sender-cookie");
+    deleteHeader(requestHeaders, "x-target-url");
+    deleteHeader(requestHeaders, "x-sender-origin");
+    deleteHeader(requestHeaders, "x-sender-host");
+    deleteHeader(requestHeaders, "x-sender-referer");
+    deleteHeader(requestHeaders, "x-sender-user-agent");
+    deleteHeader(requestHeaders, "x-sender-cookie");
+    setHeaderIfPresent(requestHeaders, "origin", senderOrigin);
+    setHeaderIfPresent(requestHeaders, "referer", senderReferer);
+    setHeaderIfPresent(requestHeaders, "user-agent", senderUserAgent);
+    setHeaderIfPresent(requestHeaders, "cookie", senderCookie);
+  }
+  return {
+    body,
+    headers: requestHeaders,
+    method,
+    url: targetUrl || url,
+  };
+}
+
+async function createPcbVendorFetchRequest(input, init) {
+  return normalizePcbVendorFetchRequest({
+    body: await getNativeFetchBody(init),
+    headers: mergeFetchHeaders(input, init),
+    method: init?.method || input?.method || "GET",
+    url: getFetchInputUrl(input),
+  });
+}
+
+function shouldCachePcbVendorResponse(request) {
+  try {
+    const url = new URL(request?.url || "", window.location.href);
+    if (url.hostname === "easyeda.com" && url.pathname.startsWith("/api/")) {
+      return true;
+    }
+    return url.hostname === "jlcsearch.tscircuit.com";
+  } catch {
+    return false;
+  }
+}
+
+function getPcbVendorResponseCacheKey(request) {
+  if (!shouldCachePcbVendorResponse(request)) {
+    return "";
+  }
+  const method = String(request?.method || "GET").toUpperCase();
+  if (method !== "GET" && method !== "POST") {
+    return "";
+  }
+  return `${PCB_VENDOR_RESPONSE_CACHE_PREFIX}${hashString([
+    method,
+    request.url || "",
+    request.body || "",
+  ].join("\0"))}`;
+}
+
+function readPcbVendorResponseCache(cacheKey) {
+  if (!cacheKey || typeof window === "undefined") {
+    return null;
+  }
+  try {
+    const cached = window.localStorage.getItem(cacheKey);
+    if (!cached) {
+      return null;
+    }
+    const parsed = JSON.parse(cached);
+    if (!parsed || typeof parsed.body !== "string") {
+      return null;
+    }
+    return new Response(parsed.body, {
+      headers: parsed.headers || {},
+      status: parsed.status || 200,
+      statusText: parsed.statusText || "OK",
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function cachePcbVendorResponse(cacheKey, response) {
+  if (!cacheKey || !response?.ok || typeof window === "undefined") {
+    return;
+  }
+  try {
+    const responseBody = await response.clone().text();
+    if (responseBody.length > PCB_VENDOR_RESPONSE_CACHE_MAX_CHARS) {
+      return;
+    }
+    const headers = {};
+    response.headers?.forEach?.((value, key) => {
+      headers[key] = value;
+    });
+    window.localStorage.setItem(cacheKey, JSON.stringify({
+      body: responseBody,
+      createdAt: Date.now(),
+      headers,
+      status: response.status,
+      statusText: response.statusText,
+    }));
+  } catch {
+    // Vendor response caching is an optimization; fetch failure handling below is the source of truth.
+  }
+}
+
+async function fetchPcbPartsEngineViaNativeRequest(request) {
+  const nativeResponse = await invoke("pcb_vendor_fetch", {
+    request,
+  });
+  return new Response(nativeResponse?.body || "", {
+    headers: nativeResponse?.headers || {},
+    status: nativeResponse?.status || 200,
+    statusText: nativeResponse?.statusText || "",
+  });
 }
 
 function installPcbPartsEngineFetchRetry() {
@@ -175,20 +381,43 @@ function installPcbPartsEngineFetchRetry() {
       return originalFetch(input, init);
     }
 
+    const nativeRequest = await createPcbVendorFetchRequest(input, init);
+    const vendorResponseCacheKey = getPcbVendorResponseCacheKey(nativeRequest);
+    const rememberResponse = async (response) => {
+      await cachePcbVendorResponse(vendorResponseCacheKey, response);
+      return response;
+    };
     let lastError = null;
+    const preferNativeFetch = shouldPreferNativePcbPartsEngineFetch(input);
     for (let attempt = 0; attempt <= PCB_PARTS_ENGINE_FETCH_RETRY_DELAYS_MS.length; attempt += 1) {
       try {
-        const response = await originalFetch(input, init);
+        const response = preferNativeFetch
+          ? await fetchPcbPartsEngineViaNativeRequest(nativeRequest)
+          : await originalFetch(input, init);
         if (!shouldRetryPcbPartsEngineResponse(response) || attempt === PCB_PARTS_ENGINE_FETCH_RETRY_DELAYS_MS.length) {
-          return response;
+          return rememberResponse(response);
         }
       } catch (error) {
         lastError = error;
+        if (!preferNativeFetch) {
+          try {
+            const nativeResponse = await fetchPcbPartsEngineViaNativeRequest(nativeRequest);
+            if (!shouldRetryPcbPartsEngineResponse(nativeResponse) || attempt === PCB_PARTS_ENGINE_FETCH_RETRY_DELAYS_MS.length) {
+              return rememberResponse(nativeResponse);
+            }
+          } catch (nativeError) {
+            lastError = nativeError;
+          }
+        }
         if (attempt === PCB_PARTS_ENGINE_FETCH_RETRY_DELAYS_MS.length) {
           break;
         }
       }
       await sleep(PCB_PARTS_ENGINE_FETCH_RETRY_DELAYS_MS[attempt]);
+    }
+    const cachedResponse = readPcbVendorResponseCache(vendorResponseCacheKey);
+    if (cachedResponse) {
+      return cachedResponse;
     }
     throw lastError ?? new Error(`PCB parts engine fetch failed for ${getFetchInputUrl(input) || "unknown URL"}`);
   };
@@ -246,6 +475,29 @@ function createPcbPartsEngineLocalCache(fsMap) {
       } catch {}
     },
   };
+}
+
+function summarizeCircuitJsonIssues(circuitJson) {
+  const errors = [];
+  const warnings = [];
+  for (const element of normalizeCircuitJsonPayload(circuitJson)) {
+    const type = typeof element?.type === "string" ? element.type : "";
+    if (/_error$/.test(type)) {
+      errors.push(element);
+    } else if (/_warning$/.test(type)) {
+      warnings.push(element);
+    }
+  }
+  return { errors, warnings };
+}
+
+function formatCircuitJsonIssueSummary(label, issues) {
+  if (!issues.length) {
+    return "";
+  }
+  const firstMessage = issues[0]?.message || issues[0]?.error || issues[0]?.type || "No message";
+  const suffix = issues.length === 1 ? "" : ` and ${issues.length - 1} more`;
+  return `${label}: ${firstMessage}${suffix}`;
 }
 
 function serializeJavaScriptLiteral(value) {
@@ -756,6 +1008,12 @@ const RenderErrorBanner = styled.div`
   font-size: 11px;
   line-height: 1.35;
   box-shadow: 0 12px 28px rgba(15, 23, 42, 0.12);
+
+  &[data-tone="warning"] {
+    border-color: rgba(245, 158, 11, 0.3);
+    background: rgba(255, 251, 235, 0.96);
+    color: #92400e;
+  }
 `;
 
 const PanelMessage = styled.div`
@@ -793,6 +1051,7 @@ export default function PcbPanel({
   const [solverEvents, setSolverEvents] = useState([]);
   const [renderStatus, setRenderStatus] = useState("idle");
   const [renderError, setRenderError] = useState("");
+  const [renderWarning, setRenderWarning] = useState("");
   const [status, setStatus] = useState("loading");
   const [error, setError] = useState("");
   const readSeqRef = useRef(0);
@@ -878,6 +1137,7 @@ export default function PcbPanel({
         setCircuitJson(null);
         setRenderLog(null);
         setRenderError("");
+        setRenderWarning("");
         setSolverEvents([]);
         setRenderStatus("idle");
         setStatus("ready");
@@ -898,6 +1158,7 @@ export default function PcbPanel({
     setCircuitJson(null);
     setRenderLog(null);
     setRenderError("");
+    setRenderWarning("");
     setSolverEvents([]);
     setRenderStatus("idle");
     readSource();
@@ -930,8 +1191,10 @@ export default function PcbPanel({
       if (!isCurrent()) {
         return;
       }
+      let latestCircuitJson = null;
       setCircuitJson(null);
       setRenderError("");
+      setRenderWarning("");
       setRenderLog({
         debugOutputs: [],
         eventsProcessed: 0,
@@ -947,12 +1210,15 @@ export default function PcbPanel({
           "preparing PCB renderer worker",
         );
         worker = await withTimeout(createCircuitWebWorker({
+          easyEdaProxyConfig: {
+            proxyEndpointUrl: PCB_EASYEDA_PROXY_ENDPOINT_URL,
+          },
+          enableFetchProxy: true,
           projectConfig: {
             ...(partsEngineLocalCache ? { localCacheEngine: partsEngineLocalCache } : {}),
             projectBaseUrl: normalizedRepoPath || repoPath || "",
           },
           verbose: false,
-          enableFetchProxy: true,
           webWorkerBlobUrl: patchedEvalWorkerBlobUrl,
         }), "starting PCB renderer worker");
         const workerErrorPromise = new Promise((_, reject) => {
@@ -1008,8 +1274,9 @@ export default function PcbPanel({
         }), "executing PCB source");
         const settled = runWorkerStep(worker.renderUntilSettled(), "settling PCB render");
         const initialCircuitJson = await runWorkerStep(worker.getCircuitJson(), "reading initial PCB JSON");
+        latestCircuitJson = normalizeCircuitJsonPayload(initialCircuitJson);
         if (isCurrent()) {
-          setCircuitJson(normalizeCircuitJsonPayload(initialCircuitJson));
+          setCircuitJson(latestCircuitJson);
           updateRenderLog((previous) => ({
             ...previous,
             progress: Math.max(previous.progress || 0, 0.55),
@@ -1017,10 +1284,19 @@ export default function PcbPanel({
         }
         await settled;
         const finalCircuitJson = await runWorkerStep(worker.getCircuitJson(), "reading final PCB JSON");
+        latestCircuitJson = normalizeCircuitJsonPayload(finalCircuitJson);
+        const finalIssues = summarizeCircuitJsonIssues(latestCircuitJson);
         if (isCurrent()) {
-          setCircuitJson(normalizeCircuitJsonPayload(finalCircuitJson));
-          setRenderStatus("ready");
-          setRenderError("");
+          setCircuitJson(latestCircuitJson);
+          if (finalIssues.errors.length > 0) {
+            setRenderStatus("error");
+            setRenderError(formatCircuitJsonIssueSummary("PCB design error", finalIssues.errors));
+            setRenderWarning("");
+          } else {
+            setRenderStatus("ready");
+            setRenderError("");
+            setRenderWarning(formatCircuitJsonIssueSummary("PCB design warning", finalIssues.warnings));
+          }
           updateRenderLog((previous) => ({
             ...previous,
             progress: 1,
@@ -1028,8 +1304,15 @@ export default function PcbPanel({
         }
       } catch (err) {
         if (isCurrent()) {
-          setRenderError(getErrorMessage(err));
-          setRenderStatus("error");
+          if (latestCircuitJson?.length) {
+            setCircuitJson(latestCircuitJson);
+            setRenderWarning(`Partial PCB render: ${getErrorMessage(err)}`);
+            setRenderStatus("ready");
+          } else {
+            setRenderError(getErrorMessage(err));
+            setRenderWarning("");
+            setRenderStatus("error");
+          }
           updateRenderLog((previous) => ({
             ...previous,
             progress: previous.progress || 1,
@@ -1157,13 +1440,13 @@ export default function PcbPanel({
           <PanelMessage>Rendering board…</PanelMessage>
         ) : (
           <RunFrameSurface>
-            {renderError ? (
-              <RenderErrorBanner>
-                PCB renderer warning: {renderError}
+            {renderError || renderWarning ? (
+              <RenderErrorBanner data-tone={renderError ? "error" : "warning"}>
+                {renderError ? "PCB renderer error" : "PCB renderer warning"}: {renderError || renderWarning}
               </RenderErrorBanner>
             ) : null}
             <PreviewFrame
-              key={`${boardPath}:${activeTab}:${circuitJson.length}:${renderStatus}:${renderError}`}
+              key={`${boardPath}:${activeTab}:${circuitJson.length}:${renderStatus}:${renderError}:${renderWarning}`}
               srcDoc={previewSrcDoc}
               title={`${board?.name || "PCB"} renderer`}
             />

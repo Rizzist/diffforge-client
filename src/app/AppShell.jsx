@@ -929,7 +929,14 @@ import {
   WORKSPACE_TOOL_DOC_DRAG_MIME,
 } from "../tools/workspaceToolDragTypes.js";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
-import WebWorkspaceView from "../web/WebWorkspaceView.jsx";
+import WebWorkspaceView, { workspaceWebTabPaneId } from "../web/WebWorkspaceView.jsx";
+import { DEFAULT_WEB_URL, normalizeWebInput } from "../web/webNative.js";
+import {
+  WEB_PANEL_CLOSED_EVENT,
+  WEB_PANEL_CONTROL_EVENT,
+  WEB_PANEL_CONTROL_NAVIGATE,
+  WEB_PANEL_CONTROL_RETURN,
+} from "../web/webPanelBridge.js";
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AppSelect from "./AppSelect.jsx";
 import AccountAssetsView from "../assets/AccountAssetsView.jsx";
@@ -2044,6 +2051,24 @@ function permissionStatusLabel(known, ready, readyLabel = "Ready", attentionLabe
 
 function normalizeRemoteCommandName(value) {
   return String(value || "").trim().toLowerCase().replace(/[.\s-]+/g, "_");
+}
+
+function normalizeWorkspaceWebTabSessionUrl(value) {
+  return normalizeWebInput(value) || String(value || "").trim() || DEFAULT_WEB_URL;
+}
+
+function isWorkspaceWebTabPaneId(value) {
+  return String(value || "").trim().startsWith("workspace-web-tab-");
+}
+
+function findWorkspaceWebTabPaneIdByLabel(sessions, label) {
+  const safeLabel = String(label || "").trim();
+  if (!safeLabel || !sessions || typeof sessions !== "object") {
+    return "";
+  }
+  return Object.entries(sessions).find(([, session]) => (
+    String(session?.popoutLabel || session?.label || "").trim() === safeLabel
+  ))?.[0] || "";
 }
 
 function normalizeWorkspaceTabId(value) {
@@ -21433,6 +21458,7 @@ export default function App() {
   const [workspaceGraphState, setWorkspaceGraphState] = useState({});
   const [workspaceArchitectureTerminalActivity, setWorkspaceArchitectureTerminalActivity] = useState({});
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
+  const [workspaceWebTabSessions, setWorkspaceWebTabSessions] = useState({});
   const [spaceMode, setSpaceMode] = useState(APP_SPACE_MODE_DEFAULT);
   const [loopspaces, setLoopspaces] = useState(readLoopspaces);
   const [selectedLoopspaceId, setSelectedLoopspaceId] = useState("");
@@ -21516,6 +21542,8 @@ export default function App() {
   const [workspaceToolLayoutWidth, setWorkspaceToolLayoutWidth] = useState(0);
   const [workspaceToolRuntimeBridges, setWorkspaceToolRuntimeBridges] = useState({});
   const workspaceToolRuntimeBridgesRef = useRef(workspaceToolRuntimeBridges);
+  const workspaceWebTabSessionsRef = useRef(workspaceWebTabSessions);
+  workspaceWebTabSessionsRef.current = workspaceWebTabSessions;
   useEffect(() => {
     workspaceToolRuntimeBridgesRef.current = workspaceToolRuntimeBridges;
   }, [workspaceToolRuntimeBridges]);
@@ -24888,6 +24916,19 @@ export default function App() {
     };
   }, []);
   const selectedWorkspace = findWorkspaceById(workspaces, selectedWorkspaceId);
+  const selectedWorkspaceWebTabPaneId = selectedWorkspace?.id
+    ? workspaceWebTabPaneId(selectedWorkspace.id)
+    : "";
+  const selectedWorkspaceWebTabSession = selectedWorkspaceWebTabPaneId
+    ? workspaceWebTabSessions[selectedWorkspaceWebTabPaneId] || {
+      currentUrl: DEFAULT_WEB_URL,
+      paneId: selectedWorkspaceWebTabPaneId,
+      poppedOut: false,
+      popoutLabel: "",
+      resumeNonce: 0,
+      workspaceId: selectedWorkspace?.id || "",
+    }
+    : null;
   const accountToolComposerItems = useMemo(
     () => buildAccountToolComposerItems(accountToolItems, selectedWorkspace?.id || ""),
     [accountToolItems, selectedWorkspace?.id],
@@ -25216,6 +25257,310 @@ export default function App() {
       });
     }, VIEW_TRANSITION_MS);
   }, [activeView, visibleView]);
+
+  const setWorkspaceWebTabSession = useCallback((paneId, updater) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return;
+    }
+
+    setWorkspaceWebTabSessions((current) => {
+      const currentSession = current[safePaneId] || {
+        currentUrl: DEFAULT_WEB_URL,
+        paneId: safePaneId,
+        poppedOut: false,
+        popoutLabel: "",
+        resumeNonce: 0,
+        workspaceId: "",
+      };
+      const patch = typeof updater === "function"
+        ? updater(currentSession, current)
+        : updater;
+
+      if (patch === null) {
+        if (!current[safePaneId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[safePaneId];
+        workspaceWebTabSessionsRef.current = next;
+        return next;
+      }
+
+      const patchObject = patch && typeof patch === "object" ? patch : {};
+      const nextSession = {
+        ...currentSession,
+        ...patchObject,
+        currentUrl: normalizeWorkspaceWebTabSessionUrl(
+          patchObject.currentUrl ?? patchObject.url ?? currentSession.currentUrl,
+        ),
+        paneId: safePaneId,
+        poppedOut: patchObject.poppedOut !== undefined
+          ? Boolean(patchObject.poppedOut)
+          : Boolean(currentSession.poppedOut),
+        popoutLabel: String(
+          patchObject.popoutLabel ?? patchObject.label ?? currentSession.popoutLabel ?? "",
+        ).trim(),
+        resumeNonce: Number.isFinite(Number(patchObject.resumeNonce))
+          ? Number(patchObject.resumeNonce)
+          : Number(currentSession.resumeNonce || 0),
+        workspaceId: String(patchObject.workspaceId ?? currentSession.workspaceId ?? "").trim(),
+      };
+      const next = {
+        ...current,
+        [safePaneId]: nextSession,
+      };
+      workspaceWebTabSessionsRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const rememberWorkspaceWebTabUrl = useCallback(({ paneId, url, workspaceId } = {}) => {
+    const safePaneId = String(paneId || "").trim();
+    const safeUrl = normalizeWorkspaceWebTabSessionUrl(url);
+    if (!safePaneId || !safeUrl) {
+      return safeUrl;
+    }
+    setWorkspaceWebTabSession(safePaneId, (current) => ({
+      currentUrl: safeUrl,
+      workspaceId: workspaceId || current.workspaceId || "",
+    }));
+    return safeUrl;
+  }, [setWorkspaceWebTabSession]);
+
+  const clearWorkspaceWebTabBreakout = useCallback((paneId, url = "") => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return;
+    }
+    setWorkspaceWebTabSession(safePaneId, (current) => {
+      const wasPoppedOut = Boolean(current.poppedOut || current.popoutLabel || current.label);
+      return {
+        currentUrl: url ? normalizeWorkspaceWebTabSessionUrl(url) : current.currentUrl,
+        poppedOut: false,
+        popoutLabel: "",
+        resumeNonce: wasPoppedOut ? Number(current.resumeNonce || 0) + 1 : Number(current.resumeNonce || 0),
+        workspaceId: current.workspaceId || "",
+      };
+    });
+  }, [setWorkspaceWebTabSession]);
+
+  const openWorkspaceWebTabPopout = useCallback(async ({ paneId, url, workspaceId } = {}) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return false;
+    }
+    const currentSession = workspaceWebTabSessionsRef.current[safePaneId] || {};
+    const targetUrl = rememberWorkspaceWebTabUrl({
+      paneId: safePaneId,
+      url: url || currentSession.currentUrl || DEFAULT_WEB_URL,
+      workspaceId,
+    });
+    const existingLabel = String(currentSession.popoutLabel || currentSession.label || "").trim();
+
+    if (existingLabel) {
+      try {
+        const focused = await invoke("web_panel_focus", { label: existingLabel });
+        if (focused) {
+          setWorkspaceWebTabSession(safePaneId, {
+            currentUrl: targetUrl,
+            poppedOut: true,
+            popoutLabel: existingLabel,
+            workspaceId,
+          });
+          return true;
+        }
+      } catch {
+        /* stale labels fall through to a fresh open */
+      }
+      clearWorkspaceWebTabBreakout(safePaneId, targetUrl);
+    }
+
+    try {
+      const result = await invoke("web_panel_open", {
+        height: null,
+        paneId: safePaneId,
+        theme: document.documentElement?.dataset?.forgeTheme || "",
+        title: "Web",
+        url: targetUrl,
+        width: null,
+        workspaceId,
+      });
+      const label = String(result?.label || "").trim();
+      setWorkspaceWebTabSession(safePaneId, {
+        currentUrl: targetUrl,
+        poppedOut: true,
+        popoutLabel: label,
+        workspaceId,
+      });
+      return true;
+    } catch {
+      openUrl(targetUrl).catch(() => {
+        window.open(targetUrl, "_blank", "noopener,noreferrer");
+      });
+      return false;
+    }
+  }, [
+    clearWorkspaceWebTabBreakout,
+    rememberWorkspaceWebTabUrl,
+    setWorkspaceWebTabSession,
+  ]);
+
+  const focusWorkspaceWebTabPopout = useCallback(async ({ label, paneId } = {}) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return false;
+    }
+    const currentSession = workspaceWebTabSessionsRef.current[safePaneId] || {};
+    const targetLabel = String(label || currentSession.popoutLabel || currentSession.label || "").trim();
+    if (!targetLabel) {
+      clearWorkspaceWebTabBreakout(safePaneId, currentSession.currentUrl);
+      return false;
+    }
+    try {
+      const focused = await invoke("web_panel_focus", { label: targetLabel });
+      if (!focused) {
+        clearWorkspaceWebTabBreakout(safePaneId, currentSession.currentUrl);
+      }
+      return Boolean(focused);
+    } catch {
+      clearWorkspaceWebTabBreakout(safePaneId, currentSession.currentUrl);
+      return false;
+    }
+  }, [clearWorkspaceWebTabBreakout]);
+
+  const returnWorkspaceWebTabPopout = useCallback(({ label, paneId, url, workspaceId } = {}) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return;
+    }
+    const currentSession = workspaceWebTabSessionsRef.current[safePaneId] || {};
+    const returnUrl = normalizeWorkspaceWebTabSessionUrl(url || currentSession.currentUrl || DEFAULT_WEB_URL);
+    const targetLabel = String(label || currentSession.popoutLabel || currentSession.label || "").trim();
+    clearWorkspaceWebTabBreakout(safePaneId, returnUrl);
+    setWorkspaceWebTabSession(safePaneId, (current) => ({
+      currentUrl: returnUrl,
+      poppedOut: false,
+      popoutLabel: "",
+      resumeNonce: Number(current.resumeNonce || 0),
+      workspaceId: workspaceId || current.workspaceId || "",
+    }));
+    if (targetLabel) {
+      invoke("web_panel_close", { label: targetLabel }).catch(() => {});
+    }
+  }, [clearWorkspaceWebTabBreakout, setWorkspaceWebTabSession]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(WEB_PANEL_CLOSED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      let paneId = String(payload.paneId || payload.pane_id || "").trim();
+      const windowId = String(payload.windowId || payload.window_id || "").trim();
+      if (paneId && !isWorkspaceWebTabPaneId(paneId)) {
+        return;
+      }
+      if (!paneId && windowId) {
+        paneId = findWorkspaceWebTabPaneIdByLabel(workspaceWebTabSessionsRef.current, windowId);
+      }
+      if (!paneId) {
+        return;
+      }
+      clearWorkspaceWebTabBreakout(paneId, payload.url);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [clearWorkspaceWebTabBreakout]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(WEB_PANEL_CONTROL_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const paneId = String(payload.paneId || payload.pane_id || "").trim();
+      if (!isWorkspaceWebTabPaneId(paneId)) {
+        return;
+      }
+      const control = String(payload.control || "").trim();
+      if (control === WEB_PANEL_CONTROL_NAVIGATE) {
+        rememberWorkspaceWebTabUrl({
+          paneId,
+          url: payload.url,
+          workspaceId: payload.workspaceId || payload.workspace_id || "",
+        });
+        return;
+      }
+      if (control === WEB_PANEL_CONTROL_RETURN) {
+        returnWorkspaceWebTabPopout({
+          label: payload.windowId || payload.window_id || "",
+          paneId,
+          url: payload.url,
+          workspaceId: payload.workspaceId || payload.workspace_id || "",
+        });
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [rememberWorkspaceWebTabUrl, returnWorkspaceWebTabPopout]);
+
+  useEffect(() => {
+    if (!workspaceListHydrated) {
+      return;
+    }
+    const validPaneIds = new Set(
+      workspaces.map((workspace) => workspaceWebTabPaneId(workspace?.id)).filter(Boolean),
+    );
+    const staleEntries = Object.entries(workspaceWebTabSessionsRef.current).filter(([paneId]) => (
+      !validPaneIds.has(paneId)
+    ));
+    if (!staleEntries.length) {
+      return;
+    }
+    staleEntries.forEach(([, session]) => {
+      const label = String(session?.popoutLabel || session?.label || "").trim();
+      if (label) {
+        invoke("web_panel_close", { label }).catch(() => {});
+      }
+    });
+    setWorkspaceWebTabSessions((current) => {
+      const next = { ...current };
+      staleEntries.forEach(([paneId]) => {
+        delete next[paneId];
+      });
+      workspaceWebTabSessionsRef.current = next;
+      return next;
+    });
+  }, [workspaces, workspaceListHydrated]);
 
   const loadSettingsPermissionState = useCallback(async () => {
     setSettingsPermissionState((current) => ({
@@ -34806,6 +35151,7 @@ export default function App() {
       || isWorkspaceSettingsOpen
       || loopspaceCreatePanelOpen
       || isLoopspaceSettingsOpen
+      || networkingOverlayOpen
       || shouldShowWorkspaceGitPullPrompt,
   );
   const toggleWorkspaceGitPullRepository = useCallback((repoPath) => {
@@ -44878,6 +45224,7 @@ export default function App() {
         }
       } else if (
         lifecycleEvent.type === "agent-output"
+        || lifecycleEvent.type === "provider-user-prompt-answered"
         || lifecycleEvent.type === "provider-user-prompt-started"
         || lifecycleEvent.type === "provider-tool-started"
         || lifecycleEvent.type === "provider-tool-completed"
@@ -49068,6 +49415,11 @@ export default function App() {
                   ) : selectedWorkspace ? (
                     <WebWorkspaceView
                       isActive={activeView === "web" && visibleView === "web" && viewMotion !== "exiting"}
+                      onFocusWebTabPopout={focusWorkspaceWebTabPopout}
+                      onPopOutWebTab={openWorkspaceWebTabPopout}
+                      onReturnWebTabPopout={returnWorkspaceWebTabPopout}
+                      onWebTabNavigate={rememberWorkspaceWebTabUrl}
+                      webTabSession={selectedWorkspaceWebTabSession}
                       webviewObscured={workspaceNativeWebviewObscured}
                       workspace={selectedWorkspace}
                     />

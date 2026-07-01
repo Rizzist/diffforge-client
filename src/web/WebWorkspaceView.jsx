@@ -1,6 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
-import { openUrl } from "@tauri-apps/plugin-opener";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import {
@@ -16,27 +14,19 @@ import {
 } from "../terminals/panelAgentPromptBridge.js";
 import WebPane from "./WebPane.jsx";
 import { DEFAULT_WEB_URL, normalizeWebInput } from "./webNative.js";
-import {
-  WEB_PANEL_CLOSED_EVENT,
-  WEB_PANEL_CONTROL_EVENT,
-  WEB_PANEL_CONTROL_NAVIGATE,
-  WEB_PANEL_CONTROL_RETURN,
-} from "./webPanelBridge.js";
 
-function workspaceWebTabPaneId(workspaceId) {
+export function workspaceWebTabPaneId(workspaceId) {
   const safeWorkspaceId = String(workspaceId || "").trim();
   return `workspace-web-tab-${safeWorkspaceId || "workspace"}`;
 }
 
-function fallbackOpenExternal(url) {
-  const targetUrl = normalizeWebInput(url) || DEFAULT_WEB_URL;
-  openUrl(targetUrl).catch(() => {
-    window.open(targetUrl, "_blank", "noopener,noreferrer");
-  });
-}
-
 export default function WebWorkspaceView({
   isActive = true,
+  onFocusWebTabPopout = null,
+  onPopOutWebTab = null,
+  onReturnWebTabPopout = null,
+  onWebTabNavigate = null,
+  webTabSession = null,
   webviewObscured = false,
   workspace,
 }) {
@@ -47,18 +37,23 @@ export default function WebWorkspaceView({
     [workspaceId],
   );
 
-  const [currentUrl, setCurrentUrl] = useState(DEFAULT_WEB_URL);
-  const [poppedOut, setPoppedOut] = useState(false);
-  const [popoutLabel, setPopoutLabel] = useState("");
-  const [resumeNonce, setResumeNonce] = useState(0);
+  const sessionUrl = useMemo(
+    () => normalizeWebInput(webTabSession?.currentUrl || webTabSession?.url)
+      || String(webTabSession?.currentUrl || webTabSession?.url || "").trim()
+      || DEFAULT_WEB_URL,
+    [webTabSession?.currentUrl, webTabSession?.url],
+  );
+  const popoutLabel = String(webTabSession?.popoutLabel || webTabSession?.label || "").trim();
+  const poppedOut = Boolean(webTabSession?.poppedOut || popoutLabel);
+  const resumeNonce = Number(webTabSession?.resumeNonce || 0);
+
+  const [currentUrl, setCurrentUrl] = useState(sessionUrl);
   const [agentPromptActivityItems, setAgentPromptActivityItems] = useState([]);
   const [agentPromptTargets, setAgentPromptTargets] = useState([]);
   const [defaultAgentPromptTargetIds, setDefaultAgentPromptTargetIds] = useState([]);
 
   const agentPromptTargetsRequestIdRef = useRef("");
-  const lastUrlRef = useRef(DEFAULT_WEB_URL);
-  const poppedOutRef = useRef(false);
-  const popoutLabelRef = useRef("");
+  const lastUrlRef = useRef(sessionUrl);
   const previousPaneIdRef = useRef(paneId);
 
   const rememberUrl = useCallback((url) => {
@@ -68,172 +63,49 @@ export default function WebWorkspaceView({
     }
     lastUrlRef.current = safeUrl;
     setCurrentUrl(safeUrl);
-  }, []);
+    onWebTabNavigate?.({ paneId, url: safeUrl, workspaceId });
+  }, [onWebTabNavigate, paneId, workspaceId]);
 
-  const clearBreakout = useCallback((url) => {
-    if (url) {
-      rememberUrl(url);
-    }
-    const wasPoppedOut = poppedOutRef.current || Boolean(popoutLabelRef.current);
-    poppedOutRef.current = false;
-    popoutLabelRef.current = "";
-    setPoppedOut(false);
-    setPopoutLabel("");
-    if (wasPoppedOut) {
-      setResumeNonce((nonce) => nonce + 1);
-    }
-  }, [rememberUrl]);
+  useEffect(() => {
+    lastUrlRef.current = sessionUrl;
+    setCurrentUrl(sessionUrl);
+  }, [sessionUrl]);
 
   useEffect(() => {
     if (previousPaneIdRef.current === paneId) {
       return;
     }
-    const previousLabel = popoutLabelRef.current;
-    if (previousLabel) {
-      invoke("web_panel_close", { label: previousLabel }).catch(() => {});
-    }
     previousPaneIdRef.current = paneId;
-    lastUrlRef.current = DEFAULT_WEB_URL;
-    poppedOutRef.current = false;
-    popoutLabelRef.current = "";
+    lastUrlRef.current = sessionUrl;
     agentPromptTargetsRequestIdRef.current = "";
-    setCurrentUrl(DEFAULT_WEB_URL);
-    setPoppedOut(false);
-    setPopoutLabel("");
+    setCurrentUrl(sessionUrl);
     setAgentPromptActivityItems([]);
     setAgentPromptTargets([]);
     setDefaultAgentPromptTargetIds([]);
-    setResumeNonce((nonce) => nonce + 1);
-  }, [paneId]);
-
-  useEffect(() => () => {
-    const label = popoutLabelRef.current;
-    if (label) {
-      invoke("web_panel_close", { label }).catch(() => {});
-    }
-  }, []);
+  }, [paneId, sessionUrl]);
 
   const popOutWebTab = useCallback(async (_terminalIndex, _paneId, url) => {
     const targetUrl = normalizeWebInput(url || lastUrlRef.current) || DEFAULT_WEB_URL;
     rememberUrl(targetUrl);
-    if (popoutLabelRef.current) {
-      invoke("web_panel_focus", { label: popoutLabelRef.current }).catch(() => {});
+    if (poppedOut) {
+      onFocusWebTabPopout?.({ label: popoutLabel, paneId, url: targetUrl, workspaceId });
       return;
     }
-    try {
-      const result = await invoke("web_panel_open", {
-        height: null,
-        paneId,
-        theme: document.documentElement?.dataset?.forgeTheme || "",
-        title: "Web",
-        url: targetUrl,
-        width: null,
-        workspaceId,
-      });
-      const label = String(result?.label || "").trim();
-      if (label) {
-        popoutLabelRef.current = label;
-        setPopoutLabel(label);
-      }
-      poppedOutRef.current = true;
-      setPoppedOut(true);
-    } catch {
-      fallbackOpenExternal(targetUrl);
-    }
-  }, [paneId, rememberUrl, workspaceId]);
+    onPopOutWebTab?.({ paneId, url: targetUrl, workspaceId });
+  }, [onFocusWebTabPopout, onPopOutWebTab, paneId, popoutLabel, poppedOut, rememberUrl, workspaceId]);
 
   const focusWebTabPopout = useCallback(() => {
-    const label = popoutLabelRef.current || popoutLabel;
-    if (label) {
-      invoke("web_panel_focus", { label }).catch(() => {});
-    }
-  }, [popoutLabel]);
+    onFocusWebTabPopout?.({ label: popoutLabel, paneId, url: currentUrl, workspaceId });
+  }, [currentUrl, onFocusWebTabPopout, paneId, popoutLabel, workspaceId]);
 
   const returnWebTabPopout = useCallback((_terminalIndex, _paneId, url) => {
-    const label = popoutLabelRef.current || popoutLabel;
     const returnUrl = normalizeWebInput(url)
       || String(url || "").trim()
       || lastUrlRef.current
       || DEFAULT_WEB_URL;
-    clearBreakout(returnUrl);
-    if (label) {
-      invoke("web_panel_close", { label }).catch(() => {});
-    }
-  }, [clearBreakout, popoutLabel]);
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten = () => {};
-
-    listen(WEB_PANEL_CLOSED_EVENT, (event) => {
-      if (disposed) {
-        return;
-      }
-      const payload = event?.payload || {};
-      const eventPaneId = String(payload.paneId || payload.pane_id || "").trim();
-      const eventWindowId = String(payload.windowId || payload.window_id || "").trim();
-      if (eventPaneId && eventPaneId !== paneId) {
-        return;
-      }
-      if (!eventPaneId && eventWindowId && eventWindowId !== popoutLabelRef.current) {
-        return;
-      }
-      if (!eventPaneId && !eventWindowId) {
-        return;
-      }
-      clearBreakout(payload.url);
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
-
-    return () => {
-      disposed = true;
-      unlisten();
-    };
-  }, [clearBreakout, paneId]);
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten = () => {};
-
-    listen(WEB_PANEL_CONTROL_EVENT, (event) => {
-      if (disposed) {
-        return;
-      }
-      const payload = event?.payload || {};
-      const eventPaneId = String(payload.paneId || payload.pane_id || "").trim();
-      if (eventPaneId !== paneId) {
-        return;
-      }
-      const control = String(payload.control || "").trim();
-      if (control === WEB_PANEL_CONTROL_NAVIGATE) {
-        rememberUrl(payload.url);
-        return;
-      }
-      if (control === WEB_PANEL_CONTROL_RETURN) {
-        returnWebTabPopout(null, paneId, payload.url);
-      }
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
-
-    return () => {
-      disposed = true;
-      unlisten();
-    };
-  }, [paneId, rememberUrl, returnWebTabPopout]);
+    rememberUrl(returnUrl);
+    onReturnWebTabPopout?.({ label: popoutLabel, paneId, url: returnUrl, workspaceId });
+  }, [onReturnWebTabPopout, paneId, popoutLabel, rememberUrl, workspaceId]);
 
   const requestAgentPromptTargets = useCallback(() => {
     const requestId = createPanelAgentPromptRequestId("web-tab-targets");

@@ -50,6 +50,7 @@ const LIVE_TERMINAL_STATUSES = new Set([
 const PROMPTING_CLEARING_TERMINAL_EVENT_TYPES = new Set([
   "message-submitted",
   "pending-prompt-sent",
+  "provider-user-prompt-answered",
   "provider-turn-completed",
   "provider-turn-error",
   "provider-turn-interrupted",

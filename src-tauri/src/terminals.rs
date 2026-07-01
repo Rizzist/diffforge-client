@@ -602,20 +602,17 @@ fn terminal_runtime_snapshot_is_busy_turn(runtime: &TerminalRuntimeSnapshot) -> 
 }
 
 fn terminal_prompt_ready_recovery_allowed(
-    metadata: &TerminalInstanceMetadata,
+    _metadata: &TerminalInstanceMetadata,
     runtime: &TerminalRuntimeSnapshot,
 ) -> bool {
     if terminal_runtime_snapshot_is_starting(runtime) {
         return true;
     }
 
-    // Claude Code can keep prompt-looking rows visible while a turn is still
-    // active. For Claude, real Stop hooks are the only non-startup completion
-    // authority; output-tail prompt markers are only safe for startup recovery.
-    if terminal_metadata_is_claude(metadata) {
-        return false;
-    }
-
+    // Provider Stop/session-idle hooks remain the primary completion signal,
+    // but running terminals can predate the latest hook install or miss one
+    // hook write. A prompt marker after the busy debounce is a recovery signal
+    // for every hook-managed provider, including Claude.
     terminal_runtime_snapshot_is_busy_turn(runtime)
 }
 
@@ -10454,12 +10451,20 @@ fn emit_terminal_prompt_submitted_activity_started(
         cwd: Some(instance.working_directory.display().to_string()),
         user_message: Some(prompt.to_string()),
         message: Some(prompt.to_string()),
+        live_text_delta: None,
+        live_text_snapshot: None,
+        live_text_kind: None,
         tool_name: None,
         tool_use_id: None,
         approval_id: None,
         permission_prompt_id: None,
         permission_request_id: None,
         permission_mode: None,
+        prompt_id: None,
+        prompt_kind: None,
+        prompt_default_option: None,
+        prompt_ttl_ms: None,
+        prompt_options: Vec::new(),
         manual_prompt_source: None,
         manual_approval_required: false,
         provider_blocked_for_user: false,
@@ -10924,6 +10929,44 @@ fn terminal_activity_hook_status_key(event: &Value, keys: &[&str]) -> Option<Str
     terminal_activity_hook_string(event, keys).map(|value| terminal_activity_hook_name_key(&value))
 }
 
+fn terminal_activity_hook_resolution_is_failure(event: &Value) -> bool {
+    terminal_activity_hook_status_key(
+        event,
+        &[
+            "permissionDecision",
+            "permission_decision",
+            "decision",
+            "approvalDecision",
+            "approval_decision",
+            "permissionStatus",
+            "permission_status",
+            "approvalStatus",
+            "approval_status",
+            "status",
+            "result",
+            "outcome",
+        ],
+    )
+    .is_some_and(|status| {
+        matches!(
+            status.as_str(),
+            "cancel"
+                | "cancelled"
+                | "canceled"
+                | "deny"
+                | "denied"
+                | "error"
+                | "failed"
+                | "failure"
+                | "no"
+                | "reject"
+                | "rejected"
+                | "timeout"
+                | "timedout"
+        )
+    })
+}
+
 #[derive(Debug, Clone)]
 struct TerminalActivityHookManualPrompt {
     kind: String,
@@ -10931,6 +10974,190 @@ struct TerminalActivityHookManualPrompt {
     approval_id: Option<String>,
     permission_prompt_id: Option<String>,
     permission_request_id: Option<String>,
+    default_option: Option<String>,
+    ttl_ms: Option<u64>,
+    options: Vec<TerminalActivityHookPromptOption>,
+}
+
+fn terminal_activity_hook_prompt_option_id(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn terminal_activity_hook_prompt_option_from_value(
+    value: &Value,
+) -> Option<TerminalActivityHookPromptOption> {
+    if let Some(text) = value.as_str().map(str::trim).filter(|text| !text.is_empty()) {
+        let id = terminal_activity_hook_prompt_option_id(text);
+        return (!id.is_empty()).then(|| TerminalActivityHookPromptOption {
+            id,
+            label: text.chars().take(80).collect(),
+            value: Some(text.to_string()),
+        });
+    }
+    if let Some(items) = value.as_array() {
+        let id_source = items
+            .first()
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        let raw_value = items
+            .get(2)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .or_else(|| id_source.clone());
+        let id = id_source
+            .as_deref()
+            .or(raw_value.as_deref())
+            .map(terminal_activity_hook_prompt_option_id)
+            .unwrap_or_default();
+        let label = items
+            .get(1)
+            .and_then(Value::as_str)
+            .or_else(|| items.first().and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| id.clone());
+        return (!id.is_empty()).then(|| TerminalActivityHookPromptOption {
+            id,
+            label: label.chars().take(80).collect(),
+            value: raw_value,
+        });
+    }
+    let object = value.as_object()?;
+    let id_source = [
+        "id",
+        "key",
+        "option",
+        "choice",
+        "action",
+        "decision",
+    ]
+    .iter()
+    .find_map(|key| object.get(*key).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|text| !text.is_empty())
+    .map(str::to_string);
+    let raw_value = [
+        "value",
+        "rawValue",
+        "raw_value",
+        "answer",
+        "input",
+        "selection",
+    ]
+    .iter()
+    .find_map(|key| object.get(*key).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|text| !text.is_empty())
+    .map(str::to_string)
+    .or_else(|| id_source.clone());
+    let label = [
+        "label",
+        "title",
+        "name",
+        "text",
+        "description",
+        "message",
+        "value",
+        "id",
+    ]
+    .iter()
+    .find_map(|key| object.get(*key).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|text| !text.is_empty())
+    .map(str::to_string)
+    .or_else(|| raw_value.clone())
+    .unwrap_or_default();
+    let id = id_source
+        .as_deref()
+        .or(raw_value.as_deref())
+        .or_else(|| (!label.is_empty()).then_some(label.as_str()))
+        .map(terminal_activity_hook_prompt_option_id)
+        .unwrap_or_default();
+    (!id.is_empty()).then(|| TerminalActivityHookPromptOption {
+        id,
+        label: label.chars().take(80).collect(),
+        value: raw_value,
+    })
+}
+
+fn terminal_activity_hook_prompt_options_from_event(
+    event: &Value,
+    prompt_kind: &str,
+) -> Vec<TerminalActivityHookPromptOption> {
+    let mut options = [
+        "promptOptions",
+        "prompt_options",
+        "options",
+        "choices",
+        "actions",
+        "decisions",
+    ]
+    .iter()
+    .filter_map(|key| event.get(*key))
+    .flat_map(|value| {
+        value
+            .as_array()
+            .cloned()
+            .unwrap_or_else(|| vec![value.clone()])
+            .into_iter()
+    })
+    .filter_map(|value| terminal_activity_hook_prompt_option_from_value(&value))
+    .collect::<Vec<_>>();
+
+    if options.is_empty() && matches!(prompt_kind, "approval" | "permission") {
+        options.extend([
+            TerminalActivityHookPromptOption {
+                id: "allow_once".to_string(),
+                label: "Allow once".to_string(),
+                value: None,
+            },
+            TerminalActivityHookPromptOption {
+                id: "deny".to_string(),
+                label: "Deny".to_string(),
+                value: None,
+            },
+            TerminalActivityHookPromptOption {
+                id: "park".to_string(),
+                label: "Park todo".to_string(),
+                value: None,
+            },
+        ]);
+    } else if options.is_empty() {
+        options.push(TerminalActivityHookPromptOption {
+            id: "continue".to_string(),
+            label: "Continue".to_string(),
+            value: None,
+        });
+    }
+
+    let mut deduped = Vec::<TerminalActivityHookPromptOption>::new();
+    for option in options {
+        if option.id.is_empty() || deduped.iter().any(|existing| existing.id == option.id) {
+            continue;
+        }
+        deduped.push(option);
+    }
+    deduped
 }
 
 fn terminal_activity_hook_manual_prompt(
@@ -10941,6 +11168,9 @@ fn terminal_activity_hook_manual_prompt(
     let manual_event = matches!(
         hook_key.as_str(),
         "manualapprovalrequired"
+            | "elicitation"
+            | "elicitationrequest"
+            | "elicitationrequested"
             | "manualprompt"
             | "permissionprompt"
             | "permissionpromptstarted"
@@ -11069,8 +11299,20 @@ fn terminal_activity_hook_manual_prompt(
     let approval_id = terminal_activity_hook_string(event, &["approvalId", "approval_id"]);
     let permission_prompt_id =
         terminal_activity_hook_string(event, &["permissionPromptId", "permission_prompt_id"]);
-    let permission_request_id =
-        terminal_activity_hook_string(event, &["permissionRequestId", "permission_request_id"]);
+    let permission_request_id = terminal_activity_hook_string(
+        event,
+        &[
+            "permissionRequestId",
+            "permission_request_id",
+            "promptId",
+            "prompt_id",
+            "questionId",
+            "question_id",
+            "selectionId",
+            "selection_id",
+            "id",
+        ],
+    );
     let tool_use_id = terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]);
     let has_action_token = approval_id.is_some()
         || permission_prompt_id.is_some()
@@ -11090,14 +11332,27 @@ fn terminal_activity_hook_manual_prompt(
         ],
     )
     .map(|value| terminal_activity_hook_name_key(&value))
-    .filter(|value| matches!(value.as_str(), "approval" | "permission"))
-    .unwrap_or_else(|| {
-        if terminal_activity_hook_bool(
-            event,
-            &["manualApprovalRequired", "manual_approval_required"],
-        ) || hook_key.contains("approval")
-        {
-            "approval".to_string()
+    .filter(|value| {
+        matches!(
+            value.as_str(),
+            "approval" | "permission" | "question" | "selection" | "input" | "text" | "choice"
+        )
+    })
+        .unwrap_or_else(|| {
+            if terminal_activity_hook_bool(
+                event,
+                &["manualApprovalRequired", "manual_approval_required"],
+            ) || hook_key.contains("approval")
+            {
+                "approval".to_string()
+            } else if hook_key.contains("elicitation") {
+                "selection".to_string()
+            } else if hook_key.contains("selection") {
+                "selection".to_string()
+            } else if hook_key.contains("question") {
+            "question".to_string()
+        } else if hook_key.contains("input") {
+            "input".to_string()
         } else {
             "permission".to_string()
         }
@@ -11109,6 +11364,8 @@ fn terminal_activity_hook_manual_prompt(
             "prompting_user_text",
             "promptingText",
             "prompting_text",
+            "question",
+            "title",
             "description",
             "message",
             "prompt",
@@ -11116,6 +11373,51 @@ fn terminal_activity_hook_manual_prompt(
             "last_message",
         ],
     );
+    let default_option = terminal_activity_hook_string(
+        event,
+        &[
+            "promptDefaultOption",
+            "prompt_default_option",
+            "defaultOption",
+            "default_option",
+            "default",
+            "defaultDecision",
+            "default_decision",
+        ],
+    )
+    .map(|value| terminal_activity_hook_prompt_option_id(&value))
+    .filter(|value| !value.is_empty())
+    .or_else(|| {
+        if matches!(kind.as_str(), "approval" | "permission") {
+            Some("deny".to_string())
+        } else {
+            None
+        }
+    });
+    let ttl_ms = [
+        "promptTtlMs",
+        "prompt_ttl_ms",
+        "ttlMs",
+        "ttl_ms",
+        "timeoutMs",
+        "timeout_ms",
+    ]
+    .iter()
+    .find_map(|key| {
+        event
+            .get(*key)
+            .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse::<u64>().ok()))
+    });
+    let mut options = terminal_activity_hook_prompt_options_from_event(event, &kind);
+    if let Some(default_option) = default_option.as_deref() {
+        if !options.iter().any(|option| option.id == default_option) {
+            options.push(TerminalActivityHookPromptOption {
+                id: default_option.to_string(),
+                label: default_option.replace('_', " "),
+                value: None,
+            });
+        }
+    }
 
     Some(TerminalActivityHookManualPrompt {
         kind,
@@ -11123,6 +11425,9 @@ fn terminal_activity_hook_manual_prompt(
         approval_id,
         permission_prompt_id,
         permission_request_id,
+        default_option,
+        ttl_ms,
+        options,
     })
 }
 
@@ -11249,7 +11554,7 @@ fn terminal_activity_hook_activity_kind(
             false,
             "cli_hook_tool_batch",
         )),
-        "messagedisplay" | "assistantmessagedisplay" | "assistantmessagedelta" => Some((
+        "messagedisplay" | "assistantmessagedisplay" | "assistantmessagedelta" | "messagedelta" => Some((
             "provider-message-displayed",
             "thinking",
             "active",
@@ -11286,13 +11591,58 @@ fn terminal_activity_hook_activity_kind(
             false,
             "cli_hook_compacted",
         )),
-        "permissionrequest" => Some((
+        "permissionrequest"
+        | "userpromptrequired"
+        | "manualprompt"
+        | "permissionprompt"
+        | "permissionpromptstarted"
+        | "userinputrequired"
+        | "userinputrequested"
+        | "userpromptstarted"
+        | "elicitation" => Some((
             "provider-permission-requested",
             "paused",
             "active",
             "awaiting_permission",
             false,
             "cli_hook_permission_request",
+        )),
+        "permissiondenied" => Some((
+            "provider-tool-failed",
+            "thinking",
+            "active",
+            "tool_failed",
+            false,
+            "cli_hook_permission_resolved",
+        )),
+        "elicitationresult" => {
+            if terminal_activity_hook_resolution_is_failure(event) {
+                Some((
+                    "provider-tool-failed",
+                    "thinking",
+                    "active",
+                    "tool_failed",
+                    false,
+                    "cli_hook_permission_resolved",
+                ))
+            } else {
+                Some((
+                    "provider-user-prompt-answered",
+                    "thinking",
+                    "active",
+                    "running",
+                    false,
+                    "cli_hook_prompt_answered",
+                ))
+            }
+        }
+        "notification" => Some((
+            "provider-work-update",
+            "thinking",
+            "active",
+            "running",
+            false,
+            "cli_hook_notification",
         )),
         "subagentstart" => Some((
             "provider-subagent-started",
@@ -11341,7 +11691,15 @@ fn terminal_activity_hook_non_lifecycle_is_expected(hook_event_name: &str) -> bo
             | "compactionstarted"
             | "contextcompactioncompleted"
             | "contextcompactionstarted"
+            | "elicitation"
+            | "elicitationresult"
+            | "manualprompt"
+            | "messagedelta"
             | "messagedisplay"
+            | "notification"
+            | "permissiondenied"
+            | "permissionprompt"
+            | "permissionpromptstarted"
             | "permissionrequest"
             | "postcompact"
             | "posttoolbatch"
@@ -11357,6 +11715,10 @@ fn terminal_activity_hook_non_lifecycle_is_expected(hook_event_name: &str) -> bo
             | "taskcreated"
             | "thinking"
             | "thinkingdelta"
+            | "userinputrequired"
+            | "userinputrequested"
+            | "userpromptrequired"
+            | "userpromptstarted"
     )
 }
 
@@ -11629,10 +11991,33 @@ fn terminal_activity_hook_payload(
         &provider,
         &metadata.agent_kind,
     );
+    let hook_key = terminal_activity_hook_name_key(&hook_event_name);
     let provider_session_id = terminal_activity_hook_provider_session_id(event);
-    let provider_turn_id = terminal_activity_hook_string(event, &["turnId", "turn_id"]);
-    let user_message = terminal_activity_hook_message_text(
-        event,
+    let provider_turn_id = terminal_activity_hook_string(event, &["turnId", "turn_id"]).or_else(|| {
+        terminal_activity_hook_is_prompt_submit_key(&hook_key)
+            .then(|| format!("hook-turn-{}-{event_time_ms}", metadata.pane_id))
+    });
+    let final_message_hook = matches!(
+        hook_key.as_str(),
+        "stop" | "turnstop" | "assistantstop" | "subagentstop"
+    );
+    let user_message_keys: &[&str] = if final_message_hook {
+        &[
+            "lastMessage",
+            "last_message",
+            "lastAssistantMessage",
+            "last_assistant_message",
+            "assistantMessage",
+            "assistant_message",
+            "outputText",
+            "output_text",
+            "content",
+            "response",
+            "output",
+            "text",
+            "message",
+        ]
+    } else {
         &[
             "assistantMessage",
             "assistant_message",
@@ -11654,8 +12039,86 @@ fn terminal_activity_hook_payload(
             "description",
             "lastMessage",
             "last_message",
+        ]
+    };
+    let user_message = terminal_activity_hook_message_text(event, user_message_keys);
+    let live_text_kind = if final_message_hook && user_message.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+        Some("assistant".to_string())
+    } else if matches!(
+        hook_key.as_str(),
+        "messagedisplay"
+            | "assistantmessagedisplay"
+            | "assistantmessagedelta"
+            | "messagedelta"
+    ) {
+        Some("assistant".to_string())
+    } else if matches!(
+        hook_key.as_str(),
+        "thinking" | "thinkingdelta" | "assistantthinkingdelta"
+            | "reasoning" | "reasoningdelta" | "assistantreasoningdelta"
+    ) {
+        Some("reasoning".to_string())
+    } else {
+        None
+    };
+    let live_delta_hook = matches!(
+        hook_key.as_str(),
+        "messagedisplay"
+            | "assistantmessagedisplay"
+            | "assistantmessagedelta"
+            | "messagedelta"
+            | "thinkingdelta"
+            | "assistantthinkingdelta"
+            | "reasoningdelta"
+            | "assistantreasoningdelta"
+    );
+    let live_text_delta = if live_text_kind.is_some() && live_delta_hook {
+        terminal_activity_hook_message_text(
+            event,
+            &[
+                "assistantDelta",
+                "assistant_delta",
+                "textDelta",
+                "text_delta",
+                "delta",
+                "contentDelta",
+                "content_delta",
+                "thinkingDelta",
+                "thinking_delta",
+                "reasoningDelta",
+                "reasoning_delta",
+                "assistantMessage",
+                "assistant_message",
+                "outputText",
+                "output_text",
+                "text",
+                "message",
+            ],
+        )
+        .or_else(|| user_message.clone())
+        .filter(|value| !value.trim().is_empty())
+    } else {
+        None
+    };
+    let explicit_live_text_snapshot = terminal_activity_hook_message_text(
+        event,
+        &[
+            "assistantMessageSnapshot",
+            "assistant_message_snapshot",
+            "assistantSnapshot",
+            "assistant_snapshot",
+            "messageSnapshot",
+            "message_snapshot",
+            "cumulativeText",
+            "cumulative_text",
+            "snapshot",
         ],
     );
+    let live_text_snapshot = if final_message_hook && live_text_kind.is_some() {
+        user_message.clone().filter(|value| !value.trim().is_empty())
+    } else {
+        explicit_live_text_snapshot
+    };
     let input_ready_at = input_ready.then(|| event_time.clone());
     let prompt_ready_at = input_ready.then(|| event_time.clone());
     let completed_at = input_ready.then(|| event_time.clone());
@@ -11688,6 +12151,23 @@ fn terminal_activity_hook_payload(
     let permission_request_id = manual_prompt
         .as_ref()
         .and_then(|prompt| prompt.permission_request_id.clone());
+    let prompt_id = manual_prompt.as_ref().and_then(|prompt| {
+        prompt
+            .approval_id
+            .clone()
+            .or_else(|| prompt.permission_prompt_id.clone())
+            .or_else(|| prompt.permission_request_id.clone())
+            .or_else(|| terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]))
+    });
+    let prompt_kind = manual_prompt.as_ref().map(|prompt| prompt.kind.clone());
+    let prompt_default_option = manual_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.default_option.clone());
+    let prompt_ttl_ms = manual_prompt.as_ref().and_then(|prompt| prompt.ttl_ms);
+    let prompt_options = manual_prompt
+        .as_ref()
+        .map(|prompt| prompt.options.clone())
+        .unwrap_or_default();
     let current_runtime = terminal_runtime_snapshot(instance);
     let projected_runtime = terminal_project_runtime(
         &metadata,
@@ -11766,12 +12246,20 @@ fn terminal_activity_hook_payload(
         cwd: terminal_activity_hook_string(event, &["cwd"]),
         user_message: user_message.clone(),
         message: user_message,
+        live_text_delta,
+        live_text_snapshot,
+        live_text_kind,
         tool_name: terminal_activity_hook_string(event, &["toolName", "tool_name"]),
         tool_use_id: terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]),
         approval_id,
         permission_prompt_id,
         permission_request_id,
         permission_mode,
+        prompt_id,
+        prompt_kind,
+        prompt_default_option,
+        prompt_ttl_ms,
+        prompt_options,
         manual_prompt_source,
         manual_approval_required,
         provider_blocked_for_user,
@@ -12213,7 +12701,19 @@ fn apply_terminal_activity_hook_payload(
             "workspace_id": payload.workspace_id.clone(),
         }),
     );
-    let cloud_payload = payload.clone();
+    let mut cloud_payload = payload.clone();
+    if cloud_payload.provider_session_id.is_none() {
+        cloud_payload.provider_session_id = runtime_snapshot.provider_session_id.clone();
+    }
+    if cloud_payload.native_session_id.is_none() {
+        cloud_payload.native_session_id = runtime_snapshot.native_session_id.clone();
+    }
+    if cloud_payload.provider_turn_id.is_none() {
+        cloud_payload.provider_turn_id = runtime_snapshot.provider_turn_id.clone();
+    }
+    if cloud_payload.turn_id.is_none() {
+        cloud_payload.turn_id = runtime_snapshot.turn_id.clone();
+    }
     let cloud_state = cloud_mcp_state.clone();
     tauri::async_runtime::spawn(async move {
         cloud_mcp_sync_terminal_activity_hook_delta(&cloud_state, &cloud_payload).await;
@@ -14183,6 +14683,121 @@ async fn terminal_write(
         false,
     )
     .await
+}
+
+fn terminal_agent_prompt_answer_input(
+    option_id: &str,
+    option_label: &str,
+    option_value: Option<&str>,
+) -> String {
+    if let Some(value) = option_value.map(str::trim).filter(|value| !value.is_empty()) {
+        return format!("{value}\r");
+    }
+    let option_key = terminal_activity_hook_prompt_option_id(option_id);
+    let label_key = terminal_activity_hook_prompt_option_id(option_label);
+    let key = if option_key.is_empty() {
+        label_key.as_str()
+    } else {
+        option_key.as_str()
+    };
+    match key {
+        "allow" | "allow_once" | "approve" | "approved" | "once" | "yes" | "y" => "y\r".to_string(),
+        "allow_always" | "always" | "approve_always" => "a\r".to_string(),
+        "deny" | "denied" | "no" | "n" | "reject" | "rejected" => "n\r".to_string(),
+        "cancel" | "escape" | "interrupt" | "park" | "skip" => "\x1b".to_string(),
+        "continue" | "default" | "enter" | "ok" => "\r".to_string(),
+        _ if key.len() == 1 => format!("{key}\r"),
+        _ => format!("{option_id}\r"),
+    }
+}
+
+fn terminal_remote_command_string(event: &Value, keys: &[&str]) -> Option<String> {
+    terminal_activity_hook_string(event, keys)
+        .or_else(|| {
+            event
+                .get("payload")
+                .and_then(|payload| terminal_activity_hook_string(payload, keys))
+        })
+        .or_else(|| {
+            event
+                .get("request")
+                .and_then(|request| terminal_activity_hook_string(request, keys))
+        })
+}
+
+fn terminal_remote_command_u64(event: &Value, keys: &[&str]) -> Option<u64> {
+    let value_from = |root: &Value| {
+        keys.iter().find_map(|key| {
+            root.get(*key)
+                .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse::<u64>().ok()))
+        })
+    };
+    value_from(event)
+        .or_else(|| event.get("payload").and_then(|payload| value_from(payload)))
+        .or_else(|| event.get("request").and_then(|request| value_from(request)))
+}
+
+pub(crate) async fn terminal_answer_agent_prompt_remote_command(
+    app: AppHandle,
+    event: Value,
+) -> Result<Value, String> {
+    let pane_id = terminal_remote_command_string(
+        &event,
+        &[
+            "target_terminal_id",
+            "targetTerminalId",
+            "terminal_id",
+            "terminalId",
+            "pane_id",
+            "paneId",
+        ],
+    )
+    .ok_or_else(|| "Prompt answer requires a target terminal id.".to_string())?;
+    let instance_id =
+        terminal_remote_command_u64(&event, &["terminal_instance_id", "terminalInstanceId"]);
+    let prompt_id = terminal_remote_command_string(&event, &["prompt_id", "promptId"])
+        .ok_or_else(|| "Prompt answer requires a prompt id.".to_string())?;
+    let option_id = terminal_remote_command_string(&event, &["option_id", "optionId", "choice"])
+        .ok_or_else(|| "Prompt answer requires an option id.".to_string())?;
+    let option_label = terminal_remote_command_string(&event, &["option_label", "optionLabel"])
+        .unwrap_or_else(|| option_id.clone());
+    let option_value =
+        terminal_remote_command_string(&event, &["option_value", "optionValue", "value"]);
+    let data = terminal_agent_prompt_answer_input(&option_id, &option_label, option_value.as_deref());
+    let state_app = app.clone();
+    let cloud_app = app.clone();
+    let state = state_app.state::<TerminalState>();
+    let cloud_mcp_state = cloud_app.state::<CloudMcpState>();
+    terminal_write_inner(
+        app,
+        state.inner(),
+        cloud_mcp_state.inner(),
+        pane_id.clone(),
+        instance_id,
+        data,
+        Some(prompt_id.clone()).filter(|value| !value.trim().is_empty()),
+        None,
+        Some("agent_prompt_answer".to_string()),
+        Some(crate::coordination::kernel::now_rfc3339()),
+        None,
+        None,
+        None,
+        None,
+        Some("prompt_answer".to_string()),
+        Some(false),
+        None,
+        Some(false),
+        true,
+    )
+    .await?;
+    Ok(json!({
+        "prompt_id": prompt_id,
+        "option_id": option_id,
+        "option_value": option_value.unwrap_or_default(),
+        "pane_id": pane_id,
+        "terminal_instance_id": instance_id,
+        "answered": true,
+    }))
 }
 
 #[tauri::command]
@@ -16977,7 +17592,7 @@ mod terminal_tests {
             &codex_metadata,
             &runtime
         ));
-        assert!(!terminal_prompt_ready_recovery_allowed(
+        assert!(terminal_prompt_ready_recovery_allowed(
             &claude_metadata,
             &runtime
         ));

@@ -16,11 +16,72 @@ const PCB_HARDWARE_DIR: &str = "hardware";
 const PCB_BOARD_EXTENSION: &str = ".board.tsx";
 const PCB_MANIFEST_DIR: &str = ".agents";
 const PCB_MANIFEST_FILE: &str = "pcb-workspaces.json";
+const PCB_VENDOR_FETCH_TIMEOUT_SECS: u64 = 20;
+const PCB_VENDOR_FETCH_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+const PCB_VENDOR_FETCH_ALLOWED_HOSTS: &[&str] = &[
+    "jlcsearch.tscircuit.com",
+    "easyeda.com",
+    "modules.easyeda.com",
+    "modelcdn.tscircuit.com",
+    "kicad-mod-cache.tscircuit.com",
+];
 
 // Per-workspace watch roots already wired up, so repeated `pcb_watch_start`
 // calls from a remounting PcbView are idempotent.
 static PCB_WATCH_ROOTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::OnceLock::new();
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PcbVendorFetchRequest {
+    url: String,
+    method: Option<String>,
+    headers: Option<std::collections::HashMap<String, String>>,
+    body: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PcbVendorFetchResponse {
+    status: u16,
+    status_text: String,
+    headers: std::collections::HashMap<String, String>,
+    body: String,
+}
+
+fn pcb_vendor_fetch_url(raw_url: &str) -> Result<reqwest::Url, String> {
+    let url = reqwest::Url::parse(raw_url)
+        .map_err(|error| format!("Invalid PCB vendor fetch URL: {error}"))?;
+    if url.scheme() != "https" {
+        return Err("PCB vendor fetch URL must use HTTPS.".to_string());
+    }
+    let host = url
+        .host_str()
+        .ok_or_else(|| "PCB vendor fetch URL is missing a host.".to_string())?;
+    if !PCB_VENDOR_FETCH_ALLOWED_HOSTS.contains(&host) {
+        return Err(format!("PCB vendor fetch host is not allowed: {host}"));
+    }
+    Ok(url)
+}
+
+fn pcb_vendor_fetch_should_forward_header(name: &str, value: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "host"
+            | "authority"
+            | "connection"
+            | "content-length"
+            | "transfer-encoding"
+            | "accept-encoding"
+    ) {
+        return false;
+    }
+    if lower == "cookie" && value.contains("<PUT") {
+        return false;
+    }
+    true
+}
 
 fn pcb_starter_source(board_name: &str) -> String {
     format!(
@@ -517,6 +578,71 @@ async fn pcb_document_delete(
         "changedAtMs": architecture_now_millis(),
     }));
     Ok(result)
+}
+
+#[tauri::command]
+async fn pcb_vendor_fetch(request: PcbVendorFetchRequest) -> Result<PcbVendorFetchResponse, String> {
+    let url = pcb_vendor_fetch_url(request.url.as_str())?;
+    let method_text = request
+        .method
+        .as_deref()
+        .unwrap_or("GET")
+        .trim()
+        .to_ascii_uppercase();
+    let method = reqwest::Method::from_bytes(method_text.as_bytes())
+        .map_err(|error| format!("Invalid PCB vendor fetch method: {error}"))?;
+    let body = request.body.unwrap_or_default();
+    if body.len() > PCB_VENDOR_FETCH_MAX_BODY_BYTES {
+        return Err("PCB vendor fetch request body is too large.".to_string());
+    }
+
+    let client = http_client(std::time::Duration::from_secs(PCB_VENDOR_FETCH_TIMEOUT_SECS))?;
+    let mut builder = client.request(method, url);
+    if let Some(headers) = request.headers {
+        for (name, value) in headers {
+            if !pcb_vendor_fetch_should_forward_header(name.as_str(), value.as_str()) {
+                continue;
+            }
+            let Ok(header_name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+                continue;
+            };
+            let Ok(header_value) = reqwest::header::HeaderValue::from_str(value.as_str()) else {
+                continue;
+            };
+            builder = builder.header(header_name, header_value);
+        }
+    }
+    if !body.is_empty() {
+        builder = builder.body(body);
+    }
+
+    let response = builder
+        .send()
+        .await
+        .map_err(|error| format!("PCB vendor fetch failed: {error}"))?;
+    let status = response.status();
+    let status_text = status.canonical_reason().unwrap_or_default().to_string();
+    let mut headers = std::collections::HashMap::new();
+    for (name, value) in response.headers().iter() {
+        if let Ok(text) = value.to_str() {
+            headers.insert(name.as_str().to_string(), text.to_string());
+        }
+    }
+    let bytes = response
+        .bytes()
+        .await
+        .map_err(|error| format!("Unable to read PCB vendor fetch response: {error}"))?;
+    if bytes.len() > PCB_VENDOR_FETCH_MAX_BODY_BYTES {
+        return Err("PCB vendor fetch response body is too large.".to_string());
+    }
+    let body = String::from_utf8_lossy(&bytes).to_string();
+
+    Ok(PcbVendorFetchResponse {
+        status: status.as_u16(),
+        status_text,
+        headers,
+        body,
+    })
 }
 
 // Ensure a debounced filesystem watcher is running for this workspace's
