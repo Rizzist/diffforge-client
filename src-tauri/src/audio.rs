@@ -531,6 +531,48 @@ struct NativeAudioChunk {
     timestamp: Instant,
 }
 
+#[derive(Clone)]
+struct NativePartialAudioChunk {
+    index: u64,
+    start_ms: u64,
+    end_ms: u64,
+    audio_ms: u64,
+    samples: Vec<f32>,
+    sample_rate: u32,
+    peak: f32,
+    rms: f32,
+    reason: String,
+}
+
+struct NativePartialCaptureState {
+    session_id: String,
+    chunk_tx: mpsc::UnboundedSender<NativePartialAudioChunk>,
+    next_index: u64,
+    buffered_samples: Vec<f32>,
+    buffered_start_ms: f64,
+    buffered_ms: f64,
+    total_ms: f64,
+    silence_ms: f64,
+    noise_floor_db: f32,
+    peak: f32,
+    rms: f32,
+    has_speech: bool,
+    min_chunk_ms: u64,
+    max_chunk_ms: u64,
+    silence_cut_ms: u64,
+}
+
+struct NativePartialFinishedCapture {
+    session_id: String,
+    sample_rate: u32,
+    samples: Vec<f32>,
+    candidate_chunks: usize,
+    capture_chunk_count: u64,
+    capture_input_ms: f64,
+    capture_peak: f32,
+    capture_rms: f32,
+}
+
 struct NativeAudioShared {
     capture_chunk_count: u64,
     capture_input_ms: f64,
@@ -540,6 +582,8 @@ struct NativeAudioShared {
     chunks: VecDeque<NativeAudioChunk>,
     input_chunk_count: u64,
     last_stats_at: Instant,
+    partial_capture: Option<NativePartialCaptureState>,
+    partial_finished_capture: Option<NativePartialFinishedCapture>,
     realtime_audio_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     sample_rate: u32,
     total_samples: usize,
@@ -556,6 +600,8 @@ impl NativeAudioShared {
             chunks: VecDeque::new(),
             input_chunk_count: 0,
             last_stats_at: Instant::now(),
+            partial_capture: None,
+            partial_finished_capture: None,
             realtime_audio_tx: None,
             sample_rate,
             total_samples: 0,
@@ -618,11 +664,27 @@ enum NativeAudioCommand {
     Begin {
         response: std::sync::mpsc::Sender<Result<(), String>>,
     },
+    BeginPartial {
+        session_id: String,
+        chunk_tx: mpsc::UnboundedSender<NativePartialAudioChunk>,
+        min_chunk_ms: u64,
+        max_chunk_ms: u64,
+        silence_ms: u64,
+        response: std::sync::mpsc::Sender<Result<(), String>>,
+    },
     DetachRealtime {
         response: std::sync::mpsc::Sender<Result<(), String>>,
     },
     Finish {
         response: std::sync::mpsc::Sender<Result<AudioInputCaptureResult, String>>,
+    },
+    FinishPartial {
+        session_id: String,
+        response: std::sync::mpsc::Sender<Result<(), String>>,
+    },
+    CancelPartial {
+        session_id: Option<String>,
+        response: std::sync::mpsc::Sender<Result<(), String>>,
     },
     Start {
         app: AppHandle,
@@ -744,11 +806,55 @@ impl NativeAudioWorker {
         )
     }
 
+    fn begin_partial_capture(
+        &self,
+        session_id: String,
+        chunk_tx: mpsc::UnboundedSender<NativePartialAudioChunk>,
+        min_chunk_ms: u64,
+        max_chunk_ms: u64,
+        silence_ms: u64,
+    ) -> Result<(), String> {
+        self.run_command_with_timeout(
+            "begin_partial_capture",
+            Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
+            |response| NativeAudioCommand::BeginPartial {
+                session_id,
+                chunk_tx,
+                min_chunk_ms,
+                max_chunk_ms,
+                silence_ms,
+                response,
+            },
+        )
+    }
+
     fn finish_capture(&self) -> Result<AudioInputCaptureResult, String> {
         self.run_command_with_timeout(
             "finish_capture",
             Duration::from_secs(NATIVE_AUDIO_FINISH_TIMEOUT_SECS),
             |response| NativeAudioCommand::Finish { response },
+        )
+    }
+
+    fn finish_partial_capture(&self, session_id: String) -> Result<(), String> {
+        self.run_command_with_timeout(
+            "finish_partial_capture",
+            Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
+            |response| NativeAudioCommand::FinishPartial {
+                session_id,
+                response,
+            },
+        )
+    }
+
+    fn cancel_partial_capture(&self, session_id: Option<String>) -> Result<(), String> {
+        self.run_command_with_timeout(
+            "cancel_partial_capture",
+            Duration::from_secs(NATIVE_AUDIO_COMMAND_TIMEOUT_SECS),
+            |response| NativeAudioCommand::CancelPartial {
+                session_id,
+                response,
+            },
         )
     }
 
@@ -845,6 +951,28 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
                 }
                 let _ = response.send(result);
             }
+            NativeAudioCommand::BeginPartial {
+                session_id,
+                chunk_tx,
+                min_chunk_ms,
+                max_chunk_ms,
+                silence_ms,
+                response,
+            } => {
+                let result = begin_native_audio_partial_capture_for_session(
+                    session.as_ref(),
+                    session_id,
+                    chunk_tx,
+                    min_chunk_ms,
+                    max_chunk_ms,
+                    silence_ms,
+                );
+                if result.is_ok() {
+                    capture_active = true;
+                    apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
+                }
+                let _ = response.send(result);
+            }
             NativeAudioCommand::DetachRealtime { response } => {
                 let result = detach_native_audio_realtime_stream(session.as_ref());
                 realtime_attached = false;
@@ -855,6 +983,30 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
                 let result = finish_native_audio_capture_for_session(session.as_ref());
                 capture_active = false;
                 apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
+                let _ = response.send(result);
+            }
+            NativeAudioCommand::FinishPartial {
+                session_id,
+                response,
+            } => {
+                let result =
+                    finish_native_audio_partial_capture_for_session(session.as_ref(), &session_id);
+                if result.is_ok() {
+                    capture_active = false;
+                    apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
+                }
+                let _ = response.send(result);
+            }
+            NativeAudioCommand::CancelPartial {
+                session_id,
+                response,
+            } => {
+                let result =
+                    cancel_native_audio_partial_capture_for_session(session.as_ref(), session_id.as_deref());
+                if result.is_ok() {
+                    capture_active = false;
+                    apply_voice_processing_bypass(&mut session, capture_active, realtime_attached);
+                }
                 let _ = response.send(result);
             }
             NativeAudioCommand::Start {
@@ -1390,6 +1542,143 @@ fn native_audio_chunk_reaches(chunk: &NativeAudioChunk, started_at: Instant) -> 
     chunk.timestamp + Duration::from_secs_f64(chunk.duration_ms / 1000.0) >= started_at
 }
 
+fn audio_rms_dbfs(rms: f32) -> f32 {
+    if rms <= 0.000001 {
+        -120.0
+    } else {
+        (20.0 * rms.max(0.000001).log10()).clamp(-120.0, 0.0)
+    }
+}
+
+fn native_partial_capture_state(
+    session_id: String,
+    chunk_tx: mpsc::UnboundedSender<NativePartialAudioChunk>,
+    min_chunk_ms: u64,
+    max_chunk_ms: u64,
+    silence_ms: u64,
+) -> NativePartialCaptureState {
+    NativePartialCaptureState {
+        session_id,
+        chunk_tx,
+        next_index: 0,
+        buffered_samples: Vec::new(),
+        buffered_start_ms: 0.0,
+        buffered_ms: 0.0,
+        total_ms: 0.0,
+        silence_ms: 0.0,
+        noise_floor_db: -60.0,
+        peak: 0.0,
+        rms: 0.0,
+        has_speech: false,
+        min_chunk_ms: min_chunk_ms.clamp(3_000, WHISPER_PARTIAL_MAX_CHUNK_MS),
+        max_chunk_ms: max_chunk_ms
+            .clamp(WHISPER_PARTIAL_MIN_CHUNK_MS, WHISPER_PARTIAL_MAX_CHUNK_MS),
+        silence_cut_ms: silence_ms.clamp(300, 2_000),
+    }
+}
+
+fn native_partial_reset_buffer(state: &mut NativePartialCaptureState) {
+    state.buffered_samples.clear();
+    state.buffered_start_ms = state.total_ms;
+    state.buffered_ms = 0.0;
+    state.silence_ms = 0.0;
+    state.peak = 0.0;
+    state.rms = 0.0;
+    state.has_speech = false;
+}
+
+fn native_partial_take_chunk(
+    state: &mut NativePartialCaptureState,
+    sample_rate: u32,
+    reason: &str,
+    force_short_tail: bool,
+) -> Option<NativePartialAudioChunk> {
+    if state.buffered_samples.is_empty() {
+        native_partial_reset_buffer(state);
+        return None;
+    }
+
+    let audio_ms = state.buffered_ms.round().max(0.0) as u64;
+    if !state.has_speech || (!force_short_tail && audio_ms < WHISPER_PARTIAL_MIN_TAIL_MS) {
+        native_partial_reset_buffer(state);
+        return None;
+    }
+
+    let start_ms = state.buffered_start_ms.round().max(0.0) as u64;
+    let end_ms = (state.buffered_start_ms + state.buffered_ms)
+        .round()
+        .max(start_ms as f64) as u64;
+    let samples = std::mem::take(&mut state.buffered_samples);
+    let chunk = NativePartialAudioChunk {
+        index: state.next_index,
+        start_ms,
+        end_ms,
+        audio_ms,
+        samples,
+        sample_rate,
+        peak: state.peak,
+        rms: state.rms,
+        reason: reason.to_string(),
+    };
+    state.next_index += 1;
+    state.buffered_start_ms = state.total_ms;
+    state.buffered_ms = 0.0;
+    state.silence_ms = 0.0;
+    state.peak = 0.0;
+    state.rms = 0.0;
+    state.has_speech = false;
+
+    Some(chunk)
+}
+
+fn native_partial_ingest_samples(
+    state: &mut NativePartialCaptureState,
+    samples: &[f32],
+    duration_ms: f64,
+    rms: f32,
+    peak: f32,
+    sample_rate: u32,
+) -> Option<NativePartialAudioChunk> {
+    if samples.is_empty() || duration_ms <= 0.0 {
+        return None;
+    }
+
+    let rms_db = audio_rms_dbfs(rms);
+    let speech_threshold = (state.noise_floor_db + 10.0).max(-45.0);
+    let silence_threshold = (state.noise_floor_db + 6.0).max(-50.0);
+    let speech = rms_db > speech_threshold || peak >= 0.035;
+    let quiet = rms_db <= silence_threshold && peak < 0.025;
+
+    if speech {
+        state.has_speech = true;
+        state.silence_ms = 0.0;
+    } else if quiet || !state.has_speech {
+        state.silence_ms += duration_ms;
+        let blend = if state.has_speech { 0.01 } else { 0.05 };
+        state.noise_floor_db = (state.noise_floor_db * (1.0 - blend)) + (rms_db * blend);
+    } else {
+        state.silence_ms = 0.0;
+    }
+
+    state.buffered_samples.extend_from_slice(samples);
+    state.buffered_ms += duration_ms;
+    state.total_ms += duration_ms;
+    state.peak = state.peak.max(peak);
+    state.rms = state.rms.max(rms);
+
+    if state.buffered_ms >= state.min_chunk_ms as f64
+        && state.silence_ms >= state.silence_cut_ms as f64
+    {
+        return native_partial_take_chunk(state, sample_rate, "quiet-gap", false);
+    }
+
+    if state.buffered_ms >= state.max_chunk_ms as f64 {
+        return native_partial_take_chunk(state, sample_rate, "max-length", false);
+    }
+
+    None
+}
+
 fn process_native_audio_samples(
     app: &AppHandle,
     device_id: &str,
@@ -1402,6 +1691,8 @@ fn process_native_audio_samples(
 
     let mut realtime_audio = None;
     let mut realtime_audio_tx = None;
+    let mut partial_chunk_tx = None;
+    let mut partial_chunk = None;
     let stats = {
         let mut shared = match shared.lock() {
             Ok(shared) => shared,
@@ -1409,7 +1700,13 @@ fn process_native_audio_samples(
         };
         let now = Instant::now();
         let (rms, peak) = native_audio_stats(&samples);
-        let duration_ms = (samples.len() as f64 / shared.sample_rate as f64) * 1000.0;
+        let sample_rate = shared.sample_rate;
+        let duration_ms = (samples.len() as f64 / sample_rate as f64) * 1000.0;
+        let partial_samples = if shared.partial_capture.is_some() {
+            Some(samples.clone())
+        } else {
+            None
+        };
 
         if shared.capture_started_at.is_some() {
             realtime_audio_tx = shared.realtime_audio_tx.clone();
@@ -1436,6 +1733,20 @@ fn process_native_audio_samples(
             shared.capture_input_ms += duration_ms;
             shared.capture_peak = shared.capture_peak.max(peak);
             shared.capture_rms = shared.capture_rms.max(rms);
+        }
+
+        if let (Some(partial), Some(partial_samples)) =
+            (shared.partial_capture.as_mut(), partial_samples.as_deref())
+        {
+            partial_chunk_tx = Some(partial.chunk_tx.clone());
+            partial_chunk = native_partial_ingest_samples(
+                partial,
+                partial_samples,
+                duration_ms,
+                rms,
+                peak,
+                sample_rate,
+            );
         }
 
         // Full-rate stats only while a consumer actually needs the live
@@ -1482,6 +1793,10 @@ fn process_native_audio_samples(
 
     if let (Some(audio_tx), Some(audio_bytes)) = (realtime_audio_tx, realtime_audio) {
         let _ = audio_tx.send(audio_bytes);
+    }
+
+    if let (Some(chunk_tx), Some(chunk)) = (partial_chunk_tx, partial_chunk) {
+        let _ = chunk_tx.send(chunk);
     }
 }
 
@@ -2137,10 +2452,104 @@ fn encode_native_wav(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     bytes
 }
 
+fn native_bounded_whisper_samples(samples: Vec<f32>, sample_rate: u32) -> (Vec<f32>, u64) {
+    let max_samples = (sample_rate as f64 * AUDIO_CAPTURE_MAX_SECONDS).round() as usize;
+    let bounded_samples = if samples.len() > max_samples {
+        samples[samples.len() - max_samples..].to_vec()
+    } else {
+        samples
+    };
+    let audio_ms =
+        ((bounded_samples.len() as f64 / sample_rate as f64) * 1000.0).round() as u64;
+
+    (bounded_samples, audio_ms)
+}
+
+fn prepare_native_whisper_capture_wav(
+    source: &str,
+    started_at: Instant,
+    sample_rate: u32,
+    samples: Vec<f32>,
+    candidate_chunks: usize,
+    capture_chunk_count: u64,
+    capture_input_ms: f64,
+    capture_peak: f32,
+    capture_rms: f32,
+) -> Result<(Vec<u8>, u64), String> {
+    if samples.is_empty() {
+        return Err("No audio captured.".to_string());
+    }
+
+    let (bounded_samples, audio_ms) = native_bounded_whisper_samples(samples, sample_rate);
+    let resample_started_at = Instant::now();
+    let resampled = match resample_whisper_audio_to_16khz(&bounded_samples, sample_rate) {
+        Ok(samples) => samples,
+        Err(error) => {
+            log_whisper_local_audio_event(
+                "audio.resample.error",
+                Some(resample_started_at.elapsed()),
+                json!({
+                    "source": source,
+                    "sample_rate": sample_rate,
+                    "target_sample_rate": AUDIO_TARGET_SAMPLE_RATE,
+                    "input_samples": bounded_samples.len(),
+                    "error": clean_whisper_local_audio_log_text(&error),
+                }),
+            );
+            return Err(error);
+        }
+    };
+    let resample_elapsed = resample_started_at.elapsed();
+    let wav_bytes = encode_native_wav(&resampled, AUDIO_TARGET_SAMPLE_RATE);
+
+    log_whisper_local_audio_event(
+        "audio.capture.prepare.done",
+        Some(started_at.elapsed()),
+        json!({
+            "source": source,
+            "sample_rate": sample_rate,
+            "target_sample_rate": AUDIO_TARGET_SAMPLE_RATE,
+            "candidate_chunks": candidate_chunks,
+            "capture_chunk_count": capture_chunk_count,
+            "capture_input_ms": capture_input_ms,
+            "capture_peak": capture_peak,
+            "capture_rms": capture_rms,
+            "audio_ms": audio_ms,
+            "captured_samples": bounded_samples.len(),
+            "resampled_samples": resampled.len(),
+            "resample_elapsed_ms": resample_elapsed.as_secs_f64() * 1000.0,
+            "wav_bytes": wav_bytes.len(),
+        }),
+    );
+
+    Ok((wav_bytes, audio_ms))
+}
+
 fn finish_native_whisper_audio_capture(
     shared: &mut NativeAudioShared,
 ) -> Result<(Vec<u8>, u64), String> {
     let started_at = Instant::now();
+    if let Some(finished) = shared.partial_finished_capture.take() {
+        shared.capture_started_at = None;
+        shared.capture_chunk_count = 0;
+        shared.capture_input_ms = 0.0;
+        shared.capture_peak = 0.0;
+        shared.capture_rms = 0.0;
+        native_audio_trim(shared);
+
+        return prepare_native_whisper_capture_wav(
+            "partial-fallback",
+            started_at,
+            finished.sample_rate,
+            finished.samples,
+            finished.candidate_chunks,
+            finished.capture_chunk_count,
+            finished.capture_input_ms,
+            finished.capture_peak,
+            finished.capture_rms,
+        );
+    }
+
     let capture_started_at = shared
         .capture_started_at
         .take()
@@ -2166,58 +2575,17 @@ fn finish_native_whisper_audio_capture(
         .flat_map(|chunk| chunk.samples.iter().copied())
         .collect::<Vec<_>>();
 
-    if captured_samples.is_empty() {
-        return Err("No audio captured.".to_string());
-    }
-
-    let max_samples = (shared.sample_rate as f64 * AUDIO_CAPTURE_MAX_SECONDS).round() as usize;
-    let bounded_samples = if captured_samples.len() > max_samples {
-        captured_samples[captured_samples.len() - max_samples..].to_vec()
-    } else {
-        captured_samples
-    };
-    let audio_ms =
-        ((bounded_samples.len() as f64 / shared.sample_rate as f64) * 1000.0).round() as u64;
-    let resample_started_at = Instant::now();
-    let resampled = match resample_whisper_audio_to_16khz(&bounded_samples, shared.sample_rate) {
-        Ok(samples) => samples,
-        Err(error) => {
-            log_whisper_local_audio_event(
-                "audio.resample.error",
-                Some(resample_started_at.elapsed()),
-                json!({
-                    "sample_rate": shared.sample_rate,
-                    "target_sample_rate": AUDIO_TARGET_SAMPLE_RATE,
-                    "input_samples": bounded_samples.len(),
-                    "error": clean_whisper_local_audio_log_text(&error),
-                }),
-            );
-            return Err(error);
-        }
-    };
-    let resample_elapsed = resample_started_at.elapsed();
-    let wav_bytes = encode_native_wav(&resampled, AUDIO_TARGET_SAMPLE_RATE);
-
-    log_whisper_local_audio_event(
-        "audio.capture.prepare.done",
-        Some(started_at.elapsed()),
-        json!({
-            "sample_rate": shared.sample_rate,
-            "target_sample_rate": AUDIO_TARGET_SAMPLE_RATE,
-            "candidate_chunks": candidate_chunks,
-            "capture_chunk_count": capture_chunk_count,
-            "capture_input_ms": capture_input_ms,
-            "capture_peak": capture_peak,
-            "capture_rms": capture_rms,
-            "audio_ms": audio_ms,
-            "captured_samples": bounded_samples.len(),
-            "resampled_samples": resampled.len(),
-            "resample_elapsed_ms": resample_elapsed.as_secs_f64() * 1000.0,
-            "wav_bytes": wav_bytes.len(),
-        }),
-    );
-
-    Ok((wav_bytes, audio_ms))
+    prepare_native_whisper_capture_wav(
+        "live",
+        started_at,
+        shared.sample_rate,
+        captured_samples,
+        candidate_chunks,
+        capture_chunk_count,
+        capture_input_ms,
+        capture_peak,
+        capture_rms,
+    )
 }
 
 fn native_audio_status(session: &NativeAudioSession) -> AudioInputMonitorStatus {
@@ -2559,6 +2927,7 @@ fn begin_native_audio_capture_for_session(
     shared.capture_input_ms = preroll_input_ms;
     shared.capture_peak = preroll_peak;
     shared.capture_rms = preroll_rms;
+    shared.partial_finished_capture = None;
     let buffer_chunks = shared.chunks.len();
     drop(shared);
 
@@ -2587,6 +2956,162 @@ fn begin_native_audio_capture_for_session(
     Ok(())
 }
 
+fn begin_native_audio_partial_capture_for_session(
+    session: Option<&NativeAudioSession>,
+    session_id: String,
+    chunk_tx: mpsc::UnboundedSender<NativePartialAudioChunk>,
+    min_chunk_ms: u64,
+    max_chunk_ms: u64,
+    silence_ms: u64,
+) -> Result<(), String> {
+    let session = session.ok_or_else(|| {
+        "Choose and enable a microphone in the Audio tab before recording.".to_string()
+    })?;
+    let mut queued_chunks = Vec::new();
+    let mut shared = session
+        .shared
+        .lock()
+        .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
+
+    let capture_started_at = shared
+        .capture_started_at
+        .ok_or_else(|| "Recorder is not armed.".to_string())?;
+    shared.partial_finished_capture = None;
+    let mut partial = native_partial_capture_state(
+        session_id,
+        chunk_tx.clone(),
+        min_chunk_ms,
+        max_chunk_ms,
+        silence_ms,
+    );
+    let sample_rate = shared.sample_rate;
+    let candidates = shared
+        .chunks
+        .iter()
+        .filter(|chunk| native_audio_chunk_reaches(chunk, capture_started_at))
+        .map(|chunk| (chunk.samples.clone(), chunk.duration_ms))
+        .collect::<Vec<_>>();
+
+    for (samples, duration_ms) in candidates {
+        let (rms, peak) = native_audio_stats(&samples);
+        if let Some(chunk) =
+            native_partial_ingest_samples(&mut partial, &samples, duration_ms, rms, peak, sample_rate)
+        {
+            queued_chunks.push(chunk);
+        }
+    }
+
+    shared.partial_capture = Some(partial);
+    drop(shared);
+
+    for chunk in queued_chunks {
+        let _ = chunk_tx.send(chunk);
+    }
+
+    Ok(())
+}
+
+fn finish_native_audio_partial_capture_for_session(
+    session: Option<&NativeAudioSession>,
+    session_id: &str,
+) -> Result<(), String> {
+    let session = session.ok_or_else(|| {
+        "Choose and enable a microphone in the Audio tab before recording.".to_string()
+    })?;
+    let mut final_chunk = None;
+    let mut final_chunk_tx = None;
+    let mut shared = session
+        .shared
+        .lock()
+        .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
+
+    match shared.partial_capture.take() {
+        Some(mut partial) if partial.session_id == session_id => {
+            final_chunk_tx = Some(partial.chunk_tx.clone());
+            final_chunk =
+                native_partial_take_chunk(&mut partial, shared.sample_rate, "final", true);
+            if let Some(capture_started_at) = shared.capture_started_at.take() {
+                let candidates = shared
+                    .chunks
+                    .iter()
+                    .filter(|chunk| native_audio_chunk_reaches(chunk, capture_started_at))
+                    .collect::<Vec<_>>();
+                let captured_samples = candidates
+                    .iter()
+                    .flat_map(|chunk| chunk.samples.iter().copied())
+                    .collect::<Vec<_>>();
+                let (samples, _) =
+                    native_bounded_whisper_samples(captured_samples, shared.sample_rate);
+                shared.partial_finished_capture = Some(NativePartialFinishedCapture {
+                    session_id: session_id.to_string(),
+                    sample_rate: shared.sample_rate,
+                    samples,
+                    candidate_chunks: candidates.len(),
+                    capture_chunk_count: shared.capture_chunk_count,
+                    capture_input_ms: shared.capture_input_ms,
+                    capture_peak: shared.capture_peak,
+                    capture_rms: shared.capture_rms,
+                });
+            } else {
+                shared.partial_finished_capture = None;
+            }
+            shared.capture_chunk_count = 0;
+            shared.capture_input_ms = 0.0;
+            shared.capture_peak = 0.0;
+            shared.capture_rms = 0.0;
+            native_audio_trim(&mut shared);
+        }
+        Some(partial) => {
+            shared.partial_capture = Some(partial);
+            return Err("Local Whisper partial session is not active.".to_string());
+        }
+        None => {}
+    }
+
+    drop(shared);
+
+    if let (Some(chunk_tx), Some(chunk)) = (final_chunk_tx, final_chunk) {
+        let _ = chunk_tx.send(chunk);
+    }
+
+    Ok(())
+}
+
+fn cancel_native_audio_partial_capture_for_session(
+    session: Option<&NativeAudioSession>,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    if let Some(session) = session {
+        let mut shared = session
+            .shared
+            .lock()
+            .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
+
+        let should_clear = session_id.is_none()
+            || shared
+                .partial_capture
+                .as_ref()
+                .is_some_and(|partial| Some(partial.session_id.as_str()) == session_id)
+            || shared
+                .partial_finished_capture
+                .as_ref()
+                .is_some_and(|finished| Some(finished.session_id.as_str()) == session_id);
+
+        if should_clear {
+            shared.partial_capture = None;
+            shared.partial_finished_capture = None;
+            shared.capture_started_at = None;
+            shared.capture_chunk_count = 0;
+            shared.capture_input_ms = 0.0;
+            shared.capture_peak = 0.0;
+            shared.capture_rms = 0.0;
+            native_audio_trim(&mut shared);
+        }
+    }
+
+    Ok(())
+}
+
 fn finish_native_audio_capture_for_session(
     session: Option<&NativeAudioSession>,
 ) -> Result<AudioInputCaptureResult, String> {
@@ -2598,6 +3123,7 @@ fn finish_native_audio_capture_for_session(
         .shared
         .lock()
         .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
+    shared.partial_capture = None;
     let (wav_bytes, audio_ms) = match finish_native_whisper_audio_capture(&mut shared) {
         Ok(result) => result,
         Err(error) => {
@@ -3726,6 +4252,460 @@ fn transcribe_whisper_audio_for(
         segments,
         duration_ms: started_at.elapsed().as_millis(),
     })
+}
+
+fn transcribe_whisper_wav_bytes_for<F>(
+    app: &AppHandle,
+    warm_cache: &WhisperCliWarmCache,
+    audio_bytes: Vec<u8>,
+    audio_ms: Option<u64>,
+    capture_peak: Option<f32>,
+    capture_rms: Option<f32>,
+    temp_prefix: &str,
+    mut should_cancel: F,
+) -> Result<WhisperTranscriptionResult, String>
+where
+    F: FnMut() -> bool,
+{
+    let started_at = Instant::now();
+    if should_cancel() {
+        return Err("Local Whisper transcription canceled.".to_string());
+    }
+
+    if audio_bytes.len() > WHISPER_MAX_AUDIO_BYTES {
+        return Err("Recorded audio is too large to transcribe.".to_string());
+    }
+
+    let model_path = whisper_model_path(app)?;
+    if !model_path.exists() {
+        return Err("Install the local Whisper model before recording.".to_string());
+    }
+
+    let runtime_path = whisper_runtime_executable_path(app)?
+        .ok_or_else(|| "Install the local Whisper runtime before recording.".to_string())?;
+    let warm_started_at = Instant::now();
+    let warm_status = warm_cache.prepare(&model_path)?;
+    log_whisper_local_audio_event(
+        "whisper.partial.cache_warm.done",
+        Some(warm_started_at.elapsed()),
+        json!({
+            "cached": warm_status.cached,
+            "warmed_bytes": warm_status.warmed_bytes,
+            "model_path": warm_status.model_path,
+        }),
+    );
+
+    let temp_directory = whisper_model_directory(app)?.join("recordings");
+    fs::create_dir_all(&temp_directory)
+        .map_err(|error| format!("Unable to prepare audio recording directory: {error}"))?;
+    let safe_prefix = temp_prefix
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+        .take(80)
+        .collect::<String>();
+    let prefix = if safe_prefix.is_empty() {
+        "partial".to_string()
+    } else {
+        safe_prefix
+    };
+    let audio_path = temp_directory.join(format!("{prefix}-{}.wav", uuid::Uuid::new_v4()));
+    fs::write(&audio_path, &audio_bytes)
+        .map_err(|error| format!("Unable to prepare microphone audio: {error}"))?;
+
+    let runtime = runtime_path.display().to_string();
+    let model = model_path.display().to_string();
+    let audio = audio_path.display().to_string();
+    let thread_count = whisper_cli_thread_count().min(4).to_string();
+    let bias_prompt = voice_dictionary_whisper_prompt(app);
+    let mut args = vec![
+        "-m".to_string(),
+        model.clone(),
+        "-f".to_string(),
+        audio.clone(),
+        "-l".to_string(),
+        "en".to_string(),
+        "-t".to_string(),
+        thread_count.clone(),
+        "-nt".to_string(),
+        "-np".to_string(),
+        "-bo".to_string(),
+        "1".to_string(),
+        "-bs".to_string(),
+        "1".to_string(),
+        "-nf".to_string(),
+    ];
+    if let Some(prompt) = bias_prompt.as_ref() {
+        args.push("--prompt".to_string());
+        args.push(prompt.clone());
+    }
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let cli_started_at = Instant::now();
+    let capture_result = run_command_capture_with_cancel(
+        &runtime,
+        &arg_refs,
+        None,
+        Duration::from_secs(WHISPER_TRANSCRIBE_TIMEOUT_SECS),
+        None,
+        || should_cancel(),
+        "Local Whisper transcription canceled.",
+    );
+    let capture = match capture_result {
+        Ok(capture) => capture,
+        Err(error) => {
+            let _ = fs::remove_file(&audio_path);
+            log_whisper_local_audio_event(
+                "whisper.partial.cli.error",
+                Some(cli_started_at.elapsed()),
+                json!({
+                    "error": clean_whisper_local_audio_log_text(&error),
+                    "audio_path_removed": true,
+                }),
+            );
+            return Err(error);
+        }
+    };
+
+    let transcript = if capture.exit_code == Some(0) {
+        capture.stdout.trim().to_string()
+    } else {
+        command_output_text(&capture.stdout, &capture.stderr)
+    };
+    let policy = whisper_transcript_policy();
+    let request = WhisperTranscriptionRequest {
+        audio_base64: String::new(),
+        audio_ms,
+        capture_peak,
+        capture_rms,
+    };
+    let mut text = normalize_transcript_text(&transcript);
+    if whisper_local_transcript_drop_reason(policy, &request, &text).is_some() {
+        text.clear();
+    }
+    let _ = fs::remove_file(&audio_path);
+
+    if capture.exit_code != Some(0) && text.is_empty() {
+        let error = first_output_line(&command_output_text(&capture.stdout, &capture.stderr))
+            .chars()
+            .take(240)
+            .collect::<String>();
+        return Err(error);
+    }
+
+    log_whisper_local_audio_event(
+        "whisper.partial.done",
+        Some(started_at.elapsed()),
+        json!({
+            "exit_code": capture.exit_code,
+            "audio_bytes": audio_bytes.len(),
+            "audio_ms": audio_ms,
+            "raw_transcript_chars": transcript.chars().count(),
+            "clean_text_chars": text.chars().count(),
+        }),
+    );
+
+    Ok(WhisperTranscriptionResult {
+        segments: if text.is_empty() { 0 } else { 1 },
+        text,
+        duration_ms: started_at.elapsed().as_millis(),
+    })
+}
+
+fn local_whisper_partial_wav_bytes(chunk: &NativePartialAudioChunk) -> Result<Vec<u8>, String> {
+    let resampled = resample_whisper_audio_to_16khz(&chunk.samples, chunk.sample_rate)?;
+    Ok(encode_native_wav(&resampled, AUDIO_TARGET_SAMPLE_RATE))
+}
+
+fn local_whisper_partial_join_text(existing: &str, next: &str) -> String {
+    let existing = existing.trim();
+    let next = next.trim();
+    if existing.is_empty() {
+        return next.to_string();
+    }
+    if next.is_empty() {
+        return existing.to_string();
+    }
+
+    let existing_words = existing.split_whitespace().collect::<Vec<_>>();
+    let next_words = next.split_whitespace().collect::<Vec<_>>();
+    let max_overlap = existing_words.len().min(next_words.len()).min(12);
+    let mut overlap = 0usize;
+
+    for count in (1..=max_overlap).rev() {
+        let left = existing_words[existing_words.len() - count..]
+            .iter()
+            .map(|word| {
+                word.trim_matches(|ch: char| !ch.is_alphanumeric())
+                    .to_lowercase()
+            })
+            .collect::<Vec<_>>();
+        let right = next_words[..count]
+            .iter()
+            .map(|word| {
+                word.trim_matches(|ch: char| !ch.is_alphanumeric())
+                    .to_lowercase()
+            })
+            .collect::<Vec<_>>();
+        if left == right && left.iter().any(|word| !word.is_empty()) {
+            overlap = count;
+            break;
+        }
+    }
+
+    let suffix = next_words
+        .into_iter()
+        .skip(overlap)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if suffix.is_empty() {
+        existing.to_string()
+    } else if matches!(suffix.chars().next(), Some('.' | ',' | ';' | ':' | '?' | '!')) {
+        format!("{existing}{suffix}")
+    } else {
+        format!("{existing} {suffix}")
+    }
+}
+
+fn local_whisper_partial_assembled_text(chunks: &[LocalWhisperPartialChunkResult]) -> String {
+    let mut ordered = chunks.to_vec();
+    ordered.sort_by_key(|chunk| chunk.index);
+    let mut text = String::new();
+    for chunk in ordered {
+        text = local_whisper_partial_join_text(&text, &chunk.text);
+    }
+    text.trim().to_string()
+}
+
+#[cfg(test)]
+mod local_whisper_partial_tests {
+    use super::*;
+
+    #[test]
+    fn local_whisper_partial_join_text_removes_word_overlap() {
+        let text = local_whisper_partial_join_text(
+            "The first paragraph ends with a careful transition.",
+            "careful transition. Then the next idea starts.",
+        );
+
+        assert_eq!(
+            text,
+            "The first paragraph ends with a careful transition. Then the next idea starts."
+        );
+    }
+
+    #[test]
+    fn native_partial_ingest_emits_after_minimum_window_and_quiet_gap() {
+        let (chunk_tx, _chunk_rx) = mpsc::unbounded_channel();
+        let mut state =
+            native_partial_capture_state("session".to_string(), chunk_tx, 10_000, 35_000, 750);
+        let speech_samples = vec![0.08; 160];
+        let quiet_samples = vec![0.0; 160];
+
+        assert!(native_partial_ingest_samples(
+            &mut state,
+            &speech_samples,
+            5_000.0,
+            0.08,
+            0.08,
+            AUDIO_TARGET_SAMPLE_RATE,
+        )
+        .is_none());
+        assert!(native_partial_ingest_samples(
+            &mut state,
+            &speech_samples,
+            5_000.0,
+            0.08,
+            0.08,
+            AUDIO_TARGET_SAMPLE_RATE,
+        )
+        .is_none());
+
+        let chunk = native_partial_ingest_samples(
+            &mut state,
+            &quiet_samples,
+            800.0,
+            0.0,
+            0.0,
+            AUDIO_TARGET_SAMPLE_RATE,
+        )
+        .expect("quiet gap should emit a chunk");
+
+        assert_eq!(chunk.index, 0);
+        assert_eq!(chunk.start_ms, 0);
+        assert_eq!(chunk.end_ms, 10_800);
+        assert_eq!(chunk.audio_ms, 10_800);
+        assert_eq!(chunk.reason, "quiet-gap");
+    }
+
+    #[test]
+    fn finish_capture_uses_frozen_partial_fallback_snapshot() {
+        let sample_rate = AUDIO_TARGET_SAMPLE_RATE;
+        let mut shared = NativeAudioShared::new(sample_rate);
+        let live_samples = vec![0.02; sample_rate as usize * 3];
+
+        shared.capture_started_at = Some(Instant::now() - Duration::from_secs(3));
+        shared.capture_chunk_count = 3;
+        shared.capture_input_ms = 3_000.0;
+        shared.capture_peak = 0.02;
+        shared.capture_rms = 0.02;
+        shared.total_samples = live_samples.len();
+        shared.chunks.push_back(NativeAudioChunk {
+            duration_ms: 3_000.0,
+            samples: live_samples,
+            timestamp: Instant::now(),
+        });
+        shared.partial_finished_capture = Some(NativePartialFinishedCapture {
+            session_id: "session".to_string(),
+            sample_rate,
+            samples: vec![0.04; sample_rate as usize],
+            candidate_chunks: 1,
+            capture_chunk_count: 1,
+            capture_input_ms: 1_000.0,
+            capture_peak: 0.04,
+            capture_rms: 0.04,
+        });
+
+        let (wav_bytes, audio_ms) =
+            finish_native_whisper_audio_capture(&mut shared).expect("snapshot should encode");
+
+        assert_eq!(audio_ms, 1_000);
+        assert!(wav_bytes.len() > 44);
+        assert!(shared.partial_finished_capture.is_none());
+        assert!(shared.capture_started_at.is_none());
+        assert_eq!(shared.capture_chunk_count, 0);
+    }
+}
+
+fn emit_local_whisper_partial_transcript(
+    app: &AppHandle,
+    session_id: &str,
+    chunk_index: u64,
+    text: &str,
+    audio_ms: u64,
+    is_final: bool,
+) {
+    let _ = app.emit(
+        AUDIO_REALTIME_TRANSCRIPT_EVENT,
+        json!({
+            "provider": "whisper-local",
+            "sessionId": session_id,
+            "chunkIndex": chunk_index,
+            "text": text,
+            "isFinal": is_final,
+            "speechFinal": true,
+            "audioMs": audio_ms,
+            "historyId": "",
+        }),
+    );
+}
+
+async fn run_local_whisper_partial_session(
+    app: AppHandle,
+    engine: WhisperCliWarmCache,
+    session_id: String,
+    cancel_flag: Arc<AtomicBool>,
+    mut chunk_rx: mpsc::UnboundedReceiver<NativePartialAudioChunk>,
+    finished_tx: oneshot::Sender<Result<LocalWhisperPartialTranscriptionResult, String>>,
+) {
+    let started_at = Instant::now();
+    let mut chunks = Vec::<LocalWhisperPartialChunkResult>::new();
+    let mut last_audio_ms = 0u64;
+    let mut last_error: Option<String> = None;
+
+    while let Some(chunk) = chunk_rx.recv().await {
+        if cancel_flag.load(Ordering::Acquire) {
+            break;
+        }
+
+        last_audio_ms = last_audio_ms.max(chunk.end_ms);
+        let chunk_index = chunk.index;
+        let session_for_task = session_id.clone();
+        let app_for_task = app.clone();
+        let engine_for_task = engine.clone();
+        let cancel_for_task = Arc::clone(&cancel_flag);
+        let transcription = tauri::async_runtime::spawn_blocking(move || {
+            let wav_bytes = local_whisper_partial_wav_bytes(&chunk)?;
+            let prefix = format!("partial-{session_for_task}-{}", chunk.index);
+            let started = Instant::now();
+            let result = transcribe_whisper_wav_bytes_for(
+                &app_for_task,
+                &engine_for_task,
+                wav_bytes,
+                Some(chunk.audio_ms),
+                Some(chunk.peak),
+                Some(chunk.rms),
+                &prefix,
+                || cancel_for_task.load(Ordering::Acquire),
+            )?;
+            Ok::<LocalWhisperPartialChunkResult, String>(LocalWhisperPartialChunkResult {
+                index: chunk.index,
+                start_ms: chunk.start_ms,
+                end_ms: chunk.end_ms,
+                audio_ms: chunk.audio_ms,
+                text: result.text,
+                reason: chunk.reason,
+                duration_ms: started.elapsed().as_millis(),
+            })
+        })
+        .await;
+
+        match transcription {
+            Ok(Ok(result)) => {
+                if !result.text.trim().is_empty() {
+                    chunks.push(result);
+                    let assembled = local_whisper_partial_assembled_text(&chunks);
+                    emit_local_whisper_partial_transcript(
+                        &app,
+                        &session_id,
+                        chunk_index,
+                        &assembled,
+                        last_audio_ms,
+                        false,
+                    );
+                }
+            }
+            Ok(Err(error)) => {
+                if cancel_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                last_error = Some(error);
+            }
+            Err(error) => {
+                if cancel_flag.load(Ordering::Acquire) {
+                    break;
+                }
+                last_error = Some(format!("Unable to run local Whisper partial transcription: {error}"));
+            }
+        }
+    }
+
+    let text = local_whisper_partial_assembled_text(&chunks);
+    if !text.is_empty() {
+        emit_local_whisper_partial_transcript(
+            &app,
+            &session_id,
+            chunks.last().map(|chunk| chunk.index).unwrap_or(0),
+            &text,
+            last_audio_ms,
+            true,
+        );
+    }
+
+    if text.is_empty() {
+        if let Some(error) = last_error {
+            let _ = finished_tx.send(Err(error));
+            return;
+        }
+    }
+
+    let _ = finished_tx.send(Ok(LocalWhisperPartialTranscriptionResult {
+        segments: chunks.len(),
+        text,
+        duration_ms: started_at.elapsed().as_millis(),
+        audio_ms: last_audio_ms,
+        chunks,
+        partial: true,
+        cancelled: cancel_flag.load(Ordering::Acquire),
+    }));
 }
 
 fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
@@ -7316,6 +8296,218 @@ async fn transcribe_whisper_audio(
     })
     .await
     .map_err(|error| format!("Unable to run local Whisper transcription: {error}"))?
+}
+
+#[tauri::command]
+async fn start_local_whisper_partial_transcription(
+    app: AppHandle,
+    audio_state: State<'_, AudioState>,
+    request: LocalWhisperPartialStartRequest,
+) -> Result<LocalWhisperPartialStartStatus, String> {
+    let session_id = request.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err("Local Whisper partial session id is required.".to_string());
+    }
+
+    let min_chunk_ms = request.min_chunk_ms.unwrap_or(WHISPER_PARTIAL_MIN_CHUNK_MS);
+    let max_chunk_ms = request.max_chunk_ms.unwrap_or(WHISPER_PARTIAL_MAX_CHUNK_MS);
+    let silence_ms = request.silence_ms.unwrap_or(WHISPER_PARTIAL_SILENCE_MS);
+    let _history_id = request.history_id.unwrap_or_default();
+    let engine = audio_state.whisper_engine.clone();
+    let prepare_app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || prepare_whisper_model_for(&prepare_app, &engine))
+        .await
+        .map_err(|error| format!("Unable to prepare local Whisper partial transcription: {error}"))??;
+
+    let previous_session = {
+        let mut session_guard = audio_state.local_whisper_partial.lock().await;
+        session_guard.take()
+    };
+    if let Some(previous) = previous_session {
+        previous.cancel_flag.store(true, Ordering::Release);
+        let _ = audio_state
+            .input_worker
+            .cancel_partial_capture(Some(previous.session_id));
+    }
+
+    let (chunk_tx, chunk_rx) = mpsc::unbounded_channel::<NativePartialAudioChunk>();
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    let (finished_tx, finished_rx) =
+        oneshot::channel::<Result<LocalWhisperPartialTranscriptionResult, String>>();
+    let generation = audio_state
+        .local_whisper_partial_generation
+        .fetch_add(1, Ordering::AcqRel)
+        + 1;
+    let task_app = app.clone();
+    let task_engine = audio_state.whisper_engine.clone();
+    let task_session_id = session_id.clone();
+    let task_cancel = Arc::clone(&cancel_flag);
+    tauri::async_runtime::spawn(run_local_whisper_partial_session(
+        task_app,
+        task_engine,
+        task_session_id,
+        task_cancel,
+        chunk_rx,
+        finished_tx,
+    ));
+
+    {
+        let mut session_guard = audio_state.local_whisper_partial.lock().await;
+        *session_guard = Some(LocalWhisperPartialSession {
+            session_id: session_id.clone(),
+            cancel_flag: Arc::clone(&cancel_flag),
+            finished_rx: Some(finished_rx),
+        });
+    }
+
+    if let Err(error) = audio_state.input_worker.begin_partial_capture(
+        session_id.clone(),
+        chunk_tx,
+        min_chunk_ms,
+        max_chunk_ms,
+        silence_ms,
+    ) {
+        cancel_flag.store(true, Ordering::Release);
+        let mut session_guard = audio_state.local_whisper_partial.lock().await;
+        if session_guard
+            .as_ref()
+            .is_some_and(|session| session.session_id == session_id)
+        {
+            session_guard.take();
+        }
+        return Err(error);
+    }
+
+    if cancel_flag.load(Ordering::Acquire) {
+        let _ = audio_state
+            .input_worker
+            .cancel_partial_capture(Some(session_id.clone()));
+        return Err("Local Whisper partial transcription was canceled.".to_string());
+    }
+    log_audio_diagnostic_event(
+        "audio.whisper_partial.start",
+        json!({
+            "session_id": &session_id,
+            "generation": generation,
+            "min_chunk_ms": min_chunk_ms,
+            "max_chunk_ms": max_chunk_ms,
+            "silence_ms": silence_ms,
+        }),
+    );
+
+    Ok(LocalWhisperPartialStartStatus {
+        active: true,
+        session_id,
+    })
+}
+
+#[tauri::command]
+async fn stop_local_whisper_partial_transcription(
+    audio_state: State<'_, AudioState>,
+    request: LocalWhisperPartialStopRequest,
+) -> Result<LocalWhisperPartialTranscriptionResult, String> {
+    let session_id = request.session_id.trim().to_string();
+    if session_id.is_empty() {
+        return Err("Local Whisper partial session id is required.".to_string());
+    }
+
+    {
+        let session_guard = audio_state.local_whisper_partial.lock().await;
+        match session_guard.as_ref() {
+            Some(session) if session.session_id == session_id => {}
+            Some(session) => {
+                let active_session_id = session.session_id.clone();
+                return Err(format!(
+                    "Local Whisper partial session mismatch: active session is {active_session_id}."
+                ));
+            }
+            None => {
+                return Err("Local Whisper partial transcription is not active.".to_string());
+            }
+        }
+    };
+
+    audio_state
+        .input_worker
+        .finish_partial_capture(session_id.clone())?;
+
+    let session = {
+        let mut session_guard = audio_state.local_whisper_partial.lock().await;
+        match session_guard.take() {
+            Some(session) if session.session_id == session_id => session,
+            Some(session) => {
+                let active_session_id = session.session_id.clone();
+                *session_guard = Some(session);
+                return Err(format!(
+                    "Local Whisper partial session mismatch after stop: active session is {active_session_id}."
+                ));
+            }
+            None => {
+                return Err("Local Whisper partial transcription is no longer active.".to_string());
+            }
+        }
+    };
+    let cancel_flag = Arc::clone(&session.cancel_flag);
+    let finished_rx = session
+        .finished_rx
+        .ok_or_else(|| "Local Whisper partial transcription is already stopping.".to_string())?;
+
+    match timeout(
+        Duration::from_secs(WHISPER_PARTIAL_FINISH_TIMEOUT_SECS),
+        finished_rx,
+    )
+    .await
+    {
+        Ok(Ok(result)) => {
+            let _ = audio_state
+                .input_worker
+                .cancel_partial_capture(Some(session_id));
+            result
+        }
+        Ok(Err(_)) => Err("Local Whisper partial transcription stopped unexpectedly.".to_string()),
+        Err(_) => {
+            cancel_flag.store(true, Ordering::Release);
+            Err("Local Whisper partial transcription timed out while finishing.".to_string())
+        }
+    }
+}
+
+#[tauri::command]
+async fn cancel_local_whisper_partial_transcription(
+    audio_state: State<'_, AudioState>,
+    request: Option<LocalWhisperPartialCancelRequest>,
+) -> Result<(), String> {
+    let requested_session_id = request
+        .and_then(|value| value.session_id)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let session = {
+        let mut session_guard = audio_state.local_whisper_partial.lock().await;
+        if let Some(requested) = requested_session_id.as_deref() {
+            if session_guard
+                .as_ref()
+                .is_some_and(|session| session.session_id != requested)
+            {
+                return Ok(());
+            }
+        }
+        session_guard.take()
+    };
+
+    if let Some(session) = session {
+        session.cancel_flag.store(true, Ordering::Release);
+        let _ = audio_state
+            .input_worker
+            .cancel_partial_capture(Some(session.session_id));
+    } else if let Some(requested_session_id) = requested_session_id {
+        let _ = audio_state
+            .input_worker
+            .cancel_partial_capture(Some(requested_session_id));
+    } else {
+        let _ = audio_state.input_worker.cancel_partial_capture(None);
+    }
+
+    Ok(())
 }
 
 #[tauri::command]

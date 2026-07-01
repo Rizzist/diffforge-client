@@ -32,6 +32,7 @@ const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 60_000;
 const TOKENOMICS_HOT_TAIL_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TOKENOMICS_LIVE_LIMIT_REFRESH_INTERVAL_MS = 60_000;
 const TOKENOMICS_SUMMARY_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const TOKENOMICS_LIMIT_CLOUD_SYNC_REASON = "tokenomics_limits_changed";
 const TOKENOMICS_DAILY_WINDOW_DAYS = 30;
 const TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS = TOKENOMICS_DAILY_WINDOW_DAYS;
 const TOKENOMICS_DAILY_RANGE_OPTIONS = [7, TOKENOMICS_DAILY_WINDOW_DAYS];
@@ -2713,14 +2714,72 @@ function providerLimitDisplayedRemainingPercent(row = {}) {
   return null;
 }
 
+function tokenomicsLimitSignatureText(...values) {
+  for (const value of values) {
+    if (value == null) continue;
+    const text = String(value).trim();
+    if (text) return text.toLowerCase();
+  }
+  return "";
+}
+
+function tokenomicsLimitSignaturePercent(...values) {
+  const value = limitNumberOrNull(...values);
+  return value == null ? "" : String(Math.max(0, Math.min(100, Math.round(value))));
+}
+
+function tokenomicsLimitSignatureNumber(...values) {
+  const value = limitNumberOrNull(...values);
+  return value == null ? "" : String(Math.round(value));
+}
+
+function tokenomicsLimitResetSignature(row = {}) {
+  const reset = limitResetDate(row);
+  if (!reset) return "";
+  return String(Math.round(reset.getTime() / 60_000));
+}
+
+function providerLimitSyncSignature(row = {}) {
+  const remaining = providerLimitDisplayedRemainingPercent(row);
+  const used = tokenomicsLimitSignaturePercent(
+    row?.used_percent,
+    row?.usedPercent,
+    row?.limit_used_percent,
+    row?.limitUsedPercent,
+  );
+  const paceDelta = tokenomicsLimitSignatureNumber(row?.pace_delta_percent, row?.paceDeltaPercent);
+  const paceTrajectoryDelta = tokenomicsLimitSignatureNumber(
+    row?.pace_trajectory_delta_percent,
+    row?.paceTrajectoryDeltaPercent,
+  );
+  const projectedUsed = tokenomicsLimitSignatureNumber(
+    row?.pace_projected_used_percent,
+    row?.paceProjectedUsedPercent,
+    row?.pace_trajectory_projected_used_percent,
+    row?.paceTrajectoryProjectedUsedPercent,
+  );
+  return [
+    providerLimitKey(row),
+    `remaining:${remaining == null ? "" : remaining}`,
+    `used:${used}`,
+    `status:${tokenomicsLimitSignatureText(row?.status_label, row?.statusLabel)}`,
+    `pace:${tokenomicsLimitSignatureText(row?.pace_status, row?.paceStatus, row?.pace_trajectory_status, row?.paceTrajectoryStatus)}`,
+    `pace_delta:${paceDelta}`,
+    `pace_trajectory_delta:${paceTrajectoryDelta}`,
+    `projected_used:${projectedUsed}`,
+    `source:${tokenomicsLimitSignatureText(row?.limit_source, row?.limitSource, row?.source)}`,
+    `source_kind:${tokenomicsLimitSignatureText(row?.limit_source_kind, row?.limitSourceKind)}`,
+    `confidence:${tokenomicsLimitSignatureText(row?.confidence)}`,
+    `plan:${tokenomicsLimitSignatureText(row?.plan_name, row?.planName)}`,
+    `reset:${tokenomicsLimitResetSignature(row)}`,
+    `active:${providerLimitUsesActiveAccount(row) ? "1" : "0"}`,
+  ].join(";");
+}
+
 function tokenomicsLimitPercentSignature(summary = {}) {
   const limits = limitRowsForDisplay(summary);
   const limitSignature = mergeProviderLimits([], limits)
-    .map((row) => {
-      const remaining = providerLimitDisplayedRemainingPercent(row);
-      if (remaining == null) return "";
-      return `${providerLimitKey(row)}=${remaining}`;
-    })
+    .map(providerLimitSyncSignature)
     .filter(Boolean)
     .sort()
     .join("|");
@@ -2731,7 +2790,15 @@ function tokenomicsLimitPercentSignature(summary = {}) {
     .map((row) => {
       const used = limitNumberOrNull(row?.used_percent, row?.usedPercent, row?.limit_used_percent, row?.limitUsedPercent);
       if (used == null) return "";
-      return `${providerLimitSampleKey(row)}=${Math.round(used)}`;
+      const paceDelta = tokenomicsLimitSignatureNumber(row?.pace_delta_percent, row?.paceDeltaPercent);
+      return [
+        providerLimitSampleKey(row),
+        `used:${Math.max(0, Math.min(100, Math.round(used)))}`,
+        `pace:${tokenomicsLimitSignatureText(row?.pace_status, row?.paceStatus)}`,
+        `pace_delta:${paceDelta}`,
+        `source:${tokenomicsLimitSignatureText(row?.limit_source, row?.limitSource, row?.source)}`,
+        `confidence:${tokenomicsLimitSignatureText(row?.confidence)}`,
+      ].join(";");
     })
     .filter(Boolean)
     .sort()
@@ -2867,8 +2934,30 @@ function rememberTokenomicsLimitSignature(summary) {
 }
 
 function scheduleTokenomicsLimitCloudSync() {
-  tokenomicsStore.limitSyncPending = false;
-  tokenomicsStore.limitSyncInFlight = false;
+  tokenomicsStore.limitSyncPending = true;
+  if (tokenomicsStore.limitSyncInFlight) {
+    return;
+  }
+
+  scheduleTokenomicsIdleTask(() => {
+    if (!tokenomicsStore.limitSyncPending || tokenomicsStore.limitSyncInFlight) {
+      return;
+    }
+    tokenomicsStore.limitSyncPending = false;
+    tokenomicsStore.limitSyncInFlight = true;
+    invoke("cloud_mcp_schedule_tokenomics_sync", {
+      reason: TOKENOMICS_LIMIT_CLOUD_SYNC_REASON,
+      full: false,
+      resyncLast30Days: false,
+    })
+      .catch(() => {})
+      .finally(() => {
+        tokenomicsStore.limitSyncInFlight = false;
+        if (tokenomicsStore.limitSyncPending) {
+          scheduleTokenomicsLimitCloudSync();
+        }
+      });
+  }, { delayMs: 0, timeout: 1200 });
 }
 
 function mergeSummaryIntoTokenomicsStore(next, { syncLimitChanges = false } = {}) {
@@ -2879,7 +2968,7 @@ function mergeSummaryIntoTokenomicsStore(next, { syncLimitChanges = false } = {}
       const merged = mergeTokenomicsSummary(previous.summary, next || {});
       const previousSignature = tokenomicsStore.limitPercentSignature || tokenomicsLimitPercentSignature(previous.summary);
       nextSignature = tokenomicsLimitPercentSignature(merged);
-      shouldSyncLimits = Boolean(syncLimitChanges && previousSignature && nextSignature && previousSignature !== nextSignature);
+      shouldSyncLimits = Boolean(syncLimitChanges && nextSignature && previousSignature !== nextSignature);
       return merged;
     })(),
   }));

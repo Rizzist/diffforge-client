@@ -771,6 +771,7 @@ fn cloud_mcp_background_sync_ack(kind: &str, key: &str, reason: &str, extra: Val
 /// Reason tag for the every-minute background stamp/sync. Kept off the visible
 /// activity surface so the periodic sync does not flash a spinner each minute.
 const CLOUD_MCP_TOKENOMICS_PERIODIC_REASON: &str = "tokenomics_periodic";
+const CLOUD_MCP_TOKENOMICS_STARTUP_REASON: &str = "tokenomics_startup";
 /// Idle gap between the end of one stamp cycle and the start of the next. The
 /// SQLite handle is closed while we wait so the loop stays energy-cheap.
 const CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS: u64 = 60;
@@ -796,6 +797,16 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
             CLOUD_MCP_TOKENOMICS_PERIODIC_STARTUP_DELAY_SECS,
         ))
         .await;
+        if !app_shutdown_requested() {
+            let _ = cloud_mcp_enqueue_tokenomics_sync(
+                app.clone(),
+                &state,
+                CLOUD_MCP_TOKENOMICS_STARTUP_REASON.to_string(),
+                true,
+                false,
+            )
+            .await;
+        }
 
         let mut tokenomics_sync_pending_after_offline = false;
         loop {
@@ -1934,46 +1945,112 @@ fn cloud_mcp_table_primary_key_columns(
     Ok(columns.into_iter().map(|(_, name)| name).collect())
 }
 
+fn cloud_mcp_reset_table_if_primary_key_mismatch(
+    conn: &rusqlite::Connection,
+    table: &str,
+    expected: &[&str],
+) -> rusqlite::Result<()> {
+    let actual = cloud_mcp_table_primary_key_columns(conn, table)?;
+    if actual.is_empty() {
+        return Ok(());
+    }
+    let expected = expected
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    if actual != expected {
+        conn.execute(&format!("DROP TABLE IF EXISTS {table}"), [])?;
+    }
+    Ok(())
+}
+
 fn cloud_mcp_agent_chat_sync_state_prepare_schema(
     conn: &rusqlite::Connection,
 ) -> rusqlite::Result<()> {
-    let session_pk =
-        cloud_mcp_table_primary_key_columns(conn, CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE)?;
-    let record_pk =
-        cloud_mcp_table_primary_key_columns(conn, CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE)?;
-    let session_pk_expected = [
-        "scope_key",
-        "device_id",
-        "workspace_id",
-        "provider",
-        "session_id",
-    ];
-    let record_pk_expected = [
-        "scope_key",
-        "device_id",
-        "workspace_id",
-        "provider",
-        "session_id",
-        "record_key",
-    ];
-    let reset_session = !session_pk.is_empty()
-        && session_pk
-            != session_pk_expected
-                .iter()
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>();
-    let reset_record = !record_pk.is_empty()
-        && record_pk
-            != record_pk_expected
-                .iter()
-                .map(|value| value.to_string())
-                .collect::<Vec<_>>();
-    if reset_session || reset_record {
-        conn.execute_batch(&format!(
-            "DROP TABLE IF EXISTS {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE};
-             DROP TABLE IF EXISTS {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE};"
-        ))?;
-    }
+    cloud_mcp_reset_table_if_primary_key_mismatch(conn, CLOUD_MCP_OUTBOX_TABLE, &["outbox_id"])?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE,
+        &[
+            "scope_key",
+            "device_id",
+            "workspace_id",
+            "provider",
+            "session_id",
+        ],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE,
+        &[
+            "scope_key",
+            "device_id",
+            "workspace_id",
+            "provider",
+            "session_id",
+            "record_key",
+        ],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE,
+        &["device_id", "billing_scope_key"],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_TOKENOMICS_DAY_SYNC_STATE_TABLE,
+        &["device_id", "billing_scope_key", "day_start_ms"],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_ARCHITECTURE_GRAPH_SYNC_STATE_TABLE,
+        &["scope_key", "device_id", "graph_id"],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE,
+        &["scope_key", "device_id", "sync_unit"],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_ASSET_DEVICE_SYNC_STATE_TABLE,
+        &["scope_key", "device_id", "asset_id"],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_LOOPSPACE_MIRROR_TABLE,
+        &["scope_key", "loopspace_id"],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_LOOPSPACE_SYNC_STATE_TABLE,
+        &["scope_key"],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_LOOPSPACE_TRIGGER_MIRROR_TABLE,
+        &["scope_key", "trigger_id"],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_MIRROR_TABLE,
+        &["scope_key", "run_id"],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_LOOPSPACE_MIRROR_TABLE,
+        &["scope_key", "loopspace_id", "run_id"],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE,
+        &["scope_key", "event_id"],
+    )?;
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_LOOPSPACE_TRIGGER_SYNC_STATE_TABLE,
+        &["scope_key"],
+    )?;
     Ok(())
 }
 
@@ -7260,7 +7337,10 @@ fn cloud_mcp_tokenomics_sync_reason_visible(
 ) -> bool {
     // The every-minute background stamp/sync stays off the activity surface;
     // user- and event-triggered syncs remain visible.
-    reason != CLOUD_MCP_TOKENOMICS_PERIODIC_REASON
+    !matches!(
+        reason,
+        CLOUD_MCP_TOKENOMICS_PERIODIC_REASON | CLOUD_MCP_TOKENOMICS_STARTUP_REASON
+    )
 }
 
 async fn cloud_mcp_enqueue_tokenomics_sync(
@@ -29722,8 +29802,8 @@ async fn cloud_mcp_delete_agent_chat_session(
 
 #[tauri::command]
 async fn cloud_mcp_sync_tokenomics_state(
-    _app: AppHandle,
-    _state: State<'_, CloudMcpState>,
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
     _summary: Value,
     reason: Option<String>,
     delta: Option<bool>,
@@ -29739,16 +29819,26 @@ async fn cloud_mcp_sync_tokenomics_state(
                 CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT.to_string()
             }
         });
+    let queued_job = cloud_mcp_enqueue_tokenomics_sync(
+        app,
+        state.inner(),
+        clean_reason.clone(),
+        !is_delta,
+        false,
+    )
+    .await;
     Ok(cloud_mcp_background_sync_ack(
         "tokenomics_sync",
         "tokenomics:scan",
         &clean_reason,
         json!({
             "delta": is_delta,
-            "full": false,
+            "full": queued_job.force_full,
             "queued_reason": clean_reason,
-            "queued": false,
-            "local_only": true,
+            "queued": true,
+            "local_only": false,
+            "enqueued_ms": queued_job.enqueued_ms,
+            "force_resync": queued_job.force_resync,
             "sync_protocol": CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL,
             "syncProtocol": CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL,
             "tokenomics_event_kind": if is_delta {
@@ -29762,8 +29852,8 @@ async fn cloud_mcp_sync_tokenomics_state(
 
 #[tauri::command]
 async fn cloud_mcp_schedule_tokenomics_sync(
-    _app: AppHandle,
-    _state: State<'_, CloudMcpState>,
+    app: AppHandle,
+    state: State<'_, CloudMcpState>,
     reason: Option<String>,
     full: Option<bool>,
     resync_last_30_days: Option<bool>,
@@ -29774,17 +29864,26 @@ async fn cloud_mcp_schedule_tokenomics_sync(
         .unwrap_or_else(|| CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT.to_string());
     let force_full = full.unwrap_or(false);
     let force_resync = resync_last_30_days.unwrap_or(false);
+    let queued_job = cloud_mcp_enqueue_tokenomics_sync(
+        app,
+        state.inner(),
+        clean_reason.clone(),
+        force_full,
+        force_resync,
+    )
+    .await;
 
     Ok(cloud_mcp_background_sync_ack(
         "tokenomics_sync",
         "tokenomics:scan",
         &clean_reason,
         json!({
-            "full": force_full,
-            "resync_last_30_days": force_resync,
+            "full": queued_job.force_full,
+            "resync_last_30_days": queued_job.force_resync,
             "queued_reason": clean_reason,
-            "queued": false,
-            "local_only": true,
+            "queued": true,
+            "local_only": false,
+            "enqueued_ms": queued_job.enqueued_ms,
         }),
     ))
 }
@@ -38692,6 +38791,11 @@ fn cloud_mcp_asset_library_db_path() -> Option<PathBuf> {
 }
 
 fn cloud_mcp_asset_library_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    cloud_mcp_reset_table_if_primary_key_mismatch(
+        conn,
+        CLOUD_MCP_ASSET_DEVICE_SYNC_STATE_TABLE,
+        &["scope_key", "device_id", "asset_id"],
+    )?;
     conn.execute_batch(
         "
         PRAGMA journal_mode = WAL;
@@ -48566,6 +48670,216 @@ mod cloud_mcp_tests {
             transport: "direct_cloud_container".to_string(),
         });
         assert!(cloud_mcp_last_direct_route_fresh("/v1/voice/ws").is_none());
+    }
+
+    #[test]
+    fn sync_state_prepare_schema_rolls_back_stale_primary_keys() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        fn assert_table_pk(conn: &rusqlite::Connection, table: &str, expected: &[&str]) {
+            let expected = expected
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                cloud_mcp_table_primary_key_columns(conn, table).unwrap(),
+                expected,
+                "unexpected primary key for {table}"
+            );
+        }
+
+        conn.execute_batch(
+            &format!(
+                "
+                CREATE TABLE {CLOUD_MCP_OUTBOX_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    outbox_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, outbox_id)
+                );
+                CREATE TABLE {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    stale_scope_b TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    device_id TEXT NOT NULL DEFAULT '',
+                    workspace_id TEXT NOT NULL DEFAULT '',
+                    provider TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, stale_scope_b, scope_key, device_id, workspace_id, provider, session_id)
+                );
+                CREATE TABLE {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    device_id TEXT NOT NULL DEFAULT '',
+                    workspace_id TEXT NOT NULL DEFAULT '',
+                    provider TEXT NOT NULL DEFAULT '',
+                    session_id TEXT NOT NULL DEFAULT '',
+                    record_key TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, scope_key, device_id, workspace_id, provider, session_id, record_key)
+                );
+                CREATE TABLE {CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    stale_scope_b TEXT NOT NULL DEFAULT '',
+                    device_id TEXT NOT NULL DEFAULT '',
+                    billing_scope_key TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, stale_scope_b, device_id, billing_scope_key)
+                );
+                CREATE TABLE {CLOUD_MCP_TOKENOMICS_DAY_SYNC_STATE_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    device_id TEXT NOT NULL DEFAULT '',
+                    billing_scope_key TEXT NOT NULL DEFAULT '',
+                    day_start_ms INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(stale_scope_a, device_id, billing_scope_key, day_start_ms)
+                );
+                CREATE TABLE {CLOUD_MCP_ARCHITECTURE_GRAPH_SYNC_STATE_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    device_id TEXT NOT NULL DEFAULT '',
+                    graph_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, scope_key, device_id, graph_id)
+                );
+                CREATE TABLE {CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    stale_scope_b TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    device_id TEXT NOT NULL DEFAULT '',
+                    sync_unit TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, stale_scope_b, scope_key, device_id, sync_unit)
+                );
+                CREATE TABLE {CLOUD_MCP_ASSET_DEVICE_SYNC_STATE_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    device_id TEXT NOT NULL DEFAULT '',
+                    asset_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, scope_key, device_id, asset_id)
+                );
+                CREATE TABLE {CLOUD_MCP_LOOPSPACE_MIRROR_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    loopspace_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, scope_key, loopspace_id)
+                );
+                CREATE TABLE {CLOUD_MCP_LOOPSPACE_SYNC_STATE_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, scope_key)
+                );
+                CREATE TABLE {CLOUD_MCP_LOOPSPACE_TRIGGER_MIRROR_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    trigger_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, scope_key, trigger_id)
+                );
+                CREATE TABLE {CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_MIRROR_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    run_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, scope_key, run_id)
+                );
+                CREATE TABLE {CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_LOOPSPACE_MIRROR_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    loopspace_id TEXT NOT NULL DEFAULT '',
+                    run_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, scope_key, loopspace_id, run_id)
+                );
+                CREATE TABLE {CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    event_id TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, scope_key, event_id)
+                );
+                CREATE TABLE {CLOUD_MCP_LOOPSPACE_TRIGGER_SYNC_STATE_TABLE}(
+                    stale_scope_a TEXT NOT NULL DEFAULT '',
+                    scope_key TEXT NOT NULL DEFAULT '',
+                    PRIMARY KEY(stale_scope_a, scope_key)
+                );
+                "
+            ),
+        )
+        .unwrap();
+
+        cloud_mcp_asset_library_init_conn(&conn).unwrap();
+        cloud_mcp_outbox_init_conn(&conn).unwrap();
+
+        assert_table_pk(&conn, CLOUD_MCP_OUTBOX_TABLE, &["outbox_id"]);
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE,
+            &[
+                "scope_key",
+                "device_id",
+                "workspace_id",
+                "provider",
+                "session_id",
+            ],
+        );
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE,
+            &[
+                "scope_key",
+                "device_id",
+                "workspace_id",
+                "provider",
+                "session_id",
+                "record_key",
+            ],
+        );
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE,
+            &["device_id", "billing_scope_key"],
+        );
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_TOKENOMICS_DAY_SYNC_STATE_TABLE,
+            &["device_id", "billing_scope_key", "day_start_ms"],
+        );
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_ARCHITECTURE_GRAPH_SYNC_STATE_TABLE,
+            &["scope_key", "device_id", "graph_id"],
+        );
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_DEVICE_LIVE_SYNC_STATE_TABLE,
+            &["scope_key", "device_id", "sync_unit"],
+        );
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_ASSET_DEVICE_SYNC_STATE_TABLE,
+            &["scope_key", "device_id", "asset_id"],
+        );
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_LOOPSPACE_MIRROR_TABLE,
+            &["scope_key", "loopspace_id"],
+        );
+        assert_table_pk(&conn, CLOUD_MCP_LOOPSPACE_SYNC_STATE_TABLE, &["scope_key"]);
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_LOOPSPACE_TRIGGER_MIRROR_TABLE,
+            &["scope_key", "trigger_id"],
+        );
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_MIRROR_TABLE,
+            &["scope_key", "run_id"],
+        );
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_LOOPSPACE_TRIGGER_RUN_LOOPSPACE_MIRROR_TABLE,
+            &["scope_key", "loopspace_id", "run_id"],
+        );
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_LOOPSPACE_RUNTIME_EVENT_MIRROR_TABLE,
+            &["scope_key", "event_id"],
+        );
+        assert_table_pk(
+            &conn,
+            CLOUD_MCP_LOOPSPACE_TRIGGER_SYNC_STATE_TABLE,
+            &["scope_key"],
+        );
     }
 
     #[test]

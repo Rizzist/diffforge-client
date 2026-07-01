@@ -29036,6 +29036,7 @@ export default function App() {
     native_session_id = "",
     providerSessionId = "",
     provider_session_id = "",
+    reuseExistingSession = true,
     role = "",
     sessionId = "",
     sessionTitle = "",
@@ -29083,7 +29084,7 @@ export default function App() {
         || session_id
         || "",
     ).trim();
-    if (requestedProviderSessionId) {
+    if (reuseExistingSession && requestedProviderSessionId) {
       const existingTerminal = currentIndexes
         .map((terminalIndex) => {
           const terminalRole = normalizeWorkspaceTerminalRole(
@@ -32862,6 +32863,7 @@ export default function App() {
     const added = addWorkspaceTerminal({
       model: String(item?.modelId || item?.model_id || "").trim(),
       providerSessionId: targetProviderSessionId,
+      reuseExistingSession: false,
       role,
       sessionTitle: String(item?.title || "").trim(),
       source: "session_history_open_terminal",

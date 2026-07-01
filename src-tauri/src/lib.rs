@@ -346,8 +346,15 @@ const AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT: &str = "forge-audio-model-download-pr
 const AUDIO_INPUT_STATS_EVENT: &str = "forge-audio-input-stats";
 const AUDIO_TARGET_SAMPLE_RATE: u32 = 16_000;
 const AUDIO_BUFFER_MAX_SECONDS: f64 = 3.0;
-const AUDIO_CAPTURE_MAX_SECONDS: f64 = 90.0;
+// Match the widget's locked recording window. Local Whisper receives one WAV
+// after release, so trimming shorter here silently drops the start of long takes.
+const AUDIO_CAPTURE_MAX_SECONDS: f64 = 900.0;
 const AUDIO_CAPTURE_PREROLL_MS: u64 = 500;
+const WHISPER_PARTIAL_MIN_CHUNK_MS: u64 = 10_000;
+const WHISPER_PARTIAL_MAX_CHUNK_MS: u64 = 35_000;
+const WHISPER_PARTIAL_SILENCE_MS: u64 = 750;
+const WHISPER_PARTIAL_MIN_TAIL_MS: u64 = 1_200;
+const WHISPER_PARTIAL_FINISH_TIMEOUT_SECS: u64 = 600;
 /// Live input-stats emit cadence while actively recording or feeding an agent
 /// stream — a smooth ~17 fps meter/waveform.
 const AUDIO_STATS_INTERVAL_MS: u64 = 60;
@@ -934,6 +941,8 @@ struct AudioState {
     shortcut_manager: AudioShortcutManager,
     whisper_cancel_token: Arc<AtomicU64>,
     whisper_engine: WhisperCliWarmCache,
+    local_whisper_partial: Arc<Mutex<Option<LocalWhisperPartialSession>>>,
+    local_whisper_partial_generation: Arc<AtomicU64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -2417,6 +2426,65 @@ struct WhisperTranscriptionResult {
     text: String,
     segments: usize,
     duration_ms: u128,
+}
+
+struct LocalWhisperPartialSession {
+    session_id: String,
+    cancel_flag: Arc<AtomicBool>,
+    finished_rx: Option<oneshot::Receiver<Result<LocalWhisperPartialTranscriptionResult, String>>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalWhisperPartialStartRequest {
+    session_id: String,
+    history_id: Option<String>,
+    min_chunk_ms: Option<u64>,
+    max_chunk_ms: Option<u64>,
+    silence_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalWhisperPartialStopRequest {
+    session_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalWhisperPartialCancelRequest {
+    session_id: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalWhisperPartialStartStatus {
+    active: bool,
+    session_id: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalWhisperPartialChunkResult {
+    index: u64,
+    start_ms: u64,
+    end_ms: u64,
+    audio_ms: u64,
+    text: String,
+    reason: String,
+    duration_ms: u128,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalWhisperPartialTranscriptionResult {
+    text: String,
+    segments: usize,
+    duration_ms: u128,
+    audio_ms: u64,
+    chunks: Vec<LocalWhisperPartialChunkResult>,
+    partial: bool,
+    cancelled: bool,
 }
 
 #[derive(Deserialize)]
@@ -5071,6 +5139,8 @@ pub fn run() {
             shortcut_manager: AudioShortcutManager::new(),
             whisper_cancel_token: Arc::new(AtomicU64::new(0)),
             whisper_engine: WhisperCliWarmCache::new(),
+            local_whisper_partial: Arc::new(Mutex::new(None)),
+            local_whisper_partial_generation: Arc::new(AtomicU64::new(0)),
         })
         .manage(SnippingState::new())
         .plugin(tauri_plugin_autostart::init(
@@ -5260,6 +5330,9 @@ pub fn run() {
             prepare_whisper_model,
             transcribe_whisper_audio,
             cancel_whisper_transcription,
+            start_local_whisper_partial_transcription,
+            stop_local_whisper_partial_transcription,
+            cancel_local_whisper_partial_transcription,
             start_deepgram_realtime_transcription,
             stop_deepgram_realtime_transcription,
             prewarm_cloud_voice_agent_stream,

@@ -13537,6 +13537,11 @@ function WorkspaceTerminal({
             || forkFromProviderSessionIdForThisStart
             || "",
         ).trim();
+        const openedProviderSessionDropped = Boolean(
+          startupThreadProviderSessionId
+            && !openedProviderSessionId
+            && !openedForkFromProviderSessionId,
+        );
         const openedSharedHistoryId = String(
           openResult?.sharedHistoryId
             || openResult?.shared_history_id
@@ -13587,6 +13592,7 @@ function WorkspaceTerminal({
           backendProviderSessionPresent: Boolean(openedProviderSessionId),
           backendNativeSessionPresent: Boolean(openedNativeSessionId),
           backendProviderSessionReturned: backendReturnedProviderSession,
+          openedProviderSessionDropped,
           terminalIndex,
           workspaceId: workspace?.id || "",
         });
@@ -13607,12 +13613,12 @@ function WorkspaceTerminal({
           speed: startupThreadProviderSpeed,
           forkFromProviderSessionId: openedForkFromProviderSessionId,
           nativeSessionId: openedNativeSessionId,
-          nativeSessionIdCleared: Boolean(openedForkFromProviderSessionId),
+          nativeSessionIdCleared: Boolean(openedForkFromProviderSessionId || openedProviderSessionDropped),
           nativeSessionKind: openedNativeSessionId ? "session" : "",
           nativeSessionSource: openedNativeSessionId ? "session-restore" : "",
           paneId,
           providerSessionId: openedProviderSessionId || openedNativeSessionId,
-          providerSessionIdCleared: Boolean(openedForkFromProviderSessionId),
+          providerSessionIdCleared: Boolean(openedForkFromProviderSessionId || openedProviderSessionDropped),
           sessionId: openResult?.sessionId || "",
           sharedHistoryId: openedSharedHistoryId,
           sessionMode: openResult?.sessionMode || sessionModeForThisStart,

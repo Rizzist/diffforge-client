@@ -17,9 +17,6 @@ const AUDIO_TRANSCRIPTION_HISTORY_STORAGE_KEY = "diffforge.audio.transcriptionHi
 const AUDIO_TRANSCRIPTION_RESULT_EVENT = "forge-audio-transcription-result";
 const AUDIO_DICTATION_STREAM_EVENT = "forge-audio-dictation-stream";
 const DICTATION_CARD_LIMIT = 8;
-// A live stream frame older than this is a dead take (widget window went
-// away without its closing frame): drop it instead of pinning "LIVE".
-const DICTATION_STREAM_STALE_MS = 12_000;
 
 const REFRESH_DEBOUNCE_MS = 40;
 const CARD_LIMIT = 30;
@@ -1608,19 +1605,6 @@ export function ActivityOverlayPanel({ embedded = false }) {
       if (unlistenStream) unlistenStream();
     };
   }, []);
-
-  useEffect(() => {
-    if (!dictationStream) {
-      return undefined;
-    }
-    const expiresInMs = dictationStream.atMs + DICTATION_STREAM_STALE_MS - Date.now();
-    if (expiresInMs <= 0) {
-      setDictationStream(null);
-      return undefined;
-    }
-    const timer = window.setTimeout(() => setDictationStream(null), expiresInMs + 30);
-    return () => window.clearTimeout(timer);
-  }, [dictationStream]);
 
   useEffect(() => {
     let cancelled = false;

@@ -104,7 +104,14 @@ async fn tokenomics_scan_usage(
     .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))??;
     tokenomics_clear_summary_cache();
     tokenomics_store_summary_snapshot_for_app(&app, false, true, &summary);
-    tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
+    tokenomics_enqueue_usage_sync_if_needed(
+        app,
+        state.inner(),
+        &summary,
+        "tokenomics_usage_scan",
+        false,
+    )
+    .await;
     Ok(summary)
 }
 
@@ -122,7 +129,14 @@ async fn tokenomics_scan_usage_silent(
     .map_err(|error| format!("Unable to join Tokenomics scan: {error}"))??;
     tokenomics_clear_summary_cache();
     tokenomics_store_summary_snapshot_for_app(&app, false, true, &summary);
-    tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
+    tokenomics_enqueue_usage_sync_if_needed(
+        app,
+        state.inner(),
+        &summary,
+        "tokenomics_usage_scan_silent",
+        false,
+    )
+    .await;
     Ok(summary)
 }
 
@@ -151,7 +165,14 @@ async fn tokenomics_scan_realtime_usage(
         tokenomics_clear_summary_cache();
         tokenomics_store_summary_snapshot_for_app(&app, false, true, &summary);
     }
-    tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
+    tokenomics_enqueue_usage_sync_if_needed(
+        app,
+        state.inner(),
+        &summary,
+        "tokenomics_realtime_usage_scan",
+        false,
+    )
+    .await;
     Ok(summary)
 }
 
@@ -169,7 +190,14 @@ async fn tokenomics_resync_last_30_days(
     .map_err(|error| format!("Unable to join Tokenomics resync: {error}"))??;
     tokenomics_clear_summary_cache();
     tokenomics_store_summary_snapshot_for_app(&app, false, true, &summary);
-    tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
+    tokenomics_enqueue_usage_sync_if_needed(
+        app,
+        state.inner(),
+        &summary,
+        "tokenomics_resync_last_30_days",
+        true,
+    )
+    .await;
     Ok(summary)
 }
 
@@ -239,7 +267,14 @@ async fn tokenomics_record_usage(
     .map_err(|error| format!("Unable to join Tokenomics record: {error}"))??;
     tokenomics_clear_summary_cache();
     tokenomics_store_summary_snapshot_for_app(&app, false, true, &summary);
-    tokenomics_enqueue_usage_sync_if_inserted(app, state.inner(), &summary).await;
+    tokenomics_enqueue_usage_sync_if_needed(
+        app,
+        state.inner(),
+        &summary,
+        "tokenomics_manual_usage_record",
+        false,
+    )
+    .await;
     Ok(summary)
 }
 
@@ -921,20 +956,35 @@ fn tokenomics_live_limits_snapshot_from_conn_with_options(
     conn: &rusqlite::Connection,
     force_provider_refresh: bool,
 ) -> Result<Value, String> {
-    let mut limits = tokenomics_provider_limits(conn, false, false, force_provider_refresh, false)?;
+    let mut limits = tokenomics_provider_limits(conn, false, false, force_provider_refresh, true)?;
+    let recorded_samples = tokenomics_record_provider_limit_samples(conn, &limits)?;
     tokenomics_apply_provider_limit_sample_pacing(conn, &mut limits)?;
+    let recorded_windows = tokenomics_record_latest_windows(conn, &limits)?;
+    tokenomics_invalidate_summary_snapshots(conn)?;
+    tokenomics_clear_summary_cache();
+    let scope = tokenomics_current_billing_scope();
+    let retired_account_keys = tokenomics_retired_provider_account_keys();
+    let mut latest_windows = tokenomics_latest_window_rows(conn, None, Some(&scope))?;
+    tokenomics_retain_active_account_rows(&mut latest_windows, &retired_account_keys);
+    let mut limit_samples = tokenomics_provider_limit_sample_sync_rows(conn, None, Some(&scope))?;
+    tokenomics_retain_active_account_rows(&mut limit_samples, &retired_account_keys);
     let scan_index = tokenomics_scan_index_status(conn)?;
     Ok(json!({
-        "known": false,
+        "known": !limits.is_empty() || !latest_windows.is_empty() || !limit_samples.is_empty(),
         "source": "rust_live_provider_limits",
         "updated_at": tokenomics_now_iso_like(),
-        "limit_sample_count": 0,
-        "latest_window_count": 0,
-        "latestWindowCount": 0,
-        "limit_samples": [],
-        "limitSamples": [],
-        "latest_windows": [],
-        "latestWindows": [],
+        "recorded_samples": recorded_samples,
+        "recordedSamples": recorded_samples,
+        "recorded_windows": recorded_windows,
+        "recordedWindows": recorded_windows,
+        "limit_sample_count": limit_samples.len(),
+        "limitSampleCount": limit_samples.len(),
+        "latest_window_count": latest_windows.len(),
+        "latestWindowCount": latest_windows.len(),
+        "limit_samples": limit_samples.clone(),
+        "limitSamples": limit_samples,
+        "latest_windows": latest_windows.clone(),
+        "latestWindows": latest_windows,
         "limits": limits,
         "scan_index": scan_index.clone(),
         "scanIndex": scan_index,
@@ -2041,19 +2091,30 @@ fn tokenomics_invalidate_summary_snapshots(conn: &rusqlite::Connection) -> Resul
     Ok(())
 }
 
-async fn tokenomics_enqueue_usage_sync_if_inserted(
-    _app: AppHandle,
-    _state: &CloudMcpState,
+async fn tokenomics_enqueue_usage_sync_if_needed(
+    app: AppHandle,
+    state: &CloudMcpState,
     summary: &Value,
+    reason: &str,
+    force_full: bool,
 ) {
     let inserted_events = tokenomics_summary_inserted_events(summary);
-    if inserted_events == 0 {
+    if inserted_events == 0 && !force_full {
         return;
     }
+    let _ = cloud_mcp_enqueue_tokenomics_sync(
+        app,
+        state,
+        reason.to_string(),
+        force_full,
+        false,
+    )
+    .await;
     log_terminal_status_event(
-        "backend.tokenomics.sync_skipped",
+        "backend.tokenomics.sync_queued",
         json!({
-            "reason": "local_only_client_owned",
+            "reason": reason,
+            "force_full": force_full,
             "inserted_events": inserted_events,
         }),
     );

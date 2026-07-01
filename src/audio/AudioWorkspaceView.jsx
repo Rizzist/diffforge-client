@@ -68,7 +68,10 @@ import {
   writeForgeLlmCleanup,
   writeAudioLlmCleanupEngine,
   readSelectedAudioInputDeviceId,
+  cancelLocalWhisperPartialTranscription,
   startLowPowerAudioBuffer,
+  startLocalWhisperPartialTranscription,
+  stopLocalWhisperPartialTranscription,
   normalizeAudioPolishingSystemPrompt,
   writeAudioPolishingSystemPrompt,
   writeAudioRecorderMode,
@@ -540,7 +543,7 @@ const AUDIO_REALTIME_TRANSCRIPT_EVENT = "forge-audio-realtime-transcript";
 // App-wide live dictation mirror: the Activity widget renders the incoming
 // stream (phase + interim text) from these broadcasts while a take is live.
 const AUDIO_DICTATION_STREAM_EVENT = "forge-audio-dictation-stream";
-const AUDIO_RECORDING_MAX_SECONDS = 90;
+const AUDIO_RECORDING_MAX_SECONDS = 150;
 const AUDIO_RECORDING_LOCKED_MAX_SECONDS = 900;
 const AUDIO_RECORDING_TIMER_MS = 250;
 const AUDIO_HYBRID_TAP_MAX_MS = 280;
@@ -6099,6 +6102,10 @@ export function AudioWidgetWindow() {
   const forgeVoiceEventsActiveRef = useRef(false);
   const forgeVoiceServerSessionIdRef = useRef("");
   const forgeVoiceTtsPlayerRef = useRef(null);
+  const localWhisperPartialSessionIdRef = useRef("");
+  const localWhisperPartialHistoryIdRef = useRef("");
+  const localWhisperPartialFailedRef = useRef(false);
+  const localWhisperPartialTextRef = useRef("");
   // GPT-Realtime interim transcripts are token deltas, not cumulative
   // phrases; the live line accumulates them here between turn boundaries.
   const forgeVoiceRealtimeDraftRef = useRef("");
@@ -6237,6 +6244,10 @@ export function AudioWidgetWindow() {
 
     recordingLockedRef.current = false;
     setRecordingLocked(false);
+    localWhisperPartialSessionIdRef.current = "";
+    localWhisperPartialHistoryIdRef.current = "";
+    localWhisperPartialFailedRef.current = false;
+    localWhisperPartialTextRef.current = "";
 
     setTranscriptionProvider(currentProvider);
     setRecorderMode(currentRecorderMode);
@@ -6480,6 +6491,10 @@ export function AudioWidgetWindow() {
         id: `forge-dictation-${Date.now()}-${recordingRunId}`,
       }
       : null;
+    localWhisperPartialSessionIdRef.current = "";
+    localWhisperPartialHistoryIdRef.current = "";
+    localWhisperPartialFailedRef.current = false;
+    localWhisperPartialTextRef.current = "";
     setError("");
     setFinishPending(false);
     setMessage(currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT ? "Starting.." : "Arming buffer");
@@ -6507,8 +6522,33 @@ export function AudioWidgetWindow() {
       }
       await audioBuffer.beginCapture();
       captureBegan = true;
+      if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL) {
+        const partialSessionId = `local-whisper-${Date.now()}-${recordingRunId}`;
+        const partialHistoryId = `local-whisper-history-${Date.now()}-${recordingRunId}`;
+        try {
+          await startLocalWhisperPartialTranscription({
+            historyId: partialHistoryId,
+            maxChunkMs: 35000,
+            minChunkMs: 10000,
+            sessionId: partialSessionId,
+            silenceMs: 750,
+          });
+          localWhisperPartialSessionIdRef.current = partialSessionId;
+          localWhisperPartialHistoryIdRef.current = partialHistoryId;
+        } catch {
+          localWhisperPartialFailedRef.current = true;
+          localWhisperPartialSessionIdRef.current = "";
+          localWhisperPartialHistoryIdRef.current = "";
+        }
+      }
       if (recordingRunRef.current !== recordingRunId) {
         await audioBuffer.finishCapture({ decode: false }).catch(() => null);
+        if (localWhisperPartialSessionIdRef.current) {
+          await cancelLocalWhisperPartialTranscription({
+            sessionId: localWhisperPartialSessionIdRef.current,
+          }).catch(() => {});
+          localWhisperPartialSessionIdRef.current = "";
+        }
         if (audioBufferRef.current === audioBuffer) {
           await closeWarmBuffer();
         } else {
@@ -6624,6 +6664,12 @@ export function AudioWidgetWindow() {
         await stopCloudVoiceAgentStream(getForgeVoiceControlRequest()).catch(() => {});
       }
       const failedAudioBuffer = audioBuffer;
+      if (localWhisperPartialSessionIdRef.current) {
+        await cancelLocalWhisperPartialTranscription({
+          sessionId: localWhisperPartialSessionIdRef.current,
+        }).catch(() => {});
+        localWhisperPartialSessionIdRef.current = "";
+      }
       if (captureBegan) {
         await failedAudioBuffer?.finishCapture?.({ decode: false }).catch(() => null);
         playNotificationSfx("voice.off");
@@ -8534,7 +8580,9 @@ export function AudioWidgetWindow() {
           ? "forge-voice-agent"
         : provider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
           ? "forge-nova3-dictation"
-          : "whisper-local",
+          : result?.partial
+            ? "whisper-local-partial"
+            : "whisper-local",
       sourceText: pipeline.changed ? rawText : "",
       text,
     };
@@ -8769,6 +8817,45 @@ export function AudioWidgetWindow() {
           };
         })()
         : await (async () => {
+          const partialSessionId = localWhisperPartialSessionIdRef.current;
+          if (partialSessionId && !localWhisperPartialFailedRef.current) {
+            setMessage("Finishing local transcript");
+            try {
+              const partialResult = await stopLocalWhisperPartialTranscription({
+                sessionId: partialSessionId,
+              });
+              localWhisperPartialSessionIdRef.current = "";
+              return {
+                ...(partialResult || {}),
+                audioMs: Number(partialResult?.audioMs || 0),
+              };
+            } catch (partialError) {
+              localWhisperPartialFailedRef.current = true;
+              localWhisperPartialSessionIdRef.current = "";
+              try {
+                const { audioBase64, audioMs } = await audioBuffer.finishCapture({ decode: false });
+                const { peak, rms } = audioBuffer.getCaptureStats();
+                await cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
+                setMessage("Transcribing locally");
+                const transcriptionResult = await invoke("transcribe_whisper_audio", {
+                  request: {
+                    audioBase64,
+                    audioMs,
+                    capturePeak: peak,
+                    captureRms: rms,
+                  },
+                });
+                return {
+                  ...(transcriptionResult || {}),
+                  audioMs,
+                };
+              } catch {
+                await cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
+              }
+              throw partialError;
+            }
+          }
+
           const { audioBase64, audioMs } = await audioBuffer.finishCapture({ decode: false });
           const { peak, rms } = audioBuffer.getCaptureStats();
           setMessage("Transcribing locally");
@@ -8864,7 +8951,9 @@ export function AudioWidgetWindow() {
             ? "forge-voice-agent"
           : currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE
             ? (result?.llmCleaned ? "forge-nova3-llm-cleaned" : "forge-nova3-dictation")
-            : "whisper-local",
+            : result?.partial
+              ? "whisper-local-partial"
+              : "whisper-local",
         sourceText: pipeline.changed ? rawTranscript : "",
         text: nextTranscript,
         timings: forgeCleanupMetadata?.timings
@@ -9021,7 +9110,13 @@ export function AudioWidgetWindow() {
         // stopRecording run publishes it as cancelled instead of inserting.
         cancelSalvageRunRef.current = recordingRunId;
       } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL) {
-        void invoke("cancel_whisper_transcription").catch(() => {});
+        const partialSessionId = localWhisperPartialSessionIdRef.current;
+        localWhisperPartialSessionIdRef.current = "";
+        if (partialSessionId) {
+          void cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
+        } else {
+          void invoke("cancel_whisper_transcription").catch(() => {});
+        }
       }
 
       // The in-flight stopRecording task owns this buffer from here. Detach the
@@ -9066,6 +9161,60 @@ export function AudioWidgetWindow() {
         audioBufferStartRef.current = null;
         audioBufferReadyAtRef.current = 0;
         audioBufferRef.current = null;
+      }
+      if (
+        currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL
+        && localWhisperPartialSessionIdRef.current
+        && !localWhisperPartialFailedRef.current
+      ) {
+        const partialSessionId = localWhisperPartialSessionIdRef.current;
+        const partialText = localWhisperPartialTextRef.current.trim();
+        const audioMs = recordingStartedAt > 0 ? Math.max(0, Date.now() - recordingStartedAt) : 0;
+        localWhisperPartialSessionIdRef.current = "";
+        resetWidgetToStartState();
+        setMessage(partialText ? "Cancelled, saving to history" : "Cancelled");
+        const partialTeardown = trackAudioCaptureTeardown((async () => {
+          try {
+            const partialResult = await stopLocalWhisperPartialTranscription({
+              sessionId: partialSessionId,
+            });
+            await audioBuffer?.close?.().catch(() => {});
+            return {
+              partialResult,
+              type: "partial",
+            };
+          } catch {
+            const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
+            await cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
+            await audioBuffer?.close?.().catch(() => {});
+            return {
+              captureResult,
+              type: "fallback",
+            };
+          }
+        })());
+        void (async () => {
+          const salvageResult = await partialTeardown;
+          if (salvageResult?.type === "partial") {
+            const partialResult = salvageResult.partialResult || {};
+            const text = String(partialResult.text || partialText || "").trim();
+            if (!text) {
+              return;
+            }
+            publishCancelledTranscript(
+              {
+                ...(partialResult || {}),
+                audioMs: Number(partialResult?.audioMs || audioMs || 0),
+                latencyMs: Math.max(0, Date.now() - submittedAt),
+                text,
+              },
+              AUDIO_TRANSCRIPTION_PROVIDER_LOCAL,
+            );
+          } else {
+            salvageLocalCancelledCapture(salvageResult?.captureResult, captureStats);
+          }
+        })();
+        return;
       }
       const captureTeardown = trackAudioCaptureTeardown((async () => {
         const captureResult = await audioBuffer.finishCapture({ decode: false }).catch(() => null);
@@ -9129,6 +9278,12 @@ export function AudioWidgetWindow() {
     if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_FORGE_AGENT) {
       forgeVoiceEventsActiveRef.current = false;
     }
+    const localPartialSessionIdForCancel = currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL
+      ? localWhisperPartialSessionIdRef.current
+      : "";
+    if (localPartialSessionIdForCancel) {
+      localWhisperPartialSessionIdRef.current = "";
+    }
     // closeWarmBuffer detaches the buffer ref synchronously, so an immediate
     // new take never races the close running in the background.
     void closeWarmBuffer().catch(() => {});
@@ -9143,10 +9298,16 @@ export function AudioWidgetWindow() {
         await forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
         forgeVoiceTtsPlayerRef.current = null;
       } else {
-        await invoke("cancel_whisper_transcription").catch(() => {});
+        if (localPartialSessionIdForCancel) {
+          await cancelLocalWhisperPartialTranscription({
+            sessionId: localPartialSessionIdForCancel,
+          }).catch(() => {});
+        } else {
+          await invoke("cancel_whisper_transcription").catch(() => {});
+        }
       }
     })();
-  }, [closeWarmBuffer, getForgeVoiceControlRequest, publishCancelledTranscript, resetWidgetToStartState, salvageLocalCancelledCapture, showCancelNotice, trackAudioCaptureTeardown]);
+  }, [closeWarmBuffer, getForgeVoiceControlRequest, publishCancelledTranscript, recordingStartedAt, resetWidgetToStartState, salvageLocalCancelledCapture, showCancelNotice, trackAudioCaptureTeardown]);
 
   // "Finish and paste" from the bottom bar: stop the active take (locked or
   // held) and run the normal transcribe-and-insert flow.
@@ -9238,6 +9399,12 @@ export function AudioWidgetWindow() {
         stopCloudVoiceAgentStream(getForgeVoiceControlRequest()).catch(() => {});
         forgeVoiceTtsPlayerRef.current?.close?.().catch(() => {});
         forgeVoiceTtsPlayerRef.current = null;
+      }
+      if (localWhisperPartialSessionIdRef.current) {
+        cancelLocalWhisperPartialTranscription({
+          sessionId: localWhisperPartialSessionIdRef.current,
+        }).catch(() => {});
+        localWhisperPartialSessionIdRef.current = "";
       }
       closeWarmBuffer();
     };
@@ -9560,14 +9727,28 @@ export function AudioWidgetWindow() {
         if (activeProvider !== AUDIO_TRANSCRIPTION_PROVIDER_CLOUD) {
           return;
         }
+      } else if (eventProvider === "whisper-local") {
+        const eventSessionId = String(event.payload?.sessionId || "").trim();
+        if (
+          activeProvider !== AUDIO_TRANSCRIPTION_PROVIDER_LOCAL
+          || !eventSessionId
+          || eventSessionId !== localWhisperPartialSessionIdRef.current
+        ) {
+          return;
+        }
       } else {
         return;
       }
 
+      if (eventProvider === "whisper-local") {
+        localWhisperPartialTextRef.current = text;
+      }
       setRealtimeTranscript(text);
       const liveLabel = eventProvider === "forge"
         ? "Forge cloud"
-        : "Deepgram";
+        : eventProvider === "whisper-local"
+          ? "Local Whisper"
+          : "Deepgram";
       setMessage(event.payload?.isFinal ? `${liveLabel} finalizing` : `${liveLabel} live`);
     })
       .then((nextUnlisten) => {

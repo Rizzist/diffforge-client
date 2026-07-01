@@ -1115,6 +1115,20 @@ export async function prepareWhisperModel() {
   return invoke("prepare_whisper_model");
 }
 
+export async function startLocalWhisperPartialTranscription(request) {
+  return invoke("start_local_whisper_partial_transcription", { request });
+}
+
+export async function stopLocalWhisperPartialTranscription(request) {
+  return invoke("stop_local_whisper_partial_transcription", { request });
+}
+
+export async function cancelLocalWhisperPartialTranscription(request = null) {
+  return invoke("cancel_local_whisper_partial_transcription", {
+    request,
+  });
+}
+
 export async function startLowPowerAudioBuffer({
   deviceId = "default",
   owner = "audio",

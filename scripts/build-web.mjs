@@ -78,8 +78,9 @@ function assetPathFromReference(reference, containingFile) {
 }
 
 function isKnownEmbeddedAssetReference(reference, containingFile) {
+  const basename = path.basename(containingFile);
   return (
-    path.basename(containingFile).startsWith("standalone.min-")
+    (basename.startsWith("standalone.min-") || basename.startsWith("standalone-preview.min-"))
     && (reference === "../components/GenericSolverDebugger" || reference === "./MyComponent")
   );
 }
