@@ -8836,6 +8836,9 @@ export function AudioWidgetWindow() {
                 const { audioBase64, audioMs } = await audioBuffer.finishCapture({ decode: false });
                 const { peak, rms } = audioBuffer.getCaptureStats();
                 await cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
+                if (recordingRunRef.current !== recordingRunId) {
+                  return { audioMs };
+                }
                 setMessage("Transcribing locally");
                 const transcriptionResult = await invoke("transcribe_whisper_audio", {
                   request: {
@@ -8858,6 +8861,9 @@ export function AudioWidgetWindow() {
 
           const { audioBase64, audioMs } = await audioBuffer.finishCapture({ decode: false });
           const { peak, rms } = audioBuffer.getCaptureStats();
+          if (recordingRunRef.current !== recordingRunId) {
+            return { audioMs };
+          }
           setMessage("Transcribing locally");
           const transcriptionResult = await invoke("transcribe_whisper_audio", {
             request: {
@@ -8873,12 +8879,16 @@ export function AudioWidgetWindow() {
           };
       })();
       if (recordingRunRef.current !== recordingRunId) {
-        if (cancelSalvageRunRef.current === recordingRunId) {
-          cancelSalvageRunRef.current = 0;
-          publishCancelledTranscript(
-            { ...result, latencyMs: Math.max(0, Date.now() - submittedAt) },
-            currentProvider,
-          );
+        try {
+          if (cancelSalvageRunRef.current === recordingRunId) {
+            cancelSalvageRunRef.current = 0;
+            await publishCancelledTranscript(
+              { ...result, latencyMs: Math.max(0, Date.now() - submittedAt) },
+              currentProvider,
+            );
+          }
+        } finally {
+          await audioBuffer?.close?.().catch(() => {});
         }
         return;
       }
@@ -9109,14 +9119,6 @@ export function AudioWidgetWindow() {
         // Let the in-flight transcription finish detached; the invalidated
         // stopRecording run publishes it as cancelled instead of inserting.
         cancelSalvageRunRef.current = recordingRunId;
-      } else if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL) {
-        const partialSessionId = localWhisperPartialSessionIdRef.current;
-        localWhisperPartialSessionIdRef.current = "";
-        if (partialSessionId) {
-          void cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
-        } else {
-          void invoke("cancel_whisper_transcription").catch(() => {});
-        }
       }
 
       // The in-flight stopRecording task owns this buffer from here. Detach the
@@ -9128,6 +9130,42 @@ export function AudioWidgetWindow() {
         audioBufferReadyAtRef.current = 0;
         audioBufferRef.current = null;
       }
+
+      if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL) {
+        const partialSessionId = localWhisperPartialSessionIdRef.current;
+        const partialText = localWhisperPartialTextRef.current.trim();
+        if (cancelSalvageRunRef.current === recordingRunId) {
+          cancelSalvageRunRef.current = 0;
+        }
+        localWhisperPartialSessionIdRef.current = "";
+        localWhisperPartialHistoryIdRef.current = "";
+        localWhisperPartialFailedRef.current = false;
+        localWhisperPartialTextRef.current = "";
+        if (partialText && salvage) {
+          void publishCancelledTranscript(
+            {
+              audioMs: recordingStartedAt > 0 ? Math.max(0, Date.now() - recordingStartedAt) : 0,
+              partial: true,
+              text: partialText,
+            },
+            AUDIO_TRANSCRIPTION_PROVIDER_LOCAL,
+          );
+        }
+        trackAudioCaptureTeardown((async () => {
+          await Promise.all([
+            invoke("cancel_whisper_transcription").catch(() => {}),
+            partialSessionId
+              ? cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {})
+              : Promise.resolve(),
+          ]);
+          await audioBuffer?.finishCapture({ decode: false }).catch(() => null);
+          await audioBuffer?.close?.().catch(() => {});
+        })());
+        resetWidgetToStartState();
+        setMessage(partialText && salvage ? "Cancelled, saving to history" : "Cancelled");
+        return;
+      }
+
       if (
         audioBuffer
         && (
@@ -10265,13 +10303,16 @@ export function AudioWidgetWindow() {
       <AudioBarCancelButton
         aria-label="Dismiss"
         onClick={(event) => {
+          event.preventDefault();
           event.stopPropagation();
           dismissCancelNotice();
         }}
         onMouseDown={(event) => {
+          event.preventDefault();
           event.stopPropagation();
         }}
         onPointerDown={(event) => {
+          event.preventDefault();
           event.stopPropagation();
         }}
         title="Dismiss now"
@@ -10376,23 +10417,24 @@ export function AudioWidgetWindow() {
           {cancelNotice ? cancelNoticeSurface : (
             <AudioBarSurface
               key={barGeometryReady ? `${barGeometryKey}-ready` : `${barGeometryKey}-pending`}
-              onClick={isRecordingFocus || widgetState === "arming" ? finishFromBar : undefined}
               role="status"
-              style={isRecordingFocus || widgetState === "arming" ? { cursor: "pointer" } : undefined}
               title={isRecordingFocus || widgetState === "arming"
-                ? "Click to finish and paste, or press the shortcut again. X cancels."
+                ? "Use the stop button or shortcut to finish. X cancels."
                 : undefined}
             >
               <AudioBarCancelButton
                 aria-label="Cancel dictation"
                 onClick={(event) => {
+                  event.preventDefault();
                   event.stopPropagation();
                   cancelRecording();
                 }}
                 onMouseDown={(event) => {
+                  event.preventDefault();
                   event.stopPropagation();
                 }}
                 onPointerDown={(event) => {
+                  event.preventDefault();
                   event.stopPropagation();
                 }}
                 title="Cancel: stop without pasting. The transcript is still saved to History."
@@ -10519,13 +10561,16 @@ export function AudioWidgetWindow() {
           <AudioWidgetCancelButton
             aria-label="Cancel and save transcript to history"
             onClick={(event) => {
+              event.preventDefault();
               event.stopPropagation();
               cancelRecording();
             }}
             onMouseDown={(event) => {
+              event.preventDefault();
               event.stopPropagation();
             }}
             onPointerDown={(event) => {
+              event.preventDefault();
               event.stopPropagation();
             }}
             title="Cancel (transcript is saved to history)"

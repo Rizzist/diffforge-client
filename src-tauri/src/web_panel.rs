@@ -90,6 +90,7 @@ fn web_panel_open(
     url: Option<String>,
     theme: Option<String>,
     title: Option<String>,
+    workspace_id: Option<String>,
     width: Option<f64>,
     height: Option<f64>,
 ) -> Result<WebPanelOpenResult, String> {
@@ -111,6 +112,13 @@ fn web_panel_open(
     } else {
         title_text
     };
+    let workspace_text = workspace_id
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .chars()
+        .take(160)
+        .collect::<String>();
     let label = web_panel_label(&pane_text);
 
     if let Some(window) = app.get_webview_window(&label) {
@@ -128,12 +136,13 @@ fn web_panel_open(
         .map(|value| value.clamp(WEB_PANEL_MIN_HEIGHT, 1800.0))
         .unwrap_or(WEB_PANEL_DEFAULT_HEIGHT);
     let app_url = format!(
-        "index.html#/web-panel?paneId={}&url={}&theme={}&title={}&windowId={}",
+        "index.html#/web-panel?paneId={}&url={}&theme={}&title={}&windowId={}&workspaceId={}",
         percent_encode_query_component(&pane_text),
         percent_encode_query_component(&url_text),
         percent_encode_query_component(&theme_text),
         percent_encode_query_component(&title_text),
         percent_encode_query_component(&label),
+        percent_encode_query_component(&workspace_text),
     );
 
     let window = WebviewWindowBuilder::new(&app, label.clone(), WebviewUrl::App(app_url.into()))

@@ -11,6 +11,7 @@ import { LayoutRow } from "@styled-icons/remix-line/LayoutRow";
 import { Refresh } from "@styled-icons/material-rounded/Refresh";
 
 import {
+  ButtonBotIcon,
   ButtonDragIcon,
   TerminalCloseButton,
   TerminalRailControls,
@@ -24,6 +25,8 @@ import {
   normalizeWebInput,
   useNativeWebview,
 } from "./webNative.js";
+import PanelAgentPromptActivity from "../terminals/PanelAgentPromptActivity.jsx";
+import PanelAgentPromptComposer from "../terminals/PanelAgentPromptComposer.jsx";
 
 function PopOutGlyph(props) {
   return (
@@ -56,12 +59,17 @@ export default function WebPane({
   onFocusBreakout,
   onNavigate,
   controlCommand = null,
+  defaultPanelAgentPromptTargetIds = [],
+  panelAgentPromptActivityItems = [],
+  onSubmitPanelAgentPrompt = null,
+  panelAgentPromptTargets = [],
 }) {
   const startUrl = useMemo(() => normalizeWebInput(initialUrl) || DEFAULT_WEB_URL, [initialUrl]);
   const [history, setHistory] = useState(() => [startUrl]);
   const [historyIndex, setHistoryIndex] = useState(0);
   const [addressValue, setAddressValue] = useState(startUrl);
   const [addressError, setAddressError] = useState("");
+  const [agentPromptOpen, setAgentPromptOpen] = useState(false);
   const viewportRef = useRef(null);
   const controlCommandSeenRef = useRef(0);
 
@@ -87,6 +95,7 @@ export default function WebPane({
     && !dragActive
     && !poppedOut
     && !webviewObscured
+    && !agentPromptOpen
     && (!fullscreenActive || isFullscreen),
   );
 
@@ -247,6 +256,17 @@ export default function WebPane({
           </WebPaneCloseButton>
         </WebPaneRailControls>
         <WebPaneRailControls data-rail-row="secondary">
+          <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
+          <WebPaneIconButton
+            aria-label="Prompt terminal agents"
+            aria-pressed={agentPromptOpen ? "true" : "false"}
+            data-active={agentPromptOpen ? "true" : undefined}
+            onClick={() => setAgentPromptOpen((open) => !open)}
+            title="Prompt terminal agents"
+            type="button"
+          >
+            <ButtonBotIcon aria-hidden="true" />
+          </WebPaneIconButton>
           <WebPaneIconButton
             aria-label="Split right"
             onClick={() => onSplit?.({ direction: "vertical", terminalIndex, paneId })}
@@ -301,6 +321,17 @@ export default function WebPane({
               </WebPaneOverlayButton>
             </WebPaneBreakoutActions>
           </WebPaneBreakoutOverlay>
+        ) : null}
+        {agentPromptOpen ? (
+          <PanelAgentPromptComposer
+            autoFocus
+            defaultSelectedTargetIds={defaultPanelAgentPromptTargetIds}
+            onClose={() => setAgentPromptOpen(false)}
+            onSubmit={onSubmitPanelAgentPrompt}
+            panelKind="web"
+            panelPaneId={paneId}
+            targets={panelAgentPromptTargets}
+          />
         ) : null}
       </WebPaneViewport>
     </WebPaneSurface>

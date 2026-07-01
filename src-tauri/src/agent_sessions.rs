@@ -57,8 +57,8 @@ struct CodexThreadSessionDiscoverRequest {
     workspace_id: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct CodexThreadTranscriptArtifact {
     kind: String,
     mime_type: String,
@@ -74,8 +74,8 @@ struct CodexThreadTranscriptArtifact {
     original_path: String,
 }
 
-#[derive(Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
 struct CodexThreadTranscriptMessage {
     id: String,
     role: String,
@@ -2037,6 +2037,69 @@ mod agent_sessions_tests {
         assert_eq!(opencode_model_from_value(&json!({})), None);
     }
 
+    #[test]
+    fn cloud_session_response_rehydrates_normalized_messages() {
+        let first_messages = serde_json::to_string(&json!([
+            {
+                "id": "m1",
+                "role": "user",
+                "kind": "message",
+                "text": "please inspect the board",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "source": "claude",
+            }
+        ]))
+        .unwrap();
+        let response = json!({
+            "ok": true,
+            "session": {
+                "id": "agent-chat-session-1",
+                "providerSessionId": "provider-session-1",
+                "title": "Board inspection",
+                "cwd": "/tmp/project",
+                "latestTimestamp": "2026-01-01T00:00:05Z",
+            },
+            "records": [
+                {
+                    "recordIndex": 0,
+                    "messages_json": first_messages,
+                },
+                {
+                    "recordIndex": 1,
+                    "messages": [{
+                        "id": "m2",
+                        "role": "assistant",
+                        "kind": "message",
+                        "text": "I found the synced transcript.",
+                        "createdAt": "2026-01-01T00:00:05Z",
+                        "source": "claude",
+                    }],
+                },
+            ],
+        });
+
+        let result = agent_thread_transcript_from_cloud_session_response(
+            "claude",
+            "provider-session-1",
+            "/fallback",
+            10,
+            &response,
+        )
+        .unwrap();
+
+        assert_eq!(result.session_id, "provider-session-1");
+        assert_eq!(result.session_title, "Board inspection");
+        assert_eq!(result.cwd, "/tmp/project");
+        assert_eq!(result.matched_by, "sessionId");
+        assert_eq!(
+            result.rollout_path,
+            "cloud://agent-chat-session/agent-chat-session-1"
+        );
+        assert_eq!(result.messages.len(), 2);
+        assert_eq!(result.messages[0].text, "please inspect the board");
+        assert_eq!(result.messages[1].text, "I found the synced transcript.");
+    }
+
     static OPENCODE_DB_TEST_LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
 
     #[test]
@@ -3778,6 +3841,307 @@ fn parse_opencode_session(
     ))
 }
 
+fn agent_thread_cloud_response_root(value: &Value) -> &Value {
+    value
+        .get("data")
+        .filter(|data| data.is_object())
+        .unwrap_or(value)
+}
+
+fn agent_thread_cloud_string_array(value: Option<&Value>) -> Vec<Value> {
+    match value {
+        Some(Value::Array(items)) => items.clone(),
+        Some(Value::String(text)) => serde_json::from_str::<Value>(text)
+            .ok()
+            .and_then(|parsed| parsed.as_array().cloned())
+            .unwrap_or_default(),
+        Some(Value::Object(object)) => object
+            .get("messages")
+            .or_else(|| object.get("items"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn agent_thread_cloud_record_messages(record: &Value) -> Vec<Value> {
+    for key in ["messages", "messagesJson", "messages_json"] {
+        let messages = agent_thread_cloud_string_array(record.get(key));
+        if !messages.is_empty() {
+            return messages;
+        }
+    }
+    Vec::new()
+}
+
+fn agent_thread_cloud_message_has_content(message: &CodexThreadTranscriptMessage) -> bool {
+    !message.text.trim().is_empty()
+        || !message.title.trim().is_empty()
+        || !message.artifacts.is_empty()
+        || message.kind.trim().eq_ignore_ascii_case("task_complete")
+}
+
+fn agent_thread_cloud_artifacts(value: &Value) -> Vec<CodexThreadTranscriptArtifact> {
+    value
+        .get("artifacts")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    serde_json::from_value::<CodexThreadTranscriptArtifact>(item.clone()).ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn agent_thread_cloud_message_from_value(
+    value: &Value,
+    agent_id: &str,
+    fallback_timestamp: &str,
+    fallback_id: String,
+) -> Option<CodexThreadTranscriptMessage> {
+    if let Ok(mut message) =
+        serde_json::from_value::<CodexThreadTranscriptMessage>(value.clone())
+    {
+        if message.id.trim().is_empty() {
+            message.id = fallback_id.clone();
+        }
+        if message.role.trim().is_empty() {
+            message.role = "assistant".to_string();
+        }
+        if message.kind.trim().is_empty() {
+            message.kind = "message".to_string();
+        }
+        if message.created_at.trim().is_empty() {
+            message.created_at = fallback_timestamp.to_string();
+        }
+        if message.source.trim().is_empty() {
+            message.source = agent_id.to_string();
+        }
+        if agent_thread_cloud_message_has_content(&message) {
+            return Some(message);
+        }
+    }
+
+    let kind = cloud_mcp_payload_text(value, &["kind", "type"])
+        .unwrap_or_else(|| "message".to_string());
+    let text = cloud_mcp_payload_text(value, &["text", "message", "content"])
+        .unwrap_or_default();
+    let title = cloud_mcp_payload_text(value, &["title"]).unwrap_or_default();
+    let artifacts = agent_thread_cloud_artifacts(value);
+    if text.trim().is_empty()
+        && title.trim().is_empty()
+        && artifacts.is_empty()
+        && !kind.trim().eq_ignore_ascii_case("task_complete")
+    {
+        return None;
+    }
+
+    Some(CodexThreadTranscriptMessage {
+        id: cloud_mcp_payload_text(value, &["id", "messageId", "message_id"])
+            .unwrap_or(fallback_id),
+        role: cloud_mcp_payload_text(value, &["role"]).unwrap_or_else(|| "assistant".to_string()),
+        kind,
+        text,
+        title,
+        call_id: cloud_mcp_payload_text(value, &["callId", "call_id"]).unwrap_or_default(),
+        created_at: cloud_mcp_payload_text(
+            value,
+            &["createdAt", "created_at", "timestamp", "time"],
+        )
+        .unwrap_or_else(|| fallback_timestamp.to_string()),
+        source: cloud_mcp_payload_text(value, &["source"]).unwrap_or_else(|| agent_id.to_string()),
+        artifacts,
+    })
+}
+
+fn agent_thread_transcript_from_cloud_session_response(
+    agent_id: &str,
+    provider_session_id: &str,
+    fallback_cwd: &str,
+    max_messages: usize,
+    response: &Value,
+) -> Result<CodexThreadTranscriptResult, String> {
+    let root = agent_thread_cloud_response_root(response);
+    let session = root
+        .get("session")
+        .filter(|value| value.is_object())
+        .ok_or_else(|| "Cloud session response did not include a session.".to_string())?;
+    let cloud_session_id = cloud_mcp_payload_text(
+        session,
+        &["id", "agentChatSessionId", "agent_chat_session_id"],
+    )
+    .unwrap_or_default();
+    let session_id = cloud_mcp_payload_text(
+        session,
+        &[
+            "sessionId",
+            "session_id",
+            "providerSessionId",
+            "provider_session_id",
+        ],
+    )
+    .unwrap_or_else(|| provider_session_id.to_string());
+    let mut latest_timestamp = cloud_mcp_payload_text(
+        session,
+        &[
+            "latestTimestamp",
+            "latest_timestamp",
+            "updatedAt",
+            "updated_at",
+            "createdAt",
+            "created_at",
+        ],
+    )
+    .unwrap_or_default();
+    let records = root
+        .get("records")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut messages = Vec::new();
+    for (record_index, record) in records.iter().enumerate() {
+        let record_timestamp = cloud_mcp_payload_text(
+            record,
+            &[
+                "recordTimestamp",
+                "record_timestamp",
+                "latestTimestamp",
+                "latest_timestamp",
+                "createdAt",
+                "created_at",
+            ],
+        )
+        .unwrap_or_else(|| latest_timestamp.clone());
+        for (message_index, message) in agent_thread_cloud_record_messages(record)
+            .iter()
+            .enumerate()
+        {
+            let fallback_id = format!("cloud-{record_index}-{message_index}");
+            if let Some(message) = agent_thread_cloud_message_from_value(
+                message,
+                agent_id,
+                &record_timestamp,
+                fallback_id,
+            ) {
+                messages.push(message);
+            }
+        }
+    }
+    if messages.len() > max_messages {
+        messages.drain(0..messages.len() - max_messages);
+    }
+    if latest_timestamp.trim().is_empty() {
+        latest_timestamp = messages
+            .last()
+            .map(|message| message.created_at.clone())
+            .unwrap_or_default();
+    }
+
+    Ok(CodexThreadTranscriptResult {
+        session_id,
+        session_title: cloud_mcp_payload_text(session, &["title", "sessionTitle", "session_title"])
+            .unwrap_or_default(),
+        rollout_path: if cloud_session_id.trim().is_empty() {
+            format!("cloud://agent-chat-session/{provider_session_id}")
+        } else {
+            format!("cloud://agent-chat-session/{cloud_session_id}")
+        },
+        cwd: cloud_mcp_payload_text(session, &["cwd", "workingDirectory", "working_directory"])
+            .unwrap_or_else(|| fallback_cwd.to_string()),
+        matched_by: "sessionId".to_string(),
+        latest_timestamp,
+        messages,
+    })
+}
+
+fn agent_thread_cloud_session_matches_provider_session(
+    session: &Value,
+    provider_session_id: &str,
+) -> bool {
+    let expected = provider_session_id.trim();
+    if expected.is_empty() {
+        return false;
+    }
+    cloud_mcp_payload_text(
+        session,
+        &[
+            "sessionId",
+            "session_id",
+            "providerSessionId",
+            "provider_session_id",
+        ],
+    )
+    .map(|value| value.trim() == expected)
+    .unwrap_or(false)
+}
+
+fn read_agent_thread_cloud_transcript(
+    agent_id: &str,
+    provider_session_id: &str,
+    cwd: &str,
+    workspace_id: Option<&str>,
+    max_messages: usize,
+) -> Result<CodexThreadTranscriptResult, String> {
+    let provider_session_id = provider_session_id.trim();
+    if provider_session_id.is_empty() {
+        return Err("Provider session id is required to read a cloud transcript.".to_string());
+    }
+
+    let mut list_query = vec![
+        ("limit", "5".to_string()),
+        ("provider", agent_id.to_string()),
+        ("provider_session_id", provider_session_id.to_string()),
+    ];
+    if let Some(workspace_id) = workspace_id.map(str::trim).filter(|value| !value.is_empty()) {
+        list_query.push(("workspace_id", workspace_id.to_string()));
+    }
+    let list_response =
+        cloud_mcp_internal_api_get_blocking("/v1/internal/api/sessions", &list_query)?;
+    let list_root = agent_thread_cloud_response_root(&list_response);
+    let sessions = list_root
+        .get("sessions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "Cloud session list response did not include sessions.".to_string())?;
+    let session = sessions
+        .iter()
+        .find(|session| agent_thread_cloud_session_matches_provider_session(session, provider_session_id))
+        .or_else(|| sessions.first())
+        .ok_or_else(|| "Cloud did not return a synced session for this provider id.".to_string())?;
+    let cloud_session_id = cloud_mcp_payload_text(
+        session,
+        &["id", "agentChatSessionId", "agent_chat_session_id"],
+    )
+    .ok_or_else(|| "Cloud session list row did not include a session id.".to_string())?;
+
+    let mut detail_query = vec![
+        ("limit", "2000".to_string()),
+        ("record_limit", "2000".to_string()),
+        ("record_direction", "latest".to_string()),
+    ];
+    if let Some(workspace_id) = workspace_id.map(str::trim).filter(|value| !value.is_empty()) {
+        detail_query.push(("workspace_id", workspace_id.to_string()));
+    }
+    let detail_path = format!("/v1/internal/api/sessions/{cloud_session_id}");
+    let detail_response = cloud_mcp_internal_api_get_blocking(&detail_path, &detail_query)?;
+    agent_thread_transcript_from_cloud_session_response(
+        agent_id,
+        provider_session_id,
+        cwd,
+        max_messages,
+        &detail_response,
+    )
+}
+
+fn agent_thread_transcript_result_is_cloud_backed(
+    result: &CodexThreadTranscriptResult,
+) -> bool {
+    result.rollout_path.trim_start().starts_with("cloud://")
+}
+
 fn read_agent_thread_transcript(
     agent_id: &str,
     provider_session_id: &str,
@@ -3790,8 +4154,86 @@ fn read_agent_thread_transcript(
     }
 
     if agent_id == "claude" {
-        let (path, initial_meta, matched_by) = find_claude_session(provider_session_id, cwd)?;
-        let (parsed_meta, mut messages) = parse_claude_session(&path, max_messages)?;
+        let local_result: Result<CodexThreadTranscriptResult, String> = (|| {
+            let (path, initial_meta, matched_by) = find_claude_session(provider_session_id, cwd)?;
+            let (parsed_meta, mut messages) = parse_claude_session(&path, max_messages)?;
+            let session_id = if parsed_meta.session_id.is_empty() {
+                initial_meta.session_id
+            } else {
+                parsed_meta.session_id
+            };
+            let cwd = if parsed_meta.cwd.is_empty() {
+                initial_meta.cwd
+            } else {
+                parsed_meta.cwd
+            };
+            let latest_timestamp = if parsed_meta.latest_timestamp.is_empty() {
+                initial_meta.latest_timestamp
+            } else {
+                parsed_meta.latest_timestamp
+            };
+
+            promote_generated_image_artifacts(&mut messages, &cwd, workspace_id);
+            Ok(CodexThreadTranscriptResult {
+                session_id,
+                session_title: if parsed_meta.title.is_empty() {
+                    initial_meta.title
+                } else {
+                    parsed_meta.title
+                },
+                rollout_path: path.to_string_lossy().to_string(),
+                cwd,
+                matched_by,
+                latest_timestamp,
+                messages,
+            })
+        })();
+        return local_result.or_else(|local_error| {
+            read_agent_thread_cloud_transcript(
+                agent_id,
+                provider_session_id,
+                cwd,
+                workspace_id,
+                max_messages,
+            )
+            .map_err(|cloud_error| format!("{local_error}; cloud fallback failed: {cloud_error}"))
+        });
+    }
+
+    if agent_id == "opencode" {
+        let local_result: Result<CodexThreadTranscriptResult, String> = (|| {
+            let (session_id, title, session_cwd, matched_by) =
+                find_opencode_session(provider_session_id, cwd)?;
+            let (parsed_meta, mut messages) =
+                parse_opencode_session(&session_id, &title, &session_cwd, max_messages)?;
+            promote_generated_image_artifacts(&mut messages, &parsed_meta.cwd, workspace_id);
+            Ok(CodexThreadTranscriptResult {
+                session_id: parsed_meta.session_id,
+                session_title: parsed_meta.title,
+                rollout_path: opencode_db_path()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                cwd: parsed_meta.cwd,
+                matched_by,
+                latest_timestamp: parsed_meta.latest_timestamp,
+                messages,
+            })
+        })();
+        return local_result.or_else(|local_error| {
+            read_agent_thread_cloud_transcript(
+                agent_id,
+                provider_session_id,
+                cwd,
+                workspace_id,
+                max_messages,
+            )
+            .map_err(|cloud_error| format!("{local_error}; cloud fallback failed: {cloud_error}"))
+        });
+    }
+
+    let local_result: Result<CodexThreadTranscriptResult, String> = (|| {
+        let (path, initial_meta, matched_by) = find_codex_rollout(provider_session_id, cwd)?;
+        let (parsed_meta, mut messages) = parse_codex_rollout(&path, max_messages)?;
         let session_id = if parsed_meta.session_id.is_empty() {
             initial_meta.session_id
         } else {
@@ -3807,74 +4249,32 @@ fn read_agent_thread_transcript(
         } else {
             parsed_meta.latest_timestamp
         };
-
+        let session_title = first_non_empty_title(&[
+            parsed_meta.title,
+            initial_meta.title,
+            codex_session_index_title(&session_id),
+        ]);
         promote_generated_image_artifacts(&mut messages, &cwd, workspace_id);
-        return Ok(CodexThreadTranscriptResult {
+
+        Ok(CodexThreadTranscriptResult {
             session_id,
-            session_title: if parsed_meta.title.is_empty() {
-                initial_meta.title
-            } else {
-                parsed_meta.title
-            },
+            session_title,
             rollout_path: path.to_string_lossy().to_string(),
             cwd,
             matched_by,
             latest_timestamp,
             messages,
-        });
-    }
-
-    if agent_id == "opencode" {
-        let (session_id, title, session_cwd, matched_by) =
-            find_opencode_session(provider_session_id, cwd)?;
-        let (parsed_meta, mut messages) =
-            parse_opencode_session(&session_id, &title, &session_cwd, max_messages)?;
-        promote_generated_image_artifacts(&mut messages, &parsed_meta.cwd, workspace_id);
-        return Ok(CodexThreadTranscriptResult {
-            session_id: parsed_meta.session_id,
-            session_title: parsed_meta.title,
-            rollout_path: opencode_db_path()
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            cwd: parsed_meta.cwd,
-            matched_by,
-            latest_timestamp: parsed_meta.latest_timestamp,
-            messages,
-        });
-    }
-
-    let (path, initial_meta, matched_by) = find_codex_rollout(provider_session_id, cwd)?;
-    let (parsed_meta, mut messages) = parse_codex_rollout(&path, max_messages)?;
-    let session_id = if parsed_meta.session_id.is_empty() {
-        initial_meta.session_id
-    } else {
-        parsed_meta.session_id
-    };
-    let cwd = if parsed_meta.cwd.is_empty() {
-        initial_meta.cwd
-    } else {
-        parsed_meta.cwd
-    };
-    let latest_timestamp = if parsed_meta.latest_timestamp.is_empty() {
-        initial_meta.latest_timestamp
-    } else {
-        parsed_meta.latest_timestamp
-    };
-    let session_title = first_non_empty_title(&[
-        parsed_meta.title,
-        initial_meta.title,
-        codex_session_index_title(&session_id),
-    ]);
-    promote_generated_image_artifacts(&mut messages, &cwd, workspace_id);
-
-    Ok(CodexThreadTranscriptResult {
-        session_id,
-        session_title,
-        rollout_path: path.to_string_lossy().to_string(),
-        cwd,
-        matched_by,
-        latest_timestamp,
-        messages,
+        })
+    })();
+    local_result.or_else(|local_error| {
+        read_agent_thread_cloud_transcript(
+            agent_id,
+            provider_session_id,
+            cwd,
+            workspace_id,
+            max_messages,
+        )
+        .map_err(|cloud_error| format!("{local_error}; cloud fallback failed: {cloud_error}"))
     })
 }
 
@@ -4092,13 +4492,15 @@ async fn emit_agent_thread_transcript_watch_update(
             "workspaceId": context.workspace_id,
         }),
     );
-    agent_chat_session_sync_spawn_from_result(
-        app,
-        &context.agent_id,
-        &result,
-        agent_chat_session_sync_context_from_watch(&context),
-        "transcript_watch_update",
-    );
+    if !agent_thread_transcript_result_is_cloud_backed(&result) {
+        agent_chat_session_sync_spawn_from_result(
+            app,
+            &context.agent_id,
+            &result,
+            agent_chat_session_sync_context_from_watch(&context),
+            "transcript_watch_update",
+        );
+    }
 }
 
 fn register_agent_thread_transcript_watch(
@@ -4114,6 +4516,9 @@ fn register_agent_thread_transcript_watch(
         context.cwd = result.cwd.clone();
     }
     if context.provider_session_id.trim().is_empty() {
+        return Ok(());
+    }
+    if agent_thread_transcript_result_is_cloud_backed(result) {
         return Ok(());
     }
 
@@ -4238,17 +4643,19 @@ async fn agent_thread_session_discover(
     }?;
     promote_result_generated_image_artifacts(&mut result, workspace_id);
     emit_promoted_generated_asset_event(&app, &result, workspace_id, "session-discover");
-    agent_chat_session_sync_spawn_from_result(
-        app,
-        &agent_id,
-        &result,
-        AgentChatSessionSyncContext {
-            workspace_id: workspace_id.unwrap_or_default().to_string(),
-            source: "session-discover".to_string(),
-            ..AgentChatSessionSyncContext::default()
-        },
-        "session_discover",
-    );
+    if !agent_thread_transcript_result_is_cloud_backed(&result) {
+        agent_chat_session_sync_spawn_from_result(
+            app,
+            &agent_id,
+            &result,
+            AgentChatSessionSyncContext {
+                workspace_id: workspace_id.unwrap_or_default().to_string(),
+                source: "session-discover".to_string(),
+                ..AgentChatSessionSyncContext::default()
+            },
+            "session_discover",
+        );
+    }
     Ok(result)
 }
 
@@ -4279,17 +4686,19 @@ async fn agent_thread_transcript(
         request.workspace_id.as_deref(),
         "transcript-read",
     );
-    agent_chat_session_sync_spawn_from_result(
-        app,
-        &agent_id,
-        &result,
-        AgentChatSessionSyncContext {
-            workspace_id: request.workspace_id.unwrap_or_default(),
-            source: "transcript-read".to_string(),
-            ..AgentChatSessionSyncContext::default()
-        },
-        "transcript_read",
-    );
+    if !agent_thread_transcript_result_is_cloud_backed(&result) {
+        agent_chat_session_sync_spawn_from_result(
+            app,
+            &agent_id,
+            &result,
+            AgentChatSessionSyncContext {
+                workspace_id: request.workspace_id.unwrap_or_default(),
+                source: "transcript-read".to_string(),
+                ..AgentChatSessionSyncContext::default()
+            },
+            "transcript_read",
+        );
+    }
     Ok(result)
 }
 
@@ -4312,13 +4721,15 @@ async fn agent_thread_transcript_watch(
         Some(context.workspace_id.as_str()).filter(|value| !value.trim().is_empty()),
         "transcript-watch-start",
     );
-    agent_chat_session_sync_spawn_from_result(
-        app.clone(),
-        &context.agent_id,
-        &result,
-        agent_chat_session_sync_context_from_watch(&context),
-        "transcript_watch_start",
-    );
-    let _ = register_agent_thread_transcript_watch(&app, &request, &result);
+    if !agent_thread_transcript_result_is_cloud_backed(&result) {
+        agent_chat_session_sync_spawn_from_result(
+            app.clone(),
+            &context.agent_id,
+            &result,
+            agent_chat_session_sync_context_from_watch(&context),
+            "transcript_watch_start",
+        );
+        let _ = register_agent_thread_transcript_watch(&app, &request, &result);
+    }
     Ok(result)
 }

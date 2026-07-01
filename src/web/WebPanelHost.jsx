@@ -9,6 +9,7 @@ import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { Refresh } from "@styled-icons/material-rounded/Refresh";
 
 import {
+  ButtonBotIcon,
   ButtonCloseIcon,
   ButtonDragIcon,
   GlobalStyle,
@@ -30,10 +31,23 @@ import {
   WEB_PANEL_CONTROL_NAVIGATE,
   WEB_PANEL_CONTROL_RETURN,
 } from "./webPanelBridge.js";
+import PanelAgentPromptActivity from "../terminals/PanelAgentPromptActivity.jsx";
+import PanelAgentPromptComposer from "../terminals/PanelAgentPromptComposer.jsx";
+import {
+  PANEL_AGENT_PROMPT_ACTIVITY_EVENT,
+  PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT,
+  PANEL_AGENT_PROMPT_RESULT_EVENT,
+  PANEL_AGENT_PROMPT_SUBMIT_EVENT,
+  PANEL_AGENT_PROMPT_TARGETS_EVENT,
+  PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT,
+  createPanelAgentPromptRequestId,
+  normalizePanelAgentPromptActivityItems,
+  normalizePanelAgentPromptTargets,
+} from "../terminals/panelAgentPromptBridge.js";
 
 function parseWebPanelParams() {
   if (typeof window === "undefined") {
-    return { paneId: "", url: DEFAULT_WEB_URL, theme: "dark", windowId: "" };
+    return { paneId: "", url: DEFAULT_WEB_URL, theme: "dark", windowId: "", workspaceId: "" };
   }
   const hash = window.location.hash || "";
   const queryIndex = hash.indexOf("?");
@@ -44,6 +58,7 @@ function parseWebPanelParams() {
     theme,
     url: normalizeWebInput(params.get("url") || "") || DEFAULT_WEB_URL,
     windowId: params.get("windowId") || "",
+    workspaceId: params.get("workspaceId") || "",
   };
 }
 
@@ -62,7 +77,12 @@ export default function WebPanelHost() {
   const [historyIndex, setHistoryIndex] = useState(0);
   const [addressValue, setAddressValue] = useState(params.url);
   const [addressError, setAddressError] = useState("");
+  const [agentPromptOpen, setAgentPromptOpen] = useState(false);
+  const [agentPromptActivityItems, setAgentPromptActivityItems] = useState([]);
+  const [agentPromptTargets, setAgentPromptTargets] = useState([]);
+  const [defaultAgentPromptTargetIds, setDefaultAgentPromptTargetIds] = useState([]);
   const viewportRef = useRef(null);
+  const agentPromptTargetsRequestIdRef = useRef("");
 
   const currentUrl = history[historyIndex] || DEFAULT_WEB_URL;
   const currentHost = useMemo(() => hostForUrl(currentUrl), [currentUrl]);
@@ -101,11 +121,184 @@ export default function WebPanelHost() {
   const { reload } = useNativeWebview({
     viewportRef,
     url: currentUrl,
-    visible: true,
+    visible: !agentPromptOpen,
     parentWindowLabel: windowLabel,
     scopeParts,
     onNavigate: handleLoadedUrl,
   });
+
+  const requestAgentPromptTargets = useCallback(() => {
+    const requestId = createPanelAgentPromptRequestId("web-panel-targets");
+    agentPromptTargetsRequestIdRef.current = requestId;
+    emit(PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT, {
+      panelKind: "web",
+      paneId: params.paneId,
+      requestId,
+      windowId: windowLabel,
+      workspaceId: params.workspaceId,
+    }).catch(() => {});
+  }, [params.paneId, params.workspaceId, windowLabel]);
+
+  const requestAgentPromptActivity = useCallback(() => {
+    emit(PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT, {
+      panelKind: "web",
+      paneId: params.paneId,
+      windowId: windowLabel,
+      workspaceId: params.workspaceId,
+    }).catch(() => {});
+  }, [params.paneId, params.workspaceId, windowLabel]);
+
+  useEffect(() => {
+    requestAgentPromptActivity();
+  }, [requestAgentPromptActivity]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(PANEL_AGENT_PROMPT_ACTIVITY_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const paneId = String(payload.paneId || payload.pane_id || payload.panelPaneId || payload.panel_pane_id || "").trim();
+      if (!paneId || (params.paneId && paneId !== params.paneId)) {
+        return;
+      }
+      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      if (workspaceId && params.workspaceId && workspaceId !== params.workspaceId) {
+        return;
+      }
+      const windowId = String(payload.windowId || payload.window_id || "").trim();
+      if (windowId && windowId !== windowLabel) {
+        return;
+      }
+      setAgentPromptActivityItems(normalizePanelAgentPromptActivityItems(payload.items));
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [params.paneId, params.workspaceId, windowLabel]);
+
+  useEffect(() => {
+    if (agentPromptOpen) {
+      requestAgentPromptTargets();
+    }
+  }, [agentPromptOpen, requestAgentPromptTargets]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(PANEL_AGENT_PROMPT_TARGETS_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const requestId = String(payload.requestId || payload.request_id || "").trim();
+      const windowId = String(payload.windowId || payload.window_id || "").trim();
+      if (requestId && requestId !== agentPromptTargetsRequestIdRef.current) {
+        return;
+      }
+      if (windowId && windowId !== windowLabel) {
+        return;
+      }
+      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      if (workspaceId && params.workspaceId && workspaceId !== params.workspaceId) {
+        return;
+      }
+      setAgentPromptTargets(normalizePanelAgentPromptTargets(payload.targets));
+      setDefaultAgentPromptTargetIds(
+        (Array.isArray(payload.defaultSelectedTargetIds)
+          ? payload.defaultSelectedTargetIds
+          : Array.isArray(payload.default_selected_target_ids)
+            ? payload.default_selected_target_ids
+            : []
+        ).map((id) => String(id || "").trim()).filter(Boolean),
+      );
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [params.workspaceId, windowLabel]);
+
+  const submitAgentPrompt = useCallback(async ({ targetIds, targetTerminalIndexes, text }) => {
+    const requestId = createPanelAgentPromptRequestId("web-panel-submit");
+    let unlisten = () => {};
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        settled = true;
+        unlisten();
+      };
+      const timeoutId = window.setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        cleanup();
+        reject(new Error("Timed out sending prompt."));
+      }, 15000);
+      listen(PANEL_AGENT_PROMPT_RESULT_EVENT, (event) => {
+        const payload = event?.payload || {};
+        if (String(payload.requestId || payload.request_id || "").trim() !== requestId) {
+          return;
+        }
+        const windowId = String(payload.windowId || payload.window_id || "").trim();
+        if (windowId && windowId !== windowLabel) {
+          return;
+        }
+        window.clearTimeout(timeoutId);
+        cleanup();
+        if (payload.ok === true) {
+          resolve(payload);
+        } else {
+          reject(new Error(String(payload.error || "Unable to send prompt.")));
+        }
+      })
+        .then((nextUnlisten) => {
+          if (settled) {
+            nextUnlisten();
+          } else {
+            unlisten = nextUnlisten;
+            emit(PANEL_AGENT_PROMPT_SUBMIT_EVENT, {
+              panelKind: "web",
+              paneId: params.paneId,
+              requestId,
+              targetIds,
+              targetTerminalIndexes,
+              text,
+              windowId: windowLabel,
+              workspaceId: params.workspaceId,
+            }).catch((error) => {
+              window.clearTimeout(timeoutId);
+              cleanup();
+              reject(error);
+            });
+          }
+        })
+        .catch((error) => {
+          window.clearTimeout(timeoutId);
+          cleanup();
+          reject(error);
+        });
+    });
+  }, [params.paneId, params.workspaceId, windowLabel]);
 
   const navigateTo = useCallback((targetUrl) => {
     setHistory((previous) => {
@@ -281,6 +474,17 @@ export default function WebPanelHost() {
           </HostRailIdentity>
 
           <HostRailControls data-rail-row="secondary">
+            <PanelAgentPromptActivity items={agentPromptActivityItems} />
+            <HostIconButton
+              aria-label="Prompt terminal agents"
+              aria-pressed={agentPromptOpen ? "true" : "false"}
+              data-active={agentPromptOpen ? "true" : undefined}
+              onClick={() => setAgentPromptOpen((open) => !open)}
+              title="Prompt terminal agents"
+              type="button"
+            >
+              <ButtonBotIcon aria-hidden="true" />
+            </HostIconButton>
             <HostIconButton
               aria-label="Return web panel to the app"
               aria-pressed="true"
@@ -335,6 +539,18 @@ export default function WebPanelHost() {
           <Language aria-hidden="true" />
           <span>{currentHost}</span>
         </HostBackdrop>
+        {agentPromptOpen ? (
+          <PanelAgentPromptComposer
+            autoFocus
+            defaultSelectedTargetIds={defaultAgentPromptTargetIds}
+            onClose={() => setAgentPromptOpen(false)}
+            onSubmit={submitAgentPrompt}
+            panelKind="web"
+            panelPaneId={params.paneId}
+            targets={agentPromptTargets}
+            windowId={windowLabel}
+          />
+        ) : null}
       </HostViewport>
     </HostSurface>
   );

@@ -34,7 +34,7 @@
           "$TEMP/**"
         ]
       },
-      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:* ws://localhost:* https://diffforge.ai; img-src 'self' asset: http://asset.localhost data:; media-src 'self' asset: http://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self' blob: 'wasm-unsafe-eval'; worker-src 'self' blob:",
+      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:* ws://localhost:* https://diffforge.ai; img-src 'self' asset: http://asset.localhost data:; media-src 'self' asset: http://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self' blob: 'unsafe-eval' 'wasm-unsafe-eval'; worker-src 'self' blob:",
       "dangerousDisableAssetCspModification": [
         "style-src"
       ]

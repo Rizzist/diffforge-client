@@ -48,6 +48,7 @@ import styled, { keyframes } from "styled-components";
 
 import {
   ButtonAddIcon,
+  ButtonBotIcon,
   ButtonCloseIcon,
   ButtonDeleteIcon,
   ButtonDragIcon,
@@ -141,6 +142,18 @@ import {
 import { WORKSPACE_TOOL_TODO_DRAG_MIME } from "../tools/workspaceToolDragTypes.js";
 import { warmWorkspaceTools } from "../tools/workspaceToolsStore.js";
 import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
+import PanelAgentPromptActivity from "./PanelAgentPromptActivity.jsx";
+import PanelAgentPromptComposer from "./PanelAgentPromptComposer.jsx";
+import {
+  PANEL_AGENT_PROMPT_ACTIVITY_EVENT,
+  PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT,
+  PANEL_AGENT_PROMPT_RESULT_EVENT,
+  PANEL_AGENT_PROMPT_SUBMIT_EVENT,
+  PANEL_AGENT_PROMPT_TARGETS_EVENT,
+  PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT,
+  normalizePanelAgentPromptActivityItems,
+  normalizePanelAgentPromptTargets,
+} from "./panelAgentPromptBridge.js";
 import { logTerminalStatus } from "./terminalStatusLog.js";
 import {
   appControlMessageHasExplicitTerminalTarget,
@@ -170,6 +183,7 @@ import {
 import { TODO_COMPLETED_NOTIFICATION_EVENT } from "../notifications/workspaceNotifications";
 import { sendNativeNotification } from "../notifications/nativeNotifications";
 import {
+  TODO_QUEUE_SOURCE_PANEL_AGENT_PROMPT,
   TODO_QUEUE_SOURCE_REMOTE_CONTROL,
   TODO_QUEUE_SOURCE_TERMINAL_DIRECT,
   TODO_QUEUE_SOURCE_TODO_AUTO,
@@ -331,6 +345,15 @@ const APP_CONTROL_SEND_MESSAGE_MAX_RECOVERY_ATTEMPTS = 1;
 const TODO_QUEUE_RESUME_LOCK_STALE_MS = 30 * 60 * 1000;
 const TODO_QUEUE_PENDING_SPOKES = Array.from({ length: 8 }, (_, index) => index);
 const TODO_QUEUE_AGENT_ROLES = new Set(["codex", "claude", "opencode"]);
+const PANEL_AGENT_PROMPT_COMPLETED_RETENTION_MS = 5000;
+const PANEL_AGENT_PROMPT_SETTLED_STATUSES = new Set([
+  "cancelled",
+  "canceled",
+  "completed",
+  "failed",
+  "interrupted",
+  "timed_out",
+]);
 const TODO_QUEUE_CLOSED_TURN_STATES = new Set([
   "cancelled",
   "canceled",
@@ -2789,6 +2812,7 @@ const TerminalPcbPanelTitle = styled(TerminalAgentLabel)`
 `;
 
 const TerminalPcbPanelBody = styled.div`
+  position: relative;
   flex: 1 1 auto;
   min-width: 0;
   min-height: 0;
@@ -21727,6 +21751,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
 
 function WorkspacePcbGridPane({
   controlCommand = null,
+  defaultPanelAgentPromptTargetIds = [],
   dragActive = false,
   fullscreenActive = false,
   isActive = false,
@@ -21738,9 +21763,12 @@ function WorkspacePcbGridPane({
   onPopOut = null,
   onReturnFromBreakout = null,
   onSplit = null,
+  onSubmitPanelAgentPrompt = null,
   onToggleFullscreen = null,
   paneId = "",
   paneLimitReached = false,
+  panelAgentPromptActivityItems = [],
+  panelAgentPromptTargets = [],
   poppedOut = false,
   repoPath = "",
   resumeNonce = 0,
@@ -21751,6 +21779,7 @@ function WorkspacePcbGridPane({
   const [createRequestNonce, setCreateRequestNonce] = useState(0);
   const [deleteRequestNonce, setDeleteRequestNonce] = useState(0);
   const [refreshRequestNonce, setRefreshRequestNonce] = useState(0);
+  const [agentPromptOpen, setAgentPromptOpen] = useState(false);
   const boardTitle = board?.name || "PCB";
   const splitTitle = paneLimitReached ? "Panel limit reached" : "Split PCB panel";
 
@@ -21797,6 +21826,17 @@ function WorkspacePcbGridPane({
           </TerminalPcbPanelTitle>
         </TerminalPcbPanelIdentity>
         <TerminalRailControls data-rail-row="secondary">
+          <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
+          <TerminalRestartButton
+            aria-label="Prompt terminal agents"
+            aria-pressed={agentPromptOpen ? "true" : "false"}
+            data-active={agentPromptOpen ? "true" : undefined}
+            onClick={() => setAgentPromptOpen((open) => !open)}
+            title="Prompt terminal agents"
+            type="button"
+          >
+            <ButtonBotIcon aria-hidden="true" />
+          </TerminalRestartButton>
           <TerminalRestartButton
             aria-label="New or switch PCB board"
             disabled={!repoPath}
@@ -21909,6 +21949,17 @@ function WorkspacePcbGridPane({
             workspaceId={workspaceId}
           />
         )}
+        {agentPromptOpen ? (
+          <PanelAgentPromptComposer
+            autoFocus
+            defaultSelectedTargetIds={defaultPanelAgentPromptTargetIds}
+            onClose={() => setAgentPromptOpen(false)}
+            onSubmit={onSubmitPanelAgentPrompt}
+            panelKind="pcb"
+            panelPaneId={paneId}
+            targets={panelAgentPromptTargets}
+          />
+        ) : null}
       </TerminalPcbPanelBody>
     </TerminalPcbPanelShell>
   );
@@ -22152,6 +22203,9 @@ function TerminalView({
   const [todoQueueDraft, setTodoQueueDraft] = useState("");
   const [todoQueueItems, setTodoQueueItems] = useState([]);
   const [todoQueuePendingItems, setTodoQueuePendingItems] = useState({});
+  const [panelAgentPromptActivityItems, setPanelAgentPromptActivityItems] = useState([]);
+  const panelAgentPromptActivityPaneIdsRef = useRef(new Set());
+  const panelAgentPromptActivityTimersRef = useRef(new Map());
   const [todoQueueDispatchRevision, setTodoQueueDispatchRevision] = useState(0);
   const [todoDispatchStartupReconcileActive, setTodoDispatchStartupReconcileActive] = useState(true);
   const [todoQueuePaneMode, setTodoQueuePaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
@@ -22445,6 +22499,48 @@ function TerminalView({
     setTodoQueuePendingItems(normalizedPendingItems);
   }, []);
 
+  const removePanelAgentPromptActivityItems = useCallback((itemIds = []) => {
+    const itemIdSet = new Set(
+      (Array.isArray(itemIds) ? itemIds : [itemIds])
+        .map((itemId) => String(itemId || "").trim())
+        .filter(Boolean),
+    );
+    if (!itemIdSet.size) {
+      return;
+    }
+    itemIdSet.forEach((itemId) => {
+      const timeoutId = panelAgentPromptActivityTimersRef.current.get(itemId);
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+        panelAgentPromptActivityTimersRef.current.delete(itemId);
+      }
+    });
+    setPanelAgentPromptActivityItems((currentItems) => (
+      currentItems.filter((item) => !itemIdSet.has(String(item.itemId || item.id || "").trim()))
+    ));
+  }, []);
+
+  const schedulePanelAgentPromptActivityRemoval = useCallback((itemIds = []) => {
+    const safeItemIds = (Array.isArray(itemIds) ? itemIds : [itemIds])
+      .map((itemId) => String(itemId || "").trim())
+      .filter(Boolean);
+    safeItemIds.forEach((itemId) => {
+      if (panelAgentPromptActivityTimersRef.current.has(itemId)) {
+        return;
+      }
+      const timeoutId = window.setTimeout(() => {
+        panelAgentPromptActivityTimersRef.current.delete(itemId);
+        removePanelAgentPromptActivityItems(itemId);
+      }, PANEL_AGENT_PROMPT_COMPLETED_RETENTION_MS);
+      panelAgentPromptActivityTimersRef.current.set(itemId, timeoutId);
+    });
+  }, [removePanelAgentPromptActivityItems]);
+
+  useEffect(() => () => {
+    panelAgentPromptActivityTimersRef.current.forEach((timeoutId) => window.clearTimeout(timeoutId));
+    panelAgentPromptActivityTimersRef.current.clear();
+  }, []);
+
   const markTodoQueueTombstonedIds = useCallback((todoIds = []) => {
     const safeTodoIds = (Array.isArray(todoIds) ? todoIds : [todoIds])
       .map((todoId) => String(todoId || "").trim())
@@ -22452,10 +22548,11 @@ function TerminalView({
     if (!safeTodoIds.length) {
       return;
     }
+    removePanelAgentPromptActivityItems(safeTodoIds);
     const nextTombstoned = new Set(todoQueueTombstonedIdsRef.current || []);
     safeTodoIds.forEach((todoId) => nextTombstoned.add(todoId));
     todoQueueTombstonedIdsRef.current = nextTombstoned;
-  }, []);
+  }, [removePanelAgentPromptActivityItems]);
 
   const getTodoQueueItemAgentSessionMetadataForSync = useCallback((item, pendingItem = null) => {
     const targetTerminalIndex = getTodoQueueTargetTerminalIndex(item) ?? getTodoQueueTargetTerminalIndex(pendingItem);
@@ -27808,6 +27905,7 @@ function TerminalView({
         title: "Web",
         url: targetUrl,
         width: rect?.width || null,
+        workspaceId: terminalWorkspace?.id || "",
       });
       const label = String(result?.label || "").trim();
       if (label) {
@@ -27817,7 +27915,7 @@ function TerminalView({
     } catch {
       // If the window fails to open, the pane simply stays in the grid.
     }
-  }, [rememberWebPaneUrl]);
+  }, [rememberWebPaneUrl, terminalWorkspace?.id]);
 
   const clearWebPanelBreakout = useCallback((paneId) => {
     const safePaneId = String(paneId || "").trim();
@@ -32990,6 +33088,454 @@ function TerminalView({
     terminalWorkspace?.id,
   ]);
 
+  const panelAgentPromptTargets = useMemo(() => (
+    logicalTerminalIndexes
+      .map((terminalIndex) => {
+        if (paneKinds?.[terminalIndex] === "web" || paneKinds?.[terminalIndex] === "pcb") {
+          return null;
+        }
+        const role = resolveTodoQueueTerminalAgentRole(
+          getTerminalRole(terminalIndex),
+          getTerminalAgent(terminalIndex)?.id,
+        );
+        if (!TODO_QUEUE_AGENT_ROLES.has(role)) {
+          return null;
+        }
+        const paneId = getTerminalPaneId(terminalIndex);
+        if (!paneId) {
+          return null;
+        }
+        const meta = getTerminalTabAgentMeta(role);
+        const colorSlot = getTerminalAgentColorSlot(terminalIndex);
+        const color = terminalColorForSlot(colorSlot);
+        const label = `${meta.label} ${terminalIndex + 1}`;
+        return {
+          color,
+          id: String(terminalIndex),
+          label,
+          paneId,
+          role,
+          short: meta.short,
+          terminalIndex,
+          title: `${label} (${paneId})`,
+        };
+      })
+      .filter(Boolean)
+  ), [
+    getTerminalAgent,
+    getTerminalPaneId,
+    getTerminalRole,
+    logicalTerminalIndexes,
+    paneKinds,
+  ]);
+
+  const defaultPanelAgentPromptTargetIds = useMemo(() => {
+    if (!panelAgentPromptTargets.length) {
+      return [];
+    }
+    const activeTarget = panelAgentPromptTargets.find((target) => target.paneId === activePaneId);
+    return [activeTarget?.id || panelAgentPromptTargets[0].id];
+  }, [activePaneId, panelAgentPromptTargets]);
+
+  const addPanelAgentPromptActivityItems = useCallback((items = []) => {
+    const normalizedItems = normalizePanelAgentPromptActivityItems(items);
+    if (!normalizedItems.length) {
+      return;
+    }
+    normalizedItems.forEach((item) => {
+      const timeoutId = panelAgentPromptActivityTimersRef.current.get(item.itemId);
+      if (timeoutId) {
+        window.clearTimeout(timeoutId);
+        panelAgentPromptActivityTimersRef.current.delete(item.itemId);
+      }
+    });
+    setPanelAgentPromptActivityItems((currentItems) => {
+      const nextById = new Map(currentItems.map((item) => [String(item.itemId || item.id || ""), item]));
+      normalizedItems.forEach((item) => {
+        const previous = nextById.get(item.itemId) || {};
+        nextById.set(item.itemId, {
+          ...previous,
+          ...item,
+          status: item.status || previous.status || "queued",
+          submittedAtMs: previous.submittedAtMs || item.submittedAtMs || Date.now(),
+        });
+      });
+      return [...nextById.values()].sort((left, right) => (
+        Number(left.submittedAtMs || 0) - Number(right.submittedAtMs || 0)
+      ));
+    });
+  }, []);
+
+  const submitPanelAgentPrompt = useCallback(async ({
+    panelKind = "panel",
+    panelPaneId = "",
+    targetIds = [],
+    targetTerminalIndexes = [],
+    text = "",
+    windowId = "",
+  } = {}) => {
+    const cleanText = normalizeTodoQueueText(text);
+    if (!cleanText) {
+      throw new Error("Type a prompt.");
+    }
+    const targetIdSet = new Set(
+      (Array.isArray(targetIds) ? targetIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean),
+    );
+    const requestedIndexes = [
+      ...(Array.isArray(targetTerminalIndexes) ? targetTerminalIndexes : []),
+      ...panelAgentPromptTargets
+        .filter((target) => targetIdSet.has(target.id))
+        .map((target) => target.terminalIndex),
+    ];
+    const allowedIndexes = new Set(panelAgentPromptTargets.map((target) => target.terminalIndex));
+    const uniqueIndexes = [];
+    requestedIndexes.forEach((value) => {
+      const terminalIndex = Number.parseInt(value, 10);
+      if (
+        Number.isInteger(terminalIndex)
+        && allowedIndexes.has(terminalIndex)
+        && !uniqueIndexes.includes(terminalIndex)
+      ) {
+        uniqueIndexes.push(terminalIndex);
+      }
+    });
+    if (!uniqueIndexes.length) {
+      throw new Error("Choose at least one coding agent.");
+    }
+    const workspaceId = terminalWorkspace?.id || "";
+    const drafts = uniqueIndexes.map((terminalIndex) => ({
+      deviceId: cloudDesktopDeviceId || "",
+      panelKind,
+      source: TODO_QUEUE_SOURCE_PANEL_AGENT_PROMPT,
+      text: cleanText,
+      workspaceId,
+      ...(getExplicitTerminalTargetFields(terminalIndex) || {}),
+    }));
+    const createdItems = await createTodoQueueItemsInRust(drafts, "panel_agent_prompt_submitted");
+    if (!createdItems.length) {
+      throw new Error("Unable to create prompt todo.");
+    }
+    const targetByTerminalIndex = new Map(panelAgentPromptTargets.map((target) => [target.terminalIndex, target]));
+    const activityItems = createdItems.map((item, index) => {
+      const itemTerminalIndex = getTodoQueueTargetTerminalIndex(item);
+      const targetTerminalIndex = Number.isInteger(itemTerminalIndex)
+        ? itemTerminalIndex
+        : uniqueIndexes[index];
+      const target = targetByTerminalIndex.get(targetTerminalIndex) || null;
+      const itemId = String(item?.id || "").trim();
+      return {
+        color: target?.color || getTodoQueueTargetTerminalColor(item) || "",
+        id: itemId,
+        itemId,
+        label: target?.label || (Number.isInteger(targetTerminalIndex) ? `Agent ${targetTerminalIndex + 1}` : "Agent"),
+        panelKind,
+        panelPaneId,
+        role: target?.role || getTodoQueueTargetAgentId(item) || "",
+        short: target?.short || "",
+        status: "queued",
+        submittedAtMs: Date.now() + index,
+        targetTerminalIndex,
+        text: cleanText.slice(0, 160),
+        title: target?.title || cleanText.slice(0, 160),
+        windowId,
+        workspaceId,
+      };
+    }).filter((item) => item.itemId);
+    addPanelAgentPromptActivityItems(activityItems);
+    createdItems.forEach((item) => {
+      const itemTerminalIndex = getTodoQueueTargetTerminalIndex(item);
+      queueTodoQueueItem(item.id, {
+        item,
+        targetTerminalIndex: Number.isInteger(itemTerminalIndex) ? itemTerminalIndex : undefined,
+      });
+    });
+    logTerminalStatus("frontend.panel_agent_prompt.submitted", {
+      itemCount: createdItems.length,
+      panelKind,
+      targetTerminalIndexes: uniqueIndexes,
+      workspaceId,
+    });
+    return createdItems;
+  }, [
+    addPanelAgentPromptActivityItems,
+    cloudDesktopDeviceId,
+    createTodoQueueItemsInRust,
+    getExplicitTerminalTargetFields,
+    panelAgentPromptTargets,
+    queueTodoQueueItem,
+    terminalWorkspace?.id,
+  ]);
+
+  useEffect(() => {
+    if (!panelAgentPromptActivityItems.length) {
+      return;
+    }
+    const itemById = new Map(todoQueueItems.map((item) => [String(item?.id || "").trim(), item]));
+    const completedItemIds = [];
+    setPanelAgentPromptActivityItems((currentItems) => {
+      let changed = false;
+      const nextItems = currentItems
+        .map((activityItem) => {
+          const itemId = String(activityItem.itemId || activityItem.id || "").trim();
+          if (!itemId) {
+            changed = true;
+            return null;
+          }
+          const queueItem = itemById.get(itemId) || null;
+          const pendingItem = todoQueuePendingItems[itemId] || null;
+          if (!queueItem && !pendingItem) {
+            if (activityItem.status === "completed") {
+              return activityItem;
+            }
+            changed = true;
+            return null;
+          }
+          const lifecycleStatus = queueItem ? getTodoQueueCanonicalLifecycleStatus(queueItem) : "";
+          const pendingPhase = pendingItem ? getTodoQueuePendingPhase(pendingItem) : "";
+          const nextStatus = PANEL_AGENT_PROMPT_SETTLED_STATUSES.has(lifecycleStatus)
+            ? "completed"
+            : pendingPhase && pendingPhase !== "queued"
+              ? "running"
+              : lifecycleStatus === "running"
+                ? "running"
+                : "queued";
+          if (nextStatus === "completed") {
+            completedItemIds.push(itemId);
+          }
+          if (nextStatus === activityItem.status) {
+            return activityItem;
+          }
+          changed = true;
+          return {
+            ...activityItem,
+            completedAtMs: nextStatus === "completed" ? Date.now() : activityItem.completedAtMs || 0,
+            status: nextStatus,
+          };
+        })
+        .filter(Boolean);
+      return changed ? nextItems : currentItems;
+    });
+    if (completedItemIds.length) {
+      schedulePanelAgentPromptActivityRemoval(completedItemIds);
+    }
+  }, [
+    panelAgentPromptActivityItems.length,
+    schedulePanelAgentPromptActivityRemoval,
+    todoQueueItems,
+    todoQueuePendingItems,
+  ]);
+
+  useEffect(() => {
+    const handleTodoCompleted = (event) => {
+      const detail = event?.detail || {};
+      const workspaceId = String(detail.workspaceId || "").trim();
+      if (workspaceId && terminalWorkspace?.id && workspaceId !== terminalWorkspace.id) {
+        return;
+      }
+      const itemId = String(detail.itemId || detail.todoId || "").trim();
+      if (!itemId) {
+        return;
+      }
+      setPanelAgentPromptActivityItems((currentItems) => {
+        let changed = false;
+        const nextItems = currentItems.map((item) => {
+          if (String(item.itemId || item.id || "").trim() !== itemId) {
+            return item;
+          }
+          if (item.status === "completed") {
+            return item;
+          }
+          changed = true;
+          return {
+            ...item,
+            completedAtMs: Date.now(),
+            status: "completed",
+          };
+        });
+        return changed ? nextItems : currentItems;
+      });
+      schedulePanelAgentPromptActivityRemoval(itemId);
+    };
+    window.addEventListener(TODO_COMPLETED_NOTIFICATION_EVENT, handleTodoCompleted);
+    return () => {
+      window.removeEventListener(TODO_COMPLETED_NOTIFICATION_EVENT, handleTodoCompleted);
+    };
+  }, [schedulePanelAgentPromptActivityRemoval, terminalWorkspace?.id]);
+
+  const emitPanelAgentPromptActivitySnapshot = useCallback((payload = {}) => {
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!workspaceId) {
+      return;
+    }
+    const paneId = String(payload.paneId || payload.pane_id || payload.panelPaneId || payload.panel_pane_id || "").trim();
+    const panelKind = String(payload.panelKind || payload.panel_kind || "panel").trim();
+    const windowId = String(payload.windowId || payload.window_id || "").trim();
+    if (!paneId) {
+      return;
+    }
+    const items = normalizePanelAgentPromptActivityItems(
+      panelAgentPromptActivityItems.filter((item) => {
+        if (paneId && String(item.panelPaneId || "").trim() !== paneId) {
+          return false;
+        }
+        if (panelKind && panelKind !== "panel" && String(item.panelKind || "").trim() !== panelKind) {
+          return false;
+        }
+        return true;
+      }),
+    );
+    emit(PANEL_AGENT_PROMPT_ACTIVITY_EVENT, {
+      items,
+      panelKind,
+      panel_kind: panelKind,
+      paneId,
+      pane_id: paneId,
+      windowId,
+      window_id: windowId,
+      workspaceId,
+      workspace_id: workspaceId,
+    }).catch(() => {});
+  }, [panelAgentPromptActivityItems, terminalWorkspace?.id]);
+
+  useEffect(() => {
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!workspaceId) {
+      return;
+    }
+    const currentPaneIds = new Set(
+      panelAgentPromptActivityItems
+        .map((item) => String(item.panelPaneId || "").trim())
+        .filter(Boolean),
+    );
+    const paneIds = new Set([
+      ...panelAgentPromptActivityPaneIdsRef.current,
+      ...currentPaneIds,
+    ]);
+    paneIds.forEach((paneId) => {
+      const paneItem = panelAgentPromptActivityItems.find((item) => String(item.panelPaneId || "").trim() === paneId);
+      emitPanelAgentPromptActivitySnapshot({
+        panelKind: paneItem?.panelKind || "panel",
+        paneId,
+      });
+    });
+    panelAgentPromptActivityPaneIdsRef.current = currentPaneIds;
+  }, [
+    emitPanelAgentPromptActivitySnapshot,
+    panelAgentPromptActivityItems,
+    terminalWorkspace?.id,
+  ]);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners = [];
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!workspaceId) {
+      return undefined;
+    }
+
+    const register = (eventName, handler) => {
+      listen(eventName, handler)
+        .then((unlisten) => {
+          if (disposed) {
+            unlisten();
+          } else {
+            unlisteners.push(unlisten);
+          }
+        })
+        .catch(() => {});
+    };
+
+    const payloadMatchesWorkspace = (payload = {}) => {
+      const eventWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      return !eventWorkspaceId || eventWorkspaceId === workspaceId;
+    };
+
+    register(PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT, (event) => {
+      const payload = event?.payload || {};
+      if (!payloadMatchesWorkspace(payload)) {
+        return;
+      }
+      emit(PANEL_AGENT_PROMPT_TARGETS_EVENT, {
+        defaultSelectedTargetIds: defaultPanelAgentPromptTargetIds,
+        default_selected_target_ids: defaultPanelAgentPromptTargetIds,
+        panelKind: payload.panelKind || payload.panel_kind || "panel",
+        paneId: payload.paneId || payload.pane_id || "",
+        requestId: payload.requestId || payload.request_id || "",
+        targets: normalizePanelAgentPromptTargets(panelAgentPromptTargets),
+        windowId: payload.windowId || payload.window_id || "",
+        workspaceId,
+        workspace_id: workspaceId,
+      }).catch(() => {});
+    });
+
+    register(PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT, (event) => {
+      const payload = event?.payload || {};
+      if (!payloadMatchesWorkspace(payload)) {
+        return;
+      }
+      emitPanelAgentPromptActivitySnapshot(payload);
+    });
+
+    register(PANEL_AGENT_PROMPT_SUBMIT_EVENT, (event) => {
+      const payload = event?.payload || {};
+      if (!payloadMatchesWorkspace(payload)) {
+        return;
+      }
+      const requestId = String(payload.requestId || payload.request_id || "").trim();
+      submitPanelAgentPrompt({
+        panelPaneId: payload.panelPaneId || payload.panel_pane_id || payload.paneId || payload.pane_id || "",
+        panelKind: payload.panelKind || payload.panel_kind || "panel",
+        targetIds: payload.targetIds || payload.target_ids || [],
+        targetTerminalIndexes: payload.targetTerminalIndexes || payload.target_terminal_indexes || [],
+        text: payload.text || payload.prompt || "",
+        windowId: payload.windowId || payload.window_id || "",
+      })
+        .then((items) => {
+          emit(PANEL_AGENT_PROMPT_RESULT_EVENT, {
+            itemCount: items.length,
+            item_count: items.length,
+            ok: true,
+            paneId: payload.paneId || payload.pane_id || "",
+            requestId,
+            windowId: payload.windowId || payload.window_id || "",
+            workspaceId,
+            workspace_id: workspaceId,
+          }).catch(() => {});
+        })
+        .catch((error) => {
+          emit(PANEL_AGENT_PROMPT_RESULT_EVENT, {
+            error: error?.message || String(error || "Unable to send prompt."),
+            ok: false,
+            paneId: payload.paneId || payload.pane_id || "",
+            requestId,
+            windowId: payload.windowId || payload.window_id || "",
+            workspaceId,
+            workspace_id: workspaceId,
+          }).catch(() => {});
+        });
+    });
+
+    return () => {
+      disposed = true;
+      while (unlisteners.length) {
+        const unlisten = unlisteners.pop();
+        try {
+          unlisten?.();
+        } catch {
+          /* listener already detached */
+        }
+      }
+    };
+  }, [
+    defaultPanelAgentPromptTargetIds,
+    emitPanelAgentPromptActivitySnapshot,
+    panelAgentPromptTargets,
+    submitPanelAgentPrompt,
+    terminalWorkspace?.id,
+  ]);
+
   // Starts the Rust cross-window drag watcher for any terminals currently
   // hosted in their own breakout windows. No-op when nothing is popped out, so
   // the common (all-in-grid) drag never touches the watcher.
@@ -37139,6 +37685,7 @@ function TerminalView({
                   terminalIndex={terminalIndex}
                   paneId={terminalPaneId}
                   workspaceId={terminalWorkspace?.id || ""}
+                  defaultPanelAgentPromptTargetIds={defaultPanelAgentPromptTargetIds}
                   initialUrl={webPaneUrlsRef.current[terminalPaneId] || DEFAULT_WEB_URL}
                   isActive={isWorkspaceSurfaceVisible && !tabHidden && webSurfaceReady}
                   isFullscreen={fullscreenThisTerminal}
@@ -37176,6 +37723,11 @@ function TerminalView({
                   onReturnFromBreakout={(index, pid) => returnWebPanelToGrid(pid)}
                   onFocusBreakout={focusWebPanel}
                   onNavigate={(url) => rememberWebPaneUrl(terminalPaneId, url)}
+                  onSubmitPanelAgentPrompt={submitPanelAgentPrompt}
+                  panelAgentPromptActivityItems={panelAgentPromptActivityItems.filter((item) => (
+                    String(item.panelPaneId || "").trim() === terminalPaneId
+                  ))}
+                  panelAgentPromptTargets={panelAgentPromptTargets}
                   controlCommand={webPaneCommands[terminalPaneId] || null}
                 />
               </TerminalSurfaceSlot>
@@ -37200,6 +37752,7 @@ function TerminalView({
               >
                 <WorkspacePcbGridPane
                   dragActive={terminalDragActive}
+                  defaultPanelAgentPromptTargetIds={defaultPanelAgentPromptTargetIds}
                   fullscreenActive={fullscreenActive}
                   isActive={isWorkspaceSurfaceVisible && !tabHidden}
                   isFullscreen={fullscreenThisTerminal}
@@ -37232,9 +37785,14 @@ function TerminalView({
                   onPopOut={popOutPcbPanelForIndex}
                   onReturnFromBreakout={(index, pid) => returnPcbPanelToGrid(pid)}
                   onSplit={handleSplitTerminal}
+                  onSubmitPanelAgentPrompt={submitPanelAgentPrompt}
                   onToggleFullscreen={(index, pid) => handleToggleFullscreenTerminal({ paneId: pid, terminalIndex: index })}
                   paneId={terminalPaneId}
                   paneLimitReached={terminalPaneLimitReached}
+                  panelAgentPromptActivityItems={panelAgentPromptActivityItems.filter((item) => (
+                    String(item.panelPaneId || "").trim() === terminalPaneId
+                  ))}
+                  panelAgentPromptTargets={panelAgentPromptTargets}
                   poppedOut={Boolean(pcbBreakoutPanes[terminalPaneId])}
                   repoPath={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || ""}
                   resumeNonce={pcbPaneResumeNonces[terminalPaneId] || 0}

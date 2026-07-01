@@ -21851,6 +21851,22 @@ fn cloud_mcp_asset_http_target_blocking(
     })
 }
 
+fn cloud_mcp_internal_api_http_target_blocking(
+    base_url: &str,
+    endpoint_path: &str,
+) -> Result<CloudMcpAssetHttpTarget, String> {
+    if let Some(target) = cloud_mcp_local_docker_ws_target(endpoint_path) {
+        let url = cloud_mcp_http_url_from_ws_url(&target.ws_url)
+            .ok_or_else(|| "Cloud internal API local Docker URL is invalid.".to_string())?;
+        return Ok(CloudMcpAssetHttpTarget {
+            url,
+            route_token: None,
+        });
+    }
+
+    cloud_mcp_asset_http_target_blocking(base_url, endpoint_path)
+}
+
 fn cloud_mcp_asset_direct_presigned(_payload: &Value) -> bool {
     // B2 credentials and object URLs stay server-side; desktop transfers only
     // talk to cloud-diffforge.
@@ -36543,6 +36559,273 @@ fn cloud_mcp_asset_http_headers(
     Ok(headers)
 }
 
+fn cloud_mcp_header_value(value: &str, label: &str) -> Result<reqwest::header::HeaderValue, String> {
+    reqwest::header::HeaderValue::from_str(value)
+        .map_err(|error| format!("Invalid Cloud MCP {label} header: {error}"))
+}
+
+fn cloud_mcp_normalize_appwrite_user_id(value: &str) -> Option<String> {
+    let mut value = value.trim();
+    for _ in 0..3 {
+        let mut stripped_prefix = false;
+        for prefix in [
+            "account:",
+            "appwrite:",
+            "user:",
+            "users/",
+            "appwrite-",
+            "user_",
+        ] {
+            if let Some(stripped) = value.strip_prefix(prefix) {
+                value = stripped.trim();
+                stripped_prefix = true;
+                break;
+            }
+        }
+        if !stripped_prefix {
+            break;
+        }
+    }
+    let cleaned = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(*ch, '_' | '-' | '.'))
+        .take(160)
+        .collect::<String>();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
+}
+
+fn cloud_mcp_appwrite_user_id_from_jwt(token: &str) -> Option<String> {
+    let payload_b64 = token.split('.').nth(1)?;
+    let payload = general_purpose::URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+    let claims = serde_json::from_slice::<Value>(&payload).ok()?;
+    for key in [
+        "userId",
+        "user_id",
+        "appwriteUserId",
+        "appwrite_user_id",
+        "$id",
+        "sub",
+    ] {
+        if let Some(user_id) = claims
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(cloud_mcp_normalize_appwrite_user_id)
+        {
+            return Some(user_id);
+        }
+    }
+    None
+}
+
+fn cloud_mcp_note_appwrite_user_id_hint_candidate(
+    candidates: &mut HashMap<String, (u32, i64)>,
+    raw: &str,
+    score: u32,
+    updated_at_ms: i64,
+) {
+    let Some(user_id) = cloud_mcp_normalize_appwrite_user_id(raw) else {
+        return;
+    };
+    let entry = candidates.entry(user_id).or_insert((0, 0));
+    entry.0 = entry.0.saturating_add(score);
+    entry.1 = entry.1.max(updated_at_ms);
+}
+
+fn cloud_mcp_local_appwrite_user_id_hint() -> Option<String> {
+    let conn = cloud_mcp_open_todo_mirror_conn().ok()?;
+    let mut candidates = HashMap::<String, (u32, i64)>::new();
+    if let Ok(mut statement) = conn.prepare(&format!(
+        "SELECT account_id, scope_key, updated_at_ms
+         FROM {CLOUD_MCP_ACCOUNT_TODO_SYNC_STATE_TABLE}
+         WHERE account_id LIKE 'user_%'
+            OR scope_key LIKE 'account:user_%'
+         ORDER BY updated_at_ms DESC
+         LIMIT 32"
+    )) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                let (account_id, scope_key, updated_at_ms) = row;
+                cloud_mcp_note_appwrite_user_id_hint_candidate(
+                    &mut candidates,
+                    &account_id,
+                    4,
+                    updated_at_ms,
+                );
+                cloud_mcp_note_appwrite_user_id_hint_candidate(
+                    &mut candidates,
+                    &scope_key,
+                    3,
+                    updated_at_ms,
+                );
+            }
+        }
+    }
+    if let Ok(mut statement) = conn.prepare(&format!(
+        "SELECT account_id, scope_key, COUNT(*) AS row_count, MAX(applied_at_ms) AS updated_at_ms
+         FROM {CLOUD_MCP_ACCOUNT_TODO_CACHE_TABLE}
+         WHERE account_id LIKE 'user_%'
+            OR scope_key LIKE 'account:user_%'
+         GROUP BY account_id, scope_key
+         ORDER BY updated_at_ms DESC
+         LIMIT 32"
+    )) {
+        if let Ok(rows) = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?.clamp(1, 16) as u32,
+                row.get::<_, i64>(3)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                let (account_id, scope_key, row_score, updated_at_ms) = row;
+                cloud_mcp_note_appwrite_user_id_hint_candidate(
+                    &mut candidates,
+                    &account_id,
+                    row_score,
+                    updated_at_ms,
+                );
+                cloud_mcp_note_appwrite_user_id_hint_candidate(
+                    &mut candidates,
+                    &scope_key,
+                    row_score.saturating_sub(1).max(1),
+                    updated_at_ms,
+                );
+            }
+        }
+    }
+    candidates
+        .into_iter()
+        .max_by(|(left_id, (left_score, left_updated)), (right_id, (right_score, right_updated))| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| left_updated.cmp(right_updated))
+                .then_with(|| right_id.cmp(left_id))
+        })
+        .map(|(user_id, _)| user_id)
+}
+
+fn cloud_mcp_internal_api_http_headers(
+    route_token: Option<&str>,
+) -> Result<reqwest::header::HeaderMap, String> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    let mut appwrite_user_id = None;
+    if let Some(token) = cloud_mcp_process_authorization_bearer() {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            cloud_mcp_header_value(&format!("Bearer {token}"), "authorization")?,
+        );
+        headers.insert(
+            "x-diffforge-appwrite-jwt",
+            cloud_mcp_header_value(&token, "appwrite jwt")?,
+        );
+        appwrite_user_id = cloud_mcp_appwrite_user_id_from_jwt(&token);
+    }
+    if appwrite_user_id.is_none() {
+        appwrite_user_id = cloud_mcp_local_appwrite_user_id_hint();
+    }
+    if let Some(user_id) = appwrite_user_id {
+        headers.insert(
+            "x-diffforge-appwrite-user-id",
+            cloud_mcp_header_value(&user_id, "appwrite user id")?,
+        );
+    }
+    headers.insert(
+        "x-diffforge-client-id",
+        reqwest::header::HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
+    );
+    headers.insert(
+        "x-diffforge-actor",
+        reqwest::header::HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
+    );
+    let device_profile = cloud_mcp_desktop_device_profile();
+    if let Some(device_id) = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"]) {
+        headers.insert(
+            "x-diffforge-device-id",
+            cloud_mcp_header_value(&device_id, "device id")?,
+        );
+    }
+    let (billing_scope_type, _team_id) = cloud_mcp_process_account_scope();
+    headers.insert(
+        "x-diffforge-billing-scope-type",
+        cloud_mcp_header_value(&billing_scope_type, "billing scope")?,
+    );
+    headers.insert(
+        "x-diffforge-scope-type",
+        cloud_mcp_header_value(&billing_scope_type, "scope")?,
+    );
+    let (plan_name, device_limit) = cloud_mcp_process_account_plan();
+    headers.insert(
+        "x-diffforge-plan-name",
+        cloud_mcp_header_value(&plan_name, "plan")?,
+    );
+    if let Some(device_limit) = device_limit {
+        headers.insert(
+            "x-diffforge-device-limit",
+            cloud_mcp_header_value(&device_limit.to_string(), "device limit")?,
+        );
+    }
+    if let Some(route_token) = route_token.filter(|value| !value.trim().is_empty()) {
+        headers.insert(
+            "x-diffforge-direct-route-token",
+            cloud_mcp_header_value(route_token, "route token")?,
+        );
+    }
+    Ok(headers)
+}
+
+fn cloud_mcp_internal_api_get_blocking(
+    endpoint_path: &str,
+    query_pairs: &[(&str, String)],
+) -> Result<Value, String> {
+    let base_url = cloud_mcp_base_url();
+    let target = cloud_mcp_internal_api_http_target_blocking(&base_url, endpoint_path)
+        .map_err(|error| format!("Cloud internal API route unavailable: {error}"))?;
+    let mut url = reqwest::Url::parse(&target.url)
+        .map_err(|error| format!("Cloud internal API route URL is invalid: {error}"))?;
+    {
+        let mut query = url.query_pairs_mut();
+        for (key, value) in query_pairs {
+            if !key.trim().is_empty() && !value.trim().is_empty() {
+                query.append_pair(key, value);
+            }
+        }
+        if let Some(route_token) = target.route_token.as_deref() {
+            if !route_token.trim().is_empty() {
+                query.append_pair("route_token", route_token);
+            }
+        }
+    }
+    let response = shared_blocking_http_client()
+        .get(url)
+        .timeout(Duration::from_secs(CLOUD_MCP_SYNC_TIMEOUT_SECS))
+        .header("Accept", "application/json")
+        .headers(cloud_mcp_internal_api_http_headers(
+            target.route_token.as_deref(),
+        )?)
+        .send()
+        .map_err(|error| format!("Cloud internal API request failed: {error}"))?;
+    let (status, parsed) = cloud_mcp_read_route_response_blocking(response)?;
+    if !status.is_success() {
+        return Err(format!(
+            "Cloud internal API returned {}: {}",
+            status.as_u16(),
+            cloud_mcp_route_response_message(&parsed, "request failed")
+        ));
+    }
+    Ok(parsed)
+}
+
 #[tauri::command]
 async fn cloud_mcp_list_account_assets(
     state: State<'_, CloudMcpState>,
@@ -47153,6 +47436,26 @@ mod cloud_mcp_tests {
         assert!(cloud_mcp_agent_uses_activity_hooks(" OpenCode "));
         assert!(!cloud_mcp_agent_uses_activity_hooks("shell"));
         assert!(!cloud_mcp_agent_uses_activity_hooks("generic"));
+    }
+
+    #[test]
+    fn appwrite_user_id_normalization_strips_account_prefixes() {
+        assert_eq!(
+            cloud_mcp_normalize_appwrite_user_id("user_69fa47cf6230dc6d27cb").as_deref(),
+            Some("69fa47cf6230dc6d27cb")
+        );
+        assert_eq!(
+            cloud_mcp_normalize_appwrite_user_id("account:user_69fa47cf6230dc6d27cb").as_deref(),
+            Some("69fa47cf6230dc6d27cb")
+        );
+        assert_eq!(
+            cloud_mcp_normalize_appwrite_user_id("appwrite:abc123").as_deref(),
+            Some("abc123")
+        );
+        assert_eq!(
+            cloud_mcp_normalize_appwrite_user_id("client_rust-diffforge-agent").as_deref(),
+            Some("client_rust-diffforge-agent")
+        );
     }
 
     #[test]

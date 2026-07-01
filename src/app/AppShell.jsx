@@ -42871,15 +42871,16 @@ export default function App() {
           || homeSearchCwd
           || "",
       );
+      const transcriptSessionOnlyHydration = (
+        thread.transcriptHydrationMode === "session-only"
+        || Boolean(thread.freshSessionStartedAt)
+      );
       const canDiscoverProviderSession = Boolean(
         !providerSessionId
           && (expectedUserMessage || (allowTimestampFallback && discoveryCwd && submittedAt))
           && (pollUntilTurnComplete || promptEventId)
       );
-      const threadRequiresSessionHydration = (
-        thread.transcriptHydrationMode === "session-only"
-        || Boolean(thread.freshSessionStartedAt)
-      )
+      const threadRequiresSessionHydration = transcriptSessionOnlyHydration
         && !providerSessionId
         && !canDiscoverProviderSession;
       if (threadRequiresSessionHydration) {
@@ -42926,10 +42927,7 @@ export default function App() {
       if (
         !providerSessionId
         && canDiscoverProviderSession
-        && (
-          thread.transcriptHydrationMode === "session-only"
-          || Boolean(thread.freshSessionStartedAt)
-        )
+        && transcriptSessionOnlyHydration
       ) {
         logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.prompt_discovery_allowed", {
           agentId,
@@ -43014,8 +43012,13 @@ export default function App() {
         const providerTranscriptWatchAlreadyActive = workspaceThreadTranscriptWatchKeysRef.current.has(providerTranscriptWatchKey);
         const shouldRefreshActiveTranscriptWatch = Boolean(
           providerTranscriptWatchAlreadyActive
-            && pollUntilTurnComplete
-            && (promptEventId || expectedUserMessage)
+            && (
+              transcriptSessionOnlyHydration
+              || (
+                pollUntilTurnComplete
+                && (promptEventId || expectedUserMessage)
+              )
+            )
         );
         if (providerTranscriptWatchAlreadyActive && !shouldRefreshActiveTranscriptWatch) {
           logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.skip", {
@@ -43038,7 +43041,7 @@ export default function App() {
             pollUntilTurnComplete,
             promptEventIdPresent: Boolean(promptEventId),
             providerSessionPresent: Boolean(providerSessionId),
-            reason: "turn_completion_refresh",
+            reason: transcriptSessionOnlyHydration ? "session_hydration_refresh" : "turn_completion_refresh",
             requestKey,
             threadId,
             workspaceId,
@@ -43113,6 +43116,18 @@ export default function App() {
           const messages = Array.isArray(result?.messages) ? result.messages : [];
           const sessionId = String(result?.sessionId || providerSessionId || "").trim();
           const matchedBy = String(result?.matchedBy || "").trim().toLowerCase();
+          const cloudBackedTranscript = String(result?.rolloutPath || "").trim().startsWith("cloud://");
+          if (cloudBackedTranscript && providerTranscriptWatchKey) {
+            workspaceThreadTranscriptWatchKeysRef.current.delete(providerTranscriptWatchKey);
+            providerTranscriptWatchKeyRegisteredByRequest = false;
+            logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.cloud_watch_released", {
+              agentId,
+              matchedBy: result?.matchedBy || "",
+              requestKey,
+              threadId,
+              workspaceId,
+            });
+          }
           const discoveredByPrompt = !providerSessionId
             && ["prompt", "prompt+cwd", "cwd+timestamp-recovery"].includes(matchedBy)
             && Boolean(sessionId);
@@ -43890,6 +43905,34 @@ export default function App() {
                   providerSessionId: sessionId || providerSessionId,
                 });
               }, transcriptResultContinueDelayMs);
+            }
+          }
+          if (cloudBackedTranscript && !pollUntilTurnComplete) {
+            const elapsedMs = Date.now() - pollStartedAt;
+            const shouldContinueCloudRefresh = Boolean(
+              workspaceThreadTranscriptHydrationIsVisible({ threadId, workspaceId })
+                && elapsedMs < WORKSPACE_THREAD_PROJECTION_POLL_TIMEOUT_MS
+            );
+            logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.cloud_refresh", {
+              agentId,
+              elapsedMs,
+              messageCount: messages.length,
+              requestKey,
+              sessionIdPresent: Boolean(sessionId),
+              shouldContinueCloudRefresh,
+              threadId,
+              workspaceId,
+            });
+            if (shouldContinueCloudRefresh) {
+              window.setTimeout(() => {
+                requestWorkspaceThreadTranscript({
+                  ...event,
+                  delayMs: 0,
+                  pollStartedAt,
+                  providerSessionId: sessionId || providerSessionId,
+                  source: event.source || "cloud-transcript-refresh",
+                });
+              }, WORKSPACE_THREAD_TRANSCRIPT_WATCH_FALLBACK_INTERVAL_MS);
             }
           }
         })
