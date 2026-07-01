@@ -25,11 +25,268 @@ export const PCB_TABS = PCB_VIEW_TABS.map((tab) => tab.id);
 export const PCB_STORE_CHANGED_EVENT = "pcb-store-changed";
 const PCB_MAIN_FILE_PATH = "main.tsx";
 const PCB_RENDER_TIMEOUT_MS = 30000;
+const PCB_PARTS_ENGINE_FETCH_RETRY_DELAYS_MS = [250, 750];
+const PCB_PARTS_ENGINE_FETCH_HOSTS = new Set([
+  "jlcsearch.tscircuit.com",
+  "easyeda.com",
+  "modules.easyeda.com",
+  "modelcdn.tscircuit.com",
+  "kicad-mod-cache.tscircuit.com",
+]);
+const PCB_PARTS_ENGINE_CACHE_PREFIX = "diffforge:pcb:parts-engine:v1:";
+const PCB_PARTS_ENGINE_FETCH_RETRY_SYMBOL = Symbol.for("diffforge.pcb.partsEngineFetchRetry");
+const PCB_EVAL_WORKER_POLYFILL_SOURCE = `
+(function () {
+  function getIteratorPrototype() {
+    if (typeof Iterator !== "undefined" && Iterator && Iterator.prototype) {
+      return Iterator.prototype;
+    }
+    try {
+      return Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]()));
+    } catch {
+      return null;
+    }
+  }
+  var iteratorPrototype = getIteratorPrototype();
+  if (!iteratorPrototype) {
+    return;
+  }
+  function defineIteratorHelper(name, helper) {
+    if (typeof iteratorPrototype[name] === "function") {
+      return;
+    }
+    Object.defineProperty(iteratorPrototype, name, {
+      configurable: true,
+      writable: true,
+      value: helper,
+    });
+  }
+  defineIteratorHelper("map", function (callback) {
+    var source = this;
+    var index = 0;
+    return (function* () {
+      for (var value of source) {
+        yield callback(value, index++);
+      }
+    })();
+  });
+  defineIteratorHelper("filter", function (callback) {
+    var source = this;
+    var index = 0;
+    return (function* () {
+      for (var value of source) {
+        if (callback(value, index++)) {
+          yield value;
+        }
+      }
+    })();
+  });
+  defineIteratorHelper("toArray", function () {
+    return Array.from(this);
+  });
+  defineIteratorHelper("flatMap", function (callback) {
+    var source = this;
+    var index = 0;
+    return (function* () {
+      for (var value of source) {
+        var mapped = callback(value, index++);
+        if (mapped == null) {
+          continue;
+        }
+        if (typeof mapped[Symbol.iterator] === "function") {
+          yield* mapped;
+        } else {
+          yield mapped;
+        }
+      }
+    })();
+  });
+  defineIteratorHelper("some", function (callback) {
+    var index = 0;
+    for (var value of this) {
+      if (callback(value, index++)) {
+        return true;
+      }
+    }
+    return false;
+  });
+  defineIteratorHelper("every", function (callback) {
+    var index = 0;
+    for (var value of this) {
+      if (!callback(value, index++)) {
+        return false;
+      }
+    }
+    return true;
+  });
+  defineIteratorHelper("find", function (callback) {
+    var index = 0;
+    for (var value of this) {
+      if (callback(value, index++)) {
+        return value;
+      }
+    }
+    return undefined;
+  });
+})();
+`;
+let patchedEvalWorkerBlobUrlPromise = null;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function getFetchInputUrl(input) {
+  if (typeof input === "string") {
+    return input;
+  }
+  if (input && typeof input.url === "string") {
+    return input.url;
+  }
+  return "";
+}
+
+function isPcbPartsEngineFetch(input) {
+  const inputUrl = getFetchInputUrl(input);
+  if (!inputUrl) {
+    return false;
+  }
+  try {
+    return PCB_PARTS_ENGINE_FETCH_HOSTS.has(new URL(inputUrl, window.location.href).hostname);
+  } catch {
+    return false;
+  }
+}
+
+function shouldRetryPcbPartsEngineResponse(response) {
+  return response?.status === 408 || response?.status === 425 || response?.status === 429 || response?.status >= 500;
+}
+
+function installPcbPartsEngineFetchRetry() {
+  if (typeof window === "undefined" || typeof window.fetch !== "function") {
+    return;
+  }
+  if (window[PCB_PARTS_ENGINE_FETCH_RETRY_SYMBOL]) {
+    return;
+  }
+  const originalFetch = window.fetch.bind(window);
+  window.fetch = async (input, init) => {
+    if (!isPcbPartsEngineFetch(input)) {
+      return originalFetch(input, init);
+    }
+
+    let lastError = null;
+    for (let attempt = 0; attempt <= PCB_PARTS_ENGINE_FETCH_RETRY_DELAYS_MS.length; attempt += 1) {
+      try {
+        const response = await originalFetch(input, init);
+        if (!shouldRetryPcbPartsEngineResponse(response) || attempt === PCB_PARTS_ENGINE_FETCH_RETRY_DELAYS_MS.length) {
+          return response;
+        }
+      } catch (error) {
+        lastError = error;
+        if (attempt === PCB_PARTS_ENGINE_FETCH_RETRY_DELAYS_MS.length) {
+          break;
+        }
+      }
+      await sleep(PCB_PARTS_ENGINE_FETCH_RETRY_DELAYS_MS[attempt]);
+    }
+    throw lastError ?? new Error(`PCB parts engine fetch failed for ${getFetchInputUrl(input) || "unknown URL"}`);
+  };
+  window[PCB_PARTS_ENGINE_FETCH_RETRY_SYMBOL] = true;
+}
+
+function stableSerializeFsMap(fsMap) {
+  return Object.entries(fsMap || {})
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([filePath, content]) => `${filePath}\0${typeof content === "string" ? content : JSON.stringify(content)}`)
+    .join("\0");
+}
+
+function hashString(value) {
+  let hash = 2166136261;
+  for (let index = 0; index < value.length; index += 1) {
+    hash ^= value.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(36);
+}
+
+function createPcbPartsEngineLocalCache(fsMap) {
+  const namespace = `${PCB_PARTS_ENGINE_CACHE_PREFIX}${hashString(stableSerializeFsMap(fsMap))}:`;
+  const memoryCache = new Map();
+  const makeKey = (cacheKey) => `${namespace}${cacheKey}`;
+
+  return {
+    async getItem(cacheKey) {
+      if (!cacheKey) {
+        return null;
+      }
+      const key = makeKey(cacheKey);
+      if (memoryCache.has(key)) {
+        return memoryCache.get(key);
+      }
+      try {
+        const value = window.localStorage.getItem(key);
+        if (value != null) {
+          memoryCache.set(key, value);
+        }
+        return value;
+      } catch {
+        return null;
+      }
+    },
+    async setItem(cacheKey, value) {
+      if (!cacheKey || typeof value !== "string") {
+        return;
+      }
+      const key = makeKey(cacheKey);
+      memoryCache.set(key, value);
+      try {
+        window.localStorage.setItem(key, value);
+      } catch {}
+    },
+  };
+}
 
 function serializeJavaScriptLiteral(value) {
   return String(JSON.stringify(value) ?? "null")
     .replace(/\u2028/g, "\\u2028")
     .replace(/\u2029/g, "\\u2029");
+}
+
+function resolveRuntimeAssetUrl(assetUrl) {
+  try {
+    return new URL(assetUrl, import.meta.url).href;
+  } catch {}
+  if (typeof document !== "undefined") {
+    try {
+      return new URL(assetUrl, document.baseURI).href;
+    } catch {}
+  }
+  if (typeof window !== "undefined") {
+    try {
+      return new URL(assetUrl, window.location.href).href;
+    } catch {}
+  }
+  return assetUrl;
+}
+
+function getPatchedEvalWorkerBlobUrl() {
+  if (!patchedEvalWorkerBlobUrlPromise) {
+    patchedEvalWorkerBlobUrlPromise = fetch(evalWebWorkerBlobUrl)
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error(`Failed to load tscircuit eval worker: ${response.status}`);
+        }
+        return response.text();
+      })
+      .then((workerSource) => URL.createObjectURL(new Blob([
+        PCB_EVAL_WORKER_POLYFILL_SOURCE,
+        "\n",
+        workerSource,
+      ], { type: "application/javascript" })));
+  }
+  return patchedEvalWorkerBlobUrlPromise;
 }
 
 function buildRunframePreviewBootstrapSource({
@@ -108,6 +365,20 @@ const PCB_RUNFRAME_PREVIEW_BOOTSTRAP_SOURCE = `
     }
     return noopScriptUrl;
   }
+  function resolveAssetUrl(value) {
+    try {
+      return new URL(value, window.location.href).href;
+    } catch {}
+    try {
+      if (window.parent && window.parent !== window) {
+        return new URL(value, window.parent.location.href).href;
+      }
+    } catch {}
+    try {
+      return new URL(value, document.baseURI).href;
+    } catch {}
+    return value;
+  }
   var originalFetch = window.fetch && window.fetch.bind(window);
   if (originalFetch) {
     window.fetch = function (input, init) {
@@ -165,13 +436,15 @@ const PCB_RUNFRAME_PREVIEW_BOOTSTRAP_SOURCE = `
   }
   if (!window.ManifoldModule) {
     window.ManifoldModule = function () {
-      return import(embeddedManifoldModuleUrl).then(function (module) {
+      var localManifoldModuleUrl = resolveAssetUrl(embeddedManifoldModuleUrl);
+      var localManifoldWasmUrl = resolveAssetUrl(embeddedManifoldWasmUrl);
+      return import(localManifoldModuleUrl).then(function (module) {
         if (!module || typeof module.default !== "function") {
           throw new Error("Local Manifold module did not export a default initializer.");
         }
         return module.default({
           locateFile: function (path) {
-            return String(path).endsWith(".wasm") ? embeddedManifoldWasmUrl : path;
+            return String(path).endsWith(".wasm") ? localManifoldWasmUrl : resolveAssetUrl(path);
           },
         });
       });
@@ -531,6 +804,9 @@ export default function PcbPanel({
     }
     return { [PCB_MAIN_FILE_PATH]: source };
   }, [source]);
+  const partsEngineLocalCache = useMemo(() => (
+    fsMap ? createPcbPartsEngineLocalCache(fsMap) : null
+  ), [fsMap]);
   const previewProps = useMemo(() => ({
     activeEffectName: renderLog?.lastRenderEvent?.phase,
     allowSelectingVersion: false,
@@ -576,8 +852,8 @@ export default function PcbPanel({
       [buildRunframePreviewBootstrapSource({
         circuitJson,
         previewProps,
-        manifoldModuleUrl,
-        manifoldWasmUrl,
+        manifoldModuleUrl: resolveRuntimeAssetUrl(manifoldModuleUrl),
+        manifoldWasmUrl: resolveRuntimeAssetUrl(manifoldWasmUrl),
       })],
       { type: "text/javascript" },
     ));
@@ -665,12 +941,19 @@ export default function PcbPanel({
       setSolverEvents([]);
       setRenderStatus("rendering");
       try {
+        installPcbPartsEngineFetchRetry();
+        const patchedEvalWorkerBlobUrl = await withTimeout(
+          getPatchedEvalWorkerBlobUrl(),
+          "preparing PCB renderer worker",
+        );
         worker = await withTimeout(createCircuitWebWorker({
           projectConfig: {
+            ...(partsEngineLocalCache ? { localCacheEngine: partsEngineLocalCache } : {}),
             projectBaseUrl: normalizedRepoPath || repoPath || "",
           },
           verbose: false,
-          webWorkerBlobUrl: evalWebWorkerBlobUrl,
+          enableFetchProxy: true,
+          webWorkerBlobUrl: patchedEvalWorkerBlobUrl,
         }), "starting PCB renderer worker");
         const workerErrorPromise = new Promise((_, reject) => {
           const rawWorker = worker?.__rawWorker;

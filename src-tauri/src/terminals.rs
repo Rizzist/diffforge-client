@@ -10732,6 +10732,59 @@ fn terminal_activity_hook_string(event: &Value, keys: &[&str]) -> Option<String>
     None
 }
 
+fn terminal_activity_hook_text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        }
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(terminal_activity_hook_text_from_value)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then(|| text)
+        }
+        Value::Object(object) => {
+            for key in [
+                "text",
+                "content",
+                "delta",
+                "message",
+                "assistantMessage",
+                "assistant_message",
+                "outputText",
+                "output_text",
+                "summary",
+                "thinking",
+                "reasoning",
+            ] {
+                if let Some(text) = object
+                    .get(key)
+                    .and_then(terminal_activity_hook_text_from_value)
+                {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn terminal_activity_hook_message_text(event: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(text) = event
+            .get(*key)
+            .and_then(terminal_activity_hook_text_from_value)
+        {
+            return Some(text);
+        }
+    }
+    None
+}
+
 fn terminal_activity_hook_name_key(value: &str) -> String {
     value
         .chars()
@@ -11204,6 +11257,35 @@ fn terminal_activity_hook_activity_kind(
             false,
             "cli_hook_message_display",
         )),
+        "thinking"
+        | "thinkingdelta"
+        | "assistantthinkingdelta"
+        | "reasoning"
+        | "reasoningdelta"
+        | "assistantreasoningdelta" => Some((
+            "provider-turn-started",
+            "reasoning",
+            "active",
+            "running",
+            false,
+            "cli_hook_reasoning",
+        )),
+        "precompact" | "contextcompactionstarted" | "compactionstarted" => Some((
+            "provider-turn-compacting",
+            "compacting",
+            "active",
+            "compacting",
+            false,
+            "cli_hook_compacting",
+        )),
+        "postcompact" | "contextcompactioncompleted" | "compactioncompleted" => Some((
+            "provider-turn-compacted",
+            "thinking",
+            "active",
+            "running",
+            false,
+            "cli_hook_compacted",
+        )),
         "permissionrequest" => Some((
             "provider-permission-requested",
             "paused",
@@ -11253,16 +11335,28 @@ fn terminal_activity_hook_non_lifecycle_is_expected(hook_event_name: &str) -> bo
         terminal_activity_hook_name_key(hook_event_name).as_str(),
         "assistantmessagedelta"
             | "assistantmessagedisplay"
+            | "assistantreasoningdelta"
+            | "assistantthinkingdelta"
+            | "compactioncompleted"
+            | "compactionstarted"
+            | "contextcompactioncompleted"
+            | "contextcompactionstarted"
             | "messagedisplay"
             | "permissionrequest"
+            | "postcompact"
             | "posttoolbatch"
             | "posttooluse"
             | "posttoolusefailure"
+            | "precompact"
             | "pretooluse"
+            | "reasoning"
+            | "reasoningdelta"
             | "subagentstart"
             | "subagentstop"
             | "taskcompleted"
             | "taskcreated"
+            | "thinking"
+            | "thinkingdelta"
     )
 }
 
@@ -11537,13 +11631,21 @@ fn terminal_activity_hook_payload(
     );
     let provider_session_id = terminal_activity_hook_provider_session_id(event);
     let provider_turn_id = terminal_activity_hook_string(event, &["turnId", "turn_id"]);
-    let user_message = terminal_activity_hook_string(
+    let user_message = terminal_activity_hook_message_text(
         event,
         &[
             "assistantMessage",
             "assistant_message",
+            "assistantDelta",
+            "assistant_delta",
+            "outputText",
+            "output_text",
             "content",
             "delta",
+            "response",
+            "output",
+            "thinking",
+            "reasoning",
             "prompt",
             "userPrompt",
             "user_prompt",
@@ -16933,11 +17035,34 @@ mod terminal_tests {
             Some("provider-message-displayed")
         );
         assert_eq!(
+            terminal_activity_hook_activity_kind("PreCompact", &json!({})).map(|value| value.0),
+            Some("provider-turn-compacting")
+        );
+        assert_eq!(
+            terminal_activity_hook_activity_kind("PostCompact", &json!({})).map(|value| value.0),
+            Some("provider-turn-compacted")
+        );
+        assert_eq!(
+            terminal_activity_hook_activity_kind("ThinkingDelta", &json!({})).map(|value| value.1),
+            Some("reasoning")
+        );
+        assert_eq!(
             terminal_activity_hook_activity_kind("PostToolUseFailure", &json!({}))
                 .map(|value| value.0),
             Some("provider-tool-failed")
         );
         assert!(terminal_activity_hook_non_lifecycle_is_expected("TaskCompleted"));
+    }
+
+    #[test]
+    fn activity_hook_message_text_accepts_nested_delta_shapes() {
+        let message = terminal_activity_hook_message_text(
+            &json!({
+                "delta": {"text": "streamed token"},
+            }),
+            &["assistantMessage", "delta"],
+        );
+        assert_eq!(message.as_deref(), Some("streamed token"));
     }
 
     #[test]

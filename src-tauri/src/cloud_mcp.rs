@@ -11648,6 +11648,9 @@ async fn cloud_mcp_open_global_ws(
     .await;
     cloud_mcp_set_global_ws_phase(state, "authenticating", "authenticating").await;
     let auth_bearer = cloud_mcp_authorization_bearer(state).await?;
+    let appwrite_user_id = auth_bearer
+        .as_deref()
+        .and_then(cloud_mcp_appwrite_user_id_for_bearer);
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "desktop-primary".to_string());
@@ -11699,6 +11702,13 @@ async fn cloud_mcp_open_global_ws(
                 "x-diffforge-device-limit",
                 HeaderValue::from_str(&device_limit.to_string())
                     .map_err(|error| format!("Invalid Cloud MCP device limit header: {error}"))?,
+            );
+        }
+        if let Some(user_id) = appwrite_user_id.as_deref() {
+            request.headers_mut().insert(
+                "x-diffforge-appwrite-user-id",
+                HeaderValue::from_str(user_id)
+                    .map_err(|error| format!("Invalid Cloud MCP appwrite user id header: {error}"))?,
             );
         }
         cloud_mcp_apply_ws_auth_headers(
@@ -23028,7 +23038,8 @@ async fn cloud_mcp_fetch_direct_route_async(
 ) -> Result<Option<CloudMcpWsTarget>, String> {
     let url = cloud_mcp_route_request_url(base_url);
     let region_hint = cloud_mcp_region_hint();
-    let body = json!({
+    let appwrite_user_id = cloud_mcp_appwrite_user_id_for_bearer(bearer);
+    let mut body = json!({
         "requestedPath": endpoint_path,
         "clientId": CLOUD_MCP_RUST_CLIENT_ID,
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
@@ -23042,6 +23053,10 @@ async fn cloud_mcp_fetch_direct_route_async(
         "waitForReady": false,
         "waitMs": 0,
     });
+    if let Some(user_id) = appwrite_user_id.as_deref() {
+        body["appwriteUserId"] = json!(user_id);
+        body["appwrite_user_id"] = json!(user_id);
+    }
     let response = shared_async_http_client()
         .post(url)
         .timeout(Duration::from_secs(CLOUD_MCP_AUTH_TIMEOUT_SECS))
@@ -23063,6 +23078,11 @@ async fn cloud_mcp_fetch_direct_route_async(
             if let Some(device_id) = device_id {
                 if let Ok(value) = reqwest::header::HeaderValue::from_str(device_id) {
                     headers.insert("x-diffforge-device-id", value);
+                }
+            }
+            if let Some(user_id) = appwrite_user_id.as_deref() {
+                if let Ok(value) = reqwest::header::HeaderValue::from_str(user_id) {
+                    headers.insert("x-diffforge-appwrite-user-id", value);
                 }
             }
             if let Some(region_hint) = region_hint {
@@ -24572,6 +24592,7 @@ pub(crate) fn cloud_mcp_publish_terminal_output_delta(
 fn cloud_mcp_agent_turn_event_code(event_type: &str, command_phase: &str) -> &'static str {
     match event_type {
         "provider-turn-started" => "ts",
+        "provider-turn-compacting" | "provider-turn-compacted" => "ts",
         "provider-turn-completed" => "te",
         "provider-turn-error" => "er",
         "provider-turn-interrupted" => "te",
@@ -24603,6 +24624,37 @@ fn cloud_mcp_compact_turn_text(value: Option<&String>, max_chars: usize) -> Opti
     Some(value.chars().take(max_chars).collect())
 }
 
+fn cloud_mcp_agent_turn_hook_key(value: &str) -> String {
+    value
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn cloud_mcp_agent_turn_should_include_message(
+    event_code: &str,
+    payload: &TerminalActivityHookPayload,
+) -> bool {
+    if matches!(event_code, "md" | "pr" | "er") {
+        return true;
+    }
+    let hook_key = cloud_mcp_agent_turn_hook_key(payload.hook_event_name.as_str());
+    payload.command_phase == "message_delta"
+        || matches!(
+            payload.completion_evidence.as_str(),
+            "cli_hook_message_display"
+                | "cli_hook_reasoning"
+                | "cli_hook_compacting"
+                | "cli_hook_compacted"
+        )
+        || hook_key.contains("messagedisplay")
+        || hook_key.contains("messagedelta")
+        || hook_key.contains("thinking")
+        || hook_key.contains("reasoning")
+        || hook_key.contains("compact")
+}
+
 async fn cloud_mcp_publish_agent_turn_event(
     state: &CloudMcpState,
     payload: &TerminalActivityHookPayload,
@@ -24611,9 +24663,6 @@ async fn cloud_mcp_publish_agent_turn_event(
     turn_status: &str,
     direct_prompt_refs: Option<&CloudMcpDirectPromptTodoRefs>,
 ) {
-    if !cloud_mcp_terminal_output_has_subscriptions(state) {
-        return;
-    }
     let device_profile = cloud_mcp_desktop_device_profile();
     let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
         .unwrap_or_else(|| "desktop-primary".to_string());
@@ -24623,9 +24672,6 @@ async fn cloud_mcp_publish_agent_turn_event(
         &payload.pane_id,
         payload.instance_id,
     );
-    if !cloud_mcp_terminal_output_stream_is_subscribed(state, &stream_key) {
-        return;
-    }
     let Ok(auth) = cloud_mcp_ws_auth_object(state).await else {
         return;
     };
@@ -24653,7 +24699,7 @@ async fn cloud_mcp_publish_agent_turn_event(
     if let Some(tool_use_id) = cloud_mcp_compact_turn_text(payload.tool_use_id.as_ref(), 96) {
         data["tool_id"] = json!(tool_use_id);
     }
-    if matches!(event_code, "md" | "pr") {
+    if cloud_mcp_agent_turn_should_include_message(event_code, payload) {
         if let Some(message) = cloud_mcp_compact_turn_text(payload.message.as_ref(), 4096) {
             data["m"] = json!(message);
         }
@@ -37714,6 +37760,10 @@ fn cloud_mcp_local_appwrite_user_id_hint() -> Option<String> {
         .map(|(user_id, _)| user_id)
 }
 
+fn cloud_mcp_appwrite_user_id_for_bearer(token: &str) -> Option<String> {
+    cloud_mcp_appwrite_user_id_from_jwt(token).or_else(cloud_mcp_local_appwrite_user_id_hint)
+}
+
 fn cloud_mcp_internal_api_http_headers(
     route_token: Option<&str>,
 ) -> Result<reqwest::header::HeaderMap, String> {
@@ -48444,6 +48494,100 @@ mod cloud_mcp_tests {
         assert!(!cloud_mcp_agent_uses_activity_hooks("generic"));
     }
 
+    fn test_activity_hook_payload(
+        hook_event_name: &str,
+        command_phase: &str,
+        completion_evidence: &str,
+        message: Option<&str>,
+    ) -> TerminalActivityHookPayload {
+        TerminalActivityHookPayload {
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            workspace_id: "workspace-1".to_string(),
+            workspace_name: "Workspace".to_string(),
+            terminal_index: Some(0),
+            thread_id: "thread-1".to_string(),
+            agent_id: "claude".to_string(),
+            agent_kind: "claude".to_string(),
+            agent_type: String::new(),
+            agent_display_name: "Claude".to_string(),
+            display_name: "Claude".to_string(),
+            terminal_name: "Claude".to_string(),
+            terminal_nickname: "Claude".to_string(),
+            provider: "claude".to_string(),
+            event_type: "provider-turn-started".to_string(),
+            hook_event_name: hook_event_name.to_string(),
+            source: "cli-hook".to_string(),
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: command_phase.to_string(),
+            execution_phase: "running".to_string(),
+            native_rail_state: "thinking".to_string(),
+            native_rail_label: "Thinking".to_string(),
+            readiness: "busy".to_string(),
+            terminal_lifecycle: "active".to_string(),
+            terminal_status: "active".to_string(),
+            terminal_work_state: "running".to_string(),
+            turn_status: "running".to_string(),
+            session_state: "running".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: Some("session-1".to_string()),
+            native_session_id: Some("session-1".to_string()),
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            transcript_path: None,
+            cwd: None,
+            user_message: message.map(str::to_string),
+            message: message.map(str::to_string),
+            tool_name: None,
+            tool_use_id: None,
+            approval_id: None,
+            permission_prompt_id: None,
+            permission_request_id: None,
+            permission_mode: None,
+            manual_prompt_source: None,
+            manual_approval_required: false,
+            provider_blocked_for_user: false,
+            terminal_is_prompting_user: false,
+            prompting_user_kind: None,
+            prompting_user_source: None,
+            prompting_user_confidence: None,
+            prompting_user_text: None,
+            hook_health_status: "ok".to_string(),
+            hook_health_event: "ok".to_string(),
+            hook_health_observed_at_ms: 1,
+            hook_timestamp_ms: 1,
+            observed_at_ms: 1,
+            completion_evidence: completion_evidence.to_string(),
+        }
+    }
+
+    #[test]
+    fn agent_turn_message_gate_includes_reasoning_but_not_user_prompt() {
+        let reasoning = test_activity_hook_payload(
+            "ThinkingDelta",
+            "running",
+            "cli_hook_reasoning",
+            Some("reasoning token"),
+        );
+        assert!(cloud_mcp_agent_turn_should_include_message("ts", &reasoning));
+
+        let prompt_submit = test_activity_hook_payload(
+            "UserPromptSubmit",
+            "running",
+            "cli_hook_prompt_submit",
+            Some("user prompt should not echo"),
+        );
+        assert!(!cloud_mcp_agent_turn_should_include_message(
+            "ts",
+            &prompt_submit,
+        ));
+    }
+
     #[test]
     fn appwrite_user_id_normalization_strips_account_prefixes() {
         assert_eq!(
@@ -48461,6 +48605,24 @@ mod cloud_mcp_tests {
         assert_eq!(
             cloud_mcp_normalize_appwrite_user_id("client_rust-diffforge-agent").as_deref(),
             Some("client_rust-diffforge-agent")
+        );
+    }
+
+    #[test]
+    fn appwrite_user_id_from_jwt_reads_user_id_claim() {
+        let payload = serde_json::to_vec(&json!({
+            "userId": "user_69fa47cf6230dc6d27cb",
+            "sub": "fallback-user",
+        }))
+        .expect("encode jwt payload");
+        let jwt = format!(
+            "header.{}.signature",
+            general_purpose::URL_SAFE_NO_PAD.encode(payload)
+        );
+
+        assert_eq!(
+            cloud_mcp_appwrite_user_id_from_jwt(&jwt).as_deref(),
+            Some("69fa47cf6230dc6d27cb")
         );
     }
 

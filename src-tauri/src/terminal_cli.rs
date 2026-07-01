@@ -1591,6 +1591,39 @@ fn claude_write_authority_guard_settings(
                     ]
                 }
             ],
+            "MessageDisplay": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "PreCompact": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
+            "PostCompact": [
+                {
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": activity_command.clone(),
+                            "timeout": 5
+                        }
+                    ]
+                }
+            ],
             "Stop": [
                 {
                     "hooks": [
@@ -2541,6 +2574,47 @@ fn write_diff_forge_activity_hook_debug(
     }
 }
 
+fn diff_forge_activity_hook_text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(diff_forge_activity_hook_text_from_value)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then(|| text)
+        }
+        Value::Object(object) => {
+            for key in [
+                "text",
+                "content",
+                "delta",
+                "message",
+                "assistantMessage",
+                "assistant_message",
+                "outputText",
+                "output_text",
+                "summary",
+                "thinking",
+                "reasoning",
+            ] {
+                if let Some(text) = object
+                    .get(key)
+                    .and_then(diff_forge_activity_hook_text_from_value)
+                {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn diff_forge_architecture_graph_path_from_text(value: &str) -> String {
     let haystack = value.trim();
     if haystack.is_empty() {
@@ -2839,6 +2913,17 @@ fn diff_forge_activity_hook_record(
             .cloned()
             .unwrap_or(Value::Null)
     };
+    let hook_text_value = |keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|key| {
+                hook_input
+                    .get(*key)
+                    .and_then(diff_forge_activity_hook_text_from_value)
+            })
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+    };
     let tool_bool = |keys: &[&str]| -> bool {
         keys.iter().any(|key| {
             tool_input
@@ -2860,6 +2945,11 @@ fn diff_forge_activity_hook_record(
         "event_name",
         "eventName",
     ]);
+    let hook_event_key = hook_event_name
+        .chars()
+        .filter(|character| character.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect::<String>();
     let session_id = hook_string(&["session_id", "sessionId"]);
     let turn_id = hook_string(&["turn_id", "turnId"]);
     let permission_mode = hook_string(&["permission_mode", "permissionMode"]);
@@ -2876,6 +2966,37 @@ fn diff_forge_activity_hook_record(
         "last_message",
         "lastMessage",
     ]);
+    let mut assistant_payload_keys = vec![
+        "assistant_message",
+        "assistantMessage",
+        "assistant_delta",
+        "assistantDelta",
+        "content",
+        "delta",
+        "output",
+        "response",
+        "thinking",
+        "reasoning",
+    ];
+    if hook_event_key.contains("message")
+        || hook_event_key.contains("delta")
+        || hook_event_key.contains("thinking")
+        || hook_event_key.contains("reasoning")
+    {
+        assistant_payload_keys.push("message");
+    }
+    let assistant_message = first_string(vec![
+        hook_string(&[
+            "assistant_message",
+            "assistantMessage",
+            "assistant_delta",
+            "assistantDelta",
+            "output_text",
+            "outputText",
+            "text",
+        ]),
+        hook_text_value(&assistant_payload_keys),
+    ]);
     let description = first_string(vec![
         tool_string(&["description", "prompt"]),
         hook_string(&["description"]),
@@ -2883,6 +3004,11 @@ fn diff_forge_activity_hook_record(
     let user_prompt = first_string(vec![
         hook_string(&["prompt", "user_prompt", "userPrompt", "message"]),
         tool_string(&["prompt", "description"]),
+    ]);
+    let display_message = first_string(vec![
+        assistant_message.clone(),
+        user_prompt.clone(),
+        description.clone(),
     ]);
     let tool_name = first_string(vec![
         hook_string(&["tool_name", "toolName"]),
@@ -3019,8 +3145,9 @@ fn diff_forge_activity_hook_record(
         "agentId": agent_id,
         "agentType": agent_type,
         "agentTranscriptPath": agent_transcript_path,
+        "assistantMessage": assistant_message,
         "lastMessage": last_message,
-        "message": user_prompt.clone(),
+        "message": display_message,
         "prompt": user_prompt.clone(),
         "toolName": tool_name,
         "toolUseId": tool_use_id,
@@ -3106,6 +3233,9 @@ mod terminal_cli_tests {
         assert!(!settings.contains("\"Error\""));
         assert!(!settings.contains("\"Interrupt\""));
         assert!(settings.contains("\"UserPromptSubmit\""));
+        assert!(settings.contains("\"MessageDisplay\""));
+        assert!(settings.contains("\"PreCompact\""));
+        assert!(settings.contains("\"PostCompact\""));
         assert!(settings.contains("\"Stop\""));
         assert!(settings.contains("\"PostToolUse\""));
         assert!(settings.contains("\"SubagentStop\""));
@@ -3326,6 +3456,26 @@ mod terminal_cli_tests {
             }),
         );
         assert!(plain["planUpdate"].is_null());
+    }
+
+    #[test]
+    fn activity_hook_record_preserves_nested_assistant_delta_text() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hookEventName": "AssistantMessageDelta",
+                "delta": {"text": "hello from a nested delta"}
+            }),
+        );
+        assert_eq!(record["message"].as_str(), Some("hello from a nested delta"));
+        assert_eq!(
+            record["assistantMessage"].as_str(),
+            Some("hello from a nested delta")
+        );
     }
 
     #[test]
@@ -3853,6 +4003,19 @@ function pickText(parts) {
   return "";
 }
 
+function pickDeltaText(value) {
+  if (!value || typeof value !== "object") return "";
+  for (const key of ["delta", "textDelta", "contentDelta", "messageDelta"]) {
+    const candidate = value[key];
+    if (typeof candidate === "string" && candidate.trim()) return candidate;
+    if (candidate && typeof candidate === "object") {
+      const nested = pickDeltaText(candidate) || pickText([candidate]);
+      if (nested) return nested;
+    }
+  }
+  return "";
+}
+
 function eventSessionId(event) {
   const props = (event && event.properties) || {};
   return (
@@ -3926,7 +4089,33 @@ export const DiffForgeActivityPlugin = async () => {
             session_id: sessionId,
             prompt: pickText(message.parts || message.content || []),
           });
+        } else if (role === "assistant") {
+          const delta = pickDeltaText(props) || pickDeltaText(message);
+          if (delta) {
+            emit({
+              hook_event_name: "AssistantMessageDelta",
+              session_id: sessionId,
+              assistant_message: delta,
+            });
+          }
         }
+      }
+      if (type === "message.part.updated" || type === "message.part.created") {
+        const part = props.part || props.info || {};
+        const delta = pickDeltaText(props) || pickDeltaText(part);
+        if (delta) {
+          emit({
+            hook_event_name: "AssistantMessageDelta",
+            session_id: sessionId,
+            assistant_message: delta,
+          });
+        }
+      }
+      if (type === "session.compacted" || type === "session.compacting") {
+        emit({
+          hook_event_name: type === "session.compacting" ? "PreCompact" : "PostCompact",
+          session_id: sessionId,
+        });
       }
       if (type === "permission.asked") {
         emit({

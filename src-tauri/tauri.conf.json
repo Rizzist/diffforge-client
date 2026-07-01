@@ -34,7 +34,7 @@
           "$TEMP/**"
         ]
       },
-      "csp": "default-src 'self'; connect-src 'self' ipc: http://ipc.localhost ws://127.0.0.1:* ws://localhost:* https://diffforge.ai; img-src 'self' asset: http://asset.localhost data:; media-src 'self' asset: http://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self' blob: 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; worker-src 'self' blob:",
+      "csp": "default-src 'self'; connect-src 'self' blob: ipc: http://ipc.localhost ws://127.0.0.1:* ws://localhost:* https://diffforge.ai https://registry-api.tscircuit.com https://cjs.tscircuit.com https://jscdn.tscircuit.com https://cdn.jsdelivr.net https://unpkg.com https://jlcsearch.tscircuit.com https://easyeda.com https://modules.easyeda.com https://modelcdn.tscircuit.com https://kicad-mod-cache.tscircuit.com; img-src 'self' asset: http://asset.localhost data:; media-src 'self' asset: http://asset.localhost blob: data:; style-src 'self' 'unsafe-inline'; script-src 'self' blob: 'unsafe-inline' 'unsafe-eval' 'wasm-unsafe-eval'; worker-src 'self' blob:",
       "dangerousDisableAssetCspModification": [
         "style-src",
         "script-src"
