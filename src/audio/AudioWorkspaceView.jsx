@@ -550,6 +550,7 @@ const AUDIO_HYBRID_TAP_MAX_MS = 280;
 const AUDIO_HYBRID_DOUBLE_TAP_MS = 360;
 const AUDIO_CANCEL_SALVAGE_MIN_AUDIO_MS = 600;
 const DEEPGRAM_RELEASE_POST_BUFFER_MS = 500;
+const AUDIO_SUSPICIOUS_SHORT_TRANSCRIPT_MIN_AUDIO_MS = 1200;
 const AUDIO_HOTKEY_ATTENTION_HIGHLIGHT_MS = 4200;
 const AUDIO_HOTKEY_ATTENTION_TARGETS = new Set(["permissions", "recorder", "input", "microphone"]);
 // Forge cloud dictation streams audio continuously through the native
@@ -2139,6 +2140,23 @@ function audioHistoryEntryWords(entry) {
     return entryWordCount;
   }
   return String(entry?.text || "").split(/\s+/).filter(Boolean).length;
+}
+
+function audioTranscriptWordCount(text) {
+  return String(text || "").trim().split(/\s+/).filter(Boolean).length;
+}
+
+function audioTranscriptAlphanumericLength(text) {
+  return String(text || "").replace(/[^A-Za-z0-9]/g, "").length;
+}
+
+function audioTranscriptLooksSuspiciouslyShort(text, audioMs) {
+  const cleaned = String(text || "").trim();
+  if (!cleaned || Number(audioMs || 0) < AUDIO_SUSPICIOUS_SHORT_TRANSCRIPT_MIN_AUDIO_MS) {
+    return false;
+  }
+  return audioTranscriptWordCount(cleaned) <= 1
+    && audioTranscriptAlphanumericLength(cleaned) <= 2;
 }
 
 // A casual talking pace tops out well under this; it just anchors the gauge.
@@ -8907,34 +8925,49 @@ export function AudioWidgetWindow() {
         : await (async () => {
           const partialSessionId = localWhisperPartialSessionIdRef.current;
           if (partialSessionId && !localWhisperPartialFailedRef.current) {
-            setMessage("Finishing local transcript");
+            setMessage("Capturing final audio");
             try {
-              const partialResult = await stopLocalWhisperPartialTranscription({
-                sessionId: partialSessionId,
-              });
+              const partialPreviewText = localWhisperPartialTextRef.current.trim();
+              let partialStopPromise = null;
               localWhisperPartialSessionIdRef.current = "";
-              const partialAudioMs = Number(partialResult?.audioMs || 0);
-              const partialText = String(partialResult?.text || "").trim();
               let finalCapture;
               try {
                 finalCapture = await audioBuffer.finishCapture({ decode: false });
               } catch (finalCaptureError) {
+                const partialResult = await stopLocalWhisperPartialTranscription({
+                  sessionId: partialSessionId,
+                }).catch(async () => {
+                  await cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
+                  return null;
+                });
+                const partialText = String(partialResult?.text || partialPreviewText || "").trim();
                 if (partialText) {
                   return {
                     ...(partialResult || {}),
-                    audioMs: partialAudioMs,
+                    audioMs: Number(partialResult?.audioMs || 0),
+                    text: partialText,
                     partialFallback: true,
                     partialFallbackReason: "final_capture_failed",
                   };
                 }
                 throw finalCaptureError;
               }
+              partialStopPromise = stopLocalWhisperPartialTranscription({
+                sessionId: partialSessionId,
+              }).catch(async (partialStopError) => {
+                localWhisperPartialFailedRef.current = true;
+                await cancelLocalWhisperPartialTranscription({ sessionId: partialSessionId }).catch(() => {});
+                return {
+                  error: partialStopError,
+                  text: partialPreviewText,
+                };
+              });
               const { audioBase64, audioMs } = finalCapture || {};
               const { peak, rms } = audioBuffer.getCaptureStats();
               if (recordingRunRef.current !== recordingRunId) {
+                void partialStopPromise;
                 return {
-                  ...(partialResult || {}),
-                  audioMs: Number(audioMs || partialAudioMs || 0),
+                  audioMs: Number(audioMs || 0),
                 };
               }
               setMessage("Transcribing locally");
@@ -8947,18 +8980,47 @@ export function AudioWidgetWindow() {
                     captureRms: rms,
                   },
                 });
+                const transcriptText = String(transcriptionResult?.text || "").trim();
+                if (audioTranscriptLooksSuspiciouslyShort(transcriptText, audioMs)) {
+                  const partialResult = await partialStopPromise;
+                  const partialText = String(partialResult?.text || partialPreviewText || "").trim();
+                  if (
+                    partialText
+                    && !audioTranscriptLooksSuspiciouslyShort(partialText, audioMs)
+                    && partialText.length > transcriptText.length
+                  ) {
+                    return {
+                      ...(transcriptionResult || {}),
+                      audioMs,
+                      partial: false,
+                      partialFallback: true,
+                      partialFallbackReason: "final_suspicious_short",
+                      partialPreviewText: partialText,
+                      text: partialText,
+                    };
+                  }
+                  const suspiciousShortError = new Error("Local Whisper returned an incomplete transcript. Try that take again.");
+                  suspiciousShortError.partialFallbackBlocked = true;
+                  throw suspiciousShortError;
+                }
+                void partialStopPromise;
                 return {
                   ...(transcriptionResult || {}),
                   audioMs,
                   partial: false,
-                  partialPreviewText: partialText,
-                  partialSegments: Number(partialResult?.segments || 0),
+                  partialPreviewText,
                 };
               } catch (finalTranscriptionError) {
+                if (finalTranscriptionError?.partialFallbackBlocked) {
+                  throw finalTranscriptionError;
+                }
+                const partialResult = await partialStopPromise;
+                const partialText = String(partialResult?.text || partialPreviewText || "").trim();
                 if (partialText) {
                   return {
                     ...(partialResult || {}),
-                    audioMs: partialAudioMs,
+                    audioMs: Number(partialResult?.audioMs || audioMs || 0),
+                    text: partialText,
                     partialFallback: true,
                   };
                 }

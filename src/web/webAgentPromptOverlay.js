@@ -207,6 +207,68 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
       });
     }
 
+    function stopOverlayEvent(event) {
+      event.stopPropagation();
+    }
+
+    function capturePromptSelection(prompt) {
+      if (!prompt || typeof prompt.selectionStart !== "number" || typeof prompt.selectionEnd !== "number") {
+        return null;
+      }
+      return {
+        direction: prompt.selectionDirection || "none",
+        end: prompt.selectionEnd,
+        start: prompt.selectionStart
+      };
+    }
+
+    function focusPrompt(prompt, selection) {
+      if (!prompt || prompt.disabled) return;
+      window.requestAnimationFrame(() => {
+        if (!prompt.isConnected || prompt.disabled) return;
+        try {
+          prompt.focus({ preventScroll: true });
+        } catch (_) {
+          prompt.focus();
+        }
+        if (
+          selection
+          && typeof prompt.setSelectionRange === "function"
+          && typeof selection.start === "number"
+          && typeof selection.end === "number"
+        ) {
+          try {
+            prompt.setSelectionRange(selection.start, selection.end, selection.direction || "none");
+          } catch (_) {}
+        }
+      });
+    }
+
+    function shieldOverlayControl(element) {
+      if (!element) return;
+      [
+        "beforeinput",
+        "click",
+        "compositionend",
+        "compositionstart",
+        "compositionupdate",
+        "contextmenu",
+        "dblclick",
+        "input",
+        "keydown",
+        "keypress",
+        "keyup",
+        "mousedown",
+        "mouseup",
+        "pointerdown",
+        "pointerup",
+        "touchend",
+        "touchstart"
+      ].forEach((eventName) => {
+        element.addEventListener(eventName, stopOverlayEvent);
+      });
+    }
+
     function submit(state) {
       const prompt = text(state.prompt);
       const targets = normalizeTargets(state.config.targets);
@@ -297,6 +359,12 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
           }).join("")}
         </div>
       \` : "";
+      const previousPrompt = root.querySelector('[data-role="prompt"]');
+      const promptHadFocus = previousPrompt && root.activeElement === previousPrompt;
+      const promptSelection = promptHadFocus ? capturePromptSelection(previousPrompt) : null;
+      if (promptHadFocus && typeof previousPrompt.value === "string" && previousPrompt.value !== state.prompt) {
+        state.prompt = previousPrompt.value;
+      }
 
       root.innerHTML = \`
         <style>
@@ -638,10 +706,17 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
         </div>
       \`;
 
+      const shell = root.querySelector(".shell");
+      shieldOverlayControl(shell);
+
       const prompt = root.querySelector('[data-role="prompt"]');
       if (prompt) {
         prompt.value = state.prompt;
+        shieldOverlayControl(prompt);
+        prompt.addEventListener("pointerdown", () => focusPrompt(prompt));
+        prompt.addEventListener("click", () => focusPrompt(prompt));
         prompt.addEventListener("input", (event) => {
+          event.stopPropagation();
           state.prompt = event.target.value;
           state.error = "";
           const send = root.querySelector('[data-role="send"]');
@@ -650,6 +725,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
           }
         });
         prompt.addEventListener("keydown", (event) => {
+          event.stopPropagation();
           if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
             event.preventDefault();
             submit(state);
@@ -658,22 +734,28 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
             pushEvent(state, { type: "close" });
           }
         });
-        if (!state.didAutofocus && !disabled) {
+        if (promptHadFocus && !disabled) {
+          focusPrompt(prompt, promptSelection);
+        } else if (!state.didAutofocus && !disabled) {
           state.didAutofocus = true;
-          window.requestAnimationFrame(() => prompt.focus());
+          focusPrompt(prompt);
         }
       }
 
       const selector = root.querySelector('[data-role="selector"]');
       if (selector) {
-        selector.addEventListener("click", () => {
+        shieldOverlayControl(selector);
+        selector.addEventListener("click", (event) => {
+          event.stopPropagation();
           state.menuOpen = !state.menuOpen;
           render(state);
         });
       }
 
       root.querySelectorAll("[data-target-id]").forEach((button) => {
-        button.addEventListener("click", () => {
+        shieldOverlayControl(button);
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
           const id = text(button.getAttribute("data-target-id"));
           if (!id) return;
           if (state.selectedIds.includes(id)) {
@@ -688,12 +770,20 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
 
       const send = root.querySelector('[data-role="send"]');
       if (send) {
-        send.addEventListener("click", () => submit(state));
+        shieldOverlayControl(send);
+        send.addEventListener("click", (event) => {
+          event.stopPropagation();
+          submit(state);
+        });
       }
 
       const clear = root.querySelector('[data-role="clear-context"]');
       if (clear) {
-        clear.addEventListener("click", () => pushEvent(state, { type: "clearContext" }));
+        shieldOverlayControl(clear);
+        clear.addEventListener("click", (event) => {
+          event.stopPropagation();
+          pushEvent(state, { type: "clearContext" });
+        });
       }
     }
 
@@ -820,6 +910,7 @@ export function useWebAgentPromptOverlay({
   const clearContextRef = useRef(onClearContext);
   const closeRef = useRef(onClose);
   const contextRefsRef = useRef(contextRefs);
+  const defaultSelectedTargetIdsRef = useRef(defaultSelectedTargetIds);
   const evaluateRef = useRef(evaluate);
   const submitRef = useRef(onSubmit);
   const targetsRef = useRef(targets);
@@ -829,6 +920,7 @@ export function useWebAgentPromptOverlay({
   clearContextRef.current = onClearContext;
   closeRef.current = onClose;
   contextRefsRef.current = contextRefs;
+  defaultSelectedTargetIdsRef.current = defaultSelectedTargetIds;
   evaluateRef.current = evaluate;
   submitRef.current = onSubmit;
   targetsRef.current = targets;
@@ -841,6 +933,8 @@ export function useWebAgentPromptOverlay({
     defaultSelectedTargetIds,
     targets,
   }), [activityItems, contextRefs, defaultSelectedTargetIds, targets]);
+  const configRef = useRef(config);
+  configRef.current = config;
   const configSignature = useMemo(() => JSON.stringify(config), [config]);
 
   const runOverlayAction = useCallback((action, payload = {}, options = {}) => {
@@ -860,9 +954,9 @@ export function useWebAgentPromptOverlay({
       }
       return undefined;
     }
-    void runOverlayAction("show", config, { expectResult: false }).catch(() => {});
+    void runOverlayAction("show", configRef.current, { expectResult: false }).catch(() => {});
     return undefined;
-  }, [config, configSignature, evaluate, nativeEnabled, runOverlayAction]);
+  }, [configSignature, evaluate, nativeEnabled, runOverlayAction]);
 
   useEffect(() => {
     if (!nativeEnabled) {
@@ -904,7 +998,7 @@ export function useWebAgentPromptOverlay({
             await runOverlayAction("show", buildOverlayConfig({
               activityItems: activityItemsRef.current,
               contextRefs: contextRefsRef.current,
-              defaultSelectedTargetIds,
+              defaultSelectedTargetIds: defaultSelectedTargetIdsRef.current,
               targets: targetsRef.current,
             }), { expectResult: false }).catch(() => {});
             continue;
@@ -949,7 +1043,7 @@ export function useWebAgentPromptOverlay({
         void runOverlayAction("show", buildOverlayConfig({
           activityItems: activityItemsRef.current,
           contextRefs: contextRefsRef.current,
-          defaultSelectedTargetIds,
+          defaultSelectedTargetIds: defaultSelectedTargetIdsRef.current,
           targets: targetsRef.current,
         }), { expectResult: false }).catch(() => {});
       }
@@ -961,7 +1055,7 @@ export function useWebAgentPromptOverlay({
       disposed = true;
       window.clearTimeout(timeoutId);
     };
-  }, [defaultSelectedTargetIds, nativeEnabled, runOverlayAction]);
+  }, [nativeEnabled, runOverlayAction]);
 
   return {
     active: nativeEnabled,

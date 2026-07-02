@@ -19660,6 +19660,7 @@ fn cloud_mcp_apply_remote_terminal_lever(
                 continue;
             }
             match close_terminal_session(
+                Some(app.clone()),
                 terminal_state.inner(),
                 Some(&state),
                 &pane_id,

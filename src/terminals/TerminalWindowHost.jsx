@@ -289,6 +289,7 @@ export default function TerminalWindowHost() {
   const { paneId, terminalIndex, theme, title, workspaceId } = params;
   const containerRef = useRef(null);
   const xtermRef = useRef(null);
+  const terminalInstanceIdRef = useRef(0);
   const fitTerminalRef = useRef(() => {});
   const restartMenuRef = useRef(null);
   const [status, setStatus] = useState("connecting");
@@ -352,6 +353,29 @@ export default function TerminalWindowHost() {
     }
     setTerminalFontSize(next);
   }, [paneId, terminalIndex, workspaceId]);
+
+  const claimTerminalAudioTarget = useCallback(() => {
+    const instanceId = Number(terminalInstanceIdRef.current || 0);
+    if (!paneId || !instanceId) {
+      return;
+    }
+
+    invoke("set_terminal_audio_input_target", {
+      active: true,
+      instanceId,
+      paneId,
+    }).catch(() => {});
+    invoke("set_terminal_audio_route_gate", { allowTerminal: true }).catch(() => {});
+  }, [paneId]);
+
+  useEffect(() => {
+    window.addEventListener("focus", claimTerminalAudioTarget);
+    window.addEventListener("pointerdown", claimTerminalAudioTarget, true);
+    return () => {
+      window.removeEventListener("focus", claimTerminalAudioTarget);
+      window.removeEventListener("pointerdown", claimTerminalAudioTarget, true);
+    };
+  }, [claimTerminalAudioTarget]);
 
   useEffect(() => {
     document.documentElement.dataset.terminalWindow = "true";
@@ -515,6 +539,8 @@ export default function TerminalWindowHost() {
       if (disposed || !term) {
         return;
       }
+      terminalInstanceIdRef.current = instanceId;
+      claimTerminalAudioTarget();
 
       term.reset();
 
@@ -684,7 +710,7 @@ export default function TerminalWindowHost() {
         fitTerminalRef.current = () => {};
       }
     };
-  }, [paneId]);
+  }, [claimTerminalAudioTarget, paneId]);
 
   const sendControl = useCallback((control, extra = {}) => {
     if (!paneId) {
@@ -722,6 +748,7 @@ export default function TerminalWindowHost() {
 
   return (
     <HostShell
+      onFocusCapture={claimTerminalAudioTarget}
       onDragOver={(event) => {
         // The OS may deliver a doc drag's dragover here; accept it so the cursor
         // reads as droppable. The actual commit is owned by the main window
@@ -738,6 +765,7 @@ export default function TerminalWindowHost() {
           event.preventDefault();
         }
       }}
+      onPointerDownCapture={claimTerminalAudioTarget}
     >
       {/* This window's root returns before the main app mounts GlobalStyle;
           without it box-sizing stays content-box and the header pill

@@ -1412,6 +1412,11 @@ fn terminal_record_workspace_agent_session_history(
     if metadata.workspace_id.trim().is_empty() {
         return;
     }
+    let launch_metadata = instance
+        .launch_metadata
+        .lock()
+        .map(|metadata| metadata.clone())
+        .unwrap_or_default();
     let runtime = terminal_runtime_snapshot(instance);
     let provider_session_id = terminal_recordable_provider_session_id_for_metadata(
         &metadata,
@@ -1459,8 +1464,20 @@ fn terminal_record_workspace_agent_session_history(
         ),
         agent_id: metadata.agent_id,
         provider: metadata.agent_kind,
-        model_id: model_id.unwrap_or_default().trim().to_string(),
-        model_source: model_source.unwrap_or_default().trim().to_string(),
+        model_id: model_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(launch_metadata.model.as_deref())
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        model_source: model_source
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(launch_metadata.model_source.as_deref())
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
         session_mode: instance.session_mode.as_str().to_string(),
         file_authority: instance.session_mode.file_authority().to_string(),
         coordination_mode: instance
@@ -1944,9 +1961,53 @@ fn webview_window_is_focused(app: &AppHandle, label: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn app_has_focused_terminal_window(app: &AppHandle) -> bool {
+    app.webview_windows().into_iter().any(|(label, window)| {
+        label.starts_with(TERMINAL_WINDOW_LABEL_PREFIX) && window.is_focused().unwrap_or(false)
+    })
+}
+
 fn app_has_focused_audio_input_window(app: &AppHandle) -> bool {
     webview_window_is_focused(app, "main")
         || webview_window_is_focused(app, AUDIO_WIDGET_WINDOW_LABEL)
+        || app_has_focused_terminal_window(app)
+}
+
+fn terminal_audio_input_target_window_is_focused(
+    app: &AppHandle,
+    target: &TerminalAudioInputTarget,
+) -> bool {
+    webview_window_is_focused(app, &terminal_window_label(&target.pane_id))
+}
+
+fn app_has_focused_audio_input_window_for_target(
+    app: &AppHandle,
+    target: &TerminalAudioInputTarget,
+) -> bool {
+    webview_window_is_focused(app, "main")
+        || webview_window_is_focused(app, AUDIO_WIDGET_WINDOW_LABEL)
+        || terminal_audio_input_target_window_is_focused(app, target)
+}
+
+fn terminal_audio_target_should_own_insert(
+    app: &AppHandle,
+    state: &TerminalState,
+    target: Option<&TerminalAudioInputTarget>,
+) -> Result<bool, String> {
+    let Some(target) = target else {
+        return Ok(false);
+    };
+
+    if terminal_audio_input_target_window_is_focused(app, target) {
+        return Ok(true);
+    }
+
+    if !terminal_audio_route_gate(state)?.allow_terminal {
+        return Ok(false);
+    }
+
+    Ok(webview_window_is_focused(app, "main")
+        || webview_window_is_focused(app, AUDIO_WIDGET_WINDOW_LABEL))
 }
 
 async fn write_terminal_input(
@@ -2086,7 +2147,8 @@ async fn write_to_active_terminal_audio_input_target(
     // non-terminal editable (for example the todo list), routes dictation to
     // that input instead. The pane selection is kept so the terminal becomes
     // the target again once it is back in view.
-    if !terminal_audio_route_gate(state)?.allow_terminal {
+    let target_terminal_window_focused = terminal_audio_input_target_window_is_focused(app, &target);
+    if !terminal_audio_route_gate(state)?.allow_terminal && !target_terminal_window_focused {
         write_thread_bridge_diagnostic_log_entry(json!({
             "ts_ms": current_time_ms(),
             "phase": "backend.audio_input_target.write_skip",
@@ -2101,7 +2163,7 @@ async fn write_to_active_terminal_audio_input_target(
         return Ok(false);
     }
 
-    if !app_has_focused_audio_input_window(app) {
+    if !app_has_focused_audio_input_window_for_target(app, &target) {
         clear_terminal_audio_input_target_if_matches(state, &target.pane_id, target.instance_id)?;
         return Ok(false);
     }
@@ -5212,6 +5274,15 @@ fn spawn_terminal_reader(
             )
             .await
             {
+                terminal_record_workspace_agent_session_history(
+                    Some(cleanup_app.clone()),
+                    &instance,
+                    None,
+                    None,
+                    "detached",
+                    "reader_exit:terminal_detached",
+                    None,
+                );
                 let notify_state = cleanup_state.clone();
                 let notify_pane_id = cleanup_pane_id.clone();
                 let notify_context = TerminalCloudMcpCloseContext::from_instance(&instance);
@@ -5286,6 +5357,7 @@ async fn remove_terminal_parked_prompts_for_close(
 }
 
 async fn close_terminal_session(
+    app: Option<AppHandle>,
     state: &TerminalState,
     cloud_mcp_state: Option<&CloudMcpState>,
     pane_id: &str,
@@ -5364,6 +5436,15 @@ async fn close_terminal_session(
                 let _ = tokio::time::timeout(Duration::from_millis(2_000), notify_task).await;
             }
         }
+        terminal_record_workspace_agent_session_history(
+            app.clone(),
+            &instance,
+            None,
+            None,
+            "detached",
+            "terminal_close:terminal_detached",
+            None,
+        );
         let cleanup_tracker = Arc::clone(&state.cleanup_tracker);
         let cleanup_task = tauri::async_runtime::spawn_blocking(move || {
             let _cleanup_guard = cleanup_tracker.begin("terminal_close", Some(cleanup_instance_id));
@@ -5531,6 +5612,18 @@ async fn close_all_terminal_sessions(
     } else {
         "close_all"
     };
+
+    for (_, instance) in &instances {
+        terminal_record_workspace_agent_session_history(
+            Some(app.clone()),
+            instance,
+            None,
+            None,
+            "detached",
+            format!("{close_reason}:terminal_detached"),
+            None,
+        );
+    }
 
     let mut notify_tasks = Vec::new();
     for (pane_id, instance) in &instances {
@@ -6019,6 +6112,7 @@ async fn terminal_open(
         && !fresh_session
         && session_mode.should_prepare_coordination();
     close_terminal_session(
+        Some(app.clone()),
         &state,
         Some(cloud_mcp_state.inner()),
         &pane_id,
@@ -17265,6 +17359,7 @@ async fn terminal_resize(
 
 #[tauri::command]
 async fn terminal_close(
+    app: AppHandle,
     state: State<'_, TerminalState>,
     cloud_mcp_state: State<'_, CloudMcpState>,
     pane_id: String,
@@ -17279,6 +17374,7 @@ async fn terminal_close(
     let _lifecycle_guard = lifecycle_lock.lock().await;
 
     close_terminal_session(
+        Some(app),
         &state,
         Some(cloud_mcp_state.inner()),
         &pane_id,

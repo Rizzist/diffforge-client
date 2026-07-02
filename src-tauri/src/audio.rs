@@ -13173,6 +13173,9 @@ async fn insert_transcribed_text(
         .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
         .and_then(|window| window.is_visible().ok())
         .unwrap_or(false);
+    let terminal_target = active_terminal_audio_input_target(&terminal_state)?;
+    let terminal_target_owned_insert =
+        terminal_audio_target_should_own_insert(&app, &terminal_state, terminal_target.as_ref())?;
 
     if write_to_active_terminal_audio_input_target(&app, &terminal_state, &cloud_mcp_state, &text)
         .await?
@@ -13182,6 +13185,12 @@ async fn insert_transcribed_text(
             installed: whisper_model_status_for(&app)?.installed,
             shortcut: audio_push_to_talk_shortcut_for(&app),
         });
+    }
+
+    if terminal_target_owned_insert {
+        return Err(
+            "Selected terminal was not available for direct dictation insertion.".to_string(),
+        );
     }
 
     #[cfg(target_os = "macos")]
