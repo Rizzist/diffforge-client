@@ -78,6 +78,7 @@ struct WorkspaceAgentSessionHistoryListRequest {
     workspace_id: String,
     root_directory: Option<String>,
     limit: Option<usize>,
+    fast: Option<bool>,
 }
 
 #[derive(Clone, Serialize)]
@@ -1288,6 +1289,7 @@ fn workspace_agent_session_history_list_blocking(
 ) -> Result<WorkspaceAgentSessionHistoryListResult, String> {
     let workspace_id = workspace_threads_clean_workspace_id(&request.workspace_id)?;
     let limit = request.limit.unwrap_or(200).clamp(1, 500);
+    let fast = request.fast.unwrap_or(false);
     let (connection, root, db_path) =
         workspace_threads_open_store(request.root_directory.as_deref(), true)?;
     let root_display = workspace_path_display(&root);
@@ -1395,8 +1397,10 @@ fn workspace_agent_session_history_list_blocking(
     items.retain(workspace_agent_session_history_item_is_visible);
     items = workspace_agent_session_history_dedupe_items(items);
     items = workspace_agent_session_history_limit_with_fork_parents(items, limit);
-    workspace_agent_session_history_enrich_chat_sync(&mut items);
-    workspace_agent_session_history_enrich_previews(&mut items);
+    if !fast {
+        workspace_agent_session_history_enrich_chat_sync(&mut items);
+        workspace_agent_session_history_enrich_previews(&mut items);
+    }
     Ok(WorkspaceAgentSessionHistoryListResult {
         generated_at_ms: workspace_threads_now_millis_u64(),
         workspace_id,
@@ -2362,16 +2366,19 @@ async fn workspace_agent_session_history_list(
     app: AppHandle,
     request: WorkspaceAgentSessionHistoryListRequest,
 ) -> Result<WorkspaceAgentSessionHistoryListResult, String> {
+    let fast = request.fast.unwrap_or(false);
     let result = tauri::async_runtime::spawn_blocking(move || {
         workspace_agent_session_history_list_blocking(request)
     })
     .await
     .map_err(|error| format!("Workspace session history read worker failed: {error}"))??;
-    agent_chat_session_sync_spawn_from_history_items(
-        app,
-        &result.items,
-        "workspace_session_history_list",
-    );
+    if !fast {
+        agent_chat_session_sync_spawn_from_history_items(
+            app,
+            &result.items,
+            "workspace_session_history_list",
+        );
+    }
     Ok(result)
 }
 
@@ -2678,6 +2685,7 @@ mod workspace_threads_store_tests {
 
         let result = workspace_agent_session_history_list_blocking(
             WorkspaceAgentSessionHistoryListRequest {
+                fast: Some(false),
                 limit: Some(50),
                 root_directory: Some(root_text.clone()),
                 workspace_id: "workspace-session-history".to_string(),
@@ -2722,6 +2730,7 @@ mod workspace_threads_store_tests {
 
         let result = workspace_agent_session_history_list_blocking(
             WorkspaceAgentSessionHistoryListRequest {
+                fast: Some(false),
                 limit: Some(50),
                 root_directory: Some(root_text.clone()),
                 workspace_id: "workspace-session-history".to_string(),
@@ -2785,6 +2794,7 @@ mod workspace_threads_store_tests {
         assert!(duplicate_update);
         let result = workspace_agent_session_history_list_blocking(
             WorkspaceAgentSessionHistoryListRequest {
+                fast: Some(false),
                 limit: Some(50),
                 root_directory: Some(root_text.clone()),
                 workspace_id: "workspace-session-history".to_string(),
@@ -2832,6 +2842,7 @@ mod workspace_threads_store_tests {
         assert!(!invalid_opencode);
         let result = workspace_agent_session_history_list_blocking(
             WorkspaceAgentSessionHistoryListRequest {
+                fast: Some(false),
                 limit: Some(50),
                 root_directory: Some(root_text.clone()),
                 workspace_id: "workspace-session-history".to_string(),
@@ -2913,6 +2924,7 @@ mod workspace_threads_store_tests {
 
         let result = workspace_agent_session_history_list_blocking(
             WorkspaceAgentSessionHistoryListRequest {
+                fast: Some(false),
                 limit: Some(50),
                 root_directory: Some(root.to_string_lossy().to_string()),
                 workspace_id: "workspace-session-history".to_string(),
@@ -2984,6 +2996,7 @@ mod workspace_threads_store_tests {
 
         let result = workspace_agent_session_history_list_blocking(
             WorkspaceAgentSessionHistoryListRequest {
+                fast: Some(false),
                 limit: Some(2),
                 root_directory: Some(root.to_string_lossy().to_string()),
                 workspace_id: "workspace-session-history".to_string(),

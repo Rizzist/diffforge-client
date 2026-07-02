@@ -2,6 +2,7 @@ const CODEX_TRANSCRIPT_DEFAULT_LIMIT: usize = 260;
 const CODEX_TRANSCRIPT_MAX_LIMIT: usize = 420;
 const CODEX_TRANSCRIPT_MAX_TEXT: usize = 12_000;
 const CODEX_TRANSCRIPT_MAX_TOOL_TEXT: usize = 8_000;
+const CODEX_TRANSCRIPT_MAX_REASONING_TEXT: usize = 48_000;
 const CODEX_ROLLOUT_SCAN_LIMIT: usize = 2_500;
 const AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT: &str = "forge-agent-thread-transcript-updated";
 const AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS: u64 = 180;
@@ -718,6 +719,30 @@ fn clean_codex_transcript_text(value: impl AsRef<str>, max_chars: usize) -> Stri
     }
 
     output.trim().to_string()
+}
+
+fn clean_codex_reasoning_text(value: impl AsRef<str>) -> String {
+    let cleaned = clean_codex_transcript_text(value, CODEX_TRANSCRIPT_MAX_REASONING_TEXT + 1024);
+    if cleaned.chars().count() <= CODEX_TRANSCRIPT_MAX_REASONING_TEXT {
+        return cleaned;
+    }
+    let mut output = cleaned
+        .chars()
+        .take(CODEX_TRANSCRIPT_MAX_REASONING_TEXT)
+        .collect::<String>();
+    if let Some((index, _)) = output
+        .char_indices()
+        .rev()
+        .take_while(|(index, _)| {
+            output.len().saturating_sub(*index) <= 1024
+        })
+        .find(|(_, character)| character.is_whitespace())
+    {
+        output.truncate(index);
+    }
+    output = output.trim().to_string();
+    output.push_str("\n\n[truncated]");
+    output
 }
 
 fn clean_codex_title(value: impl AsRef<str>, fallback: &str) -> String {
@@ -2046,42 +2071,65 @@ mod agent_sessions_tests {
         env::temp_dir().join(format!("{name}-{suffix}"))
     }
 
-    fn opencode_step_finish(data: Value) -> CodexThreadTranscriptMessage {
-        let messages = opencode_part_message("msg1", "assistant", "part1", "2024-01-01T00:00:00Z", &data);
-        assert_eq!(messages.len(), 1, "step-finish yields one message: {data}");
-        messages.into_iter().next().unwrap()
+    fn opencode_step_finish(data: Value) -> Vec<CodexThreadTranscriptMessage> {
+        opencode_part_message("msg1", "assistant", "part1", "2024-01-01T00:00:00Z", &data)
     }
 
     #[test]
     fn opencode_step_finish_classifies_on_structured_fields_only() {
-        // Normal finish reasons synthesize the task_complete marker.
+        // Normal finish reasons are control metadata, not visible messages.
         for reason in ["stop", "tool-calls", "length"] {
-            let message =
+            let messages =
                 opencode_step_finish(json!({"type": "step-finish", "reason": reason}));
-            assert_eq!(message.kind, "task_complete", "reason {reason} completes the turn");
+            assert!(
+                messages.is_empty(),
+                "reason {reason} should not render a transcript message"
+            );
         }
-        // The message-level `finish` mirror is also honored.
-        let message = opencode_step_finish(json!({"type": "step-finish", "finish": "stop"}));
-        assert_eq!(message.kind, "task_complete");
+        // The message-level `finish` mirror is also suppressed.
+        assert!(opencode_step_finish(json!({"type": "step-finish", "finish": "stop"})).is_empty());
 
         // R5: free-form `summary` prose must NOT be classified — only the
         // structured finish-reason fields drive error/interrupted routing.
-        let message = opencode_step_finish(
+        let messages = opencode_step_finish(
             json!({"type": "step-finish", "summary": "cancelled the timer and stopped"}),
         );
-        assert_eq!(
-            message.kind, "task_complete",
-            "free-text summary must not be read as an interrupt"
-        );
+        assert!(messages.is_empty(), "free-text summary must not render");
 
         // Structured error / abort reasons route away from completion.
-        let message = opencode_step_finish(json!({"type": "step-finish", "reason": "error"}));
+        let message = opencode_step_finish(json!({"type": "step-finish", "reason": "error"}))
+            .into_iter()
+            .next()
+            .expect("error message");
         assert_eq!(message.kind, "error");
         assert!(message.id.ends_with("step-error"));
 
-        let message = opencode_step_finish(json!({"type": "step-finish", "reason": "aborted"}));
+        let message = opencode_step_finish(json!({"type": "step-finish", "reason": "aborted"}))
+            .into_iter()
+            .next()
+            .expect("aborted message");
         assert_eq!(message.kind, "error");
         assert!(message.id.ends_with("step-interrupted"));
+    }
+
+    #[test]
+    fn opencode_reasoning_uses_word_boundary_truncation() {
+        let reasoning = format!(
+            "{} tailword",
+            "reasoning ".repeat(CODEX_TRANSCRIPT_MAX_REASONING_TEXT / "reasoning ".len() + 200)
+        );
+        let messages = opencode_part_message(
+            "msg1",
+            "assistant",
+            "part1",
+            "2024-01-01T00:00:00Z",
+            &json!({"type": "reasoning", "text": reasoning}),
+        );
+        assert_eq!(messages.len(), 1);
+        let text = messages[0].text.as_str();
+        assert!(text.ends_with("[truncated]"));
+        assert!(text.chars().count() > CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+        assert!(!text.contains("tailword"));
     }
 
     #[test]
@@ -3320,7 +3368,7 @@ fn opencode_part_message(
                 id: format!("opencode-{message_id}-{part_id}-reasoning"),
                 role: "activity".to_string(),
                 kind: "reasoning".to_string(),
-                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                text: clean_codex_reasoning_text(text),
                 title: "Reasoning".to_string(),
                 call_id: String::new(),
                 created_at: opencode_part_created_at(timestamp, data, false),
@@ -3445,9 +3493,9 @@ fn opencode_part_message(
         "step-finish" => {
             // OpenCode/AI-SDK records the finish reason on the step part as
             // `reason` (e.g. "stop", "tool-calls", "length"); some versions also
-            // mirror it on the assistant message as `finish`. A normal turn end
-            // ("stop"/"tool-calls"/"length") must synthesize a `task_complete`
-            // marker so the turn settles to idle even without the live hook.
+            // mirror it on the assistant message as `finish`. Normal finish
+            // reasons are control metadata and must not render as assistant
+            // messages; live hooks settle the turn state.
             // Classification runs ONLY on the structured finish-reason fields —
             // `summary` is free-form prose used for display text only, so a
             // summary like "cancelled the timer" must not be read as an
@@ -3491,12 +3539,7 @@ fn opencode_part_message(
                     },
                 )]
             } else {
-                vec![transcript_task_complete_message(
-                    format!("opencode-{message_id}-{part_id}-task-complete"),
-                    "opencode",
-                    timestamp,
-                    display_text,
-                )]
+                Vec::new()
             }
         }
         "snapshot" => vec![CodexThreadTranscriptMessage {

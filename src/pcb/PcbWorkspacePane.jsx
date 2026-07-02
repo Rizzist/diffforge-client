@@ -7,6 +7,7 @@ import AppSelect from "../app/AppSelect.jsx";
 import PcbPanel, { PCB_STORE_CHANGED_EVENT } from "./PcbPanel.jsx";
 
 const PCB_GRID_SLOT_STORAGE_PREFIX = "diffforge.pcb.gridPaneSlot.";
+const PCB_SELECT_MENU_MAX_HEIGHT = 132;
 
 function normalizeRepoIdentity(repoPath) {
   return String(repoPath || "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
@@ -80,6 +81,7 @@ const PaneBody = styled.div`
   min-height: 0;
   display: flex;
   overflow: hidden;
+  container: pcb-pane / size;
 `;
 
 const EmptyPane = styled.div`
@@ -87,31 +89,67 @@ const EmptyPane = styled.div`
   width: 100%;
   min-width: 0;
   min-height: 0;
-  place-items: center;
+  align-items: safe center;
+  justify-items: center;
   padding: 18px;
+  overflow: auto;
+  overscroll-behavior: contain;
   color: rgba(203, 213, 225, 0.82);
   background:
     linear-gradient(135deg, rgba(16, 185, 129, 0.08), transparent 34%),
     #04070d;
+
+  @container pcb-pane (max-height: 360px) {
+    align-items: start;
+    padding: 10px;
+  }
 `;
 
 const EmptyCard = styled.div`
   display: flex;
   width: min(360px, 100%);
   min-width: 0;
+  max-height: 100%;
   flex-direction: column;
   align-items: stretch;
   gap: 10px;
   padding: 16px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-color: rgba(148, 163, 184, 0.48) transparent;
+  scrollbar-width: thin;
   border: 1px solid rgba(148, 163, 184, 0.18);
   border-radius: 8px;
   background: rgba(11, 14, 20, 0.88);
+
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.5);
+  }
+
+  @container pcb-pane (max-height: 360px) {
+    gap: 8px;
+    padding: 12px;
+  }
+
+  @container pcb-pane (max-height: 260px) {
+    gap: 6px;
+    padding: 10px;
+  }
 `;
 
 const EmptyTitle = styled.div`
   color: rgba(241, 245, 249, 0.92);
   font-size: 13px;
   font-weight: 850;
+
+  @container pcb-pane (max-height: 260px) {
+    font-size: 12px;
+  }
 `;
 
 const EmptyHint = styled.div`
@@ -119,6 +157,11 @@ const EmptyHint = styled.div`
   font-size: 11px;
   font-weight: 700;
   line-height: 1.35;
+
+  @container pcb-pane (max-height: 300px) {
+    font-size: 10px;
+    line-height: 1.25;
+  }
 `;
 
 const PaneButton = styled.button`
@@ -139,6 +182,10 @@ const PaneButton = styled.button`
   &:disabled {
     cursor: not-allowed;
     opacity: 0.45;
+  }
+
+  @container pcb-pane (max-height: 260px) {
+    min-height: 28px;
   }
 `;
 
@@ -167,10 +214,18 @@ const CreateOverlay = styled.div`
   inset: 0;
   z-index: 8;
   display: grid;
-  place-items: center;
+  align-items: safe center;
+  justify-items: center;
   padding: 18px;
+  overflow: auto;
+  overscroll-behavior: contain;
   background: rgba(2, 3, 4, 0.72);
   backdrop-filter: blur(10px);
+
+  @container pcb-pane (max-height: 420px) {
+    align-items: start;
+    padding: 10px;
+  }
 `;
 
 const CreateCard = styled(EmptyCard)`
@@ -197,6 +252,10 @@ const CreateInput = styled.input`
   &::placeholder {
     color: rgba(148, 163, 184, 0.72);
   }
+
+  @container pcb-pane (max-height: 260px) {
+    min-height: 30px;
+  }
 `;
 
 const CreateActions = styled.div`
@@ -204,6 +263,10 @@ const CreateActions = styled.div`
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
+
+  @container pcb-pane (max-width: 300px) {
+    grid-template-columns: 1fr;
+  }
 `;
 
 const CreateSecondaryRow = styled.div`
@@ -231,6 +294,10 @@ const CreateCancelButton = styled.button`
   &:disabled {
     cursor: not-allowed;
     opacity: 0.5;
+  }
+
+  @container pcb-pane (max-height: 260px) {
+    min-height: 28px;
   }
 `;
 
@@ -684,6 +751,8 @@ export default function PcbWorkspacePane({
               </PaneButton>
               <AppSelect
                 isDisabled={!availableBoards.length || busy || deleting}
+                maxMenuHeight={PCB_SELECT_MENU_MAX_HEIGHT}
+                menuShouldScrollIntoView={false}
                 onChange={selectBoardPath}
                 options={boardOptions}
                 placeholder={availableBoards.length ? "Open existing design" : "No saved designs yet"}
@@ -702,6 +771,8 @@ export default function PcbWorkspacePane({
               <CreatePickerWrap>
                 <AppSelect
                   isDisabled={!availableBoards.length || busy || deleting}
+                  maxMenuHeight={PCB_SELECT_MENU_MAX_HEIGHT}
+                  menuShouldScrollIntoView={false}
                   onChange={selectBoardFromPicker}
                   options={boardOptions}
                   placeholder={availableBoards.length ? "Switch board" : "No saved designs yet"}

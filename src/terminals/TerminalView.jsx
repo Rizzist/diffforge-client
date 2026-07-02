@@ -12973,6 +12973,7 @@ const TODO_QUEUE_IGNORED_READINESS_EVENT_TYPES = new Set([
   "terminal-input-ready",
   "terminal-prompt-ready",
 ]);
+const TODO_QUEUE_WEBVIEW_SESSION_STARTED_AT_MS = Date.now();
 
 const TODO_QUEUE_PROVIDER_HOOK_COMPLETION_EVENT_TYPES = new Set([
   "provider-turn-completed",
@@ -13123,6 +13124,51 @@ function todoQueueTerminalIdentityConflictsWithIndex(identity, terminalIndex) {
 function todoQueueTimestampMs(value) {
   const parsed = Date.parse(String(value || "").trim());
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function todoQueueCompletionTimestampMs(...items) {
+  return items.reduce((latest, item) => Math.max(
+    latest,
+    todoQueueTimestampMs(item?.todoCompletedAt || item?.todo_completed_at),
+    todoQueueTimestampMs(item?.completedAt || item?.completed_at),
+    Number(item?.completedAtMs || item?.completed_at_ms || 0) || 0,
+    todoQueueTimestampMs(item?.todoStatusUpdatedAt || item?.todo_status_updated_at),
+    Number(item?.updatedAtMs || item?.updated_at_ms || 0) || 0,
+  ), 0);
+}
+
+function todoQueueStartedDuringWebviewSession(...items) {
+  const startedAtMs = items.reduce((latest, item) => Math.max(
+    latest,
+    Number(item?.startedAtMs || item?.started_at_ms || 0) || 0,
+    Number(item?.submittedAtMs || item?.submitted_at_ms || 0) || 0,
+    todoQueueTimestampMs(item?.startedAt || item?.started_at),
+    todoQueueTimestampMs(item?.submittedAt || item?.submitted_at),
+  ), 0);
+  return startedAtMs >= TODO_QUEUE_WEBVIEW_SESSION_STARTED_AT_MS - 1000;
+}
+
+function todoQueueCompletionIsFreshForWebview(...items) {
+  return todoQueueCompletionTimestampMs(...items) >= TODO_QUEUE_WEBVIEW_SESSION_STARTED_AT_MS - 1000
+    || todoQueueStartedDuringWebviewSession(...items);
+}
+
+function todoQueueLifecycleEventIsStartupDerived(event = {}) {
+  const source = String(
+    event.source
+      || event.messageSource
+      || event.message_source
+      || event.completionEvidence
+      || event.completion_evidence
+      || "",
+  ).trim().toLowerCase();
+  return event.startupIdleCandidate === true
+    || event.startup_idle_candidate === true
+    || event.sessionIdleWithoutPrompt === true
+    || event.session_idle_without_prompt === true
+    || source === "startup-idle-buffer"
+    || source === "backend-startup-prompt-ready"
+    || source.includes("startup-idle");
 }
 
 function isTodoQueueSendableActivityStatus(value) {
@@ -15520,6 +15566,8 @@ function pruneTodoQueueRemoteCommandReceipts(receipts, nowMs = Date.now()) {
         commandId: String(receipt?.commandId || key),
         itemId: String(receipt?.itemId || ""),
         receivedAtMs,
+        remoteIntake: Boolean(receipt?.remoteIntake || receipt?.remote_intake),
+        source: String(receipt?.source || receipt?.receiptSource || receipt?.receipt_source || ""),
         status: normalizeTodoQueueRemoteCommandReceiptStatus(receipt?.status),
         text: String(receipt?.text || "").slice(0, 180),
         updatedAtMs,
@@ -15637,6 +15685,14 @@ function todoQueueRemoteCommandReceiptBlocks(receipt) {
     return false;
   }
   const status = normalizeTodoQueueRemoteCommandReceiptStatus(receipt?.status);
+  const source = String(receipt?.source || "").trim().toLowerCase();
+  const intakeProgress = Boolean(receipt?.remoteIntake || receipt?.remote_intake)
+    || source === "remote_intake"
+    || source === "remote_intake_webview"
+    || source === "remote_intake_headless";
+  if (status === "queued" && intakeProgress) {
+    return false;
+  }
   return TODO_QUEUE_REMOTE_COMMAND_BLOCKING_RECEIPT_STATES.has(status);
 }
 
@@ -23195,12 +23251,22 @@ function TerminalView({
       receiptSessionFields.providerSessionId
         || "",
     ).trim();
+    const receiptSource = String(
+      fields.source
+        || fields.receiptSource
+        || fields.receipt_source
+        || item?.remoteCommand?.source
+        || item?.remote_command?.source
+        || item?.source
+        || "",
+    ).trim();
     const nextReceipt = {
       commandId,
       ...receiptSessionFields,
       itemId: String(item?.id || item?.itemId || existingReceipt?.itemId || ""),
       receivedAtMs: Number(existingReceipt?.receivedAtMs || nowMs),
       ...(receiptSessionId ? { sessionId: receiptSessionId, session_id: receiptSessionId } : {}),
+      ...(receiptSource ? { source: receiptSource } : {}),
       status: normalizeTodoQueueRemoteCommandReceiptStatus(status),
       text: normalizeTodoQueueText(item?.text || existingReceipt?.text || "").slice(0, 180),
       updatedAtMs: nowMs,
@@ -30219,6 +30285,9 @@ function TerminalView({
     if (!eventInputReady) {
       return;
     }
+    if (todoQueueLifecycleEventIsStartupDerived(event)) {
+      return;
+    }
 
     const eventPaneId = normalizeTodoTerminalIdentity(event.paneId || event.pane_id || "");
     let targetTerminalIndex = normalizeTodoTerminalIndex(event.terminalIndex ?? event.terminal_index);
@@ -30272,6 +30341,9 @@ function TerminalView({
       }).then((result) => {
         const settledCount = Number(result?.settledCount ?? result?.settled_count ?? 0);
         if (!backendOnly || settledCount <= 0) {
+          return;
+        }
+        if (inputReadyAtMs < TODO_QUEUE_WEBVIEW_SESSION_STARTED_AT_MS - 1000) {
           return;
         }
         triggerTodoCompletionFlash(backendPaneId);
@@ -32663,7 +32735,13 @@ function TerminalView({
                   if (removedInFlight) {
                     setTodoQueueDispatchRevision((revision) => revision + 1);
                   }
-                  if (wasActiveLocally) {
+                  const completionFreshForWebview = todoQueueCompletionIsFreshForWebview(
+                    storeItem,
+                    item,
+                    pendingItem,
+                    pendingItem?.item,
+                  );
+                  if (wasActiveLocally && completionFreshForWebview) {
                     const storeTerminalIndex = getTodoQueueTargetTerminalIndex(storeItem);
                     const localTerminalIndex = getTodoQueueTargetTerminalIndex(item);
                     const pendingTerminalIndex = Number.isInteger(Number(pendingItem?.targetTerminalIndex))
@@ -35590,17 +35668,31 @@ function TerminalView({
           });
         }
       }
-      if (!item) {
-        logTerminalStatus("frontend.todo_queue.remote_requeue_missing", {
-          commandId: detail.commandId || todoId,
+	      if (!item) {
+	        logTerminalStatus("frontend.todo_queue.remote_requeue_missing", {
+	          commandId: detail.commandId || todoId,
           itemId: todoId,
           source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
           workspaceId: terminalWorkspace.id,
-        });
-        return;
-      }
-      if (todoQueuePendingItemsRef.current[item.id]) {
-        logTerminalStatus("frontend.todo_queue.remote_requeue_skip", {
+	        });
+	        return;
+	      }
+	      const receiptKey = getTodoQueueRemoteCommandReceiptKey(item, terminalWorkspace.id);
+	      const receipt = receiptKey
+	        ? todoQueueRemoteCommandReceiptsRef.current[receiptKey] || null
+	        : null;
+	      if (receiptKey && todoQueueRemoteCommandReceiptBlocks(receipt)) {
+	        logTerminalStatus("frontend.todo_queue.remote_requeue_duplicate_skip", {
+	          commandId: detail.commandId || getTodoQueueRemoteCommandId(item) || todoId,
+	          itemId: item.id,
+	          receiptStatus: receipt?.status || "",
+	          source: TODO_QUEUE_SOURCE_REMOTE_CONTROL,
+	          workspaceId: terminalWorkspace.id,
+	        });
+	        return;
+	      }
+	      if (todoQueuePendingItemsRef.current[item.id]) {
+	        logTerminalStatus("frontend.todo_queue.remote_requeue_skip", {
           commandId: detail.commandId || todoId,
           itemId: todoId,
           pendingPhase: getTodoQueuePendingPhase(todoQueuePendingItemsRef.current[item.id]),
@@ -35622,10 +35714,14 @@ function TerminalView({
           ?? detail.item?.target_terminal_index,
       );
       if (targetTerminalIndex != null || detail.generic === true) {
-        applyTodoHistoryTarget(item.id, targetTerminalIndex);
-      }
-      queueTodoQueueItem(item.id, {
-        generic: detail.generic === true,
+	        applyTodoHistoryTarget(item.id, targetTerminalIndex);
+	      }
+	      recordTodoQueueRemoteCommandReceipt(item, "queued", {
+	        commandId: detail.commandId || getTodoQueueRemoteCommandId(item) || "",
+	        workspaceId: terminalWorkspace.id,
+	      });
+	      queueTodoQueueItem(item.id, {
+	        generic: detail.generic === true,
         item,
         targetTerminalIndex,
       });

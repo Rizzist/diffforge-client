@@ -38,6 +38,7 @@ const TOKENOMICS_PERIODIC_SENTINEL_MAX_ENTRIES_PER_ROOT: usize = 512;
 const TOKENOMICS_PERIODIC_SENTINEL_MAX_DEPTH: usize = 3;
 const TOKENOMICS_SUMMARY_SNAPSHOT_CACHE_KEY_PREFIX: &str = "summary_snapshot_cache:";
 const TOKENOMICS_SCAN_PROGRESS_EVENT: &str = "diffforge://tokenomics-scan-progress";
+const TOKENOMICS_UPDATED_EVENT: &str = "diffforge://tokenomics-updated";
 const TOKENOMICS_LOCAL_DEVICE_ALIASES_KEY: &str = "local_device_aliases";
 const TOKENOMICS_CLOUD_PROVIDER_LIMITS_KEY: &str = "cloud_provider_limits";
 const TOKENOMICS_LIMITS_CHANGED_SYNC_REASON: &str = "tokenomics_limits_changed";
@@ -2098,7 +2099,7 @@ fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String
     drop(conn);
     tokenomics_clear_summary_cache();
 
-    Ok(json!({
+    let status = json!({
         "token_scan": token_scan,
         "recorded_samples": recorded_samples,
         "recorded_windows": recorded_windows,
@@ -2110,7 +2111,12 @@ fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String
         "source_count": gate.fingerprint.source_count,
         "latest_modified_ms": gate.fingerprint.latest_modified_ms,
         "total_bytes": gate.fingerprint.total_bytes,
-    }))
+    });
+    if recorded_samples > 0 || recorded_windows > 0 || token_scan_inserted_events > 0 {
+        tokenomics_emit_updated(app, status.clone());
+    }
+
+    Ok(status)
 }
 
 /// Removes the persisted read-only summary snapshots so the next summary read
@@ -4868,6 +4874,10 @@ fn tokenomics_emit_scan_progress(app: &AppHandle, emit_progress: bool, payload: 
         return;
     }
     let _ = app.emit(TOKENOMICS_SCAN_PROGRESS_EVENT, payload);
+}
+
+fn tokenomics_emit_updated(app: &AppHandle, payload: Value) {
+    let _ = app.emit(TOKENOMICS_UPDATED_EVENT, payload);
 }
 
 fn tokenomics_utc_day_start_unix(seconds: u64) -> u64 {

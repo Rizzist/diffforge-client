@@ -25859,6 +25859,18 @@ fn cloud_mcp_merge_live_text_delta(left: &str, right: &str) -> CloudMcpLiveTextM
     CloudMcpLiveTextMerge::Delta(format!("{left}{right}"))
 }
 
+fn cloud_mcp_live_text_looks_cumulative_snapshot(cached_text: &str, incoming_text: &str) -> bool {
+    if cached_text.is_empty() || incoming_text.is_empty() {
+        return false;
+    }
+    if incoming_text.starts_with(cached_text) {
+        return true;
+    }
+    let common_prefix = cloud_mcp_common_prefix_len(cached_text, incoming_text);
+    let shorter_len = cached_text.chars().count().min(incoming_text.chars().count());
+    common_prefix >= 8 && common_prefix * 2 >= shorter_len
+}
+
 fn cloud_mcp_agent_turn_hook_key(value: &str) -> String {
     value
         .chars()
@@ -26106,8 +26118,16 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
     state_value: &str,
     turn_status: &str,
 ) {
-    let mut delta_text = cloud_mcp_compact_live_turn_text(payload.live_text_delta.as_ref(), 8_192);
-    let snapshot_text = cloud_mcp_compact_live_turn_text(payload.live_text_snapshot.as_ref(), 32_768);
+    let mut raw_delta_text = payload
+        .live_text_delta
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned();
+    let mut raw_snapshot_text = payload
+        .live_text_snapshot
+        .as_ref()
+        .filter(|value| !value.is_empty())
+        .cloned();
     let is_final = matches!(turn_status, "completed" | "interrupted" | "failed")
         || matches!(state_value, "idle" | "error" | "interrupted");
     let provider_session_id = payload
@@ -26129,8 +26149,8 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
         .as_deref()
         .unwrap_or("assistant")
         .to_string();
-    if snapshot_text.is_none() {
-        if let Some(delta) = delta_text.clone() {
+    if raw_snapshot_text.is_none() {
+        if let Some(delta) = raw_delta_text.clone() {
             let cache_key = format!("{stream_key}|{content_kind}");
             let cached_text = state
                 .agent_live_text_by_stream
@@ -26140,7 +26160,7 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
                 .unwrap_or_default();
             if !cached_text.is_empty() && delta.starts_with(cached_text.as_str()) {
                 let suffix = delta[cached_text.len()..].to_string();
-                delta_text = (!suffix.is_empty()).then_some(suffix);
+                raw_delta_text = (!suffix.is_empty()).then_some(suffix);
                 if cloud_mcp_agent_stream_debug_enabled() {
                     log_terminal_status_event(
                         "backend.cloud_mcp.agent_stream.cumulative_delta",
@@ -26150,13 +26170,33 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
                             "pane_id": payload.pane_id.as_str(),
                             "provider": payload.provider.as_str(),
                             "stream_key": stream_key,
-                            "suffix": cloud_mcp_agent_stream_text_summary(delta_text.as_deref()),
+                            "suffix": cloud_mcp_agent_stream_text_summary(raw_delta_text.as_deref()),
+                        }),
+                    );
+                }
+            } else if cloud_mcp_live_text_looks_cumulative_snapshot(
+                cached_text.as_str(),
+                delta.as_str(),
+            ) {
+                raw_snapshot_text = Some(delta.clone());
+                raw_delta_text = None;
+                if cloud_mcp_agent_stream_debug_enabled() {
+                    log_terminal_status_event(
+                        "backend.cloud_mcp.agent_stream.cumulative_snapshot",
+                        json!({
+                            "cached": cloud_mcp_agent_stream_text_summary(Some(cached_text.as_str())),
+                            "incoming": cloud_mcp_agent_stream_text_summary(Some(delta.as_str())),
+                            "pane_id": payload.pane_id.as_str(),
+                            "provider": payload.provider.as_str(),
+                            "stream_key": stream_key,
                         }),
                     );
                 }
             }
         }
     }
+    let delta_text = cloud_mcp_compact_live_turn_text(raw_delta_text.as_ref(), 8_192);
+    let snapshot_text = cloud_mcp_compact_live_turn_text(raw_snapshot_text.as_ref(), 32_768);
     if delta_text.is_none() && snapshot_text.is_none() && !is_final {
         return;
     };
@@ -26285,9 +26325,9 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
             entry.is_final = is_final;
             entry.finish_reason = finish_reason;
             entry.updated_at_ms = payload.observed_at_ms;
-            if let Some(snapshot_text) = snapshot_text.as_deref() {
+            if let Some(snapshot_text) = raw_snapshot_text.as_deref() {
                 entry.text = snapshot_text.to_string();
-            } else if let Some(delta_text) = delta_text.as_deref() {
+            } else if let Some(delta_text) = raw_delta_text.as_deref() {
                 entry.text.push_str(delta_text);
             }
             if entry.text.len() > 160_000 {
@@ -51357,6 +51397,28 @@ mod cloud_mcp_tests {
             CloudMcpLiveTextMerge::Snapshot(value) => assert_eq!(value, "Hello there"),
             CloudMcpLiveTextMerge::Delta(_) => panic!("expected snapshot merge"),
         }
+    }
+
+    #[test]
+    fn live_text_cumulative_snapshot_detection_uses_uncapped_text() {
+        let cached = "cell|".repeat(3_000);
+        let incoming = format!("{cached}tail");
+        assert!(cloud_mcp_live_text_looks_cumulative_snapshot(
+            cached.as_str(),
+            incoming.as_str(),
+        ));
+        let suffix = incoming[cached.len()..].to_string();
+        assert_eq!(
+            cloud_mcp_compact_live_turn_text(Some(&suffix), 8_192).as_deref(),
+            Some("tail")
+        );
+
+        let capped_incoming =
+            cloud_mcp_compact_live_turn_text(Some(&incoming), 8_192).unwrap_or_default();
+        assert!(
+            !capped_incoming.starts_with(cached.as_str()),
+            "the capped frame must not be used for cumulative-prefix detection"
+        );
     }
 
     #[test]

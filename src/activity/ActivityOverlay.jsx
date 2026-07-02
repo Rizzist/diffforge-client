@@ -2323,13 +2323,15 @@ const OverlayBody = styled.div`
   overflow-y: auto;
   overscroll-behavior: contain;
   scrollbar-gutter: stable;
-  scrollbar-width: thin;
-  scrollbar-color: rgba(148, 163, 184, 0.35) transparent;
   cursor: grab;
   -webkit-app-region: drag;
 
+  /* WebKit-only scrollbar styling keeps the overlay rail thin in WKWebView.
+     The standard scrollbar-width/color path can fall back to macOS' native
+     expanding overlay thumb when hovered. */
   &::-webkit-scrollbar {
     width: 4px;
+    height: 4px;
   }
 
   &::-webkit-scrollbar-thumb {
@@ -2337,7 +2339,16 @@ const OverlayBody = styled.div`
     background: rgba(148, 163, 184, 0.35);
   }
 
+  &::-webkit-scrollbar-thumb:hover,
+  &::-webkit-scrollbar-thumb:active {
+    background: rgba(148, 163, 184, 0.48);
+  }
+
   &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-corner {
     background: transparent;
   }
 

@@ -35,6 +35,7 @@ import {
 } from "./tokenomicsProviderLimitMerge.js";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
+const TOKENOMICS_UPDATED_EVENT = "diffforge://tokenomics-updated";
 const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 60_000;
 const TOKENOMICS_HOT_TAIL_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TOKENOMICS_LIVE_LIMIT_REFRESH_INTERVAL_MS = 60_000;
@@ -2771,6 +2772,8 @@ const tokenomicsStore = {
   limitSyncPending: false,
   progressListenerPromise: null,
   progressUnlisten: null,
+  updatedListenerPromise: null,
+  updatedUnlisten: null,
   subscribers: new Set(),
 };
 
@@ -2890,28 +2893,39 @@ function resetTokenomicsStoreForAccount(accountKey) {
 }
 
 function ensureTokenomicsProgressListener() {
-  if (tokenomicsStore.progressUnlisten || tokenomicsStore.progressListenerPromise) {
-    return;
+  if (!tokenomicsStore.progressUnlisten && !tokenomicsStore.progressListenerPromise) {
+    tokenomicsStore.progressListenerPromise = listen(TOKENOMICS_SCAN_PROGRESS_EVENT, (event) => {
+      const payload = event.payload || null;
+      updateTokenomicsStore({ scanProgress: payload });
+      if (payload?.summary) {
+        mergeSummaryIntoTokenomicsStore(payload.summary);
+      }
+      const summaryDelta = payload?.summary_delta || payload?.summaryDelta;
+      if (summaryDelta) {
+        mergeSummaryDeltaIntoTokenomicsStore(summaryDelta);
+      }
+    })
+      .then((handler) => {
+        tokenomicsStore.progressUnlisten = handler;
+      })
+      .catch(() => {})
+      .finally(() => {
+        tokenomicsStore.progressListenerPromise = null;
+      });
   }
 
-  tokenomicsStore.progressListenerPromise = listen(TOKENOMICS_SCAN_PROGRESS_EVENT, (event) => {
-    const payload = event.payload || null;
-    updateTokenomicsStore({ scanProgress: payload });
-    if (payload?.summary) {
-      mergeSummaryIntoTokenomicsStore(payload.summary);
-    }
-    const summaryDelta = payload?.summary_delta || payload?.summaryDelta;
-    if (summaryDelta) {
-      mergeSummaryDeltaIntoTokenomicsStore(summaryDelta);
-    }
-  })
-    .then((handler) => {
-      tokenomicsStore.progressUnlisten = handler;
+  if (!tokenomicsStore.updatedUnlisten && !tokenomicsStore.updatedListenerPromise) {
+    tokenomicsStore.updatedListenerPromise = listen(TOKENOMICS_UPDATED_EVENT, () => {
+      void refreshTokenomicsSummaryIfStale({ force: true });
     })
-    .catch(() => {})
-    .finally(() => {
-      tokenomicsStore.progressListenerPromise = null;
-    });
+      .then((handler) => {
+        tokenomicsStore.updatedUnlisten = handler;
+      })
+      .catch(() => {})
+      .finally(() => {
+        tokenomicsStore.updatedListenerPromise = null;
+      });
+  }
 }
 
 function refreshTokenomicsLiveLimits({ force = false, forceProviderRefresh = false, syncLimitChanges = false } = {}) {
@@ -2967,9 +2981,6 @@ function refreshTokenomicsSummaryIfStale({ force = false } = {}) {
 }
 
 function refreshVisibleTokenomicsLimits({ force = false, forceProviderRefresh = false } = {}) {
-  if (!tokenomicsViewCanRefresh()) {
-    return Promise.resolve(tokenomicsStore.state.summary);
-  }
   return refreshTokenomicsLiveLimits({ force, forceProviderRefresh, syncLimitChanges: true })
     .finally(() => {
       void refreshTokenomicsSummaryIfStale();
@@ -3118,12 +3129,6 @@ export function warmAccountTokenomics({ accountKey = "", scan = false } = {}) {
   }
 
   return summaryPromise;
-}
-
-function tokenomicsViewCanRefresh() {
-  if (typeof document === "undefined") return true;
-  return document.visibilityState !== "hidden"
-    && (typeof document.hasFocus !== "function" || document.hasFocus());
 }
 
 function startTokenomicsViewPolling() {

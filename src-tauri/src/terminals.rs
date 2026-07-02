@@ -13603,7 +13603,9 @@ fn terminal_activity_hook_session_id_mismatches_busy_runtime(
         (payload_session_id, runtime_session_id),
         (Some(payload_session_id), Some(runtime_session_id))
             if payload_session_id != runtime_session_id
-    )
+    ) || (payload_session_id.is_none()
+        && runtime_session_id.is_some()
+        && terminal_activity_hook_is_idle_stop_payload(payload))
 }
 
 fn terminal_activity_hook_should_quiesce_idle(
@@ -13625,6 +13627,380 @@ fn terminal_activity_hook_should_quiesce_idle(
             terminal_activity_hook_name_key(&payload.hook_event_name).as_str(),
             "stop" | "turnstop" | "assistantstop"
         )
+}
+
+fn terminal_activity_hook_should_skip_todo_settlement(event: &Value, source: &str) -> bool {
+    let source = source.trim().to_ascii_lowercase();
+    terminal_activity_hook_startup_idle_candidate(event)
+        || terminal_activity_hook_startup_idle_buffered(event)
+        || source == "startup-idle-buffer"
+        || source == "backend-startup-prompt-ready"
+        || event
+            .get("source")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .is_some_and(|value| value.eq_ignore_ascii_case("backend-startup-prompt-ready"))
+}
+
+#[derive(Clone)]
+struct PendingTerminalFinalStopCandidate {
+    generation: u64,
+    session_id: String,
+    turn_id: String,
+    event: Value,
+}
+
+static TERMINAL_PENDING_FINAL_STOPS: OnceLock<
+    StdMutex<HashMap<String, PendingTerminalFinalStopCandidate>>,
+> = OnceLock::new();
+static TERMINAL_PENDING_FINAL_STOP_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+fn terminal_pending_final_stops(
+) -> &'static StdMutex<HashMap<String, PendingTerminalFinalStopCandidate>> {
+    TERMINAL_PENDING_FINAL_STOPS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn terminal_pending_final_stop_key(pane_id: &str, instance_id: u64) -> String {
+    format!("{pane_id}:{instance_id}")
+}
+
+fn terminal_activity_payload_session_id(payload: &TerminalActivityHookPayload) -> String {
+    payload
+        .provider_session_id
+        .as_deref()
+        .or(payload.native_session_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn terminal_activity_runtime_session_id(runtime: &TerminalRuntimeSnapshot) -> String {
+    runtime
+        .provider_session_id
+        .as_deref()
+        .or(runtime.native_session_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn terminal_activity_payload_turn_id(payload: &TerminalActivityHookPayload) -> String {
+    payload
+        .turn_id
+        .as_deref()
+        .or(payload.provider_turn_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn terminal_activity_runtime_turn_id(runtime: &TerminalRuntimeSnapshot) -> String {
+    runtime
+        .turn_id
+        .as_deref()
+        .or(runtime.provider_turn_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+fn terminal_activity_hook_is_idle_stop_payload(payload: &TerminalActivityHookPayload) -> bool {
+    terminal_activity_payload_is_idle_ready(payload)
+        && matches!(
+            terminal_activity_hook_name_key(&payload.hook_event_name).as_str(),
+            "stop" | "turnstop" | "assistantstop"
+        )
+}
+
+fn terminal_pending_final_stop_activity_matches(
+    candidate: &PendingTerminalFinalStopCandidate,
+    runtime: &TerminalRuntimeSnapshot,
+    payload: &TerminalActivityHookPayload,
+) -> bool {
+    let payload_session_id = terminal_activity_payload_session_id(payload);
+    let runtime_session_id = terminal_activity_runtime_session_id(runtime);
+    let session_id = if payload_session_id.is_empty() {
+        runtime_session_id.as_str()
+    } else {
+        payload_session_id.as_str()
+    };
+    if !candidate.session_id.is_empty()
+        && !session_id.is_empty()
+        && candidate.session_id != session_id
+    {
+        return false;
+    }
+
+    let payload_turn_id = terminal_activity_payload_turn_id(payload);
+    let runtime_turn_id = terminal_activity_runtime_turn_id(runtime);
+    let turn_id = if payload_turn_id.is_empty() {
+        runtime_turn_id.as_str()
+    } else {
+        payload_turn_id.as_str()
+    };
+    candidate.turn_id.is_empty() || turn_id.is_empty() || candidate.turn_id == turn_id
+}
+
+fn terminal_activity_hook_cancels_pending_final_stop(
+    payload: &TerminalActivityHookPayload,
+) -> bool {
+    let hook_key = terminal_activity_hook_name_key(&payload.hook_event_name);
+    terminal_activity_hook_is_prompt_submit_key(&hook_key)
+        || matches!(
+            terminal_projection_text(&payload.event_type, "").as_str(),
+            "provider_turn_error"
+                | "provider-turn-error"
+                | "provider_turn_interrupted"
+                | "provider-turn-interrupted"
+                | "provider_permission_requested"
+                | "provider-permission-requested"
+                | "provider_user_prompt_started"
+                | "provider-user-prompt-started"
+        )
+        || matches!(
+            hook_key.as_str(),
+            "error"
+                | "turnerror"
+                | "assistantturnerror"
+                | "stopfailure"
+                | "interrupt"
+                | "interrupted"
+                | "turninterrupt"
+                | "turninterrupted"
+                | "assistantinterrupt"
+                | "assistantturninterrupted"
+                | "userinterrupt"
+                | "userinterrupted"
+                | "permissionrequest"
+                | "userpromptrequired"
+                | "manualprompt"
+                | "permissionprompt"
+                | "permissionpromptstarted"
+                | "userinputrequired"
+                | "userinputrequested"
+                | "userpromptstarted"
+                | "elicitation"
+        )
+}
+
+fn terminal_activity_hook_idle_stop_already_settled(
+    payload: &TerminalActivityHookPayload,
+    current_runtime: &TerminalRuntimeSnapshot,
+    current_runtime_is_busy_turn: bool,
+) -> bool {
+    if current_runtime_is_busy_turn || !terminal_activity_hook_is_idle_stop_payload(payload) {
+        return false;
+    }
+    let runtime_session_id = terminal_activity_runtime_session_id(current_runtime);
+    let payload_session_id = terminal_activity_payload_session_id(payload);
+    if !runtime_session_id.is_empty()
+        && (!payload_session_id.is_empty() && payload_session_id != runtime_session_id
+            || payload_session_id.is_empty())
+    {
+        return true;
+    }
+    let runtime_turn_id = terminal_activity_runtime_turn_id(current_runtime);
+    let payload_turn_id = terminal_activity_payload_turn_id(payload);
+    !runtime_turn_id.is_empty()
+        && (!payload_turn_id.is_empty() && payload_turn_id == runtime_turn_id
+            || payload_turn_id.is_empty())
+}
+
+fn terminal_activity_hook_update_pending_final_stop_for_activity(
+    pane_id: &str,
+    instance_id: u64,
+    runtime: &TerminalRuntimeSnapshot,
+    payload: &TerminalActivityHookPayload,
+    source: &str,
+) {
+    if terminal_activity_hook_is_idle_stop_payload(payload) {
+        return;
+    }
+    let key = terminal_pending_final_stop_key(pane_id, instance_id);
+    let Ok(mut pending) = terminal_pending_final_stops().lock() else {
+        return;
+    };
+    let Some(candidate) = pending.get_mut(&key) else {
+        return;
+    };
+    if terminal_activity_hook_cancels_pending_final_stop(payload)
+        || !terminal_pending_final_stop_activity_matches(candidate, runtime, payload)
+    {
+        pending.remove(&key);
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.pending_final_stop_cancelled",
+            json!({
+                "hook_event_name": payload.hook_event_name.clone(),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "reason": "new_turn_or_mismatch",
+                "source": source,
+            }),
+        );
+        return;
+    }
+    candidate.generation = TERMINAL_PENDING_FINAL_STOP_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    log_terminal_status_event(
+        "backend.terminal_activity_hook.pending_final_stop_extended",
+        json!({
+            "buffer_ms": TERMINAL_ACTIVITY_IDLE_QUIESCE_MS,
+            "hook_event_name": payload.hook_event_name.clone(),
+            "instance_id": instance_id,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "source": source,
+        }),
+    );
+}
+
+fn terminal_activity_hook_buffer_final_stop_candidate(
+    app: &AppHandle,
+    terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
+    cloud_mcp_state: &CloudMcpState,
+    pane_id: &str,
+    instance_id: u64,
+    current_runtime: &TerminalRuntimeSnapshot,
+    event: &Value,
+    payload: &TerminalActivityHookPayload,
+    source: &str,
+) {
+    let key = terminal_pending_final_stop_key(pane_id, instance_id);
+    let generation = TERMINAL_PENDING_FINAL_STOP_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    let session_id = {
+        let payload_session_id = terminal_activity_payload_session_id(payload);
+        if payload_session_id.is_empty() {
+            terminal_activity_runtime_session_id(current_runtime)
+        } else {
+            payload_session_id
+        }
+    };
+    let turn_id = {
+        let payload_turn_id = terminal_activity_payload_turn_id(payload);
+        if payload_turn_id.is_empty() {
+            terminal_activity_runtime_turn_id(current_runtime)
+        } else {
+            payload_turn_id
+        }
+    };
+    let mut buffered_event = event.clone();
+    if let Some(object) = buffered_event.as_object_mut() {
+        object.insert("terminalIdleQuiesceBuffered".to_string(), json!(true));
+        object.insert("codexIdleQuiesceBuffered".to_string(), json!(true));
+    }
+    if let Ok(mut pending) = terminal_pending_final_stops().lock() {
+        pending.insert(
+            key.clone(),
+            PendingTerminalFinalStopCandidate {
+                generation,
+                session_id,
+                turn_id,
+                event: buffered_event,
+            },
+        );
+    }
+    log_terminal_status_event(
+        "backend.terminal_activity_hook.idle_quiesce_buffered",
+        json!({
+            "buffer_ms": TERMINAL_ACTIVITY_IDLE_QUIESCE_MS,
+            "hook_event_name": payload.hook_event_name.clone(),
+            "instance_id": instance_id,
+            "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+            "source": source,
+        }),
+    );
+    let app = app.clone();
+    let terminals = Arc::clone(terminals);
+    let cloud_mcp_state = cloud_mcp_state.clone();
+    let pane_id = pane_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(TERMINAL_ACTIVITY_IDLE_QUIESCE_MS)).await;
+        let candidate = {
+            let Ok(mut pending) = terminal_pending_final_stops().lock() else {
+                return;
+            };
+            let Some(candidate) = pending.get(&key) else {
+                return;
+            };
+            if candidate.generation != generation {
+                return;
+            }
+            pending.remove(&key)
+        };
+        let Some(candidate) = candidate else {
+            return;
+        };
+        let Some(current_instance) =
+            terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
+        else {
+            return;
+        };
+        let runtime = terminal_runtime_snapshot(&current_instance);
+        if runtime.input_ready || !terminal_runtime_snapshot_is_busy_turn(&runtime) {
+            log_terminal_status_event(
+                "backend.terminal_activity_hook.idle_quiesce_cancelled",
+                json!({
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "reason": "already_settled",
+                }),
+            );
+            return;
+        }
+        let runtime_session_id = terminal_activity_runtime_session_id(&runtime);
+        if !candidate.session_id.is_empty()
+            && !runtime_session_id.is_empty()
+            && candidate.session_id != runtime_session_id
+        {
+            log_terminal_status_event(
+                "backend.terminal_activity_hook.idle_quiesce_cancelled",
+                json!({
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "reason": "session_changed",
+                }),
+            );
+            return;
+        }
+        let runtime_turn_id = terminal_activity_runtime_turn_id(&runtime);
+        if !candidate.turn_id.is_empty()
+            && !runtime_turn_id.is_empty()
+            && candidate.turn_id != runtime_turn_id
+        {
+            log_terminal_status_event(
+                "backend.terminal_activity_hook.idle_quiesce_cancelled",
+                json!({
+                    "instance_id": instance_id,
+                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                    "reason": "turn_changed",
+                }),
+            );
+            return;
+        }
+        let Some(delayed_payload) =
+            terminal_activity_hook_payload(&current_instance, &candidate.event)
+        else {
+            return;
+        };
+        let delayed_architecture_payload =
+            terminal_architecture_activity_payload(&current_instance, &candidate.event);
+        apply_terminal_activity_hook_payload(
+            &app,
+            &terminals,
+            &cloud_mcp_state,
+            &current_instance,
+            &candidate.event,
+            delayed_payload,
+            delayed_architecture_payload,
+            "terminal-idle-quiesce",
+        );
+    });
 }
 
 fn apply_terminal_activity_hook_payload(
@@ -13718,7 +14094,20 @@ fn apply_terminal_activity_hook_payload(
         )
         .await;
     });
-    todo_dispatch_observe_activity_hook(app, &payload);
+    if terminal_activity_hook_should_skip_todo_settlement(event, source) {
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.todo_settlement_skipped",
+            json!({
+                "hook_event_name": payload.hook_event_name.clone(),
+                "instance_id": payload.instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&payload.pane_id),
+                "reason": "startup_derived",
+                "source": source,
+            }),
+        );
+    } else {
+        todo_dispatch_observe_activity_hook(app, &payload);
+    }
     terminal_hook_prompt_submitted_observe(app, instance, &payload);
     terminal_native_plan_capture_observe(instance, event, &payload);
     let _ = app.emit(TERMINAL_ACTIVITY_HOOK_EVENT, payload);
@@ -13815,6 +14204,24 @@ async fn process_terminal_activity_hook_event(
         );
         return;
     }
+    if terminal_activity_hook_idle_stop_already_settled(
+        &payload,
+        &current_runtime,
+        current_runtime_is_busy_turn,
+    ) {
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.duplicate_idle_stop_ignored",
+            json!({
+                "hook_event_name": payload.hook_event_name.clone(),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "payload_provider_session_id": payload.provider_session_id.clone(),
+                "runtime_provider_session_id": current_runtime.provider_session_id.clone(),
+                "source": source,
+            }),
+        );
+        return;
+    }
     if !terminal_activity_hook_startup_idle_buffered(event)
         && current_runtime_is_starting
         && terminal_activity_payload_is_idle_ready(&payload)
@@ -13889,70 +14296,26 @@ async fn process_terminal_activity_hook_event(
         current_runtime_is_starting,
         current_runtime_is_busy_turn,
     ) {
-        let scheduled_runtime_fingerprint =
-            terminal_runtime_startup_idle_fingerprint(&current_runtime);
-        let app = app.clone();
-        let terminals = Arc::clone(terminals);
-        let cloud_mcp_state = cloud_mcp_state.clone();
-        let pane_id = pane_id.to_string();
-        let mut buffered_event = event.clone();
-        if let Some(object) = buffered_event.as_object_mut() {
-            object.insert("terminalIdleQuiesceBuffered".to_string(), json!(true));
-            object.insert("codexIdleQuiesceBuffered".to_string(), json!(true));
-        }
-        log_terminal_status_event(
-            "backend.terminal_activity_hook.idle_quiesce_buffered",
-            json!({
-                "buffer_ms": TERMINAL_ACTIVITY_IDLE_QUIESCE_MS,
-                "hook_event_name": payload.hook_event_name.clone(),
-                "instance_id": instance_id,
-                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                "source": source,
-            }),
+        terminal_activity_hook_buffer_final_stop_candidate(
+            app,
+            terminals,
+            cloud_mcp_state,
+            pane_id,
+            instance_id,
+            &current_runtime,
+            event,
+            &payload,
+            source,
         );
-        tauri::async_runtime::spawn(async move {
-            sleep(Duration::from_millis(TERMINAL_ACTIVITY_IDLE_QUIESCE_MS)).await;
-            let Some(current_instance) =
-                terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
-            else {
-                return;
-            };
-            let runtime = terminal_runtime_snapshot(&current_instance);
-            if runtime.input_ready
-                || !terminal_runtime_snapshot_is_busy_turn(&runtime)
-                || terminal_runtime_startup_idle_fingerprint(&runtime)
-                    != scheduled_runtime_fingerprint
-            {
-                log_terminal_status_event(
-                    "backend.terminal_activity_hook.idle_quiesce_cancelled",
-                    json!({
-                        "instance_id": instance_id,
-                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                        "reason": "runtime_changed",
-                    }),
-                );
-                return;
-            }
-            let Some(delayed_payload) =
-                terminal_activity_hook_payload(&current_instance, &buffered_event)
-            else {
-                return;
-            };
-            let delayed_architecture_payload =
-                terminal_architecture_activity_payload(&current_instance, &buffered_event);
-            apply_terminal_activity_hook_payload(
-                &app,
-                &terminals,
-                &cloud_mcp_state,
-                &current_instance,
-                &buffered_event,
-                delayed_payload,
-                delayed_architecture_payload,
-                "codex-idle-quiesce",
-            );
-        });
         return;
     }
+    terminal_activity_hook_update_pending_final_stop_for_activity(
+        pane_id,
+        instance_id,
+        &current_runtime,
+        &payload,
+        source,
+    );
     apply_terminal_activity_hook_payload(
         app,
         terminals,
@@ -19098,6 +19461,130 @@ mod terminal_tests {
         ));
         assert!(!terminal_activity_hook_session_id_mismatches_busy_runtime(
             &child_idle_payload,
+            &runtime,
+            false,
+        ));
+    }
+
+    #[test]
+    fn busy_runtime_rejects_idle_completion_without_session() {
+        let runtime = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: Some("session-main".to_string()),
+            native_session_id: Some("session-main".to_string()),
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            source: "cli-hook:provider-turn-started".to_string(),
+            event_type: "provider-turn-started".to_string(),
+            hook_event_name: "UserPromptSubmit".to_string(),
+            updated_at_ms: 1,
+        };
+        let missing_session_idle_payload = terminal_activity_hook_test_payload(
+            "provider-turn-completed",
+            "idle",
+            "completed",
+            true,
+            None,
+        );
+
+        assert!(terminal_activity_hook_session_id_mismatches_busy_runtime(
+            &missing_session_idle_payload,
+            &runtime,
+            true,
+        ));
+    }
+
+    #[test]
+    fn same_turn_activity_matches_pending_final_stop() {
+        let runtime = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: Some("session-main".to_string()),
+            native_session_id: Some("session-main".to_string()),
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            source: "cli-hook:provider-turn-started".to_string(),
+            event_type: "provider-turn-started".to_string(),
+            hook_event_name: "UserPromptSubmit".to_string(),
+            updated_at_ms: 1,
+        };
+        let candidate = PendingTerminalFinalStopCandidate {
+            generation: 1,
+            session_id: "session-main".to_string(),
+            turn_id: "turn-1".to_string(),
+            event: json!({}),
+        };
+        let mut tool_payload = terminal_activity_hook_test_payload(
+            "provider-tool-completed",
+            "thinking",
+            "tool_completed",
+            false,
+            Some("session-main"),
+        );
+        tool_payload.hook_event_name = "PostToolUse".to_string();
+        tool_payload.turn_id = Some("turn-1".to_string());
+        tool_payload.provider_turn_id = Some("turn-1".to_string());
+
+        assert!(terminal_pending_final_stop_activity_matches(
+            &candidate,
+            &runtime,
+            &tool_payload,
+        ));
+
+        tool_payload.turn_id = Some("turn-2".to_string());
+        tool_payload.provider_turn_id = Some("turn-2".to_string());
+        assert!(!terminal_pending_final_stop_activity_matches(
+            &candidate,
+            &runtime,
+            &tool_payload,
+        ));
+    }
+
+    #[test]
+    fn duplicate_idle_stop_is_ignored_after_settle() {
+        let runtime = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "idle".to_string(),
+            command_phase: "completed".to_string(),
+            input_ready: true,
+            input_ready_at: Some("2026-07-02T00:00:00Z".to_string()),
+            prompt_ready_at: None,
+            completed_at: Some("2026-07-02T00:00:00Z".to_string()),
+            provider_session_id: Some("session-main".to_string()),
+            native_session_id: Some("session-main".to_string()),
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            source: "cli-hook:provider-turn-completed".to_string(),
+            event_type: "provider-turn-completed".to_string(),
+            hook_event_name: "Stop".to_string(),
+            updated_at_ms: 1,
+        };
+        let mut duplicate = terminal_activity_hook_test_payload(
+            "provider-turn-completed",
+            "idle",
+            "completed",
+            true,
+            Some("session-main"),
+        );
+        duplicate.turn_id = Some("turn-1".to_string());
+        duplicate.provider_turn_id = Some("turn-1".to_string());
+
+        assert!(terminal_activity_hook_idle_stop_already_settled(
+            &duplicate,
             &runtime,
             false,
         ));

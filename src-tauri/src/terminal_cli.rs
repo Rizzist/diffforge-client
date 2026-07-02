@@ -4757,7 +4757,7 @@ export const DiffForgeActivityPlugin = async () => {
   // emit `Stop` for a session we actually observed a prompt for. Keyed by
   // session id (not a single flag) because OpenCode fires session.idle for
   // sub-sessions too.
-  const activeSessions = new Set();
+  const activeSessions = new Map();
   const completedAssistantMessages = new Set();
   const pendingStopTimers = new Map();
   const partKinds = new Map();
@@ -4769,29 +4769,63 @@ export const DiffForgeActivityPlugin = async () => {
       pendingStopTimers.delete(sessionId);
     }
   };
-  const emitStop = (sessionId, extra = {}) => {
+  const activeTurn = (sessionId) => {
+    if (!sessionId) return null;
+    const turn = activeSessions.get(sessionId);
+    return turn && !turn.settled ? turn : null;
+  };
+  const startTurn = (sessionId) => {
+    if (!sessionId) return null;
     cancelPendingStop(sessionId);
-    const hadActiveSession = activeSessions.has(sessionId);
-    activeSessions.delete(sessionId);
+    const previous = activeSessions.get(sessionId) || {};
+    const next = {
+      settled: false,
+      turn_id: (previous.turn_id || 0) + 1,
+      pending_extra: {},
+    };
+    activeSessions.set(sessionId, next);
+    return next;
+  };
+  const noteActivity = (sessionId) => {
+    if (activeTurn(sessionId)) cancelPendingStop(sessionId);
+  };
+  const rememberStopCandidate = (sessionId, extra = {}) => {
+    const turn = activeTurn(sessionId);
+    if (!turn) return null;
+    turn.pending_extra = {
+      ...(turn.pending_extra || {}),
+      ...(extra || {}),
+    };
+    activeSessions.set(sessionId, turn);
+    return turn;
+  };
+  const emitStop = (sessionId, extra = {}) => {
+    if (!sessionId) return;
+    const turn = activeTurn(sessionId);
+    if (!turn) return;
+    cancelPendingStop(sessionId);
+    turn.settled = true;
+    activeSessions.set(sessionId, turn);
     const rememberedAssistantText = sessionId ? lastAssistantTextBySession.get(sessionId) : "";
+    const stopExtra = {
+      ...(turn.pending_extra || {}),
+      ...(extra || {}),
+    };
     emit({
       hook_event_name: "Stop",
       session_id: sessionId,
-      startup_idle_candidate: !hadActiveSession,
-      session_idle_without_prompt: !hadActiveSession,
+      startup_idle_candidate: false,
+      session_idle_without_prompt: false,
       ...(rememberedAssistantText
-        && !extra.assistant_message
-        && !extra.assistant_message_snapshot
+        && !stopExtra.assistant_message
+        && !stopExtra.assistant_message_snapshot
         ? { assistant_message_snapshot: rememberedAssistantText }
         : {}),
-      ...extra,
+      ...stopExtra,
     });
   };
   const scheduleStop = (sessionId, extra = {}) => {
-    if (!sessionId) {
-      emitStop(sessionId, extra);
-      return;
-    }
+    if (!sessionId || !rememberStopCandidate(sessionId, extra)) return;
     cancelPendingStop(sessionId);
     const timer = setTimeout(() => {
       pendingStopTimers.delete(sessionId);
@@ -4802,9 +4836,8 @@ export const DiffForgeActivityPlugin = async () => {
   return {
     "chat.message": async (input, output) => {
       const sessionId = (input && input.sessionID) || "";
-      cancelPendingStop(sessionId);
+      startTurn(sessionId);
       clearAssistantTextForSession(sessionId);
-      activeSessions.add(sessionId);
       emit({
         hook_event_name: "UserPromptSubmit",
         session_id: sessionId,
@@ -4812,7 +4845,7 @@ export const DiffForgeActivityPlugin = async () => {
       });
     },
     "tool.execute.before": async (input, output) => {
-      cancelPendingStop((input && input.sessionID) || "");
+      noteActivity((input && input.sessionID) || "");
       emit({
         hook_event_name: "PreToolUse",
         session_id: (input && input.sessionID) || "",
@@ -4822,7 +4855,7 @@ export const DiffForgeActivityPlugin = async () => {
       });
     },
     "tool.execute.after": async (input) => {
-      cancelPendingStop((input && input.sessionID) || "");
+      noteActivity((input && input.sessionID) || "");
       emit({
         hook_event_name: "PostToolUse",
         session_id: (input && input.sessionID) || "",
@@ -4831,7 +4864,7 @@ export const DiffForgeActivityPlugin = async () => {
       });
     },
     "permission.ask": async (input) => {
-      cancelPendingStop((input && input.sessionID) || "");
+      noteActivity((input && input.sessionID) || "");
       // Fires only when OpenCode actually needs a decision (auto-allowed tools
       // never ask), so surface it as a manual-approval attention event. We do
       // not touch `output` — OpenCode's own permission config decides.
@@ -4856,7 +4889,7 @@ export const DiffForgeActivityPlugin = async () => {
       const sessionId = eventSessionId(event);
       const props = (event && event.properties) || {};
       if (type === "message.updated" || type === "message.created") {
-        cancelPendingStop(sessionId);
+        noteActivity(sessionId);
         const message = props.message || props.info || {};
         const role = String(message.role || message.type || "").toLowerCase();
         if (role === "user") {
@@ -4869,7 +4902,8 @@ export const DiffForgeActivityPlugin = async () => {
               if (completionKey) completedAssistantMessages.add(completionKey);
               const completedText = pickText(message.parts || message.content || []);
               rememberAssistantText(sessionId, (message && (message.id || message.messageID || message.messageId)) || "", completedText, true);
-              emitStop(sessionId, completedText ? {
+              scheduleStop(sessionId, completedText ? {
+                opencode_idle_source: type,
                 assistant_message_snapshot: completedText,
               } : {});
             }
@@ -4877,7 +4911,7 @@ export const DiffForgeActivityPlugin = async () => {
         }
       }
       if (type === "message.part.updated") {
-        cancelPendingStop(sessionId);
+        noteActivity(sessionId);
         const part = props.part || {};
         const kind = textualPartKind(part);
         const id = (part && (part.id || part.partID || part.partId)) || props.partID || props.partId || "";
@@ -4887,7 +4921,7 @@ export const DiffForgeActivityPlugin = async () => {
         emitPartText(sessionId, kind, partText(part), true, messageId, id);
       }
       if (type === "message.part.delta") {
-        cancelPendingStop(sessionId);
+        noteActivity(sessionId);
         const id = props.partID || props.partId || "";
         const messageId = messageIdForPart(props, null);
         const key = partKey(sessionId, messageId, id);
@@ -4899,14 +4933,14 @@ export const DiffForgeActivityPlugin = async () => {
         }
       }
       if (type === "session.compacted" || type === "session.compacting") {
-        cancelPendingStop(sessionId);
+        noteActivity(sessionId);
         emit({
           hook_event_name: type === "session.compacting" ? "PreCompact" : "PostCompact",
           session_id: sessionId,
         });
       }
       if (type === "permission.asked") {
-        cancelPendingStop(sessionId);
+        noteActivity(sessionId);
         emit({
           hook_event_name: "PermissionRequest",
           session_id: sessionId,
@@ -4924,7 +4958,7 @@ export const DiffForgeActivityPlugin = async () => {
         });
       }
       if (type === "question.ask" || type === "question.asked" || type === "selection.ask" || type === "selection.asked") {
-        cancelPendingStop(sessionId);
+        noteActivity(sessionId);
         const promptId = props.id || props.questionID || props.questionId || props.promptID || props.promptId || props.selectionID || props.selectionId || "";
         emit({
           hook_event_name: "UserPromptRequired",
@@ -4953,15 +4987,19 @@ export const DiffForgeActivityPlugin = async () => {
         if (statusValue === "idle" || statusValue === "cooldown") {
           scheduleStop(sessionId, { opencode_idle_source: "session.status" });
         } else if (statusValue) {
-          cancelPendingStop(sessionId);
+          noteActivity(sessionId);
         }
       }
       if (type === "session.idle") {
         scheduleStop(sessionId, { opencode_idle_source: "session.idle" });
       } else if (type === "session.error") {
         cancelPendingStop(sessionId);
-        activeSessions.delete(sessionId);
-        emit({ hook_event_name: "StopFailure", session_id: sessionId });
+        const turn = activeTurn(sessionId);
+        if (turn) {
+          turn.settled = true;
+          activeSessions.set(sessionId, turn);
+          emit({ hook_event_name: "StopFailure", session_id: sessionId });
+        }
       }
     },
   };

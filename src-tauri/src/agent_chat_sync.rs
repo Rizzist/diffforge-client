@@ -2452,6 +2452,7 @@ fn agent_chat_session_sync_backfill_workspace_history(
     }
     tauri::async_runtime::spawn(async move {
         let request = WorkspaceAgentSessionHistoryListRequest {
+            fast: Some(false),
             workspace_id,
             root_directory,
             limit: Some(AGENT_CHAT_SESSION_HISTORY_BACKFILL_LIMIT),

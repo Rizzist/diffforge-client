@@ -21,12 +21,17 @@ static TODO_DISPATCH_RECEIPTS_CACHE: OnceLock<StdMutex<HashMap<String, Value>>> 
 static TODO_DISPATCH_DRAIN_NOTIFIED_AT: OnceLock<StdMutex<HashMap<String, u64>>> = OnceLock::new();
 static TODO_DISPATCH_ATTENTION_NOTIFIED_AT: OnceLock<StdMutex<HashMap<String, u64>>> =
     OnceLock::new();
+static TODO_DISPATCH_APP_STARTED_MS: OnceLock<u64> = OnceLock::new();
 
 fn todo_dispatch_now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+fn todo_dispatch_app_started_ms() -> u64 {
+    *TODO_DISPATCH_APP_STARTED_MS.get_or_init(todo_dispatch_now_ms)
 }
 
 fn todo_dispatch_text(value: &Value, keys: &[&str]) -> String {
@@ -514,6 +519,8 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let notify_completion_is_fresh =
+        status != "completed" || todo_dispatch_completed_receipt_fresh_for_notification(&Value::Object(merged.clone()));
 
     let mut next = current.clone();
     if let Some(object) = next.as_object_mut() {
@@ -528,7 +535,7 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
             TODO_DISPATCH_RECEIPTS_UPDATED_EVENT,
             todo_dispatch_receipts_payload(workspace_id, &next, reason),
         );
-        if before_active > 0 && after_active == 0 && status == "completed" {
+        if before_active > 0 && after_active == 0 && status == "completed" && notify_completion_is_fresh {
             todo_dispatch_maybe_notify_drained(app, workspace_id, &workspace_name, &last_text);
         }
     }
@@ -662,7 +669,7 @@ fn todo_dispatch_remote_intake_success_outcome(
     reason: &str,
 ) -> Value {
     json!({
-        "status": "completed",
+        "status": "queued",
         "message": "Remote todo intent was accepted by Rust.",
         "details": {
             "reason": reason,
@@ -751,10 +758,24 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
         ],
     );
     let origin_workspace_id = todo_dispatch_text(event, &["origin_workspace_id", "originWorkspaceId"]);
+    let webview_dispatcher_active = todo_dispatch_webview_dispatcher_active();
+    let lifecycle_owner = if webview_dispatcher_active {
+        "webview"
+    } else {
+        "rust"
+    };
+    let remote_intake_source = if webview_dispatcher_active {
+        "remote_intake_webview"
+    } else {
+        "remote_intake_headless"
+    };
     let receipt = json!({
         "commandId": command_id,
         "itemId": command_id,
         "originDeviceId": origin_device_id,
+        "remoteIntake": true,
+        "remote_intake": true,
+        "source": remote_intake_source,
         "status": intake_status,
         "text": text.chars().take(180).collect::<String>(),
         "workspaceName": workspace_name.clone(),
@@ -1103,13 +1124,12 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         "originWorkspaceId".to_string(),
                                         json!(origin_workspace_id.clone()),
                                     );
-                                    remote_object.insert(
-                                        "source".to_string(),
-                                        json!("remote_intake_headless"),
-                                    );
+                                    remote_object
+                                        .insert("source".to_string(), json!(remote_intake_source));
                                 }
                             }
                             todo_store_set_item_status(existing, intake_status, "remote_todo_intake");
+                            todo_store_set_item_lifecycle_owner(existing, lifecycle_owner);
                             changed_item = Some(existing.clone());
                             changed_kind = "remote_todo_updated";
                         }
@@ -1170,7 +1190,7 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                         "reasoningEffort": requested_reasoning_effort.clone(),
                         "effort": requested_reasoning_effort.clone(),
                         "speed": requested_speed.clone(),
-                        "remoteCommand": {
+	                        "remoteCommand": {
                             "commandId": command_id,
                             "todoId": todo_id,
                             "targetTerminalId": target_terminal_id,
@@ -1190,9 +1210,13 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                             "reasoningEffort": requested_reasoning_effort.clone(),
                             "effort": requested_reasoning_effort,
                             "speed": requested_speed,
-                            "source": "remote_intake_headless",
-                        },
-                    });
+	                            "source": remote_intake_source,
+	                        },
+                            "lifecycleOwner": lifecycle_owner,
+                            "lifecycle_owner": lifecycle_owner,
+                            "rustOwned": lifecycle_owner == "rust",
+                            "rust_owned": lifecycle_owner == "rust",
+	                    });
                     items.push(item.clone());
                     changed_item = Some(item);
                 }
@@ -1404,6 +1428,7 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
         let active = entries
             .iter()
             .filter(|(_, receipt)| todo_dispatch_receipt_active_for_settlement(receipt))
+            .filter(|(_, receipt)| todo_dispatch_receipt_submitted_after_app_start(receipt))
             .map(|(command_id, receipt)| {
                 let receipt_pane_id = receipt
                     .get("paneId")
@@ -1480,7 +1505,8 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
     let (command_id, receipt, match_source) = if let Some(matched) = matched {
         matched
     } else {
-        let queue_candidates = todo_dispatch_active_queue_item_ids_for_pane(&workspace_id, pane_id);
+        let queue_candidates =
+            todo_dispatch_fresh_active_queue_item_ids_for_pane(&workspace_id, pane_id);
         let Some(command_id) = queue_candidates.first().cloned() else {
             log_terminal_status_event(
                 "backend.todo_dispatch.hook_settle_skip",
@@ -1511,6 +1537,18 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
     let mut update = receipt;
     if let Some(object) = update.as_object_mut() {
         object.insert("status".to_string(), json!(settle_status));
+        if settle_status == "completed" {
+            let completed_at = payload
+                .completed_at
+                .as_deref()
+                .or(payload.input_ready_at.as_deref())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(chrono_like_now_iso);
+            object.insert("completedAt".to_string(), json!(completed_at.clone()));
+            object.insert("todoCompletedAt".to_string(), json!(completed_at));
+        }
         if object
             .get("workspaceName")
             .and_then(Value::as_str)
@@ -1879,11 +1917,8 @@ async fn todo_dispatch_finish_startup_reconciliation(app: &AppHandle, reason: &s
         return;
     }
     let changed = todo_store_startup_reconcile_finalize_queues(app).await;
-    let marked_receipts = if reason == "startup_reconcile_timeout" {
-        todo_dispatch_mark_active_receipts_interrupted(Some(app), "app_crash_recovered")
-    } else {
-        0
-    };
+    let marked_receipts =
+        todo_dispatch_mark_active_receipts_interrupted(Some(app), "app_crash_recovered");
     log_terminal_status_event(
         "backend.todo_dispatch.startup_reconcile_finish",
         json!({
@@ -1906,6 +1941,7 @@ fn todo_dispatch_note_startup_reconciliation_evidence(app: &AppHandle, reason: &
 
 pub(crate) fn todo_dispatch_begin_startup_reconciliation(app: AppHandle) {
     let now = todo_dispatch_now_ms();
+    let _ = TODO_DISPATCH_APP_STARTED_MS.set(now);
     let until = now.saturating_add(TODO_DISPATCH_STARTUP_RECONCILE_MS);
     TODO_DISPATCH_STARTUP_RECONCILE_STARTED_MS.store(now, Ordering::Release);
     TODO_DISPATCH_STARTUP_RECONCILE_OBSERVED_MS.store(0, Ordering::Release);
@@ -1967,11 +2003,15 @@ fn todo_dispatch_update_terminal_runtime(payload: &TerminalActivityHookPayload) 
             "activityStatus": payload.activity_status.clone(),
             "activity_status": payload.activity_status.clone(),
             "agentId": payload.agent_id.clone(),
+            "agentDisplayName": payload.agent_display_name.clone(),
+            "agent_display_name": payload.agent_display_name.clone(),
             "agentKind": payload.agent_kind.clone(),
             "commandPhase": payload.command_phase.clone(),
             "command_phase": payload.command_phase.clone(),
             "completedAt": payload.completed_at.clone(),
             "completed_at": payload.completed_at.clone(),
+            "displayName": payload.display_name.clone(),
+            "display_name": payload.display_name.clone(),
             "eventType": payload.event_type.clone(),
             "event_type": payload.event_type.clone(),
             "inputReady": payload.input_ready,
@@ -1990,6 +2030,10 @@ fn todo_dispatch_update_terminal_runtime(payload: &TerminalActivityHookPayload) 
             "provider_turn_id": payload.provider_turn_id.clone(),
             "status": payload.status.clone(),
             "terminalIndex": payload.terminal_index,
+            "terminalName": payload.terminal_name.clone(),
+            "terminal_name": payload.terminal_name.clone(),
+            "terminalNickname": payload.terminal_nickname.clone(),
+            "terminal_nickname": payload.terminal_nickname.clone(),
             "threadId": payload.thread_id.clone(),
             "updatedAtMs": now,
             "workspaceId": payload.workspace_id.trim(),
@@ -2732,6 +2776,19 @@ fn todo_store_set_item_status(item: &mut Value, status: &str, reason: &str) {
             }
             _ => {}
         }
+    }
+}
+
+fn todo_store_set_item_lifecycle_owner(item: &mut Value, owner: &str) {
+    let owner = owner.trim();
+    if owner.is_empty() {
+        return;
+    }
+    if let Some(object) = item.as_object_mut() {
+        object.insert("lifecycleOwner".to_string(), json!(owner));
+        object.insert("lifecycle_owner".to_string(), json!(owner));
+        object.insert("rustOwned".to_string(), json!(owner == "rust"));
+        object.insert("rust_owned".to_string(), json!(owner == "rust"));
     }
 }
 
@@ -4927,6 +4984,9 @@ async fn todo_store_set_status(
                     .any(|reference| todo_store_item_matches_id(item, reference))
                 {
                     todo_store_set_item_status(item, &status, &reason);
+                    if status == "queued" {
+                        todo_store_set_item_lifecycle_owner(item, "rust");
+                    }
                     apply_targets(item);
                     matched_item = Some(item.clone());
                     break;
@@ -4967,6 +5027,9 @@ async fn todo_store_set_status(
                     object.insert("workspaceId".to_string(), json!(workspace_id.clone()));
                 }
                 todo_store_set_item_status(&mut item, &status, &reason);
+                if status == "queued" {
+                    todo_store_set_item_lifecycle_owner(&mut item, "rust");
+                }
                 apply_targets(&mut item);
                 item
             }
@@ -6049,6 +6112,40 @@ fn todo_dispatch_receipt_submitted_at_ms(receipt: &Value) -> u64 {
     .unwrap_or(0)
 }
 
+fn todo_dispatch_receipt_completion_at_ms(receipt: &Value) -> u64 {
+    [
+        "todoCompletedAt",
+        "todo_completed_at",
+        "completedAt",
+        "completed_at",
+    ]
+    .iter()
+    .find_map(|key| {
+        receipt
+            .get(*key)
+            .and_then(Value::as_str)
+            .and_then(todo_dispatch_parse_iso_ms)
+    })
+    .or_else(|| receipt.get("completedAtMs").and_then(Value::as_u64))
+    .or_else(|| receipt.get("completed_at_ms").and_then(Value::as_u64))
+    .unwrap_or(0)
+}
+
+fn todo_dispatch_receipt_submitted_after_app_start(receipt: &Value) -> bool {
+    let submitted_at_ms = todo_dispatch_receipt_submitted_at_ms(receipt);
+    submitted_at_ms >= todo_dispatch_app_started_ms().saturating_sub(1_000)
+}
+
+fn todo_dispatch_completed_receipt_fresh_for_notification(receipt: &Value) -> bool {
+    let completed_at_ms = todo_dispatch_receipt_completion_at_ms(receipt);
+    completed_at_ms >= todo_dispatch_app_started_ms().saturating_sub(1_000)
+}
+
+fn todo_dispatch_queue_item_fresh_for_completion_settlement(item: &Value) -> bool {
+    let updated_ms = todo_store_item_updated_ms(item).max(todo_store_item_status_stamp_ms(item));
+    updated_ms >= todo_dispatch_app_started_ms().saturating_sub(1_000)
+}
+
 fn todo_dispatch_active_queue_item_ids_for_pane_from_items(
     items: &[Value],
     pane_id: &str,
@@ -6062,6 +6159,39 @@ fn todo_dispatch_active_queue_item_ids_for_pane_from_items(
         .filter(|item| {
             todo_dispatch_queue_item_active_for_settlement(item)
                 && todo_store_item_pane_id(item) == pane_id
+        })
+        .map(|item| {
+            (
+                todo_store_item_updated_ms(item),
+                todo_dispatch_queue_item_command_id(item),
+            )
+        })
+        .filter(|(_, id)| !id.is_empty())
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|(updated_ms, _)| std::cmp::Reverse(*updated_ms));
+    matches.into_iter().map(|(_, id)| id).collect()
+}
+
+fn todo_dispatch_fresh_active_queue_item_ids_for_pane(
+    workspace_id: &str,
+    pane_id: &str,
+) -> Vec<String> {
+    if workspace_id.trim().is_empty() {
+        return Vec::new();
+    }
+    let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
+        return Vec::new();
+    };
+    let snapshot = todo_dispatch_queue_read(&path);
+    let Some(items) = snapshot.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut matches = items
+        .iter()
+        .filter(|item| {
+            todo_dispatch_queue_item_active_for_settlement(item)
+                && todo_store_item_pane_id(item) == pane_id.trim()
+                && todo_dispatch_queue_item_fresh_for_completion_settlement(item)
         })
         .map(|item| {
             (
@@ -6266,6 +6396,7 @@ fn todo_dispatch_active_queue_item_ids_for_pane_matching(
         .filter(|item| {
             todo_dispatch_queue_item_active_for_settlement(item)
                 && todo_store_item_pane_id(item) == pane_id.trim()
+                && todo_dispatch_queue_item_fresh_for_completion_settlement(item)
                 && todo_dispatch_prompt_identity_matches_value(item, prompt_event_id, prompt_text)
         })
         .map(|item| {
@@ -6500,6 +6631,7 @@ fn todo_dispatch_mark_active_for_pane_completed(
             .iter()
             .filter(|(_, receipt)| {
                 todo_dispatch_receipt_active_for_settlement(receipt)
+                    && todo_dispatch_receipt_submitted_after_app_start(receipt)
                     && todo_dispatch_text(receipt, &["paneId", "pane_id"]) == pane_id
                     && todo_dispatch_prompt_identity_matches_value(
                         receipt,
@@ -6674,6 +6806,66 @@ mod todo_store_tests {
             );
         }
         assert!(!todo_dispatch_remote_command_is_queue_action("asset_track"));
+    }
+
+    #[test]
+    fn remote_intake_success_ack_is_progress_not_completion() {
+        let event = json!({
+            "command_kind": "todo_queue",
+            "commandId": "command-1",
+            "workspaceId": "workspace-1",
+            "targetTerminalId": "pane-1",
+        });
+
+        let outcome = todo_dispatch_remote_intake_success_outcome(
+            &event,
+            "command-1",
+            "todo-1",
+            "workspace-1",
+            &todo_dispatch_normalize_status(""),
+            "created",
+        );
+
+        assert_eq!(outcome["status"], "queued");
+        assert_ne!(outcome["status"], "completed");
+        assert_eq!(outcome["details"]["todoStatus"], "queued");
+    }
+
+    #[test]
+    fn startup_epoch_gates_receipt_and_queue_completion_settlement() {
+        let app_started_ms = todo_dispatch_app_started_ms();
+        let stale_ms = app_started_ms.saturating_sub(10_000);
+        let stale_iso = "1970-01-01T00:00:01.250Z";
+        let fresh_iso = chrono_like_now_iso();
+
+        assert!(!todo_dispatch_receipt_submitted_after_app_start(
+            &json!({ "submittedAt": stale_iso })
+        ));
+        assert!(todo_dispatch_receipt_submitted_after_app_start(
+            &json!({ "submittedAt": fresh_iso })
+        ));
+        assert!(!todo_dispatch_completed_receipt_fresh_for_notification(
+            &json!({ "completedAtMs": stale_ms })
+        ));
+        assert!(todo_dispatch_completed_receipt_fresh_for_notification(
+            &json!({ "completedAtMs": app_started_ms })
+        ));
+        assert!(!todo_dispatch_queue_item_fresh_for_completion_settlement(
+            &json!({
+                "id": "stale-running",
+                "status": "running",
+                "todoStatusUpdatedAtMs": stale_ms,
+                "updatedAtMs": stale_ms,
+            })
+        ));
+        assert!(todo_dispatch_queue_item_fresh_for_completion_settlement(
+            &json!({
+                "id": "fresh-running",
+                "status": "running",
+                "todoStatusUpdatedAtMs": app_started_ms,
+                "updatedAtMs": app_started_ms,
+            })
+        ));
     }
 
     #[test]
@@ -8591,6 +8783,8 @@ fn todo_dispatch_refresh_terminal_runtime_from_core(
                 "command_phase": runtime.command_phase.clone(),
                 "completedAt": runtime.completed_at.clone(),
                 "completed_at": runtime.completed_at.clone(),
+                "displayName": projected.display_name.clone(),
+                "display_name": projected.display_name.clone(),
                 "eventType": runtime.event_type.clone(),
                 "event_type": runtime.event_type.clone(),
                 "inputReady": input_ready,
@@ -8609,6 +8803,10 @@ fn todo_dispatch_refresh_terminal_runtime_from_core(
                 "readiness": projected.readiness.clone(),
                 "status": runtime.status.clone(),
                 "terminalIndex": metadata.terminal_index,
+                "terminalName": projected.terminal_name.clone(),
+                "terminal_name": projected.terminal_name.clone(),
+                "terminalNickname": projected.terminal_nickname.clone(),
+                "terminal_nickname": projected.terminal_nickname.clone(),
                 "terminalStatus": projected.terminal_status.clone(),
                 "terminalWorkState": projected.terminal_work_state.clone(),
                 "threadId": metadata.thread_id.clone(),
@@ -9374,12 +9572,25 @@ fn todo_dispatch_backend_model_command(item: &Value, target: &Value) -> String {
         return String::new();
     }
     let model = todo_dispatch_text(item, &["model", "modelId", "model_id"]);
+    let current_model = todo_dispatch_text(
+        target,
+        &[
+            "currentModel",
+            "current_model",
+            "modelId",
+            "model_id",
+            "model",
+        ],
+    );
     if model.is_empty()
         || model.len() > 120
         || !model.chars().all(|character| {
             character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '/' | '-')
         })
     {
+        return String::new();
+    }
+    if !current_model.is_empty() && current_model == model {
         return String::new();
     }
     if agent.contains("codex") {
@@ -9452,6 +9663,83 @@ mod todo_dispatch_backend_tests {
         assert_eq!(
             todo_dispatch_backend_model_command(&claude_item, &claude_target),
             "/model sonnet-4.6",
+        );
+
+        let current_model_target = json!({
+            "agentKind": "codex",
+            "currentModel": "gpt-5.1-codex",
+        });
+        assert_eq!(
+            todo_dispatch_backend_model_command(&codex_item, &current_model_target),
+            "",
+        );
+    }
+
+    #[test]
+    fn remote_intake_defaults_missing_status_to_queued() {
+        let requested_status = todo_dispatch_normalize_status("");
+        let intake_status = if requested_status == "queued" {
+            "queued"
+        } else {
+            "listed"
+        };
+        assert_eq!(intake_status, "queued");
+        assert!(todo_dispatch_backend_item_dispatchable(&json!({
+            "id": "command-1",
+            "status": intake_status,
+            "text": "ship it",
+        })));
+    }
+
+    #[test]
+    fn backend_target_picker_accepts_thread_index_and_name_hints() {
+        let entries = vec![
+            json!({
+                "agentId": "codex",
+                "paneId": "pane-a",
+                "terminalIndex": 0,
+                "terminalName": "Codex Primary",
+                "threadId": "thread-a",
+            }),
+            json!({
+                "agentId": "claude",
+                "paneId": "pane-b",
+                "terminalIndex": 1,
+                "terminalNickname": "Build Claude",
+                "threadId": "thread-b",
+            }),
+        ];
+
+        assert_eq!(
+            todo_dispatch_backend_pick_target_from_entries(
+                &entries,
+                &json!({ "targetThreadId": "thread-b" }),
+            )
+            .map(|entry| todo_dispatch_text(&entry, &["paneId"])),
+            Some("pane-b".to_string()),
+        );
+        assert_eq!(
+            todo_dispatch_backend_pick_target_from_entries(
+                &entries,
+                &json!({ "targetTerminalIndex": 0 }),
+            )
+            .map(|entry| todo_dispatch_text(&entry, &["paneId"])),
+            Some("pane-a".to_string()),
+        );
+        assert_eq!(
+            todo_dispatch_backend_pick_target_from_entries(
+                &entries,
+                &json!({ "targetTerminalName": " build   claude " }),
+            )
+            .map(|entry| todo_dispatch_text(&entry, &["paneId"])),
+            Some("pane-b".to_string()),
+        );
+        assert!(
+            todo_dispatch_backend_pick_target_from_entries(
+                &entries,
+                &json!({ "targetThreadId": "missing-thread" }),
+            )
+            .is_none()
         );
     }
 
@@ -9765,6 +10053,17 @@ fn todo_dispatch_backend_item_dispatchable(item: &Value) -> bool {
     if status != "queued" {
         return false;
     }
+    if todo_dispatch_webview_dispatcher_active()
+        && todo_dispatch_text(item, &["lifecycleOwner", "lifecycle_owner"]) == "webview"
+        && item
+            .get("remoteCommand")
+            .or_else(|| item.get("remote_command"))
+            .and_then(|remote| remote.get("source").or_else(|| remote.get("sourceKind")))
+            .and_then(Value::as_str)
+            == Some("remote_intake_webview")
+    {
+        return false;
+    }
     // Background policy: text-only todos (image attachments need the webview).
     if todo_dispatch_backend_item_has_image_attachment(item) {
         return false;
@@ -9902,6 +10201,11 @@ async fn todo_dispatch_backend_core_ready_entries(
         if !todo_dispatch_backend_agent_is_queueable(metadata_agent) {
             continue;
         }
+        let launch_metadata = instance
+            .launch_metadata
+            .lock()
+            .map(|metadata| metadata.clone())
+            .unwrap_or_default();
         let runtime = terminal_runtime_snapshot(&instance);
         let is_parked = parked.contains(&(pane_id.clone(), instance.id));
         let projected = terminal_project_runtime(&metadata, &runtime, is_parked);
@@ -9918,6 +10222,12 @@ async fn todo_dispatch_backend_core_ready_entries(
             "activity_status": runtime.activity_status.clone(),
             "agentId": metadata.agent_id.clone(),
             "agentKind": metadata.agent_kind.clone(),
+            "currentEffort": launch_metadata.reasoning_effort.clone(),
+            "currentModel": launch_metadata.model.clone(),
+            "current_model": launch_metadata.model.clone(),
+            "displayName": projected.display_name.clone(),
+            "display_name": projected.display_name.clone(),
+            "model": launch_metadata.model.clone(),
             "inputReady": true,
             "inputReadyAt": runtime.input_ready_at.clone(),
             "instanceId": instance.id,
@@ -9926,6 +10236,10 @@ async fn todo_dispatch_backend_core_ready_entries(
             "provider_session_id": runtime.provider_session_id.clone(),
             "readiness": projected.readiness.clone(),
             "terminalIndex": metadata.terminal_index,
+            "terminalName": projected.terminal_name.clone(),
+            "terminal_name": projected.terminal_name.clone(),
+            "terminalNickname": projected.terminal_nickname.clone(),
+            "terminal_nickname": projected.terminal_nickname.clone(),
             "terminalStatus": projected.terminal_status.clone(),
             "terminalWorkState": projected.terminal_work_state.clone(),
             "threadId": metadata.thread_id.clone(),
@@ -10021,6 +10335,164 @@ fn todo_dispatch_sort_backend_ready_entries(entries: &mut [Value]) {
     });
 }
 
+fn todo_dispatch_normalized_terminal_name(value: &str) -> String {
+    value
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+fn todo_dispatch_backend_entry_matches_name(entry: &Value, target_name: &str) -> bool {
+    let target_name = todo_dispatch_normalized_terminal_name(target_name);
+    if target_name.is_empty() {
+        return false;
+    }
+    [
+        "terminalNickname",
+        "terminal_nickname",
+        "terminalName",
+        "terminal_name",
+        "displayName",
+        "display_name",
+        "agentDisplayName",
+        "agent_display_name",
+        "name",
+    ]
+    .iter()
+    .any(|key| todo_dispatch_normalized_terminal_name(&todo_dispatch_text(entry, &[*key])) == target_name)
+}
+
+fn todo_dispatch_backend_pick_target_from_entries(entries: &[Value], item: &Value) -> Option<Value> {
+    if entries.is_empty() {
+        return None;
+    }
+    let target_pane = todo_dispatch_text(
+        item,
+        &[
+            "targetTerminalId",
+            "target_terminal_id",
+            "terminalId",
+            "terminal_id",
+            "paneId",
+            "pane_id",
+        ],
+    );
+    let target_thread = todo_dispatch_text(
+        item,
+        &["targetThreadId", "target_thread_id", "threadId", "thread_id"],
+    );
+    let target_name = todo_dispatch_text(
+        item,
+        &[
+            "targetTerminalName",
+            "target_terminal_name",
+            "terminalName",
+            "terminal_name",
+            "targetName",
+            "target_name",
+        ],
+    );
+    let target_index = todo_dispatch_i64(
+        item,
+        &[
+            "targetTerminalIndex",
+            "target_terminal_index",
+            "terminalIndex",
+            "terminal_index",
+            "index",
+        ],
+    );
+    let target_agent = todo_dispatch_backend_agent_value(
+        item,
+        &[
+            "targetAgentId",
+            "target_agent_id",
+            "agentId",
+            "agent_id",
+            "agentKind",
+            "agent_kind",
+        ],
+    );
+    let target_agent = if target_agent.is_empty() {
+        None
+    } else {
+        Some(target_agent)
+    };
+    let has_explicit_target = !target_pane.is_empty()
+        || !target_thread.is_empty()
+        || target_index.is_some()
+        || !target_name.is_empty();
+
+    let matched = entries
+        .iter()
+        .find(|entry| {
+            !target_pane.is_empty()
+                && todo_dispatch_text(
+                    entry,
+                    &[
+                        "paneId",
+                        "pane_id",
+                        "targetTerminalId",
+                        "target_terminal_id",
+                        "terminalId",
+                        "terminal_id",
+                    ],
+                ) == target_pane
+        })
+        .or_else(|| {
+            if target_thread.is_empty() {
+                None
+            } else {
+                entries.iter().find(|entry| {
+                    todo_dispatch_text(entry, &["threadId", "thread_id", "targetThreadId"])
+                        == target_thread
+                })
+            }
+        })
+        .or_else(|| {
+            target_index.and_then(|target_index| {
+                entries.iter().find(|entry| {
+                    todo_dispatch_i64(
+                        entry,
+                        &[
+                            "terminalIndex",
+                            "terminal_index",
+                            "targetTerminalIndex",
+                            "target_terminal_index",
+                            "index",
+                        ],
+                    ) == Some(target_index)
+                })
+            })
+        })
+        .or_else(|| {
+            if target_name.is_empty() {
+                None
+            } else {
+                entries
+                    .iter()
+                    .find(|entry| todo_dispatch_backend_entry_matches_name(entry, &target_name))
+            }
+        })
+        .or_else(|| {
+            if has_explicit_target {
+                // Explicit terminal selectors must resolve exactly; otherwise
+                // do not fall back to an arbitrary ready pane.
+                None
+            } else if let Some(agent) = target_agent.as_deref() {
+                entries.iter().find(|entry| {
+                    todo_dispatch_backend_agent_value(entry, &["agentId", "agent_id"]) == agent
+                        || todo_dispatch_backend_agent_value(entry, &["agentKind", "agent_kind"])
+                            == agent
+                })
+            } else {
+                entries.first()
+            }
+        });
+    matched.cloned()
+}
+
 async fn todo_dispatch_backend_pick_target(
     app: &AppHandle,
     workspace_id: &str,
@@ -10044,64 +10516,7 @@ async fn todo_dispatch_backend_pick_target(
             entries.push(entry);
         }
     }
-    if entries.is_empty() {
-        return None;
-    }
-    let target_pane = item
-        .get("targetTerminalId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    let has_non_id_terminal_hint = target_pane.is_none()
-        && (item
-            .get("targetThreadId")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .is_some_and(|value| !value.is_empty())
-            || item
-                .get("targetTerminalIndex")
-                .and_then(Value::as_u64)
-                .is_some());
-    let target_agent = todo_dispatch_backend_agent_value(
-        item,
-        &[
-            "targetAgentId",
-            "target_agent_id",
-            "agentId",
-            "agent_id",
-            "agentKind",
-            "agent_kind",
-        ],
-    );
-    let target_agent = if target_agent.is_empty() {
-        None
-    } else {
-        Some(target_agent)
-    };
-    let has_explicit_target = target_pane.is_some() || has_non_id_terminal_hint;
-
-    let matched = entries
-        .iter()
-        .find(|entry| {
-            target_pane.is_some() && entry.get("paneId").and_then(Value::as_str) == target_pane
-        })
-        .or_else(|| {
-            if has_explicit_target {
-                // An explicit terminal target must be a pane id. Legacy
-                // thread/index hints are retained as metadata, but cannot
-                // select an execution target.
-                None
-            } else if let Some(agent) = target_agent.as_deref() {
-                entries.iter().find(|entry| {
-                    todo_dispatch_backend_agent_value(entry, &["agentId", "agent_id"]) == agent
-                        || todo_dispatch_backend_agent_value(entry, &["agentKind", "agent_kind"])
-                            == agent
-                })
-            } else {
-                entries.first()
-            }
-        });
-    matched.cloned()
+    todo_dispatch_backend_pick_target_from_entries(&entries, item)
 }
 
 fn todo_dispatch_backend_try_claim_item(
@@ -10129,6 +10544,7 @@ fn todo_dispatch_backend_try_claim_item(
             continue;
         }
         todo_store_set_item_status(entry, "running", "todo_queue_backend_dispatch_claim");
+        todo_store_set_item_lifecycle_owner(entry, "rust");
         if let Some(object) = entry.as_object_mut() {
             if let Some(pane_id) = target
                 .get("paneId")
@@ -10768,7 +11184,7 @@ pub(crate) fn todo_dispatch_mark_active_receipts_interrupted(
             .filter(|(_, receipt)| {
                 matches!(
                     receipt.get("status").and_then(Value::as_str),
-                    Some("sending") | Some("submitted")
+                    Some("sending") | Some("submitted") | Some("running") | Some("dispatching")
                 )
             })
             .map(|(command_id, receipt)| (command_id.clone(), receipt.clone()))

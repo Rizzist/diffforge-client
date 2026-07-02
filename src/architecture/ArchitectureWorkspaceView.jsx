@@ -223,6 +223,36 @@ function jsonArray(value) {
   return Array.isArray(value) ? value : [];
 }
 
+const SESSION_HISTORY_CACHE_LIMIT = 24;
+const SESSION_HISTORY_ENRICH_REFRESH_DELAY_MS = 250;
+const SESSION_HISTORY_SYNC_REFRESH_DELAY_MS = 900;
+const sessionHistoryCache = new Map();
+
+function sessionHistoryCacheKey(workspaceId, rootDirectory) {
+  const workspaceKey = text(workspaceId);
+  if (!workspaceKey) return "";
+  return `${workspaceKey}\n${text(rootDirectory)}`;
+}
+
+function readSessionHistoryCache(cacheKey) {
+  if (!cacheKey || !sessionHistoryCache.has(cacheKey)) return null;
+  return sessionHistoryCache.get(cacheKey);
+}
+
+function writeSessionHistoryCache(cacheKey, items) {
+  if (!cacheKey) return;
+  sessionHistoryCache.delete(cacheKey);
+  sessionHistoryCache.set(cacheKey, {
+    items: jsonArray(items),
+    updatedAtMs: Date.now(),
+  });
+  while (sessionHistoryCache.size > SESSION_HISTORY_CACHE_LIMIT) {
+    const oldestKey = sessionHistoryCache.keys().next().value;
+    if (!oldestKey) break;
+    sessionHistoryCache.delete(oldestKey);
+  }
+}
+
 function architectureGraphIdsFromCloudEvent(event) {
   const ids = new Set();
   const pushGraphId = (value) => {
@@ -5522,6 +5552,10 @@ export default function ArchitectureWorkspaceView({
   const activeWorkspaceId = workspace?.id || "";
   const activeWorkspaceName = workspace?.name || "";
   const repoPath = activeWorkspaceId ? rootDirectory || defaultWorkingDirectory || "" : "";
+  const sessionHistoryStoreRoot = repoPath || rootDirectory || defaultWorkingDirectory || "";
+  const sessionHistoryCacheKeyValue = sessionHistoryCacheKey(activeWorkspaceId, sessionHistoryStoreRoot);
+  const sessionHistoryInitialCache = readSessionHistoryCache(sessionHistoryCacheKeyValue);
+  const hasSessionHistoryInitialCache = Boolean(sessionHistoryInitialCache);
   const [viewMode, setViewMode] = useState("sessionHistory");
   const [localArchitectureSnapshot, setLocalArchitectureSnapshot] = useState(architectureSnapshot);
 	  const [finishPlanState, setFinishPlanState] = useState({ error: "", planRef: "" });
@@ -5594,14 +5628,27 @@ export default function ArchitectureWorkspaceView({
     () => architectureTodoHistoryItemsFromWorkspaceTodos(null, activeWorkspaceId, visibleTasks, localTodoItems),
     [activeWorkspaceId, localTodoItems, visibleTasks],
   );
-  const [sessionHistoryItems, setSessionHistoryItems] = useState([]);
-  const [sessionHistoryState, setSessionHistoryState] = useState("idle");
+  const [sessionHistoryItems, setSessionHistoryItems] = useState(() => jsonArray(sessionHistoryInitialCache?.items));
+  const [sessionHistoryState, setSessionHistoryState] = useState(() => (
+    hasSessionHistoryInitialCache ? "ready" : "idle"
+  ));
   const [sessionHistoryError, setSessionHistoryError] = useState("");
+  const sessionHistoryItemsRef = useRef(sessionHistoryItems);
   const sessionHistoryRefreshSeqRef = useRef(0);
+  const sessionHistorySyncRefreshTimerRef = useRef(0);
+  useEffect(() => {
+    sessionHistoryItemsRef.current = sessionHistoryItems;
+  }, [sessionHistoryItems]);
   useEffect(() => {
     const workspaceId = text(activeWorkspaceId);
+    const cacheKey = sessionHistoryCacheKeyValue;
     if (!workspaceId) {
       sessionHistoryRefreshSeqRef.current += 1;
+      if (sessionHistorySyncRefreshTimerRef.current) {
+        window.clearTimeout(sessionHistorySyncRefreshTimerRef.current);
+        sessionHistorySyncRefreshTimerRef.current = 0;
+      }
+      sessionHistoryItemsRef.current = [];
       setSessionHistoryItems([]);
       setSessionHistoryState("idle");
       setSessionHistoryError("");
@@ -5609,36 +5656,71 @@ export default function ArchitectureWorkspaceView({
     }
     let cancelled = false;
     const unlisteners = [];
-    const rootDirectoryForStore = repoPath || rootDirectory || defaultWorkingDirectory || "";
-    const refreshSessionHistory = () => {
+    const cached = readSessionHistoryCache(cacheKey);
+    if (cached) {
+      const cachedItems = jsonArray(cached.items);
+      sessionHistoryItemsRef.current = cachedItems;
+      setSessionHistoryItems(cachedItems);
+      setSessionHistoryState("ready");
+      setSessionHistoryError("");
+    } else {
+      sessionHistoryItemsRef.current = [];
+      setSessionHistoryItems([]);
+    }
+    const refreshSessionHistory = ({ fast = true } = {}) => {
       const refreshSeq = sessionHistoryRefreshSeqRef.current + 1;
       sessionHistoryRefreshSeqRef.current = refreshSeq;
-      setSessionHistoryState((state) => (state === "ready" ? "refreshing" : "loading"));
+      setSessionHistoryState((state) => (
+        state === "ready" || state === "refreshing" || sessionHistoryItemsRef.current.length
+          ? "refreshing"
+          : "loading"
+      ));
       invoke("workspace_agent_session_history_list", {
         request: {
+          fast,
           limit: 500,
-          rootDirectory: rootDirectoryForStore || null,
+          rootDirectory: sessionHistoryStoreRoot || null,
           workspaceId,
         },
       })
         .then((result) => {
           if (cancelled || refreshSeq !== sessionHistoryRefreshSeqRef.current) return;
-          setSessionHistoryItems(jsonArray(result?.items));
+          const nextItems = jsonArray(result?.items);
+          sessionHistoryItemsRef.current = nextItems;
+          writeSessionHistoryCache(cacheKey, nextItems);
+          setSessionHistoryItems(nextItems);
           setSessionHistoryError("");
           setSessionHistoryState("ready");
+          if (fast) {
+            scheduleSessionHistoryRefresh(SESSION_HISTORY_ENRICH_REFRESH_DELAY_MS, { fast: false });
+          }
         })
         .catch((error) => {
           if (cancelled || refreshSeq !== sessionHistoryRefreshSeqRef.current) return;
           setSessionHistoryError(String(error?.message || error || "Unable to load session history."));
-          setSessionHistoryState("error");
+          setSessionHistoryState(sessionHistoryItemsRef.current.length ? "ready" : "error");
         });
     };
-    refreshSessionHistory();
+    const scheduleSessionHistoryRefresh = (delayMs = 0, options = {}) => {
+      if (sessionHistorySyncRefreshTimerRef.current) {
+        window.clearTimeout(sessionHistorySyncRefreshTimerRef.current);
+        sessionHistorySyncRefreshTimerRef.current = 0;
+      }
+      if (delayMs > 0) {
+        sessionHistorySyncRefreshTimerRef.current = window.setTimeout(() => {
+          sessionHistorySyncRefreshTimerRef.current = 0;
+          refreshSessionHistory(options);
+        }, delayMs);
+        return;
+      }
+      refreshSessionHistory(options);
+    };
+    refreshSessionHistory({ fast: true });
     listen("workspace-agent-session-history-changed", (event) => {
       if (cancelled) return;
       const eventWorkspaceId = String(event?.payload?.workspaceId || "").trim();
       if (!eventWorkspaceId || eventWorkspaceId === workspaceId) {
-        refreshSessionHistory();
+        scheduleSessionHistoryRefresh(0, { fast: true });
       }
     }).then((unlisten) => {
       if (cancelled) {
@@ -5651,7 +5733,7 @@ export default function ArchitectureWorkspaceView({
       if (cancelled) return;
       const eventWorkspaceId = String(event?.payload?.workspaceId || "").trim();
       if (!eventWorkspaceId || eventWorkspaceId === workspaceId) {
-        refreshSessionHistory();
+        scheduleSessionHistoryRefresh(SESSION_HISTORY_SYNC_REFRESH_DELAY_MS, { fast: false });
       }
     }).then((unlisten) => {
       if (cancelled) {
@@ -5662,10 +5744,14 @@ export default function ArchitectureWorkspaceView({
     }).catch(() => {});
     return () => {
       cancelled = true;
+      if (sessionHistorySyncRefreshTimerRef.current) {
+        window.clearTimeout(sessionHistorySyncRefreshTimerRef.current);
+        sessionHistorySyncRefreshTimerRef.current = 0;
+      }
       unlisteners.forEach((unlisten) => unlisten());
     };
-  }, [activeWorkspaceId, defaultWorkingDirectory, repoPath, rootDirectory]);
-  const repoLabel = pathName(repoPath || rootDirectory || defaultWorkingDirectory, "repo");
+  }, [activeWorkspaceId, sessionHistoryCacheKeyValue, sessionHistoryStoreRoot]);
+  const repoLabel = pathName(sessionHistoryStoreRoot, "repo");
   const visibleArchitectureError = architectureCloudMcpNoiseError(architectureError) ? "" : architectureError;
 
   useEffect(() => {
@@ -9658,6 +9744,9 @@ function sessionHistoryTitle(item) {
       || item?.initial_user_message
       || item?.promptPreview
       || item?.prompt_preview
+      || item?.title
+      || item?.sessionTitle
+      || item?.session_title
       || item?.providerSessionId
       || item?.provider_session_id
       || item?.nativeSessionId
@@ -9686,6 +9775,9 @@ function sessionHistorySearchFields(item) {
     item?.coordination_mode,
     sessionHistoryStatusLabel(item),
     item?.status,
+    item?.title,
+    item?.sessionTitle,
+    item?.session_title,
     item?.provider,
     item?.agentId,
     item?.agent_id,

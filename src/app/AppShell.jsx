@@ -73,6 +73,7 @@ import {
 } from "../terminals/WorkspaceTerminal/terminalCore.js";
 import {
   buildTerminalSubmittedInput,
+  getTerminalSubmitSequence,
 } from "../terminals/WorkspaceTerminal/threadRuntime.js";
 import {
   getProviderTurnCompletionIntent,
@@ -716,22 +717,28 @@ import {
   NetworkingOverlay,
   NetworkingDialog,
   NetworkingHeader,
+  NetworkingTitleRow,
+  NetworkingContractTag,
   NetworkingToolbar,
-  NetworkingSummaryGrid,
-  NetworkingMetric,
-  NetworkingSectionGrid,
-  NetworkingSection,
-  NetworkingSectionHeader,
-  NetworkingList,
-  NetworkingRow,
-  NetworkingStatusDot,
-  NetworkingRowMain,
-  NetworkingCategoryTopline,
-  NetworkingCategoryStats,
-  NetworkingCategoryCount,
-  NetworkingProgressValue,
-  NetworkingCategoryMeter,
-  NetworkingMeta,
+  NetworkingHero,
+  NetworkingHeroState,
+  NetworkingHeroGlyph,
+  NetworkingHeroCopy,
+  NetworkingHeroStats,
+  NetworkingHeroStat,
+  NetworkingChannelGrid,
+  NetworkingChannel,
+  NetworkingChannelHeader,
+  NetworkingChannelList,
+  NetworkingChannelRow,
+  NetworkingRowDot,
+  NetworkingRowStatus,
+  NetworkingRowCount,
+  NetworkingRowMeter,
+  NetworkingActivity,
+  NetworkingActivityHeader,
+  NetworkingActivityList,
+  NetworkingActivityRow,
   NetworkingEmpty,
   WorkspaceSettingsDialogHeader,
   WorkspaceSettingsHeaderMain,
@@ -18318,6 +18325,43 @@ function areWorkspaceAgentPermissionsEqual(
     .every((option) => leftPermissions[option.id] === rightPermissions[option.id]);
 }
 
+function networkRowsPendingCount(rows) {
+  return rows.reduce((total, row) => (
+    !row.hasError && row.progressPercent < 100 && row.count > 0
+      ? total + Math.max(0, Math.round(networkNumber(row.count)))
+      : total
+  ), 0);
+}
+
+function networkRowTone(row, bucket) {
+  if (row.hasError) return "bad";
+  if (row.progressPercent >= 100 || row.count <= 0) return "good";
+  const states = networkList(row.states).map((state) => networkString(state).toLowerCase());
+  if (states.includes("retrying")) return "warn";
+  return bucket === "down" ? "info" : "up";
+}
+
+function networkChannelStatus(rows) {
+  if (rows.some((row) => row.hasError)) {
+    return { text: "needs attention", tone: "bad" };
+  }
+  const pending = networkRowsPendingCount(rows);
+  if (pending > 0) {
+    return { text: `${pending} pending`, tone: "" };
+  }
+  return rows.length
+    ? { text: "up to date", tone: "good" }
+    : { text: "idle", tone: "" };
+}
+
+function networkHeartbeatTone(ageMs) {
+  const age = networkFiniteNumber(ageMs);
+  if (age == null || age <= 0) return "";
+  if (age <= 30_000) return "good";
+  if (age <= 120_000) return "warn";
+  return "bad";
+}
+
 function NetworkingInspector({
   diagnostics,
   error = "",
@@ -18336,21 +18380,16 @@ function NetworkingInspector({
   const connectionState = normalized.connection.connected
     ? "connected"
     : normalized.connection.state;
-  const connectionStateLabel = connectionState === "offline_permanent" ? "offline" : connectionState;
   const canGoOffline = typeof onGoOffline === "function" && connectionState !== "offline_permanent";
-  const pingAge = formatNetworkDuration(
-    normalized.health.pingAgeMs ?? normalized.health.ping_age_ms,
-    "none",
-  );
-  const pongAge = formatNetworkDuration(
-    normalized.health.pongAgeMs ?? normalized.health.pong_age_ms,
-    "none",
-  );
+  const pingAgeMs = networkFiniteNumber(normalized.health.pingAgeMs ?? normalized.health.ping_age_ms);
+  const pongAgeMs = networkFiniteNumber(normalized.health.pongAgeMs ?? normalized.health.pong_age_ms);
+  const heartbeatText = formatNetworkDuration(pongAgeMs ?? 0, "—");
   const packetLoss = networkPacketLossLabel(normalized);
+  const packetLossValue = Number.parseFloat(packetLoss) || 0;
   const toServerRows = aggregateNetworkCategoryRows(normalized, "up");
   const fromServerRows = aggregateNetworkCategoryRows(normalized, "down");
-  const toServerCount = networkCategoryTotal(toServerRows);
-  const fromServerCount = networkCategoryTotal(fromServerRows);
+  const fromChannelStatus = networkChannelStatus(fromServerRows);
+  const toChannelStatus = networkChannelStatus(toServerRows);
   const errorRows = Array.from(new Set([
     error,
     normalized.connection.error,
@@ -18361,63 +18400,88 @@ function NetworkingInspector({
     ...normalized.outboundRecent.map(networkItemErrorText),
   ].filter(Boolean)));
   const tokenomicsLogRows = normalized.tokenomicsSyncLog.slice(0, 12);
-  const bottomLogCount = errorRows.length + tokenomicsLogRows.length;
+  const activityCount = errorRows.length + tokenomicsLogRows.length;
 
-  const renderNetworkCategoryRows = (items, emptyLabel, bucket = "up") => (
-    items.length ? (
-      <NetworkingList data-mode="categories">
-        {items.map((row) => {
+  const pendingTotal = networkRowsPendingCount(fromServerRows) + networkRowsPendingCount(toServerRows);
+  const heroState = connectionState === "connected"
+    ? (pendingTotal > 0 ? "syncing" : "live")
+    : connectionState === "connecting"
+      ? "connecting"
+      : "offline";
+  const heroWord = heroState === "live"
+    ? "Live"
+    : heroState === "syncing"
+      ? "Syncing"
+      : heroState === "connecting"
+        ? "Connecting"
+        : "Offline";
+  const heroText = heroState === "live"
+    ? "Connected. Everything is in sync."
+    : heroState === "syncing"
+      ? `Connected. ${pendingTotal} ${pendingTotal === 1 ? "change" : "changes"} in flight.`
+      : heroState === "connecting"
+        ? "Reaching Diff Forge Cloud…"
+        : "Offline. Changes queue locally until you reconnect.";
+
+  const queueTone = normalized.deadLetterCount > 0
+    ? "bad"
+    : normalized.retryingCount > 0
+      ? "warn"
+      : normalized.pendingCount > 0
+        ? "info"
+        : "good";
+  const queueText = normalized.deadLetterCount > 0
+    ? `${normalized.deadLetterCount} dead`
+    : normalized.retryingCount > 0
+      ? `${normalized.retryingCount} retrying`
+      : normalized.pendingCount > 0
+        ? `${normalized.pendingCount} queued`
+        : "Clear";
+  const queueTitle = `Outbox: ${normalized.pendingCount} queued · ${normalized.retryingCount} retrying · ${normalized.deadLetterCount} dead-letter`;
+
+  const renderChannelRows = (rows, bucket, emptyLabel) => (
+    rows.length ? (
+      <NetworkingChannelList>
+        {rows.map((row) => {
+          const tone = networkRowTone(row, bucket);
           const progressValue = Math.round(Math.max(0, Math.min(100, row.progressPercent)));
-          const tone = row.hasError ? "red" : progressValue >= 100 ? "green" : bucket === "down" ? "green" : "blue";
-          const summaryText = networkCategorySummaryText(row, bucket);
-          const progressUnitsText = networkProgressUnitsText(row);
+          const syncing = tone !== "bad" && tone !== "good";
+          const unitsText = networkProgressUnitsText(row);
+          const statusText = tone === "bad"
+            ? "Error"
+            : !syncing
+              ? "Synced"
+              : unitsText || networkProgressPercentLabel(row.progressPercent);
+          const tooltip = [
+            networkCategorySummaryText(row, bucket),
+            row.details.join(", "),
+            `${row.eventCount} ${row.eventCount === 1 ? "event" : "events"}`,
+            row.bytes > 0 ? formatNetworkBytes(row.bytes) : "",
+            row.states.join(", "),
+            row.sources.join(", "),
+            row.latestAgeMs > 0 ? `${formatNetworkDuration(row.latestAgeMs)} ago` : "",
+          ].filter(Boolean).join(" · ");
           return (
-            <NetworkingRow key={`${bucket}:${row.domain}`} data-role="category">
-              <NetworkingStatusDot data-tone={tone} />
-              <NetworkingRowMain>
-                <NetworkingCategoryTopline>
-                  <strong title={row.label}>{row.label}</strong>
-                  <NetworkingCategoryStats>
-                    <NetworkingProgressValue data-tone={tone}>
-                      {networkProgressPercentLabel(row.progressPercent)}
-                    </NetworkingProgressValue>
-                    <NetworkingCategoryCount>{row.count}</NetworkingCategoryCount>
-                  </NetworkingCategoryStats>
-                </NetworkingCategoryTopline>
-                <p title={row.details.length ? `${summaryText} - ${row.details.join(", ")}` : summaryText}>
-                  {summaryText}
-                </p>
-                <NetworkingCategoryMeter
+            <NetworkingChannelRow key={`${bucket}:${row.domain}`} title={tooltip}>
+              <NetworkingRowDot data-tone={tone} />
+              <strong>{row.label}</strong>
+              <NetworkingRowStatus data-tone={tone}>{statusText}</NetworkingRowStatus>
+              <NetworkingRowCount>{row.count}</NetworkingRowCount>
+              {syncing ? (
+                <NetworkingRowMeter
                   aria-label={`${row.label} sync progress`}
                   aria-valuemax={100}
                   aria-valuemin={0}
                   aria-valuenow={progressValue}
                   data-tone={tone}
                   role="progressbar"
-                  style={{ "--network-progress": `${Math.max(0, Math.min(100, row.progressPercent))}%` }}
+                  style={{ "--network-progress": `${progressValue}%` }}
                 />
-                <NetworkingMeta>
-                  <span>{row.eventCount} {row.eventCount === 1 ? "event" : "events"}</span>
-                  {progressUnitsText ? (
-                    <span>{progressUnitsText}</span>
-                  ) : row.completeCount > 0 ? (
-                    <span>{row.completeCount}/{row.count} synced</span>
-                  ) : null}
-                  {row.bytes > 0 && <span>{formatNetworkBytes(row.bytes)}</span>}
-                  {row.states.map((state) => (
-                    <span key={`${row.domain}:state:${state}`}>{state}</span>
-                  ))}
-                  {row.sources.map((source) => (
-                    <span key={`${row.domain}:source:${source}`}>{source}</span>
-                  ))}
-                  {row.latestAgeMs > 0 && <span>{formatNetworkDuration(row.latestAgeMs)} ago</span>}
-                  {row.hasError && <span>error</span>}
-                </NetworkingMeta>
-              </NetworkingRowMain>
-            </NetworkingRow>
+              ) : null}
+            </NetworkingChannelRow>
           );
         })}
-      </NetworkingList>
+      </NetworkingChannelList>
     ) : (
       <NetworkingEmpty>{emptyLabel}</NetworkingEmpty>
     )
@@ -18429,17 +18493,12 @@ function NetworkingInspector({
         <NetworkingHeader>
           <WorkspaceSettingsHeaderMain>
             <PanelKicker>Network</PanelKicker>
-            <PanelHeading>Live Sync</PanelHeading>
-            <WorkspaceSettingsHeaderMeta>
-              <WorkspaceSettingsMetaPill>
-                <span>State</span>
-                <strong>{connectionStateLabel}</strong>
-              </WorkspaceSettingsMetaPill>
-              <WorkspaceSettingsMetaPill>
-                <span>Contract</span>
-                <strong>{normalized.connection.contract || "app_ws"}</strong>
-              </WorkspaceSettingsMetaPill>
-            </WorkspaceSettingsHeaderMeta>
+            <NetworkingTitleRow>
+              <PanelHeading>Live Sync</PanelHeading>
+              <NetworkingContractTag title="Sync protocol contract">
+                {normalized.connection.contract || "app_ws"}
+              </NetworkingContractTag>
+            </NetworkingTitleRow>
           </WorkspaceSettingsHeaderMain>
           <NetworkingToolbar>
             {connectionState === "connected" ? (
@@ -18496,81 +18555,103 @@ function NetworkingInspector({
           </NetworkingToolbar>
         </NetworkingHeader>
 
-        <NetworkingSummaryGrid>
-          <NetworkingMetric>
-            <span>Status</span>
-            <strong>{connectionStateLabel}</strong>
-          </NetworkingMetric>
-          <NetworkingMetric>
-            <span>Ping / Pong</span>
-            <strong>{pingAge} / {pongAge}</strong>
-          </NetworkingMetric>
-          <NetworkingMetric>
-            <span>Packet Loss</span>
-            <strong>{packetLoss}</strong>
-          </NetworkingMetric>
-          <NetworkingMetric>
-            <span>WebSocket</span>
-            <strong>{normalized.inboxRecent.length} in / {normalized.outboundRecent.length} out</strong>
-          </NetworkingMetric>
-        </NetworkingSummaryGrid>
+        <NetworkingHero data-state={heroState}>
+          <NetworkingHeroState>
+            <NetworkingHeroGlyph aria-hidden="true" data-state={heroState} />
+            <NetworkingHeroCopy>
+              <strong>{heroWord}</strong>
+              <span title={normalized.connection.error || heroText} data-tone={normalized.connection.error ? "bad" : undefined}>
+                {normalized.connection.error || heroText}
+              </span>
+            </NetworkingHeroCopy>
+          </NetworkingHeroState>
+          <NetworkingHeroStats>
+            <NetworkingHeroStat title={`Last ping ${formatNetworkDuration(pingAgeMs ?? 0, "none")} · last pong ${formatNetworkDuration(pongAgeMs ?? 0, "none")}`}>
+              <span>Heartbeat</span>
+              <strong data-tone={networkHeartbeatTone(pongAgeMs)}>{heartbeatText}</strong>
+            </NetworkingHeroStat>
+            <NetworkingHeroStat title="Share of sync sends that failed">
+              <span>Loss</span>
+              <strong data-tone={packetLossValue > 0 ? "warn" : "good"}>{packetLoss}</strong>
+            </NetworkingHeroStat>
+            <NetworkingHeroStat title="Recent WebSocket frames received / sent">
+              <span>Frames</span>
+              <strong>↓{normalized.inboxRecent.length} ↑{normalized.outboundRecent.length}</strong>
+            </NetworkingHeroStat>
+            <NetworkingHeroStat title={queueTitle}>
+              <span>Queue</span>
+              <strong data-tone={queueTone}>{queueText}</strong>
+            </NetworkingHeroStat>
+          </NetworkingHeroStats>
+        </NetworkingHero>
 
-        <NetworkingSectionGrid>
-          <NetworkingSection>
-            <NetworkingSectionHeader>
+        <NetworkingChannelGrid>
+          <NetworkingChannel data-direction="down">
+            <NetworkingChannelHeader data-direction="down">
+              <i aria-hidden="true">↓</i>
               <strong>From Server</strong>
-              <span>{fromServerCount} syncing</span>
-            </NetworkingSectionHeader>
-            {renderNetworkCategoryRows(fromServerRows, "No server updates are arriving.", "down")}
-          </NetworkingSection>
+              <span data-tone={fromChannelStatus.tone} title={`${networkCategoryTotal(fromServerRows)} tracked items`}>
+                {fromChannelStatus.text}
+              </span>
+            </NetworkingChannelHeader>
+            {renderChannelRows(fromServerRows, "down", "No server updates are arriving.")}
+          </NetworkingChannel>
 
-          <NetworkingSection>
-            <NetworkingSectionHeader>
+          <NetworkingChannel data-direction="up">
+            <NetworkingChannelHeader data-direction="up">
+              <i aria-hidden="true">↑</i>
               <strong>To Server</strong>
-              <span>{toServerCount} syncing</span>
-            </NetworkingSectionHeader>
-            {renderNetworkCategoryRows(toServerRows, "No client changes are being sent.", "up")}
-          </NetworkingSection>
-        </NetworkingSectionGrid>
+              <span data-tone={toChannelStatus.tone} title={`${networkCategoryTotal(toServerRows)} tracked items`}>
+                {toChannelStatus.text}
+              </span>
+            </NetworkingChannelHeader>
+            {renderChannelRows(toServerRows, "up", "No client changes are being sent.")}
+          </NetworkingChannel>
+        </NetworkingChannelGrid>
 
-        <NetworkingSection data-role="errors">
-          <NetworkingSectionHeader>
-            <strong>Errors & Sync Log</strong>
-            <span>{bottomLogCount ? `${bottomLogCount} current` : "clear"}</span>
-          </NetworkingSectionHeader>
-          {bottomLogCount ? (
-            <NetworkingList>
+        <NetworkingActivity>
+          <NetworkingActivityHeader>
+            <strong>Activity</strong>
+            <span data-tone={errorRows.length ? "bad" : activityCount ? undefined : "good"}>
+              {errorRows.length
+                ? `${errorRows.length} ${errorRows.length === 1 ? "error" : "errors"}`
+                : activityCount
+                  ? `${activityCount} ${activityCount === 1 ? "entry" : "entries"}`
+                  : "All clear"}
+            </span>
+          </NetworkingActivityHeader>
+          {activityCount ? (
+            <NetworkingActivityList>
               {errorRows.map((message, index) => (
-                <NetworkingRow key={`${message}:${index}`} data-tone="error">
-                  <NetworkingStatusDot data-tone="red" />
-                  <NetworkingRowMain>
-                    <strong>Error</strong>
-                    <p title={message}>{message}</p>
-                  </NetworkingRowMain>
-                </NetworkingRow>
+                <NetworkingActivityRow key={`error:${message}:${index}`}>
+                  <NetworkingRowDot data-tone="bad" />
+                  <em data-tone="bad">Error</em>
+                  <p title={message}>
+                    <span>{message}</span>
+                  </p>
+                </NetworkingActivityRow>
               ))}
               {tokenomicsLogRows.map((entry, index) => {
-                const tone = networkSyncLogTone(entry);
+                const logTone = networkSyncLogTone(entry);
+                const tone = logTone === "red" ? "bad" : logTone === "orange" ? "warn" : logTone === "green" ? "good" : "info";
                 const stage = networkSyncLogStage(entry);
                 const detail = networkSyncLogDetail(entry, normalized.nowMs);
                 return (
-                  <NetworkingRow
-                    key={`tokenomics:${entry?.tsMs || entry?.ts_ms || index}:${stage}`}
-                    data-tone={tone === "red" ? "error" : undefined}
-                  >
-                    <NetworkingStatusDot data-tone={tone} />
-                    <NetworkingRowMain>
-                      <strong title={stage}>Tokenomics: {stage}</strong>
-                      <p title={detail}>{detail}</p>
-                    </NetworkingRowMain>
-                  </NetworkingRow>
+                  <NetworkingActivityRow key={`tokenomics:${entry?.tsMs || entry?.ts_ms || index}:${stage}`}>
+                    <NetworkingRowDot data-tone={tone} />
+                    <em>Tokenomics</em>
+                    <p title={`${stage} · ${detail}`}>
+                      <strong>{stage}</strong>
+                      <span>{detail}</span>
+                    </p>
+                  </NetworkingActivityRow>
                 );
               })}
-            </NetworkingList>
+            </NetworkingActivityList>
           ) : (
-            <NetworkingEmpty>No errors or sync logs recorded.</NetworkingEmpty>
+            <NetworkingEmpty>No errors or sync events recorded.</NetworkingEmpty>
           )}
-        </NetworkingSection>
+        </NetworkingActivity>
       </NetworkingDialog>
     </NetworkingOverlay>
   );
@@ -36997,6 +37078,105 @@ export default function App() {
       }
       return { error: "Unsupported model configuration command." };
     };
+    const remoteAgentChatConfigCommandIsBareSlash = (command) => (
+      /^\/(?:model|effort)\s*$/i.test(String(command || "").trim())
+    );
+    const waitRemoteAgentChatConfigSubmitSettle = (delayMs = 120) => (
+      new Promise((resolve) => {
+        window.setTimeout(resolve, Math.max(0, Number(delayMs) || 0));
+      })
+    );
+    const remoteAgentChatConfigSubmitSequences = (provider) => {
+      const primary = getTerminalSubmitSequence(provider, false);
+      const sequences = [];
+      if (primary) {
+        sequences.push(primary);
+      }
+      if (provider === "codex" && primary !== "\r") {
+        sequences.push("\r");
+      }
+      return [...new Set(sequences)];
+    };
+    const writeRemoteAgentChatConfigCommand = async ({
+      command,
+      instanceId,
+      paneId,
+      provider,
+      threadId,
+    }) => {
+      if (remoteAgentChatConfigCommandIsBareSlash(command)) {
+        throw new Error("Refusing to send a bare model or effort slash command.");
+      }
+      if (provider !== "codex") {
+        await invoke("terminal_write", {
+          data: buildTerminalSubmittedInput(command, provider),
+          instanceId: Number.isInteger(instanceId) ? instanceId : undefined,
+          paneId,
+          promptEventSource: "remote-model-config",
+          threadId: threadId || undefined,
+        });
+        return;
+      }
+      await invoke("terminal_write", {
+        data: command,
+        instanceId: Number.isInteger(instanceId) ? instanceId : undefined,
+        paneId,
+        promptEventSource: "remote-model-config",
+        threadId: threadId || undefined,
+      });
+      await waitRemoteAgentChatConfigSubmitSettle();
+      const submitSequences = remoteAgentChatConfigSubmitSequences(provider);
+      if (!submitSequences.length) {
+        throw new Error("Remote model configuration could not resolve a submit sequence.");
+      }
+      for (const submitSequence of submitSequences) {
+        await invoke("terminal_write", {
+          data: submitSequence,
+          instanceId: Number.isInteger(instanceId) ? instanceId : undefined,
+          paneId,
+          promptEventSource: "remote-model-config",
+          threadId: threadId || undefined,
+        });
+        if (submitSequences.length > 1) {
+          await waitRemoteAgentChatConfigSubmitSettle();
+        }
+      }
+    };
+    const remoteAgentChatConfigDedupeKey = ({
+      commandKind,
+      event,
+      provider,
+      target,
+      terminal,
+      workspaceId,
+    }) => {
+      const normalizedKind = normalizeRemoteCommandName(commandKind);
+      const configType = normalizedKind.includes("effort") ? "effort" : "model";
+      const value = configType === "effort"
+        ? remoteCommandStringField(event, [
+          "reasoning_effort",
+          "reasoningEffort",
+          "effort",
+          "thinking_power",
+          "thinkingPower",
+        ]).toLowerCase()
+        : remoteCommandStringField(event, ["model_id", "modelId", "model"]);
+      const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"])
+        || String(target?.targetTerminalId || "").trim();
+      const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"])
+        || String(target?.targetThreadId || "").trim();
+      const sessionFields = remoteAgentChatConfigSessionFields(event, terminal);
+      return [
+        String(workspaceId || "").trim(),
+        paneId,
+        threadId,
+        provider || "",
+        configType,
+        value,
+        sessionFields.providerSessionId || "",
+        sessionFields.agentChatSessionId || "",
+      ].join("|");
+    };
     const recordRemoteAgentChatConfigConfirmation = async ({
       commandId,
       event,
@@ -37067,12 +37247,12 @@ export default function App() {
       if (!built.command) {
         throw new Error(built.error || "Unable to build model configuration command.");
       }
-      await invoke("terminal_write", {
-        data: buildTerminalSubmittedInput(built.command, provider),
-        instanceId: Number.isInteger(instanceId) ? instanceId : undefined,
+      await writeRemoteAgentChatConfigCommand({
+        command: built.command,
+        instanceId,
         paneId,
-        promptEventSource: "remote-model-config",
-        threadId: threadId || undefined,
+        provider,
+        threadId,
       });
       const confirmationRecorded = Boolean(built.recordModelId || built.recordReasoningEffort);
       if (confirmationRecorded) {
@@ -37171,10 +37351,37 @@ export default function App() {
         return;
       }
       if (!assessment.idle) {
+        const provider = remoteAgentChatConfigProvider(event, agentId, terminal);
+        const dedupeKey = remoteAgentChatConfigDedupeKey({
+          commandKind,
+          event,
+          provider,
+          target,
+          terminal,
+          workspaceId,
+        });
+        const duplicateQueued = Array.from(remoteModelConfigQueueRef.current.values()).find((request) => (
+          request
+            && request.commandId !== commandId
+            && request.dedupeKey
+            && request.dedupeKey === dedupeKey
+        ));
+        if (duplicateQueued) {
+          await recordRemoteCommandStatus(event, "queued", "Duplicate model configuration command coalesced with an already queued request.", {
+            assessment,
+            commandId,
+            commandKind,
+            coalescedWithCommandId: duplicateQueued.commandId,
+            terminal: remoteControlTerminalSummary(terminal, target),
+            workspaceId,
+          });
+          return;
+        }
         const queued = {
           agentId,
           commandId,
           commandKind,
+          dedupeKey,
           event,
           queuedAtMs: Date.now(),
           target,
@@ -37506,12 +37713,16 @@ export default function App() {
         window.dispatchEvent(new CustomEvent(REMOTE_TODO_REQUEUE_EVENT, {
           detail: {
             commandId,
-            item: {
-              createdAt: event.created_at || event.createdAt || new Date().toISOString(),
-              id: todoId,
-              kind: "todo",
-              remoteCommand: {
-                commandId,
+	            item: {
+	              aliasIds: [todoId, commandId].filter(Boolean),
+	              commandId,
+	              command_id: commandId,
+	              createdAt: event.created_at || event.createdAt || new Date().toISOString(),
+	              id: todoId,
+	              identityTokens: [todoId, commandId].filter(Boolean),
+	              kind: "todo",
+	              remoteCommand: {
+	                commandId,
                 source: event.source || "next-diffforge",
                 targetAgentId: agentId || "",
                 targetTerminalId,
@@ -37519,10 +37730,12 @@ export default function App() {
                 targetTerminalName,
                 targetThreadId,
                 todoId,
-              },
-              source: "next-remote-control",
-              targetAgentId: agentId || "",
-              targetAgentLabel: agentId ? getManagedAgentLabel(agentId) : "",
+	              },
+	              source: "next-remote-control",
+	              todoId,
+	              todo_id: todoId,
+	              targetAgentId: agentId || "",
+	              targetAgentLabel: agentId ? getManagedAgentLabel(agentId) : "",
               targetTerminalId,
               targetTerminalIndex,
               targetTerminalName,
@@ -37539,9 +37752,9 @@ export default function App() {
             workspaceId,
           },
         }));
-        await recordRemoteCommandStatus(event, "completed", "Todo queued for dispatch on the desktop.", {
-          commandId,
-          commandKind,
+	        await recordRemoteCommandStatus(event, "queued", "Todo queued for dispatch on the desktop.", {
+	          commandId,
+	          commandKind,
           targetTerminalId,
           targetTerminalIndex,
           targetTerminalName,
