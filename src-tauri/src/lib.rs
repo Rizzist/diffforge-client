@@ -2679,6 +2679,7 @@ include!("activity_overlay.rs");
 include!("todo_dispatch.rs");
 include!("agent_accounts.rs");
 include!("background_mode.rs");
+include!("vm_sandbox.rs");
 include!("audio.rs");
 include!("audio_history.rs");
 include!("handsfree_audio.rs");
@@ -5177,6 +5178,7 @@ pub fn run() {
             local_whisper_partial: Arc::new(Mutex::new(None)),
             local_whisper_partial_generation: Arc::new(AtomicU64::new(0)),
         })
+        .manage(VmSandboxState::default())
         .manage(SnippingState::new())
         .plugin(tauri_plugin_autostart::init(
             MacosLauncher::LaunchAgent,
@@ -5355,6 +5357,8 @@ pub fn run() {
             save_todo_text_attachment,
             whisper_model_status,
             download_whisper_model,
+            vm_sandbox_runtime_status,
+            vm_sandbox_install_runtime,
             select_whisper_model,
             uninstall_whisper_model,
             audio_input_devices,

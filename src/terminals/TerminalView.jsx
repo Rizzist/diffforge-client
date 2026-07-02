@@ -23,6 +23,7 @@ import { Webhook } from "@styled-icons/material-rounded/Webhook";
 import { TERMINAL_WINDOW_CLOSED_EVENT } from "./TerminalWindowHost.jsx";
 import WebPane from "../web/WebPane.jsx";
 import PcbWorkspacePane from "../pcb/PcbWorkspacePane.jsx";
+import VmSandboxPane from "../vm/VmSandboxPane.jsx";
 import {
   PCB_PANEL_COMMAND_EVENT,
   PCB_PANEL_CLOSED_EVENT,
@@ -272,6 +273,7 @@ const TERMINAL_EMPTY_PANEL_LAUNCHERS = Object.freeze([
   { id: "web", label: "Web" },
   { id: "docs", label: "Docs" },
   { id: "pcb", label: "PCB" },
+  { id: "vm", label: "VM Sandbox" },
   { id: "canvas", label: "Terminal canvas" },
   { id: "windows", label: "Window breakout" },
 ]);
@@ -280,7 +282,7 @@ const TERMINAL_TOOLBOX_PANEL_LAUNCHERS = Object.freeze([
   { id: "web", label: "Web" },
   { id: "docs", label: "Docs" },
   { id: "pcb", label: "PCB" },
-  { id: "simulator-3d", label: "3D Simulator", unavailable: true },
+  { id: "vm", label: "VM Sandbox" },
   { id: "whiteboard", label: "Whiteboard", unavailable: true },
 ]);
 const TERMINAL_BREAKOUT_PHASE_GRID = "grid";
@@ -1307,6 +1309,9 @@ function TerminalToolboxPanelGlyph({ panelId }) {
   }
   if (panelId === "pcb") {
     return <ButtonProcessIcon aria-hidden="true" />;
+  }
+  if (panelId === "vm") {
+    return <DeviceComputerIcon aria-hidden="true" />;
   }
   return <ButtonHubIcon aria-hidden="true" />;
 }
@@ -22330,6 +22335,7 @@ function TerminalView({
   agentStatusState,
   addWorkspaceTerminal,
   addWorkspacePcbPane,
+  addWorkspaceVmPane,
   addWorkspaceWebPane,
   paneKinds = {},
   changeWorkspaceTerminalRole,
@@ -28873,6 +28879,14 @@ function TerminalView({
     measureTerminalLayout();
   }, [addWorkspacePcbPane, logicalTerminalIndexes.length, measureTerminalLayout, terminalWorkspace?.id]);
 
+  const handleAddVmPane = useCallback(() => {
+    if (!terminalWorkspace?.id || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
+      return;
+    }
+    addWorkspaceVmPane?.({ workspaceId: terminalWorkspace.id });
+    measureTerminalLayout();
+  }, [addWorkspaceVmPane, logicalTerminalIndexes.length, measureTerminalLayout, terminalWorkspace?.id]);
+
   const handleOpenEmptyStateWebPanel = useCallback(() => {
     handleAddWebPane();
   }, [handleAddWebPane]);
@@ -28889,6 +28903,10 @@ function TerminalView({
       onOpenWorkspacePcbPanel({ source: "terminal_empty_state", workspaceId: terminalWorkspace.id });
     }
   }, [addWorkspacePcbPane, handleAddPcbPane, onOpenWorkspacePcbPanel, terminalWorkspace?.id]);
+
+  const handleOpenEmptyStateVmPanel = useCallback(() => {
+    handleAddVmPane();
+  }, [handleAddVmPane]);
 
   const handleOpenToolboxAgent = useCallback((role) => {
     openWorkspaceTerminalPane(role, "terminal_toolbox");
@@ -28910,6 +28928,10 @@ function TerminalView({
       onOpenWorkspacePcbPanel({ source: "terminal_toolbox", workspaceId: terminalWorkspace.id });
     }
   }, [addWorkspacePcbPane, handleAddPcbPane, onOpenWorkspacePcbPanel, terminalWorkspace?.id]);
+
+  const handleOpenToolboxVmPanel = useCallback(() => {
+    handleAddVmPane();
+  }, [handleAddVmPane]);
 
   const toolboxAgentOptions = useMemo(() => (
     TERMINAL_EMPTY_AGENT_LAUNCHERS.map((launcher) => {
@@ -29008,7 +29030,28 @@ function TerminalView({
               ? "Panel limit reached"
               : available
                 ? "Add PCB panel"
-                : "PCB panel unavailable",
+            : "PCB panel unavailable",
+        };
+      }
+      if (launcher.id === "vm") {
+        const available = Boolean(
+          terminalWorkspace?.id
+            && typeof addWorkspaceVmPane === "function"
+            && !terminalPaneLimitReached,
+        );
+        return {
+          ...launcher,
+          detail: "Add VM sandbox",
+          disabled: !available,
+          ready: available,
+          statusLabel: terminalPaneLimitReached ? "limit" : available ? "ready" : "disabled",
+          title: !terminalWorkspace?.id
+            ? "Select a workspace"
+            : terminalPaneLimitReached
+              ? "Panel limit reached"
+              : available
+                ? "Add VM Sandbox panel"
+                : "VM Sandbox unavailable",
         };
       }
       return {
@@ -29023,6 +29066,7 @@ function TerminalView({
   ), [
     addWorkspaceWebPane,
     addWorkspacePcbPane,
+    addWorkspaceVmPane,
     onOpenWorkspaceDocumentPanel,
     onOpenWorkspacePcbPanel,
     terminalPaneLimitReached,
@@ -34944,6 +34988,9 @@ function TerminalView({
     if (["pcb", "pcb-design", "pcb-panel", "workspace-pcb", "board"].includes(token)) {
       return "pcb";
     }
+    if (["vm", "vms", "qemu", "sandbox-vm", "vm-sandbox", "virtual-machine", "virtual-machines", "workspace-vm"].includes(token)) {
+      return "vm";
+    }
     if ([
       "doc",
       "docs",
@@ -34994,7 +35041,9 @@ function TerminalView({
         ? "web"
         : paneKinds?.[terminalIndex] === "pcb"
           ? "pcb"
-          : "terminal";
+          : paneKinds?.[terminalIndex] === "vm"
+            ? "vm"
+            : "terminal";
       if (filterKind && paneKind !== filterKind) {
         return;
       }
@@ -35018,7 +35067,9 @@ function TerminalView({
           ? "Web"
           : paneKind === "pcb"
             ? board?.name || "PCB"
-            : getManagedAgentLabel(role || WORKSPACE_TERMINAL_ROLE_GENERIC),
+            : paneKind === "vm"
+              ? "VM Sandbox"
+              : getManagedAgentLabel(role || WORKSPACE_TERMINAL_ROLE_GENERIC),
         workspaceId,
         workspace_id: workspaceId,
         workspaceName: workspaceNameText,
@@ -35037,6 +35088,11 @@ function TerminalView({
             boardPath: board?.path || "",
             poppedOut: Boolean(pcbBreakoutPanesRef.current[paneId]),
             repoPath,
+          };
+        } else if (paneKind === "vm") {
+          panel.context = {
+            repoPath,
+            runtime: "qemu",
           };
         } else {
           panel.context = {
@@ -35243,7 +35299,13 @@ function TerminalView({
       openWorkspaceDocumentPanel(entry);
       return focusWorkspacePanelFromControl({ ...input, kind: "docs" });
     }
-    const addPane = kind === "pcb" ? addWorkspacePcbPane : kind === "web" ? addWorkspaceWebPane : null;
+    const addPane = kind === "pcb"
+      ? addWorkspacePcbPane
+      : kind === "web"
+        ? addWorkspaceWebPane
+        : kind === "vm"
+          ? addWorkspaceVmPane
+          : null;
     if (!addPane || !terminalWorkspace?.id) {
       throw new Error("That workspace panel cannot be opened here.");
     }
@@ -35299,7 +35361,7 @@ function TerminalView({
         queueable: false,
         terminalIndex: result.terminalIndex,
         terminal_index: result.terminalIndex,
-        title: kind === "pcb" ? "PCB" : "Web",
+        title: kind === "pcb" ? "PCB" : kind === "vm" ? "VM Sandbox" : "Web",
         workspaceId: terminalWorkspace.id,
         workspace_id: terminalWorkspace.id,
         workspaceName: terminalWorkspace.name || workspaceName || "",
@@ -35313,6 +35375,7 @@ function TerminalView({
     };
   }, [
     addWorkspacePcbPane,
+    addWorkspaceVmPane,
     addWorkspaceWebPane,
     defaultWorkingDirectory,
     focusWorkspacePanelFromControl,
@@ -35468,6 +35531,12 @@ function TerminalView({
         });
       } else {
         throw new Error(`Unsupported PCB panel action: ${action}`);
+      }
+    } else if (panel.kind === "vm") {
+      if (["open", "focus", "refresh", "reload"].includes(action)) {
+        focusWorkspacePanelFromControl({ ...input, kind: "vm" });
+      } else {
+        throw new Error(`Unsupported VM Sandbox panel action: ${action}`);
       }
     } else if (panel.kind === "docs") {
       if (action === "open") {
@@ -37668,7 +37737,9 @@ function TerminalView({
   const getTerminalSlotStyle = useCallback((terminalIndex) => {
     const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
     const fullscreenThisTerminal = fullscreenActive && fullscreenTerminalIndex === terminalIndex;
-    const isPanelPane = paneKinds?.[terminalIndex] === "web" || paneKinds?.[terminalIndex] === "pcb";
+    const isPanelPane = paneKinds?.[terminalIndex] === "web"
+      || paneKinds?.[terminalIndex] === "pcb"
+      || paneKinds?.[terminalIndex] === "vm";
 
     if (
       draggingThisTerminal
@@ -38050,6 +38121,7 @@ function TerminalView({
           const slotTabMeta = getTerminalTabAgentMeta(terminalRole);
           const isWebPane = paneKinds?.[terminalIndex] === "web";
           const isPcbPane = paneKinds?.[terminalIndex] === "pcb";
+          const isVmPane = paneKinds?.[terminalIndex] === "vm";
           if (isWebPane) {
             const webSurfaceReady = hasMeasuredRect;
             const webLayoutRect = slotRectForLayout ? {
@@ -38205,6 +38277,77 @@ function TerminalView({
                   poppedOut={Boolean(pcbBreakoutPanes[terminalPaneId])}
                   repoPath={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || ""}
                   resumeNonce={pcbPaneResumeNonces[terminalPaneId] || 0}
+                  terminalIndex={terminalIndex}
+                  workspaceId={terminalWorkspace?.id || ""}
+                />
+                {terminalBreakoutLayoutActive && !fullscreenThisTerminal && terminalActive && (
+                  <TerminalBreakoutResizeHandles data-terminal-control="true">
+                    {TERMINAL_BREAKOUT_RESIZE_HANDLES.map((handle) => (
+                      <TerminalBreakoutResizeHandle
+                        aria-label={handle.label}
+                        data-handle={handle.id}
+                        data-terminal-control="true"
+                        data-terminal-resize-handle="true"
+                        key={handle.id}
+                        onPointerDown={(event) => beginTerminalBreakoutResize(event, terminalIndex, handle)}
+                        title={handle.label}
+                        type="button"
+                      />
+                    ))}
+                  </TerminalBreakoutResizeHandles>
+                )}
+              </TerminalSurfaceSlot>
+            );
+          }
+          if (isVmPane) {
+            return (
+              <TerminalSurfaceSlot
+                data-terminal-active={terminalActive ? "true" : "false"}
+                data-terminal-breakout={terminalBreakoutLayoutActive ? "true" : "false"}
+                data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
+                data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
+                data-terminal-hidden="false"
+                data-terminal-index={terminalIndex}
+                data-terminal-interacting={terminalBreakoutCanvasInteracting ? "true" : "false"}
+                data-terminal-surface-slot="true"
+                data-terminal-tab-hidden={tabHidden ? "true" : "false"}
+                data-terminal-vm-pane="true"
+                key={`${terminalWorkspace.id}-${terminalIndex}`}
+                onClickCapture={(event) => handleTerminalBreakoutSlotClickCapture(event, terminalIndex)}
+                style={getTerminalSlotStyle(terminalIndex)}
+              >
+                <VmSandboxPane
+                  dragActive={terminalDragActive}
+                  fullscreenActive={fullscreenActive}
+                  isActive={isWorkspaceSurfaceVisible && !tabHidden}
+                  isFullscreen={fullscreenThisTerminal}
+                  onClose={(index) => closeWorkspaceTerminal({ workspaceId: terminalWorkspace?.id || "", terminalIndex: index })}
+                  onDragHandlePointerDown={(event, index, pid) => {
+                    if (event.button !== 0) {
+                      return;
+                    }
+                    const slotEl = event.currentTarget.closest("[data-terminal-surface-slot]");
+                    const surfaceEl = event.currentTarget.closest("[data-workspace-vm-shell]") || slotEl;
+                    if (!surfaceEl) {
+                      return;
+                    }
+                    event.preventDefault();
+                    event.stopPropagation();
+                    handleBeginTerminalDrag({
+                      clientX: event.clientX,
+                      clientY: event.clientY,
+                      paneId: pid,
+                      panelRect: getPlainDomRect(slotEl?.getBoundingClientRect?.()),
+                      pointerId: event.pointerId,
+                      surfaceRect: getPlainDomRect(surfaceEl?.getBoundingClientRect?.()),
+                      terminalIndex: index,
+                      workspaceId: terminalWorkspace?.id || "",
+                    });
+                  }}
+                  onSplit={handleSplitTerminal}
+                  onToggleFullscreen={(index, pid) => handleToggleFullscreenTerminal({ paneId: pid, terminalIndex: index })}
+                  paneId={terminalPaneId}
+                  paneLimitReached={terminalPaneLimitReached}
                   terminalIndex={terminalIndex}
                   workspaceId={terminalWorkspace?.id || ""}
                 />
@@ -38786,7 +38929,9 @@ function TerminalView({
                       ? handleOpenToolboxDocsPanel
                       : option.id === "pcb"
                         ? handleOpenToolboxPcbPanel
-                        : undefined;
+                        : option.id === "vm"
+                          ? handleOpenToolboxVmPanel
+                          : undefined;
 
                   return (
                     <TerminalToolboxOption
@@ -38843,6 +38988,19 @@ function TerminalView({
             type="button"
           >
             <DeviceWebIcon aria-hidden="true" />
+          </TerminalBreakoutButton>
+          <TerminalBreakoutButton
+            aria-label="Add VM Sandbox panel to canvas"
+            disabled={!addWorkspaceVmPane || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT}
+            onClick={handleAddVmPane}
+            title={
+              logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT
+                ? "Panel limit reached"
+                : "Add VM Sandbox panel"
+            }
+            type="button"
+          >
+            <DeviceComputerIcon aria-hidden="true" />
           </TerminalBreakoutButton>
           <TerminalBreakoutTopBarDivider aria-hidden="true" />
           <TerminalBreakoutButton
@@ -38942,6 +39100,7 @@ function TerminalView({
             const webPanel = launcher.id === "web";
             const docsPanel = launcher.id === "docs";
             const pcbPanel = launcher.id === "pcb";
+            const vmPanel = launcher.id === "vm";
             const webEnabled = Boolean(workspaceSelected && addWorkspaceWebPane && !limitReached);
             const docsEnabled = Boolean(
               workspaceSelected
@@ -38952,10 +39111,19 @@ function TerminalView({
                 && (typeof addWorkspacePcbPane === "function" || typeof onOpenWorkspacePcbPanel === "function")
                 && !limitReached,
             );
-            const enabled = webPanel ? webEnabled : docsPanel ? docsEnabled : pcbPanel ? pcbEnabled : false;
+            const vmEnabled = Boolean(workspaceSelected && addWorkspaceVmPane && !limitReached);
+            const enabled = webPanel
+              ? webEnabled
+              : docsPanel
+                ? docsEnabled
+                : pcbPanel
+                  ? pcbEnabled
+                  : vmPanel
+                    ? vmEnabled
+                    : false;
             const title = !workspaceSelected
               ? "Select a workspace"
-              : limitReached && (webPanel || pcbPanel)
+              : limitReached && (webPanel || pcbPanel || vmPanel)
                 ? "Panel limit reached"
                 : webPanel
                   ? webEnabled ? "Add web panel" : "Web panel unavailable"
@@ -38963,14 +39131,18 @@ function TerminalView({
                     ? docsEnabled ? "Open Docs panel" : "Docs panel unavailable"
                     : pcbPanel
                       ? pcbEnabled ? "Add PCB panel" : "PCB panel unavailable"
-                      : `${launcher.label} requires a terminal`;
+                      : vmPanel
+                        ? vmEnabled ? "Add VM Sandbox panel" : "VM Sandbox unavailable"
+                        : `${launcher.label} requires a terminal`;
             const handleClick = webPanel
               ? handleOpenEmptyStateWebPanel
               : docsPanel
                 ? handleOpenEmptyStateDocsPanel
                 : pcbPanel
                   ? handleOpenEmptyStatePcbPanel
-                  : undefined;
+                  : vmPanel
+                    ? handleOpenEmptyStateVmPanel
+                    : undefined;
 
             return (
               <TerminalNoPanelsIconButton

@@ -267,6 +267,25 @@ fn pcb_source_is_default_starter(board_name: &str, source: &str) -> bool {
     source.trim() == pcb_starter_source(board_name).trim()
 }
 
+// Boards stay on disk when their workspace is deleted, but the manifest still
+// names the dead workspace as owner, which stranded them: a workspace
+// re-created at the same location could never see or open them. An owner
+// missing from the local catalog (live entries across every scope file) is
+// orphaned and reclaimable by the requesting workspace. `None` means the
+// catalog could not be read — stay conservative and treat every owner as live.
+fn pcb_live_workspace_ids(app: &tauri::AppHandle) -> Option<std::collections::HashSet<String>> {
+    local_workspace_catalog_all_workspace_ids(app).ok()
+}
+
+fn pcb_owner_is_orphaned(
+    owner: &str,
+    live_workspace_ids: Option<&std::collections::HashSet<String>>,
+) -> bool {
+    live_workspace_ids
+        .map(|ids| !ids.contains(owner))
+        .unwrap_or(false)
+}
+
 // Reject path traversal / absolute escapes from a frontend-provided board path.
 fn pcb_resolve_board_abs(
     root: &std::path::Path,
@@ -320,7 +339,11 @@ fn pcb_collect_boards(hardware: &std::path::Path, root: &std::path::Path, out: &
     }
 }
 
-fn pcb_documents_list_blocking(repo_path: String, workspace_id: Option<String>) -> Result<serde_json::Value, String> {
+fn pcb_documents_list_blocking(
+    repo_path: String,
+    workspace_id: Option<String>,
+    live_workspace_ids: Option<std::collections::HashSet<String>>,
+) -> Result<serde_json::Value, String> {
     let (root, hardware) = pcb_hardware_root(repo_path.as_str())?;
     let workspace_text = pcb_workspace_text(workspace_id);
     let mut manifest = pcb_read_manifest(&root)?;
@@ -335,7 +358,17 @@ fn pcb_documents_list_blocking(repo_path: String, workspace_id: Option<String>) 
                 return false;
             };
             match pcb_manifest_board_workspace(&manifest, path) {
-                Some(owner) => owner == workspace_text,
+                Some(owner) if owner == workspace_text => true,
+                Some(owner) => {
+                    if pcb_owner_is_orphaned(&owner, live_workspace_ids.as_ref())
+                        && pcb_manifest_set_board(&mut manifest, path, &workspace_text).is_ok()
+                    {
+                        manifest_changed = true;
+                        true
+                    } else {
+                        false
+                    }
+                }
                 None => {
                     let Ok(abs) = pcb_resolve_board_abs(&root, path) else {
                         return false;
@@ -377,6 +410,7 @@ fn pcb_document_read_blocking(
     repo_path: String,
     board_path: String,
     workspace_id: Option<String>,
+    live_workspace_ids: Option<std::collections::HashSet<String>>,
 ) -> Result<serde_json::Value, String> {
     let (root, _) = pcb_hardware_root(repo_path.as_str())?;
     let abs = pcb_resolve_board_abs(&root, board_path.as_str())?;
@@ -390,7 +424,14 @@ fn pcb_document_read_blocking(
         let mut manifest = pcb_read_manifest(&root)?;
         match pcb_manifest_board_workspace(&manifest, &rel_path) {
             Some(owner) if owner == workspace_text => {}
-            Some(_) => return Err("This PCB board belongs to a different workspace.".to_string()),
+            Some(owner) => {
+                if !pcb_owner_is_orphaned(&owner, live_workspace_ids.as_ref()) {
+                    return Err("This PCB board belongs to a different workspace.".to_string());
+                }
+                pcb_manifest_set_board(&mut manifest, &rel_path, &workspace_text)?;
+                pcb_write_manifest(&root, &manifest)?;
+                claimed = true;
+            }
             None => {
                 if pcb_source_is_default_starter(&board_name, &source) {
                     return Err("This PCB board is not assigned to this workspace.".to_string());
@@ -415,6 +456,7 @@ fn pcb_document_create_blocking(
     repo_path: String,
     name: String,
     workspace_id: Option<String>,
+    live_workspace_ids: Option<std::collections::HashSet<String>>,
 ) -> Result<serde_json::Value, String> {
     let (root, hardware) = pcb_hardware_root(repo_path.as_str())?;
     let workspace_text = pcb_workspace_text(workspace_id);
@@ -423,9 +465,17 @@ fn pcb_document_create_blocking(
     let mut dir = hardware.join(&slug);
     let mut file = dir.join(format!("{slug}{PCB_BOARD_EXTENSION}"));
     if !workspace_text.is_empty() {
+        let owner_is_reclaimable = |owner: Option<&str>| {
+            owner
+                .map(|owner| {
+                    owner == workspace_text
+                        || pcb_owner_is_orphaned(owner, live_workspace_ids.as_ref())
+                })
+                .unwrap_or(false)
+        };
         let base_rel = pcb_relative_path(&root, &file);
         let base_owner = pcb_manifest_board_workspace(&manifest, &base_rel);
-        if file.exists() && base_owner.as_deref() != Some(workspace_text.as_str()) {
+        if file.exists() && !owner_is_reclaimable(base_owner.as_deref()) {
             let token = pcb_workspace_token(&workspace_text);
             let mut counter = 0usize;
             loop {
@@ -438,7 +488,7 @@ fn pcb_document_create_blocking(
                 file = dir.join(format!("{slug}{PCB_BOARD_EXTENSION}"));
                 let rel = pcb_relative_path(&root, &file);
                 let owner = pcb_manifest_board_workspace(&manifest, &rel);
-                if !file.exists() || owner.as_deref() == Some(workspace_text.as_str()) {
+                if !file.exists() || owner_is_reclaimable(owner.as_deref()) {
                     break;
                 }
                 counter += 1;
@@ -474,6 +524,7 @@ fn pcb_document_delete_blocking(
     repo_path: String,
     board_path: String,
     workspace_id: Option<String>,
+    live_workspace_ids: Option<std::collections::HashSet<String>>,
 ) -> Result<serde_json::Value, String> {
     let (root, _) = pcb_hardware_root(repo_path.as_str())?;
     let abs = pcb_resolve_board_abs(&root, board_path.as_str())?;
@@ -482,7 +533,9 @@ fn pcb_document_delete_blocking(
     let mut manifest = pcb_read_manifest(&root)?;
     if !workspace_text.is_empty() {
         if let Some(owner) = pcb_manifest_board_workspace(&manifest, &rel_path) {
-            if owner != workspace_text {
+            if owner != workspace_text
+                && !pcb_owner_is_orphaned(&owner, live_workspace_ids.as_ref())
+            {
                 return Err("This PCB board belongs to a different workspace.".to_string());
             }
         } else {
@@ -508,8 +561,15 @@ fn pcb_document_delete_blocking(
 }
 
 #[tauri::command]
-async fn pcb_documents_list(repo_path: String, workspace_id: Option<String>) -> Result<serde_json::Value, String> {
-    tauri::async_runtime::spawn_blocking(move || pcb_documents_list_blocking(repo_path, workspace_id))
+async fn pcb_documents_list(
+    app: tauri::AppHandle,
+    repo_path: String,
+    workspace_id: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let live_workspace_ids = pcb_live_workspace_ids(&app);
+        pcb_documents_list_blocking(repo_path, workspace_id, live_workspace_ids)
+    })
         .await
         .map_err(|error| format!("PCB document list worker failed: {error}"))?
 }
@@ -521,8 +581,10 @@ async fn pcb_document_read(
     board_path: String,
     workspace_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    let app_for_worker = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        pcb_document_read_blocking(repo_path, board_path, workspace_id)
+        let live_workspace_ids = pcb_live_workspace_ids(&app_for_worker);
+        pcb_document_read_blocking(repo_path, board_path, workspace_id, live_workspace_ids)
     })
         .await
         .map_err(|error| format!("PCB document read worker failed: {error}"))??;
@@ -544,8 +606,10 @@ async fn pcb_document_create(
     name: String,
     workspace_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    let app_for_worker = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        pcb_document_create_blocking(repo_path, name, workspace_id)
+        let live_workspace_ids = pcb_live_workspace_ids(&app_for_worker);
+        pcb_document_create_blocking(repo_path, name, workspace_id, live_workspace_ids)
     })
         .await
         .map_err(|error| format!("PCB document create worker failed: {error}"))??;
@@ -565,8 +629,10 @@ async fn pcb_document_delete(
     board_path: String,
     workspace_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
+    let app_for_worker = app.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        pcb_document_delete_blocking(repo_path, board_path, workspace_id)
+        let live_workspace_ids = pcb_live_workspace_ids(&app_for_worker);
+        pcb_document_delete_blocking(repo_path, board_path, workspace_id, live_workspace_ids)
     })
         .await
         .map_err(|error| format!("PCB document delete worker failed: {error}"))??;
@@ -928,6 +994,7 @@ async fn pcb_window_open(
             repo_text.clone(),
             board_path.clone(),
             Some(workspace_text.clone()),
+            pcb_live_workspace_ids(&app),
         )?;
     }
 

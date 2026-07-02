@@ -3907,6 +3907,9 @@ const DEFAULT_WORKSPACE_WEB_PANEL_COUNT = 0;
 const MIN_WORKSPACE_PCB_COUNT = 0;
 const MAX_WORKSPACE_PCB_COUNT = 4;
 const DEFAULT_WORKSPACE_PCB_COUNT = 0;
+const MIN_WORKSPACE_VM_COUNT = 0;
+const MAX_WORKSPACE_VM_COUNT = 4;
+const DEFAULT_WORKSPACE_VM_COUNT = 0;
 const TERMINAL_DEFAULT_COLS = 80;
 const TERMINAL_DEFAULT_ROWS = 24;
 const TERMINAL_MIN_COLS = 20;
@@ -13944,10 +13947,10 @@ const WORKSPACE_PANEL_CARDS = [
     maxCount: MAX_WORKSPACE_PCB_COUNT,
   },
   {
-    id: "simulator-3d",
-    label: "3D Simulator",
-    statusLabel: "coming soon",
-    unavailable: true,
+    id: "vm-sandbox",
+    label: "VM Sandbox",
+    statusLabel: "runtime on first use",
+    maxCount: MAX_WORKSPACE_VM_COUNT,
   },
   {
     id: "touch-whiteboard",
@@ -13966,6 +13969,9 @@ function WorkspacePanelGlyph({ panelId }) {
   }
   if (panelId === "pcb-design") {
     return <ButtonProcessIcon aria-hidden="true" />;
+  }
+  if (panelId === "vm-sandbox") {
+    return <ButtonTerminalIcon aria-hidden="true" />;
   }
   if (panelId === "touch-whiteboard") {
     return <ButtonWhiteboardIcon aria-hidden="true" />;
@@ -14209,7 +14215,12 @@ function WorkspaceCreatePanel({
   const [browseError, setBrowseError] = useState("");
   const [cdDraft, setCdDraft] = useState("");
   const [agentCounts, setAgentCounts] = useState({});
-  const [panelCounts, setPanelCounts] = useState({ document: DEFAULT_WORKSPACE_DOCUMENT_COUNT, web: DEFAULT_WORKSPACE_WEB_PANEL_COUNT, "pcb-design": DEFAULT_WORKSPACE_PCB_COUNT });
+  const [panelCounts, setPanelCounts] = useState({
+    document: DEFAULT_WORKSPACE_DOCUMENT_COUNT,
+    web: DEFAULT_WORKSPACE_WEB_PANEL_COUNT,
+    "pcb-design": DEFAULT_WORKSPACE_PCB_COUNT,
+    "vm-sandbox": DEFAULT_WORKSPACE_VM_COUNT,
+  });
   const [agentPermissions, setAgentPermissions] = useState({});
   const [agentSessionModeDraft, setAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
   const [initializeGitDraft, setInitializeGitDraft] = useState(false);
@@ -14263,6 +14274,7 @@ function WorkspaceCreatePanel({
       document: DEFAULT_WORKSPACE_DOCUMENT_COUNT,
       web: DEFAULT_WORKSPACE_WEB_PANEL_COUNT,
       "pcb-design": DEFAULT_WORKSPACE_PCB_COUNT,
+      "vm-sandbox": DEFAULT_WORKSPACE_VM_COUNT,
     });
     setAgentPermissions(normalizeWorkspaceAgentPermissions(null, roleOptions));
     setAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
@@ -14411,6 +14423,17 @@ function WorkspaceCreatePanel({
         }
         return { ...current, "pcb-design": nextValue };
       });
+      return;
+    }
+    if (panelId === "vm-sandbox") {
+      setPanelCounts((current) => {
+        const currentValue = normalizeWorkspaceVmCount(current["vm-sandbox"]);
+        const nextValue = normalizeWorkspaceVmCount(currentValue + Number(delta || 0));
+        if (nextValue === currentValue) {
+          return current;
+        }
+        return { ...current, "vm-sandbox": nextValue };
+      });
     }
   }, []);
 
@@ -14439,7 +14462,8 @@ function WorkspaceCreatePanel({
     document: normalizeWorkspaceDocumentCount(panelCounts.document),
     web: normalizeWorkspaceWebPanelCount(panelCounts.web),
     "pcb-design": normalizeWorkspacePcbCount(panelCounts["pcb-design"]),
-  }), [panelCounts.document, panelCounts.web, panelCounts["pcb-design"]]);
+    "vm-sandbox": normalizeWorkspaceVmCount(panelCounts["vm-sandbox"]),
+  }), [panelCounts.document, panelCounts.web, panelCounts["pcb-design"], panelCounts["vm-sandbox"]]);
 
   useEffect(() => {
     if (!visible) {
@@ -14802,7 +14826,7 @@ function WorkspaceCreatePanel({
         <WorkspaceCreateSection>
           <SettingsLabel>Panels</SettingsLabel>
           <SettingsHint>
-            Pick non-terminal workspace panels. Web and PCB design panels open in the terminals grid. You can add or remove either later too.
+            Pick non-terminal workspace panels. Web, PCB design, and VM Sandbox panels open in the terminals grid. You can add or remove them later too.
           </SettingsHint>
           <WorkspacePanelCountCards
             counts={availablePanelCounts}
@@ -14822,6 +14846,9 @@ function WorkspaceCreatePanel({
               : ""}
             {availablePanelCounts["pcb-design"]
               ? ` and ${availablePanelCounts["pcb-design"]} PCB panel${availablePanelCounts["pcb-design"] === 1 ? "" : "s"}`
+              : ""}
+            {availablePanelCounts["vm-sandbox"]
+              ? ` and ${availablePanelCounts["vm-sandbox"]} VM Sandbox panel${availablePanelCounts["vm-sandbox"] === 1 ? "" : "s"}`
               : ""}
             {" "}will open in {getDirectoryName(currentDirectory) || "the chosen folder"}.
           </SettingsHint>
@@ -18018,6 +18045,14 @@ function normalizeWorkspacePcbCount(value) {
   return Math.min(MAX_WORKSPACE_PCB_COUNT, Math.max(MIN_WORKSPACE_PCB_COUNT, count));
 }
 
+function normalizeWorkspaceVmCount(value) {
+  const count = Number.parseInt(value, 10);
+  if (!Number.isFinite(count)) {
+    return DEFAULT_WORKSPACE_VM_COUNT;
+  }
+  return Math.min(MAX_WORKSPACE_VM_COUNT, Math.max(MIN_WORKSPACE_VM_COUNT, count));
+}
+
 function getWorkspaceDocumentCount(workspaceSettings, workspaceId) {
   const settings = workspaceSettings?.[workspaceId];
   const paneRecords = normalizeWorkspacePaneRecords(settings?.panes, { workspaceId });
@@ -18040,6 +18075,18 @@ function getWorkspacePcbCount(workspaceSettings, workspaceId) {
     return DEFAULT_WORKSPACE_PCB_COUNT;
   }
   return normalizeWorkspacePcbCount(settings.pcbCount);
+}
+
+function getWorkspaceVmCount(workspaceSettings, workspaceId) {
+  const settings = workspaceSettings?.[workspaceId];
+  const paneCount = getWorkspaceVmPaneIndexes(workspaceSettings, workspaceId).length;
+  if (paneCount > 0) {
+    return normalizeWorkspaceVmCount(paneCount);
+  }
+  if (!settings || !Object.prototype.hasOwnProperty.call(settings, "vmCount")) {
+    return DEFAULT_WORKSPACE_VM_COUNT;
+  }
+  return normalizeWorkspaceVmCount(settings.vmCount);
 }
 
 function getWorkspaceTerminalRoleIds(roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS) {
@@ -18687,6 +18734,10 @@ function normalizeWorkspaceSettings(value) {
         let pcbCount = hasPcbCount
           ? normalizeWorkspacePcbCount(settings.pcbCount)
           : DEFAULT_WORKSPACE_PCB_COUNT;
+        const hasVmCount = Object.prototype.hasOwnProperty.call(settings || {}, "vmCount");
+        let vmCount = hasVmCount
+          ? normalizeWorkspaceVmCount(settings.vmCount)
+          : DEFAULT_WORKSPACE_VM_COUNT;
         let paneKinds = {
           ...normalizeWorkspacePaneKinds(settings?.paneKinds),
           ...inputPaneKinds,
@@ -18695,17 +18746,29 @@ function normalizeWorkspaceSettings(value) {
         if (!hasPcbCount && existingPcbPaneCount > 0) {
           pcbCount = normalizeWorkspacePcbCount(existingPcbPaneCount);
         }
-        const hydratedPanes = ensureWorkspacePaneKindCount(
+        const existingVmPaneCount = workspacePaneKindsVmIndexes(paneKinds).length;
+        if (!hasVmCount && existingVmPaneCount > 0) {
+          vmCount = normalizeWorkspaceVmCount(existingVmPaneCount);
+        }
+        let hydratedPanes = ensureWorkspacePaneKindCount(
           paneKinds,
           terminalRoles,
           WORKSPACE_PANE_KIND_PCB,
           pcbCount,
           terminalRoles[0] || "codex",
         );
+        hydratedPanes = ensureWorkspacePaneKindCount(
+          hydratedPanes.paneKinds,
+          hydratedPanes.terminalRoles,
+          WORKSPACE_PANE_KIND_VM,
+          vmCount,
+          terminalRoles[0] || "codex",
+        );
         paneKinds = hydratedPanes.paneKinds;
         terminalRoles = hydratedPanes.terminalRoles;
         terminalCount = terminalRoles.length;
         pcbCount = workspacePaneKindsPcbIndexes(paneKinds).length;
+        vmCount = workspacePaneKindsVmIndexes(paneKinds).length;
         const hasLogicalTerminalIndexes = Object.prototype.hasOwnProperty.call(settings || {}, "logicalTerminalIndexes");
         const logicalTerminalIndexes = hasLogicalTerminalIndexes
           ? normalizePersistedWorkspaceLogicalIndexes(settings.logicalTerminalIndexes, terminalCount, paneKinds)
@@ -18728,6 +18791,7 @@ function normalizeWorkspaceSettings(value) {
           ? normalizePersistedWorkspaceDisplayRows(settings.displayRows, logicalTerminalIndexes)
           : null;
         const hasDefaultPcbCount = pcbCount === DEFAULT_WORKSPACE_PCB_COUNT;
+        const hasDefaultVmCount = vmCount === DEFAULT_WORKSPACE_VM_COUNT;
         const hasPanelPanes = workspacePaneKindsHasPanels(paneKinds);
         const paneRecordIndexes = Array.isArray(logicalTerminalIndexes)
           ? logicalTerminalIndexes
@@ -18760,6 +18824,7 @@ function normalizeWorkspaceSettings(value) {
             && !hasCustomTerminalRoles
             && hasDefaultDocumentsCount
             && hasDefaultPcbCount
+            && hasDefaultVmCount
             && !hasPanelPanes
             && !hasCustomAgentPermissions
             && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
@@ -18780,6 +18845,7 @@ function normalizeWorkspaceSettings(value) {
             terminalRoles,
             documentsCount,
             pcbCount,
+            vmCount,
             ...(panes.length ? { panes } : {}),
             ...(hasPanelPanes ? { paneKinds } : {}),
             ...(Array.isArray(logicalTerminalIndexes) ? { logicalTerminalIndexes } : {}),
@@ -20233,20 +20299,24 @@ const WORKSPACE_PANE_KIND_TERMINAL = "terminal";
 const WORKSPACE_PANE_KIND_DOCS = "docs";
 const WORKSPACE_PANE_KIND_WEB = "web";
 const WORKSPACE_PANE_KIND_PCB = "pcb";
+const WORKSPACE_PANE_KIND_VM = "vm";
 const WORKSPACE_PANE_KINDS = new Set([
   WORKSPACE_PANE_KIND_WEB,
   WORKSPACE_PANE_KIND_PCB,
+  WORKSPACE_PANE_KIND_VM,
 ]);
 const WORKSPACE_SLOT_PANE_KINDS = new Set([
   WORKSPACE_PANE_KIND_TERMINAL,
   WORKSPACE_PANE_KIND_WEB,
   WORKSPACE_PANE_KIND_PCB,
+  WORKSPACE_PANE_KIND_VM,
 ]);
 const WORKSPACE_PANE_RECORD_KINDS = new Set([
   WORKSPACE_PANE_KIND_TERMINAL,
   WORKSPACE_PANE_KIND_DOCS,
   WORKSPACE_PANE_KIND_WEB,
   WORKSPACE_PANE_KIND_PCB,
+  WORKSPACE_PANE_KIND_VM,
 ]);
 
 function normalizeWorkspacePaneKind(value, fallback = "") {
@@ -20266,12 +20336,16 @@ function normalizeWorkspacePaneKind(value, fallback = "") {
   if (["pcb", "pcb-design", "pcb-panel", "workspace-pcb"].includes(normalizedKind)) {
     return WORKSPACE_PANE_KIND_PCB;
   }
+  if (["vm", "vms", "qemu", "vm-sandbox", "sandbox-vm", "virtual-machine", "virtual-machines", "workspace-vm", "vmware"].includes(normalizedKind)) {
+    return WORKSPACE_PANE_KIND_VM;
+  }
   return fallback;
 }
 
 function workspacePaneRecordKindLabel(kind) {
   if (kind === WORKSPACE_PANE_KIND_DOCS) return "Docs";
   if (kind === WORKSPACE_PANE_KIND_PCB) return "PCB";
+  if (kind === WORKSPACE_PANE_KIND_VM) return "VM Sandbox";
   if (kind === WORKSPACE_PANE_KIND_WEB) return "Web";
   return "Terminal";
 }
@@ -20619,6 +20693,7 @@ function workspacePaneKindsHasPanels(paneKinds) {
 
 function workspacePaneKindLabel(kind) {
   if (kind === WORKSPACE_PANE_KIND_PCB) return "PCB";
+  if (kind === WORKSPACE_PANE_KIND_VM) return "VM Sandbox";
   if (kind === WORKSPACE_PANE_KIND_WEB) return "Web";
   return "Panel";
 }
@@ -20975,6 +21050,10 @@ function workspacePaneKindsPcbIndexes(paneKinds) {
   return workspacePaneKindsIndexes(paneKinds, WORKSPACE_PANE_KIND_PCB);
 }
 
+function workspacePaneKindsVmIndexes(paneKinds) {
+  return workspacePaneKindsIndexes(paneKinds, WORKSPACE_PANE_KIND_VM);
+}
+
 function getWorkspaceTerminalOnlyRolesForPaneKinds(
   logicalIndexes,
   terminalRoles,
@@ -20994,9 +21073,12 @@ function getWorkspaceTerminalOnlyRolesForPaneKinds(
     .map(({ role }) => role || fallbackRole);
 }
 
-function getWorkspaceDraftPanelPaneKinds(paneKinds, webPanelCount, pcbCount) {
+function getWorkspaceDraftPanelPaneKinds(paneKinds, webPanelCount, pcbCount, vmCount = null) {
   const normalizedPaneKinds = normalizeWorkspacePaneKinds(paneKinds);
   const nextPaneKinds = {};
+  const desiredVmCount = vmCount === null || vmCount === undefined
+    ? workspacePaneKindsVmIndexes(normalizedPaneKinds).length
+    : normalizeWorkspaceVmCount(vmCount);
 
   workspacePaneKindsWebIndexes(normalizedPaneKinds)
     .slice(0, normalizeWorkspaceWebPanelCount(webPanelCount))
@@ -21007,6 +21089,11 @@ function getWorkspaceDraftPanelPaneKinds(paneKinds, webPanelCount, pcbCount) {
     .slice(0, normalizeWorkspacePcbCount(pcbCount))
     .forEach((slotIndex) => {
       nextPaneKinds[slotIndex] = WORKSPACE_PANE_KIND_PCB;
+    });
+  workspacePaneKindsVmIndexes(normalizedPaneKinds)
+    .slice(0, desiredVmCount)
+    .forEach((slotIndex) => {
+      nextPaneKinds[slotIndex] = WORKSPACE_PANE_KIND_VM;
     });
 
   return nextPaneKinds;
@@ -21030,7 +21117,9 @@ function fillWorkspaceDraftPanelPaneKinds(paneKinds, usedIndexes, paneKind, targ
 
   const desiredCount = paneKind === WORKSPACE_PANE_KIND_PCB
     ? normalizeWorkspacePcbCount(targetCount)
-    : normalizeWorkspaceWebPanelCount(targetCount);
+    : paneKind === WORKSPACE_PANE_KIND_VM
+      ? normalizeWorkspaceVmCount(targetCount)
+      : normalizeWorkspaceWebPanelCount(targetCount);
   let currentCount = workspacePaneKindsIndexes(nextPaneKinds, paneKind).length;
   let nextSlotIndex = 0;
 
@@ -21052,6 +21141,10 @@ function getWorkspaceWebPaneIndexes(workspaceSettings, workspaceId) {
 
 function getWorkspacePcbPaneIndexes(workspaceSettings, workspaceId) {
   return workspacePaneKindsPcbIndexes(getWorkspacePaneKinds(workspaceSettings, workspaceId));
+}
+
+function getWorkspaceVmPaneIndexes(workspaceSettings, workspaceId) {
+  return workspacePaneKindsVmIndexes(getWorkspacePaneKinds(workspaceSettings, workspaceId));
 }
 
 function expandTerminalRolesForPaneKinds(terminalRoles, paneKinds, fallbackRole = "codex") {
@@ -21420,6 +21513,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const hasDisplayRows = Object.prototype.hasOwnProperty.call(nextValues, "displayRows");
   const hasDocumentsCount = Object.prototype.hasOwnProperty.call(nextValues, "documentsCount");
   const hasPcbCount = Object.prototype.hasOwnProperty.call(nextValues, "pcbCount");
+  const hasVmCount = Object.prototype.hasOwnProperty.call(nextValues, "vmCount");
   const hasPaneKinds = Object.prototype.hasOwnProperty.call(nextValues, "paneKinds");
   const hasPanes = Object.prototype.hasOwnProperty.call(nextValues, "panes");
   const hasAgentPermissions = Object.prototype.hasOwnProperty.call(nextValues, "agentPermissions");
@@ -21428,7 +21522,8 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     || hasLogicalTerminalIndexes
     || hasTerminalCount
     || hasTerminalRoles
-    || hasPcbCount;
+    || hasPcbCount
+    || hasVmCount;
   const inputPanes = normalizeWorkspacePaneRecords(
     hasPanes
       ? nextValues.panes
@@ -21492,6 +21587,13 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
         ? currentSettings.pcbCount
         : DEFAULT_WORKSPACE_PCB_COUNT,
   );
+  let vmCount = normalizeWorkspaceVmCount(
+    hasVmCount
+      ? nextValues.vmCount
+      : Object.prototype.hasOwnProperty.call(currentSettings, "vmCount")
+        ? currentSettings.vmCount
+        : DEFAULT_WORKSPACE_VM_COUNT,
+  );
   let paneKinds = {
     ...normalizeWorkspacePaneKinds(
       hasPaneKinds ? nextValues.paneKinds : currentSettings.paneKinds,
@@ -21502,17 +21604,29 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   if (!hasPcbCount && existingPcbPaneCount > 0) {
     pcbCount = normalizeWorkspacePcbCount(existingPcbPaneCount);
   }
-  const hydratedPanes = ensureWorkspacePaneKindCount(
+  const existingVmPaneCount = workspacePaneKindsVmIndexes(paneKinds).length;
+  if (!hasVmCount && existingVmPaneCount > 0) {
+    vmCount = normalizeWorkspaceVmCount(existingVmPaneCount);
+  }
+  let hydratedPanes = ensureWorkspacePaneKindCount(
     paneKinds,
     terminalRoles,
     WORKSPACE_PANE_KIND_PCB,
     pcbCount,
     fallbackRole,
   );
+  hydratedPanes = ensureWorkspacePaneKindCount(
+    hydratedPanes.paneKinds,
+    hydratedPanes.terminalRoles,
+    WORKSPACE_PANE_KIND_VM,
+    vmCount,
+    fallbackRole,
+  );
   paneKinds = hydratedPanes.paneKinds;
   terminalRoles = hydratedPanes.terminalRoles;
   terminalCount = terminalRoles.length;
   pcbCount = workspacePaneKindsPcbIndexes(paneKinds).length;
+  vmCount = workspacePaneKindsVmIndexes(paneKinds).length;
   const shouldPersistLogicalIndexes = hasLogicalTerminalIndexes
     || Object.prototype.hasOwnProperty.call(currentSettings || {}, "logicalTerminalIndexes");
   const logicalTerminalIndexes = shouldPersistLogicalIndexes
@@ -21544,6 +21658,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     )
     : null;
   const hasDefaultPcbCount = pcbCount === DEFAULT_WORKSPACE_PCB_COUNT;
+  const hasDefaultVmCount = vmCount === DEFAULT_WORKSPACE_VM_COUNT;
   const hasPanelPanes = workspacePaneKindsHasPanels(paneKinds);
   const paneRecordIndexes = Array.isArray(logicalTerminalIndexes)
     ? logicalTerminalIndexes
@@ -21581,6 +21696,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     && !hasCustomTerminalRoles
     && hasDefaultDocumentsCount
     && hasDefaultPcbCount
+    && hasDefaultVmCount
     && !hasPanelPanes
     && !hasCustomAgentPermissions
     && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
@@ -21599,6 +21715,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     terminalRoles,
     documentsCount,
     pcbCount,
+    vmCount,
     ...(panes.length ? { panes } : {}),
     ...(hasPanelPanes ? { paneKinds } : {}),
     ...(Array.isArray(logicalTerminalIndexes) ? { logicalTerminalIndexes } : {}),
@@ -21720,6 +21837,7 @@ export default function App() {
   const [workspaceDocumentCountDraft, setWorkspaceDocumentCountDraft] = useState(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
   const [workspaceWebPanelCountDraft, setWorkspaceWebPanelCountDraft] = useState(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
   const [workspacePcbCountDraft, setWorkspacePcbCountDraft] = useState(String(DEFAULT_WORKSPACE_PCB_COUNT));
+  const [workspaceVmPanelCountDraft, setWorkspaceVmPanelCountDraft] = useState(String(DEFAULT_WORKSPACE_VM_COUNT));
   const [workspaceAgentPermissionsDraft, setWorkspaceAgentPermissionsDraft] = useState({});
   const [workspaceAgentSessionModeDraft, setWorkspaceAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
   const [workspaceInitializeGitDraft, setWorkspaceInitializeGitDraft] = useState(false);
@@ -25355,6 +25473,7 @@ export default function App() {
     setWorkspaceDocumentCountDraft(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
     setWorkspaceWebPanelCountDraft(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
     setWorkspacePcbCountDraft(String(DEFAULT_WORKSPACE_PCB_COUNT));
+    setWorkspaceVmPanelCountDraft(String(DEFAULT_WORKSPACE_VM_COUNT));
     setWorkspaceAgentPermissionsDraft(normalizeWorkspaceAgentPermissions(null));
     setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
     setWorkspaceInitializeGitDraft(false);
@@ -25435,6 +25554,7 @@ export default function App() {
     setWorkspaceDocumentCountDraft(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
     setWorkspaceWebPanelCountDraft(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
     setWorkspacePcbCountDraft(String(DEFAULT_WORKSPACE_PCB_COUNT));
+    setWorkspaceVmPanelCountDraft(String(DEFAULT_WORKSPACE_VM_COUNT));
     setWorkspaceAgentPermissionsDraft(normalizeWorkspaceAgentPermissions(null));
     setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
     setWorkspaceInitializeGitDraft(false);
@@ -28792,6 +28912,7 @@ export default function App() {
         requestedPanelCounts?.document ?? requestedPanelCounts?.documents,
       );
       const pcbCount = normalizeWorkspacePcbCount(requestedPanelCounts?.["pcb-design"]);
+      const vmCount = normalizeWorkspaceVmCount(requestedPanelCounts?.["vm-sandbox"] ?? requestedPanelCounts?.vm);
       const webPanelCount = normalizeWorkspaceWebPanelCount(requestedPanelCounts?.web);
       // Panel panes occupy slots after the terminal slots. Their terminalRoles
       // entry is a never-read placeholder; paneKinds marks them so the grid
@@ -28799,9 +28920,11 @@ export default function App() {
       let seededTerminalRoles = terminalRoles;
       let seededPaneKinds = null;
       let seededPcbCount = pcbCount;
+      let seededVmCount = vmCount;
       const requestedGridPanels = [
         ...Array.from({ length: webPanelCount }, () => WORKSPACE_PANE_KIND_WEB),
         ...Array.from({ length: pcbCount }, () => WORKSPACE_PANE_KIND_PCB),
+        ...Array.from({ length: vmCount }, () => WORKSPACE_PANE_KIND_VM),
       ];
       if (requestedGridPanels.length > 0) {
         const baseTerminalRoles = terminalRoles && terminalRoles.length ? terminalRoles : ["codex"];
@@ -28819,6 +28942,7 @@ export default function App() {
           }
         }
         seededPcbCount = workspacePaneKindsPcbIndexes(seededPaneKinds).length;
+        seededVmCount = workspacePaneKindsVmIndexes(seededPaneKinds).length;
       }
       const seededLogicalIndexes = seededTerminalRoles?.length
         ? normalizeWorkspaceTerminalIndexes(undefined, seededTerminalRoles.length)
@@ -28837,6 +28961,7 @@ export default function App() {
         agentSessionMode,
         documentsCount,
         pcbCount: seededPcbCount,
+        vmCount: seededVmCount,
         agentPermissions,
         ...(seededTerminalRoles
           ? { terminalCount: seededTerminalRoles.length, terminalRoles: seededTerminalRoles }
@@ -28950,6 +29075,7 @@ export default function App() {
     const documentsCount = normalizeWorkspaceDocumentCount(workspaceDocumentCountDraft);
     const webPanelCount = normalizeWorkspaceWebPanelCount(workspaceWebPanelCountDraft);
     const pcbPanelCount = normalizeWorkspacePcbCount(workspacePcbCountDraft);
+    const vmPanelCount = normalizeWorkspaceVmCount(workspaceVmPanelCountDraft);
     const terminalRoles = normalizeWorkspaceTerminalRoles(
       workspaceTerminalRolesDraft,
       terminalCount,
@@ -29083,10 +29209,15 @@ export default function App() {
         pcbPanelCount,
         Math.max(0, panelSlotCapacity - desiredWebPanelCount),
       );
+      const desiredVmPanelCount = Math.min(
+        vmPanelCount,
+        Math.max(0, panelSlotCapacity - desiredWebPanelCount - desiredPcbPanelCount),
+      );
       let settingsStoredPaneKinds = getWorkspaceDraftPanelPaneKinds(
         settingsPaneKinds,
         desiredWebPanelCount,
         desiredPcbPanelCount,
+        desiredVmPanelCount,
       );
       const keptPanelIndexes = workspacePaneKindsIndexes(settingsStoredPaneKinds);
       const terminalNextIndexes = rootChanged
@@ -29109,6 +29240,12 @@ export default function App() {
         WORKSPACE_PANE_KIND_PCB,
         desiredPcbPanelCount,
       );
+      settingsStoredPaneKinds = fillWorkspaceDraftPanelPaneKinds(
+        settingsStoredPaneKinds,
+        usedDraftSlotIndexes,
+        WORKSPACE_PANE_KIND_VM,
+        desiredVmPanelCount,
+      );
       const settingsPanelIndexes = workspacePaneKindsIndexes(settingsStoredPaneKinds);
       const settingsPanelIndexSet = new Set(settingsPanelIndexes);
       const nextTerminalIndexes = normalizeWorkspaceTerminalSlotIndexes([
@@ -29123,6 +29260,7 @@ export default function App() {
       const effectiveTerminalCount = nextTerminalIndexes.length;
       const effectiveWebPanelCount = workspacePaneKindsWebIndexes(settingsStoredPaneKinds).length;
       const effectivePcbCount = workspacePaneKindsPcbIndexes(settingsStoredPaneKinds).length;
+      const effectiveVmCount = workspacePaneKindsVmIndexes(settingsStoredPaneKinds).length;
       const nextTerminalIndexSet = new Set(nextTerminalIndexes);
       const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
         [terminalIndex, effectiveTerminalRoles[index]]
@@ -29300,6 +29438,7 @@ export default function App() {
           terminalRoles: effectiveTerminalRoles,
           documentsCount,
           pcbCount: effectivePcbCount,
+          vmCount: effectiveVmCount,
           paneKinds: settingsStoredPaneKinds,
           logicalTerminalIndexes: nextTerminalIndexes,
           displayRows: persistedDisplayRows,
@@ -29333,6 +29472,7 @@ export default function App() {
       setWorkspaceDocumentCountDraft(String(documentsCount));
       setWorkspaceWebPanelCountDraft(String(effectiveWebPanelCount));
       setWorkspacePcbCountDraft(String(effectivePcbCount));
+      setWorkspaceVmPanelCountDraft(String(effectiveVmCount));
       setWorkspaceTerminalRolesDraft(terminalRoles);
       setWorkspaceAgentPermissionsDraft(agentPermissions);
       setWorkspaceAgentSessionModeDraft(agentSessionMode);
@@ -29360,6 +29500,7 @@ export default function App() {
     workspaceDocumentCountDraft,
     workspaceWebPanelCountDraft,
     workspacePcbCountDraft,
+    workspaceVmPanelCountDraft,
     workspaceAgentSessionModeDraft,
     workspaceAgentPermissionsDraft,
     workspaceInitializeGitDraft,
@@ -29438,6 +29579,7 @@ export default function App() {
     delete nextPaneKinds[removedTerminalIndex];
     const nextWebPanelCount = workspacePaneKindsWebIndexes(nextPaneKinds).length;
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
+    const nextVmCount = workspacePaneKindsVmIndexes(nextPaneKinds).length;
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
       [workspaceId]: nextIndexes,
@@ -29451,6 +29593,7 @@ export default function App() {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
       pcbCount: nextPcbCount,
+      vmCount: nextVmCount,
       paneKinds: nextPaneKinds,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
@@ -29487,6 +29630,7 @@ export default function App() {
       setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
       setWorkspaceWebPanelCountDraft(String(nextWebPanelCount));
       setWorkspacePcbCountDraft(String(nextPcbCount));
+      setWorkspaceVmPanelCountDraft(String(nextVmCount));
     }
   }, [
     workspaceSettingsModalId,
@@ -29577,6 +29721,7 @@ export default function App() {
     }
     const nextWebPanelCount = workspacePaneKindsWebIndexes(nextPaneKinds).length;
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
+    const nextVmCount = workspacePaneKindsVmIndexes(nextPaneKinds).length;
     const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
     const nextDisplayRows = insertLogicalTerminalInDisplayRows(
       currentRows,
@@ -29593,6 +29738,7 @@ export default function App() {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
       pcbCount: nextPcbCount,
+      vmCount: nextVmCount,
       paneKinds: nextPaneKinds,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
@@ -29625,6 +29771,7 @@ export default function App() {
       setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
       setWorkspaceWebPanelCountDraft(String(nextWebPanelCount));
       setWorkspacePcbCountDraft(String(nextPcbCount));
+      setWorkspaceVmPanelCountDraft(String(nextVmCount));
     }
   }, [
     workspaceSettingsModalId,
@@ -29784,6 +29931,7 @@ export default function App() {
       setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
       setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
       setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
+      setWorkspaceVmPanelCountDraft(String(workspacePaneKindsVmIndexes(nextPaneKinds).length));
     }
 
     const restoredThreadId = requestedProviderSessionId && AGENT_PROVIDERS.some((provider) => provider.id === nextRole)
@@ -29889,11 +30037,13 @@ export default function App() {
     };
     const nextWebPanelCount = workspacePaneKindsWebIndexes(nextPaneKinds).length;
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
+    const nextVmCount = workspacePaneKindsVmIndexes(nextPaneKinds).length;
     const nextDisplayRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
       pcbCount: nextPcbCount,
+      vmCount: nextVmCount,
       paneKinds: nextPaneKinds,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
@@ -29926,6 +30076,7 @@ export default function App() {
       setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
       setWorkspaceWebPanelCountDraft(String(nextWebPanelCount));
       setWorkspacePcbCountDraft(String(nextPcbCount));
+      setWorkspaceVmPanelCountDraft(String(nextVmCount));
     }
 
     return { paneKind, terminalIndex: nextTerminalIndex, workspaceId };
@@ -29941,6 +30092,10 @@ export default function App() {
 
   const addWorkspacePcbPane = useCallback((options = {}) => (
     addWorkspacePanelPane({ ...options, paneKind: WORKSPACE_PANE_KIND_PCB })
+  ), [addWorkspacePanelPane]);
+
+  const addWorkspaceVmPane = useCallback((options = {}) => (
+    addWorkspacePanelPane({ ...options, paneKind: WORKSPACE_PANE_KIND_VM })
   ), [addWorkspacePanelPane]);
 
   const rejectWorkspacePromptDeliveriesForThread = useCallback((workspaceId, threadId, message = "") => {
@@ -30178,6 +30333,7 @@ export default function App() {
       setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
       setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
       setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
+      setWorkspaceVmPanelCountDraft(String(workspacePaneKindsVmIndexes(nextPaneKinds).length));
     }
 
     setWorkspaceThreads((threads) => materializeWorkspaceThreadForTerminal(threads, {
@@ -30387,6 +30543,7 @@ export default function App() {
       setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
       setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
       setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
+      setWorkspaceVmPanelCountDraft(String(workspacePaneKindsVmIndexes(nextPaneKinds).length));
     }
 
     if (roleThread?.id) {
@@ -30573,6 +30730,7 @@ export default function App() {
       setWorkspaceTerminalRolesDraft(nextTerminalOnlyRoles);
       setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
       setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
+      setWorkspaceVmPanelCountDraft(String(workspacePaneKindsVmIndexes(nextPaneKinds).length));
     }
 
     const addedCount = addedIndexes.length;
@@ -32332,6 +32490,13 @@ export default function App() {
     [selectedWorkspace?.id, shouldShowWorkspaceSetup, workspaceSettings],
   );
   const selectedWorkspacePcbPanelCount = selectedWorkspacePcbPaneIndexes.length;
+  const selectedWorkspaceVmPaneIndexes = useMemo(
+    () => (selectedWorkspace && !shouldShowWorkspaceSetup
+      ? getWorkspaceVmPaneIndexes(workspaceSettings, selectedWorkspace.id)
+      : []),
+    [selectedWorkspace?.id, shouldShowWorkspaceSetup, workspaceSettings],
+  );
+  const selectedWorkspaceVmPanelCount = selectedWorkspaceVmPaneIndexes.length;
   const selectedWorkspaceSlotIndexes = useMemo(
     () => (selectedWorkspace && !shouldShowWorkspaceSetup
       ? getWorkspaceLogicalTerminalIndexes(
@@ -32343,9 +32508,9 @@ export default function App() {
     [selectedWorkspace?.id, shouldShowWorkspaceSetup, workspaceTerminalLogicalIndexes, selectedWorkspaceTerminalCount],
   );
   const selectedWorkspacePanelPaneIndexes = useMemo(
-    () => [...selectedWorkspaceWebPaneIndexes, ...selectedWorkspacePcbPaneIndexes]
+    () => [...selectedWorkspaceWebPaneIndexes, ...selectedWorkspacePcbPaneIndexes, ...selectedWorkspaceVmPaneIndexes]
       .sort((left, right) => left - right),
-    [selectedWorkspacePcbPaneIndexes, selectedWorkspaceWebPaneIndexes],
+    [selectedWorkspacePcbPaneIndexes, selectedWorkspaceVmPaneIndexes, selectedWorkspaceWebPaneIndexes],
   );
   const selectedWorkspaceTerminalOnlyRoles = useMemo(() => {
     if (!selectedWorkspacePanelPaneIndexes.length) {
@@ -47828,6 +47993,7 @@ export default function App() {
     setWorkspaceDocumentCountDraft(String(selectedWorkspace ? selectedWorkspaceDocumentCount : DEFAULT_WORKSPACE_DOCUMENT_COUNT));
     setWorkspaceWebPanelCountDraft(String(selectedWorkspace ? selectedWorkspaceWebPanelCount : DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
     setWorkspacePcbCountDraft(String(selectedWorkspace ? selectedWorkspacePcbPanelCount : DEFAULT_WORKSPACE_PCB_COUNT));
+    setWorkspaceVmPanelCountDraft(String(selectedWorkspace ? selectedWorkspaceVmPanelCount : DEFAULT_WORKSPACE_VM_COUNT));
     setWorkspaceTerminalRolesDraft(selectedWorkspace ? selectedWorkspaceTerminalOnlyRoles : normalizeWorkspaceTerminalRoles(
       [],
       MIN_WORKSPACE_TERMINAL_COUNT,
@@ -47853,6 +48019,7 @@ export default function App() {
     selectedWorkspaceAgentPermissions,
     selectedWorkspaceDocumentCount,
     selectedWorkspacePcbPanelCount,
+    selectedWorkspaceVmPanelCount,
     selectedWorkspaceWebPanelCount,
     selectedWorkspaceTerminalOnlyCount,
     selectedWorkspaceTerminalOnlyRoles,
@@ -48075,7 +48242,8 @@ export default function App() {
     document: normalizeWorkspaceDocumentCount(workspaceDocumentCountDraft),
     web: normalizeWorkspaceWebPanelCount(workspaceWebPanelCountDraft),
     "pcb-design": normalizeWorkspacePcbCount(workspacePcbCountDraft),
-  }), [workspaceDocumentCountDraft, workspacePcbCountDraft, workspaceWebPanelCountDraft]);
+    "vm-sandbox": normalizeWorkspaceVmCount(workspaceVmPanelCountDraft),
+  }), [workspaceDocumentCountDraft, workspacePcbCountDraft, workspaceVmPanelCountDraft, workspaceWebPanelCountDraft]);
   const updateWorkspaceSettingsAgentCount = useCallback((roleId, delta) => {
     const nextRoles = adjustWorkspaceAgentCardRoles(
       workspaceSettingsTerminalRoles,
@@ -48130,6 +48298,15 @@ export default function App() {
       setWorkspacePcbCountDraft((current) => {
         const currentValue = normalizeWorkspacePcbCount(current);
         return String(normalizeWorkspacePcbCount(currentValue + Number(delta || 0)));
+      });
+      setWorkspaceSettingsError("");
+      setWorkspaceSettingsMessage("");
+      return;
+    }
+    if (panelId === "vm-sandbox") {
+      setWorkspaceVmPanelCountDraft((current) => {
+        const currentValue = normalizeWorkspaceVmCount(current);
+        return String(normalizeWorkspaceVmCount(currentValue + Number(delta || 0)));
       });
       setWorkspaceSettingsError("");
       setWorkspaceSettingsMessage("");
@@ -48858,6 +49035,7 @@ export default function App() {
                             agentStatusState={agentStatusState}
                             addWorkspaceTerminal={addWorkspaceTerminal}
                             addWorkspacePcbPane={addWorkspacePcbPane}
+                            addWorkspaceVmPane={addWorkspaceVmPane}
                             addWorkspaceWebPane={addWorkspaceWebPane}
                             paneKinds={runtimeDescriptor.paneKinds}
                             closeWorkspaceTerminal={closeWorkspaceTerminal}
@@ -49267,7 +49445,7 @@ export default function App() {
                           <WorkspaceCreateSection>
                             <SettingsLabel>Panels</SettingsLabel>
                             <SettingsHint>
-                              Pick non-terminal workspace panels. Web and PCB design panels open in the terminals grid. You can add or remove either later too.
+                              Pick non-terminal workspace panels. Web, PCB design, and VM Sandbox panels open in the terminals grid. You can add or remove them later too.
                             </SettingsHint>
                             <WorkspacePanelCountCards
                               counts={workspaceSettingsPanelCounts}
