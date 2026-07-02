@@ -24,6 +24,7 @@ const THREAD_PROMPT_LABEL_MAX_CHARS = 48;
 const THREAD_PROMPT_LABEL_ELLIPSIS = "...";
 const DEFAULT_AGENT_ID = "codex";
 const THREAD_AGENT_IDS = ["codex", "claude", "opencode"];
+let liveTextProjectionEventSequence = 0;
 const WORKSPACE_TERMINAL_NICKNAMES = [
   "Al", "Bo", "Cy", "Ed", "Ev", "Jo", "Li", "Mo", "Oz", "Ty",
   "Ada", "Ali", "Amy", "Ari", "Ava", "Bea", "Ben", "Bob", "Cal", "Dan",
@@ -463,6 +464,21 @@ function cleanMessageText(value, fallback = "") {
     .trim();
 
   return text || fallback;
+}
+
+function cleanLiveMessageText(value, { trim = false } = {}) {
+  if (value === undefined || value === null) {
+    return "";
+  }
+  const text = String(value)
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u0000-\u0008\u000B-\u001F\u007F]/g, " ")
+    .replace(/\n{4,}/g, "\n\n\n");
+  return trim ? text.trim() : text;
+}
+
+function firstPresentTextValue(values) {
+  return values.find((value) => value !== undefined && value !== null);
 }
 
 function tryParseJsonLikeText(value) {
@@ -939,7 +955,7 @@ function shouldPreferIncomingPastedBody(existingText, incomingText) {
   );
 }
 
-function chooseProjectedMessageText(existingText, incomingText) {
+function chooseProjectedMessageText(existingText, incomingText, { preserveWhitespace = false } = {}) {
   if (shouldPreferIncomingPastedBody(existingText, incomingText)) {
     return cleanMessageText(incomingText);
   }
@@ -948,7 +964,7 @@ function chooseProjectedMessageText(existingText, incomingText) {
     return cleanMessageText(existingText);
   }
 
-  return cleanMessageText(incomingText);
+  return preserveWhitespace ? cleanLiveMessageText(incomingText) : cleanMessageText(incomingText);
 }
 
 function isTranscriptHistoryProjectionSource(source) {
@@ -1630,10 +1646,12 @@ function normalizeThreadMessage(message) {
     .replace(/[^a-z0-9_-]/g, "-")
     .slice(0, 48);
   const source = cleanText(message.source);
-  const rawText = message.text || message.message;
+  const rawText = message.text ?? message.message;
   const text = safeRole === "user"
     ? normalizeAttachmentEchoText(rawText)
-    : cleanMessageText(rawText);
+    : safeRole === "assistant"
+      ? cleanLiveMessageText(rawText)
+      : cleanMessageText(rawText);
   const artifacts = normalizeThreadArtifacts(message.artifacts || message.attachments);
   const toolMetadata = normalizeThreadToolMetadata(message);
   const title = cleanText(message.title);
@@ -1690,8 +1708,8 @@ function normalizeThreadMessages(messages) {
   return normalized.slice(-MAX_THREAD_MESSAGES);
 }
 
-function compactPersistedThreadText(value) {
-  const text = cleanMessageText(value);
+function compactPersistedThreadText(value, { preserveWhitespace = false } = {}) {
+  const text = preserveWhitespace ? cleanLiveMessageText(value) : cleanMessageText(value);
   if (text.length <= MAX_PERSISTED_THREAD_TEXT_CHARS) {
     return text;
   }
@@ -1743,7 +1761,9 @@ function compactPersistedThreadMessage(message) {
 
   return {
     ...normalizedMessage,
-    text: compactPersistedThreadText(normalizedMessage.text),
+    text: compactPersistedThreadText(normalizedMessage.text, {
+      preserveWhitespace: normalizedMessage.role === "assistant",
+    }),
     ...compactPersistedThreadToolMetadata(normalizedMessage),
   };
 }
@@ -1838,11 +1858,17 @@ function normalizeThreadProjectionEvent(event, fallbackSequence = 0) {
       || (isTurnProjectionEventType(type) ? turnId : "")
       || event.id,
   );
-  const delta = cleanMessageText(event.delta);
-  const rawText = event.text || event.message;
+  const isAssistantTextEvent = type === "thread.message.assistant.delta"
+    || type === "thread.message.assistant.complete";
+  const delta = isAssistantTextEvent
+    ? cleanLiveMessageText(event.delta)
+    : cleanMessageText(event.delta);
+  const rawText = event.text ?? event.message;
   const text = type === "thread.message.user"
     ? normalizeAttachmentEchoText(rawText)
-    : cleanMessageText(rawText);
+    : isAssistantTextEvent
+      ? cleanLiveMessageText(rawText)
+      : cleanMessageText(rawText);
   const title = cleanText(event.title);
   const artifacts = normalizeThreadArtifacts(event.artifacts || event.attachments);
   const toolMetadata = normalizeThreadToolMetadata(event);
@@ -1949,11 +1975,17 @@ function compactPersistedThreadProjectionEvent(event) {
   if (!normalizedEvent) {
     return null;
   }
+  const preserveAssistantWhitespace = normalizedEvent.type === "thread.message.assistant.delta"
+    || normalizedEvent.type === "thread.message.assistant.complete";
 
   return {
     ...normalizedEvent,
-    delta: compactPersistedThreadText(normalizedEvent.delta),
-    text: compactPersistedThreadText(normalizedEvent.text),
+    delta: compactPersistedThreadText(normalizedEvent.delta, {
+      preserveWhitespace: preserveAssistantWhitespace,
+    }),
+    text: compactPersistedThreadText(normalizedEvent.text, {
+      preserveWhitespace: preserveAssistantWhitespace,
+    }),
     ...compactPersistedThreadToolMetadata(normalizedEvent),
   };
 }
@@ -2001,7 +2033,9 @@ function upsertProjectedMessage(messagesById, messageOrder, message) {
     ...normalizedMessage,
     artifacts: mergeThreadArtifacts(existingMessage?.artifacts, normalizedMessage.artifacts),
     id: matchingMessageId,
-    text: chooseProjectedMessageText(existingMessage?.text, normalizedMessage.text),
+    text: chooseProjectedMessageText(existingMessage?.text, normalizedMessage.text, {
+      preserveWhitespace: normalizedMessage.role === "assistant",
+    }),
   });
 }
 
@@ -2499,6 +2533,34 @@ function findMatchingProjectedMessage(projectedMessages, message) {
   )) || null;
 }
 
+function findMatchingLiveHookAssistantMessage(projectedMessages, {
+  messageTurnId = "",
+  promptMessageId = "",
+} = {}) {
+  const safeTurnId = cleanText(messageTurnId);
+  const safePromptMessageId = cleanText(promptMessageId);
+  return [...(Array.isArray(projectedMessages) ? projectedMessages : [])]
+    .reverse()
+    .find((candidate) => {
+      if (
+        candidate?.role !== "assistant"
+        || !isLiveHookProjectionSource(candidate.source)
+        || !cleanMessageText(candidate.text)
+      ) {
+        return false;
+      }
+      const candidateTurnId = cleanText(candidate.turnId);
+      if (!safeTurnId || !candidateTurnId) {
+        return true;
+      }
+      return projectionTurnIdsMatchPrompt(
+        candidateTurnId,
+        safeTurnId,
+        safePromptMessageId,
+      );
+    }) || null;
+}
+
 function createSubmittedUserProjectionEvents(thread, event = {}) {
   const text = cleanSubmittedUserMessage(
     event.expectedUserMessage
@@ -2574,20 +2636,22 @@ export function createWorkspaceThreadLiveTextProjectionEvents(thread, event = {}
     return [];
   }
 
-  const delta = cleanMessageText(
-    event.liveTextDelta
-      || event.live_text_delta
-      || event.assistantDelta
-      || event.assistant_delta,
-  );
-  const snapshot = cleanMessageText(
-    event.liveTextSnapshot
-      || event.live_text_snapshot
-      || event.assistantMessageSnapshot
-      || event.assistant_message_snapshot
-      || event.assistantMessage
-      || event.assistant_message,
-  );
+  const deltaValue = firstPresentTextValue([
+    event.liveTextDelta,
+    event.live_text_delta,
+    event.assistantDelta,
+    event.assistant_delta,
+  ]);
+  const snapshotValue = firstPresentTextValue([
+    event.liveTextSnapshot,
+    event.live_text_snapshot,
+    event.assistantMessageSnapshot,
+    event.assistant_message_snapshot,
+    event.assistantMessage,
+    event.assistant_message,
+  ]);
+  const delta = cleanLiveMessageText(deltaValue);
+  const snapshot = cleanLiveMessageText(snapshotValue);
   if (!delta && !snapshot) {
     return [];
   }
@@ -2601,13 +2665,23 @@ export function createWorkspaceThreadLiveTextProjectionEvents(thread, event = {}
       || event.message_id
       || latestTurn?.messageId,
   );
+  const liveSessionId = cleanText(
+    event.providerSessionId
+      || event.provider_session_id
+      || event.nativeSessionId
+      || event.native_session_id
+      || event.sessionId
+      || event.session_id
+      || thread?.transcriptSessionId,
+  );
   const turnId = cleanText(
     event.turnId
       || event.turn_id
       || event.providerTurnId
       || event.provider_turn_id
       || latestTurn?.turnId
-      || (promptMessageId ? createTurnIdForMessage(thread, promptMessageId) : ""),
+      || (promptMessageId ? createTurnIdForMessage(thread, promptMessageId) : "")
+      || (liveSessionId ? `turn-live-${stableProjectionKey(liveSessionId, "session")}` : ""),
   );
   const messageId = cleanText(
     event.assistantMessageId
@@ -2616,6 +2690,23 @@ export function createWorkspaceThreadLiveTextProjectionEvents(thread, event = {}
     turnId
       ? `assistant-${stableProjectionKey(turnId, "turn")}`
       : createRandomId("assistant-live"),
+  );
+  const existingAssistantTextLength = cleanLiveMessageText(
+    normalizeThreadMessages(thread?.messages)
+      .find((message) => message.role === "assistant" && message.id === messageId)
+      ?.text,
+  ).length;
+  const liveTextEventKey = cleanText(
+    event.liveTextEventId
+      || event.live_text_event_id
+      || event.eventId
+      || event.event_id
+      || event.id
+      || event.sequence
+      || event.seq
+      || event.statusSeq
+      || event.status_seq,
+    `live-${++liveTextProjectionEventSequence}`,
   );
   const createdAt = cleanText(
     event.completedAt
@@ -2645,8 +2736,10 @@ export function createWorkspaceThreadLiveTextProjectionEvents(thread, event = {}
       id: [
         "projection-live-assistant-delta",
         safeKey(messageId, "message"),
+        existingAssistantTextLength,
+        safeKey(liveTextEventKey, "event"),
         delta.length,
-        stableProjectionHash(`${turnId}:${delta}`),
+        stableProjectionHash(`${turnId}:${existingAssistantTextLength}:${liveTextEventKey}:${delta}`),
       ].join("-"),
       messageId,
       promptEpoch,
@@ -2920,6 +3013,10 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     expectedUserMessage,
   );
   let projectionEvents = ensureThreadProjectionEvents(thread);
+  const liveHookProjectedMessages = projectThreadProjectionMessagesFromNormalizedEvents(
+    projectionEvents.filter(isLiveHookProjectionEvent),
+    [],
+  );
   let projectedMessages = projectThreadProjectionMessagesFromNormalizedEvents(
     projectionEvents.filter((projectionEvent) => (
       isTranscriptHistoryProjectionEvent(projectionEvent)
@@ -2987,6 +3084,9 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     const expectedPromptTurnForMessage = isExpectedPromptUserMessage
       ? runningLatestTurnId || expectedPromptTurnId
       : "";
+    const expectedAssistantTurnForMessage = message.role === "assistant" && !currentTurnId
+      ? runningLatestTurnId || expectedPromptTurnId
+      : "";
     const incomingMessageTurnId = cleanText(message.turnId || message.turn_id);
     const shouldContinueCurrentTranscriptTurn = Boolean(message.role !== "user" && currentTurnId);
     const messageArtifacts = normalizeThreadArtifacts(message.artifacts);
@@ -2994,6 +3094,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
     const messageTurnId = cleanText(
       (shouldContinueCurrentTranscriptTurn ? currentTurnId : "")
         || expectedPromptTurnForMessage
+        || expectedAssistantTurnForMessage
         || projectedMessage?.turnId
         || incomingMessageTurnId
         || currentTurnId
@@ -3047,10 +3148,10 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         });
       }
     } else if (message.role === "assistant") {
-      const nextText = cleanMessageText(message.text);
+      const nextText = cleanLiveMessageText(message.text);
       const turnComplete = isTranscriptTurnCompleteMessage(message);
       const liveHookAssistantMessage = preferLiveHookAssistantMessages
-        ? projectedMessages.find((candidate) => (
+        ? liveHookProjectedMessages.find((candidate) => (
           candidate?.role === "assistant"
           && candidate.status === "complete"
           && isLiveHookProjectionSource(candidate.source)
@@ -3062,6 +3163,15 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
           )
         ))
         : null;
+      const liveHookAssistantTarget = liveHookAssistantMessage
+        || findMatchingLiveHookAssistantMessage(projectedMessages, {
+          messageTurnId,
+          promptMessageId: promptEventId || expectedPromptTranscriptMessageId,
+        })
+        || findMatchingLiveHookAssistantMessage(liveHookProjectedMessages, {
+          messageTurnId,
+          promptMessageId: promptEventId || expectedPromptTranscriptMessageId,
+        });
       if (!nextText && !messageArtifacts.length) {
         if (
           allowTranscriptTurnCompletion
@@ -3103,14 +3213,21 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         ? projectedMessages.find((candidate) => (
           candidate.role === "assistant"
           && (!messageTurnId || candidate.turnId === messageTurnId)
-          && cleanMessageText(candidate.text) === nextText
+          && cleanLiveMessageText(candidate.text) === nextText
         ))
         : null;
-      const messageProjectionTarget = duplicateFinalAssistant || projectedMessage;
+      const messageProjectionTarget = duplicateFinalAssistant || projectedMessage || liveHookAssistantTarget;
       const shouldProjectAssistant = !duplicateFinalAssistant;
-      const effectivePreviousText = cleanMessageText(messageProjectionTarget?.text);
+      const effectivePreviousText = cleanLiveMessageText(messageProjectionTarget?.text);
       const projectionArtifactsChanged = messageArtifactsSignature
         && threadArtifactsSignature(messageProjectionTarget?.artifacts) !== messageArtifactsSignature;
+      const assistantEventBase = liveHookAssistantTarget && !duplicateFinalAssistant
+        ? {
+          ...eventBase,
+          messageId: liveHookAssistantTarget.id,
+          turnId: messageTurnId || liveHookAssistantTarget.turnId,
+        }
+        : eventBase;
       let delta = nextText;
       let replaceText = false;
       if (effectivePreviousText && nextText.startsWith(effectivePreviousText)) {
@@ -3123,15 +3240,15 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
 
       if (shouldProjectAssistant && (delta || replaceText || !messageProjectionTarget)) {
         events.push({
-          ...eventBase,
+          ...assistantEventBase,
           delta: replaceText ? "" : delta || nextText,
           id: [
             "projection-assistant-delta",
-            safeKey(messageId, "message"),
+            safeKey(assistantEventBase.messageId, "message"),
             nextText.length,
-            stableProjectionHash(`${nextText}:${messageArtifactsSignature}`),
-          ].join("-"),
-          replaceText,
+          stableProjectionHash(`${nextText}:${messageArtifactsSignature}`),
+        ].join("-"),
+        replaceText,
           text: replaceText ? nextText : "",
           type: "thread.message.assistant.delta",
         });
@@ -3146,13 +3263,14 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
         )
       ) {
         events.push({
-          ...eventBase,
+          ...assistantEventBase,
           id: [
             "projection-assistant-complete",
-            safeKey(messageId, "message"),
+            safeKey(assistantEventBase.messageId, "message"),
             nextText.length,
             stableProjectionHash(`${nextText}:${messageArtifactsSignature}`),
           ].join("-"),
+          replaceText: true,
           text: nextText,
           type: "thread.message.assistant.complete",
         });
@@ -3165,7 +3283,7 @@ function createProjectionEventsFromTranscript(thread, incomingMessages, event = 
       ) {
         events.push({
           ...eventBase,
-          assistantMessageId: duplicateFinalAssistant?.id || messageId,
+          assistantMessageId: duplicateFinalAssistant?.id || liveHookAssistantTarget?.id || messageId,
           completedAt: createdAt,
           id: `projection-provider-turn-completed-${stableProjectionKey(messageTurnId, "turn")}-${stableProjectionKey(messageId, "message")}`,
           status: "completed",

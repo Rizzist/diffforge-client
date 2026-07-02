@@ -26,6 +26,13 @@ import {
   rowProviderAccountLabel,
   rowTotal,
 } from "./tokenomicsFormat.js";
+import {
+  mergeProviderLimitRowsForDisplay,
+  mergeProviderLimits,
+  mergeProviderLimitSamples,
+  providerLimitKey,
+  providerLimitSampleKey,
+} from "./tokenomicsProviderLimitMerge.js";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 60_000;
@@ -1877,62 +1884,6 @@ function limitTimestampMs(row = {}) {
   )?.getTime() || 0;
 }
 
-function providerLimitAuthorityKey(row = {}, selectedDeviceId = "all") {
-  const devicePart = selectedDeviceId === "all" ? "account" : (rowDeviceId(row) || "unknown-device");
-  return [
-    rowScopeKey(row),
-    devicePart,
-    providerKey(row),
-    rowProviderAccountKey(row),
-    normalizedLimitWindowKind(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
-  ].join("::");
-}
-
-function providerLimitSourceRank(row = {}) {
-  const sourceKind = String(row?.limit_source_kind || row?.limitSourceKind || "").toLowerCase();
-  const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
-  const confidence = String(row?.confidence || "").toLowerCase();
-  if (sourceKind.includes("cloud") || source === "cloud") return 1;
-  if (confidence === "live" || source.includes("usage_api") || source.includes("statusline")) return 3;
-  if (confidence === "sampled_stale" || source.includes("sample")) return 2;
-  return 1;
-}
-
-function shouldReplaceProviderLimit(existing = {}, incoming = {}) {
-  const incomingMs = limitTimestampMs(incoming);
-  const existingMs = limitTimestampMs(existing);
-  if (
-    providerLimitIsAuthoritativeNoData(incoming)
-    && incomingMs >= existingMs
-  ) {
-    return true;
-  }
-  if (
-    providerLimitIsAuthoritativeNoData(existing)
-    && existingMs >= incomingMs
-  ) {
-    return false;
-  }
-  const existingUnknown = providerLimitIsUnknown(existing);
-  const incomingUnknown = providerLimitIsUnknown(incoming);
-  if (existingUnknown && !incomingUnknown) return true;
-  if (!existingUnknown && incomingUnknown) return false;
-  if (incomingMs !== existingMs) return incomingMs > existingMs;
-  return providerLimitSourceRank(incoming) >= providerLimitSourceRank(existing);
-}
-
-function mergeProviderLimitRowsForDisplay(rows, selectedDeviceId = "all") {
-  const merged = new Map();
-  (Array.isArray(rows) ? rows : []).forEach((row) => {
-    const key = providerLimitAuthorityKey(row, selectedDeviceId);
-    const existing = merged.get(key);
-    if (!existing || shouldReplaceProviderLimit(existing, row)) {
-      merged.set(key, row);
-    }
-  });
-  return [...merged.values()];
-}
-
 function filterLimits(limits, selectedProvider, selectedAccountKeys = "all", selectedScopeKey = "all", selectedDeviceId = "all") {
   if (!Array.isArray(limits)) return [];
   return mergeProviderLimitRowsForDisplay(limits.filter((limit) => (
@@ -2627,78 +2578,6 @@ function lastUpdatedText(value) {
   const minutes = Math.round(seconds / 60);
   if (minutes < 60) return `Updated ${minutes} min ago`;
   return `Updated ${Math.round(minutes / 60)} hr ago`;
-}
-
-function providerLimitKey(row = {}) {
-  return [
-    rowScopeKey(row),
-    rowDeviceId(row) || "unknown-device",
-    providerKey(row),
-    rowProviderAccountKey(row),
-    String(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
-  ].join("::");
-}
-
-function providerLimitSampleKey(row = {}) {
-  return [
-    rowScopeKey(row),
-    rowDeviceId(row) || "unknown-device",
-    providerKey(row),
-    rowProviderAccountKey(row),
-    normalizedLimitWindowKind(row?.window_kind || row?.windowKind || row?.limit_kind || row?.limitKind || "provider_limit"),
-    String(row?.sample_bucket_start || row?.sampleBucketStart || row?.bucket_start || row?.bucketStart || ""),
-  ].join("::");
-}
-
-function providerLimitIsUnknown(row = {}) {
-  const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
-  const confidence = String(row?.confidence || "").toLowerCase();
-  const status = String(row?.status_label || row?.statusLabel || "").toLowerCase();
-  const hasPercent = hasKnownLimitPercent(row);
-  return source === "not_exposed"
-    || confidence === "unknown"
-    || status.includes("not exposed")
-    || (!hasPercent && row?.allowance == null && row?.used == null);
-}
-
-function providerLimitIsAuthoritativeNoData(row = {}) {
-  if (hasKnownLimitPercent(row)) return false;
-  const source = String(row?.limit_source || row?.limitSource || "").toLowerCase();
-  const confidence = String(row?.confidence || "").toLowerCase();
-  return confidence === "live"
-    && (source.includes("usage_api") || source === "claude_statusline");
-}
-
-function mergeProviderLimits(previousLimits, nextLimits) {
-  const previousRows = Array.isArray(previousLimits) ? previousLimits : [];
-  if (!Array.isArray(nextLimits)) return previousRows;
-
-  const merged = new Map();
-  previousRows.forEach((row) => merged.set(providerLimitKey(row), row));
-  nextLimits.forEach((row) => {
-    const key = providerLimitKey(row);
-    const existing = merged.get(key);
-    if (!existing || shouldReplaceProviderLimit(existing, row)) {
-      merged.set(key, row);
-    }
-  });
-  return [...merged.values()];
-}
-
-function mergeProviderLimitSamples(previousSamples, nextSamples) {
-  const previousRows = Array.isArray(previousSamples) ? previousSamples : [];
-  if (!Array.isArray(nextSamples)) return previousRows;
-
-  const merged = new Map();
-  previousRows.forEach((row) => merged.set(providerLimitSampleKey(row), row));
-  nextSamples.forEach((row) => {
-    const key = providerLimitSampleKey(row);
-    const existing = merged.get(key);
-    if (!existing || limitTimestampMs(row) >= limitTimestampMs(existing)) {
-      merged.set(key, row);
-    }
-  });
-  return [...merged.values()];
 }
 
 function providerLimitDisplayedRemainingPercent(row = {}) {

@@ -547,9 +547,12 @@ fn todo_dispatch_remote_command_is_queue_action(command_kind: &str) -> bool {
         command_kind.as_str(),
         "" | "create_task"
             | "remote_command_create_task"
-            | "task_create"
-            | "todo_create"
-            | "terminal_orchestrator_send_message"
+	            | "task_create"
+	            | "todo_create"
+	            | "todo_queue"
+	            | "queue_todo"
+	            | "workspace_todo_queue"
+	            | "terminal_orchestrator_send_message"
             | "terminal_send_message"
             | "orchestrator_send_message"
             | "loopspace_send_message"
@@ -6657,8 +6660,10 @@ mod todo_store_tests {
     fn remote_intake_accepts_loop_send_message_aliases() {
         for command_kind in [
             "",
-            "create_task",
-            "terminal_orchestrator_send_message",
+	            "create_task",
+	            "todo_queue",
+	            "workspace.todo-queue",
+	            "terminal_orchestrator_send_message",
             "terminal.orchestrator.send-message",
             "loopspace-send-message",
             "send_message",

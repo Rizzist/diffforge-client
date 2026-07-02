@@ -1350,6 +1350,56 @@ fn codex_artifact_activity_title(
     fallback.to_string()
 }
 
+fn transcript_tool_value_has_content(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => items.iter().any(transcript_tool_value_has_content),
+        Value::Object(object) => object.values().any(transcript_tool_value_has_content),
+        _ => true,
+    }
+}
+
+fn transcript_tool_value_status_is_error(value: &Value) -> bool {
+    value
+        .as_str()
+        .map(|text| {
+            matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "error" | "failed" | "failure" | "denied"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn transcript_tool_value_has_error(value: &Value) -> bool {
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if ["is_error", "isError", "failed", "failure"]
+        .iter()
+        .any(|key| object.get(*key).and_then(Value::as_bool).unwrap_or(false))
+    {
+        return true;
+    }
+    if ["status", "state", "phase"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(transcript_tool_value_status_is_error))
+    {
+        return true;
+    }
+    if ["error", "toolError", "tool_error", "stderr"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(transcript_tool_value_has_content))
+    {
+        return true;
+    }
+    ["output", "result", "response", "state"]
+        .iter()
+        .any(|key| object.get(*key).is_some_and(transcript_tool_value_has_error))
+}
+
 fn codex_summary_text(payload: &Value) -> String {
     let Some(summary) = payload.get("summary") else {
         return String::new();
@@ -1500,12 +1550,22 @@ fn codex_function_output_message(
     let raw_output = codex_content_text(output_value);
     let output = clean_codex_transcript_text(&raw_output, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
     let artifacts = codex_image_artifacts_from_content(output_value, &raw_output, "Tool output");
+    let has_error =
+        transcript_tool_value_has_error(payload) || transcript_tool_value_has_error(output_value);
 
     if output.is_empty() && artifacts.is_empty() {
         return None;
     }
-    let kind = codex_artifact_activity_kind(&output, &artifacts);
-    let title = codex_artifact_activity_title(&output, "Tool output", &artifacts);
+    let kind = if has_error {
+        "tool_output".to_string()
+    } else {
+        codex_artifact_activity_kind(&output, &artifacts)
+    };
+    let title = if has_error {
+        "Tool error".to_string()
+    } else {
+        codex_artifact_activity_title(&output, "Tool output", &artifacts)
+    };
 
     Some(CodexThreadTranscriptMessage {
         id: format!("codex-{line_index}-tool-output"),
@@ -1841,12 +1901,21 @@ fn codex_messages_from_event(
                 .or_else(|| payload.get("error"))
                 .unwrap_or(&Value::Null);
             let artifacts = codex_image_artifacts_from_content(artifact_value, &text, &title);
-            let kind = codex_artifact_activity_kind(&text, &artifacts);
-            let title = codex_artifact_activity_title(
-                &text,
-                &clean_codex_title(title, "MCP tool"),
-                &artifacts,
-            );
+            let has_error = transcript_tool_value_has_error(payload);
+            let kind = if has_error {
+                "tool_output".to_string()
+            } else {
+                codex_artifact_activity_kind(&text, &artifacts)
+            };
+            let title = if has_error {
+                "MCP tool error".to_string()
+            } else {
+                codex_artifact_activity_title(
+                    &text,
+                    &clean_codex_title(title, "MCP tool"),
+                    &artifacts,
+                )
+            };
             vec![CodexThreadTranscriptMessage {
                 id: format!("codex-{line_index}-mcp"),
                 role: "activity".to_string(),
@@ -2880,8 +2949,17 @@ fn claude_activity_from_block(
                 .unwrap_or_default();
             let text = clean_codex_transcript_text(&content, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
             let artifacts = codex_image_artifacts_from_content(block, &content, "Tool output");
-            let kind = codex_artifact_activity_kind(&text, &artifacts);
-            let title = codex_artifact_activity_title(&text, "Tool output", &artifacts);
+            let has_error = transcript_tool_value_has_error(block);
+            let kind = if has_error {
+                "tool_output".to_string()
+            } else {
+                codex_artifact_activity_kind(&text, &artifacts)
+            };
+            let title = if has_error {
+                "Tool error".to_string()
+            } else {
+                codex_artifact_activity_title(&text, "Tool output", &artifacts)
+            };
             Some(CodexThreadTranscriptMessage {
                 id: format!("claude-{line_index}-{block_index}-tool-output"),
                 role: "activity".to_string(),
@@ -3284,8 +3362,14 @@ fn opencode_part_message(
                 source: "opencode".to_string(),
                 artifacts: Vec::new(),
             });
-            let has_error = !error.trim().is_empty();
-            let output_text = if has_error { error } else { output };
+            let has_error = !error.trim().is_empty()
+                || transcript_tool_value_has_error(data)
+                || transcript_tool_value_has_error(state);
+            let output_text = if has_error && !error.trim().is_empty() {
+                error
+            } else {
+                output
+            };
             if !output_text.trim().is_empty() {
                 let artifacts =
                     codex_image_artifacts_from_content(data, &output_text, "Tool output");

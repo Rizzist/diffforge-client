@@ -15127,6 +15127,11 @@ export const AudioBarShell = styled.div`
     pointer-events: auto;
     transform: translateY(0);
   }
+
+  &[data-closing="true"] {
+    pointer-events: none;
+    transform: translateY(4px);
+  }
 `;
 
 export const AudioBarSurface = styled.div`
@@ -15165,6 +15170,11 @@ export const AudioBarSurface = styled.div`
     animation: audioBarSurfaceGrow 190ms cubic-bezier(0.3, 0, 0.2, 1) both;
   }
 
+  ${AudioBarShell}[data-mode="active"][data-closing="true"] & {
+    transform-origin: bottom center;
+    animation: audioBarSurfaceShrink 220ms cubic-bezier(0.3, 0, 0.2, 1) both;
+  }
+
   @keyframes audioBarSurfaceGrow {
     from {
       width: 64px;
@@ -15181,9 +15191,26 @@ export const AudioBarSurface = styled.div`
     }
   }
 
+  @keyframes audioBarSurfaceShrink {
+    from {
+      width: min(100%, 118px);
+      height: min(100%, 38px);
+      opacity: 1;
+      transform: translateY(0) scaleX(1);
+    }
+
+    to {
+      width: 64px;
+      height: 5px;
+      opacity: 0.72;
+      transform: translateY(2px) scaleX(0.82);
+    }
+  }
+
   @media (prefers-reduced-motion: reduce) {
     ${AudioBarShell}[data-mode="active"] &,
-    ${AudioBarShell}[data-mode="error"] & {
+    ${AudioBarShell}[data-mode="error"] &,
+    ${AudioBarShell}[data-mode="active"][data-closing="true"] & {
       animation: none;
     }
   }

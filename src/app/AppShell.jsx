@@ -72,6 +72,9 @@ import {
   TERMINAL_PROVIDER_SESSION_BOUND_EVENT,
 } from "../terminals/WorkspaceTerminal/terminalCore.js";
 import {
+  buildTerminalSubmittedInput,
+} from "../terminals/WorkspaceTerminal/threadRuntime.js";
+import {
   getProviderTurnCompletionIntent,
   shouldReconcileProviderTurnCompletion,
 } from "../terminals/providerTurnIntent.js";
@@ -20632,13 +20635,16 @@ function buildWorkspacePanelSnapshot({
     workspaceId,
   }) || `workspace-panel-${workspaceId}-${panelKind}-${safeIndex}`;
   const status = workspaceRuntimeEnabled ? "open" : "closed";
+  const lastKnownRuntime = !workspaceRuntimeEnabled;
   return {
     active: workspaceRuntimeEnabled,
-    commandable: Boolean(workspaceCommandable),
+    commandable: Boolean(workspaceCommandable && workspaceRuntimeEnabled),
     connected: workspaceRuntimeEnabled,
     displayName,
     display_name: displayName,
     kind: panelKind,
+    lastKnownRuntime,
+    last_known_runtime: lastKnownRuntime,
     lifecycle: status,
     nativeConnected: workspaceRuntimeEnabled,
     native_connected: workspaceRuntimeEnabled,
@@ -20654,6 +20660,8 @@ function buildWorkspacePanelSnapshot({
     panel_name: displayName,
     panelType: panelKind,
     panel_type: panelKind,
+    runtimeReadOnly: lastKnownRuntime,
+    runtime_read_only: lastKnownRuntime,
     slotIndex,
     slot_index: slotIndex,
     status,
@@ -20717,6 +20725,154 @@ function buildWorkspaceConfiguredPanelSnapshots({
     .sort((left, right) => (
       Number(left.terminalIndex ?? 9999) - Number(right.terminalIndex ?? 9999)
     ));
+}
+
+function buildWorkspaceConfiguredTerminalSnapshots({
+  workspaceCommandable,
+  workspaceId,
+  workspaceName,
+  workspaceRuntimeEnabled,
+  workspaceSettings,
+  workspaceTerminalFallbackRole = WORKSPACE_TERMINAL_ROLE_GENERIC,
+  workspaceTerminalLogicalIndexes,
+  workspaceTerminalRoleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS,
+  workspaceThreads,
+} = {}) {
+  const terminalCount = getWorkspaceTerminalCount(workspaceSettings || {}, workspaceId);
+  const logicalIndexes = getWorkspaceLogicalTerminalIndexes(
+    workspaceTerminalLogicalIndexes,
+    workspaceId,
+    terminalCount,
+  );
+  const paneKinds = getWorkspacePaneKinds(workspaceSettings || {}, workspaceId);
+  const terminalRoles = getWorkspaceTerminalRoles(
+    workspaceSettings || {},
+    workspaceId,
+    terminalCount,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalRoleOptions,
+  );
+  const lastKnownRuntime = !workspaceRuntimeEnabled;
+  const status = workspaceRuntimeEnabled ? "idle" : "offline";
+  const railFields = getTerminalNativeRailStateFields(status);
+  return logicalIndexes
+    .filter((terminalIndex) => !isWorkspacePanelPaneIndex(paneKinds, terminalIndex))
+    .map((terminalIndex, index) => {
+      const agentId = normalizeWorkspaceTerminalRole(
+        terminalRoles[index] || terminalRoles[terminalIndex],
+        workspaceTerminalFallbackRole,
+        workspaceTerminalRoleOptions,
+      );
+      const thread = getWorkspaceThreadForTerminalIndex(
+        workspaceThreads,
+        workspaceId,
+        terminalIndex,
+      );
+      const providerBinding = getWorkspaceThreadProviderBinding(thread, agentId);
+      const terminalRecord = workspaceThreads?.[workspaceId]?.terminals?.[String(terminalIndex)] || null;
+      const terminalNickname = terminalRealNameFromCandidates(
+        agentId,
+        getWorkspaceThreadTerminalNickname(thread, providerBinding, terminalRecord),
+        terminalRecord?.terminalNickname,
+        terminalRecord?.terminal_nickname,
+      );
+      const agentLabel = agentId === WORKSPACE_TERMINAL_ROLE_GENERIC
+        ? "Terminal"
+        : getManagedAgentLabel(agentId);
+      const terminalName = terminalNickname || terminalRealNameFromCandidates(
+        agentId,
+        terminalRecord?.terminalName,
+        terminalRecord?.terminal_name,
+        terminalRecord?.displayName,
+        terminalRecord?.display_name,
+        thread?.terminalName,
+        thread?.terminal_name,
+        providerBinding?.terminalName,
+        providerBinding?.terminal_name,
+        agentLabel,
+      );
+      const paneId = providerBinding?.terminalBinding?.paneId
+        || thread?.terminalBinding?.paneId
+        || terminalRecord?.paneId
+        || terminalRecord?.pane_id
+        || getWorkspaceTerminalPaneId(workspaceId, terminalIndex, agentId);
+      const colorSlot = getTerminalAgentColorSlot(terminalIndex);
+      const providerSessionId = String(
+        providerBinding?.nativeSessionId
+          || providerBinding?.native_session_id
+          || providerBinding?.providerSessionId
+          || providerBinding?.provider_session_id
+          || thread?.transcriptSessionId
+          || terminalRecord?.providerSessionId
+          || terminalRecord?.provider_session_id
+          || terminalRecord?.nativeSessionId
+          || terminalRecord?.native_session_id
+          || terminalRecord?.sessionId
+          || terminalRecord?.session_id
+          || "",
+      ).trim();
+      return {
+        agentId,
+        agentKind: agentId,
+        agentLabel,
+        activityStatus: status,
+        activity_status: status,
+        color: TERMINAL_AGENT_COLOR_HEX_BY_SLOT[Number(colorSlot)] || "",
+        colorSlot,
+        commandable: Boolean(workspaceCommandable && workspaceRuntimeEnabled),
+        connected: Boolean(workspaceRuntimeEnabled),
+        displayName: terminalName,
+        displayStatus: status,
+        display_status: status,
+        inputReady: false,
+        lastKnownRuntime,
+        last_known_runtime: lastKnownRuntime,
+        ...railFields,
+        nativeConnected: Boolean(workspaceRuntimeEnabled),
+        native_connected: Boolean(workspaceRuntimeEnabled),
+        nativeSessionId: providerSessionId,
+        native_session_id: providerSessionId,
+        paneId,
+        pane_id: paneId,
+        providerSessionId,
+        provider_session_id: providerSessionId,
+        readiness: workspaceRuntimeEnabled ? "ready" : "offline",
+        runtimeReadOnly: lastKnownRuntime,
+        runtime_read_only: lastKnownRuntime,
+        sessionId: providerSessionId,
+        session_id: providerSessionId,
+        sessionState: workspaceRuntimeEnabled ? "session_attached" : "no_session",
+        session_state: workspaceRuntimeEnabled ? "session_attached" : "no_session",
+        status,
+        statusSource: workspaceRuntimeEnabled ? "desktop_configured_workspace" : "desktop_inactive_workspace",
+        status_source: workspaceRuntimeEnabled ? "desktop_configured_workspace" : "desktop_inactive_workspace",
+        targetTerminalId: paneId,
+        target_terminal_id: paneId,
+        terminalEpoch: `${paneId}:0`,
+        terminalId: paneId,
+        terminal_id: paneId,
+        terminalIndex,
+        terminalInstanceId: "",
+        terminal_instance_id: "",
+        terminalLifecycle: workspaceRuntimeEnabled ? "open" : "closed",
+        terminal_lifecycle: workspaceRuntimeEnabled ? "open" : "closed",
+        terminalName,
+        terminal_name: terminalName,
+        terminalNickname: terminalNickname || terminalName,
+        terminal_nickname: terminalNickname || terminalName,
+        terminalStatus: status,
+        terminal_status: status,
+        threadId: thread?.id || createWorkspaceThreadId(workspaceId, terminalIndex),
+        turnStatus: "idle",
+        turn_status: "idle",
+        visibleTerminal: false,
+        visible_terminal: false,
+        workspaceId,
+        workspace_id: workspaceId,
+        workspaceName,
+        workspace_name: workspaceName,
+      };
+    });
 }
 
 function isWorkspacePanelPaneIndex(paneKinds, terminalIndex) {
@@ -22075,6 +22231,7 @@ export default function App() {
   const workspaceCoordinationBootstrapKeysRef = useRef(new Set());
   const terminalStatusEventEmitterRef = useRef(null);
   const remoteCommandReceiptsRef = useRef(new Map());
+  const remoteModelConfigQueueRef = useRef(new Map());
   const workspaceMcpSyncKeyRef = useRef("");
   const cloudMcpSessionContextSyncKeyRef = useRef("");
 
@@ -33033,7 +33190,10 @@ export default function App() {
     workspaceSidebarOrderById,
     workspaceVisibleTerminalRevision,
     workspaceTerminalFallbackRole,
+    workspaceTerminalLogicalIndexes,
     workspaceTerminalRoleOptions,
+    workspaceSettings,
+    workspaceThreads,
   ]);
   const selectedWorkspaceTerminalOptions = useMemo(() => {
     const presenceWorkspace = workspaceTerminalsWorkspaces.find((candidate) => (
@@ -33386,8 +33546,22 @@ export default function App() {
       const workspaceActive = activeOverride === null
         ? activeWorkspaceIds.has(workspaceId)
         : Boolean(activeOverride);
-      const terminals = presenceTerminalsByWorkspaceId.get(workspaceId) || [];
       const presencePanels = presencePanelsByWorkspaceId.get(workspaceId) || [];
+      const configuredTerminals = buildWorkspaceConfiguredTerminalSnapshots({
+        workspaceCommandable: workspaceActive,
+        workspaceId,
+        workspaceName: workspace?.name || workspaceId,
+        workspaceRuntimeEnabled: workspaceActive,
+        workspaceSettings,
+        workspaceTerminalFallbackRole,
+        workspaceTerminalLogicalIndexes,
+        workspaceTerminalRoleOptions,
+        workspaceThreads,
+      });
+      const presenceTerminals = presenceTerminalsByWorkspaceId.get(workspaceId) || [];
+      const terminals = presenceTerminals.length
+        ? presenceTerminals
+        : configuredTerminals;
       const configuredPanels = buildWorkspaceConfiguredPanelSnapshots({
         workspaceCommandable: workspaceActive,
         workspaceId,
@@ -33414,10 +33588,12 @@ export default function App() {
         });
       const panels = Array.from(panelsById.values());
       const selected = String(selectedWorkspace?.id || "").trim() === workspaceId;
+      const terminalExplicitEmpty = workspaceTerminalExplicitEmptyRef.current.has(workspaceId)
+        || configuredTerminals.length === 0;
       const terminalListAuthoritative = true;
-      const terminalListEmptyAuthoritative = terminals.length === 0;
+      const terminalListEmptyAuthoritative = terminals.length === 0 && (workspaceActive || terminalExplicitEmpty);
       const panelListAuthoritative = true;
-      const panelListEmptyAuthoritative = panels.length === 0;
+      const panelListEmptyAuthoritative = panels.length === 0 && workspaceActive;
       const workspaceMcpRegistry = workspaceMcpRegistries[workspaceId] || null;
       const workspaceMcpServers = safeCloudMcpArray(workspaceMcpRegistry?.servers)
         .map(sanitizeWorkspaceMcpServerForCloud)
@@ -33478,6 +33654,10 @@ export default function App() {
     workspaceTerminalsWorkspaces,
     workspaceSettings,
     workspaceMcpRegistries,
+    workspaceTerminalFallbackRole,
+    workspaceTerminalLogicalIndexes,
+    workspaceTerminalRoleOptions,
+    workspaceThreads,
     workspaces,
   ]);
   const workspaceCatalogSyncKey = useMemo(
@@ -36577,6 +36757,458 @@ export default function App() {
       terminalIndex: remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"]) ?? fallback.targetTerminalIndex ?? null,
       threadId: remoteControlTerminalText(terminal, ["threadId", "thread_id"]) || fallback.targetThreadId || "",
     });
+    const remoteControlTerminalCapabilityText = (terminal, keys) => {
+      const capabilities = terminal?.capabilities && typeof terminal.capabilities === "object"
+        ? terminal.capabilities
+        : terminal?.sessionCapabilities && typeof terminal.sessionCapabilities === "object"
+          ? terminal.sessionCapabilities
+          : {};
+      for (const key of keys) {
+        const text = String(capabilities?.[key] || "").trim();
+        if (text) return text;
+      }
+      return "";
+    };
+    const remoteControlTerminalCapabilityValues = (terminal, keys) => {
+      const capabilities = terminal?.capabilities && typeof terminal.capabilities === "object"
+        ? terminal.capabilities
+        : terminal?.sessionCapabilities && typeof terminal.sessionCapabilities === "object"
+          ? terminal.sessionCapabilities
+          : {};
+      const values = [];
+      keys.forEach((key) => {
+        const raw = capabilities?.[key] ?? terminal?.[key];
+        const items = Array.isArray(raw) ? raw : [raw];
+        items.forEach((item) => {
+          const text = String(item?.id || item?.model_id || item?.modelId || item || "").trim();
+          if (text && !values.includes(text)) {
+            values.push(text);
+          }
+        });
+      });
+      return values;
+    };
+    const remoteAgentChatConfigProvider = (event, agentId, terminal) => (
+      normalizeManagedAgentProviderId(
+        agentId
+          || remoteCommandStringField(event, [
+            "provider",
+            "agent_provider",
+            "agentProvider",
+            "agent_id",
+            "agentId",
+            "target_agent_id",
+            "targetAgentId",
+          ])
+          || remoteControlTerminalText(terminal, ["provider", "agentId", "agent_id", "agentKind", "agent_kind", "agentType", "agent_type"]),
+      )
+    );
+    const remoteAgentChatConfigRequestedSessionFields = (event) => ({
+      agentChatSessionId: remoteCommandStringField(event, [
+        "agent_chat_session_id",
+        "agentChatSessionId",
+      ]),
+      providerSessionId: remoteCommandStringField(event, [
+        "provider_session_id",
+        "providerSessionId",
+        "native_session_id",
+        "nativeSessionId",
+        "session_id",
+        "sessionId",
+      ]),
+      sessionRef: remoteCommandStringField(event, ["session_ref", "sessionRef"]),
+    });
+    const remoteAgentChatConfigTerminalSessionFields = (terminal) => ({
+      agentChatSessionId: remoteControlTerminalText(terminal, [
+        "agentChatSessionId",
+        "agent_chat_session_id",
+        "cloudSessionId",
+        "cloud_session_id",
+      ]),
+      providerSessionId: remoteControlTerminalText(terminal, [
+        "providerSessionId",
+        "provider_session_id",
+        "nativeSessionId",
+        "native_session_id",
+        "sessionId",
+        "session_id",
+      ]),
+    });
+    const remoteAgentChatConfigSessionFields = (event, terminal) => {
+      const requested = remoteAgentChatConfigRequestedSessionFields(event);
+      const terminalSession = remoteAgentChatConfigTerminalSessionFields(terminal);
+      const sessionRef = requested.sessionRef;
+      const sessionRefMatchesAgent = Boolean(sessionRef && terminalSession.agentChatSessionId === sessionRef);
+      const sessionRefMatchesProvider = Boolean(sessionRef && terminalSession.providerSessionId === sessionRef);
+      return {
+        agentChatSessionId: requested.agentChatSessionId
+          || (sessionRefMatchesAgent ? sessionRef : "")
+          || terminalSession.agentChatSessionId,
+        providerSessionId: requested.providerSessionId
+          || (sessionRefMatchesProvider ? sessionRef : "")
+          || terminalSession.providerSessionId,
+        requested,
+        sessionRef,
+        terminalSession,
+      };
+    };
+    const remoteAgentChatConfigValidateSessionTarget = (event, terminal) => {
+      const sessionFields = remoteAgentChatConfigSessionFields(event, terminal);
+      const { requested, sessionRef, terminalSession } = sessionFields;
+      const requestedAgentSessionId = String(requested.agentChatSessionId || "").trim();
+      const requestedProviderSessionId = String(requested.providerSessionId || "").trim();
+      const requestedSessionRef = String(sessionRef || "").trim();
+      const terminalAgentSessionId = String(terminalSession.agentChatSessionId || "").trim();
+      const terminalProviderSessionId = String(terminalSession.providerSessionId || "").trim();
+      const terminalSessionIds = new Set(
+        [terminalAgentSessionId, terminalProviderSessionId].filter(Boolean),
+      );
+      if (!requestedAgentSessionId && !requestedProviderSessionId && !requestedSessionRef) {
+        return {
+          ok: false,
+          message: "Remote model configuration requires provider_session_id, agent_chat_session_id, or session_ref.",
+          sessionFields,
+        };
+      }
+      if (requestedProviderSessionId && requestedProviderSessionId !== terminalProviderSessionId) {
+        return {
+          ok: false,
+          message: "Remote model configuration provider_session_id does not match the targeted terminal.",
+          sessionFields,
+        };
+      }
+      if (
+        requestedAgentSessionId
+        && terminalAgentSessionId
+        && requestedAgentSessionId !== terminalAgentSessionId
+      ) {
+        return {
+          ok: false,
+          message: "Remote model configuration agent_chat_session_id does not match the targeted terminal.",
+          sessionFields,
+        };
+      }
+      if (
+        requestedAgentSessionId
+        && !terminalAgentSessionId
+        && !requestedProviderSessionId
+        && !terminalSessionIds.has(requestedAgentSessionId)
+      ) {
+        return {
+          ok: false,
+          message: "Remote model configuration agent_chat_session_id cannot be verified against the targeted terminal.",
+          sessionFields,
+        };
+      }
+      if (requestedSessionRef && !terminalSessionIds.has(requestedSessionRef)) {
+        return {
+          ok: false,
+          message: "Remote model configuration session_ref does not match the targeted terminal.",
+          sessionFields,
+        };
+      }
+      return { ok: true, sessionFields };
+    };
+    const remoteAgentChatConfigCurrentModel = (event, terminal) => (
+      remoteCommandStringField(event, ["current_model", "currentModel"])
+        || remoteControlTerminalText(terminal, ["currentModel", "current_model", "modelId", "model_id", "model"])
+        || remoteControlTerminalCapabilityText(terminal, ["currentModel", "current_model"])
+    );
+    const buildRemoteAgentChatConfigCommand = ({ commandKind: rawCommandKind, event, provider, terminal }) => {
+      const commandKind = normalizeRemoteCommandName(rawCommandKind);
+      const requestedModel = remoteCommandStringField(event, ["model_id", "modelId", "model"]);
+      const requestedEffort = remoteCommandStringField(event, [
+        "reasoning_effort",
+        "reasoningEffort",
+        "effort",
+        "thinking_power",
+        "thinkingPower",
+      ]).toLowerCase();
+      if (provider === "opencode") {
+        return { error: "OpenCode does not expose a reliable live model or effort slash command." };
+      }
+      if (!["codex", "claude"].includes(provider)) {
+        return { error: "Remote model configuration requires a supported provider." };
+      }
+      const modelPattern = /^[A-Za-z0-9._:/-]+$/;
+      if (commandKind === "agent_chat_change_model") {
+        if (!requestedModel) {
+          return { error: "Remote model change did not include model_id." };
+        }
+        if (requestedModel.length > 160 || !modelPattern.test(requestedModel)) {
+          return { error: "Remote model change included an invalid model_id." };
+        }
+        const codexEfforts = new Set(["low", "medium", "high", "xhigh"]);
+        const advertisedModels = remoteControlTerminalCapabilityValues(terminal, [
+          "models",
+          "availableModels",
+          "available_models",
+          "modelIds",
+          "model_ids",
+        ]);
+        const canConfirmModelImmediately = advertisedModels.length > 0
+          && advertisedModels.includes(requestedModel);
+        if (provider === "codex" && codexEfforts.has(requestedEffort)) {
+          return {
+            awaitingDetection: !canConfirmModelImmediately,
+            command: `/model ${requestedModel} ${requestedEffort}`,
+            modelId: requestedModel,
+            recordModelId: canConfirmModelImmediately ? requestedModel : "",
+            recordReasoningEffort: canConfirmModelImmediately ? requestedEffort : "",
+            reasoningEffort: requestedEffort,
+          };
+        }
+        return {
+          awaitingDetection: !canConfirmModelImmediately,
+          command: `/model ${requestedModel}`,
+          modelId: requestedModel,
+          recordModelId: canConfirmModelImmediately ? requestedModel : "",
+          recordReasoningEffort: "",
+          reasoningEffort: "",
+        };
+      }
+      if (commandKind === "agent_chat_change_effort") {
+        const validEfforts = provider === "claude"
+          ? new Set(["low", "medium", "high", "xhigh", "max"])
+          : new Set(["low", "medium", "high", "xhigh"]);
+        if (!validEfforts.has(requestedEffort)) {
+          return { error: `Remote effort change included an invalid ${provider} reasoning_effort.` };
+        }
+        if (provider === "claude") {
+          return {
+            command: `/effort ${requestedEffort}`,
+            modelId: remoteAgentChatConfigCurrentModel(event, terminal),
+            recordModelId: "",
+            recordReasoningEffort: requestedEffort,
+            reasoningEffort: requestedEffort,
+          };
+        }
+        const currentModel = remoteAgentChatConfigCurrentModel(event, terminal);
+        if (!currentModel || currentModel.length > 160 || !modelPattern.test(currentModel)) {
+          return { error: "Codex effort changes require the current model_id." };
+        }
+        return {
+          command: `/model ${currentModel} ${requestedEffort}`,
+          modelId: currentModel,
+          recordModelId: "",
+          recordReasoningEffort: requestedEffort,
+          reasoningEffort: requestedEffort,
+        };
+      }
+      return { error: "Unsupported model configuration command." };
+    };
+    const recordRemoteAgentChatConfigConfirmation = async ({
+      commandId,
+      event,
+      modelId,
+      origin = "remote",
+      provider,
+      reasoningEffort,
+      sessionFields = null,
+      terminal,
+      workspaceId,
+    }) => {
+      const { agentChatSessionId, providerSessionId } = sessionFields
+        || remoteAgentChatConfigSessionFields(event, terminal);
+      const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]);
+      const terminalInstanceId = remoteControlTerminalNumber(terminal, ["terminalInstanceId", "terminal_instance_id", "instanceId", "instance_id"]);
+      const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index", "index"]);
+      const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"]);
+      if (!providerSessionId && !agentChatSessionId) {
+        throw new Error("Model configuration confirmation requires provider_session_id or agent_chat_session_id.");
+      }
+      await invoke("cloud_mcp_record_agent_chat_model_config", {
+        agentChatSessionId: agentChatSessionId || null,
+        commandId,
+        modelId: modelId || null,
+        origin,
+        paneId,
+        provider,
+        providerSessionId: providerSessionId || null,
+        reasoningEffort: reasoningEffort || null,
+        terminalIndex: Number.isInteger(terminalIndex) ? terminalIndex : null,
+        terminalInstanceId: Number.isInteger(terminalInstanceId) ? terminalInstanceId : null,
+        threadId: threadId || null,
+        timestamp: new Date().toISOString(),
+        turnId: remoteCommandStringField(event, ["turn_id", "turnId"]) || null,
+        workspaceId,
+        workspaceName: findWorkspaceById(workspacesRef.current, workspaceId)?.name || "",
+      });
+    };
+    const applyRemoteAgentChatConfigChange = async (request) => {
+      const {
+        commandId,
+        commandKind,
+        event,
+        target,
+        workspaceId,
+      } = request;
+      const { terminal } = findRemoteControlTerminal(workspaceId, target);
+      const provider = remoteAgentChatConfigProvider(event, request.agentId, terminal);
+      const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]);
+      const instanceId = remoteControlTerminalNumber(terminal, ["terminalInstanceId", "terminal_instance_id", "instanceId", "instance_id"]);
+      const threadId = remoteControlTerminalText(terminal, ["threadId", "thread_id"]);
+      if (!terminal || !paneId) {
+        throw new Error("Target terminal was not found on this desktop.");
+      }
+      if (!provider) {
+        throw new Error("Remote model configuration did not include a supported provider.");
+      }
+      const sessionValidation = remoteAgentChatConfigValidateSessionTarget(event, terminal);
+      if (!sessionValidation.ok) {
+        throw new Error(sessionValidation.message || "Remote model configuration session target did not match.");
+      }
+      const built = buildRemoteAgentChatConfigCommand({
+        commandKind,
+        event,
+        provider,
+        terminal,
+      });
+      if (!built.command) {
+        throw new Error(built.error || "Unable to build model configuration command.");
+      }
+      await invoke("terminal_write", {
+        data: buildTerminalSubmittedInput(built.command, provider),
+        instanceId: Number.isInteger(instanceId) ? instanceId : undefined,
+        paneId,
+        promptEventSource: "remote-model-config",
+        threadId: threadId || undefined,
+      });
+      const confirmationRecorded = Boolean(built.recordModelId || built.recordReasoningEffort);
+      if (confirmationRecorded) {
+        await recordRemoteAgentChatConfigConfirmation({
+          commandId,
+          event,
+          modelId: built.recordModelId,
+          provider,
+          reasoningEffort: built.recordReasoningEffort,
+          sessionFields: sessionValidation.sessionFields,
+          terminal,
+          workspaceId,
+        });
+      }
+      await recordRemoteCommandStatus(
+        event,
+        "applied",
+        confirmationRecorded
+          ? "Model configuration command applied to the live terminal."
+          : "Model configuration command was written; waiting for session history detection before confirming.",
+        {
+        commandId,
+        commandKind,
+        confirmation: confirmationRecorded ? "recorded" : "pending_detection",
+        modelId: built.modelId || "",
+        paneId,
+        provider,
+        reasoningEffort: built.reasoningEffort || "",
+        terminal: remoteControlTerminalSummary(terminal, target),
+        workspaceId,
+      });
+    };
+    const scheduleRemoteAgentChatConfigDrain = (commandId) => {
+      const queued = remoteModelConfigQueueRef.current.get(commandId);
+      if (!queued || queued.timer) {
+        return;
+      }
+      const timer = window.setTimeout(async () => {
+        const request = remoteModelConfigQueueRef.current.get(commandId);
+        if (!request) {
+          return;
+        }
+        remoteModelConfigQueueRef.current.set(commandId, {
+          ...request,
+          timer: null,
+        });
+        const { terminal } = findRemoteControlTerminal(request.workspaceId, request.target);
+        const assessment = assessRemoteControlTerminalIdle(terminal);
+        if (!terminal || !assessment.idle) {
+          if (Date.now() - Number(request.queuedAtMs || 0) > 10 * 60 * 1000) {
+            remoteModelConfigQueueRef.current.delete(commandId);
+            await recordRemoteCommandStatus(request.event, "error", "Timed out waiting for the terminal to become idle for model configuration.", {
+              assessment,
+              commandId,
+              commandKind: request.commandKind,
+              workspaceId: request.workspaceId,
+            });
+            return;
+          }
+          scheduleRemoteAgentChatConfigDrain(commandId);
+          return;
+        }
+        remoteModelConfigQueueRef.current.delete(commandId);
+        try {
+          await applyRemoteAgentChatConfigChange(request);
+        } catch (error) {
+          await recordRemoteCommandStatus(request.event, "error", getErrorMessage(error, "Unable to apply model configuration."), {
+            commandId,
+            commandKind: request.commandKind,
+            workspaceId: request.workspaceId,
+          });
+        }
+      }, 2_000);
+      remoteModelConfigQueueRef.current.set(commandId, {
+        ...queued,
+        timer,
+      });
+    };
+    const handleRemoteAgentChatConfigChange = async ({
+      agentId,
+      commandId,
+      commandKind,
+      event,
+      target,
+      workspaceId,
+    }) => {
+      const { terminal } = findRemoteControlTerminal(workspaceId, target);
+      const assessment = assessRemoteControlTerminalIdle(terminal);
+      if (!terminal) {
+        await recordRemoteCommandStatus(event, "error", "Target terminal was not found on this desktop.", {
+          commandId,
+          commandKind,
+          target,
+          workspaceId,
+        });
+        return;
+      }
+      if (!assessment.idle) {
+        const queued = {
+          agentId,
+          commandId,
+          commandKind,
+          event,
+          queuedAtMs: Date.now(),
+          target,
+          workspaceId,
+        };
+        remoteModelConfigQueueRef.current.set(commandId, queued);
+        scheduleRemoteAgentChatConfigDrain(commandId);
+        await recordRemoteCommandStatus(event, "queued", "Terminal is busy; model configuration will apply when it is ready.", {
+          assessment,
+          commandId,
+          commandKind,
+          terminal: remoteControlTerminalSummary(terminal, target),
+          workspaceId,
+        });
+        return;
+      }
+      try {
+        await applyRemoteAgentChatConfigChange({
+          agentId,
+          commandId,
+          commandKind,
+          event,
+          target,
+          workspaceId,
+        });
+      } catch (error) {
+        await recordRemoteCommandStatus(event, "error", getErrorMessage(error, "Unable to apply model configuration."), {
+          commandId,
+          commandKind,
+          terminal: remoteControlTerminalSummary(terminal, target),
+          workspaceId,
+        });
+      }
+    };
     const closeRemoteControlTerminal = async (workspaceId, terminal, target = {}) => {
       const paneId = remoteControlTerminalText(terminal, ["paneId", "pane_id", "terminalId", "terminal_id"]);
       const terminalIndex = remoteControlTerminalNumber(terminal, ["terminalIndex", "terminal_index"]);
@@ -36815,16 +37447,38 @@ export default function App() {
         });
         return;
       }
-      if (!targetWorkspace) {
-        await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
-          commandId,
-          commandKind,
-          workspaceId,
-        });
-        return;
-      }
-      if ([
-        "todo_queue",
+	      if (!targetWorkspace) {
+	        await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
+	          commandId,
+	          commandKind,
+	          workspaceId,
+	        });
+	        return;
+	      }
+	      if ([
+	        "agent_chat_change_model",
+	        "change_agent_chat_model",
+	        "agent_chat_model_change",
+	        "change_session_model",
+	        "session_model_change",
+	        "agent_chat_change_effort",
+	        "change_agent_chat_effort",
+	        "agent_chat_effort_change",
+	        "change_session_effort",
+	        "session_effort_change",
+	      ].includes(normalizedKind)) {
+	        await handleRemoteAgentChatConfigChange({
+	          agentId,
+	          commandId,
+	          commandKind,
+	          event,
+	          target,
+	          workspaceId,
+	        });
+	        return;
+	      }
+	      if ([
+	        "todo_queue",
         "queue_todo",
         "workspace_todo_queue",
       ].includes(normalizedKind)) {

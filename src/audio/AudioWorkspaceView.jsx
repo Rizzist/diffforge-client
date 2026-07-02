@@ -588,6 +588,7 @@ const AUDIO_WIDGET_BAR_IDLE_SIZE = { width: 84, height: 18 };
 const AUDIO_WIDGET_BAR_IDLE_HOVER_SIZE = { width: 200, height: 96 };
 const AUDIO_WIDGET_BAR_IDLE_BOTTOM_MARGIN = 0;
 const AUDIO_WIDGET_BAR_ANCHOR_ANIMATION_MS = 180;
+const AUDIO_WIDGET_BAR_CLOSE_ANIMATION_MS = 220;
 const AUDIO_WIDGET_BAR_ANCHOR_RECHECK_MS = 700;
 const AUDIO_WIDGET_CLOUD_STATUS_POLL_MS = 5000;
 // Hover transitions arrive instantly via AUDIO_WIDGET_*_HOVER_CHANGED_EVENT; this
@@ -6046,6 +6047,7 @@ export function AudioWidgetWindow() {
   const widgetManualPolishingEnabled = readAudioManualPolishingEnabled();
   const [forgeCloudConnected, setForgeCloudConnected] = useState(false);
   const [barIdleHover, setBarIdleHover] = useState(false);
+  const [barClosing, setBarClosing] = useState(false);
   const [bubbleHover, setBubbleHover] = useState(false);
   const [barPlacementReadyKey, setBarPlacementReadyKey] = useState("");
   const audioBufferRef = useRef(null);
@@ -6071,6 +6073,7 @@ export function AudioWidgetWindow() {
   const undoRequestedIdRef = useRef(0);
   const lastCancelledRef = useRef(null);
   const barSavedPlacementRef = useRef(null);
+  const barClosingTimerRef = useRef(0);
   const barPositionAnimationRef = useRef({ frame: 0, token: 0 });
   const barPlacementGenerationRef = useRef(0);
   const barPlacementReadyKeyRef = useRef("");
@@ -6088,6 +6091,7 @@ export function AudioWidgetWindow() {
   const bubbleHistoryTrayCloseDeferredRef = useRef(false);
   const widgetDraggingRef = useRef(false);
   const barIdleHoverRef = useRef(false);
+  const barActivePillVisibleRef = useRef(false);
   const bubbleHoverRef = useRef(false);
   const barIdleModeRef = useRef(false);
   const canUseBubbleHistoryTrayRef = useRef(false);
@@ -6117,6 +6121,17 @@ export function AudioWidgetWindow() {
     const hovering = Boolean(nextHovering);
     barIdleHoverRef.current = hovering;
     setBarIdleHover((current) => (current === hovering ? current : hovering));
+  }, []);
+
+  const clearBarClosingTimer = useCallback(() => {
+    if (
+      barClosingTimerRef.current
+      && typeof window !== "undefined"
+      && typeof window.clearTimeout === "function"
+    ) {
+      window.clearTimeout(barClosingTimerRef.current);
+    }
+    barClosingTimerRef.current = 0;
   }, []);
 
   const setBubbleHoverState = useCallback((nextHovering) => {
@@ -6166,6 +6181,10 @@ export function AudioWidgetWindow() {
   useEffect(() => {
     widgetDraggingRef.current = widgetDragging;
   }, [widgetDragging]);
+
+  useEffect(() => () => {
+    clearBarClosingTimer();
+  }, [clearBarClosingTimer]);
 
   useEffect(() => {
     applyAudioWidgetThemePreference(audioWidgetTheme);
@@ -7130,12 +7149,20 @@ export function AudioWidgetWindow() {
   const barErrorFrameActive = sharedErrorFrameActive && usesBottomAnchoredStyle;
   const barVisible = usesBottomAnchoredStyle
     && (widgetActive || cancelNoticeActive);
-  const barIdleMode = usesBottomAnchoredStyle && !barVisible;
+  const barActivePillVisible = usesBottomAnchoredStyle && barVisible && !cancelNoticeActive;
+  const barClosingCandidate = usesBottomAnchoredStyle
+    && !barVisible
+    && !cancelNoticeActive
+    && barActivePillVisibleRef.current;
+  const barClosingActive = !barVisible && (barClosing || barClosingCandidate);
+  const barSurfaceVisible = barVisible || barClosingActive;
+  const barGeometryVisible = barVisible || barClosingActive;
+  const barIdleMode = usesBottomAnchoredStyle && !barSurfaceVisible;
   const {
     key: barGeometryKey,
     margin: barGeometryMargin,
     size: barGeometrySize,
-  } = getAudioWidgetBarGeometry(cancelNoticeActive, barVisible, barIdleHover);
+  } = getAudioWidgetBarGeometry(cancelNoticeActive, barGeometryVisible, barIdleHover);
   const barGeometryReady = !usesBottomAnchoredStyle || barPlacementReadyKey === barGeometryKey;
   // Bubble style shows the same cancel notice pill as the bar: the window
   // morphs to the pill in place while it shows, then morphs back.
@@ -7155,6 +7182,46 @@ export function AudioWidgetWindow() {
   historyTrayClosingRef.current = historyTrayClosing;
   canUseBubbleHistoryTrayRef.current = canUseBubbleHistoryTray;
   bubbleHistoryTrayActiveRef.current = bubbleHistoryTrayFrameActive;
+
+  useEffect(() => {
+    const wasActivePillVisible = barActivePillVisibleRef.current;
+    barActivePillVisibleRef.current = barActivePillVisible;
+
+    if (!usesBottomAnchoredStyle) {
+      clearBarClosingTimer();
+      setBarClosing(false);
+      return;
+    }
+
+    if (barActivePillVisible || barVisible) {
+      clearBarClosingTimer();
+      setBarClosing(false);
+      return;
+    }
+
+    if (!wasActivePillVisible) {
+      clearBarClosingTimer();
+      setBarClosing(false);
+      return;
+    }
+
+    clearBarClosingTimer();
+    setBarClosing(true);
+    if (typeof window === "undefined" || typeof window.setTimeout !== "function") {
+      setBarClosing(false);
+      return;
+    }
+
+    barClosingTimerRef.current = window.setTimeout(() => {
+      barClosingTimerRef.current = 0;
+      setBarClosing(false);
+    }, AUDIO_WIDGET_BAR_CLOSE_ANIMATION_MS);
+  }, [
+    barActivePillVisible,
+    barVisible,
+    clearBarClosingTimer,
+    usesBottomAnchoredStyle,
+  ]);
 
   const refreshWidgetHistory = useCallback(() => {
     setWidgetHistory(readAudioTranscriptionHistory());
@@ -10434,7 +10501,7 @@ export function AudioWidgetWindow() {
   ) : null;
 
   if (widgetStyle === AUDIO_WIDGET_STYLE_BAR) {
-    if (!barVisible) {
+    if (!barSurfaceVisible) {
       const dictateShortcutLabel = formatShortcutLabel(widgetPushToTalkShortcut);
       return (
         <>
@@ -10481,10 +10548,11 @@ export function AudioWidgetWindow() {
         <GlobalStyle />
         <AudioBarShell
           aria-label={widgetLabel}
+          data-closing={barClosingActive ? "true" : undefined}
           data-geometry-ready={barGeometryReady ? "true" : "false"}
           data-mode={cancelNotice ? "notice" : "active"}
           data-theme={audioWidgetTheme}
-          data-visible={barVisible && barGeometryReady ? "true" : "false"}
+          data-visible={barVisible && !barClosingActive && barGeometryReady ? "true" : "false"}
         >
           {cancelNotice ? cancelNoticeSurface : (
             <AudioBarSurface

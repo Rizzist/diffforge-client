@@ -6,7 +6,7 @@ fn terminal_now_ms() -> u64 {
 }
 
 const TERMINAL_STARTING_IDLE_BUFFER_MS: u64 = 5_000;
-const TERMINAL_CODEX_IDLE_QUIESCE_MS: u64 = 1_750;
+const TERMINAL_ACTIVITY_IDLE_QUIESCE_MS: u64 = 1_750;
 const TERMINAL_PROMPT_READY_BUSY_DEBOUNCE_MS: u64 = 750;
 const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
 
@@ -1243,6 +1243,65 @@ fn terminal_emit_provider_session_binding(
     let _ = app.emit(TERMINAL_PROVIDER_SESSION_BOUND_EVENT, payload);
 }
 
+fn terminal_workspace_agent_session_status_requires_input(
+    event_type: &str,
+    activity_status: &str,
+    command_phase: &str,
+) -> bool {
+    let event_type = terminal_projection_text(event_type, "");
+    let activity_status = terminal_projection_text(activity_status, "");
+    let command_phase = terminal_projection_text(command_phase, "");
+    matches!(
+        event_type.as_str(),
+        "provider_user_prompt_started" | "provider-user-prompt-started"
+    ) || matches!(
+        activity_status.as_str(),
+        "awaiting_input" | "awaiting_user" | "needs_input" | "prompting_user"
+    ) || matches!(
+        command_phase.as_str(),
+        "awaiting_input"
+            | "awaiting_user"
+            | "needs_input"
+            | "prompting_user"
+            | "requires_input"
+            | "requires_user_input"
+    )
+}
+
+fn terminal_workspace_agent_session_status_from_runtime(
+    runtime: &TerminalRuntimeSnapshot,
+) -> String {
+    if terminal_workspace_agent_session_status_requires_input(
+        &runtime.event_type,
+        &runtime.activity_status,
+        &runtime.command_phase,
+    ) {
+        return "needs_input".to_string();
+    }
+    terminal_projection_text(
+        &runtime.activity_status,
+        &terminal_projection_text(&runtime.status, "active"),
+    )
+}
+
+fn terminal_workspace_agent_session_status_from_payload(
+    payload: &TerminalActivityHookPayload,
+) -> String {
+    if payload.terminal_is_prompting_user
+        || terminal_workspace_agent_session_status_requires_input(
+            &payload.event_type,
+            &payload.activity_status,
+            &payload.command_phase,
+        )
+    {
+        return "needs_input".to_string();
+    }
+    terminal_projection_text(
+        &payload.activity_status,
+        &terminal_projection_text(&payload.status, "active"),
+    )
+}
+
 fn terminal_record_workspace_provider_session_binding(
     app: Option<AppHandle>,
     instance: &TerminalInstance,
@@ -1258,13 +1317,14 @@ fn terminal_record_workspace_provider_session_binding(
     if let Some(app) = app.as_ref() {
         terminal_emit_provider_session_binding(app, &binding, None);
     }
-    let history_status = terminal_runtime_snapshot(instance).activity_status;
+    let history_status =
+        terminal_workspace_agent_session_status_from_runtime(&terminal_runtime_snapshot(instance));
     terminal_record_workspace_agent_session_history(
         app.clone(),
         instance,
         None,
         None,
-        &history_status,
+            &history_status,
         format!("{source}:provider-session"),
         None,
     );
@@ -2849,6 +2909,8 @@ fn terminal_session_capabilities(
         .collect(),
         _ => Vec::new(),
     };
+    let can_change_model_now = matches!(provider.as_str(), "codex" | "claude");
+    let can_change_effort_now = matches!(provider.as_str(), "codex" | "claude");
     TerminalSessionCapabilities {
         provider,
         current_model: launch_metadata.model.clone(),
@@ -2862,8 +2924,8 @@ fn terminal_session_capabilities(
         can_interrupt: true,
         can_raw_input: false,
         can_close: true,
-        can_change_model_now: false,
-        can_change_effort_now: false,
+        can_change_model_now,
+        can_change_effort_now,
         can_change_permission_mode_now: false,
         prompt_answer_mechanism: "pty_keystroke".to_string(),
         interrupt_mechanism: "pty_escape".to_string(),
@@ -11060,6 +11122,46 @@ fn terminal_activity_hook_text_from_value(value: &Value) -> Option<String> {
     }
 }
 
+fn terminal_activity_hook_lossless_text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => (!value.is_empty()).then(|| value.to_string()),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(terminal_activity_hook_lossless_text_from_value)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        Value::Object(object) => {
+            for key in [
+                "text",
+                "content",
+                "delta",
+                "message",
+                "assistantMessage",
+                "assistant_message",
+                "assistantMessageSnapshot",
+                "assistant_message_snapshot",
+                "outputText",
+                "output_text",
+                "summary",
+                "thinking",
+                "reasoning",
+            ] {
+                if let Some(text) = object
+                    .get(key)
+                    .and_then(terminal_activity_hook_lossless_text_from_value)
+                {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
 fn terminal_activity_hook_message_text(event: &Value, keys: &[&str]) -> Option<String> {
     for key in keys {
         if let Some(text) = event
@@ -11070,6 +11172,52 @@ fn terminal_activity_hook_message_text(event: &Value, keys: &[&str]) -> Option<S
         }
     }
     None
+}
+
+fn terminal_activity_hook_lossless_message_text(event: &Value, keys: &[&str]) -> Option<String> {
+    for key in keys {
+        if let Some(text) = event
+            .get(*key)
+            .and_then(terminal_activity_hook_lossless_text_from_value)
+        {
+            if !text.is_empty() {
+                return Some(text);
+            }
+        }
+    }
+    None
+}
+
+fn terminal_activity_stream_debug_enabled() -> bool {
+    cfg!(debug_assertions)
+        && [
+            "RUST_DIFFFORGE_AGENT_STREAM_DEBUG",
+            "RUST_DIFFFORGE_USE_LOCAL_DOCKER_CLOUD",
+        ]
+        .iter()
+        .any(|key| {
+            std::env::var(key).ok().is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "debug"
+                )
+            })
+        })
+}
+
+fn terminal_activity_text_debug_summary(value: Option<&str>) -> Value {
+    let Some(value) = value else {
+        return json!({ "present": false });
+    };
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    json!({
+        "present": true,
+        "bytes": value.len(),
+        "chars": value.chars().count(),
+        "hash": format!("{:016x}", hasher.finish()),
+    })
 }
 
 fn terminal_activity_hook_name_key(value: &str) -> String {
@@ -12202,6 +12350,11 @@ fn terminal_activity_hook_live_message_text(value: &str) -> Option<String> {
     (!text.trim().is_empty()).then_some(text)
 }
 
+fn terminal_activity_hook_structured_live_message_text(value: &str) -> Option<String> {
+    let cleaned = terminal_activity_strip_terminal_sequences(value);
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
 fn terminal_activity_hook_activity_message_text(value: &str) -> Option<String> {
     terminal_activity_hook_live_message_text(value)
         .or_else(|| terminal_activity_tui_activity_text(value))
@@ -12492,6 +12645,8 @@ fn terminal_activity_hook_payload(
             "last_message",
             "lastAssistantMessage",
             "last_assistant_message",
+            "assistantMessageSnapshot",
+            "assistant_message_snapshot",
             "assistantMessage",
             "assistant_message",
             "outputText",
@@ -12557,8 +12712,8 @@ fn terminal_activity_hook_payload(
             | "reasoningdelta"
             | "assistantreasoningdelta"
     );
-    let raw_live_text_delta = if live_text_kind.is_some() && live_delta_hook {
-        terminal_activity_hook_message_text(
+    let explicit_live_text_delta = if live_text_kind.is_some() && live_delta_hook {
+        terminal_activity_hook_lossless_message_text(
             event,
             &[
                 "assistantDelta",
@@ -12572,23 +12727,38 @@ fn terminal_activity_hook_payload(
                 "thinking_delta",
                 "reasoningDelta",
                 "reasoning_delta",
-                "assistantMessage",
-                "assistant_message",
-                "outputText",
-                "output_text",
-                "text",
-                "message",
             ],
         )
-        .or_else(|| raw_user_message.clone())
-        .filter(|value| !value.trim().is_empty())
     } else {
         None
     };
-    let live_text_delta = raw_live_text_delta
-        .as_deref()
-        .and_then(terminal_activity_hook_live_message_text);
-    let explicit_live_text_snapshot = terminal_activity_hook_message_text(
+    let raw_live_text_delta = explicit_live_text_delta.clone().or_else(|| {
+        if live_text_kind.is_some() && live_delta_hook {
+            terminal_activity_hook_message_text(
+                event,
+                &[
+                    "assistantMessage",
+                    "assistant_message",
+                    "outputText",
+                    "output_text",
+                    "text",
+                    "message",
+                ],
+            )
+            .or_else(|| raw_user_message.clone())
+            .filter(|value| !value.trim().is_empty())
+        } else {
+            None
+        }
+    });
+    let live_text_delta = raw_live_text_delta.as_deref().and_then(|value| {
+        if explicit_live_text_delta.is_some() {
+            terminal_activity_hook_structured_live_message_text(value)
+        } else {
+            terminal_activity_hook_live_message_text(value)
+        }
+    });
+    let explicit_live_text_snapshot = terminal_activity_hook_lossless_message_text(
         event,
         &[
             "assistantMessageSnapshot",
@@ -12607,15 +12777,42 @@ fn terminal_activity_hook_payload(
         ],
     );
     let raw_live_text_snapshot = if final_message_hook && live_text_kind.is_some() {
-        raw_user_message
+        explicit_live_text_snapshot.clone().or_else(|| raw_user_message
             .clone()
-            .filter(|value| !value.trim().is_empty())
+            .filter(|value| !value.trim().is_empty()))
     } else {
-        explicit_live_text_snapshot
+        explicit_live_text_snapshot.clone()
     };
-    let live_text_snapshot = raw_live_text_snapshot
-        .as_deref()
-        .and_then(terminal_activity_hook_live_message_text);
+    let live_text_snapshot = raw_live_text_snapshot.as_deref().and_then(|value| {
+        if explicit_live_text_snapshot.is_some() {
+            terminal_activity_hook_structured_live_message_text(value)
+        } else {
+            terminal_activity_hook_live_message_text(value)
+        }
+    });
+    if terminal_activity_stream_debug_enabled()
+        && (live_text_delta.is_some() || live_text_snapshot.is_some() || final_message_hook)
+    {
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.live_text",
+            json!({
+                "event_type": event_type,
+                "final_message_hook": final_message_hook,
+                "hook_event_name": hook_event_name.as_str(),
+                "hook_key": hook_key.as_str(),
+                "live_text_kind": live_text_kind.as_deref().unwrap_or_default(),
+                "pane_id": clean_terminal_diagnostic_log_text(&metadata.pane_id),
+                "provider": provider.as_str(),
+                "raw_delta": terminal_activity_text_debug_summary(raw_live_text_delta.as_deref()),
+                "raw_snapshot": terminal_activity_text_debug_summary(raw_live_text_snapshot.as_deref()),
+                "session_id_present": provider_session_id.is_some(),
+                "structured_delta": explicit_live_text_delta.is_some(),
+                "structured_snapshot": explicit_live_text_snapshot.is_some(),
+                "sanitized_delta": terminal_activity_text_debug_summary(live_text_delta.as_deref()),
+                "sanitized_snapshot": terminal_activity_text_debug_summary(live_text_snapshot.as_deref()),
+            }),
+        );
+    }
     let user_message = if live_text_kind.is_some() {
         raw_user_message
             .as_deref()
@@ -13351,6 +13548,10 @@ fn terminal_activity_hook_codex_idle_quiesce_buffered(event: &Value) -> bool {
     terminal_activity_hook_bool(
         event,
         &[
+            "terminalIdleQuiesceBuffered",
+            "terminal_idle_quiesce_buffered",
+            "activityIdleQuiesceBuffered",
+            "activity_idle_quiesce_buffered",
             "codexIdleQuiesceBuffered",
             "codex_idle_quiesce_buffered",
         ],
@@ -13367,16 +13568,56 @@ fn terminal_activity_payload_is_idle_ready(payload: &TerminalActivityHookPayload
             ))
 }
 
-fn terminal_activity_hook_should_quiesce_codex_idle(
-    instance: &TerminalInstance,
+fn terminal_activity_hook_should_ignore_startup_idle_candidate(
+    event: &Value,
+    current_runtime_is_starting: bool,
+) -> bool {
+    terminal_activity_hook_startup_idle_candidate(event)
+        && !terminal_activity_hook_startup_idle_buffered(event)
+        && !current_runtime_is_starting
+}
+
+fn terminal_activity_hook_session_id_mismatches_busy_runtime(
+    payload: &TerminalActivityHookPayload,
+    current_runtime: &TerminalRuntimeSnapshot,
+    current_runtime_is_busy_turn: bool,
+) -> bool {
+    if !current_runtime_is_busy_turn || !terminal_activity_payload_is_idle_ready(payload) {
+        return false;
+    }
+
+    let payload_session_id = payload
+        .provider_session_id
+        .as_deref()
+        .or(payload.native_session_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let runtime_session_id = current_runtime
+        .provider_session_id
+        .as_deref()
+        .or(current_runtime.native_session_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    matches!(
+        (payload_session_id, runtime_session_id),
+        (Some(payload_session_id), Some(runtime_session_id))
+            if payload_session_id != runtime_session_id
+    )
+}
+
+fn terminal_activity_hook_should_quiesce_idle(
+    metadata: &TerminalInstanceMetadata,
     event: &Value,
     payload: &TerminalActivityHookPayload,
     current_runtime_is_starting: bool,
     current_runtime_is_busy_turn: bool,
 ) -> bool {
-    terminal_metadata_is_codex(&instance.metadata)
+    (cloud_mcp_agent_uses_activity_hooks(&metadata.agent_id)
+        || cloud_mcp_agent_uses_activity_hooks(&metadata.agent_kind))
         && !terminal_activity_hook_codex_idle_quiesce_buffered(event)
         && !terminal_activity_hook_startup_idle_buffered(event)
+        && !terminal_activity_hook_startup_idle_candidate(event)
         && !current_runtime_is_starting
         && current_runtime_is_busy_turn
         && terminal_activity_payload_is_idle_ready(payload)
@@ -13432,12 +13673,13 @@ fn apply_terminal_activity_hook_payload(
         cloud_mcp_sync_terminal_activity_hook_delta(&cloud_state, &cloud_payload).await;
     });
     if payload.provider_session_id.is_none() {
+        let history_status = terminal_workspace_agent_session_status_from_payload(&payload);
         terminal_record_workspace_agent_session_history(
             Some(app.clone()),
             instance,
             None,
             None,
-            &payload.activity_status,
+            &history_status,
             "terminal_activity_hook",
             None,
         );
@@ -13537,9 +13779,7 @@ async fn process_terminal_activity_hook_event(
     let current_runtime = terminal_runtime_snapshot(instance);
     let current_runtime_is_starting = terminal_runtime_snapshot_is_starting(&current_runtime);
     let current_runtime_is_busy_turn = terminal_runtime_snapshot_is_busy_turn(&current_runtime);
-    if terminal_activity_hook_startup_idle_candidate(event)
-        && !current_runtime_is_starting
-        && !current_runtime_is_busy_turn
+    if terminal_activity_hook_should_ignore_startup_idle_candidate(event, current_runtime_is_starting)
     {
         log_terminal_status_event(
             "backend.terminal_activity_hook.startup_idle_candidate_ignored",
@@ -13547,7 +13787,29 @@ async fn process_terminal_activity_hook_event(
                 "hook_event_name": payload.hook_event_name.clone(),
                 "instance_id": instance_id,
                 "pane_id": clean_terminal_diagnostic_log_text(pane_id),
-                "reason": "runtime_not_starting",
+                "reason": if current_runtime_is_busy_turn {
+                    "runtime_busy"
+                } else {
+                    "runtime_not_starting"
+                },
+                "source": source,
+            }),
+        );
+        return;
+    }
+    if terminal_activity_hook_session_id_mismatches_busy_runtime(
+        &payload,
+        &current_runtime,
+        current_runtime_is_busy_turn,
+    ) {
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.idle_session_mismatch_ignored",
+            json!({
+                "hook_event_name": payload.hook_event_name.clone(),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(pane_id),
+                "payload_provider_session_id": payload.provider_session_id.clone(),
+                "runtime_provider_session_id": current_runtime.provider_session_id.clone(),
                 "source": source,
             }),
         );
@@ -13620,8 +13882,8 @@ async fn process_terminal_activity_hook_event(
         });
         return;
     }
-    if terminal_activity_hook_should_quiesce_codex_idle(
-        instance,
+    if terminal_activity_hook_should_quiesce_idle(
+        &instance.metadata,
         event,
         &payload,
         current_runtime_is_starting,
@@ -13635,12 +13897,13 @@ async fn process_terminal_activity_hook_event(
         let pane_id = pane_id.to_string();
         let mut buffered_event = event.clone();
         if let Some(object) = buffered_event.as_object_mut() {
+            object.insert("terminalIdleQuiesceBuffered".to_string(), json!(true));
             object.insert("codexIdleQuiesceBuffered".to_string(), json!(true));
         }
         log_terminal_status_event(
-            "backend.terminal_activity_hook.codex_idle_quiesce_buffered",
+            "backend.terminal_activity_hook.idle_quiesce_buffered",
             json!({
-                "buffer_ms": TERMINAL_CODEX_IDLE_QUIESCE_MS,
+                "buffer_ms": TERMINAL_ACTIVITY_IDLE_QUIESCE_MS,
                 "hook_event_name": payload.hook_event_name.clone(),
                 "instance_id": instance_id,
                 "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
@@ -13648,7 +13911,7 @@ async fn process_terminal_activity_hook_event(
             }),
         );
         tauri::async_runtime::spawn(async move {
-            sleep(Duration::from_millis(TERMINAL_CODEX_IDLE_QUIESCE_MS)).await;
+            sleep(Duration::from_millis(TERMINAL_ACTIVITY_IDLE_QUIESCE_MS)).await;
             let Some(current_instance) =
                 terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
             else {
@@ -13661,7 +13924,7 @@ async fn process_terminal_activity_hook_event(
                     != scheduled_runtime_fingerprint
             {
                 log_terminal_status_event(
-                    "backend.terminal_activity_hook.codex_idle_quiesce_cancelled",
+                    "backend.terminal_activity_hook.idle_quiesce_cancelled",
                     json!({
                         "instance_id": instance_id,
                         "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
@@ -18477,6 +18740,114 @@ mod terminal_tests {
         }
     }
 
+    fn terminal_activity_hook_test_payload(
+        event_type: &str,
+        activity_status: &str,
+        command_phase: &str,
+        input_ready: bool,
+        provider_session_id: Option<&str>,
+    ) -> TerminalActivityHookPayload {
+        TerminalActivityHookPayload {
+            pane_id: "pane-1".to_string(),
+            instance_id: 1,
+            workspace_id: "workspace-1".to_string(),
+            workspace_name: "Workspace".to_string(),
+            terminal_index: Some(0),
+            thread_id: "thread-1".to_string(),
+            agent_id: "opencode".to_string(),
+            agent_kind: "opencode".to_string(),
+            agent_type: String::new(),
+            agent_display_name: String::new(),
+            display_name: "OpenCode".to_string(),
+            terminal_name: "OpenCode".to_string(),
+            terminal_nickname: String::new(),
+            provider: "opencode".to_string(),
+            event_type: event_type.to_string(),
+            hook_event_name: "Stop".to_string(),
+            source: "cli-hook:provider-turn-completed".to_string(),
+            status: "active".to_string(),
+            activity_status: activity_status.to_string(),
+            command_phase: command_phase.to_string(),
+            execution_phase: if input_ready { "idle" } else { "running" }.to_string(),
+            native_rail_state: if input_ready { "idle" } else { "thinking" }.to_string(),
+            native_rail_label: if input_ready { "idle" } else { "thinking" }.to_string(),
+            readiness: if input_ready { "ready" } else { "busy" }.to_string(),
+            terminal_lifecycle: "open".to_string(),
+            terminal_status: if input_ready { "idle" } else { "thinking" }.to_string(),
+            terminal_work_state: if input_ready { "complete" } else { "running" }.to_string(),
+            turn_status: if input_ready { "completed" } else { "running" }.to_string(),
+            session_state: "session_attached".to_string(),
+            input_ready,
+            input_ready_at: input_ready.then(|| "2026-07-02T00:00:00Z".to_string()),
+            prompt_ready_at: None,
+            completed_at: input_ready.then(|| "2026-07-02T00:00:00Z".to_string()),
+            provider_session_id: provider_session_id.map(str::to_string),
+            native_session_id: provider_session_id.map(str::to_string),
+            fork_from_provider_session_id: None,
+            provider_turn_id: None,
+            turn_id: None,
+            transcript_path: None,
+            cwd: None,
+            user_message: None,
+            message: None,
+            live_text_delta: None,
+            live_text_snapshot: None,
+            live_text_kind: None,
+            tool_name: None,
+            tool_use_id: None,
+            tool_server: None,
+            tool_input: None,
+            tool_output: None,
+            tool_error: None,
+            raw_tool_payload: None,
+            command: None,
+            file_path: None,
+            duration_ms: None,
+            exit_code: None,
+            approval_id: None,
+            permission_prompt_id: None,
+            permission_request_id: None,
+            permission_mode: None,
+            prompt_id: None,
+            prompt_kind: None,
+            prompt_default_option: None,
+            prompt_ttl_ms: None,
+            prompt_options: Vec::new(),
+            prompt_answer_option: None,
+            manual_prompt_source: None,
+            manual_approval_required: false,
+            provider_blocked_for_user: false,
+            terminal_is_prompting_user: false,
+            prompting_user_kind: None,
+            prompting_user_source: None,
+            prompting_user_confidence: None,
+            prompting_user_text: None,
+            hook_health_status: "ok".to_string(),
+            hook_health_event: "event_observed".to_string(),
+            hook_health_observed_at_ms: 1,
+            hook_timestamp_ms: 1,
+            observed_at_ms: 1,
+            completion_evidence: "test".to_string(),
+        }
+    }
+
+    #[test]
+    fn terminal_workspace_agent_session_status_preserves_prompt_wait() {
+        let mut payload = terminal_activity_hook_test_payload(
+            "provider-user-prompt-started",
+            "paused",
+            "awaiting_input",
+            false,
+            Some("session-a"),
+        );
+        payload.terminal_is_prompting_user = true;
+
+        assert_eq!(
+            terminal_workspace_agent_session_status_from_payload(&payload),
+            "needs_input"
+        );
+    }
+
     #[test]
     fn terminal_projection_running_command_phase_overrides_stale_input_ready() {
         let runtime = TerminalRuntimeSnapshot {
@@ -18629,6 +19000,106 @@ mod terminal_tests {
         assert!(terminal_prompt_ready_recovery_allowed(
             &opencode_metadata,
             &runtime
+        ));
+    }
+
+    #[test]
+    fn stray_startup_idle_is_ignored_during_busy_turns() {
+        let startup_idle = json!({
+            "hookEventName": "Stop",
+            "startupIdleCandidate": true,
+            "sessionIdleWithoutPrompt": true,
+        });
+        assert!(terminal_activity_hook_should_ignore_startup_idle_candidate(
+            &startup_idle,
+            false,
+        ));
+        assert!(!terminal_activity_hook_should_ignore_startup_idle_candidate(
+            &startup_idle,
+            true,
+        ));
+    }
+
+    #[test]
+    fn hook_idle_completion_is_quiesced_for_activity_hook_agents() {
+        let mut opencode_metadata = terminal_projection_test_metadata();
+        opencode_metadata.agent_id = "opencode".to_string();
+        opencode_metadata.agent_kind = "opencode".to_string();
+        let idle_payload = terminal_activity_hook_test_payload(
+            "provider-turn-completed",
+            "idle",
+            "completed",
+            true,
+            Some("session-main"),
+        );
+
+        assert!(terminal_activity_hook_should_quiesce_idle(
+            &opencode_metadata,
+            &json!({ "hookEventName": "Stop" }),
+            &idle_payload,
+            false,
+            true,
+        ));
+        assert!(!terminal_activity_hook_should_quiesce_idle(
+            &opencode_metadata,
+            &json!({
+                "hookEventName": "Stop",
+                "terminalIdleQuiesceBuffered": true,
+            }),
+            &idle_payload,
+            false,
+            true,
+        ));
+        assert!(!terminal_activity_hook_should_quiesce_idle(
+            &opencode_metadata,
+            &json!({
+                "hookEventName": "Stop",
+                "startupIdleCandidate": true,
+            }),
+            &idle_payload,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn busy_runtime_rejects_idle_completion_from_different_session() {
+        let runtime = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: Some("session-main".to_string()),
+            native_session_id: Some("session-main".to_string()),
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            source: "cli-hook:provider-turn-started".to_string(),
+            event_type: "provider-turn-started".to_string(),
+            hook_event_name: "UserPromptSubmit".to_string(),
+            updated_at_ms: 1,
+        };
+        let child_idle_payload = terminal_activity_hook_test_payload(
+            "provider-turn-completed",
+            "idle",
+            "completed",
+            true,
+            Some("session-child"),
+        );
+
+        assert!(terminal_runtime_snapshot_is_busy_turn(&runtime));
+        assert!(terminal_activity_hook_session_id_mismatches_busy_runtime(
+            &child_idle_payload,
+            &runtime,
+            true,
+        ));
+        assert!(!terminal_activity_hook_session_id_mismatches_busy_runtime(
+            &child_idle_payload,
+            &runtime,
+            false,
         ));
     }
 
@@ -18801,6 +19272,23 @@ mod terminal_tests {
             terminal_activity_hook_live_message_text("Working (through the parser case) is content.")
                 .as_deref(),
             Some("Working (through the parser case) is content.")
+        );
+    }
+
+    #[test]
+    fn structured_live_text_preserves_markdown_table_spacing() {
+        let table = "| Component | Name |\n| --- | --- |\n|  R1  | 1kΩ |";
+        assert_eq!(
+            terminal_activity_hook_structured_live_message_text(table).as_deref(),
+            Some(table)
+        );
+        assert_eq!(
+            terminal_activity_hook_lossless_message_text(
+                &json!({ "assistant_message_snapshot": table }),
+                &["assistant_message_snapshot"],
+            )
+            .as_deref(),
+            Some(table)
         );
     }
 

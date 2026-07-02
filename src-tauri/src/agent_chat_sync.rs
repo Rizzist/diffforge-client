@@ -145,7 +145,7 @@ fn agent_chat_session_sync_acked_record_hashes(
     hashes
 }
 
-fn agent_chat_session_sync_acked_session_content_hash(
+fn agent_chat_session_sync_acked_session_metadata_hash(
     scope_key: &str,
     device_id: &str,
     workspace_id: &str,
@@ -155,7 +155,7 @@ fn agent_chat_session_sync_acked_session_content_hash(
     let conn = cloud_mcp_open_outbox_conn().ok()?;
     conn.query_row(
         &format!(
-            "SELECT content_hash
+            "SELECT COALESCE(NULLIF(metadata_hash, ''), content_hash)
              FROM {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}
              WHERE scope_key=?1 AND device_id=?2 AND workspace_id=?3 AND provider=?4 AND session_id=?5
                AND acked_at_ms>0
@@ -179,8 +179,69 @@ fn agent_chat_session_sync_record_is_changed(
         .unwrap_or(true)
 }
 
+fn agent_chat_session_sync_value_has_content(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => items.iter().any(agent_chat_session_sync_value_has_content),
+        Value::Object(object) => object.values().any(agent_chat_session_sync_value_has_content),
+        _ => true,
+    }
+}
+
+fn agent_chat_session_sync_error_text_marker(value: &str) -> bool {
+    let value = value.trim().to_ascii_lowercase();
+    !value.is_empty()
+        && (value.contains("error")
+            || value.contains("failed")
+            || value.contains("failure")
+            || value.contains("denied"))
+}
+
+fn agent_chat_session_sync_message_error_evidence(message: &Value) -> bool {
+    if cloud_mcp_payload_bool(message, &["is_error", "isError"], false) {
+        return true;
+    }
+    if ["error", "tool_error", "toolError", "stderr"]
+        .iter()
+        .any(|key| message.get(*key).is_some_and(agent_chat_session_sync_value_has_content))
+    {
+        return true;
+    }
+    let kind = agent_chat_session_sync_message_kind(message);
+    if !matches!(kind.as_str(), "tool_output" | "tool_error") {
+        return false;
+    }
+    cloud_mcp_payload_text(message, &["title"])
+        .is_some_and(|title| agent_chat_session_sync_error_text_marker(&title))
+}
+
+fn agent_chat_session_sync_normalize_message_value(mut value: Value) -> Value {
+    if agent_chat_session_sync_message_status(&value) == "error" {
+        let kind = agent_chat_session_sync_message_kind(&value);
+        let text = cloud_mcp_payload_text(&value, &["text"]).unwrap_or_default();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("status".to_string(), json!("error"));
+            if kind == "tool_output"
+                && !object
+                    .get("toolError")
+                    .or_else(|| object.get("tool_error"))
+                    .is_some_and(agent_chat_session_sync_value_has_content)
+                && !text.trim().is_empty()
+            {
+                object.insert("toolError".to_string(), json!(text.clone()));
+                object.insert("tool_error".to_string(), json!(text));
+            }
+        }
+    }
+    value
+}
+
 fn agent_chat_session_sync_message_value(message: CodexThreadTranscriptMessage) -> Value {
-    serde_json::to_value(message).unwrap_or_else(|_| json!({}))
+    agent_chat_session_sync_normalize_message_value(
+        serde_json::to_value(message).unwrap_or_else(|_| json!({})),
+    )
 }
 
 fn agent_chat_session_sync_messages_value(
@@ -221,6 +282,9 @@ fn agent_chat_session_sync_message_turn_id(message: &Value) -> String {
 
 fn agent_chat_session_sync_message_status(message: &Value) -> String {
     let status = cloud_mcp_payload_text(message, &["status"]).unwrap_or_default();
+    if status.trim().eq_ignore_ascii_case("error") || agent_chat_session_sync_message_error_evidence(message) {
+        return "error".to_string();
+    }
     if !status.trim().is_empty() {
         return status.trim().to_ascii_lowercase();
     }
@@ -566,6 +630,90 @@ fn agent_chat_session_sync_latest_model_id(model_config: &Value, fallback: &str)
         .unwrap_or_else(|| fallback.trim().to_string())
 }
 
+fn agent_chat_session_sync_model_config_fingerprint(model_config: &Value) -> String {
+    let model_id = cloud_mcp_payload_text(model_config, &["model_id", "modelId"])
+        .unwrap_or_default();
+    let reasoning_effort = cloud_mcp_payload_text(
+        model_config,
+        &["reasoning_effort", "reasoningEffort", "effort"],
+    )
+    .unwrap_or_default();
+    if model_id.trim().is_empty() && reasoning_effort.trim().is_empty() {
+        return String::new();
+    }
+    format!(
+        "{}::{}",
+        model_id.trim(),
+        reasoning_effort.trim().to_ascii_lowercase()
+    )
+}
+
+fn agent_chat_session_sync_model_config_record(
+    acked: &HashMap<String, String>,
+    provider: &str,
+    session_id: &str,
+    line_index: usize,
+    start_offset: u64,
+    timestamp: &str,
+    model_config: &Value,
+) -> Option<Value> {
+    let model_id = cloud_mcp_payload_text(model_config, &["model_id", "modelId"]);
+    let reasoning_effort = cloud_mcp_payload_text(
+        model_config,
+        &["reasoning_effort", "reasoningEffort", "effort"],
+    )
+    .map(|value| value.to_ascii_lowercase());
+    if model_id.as_deref().unwrap_or_default().trim().is_empty()
+        && reasoning_effort.as_deref().unwrap_or_default().trim().is_empty()
+    {
+        return None;
+    }
+    let record_key = format!(
+        "{provider}:{session_id}:model_config:{line_index}:{start_offset}:{}",
+        agent_chat_session_sync_hash(&json!({
+            "model_id": model_id.as_deref().unwrap_or(""),
+            "reasoning_effort": reasoning_effort.as_deref().unwrap_or(""),
+        }))
+    );
+    let timestamp = if timestamp.trim().is_empty() {
+        chrono_like_now_iso()
+    } else {
+        timestamp.to_string()
+    };
+    let raw = json!({
+        "model_id": model_id.clone(),
+        "modelId": model_id.clone(),
+        "reasoning_effort": reasoning_effort.clone(),
+        "reasoningEffort": reasoning_effort.clone(),
+        "origin": "local",
+    });
+    let mut record = agent_chat_session_sync_record(
+        acked,
+        provider,
+        session_id,
+        record_key,
+        "model_config",
+        json!({
+            "lineIndex": line_index,
+            "line_index": line_index,
+            "startOffset": start_offset,
+            "start_offset": start_offset,
+        }),
+        timestamp,
+        raw,
+        Vec::new(),
+    )?;
+    record["model_id"] = model_id.clone().map(Value::from).unwrap_or(Value::Null);
+    record["modelId"] = model_id.map(Value::from).unwrap_or(Value::Null);
+    record["reasoning_effort"] = reasoning_effort
+        .clone()
+        .map(Value::from)
+        .unwrap_or(Value::Null);
+    record["reasoningEffort"] = reasoning_effort.map(Value::from).unwrap_or(Value::Null);
+    record["origin"] = json!("local");
+    Some(record)
+}
+
 fn agent_chat_session_sync_record(
     acked: &HashMap<String, String>,
     provider: &str,
@@ -740,6 +888,7 @@ fn agent_chat_session_sync_jsonl_source(
     provider: &str,
     source_kind: &str,
     path: &Path,
+    resolved_session_id: &str,
     initial_meta: CodexRolloutMeta,
     acked: &HashMap<String, String>,
 ) -> Result<AgentChatSessionSyncSource, String> {
@@ -749,7 +898,10 @@ fn agent_chat_session_sync_jsonl_source(
     let mut offset: u64 = 0;
     let mut line_index: usize = 0;
     let mut buffer = Vec::new();
-    let mut session_id = initial_meta.session_id;
+    let mut session_id = clean_codex_id(resolved_session_id);
+    if session_id.is_empty() {
+        session_id = initial_meta.session_id;
+    }
     let mut cwd = initial_meta.cwd;
     let mut title = initial_meta.title;
     let mut latest_timestamp = initial_meta.latest_timestamp;
@@ -757,6 +909,7 @@ fn agent_chat_session_sync_jsonl_source(
     let mut thread_detail_messages = Vec::new();
     let mut total_record_count = 0usize;
     let mut model_config = json!({});
+    let mut last_model_config_fingerprint = String::new();
 
     loop {
         buffer.clear();
@@ -779,9 +932,15 @@ fn agent_chat_session_sync_jsonl_source(
             continue;
         };
         total_record_count = total_record_count.saturating_add(1);
+        let candidate_model_config = agent_chat_session_sync_model_config_from_raw(&value);
+        let candidate_model_config_fingerprint =
+            agent_chat_session_sync_model_config_fingerprint(&candidate_model_config);
+        let should_emit_model_config = !candidate_model_config_fingerprint.is_empty()
+            && !last_model_config_fingerprint.is_empty()
+            && candidate_model_config_fingerprint != last_model_config_fingerprint;
         agent_chat_session_sync_merge_model_config(
             &mut model_config,
-            agent_chat_session_sync_model_config_from_raw(&value),
+            candidate_model_config.clone(),
         );
         let timestamp = value_string(value.get("timestamp"));
         if !timestamp.is_empty() {
@@ -871,11 +1030,27 @@ fn agent_chat_session_sync_jsonl_source(
                 "endOffset": offset,
                 "end_offset": offset,
             }),
-            timestamp,
+            timestamp.clone(),
             value,
             normalized_messages,
         ) {
             records.push(record);
+        }
+        if should_emit_model_config {
+            if let Some(record) = agent_chat_session_sync_model_config_record(
+                acked,
+                provider,
+                &session_id,
+                line_index,
+                start_offset,
+                &timestamp,
+                &candidate_model_config,
+            ) {
+                records.push(record);
+            }
+        }
+        if !candidate_model_config_fingerprint.is_empty() {
+            last_model_config_fingerprint = candidate_model_config_fingerprint;
         }
         line_index = line_index.saturating_add(1);
     }
@@ -940,6 +1115,46 @@ fn agent_chat_session_sync_opencode_session_raw_row(
         .ok()
 }
 
+fn agent_chat_session_sync_opencode_model_config(model: &str) -> Value {
+    let model = model.trim();
+    if model.is_empty() {
+        return json!({});
+    }
+    let mut config = json!({});
+    if let Ok(value) = serde_json::from_str::<Value>(model) {
+        agent_chat_session_sync_merge_model_config(
+            &mut config,
+            agent_chat_session_sync_model_config_from_raw(&value),
+        );
+        if let Some(model_id) = opencode_model_from_value(&value) {
+            agent_chat_session_sync_merge_model_config(
+                &mut config,
+                json!({
+                    "modelId": model_id.clone(),
+                    "model_id": model_id,
+                }),
+            );
+        } else if let Some(model_text) = value.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+            agent_chat_session_sync_merge_model_config(
+                &mut config,
+                json!({
+                    "modelId": model_text,
+                    "model_id": model_text,
+                }),
+            );
+        }
+    } else {
+        agent_chat_session_sync_merge_model_config(
+            &mut config,
+            json!({
+                "modelId": model,
+                "model_id": model,
+            }),
+        );
+    }
+    config
+}
+
 fn agent_chat_session_sync_opencode_source(
     session_id: &str,
     title: &str,
@@ -978,8 +1193,10 @@ fn agent_chat_session_sync_opencode_source(
                 session_updated_at_ms = row.get::<_, i64>(2).unwrap_or_default();
                 let model = row.get::<_, String>(3).unwrap_or_default();
                 if !model.trim().is_empty() {
-                    model_config["modelId"] = json!(model.clone());
-                    model_config["model_id"] = json!(model);
+                    agent_chat_session_sync_merge_model_config(
+                        &mut model_config,
+                        agent_chat_session_sync_opencode_model_config(&model),
+                    );
                 }
             }
         }
@@ -1035,8 +1252,36 @@ fn agent_chat_session_sync_opencode_source(
                 row.get::<_, String>(2).unwrap_or_default(),
             ))
         })
-        .map_err(|error| format!("Unable to read OpenCode messages: {error}"))?;
-    for row in message_rows.flatten() {
+        .map_err(|error| format!("Unable to read OpenCode messages: {error}"))?
+        .flatten()
+        .collect::<Vec<_>>();
+
+    let mut part_statement = connection
+        .prepare(
+            "select id, message_id, time_created, data from part where session_id = ?1 order by time_created, id",
+        )
+        .map_err(|error| format!("Unable to query OpenCode parts: {error}"))?;
+    let part_rows = part_statement
+        .query_map(rusqlite::params![session_id.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0).unwrap_or_default(),
+                row.get::<_, String>(1).unwrap_or_default(),
+                row.get::<_, i64>(2).unwrap_or_default(),
+                row.get::<_, String>(3).unwrap_or_default(),
+            ))
+        })
+        .map_err(|error| format!("Unable to read OpenCode parts: {error}"))?
+        .flatten()
+        .collect::<Vec<_>>();
+    let message_ids_with_parts = part_rows
+        .iter()
+        .filter_map(|row| {
+            let message_id = row.1.trim();
+            (!message_id.is_empty()).then(|| message_id.to_string())
+        })
+        .collect::<HashSet<_>>();
+
+    for row in message_rows {
         let message_data = serde_json::from_str::<Value>(&row.2).unwrap_or(Value::Null);
         agent_chat_session_sync_merge_model_config(
             &mut model_config,
@@ -1053,7 +1298,9 @@ fn agent_chat_session_sync_opencode_source(
             message_data.get("content"),
             message_data.get("message"),
         ]);
-        let normalized_messages = if message_text.trim().is_empty() {
+        let normalized_messages = if message_text.trim().is_empty()
+            || message_ids_with_parts.contains(row.0.as_str())
+        {
             Vec::new()
         } else {
             agent_chat_session_sync_messages_value(vec![CodexThreadTranscriptMessage {
@@ -1095,22 +1342,7 @@ fn agent_chat_session_sync_opencode_source(
         }
     }
 
-    let mut part_statement = connection
-        .prepare(
-            "select id, message_id, time_created, data from part where session_id = ?1 order by time_created, id",
-        )
-        .map_err(|error| format!("Unable to query OpenCode parts: {error}"))?;
-    let part_rows = part_statement
-        .query_map(rusqlite::params![session_id.as_str()], |row| {
-            Ok((
-                row.get::<_, String>(0).unwrap_or_default(),
-                row.get::<_, String>(1).unwrap_or_default(),
-                row.get::<_, i64>(2).unwrap_or_default(),
-                row.get::<_, String>(3).unwrap_or_default(),
-            ))
-        })
-        .map_err(|error| format!("Unable to read OpenCode parts: {error}"))?;
-    for row in part_rows.flatten() {
+    for row in part_rows {
         let part_data = serde_json::from_str::<Value>(&row.3).unwrap_or(Value::Null);
         agent_chat_session_sync_merge_model_config(
             &mut model_config,
@@ -1210,6 +1442,7 @@ fn agent_chat_session_sync_source(
                 provider,
                 "claude_jsonl",
                 &path,
+                &session_id,
                 initial_meta,
                 &acked,
             )
@@ -1244,6 +1477,7 @@ fn agent_chat_session_sync_source(
                 provider,
                 "codex_jsonl",
                 &path,
+                &session_id,
                 initial_meta,
                 &acked,
             )
@@ -1557,7 +1791,7 @@ fn agent_chat_session_sync_payloads(
         "model_config": model_config.clone(),
         "thread_detail_hash": thread_detail_hash.as_str(),
     }));
-    let metadata_already_acked = agent_chat_session_sync_acked_session_content_hash(
+    let metadata_already_acked = agent_chat_session_sync_acked_session_metadata_hash(
         &scope_key,
         &device_id,
         &workspace_id,
@@ -2375,6 +2609,36 @@ mod agent_chat_session_sync_tests {
         assert_eq!(chunks.len(), 2);
         assert_eq!(chunks[0].len(), AGENT_CHAT_SESSION_SYNC_MAX_RECORDS_PER_PACKET);
         assert_eq!(chunks[1].len(), 1);
+    }
+
+    #[test]
+    fn agent_chat_session_sync_tool_output_error_sets_status() {
+        let message = agent_chat_session_sync_message_value(CodexThreadTranscriptMessage {
+            id: "tool-output-1".to_string(),
+            role: "activity".to_string(),
+            kind: "tool_output".to_string(),
+            text: "permission denied".to_string(),
+            title: "Tool error".to_string(),
+            call_id: "call-1".to_string(),
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            source: "codex".to_string(),
+            artifacts: Vec::new(),
+        });
+
+        assert_eq!(message["kind"], json!("tool_output"));
+        assert_eq!(message["status"], json!("error"));
+        assert_eq!(message["toolError"], json!("permission denied"));
+        assert_eq!(agent_chat_session_sync_message_status(&message), "error");
+    }
+
+    #[test]
+    fn agent_chat_session_sync_opencode_model_config_parses_session_model_json() {
+        let config = agent_chat_session_sync_opencode_model_config(
+            r#"{"id":"glm-5.2","providerID":"opencode-go"}"#,
+        );
+
+        assert_eq!(config["modelId"], json!("opencode-go/glm-5.2"));
+        assert_eq!(config["model_id"], json!("opencode-go/glm-5.2"));
     }
 
     #[test]

@@ -12611,16 +12611,6 @@ fn tokenomics_merge_provider_limits(first: Vec<Value>, second: Vec<Value>) -> Ve
 fn tokenomics_should_replace_provider_limit(existing: &Value, incoming: &Value) -> bool {
     let incoming_updated_at = tokenomics_provider_limit_updated_at_unix(incoming);
     let existing_updated_at = tokenomics_provider_limit_updated_at_unix(existing);
-    if tokenomics_provider_limit_is_authoritative_no_data(incoming)
-        && incoming_updated_at >= existing_updated_at
-    {
-        return true;
-    }
-    if tokenomics_provider_limit_is_authoritative_no_data(existing)
-        && existing_updated_at >= incoming_updated_at
-    {
-        return false;
-    }
     let existing_unknown = tokenomics_provider_limit_is_unknown(existing);
     let incoming_unknown = tokenomics_provider_limit_is_unknown(incoming);
     if existing_unknown && !incoming_unknown {
@@ -12707,22 +12697,6 @@ fn tokenomics_provider_limit_has_percent(limit: &Value) -> bool {
         ],
     )
     .is_some()
-}
-
-fn tokenomics_provider_limit_is_authoritative_no_data(limit: &Value) -> bool {
-    if tokenomics_provider_limit_has_percent(limit) {
-        return false;
-    }
-    let confidence = tokenomics_value_string(limit, &["confidence"])
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if confidence != "live" {
-        return false;
-    }
-    let source = tokenomics_value_string(limit, &["limit_source", "limitSource"])
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    source.contains("usage_api") || source == "claude_statusline"
 }
 
 fn tokenomics_provider_limit_updated_at_unix(limit: &Value) -> u64 {
@@ -17555,13 +17529,13 @@ mod tokenomics_tests {
     }
 
     #[test]
-    fn tokenomics_provider_limit_merge_prefers_live_no_data_over_stale_known() {
+    fn tokenomics_provider_limit_merge_keeps_known_percent_over_live_no_data() {
         let cloud_known = json!({
-            "provider": "openai",
-            "agent_kind": "codex",
-            "provider_account_key": "openai:codex:personal",
-            "window_kind": "weekly",
-            "limit_source": "codex_usage_api",
+            "provider": "anthropic",
+            "agent_kind": "claude",
+            "provider_account_key": "anthropic:claude:personal",
+            "window_kind": "5_hour",
+            "limit_source": "claude_statusline",
             "confidence": "live",
             "used_percent": 84,
             "remaining_percent": 16,
@@ -17570,11 +17544,11 @@ mod tokenomics_tests {
             "updated_at": "unix:1000"
         });
         let live_no_data = json!({
-            "provider": "openai",
-            "agent_kind": "codex",
-            "provider_account_key": "openai:codex:personal",
-            "window_kind": "weekly",
-            "limit_source": "codex_usage_api",
+            "provider": "anthropic",
+            "agent_kind": "claude",
+            "provider_account_key": "anthropic:claude:personal",
+            "window_kind": "5_hour",
+            "limit_source": "claude_statusline",
             "confidence": "live",
             "used_percent": Value::Null,
             "remaining_percent": Value::Null,
@@ -17587,18 +17561,18 @@ mod tokenomics_tests {
             tokenomics_merge_provider_limits(vec![cloud_known.clone()], vec![live_no_data.clone()]);
 
         assert_eq!(merged.len(), 1);
-        assert!(merged[0]["used_percent"].is_null());
-        assert!(merged[0]["remaining_percent"].is_null());
-        assert_eq!(merged[0]["pace_status"], json!("unknown"));
-        assert!(merged[0]["pace_delta_percent"].is_null());
+        assert_eq!(merged[0]["used_percent"], json!(84));
+        assert_eq!(merged[0]["remaining_percent"], json!(16));
+        assert_eq!(merged[0]["pace_status"], json!("over_pace"));
+        assert_eq!(merged[0]["pace_delta_percent"], json!(497));
 
         let reversed = tokenomics_merge_provider_limits(vec![live_no_data], vec![cloud_known]);
 
         assert_eq!(reversed.len(), 1);
-        assert!(reversed[0]["used_percent"].is_null());
-        assert!(reversed[0]["remaining_percent"].is_null());
-        assert_eq!(reversed[0]["pace_status"], json!("unknown"));
-        assert!(reversed[0]["pace_delta_percent"].is_null());
+        assert_eq!(reversed[0]["used_percent"], json!(84));
+        assert_eq!(reversed[0]["remaining_percent"], json!(16));
+        assert_eq!(reversed[0]["pace_status"], json!("over_pace"));
+        assert_eq!(reversed[0]["pace_delta_percent"], json!(497));
     }
 
     #[test]

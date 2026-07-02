@@ -557,7 +557,6 @@ import {
   getTerminalSubmitSequence,
   getTerminalComposerSnapshot,
   getTerminalComposerText,
-  getEventTargetElement,
   getWorkspaceTerminalPaneId,
   getWorkspaceThreadComposerAttachments,
   getWorkspaceThreadComposerAttachmentSnapshot,
@@ -1935,27 +1934,6 @@ function resolveTerminalRelativePathLink(path, workspaceRoot) {
     .replace(/^[.][\\/]+/, "")
     .replace(/[\\/]+/g, separator);
   return `${root}${separator}${relativePath}`;
-}
-
-function isTerminalViewArrowShortcutEditableTarget(target, terminalKeyboardContainer) {
-  const targetElement = getEventTargetElement(target);
-
-  if (!targetElement) {
-    return false;
-  }
-
-  if (
-    typeof Node !== "undefined"
-    && terminalKeyboardContainer instanceof Node
-    && targetElement instanceof Node
-    && terminalKeyboardContainer.contains(targetElement)
-  ) {
-    return false;
-  }
-
-  return Boolean(targetElement.closest?.(
-    "input, textarea, select, [contenteditable], [role='textbox']",
-  ));
 }
 
 // Per-terminal xterm zoom: each pane owns its font size (TUI surface only —
@@ -15727,90 +15705,18 @@ function WorkspaceTerminal({
     selectCurrentTerminalThreadForFullscreenView,
     terminalUiViewActive,
   ]);
-  const setTerminalUiViewFromArrowShortcut = useCallback((nextUiViewActive) => {
-    if (nextUiViewActive) {
-      if (!canOpenTerminalUiView || terminalUiViewActiveRef.current) {
-        return false;
-      }
-
-      activateTerminalPane("terminal_ui_view_arrow_shortcut", { focusKeyboard: false });
-    } else {
-      if (!terminalUiViewActiveRef.current) {
-        return false;
-      }
-
-      activateTerminalPane("terminal_tui_view_arrow_shortcut", { focusKeyboard: false });
+  const closeTerminalUiView = useCallback(() => {
+    if (!terminalUiViewActiveRef.current) {
+      return;
     }
 
-    terminalUiViewActiveRef.current = nextUiViewActive;
-    if (nextUiViewActive) {
-      selectCurrentTerminalThreadForFullscreenView();
-      if (isGenericTerminal) {
-        focusShellLauncherInput();
-      }
-    }
-    setTerminalUiViewActive(nextUiViewActive);
-    if (!nextUiViewActive) {
-      focusTerminalKeyboardInputAfterUiHide();
-    }
-    return true;
+    activateTerminalPane("terminal_ui_view_close", { focusKeyboard: false });
+    terminalUiViewActiveRef.current = false;
+    setTerminalUiViewActive(false);
+    focusTerminalKeyboardInputAfterUiHide();
   }, [
     activateTerminalPane,
-    canOpenTerminalUiView,
-    focusShellLauncherInput,
     focusTerminalKeyboardInputAfterUiHide,
-    isGenericTerminal,
-    selectCurrentTerminalThreadForFullscreenView,
-  ]);
-  const closeFullscreenThreadUiView = useCallback(() => {
-    setTerminalUiViewFromArrowShortcut(false);
-  }, [setTerminalUiViewFromArrowShortcut]);
-  useEffect(() => {
-    if (terminalClosed || terminalClosing) {
-      return undefined;
-    }
-
-    const handleTerminalViewArrowShortcut = (event) => {
-      if (
-        event.key !== "ArrowLeft"
-        && event.key !== "ArrowRight"
-      ) {
-        return;
-      }
-
-      if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
-        return;
-      }
-
-      if (isTerminalViewArrowShortcutEditableTarget(event.target, containerRef.current)) {
-        return;
-      }
-
-      const terminalInstanceId = terminalInstanceIdRef.current || 0;
-      if (!isActive && !terminalKeyboardTargetMatches(paneId, terminalInstanceId)) {
-        return;
-      }
-
-      const didChangeView = setTerminalUiViewFromArrowShortcut(event.key === "ArrowRight");
-      if (!didChangeView) {
-        return;
-      }
-
-      event.preventDefault();
-      event.stopPropagation();
-      event.stopImmediatePropagation?.();
-    };
-
-    window.addEventListener("keydown", handleTerminalViewArrowShortcut, true);
-    return () => {
-      window.removeEventListener("keydown", handleTerminalViewArrowShortcut, true);
-    };
-  }, [
-    isActive,
-    paneId,
-    setTerminalUiViewFromArrowShortcut,
-    terminalClosed,
-    terminalClosing,
   ]);
   useEffect(() => {
     if ((!thread && !isGenericTerminal) || terminalClosed || terminalClosing) {
@@ -17042,7 +16948,7 @@ function WorkspaceTerminal({
               composerAttachments={threadComposerAttachments}
               composerDrafts={threadComposerDrafts}
               onActiveThreadChange={handleThreadsViewActiveThreadChange}
-              onClose={fullscreenThreadUiViewActive ? closeFullscreenThreadUiView : toggleTerminalFullscreen}
+              onClose={fullscreenThreadUiViewActive ? closeTerminalUiView : toggleTerminalFullscreen}
               onCreateChat={createWorkspaceThreadChat}
               onArchiveThread={onArchiveWorkspaceThread}
               onDraftInput={syncWorkspaceThreadComposerInput}

@@ -5505,6 +5505,7 @@ pub fn run() {
             cloud_mcp_report_cli_snapshot,
             cloud_mcp_start_remote_command_listener,
             cloud_mcp_record_remote_command_status,
+            cloud_mcp_record_agent_chat_model_config,
             cloud_mcp_get_audio_preferences,
             cloud_mcp_set_audio_preferences,
             cloud_mcp_record_voice_plan_task_status,

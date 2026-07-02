@@ -2455,6 +2455,27 @@ pub fn run_diff_forge_activity_hook(args: &[String]) -> i32 {
         &terminal_index,
         &hook_input,
     );
+    if diff_forge_activity_stream_debug_enabled() {
+        write_diff_forge_activity_hook_debug(
+            &debug_path,
+            "normalized_live_text",
+            &provider,
+            &pane_id,
+            instance_id,
+            &workspace_id,
+            &terminal_index,
+            &activity_path,
+            json!({
+                "hookEventName": record.get("hookEventName").and_then(Value::as_str).unwrap_or_default(),
+                "rawKeys": diff_forge_activity_hook_object_keys(&hook_input),
+                "assistantDelta": diff_forge_activity_hook_text_debug_summary(record.get("assistantDelta").and_then(Value::as_str)),
+                "assistantMessage": diff_forge_activity_hook_text_debug_summary(record.get("assistantMessage").and_then(Value::as_str)),
+                "assistantMessageSnapshot": diff_forge_activity_hook_text_debug_summary(record.get("assistantMessageSnapshot").and_then(Value::as_str)),
+                "reasoningDelta": diff_forge_activity_hook_text_debug_summary(record.get("reasoningDelta").and_then(Value::as_str)),
+                "reasoningSnapshot": diff_forge_activity_hook_text_debug_summary(record.get("reasoningSnapshot").and_then(Value::as_str)),
+            }),
+        );
+    }
     if let Some(transport) = activity_transport.as_ref() {
         match send_diff_forge_activity_hook_transport(transport, &record) {
             Ok(()) => return 0,
@@ -2667,6 +2688,45 @@ fn write_diff_forge_activity_hook_debug(
     }
 }
 
+fn diff_forge_activity_stream_debug_enabled() -> bool {
+    cfg!(debug_assertions)
+        && ["RUST_DIFFFORGE_AGENT_STREAM_DEBUG", "RUST_DIFFFORGE_USE_LOCAL_DOCKER_CLOUD"]
+            .iter()
+            .any(|key| {
+                env::var(key)
+                    .ok()
+                    .is_some_and(|value| matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on" | "debug"
+                    ))
+            })
+}
+
+fn diff_forge_activity_hook_object_keys(value: &Value) -> Vec<String> {
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    let mut keys = object.keys().cloned().collect::<Vec<_>>();
+    keys.sort();
+    keys.truncate(80);
+    keys
+}
+
+fn diff_forge_activity_hook_text_debug_summary(value: Option<&str>) -> Value {
+    let Some(value) = value else {
+        return json!({ "present": false });
+    };
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    json!({
+        "present": true,
+        "bytes": value.len(),
+        "chars": value.chars().count(),
+        "hash": format!("{:016x}", hasher.finish()),
+    })
+}
+
 fn diff_forge_activity_hook_text_from_value(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => {
@@ -2698,6 +2758,46 @@ fn diff_forge_activity_hook_text_from_value(value: &Value) -> Option<String> {
                 if let Some(text) = object
                     .get(key)
                     .and_then(diff_forge_activity_hook_text_from_value)
+                {
+                    return Some(text);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn diff_forge_activity_hook_lossless_text_from_value(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => (!value.is_empty()).then(|| value.to_string()),
+        Value::Array(items) => {
+            let text = items
+                .iter()
+                .filter_map(diff_forge_activity_hook_lossless_text_from_value)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.is_empty()).then_some(text)
+        }
+        Value::Object(object) => {
+            for key in [
+                "text",
+                "content",
+                "delta",
+                "message",
+                "assistantMessage",
+                "assistant_message",
+                "assistantMessageSnapshot",
+                "assistant_message_snapshot",
+                "outputText",
+                "output_text",
+                "summary",
+                "thinking",
+                "reasoning",
+            ] {
+                if let Some(text) = object
+                    .get(key)
+                    .and_then(diff_forge_activity_hook_lossless_text_from_value)
                 {
                     return Some(text);
                 }
@@ -3023,6 +3123,16 @@ fn diff_forge_activity_hook_record(
             .filter(|value| !value.is_empty())
             .unwrap_or_default()
     };
+    let hook_lossless_text_value = |keys: &[&str]| -> String {
+        keys.iter()
+            .find_map(|key| {
+                hook_input
+                    .get(*key)
+                    .and_then(diff_forge_activity_hook_lossless_text_from_value)
+            })
+            .filter(|value| !value.is_empty())
+            .unwrap_or_default()
+    };
     let tool_bool = |keys: &[&str]| -> bool {
         keys.iter().any(|key| {
             tool_input
@@ -3095,6 +3205,37 @@ fn diff_forge_activity_hook_record(
             "text",
         ]),
         hook_text_value(&assistant_payload_keys),
+    ]);
+    let assistant_delta = hook_lossless_text_value(&[
+        "assistant_delta",
+        "assistantDelta",
+        "text_delta",
+        "textDelta",
+        "content_delta",
+        "contentDelta",
+        "delta",
+    ]);
+    let assistant_message_snapshot = hook_lossless_text_value(&[
+        "assistant_message_snapshot",
+        "assistantMessageSnapshot",
+        "assistant_snapshot",
+        "assistantSnapshot",
+        "message_snapshot",
+        "messageSnapshot",
+        "cumulative_text",
+        "cumulativeText",
+    ]);
+    let reasoning_delta = hook_lossless_text_value(&[
+        "reasoning_delta",
+        "reasoningDelta",
+        "thinking_delta",
+        "thinkingDelta",
+    ]);
+    let reasoning_snapshot = hook_lossless_text_value(&[
+        "reasoning_snapshot",
+        "reasoningSnapshot",
+        "thinking_snapshot",
+        "thinkingSnapshot",
     ]);
     let description = first_string(vec![
         tool_string(&["description", "prompt"]),
@@ -3402,6 +3543,14 @@ fn diff_forge_activity_hook_record(
         "agentType": agent_type,
         "agentTranscriptPath": agent_transcript_path,
         "assistantMessage": assistant_message,
+        "assistantDelta": assistant_delta.clone(),
+        "assistant_delta": assistant_delta,
+        "assistantMessageSnapshot": assistant_message_snapshot.clone(),
+        "assistant_message_snapshot": assistant_message_snapshot,
+        "reasoningDelta": reasoning_delta.clone(),
+        "reasoning_delta": reasoning_delta,
+        "reasoningSnapshot": reasoning_snapshot.clone(),
+        "reasoning_snapshot": reasoning_snapshot,
         "lastMessage": last_message.clone(),
         "lastAssistantMessage": last_message,
         "message": display_message,
@@ -3602,7 +3751,17 @@ mod terminal_cli_tests {
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("User message updates"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("assistantMessageCompleted"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("emitStop(sessionId"));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("texts.join(\"\\n\").trim()"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("const IDLE_STOP_DELAY_MS = 1500"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("const emitQueues = new Map()"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("assistant_message_snapshot"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("const assistantTextPartsByMessage = new Map()"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("rememberAssistantPartSnapshot"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("scheduleStop(sessionId"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("clearTimeout(timer)"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("texts.join(\"\\n\")"));
+        assert!(!DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains(
+            "if (statusValue === \"idle\" || statusValue === \"cooldown\") {\n          emitStop(sessionId);"
+        ));
         assert!(!DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains(
             "activeSessions.add(sessionId);\n          emit({\n            hook_event_name: \"UserPromptSubmit\""
         ));
@@ -3833,6 +3992,25 @@ mod terminal_cli_tests {
             record["assistantMessage"].as_str(),
             Some("hello from a nested delta")
         );
+    }
+
+    #[test]
+    fn activity_hook_record_preserves_exact_assistant_snapshot_text() {
+        let table = "| A | B |\n| --- | --- |\n|  one  | two |";
+        let record = diff_forge_activity_hook_record(
+            "opencode",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hookEventName": "AssistantMessageDelta",
+                "assistant_message_snapshot": table
+            }),
+        );
+
+        assert_eq!(record["assistantMessageSnapshot"].as_str(), Some(table));
+        assert_eq!(record["assistant_message_snapshot"].as_str(), Some(table));
     }
 
     #[test]
@@ -4337,18 +4515,71 @@ import { spawn } from "node:child_process";
 
 const HOOK_BIN = process.env.DIFFFORGE_OPENCODE_ACTIVITY_HOOK_BIN || "";
 const PROVIDER = "opencode";
+const IDLE_STOP_DELAY_MS = 1500;
+const HOOK_EMIT_TIMEOUT_MS = 5000;
+const emitQueues = new Map();
+const lastAssistantTextByMessage = new Map();
+const lastAssistantTextBySession = new Map();
+const assistantTextPartsByMessage = new Map();
+
+function clearAssistantTextForSession(sessionId) {
+  if (!sessionId) return;
+  lastAssistantTextBySession.delete(sessionId);
+  for (const key of Array.from(lastAssistantTextByMessage.keys())) {
+    if (key.startsWith(`${sessionId}:`)) {
+      lastAssistantTextByMessage.delete(key);
+    }
+  }
+  for (const key of Array.from(assistantTextPartsByMessage.keys())) {
+    if (key.startsWith(`${sessionId}:`)) {
+      assistantTextPartsByMessage.delete(key);
+    }
+  }
+}
+
+function spawnHook(payload) {
+  if (!HOOK_BIN) return Promise.resolve();
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      resolve();
+    };
+    try {
+      const child = spawn(HOOK_BIN, ["--diff-forge-activity-hook", "--provider", PROVIDER], {
+        stdio: ["pipe", "ignore", "ignore"],
+        windowsHide: true,
+      });
+      const timeout = setTimeout(() => {
+        try { child.kill(); } catch {}
+        finish();
+      }, HOOK_EMIT_TIMEOUT_MS);
+      const done = () => {
+        clearTimeout(timeout);
+        finish();
+      };
+      child.on("close", done);
+      child.on("exit", done);
+      child.on("error", done);
+      child.stdin.on("error", () => {});
+      child.stdin.end(JSON.stringify(payload || {}));
+    } catch {
+      finish();
+    }
+  });
+}
 
 function emit(payload) {
-  if (!HOOK_BIN) return;
-  try {
-    const child = spawn(HOOK_BIN, ["--diff-forge-activity-hook", "--provider", PROVIDER], {
-      stdio: ["pipe", "ignore", "ignore"],
-      windowsHide: true,
-    });
-    child.on("error", () => {});
-    child.stdin.on("error", () => {});
-    child.stdin.end(JSON.stringify(payload || {}));
-  } catch {}
+  if (!HOOK_BIN) return Promise.resolve();
+  const sessionKey = (payload && payload.session_id) || "global";
+  const previous = emitQueues.get(sessionKey) || Promise.resolve();
+  const next = previous.catch(() => {}).then(() => spawnHook(payload));
+  emitQueues.set(sessionKey, next);
+  next.finally(() => {
+    if (emitQueues.get(sessionKey) === next) emitQueues.delete(sessionKey);
+  });
+  return next;
 }
 
 function pickText(parts) {
@@ -4356,9 +4587,9 @@ function pickText(parts) {
   const texts = [];
   for (const part of parts) {
     const text = part && (part.text != null ? part.text : part.content);
-    if (typeof text === "string" && text.trim()) texts.push(text.trim());
+    if (typeof text === "string" && text.length > 0) texts.push(text);
   }
-  return texts.join("\n").trim();
+  return texts.join("\n");
 }
 
 function nonEmptyString(value) {
@@ -4467,13 +4698,46 @@ function partKey(sessionId, messageId, partId) {
   return sessionId && partId ? `${sessionId}:${messageId || "message"}:${partId}` : "";
 }
 
-function emitPartText(sessionId, kind, text, snapshot) {
+function rememberAssistantText(sessionId, messageId, text, snapshot) {
+  if (!nonEmptyString(text) || !sessionId) return;
+  const messageKey = `${sessionId}:${messageId || "message"}`;
+  let nextText = text;
+  if (!snapshot && lastAssistantTextByMessage.has(messageKey)) {
+    nextText = `${lastAssistantTextByMessage.get(messageKey)}${text}`;
+  }
+  lastAssistantTextByMessage.set(messageKey, nextText);
+  lastAssistantTextBySession.set(sessionId, nextText);
+}
+
+function rememberAssistantPartSnapshot(sessionId, messageId, partId, text) {
+  if (!nonEmptyString(text) || !sessionId) return text;
+  const messageKey = `${sessionId}:${messageId || "message"}`;
+  let parts = assistantTextPartsByMessage.get(messageKey);
+  if (!parts) {
+    parts = new Map();
+    assistantTextPartsByMessage.set(messageKey, parts);
+  }
+  parts.set(partId || `part-${parts.size}`, text);
+  const nextText = Array.from(parts.values()).join("\n");
+  lastAssistantTextByMessage.set(messageKey, nextText);
+  lastAssistantTextBySession.set(sessionId, nextText);
+  return nextText;
+}
+
+function emitPartText(sessionId, kind, text, snapshot, messageId, partId) {
   if (!nonEmptyString(text)) return;
+  const outputText = kind === "text" && snapshot
+    ? rememberAssistantPartSnapshot(sessionId, messageId, partId, text)
+    : text;
+  if (!(kind === "text" && snapshot)) {
+    rememberAssistantText(sessionId, messageId, text, snapshot);
+  }
   if (kind === "reasoning") {
     emit({
       hook_event_name: "ReasoningDelta",
       session_id: sessionId,
-      [snapshot ? "reasoning_snapshot" : "reasoning_delta"]: text,
+      message_id: messageId || "",
+      [snapshot ? "reasoning_snapshot" : "reasoning_delta"]: outputText,
     });
     return;
   }
@@ -4481,7 +4745,8 @@ function emitPartText(sessionId, kind, text, snapshot) {
     emit({
       hook_event_name: "AssistantMessageDelta",
       session_id: sessionId,
-      [snapshot ? "assistant_message_snapshot" : "assistant_delta"]: text,
+      message_id: messageId || "",
+      [snapshot ? "assistant_message_snapshot" : "assistant_delta"]: outputText,
     });
   }
 }
@@ -4494,21 +4759,51 @@ export const DiffForgeActivityPlugin = async () => {
   // sub-sessions too.
   const activeSessions = new Set();
   const completedAssistantMessages = new Set();
+  const pendingStopTimers = new Map();
   const partKinds = new Map();
+  const cancelPendingStop = (sessionId) => {
+    if (!sessionId) return;
+    const timer = pendingStopTimers.get(sessionId);
+    if (timer) {
+      clearTimeout(timer);
+      pendingStopTimers.delete(sessionId);
+    }
+  };
   const emitStop = (sessionId, extra = {}) => {
+    cancelPendingStop(sessionId);
     const hadActiveSession = activeSessions.has(sessionId);
     activeSessions.delete(sessionId);
+    const rememberedAssistantText = sessionId ? lastAssistantTextBySession.get(sessionId) : "";
     emit({
       hook_event_name: "Stop",
       session_id: sessionId,
       startup_idle_candidate: !hadActiveSession,
       session_idle_without_prompt: !hadActiveSession,
+      ...(rememberedAssistantText
+        && !extra.assistant_message
+        && !extra.assistant_message_snapshot
+        ? { assistant_message_snapshot: rememberedAssistantText }
+        : {}),
       ...extra,
     });
+  };
+  const scheduleStop = (sessionId, extra = {}) => {
+    if (!sessionId) {
+      emitStop(sessionId, extra);
+      return;
+    }
+    cancelPendingStop(sessionId);
+    const timer = setTimeout(() => {
+      pendingStopTimers.delete(sessionId);
+      emitStop(sessionId, extra);
+    }, IDLE_STOP_DELAY_MS);
+    pendingStopTimers.set(sessionId, timer);
   };
   return {
     "chat.message": async (input, output) => {
       const sessionId = (input && input.sessionID) || "";
+      cancelPendingStop(sessionId);
+      clearAssistantTextForSession(sessionId);
       activeSessions.add(sessionId);
       emit({
         hook_event_name: "UserPromptSubmit",
@@ -4517,6 +4812,7 @@ export const DiffForgeActivityPlugin = async () => {
       });
     },
     "tool.execute.before": async (input, output) => {
+      cancelPendingStop((input && input.sessionID) || "");
       emit({
         hook_event_name: "PreToolUse",
         session_id: (input && input.sessionID) || "",
@@ -4526,6 +4822,7 @@ export const DiffForgeActivityPlugin = async () => {
       });
     },
     "tool.execute.after": async (input) => {
+      cancelPendingStop((input && input.sessionID) || "");
       emit({
         hook_event_name: "PostToolUse",
         session_id: (input && input.sessionID) || "",
@@ -4534,6 +4831,7 @@ export const DiffForgeActivityPlugin = async () => {
       });
     },
     "permission.ask": async (input) => {
+      cancelPendingStop((input && input.sessionID) || "");
       // Fires only when OpenCode actually needs a decision (auto-allowed tools
       // never ask), so surface it as a manual-approval attention event. We do
       // not touch `output` — OpenCode's own permission config decides.
@@ -4558,56 +4856,57 @@ export const DiffForgeActivityPlugin = async () => {
       const sessionId = eventSessionId(event);
       const props = (event && event.properties) || {};
       if (type === "message.updated" || type === "message.created") {
+        cancelPendingStop(sessionId);
         const message = props.message || props.info || {};
         const role = String(message.role || message.type || "").toLowerCase();
         if (role === "user") {
           // `chat.message` is OpenCode's prompt boundary. User message updates
           // can arrive after session idle and must not reopen a completed turn.
         } else if (role === "assistant") {
-          const delta = pickDeltaText(props) || pickDeltaText(message);
-          if (delta) {
-            emit({
-              hook_event_name: "AssistantMessageDelta",
-              session_id: sessionId,
-              assistant_delta: delta,
-            });
-          }
           if (assistantMessageCompleted(message, props)) {
             const completionKey = assistantMessageCompletionKey(sessionId, message, props);
             if (!completionKey || !completedAssistantMessages.has(completionKey)) {
               if (completionKey) completedAssistantMessages.add(completionKey);
-              emitStop(sessionId, {
-                assistant_message: pickText(message.parts || message.content || []),
-              });
+              const completedText = pickText(message.parts || message.content || []);
+              rememberAssistantText(sessionId, (message && (message.id || message.messageID || message.messageId)) || "", completedText, true);
+              emitStop(sessionId, completedText ? {
+                assistant_message_snapshot: completedText,
+              } : {});
             }
           }
         }
       }
       if (type === "message.part.updated") {
+        cancelPendingStop(sessionId);
         const part = props.part || {};
         const kind = textualPartKind(part);
         const id = (part && (part.id || part.partID || part.partId)) || props.partID || props.partId || "";
-        const key = partKey(sessionId, messageIdForPart(props, part), id);
+        const messageId = messageIdForPart(props, part);
+        const key = partKey(sessionId, messageId, id);
         if (key && kind) partKinds.set(key, kind);
-        emitPartText(sessionId, kind, partText(part), true);
+        emitPartText(sessionId, kind, partText(part), true, messageId, id);
       }
       if (type === "message.part.delta") {
+        cancelPendingStop(sessionId);
         const id = props.partID || props.partId || "";
-        const key = partKey(sessionId, messageIdForPart(props, null), id);
+        const messageId = messageIdForPart(props, null);
+        const key = partKey(sessionId, messageId, id);
         const kind = partKinds.get(key) || "text";
         const field = String(props.field || "").toLowerCase();
         const delta = nonEmptyString(props.delta) ? props.delta : pickDeltaText(props);
         if (kind && (!field || field === "text" || field === "content" || field === "delta")) {
-          emitPartText(sessionId, kind, delta, false);
+          emitPartText(sessionId, kind, delta, false, messageId, id);
         }
       }
       if (type === "session.compacted" || type === "session.compacting") {
+        cancelPendingStop(sessionId);
         emit({
           hook_event_name: type === "session.compacting" ? "PreCompact" : "PostCompact",
           session_id: sessionId,
         });
       }
       if (type === "permission.asked") {
+        cancelPendingStop(sessionId);
         emit({
           hook_event_name: "PermissionRequest",
           session_id: sessionId,
@@ -4625,6 +4924,7 @@ export const DiffForgeActivityPlugin = async () => {
         });
       }
       if (type === "question.ask" || type === "question.asked" || type === "selection.ask" || type === "selection.asked") {
+        cancelPendingStop(sessionId);
         const promptId = props.id || props.questionID || props.questionId || props.promptID || props.promptId || props.selectionID || props.selectionId || "";
         emit({
           hook_event_name: "UserPromptRequired",
@@ -4639,7 +4939,9 @@ export const DiffForgeActivityPlugin = async () => {
       }
       if (type === "session.status") {
         // OpenCode >= 1.17 reports turn phases via session.status; treat a
-        // return to idle/cooldown as the turn settling, same as session.idle.
+        // return to idle/cooldown as a quiet-period completion candidate.
+        // OpenCode can publish idle before the final message/tool events have
+        // drained, so a later event for the same session cancels this.
         const raw = props.status !== undefined
           ? props.status
           : (props.phase !== undefined ? props.phase : props.state);
@@ -4649,12 +4951,15 @@ export const DiffForgeActivityPlugin = async () => {
             : raw) || ""
         ).toLowerCase();
         if (statusValue === "idle" || statusValue === "cooldown") {
-          emitStop(sessionId);
+          scheduleStop(sessionId, { opencode_idle_source: "session.status" });
+        } else if (statusValue) {
+          cancelPendingStop(sessionId);
         }
       }
       if (type === "session.idle") {
-        emitStop(sessionId);
+        scheduleStop(sessionId, { opencode_idle_source: "session.idle" });
       } else if (type === "session.error") {
+        cancelPendingStop(sessionId);
         activeSessions.delete(sessionId);
         emit({ hook_event_name: "StopFailure", session_id: sessionId });
       }

@@ -2374,6 +2374,458 @@ test("live hook snapshots replace streamed assistant text and survive transcript
   assert.equal(assistantMessages[0].text.includes("Connections::Layout"), false);
 });
 
+test("transcript hydration replaces corrupted live stream for the same turn", () => {
+  const workspaceId = "workspace-opencode-live-replace";
+  const threadId = "thread-opencode-live-replace";
+  const promptId = "prompt-opencode-live-replace";
+  const turnId = `turn-${promptId}`;
+  const submittedAt = "2026-07-02T18:00:00.000Z";
+  const completedAt = "2026-07-02T18:00:04.000Z";
+  const promptText = "ok nice make a table of the items in the blinky board";
+  const finalTable = [
+    "Here's a table of the items in the blinky board:",
+    "",
+    "| Component | Name | Value | Footprint | Position (X, Y) | Connections |",
+    "| --- | --- | --- | --- | --- | --- |",
+    "| Resistor | R1 | 1kΩ | 0402 | (-3, 0) | pin2 -> D1 anode |",
+    "| LED | D1 | - | 0402 | (3, 0) | anode <- R1 pin2 |",
+    "",
+    "Board size: 12mm x 10mm",
+  ].join("\n");
+  const corruptedLiveText = "'s atablethe blinkof they boardHereitems in2 |: |Component| Name| |(Xpin040";
+  const baseThread = {
+    activityStatus: "thinking",
+    currentAgent: "opencode",
+    id: threadId,
+    latestTurn: {
+      agentId: "opencode",
+      messageId: promptId,
+      requestedAt: submittedAt,
+      startedAt: submittedAt,
+      state: "running",
+      turnId,
+    },
+    materialized: true,
+    messages: [{
+      agentId: "opencode",
+      createdAt: submittedAt,
+      id: promptId,
+      role: "user",
+      source: "cli-hook:provider-turn-started",
+      status: "submitted",
+      text: promptText,
+      turnId,
+    }],
+    projectionEvents: [{
+      agentId: "opencode",
+      createdAt: submittedAt,
+      id: "turn-start-replace",
+      messageId: promptId,
+      source: "cli-hook:provider-turn-started",
+      status: "running",
+      turnId,
+      type: "thread.turn.started",
+    }, {
+      agentId: "opencode",
+      createdAt: submittedAt,
+      id: "user-message-replace",
+      messageId: promptId,
+      role: "user",
+      source: "cli-hook:provider-turn-started",
+      status: "submitted",
+      text: promptText,
+      turnId,
+      type: "thread.message.user",
+    }],
+    providerBindings: {
+      opencode: {
+        activityStatus: "thinking",
+        inputReady: false,
+        nativeSessionId: "opencode-session-live-replace",
+        status: "active",
+      },
+    },
+    status: "active",
+    terminalIndex: 0,
+    transcriptSessionId: "opencode-session-live-replace",
+    workspaceId,
+  };
+  const state = {
+    [workspaceId]: {
+      activeThreadId: threadId,
+      id: workspaceId,
+      terminals: {},
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: baseThread,
+      },
+    },
+  };
+
+  const liveProjectionEvents = createWorkspaceThreadLiveTextProjectionEvents(baseThread, {
+    agentId: "opencode",
+    liveTextDelta: corruptedLiveText,
+    liveTextKind: "assistant",
+    source: "cli-hook:assistant-message-delta",
+    type: "provider-message-displayed",
+  });
+  const streamed = appendWorkspaceThreadProjectionEvents(state, {
+    agentId: "opencode",
+    projectionEvents: liveProjectionEvents,
+    threadId,
+    type: "provider-message-displayed",
+    workspaceId,
+  });
+  assert.equal(
+    streamed[workspaceId].threads[threadId].messages
+      .filter((message) => message.role === "assistant").length,
+    1,
+  );
+
+  const hydrated = hydrateWorkspaceThreadSessionTranscript(streamed, {
+    agentId: "opencode",
+    assistantResponseCompletesTurn: true,
+    expectedMessageCreatedAt: submittedAt,
+    expectedUserMessage: promptText,
+    messages: [{
+      createdAt: submittedAt,
+      id: promptId,
+      role: "user",
+      text: promptText,
+    }, {
+      createdAt: completedAt,
+      id: "assistant-final-table",
+      role: "assistant",
+      text: finalTable,
+    }],
+    promptAccepted: true,
+    promptEventId: promptId,
+    providerSessionId: "opencode-session-live-replace",
+    sessionId: "opencode-session-live-replace",
+    source: "opencode-session-watch",
+    submittedAt,
+    threadId,
+    workspaceId,
+  });
+  const assistantMessages = hydrated[workspaceId].threads[threadId].messages
+    .filter((message) => message.role === "assistant");
+  assert.equal(assistantMessages.length, 1);
+  assert.equal(assistantMessages[0].text, finalTable);
+  assert.equal(assistantMessages[0].text.includes(corruptedLiveText), false);
+});
+
+test("live assistant projection preserves whitespace-only deltas", () => {
+  const workspaceId = "workspace-live-space-delta";
+  const threadId = "thread-live-space-delta";
+  const promptId = "prompt-live-space-delta";
+  const turnId = `turn-${promptId}`;
+  const submittedAt = "2026-07-02T18:20:00.000Z";
+  const baseThread = {
+    activityStatus: "thinking",
+    currentAgent: "opencode",
+    id: threadId,
+    latestTurn: {
+      agentId: "opencode",
+      messageId: promptId,
+      requestedAt: submittedAt,
+      startedAt: submittedAt,
+      state: "running",
+      turnId,
+    },
+    materialized: true,
+    messages: [{
+      agentId: "opencode",
+      createdAt: submittedAt,
+      id: promptId,
+      role: "user",
+      source: "cli-hook:provider-turn-started",
+      status: "submitted",
+      text: "make a short table",
+      turnId,
+    }],
+    projectionEvents: [{
+      agentId: "opencode",
+      createdAt: submittedAt,
+      id: "turn-start-space-delta",
+      messageId: promptId,
+      source: "cli-hook:provider-turn-started",
+      status: "running",
+      turnId,
+      type: "thread.turn.started",
+    }],
+    status: "active",
+    transcriptSessionId: "opencode-session-space-delta",
+    workspaceId,
+  };
+  let state = {
+    [workspaceId]: {
+      activeThreadId: threadId,
+      id: workspaceId,
+      terminals: {},
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: baseThread,
+      },
+    },
+  };
+
+  for (const chunk of ["Here's", " ", "a", " ", "table"]) {
+    const projectionEvents = createWorkspaceThreadLiveTextProjectionEvents(
+      state[workspaceId].threads[threadId],
+      {
+        agentId: "opencode",
+        liveTextDelta: chunk,
+        liveTextKind: "assistant",
+        source: "cli-hook:assistant-message-delta",
+        type: "provider-message-displayed",
+      },
+    );
+    state = appendWorkspaceThreadProjectionEvents(state, {
+      agentId: "opencode",
+      projectionEvents,
+      threadId,
+      type: "provider-message-displayed",
+      workspaceId,
+    });
+  }
+
+  const assistant = state[workspaceId].threads[threadId].messages
+    .find((message) => message.role === "assistant");
+  assert.equal(assistant?.text, "Here's a table");
+});
+
+test("live assistant projection preserves repeated identical chunks from one snapshot", () => {
+  const workspaceId = "workspace-live-repeated-space";
+  const threadId = "thread-live-repeated-space";
+  const promptId = "prompt-live-repeated-space";
+  const turnId = `turn-${promptId}`;
+  const baseThread = {
+    currentAgent: "opencode",
+    id: threadId,
+    latestTurn: {
+      agentId: "opencode",
+      messageId: promptId,
+      state: "running",
+      turnId,
+    },
+    materialized: true,
+    messages: [{
+      id: promptId,
+      role: "user",
+      status: "submitted",
+      text: "space twice",
+      turnId,
+    }],
+    projectionEvents: [{
+      id: "turn-start-repeated-space",
+      messageId: promptId,
+      status: "running",
+      turnId,
+      type: "thread.turn.started",
+    }],
+    status: "active",
+    transcriptSessionId: "opencode-session-repeated-space",
+    workspaceId,
+  };
+  const projectionEvents = ["a", " ", " "].flatMap((chunk) => (
+    createWorkspaceThreadLiveTextProjectionEvents(baseThread, {
+      agentId: "opencode",
+      liveTextDelta: chunk,
+      liveTextKind: "assistant",
+      source: "cli-hook:assistant-message-delta",
+      type: "provider-message-displayed",
+    })
+  ));
+  const state = appendWorkspaceThreadProjectionEvents({
+    [workspaceId]: {
+      activeThreadId: threadId,
+      id: workspaceId,
+      terminals: {},
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: baseThread,
+      },
+    },
+  }, {
+    agentId: "opencode",
+    projectionEvents,
+    threadId,
+    type: "provider-message-displayed",
+    workspaceId,
+  });
+
+  const assistant = state[workspaceId].threads[threadId].messages
+    .find((message) => message.role === "assistant");
+  assert.equal(assistant?.text, "a  ");
+});
+
+test("live assistant snapshots preserve edge whitespace", () => {
+  const workspaceId = "workspace-live-snapshot-space";
+  const threadId = "thread-live-snapshot-space";
+  const promptId = "prompt-live-snapshot-space";
+  const turnId = `turn-${promptId}`;
+  const snapshot = "\n  indented snapshot  \n";
+  const baseThread = {
+    currentAgent: "opencode",
+    id: threadId,
+    latestTurn: {
+      agentId: "opencode",
+      messageId: promptId,
+      state: "running",
+      turnId,
+    },
+    materialized: true,
+    messages: [{ id: promptId, role: "user", status: "submitted", text: "snapshot", turnId }],
+    projectionEvents: [{
+      id: "turn-start-snapshot-space",
+      messageId: promptId,
+      status: "running",
+      turnId,
+      type: "thread.turn.started",
+    }],
+    status: "active",
+    transcriptSessionId: "opencode-session-snapshot-space",
+    workspaceId,
+  };
+  const projectionEvents = createWorkspaceThreadLiveTextProjectionEvents(baseThread, {
+    agentId: "opencode",
+    liveTextKind: "assistant",
+    liveTextSnapshot: snapshot,
+    source: "cli-hook:assistant-message-delta",
+    type: "provider-message-displayed",
+  });
+  const state = appendWorkspaceThreadProjectionEvents({
+    [workspaceId]: {
+      activeThreadId: threadId,
+      id: workspaceId,
+      terminals: {},
+      threadOrder: [threadId],
+      threads: { [threadId]: baseThread },
+    },
+  }, {
+    agentId: "opencode",
+    projectionEvents,
+    threadId,
+    type: "provider-message-displayed",
+    workspaceId,
+  });
+  const assistant = state[workspaceId].threads[threadId].messages
+    .find((message) => message.role === "assistant");
+  assert.equal(assistant?.text, snapshot);
+});
+
+test("assistant transcript replaces live text exactly without user transcript echo", () => {
+  const workspaceId = "workspace-assistant-only-replace";
+  const threadId = "thread-assistant-only-replace";
+  const promptId = "prompt-assistant-only-replace";
+  const turnId = `turn-${promptId}`;
+  const baseThread = {
+    currentAgent: "opencode",
+    id: threadId,
+    latestTurn: {
+      agentId: "opencode",
+      messageId: promptId,
+      state: "running",
+      turnId,
+    },
+    materialized: true,
+    messages: [{ id: promptId, role: "user", status: "submitted", text: "finish this", turnId }],
+    projectionEvents: [{
+      id: "turn-start-assistant-only",
+      messageId: promptId,
+      status: "running",
+      turnId,
+      type: "thread.turn.started",
+    }, {
+      delta: "bad stream",
+      id: "live-assistant-bad-stream",
+      messageId: `assistant-${promptId}`,
+      source: "cli-hook:assistant-message-delta",
+      turnId,
+      type: "thread.message.assistant.delta",
+    }],
+    status: "active",
+    transcriptSessionId: "opencode-session-assistant-only",
+    workspaceId,
+  };
+  const state = {
+    [workspaceId]: {
+      activeThreadId: threadId,
+      id: workspaceId,
+      terminals: {},
+      threadOrder: [threadId],
+      threads: { [threadId]: baseThread },
+    },
+  };
+  const finalText = "Here  are\n  exact spaces  ";
+  const hydrated = hydrateWorkspaceThreadSessionTranscript(state, {
+    agentId: "opencode",
+    assistantResponseCompletesTurn: true,
+    messages: [{
+      createdAt: "2026-07-02T18:30:00.000Z",
+      id: "assistant-only-final",
+      role: "assistant",
+      text: finalText,
+    }],
+    promptAccepted: true,
+    promptEventId: promptId,
+    providerSessionId: "opencode-session-assistant-only",
+    sessionId: "opencode-session-assistant-only",
+    source: "opencode-session-watch",
+    threadId,
+    workspaceId,
+  });
+  const assistantMessages = hydrated[workspaceId].threads[threadId].messages
+    .filter((message) => message.role === "assistant");
+  assert.equal(assistantMessages.length, 1);
+  assert.equal(assistantMessages[0].text, finalText);
+});
+
+test("assistant live formatting survives persistence", () => {
+  const workspaceId = "workspace-persist-live-space";
+  const threadId = "thread-persist-live-space";
+  const assistantText = "a  b\n    code";
+  const state = {
+    [workspaceId]: {
+      activeThreadId: threadId,
+      id: workspaceId,
+      terminals: {},
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          id: threadId,
+          materialized: true,
+          messages: [{
+            id: "assistant-persist-space",
+            role: "assistant",
+            source: "cli-hook:assistant-message-delta",
+            status: "streaming",
+            text: assistantText,
+          }],
+          projectionEvents: [{
+            delta: assistantText,
+            id: "projection-assistant-persist-space",
+            messageId: "assistant-persist-space",
+            source: "cli-hook:assistant-message-delta",
+            type: "thread.message.assistant.delta",
+          }],
+          status: "active",
+          workspaceId,
+        },
+      },
+    },
+  };
+  const restored = normalizeWorkspaceThreads(persistWorkspaceThreads(state));
+  assert.equal(
+    restored[workspaceId].threads[threadId].messages[0].text,
+    assistantText,
+  );
+  assert.equal(
+    restored[workspaceId].threads[threadId].projectionEvents[0].delta,
+    assistantText,
+  );
+});
+
 test("live provider tool hooks render as structured activity messages", () => {
   const workspaceId = "workspace-live-tools";
   const threadId = "thread-live-tools";
