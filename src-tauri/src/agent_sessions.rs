@@ -1504,7 +1504,10 @@ fn codex_function_call_message(
 ) -> Option<CodexThreadTranscriptMessage> {
     let name = value_string(payload.get("name"));
     let call_id = value_string(payload.get("call_id"));
-    let arguments = payload.get("arguments").unwrap_or(&Value::Null);
+    let arguments = payload
+        .get("arguments")
+        .or_else(|| payload.get("input"))
+        .unwrap_or(&Value::Null);
     let parsed_arguments = parse_call_arguments(arguments);
     let fallback_title = if name.is_empty() {
         "Called tool".to_string()
@@ -1994,6 +1997,22 @@ fn codex_messages_from_response_item(
                     artifacts,
                 }];
             }
+            if role == "user" {
+                if text.is_empty() && artifacts.is_empty() {
+                    return Vec::new();
+                }
+                return vec![CodexThreadTranscriptMessage {
+                    id: format!("codex-{line_index}-user"),
+                    role: "user".to_string(),
+                    kind: "message".to_string(),
+                    text,
+                    title: String::new(),
+                    call_id: String::new(),
+                    created_at: timestamp.to_string(),
+                    source: "codex".to_string(),
+                    artifacts,
+                }];
+            }
             if role != "assistant" {
                 return Vec::new();
             }
@@ -2013,16 +2032,53 @@ fn codex_messages_from_response_item(
                 artifacts,
             }]
         }
-        "function_call" | "custom_tool_call" => {
+        "function_call" | "custom_tool_call" | "custom_tool" => {
             codex_function_call_message(line_index, timestamp, payload)
                 .into_iter()
                 .collect()
         }
-        "function_call_output" | "custom_tool_call_output" => {
+        "function_call_output" | "custom_tool_call_output" | "custom_tool_output" => {
             codex_function_output_message(line_index, timestamp, payload)
                 .into_iter()
                 .collect()
         }
+        "tool_search_call" | "tool_search" => vec![CodexThreadTranscriptMessage {
+            id: format!("codex-{line_index}-tool-search-call"),
+            role: "activity".to_string(),
+            kind: "tool_call".to_string(),
+            text: clean_codex_transcript_text(pretty_json(payload), CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+            title: "Searched tools".to_string(),
+            call_id: first_value_string(&[payload.get("call_id"), payload.get("callId"), payload.get("id")]),
+            created_at: timestamp.to_string(),
+            source: "codex".to_string(),
+            artifacts: Vec::new(),
+        }],
+        "tool_search_output" => vec![CodexThreadTranscriptMessage {
+            id: format!("codex-{line_index}-tool-search-output"),
+            role: "activity".to_string(),
+            kind: "tool_output".to_string(),
+            text: clean_codex_transcript_text(
+                {
+                    let output = payload
+                        .get("output")
+                        .or_else(|| payload.get("result"))
+                        .or_else(|| payload.get("results"))
+                        .unwrap_or(payload);
+                    let text = codex_content_text(output);
+                    if text.trim().is_empty() {
+                        pretty_json(output)
+                    } else {
+                        text
+                    }
+                },
+                CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+            ),
+            title: "Tool search results".to_string(),
+            call_id: first_value_string(&[payload.get("call_id"), payload.get("callId"), payload.get("id")]),
+            created_at: timestamp.to_string(),
+            source: "codex".to_string(),
+            artifacts: Vec::new(),
+        }],
         "web_search_call" => vec![CodexThreadTranscriptMessage {
             id: format!("codex-{line_index}-web-search"),
             role: "activity".to_string(),
@@ -2039,21 +2095,21 @@ fn codex_messages_from_response_item(
                 codex_summary_text(payload),
                 CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
             );
-            if summary.is_empty() {
-                Vec::new()
-            } else {
-                vec![CodexThreadTranscriptMessage {
-                    id: format!("codex-{line_index}-reasoning"),
-                    role: "activity".to_string(),
-                    kind: "reasoning".to_string(),
-                    text: summary,
-                    title: "Reasoning".to_string(),
-                    call_id: String::new(),
-                    created_at: timestamp.to_string(),
-                    source: "codex".to_string(),
-                    artifacts: Vec::new(),
-                }]
-            }
+            vec![CodexThreadTranscriptMessage {
+                id: format!("codex-{line_index}-reasoning"),
+                role: "activity".to_string(),
+                kind: "reasoning".to_string(),
+                text: if summary.is_empty() {
+                    "Reasoning step recorded.".to_string()
+                } else {
+                    summary
+                },
+                title: "Reasoning".to_string(),
+                call_id: String::new(),
+                created_at: timestamp.to_string(),
+                source: "codex".to_string(),
+                artifacts: Vec::new(),
+            }]
         }
         _ => Vec::new(),
     }
@@ -2071,12 +2127,79 @@ mod agent_sessions_tests {
         env::temp_dir().join(format!("{name}-{suffix}"))
     }
 
-    fn opencode_step_finish(data: Value) -> Vec<CodexThreadTranscriptMessage> {
-        opencode_part_message("msg1", "assistant", "part1", "2024-01-01T00:00:00Z", &data)
-    }
+	    fn opencode_step_finish(data: Value) -> Vec<CodexThreadTranscriptMessage> {
+	        opencode_part_message("msg1", "assistant", "part1", "2024-01-01T00:00:00Z", &data)
+	    }
 
     #[test]
-    fn opencode_step_finish_classifies_on_structured_fields_only() {
+    fn codex_response_item_handles_v142_tool_search_and_user_shapes() {
+        let custom_tool = codex_messages_from_response_item(
+            1,
+            "2026-07-02T00:00:00Z",
+            &json!({
+                "type": "custom_tool_call",
+                "name": "tool_search",
+                "call_id": "call-custom",
+                "input": {"query": "workspace tools"}
+            }),
+        );
+        assert_eq!(custom_tool.len(), 1);
+        assert_eq!(custom_tool[0].kind, "tool_call");
+        assert!(custom_tool[0].text.contains("workspace tools"));
+
+        let tool_search = codex_messages_from_response_item(
+            2,
+            "2026-07-02T00:00:01Z",
+            &json!({
+                "type": "tool_search_call",
+                "call_id": "call-search",
+                "query": "browser"
+            }),
+        );
+        assert_eq!(tool_search.len(), 1);
+        assert_eq!(tool_search[0].title, "Searched tools");
+        assert_eq!(tool_search[0].call_id, "call-search");
+
+        let tool_search_output = codex_messages_from_response_item(
+            3,
+            "2026-07-02T00:00:02Z",
+            &json!({
+                "type": "tool_search_output",
+                "call_id": "call-search",
+                "output": [{"name": "browser.open"}]
+            }),
+        );
+        assert_eq!(tool_search_output.len(), 1);
+        assert_eq!(tool_search_output[0].kind, "tool_output");
+        assert!(tool_search_output[0].text.contains("browser.open"));
+
+        let reasoning = codex_messages_from_response_item(
+            4,
+            "2026-07-02T00:00:03Z",
+            &json!({
+                "type": "reasoning",
+                "summary": []
+            }),
+        );
+        assert_eq!(reasoning.len(), 1);
+        assert_eq!(reasoning[0].text, "Reasoning step recorded.");
+
+        let user_message = codex_messages_from_response_item(
+            5,
+            "2026-07-02T00:00:04Z",
+            &json!({
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "queued prompt"}]
+            }),
+        );
+        assert_eq!(user_message.len(), 1);
+        assert_eq!(user_message[0].role, "user");
+        assert!(user_message[0].text.contains("queued prompt"));
+    }
+
+	    #[test]
+	    fn opencode_step_finish_classifies_on_structured_fields_only() {
         // Normal finish reasons are control metadata, not visible messages.
         for reason in ["stop", "tool-calls", "length"] {
             let messages =

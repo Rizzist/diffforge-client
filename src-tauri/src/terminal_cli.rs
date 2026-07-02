@@ -3748,7 +3748,9 @@ mod terminal_cli_tests {
     fn opencode_plugin_uses_chat_message_as_prompt_boundary() {
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("\"chat.message\""));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("hook_event_name: \"UserPromptSubmit\""));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("User message updates"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("userPromptSubmitKeys"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("messageRoleForPart"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("role !== \"assistant\""));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("assistantMessageCompleted"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("emitStop(sessionId"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("const IDLE_STOP_DELAY_MS = 1500"));
@@ -4517,10 +4519,12 @@ const HOOK_BIN = process.env.DIFFFORGE_OPENCODE_ACTIVITY_HOOK_BIN || "";
 const PROVIDER = "opencode";
 const IDLE_STOP_DELAY_MS = 1500;
 const HOOK_EMIT_TIMEOUT_MS = 5000;
-const emitQueues = new Map();
-const lastAssistantTextByMessage = new Map();
-const lastAssistantTextBySession = new Map();
-const assistantTextPartsByMessage = new Map();
+	const emitQueues = new Map();
+	const lastAssistantTextByMessage = new Map();
+	const lastAssistantTextBySession = new Map();
+	const assistantTextPartsByMessage = new Map();
+const messageRolesById = new Map();
+const submittedUserMessages = new Set();
 
 function clearAssistantTextForSession(sessionId) {
   if (!sessionId) return;
@@ -4530,12 +4534,22 @@ function clearAssistantTextForSession(sessionId) {
       lastAssistantTextByMessage.delete(key);
     }
   }
-  for (const key of Array.from(assistantTextPartsByMessage.keys())) {
+	  for (const key of Array.from(assistantTextPartsByMessage.keys())) {
+	    if (key.startsWith(`${sessionId}:`)) {
+	      assistantTextPartsByMessage.delete(key);
+	    }
+	  }
+  for (const key of Array.from(messageRolesById.keys())) {
     if (key.startsWith(`${sessionId}:`)) {
-      assistantTextPartsByMessage.delete(key);
+      messageRolesById.delete(key);
     }
   }
-}
+  for (const key of Array.from(submittedUserMessages.keys())) {
+    if (key.startsWith(`${sessionId}:`)) {
+      submittedUserMessages.delete(key);
+    }
+  }
+	}
 
 function spawnHook(payload) {
   if (!HOOK_BIN) return Promise.resolve();
@@ -4582,14 +4596,21 @@ function emit(payload) {
   return next;
 }
 
-function pickText(parts) {
-  if (!Array.isArray(parts)) return "";
+	function pickText(parts) {
+	  if (!Array.isArray(parts)) return "";
   const texts = [];
   for (const part of parts) {
     const text = part && (part.text != null ? part.text : part.content);
     if (typeof text === "string" && text.length > 0) texts.push(text);
   }
-  return texts.join("\n");
+	  return texts.join("\n");
+	}
+
+function textFromMessage(message) {
+  if (!message || typeof message !== "object") return "";
+  if (typeof message.text === "string") return message.text;
+  if (typeof message.content === "string") return message.content;
+  return pickText(message.parts || message.content || []);
 }
 
 function nonEmptyString(value) {
@@ -4686,16 +4707,66 @@ function partText(part) {
   return typeof part.text === "string" ? part.text : pickText([part]);
 }
 
-function messageIdForPart(props, part) {
+	function messageIdForPart(props, part) {
   const message = (props && (props.message || props.info)) || {};
   return (part && (part.messageID || part.messageId || part.message_id))
     || (props && (props.messageID || props.messageId || props.message_id))
     || (message && (message.id || message.messageID || message.messageId || message.message_id))
+	    || "";
+	}
+
+function messageIdForMessage(message, props) {
+  return (message && (message.id || message.messageID || message.messageId || message.message_id))
+    || (props && (props.id || props.messageID || props.messageId || props.message_id))
     || "";
+}
+
+function normalizedMessageRole(value) {
+  const role = String((value && (value.role || value.authorRole || value.author_role || value.type)) || "").toLowerCase();
+  return role === "assistant" || role === "user" ? role : "";
+}
+
+function rememberMessageRole(sessionId, message, props) {
+  const messageId = messageIdForMessage(message, props);
+  const role = normalizedMessageRole(message) || normalizedMessageRole(props && props.info);
+  if (sessionId && messageId && role) {
+    messageRolesById.set(`${sessionId}:${messageId}`, role);
+    messageRolesById.set(messageId, role);
+  }
+  return role;
+}
+
+function messageRoleForPart(sessionId, props, part) {
+  const role = normalizedMessageRole(part && part.message)
+    || normalizedMessageRole(props && props.message)
+    || normalizedMessageRole(props && props.info)
+    || normalizedMessageRole(part);
+  if (role) return role;
+  const messageId = messageIdForPart(props, part);
+  if (!messageId) return "";
+  return messageRolesById.get(`${sessionId}:${messageId}`) || messageRolesById.get(messageId) || "";
 }
 
 function partKey(sessionId, messageId, partId) {
   return sessionId && partId ? `${sessionId}:${messageId || "message"}:${partId}` : "";
+}
+
+function userPromptSubmitKeys(sessionId, messageId, prompt, reason) {
+  const scope = sessionId || "session";
+  const keys = [];
+  if (nonEmptyString(prompt)) keys.push(`${scope}:prompt:${prompt}`);
+  if (nonEmptyString(messageId)) keys.push(`${scope}:message:${messageId}`);
+  const fallback = messageId || prompt || reason || "";
+  if (fallback) keys.push(`${scope}:${fallback}`);
+  return keys;
+}
+
+function userPromptAlreadySubmitted(keys) {
+  return keys.some((key) => submittedUserMessages.has(key));
+}
+
+function rememberUserPromptSubmitted(keys) {
+  keys.forEach((key) => submittedUserMessages.add(key));
 }
 
 function rememberAssistantText(sessionId, messageId, text, snapshot) {
@@ -4717,7 +4788,9 @@ function rememberAssistantPartSnapshot(sessionId, messageId, partId, text) {
     parts = new Map();
     assistantTextPartsByMessage.set(messageKey, parts);
   }
-  parts.set(partId || `part-${parts.size}`, text);
+  const partStorageId = partId || `part-${parts.size}`;
+  if (parts.get(partStorageId) === text) return "";
+  parts.set(partStorageId, text);
   const nextText = Array.from(parts.values()).join("\n");
   lastAssistantTextByMessage.set(messageKey, nextText);
   lastAssistantTextBySession.set(sessionId, nextText);
@@ -4725,10 +4798,11 @@ function rememberAssistantPartSnapshot(sessionId, messageId, partId, text) {
 }
 
 function emitPartText(sessionId, kind, text, snapshot, messageId, partId) {
-  if (!nonEmptyString(text)) return;
+  if (!nonEmptyString(text)) return false;
   const outputText = kind === "text" && snapshot
     ? rememberAssistantPartSnapshot(sessionId, messageId, partId, text)
     : text;
+  if (!nonEmptyString(outputText)) return false;
   if (!(kind === "text" && snapshot)) {
     rememberAssistantText(sessionId, messageId, text, snapshot);
   }
@@ -4739,7 +4813,7 @@ function emitPartText(sessionId, kind, text, snapshot, messageId, partId) {
       message_id: messageId || "",
       [snapshot ? "reasoning_snapshot" : "reasoning_delta"]: outputText,
     });
-    return;
+    return true;
   }
   if (kind === "text") {
     emit({
@@ -4748,7 +4822,9 @@ function emitPartText(sessionId, kind, text, snapshot, messageId, partId) {
       message_id: messageId || "",
       [snapshot ? "assistant_message_snapshot" : "assistant_delta"]: outputText,
     });
+    return true;
   }
+  return false;
 }
 
 export const DiffForgeActivityPlugin = async () => {
@@ -4774,20 +4850,46 @@ export const DiffForgeActivityPlugin = async () => {
     const turn = activeSessions.get(sessionId);
     return turn && !turn.settled ? turn : null;
   };
-  const startTurn = (sessionId) => {
+	  const startTurn = (sessionId, reason = "chat.message") => {
+	    if (!sessionId) return null;
+	    cancelPendingStop(sessionId);
+	    const previous = activeSessions.get(sessionId) || {};
+	    const next = {
+      implicit: reason !== "chat.message",
+      reason,
+	      settled: false,
+	      turn_id: (previous.turn_id || 0) + 1,
+	      pending_extra: {},
+	    };
+	    activeSessions.set(sessionId, next);
+	    return next;
+	  };
+  const ensureTurn = (sessionId, reason = "activity") => {
     if (!sessionId) return null;
-    cancelPendingStop(sessionId);
-    const previous = activeSessions.get(sessionId) || {};
-    const next = {
-      settled: false,
-      turn_id: (previous.turn_id || 0) + 1,
-      pending_extra: {},
-    };
-    activeSessions.set(sessionId, next);
-    return next;
+    const existing = activeTurn(sessionId);
+    if (existing) {
+      cancelPendingStop(sessionId);
+      return existing;
+    }
+    return startTurn(sessionId, reason);
   };
-  const noteActivity = (sessionId) => {
-    if (activeTurn(sessionId)) cancelPendingStop(sessionId);
+	  const noteActivity = (sessionId, reason = "activity") => {
+	    if (ensureTurn(sessionId, reason)) cancelPendingStop(sessionId);
+	  };
+  const emitUserPromptFromMessage = (sessionId, message, props, reason = "message") => {
+    if (!sessionId) return;
+    const messageId = messageIdForMessage(message, props);
+    const prompt = textFromMessage(message);
+    const submitKeys = userPromptSubmitKeys(sessionId, messageId, prompt, reason);
+    if (userPromptAlreadySubmitted(submitKeys)) return;
+    ensureTurn(sessionId, reason);
+    clearAssistantTextForSession(sessionId);
+    rememberUserPromptSubmitted(submitKeys);
+    emit({
+      hook_event_name: "UserPromptSubmit",
+      session_id: sessionId,
+      prompt,
+    });
   };
   const rememberStopCandidate = (sessionId, extra = {}) => {
     const turn = activeTurn(sessionId);
@@ -4836,16 +4938,20 @@ export const DiffForgeActivityPlugin = async () => {
   return {
     "chat.message": async (input, output) => {
       const sessionId = (input && input.sessionID) || "";
-      startTurn(sessionId);
+      const prompt = pickText(output && output.parts);
+      const submitKeys = userPromptSubmitKeys(sessionId, "", prompt, "chat.message");
+      if (userPromptAlreadySubmitted(submitKeys)) return;
+      startTurn(sessionId, "chat.message");
       clearAssistantTextForSession(sessionId);
+      rememberUserPromptSubmitted(submitKeys);
       emit({
         hook_event_name: "UserPromptSubmit",
         session_id: sessionId,
-        prompt: pickText(output && output.parts),
-      });
-    },
-    "tool.execute.before": async (input, output) => {
-      noteActivity((input && input.sessionID) || "");
+	        prompt,
+	      });
+	    },
+	    "tool.execute.before": async (input, output) => {
+	      noteActivity((input && input.sessionID) || "", "tool.execute.before");
       emit({
         hook_event_name: "PreToolUse",
         session_id: (input && input.sessionID) || "",
@@ -4854,8 +4960,8 @@ export const DiffForgeActivityPlugin = async () => {
         tool_input: (output && output.args) || {},
       });
     },
-    "tool.execute.after": async (input) => {
-      noteActivity((input && input.sessionID) || "");
+	    "tool.execute.after": async (input) => {
+	      noteActivity((input && input.sessionID) || "", "tool.execute.after");
       emit({
         hook_event_name: "PostToolUse",
         session_id: (input && input.sessionID) || "",
@@ -4863,8 +4969,8 @@ export const DiffForgeActivityPlugin = async () => {
         tool_use_id: (input && input.callID) || "",
       });
     },
-    "permission.ask": async (input) => {
-      noteActivity((input && input.sessionID) || "");
+	    "permission.ask": async (input) => {
+	      noteActivity((input && input.sessionID) || "", "permission.ask");
       // Fires only when OpenCode actually needs a decision (auto-allowed tools
       // never ask), so surface it as a manual-approval attention event. We do
       // not touch `output` — OpenCode's own permission config decides.
@@ -4887,17 +4993,20 @@ export const DiffForgeActivityPlugin = async () => {
     event: async ({ event }) => {
       const type = (event && event.type) || "";
       const sessionId = eventSessionId(event);
-      const props = (event && event.properties) || {};
-      if (type === "message.updated" || type === "message.created") {
-        noteActivity(sessionId);
-        const message = props.message || props.info || {};
-        const role = String(message.role || message.type || "").toLowerCase();
+	      const props = (event && event.properties) || {};
+	      if (type === "message.updated" || type === "message.created") {
+	        const message = props.message || props.info || {};
+        const role = rememberMessageRole(sessionId, message, props);
         if (role === "user") {
-          // `chat.message` is OpenCode's prompt boundary. User message updates
-          // can arrive after session idle and must not reopen a completed turn.
+          emitUserPromptFromMessage(sessionId, message, props, type);
         } else if (role === "assistant") {
-          if (assistantMessageCompleted(message, props)) {
-            const completionKey = assistantMessageCompletionKey(sessionId, message, props);
+          const completed = assistantMessageCompleted(message, props);
+          const completionKey = completed ? assistantMessageCompletionKey(sessionId, message, props) : "";
+          if (completed && completionKey && completedAssistantMessages.has(completionKey)) {
+            return;
+          }
+          noteActivity(sessionId, type);
+          if (completed) {
             if (!completionKey || !completedAssistantMessages.has(completionKey)) {
               if (completionKey) completedAssistantMessages.add(completionKey);
               const completedText = pickText(message.parts || message.content || []);
@@ -4909,38 +5018,48 @@ export const DiffForgeActivityPlugin = async () => {
             }
           }
         }
-      }
-      if (type === "message.part.updated") {
-        noteActivity(sessionId);
-        const part = props.part || {};
-        const kind = textualPartKind(part);
-        const id = (part && (part.id || part.partID || part.partId)) || props.partID || props.partId || "";
-        const messageId = messageIdForPart(props, part);
+	      }
+	      if (type === "message.part.updated") {
+	        const part = props.part || {};
+	        const kind = textualPartKind(part);
+	        const id = (part && (part.id || part.partID || part.partId)) || props.partID || props.partId || "";
+	        const messageId = messageIdForPart(props, part);
+        const role = messageRoleForPart(sessionId, props, part);
+        if (role === "user") {
+          emitUserPromptFromMessage(sessionId, props.message || props.info || { id: messageId, parts: [part], role: "user" }, props, type);
+          return;
+        }
+        if (role !== "assistant") return;
         const key = partKey(sessionId, messageId, id);
         if (key && kind) partKinds.set(key, kind);
-        emitPartText(sessionId, kind, partText(part), true, messageId, id);
+        if (emitPartText(sessionId, kind, partText(part), true, messageId, id)) {
+          noteActivity(sessionId, type);
+        }
       }
-      if (type === "message.part.delta") {
-        noteActivity(sessionId);
-        const id = props.partID || props.partId || "";
-        const messageId = messageIdForPart(props, null);
+	      if (type === "message.part.delta") {
+	        const id = props.partID || props.partId || "";
+	        const messageId = messageIdForPart(props, null);
+        const role = messageRoleForPart(sessionId, props, null);
+        if (role !== "assistant") return;
         const key = partKey(sessionId, messageId, id);
         const kind = partKinds.get(key) || "text";
         const field = String(props.field || "").toLowerCase();
         const delta = nonEmptyString(props.delta) ? props.delta : pickDeltaText(props);
         if (kind && (!field || field === "text" || field === "content" || field === "delta")) {
-          emitPartText(sessionId, kind, delta, false, messageId, id);
+          if (emitPartText(sessionId, kind, delta, false, messageId, id)) {
+            noteActivity(sessionId, type);
+          }
         }
       }
-      if (type === "session.compacted" || type === "session.compacting") {
-        noteActivity(sessionId);
+	      if (type === "session.compacted" || type === "session.compacting") {
+	        noteActivity(sessionId, type);
         emit({
           hook_event_name: type === "session.compacting" ? "PreCompact" : "PostCompact",
           session_id: sessionId,
         });
       }
-      if (type === "permission.asked") {
-        noteActivity(sessionId);
+	      if (type === "permission.asked") {
+	        noteActivity(sessionId, type);
         emit({
           hook_event_name: "PermissionRequest",
           session_id: sessionId,
@@ -4957,8 +5076,8 @@ export const DiffForgeActivityPlugin = async () => {
           ],
         });
       }
-      if (type === "question.ask" || type === "question.asked" || type === "selection.ask" || type === "selection.asked") {
-        noteActivity(sessionId);
+	      if (type === "question.ask" || type === "question.asked" || type === "selection.ask" || type === "selection.asked") {
+	        noteActivity(sessionId, type);
         const promptId = props.id || props.questionID || props.questionId || props.promptID || props.promptId || props.selectionID || props.selectionId || "";
         emit({
           hook_event_name: "UserPromptRequired",
@@ -4984,11 +5103,11 @@ export const DiffForgeActivityPlugin = async () => {
             ? (raw.type || raw.phase || raw.state || raw.status)
             : raw) || ""
         ).toLowerCase();
-        if (statusValue === "idle" || statusValue === "cooldown") {
-          scheduleStop(sessionId, { opencode_idle_source: "session.status" });
-        } else if (statusValue) {
-          noteActivity(sessionId);
-        }
+	        if (statusValue === "idle" || statusValue === "cooldown") {
+	          scheduleStop(sessionId, { opencode_idle_source: "session.status" });
+	        } else if (statusValue) {
+	          noteActivity(sessionId, "session.status");
+	        }
       }
       if (type === "session.idle") {
         scheduleStop(sessionId, { opencode_idle_source: "session.idle" });

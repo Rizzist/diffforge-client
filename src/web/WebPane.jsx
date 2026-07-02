@@ -188,6 +188,7 @@ export default function WebPane({
     workspaceId,
   });
   const webAgentPromptOverlay = useWebAgentPromptOverlay({
+    activityItems: panelAgentPromptActivityItems,
     contextRefs: webElementPicker.contextRefs,
     defaultSelectedTargetIds: defaultPanelAgentPromptTargetIds,
     enabled: nativeAgentPromptOverlayActive,

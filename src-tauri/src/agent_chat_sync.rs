@@ -39,6 +39,7 @@ const AGENT_CHAT_SESSION_HISTORY_BACKFILL_SPAWN_LIMIT: usize = 24;
 const AGENT_CHAT_SESSION_HISTORY_BACKFILL_INTERVAL_MS: u64 = 60_000;
 const AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS: u64 = 5 * 60_000;
 const AGENT_CHAT_SESSION_SYNC_BUILD_CONCURRENCY: usize = 4;
+const AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION: u64 = 2;
 
 static AGENT_CHAT_SESSION_HISTORY_BACKFILL_LAST: OnceLock<StdMutex<HashMap<String, u64>>> =
     OnceLock::new();
@@ -725,12 +726,13 @@ fn agent_chat_session_sync_record(
     raw: Value,
     normalized_messages: Vec<Value>,
 ) -> Option<Value> {
-    let record_hash = agent_chat_session_sync_hash(&json!({
-        "provider": provider,
-        "session_id": session_id,
-        "record_key": record_key.clone(),
-        "record_kind": record_kind,
-        "raw": raw.clone(),
+	    let record_hash = agent_chat_session_sync_hash(&json!({
+	        "provider": provider,
+        "parser_schema_version": AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION,
+	        "session_id": session_id,
+	        "record_key": record_key.clone(),
+	        "record_kind": record_kind,
+	        "raw": raw.clone(),
     }));
     if !agent_chat_session_sync_record_is_changed(acked, &record_key, &record_hash) {
         return None;
@@ -740,9 +742,11 @@ fn agent_chat_session_sync_record(
         "record_key": record_key,
         "recordHash": record_hash,
         "record_hash": record_hash,
-        "recordKind": record_kind,
-        "record_kind": record_kind,
-        "sourceCursor": source_cursor,
+	        "recordKind": record_kind,
+	        "record_kind": record_kind,
+        "parserSchemaVersion": AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION,
+        "parser_schema_version": AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION,
+	        "sourceCursor": source_cursor,
         "source_cursor": source_cursor,
         "timestamp": timestamp,
         "createdAt": timestamp,
@@ -1014,8 +1018,9 @@ fn agent_chat_session_sync_jsonl_source(
             .unwrap_or("jsonl")
             .to_string();
         let line_hash = agent_chat_session_sync_text_hash(&raw_line);
-        let record_key =
-            format!("{provider}:{session_id}:jsonl:{line_index}:{start_offset}:{line_hash}");
+	        let record_key = format!(
+            "{provider}:{session_id}:jsonl:v{AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION}:{line_index}:{start_offset}:{line_hash}"
+        );
         if let Some(record) = agent_chat_session_sync_record(
             acked,
             provider,
@@ -1352,10 +1357,9 @@ fn agent_chat_session_sync_opencode_source(
         if !timestamp.is_empty() {
             latest_timestamp = timestamp.clone();
         }
-        let role = role_by_message
-            .get(&row.1)
-            .cloned()
-            .unwrap_or_else(|| "assistant".to_string());
+        let Some(role) = role_by_message.get(&row.1).cloned() else {
+            continue;
+        };
         let normalized_messages = agent_chat_session_sync_messages_value(opencode_part_message(
             &row.1,
             &role,

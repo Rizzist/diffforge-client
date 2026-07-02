@@ -555,7 +555,7 @@ const AUDIO_HOTKEY_ATTENTION_TARGETS = new Set(["permissions", "recorder", "inpu
 // Forge cloud dictation streams audio continuously through the native
 // worker, so only a short tail is needed to flush in-flight chunks before
 // the finish frame; this keeps release-to-transcript latency low.
-const FORGE_RELEASE_POST_BUFFER_MS = 350;
+const FORGE_RELEASE_POST_BUFFER_MS = 500;
 // Last successful billing snapshot, module-wide: provider switches and
 // remounts render the known state instantly (stale-while-revalidate) instead
 // of flashing startup text while the network refresh runs.
@@ -8913,10 +8913,57 @@ export function AudioWidgetWindow() {
                 sessionId: partialSessionId,
               });
               localWhisperPartialSessionIdRef.current = "";
-              return {
-                ...(partialResult || {}),
-                audioMs: Number(partialResult?.audioMs || 0),
-              };
+              const partialAudioMs = Number(partialResult?.audioMs || 0);
+              const partialText = String(partialResult?.text || "").trim();
+              let finalCapture;
+              try {
+                finalCapture = await audioBuffer.finishCapture({ decode: false });
+              } catch (finalCaptureError) {
+                if (partialText) {
+                  return {
+                    ...(partialResult || {}),
+                    audioMs: partialAudioMs,
+                    partialFallback: true,
+                    partialFallbackReason: "final_capture_failed",
+                  };
+                }
+                throw finalCaptureError;
+              }
+              const { audioBase64, audioMs } = finalCapture || {};
+              const { peak, rms } = audioBuffer.getCaptureStats();
+              if (recordingRunRef.current !== recordingRunId) {
+                return {
+                  ...(partialResult || {}),
+                  audioMs: Number(audioMs || partialAudioMs || 0),
+                };
+              }
+              setMessage("Transcribing locally");
+              try {
+                const transcriptionResult = await invoke("transcribe_whisper_audio", {
+                  request: {
+                    audioBase64,
+                    audioMs,
+                    capturePeak: peak,
+                    captureRms: rms,
+                  },
+                });
+                return {
+                  ...(transcriptionResult || {}),
+                  audioMs,
+                  partial: false,
+                  partialPreviewText: partialText,
+                  partialSegments: Number(partialResult?.segments || 0),
+                };
+              } catch (finalTranscriptionError) {
+                if (partialText) {
+                  return {
+                    ...(partialResult || {}),
+                    audioMs: partialAudioMs,
+                    partialFallback: true,
+                  };
+                }
+                throw finalTranscriptionError;
+              }
             } catch (partialError) {
               localWhisperPartialFailedRef.current = true;
               localWhisperPartialSessionIdRef.current = "";

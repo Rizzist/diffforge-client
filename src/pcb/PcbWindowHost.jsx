@@ -61,6 +61,14 @@ function parsePcbWindowParams() {
   };
 }
 
+function safeTauriWindowCall(windowHandle, action, ...args) {
+  try {
+    Promise.resolve(windowHandle?.[action]?.(...args)).catch(() => {});
+  } catch {
+    // Native window handles can be released during close/return races.
+  }
+}
+
 const WindowRoot = styled.div`
   position: fixed;
   inset: 0;
@@ -111,7 +119,7 @@ export default function PcbWindowHost() {
     }
     event.preventDefault();
     event.stopPropagation();
-    currentWindow.startDragging().catch(() => {});
+    safeTauriWindowCall(currentWindow, "startDragging");
   }, [currentWindow]);
 
   const startChromeDrag = useCallback((event) => {
@@ -123,7 +131,7 @@ export default function PcbWindowHost() {
     }
     event.preventDefault();
     event.stopPropagation();
-    currentWindow.startDragging().catch(() => {});
+    safeTauriWindowCall(currentWindow, "startDragging");
   }, [currentWindow]);
 
   const returnToGrid = useCallback(() => {
@@ -135,7 +143,7 @@ export default function PcbWindowHost() {
     })
       .catch(() => {})
       .finally(() => {
-        currentWindow.close().catch(() => {});
+        safeTauriWindowCall(currentWindow, "close");
       });
   }, [currentWindow, params.paneId, params.workspaceId, windowLabel]);
 
@@ -343,7 +351,7 @@ export default function PcbWindowHost() {
       }
       const action = String(payload.action || payload.command?.action || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
       if (action === "focus" || action === "open" || action === "popout" || action === "open-window") {
-        currentWindow.setFocus().catch(() => {});
+        safeTauriWindowCall(currentWindow, "setFocus");
         return;
       }
       if (action === "return" || action === "return-to-grid") {
@@ -431,7 +439,7 @@ export default function PcbWindowHost() {
             >
               <OpenInNew aria-hidden="true" />
             </PanelIconButton>
-            <PanelCloseButton aria-label="Close" onClick={() => currentWindow.close().catch(() => {})} title="Close" type="button">
+            <PanelCloseButton aria-label="Close" onClick={() => safeTauriWindowCall(currentWindow, "close")} title="Close" type="button">
               <ButtonCloseIcon aria-hidden="true" />
             </PanelCloseButton>
           </TerminalRailControls>

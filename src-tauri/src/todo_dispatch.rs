@@ -13,6 +13,7 @@ const TODO_DISPATCH_RECEIPT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const TODO_DISPATCH_RECEIPT_MAX_ITEMS: usize = 400;
 const TODO_DISPATCH_DRAIN_NOTIFY_DEDUPE_MS: u64 = 5_000;
 const TODO_DISPATCH_ATTENTION_DEDUPE_MS: u64 = 120_000;
+const TODO_DISPATCH_MODEL_SWITCH_INPUT_READY_TIMEOUT_MS: u64 = 8_000;
 const TODO_DISPATCH_APP_CONTROL_WORKSPACE_ID: &str = "__diffforge_app_control__";
 const TODO_DISPATCH_APP_CONTROL_WORKSPACE_ID_NORMALIZED: &str = "diffforge_app_control";
 const TODO_DISPATCH_APP_CONTROL_PANE_ID: &str = "forge-app-control-agent-terminal";
@@ -1396,10 +1397,28 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
         "provider-turn-interrupted" => Some("interrupted"),
         _ => None,
     };
-    let Some(settle_status) = settle_status else {
+	    let Some(settle_status) = settle_status else {
+	        return;
+	    };
+    let settled_prompt_text = payload
+        .user_message
+        .as_deref()
+        .or(payload.message.as_deref())
+        .unwrap_or_default()
+        .trim_start();
+    if settled_prompt_text.starts_with("/model") {
+        log_terminal_status_event(
+            "backend.todo_dispatch.hook_settle_skip",
+            json!({
+                "event_type": event_type,
+                "pane_id": payload.pane_id,
+                "reason": "model_command_turn",
+                "status": settle_status,
+            }),
+        );
         return;
-    };
-    let workspace_id = payload.workspace_id.trim().to_string();
+    }
+	    let workspace_id = payload.workspace_id.trim().to_string();
     if workspace_id.is_empty() {
         log_terminal_status_event(
             "backend.todo_dispatch.hook_settle_skip",
@@ -1483,9 +1502,9 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
             .filter(|(_, _, _, score)| *score > 0)
             .cloned()
             .collect::<Vec<_>>();
-        if matches.is_empty() && active.len() == 1 {
-            matches = active.clone();
-        }
+	        if matches.is_empty() && active.len() == 1 && turn_refs.is_empty() {
+	            matches = active.clone();
+	        }
         matches.sort_by(|left, right| right.3.cmp(&left.3).then_with(|| right.2.cmp(&left.2)));
         matches
             .first()
@@ -1502,9 +1521,36 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
             })
     });
 
-    let (command_id, receipt, match_source) = if let Some(matched) = matched {
-        matched
+	    let (command_id, receipt, match_source) = if let Some(matched) = matched {
+	        matched
     } else {
+        if !turn_refs.is_empty() {
+            log_terminal_status_event(
+                "backend.todo_dispatch.hook_settle_skip",
+                json!({
+                    "event_type": event_type,
+                    "pane_id": payload.pane_id,
+                    "reason": "turn_refs_without_receipt_match",
+                    "status": settle_status,
+                    "turn_refs": turn_refs,
+                    "workspace_id": workspace_id,
+                }),
+            );
+            return;
+        }
+        if settled_prompt_text.is_empty() {
+            log_terminal_status_event(
+                "backend.todo_dispatch.hook_settle_skip",
+                json!({
+                    "event_type": event_type,
+                    "pane_id": payload.pane_id,
+                    "reason": "promptless_turn_without_receipt",
+                    "status": settle_status,
+                    "workspace_id": workspace_id,
+                }),
+            );
+            return;
+        }
         let queue_candidates =
             todo_dispatch_fresh_active_queue_item_ids_for_pane(&workspace_id, pane_id);
         let Some(command_id) = queue_candidates.first().cloned() else {
@@ -8859,6 +8905,30 @@ async fn todo_dispatch_pane_input_ready_authoritative(
     registry_ready
 }
 
+async fn todo_dispatch_wait_for_pane_input_ready_after_model(
+    app: &AppHandle,
+    pane_id: &str,
+    target_instance_id: u64,
+) -> bool {
+    let deadline = todo_dispatch_now_ms().saturating_add(TODO_DISPATCH_MODEL_SWITCH_INPUT_READY_TIMEOUT_MS);
+    loop {
+        match todo_dispatch_pane_input_ready_authoritative(app, pane_id, target_instance_id).await {
+            Some(true) => return true,
+            Some(false) => {
+                if todo_dispatch_now_ms() >= deadline {
+                    return false;
+                }
+            }
+            None => {
+                if todo_dispatch_now_ms() >= deadline {
+                    return true;
+                }
+            }
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+}
+
 pub(crate) fn todo_dispatch_webview_dispatcher_active() -> bool {
     let heartbeat = TODO_DISPATCH_WEBVIEW_HEARTBEAT_MS.load(Ordering::Acquire);
     heartbeat != 0
@@ -9566,6 +9636,76 @@ fn todo_dispatch_backend_submit_sequence(item: &Value, target: &Value) -> &'stat
     }
 }
 
+fn todo_dispatch_canonical_model_id(agent: &str, model: &str) -> String {
+    let model = model.trim();
+    if model.is_empty() {
+        return String::new();
+    }
+    let agent = todo_dispatch_backend_agent_id(agent);
+    let mut normalized = String::new();
+    let mut previous_dash = false;
+    for character in model.chars().flat_map(char::to_lowercase) {
+        let mapped = if character.is_ascii_alphanumeric() || character == '.' {
+            Some(character)
+        } else if matches!(character, '-' | '_' | ':' | '/' | ' ') {
+            Some('-')
+        } else {
+            None
+        };
+        let Some(mapped) = mapped else {
+            continue;
+        };
+        if mapped == '-' {
+            if !previous_dash && !normalized.is_empty() {
+                normalized.push(mapped);
+                previous_dash = true;
+            }
+        } else {
+            normalized.push(mapped);
+            previous_dash = false;
+        }
+    }
+    let normalized = normalized.trim_matches('-').to_string();
+    let model_id = ["anthropic-", "claude-", "openai-", "codex-"]
+        .iter()
+        .find_map(|prefix| normalized.strip_prefix(prefix))
+        .unwrap_or(&normalized);
+
+    if agent.contains("claude")
+        || model_id.contains("sonnet")
+        || model_id.contains("opus")
+        || model_id.contains("haiku")
+    {
+        if model_id.contains("sonnet") {
+            return "claude:sonnet".to_string();
+        }
+        if model_id.contains("opus") {
+            return "claude:opus".to_string();
+        }
+        if model_id.contains("haiku") {
+            return "claude:haiku".to_string();
+        }
+    }
+
+    if agent.contains("codex") || model_id.contains("gpt") {
+        if model_id.contains("gpt-5.5")
+            || model_id.contains("gpt-5-5")
+            || model_id.contains("gpt55")
+        {
+            return "codex:gpt-5.5".to_string();
+        }
+        return format!("codex:{model_id}");
+    }
+
+    format!("{agent}:{model_id}")
+}
+
+fn todo_dispatch_canonical_model_equal(agent: &str, left: &str, right: &str) -> bool {
+    let left = todo_dispatch_canonical_model_id(agent, left);
+    let right = todo_dispatch_canonical_model_id(agent, right);
+    !left.is_empty() && left == right
+}
+
 fn todo_dispatch_backend_model_command(item: &Value, target: &Value) -> String {
     let agent = todo_dispatch_backend_target_agent(item, target);
     if !agent.contains("codex") && !agent.contains("claude") {
@@ -9582,32 +9722,47 @@ fn todo_dispatch_backend_model_command(item: &Value, target: &Value) -> String {
             "model",
         ],
     );
-    if model.is_empty()
-        || model.len() > 120
-        || !model.chars().all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '/' | '-')
-        })
-    {
+    let effort = todo_dispatch_text(
+        item,
+        &[
+            "reasoningEffort",
+            "reasoning_effort",
+            "thinkingPower",
+            "thinking_power",
+            "effort",
+        ],
+    )
+    .to_ascii_lowercase();
+    let current_effort = todo_dispatch_text(
+        target,
+        &[
+            "currentReasoningEffort",
+            "current_reasoning_effort",
+            "reasoningEffort",
+            "reasoning_effort",
+            "thinkingPower",
+            "thinking_power",
+            "effort",
+        ],
+    )
+    .to_ascii_lowercase();
+    let valid_codex_effort =
+        agent.contains("codex") && matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh");
+    if model.is_empty() || model.len() > 120 {
         return String::new();
     }
-    if !current_model.is_empty() && current_model == model {
-        return String::new();
-    }
-    if agent.contains("codex") {
-        let effort = todo_dispatch_text(
-            item,
-            &[
-                "reasoningEffort",
-                "reasoning_effort",
-                "thinkingPower",
-                "thinking_power",
-                "effort",
-            ],
-        )
-        .to_ascii_lowercase();
-        if matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh") {
-            return format!("/model {model} {effort}");
+    if !current_model.is_empty() && todo_dispatch_canonical_model_equal(&agent, &current_model, &model) {
+        if !valid_codex_effort || (!current_effort.is_empty() && current_effort == effort) {
+            return String::new();
         }
+    }
+    if !model.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | ':' | '/' | '-')
+    }) {
+        return String::new();
+    }
+    if valid_codex_effort {
+        return format!("/model {model} {effort}");
     }
     format!("/model {model}")
 }
@@ -9668,9 +9823,48 @@ mod todo_dispatch_backend_tests {
         let current_model_target = json!({
             "agentKind": "codex",
             "currentModel": "gpt-5.1-codex",
+            "currentReasoningEffort": "high",
         });
         assert_eq!(
             todo_dispatch_backend_model_command(&codex_item, &current_model_target),
+            "",
+        );
+
+        let claude_alias_target = json!({
+            "agentKind": "claude",
+            "currentModel": "Sonnet 5",
+        });
+        let claude_alias_item = json!({
+            "model": "claude-sonnet-5",
+        });
+        assert_eq!(
+            todo_dispatch_backend_model_command(&claude_alias_item, &claude_alias_target),
+            "",
+        );
+
+        let codex_alias_target = json!({
+            "agentKind": "codex",
+            "currentModel": "gpt 5.5",
+        });
+        let codex_alias_item = json!({
+            "model": "openai/gpt-5-5",
+            "reasoning_effort": "xhigh",
+        });
+        assert_eq!(
+            todo_dispatch_backend_model_command(&codex_alias_item, &codex_alias_target),
+            "/model openai/gpt-5-5 xhigh",
+        );
+
+        let codex_alias_same_effort_target = json!({
+            "agentKind": "codex",
+            "currentModel": "gpt 5.5",
+            "currentReasoningEffort": "xhigh",
+        });
+        assert_eq!(
+            todo_dispatch_backend_model_command(
+                &codex_alias_item,
+                &codex_alias_same_effort_target,
+            ),
             "",
         );
     }
@@ -10790,13 +10984,14 @@ async fn todo_dispatch_backend_submit(
         {
             return false;
         }
-        sleep(Duration::from_millis(
-            TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
-        ))
-        .await;
-        if !todo_dispatch_terminal_instance_still_current(&terminal_state, &pane_id, &instance)
+        if !todo_dispatch_wait_for_pane_input_ready_after_model(app, &pane_id, target_instance_id)
             .await
         {
+            return false;
+        }
+	        if !todo_dispatch_terminal_instance_still_current(&terminal_state, &pane_id, &instance)
+	            .await
+	        {
             return false;
         }
     }

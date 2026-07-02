@@ -2052,6 +2052,28 @@ fn cloud_mcp_table_primary_key_columns(
     Ok(columns.into_iter().map(|(_, name)| name).collect())
 }
 
+fn cloud_mcp_table_exists(conn: &rusqlite::Connection, table: &str) -> rusqlite::Result<bool> {
+    let count: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [table],
+        |row| row.get(0),
+    )?;
+    Ok(count > 0)
+}
+
+fn cloud_mcp_table_columns(
+    conn: &rusqlite::Connection,
+    table: &str,
+) -> rusqlite::Result<HashSet<String>> {
+    let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let mut columns = HashSet::new();
+    for row in rows {
+        columns.insert(row?.to_ascii_lowercase());
+    }
+    Ok(columns)
+}
+
 fn cloud_mcp_table_has_column(
     conn: &rusqlite::Connection,
     table: &str,
@@ -25804,6 +25826,22 @@ fn cloud_mcp_compact_live_turn_text(value: Option<&String>, max_chars: usize) ->
     Some(value.chars().take(max_chars).collect())
 }
 
+fn cloud_mcp_compact_tool_value(value: Option<&Value>, max_chars: usize) -> Option<Value> {
+    let value = value?;
+    if value.is_null() {
+        return None;
+    }
+    let text = value
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default());
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(json!(text.chars().take(max_chars).collect::<String>()))
+}
+
 enum CloudMcpLiveTextMerge {
     Delta(String),
     Snapshot(String),
@@ -26384,6 +26422,130 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
     }
 }
 
+async fn cloud_mcp_publish_agent_chat_live_tool_delta(
+    state: &CloudMcpState,
+    payload: &TerminalActivityHookPayload,
+    status_seq: u64,
+    stream_key: &str,
+    device_id: &str,
+    event_code: &str,
+    state_value: &str,
+    turn_status: &str,
+) {
+    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
+        return;
+    };
+    let Ok(auth) = cloud_mcp_ws_auth_object(state).await else {
+        return;
+    };
+    let provider_session_id = payload
+        .provider_session_id
+        .as_deref()
+        .or(payload.native_session_id.as_deref())
+        .unwrap_or("");
+    let turn_id = payload
+        .turn_id
+        .as_deref()
+        .or(payload.provider_turn_id.as_deref())
+        .unwrap_or(provider_session_id);
+    let tool_name = cloud_mcp_compact_turn_text(payload.tool_name.as_ref(), 96)
+        .unwrap_or_else(|| if matches!(event_code, "ss" | "se") { "Subtask" } else { "Tool" }.to_string());
+    let call_id = cloud_mcp_compact_turn_text(payload.tool_use_id.as_ref(), 160).unwrap_or_default();
+    let asp_event_type =
+        cloud_mcp_agent_turn_asp_event_type(event_code, payload, state_value, turn_status);
+    let item_id = cloud_mcp_agent_turn_asp_item_id(stream_key, turn_id, event_code, payload, "tool");
+    let status = match event_code {
+        "xf" => "failed",
+        "xe" | "se" => "completed",
+        _ => "started",
+    };
+    let mut envelope = json!({
+        "v": 1,
+        "k": "agent_chat_session_live_delta",
+        "kind": "agent_chat_session_live_delta",
+        "event_kind": "agent_chat_session_live_delta",
+        "contract": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
+        "c": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
+        "auth": auth,
+        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
+        "id": format!("agentchat-live-tool-{status_seq}"),
+        "m": "live_delta",
+        "mode": "live_delta",
+        "sk": stream_key,
+        "q": status_seq,
+        "seq": status_seq,
+        "device_id": device_id,
+        "deviceId": device_id,
+        "workspace_id": payload.workspace_id.as_str(),
+        "workspaceId": payload.workspace_id.as_str(),
+        "workspace_name": payload.workspace_name.as_str(),
+        "workspaceName": payload.workspace_name.as_str(),
+        "pane_id": payload.pane_id.as_str(),
+        "paneId": payload.pane_id.as_str(),
+        "terminal_id": payload.pane_id.as_str(),
+        "terminalId": payload.pane_id.as_str(),
+        "terminal_instance_id": payload.instance_id,
+        "terminalInstanceId": payload.instance_id,
+        "provider": payload.provider.as_str(),
+        "provider_session_id": provider_session_id,
+        "providerSessionId": provider_session_id,
+        "session_id": provider_session_id,
+        "sessionId": provider_session_id,
+        "turn_id": turn_id,
+        "turnId": turn_id,
+        "message_id": format!("live-tool:{}:{}:{}", payload.workspace_id, payload.pane_id, if call_id.is_empty() { item_id.as_str() } else { call_id.as_str() }),
+        "messageId": format!("live-tool:{}:{}:{}", payload.workspace_id, payload.pane_id, if call_id.is_empty() { item_id.as_str() } else { call_id.as_str() }),
+        "item_id": item_id.as_str(),
+        "itemId": item_id.as_str(),
+        "call_id": call_id.as_str(),
+        "callId": call_id.as_str(),
+        "role": "assistant",
+        "content_kind": "tool",
+        "contentKind": "tool",
+        "state": state_value,
+        "status": status,
+        "turn_status": turn_status,
+        "turnStatus": turn_status,
+        "is_final": false,
+        "isFinal": false,
+        "tool_name": tool_name.as_str(),
+        "toolName": tool_name.as_str(),
+        "tool": tool_name.as_str(),
+        "asp": {
+            "event_type": asp_event_type,
+            "eventType": asp_event_type,
+            "item_id": item_id.as_str(),
+            "itemId": item_id.as_str(),
+            "item_kind": "tool",
+            "itemKind": "tool",
+            "content_kind": "tool",
+            "contentKind": "tool",
+            "seq": status_seq,
+        },
+        "observed_at_ms": payload.observed_at_ms,
+        "observedAtMs": payload.observed_at_ms,
+    });
+    if let Some(tool_input) = cloud_mcp_compact_tool_value(payload.tool_input.as_ref(), 4096) {
+        envelope["tool_input"] = tool_input.clone();
+        envelope["toolInput"] = tool_input;
+    }
+    if let Some(tool_output) = cloud_mcp_compact_tool_value(payload.tool_output.as_ref(), 4096) {
+        envelope["tool_output"] = tool_output.clone();
+        envelope["toolOutput"] = tool_output;
+    }
+    if let Some(tool_error) = cloud_mcp_compact_tool_value(payload.tool_error.as_ref(), 4096) {
+        envelope["tool_error"] = tool_error.clone();
+        envelope["toolError"] = tool_error;
+    }
+    if tx.send(envelope).is_err() {
+        cloud_mcp_mark_global_ws_disconnected(
+            state,
+            "Cloud MCP app websocket live tool sender is closed.",
+        )
+        .await;
+    }
+}
+
 async fn cloud_mcp_agent_turn_stream_lock(
     state: &CloudMcpState,
     stream_key: &str,
@@ -26941,10 +27103,23 @@ async fn cloud_mcp_publish_agent_turn_event_now(
         )
         .await;
     }
-    let turn_is_final = matches!(turn_status, "completed" | "interrupted" | "failed")
-        || matches!(state_value, "idle" | "error" | "interrupted");
-    if event_code == "md"
-        || payload.live_text_delta.is_some()
+	    let turn_is_final = matches!(turn_status, "completed" | "interrupted" | "failed")
+	        || matches!(state_value, "idle" | "error" | "interrupted");
+    if matches!(event_code, "xs" | "xe" | "xf" | "ss" | "se") {
+        cloud_mcp_publish_agent_chat_live_tool_delta(
+            state,
+            payload,
+            status_seq,
+            &stream_key,
+            &device_id,
+            event_code,
+            state_value,
+            turn_status,
+        )
+        .await;
+    }
+	    if event_code == "md"
+	        || payload.live_text_delta.is_some()
         || payload.live_text_snapshot.is_some()
         || turn_is_final
     {
@@ -42893,7 +43068,220 @@ fn cloud_mcp_asset_library_db_path() -> Option<PathBuf> {
     Some(path)
 }
 
+fn cloud_mcp_asset_cache_table_needs_rebuild(
+    conn: &rusqlite::Connection,
+    table: &str,
+    expected_pk: &[&str],
+    required_columns: &[(&str, &str, &str)],
+) -> rusqlite::Result<bool> {
+    if !cloud_mcp_table_exists(conn, table)? {
+        return Ok(false);
+    }
+    let expected_pk = expected_pk
+        .iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>();
+    if cloud_mcp_table_primary_key_columns(conn, table)? != expected_pk {
+        return Ok(true);
+    }
+    let columns = cloud_mcp_table_columns(conn, table)?;
+    Ok(required_columns
+        .iter()
+        .any(|(column, _, _)| !columns.contains(&column.to_ascii_lowercase())))
+}
+
+fn cloud_mcp_asset_cache_copy_expr(
+    column: &str,
+    default_value: &str,
+    existing_columns: &HashSet<String>,
+) -> String {
+    if existing_columns.contains(&column.to_ascii_lowercase()) {
+        if column == "row_json" {
+            "CASE WHEN row_json IS NOT NULL AND TRIM(row_json) != '' THEN row_json ELSE '{}' END"
+                .to_string()
+        } else {
+            format!("COALESCE({column}, {default_value})")
+        }
+    } else {
+        default_value.to_string()
+    }
+}
+
+fn cloud_mcp_asset_cache_rebuild_table(
+    conn: &rusqlite::Connection,
+    table: &str,
+    unique_key: &str,
+    columns: &[(&str, &str, &str)],
+) -> rusqlite::Result<()> {
+    let backup_table = format!("{table}__schema_migration_old");
+    let column_names = columns
+        .iter()
+        .map(|(column, _, _)| *column)
+        .collect::<Vec<_>>();
+    let column_defs = columns
+        .iter()
+        .map(|(_, definition, _)| *definition)
+        .collect::<Vec<_>>();
+
+    conn.execute_batch("SAVEPOINT asset_cache_schema_migration;")?;
+    let result = (|| -> rusqlite::Result<()> {
+        conn.execute(&format!("DROP TABLE IF EXISTS {backup_table}"), [])?;
+        conn.execute(
+            &format!("ALTER TABLE {table} RENAME TO {backup_table}"),
+            [],
+        )?;
+        conn.execute(
+            &format!("CREATE TABLE {table}({})", column_defs.join(", ")),
+            [],
+        )?;
+
+        let existing_columns = cloud_mcp_table_columns(conn, &backup_table)?;
+        let select_exprs = columns
+            .iter()
+            .map(|(column, _, default_value)| {
+                cloud_mcp_asset_cache_copy_expr(column, default_value, &existing_columns)
+            })
+            .collect::<Vec<_>>();
+        let copy_where = if existing_columns.contains(&unique_key.to_ascii_lowercase()) {
+            format!("WHERE TRIM(COALESCE({unique_key}, '')) != ''")
+        } else {
+            "WHERE 0".to_string()
+        };
+        let mut copy_order = Vec::new();
+        if existing_columns.contains("updated_at") {
+            copy_order.push("updated_at ASC");
+        }
+        if existing_columns.contains("mirror_updated_at_ms") {
+            copy_order.push("mirror_updated_at_ms ASC");
+        }
+        let copy_order = if copy_order.is_empty() {
+            String::new()
+        } else {
+            format!("ORDER BY {}", copy_order.join(", "))
+        };
+        conn.execute(
+            &format!(
+                "INSERT OR REPLACE INTO {table}({columns})
+                 SELECT {select_exprs}
+                 FROM {backup_table}
+                 {copy_where}
+                 {copy_order}",
+                columns = column_names.join(", "),
+                select_exprs = select_exprs.join(", ")
+            ),
+            [],
+        )?;
+        conn.execute(&format!("DROP TABLE IF EXISTS {backup_table}"), [])?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => conn.execute_batch("RELEASE SAVEPOINT asset_cache_schema_migration;"),
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT asset_cache_schema_migration;
+                 RELEASE SAVEPOINT asset_cache_schema_migration;",
+            );
+            Err(error)
+        }
+    }
+}
+
+fn cloud_mcp_asset_library_prepare_core_tables(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<()> {
+    const ASSET_ITEM_COLUMNS: &[(&str, &str, &str)] = &[
+        ("asset_id", "asset_id TEXT PRIMARY KEY", "''"),
+        ("base_url", "base_url TEXT NOT NULL DEFAULT ''", "''"),
+        ("name", "name TEXT NOT NULL DEFAULT ''", "''"),
+        ("kind", "kind TEXT NOT NULL DEFAULT 'file'", "'file'"),
+        ("mime_type", "mime_type TEXT NOT NULL DEFAULT ''", "''"),
+        ("size_bytes", "size_bytes INTEGER NOT NULL DEFAULT 0", "0"),
+        ("sha256", "sha256 TEXT NOT NULL DEFAULT ''", "''"),
+        ("blob_id", "blob_id TEXT NOT NULL DEFAULT ''", "''"),
+        (
+            "cloud_status",
+            "cloud_status TEXT NOT NULL DEFAULT ''",
+            "''",
+        ),
+        (
+            "local_status",
+            "local_status TEXT NOT NULL DEFAULT ''",
+            "''",
+        ),
+        ("local_path", "local_path TEXT NOT NULL DEFAULT ''", "''"),
+        ("object_key", "object_key TEXT NOT NULL DEFAULT ''", "''"),
+        (
+            "origin_device_id",
+            "origin_device_id TEXT NOT NULL DEFAULT ''",
+            "''",
+        ),
+        ("updated_at", "updated_at TEXT NOT NULL DEFAULT ''", "''"),
+        (
+            "mirror_updated_at_ms",
+            "mirror_updated_at_ms INTEGER NOT NULL DEFAULT 0",
+            "0",
+        ),
+        ("row_json", "row_json TEXT NOT NULL", "'{}'"),
+    ];
+    const ASSET_TRANSFER_COLUMNS: &[(&str, &str, &str)] = &[
+        ("transfer_id", "transfer_id TEXT PRIMARY KEY", "''"),
+        ("asset_id", "asset_id TEXT NOT NULL DEFAULT ''", "''"),
+        ("cloud_id", "cloud_id TEXT NOT NULL DEFAULT ''", "''"),
+        (
+            "provider_kind",
+            "provider_kind TEXT NOT NULL DEFAULT ''",
+            "''",
+        ),
+        ("base_url", "base_url TEXT NOT NULL DEFAULT ''", "''"),
+        ("direction", "direction TEXT NOT NULL DEFAULT ''", "''"),
+        ("status", "status TEXT NOT NULL DEFAULT ''", "''"),
+        (
+            "bytes_total",
+            "bytes_total INTEGER NOT NULL DEFAULT 0",
+            "0",
+        ),
+        ("bytes_done", "bytes_done INTEGER NOT NULL DEFAULT 0", "0"),
+        ("updated_at", "updated_at TEXT NOT NULL DEFAULT ''", "''"),
+        (
+            "mirror_updated_at_ms",
+            "mirror_updated_at_ms INTEGER NOT NULL DEFAULT 0",
+            "0",
+        ),
+        ("row_json", "row_json TEXT NOT NULL", "'{}'"),
+    ];
+
+    if cloud_mcp_asset_cache_table_needs_rebuild(
+        conn,
+        "account_asset_items",
+        &["asset_id"],
+        ASSET_ITEM_COLUMNS,
+    )? {
+        cloud_mcp_asset_cache_rebuild_table(
+            conn,
+            "account_asset_items",
+            "asset_id",
+            ASSET_ITEM_COLUMNS,
+        )?;
+    }
+    if cloud_mcp_asset_cache_table_needs_rebuild(
+        conn,
+        "account_asset_transfers",
+        &["transfer_id"],
+        ASSET_TRANSFER_COLUMNS,
+    )? {
+        cloud_mcp_asset_cache_rebuild_table(
+            conn,
+            "account_asset_transfers",
+            "transfer_id",
+            ASSET_TRANSFER_COLUMNS,
+        )?;
+    }
+    Ok(())
+}
+
 fn cloud_mcp_asset_library_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    cloud_mcp_asset_library_prepare_core_tables(conn)?;
     cloud_mcp_reset_table_if_primary_key_mismatch(
         conn,
         CLOUD_MCP_ASSET_DEVICE_SYNC_STATE_TABLE,
@@ -56390,6 +56778,275 @@ mod cloud_mcp_tests {
         assert_eq!(status["aggregate"]["status"].as_str(), Some("empty"));
         assert_eq!(status["terminal"].as_bool(), Some(false));
         assert_eq!(status["has_filters"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn asset_library_init_migrates_legacy_asset_cache_primary_keys() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE account_asset_items(
+                sync_server_id TEXT NOT NULL DEFAULT '',
+                sync_timeline_id TEXT NOT NULL DEFAULT '',
+                asset_id TEXT NOT NULL DEFAULT '',
+                base_url TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL DEFAULT '',
+                kind TEXT NOT NULL DEFAULT 'file',
+                mime_type TEXT NOT NULL DEFAULT '',
+                size_bytes INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT NOT NULL DEFAULT '',
+                blob_id TEXT NOT NULL DEFAULT '',
+                cloud_status TEXT NOT NULL DEFAULT '',
+                local_status TEXT NOT NULL DEFAULT '',
+                local_path TEXT NOT NULL DEFAULT '',
+                object_key TEXT NOT NULL DEFAULT '',
+                origin_device_id TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT '',
+                mirror_updated_at_ms INTEGER NOT NULL DEFAULT 0,
+                row_json TEXT NOT NULL,
+                PRIMARY KEY(sync_server_id, sync_timeline_id, asset_id)
+            );
+            CREATE TABLE account_asset_transfers(
+                sync_server_id TEXT NOT NULL DEFAULT '',
+                sync_timeline_id TEXT NOT NULL DEFAULT '',
+                transfer_id TEXT NOT NULL DEFAULT '',
+                asset_id TEXT NOT NULL DEFAULT '',
+                cloud_id TEXT NOT NULL DEFAULT '',
+                provider_kind TEXT NOT NULL DEFAULT '',
+                base_url TEXT NOT NULL DEFAULT '',
+                direction TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT '',
+                bytes_total INTEGER NOT NULL DEFAULT 0,
+                bytes_done INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT '',
+                mirror_updated_at_ms INTEGER NOT NULL DEFAULT 0,
+                row_json TEXT NOT NULL,
+                PRIMARY KEY(sync_server_id, sync_timeline_id, transfer_id)
+            );
+            "#,
+        )
+        .unwrap();
+        let root = test_cloud_root("asset-cache-legacy-primary-key-migration");
+        fs::create_dir_all(&root).unwrap();
+        let old_path = root.join("old.png");
+        let new_path = root.join("new.png");
+        let after_path = root.join("after.png");
+        fs::write(&old_path, b"old png payload").unwrap();
+        fs::write(&new_path, b"new png payload").unwrap();
+        fs::write(&after_path, b"after png payload").unwrap();
+        let old_path = old_path.to_string_lossy().to_string();
+        let new_path = new_path.to_string_lossy().to_string();
+        let after_path = after_path.to_string_lossy().to_string();
+        conn.execute(
+            "INSERT INTO account_asset_items(
+                sync_server_id, sync_timeline_id, asset_id, base_url, name, kind,
+                mime_type, size_bytes, sha256, cloud_status, local_status,
+                local_path, updated_at, mirror_updated_at_ms, row_json
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            rusqlite::params![
+                "server-a",
+                "timeline-a",
+                "asset-legacy",
+                "https://cloud.example",
+                "old.png",
+                "image",
+                "image/png",
+                9,
+                "old-sha",
+                "local_only",
+                "local_available",
+                old_path.as_str(),
+                "2026-01-01T00:00:00.000Z",
+                1,
+                json!({"asset_id": "asset-legacy", "name": "old.png", "local_path": old_path.as_str()})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_asset_items(
+                sync_server_id, sync_timeline_id, asset_id, base_url, name, kind,
+                mime_type, size_bytes, sha256, cloud_status, local_status,
+                local_path, updated_at, mirror_updated_at_ms, row_json
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            rusqlite::params![
+                "server-b",
+                "timeline-b",
+                "asset-legacy",
+                "https://cloud.example",
+                "new.png",
+                "image",
+                "image/png",
+                10,
+                "new-sha",
+                "local_only",
+                "local_available",
+                new_path.as_str(),
+                "2026-02-01T00:00:00.000Z",
+                2,
+                json!({"asset_id": "asset-legacy", "name": "new.png", "local_path": new_path.as_str()})
+                    .to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_asset_transfers(
+                sync_server_id, sync_timeline_id, transfer_id, asset_id, cloud_id,
+                provider_kind, base_url, direction, status, bytes_total, bytes_done,
+                updated_at, mirror_updated_at_ms, row_json
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                "server-a",
+                "timeline-a",
+                "transfer-legacy",
+                "asset-legacy",
+                "cloud-a",
+                "appwrite",
+                "https://cloud.example",
+                "upload",
+                "queued",
+                10,
+                1,
+                "2026-01-01T00:00:00.000Z",
+                1,
+                json!({"transfer_id": "transfer-legacy", "status": "queued"}).to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO account_asset_transfers(
+                sync_server_id, sync_timeline_id, transfer_id, asset_id, cloud_id,
+                provider_kind, base_url, direction, status, bytes_total, bytes_done,
+                updated_at, mirror_updated_at_ms, row_json
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            rusqlite::params![
+                "server-b",
+                "timeline-b",
+                "transfer-legacy",
+                "asset-legacy",
+                "cloud-a",
+                "appwrite",
+                "https://cloud.example",
+                "upload",
+                "uploading",
+                10,
+                5,
+                "2026-02-01T00:00:00.000Z",
+                2,
+                json!({"transfer_id": "transfer-legacy", "status": "uploading"}).to_string()
+            ],
+        )
+        .unwrap();
+
+        cloud_mcp_asset_library_init_conn(&conn).unwrap();
+
+        assert_eq!(
+            cloud_mcp_table_primary_key_columns(&conn, "account_asset_items").unwrap(),
+            vec!["asset_id".to_string()]
+        );
+        assert_eq!(
+            cloud_mcp_table_primary_key_columns(&conn, "account_asset_transfers").unwrap(),
+            vec!["transfer_id".to_string()]
+        );
+        let item_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM account_asset_items", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(item_count, 1);
+        let migrated_path: String = conn
+            .query_row(
+                "SELECT local_path FROM account_asset_items WHERE asset_id='asset-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_path, new_path);
+        let transfer_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM account_asset_transfers", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(transfer_count, 1);
+        let migrated_transfer_status: String = conn
+            .query_row(
+                "SELECT status FROM account_asset_transfers WHERE transfer_id='transfer-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrated_transfer_status, "uploading");
+
+        cloud_mcp_update_asset_library_conn(
+            &conn,
+            "local_asset_registration",
+            Some("https://cloud.example"),
+            None,
+            None,
+            &json!({
+                "assets": [{
+                    "asset_id": "asset-legacy",
+                    "name": "after.png",
+                    "kind": "image",
+                    "mime_type": "image/png",
+                    "size_bytes": 12,
+                    "sha256": "after-sha",
+                    "cloud_status": "local_only",
+                    "local_status": "local_available",
+                    "local_path": after_path.as_str(),
+                    "updated_at": "2026-03-01T00:00:00.000Z"
+                }, {
+                    "asset_id": "asset-fresh-after-migration",
+                    "name": "after.png",
+                    "kind": "image",
+                    "mime_type": "image/png",
+                    "size_bytes": 12,
+                    "sha256": "after-sha",
+                    "cloud_status": "local_only",
+                    "local_status": "local_available",
+                    "local_path": after_path.as_str(),
+                    "updated_at": "2026-03-01T00:00:00.000Z"
+                }],
+                "transfers": [{
+                    "transfer_id": "transfer-legacy",
+                    "asset_id": "asset-legacy",
+                    "cloud_id": "cloud-a",
+                    "provider_kind": "appwrite",
+                    "direction": "upload",
+                    "status": "completed",
+                    "bytes_total": 12,
+                    "bytes_done": 12,
+                    "updated_at": "2026-03-01T00:00:00.000Z"
+                }]
+            }),
+        )
+        .unwrap();
+
+        let updated_path: String = conn
+            .query_row(
+                "SELECT local_path FROM account_asset_items WHERE asset_id='asset-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_path, new_path);
+        let fresh_path: String = conn
+            .query_row(
+                "SELECT local_path FROM account_asset_items WHERE asset_id='asset-fresh-after-migration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fresh_path, after_path);
+        let updated_transfer_status: String = conn
+            .query_row(
+                "SELECT status FROM account_asset_transfers WHERE transfer_id='transfer-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_transfer_status, "completed");
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]

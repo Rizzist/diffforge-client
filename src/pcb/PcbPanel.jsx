@@ -25,6 +25,7 @@ export const PCB_TABS = PCB_VIEW_TABS.map((tab) => tab.id);
 export const PCB_STORE_CHANGED_EVENT = "pcb-store-changed";
 const PCB_MAIN_FILE_PATH = "main.tsx";
 const PCB_RENDER_TIMEOUT_MS = 30000;
+const PCB_RENDER_CANCELLED_MESSAGE = "PCB render cancelled.";
 const PCB_PARTS_ENGINE_FETCH_RETRY_DELAYS_MS = [250, 750];
 const PCB_PARTS_ENGINE_FETCH_HOSTS = new Set([
   "jlcsearch.tscircuit.com",
@@ -604,6 +605,26 @@ const PCB_RUNFRAME_PREVIEW_BOOTSTRAP_SOURCE = `
     delete value.elements;
     return value;
   }
+  function releaseWebglContexts() {
+    var canvases = document.querySelectorAll ? document.querySelectorAll("canvas") : [];
+    for (var index = 0; index < canvases.length; index += 1) {
+      var canvas = canvases[index];
+      ["webgl2", "webgl", "experimental-webgl"].forEach(function (contextType) {
+        try {
+          var context = canvas.getContext && canvas.getContext(contextType);
+          var extension = context && context.getExtension && context.getExtension("WEBGL_lose_context");
+          if (extension && typeof extension.loseContext === "function") {
+            extension.loseContext();
+          }
+        } catch {}
+      });
+    }
+    try {
+      window.TSCIRCUIT_3D_OBJECT_REF = undefined;
+    } catch {}
+  }
+  window.addEventListener("pagehide", releaseWebglContexts);
+  window.addEventListener("beforeunload", releaseWebglContexts);
   function isPostpigUrl(value) {
     try {
       return new URL(String(value), window.location.href).hostname === "postpig.tscircuit.com";
@@ -713,6 +734,60 @@ function enqueuePcbRender(task) {
   const run = pcbRenderQueue.then(task, task);
   pcbRenderQueue = run.catch(() => {});
   return run;
+}
+
+function createPcbRenderCancelledError() {
+  const error = new Error(PCB_RENDER_CANCELLED_MESSAGE);
+  error.name = "AbortError";
+  return error;
+}
+
+function isPcbRenderCancelledError(error) {
+  return error?.name === "AbortError" && error?.message === PCB_RENDER_CANCELLED_MESSAGE;
+}
+
+function releasePreviewFrameWebGlContexts(frame) {
+  let frameDocument = null;
+  try {
+    frameDocument = frame?.contentDocument || frame?.contentWindow?.document || null;
+  } catch {
+    frameDocument = null;
+  }
+  if (!frameDocument) {
+    return;
+  }
+  const canvases = frameDocument.querySelectorAll?.("canvas") || [];
+  canvases.forEach((canvas) => {
+    ["webgl2", "webgl", "experimental-webgl"].forEach((contextType) => {
+      try {
+        const context = canvas.getContext?.(contextType);
+        context?.getExtension?.("WEBGL_lose_context")?.loseContext?.();
+      } catch {
+        // Losing old preview contexts is best-effort; the new frame is the source of truth.
+      }
+    });
+  });
+  try {
+    if (frame?.contentWindow) {
+      frame.contentWindow.TSCIRCUIT_3D_OBJECT_REF = undefined;
+    }
+  } catch {}
+}
+
+function resetPreviewFrame(frame) {
+  if (!frame) {
+    return;
+  }
+  releasePreviewFrameWebGlContexts(frame);
+  try {
+    frame.srcdoc = "<!doctype html><html><body></body></html>";
+  } catch {}
+  try {
+    frame.removeAttribute("srcdoc");
+  } catch {}
+  try {
+    frame.src = "about:blank";
+  } catch {}
 }
 
 function escapeHtmlAttribute(value) {
@@ -994,6 +1069,25 @@ const PreviewFrame = styled.iframe`
   background: #ffffff;
 `;
 
+function ManagedPreviewFrame({ srcDoc, title }) {
+  const frameRef = useRef(null);
+
+  useEffect(() => {
+    const frame = frameRef.current;
+    return () => {
+      resetPreviewFrame(frame);
+    };
+  }, []);
+
+  return (
+    <PreviewFrame
+      ref={frameRef}
+      srcDoc={srcDoc}
+      title={title}
+    />
+  );
+}
+
 const RenderErrorBanner = styled.div`
   position: absolute;
   z-index: 2;
@@ -1046,7 +1140,7 @@ export default function PcbPanel({
   const [activeTab, setActiveTab] = useState(defaultTabId);
   const [source, setSource] = useState(null);
   const [circuitJson, setCircuitJson] = useState(null);
-  const [runframePreviewBootstrapUrl, setRunframePreviewBootstrapUrl] = useState("");
+  const [runframePreviewBootstrap, setRunframePreviewBootstrap] = useState({ signature: "", url: "" });
   const [renderLog, setRenderLog] = useState(null);
   const [solverEvents, setSolverEvents] = useState([]);
   const [renderStatus, setRenderStatus] = useState("idle");
@@ -1067,44 +1161,59 @@ export default function PcbPanel({
     fsMap ? createPcbPartsEngineLocalCache(fsMap) : null
   ), [fsMap]);
   const previewProps = useMemo(() => ({
-    activeEffectName: renderLog?.lastRenderEvent?.phase,
     allowSelectingVersion: false,
     availableTabs: PCB_TABS,
     code: source || "",
     defaultActiveTab: activeTab,
     defaultTab: activeTab,
-    errorMessage: renderError || null,
-    errorStack: renderError ? "" : null,
+    errorMessage: null,
+    errorStack: null,
     fsMap: fsMap || {},
-    isRunningCode: renderStatus === "rendering",
+    isRunningCode: false,
     isWebEmbedded: true,
     projectName: board?.name || boardPath || "PCB",
-    renderLog,
+    renderLog: null,
     showCodeTab: false,
     showFileMenu: false,
     showImportAndFormatButtons: false,
     showRenderLogTab: true,
     showRightHeaderContent: false,
     showToggleFullScreen: false,
-    solverEvents,
-  }), [activeTab, board?.name, boardPath, fsMap, renderError, renderLog, renderStatus, solverEvents, source]);
+    solverEvents: [],
+  }), [activeTab, board?.name, boardPath, fsMap, source]);
+  const circuitJsonSignature = useMemo(() => (
+    circuitJson ? hashString(serializeJavaScriptLiteral(normalizeCircuitJsonPayload(circuitJson))) : ""
+  ), [circuitJson]);
+  const previewPayloadSignature = useMemo(() => (
+    circuitJsonSignature
+      ? hashString(`${circuitJsonSignature}\0${serializeJavaScriptLiteral(previewProps)}`)
+      : ""
+  ), [circuitJsonSignature, previewProps]);
+  const previewFrameKey = useMemo(() => (
+    `${boardPath}:${previewPayloadSignature}`
+  ), [boardPath, previewPayloadSignature]);
   const previewSrcDoc = useMemo(() => {
-    if (!circuitJson || !runframePreviewBootstrapUrl) {
+    if (
+      !circuitJson
+      || !previewPayloadSignature
+      || !runframePreviewBootstrap.url
+      || runframePreviewBootstrap.signature !== previewPayloadSignature
+    ) {
       return "";
     }
     return buildPreviewSrcDoc({
-      bootstrapUrl: runframePreviewBootstrapUrl,
+      bootstrapUrl: runframePreviewBootstrap.url,
       scriptUrl: runframeStandalonePreviewUrl,
     });
-  }, [circuitJson, runframePreviewBootstrapUrl]);
+  }, [circuitJson, previewPayloadSignature, runframePreviewBootstrap.signature, runframePreviewBootstrap.url]);
 
   useEffect(() => {
     setActiveTab(defaultTabId);
   }, [boardPath, defaultTabId]);
 
   useEffect(() => {
-    if (!circuitJson) {
-      setRunframePreviewBootstrapUrl("");
+    if (!circuitJson || !previewPayloadSignature) {
+      setRunframePreviewBootstrap({ signature: "", url: "" });
       return undefined;
     }
     const bootstrapUrl = URL.createObjectURL(new Blob(
@@ -1116,11 +1225,11 @@ export default function PcbPanel({
       })],
       { type: "text/javascript" },
     ));
-    setRunframePreviewBootstrapUrl(bootstrapUrl);
+    setRunframePreviewBootstrap({ signature: previewPayloadSignature, url: bootstrapUrl });
     return () => {
       URL.revokeObjectURL(bootstrapUrl);
     };
-  }, [circuitJson, previewProps]);
+  }, [circuitJson, previewPayloadSignature, previewProps]);
 
   const readSource = useCallback(() => {
     const readSeq = readSeqRef.current + 1;
@@ -1172,9 +1281,15 @@ export default function PcbPanel({
     renderSeqRef.current = renderSeq;
     let cancelled = false;
     let worker = null;
+    let abortRender = () => {};
     let cleanupWorkerErrorListeners = () => {};
 
     const isCurrent = () => !cancelled && renderSeqRef.current === renderSeq;
+    const throwIfCancelled = () => {
+      if (!isCurrent()) {
+        throw createPcbRenderCancelledError();
+      }
+    };
     const updateRenderLog = (updater) => {
       if (!isCurrent()) {
         return;
@@ -1191,6 +1306,9 @@ export default function PcbPanel({
       if (!isCurrent()) {
         return;
       }
+      const renderAbortPromise = new Promise((_, reject) => {
+        abortRender = () => reject(createPcbRenderCancelledError());
+      });
       let latestCircuitJson = null;
       setCircuitJson(null);
       setRenderError("");
@@ -1206,10 +1324,11 @@ export default function PcbPanel({
       try {
         installPcbPartsEngineFetchRetry();
         const patchedEvalWorkerBlobUrl = await withTimeout(
-          getPatchedEvalWorkerBlobUrl(),
+          Promise.race([getPatchedEvalWorkerBlobUrl(), renderAbortPromise]),
           "preparing PCB renderer worker",
         );
-        worker = await withTimeout(createCircuitWebWorker({
+        throwIfCancelled();
+        worker = await withTimeout(Promise.race([createCircuitWebWorker({
           easyEdaProxyConfig: {
             proxyEndpointUrl: PCB_EASYEDA_PROXY_ENDPOINT_URL,
           },
@@ -1220,7 +1339,8 @@ export default function PcbPanel({
           },
           verbose: false,
           webWorkerBlobUrl: patchedEvalWorkerBlobUrl,
-        }), "starting PCB renderer worker");
+        }), renderAbortPromise]), "starting PCB renderer worker");
+        throwIfCancelled();
         const workerErrorPromise = new Promise((_, reject) => {
           const rawWorker = worker?.__rawWorker;
           if (!rawWorker?.addEventListener) {
@@ -1236,9 +1356,11 @@ export default function PcbPanel({
             rawWorker.removeEventListener("messageerror", handleWorkerError);
           };
         });
-        const runWorkerStep = (promise, label) => (
-          withTimeout(Promise.race([promise, workerErrorPromise]), label)
-        );
+        const runWorkerStep = async (promise, label) => {
+          const result = await withTimeout(Promise.race([promise, workerErrorPromise, renderAbortPromise]), label);
+          throwIfCancelled();
+          return result;
+        };
         worker.on("board:renderPhaseStarted", (event) => {
           const entry = { ...event, createdAt: Date.now() };
           updateRenderLog((previous) => {
@@ -1272,7 +1394,11 @@ export default function PcbPanel({
           fsMap,
           mainComponentPath: PCB_MAIN_FILE_PATH,
         }), "executing PCB source");
-        const settled = runWorkerStep(worker.renderUntilSettled(), "settling PCB render");
+        let settledError = null;
+        const settled = runWorkerStep(worker.renderUntilSettled(), "settling PCB render")
+          .catch((err) => {
+            settledError = err;
+          });
         const initialCircuitJson = await runWorkerStep(worker.getCircuitJson(), "reading initial PCB JSON");
         latestCircuitJson = normalizeCircuitJsonPayload(initialCircuitJson);
         if (isCurrent()) {
@@ -1283,6 +1409,9 @@ export default function PcbPanel({
           }));
         }
         await settled;
+        if (settledError) {
+          throw settledError;
+        }
         const finalCircuitJson = await runWorkerStep(worker.getCircuitJson(), "reading final PCB JSON");
         latestCircuitJson = normalizeCircuitJsonPayload(finalCircuitJson);
         const finalIssues = summarizeCircuitJsonIssues(latestCircuitJson);
@@ -1303,6 +1432,9 @@ export default function PcbPanel({
           }));
         }
       } catch (err) {
+        if (isPcbRenderCancelledError(err) || !isCurrent()) {
+          return;
+        }
         if (isCurrent()) {
           if (latestCircuitJson?.length) {
             setCircuitJson(latestCircuitJson);
@@ -1319,6 +1451,7 @@ export default function PcbPanel({
           }));
         }
       } finally {
+        abortRender = () => {};
         cleanupWorkerErrorListeners();
         try {
           await worker?.clearEventListeners?.();
@@ -1337,13 +1470,14 @@ export default function PcbPanel({
 
     return () => {
       cancelled = true;
+      abortRender();
       try {
-        void worker?.kill?.();
+        Promise.resolve(worker?.kill?.()).catch(() => {});
       } catch {
         // Worker cleanup is best effort during live reload churn.
       }
     };
-  }, [fsMap, normalizedRepoPath, repoPath]);
+  }, [fsMap, normalizedRepoPath, partsEngineLocalCache, repoPath]);
 
   // Live reload: re-read when the watcher reports this board changed on disk.
   useEffect(() => {
@@ -1445,8 +1579,8 @@ export default function PcbPanel({
                 {renderError ? "PCB renderer error" : "PCB renderer warning"}: {renderError || renderWarning}
               </RenderErrorBanner>
             ) : null}
-            <PreviewFrame
-              key={`${boardPath}:${activeTab}:${circuitJson.length}:${renderStatus}:${renderError}:${renderWarning}`}
+            <ManagedPreviewFrame
+              key={previewFrameKey}
               srcDoc={previewSrcDoc}
               title={`${board?.name || "PCB"} renderer`}
             />

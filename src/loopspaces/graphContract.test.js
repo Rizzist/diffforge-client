@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 
 import {
   loopspaceGraphOutputPortsForNode,
+  loopspaceGraphPropValue,
   loopspaceGraphVisualDefaultsForNode,
   validateLoopspaceGraphAst,
   validateLoopspaceGraphAstForUpdate,
@@ -55,6 +56,14 @@ test("graph contract exposes execution branches for action nodes", () => {
     loopspaceGraphOutputPortsForNode(dispatchTodosNode).map((port) => port.id),
     ["exec", "success", "failure", "interrupt"],
   );
+});
+
+test("graph prop lookup tolerates missing props during runtime updates", () => {
+  assert.equal(loopspaceGraphPropValue(undefined, ["script_id"]), undefined);
+  assert.equal(loopspaceGraphPropValue(null, ["script_id"]), undefined);
+  assert.equal(loopspaceGraphPropValue([], ["script_id"]), undefined);
+  assert.equal(loopspaceGraphPropValue({ script_id: "", path_key: "build.sh" }, ["script_id", "path_key"]), "build.sh");
+  assert.equal(loopspaceGraphPropValue({ script_id: "script-1" }, ["script_id"]), "script-1");
 });
 
 test("graph contract exposes document and asset resource ports", () => {

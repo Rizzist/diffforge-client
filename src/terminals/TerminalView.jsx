@@ -13215,6 +13215,28 @@ function getTodoQueueRequestedModel(item) {
   return getTodoQueueStringField(item, ["model", "modelId", "model_id"]);
 }
 
+function getTodoQueueCurrentModel(item) {
+  return getTodoQueueStringField(item, [
+    "currentModel",
+    "current_model",
+    "confirmedModel",
+    "confirmed_model",
+    "sessionModel",
+    "session_model",
+  ]);
+}
+
+function getTodoQueueCurrentReasoningEffort(item) {
+  return getTodoQueueStringField(item, [
+    "currentReasoningEffort",
+    "current_reasoning_effort",
+    "confirmedReasoningEffort",
+    "confirmed_reasoning_effort",
+    "sessionReasoningEffort",
+    "session_reasoning_effort",
+  ]).toLowerCase();
+}
+
 function getTodoQueueRequestedReasoningEffort(item) {
   return getTodoQueueStringField(item, [
     "reasoningEffort",
@@ -13229,11 +13251,49 @@ function getTodoQueueRequestedSpeed(item) {
   return getTodoQueueStringField(item, ["speed", "serviceTier", "service_tier"]).toLowerCase();
 }
 
-function buildTodoQueueAgentModelCommand(agentId, model, reasoningEffort) {
+function canonicalTodoQueueModelId(agentId, model) {
   const targetAgentId = normalizeTodoTerminalAgentId(agentId);
-  const targetModel = String(model || "").trim();
+  const normalized = String(model || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_:/]+/g, "-")
+    .replace(/[^a-z0-9.+-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/^(anthropic|claude|openai|codex)-/, "");
+  if (!normalized) return "";
+  if (targetAgentId === "claude" || /(sonnet|opus|haiku)/.test(normalized)) {
+    if (normalized.includes("sonnet")) return "claude:sonnet";
+    if (normalized.includes("opus")) return "claude:opus";
+    if (normalized.includes("haiku")) return "claude:haiku";
+  }
+  if (targetAgentId === "codex" || normalized.includes("gpt")) {
+    if (/gpt-?5[.-]?5|gpt55/.test(normalized)) return "codex:gpt-5.5";
+    return `codex:${normalized}`;
+  }
+  return `${targetAgentId || "model"}:${normalized}`;
+}
+
+function todoQueueModelIdsEqual(agentId, left, right) {
+  const leftModel = canonicalTodoQueueModelId(agentId, left);
+  const rightModel = canonicalTodoQueueModelId(agentId, right);
+  return Boolean(leftModel && rightModel && leftModel === rightModel);
+}
+
+function buildTodoQueueAgentModelCommand(agentId, model, reasoningEffort, currentModel = "", currentReasoningEffort = "") {
+  const targetAgentId = normalizeTodoTerminalAgentId(agentId);
+  const effort = String(reasoningEffort || "").trim().toLowerCase();
+  const codexEfforts = new Set(["low", "medium", "high", "xhigh"]);
+  const validCodexEffort = targetAgentId === "codex" && codexEfforts.has(effort);
+  const targetModel = String(model || (validCodexEffort ? currentModel : "") || "").trim();
   if (!targetModel || !["codex", "claude"].includes(targetAgentId)) {
     return "";
+  }
+  if (currentModel && todoQueueModelIdsEqual(targetAgentId, currentModel, targetModel)) {
+    const currentEffort = String(currentReasoningEffort || "").trim().toLowerCase();
+    if (!validCodexEffort || (currentEffort && currentEffort === effort)) {
+      return "";
+    }
   }
   if (
     targetModel.length > 120
@@ -13241,9 +13301,7 @@ function buildTodoQueueAgentModelCommand(agentId, model, reasoningEffort) {
   ) {
     return "";
   }
-  const effort = String(reasoningEffort || "").trim().toLowerCase();
-  const codexEfforts = new Set(["low", "medium", "high", "xhigh"]);
-  if (targetAgentId === "codex" && codexEfforts.has(effort)) {
+  if (validCodexEffort) {
     return `/model ${targetModel} ${effort}`;
   }
   return `/model ${targetModel}`;
@@ -15001,7 +15059,15 @@ function createTodoQueueItem(text, options = {}) {
   const targetAgentId = normalizeTodoTerminalAgentId(options.targetAgentId || options.target_agent_id);
   const targetAgentLabel = String(options.targetAgentLabel || options.target_agent_label || targetAgentId || "").trim();
   const requestedModel = getTodoQueueRequestedModel(options);
+  const currentModel = getTodoQueueCurrentModel(options);
   const requestedReasoningEffort = getTodoQueueRequestedReasoningEffort(options);
+  const currentReasoningEffort = getTodoQueueCurrentReasoningEffort(options);
+  const sameModel = currentModel && (!requestedModel || todoQueueModelIdsEqual(targetAgentId, currentModel, requestedModel));
+  const effortSwitch = requestedReasoningEffort
+    && (!currentReasoningEffort || currentReasoningEffort !== requestedReasoningEffort);
+  const effectiveRequestedModel = sameModel
+    ? (effortSwitch ? requestedModel || currentModel : "")
+    : requestedModel;
   const requestedSpeed = getTodoQueueRequestedSpeed(options);
   const targetExplicit = todoQueueItemTargetIsExplicit(options);
   const targetTerminalId = getTodoQueueTargetTerminalId(options);
@@ -15071,7 +15137,7 @@ function createTodoQueueItem(text, options = {}) {
     ...(targetExplicit ? { targetExplicit: true, explicitTarget: true, userPinnedTarget: true } : {}),
     ...(targetAgentId ? { targetAgentId } : {}),
     ...(targetAgentLabel ? { targetAgentLabel } : {}),
-    ...(requestedModel ? { model: requestedModel, modelId: requestedModel } : {}),
+    ...(effectiveRequestedModel ? { model: effectiveRequestedModel, modelId: effectiveRequestedModel } : {}),
     ...(requestedReasoningEffort ? { effort: requestedReasoningEffort, reasoningEffort: requestedReasoningEffort } : {}),
     ...(requestedSpeed ? { speed: requestedSpeed } : {}),
     ...(targetTerminalId ? { targetTerminalId } : {}),
@@ -15108,7 +15174,15 @@ function normalizeTodoQueueItem(item) {
   const targetAgentId = normalizeTodoTerminalAgentId(item.targetAgentId || item.target_agent_id);
   const targetAgentLabel = String(item.targetAgentLabel || item.target_agent_label || targetAgentId || "").trim();
   const requestedModel = getTodoQueueRequestedModel(item);
+  const currentModel = getTodoQueueCurrentModel(item);
   const requestedReasoningEffort = getTodoQueueRequestedReasoningEffort(item);
+  const currentReasoningEffort = getTodoQueueCurrentReasoningEffort(item);
+  const sameModel = currentModel && (!requestedModel || todoQueueModelIdsEqual(targetAgentId, currentModel, requestedModel));
+  const effortSwitch = requestedReasoningEffort
+    && (!currentReasoningEffort || currentReasoningEffort !== requestedReasoningEffort);
+  const effectiveRequestedModel = sameModel
+    ? (effortSwitch ? requestedModel || currentModel : "")
+    : requestedModel;
   const requestedSpeed = getTodoQueueRequestedSpeed(item);
   const targetExplicit = todoQueueItemTargetIsExplicit(item);
   const targetTerminalId = getTodoQueueTargetTerminalId(item);
@@ -15185,7 +15259,7 @@ function normalizeTodoQueueItem(item) {
     ...(targetExplicit ? { targetExplicit: true, explicitTarget: true, userPinnedTarget: true } : {}),
     ...(targetAgentId ? { targetAgentId } : {}),
     ...(targetAgentLabel ? { targetAgentLabel } : {}),
-    ...(requestedModel ? { model: requestedModel, modelId: requestedModel } : {}),
+    ...(effectiveRequestedModel ? { model: effectiveRequestedModel, modelId: effectiveRequestedModel } : {}),
     ...(requestedReasoningEffort ? { effort: requestedReasoningEffort, reasoningEffort: requestedReasoningEffort } : {}),
     ...(requestedSpeed ? { speed: requestedSpeed } : {}),
     ...(targetTerminalId ? { targetTerminalId } : {}),
@@ -28462,7 +28536,7 @@ function TerminalView({
         return;
       }
       if (control === PCB_PANEL_CONTROL_RETURN) {
-        returnPcbPanelToGrid(paneId);
+        clearPcbPanelBreakout(paneId);
       }
     })
       .then((nextUnlisten) => {
@@ -28478,7 +28552,7 @@ function TerminalView({
       disposed = true;
       unlisten();
     };
-  }, [recordPcbPaneBoard, returnPcbPanelToGrid, terminalWorkspace?.id]);
+  }, [clearPcbPanelBreakout, recordPcbPaneBoard, terminalWorkspace?.id]);
 
   // A breakout window closing (its close button, OS close, or our toggle)
   // returns the pane to the grid and re-asserts the grid's PTY size.

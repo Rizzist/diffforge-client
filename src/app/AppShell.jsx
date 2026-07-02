@@ -290,6 +290,7 @@ import {
   loopspaceGraphOutputPortForId as contractLoopspaceGraphOutputPortForId,
   loopspaceGraphOutputPortsForNode as contractLoopspaceGraphOutputPortsForNode,
   loopspaceGraphPortLabel as contractLoopspaceGraphPortLabel,
+  loopspaceGraphPropValue,
   loopspaceGraphVisualDefaultsForNode as contractLoopspaceGraphVisualDefaultsForNode,
   validateLoopspaceGraphEdgeCandidate,
 } from "../loopspaces/graphContract.js";
@@ -5712,15 +5713,6 @@ function loopspaceSetDragPayload(event, customMime, payload, fallbackText = "") 
       // text/plain is the portable path; custom MIME is only a richer hint.
     }
   }
-}
-
-function loopspaceGraphPropValue(props, keys = []) {
-  for (const key of keys) {
-    if (Object.prototype.hasOwnProperty.call(props, key) && props[key] !== "") {
-      return props[key];
-    }
-  }
-  return undefined;
 }
 
 const LOOPSPACE_MESSAGE_STEP_NODE_KINDS = new Set(["checkpoint", "message_step", "step", "substep", "todo"]);

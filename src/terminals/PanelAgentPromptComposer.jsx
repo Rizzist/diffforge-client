@@ -360,7 +360,6 @@ export default function PanelAgentPromptComposer({
         windowId,
       });
       setPrompt("");
-      onClose?.();
     } catch (err) {
       setError(err?.message || String(err || "Unable to send prompt."));
     } finally {

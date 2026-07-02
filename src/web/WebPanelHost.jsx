@@ -340,6 +340,7 @@ export default function WebPanelHost() {
   }, [params.paneId, params.workspaceId, windowLabel]);
 
   const webAgentPromptOverlay = useWebAgentPromptOverlay({
+    activityItems: agentPromptActivityItems,
     contextRefs: webElementPicker.contextRefs,
     defaultSelectedTargetIds: defaultAgentPromptTargetIds,
     enabled: nativeAgentPromptOverlayActive,

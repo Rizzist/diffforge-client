@@ -8591,12 +8591,7 @@ async fn stop_local_whisper_partial_transcription(
     )
     .await
     {
-        Ok(Ok(result)) => {
-            let _ = audio_state
-                .input_worker
-                .cancel_partial_capture(Some(session_id));
-            result
-        }
+        Ok(Ok(result)) => result,
         Ok(Err(_)) => Err("Local Whisper partial transcription stopped unexpectedly.".to_string()),
         Err(_) => {
             cancel_flag.store(true, Ordering::Release);

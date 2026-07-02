@@ -264,6 +264,19 @@ export function loopspaceGraphPortLabel(portId = "") {
   return port?.label || (safePortId ? safePortId.toUpperCase() : "OUT");
 }
 
+export function loopspaceGraphPropValue(props, keys = []) {
+  if (!props || typeof props !== "object" || Array.isArray(props)) {
+    return undefined;
+  }
+  const propKeys = Array.isArray(keys) ? keys : [keys];
+  for (const key of propKeys) {
+    if (Object.prototype.hasOwnProperty.call(props, key) && props[key] !== "") {
+      return props[key];
+    }
+  }
+  return undefined;
+}
+
 export function loopspaceGraphVisualDefaultsForNode(value) {
   return { ...(loopspaceGraphNodeContract(value).visual || {}) };
 }
