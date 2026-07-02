@@ -1860,6 +1860,7 @@ const SnippingPanel = styled.section`
   width: min(1080px, 100%);
   align-self: start;
   justify-self: center;
+  container-type: inline-size;
   gap: 12px;
   padding: 14px;
   border: 1px solid var(--audio-border, var(--forge-border));
@@ -1882,6 +1883,10 @@ const SnippingActionGrid = styled.div`
   @media (max-width: 820px) {
     grid-template-columns: 1fr;
   }
+
+  @container (max-width: 720px) {
+    grid-template-columns: 1fr;
+  }
 `;
 
 const SnippingHeaderActions = styled.div`
@@ -1895,20 +1900,12 @@ const SnippingHeaderActions = styled.div`
 
 const SnippingButtonGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr));
   gap: 8px;
 
   button {
     min-height: 42px;
     justify-content: center;
-  }
-
-  @media (max-width: 760px) {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-  }
-
-  @media (max-width: 580px) {
-    grid-template-columns: 1fr;
   }
 `;
 

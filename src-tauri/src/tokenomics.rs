@@ -31,7 +31,7 @@ const TOKENOMICS_CLAUDE_USAGE_CACHE_TTL_SECS: u64 = 5 * 60;
 const TOKENOMICS_CLAUDE_USAGE_CACHE_STALE_SECS: u64 = 30 * 60;
 const TOKENOMICS_SUMMARY_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_LIVE_LIMITS_CACHE_TTL_MS: u64 = 60_000;
-const TOKENOMICS_PERIODIC_PROVIDER_REFRESH_INTERVAL_MS: u64 = 5 * 60 * 1000;
+const TOKENOMICS_PERIODIC_PROVIDER_REFRESH_INTERVAL_MS: u64 = 60 * 1000;
 const TOKENOMICS_PERIODIC_SOURCE_DISCOVERY_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_PERIODIC_FINGERPRINT_FILES_PER_ROOT: usize = 16;
 const TOKENOMICS_PERIODIC_SENTINEL_MAX_ENTRIES_PER_ROOT: usize = 512;
@@ -2089,7 +2089,8 @@ fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String
     // include_stale_provider_cache = false -> only stamp freshly observed %s
     //   (failed fetches yield unknown rows that the recorders skip).
     // reconcile_accounts = true -> keep provider-account identity current.
-    let mut limits = tokenomics_provider_limits(&conn, false, false, false, true)?;
+    let mut limits =
+        tokenomics_provider_limits(&conn, false, false, gate.provider_refresh_due, true)?;
     let recorded_samples = tokenomics_record_provider_limit_samples(&conn, &limits)?;
     tokenomics_apply_provider_limit_sample_pacing(&conn, &mut limits)?;
     let recorded_windows = tokenomics_record_latest_windows(&conn, &limits)?;
@@ -17615,6 +17616,70 @@ mod tokenomics_tests {
         assert_eq!(merged.len(), 1);
         assert_eq!(merged[0]["used_percent"], json!(98));
         assert_eq!(merged[0]["remaining_percent"], json!(2));
+    }
+
+    #[test]
+    fn tokenomics_provider_limit_merge_prefers_fresher_codex_usage_snapshot() {
+        let cloud_known = json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "provider_account_key": "openai:codex:pro",
+            "window_kind": "weekly",
+            "limit_source": "codex_usage_api",
+            "confidence": "live",
+            "used_percent": 84,
+            "remaining_percent": 16,
+            "updated_at": "unix:2000"
+        });
+        let local_live = json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "provider_account_key": "openai:codex:pro",
+            "window_kind": "weekly",
+            "limit_source": "codex_usage_api",
+            "confidence": "live",
+            "used_percent": 88,
+            "remaining_percent": 12,
+            "updated_at": "unix:2010"
+        });
+
+        let merged = tokenomics_merge_provider_limits(vec![cloud_known], vec![local_live]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["used_percent"], json!(88));
+        assert_eq!(merged[0]["remaining_percent"], json!(12));
+    }
+
+    #[test]
+    fn tokenomics_provider_limit_merge_rejects_codex_no_data_over_known_percent() {
+        let cloud_known = json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "provider_account_key": "openai:codex:pro",
+            "window_kind": "weekly",
+            "limit_source": "codex_usage_api",
+            "confidence": "live",
+            "used_percent": 84,
+            "remaining_percent": 16,
+            "updated_at": "unix:2000"
+        });
+        let live_no_data = json!({
+            "provider": "openai",
+            "agent_kind": "codex",
+            "provider_account_key": "openai:codex:pro",
+            "window_kind": "weekly",
+            "limit_source": "codex_usage_api",
+            "confidence": "live",
+            "used_percent": Value::Null,
+            "remaining_percent": Value::Null,
+            "updated_at": "unix:2010"
+        });
+
+        let merged = tokenomics_merge_provider_limits(vec![cloud_known], vec![live_no_data]);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["used_percent"], json!(84));
+        assert_eq!(merged[0]["remaining_percent"], json!(16));
     }
 
     #[test]

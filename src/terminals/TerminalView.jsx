@@ -38037,7 +38037,17 @@ function TerminalView({
             && !fullscreenThisTerminal
             && !draggingThisTerminal
             && tabVisibilityByTerminal.get(terminalIndex) === false;
-          const slotTabMeta = getTerminalTabAgentMeta(getTerminalRole(terminalIndex));
+          const terminalAgent = getTerminalAgent(terminalIndex);
+          const terminalRole = getTerminalRole(terminalIndex);
+          const terminalAgentId = String(terminalAgent?.id || "").trim().toLowerCase();
+          const terminalRoleId = String(terminalRole || "").trim().toLowerCase();
+          const terminalPrewarmShell = shouldPrewarmWorkspaceTerminals
+            && terminalAgentId !== "claude"
+            && terminalRoleId !== "claude";
+          const terminalStartupReadyForPane = terminalPrewarmShell || !shouldPrewarmWorkspaceTerminals
+            ? terminalStartupReady
+            : terminalStartupReady && workspaceTerminalAgentLaunchReady;
+          const slotTabMeta = getTerminalTabAgentMeta(terminalRole);
           const isWebPane = paneKinds?.[terminalIndex] === "web";
           const isPcbPane = paneKinds?.[terminalIndex] === "pcb";
           if (isWebPane) {
@@ -38123,6 +38133,7 @@ function TerminalView({
                   onSubmitPanelAgentPrompt={submitPanelAgentPrompt}
                   panelAgentPromptActivityItems={panelAgentPromptActivityItems.filter((item) => (
                     String(item.panelPaneId || "").trim() === terminalPaneId
+                    && String(item.panelKind || "").trim() === "web"
                   ))}
                   panelAgentPromptTargets={panelAgentPromptTargets}
                   controlCommand={webPaneCommands[terminalPaneId] || null}
@@ -38188,6 +38199,7 @@ function TerminalView({
                   paneLimitReached={terminalPaneLimitReached}
                   panelAgentPromptActivityItems={panelAgentPromptActivityItems.filter((item) => (
                     String(item.panelPaneId || "").trim() === terminalPaneId
+                    && String(item.panelKind || "").trim() === "pcb"
                   ))}
                   panelAgentPromptTargets={panelAgentPromptTargets}
                   poppedOut={Boolean(pcbBreakoutPanes[terminalPaneId])}
@@ -38484,7 +38496,7 @@ function TerminalView({
               )}
               <WorkspaceTerminal
                 key={`${terminalWorkspace.id}-${terminalIndex}`}
-                agent={getTerminalAgent(terminalIndex)}
+                agent={terminalAgent}
                 agentLaunchEpoch={workspaceAgentLaunchEpoch}
                 agentLaunchDefaults={agentLaunchDefaults}
                 agentLaunchReady={workspaceTerminalAgentLaunchReady}
@@ -38512,13 +38524,13 @@ function TerminalView({
                 onThreadTerminalLifecycle={handleWorkspaceTerminalLifecycle}
                 onToggleFullscreenTerminal={handleToggleFullscreenTerminal}
                 onPopOutTerminalWindow={popOutTerminalWindowForIndex}
-                prewarmShell={shouldPrewarmWorkspaceTerminals}
+                prewarmShell={terminalPrewarmShell}
                 permissionMode={getTerminalPermissionMode(terminalIndex)}
-                startupReady={terminalStartupReady}
+                startupReady={terminalStartupReadyForPane}
                 terminalBreakoutActive={terminalBreakoutLayoutActive}
                 terminalCount={terminalWorkspaceLogicalTerminalCount}
                 terminalIndex={terminalIndex}
-                terminalRole={getTerminalRole(terminalIndex)}
+                terminalRole={terminalRole}
                 terminalSelectionMode="pointerdown"
                 thread={getTerminalThread(terminalIndex)}
                 threadsViewActive={false}
@@ -38674,6 +38686,7 @@ function TerminalView({
               </TerminalDocumentPanelHeader>
               <TerminalDocumentPanelBody>
                 <ToolsWorkspaceView
+                  agentPromptWorkspaceId={terminalWorkspace?.id || ""}
                   defaultWorkingDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
                   embeddedDocsOpenRequest={terminalBreakoutDocumentPanel}
                   embeddedDocsPanel

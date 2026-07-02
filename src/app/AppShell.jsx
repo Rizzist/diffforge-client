@@ -18203,7 +18203,14 @@ function getReadyWorkspaceTerminalAgent(agentStatuses, role) {
     return GENERIC_TERMINAL_AGENT;
   }
 
-  return getReadyAgent(agentStatuses, roleId);
+  const exactAgent = (Array.isArray(agentStatuses) ? agentStatuses : [])
+    .find((agent) => agent?.id === roleId);
+
+  if (exactAgent?.installed || exactAgent?.authenticated) {
+    return exactAgent;
+  }
+
+  return null;
 }
 
 function isWorkspacePermissionAgentRole(role) {
@@ -34392,12 +34399,14 @@ export default function App() {
     try {
       window.localStorage.setItem(ACTIVITY_OVERLAY_CONTEXT_STORAGE_KEY, JSON.stringify({
         ...activityOverlayContext,
+        cloudSyncAvailable: accountIsPaid,
         updatedAt: Date.now(),
       }));
     } catch {
       // The activity overlay falls back to account-level assets if context cannot be shared.
     }
   }, [
+    accountIsPaid,
     activityOverlayContext.repoPath,
     activityOverlayContext.workspaceId,
     activityOverlayContext.workspaceName,
@@ -48857,10 +48866,16 @@ export default function App() {
                             createFirstWorkspace={createFirstWorkspace}
                             chooseNewWorkspaceRootDirectory={chooseNewWorkspaceRootDirectory}
                             gitRepositoriesPreload={workspaceGitRepositoryPreloads[
-                              workspaceGitPullPromptCheckKey(runtimeWorkspace.id, runtimeDescriptor.workingDirectory)
+                              workspaceGitPullPromptCheckKey(
+                                runtimeWorkspace.id,
+                                runtimeDescriptor.workingDirectory || defaultWorkingDirectory,
+                              )
                             ] || null}
                             gitSnapshotsPreload={workspaceGitSnapshotPreloads[
-                              workspaceGitPullPromptCheckKey(runtimeWorkspace.id, runtimeDescriptor.workingDirectory)
+                              workspaceGitPullPromptCheckKey(
+                                runtimeWorkspace.id,
+                                runtimeDescriptor.workingDirectory || defaultWorkingDirectory,
+                              )
                             ] || null}
                             handlePreparedTerminalChange={handlePreparedTerminalChange}
                             isAppClosing={workspaceCloseState.isActive}

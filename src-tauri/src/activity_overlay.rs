@@ -19,10 +19,64 @@ fn position_activity_overlay_window(window: &tauri::WebviewWindow) {
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
 }
 
+/// Cross-Space style for the hotkey-summoned activity widget. Tauri's
+/// `always_on_top` only floats above ordinary windows; showing the widget
+/// while another app owns a fullscreen Space also needs AppKit's
+/// FullScreenAuxiliary behavior and a level above the fullscreen window.
+/// Re-asserted on ensure/show because these are mutable NSWindow properties.
+#[cfg(target_os = "macos")]
+fn activity_overlay_apply_macos_space_style(window: &tauri::WebviewWindow) {
+    snipping_convert_overlay_window_to_panel(window);
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        snipping_catch_objc("activity_overlay_apply_macos_space_style", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.setCollectionBehavior(
+                objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
+                    | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+                    | objc2_app_kit::NSWindowCollectionBehavior::Transient
+                    | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+                    | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
+            );
+            ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+            ns_window.setHidesOnDeactivate(false);
+            ns_window.setAcceptsMouseMovedEvents(true);
+        });
+    });
+}
+
+/// Surfaces the widget even while Diff Forge is not the active app, such as
+/// when the hotkey fires inside another app's fullscreen Space.
+#[cfg(target_os = "macos")]
+fn activity_overlay_order_front_regardless(window: &tauri::WebviewWindow) {
+    let window_for_main = window.clone();
+    let _ = window.run_on_main_thread(move || {
+        snipping_catch_objc("activity_overlay_order_front_regardless", || {
+            let Ok(ns_window) = window_for_main.ns_window() else {
+                return;
+            };
+            if ns_window.is_null() {
+                return;
+            }
+            let ns_window: &NSWindow = unsafe { &*ns_window.cast::<NSWindow>() };
+            ns_window.orderFrontRegardless();
+        });
+    });
+}
+
 fn ensure_activity_overlay_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     let _span = BackendCpuSpan::new("activity_overlay.ensure_window");
     if let Some(window) = app.get_webview_window(ACTIVITY_OVERLAY_WINDOW_LABEL) {
         size_activity_overlay_window(&window);
+        #[cfg(target_os = "macos")]
+        activity_overlay_apply_macos_space_style(&window);
         return Ok(window);
     }
 
@@ -79,6 +133,11 @@ fn show_activity_overlay_for(app: &AppHandle, focus: bool) -> Result<ActivityOve
     window
         .show()
         .map_err(|error| format!("Unable to show activity overlay: {error}"))?;
+    #[cfg(target_os = "macos")]
+    {
+        activity_overlay_apply_macos_space_style(&window);
+        activity_overlay_order_front_regardless(&window);
+    }
     if focus {
         let _ = window.set_focus();
     }

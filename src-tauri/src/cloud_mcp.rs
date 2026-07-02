@@ -22971,7 +22971,10 @@ async fn cloud_mcp_resolve_ws_target_via_app_ws(
         "contract": "diffforge.app_ws.v1",
         "auth": auth,
         "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "request": json!({}),
+        "request": json!({
+            "endpoint_path": endpoint_path,
+            "endpointPath": endpoint_path,
+        }),
     });
     if tx.send(envelope).is_err() {
         state.global_ws_pending.lock().await.remove(&request_id);
@@ -23008,6 +23011,11 @@ async fn cloud_mcp_resolve_ws_target_via_app_ws(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Cloud app websocket returned no route token.".to_string())?
         .to_string();
+    if !cloud_mcp_route_token_scope_allows_endpoint(&route_token, endpoint_path) {
+        return Err(format!(
+            "Cloud app websocket route token is not scoped for {endpoint_path}; resolving through the balancer."
+        ));
+    }
     let target = CloudMcpWsTarget {
         ws_url: cloud_mcp_rewrite_ws_endpoint(&app_ws_url, endpoint_path),
         route_token: Some(route_token),
@@ -40485,11 +40493,24 @@ fn cloud_mcp_asset_http_headers(
         "Cloud MCP auth token is unavailable; waiting for sign-in before transferring assets."
             .to_string()
     })?;
-    headers.insert(
-        reqwest::header::AUTHORIZATION,
-        reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|error| format!("Invalid asset transfer auth header: {error}"))?,
-    );
+    let route_token = route_token.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(route_token) = route_token {
+        let route_header = reqwest::header::HeaderValue::from_str(route_token)
+            .map_err(|error| format!("Invalid asset transfer route header: {error}"))?;
+        headers.insert("x-diffforge-direct-route-token", route_header.clone());
+        headers.insert("x-diffforge-route-token", route_header);
+        headers.insert(
+            "x-diffforge-appwrite-jwt",
+            reqwest::header::HeaderValue::from_str(token)
+                .map_err(|error| format!("Invalid asset transfer appwrite jwt header: {error}"))?,
+        );
+    } else {
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|error| format!("Invalid asset transfer auth header: {error}"))?,
+        );
+    }
     headers.insert(
         "x-diffforge-client-id",
         reqwest::header::HeaderValue::from_static(CLOUD_MCP_RUST_CLIENT_ID),
@@ -40528,13 +40549,6 @@ fn cloud_mcp_asset_http_headers(
             "x-diffforge-device-limit",
             reqwest::header::HeaderValue::from_str(&device_limit.to_string())
                 .map_err(|error| format!("Invalid asset transfer device limit header: {error}"))?,
-        );
-    }
-    if let Some(route_token) = route_token.filter(|value| !value.trim().is_empty()) {
-        headers.insert(
-            "x-diffforge-direct-route-token",
-            reqwest::header::HeaderValue::from_str(route_token)
-                .map_err(|error| format!("Invalid asset transfer route header: {error}"))?,
         );
     }
     Ok(headers)
@@ -40710,15 +40724,23 @@ fn cloud_mcp_internal_api_http_headers(
 ) -> Result<reqwest::header::HeaderMap, String> {
     let mut headers = reqwest::header::HeaderMap::new();
     let mut appwrite_user_id = None;
+    let route_token = route_token.map(str::trim).filter(|value| !value.is_empty());
     if let Some(token) = cloud_mcp_process_authorization_bearer() {
-        headers.insert(
-            reqwest::header::AUTHORIZATION,
-            cloud_mcp_header_value(&format!("Bearer {token}"), "authorization")?,
-        );
-        headers.insert(
-            "x-diffforge-appwrite-jwt",
-            cloud_mcp_header_value(&token, "appwrite jwt")?,
-        );
+        if route_token.is_some() {
+            headers.insert(
+                "x-diffforge-appwrite-jwt",
+                cloud_mcp_header_value(&token, "appwrite jwt")?,
+            );
+        } else {
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                cloud_mcp_header_value(&format!("Bearer {token}"), "authorization")?,
+            );
+            headers.insert(
+                "x-diffforge-appwrite-jwt",
+                cloud_mcp_header_value(&token, "appwrite jwt")?,
+            );
+        }
         appwrite_user_id = cloud_mcp_appwrite_user_id_from_jwt(&token);
     }
     if appwrite_user_id.is_none() {
@@ -40765,11 +40787,10 @@ fn cloud_mcp_internal_api_http_headers(
             cloud_mcp_header_value(&device_limit.to_string(), "device limit")?,
         );
     }
-    if let Some(route_token) = route_token.filter(|value| !value.trim().is_empty()) {
-        headers.insert(
-            "x-diffforge-direct-route-token",
-            cloud_mcp_header_value(route_token, "route token")?,
-        );
+    if let Some(route_token) = route_token {
+        let route_header = cloud_mcp_header_value(route_token, "route token")?;
+        headers.insert("x-diffforge-direct-route-token", route_header.clone());
+        headers.insert("x-diffforge-route-token", route_header);
     }
     Ok(headers)
 }
@@ -41995,6 +42016,32 @@ async fn cloud_mcp_publish_account_asset(
     cloud_mcp_update_asset_library_from_response(
         "asset_publish_public",
         Some("/v1/assets/publish-public"),
+        &payload,
+        &data,
+    );
+    Ok(data)
+}
+
+#[tauri::command]
+async fn cloud_mcp_unpublish_account_asset(
+    state: State<'_, CloudMcpState>,
+    asset_id: String,
+) -> Result<Value, String> {
+    let mut payload = cloud_mcp_asset_payload_base("asset_unpublish_public");
+    if let Some(object) = payload.as_object_mut() {
+        object.insert("asset_id".to_string(), json!(asset_id));
+        object.insert("assetId".to_string(), json!(asset_id));
+    }
+    let response = cloud_mcp_post_json_endpoint(
+        state.inner(),
+        "/v1/assets/unpublish-public",
+        &payload,
+    )
+    .await?;
+    let data = response.get("data").cloned().unwrap_or(response);
+    cloud_mcp_update_asset_library_from_response(
+        "asset_unpublish_public",
+        Some("/v1/assets/unpublish-public"),
         &payload,
         &data,
     );
@@ -53620,6 +53667,81 @@ mod cloud_mcp_tests {
             transport: "direct_cloud_container".to_string(),
         });
         assert!(cloud_mcp_last_direct_route_fresh("/v1/voice/ws").is_none());
+    }
+
+    #[test]
+    fn route_token_scope_rejects_websocket_token_for_asset_upload_path() {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let make_scoped_token = |allowed_paths: Value| {
+            let payload = general_purpose::URL_SAFE_NO_PAD.encode(
+                serde_json::to_vec(&json!({
+                    "exp": now_s + 120,
+                    "allowed_paths": allowed_paths,
+                }))
+                .expect("encode claims"),
+            );
+            format!("{payload}.test-signature")
+        };
+        let websocket_token = make_scoped_token(json!([
+            "/v1/app/ws",
+            "/v1/voice/ws",
+            "/v1/voice/dictation/ws",
+            "/v1/media/convert/ws",
+        ]));
+        assert!(!cloud_mcp_route_token_scope_allows_endpoint(
+            &websocket_token,
+            "/v1/assets/upload/asset-upload-123"
+        ));
+
+        let asset_token = make_scoped_token(json!(["/v1/assets/upload/*"]));
+        assert!(cloud_mcp_route_token_scope_allows_endpoint(
+            &asset_token,
+            "/v1/assets/upload/asset-upload-123"
+        ));
+    }
+
+    #[test]
+    fn asset_http_headers_move_appwrite_jwt_out_of_authorization_for_direct_routes() {
+        let headers = cloud_mcp_asset_http_headers(
+            Some("appwrite.jwt.token"),
+            Some("route.payload.signature"),
+        )
+        .expect("headers");
+        assert!(headers.get(reqwest::header::AUTHORIZATION).is_none());
+        assert_eq!(
+            headers
+                .get("x-diffforge-appwrite-jwt")
+                .and_then(|value| value.to_str().ok()),
+            Some("appwrite.jwt.token")
+        );
+        assert_eq!(
+            headers
+                .get("x-diffforge-direct-route-token")
+                .and_then(|value| value.to_str().ok()),
+            Some("route.payload.signature")
+        );
+        assert_eq!(
+            headers
+                .get("x-diffforge-route-token")
+                .and_then(|value| value.to_str().ok()),
+            Some("route.payload.signature")
+        );
+
+        let bearer_headers =
+            cloud_mcp_asset_http_headers(Some("appwrite.jwt.token"), None).expect("headers");
+        assert_eq!(
+            bearer_headers
+                .get(reqwest::header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer appwrite.jwt.token")
+        );
+        assert!(bearer_headers.get("x-diffforge-appwrite-jwt").is_none());
+        assert!(bearer_headers
+            .get("x-diffforge-direct-route-token")
+            .is_none());
     }
 
     #[test]

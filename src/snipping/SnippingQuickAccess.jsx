@@ -24,6 +24,7 @@ import { Numbers } from "@styled-icons/material-rounded/Numbers";
 import { Pause } from "@styled-icons/material-rounded/Pause";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
 import { Public } from "@styled-icons/material-rounded/Public";
+import { PublicOff } from "@styled-icons/material-rounded/PublicOff";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { RadioButtonUnchecked } from "@styled-icons/material-rounded/RadioButtonUnchecked";
 import { Rectangle } from "@styled-icons/material-rounded/Rectangle";
@@ -1145,6 +1146,24 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
     }
   }, [assetId, publicUrl, showStatus, uploadState]);
 
+  const makePrivate = useCallback(async () => {
+    if (!assetId) return;
+    const previousState = uploadState;
+    setUploadState("deleting");
+    try {
+      await invoke("snipping_unpublish_uploaded_asset", {
+        request: { assetId },
+      });
+      setPublicUrl("");
+      setUrlCopied(false);
+      setUploadState("private");
+      showStatus("Public URL removed");
+    } catch (error) {
+      setUploadState(previousState === "done" || publicUrl ? "done" : "private");
+      throw error;
+    }
+  }, [assetId, publicUrl, showStatus, uploadState]);
+
   const copyPublicUrl = useCallback(async () => {
     const copied = await copyTextToClipboard(publicUrl);
     showStatus(copied ? "URL copied" : "Clipboard is not available in this webview.");
@@ -1154,6 +1173,7 @@ function useSnipCloudUpload({ imageVersion, localPath, name, showStatus }) {
   return {
     copyPublicUrl,
     deleteCloudUpload,
+    makePrivate,
     makePublic,
     uploadPercent,
     uploadState,
@@ -1592,6 +1612,7 @@ export function SnippingFloatWindow() {
   const {
     copyPublicUrl,
     deleteCloudUpload,
+    makePrivate,
     makePublic,
     uploadPercent,
     uploadState,
@@ -1653,6 +1674,8 @@ export function SnippingFloatWindow() {
         }
       } else if (action === "publish") {
         await makePublic();
+      } else if (action === "unpublish") {
+        await makePrivate();
       } else if (action === "deleteCloud") {
         await deleteCloudUpload();
       }
@@ -1672,6 +1695,7 @@ export function SnippingFloatWindow() {
     copyPublicUrl,
     deleteCloudUpload,
     localPath,
+    makePrivate,
     makePublic,
     name,
     previewUrl,
@@ -1804,6 +1828,19 @@ export function SnippingFloatWindow() {
               type="button"
             >
               {videoPlaying ? <Pause aria-hidden="true" /> : <PlayArrow aria-hidden="true" />}
+            </FloatUploadSideButton>
+          )}
+          {uploadState === "done" && (
+            <FloatUploadSideButton
+              aria-label={`Make ${name} private`}
+              data-primary="true"
+              disabled={busy || closing}
+              {...hoverControlProps("make-private")}
+              onClick={() => runAction("unpublish")}
+              title="Make private"
+              type="button"
+            >
+              <PublicOff aria-hidden="true" />
             </FloatUploadSideButton>
           )}
           {uploadState === "done" && (
@@ -2483,6 +2520,7 @@ function StripSnipTile({
   const {
     copyPublicUrl,
     deleteCloudUpload,
+    makePrivate,
     makePublic,
     uploadPercent,
     uploadState,
@@ -2539,6 +2577,8 @@ function StripSnipTile({
         }
       } else if (action === "publish") {
         await makePublic();
+      } else if (action === "unpublish") {
+        await makePrivate();
       } else if (action === "deleteCloud") {
         await deleteCloudUpload();
       }
@@ -2552,6 +2592,7 @@ function StripSnipTile({
     copyPublicUrl,
     deleteCloudUpload,
     localPath,
+    makePrivate,
     makePublic,
     name,
     onChanged,
@@ -2727,6 +2768,18 @@ function StripSnipTile({
         <PushPin aria-hidden="true" />
       </StripTilePinButton>
       <StripUploadControls data-state={uploadState}>
+        {uploadState === "done" && (
+          <StripUploadSideButton
+            aria-label={`Make ${name} private`}
+            data-primary="true"
+            disabled={busy}
+            onClick={() => runAction("unpublish")}
+            title="Make private"
+            type="button"
+          >
+            <PublicOff aria-hidden="true" />
+          </StripUploadSideButton>
+        )}
         {uploadState === "done" && (
           <StripUploadSideButton
             aria-label={`Remove Cloud upload of ${name}`}

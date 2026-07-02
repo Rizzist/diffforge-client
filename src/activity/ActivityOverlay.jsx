@@ -78,6 +78,9 @@ function dataValue(value) {
 function normalizeActivityOverlayContext(value) {
   const object = jsonObject(value) || {};
   return {
+    // Unknown (missing) means "assume available" so older payloads keep the
+    // sync UI; only an explicit false from the main window hides it.
+    cloudSyncAvailable: object.cloudSyncAvailable !== false && object.cloud_sync_available !== false,
     repoPath: text(object.repoPath || object.repo_path),
     workspaceId: text(object.workspaceId || object.workspace_id),
     workspaceName: text(object.workspaceName || object.workspace_name),
@@ -1551,13 +1554,16 @@ export function ActivityOverlayPanel({ embedded = false }) {
     () => normalizeTransferCards(data.library),
     [data.library],
   );
+  // Free plans cannot cloud-sync: the outbox only accumulates, so a "Syncing"
+  // badge and progress rows would spin forever. Hide all sync UI instead.
+  const cloudSyncAvailable = context.cloudSyncAvailable !== false;
   const syncCards = useMemo(
-    () => normalizeLiveSyncCards(data.cloudStatus),
-    [data.cloudStatus],
+    () => (cloudSyncAvailable ? normalizeLiveSyncCards(data.cloudStatus) : []),
+    [cloudSyncAvailable, data.cloudStatus],
   );
   const syncBadge = useMemo(
-    () => normalizeActivitySyncBadge(data.cloudStatus),
-    [data.cloudStatus],
+    () => (cloudSyncAvailable ? normalizeActivitySyncBadge(data.cloudStatus) : null),
+    [cloudSyncAvailable, data.cloudStatus],
   );
   const progressCards = useMemo(
     () => [...syncCards, ...transferCards],

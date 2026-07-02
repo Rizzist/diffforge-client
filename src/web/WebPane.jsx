@@ -196,6 +196,8 @@ export default function WebPane({
     onClearContext: webElementPicker.clearSelection,
     onClose: () => setAgentPromptOpen(false),
     onSubmit: onSubmitPanelAgentPrompt,
+    panelKind,
+    panelPaneId: paneId,
     targets: panelAgentPromptTargets,
   });
 

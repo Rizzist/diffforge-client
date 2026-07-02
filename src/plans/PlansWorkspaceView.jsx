@@ -303,8 +303,20 @@ function filterPlanSnapshotForSession(snapshot, sessionId) {
   };
 }
 
-function normalizeTerminalReceipts(receipts, paneId, options = {}) {
+// Pane ids embed the agent kind that was active at dispatch time
+// (workspace-terminal-<ws>-<index>-<agentKind>), so receipts recorded before an
+// agent switch live under a different suffix than the terminal's current pane
+// id. Strip the trailing agent segment so a terminal slot keeps its todo
+// history across agent changes.
+function terminalPaneIdentity(paneId) {
   const pane = cleanText(paneId);
+  if (!pane) return "";
+  const match = pane.match(/^(.*-\d+)-[a-z][a-z0-9_-]*$/i);
+  return match ? match[1] : pane;
+}
+
+function normalizeTerminalReceipts(receipts, paneId, options = {}) {
+  const pane = terminalPaneIdentity(paneId);
   const sessionId = cleanText(options.sessionId);
   if (!pane || !receipts || typeof receipts !== "object" || Array.isArray(receipts)) {
     return [];
@@ -312,7 +324,7 @@ function normalizeTerminalReceipts(receipts, paneId, options = {}) {
   return Object.entries(receipts)
     .map(([key, receipt]) => {
       if (!receipt || typeof receipt !== "object") return null;
-      if (cleanText(receipt.paneId || receipt.pane_id) !== pane) return null;
+      if (terminalPaneIdentity(receipt.paneId || receipt.pane_id) !== pane) return null;
       const receivedAtMs = Number(receipt.receivedAtMs) || 0;
       const updatedAtMs = Number(receipt.updatedAtMs) || receivedAtMs;
       if (!receivedAtMs && !updatedAtMs) return null;

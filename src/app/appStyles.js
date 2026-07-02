@@ -12012,6 +12012,10 @@ export const AudioLocalModelRow = styled.div`
   @media (max-width: 520px) {
     grid-template-columns: 1fr;
   }
+
+  @container (max-width: 430px) {
+    grid-template-columns: 1fr;
+  }
 `;
 
 export const AudioLocalModelCopy = styled.div`
@@ -12050,9 +12054,10 @@ export const AudioLocalModelMeta = styled.div`
 `;
 
 export const AudioLocalModelPill = styled.span`
-  display: inline-flex;
-  min-height: 20px;
-  align-items: center;
+  display: inline-block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
   padding: 0 7px;
   border: 1px solid var(--audio-border, rgba(125, 160, 205, 0.2));
   border-radius: 999px;
@@ -12060,6 +12065,8 @@ export const AudioLocalModelPill = styled.span`
   background: rgba(var(--audio-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.06);
   font-size: 10px;
   font-weight: 760;
+  line-height: 18px;
+  text-overflow: ellipsis;
   white-space: nowrap;
 
   &[data-tone="ready"] {
@@ -12102,6 +12109,7 @@ export const AudioLocalModelActions = styled.div`
 export const AudioProviderPanel = styled.section`
   display: grid;
   align-content: start;
+  container-type: inline-size;
   min-width: 0;
   gap: 10px;
   padding: 12px;
@@ -12132,10 +12140,15 @@ export const AudioRecorderActions = styled.div`
     min-height: 40px;
     min-width: 0;
     justify-content: center;
+    overflow: hidden;
     white-space: nowrap;
   }
 
   @media (max-width: 520px) {
+    grid-template-columns: 1fr;
+  }
+
+  @container (max-width: 340px) {
     grid-template-columns: 1fr;
   }
 `;
@@ -17093,6 +17106,7 @@ export const McpSwitchButton = styled.button`
 
   > span {
     position: relative;
+    flex: none;
     width: 28px;
     height: 16px;
     border-radius: 999px;

@@ -23,6 +23,7 @@ import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { MoveToInbox } from "@styled-icons/material-rounded/MoveToInbox";
 import { PinOff } from "@styled-icons/fluentui-system-regular/PinOff";
 import { Public } from "@styled-icons/material-rounded/Public";
+import { PublicOff } from "@styled-icons/material-rounded/PublicOff";
 import { PushPin } from "@styled-icons/material-rounded/PushPin";
 import { Settings } from "@styled-icons/material-rounded/Settings";
 import { CloudQueue } from "@styled-icons/material-rounded/CloudQueue";
@@ -1286,6 +1287,11 @@ function AssetsPanel({
             showAssetToast("error", "Copy failed", message, [publicUrl]);
           }
         }
+      } else if (action === "unpublish") {
+        const response = await invoke("cloud_mcp_unpublish_account_asset", {
+          assetId: id,
+        });
+        adoptAccountAssetsLibraryEvent(response);
       } else {
         const command = action === "upload"
           ? "cloud_mcp_upload_account_asset"
@@ -1315,6 +1321,8 @@ function AssetsPanel({
         showAssetToast("success", "Local copy deleted", availability?.hasCloud ? "Cloud copy is unchanged." : "Deleted local copy.", [name]);
       } else if (action === "deleteCloud") {
         showAssetToast("success", "Cloud copy deleted", availability?.hasLocal ? "Private and public Cloud copies were removed. Local copy is unchanged." : "Private and public Cloud copies were removed.", [name, selectedCloudLabel]);
+      } else if (action === "unpublish") {
+        showAssetToast("success", "Public URL removed", "Asset is private again. Cloud copy is unchanged.", [name]);
       }
     } catch (nextError) {
       if (action === "upload") {
@@ -1562,6 +1570,7 @@ function AssetsPanel({
             const copyBusy = busyKey === `copy:${id}`;
             const copyPublicBusy = busyKey === `copyPublic:${id}`;
             const publishBusy = busyKey === `publish:${id}`;
+            const unpublishBusy = busyKey === `unpublish:${id}`;
             const pinBusy = busyKey === `pin:${id}`;
             const untrackBusy = busyKey === `untrack:${id}`;
             const canUpload = canRunAssetAction && !transferActive && availability.hasLocal && !availability.hasCloud && Boolean(localPath);
@@ -1569,6 +1578,7 @@ function AssetsPanel({
             const canDeleteCloud = canRunAssetAction && !transferActive && availability.hasCloud;
             const canDeleteLocal = canRunAssetAction && !transferActive && availability.hasLocal && Boolean(localPath);
             const canPublish = canRunAssetAction && !transferActive && availability.hasCloud && !isPublic;
+            const canUnpublish = canRunAssetAction && !transferActive && isPublic;
             const canCopyPublic = isPublic;
             const canView = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
             const canCopy = availability.hasLocal && assetIsImage(asset) && Boolean(localPath);
@@ -1732,6 +1742,19 @@ function AssetsPanel({
                       >
                         <Link aria-hidden="true" />
                         <span>Copy URL</span>
+                      </AssetShareButton>
+                    )}
+                    {isPublic && (
+                      <AssetShareButton
+                        aria-label={`Make ${name} private`}
+                        data-warning="true"
+                        disabled={!canUnpublish || unpublishBusy || Boolean(busyKey && !unpublishBusy)}
+                        onClick={() => runAssetAction("unpublish", asset)}
+                        title="Make private"
+                        type="button"
+                      >
+                        <PublicOff aria-hidden="true" />
+                        <span>Make private</span>
                       </AssetShareButton>
                     )}
                   </AssetShareActions>

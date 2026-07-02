@@ -10692,6 +10692,25 @@ async fn snipping_publish_uploaded_asset(
 }
 
 #[tauri::command]
+async fn snipping_unpublish_uploaded_asset(
+    app: AppHandle,
+    request: SnippingPublishAssetRequest,
+) -> Result<Value, String> {
+    let asset_id = request.asset_id.trim().to_string();
+    if asset_id.is_empty() {
+        return Err("An asset id is required to make a snip private.".to_string());
+    }
+    let unpublished =
+        cloud_mcp_unpublish_account_asset(app.state::<CloudMcpState>(), asset_id.clone()).await?;
+    Ok(json!({
+        "kind": "snip_unpublished",
+        "asset_id": asset_id.clone(),
+        "assetId": asset_id,
+        "unpublished": unpublished,
+    }))
+}
+
+#[tauri::command]
 async fn snipping_delete_uploaded_asset_from_cloud(
     app: AppHandle,
     request: SnippingPublishAssetRequest,

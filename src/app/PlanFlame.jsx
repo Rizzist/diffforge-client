@@ -9,7 +9,11 @@ export const PLAN_FLAME_OPTIONS = [
 ];
 
 const PLAN_FLAME_KEYS = new Set(PLAN_FLAME_OPTIONS.map((option) => option.key));
+const PLAN_FLAME_OPTION_RANKS = new Map(
+  PLAN_FLAME_OPTIONS.map((option, index) => [option.key, index]),
+);
 const PLAN_FLAME_REVEAL_DELAY_MS = 180;
+const PLAN_FLAME_EXIT_DURATION_MS = 1500;
 const PLAN_FLAME_ANIMATION_STORAGE_KEY = "diffforge.planFlame.animationEnabled";
 
 // quality.ratio caps the render pixel ratio, quality.octaves the noise depth,
@@ -361,6 +365,19 @@ export function normalizePlanFlameKey(plan, fallback = "") {
   return PLAN_FLAME_KEYS.has(key) ? key : fallback;
 }
 
+function planFlamePreviewOptionsForPlan(plan) {
+  const planKey = normalizePlanFlameKey(plan);
+  const planRank = PLAN_FLAME_OPTION_RANKS.get(planKey);
+
+  if (!Number.isInteger(planRank) || planRank <= 0) {
+    return [];
+  }
+
+  return PLAN_FLAME_OPTIONS.slice(0, planRank + 1);
+}
+
+function ignoreFlameReady() {}
+
 function FlameShaderCanvas({ active, preset, planKey, onReady }) {
   const canvasRef = useRef(null);
 
@@ -620,9 +637,10 @@ export function PlanFlame({ active = true, plan, showControls = false }) {
   const planKey = normalizePlanFlameKey(plan);
   const [previewPlan, setPreviewPlan] = useState(planKey);
   const [shaderReady, setShaderReady] = useState(false);
-  const [flameMounted, setFlameMounted] = useState(false);
-  const [flameVisible, setFlameVisible] = useState(false);
+  const [flameLayers, setFlameLayers] = useState([]);
   const [animationEnabled, setAnimationEnabled] = useState(readPlanFlameAnimationEnabled);
+  const flameLayerSequenceRef = useRef(0);
+  const activeFlameLayerRef = useRef(null);
   const [pageVisible, setPageVisible] = useState(() => (
     typeof document === "undefined" || document.visibilityState !== "hidden"
   ));
@@ -648,10 +666,13 @@ export function PlanFlame({ active = true, plan, showControls = false }) {
     };
   }, []);
 
-  const activePlan = normalizePlanFlameKey(previewPlan, planKey);
+  const planPreviewOptions = planFlamePreviewOptionsForPlan(planKey);
+  const previewPlanAllowed = planPreviewOptions.some((option) => option.key === previewPlan);
+  const activePlan = normalizePlanFlameKey(previewPlanAllowed ? previewPlan : "", planKey);
   const preset = PLAN_FLAME_PRESETS[activePlan];
   const flameActive = Boolean(active && pageVisible && preset);
-  const fireVisible = Boolean(flameVisible && animationEnabled);
+  const activeLayerVisible = flameLayers.some((layer) => layer.active && layer.visible);
+  const showPlanSwitch = Boolean(animationEnabled && planPreviewOptions.length > 1);
   const animationToggleLabel = animationEnabled
     ? "Hide fire animation"
     : "Show fire animation";
@@ -678,61 +699,126 @@ export function PlanFlame({ active = true, plan, showControls = false }) {
   useEffect(() => {
     let revealTimer = 0;
     let frame = 0;
+    let cleanupTimer = 0;
 
     if (!flameActive) {
-      setFlameVisible(false);
-      setFlameMounted(false);
       setShaderReady(false);
-      return undefined;
+      activeFlameLayerRef.current = null;
+      setFlameLayers((layers) => layers.map((layer) => ({
+        ...layer,
+        active: false,
+        visible: false,
+      })));
+      cleanupTimer = window.setTimeout(() => {
+        setFlameLayers([]);
+      }, PLAN_FLAME_EXIT_DURATION_MS);
+      return () => {
+        window.clearTimeout(cleanupTimer);
+      };
     }
 
-    setFlameVisible(false);
-    setFlameMounted(false);
     setShaderReady(false);
+    let targetLayerId = activeFlameLayerRef.current?.planKey === activePlan
+      ? activeFlameLayerRef.current.id
+      : "";
+
+    if (targetLayerId) {
+      setFlameLayers((layers) => layers.map((layer) => (
+        layer.id === targetLayerId
+          ? { ...layer, active: true, visible: false }
+          : { ...layer, active: false, visible: false }
+      )));
+    } else {
+      targetLayerId = `${activePlan}-${flameLayerSequenceRef.current += 1}`;
+      activeFlameLayerRef.current = { id: targetLayerId, planKey: activePlan };
+      setFlameLayers((layers) => [
+        ...layers.map((layer) => ({
+          ...layer,
+          active: false,
+          visible: false,
+        })).slice(-1),
+        {
+          id: targetLayerId,
+          planKey: activePlan,
+          active: true,
+          visible: false,
+        },
+      ]);
+    }
+
     revealTimer = window.setTimeout(() => {
-      setFlameMounted(true);
       frame = window.requestAnimationFrame(() => {
-        setFlameVisible(true);
+        setFlameLayers((layers) => layers.map((layer) => (
+          layer.id === targetLayerId
+            ? { ...layer, visible: true }
+            : layer
+        )));
       });
     }, PLAN_FLAME_REVEAL_DELAY_MS);
+    cleanupTimer = window.setTimeout(() => {
+      setFlameLayers((layers) => layers.filter((layer) => layer.active || layer.visible));
+    }, PLAN_FLAME_EXIT_DURATION_MS);
 
     return () => {
       window.clearTimeout(revealTimer);
+      window.clearTimeout(cleanupTimer);
       if (frame) {
         window.cancelAnimationFrame(frame);
       }
     };
   }, [activePlan, flameActive]);
 
-  if (!preset) return null;
-  if (!flameMounted) return null;
+  if (flameLayers.length === 0) return null;
 
   return (
     <>
-      <FlameStage
-        aria-hidden="true"
-        data-plan={activePlan}
-        data-ready={shaderReady ? "true" : "false"}
-        data-visible={fireVisible ? "true" : "false"}
-        style={flameVars}
-      >
-        <FlameBackdrop />
-        {animationEnabled && (
-          <FlameShaderCanvas
-            active={fireVisible}
-            key={activePlan}
-            onReady={setShaderReady}
-            planKey={activePlan}
-            preset={preset}
-          />
-        )}
-        <FlameFallback
-          data-animated={animationEnabled ? "true" : "false"}
-          data-ready={shaderReady ? "true" : "false"}
-        />
-      </FlameStage>
+      {flameLayers.map((layer) => {
+        const layerPreset = PLAN_FLAME_PRESETS[layer.planKey];
+        if (!layerPreset) {
+          return null;
+        }
+
+        const isActiveLayer = layer.active && layer.planKey === activePlan;
+        const layerFireVisible = Boolean(layer.visible && animationEnabled);
+        const layerShaderReady = Boolean(isActiveLayer ? shaderReady : animationEnabled);
+        const layerVars = {
+          "--flame-glow": layerPreset.glow,
+          "--flame-h": `${layerPreset.height}px`,
+          "--flame-heat": layerPreset.heat,
+        };
+
+        return (
+          <FlameStage
+            aria-hidden="true"
+            data-plan={layer.planKey}
+            data-ready={layerShaderReady ? "true" : "false"}
+            data-transition={isActiveLayer ? "entering" : "exiting"}
+            data-visible={layerFireVisible ? "true" : "false"}
+            key={layer.id}
+            style={layerVars}
+          >
+            <FlameBackdrop />
+            {animationEnabled && (
+              <FlameShaderCanvas
+                active={layerFireVisible}
+                key={layer.planKey}
+                onReady={isActiveLayer ? setShaderReady : ignoreFlameReady}
+                planKey={layer.planKey}
+                preset={layerPreset}
+              />
+            )}
+            <FlameFallback
+              data-animated={animationEnabled ? "true" : "false"}
+              data-ready={layerShaderReady ? "true" : "false"}
+            />
+          </FlameStage>
+        );
+      })}
       {showControls && (
-        <FlameControls data-visible={flameVisible ? "true" : "false"} style={flameVars}>
+        <FlameControls
+          data-visible={activeLayerVisible ? "true" : "false"}
+          style={flameVars}
+        >
           <FlameAnimationToggle
             aria-checked={animationEnabled}
             aria-label={animationToggleLabel}
@@ -741,9 +827,9 @@ export function PlanFlame({ active = true, plan, showControls = false }) {
             title={animationToggleLabel}
             type="button"
           />
-          {animationEnabled && (
+          {showPlanSwitch && (
             <FlameSwitch aria-label="Switch fire plan preview">
-              {PLAN_FLAME_OPTIONS.map((option) => (
+              {planPreviewOptions.map((option) => (
                 <FlameSwitchButton
                   aria-label={`Preview ${option.label} fire`}
                   data-active={activePlan === option.key}

@@ -903,6 +903,8 @@ export function useWebAgentPromptOverlay({
   onClearContext = null,
   onClose = null,
   onSubmit = null,
+  panelKind = "",
+  panelPaneId = "",
   targets = [],
   windowId = "",
 } = {}) {
@@ -912,6 +914,8 @@ export function useWebAgentPromptOverlay({
   const contextRefsRef = useRef(contextRefs);
   const defaultSelectedTargetIdsRef = useRef(defaultSelectedTargetIds);
   const evaluateRef = useRef(evaluate);
+  const panelKindRef = useRef(panelKind);
+  const panelPaneIdRef = useRef(panelPaneId);
   const submitRef = useRef(onSubmit);
   const targetsRef = useRef(targets);
   const windowIdRef = useRef(windowId);
@@ -922,6 +926,8 @@ export function useWebAgentPromptOverlay({
   contextRefsRef.current = contextRefs;
   defaultSelectedTargetIdsRef.current = defaultSelectedTargetIds;
   evaluateRef.current = evaluate;
+  panelKindRef.current = panelKind;
+  panelPaneIdRef.current = panelPaneId;
   submitRef.current = onSubmit;
   targetsRef.current = targets;
   windowIdRef.current = windowId;
@@ -1019,6 +1025,8 @@ export function useWebAgentPromptOverlay({
           try {
             await submitRef.current?.({
               contextRefs: contextRefsRef.current,
+              panelKind: panelKindRef.current,
+              panelPaneId: panelPaneIdRef.current,
               targetIds,
               targetTerminalIndexes,
               text,

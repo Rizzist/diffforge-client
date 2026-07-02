@@ -2980,7 +2980,7 @@ function refreshTokenomicsSummaryIfStale({ force = false } = {}) {
   return loadTokenomicsStore({ force: true, summaryOnly: true });
 }
 
-function refreshVisibleTokenomicsLimits({ force = false, forceProviderRefresh = false } = {}) {
+function refreshVisibleTokenomicsLimits({ force = false, forceProviderRefresh = true } = {}) {
   return refreshTokenomicsLiveLimits({ force, forceProviderRefresh, syncLimitChanges: true })
     .finally(() => {
       void refreshTokenomicsSummaryIfStale();
@@ -3054,7 +3054,11 @@ function loadTokenomicsStore({
   tokenomicsStore.loadPromise = (async () => {
     try {
       if (shouldScan) {
-        void refreshTokenomicsLiveLimits({ force: true, syncLimitChanges: true });
+        void refreshTokenomicsLiveLimits({
+          force: true,
+          forceProviderRefresh: true,
+          syncLimitChanges: true,
+        });
       }
 
       const next = forceResync
@@ -3121,7 +3125,11 @@ export function warmAccountTokenomics({ accountKey = "", scan = false } = {}) {
           scan: true,
         }).finally(() => {
           if (tokenomicsStore.requestEpoch === requestEpoch) {
-            void refreshTokenomicsLiveLimits({ force: true, syncLimitChanges: true });
+            void refreshTokenomicsLiveLimits({
+              force: true,
+              forceProviderRefresh: true,
+              syncLimitChanges: true,
+            });
           }
         });
       }, { delayMs: 120, timeout: 1500 });

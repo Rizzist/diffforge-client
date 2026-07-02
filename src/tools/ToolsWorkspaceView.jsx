@@ -1530,6 +1530,7 @@ function ToolsHydrationProgress({ placement = "panel", progress }) {
 }
 
 export default function ToolsWorkspaceView({
+  agentPromptWorkspaceId = "",
   embeddedDocsOpenRequest = null,
   embeddedDocsPanel = false,
   embeddedDocsWindowOpenRequest = null,
@@ -1706,6 +1707,9 @@ export default function ToolsWorkspaceView({
   const [skillsQuery, setSkillsQuery] = useState("");
   const [templateQuery, setTemplateQuery] = useState("");
   const [newDocDraft, setNewDocDraft] = useState({ createKind: "document", folderPath: "", name: "", type: "document" });
+  // In the embedded docs panel there is no side-by-side editor column, so the
+  // create form takes over the single column (tree ⇄ create swap) when armed.
+  const [docsCreateActive, setDocsCreateActive] = useState(false);
   const [documentDraft, setDocumentDraft] = useState(() => getWorkspaceToolsDocumentDraft());
   const [documentDrafts, setDocumentDrafts] = useState(() => getWorkspaceToolsDocumentDrafts());
   const [documentDraftApplyTick, setDocumentDraftApplyTick] = useState(0);
@@ -2956,6 +2960,7 @@ export default function ToolsWorkspaceView({
       createKind: "document",
       folderPath,
     }));
+    setDocsCreateActive(true);
   }, [closeDocsContextMenu, docsContextMenu]);
 
   const beginContextCreateFolder = useCallback((target = docsContextMenu?.target || {}) => {
@@ -2968,6 +2973,7 @@ export default function ToolsWorkspaceView({
       createKind: "folder",
       folderPath,
     }));
+    setDocsCreateActive(true);
   }, [closeDocsContextMenu, docsContextMenu]);
 
   const createDocumentFolder = useCallback((parentPathInput = "", folderNameInput = "") => {
@@ -3002,6 +3008,7 @@ export default function ToolsWorkspaceView({
       name: "",
       folderPath,
     }));
+    setDocsCreateActive(false);
     return true;
   }, [persistSkillsLibrary, skillsLibrary.skills]);
 
@@ -3695,6 +3702,7 @@ export default function ToolsWorkspaceView({
     setSkillEditor(draftEditor);
     setWorkspaceToolsDocumentDraft(editorDraftSnapshot(draftEditor, "", null));
     setNewDocDraft((current) => ({ ...current, createKind: "document", name: "" }));
+    setDocsCreateActive(false);
   }, [createDocumentFolder, newDocDraft, skillsLibrary.skills]);
 
 	  useEffect(() => {
@@ -4812,6 +4820,7 @@ export default function ToolsWorkspaceView({
         title: text(scriptEditor?.title, "Script"),
         updatedAtMs: Date.now(),
         windowId: breakout.label,
+        workspaceId: text(agentPromptWorkspaceId),
       };
     }
     return {
@@ -4834,8 +4843,10 @@ export default function ToolsWorkspaceView({
       title: text(skillEditor?.title, "Document"),
       updatedAtMs: Date.now(),
       windowId: breakout.label,
+      workspaceId: text(agentPromptWorkspaceId),
     };
   }, [
+    agentPromptWorkspaceId,
     scriptEditor,
     scriptEditorBusy,
     scriptEditorKey,
@@ -5220,8 +5231,8 @@ export default function ToolsWorkspaceView({
 
   const docsCreateMode = !skillEditor;
   const showDocsTemplatesPane = docsCreateMode && !rightToolsOrchestratorOpen;
-  const embeddedDocsShowExplorer = embeddedDocsPanel ? !skillEditor : !docsExplorerCollapsed;
-  const embeddedDocsShowEditor = !embeddedDocsPanel || Boolean(skillEditor);
+  const embeddedDocsShowExplorer = embeddedDocsPanel ? !skillEditor && !docsCreateActive : !docsExplorerCollapsed;
+  const embeddedDocsShowEditor = !embeddedDocsPanel || Boolean(skillEditor) || docsCreateActive;
   const embeddedDocsShowTemplates = !embeddedDocsPanel && showDocsTemplatesPane;
   const preservedSkillEditorSelection = useMemo(() => {
     if (!skillEditor || !lastDocumentSelection) return null;
@@ -5666,6 +5677,7 @@ export default function ToolsWorkspaceView({
                                         kind: "document",
                                       })}
                                       onClick={() => {
+                                        setDocsCreateActive(false);
                                         if (row.isDraft) {
                                             const draftDocument = row.draftDocument
                                               ? { ...row.draftDocument, selectedKey: row.draftSelectedKey || row.key }
@@ -6044,6 +6056,15 @@ export default function ToolsWorkspaceView({
                       >
                         {text(newDocDraft.createKind, "document") === "folder" ? "Create folder" : "Create doc"}
                       </ToolsPrimaryButton>
+                      {embeddedDocsPanel ? (
+                        <ToolsGhostButton
+                          onClick={() => setDocsCreateActive(false)}
+                          type="button"
+                        >
+                          <span className="codicon codicon-arrow-left" aria-hidden="true" />
+                          Back to docs
+                        </ToolsGhostButton>
+                      ) : null}
                     </DocsCreateModal>
                   )}
                     </DocsCenterPane>

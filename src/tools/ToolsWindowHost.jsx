@@ -7,12 +7,24 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 
 import { GlobalStyle } from "../app/appStyles.js";
+import PanelAgentPromptActivity from "../terminals/PanelAgentPromptActivity.jsx";
+import PanelAgentPromptComposer from "../terminals/PanelAgentPromptComposer.jsx";
+import {
+  PANEL_AGENT_PROMPT_ACTIVITY_EVENT,
+  PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT,
+  PANEL_AGENT_PROMPT_RESULT_EVENT,
+  PANEL_AGENT_PROMPT_SUBMIT_EVENT,
+  PANEL_AGENT_PROMPT_TARGETS_EVENT,
+  PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT,
+  createPanelAgentPromptRequestId,
+  normalizePanelAgentPromptActivityItems,
+  normalizePanelAgentPromptTargets,
+} from "../terminals/panelAgentPromptBridge.js";
 import {
   TOOLS_WINDOW_CLOSED_EVENT,
   TOOLS_WINDOW_AGENT_COMPANION_CLOSE,
   TOOLS_WINDOW_AGENT_COMPANION_EVENT,
   TOOLS_WINDOW_AGENT_COMPANION_FOCUS,
-  TOOLS_WINDOW_AGENT_COMPANION_OPEN,
   TOOLS_WINDOW_CONTROL_CLOSE,
   TOOLS_WINDOW_CONTROL_DELETE,
   TOOLS_WINDOW_CONTROL_DISCARD,
@@ -312,6 +324,15 @@ export default function ToolsWindowHost() {
   const canvasRef = useRef(null);
   const lastLocalEditAtRef = useRef(0);
   const pendingContentRef = useRef("");
+  const [agentPromptTargets, setAgentPromptTargets] = useState([]);
+  const [defaultAgentPromptTargetIds, setDefaultAgentPromptTargetIds] = useState([]);
+  const [agentPromptActivityItems, setAgentPromptActivityItems] = useState([]);
+  const [agentWorkspaceId, setAgentWorkspaceId] = useState("");
+  const [docSelection, setDocSelection] = useState(null);
+  const agentWorkspaceIdRef = useRef("");
+  const agentPromptTargetsRequestIdRef = useRef("");
+  agentWorkspaceIdRef.current = agentWorkspaceId;
+  const agentPaneId = `tools-window-${params.windowId || params.key || "popout"}`;
 
   useEffect(() => {
     document.documentElement.dataset.toolsWindow = "true";
@@ -326,6 +347,12 @@ export default function ToolsWindowHost() {
   useEffect(() => {
     writeStoredTheme(params.mode, theme);
   }, [params.mode, theme]);
+
+  // The agent composer and activity chips style themselves off the app-wide
+  // forge theme attribute; mirror the window theme onto it.
+  useEffect(() => {
+    document.documentElement.dataset.forgeTheme = theme === "light" ? "light" : "dark";
+  }, [theme]);
 
   const requestMeta = useCallback(() => {
     emit(TOOLS_WINDOW_META_REQUEST_EVENT, {
@@ -466,6 +493,216 @@ export default function ToolsWindowHost() {
     };
   }, [params.key, params.mode, params.windowId]);
 
+  // The owner stamps its workspace id into the meta stream; adopt it so the
+  // orchestrator bridge talks to exactly one TerminalView instance.
+  useEffect(() => {
+    const metaWorkspaceId = text(meta?.workspaceId || meta?.workspace_id);
+    if (metaWorkspaceId) {
+      setAgentWorkspaceId(metaWorkspaceId);
+    }
+  }, [meta]);
+
+  const docIdentity = text(meta?.pathKey || meta?.documentKey || meta?.scriptKey || params.key);
+  useEffect(() => {
+    setDocSelection(null);
+  }, [docIdentity]);
+
+  const requestAgentPromptTargets = useCallback(() => {
+    const requestId = createPanelAgentPromptRequestId("tools-window-targets");
+    agentPromptTargetsRequestIdRef.current = requestId;
+    emit(PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT, {
+      panelKind: "docs",
+      paneId: agentPaneId,
+      requestId,
+      windowId: params.windowId,
+      workspaceId: agentWorkspaceIdRef.current,
+    }).catch(() => {});
+  }, [agentPaneId, params.windowId]);
+
+  const requestAgentPromptActivity = useCallback(() => {
+    emit(PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT, {
+      panelKind: "docs",
+      paneId: agentPaneId,
+      windowId: params.windowId,
+      workspaceId: agentWorkspaceIdRef.current,
+    }).catch(() => {});
+  }, [agentPaneId, params.windowId]);
+
+  useEffect(() => {
+    requestAgentPromptTargets();
+    requestAgentPromptActivity();
+    const intervalId = window.setInterval(requestAgentPromptTargets, 15000);
+    return () => window.clearInterval(intervalId);
+  }, [agentWorkspaceId, requestAgentPromptActivity, requestAgentPromptTargets]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(PANEL_AGENT_PROMPT_TARGETS_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const requestId = String(payload.requestId || payload.request_id || "").trim();
+      if (requestId && requestId !== agentPromptTargetsRequestIdRef.current) {
+        return;
+      }
+      const windowId = String(payload.windowId || payload.window_id || "").trim();
+      if (windowId && windowId !== params.windowId) {
+        return;
+      }
+      const payloadWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      if (agentWorkspaceIdRef.current && payloadWorkspaceId && payloadWorkspaceId !== agentWorkspaceIdRef.current) {
+        return;
+      }
+      if (!agentWorkspaceIdRef.current && payloadWorkspaceId) {
+        setAgentWorkspaceId(payloadWorkspaceId);
+      }
+      setAgentPromptTargets(normalizePanelAgentPromptTargets(payload.targets));
+      setDefaultAgentPromptTargetIds(
+        (Array.isArray(payload.defaultSelectedTargetIds)
+          ? payload.defaultSelectedTargetIds
+          : Array.isArray(payload.default_selected_target_ids)
+            ? payload.default_selected_target_ids
+            : []
+        ).map((id) => String(id || "").trim()).filter(Boolean),
+      );
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [params.windowId]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(PANEL_AGENT_PROMPT_ACTIVITY_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const paneId = String(payload.paneId || payload.pane_id || payload.panelPaneId || payload.panel_pane_id || "").trim();
+      if (!paneId || paneId !== agentPaneId) {
+        return;
+      }
+      const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+      if (workspaceId && agentWorkspaceIdRef.current && workspaceId !== agentWorkspaceIdRef.current) {
+        return;
+      }
+      setAgentPromptActivityItems(normalizePanelAgentPromptActivityItems(payload.items));
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+        } else {
+          unlisten = nextUnlisten;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [agentPaneId]);
+
+  const submitAgentPrompt = useCallback(async ({ targetIds, targetTerminalIndexes, text: promptText }) => {
+    const requestId = createPanelAgentPromptRequestId("tools-window-submit");
+    const script = params.mode === "scripts";
+    const docTitle = text(localTitle, script ? "Script" : "Document");
+    const docPath = text(meta?.subtitle || meta?.pathKey || meta?.documentKey || meta?.scriptKey);
+    const docLabel = `${script ? "Script" : "Document"} "${docTitle}"${docPath ? ` (${docPath})` : ""}`;
+    const selectionText = String(docSelection?.text || "").trim();
+    const excerpt = selectionText.length > 1600
+      ? `${selectionText.slice(0, 1599).trimEnd()}…`
+      : selectionText;
+    const finalText = excerpt
+      ? `${String(promptText || "").trim()}\n\n${docLabel} — selected excerpt (characters ${docSelection.start}-${docSelection.end}):\n"""\n${excerpt}\n"""`
+      : `${String(promptText || "").trim()}\n\nContext: ${docLabel}.`;
+    let unlisten = () => {};
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        settled = true;
+        unlisten();
+      };
+      const timeoutId = window.setTimeout(() => {
+        if (settled) {
+          return;
+        }
+        cleanup();
+        reject(new Error("Timed out sending prompt."));
+      }, 15000);
+      listen(PANEL_AGENT_PROMPT_RESULT_EVENT, (event) => {
+        const payload = event?.payload || {};
+        if (String(payload.requestId || payload.request_id || "").trim() !== requestId) {
+          return;
+        }
+        const windowId = String(payload.windowId || payload.window_id || "").trim();
+        if (windowId && windowId !== params.windowId) {
+          return;
+        }
+        window.clearTimeout(timeoutId);
+        cleanup();
+        if (payload.ok === true) {
+          resolve(payload);
+        } else {
+          reject(new Error(String(payload.error || "Unable to send prompt.")));
+        }
+      })
+        .then((nextUnlisten) => {
+          if (settled) {
+            nextUnlisten();
+          } else {
+            unlisten = nextUnlisten;
+            emit(PANEL_AGENT_PROMPT_SUBMIT_EVENT, {
+              panelKind: "docs",
+              paneId: agentPaneId,
+              requestId,
+              targetIds,
+              targetTerminalIndexes,
+              text: finalText,
+              windowId: params.windowId,
+              workspaceId: agentWorkspaceIdRef.current,
+            }).catch((error) => {
+              window.clearTimeout(timeoutId);
+              cleanup();
+              reject(error);
+            });
+          }
+        })
+        .catch((error) => {
+          window.clearTimeout(timeoutId);
+          cleanup();
+          reject(error);
+        });
+    });
+  }, [agentPaneId, docSelection, localTitle, meta, params.mode, params.windowId]);
+
+  const handlePageSelectionChange = useCallback((page, element) => {
+    if (!element) {
+      return;
+    }
+    const start = Number(element.selectionStart) || 0;
+    const end = Number(element.selectionEnd) || 0;
+    if (end > start) {
+      setDocSelection({
+        end: page.start + end,
+        page: page.index + 1,
+        start: page.start + start,
+        text: String(element.value || "").slice(start, end),
+      });
+    }
+  }, []);
+
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas || typeof window === "undefined") return undefined;
@@ -476,7 +713,10 @@ export default function ToolsWindowHost() {
       const widthScale = Math.max(PAGE_MIN_SCALE, (bounds.width - PAGE_INLINE_GUTTER) / A4_WIDTH);
       const heightScale = Math.max(PAGE_MIN_SCALE, (bounds.height - PAGE_VERTICAL_GUTTER) / A4_HEIGHT);
       const nextScale = Math.min(PAGE_MAX_SCALE, widthScale, heightScale);
-      setFitScale((current) => (Math.abs(current - nextScale) < 0.005 ? current : nextScale));
+      // The hysteresis must exceed the scale delta a classic scrollbar's
+      // appearance causes (~15px / A4 width ≈ 0.019), or fit-to-width and the
+      // scrollbar toggle each other forever.
+      setFitScale((current) => (Math.abs(current - nextScale) < 0.025 ? current : nextScale));
     };
     const schedule = () => {
       if (frame) window.cancelAnimationFrame(frame);
@@ -555,12 +795,8 @@ export default function ToolsWindowHost() {
       }
     }
     const finalFrameState = await refreshWindowFrameState();
-    const finalMaximized = finalFrameState?.expanded ?? nextMaximized;
-    setMaximized(finalMaximized);
-    sendAgentCompanion(finalMaximized
-      ? TOOLS_WINDOW_AGENT_COMPANION_OPEN
-      : TOOLS_WINDOW_AGENT_COMPANION_CLOSE);
-  }, [currentWindow, maximized, refreshWindowFrameState, sendAgentCompanion]);
+    setMaximized(finalFrameState?.expanded ?? nextMaximized);
+  }, [currentWindow, maximized, refreshWindowFrameState]);
 
   const zoomIn = useCallback(() => {
     setZoomFactor((current) => clampZoomFactor(current * ZOOM_STEP));
@@ -714,7 +950,7 @@ export default function ToolsWindowHost() {
 
         {meta?.error || localError ? <ToolsWindowError role="alert">{String(meta?.error || localError)}</ToolsWindowError> : null}
 
-        <ToolsWindowMain data-agent-dock={maximized ? "true" : "false"}>
+        <ToolsWindowMain>
           <ToolsWindowCanvas
             onWheel={handleCanvasWheel}
             ref={canvasRef}
@@ -739,6 +975,7 @@ export default function ToolsWindowHost() {
                     ) : null}
                     <ToolsWindowBodyTextarea
                       aria-label={`${isScript ? "Script" : "Document"} content page ${page.index + 1}`}
+                      onSelect={(event) => handlePageSelectionChange(page, event.target)}
                       onChange={(event) => {
                         const nextContent = replacePageContent(localContent, page, event.target.value);
                         setLocalContent(nextContent);
@@ -761,34 +998,54 @@ export default function ToolsWindowHost() {
               </ToolsWindowEmpty>
             )}
           </ToolsWindowCanvas>
-          {maximized ? (
-            <ToolsWindowAgentDock>
-              <ToolsWindowAgentDockHeader>
+          <ToolsWindowAgentDock>
+            <ToolsWindowAgentDockHeader>
+              <div>
                 <strong>Agent</strong>
                 <span>Terminal orchestrator</span>
-              </ToolsWindowAgentDockHeader>
-              <ToolsWindowAgentDockStatus>
-                <span />
-                <strong>Companion</strong>
-              </ToolsWindowAgentDockStatus>
-              <ToolsWindowAgentDockActions>
-                <ToolsWindowTopButton
-                  data-tools-window-control="true"
-                  onClick={() => sendAgentCompanion(TOOLS_WINDOW_AGENT_COMPANION_FOCUS)}
-                  type="button"
-                >
-                  Focus
-                </ToolsWindowTopButton>
-                <ToolsWindowTopButton
-                  data-tools-window-control="true"
-                  onClick={() => sendAgentCompanion(TOOLS_WINDOW_AGENT_COMPANION_OPEN)}
-                  type="button"
-                >
-                  Open
-                </ToolsWindowTopButton>
-              </ToolsWindowAgentDockActions>
-            </ToolsWindowAgentDock>
-          ) : null}
+              </div>
+              <ToolsWindowIconButton
+                aria-label="Open terminal window"
+                data-tools-window-control="true"
+                onClick={() => sendAgentCompanion(TOOLS_WINDOW_AGENT_COMPANION_FOCUS)}
+                title="Open terminal window"
+                type="button"
+              >
+                <span className="codicon codicon-terminal" aria-hidden="true" />
+              </ToolsWindowIconButton>
+            </ToolsWindowAgentDockHeader>
+            <ToolsWindowAgentDockBody>
+              <PanelAgentPromptActivity items={agentPromptActivityItems} />
+              {docSelection ? (
+                <ToolsWindowSelectionChip>
+                  <strong>{`Selection · page ${docSelection.page}`}</strong>
+                  <span>{docSelection.text}</span>
+                  <button
+                    aria-label="Clear selection"
+                    onClick={() => setDocSelection(null)}
+                    title="Clear selection"
+                    type="button"
+                  >
+                    <span className="codicon codicon-close" aria-hidden="true" />
+                  </button>
+                </ToolsWindowSelectionChip>
+              ) : (
+                <ToolsWindowAgentDockHint>
+                  Highlight text in the {isScript ? "script" : "document"} to attach it to your prompt.
+                </ToolsWindowAgentDockHint>
+              )}
+            </ToolsWindowAgentDockBody>
+            <ToolsWindowAgentComposerSlot>
+              <PanelAgentPromptComposer
+                defaultSelectedTargetIds={defaultAgentPromptTargetIds}
+                onSubmit={submitAgentPrompt}
+                panelKind="docs"
+                panelPaneId={agentPaneId}
+                targets={agentPromptTargets}
+                windowId={params.windowId}
+              />
+            </ToolsWindowAgentComposerSlot>
+          </ToolsWindowAgentDock>
         </ToolsWindowMain>
       </ToolsWindowShell>
     </>
@@ -860,7 +1117,7 @@ const ToolsWindowTitleBar = styled.header`
   min-width: 0;
   align-items: center;
   gap: 12px;
-  padding: 10px 12px 8px;
+  padding: 8px 12px 6px;
   border-bottom: 1px solid rgba(var(--tools-window-accent-rgb), 0.11);
   background: rgba(0, 0, 0, 0.2);
   user-select: none;
@@ -941,7 +1198,7 @@ const ToolsWindowToolbar = styled.div`
   grid-template-columns: max-content minmax(150px, 1fr) max-content;
   align-items: center;
   gap: 10px;
-  padding: 10px 14px;
+  padding: 6px 12px;
   border-bottom: 1px solid rgba(var(--tools-window-accent-rgb), 0.1);
 
   @media (max-width: 760px) {
@@ -1068,17 +1325,27 @@ const ToolsWindowCanvas = styled.section`
   overflow: auto;
   padding: 34px;
   overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 `;
 
 const ToolsWindowMain = styled.div`
   display: grid;
-  grid-template-columns: minmax(0, 1fr);
+  /* Pin to the shell's 1fr row: without an error banner only three children
+     render, and auto-placement would drop this into an auto row sized by its
+     own content — the canvas height then tracks the zoomed pages and the
+     fit-to-height effect chases itself between two zoom states forever. */
+  grid-row: 4 / 5;
+  grid-template-columns: minmax(0, 1fr) clamp(250px, 24vw, 330px);
   min-width: 0;
   min-height: 0;
   overflow: hidden;
 
-  &[data-agent-dock="true"] {
-    grid-template-columns: minmax(0, 1fr) clamp(230px, 18vw, 320px);
+  @media (max-width: 680px) {
+    grid-template-columns: minmax(0, 1fr);
+
+    > aside {
+      display: none;
+    }
   }
 `;
 
@@ -1170,22 +1437,29 @@ const ToolsWindowEmpty = styled.div`
 
 const ToolsWindowAgentDock = styled.aside`
   display: grid;
-  align-content: start;
-  gap: 12px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 10px;
   min-width: 0;
   min-height: 0;
-  padding: 14px;
+  padding: 12px;
   border-left: 1px solid rgba(var(--tools-window-accent-rgb), 0.13);
-  overflow: hidden auto;
   background:
-    radial-gradient(circle at 50% 0%, rgba(var(--tools-window-accent-rgb), 0.12), transparent 42%),
+    radial-gradient(circle at 50% 0%, rgba(var(--tools-window-accent-rgb), 0.1), transparent 42%),
     color-mix(in srgb, var(--tools-window-panel) 92%, black);
 `;
 
 const ToolsWindowAgentDockHeader = styled.div`
-  display: grid;
-  gap: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   min-width: 0;
+
+  > div {
+    display: grid;
+    gap: 2px;
+    min-width: 0;
+  }
 
   strong {
     color: var(--tools-window-text);
@@ -1203,33 +1477,93 @@ const ToolsWindowAgentDockHeader = styled.div`
   }
 `;
 
-const ToolsWindowAgentDockStatus = styled.div`
-  display: inline-flex;
-  align-items: center;
-  width: fit-content;
+const ToolsWindowAgentDockBody = styled.div`
+  display: grid;
+  align-content: start;
   gap: 8px;
-  min-height: 28px;
-  padding: 0 10px;
-  border: 1px solid rgba(134, 239, 172, 0.24);
-  border-radius: 999px;
-  color: #bbf7d0;
-  background: rgba(20, 83, 45, 0.2);
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden auto;
+`;
+
+const ToolsWindowAgentDockHint = styled.p`
+  margin: 0;
+  color: var(--tools-window-muted);
   font-size: 11px;
-  font-weight: 850;
+  font-weight: 680;
+  line-height: 1.5;
+`;
+
+const ToolsWindowSelectionChip = styled.div`
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 3px 6px;
+  min-width: 0;
+  padding: 8px 9px;
+  border: 1px solid rgba(52, 211, 153, 0.28);
+  border-radius: 10px;
+  background: rgba(6, 78, 59, 0.18);
+
+  strong {
+    color: rgba(209, 250, 229, 0.94);
+    font-size: 10px;
+    font-weight: 850;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
 
   span {
-    width: 8px;
-    height: 8px;
-    border-radius: 999px;
-    background: #86efac;
-    box-shadow: 0 0 0 4px rgba(134, 239, 172, 0.12);
+    grid-column: 1 / -1;
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 5;
+    overflow: hidden;
+    color: var(--tools-window-text);
+    font-size: 11px;
+    font-weight: 620;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+
+  button {
+    display: inline-grid;
+    width: 20px;
+    height: 20px;
+    padding: 0;
+    place-items: center;
+    border: 0;
+    border-radius: 6px;
+    color: rgba(209, 250, 229, 0.8);
+    background: transparent;
+    cursor: pointer;
+
+    &:hover,
+    &:focus-visible {
+      outline: none;
+      color: #ffffff;
+      background: rgba(52, 211, 153, 0.18);
+    }
+  }
+
+  ${ToolsWindowShell}[data-theme="light"] & {
+    border-color: rgba(5, 150, 105, 0.26);
+    background: rgba(209, 250, 229, 0.55);
+
+    strong {
+      color: rgba(6, 95, 70, 0.96);
+    }
+
+    button {
+      color: rgba(6, 95, 70, 0.8);
+    }
   }
 `;
 
-const ToolsWindowAgentDockActions = styled.div`
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px;
+const ToolsWindowAgentComposerSlot = styled.div`
+  position: relative;
+  min-height: 132px;
 `;
 
 const ToolsWindowButton = styled.button`
