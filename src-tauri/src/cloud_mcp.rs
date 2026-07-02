@@ -29539,6 +29539,39 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
     let mut normalized_terminal_orchestrators = Vec::new();
     let device_profile = cloud_mcp_desktop_device_profile();
 
+    // Deactivating a workspace closes its PTYs, so the frontend reports it with zero
+    // terminals; the device contract is that remote dashboards keep showing the last
+    // known terminals read-only. Backfill inactive workspaces from the cached snapshots
+    // instead of publishing an authoritative empty list that would clear them everywhere.
+    let cached_last_known_terminals: std::collections::BTreeMap<String, Vec<Value>> = {
+        let snapshots = state.inner().runtime_snapshots.lock().await;
+        let mut cached = std::collections::BTreeMap::new();
+        for snapshot in [
+            snapshots.workspace_terminals.as_ref(),
+            snapshots.workspace_catalog.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            for workspace in cloud_mcp_payload_items(snapshot, &["workspaces"], 64) {
+                let Some(workspace_id) =
+                    cloud_mcp_payload_text(&workspace, &["workspace_id", "workspaceId", "id"])
+                        .filter(|value| !value.trim().is_empty())
+                else {
+                    continue;
+                };
+                if cached.contains_key(&workspace_id) {
+                    continue;
+                }
+                let terminals = cloud_mcp_workspace_terminal_items(&workspace);
+                if !terminals.is_empty() {
+                    cached.insert(workspace_id, terminals);
+                }
+            }
+        }
+        cached
+    };
+
     if let Some(orchestrators) = terminal_orchestrators.as_ref() {
         for terminal in cloud_mcp_json_collection_items(orchestrators)
             .into_iter()
@@ -29866,6 +29899,21 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                 }))
             })
             .collect::<Vec<_>>();
+        let mut terminals = terminals;
+        let mut terminal_list_last_known_fallback = false;
+        if !workspace_active && terminals.is_empty() {
+            if let Some(cached) = cached_last_known_terminals.get(&workspace_id) {
+                terminals = cached
+                    .iter()
+                    .cloned()
+                    .map(|mut terminal| {
+                        cloud_mcp_mark_terminal_last_known_read_only(&mut terminal);
+                        terminal
+                    })
+                    .collect();
+                terminal_list_last_known_fallback = true;
+            }
+        }
         let panels = cloud_mcp_workspace_panel_items(workspace)
             .iter()
             .enumerate()
@@ -30026,7 +30074,13 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         let terminal_clear_reason = if terminal_list_empty_authoritative
             && requested_terminal_clear_reason.trim().is_empty()
         {
-            "all_terminals_closed".to_string()
+            // "all_terminals_closed" authorizes downstream clears of last-known terminals;
+            // an inactive workspace with no cached terminals is not a user-driven clear.
+            if workspace_active {
+                "all_terminals_closed".to_string()
+            } else {
+                "workspace_inactive".to_string()
+            }
         } else {
             requested_terminal_clear_reason
         };
@@ -30048,6 +30102,8 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             "terminal_clear_reason": terminal_clear_reason,
             "terminal_list_empty_authoritative": terminal_list_empty_authoritative,
             "terminal_list_authoritative": terminal_list_authoritative,
+            "last_known_terminal_fallback": terminal_list_last_known_fallback,
+            "lastKnownTerminalFallback": terminal_list_last_known_fallback,
             "last_known_runtime": workspace
                 .get("last_known_runtime")
                 .or_else(|| workspace.get("lastKnownRuntime"))
