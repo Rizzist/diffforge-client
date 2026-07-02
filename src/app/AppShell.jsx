@@ -324,6 +324,8 @@ import {
   buildWorkspaceThreadsPersistDelta,
   clearWorkspaceThreadsBrowserPersistence,
   clearWorkspaceThreadPendingPrompt,
+  createWorkspaceThreadLiveTextProjectionEvents,
+  createWorkspaceThreadToolProjectionEvents,
   createWorkspaceThreadId,
   diagnoseWorkspaceThreadSessionTranscriptHydration,
   deleteWorkspaceThread,
@@ -42926,6 +42928,7 @@ export default function App() {
         latestTimestamp: result.latestTimestamp || "",
         messages,
         matchedBy: result.matchedBy || matchedBy,
+        preferLiveHookAssistantMessages: transcriptLifecycleUsesActivityHooks,
         promptAccepted,
         promptEpoch: getWorkspaceThreadPromptEpoch(event),
         promptEventId,
@@ -45228,11 +45231,27 @@ export default function App() {
         || lifecycleEvent.type === "provider-user-prompt-started"
         || lifecycleEvent.type === "provider-tool-started"
         || lifecycleEvent.type === "provider-tool-completed"
+        || lifecycleEvent.type === "provider-tool-failed"
+        || lifecycleEvent.type === "provider-tool-batch-completed"
         || lifecycleEvent.type === "provider-subagent-started"
         || lifecycleEvent.type === "provider-subagent-completed"
       ) {
-        operation = "mark_agent_activity";
-        nextThreads = markWorkspaceThreadAgentActivity(threads, lifecycleEvent);
+        const activityProjectionEvents = Array.isArray(lifecycleEvent.projectionEvents)
+          ? lifecycleEvent.projectionEvents
+          : Array.isArray(lifecycleEvent.events)
+            ? lifecycleEvent.events
+            : [];
+        if (activityProjectionEvents.length) {
+          operation = "append_activity_projection";
+          nextThreads = appendWorkspaceThreadProjectionEvents(threads, {
+            ...lifecycleEvent,
+            clearPendingPrompt: false,
+            projectionEvents: activityProjectionEvents,
+          });
+        } else {
+          operation = "mark_agent_activity";
+          nextThreads = markWorkspaceThreadAgentActivity(threads, lifecycleEvent);
+        }
       } else if (lifecycleEvent.type === "message-submitted" || lifecycleEvent.type === "thread-starting") {
         operation = lifecycleEvent.type === "message-submitted"
           ? "materialize_message_submitted"
@@ -45718,6 +45737,10 @@ export default function App() {
         || payload.provider
         || payload.agentKind
         || "";
+      const payloadLiveTextKind = String(
+        payload.liveTextKind || payload.live_text_kind || "",
+      ).trim().toLowerCase();
+      const payloadMessageIsLiveAssistantText = payloadLiveTextKind === "assistant";
       let lifecycleEvent = {
         ...payload,
         activityStatus,
@@ -45742,7 +45765,9 @@ export default function App() {
         terminalIndex: payload.terminalIndex,
         threadId: payload.threadId || "",
         type,
-        userMessage: payload.userMessage || payload.message || "",
+        userMessage: payloadMessageIsLiveAssistantText
+          ? ""
+          : payload.userMessage || payload.message || "",
         workspaceId,
       };
       const acceptedPromptDetail = acceptWorkspaceThreadPromptFromActivityHook(lifecycleEvent);
@@ -45753,14 +45778,35 @@ export default function App() {
           promptEventId: acceptedPromptDetail.promptEventId,
         };
       }
-      const hookProjectionEvents = type === "provider-turn-started"
-        ? buildTerminalStartedProjectionEvents({
+      let hookThread = lifecycleEvent.threadId
+        ? workspaceThreadsRef.current?.[workspaceId]?.threads?.[lifecycleEvent.threadId] || null
+        : null;
+      if (!hookThread && lifecycleEvent.terminalIndex != null) {
+        hookThread = getWorkspaceThreadForTerminalIndex(
+          workspaceThreadsRef.current,
+          workspaceId,
+          lifecycleEvent.terminalIndex,
+        );
+      }
+      if (hookThread?.id && !lifecycleEvent.threadId) {
+        lifecycleEvent = {
           ...lifecycleEvent,
-          agentId: hookAgentId,
-          source: hookSource,
-          type,
-        })
-        : [];
+          threadId: hookThread.id,
+        };
+      }
+      const hookProjectionEventContext = {
+        ...lifecycleEvent,
+        agentId: hookAgentId,
+        source: hookSource,
+        type,
+      };
+      const hookProjectionEvents = [
+        ...(type === "provider-turn-started"
+          ? buildTerminalStartedProjectionEvents(hookProjectionEventContext)
+          : []),
+        ...createWorkspaceThreadLiveTextProjectionEvents(hookThread, hookProjectionEventContext),
+        ...createWorkspaceThreadToolProjectionEvents(hookThread, hookProjectionEventContext),
+      ];
       if (hookProjectionEvents.length > 0) {
         lifecycleEvent = {
           ...lifecycleEvent,
@@ -45779,6 +45825,7 @@ export default function App() {
         inputReady,
         paneId: payload.paneId || "",
         providerSessionPresent: Boolean(lifecycleEvent.providerSessionId),
+        projectionEventCount: hookProjectionEvents.length,
         terminalIndex: payload.terminalIndex ?? "",
         threadId: lifecycleEvent.threadId,
         type,

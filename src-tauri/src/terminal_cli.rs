@@ -2010,8 +2010,13 @@ fn refresh_codex_activity_hook_profile_for_terminal(
     };
 
     let profile_path = PathBuf::from(&home).join(format!("{profile}.config.toml"));
-    let hooks_path = codex_hooks_path_from_profile(&profile_path)?
-        .unwrap_or_else(|| PathBuf::from(&home).join(format!("{profile}.hooks.json")));
+    // Codex (verified on 0.142) loads command hooks ONLY from
+    // `$CODEX_HOME/hooks.json`; a `hooksPath` key or inline `[[hooks.*]]`
+    // blocks in a `--profile <name>.config.toml` layer are ignored, so the
+    // activity hooks must live in the home-level file or they never run.
+    // Diff Forge codex homes are per-slot, so pane-scoped commands are safe
+    // there; the last launch for a shared home owns the hook commands.
+    let hooks_path = PathBuf::from(&home).join("hooks.json");
     let body = match fs::read_to_string(&hooks_path) {
         Ok(body) => Some(body),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -2074,6 +2079,7 @@ fn refresh_codex_activity_hook_profile_for_terminal(
     Ok(updated)
 }
 
+#[allow(dead_code)] // Legacy `hooksPath` reader; codex 0.142 ignores profile-layer hooks paths.
 fn codex_hooks_path_from_profile(profile_path: &Path) -> Result<Option<PathBuf>, String> {
     let Ok(body) = fs::read_to_string(profile_path) else {
         return Ok(None);
@@ -3111,7 +3117,45 @@ fn diff_forge_activity_hook_record(
         hook_string(&["tool_use_id", "toolUseId"]),
         tool_string(&["tool_use_id", "toolUseId"]),
     ]);
+    let tool_server = first_string(vec![
+        hook_string(&["tool_server", "toolServer", "server"]),
+        tool_string(&["tool_server", "toolServer", "server"]),
+    ]);
     let command = tool_string(&["command"]);
+    let tool_output = hook_value(&[
+        "tool_output",
+        "toolOutput",
+        "tool_response",
+        "toolResponse",
+        "output",
+        "result",
+        "response",
+        "stdout",
+    ]);
+    let tool_error = hook_value(&[
+        "tool_error",
+        "toolError",
+        "error",
+        "stderr",
+    ]);
+    let raw_tool_payload = hook_value(&[
+        "rawToolPayload",
+        "raw_tool_payload",
+        "rawPayload",
+        "raw_payload",
+        "raw",
+    ]);
+    let duration_ms = hook_value(&[
+        "durationMs",
+        "duration_ms",
+        "elapsedMs",
+        "elapsed_ms",
+    ]);
+    let exit_code = hook_value(&[
+        "exitCode",
+        "exit_code",
+        "code",
+    ]);
     let mut tool_paths = Vec::new();
     claude_guard_collect_tool_paths(tool_input, &mut tool_paths);
     let graph_file_path = tool_paths
@@ -3364,8 +3408,17 @@ fn diff_forge_activity_hook_record(
         "prompt": user_prompt.clone(),
         "toolName": tool_name,
         "toolUseId": tool_use_id,
+        "toolServer": tool_server,
+        "toolInput": tool_input.clone(),
+        "toolOutput": tool_output,
+        "toolError": tool_error,
+        "rawToolPayload": raw_tool_payload,
         "command": command,
         "filePath": tool_paths.first().cloned().unwrap_or_default(),
+        "durationMs": duration_ms.clone(),
+        "duration_ms": duration_ms,
+        "exitCode": exit_code.clone(),
+        "exit_code": exit_code,
         "graphFilePath": graph_file_path,
         "approvalId": approval_id,
         "permissionPromptId": permission_prompt_id,
@@ -3463,6 +3516,39 @@ mod terminal_cli_tests {
     }
 
     #[test]
+    fn activity_hook_record_preserves_tool_response_timing_and_exit_code() {
+        let record = diff_forge_activity_hook_record(
+            "claude",
+            "pane-1",
+            7,
+            "workspace-1",
+            "0",
+            &json!({
+                "hookEventName": "PostToolUse",
+                "toolName": "Bash",
+                "toolUseId": "tool-123",
+                "toolInput": { "command": "npm test" },
+                "tool_response": {
+                    "stdout": "ok",
+                    "stderr": "",
+                    "interrupted": false
+                },
+                "duration_ms": 1234,
+                "exit_code": 0
+            }),
+        );
+
+        assert_eq!(record["toolName"].as_str(), Some("Bash"));
+        assert_eq!(record["toolUseId"].as_str(), Some("tool-123"));
+        assert_eq!(record["toolInput"]["command"].as_str(), Some("npm test"));
+        assert_eq!(record["toolOutput"]["stdout"].as_str(), Some("ok"));
+        assert_eq!(record["durationMs"].as_u64(), Some(1234));
+        assert_eq!(record["duration_ms"].as_u64(), Some(1234));
+        assert_eq!(record["exitCode"].as_i64(), Some(0));
+        assert_eq!(record["exit_code"].as_i64(), Some(0));
+    }
+
+    #[test]
     fn claude_guard_settings_use_valid_claude_hook_events() {
         let coordination = TerminalCoordinationSession {
             repo_path: "/repo".to_string(),
@@ -3507,6 +3593,19 @@ mod terminal_cli_tests {
         assert!(settings.contains("3"));
         assert!(settings.contains("--events-path"));
         assert!(settings.contains("--debug-path"));
+    }
+
+    #[test]
+    fn opencode_plugin_uses_chat_message_as_prompt_boundary() {
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("\"chat.message\""));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("hook_event_name: \"UserPromptSubmit\""));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("User message updates"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("assistantMessageCompleted"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("emitStop(sessionId"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("texts.join(\"\\n\").trim()"));
+        assert!(!DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains(
+            "activeSessions.add(sessionId);\n          emit({\n            hook_event_name: \"UserPromptSubmit\""
+        ));
     }
 
     #[test]
@@ -4254,18 +4353,23 @@ function emit(payload) {
 
 function pickText(parts) {
   if (!Array.isArray(parts)) return "";
+  const texts = [];
   for (const part of parts) {
     const text = part && (part.text != null ? part.text : part.content);
-    if (typeof text === "string" && text.trim()) return text.trim();
+    if (typeof text === "string" && text.trim()) texts.push(text.trim());
   }
-  return "";
+  return texts.join("\n").trim();
+}
+
+function nonEmptyString(value) {
+  return typeof value === "string" && value.length > 0;
 }
 
 function pickDeltaText(value) {
   if (!value || typeof value !== "object") return "";
   for (const key of ["delta", "textDelta", "contentDelta", "messageDelta"]) {
     const candidate = value[key];
-    if (typeof candidate === "string" && candidate.trim()) return candidate;
+    if (nonEmptyString(candidate)) return candidate;
     if (candidate && typeof candidate === "object") {
       const nested = pickDeltaText(candidate) || pickText([candidate]);
       if (nested) return nested;
@@ -4285,6 +4389,103 @@ function eventSessionId(event) {
   );
 }
 
+function statusText(value) {
+  if (value == null) return "";
+  if (typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return String(value).toLowerCase();
+  }
+  if (typeof value === "object") {
+    return String(value.type || value.phase || value.state || value.status || value.reason || "").toLowerCase();
+  }
+  return "";
+}
+
+function completionFlag(value) {
+  const text = statusText(value);
+  return text === "true"
+    || text === "1"
+    || text === "complete"
+    || text === "completed"
+    || text === "done"
+    || text === "finish"
+    || text === "finished"
+    || text === "success"
+    || text === "succeeded"
+    || text === "stop"
+    || text === "stopped";
+}
+
+function assistantMessageCompleted(message, props) {
+  const time = (message && message.time) || (props && props.time) || {};
+  if (time.completed || time.completedAt || time.completed_at) return true;
+  for (const source of [message || {}, props || {}]) {
+    if (completionFlag(source.completed)
+      || completionFlag(source.done)
+      || completionFlag(source.finished)
+      || completionFlag(source.complete)
+      || completionFlag(source.finish)
+      || completionFlag(source.status)
+      || completionFlag(source.state)
+      || completionFlag(source.phase)
+      || completionFlag(source.finishReason)
+      || completionFlag(source.finish_reason)
+      || completionFlag(source.stopReason)
+      || completionFlag(source.stop_reason)
+      || completionFlag(source.completedAt)
+      || completionFlag(source.completed_at)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function assistantMessageCompletionKey(sessionId, message, props) {
+  const key = (message && (message.id || message.messageID || message.messageId))
+    || (props && (props.id || props.messageID || props.messageId));
+  return key ? `${sessionId || "session"}:${key}` : "";
+}
+
+function textualPartKind(part) {
+  const kind = String((part && (part.type || part.kind)) || "").toLowerCase();
+  return kind === "text" || kind === "reasoning" ? kind : "";
+}
+
+function partText(part) {
+  if (!part || typeof part !== "object") return "";
+  return typeof part.text === "string" ? part.text : pickText([part]);
+}
+
+function messageIdForPart(props, part) {
+  const message = (props && (props.message || props.info)) || {};
+  return (part && (part.messageID || part.messageId || part.message_id))
+    || (props && (props.messageID || props.messageId || props.message_id))
+    || (message && (message.id || message.messageID || message.messageId || message.message_id))
+    || "";
+}
+
+function partKey(sessionId, messageId, partId) {
+  return sessionId && partId ? `${sessionId}:${messageId || "message"}:${partId}` : "";
+}
+
+function emitPartText(sessionId, kind, text, snapshot) {
+  if (!nonEmptyString(text)) return;
+  if (kind === "reasoning") {
+    emit({
+      hook_event_name: "ReasoningDelta",
+      session_id: sessionId,
+      [snapshot ? "reasoning_snapshot" : "reasoning_delta"]: text,
+    });
+    return;
+  }
+  if (kind === "text") {
+    emit({
+      hook_event_name: "AssistantMessageDelta",
+      session_id: sessionId,
+      [snapshot ? "assistant_message_snapshot" : "assistant_delta"]: text,
+    });
+  }
+}
+
 export const DiffForgeActivityPlugin = async () => {
   // Track which sessions have an in-flight turn so a stray, startup, duplicate,
   // or child/sub-agent `session.idle` cannot settle the wrong turn: we only
@@ -4292,6 +4493,19 @@ export const DiffForgeActivityPlugin = async () => {
   // session id (not a single flag) because OpenCode fires session.idle for
   // sub-sessions too.
   const activeSessions = new Set();
+  const completedAssistantMessages = new Set();
+  const partKinds = new Map();
+  const emitStop = (sessionId, extra = {}) => {
+    const hadActiveSession = activeSessions.has(sessionId);
+    activeSessions.delete(sessionId);
+    emit({
+      hook_event_name: "Stop",
+      session_id: sessionId,
+      startup_idle_candidate: !hadActiveSession,
+      session_idle_without_prompt: !hadActiveSession,
+      ...extra,
+    });
+  };
   return {
     "chat.message": async (input, output) => {
       const sessionId = (input && input.sessionID) || "";
@@ -4331,11 +4545,11 @@ export const DiffForgeActivityPlugin = async () => {
         tool_use_id: (input && input.callID) || "",
         tool_name: (input && input.type) || "",
         description: (input && input.title) || "",
-        prompt_default_option: "deny",
+        prompt_default_option: "reject",
         prompt_options: [
           ["allow_once", "Allow once"],
-          ["deny", "Deny"],
-          ["park", "Park todo"]
+          ["allow_always", "Allow always"],
+          ["reject", "Reject"]
         ],
       });
     },
@@ -4347,32 +4561,44 @@ export const DiffForgeActivityPlugin = async () => {
         const message = props.message || props.info || {};
         const role = String(message.role || message.type || "").toLowerCase();
         if (role === "user") {
-          activeSessions.add(sessionId);
-          emit({
-            hook_event_name: "UserPromptSubmit",
-            session_id: sessionId,
-            prompt: pickText(message.parts || message.content || []),
-          });
+          // `chat.message` is OpenCode's prompt boundary. User message updates
+          // can arrive after session idle and must not reopen a completed turn.
         } else if (role === "assistant") {
           const delta = pickDeltaText(props) || pickDeltaText(message);
           if (delta) {
             emit({
               hook_event_name: "AssistantMessageDelta",
               session_id: sessionId,
-              assistant_message: delta,
+              assistant_delta: delta,
             });
+          }
+          if (assistantMessageCompleted(message, props)) {
+            const completionKey = assistantMessageCompletionKey(sessionId, message, props);
+            if (!completionKey || !completedAssistantMessages.has(completionKey)) {
+              if (completionKey) completedAssistantMessages.add(completionKey);
+              emitStop(sessionId, {
+                assistant_message: pickText(message.parts || message.content || []),
+              });
+            }
           }
         }
       }
-      if (type === "message.part.updated" || type === "message.part.created") {
-        const part = props.part || props.info || {};
-        const delta = pickDeltaText(props) || pickDeltaText(part);
-        if (delta) {
-          emit({
-            hook_event_name: "AssistantMessageDelta",
-            session_id: sessionId,
-            assistant_message: delta,
-          });
+      if (type === "message.part.updated") {
+        const part = props.part || {};
+        const kind = textualPartKind(part);
+        const id = (part && (part.id || part.partID || part.partId)) || props.partID || props.partId || "";
+        const key = partKey(sessionId, messageIdForPart(props, part), id);
+        if (key && kind) partKinds.set(key, kind);
+        emitPartText(sessionId, kind, partText(part), true);
+      }
+      if (type === "message.part.delta") {
+        const id = props.partID || props.partId || "";
+        const key = partKey(sessionId, messageIdForPart(props, null), id);
+        const kind = partKinds.get(key) || "text";
+        const field = String(props.field || "").toLowerCase();
+        const delta = nonEmptyString(props.delta) ? props.delta : pickDeltaText(props);
+        if (kind && (!field || field === "text" || field === "content" || field === "delta")) {
+          emitPartText(sessionId, kind, delta, false);
         }
       }
       if (type === "session.compacted" || type === "session.compacting") {
@@ -4390,11 +4616,11 @@ export const DiffForgeActivityPlugin = async () => {
           tool_use_id: props.callID || props.toolCallID || "",
           tool_name: props.type || props.tool || "",
           description: props.title || props.description || "",
-          prompt_default_option: "deny",
+          prompt_default_option: "reject",
           prompt_options: [
             ["allow_once", "Allow once"],
-            ["deny", "Deny"],
-            ["park", "Park todo"]
+            ["allow_always", "Allow always"],
+            ["reject", "Reject"]
           ],
         });
       }
@@ -4411,15 +4637,23 @@ export const DiffForgeActivityPlugin = async () => {
           prompt_options: props.options || props.choices || props.actions || [],
         });
       }
+      if (type === "session.status") {
+        // OpenCode >= 1.17 reports turn phases via session.status; treat a
+        // return to idle/cooldown as the turn settling, same as session.idle.
+        const raw = props.status !== undefined
+          ? props.status
+          : (props.phase !== undefined ? props.phase : props.state);
+        const statusValue = String(
+          (raw && typeof raw === "object"
+            ? (raw.type || raw.phase || raw.state || raw.status)
+            : raw) || ""
+        ).toLowerCase();
+        if (statusValue === "idle" || statusValue === "cooldown") {
+          emitStop(sessionId);
+        }
+      }
       if (type === "session.idle") {
-        const hadActiveSession = activeSessions.has(sessionId);
-        activeSessions.delete(sessionId);
-        emit({
-          hook_event_name: "Stop",
-          session_id: sessionId,
-          startup_idle_candidate: !hadActiveSession,
-          session_idle_without_prompt: !hadActiveSession,
-        });
+        emitStop(sessionId);
       } else if (type === "session.error") {
         activeSessions.delete(sessionId);
         emit({ hook_event_name: "StopFailure", session_id: sessionId });

@@ -6,6 +6,8 @@ import {
   applyWorkspaceThreadProviderSessionBinding,
   bindWorkspaceThreadTerminal,
   clearWorkspaceThreadPendingPrompt,
+  createWorkspaceThreadLiveTextProjectionEvents,
+  createWorkspaceThreadToolProjectionEvents,
   deleteWorkspaceThread,
   getWorkspaceThreadForTerminalIndex,
   getWorkspaceThreadSelectionForLiveTerminal,
@@ -2188,6 +2190,413 @@ test("provider turn interruption settles running thread and keeps terminal input
   assert.equal(thread.providerBindings.codex.inputReady, true);
   assert.equal(thread.providerBindings.codex.activityStatus, "idle");
   assert.equal(next[workspaceId].terminals[0].inputReady, true);
+});
+
+test("live hook snapshots replace streamed assistant text and survive transcript hydration", () => {
+  const workspaceId = "workspace-opencode-live";
+  const threadId = "thread-opencode-live";
+  const promptId = "prompt-opencode-live";
+  const turnId = `turn-${promptId}`;
+  const submittedAt = "2026-07-02T16:00:00.000Z";
+  const completedAt = "2026-07-02T16:00:04.000Z";
+  const promptText = "make table of what we have so far";
+  const finalTable = [
+    "| Board | Size | Components | Layout & Connections |",
+    "| --- | --- | --- | --- |",
+    "| blinky | 12mm x 10mm | R1: 1k, 0402<br>D1: LED, 0402 | Battery -> R1 -> D1 -> Ground |",
+    "| switch-led-buzzer | 40mm x 30mm | BT1, SW1, R1, D1, BZ1, C1 | Switch drives LED, buzzer, and capacitor branches in parallel |",
+  ].join("\n");
+  const scrambledTranscriptText = "Connections::Layout&twoboards-10on|I'vesummaryhere's,tableaofreviewed|-----";
+  const baseThread = {
+    activityStatus: "thinking",
+    currentAgent: "opencode",
+    id: threadId,
+    latestTurn: {
+      agentId: "opencode",
+      messageId: promptId,
+      requestedAt: submittedAt,
+      startedAt: submittedAt,
+      state: "running",
+      turnId,
+    },
+    materialized: true,
+    messages: [{
+      agentId: "opencode",
+      createdAt: submittedAt,
+      id: promptId,
+      role: "user",
+      source: "cli-hook:provider-turn-started",
+      status: "submitted",
+      text: promptText,
+      turnId,
+    }],
+    projectionEvents: [{
+      agentId: "opencode",
+      createdAt: submittedAt,
+      id: "turn-start",
+      messageId: promptId,
+      promptEpoch: 1,
+      prompt_epoch: 1,
+      source: "cli-hook:provider-turn-started",
+      status: "running",
+      turnId,
+      type: "thread.turn.started",
+    }, {
+      agentId: "opencode",
+      createdAt: submittedAt,
+      id: "user-message",
+      messageId: promptId,
+      promptEpoch: 1,
+      prompt_epoch: 1,
+      role: "user",
+      source: "cli-hook:provider-turn-started",
+      status: "submitted",
+      text: promptText,
+      turnId,
+      type: "thread.message.user",
+    }],
+    providerBindings: {
+      opencode: {
+        activityStatus: "thinking",
+        inputReady: false,
+        nativeSessionId: "opencode-session-live",
+        nativeSessionKind: "session",
+        status: "active",
+        terminalBinding: {
+          terminalIndex: 0,
+        },
+      },
+    },
+    status: "active",
+    terminalBinding: {
+      terminalIndex: 0,
+    },
+    terminalIndex: 0,
+    transcriptSessionId: "opencode-session-live",
+    workspaceId,
+  };
+  const state = {
+    [workspaceId]: {
+      activeThreadId: threadId,
+      id: workspaceId,
+      terminalThreadIds: {
+        0: threadId,
+      },
+      terminals: {
+        0: {
+          activityStatus: "thinking",
+          inputReady: false,
+          terminalIndex: 0,
+          threadId,
+        },
+      },
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: baseThread,
+      },
+    },
+  };
+
+  const deltaProjectionEvents = createWorkspaceThreadLiveTextProjectionEvents(baseThread, {
+    agentId: "opencode",
+    liveTextDelta: "Based on the two boards",
+    liveTextKind: "assistant",
+    source: "cli-hook:assistant-message-delta",
+    type: "provider-output",
+  });
+  const streamed = appendWorkspaceThreadProjectionEvents(state, {
+    agentId: "opencode",
+    projectionEvents: deltaProjectionEvents,
+    threadId,
+    type: "provider-output",
+    workspaceId,
+  });
+  assert.equal(
+    streamed[workspaceId].threads[threadId].messages.at(-1).text,
+    "Based on the two boards",
+  );
+
+  const finalProjectionEvents = createWorkspaceThreadLiveTextProjectionEvents(
+    streamed[workspaceId].threads[threadId],
+    {
+      agentId: "opencode",
+      completedAt,
+      liveTextKind: "assistant",
+      liveTextSnapshot: finalTable,
+      source: "cli-hook:provider-turn-completed",
+      type: "provider-turn-completed",
+    },
+  );
+  const completed = appendWorkspaceThreadProjectionEvents(streamed, {
+    agentId: "opencode",
+    completedAt,
+    inputReady: true,
+    projectionEvents: finalProjectionEvents,
+    threadId,
+    type: "provider-turn-completed",
+    workspaceId,
+  });
+  const completedThread = completed[workspaceId].threads[threadId];
+  assert.equal(completedThread.latestTurn.state, "completed");
+  assert.equal(completedThread.messages.at(-1).text, finalTable);
+  assert.equal(completedThread.messages.at(-1).status, "complete");
+
+  const hydrated = hydrateWorkspaceThreadSessionTranscript(completed, {
+    agentId: "opencode",
+    assistantResponseCompletesTurn: true,
+    expectedMessageCreatedAt: submittedAt,
+    expectedUserMessage: promptText,
+    messages: [{
+      createdAt: submittedAt,
+      id: promptId,
+      role: "user",
+      text: promptText,
+    }, {
+      createdAt: completedAt,
+      id: "assistant-scrambled",
+      role: "assistant",
+      text: scrambledTranscriptText,
+    }],
+    preferLiveHookAssistantMessages: true,
+    promptAccepted: true,
+    promptEventId: promptId,
+    providerSessionId: "opencode-session-live",
+    sessionId: "opencode-session-live",
+    source: "opencode-session-watch",
+    submittedAt,
+    threadId,
+    workspaceId,
+  });
+  const assistantMessages = hydrated[workspaceId].threads[threadId].messages
+    .filter((message) => message.role === "assistant");
+  assert.equal(assistantMessages.length, 1);
+  assert.equal(assistantMessages[0].text, finalTable);
+  assert.equal(assistantMessages[0].text.includes("Connections::Layout"), false);
+});
+
+test("live provider tool hooks render as structured activity messages", () => {
+  const workspaceId = "workspace-live-tools";
+  const threadId = "thread-live-tools";
+  const promptId = "prompt-live-tools";
+  const turnId = `turn-${promptId}`;
+  const startedAt = "2026-07-02T17:00:00.000Z";
+  const baseThread = {
+    activityStatus: "thinking",
+    currentAgent: "opencode",
+    id: threadId,
+    latestTurn: {
+      agentId: "opencode",
+      messageId: promptId,
+      startedAt,
+      state: "running",
+      turnId,
+    },
+    materialized: true,
+    messages: [{
+      agentId: "opencode",
+      createdAt: startedAt,
+      id: promptId,
+      role: "user",
+      status: "submitted",
+      text: "run drc",
+      turnId,
+    }],
+    projectionEvents: [{
+      agentId: "opencode",
+      createdAt: startedAt,
+      id: "turn-start",
+      messageId: promptId,
+      source: "cli-hook:provider-turn-started",
+      status: "running",
+      turnId,
+      type: "thread.turn.started",
+    }],
+    providerBindings: {
+      opencode: {
+        activityStatus: "thinking",
+        inputReady: false,
+        status: "active",
+      },
+    },
+    status: "active",
+    terminalIndex: 0,
+    workspaceId,
+  };
+  const state = {
+    [workspaceId]: {
+      activeThreadId: threadId,
+      id: workspaceId,
+      terminals: {
+        0: {
+          activityStatus: "thinking",
+          terminalIndex: 0,
+          threadId,
+        },
+      },
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: baseThread,
+      },
+    },
+  };
+
+  const startedProjectionEvents = createWorkspaceThreadToolProjectionEvents(baseThread, {
+    agentId: "opencode",
+    messageId: "shared-tool-message",
+    source: "cli-hook:provider-tool-started",
+    toolInput: {
+      board_path: "hardware/switch-led-buzzer/switch-led-buzzer.board.tsx",
+    },
+    toolName: "coordination-kernel.pcb_drc",
+    toolUseId: "call-drc-1",
+    type: "provider-tool-started",
+  });
+  const withToolStart = appendWorkspaceThreadProjectionEvents(state, {
+    activityStatus: "tool_running",
+    agentId: "opencode",
+    clearPendingPrompt: false,
+    projectionEvents: startedProjectionEvents,
+    threadId,
+    type: "provider-tool-started",
+    workspaceId,
+  });
+
+  const startMessage = withToolStart[workspaceId].threads[threadId].messages
+    .find((message) => message.kind === "tool_call");
+  assert.equal(startMessage.title, "Called coordination-kernel.pcb_drc");
+  assert.equal(startMessage.toolName, "coordination-kernel.pcb_drc");
+  assert.deepEqual(startMessage.toolInput, {
+    board_path: "hardware/switch-led-buzzer/switch-led-buzzer.board.tsx",
+  });
+  assert.equal(startMessage.status, "running");
+
+  const outputProjectionEvents = createWorkspaceThreadToolProjectionEvents(
+    withToolStart[workspaceId].threads[threadId],
+    {
+      agentId: "opencode",
+      messageId: "shared-tool-message",
+      source: "cli-hook:provider-tool-completed",
+      toolName: "coordination-kernel.pcb_drc",
+      toolOutput: {
+        componentCount: 6,
+        errorCount: 0,
+        traceCount: 8,
+        warningCount: 0,
+      },
+      toolUseId: "call-drc-1",
+      type: "provider-tool-completed",
+    },
+  );
+  const withToolOutput = appendWorkspaceThreadProjectionEvents(withToolStart, {
+    activityStatus: "thinking",
+    agentId: "opencode",
+    clearPendingPrompt: false,
+    projectionEvents: outputProjectionEvents,
+    threadId,
+    type: "provider-tool-completed",
+    workspaceId,
+  });
+  const outputMessage = withToolOutput[workspaceId].threads[threadId].messages
+    .find((message) => message.kind === "tool_output");
+  const toolMessages = withToolOutput[workspaceId].threads[threadId].messages
+    .filter((message) => message.kind === "tool_call" || message.kind === "tool_output");
+  assert.deepEqual(
+    toolMessages.map((message) => message.kind),
+    ["tool_call", "tool_output"],
+  );
+  assert.equal(outputMessage.title, "coordination-kernel.pcb_drc finished");
+  assert.deepEqual(outputMessage.toolOutput, {
+    componentCount: 6,
+    errorCount: 0,
+    traceCount: 8,
+    warningCount: 0,
+  });
+  assert.match(outputMessage.text, /componentCount/);
+});
+
+test("failed live provider tool hooks carry structured errors", () => {
+  const thread = {
+    currentAgent: "opencode",
+    id: "thread-tool-failed",
+    latestTurn: {
+      messageId: "prompt-tool-failed",
+      turnId: "turn-tool-failed",
+    },
+    workspaceId: "workspace-tool-failed",
+  };
+  const projectionEvents = createWorkspaceThreadToolProjectionEvents(thread, {
+    agentId: "opencode",
+    source: "cli-hook:provider-tool-failed",
+    toolError: {
+      error: "DRC failed",
+      warningCount: 2,
+    },
+    toolName: "coordination-kernel.pcb_drc",
+    toolUseId: "call-drc-failed",
+    type: "provider-tool-failed",
+  });
+
+  assert.equal(projectionEvents.length, 1);
+  assert.equal(projectionEvents[0].kind, "tool_output");
+  assert.equal(projectionEvents[0].status, "error");
+  assert.equal(projectionEvents[0].title, "coordination-kernel.pcb_drc failed");
+  assert.deepEqual(projectionEvents[0].toolError, {
+    error: "DRC failed",
+    warningCount: 2,
+  });
+  assert.match(projectionEvents[0].text, /DRC failed/);
+});
+
+test("title-only tool projection events remain visible", () => {
+  const workspaceId = "workspace-title-only-tool";
+  const threadId = "thread-title-only-tool";
+  const state = {
+    [workspaceId]: {
+      activeThreadId: threadId,
+      id: workspaceId,
+      terminals: {},
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          currentAgent: "codex",
+          id: threadId,
+          messages: [],
+          projectionEvents: [],
+          providerBindings: {
+            codex: {
+              activityStatus: "thinking",
+              status: "active",
+            },
+          },
+          status: "active",
+          workspaceId,
+        },
+      },
+    },
+  };
+  const next = appendWorkspaceThreadProjectionEvents(state, {
+    agentId: "codex",
+    projectionEvents: [{
+      agentId: "codex",
+      createdAt: "2026-07-02T17:04:00.000Z",
+      id: "title-only-start-task",
+      kind: "tool_call",
+      messageId: "tool-start-task-call",
+      source: "cli-hook:provider-tool-started",
+      status: "running",
+      title: "Called start_task",
+      type: "thread.tool_call",
+    }],
+    threadId,
+    type: "provider-tool-started",
+    workspaceId,
+  });
+
+  const message = next[workspaceId].threads[threadId].messages.at(-1);
+  assert.equal(message.role, "activity");
+  assert.equal(message.kind, "tool_call");
+  assert.equal(message.title, "Called start_task");
+  assert.equal(message.text, "");
 });
 
 test("session transcript preserves generated image artifacts through hydration", () => {

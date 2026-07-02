@@ -172,7 +172,7 @@ const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_FILE: &str = "workspace-activation.jsonl";
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
-const TERMINAL_STATUS_LOGGING_ENABLED: bool = false;
+const TERMINAL_STATUS_LOGGING_ENABLED: bool = true;
 const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
 /// Persist the cloud sync/connect loop into logs/cloud-sync.jsonl:
 /// every connection-state note, ws phase change, route resolution, open
@@ -1016,6 +1016,15 @@ struct TerminalRuntimeSnapshot {
     updated_at_ms: u64,
 }
 
+#[derive(Clone, Default)]
+struct TerminalLaunchRuntimeMetadata {
+    model: Option<String>,
+    model_source: Option<String>,
+    reasoning_effort: Option<String>,
+    speed: Option<String>,
+    permission_mode: Option<String>,
+}
+
 impl TerminalRuntimeSnapshot {
     fn opened_with_state(
         provider_session_id: Option<String>,
@@ -1091,6 +1100,7 @@ struct TerminalInstance {
     session_mode: TerminalSessionMode,
     metadata: TerminalInstanceMetadata,
     runtime: Arc<StdMutex<TerminalRuntimeSnapshot>>,
+    launch_metadata: Arc<StdMutex<TerminalLaunchRuntimeMetadata>>,
     // Whether this pane was opened with the app-control orchestrator MCP. Kept
     // so deferred/resume agent starts can re-inject app-control (and its
     // auto-approval) the same way the initial open does.
@@ -1412,6 +1422,7 @@ impl TerminalInstance {
         coordination: Option<TerminalCoordinationSession>,
         session_mode: TerminalSessionMode,
         metadata: TerminalInstanceMetadata,
+        launch_metadata: TerminalLaunchRuntimeMetadata,
         app_control_mcp_requested: bool,
     ) -> (Self, Box<dyn Read + Send>) {
         let WarmPty {
@@ -1447,6 +1458,7 @@ impl TerminalInstance {
                 session_mode,
                 metadata,
                 runtime: Arc::new(StdMutex::new(initial_runtime)),
+                launch_metadata: Arc::new(StdMutex::new(launch_metadata)),
                 app_control_mcp_requested,
             },
             reader,
@@ -1982,6 +1994,7 @@ struct TerminalOpenResult {
     model_source: Option<String>,
     reasoning_effort: Option<String>,
     speed: Option<String>,
+    permission_mode: Option<String>,
     activity_status: String,
     command_phase: String,
     input_ready: bool,
@@ -2094,6 +2107,8 @@ struct TerminalActivityHookPromptOption {
     id: String,
     label: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<String>,
 }
 
@@ -2147,6 +2162,15 @@ struct TerminalActivityHookPayload {
     live_text_kind: Option<String>,
     tool_name: Option<String>,
     tool_use_id: Option<String>,
+    tool_server: Option<String>,
+    tool_input: Option<Value>,
+    tool_output: Option<Value>,
+    tool_error: Option<Value>,
+    raw_tool_payload: Option<Value>,
+    command: Option<String>,
+    file_path: Option<String>,
+    duration_ms: Option<u64>,
+    exit_code: Option<i64>,
     approval_id: Option<String>,
     permission_prompt_id: Option<String>,
     permission_request_id: Option<String>,
@@ -3465,6 +3489,7 @@ async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: Str
         )
         .await
     };
+    let _ = cloud_mcp_request_desktop_close(&app_for_shutdown, "app_shutdown").await;
 
     emit_app_shutdown_progress(
         &app_for_shutdown,

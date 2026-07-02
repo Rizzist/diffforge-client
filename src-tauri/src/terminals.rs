@@ -6,8 +6,61 @@ fn terminal_now_ms() -> u64 {
 }
 
 const TERMINAL_STARTING_IDLE_BUFFER_MS: u64 = 5_000;
+const TERMINAL_CODEX_IDLE_QUIESCE_MS: u64 = 1_750;
 const TERMINAL_PROMPT_READY_BUSY_DEBOUNCE_MS: u64 = 750;
 const TERMINAL_STARTUP_READY_SCAN_BYTES: usize = 16 * 1024;
+
+fn terminal_output_latest_working_indicator_index(text: &str) -> Option<usize> {
+    let lower = text.to_lowercase();
+    ["working (", "esc to interrupt", "context refresh"]
+        .into_iter()
+        .filter_map(|needle| lower.rfind(needle))
+        .max()
+}
+
+fn terminal_output_latest_prompt_marker_index(text: &str) -> Option<usize> {
+    let lower = text.to_ascii_lowercase();
+    let mut latest = ["›", "❯", "❱"]
+        .into_iter()
+        .filter_map(|needle| text.rfind(needle))
+        .max();
+
+    if (lower.contains("opencode") || lower.contains("build "))
+        && lower.contains("ctrl+p commands")
+    {
+        latest = latest.max(lower.rfind("ctrl+p commands"));
+    }
+
+    let mut offset = 0;
+    for line in text.split_inclusive('\n') {
+        let line_without_newline = line.trim_end_matches(|ch| ch == '\r' || ch == '\n');
+        let trimmed_start = line_without_newline.trim_start();
+        if trimmed_start == ">" || trimmed_start.starts_with("> ") {
+            latest = latest.max(Some(offset + (line_without_newline.len() - trimmed_start.len())));
+        }
+        offset += line.len();
+    }
+
+    latest
+}
+
+fn terminal_output_prompt_marker_after_working_indicator(text: &str) -> bool {
+    let Some(prompt_index) = terminal_output_latest_prompt_marker_index(text) else {
+        return false;
+    };
+    terminal_output_latest_working_indicator_index(text)
+        .map(|working_index| prompt_index > working_index)
+        .unwrap_or(true)
+}
+
+fn terminal_output_current_prompt_marker(text: &str) -> bool {
+    let cleaned = cloud_mcp_clean_terminal_state_text(text);
+    if cleaned.is_empty() {
+        return false;
+    }
+    terminal_output_prompt_marker_after_working_indicator(text)
+        || terminal_output_prompt_marker_after_working_indicator(&cleaned)
+}
 
 #[cfg(windows)]
 fn terminal_windows_build_number() -> Option<u32> {
@@ -255,6 +308,27 @@ struct TerminalProviderResolvedLaunchOptions {
     reasoning_effort: Option<String>,
     speed: Option<String>,
     permission_mode: Option<String>,
+}
+
+fn terminal_launch_runtime_metadata_from_resolved(
+    launch: &TerminalProviderResolvedLaunchOptions,
+) -> TerminalLaunchRuntimeMetadata {
+    TerminalLaunchRuntimeMetadata {
+        model: launch.model.clone(),
+        model_source: launch.model_source.clone(),
+        reasoning_effort: launch.reasoning_effort.clone(),
+        speed: launch.speed.clone(),
+        permission_mode: launch.permission_mode.clone(),
+    }
+}
+
+fn terminal_apply_launch_runtime_metadata(
+    instance: &TerminalInstance,
+    launch: &TerminalProviderResolvedLaunchOptions,
+) {
+    if let Ok(mut metadata) = instance.launch_metadata.lock() {
+        *metadata = terminal_launch_runtime_metadata_from_resolved(launch);
+    }
 }
 
 fn terminal_normalize_launch_keyword(value: Option<String>) -> Option<String> {
@@ -602,7 +676,7 @@ fn terminal_runtime_snapshot_is_busy_turn(runtime: &TerminalRuntimeSnapshot) -> 
 }
 
 fn terminal_prompt_ready_recovery_allowed(
-    _metadata: &TerminalInstanceMetadata,
+    metadata: &TerminalInstanceMetadata,
     runtime: &TerminalRuntimeSnapshot,
 ) -> bool {
     if terminal_runtime_snapshot_is_starting(runtime) {
@@ -612,7 +686,13 @@ fn terminal_prompt_ready_recovery_allowed(
     // Provider Stop/session-idle hooks remain the primary completion signal,
     // but running terminals can predate the latest hook install or miss one
     // hook write. A prompt marker after the busy debounce is a recovery signal
-    // for every hook-managed provider, including Claude.
+    // for hook-managed providers that do not emit reliable turn-end hooks.
+    // Codex has full hooks.json coverage, and prompt-ready recovery can race
+    // ahead of its real Stop hook while an answer is still streaming.
+    if terminal_metadata_is_codex(metadata) {
+        return false;
+    }
+
     terminal_runtime_snapshot_is_busy_turn(runtime)
 }
 
@@ -1827,9 +1907,21 @@ async fn write_terminal_input(
         return Err("Terminal input chunk is too large.".to_string());
     }
 
-    let Some(instance) = get_terminal_instance_if_current(state, pane_id, instance_id).await?
-    else {
-        return Ok(false);
+    let instance = {
+        let terminals = state.terminals.read().await;
+        let Some(instance) = terminals.get(pane_id).cloned() else {
+            return if instance_id.is_some() {
+                Ok(false)
+            } else {
+                Err("Terminal session is not running.".to_string())
+            };
+        };
+
+        if instance_id.is_some_and(|expected_id| expected_id != instance.id) {
+            return Ok(false);
+        }
+
+        instance
     };
     let input_kind = terminal_input_forensics_kind(data);
     log_terminal_crash_forensics_event(
@@ -1842,8 +1934,16 @@ async fn write_terminal_input(
         }),
     );
     let lock_started_at = Instant::now();
+    let terminals = state.terminals.read().await;
     let mut writer = instance.writer.lock().await;
     let lock_wait_ms = terminal_diagnostic_elapsed_ms(lock_started_at);
+    if terminals
+        .get(pane_id)
+        .map(|current| current.id != instance.id)
+        .unwrap_or(true)
+    {
+        return Ok(false);
+    }
     let write_started_at = Instant::now();
 
     if let Err(error) = writer.write_all(data.as_bytes()) {
@@ -2413,6 +2513,7 @@ fn cleanup_terminal_instance_with_context(
         session_mode: _,
         metadata,
         runtime: _,
+        launch_metadata: _,
         app_control_mcp_requested: _,
     } = instance;
     let metadata_fields = terminal_metadata_forensics_json(&metadata);
@@ -2697,6 +2798,81 @@ struct TerminalLiveParkedPromptSummary {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct TerminalSessionCapabilities {
+    provider: String,
+    current_model: Option<String>,
+    current_model_source: Option<String>,
+    current_effort: Option<String>,
+    current_speed: Option<String>,
+    permission_mode: Option<String>,
+    available_reasoning_efforts: Vec<String>,
+    available_permission_modes: Vec<String>,
+    can_prompt_answer: bool,
+    can_interrupt: bool,
+    can_raw_input: bool,
+    can_close: bool,
+    can_change_model_now: bool,
+    can_change_effort_now: bool,
+    can_change_permission_mode_now: bool,
+    prompt_answer_mechanism: String,
+    interrupt_mechanism: String,
+    raw_input_mechanism: String,
+}
+
+fn terminal_session_capabilities(
+    agent_kind: &str,
+    launch_metadata: &TerminalLaunchRuntimeMetadata,
+) -> TerminalSessionCapabilities {
+    let provider = terminal_normalize_agent_kind(Some(agent_kind))
+        .unwrap_or_else(|| agent_kind.trim().to_ascii_lowercase())
+        .replace('-', "_");
+    let available_reasoning_efforts = match provider.as_str() {
+        "codex" => ["low", "medium", "high", "xhigh"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        "claude" => ["low", "medium", "high", "xhigh", "max"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    };
+    let available_permission_modes = match provider.as_str() {
+        "codex" | "claude" | "opencode" => [
+            TERMINAL_PERMISSION_MODE_PLAN,
+            TERMINAL_PERMISSION_MODE_ASK,
+            TERMINAL_PERMISSION_MODE_ACCEPT_EDITS,
+            TERMINAL_PERMISSION_MODE_BYPASS,
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        _ => Vec::new(),
+    };
+    TerminalSessionCapabilities {
+        provider,
+        current_model: launch_metadata.model.clone(),
+        current_model_source: launch_metadata.model_source.clone(),
+        current_effort: launch_metadata.reasoning_effort.clone(),
+        current_speed: launch_metadata.speed.clone(),
+        permission_mode: launch_metadata.permission_mode.clone(),
+        available_reasoning_efforts,
+        available_permission_modes,
+        can_prompt_answer: true,
+        can_interrupt: true,
+        can_raw_input: false,
+        can_close: true,
+        can_change_model_now: false,
+        can_change_effort_now: false,
+        can_change_permission_mode_now: false,
+        prompt_answer_mechanism: "pty_keystroke".to_string(),
+        interrupt_mechanism: "pty_escape".to_string(),
+        raw_input_mechanism: "unsupported_cloud_lane".to_string(),
+    }
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct TerminalLiveSessionSummary {
     pane_id: String,
     instance_id: u64,
@@ -2737,6 +2913,7 @@ struct TerminalLiveSessionSummary {
     working_directory: String,
     session_mode: String,
     file_authority: String,
+    capabilities: TerminalSessionCapabilities,
     coordination: Option<TerminalLiveCoordinationSummary>,
     active_task: Option<TerminalLiveActiveTaskSummary>,
     parked_prompt: Option<TerminalLiveParkedPromptSummary>,
@@ -4387,20 +4564,23 @@ fn spawn_terminal_reader(
         }
         let start = tail.len().saturating_sub(TERMINAL_STARTUP_READY_SCAN_BYTES);
         let text = String::from_utf8_lossy(&tail[start..]);
-        let cleaned = cloud_mcp_clean_terminal_state_text(&text);
-        !cleaned.is_empty()
-            && !cloud_mcp_terminal_output_has_working_indicator(&cleaned)
-            && (cloud_mcp_terminal_output_has_prompt_marker(&text)
-                || cloud_mcp_terminal_output_has_prompt_marker(&cleaned))
+        let mut recent_lines = text.lines().rev().take(8).collect::<Vec<_>>();
+        recent_lines.reverse();
+        let recent_text = recent_lines.join("\n");
+        terminal_output_current_prompt_marker(&recent_text)
     }
 
     async fn observe_terminal_prompt_ready(
         app: AppHandle,
         terminals: Arc<RwLock<HashMap<String, TerminalInstance>>>,
         cloud_mcp_state: CloudMcpState,
+        headless_output: Arc<StdMutex<TerminalHeadlessOutputBuffer>>,
         pane_id: String,
         instance_id: u64,
     ) {
+        if !terminal_headless_tail_has_prompt_marker(&headless_output) {
+            return;
+        }
         let mut instance =
             match terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await {
                 Some(instance) => instance,
@@ -4437,6 +4617,9 @@ fn spawn_terminal_reader(
                 if runtime.input_ready
                     || !terminal_prompt_ready_recovery_allowed(&instance.metadata, &runtime)
                 {
+                    return;
+                }
+                if !terminal_headless_tail_has_prompt_marker(&headless_output) {
                     return;
                 }
             }
@@ -4854,6 +5037,7 @@ fn spawn_terminal_reader(
                         let readiness_app = app.clone();
                         let readiness_terminals = Arc::clone(&terminals);
                         let readiness_cloud_state = cloud_mcp_state.clone();
+                        let readiness_headless_output = Arc::clone(&headless_output);
                         let readiness_pane_id = reader_pane_id.clone();
                         let readiness_observer_in_flight =
                             Arc::clone(&prompt_ready_observer_in_flight);
@@ -4862,6 +5046,7 @@ fn spawn_terminal_reader(
                                 readiness_app,
                                 readiness_terminals,
                                 readiness_cloud_state,
+                                readiness_headless_output,
                                 readiness_pane_id,
                                 instance_id,
                             )
@@ -6117,6 +6302,7 @@ async fn terminal_open(
         terminal_nickname,
     };
     let terminal_metadata_for_log = terminal_metadata.clone();
+    let launch_metadata = terminal_launch_runtime_metadata_from_resolved(&resolved_launch);
 
     let (instance, reader) = TerminalInstance::from_warm_shell(
         instance_id,
@@ -6126,6 +6312,7 @@ async fn terminal_open(
         terminal_coordination.clone(),
         effective_session_mode,
         terminal_metadata,
+        launch_metadata,
         app_control_mcp_requested,
     );
     let runtime_snapshot = terminal_runtime_apply_opened(
@@ -6380,6 +6567,7 @@ async fn terminal_open(
         model_source: resolved_launch.model_source,
         reasoning_effort: resolved_launch.reasoning_effort,
         speed: resolved_launch.speed,
+        permission_mode: resolved_launch.permission_mode,
         activity_status: runtime_snapshot.activity_status,
         command_phase: runtime_snapshot.command_phase,
         input_ready: runtime_snapshot.input_ready,
@@ -7335,6 +7523,7 @@ async fn start_terminal_agent_in_prepared_pty(
                     fork_source_for_runtime.as_deref(),
                     "terminal-start-agent",
                 );
+                terminal_apply_launch_runtime_metadata(&instance, &resolved_launch);
                 terminal_record_workspace_agent_session_history(
                     Some(app.clone()),
                     &instance,
@@ -10355,6 +10544,40 @@ fn terminal_prompt_submitted_should_emit_synthetic_activity(
         || cloud_mcp_agent_uses_activity_hooks(&metadata.agent_kind)
 }
 
+fn terminal_prompt_fallback_event_id(
+    pane_id: &str,
+    instance_id: u64,
+    observed_at_ms: u64,
+    prompt: &str,
+) -> String {
+    use std::hash::{Hash, Hasher};
+
+    let pane_key = pane_id
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .chars()
+        .take(80)
+        .collect::<String>();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    prompt.hash(&mut hasher);
+    format!(
+        "terminal-prompt:{}:{}:{}:{:016x}",
+        if pane_key.is_empty() { "pane" } else { pane_key.as_str() },
+        instance_id,
+        observed_at_ms,
+        hasher.finish(),
+    )
+}
+
 fn emit_terminal_prompt_submitted_activity_started(
     app: &AppHandle,
     instance: &TerminalInstance,
@@ -10381,7 +10604,10 @@ fn emit_terminal_prompt_submitted_activity_started(
     let prompt_event_id = prompt_event_id
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .map(str::to_string);
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            terminal_prompt_fallback_event_id(&metadata.pane_id, instance.id, now_ms, prompt)
+        });
     let fork_from_provider_session_id =
         terminal_runtime_snapshot(instance).fork_from_provider_session_id;
     let thread_id = thread_id_override
@@ -10400,8 +10626,8 @@ fn emit_terminal_prompt_submitted_activity_started(
         provider_session_id: None,
         native_session_id: None,
         fork_from_provider_session_id: fork_from_provider_session_id.clone(),
-        provider_turn_id: prompt_event_id.clone(),
-        turn_id: prompt_event_id.clone(),
+        provider_turn_id: Some(prompt_event_id.clone()),
+        turn_id: Some(prompt_event_id.clone()),
         source: "backend:prompt-submitted".to_string(),
         event_type: "provider-turn-started".to_string(),
         hook_event_name: "BackendPromptSubmit".to_string(),
@@ -10445,8 +10671,8 @@ fn emit_terminal_prompt_submitted_activity_started(
         provider_session_id: None,
         native_session_id: None,
         fork_from_provider_session_id,
-        provider_turn_id: prompt_event_id.clone(),
-        turn_id: prompt_event_id,
+        provider_turn_id: Some(prompt_event_id.clone()),
+        turn_id: Some(prompt_event_id),
         transcript_path: None,
         cwd: Some(instance.working_directory.display().to_string()),
         user_message: Some(prompt.to_string()),
@@ -10456,6 +10682,15 @@ fn emit_terminal_prompt_submitted_activity_started(
         live_text_kind: None,
         tool_name: None,
         tool_use_id: None,
+        tool_server: None,
+        tool_input: None,
+        tool_output: None,
+        tool_error: None,
+        raw_tool_payload: None,
+        command: None,
+        file_path: None,
+        duration_ms: None,
+        exit_code: None,
         approval_id: None,
         permission_prompt_id: None,
         permission_request_id: None,
@@ -10514,6 +10749,19 @@ fn emit_terminal_prompt_submitted(
     if prompt.is_empty() {
         return;
     }
+    let resolved_prompt_event_id = prompt_event_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            terminal_prompt_fallback_event_id(
+                &instance.metadata.pane_id,
+                instance.id,
+                terminal_now_ms(),
+                prompt,
+            )
+        });
+    let prompt_event_id = Some(resolved_prompt_event_id.as_str());
     if !terminal_prompt_submitted_source_is_authoritative(
         prompt_source,
         prompt_match,
@@ -10736,6 +10984,39 @@ fn terminal_activity_hook_string(event: &Value, keys: &[&str]) -> Option<String>
     }
 
     None
+}
+
+fn terminal_activity_hook_value(event: &Value, keys: &[&str]) -> Option<Value> {
+    for key in keys {
+        let Some(value) = event.get(*key) else {
+            continue;
+        };
+        if value.is_null() {
+            continue;
+        }
+        if value.as_str().is_some_and(|text| text.trim().is_empty()) {
+            continue;
+        }
+        return Some(value.clone());
+    }
+
+    None
+}
+
+fn terminal_activity_hook_u64(event: &Value, keys: &[&str]) -> Option<u64> {
+    keys.iter().find_map(|key| {
+        event
+            .get(*key)
+            .and_then(|value| value.as_u64().or_else(|| value.as_str()?.trim().parse::<u64>().ok()))
+    })
+}
+
+fn terminal_activity_hook_i64(event: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter().find_map(|key| {
+        event
+            .get(*key)
+            .and_then(|value| value.as_i64().or_else(|| value.as_str()?.trim().parse::<i64>().ok()))
+    })
 }
 
 fn terminal_activity_hook_text_from_value(value: &Value) -> Option<String> {
@@ -11007,6 +11288,7 @@ fn terminal_activity_hook_prompt_option_from_value(
         return (!id.is_empty()).then(|| TerminalActivityHookPromptOption {
             id,
             label: text.chars().take(80).collect(),
+            description: None,
             value: Some(text.to_string()),
         });
     }
@@ -11037,9 +11319,16 @@ fn terminal_activity_hook_prompt_option_from_value(
             .filter(|text| !text.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| id.clone());
+        let description = items
+            .get(3)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(|text| text.chars().take(240).collect());
         return (!id.is_empty()).then(|| TerminalActivityHookPromptOption {
             id,
             label: label.chars().take(80).collect(),
+            description,
             value: raw_value,
         });
     }
@@ -11071,32 +11360,49 @@ fn terminal_activity_hook_prompt_option_from_value(
     .filter(|text| !text.is_empty())
     .map(str::to_string)
     .or_else(|| id_source.clone());
-    let label = [
+    let explicit_label = [
         "label",
         "title",
         "name",
         "text",
-        "description",
         "message",
-        "value",
-        "id",
     ]
     .iter()
     .find_map(|key| object.get(*key).and_then(Value::as_str))
     .map(str::trim)
     .filter(|text| !text.is_empty())
-    .map(str::to_string)
-    .or_else(|| raw_value.clone())
-    .unwrap_or_default();
+    .map(str::to_string);
+    let description_text = [
+        "description",
+        "detail",
+        "help",
+        "hint",
+        "summary",
+    ]
+    .iter()
+    .find_map(|key| object.get(*key).and_then(Value::as_str))
+    .map(str::trim)
+    .filter(|text| !text.is_empty())
+    .map(str::to_string);
+    let label = explicit_label
+        .clone()
+        .or_else(|| raw_value.clone())
+        .or_else(|| description_text.clone())
+        .or_else(|| id_source.clone())
+        .unwrap_or_default();
     let id = id_source
         .as_deref()
         .or(raw_value.as_deref())
         .or_else(|| (!label.is_empty()).then_some(label.as_str()))
         .map(terminal_activity_hook_prompt_option_id)
         .unwrap_or_default();
+    let description = description_text
+        .filter(|text| text != &label)
+        .map(|text| text.chars().take(240).collect());
     (!id.is_empty()).then(|| TerminalActivityHookPromptOption {
         id,
         label: label.chars().take(80).collect(),
+        description,
         value: raw_value,
     })
 }
@@ -11130,16 +11436,19 @@ fn terminal_activity_hook_prompt_options_from_event(
             TerminalActivityHookPromptOption {
                 id: "allow_once".to_string(),
                 label: "Allow once".to_string(),
+                description: None,
                 value: None,
             },
             TerminalActivityHookPromptOption {
-                id: "deny".to_string(),
-                label: "Deny".to_string(),
+                id: "allow_always".to_string(),
+                label: "Allow always".to_string(),
+                description: None,
                 value: None,
             },
             TerminalActivityHookPromptOption {
-                id: "park".to_string(),
-                label: "Park todo".to_string(),
+                id: "reject".to_string(),
+                label: "Reject".to_string(),
+                description: None,
                 value: None,
             },
         ]);
@@ -11147,6 +11456,7 @@ fn terminal_activity_hook_prompt_options_from_event(
         options.push(TerminalActivityHookPromptOption {
             id: "continue".to_string(),
             label: "Continue".to_string(),
+            description: None,
             value: None,
         });
     }
@@ -11390,7 +11700,7 @@ fn terminal_activity_hook_manual_prompt(
     .filter(|value| !value.is_empty())
     .or_else(|| {
         if matches!(kind.as_str(), "approval" | "permission") {
-            Some("deny".to_string())
+            Some("reject".to_string())
         } else {
             None
         }
@@ -11415,6 +11725,7 @@ fn terminal_activity_hook_manual_prompt(
             options.push(TerminalActivityHookPromptOption {
                 id: default_option.to_string(),
                 label: default_option.replace('_', " "),
+                description: None,
                 value: None,
             });
         }
@@ -11721,6 +12032,179 @@ fn terminal_activity_hook_non_lifecycle_is_expected(hook_event_name: &str) -> bo
             | "userpromptrequired"
             | "userpromptstarted"
     )
+}
+
+fn terminal_activity_strip_terminal_sequences(value: &str) -> String {
+    enum State {
+        Ground,
+        Escape,
+        Csi,
+        Osc,
+        OscEscape,
+        Ss3,
+    }
+
+    let mut state = State::Ground;
+    let mut output = String::with_capacity(value.len());
+    for character in value.chars() {
+        match state {
+            State::Ground => match character {
+                '\u{1b}' => state = State::Escape,
+                '\u{8}' => {
+                    if !output.ends_with('\n') {
+                        output.pop();
+                    }
+                }
+                '\r' | '\n' => output.push('\n'),
+                '\t' => output.push(' '),
+                _ if character.is_control() => output.push(' '),
+                _ => output.push(character),
+            },
+            State::Escape => {
+                state = match character {
+                    '[' => State::Csi,
+                    ']' | 'P' | '^' | '_' | 'X' => State::Osc,
+                    'O' => State::Ss3,
+                    _ => State::Ground,
+                };
+            }
+            State::Csi => {
+                let code = character as u32;
+                if (0x40..=0x7e).contains(&code) {
+                    state = State::Ground;
+                }
+            }
+            State::Osc => {
+                if character == '\u{1b}' {
+                    state = State::OscEscape;
+                } else if character == '\u{7}' {
+                    state = State::Ground;
+                }
+            }
+            State::OscEscape => {
+                state = if character == '\\' {
+                    State::Ground
+                } else if character == '\u{1b}' {
+                    State::OscEscape
+                } else {
+                    State::Osc
+                };
+            }
+            State::Ss3 => state = State::Ground,
+        }
+    }
+    output
+}
+
+fn terminal_activity_compact_text(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn terminal_activity_collapse_duplicate_runs(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut previous = None;
+    for character in value.chars() {
+        if Some(character) != previous {
+            output.push(character);
+        }
+        previous = Some(character);
+    }
+    output
+}
+
+fn terminal_activity_line_is_tui_context(line: &str) -> bool {
+    let compact = terminal_activity_compact_text(line);
+    let lower = compact.to_ascii_lowercase();
+    let deduped_lower = terminal_activity_collapse_duplicate_runs(&lower);
+    let status_line = |value: &str| {
+        value.contains("esc to interrupt")
+            || value == "working"
+            || (value.starts_with("working ") && value.contains(" esc "))
+            || (value.starts_with("working ") && value.contains(" interrupt"))
+            || value.contains("context refresh")
+    };
+    if status_line(&lower) || status_line(&deduped_lower) {
+        return true;
+    }
+
+    let has_footer_separator = lower.contains(" · ") || lower.contains('·');
+    let has_path_hint = lower.contains("~/") || lower.contains('/') || lower.contains('\\');
+    let has_model_hint = lower.starts_with("gpt-")
+        || lower.starts_with("claude")
+        || lower.contains(" xhigh")
+        || lower.contains(" high")
+        || lower.contains(" medium")
+        || lower.contains(" low")
+        || lower.contains(" opus")
+        || lower.contains(" sonnet")
+        || lower.contains(" haiku");
+    if has_footer_separator && has_path_hint && has_model_hint {
+        return true;
+    }
+
+    lower.contains("ctrl+p commands")
+        && (lower.contains("opencode") || lower.contains("build "))
+}
+
+fn terminal_activity_line_is_prompt_chrome(line: &str) -> bool {
+    let compact = terminal_activity_compact_text(line);
+
+    let prompt_trimmed = compact
+        .trim_start_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '│' | '┃' | '┆' | '┊')
+        })
+        .trim();
+    prompt_trimmed == ">"
+        || prompt_trimmed.starts_with("> ")
+        || prompt_trimmed.starts_with('›')
+        || prompt_trimmed.starts_with('❯')
+        || prompt_trimmed.starts_with('❱')
+}
+
+fn terminal_activity_line_is_tui_chrome(line: &str, tui_context: bool) -> bool {
+    terminal_activity_line_is_tui_context(line)
+        || (tui_context && terminal_activity_line_is_prompt_chrome(line))
+}
+
+fn terminal_activity_tui_activity_text(value: &str) -> Option<String> {
+    let cleaned = terminal_activity_strip_terminal_sequences(value);
+    let compact = terminal_activity_compact_text(&cleaned);
+    let lower = compact.to_ascii_lowercase();
+    let deduped_lower = terminal_activity_collapse_duplicate_runs(&lower);
+    if lower.contains("working")
+        || lower.contains("esc to interrupt")
+        || deduped_lower.contains("working")
+        || deduped_lower.contains("esc to interrupt")
+    {
+        return Some("Working".to_string());
+    }
+    if lower.contains("context refresh") || deduped_lower.contains("context refresh") {
+        return Some("Context refresh".to_string());
+    }
+    None
+}
+
+fn terminal_activity_hook_live_message_text(value: &str) -> Option<String> {
+    let cleaned = terminal_activity_strip_terminal_sequences(value);
+    let compact_lines = cleaned
+        .lines()
+        .map(terminal_activity_compact_text)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    let tui_context = compact_lines
+        .iter()
+        .any(|line| terminal_activity_line_is_tui_context(line));
+    let lines = compact_lines
+        .into_iter()
+        .filter(|line| !terminal_activity_line_is_tui_chrome(line, tui_context))
+        .collect::<Vec<_>>();
+    let text = lines.join("\n");
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn terminal_activity_hook_activity_message_text(value: &str) -> Option<String> {
+    terminal_activity_hook_live_message_text(value)
+        .or_else(|| terminal_activity_tui_activity_text(value))
 }
 
 fn terminal_architecture_graph_path_from_text(value: &str) -> String {
@@ -12042,8 +12526,8 @@ fn terminal_activity_hook_payload(
             "last_message",
         ]
     };
-    let user_message = terminal_activity_hook_message_text(event, user_message_keys);
-    let live_text_kind = if final_message_hook && user_message.as_deref().is_some_and(|value| !value.trim().is_empty()) {
+    let raw_user_message = terminal_activity_hook_message_text(event, user_message_keys);
+    let live_text_kind = if final_message_hook && raw_user_message.as_deref().is_some_and(|value| !value.trim().is_empty()) {
         Some("assistant".to_string())
     } else if matches!(
         hook_key.as_str(),
@@ -12073,7 +12557,7 @@ fn terminal_activity_hook_payload(
             | "reasoningdelta"
             | "assistantreasoningdelta"
     );
-    let live_text_delta = if live_text_kind.is_some() && live_delta_hook {
+    let raw_live_text_delta = if live_text_kind.is_some() && live_delta_hook {
         terminal_activity_hook_message_text(
             event,
             &[
@@ -12096,11 +12580,14 @@ fn terminal_activity_hook_payload(
                 "message",
             ],
         )
-        .or_else(|| user_message.clone())
+        .or_else(|| raw_user_message.clone())
         .filter(|value| !value.trim().is_empty())
     } else {
         None
     };
+    let live_text_delta = raw_live_text_delta
+        .as_deref()
+        .and_then(terminal_activity_hook_live_message_text);
     let explicit_live_text_snapshot = terminal_activity_hook_message_text(
         event,
         &[
@@ -12112,19 +12599,39 @@ fn terminal_activity_hook_payload(
             "message_snapshot",
             "cumulativeText",
             "cumulative_text",
+            "reasoningSnapshot",
+            "reasoning_snapshot",
+            "thinkingSnapshot",
+            "thinking_snapshot",
             "snapshot",
         ],
     );
-    let live_text_snapshot = if final_message_hook && live_text_kind.is_some() {
-        user_message.clone().filter(|value| !value.trim().is_empty())
+    let raw_live_text_snapshot = if final_message_hook && live_text_kind.is_some() {
+        raw_user_message
+            .clone()
+            .filter(|value| !value.trim().is_empty())
     } else {
         explicit_live_text_snapshot
+    };
+    let live_text_snapshot = raw_live_text_snapshot
+        .as_deref()
+        .and_then(terminal_activity_hook_live_message_text);
+    let user_message = if live_text_kind.is_some() {
+        raw_user_message
+            .as_deref()
+            .and_then(terminal_activity_hook_activity_message_text)
+    } else {
+        raw_user_message.clone()
     };
     let input_ready_at = input_ready.then(|| event_time.clone());
     let prompt_ready_at = input_ready.then(|| event_time.clone());
     let completed_at = input_ready.then(|| event_time.clone());
     let permission_mode =
         terminal_activity_hook_string(event, &["permissionMode", "permission_mode"]);
+    let prompt_is_open = matches!(
+        event_type,
+        "provider-permission-requested" | "provider-user-prompt-started"
+    );
     let manual_prompt_source = manual_prompt.as_ref().map(|_| "hook".to_string());
     let manual_approval_required = manual_prompt
         .as_ref()
@@ -12138,20 +12645,90 @@ fn terminal_activity_hook_payload(
             event,
             &["providerBlockedForUser", "provider_blocked_for_user"],
         );
-    let terminal_is_prompting_user = manual_prompt.is_some();
-    let prompting_user_kind = manual_prompt.as_ref().map(|prompt| prompt.kind.clone());
+    let explicit_prompt_kind = terminal_activity_hook_string(
+        event,
+        &[
+            "promptKind",
+            "prompt_kind",
+            "promptingUserKind",
+            "prompting_user_kind",
+            "promptingKind",
+            "prompting_kind",
+        ],
+    )
+    .map(|value| terminal_activity_hook_name_key(&value))
+    .filter(|value| {
+        matches!(
+            value.as_str(),
+            "approval" | "permission" | "question" | "selection" | "input" | "text" | "choice"
+        )
+    });
+    let prompt_kind = manual_prompt
+        .as_ref()
+        .map(|prompt| prompt.kind.clone())
+        .or_else(|| explicit_prompt_kind.clone())
+        .or_else(|| {
+            if event_type == "provider-permission-requested" {
+                Some("permission".to_string())
+            } else if event_type == "provider-user-prompt-started" {
+                Some("prompt".to_string())
+            } else {
+                None
+            }
+        });
+    let terminal_is_prompting_user = manual_prompt.is_some() || prompt_is_open;
+    let prompting_user_kind = manual_prompt
+        .as_ref()
+        .map(|prompt| prompt.kind.clone())
+        .or_else(|| prompt_kind.clone());
     let prompting_user_text = manual_prompt
         .as_ref()
-        .and_then(|prompt| prompt.text.clone());
+        .and_then(|prompt| prompt.text.clone())
+        .or_else(|| {
+            terminal_activity_hook_string(
+                event,
+                &[
+                    "promptingUserText",
+                    "prompting_user_text",
+                    "promptingText",
+                    "prompting_text",
+                    "question",
+                    "title",
+                    "description",
+                    "message",
+                    "prompt",
+                ],
+            )
+        });
+    let event_approval_id = terminal_activity_hook_string(event, &["approvalId", "approval_id"]);
+    let event_permission_prompt_id =
+        terminal_activity_hook_string(event, &["permissionPromptId", "permission_prompt_id"]);
+    let event_permission_request_id = terminal_activity_hook_string(
+        event,
+        &[
+            "permissionRequestId",
+            "permission_request_id",
+            "promptId",
+            "prompt_id",
+            "questionId",
+            "question_id",
+            "selectionId",
+            "selection_id",
+            "id",
+        ],
+    );
     let approval_id = manual_prompt
         .as_ref()
-        .and_then(|prompt| prompt.approval_id.clone());
+        .and_then(|prompt| prompt.approval_id.clone())
+        .or_else(|| event_approval_id.clone());
     let permission_prompt_id = manual_prompt
         .as_ref()
-        .and_then(|prompt| prompt.permission_prompt_id.clone());
+        .and_then(|prompt| prompt.permission_prompt_id.clone())
+        .or_else(|| event_permission_prompt_id.clone());
     let permission_request_id = manual_prompt
         .as_ref()
-        .and_then(|prompt| prompt.permission_request_id.clone());
+        .and_then(|prompt| prompt.permission_request_id.clone())
+        .or_else(|| event_permission_request_id.clone());
     let prompt_id = manual_prompt.as_ref().and_then(|prompt| {
         prompt
             .approval_id
@@ -12159,16 +12736,64 @@ fn terminal_activity_hook_payload(
             .or_else(|| prompt.permission_prompt_id.clone())
             .or_else(|| prompt.permission_request_id.clone())
             .or_else(|| terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]))
-    });
-    let prompt_kind = manual_prompt.as_ref().map(|prompt| prompt.kind.clone());
+    })
+    .or_else(|| event_approval_id.clone())
+    .or_else(|| event_permission_prompt_id.clone())
+    .or_else(|| event_permission_request_id.clone())
+    .or_else(|| terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]));
+    let explicit_default_option = terminal_activity_hook_string(
+        event,
+        &[
+            "promptDefaultOption",
+            "prompt_default_option",
+            "defaultOption",
+            "default_option",
+            "default",
+            "defaultDecision",
+            "default_decision",
+        ],
+    )
+    .map(|value| terminal_activity_hook_prompt_option_id(&value))
+    .filter(|value| !value.is_empty());
     let prompt_default_option = manual_prompt
         .as_ref()
-        .and_then(|prompt| prompt.default_option.clone());
-    let prompt_ttl_ms = manual_prompt.as_ref().and_then(|prompt| prompt.ttl_ms);
+        .and_then(|prompt| prompt.default_option.clone())
+        .or(explicit_default_option)
+        .or_else(|| {
+            (prompt_is_open && matches!(prompt_kind.as_deref(), Some("approval" | "permission")))
+                .then(|| "reject".to_string())
+        });
+    let event_prompt_ttl_ms = [
+        "promptTtlMs",
+        "prompt_ttl_ms",
+        "ttlMs",
+        "ttl_ms",
+        "timeoutMs",
+        "timeout_ms",
+    ]
+    .iter()
+    .find_map(|key| {
+        event
+            .get(*key)
+            .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse::<u64>().ok()))
+    });
+    let prompt_ttl_ms = manual_prompt
+        .as_ref()
+        .and_then(|prompt| prompt.ttl_ms)
+        .or(event_prompt_ttl_ms);
     let prompt_options = manual_prompt
         .as_ref()
         .map(|prompt| prompt.options.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            if prompt_is_open {
+                terminal_activity_hook_prompt_options_from_event(
+                    event,
+                    prompt_kind.as_deref().unwrap_or_default(),
+                )
+            } else {
+                Vec::new()
+            }
+        });
     let prompt_answer_option = if matches!(
         event_type,
         "provider-user-prompt-answered" | "provider-user-prompt-completed"
@@ -12276,6 +12901,33 @@ fn terminal_activity_hook_payload(
         live_text_kind,
         tool_name: terminal_activity_hook_string(event, &["toolName", "tool_name"]),
         tool_use_id: terminal_activity_hook_string(event, &["toolUseId", "tool_use_id"]),
+        tool_server: terminal_activity_hook_string(event, &["toolServer", "tool_server", "server"]),
+        tool_input: terminal_activity_hook_value(event, &["toolInput", "tool_input", "input", "arguments", "args"]),
+        tool_output: terminal_activity_hook_value(
+            event,
+            &[
+                "toolOutput",
+                "tool_output",
+                "toolResponse",
+                "tool_response",
+                "output",
+                "result",
+                "response",
+                "stdout",
+            ],
+        ),
+        tool_error: terminal_activity_hook_value(
+            event,
+            &["toolError", "tool_error", "error", "stderr"],
+        ),
+        raw_tool_payload: terminal_activity_hook_value(
+            event,
+            &["rawToolPayload", "raw_tool_payload", "rawPayload", "raw_payload", "raw"],
+        ),
+        command: terminal_activity_hook_string(event, &["command"]),
+        file_path: terminal_activity_hook_string(event, &["filePath", "file_path", "path"]),
+        duration_ms: terminal_activity_hook_u64(event, &["durationMs", "duration_ms", "elapsedMs", "elapsed_ms"]),
+        exit_code: terminal_activity_hook_i64(event, &["exitCode", "exit_code", "code"]),
         approval_id,
         permission_prompt_id,
         permission_request_id,
@@ -12494,10 +13146,16 @@ fn terminal_hook_prompt_submitted_observe(
         app,
         instance,
         prompt,
-        None,
+        payload
+            .turn_id
+            .as_deref()
+            .or(payload.provider_turn_id.as_deref()),
         None,
         Some("cli-activity-hook"),
-        None,
+        payload
+            .prompt_ready_at
+            .as_deref()
+            .or(payload.input_ready_at.as_deref()),
         None,
         None,
         None,
@@ -12689,6 +13347,16 @@ fn terminal_activity_hook_startup_idle_buffered(event: &Value) -> bool {
     )
 }
 
+fn terminal_activity_hook_codex_idle_quiesce_buffered(event: &Value) -> bool {
+    terminal_activity_hook_bool(
+        event,
+        &[
+            "codexIdleQuiesceBuffered",
+            "codex_idle_quiesce_buffered",
+        ],
+    )
+}
+
 fn terminal_activity_payload_is_idle_ready(payload: &TerminalActivityHookPayload) -> bool {
     payload.input_ready
         && (terminal_projection_state_is_idle(&payload.activity_status)
@@ -12697,6 +13365,25 @@ fn terminal_activity_payload_is_idle_ready(payload: &TerminalActivityHookPayload
                 terminal_projection_text(&payload.command_phase, "").as_str(),
                 "completed" | "complete" | "done"
             ))
+}
+
+fn terminal_activity_hook_should_quiesce_codex_idle(
+    instance: &TerminalInstance,
+    event: &Value,
+    payload: &TerminalActivityHookPayload,
+    current_runtime_is_starting: bool,
+    current_runtime_is_busy_turn: bool,
+) -> bool {
+    terminal_metadata_is_codex(&instance.metadata)
+        && !terminal_activity_hook_codex_idle_quiesce_buffered(event)
+        && !terminal_activity_hook_startup_idle_buffered(event)
+        && !current_runtime_is_starting
+        && current_runtime_is_busy_turn
+        && terminal_activity_payload_is_idle_ready(payload)
+        && matches!(
+            terminal_activity_hook_name_key(&payload.hook_event_name).as_str(),
+            "stop" | "turnstop" | "assistantstop"
+        )
 }
 
 fn apply_terminal_activity_hook_payload(
@@ -12849,7 +13536,11 @@ async fn process_terminal_activity_hook_event(
     };
     let current_runtime = terminal_runtime_snapshot(instance);
     let current_runtime_is_starting = terminal_runtime_snapshot_is_starting(&current_runtime);
-    if terminal_activity_hook_startup_idle_candidate(event) && !current_runtime_is_starting {
+    let current_runtime_is_busy_turn = terminal_runtime_snapshot_is_busy_turn(&current_runtime);
+    if terminal_activity_hook_startup_idle_candidate(event)
+        && !current_runtime_is_starting
+        && !current_runtime_is_busy_turn
+    {
         log_terminal_status_event(
             "backend.terminal_activity_hook.startup_idle_candidate_ignored",
             json!({
@@ -12925,6 +13616,76 @@ async fn process_terminal_activity_hook_event(
                 delayed_payload,
                 delayed_architecture_payload,
                 "startup-idle-buffer",
+            );
+        });
+        return;
+    }
+    if terminal_activity_hook_should_quiesce_codex_idle(
+        instance,
+        event,
+        &payload,
+        current_runtime_is_starting,
+        current_runtime_is_busy_turn,
+    ) {
+        let scheduled_runtime_fingerprint =
+            terminal_runtime_startup_idle_fingerprint(&current_runtime);
+        let app = app.clone();
+        let terminals = Arc::clone(terminals);
+        let cloud_mcp_state = cloud_mcp_state.clone();
+        let pane_id = pane_id.to_string();
+        let mut buffered_event = event.clone();
+        if let Some(object) = buffered_event.as_object_mut() {
+            object.insert("codexIdleQuiesceBuffered".to_string(), json!(true));
+        }
+        log_terminal_status_event(
+            "backend.terminal_activity_hook.codex_idle_quiesce_buffered",
+            json!({
+                "buffer_ms": TERMINAL_CODEX_IDLE_QUIESCE_MS,
+                "hook_event_name": payload.hook_event_name.clone(),
+                "instance_id": instance_id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "source": source,
+            }),
+        );
+        tauri::async_runtime::spawn(async move {
+            sleep(Duration::from_millis(TERMINAL_CODEX_IDLE_QUIESCE_MS)).await;
+            let Some(current_instance) =
+                terminal_activity_hook_current_instance(&terminals, &pane_id, instance_id).await
+            else {
+                return;
+            };
+            let runtime = terminal_runtime_snapshot(&current_instance);
+            if runtime.input_ready
+                || !terminal_runtime_snapshot_is_busy_turn(&runtime)
+                || terminal_runtime_startup_idle_fingerprint(&runtime)
+                    != scheduled_runtime_fingerprint
+            {
+                log_terminal_status_event(
+                    "backend.terminal_activity_hook.codex_idle_quiesce_cancelled",
+                    json!({
+                        "instance_id": instance_id,
+                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                        "reason": "runtime_changed",
+                    }),
+                );
+                return;
+            }
+            let Some(delayed_payload) =
+                terminal_activity_hook_payload(&current_instance, &buffered_event)
+            else {
+                return;
+            };
+            let delayed_architecture_payload =
+                terminal_architecture_activity_payload(&current_instance, &buffered_event);
+            apply_terminal_activity_hook_payload(
+                &app,
+                &terminals,
+                &cloud_mcp_state,
+                &current_instance,
+                &buffered_event,
+                delayed_payload,
+                delayed_architecture_payload,
+                "codex-idle-quiesce",
             );
         });
         return;
@@ -13949,6 +14710,25 @@ async fn mark_terminal_parked_prompt_lifecycle_in_cloud(
         .await;
 }
 
+fn terminal_write_is_prompt_answer(
+    prompt_event_source: Option<&str>,
+    todo_action: Option<&str>,
+) -> bool {
+    [prompt_event_source, todo_action]
+        .into_iter()
+        .flatten()
+        .any(|value| {
+            matches!(
+                terminal_projection_text(value, "").as_str(),
+                "agent_prompt_answer"
+                    | "answer_agent_prompt"
+                    | "agent_input_answer"
+                    | "terminal_prompt_answer"
+                    | "prompt_answer"
+            )
+        })
+}
+
 async fn terminal_write_inner(
     app: AppHandle,
     state: &TerminalState,
@@ -13971,6 +14751,10 @@ async fn terminal_write_inner(
     _realtime_write: bool,
 ) -> Result<(), String> {
     validate_terminal_pane_id(&pane_id)?;
+    let prompt_answer_requested = terminal_write_is_prompt_answer(
+        prompt_event_source.as_deref(),
+        todo_action.as_deref(),
+    );
     let Some(instance) = get_terminal_instance_if_current(state, &pane_id, instance_id).await?
     else {
         write_thread_bridge_diagnostic_log_entry(json!({
@@ -14009,11 +14793,18 @@ async fn terminal_write_inner(
             }));
             return Err("Terminal session is not running.".to_string());
         }
+        if prompt_answer_requested {
+            return Err("Terminal session is not running.".to_string());
+        }
         return Ok(());
     };
-    let prompt_submission_requested = prompt_event_text
+    let mut prompt_event_id = prompt_event_id;
+    let prompt_submission_text = prompt_event_text
         .as_deref()
-        .is_some_and(|value| !value.trim().is_empty());
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let prompt_submission_requested = prompt_submission_text.is_some();
     if prompt_submission_requested {
         log_terminal_status_event(
             "backend.terminal_write.prompt_start",
@@ -14084,6 +14875,41 @@ async fn terminal_write_inner(
                 return Err(error);
             }
         }
+    }
+    if let Some(event_prompt) = prompt_submission_text
+        .as_deref()
+        .filter(|value| !is_terminal_control_prompt(value))
+    {
+        let resolved_prompt_event_id = prompt_event_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                terminal_prompt_fallback_event_id(&pane_id, instance.id, terminal_now_ms(), event_prompt)
+            });
+        prompt_event_id = Some(resolved_prompt_event_id);
+        emit_terminal_prompt_submitted_activity_started(
+            &app,
+            &instance,
+            event_prompt,
+            prompt_event_id.as_deref(),
+            prompt_event_submitted_at.as_deref(),
+            "terminal_write_prompt_submit",
+            thread_id.as_deref(),
+        );
+        log_terminal_status_event(
+            "backend.terminal_write.prompt_first_paint_emitted",
+            json!({
+                "has_prompt_event_id": true,
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                "prompt_event_id": prompt_event_id.as_deref().unwrap_or_default(),
+                "prompt_event_source": prompt_event_source.as_deref().unwrap_or_default(),
+                "prompt_text_len": event_prompt.len(),
+                "thread_id": thread_id.as_deref().unwrap_or_default(),
+            }),
+        );
     }
     let _input_guard = instance.input_queue.lock().await;
     let original_data_diagnostic = terminal_write_data_diagnostic(&data);
@@ -14206,6 +15032,9 @@ async fn terminal_write_inner(
         }
     };
     let input_write_elapsed_ms = terminal_diagnostic_elapsed_ms(input_write_started_at);
+    if prompt_answer_requested && !input_write_result {
+        return Err("Agent prompt answer was not written to the terminal.".to_string());
+    }
     if prompt_submission_requested {
         log_terminal_status_event(
             "backend.terminal_write.prompt_write_done",
@@ -14711,20 +15540,59 @@ async fn terminal_write(
     .await
 }
 
+fn terminal_agent_kind_is_opencode(value: &str) -> bool {
+    let normalized = value.trim().to_ascii_lowercase();
+    normalized.contains("opencode")
+        || normalized.contains("open-code")
+        || normalized.contains("open_code")
+}
+
+fn terminal_opencode_prompt_answer_input(key: &str) -> Option<String> {
+    match key {
+        "1" | "allow" | "allow_once" | "approve" | "approved" | "once" | "yes" | "y" => {
+            Some("\r".to_string())
+        }
+        "2" | "allow_always" | "always" | "approve_always" => Some("\x1b[C\r\r".to_string()),
+        "3" | "deny" | "denied" | "no" | "n" | "reject" | "rejected" => {
+            Some("\x1b[C\x1b[C\r".to_string())
+        }
+        "cancel" | "escape" | "interrupt" | "park" | "skip" => Some("\x1b".to_string()),
+        "continue" | "default" | "enter" | "ok" => Some("\r".to_string()),
+        _ => None,
+    }
+}
+
 fn terminal_agent_prompt_answer_input(
+    agent_kind: &str,
     option_id: &str,
     option_label: &str,
     option_value: Option<&str>,
 ) -> String {
+    let option_key = terminal_activity_hook_prompt_option_id(option_id);
+    let label_key = terminal_activity_hook_prompt_option_id(option_label);
+    let value_key = option_value
+        .map(terminal_activity_hook_prompt_option_id)
+        .unwrap_or_default();
+    let key = [
+        option_key.as_str(),
+        label_key.as_str(),
+        value_key.as_str(),
+    ]
+    .into_iter()
+    .find(|value| !value.is_empty())
+    .unwrap_or_default();
+    if terminal_agent_kind_is_opencode(agent_kind) {
+        if let Some(input) = terminal_opencode_prompt_answer_input(key) {
+            return input;
+        }
+    }
     if let Some(value) = option_value.map(str::trim).filter(|value| !value.is_empty()) {
         return format!("{value}\r");
     }
-    let option_key = terminal_activity_hook_prompt_option_id(option_id);
-    let label_key = terminal_activity_hook_prompt_option_id(option_label);
-    let key = if option_key.is_empty() {
-        label_key.as_str()
+    let key = if key.is_empty() {
+        option_id
     } else {
-        option_key.as_str()
+        key
     };
     match key {
         "allow" | "allow_once" | "approve" | "approved" | "once" | "yes" | "y" => "y\r".to_string(),
@@ -14789,11 +15657,21 @@ pub(crate) async fn terminal_answer_agent_prompt_remote_command(
         .unwrap_or_else(|| option_id.clone());
     let option_value =
         terminal_remote_command_string(&event, &["option_value", "optionValue", "value"]);
-    let data = terminal_agent_prompt_answer_input(&option_id, &option_label, option_value.as_deref());
     let state_app = app.clone();
     let cloud_app = app.clone();
     let state = state_app.state::<TerminalState>();
     let cloud_mcp_state = cloud_app.state::<CloudMcpState>();
+    let Some(instance) = get_terminal_instance_if_current(state.inner(), &pane_id, instance_id)
+        .await?
+    else {
+        return Err("Terminal session is not running.".to_string());
+    };
+    let data = terminal_agent_prompt_answer_input(
+        &instance.metadata.agent_kind,
+        &option_id,
+        &option_label,
+        option_value.as_deref(),
+    );
     terminal_write_inner(
         app,
         state.inner(),
@@ -14816,12 +15694,32 @@ pub(crate) async fn terminal_answer_agent_prompt_remote_command(
         true,
     )
     .await?;
+    let runtime = match get_terminal_instance_if_current(state.inner(), &pane_id, instance_id).await {
+        Ok(Some(instance)) => Some(terminal_runtime_snapshot(&instance)),
+        _ => None,
+    };
     Ok(json!({
         "prompt_id": prompt_id,
         "option_id": option_id,
         "option_value": option_value.unwrap_or_default(),
         "pane_id": pane_id,
         "terminal_instance_id": instance_id,
+        "turn_id": runtime
+            .as_ref()
+            .and_then(|snapshot| snapshot.turn_id.clone())
+            .unwrap_or_default(),
+        "provider_turn_id": runtime
+            .as_ref()
+            .and_then(|snapshot| snapshot.provider_turn_id.clone())
+            .unwrap_or_default(),
+        "provider_session_id": runtime
+            .as_ref()
+            .and_then(|snapshot| snapshot.provider_session_id.clone())
+            .unwrap_or_default(),
+        "native_session_id": runtime
+            .as_ref()
+            .and_then(|snapshot| snapshot.native_session_id.clone())
+            .unwrap_or_default(),
         "answered": true,
     }))
 }
@@ -16319,6 +17217,12 @@ async fn terminal_live_sessions(
         let has_active_task = active_task.is_some();
         let parked = parked_prompt.is_some();
         let projected_runtime = terminal_project_runtime(&metadata, &runtime, parked);
+        let launch_metadata = instance
+            .launch_metadata
+            .lock()
+            .map(|metadata| metadata.clone())
+            .unwrap_or_default();
+        let capabilities = terminal_session_capabilities(&metadata.agent_kind, &launch_metadata);
 
         summaries.push(TerminalLiveSessionSummary {
             pane_id,
@@ -16360,6 +17264,7 @@ async fn terminal_live_sessions(
             working_directory: instance.working_directory.to_string_lossy().to_string(),
             session_mode: instance.session_mode.as_str().to_string(),
             file_authority: instance.session_mode.file_authority().to_string(),
+            capabilities,
             coordination,
             active_task,
             parked_prompt,
@@ -17657,7 +18562,7 @@ mod terminal_tests {
         claude_metadata.agent_kind = "claude".to_string();
 
         assert!(terminal_runtime_snapshot_is_busy_turn(&runtime));
-        assert!(terminal_prompt_ready_recovery_allowed(
+        assert!(!terminal_prompt_ready_recovery_allowed(
             &codex_metadata,
             &runtime
         ));
@@ -17687,6 +18592,112 @@ mod terminal_tests {
         runtime.activity_status = "error".to_string();
         runtime.command_phase = "failed".to_string();
         assert!(!terminal_runtime_snapshot_is_busy_turn(&runtime));
+    }
+
+    #[test]
+    fn codex_busy_prompt_ready_recovery_is_blocked() {
+        let runtime = TerminalRuntimeSnapshot {
+            status: "active".to_string(),
+            activity_status: "thinking".to_string(),
+            command_phase: "running".to_string(),
+            input_ready: false,
+            input_ready_at: None,
+            prompt_ready_at: None,
+            completed_at: None,
+            provider_session_id: Some("session-1".to_string()),
+            native_session_id: Some("session-1".to_string()),
+            fork_from_provider_session_id: None,
+            provider_turn_id: Some("turn-1".to_string()),
+            turn_id: Some("turn-1".to_string()),
+            source: "cli-hook:provider-turn-started".to_string(),
+            event_type: "provider-turn-started".to_string(),
+            hook_event_name: "UserPromptSubmit".to_string(),
+            updated_at_ms: 1,
+        };
+        let mut codex_metadata = terminal_projection_test_metadata();
+        codex_metadata.agent_id = "codex".to_string();
+        codex_metadata.agent_kind = "codex".to_string();
+        let mut opencode_metadata = codex_metadata.clone();
+        opencode_metadata.agent_id = "opencode".to_string();
+        opencode_metadata.agent_kind = "opencode".to_string();
+
+        assert!(terminal_runtime_snapshot_is_busy_turn(&runtime));
+        assert!(!terminal_prompt_ready_recovery_allowed(
+            &codex_metadata,
+            &runtime
+        ));
+        assert!(terminal_prompt_ready_recovery_allowed(
+            &opencode_metadata,
+            &runtime
+        ));
+    }
+
+    #[test]
+    fn approval_prompt_fallback_matches_opencode_tui_choices() {
+        let options = terminal_activity_hook_prompt_options_from_event(&json!({}), "permission");
+        let ids = options
+            .iter()
+            .map(|option| option.id.as_str())
+            .collect::<Vec<_>>();
+        let labels = options
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, vec!["allow_once", "allow_always", "reject"]);
+        assert_eq!(labels, vec!["Allow once", "Allow always", "Reject"]);
+    }
+
+    #[test]
+    fn manual_approval_prompt_default_uses_reject_not_stale_deny() {
+        let prompt = terminal_activity_hook_manual_prompt(
+            "PermissionAsked",
+            &json!({
+                "hookEventName": "PermissionAsked",
+                "manualApprovalRequired": true,
+                "permissionRequestId": "permission-1",
+            }),
+        )
+        .expect("manual permission prompt");
+
+        assert_eq!(prompt.default_option.as_deref(), Some("reject"));
+        assert!(prompt.options.iter().any(|option| option.id == "reject"));
+        assert!(!prompt.options.iter().any(|option| option.id == "deny"));
+    }
+
+    #[test]
+    fn opencode_prompt_answer_uses_selection_navigation() {
+        assert_eq!(
+            terminal_agent_prompt_answer_input("opencode", "allow_once", "Allow once", None),
+            "\r"
+        );
+        assert_eq!(
+            terminal_agent_prompt_answer_input(
+                "open-code",
+                "allow_always",
+                "Allow always",
+                None
+            ),
+            "\x1b[C\r\r"
+        );
+        assert_eq!(
+            terminal_agent_prompt_answer_input("opencode", "reject", "Reject", None),
+            "\x1b[C\x1b[C\r"
+        );
+        assert_eq!(
+            terminal_agent_prompt_answer_input("codex", "allow_once", "Allow once", None),
+            "y\r"
+        );
+    }
+
+    #[test]
+    fn prompt_ready_marker_must_follow_working_indicator() {
+        assert!(terminal_output_current_prompt_marker(
+            "working (press esc to interrupt)\ncompleted\n> "
+        ));
+        assert!(!terminal_output_current_prompt_marker(
+            "> \nworking (press esc to interrupt)"
+        ));
     }
 
     #[test]
@@ -17750,6 +18761,50 @@ mod terminal_tests {
     }
 
     #[test]
+    fn live_text_sanitizer_drops_codex_tui_chrome() {
+        let tui = "\u{1b}[44;3H\u{1b}[2mWorking\u{1b}[22m\
+ \u{1b}[2m(51s • esc to interrupt)\u{1b}[39m\
+\u{1b}[47;1H\u{1b}[1m›\u{1b}[47;3H\u{1b}[22mRun /review on my current changes\
+\u{1b}[49;3H\u{1b}[38;2;246;226;183;49mgpt-5.5 xhigh\u{1b}[39;49m · \
+\u{1b}[38;2;171;223;167;49m~/Documents/CODING/testforge\u{1b}[39m";
+
+        assert_eq!(terminal_activity_hook_live_message_text(tui), None);
+        assert_eq!(
+            terminal_activity_hook_activity_message_text(tui).as_deref(),
+            Some("Working")
+        );
+    }
+
+    #[test]
+    fn live_text_sanitizer_keeps_prose_without_footer() {
+        let tui = "I’ll inspect the hook path first.\n\
+\u{1b}[49;3H\u{1b}[38;2;246;226;183;49mgpt-5.5 xhigh\u{1b}[39;49m · \
+\u{1b}[38;2;171;223;167;49m~/Documents/CODING/testforge\u{1b}[39m";
+
+        assert_eq!(
+            terminal_activity_hook_live_message_text(tui).as_deref(),
+            Some("I’ll inspect the hook path first.")
+        );
+    }
+
+    #[test]
+    fn live_text_sanitizer_keeps_prompt_prefixed_prose_without_tui_context() {
+        assert_eq!(
+            terminal_activity_hook_live_message_text("›-prefixed prose should stay").as_deref(),
+            Some("›-prefixed prose should stay")
+        );
+    }
+
+    #[test]
+    fn live_text_sanitizer_keeps_working_parenthetical_prose() {
+        assert_eq!(
+            terminal_activity_hook_live_message_text("Working (through the parser case) is content.")
+                .as_deref(),
+            Some("Working (through the parser case) is content.")
+        );
+    }
+
+    #[test]
     fn activity_hook_provider_session_id_accepts_provider_aliases() {
         assert_eq!(
             terminal_activity_hook_provider_session_id(&json!({
@@ -17786,6 +18841,17 @@ mod terminal_tests {
         }
 
         assert!(!terminal_activity_hook_is_prompt_submit("Stop"));
+    }
+
+    #[test]
+    fn prompt_fallback_event_id_is_non_empty_and_prompt_stable() {
+        let first = terminal_prompt_fallback_event_id("pane/one", 7, 42, "build the pcb");
+        let second = terminal_prompt_fallback_event_id("pane/one", 7, 42, "build the pcb");
+        let different_prompt = terminal_prompt_fallback_event_id("pane/one", 7, 42, "route traces");
+
+        assert!(first.starts_with("terminal-prompt:pane-one:7:42:"));
+        assert_eq!(first, second);
+        assert_ne!(first, different_prompt);
     }
 
     #[test]
@@ -18430,7 +19496,8 @@ mod terminal_tests {
         let mut coordination = terminal_test_coordination("codex_hook_profile_scope");
         let home = terminal_test_directory("codex_hook_profile_home");
         let profile = "diffforge-test-profile";
-        let hooks_path = home.join(format!("{profile}.hooks.json"));
+        // Codex only loads hooks from the home-level hooks.json.
+        let hooks_path = home.join("hooks.json");
         let profile_path = home.join(format!("{profile}.config.toml"));
         fs::create_dir_all(&home).unwrap();
         fs::write(
@@ -18523,7 +19590,8 @@ mod terminal_tests {
         assert!(hooks.contains("--events-path"));
         assert!(hooks.contains("--debug-path"));
         assert!(!hooks.contains("--diff-forge-write-guard"));
-        assert_eq!(hooks.matches("--pane-id").count(), 7);
+        // One scoped command per ensured activity-hook event.
+        assert_eq!(hooks.matches("--pane-id").count(), 17);
         let profile_config = fs::read_to_string(&profile_path).unwrap();
         assert!(profile_config.contains("[[hooks.UserPromptSubmit]]"));
         assert!(profile_config.contains("[[hooks.Stop]]"));
@@ -18545,7 +19613,8 @@ mod terminal_tests {
         let mut coordination = terminal_test_coordination("codex_hook_profile_create");
         let home = terminal_test_directory("codex_hook_profile_create_home");
         let profile = "diffforge-test-profile";
-        let hooks_path = home.join(format!("{profile}.hooks.json"));
+        // Codex only loads hooks from the home-level hooks.json.
+        let hooks_path = home.join("hooks.json");
         let profile_path = home.join(format!("{profile}.config.toml"));
         fs::create_dir_all(&home).unwrap();
         fs::write(
@@ -19823,6 +20892,8 @@ mod terminal_tests {
         let plugin_body = fs::read_to_string(plugin_path).expect("plugin file written");
         assert!(plugin_body.contains("--diff-forge-activity-hook"));
         assert!(plugin_body.contains("session.idle"));
+        assert!(plugin_body.contains("[\"allow_always\", \"Allow always\"]"));
+        assert!(plugin_body.contains("[\"reject\", \"Reject\"]"));
 
         // Without coordination there is no MCP block or permission override.
         assert!(config.get("mcp").is_none());

@@ -16,7 +16,7 @@ const TOKENOMICS_SQLITE_BUSY_TIMEOUT_MS: u64 = 30_000;
 const TOKENOMICS_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
 const TOKENOMICS_CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const TOKENOMICS_CODEX_SCANNER_VERSION: &str = "codex-token-count-v7-ledger-tail-30d";
-const TOKENOMICS_GENERIC_SCANNER_VERSION: &str = "generic-tokenomics-v5-ledger-tail-30d";
+const TOKENOMICS_GENERIC_SCANNER_VERSION: &str = "generic-tokenomics-v6-request-dedupe-30d";
 const TOKENOMICS_ROLLUP_ID_VERSION: &str = "tokenomics-v2-utc-hour-rollups-v2";
 const TOKENOMICS_CODEX_IMPORT_LEDGER_REPAIR_VERSION: &str =
     "codex-import-ledger-orphan-prune-v1";
@@ -1369,8 +1369,7 @@ fn tokenomics_scan_usage_for_mode(
                         0
                     };
                     let should_clear_existing_source_events = !can_resume_from_offset
-                        && offset.scanner_version == TOKENOMICS_GENERIC_SCANNER_VERSION
-                        && offset.last_byte_offset > 0;
+                        && (offset.last_byte_offset > 0 || offset.last_line_index >= 0);
                     source_files += 1;
                     scanned_files += 1;
                     let scan = tokenomics_run_write_batch(&conn, || {
@@ -5906,6 +5905,7 @@ fn tokenomics_opencode_event_from_message(
         subscription_key: Some(provider_account.key.clone()),
         provider_account_key: Some(provider_account.key.clone()),
         provider_account_label: Some(provider_account.label.clone()),
+        source_request_id: None,
         billing_scope_type: billing_scope.scope_type,
         billing_team_id: billing_scope.team_id,
         billing_scope_source: billing_scope.source,
@@ -6826,6 +6826,7 @@ fn tokenomics_scan_codex_session_file(
             subscription_key: Some(source_provider_account.key.clone()),
             provider_account_key: Some(source_provider_account.key.clone()),
             provider_account_label: Some(source_provider_account.label.clone()),
+            source_request_id: None,
             billing_scope_type: billing_scope.scope_type.clone(),
             billing_team_id: billing_scope.team_id.clone(),
             billing_scope_source: billing_scope.source.clone(),
@@ -7313,6 +7314,7 @@ fn tokenomics_record_usage_json_tree_stats(
         tokenomics_current_billing_scope(),
         None,
         None,
+        None,
         Some(tokenomics_local_device_id()),
         &mut extracted,
     );
@@ -7327,23 +7329,38 @@ fn tokenomics_record_usage_json_tree_stats(
             .and_then(|path| path.extension().and_then(|value| value.to_str()))
             .unwrap_or("manual")
             .to_string();
-        let raw_identity = json!({
-            "provider": event.provider,
-            "agent_kind": event.agent_kind,
-            "model": event.model,
-            "created_at": event.created_at,
-            "input_tokens": event.input_tokens,
-            "output_tokens": event.output_tokens,
-            "cache_read_tokens": event.cache_read_tokens,
-            "cache_write_tokens": event.cache_write_tokens,
-            "provider_account_key": tokenomics_event_identity_account_key(
-                event.provider.as_str(),
-                event.agent_kind.as_str(),
-                event.provider_account_key.as_deref(),
-            ),
-            "source_path": event.source_path,
-            "line_index": line_index,
-        });
+        let provider_account_key = tokenomics_event_identity_account_key(
+            event.provider.as_str(),
+            event.agent_kind.as_str(),
+            event.provider_account_key.as_deref(),
+        );
+        let raw_identity = if let Some(source_request_id) = event
+            .source_request_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            json!({
+                "provider": event.provider,
+                "agent_kind": event.agent_kind,
+                "provider_account_key": provider_account_key,
+                "source_request_id": source_request_id,
+            })
+        } else {
+            json!({
+                "provider": event.provider,
+                "agent_kind": event.agent_kind,
+                "model": event.model,
+                "created_at": event.created_at,
+                "input_tokens": event.input_tokens,
+                "output_tokens": event.output_tokens,
+                "cache_read_tokens": event.cache_read_tokens,
+                "cache_write_tokens": event.cache_write_tokens,
+                "provider_account_key": provider_account_key,
+                "source_path": event.source_path,
+                "line_index": line_index,
+            })
+        };
         event.id = tokenomics_hash(&raw_identity.to_string());
         if !seen_event_ids.insert(event.id.clone()) {
             continue;
@@ -7386,6 +7403,7 @@ struct TokenomicsUsageEvent {
     subscription_key: Option<String>,
     provider_account_key: Option<String>,
     provider_account_label: Option<String>,
+    source_request_id: Option<String>,
     billing_scope_type: String,
     billing_team_id: Option<String>,
     billing_scope_source: String,
@@ -7413,14 +7431,17 @@ fn tokenomics_extract_usage_events(
     inherited_billing_scope: TokenomicsBillingScope,
     inherited_model: Option<String>,
     inherited_timestamp: Option<String>,
+    inherited_request_id: Option<String>,
     inherited_device_id: Option<String>,
     output: &mut Vec<TokenomicsUsageEvent>,
 ) {
     let mut model = inherited_model;
     let mut timestamp = inherited_timestamp;
+    let mut request_id = inherited_request_id;
     let device_id = inherited_device_id;
     let mut billing_scope = inherited_billing_scope;
     if let Some(object) = value.as_object() {
+        request_id = tokenomics_usage_request_id_from_object(object, request_id);
         if let Some(next_model) = object
             .get("model")
             .or_else(|| object.get("model_id"))
@@ -7458,6 +7479,7 @@ fn tokenomics_extract_usage_events(
                 tokenomics_billing_scope_from_value(usage_value, &billing_scope),
                 model.clone(),
                 timestamp.clone(),
+                request_id.clone(),
                 device_id.clone().unwrap_or_else(tokenomics_local_device_id),
             ) {
                 output.push(event);
@@ -7472,6 +7494,7 @@ fn tokenomics_extract_usage_events(
                 billing_scope.clone(),
                 model.clone(),
                 timestamp.clone(),
+                request_id.clone(),
                 device_id.clone(),
                 output,
             );
@@ -7486,11 +7509,62 @@ fn tokenomics_extract_usage_events(
                 billing_scope.clone(),
                 model.clone(),
                 timestamp.clone(),
+                request_id.clone(),
                 device_id.clone(),
                 output,
             );
         }
     }
+}
+
+fn tokenomics_usage_request_id_from_object(
+    object: &serde_json::Map<String, Value>,
+    inherited_request_id: Option<String>,
+) -> Option<String> {
+    let direct = [
+        "requestId",
+        "request_id",
+        "requestID",
+        "anthropicRequestId",
+        "anthropic_request_id",
+    ]
+    .iter()
+    .find_map(|key| {
+        object
+            .get(*key)
+            .and_then(tokenomics_json_scalar_text)
+            .and_then(tokenomics_account_label_text)
+    });
+    if direct.is_some() {
+        return direct;
+    }
+    if inherited_request_id.is_some() {
+        return inherited_request_id;
+    }
+
+    let looks_like_message = object.get("usage").is_some()
+        && (object.get("model").is_some()
+            || object
+                .get("type")
+                .and_then(Value::as_str)
+                .map(|value| value == "message")
+                .unwrap_or(false)
+            || object
+                .get("role")
+                .and_then(Value::as_str)
+                .map(|value| value == "assistant")
+                .unwrap_or(false));
+    if looks_like_message {
+        if let Some(message_id) = object
+            .get("id")
+            .and_then(tokenomics_json_scalar_text)
+            .and_then(tokenomics_account_label_text)
+        {
+            return Some(message_id);
+        }
+    }
+
+    inherited_request_id
 }
 
 fn tokenomics_object_looks_like_usage(object: &serde_json::Map<String, Value>) -> bool {
@@ -7516,6 +7590,7 @@ fn tokenomics_usage_event_from_value(
     billing_scope: TokenomicsBillingScope,
     model: Option<String>,
     timestamp: Option<String>,
+    source_request_id: Option<String>,
     device_id: String,
 ) -> Option<TokenomicsUsageEvent> {
     let input_tokens = tokenomics_usage_number(
@@ -7589,6 +7664,7 @@ fn tokenomics_usage_event_from_value(
         subscription_key: Some(provider_account.key.clone()),
         provider_account_key: Some(provider_account.key.clone()),
         provider_account_label: Some(provider_account.label.clone()),
+        source_request_id,
         billing_scope_type: billing_scope.scope_type,
         billing_team_id: billing_scope.team_id,
         billing_scope_source: billing_scope.source,
@@ -8297,6 +8373,16 @@ fn tokenomics_record_usage_value(
             .or_else(|| usage.get("createdAt"))
             .and_then(Value::as_str)
             .map(|value| value.to_string()),
+        tokenomics_value_string(
+            usage,
+            &[
+                "requestId",
+                "request_id",
+                "requestID",
+                "message_id",
+                "messageId",
+            ],
+        ),
         tokenomics_local_device_id(),
     ) else {
         return Ok(0);
@@ -14781,6 +14867,7 @@ mod tokenomics_tests {
                 subscription_key: Some("openai:codex:d9b6c65b".to_string()),
                 provider_account_key: Some("openai:codex:d9b6c65b".to_string()),
                 provider_account_label: Some("Digital Agency".to_string()),
+                source_request_id: None,
                 billing_scope_type: "personal".to_string(),
                 billing_team_id: None,
                 billing_scope_source: "legacy_provider_restore".to_string(),
@@ -16183,6 +16270,76 @@ mod tokenomics_tests {
         assert_eq!(import["raw_available"], json!(0));
         assert_eq!(import["event_count"], json!(2));
         assert_eq!(import["import_status"], json!("raw_deleted_imported"));
+    }
+
+    #[test]
+    fn tokenomics_claude_jsonl_scan_dedupes_repeated_request_chunks() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&conn).unwrap();
+        let path = tokenomics_test_temp_path("claude-request-dedupe", "jsonl");
+        let account = tokenomics_provider_account("anthropic", "claude");
+
+        for (index, timestamp) in [
+            "2026-07-02T00:29:04.636Z",
+            "2026-07-02T00:29:06.067Z",
+            "2026-07-02T00:29:07.289Z",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tokenomics_append_json_line(
+                &path,
+                json!({
+                    "requestId": "req_same_claude_call",
+                    "timestamp": timestamp,
+                    "type": "assistant",
+                    "message": {
+                        "id": format!("msg_chunk_{index}"),
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "claude-fable-5",
+                        "usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 5,
+                            "cache_read_input_tokens": 100,
+                            "cache_creation_input_tokens": 20
+                        }
+                    }
+                }),
+            );
+        }
+
+        let scan = tokenomics_scan_file(
+            &conn,
+            "anthropic",
+            "claude",
+            &account,
+            &path,
+            -1,
+            0,
+        )
+        .unwrap();
+        assert_eq!(scan.inserted_events, 1);
+        assert_eq!(scan.observed_events, 3);
+
+        let totals = tokenomics_query_one(
+            &conn,
+            "SELECT COUNT(*) AS count,
+                    COALESCE(SUM(input_tokens), 0) AS input_tokens,
+                    COALESCE(SUM(output_tokens), 0) AS output_tokens,
+                    COALESCE(SUM(cache_read_tokens), 0) AS cache_read_tokens,
+                    COALESCE(SUM(cache_write_tokens), 0) AS cache_write_tokens,
+                    COALESCE(SUM(total_tokens), 0) AS total_tokens
+             FROM tokenomics_usage_events
+             WHERE provider='anthropic' AND agent_kind='claude'",
+        )
+        .unwrap();
+        assert_eq!(totals["count"], json!(1));
+        assert_eq!(totals["input_tokens"], json!(10));
+        assert_eq!(totals["output_tokens"], json!(5));
+        assert_eq!(totals["cache_read_tokens"], json!(100));
+        assert_eq!(totals["cache_write_tokens"], json!(20));
+        assert_eq!(totals["total_tokens"], json!(135));
     }
 
     #[test]

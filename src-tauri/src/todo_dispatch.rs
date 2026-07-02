@@ -9594,6 +9594,15 @@ mod todo_dispatch_backend_tests {
             live_text_kind: None,
             tool_name: None,
             tool_use_id: None,
+            tool_server: None,
+            tool_input: None,
+            tool_output: None,
+            tool_error: None,
+            raw_tool_payload: None,
+            command: None,
+            file_path: None,
+            duration_ms: None,
+            exit_code: None,
             approval_id: None,
             permission_prompt_id: None,
             permission_request_id: None,
@@ -10183,6 +10192,41 @@ fn todo_dispatch_backend_release_claim(workspace_id: &str, item: &Value, reason:
     }
 }
 
+async fn todo_dispatch_terminal_instance_still_current(
+    terminal_state: &TerminalState,
+    pane_id: &str,
+    instance: &TerminalInstance,
+) -> bool {
+    let guard = terminal_state.terminals.read().await;
+    guard
+        .get(pane_id)
+        .map(|current| current.id == instance.id)
+        .unwrap_or(false)
+}
+
+async fn todo_dispatch_write_current_terminal_chunks(
+    terminal_state: &TerminalState,
+    pane_id: &str,
+    instance: &TerminalInstance,
+    chunks: &[&[u8]],
+) -> bool {
+    let guard = terminal_state.terminals.read().await;
+    let mut writer = instance.writer.lock().await;
+    if guard
+        .get(pane_id)
+        .map(|current| current.id != instance.id)
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    for chunk in chunks {
+        if writer.write_all(chunk).is_err() {
+            return false;
+        }
+    }
+    writer.flush().is_ok()
+}
+
 async fn todo_dispatch_backend_submit(
     app: &AppHandle,
     workspace_id: &str,
@@ -10299,84 +10343,67 @@ async fn todo_dispatch_backend_submit(
     // the input queue, write the prompt, settle, then the submit sequence.
     let _input_guard = instance.input_queue.lock().await;
     if !model_switch_command.is_empty() {
-        {
-            let mut writer = instance.writer.lock().await;
-            // Ctrl-U clears any stale TUI input before applying the requested
-            // loop agent model/effort settings.
-            if writer.write_all(b"\x15").is_err()
-                || writer.write_all(model_switch_command.as_bytes()).is_err()
-                || writer.flush().is_err()
-            {
-                return false;
-            }
-        }
-        sleep(Duration::from_millis(
-            TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
-        ))
-        .await;
-        {
-            let still_current = {
-                let guard = terminal_state.terminals.read().await;
-                guard
-                    .get(&pane_id)
-                    .map(|current| current.id == instance.id)
-                    .unwrap_or(false)
-            };
-            if !still_current {
-                return false;
-            }
-            let mut writer = instance.writer.lock().await;
-            if writer.write_all(submit_sequence.as_bytes()).is_err() || writer.flush().is_err() {
-                return false;
-            }
-        }
-        sleep(Duration::from_millis(
-            TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
-        ))
-        .await;
-        {
-            let still_current = {
-                let guard = terminal_state.terminals.read().await;
-                guard
-                    .get(&pane_id)
-                    .map(|current| current.id == instance.id)
-                    .unwrap_or(false)
-            };
-            if !still_current {
-                return false;
-            }
-        }
-    }
-    {
-        let mut writer = instance.writer.lock().await;
-        // Ctrl-U clears any stale TUI input left by a previous interrupted or
-        // failed UI write before Rust submits the queued todo.
-        if writer.write_all(b"\x15").is_err()
-            || writer.write_all(prompt.as_bytes()).is_err()
-            || writer.flush().is_err()
+        // Ctrl-U clears any stale TUI input before applying the requested
+        // loop agent model/effort settings.
+        if !todo_dispatch_write_current_terminal_chunks(
+            &terminal_state,
+            &pane_id,
+            &instance,
+            &[b"\x15".as_ref(), model_switch_command.as_bytes()],
+        )
+        .await
         {
             return false;
         }
+        sleep(Duration::from_millis(
+            TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
+        ))
+        .await;
+        if !todo_dispatch_write_current_terminal_chunks(
+            &terminal_state,
+            &pane_id,
+            &instance,
+            &[submit_sequence.as_bytes()],
+        )
+        .await
+        {
+            return false;
+        }
+        sleep(Duration::from_millis(
+            TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
+        ))
+        .await;
+        if !todo_dispatch_terminal_instance_still_current(&terminal_state, &pane_id, &instance)
+            .await
+        {
+            return false;
+        }
+    }
+    // Ctrl-U clears any stale TUI input left by a previous interrupted or
+    // failed UI write before Rust submits the queued todo.
+    if !todo_dispatch_write_current_terminal_chunks(
+        &terminal_state,
+        &pane_id,
+        &instance,
+        &[b"\x15".as_ref(), prompt.as_bytes()],
+    )
+    .await
+    {
+        return false;
     }
     sleep(Duration::from_millis(
         TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS,
     ))
     .await;
+    if !todo_dispatch_write_current_terminal_chunks(
+        &terminal_state,
+        &pane_id,
+        &instance,
+        &[submit_sequence.as_bytes()],
+    )
+    .await
     {
-        let still_current = {
-            let guard = terminal_state.terminals.read().await;
-            guard
-                .get(&pane_id)
-                .map(|current| current.id == instance.id)
-                .unwrap_or(false)
-        };
-        if !still_current {
-            return false;
-        }
-        let mut writer = instance.writer.lock().await;
-        if writer.write_all(submit_sequence.as_bytes()).is_err() || writer.flush().is_err() {
-            return false;
-        }
+        return false;
     }
 
     let submitted_at = crate::coordination::kernel::now_rfc3339();

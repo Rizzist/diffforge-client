@@ -517,6 +517,7 @@ struct CloudMcpState {
     agent_turn_stream_snapshots: Arc<StdMutex<HashMap<String, Value>>>,
     agent_live_text_by_stream: Arc<StdMutex<HashMap<String, CloudMcpAgentLiveTextSnapshot>>>,
     agent_turn_delta_pending: Arc<Mutex<HashMap<String, CloudMcpPendingAgentTurnDelta>>>,
+    agent_turn_stream_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
     agent_turn_delta_generation: Arc<AtomicU64>,
     device_live_snapshot_debounce: Arc<StdMutex<Option<String>>>,
     remote_command_listener_started: Arc<AtomicBool>,
@@ -794,6 +795,7 @@ impl CloudMcpState {
             agent_turn_stream_snapshots: Arc::new(StdMutex::new(HashMap::new())),
             agent_live_text_by_stream: Arc::new(StdMutex::new(HashMap::new())),
             agent_turn_delta_pending: Arc::new(Mutex::new(HashMap::new())),
+            agent_turn_stream_locks: Arc::new(Mutex::new(HashMap::new())),
             agent_turn_delta_generation: Arc::new(AtomicU64::new(0)),
             device_live_snapshot_debounce: Arc::new(StdMutex::new(None)),
             remote_command_listener_started: Arc::new(AtomicBool::new(false)),
@@ -11885,8 +11887,15 @@ async fn cloud_mcp_open_global_ws(
         tokio::select! {
             biased;
             _ = cloud_mcp_shutdown_goodbye_notify().notified() => {
-                // Manual quit: close deliberately so the cloud broadcasts
-                // the offline account-live snapshot immediately.
+                // Manual quit: flush buffered turn deltas and any pending
+                // debounced snapshot through the still-open socket, then close
+                // deliberately so the cloud broadcasts the offline
+                // account-live snapshot immediately.
+                cloud_mcp_flush_all_pending_agent_turn_deltas(state).await;
+                cloud_mcp_flush_pending_device_live_snapshot(state).await;
+                while let Ok(outgoing) = rx.try_recv() {
+                    let _ = write.send(Message::Text(outgoing.to_string().into())).await;
+                }
                 let goodbye = json!({
                     "kind": "desktop_goodbye",
                     "contract": "diffforge.app_ws.v1",
@@ -12046,6 +12055,13 @@ async fn cloud_mcp_open_global_ws(
                     .unwrap_or_default()
                     .to_string();
                 if outgoing_kind == "cloud_app_ws_close" {
+                    // Deliberate close: drain buffered turn deltas and the
+                    // pending debounced snapshot before the socket goes away.
+                    cloud_mcp_flush_all_pending_agent_turn_deltas(state).await;
+                    cloud_mcp_flush_pending_device_live_snapshot(state).await;
+                    while let Ok(flushed) = rx.try_recv() {
+                        let _ = write.send(Message::Text(flushed.to_string().into())).await;
+                    }
                     if let Err(error) = write
                         .send(Message::Text(outgoing.to_string().into()))
                         .await
@@ -17523,11 +17539,23 @@ fn cloud_mcp_remote_command_field_text(event: &Value, keys: &[&str]) -> Option<S
         })
 }
 
+fn cloud_mcp_remote_command_field_i64(event: &Value, keys: &[&str]) -> Option<i64> {
+    cloud_mcp_payload_i64(event, keys)
+        .or_else(|| {
+            keys.iter()
+                .find_map(|key| cloud_mcp_payload_i64(event, &["payload", *key]))
+        })
+        .or_else(|| {
+            keys.iter()
+                .find_map(|key| cloud_mcp_payload_i64(event, &["request", *key]))
+        })
+}
+
 fn cloud_mcp_remote_command_matches_device(event: &Value) -> bool {
     let Some(target_device_id) =
         cloud_mcp_remote_command_field_text(event, &["target_device_id", "targetDeviceId"])
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
     else {
         return false;
     };
@@ -17553,14 +17581,12 @@ fn cloud_mcp_remote_command_receipt_key(event: &Value) -> Option<String> {
     let client_id = cloud_mcp_payload_text(event, &["client_id"])
         .or_else(|| cloud_mcp_payload_text(event, &["clientId"]))
         .unwrap_or_default();
-    let command_kind =
-        cloud_mcp_remote_command_field_text(event, &["command_kind", "commandKind"])
-            .unwrap_or_default();
-    let workspace_id =
-        cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
-            .unwrap_or_default();
-    let intent_id = cloud_mcp_remote_command_field_text(event, &["intent_id", "intentId"])
+    let command_kind = cloud_mcp_remote_command_field_text(event, &["command_kind", "commandKind"])
         .unwrap_or_default();
+    let workspace_id = cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
+        .unwrap_or_default();
+    let intent_id =
+        cloud_mcp_remote_command_field_text(event, &["intent_id", "intentId"]).unwrap_or_default();
     Some(format!(
         "{}::{}::{}::{}::{}",
         client_id.trim(),
@@ -17617,11 +17643,14 @@ fn cloud_mcp_remote_command_id(event: &Value) -> String {
 }
 
 fn cloud_mcp_remote_command_kind(event: &Value) -> String {
-    cloud_mcp_remote_command_field_text(event, &["command_kind", "commandKind", "action", "command"])
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['.', ' ', '-'], "_")
+    cloud_mcp_remote_command_field_text(
+        event,
+        &["command_kind", "commandKind", "action", "command"],
+    )
+    .unwrap_or_default()
+    .trim()
+    .to_ascii_lowercase()
+    .replace(['.', ' ', '-'], "_")
 }
 
 fn cloud_mcp_remote_command_is_cancel(event: &Value) -> bool {
@@ -17641,9 +17670,9 @@ fn cloud_mcp_remote_command_cancel_target_id(event: &Value) -> String {
             "targetCommandId",
         ],
     )
-        .unwrap_or_default()
-        .trim()
-        .to_string()
+    .unwrap_or_default()
+    .trim()
+    .to_string()
 }
 
 fn cloud_mcp_remote_command_receipts_contains_id(
@@ -18457,9 +18486,8 @@ fn cloud_mcp_apply_remote_workspace_lever(
         return false;
     }
     let command_kind = cloud_mcp_remote_command_kind(event);
-    let workspace_id =
-        cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
-            .unwrap_or_default();
+    let workspace_id = cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
+        .unwrap_or_default();
     if workspace_id.is_empty() {
         return false;
     }
@@ -18569,7 +18597,11 @@ fn cloud_mcp_apply_remote_agent_prompt_lever(
     let command_kind = cloud_mcp_remote_command_kind(event);
     if !matches!(
         command_kind.as_str(),
-        "agent_prompt_answer" | "answer_agent_prompt" | "agent_input_answer" | "terminal_prompt_answer" | "prompt_answer"
+        "agent_prompt_answer"
+            | "answer_agent_prompt"
+            | "agent_input_answer"
+            | "terminal_prompt_answer"
+            | "prompt_answer"
     ) {
         return false;
     }
@@ -18637,7 +18669,19 @@ async fn cloud_mcp_publish_prompt_answered_event(
     .or_else(|| cloud_mcp_payload_text(event, &["request", "target_workspace_id"]))
     .unwrap_or_default();
     let pane_id = cloud_mcp_payload_text(details, &["pane_id"])
-        .or_else(|| cloud_mcp_payload_text(event, &["target_terminal_id", "targetTerminalId", "terminal_id", "terminalId", "pane_id", "paneId"]))
+        .or_else(|| {
+            cloud_mcp_payload_text(
+                event,
+                &[
+                    "target_terminal_id",
+                    "targetTerminalId",
+                    "terminal_id",
+                    "terminalId",
+                    "pane_id",
+                    "paneId",
+                ],
+            )
+        })
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_terminal_id"]))
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "terminal_id"]))
         .or_else(|| cloud_mcp_payload_text(event, &["request", "target_terminal_id"]))
@@ -18649,17 +18693,25 @@ async fn cloud_mcp_publish_prompt_answered_event(
     let instance_id = details
         .get("terminal_instance_id")
         .and_then(Value::as_u64)
-        .or_else(|| cloud_mcp_payload_i64(event, &["terminal_instance_id"]).and_then(|value| u64::try_from(value).ok()))
-        .or_else(|| cloud_mcp_payload_i64(event, &["terminalInstanceId"]).and_then(|value| u64::try_from(value).ok()))
-        .or_else(|| cloud_mcp_payload_i64(event, &["payload", "terminal_instance_id"]).and_then(|value| u64::try_from(value).ok()))
-        .or_else(|| cloud_mcp_payload_i64(event, &["request", "terminal_instance_id"]).and_then(|value| u64::try_from(value).ok()))
+        .or_else(|| {
+            cloud_mcp_payload_i64(event, &["terminal_instance_id"])
+                .and_then(|value| u64::try_from(value).ok())
+        })
+        .or_else(|| {
+            cloud_mcp_payload_i64(event, &["terminalInstanceId"])
+                .and_then(|value| u64::try_from(value).ok())
+        })
+        .or_else(|| {
+            cloud_mcp_payload_i64(event, &["payload", "terminal_instance_id"])
+                .and_then(|value| u64::try_from(value).ok())
+        })
+        .or_else(|| {
+            cloud_mcp_payload_i64(event, &["request", "terminal_instance_id"])
+                .and_then(|value| u64::try_from(value).ok())
+        })
         .unwrap_or_default();
-    let stream_key = cloud_mcp_terminal_output_stream_key(
-        &device_id,
-        &workspace_id,
-        &pane_id,
-        instance_id,
-    );
+    let stream_key =
+        cloud_mcp_terminal_output_stream_key(&device_id, &workspace_id, &pane_id, instance_id);
     let prompt_id = cloud_mcp_payload_text(details, &["prompt_id"])
         .or_else(|| cloud_mcp_payload_text(event, &["prompt_id", "promptId"]))
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "prompt_id"]))
@@ -18671,10 +18723,25 @@ async fn cloud_mcp_publish_prompt_answered_event(
         .or_else(|| cloud_mcp_payload_text(event, &["request", "option_id"]))
         .unwrap_or_default();
     let status_seq = cloud_mcp_next_terminal_lifecycle_seq(state, Some(cloud_mcp_now_ms()));
-    let turn_id = cloud_mcp_payload_text(event, &["turn_id", "turnId"])
+    let turn_id = cloud_mcp_payload_text(details, &["turn_id", "turnId"])
+        .or_else(|| cloud_mcp_payload_text(details, &["provider_turn_id", "providerTurnId"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["turn_id", "turnId"]))
         .or_else(|| cloud_mcp_payload_text(event, &["payload", "turn_id"]))
         .or_else(|| cloud_mcp_payload_text(event, &["request", "turn_id"]))
+        .or_else(|| cloud_mcp_payload_text(event, &["provider_turn_id", "providerTurnId"]))
         .unwrap_or_default();
+    let asp_item_id = [
+        "asp",
+        stream_key.as_str(),
+        turn_id.as_str(),
+        "prompt",
+        prompt_id.as_str(),
+    ]
+    .into_iter()
+    .map(cloud_mcp_agent_turn_asp_safe_id)
+    .filter(|part| !part.is_empty())
+    .collect::<Vec<_>>()
+    .join(":");
     let envelope = json!({
         "v": 1,
         "k": "turn.e",
@@ -18689,6 +18756,19 @@ async fn cloud_mcp_publish_prompt_answered_event(
         "t": "pa",
         "st": "running",
         "ts": "running",
+        "asp": {
+            "event_type": "prompt.answered",
+            "eventType": "prompt.answered",
+            "item_id": asp_item_id.as_str(),
+            "itemId": asp_item_id.as_str(),
+            "item_kind": "prompt",
+            "itemKind": "prompt",
+            "seq": status_seq,
+        },
+        "asp_event_type": "prompt.answered",
+        "aspEventType": "prompt.answered",
+        "item_id": asp_item_id.as_str(),
+        "itemId": asp_item_id.as_str(),
         "d": device_id,
         "w": workspace_id,
         "p": pane_id,
@@ -18696,9 +18776,28 @@ async fn cloud_mcp_publish_prompt_answered_event(
         "x": {
             "et": "provider-user-prompt-answered",
             "hn": "RemoteAgentPromptAnswer",
-            "pid": prompt_id,
-            "opt": option_id,
+            "pid": prompt_id.as_str(),
+            "prompt_id": prompt_id.as_str(),
+            "promptId": prompt_id.as_str(),
+            "opt": option_id.as_str(),
+            "option_id": option_id.as_str(),
+            "optionId": option_id.as_str(),
+            "chosen_option_id": option_id.as_str(),
+            "chosenOptionId": option_id.as_str(),
             "src": "remote",
+            "asp": {
+                "event_type": "prompt.answered",
+                "eventType": "prompt.answered",
+                "item_id": asp_item_id.as_str(),
+                "itemId": asp_item_id.as_str(),
+                "item_kind": "prompt",
+                "itemKind": "prompt",
+                "seq": status_seq,
+            },
+            "asp_event_type": "prompt.answered",
+            "aspEventType": "prompt.answered",
+            "item_id": asp_item_id.as_str(),
+            "itemId": asp_item_id.as_str(),
         },
         "at": cloud_mcp_now_ms(),
     });
@@ -19056,8 +19155,9 @@ fn cloud_mcp_apply_remote_terminal_interrupt_lever(
         return false;
     }
     let workspace_id =
-        cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"]).unwrap_or_default();
-    let target_terminal_id = cloud_mcp_payload_text(
+        cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
+            .unwrap_or_default();
+    let target_terminal_id = cloud_mcp_remote_command_field_text(
         event,
         &[
             "target_terminal_id",
@@ -19069,8 +19169,10 @@ fn cloud_mcp_apply_remote_terminal_interrupt_lever(
         ],
     )
     .unwrap_or_default();
-    let instance_id = cloud_mcp_payload_i64(event, &["terminal_instance_id"])
-        .or_else(|| cloud_mcp_payload_i64(event, &["terminalInstanceId"]))
+    let instance_id = cloud_mcp_remote_command_field_i64(
+        event,
+        &["terminal_instance_id", "terminalInstanceId"],
+    )
         .and_then(|value| u64::try_from(value).ok())
         .filter(|value| *value > 0);
     let app = app.clone();
@@ -19122,9 +19224,7 @@ fn cloud_mcp_apply_remote_terminal_interrupt_lever(
                             &target_terminal_id,
                         )
                     })
-                    .and_then(|terminal| {
-                        cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"])
-                    })
+                    .and_then(|terminal| cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"]))
             })
             .map(|pane_id| pane_id.trim().to_string())
             .filter(|pane_id| !pane_id.is_empty())
@@ -19413,9 +19513,7 @@ fn cloud_mcp_apply_remote_terminal_lever(
             .await;
             return;
         }
-        if matches!(action.as_str(), "close_one" | "close_force")
-            && target_terminal_id.is_empty()
-        {
+        if matches!(action.as_str(), "close_one" | "close_force") && target_terminal_id.is_empty() {
             let _ = cloud_mcp_send_remote_command_status_event(
                 &state,
                 &event,
@@ -21337,11 +21435,38 @@ fn cloud_mcp_live_state_merge_object(target: &mut Value, incoming: Value) {
     }
     let target = target.as_object_mut().expect("checked object");
     let incoming = incoming.as_object().expect("checked object");
+    let incoming_workspace = Value::Object(incoming.clone());
     for (key, value) in incoming {
         if key == "workspaces" {
             let existing = target.entry(key.clone()).or_insert_with(|| json!({}));
             cloud_mcp_live_state_merge_object(existing, value.clone());
         } else if key == "terminals" || key == "mcps" || key == "cli_states" {
+            if key == "terminals" {
+                let incoming_terminals_empty = cloud_mcp_live_state_values(Some(value)).is_empty();
+                let existing_terminals_non_empty = target
+                    .get(key)
+                    .map(|terminals| !cloud_mcp_live_state_values(Some(terminals)).is_empty())
+                    .unwrap_or(false);
+                let empty_authoritative = (cloud_mcp_payload_bool(
+                    &incoming_workspace,
+                    &["terminal_list_empty_authoritative"],
+                    false,
+                ) || cloud_mcp_payload_bool(
+                    &incoming_workspace,
+                    &["terminalListEmptyAuthoritative"],
+                    false,
+                )) && cloud_mcp_workspace_terminal_empty_clear_is_explicit(
+                    &incoming_workspace,
+                    "",
+                    "",
+                );
+                if incoming_terminals_empty
+                    && (existing_terminals_non_empty || !empty_authoritative)
+                    && !empty_authoritative
+                {
+                    continue;
+                }
+            }
             target.insert(key.clone(), value.clone());
         } else {
             target.insert(key.clone(), value.clone());
@@ -21392,6 +21517,36 @@ fn cloud_mcp_compact_terminal_live_state(terminal: &Value, index: usize) -> Valu
             "id",
         ],
     );
+    if let Some(terminal_id) = item.get("id").cloned() {
+        item.entry("terminal_id".to_string())
+            .or_insert_with(|| terminal_id.clone());
+        item.entry("terminalId".to_string())
+            .or_insert_with(|| terminal_id.clone());
+        item.entry("pane_id".to_string())
+            .or_insert_with(|| terminal_id.clone());
+        item.entry("paneId".to_string())
+            .or_insert(terminal_id);
+    }
+    cloud_mcp_compact_insert_value(
+        &mut item,
+        "terminal_instance_id",
+        terminal,
+        &[
+            "terminal_instance_id",
+            "terminalInstanceId",
+            "target_terminal_instance_id",
+            "targetTerminalInstanceId",
+            "instance_id",
+            "instanceId",
+        ],
+    );
+    if let Some(instance_id) = item.get("terminal_instance_id").cloned() {
+        item.entry("terminalInstanceId".to_string())
+            .or_insert_with(|| instance_id.clone());
+        item.entry("instance_id".to_string())
+            .or_insert_with(|| instance_id.clone());
+        item.entry("instanceId".to_string()).or_insert(instance_id);
+    }
     cloud_mcp_compact_insert_value(
         &mut item,
         "name",
@@ -21428,7 +21583,45 @@ fn cloud_mcp_compact_terminal_live_state(terminal: &Value, index: usize) -> Valu
             ][..],
         ),
         ("status", &["status", "state"][..]),
+        (
+            "activity_status",
+            &["activity_status", "activityStatus"][..],
+        ),
+        (
+            "native_rail_state",
+            &["native_rail_state", "nativeRailState"][..],
+        ),
+        ("readiness", &["readiness"][..]),
+        ("turn_status", &["turn_status", "turnStatus"][..]),
+        (
+            "prompt_event_id",
+            &["prompt_event_id", "promptEventId"][..],
+        ),
+        (
+            "user_message",
+            &["user_message", "userMessage"][..],
+        ),
+        (
+            "current_prompt",
+            &["current_prompt", "currentPrompt"][..],
+        ),
+        ("last_prompt", &["last_prompt", "lastPrompt"][..]),
         ("commandable", &["commandable"][..]),
+        ("connected", &["connected"][..]),
+        (
+            "native_connected",
+            &["native_connected", "nativeConnected"][..],
+        ),
+        (
+            "last_known_runtime",
+            &["last_known_runtime", "lastKnownRuntime"][..],
+        ),
+        (
+            "runtime_read_only",
+            &["runtime_read_only", "runtimeReadOnly"][..],
+        ),
+        ("status_seq", &["status_seq", "statusSeq"][..]),
+        ("input_ready", &["input_ready", "inputReady"][..]),
         (
             "session_id",
             &[
@@ -21499,6 +21692,46 @@ fn cloud_mcp_compact_workspace_live_state(workspace: &Value, index: usize) -> (S
         ),
         ("commandable", &["commandable"][..]),
         (
+            "last_known_runtime",
+            &["last_known_runtime", "lastKnownRuntime"][..],
+        ),
+        (
+            "runtime_read_only",
+            &["runtime_read_only", "runtimeReadOnly"][..],
+        ),
+        (
+            "last_known_terminal_fallback",
+            &["last_known_terminal_fallback", "lastKnownTerminalFallback"][..],
+        ),
+        (
+            "terminal_clear_reason",
+            &["terminal_clear_reason", "terminalClearReason"][..],
+        ),
+        ("terminal_count", &["terminal_count", "terminalCount"][..]),
+        (
+            "terminal_list_authoritative",
+            &["terminal_list_authoritative", "terminalListAuthoritative"][..],
+        ),
+        (
+            "terminal_list_empty_authoritative",
+            &[
+                "terminal_list_empty_authoritative",
+                "terminalListEmptyAuthoritative",
+            ][..],
+        ),
+        (
+            "workspace_runtime_seq",
+            &["workspace_runtime_seq", "workspaceRuntimeSeq"][..],
+        ),
+        (
+            "workspace_runtime_epoch",
+            &["workspace_runtime_epoch", "workspaceRuntimeEpoch"][..],
+        ),
+        (
+            "workspace_snapshot_fallback",
+            &["workspace_snapshot_fallback", "workspaceSnapshotFallback"][..],
+        ),
+        (
             "path",
             &[
                 "path",
@@ -21511,17 +21744,29 @@ fn cloud_mcp_compact_workspace_live_state(workspace: &Value, index: usize) -> (S
     ] {
         cloud_mcp_compact_insert_value(&mut item, key, workspace, aliases);
     }
-    if workspace.get("terminals").is_some() {
-        let terminals = cloud_mcp_live_state_values(workspace.get("terminals"))
-            .into_iter()
-            .enumerate()
-            .map(|(terminal_index, terminal)| {
-                cloud_mcp_compact_terminal_live_state(&terminal, terminal_index)
-            })
-            .collect::<Vec<_>>();
-        item.entry("terminal_count".to_string())
-            .or_insert_with(|| json!(terminals.len()));
-        item.insert("terminals".to_string(), Value::Array(terminals));
+    if let Some(terminal_value) = workspace.get("terminals") {
+        let terminal_values = cloud_mcp_live_state_values(Some(terminal_value));
+        let terminal_empty_authoritative = (cloud_mcp_payload_bool(
+            workspace,
+            &["terminal_list_empty_authoritative"],
+            false,
+        ) || cloud_mcp_payload_bool(workspace, &["terminalListEmptyAuthoritative"], false))
+            && cloud_mcp_workspace_terminal_empty_clear_is_explicit(workspace, "", "");
+        if !terminal_values.is_empty() || terminal_empty_authoritative {
+            let terminals = terminal_values
+                .into_iter()
+                .enumerate()
+                .map(|(terminal_index, terminal)| {
+                    cloud_mcp_compact_terminal_live_state(&terminal, terminal_index)
+                })
+                .collect::<Vec<_>>();
+            item.entry("terminal_count".to_string())
+                .or_insert_with(|| json!(terminals.len()));
+            item.insert("terminals".to_string(), Value::Array(terminals));
+        } else {
+            item.remove("terminal_count");
+            item.remove("terminal_list_empty_authoritative");
+        }
     }
     if workspace.get("mcps").is_some() || workspace.get("servers").is_some() {
         let mcps =
@@ -24812,6 +25057,35 @@ fn cloud_mcp_handle_terminal_output_subscription(
                 for snapshot in live_text {
                     let parts = stream_key.split(':').collect::<Vec<_>>();
                     if parts.len() == 4 {
+                        let status_seq =
+                            cloud_mcp_next_terminal_lifecycle_seq(&state, Some(cloud_mcp_now_ms()));
+                        let item_kind = cloud_mcp_agent_turn_asp_item_kind(
+                            "md",
+                            snapshot.content_kind.as_str(),
+                        );
+                        let item_id = [
+                            "asp",
+                            stream_key.as_str(),
+                            snapshot.turn_id.as_str(),
+                            item_kind,
+                            snapshot.content_kind.as_str(),
+                        ]
+                        .into_iter()
+                        .map(cloud_mcp_agent_turn_asp_safe_id)
+                        .filter(|part| !part.is_empty())
+                        .collect::<Vec<_>>()
+                        .join(":");
+                        let live_event_type = if snapshot.is_final {
+                            if item_kind == "reasoning" {
+                                "reasoning.completed"
+                            } else {
+                                "message.completed"
+                            }
+                        } else if item_kind == "reasoning" {
+                            "reasoning.delta"
+                        } else {
+                            "message.delta"
+                        };
                         let envelope = json!({
                             "v": 1,
                             "k": "agent_chat_session_live_delta",
@@ -24819,14 +25093,15 @@ fn cloud_mcp_handle_terminal_output_subscription(
                             "event_kind": "agent_chat_session_live_delta",
                             "contract": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
                             "c": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
-                            "auth": auth,
+                            "auth": auth.clone(),
                             "client_id": CLOUD_MCP_RUST_CLIENT_ID,
                             "id": format!("agentchat-live-replay-{}", cloud_mcp_now_ms()),
                             "m": "live_delta",
                             "mode": "live_delta",
                             "replay": true,
                             "sk": stream_key.as_str(),
-                            "q": cloud_mcp_next_terminal_lifecycle_seq(&state, Some(cloud_mcp_now_ms())),
+                            "q": status_seq,
+                            "seq": status_seq,
                             "d": parts[0],
                             "w": parts[1],
                             "p": parts[2],
@@ -24842,6 +25117,8 @@ fn cloud_mcp_handle_terminal_output_subscription(
                             "turnId": snapshot.turn_id.as_str(),
                             "message_id": snapshot.message_id.as_str(),
                             "messageId": snapshot.message_id.as_str(),
+                            "item_id": item_id.as_str(),
+                            "itemId": item_id.as_str(),
                             "snapshot_text": snapshot.text.as_str(),
                             "snapshotText": snapshot.text.as_str(),
                             "state": snapshot.state.as_str(),
@@ -24852,6 +25129,17 @@ fn cloud_mcp_handle_terminal_output_subscription(
                             "isFinal": snapshot.is_final,
                             "finish_reason": snapshot.finish_reason.as_str(),
                             "finishReason": snapshot.finish_reason.as_str(),
+                            "asp": {
+                                "event_type": live_event_type,
+                                "eventType": live_event_type,
+                                "item_id": item_id.as_str(),
+                                "itemId": item_id.as_str(),
+                                "item_kind": item_kind,
+                                "itemKind": item_kind,
+                                "content_kind": snapshot.content_kind.as_str(),
+                                "contentKind": snapshot.content_kind.as_str(),
+                                "seq": status_seq,
+                            },
                             "observed_at_ms": snapshot.updated_at_ms,
                             "observedAtMs": snapshot.updated_at_ms,
                         });
@@ -25135,6 +25423,61 @@ fn cloud_mcp_compact_turn_text(value: Option<&String>, max_chars: usize) -> Opti
     Some(value.chars().take(max_chars).collect())
 }
 
+enum CloudMcpLiveTextMerge {
+    Delta(String),
+    Snapshot(String),
+}
+
+fn cloud_mcp_longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
+    let left_chars = left.chars().collect::<Vec<_>>();
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let max_overlap = left_chars.len().min(right_chars.len()).min(4096);
+    for overlap in (1..=max_overlap).rev() {
+        if left_chars[left_chars.len() - overlap..] == right_chars[..overlap] {
+            return overlap;
+        }
+    }
+    0
+}
+
+fn cloud_mcp_common_prefix_len(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(left, right)| left == right)
+        .count()
+}
+
+fn cloud_mcp_merge_live_text_delta(left: &str, right: &str) -> CloudMcpLiveTextMerge {
+    if left.is_empty() {
+        return CloudMcpLiveTextMerge::Delta(right.to_string());
+    }
+    if right.is_empty() {
+        return CloudMcpLiveTextMerge::Delta(left.to_string());
+    }
+    if left == right {
+        return CloudMcpLiveTextMerge::Delta(format!("{left}{right}"));
+    }
+    let left_len = left.chars().count();
+    let right_len = right.chars().count();
+    if right.starts_with(left) {
+        return CloudMcpLiveTextMerge::Delta(right.to_string());
+    }
+
+    let overlap = cloud_mcp_longest_suffix_prefix_overlap(left, right);
+    if overlap > 0 {
+        let suffix = right.chars().skip(overlap).collect::<String>();
+        return CloudMcpLiveTextMerge::Delta(format!("{left}{suffix}"));
+    }
+
+    let common_prefix = cloud_mcp_common_prefix_len(left, right);
+    let shorter_len = left_len.min(right_len);
+    if common_prefix >= 8 || (common_prefix >= 4 && common_prefix * 2 >= shorter_len) {
+        return CloudMcpLiveTextMerge::Snapshot(right.to_string());
+    }
+
+    CloudMcpLiveTextMerge::Delta(format!("{left}{right}"))
+}
+
 fn cloud_mcp_agent_turn_hook_key(value: &str) -> String {
     value
         .chars()
@@ -25166,6 +25509,25 @@ fn cloud_mcp_agent_turn_should_include_message(
         || hook_key.contains("compact")
 }
 
+fn cloud_mcp_agent_turn_is_prompt_submission(
+    event_code: &str,
+    payload: &TerminalActivityHookPayload,
+    hook_key: &str,
+) -> bool {
+    event_code == "ts"
+        && (matches!(
+            hook_key,
+            "backendpromptsubmit"
+                | "userpromptsubmit"
+                | "userpromptsubmitted"
+                | "promptsubmit"
+                | "promptsubmitted"
+        ) || matches!(
+            payload.completion_evidence.as_str(),
+            "backend_prompt_submit" | "cli_hook_prompt_submit"
+        ))
+}
+
 fn cloud_mcp_agent_turn_prompt_options(payload: &TerminalActivityHookPayload) -> Value {
     Value::Array(
         payload
@@ -25178,14 +25540,180 @@ fn cloud_mcp_agent_turn_prompt_options(payload: &TerminalActivityHookPayload) ->
                     .as_deref()
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
-                if raw_value.is_some_and(|value| value != option.id) {
-                    json!([option.id.as_str(), option.label.as_str(), raw_value.unwrap_or_default()])
-                } else {
-                    json!([option.id.as_str(), option.label.as_str()])
+                let description = option
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                let mut row = vec![json!(option.id.as_str()), json!(option.label.as_str())];
+                if raw_value.is_some_and(|value| value != option.id) || description.is_some() {
+                    row.push(json!(raw_value.unwrap_or_default()));
                 }
+                if let Some(description) = description {
+                    row.push(json!(description));
+                }
+                Value::Array(row)
             })
             .collect::<Vec<_>>(),
     )
+}
+
+fn cloud_mcp_agent_turn_prompt_option_objects(payload: &TerminalActivityHookPayload) -> Value {
+    Value::Array(
+        payload
+            .prompt_options
+            .iter()
+            .filter(|option| !option.id.trim().is_empty())
+            .map(|option| {
+                let raw_value = option
+                    .value
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or(option.id.as_str());
+                let mut row = json!({
+                    "id": option.id.as_str(),
+                    "label": option.label.as_str(),
+                    "value": raw_value,
+                });
+                if let Some(description) = option
+                    .description
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    row["description"] = json!(description);
+                }
+                row
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn cloud_mcp_agent_turn_prompt_id(payload: &TerminalActivityHookPayload) -> Option<String> {
+    [
+        payload.prompt_id.as_deref(),
+        payload.permission_request_id.as_deref(),
+        payload.permission_prompt_id.as_deref(),
+        payload.approval_id.as_deref(),
+        payload.tool_use_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .map(str::to_string)
+}
+
+fn cloud_mcp_agent_turn_prompt_kind(payload: &TerminalActivityHookPayload) -> Option<String> {
+    [
+        payload.prompt_kind.as_deref(),
+        payload.prompting_user_kind.as_deref(),
+        payload.permission_mode.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .find(|value| !value.is_empty())
+    .map(str::to_string)
+}
+
+fn cloud_mcp_agent_turn_asp_safe_id(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .split('_')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+fn cloud_mcp_agent_turn_asp_event_type(
+    event_code: &str,
+    payload: &TerminalActivityHookPayload,
+    state_value: &str,
+    turn_status: &str,
+) -> &'static str {
+    match event_code {
+        "ts" => "turn.started",
+        "md" => {
+            let kind = payload
+                .live_text_kind
+                .as_deref()
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if kind.contains("reason") || kind.contains("thinking") {
+                "reasoning.delta"
+            } else {
+                "message.delta"
+            }
+        }
+        "xs" | "ss" => "tool.started",
+        "xe" | "se" => "tool.completed",
+        "xf" => "tool.failed",
+        "pr" => "prompt.opened",
+        "pa" => "prompt.answered",
+        "cc" => "context.compacting",
+        "cd" => "context.compacted",
+        "er" => "turn.error",
+        "te" if matches!(turn_status, "interrupted") || matches!(state_value, "interrupted") => {
+            "session.interrupted"
+        }
+        "te" => "turn.completed",
+        _ => "state.changed",
+    }
+}
+
+fn cloud_mcp_agent_turn_asp_item_kind(event_code: &str, content_kind: &str) -> &'static str {
+    let content_kind = content_kind.to_ascii_lowercase();
+    match event_code {
+        "md" if content_kind.contains("reason") || content_kind.contains("thinking") => "reasoning",
+        "md" => "message",
+        "xs" | "xe" | "xf" | "ss" | "se" => "tool",
+        "pr" | "pa" => "prompt",
+        "cc" | "cd" => "context",
+        _ => "turn",
+    }
+}
+
+fn cloud_mcp_agent_turn_asp_item_id(
+    stream_key: &str,
+    turn_id: &str,
+    event_code: &str,
+    payload: &TerminalActivityHookPayload,
+    content_kind: &str,
+) -> String {
+    let item_kind = cloud_mcp_agent_turn_asp_item_kind(event_code, content_kind);
+    let item_source = match item_kind {
+        "tool" => payload
+            .tool_use_id
+            .as_deref()
+            .or(payload.tool_name.as_deref())
+            .unwrap_or(item_kind),
+        "prompt" => payload
+            .prompt_id
+            .as_deref()
+            .or(payload.permission_request_id.as_deref())
+            .or(payload.permission_prompt_id.as_deref())
+            .or(payload.approval_id.as_deref())
+            .unwrap_or(item_kind),
+        "reasoning" | "message" => content_kind,
+        _ => item_kind,
+    };
+    ["asp", stream_key, turn_id, item_kind, item_source]
+        .into_iter()
+        .map(cloud_mcp_agent_turn_asp_safe_id)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 async fn cloud_mcp_publish_agent_chat_live_delta(
@@ -25229,6 +25757,20 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
         .as_deref()
         .unwrap_or("assistant")
         .to_string();
+    let content_kind_token = content_kind.to_ascii_lowercase();
+    let live_event_type = if is_final {
+        if content_kind_token.contains("reason") || content_kind_token.contains("thinking") {
+            "reasoning.completed"
+        } else {
+            "message.completed"
+        }
+    } else if content_kind_token.contains("reason") || content_kind_token.contains("thinking") {
+        "reasoning.delta"
+    } else {
+        "message.delta"
+    };
+    let item_id =
+        cloud_mcp_agent_turn_asp_item_id(stream_key, turn_id, "md", payload, content_kind.as_str());
     let mut envelope = json!({
         "v": 1,
         "k": "agent_chat_session_live_delta",
@@ -25265,6 +25807,8 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
         "turnId": turn_id,
         "message_id": message_id.as_str(),
         "messageId": message_id.as_str(),
+        "item_id": item_id.as_str(),
+        "itemId": item_id.as_str(),
         "role": "assistant",
         "content_kind": content_kind.as_str(),
         "contentKind": content_kind.as_str(),
@@ -25276,6 +25820,17 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
         "isFinal": is_final,
         "finish_reason": if is_final { turn_status } else { "" },
         "finishReason": if is_final { turn_status } else { "" },
+        "asp": {
+            "event_type": live_event_type,
+            "eventType": live_event_type,
+            "item_id": item_id.as_str(),
+            "itemId": item_id.as_str(),
+            "item_kind": if content_kind_token.contains("reason") || content_kind_token.contains("thinking") { "reasoning" } else { "message" },
+            "itemKind": if content_kind_token.contains("reason") || content_kind_token.contains("thinking") { "reasoning" } else { "message" },
+            "content_kind": content_kind.as_str(),
+            "contentKind": content_kind.as_str(),
+            "seq": status_seq,
+        },
         "observed_at_ms": payload.observed_at_ms,
         "observedAtMs": payload.observed_at_ms,
     });
@@ -25295,19 +25850,20 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
             String::new()
         };
         {
-            let entry = live_text.entry(cache_key).or_insert_with(|| {
-                CloudMcpAgentLiveTextSnapshot {
-                    text: String::new(),
-                    turn_id: turn_id.to_string(),
-                    message_id: message_id.clone(),
-                    content_kind: content_kind.clone(),
-                    state: state_value.to_string(),
-                    turn_status: turn_status.to_string(),
-                    is_final,
-                    finish_reason: finish_reason.clone(),
-                    updated_at_ms: payload.observed_at_ms,
-                }
-            });
+            let entry =
+                live_text
+                    .entry(cache_key)
+                    .or_insert_with(|| CloudMcpAgentLiveTextSnapshot {
+                        text: String::new(),
+                        turn_id: turn_id.to_string(),
+                        message_id: message_id.clone(),
+                        content_kind: content_kind.clone(),
+                        state: state_value.to_string(),
+                        turn_status: turn_status.to_string(),
+                        is_final,
+                        finish_reason: finish_reason.clone(),
+                        updated_at_ms: payload.observed_at_ms,
+                    });
             if !turn_id.is_empty() && !entry.turn_id.is_empty() && entry.turn_id != turn_id {
                 entry.text.clear();
             }
@@ -25359,10 +25915,21 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
     }
 }
 
-/// Flushes and publishes any buffered message-delta frame for the stream key.
-/// Awaited before every non-delta turn event and before remote prompt-answer
-/// events so buffered live text is always sent ahead of state transitions.
-async fn cloud_mcp_flush_pending_agent_turn_delta(state: &CloudMcpState, stream_key: &str) {
+async fn cloud_mcp_agent_turn_stream_lock(
+    state: &CloudMcpState,
+    stream_key: &str,
+) -> Arc<Mutex<()>> {
+    let mut locks = state.agent_turn_stream_locks.lock().await;
+    locks
+        .entry(stream_key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
+async fn cloud_mcp_flush_pending_agent_turn_delta_unlocked(
+    state: &CloudMcpState,
+    stream_key: &str,
+) {
     let pending = {
         let mut pending_map = state.agent_turn_delta_pending.lock().await;
         pending_map.remove(stream_key)
@@ -25377,6 +25944,45 @@ async fn cloud_mcp_flush_pending_agent_turn_delta(state: &CloudMcpState, stream_
             pending.direct_prompt_refs.as_ref(),
         )
         .await;
+    }
+}
+
+/// Flushes and publishes any buffered message-delta frame for the stream key.
+/// Awaited before every non-delta turn event and before remote prompt-answer
+/// events so buffered live text is always sent ahead of state transitions.
+async fn cloud_mcp_flush_pending_agent_turn_delta(state: &CloudMcpState, stream_key: &str) {
+    let stream_lock = cloud_mcp_agent_turn_stream_lock(state, stream_key).await;
+    let _stream_guard = stream_lock.lock().await;
+    cloud_mcp_flush_pending_agent_turn_delta_unlocked(state, stream_key).await;
+}
+
+/// Drains every buffered coalesced turn delta and publishes it immediately.
+/// Called on deliberate websocket teardown so live text buffered inside the
+/// coalescing window is not lost with the connection.
+async fn cloud_mcp_flush_all_pending_agent_turn_deltas(state: &CloudMcpState) {
+    loop {
+        let Some(stream_key) = ({
+            let pending_map = state.agent_turn_delta_pending.lock().await;
+            pending_map.keys().next().cloned()
+        }) else {
+            break;
+        };
+        cloud_mcp_flush_pending_agent_turn_delta(state, &stream_key).await;
+    }
+}
+
+/// Publishes any pending debounced device live-state snapshot immediately.
+/// Called on deliberate websocket teardown so the final projected terminal
+/// state (idle/closed) is not lost inside the debounce window; taking the
+/// pending reason also makes the scheduled timer flush a no-op.
+async fn cloud_mcp_flush_pending_device_live_snapshot(state: &CloudMcpState) {
+    let reason = state
+        .device_live_snapshot_debounce
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take());
+    if let Some(reason) = reason {
+        cloud_mcp_publish_device_live_state_snapshot(state, &reason).await;
     }
 }
 
@@ -25396,6 +26002,8 @@ fn cloud_mcp_schedule_agent_turn_delta_flush(
             CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_WINDOW_MS,
         ))
         .await;
+        let stream_lock = cloud_mcp_agent_turn_stream_lock(&state, &stream_key).await;
+        let _stream_guard = stream_lock.lock().await;
         let pending = {
             let mut pending_map = state.agent_turn_delta_pending.lock().await;
             if pending_map
@@ -25449,8 +26057,11 @@ async fn cloud_mcp_publish_agent_turn_event(
         payload.event_type.as_str(),
         payload.command_phase.as_str(),
     );
+    let stream_lock = cloud_mcp_agent_turn_stream_lock(state, &stream_key).await;
+    let _stream_guard = stream_lock.lock().await;
     // Only pure message deltas coalesce; snapshot-carrying frames publish
-    // immediately so the merge stays a delta concatenation.
+    // immediately, and repaint-shaped merges can promote the pending frame to
+    // a snapshot inside the coalescing window.
     let coalescible = event_code == "md"
         && payload.live_text_snapshot.is_none()
         && payload
@@ -25458,7 +26069,7 @@ async fn cloud_mcp_publish_agent_turn_event(
             .as_deref()
             .is_some_and(|delta| !delta.trim().is_empty());
     if !coalescible {
-        cloud_mcp_flush_pending_agent_turn_delta(state, &stream_key).await;
+        cloud_mcp_flush_pending_agent_turn_delta_unlocked(state, &stream_key).await;
         cloud_mcp_publish_agent_turn_event_now(
             state,
             payload,
@@ -25470,78 +26081,87 @@ async fn cloud_mcp_publish_agent_turn_event(
         .await;
         return;
     }
-    let flushed_pending = {
-        let mut pending_map = state.agent_turn_delta_pending.lock().await;
-        match pending_map.get_mut(&stream_key) {
-            Some(pending)
-                if pending.payload.live_text_kind == payload.live_text_kind
-                    && pending.payload.turn_id == payload.turn_id
-                    && pending
-                        .payload
-                        .live_text_delta
-                        .as_deref()
-                        .unwrap_or_default()
-                        .len()
-                        + payload.live_text_delta.as_deref().unwrap_or_default().len()
-                        <= CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_MAX_BYTES =>
-            {
-                let mut merged_delta = pending
-                    .payload
-                    .live_text_delta
-                    .take()
-                    .unwrap_or_default();
-                merged_delta.push_str(payload.live_text_delta.as_deref().unwrap_or_default());
-                let generation = pending.generation;
-                let mut merged_payload = payload.clone();
-                merged_payload.live_text_delta = Some(merged_delta);
-                *pending = CloudMcpPendingAgentTurnDelta {
-                    payload: merged_payload,
-                    status_seq,
-                    state_value: state_value.to_string(),
-                    turn_status: turn_status.to_string(),
-                    direct_prompt_refs: direct_prompt_refs.cloned(),
-                    generation,
-                };
-                None
-            }
-            other => {
-                // Kind/turn changed or the merged frame would exceed the
-                // byte cap: flush the old window and start a new one.
-                let flushed = if other.is_some() {
-                    pending_map.remove(&stream_key)
-                } else {
-                    None
-                };
-                let generation = state
-                    .agent_turn_delta_generation
-                    .fetch_add(1, Ordering::SeqCst)
-                    .wrapping_add(1);
-                pending_map.insert(
-                    stream_key.clone(),
-                    CloudMcpPendingAgentTurnDelta {
-                        payload: payload.clone(),
+    // Publish-before-insert: a displaced (unmergeable) pending window must be
+    // fully sent before the new window is created, so a flush of the new
+    // window can never overtake the older buffered text for this stream.
+    loop {
+        let displaced = {
+            let mut pending_map = state.agent_turn_delta_pending.lock().await;
+            match pending_map.get_mut(&stream_key) {
+                Some(pending)
+                    if pending.payload.live_text_kind == payload.live_text_kind
+                        && pending.payload.turn_id == payload.turn_id
+                        && pending.payload.live_text_snapshot.is_none()
+                        && pending.payload.live_text_delta.is_some()
+                        && pending
+                            .payload
+                            .live_text_delta
+                            .as_deref()
+                            .unwrap_or_default()
+                            .len()
+                            + payload.live_text_delta.as_deref().unwrap_or_default().len()
+                            <= CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_MAX_BYTES =>
+                {
+                    let merged_delta = pending.payload.live_text_delta.take().unwrap_or_default();
+                    let incoming_delta = payload.live_text_delta.as_deref().unwrap_or_default();
+                    let generation = pending.generation;
+                    let mut merged_payload = payload.clone();
+                    match cloud_mcp_merge_live_text_delta(&merged_delta, incoming_delta) {
+                        CloudMcpLiveTextMerge::Delta(delta) => {
+                            merged_payload.live_text_delta = Some(delta);
+                            merged_payload.live_text_snapshot = None;
+                        }
+                        CloudMcpLiveTextMerge::Snapshot(snapshot) => {
+                            merged_payload.live_text_delta = None;
+                            merged_payload.live_text_snapshot = Some(snapshot);
+                        }
+                    }
+                    *pending = CloudMcpPendingAgentTurnDelta {
+                        payload: merged_payload,
                         status_seq,
                         state_value: state_value.to_string(),
                         turn_status: turn_status.to_string(),
                         direct_prompt_refs: direct_prompt_refs.cloned(),
                         generation,
-                    },
-                );
-                cloud_mcp_schedule_agent_turn_delta_flush(state, &stream_key, generation);
-                flushed
+                    };
+                    return;
+                }
+                // Kind/turn changed or the merged frame would exceed the byte
+                // cap: take the old window out and publish it below before a
+                // new window may exist.
+                Some(_) => pending_map.remove(&stream_key),
+                None => {
+                    let generation = state
+                        .agent_turn_delta_generation
+                        .fetch_add(1, Ordering::SeqCst)
+                        .wrapping_add(1);
+                    pending_map.insert(
+                        stream_key.clone(),
+                        CloudMcpPendingAgentTurnDelta {
+                            payload: payload.clone(),
+                            status_seq,
+                            state_value: state_value.to_string(),
+                            turn_status: turn_status.to_string(),
+                            direct_prompt_refs: direct_prompt_refs.cloned(),
+                            generation,
+                        },
+                    );
+                    cloud_mcp_schedule_agent_turn_delta_flush(state, &stream_key, generation);
+                    return;
+                }
             }
+        };
+        if let Some(displaced) = displaced {
+            cloud_mcp_publish_agent_turn_event_now(
+                state,
+                &displaced.payload,
+                displaced.status_seq,
+                &displaced.state_value,
+                &displaced.turn_status,
+                displaced.direct_prompt_refs.as_ref(),
+            )
+            .await;
         }
-    };
-    if let Some(flushed) = flushed_pending {
-        cloud_mcp_publish_agent_turn_event_now(
-            state,
-            &flushed.payload,
-            flushed.status_seq,
-            &flushed.state_value,
-            &flushed.turn_status,
-            flushed.direct_prompt_refs.as_ref(),
-        )
-        .await;
     }
 }
 
@@ -25573,17 +26193,9 @@ async fn cloud_mcp_publish_agent_turn_event_now(
         payload.command_phase.as_str(),
     );
     let hook_key = cloud_mcp_agent_turn_hook_key(payload.hook_event_name.as_str());
-    if (event_code == "ts"
-        && matches!(
-            hook_key.as_str(),
-            "backendpromptsubmit"
-                | "userpromptsubmit"
-                | "userpromptsubmitted"
-                | "promptsubmit"
-                | "promptsubmitted"
-        ))
-        || payload.completion_evidence == "cli_hook_prompt_submit"
-    {
+    let prompt_submission =
+        cloud_mcp_agent_turn_is_prompt_submission(event_code, payload, hook_key.as_str());
+    if prompt_submission {
         if let Ok(mut live_text) = state.agent_live_text_by_stream.lock() {
             live_text.remove(&stream_key);
             let prefix = format!("{stream_key}|");
@@ -25603,55 +26215,162 @@ async fn cloud_mcp_publish_agent_turn_event_now(
         .or(payload.provider_turn_id.as_deref())
         .or_else(|| direct_prompt_refs.map(|refs| refs.command_id.as_str()))
         .unwrap_or("");
+    let content_kind = payload.live_text_kind.as_deref().unwrap_or_default();
+    let asp_event_type =
+        cloud_mcp_agent_turn_asp_event_type(event_code, payload, state_value, turn_status);
+    let asp_item_kind = cloud_mcp_agent_turn_asp_item_kind(event_code, content_kind);
+    let asp_item_id =
+        cloud_mcp_agent_turn_asp_item_id(&stream_key, turn_id, event_code, payload, content_kind);
     let mut data = json!({
         "et": payload.event_type.as_str(),
         "hn": payload.hook_event_name.as_str(),
         "ir": payload.input_ready,
+        "asp": {
+            "event_type": asp_event_type,
+            "eventType": asp_event_type,
+            "item_id": asp_item_id.as_str(),
+            "itemId": asp_item_id.as_str(),
+            "item_kind": asp_item_kind,
+            "itemKind": asp_item_kind,
+            "seq": status_seq,
+        },
     });
     if let Some(tool_name) = cloud_mcp_compact_turn_text(payload.tool_name.as_ref(), 96) {
-        data["tool"] = json!(tool_name);
+        data["tool"] = json!(tool_name.as_str());
+        data["toolName"] = json!(tool_name.as_str());
+        data["tool_name"] = json!(tool_name.as_str());
     }
     if let Some(tool_use_id) = cloud_mcp_compact_turn_text(payload.tool_use_id.as_ref(), 96) {
-        data["tool_id"] = json!(tool_use_id);
+        data["tool_id"] = json!(tool_use_id.as_str());
+        data["toolUseId"] = json!(tool_use_id.as_str());
+        data["tool_use_id"] = json!(tool_use_id.as_str());
+    }
+    if let Some(tool_server) = cloud_mcp_compact_turn_text(payload.tool_server.as_ref(), 96) {
+        data["toolServer"] = json!(tool_server.as_str());
+        data["tool_server"] = json!(tool_server.as_str());
+    }
+    if let Some(command) = cloud_mcp_compact_turn_text(payload.command.as_ref(), 4096) {
+        data["command"] = json!(command.as_str());
+    }
+    if let Some(file_path) = cloud_mcp_compact_turn_text(payload.file_path.as_ref(), 4096) {
+        data["filePath"] = json!(file_path.as_str());
+        data["file_path"] = json!(file_path.as_str());
+    }
+    if let Some(duration_ms) = payload.duration_ms {
+        data["durationMs"] = json!(duration_ms);
+        data["duration_ms"] = json!(duration_ms);
+    }
+    if let Some(exit_code) = payload.exit_code {
+        data["exitCode"] = json!(exit_code);
+        data["exit_code"] = json!(exit_code);
+    }
+    if let Some(tool_input) = payload.tool_input.as_ref().filter(|value| !value.is_null()) {
+        data["toolInput"] = tool_input.clone();
+        data["tool_input"] = tool_input.clone();
+    }
+    if let Some(tool_output) = payload.tool_output.as_ref().filter(|value| !value.is_null()) {
+        data["toolOutput"] = tool_output.clone();
+        data["tool_output"] = tool_output.clone();
+    }
+    if let Some(tool_error) = payload.tool_error.as_ref().filter(|value| !value.is_null()) {
+        data["toolError"] = tool_error.clone();
+        data["tool_error"] = tool_error.clone();
+    }
+    if let Some(raw_tool_payload) = payload
+        .raw_tool_payload
+        .as_ref()
+        .filter(|value| !value.is_null())
+    {
+        data["rawToolPayload"] = raw_tool_payload.clone();
+        data["raw_tool_payload"] = raw_tool_payload.clone();
     }
     if cloud_mcp_agent_turn_should_include_message(event_code, payload) {
         if let Some(message) = cloud_mcp_compact_turn_text(payload.message.as_ref(), 4096) {
-            data["m"] = json!(message);
+            data["m"] = json!(message.as_str());
+            if event_code == "pr" {
+                data["message"] = json!(message.as_str());
+            }
+        }
+    }
+    if prompt_submission {
+        if let Some(user_message) = cloud_mcp_compact_turn_text(payload.user_message.as_ref(), 12_000)
+            .or_else(|| cloud_mcp_compact_turn_text(payload.message.as_ref(), 12_000))
+        {
+            data["um"] = json!(user_message.as_str());
+            data["user_message"] = json!(user_message.as_str());
+            data["userMessage"] = json!(user_message.as_str());
+            data["user_message_id"] = json!(asp_item_id.as_str());
+            data["userMessageId"] = json!(asp_item_id.as_str());
+            data["src"] = json!(if payload.source.starts_with("cli-hook") {
+                "terminal"
+            } else {
+                "local"
+            });
         }
     }
     if event_code == "pr" && data.get("m").is_none() {
         if let Some(prompt_text) =
             cloud_mcp_compact_turn_text(payload.prompting_user_text.as_ref(), 4096)
         {
-            data["m"] = json!(prompt_text);
+            data["m"] = json!(prompt_text.as_str());
+            data["message"] = json!(prompt_text.as_str());
         }
     }
     if let Some(live_text_kind) = payload.live_text_kind.as_deref() {
         data["lt"] = json!(live_text_kind);
     }
-    if let Some(live_text_delta) = cloud_mcp_compact_turn_text(payload.live_text_delta.as_ref(), 4096) {
+    if let Some(live_text_delta) =
+        cloud_mcp_compact_turn_text(payload.live_text_delta.as_ref(), 4096)
+    {
         data["dm"] = json!(live_text_delta);
     }
-    if let Some(prompt_id) = payload.prompt_id.as_deref().filter(|value| !value.trim().is_empty()) {
-        data["pid"] = json!(prompt_id);
+    if let Some(live_text_snapshot) =
+        cloud_mcp_compact_turn_text(payload.live_text_snapshot.as_ref(), 32_768)
+    {
+        data["sm"] = json!(live_text_snapshot.as_str());
+        data["snapshot_text"] = json!(live_text_snapshot.as_str());
+        data["snapshotText"] = json!(live_text_snapshot.as_str());
     }
-    if let Some(prompt_kind) = payload.prompt_kind.as_deref().filter(|value| !value.trim().is_empty()) {
-        data["pm"] = json!(prompt_kind);
+    if let Some(prompt_id) = cloud_mcp_agent_turn_prompt_id(payload) {
+        data["pid"] = json!(prompt_id.as_str());
+        data["prompt_id"] = json!(prompt_id.as_str());
+        data["promptId"] = json!(prompt_id.as_str());
     }
-    if let Some(default_option) = payload.prompt_default_option.as_deref().filter(|value| !value.trim().is_empty()) {
+    if let Some(prompt_kind) = cloud_mcp_agent_turn_prompt_kind(payload) {
+        data["pm"] = json!(prompt_kind.as_str());
+        data["prompt_kind"] = json!(prompt_kind.as_str());
+        data["promptKind"] = json!(prompt_kind.as_str());
+    }
+    if let Some(default_option) = payload
+        .prompt_default_option
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         data["def"] = json!(default_option);
+        data["default_option_id"] = json!(default_option);
+        data["defaultOptionId"] = json!(default_option);
     }
     if let Some(ttl_ms) = payload.prompt_ttl_ms {
         data["ttl"] = json!(ttl_ms);
+        data["ttl_ms"] = json!(ttl_ms);
+        data["ttlMs"] = json!(ttl_ms);
     }
     if !payload.prompt_options.is_empty() {
         data["opts"] = cloud_mcp_agent_turn_prompt_options(payload);
+        let option_objects = cloud_mcp_agent_turn_prompt_option_objects(payload);
+        data["options"] = option_objects.clone();
+        data["prompt_options"] = option_objects.clone();
+        data["promptOptions"] = option_objects;
     }
     if event_code == "pa" {
         if let Some(answer_option) =
             cloud_mcp_compact_turn_text(payload.prompt_answer_option.as_ref(), 96)
         {
-            data["opt"] = json!(answer_option);
+            data["opt"] = json!(answer_option.as_str());
+            data["option_id"] = json!(answer_option.as_str());
+            data["optionId"] = json!(answer_option.as_str());
+            data["chosen_option_id"] = json!(answer_option.as_str());
+            data["chosenOptionId"] = json!(answer_option.as_str());
         }
         // Hook-observed answers were made locally in the terminal; the remote
         // command answer path publishes its own `pa` tagged src=remote.
@@ -25661,7 +26380,7 @@ async fn cloud_mcp_publish_agent_turn_event_now(
         data["todo"] = json!(refs.todo_id.as_str());
         data["cmd"] = json!(refs.command_id.as_str());
     }
-    let envelope = json!({
+    let mut envelope = json!({
         "v": 1,
         "k": "turn.e",
         "kind": "turn.e",
@@ -25675,6 +26394,19 @@ async fn cloud_mcp_publish_agent_turn_event_now(
         "t": event_code,
         "st": state_value,
         "ts": turn_status,
+        "asp": {
+            "event_type": asp_event_type,
+            "eventType": asp_event_type,
+            "item_id": asp_item_id.as_str(),
+            "itemId": asp_item_id.as_str(),
+            "item_kind": asp_item_kind,
+            "itemKind": asp_item_kind,
+            "seq": status_seq,
+        },
+        "asp_event_type": asp_event_type,
+        "aspEventType": asp_event_type,
+        "item_id": asp_item_id.as_str(),
+        "itemId": asp_item_id.as_str(),
         "d": device_id,
         "w": payload.workspace_id.as_str(),
         "p": payload.pane_id.as_str(),
@@ -25682,10 +26414,27 @@ async fn cloud_mcp_publish_agent_turn_event_now(
         "x": data,
         "at": payload.observed_at_ms,
     });
+    if prompt_submission {
+        if let Some(user_message) = envelope
+            .get("x")
+            .and_then(|data| data.get("um"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            envelope["user_message"] = json!(user_message.as_str());
+            envelope["userMessage"] = json!(user_message.as_str());
+            envelope["user_message_id"] = json!(asp_item_id.as_str());
+            envelope["userMessageId"] = json!(asp_item_id.as_str());
+        }
+    }
     if let Ok(mut snapshots) = state.agent_turn_stream_snapshots.lock() {
         snapshots.insert(stream_key.clone(), envelope.clone());
         if snapshots.len() > 256 {
-            let stale_keys = snapshots.keys().take(snapshots.len().saturating_sub(256)).cloned().collect::<Vec<_>>();
+            let stale_keys = snapshots
+                .keys()
+                .take(snapshots.len().saturating_sub(256))
+                .cloned()
+                .collect::<Vec<_>>();
             for key in stale_keys {
                 snapshots.remove(&key);
             }
@@ -26003,6 +26752,60 @@ fn cloud_mcp_payload_items(payload: &Value, keys: &[&str], limit: usize) -> Vec<
 
 fn cloud_mcp_workspace_terminal_items(workspace: &Value) -> Vec<Value> {
     cloud_mcp_payload_items(workspace, &["terminals"], 64)
+}
+
+fn cloud_mcp_terminal_empty_clear_reason_is_explicit(value: &str) -> bool {
+    let token = value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', ' ', '.'], "_");
+    if token.is_empty() {
+        return false;
+    }
+    matches!(
+        token.as_str(),
+        "all_terminals_closed"
+            | "all_terminal_sessions_closed"
+            | "close_all_terminals"
+            | "terminal_closed"
+            | "terminals_closed"
+            | "terminal_deleted"
+            | "terminals_deleted"
+            | "terminal_removed"
+            | "terminals_removed"
+            | "workspace_deleted"
+            | "workspace_delete"
+            | "workspace_removed"
+            | "workspace_catalog_deleted"
+    ) || token.contains("all_terminals_closed")
+        || token.contains("all_terminal_sessions_closed")
+        || token.contains("close_all_terminals")
+}
+
+fn cloud_mcp_workspace_terminal_empty_clear_is_explicit(
+    workspace: &Value,
+    snapshot_reason: &str,
+    requested_terminal_clear_reason: &str,
+) -> bool {
+    if cloud_mcp_terminal_empty_clear_reason_is_explicit(requested_terminal_clear_reason)
+        || cloud_mcp_terminal_empty_clear_reason_is_explicit(snapshot_reason)
+    {
+        return true;
+    }
+    [
+        "terminal_clear_reason",
+        "terminalClearReason",
+        "reason",
+        "event_kind",
+        "eventKind",
+        "event_type",
+        "eventType",
+        "status",
+        "state",
+    ]
+    .iter()
+    .filter_map(|key| workspace.get(*key).and_then(Value::as_str))
+    .any(cloud_mcp_terminal_empty_clear_reason_is_explicit)
 }
 
 fn cloud_mcp_workspace_panel_items(workspace: &Value) -> Vec<Value> {
@@ -27547,33 +28350,19 @@ fn cloud_mcp_mark_terminal_last_known_read_only(value: &mut Value) {
     object.insert("connected".to_string(), json!(false));
 }
 
-fn cloud_mcp_mark_terminal_live_commandable(value: &mut Value) {
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    object.insert("last_known_runtime".to_string(), json!(false));
-    object.insert("lastKnownRuntime".to_string(), json!(false));
-    object.insert("runtime_read_only".to_string(), json!(false));
-    object.insert("runtimeReadOnly".to_string(), json!(false));
-    object.insert("commandable".to_string(), json!(true));
-    object.insert("native_connected".to_string(), json!(true));
-    object.insert("nativeConnected".to_string(), json!(true));
-    object.insert("connected".to_string(), json!(true));
-}
-
-fn cloud_mcp_mark_workspace_terminals_live_commandable(workspace: &mut Value) {
+fn cloud_mcp_mark_workspace_terminals_last_known_read_only(workspace: &mut Value) {
     let Some(terminals) = workspace.get_mut("terminals") else {
         return;
     };
     if let Some(terminals) = terminals.as_array_mut() {
         for terminal in terminals {
-            cloud_mcp_mark_terminal_live_commandable(terminal);
+            cloud_mcp_mark_terminal_last_known_read_only(terminal);
         }
         return;
     }
     if let Some(terminals) = terminals.as_object_mut() {
         for terminal in terminals.values_mut() {
-            cloud_mcp_mark_terminal_live_commandable(terminal);
+            cloud_mcp_mark_terminal_last_known_read_only(terminal);
         }
     }
 }
@@ -28916,15 +29705,25 @@ async fn cloud_mcp_signal_desktop_closing(app: &AppHandle, reason: &str) -> Resu
         ),
     )
     .await;
-    let _ = timeout(
-        Duration::from_millis(900),
-        cloud_mcp_send_app_ws_close_request(&state, reason),
-    )
-    .await;
-    sleep(Duration::from_millis(250)).await;
     let result = lifecycle_result
         .map_err(|_| "Timed out sending desktop close signal to Cloud MCP.".to_string())??;
     Ok(result)
+}
+
+async fn cloud_mcp_request_desktop_close(app: &AppHandle, reason: &str) -> Result<(), String> {
+    let state = app.state::<CloudMcpState>().inner().clone();
+    if !cloud_mcp_status_snapshot(&state).await.global_ws_connected {
+        return Ok(());
+    }
+
+    timeout(
+        Duration::from_millis(900),
+        cloud_mcp_send_app_ws_close_request(&state, reason),
+    )
+    .await
+    .map_err(|_| "Timed out sending desktop close request to Cloud MCP.".to_string())??;
+    sleep(Duration::from_millis(250)).await;
+    Ok(())
 }
 
 const CLOUD_MCP_LEGACY_SESSION_STATE_KEY: &str = "desktop-session";
@@ -29875,6 +30674,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             .filter(|value| !value.is_empty())
     };
     let reason = clean_option(reason).unwrap_or_else(|| "device_workspaces_snapshot".to_string());
+    let reason_for_ack = reason.clone();
     let workspace_items = workspaces
         .as_array()
         .ok_or_else(|| "Device workspace snapshot sync requires a workspaces array.".to_string())?;
@@ -29882,6 +30682,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
     let mut selected_workspace_id: Option<String> = None;
     let mut selected_workspace_name: Option<String> = None;
     let mut skipped_archived_count = 0usize;
+    let mut skipped_archived_workspace_ids = std::collections::BTreeSet::new();
     let mut normalized_terminal_orchestrators = Vec::new();
     let device_profile = cloud_mcp_desktop_device_profile();
 
@@ -29889,7 +30690,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
     // terminals; the device contract is that remote dashboards keep showing the last
     // known terminals read-only. Backfill inactive workspaces from the cached snapshots
     // instead of publishing an authoritative empty list that would clear them everywhere.
-    let cached_last_known_terminals: std::collections::BTreeMap<String, Vec<Value>> = {
+    let cached_last_known_workspaces: std::collections::BTreeMap<String, Value> = {
         let snapshots = state.inner().runtime_snapshots.lock().await;
         let mut cached = std::collections::BTreeMap::new();
         for snapshot in [
@@ -29909,14 +30710,21 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                 if cached.contains_key(&workspace_id) {
                     continue;
                 }
-                let terminals = cloud_mcp_workspace_terminal_items(&workspace);
-                if !terminals.is_empty() {
-                    cached.insert(workspace_id, terminals);
+                if !cloud_mcp_workspace_snapshot_is_locally_archived(&workspace) {
+                    cached.insert(workspace_id, workspace);
                 }
             }
         }
         cached
     };
+    let cached_last_known_terminals: std::collections::BTreeMap<String, Vec<Value>> =
+        cached_last_known_workspaces
+            .iter()
+            .filter_map(|(workspace_id, workspace)| {
+                let terminals = cloud_mcp_workspace_terminal_items(workspace);
+                (!terminals.is_empty()).then(|| (workspace_id.clone(), terminals))
+            })
+            .collect();
 
     if let Some(orchestrators) = terminal_orchestrators.as_ref() {
         for terminal in cloud_mcp_json_collection_items(orchestrators)
@@ -29935,6 +30743,12 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
 
     for (workspace_index, workspace) in workspace_items.iter().take(64).enumerate() {
         if cloud_mcp_workspace_snapshot_is_locally_archived(workspace) {
+            if let Some(workspace_id) =
+                cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+                    .filter(|value| !value.trim().is_empty())
+            {
+                skipped_archived_workspace_ids.insert(workspace_id);
+            }
             skipped_archived_count += 1;
             continue;
         }
@@ -30246,8 +31060,16 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             })
             .collect::<Vec<_>>();
         let mut terminals = terminals;
+        let requested_terminal_clear_reason =
+            cloud_mcp_payload_text(workspace, &["terminal_clear_reason", "terminalClearReason"])
+                .unwrap_or_default();
+        let terminal_empty_clear_explicit = cloud_mcp_workspace_terminal_empty_clear_is_explicit(
+            workspace,
+            &reason,
+            &requested_terminal_clear_reason,
+        );
         let mut terminal_list_last_known_fallback = false;
-        if !workspace_active && terminals.is_empty() {
+        if terminals.is_empty() && !terminal_empty_clear_explicit {
             if let Some(cached) = cached_last_known_terminals.get(&workspace_id) {
                 terminals = cached
                     .iter()
@@ -30410,20 +31232,20 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             ],
         )
         .unwrap_or(workspace_index as u64);
-        let requested_terminal_clear_reason =
-            cloud_mcp_payload_text(workspace, &["terminal_clear_reason", "terminalClearReason"])
-                .unwrap_or_default();
-        let terminal_list_authoritative = true;
-        let terminal_list_empty_authoritative = terminals.is_empty();
+        let terminal_list_authoritative =
+            !terminal_list_last_known_fallback && (!terminals.is_empty() || terminal_empty_clear_explicit);
+        let terminal_list_empty_authoritative = terminals.is_empty() && terminal_empty_clear_explicit;
         let panel_list_authoritative = true;
         let panel_list_empty_authoritative = panels.is_empty();
-        let terminal_clear_reason = if terminal_list_empty_authoritative
-            && requested_terminal_clear_reason.trim().is_empty()
-        {
-            // "all_terminals_closed" authorizes downstream clears of last-known terminals;
-            // an inactive workspace with no cached terminals is not a user-driven clear.
-            if workspace_active {
-                "all_terminals_closed".to_string()
+        let terminal_clear_reason = if terminals.is_empty() {
+            if terminal_empty_clear_explicit {
+                if requested_terminal_clear_reason.trim().is_empty() {
+                    reason.clone()
+                } else {
+                    requested_terminal_clear_reason
+                }
+            } else if workspace_active {
+                "transient_empty_terminal_snapshot".to_string()
             } else {
                 "workspace_inactive".to_string()
             }
@@ -30487,6 +31309,78 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             }
         }
     }
+    let input_workspace_count = normalized_workspaces.len();
+    let mut workspace_snapshot_fallback_count = 0usize;
+    if !cached_last_known_workspaces.is_empty() {
+        let mut reported_workspace_ids = normalized_workspaces
+            .iter()
+            .filter_map(|workspace| {
+                cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId", "id"])
+                    .filter(|value| !value.trim().is_empty())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        for (workspace_id, cached_workspace) in cached_last_known_workspaces.iter() {
+            if reported_workspace_ids.contains(workspace_id)
+                || skipped_archived_workspace_ids.contains(workspace_id)
+            {
+                continue;
+            }
+            let mut workspace = cached_workspace.clone();
+            if let Some(object) = workspace.as_object_mut() {
+                object.insert("workspace_snapshot_fallback".to_string(), json!(true));
+                object.insert("workspaceSnapshotFallback".to_string(), json!(true));
+                object.insert("last_known_workspace_fallback".to_string(), json!(true));
+                object.insert("lastKnownWorkspaceFallback".to_string(), json!(true));
+                object
+                    .entry("workspace_id".to_string())
+                    .or_insert_with(|| json!(workspace_id.clone()));
+                object
+                    .entry("id".to_string())
+                    .or_insert_with(|| json!(workspace_id.clone()));
+                object.insert(
+                    "reason".to_string(),
+                    json!("workspace_snapshot_transient_gap_backfill"),
+                );
+                object.insert("updated_at_ms".to_string(), json!(cloud_mcp_now_ms()));
+                object.insert("updatedAtMs".to_string(), json!(cloud_mcp_now_ms()));
+            }
+            normalized_workspaces.push(workspace);
+            reported_workspace_ids.insert(workspace_id.clone());
+            workspace_snapshot_fallback_count += 1;
+        }
+    }
+    let reason_token = reason.trim().to_ascii_lowercase().replace('-', "_");
+    let workspace_set_clear_requested = matches!(
+        reason_token.as_str(),
+        "workspace_deleted"
+            | "workspace_delete"
+            | "all_workspaces_deleted"
+            | "all_workspaces_closed"
+            | "workspace_catalog_cleared"
+    );
+    if normalized_workspaces.is_empty() && !workspace_set_clear_requested {
+        let sync_key = "device_workspaces_snapshot".to_string();
+        return Ok(cloud_mcp_background_sync_ack(
+            "device_workspaces_snapshot",
+            &sync_key,
+            &reason_for_ack,
+            json!({
+                "queued": false,
+                "sent": false,
+                "skipped": true,
+                "skip_reason": "transient_empty_workspace_snapshot",
+                "stored": {
+                    "cached_workspace_count": cached_last_known_workspaces.len(),
+                    "input_workspace_count": input_workspace_count,
+                    "skipped_archived_workspace_count": skipped_archived_count,
+                    "workspace_count": 0,
+                    "workspace_snapshot_fallback_count": workspace_snapshot_fallback_count,
+                },
+                "stored_count": 0,
+                "workspace_count": 0,
+            }),
+        ));
+    }
     let terminal_count = normalized_workspaces
         .iter()
         .map(|workspace| {
@@ -30532,7 +31426,6 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         .unwrap_or(Value::Null);
     let selected_workspace_id_value = selected_workspace_id.clone();
 
-    let reason_for_ack = reason.clone();
     let payload = json!({
         "source": "rust-diffforge-device-workspaces",
         "contract": "diffforge.device_workspaces.v1",
@@ -30555,6 +31448,10 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         "snapshotFull": true,
         "workspace_snapshot_authoritative": true,
         "workspaceSnapshotAuthoritative": true,
+        "workspace_snapshot_input_count": input_workspace_count,
+        "workspaceSnapshotInputCount": input_workspace_count,
+        "workspace_snapshot_fallback_count": workspace_snapshot_fallback_count,
+        "workspaceSnapshotFallbackCount": workspace_snapshot_fallback_count,
         "workspace_count": workspace_count,
         "skipped_archived_workspace_count": skipped_archived_count,
         "skippedArchivedWorkspaceCount": skipped_archived_count,
@@ -30648,6 +31545,9 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             "skip_reason": skipped_reason,
             "stored": {
                 "stored_count": workspace_count,
+                "input_workspace_count": input_workspace_count,
+                "workspace_snapshot_fallback_count": workspace_snapshot_fallback_count,
+                "workspaceSnapshotFallbackCount": workspace_snapshot_fallback_count,
                 "skipped_archived_workspace_count": skipped_archived_count,
                 "skippedArchivedWorkspaceCount": skipped_archived_count,
                 "server_count": server_count,
@@ -30656,6 +31556,9 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                 "workspace_count": workspace_count,
             },
             "stored_count": workspace_count,
+            "input_workspace_count": input_workspace_count,
+            "workspace_snapshot_fallback_count": workspace_snapshot_fallback_count,
+            "workspaceSnapshotFallbackCount": workspace_snapshot_fallback_count,
             "server_count": server_count,
             "terminal_count": terminal_count,
             "terminal_orchestrator_count": terminal_orchestrator_count,
@@ -31194,7 +32097,10 @@ async fn cloud_mcp_publish_device_live_state_snapshot_debounced(
     }
     let state = state.clone();
     tauri::async_runtime::spawn(async move {
-        sleep(Duration::from_millis(CLOUD_MCP_DEVICE_LIVE_SNAPSHOT_DEBOUNCE_MS)).await;
+        sleep(Duration::from_millis(
+            CLOUD_MCP_DEVICE_LIVE_SNAPSHOT_DEBOUNCE_MS,
+        ))
+        .await;
         let reason = state
             .device_live_snapshot_debounce
             .lock()
@@ -31244,6 +32150,15 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     let prompt_event_id = context_entry
         .as_ref()
         .and_then(|entry| entry.prompt_event_id.as_deref());
+    let turn_prompt_event_id = payload
+        .turn_id
+        .as_deref()
+        .or(payload.provider_turn_id.as_deref())
+        .or(prompt_event_id);
+    let current_prompt = payload
+        .user_message
+        .as_deref()
+        .or(payload.message.as_deref());
     let state_value = cloud_mcp_terminal_lifecycle_state(
         &payload.event_type,
         &payload.terminal_status,
@@ -31361,8 +32276,15 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         "sessionId": provider_session_id,
         "fork_from_provider_session_id": fork_from_provider_session_id.clone(),
         "forkFromProviderSessionId": fork_from_provider_session_id,
-        "prompt_event_id": prompt_event_id,
-        "promptEventId": prompt_event_id,
+        "prompt_event_id": turn_prompt_event_id,
+        "promptEventId": turn_prompt_event_id,
+        "user_message": current_prompt,
+        "userMessage": current_prompt,
+        "current_prompt": current_prompt,
+        "currentPrompt": current_prompt,
+        "last_prompt": current_prompt,
+        "lastPrompt": current_prompt,
+        "message": payload.message.as_deref(),
         "todo_id": direct_prompt_refs.as_ref().map(|refs| refs.todo_id.as_str()),
         "todoId": direct_prompt_refs.as_ref().map(|refs| refs.todo_id.as_str()),
         "todo_dispatch_id": direct_prompt_refs.as_ref().map(|refs| refs.dispatch_id.as_str()),
@@ -31457,7 +32379,7 @@ fn cloud_mcp_mark_workspace_inactive_in_snapshot(
             workspace_object.insert("updated_at_ms".to_string(), json!(observed_at_ms));
             workspace_object.insert("updatedAtMs".to_string(), json!(observed_at_ms));
         }
-        cloud_mcp_mark_workspace_terminals_live_commandable(workspace);
+        cloud_mcp_mark_workspace_terminals_last_known_read_only(workspace);
     }
     if changed {
         object.insert("reason".to_string(), json!(reason));
@@ -31654,6 +32576,10 @@ fn cloud_mcp_empty_workspace_snapshot(source: &str, reason: &str, count_kind: &s
         "snapshot_id": format!("empty-workspaces-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4()),
         "snapshot_full": true,
         "authoritative": true,
+        "workspace_set_empty_authoritative": true,
+        "workspaceSetEmptyAuthoritative": true,
+        "workspace_clear_reason": reason,
+        "workspaceClearReason": reason,
         "workspace_count": 0,
         "workspaceCount": 0,
         "workspaces": [],
@@ -49629,6 +50555,15 @@ mod cloud_mcp_tests {
             live_text_kind: None,
             tool_name: None,
             tool_use_id: None,
+            tool_server: None,
+            tool_input: None,
+            tool_output: None,
+            tool_error: None,
+            raw_tool_payload: None,
+            command: None,
+            file_path: None,
+            duration_ms: None,
+            exit_code: None,
             approval_id: None,
             permission_prompt_id: None,
             permission_request_id: None,
@@ -49664,7 +50599,9 @@ mod cloud_mcp_tests {
             "cli_hook_reasoning",
             Some("reasoning token"),
         );
-        assert!(cloud_mcp_agent_turn_should_include_message("ts", &reasoning));
+        assert!(cloud_mcp_agent_turn_should_include_message(
+            "ts", &reasoning
+        ));
 
         let prompt_submit = test_activity_hook_payload(
             "UserPromptSubmit",
@@ -49675,6 +50612,71 @@ mod cloud_mcp_tests {
         assert!(!cloud_mcp_agent_turn_should_include_message(
             "ts",
             &prompt_submit,
+        ));
+    }
+
+    #[test]
+    fn live_text_delta_merge_deduplicates_repaint_overlap() {
+        match cloud_mcp_merge_live_text_delta("Work", "king on it") {
+            CloudMcpLiveTextMerge::Delta(value) => assert_eq!(value, "Working on it"),
+            CloudMcpLiveTextMerge::Snapshot(_) => panic!("expected delta merge"),
+        }
+
+        match cloud_mcp_merge_live_text_delta("Working", "Working") {
+            CloudMcpLiveTextMerge::Delta(value) => assert_eq!(value, "WorkingWorking"),
+            CloudMcpLiveTextMerge::Snapshot(_) => panic!("expected repeated delta append"),
+        }
+
+        match cloud_mcp_merge_live_text_delta("ha ", "ha ") {
+            CloudMcpLiveTextMerge::Delta(value) => assert_eq!(value, "ha ha "),
+            CloudMcpLiveTextMerge::Snapshot(_) => panic!("expected repeated token append"),
+        }
+    }
+
+    #[test]
+    fn live_text_delta_merge_promotes_repaint_replacement_to_snapshot() {
+        match cloud_mcp_merge_live_text_delta("Hello world", "Hello there") {
+            CloudMcpLiveTextMerge::Snapshot(value) => assert_eq!(value, "Hello there"),
+            CloudMcpLiveTextMerge::Delta(_) => panic!("expected snapshot merge"),
+        }
+    }
+
+    #[test]
+    fn agent_turn_prompt_submission_marks_user_message_plane() {
+        let backend_prompt = test_activity_hook_payload(
+            "BackendPromptSubmit",
+            "running",
+            "backend_prompt_submit",
+            Some("route this prompt over websocket"),
+        );
+        assert!(cloud_mcp_agent_turn_is_prompt_submission(
+            "ts",
+            &backend_prompt,
+            "backendpromptsubmit",
+        ));
+
+        let cli_prompt = test_activity_hook_payload(
+            "UserPromptSubmit",
+            "running",
+            "cli_hook_prompt_submit",
+            Some("typed in the tui"),
+        );
+        assert!(cloud_mcp_agent_turn_is_prompt_submission(
+            "ts",
+            &cli_prompt,
+            "userpromptsubmit",
+        ));
+
+        let message_delta = test_activity_hook_payload(
+            "MessageDisplay",
+            "message_delta",
+            "cli_hook_message_display",
+            Some("assistant text"),
+        );
+        assert!(!cloud_mcp_agent_turn_is_prompt_submission(
+            "md",
+            &message_delta,
+            "messagedisplay",
         ));
     }
 
@@ -49733,6 +50735,74 @@ mod cloud_mcp_tests {
         assert_eq!(
             cloud_mcp_workspace_panel_kind(&docs_panel).as_deref(),
             Some("docs"),
+        );
+    }
+
+    #[test]
+    fn live_state_merge_preserves_terminals_against_transient_empty() {
+        let mut target = json!({
+            "terminals": [{ "terminal_id": "terminal-1" }],
+            "terminal_count": 1,
+        });
+
+        cloud_mcp_live_state_merge_object(
+            &mut target,
+            json!({
+                "terminal_list_empty_authoritative": false,
+                "terminals": [],
+                "terminal_count": 0,
+            }),
+        );
+
+        assert_eq!(
+            target["terminals"].as_array().map(Vec::len),
+            Some(1),
+        );
+
+        cloud_mcp_live_state_merge_object(
+            &mut target,
+            json!({
+                "terminal_list_empty_authoritative": true,
+                "terminal_clear_reason": "all_terminals_closed",
+                "terminals": [],
+                "terminal_count": 0,
+            }),
+        );
+
+        assert_eq!(
+            target["terminals"].as_array().map(Vec::len),
+            Some(0),
+        );
+    }
+
+    #[test]
+    fn live_state_compaction_omits_transient_empty_terminals() {
+        let (_key, compacted) = cloud_mcp_compact_workspace_live_state(
+            &json!({
+                "workspace_id": "workspace-1",
+                "terminal_count": 0,
+                "terminal_list_empty_authoritative": false,
+                "terminals": [],
+            }),
+            0,
+        );
+
+        assert!(compacted.get("terminals").is_none());
+        assert!(compacted.get("terminal_count").is_none());
+
+        let (_key, explicit_clear) = cloud_mcp_compact_workspace_live_state(
+            &json!({
+                "workspace_id": "workspace-1",
+                "terminal_count": 0,
+                "terminal_list_empty_authoritative": true,
+                "terminal_clear_reason": "all_terminals_closed",
+                "terminals": [],
+            }),
+            0,
+        );
+        assert_eq!(
+            explicit_clear["terminals"].as_array().map(Vec::len),
+            Some(0),
         );
     }
 

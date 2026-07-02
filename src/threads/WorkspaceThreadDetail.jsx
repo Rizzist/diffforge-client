@@ -1233,6 +1233,17 @@ const TranscriptActivityMetaBody = styled(TranscriptActivityBody)`
   color: var(--thread-muted-soft);
 `;
 
+const TranscriptActivitySectionLabel = styled.div`
+  margin: 7px 0 2px 18px;
+  color: var(--thread-muted-soft);
+  font-size: var(--thread-detail-mini-font-size);
+  font-weight: 650;
+  line-height: 1.25;
+  text-transform: uppercase;
+  user-select: text;
+  -webkit-user-select: text;
+`;
+
 const TranscriptActivityJsonBody = styled.pre`
   max-height: 360px;
   min-width: 0;
@@ -4477,7 +4488,21 @@ function getThreadDetailRenderDiagnosticSignature(snapshot) {
 
 function getToolCallLabel(message) {
   const title = String(message?.title || "").trim();
-  const genericTitles = new Set(["activity", "tool call", "tool output"]);
+  const toolName = getToolDisplayName(message);
+  const genericTitles = new Set(["activity", "bash", "command", "tool", "tool call", "tool output"]);
+  if (
+    toolName
+    && (
+      !title
+      || genericTitles.has(title.toLowerCase())
+    )
+  ) {
+    const kind = String(message?.kind || "").toLowerCase();
+    if (kind === "tool_output") {
+      return `${toolName} output`;
+    }
+    return `Called ${toolName}`;
+  }
   if (title && !genericTitles.has(title.toLowerCase())) {
     return title;
   }
@@ -4500,6 +4525,23 @@ function getToolCallLabel(message) {
     .find(Boolean);
 
   return firstLine || title || "Tool call";
+}
+
+function getToolDisplayName(message) {
+  const explicit = String(message?.toolDisplayName || message?.tool_display_name || "").trim();
+  if (explicit) {
+    return explicit;
+  }
+  const rawName = String(message?.toolName || message?.tool_name || "").trim();
+  const server = String(message?.toolServer || message?.tool_server || "").trim();
+  const mcpMatch = /^mcp_{2,}(.+?)_{2,}(.+)$/.exec(rawName);
+  if (mcpMatch) {
+    return `${mcpMatch[1].replace(/_/g, "-")} / ${mcpMatch[2]}`;
+  }
+  if (server && rawName && !rawName.toLowerCase().startsWith(`${server.toLowerCase()}.`)) {
+    return `${server} / ${rawName}`;
+  }
+  return rawName || String(message?.command || "").trim() || String(message?.filePath || message?.file_path || "").trim();
 }
 
 function isActivityMessage(message) {
@@ -4960,6 +5002,28 @@ function getActivityGroupStatus(messages) {
   return normalizedStatuses.size === 1 ? statuses[0] : "";
 }
 
+function getActivityRowStatus(messages) {
+  const rowMessages = Array.isArray(messages) ? messages : [];
+  const statuses = rowMessages
+    .map(getActivityStatusLabel)
+    .map((status) => status.toLowerCase())
+    .filter(Boolean);
+  if (rowMessages.some(activityMessageIsError)
+    || statuses.some((status) => status.includes("error") || status.includes("failed"))
+  ) {
+    return "error";
+  }
+  if (rowMessages.some((message) => String(message?.kind || "").toLowerCase() === "tool_output")
+    || statuses.some((status) => ["complete", "completed", "done", "success", "succeeded"].includes(status))
+  ) {
+    return "complete";
+  }
+  if (statuses.some((status) => ["running", "streaming", "tool_running"].includes(status))) {
+    return "running";
+  }
+  return getActivityGroupStatus(rowMessages);
+}
+
 const ACTIVITY_JSON_PARSE_MAX_CHARS = 180_000;
 const ACTIVITY_JSON_EXPAND_MAX_DEPTH = 6;
 
@@ -5064,7 +5128,112 @@ function parseActivityJsonBody(body) {
   return parseActivityJsonCandidate(text.slice(startIndex), text.slice(0, startIndex));
 }
 
-function ActivityToolBody({ body, expanded }) {
+function activityValueHasContent(value) {
+  if (value == null) {
+    return false;
+  }
+  if (typeof value === "string") {
+    return value.trim().length > 0;
+  }
+  if (Array.isArray(value)) {
+    return value.length > 0;
+  }
+  if (typeof value === "object") {
+    return Object.keys(value).length > 0;
+  }
+  return true;
+}
+
+function formatActivityValue(value) {
+  if (!activityValueHasContent(value)) {
+    return "";
+  }
+  if (typeof value === "string") {
+    return value.trim();
+  }
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value || "").trim();
+  }
+}
+
+function getActivitySectionKey(label, body) {
+  return `${String(label || "").toLowerCase()}::${String(body || "").trim()}`;
+}
+
+function addActivitySection(sections, label, value) {
+  const body = formatActivityValue(value);
+  if (!body) {
+    return;
+  }
+  const key = getActivitySectionKey(label, body);
+  if (sections.some((section) => section.key === key)) {
+    return;
+  }
+  sections.push({
+    body,
+    key,
+    label,
+  });
+}
+
+function activityMessageIsError(message) {
+  const kind = String(message?.kind || "").toLowerCase();
+  const status = String(message?.status || "").toLowerCase();
+  const title = String(message?.title || "").toLowerCase();
+  return kind.includes("error")
+    || status.includes("error")
+    || status.includes("failed")
+    || title.includes("error")
+    || title.includes("failed")
+    || activityValueHasContent(message?.toolError || message?.tool_error);
+}
+
+function getActivityDetailSections(messages) {
+  const sections = [];
+  (Array.isArray(messages) ? messages : []).filter(Boolean).forEach((message) => {
+    const kind = String(message.kind || "activity").trim().toLowerCase();
+    if (message.command) {
+      addActivitySection(sections, "Command", `$ ${message.command}`);
+    }
+    if (message.filePath || message.file_path) {
+      addActivitySection(sections, "File", message.filePath || message.file_path);
+    }
+    if (activityValueHasContent(message.toolInput || message.tool_input)) {
+      addActivitySection(sections, "Arguments", message.toolInput || message.tool_input);
+    }
+    if (activityValueHasContent(message.toolOutput || message.tool_output)) {
+      addActivitySection(sections, "Output", message.toolOutput || message.tool_output);
+    }
+    if (activityValueHasContent(message.toolError || message.tool_error)) {
+      addActivitySection(sections, "Error", message.toolError || message.tool_error);
+    }
+    const body = String(message.text || "").trim();
+    if (body) {
+      if (kind === "tool_call") {
+        addActivitySection(sections, activityValueHasContent(message.toolInput || message.tool_input) ? "Details" : "Arguments", body);
+      } else if (kind === "tool_output" || kind === "image_generation") {
+        addActivitySection(sections, activityMessageIsError(message) ? "Error" : "Output", body);
+      } else {
+        addActivitySection(sections, "Details", body);
+      }
+    }
+    const metaParts = [];
+    if (Number.isFinite(Number(message.durationMs || message.duration_ms))) {
+      metaParts.push(`${Number(message.durationMs || message.duration_ms)} ms`);
+    }
+    if (Number.isFinite(Number(message.exitCode ?? message.exit_code))) {
+      metaParts.push(`exit ${Number(message.exitCode ?? message.exit_code)}`);
+    }
+    if (metaParts.length) {
+      addActivitySection(sections, "Result", metaParts.join(" | "));
+    }
+  });
+  return sections;
+}
+
+function ActivitySectionBody({ body, expanded }) {
   const parsedJson = useMemo(
     () => (expanded ? parseActivityJsonBody(body) : null),
     [body, expanded],
@@ -5089,26 +5258,67 @@ function ActivityToolBody({ body, expanded }) {
   );
 }
 
-function ActivityToolRow({ message }) {
-  const artifacts = getMessageArtifacts(message);
-  const artifactKey = artifacts.map(getArtifactReference).join("|");
-  const [expanded, setExpanded] = useState(() => artifacts.length > 0);
-
-  useEffect(() => {
-    if (artifacts.length) {
-      setExpanded(true);
-    }
-  }, [artifacts.length, artifactKey]);
-
-  if (!message) {
+function ActivityToolBody({ messages, expanded }) {
+  const sections = useMemo(
+    () => getActivityDetailSections(messages),
+    [messages],
+  );
+  if (!sections.length) {
     return null;
   }
 
-  const label = getToolCallLabel(message);
-  const status = String(message.status || "").trim();
-  const body = String(message.text || "").trim();
-  const kind = String(message.kind || "activity").trim().toLowerCase();
-  const hasBody = Boolean(body);
+  return sections.map((section) => (
+    <div key={section.key}>
+      <TranscriptActivitySectionLabel>{section.label}</TranscriptActivitySectionLabel>
+      <ActivitySectionBody body={section.body} expanded={expanded} />
+    </div>
+  ));
+}
+
+function activityRowMessages(messages, message) {
+  if (Array.isArray(messages) && messages.length) {
+    return messages.filter(Boolean);
+  }
+  return message ? [message] : [];
+}
+
+function mergeActivityArtifacts(messages) {
+  const merged = [];
+  const seen = new Set();
+  messages.forEach((activityMessage) => {
+    getMessageArtifacts(activityMessage).forEach((artifact) => {
+      const reference = getArtifactReference(artifact);
+      if (!seen.has(reference)) {
+        seen.add(reference);
+        merged.push(artifact);
+      }
+    });
+  });
+  return merged;
+}
+
+function ActivityToolRow({ message, messages }) {
+  const rowMessages = activityRowMessages(messages, message);
+  const primaryMessage = rowMessages[0] || message;
+  const artifacts = mergeActivityArtifacts(rowMessages);
+  const artifactKey = artifacts.map(getArtifactReference).join("|");
+  const detailSections = getActivityDetailSections(rowMessages);
+  const [expanded, setExpanded] = useState(() => artifacts.length > 0 || detailSections.length > 0);
+
+  useEffect(() => {
+    if (artifacts.length || detailSections.length) {
+      setExpanded(true);
+    }
+  }, [artifacts.length, artifactKey, detailSections.length]);
+
+  if (!primaryMessage) {
+    return null;
+  }
+
+  const label = getToolCallLabel(primaryMessage);
+  const status = getActivityRowStatus(rowMessages) || String(primaryMessage.status || "").trim();
+  const kind = String(primaryMessage.kind || "activity").trim().toLowerCase();
+  const hasBody = detailSections.length > 0;
   const hasArtifacts = artifacts.length > 0;
   const expandable = hasBody || hasArtifacts;
 
@@ -5140,12 +5350,43 @@ function ActivityToolRow({ message }) {
         >
           <TranscriptActivityDisclosureInner>
             {hasArtifacts ? <MessageArtifactList artifacts={artifacts} /> : null}
-            {hasBody ? <ActivityToolBody body={body} expanded={expanded} /> : null}
+            {hasBody ? <ActivityToolBody messages={rowMessages} expanded={expanded} /> : null}
           </TranscriptActivityDisclosureInner>
         </TranscriptActivityDisclosure>
       ) : null}
     </TranscriptActivityTool>
   );
+}
+
+function groupActivityMessagesForDisplay(messages) {
+  const rows = [];
+  const pendingByCallId = new Map();
+  (Array.isArray(messages) ? messages : []).forEach((activityMessage) => {
+    const kind = String(activityMessage?.kind || "").toLowerCase();
+    const callId = String(activityMessage?.callId || activityMessage?.call_id || "").trim();
+    if (kind === "tool_call") {
+      const row = {
+        id: activityMessage?.id || `tool-call-${rows.length}`,
+        message: activityMessage,
+        messages: [activityMessage],
+      };
+      rows.push(row);
+      if (callId) {
+        pendingByCallId.set(callId, row);
+      }
+      return;
+    }
+    if (kind === "tool_output" && callId && pendingByCallId.has(callId)) {
+      pendingByCallId.get(callId).messages.push(activityMessage);
+      return;
+    }
+    rows.push({
+      id: activityMessage?.id || `activity-${rows.length}`,
+      message: activityMessage,
+      messages: [activityMessage],
+    });
+  });
+  return rows;
 }
 
 function ActivityMessage({ message, messages }) {
@@ -5158,23 +5399,28 @@ function ActivityMessage({ message, messages }) {
     .flatMap((groupMessage) => getMessageArtifacts(groupMessage).map(getArtifactReference))
     .join("|");
   const hasArtifacts = Boolean(groupArtifactKey);
-  const [expanded, setExpanded] = useState(() => hasArtifacts);
+  const displayRows = groupActivityMessagesForDisplay(groupMessages);
+  const hasDetails = displayRows.some((row) => getActivityDetailSections(row.messages).length > 0);
+  const [expanded, setExpanded] = useState(() => hasArtifacts || hasDetails || groupMessages.length > 1);
 
   useEffect(() => {
-    if (hasArtifacts) {
+    if (hasArtifacts || hasDetails || groupMessages.length > 1) {
       setExpanded(true);
     }
-  }, [hasArtifacts, groupArtifactKey]);
+  }, [hasArtifacts, groupArtifactKey, groupMessages.length, hasDetails]);
 
   if (!groupMessages.length) {
     return null;
   }
 
   const activityCount = groupMessages.length;
+  const toolCallCount = groupMessages.filter((groupMessage) => (
+    String(groupMessage?.kind || "").toLowerCase() === "tool_call"
+  )).length || displayRows.length;
   const label = activityCount === 1
     ? getToolCallLabel(groupMessages[0])
-    : `${activityCount} activities`;
-  const status = getActivityGroupStatus(groupMessages);
+    : `${toolCallCount} tool ${toolCallCount === 1 ? "call" : "calls"}`;
+  const status = getActivityRowStatus(groupMessages);
 
   return (
     <TranscriptActivityCell data-message-role="activity" data-status={status || "complete"}>
@@ -5202,10 +5448,11 @@ function ActivityMessage({ message, messages }) {
         >
           <TranscriptActivityDisclosureInner>
             <TranscriptActivityList>
-              {groupMessages.map((activityMessage, index) => (
+              {displayRows.map((row, index) => (
                 <ActivityToolRow
-                  key={activityMessage?.id || `activity-${index}`}
-                  message={activityMessage}
+                  key={row.id || row.message?.id || `activity-${index}`}
+                  message={row.message}
+                  messages={row.messages}
                 />
               ))}
             </TranscriptActivityList>
