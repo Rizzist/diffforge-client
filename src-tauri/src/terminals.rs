@@ -10465,6 +10465,7 @@ fn emit_terminal_prompt_submitted_activity_started(
         prompt_default_option: None,
         prompt_ttl_ms: None,
         prompt_options: Vec::new(),
+        prompt_answer_option: None,
         manual_prompt_source: None,
         manual_approval_required: false,
         provider_blocked_for_user: false,
@@ -12168,6 +12169,30 @@ fn terminal_activity_hook_payload(
         .as_ref()
         .map(|prompt| prompt.options.clone())
         .unwrap_or_default();
+    let prompt_answer_option = if matches!(
+        event_type,
+        "provider-user-prompt-answered" | "provider-user-prompt-completed"
+    ) {
+        terminal_activity_hook_string(
+            event,
+            &[
+                "optionId",
+                "option_id",
+                "selectedOptionId",
+                "selected_option_id",
+                "selectedOption",
+                "selected_option",
+                "answer",
+                "choice",
+                "permissionDecision",
+                "permission_decision",
+                "decision",
+                "response",
+            ],
+        )
+    } else {
+        None
+    };
     let current_runtime = terminal_runtime_snapshot(instance);
     let projected_runtime = terminal_project_runtime(
         &metadata,
@@ -12260,6 +12285,7 @@ fn terminal_activity_hook_payload(
         prompt_default_option,
         prompt_ttl_ms,
         prompt_options,
+        prompt_answer_option,
         manual_prompt_source,
         manual_approval_required,
         provider_blocked_for_user,
@@ -15435,8 +15461,51 @@ async fn terminal_interrupt_agent(
     instance_id: Option<u64>,
     reason: Option<String>,
 ) -> Result<TerminalInterruptAgentResult, String> {
+    terminal_interrupt_agent_inner(
+        &app,
+        state.inner(),
+        cloud_mcp_state.inner(),
+        pane_id,
+        instance_id,
+        reason,
+    )
+    .await
+}
+
+/// Headless entry point for the cloud `terminal_interrupt` remote command:
+/// resolves the target pane and writes the Escape interrupt through the same
+/// machinery as the local Escape key, with no webview involvement.
+pub(crate) async fn terminal_interrupt_agent_remote(
+    app: AppHandle,
+    pane_id: String,
+    instance_id: Option<u64>,
+    reason: String,
+) -> Result<TerminalInterruptAgentResult, String> {
+    let state_app = app.clone();
+    let cloud_app = app.clone();
+    let state = state_app.state::<TerminalState>();
+    let cloud_mcp_state = cloud_app.state::<CloudMcpState>();
+    terminal_interrupt_agent_inner(
+        &app,
+        state.inner(),
+        cloud_mcp_state.inner(),
+        pane_id,
+        instance_id,
+        Some(reason),
+    )
+    .await
+}
+
+async fn terminal_interrupt_agent_inner(
+    app: &AppHandle,
+    state: &TerminalState,
+    cloud_mcp_state: &CloudMcpState,
+    pane_id: String,
+    instance_id: Option<u64>,
+    reason: Option<String>,
+) -> Result<TerminalInterruptAgentResult, String> {
     validate_terminal_pane_id(&pane_id)?;
-    let Some(instance) = get_terminal_instance_if_current(&state, &pane_id, instance_id).await?
+    let Some(instance) = get_terminal_instance_if_current(state, &pane_id, instance_id).await?
     else {
         return Ok(TerminalInterruptAgentResult {
             interrupted_active_task: false,
@@ -15455,7 +15524,7 @@ async fn terminal_interrupt_agent(
         .map(|task| task.task_id.clone());
     write_terminal_interrupt_escape(&instance).await?;
     let interrupted_active_task = mark_terminal_active_task_interrupted(
-        cloud_mcp_state.inner(),
+        cloud_mcp_state,
         &pane_id,
         &instance,
         &reason,
@@ -15473,9 +15542,9 @@ async fn terminal_interrupt_agent(
         );
     }
     let interrupted_parked_prompt_count = interrupt_terminal_parked_prompts(
-        &app,
-        state.inner(),
-        cloud_mcp_state.inner(),
+        app,
+        state,
+        cloud_mcp_state,
         &pane_id,
         &instance,
         &reason,
@@ -15483,7 +15552,7 @@ async fn terminal_interrupt_agent(
     )
     .await?;
     let interrupted_todo_count = todo_dispatch_mark_active_for_pane_interrupted(
-        &app,
+        app,
         &instance.metadata.workspace_id,
         &pane_id,
         &reason,

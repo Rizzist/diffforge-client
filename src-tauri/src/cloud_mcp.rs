@@ -156,6 +156,18 @@ const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT: &str = "diffforge.agent_chat_s
 const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_SCHEMA_VERSION: u64 = 1;
 const CLOUD_MCP_TERMINAL_OUTPUT_CONTRACT: &str = "diffforge.termout.v1";
 const CLOUD_MCP_AGENT_TURN_CONTRACT: &str = "diffforge.agentturn.v1";
+// Live-text `md` turn events and their chat live-delta mirrors coalesce per
+// stream key so hook storms emit merged frames instead of one ws frame per
+// token burst. State-transition turn events always flush the pending delta
+// first and are never delayed. Mirrors the PTY output coalescer
+// (TERMINAL_OUTPUT_COALESCE_WINDOW_MS / TERMINAL_OUTPUT_COALESCE_MAX_BYTES).
+const CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_WINDOW_MS: u64 = 50;
+const CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_MAX_BYTES: usize = 4 * 1024;
+// Device live-state snapshots triggered from terminal-state live updates are
+// debounced (trailing, latest-wins) so hook storms publish at most ~6
+// snapshots/sec; the content dedup in
+// cloud_mcp_publish_device_live_state_snapshot still applies afterwards.
+const CLOUD_MCP_DEVICE_LIVE_SNAPSHOT_DEBOUNCE_MS: u64 = 150;
 const CLOUD_MCP_TOKENOMICS_DELTA_AVAILABLE_EVENT: &str = "tokenomics_delta_available";
 const CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT: &str = "tokenomics_device_delta";
 const CLOUD_MCP_TOKENOMICS_DEVICE_SNAPSHOT_EVENT: &str = "tokenomics_device_snapshot";
@@ -504,6 +516,9 @@ struct CloudMcpState {
     terminal_output_tail_by_stream: Arc<StdMutex<HashMap<String, CloudMcpTerminalOutputTail>>>,
     agent_turn_stream_snapshots: Arc<StdMutex<HashMap<String, Value>>>,
     agent_live_text_by_stream: Arc<StdMutex<HashMap<String, CloudMcpAgentLiveTextSnapshot>>>,
+    agent_turn_delta_pending: Arc<Mutex<HashMap<String, CloudMcpPendingAgentTurnDelta>>>,
+    agent_turn_delta_generation: Arc<AtomicU64>,
+    device_live_snapshot_debounce: Arc<StdMutex<Option<String>>>,
     remote_command_listener_started: Arc<AtomicBool>,
     remote_command_receipts: Arc<Mutex<HashMap<String, u64>>>,
     remote_command_cancellations: Arc<Mutex<HashMap<String, u64>>>,
@@ -623,6 +638,19 @@ struct CloudMcpDirectPromptTodoRefs {
     todo_id: String,
     dispatch_id: String,
     command_id: String,
+}
+
+/// One coalescing window of buffered `md` (message-delta) turn activity for a
+/// stream key: the latest hook payload with the concatenated live-text delta,
+/// plus the latest seq/state so the merged frame reflects the newest state.
+#[derive(Clone)]
+struct CloudMcpPendingAgentTurnDelta {
+    payload: TerminalActivityHookPayload,
+    status_seq: u64,
+    state_value: String,
+    turn_status: String,
+    direct_prompt_refs: Option<CloudMcpDirectPromptTodoRefs>,
+    generation: u64,
 }
 
 #[derive(Clone)]
@@ -765,6 +793,9 @@ impl CloudMcpState {
             terminal_output_tail_by_stream: Arc::new(StdMutex::new(HashMap::new())),
             agent_turn_stream_snapshots: Arc::new(StdMutex::new(HashMap::new())),
             agent_live_text_by_stream: Arc::new(StdMutex::new(HashMap::new())),
+            agent_turn_delta_pending: Arc::new(Mutex::new(HashMap::new())),
+            agent_turn_delta_generation: Arc::new(AtomicU64::new(0)),
+            device_live_snapshot_debounce: Arc::new(StdMutex::new(None)),
             remote_command_listener_started: Arc::new(AtomicBool::new(false)),
             remote_command_receipts: Arc::new(Mutex::new(HashMap::new())),
             remote_command_cancellations: Arc::new(Mutex::new(HashMap::new())),
@@ -18380,6 +18411,7 @@ async fn cloud_mcp_start_remote_command_listener(
             }
             let remote_lever_handled =
                 cloud_mcp_apply_remote_workspace_lever(&app, &state_clone, &event)
+                    || cloud_mcp_apply_remote_terminal_interrupt_lever(&app, &state_clone, &event)
                     || cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event)
                     || cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event)
                     || cloud_mcp_apply_remote_agent_prompt_lever(&app, &state_clone, &event)
@@ -18666,9 +18698,13 @@ async fn cloud_mcp_publish_prompt_answered_event(
             "hn": "RemoteAgentPromptAnswer",
             "pid": prompt_id,
             "opt": option_id,
+            "src": "remote",
         },
         "at": cloud_mcp_now_ms(),
     });
+    // Prompt answers are state transitions: drain any buffered live-text
+    // delta for the stream first so the web never sees them reordered.
+    cloud_mcp_flush_pending_agent_turn_delta(state, &stream_key).await;
     if let Ok(mut snapshots) = state.agent_turn_stream_snapshots.lock() {
         snapshots.insert(stream_key, envelope.clone());
     }
@@ -18997,6 +19033,149 @@ fn cloud_mcp_presence_terminal_is_idle(terminal: &Value) -> bool {
     )
 }
 
+/// Headless actuation for the `terminal_interrupt` remote command. Unlike the
+/// broader terminal lever this always runs natively — webview alive or not —
+/// because the PTY Escape write and task-interrupt bookkeeping are Rust-owned,
+/// so the dashboard lever never waits on a webview round trip.
+fn cloud_mcp_apply_remote_terminal_interrupt_lever(
+    app: &AppHandle,
+    state: &CloudMcpState,
+    event: &Value,
+) -> bool {
+    let command_kind = cloud_mcp_remote_command_kind(event);
+    if !matches!(
+        command_kind.as_str(),
+        "terminal_interrupt"
+            | "interrupt"
+            | "terminal_send_escape"
+            | "interrupt_terminal"
+            | "terminal_stop"
+            | "stop_terminal"
+            | "terminal_cancel"
+    ) {
+        return false;
+    }
+    let workspace_id =
+        cloud_mcp_payload_text(event, &["workspace_id", "workspaceId"]).unwrap_or_default();
+    let target_terminal_id = cloud_mcp_payload_text(
+        event,
+        &[
+            "target_terminal_id",
+            "targetTerminalId",
+            "terminal_id",
+            "terminalId",
+            "pane_id",
+            "paneId",
+        ],
+    )
+    .unwrap_or_default();
+    let instance_id = cloud_mcp_payload_i64(event, &["terminal_instance_id"])
+        .or_else(|| cloud_mcp_payload_i64(event, &["terminalInstanceId"]))
+        .and_then(|value| u64::try_from(value).ok())
+        .filter(|value| *value > 0);
+    let app = app.clone();
+    let state = state.clone();
+    let event = event.clone();
+    tauri::async_runtime::spawn(async move {
+        if target_terminal_id.is_empty() {
+            let _ = cloud_mcp_send_remote_command_status_event(
+                &state,
+                &event,
+                "failed",
+                "Terminal interrupt requires an exact terminal id.",
+                None,
+            )
+            .await;
+            return;
+        }
+        // Prefer the presence snapshot's pane id for the targeted terminal;
+        // fall back to treating the target id as the pane id (the prompt
+        // answer lever's convention).
+        let snapshot = {
+            let snapshots = state.runtime_snapshots.lock().await;
+            snapshots.workspace_terminals.clone()
+        };
+        let resolved_pane_id = snapshot
+            .as_ref()
+            .and_then(|payload| payload.get("workspaces"))
+            .and_then(Value::as_array)
+            .and_then(|workspaces| {
+                workspaces
+                    .iter()
+                    .filter(|workspace| {
+                        workspace_id.is_empty()
+                            || cloud_mcp_payload_text(workspace, &["workspace_id", "workspaceId"])
+                                .as_deref()
+                                == Some(workspace_id.as_str())
+                    })
+                    .flat_map(|workspace| {
+                        workspace
+                            .get("terminals")
+                            .and_then(Value::as_array)
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .find(|terminal| {
+                        cloud_mcp_terminal_matches_target_id(
+                            &workspace_id,
+                            terminal,
+                            &target_terminal_id,
+                        )
+                    })
+                    .and_then(|terminal| {
+                        cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"])
+                    })
+            })
+            .map(|pane_id| pane_id.trim().to_string())
+            .filter(|pane_id| !pane_id.is_empty())
+            .unwrap_or_else(|| target_terminal_id.clone());
+        match crate::terminal_interrupt_agent_remote(
+            app,
+            resolved_pane_id,
+            instance_id,
+            "remote_command".to_string(),
+        )
+        .await
+        {
+            Ok(result) if result.wrote_escape => {
+                let details = serde_json::to_value(&result).unwrap_or_else(|_| json!({}));
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "completed",
+                    "Escape interrupt sent to the terminal headless.",
+                    Some(&details),
+                )
+                .await;
+            }
+            Ok(_) => {
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "failed",
+                    "No live terminal session matched the requested terminal id.",
+                    None,
+                )
+                .await;
+            }
+            Err(error) => {
+                let details = json!({
+                    "error": clean_terminal_telemetry_text(&error),
+                });
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state,
+                    &event,
+                    "failed",
+                    "Unable to interrupt the terminal.",
+                    Some(&details),
+                )
+                .await;
+            }
+        }
+    });
+    true
+}
+
 /// Headless actuation for remote terminal levers. Close-idle commands run
 /// natively against the live PTY sessions (resolved from the cached presence
 /// snapshot by exact pane id); relaunch is deferred as a replayed remote
@@ -19022,8 +19201,6 @@ fn cloud_mcp_apply_remote_terminal_lever(
         "terminal_close" | "close_terminal" | "terminal_force_close" | "force_close_terminal" => {
             "close_force"
         }
-        "terminal_interrupt" | "interrupt_terminal" | "terminal_stop" | "stop_terminal"
-        | "terminal_cancel" => "interrupt",
         "terminal_relaunch_agent"
         | "relaunch_terminal_agent"
         | "relaunch_terminal"
@@ -19236,7 +19413,7 @@ fn cloud_mcp_apply_remote_terminal_lever(
             .await;
             return;
         }
-        if matches!(action.as_str(), "close_one" | "close_force" | "interrupt")
+        if matches!(action.as_str(), "close_one" | "close_force")
             && target_terminal_id.is_empty()
         {
             let _ = cloud_mcp_send_remote_command_status_event(
@@ -19252,7 +19429,7 @@ fn cloud_mcp_apply_remote_terminal_lever(
         let matches_target = |terminal: &Value| -> bool {
             cloud_mcp_terminal_matches_target_id(&workspace_id, terminal, &target_terminal_id)
         };
-        let candidates = if matches!(action.as_str(), "close_one" | "close_force" | "interrupt") {
+        let candidates = if matches!(action.as_str(), "close_one" | "close_force") {
             let matched = workspace_terminals
                 .iter()
                 .find(|terminal| matches_target(terminal))
@@ -19274,40 +19451,6 @@ fn cloud_mcp_apply_remote_terminal_lever(
         } else {
             workspace_terminals
         };
-        if action == "interrupt" {
-            let terminal = candidates.first().cloned().unwrap_or(Value::Null);
-            let pane_id =
-                cloud_mcp_payload_text(&terminal, &["pane_id", "paneId"]).unwrap_or_default();
-            let terminal_state = app.state::<TerminalState>();
-            let result = if pane_id.is_empty() {
-                Err("Terminal pane id is unknown.".to_string())
-            } else {
-                write_terminal_input(
-                    Some(&app),
-                    terminal_state.inner(),
-                    &pane_id,
-                    None,
-                    "\u{3}",
-                    "remote_interrupt",
-                )
-                .await
-                .map(|_| ())
-            };
-            let (status, message) = match result {
-                Ok(()) => (
-                    "completed",
-                    "Interrupt sent to the terminal headless.".to_string(),
-                ),
-                Err(error) => (
-                    "failed",
-                    format!("Unable to interrupt the terminal: {error}"),
-                ),
-            };
-            let _ =
-                cloud_mcp_send_remote_command_status_event(&state, &event, status, &message, None)
-                    .await;
-            return;
-        }
         let mut closed = 0usize;
         let mut skipped_busy = 0usize;
         let mut failed = 0usize;
@@ -25216,7 +25359,193 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
     }
 }
 
+/// Flushes and publishes any buffered message-delta frame for the stream key.
+/// Awaited before every non-delta turn event and before remote prompt-answer
+/// events so buffered live text is always sent ahead of state transitions.
+async fn cloud_mcp_flush_pending_agent_turn_delta(state: &CloudMcpState, stream_key: &str) {
+    let pending = {
+        let mut pending_map = state.agent_turn_delta_pending.lock().await;
+        pending_map.remove(stream_key)
+    };
+    if let Some(pending) = pending {
+        cloud_mcp_publish_agent_turn_event_now(
+            state,
+            &pending.payload,
+            pending.status_seq,
+            &pending.state_value,
+            &pending.turn_status,
+            pending.direct_prompt_refs.as_ref(),
+        )
+        .await;
+    }
+}
+
+/// One timer per coalescing window: fires CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_WINDOW_MS
+/// after the first buffered delta and publishes whatever merged frame is still
+/// pending for that generation. A state-transition flush that already drained
+/// the entry (or a newer window) makes this a no-op via the generation check.
+fn cloud_mcp_schedule_agent_turn_delta_flush(
+    state: &CloudMcpState,
+    stream_key: &str,
+    generation: u64,
+) {
+    let state = state.clone();
+    let stream_key = stream_key.to_string();
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(
+            CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_WINDOW_MS,
+        ))
+        .await;
+        let pending = {
+            let mut pending_map = state.agent_turn_delta_pending.lock().await;
+            if pending_map
+                .get(&stream_key)
+                .is_some_and(|entry| entry.generation == generation)
+            {
+                pending_map.remove(&stream_key)
+            } else {
+                None
+            }
+        };
+        if let Some(pending) = pending {
+            cloud_mcp_publish_agent_turn_event_now(
+                &state,
+                &pending.payload,
+                pending.status_seq,
+                &pending.state_value,
+                &pending.turn_status,
+                pending.direct_prompt_refs.as_ref(),
+            )
+            .await;
+        }
+    });
+}
+
+/// Coalescing front for agent turn events, modeled on the PTY output
+/// coalescer: `md` live-text deltas merge per stream key inside
+/// ~CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_WINDOW_MS windows (concatenated delta
+/// text, latest seq/state), while every other event code — turn/tool/prompt/
+/// compaction/subagent state transitions included — first flushes the pending
+/// delta for its stream and then publishes immediately, so transitions stay
+/// instant and buffered text is never reordered behind them.
 async fn cloud_mcp_publish_agent_turn_event(
+    state: &CloudMcpState,
+    payload: &TerminalActivityHookPayload,
+    status_seq: u64,
+    state_value: &str,
+    turn_status: &str,
+    direct_prompt_refs: Option<&CloudMcpDirectPromptTodoRefs>,
+) {
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
+        .unwrap_or_else(|| "desktop-primary".to_string());
+    let stream_key = cloud_mcp_terminal_output_stream_key(
+        &device_id,
+        &payload.workspace_id,
+        &payload.pane_id,
+        payload.instance_id,
+    );
+    let event_code = cloud_mcp_agent_turn_event_code(
+        payload.event_type.as_str(),
+        payload.command_phase.as_str(),
+    );
+    // Only pure message deltas coalesce; snapshot-carrying frames publish
+    // immediately so the merge stays a delta concatenation.
+    let coalescible = event_code == "md"
+        && payload.live_text_snapshot.is_none()
+        && payload
+            .live_text_delta
+            .as_deref()
+            .is_some_and(|delta| !delta.trim().is_empty());
+    if !coalescible {
+        cloud_mcp_flush_pending_agent_turn_delta(state, &stream_key).await;
+        cloud_mcp_publish_agent_turn_event_now(
+            state,
+            payload,
+            status_seq,
+            state_value,
+            turn_status,
+            direct_prompt_refs,
+        )
+        .await;
+        return;
+    }
+    let flushed_pending = {
+        let mut pending_map = state.agent_turn_delta_pending.lock().await;
+        match pending_map.get_mut(&stream_key) {
+            Some(pending)
+                if pending.payload.live_text_kind == payload.live_text_kind
+                    && pending.payload.turn_id == payload.turn_id
+                    && pending
+                        .payload
+                        .live_text_delta
+                        .as_deref()
+                        .unwrap_or_default()
+                        .len()
+                        + payload.live_text_delta.as_deref().unwrap_or_default().len()
+                        <= CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_MAX_BYTES =>
+            {
+                let mut merged_delta = pending
+                    .payload
+                    .live_text_delta
+                    .take()
+                    .unwrap_or_default();
+                merged_delta.push_str(payload.live_text_delta.as_deref().unwrap_or_default());
+                let generation = pending.generation;
+                let mut merged_payload = payload.clone();
+                merged_payload.live_text_delta = Some(merged_delta);
+                *pending = CloudMcpPendingAgentTurnDelta {
+                    payload: merged_payload,
+                    status_seq,
+                    state_value: state_value.to_string(),
+                    turn_status: turn_status.to_string(),
+                    direct_prompt_refs: direct_prompt_refs.cloned(),
+                    generation,
+                };
+                None
+            }
+            other => {
+                // Kind/turn changed or the merged frame would exceed the
+                // byte cap: flush the old window and start a new one.
+                let flushed = if other.is_some() {
+                    pending_map.remove(&stream_key)
+                } else {
+                    None
+                };
+                let generation = state
+                    .agent_turn_delta_generation
+                    .fetch_add(1, Ordering::SeqCst)
+                    .wrapping_add(1);
+                pending_map.insert(
+                    stream_key.clone(),
+                    CloudMcpPendingAgentTurnDelta {
+                        payload: payload.clone(),
+                        status_seq,
+                        state_value: state_value.to_string(),
+                        turn_status: turn_status.to_string(),
+                        direct_prompt_refs: direct_prompt_refs.cloned(),
+                        generation,
+                    },
+                );
+                cloud_mcp_schedule_agent_turn_delta_flush(state, &stream_key, generation);
+                flushed
+            }
+        }
+    };
+    if let Some(flushed) = flushed_pending {
+        cloud_mcp_publish_agent_turn_event_now(
+            state,
+            &flushed.payload,
+            flushed.status_seq,
+            &flushed.state_value,
+            &flushed.turn_status,
+            flushed.direct_prompt_refs.as_ref(),
+        )
+        .await;
+    }
+}
+
+async fn cloud_mcp_publish_agent_turn_event_now(
     state: &CloudMcpState,
     payload: &TerminalActivityHookPayload,
     status_seq: u64,
@@ -25290,6 +25619,13 @@ async fn cloud_mcp_publish_agent_turn_event(
             data["m"] = json!(message);
         }
     }
+    if event_code == "pr" && data.get("m").is_none() {
+        if let Some(prompt_text) =
+            cloud_mcp_compact_turn_text(payload.prompting_user_text.as_ref(), 4096)
+        {
+            data["m"] = json!(prompt_text);
+        }
+    }
     if let Some(live_text_kind) = payload.live_text_kind.as_deref() {
         data["lt"] = json!(live_text_kind);
     }
@@ -25310,6 +25646,16 @@ async fn cloud_mcp_publish_agent_turn_event(
     }
     if !payload.prompt_options.is_empty() {
         data["opts"] = cloud_mcp_agent_turn_prompt_options(payload);
+    }
+    if event_code == "pa" {
+        if let Some(answer_option) =
+            cloud_mcp_compact_turn_text(payload.prompt_answer_option.as_ref(), 96)
+        {
+            data["opt"] = json!(answer_option);
+        }
+        // Hook-observed answers were made locally in the terminal; the remote
+        // command answer path publishes its own `pa` tagged src=remote.
+        data["src"] = json!("local");
     }
     if let Some(refs) = direct_prompt_refs {
         data["todo"] = json!(refs.todo_id.as_str());
@@ -30817,13 +31163,56 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
     }
 }
 
+/// Trailing latest-wins debounce in front of the device live-state snapshot
+/// publisher. Every caller's delta is already merged into the snapshot state
+/// before this runs, so collapsing a hook storm to one publish per
+/// CLOUD_MCP_DEVICE_LIVE_SNAPSHOT_DEBOUNCE_MS window loses nothing: the flush
+/// recomputes the snapshot from the latest state. The content dedup decision
+/// inside cloud_mcp_publish_device_live_state_snapshot still applies.
+async fn cloud_mcp_publish_device_live_state_snapshot_debounced(
+    state: &CloudMcpState,
+    reason: &str,
+) {
+    let mut lock_failed = false;
+    let already_scheduled = match state.device_live_snapshot_debounce.lock() {
+        Ok(mut pending) => {
+            let already_scheduled = pending.is_some();
+            *pending = Some(reason.to_string());
+            already_scheduled
+        }
+        Err(_) => {
+            lock_failed = true;
+            false
+        }
+    };
+    if lock_failed {
+        cloud_mcp_publish_device_live_state_snapshot(state, reason).await;
+        return;
+    }
+    if already_scheduled {
+        return;
+    }
+    let state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(CLOUD_MCP_DEVICE_LIVE_SNAPSHOT_DEBOUNCE_MS)).await;
+        let reason = state
+            .device_live_snapshot_debounce
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.take());
+        if let Some(reason) = reason {
+            cloud_mcp_publish_device_live_state_snapshot(&state, &reason).await;
+        }
+    });
+}
+
 async fn cloud_mcp_publish_terminal_state_live_update(
     state: &CloudMcpState,
     payload: &Value,
     reason: &str,
 ) {
     cloud_mcp_apply_terminal_state_to_device_live_snapshot(state, payload, reason).await;
-    cloud_mcp_publish_device_live_state_snapshot(state, reason).await;
+    cloud_mcp_publish_device_live_state_snapshot_debounced(state, reason).await;
 }
 
 pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
@@ -49249,6 +49638,7 @@ mod cloud_mcp_tests {
             prompt_default_option: None,
             prompt_ttl_ms: None,
             prompt_options: Vec::new(),
+            prompt_answer_option: None,
             manual_prompt_source: None,
             manual_approval_required: false,
             provider_blocked_for_user: false,

@@ -591,6 +591,9 @@ fn todo_dispatch_remote_intake_already_current(
     target_agent_id: &str,
     target_color_slot: Option<i64>,
     target_terminal_color: &str,
+    requested_model: &str,
+    requested_reasoning_effort: &str,
+    requested_speed: &str,
 ) -> bool {
     if todo_store_item_status(item) != status {
         return false;
@@ -632,6 +635,18 @@ fn todo_dispatch_remote_intake_already_current(
         item,
         &["targetTerminalColor", "target_terminal_color", "terminalColor", "terminal_color"],
         target_terminal_color,
+    ) && todo_dispatch_remote_intake_field_matches(
+        item,
+        &["model", "modelId", "model_id"],
+        requested_model,
+    ) && todo_dispatch_remote_intake_field_matches(
+        item,
+        &["reasoningEffort", "reasoning_effort", "effort"],
+        requested_reasoning_effort,
+    ) && todo_dispatch_remote_intake_field_matches(
+        item,
+        &["speed", "serviceTier", "service_tier"],
+        requested_speed,
     )
 }
 
@@ -887,6 +902,9 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                             &target_agent_id,
                             target_color_slot,
                             &target_terminal_color,
+                            &requested_model,
+                            &requested_reasoning_effort,
+                            &requested_speed,
                         ) {
                             changed_item = Some(existing.clone());
                             changed_kind = "remote_todo_already_current";
@@ -937,6 +955,28 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         "targetTerminalColor".to_string(),
                                         json!(target_terminal_color.clone()),
                                     );
+                                }
+                                if !requested_model.is_empty() {
+                                    object.insert("model".to_string(), json!(requested_model.clone()));
+                                    object.insert("model_id".to_string(), json!(requested_model.clone()));
+                                    object.insert("modelId".to_string(), json!(requested_model.clone()));
+                                }
+                                if !requested_reasoning_effort.is_empty() {
+                                    object.insert(
+                                        "reasoning_effort".to_string(),
+                                        json!(requested_reasoning_effort.clone()),
+                                    );
+                                    object.insert(
+                                        "reasoningEffort".to_string(),
+                                        json!(requested_reasoning_effort.clone()),
+                                    );
+                                    object.insert(
+                                        "effort".to_string(),
+                                        json!(requested_reasoning_effort.clone()),
+                                    );
+                                }
+                                if !requested_speed.is_empty() {
+                                    object.insert("speed".to_string(), json!(requested_speed.clone()));
                                 }
                                 if target_explicit {
                                     object.insert("targetExplicit".to_string(), json!(true));
@@ -1019,6 +1059,34 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                             "targetTerminalColor".to_string(),
                                             json!(target_terminal_color.clone()),
                                         );
+                                    }
+                                    if !requested_model.is_empty() {
+                                        remote_object
+                                            .insert("model".to_string(), json!(requested_model.clone()));
+                                        remote_object.insert(
+                                            "model_id".to_string(),
+                                            json!(requested_model.clone()),
+                                        );
+                                        remote_object
+                                            .insert("modelId".to_string(), json!(requested_model.clone()));
+                                    }
+                                    if !requested_reasoning_effort.is_empty() {
+                                        remote_object.insert(
+                                            "reasoning_effort".to_string(),
+                                            json!(requested_reasoning_effort.clone()),
+                                        );
+                                        remote_object.insert(
+                                            "reasoningEffort".to_string(),
+                                            json!(requested_reasoning_effort.clone()),
+                                        );
+                                        remote_object.insert(
+                                            "effort".to_string(),
+                                            json!(requested_reasoning_effort.clone()),
+                                        );
+                                    }
+                                    if !requested_speed.is_empty() {
+                                        remote_object
+                                            .insert("speed".to_string(), json!(requested_speed.clone()));
                                     }
                                     remote_object.insert(
                                         "originClientId".to_string(),
@@ -9535,6 +9603,7 @@ mod todo_dispatch_backend_tests {
             prompt_default_option: None,
             prompt_ttl_ms: None,
             prompt_options: Vec::new(),
+            prompt_answer_option: None,
             manual_prompt_source: None,
             manual_approval_required: false,
             provider_blocked_for_user: false,

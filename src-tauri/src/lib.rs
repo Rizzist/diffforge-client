@@ -2156,6 +2156,7 @@ struct TerminalActivityHookPayload {
     prompt_default_option: Option<String>,
     prompt_ttl_ms: Option<u64>,
     prompt_options: Vec<TerminalActivityHookPromptOption>,
+    prompt_answer_option: Option<String>,
     manual_prompt_source: Option<String>,
     manual_approval_required: bool,
     provider_blocked_for_user: bool,
