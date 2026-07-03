@@ -47,6 +47,8 @@ const VIDEO_RENDER_FRAME_WINDOW_MS: u64 = 1000;
 const VIDEO_WAVEFORM_PCM_LIMIT_BYTES: usize = 60 * 1024 * 1024;
 const VIDEO_TRANSCRIBE_MP3_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
 const VIDEO_TRANSCRIBE_TIMEOUT_SECS: u64 = 180;
+const VIDEO_CLOUD_GENERATE_MAX_B64_BYTES: usize = 40 * 1024 * 1024;
+const VIDEO_CLOUD_GENERATE_ACK_TIMEOUT_SECS: u64 = 45;
 const VIDEO_DIRECT_UPSCALE_VIDEO_LIMIT_BYTES: u64 = 60 * 1024 * 1024;
 const VIDEO_DIRECT_UPSCALE_IMAGE_LIMIT_BYTES: u64 = 25 * 1024 * 1024;
 
@@ -82,6 +84,9 @@ static VIDEO_EXPORT_JOBS: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 static VIDEO_GENERATE_JOBS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, VideoJobHandle>>,
+> = std::sync::OnceLock::new();
+static VIDEO_CLOUD_GENERATE_JOBS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, VideoCloudGenerateJobHandle>>,
 > = std::sync::OnceLock::new();
 static VIDEO_TRANSCRIBE_JOBS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, VideoJobHandle>>,
@@ -318,6 +323,42 @@ struct VideoProviderDefinition {
 }
 
 const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
+    VideoProviderDefinition {
+        id: "cloud",
+        label: "Diff Forge Cloud",
+        kind: "mixed",
+        default_base_url: "",
+        models: &[
+            "kling3_0",
+            "kling3_0_turbo",
+            "kling2_6",
+            "seedance_2_0",
+            "seedance_1_5_pro",
+            "veo3_1",
+            "veo3_1_lite",
+            "veo3",
+            "wan2_7",
+            "wan2_6",
+            "minimax_hailuo",
+            "grok_video_1_5",
+            "nano_banana_pro",
+            "nano_banana_2",
+            "flux_2",
+            "flux_kontext",
+            "gpt_image_2",
+            "text2image_soul_v2",
+            "seedream_v4_5",
+            "seedream_v5_lite",
+            "grok_image",
+            "recraft_v4_1",
+            "seedvr2-video-upscaler",
+            "esrgan-image-upscaler",
+            "topaz-video-upscale",
+            "topaz-image-upscale",
+            "real-esrgan-replicate",
+        ],
+        requires_secret_key: false,
+    },
     VideoProviderDefinition {
         id: "higgsfield",
         label: "Higgsfield",
@@ -5824,6 +5865,7 @@ fn video_asset_data_uri_with_limit(
     Ok((format!("data:{mime};base64,{base64}"), base64, mime, bytes))
 }
 
+#[derive(Clone)]
 struct VideoGenerateJobContext {
     app: tauri::AppHandle,
     root: std::path::PathBuf,
@@ -5837,6 +5879,12 @@ struct VideoGenerateJobContext {
     created_at_ms: u64,
     registry_path: std::path::PathBuf,
     last_registry_write_ms: std::sync::Arc<std::sync::Mutex<u64>>,
+}
+
+#[derive(Clone)]
+struct VideoCloudGenerateJobHandle {
+    context: VideoGenerateJobContext,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn video_generation_jobs_path(media_root: &std::path::Path) -> std::path::PathBuf {
@@ -6248,6 +6296,442 @@ async fn video_download_provider_urls(
         output_paths.push(video_download_generated_url(context, client, url, index, cancel).await?);
     }
     Ok(output_paths)
+}
+
+fn video_cloud_generate_jobs()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, VideoCloudGenerateJobHandle>> {
+    VIDEO_CLOUD_GENERATE_JOBS
+        .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn video_cloud_register_generation_job(
+    cloud_job_id: &str,
+    context: VideoGenerateJobContext,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    video_cloud_generate_jobs()
+        .lock()
+        .map_err(|_| "Video cloud generation registry is poisoned.".to_string())?
+        .insert(
+            cloud_job_id.to_string(),
+            VideoCloudGenerateJobHandle { context, cancel },
+        );
+    Ok(())
+}
+
+fn video_cloud_generation_handle(cloud_job_id: &str) -> Option<VideoCloudGenerateJobHandle> {
+    video_cloud_generate_jobs()
+        .lock()
+        .ok()
+        .and_then(|jobs| jobs.get(cloud_job_id).cloned())
+}
+
+fn video_cloud_remove_generation_job(
+    cloud_job_id: &str,
+) -> Option<VideoCloudGenerateJobHandle> {
+    video_cloud_generate_jobs()
+        .lock()
+        .ok()
+        .and_then(|mut jobs| jobs.remove(cloud_job_id))
+}
+
+fn video_cloud_cancel_generation_job(job_id: &str) -> bool {
+    let found = video_cloud_generate_jobs().lock().ok().and_then(|mut jobs| {
+        let cloud_job_id = jobs
+            .iter()
+            .find(|(_, handle)| handle.context.job_id == job_id)
+            .map(|(cloud_job_id, _)| cloud_job_id.clone())?;
+        jobs.remove(&cloud_job_id).map(|handle| (cloud_job_id, handle))
+    });
+    let Some((_cloud_job_id, handle)) = found else {
+        return false;
+    };
+    handle
+        .cancel
+        .store(true, std::sync::atomic::Ordering::Release);
+    // Cloud generation v1 has no remote cancel contract. This only cancels
+    // local downloads and stops handling future pushes for this job.
+    video_emit_generate_progress(
+        &handle.context,
+        "cancelled",
+        Some(100.0),
+        "Generation cancelled.",
+        true,
+        None,
+        &[],
+    );
+    video_job_registry_remove(&VIDEO_GENERATE_JOBS, job_id);
+    true
+}
+
+fn video_cloud_event_text(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn video_cloud_job_id_from_provider_ref(provider_ref: &serde_json::Value) -> Option<String> {
+    video_cloud_event_text(provider_ref, &["cloudJobId", "cloud_job_id", "jobId", "job_id"])
+}
+
+fn video_cloud_event_error(value: &serde_json::Value) -> String {
+    value
+        .get("error")
+        .and_then(|error| {
+            error
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| error.get("message").and_then(serde_json::Value::as_str).map(str::to_string))
+        })
+        .unwrap_or_else(|| "Cloud media generation failed.".to_string())
+}
+
+fn video_cloud_generation_event_kind(event: &serde_json::Value) -> Option<String> {
+    video_cloud_event_text(event, &["event_kind", "eventKind", "kind"])
+}
+
+fn video_cloud_generate_progress_event(event: &serde_json::Value) {
+    let Some(cloud_job_id) = video_cloud_event_text(event, &["jobId", "job_id"]) else {
+        return;
+    };
+    let Some(handle) = video_cloud_generation_handle(&cloud_job_id) else {
+        return;
+    };
+    if handle.cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    let state = video_cloud_event_text(event, &["state"]).unwrap_or_else(|| "running".to_string());
+    let percent = event.get("percent").and_then(serde_json::Value::as_f64);
+    let message = video_cloud_event_text(event, &["message"]).unwrap_or_else(|| {
+        match state.as_str() {
+            "queued" => "Cloud generation queued.",
+            "downloading" => "Cloud is preparing generated media.",
+            "done" => "Cloud generation finished.",
+            "error" => "Cloud generation failed.",
+            _ => "Cloud generation running.",
+        }
+        .to_string()
+    });
+    video_emit_generate_progress(
+        &handle.context,
+        &state,
+        percent,
+        &message,
+        false,
+        None,
+        &[],
+    );
+}
+
+fn video_cloud_generate_output_urls(event: &serde_json::Value) -> Vec<String> {
+    event
+        .get("outputs")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|output| output.get("url").and_then(serde_json::Value::as_str))
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+async fn video_cloud_generate_result_worker(
+    cloud_job_id: String,
+    handle: VideoCloudGenerateJobHandle,
+    event: serde_json::Value,
+) {
+    if handle.cancel.load(std::sync::atomic::Ordering::Acquire) {
+        video_cloud_remove_generation_job(&cloud_job_id);
+        video_job_registry_remove(&VIDEO_GENERATE_JOBS, &handle.context.job_id);
+        return;
+    }
+    let ok = event
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if !ok {
+        let error = video_cloud_event_error(&event);
+        video_emit_generate_progress(
+            &handle.context,
+            "error",
+            Some(100.0),
+            &error,
+            true,
+            Some(&error),
+            &[],
+        );
+        video_cloud_remove_generation_job(&cloud_job_id);
+        video_job_registry_remove(&VIDEO_GENERATE_JOBS, &handle.context.job_id);
+        return;
+    }
+    let urls = video_cloud_generate_output_urls(&event);
+    let result = async {
+        if urls.is_empty() {
+            return Err("Cloud media generation completed without output URLs.".to_string());
+        }
+        let client = http_client(std::time::Duration::from_secs(VIDEO_DOWNLOAD_TIMEOUT_SECS))?;
+        video_download_provider_urls(&handle.context, &client, urls, &handle.cancel).await
+    }
+    .await;
+    match result {
+        Ok(output_paths) => {
+            let _ = handle.context.app.emit(
+                VIDEO_STORE_CHANGED_EVENT,
+                serde_json::json!({
+                    "repoPath": handle.context.root.to_string_lossy().to_string(),
+                    "paths": output_paths,
+                    "changedAtMs": video_now_millis(),
+                }),
+            );
+            video_emit_generate_progress(
+                &handle.context,
+                "done",
+                Some(100.0),
+                "Generation finished.",
+                true,
+                None,
+                &output_paths,
+            );
+        }
+        Err(_error) if handle.cancel.load(std::sync::atomic::Ordering::Acquire) => {
+            video_emit_generate_progress(
+                &handle.context,
+                "cancelled",
+                Some(100.0),
+                "Generation cancelled.",
+                true,
+                None,
+                &[],
+            );
+        }
+        Err(error) => {
+            video_emit_generate_progress(
+                &handle.context,
+                "error",
+                Some(100.0),
+                &error,
+                true,
+                Some(&error),
+                &[],
+            );
+        }
+    }
+    video_cloud_remove_generation_job(&cloud_job_id);
+    video_job_registry_remove(&VIDEO_GENERATE_JOBS, &handle.context.job_id);
+}
+
+fn video_cloud_generate_result_event(event: serde_json::Value) {
+    let Some(cloud_job_id) = video_cloud_event_text(&event, &["jobId", "job_id"]) else {
+        return;
+    };
+    let Some(handle) = video_cloud_generation_handle(&cloud_job_id) else {
+        return;
+    };
+    tauri::async_runtime::spawn(video_cloud_generate_result_worker(
+        cloud_job_id,
+        handle,
+        event,
+    ));
+}
+
+fn video_cloud_handle_generation_event(event: serde_json::Value) {
+    match video_cloud_generation_event_kind(&event).as_deref() {
+        Some("media_generate_progress") => video_cloud_generate_progress_event(&event),
+        Some("media_generate_result") => video_cloud_generate_result_event(event),
+        _ => {}
+    }
+}
+
+fn video_cloud_generation_events_start(app: tauri::AppHandle, cloud_state: CloudMcpState) {
+    let mut events = cloud_state.global_ws_events.subscribe();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) => video_cloud_handle_generation_event(event),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        drop(app);
+    });
+}
+
+fn video_cloud_kind_for_request(request: &VideoGenerateRequest) -> &'static str {
+    if request.mode == "upscale-video" || request.mode == "upscale-image" {
+        "upscale"
+    } else if request.mode.contains("video") {
+        "video"
+    } else {
+        "image"
+    }
+}
+
+fn video_cloud_append_b64_asset(
+    root: &std::path::Path,
+    media_root: &std::path::Path,
+    input_path: &str,
+    total_b64: &mut usize,
+) -> Result<(String, String), String> {
+    let (_data_uri, b64, mime, _bytes) = video_asset_data_uri(root, media_root, input_path)?;
+    *total_b64 = total_b64.saturating_add(b64.len());
+    if *total_b64 > VIDEO_CLOUD_GENERATE_MAX_B64_BYTES {
+        return Err("Cloud media generation input exceeds the 40MB base64 payload limit.".to_string());
+    }
+    Ok((b64, mime))
+}
+
+fn video_cloud_generate_payload(
+    context: &VideoGenerateJobContext,
+    request: &VideoGenerateRequest,
+) -> Result<serde_json::Value, String> {
+    let mut input = serde_json::Map::new();
+    let prompt = request.prompt.trim();
+    if !prompt.is_empty() {
+        input.insert("prompt".to_string(), serde_json::json!(prompt));
+    }
+    if let Some(params) = request.params.as_ref() {
+        if let Some(duration_sec) = params.duration_sec {
+            input.insert("durationSec".to_string(), serde_json::json!(duration_sec));
+        }
+        if let Some(aspect) = params.aspect.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            input.insert("aspectRatio".to_string(), serde_json::json!(aspect));
+        }
+        if let Some(resolution) = params.resolution.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+            input.insert("resolution".to_string(), serde_json::json!(resolution));
+        }
+        if let Some(num_images) = params.num_images {
+            input.insert("numImages".to_string(), serde_json::json!(num_images));
+        }
+        if let Some(quality) = params
+            .extra
+            .get("quality")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            input.insert("quality".to_string(), serde_json::json!(quality));
+        }
+        if let Some(sound) = params.extra.get("sound").and_then(serde_json::Value::as_bool) {
+            input.insert("sound".to_string(), serde_json::json!(sound));
+        }
+    }
+    input.insert("mode".to_string(), serde_json::json!(request.mode.clone()));
+
+    let mut total_b64 = 0usize;
+    if request.mode == "upscale-video" || request.mode == "upscale-image" {
+        let source_path = request
+            .input_asset_paths
+            .first()
+            .ok_or_else(|| format!("Cloud {} requires an input asset.", request.mode))?;
+        let (b64, mime) = video_cloud_append_b64_asset(
+            &context.root,
+            &context.media_root,
+            source_path,
+            &mut total_b64,
+        )?;
+        input.insert("sourceB64".to_string(), serde_json::json!(b64));
+        input.insert("sourceMime".to_string(), serde_json::json!(mime));
+    } else if request.mode == "image-to-video" {
+        let start_path = request
+            .input_asset_paths
+            .first()
+            .ok_or_else(|| "Cloud image-to-video requires a start frame asset.".to_string())?;
+        let (b64, mime) = video_cloud_append_b64_asset(
+            &context.root,
+            &context.media_root,
+            start_path,
+            &mut total_b64,
+        )?;
+        input.insert("startFrameB64".to_string(), serde_json::json!(b64));
+        input.insert("startFrameMime".to_string(), serde_json::json!(mime));
+        if let Some(end_path) = request.input_asset_paths.get(1) {
+            let (b64, mime) = video_cloud_append_b64_asset(
+                &context.root,
+                &context.media_root,
+                end_path,
+                &mut total_b64,
+            )?;
+            input.insert("endFrameB64".to_string(), serde_json::json!(b64));
+            input.insert("endFrameMime".to_string(), serde_json::json!(mime));
+        }
+    } else if !request.input_asset_paths.is_empty() {
+        let mut reference_images = Vec::new();
+        for input_path in &request.input_asset_paths {
+            let (b64, mime) = video_cloud_append_b64_asset(
+                &context.root,
+                &context.media_root,
+                input_path,
+                &mut total_b64,
+            )?;
+            reference_images.push(serde_json::json!({
+                "b64": b64,
+                "mime": mime,
+            }));
+        }
+        input.insert(
+            "referenceImagesB64".to_string(),
+            serde_json::Value::Array(reference_images),
+        );
+    }
+
+    Ok(serde_json::json!({
+        "requestId": format!("video-generate-{}-{}", video_now_millis(), uuid::Uuid::new_v4()),
+        "model": context.model.clone(),
+        "kind": video_cloud_kind_for_request(request),
+        "input": serde_json::Value::Object(input),
+    }))
+}
+
+async fn video_generate_cloud(
+    context: &VideoGenerateJobContext,
+    request: &VideoGenerateRequest,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<(), String> {
+    if cancel.load(std::sync::atomic::Ordering::Acquire) {
+        return Err("Video generation cancelled.".to_string());
+    }
+    let payload = video_cloud_generate_payload(context, request)?;
+    let cloud_state = context.app.state::<CloudMcpState>().inner().clone();
+    let response = cloud_mcp_ws_request_once_with_timeout(
+        &cloud_state,
+        "media_generate_request",
+        &payload,
+        std::time::Duration::from_secs(VIDEO_CLOUD_GENERATE_ACK_TIMEOUT_SECS),
+    )
+    .await?;
+    let data = response
+        .get("data")
+        .cloned()
+        .unwrap_or_else(|| response.clone());
+    if data.get("ok").and_then(serde_json::Value::as_bool) != Some(true) {
+        return Err(video_cloud_event_error(&data));
+    }
+    let cloud_job_id = video_cloud_event_text(&data, &["jobId", "job_id"])
+        .ok_or_else(|| "Cloud media generation ack omitted jobId.".to_string())?;
+    video_set_generation_provider_ref(
+        context,
+        serde_json::json!({
+            "cloudJobId": cloud_job_id.clone(),
+            "requestId": data.get("requestId").or_else(|| data.get("request_id")).cloned().unwrap_or(serde_json::Value::Null),
+        }),
+    )?;
+    video_cloud_register_generation_job(&cloud_job_id, context.clone(), cancel.clone())?;
+    video_emit_generate_progress(
+        context,
+        "queued",
+        Some(0.0),
+        "Cloud generation queued.",
+        false,
+        None,
+        &[],
+    );
+    Ok(())
 }
 
 async fn video_generate_higgsfield(
@@ -6940,6 +7424,10 @@ async fn video_generate_worker(
         let provider = video_provider_definition(&request.provider_id)
             .ok_or_else(|| format!("Unknown video generation provider: {}", request.provider_id))?;
         let output_paths = match provider.id {
+            "cloud" => {
+                video_generate_cloud(&context, &request, &cancel).await?;
+                Vec::new()
+            }
             "higgsfield" => {
                 video_emit_generate_progress(
                     &context,
@@ -6998,18 +7486,22 @@ async fn video_generate_worker(
                 ))
             }
         };
-        let _ = context.app.emit(
-            VIDEO_STORE_CHANGED_EVENT,
-            serde_json::json!({
-                "repoPath": context.root.to_string_lossy().to_string(),
-                "paths": output_paths,
-                "changedAtMs": video_now_millis(),
-            }),
-        );
+        if provider.id != "cloud" {
+            let _ = context.app.emit(
+                VIDEO_STORE_CHANGED_EVENT,
+                serde_json::json!({
+                    "repoPath": context.root.to_string_lossy().to_string(),
+                    "paths": output_paths,
+                    "changedAtMs": video_now_millis(),
+                }),
+            );
+        }
         Ok::<Vec<String>, String>(output_paths)
     }
     .await;
+    let keep_cloud_job_active = context.provider_id == "cloud" && result.is_ok();
     match result {
+        Ok(output_paths) if context.provider_id == "cloud" && output_paths.is_empty() => {}
         Ok(output_paths) => video_emit_generate_progress(
             &context,
             "done",
@@ -7040,7 +7532,9 @@ async fn video_generate_worker(
             &[],
         ),
     }
-    video_job_registry_remove(&VIDEO_GENERATE_JOBS, &context.job_id);
+    if !keep_cloud_job_active {
+        video_job_registry_remove(&VIDEO_GENERATE_JOBS, &context.job_id);
+    }
 }
 
 #[tauri::command]
@@ -7489,6 +7983,39 @@ async fn video_generate_resume(
     if job.provider_ref.is_none() {
         return Err("Video generation job does not have a providerRef to resume.".to_string());
     }
+    if job.provider_id == "cloud" {
+        let cloud_job_id = job
+            .provider_ref
+            .as_ref()
+            .and_then(video_cloud_job_id_from_provider_ref)
+            .ok_or_else(|| "Cloud generation providerRef is missing cloudJobId.".to_string())?;
+        let cancel = video_job_registry_insert_with_id(&VIDEO_GENERATE_JOBS, &job.job_id)?;
+        let context = VideoGenerateJobContext {
+            app,
+            root,
+            media_root: media_root.clone(),
+            generated_dir: media_root.join(VIDEO_GENERATED_DIR),
+            job_id: job.job_id.clone(),
+            provider_id: job.provider_id.clone(),
+            model: job.model.clone(),
+            mode: job.mode.clone(),
+            planned_paths: job.planned_paths.clone(),
+            created_at_ms: job.created_at_ms,
+            registry_path,
+            last_registry_write_ms: std::sync::Arc::new(std::sync::Mutex::new(0)),
+        };
+        video_cloud_register_generation_job(&cloud_job_id, context.clone(), cancel)?;
+        video_emit_generate_progress(
+            &context,
+            "running",
+            None,
+            "Waiting for Diff Forge Cloud.",
+            false,
+            None,
+            &[],
+        );
+        return Ok(VideoGenerateResumeResponse { ok: true });
+    }
     video_generate_resume_preflight(&job, &auth).await?;
     let cancel = video_job_registry_insert_with_id(&VIDEO_GENERATE_JOBS, &job.job_id)?;
     let context = VideoGenerateJobContext {
@@ -7514,7 +8041,10 @@ async fn video_generate_resume(
 #[tauri::command]
 fn video_generate_cancel(job_id: String) -> Result<(), String> {
     match video_job_registry_cancel(&VIDEO_GENERATE_JOBS, &job_id) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            let _ = video_cloud_cancel_generation_job(&job_id);
+            Ok(())
+        }
         Err(error) if error == "Unknown job" => {
             video_job_registry_cancel(&VIDEO_LORA_JOBS, &job_id).map_err(|lora_error| {
                 if lora_error == "Unknown job" {

@@ -5222,6 +5222,10 @@ pub fn run() {
                 app.handle().clone(),
                 app.state::<CloudMcpState>().inner().clone(),
             );
+            video_cloud_generation_events_start(
+                app.handle().clone(),
+                app.state::<CloudMcpState>().inner().clone(),
+            );
             architecture_store_watcher_start(app.handle().clone());
             cloud_mcp_start_account_documents_watcher(app.handle().clone());
             cloud_mcp_start_agent_inventory_watcher(

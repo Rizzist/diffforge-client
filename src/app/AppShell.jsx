@@ -13933,10 +13933,16 @@ function WorkspaceCreateAgentGlyph({ roleId }) {
 
 const WORKSPACE_PANEL_CARDS = [
   {
-    id: "document",
-    label: "Document",
+    id: "pcb-design",
+    label: "PCB Design",
     statusLabel: "ready",
-    maxCount: MAX_WORKSPACE_DOCUMENT_COUNT,
+    maxCount: MAX_WORKSPACE_PCB_COUNT,
+  },
+  {
+    id: "video-editor",
+    label: "Video",
+    statusLabel: "ready",
+    maxCount: MAX_WORKSPACE_VIDEO_PANEL_COUNT,
   },
   {
     id: "web",
@@ -13945,28 +13951,22 @@ const WORKSPACE_PANEL_CARDS = [
     maxCount: MAX_WORKSPACE_WEB_PANEL_COUNT,
   },
   {
-    id: "pcb-design",
-    label: "PCB Design",
+    id: "document",
+    label: "Docs",
     statusLabel: "ready",
-    maxCount: MAX_WORKSPACE_PCB_COUNT,
-  },
-  {
-    id: "vm-sandbox",
-    label: "VM Sandbox",
-    statusLabel: "runtime on first use",
-    maxCount: MAX_WORKSPACE_VM_COUNT,
-  },
-  {
-    id: "video-editor",
-    label: "Video editor",
-    statusLabel: "ready",
-    maxCount: MAX_WORKSPACE_VIDEO_PANEL_COUNT,
+    maxCount: MAX_WORKSPACE_DOCUMENT_COUNT,
   },
   {
     id: "touch-whiteboard",
-    label: "Touch Whiteboard",
+    label: "Whiteboard",
     statusLabel: "coming soon",
     unavailable: true,
+  },
+  {
+    id: "vm-sandbox",
+    label: "VM",
+    statusLabel: "runtime on first use",
+    maxCount: MAX_WORKSPACE_VM_COUNT,
   },
 ];
 
@@ -14853,7 +14853,7 @@ function WorkspaceCreatePanel({
         <WorkspaceCreateSection>
           <SettingsLabel>Panels</SettingsLabel>
           <SettingsHint>
-            Pick non-terminal workspace panels. Web, PCB design, VM Sandbox, and Video editor panels open in the terminals grid. You can add or remove them later too.
+            Pick non-terminal workspace panels. PCB, Video, Web, Docs, and VM panels open in the terminals grid. Whiteboard is coming soon.
           </SettingsHint>
           <WorkspacePanelCountCards
             counts={availablePanelCounts}
@@ -49750,7 +49750,7 @@ export default function App() {
                           <WorkspaceCreateSection>
                             <SettingsLabel>Panels</SettingsLabel>
                             <SettingsHint>
-                              Pick non-terminal workspace panels. Web, PCB design, Video editor, and VM Sandbox panels open in the terminals grid. You can add or remove them later too.
+                              Pick non-terminal workspace panels. PCB, Video, Web, Docs, and VM panels open in the terminals grid. Whiteboard is coming soon.
                             </SettingsHint>
                             <WorkspacePanelCountCards
                               counts={workspaceSettingsPanelCounts}

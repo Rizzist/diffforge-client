@@ -30,11 +30,7 @@ import {
   rippleDeleteWords,
   updateClip,
 } from "./videoEditorModel.js";
-import {
-  FAL_UPSCALE_IMAGE_MODEL,
-  FAL_UPSCALE_VIDEO_MODEL,
-  videoProviderAuth,
-} from "./videoProviders.js";
+import AssetPanel from "./AssetPanel.jsx";
 import {
   VideoCard,
   VideoErrorText,
@@ -56,6 +52,36 @@ import {
 } from "./videoStyles.js";
 
 const SLOT_STORAGE_PREFIX = "diffforge.video.gridPaneSlot.";
+const LAYOUT_STORAGE_PREFIX = "diffforge.video.paneLayout.";
+
+// Everything about the pane's surface that should survive a restart:
+// which panels are open, which asset's transcript/details, and the split
+// layouts (horizontal per panel-combination + the preview/timeline split).
+function readLayoutPrefs(workspaceId, paneId, repoPath) {
+  const key = slotStorageKey(workspaceId, paneId, repoPath).replace(SLOT_STORAGE_PREFIX, LAYOUT_STORAGE_PREFIX);
+  if (!key.startsWith(LAYOUT_STORAGE_PREFIX)) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(key) || "{}");
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeLayoutPrefs(workspaceId, paneId, repoPath, patch) {
+  const key = slotStorageKey(workspaceId, paneId, repoPath).replace(SLOT_STORAGE_PREFIX, LAYOUT_STORAGE_PREFIX);
+  if (!key.startsWith(LAYOUT_STORAGE_PREFIX)) {
+    return;
+  }
+  try {
+    const current = readLayoutPrefs(workspaceId, paneId, repoPath);
+    window.localStorage.setItem(key, JSON.stringify({ ...current, ...patch }));
+  } catch {
+    /* persistence is best-effort */
+  }
+}
 const AUTOSAVE_DELAY_MS = 800;
 const HISTORY_LIMIT = 60;
 const WIDE_MIN_WIDTH = 680;
@@ -345,8 +371,16 @@ export default function VideoWorkspacePane({
   workspaceId = "",
 }) {
   const [view, setView] = useState("menu");
-  const [libraryOpen, setLibraryOpen] = useState(true);
-  const [sidePanel, setSidePanel] = useState("");
+  const initialPrefsRef = useRef(null);
+  if (initialPrefsRef.current === null) {
+    initialPrefsRef.current = readLayoutPrefs(workspaceId, paneId, repoPath);
+  }
+  const [libraryOpen, setLibraryOpen] = useState(() => initialPrefsRef.current.libraryOpen !== false);
+  const [sidePanel, setSidePanel] = useState(() =>
+    ["generate", "export", "transcript", "asset"].includes(initialPrefsRef.current.sidePanel)
+      ? initialPrefsRef.current.sidePanel
+      : "",
+  );
   const [paneWidth, setPaneWidth] = useState(0);
   const [tools, setTools] = useState(null);
   const [installProgress, setInstallProgress] = useState(null);
@@ -366,6 +400,38 @@ export default function VideoWorkspacePane({
   const [transcriptAsset, setTranscriptAsset] = useState(null);
   const [generateSeed, setGenerateSeed] = useState(null);
   const seedNonceRef = useRef(0);
+  const restoredPanelAssetRef = useRef(false);
+
+  // Persist the surface flags whenever they change (layouts save separately,
+  // debounced, from the split groups' onLayoutChanged).
+  useEffect(() => {
+    writeLayoutPrefs(workspaceId, paneId, repoPath, {
+      libraryOpen,
+      sidePanel,
+      transcriptAssetPath: transcriptAsset?.path || "",
+      selectedAssetPath,
+    });
+  }, [libraryOpen, paneId, repoPath, selectedAssetPath, sidePanel, transcriptAsset?.path, workspaceId]);
+
+  const layoutSaveTimerRef = useRef(0);
+  const pendingLayoutRef = useRef({});
+  const saveGroupLayout = useCallback(
+    (slot, layout) => {
+      pendingLayoutRef.current[slot] = layout;
+      window.clearTimeout(layoutSaveTimerRef.current);
+      layoutSaveTimerRef.current = window.setTimeout(() => {
+        const prefs = readLayoutPrefs(workspaceId, paneId, repoPath);
+        const layouts = { ...(prefs.layouts || {}), ...pendingLayoutRef.current };
+        pendingLayoutRef.current = {};
+        writeLayoutPrefs(workspaceId, paneId, repoPath, { layouts });
+      }, 300);
+    },
+    [paneId, repoPath, workspaceId],
+  );
+  useEffect(() => () => window.clearTimeout(layoutSaveTimerRef.current), []);
+
+  const comboKey = `h:${libraryOpen ? "lib" : "nolib"}|${sidePanel ? "side" : "none"}`;
+  const savedLayouts = initialPrefsRef.current.layouts || {};
   const playbackRef = useRef(null);
   if (!playbackRef.current) {
     playbackRef.current = createPlaybackStore(0);
@@ -899,6 +965,31 @@ export default function VideoWorkspacePane({
     return map;
   }, [assets]);
 
+  // Restore the persisted transcript/asset panel target once assets load;
+  // if the asset no longer exists, close that panel gracefully.
+  useEffect(() => {
+    if (restoredPanelAssetRef.current || !assets.length) {
+      return;
+    }
+    restoredPanelAssetRef.current = true;
+    const prefs = initialPrefsRef.current;
+    if (prefs.sidePanel === "transcript" && prefs.transcriptAssetPath) {
+      const asset = assets.find((entry) => entry.path === prefs.transcriptAssetPath);
+      if (asset) {
+        setTranscriptAsset(asset);
+      } else {
+        setSidePanel("");
+      }
+    }
+    if (prefs.sidePanel === "asset" && prefs.selectedAssetPath) {
+      if (!assets.some((entry) => entry.path === prefs.selectedAssetPath)) {
+        setSidePanel("");
+      } else {
+        setSelectedAssetPath(prefs.selectedAssetPath);
+      }
+    }
+  }, [assets]);
+
   // Transcript panel + AI Edit routing --------------------------------------
 
   // Opening a side panel programmatically respects the same width guard as
@@ -921,37 +1012,26 @@ export default function VideoWorkspacePane({
     [openSidePanel],
   );
 
+  const openAssetPanel = useCallback(
+    (asset) => {
+      setSelectedAssetPath(asset?.path || "");
+      openSidePanel("asset");
+    },
+    [openSidePanel],
+  );
+
   const handleAiEdit = useCallback(
     ({ action, asset }) => {
       if (action === "upscale-video" || action === "upscale-image") {
-        const auth = videoProviderAuth("flux-lora");
-        if (!auth.apiKey) {
-          setPaneError("Upscaling runs on fal.ai — add the Flux + LoRA API key in Generate → API keys.");
-          openSidePanel("generate");
-          return;
-        }
-        invoke("video_generate_start", {
-          repoPath,
-          request: {
-            providerId: "fal",
-            model: action === "upscale-video" ? FAL_UPSCALE_VIDEO_MODEL : FAL_UPSCALE_IMAGE_MODEL,
-            mode: action,
-            prompt: "",
-            inputAssetPaths: [asset.path],
-            params: { durationSec: null, aspect: null, resolution: null, seed: null },
-            loraId: null,
-            auth,
-          },
-        })
-          .then(() => openSidePanel("generate"))
-          .catch((err) => setPaneError(String(err)));
+        // Upscaling lives in the asset panel now (cloud-run, per-model options).
+        openAssetPanel(asset);
         return;
       }
       seedNonceRef.current += 1;
       setGenerateSeed({ action, asset, nonce: seedNonceRef.current });
       openSidePanel("generate");
     },
-    [openSidePanel, repoPath],
+    [openAssetPanel, openSidePanel],
   );
 
   // Auto-captions: style caption clips onto a Captions track for the clip
@@ -1215,7 +1295,7 @@ export default function VideoWorkspacePane({
     onAiEdit: handleAiEdit,
     onImported: refreshAssets,
     onOpenTranscript: openTranscript,
-    onSelectAsset: (asset) => setSelectedAssetPath(asset?.path || ""),
+    onSelectAsset: openAssetPanel,
     paneToken: paneId || "video-pane",
     repoPath,
     selectedPath: selectedAssetPath,
@@ -1273,6 +1353,17 @@ export default function VideoWorkspacePane({
       onGenerateCaptions={generateCaptions}
       onRemoveWordsFromCut={removeWordsFromCut}
       onSeekSource={seekSource}
+      repoPath={repoPath}
+    />
+  ) : sidePanel === "asset" ? (
+    <AssetPanel
+      asset={assetsByPath[selectedAssetPath] || null}
+      onAddToTimeline={addAssetToTimeline}
+      onDeleted={() => {
+        refreshAssets();
+        setSidePanel("");
+      }}
+      onOpenTranscript={openTranscript}
       repoPath={repoPath}
     />
   ) : sidePanel === "export" ? (
@@ -1401,6 +1492,8 @@ export default function VideoWorkspacePane({
                 // instead of whatever sliver the previous layout left over.
                 // Pixel minSizes keep panels readable at any pane width.
                 <Group
+                  defaultLayout={savedLayouts[comboKey]}
+                  onLayoutChanged={(layout) => saveGroupLayout(comboKey, layout)}
                   orientation="horizontal"
                   style={{ height: "100%", width: "100%" }}
                 >
@@ -1413,7 +1506,12 @@ export default function VideoWorkspacePane({
                     </React.Fragment>
                   ) : null}
                   <SplitPanel id="video-split-center" key="center" minSize="360px">
-                    <Group orientation="vertical" style={{ height: "100%", width: "100%" }}>
+                    <Group
+                      defaultLayout={savedLayouts.vertical}
+                      onLayoutChanged={(layout) => saveGroupLayout("vertical", layout)}
+                      orientation="vertical"
+                      style={{ height: "100%", width: "100%" }}
+                    >
                       <SplitPanel defaultSize={62} id="video-split-preview" key="preview" minSize="150px">
                         {previewCell}
                       </SplitPanel>
@@ -1455,7 +1553,13 @@ export default function VideoWorkspacePane({
                   {sidePanelContent ? (
                     <VideoSheet>
                       <VideoSheetHeader>
-                        {sidePanel === "generate" ? "Generate" : sidePanel === "transcript" ? "Transcript" : "Export"}
+                        {sidePanel === "generate"
+                          ? "Generate"
+                          : sidePanel === "transcript"
+                            ? "Transcript"
+                            : sidePanel === "asset"
+                              ? "Asset"
+                              : "Export"}
                         <VideoRailSpacer />
                         <VideoIconButton onClick={() => setSidePanel("")} title="Close" type="button">
                           <Close aria-hidden="true" />

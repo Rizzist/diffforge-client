@@ -13,6 +13,7 @@ import { emitVideoAssetDrag } from "./videoDragEvents.js";
 import { VIDEO_TRANSCRIBE_PROGRESS_EVENT } from "./videoPanelBridge.js";
 import { VideoErrorText, VideoHint, VideoIconButton, VideoSecondaryButton } from "./videoStyles.js";
 import { formatTimecode } from "./videoEditorModel.js";
+import { resolutionClass } from "./generationCatalog.js";
 
 const MEDIA_DIALOG_FILTERS = [
   {
@@ -664,7 +665,14 @@ export default function MediaBin({
                   {transcribing[asset.path] ? " · transcribing" : asset.hasTranscript ? " · T" : ""}
                 </AssetKind>
                 {Number.isFinite(Number(asset.durationMs)) && asset.durationMs > 0 ? (
-                  <AssetDuration>{formatTimecode(asset.durationMs)}</AssetDuration>
+                  <AssetDuration>
+                    {asset.kind === "video" && asset.width && asset.height
+                      ? `${resolutionClass(asset.width, asset.height)} · `
+                      : ""}
+                    {formatTimecode(asset.durationMs)}
+                  </AssetDuration>
+                ) : asset.kind === "image" && asset.width && asset.height ? (
+                  <AssetDuration>{`${asset.width}×${asset.height}`}</AssetDuration>
                 ) : null}
                 <HoverActions>
                   <HoverButton
