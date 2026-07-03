@@ -324,20 +324,42 @@ function updateClipIn(project, clipId, updater) {
   return next;
 }
 
+// First position ≥ startMs on a track where a clip of durationMs fits without
+// overlapping. Timelines never overlap: colliding placements slide forward
+// into the first gap (or after the last clip).
+export function firstFreePositionOnTrack(track, startMs, durationMs, ignoreIds = []) {
+  const ignore = new Set(ignoreIds);
+  const clips = (track?.clips || [])
+    .filter((clip) => !ignore.has(clip.id))
+    .sort((a, b) => a.timelineStartMs - b.timelineStartMs);
+  let candidate = Math.max(0, Math.round(startMs));
+  for (const clip of clips) {
+    if (candidate + durationMs <= clip.timelineStartMs) {
+      break; // fits in the gap before this clip
+    }
+    if (candidate < clipEndMs(clip)) {
+      candidate = clipEndMs(clip);
+    }
+  }
+  return candidate;
+}
+
 export function moveClip(project, clipId, timelineStartMs) {
-  return updateClipIn(project, clipId, (clip) => {
-    clip.timelineStartMs = Math.max(0, Math.round(timelineStartMs));
+  return updateClipIn(project, clipId, (clip, track) => {
+    clip.timelineStartMs = firstFreePositionOnTrack(track, timelineStartMs, clip.durationMs, [clip.id]);
   });
 }
 
 // Group move: shift every listed clip by the same delta, clamped so the
-// earliest one lands at 0 (relative spacing always survives).
+// earliest one lands at 0 (relative spacing always survives). Collisions with
+// clips outside the group push the whole group forward until nothing overlaps.
 export function moveClips(project, clipIds, deltaMs) {
   const ids = Array.isArray(clipIds) ? clipIds.filter(Boolean) : [];
   if (!ids.length) {
     return project;
   }
   const next = cloneProject(project);
+  const idSet = new Set(ids);
   const targets = [];
   for (const clipId of ids) {
     const found = findClip(next, clipId);
@@ -349,7 +371,25 @@ export function moveClips(project, clipIds, deltaMs) {
     return project;
   }
   const minStart = Math.min(...targets.map((entry) => entry.clip.timelineStartMs));
-  const applied = Math.max(Math.round(deltaMs), -minStart);
+  let applied = Math.max(Math.round(deltaMs), -minStart);
+  for (let iteration = 0; iteration < 10; iteration += 1) {
+    let push = 0;
+    for (const { clip, track } of targets) {
+      const proposed = clip.timelineStartMs + applied;
+      for (const other of track.clips) {
+        if (idSet.has(other.id)) {
+          continue;
+        }
+        if (proposed < clipEndMs(other) && proposed + clip.durationMs > other.timelineStartMs) {
+          push = Math.max(push, clipEndMs(other) - proposed);
+        }
+      }
+    }
+    if (!push) {
+      break;
+    }
+    applied += push;
+  }
   for (const { clip, track } of targets) {
     clip.timelineStartMs += applied;
     track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
@@ -443,7 +483,12 @@ export function moveClipToTrack(project, clipId, targetTrackId, timelineStartMs)
     return project;
   }
   found.track.clips = found.track.clips.filter((clip) => clip.id !== clipId);
-  found.clip.timelineStartMs = Math.max(0, Math.round(timelineStartMs));
+  found.clip.timelineStartMs = firstFreePositionOnTrack(
+    target,
+    timelineStartMs,
+    found.clip.durationMs,
+    [clipId],
+  );
   target.clips.push(found.clip);
   target.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
   return next;
@@ -753,7 +798,11 @@ export function pasteClips(project, payload, atMs) {
       {
         ...entry.clip,
         id: makeVideoId("clip"),
-        timelineStartMs: Math.max(0, (entry.clip.timelineStartMs || 0) + offset),
+        timelineStartMs: firstFreePositionOnTrack(
+          track,
+          Math.max(0, (entry.clip.timelineStartMs || 0) + offset),
+          Math.max(MIN_CLIP_DURATION_MS, Math.round(entry.clip.durationMs || MIN_CLIP_DURATION_MS)),
+        ),
       },
       kind,
     );
@@ -1203,8 +1252,11 @@ export function updateClip(project, clipId, patch) {
 
 // Insert a media asset as a clip. Video/image assets land on a video track,
 // audio assets on an audio track; creates a track when none exists or when the
-// preferred track is locked.
-export function addMediaClip(project, asset, { trackId = "", timelineStartMs = 0 } = {}) {
+// preferred track is locked. Placement never overlaps (slides into the first
+// free gap at/after the requested position). A video WITH audio also gets a
+// LINKED audio clip on an audio track so its sound is editable separately —
+// the video clip itself is muted (the audio lives on the partner clip).
+export function addMediaClip(project, asset, { trackId = "", timelineStartMs = 0, linkAudio = true } = {}) {
   const isAudio = asset?.kind === "audio";
   const wantedKind = isAudio ? "audio" : "video";
   let next = cloneProject(project);
@@ -1217,20 +1269,64 @@ export function addMediaClip(project, asset, { trackId = "", timelineStartMs = 0
     track = next.tracks[next.tracks.length - 1];
   }
   const fallbackDuration = asset?.kind === "image" ? 4000 : 3000;
+  const durationMs = Math.max(MIN_CLIP_DURATION_MS, Math.round(cleanNumber(asset?.durationMs, fallbackDuration)));
+  const wantsLinkedAudio = linkAudio && asset?.kind === "video" && asset?.hasAudio === true;
+  const startMs = firstFreePositionOnTrack(track, timelineStartMs, durationMs);
   const clip = normalizeClip(
     {
       id: makeVideoId("clip"),
       assetPath: asset?.path || "",
-      timelineStartMs: Math.max(0, Math.round(timelineStartMs)),
-      durationMs: Math.max(MIN_CLIP_DURATION_MS, Math.round(cleanNumber(asset?.durationMs, fallbackDuration))),
+      timelineStartMs: startMs,
+      durationMs,
       sourceInMs: 0,
       speed: 1,
+      // Muted when a linked audio partner carries the sound.
+      gain: wantsLinkedAudio ? { level: 0, keyframes: [] } : undefined,
     },
     track.kind,
   );
   track.clips.push(clip);
   track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
-  return { project: next, clipId: clip.id, trackId: track.id };
+  let audioClipId = "";
+  if (wantsLinkedAudio) {
+    // The audio partner must sit at the SAME start (A/V sync) — pick the
+    // first unlocked audio track with that slot free, else add one.
+    let audioTrack = next.tracks.find(
+      (entry) =>
+        entry.kind === "audio"
+        && !entry.locked
+        && firstFreePositionOnTrack(entry, startMs, durationMs) === startMs,
+    );
+    if (!audioTrack) {
+      next = addTrack(next, "audio");
+      audioTrack = next.tracks[next.tracks.length - 1];
+      // addTrack cloned the project — refind the video clip's track reference.
+      track = next.tracks.find((entry) => entry.id === track.id) || track;
+    }
+    const audioClip = normalizeClip(
+      {
+        id: makeVideoId("clip"),
+        assetPath: asset?.path || "",
+        timelineStartMs: startMs,
+        durationMs,
+        sourceInMs: 0,
+        speed: 1,
+      },
+      "audio",
+    );
+    audioTrack.clips.push(audioClip);
+    audioTrack.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
+    audioClipId = audioClip.id;
+    linkIdSeq += 1;
+    const linkId = `link-${Date.now().toString(36)}-av${linkIdSeq}`;
+    const videoRef = findClip(next, clip.id);
+    const audioRef = findClip(next, audioClip.id);
+    if (videoRef && audioRef) {
+      videoRef.clip.linkId = linkId;
+      audioRef.clip.linkId = linkId;
+    }
+  }
+  return { project: next, clipId: clip.id, trackId: track.id, audioClipId };
 }
 
 export function addTextClip(project, { trackId = "", timelineStartMs = 0, text = "Text" } = {}) {

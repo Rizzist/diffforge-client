@@ -482,6 +482,7 @@ const WebPaneSurface = styled.section`
   --web-blue: #68a3ff;
   --web-danger: #ff9b9b;
 
+  container-type: inline-size;
   display: grid;
   width: 100%;
   height: 100%;
@@ -507,6 +508,7 @@ const WebPaneSurface = styled.section`
 `;
 
 const WebPaneRail = styled(TerminalRestartPill)`
+  grid-template-columns: minmax(0, 1fr) auto;
   border-bottom-color: var(--web-border);
   background: var(--web-panel);
 `;
@@ -521,8 +523,13 @@ const WebPaneDragButton = styled(TerminalRestartButton)`
 `;
 
 const WebPaneRailControls = styled(TerminalRailControls)`
+  &[data-rail-row="primary"] {
+    grid-column: 2;
+    grid-row: 1;
+  }
+
   &[data-rail-row="secondary"] {
-    grid-column: 1;
+    grid-column: 1 / -1;
     grid-row: 3;
     width: 100%;
   }
@@ -538,7 +545,7 @@ const WebPaneIconButton = styled(TerminalRestartButton)`
 
 const WebPaneNav = styled.form`
   display: flex;
-  grid-column: 1;
+  grid-column: 1 / -1;
   grid-row: 2;
   min-width: min(100%, 220px);
   align-items: center;

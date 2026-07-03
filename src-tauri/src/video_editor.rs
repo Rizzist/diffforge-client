@@ -2797,7 +2797,7 @@ async fn video_transcribe_worker(
             &job_id,
             &path,
             "extracting",
-            Some(0.0),
+            Some(12.0),
             false,
             None,
         );
@@ -2879,7 +2879,7 @@ async fn video_transcribe_worker(
             &job_id,
             &rel_path,
             "uploading",
-            Some(35.0),
+            Some(38.0),
             false,
             None,
         );
@@ -2912,7 +2912,7 @@ async fn video_transcribe_worker(
             &job_id,
             &rel_path,
             "transcribing",
-            Some(55.0),
+            Some(66.0),
             false,
             None,
         );
@@ -3090,6 +3090,46 @@ async fn video_transcript_update(
     })
     .await
     .map_err(|error| format!("Video transcript update worker failed: {error}"))?
+}
+
+// Removes a media file's cached transcript entirely (the media itself is
+// untouched). hasTranscript flips false on the next media list.
+#[tauri::command]
+async fn video_transcript_delete(
+    app: tauri::AppHandle,
+    repo_path: String,
+    path: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
+        video_ensure_media_dirs(&media_root)?;
+        let (_abs, rel_path, kind, metadata) =
+            video_resolve_existing_media_file(&root, &media_root, path.as_str())?;
+        if !matches!(kind, "audio" | "video") {
+            return Err("Transcripts are only available for audio or video media.".to_string());
+        }
+        let transcript_path = video_transcript_cache_path(&media_root, &rel_path, &metadata);
+        match std::fs::remove_file(&transcript_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err("No transcript exists for this media.".to_string());
+            }
+            Err(error) => {
+                return Err(format!("Unable to delete transcript: {error}"));
+            }
+        }
+        let _ = app.emit(
+            VIDEO_TRANSCRIPT_UPDATED_EVENT,
+            serde_json::json!({
+                "repoPath": root.to_string_lossy().to_string(),
+                "path": rel_path,
+                "deleted": true,
+            }),
+        );
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("Video transcript delete worker failed: {error}"))?
 }
 
 fn video_format_subtitle_time(ms: u64, separator: char) -> String {

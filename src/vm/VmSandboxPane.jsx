@@ -65,6 +65,7 @@ const spin = keyframes`
 `;
 
 const VmSandboxShell = styled.section`
+  container-type: inline-size;
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -84,8 +85,9 @@ const VmSandboxShell = styled.section`
 `;
 
 const VmSandboxHeader = styled.header`
+  container-type: inline-size;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr) auto;
   align-items: center;
   column-gap: 12px;
   row-gap: 2px;
@@ -94,17 +96,41 @@ const VmSandboxHeader = styled.header`
   border-bottom: 1px solid rgba(98, 116, 148, 0.28);
   background: rgba(6, 9, 15, 0.8);
 
-  [data-rail-row="secondary"] {
-    grid-column: 1 / -1;
-    grid-row: 2;
-    width: 100%;
+  && [data-rail-row="primary"] {
+    grid-column: 3;
+    grid-row: 1;
+    justify-self: end;
+  }
+
+  && [data-rail-row="secondary"] {
+    grid-column: 2;
+    grid-row: 1;
+    width: auto;
     justify-content: flex-start;
+  }
+
+  @container (max-width: 520px) {
+    && {
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+    }
+
+    && [data-rail-row="primary"] {
+      grid-column: 2;
+      grid-row: 1;
+    }
+
+    && [data-rail-row="secondary"] {
+      grid-column: 1 / -1;
+      grid-row: 2;
+      width: 100%;
+    }
   }
 `;
 
 const VmSandboxIdentity = styled.div`
   display: flex;
-  grid-column: 1 / -1;
+  grid-column: 1;
   grid-row: 1;
   align-items: center;
   min-width: 0;
@@ -584,6 +610,16 @@ export default function VmSandboxPane({
             <span>{runtimeSubtitle}</span>
           </VmSandboxTitleBlock>
         </VmSandboxIdentity>
+        <TerminalRailControls data-rail-row="primary">
+          <TerminalCloseButton
+            aria-label="Close VM Sandbox panel"
+            onClick={() => onClose?.(terminalIndex, paneId)}
+            title="Close VM Sandbox panel"
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </TerminalCloseButton>
+        </TerminalRailControls>
         <TerminalRailControls data-rail-row="secondary">
           <TerminalRestartButton
             aria-label="Recheck VM Sandbox runtime"
@@ -625,14 +661,6 @@ export default function VmSandboxPane({
               <ButtonFullscreenIcon aria-hidden="true" />
             )}
           </TerminalRestartButton>
-          <TerminalCloseButton
-            aria-label="Close VM Sandbox panel"
-            onClick={() => onClose?.(terminalIndex, paneId)}
-            title="Close VM Sandbox panel"
-            type="button"
-          >
-            <ButtonCloseIcon aria-hidden="true" />
-          </TerminalCloseButton>
         </TerminalRailControls>
       </VmSandboxHeader>
 

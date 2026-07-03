@@ -411,6 +411,16 @@ export default function VideoWindowHost() {
             Video editor
           </PanelTitle>
         </PanelIdentity>
+        <TerminalRailControls data-rail-row="primary">
+          <PanelCloseButton
+            aria-label="Close"
+            onClick={() => safeTauriWindowCall(currentWindow, "close")}
+            title="Close"
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </PanelCloseButton>
+        </TerminalRailControls>
         <TerminalRailControls data-rail-row="secondary">
           <PanelAgentPromptActivity items={agentPromptActivityItems} />
           <PanelIconButton
@@ -433,14 +443,6 @@ export default function VideoWindowHost() {
           >
             <OpenInNew aria-hidden="true" />
           </PanelIconButton>
-          <PanelCloseButton
-            aria-label="Close"
-            onClick={() => safeTauriWindowCall(currentWindow, "close")}
-            title="Close"
-            type="button"
-          >
-            <ButtonCloseIcon aria-hidden="true" />
-          </PanelCloseButton>
         </TerminalRailControls>
       </PanelChrome>
       <PanelBody>
@@ -470,6 +472,7 @@ export default function VideoWindowHost() {
 }
 
 const PanelWindowRoot = styled.div`
+  container-type: inline-size;
   display: grid;
   width: 100vw;
   height: 100vh;

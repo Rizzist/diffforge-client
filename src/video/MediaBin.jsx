@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
@@ -542,6 +543,16 @@ export default function MediaBin({
             return;
           }
           state.started = true;
+          // The tile's pointerdown can't preventDefault (double-click must
+          // keep working), so the browser starts a text selection as the
+          // pointer sweeps the timeline — suppress it for the drag's duration.
+          document.body.style.userSelect = "none";
+          document.body.style.webkitUserSelect = "none";
+          try {
+            window.getSelection()?.removeAllRanges();
+          } catch {
+            /* selection API unavailable */
+          }
           emitVideoAssetDrag({ phase: "start", asset, paneToken, x: moveEvent.clientX, y: moveEvent.clientY });
         }
         setDrag({ asset, x: moveEvent.clientX, y: moveEvent.clientY });
@@ -553,6 +564,8 @@ export default function MediaBin({
         window.removeEventListener("pointercancel", handleCancel);
         dragStateRef.current = null;
         setDrag(null);
+        document.body.style.userSelect = "";
+        document.body.style.webkitUserSelect = "";
         if (state.started) {
           emitVideoAssetDrag({
             phase: cancelled ? "cancel" : "end",
@@ -688,13 +701,14 @@ export default function MediaBin({
           ))}
         </BinGrid>
       )}
-      {drag ? (
+      {drag ? createPortal(
         <DragGhost style={{ left: `${drag.x + 10}px`, top: `${drag.y + 8}px` }}>
           {drag.asset.thumbnailDataUrl ? <img alt="" src={drag.asset.thumbnailDataUrl} /> : null}
           <span>{drag.asset.name}</span>
-        </DragGhost>
+        </DragGhost>,
+        document.body,
       ) : null}
-      {aiMenu ? (
+      {aiMenu ? createPortal(
         <AiMenu
           onPointerDown={(event) => event.stopPropagation()}
           style={{ left: `${Math.min(aiMenu.x, window.innerWidth - 190)}px`, top: `${aiMenu.y}px` }}
@@ -772,7 +786,8 @@ export default function MediaBin({
           >
             + Add at playhead
           </AiMenuItem>
-        </AiMenu>
+        </AiMenu>,
+        document.body,
       ) : null}
     </BinRoot>
   );

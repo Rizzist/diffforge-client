@@ -177,6 +177,54 @@ test("removes clips and respects locked tracks", () => {
   assert.equal(removeClip(locked, "clip-1"), locked);
 });
 
+test("videos with audio expand into a linked, separately-editable A/V pair", () => {
+  const starter = makeStarterProject("x");
+  const result = addMediaClip(
+    starter,
+    { path: "media/assets/talk.mp4", kind: "video", durationMs: 5000, hasAudio: true },
+    { timelineStartMs: 1000 },
+  );
+  const videoClip = result.project.tracks.find((track) => track.kind === "video").clips[0];
+  const audioClip = result.project.tracks.find((track) => track.kind === "audio").clips[0];
+  assert.ok(result.audioClipId);
+  assert.equal(audioClip.id, result.audioClipId);
+  assert.equal(audioClip.timelineStartMs, videoClip.timelineStartMs);
+  assert.equal(audioClip.durationMs, videoClip.durationMs);
+  assert.equal(videoClip.linkId, audioClip.linkId);
+  assert.ok(videoClip.linkId);
+  assert.equal(videoClip.gain.level, 0); // sound lives on the audio partner
+  assert.equal(audioClip.gain.level, 1);
+  assert.equal(expandWithLinks(result.project, [videoClip.id]).length, 2);
+
+  // No audio in the source → no partner.
+  const silent = addMediaClip(starter, { path: "media/assets/b.mp4", kind: "video", hasAudio: false });
+  assert.equal(silent.audioClipId, "");
+  assert.equal(silent.project.tracks.find((track) => track.kind === "audio").clips.length, 0);
+});
+
+test("clips never overlap: adds, moves, and group moves slide into free space", () => {
+  let project = projectWithClip(); // clip-1 at 1000..5000
+  // Add colliding → slides to 5000.
+  const added = addMediaClip(project, { path: "media/assets/b.mp4", kind: "video", durationMs: 2000 }, { timelineStartMs: 2000 });
+  project = added.project;
+  const clips = project.tracks.find((track) => track.kind === "video").clips;
+  assert.equal(clips[1].timelineStartMs, 5000);
+  // Move the second clip into the first → pushed to the free gap after it.
+  const moved = moveClip(project, added.clipId, 1500);
+  assert.equal(moved.tracks.find((track) => track.kind === "video").clips[1].timelineStartMs, 5000);
+  // Group move colliding with an outsider pushes the whole group clear.
+  const third = addMediaClip(moved, { path: "media/assets/c.mp4", kind: "video", durationMs: 1000 }, { timelineStartMs: 9000 });
+  const groupMoved = moveClips(third.project, ["clip-1", added.clipId], 7000);
+  const after = groupMoved.tracks.find((track) => track.kind === "video").clips;
+  const ids = after.map((clip) => clip.id);
+  const first = after[ids.indexOf("clip-1")];
+  // clip-1 (4000ms) proposed at 8000 overlaps 9000..10000 outsider → pushed to 10000.
+  assert.equal(first.timelineStartMs, 10000);
+  // Relative spacing preserved (partner was +4000 from clip-1).
+  const partner = after.find((clip) => clip.id === added.clipId);
+  assert.equal(partner.timelineStartMs - first.timelineStartMs, 4000);
+});
+
 test("adds media clips to a matching track and creates one when missing", () => {
   const starter = makeStarterProject("x");
   const withVideo = addMediaClip(starter, { path: "media/assets/v.mp4", kind: "video", durationMs: 2500 });

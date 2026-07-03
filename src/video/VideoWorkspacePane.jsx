@@ -109,25 +109,89 @@ const SplitPanel = styled(Panel)`
   }
 `;
 
+// Separators must be FINDABLE on a black surface: an always-visible hairline
+// with a centered grip dot, widening to emerald on hover/drag.
 const SplitSeparatorH = styled(Separator)`
-  width: 5px;
+  width: 7px;
   flex: none;
   cursor: col-resize;
   background: transparent;
+  position: relative;
 
-  &:hover {
-    background: rgba(16, 185, 129, 0.28);
+  &::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: 3px;
+    width: 1px;
+    background: rgba(148, 163, 184, 0.22);
+  }
+
+  &::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    left: 2px;
+    width: 3px;
+    height: 26px;
+    transform: translateY(-50%);
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.4);
+  }
+
+  &:hover::before,
+  &[data-resizing]::before {
+    left: 2px;
+    width: 3px;
+    background: rgba(16, 185, 129, 0.55);
+  }
+
+  &:hover::after,
+  &[data-resizing]::after {
+    background: rgba(16, 185, 129, 0.9);
   }
 `;
 
 const SplitSeparatorV = styled(Separator)`
-  height: 5px;
+  height: 7px;
   flex: none;
   cursor: row-resize;
   background: transparent;
+  position: relative;
 
-  &:hover {
-    background: rgba(16, 185, 129, 0.28);
+  &::before {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    top: 3px;
+    height: 1px;
+    background: rgba(148, 163, 184, 0.22);
+  }
+
+  &::after {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 2px;
+    height: 3px;
+    width: 26px;
+    transform: translateX(-50%);
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.4);
+  }
+
+  &:hover::before,
+  &[data-resizing]::before {
+    top: 2px;
+    height: 3px;
+    background: rgba(16, 185, 129, 0.55);
+  }
+
+  &:hover::after,
+  &[data-resizing]::after {
+    background: rgba(16, 185, 129, 0.9);
   }
 `;
 
@@ -731,7 +795,7 @@ export default function VideoWorkspacePane({
       if (tab === "media" || tab === "library") {
         setLibraryOpen(true);
       } else if (tab === "generate") {
-        setSidePanel("generate");
+        openSidePanel("generate");
       } else if (tab === "export") {
         setSidePanel("export");
       } else if (tab === "edit") {
@@ -774,10 +838,25 @@ export default function VideoWorkspacePane({
 
   // Transcript panel + AI Edit routing --------------------------------------
 
-  const openTranscript = useCallback((asset) => {
-    setTranscriptAsset(asset);
-    setSidePanel("transcript");
-  }, []);
+  // Opening a side panel programmatically respects the same width guard as
+  // the rail toggles: below ~900px the library yields its space.
+  const openSidePanel = useCallback(
+    (panel) => {
+      setSidePanel(panel);
+      if (paneWidth > 0 && paneWidth < 900) {
+        setLibraryOpen(false);
+      }
+    },
+    [paneWidth],
+  );
+
+  const openTranscript = useCallback(
+    (asset) => {
+      setTranscriptAsset(asset);
+      openSidePanel("transcript");
+    },
+    [openSidePanel],
+  );
 
   const handleAiEdit = useCallback(
     ({ action, asset }) => {
@@ -785,7 +864,7 @@ export default function VideoWorkspacePane({
         const auth = videoProviderAuth("flux-lora");
         if (!auth.apiKey) {
           setPaneError("Upscaling runs on fal.ai — add the Flux + LoRA API key in Generate → API keys.");
-          setSidePanel("generate");
+          openSidePanel("generate");
           return;
         }
         invoke("video_generate_start", {
@@ -801,15 +880,15 @@ export default function VideoWorkspacePane({
             auth,
           },
         })
-          .then(() => setSidePanel("generate"))
+          .then(() => openSidePanel("generate"))
           .catch((err) => setPaneError(String(err)));
         return;
       }
       seedNonceRef.current += 1;
       setGenerateSeed({ action, asset, nonce: seedNonceRef.current });
-      setSidePanel("generate");
+      openSidePanel("generate");
     },
-    [repoPath],
+    [openSidePanel, repoPath],
   );
 
   // Auto-captions: style caption clips onto a Captions track for the clip
@@ -961,6 +1040,8 @@ export default function VideoWorkspacePane({
       if (path) {
         transcriptCacheRef.current.delete(path);
       }
+      // hasTranscript badges follow the cache (delete/update/fresh runs).
+      refreshAssets();
     };
     listen("video-transcript-updated", invalidate).then(adopt).catch(() => {});
     listen(VIDEO_TRANSCRIBE_PROGRESS_EVENT, (event) => {
@@ -976,7 +1057,7 @@ export default function VideoWorkspacePane({
         fn();
       }
     };
-  }, []);
+  }, [refreshAssets]);
 
   useEffect(() => {
     if (!ranges.length || !project) {
@@ -1037,9 +1118,30 @@ export default function VideoWorkspacePane({
     };
   }, [assetsByPath, project, ranges, repoPath]);
 
-  const toggleSidePanel = useCallback((panel) => {
-    setSidePanel((current) => (current === panel ? "" : panel));
-  }, []);
+  const toggleSidePanel = useCallback(
+    (panel) => {
+      setSidePanel((current) => {
+        const next = current === panel ? "" : panel;
+        // Mid-width panes can't fit library + side panel at usable minimums —
+        // yield the space instead of crushing everything into slivers.
+        if (next && paneWidth > 0 && paneWidth < 900) {
+          setLibraryOpen(false);
+        }
+        return next;
+      });
+    },
+    [paneWidth],
+  );
+
+  const toggleLibrary = useCallback(() => {
+    setLibraryOpen((open) => {
+      const next = !open;
+      if (next && paneWidth > 0 && paneWidth < 900) {
+        setSidePanel("");
+      }
+      return next;
+    });
+  }, [paneWidth]);
 
   const installBusy = installing || (installProgress && !installProgress.done && !installProgress.error);
 
@@ -1200,7 +1302,7 @@ export default function VideoWorkspacePane({
               ) : null}
               <VideoRailButton
                 data-active={libraryOpen ? "true" : "false"}
-                onClick={() => setLibraryOpen((open) => !open)}
+                onClick={toggleLibrary}
                 title="Toggle media library"
                 type="button"
               >
@@ -1229,28 +1331,36 @@ export default function VideoWorkspacePane({
             {paneError ? <VideoErrorText style={{ padding: "3px 10px" }}>{paneError}</VideoErrorText> : null}
             <EditorArea>
               {wide ? (
-                <Group orientation="horizontal" style={{ height: "100%", width: "100%" }}>
+                // Keyed by the visible-panel combo: toggling a panel remounts
+                // the group so every panel reopens at a USABLE default width
+                // instead of whatever sliver the previous layout left over.
+                // Pixel minSizes keep panels readable at any pane width.
+                <Group
+                  key={`split-${libraryOpen ? "lib" : "nolib"}-${sidePanel || "none"}`}
+                  orientation="horizontal"
+                  style={{ height: "100%", width: "100%" }}
+                >
                   {libraryOpen ? (
                     <>
-                      <SplitPanel defaultSize={20} minSize={13}>
+                      <SplitPanel defaultSize="260px" minSize="190px">
                         <MediaBin {...binProps} />
                       </SplitPanel>
                       <SplitSeparatorH />
                     </>
                   ) : null}
-                  <SplitPanel minSize={30}>
+                  <SplitPanel minSize="360px">
                     <Group orientation="vertical" style={{ height: "100%", width: "100%" }}>
-                      <SplitPanel defaultSize={58} minSize={22}>
+                      <SplitPanel defaultSize={56} minSize="150px">
                         {previewCell}
                       </SplitPanel>
                       <SplitSeparatorV />
-                      <SplitPanel minSize={18}>{timelineCell}</SplitPanel>
+                      <SplitPanel minSize="140px">{timelineCell}</SplitPanel>
                     </Group>
                   </SplitPanel>
                   {sidePanelContent ? (
                     <>
                       <SplitSeparatorH />
-                      <SplitPanel defaultSize={30} minSize={20}>
+                      <SplitPanel defaultSize="340px" minSize="280px">
                         {sidePanelContent}
                       </SplitPanel>
                     </>

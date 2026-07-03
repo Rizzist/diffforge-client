@@ -5373,6 +5373,7 @@ pub fn run() {
             video_transcribe_cancel,
             video_transcript_get,
             video_transcript_update,
+            video_transcript_delete,
             video_transcript_export,
             video_generate_start,
             video_generate_resume,

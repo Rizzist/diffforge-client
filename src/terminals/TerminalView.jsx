@@ -2752,6 +2752,7 @@ const TerminalBreakoutDocumentWindow = styled(TerminalSurfaceSlot)`
 `;
 
 const TerminalDocumentPanelShell = styled.div`
+  container-type: inline-size;
   display: flex;
   width: 100%;
   height: 100%;
@@ -2794,6 +2795,7 @@ const TerminalDocumentPanelBody = styled.div`
 `;
 
 const TerminalPcbPanelShell = styled.div`
+  container-type: inline-size;
   display: flex;
   width: 100%;
   height: 100%;
@@ -22192,6 +22194,16 @@ function WorkspacePcbGridPane({
             {boardTitle}
           </TerminalPcbPanelTitle>
         </TerminalPcbPanelIdentity>
+        <TerminalRailControls data-rail-row="primary">
+          <TerminalCloseButton
+            aria-label="Close PCB panel"
+            onClick={() => onClose?.(terminalIndex, paneId)}
+            title="Close PCB panel"
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </TerminalCloseButton>
+        </TerminalRailControls>
         <TerminalRailControls data-rail-row="secondary">
           <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
           <TerminalRestartButton
@@ -22279,14 +22291,6 @@ function WorkspacePcbGridPane({
               <ButtonFullscreenIcon aria-hidden="true" />
             )}
           </TerminalRestartButton>
-          <TerminalCloseButton
-            aria-label="Close PCB panel"
-            onClick={() => onClose?.(terminalIndex, paneId)}
-            title="Close PCB panel"
-            type="button"
-          >
-            <ButtonCloseIcon aria-hidden="true" />
-          </TerminalCloseButton>
         </TerminalRailControls>
       </TerminalPcbPanelHeader>
       <TerminalPcbPanelBody>
@@ -22421,6 +22425,16 @@ function WorkspaceVideoGridPane({
             {projectTitle}
           </TerminalVideoPanelTitle>
         </TerminalVideoPanelIdentity>
+        <TerminalRailControls data-rail-row="primary">
+          <TerminalCloseButton
+            aria-label="Close Video panel"
+            onClick={() => onClose?.(terminalIndex, paneId)}
+            title="Close Video panel"
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </TerminalCloseButton>
+        </TerminalRailControls>
         <TerminalRailControls data-rail-row="secondary">
           <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
           <TerminalRestartButton
@@ -22508,14 +22522,6 @@ function WorkspaceVideoGridPane({
               <ButtonFullscreenIcon aria-hidden="true" />
             )}
           </TerminalRestartButton>
-          <TerminalCloseButton
-            aria-label="Close Video panel"
-            onClick={() => onClose?.(terminalIndex, paneId)}
-            title="Close Video panel"
-            type="button"
-          >
-            <ButtonCloseIcon aria-hidden="true" />
-          </TerminalCloseButton>
         </TerminalRailControls>
       </TerminalVideoPanelHeader>
       <TerminalVideoPanelBody>
@@ -39566,6 +39572,17 @@ function TerminalView({
                     Docs
                   </TerminalDocumentPanelTitle>
                 </TerminalDocumentPanelIdentity>
+                <TerminalRailControls data-rail-row="primary">
+                  <TerminalCloseButton
+                    aria-label="Close Docs panel"
+                    onClick={closeWorkspaceDocumentPanel}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    title="Close Docs panel"
+                    type="button"
+                  >
+                    <ButtonCloseIcon aria-hidden="true" />
+                  </TerminalCloseButton>
+                </TerminalRailControls>
                 <TerminalRailControls data-rail-row="secondary">
                   <PanelAgentPromptActivity
                     items={panelAgentPromptActivityItems.filter((item) => (
@@ -39608,15 +39625,6 @@ function TerminalView({
                       <ButtonFullscreenIcon aria-hidden="true" />
                     )}
                   </TerminalRestartButton>
-                  <TerminalCloseButton
-                    aria-label="Close Docs panel"
-                    onClick={closeWorkspaceDocumentPanel}
-                    onPointerDown={(event) => event.stopPropagation()}
-                    title="Close Docs panel"
-                    type="button"
-                  >
-                    <ButtonCloseIcon aria-hidden="true" />
-                  </TerminalCloseButton>
                 </TerminalRailControls>
               </TerminalDocumentPanelHeader>
               <TerminalDocumentPanelBody>

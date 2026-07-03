@@ -61,6 +61,7 @@ const TERMINAL_WINDOW_FONT_SIZE_STEP = 1;
 const TERMINAL_DRAG_TARGET_EVENT = "forge-terminal-drag-target";
 
 const HostShell = styled.div`
+  container-type: inline-size;
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   width: 100vw;

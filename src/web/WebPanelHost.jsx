@@ -525,6 +525,12 @@ export default function WebPanelHost() {
             </HostIconButton>
           </HostRailIdentity>
 
+          <HostRailControls data-rail-row="primary">
+            <HostCloseButton aria-label="Close" onClick={() => currentWindow.close().catch(() => {})} title="Close" type="button">
+              <ButtonCloseIcon aria-hidden="true" />
+            </HostCloseButton>
+          </HostRailControls>
+
           <HostRailControls data-rail-row="secondary">
             <PanelAgentPromptActivity items={agentPromptActivityItems} />
             <HostIconButton
@@ -559,9 +565,6 @@ export default function WebPanelHost() {
             >
               <OpenInNew aria-hidden="true" />
             </HostIconButton>
-            <HostCloseButton aria-label="Close" onClick={() => currentWindow.close().catch(() => {})} title="Close" type="button">
-              <ButtonCloseIcon aria-hidden="true" />
-            </HostCloseButton>
           </HostRailControls>
         </HostTopRail>
 
@@ -659,6 +662,7 @@ const HostSurface = styled.section`
 const HostChrome = styled.header`
   position: relative;
   z-index: 80;
+  container-type: inline-size;
   display: grid;
   width: 100%;
   min-width: 0;

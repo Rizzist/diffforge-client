@@ -6,6 +6,7 @@ import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { VIDEO_TRANSCRIBE_PROGRESS_EVENT } from "./videoPanelBridge.js";
 import { formatTimecode } from "./videoEditorModel.js";
 import {
+  VideoDangerButton,
   VideoErrorText,
   VideoHint,
   VideoPaneButton,
@@ -139,6 +140,8 @@ const TimeField = styled.input`
   }
 `;
 
+// Auto-grows to fit its content (JS-sized) — a caption row must show ALL of
+// its text at a glance, never hide it behind an inner scroll.
 const SegmentText = styled.textarea`
   width: 100%;
   min-height: 34px;
@@ -153,6 +156,7 @@ const SegmentText = styled.textarea`
   resize: none;
   outline: 0;
   padding: 3px 5px;
+  overflow: hidden;
 
   &:hover,
   &:focus {
@@ -160,6 +164,18 @@ const SegmentText = styled.textarea`
     background: rgba(2, 6, 12, 0.8);
   }
 `;
+
+function autosizeTextarea(element) {
+  if (element) {
+    element.style.height = "auto";
+    element.style.height = `${element.scrollHeight + 2}px`;
+  }
+}
+
+// Client-side progress ceilings per phase: local extraction owns 0-33%, the
+// upload 33-62%, the cloud round-trip 62-94% — the bar keeps crawling toward
+// the ceiling while a phase runs so long waits still read as alive.
+const PHASE_CEILING = { starting: 12, extracting: 33, uploading: 62, transcribing: 94 };
 
 const RowActions = styled.div`
   position: absolute;
@@ -289,6 +305,38 @@ export default function TranscriptPanel({
   const [struckWords, setStruckWords] = useState([]); // [{segIndex, wordIndex}]
   const [transcribing, setTranscribing] = useState(false);
   const [progress, setProgress] = useState(null);
+  const [crawlPercent, setCrawlPercent] = useState(0);
+  const [deleteArmed, setDeleteArmed] = useState(false);
+  const segmentListRef = useRef(null);
+
+  // Two-step delete: first click arms for 3s, second click deletes.
+  useEffect(() => {
+    if (!deleteArmed) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setDeleteArmed(false), 3000);
+    return () => window.clearTimeout(timer);
+  }, [deleteArmed]);
+
+  const deleteTranscript = useCallback(() => {
+    if (!deleteArmed) {
+      setDeleteArmed(true);
+      return;
+    }
+    setDeleteArmed(false);
+    if (!repoPath || !asset?.path) {
+      return;
+    }
+    invoke("video_transcript_delete", { repoPath, path: asset.path })
+      .then(() => {
+        setTranscript(null);
+        setSavedSegments(null);
+        setStruckWords([]);
+        setMode("segments");
+        setError("");
+      })
+      .catch((err) => setError(String(err)));
+  }, [asset?.path, deleteArmed, repoPath]);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [savedNote, setSavedNote] = useState("");
   const assetPathRef = useRef("");
@@ -391,6 +439,35 @@ export default function TranscriptPanel({
       setError(String(err));
     });
   }, [asset?.path, repoPath, transcribing, transcript]);
+
+  // Crawl the bar toward the current phase's ceiling while waiting.
+  useEffect(() => {
+    if (!transcribing) {
+      setCrawlPercent(0);
+      return undefined;
+    }
+    const base = Number(progress?.percent) || 0;
+    setCrawlPercent((current) => Math.max(current, base));
+    const ceiling = PHASE_CEILING[progress?.state] ?? 94;
+    const timer = window.setInterval(() => {
+      setCrawlPercent((current) => Math.min(ceiling, Math.max(current, base) + 0.6));
+    }, 350);
+    return () => window.clearInterval(timer);
+  }, [progress?.percent, progress?.state, transcribing]);
+
+  const displayedPercent = Math.max(Number(progress?.percent) || 0, crawlPercent);
+
+  // Size every segment textarea to its content whenever the list changes.
+  useEffect(() => {
+    if (mode !== "segments") {
+      return;
+    }
+    window.requestAnimationFrame(() => {
+      segmentListRef.current
+        ?.querySelectorAll?.("textarea")
+        ?.forEach?.((element) => autosizeTextarea(element));
+    });
+  }, [mode, transcript]);
 
   const dirty = useMemo(
     () => transcript && savedSegments && !segmentsEqual(transcript.segments, savedSegments),
@@ -558,6 +635,13 @@ export default function TranscriptPanel({
               >
                 Copy
               </VideoSecondaryButton>
+              <VideoDangerButton
+                onClick={deleteTranscript}
+                title="Remove this media's transcript entirely (the media file is untouched)"
+                type="button"
+              >
+                {deleteArmed ? "Really delete?" : "Delete"}
+              </VideoDangerButton>
             </>
           ) : null}
         </ActionRow>
@@ -592,9 +676,16 @@ export default function TranscriptPanel({
         {transcribing && progress ? (
           <div style={{ display: "grid", gap: 3 }}>
             <VideoProgressTrack>
-              <VideoProgressFill style={{ width: `${Math.min(100, Math.max(5, progress.percent || 8))}%` }} />
+              <VideoProgressFill style={{ width: `${Math.min(100, Math.max(5, displayedPercent))}%` }} />
             </VideoProgressTrack>
-            <VideoHint>{progress.state || "working"} — audio is extracted locally, transcribed in your cloud (billed by MB)</VideoHint>
+            <VideoHint>
+              {Math.round(displayedPercent)}% ·{" "}
+              {progress.state === "extracting" || progress.state === "starting"
+                ? "extracting audio locally (ffmpeg → compact MP3)"
+                : progress.state === "uploading"
+                  ? "sending to your cloud over the app websocket"
+                  : "transcribing on the server (Whisper via Deepgram, billed by MB)"}
+            </VideoHint>
           </div>
         ) : null}
         {error ? <VideoErrorText>{error}</VideoErrorText> : null}
@@ -609,7 +700,7 @@ export default function TranscriptPanel({
         </EmptyState>
       ) : null}
       {transcript && mode === "segments" ? (
-        <SegmentList>
+        <SegmentList ref={segmentListRef}>
           {transcript.segments.map((segment, index) => (
             <SegmentRow data-active={activeIndex === index ? "true" : "false"} key={index}>
               <RowActions>
@@ -658,8 +749,12 @@ export default function TranscriptPanel({
                 />
               </SegmentMeta>
               <SegmentText
-                onChange={(event) => updateSegment(index, { text: event.target.value })}
+                onChange={(event) => {
+                  autosizeTextarea(event.target);
+                  updateSegment(index, { text: event.target.value });
+                }}
                 onFocus={() => setActiveIndex(index)}
+                ref={autosizeTextarea}
                 value={segment.text}
               />
             </SegmentRow>

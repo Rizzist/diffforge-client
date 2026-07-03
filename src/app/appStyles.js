@@ -1165,6 +1165,16 @@ export const panelEnter = keyframes`
   }
 `;
 
+export const railContentReveal = keyframes`
+  from {
+    transform: translateY(6px);
+  }
+
+  to {
+    transform: translateY(0);
+  }
+`;
+
 export const workspaceNotificationPing = keyframes`
   0% {
     opacity: 0;
@@ -2555,7 +2565,8 @@ export const RailHeader = styled.div`
   grid-template-columns: minmax(0, 1fr) 24px 24px;
   align-items: center;
   gap: 6px;
-  animation: ${panelEnter} 220ms cubic-bezier(0.2, 0.8, 0.2, 1) 80ms both;
+  opacity: 1;
+  animation: ${railContentReveal} 220ms cubic-bezier(0.2, 0.8, 0.2, 1) 80ms both;
   transition:
     gap 200ms cubic-bezier(0.2, 0.8, 0.2, 1),
     grid-template-columns 220ms cubic-bezier(0.2, 0.8, 0.2, 1);
@@ -2730,8 +2741,8 @@ export const WorkspaceRow = styled.div`
   min-width: 0;
   max-width: 100%;
   align-items: center;
-  opacity: 0;
-  animation: ${panelEnter} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  opacity: 1;
+  animation: ${railContentReveal} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
 
   &:nth-child(1) {
     animation-delay: 110ms;
@@ -3384,7 +3395,8 @@ export const RailFooter = styled.div`
   background:
     linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.04), transparent),
     rgba(7, 9, 13, 0.7);
-  animation: ${panelEnter} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) 220ms both;
+  opacity: 1;
+  animation: ${railContentReveal} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) 220ms both;
   transition:
     background 260ms ease,
     border-color 260ms ease,
@@ -10008,8 +10020,9 @@ export const TerminalClosingOverlay = styled.div`
 export const TerminalRestartPill = styled.div`
   position: relative;
   z-index: 80;
+  container-type: inline-size;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, max-content) minmax(0, 1fr) auto;
   grid-auto-rows: minmax(22px, auto);
   width: 100%;
   max-width: none;
@@ -10031,13 +10044,32 @@ export const TerminalRestartPill = styled.div`
     border-bottom-color: rgba(24, 34, 48, 0.12);
     background: #eef1f5;
   }
+
+  @container (max-width: 520px) {
+    && {
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+    }
+
+    && [data-rail-row="primary"] {
+      grid-column: 2;
+      grid-row: 1;
+    }
+
+    && [data-rail-row="secondary"] {
+      grid-column: 1 / -1;
+      grid-row: 2;
+      width: 100%;
+      justify-self: start;
+    }
+  }
 `;
 
 export const TerminalRailIdentity = styled.span`
   display: inline-flex;
-  grid-column: 1 / -1;
+  grid-column: 1;
   grid-row: 1;
-  min-width: min-content;
+  min-width: 0;
   max-width: 100%;
   align-items: center;
   justify-content: flex-start;
@@ -10066,6 +10098,8 @@ export const TerminalAgentLabel = styled.span`
 
 export const TerminalRailControls = styled.span`
   display: inline-flex;
+  grid-column: 2;
+  grid-row: 1;
   max-width: 100%;
   min-width: 0;
   flex-wrap: wrap;
@@ -10075,15 +10109,15 @@ export const TerminalRailControls = styled.span`
   gap: 2px;
 
   &[data-rail-row="primary"] {
-    grid-column: 2;
-    grid-row: 2;
+    grid-column: 3;
+    grid-row: 1;
     justify-self: end;
     flex-wrap: nowrap;
   }
 
   &[data-rail-row="secondary"] {
-    grid-column: 1;
-    grid-row: 2;
+    grid-column: 2;
+    grid-row: 1;
     justify-self: start;
   }
 `;

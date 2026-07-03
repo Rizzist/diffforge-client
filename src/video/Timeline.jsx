@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { Add } from "@styled-icons/material-rounded/Add";
@@ -92,6 +93,8 @@ const TimelineRoot = styled.div`
 
 const TimelineToolbar = styled.div`
   display: flex;
+  user-select: none;
+  -webkit-user-select: none;
   align-items: center;
   gap: 2px;
   padding: 2px 6px;
@@ -184,6 +187,8 @@ const TimelineCanvas = styled.div`
 
 const RulerRow = styled.div`
   position: sticky;
+  user-select: none;
+  -webkit-user-select: none;
   top: 0;
   z-index: 6;
   display: flex;
@@ -234,6 +239,8 @@ const TrackRow = styled.div`
 
 const TrackLabelRail = styled.div`
   position: sticky;
+  user-select: none;
+  -webkit-user-select: none;
   left: 0;
   z-index: 5;
   width: ${LABEL_RAIL_WIDTH}px;
@@ -877,16 +884,29 @@ export default function Timeline({
           const proposedEdge = drag.originStartMs + deltaMs;
           const snappedEdge = snapMs(proposedEdge, snapPoints, snapThresholdMs);
           setSnapLineMs(snappedEdge !== Math.round(proposedEdge) ? snappedEdge : null);
-          next = rippleMode
-            ? rippleTrim(project, drag.clipId, "start", snappedEdge - drag.originStartMs)
-            : trimClipStart(project, drag.clipId, snappedEdge - drag.originStartMs);
+          const trimDelta = snappedEdge - drag.originStartMs;
+          if (rippleMode) {
+            next = rippleTrim(project, drag.clipId, "start", trimDelta);
+          } else {
+            // Linked partners trim in lockstep so A/V stays in sync.
+            next = project;
+            for (const id of drag.groupIds) {
+              next = trimClipStart(next, id, trimDelta);
+            }
+          }
         } else if (drag.mode === "trim-end") {
           const proposedEdge = drag.originEndMs + deltaMs;
           const snappedEdge = snapMs(proposedEdge, snapPoints, snapThresholdMs);
           setSnapLineMs(snappedEdge !== Math.round(proposedEdge) ? snappedEdge : null);
-          next = rippleMode
-            ? rippleTrim(project, drag.clipId, "end", snappedEdge - drag.originEndMs)
-            : trimClipEnd(project, drag.clipId, snappedEdge - drag.originEndMs);
+          const trimDelta = snappedEdge - drag.originEndMs;
+          if (rippleMode) {
+            next = rippleTrim(project, drag.clipId, "end", trimDelta);
+          } else {
+            next = project;
+            for (const id of drag.groupIds) {
+              next = trimClipEnd(next, id, trimDelta);
+            }
+          }
         }
         drag.latest = next;
         onChange?.(next, { transient: true });
@@ -1495,7 +1515,7 @@ export default function Timeline({
           <Playhead style={{ left: `${LABEL_RAIL_WIDTH + playheadMs * pxPerMs}px` }} />
         </TimelineCanvas>
       </TimelineScroller>
-      {marquee ? (
+      {marquee ? createPortal(
         <MarqueeRect
           style={{
             left: `${marquee.x0}px`,
@@ -1504,6 +1524,7 @@ export default function Timeline({
             height: `${marquee.y1 - marquee.y0}px`,
           }}
         />
+        ,document.body,
       ) : null}
       {selected ? (
         <InspectorPopover data-video-clip-inspector="true">

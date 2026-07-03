@@ -26442,6 +26442,37 @@ export default function App() {
   }, [animateWorkspaceRailWidth, workspaceRailCollapsed]);
 
   useEffect(() => {
+    if (workspaceRailCollapsed || typeof window === "undefined") {
+      return undefined;
+    }
+
+    const repairExpandedRail = () => {
+      const shell = dashboardShellRef.current;
+      if (!shell) {
+        return;
+      }
+      window.cancelAnimationFrame(workspaceRailAnimationFrameRef.current);
+      workspaceRailAnimationFrameRef.current = 0;
+      shell.style.removeProperty("--workspace-rail-current-width");
+    };
+    const handleVisibilityChange = () => {
+      if (!document.hidden) {
+        repairExpandedRail();
+      }
+    };
+    const repairTimer = window.setTimeout(repairExpandedRail, WORKSPACE_RAIL_ANIMATION_MS + 80);
+
+    window.addEventListener("focus", repairExpandedRail);
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+
+    return () => {
+      window.clearTimeout(repairTimer);
+      window.removeEventListener("focus", repairExpandedRail);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+    };
+  }, [workspaceRailCollapsed]);
+
+  useEffect(() => {
     const platform = getWindowControlPlatform();
 
     document.documentElement.dataset.windowPlatform = platform;
