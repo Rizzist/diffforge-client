@@ -98,6 +98,7 @@ export default function ExportPanel({ ffmpegReady = false, project, projectPath 
   const [job, setJob] = useState(null);
   const [error, setError] = useState("");
   const ownJobIdRef = useRef("");
+  const [agentJob, setAgentJob] = useState(null); // exports started by agents (MCP)
 
   useEffect(() => {
     if (preset === "project") {
@@ -123,10 +124,22 @@ export default function ExportPanel({ ffmpegReady = false, project, projectPath 
         return;
       }
       const payload = event?.payload;
-      if (!payload?.jobId || payload.jobId !== ownJobIdRef.current) {
+      if (!payload?.jobId) {
         return;
       }
-      setJob(payload);
+      if (payload.jobId === ownJobIdRef.current) {
+        setJob(payload);
+        return;
+      }
+      // Agent/MCP-started exports show as a read-only status row — never
+      // adopted as our own job (that caused cross-adoption bugs before).
+      // Only for this workspace (payload.repoPath added for MCP exports).
+      const payloadRepo = String(payload.repoPath || "").replace(/[\\/]+$/, "");
+      const ownRepo = String(repoPath || "").replace(/[\\/]+$/, "");
+      if (payloadRepo && ownRepo && payloadRepo !== ownRepo) {
+        return;
+      }
+      setAgentJob(payload);
     })
       .then((next) => {
         if (disposed) {
@@ -140,7 +153,16 @@ export default function ExportPanel({ ffmpegReady = false, project, projectPath 
       disposed = true;
       unlisten();
     };
-  }, []);
+  }, [repoPath]);
+
+  // Settled agent-export rows clear themselves after a short beat.
+  useEffect(() => {
+    if (!agentJob?.done) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setAgentJob(null), 12000);
+    return () => window.clearTimeout(timer);
+  }, [agentJob]);
 
   const startExport = useCallback(async () => {
     setError("");
@@ -188,6 +210,15 @@ export default function ExportPanel({ ffmpegReady = false, project, projectPath 
       </VideoHint>
       {!ffmpegReady ? (
         <VideoErrorText>ffmpeg is not installed — use the Install chip in the top bar first.</VideoErrorText>
+      ) : null}
+      {agentJob ? (
+        <VideoHint>
+          {agentJob.done && !agentJob.error
+            ? `✨ Agent export finished${agentJob.outputPath ? `: ${agentJob.outputPath}` : ""}`
+            : agentJob.error
+              ? `✨ Agent export failed: ${agentJob.error}`
+              : `✨ Agent export running… ${Math.round(agentJob.percent || 0)}%`}
+        </VideoHint>
       ) : null}
       <PresetRow>
         {SIZE_PRESETS.map((entry) => (
@@ -295,7 +326,18 @@ export default function ExportPanel({ ffmpegReady = false, project, projectPath 
           <DoneRow>
             ✓ Exported
             {job.outputPath ? (
-              <VideoSecondaryButton onClick={() => revealItemInDir(job.outputPath).catch(() => {})} type="button">
+              <VideoSecondaryButton
+                onClick={() => {
+                  // outputPath may be repo-relative (shared job registry with
+                  // agent/MCP exports) or absolute (legacy) — resolve both.
+                  const raw = String(job.outputPath || "");
+                  const abs = /^([A-Za-z]:[\\/]|\/)/.test(raw)
+                    ? raw
+                    : `${String(repoPath || "").replace(/[\\/]+$/, "")}/${raw}`;
+                  revealItemInDir(abs).catch(() => {});
+                }}
+                type="button"
+              >
                 Show in folder
               </VideoSecondaryButton>
             ) : null}

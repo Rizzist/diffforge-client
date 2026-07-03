@@ -271,6 +271,25 @@ export default function PanelAgentPromptComposer({
   const [prompt, setPrompt] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState("");
+  // Video panes transcribe missing media before submitting; the pane
+  // broadcasts progress so the composer can say why it's busy.
+  const [prepHint, setPrepHint] = useState("");
+  useEffect(() => {
+    if (panelKind !== "video") {
+      return undefined;
+    }
+    const onPrep = (event) => {
+      const detail = event?.detail || {};
+      if (detail.phase === "transcribing") {
+        const count = Number(detail.count) || 0;
+        setPrepHint(`Transcribing ${count} clip${count === 1 ? "" : "s"} for context…`);
+      } else {
+        setPrepHint("");
+      }
+    };
+    window.addEventListener("diffforge-video-agent-prep", onPrep);
+    return () => window.removeEventListener("diffforge-video-agent-prep", onPrep);
+  }, [panelKind]);
   const inputRef = useRef(null);
   const targetSignature = useMemo(
     () => (Array.isArray(targets) ? targets : []).map((target) => target.id).join("|"),
@@ -461,6 +480,7 @@ export default function PanelAgentPromptComposer({
         </SendButton>
       </ComposerFooter>
       {error ? <ComposerError role="alert">{error}</ComposerError> : null}
+      {prepHint && submitting ? <ComposerPrepHint>{prepHint}</ComposerPrepHint> : null}
     </ComposerShell>
   );
 }
@@ -766,5 +786,15 @@ const ComposerError = styled.div`
   color: #fca5a5;
   font-size: 11px;
   font-weight: 760;
+  line-height: 1.3;
+`;
+
+const ComposerPrepHint = styled.div`
+  grid-column: 1 / -1;
+  min-width: 0;
+  padding: 0 12px 2px;
+  color: #93c5fd;
+  font-size: 10.5px;
+  font-weight: 650;
   line-height: 1.3;
 `;

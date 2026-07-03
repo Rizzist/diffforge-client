@@ -2,6 +2,12 @@ const APP_CONTROL_MCP_REQUEST_EVENT: &str = "forge-app-control-mcp-request";
 const APP_CONTROL_MCP_SERVER_NAME: &str = "diffforge-app-control";
 const APP_CONTROL_MCP_TIMEOUT_MS: u64 = 20_000;
 const APP_CONTROL_MCP_SCRIPT_RUN_TIMEOUT_MS: u64 = 60 * 60 * 1000;
+const APP_CONTROL_MCP_BRIDGE_READ_TIMEOUT_MS: u64 = 15_000;
+const APP_CONTROL_MCP_BRIDGE_MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
+const DIFFFORGE_APP_BRIDGE_ENDPOINT_ENV: &str = "DIFFFORGE_APP_BRIDGE_ENDPOINT";
+const DIFFFORGE_APP_BRIDGE_TOKEN_ENV: &str = "DIFFFORGE_APP_BRIDGE_TOKEN";
+const VIDEO_MCP_NO_WORKSPACE_MESSAGE: &str =
+    "No video workspace here — open a Video Editor pane (media/ folder) first.";
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -12,10 +18,11 @@ struct AppControlMcpEndpoint {
     url: String,
 }
 
+#[derive(Clone)]
 struct AppControlMcpState {
     endpoint: Arc<StdMutex<Option<AppControlMcpEndpoint>>>,
     pending: Arc<StdMutex<HashMap<String, oneshot::Sender<Value>>>>,
-    next_request_id: AtomicU64,
+    next_request_id: Arc<AtomicU64>,
 }
 
 impl AppControlMcpState {
@@ -23,7 +30,7 @@ impl AppControlMcpState {
         Self {
             endpoint: Arc::new(StdMutex::new(None)),
             pending: Arc::new(StdMutex::new(HashMap::new())),
-            next_request_id: AtomicU64::new(1),
+            next_request_id: Arc::new(AtomicU64::new(1)),
         }
     }
 }
@@ -61,6 +68,7 @@ async fn app_control_mcp_endpoint_for_state(
 ) -> Result<AppControlMcpEndpoint, String> {
     if let Ok(endpoint) = state.endpoint.lock() {
         if let Some(endpoint) = endpoint.clone() {
+            publish_app_control_mcp_bridge_env(&endpoint);
             return Ok(endpoint);
         }
     } else {
@@ -93,7 +101,20 @@ async fn app_control_mcp_endpoint_for_state(
     }
 
     spawn_app_control_mcp_bridge_listener(app, state, listener, endpoint.token.clone());
+    publish_app_control_mcp_bridge_env(&endpoint);
     Ok(endpoint)
+}
+
+fn app_control_mcp_bridge_endpoint_text(endpoint: &AppControlMcpEndpoint) -> String {
+    format!("{}:{}", endpoint.host, endpoint.port)
+}
+
+fn publish_app_control_mcp_bridge_env(endpoint: &AppControlMcpEndpoint) {
+    env::set_var(
+        DIFFFORGE_APP_BRIDGE_ENDPOINT_ENV,
+        app_control_mcp_bridge_endpoint_text(endpoint),
+    );
+    env::set_var(DIFFFORGE_APP_BRIDGE_TOKEN_ENV, &endpoint.token);
 }
 
 fn app_control_mcp_command() -> String {
@@ -120,8 +141,7 @@ fn spawn_app_control_mcp_bridge_listener(
     expected_token: String,
 ) {
     let pending = Arc::clone(&state.pending);
-    let request_counter = state.next_request_id.load(Ordering::Relaxed);
-    let counter = Arc::new(AtomicU64::new(request_counter));
+    let counter = Arc::clone(&state.next_request_id);
     tauri::async_runtime::spawn(async move {
         loop {
             let Ok((stream, _addr)) = listener.accept().await else {
@@ -155,15 +175,28 @@ async fn handle_app_control_mcp_bridge_connection(
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 4096];
     loop {
-        let read = stream
-            .read(&mut chunk)
-            .await
-            .map_err(|error| format!("Unable to read app-control MCP bridge request: {error}"))?;
+        let read = match timeout(
+            Duration::from_millis(APP_CONTROL_MCP_BRIDGE_READ_TIMEOUT_MS),
+            stream.read(&mut chunk),
+        )
+        .await
+        {
+            Ok(Ok(read)) => read,
+            Ok(Err(error)) => {
+                return Err(format!(
+                    "Unable to read app-control MCP bridge request: {error}"
+                ));
+            }
+            Err(_) => return Ok(()),
+        };
         if read == 0 {
             break;
         }
         bytes.extend_from_slice(&chunk[..read]);
-        if bytes.contains(&b'\n') || bytes.len() > 1024 * 1024 {
+        if bytes.len() > APP_CONTROL_MCP_BRIDGE_MAX_REQUEST_BYTES {
+            return Ok(());
+        }
+        if bytes.contains(&b'\n') {
             break;
         }
     }
@@ -273,6 +306,28 @@ async fn handle_app_control_mcp_bridge_connection(
         return Ok(());
     }
 
+    if matches!(
+        request.tool.as_str(),
+        "video_context"
+            | "video_edit"
+            | "video_transcribe"
+            | "video_look"
+            | "video_media"
+            | "video_generate"
+            | "video_export"
+    ) {
+        let response = handle_app_control_mcp_video_tool(
+            app.clone(),
+            Arc::clone(&pending),
+            Arc::clone(&counter),
+            request.tool.as_str(),
+            request.input,
+        )
+        .await;
+        write_app_control_mcp_bridge_response(&mut stream, response).await?;
+        return Ok(());
+    }
+
     let request_id = format!(
         "app-control-mcp-{}",
         counter.fetch_add(1, Ordering::Relaxed)
@@ -332,6 +387,450 @@ async fn handle_app_control_mcp_bridge_connection(
         }
     };
     write_app_control_mcp_bridge_response(&mut stream, response).await
+}
+
+async fn app_control_mcp_ui_tool_request(
+    app: AppHandle,
+    pending: Arc<StdMutex<HashMap<String, oneshot::Sender<Value>>>>,
+    counter: Arc<AtomicU64>,
+    tool: &str,
+    input: Value,
+) -> Result<Value, String> {
+    let request_id = format!(
+        "app-control-mcp-{}",
+        counter.fetch_add(1, Ordering::Relaxed)
+    );
+    let (sender, receiver) = oneshot::channel();
+    pending
+        .lock()
+        .map_err(|_| "Unable to lock app-control MCP pending map.".to_string())?
+        .insert(request_id.clone(), sender);
+
+    let emit_result = app.emit(
+        APP_CONTROL_MCP_REQUEST_EVENT,
+        json!({
+            "requestId": request_id,
+            "tool": tool,
+            "input": input,
+        }),
+    );
+    if let Err(error) = emit_result {
+        let _ = pending
+            .lock()
+            .map_err(|_| "Unable to lock app-control MCP pending map.".to_string())?
+            .remove(&request_id);
+        return Err(format!(
+            "Unable to send app-control MCP request to the UI: {error}"
+        ));
+    }
+
+    let ui_timeout_ms = app_control_mcp_tool_timeout_ms(tool);
+    match timeout(Duration::from_millis(ui_timeout_ms), receiver).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err("The app-control MCP reply was cancelled.".to_string()),
+        Err(_) => {
+            let _ = pending
+                .lock()
+                .map_err(|_| "Unable to lock app-control MCP pending map.".to_string())?
+                .remove(&request_id);
+            Err("Timed out waiting for the app UI to handle the MCP request.".to_string())
+        }
+    }
+}
+
+fn app_control_mcp_input_text(input: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| input.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn app_control_mcp_state_workspace_root(state: &Value, key: &str) -> Option<String> {
+    state
+        .get(key)
+        .and_then(|workspace| workspace.get("rootDirectory"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn app_control_mcp_repo_path_from_state_response(response: &Value) -> Option<String> {
+    let state = response.get("data").unwrap_or(response);
+    app_control_mcp_state_workspace_root(state, "selectedWorkspace")
+        .or_else(|| app_control_mcp_state_workspace_root(state, "activatedWorkspace"))
+        .or_else(|| {
+            state
+                .get("workspaces")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|workspace| {
+                    workspace.get("selected").and_then(Value::as_bool) == Some(true)
+                        || workspace.get("active").and_then(Value::as_bool) == Some(true)
+                })
+                .find_map(|workspace| {
+                    workspace
+                        .get("rootDirectory")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                })
+        })
+}
+
+async fn app_control_mcp_resolve_video_repo_path(
+    app: AppHandle,
+    pending: Arc<StdMutex<HashMap<String, oneshot::Sender<Value>>>>,
+    counter: Arc<AtomicU64>,
+    input: &Value,
+) -> Result<String, String> {
+    if let Some(repo_path) = app_control_mcp_input_text(input, &["repoPath", "repo_path"]) {
+        return Ok(repo_path);
+    }
+
+    let state =
+        app_control_mcp_ui_tool_request(app, pending, counter, "get_state", json!({})).await?;
+    app_control_mcp_repo_path_from_state_response(&state).ok_or_else(|| {
+        "No workspace repo path is active. Pass repoPath or select a workspace.".to_string()
+    })
+}
+
+fn app_control_mcp_json_error(code: &str, message: impl Into<String>) -> Value {
+    json!({
+        "ok": false,
+        "error": {
+            "code": code,
+            "message": message.into(),
+        },
+    })
+}
+
+fn app_control_mcp_present(input: &Value, keys: &[&str]) -> bool {
+    keys.iter()
+        .any(|key| input.get(*key).is_some_and(|value| !value.is_null()))
+}
+
+fn app_control_mcp_video_look_times(input: &Value) -> Result<Vec<u64>, String> {
+    let has_at = app_control_mcp_present(input, &["atMs", "at_ms"]);
+    let has_times = app_control_mcp_present(input, &["timesMs", "times_ms"]);
+    let has_range = app_control_mcp_present(input, &["range"]);
+    if [has_at, has_times, has_range]
+        .into_iter()
+        .filter(|present| *present)
+        .count()
+        != 1
+    {
+        return Err("Pass exactly one of atMs, timesMs, or range.".to_string());
+    }
+    if has_at {
+        let at_ms = input
+            .get("atMs")
+            .or_else(|| input.get("at_ms"))
+            .and_then(video_mcp_value_u64)
+            .ok_or_else(|| "atMs must be a non-negative number.".to_string())?;
+        return Ok(vec![at_ms]);
+    }
+    if has_times {
+        let values = input
+            .get("timesMs")
+            .or_else(|| input.get("times_ms"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| "timesMs must be an array.".to_string())?;
+        let mut times = Vec::new();
+        for value in values {
+            times.push(
+                video_mcp_value_u64(value)
+                    .ok_or_else(|| "timesMs entries must be non-negative numbers.".to_string())?,
+            );
+        }
+        if times.is_empty() {
+            return Err("timesMs must include at least one timestamp.".to_string());
+        }
+        return Ok(times);
+    }
+    let range = input
+        .get("range")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "range must be an object.".to_string())?;
+    let start_ms = range
+        .get("startMs")
+        .or_else(|| range.get("start_ms"))
+        .and_then(video_mcp_value_u64)
+        .ok_or_else(|| "range.startMs is required.".to_string())?;
+    let end_ms = range
+        .get("endMs")
+        .or_else(|| range.get("end_ms"))
+        .and_then(video_mcp_value_u64)
+        .ok_or_else(|| "range.endMs is required.".to_string())?;
+    let frames = range
+        .get("frames")
+        .and_then(video_mcp_value_u64)
+        .unwrap_or(2)
+        .clamp(2, VIDEO_MCP_LOOK_MAX_FRAMES as u64) as usize;
+    let from = start_ms.min(end_ms);
+    let to = start_ms.max(end_ms);
+    if frames == 1 || from == to {
+        return Ok(vec![from]);
+    }
+    Ok((0..frames)
+        .map(|index| {
+            let ratio = index as f64 / (frames.saturating_sub(1)) as f64;
+            from.saturating_add(((to - from) as f64 * ratio).round() as u64)
+        })
+        .collect())
+}
+
+// Compact per-tool detail for the pane's Agent activity feed. Keep tiny —
+// the feed renders icons, not payloads.
+fn app_control_mcp_video_activity_detail(tool: &str, input: &Value) -> Value {
+    match tool {
+        "video_context" => json!({ "include": input.get("include").cloned().unwrap_or(Value::Null) }),
+        "video_edit" => {
+            let ops = input.get("ops").and_then(Value::as_array);
+            let kinds: Vec<String> = ops
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|op| op.get("op").and_then(Value::as_str))
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            json!({ "ops": kinds.len(), "opKinds": kinds })
+        }
+        "video_look" => json!({
+            "atMs": input.get("atMs").cloned().unwrap_or(Value::Null),
+            "timesMs": input.get("timesMs").cloned().unwrap_or(Value::Null),
+            "range": input.get("range").cloned().unwrap_or(Value::Null),
+        }),
+        "video_media" => json!({
+            "action": input.get("action").cloned().unwrap_or(Value::Null),
+            "query": input.get("query").cloned().unwrap_or(Value::Null),
+        }),
+        "video_generate" => json!({
+            "action": input.get("action").cloned().unwrap_or(Value::Null),
+            "model": input.get("model").cloned().unwrap_or(Value::Null),
+        }),
+        "video_export" => json!({ "action": input.get("action").cloned().unwrap_or(Value::Null) }),
+        "video_transcribe" => json!({
+            "paths": input.get("paths").cloned().unwrap_or(Value::Null),
+            "scope": input.get("scope").cloned().unwrap_or(Value::Null),
+        }),
+        _ => Value::Null,
+    }
+}
+
+// Result fragments worth surfacing in the feed (job ids, edit summaries,
+// transcript statuses) — never full payloads (look frames are megabytes).
+fn app_control_mcp_video_activity_result(tool: &str, result: &Value) -> Value {
+    let data = result.get("data");
+    match (tool, data) {
+        ("video_edit", Some(data)) => json!({
+            "summary": data.get("summary").cloned().unwrap_or(Value::Null),
+            "changedClipIds": data.get("changedClipIds").cloned().unwrap_or(Value::Null),
+        }),
+        ("video_generate", Some(data)) => json!({
+            "jobId": data.get("jobId").cloned().unwrap_or(Value::Null),
+        }),
+        ("video_export", Some(data)) => json!({
+            "jobId": data.get("jobId").cloned().unwrap_or(Value::Null),
+            "outputPath": data.get("outputPath").cloned().unwrap_or(Value::Null),
+        }),
+        ("video_transcribe", Some(data)) => json!({
+            "results": data
+                .get("results")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .map(|item| {
+                            json!({
+                                "assetPath": item.get("assetPath").cloned().unwrap_or(Value::Null),
+                                "status": item.get("status").cloned().unwrap_or(Value::Null),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default(),
+        }),
+        ("video_media", Some(data)) => json!({
+            "moments": data.get("moments").and_then(Value::as_array).map(|m| m.len()),
+            "assets": data.get("assets").and_then(Value::as_array).map(|a| a.len()),
+        }),
+        ("video_look", Some(data)) => json!({
+            "frames": data.get("frames").and_then(Value::as_array).map(|f| f.len()),
+        }),
+        _ => Value::Null,
+    }
+}
+
+async fn handle_app_control_mcp_video_tool(
+    app: AppHandle,
+    pending: Arc<StdMutex<HashMap<String, oneshot::Sender<Value>>>>,
+    counter: Arc<AtomicU64>,
+    tool: &str,
+    input: Value,
+) -> Value {
+    let repo_path = match app_control_mcp_resolve_video_repo_path(
+        app.clone(),
+        pending,
+        counter,
+        &input,
+    )
+    .await
+    {
+        Ok(repo_path) => repo_path,
+        Err(error) => return app_control_mcp_json_error("repo_path_required", error),
+    };
+    if !video_workspace_has_media(&repo_path) {
+        return app_control_mcp_json_error("no_video_workspace", VIDEO_MCP_NO_WORKSPACE_MESSAGE);
+    }
+
+    // Every agent tool call is mirrored to the pane's Agent activity feed:
+    // one start event, one done/error event, matched by id.
+    let activity_id = format!("mcp-{}", uuid::Uuid::new_v4().simple());
+    let start_detail = app_control_mcp_video_activity_detail(tool, &input);
+    let _ = app.emit(
+        "video-agent-activity",
+        json!({
+            "id": activity_id,
+            "tool": tool,
+            "repoPath": repo_path,
+            "phase": "start",
+            "detail": start_detail,
+        }),
+    );
+
+    let result = handle_app_control_mcp_video_tool_inner(app.clone(), repo_path.clone(), tool, input).await;
+
+    let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
+    let error_message = result
+        .get("error")
+        .and_then(|error| error.get("message"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let _ = app.emit(
+        "video-agent-activity",
+        json!({
+            "id": activity_id,
+            "tool": tool,
+            "repoPath": repo_path,
+            "phase": if ok { "done" } else { "error" },
+            "error": error_message,
+            "result": app_control_mcp_video_activity_result(tool, &result),
+        }),
+    );
+    result
+}
+
+async fn handle_app_control_mcp_video_tool_inner(
+    app: AppHandle,
+    repo_path: String,
+    tool: &str,
+    input: Value,
+) -> Value {
+    match tool {
+        "video_context" => {
+            let include = input
+                .get("include")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .filter(|items| !items.is_empty())
+                .unwrap_or_else(|| {
+                    ["timeline", "selection", "transcripts", "jobs"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                });
+            match video_mcp_context(app, repo_path, include).await {
+                Ok(data) => json!({"ok": true, "data": data}),
+                Err(error) => app_control_mcp_json_error("video_context_failed", error),
+            }
+        }
+        "video_edit" => {
+            let project_path = app_control_mcp_input_text(&input, &["projectPath", "project_path"]);
+            let ops = input.get("ops").cloned().unwrap_or_else(|| json!([]));
+            let include_pipe = input
+                .get("includePipe")
+                .or_else(|| input.get("include_pipe"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            match video_mcp_edit(app, repo_path, project_path, ops, include_pipe).await {
+                Ok(data) => json!({"ok": true, "data": data}),
+                Err(error) => app_control_mcp_json_error("video_edit_failed", error),
+            }
+        }
+        "video_look" => {
+            let project_path = app_control_mcp_input_text(&input, &["projectPath", "project_path"]);
+            let times_ms = match app_control_mcp_video_look_times(&input) {
+                Ok(times_ms) => times_ms,
+                Err(error) => return app_control_mcp_json_error("video_look_bad_input", error),
+            };
+            match video_mcp_look(app, repo_path, project_path, times_ms).await {
+                Ok(data) => json!({"ok": true, "data": data}),
+                Err(error) => app_control_mcp_json_error("video_look_failed", error),
+            }
+        }
+        "video_media" => match video_mcp_media(app, repo_path, input).await {
+            Ok(data) => json!({"ok": true, "data": data}),
+            Err(error) => app_control_mcp_json_error("video_media_failed", error),
+        },
+        "video_generate" => match video_mcp_generate(app, repo_path, input).await {
+            Ok(data) => json!({"ok": true, "data": data}),
+            Err(error) => app_control_mcp_json_error("video_generate_failed", error),
+        },
+        "video_export" => match video_mcp_export(app, repo_path, input).await {
+            Ok(data) => json!({"ok": true, "data": data}),
+            Err(error) => app_control_mcp_json_error("video_export_failed", error),
+        },
+        "video_transcribe" => {
+            let paths = input
+                .get("paths")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToOwned::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let scope_selection = input
+                .get("scope")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .is_some_and(|scope| scope.eq_ignore_ascii_case("selection"));
+            let wait = input.get("wait").and_then(Value::as_bool).unwrap_or(true);
+            let from_ms = input
+                .get("fromMs")
+                .or_else(|| input.get("from_ms"))
+                .and_then(Value::as_u64);
+            let to_ms = input
+                .get("toMs")
+                .or_else(|| input.get("to_ms"))
+                .and_then(Value::as_u64);
+            match video_mcp_transcribe(app, repo_path, paths, scope_selection, wait, from_ms, to_ms)
+                .await
+            {
+                Ok(data) => json!({"ok": true, "data": data}),
+                Err(error) => app_control_mcp_json_error("video_transcribe_failed", error),
+            }
+        }
+        _ => app_control_mcp_json_error("unknown_tool", format!("Unknown video tool: {tool}")),
+    }
 }
 
 async fn write_app_control_mcp_bridge_response(
@@ -1495,14 +1994,33 @@ fn app_control_mcp_forward_to_app(
     tool: &str,
     input: Value,
 ) -> Result<Value, String> {
-    let mut stream = std::net::TcpStream::connect(context.endpoint.trim())
+    app_control_mcp_forward_bridge_request(
+        &context.endpoint,
+        &context.token,
+        tool,
+        input,
+        app_control_mcp_tool_timeout_ms(tool).saturating_add(1000),
+    )
+}
+
+pub(crate) fn app_control_mcp_forward_bridge_request(
+    endpoint: &str,
+    token: &str,
+    tool: &str,
+    input: Value,
+    timeout_ms: u64,
+) -> Result<Value, String> {
+    let endpoint = endpoint
+        .trim()
+        .strip_prefix("tcp://")
+        .unwrap_or_else(|| endpoint.trim());
+    let mut stream = std::net::TcpStream::connect(endpoint)
         .map_err(|error| format!("Unable to connect to app-control bridge: {error}"))?;
-    let bridge_timeout_ms = app_control_mcp_tool_timeout_ms(tool).saturating_add(1000);
-    let timeout_duration = Duration::from_millis(bridge_timeout_ms);
+    let timeout_duration = Duration::from_millis(timeout_ms);
     let _ = stream.set_read_timeout(Some(timeout_duration));
     let _ = stream.set_write_timeout(Some(timeout_duration));
     let mut request = json!({
-        "token": context.token,
+        "token": token,
         "tool": tool,
         "input": input,
     })
@@ -1523,7 +2041,15 @@ fn app_control_mcp_forward_to_app(
 }
 
 fn app_control_mcp_tool_timeout_ms(tool: &str) -> u64 {
-    if tool == "run_local_script" || tool == "upload_asset" || tool == "download_asset" {
+    if matches!(
+        tool,
+        "run_local_script"
+            | "upload_asset"
+            | "download_asset"
+            | "video_transcribe"
+            | "video_look"
+            | "video_media"
+    ) {
         APP_CONTROL_MCP_SCRIPT_RUN_TIMEOUT_MS
     } else {
         APP_CONTROL_MCP_TIMEOUT_MS

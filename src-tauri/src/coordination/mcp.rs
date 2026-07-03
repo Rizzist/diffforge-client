@@ -1,25 +1,25 @@
 use std::{
     collections::HashMap,
-    fs,
+    env, fs,
     io::{self, BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::mpsc,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use super::{
-    db::{coordination_daemon_info_path, REPO_ID},
-    kernel::{api_error, api_ok, CoordinationKernel, EventRefs},
+    db::{REPO_ID, coordination_daemon_info_path},
+    kernel::{CoordinationKernel, EventRefs, api_error, api_ok},
 };
 
 pub const TOOL_NAMES: &[&str] = &[
@@ -64,7 +64,28 @@ const WORKSPACE_GATEWAY_BUILTIN_TOOLS: &[&str] = &[
     "secrets__list",
     "secrets__get",
     "secrets__write_env_file",
+    "video_context",
+    "video_edit",
+    "video_transcribe",
+    "video_look",
+    "video_media",
+    "video_generate",
+    "video_export",
 ];
+const WORKSPACE_GATEWAY_VIDEO_TOOLS: &[&str] = &[
+    "video_context",
+    "video_edit",
+    "video_transcribe",
+    "video_look",
+    "video_media",
+    "video_generate",
+    "video_export",
+];
+const DIFFFORGE_APP_BRIDGE_ENDPOINT_ENV: &str = "DIFFFORGE_APP_BRIDGE_ENDPOINT";
+const DIFFFORGE_APP_BRIDGE_TOKEN_ENV: &str = "DIFFFORGE_APP_BRIDGE_TOKEN";
+const WORKSPACE_GATEWAY_VIDEO_NO_WORKSPACE_MESSAGE: &str =
+    "No video workspace here — open a Video Editor pane (media/ folder) first.";
+const WORKSPACE_GATEWAY_VIDEO_BRIDGE_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 const WORKSPACE_MCP_EXPOSURE_LAZY: &str = "lazy";
 const WORKSPACE_MCP_EXPOSURE_PINNED: &str = "pinned";
 const WORKSPACE_MCP_EXPOSURE_HIDDEN: &str = "hidden";
@@ -879,27 +900,53 @@ pub fn run_workspace_gateway_stdio_server(context: McpContext) -> Result<(), Str
 
     let stdin = io::stdin();
     let mut reader = io::BufReader::new(stdin.lock());
-    let mut stdout = io::stdout();
+    let stdout = Arc::new(StdMutex::new(io::stdout()));
 
     while let Some(read_result) = read_rpc_message(&mut reader)? {
         let (request, transport) = match read_result {
             Ok(value) => value,
             Err((transport, message)) => {
+                let mut stdout = stdout
+                    .lock()
+                    .map_err(|_| "Unable to lock MCP stdout.".to_string())?;
                 write_rpc_response(
-                    &mut stdout,
+                    &mut *stdout,
                     transport,
                     &json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":message}}),
                 )?;
                 continue;
             }
         };
+        if workspace_gateway_request_is_video_tool_call(&request) {
+            let context = context.clone();
+            let stdout = Arc::clone(&stdout);
+            thread::spawn(move || {
+                let response = handle_workspace_gateway_json_rpc(&context, request);
+                if !response.is_null() {
+                    if let Ok(mut stdout) = stdout.lock() {
+                        let _ = write_rpc_response(&mut *stdout, transport, &response);
+                    }
+                }
+            });
+            continue;
+        }
         let response = handle_workspace_gateway_json_rpc(&context, request);
         if !response.is_null() {
-            write_rpc_response(&mut stdout, transport, &response)?;
+            let mut stdout = stdout
+                .lock()
+                .map_err(|_| "Unable to lock MCP stdout.".to_string())?;
+            write_rpc_response(&mut *stdout, transport, &response)?;
         }
     }
 
     Ok(())
+}
+
+fn workspace_gateway_request_is_video_tool_call(request: &Value) -> bool {
+    request["method"].as_str() == Some("tools/call")
+        && request["params"]["name"]
+            .as_str()
+            .is_some_and(workspace_gateway_is_video_tool)
 }
 
 fn handle_workspace_gateway_json_rpc(context: &McpContext, request: Value) -> Value {
@@ -970,9 +1017,13 @@ fn handle_workspace_gateway_json_rpc(context: &McpContext, request: Value) -> Va
 
 fn workspace_gateway_tools(context: &McpContext) -> Vec<Value> {
     let secrets_enabled = workspace_gateway_secrets_enabled(context);
+    let video_enabled = workspace_gateway_video_tools_enabled(context);
     let mut tools = WORKSPACE_GATEWAY_BUILTIN_TOOLS
         .iter()
-        .filter(|name| secrets_enabled || !name.starts_with("secrets__"))
+        .filter(|name| {
+            (secrets_enabled || !name.starts_with("secrets__"))
+                && (video_enabled || !workspace_gateway_is_video_tool(name))
+        })
         .map(|name| {
             json!({
                 "name": name,
@@ -1061,12 +1112,99 @@ fn workspace_gateway_secrets_enabled(context: &McpContext) -> bool {
         .unwrap_or(false)
 }
 
+fn workspace_gateway_is_video_tool(tool: &str) -> bool {
+    WORKSPACE_GATEWAY_VIDEO_TOOLS.contains(&tool)
+}
+
+fn workspace_gateway_app_bridge_env() -> Option<(String, String)> {
+    let endpoint = env::var(DIFFFORGE_APP_BRIDGE_ENDPOINT_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    let token = env::var(DIFFFORGE_APP_BRIDGE_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())?;
+    Some((endpoint, token))
+}
+
+fn workspace_gateway_video_repo_path(context: &McpContext) -> Result<String, String> {
+    context
+        .repo_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| "Video MCP tools require a workspace repo mapping.".to_string())
+}
+
+fn workspace_gateway_video_workspace_has_media(repo_path: &str) -> bool {
+    Path::new(repo_path).join("media").is_dir()
+}
+
+fn workspace_gateway_video_tools_enabled(context: &McpContext) -> bool {
+    workspace_gateway_app_bridge_env().is_some()
+        && context
+            .repo_path
+            .as_deref()
+            .is_some_and(workspace_gateway_video_workspace_has_media)
+}
+
+fn workspace_gateway_forward_video_tool(
+    context: &McpContext,
+    tool: &str,
+    input: Value,
+) -> Result<Value, String> {
+    let repo_path = workspace_gateway_video_repo_path(context)?;
+    if !workspace_gateway_video_workspace_has_media(&repo_path) {
+        return Err(WORKSPACE_GATEWAY_VIDEO_NO_WORKSPACE_MESSAGE.to_string());
+    }
+    let (endpoint, token) = workspace_gateway_app_bridge_env().ok_or_else(|| {
+        "Video MCP tools need the Diff Forge app bridge. Open Diff Forge and restart this terminal."
+            .to_string()
+    })?;
+    let mut forwarded_input = input;
+    if let Some(object) = forwarded_input.as_object_mut() {
+        object.remove("repoPath");
+        object.remove("repo_path");
+        object.insert("repoPath".to_string(), json!(repo_path));
+    } else {
+        forwarded_input = json!({ "repoPath": repo_path });
+    }
+    let response = crate::app_control_mcp_forward_bridge_request(
+        &endpoint,
+        &token,
+        tool,
+        forwarded_input,
+        WORKSPACE_GATEWAY_VIDEO_BRIDGE_TIMEOUT_MS,
+    )?;
+    if response.get("ok").and_then(Value::as_bool) == Some(false) {
+        let message = response
+            .get("error")
+            .and_then(|error| error.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or("The Diff Forge app bridge rejected the video MCP request.");
+        return Err(message.to_string());
+    }
+    if response.get("ok").and_then(Value::as_bool) == Some(true) {
+        return Ok(response.get("data").cloned().unwrap_or_else(|| json!({})));
+    }
+    Ok(response)
+}
+
 fn workspace_gateway_builtin_tool(context: &McpContext, tool: &str, input: Value) -> Value {
     if tool.starts_with("secrets__") && !workspace_gateway_secrets_enabled(context) {
         return workspace_gateway_error_content(
             "The Secrets MCP is disabled for this workspace. Enable it in the Diff Forge MCPs tab before using secrets tools."
                 .to_string(),
         );
+    }
+    if workspace_gateway_is_video_tool(tool) {
+        return match workspace_gateway_forward_video_tool(context, tool, input) {
+            Ok(result) if tool == "video_look" => workspace_gateway_video_look_content(result),
+            Ok(result) => workspace_gateway_content(result),
+            Err(error) => workspace_gateway_error_content(error),
+        };
     }
     match tool {
         "workspace_mcp__sync_manifest" => match workspace_gateway_manifest(context) {
@@ -1241,6 +1379,27 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
         "secrets__write_env_file" => {
             "Write selected local-only workspace secrets into an env file without returning secret values in the tool result. Each secret must be enabled for agent access."
         }
+        "video_context" => {
+            "Read Video Editor timeline, selection, transcripts, and jobs. Call this first; clip ids are stable only within one context/edit exchange, so re-fetch after edits."
+        }
+        "video_edit" => {
+            "Apply atomic Video Editor edits after video_context. ops support split, trim, move, remove, rippleDeleteRange, removeWords, addClip, addText, addCaptions, setProps; use video_media search moments as addClip sourceInMs/durationMs, use removeWords with transcript word indexes, and call video_transcribe first if transcript data is missing."
+        }
+        "video_transcribe" => {
+            "Read or start transcripts for video assets. Use before removeWords/addCaptions when video_context reports missing transcripts."
+        }
+        "video_look" => {
+            "Render exact composited Video Editor timeline frame(s) as JPEG image content blocks. Use after video_context when visual inspection is needed."
+        }
+        "video_media" => {
+            "List, search, import, and organize Video Editor media. Search returns filename matches plus transcript moments from cached transcripts."
+        }
+        "video_generate" => {
+            "List models, start, poll, or cancel Diff Forge Cloud generation (video/image/audio). start returns jobId; poll status."
+        }
+        "video_export" => {
+            "Start full or draft Video Editor exports and poll progress. start returns jobId; poll status."
+        }
         _ => "Workspace MCP gateway tool.",
     }
 }
@@ -1337,6 +1496,129 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
                 }
             },
             "required": ["keys"],
+            "additionalProperties": true
+        }),
+        "video_context" => json!({
+            "type": "object",
+            "properties": {
+                "include": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Optional sections: timeline, selection, transcripts, jobs. Defaults to all."
+                }
+            },
+            "additionalProperties": true
+        }),
+        "video_edit" => json!({
+            "type": "object",
+            "properties": {
+                "projectPath": {"type": "string"},
+                "ops": {
+                    "type": "array",
+                    "items": {"type": "object", "additionalProperties": true},
+                    "description": "Required edit ops with op discriminator: split, trim, move, remove, rippleDeleteRange, removeWords, addClip, addText, addCaptions, setProps. For addClip, pass assetPath, atMs, optional sourceInMs/durationMs, and optional trackHint."
+                },
+                "includePipe": {"type": "boolean"}
+            },
+            "required": ["ops"],
+            "additionalProperties": true
+        }),
+        "video_look" => json!({
+            "type": "object",
+            "properties": {
+                "repoPath": {"type": "string"},
+                "projectPath": {"type": "string"},
+                "atMs": {"type": "integer", "minimum": 0},
+                "timesMs": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 0},
+                    "description": "Timeline timestamps to render. More than 6 are clamped to the first 6."
+                },
+                "range": {
+                    "type": "object",
+                    "properties": {
+                        "startMs": {"type": "integer", "minimum": 0},
+                        "endMs": {"type": "integer", "minimum": 0},
+                        "frames": {"type": "integer", "minimum": 2, "maximum": 6}
+                    },
+                    "required": ["startMs", "endMs"],
+                    "additionalProperties": true
+                }
+            },
+            "description": "Pass exactly one of atMs, timesMs, or range. range spreads frames evenly and video_look clamps output to 6 JPEG frames.",
+            "additionalProperties": true
+        }),
+        "video_media" => json!({
+            "type": "object",
+            "properties": {
+                "repoPath": {"type": "string"},
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "search", "import", "folders", "createFolder", "setFolder"]
+                },
+                "kind": {"type": "string", "enum": ["video", "audio", "image"]},
+                "folderId": {"type": "string"},
+                "query": {"type": "string", "description": "Required for search. Matches filenames and cached transcript segment text."},
+                "sourcePaths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Required absolute file paths for import."
+                },
+                "name": {"type": "string", "description": "Required for createFolder."},
+                "path": {"type": "string", "description": "Required media path for setFolder."}
+            },
+            "required": ["action"],
+            "additionalProperties": true
+        }),
+        "video_generate" => json!({
+            "type": "object",
+            "properties": {
+                "repoPath": {"type": "string"},
+                "action": {"type": "string", "enum": ["models", "start", "status", "cancel"]},
+                "kind": {"type": "string", "enum": ["video", "image", "audio"]},
+                "model": {"type": "string", "description": "Cloud jobType id from models."},
+                "prompt": {"type": "string"},
+                "mode": {"type": "string"},
+                "inputAssetPaths": {"type": "array", "items": {"type": "string"}},
+                "audioAssetPaths": {"type": "array", "items": {"type": "string"}},
+                "params": {"type": "object", "additionalProperties": true},
+                "jobId": {"type": "string"}
+            },
+            "required": ["action"],
+            "description": "Use models first for Diff Forge Cloud generation (video/image/audio). start returns jobId; poll status.",
+            "additionalProperties": true
+        }),
+        "video_export" => json!({
+            "type": "object",
+            "properties": {
+                "repoPath": {"type": "string"},
+                "projectPath": {"type": "string"},
+                "action": {"type": "string", "enum": ["export", "draft", "status"]},
+                "range": {
+                    "type": "object",
+                    "properties": {
+                        "startMs": {"type": "integer", "minimum": 0},
+                        "endMs": {"type": "integer", "minimum": 0}
+                    },
+                    "required": ["startMs", "endMs"],
+                    "additionalProperties": true
+                },
+                "resolution": {"type": "string", "enum": ["480p", "720p", "1080p", "source"]},
+                "jobId": {"type": "string"}
+            },
+            "required": ["action"],
+            "description": "export starts a full render; draft requires range and forces 480p. start returns jobId; poll status.",
+            "additionalProperties": true
+        }),
+        "video_transcribe" => json!({
+            "type": "object",
+            "properties": {
+                "paths": {"type": "array", "items": {"type": "string"}},
+                "scope": {"type": "string", "description": "Use selection to transcribe media clips under the current selected ranges."},
+                "wait": {"type": "boolean", "description": "Defaults true."},
+                "fromMs": {"type": "integer", "minimum": 0},
+                "toMs": {"type": "integer", "minimum": 0}
+            },
             "additionalProperties": true
         }),
         _ => json!({"type": "object", "properties": {}}),
@@ -2888,6 +3170,45 @@ fn workspace_gateway_content(value: Value) -> Value {
         "content": [{"type": "text", "text": value.to_string()}],
         "isError": value["ok"].as_bool() == Some(false),
     })
+}
+
+fn workspace_gateway_content_blocks(content: Vec<Value>, is_error: bool) -> Value {
+    json!({
+        "content": content,
+        "isError": is_error,
+    })
+}
+
+fn workspace_gateway_video_look_content(value: Value) -> Value {
+    let mut content = Vec::new();
+    if let Some(frames) = value.get("frames").and_then(Value::as_array) {
+        for frame in frames {
+            let Some(data) = frame
+                .get("b64Jpeg")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|data| !data.is_empty())
+            else {
+                continue;
+            };
+            content.push(json!({
+                "type": "image",
+                "data": data,
+                "mimeType": "image/jpeg",
+            }));
+        }
+    }
+    let note = value
+        .get("note")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|note| !note.is_empty())
+        .unwrap_or("rendered video frame(s)");
+    content.push(json!({
+        "type": "text",
+        "text": note,
+    }));
+    workspace_gateway_content_blocks(content, false)
 }
 
 fn workspace_gateway_error_content(error: impl Into<String>) -> Value {
@@ -5272,6 +5593,28 @@ mod tests {
     }
 
     #[test]
+    fn workspace_gateway_video_look_content_emits_image_blocks() {
+        let result = workspace_gateway_video_look_content(json!({
+            "frames": [
+                {"atMs": 1000, "b64Jpeg": "abc123"},
+                {"atMs": 2000, "b64Jpeg": "def456"}
+            ],
+            "note": "rendered 1000ms, 2000ms"
+        }));
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        let content = result["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 3);
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["data"], "abc123");
+        assert_eq!(content[0]["mimeType"], "image/jpeg");
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["data"], "def456");
+        assert_eq!(content[1]["mimeType"], "image/jpeg");
+        assert_eq!(content[2]["type"], "text");
+        assert_eq!(content[2]["text"], "rendered 1000ms, 2000ms");
+    }
+
+    #[test]
     fn lifecycle_tools_are_hidden_for_direct_unmanaged_policy() {
         let repo = std::env::temp_dir().join(format!(
             "diffforge-mcp-direct-unmanaged-{}",
@@ -5346,11 +5689,13 @@ mod tests {
         );
         assert_eq!(denied["ok"].as_bool(), Some(false));
         assert_eq!(denied["error"]["code"].as_str(), Some("unknown_tool"));
-        assert!(!denied["error"]["details"]["allowed_tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool.as_str() == Some("start_task")));
+        assert!(
+            !denied["error"]["details"]["allowed_tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool.as_str() == Some("start_task"))
+        );
 
         let session_context = McpContext {
             session_id: Some("session-1".to_string()),

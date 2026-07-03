@@ -731,6 +731,7 @@ fn terminal_args_with_codex_mcp_identity(
             &coordination.mcp_command,
             &gateway_args,
         );
+        append_codex_workspace_gateway_bridge_env_args(&mut next);
         for tool in TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS {
             append_codex_mcp_tool_approval_arg(&mut next, "workspace-mcp-gateway", tool);
         }
@@ -807,6 +808,13 @@ const TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS: &[&str] = &[
     "secrets__list",
     "secrets__get",
     "secrets__write_env_file",
+    "video_context",
+    "video_edit",
+    "video_transcribe",
+    "video_look",
+    "video_media",
+    "video_generate",
+    "video_export",
 ];
 const APP_CONTROL_MCP_TOOL_NAMES: &[&str] = &[
     "get_state",
@@ -1137,6 +1145,18 @@ fn append_codex_mcp_tool_approval_arg(args: &mut Vec<String>, server_key: &str, 
     ));
 }
 
+fn append_codex_workspace_gateway_bridge_env_args(args: &mut Vec<String>) {
+    let server_key = terminal_toml_key_segment("workspace-mcp-gateway");
+    for (key, value) in terminal_app_bridge_env_vars() {
+        args.push("-c".to_string());
+        args.push(format!(
+            "mcp_servers.{server_key}.env.{}={}",
+            terminal_toml_key_segment(&key),
+            terminal_toml_string(&value)
+        ));
+    }
+}
+
 fn append_codex_app_control_developer_instructions_arg(args: &mut Vec<String>) {
     let existing = take_codex_config_string_override(args, "developer_instructions");
     let instructions = match existing {
@@ -1245,10 +1265,7 @@ fn terminal_normalize_permission_mode(value: Option<String>) -> Result<Option<St
     let Some(value) = value else {
         return Ok(None);
     };
-    let mode = value
-        .trim()
-        .to_ascii_lowercase()
-        .replace([' ', '-'], "_");
+    let mode = value.trim().to_ascii_lowercase().replace([' ', '-'], "_");
     if mode.is_empty() || mode == "default" {
         return Ok(None);
     }
@@ -1519,9 +1536,29 @@ fn claude_allowed_tools_arg(
             "secrets__list",
             "secrets__get",
             "secrets__write_env_file",
+            "video_context",
+            "video_edit",
+            "video_transcribe",
+            "video_look",
+            "video_media",
+            "video_generate",
+            "video_export",
         ]
         .into_iter()
         .map(|tool| format!("mcp__workspace-mcp-gateway__{tool}")),
+    );
+    tools.extend(
+        [
+            "video_context",
+            "video_edit",
+            "video_transcribe",
+            "video_look",
+            "video_media",
+            "video_generate",
+            "video_export",
+        ]
+        .into_iter()
+        .map(|tool| format!("mcp__diffforge-workspace-mcp-gateway__{tool}")),
     );
     if let Some(value) =
         terminal_coordination_env_value(coordination, "DIFFFORGE_WORKSPACE_MCP_ALLOWED_TOOLS")
@@ -1974,6 +2011,71 @@ fn extend_terminal_activity_env_vars(
 fn set_terminal_env_var(env_vars: &mut Vec<(String, String)>, key: &str, value: &str) {
     env_vars.retain(|(existing_key, _)| existing_key != key);
     env_vars.push((key.to_string(), value.to_string()));
+}
+
+fn terminal_app_bridge_env_vars() -> Vec<(String, String)> {
+    let endpoint = env::var(DIFFFORGE_APP_BRIDGE_ENDPOINT_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    let token = env::var(DIFFFORGE_APP_BRIDGE_TOKEN_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    match (endpoint, token) {
+        (Some(endpoint), Some(token)) => vec![
+            (DIFFFORGE_APP_BRIDGE_ENDPOINT_ENV.to_string(), endpoint),
+            (DIFFFORGE_APP_BRIDGE_TOKEN_ENV.to_string(), token),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn terminal_workspace_gateway_environment(
+    coordination: Option<&TerminalCoordinationSession>,
+) -> serde_json::Map<String, Value> {
+    let mut environment = serde_json::Map::new();
+    environment.insert("COORDINATION_ENABLED".to_string(), json!("1"));
+    environment.insert("DIFFFORGE_WORKSPACE_MCP_GATEWAY".to_string(), json!("1"));
+    if let Some(coordination) = coordination {
+        environment.insert(
+            "COORDINATION_REPO_PATH".to_string(),
+            json!(coordination.repo_path.clone()),
+        );
+        environment.insert(
+            "COORDINATION_DB_PATH".to_string(),
+            json!(coordination.db_path.clone()),
+        );
+        environment.insert(
+            "COORDINATION_AGENT_ID".to_string(),
+            json!(coordination.agent_id.clone()),
+        );
+        environment.insert(
+            "COORDINATION_SESSION_ID".to_string(),
+            json!(coordination.session_id.clone()),
+        );
+        environment.insert(
+            "COORDINATION_TERMINAL_LAUNCH_EPOCH".to_string(),
+            json!(coordination
+                .terminal_launch_epoch
+                .clone()
+                .unwrap_or_default()),
+        );
+        for key in [
+            "COORDINATION_AGENT_SLOT_ID",
+            "COORDINATION_SLOT_KEY",
+            "COORDINATION_WORKSPACE_ID",
+            "COORDINATION_OBJECTIVE_KEY",
+        ] {
+            if let Some(value) = terminal_coordination_env_value(coordination, key) {
+                environment.insert(key.to_string(), json!(value));
+            }
+        }
+    }
+    for (key, value) in terminal_app_bridge_env_vars() {
+        environment.insert(key, json!(value));
+    }
+    environment
 }
 
 fn apply_codex_resume_home_env(env_vars: &mut Vec<(String, String)>, home: &str) {
@@ -2690,16 +2792,19 @@ fn write_diff_forge_activity_hook_debug(
 
 fn diff_forge_activity_stream_debug_enabled() -> bool {
     cfg!(debug_assertions)
-        && ["RUST_DIFFFORGE_AGENT_STREAM_DEBUG", "RUST_DIFFFORGE_USE_LOCAL_DOCKER_CLOUD"]
-            .iter()
-            .any(|key| {
-                env::var(key)
-                    .ok()
-                    .is_some_and(|value| matches!(
-                        value.trim().to_ascii_lowercase().as_str(),
-                        "1" | "true" | "yes" | "on" | "debug"
-                    ))
+        && [
+            "RUST_DIFFFORGE_AGENT_STREAM_DEBUG",
+            "RUST_DIFFFORGE_USE_LOCAL_DOCKER_CLOUD",
+        ]
+        .iter()
+        .any(|key| {
+            env::var(key).ok().is_some_and(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "debug"
+                )
             })
+        })
 }
 
 fn diff_forge_activity_hook_object_keys(value: &Value) -> Vec<String> {
@@ -3273,12 +3378,7 @@ fn diff_forge_activity_hook_record(
         "response",
         "stdout",
     ]);
-    let tool_error = hook_value(&[
-        "tool_error",
-        "toolError",
-        "error",
-        "stderr",
-    ]);
+    let tool_error = hook_value(&["tool_error", "toolError", "error", "stderr"]);
     let raw_tool_payload = hook_value(&[
         "rawToolPayload",
         "raw_tool_payload",
@@ -3286,17 +3386,8 @@ fn diff_forge_activity_hook_record(
         "raw_payload",
         "raw",
     ]);
-    let duration_ms = hook_value(&[
-        "durationMs",
-        "duration_ms",
-        "elapsedMs",
-        "elapsed_ms",
-    ]);
-    let exit_code = hook_value(&[
-        "exitCode",
-        "exit_code",
-        "code",
-    ]);
+    let duration_ms = hook_value(&["durationMs", "duration_ms", "elapsedMs", "elapsed_ms"]);
+    let exit_code = hook_value(&["exitCode", "exit_code", "code"]);
     let mut tool_paths = Vec::new();
     claude_guard_collect_tool_paths(tool_input, &mut tool_paths);
     let graph_file_path = tool_paths
@@ -3654,7 +3745,10 @@ mod terminal_cli_tests {
             record.get("promptDefaultOption").and_then(Value::as_str),
             Some("Use existing config")
         );
-        assert_eq!(record.get("promptTtlMs").and_then(Value::as_u64), Some(45000));
+        assert_eq!(
+            record.get("promptTtlMs").and_then(Value::as_u64),
+            Some(45000)
+        );
         assert_eq!(
             record
                 .get("promptOptions")
@@ -3747,7 +3841,9 @@ mod terminal_cli_tests {
     #[test]
     fn opencode_plugin_uses_chat_message_as_prompt_boundary() {
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("\"chat.message\""));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("hook_event_name: \"UserPromptSubmit\""));
+        assert!(
+            DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("hook_event_name: \"UserPromptSubmit\"")
+        );
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("userPromptSubmitKeys"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("messageRoleForPart"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("role !== \"assistant\""));
@@ -3756,7 +3852,8 @@ mod terminal_cli_tests {
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("const IDLE_STOP_DELAY_MS = 1500"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("const emitQueues = new Map()"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("assistant_message_snapshot"));
-        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("const assistantTextPartsByMessage = new Map()"));
+        assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS
+            .contains("const assistantTextPartsByMessage = new Map()"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("rememberAssistantPartSnapshot"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("scheduleStop(sessionId"));
         assert!(DIFFFORGE_OPENCODE_ACTIVITY_PLUGIN_JS.contains("clearTimeout(timer)"));
@@ -3989,7 +4086,10 @@ mod terminal_cli_tests {
                 "delta": {"text": "hello from a nested delta"}
             }),
         );
-        assert_eq!(record["message"].as_str(), Some("hello from a nested delta"));
+        assert_eq!(
+            record["message"].as_str(),
+            Some("hello from a nested delta")
+        );
         assert_eq!(
             record["assistantMessage"].as_str(),
             Some("hello from a nested delta")
@@ -4192,9 +4292,13 @@ fn claude_coordination_mcp_config_arg(
     coordination_args: &[String],
 ) -> String {
     if let Some(path) = claude_coordination_mcp_config_path_arg(coordination) {
+        inject_claude_workspace_gateway_bridge_env(&path, coordination, coordination_args);
         return path;
     }
 
+    let gateway_args = terminal_workspace_gateway_args_from_coordination_args(coordination_args);
+    let gateway_environment =
+        Value::Object(terminal_workspace_gateway_environment(Some(coordination)));
     json!({
         "mcpServers": {
             "coordination-kernel": {
@@ -4216,10 +4320,79 @@ fn claude_coordination_mcp_config_arg(
                     "identitySource": "terminal_launch_args",
                     "authority": "local_coordination_kernel"
                 }
+            },
+            "workspace-mcp-gateway": {
+                "command": coordination.mcp_command.clone(),
+                "args": gateway_args,
+                "env": gateway_environment,
+                "diffforge": {
+                    "scope": "terminal-session",
+                    "alwaysOn": true,
+                    "toggleable": false,
+                    "identitySource": "terminal_launch_args",
+                    "authority": "workspace_mcp_gateway"
+                }
             }
         }
     })
     .to_string()
+}
+
+fn inject_claude_workspace_gateway_bridge_env(
+    path: &str,
+    coordination: &TerminalCoordinationSession,
+    coordination_args: &[String],
+) {
+    if terminal_app_bridge_env_vars().is_empty() {
+        return;
+    }
+    let path = PathBuf::from(path);
+    let Ok(body) = fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(mut config) = serde_json::from_str::<Value>(&body) else {
+        return;
+    };
+    let Some(config_object) = config.as_object_mut() else {
+        return;
+    };
+    let mcp_servers = config_object
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(mcp_servers) = mcp_servers.as_object_mut() else {
+        return;
+    };
+    let gateway_args = terminal_workspace_gateway_args_from_coordination_args(coordination_args);
+    let gateway = mcp_servers
+        .entry("workspace-mcp-gateway".to_string())
+        .or_insert_with(|| {
+            json!({
+                "command": coordination.mcp_command.clone(),
+                "args": gateway_args,
+                "diffforge": {
+                    "scope": "terminal-session",
+                    "alwaysOn": true,
+                    "toggleable": false,
+                    "identitySource": "terminal_launch_args",
+                    "authority": "workspace_mcp_gateway"
+                }
+            })
+        });
+    let Some(gateway_object) = gateway.as_object_mut() else {
+        return;
+    };
+    let environment = gateway_object
+        .entry("env".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let Some(environment) = environment.as_object_mut() else {
+        return;
+    };
+    for (key, value) in terminal_workspace_gateway_environment(Some(coordination)) {
+        environment.insert(key, value);
+    }
+    if let Ok(serialized) = serde_json::to_vec_pretty(&config) {
+        let _ = fs::write(&path, serialized);
+    }
 }
 
 fn claude_coordination_mcp_config_path_arg(
@@ -5305,10 +5478,7 @@ fn terminal_env_vars_with_opencode_coordination_config(
                 "type": "local",
                 "command": gateway_command,
                 "enabled": true,
-                "environment": {
-                    "COORDINATION_ENABLED": "1",
-                    "DIFFFORGE_WORKSPACE_MCP_GATEWAY": "1"
-                }
+                "environment": Value::Object(terminal_workspace_gateway_environment(Some(coordination)))
             }),
         );
 
@@ -7157,6 +7327,7 @@ fn apply_codex_coordinated_exec_args(
         &coordination.mcp_command,
         &gateway_args,
     );
+    append_codex_workspace_gateway_bridge_env_args(&mut codex_config_args);
     for tool in TERMINAL_WORKSPACE_MCP_GATEWAY_TOOLS {
         append_codex_mcp_tool_approval_arg(&mut codex_config_args, "workspace-mcp-gateway", tool);
     }

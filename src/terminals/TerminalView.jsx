@@ -22590,16 +22590,23 @@ function WorkspaceVideoGridPane({
     onProjectChange?.(nextProject);
   }, [onProjectChange]);
 
-  const submitVideoPanelAgentPrompt = useCallback((payload = {}) => {
+  const submitVideoPanelAgentPrompt = useCallback(async (payload = {}) => {
     const contextText = project?.path
-      ? `Context: video project "${project.name || "Video"}" at ${project.path} (Diff Forge video pipe format — the file's # header documents the line syntax; media assets live under media/assets/).`
-      : "Context: Diff Forge video editor pane (projects live under media/projects/*.video.pipe; the file's # header documents the syntax).";
-    const selectionText = String(project?.selectionContext || "").trim();
+      ? `Context: video project "${project.name || "Video"}" at ${project.path} (Diff Forge video pipe format — the file's # header documents the line syntax; media assets live under media/assets/). MCP tools: video_context (call first for timeline/selection/transcripts), video_edit (batched ops incl. removeWords/rippleDeleteRange/addCaptions), video_transcribe.`
+      : "Context: Diff Forge video editor pane (projects live under media/projects/*.video.pipe; the file's # header documents the syntax). MCP tools: video_context / video_edit / video_transcribe.";
+    // Media under the selected ranges without transcripts is transcribed
+    // before the prompt goes out — the agent gets word-timed context up front.
+    let selectionText = "";
+    try {
+      selectionText = String((await project?.prepareContext?.()) ?? project?.selectionContext ?? "").trim();
+    } catch {
+      selectionText = String(project?.selectionContext || "").trim();
+    }
     return onSubmitPanelAgentPrompt?.({
       ...payload,
       text: `${payload?.text || ""}\n\n${contextText}${selectionText ? `\n\n${selectionText}` : ""}`,
     });
-  }, [onSubmitPanelAgentPrompt, project?.name, project?.path, project?.selectionContext]);
+  }, [onSubmitPanelAgentPrompt, project?.name, project?.path, project?.prepareContext, project?.selectionContext]);
 
   return (
     <TerminalVideoPanelShell

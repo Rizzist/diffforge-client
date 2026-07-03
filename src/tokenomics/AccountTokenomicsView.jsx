@@ -963,8 +963,10 @@ function rowMatchesAccountFilter(row, selectedProvider, accountKeys) {
   return selectedAccountKey === "all" || rowProviderAccountKey(row) === selectedAccountKey;
 }
 
+const TOKENOMICS_DEFAULT_ACCOUNT_KEY = "local-account";
+
 function normalizeTokenomicsAccountKey(accountKey) {
-  return String(accountKey || "local-account").trim() || "local-account";
+  return String(accountKey || TOKENOMICS_DEFAULT_ACCOUNT_KEY).trim() || TOKENOMICS_DEFAULT_ACCOUNT_KEY;
 }
 
 function providerAccent(provider) {
@@ -2753,7 +2755,8 @@ function mergeTokenomicsSummaryDelta(previous, next) {
 }
 
 const tokenomicsStore = {
-  accountKey: "local-account",
+  accountKey: TOKENOMICS_DEFAULT_ACCOUNT_KEY,
+  loadedAccountKey: "",
   requestEpoch: 0,
   state: createTokenomicsStoreState(),
   loadedOnce: false,
@@ -2845,6 +2848,7 @@ function scheduleTokenomicsLimitCloudSync() {
 function mergeSummaryIntoTokenomicsStore(next, { syncLimitChanges = false } = {}) {
   let nextSignature = "";
   let shouldSyncLimits = false;
+  tokenomicsStore.loadedAccountKey = tokenomicsStore.accountKey;
   updateTokenomicsStore((previous) => ({
     summary: (() => {
       const merged = mergeTokenomicsSummary(previous.summary, next || {});
@@ -2864,20 +2868,44 @@ function mergeSummaryIntoTokenomicsStore(next, { syncLimitChanges = false } = {}
 
 function mergeSummaryDeltaIntoTokenomicsStore(next) {
   if (!next) return;
+  tokenomicsStore.loadedAccountKey = tokenomicsStore.accountKey;
   updateTokenomicsStore((previous) => ({
     summary: mergeTokenomicsSummaryDelta(previous.summary, next),
   }));
 }
 
 function resetTokenomicsStoreForAccount(accountKey) {
-  const normalizedAccountKey = normalizeTokenomicsAccountKey(accountKey);
+  const incomingAccountKey = String(accountKey || "").trim();
+  if (!incomingAccountKey) {
+    return;
+  }
+
+  const normalizedAccountKey = normalizeTokenomicsAccountKey(incomingAccountKey);
   if (tokenomicsStore.accountKey === normalizedAccountKey) {
+    return;
+  }
+
+  const currentAccountKey = String(tokenomicsStore.accountKey || "").trim();
+  const currentIsInitialAccount = !currentAccountKey || currentAccountKey === TOKENOMICS_DEFAULT_ACCOUNT_KEY;
+  const loadedAccountKey = String(tokenomicsStore.loadedAccountKey || "").trim();
+  const loadedForDifferentRealAccount = Boolean(
+    loadedAccountKey
+      && loadedAccountKey !== TOKENOMICS_DEFAULT_ACCOUNT_KEY
+      && loadedAccountKey !== normalizedAccountKey,
+  );
+
+  if (currentIsInitialAccount && !loadedForDifferentRealAccount) {
+    tokenomicsStore.accountKey = normalizedAccountKey;
+    if (tokenomicsStore.state.summary) {
+      tokenomicsStore.loadedAccountKey = normalizedAccountKey;
+    }
     return;
   }
 
   tokenomicsStore.accountKey = normalizedAccountKey;
   tokenomicsStore.requestEpoch += 1;
   tokenomicsStore.loadedOnce = false;
+  tokenomicsStore.loadedAccountKey = "";
   tokenomicsStore.loadPromise = null;
   tokenomicsStore.liveLimitsPromise = null;
   tokenomicsStore.liveLimitsForcedRefreshQueued = false;
@@ -3072,6 +3100,7 @@ function loadTokenomicsStore({
         return tokenomicsStore.state.summary;
       }
       tokenomicsStore.loadedOnce = true;
+      tokenomicsStore.loadedAccountKey = tokenomicsStore.accountKey;
       if (summaryOnly) {
         tokenomicsStore.summaryRefreshLastAt = Date.now();
       }
@@ -3293,6 +3322,12 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     updateTokenomicsStore({ selectedProvider: provider });
   }, []);
 
+  // The provider filter buttons were removed — the three color-coded provider
+  // rows always render, so pin any persisted store filter back to "all".
+  useEffect(() => {
+    setSelectedProvider("all");
+  }, [setSelectedProvider]);
+
   const setSelectedProviderAccountKey = useCallback((providerId, nextAccountKey) => {
     updateTokenomicsStore((previous) => ({
       selectedProviderAccountKeys: {
@@ -3333,7 +3368,9 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   }, [agentCredentialSignature]);
 
   const visibleSummary = useMemo(
-    () => canonicalizeTokenomicsAccountSummary(summaryForMappedNativeDevices(summary), agentAccounts),
+    () => (summary
+      ? canonicalizeTokenomicsAccountSummary(summaryForMappedNativeDevices(summary), agentAccounts)
+      : null),
     [agentAccounts, summary],
   );
   // Cloud sync is intentionally ignored on this client, so Tokenomics always
@@ -3482,20 +3519,6 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   return (
     <TokenomicsShell>
       <TokenomicsPanel>
-        <ProviderTabs role="tablist" aria-label="Tokenomics provider filter">
-          {PROVIDERS.map((provider) => (
-            <ProviderTab
-              key={provider.id}
-              $active={selectedProvider === provider.id}
-              $provider={provider.id}
-              onClick={() => setSelectedProvider(provider.id)}
-              role="tab"
-              type="button"
-            >
-              {provider.label}
-            </ProviderTab>
-          ))}
-        </ProviderTabs>
         {accountOptionGroups.length > 0 ? (
           <ProviderAccountRows aria-label="Provider account filters">
             {accountOptionGroups.map((group) => (
@@ -3531,7 +3554,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
 
         {error ? <TokenomicsError>{error}</TokenomicsError> : null}
 
-        {status !== "ready" ? (
+        {status !== "ready" && !visibleSummary ? (
           <TokenomicsLoading role="status" aria-live="polite">
             <span />
             <strong>{tokenomicsLoadingLabel(status, summary, scanProgress)}</strong>
@@ -3685,7 +3708,12 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
           </UsageTable>
           <ModelList>
             {breakdown.length ? breakdown.map((item) => (
-              <ModelRow key={item.label}>
+              <ModelRow
+                $provider={PROVIDER_ACCOUNT_FILTER_PROVIDERS.includes(String(item.label || "").toLowerCase())
+                  ? String(item.label).toLowerCase()
+                  : undefined}
+                key={item.label}
+              >
                 <span>{item.label}</span>
                 <strong>{item.percent}%</strong>
               </ModelRow>
@@ -3811,9 +3839,8 @@ const TokenomicsShell = styled.section`
   padding: clamp(6px, 1.8vw, 12px);
   color: #e5eefb;
   background:
-    radial-gradient(circle at 50% 0%, rgba(var(--forge-tint-rgb), 0.13), transparent 34%),
-    radial-gradient(circle at 100% 12%, rgba(251, 146, 60, 0.08), transparent 28%),
-    linear-gradient(180deg, #05070a, #020304 68%, #05070a);
+    radial-gradient(circle at 50% 0%, rgba(var(--forge-tint-rgb), 0.06), transparent 38%),
+    linear-gradient(180deg, #05080d, #020304 68%, #05080d);
 
   &,
   * {
@@ -3851,46 +3878,6 @@ const TokenomicsPanel = styled.div`
   }
 `;
 
-const ProviderTabs = styled.div`
-  display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 4px;
-  container-type: inline-size;
-  min-width: 0;
-  padding: 3px;
-  border: 1px solid rgba(148, 163, 184, 0.14);
-  border-radius: 8px;
-  background: rgba(2, 6, 12, 0.82);
-
-  html[data-forge-theme="light"] & {
-    border-color: rgba(15, 23, 42, 0.08);
-    background: #eef4ff;
-  }
-`;
-
-const ProviderTab = styled.button`
-  min-width: 0;
-  min-height: 28px;
-  padding: 0 3px;
-  border: 1px solid ${({ $active, $provider }) => ($active ? providerAccent($provider) : "transparent")};
-  border-radius: 7px;
-  color: ${({ $active, $provider }) => ($active ? providerAccent($provider) : "#9aa8bc")};
-  background: ${({ $active, $provider }) => ($active ? `color-mix(in srgb, ${providerAccent($provider)} 18%, transparent)` : "transparent")};
-  font: inherit;
-  font-size: clamp(8px, 1.8vw, 12px);
-  font-size: clamp(8px, 2.1cqi, 12px);
-  font-weight: 900;
-  letter-spacing: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-
-  html[data-forge-theme="light"] & {
-    color: ${({ $active, $provider }) => ($active ? providerAccent($provider) : "#475569")};
-    background: ${({ $active, $provider }) => ($active ? `color-mix(in srgb, ${providerAccent($provider)} 12%, #ffffff)` : "transparent")};
-  }
-`;
-
 const ProviderAccountRows = styled.div`
   display: grid;
   gap: 5px;
@@ -3924,13 +3911,13 @@ const AccountTab = styled.button`
   max-width: 210px;
   min-height: 28px;
   padding: ${({ $iconOnly }) => ($iconOnly ? "0" : "0 10px")};
-  border: 1px solid ${({ $active, $provider }) => ($active ? providerAccent($provider) : "rgba(148, 163, 184, 0.16)")};
-  border-radius: 7px;
+  border: 1px solid ${({ $active, $provider }) => ($active ? providerAccent($provider) : "rgba(230, 236, 245, 0.1)")};
+  border-radius: 8px;
   color: ${({ $active, $provider }) => ($active ? providerAccent($provider) : "#94a3b8")};
-  background: ${({ $active, $provider }) => ($active ? `color-mix(in srgb, ${providerAccent($provider)} 14%, rgba(15, 23, 42, 0.74))` : "rgba(15, 23, 42, 0.48)")};
+  background: ${({ $active, $provider }) => ($active ? `color-mix(in srgb, ${providerAccent($provider)} 14%, #10151c)` : "#151b23")};
   font: inherit;
   font-size: 11px;
-  font-weight: 850;
+  font-weight: 750;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -4033,8 +4020,8 @@ const ProviderLimitHeading = styled.div`
   min-width: 0;
   padding: 0 2px 1px;
   color: ${({ $provider }) => providerAccent($provider)};
-  font-size: 12px;
-  font-weight: 950;
+  font-size: 13px;
+  font-weight: 800;
 
   strong {
     min-width: 0;
@@ -4051,9 +4038,9 @@ const PlanStatusLine = styled.div`
   gap: 8px;
   min-width: 0;
   padding: 0 2px;
-  color: #8fa0b6;
-  font-size: clamp(9px, 2.2vw, 11px);
-  font-weight: 900;
+  color: #7a8493;
+  font-size: clamp(9px, 2.2vw, 10.5px);
+  font-weight: 700;
 
   strong {
     min-width: 0;
@@ -4086,9 +4073,9 @@ const LimitCard = styled.div`
   gap: 7px;
   min-width: 0;
   padding: 10px;
-  border: 1px solid rgba(148, 163, 184, 0.13);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 11px;
+  background: #0d1117;
   container-type: inline-size;
 
   --tone: ${({ tone }) => toneColor(tone)};
@@ -4121,9 +4108,9 @@ const MetricName = styled.div`
   align-items: center;
   gap: 7px;
   min-width: 0;
-  color: #e5eefb;
-  font-size: clamp(12px, 3.1vw, 14px);
-  font-weight: 900;
+  color: #f4f7fa;
+  font-size: clamp(12px, 3.1vw, 13px);
+  font-weight: 750;
 
   @container (max-width: 450px) {
     gap: 6px;
@@ -4183,17 +4170,17 @@ const MetricScore = styled.div`
 `;
 
 const ProgressTrack = styled.div`
-  height: 8px;
+  height: 6px;
   overflow: hidden;
   border-radius: 999px;
-  background: rgba(148, 163, 184, 0.22);
+  background: #1b2330;
 
   html[data-forge-theme="light"] & {
     background: rgba(15, 23, 42, 0.12);
   }
 
   @container (max-width: 450px) {
-    height: 6px;
+    height: 5px;
   }
 `;
 
@@ -4203,7 +4190,6 @@ const ProgressFill = styled.div`
   border-radius: inherit;
   --bar-tone: ${({ $tone }) => toneColor($tone)};
   background: var(--bar-tone);
-  box-shadow: 0 0 18px color-mix(in srgb, var(--bar-tone) 72%, transparent);
 `;
 
 const MetricFoot = styled.div`
@@ -4212,9 +4198,9 @@ const MetricFoot = styled.div`
   justify-content: space-between;
   gap: 8px;
   min-width: 0;
-  color: #8794a8;
-  font-size: clamp(9px, 2.5vw, 11px);
-  font-weight: 900;
+  color: #7a8493;
+  font-size: clamp(9px, 2.5vw, 10.5px);
+  font-weight: 650;
 
   @container (max-width: 450px) {
     gap: 6px;
@@ -4237,7 +4223,7 @@ const MetricFoot = styled.div`
     max-width: 62%;
     overflow: visible;
     color: var(--tone);
-    font-weight: 900;
+    font-weight: 750;
     line-height: 1.15;
     text-align: right;
     white-space: normal;
@@ -4261,9 +4247,9 @@ const ChartCard = styled.div`
   gap: 8px;
   min-width: 0;
   padding: 10px;
-  border: 1px solid rgba(148, 163, 184, 0.13);
-  border-radius: 8px;
-  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 11px;
+  background: #0d1117;
   overflow: hidden;
 
   html[data-forge-theme="light"] & {
@@ -4465,11 +4451,11 @@ const UsageCard = styled.div`
   gap: 9px;
   min-width: 0;
   padding: 10px;
-  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.17);
-  border-radius: 8px;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 11px;
   background:
-    radial-gradient(circle at 0% 0%, rgba(var(--forge-tint-rgb), 0.12), transparent 36%),
-    rgba(15, 23, 42, 0.76);
+    radial-gradient(circle at 0% 0%, rgba(var(--forge-tint-rgb), 0.07), transparent 36%),
+    #0d1117;
 
   html[data-forge-theme="light"] & {
     border-color: rgba(var(--forge-tint-rgb), 0.15);
@@ -4556,6 +4542,7 @@ const ModelRow = styled.div`
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    color: ${({ $provider }) => ($provider ? providerAccent($provider) : "inherit")};
   }
 
   strong {
@@ -4578,10 +4565,10 @@ const CreditsCard = styled.div`
   min-width: 0;
   padding: 10px;
   border: 1px solid rgba(251, 146, 60, 0.18);
-  border-radius: 8px;
+  border-radius: 11px;
   background:
-    radial-gradient(circle at 100% 0%, rgba(251, 146, 60, 0.1), transparent 34%),
-    rgba(15, 23, 42, 0.72);
+    radial-gradient(circle at 100% 0%, rgba(251, 146, 60, 0.07), transparent 34%),
+    #0d1117;
 
   html[data-forge-theme="light"] & {
     border-color: rgba(249, 115, 22, 0.18);
@@ -4663,11 +4650,11 @@ const StorageCard = styled.div`
   gap: 9px;
   min-width: 0;
   padding: 10px;
-  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.17);
-  border-radius: 8px;
+  border: 1px solid rgba(230, 236, 245, 0.1);
+  border-radius: 11px;
   background:
-    radial-gradient(circle at 100% 0%, rgba(52, 211, 153, 0.08), transparent 34%),
-    rgba(15, 23, 42, 0.72);
+    radial-gradient(circle at 100% 0%, rgba(52, 211, 153, 0.06), transparent 34%),
+    #0d1117;
 
   html[data-forge-theme="light"] & {
     border-color: rgba(var(--forge-tint-rgb), 0.14);

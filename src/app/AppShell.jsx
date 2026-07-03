@@ -464,7 +464,20 @@ import {
   WorkspaceMuted,
   RailFooter,
   RailGlobalActions,
+  RailViewActions,
   RailActionButton,
+  RailAssetsIcon,
+  RailAudioIcon,
+  RailFilesIcon,
+  RailHelpIcon,
+  RailHistoryIcon,
+  RailSettingsIcon,
+  RailSignOutIcon,
+  RailSnippingIcon,
+  RailTerminalIcon,
+  RailTokenomicsIcon,
+  RailToolsIcon,
+  RailWebIcon,
   WorkspaceViewStack,
   WorkspaceAppToolLayout,
   WorkspaceAppToolPortalHost,
@@ -995,7 +1008,7 @@ import SnippingQuickAccess, {
   SNIPPING_STRIP_HASH,
   SNIPPING_TOAST_HASH,
 } from "../snipping/SnippingQuickAccess.jsx";
-import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
+import AccountTokenomicsView, { warmAccountTokenomics } from "../tokenomics/AccountTokenomicsView.jsx";
 
 const BRAND_NAME = "Diff Forge AI";
 const LAUNCH_MINIMUM_MS = 1400;
@@ -22115,6 +22128,7 @@ export default function App() {
     accountKey: authAccountKey,
     entitlements: authEntitlements,
   } = useAuthSnapshot();
+  const resolvedTokenomicsAccountKey = authAccountKey || user?.id || user?.email || "";
   const [apiState, setApiState] = useState("checking");
   const [apiMessage, setApiMessage] = useState("Checking connection");
   const [activeView, setActiveView] = useState(DEFAULT_WORKSPACE_VIEW);
@@ -22270,6 +22284,7 @@ export default function App() {
   // and flickered the app between login and dashboard.
   const billingStatusRef = useRef(null);
   billingStatusRef.current = billingStatus;
+  const tokenomicsWarmAccountKeyRef = useRef("");
   const workspaceToolLayoutRef = useRef(null);
   const workspaceToolPanelRef = useRef(null);
   const workspaceToolMainPanelRef = useRef(null);
@@ -28436,6 +28451,15 @@ export default function App() {
       return null;
     }
   }, [authState]);
+
+  useEffect(() => {
+    const accountKey = String(resolvedTokenomicsAccountKey || "").trim();
+    if (!accountKey || tokenomicsWarmAccountKeyRef.current === accountKey) {
+      return;
+    }
+    tokenomicsWarmAccountKeyRef.current = accountKey;
+    void warmAccountTokenomics({ accountKey });
+  }, [resolvedTokenomicsAccountKey]);
 
   const resolveAgentInstallationSyncTarget = useCallback(() => {
     const currentWorkspaces = Array.isArray(workspacesRef.current) ? workspacesRef.current : [];
@@ -49330,51 +49354,55 @@ export default function App() {
                   </RailTop>
 
                   <RailFooter>
-                    {shouldShowTerminalNav && (
-                      <RailActionButton
-                        aria-label="Terminals"
-                        data-active={activeView === DEFAULT_WORKSPACE_VIEW}
-                        onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
-                        title="Terminals"
-                        type="button"
-                      >
-                        <ButtonTerminalIcon aria-hidden="true" />
-                        <span>Terminals</span>
-                      </RailActionButton>
-                    )}
-                    {shouldShowWorkspaceDetailNav && (
-                      <>
-                        <RailActionButton
-                          aria-label="Files"
-                          data-active={activeView === "files"}
-                          onClick={() => showView("files")}
-                          title="Files"
-                          type="button"
-                        >
-                          <ButtonFolderIcon aria-hidden="true" />
-                          <span>Files</span>
-                        </RailActionButton>
-                        <RailActionButton
-                          aria-label="Web"
-                          data-active={activeView === "web"}
-                          onClick={() => showView("web")}
-                          title="Web"
-                          type="button"
-                        >
-                          <ButtonWebIcon aria-hidden="true" />
-                          <span>Web</span>
-                        </RailActionButton>
-                        <RailActionButton
-                          aria-label="History"
-                          data-active={activeView === "architecture"}
-                          onClick={() => showView("architecture")}
-                          title="Todo, task, and scan history"
-                          type="button"
-                        >
-                          <ButtonForgeIcon aria-hidden="true" />
-                          <span>History</span>
-                        </RailActionButton>
-                      </>
+                    {(shouldShowTerminalNav || shouldShowWorkspaceDetailNav) && (
+                      <RailViewActions aria-label="Workspace views">
+                        {shouldShowTerminalNav && (
+                          <RailActionButton
+                            aria-label="Terminals"
+                            data-active={activeView === DEFAULT_WORKSPACE_VIEW}
+                            onClick={() => showView(DEFAULT_WORKSPACE_VIEW)}
+                            title="Terminals"
+                            type="button"
+                          >
+                            <RailTerminalIcon aria-hidden="true" />
+                            <span>Terminals</span>
+                          </RailActionButton>
+                        )}
+                        {shouldShowWorkspaceDetailNav && (
+                          <>
+                            <RailActionButton
+                              aria-label="Files"
+                              data-active={activeView === "files"}
+                              onClick={() => showView("files")}
+                              title="Files"
+                              type="button"
+                            >
+                              <RailFilesIcon aria-hidden="true" />
+                              <span>Files</span>
+                            </RailActionButton>
+                            <RailActionButton
+                              aria-label="Web"
+                              data-active={activeView === "web"}
+                              onClick={() => showView("web")}
+                              title="Web"
+                              type="button"
+                            >
+                              <RailWebIcon aria-hidden="true" />
+                              <span>Web</span>
+                            </RailActionButton>
+                            <RailActionButton
+                              aria-label="History"
+                              data-active={activeView === "architecture"}
+                              onClick={() => showView("architecture")}
+                              title="Todo, task, and scan history"
+                              type="button"
+                            >
+                              <RailHistoryIcon aria-hidden="true" />
+                              <span>History</span>
+                            </RailActionButton>
+                          </>
+                        )}
+                      </RailViewActions>
                     )}
                     <RailGlobalActions aria-label="Global controls">
                       <RailActionButton
@@ -49385,7 +49413,7 @@ export default function App() {
                         title="Docs, MCPs, CLIs & Scripts"
                         type="button"
                       >
-                        <ButtonHubIcon aria-hidden="true" />
+                        <RailToolsIcon aria-hidden="true" />
                         <span>Tools</span>
                       </RailActionButton>
                       <RailActionButton
@@ -49396,7 +49424,7 @@ export default function App() {
                         title="Assets"
                         type="button"
                       >
-                        <ButtonAssetsIcon aria-hidden="true" />
+                        <RailAssetsIcon aria-hidden="true" />
                         <span>Assets</span>
                       </RailActionButton>
                       <RailActionButton
@@ -49407,7 +49435,7 @@ export default function App() {
                         title="Snipping"
                         type="button"
                       >
-                        <ButtonSnippingIcon aria-hidden="true" />
+                        <RailSnippingIcon aria-hidden="true" />
                         <span>Snipping</span>
                       </RailActionButton>
                       <RailActionButton
@@ -49418,7 +49446,7 @@ export default function App() {
                         title="Audio"
                         type="button"
                       >
-                        <ButtonMicIcon aria-hidden="true" />
+                        <RailAudioIcon aria-hidden="true" />
                         <span>Audio</span>
                       </RailActionButton>
                       <RailActionButton
@@ -49429,7 +49457,7 @@ export default function App() {
                         title="Tokenomics"
                         type="button"
                       >
-                        <ButtonBrowserIcon aria-hidden="true" />
+                        <RailTokenomicsIcon aria-hidden="true" />
                         <span>Tokenomics</span>
                       </RailActionButton>
                       <RailActionButton
@@ -49440,7 +49468,7 @@ export default function App() {
                         title="Settings"
                         type="button"
                       >
-                        <ButtonSettingsIcon aria-hidden="true" />
+                        <RailSettingsIcon aria-hidden="true" />
                         <span>Settings</span>
                       </RailActionButton>
                       <RailActionButton
@@ -49450,7 +49478,7 @@ export default function App() {
                         title="Help"
                         type="button"
                       >
-                        <ButtonBrowserIcon aria-hidden="true" />
+                        <RailHelpIcon aria-hidden="true" />
                         <span>Help</span>
                       </RailActionButton>
                       <RailActionButton
@@ -49461,7 +49489,7 @@ export default function App() {
                         title="Sign out"
                         type="button"
                       >
-                        <ButtonLogoutIcon aria-hidden="true" />
+                        <RailSignOutIcon aria-hidden="true" />
                         <span>Sign out</span>
                       </RailActionButton>
                     </RailGlobalActions>
@@ -49546,7 +49574,7 @@ export default function App() {
                           key={runtimeWorkspace.id}
                         >
                           <TerminalView
-                            accountKey={authAccountKey || user?.id || user?.email || ""}
+                            accountKey={resolvedTokenomicsAccountKey}
                             architectureTerminalActivity={workspaceArchitectureTerminalActivity[runtimeWorkspace.id]?.latest || null}
                             architectureWorkspaceRoot={runtimeDescriptor.workingDirectory}
                             architectureWorkspaceState={runtimeArchitectureGraphState}
@@ -51110,7 +51138,7 @@ export default function App() {
               ) : visibleView === "tokenomics" ? (
                 <ForgeWorkspace aria-label="Account Tokenomics" data-motion={viewMotion}>
                   <AccountTokenomicsView
-                    accountKey={authAccountKey || user?.id || user?.email || ""}
+                    accountKey={resolvedTokenomicsAccountKey}
                     billingStatus={billingStatus}
                     storageUsage={cloudWorkspaceProgress.storageUsage}
                   />
@@ -51359,7 +51387,7 @@ export default function App() {
                                 }}
                               >
                                 <TodoQueuePanel
-                                  accountKey={authAccountKey || user?.id || user?.email || ""}
+                                  accountKey={resolvedTokenomicsAccountKey}
                                   activeWorkspaceToolId={accountWorkspaceToolTab}
                                   agentStatuses={agentStatuses}
                                   billingStatus={billingStatus}

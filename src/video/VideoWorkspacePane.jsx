@@ -9,6 +9,8 @@ import { Close } from "@styled-icons/material-rounded/Close";
 import { Delete } from "@styled-icons/material-rounded/Delete";
 import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
 import { PermMedia } from "@styled-icons/material-rounded/PermMedia";
+import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
+import AgentActivityPanel from "./AgentActivityPanel.jsx";
 import MediaBin from "./MediaBin.jsx";
 import Timeline from "./Timeline.jsx";
 import VideoEditor from "./VideoEditor.jsx";
@@ -230,6 +232,59 @@ const EditorArea = styled.div`
   display: flex;
   flex-direction: column;
   position: relative;
+`;
+
+const AgentUnseenDot = styled.span`
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: #34d399;
+  flex: none;
+`;
+
+// Transient chip announcing an agent's MCP edit, with one-tap undo.
+const AgentEditToast = styled.div`
+  position: absolute;
+  top: 8px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(520px, 90%);
+  padding: 5px 8px 5px 12px;
+  border: 1px solid rgba(16, 185, 129, 0.45);
+  border-radius: 999px;
+  background: rgba(3, 12, 9, 0.95);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.45);
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    font-size: 10.5px;
+    font-weight: 650;
+    color: #a7f3d0;
+  }
+
+  button {
+    appearance: none;
+    border: 1px solid rgba(148, 163, 184, 0.25);
+    background: transparent;
+    color: #e2e8f0;
+    font-size: 10px;
+    font-weight: 750;
+    padding: 2px 9px;
+    border-radius: 999px;
+    cursor: pointer;
+    flex: none;
+
+    &:hover {
+      border-color: rgba(16, 185, 129, 0.6);
+    }
+  }
 `;
 
 const PreviewCell = styled.div`
@@ -594,6 +649,10 @@ export default function VideoWorkspacePane({
     setHistoryVersion((version) => version + 1);
   }, []);
 
+  // Assigned below once the autosave/history machinery exists (the watcher
+  // effect above renders earlier than those declarations).
+  const reloadProjectExternalRef = useRef(() => {});
+
   const openProject = useCallback(
     (path) => {
       if (!repoPath || !path) {
@@ -662,11 +721,62 @@ export default function VideoWorkspacePane({
     }
   }, [projectPath, storageKey]);
 
+  // prepareAgentContext is defined later (it needs the transcript machinery);
+  // expose it through a stable wrapper so this effect never re-fires for it.
+  const prepareAgentContextRef = useRef(null);
+  const prepareAgentContextStable = useCallback(
+    () => (prepareAgentContextRef.current ? prepareAgentContextRef.current() : Promise.resolve("")),
+    [],
+  );
+
   useEffect(() => {
     onProjectChange?.(
-      projectPath ? { path: projectPath, name: project?.name || "", selectionContext } : null,
+      projectPath
+        ? {
+            path: projectPath,
+            name: project?.name || "",
+            selectionContext,
+            prepareContext: prepareAgentContextStable,
+          }
+        : null,
     );
-  }, [onProjectChange, project?.name, projectPath, selectionContext]);
+  }, [onProjectChange, prepareAgentContextStable, project?.name, projectPath, selectionContext]);
+
+  // Mirror the pane's live selection state into Rust so the video MCP tools
+  // (video_context) can report ranges/playhead/selection to agents. While
+  // playing the playhead dep is parked (-1) — seeks and pauses re-push.
+  const agentStatePlayheadMs = playing ? -1 : Math.round(playheadUiMs);
+  useEffect(() => {
+    if (!repoPath) {
+      return undefined;
+    }
+    const timer = window.setTimeout(() => {
+      invoke("video_agent_state_set", {
+        repoPath,
+        projectPath: projectPath || "",
+        ranges: ranges.map((range) => ({ startMs: range.startMs, endMs: range.endMs })),
+        playheadMs: Math.round(playbackRef.current?.getMs?.() || 0),
+        selectedClipIds,
+      }).catch(() => {});
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [agentStatePlayheadMs, projectPath, ranges, repoPath, selectedClipIds]);
+
+  // Pane closing (or switching repos) clears its agent state in Rust.
+  useEffect(() => {
+    if (!repoPath) {
+      return undefined;
+    }
+    return () => {
+      invoke("video_agent_state_set", {
+        repoPath,
+        projectPath: "",
+        ranges: [],
+        playheadMs: 0,
+        selectedClipIds: [],
+      }).catch(() => {});
+    };
+  }, [repoPath]);
 
   // Install progress stream.
   useEffect(() => {
@@ -725,7 +835,9 @@ export default function VideoWorkspacePane({
         const current = projectPathRef.current;
         const ownWriteRecent = Date.now() - lastLocalWriteAtRef.current < 2000;
         if (current && !ownWriteRecent && (!paths.length || paths.includes(current))) {
-          openProject(current);
+          // External (agent/file) edit: reload in place — preserve undo
+          // history and never let a stale pending autosave clobber it.
+          reloadProjectExternalRef.current(current);
         }
       }
     })
@@ -741,7 +853,7 @@ export default function VideoWorkspacePane({
       disposed = true;
       unlisten();
     };
-  }, [openProject, refreshAssets, refreshProjects, repoPath]);
+  }, [refreshAssets, refreshProjects, repoPath]);
 
   // Autosave: target path captured at edit time (switching projects inside
   // the debounce window must not cross-write), flushed on unmount.
@@ -806,6 +918,42 @@ export default function VideoWorkspacePane({
     [scheduleSave],
   );
 
+  // Assigned once the agent-toast machinery (defined below) exists.
+  const flushPendingAgentToastRef = useRef(null);
+
+  // External reload (agent MCP writes, direct file edits): drop any pending
+  // stale autosave, keep the pre-reload project as an undo entry, and swap
+  // the project in place without resetting playhead/selection/view.
+  const reloadProjectExternal = useCallback(
+    (path) => {
+      if (!repoPath || !path) {
+        return;
+      }
+      pendingSaveRef.current = null;
+      window.clearTimeout(saveTimerRef.current);
+      invoke("video_project_read", { repoPath, projectPath: path })
+        .then((result) => {
+          const next = normalizeProject(result?.project);
+          if (projectStateRef.current) {
+            const history = historyRef.current;
+            history.past.push(projectStateRef.current);
+            if (history.past.length > HISTORY_LIMIT) {
+              history.past.shift();
+            }
+            history.future = [];
+            setHistoryVersion((version) => version + 1);
+          }
+          setProject(next);
+          setPaneError("");
+          // History entry is in — an agent-edit toast may now safely offer Undo.
+          flushPendingAgentToastRef.current?.();
+        })
+        .catch(() => {});
+    },
+    [repoPath],
+  );
+  reloadProjectExternalRef.current = reloadProjectExternal;
+
   const undo = useCallback(() => {
     const history = historyRef.current;
     const previous = history.past.pop();
@@ -818,6 +966,119 @@ export default function VideoWorkspacePane({
     setHistoryVersion((version) => version + 1);
     handleProjectChange(previous, { fromHistory: true });
   }, [handleProjectChange]);
+
+  // Agent activity feed: every video MCP call mirrors one start + one
+  // done/error event, matched by id. Rendered icon-first in the Agent tab.
+  const [agentActivity, setAgentActivity] = useState([]);
+  const [agentActivityUnseen, setAgentActivityUnseen] = useState(0);
+  const sidePanelRef = useRef(sidePanel);
+  sidePanelRef.current = sidePanel;
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen("video-agent-activity", (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      if (
+        !payload.id ||
+        normalizeRepoIdentity(payload.repoPath) !== normalizeRepoIdentity(repoPath)
+      ) {
+        return;
+      }
+      setAgentActivity((current) => {
+        const index = current.findIndex((entry) => entry.id === payload.id);
+        if (index >= 0) {
+          const next = [...current];
+          next[index] = { ...next[index], ...payload, atMs: next[index].atMs };
+          return next;
+        }
+        return [{ ...payload, atMs: Date.now() }, ...current].slice(0, 40);
+      });
+      if (payload.phase === "start" && sidePanelRef.current !== "agent") {
+        setAgentActivityUnseen((count) => Math.min(99, count + 1));
+      }
+    })
+      .then((next) => {
+        if (disposed) {
+          next();
+        } else {
+          unlisten = next;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [repoPath]);
+
+  // Agent MCP edits announce themselves (rust emits video-agent-edited right
+  // after the write). The toast is shown only once the external reload has
+  // pushed the pre-edit project into history — otherwise a fast Undo click
+  // would pop the WRONG entry. Fallback shows it after 3s regardless.
+  const [agentEditToast, setAgentEditToast] = useState(null); // { summary, canUndo }
+  const pendingAgentToastRef = useRef(null); // { summary, at, fallbackTimer }
+  const agentToastHideTimerRef = useRef(0);
+  const showAgentToast = useCallback((summary, canUndo = true) => {
+    setAgentEditToast({ summary, canUndo });
+    window.clearTimeout(agentToastHideTimerRef.current);
+    agentToastHideTimerRef.current = window.setTimeout(() => setAgentEditToast(null), 8000);
+  }, []);
+  const flushPendingAgentToast = useCallback(() => {
+    const pending = pendingAgentToastRef.current;
+    if (!pending) {
+      return;
+    }
+    pendingAgentToastRef.current = null;
+    window.clearTimeout(pending.fallbackTimer);
+    showAgentToast(pending.summary);
+  }, [showAgentToast]);
+  flushPendingAgentToastRef.current = flushPendingAgentToast;
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen("video-agent-edited", (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      if (payload.projectPath && projectPathRef.current && payload.projectPath !== projectPathRef.current) {
+        return;
+      }
+      const summary = String(payload.summary || "timeline edited");
+      const previous = pendingAgentToastRef.current;
+      if (previous) {
+        window.clearTimeout(previous.fallbackTimer);
+      }
+      const fallbackTimer = window.setTimeout(() => {
+        if (pendingAgentToastRef.current) {
+          pendingAgentToastRef.current = null;
+          // Reload never landed — no history entry was pushed, so offering
+          // Undo here would pop the user's own previous edit. Info only.
+          showAgentToast(summary, false);
+        }
+      }, 3000);
+      pendingAgentToastRef.current = { summary, at: Date.now(), fallbackTimer };
+    })
+      .then((next) => {
+        if (disposed) {
+          next();
+        } else {
+          unlisten = next;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      window.clearTimeout(agentToastHideTimerRef.current);
+      if (pendingAgentToastRef.current) {
+        window.clearTimeout(pendingAgentToastRef.current.fallbackTimer);
+      }
+      unlisten();
+    };
+  }, [showAgentToast]);
 
   const redo = useCallback(() => {
     const history = historyRef.current;
@@ -993,6 +1254,10 @@ export default function VideoWorkspacePane({
     }
     return map;
   }, [assets]);
+  const assetsByPathRef = useRef(assetsByPath);
+  assetsByPathRef.current = assetsByPath;
+  const rangesRef = useRef(ranges);
+  rangesRef.current = ranges;
 
   // Restore the persisted transcript/asset panel target once assets load;
   // if the asset no longer exists, close that panel gracefully.
@@ -1039,6 +1304,57 @@ export default function VideoWorkspacePane({
       openSidePanel("transcript");
     },
     [openSidePanel],
+  );
+
+  // Clicking an Agent-feed entry jumps to the thing it touched.
+  const handleAgentActivityNavigate = useCallback(
+    (entry) => {
+      const tool = String(entry?.tool || "");
+      const detail = entry?.detail || {};
+      const result = entry?.result || {};
+      if (tool === "video_transcribe") {
+        const paths = Array.isArray(result.results) && result.results.length
+          ? result.results.map((row) => row.assetPath)
+          : Array.isArray(detail.paths)
+            ? detail.paths
+            : [];
+        const asset = paths.map((path) => assetsByPathRef.current[path]).find(Boolean);
+        if (asset) {
+          openTranscript(asset);
+          return;
+        }
+        setLibraryOpen(true);
+        return;
+      }
+      if (tool === "video_edit") {
+        const ids = Array.isArray(result.changedClipIds) ? result.changedClipIds : [];
+        if (ids.length) {
+          setSelectedClipIds(ids); // Timeline scrolls new selections into view
+        }
+        return;
+      }
+      if (tool === "video_look") {
+        const at = Number(detail.atMs) || (Array.isArray(detail.timesMs) ? Number(detail.timesMs[0]) : NaN);
+        if (Number.isFinite(at)) {
+          commitSeek(at);
+        }
+        return;
+      }
+      if (tool === "video_media") {
+        setLibraryOpen(true);
+        return;
+      }
+      if (tool === "video_generate") {
+        setSidePanel("generate");
+        return;
+      }
+      if (tool === "video_export") {
+        setSidePanel("export");
+        return;
+      }
+      // video_context — nothing spatial to jump to.
+    },
+    [commitSeek, openTranscript],
   );
 
   const openAssetPanel = useCallback(
@@ -1279,64 +1595,177 @@ export default function VideoWorkspacePane({
     };
   }, [refreshAssets]);
 
+  // Builds the range-scoped context string handed to agents. Shared between
+  // the live effect below and the pre-submit prepareAgentContext flow.
+  const buildSelectionContext = useCallback(async () => {
+    const currentProject = projectStateRef.current;
+    const currentRanges = rangesRef.current;
+    if (!currentRanges.length || !currentProject) {
+      return "";
+    }
+    const lines = ["Selected timeline ranges (scope any edits to these):"];
+    for (const range of currentRanges) {
+      const overlapping = clipsInRange(currentProject, range.startMs, range.endMs);
+      const clipBits = [];
+      for (const { track, clip } of overlapping) {
+        if (track.kind === "text") {
+          clipBits.push(`text "${String(clip.text || "").slice(0, 60)}" on ${track.label}`);
+          continue;
+        }
+        let bit = `${clip.assetPath} on ${track.label} (${formatTimecode(clip.timelineStartMs)}–${formatTimecode(clip.timelineStartMs + clip.durationMs)})`;
+        const asset = assetsByPathRef.current[clip.assetPath];
+        // Cache-first regardless of the (possibly stale) hasTranscript flag —
+        // the pre-submit flow seeds the cache right after transcribing.
+        let transcript = transcriptCacheRef.current.get(clip.assetPath);
+        if (transcript === undefined && asset?.hasTranscript) {
+          try {
+            transcript = await invoke("video_transcript_get", { repoPath, path: clip.assetPath });
+          } catch {
+            transcript = null;
+          }
+          transcriptCacheRef.current.set(clip.assetPath, transcript);
+        }
+        const segments = Array.isArray(transcript?.segments) ? transcript.segments : [];
+        if (segments.length) {
+          const speed = clip.speed || 1;
+          // Clamp the window to the actual clip overlap — a range extending
+          // past the clip must not pull transcript after the visible media.
+          const overlapStart = Math.max(range.startMs, clip.timelineStartMs);
+          const overlapEnd = Math.min(range.endMs, clip.timelineStartMs + clip.durationMs);
+          const sourceFrom = (clip.sourceInMs || 0) + Math.max(0, overlapStart - clip.timelineStartMs) * speed;
+          const sourceTo = (clip.sourceInMs || 0) + Math.max(0, overlapEnd - clip.timelineStartMs) * speed;
+          const excerpt = segments
+            .filter((segment) => segment.startMs < sourceTo && segment.endMs > sourceFrom)
+            .map((segment) => segment.text)
+            .join(" ")
+            .slice(0, 400);
+          if (excerpt) {
+            bit += ` — transcript: "${excerpt}"`;
+          }
+        }
+        clipBits.push(bit);
+      }
+      lines.push(
+        `- ${formatTimecode(range.startMs)}–${formatTimecode(range.endMs)}: ${clipBits.length ? clipBits.join("; ") : "empty"}`,
+      );
+    }
+    return lines.join("\n");
+  }, [repoPath]);
+
   useEffect(() => {
     if (!ranges.length || !project) {
       setSelectionContext("");
       return undefined;
     }
     let cancelled = false;
-    const build = async () => {
-      const lines = ["Selected timeline ranges (scope any edits to these):"];
-      for (const range of ranges) {
-        const overlapping = clipsInRange(project, range.startMs, range.endMs);
-        const clipBits = [];
-        for (const { track, clip } of overlapping) {
-          if (track.kind === "text") {
-            clipBits.push(`text "${String(clip.text || "").slice(0, 60)}" on ${track.label}`);
-            continue;
-          }
-          let bit = `${clip.assetPath} on ${track.label} (${formatTimecode(clip.timelineStartMs)}–${formatTimecode(clip.timelineStartMs + clip.durationMs)})`;
-          const asset = assetsByPath[clip.assetPath];
-          if (asset?.hasTranscript) {
-            let transcript = transcriptCacheRef.current.get(clip.assetPath);
-            if (transcript === undefined) {
-              try {
-                transcript = await invoke("video_transcript_get", { repoPath, path: clip.assetPath });
-              } catch {
-                transcript = null;
-              }
-              transcriptCacheRef.current.set(clip.assetPath, transcript);
-            }
-            const segments = Array.isArray(transcript?.segments) ? transcript.segments : [];
-            if (segments.length) {
-              const speed = clip.speed || 1;
-              const sourceFrom = (clip.sourceInMs || 0) + Math.max(0, range.startMs - clip.timelineStartMs) * speed;
-              const sourceTo = (clip.sourceInMs || 0) + Math.max(0, range.endMs - clip.timelineStartMs) * speed;
-              const excerpt = segments
-                .filter((segment) => segment.startMs < sourceTo && segment.endMs > sourceFrom)
-                .map((segment) => segment.text)
-                .join(" ")
-                .slice(0, 400);
-              if (excerpt) {
-                bit += ` — transcript: "${excerpt}"`;
-              }
-            }
-          }
-          clipBits.push(bit);
+    buildSelectionContext()
+      .then((text) => {
+        if (!cancelled) {
+          setSelectionContext(text);
         }
-        lines.push(
-          `- ${formatTimecode(range.startMs)}–${formatTimecode(range.endMs)}: ${clipBits.length ? clipBits.join("; ") : "empty"}`,
-        );
-      }
-      if (!cancelled) {
-        setSelectionContext(lines.join("\n"));
-      }
-    };
-    void build();
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
-  }, [assetsByPath, project, ranges, repoPath]);
+  }, [assetsByPath, buildSelectionContext, project, ranges]);
+
+  // Pre-submit hook for the agent composer: media under the selected ranges
+  // that has no transcript yet gets transcribed FIRST, so the prompt goes out
+  // with full word-timed context instead of the agent discovering gaps.
+  const prepareAgentContext = useCallback(async () => {
+    const currentProject = projectStateRef.current;
+    const currentRanges = rangesRef.current;
+    if (!currentProject || !currentRanges.length || !repoPath) {
+      return buildSelectionContext();
+    }
+    const missing = new Set();
+    for (const range of currentRanges) {
+      for (const { track, clip } of clipsInRange(currentProject, range.startMs, range.endMs)) {
+        if (track.kind === "text" || !clip.assetPath) {
+          continue;
+        }
+        const asset = assetsByPathRef.current[clip.assetPath];
+        if (asset && !asset.pending && !asset.hasTranscript && (asset.kind === "video" || asset.kind === "audio")) {
+          missing.add(clip.assetPath);
+        }
+      }
+    }
+    if (missing.size) {
+      const prepActivityId = `prep-${Date.now()}`;
+      setAgentActivity((current) => [
+        {
+          id: prepActivityId,
+          tool: "video_transcribe",
+          phase: "start",
+          detail: { paths: [...missing], scope: "pre-submit" },
+          atMs: Date.now(),
+        },
+        ...current,
+      ].slice(0, 40));
+      try {
+        window.dispatchEvent(new CustomEvent("diffforge-video-agent-prep", {
+          detail: { phase: "transcribing", count: missing.size },
+        }));
+      } catch {
+        /* hint only */
+      }
+      await Promise.all(
+        [...missing].map(
+          (path) =>
+            new Promise((resolve) => {
+              const timeout = window.setTimeout(() => resolve(), 240_000);
+              let unlisten = () => {};
+              listen(VIDEO_TRANSCRIBE_PROGRESS_EVENT, (event) => {
+                const payload = event?.payload || {};
+                if (String(payload.path || "") === path && (payload.done || payload.error)) {
+                  window.clearTimeout(timeout);
+                  unlisten();
+                  resolve();
+                }
+              })
+                .then((next) => {
+                  unlisten = next;
+                  return invoke("video_transcribe_start", { repoPath, path, force: false });
+                })
+                .catch(() => {
+                  window.clearTimeout(timeout);
+                  unlisten();
+                  resolve();
+                });
+            }),
+        ),
+      );
+      // Seed the cache directly — refreshAssets is async and the context
+      // build below must not race the hasTranscript flag refresh.
+      await Promise.all(
+        [...missing].map(async (path) => {
+          transcriptCacheRef.current.delete(path);
+          try {
+            const transcript = await invoke("video_transcript_get", { repoPath, path });
+            if (transcript?.available !== false) {
+              transcriptCacheRef.current.set(path, transcript);
+            }
+          } catch {
+            /* transcription failed — context simply omits this clip's text */
+          }
+        }),
+      );
+      refreshAssets();
+      setAgentActivity((current) =>
+        current.map((entry) =>
+          entry.id === prepActivityId ? { ...entry, phase: "done" } : entry,
+        ),
+      );
+      try {
+        window.dispatchEvent(new CustomEvent("diffforge-video-agent-prep", { detail: { phase: "done" } }));
+      } catch {
+        /* hint only */
+      }
+    }
+    return buildSelectionContext();
+  }, [buildSelectionContext, refreshAssets, repoPath]);
+  prepareAgentContextRef.current = prepareAgentContext;
 
   const toggleSidePanel = useCallback(
     (panel) => {
@@ -1452,6 +1881,8 @@ export default function VideoWorkspacePane({
     />
   ) : sidePanel === "export" ? (
     <ExportPanel ffmpegReady={ffmpegReady} project={project} projectPath={projectPath} repoPath={repoPath} />
+  ) : sidePanel === "agent" ? (
+    <AgentActivityPanel entries={agentActivity} onNavigate={handleAgentActivityNavigate} />
   ) : null;
 
   return (
@@ -1559,6 +1990,21 @@ export default function VideoWorkspacePane({
                 Generate
               </VideoRailButton>
               <VideoRailButton
+                data-active={sidePanel === "agent" ? "true" : "false"}
+                onClick={() => {
+                  setAgentActivityUnseen(0);
+                  toggleSidePanel("agent");
+                }}
+                title="Agent activity — everything agents did via MCP"
+                type="button"
+              >
+                <SmartToy aria-hidden="true" />
+                Agent
+                {agentActivityUnseen > 0 && sidePanel !== "agent" ? (
+                  <AgentUnseenDot aria-hidden />
+                ) : null}
+              </VideoRailButton>
+              <VideoRailButton
                 data-active={sidePanel === "export" ? "true" : "false"}
                 onClick={() => toggleSidePanel("export")}
                 title="Export"
@@ -1570,6 +2016,25 @@ export default function VideoWorkspacePane({
             </VideoRail>
             {paneError ? <VideoErrorText style={{ padding: "3px 10px" }}>{paneError}</VideoErrorText> : null}
             <EditorArea>
+              {agentEditToast ? (
+                <AgentEditToast>
+                  <span title={agentEditToast.summary}>✨ Agent: {agentEditToast.summary}</span>
+                  {agentEditToast.canUndo ? (
+                    <button
+                      onClick={() => {
+                        undo();
+                        setAgentEditToast(null);
+                      }}
+                      type="button"
+                    >
+                      Undo
+                    </button>
+                  ) : null}
+                  <button onClick={() => setAgentEditToast(null)} type="button">
+                    ✕
+                  </button>
+                </AgentEditToast>
+              ) : null}
               {wide ? (
                 // Keyed by the visible-panel combo: toggling a panel remounts
                 // the group so every panel reopens at a USABLE default width
@@ -1643,7 +2108,9 @@ export default function VideoWorkspacePane({
                             ? "Transcript"
                             : sidePanel === "asset"
                               ? "Asset"
-                              : "Export"}
+                              : sidePanel === "agent"
+                                ? "Agent"
+                                : "Export"}
                         <VideoRailSpacer />
                         <VideoIconButton onClick={() => setSidePanel("")} title="Close" type="button">
                           <Close aria-hidden="true" />

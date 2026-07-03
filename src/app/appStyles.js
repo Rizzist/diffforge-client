@@ -49,6 +49,18 @@ import { Terminal as TerminalIcon } from "@styled-icons/material-rounded/Termina
 import { TerminalFill as AgentTerminalGlyph } from "@styled-icons/bootstrap/TerminalFill";
 import { LayoutSplit } from "@styled-icons/bootstrap/LayoutSplit";
 import { LayoutRow } from "@styled-icons/remix-line/LayoutRow";
+import { Cloud as RailCloudGlyph } from "@styled-icons/fluentui-system-regular/Cloud";
+import { Cube as RailCubeGlyph } from "@styled-icons/fluentui-system-regular/Cube";
+import { Cut as RailCutGlyph } from "@styled-icons/fluentui-system-regular/Cut";
+import { Folder as RailFolderGlyph } from "@styled-icons/fluentui-system-regular/Folder";
+import { Globe as RailGlobeGlyph } from "@styled-icons/fluentui-system-regular/Globe";
+import { History as RailHistoryGlyph } from "@styled-icons/fluentui-system-regular/History";
+import { Mic as RailMicGlyph } from "@styled-icons/fluentui-system-regular/Mic";
+import { QuestionCircle as RailQuestionCircleGlyph } from "@styled-icons/fluentui-system-regular/QuestionCircle";
+import { Settings as RailSettingsGlyph } from "@styled-icons/fluentui-system-regular/Settings";
+import { SignOut as RailSignOutGlyph } from "@styled-icons/fluentui-system-regular/SignOut";
+import { WindowConsole as RailTerminalGlyph } from "@styled-icons/fluentui-system-regular/WindowConsole";
+import { WrenchScrewdriver as RailWrenchScrewdriverGlyph } from "@styled-icons/fluentui-system-regular/WrenchScrewdriver";
 import CodexBrandGlyph from "@likec4/icons/tech/openai-icon";
 import ClaudeBrandGlyph from "@likec4/icons/tech/claude-icon";
 
@@ -3320,8 +3332,8 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
 export const WorkspaceAccent = styled.span`
   align-self: center;
   justify-self: center;
-  width: 10px;
-  height: 10px;
+  width: 12px;
+  height: 12px;
   border: 1px solid var(--workspace-card-status-border);
   border-radius: 3px;
   box-sizing: border-box;
@@ -3344,6 +3356,13 @@ export const WorkspaceAccent = styled.span`
     border-color: var(--workspace-card-status-border);
     background: var(--workspace-card-status);
     box-shadow: 0 0 10px rgba(var(--forge-accent-rgb), 0.2);
+    transform: scale(1.08);
+  }
+
+  ${WorkspaceButton}[data-selected="true"] & {
+    border-color: rgba(var(--forge-accent-soft-rgb), 0.7);
+    background: var(--forge-accent);
+    box-shadow: 0 0 8px rgba(var(--forge-accent-rgb), 0.55);
     transform: scale(1.08);
   }
 
@@ -3395,11 +3414,8 @@ export const RailFooter = styled.div`
   overscroll-behavior: contain;
   padding-top: 8px;
   padding-right: 2px;
-  border-top: 1px solid var(--forge-border);
   scrollbar-gutter: stable;
-  background:
-    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.04), transparent),
-    rgba(7, 9, 13, 0.7);
+  background: transparent;
   opacity: 1;
   animation: ${railContentReveal} 260ms cubic-bezier(0.2, 0.8, 0.2, 1) 220ms both;
   transition:
@@ -3409,9 +3425,34 @@ export const RailFooter = styled.div`
     padding 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   html[data-forge-theme="light"] & {
+    background: transparent;
+  }
+`;
+
+export const RailViewActions = styled.div`
+  display: grid;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid var(--forge-border);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.018), transparent),
+    rgba(230, 236, 245, 0.015);
+  transition:
+    padding 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    border-color 160ms ease,
+    background 160ms ease;
+
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    padding: 3px;
+    border-color: rgba(230, 236, 245, 0.075);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(var(--forge-tint-rgb), 0.12);
     background:
-      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.045), transparent),
-      rgba(245, 245, 247, 0.68);
+      linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.02), transparent),
+      var(--forge-surface);
   }
 `;
 
@@ -3419,12 +3460,12 @@ export const RailGlobalActions = styled.div`
   display: grid;
   gap: 2px;
   margin-top: 7px;
-  padding: 4px;
-  border: 1px solid rgba(230, 236, 245, 0.1);
-  border-radius: 8px;
+  padding: 5px;
+  border: 1px solid var(--forge-border);
+  border-radius: 10px;
   background:
     linear-gradient(180deg, rgba(var(--forge-tint-rgb), 0.018), transparent),
-    rgba(230, 236, 245, 0.018);
+    rgba(230, 236, 245, 0.015);
   transition:
     padding 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
     border-color 160ms ease,
@@ -3446,14 +3487,15 @@ export const RailGlobalActions = styled.div`
 
 export const RailActionButton = styled.button`
   position: relative;
-  display: inline-flex;
+  display: grid;
   width: 100%;
   min-width: 0;
   max-width: 100%;
   min-height: 32px;
+  grid-template-columns: 30px minmax(0, 1fr);
   align-items: center;
-  gap: 8px;
-  padding: 0 9px 0 11px;
+  gap: 0;
+  padding: 0 9px 0 5px;
   border: 1px solid transparent;
   border-radius: 8px;
   box-sizing: border-box;
@@ -3473,11 +3515,11 @@ export const RailActionButton = styled.button`
 
   &::before {
     position: absolute;
-    top: 8px;
-    bottom: 8px;
-    left: 3px;
-    width: 2px;
-    border-radius: 999px;
+    top: 7px;
+    bottom: 7px;
+    left: 2px;
+    width: 3px;
+    border-radius: 3px;
     background: transparent;
     content: "";
     transition:
@@ -3488,8 +3530,9 @@ export const RailActionButton = styled.button`
   svg {
     display: block;
     flex: 0 0 auto;
-    width: 15px;
-    height: 15px;
+    width: 16px;
+    height: 16px;
+    justify-self: center;
     margin: 0;
     color: var(--forge-text-muted);
     transition: color 160ms ease;
@@ -3517,13 +3560,14 @@ export const RailActionButton = styled.button`
   }
 
   &[data-active="true"] {
-    border-color: rgba(var(--forge-accent-soft-rgb), 0.28);
-    background: rgba(var(--forge-accent-soft-rgb), 0.12);
+    border-color: var(--forge-accent-selected-border);
+    background: var(--forge-accent-selected-bg);
+    box-shadow: 0 0 0 1px var(--forge-accent-selected-ring);
   }
 
   &[data-active="true"]::before {
-    background: var(--forge-accent-soft);
-    box-shadow: 0 0 10px rgba(var(--forge-accent-rgb), 0.22);
+    background: var(--forge-accent);
+    box-shadow: 0 0 10px rgba(var(--forge-accent-rgb), 0.3);
   }
 
   &[data-active="true"] svg,
@@ -3563,7 +3607,7 @@ export const RailActionButton = styled.button`
 
   &[data-scope="global"] {
     min-height: 34px;
-    padding-left: 8px;
+    padding-left: 5px;
     border-color: transparent;
     color: #98a3b1;
     background: transparent;
@@ -3654,7 +3698,8 @@ export const RailActionButton = styled.button`
 
   ${WorkspaceRail}[data-collapsed="true"] & {
     min-height: 30px;
-    justify-content: center;
+    grid-template-columns: 1fr;
+    justify-items: center;
     gap: 0;
     padding: 0;
   }
@@ -3682,9 +3727,10 @@ export const RailActionButton = styled.button`
 
   @media (max-width: 760px) {
     min-height: 32px;
-    justify-content: flex-start;
-    gap: 8px;
-    padding: 0 9px 0 11px;
+    grid-template-columns: 30px minmax(0, 1fr);
+    justify-items: stretch;
+    gap: 0;
+    padding: 0 9px 0 5px;
 
     &::before {
       top: 8px;
@@ -3703,7 +3749,7 @@ export const RailActionButton = styled.button`
 
     &[data-scope="global"] {
       min-height: 34px;
-      padding-left: 8px;
+      padding-left: 5px;
     }
   }
 `;
@@ -9073,10 +9119,10 @@ export const TerminalWorkspaceSurface = styled.section`
   &[data-focused="true"]::after {
     opacity: 1;
     box-shadow:
-      inset 0 0 0 2px rgba(132, 157, 190, 0.58),
-      inset 0 0 0 1px rgba(226, 232, 240, 0.18),
-      inset 0 0 14px rgba(132, 157, 190, 0.06),
-      0 0 12px rgba(132, 157, 190, 0.14);
+      inset 0 0 0 2px rgba(var(--forge-accent-soft-rgb), 0.55),
+      inset 0 0 0 1px rgba(var(--forge-accent-rgb), 0.24),
+      inset 0 0 14px rgba(var(--forge-accent-rgb), 0.06),
+      0 0 12px rgba(var(--forge-accent-rgb), 0.18);
   }
 
   &[data-threads-view="true"]::after {
@@ -21482,6 +21528,60 @@ export const titleIconSize = `
   width: 15px;
   height: 15px;
   flex: 0 0 auto;
+`;
+
+const railActionIconSize = `
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+`;
+
+export const RailTerminalIcon = styled(RailTerminalGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailFilesIcon = styled(RailFolderGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailWebIcon = styled(RailGlobeGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailHistoryIcon = styled(RailHistoryGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailToolsIcon = styled(RailWrenchScrewdriverGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailAssetsIcon = styled(RailCloudGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailSnippingIcon = styled(RailCutGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailAudioIcon = styled(RailMicGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailTokenomicsIcon = styled(RailCubeGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailSettingsIcon = styled(RailSettingsGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailHelpIcon = styled(RailQuestionCircleGlyph)`
+  ${railActionIconSize}
+`;
+
+export const RailSignOutIcon = styled(RailSignOutGlyph)`
+  ${railActionIconSize}
 `;
 
 export const TitleBackgroundIcon = styled(TitleBackgroundGlyph)`

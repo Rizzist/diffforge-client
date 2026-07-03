@@ -907,6 +907,7 @@ export default function GeneratePanel({
             numImages: caps.maxImages ? numImages : null,
             sound: caps.supportsSound ? sound : null,
             voice: caps.voices ? voice : null,
+            providerMode: caps.modes ? genMode : null,
             seed: null,
           },
           loraId: null,

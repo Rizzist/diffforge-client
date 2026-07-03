@@ -168,6 +168,30 @@ const FolderInput = styled.input`
   flex: none;
 `;
 
+// Library search: filenames instantly, transcript text (cached segments)
+// on a short debounce — matches get a ¶ badge.
+const SearchInput = styled.input`
+  appearance: none;
+  flex: 1 1 auto;
+  min-width: 60px;
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(4, 8, 14, 0.7);
+  color: #e2e8f0;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 999px;
+  outline: none;
+
+  &::placeholder {
+    color: rgba(148, 163, 184, 0.55);
+  }
+
+  &:focus {
+    border-color: rgba(16, 185, 129, 0.5);
+  }
+`;
+
 const AiMenuHeading = styled.div`
   padding: 4px 10px 2px;
   font-size: 8.5px;
@@ -182,8 +206,8 @@ const BinGrid = styled.div`
   min-height: 0;
   overflow-y: auto;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(92px, 1fr));
-  gap: 6px;
+  grid-template-columns: repeat(auto-fill, minmax(72px, 1fr));
+  gap: 5px;
   align-content: start;
   padding: 4px 6px 8px;
 `;
@@ -341,8 +365,8 @@ const AssetKind = styled.span`
 `;
 
 const AssetName = styled.div`
-  padding: 3px 5px 4px;
-  font-size: 9.5px;
+  padding: 2px 4px 3px;
+  font-size: 8.5px;
   font-weight: 650;
   color: rgba(214, 222, 235, 0.9);
   white-space: nowrap;
@@ -476,6 +500,7 @@ export default function MediaBin({
   useEffect(() => {
     let disposed = false;
     let unlisten = () => {};
+    let unlistenUpdated = () => {};
     listen(VIDEO_TRANSCRIBE_PROGRESS_EVENT, (event) => {
       if (disposed) {
         return;
@@ -495,6 +520,7 @@ export default function MediaBin({
         return next;
       });
       if (payload.done && !payload.error) {
+        transcriptTextCacheRef.current.delete(path); // fresh text for search
         onImported?.(); // refresh so hasTranscript badges appear
       }
       if (payload.error) {
@@ -509,9 +535,25 @@ export default function MediaBin({
         }
       })
       .catch(() => {});
+    // Transcript edits/deletes must also invalidate the search cache.
+    listen("video-transcript-updated", (event) => {
+      const path = String(event?.payload?.path || "").trim();
+      if (path) {
+        transcriptTextCacheRef.current.delete(path);
+      }
+    })
+      .then((next) => {
+        if (disposed) {
+          next();
+        } else {
+          unlistenUpdated = next;
+        }
+      })
+      .catch(() => {});
     return () => {
       disposed = true;
       unlisten();
+      unlistenUpdated();
     };
   }, [onImported]);
 
@@ -571,10 +613,69 @@ export default function MediaBin({
   const [newFolderOpen, setNewFolderOpen] = useState(false);
   const [newFolderName, setNewFolderName] = useState("");
 
+  // Search: filename substring instantly; transcript text on a debounce
+  // (segments fetched once per asset and cached for the session).
+  const [query, setQuery] = useState("");
+  const [transcriptHits, setTranscriptHits] = useState(() => new Set());
+  const transcriptTextCacheRef = useRef(new Map()); // path → lowercased full text | null
+  useEffect(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle || !repoPath) {
+      setTranscriptHits(new Set());
+      return undefined;
+    }
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      // Prune cache entries for assets that no longer exist (delete/rename).
+      const livePaths = new Set(assets.map((asset) => asset.path));
+      for (const key of [...transcriptTextCacheRef.current.keys()]) {
+        if (!livePaths.has(key)) {
+          transcriptTextCacheRef.current.delete(key);
+        }
+      }
+      const hits = new Set();
+      await Promise.all(
+        assets
+          .filter((asset) => asset.hasTranscript && !asset.pending)
+          .map(async (asset) => {
+            let text = transcriptTextCacheRef.current.get(asset.path);
+            if (text === undefined) {
+              try {
+                const transcript = await invoke("video_transcript_get", { repoPath, path: asset.path });
+                text = (Array.isArray(transcript?.segments) ? transcript.segments : [])
+                  .map((segment) => String(segment.text || ""))
+                  .join(" ")
+                  .toLowerCase();
+              } catch {
+                text = null;
+              }
+              transcriptTextCacheRef.current.set(asset.path, text);
+            }
+            if (!cancelled && text && text.includes(needle)) {
+              hits.add(asset.path);
+            }
+          }),
+      );
+      if (!cancelled) {
+        setTranscriptHits(hits);
+      }
+    }, 250);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [assets, query, repoPath]);
+
   const visibleAssets = useMemo(() => {
     let list = assets;
     if (activeFolder) {
       list = list.filter((asset) => (asset.folderId || "") === activeFolder);
+    }
+    const needle = query.trim().toLowerCase();
+    if (needle) {
+      list = list.filter(
+        (asset) => String(asset.name || "").toLowerCase().includes(needle) || transcriptHits.has(asset.path),
+      );
     }
     if (filter === "all") {
       return list;
@@ -583,7 +684,7 @@ export default function MediaBin({
       return list.filter((asset) => asset.folder === "generated");
     }
     return list.filter((asset) => asset.kind === filter);
-  }, [activeFolder, assets, filter]);
+  }, [activeFolder, assets, filter, query, transcriptHits]);
 
   const submitNewFolder = useCallback(() => {
     const name = newFolderName.trim();
@@ -806,6 +907,13 @@ export default function MediaBin({
               ) : null}
             </FolderChip>
           ))}
+          <SearchInput
+            onChange={(event) => setQuery(event.target.value)}
+            placeholder="Search names & transcripts…"
+            spellCheck={false}
+            type="search"
+            value={query}
+          />
           {newFolderOpen ? (
             <FolderInput
               autoFocus
@@ -866,6 +974,7 @@ export default function MediaBin({
                 <AssetKind>
                   {asset.pending ? "generating" : asset.folder === "generated" ? "AI" : asset.kind}
                   {transcribing[asset.path] ? " · transcribing" : asset.hasTranscript ? " · T" : ""}
+                  {query.trim() && transcriptHits.has(asset.path) ? " · ¶" : ""}
                 </AssetKind>
                 {Number.isFinite(Number(asset.durationMs)) && asset.durationMs > 0 ? (
                   <AssetDuration>

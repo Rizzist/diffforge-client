@@ -5195,6 +5195,15 @@ pub fn run() {
             startup_settings_initialize(app.handle());
             cloud_mcp_register_sync_status_app(app.handle());
             cloud_mcp_start_local_device_bridge();
+            let app_control_bridge_app = app.handle().clone();
+            let app_control_bridge_state = app.state::<AppControlMcpState>().inner().clone();
+            tauri::async_runtime::spawn(async move {
+                let _ = app_control_mcp_endpoint_for_state(
+                    app_control_bridge_app,
+                    &app_control_bridge_state,
+                )
+                .await;
+            });
             let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
             let cloud_mcp_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {
@@ -5375,6 +5384,7 @@ pub fn run() {
             video_project_read,
             video_project_write,
             video_project_delete,
+            video_agent_state_set,
             video_export_start,
             video_export_cancel,
             video_render_frame,
