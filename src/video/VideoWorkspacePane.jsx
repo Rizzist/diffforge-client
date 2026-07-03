@@ -16,6 +16,7 @@ import GeneratePanel from "./GeneratePanel.jsx";
 import ExportPanel from "./ExportPanel.jsx";
 import { createPlaybackStore } from "./videoPlaybackStore.js";
 import {
+  VIDEO_GENERATE_PROGRESS_EVENT,
   VIDEO_STORE_CHANGED_EVENT,
   VIDEO_TOOLS_INSTALL_PROGRESS_EVENT,
   VIDEO_TRANSCRIBE_PROGRESS_EVENT,
@@ -1136,6 +1137,54 @@ export default function VideoWorkspacePane({
   }, [commitSeek]);
 
   // Placeholder-first: a reserved generation path becomes a clip immediately.
+  // A failed generation must take its timeline placeholder with it — the
+  // ghost clip's assetPath is one of the job's plannedPaths.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(VIDEO_GENERATE_PROGRESS_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const planned = Array.isArray(payload.plannedPaths) ? payload.plannedPaths.filter(Boolean) : [];
+      if (!payload.error || !planned.length) {
+        return;
+      }
+      const current = projectStateRef.current;
+      if (!current) {
+        refreshAssets();
+        return;
+      }
+      const doomed = new Set(planned);
+      let changed = false;
+      const tracks = (current.tracks || []).map((track) => {
+        const clips = (track.clips || []).filter((clip) => {
+          const hit = Boolean(clip.assetPath) && doomed.has(clip.assetPath);
+          changed = changed || hit;
+          return !hit;
+        });
+        return clips.length === (track.clips || []).length ? track : { ...track, clips };
+      });
+      if (changed) {
+        handleProjectChange({ ...current, tracks }, { transient: false });
+      }
+      refreshAssets(); // pending library tiles for the job disappear too
+    })
+      .then((next) => {
+        if (disposed) {
+          next();
+        } else {
+          unlisten = next;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [handleProjectChange, refreshAssets]);
+
   const addPlannedClip = useCallback(
     (plannedPath, durationMs) => {
       const current = projectStateRef.current;
@@ -1376,6 +1425,7 @@ export default function VideoWorkspacePane({
       onGenerated={refreshAssets}
       onInsertAsset={insertAssetPath}
       onPlannedClip={addPlannedClip}
+      paneToken={paneId || "video-pane"}
       repoPath={repoPath}
       seed={generateSeed}
     />

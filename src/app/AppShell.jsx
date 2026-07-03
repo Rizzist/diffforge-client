@@ -27,7 +27,7 @@ import { Schedule } from "@styled-icons/material-rounded/Schedule";
 import { Send } from "@styled-icons/material-rounded/Send";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Webhook } from "@styled-icons/material-rounded/Webhook";
-import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import {
@@ -85,6 +85,10 @@ import {
   logThreadBridgeDiagnosticEvent,
 } from "../terminals/terminalDiagnostics";
 import {
+  beginTerminalLayoutAnimation,
+  endTerminalLayoutAnimation,
+} from "../terminals/terminalResizeController.js";
+import {
   terminalCommandPhaseFromLifecycleEvent,
   terminalActivityStatusIsBusy,
   terminalActivityStatusIsPaused,
@@ -130,6 +134,8 @@ import TerminalView, {
 } from "../terminals/TerminalView.jsx";
 
 const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
+const EMPTY_ARRAY = Object.freeze([]);
+const EMPTY_OBJECT = Object.freeze({});
 
 function normalizeAccountToolTodoItem(item, workspaceId = "") {
   if (!item || typeof item !== "object") {
@@ -17900,14 +17906,14 @@ function workspaceRootCoordinationTargetRecord(rootDirectory, rootGitRepository 
 function getWorkspaceCoordinationTargetsForRoot(targetsByRoot, rootDirectory) {
   const safeRoot = cleanWorkspaceRootDirectory(rootDirectory);
   if (!safeRoot) {
-    return [];
+    return EMPTY_ARRAY;
   }
   const record = targetsByRoot?.[getWorkspaceRootIdentity(safeRoot)];
   if (record?.targets?.length) {
     return record.targets;
   }
 
-  return workspaceRootCoordinationTargetRecord(safeRoot)?.targets || [];
+  return workspaceRootCoordinationTargetRecord(safeRoot)?.targets || EMPTY_ARRAY;
 }
 
 function isWindowsSystemRootDirectory(value) {
@@ -19070,22 +19076,12 @@ function persistAgentLaunchDefaultsSettings(settings) {
   }).catch(() => {});
 }
 
-function readWorkspaceRailCollapsed() {
+function cleanupLegacyWorkspaceRailStorage() {
   try {
     window.localStorage.removeItem(WORKSPACE_RAIL_STORAGE_KEY);
     window.sessionStorage.removeItem(WORKSPACE_RAIL_STORAGE_KEY);
   } catch {
     // Legacy rail density should not affect the next app open.
-  }
-  return false;
-}
-
-function persistWorkspaceRailCollapsed() {
-  try {
-    window.localStorage.removeItem(WORKSPACE_RAIL_STORAGE_KEY);
-    window.sessionStorage.removeItem(WORKSPACE_RAIL_STORAGE_KEY);
-  } catch {
-    // Legacy cleanup is best-effort.
   }
 }
 
@@ -20198,6 +20194,183 @@ function getWorkspaceRootDirectory(workspaceSettings, workspaceId) {
 function getWorkspaceRootWasEmptyAtSelection(workspaceSettings, workspaceId) {
   return Boolean(workspaceSettings?.[workspaceId]?.rootWasEmptyAtSelection);
 }
+
+const LoopspaceRailRow = memo(function LoopspaceRailRow({
+  loopspaceId,
+  loopspaceName,
+  onSelect,
+  onSettings,
+  selected,
+}) {
+  const runtimeState = selected ? "activated" : "closed";
+  const rowKey = `loopspace:${loopspaceId}`;
+  const handleSelect = useCallback(() => {
+    onSelect(loopspaceId);
+  }, [loopspaceId, onSelect]);
+  const handleSettings = useCallback((event) => {
+    event.stopPropagation();
+    onSettings(loopspaceId);
+  }, [loopspaceId, onSettings]);
+
+  return (
+    <WorkspaceRow
+      data-runtime={runtimeState}
+      data-selected={selected}
+      data-workspace-rail-row-key={rowKey}
+    >
+      <WorkspaceButton
+        aria-label={loopspaceName}
+        data-runtime={runtimeState}
+        data-selected={selected}
+        onClick={handleSelect}
+        title={loopspaceName}
+        type="button"
+      >
+        <WorkspaceAccent aria-hidden="true" />
+        <WorkspaceLabel>
+          <WorkspaceCompactGlyph aria-hidden="true">
+            {getWorkspaceRailInitials(loopspaceName)}
+          </WorkspaceCompactGlyph>
+          <strong>{loopspaceName}</strong>
+          <span>loop</span>
+        </WorkspaceLabel>
+      </WorkspaceButton>
+      <WorkspaceSettingsButton
+        aria-label={`Open settings for ${loopspaceName}`}
+        onClick={handleSettings}
+        title="Loop settings"
+        type="button"
+      >
+        <ButtonSettingsIcon aria-hidden="true" />
+      </WorkspaceSettingsButton>
+    </WorkspaceRow>
+  );
+});
+
+const WorkspaceRailWorkspaceRow = memo(function WorkspaceRailWorkspaceRow({
+  activatedWorkspaceId,
+  defaultWorkingDirectory,
+  deactivationWorkspaceId,
+  deactivationActive,
+  enabled,
+  notificationBadgeCount,
+  notificationBadgeVariant,
+  notificationHighlighted,
+  notificationPendingActionCount,
+  notificationUnreadCount,
+  onLifecycle,
+  onSelect,
+  onSettings,
+  pendingActivation,
+  selected,
+  workspaceId,
+  workspaceName,
+  workspaceSettings,
+  workspaceState,
+}) {
+  const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspaceId);
+  const rowKey = `workspace:${workspaceId}`;
+  const runtimeState = pendingActivation
+    ? "activating"
+    : workspaceId === activatedWorkspaceId
+      ? workspaceState === "ready"
+        ? "activated"
+        : "activating"
+      : enabled
+        ? "activated"
+        : "closed";
+  const notificationBadgeText = formatWorkspaceNotificationBadgeCount(notificationBadgeCount);
+  const hasNotificationBadge = Boolean(notificationBadgeText);
+  const notificationLabel = notificationPendingActionCount
+    ? `${notificationPendingActionCount} action${notificationPendingActionCount === 1 ? "" : "s"} required`
+    : notificationUnreadCount
+      ? `${notificationUnreadCount} unread notification${notificationUnreadCount === 1 ? "" : "s"}`
+      : "";
+  const workspaceButtonLabel = notificationLabel
+    ? `${workspaceName}, ${notificationLabel}`
+    : workspaceName;
+  const lifecycleBusy = Boolean(
+    pendingActivation
+      || (deactivationActive && deactivationWorkspaceId === workspaceId),
+  );
+  const lifecycleLabel = enabled
+    ? `Deactivate ${workspaceName}`
+    : pendingActivation
+      ? `Opening ${workspaceName}`
+      : `Activate ${workspaceName}`;
+  const handleSelect = useCallback(() => {
+    onSelect(workspaceId);
+  }, [onSelect, workspaceId]);
+  const handleLifecycle = useCallback((event) => {
+    event.stopPropagation();
+    onLifecycle(workspaceId, enabled);
+  }, [enabled, onLifecycle, workspaceId]);
+  const handleSettings = useCallback((event) => {
+    event.stopPropagation();
+    onSettings(workspaceId);
+  }, [onSettings, workspaceId]);
+
+  return (
+    <WorkspaceRow
+      data-notification-highlight={notificationHighlighted ? "true" : undefined}
+      data-runtime={runtimeState}
+      data-selected={selected}
+      data-workspace-rail-row-key={rowKey}
+    >
+      <WorkspaceButton
+        aria-label={workspaceButtonLabel}
+        data-runtime={runtimeState}
+        data-selected={selected}
+        onClick={handleSelect}
+        title={
+          notificationLabel
+            ? `${workspaceName} - ${notificationLabel}`
+            : workspaceName
+        }
+        type="button"
+      >
+        <WorkspaceAccent aria-hidden="true" />
+        <WorkspaceLabel>
+          <WorkspaceCompactGlyph aria-hidden="true">
+            {getWorkspaceRailInitials(workspaceName)}
+          </WorkspaceCompactGlyph>
+          <strong>{workspaceName}</strong>
+          <span>{getDirectoryName(workspaceRoot || defaultWorkingDirectory)}</span>
+        </WorkspaceLabel>
+        {hasNotificationBadge && (
+          <WorkspaceNotificationBadge
+            aria-hidden="true"
+            data-variant={notificationBadgeVariant}
+          >
+            {notificationBadgeText}
+          </WorkspaceNotificationBadge>
+        )}
+      </WorkspaceButton>
+      <WorkspaceLifecycleButton
+        aria-label={lifecycleLabel}
+        data-runtime={runtimeState}
+        disabled={lifecycleBusy}
+        onClick={handleLifecycle}
+        title={lifecycleLabel}
+        type="button"
+      >
+        {enabled ? (
+          <ButtonCloseIcon aria-hidden="true" />
+        ) : (
+          <ButtonTerminalIcon aria-hidden="true" />
+        )}
+      </WorkspaceLifecycleButton>
+      <WorkspaceSettingsButton
+        aria-label={`Open settings for ${workspaceName}`}
+        onClick={handleSettings}
+        title="Workspace settings"
+        type="button"
+      >
+        <ButtonSettingsIcon aria-hidden="true" />
+      </WorkspaceSettingsButton>
+    </WorkspaceRow>
+  );
+});
 
 const AGENT_SESSION_MODE_WORKTREE = "worktree_coordination";
 const AGENT_SESSION_MODE_COORDINATED = "direct_coordination";
@@ -22030,8 +22203,7 @@ export default function App() {
   const [workspaceTerminalNotificationAttention, setWorkspaceTerminalNotificationAttention] = useState({});
   const [workspaceTerminalFocusRequest, setWorkspaceTerminalFocusRequest] = useState(null);
   const [workspaceLifecycleSettings, setWorkspaceLifecycleSettings] = useState(readWorkspaceLifecycleSettings);
-  const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(readWorkspaceRailCollapsed);
-  const [workspaceRailNativeHoverKey, setWorkspaceRailNativeHoverKey] = useState("");
+  const [workspaceRailCollapsed, setWorkspaceRailCollapsed] = useState(false);
   const [appAppearanceSettings, setAppAppearanceSettings] = useState(readAppAppearanceSettings);
   const [appStartupSettings, setAppStartupSettings] = useState(() => normalizeAppStartupSettings(null));
   const [appStartupSettingsState, setAppStartupSettingsState] = useState("idle");
@@ -22131,7 +22303,9 @@ export default function App() {
   const dashboardShellRef = useRef(null);
   const workspaceRailRef = useRef(null);
   const workspaceRailAnimationFrameRef = useRef(0);
+  const workspaceRailAnimatingRef = useRef(false);
   const workspaceRailNativeHoverFrameRef = useRef(0);
+  const workspaceRailNativeHoverElementRef = useRef(null);
   const workspaceGitPullPromptCheckRef = useRef("");
   const workspaceGitPullPromptSkippedRef = useRef(new Set());
   const viewTransitionTimeoutRef = useRef(null);
@@ -24713,12 +24887,25 @@ export default function App() {
     let cancelled = false;
     let unlistenMainWindowCursor = null;
 
+    const setNativeHoverRow = (nextRow) => {
+      const currentRow = workspaceRailNativeHoverElementRef.current;
+      if (currentRow && currentRow !== nextRow) {
+        currentRow.removeAttribute("data-native-hovered");
+      }
+      if (nextRow) {
+        nextRow.setAttribute("data-native-hovered", "true");
+        workspaceRailNativeHoverElementRef.current = nextRow;
+        return;
+      }
+      workspaceRailNativeHoverElementRef.current = null;
+    };
+
     const clearNativeHover = () => {
       if (workspaceRailNativeHoverFrameRef.current) {
         window.cancelAnimationFrame(workspaceRailNativeHoverFrameRef.current);
         workspaceRailNativeHoverFrameRef.current = 0;
       }
-      setWorkspaceRailNativeHoverKey("");
+      setNativeHoverRow(null);
     };
 
     const scheduleNativeHoverFromPoint = (clientX, clientY) => {
@@ -24745,16 +24932,14 @@ export default function App() {
         }
         const rail = workspaceRailRef.current;
         if (!rail) {
-          setWorkspaceRailNativeHoverKey("");
+          setNativeHoverRow(null);
           return;
         }
 
         const target = document.elementFromPoint(x, y);
         const row = target?.closest?.("[data-workspace-rail-row-key]");
-        const nextKey = row && rail.contains(row)
-          ? String(row.getAttribute("data-workspace-rail-row-key") || "")
-          : "";
-        setWorkspaceRailNativeHoverKey((current) => (current === nextKey ? current : nextKey));
+        const nextRow = row && rail.contains(row) ? row : null;
+        setNativeHoverRow(nextRow);
       });
     };
 
@@ -24785,12 +24970,25 @@ export default function App() {
         window.cancelAnimationFrame(workspaceRailNativeHoverFrameRef.current);
         workspaceRailNativeHoverFrameRef.current = 0;
       }
+      setNativeHoverRow(null);
     };
   }, []);
 
   useEffect(() => {
     workspaceSettingsRef.current = workspaceSettings;
   }, [workspaceSettings]);
+
+  useLayoutEffect(() => {
+    const currentRow = workspaceRailNativeHoverElementRef.current;
+    const rail = workspaceRailRef.current;
+    if (!currentRow) {
+      return;
+    }
+    if (!rail || !currentRow.isConnected || !rail.contains(currentRow)) {
+      currentRow.removeAttribute("data-native-hovered");
+      workspaceRailNativeHoverElementRef.current = null;
+    }
+  }, [loopspaces, spaceMode, workspaces]);
 
   useEffect(() => {
     agentLaunchDefaultsRef.current = agentLaunchDefaults;
@@ -25430,7 +25628,25 @@ export default function App() {
       }
     };
   }, []);
-  const selectedWorkspace = findWorkspaceById(workspaces, selectedWorkspaceId);
+  const workspaceById = useMemo(() => {
+    const byId = new Map();
+    (Array.isArray(workspaces) ? workspaces : []).forEach((workspace) => {
+      if (workspace && !byId.has(workspace.id)) {
+        byId.set(workspace.id, workspace);
+      }
+    });
+    return byId;
+  }, [workspaces]);
+  const loopspaceById = useMemo(() => {
+    const byId = new Map();
+    (Array.isArray(loopspaces) ? loopspaces : []).forEach((loopspace) => {
+      if (loopspace && !byId.has(loopspace.id)) {
+        byId.set(loopspace.id, loopspace);
+      }
+    });
+    return byId;
+  }, [loopspaces]);
+  const selectedWorkspace = workspaceById.get(selectedWorkspaceId) || null;
   const selectedWorkspaceWebTabPaneId = selectedWorkspace?.id
     ? workspaceWebTabPaneId(selectedWorkspace.id)
     : "";
@@ -25452,12 +25668,12 @@ export default function App() {
     () => buildAccountToolPendingItems(accountToolComposerItems, selectedWorkspace?.id || ""),
     [accountToolComposerItems, selectedWorkspace?.id],
   );
-  const activatedWorkspace = findWorkspaceById(workspaces, activatedWorkspaceId);
+  const activatedWorkspace = workspaceById.get(activatedWorkspaceId) || null;
   const archivedWorkspaces = useMemo(
     () => archivedWorkspaceCatalog(workspaceCatalog),
     [workspaceCatalog],
   );
-  const selectedLoopspace = findLoopspaceById(loopspaces, selectedLoopspaceId);
+  const selectedLoopspace = loopspaceById.get(selectedLoopspaceId) || null;
   const applyLoopspaceSnapshot = useCallback((value, options = {}) => {
     const nextLoopspaces = normalizeLoopspaces(value);
     const preserveCurrentOnColdEmpty = Boolean(options?.preserveCurrentOnColdEmpty);
@@ -26415,18 +26631,76 @@ export default function App() {
     };
   }, [highlightSettingsPermission, showView]);
 
+  useEffect(() => {
+    cleanupLegacyWorkspaceRailStorage();
+  }, []);
+
+  const measureWorkspaceToolLayoutWidth = useCallback(() => {
+    const element = workspaceToolLayoutRef.current;
+    if (!element) {
+      return;
+    }
+
+    const nextWidth = Math.round(element.getBoundingClientRect().width || 0);
+    setWorkspaceToolLayoutWidth((currentWidth) => (
+      currentWidth === nextWidth ? currentWidth : nextWidth
+    ));
+  }, []);
+
+  const beginWorkspaceRailAnimation = useCallback(() => {
+    const shell = dashboardShellRef.current;
+    const rail = workspaceRailRef.current;
+
+    shell?.setAttribute("data-rail-animating", "true");
+    rail?.setAttribute("data-rail-animating", "true");
+
+    if (workspaceRailAnimatingRef.current) {
+      return;
+    }
+
+    workspaceRailAnimatingRef.current = true;
+    beginTerminalLayoutAnimation();
+  }, []);
+
+  const finishWorkspaceRailAnimation = useCallback(({
+    measureLayout = true,
+    reason = "workspace_rail_animation_end",
+  } = {}) => {
+    const shell = dashboardShellRef.current;
+    const rail = workspaceRailRef.current;
+
+    if (typeof window !== "undefined" && workspaceRailAnimationFrameRef.current) {
+      window.cancelAnimationFrame(workspaceRailAnimationFrameRef.current);
+    }
+    workspaceRailAnimationFrameRef.current = 0;
+    shell?.style.removeProperty("--workspace-rail-current-width");
+    shell?.removeAttribute("data-rail-animating");
+    rail?.removeAttribute("data-rail-animating");
+
+    if (workspaceRailAnimatingRef.current) {
+      workspaceRailAnimatingRef.current = false;
+      endTerminalLayoutAnimation(reason);
+    }
+
+    if (measureLayout) {
+      measureWorkspaceToolLayoutWidth();
+    }
+  }, [measureWorkspaceToolLayoutWidth]);
+
   const animateWorkspaceRailWidth = useCallback((nextCollapsed) => {
     const shell = dashboardShellRef.current;
     const rail = workspaceRailRef.current;
 
     if (!shell || !rail || typeof window === "undefined") {
+      finishWorkspaceRailAnimation({ reason: "workspace_rail_animation_cancelled" });
       return;
     }
 
     window.cancelAnimationFrame(workspaceRailAnimationFrameRef.current);
+    workspaceRailAnimationFrameRef.current = 0;
 
     if (window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches) {
-      shell.style.removeProperty("--workspace-rail-current-width");
+      finishWorkspaceRailAnimation({ reason: "workspace_rail_animation_reduced_motion" });
       return;
     }
 
@@ -26440,15 +26714,16 @@ export default function App() {
     const startWidth = Number.isFinite(currentWidth) ? currentWidth : null;
 
     if (!Number.isFinite(startWidth) || !Number.isFinite(targetWidth)) {
-      shell.style.removeProperty("--workspace-rail-current-width");
+      finishWorkspaceRailAnimation({ reason: "workspace_rail_animation_skipped" });
       return;
     }
 
     if (Math.abs(startWidth - targetWidth) < 0.5) {
-      shell.style.removeProperty("--workspace-rail-current-width");
+      finishWorkspaceRailAnimation({ reason: "workspace_rail_animation_skipped" });
       return;
     }
 
+    beginWorkspaceRailAnimation();
     shell.style.setProperty("--workspace-rail-current-width", `${startWidth}px`);
 
     const startedAt = performance.now();
@@ -26464,17 +26739,15 @@ export default function App() {
         return;
       }
 
-      shell.style.removeProperty("--workspace-rail-current-width");
-      workspaceRailAnimationFrameRef.current = 0;
+      finishWorkspaceRailAnimation();
     };
 
     workspaceRailAnimationFrameRef.current = window.requestAnimationFrame(step);
-  }, []);
+  }, [beginWorkspaceRailAnimation, finishWorkspaceRailAnimation]);
 
   const toggleWorkspaceRailCollapsed = useCallback(() => {
     const nextCollapsed = !workspaceRailCollapsed;
     animateWorkspaceRailWidth(nextCollapsed);
-    persistWorkspaceRailCollapsed();
     setWorkspaceRailCollapsed(nextCollapsed);
   }, [animateWorkspaceRailWidth, workspaceRailCollapsed]);
 
@@ -26484,13 +26757,7 @@ export default function App() {
     }
 
     const repairExpandedRail = () => {
-      const shell = dashboardShellRef.current;
-      if (!shell) {
-        return;
-      }
-      window.cancelAnimationFrame(workspaceRailAnimationFrameRef.current);
-      workspaceRailAnimationFrameRef.current = 0;
-      shell.style.removeProperty("--workspace-rail-current-width");
+      finishWorkspaceRailAnimation({ reason: "workspace_rail_animation_repair" });
     };
     const handleVisibilityChange = () => {
       if (!document.hidden) {
@@ -26507,7 +26774,7 @@ export default function App() {
       window.removeEventListener("focus", repairExpandedRail);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [workspaceRailCollapsed]);
+  }, [finishWorkspaceRailAnimation, workspaceRailCollapsed]);
 
   useEffect(() => {
     const platform = getWindowControlPlatform();
@@ -26546,12 +26813,15 @@ export default function App() {
   }, [showView, spaceMode]);
 
   useEffect(() => () => {
-    window.cancelAnimationFrame(workspaceRailAnimationFrameRef.current);
+    finishWorkspaceRailAnimation({
+      measureLayout: false,
+      reason: "workspace_rail_animation_unmount",
+    });
     if (workspaceAgentBatchRetryTimerRef.current) {
       window.clearTimeout(workspaceAgentBatchRetryTimerRef.current);
       workspaceAgentBatchRetryTimerRef.current = 0;
     }
-  }, []);
+  }, [finishWorkspaceRailAnimation]);
 
   const clearPreparedWorkspaceTerminals = useCallback((workspaceId) => {
     if (!workspaceId) {
@@ -27425,6 +27695,14 @@ export default function App() {
     showView,
     updateWorkspaceLifecycleSettings,
   ]);
+
+  const toggleWorkspaceLifecycleFromRail = useCallback((workspaceId, enabled) => {
+    if (enabled) {
+      void deactivateWorkspace(workspaceId, "workspace_rail_toggle");
+      return;
+    }
+    requestWorkspaceActivation(workspaceId, "workspace_rail_toggle");
+  }, [deactivateWorkspace, requestWorkspaceActivation]);
 
   const deleteWorkspaceFromForge = useCallback(async (workspaceId) => {
     const targetWorkspaceId = String(workspaceId || "").trim();
@@ -32626,6 +32904,10 @@ export default function App() {
   const shouldShowCloudWorkspaceSetup = userIsPaid && !cloudWorkspaceReady;
   const shouldShowStartupAgentSetup = userIsPaid && cloudWorkspaceReady;
   const planLabel = billingPlanLabelFromStatus(billingStatus, user);
+  const billingPlanName = useMemo(
+    () => billingPlanNameFromStatus(billingStatus, user),
+    [billingStatus, user],
+  );
   const billingCredits = billingStatus?.credits || null;
   const billingRemainingCredits = Number(billingCredits?.termRemainingCredits || 0);
   const billingCreditPercent = creditUsagePercent(billingCredits);
@@ -32646,9 +32928,20 @@ export default function App() {
     writeDismissedLowCreditWarningKey(nextDismissedKey);
     setDismissedLowCreditWarningKey(nextDismissedKey);
   }, [billingStatus]);
-  const connectedAgentCount = agentStatuses.filter((agent) => agent.installed && agent.authenticated).length;
-  const optionalAgentCount = Math.max(0, AGENT_PROVIDERS.length - connectedAgentCount);
-  const startupAgentUpdates = getAgentUpdatesAvailable(agentStatuses);
+  const {
+    connectedAgentCount,
+    optionalAgentCount,
+    startupAgentUpdates,
+  } = useMemo(() => {
+    const nextConnectedAgentCount = agentStatuses.filter((agent) => (
+      agent.installed && agent.authenticated
+    )).length;
+    return {
+      connectedAgentCount: nextConnectedAgentCount,
+      optionalAgentCount: Math.max(0, AGENT_PROVIDERS.length - nextConnectedAgentCount),
+      startupAgentUpdates: getAgentUpdatesAvailable(agentStatuses),
+    };
+  }, [agentStatuses]);
   const startupAgentStatusTitle = startupAgentGateState === "choice"
     ? "Terminal CLI updates available"
     : startupAgentGateState === "updating"
@@ -33027,7 +33320,7 @@ export default function App() {
     }
 
     const descriptors = enabledRuntimeWorkspaceIds
-      .map((workspaceId) => findWorkspaceById(workspaces, workspaceId))
+      .map((workspaceId) => workspaceById.get(workspaceId) || null)
       .filter(Boolean)
       .map((runtimeWorkspace) => {
         const rootDirectory = getWorkspaceRootDirectory(workspaceSettings, runtimeWorkspace.id);
@@ -33160,8 +33453,25 @@ export default function App() {
     workspaceTerminalLogicalIndexes,
     workspaceTerminalRoleOptions,
     workspaceRuntimeThreadSignature,
-    workspaces,
+    workspaceById,
   ]);
+  const workspaceRuntimeCoordinationTargetsByWorkspaceId = useMemo(() => {
+    const targetsByWorkspaceId = new Map();
+    enabledWorkspaceRuntimeDescriptors.forEach((descriptor) => {
+      const workspaceId = descriptor.workspace?.id || "";
+      if (!workspaceId) {
+        return;
+      }
+      targetsByWorkspaceId.set(
+        workspaceId,
+        getWorkspaceCoordinationTargetsForRoot(
+          workspaceCoordinationTargetsByRoot,
+          descriptor.workingDirectory,
+        ),
+      );
+    });
+    return targetsByWorkspaceId;
+  }, [enabledWorkspaceRuntimeDescriptors, workspaceCoordinationTargetsByRoot]);
   const workspaceStartupWarmupTargets = useMemo(() => {
     const targets = [];
     const seen = new Set();
@@ -34810,6 +35120,18 @@ export default function App() {
   const selectedWorkspaceFileRoot = selectedWorkspace
     ? selectedWorkspaceRootDirectory || defaultWorkingDirectory
     : "";
+  const selectedWorkspaceCoordinationTargets = useMemo(() => (
+    selectedWorkspace
+      ? getWorkspaceCoordinationTargetsForRoot(
+        workspaceCoordinationTargetsByRoot,
+        selectedWorkspaceFileRoot,
+      )
+      : EMPTY_ARRAY
+  ), [
+    selectedWorkspace,
+    selectedWorkspaceFileRoot,
+    workspaceCoordinationTargetsByRoot,
+  ]);
   const activityOverlayContext = useMemo(() => ({
     repoPath: selectedWorkspaceFileRoot || "",
     workspaceId: selectedWorkspace?.id || "",
@@ -35103,7 +35425,7 @@ export default function App() {
   const railSpaceModeLabel = loopspacesModeActive ? "Loopspaces" : "Workspaces";
   const railSpaceModeTitle = loopspacesModeActive ? "Show workspaces" : "Enter Loopspaces";
   const loopspaceSettingsLoop = loopspaceSettingsPanelId
-    ? findLoopspaceById(loopspaces, loopspaceSettingsPanelId)
+    ? loopspaceById.get(loopspaceSettingsPanelId) || null
     : null;
   const isLoopspaceSettingsOpen = Boolean(loopspacesModeActive && loopspaceSettingsLoop);
   const isLoopspaceSettingsBusy = loopspaceActionState === "renaming" || loopspaceActionState === "deleting";
@@ -35673,13 +35995,14 @@ export default function App() {
     }
 
     const updateWidth = () => {
-      const nextWidth = Math.round(element.getBoundingClientRect().width || 0);
-      setWorkspaceToolLayoutWidth((currentWidth) => (
-        currentWidth === nextWidth ? currentWidth : nextWidth
-      ));
+      if (workspaceRailAnimatingRef.current) {
+        return;
+      }
+
+      measureWorkspaceToolLayoutWidth();
     };
 
-    updateWidth();
+    measureWorkspaceToolLayoutWidth();
 
     if (typeof ResizeObserver === "undefined") {
       window.addEventListener("resize", updateWidth);
@@ -35689,7 +36012,7 @@ export default function App() {
     const observer = new ResizeObserver(updateWidth);
     observer.observe(element);
     return () => observer.disconnect();
-  }, [authState]);
+  }, [authState, measureWorkspaceToolLayoutWidth]);
 
   useEffect(() => {
     if (!workspaceToolPaneHasWidth && workspaceToolPaneMode !== TODO_QUEUE_PANE_MODE_MINIMIZED) {
@@ -35808,7 +36131,7 @@ export default function App() {
   const isSelectedWorkspaceDefault = Boolean(
     selectedWorkspace && workspaceLifecycleSettings.defaultWorkspaceId === selectedWorkspace.id,
   );
-  const defaultWorkspace = findWorkspaceById(workspaces, workspaceLifecycleSettings.defaultWorkspaceId);
+  const defaultWorkspace = workspaceById.get(workspaceLifecycleSettings.defaultWorkspaceId) || null;
   const activeAppTheme = normalizeAppTheme(appAppearanceSettings.theme);
   const appStartupEnabled = Boolean(appStartupSettings.enabled);
   const appStartupBusy = appStartupSettingsState === "loading" || appStartupSettingsState === "saving";
@@ -36475,9 +36798,11 @@ export default function App() {
     selectedWorkspaceFileRoot,
     selectedWorkspace?.id || "",
   );
-  const selectedWorkspaceGraphState = selectedWorkspaceGraphStateKey
-    ? workspaceGraphState[selectedWorkspaceGraphStateKey] || {}
-    : {};
+  const selectedWorkspaceGraphState = useMemo(() => (
+    selectedWorkspaceGraphStateKey
+      ? workspaceGraphState[selectedWorkspaceGraphStateKey] || EMPTY_OBJECT
+      : EMPTY_OBJECT
+  ), [selectedWorkspaceGraphStateKey, workspaceGraphState]);
   const refreshSelectedWorkspaceArchitectureGraphList = useCallback((architectureRepoPath, options = {}) => {
     if (!selectedWorkspace?.id) {
       return Promise.resolve([]);
@@ -48352,6 +48677,35 @@ export default function App() {
 
   const isConnectivityBlocked = false;
   const isPaidPlanUser = accountIsPaid || billingStatus?.planStatus === "paid";
+  const toolsWorkspaceArchitectures = useMemo(() => ({
+    catalog: architectureHub.catalog,
+    catalogError: architectureHub.error,
+    catalogState: architectureHub.state,
+    graphLists: architectureHubGraphLists,
+    hydration: architectureHubHydration,
+    onCopyGraph: copyArchitectureHubGraph,
+    onGraphListRefresh: refreshArchitectureHubGraphList,
+    onRefreshCatalog: refreshArchitectureHubCatalog,
+    onSelectionChange: updateArchitectureHubSelection,
+    resolveRepoSyncContext: resolveArchitectureHubSyncContext,
+    selectedGraphId: architectureHubGraphState.architectureSelectedGraphId,
+    selectedRepoPath: architectureHubGraphState.architectureSelectedRepoPath,
+    workspaceDispatchTargets: workspaceTerminalDispatchTargets,
+  }), [
+    architectureHub.catalog,
+    architectureHub.error,
+    architectureHub.state,
+    architectureHubGraphLists,
+    architectureHubGraphState.architectureSelectedGraphId,
+    architectureHubGraphState.architectureSelectedRepoPath,
+    architectureHubHydration,
+    copyArchitectureHubGraph,
+    refreshArchitectureHubCatalog,
+    refreshArchitectureHubGraphList,
+    resolveArchitectureHubSyncContext,
+    updateArchitectureHubSelection,
+    workspaceTerminalDispatchTargets,
+  ]);
   const shouldHoldWorkspaceShellForStartup = authState === "authenticated" && userIsPaid && workspaceState !== "ready";
   const cloudSyncConnection = String(cloudSyncStatus?.connection || "local").toLowerCase();
   const cloudSyncPendingCount = normalizeCloudSyncCount(cloudSyncStatus?.pendingCount);
@@ -48921,50 +49275,16 @@ export default function App() {
                     >
                       {loopspacesModeActive ? (
                         <>
-                          {loopspaces.map((loopspace) => {
-                            const selected = loopspace.id === selectedLoopspaceId;
-                            const loopspaceHoverKey = `loopspace:${loopspace.id}`;
-                            return (
-                              <WorkspaceRow
-                                data-native-hovered={workspaceRailNativeHoverKey === loopspaceHoverKey ? "true" : undefined}
-                                data-runtime={selected ? "activated" : "closed"}
-                                data-selected={selected}
-                                data-workspace-rail-row-key={loopspaceHoverKey}
-                                key={loopspace.id}
-                              >
-                                <WorkspaceButton
-                                  aria-label={loopspace.name}
-                                  data-runtime={selected ? "activated" : "closed"}
-                                  data-selected={selected}
-                                  onClick={() => {
-                                    selectLoopspaceFromRail(loopspace.id);
-                                  }}
-                                  title={loopspace.name}
-                                  type="button"
-                                >
-                                  <WorkspaceAccent aria-hidden="true" />
-                                  <WorkspaceLabel>
-                                    <WorkspaceCompactGlyph aria-hidden="true">
-                                      {getWorkspaceRailInitials(loopspace.name)}
-                                    </WorkspaceCompactGlyph>
-                                    <strong>{loopspace.name}</strong>
-                                    <span>loop</span>
-                                  </WorkspaceLabel>
-                                </WorkspaceButton>
-                                <WorkspaceSettingsButton
-                                  aria-label={`Open settings for ${loopspace.name}`}
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    openLoopspaceSettings(loopspace.id);
-                                  }}
-                                  title="Loop settings"
-                                  type="button"
-                                >
-                                  <ButtonSettingsIcon aria-hidden="true" />
-                                </WorkspaceSettingsButton>
-                              </WorkspaceRow>
-                            );
-                          })}
+                          {loopspaces.map((loopspace) => (
+                            <LoopspaceRailRow
+                              key={loopspace.id}
+                              loopspaceId={loopspace.id}
+                              loopspaceName={loopspace.name}
+                              onSelect={selectLoopspaceFromRail}
+                              onSettings={openLoopspaceSettings}
+                              selected={loopspace.id === selectedLoopspaceId}
+                            />
+                          ))}
                           {!loopspaces.length && (
                             <WorkspaceMuted>No loops</WorkspaceMuted>
                           )}
@@ -48972,112 +49292,33 @@ export default function App() {
                       ) : (
                         <>
                           {workspaces.map((workspace) => {
-                            const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
-                            const workspaceHoverKey = `workspace:${workspace.id}`;
                             const workspaceIsRuntimeEnabled = enabledRuntimeWorkspaceIds.includes(workspace.id);
                             const workspaceIsPendingActivation = workspacePendingActivationId === workspace.id;
-                            const workspaceRuntimeState = workspaceIsPendingActivation
-                              ? "activating"
-                              : workspace.id === activatedWorkspaceId
-                                ? workspaceState === "ready"
-                                  ? "activated"
-                                  : "activating"
-                                : workspaceIsRuntimeEnabled
-                                  ? "activated"
-                                  : "closed";
-                            const notificationSummary = workspaceNotificationSummaries[workspace.id] || {};
-                            const notificationBadgeText = formatWorkspaceNotificationBadgeCount(
-                              notificationSummary.badgeCount,
-                            );
-                            const hasNotificationBadge = Boolean(notificationBadgeText);
-                            const notificationLabel = notificationSummary.pendingActionCount
-                              ? `${notificationSummary.pendingActionCount} action${notificationSummary.pendingActionCount === 1 ? "" : "s"} required`
-                              : notificationSummary.unreadCount
-                                ? `${notificationSummary.unreadCount} unread notification${notificationSummary.unreadCount === 1 ? "" : "s"}`
-                                : "";
-                            const workspaceButtonLabel = notificationLabel
-                              ? `${workspace.name}, ${notificationLabel}`
-                              : workspace.name;
-                            const workspaceLifecycleBusy = Boolean(
-                              workspaceIsPendingActivation
-                                || (workspaceDeactivationState.isActive
-                                  && workspaceDeactivationState.workspaceId === workspace.id),
-                            );
-                            const workspaceLifecycleLabel = workspaceIsRuntimeEnabled
-                              ? `Deactivate ${workspace.name}`
-                              : workspaceIsPendingActivation
-                                ? `Opening ${workspace.name}`
-                                : `Activate ${workspace.name}`;
+                            const notificationSummary = workspaceNotificationSummaries[workspace.id] || EMPTY_OBJECT;
 
                             return (
-                              <WorkspaceRow
-                                data-native-hovered={workspaceRailNativeHoverKey === workspaceHoverKey ? "true" : undefined}
-                                data-notification-highlight={workspaceNotificationHighlights[workspace.id] ? "true" : undefined}
-                                data-runtime={workspaceRuntimeState}
-                                data-selected={workspace.id === selectedWorkspaceId}
-                                data-workspace-rail-row-key={workspaceHoverKey}
+                              <WorkspaceRailWorkspaceRow
+                                activatedWorkspaceId={activatedWorkspaceId}
+                                defaultWorkingDirectory={defaultWorkingDirectory}
+                                deactivationActive={workspaceDeactivationState.isActive}
+                                deactivationWorkspaceId={workspaceDeactivationState.workspaceId}
+                                enabled={workspaceIsRuntimeEnabled}
                                 key={workspace.id}
-                              >
-                                <WorkspaceButton
-                                  aria-label={workspaceButtonLabel}
-                                  data-runtime={workspaceRuntimeState}
-                                  data-selected={workspace.id === selectedWorkspaceId}
-                                  onClick={() => {
-                                    selectWorkspaceFromRail(workspace.id);
-                                  }}
-                                  title={notificationLabel ? `${workspace.name} - ${notificationLabel}` : workspace.name}
-                                  type="button"
-                                >
-                                  <WorkspaceAccent aria-hidden="true" />
-                                  <WorkspaceLabel>
-                                    <WorkspaceCompactGlyph aria-hidden="true">
-                                      {getWorkspaceRailInitials(workspace.name)}
-                                    </WorkspaceCompactGlyph>
-                                    <strong>{workspace.name}</strong>
-                                    <span>{getDirectoryName(workspaceRoot || defaultWorkingDirectory)}</span>
-                                  </WorkspaceLabel>
-                                  {hasNotificationBadge && (
-                                    <WorkspaceNotificationBadge
-                                      aria-hidden="true"
-                                      data-variant={notificationSummary.badgeVariant}
-                                    >
-                                      {notificationBadgeText}
-                                    </WorkspaceNotificationBadge>
-                                  )}
-                                </WorkspaceButton>
-                                <WorkspaceLifecycleButton
-                                  aria-label={workspaceLifecycleLabel}
-                                  data-runtime={workspaceRuntimeState}
-                                  disabled={workspaceLifecycleBusy}
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    if (workspaceIsRuntimeEnabled) {
-                                      void deactivateWorkspace(workspace.id, "workspace_rail_toggle");
-                                      return;
-                                    }
-                                    requestWorkspaceActivation(workspace.id, "workspace_rail_toggle");
-                                  }}
-                                  title={workspaceLifecycleLabel}
-                                  type="button"
-                                >
-                                  {workspaceIsRuntimeEnabled ? (
-                                    <ButtonCloseIcon aria-hidden="true" />
-                                  ) : (
-                                    <ButtonTerminalIcon aria-hidden="true" />
-                                  )}
-                                </WorkspaceLifecycleButton>
-                                <WorkspaceSettingsButton
-                                  aria-label={`Open settings for ${workspace.name}`}
-                                  onClick={(event) => {
-                                    event.stopPropagation();
-                                    openWorkspaceSettings(workspace.id);
-                                  }}
-                                  title="Workspace settings"
-                                  type="button"
-                                >
-                                  <ButtonSettingsIcon aria-hidden="true" />
-                                </WorkspaceSettingsButton>
-                              </WorkspaceRow>
+                                notificationBadgeCount={notificationSummary.badgeCount}
+                                notificationBadgeVariant={notificationSummary.badgeVariant}
+                                notificationHighlighted={Boolean(workspaceNotificationHighlights[workspace.id])}
+                                notificationPendingActionCount={notificationSummary.pendingActionCount}
+                                notificationUnreadCount={notificationSummary.unreadCount}
+                                onLifecycle={toggleWorkspaceLifecycleFromRail}
+                                onSelect={selectWorkspaceFromRail}
+                                onSettings={openWorkspaceSettings}
+                                pendingActivation={workspaceIsPendingActivation}
+                                selected={workspace.id === selectedWorkspaceId}
+                                workspaceId={workspace.id}
+                                workspaceName={workspace.name}
+                                workspaceSettings={workspaceSettings}
+                                workspaceState={workspaceState}
+                              />
                             );
                           })}
                           {workspaceSyncState === "loading" && (
@@ -49264,7 +49505,7 @@ export default function App() {
                             && !isWorkspaceSettingsOpen
                         }
                         onAction={openCreateWorkspaceModal}
-                        plan={billingPlanNameFromStatus(billingStatus, user)}
+                        plan={billingPlanName}
                         title="No Workspaces Selected"
                         viewMotion={viewMotion}
                       />
@@ -49295,8 +49536,8 @@ export default function App() {
                         runtimeWorkspace.id,
                       );
                       const runtimeArchitectureGraphState = runtimeArchitectureGraphStateKey
-                        ? workspaceGraphState[runtimeArchitectureGraphStateKey] || {}
-                        : {};
+                        ? workspaceGraphState[runtimeArchitectureGraphStateKey] || EMPTY_OBJECT
+                        : EMPTY_OBJECT;
 
                       return (
                         <WorkspaceRuntimeLayer
@@ -49327,10 +49568,9 @@ export default function App() {
                             terminalRolesByIndex={runtimeDescriptor.terminalRolesByIndex}
                             terminalWorkspaceRootWasEmptyAtSelection={runtimeDescriptor.rootWasEmptyAtSelection}
                             terminalWorkspaceWorkingDirectory={runtimeDescriptor.workingDirectory}
-                            terminalWorkspaceCoordinationTargets={getWorkspaceCoordinationTargetsForRoot(
-                              workspaceCoordinationTargetsByRoot,
-                              runtimeDescriptor.workingDirectory,
-                            )}
+                            terminalWorkspaceCoordinationTargets={
+                              workspaceRuntimeCoordinationTargetsByWorkspaceId.get(runtimeWorkspace.id) || EMPTY_ARRAY
+                            }
                             terminalWorkspaceLogicalIndexes={runtimeDescriptor.logicalTerminalIndexes}
                             terminalWorkspaceLogicalTerminalCount={runtimeDescriptor.logicalTerminalCount}
                             agentLaunchDefaults={agentLaunchDefaults}
@@ -49378,7 +49618,7 @@ export default function App() {
                             onOpenWorkspaceDocumentPanel={openSelectedWorkspaceDocumentPanel}
                             onCloseWorkspaceDocumentPanel={closeWorkspaceDocumentPanel}
                             onOpenWorkspacePcbPanel={openSelectedWorkspacePcbPanel}
-                            plan={billingPlanNameFromStatus(billingStatus, user)}
+                            plan={billingPlanName}
                             onMinimizeWorkspaceToolPane={minimizeWorkspaceToolPane}
                             onRestoreWorkspaceToolPane={restoreWorkspaceToolPane}
                             onToggleFullscreenWorkspaceToolPane={toggleFullscreenWorkspaceToolPane}
@@ -49447,7 +49687,7 @@ export default function App() {
                               && !loopspaceCreatePanelOpen
                           }
                           onAction={openCreateLoopspacePanel}
-                          plan={billingPlanNameFromStatus(billingStatus, user)}
+                          plan={billingPlanName}
                           title={loopspaceIdleTitle}
                           viewMotion={viewMotion}
                         />
@@ -49461,7 +49701,7 @@ export default function App() {
                     >
                       <WorkspaceIdleState
                         detail={defaultWorkspaceIdleDetail}
-                        plan={billingPlanNameFromStatus(billingStatus, user)}
+                        plan={billingPlanName}
                         viewMotion={viewMotion}
                       />
                     </WorkspaceRuntimeLayer>
@@ -50747,21 +50987,7 @@ export default function App() {
                       data-motion={globalToolsViewVisible ? viewMotion : "entered"}
                     >
                       <ToolsWorkspaceView
-                        architectures={{
-                          catalog: architectureHub.catalog,
-                          catalogError: architectureHub.error,
-                          catalogState: architectureHub.state,
-                          graphLists: architectureHubGraphLists,
-                          hydration: architectureHubHydration,
-                          onCopyGraph: copyArchitectureHubGraph,
-                          onGraphListRefresh: refreshArchitectureHubGraphList,
-                          onRefreshCatalog: refreshArchitectureHubCatalog,
-                          onSelectionChange: updateArchitectureHubSelection,
-                          resolveRepoSyncContext: resolveArchitectureHubSyncContext,
-                          selectedGraphId: architectureHubGraphState.architectureSelectedGraphId,
-                          selectedRepoPath: architectureHubGraphState.architectureSelectedRepoPath,
-                          workspaceDispatchTargets: workspaceTerminalDispatchTargets,
-                        }}
+                        architectures={toolsWorkspaceArchitectures}
                         defaultWorkingDirectory={defaultWorkingDirectory}
                         initialSection={globalToolsViewVisible ? visibleView : "tools"}
                         onAppControlContextChange={handleAppControlContextChange}
@@ -50788,7 +51014,7 @@ export default function App() {
                       detail="Create a workspace before browsing project files."
                       flameActive={visibleView === "files" && !workspaceCreateModalOpen}
                       onAction={openCreateWorkspaceModal}
-                      plan={billingPlanNameFromStatus(billingStatus, user)}
+                      plan={billingPlanName}
                       title="No Workspaces Selected"
                       viewMotion={viewMotion}
                     />
@@ -50812,7 +51038,7 @@ export default function App() {
                       detail="Create a workspace before opening the web view."
                       flameActive={visibleView === "web" && !workspaceCreateModalOpen}
                       onAction={openCreateWorkspaceModal}
-                      plan={billingPlanNameFromStatus(billingStatus, user)}
+                      plan={billingPlanName}
                       title="No Workspaces Selected"
                       viewMotion={viewMotion}
                     />
@@ -50841,7 +51067,7 @@ export default function App() {
                       architectureRepositoryScanError={selectedWorkspaceGraphState.architectureRepositoryScanError || ""}
                       architectureRepositoryScanSnapshot={selectedWorkspaceGraphState.architectureRepositoryScanSnapshot || null}
                       architectureRepositoryScanState={selectedWorkspaceGraphState.architectureRepositoryScanState || "idle"}
-                      architectureGraphLists={selectedWorkspaceGraphState.architectureGraphLists || {}}
+                      architectureGraphLists={selectedWorkspaceGraphState.architectureGraphLists || EMPTY_OBJECT}
                       architectureSelectedGraphId={selectedWorkspaceGraphState.architectureSelectedGraphId || ""}
                       architectureSelectedRepoPath={selectedWorkspaceGraphState.architectureSelectedRepoPath || ""}
                       architectureSnapshot={selectedWorkspaceGraphState.architectureSnapshot || null}
@@ -51139,11 +51365,8 @@ export default function App() {
                                   billingStatus={billingStatus}
                                   connectedDevices={cloudWorkspaceProgress.connectedDevices}
                                   coordinationTargets={selectedWorkspace
-                                    ? getWorkspaceCoordinationTargetsForRoot(
-                                      workspaceCoordinationTargetsByRoot,
-                                      selectedWorkspaceFileRoot,
-                                    )
-                                    : []}
+                                    ? selectedWorkspaceCoordinationTargets
+                                    : EMPTY_ARRAY}
                                   defaultWorkingDirectory={defaultWorkingDirectory}
                                   deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
                                   documentPanelEnabled={selectedWorkspaceDocumentsEnabled}

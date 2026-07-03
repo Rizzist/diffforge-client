@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import AppSelect from "../app/AppSelect.jsx";
+import { emitVideoAssetDrag } from "./videoDragEvents.js";
 import {
   GENERATION_KINDS,
   GENERATION_PROVIDER_LABEL,
@@ -347,44 +349,166 @@ const CountStepper = styled.div`
   }
 `;
 
-const JobRow = styled.div`
-  display: grid;
-  gap: 4px;
-  padding: 7px 8px;
+// History rows: preview thumb (draggable onto the timeline once media
+// exists) + model/prompt/progress + status/action column.
+const HistRow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 7px;
   border: 1px solid rgba(148, 163, 184, 0.12);
-  border-radius: 7px;
+  border-radius: 8px;
   background: rgba(4, 8, 14, 0.6);
 `;
 
-const JobTitle = styled.div`
+const HistThumb = styled.div`
+  position: relative;
+  flex: none;
+  width: 74px;
+  height: 48px;
+  border-radius: 6px;
+  overflow: hidden;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  background:
+    radial-gradient(90% 120% at 20% 0%, rgba(37, 99, 235, 0.18), transparent 60%),
+    linear-gradient(150deg, rgba(23, 32, 48, 0.95), rgba(6, 10, 18, 0.98));
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 10.5px;
-  font-weight: 750;
-  color: rgba(226, 232, 240, 0.94);
+  justify-content: center;
 
-  em {
-    font-style: normal;
-    color: #8fa0b8;
-    font-weight: 600;
+  img {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    display: block;
   }
 
-  span {
-    margin-left: auto;
-    font-size: 9px;
-    font-weight: 800;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: ${(props) => (props.$tone === "error" ? "#fca5a5" : props.$tone === "done" ? "#a7f3d0" : "#93c5fd")};
+  &[data-draggable="true"] {
+    cursor: grab;
+  }
+
+  &[data-status="error"] {
+    background:
+      radial-gradient(90% 120% at 20% 0%, rgba(248, 113, 113, 0.16), transparent 60%),
+      linear-gradient(150deg, rgba(45, 20, 24, 0.95), rgba(10, 6, 8, 0.98));
+    border-color: rgba(248, 113, 113, 0.3);
   }
 `;
 
-const JobMessage = styled.div`
-  font-size: 9.5px;
-  font-weight: 550;
-  color: #8fa0b8;
+const HistGlyph = styled.span`
+  font-size: 15px;
+  color: rgba(148, 163, 184, 0.8);
+
+  &[data-status="running"] {
+    color: #93c5fd;
+    animation: hist-spin 1.4s linear infinite;
+  }
+
+  &[data-status="error"] {
+    color: #fca5a5;
+  }
+
+  @keyframes hist-spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+`;
+
+const HistInfo = styled.div`
+  flex: 1 1 auto;
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+
+  b {
+    font-size: 10.5px;
+    font-weight: 800;
+    color: rgba(226, 232, 240, 0.94);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  p {
+    margin: 0;
+    font-size: 9.5px;
+    font-weight: 550;
+    color: #8fa0b8;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+`;
+
+const HistError = styled.div`
+  font-size: 9px;
+  font-weight: 600;
+  color: #fca5a5;
   overflow-wrap: anywhere;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+`;
+
+const HistSide = styled.div`
+  flex: none;
+  display: grid;
+  gap: 4px;
+  justify-items: end;
+`;
+
+const HistStatus = styled.span`
+  font-size: 8.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #93c5fd;
+
+  &[data-status="error"] {
+    color: #fca5a5;
+  }
+
+  &[data-status="done"] {
+    color: #a7f3d0;
+  }
+`;
+
+const HistDragGhost = styled.div`
+  position: fixed;
+  z-index: 9999;
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px 4px 4px;
+  border: 1px solid rgba(16, 185, 129, 0.5);
+  border-radius: 7px;
+  background: rgba(4, 8, 14, 0.92);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.5);
+
+  img {
+    width: 42px;
+    height: 26px;
+    object-fit: cover;
+    border-radius: 4px;
+    display: block;
+  }
+
+  span {
+    font-size: 9.5px;
+    font-weight: 700;
+    color: #cbd5f5;
+    max-width: 140px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
 `;
 
 const InlineRow = styled.div`
@@ -402,16 +526,6 @@ const SectionTitle = styled.div`
   color: rgba(167, 243, 208, 0.9);
 `;
 
-function jobTone(job) {
-  if (job.error) {
-    return "error";
-  }
-  if (job.done) {
-    return "done";
-  }
-  return "running";
-}
-
 // Generation panel — palmier-style: Image / Video / Audio type tabs, one
 // provider (Higgsfield, keys held by your cloud), a real model catalog, and a
 // capability-driven form: the slots and parameters each model actually
@@ -422,6 +536,7 @@ export default function GeneratePanel({
   onGenerated,
   onInsertAsset,
   onPlannedClip,
+  paneToken = "video-pane",
   repoPath = "",
   seed = null,
 }) {
@@ -597,6 +712,11 @@ export default function GeneratePanel({
       if (payload.done && !payload.error) {
         onGenerated?.(payload);
       }
+      // Settled jobs land in the registry — refresh so the history list
+      // shows the final state (and output previews) without reopening.
+      if (payload.done || payload.error) {
+        loadHistory();
+      }
     })
       .then((next) => {
         if (disposed) {
@@ -611,7 +731,22 @@ export default function GeneratePanel({
       disposed = true;
       unlisten();
     };
-  }, [onGenerated]);
+  }, [loadHistory, onGenerated]);
+
+  // History display list: registry snapshots overlaid with live progress
+  // (percent/state/error) by jobId; live jobs not yet in the registry lead.
+  const displayJobs = useMemo(() => {
+    const liveById = new Map(jobs.filter((job) => job.jobId).map((job) => [job.jobId, job]));
+    const merged = historyJobs.map((job) => {
+      const live = liveById.get(job.jobId);
+      if (!live) {
+        return job;
+      }
+      liveById.delete(job.jobId);
+      return { ...job, ...live, request: job.request };
+    });
+    return [...liveById.values(), ...merged];
+  }, [historyJobs, jobs]);
 
   const assetsByPath = useMemo(() => {
     const map = {};
@@ -623,6 +758,76 @@ export default function GeneratePanel({
 
   const imageAssets = useMemo(() => assets.filter((asset) => asset.kind === "image" && !asset.pending), [assets]);
   const audioAssets = useMemo(() => assets.filter((asset) => asset.kind === "audio" && !asset.pending), [assets]);
+
+  // A history job's preview = the first output (or planned) path that exists
+  // as a real, non-pending library asset.
+  const resolvePreviewAsset = useCallback(
+    (job) => {
+      const candidates = [
+        ...(Array.isArray(job.outputPaths) ? job.outputPaths : []),
+        ...(Array.isArray(job.plannedPaths) ? job.plannedPaths : []),
+      ];
+      for (const path of candidates) {
+        const asset = assetsByPath[path];
+        if (asset && !asset.pending) {
+          return asset;
+        }
+      }
+      return null;
+    },
+    [assetsByPath],
+  );
+
+  // Drag a finished generation straight onto the timeline — same pointer-drag
+  // channel MediaBin uses (HTML5 DnD is banned in grid panes).
+  const [historyDrag, setHistoryDrag] = useState(null); // { asset, x, y }
+  const beginHistoryDrag = useCallback(
+    (event, asset) => {
+      if (event.button !== 0 || event.target.closest("button")) {
+        return;
+      }
+      const startX = event.clientX;
+      const startY = event.clientY;
+      const state = { started: false };
+      const handleMove = (moveEvent) => {
+        if (!state.started) {
+          if (Math.abs(moveEvent.clientX - startX) + Math.abs(moveEvent.clientY - startY) < 5) {
+            return;
+          }
+          state.started = true;
+          document.body.style.userSelect = "none";
+          document.body.style.webkitUserSelect = "none";
+          emitVideoAssetDrag({ phase: "start", asset, paneToken, x: moveEvent.clientX, y: moveEvent.clientY });
+        }
+        setHistoryDrag({ asset, x: moveEvent.clientX, y: moveEvent.clientY });
+        emitVideoAssetDrag({ phase: "move", asset, paneToken, x: moveEvent.clientX, y: moveEvent.clientY });
+      };
+      const finish = (endEvent, cancelled) => {
+        window.removeEventListener("pointermove", handleMove);
+        window.removeEventListener("pointerup", handleUp);
+        window.removeEventListener("pointercancel", handleCancel);
+        setHistoryDrag(null);
+        document.body.style.userSelect = "";
+        document.body.style.webkitUserSelect = "";
+        if (state.started) {
+          emitVideoAssetDrag({
+            phase: cancelled ? "cancel" : "end",
+            asset,
+            paneToken,
+            metaKey: Boolean(endEvent?.metaKey || endEvent?.ctrlKey),
+            x: endEvent?.clientX ?? startX,
+            y: endEvent?.clientY ?? startY,
+          });
+        }
+      };
+      const handleUp = (upEvent) => finish(upEvent, false);
+      const handleCancel = (cancelEvent) => finish(cancelEvent, true);
+      window.addEventListener("pointermove", handleMove);
+      window.addEventListener("pointerup", handleUp);
+      window.addEventListener("pointercancel", handleCancel);
+    },
+    [paneToken],
+  );
 
   const fillSlot = useCallback((slotKey, index, path) => {
     setSlots((current) => {
@@ -712,10 +917,16 @@ export default function GeneratePanel({
       if (intoTimeline && planned.length && model.kind === "video") {
         onPlannedClip?.(planned[0], (Number(durationSec) || 5) * 1000);
       }
+      // Submitted: clear the form and jump to history where the new job
+      // shows up live.
+      setPrompt("");
+      setSlots({ startFrame: "", endFrame: "", references: [], audio: "" });
+      loadHistory();
+      setHistoryOpen(true);
     } catch (err) {
       setError(String(err));
     }
-  }, [aspect, caps, durationSec, genMode, intoTimeline, model, numImages, onPlannedClip, prompt, quality, repoPath, resolution, slots, sound, voice]);
+  }, [aspect, caps, durationSec, genMode, intoTimeline, loadHistory, model, numImages, onPlannedClip, prompt, quality, repoPath, resolution, slots, sound, voice]);
 
   const estUsd = estimateModelUsd(model, { durationSec, numImages });
 
@@ -983,45 +1194,6 @@ export default function GeneratePanel({
           ) : null}
         </InlineRow>
       </Section>
-      <Section style={{ borderBottom: "none" }}>
-        <SectionTitle>Jobs</SectionTitle>
-        {!jobs.length ? (
-          <VideoHint>Generations land in media/generated and appear in the library (AI filter).</VideoHint>
-        ) : null}
-        {jobs.map((job) => (
-          <JobRow key={job.jobId}>
-            <JobTitle $tone={jobTone(job)}>
-              {job.model || job.providerId || "generate"}
-              <em>{job.state || ""}</em>
-              <span>{job.error ? "error" : job.done ? "done" : `${Math.round(job.percent || 0)}%`}</span>
-            </JobTitle>
-            {!job.done ? (
-              <VideoProgressTrack>
-                <VideoProgressFill style={{ width: `${Math.min(100, Math.max(3, job.percent || 3))}%` }} />
-              </VideoProgressTrack>
-            ) : null}
-            {job.message || job.error ? <JobMessage>{job.error || job.message}</JobMessage> : null}
-            {!job.done ? (
-              <InlineRow>
-                <VideoSecondaryButton
-                  onClick={() => invoke("video_generate_cancel", { jobId: job.jobId }).catch(() => {})}
-                  type="button"
-                >
-                  Cancel
-                </VideoSecondaryButton>
-              </InlineRow>
-            ) : Array.isArray(job.outputPaths) && job.outputPaths.length && !job.error ? (
-              <InlineRow>
-                {job.outputPaths.map((path) => (
-                  <VideoPaneButton key={path} onClick={() => onInsertAsset?.(path)} type="button">
-                    + Insert at playhead
-                  </VideoPaneButton>
-                ))}
-              </InlineRow>
-            ) : null}
-          </JobRow>
-        ))}
-      </Section>
       </FormScroll>
       <HistorySlide data-open={historyOpen ? "true" : "false"} {...(historyOpen ? {} : { inert: "" })}>
         <HistoryHeader>
@@ -1031,32 +1203,88 @@ export default function GeneratePanel({
           <SectionTitle>Job history</SectionTitle>
         </HistoryHeader>
         <HistoryList>
-          {historyJobs.length ? (
-            historyJobs.map((job) => (
-              <JobRow key={`hist-${job.jobId}`}>
-                <JobTitle $tone={job.error ? "error" : "done"}>
-                  {job.request?.model || job.model || job.providerId || "job"}
-                  <em>{job.request?.prompt ? job.request.prompt.slice(0, 48) : job.mode || ""}</em>
-                  <span>{job.error ? "error" : job.done ? "done" : "running"}</span>
-                </JobTitle>
-                {job.request && job.request.kind !== "upscale" && !String(job.request.mode || "").startsWith("upscale") ? (
-                  <InlineRow>
-                    <VideoSecondaryButton
-                      onClick={() => reuseJob(job)}
-                      title="Load this job's prompt, inputs, and settings into the form (missing inputs are fine)"
-                      type="button"
-                    >
-                      ↺ Reuse
-                    </VideoSecondaryButton>
-                  </InlineRow>
-                ) : null}
-              </JobRow>
-            ))
+          {displayJobs.length ? (
+            displayJobs.map((job) => {
+              const previewAsset = resolvePreviewAsset(job);
+              const status = job.error ? "error" : job.done ? "done" : "running";
+              const promptText = job.request?.prompt || job.message || "";
+              const canReuse =
+                job.request &&
+                job.request.kind !== "upscale" &&
+                !String(job.request.mode || "").startsWith("upscale");
+              return (
+                <HistRow key={`hist-${job.jobId}`}>
+                  <HistThumb
+                    data-draggable={previewAsset ? "true" : "false"}
+                    data-status={status}
+                    onDoubleClick={() => previewAsset && onInsertAsset?.(previewAsset.path)}
+                    onPointerDown={(event) => previewAsset && beginHistoryDrag(event, previewAsset)}
+                    title={
+                      previewAsset
+                        ? `${previewAsset.name}\nDrag onto the timeline · double-click adds at the playhead`
+                        : status === "running"
+                          ? "Generating…"
+                          : status === "error"
+                            ? "Failed — no media"
+                            : "Media not in the library anymore"
+                    }
+                  >
+                    {previewAsset?.thumbnailDataUrl ? (
+                      <img alt="" draggable={false} src={previewAsset.thumbnailDataUrl} />
+                    ) : (
+                      <HistGlyph aria-hidden data-status={status}>
+                        {status === "running" ? "✦" : status === "error" ? "⚠" : "◇"}
+                      </HistGlyph>
+                    )}
+                  </HistThumb>
+                  <HistInfo>
+                    <b>{job.request?.model || job.model || job.providerId || "job"}</b>
+                    {promptText ? <p>{promptText}</p> : null}
+                    {status === "running" ? (
+                      <VideoProgressTrack>
+                        <VideoProgressFill
+                          style={{ width: `${Math.min(100, Math.max(3, job.percent || 3))}%` }}
+                        />
+                      </VideoProgressTrack>
+                    ) : null}
+                    {job.error ? <HistError>{job.error}</HistError> : null}
+                  </HistInfo>
+                  <HistSide>
+                    <HistStatus data-status={status}>
+                      {status === "running" ? `${Math.round(job.percent || 0)}%` : status}
+                    </HistStatus>
+                    {status === "running" ? (
+                      <VideoSecondaryButton
+                        onClick={() => invoke("video_generate_cancel", { jobId: job.jobId }).catch(() => {})}
+                        type="button"
+                      >
+                        Cancel
+                      </VideoSecondaryButton>
+                    ) : canReuse ? (
+                      <VideoSecondaryButton
+                        onClick={() => reuseJob(job)}
+                        title="Load this job's prompt, inputs, and settings into the form (missing inputs are fine)"
+                        type="button"
+                      >
+                        ↺ Reuse
+                      </VideoSecondaryButton>
+                    ) : null}
+                  </HistSide>
+                </HistRow>
+              );
+            })
           ) : (
-            <VideoHint>No past jobs yet.</VideoHint>
+            <VideoHint>No jobs yet — generations land in media/generated and appear in the library (AI filter).</VideoHint>
           )}
         </HistoryList>
       </HistorySlide>
+      {historyDrag ? createPortal(
+        <HistDragGhost style={{ left: `${historyDrag.x + 10}px`, top: `${historyDrag.y + 8}px` }}>
+          {historyDrag.asset.thumbnailDataUrl ? <img alt="" src={historyDrag.asset.thumbnailDataUrl} /> : null}
+          <span>{historyDrag.asset.name}</span>
+        </HistDragGhost>,
+        document.body,
+      ) : null}
     </PanelRoot>
   );
 }

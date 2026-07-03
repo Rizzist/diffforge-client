@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -5528,7 +5528,7 @@ function layoutScannedResultGraph(graph) {
   };
 }
 
-export default function ArchitectureWorkspaceView({
+function ArchitectureWorkspaceView({
   defaultWorkingDirectory,
   rootDirectory,
   architectureError = "",
@@ -5869,6 +5869,8 @@ export default function ArchitectureWorkspaceView({
     </ArchitectureSurface>
   );
 }
+
+export default memo(ArchitectureWorkspaceView);
 
 export function ArchitectureHubView({
   catalog = null,

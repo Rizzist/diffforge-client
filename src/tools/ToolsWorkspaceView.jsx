@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
 import {
@@ -1529,7 +1529,7 @@ function ToolsHydrationProgress({ placement = "panel", progress }) {
   );
 }
 
-export default function ToolsWorkspaceView({
+function ToolsWorkspaceView({
   agentPromptWorkspaceId = "",
   embeddedDocsOpenRequest = null,
   embeddedDocsPanel = false,
@@ -6955,6 +6955,8 @@ export default function ToolsWorkspaceView({
     </ToolsHubShell>
   );
 }
+
+export default memo(ToolsWorkspaceView);
 
 const ToolsHubShell = styled.section`
   --tools-border: rgba(230, 236, 245, 0.1);

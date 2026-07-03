@@ -10,6 +10,7 @@ const APPROVAL_CUE_COOLDOWN_MS = 5000;
 const ALL_DONE_CUE_COOLDOWN_MS = 1200;
 const NOTIFICATION_CUE_COOLDOWN_MS = 800;
 const TERMINAL_READY_NOTIFICATION_KIND = "terminal.ready";
+let lastPersistedWorkspaceNotificationsPayload = "";
 // One physical completion arrives twice: the lifecycle reducer's generic
 // terminal.ready and TerminalView's richer todo.completed both describe the
 // same finishing terminal, in racy order. Within this window the pair is
@@ -429,10 +430,15 @@ export function persistWorkspaceNotifications(state) {
         },
       ]),
     );
-    window.localStorage.setItem(
-      WORKSPACE_NOTIFICATION_STORAGE_KEY,
-      JSON.stringify({ version: WORKSPACE_NOTIFICATION_VERSION, workspaces }),
-    );
+    const serialized = JSON.stringify({
+      version: WORKSPACE_NOTIFICATION_VERSION,
+      workspaces,
+    });
+    if (serialized === lastPersistedWorkspaceNotificationsPayload) {
+      return;
+    }
+    window.localStorage.setItem(WORKSPACE_NOTIFICATION_STORAGE_KEY, serialized);
+    lastPersistedWorkspaceNotificationsPayload = serialized;
   } catch {
     // Notifications are convenience state; live coordination events and snapshots rebuild essentials.
   }
@@ -1565,13 +1571,30 @@ export function markWorkspaceNotificationsSeen(state, workspaceId) {
   if (!safeWorkspaceId) {
     return normalizeWorkspaceNotificationState(state);
   }
+  const source = state && typeof state === "object" && !Array.isArray(state) ? state : null;
+  const sourceWorkspaces = source?.workspaces
+    && typeof source.workspaces === "object"
+    && !Array.isArray(source.workspaces)
+    ? source.workspaces
+    : null;
+  if (source?.version === WORKSPACE_NOTIFICATION_VERSION && sourceWorkspaces) {
+    const sourceNotifications = sourceWorkspaces[safeWorkspaceId]?.notifications || {};
+    const hasUnread = Object.values(sourceNotifications).some((notification) => (
+      notification?.status === "unread"
+    ));
+    if (!hasUnread) {
+      return state;
+    }
+  }
   const { bucket, state: currentState } = getWorkspaceBucket(state, safeWorkspaceId);
   const seenAt = nowIso();
+  let markedSeen = false;
   const notifications = Object.fromEntries(
     Object.entries(bucket.notifications).map(([id, notification]) => {
       if (notification.status !== "unread") {
         return [id, notification];
       }
+      markedSeen = true;
       return [id, {
         ...notification,
         seenAt,
@@ -1580,6 +1603,10 @@ export function markWorkspaceNotificationsSeen(state, workspaceId) {
       }];
     }),
   );
+
+  if (!markedSeen) {
+    return currentState;
+  }
 
   return setWorkspaceBucket(currentState, safeWorkspaceId, {
     ...bucket,

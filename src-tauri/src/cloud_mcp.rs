@@ -24148,6 +24148,9 @@ fn cloud_mcp_direct_target_from_balancer_route(
         .get("route_token")
         .and_then(Value::as_str)
         .map(str::to_string)?;
+    if !cloud_mcp_route_token_scope_allows_endpoint(&route_token, endpoint_path) {
+        return None;
+    }
     let preferred = if endpoint_path == "/v1/voice/ws" {
         direct
             .get("voice_websocket_url")
@@ -24195,6 +24198,9 @@ fn cloud_mcp_direct_target_from_broker_route(
         .or_else(|| route.get("route_token"))
         .and_then(Value::as_str)
         .map(str::to_string)?;
+    if !cloud_mcp_route_token_scope_allows_endpoint(&route_token, endpoint_path) {
+        return None;
+    }
     let preferred = if endpoint_path == "/v1/voice/ws" {
         route
             .get("voiceWebsocketUrl")
@@ -53702,6 +53708,34 @@ mod cloud_mcp_tests {
             &asset_token,
             "/v1/assets/upload/asset-upload-123"
         ));
+
+        let app_scoped_route = json!({
+            "direct": {
+                "enabled": true,
+                "route_token": websocket_token,
+                "browser_compatible": true,
+                "app_websocket_url": "wss://node.example/_diffforge/instances/abc/v1/app/ws",
+            }
+        });
+        assert!(cloud_mcp_direct_target_from_route(
+            &app_scoped_route,
+            "/v1/assets/upload/asset-upload-123"
+        )
+        .is_none());
+
+        let asset_scoped_route = json!({
+            "direct": {
+                "enabled": true,
+                "route_token": asset_token,
+                "browser_compatible": true,
+                "app_websocket_url": "wss://node.example/_diffforge/instances/abc/v1/app/ws",
+            }
+        });
+        assert!(cloud_mcp_direct_target_from_route(
+            &asset_scoped_route,
+            "/v1/assets/upload/asset-upload-123"
+        )
+        .is_some());
     }
 
     #[test]

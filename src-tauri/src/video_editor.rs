@@ -1471,7 +1471,9 @@ fn video_pending_generated_media_items(
         video_read_generation_jobs(&video_generation_jobs_path(media_root)).unwrap_or_default();
     let mut items = Vec::new();
     for job in jobs {
-        if job.done {
+        // Errored jobs must not leave ghost tiles in the library; a resume
+        // clears the error and the tile comes back.
+        if job.done || job.error.is_some() {
             continue;
         }
         for planned_path in &job.planned_paths {
@@ -6720,6 +6722,8 @@ fn video_emit_generate_progress(
         done,
         error,
         output_paths,
+        &context.model,
+        &context.planned_paths,
     );
 }
 
@@ -6733,6 +6737,8 @@ fn video_emit_generate_progress_event(
     done: bool,
     error: Option<&str>,
     output_paths: &[String],
+    model: &str,
+    planned_paths: &[String],
 ) {
     let _ = app.emit(
         VIDEO_GENERATE_PROGRESS_EVENT,
@@ -6745,6 +6751,9 @@ fn video_emit_generate_progress_event(
             "done": done,
             "error": error,
             "outputPaths": output_paths,
+            "model": model,
+            // Lets the frontend clean up placeholder clips when a job errors.
+            "plannedPaths": planned_paths,
         }),
     );
 }

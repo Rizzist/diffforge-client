@@ -25,6 +25,32 @@ const RESIZE_DIAGNOSTIC_SLOW_MS = 16;
 
 const pendingFrameResizeControllers = new Set();
 let resizeFrameHandle = 0;
+const layoutAnimationResizeCallbacks = new Set();
+let layoutAnimationDepth = 0;
+
+export function beginTerminalLayoutAnimation() {
+  layoutAnimationDepth += 1;
+}
+
+export function endTerminalLayoutAnimation(reason = "layout_animation_end") {
+  if (layoutAnimationDepth === 0) {
+    return;
+  }
+
+  layoutAnimationDepth -= 1;
+
+  if (layoutAnimationDepth !== 0) {
+    return;
+  }
+
+  Array.from(layoutAnimationResizeCallbacks).forEach((callback) => {
+    callback(reason);
+  });
+}
+
+function terminalLayoutAnimationIsActive() {
+  return layoutAnimationDepth > 0;
+}
 
 function clampDimension(value, fallback, minimum, maximum) {
   const numericValue = Number.isFinite(value) ? Math.floor(value) : fallback;
@@ -600,12 +626,28 @@ export function createTerminalResizeController({
     enqueueResizeController(controller);
   };
 
-  const observer = new ResizeObserver(() => {
-    schedule("resize_observer", debounceMs, {
+  const scheduleObservedResize = (reason = "resize_observer") => {
+    schedule(reason, debounceMs, {
       deferWebglAtlasClear: true,
       frontendFirst: true,
       nativeDelayMs: nativeResizeTrailingMs,
     });
+  };
+
+  const scheduleLayoutAnimationEndResize = (reason) => {
+    if (disposed) {
+      return;
+    }
+
+    scheduleObservedResize(reason);
+  };
+
+  const observer = new ResizeObserver(() => {
+    if (terminalLayoutAnimationIsActive()) {
+      return;
+    }
+
+    scheduleObservedResize();
   });
 
   function flushScheduledResize() {
@@ -806,6 +848,7 @@ export function createTerminalResizeController({
       nativeResizeBurstActive = false;
       nativeResizeBurstStartedAt = 0;
       nativeResizeBurstStartSize = null;
+      layoutAnimationResizeCallbacks.delete(scheduleLayoutAnimationEndResize);
       observer.disconnect();
     },
     flushScheduledResize,
@@ -819,6 +862,7 @@ export function createTerminalResizeController({
     schedule,
   };
 
+  layoutAnimationResizeCallbacks.add(scheduleLayoutAnimationEndResize);
   observer.observe(container);
 
   return controller;

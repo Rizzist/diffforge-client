@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 
 import { FormMessage } from "../app/appStyles";
+import { collapseFunctionalRepoPathToCoreRepoPath } from "../terminals/coreRepoNameDisplay";
 
 function text(value, fallback = "") {
   const normalized = String(value || "").trim();
@@ -12,6 +13,51 @@ function text(value, fallback = "") {
 function numberValue(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : 0;
+}
+
+function cleanWorkspaceRootDirectory(value) {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  const cleaned = value.replace(/[\u0000-\u001F\u007F]/g, "").trim();
+  const uncVerbatimMatch = cleaned.match(/^[\\/]{2}\?[\\/]UNC[\\/](.+)$/i);
+
+  if (uncVerbatimMatch) {
+    return collapseFunctionalRepoPathToCoreRepoPath(`\\\\${uncVerbatimMatch[1]}`.trim());
+  }
+
+  const driveVerbatimMatch = cleaned.match(/^[\\/]{2}\?[\\/]([a-z]:[\\/].*)$/i);
+
+  if (driveVerbatimMatch) {
+    return collapseFunctionalRepoPathToCoreRepoPath(driveVerbatimMatch[1].trim());
+  }
+
+  return collapseFunctionalRepoPathToCoreRepoPath(cleaned);
+}
+
+function getWorkspaceRootIdentity(value) {
+  const cleaned = cleanWorkspaceRootDirectory(value).replace(/\\/g, "/");
+
+  if (!cleaned) {
+    return "";
+  }
+
+  const withoutTrailingSlash = cleaned === "/"
+    ? cleaned
+    : cleaned.replace(/\/+$/g, "");
+
+  return withoutTrailingSlash.toLowerCase();
+}
+
+function workspaceRootDirectoryMatches(left, right) {
+  if (left === right) {
+    return true;
+  }
+
+  const leftIdentity = getWorkspaceRootIdentity(left);
+  const rightIdentity = getWorkspaceRootIdentity(right);
+  return Boolean(leftIdentity && rightIdentity && leftIdentity === rightIdentity);
 }
 
 function shortSha(value) {
@@ -430,6 +476,7 @@ export default function GitWorkspaceView({
   const [snapshotError, setSnapshotError] = useState("");
   const [snapshot, setSnapshot] = useState(null);
   const [expandedHistoryKeys, setExpandedHistoryKeys] = useState(() => new Set());
+  const [initializeRepositoryState, setInitializeRepositoryState] = useState("idle");
   const [commitMessage, setCommitMessage] = useState("");
   const [commitState, setCommitState] = useState("idle");
   const [commitError, setCommitError] = useState("");
@@ -448,12 +495,12 @@ export default function GitWorkspaceView({
   const preloadMatches = Boolean(
     repositoriesPreload
       && repositoriesPreload.workspaceId === workspaceId
-      && repositoriesPreload.rootDirectory === rootDirectory,
+      && workspaceRootDirectoryMatches(repositoriesPreload.rootDirectory, rootDirectory),
   );
   const snapshotsPreloadMatches = Boolean(
     snapshotsPreload
       && snapshotsPreload.workspaceId === workspaceId
-      && snapshotsPreload.rootDirectory === rootDirectory
+      && workspaceRootDirectoryMatches(snapshotsPreload.rootDirectory, rootDirectory)
       && snapshotsPreload.snapshots
       && typeof snapshotsPreload.snapshots === "object",
   );
@@ -574,6 +621,32 @@ export default function GitWorkspaceView({
     });
   }, [refreshRepositories]);
 
+  const handleInitializeRepository = useCallback(async () => {
+    if (!rootDirectory || initializeRepositoryState === "running") {
+      return;
+    }
+
+    setInitializeRepositoryState("running");
+    setRepositoriesError("");
+    try {
+      await invoke("workspace_initialize_git", { repoPath: rootDirectory });
+      if (typeof onRefreshRepositories === "function") {
+        setRepositoriesState("loading");
+        await refreshRepositories({ refresh: true });
+      }
+    } catch (error) {
+      setRepositoriesError(error?.message || String(error || "Unable to initialize Git repository."));
+      setRepositoriesState("error");
+    } finally {
+      setInitializeRepositoryState("idle");
+    }
+  }, [
+    initializeRepositoryState,
+    onRefreshRepositories,
+    refreshRepositories,
+    rootDirectory,
+  ]);
+
   useEffect(() => {
     if (!preloadMatches || !repositoriesPreload || repositoriesPreload.state !== "loading") {
       return undefined;
@@ -639,14 +712,13 @@ export default function GitWorkspaceView({
     } else if (
       repositoriesPreload?.state === "loading"
       && repositoryPreloadLoadingStale(repositoriesPreload)
-      && typeof onRefreshRepositories !== "function"
     ) {
       setRepositoriesError("Git repository check timed out.");
       setRepositoriesState("error");
     } else {
       setRepositoriesState(repositoriesPreload?.state === "loading" ? "loading" : "ready");
     }
-  }, [onRefreshRepositories, preloadMatches, preloadSignature, repositoriesPreload]);
+  }, [preloadMatches, preloadSignature, repositoriesPreload]);
 
   useEffect(() => {
     if (preloadMatches) {
@@ -662,10 +734,11 @@ export default function GitWorkspaceView({
     setSnapshot(null);
     setExpandedHistoryKeys(new Set());
     setCommitMessage("");
+    setInitializeRepositoryState("idle");
     setCommitState("idle");
     setCommitError("");
     setCommitNotice("");
-  }, [selectedRepoPath]);
+  }, [rootDirectory, selectedRepoPath, workspaceId]);
 
   useEffect(() => {
     if (!selectedRepoPath) {
@@ -944,6 +1017,15 @@ export default function GitWorkspaceView({
               type="button"
             >
               Retry
+            </GitEmptyAction>
+          ) : null}
+          {repositoriesState === "ready" ? (
+            <GitEmptyAction
+              disabled={initializeRepositoryState === "running"}
+              onClick={handleInitializeRepository}
+              type="button"
+            >
+              {initializeRepositoryState === "running" ? "Initializing..." : "Initialize Git repository"}
             </GitEmptyAction>
           ) : null}
         </GitEmpty>
@@ -1725,6 +1807,11 @@ const GitEmptyAction = styled.button`
   &:hover {
     border-color: rgba(125, 176, 255, 0.45);
     background: var(--git-vscode-hover);
+  }
+
+  &:disabled {
+    cursor: wait;
+    opacity: 0.65;
   }
 `;
 

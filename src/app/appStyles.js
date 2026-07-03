@@ -2533,6 +2533,11 @@ export const WorkspaceRail = styled.aside`
     backdrop-filter: saturate(180%) blur(20px);
   }
 
+  html[data-forge-theme="light"] [data-rail-animating="true"] &,
+  html[data-forge-theme="light"] &[data-rail-animating="true"] {
+    backdrop-filter: none;
+  }
+
   &[data-collapsed="true"] {
     gap: 7px;
     padding: 8px 6px;
