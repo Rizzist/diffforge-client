@@ -5,7 +5,7 @@ import { Pause } from "@styled-icons/material-rounded/Pause";
 import { PhotoCamera } from "@styled-icons/material-rounded/PhotoCamera";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
 import { SkipPrevious } from "@styled-icons/material-rounded/SkipPrevious";
-import { clipsAtMs, formatTimecode, gainAtMs, projectDurationMs } from "./videoEditorModel.js";
+import { clipPropAtMs, clipsAtMs, formatTimecode, gainAtMs, projectDurationMs } from "./videoEditorModel.js";
 import { VideoIconButton } from "./videoStyles.js";
 
 const PreviewRoot = styled.div`
@@ -361,10 +361,13 @@ export default function VideoEditor({
           >
             {visual ? (
               <PreviewLayer
-                style={{
-                  opacity: visual.clip.transform?.opacity ?? 1,
-                  transform: `translate(${(visual.clip.transform?.x || 0) * 100}%, ${(visual.clip.transform?.y || 0) * 100}%) scale(${visual.clip.transform?.scale ?? 1})`,
-                }}
+                style={(() => {
+                  const clipRelMs = playheadMs - visual.clip.timelineStartMs;
+                  return {
+                    opacity: clipPropAtMs(visual.clip, "opacity", clipRelMs),
+                    transform: `translate(${clipPropAtMs(visual.clip, "x", clipRelMs) * 100}%, ${clipPropAtMs(visual.clip, "y", clipRelMs) * 100}%) scale(${clipPropAtMs(visual.clip, "scale", clipRelMs)})`,
+                  };
+                })()}
               >
                 {visualIsImage ? (
                   <img alt="" draggable={false} src={assetSrc(visual.clip.assetPath)} />

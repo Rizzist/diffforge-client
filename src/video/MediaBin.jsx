@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { Add } from "@styled-icons/material-rounded/Add";
+import { AutoAwesome } from "@styled-icons/material-rounded/AutoAwesome";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { Subtitles } from "@styled-icons/material-rounded/Subtitles";
 import { listen } from "@tauri-apps/api/event";
@@ -122,6 +123,64 @@ const AssetTile = styled.div`
 
   &[data-dragging="true"] {
     opacity: 0.45;
+  }
+
+  &[data-pending="true"] {
+    border-style: dashed;
+    border-color: rgba(96, 165, 250, 0.45);
+    cursor: default;
+  }
+`;
+
+const PendingSpin = styled.span`
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  color: #93c5fd;
+  animation: video-pending-pulse 1.4s ease-in-out infinite;
+
+  @keyframes video-pending-pulse {
+    0%,
+    100% {
+      opacity: 0.35;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
+`;
+
+const AiMenu = styled.div`
+  position: fixed;
+  z-index: 9999;
+  display: grid;
+  gap: 2px;
+  padding: 4px;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 8px;
+  background: rgba(7, 12, 22, 0.98);
+  box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55);
+  min-width: 168px;
+`;
+
+const AiMenuItem = styled.button`
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: rgba(203, 213, 225, 0.92);
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 5px 10px;
+  border-radius: 5px;
+  cursor: pointer;
+  text-align: left;
+
+  &:hover {
+    background: rgba(16, 185, 129, 0.16);
+    color: #d1fae5;
   }
 `;
 
@@ -284,7 +343,9 @@ export default function MediaBin({
   assets = [],
   error = "",
   onAddToTimeline,
+  onAiEdit,
   onImported,
+  onOpenTranscript,
   onSelectAsset,
   paneToken = "",
   repoPath = "",
@@ -343,23 +404,16 @@ export default function MediaBin({
     };
   }, [onImported]);
 
-  const startTranscribe = useCallback(
-    (asset) => {
-      if (!repoPath || !asset?.path || transcribing[asset.path]) {
-        return;
-      }
-      setTranscribing((current) => ({ ...current, [asset.path]: "starting" }));
-      invoke("video_transcribe_start", { repoPath, path: asset.path }).catch((err) => {
-        setTranscribing((current) => {
-          const next = { ...current };
-          delete next[asset.path];
-          return next;
-        });
-        setImportError(String(err));
-      });
-    },
-    [repoPath, transcribing],
-  );
+  const [aiMenu, setAiMenu] = useState(null); // { asset, x, y }
+
+  useEffect(() => {
+    if (!aiMenu) {
+      return undefined;
+    }
+    const close = () => setAiMenu(null);
+    window.addEventListener("pointerdown", close);
+    return () => window.removeEventListener("pointerdown", close);
+  }, [aiMenu]);
 
   const visibleAssets = useMemo(() => {
     if (filter === "all") {
@@ -504,6 +558,7 @@ export default function MediaBin({
             phase: cancelled ? "cancel" : "end",
             asset,
             paneToken,
+            metaKey: Boolean(endEvent?.metaKey || endEvent?.ctrlKey),
             x: endEvent?.clientX ?? startX,
             y: endEvent?.clientY ?? startY,
           });
@@ -548,13 +603,18 @@ export default function MediaBin({
           {visibleAssets.map((asset) => (
             <AssetTile
               data-dragging={drag?.asset?.path === asset.path ? "true" : "false"}
+              data-pending={asset.pending ? "true" : "false"}
               data-selected={selectedPath === asset.path ? "true" : "false"}
               draggable={false}
               key={asset.path}
-              onClick={() => onSelectAsset?.(asset)}
-              onDoubleClick={() => onAddToTimeline?.(asset)}
-              onPointerDown={(event) => beginPointerDrag(event, asset)}
-              title={`${asset.name}\nDrag to the timeline · double-click or + adds at the playhead`}
+              onClick={() => !asset.pending && onSelectAsset?.(asset)}
+              onDoubleClick={() => !asset.pending && onAddToTimeline?.(asset)}
+              onPointerDown={(event) => !asset.pending && beginPointerDrag(event, asset)}
+              title={
+                asset.pending
+                  ? `${asset.name}\nGenerating… appears here when ready`
+                  : `${asset.name}\nDrag to the timeline · double-click or + adds at the playhead`
+              }
             >
               <AssetThumb>
                 {asset.thumbnailDataUrl ? (
@@ -562,8 +622,9 @@ export default function MediaBin({
                 ) : (
                   <AssetGlyph aria-hidden>{assetGlyph(asset.kind)}</AssetGlyph>
                 )}
+                {asset.pending ? <PendingSpin aria-hidden>✦</PendingSpin> : null}
                 <AssetKind>
-                  {asset.folder === "generated" ? "AI" : asset.kind}
+                  {asset.pending ? "generating" : asset.folder === "generated" ? "AI" : asset.kind}
                   {transcribing[asset.path] ? " · …" : asset.hasTranscript ? " · T" : ""}
                 </AssetKind>
                 {Number.isFinite(Number(asset.durationMs)) && asset.durationMs > 0 ? (
@@ -581,22 +642,31 @@ export default function MediaBin({
                   >
                     <Add aria-hidden="true" />
                   </HoverButton>
-                  {asset.kind !== "image" ? (
+                  {asset.kind !== "image" && !asset.pending ? (
                     <HoverButton
-                      aria-label={`Transcribe ${asset.name}`}
-                      disabled={Boolean(transcribing[asset.path])}
+                      aria-label={`Transcript for ${asset.name}`}
                       onClick={(event) => {
                         event.stopPropagation();
-                        startTranscribe(asset);
+                        onOpenTranscript?.(asset);
                       }}
-                      title={
-                        asset.hasTranscript
-                          ? "Re-transcribe (Whisper via cloud)"
-                          : "Transcribe audio (Whisper via cloud) — lets AI agents understand this media"
-                      }
+                      title="Transcript — transcribe, edit, caption, cut words (HappySRT-style)"
                       type="button"
                     >
                       <Subtitles aria-hidden="true" />
+                    </HoverButton>
+                  ) : null}
+                  {!asset.pending ? (
+                    <HoverButton
+                      aria-label={`AI edit ${asset.name}`}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        const rect = event.currentTarget.getBoundingClientRect();
+                        setAiMenu({ asset, x: rect.left, y: rect.bottom + 4 });
+                      }}
+                      title="AI edit"
+                      type="button"
+                    >
+                      <AutoAwesome aria-hidden="true" />
                     </HoverButton>
                   ) : null}
                   <HoverButton
@@ -623,6 +693,86 @@ export default function MediaBin({
           {drag.asset.thumbnailDataUrl ? <img alt="" src={drag.asset.thumbnailDataUrl} /> : null}
           <span>{drag.asset.name}</span>
         </DragGhost>
+      ) : null}
+      {aiMenu ? (
+        <AiMenu
+          onPointerDown={(event) => event.stopPropagation()}
+          style={{ left: `${Math.min(aiMenu.x, window.innerWidth - 190)}px`, top: `${aiMenu.y}px` }}
+        >
+          {aiMenu.asset.kind === "image" ? (
+            <>
+              <AiMenuItem
+                onClick={() => {
+                  onAiEdit?.({ action: "image-to-video", asset: aiMenu.asset });
+                  setAiMenu(null);
+                }}
+                type="button"
+              >
+                🎬 Create video from this
+              </AiMenuItem>
+              <AiMenuItem
+                onClick={() => {
+                  onAiEdit?.({ action: "image-edit", asset: aiMenu.asset });
+                  setAiMenu(null);
+                }}
+                type="button"
+              >
+                ✏️ Edit with AI
+              </AiMenuItem>
+              <AiMenuItem
+                onClick={() => {
+                  onAiEdit?.({ action: "upscale-image", asset: aiMenu.asset });
+                  setAiMenu(null);
+                }}
+                type="button"
+              >
+                ⤴ Upscale image
+              </AiMenuItem>
+            </>
+          ) : null}
+          {aiMenu.asset.kind === "video" ? (
+            <>
+              <AiMenuItem
+                onClick={() => {
+                  onAiEdit?.({ action: "upscale-video", asset: aiMenu.asset });
+                  setAiMenu(null);
+                }}
+                type="button"
+              >
+                ⤴ Upscale video
+              </AiMenuItem>
+              <AiMenuItem
+                onClick={() => {
+                  onOpenTranscript?.(aiMenu.asset);
+                  setAiMenu(null);
+                }}
+                type="button"
+              >
+                ¶ Transcript & captions
+              </AiMenuItem>
+            </>
+          ) : null}
+          {aiMenu.asset.kind === "audio" ? (
+            <AiMenuItem
+              onClick={() => {
+                onOpenTranscript?.(aiMenu.asset);
+                setAiMenu(null);
+              }}
+              type="button"
+            >
+              ¶ Transcript & captions
+            </AiMenuItem>
+          ) : null}
+          <AiMenuItem
+            onClick={() => {
+              onAddToTimeline?.(aiMenu.asset);
+              setAiMenu(null);
+            }}
+            type="button"
+          >
+            + Add at playhead
+          </AiMenuItem>
+        </AiMenu>
       ) : null}
     </BinRoot>
   );

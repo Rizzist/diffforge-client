@@ -17,8 +17,23 @@ import ExportPanel from "./ExportPanel.jsx";
 import {
   VIDEO_STORE_CHANGED_EVENT,
   VIDEO_TOOLS_INSTALL_PROGRESS_EVENT,
+  VIDEO_TRANSCRIBE_PROGRESS_EVENT,
 } from "./videoPanelBridge.js";
-import { addMediaClip, clipsInRange, formatTimecode, normalizeProject, updateClip } from "./videoEditorModel.js";
+import TranscriptPanel from "./TranscriptPanel.jsx";
+import {
+  addCaptionsForClip,
+  addMediaClip,
+  clipsInRange,
+  formatTimecode,
+  normalizeProject,
+  rippleDeleteWords,
+  updateClip,
+} from "./videoEditorModel.js";
+import {
+  FAL_UPSCALE_IMAGE_MODEL,
+  FAL_UPSCALE_VIDEO_MODEL,
+  videoProviderAuth,
+} from "./videoProviders.js";
 import {
   VideoCard,
   VideoErrorText,
@@ -283,6 +298,9 @@ export default function VideoWorkspacePane({
   const [ranges, setRanges] = useState([]);
   const [selectionContext, setSelectionContext] = useState("");
   const [selectedAssetPath, setSelectedAssetPath] = useState("");
+  const [transcriptAsset, setTranscriptAsset] = useState(null);
+  const [generateSeed, setGenerateSeed] = useState(null);
+  const seedNonceRef = useRef(0);
   const [playheadMs, setPlayheadMs] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [historyVersion, setHistoryVersion] = useState(0);
@@ -754,6 +772,137 @@ export default function VideoWorkspacePane({
     return map;
   }, [assets]);
 
+  // Transcript panel + AI Edit routing --------------------------------------
+
+  const openTranscript = useCallback((asset) => {
+    setTranscriptAsset(asset);
+    setSidePanel("transcript");
+  }, []);
+
+  const handleAiEdit = useCallback(
+    ({ action, asset }) => {
+      if (action === "upscale-video" || action === "upscale-image") {
+        const auth = videoProviderAuth("flux-lora");
+        if (!auth.apiKey) {
+          setPaneError("Upscaling runs on fal.ai — add the Flux + LoRA API key in Generate → API keys.");
+          setSidePanel("generate");
+          return;
+        }
+        invoke("video_generate_start", {
+          repoPath,
+          request: {
+            providerId: "fal",
+            model: action === "upscale-video" ? FAL_UPSCALE_VIDEO_MODEL : FAL_UPSCALE_IMAGE_MODEL,
+            mode: action,
+            prompt: "",
+            inputAssetPaths: [asset.path],
+            params: { durationSec: null, aspect: null, resolution: null, seed: null },
+            loraId: null,
+            auth,
+          },
+        })
+          .then(() => setSidePanel("generate"))
+          .catch((err) => setPaneError(String(err)));
+        return;
+      }
+      seedNonceRef.current += 1;
+      setGenerateSeed({ action, asset, nonce: seedNonceRef.current });
+      setSidePanel("generate");
+    },
+    [repoPath],
+  );
+
+  // Auto-captions: style caption clips onto a Captions track for the clip
+  // using this asset (selected clip preferred).
+  const generateCaptions = useCallback(
+    (asset, segments) => {
+      const current = projectStateRef.current;
+      if (!current || !asset?.path) {
+        return;
+      }
+      let target = null;
+      for (const track of current.tracks) {
+        for (const clip of track.clips) {
+          if (clip.assetPath === asset.path && track.kind !== "text") {
+            if (selectedClipIds.includes(clip.id)) {
+              target = clip;
+              break;
+            }
+            target = target || clip;
+          }
+        }
+      }
+      if (!target) {
+        setPaneError("Put this media on the timeline first, then generate captions for it.");
+        return;
+      }
+      const result = addCaptionsForClip(current, target.id, segments);
+      if (result.count) {
+        handleProjectChange(result.project, { transient: false });
+        setPaneError("");
+      } else {
+        setPaneError("No transcript segments overlap this clip's trimmed range.");
+      }
+    },
+    [handleProjectChange, selectedClipIds],
+  );
+
+  // The HappySRT-style flagship: strike words → ripple them out of the cut.
+  const removeWordsFromCut = useCallback(
+    (asset, words) => {
+      const current = projectStateRef.current;
+      if (!current || !asset?.path || !words?.length) {
+        return;
+      }
+      const result = rippleDeleteWords(current, asset.path, words);
+      if (result.ranges.length) {
+        handleProjectChange(result.project, { transient: false });
+      } else {
+        setPaneError("Those words aren't inside any timeline clip of this media.");
+      }
+    },
+    [handleProjectChange],
+  );
+
+  const seekSource = useCallback((asset, sourceMs) => {
+    const current = projectStateRef.current;
+    if (!current) {
+      return;
+    }
+    for (const track of current.tracks) {
+      for (const clip of track.clips) {
+        if (clip.assetPath !== asset?.path) {
+          continue;
+        }
+        const speed = clip.speed || 1;
+        const from = clip.sourceInMs || 0;
+        const to = from + clip.durationMs * speed;
+        if (sourceMs >= from && sourceMs <= to) {
+          setPlayheadMs(clip.timelineStartMs + Math.round((sourceMs - from) / speed));
+          return;
+        }
+      }
+    }
+  }, []);
+
+  // Placeholder-first: a reserved generation path becomes a clip immediately.
+  const addPlannedClip = useCallback(
+    (plannedPath, durationMs) => {
+      const current = projectStateRef.current;
+      if (!current || !plannedPath) {
+        return;
+      }
+      const result = addMediaClip(
+        current,
+        { path: plannedPath, kind: "video", durationMs },
+        { timelineStartMs: playheadMs },
+      );
+      handleProjectChange(result.project, { transient: false });
+      setSelectedClipIds([result.clipId]);
+    },
+    [handleProjectChange, playheadMs],
+  );
+
   // Preview text drag → clip style updates (transient while dragging).
   const handleUpdateTextClip = useCallback(
     (clipId, patch, { transient = false } = {}) => {
@@ -794,6 +943,41 @@ export default function VideoWorkspacePane({
   // transcript slices inside each range. Rides along on every agent prompt
   // sent from this pane (the TerminalView wrapper appends it).
   const transcriptCacheRef = useRef(new Map());
+
+  // Transcript edits and fresh transcriptions invalidate the cached slices
+  // used for AI range context.
+  useEffect(() => {
+    let disposed = false;
+    const unlisteners = [];
+    const adopt = (fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisteners.push(fn);
+      }
+    };
+    const invalidate = (event) => {
+      const path = String(event?.payload?.path || "").trim();
+      if (path) {
+        transcriptCacheRef.current.delete(path);
+      }
+    };
+    listen("video-transcript-updated", invalidate).then(adopt).catch(() => {});
+    listen(VIDEO_TRANSCRIBE_PROGRESS_EVENT, (event) => {
+      if (event?.payload?.done && !event?.payload?.error) {
+        invalidate(event);
+      }
+    })
+      .then(adopt)
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      for (const fn of unlisteners) {
+        fn();
+      }
+    };
+  }, []);
+
   useEffect(() => {
     if (!ranges.length || !project) {
       setSelectionContext("");
@@ -863,7 +1047,9 @@ export default function VideoWorkspacePane({
     assets,
     error: mediaError,
     onAddToTimeline: addAssetToTimeline,
+    onAiEdit: handleAiEdit,
     onImported: refreshAssets,
+    onOpenTranscript: openTranscript,
     onSelectAsset: (asset) => setSelectedAssetPath(asset?.path || ""),
     paneToken: paneId || "video-pane",
     repoPath,
@@ -906,7 +1092,22 @@ export default function VideoWorkspacePane({
   );
 
   const sidePanelContent = sidePanel === "generate" ? (
-    <GeneratePanel assets={assets} onGenerated={refreshAssets} onInsertAsset={insertAssetPath} repoPath={repoPath} />
+    <GeneratePanel
+      assets={assets}
+      onGenerated={refreshAssets}
+      onInsertAsset={insertAssetPath}
+      onPlannedClip={addPlannedClip}
+      repoPath={repoPath}
+      seed={generateSeed}
+    />
+  ) : sidePanel === "transcript" ? (
+    <TranscriptPanel
+      asset={transcriptAsset}
+      onGenerateCaptions={generateCaptions}
+      onRemoveWordsFromCut={removeWordsFromCut}
+      onSeekSource={seekSource}
+      repoPath={repoPath}
+    />
   ) : sidePanel === "export" ? (
     <ExportPanel ffmpegReady={ffmpegReady} project={project} projectPath={projectPath} repoPath={repoPath} />
   ) : null;
@@ -1078,7 +1279,7 @@ export default function VideoWorkspacePane({
                   {sidePanelContent ? (
                     <VideoSheet>
                       <VideoSheetHeader>
-                        {sidePanel === "generate" ? "Generate" : "Export"}
+                        {sidePanel === "generate" ? "Generate" : sidePanel === "transcript" ? "Transcript" : "Export"}
                         <VideoRailSpacer />
                         <VideoIconButton onClick={() => setSidePanel("")} title="Close" type="button">
                           <Close aria-hidden="true" />

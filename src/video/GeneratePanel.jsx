@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -9,6 +9,7 @@ import {
 } from "./videoPanelBridge.js";
 import {
   VIDEO_PROVIDERS,
+  estimateGenerationUsd,
   getVideoProvider,
   readVideoProviderKeys,
   videoProviderAuth,
@@ -252,7 +253,14 @@ function jobTone(job) {
 // AI generation: capability-driven form (fields appear only when the chosen
 // provider/mode uses them), thumbnail pickers for start frames and LoRA
 // training sets, streaming job progress, inline key management.
-export default function GeneratePanel({ assets = [], onGenerated, onInsertAsset, repoPath = "" }) {
+export default function GeneratePanel({
+  assets = [],
+  onGenerated,
+  onInsertAsset,
+  onPlannedClip,
+  repoPath = "",
+  seed = null,
+}) {
   const [providerId, setProviderId] = useState(VIDEO_PROVIDERS[0].id);
   const provider = getVideoProvider(providerId) || VIDEO_PROVIDERS[0];
   const capabilities = provider.capabilities || {};
@@ -271,6 +279,56 @@ export default function GeneratePanel({ assets = [], onGenerated, onInsertAsset,
   const [trainOpen, setTrainOpen] = useState(false);
   const [loras, setLoras] = useState([]);
   const [loraDraft, setLoraDraft] = useState({ name: "", triggerWord: "", steps: 1000, imagePaths: [] });
+  const [intoTimeline, setIntoTimeline] = useState(true);
+  const [staleJobs, setStaleJobs] = useState([]);
+  const seedSeenRef = useRef(0);
+
+  // AI Edit menu seeds the form (create-video-from-image, edit-image, …).
+  useEffect(() => {
+    if (!seed || seed.nonce === seedSeenRef.current) {
+      return;
+    }
+    seedSeenRef.current = seed.nonce;
+    if (seed.action === "image-to-video") {
+      setProviderId((current) => {
+        const currentProvider = getVideoProvider(current);
+        return currentProvider?.kind === "video" && currentProvider.capabilities?.startFrame ? current : "seedance";
+      });
+      setMode("image-to-video");
+      setStartFramePath(seed.asset?.path || "");
+    } else if (seed.action === "image-edit") {
+      setProviderId((current) => {
+        const currentProvider = getVideoProvider(current);
+        return currentProvider?.modes?.includes("image-edit") ? current : "gpt-image-2";
+      });
+      setMode("image-edit");
+      setSourceImagePaths(seed.asset?.path ? [seed.asset.path] : []);
+    }
+  }, [seed]);
+
+  // Jobs interrupted by an app restart: offer resume (keys re-supplied from
+  // local storage — the backend never persists them).
+  useEffect(() => {
+    if (!repoPath) {
+      return;
+    }
+    invoke("video_jobs_list", { repoPath })
+      .then((result) => {
+        const jobs = Array.isArray(result?.jobs) ? result.jobs : [];
+        setStaleJobs(jobs.filter((job) => !job.done && job.providerRef));
+      })
+      .catch(() => {});
+  }, [repoPath]);
+
+  const resumeJob = useCallback(
+    (job) => {
+      const keyProvider = job.providerId === "fal" ? "flux-lora" : job.providerId;
+      invoke("video_generate_resume", { repoPath, jobId: job.jobId, auth: videoProviderAuth(keyProvider) })
+        .then(() => setStaleJobs((current) => current.filter((entry) => entry.jobId !== job.jobId)))
+        .catch((err) => setError(String(err)));
+    },
+    [repoPath],
+  );
 
   useEffect(() => {
     if (!provider.models.includes(model)) {
@@ -385,7 +443,7 @@ export default function GeneratePanel({ assets = [], onGenerated, onInsertAsset,
         ? sourceImagePaths
         : [];
     try {
-      await invoke("video_generate_start", {
+      const result = await invoke("video_generate_start", {
         repoPath,
         request: {
           providerId,
@@ -403,10 +461,16 @@ export default function GeneratePanel({ assets = [], onGenerated, onInsertAsset,
           auth,
         },
       });
+      // Placeholder-first: drop the reserved path straight onto the timeline
+      // so the cut keeps moving while the model renders.
+      const planned = Array.isArray(result?.plannedPaths) ? result.plannedPaths : [];
+      if (intoTimeline && planned.length && provider.kind === "video") {
+        onPlannedClip?.(planned[0], (Number(durationSec) || capabilities.duration?.default || 5) * 1000);
+      }
     } catch (err) {
       setError(String(err));
     }
-  }, [aspect, auth, capabilities, durationSec, isImageEdit, keyReady, loraId, mode, model, prompt, provider, providerId, repoPath, sourceImagePaths, startFramePath, wantsAspect, wantsDuration, wantsSourceImages, wantsStartFrame]);
+  }, [aspect, auth, capabilities, durationSec, intoTimeline, isImageEdit, keyReady, loraId, mode, model, onPlannedClip, prompt, provider, providerId, repoPath, sourceImagePaths, startFramePath, wantsAspect, wantsDuration, wantsSourceImages, wantsStartFrame]);
 
   const startLoraTraining = useCallback(async () => {
     setError("");
@@ -583,11 +647,43 @@ export default function GeneratePanel({ assets = [], onGenerated, onInsertAsset,
           <VideoPaneButton disabled={!repoPath} onClick={startGenerate} type="button">
             Generate
           </VideoPaneButton>
+          {(() => {
+            const usd = estimateGenerationUsd(provider, { durationSec: Number(durationSec) || 5 });
+            return usd != null ? (
+              <VideoHint title="Ballpark — billed to your own key, not through us">
+                ≈ ${usd.toFixed(2)}
+              </VideoHint>
+            ) : null;
+          })()}
+          {provider.kind === "video" ? (
+            <VideoHint
+              as="label"
+              style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}
+            >
+              <input
+                checked={intoTimeline}
+                onChange={(event) => setIntoTimeline(event.target.checked)}
+                style={{ accentColor: "#10b981" }}
+                type="checkbox"
+              />
+              into timeline
+            </VideoHint>
+          ) : null}
           <VideoSecondaryButton onClick={() => setKeysOpen((open) => !open)} type="button">
             {keysOpen ? "Hide keys" : "API keys"}
           </VideoSecondaryButton>
           {!keyReady ? <VideoHint>{provider.label} key missing</VideoHint> : null}
         </InlineRow>
+        {staleJobs.length ? (
+          <InlineRow>
+            <VideoHint>Interrupted by restart:</VideoHint>
+            {staleJobs.map((job) => (
+              <VideoSecondaryButton key={job.jobId} onClick={() => resumeJob(job)} type="button">
+                Resume {job.providerId} {job.mode || ""}
+              </VideoSecondaryButton>
+            ))}
+          </InlineRow>
+        ) : null}
         {keysOpen ? (
           <KeyGrid>
             {VIDEO_PROVIDERS.map((entry) => {

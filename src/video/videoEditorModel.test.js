@@ -2,28 +2,42 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  addCaptionsForClip,
   addMediaClip,
   addTextClip,
   addTrack,
+  clipPropAtMs,
   clipsAtMs,
   clipsInRange,
   collectSnapPoints,
+  expandWithLinks,
   formatTimecode,
   gainAtMs,
+  kfValueAtMs,
+  linkClips,
   makeStarterProject,
   moveClip,
   moveClips,
   moveClipToTrack,
   normalizeProject,
   normalizeTextStyle,
+  pasteClips,
   projectDurationMs,
   removeClip,
   removeClips,
   rippleDeleteClip,
+  rippleDeleteRange,
+  rippleDeleteWords,
+  rippleInsertGap,
+  rippleTrim,
+  serializeClips,
+  setClipKeyframe,
   snapMs,
   splitClip,
+  splitLinkedAt,
   trimClipEnd,
   trimClipStart,
+  unlinkClip,
   updateClip,
 } from "./videoEditorModel.js";
 
@@ -263,6 +277,191 @@ test("clipsInRange returns overlapping clips only", () => {
   assert.equal(clipsInRange(project, 0, 999).length, 0);
   assert.equal(clipsInRange(project, 4999, 9000).length, 1);
   assert.equal(clipsInRange(project, 0, 1001).length, 1);
+});
+
+test("keyframe interpolation honors linear, hold, and smooth easings", () => {
+  const frames = [
+    { atMs: 0, value: 0, easing: "linear" },
+    { atMs: 1000, value: 1, easing: "hold" },
+    { atMs: 2000, value: 0.5, easing: "smooth" },
+    { atMs: 3000, value: 1, easing: "linear" },
+  ];
+  assert.equal(kfValueAtMs(frames, -50, 9), 0);
+  assert.ok(Math.abs(kfValueAtMs(frames, 500, 9) - 0.5) < 1e-9); // linear
+  assert.equal(kfValueAtMs(frames, 1500, 9), 1); // hold keeps previous value
+  const smoothMid = kfValueAtMs(frames, 2500, 9); // smoothstep(0.5) = 0.5 → midpoint
+  assert.ok(Math.abs(smoothMid - 0.75) < 1e-9);
+  assert.equal(kfValueAtMs(frames, 9999, 9), 1);
+  assert.equal(kfValueAtMs([], 100, 7), 7); // fallback
+});
+
+test("setClipKeyframe stores normalized frames and clipPropAtMs resolves them", () => {
+  let project = projectWithClip();
+  project = setClipKeyframe(project, "clip-1", "opacity", 0, 1);
+  project = setClipKeyframe(project, "clip-1", "opacity", 2000, 0, "hold");
+  const clip = project.tracks.find((track) => track.kind === "video").clips[0];
+  assert.equal(clip.kf.opacity.length, 2);
+  assert.ok(Math.abs(clipPropAtMs(clip, "opacity", 1000) - 0.5) < 1e-9);
+  assert.equal(clipPropAtMs(clip, "scale", 1000), 1); // static fallback
+});
+
+test("split partitions property keyframes with boundary sampling", () => {
+  let project = projectWithClip();
+  project = setClipKeyframe(project, "clip-1", "opacity", 0, 1);
+  project = setClipKeyframe(project, "clip-1", "opacity", 4000, 0);
+  const split = splitClip(project, "clip-1", 3000); // 2000 into the clip
+  const clips = split.tracks.find((track) => track.kind === "video").clips;
+  const [left, right] = clips;
+  assert.ok(Math.abs(kfValueAtMs(left.kf.opacity, left.durationMs, 9) - 0.5) < 1e-9);
+  assert.ok(Math.abs(kfValueAtMs(right.kf.opacity, 0, 9) - 0.5) < 1e-9);
+});
+
+test("linked clips select, split, and unlink as a group", () => {
+  let project = projectWithClip();
+  const audio = addMediaClip(project, { path: "media/assets/a.mp3", kind: "audio", durationMs: 4000 }, { timelineStartMs: 1000 });
+  project = audio.project;
+  project = linkClips(project, ["clip-1", audio.clipId]);
+  assert.equal(expandWithLinks(project, ["clip-1"]).length, 2);
+
+  const split = splitLinkedAt(project, "clip-1", 3000);
+  const videoClips = split.tracks.find((track) => track.kind === "video").clips;
+  const audioClips = split.tracks.find((track) => track.kind === "audio").clips;
+  assert.equal(videoClips.length, 2);
+  assert.equal(audioClips.length, 2);
+  // Right halves are linked to each other, left halves keep the original link.
+  assert.ok(videoClips[1].linkId);
+  assert.equal(videoClips[1].linkId, audioClips[1].linkId);
+  assert.notEqual(videoClips[1].linkId, videoClips[0].linkId);
+
+  const unlinked = unlinkClip(split, videoClips[0].id);
+  assert.equal(expandWithLinks(unlinked, [videoClips[0].id]).length, 1);
+});
+
+test("copy/paste round-trips clips with fresh ids and remapped links", () => {
+  let project = projectWithClip();
+  const audio = addMediaClip(project, { path: "media/assets/a.mp3", kind: "audio", durationMs: 4000 }, { timelineStartMs: 1000 });
+  project = linkClips(audio.project, ["clip-1", audio.clipId]);
+  const payload = serializeClips(project, ["clip-1"]); // link expansion pulls the audio too
+  assert.equal(payload.entries.length, 2);
+  const pasted = pasteClips(project, payload, 9000);
+  assert.equal(pasted.clipIds.length, 2);
+  const videoClips = pasted.project.tracks.find((track) => track.kind === "video").clips;
+  assert.equal(videoClips.length, 2);
+  assert.equal(videoClips[1].timelineStartMs, 9000);
+  const pastedVideo = videoClips[1];
+  const pastedAudio = pasted.project.tracks.find((track) => track.kind === "audio").clips[1];
+  assert.equal(pastedVideo.linkId, pastedAudio.linkId);
+  assert.notEqual(pastedVideo.linkId, videoClips[0].linkId);
+});
+
+test("rippleTrim start edge keeps the clip anchored and closes the gap", () => {
+  let project = projectWithClip({ timelineStartMs: 0, durationMs: 1000, sourceInMs: 0 });
+  const later = addMediaClip(project, { path: "media/assets/b.mp4", kind: "video", durationMs: 1000 }, { timelineStartMs: 1000 });
+  project = later.project;
+  const trimmed = rippleTrim(project, "clip-1", "start", 200);
+  const clips = trimmed.tracks.find((track) => track.kind === "video").clips;
+  assert.equal(clips[0].timelineStartMs, 0); // anchored — no leading gap
+  assert.equal(clips[0].durationMs, 800);
+  assert.equal(clips[0].sourceInMs, 200); // in-point moved
+  assert.equal(clips[1].timelineStartMs, 800); // follower closed the gap, no overlap
+});
+
+test("split preserves hold easing across the boundary and unlinks the right half", () => {
+  let project = projectWithClip();
+  project = setClipKeyframe(project, "clip-1", "opacity", 0, 1, "hold");
+  project = setClipKeyframe(project, "clip-1", "opacity", 4000, 0);
+  project = linkClips(project, ["clip-1", addMediaClip(project, { path: "media/assets/x.mp3", kind: "audio" }).clipId]);
+  // linkClips cloned — refind and split the video clip only (plain split).
+  const split = splitClip(project, "clip-1", 3000); // offset 2000, inside the held segment
+  const clips = split.tracks.find((track) => track.kind === "video").clips;
+  const [left, right] = clips;
+  assert.equal(right.linkId, ""); // plain split never inherits the link
+  // Held segment: value stays 1 on both sides of the cut.
+  assert.equal(kfValueAtMs(left.kf.opacity, left.durationMs, 9), 1);
+  assert.equal(kfValueAtMs(right.kf.opacity, 0, 9), 1);
+  assert.equal(kfValueAtMs(right.kf.opacity, 1000, 9), 1); // still holding until 2000
+});
+
+test("rippleDeleteRange slices envelopes on head and tail fragments", () => {
+  let project = projectWithClip(); // 1000..5000
+  project = setClipKeyframe(project, "clip-1", "opacity", 0, 1);
+  project = setClipKeyframe(project, "clip-1", "opacity", 4000, 0);
+  const next = rippleDeleteRange(project, 2000, 3000); // clip-relative 1000..2000
+  const clips = next.tracks.find((track) => track.kind === "video").clips;
+  const [head, tail] = clips;
+  // Head boundary sampled at 1000 → 0.75; tail rebased boundary at cut → 0.5.
+  assert.ok(Math.abs(kfValueAtMs(head.kf.opacity, head.durationMs, 9) - 0.75) < 1e-9);
+  assert.ok(Math.abs(kfValueAtMs(tail.kf.opacity, 0, 9) - 0.5) < 1e-9);
+  assert.ok(Math.abs(kfValueAtMs(tail.kf.opacity, tail.durationMs, 9) - 0) < 1e-9);
+});
+
+test("rippleTrim closes the gap behind a shortened clip", () => {
+  let project = projectWithClip(); // clip-1 at 1000..5000
+  const later = addMediaClip(project, { path: "media/assets/b.mp4", kind: "video", durationMs: 2000 }, { timelineStartMs: 5000 });
+  project = later.project;
+  const trimmed = rippleTrim(project, "clip-1", "end", -1000);
+  const clips = trimmed.tracks.find((track) => track.kind === "video").clips;
+  assert.equal(clips[0].durationMs, 3000);
+  assert.equal(clips[1].timelineStartMs, 4000); // slid left by 1000
+});
+
+test("rippleDeleteRange trims straddlers and closes the gap across tracks", () => {
+  let project = projectWithClip(); // video 1000..5000
+  const audio = addMediaClip(project, { path: "media/assets/a.mp3", kind: "audio", durationMs: 6000 }, { timelineStartMs: 0 });
+  project = audio.project;
+  const next = rippleDeleteRange(project, 2000, 3000);
+  const video = next.tracks.find((track) => track.kind === "video").clips;
+  const audioClips = next.tracks.find((track) => track.kind === "audio").clips;
+  // Video: head 1000..2000 + tail (was 3000..5000) now starting at 2000.
+  assert.equal(video.length, 2);
+  assert.equal(video[0].durationMs, 1000);
+  assert.equal(video[1].timelineStartMs, 2000);
+  assert.equal(video[1].durationMs, 2000);
+  assert.equal(video[1].sourceInMs, 500 + 2000); // source continuity preserved
+  // Audio: 6000 → 5000 total, ending at 5000 (the new project duration).
+  assert.equal(audioClips.reduce((sum, clip) => sum + clip.durationMs, 0), 5000);
+  assert.equal(projectDurationMs(next), 5000);
+});
+
+test("rippleInsertGap splits straddlers and shifts later clips right", () => {
+  const project = projectWithClip(); // 1000..5000
+  const next = rippleInsertGap(project, 2000, 1500);
+  const clips = next.tracks.find((track) => track.kind === "video").clips;
+  assert.equal(clips.length, 2);
+  assert.equal(clips[0].durationMs, 1000);
+  assert.equal(clips[1].timelineStartMs, 3500);
+});
+
+test("addCaptionsForClip maps source segments through trim and speed", () => {
+  const project = projectWithClip({ sourceInMs: 1000, speed: 2 }); // shows source 1000..9000 over timeline 1000..5000
+  const segments = [
+    { startMs: 1000, endMs: 3000, text: "hello there world" },
+    { startMs: 20000, endMs: 21000, text: "off screen" },
+  ];
+  const result = addCaptionsForClip(project, "clip-1", segments);
+  assert.ok(result.count >= 1);
+  const captionTrack = result.project.tracks.find((track) => track.label === "Captions");
+  const first = captionTrack.clips[0];
+  assert.equal(first.timelineStartMs, 1000); // (1000-1000)/2 + 1000
+  assert.equal(first.captionGroup, "cap-clip-1");
+  // Re-running replaces rather than duplicates.
+  const rerun = addCaptionsForClip(result.project, "clip-1", segments);
+  const rerunTrack = rerun.project.tracks.find((track) => track.label === "Captions");
+  assert.equal(rerunTrack.clips.length, captionTrack.clips.length);
+});
+
+test("rippleDeleteWords removes word spans through the clip mapping", () => {
+  const project = projectWithClip(); // source 500..4500 over timeline 1000..5000, speed 1
+  const words = [
+    { startMs: 1500, endMs: 1700, text: "um" },
+    { startMs: 1750, endMs: 1900, text: "uh" }, // merges with previous (gap < 120)
+  ];
+  const result = rippleDeleteWords(project, "media/assets/a.mp4", words);
+  assert.equal(result.ranges.length, 1);
+  assert.equal(result.ranges[0].startMs, 2000); // 1000 + (1500-500)
+  const clips = result.project.tracks.find((track) => track.kind === "video").clips;
+  const total = clips.reduce((sum, clip) => sum + clip.durationMs, 0);
+  assert.equal(total, 4000 - 400);
 });
 
 test("formats timecodes", () => {

@@ -8,6 +8,9 @@ import { Delete } from "@styled-icons/material-rounded/Delete";
 import { Lock } from "@styled-icons/material-rounded/Lock";
 import { LockOpen } from "@styled-icons/material-rounded/LockOpen";
 import { DeleteSweep } from "@styled-icons/material-rounded/DeleteSweep";
+import { Link } from "@styled-icons/material-rounded/Link";
+import { LinkOff } from "@styled-icons/material-rounded/LinkOff";
+import { NearMe } from "@styled-icons/material-rounded/NearMe";
 import { Redo } from "@styled-icons/material-rounded/Redo";
 import { TextFields } from "@styled-icons/material-rounded/TextFields";
 import { Undo } from "@styled-icons/material-rounded/Undo";
@@ -19,24 +22,36 @@ import {
   addMediaClip,
   addTextClip,
   addTrack,
+  clearClipKeyframes,
   clipEndMs,
+  clipIdsFromMs,
+  clipPropAtMs,
   collectSnapPoints,
+  expandWithLinks,
   findClip,
   formatTimecode,
   gainAtMs,
+  linkClips,
   MEME_TEXT_STYLE,
   moveClip,
   moveClips,
   moveClipToTrack,
+  moveTrackTo,
   normalizeGain,
+  pasteClips,
   projectDurationMs,
   removeClips,
   removeTrack,
   rippleDeleteClip,
+  rippleInsertGap,
+  rippleTrim,
+  serializeClips,
+  setClipKeyframe,
   snapMs,
-  splitClip,
+  splitLinkedAt,
   trimClipEnd,
   trimClipStart,
+  unlinkClip,
   updateClip,
   updateTrack,
 } from "./videoEditorModel.js";
@@ -55,6 +70,16 @@ const TRACK_HEIGHTS = { video: 46, audio: 34, text: 26 };
 const TRACK_GAP = 3;
 const MIN_ZOOM = 8;
 const MAX_ZOOM = 480;
+
+// Type colors (palmier-style scannability: video cyan, audio green, text purple).
+const TRACK_TINTS = {
+  video: "rgba(34, 211, 238, 0.6)",
+  audio: "rgba(52, 211, 153, 0.6)",
+  text: "rgba(192, 132, 252, 0.6)",
+};
+
+// In-app clip clipboard (module scope: works across panes in one window).
+let videoClipClipboard = null;
 
 const TimelineRoot = styled.div`
   display: flex;
@@ -82,9 +107,9 @@ const TimelineToolbar = styled.div`
 
 const ToolbarTimecode = styled.span`
   font-size: 10.5px;
-  font-weight: 750;
+  font-weight: 800;
   font-variant-numeric: tabular-nums;
-  color: #a7f3d0;
+  color: #fbbf24;
   margin-right: 4px;
   white-space: nowrap;
 `;
@@ -216,10 +241,12 @@ const TrackLabelRail = styled.div`
   display: flex;
   align-items: center;
   gap: 1px;
-  padding: 0 3px;
+  padding: 0 3px 0 5px;
   background: rgba(7, 14, 24, 0.92);
   border-right: 1px solid rgba(148, 163, 184, 0.12);
   border-radius: 0 4px 4px 0;
+  border-left: 2px solid ${(props) => TRACK_TINTS[props.$kind] || "transparent"};
+  cursor: grab;
 `;
 
 const TrackLabelText = styled.span`
@@ -370,6 +397,49 @@ const GainEnvelope = styled.svg`
   height: 100%;
   pointer-events: none;
   opacity: 0.9;
+`;
+
+const SnapLine = styled.div`
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 0;
+  border-left: 1.5px dashed rgba(251, 191, 36, 0.85);
+  z-index: 8;
+  pointer-events: none;
+`;
+
+const MarqueeRect = styled.div`
+  position: fixed;
+  z-index: 9999;
+  border: 1px dashed rgba(96, 165, 250, 0.8);
+  background: rgba(37, 99, 235, 0.12);
+  pointer-events: none;
+`;
+
+const KfDiamond = styled.span`
+  position: absolute;
+  bottom: 1px;
+  width: 5px;
+  height: 5px;
+  transform: rotate(45deg) translateX(-50%);
+  background: #fbbf24;
+  border-radius: 1px;
+  pointer-events: none;
+`;
+
+const LinkBadge = styled.span`
+  position: absolute;
+  right: 3px;
+  bottom: 2px;
+  display: inline-flex;
+  color: rgba(226, 232, 240, 0.75);
+  pointer-events: none;
+
+  svg {
+    width: 9px;
+    height: 9px;
+  }
 `;
 
 const RangeOverlay = styled.div`
@@ -546,10 +616,44 @@ export default function Timeline({
   const scrollerRef = useRef(null);
   const dragRef = useRef(null);
   const addTrackButtonRef = useRef(null);
+  const hoveredRef = useRef(false);
   const [zoom, setZoom] = useState(60); // px per second
   const [dropHintTrackId, setDropHintTrackId] = useState("");
   const [addTrackOpen, setAddTrackOpen] = useState(false);
+  const [tool, setTool] = useState("pointer"); // pointer | razor
+  const [snapLineMs, setSnapLineMs] = useState(null);
+  const [marquee, setMarquee] = useState(null); // { x0, y0, x1, y1 } client coords
   const pxPerMs = zoom / 1000;
+  const toolRef = useRef(tool);
+  toolRef.current = tool;
+
+  // Option/Alt-scroll and pinch zoom, anchored at the cursor.
+  const handleWheel = useCallback(
+    (event) => {
+      if (!event.altKey && !event.ctrlKey) {
+        return;
+      }
+      event.preventDefault();
+      const scroller = scrollerRef.current;
+      if (!scroller) {
+        return;
+      }
+      const rect = scroller.getBoundingClientRect();
+      const cursorX = event.clientX - rect.left + scroller.scrollLeft - LABEL_RAIL_WIDTH;
+      const cursorMs = Math.max(0, cursorX / pxPerMs);
+      const factor = Math.exp(-event.deltaY * (event.ctrlKey ? 0.01 : 0.002));
+      setZoom((current) => {
+        const next = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, current * factor));
+        // Keep the time under the cursor stationary.
+        window.requestAnimationFrame(() => {
+          const nextPxPerMs = next / 1000;
+          scroller.scrollLeft = cursorMs * nextPxPerMs - (event.clientX - rect.left) + LABEL_RAIL_WIDTH;
+        });
+        return next;
+      });
+    },
+    [pxPerMs],
+  );
 
   const durationMs = useMemo(() => projectDurationMs(project), [project]);
   const canvasWidth = Math.max(640, (durationMs + 15000) * pxPerMs + LABEL_RAIL_WIDTH);
@@ -622,7 +726,16 @@ export default function Timeline({
           return;
         }
         const dropMs = timeFromClientX(detail.x);
-        const result = addMediaClip(projectRef.current, detail.asset, {
+        // ⌘-drop = ripple insert: open a gap for the incoming clip first.
+        let base = projectRef.current;
+        if (detail.metaKey) {
+          const gapMs = Math.max(
+            500,
+            Math.round(Number(detail.asset.durationMs) || (detail.asset.kind === "image" ? 4000 : 3000)),
+          );
+          base = rippleInsertGap(base, Math.round(dropMs), gapMs);
+        }
+        const result = addMediaClip(base, detail.asset, {
           trackId,
           timelineStartMs: dropMs,
         });
@@ -678,9 +791,11 @@ export default function Timeline({
     [onRangesChange, onSeek, ranges, timeFromClientX],
   );
 
-  // Clip drag: move within/between compatible lanes (whole selection moves
-  // together when the grabbed clip is part of it), or trim from a handle.
-  // Starts/edges snap to other clips, the playhead, and zero (~8px window).
+  // Clip drag: move within/between compatible lanes (whole selection + linked
+  // partners move together; Alt ignores links), trim from a handle (Shift =
+  // ripple trim), or razor-split when the razor tool is active. Starts/edges
+  // snap to other clips, the playhead, and zero (~8px window) with a visible
+  // snap line.
   const beginClipDrag = useCallback(
     (event, trackId, clip, mode) => {
       if (event.button !== 0) {
@@ -688,13 +803,21 @@ export default function Timeline({
       }
       event.preventDefault();
       event.stopPropagation();
-      const additive = event.shiftKey;
+      if (toolRef.current === "razor" && mode === "move") {
+        const at = timeFromClientX(event.clientX);
+        onChange?.(splitLinkedAt(project, clip.id, at), { transient: false });
+        return;
+      }
+      const additive = event.shiftKey && mode === "move";
       const partOfSelection = selectedSet.has(clip.id);
       if (additive) {
         selectClip(clip.id, { additive: true });
         return; // shift-click is pure selection, never a drag
       }
-      const groupIds = partOfSelection && selectedClipIds.length > 1 ? selectedClipIds : [clip.id];
+      const ignoreLinks = event.altKey;
+      const baseIds = partOfSelection && selectedClipIds.length > 1 ? selectedClipIds : [clip.id];
+      const groupIds = ignoreLinks ? baseIds : expandWithLinks(project, baseIds);
+      const rippleMode = event.shiftKey && mode !== "move";
       if (!partOfSelection) {
         selectClip(clip.id);
       }
@@ -734,6 +857,13 @@ export default function Timeline({
           const byEnd = snapMs(proposedEnd, snapPoints, snapThresholdMs) - (drag.originEndMs - drag.originStartMs);
           const snappedStart =
             Math.abs(byStart - proposedStart) <= Math.abs(byEnd - proposedStart) ? byStart : Math.max(0, byEnd);
+          setSnapLineMs(
+            snappedStart !== Math.round(proposedStart)
+              ? snappedStart === byStart
+                ? byStart
+                : snappedStart + (drag.originEndMs - drag.originStartMs)
+              : null,
+          );
           if (drag.groupIds.length > 1) {
             next = moveClips(project, drag.groupIds, snappedStart - drag.originStartMs);
           } else {
@@ -746,11 +876,17 @@ export default function Timeline({
         } else if (drag.mode === "trim-start") {
           const proposedEdge = drag.originStartMs + deltaMs;
           const snappedEdge = snapMs(proposedEdge, snapPoints, snapThresholdMs);
-          next = trimClipStart(project, drag.clipId, snappedEdge - drag.originStartMs);
+          setSnapLineMs(snappedEdge !== Math.round(proposedEdge) ? snappedEdge : null);
+          next = rippleMode
+            ? rippleTrim(project, drag.clipId, "start", snappedEdge - drag.originStartMs)
+            : trimClipStart(project, drag.clipId, snappedEdge - drag.originStartMs);
         } else if (drag.mode === "trim-end") {
           const proposedEdge = drag.originEndMs + deltaMs;
           const snappedEdge = snapMs(proposedEdge, snapPoints, snapThresholdMs);
-          next = trimClipEnd(project, drag.clipId, snappedEdge - drag.originEndMs);
+          setSnapLineMs(snappedEdge !== Math.round(proposedEdge) ? snappedEdge : null);
+          next = rippleMode
+            ? rippleTrim(project, drag.clipId, "end", snappedEdge - drag.originEndMs)
+            : trimClipEnd(project, drag.clipId, snappedEdge - drag.originEndMs);
         }
         drag.latest = next;
         onChange?.(next, { transient: true });
@@ -761,6 +897,7 @@ export default function Timeline({
         window.removeEventListener("pointermove", handleMove);
         window.removeEventListener("pointerup", handleUp);
         window.removeEventListener("pointercancel", handleUp);
+        setSnapLineMs(null);
         if (drag?.moved && drag.latest && drag.latest !== project) {
           onChange?.(drag.latest, { transient: false });
         }
@@ -769,10 +906,109 @@ export default function Timeline({
       window.addEventListener("pointerup", handleUp);
       window.addEventListener("pointercancel", handleUp);
     },
-    [onChange, playheadMs, project, pxPerMs, selectClip, selectedClipIds, selectedSet, trackIdFromPoint],
+    [onChange, playheadMs, project, pxPerMs, selectClip, selectedClipIds, selectedSet, timeFromClientX, trackIdFromPoint],
   );
 
-  // Keyboard: delete selected clip, undo/redo.
+  // Empty-lane press: click seeks + clears; drag = marquee selection across
+  // every lane the rectangle touches.
+  const beginLanePress = useCallback(
+    (event) => {
+      if (event.button !== 0) {
+        return;
+      }
+      const startX = event.clientX;
+      const startY = event.clientY;
+      let moved = false;
+      const handleMove = (moveEvent) => {
+        if (!moved && Math.abs(moveEvent.clientX - startX) + Math.abs(moveEvent.clientY - startY) > 5) {
+          moved = true;
+        }
+        if (moved) {
+          setMarquee({
+            x0: Math.min(startX, moveEvent.clientX),
+            y0: Math.min(startY, moveEvent.clientY),
+            x1: Math.max(startX, moveEvent.clientX),
+            y1: Math.max(startY, moveEvent.clientY),
+          });
+        }
+      };
+      const handleUp = (upEvent) => {
+        window.removeEventListener("pointermove", handleMove);
+        window.removeEventListener("pointerup", handleUp);
+        window.removeEventListener("pointercancel", handleUp);
+        setMarquee(null);
+        if (!moved) {
+          onSelectClips?.([]);
+          onSeek?.(timeFromClientX(startX));
+          return;
+        }
+        const fromMs = timeFromClientX(Math.min(startX, upEvent.clientX));
+        const toMs = timeFromClientX(Math.max(startX, upEvent.clientX));
+        const yFrom = Math.min(startY, upEvent.clientY);
+        const yTo = Math.max(startY, upEvent.clientY);
+        const picked = [];
+        for (const [laneTrackId, element] of laneRefs.current.entries()) {
+          const rect = element?.getBoundingClientRect?.();
+          if (!rect || rect.bottom < yFrom || rect.top > yTo) {
+            continue;
+          }
+          const track = (projectRef.current?.tracks || []).find((entry) => entry.id === laneTrackId);
+          for (const clip of track?.clips || []) {
+            if (clip.timelineStartMs < toMs && clipEndMs(clip) > fromMs) {
+              picked.push(clip.id);
+            }
+          }
+        }
+        onSelectClips?.(expandWithLinks(projectRef.current, picked));
+      };
+      window.addEventListener("pointermove", handleMove);
+      window.addEventListener("pointerup", handleUp);
+      window.addEventListener("pointercancel", handleUp);
+    },
+    [onSeek, onSelectClips, timeFromClientX],
+  );
+
+  // Track reorder: vertical drag on a track's label rail.
+  const beginTrackReorder = useCallback(
+    (event, trackId) => {
+      if (event.button !== 0 || event.target.closest("button")) {
+        return;
+      }
+      event.preventDefault();
+      const startY = event.clientY;
+      let moved = false;
+      const handleUp = (upEvent) => {
+        window.removeEventListener("pointerup", handleUp);
+        window.removeEventListener("pointermove", handleMove);
+        if (!moved) {
+          return;
+        }
+        // Find the index whose lane midpoint is closest to the drop point.
+        const tracks = projectRef.current?.tracks || [];
+        let targetIndex = tracks.findIndex((track) => track.id === trackId);
+        for (let index = 0; index < tracks.length; index += 1) {
+          const rect = laneRefs.current.get(tracks[index].id)?.getBoundingClientRect?.();
+          if (rect && upEvent.clientY >= rect.top && upEvent.clientY <= rect.bottom) {
+            targetIndex = index;
+            break;
+          }
+        }
+        onChange?.(moveTrackTo(projectRef.current, trackId, targetIndex), { transient: false });
+      };
+      const handleMove = (moveEvent) => {
+        if (Math.abs(moveEvent.clientY - startY) > 8) {
+          moved = true;
+        }
+      };
+      window.addEventListener("pointermove", handleMove);
+      window.addEventListener("pointerup", handleUp);
+    },
+    [onChange],
+  );
+
+  // Keyboard: undo/redo, copy/paste, delete, tool keys + select-forward
+  // (tool keys and A only when the pointer is over this timeline, so they
+  // never fight the rest of the app).
   useEffect(() => {
     const handleKey = (event) => {
       const target = event.target;
@@ -781,7 +1017,8 @@ export default function Timeline({
         return;
       }
       const meta = event.metaKey || event.ctrlKey;
-      if (meta && event.key.toLowerCase() === "z") {
+      const key = event.key.toLowerCase();
+      if (meta && key === "z") {
         event.preventDefault();
         if (event.shiftKey) {
           onRedo?.();
@@ -790,24 +1027,54 @@ export default function Timeline({
         }
         return;
       }
+      if (meta && key === "c" && selectedClipIds.length) {
+        event.preventDefault();
+        videoClipClipboard = serializeClips(project, selectedClipIds);
+        return;
+      }
+      if (meta && key === "v" && videoClipClipboard) {
+        event.preventDefault();
+        const result = pasteClips(project, videoClipClipboard, playheadMs);
+        if (result.clipIds.length) {
+          onChange?.(result.project, { transient: false });
+          onSelectClips?.(result.clipIds);
+        }
+        return;
+      }
+      if (!meta && hoveredRef.current && !event.defaultPrevented) {
+        if (key === "v") {
+          setTool("pointer");
+          return;
+        }
+        if (key === "c") {
+          setTool("razor");
+          return;
+        }
+        if (key === "a") {
+          event.preventDefault();
+          onSelectClips?.(expandWithLinks(project, clipIdsFromMs(project, playheadMs)));
+          return;
+        }
+      }
       if (!selectedClipIds.length || event.defaultPrevented) {
         return;
       }
       if (event.key === "Delete" || event.key === "Backspace") {
         event.preventDefault();
-        onChange?.(removeClips(project, selectedClipIds), { transient: false });
+        const ids = event.altKey ? selectedClipIds : expandWithLinks(project, selectedClipIds);
+        onChange?.(removeClips(project, ids), { transient: false });
         onSelectClips?.([]);
       }
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [onChange, onRedo, onSelectClips, onUndo, project, selectedClipIds]);
+  }, [onChange, onRedo, onSelectClips, onUndo, playheadMs, project, selectedClipIds]);
 
   const splitSelectedAtPlayhead = useCallback(() => {
     if (!selectedClipId) {
       return;
     }
-    onChange?.(splitClip(project, selectedClipId, playheadMs), { transient: false });
+    onChange?.(splitLinkedAt(project, selectedClipId, playheadMs), { transient: false });
   }, [onChange, playheadMs, project, selectedClipId]);
 
   const rulerTicks = useMemo(() => {
@@ -922,7 +1189,16 @@ export default function Timeline({
   }, []);
 
   return (
-    <TimelineRoot data-video-timeline="true" style={{ position: "relative" }}>
+    <TimelineRoot
+      data-video-timeline="true"
+      onPointerEnter={() => {
+        hoveredRef.current = true;
+      }}
+      onPointerLeave={() => {
+        hoveredRef.current = false;
+      }}
+      style={{ position: "relative", cursor: tool === "razor" ? "crosshair" : undefined }}
+    >
       <TimelineToolbar>
         <ToolbarTimecode>{formatTimecode(playheadMs, { withMs: true })}</ToolbarTimecode>
         <VideoIconButton disabled={!canUndo} onClick={() => onUndo?.()} title="Undo (⌘Z)" type="button">
@@ -932,6 +1208,41 @@ export default function Timeline({
           <Redo aria-hidden="true" />
         </VideoIconButton>
         <ToolbarDivider />
+        <VideoIconButton
+          data-active={tool === "pointer" ? "true" : "false"}
+          onClick={() => setTool("pointer")}
+          title="Pointer tool (V)"
+          type="button"
+        >
+          <NearMe aria-hidden="true" />
+        </VideoIconButton>
+        <VideoIconButton
+          data-active={tool === "razor" ? "true" : "false"}
+          onClick={() => setTool((current) => (current === "razor" ? "pointer" : "razor"))}
+          title="Razor tool (C) — click clips to split"
+          type="button"
+        >
+          <ContentCut aria-hidden="true" />
+        </VideoIconButton>
+        <ToolbarDivider />
+        {selectedClipIds.length >= 2 ? (
+          <VideoIconButton
+            onClick={() => onChange?.(linkClips(project, selectedClipIds), { transient: false })}
+            title="Link clips (move/trim/delete together)"
+            type="button"
+          >
+            <Link aria-hidden="true" />
+          </VideoIconButton>
+        ) : null}
+        {selectedClipId && findClip(project, selectedClipId)?.clip?.linkId ? (
+          <VideoIconButton
+            onClick={() => onChange?.(unlinkClip(project, selectedClipId), { transient: false })}
+            title="Unlink clips"
+            type="button"
+          >
+            <LinkOff aria-hidden="true" />
+          </VideoIconButton>
+        ) : null}
         <VideoIconButton
           disabled={!selectedClipId}
           onClick={splitSelectedAtPlayhead}
@@ -1025,7 +1336,7 @@ export default function Timeline({
           ))}
         </AddTrackMenu>
       ) : null}
-      <TimelineScroller ref={scrollerRef}>
+      <TimelineScroller onWheel={handleWheel} ref={scrollerRef}>
         <TimelineCanvas style={{ width: `${canvasWidth}px` }}>
           <RulerRow>
             <RulerRail />
@@ -1039,7 +1350,11 @@ export default function Timeline({
           </RulerRow>
           {(project?.tracks || []).map((track) => (
             <TrackRow key={track.id} style={{ height: `${trackHeight(track.kind)}px` }}>
-              <TrackLabelRail>
+              <TrackLabelRail
+                $kind={track.kind}
+                onPointerDown={(event) => beginTrackReorder(event, track.id)}
+                title="Drag up/down to reorder tracks"
+              >
                 <TrackLabelText title={track.label}>{track.label}</TrackLabelText>
                 {track.kind !== "text" ? (
                   <TrackMiniButton
@@ -1073,8 +1388,7 @@ export default function Timeline({
                 data-video-lane={track.id}
                 onPointerDown={(event) => {
                   if (event.target === event.currentTarget) {
-                    onSelectClips?.([]);
-                    onSeek?.(timeFromClientX(event.clientX));
+                    beginLanePress(event);
                   }
                 }}
                 ref={(element) => {
@@ -1122,6 +1436,22 @@ export default function Timeline({
                         </WaveformSvg>
                       ) : null}
                       <ClipLabel>{clipDisplayName(clip, track)}</ClipLabel>
+                      {clip.linkId ? (
+                        <LinkBadge title="Linked clip">
+                          <Link aria-hidden="true" />
+                        </LinkBadge>
+                      ) : null}
+                      {track.kind !== "text" && clip.kf && Object.keys(clip.kf).length
+                        ? Object.values(clip.kf)
+                            .flat()
+                            .slice(0, 24)
+                            .map((frame, frameIndex) => (
+                              <KfDiamond
+                                key={`kf-${frameIndex}`}
+                                style={{ left: `${Math.min(clip.durationMs, frame.atMs) * pxPerMs}px` }}
+                              />
+                            ))
+                        : null}
                       {track.kind !== "text" && widthPx > 30 ? (
                         <GainEnvelope preserveAspectRatio="none" viewBox={`0 0 ${widthPx} ${trackHeight(track.kind) - 6}`}>
                           <polyline
@@ -1159,9 +1489,22 @@ export default function Timeline({
               }}
             />
           ))}
+          {snapLineMs != null ? (
+            <SnapLine style={{ left: `${LABEL_RAIL_WIDTH + snapLineMs * pxPerMs}px` }} />
+          ) : null}
           <Playhead style={{ left: `${LABEL_RAIL_WIDTH + playheadMs * pxPerMs}px` }} />
         </TimelineCanvas>
       </TimelineScroller>
+      {marquee ? (
+        <MarqueeRect
+          style={{
+            left: `${marquee.x0}px`,
+            top: `${marquee.y0}px`,
+            width: `${marquee.x1 - marquee.x0}px`,
+            height: `${marquee.y1 - marquee.y0}px`,
+          }}
+        />
+      ) : null}
       {selected ? (
         <InspectorPopover data-video-clip-inspector="true">
           <InspectorHeader>
@@ -1426,6 +1769,42 @@ export default function Timeline({
                     value={selected.clip.transform?.scale ?? 1}
                   />
                 </SliderLabel>
+              </InspectorRow>
+              <VideoLabel as="div">Keyframes at playhead</VideoLabel>
+              <InspectorRow>
+                {["opacity", "scale", "x", "y"].map((prop) => {
+                  const clipRelMs = Math.min(
+                    Math.max(0, playheadMs - selected.clip.timelineStartMs),
+                    selected.clip.durationMs,
+                  );
+                  const hasFrames = Boolean(selected.clip.kf?.[prop]?.length);
+                  return (
+                    <VideoSecondaryButton
+                      key={prop}
+                      onClick={(event) => {
+                        if (event.altKey && hasFrames) {
+                          onChange?.(clearClipKeyframes(project, selected.clip.id, prop), { transient: false });
+                          return;
+                        }
+                        const value =
+                          prop === "opacity"
+                            ? selected.clip.transform?.opacity ?? 1
+                            : prop === "scale"
+                              ? selected.clip.transform?.scale ?? 1
+                              : selected.clip.transform?.[prop] ?? 0;
+                        onChange?.(
+                          setClipKeyframe(project, selected.clip.id, prop, clipRelMs, clipPropAtMs(selected.clip, prop, clipRelMs) ?? value),
+                          { transient: false },
+                        );
+                      }}
+                      style={hasFrames ? { borderColor: "rgba(251,191,36,0.5)", color: "#fbbf24" } : undefined}
+                      title={`Add ${prop} keyframe at playhead${hasFrames ? " · ⌥-click clears all" : ""}`}
+                      type="button"
+                    >
+                      ◆ {prop}
+                    </VideoSecondaryButton>
+                  );
+                })}
               </InspectorRow>
             </>
           )}
