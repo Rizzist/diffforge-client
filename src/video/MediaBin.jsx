@@ -133,6 +133,26 @@ const AssetTile = styled.div`
   }
 `;
 
+// Spinning ring shown on a tile while its transcription job runs.
+const TranscribeSpinner = styled.span`
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  width: 14px;
+  height: 14px;
+  border-radius: 999px;
+  border: 2px solid rgba(147, 197, 253, 0.25);
+  border-top-color: #93c5fd;
+  animation: video-transcribe-spin 0.9s linear infinite;
+  background: rgba(2, 6, 12, 0.6);
+
+  @keyframes video-transcribe-spin {
+    to {
+      transform: rotate(360deg);
+    }
+  }
+`;
+
 const PendingSpin = styled.span`
   position: absolute;
   inset: 0;
@@ -636,9 +656,12 @@ export default function MediaBin({
                   <AssetGlyph aria-hidden>{assetGlyph(asset.kind)}</AssetGlyph>
                 )}
                 {asset.pending ? <PendingSpin aria-hidden>✦</PendingSpin> : null}
+                {transcribing[asset.path] ? (
+                  <TranscribeSpinner aria-hidden title={`Transcribing: ${transcribing[asset.path]}`} />
+                ) : null}
                 <AssetKind>
                   {asset.pending ? "generating" : asset.folder === "generated" ? "AI" : asset.kind}
-                  {transcribing[asset.path] ? " · …" : asset.hasTranscript ? " · T" : ""}
+                  {transcribing[asset.path] ? " · transcribing" : asset.hasTranscript ? " · T" : ""}
                 </AssetKind>
                 {Number.isFinite(Number(asset.durationMs)) && asset.durationMs > 0 ? (
                   <AssetDuration>{formatTimecode(asset.durationMs)}</AssetDuration>

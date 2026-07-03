@@ -719,6 +719,29 @@ export default function Timeline({
     [pxPerMs],
   );
 
+  // A drop/add/paste selects the new clip — if it landed outside the visible
+  // window (e.g. the view had auto-scrolled during playback), bring it into
+  // view so "I dragged a video in and can't see it" can't happen.
+  const lastScrolledSelectionRef = useRef("");
+  useEffect(() => {
+    if (selectedClipIds.length !== 1 || selectedClipIds[0] === lastScrolledSelectionRef.current) {
+      return;
+    }
+    lastScrolledSelectionRef.current = selectedClipIds[0];
+    const found = findClip(project, selectedClipIds[0]);
+    const scroller = scrollerRef.current;
+    if (!found || !scroller) {
+      return;
+    }
+    const startX = LABEL_RAIL_WIDTH + found.clip.timelineStartMs * pxPerMs;
+    const endX = LABEL_RAIL_WIDTH + clipEndMs(found.clip) * pxPerMs;
+    const viewLeft = scroller.scrollLeft;
+    const viewRight = viewLeft + scroller.clientWidth;
+    if (endX < viewLeft || startX > viewRight) {
+      scroller.scrollLeft = Math.max(0, startX - scroller.clientWidth * 0.25);
+    }
+  }, [pxPerMs, project, selectedClipIds]);
+
   const laneRefs = useRef(new Map());
   const trackIdFromPoint = useCallback((clientX, clientY) => {
     for (const [trackId, element] of laneRefs.current.entries()) {

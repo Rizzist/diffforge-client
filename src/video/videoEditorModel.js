@@ -1051,43 +1051,13 @@ export const CAPTION_TEXT_STYLE = {
   fontFamily: "sans-serif",
 };
 
-function splitCaptionText(segment, maxChars) {
-  const words = Array.isArray(segment.words) && segment.words.length
-    ? segment.words
-    : String(segment.text || "")
-        .split(/\s+/)
-        .filter(Boolean)
-        .map((text, index, all) => {
-          const span = segment.endMs - segment.startMs;
-          return {
-            text,
-            startMs: segment.startMs + Math.round((span * index) / all.length),
-            endMs: segment.startMs + Math.round((span * (index + 1)) / all.length),
-          };
-        });
-  const chunks = [];
-  let current = null;
-  for (const word of words) {
-    const text = String(word.text || "").trim();
-    if (!text) {
-      continue;
-    }
-    if (!current || `${current.text} ${text}`.length > maxChars) {
-      current = { text, startMs: word.startMs, endMs: word.endMs };
-      chunks.push(current);
-    } else {
-      current.text = `${current.text} ${text}`;
-      current.endMs = word.endMs;
-    }
-  }
-  return chunks;
-}
-
-// Build caption text clips for a media clip from its asset's transcript.
+// Build caption text clips for a media clip from its asset's transcript —
+// ONE caption per transcript segment, text verbatim (WYSIWYG with the SRT
+// export: what you edit in the transcript panel is exactly what burns in).
 // Source times map to the timeline through the clip's trim + speed; captions
 // outside the clip's visible window are dropped. Existing captions for the
 // same group are replaced. Returns { project, count, trackId }.
-export function addCaptionsForClip(project, clipId, segments, { maxChars = 42, style = {} } = {}) {
+export function addCaptionsForClip(project, clipId, segments, { style = {} } = {}) {
   const found = findClip(project, clipId);
   if (!found || found.track.kind === "text") {
     return { project, count: 0, trackId: "" };
@@ -1115,29 +1085,31 @@ export function addCaptionsForClip(project, clipId, segments, { maxChars = 42, s
     if (segment.endMs <= sourceFrom || segment.startMs >= sourceTo) {
       continue;
     }
-    for (const chunk of splitCaptionText(segment, maxChars)) {
-      const startSrc = Math.max(chunk.startMs, sourceFrom);
-      const endSrc = Math.min(chunk.endMs, sourceTo);
-      if (endSrc - startSrc < 80) {
-        continue;
-      }
-      const timelineStart = clip.timelineStartMs + Math.round((startSrc - sourceFrom) / speed);
-      const durationMs = Math.max(MIN_CLIP_DURATION_MS, Math.round((endSrc - startSrc) / speed));
-      track.clips.push(
-        normalizeClip(
-          {
-            id: makeVideoId("cap"),
-            text: chunk.text,
-            timelineStartMs: timelineStart,
-            durationMs,
-            style: { ...CAPTION_TEXT_STYLE, ...style },
-            captionGroup,
-          },
-          "text",
-        ),
-      );
-      count += 1;
+    const text = String(segment.text || "").trim();
+    if (!text) {
+      continue;
     }
+    const startSrc = Math.max(segment.startMs, sourceFrom);
+    const endSrc = Math.min(segment.endMs, sourceTo);
+    if (endSrc - startSrc < 80) {
+      continue;
+    }
+    const timelineStart = clip.timelineStartMs + Math.round((startSrc - sourceFrom) / speed);
+    const durationMs = Math.max(MIN_CLIP_DURATION_MS, Math.round((endSrc - startSrc) / speed));
+    track.clips.push(
+      normalizeClip(
+        {
+          id: makeVideoId("cap"),
+          text,
+          timelineStartMs: timelineStart,
+          durationMs,
+          style: { ...CAPTION_TEXT_STYLE, ...style },
+          captionGroup,
+        },
+        "text",
+      ),
+    );
+    count += 1;
   }
   track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
   return { project: next, count, trackId: track.id };

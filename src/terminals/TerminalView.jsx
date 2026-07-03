@@ -270,6 +270,9 @@ const TERMINAL_DRAG_RELEASE_EVENT = "forge-terminal-drag-release";
 const TERMINAL_FULLSCREEN_TRANSITION_MS = 190;
 const TERMINAL_BREAKOUT_TRANSITION_MS = 260;
 const TERMINAL_BREAKOUT_STORAGE_PREFIX = "diffforge.terminalBreakout.v1";
+const TERMINAL_GRID_LAYOUT_STORAGE_PREFIX = "diffforge.terminals.gridLayout";
+const TERMINAL_GRID_LAYOUT_SAVE_DEBOUNCE_MS = 300;
+const TERMINAL_GRID_LAYOUT_SIGNATURE_LIMIT = 8;
 const TERMINAL_DOCUMENT_PANEL_ID = "workspace-document-panel";
 const TERMINAL_DOCUMENT_PANEL_KIND = "docs";
 const TERMINAL_GRID_MAX_BALANCED_COLUMNS = 3;
@@ -8787,6 +8790,23 @@ function terminalPaneLayoutDomIdPart(value) {
     : String(value).replace(/[^\w.-]/g, "_") || "pane";
 }
 
+function getTerminalGridRowPanelId(workspaceId, rowIndex) {
+  return `workspace-terminal-row-${workspaceId}-${rowIndex}`;
+}
+
+function getTerminalGridColumnGroupId(workspaceId, rowIndex) {
+  return `workspace-terminal-row-cols-${workspaceId}-${rowIndex}`;
+}
+
+function getTerminalGridPanePanelId(workspaceId, rowIndex, paneKey) {
+  return `workspace-terminal-pane-${workspaceId}-${rowIndex}-${terminalPaneLayoutDomIdPart(paneKey)}`;
+}
+
+function getTerminalGridColumnPanelIds(workspaceId, row) {
+  return (Array.isArray(row?.terminalIndexes) ? row.terminalIndexes : [])
+    .map((paneKey) => getTerminalGridPanePanelId(workspaceId, row.rowIndex, paneKey));
+}
+
 function normalizeTerminalWorkspaceRootIdentity(rootPath) {
   return String(rootPath || "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
 }
@@ -9422,6 +9442,167 @@ function canUseBrowserLocalStorage() {
     return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
   } catch {
     return false;
+  }
+}
+
+function getTerminalGridLayoutStorageKey(workspaceId) {
+  const rawWorkspaceId = String(workspaceId || "default").trim() || "default";
+  let encodedWorkspaceId = "default";
+
+  try {
+    encodedWorkspaceId = encodeURIComponent(rawWorkspaceId) || "default";
+  } catch {
+    encodedWorkspaceId = rawWorkspaceId.replace(/[^\w.-]/g, "_") || "default";
+  }
+
+  return `${TERMINAL_GRID_LAYOUT_STORAGE_PREFIX}.${encodedWorkspaceId}`;
+}
+
+function getTerminalGridPaneKind(paneKey, paneKinds = {}) {
+  if (isTerminalDocumentPanelPane(paneKey)) {
+    return TERMINAL_DOCUMENT_PANEL_KIND;
+  }
+
+  const paneKind = String(paneKinds?.[paneKey] || "").trim();
+  return paneKind || "terminal";
+}
+
+function getTerminalGridLayoutSignature(rows, paneKinds = {}) {
+  const rowKinds = (Array.isArray(rows) ? rows : [])
+    .map((row) => (Array.isArray(row?.terminalIndexes) ? row.terminalIndexes : [])
+      .map((paneKey) => getTerminalGridPaneKind(paneKey, paneKinds)))
+    .filter((row) => row.length);
+  const totalPaneCount = rowKinds.reduce((total, row) => total + row.length, 0);
+
+  return JSON.stringify({
+    panes: rowKinds,
+    rowLengths: rowKinds.map((row) => row.length),
+    totalPaneCount,
+  });
+}
+
+function normalizeTerminalGridLayoutMap(layout, panelIds = null) {
+  if (!layout || typeof layout !== "object" || Array.isArray(layout)) {
+    return null;
+  }
+
+  const expectedPanelIds = Array.isArray(panelIds)
+    ? panelIds.map((panelId) => String(panelId))
+    : null;
+  const layoutKeys = Object.keys(layout);
+
+  if (expectedPanelIds) {
+    if (!expectedPanelIds.length || layoutKeys.length !== expectedPanelIds.length) {
+      return null;
+    }
+    if (expectedPanelIds.some((panelId) => !Object.prototype.hasOwnProperty.call(layout, panelId))) {
+      return null;
+    }
+  }
+
+  const entries = expectedPanelIds
+    ? expectedPanelIds.map((panelId) => [panelId, layout[panelId]])
+    : Object.entries(layout);
+  const normalizedLayout = {};
+  let totalSize = 0;
+
+  for (const [panelId, size] of entries) {
+    const normalizedPanelId = String(panelId || "").trim();
+    const normalizedSize = Number(size);
+
+    if (!normalizedPanelId || !Number.isFinite(normalizedSize) || normalizedSize < 0) {
+      return null;
+    }
+
+    normalizedLayout[normalizedPanelId] = Number(normalizedSize.toFixed(4));
+    totalSize += normalizedSize;
+  }
+
+  return totalSize > 0 ? normalizedLayout : null;
+}
+
+function normalizeTerminalGridLayoutEntry(entry) {
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+    return null;
+  }
+
+  const rows = normalizeTerminalGridLayoutMap(entry.rows);
+  const columns = {};
+
+  if (entry.columns && typeof entry.columns === "object" && !Array.isArray(entry.columns)) {
+    Object.entries(entry.columns).forEach(([rowIndex, layout]) => {
+      const normalizedLayout = normalizeTerminalGridLayoutMap(layout);
+      if (normalizedLayout) {
+        columns[String(rowIndex)] = normalizedLayout;
+      }
+    });
+  }
+
+  if (!rows && !Object.keys(columns).length) {
+    return null;
+  }
+
+  return {
+    columns,
+    rows: rows || {},
+    updatedAt: Number(entry.updatedAt || 0) || 0,
+  };
+}
+
+function readTerminalGridLayoutStore(storageKey) {
+  if (!storageKey || !canUseBrowserLocalStorage()) {
+    return {};
+  }
+
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(storageKey) || "{}");
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function readTerminalGridLayoutEntry(storageKey, signature) {
+  if (!signature) {
+    return null;
+  }
+
+  return normalizeTerminalGridLayoutEntry(readTerminalGridLayoutStore(storageKey)[signature]);
+}
+
+function trimTerminalGridLayoutStore(layouts) {
+  const entries = Object.entries(layouts || {})
+    .map(([signature, entry]) => [signature, normalizeTerminalGridLayoutEntry(entry)])
+    .filter(([, entry]) => entry);
+
+  entries.sort((left, right) => Number(right[1].updatedAt || 0) - Number(left[1].updatedAt || 0));
+
+  return entries.slice(0, TERMINAL_GRID_LAYOUT_SIGNATURE_LIMIT).reduce((nextLayouts, [signature, entry]) => {
+    nextLayouts[signature] = entry;
+    return nextLayouts;
+  }, {});
+}
+
+function writeTerminalGridLayoutEntry(storageKey, signature, entry) {
+  if (!storageKey || !signature || !canUseBrowserLocalStorage()) {
+    return;
+  }
+
+  const normalizedEntry = normalizeTerminalGridLayoutEntry({
+    ...entry,
+    updatedAt: Date.now(),
+  });
+
+  if (!normalizedEntry) {
+    return;
+  }
+
+  try {
+    const layouts = readTerminalGridLayoutStore(storageKey);
+    layouts[signature] = normalizedEntry;
+    window.localStorage.setItem(storageKey, JSON.stringify(trimTerminalGridLayoutStore(layouts)));
+  } catch {
+    // Grid layout is convenience state; resizing should continue if persistence fails.
   }
 }
 
@@ -22990,6 +23171,8 @@ function TerminalView({
   const terminalBreakoutViewportFrameRef = useRef(0);
   const terminalBreakoutPendingViewportRef = useRef(null);
   const terminalBreakoutLayoutWriteTimerRef = useRef(0);
+  const terminalGridLayoutPendingWriteRef = useRef(null);
+  const terminalGridLayoutWriteTimerRef = useRef(0);
   const layoutMeasureFrameRef = useRef(0);
   const terminalDragCleanupRef = useRef(null);
   const terminalDragStateRef = useRef(null);
@@ -23040,6 +23223,115 @@ function TerminalView({
     () => getTerminalBreakoutStorageKey(terminalWorkspace?.id),
     [terminalWorkspace?.id],
   );
+  const terminalGridLayoutWorkspaceId = terminalWorkspace?.id || "default";
+  const terminalGridLayoutStorageKey = useMemo(
+    () => getTerminalGridLayoutStorageKey(terminalGridLayoutWorkspaceId),
+    [terminalGridLayoutWorkspaceId],
+  );
+  const terminalGridLayoutSignature = useMemo(
+    () => getTerminalGridLayoutSignature(activeDisplayRows, paneKinds),
+    [activeDisplayRows, paneKinds],
+  );
+  const terminalGridSavedLayout = useMemo(
+    () => readTerminalGridLayoutEntry(terminalGridLayoutStorageKey, terminalGridLayoutSignature),
+    [terminalGridLayoutStorageKey, terminalGridLayoutSignature],
+  );
+  const terminalGridRowPanelIds = useMemo(
+    () => activeDisplayRows.map((row) => getTerminalGridRowPanelId(terminalGridLayoutWorkspaceId, row.rowIndex)),
+    [activeDisplayRows, terminalGridLayoutWorkspaceId],
+  );
+  const terminalGridDefaultRowsLayout = useMemo(
+    () => normalizeTerminalGridLayoutMap(terminalGridSavedLayout?.rows, terminalGridRowPanelIds) || undefined,
+    [terminalGridSavedLayout, terminalGridRowPanelIds],
+  );
+  const flushTerminalGridLayoutWrite = useCallback(() => {
+    const pendingWrite = terminalGridLayoutPendingWriteRef.current;
+    terminalGridLayoutPendingWriteRef.current = null;
+
+    if (!pendingWrite) {
+      return;
+    }
+
+    writeTerminalGridLayoutEntry(
+      pendingWrite.storageKey,
+      pendingWrite.signature,
+      pendingWrite.entry,
+    );
+  }, []);
+  const queueTerminalGridLayoutWrite = useCallback((scope, layout, rowIndex = null) => {
+    if (!terminalGridLayoutSignature || terminalDragStateRef.current) {
+      return;
+    }
+
+    const normalizedLayout = normalizeTerminalGridLayoutMap(layout);
+    if (!normalizedLayout) {
+      return;
+    }
+
+    const currentPendingWrite = terminalGridLayoutPendingWriteRef.current;
+    const samePendingLayout = currentPendingWrite
+      && currentPendingWrite.storageKey === terminalGridLayoutStorageKey
+      && currentPendingWrite.signature === terminalGridLayoutSignature;
+
+    if (currentPendingWrite && !samePendingLayout) {
+      writeTerminalGridLayoutEntry(
+        currentPendingWrite.storageKey,
+        currentPendingWrite.signature,
+        currentPendingWrite.entry,
+      );
+      terminalGridLayoutPendingWriteRef.current = null;
+    }
+
+    const currentEntry = samePendingLayout
+      ? currentPendingWrite.entry
+      : readTerminalGridLayoutEntry(terminalGridLayoutStorageKey, terminalGridLayoutSignature);
+    const nextEntry = {
+      columns: { ...(currentEntry?.columns || {}) },
+      rows: currentEntry?.rows || {},
+    };
+
+    if (scope === "columns") {
+      const normalizedRowIndex = String(rowIndex);
+      nextEntry.columns[normalizedRowIndex] = normalizedLayout;
+    } else {
+      nextEntry.rows = normalizedLayout;
+    }
+
+    terminalGridLayoutPendingWriteRef.current = {
+      entry: nextEntry,
+      signature: terminalGridLayoutSignature,
+      storageKey: terminalGridLayoutStorageKey,
+    };
+
+    if (terminalGridLayoutWriteTimerRef.current) {
+      window.clearTimeout(terminalGridLayoutWriteTimerRef.current);
+    }
+
+    terminalGridLayoutWriteTimerRef.current = window.setTimeout(() => {
+      terminalGridLayoutWriteTimerRef.current = 0;
+      flushTerminalGridLayoutWrite();
+    }, TERMINAL_GRID_LAYOUT_SAVE_DEBOUNCE_MS);
+  }, [
+    flushTerminalGridLayoutWrite,
+    terminalGridLayoutSignature,
+    terminalGridLayoutStorageKey,
+  ]);
+  const handleTerminalGridRowsLayoutChanged = useCallback((layout) => {
+    queueTerminalGridLayoutWrite("rows", layout);
+  }, [queueTerminalGridLayoutWrite]);
+  const getTerminalGridColumnDefaultLayout = useCallback((row) => (
+    normalizeTerminalGridLayoutMap(
+      terminalGridSavedLayout?.columns?.[String(row.rowIndex)],
+      getTerminalGridColumnPanelIds(terminalGridLayoutWorkspaceId, row),
+    ) || undefined
+  ), [terminalGridLayoutWorkspaceId, terminalGridSavedLayout]);
+  useEffect(() => () => {
+    if (terminalGridLayoutWriteTimerRef.current) {
+      window.clearTimeout(terminalGridLayoutWriteTimerRef.current);
+      terminalGridLayoutWriteTimerRef.current = 0;
+    }
+    flushTerminalGridLayoutWrite();
+  }, [flushTerminalGridLayoutWrite]);
   useEffect(() => {
     if (!terminalToolboxOpen) {
       return undefined;
@@ -38702,59 +38994,68 @@ function TerminalView({
         data-breakout-visible={terminalBreakoutVisible ? "true" : "false"}
       >
         <ResizePanelGroup
+          defaultLayout={terminalGridDefaultRowsLayout}
           id={`workspace-terminal-layout-${terminalWorkspace.id}`}
+          key={`workspace-terminal-layout-${terminalGridLayoutWorkspaceId}-${terminalGridLayoutSignature}`}
+          onLayoutChanged={handleTerminalGridRowsLayoutChanged}
           orientation="vertical"
         >
-          {activeDisplayRows.map((row, rowOrderIndex) => (
-            <Fragment key={`row-${row.rowIndex}`}>
-              {rowOrderIndex > 0 && (
-                <ResizeHandle
-                  data-direction="vertical"
-                />
-              )}
-              <ResizePanel
-                data-terminal-row="true"
-                defaultSize={`${100 / activeDisplayRows.length}%`}
-                id={`workspace-terminal-row-${terminalWorkspace.id}-${row.rowIndex}`}
-                minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
-              >
-                <ResizePanelGroup
-                  id={`workspace-terminal-row-cols-${terminalWorkspace.id}-${row.rowIndex}`}
-                  orientation="horizontal"
+          {activeDisplayRows.map((row, rowOrderIndex) => {
+            const rowDefaultColumnLayout = getTerminalGridColumnDefaultLayout(row);
+
+            return (
+              <Fragment key={`row-${row.rowIndex}`}>
+                {rowOrderIndex > 0 && (
+                  <ResizeHandle
+                    data-direction="vertical"
+                  />
+                )}
+                <ResizePanel
+                  data-terminal-row="true"
+                  defaultSize={`${100 / activeDisplayRows.length}%`}
+                  id={getTerminalGridRowPanelId(terminalWorkspace.id, row.rowIndex)}
+                  minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
                 >
-                  {row.terminalIndexes.map((paneKey, columnOrderIndex) => {
-                    const documentPanelPane = isTerminalDocumentPanelPane(paneKey);
-                    const paneIdPart = terminalPaneLayoutDomIdPart(paneKey);
-                    const draggingThisPane = terminalDragState?.mode !== "canvas"
-                      && terminalPaneLayoutKeyIdentity(terminalDragState?.terminalIndex) === terminalPaneLayoutKeyIdentity(paneKey);
-                    return (
-                      <Fragment key={`${terminalWorkspace.id}-${paneIdPart}`}>
-                        {columnOrderIndex > 0 && (
-                          <ResizeHandle
-                            data-direction="horizontal"
-                          />
-                        )}
-                        <ResizePanel
-                          data-terminal-column="true"
-                          data-terminal-document-panel-column={documentPanelPane ? "true" : undefined}
-                          defaultSize={`${100 / row.terminalIndexes.length}%`}
-                          id={`workspace-terminal-pane-${terminalWorkspace.id}-${row.rowIndex}-${paneIdPart}`}
-                          minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
-                        >
-                          <TerminalPanelAnchor
-                            data-terminal-document-panel-anchor={documentPanelPane ? "true" : undefined}
-                            data-terminal-drag-placeholder={draggingThisPane ? "true" : undefined}
-                            data-terminal-index={Number.isInteger(paneKey) ? paneKey : undefined}
-                            data-terminal-panel-anchor={documentPanelPane ? undefined : "true"}
-                          />
-                        </ResizePanel>
-                      </Fragment>
-                    );
-                  })}
-                </ResizePanelGroup>
-              </ResizePanel>
-            </Fragment>
-          ))}
+                  <ResizePanelGroup
+                    defaultLayout={rowDefaultColumnLayout}
+                    id={getTerminalGridColumnGroupId(terminalWorkspace.id, row.rowIndex)}
+                    onLayoutChanged={(layout) => queueTerminalGridLayoutWrite("columns", layout, row.rowIndex)}
+                    orientation="horizontal"
+                  >
+                    {row.terminalIndexes.map((paneKey, columnOrderIndex) => {
+                      const documentPanelPane = isTerminalDocumentPanelPane(paneKey);
+                      const paneIdPart = terminalPaneLayoutDomIdPart(paneKey);
+                      const draggingThisPane = terminalDragState?.mode !== "canvas"
+                        && terminalPaneLayoutKeyIdentity(terminalDragState?.terminalIndex) === terminalPaneLayoutKeyIdentity(paneKey);
+                      return (
+                        <Fragment key={`${terminalWorkspace.id}-${paneIdPart}`}>
+                          {columnOrderIndex > 0 && (
+                            <ResizeHandle
+                              data-direction="horizontal"
+                            />
+                          )}
+                          <ResizePanel
+                            data-terminal-column="true"
+                            data-terminal-document-panel-column={documentPanelPane ? "true" : undefined}
+                            defaultSize={`${100 / row.terminalIndexes.length}%`}
+                            id={getTerminalGridPanePanelId(terminalWorkspace.id, row.rowIndex, paneKey)}
+                            minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
+                          >
+                            <TerminalPanelAnchor
+                              data-terminal-document-panel-anchor={documentPanelPane ? "true" : undefined}
+                              data-terminal-drag-placeholder={draggingThisPane ? "true" : undefined}
+                              data-terminal-index={Number.isInteger(paneKey) ? paneKey : undefined}
+                              data-terminal-panel-anchor={documentPanelPane ? undefined : "true"}
+                            />
+                          </ResizePanel>
+                        </Fragment>
+                      );
+                    })}
+                  </ResizePanelGroup>
+                </ResizePanel>
+              </Fragment>
+            );
+          })}
         </ResizePanelGroup>
       </TerminalGridScaffold>
       <TerminalBreakoutCanvas
