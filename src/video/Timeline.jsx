@@ -7,6 +7,7 @@ import { ContentCut } from "@styled-icons/material-rounded/ContentCut";
 import { Delete } from "@styled-icons/material-rounded/Delete";
 import { Lock } from "@styled-icons/material-rounded/Lock";
 import { LockOpen } from "@styled-icons/material-rounded/LockOpen";
+import { DeleteSweep } from "@styled-icons/material-rounded/DeleteSweep";
 import { Redo } from "@styled-icons/material-rounded/Redo";
 import { TextFields } from "@styled-icons/material-rounded/TextFields";
 import { Undo } from "@styled-icons/material-rounded/Undo";
@@ -19,15 +20,20 @@ import {
   addTextClip,
   addTrack,
   clipEndMs,
+  collectSnapPoints,
   findClip,
   formatTimecode,
   gainAtMs,
+  MEME_TEXT_STYLE,
   moveClip,
+  moveClips,
   moveClipToTrack,
   normalizeGain,
   projectDurationMs,
-  removeClip,
+  removeClips,
   removeTrack,
+  rippleDeleteClip,
+  snapMs,
   splitClip,
   trimClipEnd,
   trimClipStart,
@@ -366,6 +372,44 @@ const GainEnvelope = styled.svg`
   opacity: 0.9;
 `;
 
+const RangeOverlay = styled.div`
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 4;
+  background: rgba(96, 165, 250, 0.12);
+  border-left: 1px solid rgba(96, 165, 250, 0.55);
+  border-right: 1px solid rgba(96, 165, 250, 0.55);
+  pointer-events: none;
+`;
+
+const RangeChip = styled.span`
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  border-radius: 999px;
+  background: rgba(37, 99, 235, 0.16);
+  color: #bfdbfe;
+  font-size: 9px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  padding: 1px 3px 1px 8px;
+  white-space: nowrap;
+  flex: none;
+
+  button {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    padding: 0 3px;
+    font-size: 10px;
+    line-height: 1;
+  }
+`;
+
 const Playhead = styled.div`
   position: absolute;
   top: 0;
@@ -467,16 +511,38 @@ export default function Timeline({
   canRedo = false,
   canUndo = false,
   onChange,
+  onRangesChange,
   onRedo,
   onSeek,
-  onSelectClip,
+  onSelectClips,
   onUndo,
   paneToken = "",
   playheadMs = 0,
   project,
+  ranges = [],
   repoPath = "",
-  selectedClipId = "",
+  selectedClipIds = [],
 }) {
+  const selectedClipId = selectedClipIds.length === 1 ? selectedClipIds[0] : "";
+  const selectedSet = useMemo(() => new Set(selectedClipIds), [selectedClipIds]);
+  const selectClip = useCallback(
+    (clipId, { additive = false } = {}) => {
+      if (!clipId) {
+        onSelectClips?.([]);
+        return;
+      }
+      if (additive) {
+        onSelectClips?.(
+          selectedClipIds.includes(clipId)
+            ? selectedClipIds.filter((entry) => entry !== clipId)
+            : [...selectedClipIds, clipId],
+        );
+      } else {
+        onSelectClips?.([clipId]);
+      }
+    },
+    [onSelectClips, selectedClipIds],
+  );
   const scrollerRef = useRef(null);
   const dragRef = useRef(null);
   const addTrackButtonRef = useRef(null);
@@ -561,18 +627,44 @@ export default function Timeline({
           timelineStartMs: dropMs,
         });
         onChange?.(result.project, { transient: false });
-        onSelectClip?.(result.clipId);
+        onSelectClips?.([result.clipId]);
       }
     };
     window.addEventListener(VIDEO_ASSET_POINTER_DRAG_EVENT, handleDrag);
     return () => window.removeEventListener(VIDEO_ASSET_POINTER_DRAG_EVENT, handleDrag);
-  }, [onChange, onSelectClip, paneToken, timeFromClientX, trackIdFromPoint]);
+  }, [onChange, onSelectClips, paneToken, timeFromClientX, trackIdFromPoint]);
 
-  // Ruler scrub.
+  // Ruler: plain drag scrubs; SHIFT-drag selects a time range (chips appear
+  // in the toolbar, overlays across the tracks; ranges feed the AI context).
+  const [draftRange, setDraftRange] = useState(null);
   const beginScrub = useCallback(
     (event) => {
       event.preventDefault();
-      onSeek?.(timeFromClientX(event.clientX));
+      const anchorMs = timeFromClientX(event.clientX);
+      if (event.shiftKey) {
+        setDraftRange({ startMs: anchorMs, endMs: anchorMs });
+        const handleMove = (moveEvent) => {
+          const at = timeFromClientX(moveEvent.clientX);
+          setDraftRange({ startMs: Math.min(anchorMs, at), endMs: Math.max(anchorMs, at) });
+        };
+        const handleUp = (upEvent) => {
+          window.removeEventListener("pointermove", handleMove);
+          window.removeEventListener("pointerup", handleUp);
+          window.removeEventListener("pointercancel", handleUp);
+          setDraftRange(null);
+          const at = timeFromClientX(upEvent?.clientX ?? event.clientX);
+          const startMs = Math.round(Math.min(anchorMs, at));
+          const endMs = Math.round(Math.max(anchorMs, at));
+          if (endMs - startMs >= 120) {
+            onRangesChange?.([...(ranges || []), { startMs, endMs }]);
+          }
+        };
+        window.addEventListener("pointermove", handleMove);
+        window.addEventListener("pointerup", handleUp);
+        window.addEventListener("pointercancel", handleUp);
+        return;
+      }
+      onSeek?.(anchorMs);
       const handleMove = (moveEvent) => onSeek?.(timeFromClientX(moveEvent.clientX));
       const handleUp = () => {
         window.removeEventListener("pointermove", handleMove);
@@ -583,10 +675,12 @@ export default function Timeline({
       window.addEventListener("pointerup", handleUp);
       window.addEventListener("pointercancel", handleUp);
     },
-    [onSeek, timeFromClientX],
+    [onRangesChange, onSeek, ranges, timeFromClientX],
   );
 
-  // Clip drag: move within/between compatible lanes, or trim from a handle.
+  // Clip drag: move within/between compatible lanes (whole selection moves
+  // together when the grabbed clip is part of it), or trim from a handle.
+  // Starts/edges snap to other clips, the playhead, and zero (~8px window).
   const beginClipDrag = useCallback(
     (event, trackId, clip, mode) => {
       if (event.button !== 0) {
@@ -594,16 +688,29 @@ export default function Timeline({
       }
       event.preventDefault();
       event.stopPropagation();
-      onSelectClip?.(clip.id);
+      const additive = event.shiftKey;
+      const partOfSelection = selectedSet.has(clip.id);
+      if (additive) {
+        selectClip(clip.id, { additive: true });
+        return; // shift-click is pure selection, never a drag
+      }
+      const groupIds = partOfSelection && selectedClipIds.length > 1 ? selectedClipIds : [clip.id];
+      if (!partOfSelection) {
+        selectClip(clip.id);
+      }
+      const snapThresholdMs = 8 / pxPerMs;
+      const snapPoints = collectSnapPoints(project, groupIds, [playheadMs]);
       const startX = event.clientX;
       const startY = event.clientY;
       dragRef.current = {
         mode,
         clipId: clip.id,
+        groupIds,
         trackId,
         startX,
         startY,
         originStartMs: clip.timelineStartMs,
+        originEndMs: clipEndMs(clip),
         moved: false,
         latest: project,
       };
@@ -621,16 +728,29 @@ export default function Timeline({
         }
         let next = project;
         if (drag.mode === "move") {
-          const targetTrackId = trackIdFromPoint(moveEvent.clientX, moveEvent.clientY) || drag.trackId;
-          const nextStart = Math.max(0, drag.originStartMs + deltaMs);
-          next =
-            targetTrackId !== drag.trackId
-              ? moveClipToTrack(project, drag.clipId, targetTrackId, nextStart)
-              : moveClip(project, drag.clipId, nextStart);
+          const proposedStart = Math.max(0, drag.originStartMs + deltaMs);
+          const proposedEnd = proposedStart + (drag.originEndMs - drag.originStartMs);
+          const byStart = snapMs(proposedStart, snapPoints, snapThresholdMs);
+          const byEnd = snapMs(proposedEnd, snapPoints, snapThresholdMs) - (drag.originEndMs - drag.originStartMs);
+          const snappedStart =
+            Math.abs(byStart - proposedStart) <= Math.abs(byEnd - proposedStart) ? byStart : Math.max(0, byEnd);
+          if (drag.groupIds.length > 1) {
+            next = moveClips(project, drag.groupIds, snappedStart - drag.originStartMs);
+          } else {
+            const targetTrackId = trackIdFromPoint(moveEvent.clientX, moveEvent.clientY) || drag.trackId;
+            next =
+              targetTrackId !== drag.trackId
+                ? moveClipToTrack(project, drag.clipId, targetTrackId, snappedStart)
+                : moveClip(project, drag.clipId, snappedStart);
+          }
         } else if (drag.mode === "trim-start") {
-          next = trimClipStart(project, drag.clipId, deltaMs);
+          const proposedEdge = drag.originStartMs + deltaMs;
+          const snappedEdge = snapMs(proposedEdge, snapPoints, snapThresholdMs);
+          next = trimClipStart(project, drag.clipId, snappedEdge - drag.originStartMs);
         } else if (drag.mode === "trim-end") {
-          next = trimClipEnd(project, drag.clipId, deltaMs);
+          const proposedEdge = drag.originEndMs + deltaMs;
+          const snappedEdge = snapMs(proposedEdge, snapPoints, snapThresholdMs);
+          next = trimClipEnd(project, drag.clipId, snappedEdge - drag.originEndMs);
         }
         drag.latest = next;
         onChange?.(next, { transient: true });
@@ -649,7 +769,7 @@ export default function Timeline({
       window.addEventListener("pointerup", handleUp);
       window.addEventListener("pointercancel", handleUp);
     },
-    [onChange, onSelectClip, project, pxPerMs, trackIdFromPoint],
+    [onChange, playheadMs, project, pxPerMs, selectClip, selectedClipIds, selectedSet, trackIdFromPoint],
   );
 
   // Keyboard: delete selected clip, undo/redo.
@@ -670,18 +790,18 @@ export default function Timeline({
         }
         return;
       }
-      if (!selectedClipId || event.defaultPrevented) {
+      if (!selectedClipIds.length || event.defaultPrevented) {
         return;
       }
       if (event.key === "Delete" || event.key === "Backspace") {
         event.preventDefault();
-        onChange?.(removeClip(project, selectedClipId), { transient: false });
-        onSelectClip?.("");
+        onChange?.(removeClips(project, selectedClipIds), { transient: false });
+        onSelectClips?.([]);
       }
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [onChange, onRedo, onSelectClip, onUndo, project, selectedClipId]);
+  }, [onChange, onRedo, onSelectClips, onUndo, project, selectedClipIds]);
 
   const splitSelectedAtPlayhead = useCallback(() => {
     if (!selectedClipId) {
@@ -821,21 +941,32 @@ export default function Timeline({
           <ContentCut aria-hidden="true" />
         </VideoIconButton>
         <VideoIconButton
-          disabled={!selectedClipId}
+          disabled={!selectedClipIds.length}
           onClick={() => {
-            onChange?.(removeClip(project, selectedClipId), { transient: false });
-            onSelectClip?.("");
+            onChange?.(removeClips(project, selectedClipIds), { transient: false });
+            onSelectClips?.([]);
           }}
-          title="Delete clip"
+          title={selectedClipIds.length > 1 ? `Delete ${selectedClipIds.length} clips` : "Delete clip"}
           type="button"
         >
           <Delete aria-hidden="true" />
         </VideoIconButton>
         <VideoIconButton
+          disabled={!selectedClipId}
+          onClick={() => {
+            onChange?.(rippleDeleteClip(project, selectedClipId), { transient: false });
+            onSelectClips?.([]);
+          }}
+          title="Ripple delete (close the gap)"
+          type="button"
+        >
+          <DeleteSweep aria-hidden="true" />
+        </VideoIconButton>
+        <VideoIconButton
           onClick={() => {
             const result = addTextClip(project, { timelineStartMs: playheadMs });
             onChange?.(result.project, { transient: false });
-            onSelectClip?.(result.clipId);
+            onSelectClips?.([result.clipId]);
           }}
           title="Add text at playhead"
           type="button"
@@ -846,6 +977,28 @@ export default function Timeline({
           <Add aria-hidden="true" />
         </VideoIconButton>
         <ToolbarSpacer />
+        {(ranges || []).map((range, index) => (
+          <RangeChip
+            key={`${range.startMs}-${range.endMs}-${index}`}
+            title="Selected range — included as AI context when you prompt an agent from this pane (⇧-drag the ruler to add more)"
+          >
+            {formatTimecode(range.startMs)}–{formatTimecode(range.endMs)}
+            <button
+              aria-label="Remove range"
+              onClick={() => onRangesChange?.(ranges.filter((_, rangeIndex) => rangeIndex !== index))}
+              type="button"
+            >
+              ×
+            </button>
+          </RangeChip>
+        ))}
+        {ranges?.length ? (
+          <RangeChip as="span" title="Clear all ranges">
+            <button aria-label="Clear all ranges" onClick={() => onRangesChange?.([])} type="button">
+              clear
+            </button>
+          </RangeChip>
+        ) : null}
         <ZoomWrap title="Zoom">
           <input
             max={MAX_ZOOM}
@@ -920,7 +1073,7 @@ export default function Timeline({
                 data-video-lane={track.id}
                 onPointerDown={(event) => {
                   if (event.target === event.currentTarget) {
-                    onSelectClip?.("");
+                    onSelectClips?.([]);
                     onSeek?.(timeFromClientX(event.clientX));
                   }
                 }}
@@ -942,7 +1095,7 @@ export default function Timeline({
                   return (
                     <ClipBlock
                       $kind={track.kind}
-                      data-selected={selectedClipId === clip.id ? "true" : "false"}
+                      data-selected={selectedSet.has(clip.id) ? "true" : "false"}
                       key={clip.id}
                       onPointerDown={(event) => beginClipDrag(event, track.id, clip, "move")}
                       style={{ left: `${clip.timelineStartMs * pxPerMs}px`, width: `${widthPx}px` }}
@@ -997,6 +1150,15 @@ export default function Timeline({
               </TrackLane>
             </TrackRow>
           ))}
+          {[...(ranges || []), ...(draftRange ? [draftRange] : [])].map((range, index) => (
+            <RangeOverlay
+              key={`range-${index}`}
+              style={{
+                left: `${LABEL_RAIL_WIDTH + range.startMs * pxPerMs}px`,
+                width: `${Math.max(1, (range.endMs - range.startMs) * pxPerMs)}px`,
+              }}
+            />
+          ))}
           <Playhead style={{ left: `${LABEL_RAIL_WIDTH + playheadMs * pxPerMs}px` }} />
         </TimelineCanvas>
       </TimelineScroller>
@@ -1004,7 +1166,7 @@ export default function Timeline({
         <InspectorPopover data-video-clip-inspector="true">
           <InspectorHeader>
             <span>{clipDisplayName(selected.clip, selected.track)}</span>
-            <VideoIconButton onClick={() => onSelectClip?.("")} title="Close" type="button">
+            <VideoIconButton onClick={() => onSelectClips?.([])} title="Close" type="button">
               <Close aria-hidden="true" />
             </VideoIconButton>
           </InspectorHeader>
@@ -1072,6 +1234,64 @@ export default function Timeline({
                     value={selected.clip.style?.y ?? 0.85}
                   />
                 </SliderLabel>
+              </InspectorRow>
+              <InspectorRow>
+                <SliderLabel>
+                  Outline · {selected.clip.style?.outlineWidth ?? 0}px
+                  <input
+                    max={20}
+                    min={0}
+                    onChange={(event) => updateSelectedClip({ style: { outlineWidth: Number(event.target.value) } })}
+                    step={1}
+                    type="range"
+                    value={selected.clip.style?.outlineWidth ?? 0}
+                  />
+                </SliderLabel>
+                <VideoLabel>
+                  Outline color
+                  <VideoInput
+                    onChange={(event) => updateSelectedClip({ style: { outlineColor: event.target.value } })}
+                    type="color"
+                    value={selected.clip.style?.outlineColor || "#000000"}
+                  />
+                </VideoLabel>
+              </InspectorRow>
+              <VideoLabel>
+                Font
+                <AppSelect
+                  onChange={(value) => updateSelectedClip({ style: { fontFamily: value } })}
+                  options={[
+                    { value: "sans-serif", label: "Sans" },
+                    { value: "Impact, 'Arial Black', sans-serif", label: "Impact (meme)" },
+                    { value: "serif", label: "Serif" },
+                    { value: "monospace", label: "Mono" },
+                  ]}
+                  value={selected.clip.style?.fontFamily || "sans-serif"}
+                />
+              </VideoLabel>
+              <InspectorRow>
+                <VideoSecondaryButton
+                  data-active={selected.clip.style?.shadow ? "true" : "false"}
+                  onClick={() => updateSelectedClip({ style: { shadow: !selected.clip.style?.shadow } })}
+                  style={selected.clip.style?.shadow ? { borderColor: "rgba(16,185,129,0.5)", color: "#a7f3d0" } : undefined}
+                  type="button"
+                >
+                  Shadow
+                </VideoSecondaryButton>
+                <VideoSecondaryButton
+                  onClick={() => updateSelectedClip({ style: { uppercase: !selected.clip.style?.uppercase } })}
+                  style={selected.clip.style?.uppercase ? { borderColor: "rgba(16,185,129,0.5)", color: "#a7f3d0" } : undefined}
+                  type="button"
+                >
+                  AA
+                </VideoSecondaryButton>
+                <VideoSecondaryButton
+                  onClick={() => updateSelectedClip({ style: { ...MEME_TEXT_STYLE } })}
+                  title="Classic meme text: Impact, white, black outline, uppercase"
+                  type="button"
+                >
+                  Meme
+                </VideoSecondaryButton>
               </InspectorRow>
             </>
           ) : (

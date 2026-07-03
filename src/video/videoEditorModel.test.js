@@ -6,14 +6,21 @@ import {
   addTextClip,
   addTrack,
   clipsAtMs,
+  clipsInRange,
+  collectSnapPoints,
   formatTimecode,
   gainAtMs,
   makeStarterProject,
   moveClip,
+  moveClips,
   moveClipToTrack,
   normalizeProject,
+  normalizeTextStyle,
   projectDurationMs,
   removeClip,
+  removeClips,
+  rippleDeleteClip,
+  snapMs,
   splitClip,
   trimClipEnd,
   trimClipStart,
@@ -196,6 +203,66 @@ test("reports active clips at a playhead position, skipping muted tracks", () =>
     tracks: project.tracks.map((track) => ({ ...track, muted: track.kind === "video" })),
   });
   assert.equal(clipsAtMs(muted, 2000).video.length, 0);
+});
+
+test("normalizes meme-style text fields with defaults", () => {
+  const defaults = normalizeTextStyle({});
+  assert.equal(defaults.outlineWidth, 0);
+  assert.equal(defaults.outlineColor, "#000000");
+  assert.equal(defaults.shadow, false);
+  assert.equal(defaults.uppercase, false);
+  const meme = normalizeTextStyle({ outlineWidth: 99, outlineColor: "#111111", shadow: true, uppercase: true });
+  assert.equal(meme.outlineWidth, 40); // clamped
+  assert.equal(meme.outlineColor, "#111111");
+  assert.equal(meme.shadow, true);
+  assert.equal(meme.uppercase, true);
+});
+
+test("moves clip groups by a shared clamped delta", () => {
+  let project = projectWithClip();
+  const added = addMediaClip(project, { path: "media/assets/b.mp4", kind: "video", durationMs: 2000 }, { timelineStartMs: 6000 });
+  project = added.project;
+  const moved = moveClips(project, ["clip-1", added.clipId], -2000);
+  const clips = moved.tracks.find((track) => track.kind === "video").clips;
+  // clip-1 started at 1000 → clamp shifts everything by -1000, preserving spacing.
+  assert.equal(clips[0].timelineStartMs, 0);
+  assert.equal(clips[1].timelineStartMs, 5000);
+});
+
+test("removeClips deletes every selected clip at once", () => {
+  let project = projectWithClip();
+  const added = addMediaClip(project, { path: "media/assets/b.mp4", kind: "video" }, { timelineStartMs: 8000 });
+  project = added.project;
+  const next = removeClips(project, ["clip-1", added.clipId]);
+  assert.equal(next.tracks.find((track) => track.kind === "video").clips.length, 0);
+});
+
+test("ripple delete closes the gap on the same track", () => {
+  let project = projectWithClip(); // clip-1 at 1000, dur 4000
+  const added = addMediaClip(project, { path: "media/assets/b.mp4", kind: "video", durationMs: 2000 }, { timelineStartMs: 7000 });
+  project = added.project;
+  const next = rippleDeleteClip(project, "clip-1");
+  const clips = next.tracks.find((track) => track.kind === "video").clips;
+  assert.equal(clips.length, 1);
+  assert.equal(clips[0].timelineStartMs, 3000); // 7000 - 4000
+});
+
+test("snap points include zero, clip edges, and extras; snapMs respects threshold", () => {
+  const project = projectWithClip(); // edges at 1000 and 5000
+  const points = collectSnapPoints(project, [], [2500]);
+  assert.ok(points.includes(0));
+  assert.ok(points.includes(1000));
+  assert.ok(points.includes(5000));
+  assert.ok(points.includes(2500));
+  assert.equal(snapMs(1080, points, 100), 1000);
+  assert.equal(snapMs(1300, points, 100), 1300); // out of threshold
+});
+
+test("clipsInRange returns overlapping clips only", () => {
+  const project = projectWithClip(); // 1000..5000
+  assert.equal(clipsInRange(project, 0, 999).length, 0);
+  assert.equal(clipsInRange(project, 4999, 9000).length, 1);
+  assert.equal(clipsInRange(project, 0, 1001).length, 1);
 });
 
 test("formats timecodes", () => {

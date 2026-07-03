@@ -68,8 +68,24 @@ export function normalizeTextStyle(style) {
     align: ["left", "center", "right"].includes(style?.align) ? style.align : "center",
     bold: style?.bold !== false,
     fontFamily: cleanText(style?.fontFamily) || "sans-serif",
+    outlineColor: cleanText(style?.outlineColor) || "#000000",
+    outlineWidth: Math.min(40, Math.max(0, cleanNumber(style?.outlineWidth, 0))),
+    shadow: style?.shadow === true,
+    uppercase: style?.uppercase === true,
   };
 }
+
+// Classic meme text: heavy white face, thick black outline, uppercase.
+export const MEME_TEXT_STYLE = {
+  color: "#ffffff",
+  background: "",
+  outlineColor: "#000000",
+  outlineWidth: 6,
+  shadow: false,
+  uppercase: true,
+  bold: true,
+  fontFamily: "Impact, 'Arial Black', sans-serif",
+};
 
 export function normalizeClip(clip, trackKind) {
   if (!clip || typeof clip !== "object") {
@@ -225,6 +241,104 @@ export function moveClip(project, clipId, timelineStartMs) {
   return updateClipIn(project, clipId, (clip) => {
     clip.timelineStartMs = Math.max(0, Math.round(timelineStartMs));
   });
+}
+
+// Group move: shift every listed clip by the same delta, clamped so the
+// earliest one lands at 0 (relative spacing always survives).
+export function moveClips(project, clipIds, deltaMs) {
+  const ids = Array.isArray(clipIds) ? clipIds.filter(Boolean) : [];
+  if (!ids.length) {
+    return project;
+  }
+  const next = cloneProject(project);
+  const targets = [];
+  for (const clipId of ids) {
+    const found = findClip(next, clipId);
+    if (found && !found.track.locked) {
+      targets.push(found);
+    }
+  }
+  if (!targets.length) {
+    return project;
+  }
+  const minStart = Math.min(...targets.map((entry) => entry.clip.timelineStartMs));
+  const applied = Math.max(Math.round(deltaMs), -minStart);
+  for (const { clip, track } of targets) {
+    clip.timelineStartMs += applied;
+    track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
+  }
+  return next;
+}
+
+export function removeClips(project, clipIds) {
+  const ids = new Set(Array.isArray(clipIds) ? clipIds : []);
+  if (!ids.size) {
+    return project;
+  }
+  const next = cloneProject(project);
+  for (const track of next.tracks) {
+    if (!track.locked) {
+      track.clips = track.clips.filter((clip) => !ids.has(clip.id));
+    }
+  }
+  return next;
+}
+
+// Ripple delete: remove the clip and slide every later clip on the SAME
+// track left by its duration, closing the gap.
+export function rippleDeleteClip(project, clipId) {
+  const next = cloneProject(project);
+  const found = findClip(next, clipId);
+  if (!found || found.track.locked) {
+    return project;
+  }
+  const { clip, track } = found;
+  const start = clip.timelineStartMs;
+  const gap = clip.durationMs;
+  track.clips = track.clips.filter((entry) => entry.id !== clipId);
+  for (const entry of track.clips) {
+    if (entry.timelineStartMs >= start) {
+      entry.timelineStartMs = Math.max(0, entry.timelineStartMs - gap);
+    }
+  }
+  track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
+  return next;
+}
+
+// Candidate snap targets: timeline zero, every other clip's edges, and any
+// extra points (playhead). Sorted, deduped.
+export function collectSnapPoints(project, excludeClipIds = [], extraPoints = []) {
+  const exclude = new Set(Array.isArray(excludeClipIds) ? excludeClipIds : []);
+  const points = new Set([0]);
+  for (const point of extraPoints) {
+    if (Number.isFinite(Number(point))) {
+      points.add(Math.max(0, Math.round(Number(point))));
+    }
+  }
+  for (const track of project?.tracks || []) {
+    for (const clip of track.clips || []) {
+      if (exclude.has(clip.id)) {
+        continue;
+      }
+      points.add(clip.timelineStartMs);
+      points.add(clipEndMs(clip));
+    }
+  }
+  return [...points].sort((a, b) => a - b);
+}
+
+// Snap a proposed position to the nearest candidate within the threshold.
+export function snapMs(proposedMs, snapPoints, thresholdMs) {
+  let best = null;
+  let bestDistance = Number.POSITIVE_INFINITY;
+  for (const point of snapPoints || []) {
+    const distance = Math.abs(point - proposedMs);
+    if (distance < bestDistance) {
+      best = point;
+      bestDistance = distance;
+    }
+  }
+  return best != null && bestDistance <= thresholdMs ? best : Math.round(proposedMs);
 }
 
 // Move a clip to another track of the same media family (video/audio share the
@@ -442,6 +556,20 @@ export function addTextClip(project, { trackId = "", timelineStartMs = 0, text =
   track.clips.push(clip);
   track.clips.sort((a, b) => a.timelineStartMs - b.timelineStartMs);
   return { project: next, clipId: clip.id, trackId: track.id };
+}
+
+// Clips overlapping [startMs, endMs) on any track — drives range-scoped AI
+// context and range operations.
+export function clipsInRange(project, startMs, endMs) {
+  const result = [];
+  for (const track of project?.tracks || []) {
+    for (const clip of track.clips || []) {
+      if (clip.timelineStartMs < endMs && clipEndMs(clip) > startMs) {
+        result.push({ track, clip });
+      }
+    }
+  }
+  return result;
 }
 
 // Clips under the playhead per track kind — drives the preview compositor.

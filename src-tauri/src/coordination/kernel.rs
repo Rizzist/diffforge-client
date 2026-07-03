@@ -30278,12 +30278,6 @@ command = "diffforge --diff-forge-activity-hook"
             tools,
             &[
                 "start_task",
-                "architecture_context",
-                "architecture_list",
-                "architecture_icon_reference",
-                "architecture_revision_list",
-                "architecture_revision_read",
-                "architecture_revision_restore",
                 "list_todo_targets",
                 "get_todo_status",
                 "wait_for_todos",
@@ -30300,7 +30294,8 @@ command = "diffforge --diff-forge-activity-hook"
                 "checkpoint",
                 "complete_task",
                 "submit_patch",
-                "submit_patch_status"
+                "submit_patch_status",
+                "pcb_drc"
             ]
         );
         assert!(!tools.contains(&"request_merge"));
@@ -30331,135 +30326,32 @@ command = "diffforge --diff-forge-activity-hook"
     }
 
     #[test]
-    fn architecture_mcp_tools_explain_direct_file_architecture_workflow() {
-        let repo = temp_repo("architecture_mcp_direct_file");
+    fn deprecated_architecture_mcp_tools_are_not_exposed() {
+        let repo = temp_repo("architecture_mcp_retired");
         let _kernel = CoordinationKernel::init(&repo, None).unwrap();
         let context = crate::coordination::mcp::McpContext::default();
         let repo_path = process_path_text(&repo);
-        let source = r#"title "Appwrite Auth Flow Architecture"
-direction right
-folder "flows / auth"
 
-Client [icon: users, display: compact]
-Appwrite [icon: service, desc: Backend-as-a-service platform]
-Session Store [icon: database, desc: Stores sessions]
-
-Client > Appwrite: login
-Appwrite > Session Store: create session
-"#;
-
-        let contract = crate::coordination::mcp::dispatch_tool(
-            &context,
+        for tool in [
             "architecture_context",
-            json!({"repo_path": repo_path.clone()}),
-        );
-        assert_eq!(contract["ok"].as_bool(), Some(true));
-        assert_eq!(contract["data"]["sourceFormat"].as_str(), Some("eraserDsl"));
-        assert!(contract["data"]["dsl"]["compactNode"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("display: compact"));
-        assert!(contract["data"]["contract"]["preferredMcpTools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool.as_str() == Some("coordination-kernel.architecture_context")));
-        assert!(!contract["data"]["contract"]["preferredMcpTools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool.as_str() == Some("coordination-kernel.architecture_read")));
-        assert!(!contract["data"]["contract"]["preferredMcpTools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|tool| tool.as_str() == Some("coordination-kernel.architecture_write")));
-        assert!(repo
-            .join(".agents")
-            .join("architectures")
-            .join("AGENTS.md")
-            .exists());
-        assert!(contract["data"]["contract"]["workflow"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|step| step
-                .as_str()
-                .unwrap_or_default()
-                .contains("normal file edits")));
-
-        let old_write = crate::coordination::mcp::dispatch_tool(
-            &context,
-            "architecture_write",
-            json!({
-                "repo_path": repo_path.clone(),
-                "title": "Appwrite Auth Flow Architecture",
-                "folder": "flows / auth",
-                "source": source
-            }),
-        );
-        assert_eq!(old_write["ok"].as_bool(), Some(false));
-        assert_eq!(old_write["error"]["code"].as_str(), Some("unknown_tool"));
-
-        let old_read = crate::coordination::mcp::dispatch_tool(
-            &context,
-            "architecture_read",
-            json!({
-                "repo_path": repo_path.clone(),
-                "graph_id": "appwrite-auth-flow-architecture"
-            }),
-        );
-        assert_eq!(old_read["ok"].as_bool(), Some(false));
-        assert_eq!(old_read["error"]["code"].as_str(), Some("unknown_tool"));
-
-        let graph_path = repo
-            .join(".agents")
-            .join("architectures")
-            .join("graphs")
-            .join("appwrite-auth-flow-architecture.arch");
-        fs::create_dir_all(graph_path.parent().unwrap()).unwrap();
-        fs::write(&graph_path, source).unwrap();
-        assert!(graph_path.exists());
-        assert!(fs::read_to_string(&graph_path)
-            .unwrap()
-            .contains("Appwrite [icon: service"));
-
-        let listed = crate::coordination::mcp::dispatch_tool(
-            &context,
             "architecture_list",
-            json!({"repo_path": repo_path.clone()}),
-        );
-        assert_eq!(listed["ok"].as_bool(), Some(true));
-        assert_eq!(
-            listed["data"]["graphs"][0]["id"].as_str(),
-            Some("appwrite-auth-flow-architecture")
-        );
-        assert_eq!(
-            listed["data"]["graphs"][0]["sourceFormat"].as_str(),
-            Some("eraserDsl")
-        );
-        assert_eq!(listed["data"]["graphs"][0]["nodeCount"].as_u64(), Some(3));
-
-        let icons = crate::coordination::mcp::dispatch_tool(
-            &context,
             "architecture_icon_reference",
-            json!({"repo_path": repo_path}),
-        );
-        assert_eq!(icons["ok"].as_bool(), Some(true));
-        assert!(icons["data"]["techAndCompany"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|icon| icon.as_str() == Some("cockroachdb")));
-        assert!(icons["data"]["techAndCompany"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|icon| icon.as_str() == Some("appwrite")));
-        assert!(icons["data"]["packageResolution"]["titleInference"]
-            .as_str()
-            .unwrap()
-            .contains("missing or generic"));
+            "architecture_revision_list",
+            "architecture_revision_read",
+            "architecture_revision_restore",
+        ] {
+            let response = crate::coordination::mcp::dispatch_tool(
+                &context,
+                tool,
+                json!({"repo_path": repo_path.clone()}),
+            );
+            assert_eq!(response["ok"].as_bool(), Some(false), "{tool}");
+            assert_eq!(
+                response["error"]["code"].as_str(),
+                Some("unknown_tool"),
+                "{tool}"
+            );
+        }
     }
 
     #[test]

@@ -56,8 +56,21 @@ const PreviewTextOverlay = styled.div`
   position: absolute;
   transform: translate(-50%, -50%);
   white-space: pre-wrap;
-  pointer-events: none;
   line-height: 1.25;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
+
+  &:hover {
+    outline: 1px dashed rgba(96, 165, 250, 0.7);
+    outline-offset: 2px;
+  }
+
+  &[data-dragging="true"] {
+    cursor: grabbing;
+    outline: 1px dashed rgba(16, 185, 129, 0.85);
+    outline-offset: 2px;
+  }
 `;
 
 const PreviewEmpty = styled.div`
@@ -103,7 +116,48 @@ export default function VideoEditor({
   repoPath = "",
   onSeek,
   onTogglePlay,
+  onUpdateTextClip,
 }) {
+  const frameRef = useRef(null);
+  const [draggingTextId, setDraggingTextId] = useState("");
+
+  // Meme-editor essential: grab a title on the preview and put it where it
+  // belongs. Fractions are relative to the project frame.
+  const beginTextDrag = useCallback(
+    (event, clip) => {
+      if (event.button !== 0 || !onUpdateTextClip) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      setDraggingTextId(clip.id);
+      const moveTo = (moveEvent) => {
+        const rect = frameRef.current?.getBoundingClientRect();
+        if (!rect || rect.width <= 0 || rect.height <= 0) {
+          return;
+        }
+        const x = Math.min(1, Math.max(0, (moveEvent.clientX - rect.left) / rect.width));
+        const y = Math.min(1, Math.max(0, (moveEvent.clientY - rect.top) / rect.height));
+        onUpdateTextClip(clip.id, { style: { x, y } }, { transient: true });
+      };
+      const finish = (endEvent) => {
+        window.removeEventListener("pointermove", moveTo);
+        window.removeEventListener("pointerup", finish);
+        window.removeEventListener("pointercancel", finish);
+        setDraggingTextId("");
+        const rect = frameRef.current?.getBoundingClientRect();
+        if (rect && rect.width > 0 && rect.height > 0 && endEvent?.clientX != null) {
+          const x = Math.min(1, Math.max(0, (endEvent.clientX - rect.left) / rect.width));
+          const y = Math.min(1, Math.max(0, (endEvent.clientY - rect.top) / rect.height));
+          onUpdateTextClip(clip.id, { style: { x, y } }, { transient: false });
+        }
+      };
+      window.addEventListener("pointermove", moveTo);
+      window.addEventListener("pointerup", finish);
+      window.addEventListener("pointercancel", finish);
+    },
+    [onUpdateTextClip],
+  );
   const stageRef = useRef(null);
   const mediaPoolRef = useRef(new Map());
   const rafRef = useRef(0);
@@ -302,6 +356,7 @@ export default function VideoEditor({
         {frameSize.width > 0 ? (
           <PreviewFrame
             $background={settings.background}
+            ref={frameRef}
             style={{ width: `${frameSize.width}px`, height: `${frameSize.height}px` }}
           >
             {visual ? (
@@ -324,25 +379,35 @@ export default function VideoEditor({
                 </PreviewEmpty>
               </PreviewLayer>
             )}
-            {active.text.map(({ clip }) => (
-              <PreviewTextOverlay
-                key={clip.id}
-                style={{
-                  left: `${(clip.style?.x ?? 0.5) * 100}%`,
-                  top: `${(clip.style?.y ?? 0.85) * 100}%`,
-                  fontSize: `${Math.max(6, (clip.style?.fontSize || 48) * fontScale)}px`,
-                  color: clip.style?.color || "#ffffff",
-                  background: clip.style?.background || "transparent",
-                  textAlign: clip.style?.align || "center",
-                  fontWeight: clip.style?.bold === false ? 500 : 800,
-                  fontFamily: clip.style?.fontFamily || "sans-serif",
-                  padding: clip.style?.background ? "0.15em 0.4em" : 0,
-                  borderRadius: clip.style?.background ? "0.2em" : 0,
-                }}
-              >
-                {clip.text}
-              </PreviewTextOverlay>
-            ))}
+            {active.text.map(({ clip }) => {
+              const outlineWidth = (clip.style?.outlineWidth || 0) * fontScale;
+              return (
+                <PreviewTextOverlay
+                  data-dragging={draggingTextId === clip.id ? "true" : "false"}
+                  key={clip.id}
+                  onPointerDown={(event) => beginTextDrag(event, clip)}
+                  style={{
+                    left: `${(clip.style?.x ?? 0.5) * 100}%`,
+                    top: `${(clip.style?.y ?? 0.85) * 100}%`,
+                    fontSize: `${Math.max(6, (clip.style?.fontSize || 48) * fontScale)}px`,
+                    color: clip.style?.color || "#ffffff",
+                    background: clip.style?.background || "transparent",
+                    textAlign: clip.style?.align || "center",
+                    fontWeight: clip.style?.bold === false ? 500 : 800,
+                    fontFamily: clip.style?.fontFamily || "sans-serif",
+                    padding: clip.style?.background ? "0.15em 0.4em" : 0,
+                    borderRadius: clip.style?.background ? "0.2em" : 0,
+                    textTransform: clip.style?.uppercase ? "uppercase" : "none",
+                    WebkitTextStroke: outlineWidth > 0 ? `${outlineWidth}px ${clip.style?.outlineColor || "#000000"}` : undefined,
+                    paintOrder: outlineWidth > 0 ? "stroke fill" : undefined,
+                    textShadow: clip.style?.shadow ? "2px 2px 6px rgba(0, 0, 0, 0.75)" : "none",
+                  }}
+                  title="Drag to position"
+                >
+                  {clip.text}
+                </PreviewTextOverlay>
+              );
+            })}
           </PreviewFrame>
         ) : null}
       </PreviewStage>

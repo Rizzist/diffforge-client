@@ -9,6 +9,7 @@ const VIDEO_STORE_CHANGED_EVENT: &str = "video-store-changed";
 const VIDEO_TOOLS_INSTALL_PROGRESS_EVENT: &str = "video-tools-install-progress";
 const VIDEO_EXPORT_PROGRESS_EVENT: &str = "video-export-progress";
 const VIDEO_GENERATE_PROGRESS_EVENT: &str = "video-generate-progress";
+const VIDEO_TRANSCRIBE_PROGRESS_EVENT: &str = "video-transcribe-progress";
 const VIDEO_LORA_PROGRESS_EVENT: &str = "video-lora-progress";
 const VIDEO_PANEL_CLOSED_EVENT: &str = "video-panel-closed";
 
@@ -22,6 +23,8 @@ const VIDEO_PROBE_CACHE_FILE: &str = "probe.json";
 const VIDEO_THUMBS_DIR: &str = "thumbs";
 const VIDEO_WAVEFORMS_DIR: &str = "waveforms";
 const VIDEO_FILMSTRIPS_DIR: &str = "filmstrips";
+const VIDEO_TRANSCRIBE_DIR: &str = "transcribe";
+const VIDEO_TRANSCRIPTS_DIR: &str = "transcripts";
 const VIDEO_PROJECT_EXTENSION: &str = ".video.pipe";
 const VIDEO_PROJECT_LEGACY_EXTENSION: &str = ".video.json";
 const VIDEO_TOOLS_DIR: &str = "video-tools";
@@ -38,6 +41,8 @@ const VIDEO_PROBE_TIMEOUT_SECS: u64 = 30;
 const VIDEO_THUMB_TIMEOUT_SECS: u64 = 30;
 const VIDEO_EXPORT_PROGRESS_INTERVAL_MS: u64 = 500;
 const VIDEO_WAVEFORM_PCM_LIMIT_BYTES: usize = 60 * 1024 * 1024;
+const VIDEO_TRANSCRIBE_MP3_LIMIT_BYTES: u64 = 20 * 1024 * 1024;
+const VIDEO_TRANSCRIBE_TIMEOUT_SECS: u64 = 180;
 
 const VIDEO_TOOL_DOWNLOAD_URLS: &[(&str, &str)] = &[
     ("macos-ffmpeg-zip", "https://evermeet.cx/ffmpeg/getrelease/zip"),
@@ -70,6 +75,9 @@ static VIDEO_EXPORT_JOBS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, VideoJobHandle>>,
 > = std::sync::OnceLock::new();
 static VIDEO_GENERATE_JOBS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, VideoJobHandle>>,
+> = std::sync::OnceLock::new();
+static VIDEO_TRANSCRIBE_JOBS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, VideoJobHandle>>,
 > = std::sync::OnceLock::new();
 static VIDEO_LORA_JOBS: std::sync::OnceLock<
@@ -127,6 +135,7 @@ struct VideoMediaItem {
     width: Option<u32>,
     height: Option<u32>,
     has_audio: Option<bool>,
+    has_transcript: bool,
     thumbnail_data_url: Option<String>,
 }
 
@@ -158,6 +167,31 @@ struct VideoMediaWaveformResponse {
 struct VideoMediaFilmstripResponse {
     path: String,
     frames: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct VideoTranscriptSegment {
+    start_ms: u64,
+    end_ms: u64,
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct VideoTranscriptCache {
+    language: Option<String>,
+    text: String,
+    segments: Vec<VideoTranscriptSegment>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoTranscriptGetResponse {
+    available: bool,
+    language: Option<String>,
+    text: String,
+    segments: Vec<VideoTranscriptSegment>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -338,6 +372,10 @@ struct VideoExportTextClip {
     font_size: f64,
     color: String,
     background: Option<String>,
+    outline_color: String,
+    outline_width: f64,
+    shadow: bool,
+    uppercase: bool,
     x: f64,
     y: f64,
 }
@@ -901,6 +939,8 @@ fn video_build_media_item(
     let width = probe.as_ref().and_then(|probe| probe.width);
     let height = probe.as_ref().and_then(|probe| probe.height);
     let has_audio = probe.as_ref().and_then(|probe| probe.has_audio);
+    let has_transcript = matches!(kind, "audio" | "video")
+        && video_transcript_cache_path(media_root, &path, &metadata).is_file();
     let thumbnail_data_url = if matches!(kind, "video" | "image") {
         ffmpeg_path.and_then(|ffmpeg| {
             let thumb_path = media_root
@@ -934,6 +974,7 @@ fn video_build_media_item(
         width,
         height,
         has_audio,
+        has_transcript,
         thumbnail_data_url,
     })
 }
@@ -966,6 +1007,33 @@ fn video_cache_file_stem(
         discriminator
     );
     video_sha1_hex(&cache_key)
+}
+
+fn video_media_cache_stem(rel_path: &str, metadata: &std::fs::Metadata) -> String {
+    let modified_at_ms = video_file_modified_ms(metadata);
+    video_sha1_hex(&video_cache_key(rel_path, modified_at_ms, metadata.len()))
+}
+
+fn video_transcribe_mp3_cache_path(
+    media_root: &std::path::Path,
+    rel_path: &str,
+    metadata: &std::fs::Metadata,
+) -> std::path::PathBuf {
+    media_root
+        .join(VIDEO_CACHE_DIR)
+        .join(VIDEO_TRANSCRIBE_DIR)
+        .join(format!("{}.mp3", video_media_cache_stem(rel_path, metadata)))
+}
+
+fn video_transcript_cache_path(
+    media_root: &std::path::Path,
+    rel_path: &str,
+    metadata: &std::fs::Metadata,
+) -> std::path::PathBuf {
+    media_root
+        .join(VIDEO_CACHE_DIR)
+        .join(VIDEO_TRANSCRIPTS_DIR)
+        .join(format!("{}.json", video_media_cache_stem(rel_path, metadata)))
 }
 
 fn video_write_json_cache<T: serde::Serialize>(
@@ -2229,6 +2297,432 @@ async fn video_media_filmstrip(
     .map_err(|error| format!("Video media filmstrip worker failed: {error}"))?
 }
 
+fn video_emit_transcribe_progress(
+    app: &tauri::AppHandle,
+    job_id: &str,
+    path: &str,
+    state: &str,
+    percent: Option<f64>,
+    done: bool,
+    error: Option<&str>,
+) {
+    let _ = app.emit(
+        VIDEO_TRANSCRIBE_PROGRESS_EVENT,
+        serde_json::json!({
+            "jobId": job_id,
+            "path": path,
+            "state": state,
+            "percent": percent,
+            "done": done,
+            "error": error,
+        }),
+    );
+}
+
+fn video_transcribe_cancelled(cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>) -> bool {
+    cancel.load(std::sync::atomic::Ordering::Acquire)
+}
+
+fn video_extract_transcribe_mp3_blocking(
+    ffmpeg_path: String,
+    input_abs: std::path::PathBuf,
+    output_abs: std::path::PathBuf,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<std::path::PathBuf, String> {
+    if output_abs.is_file() {
+        return Ok(output_abs);
+    }
+    if let Some(parent) = output_abs.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create video transcription cache directory: {error}"))?;
+    }
+    let temp_abs = output_abs.with_extension("tmp.mp3");
+    let _ = std::fs::remove_file(&temp_abs);
+    let input = input_abs.to_string_lossy().to_string();
+    let output = temp_abs.to_string_lossy().to_string();
+    let mut command = std::process::Command::new(&ffmpeg_path);
+    apply_desktop_command_environment(&mut command);
+    command
+        .args([
+            "-nostdin",
+            "-y",
+            "-v",
+            "error",
+            "-i",
+            input.as_str(),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-b:a",
+            "48k",
+            "-f",
+            "mp3",
+            output.as_str(),
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("Unable to start ffmpeg transcription extract: {error}"))?;
+    let stderr = child.stderr.take();
+    let stderr_reader = stderr.map(|stderr| {
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut reader = std::io::BufReader::new(stderr);
+            let mut buffer = [0u8; 8192];
+            let mut output = Vec::new();
+            loop {
+                match reader.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if output.len() < 64 * 1024 {
+                            let remaining = (64 * 1024usize).saturating_sub(output.len());
+                            output.extend_from_slice(&buffer[..read.min(remaining)]);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            String::from_utf8_lossy(&output).to_string()
+        })
+    });
+    loop {
+        if video_transcribe_cancelled(&cancel) {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&temp_abs);
+            return Err("Video transcription cancelled.".to_string());
+        }
+        match child
+            .try_wait()
+            .map_err(|error| format!("Unable to wait for ffmpeg transcription extract: {error}"))?
+        {
+            Some(status) => {
+                let detail = stderr_reader
+                    .and_then(|reader| reader.join().ok())
+                    .unwrap_or_default();
+                if !status.success() || !temp_abs.is_file() {
+                    let detail = first_output_line(&detail);
+                    let _ = std::fs::remove_file(&temp_abs);
+                    return Err(if detail.is_empty() {
+                        "ffmpeg could not extract transcription audio.".to_string()
+                    } else {
+                        format!("ffmpeg could not extract transcription audio: {detail}")
+                    });
+                }
+                std::fs::rename(&temp_abs, &output_abs)
+                    .map_err(|error| format!("Unable to finalize transcription audio cache: {error}"))?;
+                return Ok(output_abs);
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+}
+
+fn video_parse_transcript_segments(value: &serde_json::Value) -> Vec<VideoTranscriptSegment> {
+    value
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    let text = item
+                        .get("text")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let start_ms = item
+                        .get("startMs")
+                        .or_else(|| item.get("start_ms"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0);
+                    let end_ms = item
+                        .get("endMs")
+                        .or_else(|| item.get("end_ms"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(start_ms);
+                    Some(VideoTranscriptSegment {
+                        start_ms,
+                        end_ms: end_ms.max(start_ms),
+                        text,
+                    })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn video_transcript_text(segments: &[VideoTranscriptSegment]) -> String {
+    segments
+        .iter()
+        .map(|segment| segment.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+async fn video_transcribe_worker(
+    app: tauri::AppHandle,
+    cloud_state: CloudMcpState,
+    job_id: String,
+    repo_path: String,
+    path: String,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    let result = async {
+        use base64::Engine as _;
+        video_emit_transcribe_progress(
+            &app,
+            &job_id,
+            &path,
+            "extracting",
+            Some(0.0),
+            false,
+            None,
+        );
+        let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
+        video_ensure_media_dirs(&media_root)?;
+        let (abs, rel_path, kind, metadata) =
+            video_resolve_existing_media_file(&root, &media_root, path.as_str())?;
+        if !matches!(kind, "audio" | "video") {
+            return Err("Transcription is only available for audio or video media.".to_string());
+        }
+        let transcript_path = video_transcript_cache_path(&media_root, &rel_path, &metadata);
+        if transcript_path.is_file() {
+            video_emit_transcribe_progress(
+                &app,
+                &job_id,
+                &rel_path,
+                "done",
+                Some(100.0),
+                true,
+                None,
+            );
+            return Ok(());
+        }
+        if video_transcribe_cancelled(&cancel) {
+            return Err("Video transcription cancelled.".to_string());
+        }
+        let audio_path = if abs
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("mp3"))
+        {
+            abs.clone()
+        } else {
+            let status = video_tools_status_for(&app);
+            let ffmpeg_path = status
+                .ffmpeg
+                .path
+                .ok_or_else(|| "ffmpeg is required to extract transcription audio. Install video tools first.".to_string())?;
+            let cache_path = video_transcribe_mp3_cache_path(&media_root, &rel_path, &metadata);
+            let cancel_for_extract = cancel.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                video_extract_transcribe_mp3_blocking(ffmpeg_path, abs, cache_path, cancel_for_extract)
+            })
+            .await
+            .map_err(|error| format!("Video transcription extract worker failed: {error}"))??
+        };
+        if video_transcribe_cancelled(&cancel) {
+            return Err("Video transcription cancelled.".to_string());
+        }
+        let audio_metadata = std::fs::metadata(&audio_path)
+            .map_err(|error| format!("Unable to inspect transcription audio: {error}"))?;
+        if audio_metadata.len() > VIDEO_TRANSCRIBE_MP3_LIMIT_BYTES {
+            return Err(
+                "Video media too long for cloud transcription; extracted MP3 exceeds 20MB. Trim the clip or use a shorter asset."
+                    .to_string(),
+            );
+        }
+        video_emit_transcribe_progress(
+            &app,
+            &job_id,
+            &rel_path,
+            "uploading",
+            Some(35.0),
+            false,
+            None,
+        );
+        let audio_bytes = tauri::async_runtime::spawn_blocking({
+            let audio_path = audio_path.clone();
+            move || std::fs::read(&audio_path)
+        })
+        .await
+        .map_err(|error| format!("Video transcription audio read worker failed: {error}"))?
+        .map_err(|error| format!("Unable to read transcription audio: {error}"))?;
+        if video_transcribe_cancelled(&cancel) {
+            return Err("Video transcription cancelled.".to_string());
+        }
+        let audio_base64 = base64::engine::general_purpose::STANDARD.encode(audio_bytes);
+        let request_id = format!("video-transcribe-{}-{}", video_now_millis(), uuid::Uuid::new_v4());
+        let file_name = audio_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("audio.mp3")
+            .to_string();
+        let payload = serde_json::json!({
+            "kind": "video_transcribe_request",
+            "requestId": request_id,
+            "audioBase64": audio_base64,
+            "mimeType": "audio/mpeg",
+            "fileName": file_name,
+        });
+        video_emit_transcribe_progress(
+            &app,
+            &job_id,
+            &rel_path,
+            "transcribing",
+            Some(55.0),
+            false,
+            None,
+        );
+        let response = cloud_mcp_ws_request_once_with_timeout(
+            &cloud_state,
+            "video_transcribe_request",
+            &payload,
+            std::time::Duration::from_secs(VIDEO_TRANSCRIBE_TIMEOUT_SECS),
+        )
+        .await?;
+        if video_transcribe_cancelled(&cancel) {
+            return Err("Video transcription cancelled.".to_string());
+        }
+        let data = response
+            .get("data")
+            .cloned()
+            .unwrap_or_else(|| response.clone());
+        let segments = video_parse_transcript_segments(
+            data.get("segments").unwrap_or(&serde_json::Value::Null),
+        );
+        let text = data
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| video_transcript_text(&segments));
+        let language = data
+            .get("language")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let transcript = VideoTranscriptCache {
+            language,
+            text,
+            segments,
+        };
+        video_write_json_cache(&transcript_path, &transcript, "video transcript")?;
+        video_emit_transcribe_progress(
+            &app,
+            &job_id,
+            &rel_path,
+            "done",
+            Some(100.0),
+            true,
+            None,
+        );
+        let _ = app.emit(
+            VIDEO_STORE_CHANGED_EVENT,
+            serde_json::json!({
+                "repoPath": root.to_string_lossy().to_string(),
+                "paths": [rel_path],
+                "changedAtMs": video_now_millis(),
+            }),
+        );
+        Ok::<(), String>(())
+    }
+    .await;
+    if let Err(error) = result {
+        let state = "error";
+        video_emit_transcribe_progress(
+            &app,
+            &job_id,
+            &path,
+            state,
+            Some(100.0),
+            true,
+            Some(&error),
+        );
+    }
+    video_job_registry_remove(&VIDEO_TRANSCRIBE_JOBS, &job_id);
+}
+
+#[tauri::command]
+async fn video_transcribe_start(
+    app: tauri::AppHandle,
+    cloud_state: tauri::State<'_, CloudMcpState>,
+    repo_path: String,
+    path: String,
+) -> Result<VideoJobStartResult, String> {
+    let (job_id, cancel) = video_job_registry_insert(&VIDEO_TRANSCRIBE_JOBS)?;
+    tauri::async_runtime::spawn(video_transcribe_worker(
+        app,
+        cloud_state.inner().clone(),
+        job_id.clone(),
+        repo_path,
+        path,
+        cancel,
+    ));
+    Ok(VideoJobStartResult { job_id })
+}
+
+#[tauri::command]
+fn video_transcribe_cancel(job_id: String) -> Result<(), String> {
+    video_job_registry_cancel(&VIDEO_TRANSCRIBE_JOBS, &job_id)
+}
+
+#[tauri::command]
+async fn video_transcript_get(
+    repo_path: String,
+    path: String,
+) -> Result<VideoTranscriptGetResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
+        video_ensure_media_dirs(&media_root)?;
+        let (_abs, rel_path, kind, metadata) =
+            video_resolve_existing_media_file(&root, &media_root, path.as_str())?;
+        if !matches!(kind, "audio" | "video") {
+            return Err("Transcripts are only available for audio or video media.".to_string());
+        }
+        let transcript_path = video_transcript_cache_path(&media_root, &rel_path, &metadata);
+        match std::fs::read_to_string(&transcript_path) {
+            Ok(raw) => {
+                let cache = serde_json::from_str::<VideoTranscriptCache>(&raw)
+                    .map_err(|error| format!("Unable to parse video transcript cache: {error}"))?;
+                Ok(VideoTranscriptGetResponse {
+                    available: true,
+                    language: cache.language,
+                    text: cache.text,
+                    segments: cache.segments,
+                })
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(VideoTranscriptGetResponse {
+                    available: false,
+                    language: None,
+                    text: String::new(),
+                    segments: Vec::new(),
+                })
+            }
+            Err(error) => Err(format!("Unable to read video transcript cache: {error}")),
+        }
+    })
+    .await
+    .map_err(|error| format!("Video transcript cache worker failed: {error}"))?
+}
+
 #[tauri::command]
 async fn video_frame_extract(
     app: tauri::AppHandle,
@@ -2353,7 +2847,7 @@ async fn video_frame_extract(
     .map_err(|error| format!("Video frame extract worker failed: {error}"))?
 }
 
-const VIDEO_PIPE_HEADER: &str = "#diffforge-video 1\n# syntax: project \"<name>\" <W>x<H> [fps=30] [bg=#000000]\n#   track <video|audio|text> \"<label>\" [muted] [locked]\n#   c <asset-path> at=<ms> dur=<ms> [in=<ms>] [speed=<f>] [gain=<f>] [kf=<ms>:<lvl>,...] [x=] [y=] [scale=] [opacity=]\n#   t \"<text>\" at=<ms> dur=<ms> [size=48] [color=#ffffff] [bg=] [x=0.5] [y=0.85] [align=center] [plain] [font=]\n";
+const VIDEO_PIPE_HEADER: &str = "#diffforge-video 1\n# syntax: project \"<name>\" <W>x<H> [fps=30] [bg=#000000]\n#   track <video|audio|text> \"<label>\" [muted] [locked]\n#   c <asset-path> at=<ms> dur=<ms> [in=<ms>] [speed=<f>] [gain=<f>] [kf=<ms>:<lvl>,...] [x=] [y=] [scale=] [opacity=]\n#   t \"<text>\" at=<ms> dur=<ms> [size=48] [color=#ffffff] [bg=] [outline=#000000] [outlinew=0] [shadow] [upper] [x=0.5] [y=0.85] [align=center] [plain] [font=]\n";
 
 #[derive(Debug, Clone)]
 struct VideoPipeTrackDraft {
@@ -2665,6 +3159,10 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                 let mut font_size = 48.0f64;
                 let mut color = "#ffffff".to_string();
                 let mut background = String::new();
+                let mut outline_color = "#000000".to_string();
+                let mut outline_width = 0.0f64;
+                let mut shadow = false;
+                let mut uppercase = false;
                 let mut x = 0.5f64;
                 let mut y = 0.85f64;
                 let mut align = "center".to_string();
@@ -2675,6 +3173,14 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                         bold = false;
                         continue;
                     }
+                    if token == "shadow" {
+                        shadow = true;
+                        continue;
+                    }
+                    if token == "upper" {
+                        uppercase = true;
+                        continue;
+                    }
                     if let Some((key, value)) = video_pipe_key_value(token) {
                         match key {
                             "at" => timeline_start_ms = Some(video_pipe_parse_u64(value, key, line_number)?),
@@ -2682,6 +3188,8 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                             "size" => font_size = video_pipe_parse_f64(value, key, line_number)?,
                             "color" => color = value.to_string(),
                             "bg" => background = value.to_string(),
+                            "outline" => outline_color = value.to_string(),
+                            "outlinew" => outline_width = video_pipe_parse_f64(value, key, line_number)?,
                             "x" => x = video_pipe_parse_f64(value, key, line_number)?,
                             "y" => y = video_pipe_parse_f64(value, key, line_number)?,
                             "align" => {
@@ -2714,6 +3222,10 @@ fn video_pipe_parse_project(raw: &str) -> Result<serde_json::Value, String> {
                         "fontSize": font_size,
                         "color": color,
                         "background": background,
+                        "outlineColor": outline_color,
+                        "outlineWidth": outline_width,
+                        "shadow": shadow,
+                        "uppercase": uppercase,
                         "x": x,
                         "y": y,
                         "align": align,
@@ -2908,6 +3420,18 @@ fn video_pipe_serialize_project(project: &serde_json::Value) -> Result<String, S
                     &video_json_string(style, "background", ""),
                     "",
                 );
+                let outline_color = video_json_string(style, "outlineColor", "#000000");
+                let outline_width = video_json_f64(style, "outlineWidth", 0.0).max(0.0);
+                if outline_width > 0.0 || outline_color != "#000000" {
+                    video_pipe_push_string_key(&mut line, "outline", &outline_color, "");
+                }
+                video_pipe_push_f64_key(&mut line, "outlinew", outline_width, 0.0);
+                if style.get("shadow").and_then(|value| value.as_bool()).unwrap_or(false) {
+                    line.push_str(" shadow");
+                }
+                if style.get("uppercase").and_then(|value| value.as_bool()).unwrap_or(false) {
+                    line.push_str(" upper");
+                }
                 video_pipe_push_f64_key(&mut line, "x", video_json_f64(style, "x", 0.5), 0.5);
                 video_pipe_push_f64_key(&mut line, "y", video_json_f64(style, "y", 0.85), 0.85);
                 let align = video_json_string(style, "align", "center");
@@ -3273,6 +3797,13 @@ fn video_collect_export_clips(
                         .and_then(|value| value.as_str())
                         .map(|value| value.to_string())
                         .filter(|value| !value.trim().is_empty()),
+                    outline_color: video_json_string(style, "outlineColor", "#000000"),
+                    outline_width: video_json_f64(style, "outlineWidth", 0.0).clamp(0.0, 64.0),
+                    shadow: style.get("shadow").and_then(|value| value.as_bool()).unwrap_or(false),
+                    uppercase: style
+                        .get("uppercase")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false),
                     x: video_json_f64(style, "x", 0.5).clamp(0.0, 1.0),
                     y: video_json_f64(style, "y", 0.5).clamp(0.0, 1.0),
                 });
@@ -3501,10 +4032,15 @@ fn video_build_export_filter(
     }
     for (index, clip) in text_clips.iter().enumerate() {
         let output = format!("txt{index}");
+        let text = if clip.uppercase {
+            clip.text.to_uppercase()
+        } else {
+            clip.text.clone()
+        };
         let mut draw = format!(
             "[{}]drawtext=text='{}':fontsize={}:fontcolor={}:x=(w-text_w)*{}:y=(h-text_h)*{}:enable='between(t,{},{})'",
             previous,
-            video_escape_drawtext(&clip.text),
+            video_escape_drawtext(&text),
             video_ffmpeg_number(clip.font_size),
             video_escape_filter_color(&clip.color, "#ffffff"),
             video_ffmpeg_number(clip.x),
@@ -3512,6 +4048,16 @@ fn video_build_export_filter(
             video_ffmpeg_seconds(clip.timeline_start_ms),
             video_ffmpeg_seconds(clip.timeline_start_ms.saturating_add(clip.duration_ms)),
         );
+        if clip.outline_width > 0.0 {
+            draw.push_str(&format!(
+                ":borderw={}:bordercolor={}",
+                video_ffmpeg_number(clip.outline_width),
+                video_escape_filter_color(&clip.outline_color, "#000000")
+            ));
+        }
+        if clip.shadow {
+            draw.push_str(":shadowcolor=black@0.6:shadowx=2:shadowy=2");
+        }
         if let Some(background) = clip
             .background
             .as_deref()
@@ -5317,6 +5863,10 @@ mod video_pipe_tests {
                                 "fontSize": 48,
                                 "color": "#ffffff",
                                 "background": "",
+                                "outlineColor": "#000000",
+                                "outlineWidth": 0,
+                                "shadow": false,
+                                "uppercase": false,
                                 "x": 0.5,
                                 "y": 0.85,
                                 "align": "center",
@@ -5333,6 +5883,10 @@ mod video_pipe_tests {
                                 "fontSize": 63.5,
                                 "color": "#ffeeaa",
                                 "background": "#000000cc",
+                                "outlineColor": "#111111",
+                                "outlineWidth": 4,
+                                "shadow": true,
+                                "uppercase": true,
                                 "x": 0.25,
                                 "y": 0.75,
                                 "align": "left",
@@ -5356,7 +5910,7 @@ mod video_pipe_tests {
         assert!(pipe.contains("track video \"Video Main\" locked"));
         assert!(pipe.contains("track audio \"VO Bus\" muted"));
         assert!(pipe.contains("c \"media/assets/clip one.mp4\" at=500 dur=3500 in=250 speed=1.25 gain=0.8 kf=0:0,900:0.75,1800:1 x=0.125 y=-0.25 scale=1.333 opacity=0.875"));
-        assert!(pipe.contains("t \"Hello \\\"pipe\\\"\\nLine two \\\\ ok\" at=1200 dur=2200 size=63.5 color=#ffeeaa bg=#000000cc x=0.25 y=0.75 align=left plain font=\"Open Sans\""));
+        assert!(pipe.contains("t \"Hello \\\"pipe\\\"\\nLine two \\\\ ok\" at=1200 dur=2200 size=63.5 color=#ffeeaa bg=#000000cc outline=#111111 outlinew=4 shadow upper x=0.25 y=0.75 align=left plain font=\"Open Sans\""));
         assert!(pipe.contains("t \"Default title\" at=7000 dur=900\n"));
         assert!(!pipe.contains("updatedAtMs"));
         assert!(!pipe.contains("sourceInMs"));
@@ -5411,6 +5965,10 @@ t "Hello" at=10 dur=500
         assert_eq!(style["fontSize"], 48.0);
         assert_eq!(style["color"], "#ffffff");
         assert_eq!(style["background"], "");
+        assert_eq!(style["outlineColor"], "#000000");
+        assert_eq!(style["outlineWidth"], 0.0);
+        assert_eq!(style["shadow"], false);
+        assert_eq!(style["uppercase"], false);
         assert_eq!(style["x"], 0.5);
         assert_eq!(style["y"], 0.85);
         assert_eq!(style["align"], "center");

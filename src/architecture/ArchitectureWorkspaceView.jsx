@@ -4607,7 +4607,7 @@ function architectureAgentTaskText({
     identity.graphFilePath ? `Graph file: ${identity.graphFilePath}` : identity.graphId ? `Graph id: ${identity.graphId}` : "",
     repoPath ? `Repo: ${repoPath}` : "",
     "",
-    "Use coordination-kernel.architecture_context first, then update the existing .agents/architectures/graphs/*.arch DSL file for this graph. Keep each edit syntactically valid so the Architecture tab can hot-reload the graph as nodes, groups, and edges are added.",
+    "Update the selected .arch graph file for this graph. Keep each edit syntactically valid so the Architecture tab can hot-reload the graph as nodes, groups, and edges are added.",
     "Treat .arch as a general system graph: one graph may contain connected or disconnected groups for architecture, api-pathway, api-corridor, data-flow, control-graph, state-machine, dependency-graph, deployment, runtime, or subsystem slices.",
     "Use api-corridor overlay containers only for important ordered API procedures such as auth, checkout, webhooks, task dispatch, uploads, token refresh, or async job lifecycles. API corridors explain runtime order across existing nodes; they are not replacement topology and not line-by-line source narration.",
     "Write corridors as `OAuth Login [intent: api-corridor, display: overlay, from: Browser, to: API Server, anchor: Auth API, orient: shortest-path] { Browser > API Server: GET /auth/start [step: 1, role: request, method: GET, path: /auth/start] }`. Corridor message endpoints should reference existing graph nodes or groups.",

@@ -252,7 +252,7 @@ function jobTone(job) {
 // AI generation: capability-driven form (fields appear only when the chosen
 // provider/mode uses them), thumbnail pickers for start frames and LoRA
 // training sets, streaming job progress, inline key management.
-export default function GeneratePanel({ assets = [], onGenerated, repoPath = "" }) {
+export default function GeneratePanel({ assets = [], onGenerated, onInsertAsset, repoPath = "" }) {
   const [providerId, setProviderId] = useState(VIDEO_PROVIDERS[0].id);
   const provider = getVideoProvider(providerId) || VIDEO_PROVIDERS[0];
   const capabilities = provider.capabilities || {};
@@ -747,6 +747,14 @@ export default function GeneratePanel({ assets = [], onGenerated, repoPath = "" 
                 >
                   Cancel
                 </VideoSecondaryButton>
+              </InlineRow>
+            ) : job.kind === "generate" && !job.error && Array.isArray(job.outputPaths) && job.outputPaths.length ? (
+              <InlineRow>
+                {job.outputPaths.map((path) => (
+                  <VideoPaneButton key={path} onClick={() => onInsertAsset?.(path)} type="button">
+                    + Insert at playhead
+                  </VideoPaneButton>
+                ))}
               </InlineRow>
             ) : null}
           </JobRow>

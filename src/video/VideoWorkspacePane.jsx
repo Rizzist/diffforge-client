@@ -18,7 +18,7 @@ import {
   VIDEO_STORE_CHANGED_EVENT,
   VIDEO_TOOLS_INSTALL_PROGRESS_EVENT,
 } from "./videoPanelBridge.js";
-import { addMediaClip, normalizeProject } from "./videoEditorModel.js";
+import { addMediaClip, clipsInRange, formatTimecode, normalizeProject, updateClip } from "./videoEditorModel.js";
 import {
   VideoCard,
   VideoErrorText,
@@ -279,7 +279,9 @@ export default function VideoWorkspacePane({
   const [mediaError, setMediaError] = useState("");
   const [paneError, setPaneError] = useState("");
   const [draftName, setDraftName] = useState("");
-  const [selectedClipId, setSelectedClipId] = useState("");
+  const [selectedClipIds, setSelectedClipIds] = useState([]);
+  const [ranges, setRanges] = useState([]);
+  const [selectionContext, setSelectionContext] = useState("");
   const [selectedAssetPath, setSelectedAssetPath] = useState("");
   const [playheadMs, setPlayheadMs] = useState(0);
   const [playing, setPlaying] = useState(false);
@@ -368,7 +370,7 @@ export default function VideoWorkspacePane({
           setProject(normalizeProject(result?.project));
           setProjectPath(String(result?.path || path));
           setPaneError("");
-          setSelectedClipId("");
+          setSelectedClipIds([]);
           setPlayheadMs(0);
           setPlaying(false);
           setView("editor");
@@ -425,8 +427,10 @@ export default function VideoWorkspacePane({
   }, [projectPath, storageKey]);
 
   useEffect(() => {
-    onProjectChange?.(projectPath ? { path: projectPath, name: project?.name || "" } : null);
-  }, [onProjectChange, project?.name, projectPath]);
+    onProjectChange?.(
+      projectPath ? { path: projectPath, name: project?.name || "", selectionContext } : null,
+    );
+  }, [onProjectChange, project?.name, projectPath, selectionContext]);
 
   // Install progress stream.
   useEffect(() => {
@@ -737,7 +741,7 @@ export default function VideoWorkspacePane({
       }
       const result = addMediaClip(projectStateRef.current, asset, { timelineStartMs: playheadMs });
       handleProjectChange(result.project, { transient: false });
-      setSelectedClipId(result.clipId);
+      setSelectedClipIds([result.clipId]);
     },
     [handleProjectChange, playheadMs],
   );
@@ -749,6 +753,105 @@ export default function VideoWorkspacePane({
     }
     return map;
   }, [assets]);
+
+  // Preview text drag → clip style updates (transient while dragging).
+  const handleUpdateTextClip = useCallback(
+    (clipId, patch, { transient = false } = {}) => {
+      if (!projectStateRef.current) {
+        return;
+      }
+      handleProjectChange(updateClip(projectStateRef.current, clipId, patch), { transient });
+    },
+    [handleProjectChange],
+  );
+
+  // Insert a finished generation (or any asset path) at the playhead.
+  const insertAssetPath = useCallback(
+    (path) => {
+      const clean = String(path || "").trim();
+      if (!clean || !projectStateRef.current) {
+        return;
+      }
+      const known = assetsByPath[clean];
+      const kind = known?.kind
+        || (/\.(mp3|wav|m4a|aac|flac|ogg|opus)$/i.test(clean)
+          ? "audio"
+          : /\.(png|jpe?g|webp|gif|bmp|tiff)$/i.test(clean)
+            ? "image"
+            : "video");
+      const result = addMediaClip(
+        projectStateRef.current,
+        known || { path: clean, kind },
+        { timelineStartMs: playheadMs },
+      );
+      handleProjectChange(result.project, { transient: false });
+      setSelectedClipIds([result.clipId]);
+    },
+    [assetsByPath, handleProjectChange, playheadMs],
+  );
+
+  // Range-scoped AI context: what's selected, which clips overlap, and the
+  // transcript slices inside each range. Rides along on every agent prompt
+  // sent from this pane (the TerminalView wrapper appends it).
+  const transcriptCacheRef = useRef(new Map());
+  useEffect(() => {
+    if (!ranges.length || !project) {
+      setSelectionContext("");
+      return undefined;
+    }
+    let cancelled = false;
+    const build = async () => {
+      const lines = ["Selected timeline ranges (scope any edits to these):"];
+      for (const range of ranges) {
+        const overlapping = clipsInRange(project, range.startMs, range.endMs);
+        const clipBits = [];
+        for (const { track, clip } of overlapping) {
+          if (track.kind === "text") {
+            clipBits.push(`text "${String(clip.text || "").slice(0, 60)}" on ${track.label}`);
+            continue;
+          }
+          let bit = `${clip.assetPath} on ${track.label} (${formatTimecode(clip.timelineStartMs)}–${formatTimecode(clip.timelineStartMs + clip.durationMs)})`;
+          const asset = assetsByPath[clip.assetPath];
+          if (asset?.hasTranscript) {
+            let transcript = transcriptCacheRef.current.get(clip.assetPath);
+            if (transcript === undefined) {
+              try {
+                transcript = await invoke("video_transcript_get", { repoPath, path: clip.assetPath });
+              } catch {
+                transcript = null;
+              }
+              transcriptCacheRef.current.set(clip.assetPath, transcript);
+            }
+            const segments = Array.isArray(transcript?.segments) ? transcript.segments : [];
+            if (segments.length) {
+              const speed = clip.speed || 1;
+              const sourceFrom = (clip.sourceInMs || 0) + Math.max(0, range.startMs - clip.timelineStartMs) * speed;
+              const sourceTo = (clip.sourceInMs || 0) + Math.max(0, range.endMs - clip.timelineStartMs) * speed;
+              const excerpt = segments
+                .filter((segment) => segment.startMs < sourceTo && segment.endMs > sourceFrom)
+                .map((segment) => segment.text)
+                .join(" ")
+                .slice(0, 400);
+              if (excerpt) {
+                bit += ` — transcript: "${excerpt}"`;
+              }
+            }
+          }
+          clipBits.push(bit);
+        }
+        lines.push(
+          `- ${formatTimecode(range.startMs)}–${formatTimecode(range.endMs)}: ${clipBits.length ? clipBits.join("; ") : "empty"}`,
+        );
+      }
+      if (!cancelled) {
+        setSelectionContext(lines.join("\n"));
+      }
+    };
+    void build();
+    return () => {
+      cancelled = true;
+    };
+  }, [assetsByPath, project, ranges, repoPath]);
 
   const toggleSidePanel = useCallback((panel) => {
     setSidePanel((current) => (current === panel ? "" : panel));
@@ -773,6 +876,7 @@ export default function VideoWorkspacePane({
         mediaRootAbs={mediaRootAbs}
         onSeek={(ms) => setPlayheadMs(Math.max(0, ms))}
         onTogglePlay={(next) => setPlaying(Boolean(next))}
+        onUpdateTextClip={handleUpdateTextClip}
         playheadMs={playheadMs}
         playing={playing}
         project={project}
@@ -787,20 +891,22 @@ export default function VideoWorkspacePane({
       canRedo={canRedo}
       canUndo={canUndo}
       onChange={handleProjectChange}
+      onRangesChange={setRanges}
       onRedo={redo}
       onSeek={(ms) => setPlayheadMs(Math.max(0, ms))}
-      onSelectClip={setSelectedClipId}
+      onSelectClips={setSelectedClipIds}
       onUndo={undo}
       paneToken={paneId || "video-pane"}
       playheadMs={playheadMs}
       project={project}
+      ranges={ranges}
       repoPath={repoPath}
-      selectedClipId={selectedClipId}
+      selectedClipIds={selectedClipIds}
     />
   );
 
   const sidePanelContent = sidePanel === "generate" ? (
-    <GeneratePanel assets={assets} onGenerated={refreshAssets} repoPath={repoPath} />
+    <GeneratePanel assets={assets} onGenerated={refreshAssets} onInsertAsset={insertAssetPath} repoPath={repoPath} />
   ) : sidePanel === "export" ? (
     <ExportPanel ffmpegReady={ffmpegReady} project={project} projectPath={projectPath} repoPath={repoPath} />
   ) : null;

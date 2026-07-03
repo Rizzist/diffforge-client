@@ -22389,11 +22389,12 @@ function WorkspaceVideoGridPane({
     const contextText = project?.path
       ? `Context: video project "${project.name || "Video"}" at ${project.path} (Diff Forge video pipe format — the file's # header documents the line syntax; media assets live under media/assets/).`
       : "Context: Diff Forge video editor pane (projects live under media/projects/*.video.pipe; the file's # header documents the syntax).";
+    const selectionText = String(project?.selectionContext || "").trim();
     return onSubmitPanelAgentPrompt?.({
       ...payload,
-      text: `${payload?.text || ""}\n\n${contextText}`,
+      text: `${payload?.text || ""}\n\n${contextText}${selectionText ? `\n\n${selectionText}` : ""}`,
     });
-  }, [onSubmitPanelAgentPrompt, project?.name, project?.path]);
+  }, [onSubmitPanelAgentPrompt, project?.name, project?.path, project?.selectionContext]);
 
   return (
     <TerminalVideoPanelShell

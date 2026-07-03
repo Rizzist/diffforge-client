@@ -130,9 +130,9 @@ impl TerminalCoordinationContext {
         let direct_write_policy = if self.enforcement_mode == "bounded_direct_edit" {
             "allowed_for_bounded_direct_edit"
         } else if self.enforcement_mode == "general_worker" {
-            "task_scoped_except_architecture_graph_sources"
+            "task_scoped"
         } else if self.enforcement_mode == "worktree_required" {
-            "deny_root_except_architecture_graph_sources_use_agent_branch_root"
+            "use_agent_branch_root"
         } else {
             "not_a_file_editing_authority"
         };
@@ -334,9 +334,6 @@ impl TerminalCoordinationContext {
         let workspace = self.workspace_id.as_deref().unwrap_or("none");
         let slot = self.slot_key.as_deref().unwrap_or("none");
         let worktree = self.worktree_path.as_deref().unwrap_or(&self.write_root);
-        let architecture_root = self.architecture_root_path();
-        let architecture_guide = self.architecture_guide_path();
-        let architecture_icon_reference = self.architecture_icon_reference_path();
         let branch = self
             .slot_key
             .as_deref()
@@ -345,7 +342,7 @@ impl TerminalCoordinationContext {
         let mut banner = if self.enforcement_mode == "worktree_required" {
             format!(
             "COORDINATION ENABLED\nProject root: {}\nAgent branch: {}\nAgent branch root: {}\nMerge target root: {}\n\
-	Merge integration branch: diff-forge/integration\nShell cwd opens in the visible project root, not inside .agents/worktrees. All filesystem paths are editable from this terminal; Diff Forge coordination no longer gates file IO by worktree or lease.\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nMCP config: {}\nArchitecture root: {}\nArchitecture guide: {}\nArchitecture icon reference: {}\nThis slot reuses the same MCP config and branch root across sessions.\nCoordinator MCP: always on\nCloud MCP lifecycle: task/history sync disabled; todos remain the shared cloud work state\nArchitecture graphs are account-global general system graph artifacts. For architecture/diagram/system-map/API pathway/API corridor/data-flow/control-graph/state-machine/dependency-graph/deployment/run-target work, call coordination-kernel.architecture_context for paths and semantic rules, use coordination-kernel.architecture_list to inspect existing graphs, then edit files under DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT (architecture_context.globalGraphsRoot) directly with the eraser-like DSL so the Architecture tab can reload file changes live. Preserve group intent, node role/lifecycle/source/status, edge role/condition/event/criticality props, api-corridor overlay procedure steps, and one-line run targets. Use api-corridor overlay containers only for important ordered API procedures, referencing existing nodes/groups. Use run lines only for graph-level Architecture-tab operations; they describe intent and guardrails, not shell commands. Use compact actor nodes without descriptions for humans, users, admins, agents, bots, browsers, and CLI clients, for example User [icon: users, role: actor, display: compact]. Do not create ARCHITECTURE.md, docs/architecture.md, Draw.io, SVG, or PNG architecture artifacts unless the user explicitly asks for those formats. Prefer exact provider/product/framework icon aliases such as appwrite, github, postgres, redis, cockroachdb, react, or vercel when the node/container title names a real technology; use semantic aliases such as api, database, worker, or service only when no exact icon fits.\nGit writes are not file-gated by Diff Forge; use start_task/checkpoint/complete_task for coordination visibility when useful.\nFor architecture graph-only work, do not call start_task, acquire_lease, checkpoint, or submit_patch; edit only files under DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT directly and report the graph path when done.\nRead-only inspection is free: open, search, and inspect files normally from the visible project root without calling start_task or checkpoint.\nBefore the first non-architecture graph edit:\n1. call coordination-kernel.start_task only when you are ready to edit, with a short plan for the immediate change. Rust creates or resumes the local task immediately and returns the current task_id and branch root without Cloud task/history sync.\n2. Filesystem edits are not lease-gated. Edit the requested path directly; use acquire_lease only if a user explicitly asks for lease bookkeeping.\n3. Inspect from the visible project root when useful, but write to the path that matches the user's request and current repo state.\n4. when Rust resumes a parked task, inspect the refreshed target file/context first, then call start_task again with your continuation edit plan and continue.\n5. call checkpoint with that task_id only while a task is active and after meaningful edit progress; do not checkpoint reconnaissance.\n6. submit_patch with that task_id when done. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe.\nFor autonomous intent-resolution tasks: treat current integration as source of truth, preserve every compatible task intent without asking the user, submit_patch, and never apply_merge.\nDo not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path.\n",
+	Merge integration branch: diff-forge/integration\nShell cwd opens in the visible project root, not inside .agents/worktrees. All filesystem paths are editable from this terminal; Diff Forge coordination no longer gates file IO by worktree or lease.\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nMCP config: {}\nThis slot reuses the same MCP config and branch root across sessions.\nCoordinator MCP: always on\nCloud MCP lifecycle: task/history sync disabled; todos remain the shared cloud work state\nGit writes are not file-gated by Diff Forge; use start_task/checkpoint/complete_task for coordination visibility when useful.\nRead-only inspection is free: open, search, and inspect files normally from the visible project root without calling start_task or checkpoint.\nBefore the first edit:\n1. call coordination-kernel.start_task only when you are ready to edit, with a short plan for the immediate change. Rust creates or resumes the local task immediately and returns the current task_id and branch root without Cloud task/history sync.\n2. Filesystem edits are not lease-gated. Edit the requested path directly; use acquire_lease only if a user explicitly asks for lease bookkeeping.\n3. Inspect from the visible project root when useful, but write to the path that matches the user's request and current repo state.\n4. when Rust resumes a parked task, inspect the refreshed target file/context first, then call start_task again with your continuation edit plan and continue.\n5. call checkpoint with that task_id only while a task is active and after meaningful edit progress; do not checkpoint reconnaissance.\n6. submit_patch with that task_id when done. A passing submit_patch automatically queues and applies the accepted patch as a local integration-branch commit when safe.\nFor autonomous intent-resolution tasks: treat current integration as source of truth, preserve every compatible task intent without asking the user, submit_patch, and never apply_merge.\nDo not call request_merge or apply_merge directly; submit_patch owns the automatic accept/apply path.\n",
             self.repo_path,
             branch,
             worktree,
@@ -356,10 +353,7 @@ impl TerminalCoordinationContext {
             workspace,
             self.objective_key,
             task,
-            self.mcp_config_path,
-            architecture_root,
-            architecture_guide,
-            architecture_icon_reference
+            self.mcp_config_path
         )
         } else {
             let authority_note = match self.enforcement_mode.as_str() {
@@ -370,7 +364,7 @@ impl TerminalCoordinationContext {
                 _ => "This terminal is coordinated for task tracking only. It has no patch submission authority.",
             };
             format!(
-                "COORDINATION ENABLED\nProject root: {}\nCoordination root: {}\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nMCP config: {}\nArchitecture root: {}\nArchitecture guide: {}\nArchitecture icon reference: {}\nCoordinator MCP: always on\nCloud MCP lifecycle: task/history sync disabled; todos remain the shared cloud work state\nMode: {}\nFile authority: {}\nCompletion: complete_task\n{}\nArchitecture graphs are account-global general system graph artifacts. For architecture/diagram/system-map/API pathway/API corridor/data-flow/control-graph/state-machine/dependency-graph/deployment/run-target work, call coordination-kernel.architecture_context for paths and semantic rules, use coordination-kernel.architecture_list to inspect existing graphs, then edit files under DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT (architecture_context.globalGraphsRoot) directly with the eraser-like DSL so the Architecture tab can reload file changes live. Preserve group intent, node role/lifecycle/source/status, edge role/condition/event/criticality props, api-corridor overlay procedure steps, and one-line run targets. Use api-corridor overlay containers only for important ordered API procedures, referencing existing nodes/groups. Use run lines only for graph-level Architecture-tab operations; they describe intent and guardrails, not shell commands. Use compact actor nodes without descriptions for humans, users, admins, agents, bots, browsers, and CLI clients, for example User [icon: users, role: actor, display: compact]. Do not create ARCHITECTURE.md, docs/architecture.md, Draw.io, SVG, or PNG architecture artifacts unless the user explicitly asks for those formats. Prefer exact provider/product/framework icon aliases such as appwrite, github, postgres, redis, cockroachdb, react, or vercel when the node/container title names a real technology; use semantic aliases such as api, database, worker, or service only when no exact icon fits.\nRead-only inspection is free: open, search, and inspect files normally without calling start_task or checkpoint. Architecture graph files under DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT can be edited directly so live preview works.\nFor architecture graph-only work, do not call start_task, acquire_lease, checkpoint, or submit_patch; edit only files under DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT directly and report the graph path when done.\nWhen non-architecture graph work begins, call coordination-kernel.start_task with a short plan. Local file edits are not lease-gated; edit the path that matches the user's request and use coordination calls for activity state. Checkpoint only meaningful active progress. Finish with submit_patch when an isolated worktree is assigned, otherwise complete_task.\n",
+                "COORDINATION ENABLED\nProject root: {}\nCoordination root: {}\nAgent: {}\nSlot: {}\nSession: {}\nWorkspace: {}\nObjective Key: {}\nTask: {}\nMCP config: {}\nCoordinator MCP: always on\nCloud MCP lifecycle: task/history sync disabled; todos remain the shared cloud work state\nMode: {}\nFile authority: {}\nCompletion: complete_task\n{}\nRead-only inspection is free: open, search, and inspect files normally without calling start_task or checkpoint.\nWhen work begins, call coordination-kernel.start_task with a short plan. Local file edits are not lease-gated; edit the path that matches the user's request and use coordination calls for activity state. Checkpoint only meaningful active progress. Finish with submit_patch when an isolated worktree is assigned, otherwise complete_task.\n",
                 self.repo_path,
                 self.write_root,
                 self.agent_id,
@@ -380,9 +374,6 @@ impl TerminalCoordinationContext {
                 self.objective_key,
                 task,
                 self.mcp_config_path,
-                architecture_root,
-                architecture_guide,
-                architecture_icon_reference,
                 self.session_mode(),
                 self.file_authority(),
                 authority_note,

@@ -5,7 +5,10 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { Add } from "@styled-icons/material-rounded/Add";
 import { Close } from "@styled-icons/material-rounded/Close";
+import { Subtitles } from "@styled-icons/material-rounded/Subtitles";
+import { listen } from "@tauri-apps/api/event";
 import { emitVideoAssetDrag } from "./videoDragEvents.js";
+import { VIDEO_TRANSCRIBE_PROGRESS_EVENT } from "./videoPanelBridge.js";
 import { VideoErrorText, VideoHint, VideoIconButton, VideoSecondaryButton } from "./videoStyles.js";
 import { formatTimecode } from "./videoEditorModel.js";
 
@@ -293,7 +296,70 @@ export default function MediaBin({
   const [importError, setImportError] = useState("");
   const [filter, setFilter] = useState("all");
   const [drag, setDrag] = useState(null); // { asset, x, y }
+  const [transcribing, setTranscribing] = useState({}); // path → state string
   const dragStateRef = useRef(null);
+
+  // Transcription: extract audio locally, transcribe in the cloud (Whisper
+  // via Deepgram). Progress arrives as events keyed by asset path.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(VIDEO_TRANSCRIBE_PROGRESS_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const path = String(payload.path || "").trim();
+      if (!path) {
+        return;
+      }
+      setTranscribing((current) => {
+        const next = { ...current };
+        if (payload.done || payload.error) {
+          delete next[path];
+        } else {
+          next[path] = String(payload.state || "working");
+        }
+        return next;
+      });
+      if (payload.done && !payload.error) {
+        onImported?.(); // refresh so hasTranscript badges appear
+      }
+      if (payload.error) {
+        setImportError(String(payload.error));
+      }
+    })
+      .then((next) => {
+        if (disposed) {
+          next();
+        } else {
+          unlisten = next;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [onImported]);
+
+  const startTranscribe = useCallback(
+    (asset) => {
+      if (!repoPath || !asset?.path || transcribing[asset.path]) {
+        return;
+      }
+      setTranscribing((current) => ({ ...current, [asset.path]: "starting" }));
+      invoke("video_transcribe_start", { repoPath, path: asset.path }).catch((err) => {
+        setTranscribing((current) => {
+          const next = { ...current };
+          delete next[asset.path];
+          return next;
+        });
+        setImportError(String(err));
+      });
+    },
+    [repoPath, transcribing],
+  );
 
   const visibleAssets = useMemo(() => {
     if (filter === "all") {
@@ -496,7 +562,10 @@ export default function MediaBin({
                 ) : (
                   <AssetGlyph aria-hidden>{assetGlyph(asset.kind)}</AssetGlyph>
                 )}
-                <AssetKind>{asset.folder === "generated" ? "AI" : asset.kind}</AssetKind>
+                <AssetKind>
+                  {asset.folder === "generated" ? "AI" : asset.kind}
+                  {transcribing[asset.path] ? " · …" : asset.hasTranscript ? " · T" : ""}
+                </AssetKind>
                 {Number.isFinite(Number(asset.durationMs)) && asset.durationMs > 0 ? (
                   <AssetDuration>{formatTimecode(asset.durationMs)}</AssetDuration>
                 ) : null}
@@ -512,6 +581,24 @@ export default function MediaBin({
                   >
                     <Add aria-hidden="true" />
                   </HoverButton>
+                  {asset.kind !== "image" ? (
+                    <HoverButton
+                      aria-label={`Transcribe ${asset.name}`}
+                      disabled={Boolean(transcribing[asset.path])}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        startTranscribe(asset);
+                      }}
+                      title={
+                        asset.hasTranscript
+                          ? "Re-transcribe (Whisper via cloud)"
+                          : "Transcribe audio (Whisper via cloud) — lets AI agents understand this media"
+                      }
+                      type="button"
+                    >
+                      <Subtitles aria-hidden="true" />
+                    </HoverButton>
+                  ) : null}
                   <HoverButton
                     aria-label={`Delete ${asset.name}`}
                     data-danger="true"
