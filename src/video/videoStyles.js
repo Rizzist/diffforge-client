@@ -306,8 +306,9 @@ export const VideoSplitSeparatorV = styled.div`
 // for a split).
 export const VideoSheet = styled.div`
   position: absolute;
-  inset: 28px 0 0 0;
-  z-index: 10;
+  inset: 0;
+  /* Above local editor overlays (timeline inspector 12, add-track menu 20). */
+  z-index: 30;
   display: flex;
   flex-direction: column;
   background: rgba(3, 5, 8, 0.97);

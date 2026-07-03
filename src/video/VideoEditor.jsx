@@ -228,6 +228,17 @@ export default function VideoEditor({
   const [draggingTextId, setDraggingTextId] = useState("");
   const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
   const [capturingFrame, setCapturingFrame] = useState(false);
+  // Bumped every time the visual layer node (re)mounts. The media-sync effect
+  // depends on it: without this, an attach refused because the layer didn't
+  // exist yet (stage still measuring 0 on project open) or because the layer
+  // was re-keyed to a new clip is never retried — a stuck black preview.
+  const [visualLayerNonce, setVisualLayerNonce] = useState(0);
+  const setVisualLayerNode = useCallback((element) => {
+    visualLayerRef.current = element;
+    if (element) {
+      setVisualLayerNonce((nonce) => nonce + 1);
+    }
+  }, []);
 
   const durationMs = useMemo(() => projectDurationMs(project), [project]);
   const active = useMemo(() => clipsAtMs(project, playheadMs), [playheadMs, project]);
@@ -397,6 +408,7 @@ export default function VideoEditor({
           element,
           lastCorrectionAtMs: 0,
           lastVolume: -1,
+          pendingSeekMs: -1,
           preloadKey: "",
           src: "",
           tag,
@@ -410,9 +422,12 @@ export default function VideoEditor({
       entry.element.preload = "auto";
       entry.element.playbackRate = clip.speed || 1;
       const src = assetSrc(clip.assetPath);
-      if (entry.src !== src) {
+      if (entry.src !== src && src) {
+        // Never assign an empty src (mediaRoot still resolving on project
+        // open) — it wedges the element until the next src swap.
         entry.src = src;
         entry.preloadKey = "";
+        entry.pendingSeekMs = -1;
         entry.element.src = src;
       }
       return entry;
@@ -429,7 +444,7 @@ export default function VideoEditor({
         || renderedVisualIsImageRef.current
         || renderedVisualIdRef.current !== entry.clip.id
       ) {
-        return;
+        return false;
       }
       for (const other of mediaPoolRef.current.values()) {
         if (other !== entry && other.element?.parentElement === host) {
@@ -441,6 +456,7 @@ export default function VideoEditor({
       }
       entry.element.style.display = "";
       entry.visible = true;
+      return true;
     },
     [detachEntry],
   );
@@ -450,8 +466,16 @@ export default function VideoEditor({
     try {
       // Redundant re-syncs (effect restarts, repeated seekActive calls) must
       // be no-ops: assigning currentTime — even to ~the same value — makes
-      // some decoders hiccup audibly.
-      if (Math.abs(entry.element.currentTime * 1000 - sourceMs) < 60) {
+      // some decoders hiccup audibly. Exception: an element that has loaded
+      // nothing yet (fresh src) needs one assignment regardless — the seek is
+      // what makes a paused element decode and paint its first frame — but
+      // repeats of the SAME pre-metadata seek are deduped via pendingSeekMs.
+      if (entry.element.readyState === 0) {
+        if (entry.pendingSeekMs === sourceMs) {
+          return;
+        }
+        entry.pendingSeekMs = sourceMs;
+      } else if (Math.abs(entry.element.currentTime * 1000 - sourceMs) < 60) {
         return;
       }
       entry.element.currentTime = sourceMs / 1000;
@@ -523,18 +547,29 @@ export default function VideoEditor({
 
       const wantedIds = new Set();
       const activeEntries = [];
+      let visibleEntry = null;
       for (const item of activeItems) {
         wantedIds.add(item.clip.id);
         const entry = ensureEntry(item.track, item.clip);
         if (item.visible) {
-          attachVisualEntry(entry);
-        } else {
-          detachEntry(entry);
+          visibleEntry = entry;
         }
         if (seekActive) {
           seekEntryToTimeline(entry, timelineMs);
         }
         activeEntries.push({ entry, item });
+      }
+      // Attach first, detach second: if the successor can't attach yet (the
+      // layer node re-keys on the next UI sync), keep whatever is currently
+      // on screen — a hidden gap here is the "preview flashes black" bug.
+      const visualAttached = visibleEntry ? attachVisualEntry(visibleEntry) : false;
+      const visualHost = visualLayerRef.current;
+      const keepCurrentOccupant = (entry) =>
+        !visualAttached && visualHost && entry.element?.parentElement === visualHost;
+      for (const { entry, item } of activeEntries) {
+        if (!item.visible && !keepCurrentOccupant(entry)) {
+          detachEntry(entry);
+        }
       }
 
       const primary =
@@ -592,7 +627,19 @@ export default function VideoEditor({
         }
         const endedRecently = clipEndMs(entry.clip) <= timelineMs && clipEndMs(entry.clip) >= timelineMs - EVICT_BEHIND_MS;
         if (endedRecently) {
-          detachEntry(entry);
+          if (!keepCurrentOccupant(entry)) {
+            detachEntry(entry);
+          }
+          if (!entry.element.paused) {
+            entry.element.pause();
+          }
+          continue;
+        }
+        if (keepCurrentOccupant(entry)) {
+          // Far-seek with the successor not attachable yet: hold the last
+          // frame one more sync instead of blanking; it's removed next pass.
+          // Visual fallback only — it must not keep sounding.
+          entry.element.muted = true;
           if (!entry.element.paused) {
             entry.element.pause();
           }
@@ -677,7 +724,7 @@ export default function VideoEditor({
     const currentMs = playback?.getMs?.() ?? playheadMs;
     syncMediaForTime(currentMs, { now: performance.now(), playing, seekActive: !playing });
     applyPreviewStyles(currentMs);
-  }, [applyPreviewStyles, playback, playing, playheadMs, syncMediaForTime, visual?.clip.id, visualIsImage]);
+  }, [applyPreviewStyles, playback, playing, playheadMs, syncMediaForTime, visual?.clip.id, visualIsImage, visualLayerNonce]);
 
   // Playback clock: use the active media element as master. The rAF loop never
   // drift-seeks that primary element; seeks happen on explicit seek, play
@@ -826,7 +873,7 @@ export default function VideoEditor({
             {visual ? (
               <PreviewLayer
                 key={`${visualIsImage ? "image" : "video"}-${visual.clip.id}`}
-                ref={visualLayerRef}
+                ref={setVisualLayerNode}
                 style={visualLayerStyle}
               >
                 {visualIsImage ? (

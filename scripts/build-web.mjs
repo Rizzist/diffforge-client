@@ -14,6 +14,35 @@ function sleep(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+function readBuildLockOwner() {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(lockDir, "owner.json"), "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function isProcessRunning(pid) {
+  if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) {
+    return false;
+  }
+
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code === "EPERM";
+  }
+}
+
+function describeBuildLockOwner(owner) {
+  if (!owner?.pid) {
+    return "unknown owner";
+  }
+
+  return `pid ${owner.pid}${owner.createdAt ? ` since ${owner.createdAt}` : ""}`;
+}
+
 function acquireBuildLock() {
   fs.mkdirSync(path.dirname(lockDir), { recursive: true });
   const startedAt = Date.now();
@@ -31,6 +60,12 @@ function acquireBuildLock() {
         throw error;
       }
 
+      const owner = readBuildLockOwner();
+      if (owner?.pid && !isProcessRunning(owner.pid)) {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+        continue;
+      }
+
       let ageMs = 0;
       try {
         const stats = fs.statSync(lockDir);
@@ -39,13 +74,13 @@ function acquireBuildLock() {
         ageMs = lockStaleMs + 1;
       }
 
-      if (ageMs > lockStaleMs) {
+      if (!owner?.pid && ageMs > lockStaleMs) {
         fs.rmSync(lockDir, { recursive: true, force: true });
         continue;
       }
 
       if (Date.now() - startedAt > lockTimeoutMs) {
-        throw new Error("Timed out waiting for another web build to finish.");
+        throw new Error(`Timed out waiting for another web build to finish (${describeBuildLockOwner(owner)}).`);
       }
 
       sleep(lockPollMs);

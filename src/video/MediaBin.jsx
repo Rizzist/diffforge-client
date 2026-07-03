@@ -41,10 +41,27 @@ const BinRoot = styled.div`
   min-height: 0;
   height: 100%;
 
-  &[data-drop-active="true"] {
+  &[data-drop-active="true"],
+  &[data-snip-drop-active="true"] {
     outline: 1.5px dashed rgba(16, 185, 129, 0.55);
     outline-offset: -3px;
     border-radius: 8px;
+  }
+
+  @keyframes video-bin-drop-flash {
+    0% {
+      outline-color: rgba(16, 185, 129, 0.9);
+    }
+    100% {
+      outline-color: transparent;
+    }
+  }
+
+  &[data-drop-flash="true"] {
+    outline: 2px solid transparent;
+    outline-offset: -3px;
+    border-radius: 8px;
+    animation: video-bin-drop-flash 0.9s ease-out;
   }
 `;
 
@@ -126,6 +143,13 @@ const FolderChip = styled(FilterChip)`
   &[data-active="true"] {
     border-color: rgba(16, 185, 129, 0.5);
     background: rgba(16, 185, 129, 0.14);
+    color: #a7f3d0;
+  }
+
+  &[data-snip-drop-active="true"],
+  &[data-drop-flash="true"] {
+    border-color: rgba(16, 185, 129, 0.9);
+    background: rgba(16, 185, 129, 0.22);
     color: #a7f3d0;
   }
 `;
@@ -491,6 +515,45 @@ export default function MediaBin({
     };
   }, [onImported]);
 
+  // Snip preview windows dropped on the library (routed by TerminalView's
+  // native drag stream as a DOM CustomEvent on this root / a folder pill):
+  // copy the snip into media/assets, optionally filing it into the folder.
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!root || !repoPath) {
+      return undefined;
+    }
+    const handler = async (event) => {
+      const path = String(event?.detail?.path || "").trim();
+      const folderId = String(event?.detail?.folderId || "");
+      const label = String(event?.detail?.label || "").trim();
+      if (!path) {
+        return;
+      }
+      try {
+        const result = await invoke("video_media_import", { repoPath, sourcePaths: [path] });
+        const imported = Array.isArray(result?.imported) ? result.imported : [];
+        if (folderId) {
+          await Promise.all(
+            imported.map((item) =>
+              invoke("video_media_set_folder", { repoPath, path: item.path, folderId }).catch(() => {}),
+            ),
+          );
+        }
+        onImported?.();
+        // Only a successful import consumes the preview window — on failure
+        // it stays around so the drop can be retried.
+        if (label) {
+          invoke("snipping_consume_snip_preview", { label, path }).catch(() => {});
+        }
+      } catch (err) {
+        setImportError(String(err));
+      }
+    };
+    root.addEventListener("forge-video-library-snip-drop", handler);
+    return () => root.removeEventListener("forge-video-library-snip-drop", handler);
+  }, [onImported, repoPath]);
+
   const [aiMenu, setAiMenu] = useState(null); // { asset, x, y }
 
   useEffect(() => {
@@ -722,9 +785,10 @@ export default function MediaBin({
           {folders.map((folder) => (
             <FolderChip
               data-active={activeFolder === folder.id ? "true" : "false"}
+              data-snip-drop-video-folder-id={folder.id}
               key={folder.id}
               onClick={() => setActiveFolder(folder.id)}
-              title={`Show only "${folder.name}"`}
+              title={`Show only "${folder.name}" — drop a snip here to file it inside`}
               type="button"
             >
               📁 {folder.name}

@@ -23,12 +23,62 @@ import {
 } from "./videoStyles.js";
 
 const PanelRoot = styled.div`
+  position: relative;
   display: flex;
   flex-direction: column;
   min-width: 0;
   min-height: 0;
   height: 100%;
+  overflow: hidden;
+`;
+
+const FormScroll = styled.div`
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+`;
+
+// Job history slides over the whole form (opaque, right → left).
+const HistorySlide = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: flex;
+  flex-direction: column;
+  background: #020304;
+  transform: translateX(100%);
+  transition: transform 0.22s ease;
+  pointer-events: none;
+
+  &[data-open="true"] {
+    transform: translateX(0);
+    pointer-events: auto;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #f4f6fb;
+  }
+`;
+
+const HistoryHeader = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  flex: 0 0 auto;
+`;
+
+const HistoryList = styled.div`
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  align-content: start;
 `;
 
 const KindTabs = styled.div`
@@ -516,6 +566,7 @@ export default function GeneratePanel({
       return;
     }
     seedSeenRef.current = seed.nonce;
+    setHistoryOpen(false); // an opaque history slide would hide the seeded form
     if (seed.action === "image-to-video") {
       setKind("video");
       setSlots((current) => ({ ...current, startFrame: seed.asset?.path || "" }));
@@ -699,6 +750,7 @@ export default function GeneratePanel({
 
   return (
     <PanelRoot data-video-generate="true">
+      <FormScroll {...(historyOpen ? { inert: "" } : {})}>
       <KindTabs>
         {GENERATION_KINDS.map((entry) => (
           <KindTab
@@ -902,6 +954,16 @@ export default function GeneratePanel({
           <VideoPaneButton disabled={!repoPath || !model} onClick={startGenerate} type="button">
             Generate
           </VideoPaneButton>
+          <VideoSecondaryButton
+            onClick={() => {
+              loadHistory();
+              setHistoryOpen(true);
+            }}
+            title="Past generations — reuse any job's prompt and inputs"
+            type="button"
+          >
+            History
+          </VideoSecondaryButton>
           {estUsd != null ? (
             <VideoHint title="Ballpark cost — billed through your Diff Forge cloud">≈ ${estUsd.toFixed(2)}</VideoHint>
           ) : null}
@@ -922,52 +984,11 @@ export default function GeneratePanel({
         </InlineRow>
       </Section>
       <Section style={{ borderBottom: "none" }}>
-        <InlineRow>
-          <SectionTitle style={{ flex: 1 }}>Jobs</SectionTitle>
-          <VideoSecondaryButton
-            onClick={() => {
-              setHistoryOpen((open) => {
-                if (!open) {
-                  loadHistory();
-                }
-                return !open;
-              });
-            }}
-            type="button"
-          >
-            {historyOpen ? "Hide history" : "History"}
-          </VideoSecondaryButton>
-        </InlineRow>
-        {historyOpen ? (
-          historyJobs.length ? (
-            historyJobs.map((job) => (
-              <JobRow key={`hist-${job.jobId}`}>
-                <JobTitle $tone={job.error ? "error" : "done"}>
-                  {job.request?.model || job.model || job.providerId || "job"}
-                  <em>{job.request?.prompt ? job.request.prompt.slice(0, 48) : job.mode || ""}</em>
-                  <span>{job.error ? "error" : job.done ? "done" : "running"}</span>
-                </JobTitle>
-                {job.request && job.request.kind !== "upscale" && !String(job.request.mode || "").startsWith("upscale") ? (
-                  <InlineRow>
-                    <VideoSecondaryButton
-                      onClick={() => reuseJob(job)}
-                      title="Load this job's prompt, inputs, and settings into the form (missing inputs are fine)"
-                      type="button"
-                    >
-                      ↺ Reuse
-                    </VideoSecondaryButton>
-                  </InlineRow>
-                ) : null}
-              </JobRow>
-            ))
-          ) : (
-            <VideoHint>No past jobs yet.</VideoHint>
-          )
-        ) : null}
-        {!historyOpen && !jobs.length ? (
+        <SectionTitle>Jobs</SectionTitle>
+        {!jobs.length ? (
           <VideoHint>Generations land in media/generated and appear in the library (AI filter).</VideoHint>
         ) : null}
-        {!historyOpen && jobs.map((job) => (
+        {jobs.map((job) => (
           <JobRow key={job.jobId}>
             <JobTitle $tone={jobTone(job)}>
               {job.model || job.providerId || "generate"}
@@ -1001,6 +1022,41 @@ export default function GeneratePanel({
           </JobRow>
         ))}
       </Section>
+      </FormScroll>
+      <HistorySlide data-open={historyOpen ? "true" : "false"} {...(historyOpen ? {} : { inert: "" })}>
+        <HistoryHeader>
+          <VideoSecondaryButton onClick={() => setHistoryOpen(false)} type="button">
+            ‹ Back
+          </VideoSecondaryButton>
+          <SectionTitle>Job history</SectionTitle>
+        </HistoryHeader>
+        <HistoryList>
+          {historyJobs.length ? (
+            historyJobs.map((job) => (
+              <JobRow key={`hist-${job.jobId}`}>
+                <JobTitle $tone={job.error ? "error" : "done"}>
+                  {job.request?.model || job.model || job.providerId || "job"}
+                  <em>{job.request?.prompt ? job.request.prompt.slice(0, 48) : job.mode || ""}</em>
+                  <span>{job.error ? "error" : job.done ? "done" : "running"}</span>
+                </JobTitle>
+                {job.request && job.request.kind !== "upscale" && !String(job.request.mode || "").startsWith("upscale") ? (
+                  <InlineRow>
+                    <VideoSecondaryButton
+                      onClick={() => reuseJob(job)}
+                      title="Load this job's prompt, inputs, and settings into the form (missing inputs are fine)"
+                      type="button"
+                    >
+                      ↺ Reuse
+                    </VideoSecondaryButton>
+                  </InlineRow>
+                ) : null}
+              </JobRow>
+            ))
+          ) : (
+            <VideoHint>No past jobs yet.</VideoHint>
+          )}
+        </HistoryList>
+      </HistorySlide>
     </PanelRoot>
   );
 }

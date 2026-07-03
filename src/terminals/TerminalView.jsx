@@ -30406,9 +30406,15 @@ function TerminalView({
       return null;
     }
     const element = document.elementFromPoint(clientX, clientY);
-    return element?.closest?.(
-      "[data-snip-drop-todo-id], [data-terminal-surface-slot='true'], [data-snip-drop-composer='true']",
+    const target = element?.closest?.(
+      "[data-snip-drop-video-folder-id], [data-video-media-bin='true'], [data-snip-drop-todo-id], [data-terminal-surface-slot='true'], [data-snip-drop-composer='true']",
     ) || null;
+    // Video pane slots aren't drop targets themselves — only the library
+    // (or a folder pill) inside one is. Highlighting the whole pane lies.
+    if (target?.getAttribute?.("data-terminal-video-pane") === "true") {
+      return null;
+    }
+    return target;
   }, []);
   // One green pulse on the target confirming the drop landed.
   const flashDropTarget = useCallback((element) => {
@@ -30488,6 +30494,26 @@ function TerminalView({
         return;
       }
       const snipName = path.split(/[\\/]/).filter(Boolean).pop() || "snip.png";
+
+      // The video pane's media library (or one of its folder pills): copy the
+      // snip into that workspace's media/assets. MediaBin owns the import.
+      if (
+        target.hasAttribute("data-snip-drop-video-folder-id") ||
+        target.getAttribute("data-video-media-bin") === "true"
+      ) {
+        target.dispatchEvent(new CustomEvent("forge-video-library-snip-drop", {
+          bubbles: true,
+          detail: {
+            folderId: String(target.getAttribute("data-snip-drop-video-folder-id") || ""),
+            // MediaBin consumes the preview only after the import succeeds —
+            // a failed import must leave the preview available for retry.
+            label,
+            path,
+          },
+        }));
+        flashDropTarget(target);
+        return;
+      }
 
       const todoId = String(target.getAttribute("data-snip-drop-todo-id") || "").trim();
       if (todoId) {
