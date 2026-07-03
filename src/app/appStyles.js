@@ -10008,15 +10008,15 @@ export const TerminalClosingOverlay = styled.div`
 export const TerminalRestartPill = styled.div`
   position: relative;
   z-index: 80;
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-auto-rows: minmax(22px, auto);
   width: 100%;
   max-width: none;
   min-height: 30px;
   height: auto;
   flex: 0 0 auto;
-  flex-wrap: wrap;
   align-items: center;
-  justify-content: space-between;
   align-content: center;
   column-gap: 6px;
   row-gap: 1px;
@@ -10035,6 +10035,8 @@ export const TerminalRestartPill = styled.div`
 
 export const TerminalRailIdentity = styled.span`
   display: inline-flex;
+  grid-column: 1 / -1;
+  grid-row: 1;
   min-width: min-content;
   max-width: 100%;
   align-items: center;
@@ -10064,18 +10066,25 @@ export const TerminalAgentLabel = styled.span`
 
 export const TerminalRailControls = styled.span`
   display: inline-flex;
+  max-width: 100%;
   min-width: 0;
+  flex-wrap: wrap;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   flex: 0 0 auto;
   gap: 2px;
 
   &[data-rail-row="primary"] {
-    order: 3;
+    grid-column: 2;
+    grid-row: 2;
+    justify-self: end;
+    flex-wrap: nowrap;
   }
 
   &[data-rail-row="secondary"] {
-    order: 2;
+    grid-column: 1;
+    grid-row: 2;
+    justify-self: start;
   }
 `;
 
@@ -10261,6 +10270,7 @@ export const TerminalRestartButton = styled.button`
 `;
 
 export const TerminalCloseButton = styled(TerminalRestartButton)`
+  margin-left: auto;
   color: rgba(255, 255, 255, 0.58);
 
   &:hover:not(:disabled) {

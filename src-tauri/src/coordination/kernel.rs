@@ -26977,18 +26977,13 @@ fn diffforge_agent_contract_markdown(variant: AgentContractVariant) -> String {
         return format!(
             "{DIFFFORGE_AGENT_CONTRACT_BEGIN}\n\
 # Diff Forge workspace note\n\n\
-Work normally from the visible project root. This file only documents account-global Diff Forge architecture graph artifacts.\n\n\
-## Architecture Graphs\n\n\
-- Diff Forge architecture graphs are account-global artifacts under the Diff Forge global architectures root. Use the absolute `globalGraphsRoot` from architecture_context when available.\n\
-- For architecture, diagram, deployment, flow, control, state, dependency, or subsystem visualization work, prefer updating `globalGraphsRoot/*.arch` with the eraser-like DSL so the Architecture tab can hot-reload previews.\n\
-- Direct file edits to `globalGraphsRoot/*.arch` are allowed for live architecture previews. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
-- Preserve group `intent`, node `role`/`lifecycle`/`source`/`status`, edge `role`/`condition`/`event`/`criticality`, and api-corridor route/step props when updating existing graphs.\n\
+Work normally from the visible project root. No local coordination MCP workflow applies unless Diff Forge launches the agent with coordination environment variables.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
         );
     }
     let env_gate = if variant == AgentContractVariant::ManagedEnvGated {
         "## Who this contract applies to\n\n\
-This contract applies only to coding agents launched by the Diff Forge AI desktop app. Those terminals run with `COORDINATION_SESSION_ID` and `COORDINATION_ENFORCEMENT_MODE` set in their environment and with the `coordination-kernel` MCP server mounted. If those environment variables are not present, you were not launched by Diff Forge: ignore everything below except the Architecture Graphs section, work normally from the project root, and do not attempt to call any `coordination-kernel` tools.\n\n"
+This contract applies only to coding agents launched by the Diff Forge AI desktop app. Those terminals run with `COORDINATION_SESSION_ID` and `COORDINATION_ENFORCEMENT_MODE` set in their environment and with the `coordination-kernel` MCP server mounted. If those environment variables are not present, ignore everything below, work normally from the project root, and do not attempt to call any `coordination-kernel` tools.\n\n"
     } else {
         ""
     };
@@ -26999,13 +26994,12 @@ This contract applies only to coding agents launched by the Diff Forge AI deskto
 This workspace is coordinated by Diff Forge. The user prompt is still the source of truth, and app-launched coding agents use one local MCP server for task context, leases, direct completion, and optional patch submission.\n\n\
 ## Required flow for every user task\n\n\
 1. Read-only inspection is free: open, search, and inspect files normally without calling `coordination-kernel.start_task` or `coordination-kernel.checkpoint`.\n\
-2. Architecture graph-only work is the direct-live exception: if the only edits are files under `DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT` / `architecture_context.globalGraphsRoot`, do not call `start_task`, do not acquire a normal file lease, and do not call `submit_patch`. Use the architecture MCP context/list/reference tools, edit the global graph file directly, then report the graph path in the final summary.\n\
-3. For all non-architecture graph edits, call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Rust creates or resumes the local task immediately for all leases, checkpoints, and patch submission. Task/context/history Cloud sync is disabled; todos are the shared cloud work state.\n\
-4. Filesystem edits are not lease-gated. Use normal shell and edit tools against any path the user asks you to change; `coordination-kernel.acquire_lease` is not required for file access.\n\
-5. Coordinated task calls are for shared activity state, not local filesystem permission. Keep summaries/checkpoints useful, but do not treat worktree roots or leases as write barriers.\n\
-6. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
-7. When finished with non-architecture graph edits, follow the active session `completion_mode`: call `coordination-kernel.complete_task` for direct/activity work, or `coordination-kernel.submit_patch` only when the session reports `worktree_required`/`submit_patch`. If `submit_patch` returns a `submit_job_id`, use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
-8. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
+2. Call `coordination-kernel.start_task` only when you are ready to edit, and again when a parked task resumes after first inspecting refreshed context. Include a short `plan` for the immediate edit; Rust creates or resumes the local task immediately for all leases, checkpoints, and patch submission. Task/context/history Cloud sync is disabled; todos are the shared cloud work state.\n\
+3. Filesystem edits are not lease-gated. Use normal shell and edit tools against any path the user asks you to change; `coordination-kernel.acquire_lease` is not required for file access.\n\
+4. Coordinated task calls are for shared activity state, not local filesystem permission. Keep summaries/checkpoints useful, but do not treat worktree roots or leases as write barriers.\n\
+5. Call `coordination-kernel.checkpoint` with that `task_id` only while a task is active and after meaningful edit progress; never checkpoint reconnaissance.\n\
+6. When finished, follow the active session `completion_mode`: call `coordination-kernel.complete_task` for direct/activity work, or `coordination-kernel.submit_patch` only when the session reports `worktree_required`/`submit_patch`. If `submit_patch` returns a `submit_job_id`, use `coordination-kernel.submit_patch_status` to watch validation, patch artifact creation, local integration, and cloud sync progress.\n\
+7. Keep summaries public and terse. Do not include hidden reasoning, raw terminal logs, secrets, credentials, or large source dumps.\n\n\
 ## Cloud MCP is automatic\n\n\
 - Do not call `cloud-diffforge` tools directly from the coding agent.\n\
 - Task/context/history Cloud sync is disabled. Diff Forge's Rust app/kernel keeps task lifecycle, checkpoint summaries, and merge context local while todos remain the shared cloud work state.\n\
@@ -27017,21 +27011,6 @@ This workspace is coordinated by Diff Forge. The user prompt is still the source
 ## Workspace MCP gateway\n\n\
 - Diff Forge also mounts `workspace-mcp-gateway` when workspace MCPs are installed. Call `workspace_mcp__sync_manifest` before using workspace MCP tools after config changes or when tool availability is unclear.\n\
 - Workspace MCP tools are namespaced as `<server_key>__<tool_name>` and can change when the user enables, disables, or configures MCPs in Diff Forge.\n\
-\n\
-## Architecture graphs\n\n\
-- Diff Forge architecture graphs are account-global agent artifacts under `DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT` / `architecture_context.globalGraphsRoot`; use that absolute root instead of assuming `.agents/architectures` inside the repo.\n\
-- Direct file edits to `globalGraphsRoot/*.arch` are allowed for live architecture previews, including when isolated worktrees are enabled. Do not edit generated architecture files such as `index.json`, `AGENTS.md`, or `icon-aliases.json`.\n\
-- Architecture graph-only work is live artifact work, not a managed patch task: do not call `start_task`, `acquire_lease`, `checkpoint`, or `submit_patch` when the only files you create or edit are under `globalGraphsRoot`.\n\
-- For architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, or subsystem visualization work, call `coordination-kernel.architecture_context` first. Use `coordination-kernel.architecture_list` and `coordination-kernel.architecture_icon_reference` instead of guessing the storage contract, then create or update `globalGraphsRoot/*.arch` through normal file edits so the Architecture tab reloads file changes live.\n\
-- Before creating a generic architecture doc, inspect the architecture MCP context and existing `globalGraphsRoot/*.arch` files.\n\
-- For architecture, diagram, deployment, flow, control, state, dependency, or subsystem visualization work, create or update `globalGraphsRoot/*.arch` using normal file edits and the eraser-like DSL. Do not create `ARCHITECTURE.md`, `docs/architecture.md`, Draw.io, SVG, or PNG architecture files unless the user explicitly asks for those formats.\n\
-- The DSL supports `title`, `folder`, `direction`, one-line run targets such as `run \"Deploy\" [action: deploy, envs: \"local,staging,production\", modes: \"plan,apply,verify,rollback\", defaultEnv: staging, scope: \"Deployment\"]`, containers with `{{ ... }}` and semantic props like `[icon: api, intent: api-pathway]`, node props such as `[icon: api, role: endpoint, desc: Request handling]`, compact actor props such as `[icon: users, role: actor, display: compact]`, api-corridor overlays such as `[intent: api-corridor, display: overlay, from: Client, to: API, anchor: Auth API, orient: shortest-path]`, and edges such as `A > B: label [role: calls]`, `A -- B: dependency [role: depends-on]`, and `Decision > Retry: retry [role: guards, condition: recoverable]`.\n\
-- Preserve group `intent`, node `role`/`lifecycle`/`source`/`status`, edge `role`/`condition`/`event`/`criticality` props, and api-corridor `from`/`to`/`anchor`/`route` plus ordered step `method`/`path`/`status`/`condition` props. One graph may contain connected or disconnected semantic groups.\n\
-- Use api-corridor overlays only for important ordered API procedures, not line-by-line implementation narration. Corridor endpoints should reference existing nodes or groups, and each message should use ordered `step` props with roles such as `request`, `response`, `redirect`, or `callback`.\n\
-- Use `run` lines only for graph-level operations a human should intentionally trigger from the Architecture tab. Run targets describe intent and guardrails, not shell commands, and should stay one line each.\n\
-- Use compact actor nodes without descriptions for humans, users, customers, admins, agents, bots, browsers, CLI clients, and similar entrypoints, for example `User [icon: users, role: actor, display: compact]` or `AI Agent [icon: ai, role: actor, display: compact]`.\n\
-- Name icons with simple aliases. Prefer exact provider/product/framework slugs when the node/container title names a real technology, for example `appwrite`, `github`, `postgres`, `redis`, `mongodb`, `docker`, `kubernetes`, `stripe`, `supabase`, `cloudflare`, `auth0`, `cockroachdb`, `react`, or `vercel`. Use cloud tokens like `aws:s3`, `aws:lambda`, `gcp:cloud-run`, and `azure:functions` when they fit.\n\
-- Use semantic tokens like `api`, `server`, `service`, `worker`, `database`, `storage`, `queue`, `auth`, `users`, `external`, and `settings` only when there is no exact product/provider icon. The renderer also tries to infer installed LikeC4/styled-icons logos from titles when a generic fallback is used.\n\
 {DIFFFORGE_AGENT_CONTRACT_END}\n"
     )
 }

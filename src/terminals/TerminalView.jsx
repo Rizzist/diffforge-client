@@ -14,6 +14,7 @@ import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { Devices as DeviceGenericIcon } from "@styled-icons/material-rounded/Devices";
 import { Edit } from "@styled-icons/material-rounded/Edit";
 import { Language as DeviceWebIcon } from "@styled-icons/material-rounded/Language";
+import { Movie } from "@styled-icons/material-rounded/Movie";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
 import { Schedule } from "@styled-icons/material-rounded/Schedule";
@@ -23,6 +24,7 @@ import { Webhook } from "@styled-icons/material-rounded/Webhook";
 import { TERMINAL_WINDOW_CLOSED_EVENT } from "./TerminalWindowHost.jsx";
 import WebPane from "../web/WebPane.jsx";
 import PcbWorkspacePane from "../pcb/PcbWorkspacePane.jsx";
+import VideoWorkspacePane from "../video/VideoWorkspacePane.jsx";
 import VmSandboxPane from "../vm/VmSandboxPane.jsx";
 import {
   PCB_PANEL_COMMAND_EVENT,
@@ -31,6 +33,13 @@ import {
   PCB_PANEL_CONTROL_EVENT,
   PCB_PANEL_CONTROL_RETURN,
 } from "../pcb/pcbPanelBridge.js";
+import {
+  VIDEO_PANEL_COMMAND_EVENT,
+  VIDEO_PANEL_CLOSED_EVENT,
+  VIDEO_PANEL_CONTROL_EVENT,
+  VIDEO_PANEL_CONTROL_PROJECT_CHANGE,
+  VIDEO_PANEL_CONTROL_RETURN,
+} from "../video/videoPanelBridge.js";
 import { DEFAULT_WEB_URL } from "../web/webNative.js";
 import {
   WEB_PANEL_COMMAND_EVENT,
@@ -274,6 +283,7 @@ const TERMINAL_EMPTY_PANEL_LAUNCHERS = Object.freeze([
   { id: "docs", label: "Docs" },
   { id: "pcb", label: "PCB" },
   { id: "vm", label: "VM Sandbox" },
+  { id: "video", label: "Video editor" },
   { id: "canvas", label: "Terminal canvas" },
   { id: "windows", label: "Window breakout" },
 ]);
@@ -283,6 +293,7 @@ const TERMINAL_TOOLBOX_PANEL_LAUNCHERS = Object.freeze([
   { id: "docs", label: "Docs" },
   { id: "pcb", label: "PCB" },
   { id: "vm", label: "VM Sandbox" },
+  { id: "video", label: "Video editor" },
   { id: "whiteboard", label: "Whiteboard", unavailable: true },
 ]);
 const TERMINAL_BREAKOUT_PHASE_GRID = "grid";
@@ -1312,6 +1323,9 @@ function TerminalToolboxPanelGlyph({ panelId }) {
   }
   if (panelId === "vm") {
     return <DeviceComputerIcon aria-hidden="true" />;
+  }
+  if (panelId === "video") {
+    return <Movie aria-hidden="true" />;
   }
   return <ButtonHubIcon aria-hidden="true" />;
 }
@@ -2754,10 +2768,10 @@ const TerminalDocumentPanelShell = styled.div`
 
 const TerminalDocumentPanelHeader = styled(TerminalRestartPill)`
   [data-rail-row="secondary"] {
+    width: 100%;
     max-width: 100%;
-    flex: 1 1 220px;
     flex-wrap: wrap;
-    justify-content: flex-end;
+    justify-content: flex-start;
     row-gap: 1px;
   }
 `;
@@ -2796,10 +2810,10 @@ const TerminalPcbPanelShell = styled.div`
 
 const TerminalPcbPanelHeader = styled(TerminalRestartPill)`
   [data-rail-row="secondary"] {
+    width: 100%;
     max-width: 100%;
-    flex: 1 1 220px;
     flex-wrap: wrap;
-    justify-content: flex-end;
+    justify-content: flex-start;
     row-gap: 1px;
   }
 `;
@@ -2886,6 +2900,16 @@ const TerminalPcbBreakoutButton = styled.button`
     background: rgba(255, 255, 255, 0.76);
   }
 `;
+
+const TerminalVideoPanelShell = TerminalPcbPanelShell;
+const TerminalVideoPanelHeader = TerminalPcbPanelHeader;
+const TerminalVideoPanelIdentity = TerminalPcbPanelIdentity;
+const TerminalVideoPanelGlyph = TerminalPcbPanelGlyph;
+const TerminalVideoPanelTitle = TerminalPcbPanelTitle;
+const TerminalVideoPanelBody = TerminalPcbPanelBody;
+const TerminalVideoBreakoutOverlay = TerminalPcbBreakoutOverlay;
+const TerminalVideoBreakoutActions = TerminalPcbBreakoutActions;
+const TerminalVideoBreakoutButton = TerminalPcbBreakoutButton;
 
 const TerminalNoPanelsContent = styled.div`
   position: relative;
@@ -22308,6 +22332,235 @@ function WorkspacePcbGridPane({
   );
 }
 
+function WorkspaceVideoGridPane({
+  controlCommand = null,
+  defaultPanelAgentPromptTargetIds = [],
+  dragActive = false,
+  fullscreenActive = false,
+  isActive = false,
+  isFullscreen = false,
+  onClose = null,
+  onDragHandlePointerDown = null,
+  onFocusBreakout = null,
+  onPopOut = null,
+  onProjectChange = null,
+  onReturnFromBreakout = null,
+  onSplit = null,
+  onSubmitPanelAgentPrompt = null,
+  onToggleFullscreen = null,
+  paneId = "",
+  paneLimitReached = false,
+  panelAgentPromptActivityItems = [],
+  panelAgentPromptTargets = [],
+  poppedOut = false,
+  repoPath = "",
+  resumeNonce = 0,
+  terminalIndex,
+  workspaceId = "",
+}) {
+  const [project, setProject] = useState(null);
+  const [createRequestName, setCreateRequestName] = useState("");
+  const [createRequestNonce, setCreateRequestNonce] = useState(0);
+  const [deleteRequestNonce, setDeleteRequestNonce] = useState(0);
+  const [refreshRequestNonce, setRefreshRequestNonce] = useState(0);
+  const [agentPromptOpen, setAgentPromptOpen] = useState(false);
+  const projectTitle = project?.name || "Video";
+  const splitTitle = paneLimitReached ? "Panel limit reached" : "Split Video panel";
+
+  const openProjectChooser = useCallback(() => {
+    setCreateRequestName("");
+    setCreateRequestNonce((nonce) => nonce + 1);
+  }, []);
+
+  const refreshProject = useCallback(() => {
+    setRefreshRequestNonce((nonce) => nonce + 1);
+  }, []);
+
+  const deleteProject = useCallback(() => {
+    setDeleteRequestNonce((nonce) => nonce + 1);
+  }, []);
+
+  const handleProjectChange = useCallback((nextProject) => {
+    setProject(nextProject);
+    onProjectChange?.(nextProject);
+  }, [onProjectChange]);
+
+  const submitVideoPanelAgentPrompt = useCallback((payload = {}) => {
+    const contextText = project?.path
+      ? `Context: video project "${project.name || "Video"}" at ${project.path} (Diff Forge video pipe format — the file's # header documents the line syntax; media assets live under media/assets/).`
+      : "Context: Diff Forge video editor pane (projects live under media/projects/*.video.pipe; the file's # header documents the syntax).";
+    return onSubmitPanelAgentPrompt?.({
+      ...payload,
+      text: `${payload?.text || ""}\n\n${contextText}`,
+    });
+  }, [onSubmitPanelAgentPrompt, project?.name, project?.path]);
+
+  return (
+    <TerminalVideoPanelShell
+      data-active={isActive ? "true" : "false"}
+      data-drag-active={dragActive ? "true" : undefined}
+      data-workspace-video-shell="true"
+    >
+      <TerminalVideoPanelHeader data-terminal-control="true">
+        <TerminalVideoPanelIdentity>
+          <TerminalRestartButton
+            aria-label="Drag Video panel"
+            data-terminal-drag-handle="true"
+            disabled={isFullscreen}
+            onPointerDown={(event) => onDragHandlePointerDown?.(event, terminalIndex, paneId)}
+            title={isFullscreen ? "Exit fullscreen to reorder panels" : "Drag Video panel"}
+            type="button"
+          >
+            <ButtonDragIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalVideoPanelGlyph aria-hidden="true">
+            <Movie aria-hidden="true" />
+          </TerminalVideoPanelGlyph>
+          <TerminalVideoPanelTitle title={project?.path || "Video editor"}>
+            {projectTitle}
+          </TerminalVideoPanelTitle>
+        </TerminalVideoPanelIdentity>
+        <TerminalRailControls data-rail-row="secondary">
+          <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
+          <TerminalRestartButton
+            aria-label="Prompt terminal agents"
+            aria-pressed={agentPromptOpen ? "true" : "false"}
+            data-active={agentPromptOpen ? "true" : undefined}
+            onClick={() => setAgentPromptOpen((open) => !open)}
+            title="Prompt terminal agents"
+            type="button"
+          >
+            <ButtonBotIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="New or switch video project"
+            disabled={!repoPath}
+            onClick={openProjectChooser}
+            title={repoPath ? "New or switch video project" : "Select a workspace folder first"}
+            type="button"
+          >
+            <ButtonAddIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Refresh video projects"
+            disabled={!repoPath}
+            onClick={refreshProject}
+            title={repoPath ? "Refresh video projects" : "Select a workspace folder first"}
+            type="button"
+          >
+            <ButtonRefreshIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Delete video project"
+            disabled={!repoPath || !project?.path}
+            onClick={deleteProject}
+            title={project?.path ? "Delete video project" : "Open a video project before deleting"}
+            type="button"
+          >
+            <ButtonDeleteIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Split Video panel horizontally"
+            disabled={paneLimitReached}
+            onClick={() => onSplit?.({ direction: "vertical", paneId, terminalIndex, workspaceId })}
+            title={splitTitle}
+            type="button"
+          >
+            <ButtonSplitHorizontalIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Split Video panel vertically"
+            disabled={paneLimitReached}
+            onClick={() => onSplit?.({ direction: "horizontal", paneId, terminalIndex, workspaceId })}
+            title={splitTitle}
+            type="button"
+          >
+            <ButtonSplitVerticalIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label={poppedOut ? "Return Video panel to grid" : "Open Video panel in window"}
+            aria-pressed={poppedOut ? "true" : "false"}
+            data-active={poppedOut ? "true" : undefined}
+            disabled={!poppedOut && !repoPath}
+            onClick={() => {
+              if (poppedOut) {
+                onReturnFromBreakout?.(terminalIndex, paneId);
+                return;
+              }
+              onPopOut?.(terminalIndex, paneId);
+            }}
+            title={poppedOut ? "Return to grid" : repoPath ? "Open in window" : "Select a workspace folder first"}
+            type="button"
+          >
+            <OpenInNew aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label={isFullscreen ? "Restore Video panel" : "Maximize Video panel"}
+            disabled={fullscreenActive && !isFullscreen}
+            onClick={() => onToggleFullscreen?.(terminalIndex, paneId)}
+            title={isFullscreen ? "Restore Video panel" : "Maximize Video panel"}
+            type="button"
+          >
+            {isFullscreen ? (
+              <ButtonFullscreenExitIcon aria-hidden="true" />
+            ) : (
+              <ButtonFullscreenIcon aria-hidden="true" />
+            )}
+          </TerminalRestartButton>
+          <TerminalCloseButton
+            aria-label="Close Video panel"
+            onClick={() => onClose?.(terminalIndex, paneId)}
+            title="Close Video panel"
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </TerminalCloseButton>
+        </TerminalRailControls>
+      </TerminalVideoPanelHeader>
+      <TerminalVideoPanelBody>
+        {poppedOut ? (
+          <TerminalVideoBreakoutOverlay>
+            <strong>Opened in window</strong>
+            <TerminalVideoBreakoutActions>
+              <TerminalVideoBreakoutButton onClick={() => onFocusBreakout?.(terminalIndex, paneId)} type="button">
+                Focus window
+              </TerminalVideoBreakoutButton>
+              <TerminalVideoBreakoutButton data-tone="primary" onClick={() => onReturnFromBreakout?.(terminalIndex, paneId)} type="button">
+                Return to grid
+              </TerminalVideoBreakoutButton>
+            </TerminalVideoBreakoutActions>
+          </TerminalVideoBreakoutOverlay>
+        ) : (
+          <VideoWorkspacePane
+            key={`video-${paneId}-${repoPath}-${resumeNonce}`}
+            controlCommand={controlCommand}
+            createRequestName={createRequestName}
+            createRequestNonce={createRequestNonce}
+            deleteRequestNonce={deleteRequestNonce}
+            isActive={isActive}
+            onProjectChange={handleProjectChange}
+            paneId={paneId}
+            refreshRequestNonce={refreshRequestNonce}
+            repoPath={repoPath}
+            workspaceId={workspaceId}
+          />
+        )}
+        {agentPromptOpen ? (
+          <PanelAgentPromptComposer
+            autoFocus
+            defaultSelectedTargetIds={defaultPanelAgentPromptTargetIds}
+            onClose={() => setAgentPromptOpen(false)}
+            onSubmit={submitVideoPanelAgentPrompt}
+            panelKind="video"
+            panelPaneId={paneId}
+            targets={panelAgentPromptTargets}
+          />
+        ) : null}
+      </TerminalVideoPanelBody>
+    </TerminalVideoPanelShell>
+  );
+}
+
 function TerminalView({
   accountKey = "",
   architectureTerminalActivity = null,
@@ -22336,6 +22589,7 @@ function TerminalView({
   addWorkspaceTerminal,
   addWorkspacePcbPane,
   addWorkspaceVmPane,
+  addWorkspaceVideoPane,
   addWorkspaceWebPane,
   paneKinds = {},
   changeWorkspaceTerminalRole,
@@ -22472,6 +22726,16 @@ function TerminalView({
   const [pcbPaneBoards, setPcbPaneBoards] = useState({});
   const pcbPaneBoardsRef = useRef(pcbPaneBoards);
   const pcbPaneRootScopeRef = useRef("");
+  // Video panes popped out into their own native panel windows.
+  const [videoBreakoutPanes, setVideoBreakoutPanes] = useState({});
+  const videoBreakoutPanesRef = useRef(videoBreakoutPanes);
+  // Bumped per pane when the Video window returns so the in-grid pane rereads
+  // the selected project from shared pane storage.
+  const [videoPaneResumeNonces, setVideoPaneResumeNonces] = useState({});
+  const [videoPaneCommands, setVideoPaneCommands] = useState({});
+  const [videoPaneProjects, setVideoPaneProjects] = useState({});
+  const videoPaneProjectsRef = useRef(videoPaneProjects);
+  const videoPaneRootScopeRef = useRef("");
   const [terminalBreakoutPlacements, setTerminalBreakoutPlacements] = useState({});
   const [terminalBreakoutPlanSnapshots, setTerminalBreakoutPlanSnapshots] = useState({});
   const [terminalBreakoutPlanRefreshNonce, setTerminalBreakoutPlanRefreshNonce] = useState(0);
@@ -22786,6 +23050,7 @@ function TerminalView({
   terminalBreakoutTerminalScaleRef.current = terminalBreakoutTerminalScale;
   terminalBreakoutViewportRef.current = terminalBreakoutViewport;
   pcbPaneBoardsRef.current = pcbPaneBoards;
+  videoPaneProjectsRef.current = videoPaneProjects;
   const visibleTodoQueueItems = useMemo(() => (
     todoQueueItems.filter((item) => {
       // In-flight and completed work does not render as a queue card; recoverable
@@ -23560,6 +23825,78 @@ function TerminalView({
     if (removedBreakout) {
       pcbBreakoutPanesRef.current = nextBreakouts;
       setPcbBreakoutPanes(nextBreakouts);
+    }
+  }, [
+    defaultWorkingDirectory,
+    getTerminalPaneId,
+    logicalTerminalIndexes,
+    paneKinds,
+    terminalWorkspace?.id,
+    terminalWorkspaceWorkingDirectory,
+  ]);
+
+  useEffect(() => {
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    const rootIdentity = normalizeTerminalWorkspaceRootIdentity(
+      terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "",
+    );
+    if (!workspaceId || !rootIdentity) {
+      videoPaneRootScopeRef.current = "";
+      return;
+    }
+
+    const scopeKey = `${workspaceId}:${rootIdentity}`;
+    if (videoPaneRootScopeRef.current === scopeKey) {
+      return;
+    }
+    const previousScopeKey = videoPaneRootScopeRef.current;
+    videoPaneRootScopeRef.current = scopeKey;
+    if (!previousScopeKey) {
+      return;
+    }
+
+    const videoPaneIds = logicalTerminalIndexes
+      .filter((terminalIndex) => paneKinds?.[terminalIndex] === "video")
+      .map((terminalIndex) => getTerminalPaneId(terminalIndex))
+      .filter(Boolean);
+    if (!videoPaneIds.length) {
+      return;
+    }
+    setVideoPaneProjects((current) => {
+      const next = { ...current };
+      videoPaneIds.forEach((paneId) => {
+        delete next[paneId];
+      });
+      videoPaneProjectsRef.current = next;
+      return next;
+    });
+    setVideoPaneCommands((current) => {
+      const next = { ...current };
+      videoPaneIds.forEach((paneId) => {
+        delete next[paneId];
+      });
+      return next;
+    });
+    setVideoPaneResumeNonces((current) => {
+      const next = { ...current };
+      videoPaneIds.forEach((paneId) => {
+        next[paneId] = (next[paneId] || 0) + 1;
+      });
+      return next;
+    });
+    const nextBreakouts = { ...videoBreakoutPanesRef.current };
+    let removedBreakout = false;
+    videoPaneIds.forEach((paneId) => {
+      if (!nextBreakouts[paneId]) {
+        return;
+      }
+      delete nextBreakouts[paneId];
+      removedBreakout = true;
+      invoke("video_panel_close", { paneId, workspaceId }).catch(() => {});
+    });
+    if (removedBreakout) {
+      videoBreakoutPanesRef.current = nextBreakouts;
+      setVideoBreakoutPanes(nextBreakouts);
     }
   }, [
     defaultWorkingDirectory,
@@ -27939,6 +28276,10 @@ function TerminalView({
     pcbBreakoutPanesRef.current = pcbBreakoutPanes;
   }, [pcbBreakoutPanes]);
 
+  useEffect(() => {
+    videoBreakoutPanesRef.current = videoBreakoutPanes;
+  }, [videoBreakoutPanes]);
+
   const windowBreakoutActive = Object.keys(windowBreakoutPanes).length > 0;
 
   const getTerminalWindowTitle = useCallback((terminalIndex) => {
@@ -28232,6 +28573,31 @@ function TerminalView({
     return nextCommand;
   }, [terminalWorkspace?.id]);
 
+  const sendVideoPaneCommand = useCallback((paneId, command = {}) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return null;
+    }
+    const nextCommand = {
+      ...(command || {}),
+      nonce: Date.now() + Math.random(),
+    };
+    if (videoBreakoutPanesRef.current[safePaneId]) {
+      emit(VIDEO_PANEL_COMMAND_EVENT, {
+        ...nextCommand,
+        paneId: safePaneId,
+        windowId: "",
+        workspaceId: terminalWorkspace?.id || "",
+      }).catch(() => {});
+      return nextCommand;
+    }
+    setVideoPaneCommands((current) => ({
+      ...current,
+      [safePaneId]: nextCommand,
+    }));
+    return nextCommand;
+  }, [terminalWorkspace?.id]);
+
   const recordPcbPaneBoard = useCallback((paneId, board) => {
     const safePaneId = String(paneId || "").trim();
     if (!safePaneId) {
@@ -28241,6 +28607,22 @@ function TerminalView({
       const next = { ...current };
       if (board) {
         next[safePaneId] = board;
+      } else {
+        delete next[safePaneId];
+      }
+      return next;
+    });
+  }, []);
+
+  const recordVideoPaneProject = useCallback((paneId, project) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return;
+    }
+    setVideoPaneProjects((current) => {
+      const next = { ...current };
+      if (project) {
+        next[safePaneId] = project;
       } else {
         delete next[safePaneId];
       }
@@ -28414,6 +28796,83 @@ function TerminalView({
     invoke("pcb_panel_focus", { paneId: safePaneId, workspaceId }).catch(() => {});
   }, [terminalWorkspace?.id]);
 
+  // ---- Video pane pop-out (its own native panel window) ----
+
+  const clearVideoPanelBreakout = useCallback((paneId) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return;
+    }
+    const wasPoppedOut = Boolean(videoBreakoutPanesRef.current[safePaneId]);
+    if (wasPoppedOut) {
+      const nextBreakouts = { ...videoBreakoutPanesRef.current };
+      delete nextBreakouts[safePaneId];
+      videoBreakoutPanesRef.current = nextBreakouts;
+    }
+    setVideoBreakoutPanes((current) => {
+      if (!current[safePaneId]) {
+        return current;
+      }
+      const next = { ...current };
+      delete next[safePaneId];
+      return next;
+    });
+    if (wasPoppedOut) {
+      setVideoPaneResumeNonces((current) => ({
+        ...current,
+        [safePaneId]: (current[safePaneId] || 0) + 1,
+      }));
+    }
+  }, []);
+
+  const popOutVideoPanelForIndex = useCallback(async (terminalIndex, paneId) => {
+    const safePaneId = String(paneId || "").trim();
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    const repoPath = terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || "";
+    if (!safePaneId || !workspaceId || !repoPath) {
+      return false;
+    }
+    if (videoBreakoutPanesRef.current[safePaneId]) {
+      invoke("video_panel_focus", { paneId: safePaneId, workspaceId }).catch(() => {});
+      return true;
+    }
+    try {
+      const rect = terminalLayoutRectsRef.current?.[terminalIndex] || null;
+      await invoke("video_panel_open", {
+        height: rect?.height || null,
+        paneId: safePaneId,
+        repoPath,
+        theme: document.documentElement?.dataset?.forgeTheme || "",
+        width: rect?.width || null,
+        workspaceId,
+      });
+      setVideoBreakoutPanes((current) => ({ ...current, [safePaneId]: true }));
+      videoBreakoutPanesRef.current = { ...videoBreakoutPanesRef.current, [safePaneId]: true };
+      return true;
+    } catch {
+      return false;
+    }
+  }, [defaultWorkingDirectory, terminalWorkspace?.id, terminalWorkspaceWorkingDirectory]);
+
+  const returnVideoPanelToGrid = useCallback((paneId) => {
+    const safePaneId = String(paneId || "").trim();
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!safePaneId || !workspaceId) {
+      return;
+    }
+    clearVideoPanelBreakout(safePaneId);
+    invoke("video_panel_close", { paneId: safePaneId, workspaceId }).catch(() => {});
+  }, [clearVideoPanelBreakout, terminalWorkspace?.id]);
+
+  const focusVideoPanel = useCallback((terminalIndex, paneId) => {
+    const safePaneId = String(paneId || "").trim();
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    if (!safePaneId || !workspaceId) {
+      return;
+    }
+    invoke("video_panel_focus", { paneId: safePaneId, workspaceId }).catch(() => {});
+  }, [terminalWorkspace?.id]);
+
   // A web breakout window closing returns the pane to the grid and bumps its
   // resume nonce so the in-grid WebPane remounts at the last URL.
   useEffect(() => {
@@ -28560,6 +29019,83 @@ function TerminalView({
     };
   }, [clearPcbPanelBreakout, recordPcbPaneBoard, terminalWorkspace?.id]);
 
+  // A Video panel window closing returns the pane to the grid and remounts it so
+  // it rereads the selected project written by the pop-out window.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(VIDEO_PANEL_CLOSED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const workspaceId = String(event.payload?.workspaceId || "").trim();
+      if (workspaceId && terminalWorkspace?.id && workspaceId !== terminalWorkspace.id) {
+        return;
+      }
+      const paneId = String(event.payload?.paneId || "").trim();
+      if (!paneId) {
+        return;
+      }
+      clearVideoPanelBreakout(paneId);
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [clearVideoPanelBreakout, terminalWorkspace?.id]);
+
+  // Track control clicks inside a Video pop-out window.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(VIDEO_PANEL_CONTROL_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const workspaceId = String(payload.workspaceId || "").trim();
+      if (workspaceId && terminalWorkspace?.id && workspaceId !== terminalWorkspace.id) {
+        return;
+      }
+      const control = String(payload.control || "").trim();
+      const paneId = String(payload.paneId || "").trim();
+      if (!paneId) {
+        return;
+      }
+      if (control === VIDEO_PANEL_CONTROL_PROJECT_CHANGE) {
+        recordVideoPaneProject(paneId, payload.project || null);
+        return;
+      }
+      if (control === VIDEO_PANEL_CONTROL_RETURN) {
+        clearVideoPanelBreakout(paneId);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [clearVideoPanelBreakout, recordVideoPaneProject, terminalWorkspace?.id]);
+
   // A breakout window closing (its close button, OS close, or our toggle)
   // returns the pane to the grid and re-asserts the grid's PTY size.
   useEffect(() => {
@@ -28657,6 +29193,26 @@ function TerminalView({
     currentPaneIds.forEach((paneId) => {
       if (!validPaneIds.has(paneId)) {
         invoke("pcb_panel_close", {
+          paneId,
+          workspaceId: terminalWorkspace.id,
+        }).catch(() => {});
+      }
+    });
+  }, [getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace?.id]);
+
+  // Close Video panel windows whose panes no longer exist.
+  useEffect(() => {
+    const currentPaneIds = Object.keys(videoBreakoutPanesRef.current);
+    if (!currentPaneIds.length || !terminalWorkspace?.id) {
+      return;
+    }
+
+    const validPaneIds = new Set(
+      logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex)),
+    );
+    currentPaneIds.forEach((paneId) => {
+      if (!validPaneIds.has(paneId)) {
+        invoke("video_panel_close", {
           paneId,
           workspaceId: terminalWorkspace.id,
         }).catch(() => {});
@@ -28887,6 +29443,14 @@ function TerminalView({
     measureTerminalLayout();
   }, [addWorkspaceVmPane, logicalTerminalIndexes.length, measureTerminalLayout, terminalWorkspace?.id]);
 
+  const handleAddVideoPane = useCallback(() => {
+    if (!terminalWorkspace?.id || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
+      return;
+    }
+    addWorkspaceVideoPane?.({ workspaceId: terminalWorkspace.id });
+    measureTerminalLayout();
+  }, [addWorkspaceVideoPane, logicalTerminalIndexes.length, measureTerminalLayout, terminalWorkspace?.id]);
+
   const handleOpenEmptyStateWebPanel = useCallback(() => {
     handleAddWebPane();
   }, [handleAddWebPane]);
@@ -28907,6 +29471,10 @@ function TerminalView({
   const handleOpenEmptyStateVmPanel = useCallback(() => {
     handleAddVmPane();
   }, [handleAddVmPane]);
+
+  const handleOpenEmptyStateVideoPanel = useCallback(() => {
+    handleAddVideoPane();
+  }, [handleAddVideoPane]);
 
   const handleOpenToolboxAgent = useCallback((role) => {
     openWorkspaceTerminalPane(role, "terminal_toolbox");
@@ -28932,6 +29500,10 @@ function TerminalView({
   const handleOpenToolboxVmPanel = useCallback(() => {
     handleAddVmPane();
   }, [handleAddVmPane]);
+
+  const handleOpenToolboxVideoPanel = useCallback(() => {
+    handleAddVideoPane();
+  }, [handleAddVideoPane]);
 
   const toolboxAgentOptions = useMemo(() => (
     TERMINAL_EMPTY_AGENT_LAUNCHERS.map((launcher) => {
@@ -29052,6 +29624,27 @@ function TerminalView({
               : available
                 ? "Add VM Sandbox panel"
                 : "VM Sandbox unavailable",
+          };
+      }
+      if (launcher.id === "video") {
+        const available = Boolean(
+          terminalWorkspace?.id
+            && typeof addWorkspaceVideoPane === "function"
+            && !terminalPaneLimitReached,
+        );
+        return {
+          ...launcher,
+          detail: "Add Video editor",
+          disabled: !available,
+          ready: available,
+          statusLabel: terminalPaneLimitReached ? "limit" : available ? "ready" : "disabled",
+          title: !terminalWorkspace?.id
+            ? "Select a workspace"
+            : terminalPaneLimitReached
+              ? "Panel limit reached"
+              : available
+                ? "Add Video editor panel"
+                : "Video editor unavailable",
         };
       }
       return {
@@ -29067,6 +29660,7 @@ function TerminalView({
     addWorkspaceWebPane,
     addWorkspacePcbPane,
     addWorkspaceVmPane,
+    addWorkspaceVideoPane,
     onOpenWorkspaceDocumentPanel,
     onOpenWorkspacePcbPanel,
     terminalPaneLimitReached,
@@ -34991,6 +35585,9 @@ function TerminalView({
     if (["vm", "vms", "qemu", "sandbox-vm", "vm-sandbox", "virtual-machine", "virtual-machines", "workspace-vm"].includes(token)) {
       return "vm";
     }
+    if (["video", "video-editor", "videoeditor"].includes(token)) {
+      return "video";
+    }
     if ([
       "doc",
       "docs",
@@ -35043,7 +35640,9 @@ function TerminalView({
           ? "pcb"
           : paneKinds?.[terminalIndex] === "vm"
             ? "vm"
-            : "terminal";
+            : paneKinds?.[terminalIndex] === "video"
+              ? "video"
+              : "terminal";
       if (filterKind && paneKind !== filterKind) {
         return;
       }
@@ -35051,6 +35650,7 @@ function TerminalView({
       const thread = paneKind === "terminal" ? getTerminalThread(terminalIndex) : null;
       const role = paneKind === "terminal" ? getTerminalRole(terminalIndex) : "";
       const board = paneKind === "pcb" ? pcbPaneBoardsRef.current[paneId] || null : null;
+      const project = paneKind === "video" ? videoPaneProjectsRef.current[paneId] || null : null;
       const url = paneKind === "web" ? webPaneUrlsRef.current[paneId] || DEFAULT_WEB_URL : "";
       const panel = {
         active: activePaneId === paneId,
@@ -35069,7 +35669,9 @@ function TerminalView({
             ? board?.name || "PCB"
             : paneKind === "vm"
               ? "VM Sandbox"
-              : getManagedAgentLabel(role || WORKSPACE_TERMINAL_ROLE_GENERIC),
+              : paneKind === "video"
+                ? "Video editor"
+                : getManagedAgentLabel(role || WORKSPACE_TERMINAL_ROLE_GENERIC),
         workspaceId,
         workspace_id: workspaceId,
         workspaceName: workspaceNameText,
@@ -35093,6 +35695,14 @@ function TerminalView({
           panel.context = {
             repoPath,
             runtime: "qemu",
+          };
+        } else if (paneKind === "video") {
+          panel.context = {
+            poppedOut: Boolean(videoBreakoutPanesRef.current[paneId]),
+            project,
+            projectName: project?.name || "",
+            projectPath: project?.path || "",
+            repoPath,
           };
         } else {
           panel.context = {
@@ -35238,6 +35848,8 @@ function TerminalView({
         focusWebPanel(panel.terminalIndex, panel.paneId);
       } else if (panel.kind === "pcb" && pcbBreakoutPanesRef.current[panel.paneId]) {
         focusPcbPanel(panel.terminalIndex, panel.paneId);
+      } else if (panel.kind === "video" && videoBreakoutPanesRef.current[panel.paneId]) {
+        focusVideoPanel(panel.terminalIndex, panel.paneId);
       } else if (panel.kind === "terminal" && windowBreakoutPanesRef.current[panel.paneId]) {
         focusTerminalWindow(panel.terminalIndex, panel.paneId);
       }
@@ -35251,6 +35863,7 @@ function TerminalView({
     buildWorkspacePanelSnapshots,
     focusPcbPanel,
     focusTerminalWindow,
+    focusVideoPanel,
     focusWebPanel,
     normalizeWorkspaceControlPanelKind,
     onOpenWorkspaceDocumentPanel,
@@ -35305,7 +35918,9 @@ function TerminalView({
         ? addWorkspaceWebPane
         : kind === "vm"
           ? addWorkspaceVmPane
-          : null;
+          : kind === "video"
+            ? addWorkspaceVideoPane
+            : null;
     if (!addPane || !terminalWorkspace?.id) {
       throw new Error("That workspace panel cannot be opened here.");
     }
@@ -35347,6 +35962,28 @@ function TerminalView({
           boardPath,
         });
       }
+    } else if (kind === "video") {
+      const projectPath = String(
+        input.projectPath
+          || input.project_path
+          || input.path
+          || input.filePath
+          || input.file_path
+          || "",
+      ).trim();
+      const projectName = String(input.projectName || input.project_name || input.name || "").trim();
+      if (input.create || input.new || input.newProject || input.new_project || input.name) {
+        sendVideoPaneCommand(paneId, {
+          action: "create",
+          name: input.name || projectName || "",
+        });
+      } else if (projectPath || projectName) {
+        sendVideoPaneCommand(paneId, {
+          action: "select",
+          projectName,
+          projectPath,
+        });
+      }
     }
     return {
       opened: true,
@@ -35361,7 +35998,7 @@ function TerminalView({
         queueable: false,
         terminalIndex: result.terminalIndex,
         terminal_index: result.terminalIndex,
-        title: kind === "pcb" ? "PCB" : kind === "vm" ? "VM Sandbox" : "Web",
+        title: kind === "pcb" ? "PCB" : kind === "vm" ? "VM Sandbox" : kind === "video" ? "Video editor" : "Web",
         workspaceId: terminalWorkspace.id,
         workspace_id: terminalWorkspace.id,
         workspaceName: terminalWorkspace.name || workspaceName || "",
@@ -35376,6 +36013,7 @@ function TerminalView({
   }, [
     addWorkspacePcbPane,
     addWorkspaceVmPane,
+    addWorkspaceVideoPane,
     addWorkspaceWebPane,
     defaultWorkingDirectory,
     focusWorkspacePanelFromControl,
@@ -35384,6 +36022,7 @@ function TerminalView({
     onOpenWorkspaceDocumentPanel,
     openWorkspaceDocumentPanel,
     sendPcbPaneCommand,
+    sendVideoPaneCommand,
     sendWebPaneCommand,
     terminalWorkspace?.id,
     terminalWorkspace?.name,
@@ -35451,14 +36090,26 @@ function TerminalView({
       || input.file_path
       || "";
     const inputBoardName = input.boardName || input.board_name || input.name || "";
+    const inputProjectPath = input.projectPath
+      || input.project_path
+      || input.path
+      || input.filePath
+      || input.file_path
+      || "";
+    const inputProjectName = input.projectName || input.project_name || input.name || "";
     const pcbCreateActions = ["create", "new", "new-board"];
     const pcbSelectActions = ["select", "switch", "switch-board", "open-board", "open-existing"];
     const pcbDeleteActions = ["delete", "delete-board", "remove-board"];
+    const videoCreateActions = ["create", "new", "new-project"];
+    const videoSelectActions = ["select", "switch", "switch-project", "open-project", "open-existing"];
+    const videoDeleteActions = ["delete", "delete-project", "remove-project"];
+    const actionHasVideoIntent = ["new-project", "switch-project", "open-project", "delete-project", "remove-project"].includes(action)
+      || (action === "open" && Boolean(input.projectPath || input.project_path || input.projectName || input.project_name));
     const actionHasPcbIntent = pcbCreateActions.includes(action)
       || pcbSelectActions.includes(action)
       || pcbDeleteActions.includes(action)
       || (action === "open" && Boolean(inputBoardPath || inputBoardName));
-    const requestedKind = explicitKind || (actionHasPcbIntent ? "pcb" : "");
+    const requestedKind = explicitKind || (actionHasVideoIntent ? "video" : actionHasPcbIntent ? "pcb" : "");
     const routedInput = requestedKind ? { ...input, kind: requestedKind } : input;
     const snapshot = buildWorkspacePanelSnapshots({ ...routedInput, includeContext: true });
     let panel = resolveWorkspaceControlPanel(routedInput, snapshot);
@@ -35477,6 +36128,17 @@ function TerminalView({
         ...input,
         create: pcbCreateActions.includes(action) ? true : input.create,
         kind: "pcb",
+      });
+    }
+    if (
+      !panel
+      && requestedKind === "video"
+      && (videoCreateActions.includes(action) || videoSelectActions.includes(action) || action === "open")
+    ) {
+      return openWorkspacePanelFromControl({
+        ...input,
+        create: videoCreateActions.includes(action) ? true : input.create,
+        kind: "video",
       });
     }
     if (!panel) {
@@ -35532,6 +36194,44 @@ function TerminalView({
       } else {
         throw new Error(`Unsupported PCB panel action: ${action}`);
       }
+    } else if (panel.kind === "video") {
+      if (action === "open" && (inputProjectPath || inputProjectName)) {
+        sendVideoPaneCommand(panel.paneId, {
+          action: "select",
+          projectName: inputProjectName,
+          projectPath: inputProjectPath,
+        });
+      } else if (action === "open" || action === "popout" || action === "open-window") {
+        void popOutVideoPanelForIndex(panel.terminalIndex, panel.paneId);
+      } else if (action === "return" || action === "return-to-grid") {
+        returnVideoPanelToGrid(panel.paneId);
+      } else if (videoCreateActions.includes(action)) {
+        sendVideoPaneCommand(panel.paneId, {
+          action: "create",
+          name: input.name || input.projectName || input.project_name || "",
+        });
+      } else if (["refresh", "reload"].includes(action)) {
+        sendVideoPaneCommand(panel.paneId, {
+          action: "refresh",
+        });
+      } else if (videoDeleteActions.includes(action)) {
+        sendVideoPaneCommand(panel.paneId, {
+          action: "delete",
+        });
+      } else if (videoSelectActions.includes(action)) {
+        sendVideoPaneCommand(panel.paneId, {
+          action: "select",
+          projectName: inputProjectName,
+          projectPath: inputProjectPath,
+        });
+      } else if (action === "tab") {
+        sendVideoPaneCommand(panel.paneId, {
+          action: "tab",
+          tab: input.tab || input.name || "",
+        });
+      } else {
+        throw new Error(`Unsupported Video editor panel action: ${action}`);
+      }
     } else if (panel.kind === "vm") {
       if (["open", "focus", "refresh", "reload"].includes(action)) {
         focusWorkspacePanelFromControl({ ...input, kind: "vm" });
@@ -35564,11 +36264,14 @@ function TerminalView({
     openWorkspacePanelFromControl,
     normalizeWorkspaceControlPanelKind,
     popOutPcbPanelForIndex,
+    popOutVideoPanelForIndex,
     popOutWebPanelForIndex,
     resolveWorkspaceControlPanel,
     returnPcbPanelToGrid,
+    returnVideoPanelToGrid,
     returnWebPanelToGrid,
     sendPcbPaneCommand,
+    sendVideoPaneCommand,
     sendWebPaneCommand,
   ]);
 
@@ -37739,7 +38442,8 @@ function TerminalView({
     const fullscreenThisTerminal = fullscreenActive && fullscreenTerminalIndex === terminalIndex;
     const isPanelPane = paneKinds?.[terminalIndex] === "web"
       || paneKinds?.[terminalIndex] === "pcb"
-      || paneKinds?.[terminalIndex] === "vm";
+      || paneKinds?.[terminalIndex] === "vm"
+      || paneKinds?.[terminalIndex] === "video";
 
     if (
       draggingThisTerminal
@@ -38122,6 +38826,7 @@ function TerminalView({
           const isWebPane = paneKinds?.[terminalIndex] === "web";
           const isPcbPane = paneKinds?.[terminalIndex] === "pcb";
           const isVmPane = paneKinds?.[terminalIndex] === "vm";
+          const isVideoPane = paneKinds?.[terminalIndex] === "video";
           if (isWebPane) {
             const webSurfaceReady = hasMeasuredRect;
             const webLayoutRect = slotRectForLayout ? {
@@ -38277,6 +38982,92 @@ function TerminalView({
                   poppedOut={Boolean(pcbBreakoutPanes[terminalPaneId])}
                   repoPath={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || ""}
                   resumeNonce={pcbPaneResumeNonces[terminalPaneId] || 0}
+                  terminalIndex={terminalIndex}
+                  workspaceId={terminalWorkspace?.id || ""}
+                />
+                {terminalBreakoutLayoutActive && !fullscreenThisTerminal && terminalActive && (
+                  <TerminalBreakoutResizeHandles data-terminal-control="true">
+                    {TERMINAL_BREAKOUT_RESIZE_HANDLES.map((handle) => (
+                      <TerminalBreakoutResizeHandle
+                        aria-label={handle.label}
+                        data-handle={handle.id}
+                        data-terminal-control="true"
+                        data-terminal-resize-handle="true"
+                        key={handle.id}
+                        onPointerDown={(event) => beginTerminalBreakoutResize(event, terminalIndex, handle)}
+                        title={handle.label}
+                        type="button"
+                      />
+                    ))}
+                  </TerminalBreakoutResizeHandles>
+                )}
+              </TerminalSurfaceSlot>
+            );
+          }
+          if (isVideoPane) {
+            return (
+              <TerminalSurfaceSlot
+                data-terminal-active={terminalActive ? "true" : "false"}
+                data-terminal-breakout={terminalBreakoutLayoutActive ? "true" : "false"}
+                data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
+                data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
+                data-terminal-hidden="false"
+                data-terminal-index={terminalIndex}
+                data-terminal-interacting={terminalBreakoutCanvasInteracting ? "true" : "false"}
+                data-terminal-surface-slot="true"
+                data-terminal-tab-hidden={tabHidden ? "true" : "false"}
+                data-terminal-video-pane="true"
+                key={`${terminalWorkspace.id}-${terminalIndex}`}
+                onClickCapture={(event) => handleTerminalBreakoutSlotClickCapture(event, terminalIndex)}
+                style={getTerminalSlotStyle(terminalIndex)}
+              >
+                <WorkspaceVideoGridPane
+                  dragActive={terminalDragActive}
+                  defaultPanelAgentPromptTargetIds={defaultPanelAgentPromptTargetIds}
+                  fullscreenActive={fullscreenActive}
+                  isActive={isWorkspaceSurfaceVisible && !tabHidden}
+                  isFullscreen={fullscreenThisTerminal}
+                  controlCommand={videoPaneCommands[terminalPaneId] || null}
+                  onClose={(index) => closeWorkspaceTerminal({ workspaceId: terminalWorkspace?.id || "", terminalIndex: index })}
+                  onProjectChange={(project) => recordVideoPaneProject(terminalPaneId, project)}
+                  onDragHandlePointerDown={(event, index, pid) => {
+                    if (event.button !== 0) {
+                      return;
+                    }
+                    const slotEl = event.currentTarget.closest("[data-terminal-surface-slot]");
+                    const surfaceEl = event.currentTarget.closest("[data-workspace-video-shell]") || slotEl;
+                    if (!surfaceEl) {
+                      return;
+                    }
+                    event.preventDefault();
+                    event.stopPropagation();
+                    handleBeginTerminalDrag({
+                      clientX: event.clientX,
+                      clientY: event.clientY,
+                      paneId: pid,
+                      panelRect: getPlainDomRect(slotEl?.getBoundingClientRect?.()),
+                      pointerId: event.pointerId,
+                      surfaceRect: getPlainDomRect(surfaceEl?.getBoundingClientRect?.()),
+                      terminalIndex: index,
+                      workspaceId: terminalWorkspace?.id || "",
+                    });
+                  }}
+                  onFocusBreakout={focusVideoPanel}
+                  onPopOut={popOutVideoPanelForIndex}
+                  onReturnFromBreakout={(index, pid) => returnVideoPanelToGrid(pid)}
+                  onSplit={handleSplitTerminal}
+                  onSubmitPanelAgentPrompt={submitPanelAgentPrompt}
+                  onToggleFullscreen={(index, pid) => handleToggleFullscreenTerminal({ paneId: pid, terminalIndex: index })}
+                  paneId={terminalPaneId}
+                  paneLimitReached={terminalPaneLimitReached}
+                  panelAgentPromptActivityItems={panelAgentPromptActivityItems.filter((item) => (
+                    String(item.panelPaneId || "").trim() === terminalPaneId
+                    && String(item.panelKind || "").trim() === "video"
+                  ))}
+                  panelAgentPromptTargets={panelAgentPromptTargets}
+                  poppedOut={Boolean(videoBreakoutPanes[terminalPaneId])}
+                  repoPath={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || ""}
+                  resumeNonce={videoPaneResumeNonces[terminalPaneId] || 0}
                   terminalIndex={terminalIndex}
                   workspaceId={terminalWorkspace?.id || ""}
                 />
@@ -38925,13 +39716,15 @@ function TerminalView({
                 {toolboxPanelOptions.map((option) => {
                   const handleClick = option.id === "web"
                     ? handleAddWebPane
-                    : option.id === "docs"
-                      ? handleOpenToolboxDocsPanel
-                      : option.id === "pcb"
-                        ? handleOpenToolboxPcbPanel
-                        : option.id === "vm"
-                          ? handleOpenToolboxVmPanel
-                          : undefined;
+	                    : option.id === "docs"
+	                      ? handleOpenToolboxDocsPanel
+	                      : option.id === "pcb"
+	                        ? handleOpenToolboxPcbPanel
+	                        : option.id === "vm"
+	                          ? handleOpenToolboxVmPanel
+	                          : option.id === "video"
+	                            ? handleOpenToolboxVideoPanel
+	                            : undefined;
 
                   return (
                     <TerminalToolboxOption
@@ -38989,19 +39782,32 @@ function TerminalView({
           >
             <DeviceWebIcon aria-hidden="true" />
           </TerminalBreakoutButton>
-          <TerminalBreakoutButton
-            aria-label="Add VM Sandbox panel to canvas"
-            disabled={!addWorkspaceVmPane || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT}
-            onClick={handleAddVmPane}
+	          <TerminalBreakoutButton
+	            aria-label="Add VM Sandbox panel to canvas"
+	            disabled={!addWorkspaceVmPane || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT}
+	            onClick={handleAddVmPane}
             title={
               logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT
                 ? "Panel limit reached"
                 : "Add VM Sandbox panel"
             }
             type="button"
-          >
-            <DeviceComputerIcon aria-hidden="true" />
-          </TerminalBreakoutButton>
+	          >
+	            <DeviceComputerIcon aria-hidden="true" />
+	          </TerminalBreakoutButton>
+	          <TerminalBreakoutButton
+	            aria-label="Add Video editor panel to canvas"
+	            disabled={!addWorkspaceVideoPane || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT}
+	            onClick={handleAddVideoPane}
+	            title={
+	              logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT
+	                ? "Panel limit reached"
+	                : "Add Video editor panel"
+	            }
+	            type="button"
+	          >
+	            <Movie aria-hidden="true" />
+	          </TerminalBreakoutButton>
           <TerminalBreakoutTopBarDivider aria-hidden="true" />
           <TerminalBreakoutButton
             aria-label="Zoom out terminal canvas"
@@ -39101,6 +39907,7 @@ function TerminalView({
             const docsPanel = launcher.id === "docs";
             const pcbPanel = launcher.id === "pcb";
             const vmPanel = launcher.id === "vm";
+            const videoPanel = launcher.id === "video";
             const webEnabled = Boolean(workspaceSelected && addWorkspaceWebPane && !limitReached);
             const docsEnabled = Boolean(
               workspaceSelected
@@ -39112,48 +39919,57 @@ function TerminalView({
                 && !limitReached,
             );
             const vmEnabled = Boolean(workspaceSelected && addWorkspaceVmPane && !limitReached);
+            const videoEnabled = Boolean(workspaceSelected && addWorkspaceVideoPane && !limitReached);
             const enabled = webPanel
               ? webEnabled
               : docsPanel
                 ? docsEnabled
-                : pcbPanel
-                  ? pcbEnabled
-                  : vmPanel
-                    ? vmEnabled
-                    : false;
+	                : pcbPanel
+	                  ? pcbEnabled
+	                  : vmPanel
+	                    ? vmEnabled
+	                    : videoPanel
+	                      ? videoEnabled
+	                      : false;
             const title = !workspaceSelected
               ? "Select a workspace"
-              : limitReached && (webPanel || pcbPanel || vmPanel)
+              : limitReached && (webPanel || pcbPanel || vmPanel || videoPanel)
                 ? "Panel limit reached"
                 : webPanel
                   ? webEnabled ? "Add web panel" : "Web panel unavailable"
                   : docsPanel
                     ? docsEnabled ? "Open Docs panel" : "Docs panel unavailable"
-                    : pcbPanel
-                      ? pcbEnabled ? "Add PCB panel" : "PCB panel unavailable"
-                      : vmPanel
-                        ? vmEnabled ? "Add VM Sandbox panel" : "VM Sandbox unavailable"
-                        : `${launcher.label} requires a terminal`;
+	                    : pcbPanel
+	                      ? pcbEnabled ? "Add PCB panel" : "PCB panel unavailable"
+	                      : vmPanel
+	                        ? vmEnabled ? "Add VM Sandbox panel" : "VM Sandbox unavailable"
+	                        : videoPanel
+	                          ? videoEnabled ? "Add Video editor panel" : "Video editor unavailable"
+	                          : `${launcher.label} requires a terminal`;
             const handleClick = webPanel
               ? handleOpenEmptyStateWebPanel
               : docsPanel
                 ? handleOpenEmptyStateDocsPanel
-                : pcbPanel
-                  ? handleOpenEmptyStatePcbPanel
-                  : vmPanel
-                    ? handleOpenEmptyStateVmPanel
-                    : undefined;
+	                : pcbPanel
+	                  ? handleOpenEmptyStatePcbPanel
+	                  : vmPanel
+	                    ? handleOpenEmptyStateVmPanel
+	                    : videoPanel
+	                      ? handleOpenEmptyStateVideoPanel
+	                      : undefined;
 
             return (
               <TerminalNoPanelsIconButton
                 aria-label={
-                  webPanel
-                    ? "Add web panel"
-                    : docsPanel
-                      ? "Open Docs panel"
-                      : pcbPanel
-                        ? "Add PCB panel"
-                        : launcher.label
+	                  webPanel
+	                    ? "Add web panel"
+	                    : docsPanel
+	                      ? "Open Docs panel"
+	                      : pcbPanel
+	                        ? "Add PCB panel"
+	                        : videoPanel
+	                          ? "Add Video editor panel"
+	                          : launcher.label
                 }
                 data-secondary="true"
                 disabled={!enabled}

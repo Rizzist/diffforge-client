@@ -2660,6 +2660,7 @@ include!("workspace_files.rs");
 include!("workspace_threads_store.rs");
 include!("architectures.rs");
 include!("pcb.rs");
+include!("video_editor.rs");
 include!("workspace_web.rs");
 include!("developer_processes.rs");
 include!("app_control_mcp.rs");
@@ -5350,6 +5351,32 @@ pub fn run() {
             pcb_panel_close,
             pcb_window_open,
             pcb_window_close,
+            video_tools_status,
+            video_tools_install,
+            video_tools_install_cancel,
+            video_watch_start,
+            video_media_list,
+            video_media_import,
+            video_media_delete,
+            video_media_waveform,
+            video_media_filmstrip,
+            video_frame_extract,
+            video_projects_list,
+            video_project_create,
+            video_project_read,
+            video_project_write,
+            video_project_delete,
+            video_export_start,
+            video_export_cancel,
+            video_generate_start,
+            video_generate_cancel,
+            video_generation_providers,
+            video_lora_list,
+            video_lora_delete,
+            video_lora_train_start,
+            video_panel_open,
+            video_panel_focus,
+            video_panel_close,
             delete_workspace_local_metadata,
             run_forge_prompt,
             agent_thread_turn_start,

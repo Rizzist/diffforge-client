@@ -84,18 +84,28 @@ const VmSandboxShell = styled.section`
 `;
 
 const VmSandboxHeader = styled.header`
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  column-gap: 12px;
+  row-gap: 2px;
   min-height: 58px;
   padding: 10px 12px;
   border-bottom: 1px solid rgba(98, 116, 148, 0.28);
   background: rgba(6, 9, 15, 0.8);
+
+  [data-rail-row="secondary"] {
+    grid-column: 1 / -1;
+    grid-row: 2;
+    width: 100%;
+    justify-content: flex-start;
+  }
 `;
 
 const VmSandboxIdentity = styled.div`
   display: flex;
+  grid-column: 1 / -1;
+  grid-row: 1;
   align-items: center;
   min-width: 0;
   gap: 10px;

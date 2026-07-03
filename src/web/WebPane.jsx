@@ -520,7 +520,13 @@ const WebPaneDragButton = styled(TerminalRestartButton)`
   color: var(--web-text);
 `;
 
-const WebPaneRailControls = styled(TerminalRailControls)``;
+const WebPaneRailControls = styled(TerminalRailControls)`
+  &[data-rail-row="secondary"] {
+    grid-column: 1;
+    grid-row: 3;
+    width: 100%;
+  }
+`;
 
 const WebPaneIconButton = styled(TerminalRestartButton)`
   color: var(--web-text);
@@ -532,6 +538,8 @@ const WebPaneIconButton = styled(TerminalRestartButton)`
 
 const WebPaneNav = styled.form`
   display: flex;
+  grid-column: 1;
+  grid-row: 2;
   min-width: min(100%, 220px);
   align-items: center;
   flex: 999 1 260px;

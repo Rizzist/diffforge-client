@@ -27724,6 +27724,7 @@ fn cloud_mcp_workspace_panel_kind(panel: &Value) -> Option<String> {
             Some("web".to_string())
         }
         "pcb" | "pcb-panel" | "pcb-design" | "workspace-pcb" => Some("pcb".to_string()),
+        "video" | "video-editor" | "videoeditor" => Some("video".to_string()),
         _ => None,
     }
 }

@@ -19,11 +19,15 @@ base64 = "0.22"
 cpal = "0.15"
 enigo = "0.6"
 futures-util = "0.3"
+hmac = "0.12"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 libc = "0.2"
+# lzma-rs + tar: pure-Rust extraction of ffmpeg static-build .tar.xz archives
+# (Linux managed install); zip below stays the Windows/macOS path.
+lzma-rs = "0.3"
 notify = "6"
 portable-pty = "0.9.0"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls-native-roots"] }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "multipart", "rustls-tls-native-roots"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 scap = "0.1.0-beta.1"
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +36,7 @@ sha1 = "0.10"
 sha2 = "0.10"
 shiguredo_libvpx = "2026.2.0-canary.0"
 sysinfo = "0.39.1"
+tar = "0.4"
 tauri = { version = "2", features = ["protocol-asset", "macos-private-api", "tray-icon", "unstable"] }
 tauri-plugin-deep-link = "2"
 tauri-plugin-dialog = "2"

@@ -24,12 +24,6 @@ use super::{
 
 pub const TOOL_NAMES: &[&str] = &[
     "start_task",
-    "architecture_context",
-    "architecture_list",
-    "architecture_icon_reference",
-    "architecture_revision_list",
-    "architecture_revision_read",
-    "architecture_revision_restore",
     "list_todo_targets",
     "get_todo_status",
     "wait_for_todos",
@@ -3321,13 +3315,7 @@ fn dispatch_tool_result(
     reconnect_mcp_session_if_needed(&kernel, &input, tool)?;
     match tool {
         "start_task" => kernel_start_task(&kernel, &input),
-        "architecture_context" => kernel_architecture_context(&kernel, &input),
-        "architecture_list" => kernel_architecture_list(&kernel, &input),
         "pcb_drc" => kernel_pcb_drc(&kernel, &input),
-        "architecture_icon_reference" => kernel_architecture_icon_reference(&kernel, &input),
-        "architecture_revision_list" => kernel_architecture_revision_list(&kernel, &input),
-        "architecture_revision_read" => kernel_architecture_revision_read(&kernel, &input),
-        "architecture_revision_restore" => kernel_architecture_revision_restore(&kernel, &input),
         "list_todo_targets" => kernel_list_todo_targets(&kernel, &input),
         "get_todo_status" => kernel_get_todo_status(&kernel, &input),
         "wait_for_todos" => kernel_wait_for_todos(&kernel, &input),
@@ -3383,7 +3371,7 @@ fn reconnect_mcp_session_if_needed(
     Ok(())
 }
 
-fn architecture_tool_repo_path(kernel: &CoordinationKernel, input: &Value) -> String {
+fn coordination_tool_repo_path(kernel: &CoordinationKernel, input: &Value) -> String {
     input["repo_path"]
         .as_str()
         .map(str::trim)
@@ -3392,26 +3380,11 @@ fn architecture_tool_repo_path(kernel: &CoordinationKernel, input: &Value) -> St
         .unwrap_or_else(|| kernel.paths.repo_path.display().to_string())
 }
 
-fn kernel_architecture_context(
-    kernel: &CoordinationKernel,
-    input: &Value,
-) -> Result<Value, String> {
-    Ok(api_ok(crate::architecture_context_value(
-        architecture_tool_repo_path(kernel, input),
-    )?))
-}
-
-fn kernel_architecture_list(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
-    Ok(api_ok(crate::architecture_graphs_list_value(
-        architecture_tool_repo_path(kernel, input),
-    )?))
-}
-
 // Headless PCB design-rule check for coding agents: compile a tscircuit board
 // file via the bundled node DRC helper and return only the terse error/warning
 // report, never the verbose circuit JSON.
 fn kernel_pcb_drc(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
-    let repo_path = architecture_tool_repo_path(kernel, input);
+    let repo_path = coordination_tool_repo_path(kernel, input);
     let board_path = input["board_path"]
         .as_str()
         .or_else(|| input["boardPath"].as_str())
@@ -3451,81 +3424,6 @@ fn kernel_pcb_drc(kernel: &CoordinationKernel, input: &Value) -> Result<Value, S
         )
     })?;
     Ok(api_ok(parsed))
-}
-
-fn kernel_architecture_icon_reference(
-    kernel: &CoordinationKernel,
-    input: &Value,
-) -> Result<Value, String> {
-    Ok(api_ok(crate::architecture_icon_reference_value(
-        architecture_tool_repo_path(kernel, input),
-    )?))
-}
-
-fn kernel_architecture_revision_list(
-    kernel: &CoordinationKernel,
-    input: &Value,
-) -> Result<Value, String> {
-    let graph_id = input["graph_id"]
-        .as_str()
-        .or_else(|| input["graphId"].as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    Ok(api_ok(crate::architecture_graph_revisions_list_value(
-        architecture_tool_repo_path(kernel, input),
-        graph_id,
-    )?))
-}
-
-fn kernel_architecture_revision_read(
-    kernel: &CoordinationKernel,
-    input: &Value,
-) -> Result<Value, String> {
-    let graph_id = input["graph_id"]
-        .as_str()
-        .or_else(|| input["graphId"].as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "architecture_revision_read requires graph_id.".to_string())?
-        .to_string();
-    let revision_id = input["revision_id"]
-        .as_str()
-        .or_else(|| input["revisionId"].as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "architecture_revision_read requires revision_id.".to_string())?
-        .to_string();
-    Ok(api_ok(crate::architecture_graph_revision_read_value(
-        architecture_tool_repo_path(kernel, input),
-        graph_id,
-        revision_id,
-    )?))
-}
-
-fn kernel_architecture_revision_restore(
-    kernel: &CoordinationKernel,
-    input: &Value,
-) -> Result<Value, String> {
-    let graph_id = input["graph_id"]
-        .as_str()
-        .or_else(|| input["graphId"].as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "architecture_revision_restore requires graph_id.".to_string())?
-        .to_string();
-    let revision_id = input["revision_id"]
-        .as_str()
-        .or_else(|| input["revisionId"].as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| "architecture_revision_restore requires revision_id.".to_string())?
-        .to_string();
-    Ok(api_ok(crate::architecture_graph_revision_restore_value(
-        architecture_tool_repo_path(kernel, input),
-        graph_id,
-        revision_id,
-    )?))
 }
 
 fn kernel_list_todo_targets(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
@@ -3705,16 +3603,6 @@ fn kernel_start_task(kernel: &CoordinationKernel, input: &Value) -> Result<Value
     let start_plan = optional_start_task_text(input).ok_or_else(|| {
         "start_task requires a short plan explaining what the agent is about to do.".to_string()
     })?;
-    if start_task_plan_is_direct_architecture_graph_work(&start_plan) {
-        return Ok(api_error(
-            "architecture_graph_direct_edit",
-            "Do not create a normal task for architecture graph-only work. Call architecture_context/list/reference as needed, edit globalGraphsRoot/*.arch directly, and report the graph path when done. If this work also edits code or docs, call start_task again with a plan naming the non-architecture files.",
-            json!({
-                "direct_artifact_root": "globalGraphsRoot",
-                "plan": start_plan,
-            }),
-        ));
-    }
     let agent_id = input["agent_id"]
         .as_str()
         .filter(|value| !value.trim().is_empty());
@@ -4385,51 +4273,6 @@ fn optional_start_task_text(input: &Value) -> Option<String> {
     .map(str::trim)
     .filter(|value| !value.is_empty())
     .map(str::to_string)
-}
-
-fn start_task_plan_is_direct_architecture_graph_work(plan: &str) -> bool {
-    let normalized = plan.to_ascii_lowercase();
-    let graph_intent = [
-        "globalgraphsroot",
-        "diffforge_architecture_graphs_root",
-        ".agents/architectures/graphs",
-        ".arch",
-        "architecture graph",
-        "architecture diagram",
-        "system graph",
-        "system map",
-        "deployment diagram",
-        "data-flow diagram",
-        "data flow diagram",
-        "control graph",
-        "state machine",
-        "dependency graph",
-        "api corridor",
-        "api pathway",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term));
-    if !graph_intent {
-        return false;
-    }
-    let non_graph_intent = [
-        "implement code",
-        "edit code",
-        "modify code",
-        "change code",
-        "update code",
-        "source code",
-        "code file",
-        "src/",
-        "package.json",
-        "cargo.toml",
-        "index.html",
-        "readme",
-        "docs/",
-    ]
-    .iter()
-    .any(|term| normalized.contains(term));
-    !non_graph_intent
 }
 
 fn kernel_checkpoint(kernel: &CoordinationKernel, input: &Value) -> Result<Value, String> {
@@ -5143,12 +4986,6 @@ fn mcp_start_task_seen_for_task(
 fn tool_description(name: &str) -> String {
     match name {
         "start_task" => "Start the local coordination task only after read-only inspection, immediately before active work. Omit task_id on the first call; Rust creates the task immediately for leases, checkpoints, patches, or direct/activity completion. Cloud task/history sync is disabled; use todos for shared work state.".to_string(),
-        "architecture_context" => "Return the account-global Diff Forge architecture/system-graph contract, storage paths, semantic schema, DSL rules, existing graph summaries, compact actor-node guidance, API corridor guidance, run-target guidance, and icon-reference path. Call this before architecture, diagram, deployment, API pathway, API corridor, data-flow, control-graph, state-machine, dependency-graph, run-target, or subsystem visualization work, then edit .arch files in globalGraphsRoot; use the DSL folder line for named/nested folders.".to_string(),
-        "architecture_list" => "List account-global architecture graphs stored under globalGraphsRoot.".to_string(),
-        "architecture_icon_reference" => "Return supported architecture icon aliases, semantic group/node/edge schema, and package-resolution rules for semantic, cloud, tech, company, product, framework, and fallback icons. Use this when choosing icon names and semantic props for .arch DSL groups, nodes, and edges.".to_string(),
-        "architecture_revision_list" => "List local-only architecture revision snapshots for one graph or the repo. Use only for explicit history, comparison, recovery, or deleted-graph restore work; normal latest graph context never reads revisions.".to_string(),
-        "architecture_revision_read" => "Read one local-only architecture revision snapshot by graph_id and revision_id. Use explicit revision reads only when the user asks to compare, recover, or reuse old architecture content.".to_string(),
-        "architecture_revision_restore" => "Restore one local-only architecture revision into globalGraphsRoot/<graph-id>.arch or .json and record the restore as a fresh revision. Use only after the user requests recovery or chooses a revision.".to_string(),
         "list_todo_targets" => "List same-account device/workspace targets from the local Rust SQLite todo mirror. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call.".to_string(),
         "get_todo_status" => "Return compact current status rows for todo batches, dispatch ids, todo ids, or target filters from the local Rust SQLite todo mirror only. Rust sync keeps this mirror current; this tool does not refresh Cloud during the call.".to_string(),
         "wait_for_todos" => "Wait inside the local Rust proxy over local SQLite todo status until selected todo dispatches satisfy until=terminal, accepted, or running, then return compact status. Do not manually sleep/poll from the coding agent.".to_string(),
@@ -5192,55 +5029,6 @@ fn tool_input_schema(name: &str) -> Value {
                 "reason": {"type": "string", "description": "Short public reason for the lease."}
             },
             "required": ["task_id", "resource_key"],
-            "additionalProperties": true
-        }),
-        "architecture_context" => json!({
-            "type": "object",
-            "properties": {
-                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."}
-            },
-            "additionalProperties": true
-        }),
-        "architecture_list" => json!({
-            "type": "object",
-            "properties": {
-                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."}
-            },
-            "additionalProperties": true
-        }),
-        "architecture_icon_reference" => json!({
-            "type": "object",
-            "properties": {
-                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."}
-            },
-            "additionalProperties": true
-        }),
-        "architecture_revision_list" => json!({
-            "type": "object",
-            "properties": {
-                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."},
-                "graph_id": {"type": "string", "description": "Optional architecture graph id. Omit to list local-only revisions across the repo, including deleted graph snapshots."}
-            },
-            "additionalProperties": true
-        }),
-        "architecture_revision_read" => json!({
-            "type": "object",
-            "properties": {
-                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."},
-                "graph_id": {"type": "string", "description": "Required architecture graph id."},
-                "revision_id": {"type": "string", "description": "Required local-only architecture revision id from architecture_revision_list."}
-            },
-            "required": ["graph_id", "revision_id"],
-            "additionalProperties": true
-        }),
-        "architecture_revision_restore" => json!({
-            "type": "object",
-            "properties": {
-                "repo_path": {"type": "string", "description": "Optional repo path. Defaults to the coordination context repo."},
-                "graph_id": {"type": "string", "description": "Required architecture graph id."},
-                "revision_id": {"type": "string", "description": "Required local-only architecture revision id to restore."}
-            },
-            "required": ["graph_id", "revision_id"],
             "additionalProperties": true
         }),
         "list_todo_targets" => json!({
@@ -5484,25 +5272,6 @@ mod tests {
     }
 
     #[test]
-    fn architecture_graph_only_start_task_plan_is_direct_live_work() {
-        assert!(start_task_plan_is_direct_architecture_graph_work(
-            "Create a new architecture graph for the React context auth flow."
-        ));
-        assert!(start_task_plan_is_direct_architecture_graph_work(
-            "Update globalGraphsRoot/auth-flow.arch with the new API corridor."
-        ));
-        assert!(start_task_plan_is_direct_architecture_graph_work(
-            "Update $DIFFFORGE_ARCHITECTURE_GRAPHS_ROOT/auth-flow.arch with the new API corridor."
-        ));
-        assert!(!start_task_plan_is_direct_architecture_graph_work(
-            "Implement code for the auth flow based on the architecture graph."
-        ));
-        assert!(!start_task_plan_is_direct_architecture_graph_work(
-            "Run architecture target Deploy and update src/deploy.ts."
-        ));
-    }
-
-    #[test]
     fn lifecycle_tools_are_hidden_for_direct_unmanaged_policy() {
         let repo = std::env::temp_dir().join(format!(
             "diffforge-mcp-direct-unmanaged-{}",
@@ -5531,7 +5300,6 @@ mod tests {
             );
         }
         for tool in [
-            "architecture_context",
             "list_assets",
             "get_asset_root",
             "upload_asset",
@@ -5541,6 +5309,10 @@ mod tests {
         ] {
             assert!(tools.contains(&tool), "{tool} must remain available");
         }
+        assert!(
+            !tools.contains(&"architecture_context"),
+            "deprecated architecture MCP tools must stay retired"
+        );
 
         let denied = dispatch_tool(
             &session_context,

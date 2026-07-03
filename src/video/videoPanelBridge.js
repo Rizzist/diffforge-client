@@ -1,0 +1,12 @@
+export const VIDEO_STORE_CHANGED_EVENT = "video-store-changed";
+export const VIDEO_TOOLS_INSTALL_PROGRESS_EVENT = "video-tools-install-progress";
+export const VIDEO_EXPORT_PROGRESS_EVENT = "video-export-progress";
+export const VIDEO_GENERATE_PROGRESS_EVENT = "video-generate-progress";
+export const VIDEO_LORA_PROGRESS_EVENT = "video-lora-progress";
+export const VIDEO_PANEL_CLOSED_EVENT = "video-panel-closed";
+export const VIDEO_PANEL_CONTROL_EVENT = "video-panel-control";
+export const VIDEO_PANEL_COMMAND_EVENT = "video-panel-command";
+export const VIDEO_PANEL_CONTROL_RETURN = "return";
+export const VIDEO_PANEL_CONTROL_PROJECT_CHANGE = "project_change";
+export const VIDEO_WINDOW_HASH = "#/video-window";
+export const VIDEO_ASSET_DRAG_MIME = "application/x-diffforge-video-asset";

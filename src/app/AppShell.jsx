@@ -18,6 +18,7 @@ import { ErrorOutline } from "@styled-icons/material-rounded/ErrorOutline";
 import { History } from "@styled-icons/material-rounded/History";
 import { HourglassEmpty } from "@styled-icons/material-rounded/HourglassEmpty";
 import { KeyboardArrowDown } from "@styled-icons/material-rounded/KeyboardArrowDown";
+import { Movie } from "@styled-icons/material-rounded/Movie";
 import { PauseCircle } from "@styled-icons/material-rounded/PauseCircle";
 import { PermMedia } from "@styled-icons/material-rounded/PermMedia";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
@@ -3910,6 +3911,9 @@ const DEFAULT_WORKSPACE_PCB_COUNT = 0;
 const MIN_WORKSPACE_VM_COUNT = 0;
 const MAX_WORKSPACE_VM_COUNT = 4;
 const DEFAULT_WORKSPACE_VM_COUNT = 0;
+const MIN_WORKSPACE_VIDEO_PANEL_COUNT = 0;
+const MAX_WORKSPACE_VIDEO_PANEL_COUNT = 3;
+const DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT = 0;
 const TERMINAL_DEFAULT_COLS = 80;
 const TERMINAL_DEFAULT_ROWS = 24;
 const TERMINAL_MIN_COLS = 20;
@@ -13953,6 +13957,12 @@ const WORKSPACE_PANEL_CARDS = [
     maxCount: MAX_WORKSPACE_VM_COUNT,
   },
   {
+    id: "video-editor",
+    label: "Video editor",
+    statusLabel: "ready",
+    maxCount: MAX_WORKSPACE_VIDEO_PANEL_COUNT,
+  },
+  {
     id: "touch-whiteboard",
     label: "Touch Whiteboard",
     statusLabel: "coming soon",
@@ -13972,6 +13982,9 @@ function WorkspacePanelGlyph({ panelId }) {
   }
   if (panelId === "vm-sandbox") {
     return <ButtonTerminalIcon aria-hidden="true" />;
+  }
+  if (panelId === "video-editor") {
+    return <Movie aria-hidden="true" />;
   }
   if (panelId === "touch-whiteboard") {
     return <ButtonWhiteboardIcon aria-hidden="true" />;
@@ -14220,6 +14233,7 @@ function WorkspaceCreatePanel({
     web: DEFAULT_WORKSPACE_WEB_PANEL_COUNT,
     "pcb-design": DEFAULT_WORKSPACE_PCB_COUNT,
     "vm-sandbox": DEFAULT_WORKSPACE_VM_COUNT,
+    "video-editor": DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT,
   });
   const [agentPermissions, setAgentPermissions] = useState({});
   const [agentSessionModeDraft, setAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
@@ -14275,6 +14289,7 @@ function WorkspaceCreatePanel({
       web: DEFAULT_WORKSPACE_WEB_PANEL_COUNT,
       "pcb-design": DEFAULT_WORKSPACE_PCB_COUNT,
       "vm-sandbox": DEFAULT_WORKSPACE_VM_COUNT,
+      "video-editor": DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT,
     });
     setAgentPermissions(normalizeWorkspaceAgentPermissions(null, roleOptions));
     setAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
@@ -14434,6 +14449,17 @@ function WorkspaceCreatePanel({
         }
         return { ...current, "vm-sandbox": nextValue };
       });
+      return;
+    }
+    if (panelId === "video-editor") {
+      setPanelCounts((current) => {
+        const currentValue = normalizeWorkspaceVideoCount(current["video-editor"]);
+        const nextValue = normalizeWorkspaceVideoCount(currentValue + Number(delta || 0));
+        if (nextValue === currentValue) {
+          return current;
+        }
+        return { ...current, "video-editor": nextValue };
+      });
     }
   }, []);
 
@@ -14463,7 +14489,8 @@ function WorkspaceCreatePanel({
     web: normalizeWorkspaceWebPanelCount(panelCounts.web),
     "pcb-design": normalizeWorkspacePcbCount(panelCounts["pcb-design"]),
     "vm-sandbox": normalizeWorkspaceVmCount(panelCounts["vm-sandbox"]),
-  }), [panelCounts.document, panelCounts.web, panelCounts["pcb-design"], panelCounts["vm-sandbox"]]);
+    "video-editor": normalizeWorkspaceVideoCount(panelCounts["video-editor"]),
+  }), [panelCounts.document, panelCounts.web, panelCounts["pcb-design"], panelCounts["video-editor"], panelCounts["vm-sandbox"]]);
 
   useEffect(() => {
     if (!visible) {
@@ -14826,7 +14853,7 @@ function WorkspaceCreatePanel({
         <WorkspaceCreateSection>
           <SettingsLabel>Panels</SettingsLabel>
           <SettingsHint>
-            Pick non-terminal workspace panels. Web, PCB design, and VM Sandbox panels open in the terminals grid. You can add or remove them later too.
+            Pick non-terminal workspace panels. Web, PCB design, VM Sandbox, and Video editor panels open in the terminals grid. You can add or remove them later too.
           </SettingsHint>
           <WorkspacePanelCountCards
             counts={availablePanelCounts}
@@ -14849,6 +14876,9 @@ function WorkspaceCreatePanel({
               : ""}
             {availablePanelCounts["vm-sandbox"]
               ? ` and ${availablePanelCounts["vm-sandbox"]} VM Sandbox panel${availablePanelCounts["vm-sandbox"] === 1 ? "" : "s"}`
+              : ""}
+            {availablePanelCounts["video-editor"]
+              ? ` and ${availablePanelCounts["video-editor"]} Video editor panel${availablePanelCounts["video-editor"] === 1 ? "" : "s"}`
               : ""}
             {" "}will open in {getDirectoryName(currentDirectory) || "the chosen folder"}.
           </SettingsHint>
@@ -18053,6 +18083,14 @@ function normalizeWorkspaceVmCount(value) {
   return Math.min(MAX_WORKSPACE_VM_COUNT, Math.max(MIN_WORKSPACE_VM_COUNT, count));
 }
 
+function normalizeWorkspaceVideoCount(value) {
+  const count = Number.parseInt(value, 10);
+  if (!Number.isFinite(count)) {
+    return DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT;
+  }
+  return Math.min(MAX_WORKSPACE_VIDEO_PANEL_COUNT, Math.max(MIN_WORKSPACE_VIDEO_PANEL_COUNT, count));
+}
+
 function getWorkspaceDocumentCount(workspaceSettings, workspaceId) {
   const settings = workspaceSettings?.[workspaceId];
   const paneRecords = normalizeWorkspacePaneRecords(settings?.panes, { workspaceId });
@@ -18087,6 +18125,18 @@ function getWorkspaceVmCount(workspaceSettings, workspaceId) {
     return DEFAULT_WORKSPACE_VM_COUNT;
   }
   return normalizeWorkspaceVmCount(settings.vmCount);
+}
+
+function getWorkspaceVideoCount(workspaceSettings, workspaceId) {
+  const settings = workspaceSettings?.[workspaceId];
+  const paneCount = getWorkspaceVideoPaneIndexes(workspaceSettings, workspaceId).length;
+  if (paneCount > 0) {
+    return normalizeWorkspaceVideoCount(paneCount);
+  }
+  if (!settings || !Object.prototype.hasOwnProperty.call(settings, "videoCount")) {
+    return DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT;
+  }
+  return normalizeWorkspaceVideoCount(settings.videoCount);
 }
 
 function getWorkspaceTerminalRoleIds(roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS) {
@@ -18738,6 +18788,10 @@ function normalizeWorkspaceSettings(value) {
         let vmCount = hasVmCount
           ? normalizeWorkspaceVmCount(settings.vmCount)
           : DEFAULT_WORKSPACE_VM_COUNT;
+        const hasVideoCount = Object.prototype.hasOwnProperty.call(settings || {}, "videoCount");
+        let videoCount = hasVideoCount
+          ? normalizeWorkspaceVideoCount(settings.videoCount)
+          : DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT;
         let paneKinds = {
           ...normalizeWorkspacePaneKinds(settings?.paneKinds),
           ...inputPaneKinds,
@@ -18749,6 +18803,10 @@ function normalizeWorkspaceSettings(value) {
         const existingVmPaneCount = workspacePaneKindsVmIndexes(paneKinds).length;
         if (!hasVmCount && existingVmPaneCount > 0) {
           vmCount = normalizeWorkspaceVmCount(existingVmPaneCount);
+        }
+        const existingVideoPaneCount = workspacePaneKindsVideoIndexes(paneKinds).length;
+        if (!hasVideoCount && existingVideoPaneCount > 0) {
+          videoCount = normalizeWorkspaceVideoCount(existingVideoPaneCount);
         }
         let hydratedPanes = ensureWorkspacePaneKindCount(
           paneKinds,
@@ -18764,11 +18822,19 @@ function normalizeWorkspaceSettings(value) {
           vmCount,
           terminalRoles[0] || "codex",
         );
+        hydratedPanes = ensureWorkspacePaneKindCount(
+          hydratedPanes.paneKinds,
+          hydratedPanes.terminalRoles,
+          WORKSPACE_PANE_KIND_VIDEO,
+          videoCount,
+          terminalRoles[0] || "codex",
+        );
         paneKinds = hydratedPanes.paneKinds;
         terminalRoles = hydratedPanes.terminalRoles;
         terminalCount = terminalRoles.length;
         pcbCount = workspacePaneKindsPcbIndexes(paneKinds).length;
         vmCount = workspacePaneKindsVmIndexes(paneKinds).length;
+        videoCount = workspacePaneKindsVideoIndexes(paneKinds).length;
         const hasLogicalTerminalIndexes = Object.prototype.hasOwnProperty.call(settings || {}, "logicalTerminalIndexes");
         const logicalTerminalIndexes = hasLogicalTerminalIndexes
           ? normalizePersistedWorkspaceLogicalIndexes(settings.logicalTerminalIndexes, terminalCount, paneKinds)
@@ -18792,6 +18858,7 @@ function normalizeWorkspaceSettings(value) {
           : null;
         const hasDefaultPcbCount = pcbCount === DEFAULT_WORKSPACE_PCB_COUNT;
         const hasDefaultVmCount = vmCount === DEFAULT_WORKSPACE_VM_COUNT;
+        const hasDefaultVideoCount = videoCount === DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT;
         const hasPanelPanes = workspacePaneKindsHasPanels(paneKinds);
         const paneRecordIndexes = Array.isArray(logicalTerminalIndexes)
           ? logicalTerminalIndexes
@@ -18825,6 +18892,7 @@ function normalizeWorkspaceSettings(value) {
             && hasDefaultDocumentsCount
             && hasDefaultPcbCount
             && hasDefaultVmCount
+            && hasDefaultVideoCount
             && !hasPanelPanes
             && !hasCustomAgentPermissions
             && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
@@ -18846,6 +18914,7 @@ function normalizeWorkspaceSettings(value) {
             documentsCount,
             pcbCount,
             vmCount,
+            videoCount,
             ...(panes.length ? { panes } : {}),
             ...(hasPanelPanes ? { paneKinds } : {}),
             ...(Array.isArray(logicalTerminalIndexes) ? { logicalTerminalIndexes } : {}),
@@ -20300,16 +20369,19 @@ const WORKSPACE_PANE_KIND_DOCS = "docs";
 const WORKSPACE_PANE_KIND_WEB = "web";
 const WORKSPACE_PANE_KIND_PCB = "pcb";
 const WORKSPACE_PANE_KIND_VM = "vm";
+const WORKSPACE_PANE_KIND_VIDEO = "video";
 const WORKSPACE_PANE_KINDS = new Set([
   WORKSPACE_PANE_KIND_WEB,
   WORKSPACE_PANE_KIND_PCB,
   WORKSPACE_PANE_KIND_VM,
+  WORKSPACE_PANE_KIND_VIDEO,
 ]);
 const WORKSPACE_SLOT_PANE_KINDS = new Set([
   WORKSPACE_PANE_KIND_TERMINAL,
   WORKSPACE_PANE_KIND_WEB,
   WORKSPACE_PANE_KIND_PCB,
   WORKSPACE_PANE_KIND_VM,
+  WORKSPACE_PANE_KIND_VIDEO,
 ]);
 const WORKSPACE_PANE_RECORD_KINDS = new Set([
   WORKSPACE_PANE_KIND_TERMINAL,
@@ -20317,6 +20389,7 @@ const WORKSPACE_PANE_RECORD_KINDS = new Set([
   WORKSPACE_PANE_KIND_WEB,
   WORKSPACE_PANE_KIND_PCB,
   WORKSPACE_PANE_KIND_VM,
+  WORKSPACE_PANE_KIND_VIDEO,
 ]);
 
 function normalizeWorkspacePaneKind(value, fallback = "") {
@@ -20339,6 +20412,9 @@ function normalizeWorkspacePaneKind(value, fallback = "") {
   if (["vm", "vms", "qemu", "vm-sandbox", "sandbox-vm", "virtual-machine", "virtual-machines", "workspace-vm", "vmware"].includes(normalizedKind)) {
     return WORKSPACE_PANE_KIND_VM;
   }
+  if (["video", "video-editor", "videoeditor"].includes(normalizedKind)) {
+    return WORKSPACE_PANE_KIND_VIDEO;
+  }
   return fallback;
 }
 
@@ -20346,6 +20422,7 @@ function workspacePaneRecordKindLabel(kind) {
   if (kind === WORKSPACE_PANE_KIND_DOCS) return "Docs";
   if (kind === WORKSPACE_PANE_KIND_PCB) return "PCB";
   if (kind === WORKSPACE_PANE_KIND_VM) return "VM Sandbox";
+  if (kind === WORKSPACE_PANE_KIND_VIDEO) return "Video editor";
   if (kind === WORKSPACE_PANE_KIND_WEB) return "Web";
   return "Terminal";
 }
@@ -20694,6 +20771,7 @@ function workspacePaneKindsHasPanels(paneKinds) {
 function workspacePaneKindLabel(kind) {
   if (kind === WORKSPACE_PANE_KIND_PCB) return "PCB";
   if (kind === WORKSPACE_PANE_KIND_VM) return "VM Sandbox";
+  if (kind === WORKSPACE_PANE_KIND_VIDEO) return "Video editor";
   if (kind === WORKSPACE_PANE_KIND_WEB) return "Web";
   return "Panel";
 }
@@ -21054,6 +21132,10 @@ function workspacePaneKindsVmIndexes(paneKinds) {
   return workspacePaneKindsIndexes(paneKinds, WORKSPACE_PANE_KIND_VM);
 }
 
+function workspacePaneKindsVideoIndexes(paneKinds) {
+  return workspacePaneKindsIndexes(paneKinds, WORKSPACE_PANE_KIND_VIDEO);
+}
+
 function getWorkspaceTerminalOnlyRolesForPaneKinds(
   logicalIndexes,
   terminalRoles,
@@ -21073,12 +21155,15 @@ function getWorkspaceTerminalOnlyRolesForPaneKinds(
     .map(({ role }) => role || fallbackRole);
 }
 
-function getWorkspaceDraftPanelPaneKinds(paneKinds, webPanelCount, pcbCount, vmCount = null) {
+function getWorkspaceDraftPanelPaneKinds(paneKinds, webPanelCount, pcbCount, vmCount = null, videoCount = null) {
   const normalizedPaneKinds = normalizeWorkspacePaneKinds(paneKinds);
   const nextPaneKinds = {};
   const desiredVmCount = vmCount === null || vmCount === undefined
     ? workspacePaneKindsVmIndexes(normalizedPaneKinds).length
     : normalizeWorkspaceVmCount(vmCount);
+  const desiredVideoCount = videoCount === null || videoCount === undefined
+    ? workspacePaneKindsVideoIndexes(normalizedPaneKinds).length
+    : normalizeWorkspaceVideoCount(videoCount);
 
   workspacePaneKindsWebIndexes(normalizedPaneKinds)
     .slice(0, normalizeWorkspaceWebPanelCount(webPanelCount))
@@ -21094,6 +21179,11 @@ function getWorkspaceDraftPanelPaneKinds(paneKinds, webPanelCount, pcbCount, vmC
     .slice(0, desiredVmCount)
     .forEach((slotIndex) => {
       nextPaneKinds[slotIndex] = WORKSPACE_PANE_KIND_VM;
+    });
+  workspacePaneKindsVideoIndexes(normalizedPaneKinds)
+    .slice(0, desiredVideoCount)
+    .forEach((slotIndex) => {
+      nextPaneKinds[slotIndex] = WORKSPACE_PANE_KIND_VIDEO;
     });
 
   return nextPaneKinds;
@@ -21119,7 +21209,9 @@ function fillWorkspaceDraftPanelPaneKinds(paneKinds, usedIndexes, paneKind, targ
     ? normalizeWorkspacePcbCount(targetCount)
     : paneKind === WORKSPACE_PANE_KIND_VM
       ? normalizeWorkspaceVmCount(targetCount)
-      : normalizeWorkspaceWebPanelCount(targetCount);
+      : paneKind === WORKSPACE_PANE_KIND_VIDEO
+        ? normalizeWorkspaceVideoCount(targetCount)
+        : normalizeWorkspaceWebPanelCount(targetCount);
   let currentCount = workspacePaneKindsIndexes(nextPaneKinds, paneKind).length;
   let nextSlotIndex = 0;
 
@@ -21145,6 +21237,10 @@ function getWorkspacePcbPaneIndexes(workspaceSettings, workspaceId) {
 
 function getWorkspaceVmPaneIndexes(workspaceSettings, workspaceId) {
   return workspacePaneKindsVmIndexes(getWorkspacePaneKinds(workspaceSettings, workspaceId));
+}
+
+function getWorkspaceVideoPaneIndexes(workspaceSettings, workspaceId) {
+  return workspacePaneKindsVideoIndexes(getWorkspacePaneKinds(workspaceSettings, workspaceId));
 }
 
 function expandTerminalRolesForPaneKinds(terminalRoles, paneKinds, fallbackRole = "codex") {
@@ -21514,6 +21610,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const hasDocumentsCount = Object.prototype.hasOwnProperty.call(nextValues, "documentsCount");
   const hasPcbCount = Object.prototype.hasOwnProperty.call(nextValues, "pcbCount");
   const hasVmCount = Object.prototype.hasOwnProperty.call(nextValues, "vmCount");
+  const hasVideoCount = Object.prototype.hasOwnProperty.call(nextValues, "videoCount");
   const hasPaneKinds = Object.prototype.hasOwnProperty.call(nextValues, "paneKinds");
   const hasPanes = Object.prototype.hasOwnProperty.call(nextValues, "panes");
   const hasAgentPermissions = Object.prototype.hasOwnProperty.call(nextValues, "agentPermissions");
@@ -21523,7 +21620,8 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     || hasTerminalCount
     || hasTerminalRoles
     || hasPcbCount
-    || hasVmCount;
+    || hasVmCount
+    || hasVideoCount;
   const inputPanes = normalizeWorkspacePaneRecords(
     hasPanes
       ? nextValues.panes
@@ -21594,6 +21692,13 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
         ? currentSettings.vmCount
         : DEFAULT_WORKSPACE_VM_COUNT,
   );
+  let videoCount = normalizeWorkspaceVideoCount(
+    hasVideoCount
+      ? nextValues.videoCount
+      : Object.prototype.hasOwnProperty.call(currentSettings, "videoCount")
+        ? currentSettings.videoCount
+        : DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT,
+  );
   let paneKinds = {
     ...normalizeWorkspacePaneKinds(
       hasPaneKinds ? nextValues.paneKinds : currentSettings.paneKinds,
@@ -21607,6 +21712,10 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const existingVmPaneCount = workspacePaneKindsVmIndexes(paneKinds).length;
   if (!hasVmCount && existingVmPaneCount > 0) {
     vmCount = normalizeWorkspaceVmCount(existingVmPaneCount);
+  }
+  const existingVideoPaneCount = workspacePaneKindsVideoIndexes(paneKinds).length;
+  if (!hasVideoCount && existingVideoPaneCount > 0) {
+    videoCount = normalizeWorkspaceVideoCount(existingVideoPaneCount);
   }
   let hydratedPanes = ensureWorkspacePaneKindCount(
     paneKinds,
@@ -21622,11 +21731,19 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     vmCount,
     fallbackRole,
   );
+  hydratedPanes = ensureWorkspacePaneKindCount(
+    hydratedPanes.paneKinds,
+    hydratedPanes.terminalRoles,
+    WORKSPACE_PANE_KIND_VIDEO,
+    videoCount,
+    fallbackRole,
+  );
   paneKinds = hydratedPanes.paneKinds;
   terminalRoles = hydratedPanes.terminalRoles;
   terminalCount = terminalRoles.length;
   pcbCount = workspacePaneKindsPcbIndexes(paneKinds).length;
   vmCount = workspacePaneKindsVmIndexes(paneKinds).length;
+  videoCount = workspacePaneKindsVideoIndexes(paneKinds).length;
   const shouldPersistLogicalIndexes = hasLogicalTerminalIndexes
     || Object.prototype.hasOwnProperty.call(currentSettings || {}, "logicalTerminalIndexes");
   const logicalTerminalIndexes = shouldPersistLogicalIndexes
@@ -21659,6 +21776,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     : null;
   const hasDefaultPcbCount = pcbCount === DEFAULT_WORKSPACE_PCB_COUNT;
   const hasDefaultVmCount = vmCount === DEFAULT_WORKSPACE_VM_COUNT;
+  const hasDefaultVideoCount = videoCount === DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT;
   const hasPanelPanes = workspacePaneKindsHasPanels(paneKinds);
   const paneRecordIndexes = Array.isArray(logicalTerminalIndexes)
     ? logicalTerminalIndexes
@@ -21697,6 +21815,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     && hasDefaultDocumentsCount
     && hasDefaultPcbCount
     && hasDefaultVmCount
+    && hasDefaultVideoCount
     && !hasPanelPanes
     && !hasCustomAgentPermissions
     && agentSessionMode === AGENT_SESSION_MODE_COORDINATED
@@ -21716,6 +21835,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     documentsCount,
     pcbCount,
     vmCount,
+    videoCount,
     ...(panes.length ? { panes } : {}),
     ...(hasPanelPanes ? { paneKinds } : {}),
     ...(Array.isArray(logicalTerminalIndexes) ? { logicalTerminalIndexes } : {}),
@@ -21838,6 +21958,7 @@ export default function App() {
   const [workspaceWebPanelCountDraft, setWorkspaceWebPanelCountDraft] = useState(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
   const [workspacePcbCountDraft, setWorkspacePcbCountDraft] = useState(String(DEFAULT_WORKSPACE_PCB_COUNT));
   const [workspaceVmPanelCountDraft, setWorkspaceVmPanelCountDraft] = useState(String(DEFAULT_WORKSPACE_VM_COUNT));
+  const [workspaceVideoPanelCountDraft, setWorkspaceVideoPanelCountDraft] = useState(String(DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT));
   const [workspaceAgentPermissionsDraft, setWorkspaceAgentPermissionsDraft] = useState({});
   const [workspaceAgentSessionModeDraft, setWorkspaceAgentSessionModeDraft] = useState(AGENT_SESSION_MODE_COORDINATED);
   const [workspaceInitializeGitDraft, setWorkspaceInitializeGitDraft] = useState(false);
@@ -25474,6 +25595,7 @@ export default function App() {
     setWorkspaceWebPanelCountDraft(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
     setWorkspacePcbCountDraft(String(DEFAULT_WORKSPACE_PCB_COUNT));
     setWorkspaceVmPanelCountDraft(String(DEFAULT_WORKSPACE_VM_COUNT));
+    setWorkspaceVideoPanelCountDraft(String(DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT));
     setWorkspaceAgentPermissionsDraft(normalizeWorkspaceAgentPermissions(null));
     setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
     setWorkspaceInitializeGitDraft(false);
@@ -25555,6 +25677,7 @@ export default function App() {
     setWorkspaceWebPanelCountDraft(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
     setWorkspacePcbCountDraft(String(DEFAULT_WORKSPACE_PCB_COUNT));
     setWorkspaceVmPanelCountDraft(String(DEFAULT_WORKSPACE_VM_COUNT));
+    setWorkspaceVideoPanelCountDraft(String(DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT));
     setWorkspaceAgentPermissionsDraft(normalizeWorkspaceAgentPermissions(null));
     setWorkspaceAgentSessionModeDraft(AGENT_SESSION_MODE_COORDINATED);
     setWorkspaceInitializeGitDraft(false);
@@ -28913,6 +29036,7 @@ export default function App() {
       );
       const pcbCount = normalizeWorkspacePcbCount(requestedPanelCounts?.["pcb-design"]);
       const vmCount = normalizeWorkspaceVmCount(requestedPanelCounts?.["vm-sandbox"] ?? requestedPanelCounts?.vm);
+      const videoCount = normalizeWorkspaceVideoCount(requestedPanelCounts?.["video-editor"] ?? requestedPanelCounts?.video);
       const webPanelCount = normalizeWorkspaceWebPanelCount(requestedPanelCounts?.web);
       // Panel panes occupy slots after the terminal slots. Their terminalRoles
       // entry is a never-read placeholder; paneKinds marks them so the grid
@@ -28921,10 +29045,12 @@ export default function App() {
       let seededPaneKinds = null;
       let seededPcbCount = pcbCount;
       let seededVmCount = vmCount;
+      let seededVideoCount = videoCount;
       const requestedGridPanels = [
         ...Array.from({ length: webPanelCount }, () => WORKSPACE_PANE_KIND_WEB),
         ...Array.from({ length: pcbCount }, () => WORKSPACE_PANE_KIND_PCB),
         ...Array.from({ length: vmCount }, () => WORKSPACE_PANE_KIND_VM),
+        ...Array.from({ length: videoCount }, () => WORKSPACE_PANE_KIND_VIDEO),
       ];
       if (requestedGridPanels.length > 0) {
         const baseTerminalRoles = terminalRoles && terminalRoles.length ? terminalRoles : ["codex"];
@@ -28943,6 +29069,7 @@ export default function App() {
         }
         seededPcbCount = workspacePaneKindsPcbIndexes(seededPaneKinds).length;
         seededVmCount = workspacePaneKindsVmIndexes(seededPaneKinds).length;
+        seededVideoCount = workspacePaneKindsVideoIndexes(seededPaneKinds).length;
       }
       const seededLogicalIndexes = seededTerminalRoles?.length
         ? normalizeWorkspaceTerminalIndexes(undefined, seededTerminalRoles.length)
@@ -28962,6 +29089,7 @@ export default function App() {
         documentsCount,
         pcbCount: seededPcbCount,
         vmCount: seededVmCount,
+        videoCount: seededVideoCount,
         agentPermissions,
         ...(seededTerminalRoles
           ? { terminalCount: seededTerminalRoles.length, terminalRoles: seededTerminalRoles }
@@ -29076,6 +29204,7 @@ export default function App() {
     const webPanelCount = normalizeWorkspaceWebPanelCount(workspaceWebPanelCountDraft);
     const pcbPanelCount = normalizeWorkspacePcbCount(workspacePcbCountDraft);
     const vmPanelCount = normalizeWorkspaceVmCount(workspaceVmPanelCountDraft);
+    const videoPanelCount = normalizeWorkspaceVideoCount(workspaceVideoPanelCountDraft);
     const terminalRoles = normalizeWorkspaceTerminalRoles(
       workspaceTerminalRolesDraft,
       terminalCount,
@@ -29213,11 +29342,16 @@ export default function App() {
         vmPanelCount,
         Math.max(0, panelSlotCapacity - desiredWebPanelCount - desiredPcbPanelCount),
       );
+      const desiredVideoPanelCount = Math.min(
+        videoPanelCount,
+        Math.max(0, panelSlotCapacity - desiredWebPanelCount - desiredPcbPanelCount - desiredVmPanelCount),
+      );
       let settingsStoredPaneKinds = getWorkspaceDraftPanelPaneKinds(
         settingsPaneKinds,
         desiredWebPanelCount,
         desiredPcbPanelCount,
         desiredVmPanelCount,
+        desiredVideoPanelCount,
       );
       const keptPanelIndexes = workspacePaneKindsIndexes(settingsStoredPaneKinds);
       const terminalNextIndexes = rootChanged
@@ -29246,6 +29380,12 @@ export default function App() {
         WORKSPACE_PANE_KIND_VM,
         desiredVmPanelCount,
       );
+      settingsStoredPaneKinds = fillWorkspaceDraftPanelPaneKinds(
+        settingsStoredPaneKinds,
+        usedDraftSlotIndexes,
+        WORKSPACE_PANE_KIND_VIDEO,
+        desiredVideoPanelCount,
+      );
       const settingsPanelIndexes = workspacePaneKindsIndexes(settingsStoredPaneKinds);
       const settingsPanelIndexSet = new Set(settingsPanelIndexes);
       const nextTerminalIndexes = normalizeWorkspaceTerminalSlotIndexes([
@@ -29261,6 +29401,7 @@ export default function App() {
       const effectiveWebPanelCount = workspacePaneKindsWebIndexes(settingsStoredPaneKinds).length;
       const effectivePcbCount = workspacePaneKindsPcbIndexes(settingsStoredPaneKinds).length;
       const effectiveVmCount = workspacePaneKindsVmIndexes(settingsStoredPaneKinds).length;
+      const effectiveVideoCount = workspacePaneKindsVideoIndexes(settingsStoredPaneKinds).length;
       const nextTerminalIndexSet = new Set(nextTerminalIndexes);
       const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
         [terminalIndex, effectiveTerminalRoles[index]]
@@ -29439,6 +29580,7 @@ export default function App() {
           documentsCount,
           pcbCount: effectivePcbCount,
           vmCount: effectiveVmCount,
+          videoCount: effectiveVideoCount,
           paneKinds: settingsStoredPaneKinds,
           logicalTerminalIndexes: nextTerminalIndexes,
           displayRows: persistedDisplayRows,
@@ -29473,6 +29615,7 @@ export default function App() {
       setWorkspaceWebPanelCountDraft(String(effectiveWebPanelCount));
       setWorkspacePcbCountDraft(String(effectivePcbCount));
       setWorkspaceVmPanelCountDraft(String(effectiveVmCount));
+      setWorkspaceVideoPanelCountDraft(String(effectiveVideoCount));
       setWorkspaceTerminalRolesDraft(terminalRoles);
       setWorkspaceAgentPermissionsDraft(agentPermissions);
       setWorkspaceAgentSessionModeDraft(agentSessionMode);
@@ -29501,6 +29644,7 @@ export default function App() {
     workspaceWebPanelCountDraft,
     workspacePcbCountDraft,
     workspaceVmPanelCountDraft,
+    workspaceVideoPanelCountDraft,
     workspaceAgentSessionModeDraft,
     workspaceAgentPermissionsDraft,
     workspaceInitializeGitDraft,
@@ -29580,6 +29724,7 @@ export default function App() {
     const nextWebPanelCount = workspacePaneKindsWebIndexes(nextPaneKinds).length;
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
     const nextVmCount = workspacePaneKindsVmIndexes(nextPaneKinds).length;
+    const nextVideoCount = workspacePaneKindsVideoIndexes(nextPaneKinds).length;
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
       [workspaceId]: nextIndexes,
@@ -29594,6 +29739,7 @@ export default function App() {
       terminalRoles: nextTerminalRoles,
       pcbCount: nextPcbCount,
       vmCount: nextVmCount,
+      videoCount: nextVideoCount,
       paneKinds: nextPaneKinds,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
@@ -29631,6 +29777,7 @@ export default function App() {
       setWorkspaceWebPanelCountDraft(String(nextWebPanelCount));
       setWorkspacePcbCountDraft(String(nextPcbCount));
       setWorkspaceVmPanelCountDraft(String(nextVmCount));
+      setWorkspaceVideoPanelCountDraft(String(nextVideoCount));
     }
   }, [
     workspaceSettingsModalId,
@@ -29722,6 +29869,7 @@ export default function App() {
     const nextWebPanelCount = workspacePaneKindsWebIndexes(nextPaneKinds).length;
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
     const nextVmCount = workspacePaneKindsVmIndexes(nextPaneKinds).length;
+    const nextVideoCount = workspacePaneKindsVideoIndexes(nextPaneKinds).length;
     const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
     const nextDisplayRows = insertLogicalTerminalInDisplayRows(
       currentRows,
@@ -29739,6 +29887,7 @@ export default function App() {
       terminalRoles: nextTerminalRoles,
       pcbCount: nextPcbCount,
       vmCount: nextVmCount,
+      videoCount: nextVideoCount,
       paneKinds: nextPaneKinds,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
@@ -29772,6 +29921,7 @@ export default function App() {
       setWorkspaceWebPanelCountDraft(String(nextWebPanelCount));
       setWorkspacePcbCountDraft(String(nextPcbCount));
       setWorkspaceVmPanelCountDraft(String(nextVmCount));
+      setWorkspaceVideoPanelCountDraft(String(nextVideoCount));
     }
   }, [
     workspaceSettingsModalId,
@@ -29932,6 +30082,7 @@ export default function App() {
       setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
       setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
       setWorkspaceVmPanelCountDraft(String(workspacePaneKindsVmIndexes(nextPaneKinds).length));
+      setWorkspaceVideoPanelCountDraft(String(workspacePaneKindsVideoIndexes(nextPaneKinds).length));
     }
 
     const restoredThreadId = requestedProviderSessionId && AGENT_PROVIDERS.some((provider) => provider.id === nextRole)
@@ -30038,12 +30189,14 @@ export default function App() {
     const nextWebPanelCount = workspacePaneKindsWebIndexes(nextPaneKinds).length;
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
     const nextVmCount = workspacePaneKindsVmIndexes(nextPaneKinds).length;
+    const nextVideoCount = workspacePaneKindsVideoIndexes(nextPaneKinds).length;
     const nextDisplayRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
       pcbCount: nextPcbCount,
       vmCount: nextVmCount,
+      videoCount: nextVideoCount,
       paneKinds: nextPaneKinds,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
@@ -30077,6 +30230,7 @@ export default function App() {
       setWorkspaceWebPanelCountDraft(String(nextWebPanelCount));
       setWorkspacePcbCountDraft(String(nextPcbCount));
       setWorkspaceVmPanelCountDraft(String(nextVmCount));
+      setWorkspaceVideoPanelCountDraft(String(nextVideoCount));
     }
 
     return { paneKind, terminalIndex: nextTerminalIndex, workspaceId };
@@ -30096,6 +30250,10 @@ export default function App() {
 
   const addWorkspaceVmPane = useCallback((options = {}) => (
     addWorkspacePanelPane({ ...options, paneKind: WORKSPACE_PANE_KIND_VM })
+  ), [addWorkspacePanelPane]);
+
+  const addWorkspaceVideoPane = useCallback((options = {}) => (
+    addWorkspacePanelPane({ ...options, paneKind: WORKSPACE_PANE_KIND_VIDEO })
   ), [addWorkspacePanelPane]);
 
   const rejectWorkspacePromptDeliveriesForThread = useCallback((workspaceId, threadId, message = "") => {
@@ -30334,6 +30492,7 @@ export default function App() {
       setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
       setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
       setWorkspaceVmPanelCountDraft(String(workspacePaneKindsVmIndexes(nextPaneKinds).length));
+      setWorkspaceVideoPanelCountDraft(String(workspacePaneKindsVideoIndexes(nextPaneKinds).length));
     }
 
     setWorkspaceThreads((threads) => materializeWorkspaceThreadForTerminal(threads, {
@@ -30544,6 +30703,7 @@ export default function App() {
       setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
       setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
       setWorkspaceVmPanelCountDraft(String(workspacePaneKindsVmIndexes(nextPaneKinds).length));
+      setWorkspaceVideoPanelCountDraft(String(workspacePaneKindsVideoIndexes(nextPaneKinds).length));
     }
 
     if (roleThread?.id) {
@@ -30731,6 +30891,7 @@ export default function App() {
       setWorkspaceWebPanelCountDraft(String(workspacePaneKindsWebIndexes(nextPaneKinds).length));
       setWorkspacePcbCountDraft(String(workspacePaneKindsPcbIndexes(nextPaneKinds).length));
       setWorkspaceVmPanelCountDraft(String(workspacePaneKindsVmIndexes(nextPaneKinds).length));
+      setWorkspaceVideoPanelCountDraft(String(workspacePaneKindsVideoIndexes(nextPaneKinds).length));
     }
 
     const addedCount = addedIndexes.length;
@@ -32497,6 +32658,13 @@ export default function App() {
     [selectedWorkspace?.id, shouldShowWorkspaceSetup, workspaceSettings],
   );
   const selectedWorkspaceVmPanelCount = selectedWorkspaceVmPaneIndexes.length;
+  const selectedWorkspaceVideoPaneIndexes = useMemo(
+    () => (selectedWorkspace && !shouldShowWorkspaceSetup
+      ? getWorkspaceVideoPaneIndexes(workspaceSettings, selectedWorkspace.id)
+      : []),
+    [selectedWorkspace?.id, shouldShowWorkspaceSetup, workspaceSettings],
+  );
+  const selectedWorkspaceVideoPanelCount = selectedWorkspaceVideoPaneIndexes.length;
   const selectedWorkspaceSlotIndexes = useMemo(
     () => (selectedWorkspace && !shouldShowWorkspaceSetup
       ? getWorkspaceLogicalTerminalIndexes(
@@ -32508,9 +32676,9 @@ export default function App() {
     [selectedWorkspace?.id, shouldShowWorkspaceSetup, workspaceTerminalLogicalIndexes, selectedWorkspaceTerminalCount],
   );
   const selectedWorkspacePanelPaneIndexes = useMemo(
-    () => [...selectedWorkspaceWebPaneIndexes, ...selectedWorkspacePcbPaneIndexes, ...selectedWorkspaceVmPaneIndexes]
+    () => [...selectedWorkspaceWebPaneIndexes, ...selectedWorkspacePcbPaneIndexes, ...selectedWorkspaceVmPaneIndexes, ...selectedWorkspaceVideoPaneIndexes]
       .sort((left, right) => left - right),
-    [selectedWorkspacePcbPaneIndexes, selectedWorkspaceVmPaneIndexes, selectedWorkspaceWebPaneIndexes],
+    [selectedWorkspacePcbPaneIndexes, selectedWorkspaceVideoPaneIndexes, selectedWorkspaceVmPaneIndexes, selectedWorkspaceWebPaneIndexes],
   );
   const selectedWorkspaceTerminalOnlyRoles = useMemo(() => {
     if (!selectedWorkspacePanelPaneIndexes.length) {
@@ -40729,6 +40897,9 @@ export default function App() {
         if (["pcb", "pcb-design", "pcb-panel", "workspace-pcb", "board"].includes(token)) {
           return "pcb";
         }
+        if (["video", "video-editor", "videoeditor"].includes(token)) {
+          return "video";
+        }
         if ([
           "doc",
           "docs",
@@ -40927,7 +41098,13 @@ export default function App() {
           workspace: workspaceSummary(workspace),
         };
       }
-      const addPane = kind === "pcb" ? addWorkspacePcbPane : kind === "web" ? addWorkspaceWebPane : null;
+      const addPane = kind === "pcb"
+        ? addWorkspacePcbPane
+        : kind === "video"
+          ? addWorkspaceVideoPane
+          : kind === "web"
+            ? addWorkspaceWebPane
+            : null;
       if (!addPane) {
         throw new Error(`Unsupported workspace panel kind: ${kind}`);
       }
@@ -40944,6 +41121,10 @@ export default function App() {
           || "",
       ).trim();
       const pendingBoardName = String(input.boardName || input.board_name || "").trim();
+      const pendingProjectPath = String(
+        input.projectPath || input.project_path || input.path || input.filePath || input.file_path || "",
+      ).trim();
+      const pendingProjectName = String(input.projectName || input.project_name || "").trim();
       const pendingAction = kind === "web" && (input.url || input.search || input.query)
         ? {
           action: input.search || input.query ? "search" : "navigate",
@@ -40971,7 +41152,24 @@ export default function App() {
               terminalIndex: result.terminalIndex,
               workspaceId: workspace.id,
             }
-            : null;
+            : kind === "video" && (input.create || input.name)
+              ? {
+                action: "create",
+                kind,
+                name: input.name || "",
+                terminalIndex: result.terminalIndex,
+                workspaceId: workspace.id,
+              }
+              : kind === "video" && (pendingProjectPath || pendingProjectName)
+                ? {
+                  action: "select",
+                  kind,
+                  projectName: pendingProjectName,
+                  projectPath: pendingProjectPath,
+                  terminalIndex: result.terminalIndex,
+                  workspaceId: workspace.id,
+                }
+                : null;
       if (pendingAction) {
         window.setTimeout(() => {
           const nextBridge = workspaceToolRuntimeBridgesRef.current[workspace.id] || null;
@@ -47994,6 +48192,7 @@ export default function App() {
     setWorkspaceWebPanelCountDraft(String(selectedWorkspace ? selectedWorkspaceWebPanelCount : DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
     setWorkspacePcbCountDraft(String(selectedWorkspace ? selectedWorkspacePcbPanelCount : DEFAULT_WORKSPACE_PCB_COUNT));
     setWorkspaceVmPanelCountDraft(String(selectedWorkspace ? selectedWorkspaceVmPanelCount : DEFAULT_WORKSPACE_VM_COUNT));
+    setWorkspaceVideoPanelCountDraft(String(selectedWorkspace ? selectedWorkspaceVideoPanelCount : DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT));
     setWorkspaceTerminalRolesDraft(selectedWorkspace ? selectedWorkspaceTerminalOnlyRoles : normalizeWorkspaceTerminalRoles(
       [],
       MIN_WORKSPACE_TERMINAL_COUNT,
@@ -48020,6 +48219,7 @@ export default function App() {
     selectedWorkspaceDocumentCount,
     selectedWorkspacePcbPanelCount,
     selectedWorkspaceVmPanelCount,
+    selectedWorkspaceVideoPanelCount,
     selectedWorkspaceWebPanelCount,
     selectedWorkspaceTerminalOnlyCount,
     selectedWorkspaceTerminalOnlyRoles,
@@ -48243,7 +48443,8 @@ export default function App() {
     web: normalizeWorkspaceWebPanelCount(workspaceWebPanelCountDraft),
     "pcb-design": normalizeWorkspacePcbCount(workspacePcbCountDraft),
     "vm-sandbox": normalizeWorkspaceVmCount(workspaceVmPanelCountDraft),
-  }), [workspaceDocumentCountDraft, workspacePcbCountDraft, workspaceVmPanelCountDraft, workspaceWebPanelCountDraft]);
+    "video-editor": normalizeWorkspaceVideoCount(workspaceVideoPanelCountDraft),
+  }), [workspaceDocumentCountDraft, workspacePcbCountDraft, workspaceVideoPanelCountDraft, workspaceVmPanelCountDraft, workspaceWebPanelCountDraft]);
   const updateWorkspaceSettingsAgentCount = useCallback((roleId, delta) => {
     const nextRoles = adjustWorkspaceAgentCardRoles(
       workspaceSettingsTerminalRoles,
@@ -48307,6 +48508,15 @@ export default function App() {
       setWorkspaceVmPanelCountDraft((current) => {
         const currentValue = normalizeWorkspaceVmCount(current);
         return String(normalizeWorkspaceVmCount(currentValue + Number(delta || 0)));
+      });
+      setWorkspaceSettingsError("");
+      setWorkspaceSettingsMessage("");
+      return;
+    }
+    if (panelId === "video-editor") {
+      setWorkspaceVideoPanelCountDraft((current) => {
+        const currentValue = normalizeWorkspaceVideoCount(current);
+        return String(normalizeWorkspaceVideoCount(currentValue + Number(delta || 0)));
       });
       setWorkspaceSettingsError("");
       setWorkspaceSettingsMessage("");
@@ -49036,6 +49246,7 @@ export default function App() {
                             addWorkspaceTerminal={addWorkspaceTerminal}
                             addWorkspacePcbPane={addWorkspacePcbPane}
                             addWorkspaceVmPane={addWorkspaceVmPane}
+                            addWorkspaceVideoPane={addWorkspaceVideoPane}
                             addWorkspaceWebPane={addWorkspaceWebPane}
                             paneKinds={runtimeDescriptor.paneKinds}
                             closeWorkspaceTerminal={closeWorkspaceTerminal}
@@ -49445,7 +49656,7 @@ export default function App() {
                           <WorkspaceCreateSection>
                             <SettingsLabel>Panels</SettingsLabel>
                             <SettingsHint>
-                              Pick non-terminal workspace panels. Web, PCB design, and VM Sandbox panels open in the terminals grid. You can add or remove them later too.
+                              Pick non-terminal workspace panels. Web, PCB design, Video editor, and VM Sandbox panels open in the terminals grid. You can add or remove them later too.
                             </SettingsHint>
                             <WorkspacePanelCountCards
                               counts={workspaceSettingsPanelCounts}
