@@ -43,11 +43,11 @@ const KindTab = styled.button`
   border: 1px solid rgba(148, 163, 184, 0.18);
   background: rgba(9, 13, 20, 0.6);
   color: rgba(148, 163, 184, 0.9);
-  font-size: 10.5px;
+  font-size: 9px;
   font-weight: 800;
   letter-spacing: 0.06em;
   text-transform: uppercase;
-  padding: 6px 0;
+  padding: 5px 0;
   border-radius: 8px;
   cursor: pointer;
 
@@ -68,6 +68,26 @@ const Section = styled.div`
   gap: 8px;
   padding: 10px;
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+`;
+
+// Compact react-select sizing (model/resolution/quality/voice pickers).
+const CompactSelect = styled.div`
+  .app-select__control {
+    min-height: 28px;
+  }
+
+  .app-select__value-container {
+    padding: 0 8px;
+  }
+
+  .app-select__single-value,
+  .app-select__placeholder {
+    font-size: 11px;
+  }
+
+  .app-select__dropdown-indicator {
+    padding: 4px;
+  }
 `;
 
 const ProviderRow = styled.div`
@@ -190,33 +210,54 @@ const SlotClear = styled.span`
   text-align: center;
 `;
 
+// Quick-access asset picker: a single horizontal, trackpad-scrollable row.
 const PickerPop = styled.div`
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(64px, 1fr));
+  display: flex;
   gap: 4px;
-  max-height: 180px;
-  overflow-y: auto;
+  overflow-x: auto;
   padding: 6px;
   border: 1px solid rgba(148, 163, 184, 0.22);
   border-radius: 8px;
   background: rgba(7, 12, 22, 0.98);
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
 `;
 
 const PickerThumb = styled.button`
   appearance: none;
-  aspect-ratio: 16 / 10;
+  flex: none;
+  width: 78px;
+  height: 50px;
   padding: 0;
   border-radius: 5px;
   overflow: hidden;
   border: 1px solid rgba(148, 163, 184, 0.16);
   background: #060a12;
   cursor: pointer;
+  position: relative;
 
   img {
     width: 100%;
     height: 100%;
     object-fit: cover;
     display: block;
+  }
+
+  span {
+    position: absolute;
+    inset: auto 0 0 0;
+    padding: 1px 3px;
+    background: rgba(2, 6, 12, 0.78);
+    color: #cbd5f5;
+    font-size: 7.5px;
+    font-weight: 700;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: left;
   }
 
   &:hover {
@@ -348,12 +389,83 @@ export default function GeneratePanel({
   const [numImages, setNumImages] = useState(1);
   const [sound, setSound] = useState(true);
   const [genMode, setGenMode] = useState("");
-  const [slots, setSlots] = useState({ startFrame: "", endFrame: "", references: [], source: "" });
+  const [voice, setVoice] = useState("");
+  const [slots, setSlots] = useState({ startFrame: "", endFrame: "", references: [], audio: "" });
   const [picker, setPicker] = useState(null); // { slot, index? }
   const [jobs, setJobs] = useState([]);
   const [error, setError] = useState("");
   const [intoTimeline, setIntoTimeline] = useState(true);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [historyJobs, setHistoryJobs] = useState([]);
   const seedSeenRef = useRef(0);
+
+  // Job history (persisted registry) — every job's request snapshot can be
+  // reloaded into the form for editing/re-running.
+  const loadHistory = useCallback(() => {
+    if (!repoPath) {
+      return;
+    }
+    invoke("video_jobs_list", { repoPath })
+      .then((result) => {
+        const list = Array.isArray(result?.jobs) ? result.jobs : [];
+        setHistoryJobs([...list].sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0)));
+      })
+      .catch(() => {});
+  }, [repoPath]);
+
+  const reuseJob = useCallback((job) => {
+    const request = job?.request;
+    // Upscales have no reusable form state here (AssetPanel owns that flow).
+    if (!request || request.kind === "upscale" || String(request.mode || "").startsWith("upscale")) {
+      return;
+    }
+    const catalogEntry =
+      // History stores jobType for generation, catalog id for upscales.
+      (request.model &&
+        (getGenerationModel(request.model) ||
+          generationModels("video").concat(generationModels("image"), generationModels("audio")).find(
+            (entry) => entry.jobType === request.model,
+          ))) ||
+      null;
+    if (catalogEntry && catalogEntry.kind !== "upscale") {
+      setKind(catalogEntry.kind);
+      setModelId(catalogEntry.id);
+    }
+    setPrompt(String(request.prompt || ""));
+    const params = request.params || {};
+    if (params.durationSec) {
+      setDurationSec(Number(params.durationSec));
+    }
+    if (params.aspect) {
+      setAspect(String(params.aspect));
+    }
+    if (params.resolution) {
+      setResolution(String(params.resolution));
+    }
+    if (params.quality) {
+      setQuality(String(params.quality));
+    }
+    if (params.numImages) {
+      setNumImages(Number(params.numImages));
+    }
+    if (params.voice) {
+      setVoice(String(params.voice));
+    }
+    // Missing assets are fine — slots simply stay empty for what's gone.
+    const stillExists = new Set(assets.map((asset) => asset.path));
+    const inputPaths = (Array.isArray(request.inputAssetPaths) ? request.inputAssetPaths : []).map((path) =>
+      stillExists.has(path) ? path : "",
+    );
+    const audioPaths = (Array.isArray(request.audioAssetPaths) ? request.audioAssetPaths : []).filter((path) =>
+      stillExists.has(path),
+    );
+    if (request.mode === "image-to-video") {
+      setSlots({ startFrame: inputPaths[0] || "", endFrame: inputPaths[1] || "", references: [], audio: audioPaths[0] || "" });
+    } else {
+      setSlots({ startFrame: "", endFrame: "", references: inputPaths.filter(Boolean), audio: audioPaths[0] || "" });
+    }
+    setHistoryOpen(false);
+  }, [assets]);
 
   // Keep params legal for the active model.
   useEffect(() => {
@@ -367,8 +479,15 @@ export default function GeneratePanel({
       setAspect(caps.aspectRatios.includes("16:9") ? "16:9" : caps.aspectRatios[0]);
     }
     setResolution((current) =>
-      caps.resolutions ? (caps.resolutions.includes(current) ? current : caps.resolutions[caps.resolutions.length - 1]) : "",
+      caps.resolutions
+        ? caps.resolutions.includes(current)
+          ? current
+          : caps.resolutions.includes("480p")
+            ? "480p"
+            : caps.resolutions[0]
+        : "",
     );
+    setVoice((current) => (caps.voices ? (caps.voices.includes(current) ? current : caps.voices[0]) : ""));
     setQuality((current) =>
       caps.qualities ? (caps.qualities.includes(current) ? current : caps.qualities[caps.qualities.length - 1]) : "",
     );
@@ -380,7 +499,7 @@ export default function GeneratePanel({
       startFrame: caps.supportsStartFrame ? current.startFrame : "",
       endFrame: caps.supportsEndFrame ? current.endFrame : "",
       references: (current.references || []).slice(0, caps.maxReferenceImages || 0),
-      source: "",
+      audio: caps.requiresInputAudio ? current.audio : "",
     }));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [model?.id]);
@@ -452,6 +571,7 @@ export default function GeneratePanel({
   }, [assets]);
 
   const imageAssets = useMemo(() => assets.filter((asset) => asset.kind === "image" && !asset.pending), [assets]);
+  const audioAssets = useMemo(() => assets.filter((asset) => asset.kind === "audio" && !asset.pending), [assets]);
 
   const fillSlot = useCallback((slotKey, index, path) => {
     setSlots((current) => {
@@ -480,11 +600,19 @@ export default function GeneratePanel({
       return;
     }
     if (!prompt.trim() && !caps.requiresReferenceImage) {
-      setError("Write a prompt first.");
+      setError(caps.promptLabel ? `${caps.promptLabel} first.` : "Write a prompt first.");
       return;
     }
     if (caps.requiresReferenceImage && !slots.references.length) {
       setError(`${model.displayName} needs a reference image.`);
+      return;
+    }
+    if (caps.requiresStartFrame && !slots.startFrame) {
+      setError(`${model.displayName} needs a start image.`);
+      return;
+    }
+    if (caps.requiresInputAudio && !slots.audio) {
+      setError(`${model.displayName} needs a voice audio input.`);
       return;
     }
     try {
@@ -503,15 +631,18 @@ export default function GeneratePanel({
           model: model.jobType,
           kind: model.kind,
           mode:
-            model.kind === "image"
-              ? referenceImagePaths.length
-                ? "image-edit"
-                : "text-to-image"
-              : isImageToVideo
-                ? "image-to-video"
-                : "text-to-video",
+            model.kind === "audio"
+              ? "text-to-audio"
+              : model.kind === "image"
+                ? referenceImagePaths.length
+                  ? "image-edit"
+                  : "text-to-image"
+                : isImageToVideo
+                  ? "image-to-video"
+                  : "text-to-video",
           prompt: prompt.trim(),
           inputAssetPaths,
+          audioAssetPaths: slots.audio ? [slots.audio] : [],
           params: {
             durationSec: caps.durations ? durationSec : null,
             aspect: caps.aspectRatios ? aspect : null,
@@ -519,6 +650,7 @@ export default function GeneratePanel({
             quality: caps.qualities ? quality : null,
             numImages: caps.maxImages ? numImages : null,
             sound: caps.supportsSound ? sound : null,
+            voice: caps.voices ? voice : null,
             seed: null,
           },
           loraId: null,
@@ -532,12 +664,12 @@ export default function GeneratePanel({
     } catch (err) {
       setError(String(err));
     }
-  }, [aspect, caps, durationSec, genMode, intoTimeline, model, numImages, onPlannedClip, prompt, quality, repoPath, resolution, slots, sound]);
+  }, [aspect, caps, durationSec, genMode, intoTimeline, model, numImages, onPlannedClip, prompt, quality, repoPath, resolution, slots, sound, voice]);
 
   const estUsd = estimateModelUsd(model, { durationSec, numImages });
 
   const referenceSlotCount = Math.min(caps.maxReferenceImages || 0, 4);
-  const showSlots = caps.supportsStartFrame || caps.supportsEndFrame || referenceSlotCount > 0;
+  const showSlots = caps.supportsStartFrame || caps.supportsEndFrame || referenceSlotCount > 0 || caps.requiresInputAudio;
 
   const renderSlot = (slotKey, label, path, index = 0) => {
     const asset = path ? assetsByPath[path] : null;
@@ -592,36 +724,53 @@ export default function GeneratePanel({
         </ProviderRow>
         <VideoLabel>
           Model
-          <AppSelect
-            onChange={setModelId}
-            options={models.map((entry) => ({
-              value: entry.id,
-              label: entry.displayName + (entry.description ? ` — ${entry.description}` : ""),
-            }))}
-            value={model?.id || ""}
-          />
+          <CompactSelect>
+            <AppSelect
+              onChange={setModelId}
+              options={models.map((entry) => ({
+                value: entry.id,
+                label: entry.displayName + (entry.description ? ` — ${entry.description}` : ""),
+              }))}
+              value={model?.id || ""}
+            />
+          </CompactSelect>
         </VideoLabel>
         <VideoLabel>
-          Prompt
+          {caps.promptLabel || "Prompt"}
           <VideoTextArea
             onChange={(event) => setPrompt(event.target.value)}
             placeholder={
-              caps.requiresReferenceImage
-                ? "Describe the edit to apply to the reference…"
-                : kind === "image"
-                  ? "Describe the image…"
-                  : "Describe the shot, style, camera move…"
+              caps.promptLabel
+                ? `${caps.promptLabel}…`
+                : caps.requiresReferenceImage
+                  ? "Describe the edit to apply to the reference…"
+                  : kind === "image"
+                    ? "Describe the image…"
+                    : "Describe the shot, style, camera move…"
             }
             rows={3}
             value={prompt}
           />
         </VideoLabel>
+        {caps.voices ? (
+          <VideoLabel>
+            Voice
+            <CompactSelect>
+              <AppSelect
+                onChange={setVoice}
+                options={caps.voices.map((value) => ({ value, label: value.replace(/_/g, " ") }))}
+                value={voice}
+              />
+            </CompactSelect>
+          </VideoLabel>
+        ) : null}
         {showSlots ? (
           <div style={{ display: "grid", gap: 4 }}>
             <VideoLabel as="div">Inputs</VideoLabel>
             <SlotStrip>
               {caps.supportsStartFrame ? renderSlot("startFrame", "Start", slots.startFrame) : null}
               {caps.supportsEndFrame ? renderSlot("endFrame", "End", slots.endFrame) : null}
+              {caps.requiresInputAudio ? renderSlot("audio", "♪ Voice", slots.audio) : null}
               {Array.from({ length: referenceSlotCount }, (_, index) =>
                 index <= slots.references.length
                   ? renderSlot("references", `Ref ${index + 1}`, slots.references[index] || "", index)
@@ -629,9 +778,9 @@ export default function GeneratePanel({
               )}
             </SlotStrip>
             {picker ? (
-              imageAssets.length ? (
+              (picker.slot === "audio" ? audioAssets : imageAssets).length ? (
                 <PickerPop>
-                  {imageAssets.map((asset) => (
+                  {(picker.slot === "audio" ? audioAssets : imageAssets).map((asset) => (
                     <PickerThumb
                       key={asset.path}
                       onClick={() => fillSlot(picker.slot, picker.index, asset.path)}
@@ -639,11 +788,16 @@ export default function GeneratePanel({
                       type="button"
                     >
                       {asset.thumbnailDataUrl ? <img alt="" src={asset.thumbnailDataUrl} /> : null}
+                      <span>{asset.name}</span>
                     </PickerThumb>
                   ))}
                 </PickerPop>
               ) : (
-                <VideoHint>No images in the library — import or generate one first.</VideoHint>
+                <VideoHint>
+                  {picker.slot === "audio"
+                    ? "No audio in the library — import a voice track or generate one in the Audio tab."
+                    : "No images in the library — import or generate one first."}
+                </VideoHint>
               )
             ) : null}
           </div>
@@ -686,31 +840,37 @@ export default function GeneratePanel({
           {caps.resolutions ? (
             <VideoLabel>
               Resolution
-              <AppSelect
-                onChange={setResolution}
-                options={caps.resolutions.map((value) => ({ value, label: value }))}
-                value={resolution}
-              />
+              <CompactSelect>
+                <AppSelect
+                  onChange={setResolution}
+                  options={caps.resolutions.map((value) => ({ value, label: value }))}
+                  value={resolution}
+                />
+              </CompactSelect>
             </VideoLabel>
           ) : null}
           {caps.qualities ? (
             <VideoLabel>
               Quality
-              <AppSelect
-                onChange={setQuality}
-                options={caps.qualities.map((value) => ({ value, label: value }))}
-                value={quality}
-              />
+              <CompactSelect>
+                <AppSelect
+                  onChange={setQuality}
+                  options={caps.qualities.map((value) => ({ value, label: value }))}
+                  value={quality}
+                />
+              </CompactSelect>
             </VideoLabel>
           ) : null}
           {caps.modes ? (
             <VideoLabel>
               Mode
-              <AppSelect
-                onChange={setGenMode}
-                options={caps.modes.map((value) => ({ value, label: value }))}
-                value={genMode}
-              />
+              <CompactSelect>
+                <AppSelect
+                  onChange={setGenMode}
+                  options={caps.modes.map((value) => ({ value, label: value }))}
+                  value={genMode}
+                />
+              </CompactSelect>
             </VideoLabel>
           ) : null}
         </ParamGrid>
@@ -762,11 +922,52 @@ export default function GeneratePanel({
         </InlineRow>
       </Section>
       <Section style={{ borderBottom: "none" }}>
-        <SectionTitle>Jobs</SectionTitle>
-        {!jobs.length ? (
+        <InlineRow>
+          <SectionTitle style={{ flex: 1 }}>Jobs</SectionTitle>
+          <VideoSecondaryButton
+            onClick={() => {
+              setHistoryOpen((open) => {
+                if (!open) {
+                  loadHistory();
+                }
+                return !open;
+              });
+            }}
+            type="button"
+          >
+            {historyOpen ? "Hide history" : "History"}
+          </VideoSecondaryButton>
+        </InlineRow>
+        {historyOpen ? (
+          historyJobs.length ? (
+            historyJobs.map((job) => (
+              <JobRow key={`hist-${job.jobId}`}>
+                <JobTitle $tone={job.error ? "error" : "done"}>
+                  {job.request?.model || job.model || job.providerId || "job"}
+                  <em>{job.request?.prompt ? job.request.prompt.slice(0, 48) : job.mode || ""}</em>
+                  <span>{job.error ? "error" : job.done ? "done" : "running"}</span>
+                </JobTitle>
+                {job.request && job.request.kind !== "upscale" && !String(job.request.mode || "").startsWith("upscale") ? (
+                  <InlineRow>
+                    <VideoSecondaryButton
+                      onClick={() => reuseJob(job)}
+                      title="Load this job's prompt, inputs, and settings into the form (missing inputs are fine)"
+                      type="button"
+                    >
+                      ↺ Reuse
+                    </VideoSecondaryButton>
+                  </InlineRow>
+                ) : null}
+              </JobRow>
+            ))
+          ) : (
+            <VideoHint>No past jobs yet.</VideoHint>
+          )
+        ) : null}
+        {!historyOpen && !jobs.length ? (
           <VideoHint>Generations land in media/generated and appear in the library (AI filter).</VideoHint>
         ) : null}
-        {jobs.map((job) => (
+        {!historyOpen && jobs.map((job) => (
           <JobRow key={job.jobId}>
             <JobTitle $tone={jobTone(job)}>
               {job.model || job.providerId || "generate"}

@@ -365,7 +365,12 @@ export default function TranscriptPanel({
                 }))
               : [],
           }));
-          setTranscript({ language: String(result.language || ""), segments });
+          setTranscript({
+            language: String(result.language || ""),
+            segments,
+            inherited: Boolean(result.inherited),
+            inheritedFrom: String(result.inheritedFrom || ""),
+          });
           setSavedSegments(JSON.parse(JSON.stringify(segments)));
         } else {
           setTranscript(null);
@@ -639,16 +644,24 @@ export default function TranscriptPanel({
               >
                 Copy
               </VideoSecondaryButton>
-              <VideoDangerButton
-                onClick={deleteTranscript}
-                title="Remove this media's transcript entirely (the media file is untouched)"
-                type="button"
-              >
-                {deleteArmed ? "Really delete?" : "Delete"}
-              </VideoDangerButton>
+              {!transcript.inherited ? (
+                <VideoDangerButton
+                  onClick={deleteTranscript}
+                  title="Remove this media's transcript entirely (the media file is untouched)"
+                  type="button"
+                >
+                  {deleteArmed ? "Really delete?" : "Delete"}
+                </VideoDangerButton>
+              ) : null}
             </>
           ) : null}
         </ActionRow>
+        {transcript?.inherited ? (
+          <VideoHint>
+            Shared from the original ({transcript.inheritedFrom.split("/").pop() || "source"}) — same audio.
+            Saving or re-transcribing gives this file its own copy.
+          </VideoHint>
+        ) : null}
         {transcript ? (
           <ActionRow>
             <ModeChip data-active={mode === "segments" ? "true" : "false"} onClick={() => setMode("segments")} type="button">

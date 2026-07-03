@@ -157,8 +157,10 @@ function formatBytes(bytes) {
 // upscaler shows its provider, speed class, and cost estimate.
 export default function AssetPanel({
   asset,
+  assetsByPath = {},
   onAddToTimeline,
   onDeleted,
+  onOpenAsset,
   onOpenTranscript,
   repoPath = "",
 }) {
@@ -169,6 +171,23 @@ export default function AssetPanel({
     () => (asset && (asset.kind === "video" || asset.kind === "image") ? upscaleModelsFor(asset.kind) : []),
     [asset],
   );
+
+  // Lineage both ways: what this asset was derived from (manifest relations)
+  // and what was derived FROM it (reverse scan) — so original ↔ upscale is
+  // one click in either direction.
+  const parents = useMemo(
+    () => (Array.isArray(asset?.relations) ? asset.relations.filter((rel) => rel?.type === "derived-from") : []),
+    [asset],
+  );
+  const children = useMemo(() => {
+    if (!asset?.path) {
+      return [];
+    }
+    return Object.values(assetsByPath).filter((other) =>
+      Array.isArray(other?.relations) &&
+      other.relations.some((rel) => rel?.type === "derived-from" && rel.path === asset.path),
+    );
+  }, [asset, assetsByPath]);
 
   const startUpscale = useCallback(
     (model) => {
@@ -260,11 +279,45 @@ export default function AssetPanel({
           ) : null}
           {asset.kind !== "image" ? (
             <MetaCell>
-              <b>{asset.hasTranscript ? "Yes" : "No"}</b>
+              <b>{asset.hasTranscript ? (asset.transcriptInherited ? "Shared" : "Yes") : "No"}</b>
               <span>Transcript</span>
             </MetaCell>
           ) : null}
         </MetaGrid>
+        {asset.transcriptInherited ? (
+          <VideoHint>Transcript is shared from the original video — same audio, no re-transcription needed.</VideoHint>
+        ) : null}
+        {parents.length || children.length ? (
+          <InlineRow>
+            {parents.map((rel) => {
+              const source = assetsByPath[rel.path];
+              return (
+                <VideoSecondaryButton
+                  key={`from-${rel.path}`}
+                  onClick={() => source && onOpenAsset?.(source)}
+                  title={rel.path}
+                  type="button"
+                >
+                  ⤴ {rel.via === "upscale" ? "Upscaled from" : "Generated from"}{" "}
+                  {source?.name || rel.path.split("/").pop()}
+                </VideoSecondaryButton>
+              );
+            })}
+            {children.map((other) => (
+              <VideoSecondaryButton
+                key={`to-${other.path}`}
+                onClick={() => onOpenAsset?.(other)}
+                title={other.path}
+                type="button"
+              >
+                ⤵ {other.name}
+                {other.width && other.height && resolutionClass(other.width, other.height)
+                  ? ` (${resolutionClass(other.width, other.height)})`
+                  : ""}
+              </VideoSecondaryButton>
+            ))}
+          </InlineRow>
+        ) : null}
         <InlineRow>
           <VideoPaneButton onClick={() => onAddToTimeline?.(asset)} type="button">
             + Add to timeline

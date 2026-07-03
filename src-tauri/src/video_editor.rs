@@ -26,6 +26,7 @@ const VIDEO_WAVEFORMS_DIR: &str = "waveforms";
 const VIDEO_FILMSTRIPS_DIR: &str = "filmstrips";
 const VIDEO_TRANSCRIBE_DIR: &str = "transcribe";
 const VIDEO_TRANSCRIPTS_DIR: &str = "transcripts";
+const VIDEO_MEDIA_MANIFEST_FILE: &str = "manifest.json";
 const VIDEO_PROJECT_EXTENSION: &str = ".video.pipe";
 const VIDEO_PROJECT_LEGACY_EXTENSION: &str = ".video.json";
 const VIDEO_TOOLS_DIR: &str = "video-tools";
@@ -96,6 +97,8 @@ static VIDEO_LORA_JOBS: std::sync::OnceLock<
 > = std::sync::OnceLock::new();
 static VIDEO_GENERATION_JOBS_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
     std::sync::OnceLock::new();
+static VIDEO_MEDIA_MANIFEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
 static VIDEO_GENERATION_JOBS_WRITE_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
@@ -151,6 +154,8 @@ struct VideoMediaItem {
     name: String,
     kind: String,
     folder: String,
+    folder_id: String,
+    relations: Vec<VideoMediaRelation>,
     pending: bool,
     job_id: Option<String>,
     size_bytes: u64,
@@ -160,6 +165,7 @@ struct VideoMediaItem {
     height: Option<u32>,
     has_audio: Option<bool>,
     has_transcript: bool,
+    transcript_inherited: bool,
     thumbnail_data_url: Option<String>,
 }
 
@@ -170,6 +176,60 @@ struct VideoMediaListResponse {
     media_root: String,
     ffmpeg_ready: bool,
     items: Vec<VideoMediaItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct VideoMediaFolder {
+    id: String,
+    name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct VideoMediaRelation {
+    #[serde(rename = "type")]
+    relation_type: String,
+    path: String,
+    via: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct VideoMediaAssetManifest {
+    folder_id: String,
+    relations: Vec<VideoMediaRelation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+struct VideoMediaManifest {
+    version: u32,
+    folders: Vec<VideoMediaFolder>,
+    assets: std::collections::BTreeMap<String, VideoMediaAssetManifest>,
+}
+
+impl Default for VideoMediaManifest {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            folders: Vec::new(),
+            assets: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoMediaManifestResponse {
+    folders: Vec<VideoMediaFolder>,
+    assets: std::collections::BTreeMap<String, VideoMediaAssetManifest>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct VideoMediaFolderCreateResponse {
+    id: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -226,6 +286,8 @@ struct VideoTranscriptGetResponse {
     language: Option<String>,
     text: String,
     segments: Vec<VideoTranscriptSegment>,
+    inherited: bool,
+    inherited_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -287,6 +349,7 @@ struct VideoGenerateRequest {
     mode: String,
     prompt: String,
     input_asset_paths: Vec<String>,
+    audio_asset_paths: Vec<String>,
     params: Option<VideoGenerateParams>,
     lora_id: Option<String>,
     auth: Option<VideoProviderAuth>,
@@ -310,6 +373,18 @@ struct VideoProviderAuth {
     api_key: Option<String>,
     secret_key: Option<String>,
     base_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase", default)]
+struct VideoGenerateRecordedRequest {
+    kind: String,
+    model: String,
+    mode: String,
+    prompt: String,
+    params: Option<VideoGenerateParams>,
+    input_asset_paths: Vec<String>,
+    audio_asset_paths: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -351,6 +426,10 @@ const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
             "seedream_v5_lite",
             "grok_image",
             "recraft_v4_1",
+            "text2speech_v2",
+            "sonilo_music",
+            "mirelo_sfx",
+            "higgsfield_speak",
             "seedvr2-video-upscaler",
             "esrgan-image-upscaler",
             "topaz-video-upscale",
@@ -424,6 +503,7 @@ struct VideoPersistentGenerateJob {
     provider_id: String,
     model: String,
     mode: String,
+    request: VideoGenerateRecordedRequest,
     state: String,
     percent: Option<f64>,
     planned_paths: Vec<String>,
@@ -658,6 +738,244 @@ fn video_ensure_media_dirs(media_root: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+fn video_media_manifest_path(media_root: &std::path::Path) -> std::path::PathBuf {
+    media_root.join(VIDEO_MEDIA_MANIFEST_FILE)
+}
+
+fn video_media_manifest_guard() -> Result<std::sync::MutexGuard<'static, ()>, String> {
+    VIDEO_MEDIA_MANIFEST_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .map_err(|_| "Video media manifest lock is poisoned.".to_string())
+}
+
+fn video_read_media_manifest(path: &std::path::Path) -> VideoMediaManifest {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return VideoMediaManifest::default();
+    };
+    let Ok(mut manifest) = serde_json::from_str::<VideoMediaManifest>(&raw) else {
+        return VideoMediaManifest::default();
+    };
+    manifest.version = 1;
+    let valid_folders = manifest
+        .folders
+        .iter()
+        .map(|folder| folder.id.as_str())
+        .collect::<std::collections::HashSet<_>>();
+    for asset in manifest.assets.values_mut() {
+        if !asset.folder_id.is_empty() && !valid_folders.contains(asset.folder_id.as_str()) {
+            asset.folder_id.clear();
+        }
+        asset.relations.retain(|relation| {
+            relation.relation_type == "derived-from"
+                && !relation.path.trim().is_empty()
+                && !relation.via.trim().is_empty()
+        });
+    }
+    manifest
+}
+
+fn video_write_media_manifest(
+    path: &std::path::Path,
+    manifest: &VideoMediaManifest,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create video media manifest directory: {error}"))?;
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(VIDEO_MEDIA_MANIFEST_FILE);
+    let temp_path = path.with_file_name(format!(
+        "{file_name}.{}.{}.tmp",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ));
+    let raw = serde_json::to_vec_pretty(manifest)
+        .map_err(|error| format!("Unable to serialize video media manifest: {error}"))?;
+    std::fs::write(&temp_path, raw)
+        .map_err(|error| format!("Unable to write video media manifest: {error}"))?;
+    std::fs::rename(&temp_path, path)
+        .map_err(|error| format!("Unable to finalize video media manifest: {error}"))?;
+    Ok(())
+}
+
+fn video_manifest_asset_path(
+    root: &std::path::Path,
+    media_root: &std::path::Path,
+    raw_path: &str,
+) -> Result<String, String> {
+    let abs = video_resolve_media_abs(root, media_root, raw_path)?;
+    if !abs.starts_with(media_root.join(VIDEO_ASSETS_DIR))
+        && !abs.starts_with(media_root.join(VIDEO_GENERATED_DIR))
+    {
+        return Err(
+            "Video media manifest assets must stay under media/assets or media/generated."
+                .to_string(),
+        );
+    }
+    Ok(video_relative_path(root, &abs))
+}
+
+fn video_manifest_folder_exists(manifest: &VideoMediaManifest, folder_id: &str) -> bool {
+    folder_id.is_empty() || manifest.folders.iter().any(|folder| folder.id == folder_id)
+}
+
+fn video_manifest_asset<'a>(
+    manifest: &'a VideoMediaManifest,
+    rel_path: &str,
+) -> Option<&'a VideoMediaAssetManifest> {
+    manifest.assets.get(rel_path)
+}
+
+fn video_manifest_asset_owned(
+    manifest: &VideoMediaManifest,
+    rel_path: &str,
+) -> VideoMediaAssetManifest {
+    video_manifest_asset(manifest, rel_path)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn video_manifest_slug_unique(manifest: &VideoMediaManifest, name: &str) -> String {
+    let base = video_slugify_with_fallback(name, "folder");
+    let mut candidate = base.clone();
+    let mut index = 1u32;
+    while manifest.folders.iter().any(|folder| folder.id == candidate) {
+        candidate = format!("{base}-{index}");
+        index = index.saturating_add(1);
+    }
+    candidate
+}
+
+fn video_emit_manifest_changed(
+    app: &tauri::AppHandle,
+    root: &std::path::Path,
+    manifest_path: &std::path::Path,
+) {
+    let manifest_rel = video_relative_path(root, manifest_path);
+    let _ = app.emit(
+        VIDEO_STORE_CHANGED_EVENT,
+        serde_json::json!({
+            "repoPath": root.to_string_lossy().to_string(),
+            "paths": [manifest_rel.clone()],
+            "manifestPath": manifest_rel,
+            "changedAtMs": video_now_millis(),
+        }),
+    );
+}
+
+fn video_manifest_set_asset_folder(
+    manifest: &mut VideoMediaManifest,
+    rel_path: &str,
+    folder_id: &str,
+) {
+    let entry = manifest.assets.entry(rel_path.to_string()).or_default();
+    entry.folder_id = folder_id.to_string();
+}
+
+fn video_manifest_add_relation(
+    manifest: &mut VideoMediaManifest,
+    output_path: &str,
+    source_path: &str,
+    via: &str,
+    folder_id: Option<&str>,
+) -> bool {
+    let entry = manifest.assets.entry(output_path.to_string()).or_default();
+    let mut changed = false;
+    if let Some(folder_id) = folder_id {
+        if entry.folder_id != folder_id {
+            entry.folder_id = folder_id.to_string();
+            changed = true;
+        }
+    }
+    let exists = entry.relations.iter().any(|relation| {
+        relation.relation_type == "derived-from"
+            && relation.path == source_path
+            && relation.via == via
+    });
+    if !exists {
+        entry.relations.push(VideoMediaRelation {
+            relation_type: "derived-from".to_string(),
+            path: source_path.to_string(),
+            via: via.to_string(),
+        });
+        changed = true;
+    }
+    changed
+}
+
+fn video_record_cloud_generation_relations(
+    context: &VideoGenerateJobContext,
+    output_paths: &[String],
+) -> Result<bool, String> {
+    if output_paths.is_empty() {
+        return Ok(false);
+    }
+    let source_path = context
+        .request
+        .input_asset_paths
+        .first()
+        .map(|path| video_manifest_asset_path(&context.root, &context.media_root, path))
+        .transpose()?;
+    let audio_path = if context.model == "higgsfield_speak" {
+        context
+            .request
+            .audio_asset_paths
+            .first()
+            .map(|path| video_manifest_asset_path(&context.root, &context.media_root, path))
+            .transpose()?
+    } else {
+        None
+    };
+    if source_path.is_none() && audio_path.is_none() {
+        return Ok(false);
+    }
+    let manifest_path = video_media_manifest_path(&context.media_root);
+    let _guard = video_media_manifest_guard()?;
+    let mut manifest = video_read_media_manifest(&manifest_path);
+    let via = if context.mode == "upscale-video" || context.mode == "upscale-image" {
+        "upscale"
+    } else {
+        "generate"
+    };
+    let source_folder = source_path.as_ref().and_then(|source_path| {
+        if via == "upscale" {
+            video_manifest_asset(&manifest, source_path).map(|asset| asset.folder_id.clone())
+        } else {
+            None
+        }
+    });
+    let mut changed = false;
+    for output_path in output_paths {
+        let output_path =
+            video_manifest_asset_path(&context.root, &context.media_root, output_path)?;
+        if let Some(source_path) = source_path.as_deref() {
+            changed |= video_manifest_add_relation(
+                &mut manifest,
+                &output_path,
+                source_path,
+                via,
+                source_folder.as_deref(),
+            );
+        }
+        if let Some(audio_path) = audio_path.as_deref() {
+            changed |= video_manifest_add_relation(
+                &mut manifest,
+                &output_path,
+                audio_path,
+                "generate",
+                None,
+            );
+        }
+    }
+    if changed {
+        video_write_media_manifest(&manifest_path, &manifest)?;
+    }
+    Ok(changed)
+}
+
 fn video_relative_path(root: &std::path::Path, abs: &std::path::Path) -> String {
     abs.strip_prefix(root)
         .unwrap_or(abs)
@@ -821,7 +1139,7 @@ fn video_media_kind_for_extension(path: &std::path::Path) -> Option<&'static str
         .to_ascii_lowercase();
     match extension.as_str() {
         "mp4" | "mov" | "mkv" | "webm" | "avi" | "m4v" | "mpg" | "mpeg" | "ts" => Some("video"),
-        "mp3" | "wav" | "m4a" | "aac" | "flac" | "ogg" | "opus" => Some("audio"),
+        "mp3" | "wav" | "m4a" | "aac" | "flac" | "ogg" | "oga" | "opus" | "weba" => Some("audio"),
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "tiff" => Some("image"),
         _ => None,
     }
@@ -844,8 +1162,9 @@ fn video_mime_for_path(path: &std::path::Path) -> &'static str {
         "m4a" => "audio/mp4",
         "aac" => "audio/aac",
         "flac" => "audio/flac",
-        "ogg" => "audio/ogg",
+        "ogg" | "oga" => "audio/ogg",
         "opus" => "audio/opus",
+        "weba" => "audio/webm",
         "png" => "image/png",
         "jpg" | "jpeg" => "image/jpeg",
         "webp" => "image/webp",
@@ -1053,6 +1372,7 @@ fn video_generate_thumbnail(
 fn video_build_media_item(
     root: &std::path::Path,
     media_root: &std::path::Path,
+    manifest: &VideoMediaManifest,
     abs_path: &std::path::Path,
     folder: &str,
     ffmpeg_path: Option<&str>,
@@ -1086,8 +1406,18 @@ fn video_build_media_item(
     let width = probe.as_ref().and_then(|probe| probe.width);
     let height = probe.as_ref().and_then(|probe| probe.height);
     let has_audio = probe.as_ref().and_then(|probe| probe.has_audio);
-    let has_transcript = matches!(kind, "audio" | "video")
+    let manifest_asset = video_manifest_asset_owned(manifest, &path);
+    let has_own_transcript = matches!(kind, "audio" | "video")
         && video_transcript_cache_path(media_root, &path, &metadata).is_file();
+    let transcript_inherited = if has_own_transcript || !matches!(kind, "audio" | "video") {
+        false
+    } else {
+        video_find_inherited_transcript(root, media_root, manifest, &path)
+            .ok()
+            .flatten()
+            .is_some()
+    };
+    let has_transcript = has_own_transcript || transcript_inherited;
     let thumbnail_data_url = if matches!(kind, "video" | "image") {
         ffmpeg_path.and_then(|ffmpeg| {
             let thumb_path = media_root
@@ -1117,6 +1447,8 @@ fn video_build_media_item(
             .to_string(),
         kind: kind.to_string(),
         folder: folder.to_string(),
+        folder_id: manifest_asset.folder_id,
+        relations: manifest_asset.relations,
         pending: false,
         job_id: None,
         size_bytes,
@@ -1126,6 +1458,7 @@ fn video_build_media_item(
         height,
         has_audio,
         has_transcript,
+        transcript_inherited,
         thumbnail_data_url,
     })
 }
@@ -1162,6 +1495,8 @@ fn video_pending_generated_media_items(
                     .to_string(),
                 kind: kind.to_string(),
                 folder: VIDEO_GENERATED_DIR.to_string(),
+                folder_id: String::new(),
+                relations: Vec::new(),
                 pending: true,
                 job_id: Some(job.job_id.clone()),
                 size_bytes: 0,
@@ -1171,6 +1506,7 @@ fn video_pending_generated_media_items(
                 height: None,
                 has_audio: None,
                 has_transcript: false,
+                transcript_inherited: false,
                 thumbnail_data_url: None,
             });
         }
@@ -1239,6 +1575,95 @@ fn video_transcript_cache_path(
             "{}.json",
             video_media_cache_stem(rel_path, metadata)
         ))
+}
+
+fn video_read_transcript_cache_file(
+    transcript_path: &std::path::Path,
+) -> Result<Option<VideoTranscriptCache>, String> {
+    match std::fs::read_to_string(transcript_path) {
+        Ok(raw) => serde_json::from_str::<VideoTranscriptCache>(&raw)
+            .map(Some)
+            .map_err(|error| format!("Unable to parse video transcript cache: {error}")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!("Unable to read video transcript cache: {error}")),
+    }
+}
+
+fn video_read_own_transcript_cache(
+    root: &std::path::Path,
+    media_root: &std::path::Path,
+    rel_path: &str,
+) -> Result<Option<VideoTranscriptCache>, String> {
+    let abs = video_resolve_media_abs(root, media_root, rel_path)?;
+    let metadata = match std::fs::metadata(&abs) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("Unable to inspect video media path: {error}")),
+    };
+    if !metadata.is_file() {
+        return Ok(None);
+    }
+    let Some(kind) = video_media_kind_for_extension(&abs) else {
+        return Ok(None);
+    };
+    if !matches!(kind, "audio" | "video") {
+        return Ok(None);
+    }
+    let resolved_path = video_relative_path(root, &abs);
+    let transcript_path = video_transcript_cache_path(media_root, &resolved_path, &metadata);
+    video_read_transcript_cache_file(&transcript_path)
+}
+
+fn video_find_inherited_transcript(
+    root: &std::path::Path,
+    media_root: &std::path::Path,
+    manifest: &VideoMediaManifest,
+    rel_path: &str,
+) -> Result<Option<(String, VideoTranscriptCache)>, String> {
+    let mut visited = std::collections::HashSet::new();
+    let mut queue = std::collections::VecDeque::from([(rel_path.to_string(), 0usize)]);
+    visited.insert(rel_path.to_string());
+    while let Some((current_path, depth)) = queue.pop_front() {
+        if depth >= 3 {
+            continue;
+        }
+        let Some(asset) = manifest.assets.get(&current_path) else {
+            continue;
+        };
+        for relation in &asset.relations {
+            if relation.relation_type != "derived-from" || !visited.insert(relation.path.clone()) {
+                continue;
+            }
+            let relation_abs = video_resolve_media_abs(root, media_root, relation.path.as_str())?;
+            if !relation_abs.is_file() {
+                continue;
+            }
+            if let Some(cache) =
+                video_read_own_transcript_cache(root, media_root, relation.path.as_str())?
+            {
+                return Ok(Some((relation.path.clone(), cache)));
+            }
+            queue.push_back((relation.path.clone(), depth + 1));
+        }
+    }
+    Ok(None)
+}
+
+fn video_resolve_transcript_cache(
+    root: &std::path::Path,
+    media_root: &std::path::Path,
+    manifest: &VideoMediaManifest,
+    rel_path: &str,
+    metadata: &std::fs::Metadata,
+) -> Result<Option<(Option<String>, VideoTranscriptCache)>, String> {
+    let transcript_path = video_transcript_cache_path(media_root, rel_path, metadata);
+    if let Some(cache) = video_read_transcript_cache_file(&transcript_path)? {
+        return Ok(Some((None, cache)));
+    }
+    Ok(
+        video_find_inherited_transcript(root, media_root, manifest, rel_path)?
+            .map(|(inherited_from, cache)| (Some(inherited_from), cache)),
+    )
 }
 
 fn video_write_json_cache<T: serde::Serialize>(
@@ -2246,11 +2671,13 @@ async fn video_media_list(
         let mut probe_cache = video_read_probe_cache(&cache_path);
         let mut probe_cache_dirty = false;
         let mut thumbnails_generated = 0usize;
+        let manifest = video_read_media_manifest(&video_media_manifest_path(&media_root));
         for folder in [VIDEO_ASSETS_DIR, VIDEO_GENERATED_DIR] {
             for path in video_scan_media_files(&media_root.join(folder)) {
                 if let Some(item) = video_build_media_item(
                     &root,
                     &media_root,
+                    &manifest,
                     &path,
                     folder,
                     ffmpeg_path,
@@ -2277,6 +2704,160 @@ async fn video_media_list(
     })
     .await
     .map_err(|error| format!("Video media list worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn video_media_manifest_get(repo_path: String) -> Result<VideoMediaManifestResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (_root, media_root) = video_workspace_media_root(repo_path.as_str())?;
+        video_ensure_media_dirs(&media_root)?;
+        let manifest = video_read_media_manifest(&video_media_manifest_path(&media_root));
+        Ok(VideoMediaManifestResponse {
+            folders: manifest.folders,
+            assets: manifest.assets,
+        })
+    })
+    .await
+    .map_err(|error| format!("Video media manifest get worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn video_media_folder_create(
+    app: tauri::AppHandle,
+    repo_path: String,
+    name: String,
+) -> Result<VideoMediaFolderCreateResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
+        video_ensure_media_dirs(&media_root)?;
+        let trimmed_name = name.trim();
+        if trimmed_name.is_empty() {
+            return Err("Video media folder name is required.".to_string());
+        }
+        let manifest_path = video_media_manifest_path(&media_root);
+        let _guard = video_media_manifest_guard()?;
+        let mut manifest = video_read_media_manifest(&manifest_path);
+        let id = video_manifest_slug_unique(&manifest, trimmed_name);
+        manifest.folders.push(VideoMediaFolder {
+            id: id.clone(),
+            name: trimmed_name.to_string(),
+        });
+        video_write_media_manifest(&manifest_path, &manifest)?;
+        video_emit_manifest_changed(&app, &root, &manifest_path);
+        Ok(VideoMediaFolderCreateResponse { id })
+    })
+    .await
+    .map_err(|error| format!("Video media folder create worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn video_media_folder_rename(
+    app: tauri::AppHandle,
+    repo_path: String,
+    folder_id: String,
+    name: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
+        video_ensure_media_dirs(&media_root)?;
+        let folder_id = folder_id.trim();
+        let trimmed_name = name.trim();
+        if folder_id.is_empty() || trimmed_name.is_empty() {
+            return Err("Video media folder id and name are required.".to_string());
+        }
+        let manifest_path = video_media_manifest_path(&media_root);
+        let _guard = video_media_manifest_guard()?;
+        let mut manifest = video_read_media_manifest(&manifest_path);
+        let folder = manifest
+            .folders
+            .iter_mut()
+            .find(|folder| folder.id == folder_id)
+            .ok_or_else(|| format!("Video media folder not found: {folder_id}"))?;
+        folder.name = trimmed_name.to_string();
+        video_write_media_manifest(&manifest_path, &manifest)?;
+        video_emit_manifest_changed(&app, &root, &manifest_path);
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("Video media folder rename worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn video_media_folder_delete(
+    app: tauri::AppHandle,
+    repo_path: String,
+    folder_id: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
+        video_ensure_media_dirs(&media_root)?;
+        let folder_id = folder_id.trim();
+        if folder_id.is_empty() {
+            return Err("Video media folder id is required.".to_string());
+        }
+        let manifest_path = video_media_manifest_path(&media_root);
+        let _guard = video_media_manifest_guard()?;
+        let mut manifest = video_read_media_manifest(&manifest_path);
+        let before = manifest.folders.len();
+        manifest.folders.retain(|folder| folder.id != folder_id);
+        if manifest.folders.len() == before {
+            return Err(format!("Video media folder not found: {folder_id}"));
+        }
+        let empty_assets = manifest
+            .assets
+            .iter_mut()
+            .filter_map(|(path, asset)| {
+                if asset.folder_id == folder_id {
+                    asset.folder_id.clear();
+                }
+                (asset.folder_id.is_empty() && asset.relations.is_empty()).then(|| path.clone())
+            })
+            .collect::<Vec<_>>();
+        for path in empty_assets {
+            manifest.assets.remove(&path);
+        }
+        video_write_media_manifest(&manifest_path, &manifest)?;
+        video_emit_manifest_changed(&app, &root, &manifest_path);
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("Video media folder delete worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn video_media_set_folder(
+    app: tauri::AppHandle,
+    repo_path: String,
+    path: String,
+    folder_id: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
+        video_ensure_media_dirs(&media_root)?;
+        let (_abs, rel_path, _kind, _metadata) =
+            video_resolve_existing_media_file(&root, &media_root, path.as_str())?;
+        let rel_path = video_manifest_asset_path(&root, &media_root, rel_path.as_str())?;
+        let folder_id = folder_id.trim().to_string();
+        let manifest_path = video_media_manifest_path(&media_root);
+        let _guard = video_media_manifest_guard()?;
+        let mut manifest = video_read_media_manifest(&manifest_path);
+        if !video_manifest_folder_exists(&manifest, folder_id.as_str()) {
+            return Err(format!("Video media folder not found: {folder_id}"));
+        }
+        video_manifest_set_asset_folder(&mut manifest, &rel_path, folder_id.as_str());
+        if manifest
+            .assets
+            .get(&rel_path)
+            .is_some_and(|asset| asset.folder_id.is_empty() && asset.relations.is_empty())
+        {
+            manifest.assets.remove(&rel_path);
+        }
+        video_write_media_manifest(&manifest_path, &manifest)?;
+        video_emit_manifest_changed(&app, &root, &manifest_path);
+        Ok(())
+    })
+    .await
+    .map_err(|error| format!("Video media set folder worker failed: {error}"))?
 }
 
 fn video_destination_with_collision(
@@ -2328,6 +2909,7 @@ async fn video_media_import(
         );
         let mut probe_cache_dirty = false;
         let mut thumbnails_generated = 0usize;
+        let manifest = video_read_media_manifest(&video_media_manifest_path(&media_root));
         let mut imported = Vec::new();
         let mut changed_paths = Vec::new();
         for source in source_paths {
@@ -2355,6 +2937,7 @@ async fn video_media_import(
             if let Some(item) = video_build_media_item(
                 &root,
                 &media_root,
+                &manifest,
                 &destination,
                 VIDEO_ASSETS_DIR,
                 status.ffmpeg.path.as_deref(),
@@ -2408,6 +2991,29 @@ async fn video_media_delete(
         let rel_path = video_relative_path(&root, &abs);
         std::fs::remove_file(&abs)
             .map_err(|error| format!("Unable to delete video media: {error}"))?;
+        let manifest_path = video_media_manifest_path(&media_root);
+        let _guard = video_media_manifest_guard()?;
+        let mut manifest = video_read_media_manifest(&manifest_path);
+        let mut manifest_changed = manifest.assets.remove(&rel_path).is_some();
+        let mut empty_assets = Vec::new();
+        for (asset_path, asset) in manifest.assets.iter_mut() {
+            let before = asset.relations.len();
+            asset.relations.retain(|relation| relation.path != rel_path);
+            if asset.relations.len() != before {
+                manifest_changed = true;
+            }
+            if asset.folder_id.is_empty() && asset.relations.is_empty() {
+                empty_assets.push(asset_path.clone());
+            }
+        }
+        for asset_path in empty_assets {
+            if manifest.assets.remove(&asset_path).is_some() {
+                manifest_changed = true;
+            }
+        }
+        if manifest_changed {
+            video_write_media_manifest(&manifest_path, &manifest)?;
+        }
         let cache_path = media_root
             .join(VIDEO_CACHE_DIR)
             .join(VIDEO_PROBE_CACHE_FILE);
@@ -2426,11 +3032,17 @@ async fn video_media_delete(
             let _ = std::fs::remove_file(thumb_path);
         }
         let _ = video_write_probe_cache(&cache_path, &cache);
+        let paths = if manifest_changed {
+            vec![rel_path.clone(), video_relative_path(&root, &manifest_path)]
+        } else {
+            vec![rel_path.clone()]
+        };
         let _ = app.emit(
             VIDEO_STORE_CHANGED_EVENT,
             serde_json::json!({
                 "repoPath": root.to_string_lossy().to_string(),
-                "paths": [rel_path],
+                "paths": paths,
+                "manifestPath": manifest_changed.then(|| video_relative_path(&root, &manifest_path)),
                 "changedAtMs": video_now_millis(),
             }),
         );
@@ -3075,28 +3687,27 @@ async fn video_transcript_get(
         if !matches!(kind, "audio" | "video") {
             return Err("Transcripts are only available for audio or video media.".to_string());
         }
-        let transcript_path = video_transcript_cache_path(&media_root, &rel_path, &metadata);
-        match std::fs::read_to_string(&transcript_path) {
-            Ok(raw) => {
-                let cache = serde_json::from_str::<VideoTranscriptCache>(&raw)
-                    .map_err(|error| format!("Unable to parse video transcript cache: {error}"))?;
-                Ok(VideoTranscriptGetResponse {
-                    available: true,
-                    language: cache.language,
-                    text: cache.text,
-                    segments: cache.segments,
-                })
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(VideoTranscriptGetResponse {
-                    available: false,
-                    language: None,
-                    text: String::new(),
-                    segments: Vec::new(),
-                })
-            }
-            Err(error) => Err(format!("Unable to read video transcript cache: {error}")),
+        let manifest = video_read_media_manifest(&video_media_manifest_path(&media_root));
+        if let Some((inherited_from, cache)) =
+            video_resolve_transcript_cache(&root, &media_root, &manifest, &rel_path, &metadata)?
+        {
+            return Ok(VideoTranscriptGetResponse {
+                available: true,
+                language: cache.language,
+                text: cache.text,
+                segments: cache.segments,
+                inherited: inherited_from.is_some(),
+                inherited_from,
+            });
         }
+        Ok(VideoTranscriptGetResponse {
+            available: false,
+            language: None,
+            text: String::new(),
+            segments: Vec::new(),
+            inherited: false,
+            inherited_from: None,
+        })
     })
     .await
     .map_err(|error| format!("Video transcript cache worker failed: {error}"))?
@@ -3233,11 +3844,10 @@ async fn video_transcript_export(
         if !matches!(kind, "audio" | "video") {
             return Err("Transcripts are only available for audio or video media.".to_string());
         }
-        let transcript_path = video_transcript_cache_path(&media_root, &rel_path, &metadata);
-        let raw = std::fs::read_to_string(&transcript_path)
-            .map_err(|error| format!("Unable to read video transcript cache: {error}"))?;
-        let cache = serde_json::from_str::<VideoTranscriptCache>(&raw)
-            .map_err(|error| format!("Unable to parse video transcript cache: {error}"))?;
+        let manifest = video_read_media_manifest(&video_media_manifest_path(&media_root));
+        let (_inherited_from, cache) =
+            video_resolve_transcript_cache(&root, &media_root, &manifest, &rel_path, &metadata)?
+                .ok_or_else(|| "No transcript exists for this media.".to_string())?;
         let extension = match format.trim().to_ascii_lowercase().as_str() {
             "srt" => "srt",
             "vtt" => "vtt",
@@ -3359,9 +3969,11 @@ async fn video_frame_extract(
         );
         let mut probe_cache_dirty = false;
         let mut thumbnails_generated = 0usize;
+        let manifest = video_read_media_manifest(&video_media_manifest_path(&media_root));
         let item = video_build_media_item(
             &root,
             &media_root,
+            &manifest,
             &output_abs,
             VIDEO_ASSETS_DIR,
             Some(ffmpeg_path.as_str()),
@@ -5875,6 +6487,7 @@ struct VideoGenerateJobContext {
     provider_id: String,
     model: String,
     mode: String,
+    request: VideoGenerateRecordedRequest,
     planned_paths: Vec<String>,
     created_at_ms: u64,
     registry_path: std::path::PathBuf,
@@ -5885,6 +6498,12 @@ struct VideoGenerateJobContext {
 struct VideoCloudGenerateJobHandle {
     context: VideoGenerateJobContext,
     cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[derive(Clone)]
+struct VideoGeneratedOutputSource {
+    url: String,
+    mime_type: Option<String>,
 }
 
 fn video_generation_jobs_path(media_root: &std::path::Path) -> std::path::PathBuf {
@@ -5918,7 +6537,7 @@ fn video_write_generation_jobs(
     jobs: &mut Vec<VideoPersistentGenerateJob>,
 ) -> Result<(), String> {
     jobs.sort_by_key(|job| job.created_at_ms);
-    while jobs.len() > 40 {
+    while jobs.len() > 60 {
         if let Some(index) = jobs.iter().position(|job| job.done) {
             jobs.remove(index);
         } else {
@@ -6011,6 +6630,7 @@ fn video_update_generation_job(
             provider_id: context.provider_id.clone(),
             model: context.model.clone(),
             mode: context.mode.clone(),
+            request: context.request.clone(),
             state: state.to_string(),
             percent,
             planned_paths: context.planned_paths.clone(),
@@ -6040,6 +6660,7 @@ fn video_set_generation_provider_ref(
         provider_id: context.provider_id.clone(),
         model: context.model.clone(),
         mode: context.mode.clone(),
+        request: context.request.clone(),
         state: "queued".to_string(),
         percent: None,
         planned_paths: context.planned_paths.clone(),
@@ -6048,6 +6669,26 @@ fn video_set_generation_provider_ref(
         done: false,
         error: None,
     });
+    video_write_generation_jobs(&context.registry_path, &mut jobs)
+}
+
+fn video_update_generation_job_planned_path(
+    context: &VideoGenerateJobContext,
+    index: usize,
+    planned_path: &str,
+) -> Result<(), String> {
+    let _guard = video_generation_jobs_guard()?;
+    let mut jobs = video_read_generation_jobs(&context.registry_path)?;
+    let Some(job) = jobs.iter_mut().find(|job| job.job_id == context.job_id) else {
+        return Ok(());
+    };
+    let Some(existing) = job.planned_paths.get_mut(index) else {
+        return Ok(());
+    };
+    if existing == planned_path {
+        return Ok(());
+    }
+    *existing = planned_path.to_string();
     video_write_generation_jobs(&context.registry_path, &mut jobs)
 }
 
@@ -6108,10 +6749,60 @@ fn video_emit_generate_progress_event(
     );
 }
 
+fn video_cloud_model_is_audio(model: &str) -> bool {
+    matches!(model, "text2speech_v2" | "sonilo_music" | "mirelo_sfx")
+}
+
+fn video_generate_request_kind(
+    provider: &VideoProviderDefinition,
+    model: &str,
+    request: &VideoGenerateRequest,
+) -> &'static str {
+    if request.mode == "upscale-video" || request.mode == "upscale-image" {
+        "upscale"
+    } else if provider.id == "cloud" && model == "higgsfield_speak" {
+        "video"
+    } else if provider.id == "cloud" && video_cloud_model_is_audio(model) {
+        "audio"
+    } else if request.mode.contains("audio")
+        || request.mode.contains("music")
+        || request.mode.contains("sfx")
+        || request.mode.contains("speech")
+    {
+        "audio"
+    } else if provider.kind == "video" || request.mode.contains("video") {
+        "video"
+    } else {
+        "image"
+    }
+}
+
+fn video_recorded_generate_request(
+    kind: &str,
+    model: &str,
+    request: &VideoGenerateRequest,
+) -> VideoGenerateRecordedRequest {
+    VideoGenerateRecordedRequest {
+        kind: kind.to_string(),
+        model: model.to_string(),
+        mode: request.mode.clone(),
+        prompt: request.prompt.clone(),
+        params: request.params.clone(),
+        input_asset_paths: request.input_asset_paths.clone(),
+        audio_asset_paths: request.audio_asset_paths.clone(),
+    }
+}
+
 fn video_generate_output_extension(
     provider: &VideoProviderDefinition,
     request: &VideoGenerateRequest,
+    kind: &str,
 ) -> &'static str {
+    if kind == "audio" {
+        // Audio jobs reserve .mp3 paths; downloads keep provider bytes as-is,
+        // even when a result URL ends in .wav.
+        return "mp3";
+    }
     if request.mode == "upscale-video" {
         return "mp4";
     }
@@ -6128,6 +6819,7 @@ fn video_generate_output_extension(
 fn video_generate_planned_count(
     provider: &VideoProviderDefinition,
     request: &VideoGenerateRequest,
+    kind: &str,
 ) -> usize {
     let requested = request
         .params
@@ -6135,7 +6827,10 @@ fn video_generate_planned_count(
         .and_then(|params| params.num_images)
         .unwrap_or(1)
         .clamp(1, 16) as usize;
-    if provider.kind == "video" || request.mode == "upscale-video" || request.mode.contains("video")
+    if matches!(kind, "audio" | "video" | "upscale")
+        || provider.kind == "video"
+        || request.mode == "upscale-video"
+        || request.mode.contains("video")
     {
         1
     } else {
@@ -6148,10 +6843,11 @@ fn video_plan_generated_paths(
     media_root: &std::path::Path,
     provider: &VideoProviderDefinition,
     request: &VideoGenerateRequest,
+    kind: &str,
     created_at_ms: u64,
 ) -> Vec<String> {
-    let extension = video_generate_output_extension(provider, request);
-    let count = video_generate_planned_count(provider, request);
+    let extension = video_generate_output_extension(provider, request, kind);
+    let count = video_generate_planned_count(provider, request, kind);
     let mut timestamp = created_at_ms;
     loop {
         let planned = (0..count)
@@ -6192,6 +6888,94 @@ fn video_planned_output_abs(
     Ok(output)
 }
 
+fn video_audio_extension_from_mime(mime_type: &str) -> Option<&'static str> {
+    let mime = mime_type
+        .split(';')
+        .next()
+        .unwrap_or(mime_type)
+        .trim()
+        .to_ascii_lowercase();
+    match mime.as_str() {
+        "audio/mpeg" | "audio/mp3" => Some("mp3"),
+        "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/vnd.wave" => Some("wav"),
+        "audio/ogg" | "application/ogg" => Some("ogg"),
+        "audio/mp4" | "audio/x-m4a" => Some("m4a"),
+        "audio/webm" => Some("weba"),
+        "audio/aac" => Some("aac"),
+        "audio/flac" => Some("flac"),
+        "audio/opus" => Some("opus"),
+        _ => None,
+    }
+}
+
+fn video_url_extension(url: &str) -> Option<String> {
+    let without_query = url.split('?').next().unwrap_or(url);
+    let without_fragment = without_query.split('#').next().unwrap_or(without_query);
+    std::path::Path::new(without_fragment)
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn video_audio_extension_from_url(url: &str) -> Option<&'static str> {
+    match video_url_extension(url)?.as_str() {
+        "mp3" => Some("mp3"),
+        "wav" => Some("wav"),
+        "ogg" => Some("ogg"),
+        "oga" => Some("oga"),
+        "m4a" => Some("m4a"),
+        "weba" => Some("weba"),
+        "aac" => Some("aac"),
+        "flac" => Some("flac"),
+        "opus" => Some("opus"),
+        _ => None,
+    }
+}
+
+fn video_corrected_audio_output_abs(
+    context: &VideoGenerateJobContext,
+    planned_output: &std::path::Path,
+    mime_type: Option<&str>,
+    response_mime_type: Option<&str>,
+    url: &str,
+) -> Result<std::path::PathBuf, String> {
+    if video_media_kind_for_extension(planned_output) != Some("audio") {
+        return Ok(planned_output.to_path_buf());
+    }
+    let mime_extension = mime_type.and_then(video_audio_extension_from_mime);
+    let response_extension = response_mime_type.and_then(video_audio_extension_from_mime);
+    let url_extension = video_audio_extension_from_url(url);
+    let extension = [mime_extension, response_extension, url_extension]
+        .into_iter()
+        .flatten()
+        .find(|extension| *extension != "mp3")
+        .or(mime_extension)
+        .or(response_extension)
+        .or(url_extension)
+        .unwrap_or("mp3");
+    let current_extension = planned_output
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if current_extension == extension {
+        return Ok(planned_output.to_path_buf());
+    }
+    let corrected = planned_output.with_extension(extension);
+    if !corrected.starts_with(context.media_root.join(VIDEO_GENERATED_DIR)) {
+        return Err("Corrected generated media path must stay under media/generated/.".to_string());
+    }
+    if corrected.exists() {
+        return Err(format!(
+            "Corrected generated media path already exists: {}",
+            corrected.display()
+        ));
+    }
+    Ok(corrected)
+}
+
 async fn video_poll_sleep(
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
@@ -6208,6 +6992,7 @@ async fn video_download_generated_url(
     context: &VideoGenerateJobContext,
     client: &reqwest::Client,
     url: &str,
+    mime_type: Option<&str>,
     index: usize,
     cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<String, String> {
@@ -6232,14 +7017,30 @@ async fn video_download_generated_url(
             response.status()
         ));
     }
+    let response_mime_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
     std::fs::create_dir_all(&context.generated_dir)
         .map_err(|error| format!("Unable to create generated media directory: {error}"))?;
-    let output = video_planned_output_abs(
+    let planned_output = video_planned_output_abs(
         &context.root,
         &context.media_root,
         &context.planned_paths,
         index,
     )?;
+    let output = video_corrected_audio_output_abs(
+        context,
+        &planned_output,
+        mime_type,
+        response_mime_type.as_deref(),
+        url,
+    )?;
+    let output_path = video_relative_path(&context.root, &output);
+    if output != planned_output {
+        video_update_generation_job_planned_path(context, index, &output_path)?;
+    }
     let extension = output
         .extension()
         .and_then(|value| value.to_str())
@@ -6264,7 +7065,7 @@ async fn video_download_generated_url(
         .map_err(|error| format!("Unable to finish generated media write: {error}"))?;
     std::fs::rename(&temp, &output)
         .map_err(|error| format!("Unable to finalize generated media: {error}"))?;
-    Ok(video_relative_path(&context.root, &output))
+    Ok(output_path)
 }
 
 fn video_save_generated_bytes(
@@ -6293,13 +7094,37 @@ async fn video_download_provider_urls(
 ) -> Result<Vec<String>, String> {
     let mut output_paths = Vec::new();
     for (index, url) in urls.iter().enumerate() {
-        output_paths.push(video_download_generated_url(context, client, url, index, cancel).await?);
+        output_paths
+            .push(video_download_generated_url(context, client, url, None, index, cancel).await?);
     }
     Ok(output_paths)
 }
 
-fn video_cloud_generate_jobs()
--> &'static std::sync::Mutex<std::collections::HashMap<String, VideoCloudGenerateJobHandle>> {
+async fn video_download_provider_outputs(
+    context: &VideoGenerateJobContext,
+    client: &reqwest::Client,
+    outputs: Vec<VideoGeneratedOutputSource>,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Vec<String>, String> {
+    let mut output_paths = Vec::new();
+    for (index, output) in outputs.iter().enumerate() {
+        output_paths.push(
+            video_download_generated_url(
+                context,
+                client,
+                output.url.as_str(),
+                output.mime_type.as_deref(),
+                index,
+                cancel,
+            )
+            .await?,
+        );
+    }
+    Ok(output_paths)
+}
+
+fn video_cloud_generate_jobs(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, VideoCloudGenerateJobHandle>> {
     VIDEO_CLOUD_GENERATE_JOBS
         .get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -6326,9 +7151,7 @@ fn video_cloud_generation_handle(cloud_job_id: &str) -> Option<VideoCloudGenerat
         .and_then(|jobs| jobs.get(cloud_job_id).cloned())
 }
 
-fn video_cloud_remove_generation_job(
-    cloud_job_id: &str,
-) -> Option<VideoCloudGenerateJobHandle> {
+fn video_cloud_remove_generation_job(cloud_job_id: &str) -> Option<VideoCloudGenerateJobHandle> {
     video_cloud_generate_jobs()
         .lock()
         .ok()
@@ -6336,13 +7159,17 @@ fn video_cloud_remove_generation_job(
 }
 
 fn video_cloud_cancel_generation_job(job_id: &str) -> bool {
-    let found = video_cloud_generate_jobs().lock().ok().and_then(|mut jobs| {
-        let cloud_job_id = jobs
-            .iter()
-            .find(|(_, handle)| handle.context.job_id == job_id)
-            .map(|(cloud_job_id, _)| cloud_job_id.clone())?;
-        jobs.remove(&cloud_job_id).map(|handle| (cloud_job_id, handle))
-    });
+    let found = video_cloud_generate_jobs()
+        .lock()
+        .ok()
+        .and_then(|mut jobs| {
+            let cloud_job_id = jobs
+                .iter()
+                .find(|(_, handle)| handle.context.job_id == job_id)
+                .map(|(cloud_job_id, _)| cloud_job_id.clone())?;
+            jobs.remove(&cloud_job_id)
+                .map(|handle| (cloud_job_id, handle))
+        });
     let Some((_cloud_job_id, handle)) = found else {
         return false;
     };
@@ -6376,17 +7203,22 @@ fn video_cloud_event_text(value: &serde_json::Value, keys: &[&str]) -> Option<St
 }
 
 fn video_cloud_job_id_from_provider_ref(provider_ref: &serde_json::Value) -> Option<String> {
-    video_cloud_event_text(provider_ref, &["cloudJobId", "cloud_job_id", "jobId", "job_id"])
+    video_cloud_event_text(
+        provider_ref,
+        &["cloudJobId", "cloud_job_id", "jobId", "job_id"],
+    )
 }
 
 fn video_cloud_event_error(value: &serde_json::Value) -> String {
     value
         .get("error")
         .and_then(|error| {
-            error
-                .as_str()
-                .map(str::to_string)
-                .or_else(|| error.get("message").and_then(serde_json::Value::as_str).map(str::to_string))
+            error.as_str().map(str::to_string).or_else(|| {
+                error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
         })
         .unwrap_or_else(|| "Cloud media generation failed.".to_string())
 }
@@ -6417,27 +7249,45 @@ fn video_cloud_generate_progress_event(event: &serde_json::Value) {
         }
         .to_string()
     });
-    video_emit_generate_progress(
-        &handle.context,
-        &state,
-        percent,
-        &message,
-        false,
-        None,
-        &[],
-    );
+    video_emit_generate_progress(&handle.context, &state, percent, &message, false, None, &[]);
 }
 
-fn video_cloud_generate_output_urls(event: &serde_json::Value) -> Vec<String> {
+fn video_cloud_output_mime(output: &serde_json::Value) -> Option<String> {
+    [
+        "mimeType",
+        "mime_type",
+        "mime",
+        "contentType",
+        "content_type",
+    ]
+    .iter()
+    .find_map(|key| {
+        output
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn video_cloud_generate_outputs(event: &serde_json::Value) -> Vec<VideoGeneratedOutputSource> {
     event
         .get("outputs")
         .and_then(serde_json::Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|output| output.get("url").and_then(serde_json::Value::as_str))
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .map(str::to_string)
+        .filter_map(|output| {
+            let url = output
+                .get("url")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|url| !url.is_empty())?;
+            Some(VideoGeneratedOutputSource {
+                url: url.to_string(),
+                mime_type: video_cloud_output_mime(output),
+            })
+        })
         .collect()
 }
 
@@ -6470,22 +7320,36 @@ async fn video_cloud_generate_result_worker(
         video_job_registry_remove(&VIDEO_GENERATE_JOBS, &handle.context.job_id);
         return;
     }
-    let urls = video_cloud_generate_output_urls(&event);
+    let outputs = video_cloud_generate_outputs(&event);
     let result = async {
-        if urls.is_empty() {
+        if outputs.is_empty() {
             return Err("Cloud media generation completed without output URLs.".to_string());
         }
         let client = http_client(std::time::Duration::from_secs(VIDEO_DOWNLOAD_TIMEOUT_SECS))?;
-        video_download_provider_urls(&handle.context, &client, urls, &handle.cancel).await
+        video_download_provider_outputs(&handle.context, &client, outputs, &handle.cancel).await
     }
     .await;
     match result {
         Ok(output_paths) => {
+            let manifest_changed =
+                video_record_cloud_generation_relations(&handle.context, &output_paths)
+                    .unwrap_or(false);
+            let mut changed_paths = output_paths.clone();
+            if manifest_changed {
+                changed_paths.push(video_relative_path(
+                    &handle.context.root,
+                    &video_media_manifest_path(&handle.context.media_root),
+                ));
+            }
             let _ = handle.context.app.emit(
                 VIDEO_STORE_CHANGED_EVENT,
                 serde_json::json!({
                     "repoPath": handle.context.root.to_string_lossy().to_string(),
-                    "paths": output_paths,
+                    "paths": changed_paths,
+                    "manifestPath": manifest_changed.then(|| video_relative_path(
+                        &handle.context.root,
+                        &video_media_manifest_path(&handle.context.media_root),
+                    )),
                     "changedAtMs": video_now_millis(),
                 }),
             );
@@ -6562,16 +7426,6 @@ fn video_cloud_generation_events_start(app: tauri::AppHandle, cloud_state: Cloud
     });
 }
 
-fn video_cloud_kind_for_request(request: &VideoGenerateRequest) -> &'static str {
-    if request.mode == "upscale-video" || request.mode == "upscale-image" {
-        "upscale"
-    } else if request.mode.contains("video") {
-        "video"
-    } else {
-        "image"
-    }
-}
-
 fn video_cloud_append_b64_asset(
     root: &std::path::Path,
     media_root: &std::path::Path,
@@ -6581,7 +7435,33 @@ fn video_cloud_append_b64_asset(
     let (_data_uri, b64, mime, _bytes) = video_asset_data_uri(root, media_root, input_path)?;
     *total_b64 = total_b64.saturating_add(b64.len());
     if *total_b64 > VIDEO_CLOUD_GENERATE_MAX_B64_BYTES {
-        return Err("Cloud media generation input exceeds the 40MB base64 payload limit.".to_string());
+        return Err(
+            "Cloud media generation input exceeds the 40MB base64 payload limit.".to_string(),
+        );
+    }
+    Ok((b64, mime))
+}
+
+fn video_cloud_append_audio_b64_asset(
+    root: &std::path::Path,
+    media_root: &std::path::Path,
+    input_path: &str,
+    total_b64: &mut usize,
+) -> Result<(String, String), String> {
+    let abs = video_resolve_media_abs(root, media_root, input_path)?;
+    if video_media_kind_for_extension(&abs) != Some("audio") {
+        return Err("Cloud audio inputs must be audio assets under media/.".to_string());
+    }
+    let bytes = std::fs::read(&abs)
+        .map_err(|error| format!("Unable to read audio input asset: {error}"))?;
+    let mime = video_mime_for_path(&abs).to_string();
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    *total_b64 = total_b64.saturating_add(b64.len());
+    if *total_b64 > VIDEO_CLOUD_GENERATE_MAX_B64_BYTES {
+        return Err(
+            "Cloud media generation input exceeds the 40MB base64 payload limit.".to_string(),
+        );
     }
     Ok((b64, mime))
 }
@@ -6599,10 +7479,20 @@ fn video_cloud_generate_payload(
         if let Some(duration_sec) = params.duration_sec {
             input.insert("durationSec".to_string(), serde_json::json!(duration_sec));
         }
-        if let Some(aspect) = params.aspect.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(aspect) = params
+            .aspect
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             input.insert("aspectRatio".to_string(), serde_json::json!(aspect));
         }
-        if let Some(resolution) = params.resolution.as_deref().map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(resolution) = params
+            .resolution
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             input.insert("resolution".to_string(), serde_json::json!(resolution));
         }
         if let Some(num_images) = params.num_images {
@@ -6617,14 +7507,52 @@ fn video_cloud_generate_payload(
         {
             input.insert("quality".to_string(), serde_json::json!(quality));
         }
-        if let Some(sound) = params.extra.get("sound").and_then(serde_json::Value::as_bool) {
+        if let Some(sound) = params
+            .extra
+            .get("sound")
+            .and_then(serde_json::Value::as_bool)
+        {
             input.insert("sound".to_string(), serde_json::json!(sound));
+        }
+        if let Some(voice) = params
+            .extra
+            .get("voice")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            input.insert("voice".to_string(), serde_json::json!(voice));
         }
     }
     input.insert("mode".to_string(), serde_json::json!(request.mode.clone()));
 
     let mut total_b64 = 0usize;
-    if request.mode == "upscale-video" || request.mode == "upscale-image" {
+    if context.model == "higgsfield_speak" {
+        let start_path = request
+            .input_asset_paths
+            .first()
+            .ok_or_else(|| "Cloud Higgsfield Speak requires a face image asset.".to_string())?;
+        let audio_path = request
+            .audio_asset_paths
+            .first()
+            .ok_or_else(|| "Cloud Higgsfield Speak requires an input audio asset.".to_string())?;
+        let (b64, mime) = video_cloud_append_b64_asset(
+            &context.root,
+            &context.media_root,
+            start_path,
+            &mut total_b64,
+        )?;
+        input.insert("startFrameB64".to_string(), serde_json::json!(b64));
+        input.insert("startFrameMime".to_string(), serde_json::json!(mime));
+        let (b64, mime) = video_cloud_append_audio_b64_asset(
+            &context.root,
+            &context.media_root,
+            audio_path,
+            &mut total_b64,
+        )?;
+        input.insert("inputAudioB64".to_string(), serde_json::json!(b64));
+        input.insert("inputAudioMime".to_string(), serde_json::json!(mime));
+    } else if request.mode == "upscale-video" || request.mode == "upscale-image" {
         let source_path = request
             .input_asset_paths
             .first()
@@ -6679,11 +7607,30 @@ fn video_cloud_generate_payload(
             serde_json::Value::Array(reference_images),
         );
     }
+    if context.model != "higgsfield_speak" && !request.audio_asset_paths.is_empty() {
+        let mut reference_audios = Vec::new();
+        for input_path in &request.audio_asset_paths {
+            let (b64, mime) = video_cloud_append_audio_b64_asset(
+                &context.root,
+                &context.media_root,
+                input_path,
+                &mut total_b64,
+            )?;
+            reference_audios.push(serde_json::json!({
+                "b64": b64,
+                "mime": mime,
+            }));
+        }
+        input.insert(
+            "referenceAudiosB64".to_string(),
+            serde_json::Value::Array(reference_audios),
+        );
+    }
 
     Ok(serde_json::json!({
         "requestId": format!("video-generate-{}-{}", video_now_millis(), uuid::Uuid::new_v4()),
         "model": context.model.clone(),
-        "kind": video_cloud_kind_for_request(request),
+        "kind": context.request.kind.clone(),
         "input": serde_json::Value::Object(input),
     }))
 }
@@ -7549,9 +8496,6 @@ async fn video_generate_start(
     video_ensure_media_dirs(&media_root)?;
     let (job_id, cancel) = video_job_registry_insert(&VIDEO_GENERATE_JOBS)?;
     let created_at_ms = video_now_millis();
-    let planned_paths =
-        video_plan_generated_paths(&root, &media_root, provider, &request, created_at_ms);
-    let registry_path = video_generation_jobs_path(&media_root);
     let model = if request.model.trim().is_empty() {
         provider
             .models
@@ -7562,11 +8506,17 @@ async fn video_generate_start(
     } else {
         request.model.clone()
     };
+    let kind = video_generate_request_kind(provider, &model, &request);
+    let recorded_request = video_recorded_generate_request(kind, &model, &request);
+    let planned_paths =
+        video_plan_generated_paths(&root, &media_root, provider, &request, kind, created_at_ms);
+    let registry_path = video_generation_jobs_path(&media_root);
     let entry = VideoPersistentGenerateJob {
         job_id: job_id.clone(),
         provider_id: provider.id.to_string(),
         model: model.clone(),
         mode: request.mode.clone(),
+        request: recorded_request.clone(),
         state: "submitting".to_string(),
         percent: Some(0.0),
         planned_paths: planned_paths.clone(),
@@ -7585,6 +8535,7 @@ async fn video_generate_start(
         provider_id: provider.id.to_string(),
         model,
         mode: request.mode.clone(),
+        request: recorded_request,
         planned_paths: planned_paths.clone(),
         created_at_ms,
         registry_path,
@@ -7999,6 +8950,7 @@ async fn video_generate_resume(
             provider_id: job.provider_id.clone(),
             model: job.model.clone(),
             mode: job.mode.clone(),
+            request: job.request.clone(),
             planned_paths: job.planned_paths.clone(),
             created_at_ms: job.created_at_ms,
             registry_path,
@@ -8027,6 +8979,7 @@ async fn video_generate_resume(
         provider_id: job.provider_id.clone(),
         model: job.model.clone(),
         mode: job.mode.clone(),
+        request: job.request.clone(),
         planned_paths: job.planned_paths.clone(),
         created_at_ms: job.created_at_ms,
         registry_path,

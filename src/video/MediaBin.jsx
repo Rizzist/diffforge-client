@@ -94,6 +94,65 @@ const ImportButton = styled(VideoSecondaryButton)`
   flex: none;
 `;
 
+// Folder pills: a second toolbar row scoping the grid to one folder.
+const FolderRow = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 6px 4px;
+  flex: 0 0 auto;
+  overflow-x: auto;
+  scrollbar-width: none;
+
+  &::-webkit-scrollbar {
+    display: none;
+  }
+`;
+
+const FolderChip = styled(FilterChip)`
+  text-transform: none;
+  letter-spacing: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+
+  em {
+    font-style: normal;
+    color: #fca5a5;
+    font-size: 10px;
+    line-height: 1;
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(16, 185, 129, 0.5);
+    background: rgba(16, 185, 129, 0.14);
+    color: #a7f3d0;
+  }
+`;
+
+const FolderInput = styled.input`
+  appearance: none;
+  border: 1px solid rgba(96, 165, 250, 0.5);
+  background: rgba(4, 8, 14, 0.85);
+  color: #e2e8f0;
+  font-size: 10px;
+  font-weight: 650;
+  padding: 2px 7px;
+  border-radius: 999px;
+  outline: none;
+  width: 96px;
+  flex: none;
+`;
+
+const AiMenuHeading = styled.div`
+  padding: 4px 10px 2px;
+  font-size: 8.5px;
+  font-weight: 800;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: rgba(148, 163, 184, 0.65);
+`;
+
 const BinGrid = styled.div`
   flex: 1 1 auto;
   min-height: 0;
@@ -186,6 +245,8 @@ const AiMenu = styled.div`
   background: rgba(7, 12, 22, 0.98);
   box-shadow: 0 12px 30px rgba(0, 0, 0, 0.55);
   min-width: 168px;
+  max-height: min(60vh, 320px);
+  overflow-y: auto;
 `;
 
 const AiMenuItem = styled.button`
@@ -364,9 +425,13 @@ function assetGlyph(kind) {
 export default function MediaBin({
   assets = [],
   error = "",
+  folders = [],
   onAddToTimeline,
   onAiEdit,
+  onCreateFolder,
+  onDeleteFolder,
   onImported,
+  onMoveToFolder,
   onOpenTranscript,
   onSelectAsset,
   paneToken = "",
@@ -437,15 +502,34 @@ export default function MediaBin({
     return () => window.removeEventListener("pointerdown", close);
   }, [aiMenu]);
 
+  // Folder scoping composes with the kind filter: pick a folder pill, then
+  // narrow by kind. "" = whole library.
+  const [activeFolder, setActiveFolder] = useState("");
+  const [newFolderOpen, setNewFolderOpen] = useState(false);
+  const [newFolderName, setNewFolderName] = useState("");
+
   const visibleAssets = useMemo(() => {
+    let list = assets;
+    if (activeFolder) {
+      list = list.filter((asset) => (asset.folderId || "") === activeFolder);
+    }
     if (filter === "all") {
-      return assets;
+      return list;
     }
     if (filter === "generated") {
-      return assets.filter((asset) => asset.folder === "generated");
+      return list.filter((asset) => asset.folder === "generated");
     }
-    return assets.filter((asset) => asset.kind === filter);
-  }, [assets, filter]);
+    return list.filter((asset) => asset.kind === filter);
+  }, [activeFolder, assets, filter]);
+
+  const submitNewFolder = useCallback(() => {
+    const name = newFolderName.trim();
+    if (name) {
+      onCreateFolder?.(name);
+    }
+    setNewFolderName("");
+    setNewFolderOpen(false);
+  }, [newFolderName, onCreateFolder]);
 
   const importPaths = useCallback(
     async (paths) => {
@@ -626,6 +710,61 @@ export default function MediaBin({
           </FilterChip>
         ))}
       </BinToolbar>
+      {onCreateFolder ? (
+        <FolderRow>
+          <FolderChip
+            data-active={activeFolder === "" ? "true" : "false"}
+            onClick={() => setActiveFolder("")}
+            type="button"
+          >
+            All
+          </FolderChip>
+          {folders.map((folder) => (
+            <FolderChip
+              data-active={activeFolder === folder.id ? "true" : "false"}
+              key={folder.id}
+              onClick={() => setActiveFolder(folder.id)}
+              title={`Show only "${folder.name}"`}
+              type="button"
+            >
+              📁 {folder.name}
+              {activeFolder === folder.id ? (
+                <em
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    setActiveFolder("");
+                    onDeleteFolder?.(folder.id);
+                  }}
+                  title="Delete folder (assets go back to the library root)"
+                >
+                  ×
+                </em>
+              ) : null}
+            </FolderChip>
+          ))}
+          {newFolderOpen ? (
+            <FolderInput
+              autoFocus
+              onBlur={submitNewFolder}
+              onChange={(event) => setNewFolderName(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter") {
+                  submitNewFolder();
+                } else if (event.key === "Escape") {
+                  setNewFolderName("");
+                  setNewFolderOpen(false);
+                }
+              }}
+              placeholder="Folder name…"
+              value={newFolderName}
+            />
+          ) : (
+            <FolderChip onClick={() => setNewFolderOpen(true)} title="New folder" type="button">
+              + Folder
+            </FolderChip>
+          )}
+        </FolderRow>
+      ) : null}
       {displayError ? <VideoErrorText style={{ padding: "0 8px 4px" }}>{displayError}</VideoErrorText> : null}
       {visibleAssets.length === 0 ? (
         <EmptyBin>
@@ -742,7 +881,10 @@ export default function MediaBin({
       {aiMenu ? createPortal(
         <AiMenu
           onPointerDown={(event) => event.stopPropagation()}
-          style={{ left: `${Math.min(aiMenu.x, window.innerWidth - 190)}px`, top: `${aiMenu.y}px` }}
+          style={{
+            left: `${Math.min(aiMenu.x, window.innerWidth - 190)}px`,
+            top: `${Math.max(8, Math.min(aiMenu.y, window.innerHeight - Math.min(window.innerHeight * 0.6, 320) - 12))}px`,
+          }}
         >
           {aiMenu.asset.kind === "image" ? (
             <>
@@ -817,6 +959,36 @@ export default function MediaBin({
           >
             + Add at playhead
           </AiMenuItem>
+          {folders.length ? (
+            <>
+              <AiMenuHeading>Move to folder</AiMenuHeading>
+              {(aiMenu.asset.folderId || "") !== "" ? (
+                <AiMenuItem
+                  onClick={() => {
+                    onMoveToFolder?.(aiMenu.asset, "");
+                    setAiMenu(null);
+                  }}
+                  type="button"
+                >
+                  ⌂ Library root
+                </AiMenuItem>
+              ) : null}
+              {folders
+                .filter((folder) => folder.id !== (aiMenu.asset.folderId || ""))
+                .map((folder) => (
+                  <AiMenuItem
+                    key={folder.id}
+                    onClick={() => {
+                      onMoveToFolder?.(aiMenu.asset, folder.id);
+                      setAiMenu(null);
+                    }}
+                    type="button"
+                  >
+                    📁 {folder.name}
+                  </AiMenuItem>
+                ))}
+            </>
+          ) : null}
         </AiMenu>,
         document.body,
       ) : null}

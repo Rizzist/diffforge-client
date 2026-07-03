@@ -9,7 +9,7 @@
 export const GENERATION_KINDS = [
   { id: "image", label: "Image" },
   { id: "video", label: "Video" },
-  { id: "audio", label: "Audio", disabled: true, hint: "Coming soon" },
+  { id: "audio", label: "Audio" },
 ];
 
 export const GENERATION_PROVIDER_LABEL = "Higgsfield";
@@ -323,24 +323,61 @@ export const GENERATION_MODELS = [
     est: { usdPerImage: 0.04 },
   },
 
-  // --- Audio (disabled for now) ---
+  // --- Speak: photo + voice audio → talking video (audio-input flagship) ---
   {
-    id: "sonilo-music",
-    kind: "audio",
-    jobType: "sonilo_music",
-    displayName: "Sonilo Music",
-    disabled: true,
-    caps: {},
-    est: {},
+    id: "higgsfield-speak",
+    kind: "video",
+    jobType: "higgsfield_speak",
+    displayName: "Higgsfield Speak",
+    description: "Photo + voice audio → talking video",
+    caps: {
+      supportsStartFrame: true,
+      requiresStartFrame: true,
+      requiresInputAudio: true,
+      maxReferenceImages: 0,
+      supportsSound: false,
+    },
+    est: { usdPerSecond: 0.1 },
   },
+
+  // --- Audio (Higgsfield platform) ---
   {
     id: "text-to-speech",
     kind: "audio",
     jobType: "text2speech_v2",
     displayName: "Text to Speech",
-    disabled: true,
-    caps: {},
-    est: {},
+    description: "Narration in a chosen voice",
+    caps: {
+      voices: ["elevenlabs", "minimax", "seed_speech", "vibe_voice", "cozy_voice"],
+      promptLabel: "Text to speak",
+    },
+    est: { usdPerImage: 0.03 },
+  },
+  {
+    id: "sonilo-music",
+    kind: "audio",
+    jobType: "sonilo_music",
+    displayName: "Sonilo Music",
+    description: "Music from a text brief",
+    caps: {
+      durations: [10, 20, 30, 60],
+      defaultDuration: 20,
+      promptLabel: "Describe the music",
+    },
+    est: { usdPerSecond: 0.01 },
+  },
+  {
+    id: "mirelo-sfx",
+    kind: "audio",
+    jobType: "mirelo_sfx",
+    displayName: "Mirelo SFX",
+    description: "Sound effects from a description",
+    caps: {
+      durations: [5, 10, 15],
+      defaultDuration: 10,
+      promptLabel: "Describe the sound",
+    },
+    est: { usdPerSecond: 0.015 },
   },
 
   // --- Upscalers (three providers: fal.ai, Topaz Labs, Replicate) ---

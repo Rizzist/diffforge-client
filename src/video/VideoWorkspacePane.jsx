@@ -389,6 +389,7 @@ export default function VideoWorkspacePane({
   const [projectPath, setProjectPath] = useState("");
   const [project, setProject] = useState(null);
   const [assets, setAssets] = useState([]);
+  const [folders, setFolders] = useState([]);
   const [mediaRootAbs, setMediaRootAbs] = useState("");
   const [mediaError, setMediaError] = useState("");
   const [paneError, setPaneError] = useState("");
@@ -542,7 +543,34 @@ export default function VideoWorkspacePane({
         setMediaError("");
       })
       .catch((err) => setMediaError(String(err)));
+    invoke("video_media_manifest_get", { repoPath })
+      .then((manifest) => setFolders(Array.isArray(manifest?.folders) ? manifest.folders : []))
+      .catch(() => {});
   }, [repoPath]);
+
+  const createFolder = useCallback(
+    (name) =>
+      invoke("video_media_folder_create", { repoPath, name })
+        .then(() => refreshAssets())
+        .catch((err) => setMediaError(String(err))),
+    [refreshAssets, repoPath],
+  );
+
+  const deleteFolder = useCallback(
+    (folderId) =>
+      invoke("video_media_folder_delete", { repoPath, folderId })
+        .then(() => refreshAssets())
+        .catch((err) => setMediaError(String(err))),
+    [refreshAssets, repoPath],
+  );
+
+  const moveToFolder = useCallback(
+    (asset, folderId) =>
+      invoke("video_media_set_folder", { repoPath, path: asset?.path || "", folderId: folderId || "" })
+        .then(() => refreshAssets())
+        .catch((err) => setMediaError(String(err))),
+    [refreshAssets, repoPath],
+  );
 
   const refreshProjects = useCallback(() => {
     if (!repoPath) {
@@ -1291,9 +1319,13 @@ export default function VideoWorkspacePane({
   const binProps = {
     assets,
     error: mediaError,
+    folders,
     onAddToTimeline: addAssetToTimeline,
     onAiEdit: handleAiEdit,
+    onCreateFolder: createFolder,
+    onDeleteFolder: deleteFolder,
     onImported: refreshAssets,
+    onMoveToFolder: moveToFolder,
     onOpenTranscript: openTranscript,
     onSelectAsset: openAssetPanel,
     paneToken: paneId || "video-pane",
@@ -1358,7 +1390,9 @@ export default function VideoWorkspacePane({
   ) : sidePanel === "asset" ? (
     <AssetPanel
       asset={assetsByPath[selectedAssetPath] || null}
+      assetsByPath={assetsByPath}
       onAddToTimeline={addAssetToTimeline}
+      onOpenAsset={openAssetPanel}
       onDeleted={() => {
         refreshAssets();
         setSidePanel("");
@@ -1499,7 +1533,7 @@ export default function VideoWorkspacePane({
                 >
                   {libraryOpen ? (
                     <React.Fragment key="library-slot">
-                      <SplitPanel defaultSize="260px" id="video-split-library" key="library" minSize="190px">
+                      <SplitPanel defaultSize="260px" groupResizeBehavior="preserve-pixel-size" id="video-split-library" key="library" minSize="190px">
                         <MediaBin {...binProps} />
                       </SplitPanel>
                       <SplitSeparatorH key="library-sep" />
@@ -1524,7 +1558,7 @@ export default function VideoWorkspacePane({
                   {sidePanelContent ? (
                     <React.Fragment key="side-slot">
                       <SplitSeparatorH key="side-sep" />
-                      <SplitPanel defaultSize="340px" id="video-split-side" key="side" minSize="280px">
+                      <SplitPanel defaultSize="300px" groupResizeBehavior="preserve-pixel-size" id="video-split-side" key="side" minSize="240px">
                         {sidePanelContent}
                       </SplitPanel>
                     </React.Fragment>
