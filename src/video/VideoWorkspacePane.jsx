@@ -14,6 +14,7 @@ import Timeline from "./Timeline.jsx";
 import VideoEditor from "./VideoEditor.jsx";
 import GeneratePanel from "./GeneratePanel.jsx";
 import ExportPanel from "./ExportPanel.jsx";
+import { createPlaybackStore } from "./videoPlaybackStore.js";
 import {
   VIDEO_STORE_CHANGED_EVENT,
   VIDEO_TOOLS_INSTALL_PROGRESS_EVENT,
@@ -365,7 +366,12 @@ export default function VideoWorkspacePane({
   const [transcriptAsset, setTranscriptAsset] = useState(null);
   const [generateSeed, setGenerateSeed] = useState(null);
   const seedNonceRef = useRef(0);
-  const [playheadMs, setPlayheadMs] = useState(0);
+  const playbackRef = useRef(null);
+  if (!playbackRef.current) {
+    playbackRef.current = createPlaybackStore(0);
+  }
+  const playback = playbackRef.current;
+  const [playheadUiMs, setPlayheadUiMs] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [historyVersion, setHistoryVersion] = useState(0);
 
@@ -385,6 +391,57 @@ export default function VideoWorkspacePane({
   const storageKey = useMemo(() => slotStorageKey(workspaceId, paneId, repoPath), [paneId, repoPath, workspaceId]);
   const ffmpegReady = Boolean(tools?.ffmpeg?.installed && tools?.ffprobe?.installed);
   const wide = paneWidth >= WIDE_MIN_WIDTH;
+
+  const commitSeek = useCallback(
+    (ms) => {
+      const next = Math.max(0, Number(ms) || 0);
+      playback.setMs(next);
+      setPlayheadUiMs(next);
+    },
+    [playback],
+  );
+
+  const setPlaybackPlaying = useCallback(
+    (nextPlaying) => {
+      const next = Boolean(nextPlaying);
+      setPlaying(next);
+      playback.setPlaying(next);
+      if (!next) {
+        setPlayheadUiMs(playback.getMs());
+      }
+    },
+    [playback],
+  );
+
+  const currentPlayheadMs = useCallback(() => Math.max(0, playback.getMs()), [playback]);
+
+  useEffect(() => {
+    let frame = 0;
+    let lastUiSyncAt = 0;
+    const unsubscribe = playback.subscribe((ms, isPlaying) => {
+      if (!isPlaying) {
+        window.cancelAnimationFrame(frame);
+        frame = 0;
+        lastUiSyncAt = 0;
+        setPlayheadUiMs(ms);
+        return;
+      }
+      if (frame) {
+        return;
+      }
+      frame = window.requestAnimationFrame((now) => {
+        frame = 0;
+        if (now - lastUiSyncAt >= 200) {
+          lastUiSyncAt = now;
+          setPlayheadUiMs(playback.getMs());
+        }
+      });
+    });
+    return () => {
+      window.cancelAnimationFrame(frame);
+      unsubscribe();
+    };
+  }, [playback]);
 
   // Measure the pane so layout mode is a JS decision (splits vs sheets).
   useEffect(() => {
@@ -453,14 +510,16 @@ export default function VideoWorkspacePane({
           setProjectPath(String(result?.path || path));
           setPaneError("");
           setSelectedClipIds([]);
-          setPlayheadMs(0);
+          playback.setMs(0);
+          playback.setPlaying(false);
+          setPlayheadUiMs(0);
           setPlaying(false);
           setView("editor");
           resetHistory();
         })
         .catch((err) => setPaneError(String(err)));
     },
-    [repoPath, resetHistory],
+    [playback, repoPath, resetHistory],
   );
 
   useEffect(() => {
@@ -694,13 +753,17 @@ export default function VideoWorkspacePane({
           if (result?.path) {
             setProject(normalizeProject(result.project));
             setProjectPath(String(result.path));
+            playback.setMs(0);
+            playback.setPlaying(false);
+            setPlayheadUiMs(0);
+            setPlaying(false);
             setView("editor");
             resetHistory();
           }
         })
         .catch((err) => setPaneError(String(err)));
     },
-    [refreshProjects, repoPath, resetHistory],
+    [playback, refreshProjects, repoPath, resetHistory],
   );
 
   const deleteProject = useCallback(
@@ -728,10 +791,10 @@ export default function VideoWorkspacePane({
 
   const backToMenu = useCallback(() => {
     flushPendingSave();
-    setPlaying(false);
+    setPlaybackPlaying(false);
     setView("menu");
     void refreshProjects();
-  }, [flushPendingSave, refreshProjects]);
+  }, [flushPendingSave, refreshProjects, setPlaybackPlaying]);
 
   // External toolbar nonce/command bus (PCB pane contract).
   useEffect(() => {
@@ -821,11 +884,11 @@ export default function VideoWorkspacePane({
       if (!projectStateRef.current) {
         return;
       }
-      const result = addMediaClip(projectStateRef.current, asset, { timelineStartMs: playheadMs });
+      const result = addMediaClip(projectStateRef.current, asset, { timelineStartMs: currentPlayheadMs() });
       handleProjectChange(result.project, { transient: false });
       setSelectedClipIds([result.clipId]);
     },
-    [handleProjectChange, playheadMs],
+    [currentPlayheadMs, handleProjectChange],
   );
 
   const assetsByPath = useMemo(() => {
@@ -957,12 +1020,12 @@ export default function VideoWorkspacePane({
         const from = clip.sourceInMs || 0;
         const to = from + clip.durationMs * speed;
         if (sourceMs >= from && sourceMs <= to) {
-          setPlayheadMs(clip.timelineStartMs + Math.round((sourceMs - from) / speed));
+          commitSeek(clip.timelineStartMs + Math.round((sourceMs - from) / speed));
           return;
         }
       }
     }
-  }, []);
+  }, [commitSeek]);
 
   // Placeholder-first: a reserved generation path becomes a clip immediately.
   const addPlannedClip = useCallback(
@@ -974,12 +1037,12 @@ export default function VideoWorkspacePane({
       const result = addMediaClip(
         current,
         { path: plannedPath, kind: "video", durationMs },
-        { timelineStartMs: playheadMs },
+        { timelineStartMs: currentPlayheadMs() },
       );
       handleProjectChange(result.project, { transient: false });
       setSelectedClipIds([result.clipId]);
     },
-    [handleProjectChange, playheadMs],
+    [currentPlayheadMs, handleProjectChange],
   );
 
   // Preview text drag → clip style updates (transient while dragging).
@@ -1010,12 +1073,12 @@ export default function VideoWorkspacePane({
       const result = addMediaClip(
         projectStateRef.current,
         known || { path: clean, kind },
-        { timelineStartMs: playheadMs },
+        { timelineStartMs: currentPlayheadMs() },
       );
       handleProjectChange(result.project, { transient: false });
       setSelectedClipIds([result.clipId]);
     },
-    [assetsByPath, handleProjectChange, playheadMs],
+    [assetsByPath, currentPlayheadMs, handleProjectChange],
   );
 
   // Range-scoped AI context: what's selected, which clips overlap, and the
@@ -1162,10 +1225,11 @@ export default function VideoWorkspacePane({
     <PreviewCell>
       <VideoEditor
         mediaRootAbs={mediaRootAbs}
-        onSeek={(ms) => setPlayheadMs(Math.max(0, ms))}
-        onTogglePlay={(next) => setPlaying(Boolean(next))}
+        onSeek={commitSeek}
+        onTogglePlay={setPlaybackPlaying}
         onUpdateTextClip={handleUpdateTextClip}
-        playheadMs={playheadMs}
+        playback={playback}
+        playheadMs={playheadUiMs}
         playing={playing}
         project={project}
         repoPath={repoPath}
@@ -1181,11 +1245,12 @@ export default function VideoWorkspacePane({
       onChange={handleProjectChange}
       onRangesChange={setRanges}
       onRedo={redo}
-      onSeek={(ms) => setPlayheadMs(Math.max(0, ms))}
+      onSeek={commitSeek}
       onSelectClips={setSelectedClipIds}
       onUndo={undo}
       paneToken={paneId || "video-pane"}
-      playheadMs={playheadMs}
+      playback={playback}
+      playheadMs={playheadUiMs}
       project={project}
       ranges={ranges}
       repoPath={repoPath}
@@ -1336,34 +1401,35 @@ export default function VideoWorkspacePane({
                 // instead of whatever sliver the previous layout left over.
                 // Pixel minSizes keep panels readable at any pane width.
                 <Group
-                  key={`split-${libraryOpen ? "lib" : "nolib"}-${sidePanel || "none"}`}
                   orientation="horizontal"
                   style={{ height: "100%", width: "100%" }}
                 >
                   {libraryOpen ? (
-                    <>
-                      <SplitPanel defaultSize="260px" minSize="190px">
+                    <React.Fragment key="library-slot">
+                      <SplitPanel defaultSize="260px" id="video-split-library" key="library" minSize="190px">
                         <MediaBin {...binProps} />
                       </SplitPanel>
-                      <SplitSeparatorH />
-                    </>
+                      <SplitSeparatorH key="library-sep" />
+                    </React.Fragment>
                   ) : null}
-                  <SplitPanel minSize="360px">
+                  <SplitPanel id="video-split-center" key="center" minSize="360px">
                     <Group orientation="vertical" style={{ height: "100%", width: "100%" }}>
-                      <SplitPanel defaultSize={56} minSize="150px">
+                      <SplitPanel defaultSize={62} id="video-split-preview" key="preview" minSize="150px">
                         {previewCell}
                       </SplitPanel>
-                      <SplitSeparatorV />
-                      <SplitPanel minSize="140px">{timelineCell}</SplitPanel>
+                      <SplitSeparatorV key="preview-sep" />
+                      <SplitPanel id="video-split-timeline" key="timeline" minSize="140px">
+                        {timelineCell}
+                      </SplitPanel>
                     </Group>
                   </SplitPanel>
                   {sidePanelContent ? (
-                    <>
-                      <SplitSeparatorH />
-                      <SplitPanel defaultSize="340px" minSize="280px">
+                    <React.Fragment key="side-slot">
+                      <SplitSeparatorH key="side-sep" />
+                      <SplitPanel defaultSize="340px" id="video-split-side" key="side" minSize="280px">
                         {sidePanelContent}
                       </SplitPanel>
-                    </>
+                    </React.Fragment>
                   ) : null}
                 </Group>
               ) : (

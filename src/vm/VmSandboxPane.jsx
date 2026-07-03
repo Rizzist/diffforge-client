@@ -17,7 +17,9 @@ import {
   ButtonSplitHorizontalIcon,
   ButtonSplitVerticalIcon,
   TerminalCloseButton,
+  TerminalRailIdentity,
   TerminalRailControls,
+  TerminalRestartPill,
   TerminalRestartButton,
 } from "../app/appStyles";
 
@@ -55,7 +57,7 @@ function normalizeVmSandboxPercent(value) {
 function getVmSandboxInstallText(status) {
   const min = Number(status?.approximateDownloadMbMin || 80);
   const max = Number(status?.approximateDownloadMbMax || 180);
-  return `Install VM Sandbox runtime: about ${min}-${max} MB`;
+  return `Install runtime (${min}-${max} MB)`;
 }
 
 const spin = keyframes`
@@ -69,316 +71,250 @@ const VmSandboxShell = styled.section`
   display: flex;
   flex-direction: column;
   height: 100%;
+  min-width: 0;
   min-height: 0;
   width: 100%;
   overflow: hidden;
-  background:
-    radial-gradient(circle at 16% 0%, rgba(45, 212, 191, 0.13), transparent 34%),
-    radial-gradient(circle at 86% 8%, rgba(96, 165, 250, 0.12), transparent 32%),
-    #070b12;
-  border: 1px solid rgba(90, 111, 140, 0.38);
+  background: #020304;
   color: #e8eef9;
 
-  &[data-active="true"] {
-    border-color: rgba(106, 156, 255, 0.65);
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    color: #1e293b;
   }
 `;
 
-const VmSandboxHeader = styled.header`
-  container-type: inline-size;
-  display: grid;
-  grid-template-columns: minmax(0, max-content) minmax(0, 1fr) auto;
-  align-items: center;
-  column-gap: 12px;
-  row-gap: 2px;
-  min-height: 58px;
-  padding: 10px 12px;
-  border-bottom: 1px solid rgba(98, 116, 148, 0.28);
-  background: rgba(6, 9, 15, 0.8);
-
-  && [data-rail-row="primary"] {
-    grid-column: 3;
-    grid-row: 1;
-    justify-self: end;
-  }
-
-  && [data-rail-row="secondary"] {
-    grid-column: 2;
-    grid-row: 1;
-    width: auto;
+const VmSandboxHeader = styled(TerminalRestartPill)`
+  [data-rail-row="secondary"] {
+    width: 100%;
+    max-width: 100%;
+    flex-wrap: wrap;
     justify-content: flex-start;
-  }
-
-  @container (max-width: 520px) {
-    && {
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: start;
-    }
-
-    && [data-rail-row="primary"] {
-      grid-column: 2;
-      grid-row: 1;
-    }
-
-    && [data-rail-row="secondary"] {
-      grid-column: 1 / -1;
-      grid-row: 2;
-      width: 100%;
-    }
+    row-gap: 1px;
   }
 `;
 
-const VmSandboxIdentity = styled.div`
-  display: flex;
-  grid-column: 1;
-  grid-row: 1;
-  align-items: center;
+const VmSandboxIdentity = styled(TerminalRailIdentity)`
   min-width: 0;
-  gap: 10px;
 `;
 
 const VmSandboxGlyph = styled.span`
-  display: grid;
-  place-items: center;
+  display: inline-flex;
+  width: 18px;
+  height: 18px;
+  align-items: center;
+  justify-content: center;
   flex: 0 0 auto;
-  width: 34px;
-  height: 34px;
-  color: #86efac;
-  border: 1px solid rgba(134, 239, 172, 0.35);
-  border-radius: 8px;
-  background: rgba(16, 185, 129, 0.12);
+  color: rgba(134, 239, 172, 0.92);
 
   svg {
-    width: 19px;
-    height: 19px;
+    width: 15px;
+    height: 15px;
   }
 `;
 
-const VmSandboxTitleBlock = styled.div`
-  display: flex;
-  flex-direction: column;
+const VmSandboxTitleBlock = styled.span`
+  display: inline-flex;
+  align-items: center;
   min-width: 0;
+  gap: 6px;
 
   strong {
+    display: inline-block;
+    max-width: min(18rem, 42cqi);
     overflow: hidden;
-    color: #f3f7ff;
-    font-size: 18px;
-    font-weight: 800;
-    line-height: 1.15;
     text-overflow: ellipsis;
     white-space: nowrap;
+    color: rgba(226, 232, 240, 0.92);
+    font-size: 12px;
+    font-weight: 850;
+    letter-spacing: 0;
+    line-height: 1;
   }
 
   span {
+    display: inline-flex;
+    max-width: min(11rem, 28cqi);
+    height: 18px;
+    align-items: center;
+    padding: 0 7px;
     overflow: hidden;
-    color: #92a0b6;
-    font-size: 12px;
-    font-weight: 700;
+    border: 1px solid rgba(148, 163, 184, 0.18);
+    border-radius: 999px;
+    color: rgba(154, 165, 181, 0.9);
+    background: rgba(15, 23, 42, 0.48);
+    font-size: 10px;
+    font-weight: 850;
     letter-spacing: 0;
-    line-height: 1.3;
+    line-height: 1;
     text-overflow: ellipsis;
+    text-transform: lowercase;
     white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: rgba(48, 54, 68, 0.9);
+  }
+
+  html[data-forge-theme="light"] & span {
+    border-color: rgba(99, 102, 118, 0.2);
+    color: rgba(48, 54, 68, 0.82);
+    background: rgba(255, 255, 255, 0.72);
   }
 `;
 
 const VmSandboxBody = styled.div`
-  display: flex;
+  container: vm-sandbox-body / size;
+  position: relative;
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
   overflow: auto;
-  padding: clamp(16px, 3vw, 30px);
+  overscroll-behavior: contain;
+  padding: 12px;
+  scrollbar-color: rgba(148, 163, 184, 0.48) transparent;
+  scrollbar-width: thin;
+
+  &::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(148, 163, 184, 0.5);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
 `;
 
 const VmSandboxContent = styled.div`
   display: grid;
-  grid-template-columns: minmax(0, 1.1fr) minmax(240px, 0.65fr);
-  gap: 16px;
+  grid-template-columns: minmax(0, 1fr) minmax(210px, 0.46fr);
+  align-content: start;
+  gap: 10px;
   width: 100%;
-  max-width: 1100px;
-  margin: auto;
+  min-height: min-content;
+  max-width: none;
+  margin: 0;
 
-  @media (max-width: 860px) {
+  @container vm-sandbox-body (max-width: 760px) {
     grid-template-columns: minmax(0, 1fr);
-    margin: 0;
+  }
+
+  @container vm-sandbox-body (max-height: 330px) {
+    gap: 8px;
   }
 `;
 
 const VmSandboxRuntimePanel = styled.div`
-  display: flex;
-  flex-direction: column;
+  display: grid;
+  align-content: start;
   min-width: 0;
-  min-height: 260px;
-  padding: clamp(18px, 3vw, 26px);
-  border: 1px solid rgba(106, 126, 158, 0.35);
+  gap: 10px;
+  padding: 13px;
+  border: 1px solid rgba(100, 116, 139, 0.28);
   border-radius: 8px;
-  background: rgba(10, 15, 25, 0.74);
+  background: rgba(8, 12, 18, 0.72);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    background: rgba(248, 250, 252, 0.86);
+  }
+
+  @container vm-sandbox-body (max-height: 330px) {
+    gap: 8px;
+    padding: 10px;
+  }
 `;
 
 const VmSandboxKicker = styled.span`
-  color: #86efac;
-  font-size: 12px;
-  font-weight: 900;
-  letter-spacing: 0.08em;
+  color: rgba(134, 239, 172, 0.88);
+  font-size: 10px;
+  font-weight: 850;
+  letter-spacing: 0.06em;
   text-transform: uppercase;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(15, 118, 110, 0.92);
+  }
 `;
 
 const VmSandboxHeadline = styled.h2`
-  margin: 12px 0 8px;
-  color: #f7faff;
-  font-size: clamp(24px, 4vw, 40px);
-  font-weight: 900;
-  line-height: 1.04;
+  margin: 0;
+  color: rgba(241, 245, 249, 0.96);
+  font-size: 16px;
+  font-weight: 880;
+  line-height: 1.18;
   letter-spacing: 0;
+
+  html[data-forge-theme="light"] & {
+    color: #172033;
+  }
+
+  @container vm-sandbox-body (max-height: 330px) {
+    font-size: 14px;
+  }
 `;
 
 const VmSandboxCopy = styled.p`
-  max-width: 640px;
   margin: 0;
-  color: #a6b1c5;
-  font-size: 15px;
+  color: rgba(148, 163, 184, 0.9);
+  font-size: 12px;
   font-weight: 700;
-  line-height: 1.5;
+  line-height: 1.38;
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  @container vm-sandbox-body (max-height: 260px) {
+    display: none;
+  }
 `;
 
 const VmSandboxActionRow = styled.div`
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
-  margin-top: 22px;
+  gap: 8px;
+  margin-top: 2px;
+
+  @container vm-sandbox-body (max-width: 420px) {
+    align-items: stretch;
+  }
 `;
 
 const VmSandboxPrimaryButton = styled.button`
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
-  min-height: 42px;
+  gap: 7px;
+  min-height: 32px;
   max-width: 100%;
-  padding: 0 16px;
-  color: #06110d;
-  border: 1px solid rgba(134, 239, 172, 0.65);
-  border-radius: 8px;
-  background: linear-gradient(135deg, #86efac, #5eead4);
+  min-width: 0;
+  padding: 0 11px;
+  color: rgba(220, 252, 231, 0.96);
+  border: 1px solid rgba(74, 222, 128, 0.36);
+  border-radius: 7px;
+  background: rgba(22, 101, 52, 0.32);
   cursor: pointer;
-  font-size: 14px;
-  font-weight: 900;
-  letter-spacing: 0;
-  white-space: normal;
-
-  svg {
-    width: 20px;
-    height: 20px;
-    flex: 0 0 auto;
-  }
-
-  &:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-  }
-`;
-
-const VmSandboxSecondaryButton = styled.button`
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  min-height: 42px;
-  padding: 0 14px;
-  color: #d8e2f1;
-  border: 1px solid rgba(120, 140, 170, 0.5);
-  border-radius: 8px;
-  background: rgba(13, 19, 31, 0.86);
-  cursor: pointer;
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 850;
   letter-spacing: 0;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    transform 140ms ease;
 
-  svg {
-    width: 19px;
-    height: 19px;
-    flex: 0 0 auto;
-  }
-
-  &:disabled {
-    cursor: not-allowed;
-    opacity: 0.55;
-  }
-`;
-
-const VmSandboxProgress = styled.div`
-  display: grid;
-  gap: 8px;
-  margin-top: 18px;
-`;
-
-const VmSandboxProgressHeader = styled.div`
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  color: #c8d4e8;
-  font-size: 12px;
-  font-weight: 800;
-`;
-
-const VmSandboxProgressTrack = styled.div`
-  height: 9px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: rgba(65, 76, 96, 0.78);
-`;
-
-const VmSandboxProgressBar = styled.div`
-  width: ${({ $percent }) => `${$percent ?? 18}%`};
-  height: 100%;
-  border-radius: inherit;
-  background: linear-gradient(90deg, #60a5fa, #5eead4, #86efac);
-  transition: width 160ms ease;
-`;
-
-const VmSandboxStatusPanel = styled.div`
-  display: flex;
-  flex-direction: column;
-  min-width: 0;
-  gap: 12px;
-  padding: clamp(16px, 2.5vw, 22px);
-  border: 1px solid rgba(106, 126, 158, 0.3);
-  border-radius: 8px;
-  background: rgba(6, 10, 18, 0.7);
-`;
-
-const VmSandboxStatusBadge = styled.span`
-  display: inline-flex;
-  align-items: center;
-  align-self: flex-start;
-  gap: 7px;
-  min-height: 30px;
-  padding: 0 10px;
-  color: #d9e5f7;
-  border: 1px solid rgba(120, 140, 170, 0.45);
-  border-radius: 999px;
-  background: rgba(18, 26, 40, 0.88);
-  font-size: 12px;
-  font-weight: 900;
-
-  &[data-tone="ready"] {
-    color: #bbf7d0;
-    border-color: rgba(74, 222, 128, 0.45);
-    background: rgba(22, 101, 52, 0.22);
-  }
-
-  &[data-tone="warning"] {
-    color: #fed7aa;
-    border-color: rgba(251, 146, 60, 0.45);
-    background: rgba(124, 45, 18, 0.24);
-  }
-
-  &[data-tone="error"] {
-    color: #fecaca;
-    border-color: rgba(248, 113, 113, 0.45);
-    background: rgba(127, 29, 29, 0.28);
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   svg {
@@ -386,12 +322,242 @@ const VmSandboxStatusBadge = styled.span`
     height: 16px;
     flex: 0 0 auto;
   }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(134, 239, 172, 0.58);
+    background: rgba(21, 128, 61, 0.38);
+    transform: translateY(-1px);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+    transform: none;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(20, 83, 45, 0.95);
+    border-color: rgba(22, 163, 74, 0.28);
+    background: rgba(220, 252, 231, 0.7);
+  }
+
+  @container vm-sandbox-body (max-width: 420px) {
+    flex: 1 1 180px;
+  }
+`;
+
+const VmSandboxSecondaryButton = styled.button`
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 32px;
+  min-width: 0;
+  padding: 0 10px;
+  color: rgba(226, 232, 240, 0.88);
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 7px;
+  background: rgba(15, 23, 42, 0.48);
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 820;
+  letter-spacing: 0;
+  transition:
+    border-color 140ms ease,
+    background 140ms ease,
+    color 140ms ease,
+    transform 140ms ease;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  svg {
+    width: 15px;
+    height: 15px;
+    flex: 0 0 auto;
+  }
+
+  &:hover:not(:disabled) {
+    color: #fff;
+    border-color: rgba(148, 163, 184, 0.38);
+    background: rgba(30, 41, 59, 0.72);
+    transform: translateY(-1px);
+  }
+
+  &:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+    transform: none;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(30, 41, 59, 0.88);
+    border-color: rgba(15, 23, 42, 0.12);
+    background: rgba(255, 255, 255, 0.78);
+  }
+
+  @container vm-sandbox-body (max-width: 420px) {
+    flex: 1 1 112px;
+  }
+`;
+
+const VmSandboxProgress = styled.div`
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  margin-top: 0;
+`;
+
+const VmSandboxProgressHeader = styled.div`
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-width: 0;
+  color: rgba(203, 213, 225, 0.86);
+  font-size: 11px;
+  font-weight: 800;
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  span:last-child {
+    flex: 0 0 auto;
+    color: rgba(226, 232, 240, 0.9);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] & span:last-child {
+    color: #334155;
+  }
+`;
+
+const VmSandboxProgressTrack = styled.div`
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(51, 65, 85, 0.62);
+
+  html[data-forge-theme="light"] & {
+    background: rgba(203, 213, 225, 0.72);
+  }
+`;
+
+const VmSandboxProgressBar = styled.div`
+  width: ${({ $percent }) => `${$percent ?? 18}%`};
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #60a5fa, #22c55e);
+  transition: width 160ms ease;
+`;
+
+const VmSandboxStatusPanel = styled.div`
+  display: grid;
+  align-content: start;
+  min-width: 0;
+  gap: 10px;
+  padding: 13px;
+  border: 1px solid rgba(100, 116, 139, 0.24);
+  border-radius: 8px;
+  background: rgba(6, 10, 18, 0.62);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.1);
+    background: rgba(248, 250, 252, 0.7);
+  }
+
+  @container vm-sandbox-body (max-height: 330px) {
+    gap: 8px;
+    padding: 10px;
+  }
+`;
+
+const VmSandboxStatusBadge = styled.span`
+  display: inline-flex;
+  align-items: center;
+  align-self: flex-start;
+  gap: 6px;
+  min-height: 24px;
+  max-width: 100%;
+  padding: 0 9px;
+  color: rgba(226, 232, 240, 0.9);
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 999px;
+  background: rgba(15, 23, 42, 0.5);
+  font-size: 11px;
+  font-weight: 850;
+
+  &[data-tone="ready"] {
+    color: rgba(187, 247, 208, 0.96);
+    border-color: rgba(74, 222, 128, 0.3);
+    background: rgba(22, 101, 52, 0.24);
+  }
+
+  &[data-tone="warning"] {
+    color: rgba(254, 215, 170, 0.96);
+    border-color: rgba(251, 146, 60, 0.32);
+    background: rgba(124, 45, 18, 0.22);
+  }
+
+  &[data-tone="error"] {
+    color: rgba(254, 202, 202, 0.96);
+    border-color: rgba(248, 113, 113, 0.32);
+    background: rgba(127, 29, 29, 0.24);
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  svg {
+    width: 14px;
+    height: 14px;
+    flex: 0 0 auto;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: rgba(30, 41, 59, 0.86);
+    border-color: rgba(15, 23, 42, 0.12);
+    background: rgba(255, 255, 255, 0.72);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="ready"] {
+    color: rgba(22, 101, 52, 0.95);
+    border-color: rgba(22, 163, 74, 0.22);
+    background: rgba(220, 252, 231, 0.66);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="warning"] {
+    color: rgba(154, 52, 18, 0.95);
+    border-color: rgba(249, 115, 22, 0.22);
+    background: rgba(255, 237, 213, 0.72);
+  }
+
+  html[data-forge-theme="light"] &[data-tone="error"] {
+    color: rgba(127, 29, 29, 0.95);
+    border-color: rgba(220, 38, 38, 0.22);
+    background: rgba(254, 226, 226, 0.72);
+  }
 `;
 
 const VmSandboxSpinner = styled.i`
   display: inline-block;
-  width: 16px;
-  height: 16px;
+  width: 14px;
+  height: 14px;
   border: 2px solid rgba(147, 197, 253, 0.35);
   border-top-color: #93c5fd;
   border-radius: 999px;
@@ -400,69 +566,109 @@ const VmSandboxSpinner = styled.i`
 
 const VmSandboxDetails = styled.dl`
   display: grid;
-  grid-template-columns: minmax(82px, auto) minmax(0, 1fr);
-  gap: 9px 12px;
+  grid-template-columns: minmax(58px, auto) minmax(0, 1fr);
+  gap: 7px 10px;
   margin: 0;
 
   dt {
-    color: #7f8da6;
-    font-size: 12px;
-    font-weight: 850;
+    color: rgba(148, 163, 184, 0.76);
+    font-size: 11px;
+    font-weight: 820;
   }
 
   dd {
     min-width: 0;
     margin: 0;
     overflow: hidden;
-    color: #d8e4f7;
-    font-size: 12px;
-    font-weight: 750;
+    color: rgba(226, 232, 240, 0.88);
+    font-size: 11px;
+    font-weight: 730;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & dt {
+    color: #64748b;
+  }
+
+  html[data-forge-theme="light"] & dd {
+    color: #334155;
+  }
+
+  @container vm-sandbox-body (max-width: 420px) {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 2px;
+
+    dd {
+      margin-bottom: 5px;
+    }
   }
 `;
 
 const VmSandboxPreview = styled.div`
   display: grid;
-  place-items: center;
-  min-height: 150px;
-  padding: 18px;
-  border: 1px dashed rgba(120, 140, 170, 0.36);
-  border-radius: 8px;
-  background:
-    linear-gradient(rgba(148, 163, 184, 0.06) 1px, transparent 1px),
-    linear-gradient(90deg, rgba(148, 163, 184, 0.06) 1px, transparent 1px),
-    rgba(3, 7, 14, 0.48);
-  background-size: 28px 28px;
-  text-align: center;
+  align-items: center;
+  min-height: 72px;
+  padding: 11px;
+  border: 1px dashed rgba(148, 163, 184, 0.22);
+  border-radius: 7px;
+  background: rgba(2, 6, 12, 0.34);
+  text-align: left;
 
   strong {
     display: block;
-    margin-bottom: 6px;
-    color: #f0f5ff;
-    font-size: 15px;
-    font-weight: 900;
+    margin-bottom: 4px;
+    color: rgba(241, 245, 249, 0.92);
+    font-size: 12px;
+    font-weight: 850;
   }
 
   span {
     display: block;
-    color: #8795ad;
-    font-size: 12px;
-    font-weight: 750;
-    line-height: 1.4;
+    color: rgba(148, 163, 184, 0.82);
+    font-size: 11px;
+    font-weight: 700;
+    line-height: 1.32;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(15, 23, 42, 0.12);
+    background: rgba(255, 255, 255, 0.7);
+  }
+
+  html[data-forge-theme="light"] & strong {
+    color: #1e293b;
+  }
+
+  html[data-forge-theme="light"] & span {
+    color: #64748b;
+  }
+
+  @container vm-sandbox-body (max-height: 330px) {
+    min-height: 0;
+    padding: 9px;
+  }
+
+  @container vm-sandbox-body (max-height: 245px) {
+    display: none;
   }
 `;
 
 const VmSandboxError = styled.div`
-  margin-top: 16px;
-  padding: 12px 14px;
-  color: #fecaca;
-  border: 1px solid rgba(248, 113, 113, 0.35);
-  border-radius: 8px;
-  background: rgba(127, 29, 29, 0.22);
-  font-size: 12px;
+  padding: 9px 10px;
+  color: rgba(254, 202, 202, 0.94);
+  border: 1px solid rgba(248, 113, 113, 0.28);
+  border-radius: 7px;
+  background: rgba(127, 29, 29, 0.2);
+  font-size: 11px;
   font-weight: 800;
-  line-height: 1.45;
+  line-height: 1.38;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(127, 29, 29, 0.94);
+    border-color: rgba(220, 38, 38, 0.18);
+    background: rgba(254, 226, 226, 0.72);
+  }
 `;
 
 export default function VmSandboxPane({
@@ -667,14 +873,14 @@ export default function VmSandboxPane({
       <VmSandboxBody>
         <VmSandboxContent>
           <VmSandboxRuntimePanel>
-            <VmSandboxKicker>Local virtual machine broker</VmSandboxKicker>
+            <VmSandboxKicker>Runtime</VmSandboxKicker>
             <VmSandboxHeadline>
-              {runtimeReady ? "Runtime ready for VM images." : "Install the runtime on first use."}
+              {runtimeReady ? "Ready for VM images" : "Runtime not installed"}
             </VmSandboxHeadline>
             <VmSandboxCopy>
               {runtimeReady
-                ? "Diff Forge found QEMU on this device. VM images can use this broker without adding the runtime to the app bundle."
-                : runtimeStatus?.runtimeInstallHint || "Diff Forge ships the panel only. The VM runtime is downloaded or installed when you ask for it."}
+                ? `${runtimeStatus?.runtimeName || "QEMU"} is available on this device.`
+                : runtimeStatus?.runtimeInstallHint || "Install the local VM runtime before creating images."}
             </VmSandboxCopy>
 
             <VmSandboxActionRow>
@@ -744,8 +950,8 @@ export default function VmSandboxPane({
                 <strong>{runtimeReady ? "No VM images yet" : "Runtime not ready"}</strong>
                 <span>
                   {runtimeReady
-                    ? "Linux, Windows, and imported image workflows can be enabled on top of this runtime broker."
-                    : "Install or configure the runtime before creating a VM image."}
+                    ? "Created and imported images will appear here."
+                    : "Install or configure the runtime first."}
                 </span>
               </div>
             </VmSandboxPreview>

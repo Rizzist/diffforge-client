@@ -51,6 +51,7 @@ export default function WebPane({
   workspaceId,
   initialUrl = DEFAULT_WEB_URL,
   isActive = true,
+  isFocused = false,
   isFullscreen = false,
   fullscreenActive = false,
   dragActive = false,
@@ -67,6 +68,7 @@ export default function WebPane({
   onFocusBreakout,
   onNavigate,
   onAgentPromptOpenChange,
+  onDismissPanelAgentPromptActivityItem = null,
   controlCommand = null,
   defaultPanelAgentPromptTargetIds = [],
   panelKind = "web",
@@ -187,7 +189,14 @@ export default function WebPane({
     paneId,
     workspaceId,
   });
+  const dismissPanelAgentPromptActivityItem = useCallback((itemId) => {
+    const safeItemId = String(itemId || "").trim();
+    if (safeItemId) {
+      onDismissPanelAgentPromptActivityItem?.(safeItemId);
+    }
+  }, [onDismissPanelAgentPromptActivityItem]);
   const webAgentPromptOverlay = useWebAgentPromptOverlay({
+    autoDismissCompleted: Boolean(isFocused),
     activityItems: panelAgentPromptActivityItems,
     contextRefs: webElementPicker.contextRefs,
     defaultSelectedTargetIds: defaultPanelAgentPromptTargetIds,
@@ -195,6 +204,7 @@ export default function WebPane({
     evaluate,
     onClearContext: webElementPicker.clearSelection,
     onClose: () => setAgentPromptOpen(false),
+    onDismissCompletedItem: dismissPanelAgentPromptActivityItem,
     onSubmit: onSubmitPanelAgentPrompt,
     panelKind,
     panelPaneId: paneId,
@@ -277,6 +287,8 @@ export default function WebPane({
   const splitControlsVisible = showSplitControls && typeof onSplit === "function";
   const popOutControlVisible = showPopOutControl && typeof onPopOut === "function";
   const fullscreenControlVisible = showFullscreenControl && typeof onToggleFullscreen === "function";
+  const hasPanelAgentPromptActivity = Array.isArray(panelAgentPromptActivityItems)
+    && panelAgentPromptActivityItems.length > 0;
   const effectiveBreakoutReturnUrl = normalizeWebInput(breakoutReturnUrl)
     || String(breakoutReturnUrl || "").trim()
     || currentUrl;
@@ -285,7 +297,7 @@ export default function WebPane({
     <WebPaneSurface data-workspace-web-surface="true" data-active={isActive ? "true" : undefined}>
       <WebPaneRail data-terminal-control="true">
         {dragHandleVisible ? (
-          <WebPaneIdentity>
+          <WebPaneIdentity data-web-pane-rail-section="identity">
             <WebPaneDragButton
               aria-label="Drag web panel"
               data-terminal-drag-handle="true"
@@ -297,7 +309,7 @@ export default function WebPane({
             </WebPaneDragButton>
           </WebPaneIdentity>
         ) : null}
-        <WebPaneNav onSubmit={handleSubmit}>
+        <WebPaneNav data-web-pane-rail-section="nav" onSubmit={handleSubmit}>
           <WebPaneIconButton
             aria-label="Back"
             disabled={!canGoBack}
@@ -342,7 +354,7 @@ export default function WebPane({
           />
         </WebPaneNav>
         {closeButtonVisible ? (
-          <WebPaneRailControls data-rail-row="primary">
+          <WebPaneRailControls data-rail-row="primary" data-web-pane-rail-section="primary">
             <WebPaneCloseButton
               aria-label="Close web panel"
               data-tone="close"
@@ -354,10 +366,9 @@ export default function WebPane({
             </WebPaneCloseButton>
           </WebPaneRailControls>
         ) : null}
-        <WebPaneRailControls data-rail-row="secondary">
+        <WebPaneRailControls data-rail-row="secondary" data-web-pane-rail-section="secondary">
           {agentPromptControlVisible ? (
             <>
-              <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
               <WebPaneIconButton
                 aria-label="Prompt terminal agents"
                 aria-pressed={agentPromptOpen ? "true" : "false"}
@@ -424,6 +435,15 @@ export default function WebPane({
             </WebPaneIconButton>
           ) : null}
         </WebPaneRailControls>
+        {hasPanelAgentPromptActivity ? (
+          <WebPaneActivityRow data-web-pane-rail-section="activity">
+            <PanelAgentPromptActivity
+              autoDismissCompleted={Boolean(isFocused)}
+              items={panelAgentPromptActivityItems}
+              onDismissCompletedItem={dismissPanelAgentPromptActivityItem}
+            />
+          </WebPaneActivityRow>
+        ) : null}
       </WebPaneRail>
 
       {addressError ? <WebPaneInlineError role="alert">{addressError}</WebPaneInlineError> : null}
@@ -508,9 +528,77 @@ const WebPaneSurface = styled.section`
 `;
 
 const WebPaneRail = styled(TerminalRestartPill)`
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(24px, auto) minmax(24px, auto);
+  align-items: center;
+  column-gap: 4px;
+  row-gap: 2px;
   border-bottom-color: var(--web-border);
   background: var(--web-panel);
+
+  && [data-web-pane-rail-section="identity"] {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  && [data-web-pane-rail-section="nav"] {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  && [data-web-pane-rail-section="secondary"] {
+    grid-column: 2;
+    grid-row: 1;
+    width: auto;
+    justify-self: end;
+    flex-wrap: wrap;
+  }
+
+  && [data-web-pane-rail-section="primary"] {
+    grid-column: 3;
+    grid-row: 1;
+    justify-self: end;
+  }
+
+  && [data-web-pane-rail-section="activity"] {
+    grid-column: 1 / -1;
+    grid-row: 3;
+  }
+
+  @container (max-width: 760px) {
+    && {
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+    }
+
+    && [data-web-pane-rail-section="identity"] {
+      grid-column: 1;
+      grid-row: 1;
+    }
+
+    && [data-web-pane-rail-section="primary"] {
+      grid-column: 2;
+      grid-row: 1;
+    }
+
+    && [data-web-pane-rail-section="nav"] {
+      grid-column: 1 / -1;
+      grid-row: 3;
+    }
+
+    && [data-web-pane-rail-section="secondary"] {
+      grid-column: 1 / -1;
+      grid-row: 2;
+      width: 100%;
+      justify-self: start;
+      flex-wrap: wrap;
+    }
+
+    && [data-web-pane-rail-section="activity"] {
+      grid-column: 1 / -1;
+      grid-row: 4;
+    }
+  }
 `;
 
 const WebPaneIdentity = styled(TerminalRailIdentity)`
@@ -524,14 +612,14 @@ const WebPaneDragButton = styled(TerminalRestartButton)`
 
 const WebPaneRailControls = styled(TerminalRailControls)`
   &[data-rail-row="primary"] {
-    grid-column: 2;
+    grid-column: 3;
     grid-row: 1;
   }
 
   &[data-rail-row="secondary"] {
-    grid-column: 1 / -1;
-    grid-row: 3;
-    width: 100%;
+    grid-column: 2;
+    grid-row: 1;
+    width: auto;
   }
 `;
 
@@ -547,18 +635,25 @@ const WebPaneNav = styled.form`
   display: flex;
   grid-column: 1 / -1;
   grid-row: 2;
-  min-width: min(100%, 220px);
+  width: 100%;
+  min-width: 0;
   align-items: center;
-  flex: 999 1 260px;
   gap: 2px;
-  order: 1;
   padding: 0;
   border: 0;
   background: transparent;
 `;
 
+const WebPaneActivityRow = styled.div`
+  display: flex;
+  grid-column: 1 / -1;
+  grid-row: 3;
+  min-width: 0;
+  justify-content: flex-end;
+`;
+
 const WebPaneAddressInput = styled.input`
-  min-width: 72px;
+  min-width: 0;
   flex: 1 1 120px;
   height: 24px;
   padding: 0 9px;

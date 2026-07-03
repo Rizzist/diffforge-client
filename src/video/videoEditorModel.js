@@ -142,6 +142,18 @@ export function clipPropAtMs(clip, prop, atMs) {
   return kfValueAtMs(frames, atMs, statics[prop]);
 }
 
+export function preparePropEvaluator(clip, prop) {
+  const statics = {
+    opacity: clip?.transform?.opacity ?? 1,
+    x: clip?.transform?.x ?? 0,
+    y: clip?.transform?.y ?? 0,
+    scale: clip?.transform?.scale ?? 1,
+  };
+  const fallback = Object.prototype.hasOwnProperty.call(statics, prop) ? statics[prop] : 0;
+  const frames = VIDEO_KF_PROPS.includes(prop) ? normalizeKf({ [prop]: clip?.kf?.[prop] })[prop] || [] : [];
+  return (atMs) => kfValueAtMs(frames, atMs, fallback);
+}
+
 export function normalizeTextStyle(style) {
   return {
     fontSize: Math.min(400, Math.max(8, cleanNumber(style?.fontSize, 48))),
@@ -297,6 +309,37 @@ export function gainAtMs(gain, atMs) {
     }
   }
   return normalized.level;
+}
+
+export function prepareGainEvaluator(gain) {
+  const normalized = normalizeGain(gain);
+  const frames = normalized.keyframes;
+  const baseLevel = normalized.level;
+  return (atMs) => {
+    if (!frames.length) {
+      return baseLevel;
+    }
+    if (atMs <= frames[0].atMs) {
+      return frames[0].level;
+    }
+    const last = frames[frames.length - 1];
+    if (atMs >= last.atMs) {
+      return last.level;
+    }
+    for (let index = 0; index < frames.length - 1; index += 1) {
+      const from = frames[index];
+      const to = frames[index + 1];
+      if (atMs >= from.atMs && atMs <= to.atMs) {
+        const span = to.atMs - from.atMs;
+        if (span <= 0) {
+          return to.level;
+        }
+        const ratio = (atMs - from.atMs) / span;
+        return from.level + (to.level - from.level) * ratio;
+      }
+    }
+    return baseLevel;
+  };
 }
 
 function cloneProject(project) {

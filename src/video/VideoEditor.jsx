@@ -5,8 +5,20 @@ import { Pause } from "@styled-icons/material-rounded/Pause";
 import { PhotoCamera } from "@styled-icons/material-rounded/PhotoCamera";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
 import { SkipPrevious } from "@styled-icons/material-rounded/SkipPrevious";
-import { clipPropAtMs, clipsAtMs, formatTimecode, gainAtMs, projectDurationMs } from "./videoEditorModel.js";
+import {
+  clipEndMs,
+  clipsAtMs,
+  formatTimecode,
+  prepareGainEvaluator,
+  preparePropEvaluator,
+  projectDurationMs,
+} from "./videoEditorModel.js";
 import { VideoIconButton } from "./videoStyles.js";
+
+const PRELOAD_AHEAD_MS = 3000;
+const EVICT_BEHIND_MS = 5000;
+const SECONDARY_DRIFT_MS = 350;
+const SECONDARY_DRIFT_INTERVAL_MS = 1000;
 
 const PreviewRoot = styled.div`
   display: flex;
@@ -103,13 +115,87 @@ const TransportScrub = styled.input`
   accent-color: #10b981;
 `;
 
+function isImageAsset(assetPath) {
+  return /\.(png|jpe?g|webp|gif|bmp|tiff)$/i.test(assetPath || "");
+}
+
+function mediaSourceMs(clip, timelineMs) {
+  return (clip?.sourceInMs || 0) + Math.max(0, timelineMs - (clip?.timelineStartMs || 0)) * (clip?.speed || 1);
+}
+
+function timelineMsFromMedia(clip, element) {
+  const speed = clip?.speed || 1;
+  return (clip?.timelineStartMs || 0) + ((element.currentTime * 1000 - (clip?.sourceInMs || 0)) / speed);
+}
+
+function sameTimingWindow(left, right) {
+  return Boolean(
+    left
+      && right
+      && left.assetPath === right.assetPath
+      && left.timelineStartMs === right.timelineStartMs
+      && left.durationMs === right.durationMs
+      && (left.sourceInMs || 0) === (right.sourceInMs || 0)
+      && (left.speed || 1) === (right.speed || 1),
+  );
+}
+
+function linkedAudioPartner(active, videoClip) {
+  if (!videoClip?.linkId) {
+    return null;
+  }
+  return (
+    active.audio.find(({ clip }) => clip.linkId === videoClip.linkId && sameTimingWindow(videoClip, clip))?.clip || null
+  );
+}
+
+function hasLinkedVideoTwin(project, audioClip) {
+  if (!audioClip?.linkId) {
+    return false;
+  }
+  for (const track of project?.tracks || []) {
+    if (track.kind !== "video" || track.muted) {
+      continue;
+    }
+    for (const clip of track.clips || []) {
+      if (clip.linkId === audioClip.linkId && sameTimingWindow(clip, audioClip) && !isImageAsset(clip.assetPath)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function nextClipBoundaryMs(project, timelineMs) {
+  let next = Number.POSITIVE_INFINITY;
+  for (const track of project?.tracks || []) {
+    if (track.muted) {
+      continue;
+    }
+    for (const clip of track.clips || []) {
+      if (clip.timelineStartMs > timelineMs + 0.5) {
+        next = Math.min(next, clip.timelineStartMs);
+      }
+    }
+  }
+  return Number.isFinite(next) ? next : null;
+}
+
+function topVisual(active) {
+  return active.video.length ? active.video[active.video.length - 1] : null;
+}
+
+function volumeLevel(value) {
+  return Math.min(1, Math.max(0, Number(value) || 0));
+}
+
 // Approximate realtime preview of the timeline: the topmost active video-track
-// clip renders visually (with CSS transform/opacity), every active clip with
-// audio plays through a pooled media element with live gain applied, and text
-// clips render as DOM overlays. Export via ffmpeg is the exact compositor —
-// this preview trades layered video compositing for responsiveness.
+// clip renders visually (with CSS transform/opacity), audible clips play
+// through pooled media elements, and text clips render as DOM overlays. Export
+// via ffmpeg is the exact compositor; preview prioritizes responsive editing.
 export default function VideoEditor({
   mediaRootAbs = "",
+  playback = null,
   playheadMs = 0,
   playing = false,
   project,
@@ -119,7 +205,42 @@ export default function VideoEditor({
   onUpdateTextClip,
 }) {
   const frameRef = useRef(null);
+  const stageRef = useRef(null);
+  const visualLayerRef = useRef(null);
+  const mediaPoolRef = useRef(new Map());
+  const rafRef = useRef(0);
+  const lastGapTickRef = useRef(0);
+  const primaryClockIdRef = useRef("");
+  const selfClockWriteRef = useRef(false);
+  const projectRef = useRef(project);
+  const durationRef = useRef(0);
+  const playingRef = useRef(playing);
+  const playheadMsRef = useRef(playheadMs);
+  playheadMsRef.current = playheadMs;
+  const renderedVisualIdRef = useRef("");
+  const renderedVisualIsImageRef = useRef(false);
+  const gainEvaluatorCacheRef = useRef(new Map());
+  const propEvaluatorCacheRef = useRef(new Map());
+  const textOverlayRefs = useRef(new Map());
+  const fontScaleRef = useRef(0);
+  const transportScrubRef = useRef(null);
+  const transportTimeRef = useRef(null);
   const [draggingTextId, setDraggingTextId] = useState("");
+  const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
+  const [capturingFrame, setCapturingFrame] = useState(false);
+
+  const durationMs = useMemo(() => projectDurationMs(project), [project]);
+  const active = useMemo(() => clipsAtMs(project, playheadMs), [playheadMs, project]);
+  const visual = topVisual(active);
+  const visualIsImage = visual ? isImageAsset(visual.clip.assetPath) : false;
+  renderedVisualIdRef.current = visual?.clip.id || "";
+  renderedVisualIsImageRef.current = visualIsImage;
+  projectRef.current = project;
+  durationRef.current = durationMs;
+  playingRef.current = playing;
+
+  const settings = project?.settings || { width: 1920, height: 1080, background: "#000000" };
+  const aspect = settings.width / Math.max(1, settings.height);
 
   // Meme-editor essential: grab a title on the preview and put it where it
   // belongs. Fractions are relative to the project frame.
@@ -158,17 +279,6 @@ export default function VideoEditor({
     },
     [onUpdateTextClip],
   );
-  const stageRef = useRef(null);
-  const mediaPoolRef = useRef(new Map());
-  const rafRef = useRef(0);
-  const lastTickRef = useRef(0);
-  const [stageSize, setStageSize] = useState({ width: 0, height: 0 });
-
-  const durationMs = useMemo(() => projectDurationMs(project), [project]);
-  const active = useMemo(() => clipsAtMs(project, playheadMs), [playheadMs, project]);
-
-  const settings = project?.settings || { width: 1920, height: 1080, background: "#000000" };
-  const aspect = settings.width / Math.max(1, settings.height);
 
   // Fit the project frame into the stage.
   useEffect(() => {
@@ -196,13 +306,14 @@ export default function VideoEditor({
     return { width, height: width / aspect };
   }, [aspect, stageSize]);
 
+  const fontScale = frameSize.width > 0 ? frameSize.width / Math.max(1, settings.width) : 0;
+  fontScaleRef.current = fontScale;
+
   const assetSrc = useCallback(
     (assetPath) => {
       if (!assetPath || !mediaRootAbs) {
         return "";
       }
-      // assetPath is repo-relative ("media/assets/x.mp4"); mediaRootAbs points
-      // at "<repo>/media" — join on the segment after "media/".
       const tail = assetPath.startsWith("media/") ? assetPath.slice("media/".length) : assetPath;
       const abs = `${mediaRootAbs.replace(/[\\/]+$/, "")}/${tail}`;
       try {
@@ -214,141 +325,494 @@ export default function VideoEditor({
     [mediaRootAbs],
   );
 
-  // Playback clock: advance the playhead with rAF while playing.
+  const getGainEvaluator = useCallback((clip) => {
+    const cached = gainEvaluatorCacheRef.current.get(clip.id);
+    if (cached?.gainRef === clip.gain) {
+      return cached.evaluate;
+    }
+    const evaluate = prepareGainEvaluator(clip.gain);
+    gainEvaluatorCacheRef.current.set(clip.id, { gainRef: clip.gain, evaluate });
+    return evaluate;
+  }, []);
+
+  const getPropEvaluator = useCallback((clip, prop) => {
+    const key = `${clip.id}:${prop}`;
+    const kfRef = clip.kf?.[prop] || null;
+    const cached = propEvaluatorCacheRef.current.get(key);
+    if (cached?.kfRef === kfRef && cached?.transformRef === clip.transform) {
+      return cached.evaluate;
+    }
+    const evaluate = preparePropEvaluator(clip, prop);
+    propEvaluatorCacheRef.current.set(key, { kfRef, transformRef: clip.transform, evaluate });
+    return evaluate;
+  }, []);
+
+  const detachEntry = useCallback((entry) => {
+    if (!entry?.element) {
+      return;
+    }
+    entry.visible = false;
+    entry.element.style.display = "none";
+    if (entry.element.parentElement !== document.body) {
+      document.body.appendChild(entry.element);
+    }
+  }, []);
+
+  const removeEntry = useCallback(
+    (entry) => {
+      if (!entry?.element) {
+        return;
+      }
+      try {
+        entry.element.pause();
+      } catch {
+        /* best-effort cleanup */
+      }
+      entry.element.remove();
+      mediaPoolRef.current.delete(entry.clipId);
+    },
+    [],
+  );
+
+  const ensureEntry = useCallback(
+    (track, clip) => {
+      const tag = track.kind === "audio" ? "audio" : "video";
+      let entry = mediaPoolRef.current.get(clip.id);
+      if (entry && entry.tag !== tag) {
+        removeEntry(entry);
+        entry = null;
+      }
+      if (!entry) {
+        const element = document.createElement(tag);
+        element.preload = "auto";
+        element.style.display = "none";
+        element.muted = true;
+        if (tag === "video") {
+          element.playsInline = true;
+        }
+        document.body.appendChild(element);
+        entry = {
+          clip,
+          clipId: clip.id,
+          element,
+          lastCorrectionAtMs: 0,
+          lastVolume: -1,
+          preloadKey: "",
+          src: "",
+          tag,
+          track,
+          visible: false,
+        };
+        mediaPoolRef.current.set(clip.id, entry);
+      }
+      entry.clip = clip;
+      entry.track = track;
+      entry.element.preload = "auto";
+      entry.element.playbackRate = clip.speed || 1;
+      const src = assetSrc(clip.assetPath);
+      if (entry.src !== src) {
+        entry.src = src;
+        entry.preloadKey = "";
+        entry.element.src = src;
+      }
+      return entry;
+    },
+    [assetSrc, removeEntry],
+  );
+
+  const attachVisualEntry = useCallback(
+    (entry) => {
+      const host = visualLayerRef.current;
+      if (
+        !host
+        || !entry?.element
+        || renderedVisualIsImageRef.current
+        || renderedVisualIdRef.current !== entry.clip.id
+      ) {
+        return;
+      }
+      for (const other of mediaPoolRef.current.values()) {
+        if (other !== entry && other.element?.parentElement === host) {
+          detachEntry(other);
+        }
+      }
+      if (entry.element.parentElement !== host) {
+        host.appendChild(entry.element);
+      }
+      entry.element.style.display = "";
+      entry.visible = true;
+    },
+    [detachEntry],
+  );
+
+  const seekEntryToTimeline = useCallback((entry, timelineMs) => {
+    const sourceMs = Math.max(0, mediaSourceMs(entry.clip, timelineMs));
+    try {
+      // Redundant re-syncs (effect restarts, repeated seekActive calls) must
+      // be no-ops: assigning currentTime — even to ~the same value — makes
+      // some decoders hiccup audibly.
+      if (Math.abs(entry.element.currentTime * 1000 - sourceMs) < 60) {
+        return;
+      }
+      entry.element.currentTime = sourceMs / 1000;
+    } catch {
+      /* media metadata may not be seekable yet */
+    }
+  }, []);
+
+  const preloadEntry = useCallback((entry) => {
+    const sourceMs = Math.max(0, entry.clip.sourceInMs || 0);
+    const key = `${entry.clip.id}:${entry.src}:${sourceMs}`;
+    if (entry.preloadKey === key) {
+      return;
+    }
+    entry.preloadKey = key;
+    try {
+      entry.element.currentTime = sourceMs / 1000;
+      entry.element.load?.();
+    } catch {
+      /* best-effort preload */
+    }
+  }, []);
+
+  const setEntryVolume = useCallback(
+    (entry, volumeClip, timelineMs) => {
+      const clipRelMs = Math.max(0, timelineMs - volumeClip.timelineStartMs);
+      const level = volumeLevel(getGainEvaluator(volumeClip)(clipRelMs));
+      if (Math.abs(level - entry.lastVolume) > 0.01) {
+        entry.element.volume = level;
+        entry.lastVolume = level;
+      }
+    },
+    [getGainEvaluator],
+  );
+
+  const syncMediaForTime = useCallback(
+    (timelineMs, { now = performance.now(), playing: shouldPlay = playingRef.current, seekActive = false } = {}) => {
+      const currentProject = projectRef.current;
+      const activeNow = clipsAtMs(currentProject, timelineMs);
+      const visualNow = topVisual(activeNow);
+      const visualMediaId = visualNow && !isImageAsset(visualNow.clip.assetPath) ? visualNow.clip.id : "";
+      const skippedAudioIds = new Set();
+      const videoVolumeDrivers = new Map();
+      for (const { clip } of activeNow.video) {
+        const partner = linkedAudioPartner(activeNow, clip);
+        if (partner) {
+          skippedAudioIds.add(partner.id);
+          videoVolumeDrivers.set(clip.id, partner);
+        }
+      }
+
+      const activeItems = [];
+      for (const entry of activeNow.video) {
+        if (!entry.clip.assetPath || isImageAsset(entry.clip.assetPath)) {
+          continue;
+        }
+        activeItems.push({
+          ...entry,
+          visible: entry.clip.id === visualMediaId,
+          volumeClip: videoVolumeDrivers.get(entry.clip.id) || entry.clip,
+        });
+      }
+      for (const entry of activeNow.audio) {
+        if (!entry.clip.assetPath || skippedAudioIds.has(entry.clip.id)) {
+          continue;
+        }
+        activeItems.push({ ...entry, visible: false, volumeClip: entry.clip });
+      }
+
+      const wantedIds = new Set();
+      const activeEntries = [];
+      for (const item of activeItems) {
+        wantedIds.add(item.clip.id);
+        const entry = ensureEntry(item.track, item.clip);
+        if (item.visible) {
+          attachVisualEntry(entry);
+        } else {
+          detachEntry(entry);
+        }
+        if (seekActive) {
+          seekEntryToTimeline(entry, timelineMs);
+        }
+        activeEntries.push({ entry, item });
+      }
+
+      const primary =
+        activeEntries.find(({ entry }) => entry.clip.id === visualMediaId)?.entry
+        || (!visualMediaId ? activeEntries.find(({ item }) => item.track.kind === "audio")?.entry || null : null);
+
+      for (const { entry, item } of activeEntries) {
+        const isPrimary = entry === primary;
+        if (!seekActive && !isPrimary && shouldPlay) {
+          const drift = Math.abs(entry.element.currentTime * 1000 - mediaSourceMs(entry.clip, timelineMs));
+          if (drift > SECONDARY_DRIFT_MS && now - entry.lastCorrectionAtMs > SECONDARY_DRIFT_INTERVAL_MS) {
+            seekEntryToTimeline(entry, timelineMs);
+            entry.lastCorrectionAtMs = now;
+          }
+        }
+        entry.element.muted = false;
+        entry.element.playbackRate = entry.clip.speed || 1;
+        setEntryVolume(entry, item.volumeClip, timelineMs);
+        if (shouldPlay && entry.element.paused) {
+          entry.element.play().catch(() => {});
+        }
+        if (!shouldPlay && !entry.element.paused) {
+          entry.element.pause();
+        }
+      }
+
+      for (const track of currentProject?.tracks || []) {
+        if (track.muted || track.kind === "text") {
+          continue;
+        }
+        for (const clip of track.clips || []) {
+          if (
+            !clip.assetPath
+            || isImageAsset(clip.assetPath)
+            || clip.timelineStartMs <= timelineMs
+            || clip.timelineStartMs > timelineMs + PRELOAD_AHEAD_MS
+            || (track.kind === "audio" && hasLinkedVideoTwin(currentProject, clip))
+          ) {
+            continue;
+          }
+          wantedIds.add(clip.id);
+          const entry = ensureEntry(track, clip);
+          detachEntry(entry);
+          entry.element.muted = true;
+          if (!entry.element.paused) {
+            entry.element.pause();
+          }
+          preloadEntry(entry);
+        }
+      }
+
+      for (const [clipId, entry] of mediaPoolRef.current.entries()) {
+        if (wantedIds.has(clipId)) {
+          continue;
+        }
+        const endedRecently = clipEndMs(entry.clip) <= timelineMs && clipEndMs(entry.clip) >= timelineMs - EVICT_BEHIND_MS;
+        if (endedRecently) {
+          detachEntry(entry);
+          if (!entry.element.paused) {
+            entry.element.pause();
+          }
+          continue;
+        }
+        removeEntry(entry);
+      }
+
+      return { active: activeNow, nextBoundaryMs: nextClipBoundaryMs(currentProject, timelineMs), primary };
+    },
+    [
+      attachVisualEntry,
+      detachEntry,
+      ensureEntry,
+      preloadEntry,
+      removeEntry,
+      seekEntryToTimeline,
+      setEntryVolume,
+    ],
+  );
+
+  const updateTransportDom = useCallback((ms) => {
+    const duration = durationRef.current;
+    const max = Math.max(1000, duration);
+    if (transportScrubRef.current) {
+      transportScrubRef.current.max = String(max);
+      transportScrubRef.current.value = String(Math.min(Math.max(0, ms), max));
+    }
+    if (transportTimeRef.current) {
+      transportTimeRef.current.textContent = `${formatTimecode(ms)} / ${formatTimecode(duration)}`;
+    }
+  }, []);
+
+  const applyPreviewStyles = useCallback(
+    (timelineMs) => {
+      const activeNow = clipsAtMs(projectRef.current, timelineMs);
+      const visualNow = topVisual(activeNow);
+      if (visualNow?.clip.id === renderedVisualIdRef.current && visualLayerRef.current) {
+        const clipRelMs = Math.max(0, timelineMs - visualNow.clip.timelineStartMs);
+        const opacity = getPropEvaluator(visualNow.clip, "opacity")(clipRelMs);
+        const x = getPropEvaluator(visualNow.clip, "x")(clipRelMs);
+        const y = getPropEvaluator(visualNow.clip, "y")(clipRelMs);
+        const scale = getPropEvaluator(visualNow.clip, "scale")(clipRelMs);
+        visualLayerRef.current.style.opacity = String(opacity);
+        visualLayerRef.current.style.transform = `translate(${x * 100}%, ${y * 100}%) scale(${scale})`;
+      }
+      for (const { clip } of activeNow.text) {
+        const node = textOverlayRefs.current.get(clip.id);
+        if (!node) {
+          continue;
+        }
+        const currentFontScale = fontScaleRef.current;
+        const outlineWidth = (clip.style?.outlineWidth || 0) * currentFontScale;
+        node.style.left = `${(clip.style?.x ?? 0.5) * 100}%`;
+        node.style.top = `${(clip.style?.y ?? 0.85) * 100}%`;
+        node.style.fontSize = `${Math.max(6, (clip.style?.fontSize || 48) * currentFontScale)}px`;
+        node.style.webkitTextStroke = outlineWidth > 0 ? `${outlineWidth}px ${clip.style?.outlineColor || "#000000"}` : "";
+        node.style.paintOrder = outlineWidth > 0 ? "stroke fill" : "";
+      }
+    },
+    [getPropEvaluator],
+  );
+
   useEffect(() => {
-    if (!playing) {
-      cancelAnimationFrame(rafRef.current);
-      lastTickRef.current = 0;
+    const currentMs = playback?.getMs?.() ?? playheadMs;
+    updateTransportDom(currentMs);
+    applyPreviewStyles(currentMs);
+    if (!playback?.subscribe) {
       return undefined;
     }
-    const tick = (now) => {
-      if (!lastTickRef.current) {
-        lastTickRef.current = now;
+    return playback.subscribe((ms, isPlaying) => {
+      updateTransportDom(ms);
+      applyPreviewStyles(ms);
+      if (selfClockWriteRef.current) {
+        return;
       }
-      const deltaMs = now - lastTickRef.current;
-      lastTickRef.current = now;
-      const next = playheadRef.current + deltaMs;
-      if (durationMs > 0 && next >= durationMs) {
-        onSeek?.(durationMs);
+      syncMediaForTime(ms, { now: performance.now(), playing: isPlaying, seekActive: true });
+    });
+  }, [applyPreviewStyles, playback, playheadMs, syncMediaForTime, updateTransportDom]);
+
+  useEffect(() => {
+    const currentMs = playback?.getMs?.() ?? playheadMs;
+    syncMediaForTime(currentMs, { now: performance.now(), playing, seekActive: !playing });
+    applyPreviewStyles(currentMs);
+  }, [applyPreviewStyles, playback, playing, playheadMs, syncMediaForTime, visual?.clip.id, visualIsImage]);
+
+  // Playback clock: use the active media element as master. The rAF loop never
+  // drift-seeks that primary element; seeks happen on explicit seek, play
+  // start, secondary correction, preload, or clip-boundary handoff.
+  useEffect(() => {
+    window.cancelAnimationFrame(rafRef.current);
+    lastGapTickRef.current = 0;
+    if (!playing) {
+      return undefined;
+    }
+
+    const writeClockMs = (nextMs) => {
+      if (playback?.setMs) {
+        selfClockWriteRef.current = true;
+        playback.setMs(nextMs);
+        selfClockWriteRef.current = false;
+      } else {
+        updateTransportDom(nextMs);
+        applyPreviewStyles(nextMs);
+      }
+    };
+
+    const startMs = playback?.getMs?.() ?? playheadMsRef.current;
+    const startSync = syncMediaForTime(startMs, { now: performance.now(), playing: true, seekActive: true });
+    primaryClockIdRef.current = startSync.primary?.clip.id || "";
+
+    const tick = (now) => {
+      const currentMs = playback?.getMs?.() ?? startMs;
+      let sync = syncMediaForTime(currentMs, { now, playing: true, seekActive: false });
+      const primaryId = sync.primary?.clip.id || "";
+      if (primaryId && primaryId !== primaryClockIdRef.current) {
+        sync = syncMediaForTime(currentMs, { now, playing: true, seekActive: true });
+      }
+      primaryClockIdRef.current = sync.primary?.clip.id || "";
+      let nextMs = currentMs;
+      if (sync.primary?.element) {
+        nextMs = Math.max(0, Math.min(clipEndMs(sync.primary.clip), timelineMsFromMedia(sync.primary.clip, sync.primary.element)));
+        lastGapTickRef.current = 0;
+        if (nextMs >= clipEndMs(sync.primary.clip) - 4) {
+          nextMs = clipEndMs(sync.primary.clip);
+          const nextSync = syncMediaForTime(nextMs, { now, playing: true, seekActive: true });
+          primaryClockIdRef.current = nextSync.primary?.clip.id || "";
+        }
+      } else {
+        if (!lastGapTickRef.current) {
+          lastGapTickRef.current = now;
+        }
+        const deltaMs = now - lastGapTickRef.current;
+        lastGapTickRef.current = now;
+        nextMs = currentMs + deltaMs;
+        if (sync.nextBoundaryMs != null && nextMs >= sync.nextBoundaryMs) {
+          nextMs = sync.nextBoundaryMs;
+          lastGapTickRef.current = 0;
+          const nextSync = syncMediaForTime(nextMs, { now, playing: true, seekActive: true });
+          primaryClockIdRef.current = nextSync.primary?.clip.id || "";
+        }
+      }
+
+      if (durationRef.current > 0 && nextMs >= durationRef.current) {
+        writeClockMs(durationRef.current);
         onTogglePlay?.(false);
         return;
       }
-      onSeek?.(next);
-      rafRef.current = requestAnimationFrame(tick);
+
+      writeClockMs(nextMs);
+      rafRef.current = window.requestAnimationFrame(tick);
     };
-    rafRef.current = requestAnimationFrame(tick);
-    return () => cancelAnimationFrame(rafRef.current);
-  }, [durationMs, onSeek, onTogglePlay, playing]);
 
-  const playheadRef = useRef(playheadMs);
-  playheadRef.current = playheadMs;
-
-  // Audible playback: keep one hidden media element per active audible clip,
-  // synced to the clip-relative source position with live gain.
-  useEffect(() => {
-    const pool = mediaPoolRef.current;
-    const audible = [...active.video, ...active.audio].filter(({ track, clip }) => !track.muted && clip.assetPath);
-    const wanted = new Set();
-    for (const { clip } of audible) {
-      wanted.add(clip.id);
-      let element = pool.get(clip.id);
-      if (!element) {
-        element = document.createElement(clip.assetPath && active.audio.some((entry) => entry.clip.id === clip.id) ? "audio" : "video");
-        element.muted = false;
-        element.preload = "auto";
-        element.style.display = "none";
-        document.body.appendChild(element);
-        pool.set(clip.id, element);
-      }
-      const src = assetSrc(clip.assetPath);
-      if (element.dataset.src !== src) {
-        element.dataset.src = src;
-        element.src = src;
-      }
-      const clipRelMs = playheadMs - clip.timelineStartMs;
-      const sourceMs = (clip.sourceInMs || 0) + clipRelMs * (clip.speed || 1);
-      const drift = Math.abs(element.currentTime * 1000 - sourceMs);
-      if (!playing || drift > 220) {
-        try {
-          element.currentTime = sourceMs / 1000;
-        } catch {
-          /* seeking before metadata is loaded */
-        }
-      }
-      element.playbackRate = clip.speed || 1;
-      element.volume = Math.min(1, Math.max(0, gainAtMs(clip.gain, clipRelMs)));
-      if (playing && element.paused) {
-        element.play().catch(() => {});
-      }
-      if (!playing && !element.paused) {
-        element.pause();
-      }
-    }
-    for (const [clipId, element] of pool.entries()) {
-      if (!wanted.has(clipId)) {
-        element.pause();
-        element.remove();
-        pool.delete(clipId);
-      }
-    }
-  }, [active, assetSrc, playheadMs, playing]);
+    rafRef.current = window.requestAnimationFrame(tick);
+    return () => window.cancelAnimationFrame(rafRef.current);
+    // playheadMs deliberately read via ref: the 200ms UI-cadence prop must
+    // not restart the playback loop (each restart re-seeks the primary).
+  }, [applyPreviewStyles, onTogglePlay, playback, playing, syncMediaForTime, updateTransportDom]);
 
   // Tear the pool down on unmount.
   useEffect(
     () => () => {
-      for (const element of mediaPoolRef.current.values()) {
-        element.pause();
-        element.remove();
+      window.cancelAnimationFrame(rafRef.current);
+      for (const entry of mediaPoolRef.current.values()) {
+        try {
+          entry.element.pause();
+        } catch {
+          /* best-effort cleanup */
+        }
+        entry.element.remove();
       }
       mediaPoolRef.current.clear();
     },
     [],
   );
 
-  // Visual: topmost active video clip (last video track wins).
-  const visual = active.video.length ? active.video[active.video.length - 1] : null;
-  const visualIsImage = visual ? /\.(png|jpe?g|webp|gif|bmp|tiff)$/i.test(visual.clip.assetPath || "") : false;
-  const visualRef = useRef(null);
-
   // Freeze the current frame into media/assets — an instant AI start frame.
-  const [capturingFrame, setCapturingFrame] = useState(false);
   const captureFrame = useCallback(() => {
-    if (!visual || visualIsImage || !repoPath || capturingFrame) {
+    if (!repoPath || capturingFrame) {
       return;
     }
-    const clipRelMs = playheadMs - visual.clip.timelineStartMs;
-    const sourceMs = Math.max(0, Math.round((visual.clip.sourceInMs || 0) + clipRelMs * (visual.clip.speed || 1)));
+    const currentMs = playback?.getMs?.() ?? playheadMs;
+    const activeNow = clipsAtMs(projectRef.current, currentMs);
+    const captureVisual = topVisual(activeNow);
+    if (!captureVisual || isImageAsset(captureVisual.clip.assetPath)) {
+      return;
+    }
+    const clipRelMs = currentMs - captureVisual.clip.timelineStartMs;
+    const sourceMs = Math.max(0, Math.round((captureVisual.clip.sourceInMs || 0) + clipRelMs * (captureVisual.clip.speed || 1)));
     setCapturingFrame(true);
-    invoke("video_frame_extract", { repoPath, assetPath: visual.clip.assetPath, atMs: sourceMs })
+    invoke("video_frame_extract", { repoPath, assetPath: captureVisual.clip.assetPath, atMs: sourceMs })
       .catch(() => {})
       .finally(() => setCapturingFrame(false));
-  }, [capturingFrame, playheadMs, repoPath, visual, visualIsImage]);
+  }, [capturingFrame, playback, playheadMs, repoPath]);
 
-  useEffect(() => {
-    const element = visualRef.current;
-    if (!element || !visual || visualIsImage) {
-      return;
-    }
-    const clipRelMs = playheadMs - visual.clip.timelineStartMs;
-    const sourceMs = (visual.clip.sourceInMs || 0) + clipRelMs * (visual.clip.speed || 1);
-    const drift = Math.abs(element.currentTime * 1000 - sourceMs);
-    if (!playing || drift > 220) {
-      try {
-        element.currentTime = sourceMs / 1000;
-      } catch {
-        /* not yet seekable */
-      }
-    }
-    element.playbackRate = visual.clip.speed || 1;
-    if (playing && element.paused) {
-      element.play().catch(() => {});
-    }
-    if (!playing && !element.paused) {
-      element.pause();
-    }
-  }, [playheadMs, playing, visual, visualIsImage]);
+  const handleSeek = useCallback(
+    (ms) => {
+      const next = Math.max(0, Number(ms) || 0);
+      playback?.setMs?.(next);
+      onSeek?.(next);
+    },
+    [onSeek, playback],
+  );
 
-  const fontScale = frameSize.width > 0 ? frameSize.width / Math.max(1, settings.width) : 0;
+  const visualLayerStyle = visual
+    ? (() => {
+        const clipRelMs = Math.max(0, playheadMs - visual.clip.timelineStartMs);
+        const opacity = getPropEvaluator(visual.clip, "opacity")(clipRelMs);
+        const x = getPropEvaluator(visual.clip, "x")(clipRelMs);
+        const y = getPropEvaluator(visual.clip, "y")(clipRelMs);
+        const scale = getPropEvaluator(visual.clip, "scale")(clipRelMs);
+        return {
+          opacity,
+          transform: `translate(${x * 100}%, ${y * 100}%) scale(${scale})`,
+        };
+      })()
+    : undefined;
+
+  const scrubMax = Math.max(1000, durationMs);
+  const currentStoreMs = playback?.getMs?.() ?? playheadMs;
 
   return (
     <PreviewRoot data-video-preview="true">
@@ -361,19 +825,13 @@ export default function VideoEditor({
           >
             {visual ? (
               <PreviewLayer
-                style={(() => {
-                  const clipRelMs = playheadMs - visual.clip.timelineStartMs;
-                  return {
-                    opacity: clipPropAtMs(visual.clip, "opacity", clipRelMs),
-                    transform: `translate(${clipPropAtMs(visual.clip, "x", clipRelMs) * 100}%, ${clipPropAtMs(visual.clip, "y", clipRelMs) * 100}%) scale(${clipPropAtMs(visual.clip, "scale", clipRelMs)})`,
-                  };
-                })()}
+                key={`${visualIsImage ? "image" : "video"}-${visual.clip.id}`}
+                ref={visualLayerRef}
+                style={visualLayerStyle}
               >
                 {visualIsImage ? (
                   <img alt="" draggable={false} src={assetSrc(visual.clip.assetPath)} />
-                ) : (
-                  <video key={visual.clip.id} muted playsInline ref={visualRef} src={assetSrc(visual.clip.assetPath)} />
-                )}
+                ) : null}
               </PreviewLayer>
             ) : (
               <PreviewLayer>
@@ -389,6 +847,13 @@ export default function VideoEditor({
                   data-dragging={draggingTextId === clip.id ? "true" : "false"}
                   key={clip.id}
                   onPointerDown={(event) => beginTextDrag(event, clip)}
+                  ref={(element) => {
+                    if (element) {
+                      textOverlayRefs.current.set(clip.id, element);
+                    } else {
+                      textOverlayRefs.current.delete(clip.id);
+                    }
+                  }}
                   style={{
                     left: `${(clip.style?.x ?? 0.5) * 100}%`,
                     top: `${(clip.style?.y ?? 0.85) * 100}%`,
@@ -423,7 +888,7 @@ export default function VideoEditor({
         >
           {playing ? <Pause aria-hidden="true" /> : <PlayArrow aria-hidden="true" />}
         </VideoIconButton>
-        <VideoIconButton onClick={() => onSeek?.(0)} title="Jump to start" type="button">
+        <VideoIconButton onClick={() => handleSeek(0)} title="Jump to start" type="button">
           <SkipPrevious aria-hidden="true" />
         </VideoIconButton>
         <VideoIconButton
@@ -435,15 +900,16 @@ export default function VideoEditor({
           <PhotoCamera aria-hidden="true" />
         </VideoIconButton>
         <TransportScrub
-          max={Math.max(1000, durationMs)}
+          defaultValue={Math.min(currentStoreMs, scrubMax)}
+          max={scrubMax}
           min={0}
-          onChange={(event) => onSeek?.(Number(event.target.value))}
+          onChange={(event) => handleSeek(Number(event.target.value))}
+          ref={transportScrubRef}
           step={16}
           type="range"
-          value={Math.min(playheadMs, Math.max(1000, durationMs))}
         />
-        <TransportTime>
-          {formatTimecode(playheadMs)} / {formatTimecode(durationMs)}
+        <TransportTime ref={transportTimeRef}>
+          {formatTimecode(currentStoreMs)} / {formatTimecode(durationMs)}
         </TransportTime>
       </TransportRow>
     </PreviewRoot>

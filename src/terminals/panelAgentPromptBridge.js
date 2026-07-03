@@ -4,6 +4,7 @@ export const PANEL_AGENT_PROMPT_SUBMIT_EVENT = "diffforge:panel-agent-prompt-sub
 export const PANEL_AGENT_PROMPT_RESULT_EVENT = "diffforge:panel-agent-prompt-result";
 export const PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT = "diffforge:panel-agent-prompt-activity-request";
 export const PANEL_AGENT_PROMPT_ACTIVITY_EVENT = "diffforge:panel-agent-prompt-activity";
+export const PANEL_AGENT_PROMPT_ACTIVITY_DISMISS_EVENT = "diffforge:panel-agent-prompt-activity-dismiss";
 
 export function createPanelAgentPromptRequestId(prefix = "panel-agent-prompt") {
   return `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`;
@@ -133,58 +134,84 @@ export function normalizePanelAgentPromptContextRefs(value) {
 }
 
 export function formatPanelAgentPromptContextNote(contextRefs) {
-  const [context] = normalizePanelAgentPromptContextRefs(contextRefs);
-  if (!context) {
+  const contexts = normalizePanelAgentPromptContextRefs(contextRefs);
+  if (!contexts.length) {
     return null;
   }
-  const lines = ["Selected web element context:"];
-  if (context.url) {
-    lines.push(`- url: ${context.url}`);
-  }
-  if (context.title) {
-    lines.push(`- page title: ${context.title}`);
-  }
-  if (context.element) {
-    lines.push(`- element: ${context.element}`);
-  }
-  if (context.selector) {
-    lines.push(`- selector: ${context.selector}`);
-  }
-  if (context.text) {
-    lines.push(`- text: ${context.text}`);
-  }
-  const attrs = [];
-  if (context.attributes.role) attrs.push(`role=${context.attributes.role}`);
-  if (context.attributes.ariaLabel) attrs.push(`aria-label=${context.attributes.ariaLabel}`);
-  if (context.attributes.alt) attrs.push(`alt=${context.attributes.alt}`);
-  if (context.attributes.placeholder) attrs.push(`placeholder=${context.attributes.placeholder}`);
-  if (context.attributes.href) attrs.push(`href=${context.attributes.href}`);
-  if (attrs.length) {
-    lines.push(`- attributes: ${attrs.join("; ")}`);
-  }
-  if (context.rect.width || context.rect.height) {
-    lines.push(`- viewport rect: x=${context.rect.left}, y=${context.rect.top}, w=${context.rect.width}, h=${context.rect.height}`);
-  }
-  if (context.scroll.x || context.scroll.y) {
-    lines.push(`- page scroll: x=${context.scroll.x}, y=${context.scroll.y}`);
-  }
-  const styleParts = [];
-  if (context.styles.display) styleParts.push(`display=${context.styles.display}`);
-  if (context.styles.fontSize) styleParts.push(`font=${context.styles.fontSize}${context.styles.fontWeight ? `/${context.styles.fontWeight}` : ""}`);
-  if (context.styles.color) styleParts.push(`color=${context.styles.color}`);
-  if (context.styles.backgroundColor) styleParts.push(`background=${context.styles.backgroundColor}`);
-  if (context.styles.borderRadius) styleParts.push(`radius=${context.styles.borderRadius}`);
-  if (context.styles.padding) styleParts.push(`padding=${context.styles.padding}`);
-  if (styleParts.length) {
-    lines.push(`- styles: ${styleParts.join("; ")}`);
-  }
-  if (context.parent?.element) {
-    lines.push(`- parent: ${context.parent.element}${context.parent.text ? ` text=${context.parent.text}` : ""}`);
-  }
+  const lines = [
+    contexts.length === 1
+      ? "Selected web element context:"
+      : `Selected web element contexts (${contexts.length}):`,
+  ];
+  contexts.forEach((context, index) => {
+    if (contexts.length > 1) {
+      lines.push(`Element ${index + 1}:`);
+    }
+    if (context.url) {
+      lines.push(`- url: ${context.url}`);
+    }
+    if (context.title) {
+      lines.push(`- page title: ${context.title}`);
+    }
+    if (context.element) {
+      lines.push(`- element: ${context.element}`);
+    }
+    if (context.selector) {
+      lines.push(`- selector: ${context.selector}`);
+    }
+    if (context.text) {
+      lines.push(`- text: ${context.text}`);
+    }
+    const attrs = [];
+    if (context.attributes.role) attrs.push(`role=${context.attributes.role}`);
+    if (context.attributes.ariaLabel) attrs.push(`aria-label=${context.attributes.ariaLabel}`);
+    if (context.attributes.alt) attrs.push(`alt=${context.attributes.alt}`);
+    if (context.attributes.placeholder) attrs.push(`placeholder=${context.attributes.placeholder}`);
+    if (context.attributes.href) attrs.push(`href=${context.attributes.href}`);
+    if (attrs.length) {
+      lines.push(`- attributes: ${attrs.join("; ")}`);
+    }
+    if (context.rect.width || context.rect.height) {
+      lines.push(`- viewport rect: x=${context.rect.left}, y=${context.rect.top}, w=${context.rect.width}, h=${context.rect.height}`);
+    }
+    if (context.scroll.x || context.scroll.y) {
+      lines.push(`- page scroll: x=${context.scroll.x}, y=${context.scroll.y}`);
+    }
+    const styleParts = [];
+    if (context.styles.display) styleParts.push(`display=${context.styles.display}`);
+    if (context.styles.fontSize) styleParts.push(`font=${context.styles.fontSize}${context.styles.fontWeight ? `/${context.styles.fontWeight}` : ""}`);
+    if (context.styles.color) styleParts.push(`color=${context.styles.color}`);
+    if (context.styles.backgroundColor) styleParts.push(`background=${context.styles.backgroundColor}`);
+    if (context.styles.borderRadius) styleParts.push(`radius=${context.styles.borderRadius}`);
+    if (context.styles.padding) styleParts.push(`padding=${context.styles.padding}`);
+    if (styleParts.length) {
+      lines.push(`- styles: ${styleParts.join("; ")}`);
+    }
+    if (context.parent?.element) {
+      lines.push(`- parent: ${context.parent.element}${context.parent.text ? ` text=${context.parent.text}` : ""}`);
+    }
+  });
   return {
-    title: "Selected web element",
+    title: contexts.length === 1 ? "Selected web element" : "Selected web elements",
     text: compactPanelAgentPromptMultilineText(lines.join("\n"), 1600),
   };
+}
+
+function normalizePanelAgentPromptActivityStatus(value) {
+  const rawStatus = String(value || "queued").trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (["completed", "complete", "done", "success", "succeeded"].includes(rawStatus)) {
+    return "completed";
+  }
+  if (["running", "processing", "in_flight", "sending", "dispatching", "active"].includes(rawStatus)) {
+    return "running";
+  }
+  if (["failed", "failure", "error", "errored", "timed_out", "timeout"].includes(rawStatus)) {
+    return "failed";
+  }
+  if (["interrupted", "cancelled", "canceled", "stopped", "aborted"].includes(rawStatus)) {
+    return "interrupted";
+  }
+  return "queued";
 }
 
 export function normalizePanelAgentPromptTargets(value) {
@@ -216,13 +243,13 @@ export function normalizePanelAgentPromptActivityItems(value) {
       if (!itemId) {
         return null;
       }
-      const rawStatus = String(item?.status || item?.state || "queued").trim().toLowerCase();
-      const status = rawStatus === "completed" || rawStatus === "running" ? rawStatus : "queued";
+      const status = normalizePanelAgentPromptActivityStatus(item?.status || item?.state);
       const submittedAtMs = Number(item?.submittedAtMs ?? item?.submitted_at_ms ?? 0);
       const terminalIndex = Number.parseInt(item?.targetTerminalIndex ?? item?.target_terminal_index, 10);
       return {
         color: String(item?.color || item?.targetTerminalColor || item?.target_terminal_color || "").trim(),
         completedAtMs: Number(item?.completedAtMs ?? item?.completed_at_ms ?? 0) || 0,
+        error: String(item?.error || item?.message || "").trim(),
         id: itemId,
         itemId,
         label: String(item?.label || item?.targetLabel || item?.target_label || "Agent").trim(),

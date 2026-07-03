@@ -39,6 +39,7 @@ import PanelAgentPromptActivity from "../terminals/PanelAgentPromptActivity.jsx"
 import PanelAgentPromptComposer from "../terminals/PanelAgentPromptComposer.jsx";
 import {
   PANEL_AGENT_PROMPT_ACTIVITY_EVENT,
+  PANEL_AGENT_PROMPT_ACTIVITY_DISMISS_EVENT,
   PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT,
   PANEL_AGENT_PROMPT_RESULT_EVENT,
   PANEL_AGENT_PROMPT_SUBMIT_EVENT,
@@ -69,6 +70,16 @@ function parseWebPanelParams() {
   };
 }
 
+function readWebPanelDocumentFocused() {
+  if (typeof document === "undefined") {
+    return true;
+  }
+  return (
+    document.visibilityState !== "hidden"
+    && (typeof document.hasFocus !== "function" || document.hasFocus())
+  );
+}
+
 export default function WebPanelHost() {
   const params = useMemo(() => parseWebPanelParams(), []);
   const currentWindow = useMemo(() => getCurrentWindow(), []);
@@ -89,6 +100,7 @@ export default function WebPanelHost() {
   const [agentPromptActivityItems, setAgentPromptActivityItems] = useState([]);
   const [agentPromptTargets, setAgentPromptTargets] = useState([]);
   const [defaultAgentPromptTargetIds, setDefaultAgentPromptTargetIds] = useState([]);
+  const [windowFocused, setWindowFocused] = useState(readWebPanelDocumentFocused);
   const viewportRef = useRef(null);
   const agentPromptTargetsRequestIdRef = useRef("");
 
@@ -110,6 +122,19 @@ export default function WebPanelHost() {
       setAgentPromptTargetMenuOpen(false);
     }
   }, [agentPromptOpen]);
+
+  useEffect(() => {
+    const updateFocused = () => setWindowFocused(readWebPanelDocumentFocused());
+    updateFocused();
+    window.addEventListener("focus", updateFocused);
+    window.addEventListener("blur", updateFocused);
+    document.addEventListener("visibilitychange", updateFocused);
+    return () => {
+      window.removeEventListener("focus", updateFocused);
+      window.removeEventListener("blur", updateFocused);
+      document.removeEventListener("visibilitychange", updateFocused);
+    };
+  }, []);
 
   const scopeParts = useMemo(() => [params.paneId || "pane"], [params.paneId]);
 
@@ -339,7 +364,28 @@ export default function WebPanelHost() {
     });
   }, [params.paneId, params.workspaceId, windowLabel]);
 
+  const dismissPanelAgentPromptActivityItem = useCallback((itemId) => {
+    const safeItemId = String(itemId || "").trim();
+    if (!safeItemId) {
+      return;
+    }
+    setAgentPromptActivityItems((items) => items.filter((item) => String(item.itemId || item.id || "").trim() !== safeItemId));
+    emit(PANEL_AGENT_PROMPT_ACTIVITY_DISMISS_EVENT, {
+      itemId: safeItemId,
+      item_id: safeItemId,
+      paneId: params.paneId,
+      pane_id: params.paneId,
+      panelKind: "web",
+      panel_kind: "web",
+      windowId: windowLabel,
+      window_id: windowLabel,
+      workspaceId: params.workspaceId,
+      workspace_id: params.workspaceId,
+    }).catch(() => {});
+  }, [params.paneId, params.workspaceId, windowLabel]);
+
   const webAgentPromptOverlay = useWebAgentPromptOverlay({
+    autoDismissCompleted: windowFocused,
     activityItems: agentPromptActivityItems,
     contextRefs: webElementPicker.contextRefs,
     defaultSelectedTargetIds: defaultAgentPromptTargetIds,
@@ -347,6 +393,7 @@ export default function WebPanelHost() {
     evaluate,
     onClearContext: webElementPicker.clearSelection,
     onClose: () => setAgentPromptOpen(false),
+    onDismissCompletedItem: dismissPanelAgentPromptActivityItem,
     onSubmit: submitAgentPrompt,
     targets: agentPromptTargets,
     windowId: windowLabel,
@@ -389,6 +436,8 @@ export default function WebPanelHost() {
     setAddressError("");
     reload();
   }, [reload]);
+
+  const hasAgentPromptActivity = agentPromptActivityItems.length > 0;
 
   const startWindowDrag = useCallback((event) => {
     if (event.button !== 0) {
@@ -509,11 +558,10 @@ export default function WebPanelHost() {
       <GlobalStyle />
       <HostChrome data-terminal-control="true">
         <HostTopRail
-          data-tauri-drag-region="true"
           data-terminal-control="true"
           onPointerDown={startChromeDrag}
         >
-          <HostRailIdentity data-tauri-drag-region="true">
+          <HostRailIdentity data-host-rail-section="identity" data-tauri-drag-region="true">
             <HostIconButton
               aria-label="Move web window"
               data-terminal-drag-handle="true"
@@ -525,14 +573,41 @@ export default function WebPanelHost() {
             </HostIconButton>
           </HostRailIdentity>
 
-          <HostRailControls data-rail-row="primary">
+          <HostNav data-host-rail-section="nav" onSubmit={handleSubmit}>
+            <HostIconButton aria-label="Back" disabled={!canGoBack} onClick={goBack} title="Back" type="button">
+              <ArrowBack aria-hidden="true" />
+            </HostIconButton>
+            <HostIconButton aria-label="Forward" disabled={!canGoForward} onClick={goForward} title="Forward" type="button">
+              <ArrowForward aria-hidden="true" />
+            </HostIconButton>
+            <HostIconButton aria-label="Refresh" onClick={refresh} title="Refresh" type="button">
+              <Refresh aria-hidden="true" />
+            </HostIconButton>
+            <HostAddressInput
+              aria-label="Search or enter URL"
+              autoCapitalize="none"
+              autoComplete="off"
+              autoCorrect="off"
+              inputMode="url"
+              onChange={(event) => {
+                setAddressValue(event.target.value);
+                if (addressError) {
+                  setAddressError("");
+                }
+              }}
+              placeholder="Search or enter URL"
+              spellCheck="false"
+              value={addressValue}
+            />
+          </HostNav>
+
+          <HostRailControls data-rail-row="primary" data-host-rail-section="primary">
             <HostCloseButton aria-label="Close" onClick={() => currentWindow.close().catch(() => {})} title="Close" type="button">
               <ButtonCloseIcon aria-hidden="true" />
             </HostCloseButton>
           </HostRailControls>
 
-          <HostRailControls data-rail-row="secondary">
-            <PanelAgentPromptActivity items={agentPromptActivityItems} />
+          <HostRailControls data-rail-row="secondary" data-host-rail-section="secondary">
             <HostIconButton
               aria-label="Prompt terminal agents"
               aria-pressed={agentPromptOpen ? "true" : "false"}
@@ -566,37 +641,16 @@ export default function WebPanelHost() {
               <OpenInNew aria-hidden="true" />
             </HostIconButton>
           </HostRailControls>
+          {hasAgentPromptActivity ? (
+            <HostActivityRow data-host-rail-section="activity">
+              <PanelAgentPromptActivity
+                autoDismissCompleted={windowFocused}
+                items={agentPromptActivityItems}
+                onDismissCompletedItem={dismissPanelAgentPromptActivityItem}
+              />
+            </HostActivityRow>
+          ) : null}
         </HostTopRail>
-
-        <HostNavRow>
-          <HostNav onSubmit={handleSubmit}>
-            <HostIconButton aria-label="Back" disabled={!canGoBack} onClick={goBack} title="Back" type="button">
-              <ArrowBack aria-hidden="true" />
-            </HostIconButton>
-            <HostIconButton aria-label="Forward" disabled={!canGoForward} onClick={goForward} title="Forward" type="button">
-              <ArrowForward aria-hidden="true" />
-            </HostIconButton>
-            <HostIconButton aria-label="Refresh" onClick={refresh} title="Refresh" type="button">
-              <Refresh aria-hidden="true" />
-            </HostIconButton>
-            <HostAddressInput
-              aria-label="Search or enter URL"
-              autoCapitalize="none"
-              autoComplete="off"
-              autoCorrect="off"
-              inputMode="url"
-              onChange={(event) => {
-                setAddressValue(event.target.value);
-                if (addressError) {
-                  setAddressError("");
-                }
-              }}
-              placeholder="Search or enter URL"
-              spellCheck="false"
-              value={addressValue}
-            />
-          </HostNav>
-        </HostNavRow>
       </HostChrome>
 
       {addressError ? <HostInlineError role="alert">{addressError}</HostInlineError> : null}
@@ -666,20 +720,89 @@ const HostChrome = styled.header`
   display: grid;
   width: 100%;
   min-width: 0;
-  grid-template-rows: auto auto;
+  grid-template-rows: auto;
   border-bottom: 1px solid var(--web-border);
   background: var(--web-panel);
 `;
 
 const HostTopRail = styled(TerminalRestartPill)`
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(26px, auto) minmax(26px, auto);
   min-height: 30px;
   padding: 3px 8px;
+  align-items: center;
+  column-gap: 5px;
+  row-gap: 2px;
   border-bottom-color: rgba(226, 232, 240, 0.06);
   background: transparent;
 
   html[data-forge-theme="light"] & {
     border-bottom-color: rgba(24, 34, 48, 0.1);
     background: transparent;
+  }
+
+  && [data-host-rail-section="identity"] {
+    grid-column: 1;
+    grid-row: 1;
+  }
+
+  && [data-host-rail-section="nav"] {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
+  && [data-host-rail-section="secondary"] {
+    grid-column: 2;
+    grid-row: 1;
+    width: auto;
+    justify-self: end;
+    flex-wrap: wrap;
+  }
+
+  && [data-host-rail-section="primary"] {
+    grid-column: 3;
+    grid-row: 1;
+    justify-self: end;
+  }
+
+  && [data-host-rail-section="activity"] {
+    grid-column: 1 / -1;
+    grid-row: 3;
+  }
+
+  @container (max-width: 780px) {
+    && {
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+    }
+
+    && [data-host-rail-section="identity"] {
+      grid-column: 1;
+      grid-row: 1;
+    }
+
+    && [data-host-rail-section="primary"] {
+      grid-column: 2;
+      grid-row: 1;
+    }
+
+    && [data-host-rail-section="nav"] {
+      grid-column: 1 / -1;
+      grid-row: 3;
+    }
+
+    && [data-host-rail-section="secondary"] {
+      grid-column: 1 / -1;
+      grid-row: 2;
+      width: 100%;
+      justify-self: start;
+      flex-wrap: wrap;
+    }
+
+    && [data-host-rail-section="activity"] {
+      grid-column: 1 / -1;
+      grid-row: 4;
+    }
   }
 `;
 
@@ -695,7 +818,18 @@ const HostRailIdentity = styled(TerminalRailIdentity)`
   }
 `;
 
-const HostRailControls = styled(TerminalRailControls)``;
+const HostRailControls = styled(TerminalRailControls)`
+  &[data-rail-row="primary"] {
+    grid-column: 3;
+    grid-row: 1;
+  }
+
+  &[data-rail-row="secondary"] {
+    grid-column: 2;
+    grid-row: 1;
+    width: auto;
+  }
+`;
 
 const HostIconButton = styled(TerminalRestartButton)`
   color: var(--web-text);
@@ -708,17 +842,10 @@ const HostIconButton = styled(TerminalRestartButton)`
 
 const HostCloseButton = styled(TerminalCloseButton)``;
 
-const HostNavRow = styled.div`
-  display: flex;
-  min-width: 0;
-  min-height: 34px;
-  align-items: center;
-  padding: 4px 8px 5px;
-  background: var(--web-panel);
-`;
-
 const HostNav = styled.form`
   display: flex;
+  grid-column: 1 / -1;
+  grid-row: 2;
   width: 100%;
   min-width: 0;
   align-items: center;
@@ -727,6 +854,14 @@ const HostNav = styled.form`
   padding: 0;
   border: 0;
   background: transparent;
+`;
+
+const HostActivityRow = styled.div`
+  display: flex;
+  grid-column: 1 / -1;
+  grid-row: 3;
+  min-width: 0;
+  justify-content: flex-end;
 `;
 
 const HostAddressInput = styled.input`

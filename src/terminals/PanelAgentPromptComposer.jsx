@@ -294,10 +294,9 @@ export default function PanelAgentPromptComposer({
     const selectedIdSet = new Set(selectedTargetIds);
     return targetOptions.filter((target) => selectedIdSet.has(target.id));
   }, [selectedTargetIds, targetOptions]);
-  const selectedContext = useMemo(() => (
-    Array.isArray(contextRefs) ? contextRefs.find((context) => context && typeof context === "object") || null : null
+  const selectedContexts = useMemo(() => (
+    (Array.isArray(contextRefs) ? contextRefs : []).filter((context) => context && typeof context === "object")
   ), [contextRefs]);
-  const selectedContextLabel = useMemo(() => contextRefLabel(selectedContext), [selectedContext]);
 
   useEffect(() => {
     setSelectedTargetIds((current) => {
@@ -359,13 +358,14 @@ export default function PanelAgentPromptComposer({
         text,
         windowId,
       });
+      await onClearContext?.();
       setPrompt("");
     } catch (err) {
       setError(err?.message || String(err || "Unable to send prompt."));
     } finally {
       setSubmitting(false);
     }
-  }, [contextRefs, onClose, onSubmit, panelKind, panelPaneId, prompt, selectedTargetIds, submitting, targets, windowId]);
+  }, [contextRefs, onClearContext, onSubmit, panelKind, panelPaneId, prompt, selectedTargetIds, submitting, targets, windowId]);
 
   const targetCount = Array.isArray(targets) ? targets.length : 0;
   const selectedCount = selectedTargetIds.length;
@@ -386,7 +386,7 @@ export default function PanelAgentPromptComposer({
           }
         }}
         onKeyDown={(event) => {
-          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+          if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent?.isComposing) {
             submitPrompt(event);
           }
           if (event.key === "Escape") {
@@ -398,23 +398,31 @@ export default function PanelAgentPromptComposer({
         rows={1}
         value={prompt}
       />
-      {selectedContext ? (
+      {selectedContexts.length ? (
         <ContextChipRow>
-          <ContextChip title={selectedContextLabel || "Selected web element"}>
-            <ContextChipKind>Element</ContextChipKind>
-            <ContextChipText>{selectedContextLabel || "Selected web element"}</ContextChipText>
-            {typeof onClearContext === "function" ? (
-              <ContextChipButton
-                aria-label="Clear selected web element"
-                disabled={submitting}
-                onClick={onClearContext}
-                title="Clear selected web element"
-                type="button"
+          {selectedContexts.map((context, index) => {
+            const selectedContextLabel = contextRefLabel(context);
+            return (
+              <ContextChip
+                key={context.id || context.selector || `${selectedContextLabel}:${index}`}
+                title={selectedContextLabel || "Selected web element"}
               >
-                <Close aria-hidden="true" />
-              </ContextChipButton>
-            ) : null}
-          </ContextChip>
+                <ContextChipKind>Element</ContextChipKind>
+                <ContextChipText>{selectedContextLabel || "Selected web element"}</ContextChipText>
+                {typeof onClearContext === "function" && index === selectedContexts.length - 1 ? (
+                  <ContextChipButton
+                    aria-label="Clear selected web elements"
+                    disabled={submitting}
+                    onClick={onClearContext}
+                    title="Clear selected web elements"
+                    type="button"
+                  >
+                    <Close aria-hidden="true" />
+                  </ContextChipButton>
+                ) : null}
+              </ContextChip>
+            );
+          })}
         </ContextChipRow>
       ) : null}
       <ComposerFooter>
@@ -532,6 +540,8 @@ const ContextChipRow = styled.div`
   min-width: 0;
   align-items: center;
   justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 4px;
 `;
 
 const ContextChip = styled.div`

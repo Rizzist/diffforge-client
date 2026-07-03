@@ -21548,6 +21548,43 @@ function getDefaultWorkspaceDisplayTerminalRows(logicalTerminalIndexes) {
   return getTerminalPanelRows(logicalTerminalIndexes).map((row) => row.terminalIndexes);
 }
 
+function appendLogicalTerminalToBottomDisplayRow(rows, currentTerminalIndexes, newTerminalIndex) {
+  const terminalIndex = Number.parseInt(newTerminalIndex, 10);
+  const currentIndexes = normalizeWorkspaceTerminalSlotIndexes(currentTerminalIndexes);
+  if (
+    !Number.isInteger(terminalIndex)
+    || terminalIndex < 0
+    || terminalIndex >= MAX_WORKSPACE_TERMINAL_COUNT
+  ) {
+    return normalizeWorkspaceDisplayTerminalRows(rows, currentIndexes)
+      .map((row) => row.terminalIndexes.slice());
+  }
+
+  if (!currentIndexes.length) {
+    return [[terminalIndex]];
+  }
+
+  const nextRows = normalizeWorkspaceDisplayTerminalRows(rows, currentIndexes)
+    .map((row) => row.terminalIndexes.slice());
+
+  if (currentIndexes.includes(terminalIndex)) {
+    return nextRows;
+  }
+
+  const bottomRow = nextRows[nextRows.length - 1];
+
+  if (!bottomRow) {
+    return [[terminalIndex]];
+  }
+
+  if (bottomRow.length >= 3) {
+    return [...nextRows, [terminalIndex]];
+  }
+
+  bottomRow.push(terminalIndex);
+  return nextRows;
+}
+
 function insertLogicalTerminalInDisplayRows(rows, sourceTerminalIndex, newTerminalIndex, direction) {
   const nextRows = normalizeWorkspaceDisplayTerminalRows(rows, flattenWorkspaceDisplayRows(rows))
     .map((row) => row.terminalIndexes.slice());
@@ -30076,7 +30113,12 @@ export default function App() {
     ));
     const nextPaneKinds = { ...getWorkspacePaneKinds(currentSettings, workspaceId) };
     delete nextPaneKinds[nextTerminalIndex];
-    const nextDisplayRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
+    const nextDisplayRows = appendLogicalTerminalToBottomDisplayRow(
+      currentRows,
+      currentIndexes,
+      nextTerminalIndex,
+    );
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
@@ -30221,7 +30263,12 @@ export default function App() {
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
     const nextVmCount = workspacePaneKindsVmIndexes(nextPaneKinds).length;
     const nextVideoCount = workspacePaneKindsVideoIndexes(nextPaneKinds).length;
-    const nextDisplayRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
+    const nextDisplayRows = appendLogicalTerminalToBottomDisplayRow(
+      currentRows,
+      currentIndexes,
+      nextTerminalIndex,
+    );
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
@@ -30448,7 +30495,12 @@ export default function App() {
       index === nextTerminalIndex ? agentId : roleByIndex[index] || workspaceTerminalFallbackRole
     ));
     const nextPaneKinds = getWorkspacePaneKinds(currentSettings, workspaceId);
-    const nextDisplayRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
+    const nextDisplayRows = appendLogicalTerminalToBottomDisplayRow(
+      currentRows,
+      currentIndexes,
+      nextTerminalIndex,
+    );
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
@@ -30665,9 +30717,14 @@ export default function App() {
       roleIndex = nextIndexes.indexOf(targetTerminalIndex);
       nextTerminalCount = Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
       workspaceTerminalExplicitEmptyRef.current.delete(workspaceId);
+      const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
       nextDisplayLayouts = {
         ...currentDisplayLayouts,
-        [workspaceId]: getDefaultWorkspaceDisplayTerminalRows(nextIndexes),
+        [workspaceId]: appendLogicalTerminalToBottomDisplayRow(
+          currentRows,
+          currentIndexes,
+          targetTerminalIndex,
+        ),
       };
     }
 
@@ -30886,7 +30943,13 @@ export default function App() {
       addedIndexes.includes(index) ? agentId : roleByIndex[index] || workspaceTerminalFallbackRole
     ));
     const nextPaneKinds = getWorkspacePaneKinds(currentSettings, workspaceId);
-    const nextRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
+    let nextRows = currentRows.map((row) => row.terminalIndexes.slice());
+    let appendedIndexes = currentIndexes;
+    addedIndexes.forEach((terminalIndex) => {
+      nextRows = appendLogicalTerminalToBottomDisplayRow(nextRows, appendedIndexes, terminalIndex);
+      appendedIndexes = normalizeWorkspaceTerminalSlotIndexes([...appendedIndexes, terminalIndex]);
+    });
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextRoles,

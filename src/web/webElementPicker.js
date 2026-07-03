@@ -9,7 +9,9 @@ function buildWebElementPickerScript(action) {
     const KEY = "__diffforgeWebElementPicker";
     const OVERLAY_ID = "diffforge-web-element-picker-overlay";
     const LABEL_ID = "diffforge-web-element-picker-label";
+    const SELECTED_LAYER_ID = "diffforge-web-element-picker-selected-layer";
     const AGENT_PROMPT_OVERLAY_ID = "diffforge-web-agent-prompt-overlay";
+    const MAX_SELECTIONS = 3;
     const MAX_TEXT = 420;
     const MAX_PARENT_TEXT = 180;
     const MAX_SELECTOR_DEPTH = 7;
@@ -260,12 +262,31 @@ function buildWebElementPickerScript(action) {
       return { overlay, label };
     }
 
+    function createSelectedLayer() {
+      let layer = document.getElementById(SELECTED_LAYER_ID);
+      if (!layer) {
+        layer = document.createElement("div");
+        layer.id = SELECTED_LAYER_ID;
+        layer.setAttribute("aria-hidden", "true");
+        layer.style.cssText = [
+          "position:fixed",
+          "inset:0",
+          "z-index:2147483645",
+          "pointer-events:none"
+        ].join(";");
+        document.documentElement.appendChild(layer);
+      }
+      return layer;
+    }
+
     function createController() {
       const state = {
         enabled: false,
         hotElement: null,
         selection: null,
-        selectedElement: null
+        selectedElement: null,
+        selectedElements: [],
+        selections: []
       };
 
       function updateOverlay(element, selected) {
@@ -301,6 +322,66 @@ function buildWebElementPickerScript(action) {
         if (label) label.style.display = "none";
       }
 
+      function selectionKey(selection) {
+        return String(selection && (selection.selector || selection.element || selection.id) || "");
+      }
+
+      function updateSelectedOverlays() {
+        const layer = createSelectedLayer();
+        layer.innerHTML = "";
+        state.selectedElements.forEach((element, index) => {
+          const selection = state.selections[index];
+          if (!element || !element.isConnected || !selection) {
+            return;
+          }
+          const rect = element.getBoundingClientRect();
+          if (!rect || rect.width <= 0 || rect.height <= 0) {
+            return;
+          }
+          const outline = document.createElement("div");
+          outline.style.cssText = [
+            "position:fixed",
+            "box-sizing:border-box",
+            "left:" + Math.max(0, rect.left) + "px",
+            "top:" + Math.max(0, rect.top) + "px",
+            "width:" + Math.max(1, rect.width) + "px",
+            "height:" + Math.max(1, rect.height) + "px",
+            "border:2px solid #34d399",
+            "outline:1px solid rgba(15,23,42,.55)",
+            "background:rgba(16,185,129,.14)",
+            "border-radius:6px",
+            "box-shadow:0 0 0 1px rgba(255,255,255,.24),0 10px 30px rgba(15,23,42,.2)"
+          ].join(";");
+          const label = document.createElement("div");
+          label.textContent = "Selected " + elementName(element);
+          label.style.cssText = [
+            "position:fixed",
+            "left:" + Math.max(8, Math.min(window.innerWidth - 140, rect.left)) + "px",
+            "top:" + Math.max(8, rect.top - 28) + "px",
+            "max-width:360px",
+            "padding:4px 7px",
+            "border:1px solid rgba(255,255,255,.22)",
+            "border-radius:999px",
+            "background:rgba(3,7,18,.9)",
+            "color:#e5edff",
+            "font:700 11px/1.2 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif",
+            "box-shadow:0 8px 24px rgba(0,0,0,.28)",
+            "white-space:nowrap",
+            "overflow:hidden",
+            "text-overflow:ellipsis"
+          ].join(";");
+          layer.appendChild(outline);
+          layer.appendChild(label);
+        });
+      }
+
+      function hideSelectedOverlays() {
+        const layer = document.getElementById(SELECTED_LAYER_ID);
+        if (layer) {
+          layer.remove();
+        }
+      }
+
       function handleMove(event) {
         if (!state.enabled) return;
         const element = selectableFromPoint(event.clientX, event.clientY);
@@ -323,11 +404,24 @@ function buildWebElementPickerScript(action) {
         window.setTimeout(() => {
           document.removeEventListener("click", suppressNextClick, true);
         }, 900);
-        state.selection = collect(element);
-        state.selectedElement = element;
-        state.enabled = false;
-        removeListeners();
-        updateOverlay(element, true);
+        const nextSelection = collect(element);
+        const nextKey = selectionKey(nextSelection);
+        const existingIndex = state.selections.findIndex((selection) => selectionKey(selection) === nextKey);
+        if (existingIndex >= 0) {
+          state.selections.splice(existingIndex, 1);
+          state.selectedElements.splice(existingIndex, 1);
+        } else {
+          state.selections.push(nextSelection);
+          state.selectedElements.push(element);
+          if (state.selections.length > MAX_SELECTIONS) {
+            state.selections.shift();
+            state.selectedElements.shift();
+          }
+        }
+        state.selection = state.selections[state.selections.length - 1] || null;
+        state.selectedElement = state.selectedElements[state.selectedElements.length - 1] || null;
+        updateSelectedOverlays();
+        updateOverlay(element, state.selections.some((selection) => selectionKey(selection) === nextKey));
       }
 
       function handleKeyDown(event) {
@@ -336,17 +430,21 @@ function buildWebElementPickerScript(action) {
           event.stopImmediatePropagation();
           state.selection = null;
           state.selectedElement = null;
+          state.selections = [];
+          state.selectedElements = [];
           state.enabled = false;
           removeListeners();
           hideOverlay();
+          hideSelectedOverlays();
         }
       }
 
       function handleRefresh() {
-        if (state.selection && state.selectedElement) {
-          updateOverlay(state.selectedElement, true);
-        } else if (state.enabled && state.hotElement) {
+        updateSelectedOverlays();
+        if (state.enabled && state.hotElement) {
           updateOverlay(state.hotElement, false);
+        } else if (!state.enabled) {
+          hideOverlay();
         }
       }
 
@@ -373,33 +471,33 @@ function buildWebElementPickerScript(action) {
           state.hotElement = null;
           state.selection = null;
           state.selectedElement = null;
+          state.selections = [];
+          state.selectedElements = [];
           hideOverlay();
+          hideSelectedOverlays();
           return this.snapshot();
         },
         disable() {
           removeListeners();
           state.enabled = false;
-          if (state.selection && state.selectedElement) {
-            updateOverlay(state.selectedElement, true);
-          } else {
-            hideOverlay();
-          }
+          hideOverlay();
+          updateSelectedOverlays();
           return this.snapshot();
         },
         enable() {
           removeListeners();
           state.enabled = true;
           state.hotElement = null;
-          state.selection = null;
-          state.selectedElement = null;
           hideOverlay();
+          updateSelectedOverlays();
           addListeners();
           return this.snapshot();
         },
         snapshot() {
           return {
             enabled: state.enabled,
-            selection: state.selection
+            selection: state.selection,
+            selections: state.selections.slice()
           };
         }
       };
@@ -454,6 +552,29 @@ function normalizeContext(raw, meta = {}) {
   };
 }
 
+function normalizeContexts(raw, meta = {}) {
+  const candidates = Array.isArray(raw?.selections)
+    ? raw.selections
+    : Array.isArray(raw)
+      ? raw
+      : raw?.selection
+        ? [raw.selection]
+        : raw
+          ? [raw]
+          : [];
+  const keyed = new Map();
+  candidates
+    .map((candidate) => normalizeContext(candidate, meta))
+    .filter(Boolean)
+    .forEach((context) => {
+      const key = String(context.selector || context.element || context.id || "").trim();
+      if (key && !keyed.has(key)) {
+        keyed.set(key, context);
+      }
+    });
+  return [...keyed.values()].slice(0, 3);
+}
+
 export function webElementContextLabel(context) {
   if (!context) {
     return "";
@@ -478,10 +599,10 @@ export function useWebElementPicker({
   workspaceId = "",
 } = {}) {
   const [armed, setArmed] = useState(false);
-  const [selectedContext, setSelectedContext] = useState(null);
+  const [selectedContexts, setSelectedContexts] = useState([]);
   const [error, setError] = useState("");
   const mountedRef = useRef(false);
-  const selectedIdRef = useRef("");
+  const selectedSignatureRef = useRef("");
 
   useEffect(() => {
     mountedRef.current = true;
@@ -505,8 +626,8 @@ export function useWebElementPicker({
   }, [enabled, evaluate]);
 
   const clearSelection = useCallback(async () => {
-    selectedIdRef.current = "";
-    setSelectedContext(null);
+    selectedSignatureRef.current = "";
+    setSelectedContexts([]);
     setArmed(false);
     setError("");
     if (typeof evaluate === "function") {
@@ -524,8 +645,6 @@ export function useWebElementPicker({
   const armPicker = useCallback(async () => {
     setError("");
     try {
-      selectedIdRef.current = "";
-      setSelectedContext(null);
       await runPickerAction("enable", { expectResult: false });
       if (mountedRef.current) {
         setArmed(true);
@@ -548,8 +667,8 @@ export function useWebElementPicker({
 
   useEffect(() => {
     if (!enabled) {
-      selectedIdRef.current = "";
-      setSelectedContext(null);
+      selectedSignatureRef.current = "";
+      setSelectedContexts([]);
       setArmed(false);
       setError("");
       if (typeof evaluate === "function") {
@@ -559,8 +678,8 @@ export function useWebElementPicker({
   }, [enabled, evaluate]);
 
   useEffect(() => {
-    selectedIdRef.current = "";
-    setSelectedContext(null);
+    selectedSignatureRef.current = "";
+    setSelectedContexts([]);
     setArmed(false);
     setError("");
     if (typeof evaluate === "function") {
@@ -583,18 +702,16 @@ export function useWebElementPicker({
         if (disposed) {
           return;
         }
-        const nextContext = normalizeContext(result, meta);
+        const nextContexts = normalizeContexts(result, meta);
         setError("");
-        if (nextContext) {
-          if (selectedIdRef.current !== nextContext.id) {
-            selectedIdRef.current = nextContext.id;
-            setSelectedContext(nextContext);
-          }
-          if (result?.enabled === false) {
-            setArmed(false);
-            return;
-          }
-        } else if (result?.enabled === false) {
+        const nextSignature = nextContexts
+          .map((context) => context.id || context.selector || context.element || "")
+          .join("|");
+        if (selectedSignatureRef.current !== nextSignature) {
+          selectedSignatureRef.current = nextSignature;
+          setSelectedContexts(nextContexts);
+        }
+        if (result?.enabled === false) {
           setArmed(false);
           return;
         }
@@ -612,9 +729,7 @@ export function useWebElementPicker({
     };
   }, [armed, enabled, evaluate, meta]);
 
-  const contextRefs = useMemo(() => (
-    selectedContext ? [selectedContext] : []
-  ), [selectedContext]);
+  const contextRefs = useMemo(() => selectedContexts, [selectedContexts]);
 
   return {
     armed,
@@ -622,7 +737,8 @@ export function useWebElementPicker({
     clearSelection,
     contextRefs,
     error,
-    selectedContext,
+    selectedContext: selectedContexts[0] || null,
+    selectedContexts,
     stopPicker,
     togglePicker,
   };

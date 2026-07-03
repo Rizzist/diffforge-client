@@ -60,8 +60,16 @@ function normalizeOverlayActivityItem(item) {
   if (!itemId) {
     return null;
   }
-  const rawStatus = cleanText(item.status || item.state || "queued").toLowerCase();
-  const status = rawStatus === "completed" || rawStatus === "running" ? rawStatus : "queued";
+  const rawStatus = cleanText(item.status || item.state || "queued").toLowerCase().replace(/[\s-]+/g, "_");
+  const status = ["completed", "complete", "done", "success", "succeeded"].includes(rawStatus)
+    ? "completed"
+    : ["running", "processing", "in_flight", "sending", "dispatching", "active"].includes(rawStatus)
+      ? "running"
+      : ["failed", "failure", "error", "errored", "timed_out", "timeout"].includes(rawStatus)
+        ? "failed"
+        : ["interrupted", "cancelled", "canceled", "stopped", "aborted"].includes(rawStatus)
+          ? "interrupted"
+          : "queued";
   const submittedAtMs = Number(item.submittedAtMs ?? item.submitted_at_ms ?? 0);
   return {
     color: cleanText(item.color || item.targetTerminalColor || item.target_terminal_color) || "#8bb8ff",
@@ -83,12 +91,14 @@ function normalizeOverlayActivityItems(items) {
 }
 
 function buildOverlayConfig({
+  autoDismissCompleted = false,
   activityItems = [],
   contextRefs = [],
   defaultSelectedTargetIds = [],
   targets = [],
 } = {}) {
   return {
+    autoDismissCompleted: Boolean(autoDismissCompleted),
     activityItems: normalizeOverlayActivityItems(activityItems),
     contextRefs: cleanArray(contextRefs).filter((context) => context && typeof context === "object"),
     defaultSelectedTargetIds: normalizeOverlayTargetIds(defaultSelectedTargetIds),
@@ -154,8 +164,16 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
       return array(items).map((item) => {
         const itemId = text(item && (item.itemId || item.item_id || item.id));
         if (!itemId) return null;
-        const rawStatus = text(item.status || item.state || "queued").toLowerCase();
-        const status = rawStatus === "completed" || rawStatus === "running" ? rawStatus : "queued";
+        const rawStatus = text(item.status || item.state || "queued").toLowerCase().replace(/[\\s-]+/g, "_");
+        const status = ["completed", "complete", "done", "success", "succeeded"].includes(rawStatus)
+          ? "completed"
+          : ["running", "processing", "in_flight", "sending", "dispatching", "active"].includes(rawStatus)
+            ? "running"
+            : ["failed", "failure", "error", "errored", "timed_out", "timeout"].includes(rawStatus)
+              ? "failed"
+              : ["interrupted", "cancelled", "canceled", "stopped", "aborted"].includes(rawStatus)
+                ? "interrupted"
+                : "queued";
         const submittedAtMs = Number(item.submittedAtMs || item.submitted_at_ms || 0);
         return {
           color: text(item.color || item.targetTerminalColor || item.target_terminal_color) || "#8bb8ff",
@@ -173,6 +191,8 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
     function statusLabel(status) {
       if (status === "completed") return "completed";
       if (status === "running") return "running";
+      if (status === "failed") return "failed";
+      if (status === "interrupted") return "interrupted";
       return "queued";
     }
 
@@ -325,8 +345,11 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
       const accent = first && first.color ? first.color : "#8bb8ff";
       const selectedRole = first && first.role ? first.role : "";
       const disabled = state.submitting || !targets.length;
-      const context = array(state.config.contextRefs).find((item) => item && typeof item === "object") || null;
-      const contextText = contextLabel(context) || "Selected web element";
+      const contexts = array(state.config.contextRefs).filter((item) => item && typeof item === "object");
+      const context = contexts[0] || null;
+      const contextText = contexts.length > 1
+        ? contexts.length + " selected web elements"
+        : contextLabel(context) || "Selected web element";
       const menu = state.menuOpen ? \`
         <div class="menu" role="listbox" aria-label="Terminal agents">
           \${targets.length ? targets.map((target) => {
@@ -349,11 +372,19 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
             const label = compactActivityText(item.text || item.title || item.label || "Prompt", 15);
             const target = item.short || item.label || "Agent";
             const title = [item.text || item.title || "Panel prompt", target ? "Target: " + target : "", statusLabel(item.status)].filter(Boolean).join(" - ");
+            const dismiss = item.status === "completed"
+              ? '<button aria-label="Dismiss completed prompt" class="activity-dismiss" data-dismiss-activity-id="' + html(item.itemId) + '" type="button">×</button>'
+              : "";
+            const countdown = item.status === "completed" && state.config.autoDismissCompleted
+              ? '<span class="activity-countdown" aria-hidden="true"></span>'
+              : "";
             return \`
               <div class="activity-item" data-status="\${html(item.status)}" style="--activity-color:\${html(item.color)}" title="\${html(title)}">
                 <span class="activity-dot" data-status="\${html(item.status)}"></span>
                 <span class="activity-label">\${html(label || "Prompt")}</span>
                 <span class="activity-status">\${html(statusLabel(item.status))}</span>
+                \${dismiss}
+                \${countdown}
               </div>
             \`;
           }).join("")}
@@ -373,6 +404,10 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
           @keyframes diffforge-panel-agent-spin {
             to { transform: rotate(360deg); }
           }
+          @keyframes diffforge-panel-agent-countdown {
+            from { transform: scaleX(1); }
+            to { transform: scaleX(0); }
+          }
           .activity-stack {
             position: absolute;
             top: max(10px, env(safe-area-inset-top, 0px));
@@ -382,9 +417,10 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
             min-width: 144px;
             max-width: min(260px, calc(100vw - 24px));
             gap: 4px;
-            pointer-events: none;
+            pointer-events: auto;
           }
           .activity-item {
+            position: relative;
             display: grid;
             min-width: 0;
             height: 22px;
@@ -400,9 +436,20 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
             backdrop-filter: blur(12px);
           }
           .activity-item[data-status="completed"] {
+            grid-template-columns: 14px minmax(42px, 1fr) auto 16px;
             border-color: rgba(74, 222, 128, 0.34);
             color: rgba(220, 252, 231, 0.96);
             background: rgba(20, 83, 45, 0.34);
+          }
+          .activity-item[data-status="failed"] {
+            border-color: rgba(248, 113, 113, 0.38);
+            color: rgba(254, 226, 226, 0.98);
+            background: rgba(127, 29, 29, 0.38);
+          }
+          .activity-item[data-status="interrupted"] {
+            border-color: rgba(251, 191, 36, 0.36);
+            color: rgba(254, 243, 199, 0.98);
+            background: rgba(120, 53, 15, 0.34);
           }
           .activity-dot {
             position: relative;
@@ -419,20 +466,45 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
             animation-duration: 760ms;
           }
           .activity-dot[data-status="completed"] {
+            display: grid;
+            place-items: center;
             border-color: rgba(134, 239, 172, 0.92);
             background: #22c55e;
             animation: none;
           }
           .activity-dot[data-status="completed"]::after {
             content: "";
-            position: absolute;
-            left: 3px;
-            top: 1px;
+            display: block;
             width: 3px;
             height: 6px;
             border: solid rgba(4, 20, 10, 0.92);
             border-width: 0 1.5px 1.5px 0;
-            transform: rotate(45deg);
+            transform: translateY(-.5px) rotate(45deg);
+          }
+          .activity-dot[data-status="failed"] {
+            border-color: rgba(252, 165, 165, 0.92);
+            border-top-color: rgba(252, 165, 165, 0.92);
+            background: rgba(239, 68, 68, 0.86);
+            animation: none;
+          }
+          .activity-dot[data-status="failed"]::before,
+          .activity-dot[data-status="failed"]::after {
+            content: "";
+            position: absolute;
+            left: 3px;
+            top: 4px;
+            width: 5px;
+            height: 1.5px;
+            border-radius: 999px;
+            background: rgba(69, 10, 10, 0.94);
+          }
+          .activity-dot[data-status="failed"]::before { transform: rotate(45deg); }
+          .activity-dot[data-status="failed"]::after { transform: rotate(-45deg); }
+          .activity-dot[data-status="interrupted"] {
+            border-color: rgba(253, 230, 138, 0.9);
+            border-top-color: rgba(253, 230, 138, 0.9);
+            background: rgba(245, 158, 11, 0.78);
+            animation: none;
           }
           .activity-label {
             min-width: 0;
@@ -448,6 +520,43 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
           }
           .activity-item[data-status="completed"] .activity-status {
             color: rgba(187, 247, 208, 0.92);
+          }
+          .activity-item[data-status="failed"] .activity-status {
+            color: rgba(254, 202, 202, 0.92);
+          }
+          .activity-item[data-status="interrupted"] .activity-status {
+            color: rgba(253, 230, 138, 0.92);
+          }
+          .activity-dismiss {
+            appearance: none;
+            display: inline-flex;
+            width: 16px;
+            height: 16px;
+            align-items: center;
+            justify-content: center;
+            border: 0;
+            border-radius: 999px;
+            color: currentColor;
+            background: transparent;
+            cursor: pointer;
+            font: 760 15px/1 -apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;
+            opacity: .72;
+          }
+          .activity-dismiss:hover {
+            background: rgba(255,255,255,.12);
+            opacity: 1;
+          }
+          .activity-countdown {
+            position: absolute;
+            left: 8px;
+            right: 8px;
+            bottom: 2px;
+            height: 2px;
+            border-radius: 999px;
+            background: rgba(187, 247, 208, .72);
+            transform-origin: right center;
+            animation: diffforge-panel-agent-countdown 5000ms linear forwards;
+            pointer-events: none;
           }
           .shell {
             position: absolute;
@@ -726,7 +835,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
         });
         prompt.addEventListener("keydown", (event) => {
           event.stopPropagation();
-          if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+          if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
             event.preventDefault();
             submit(state);
           } else if (event.key === "Escape") {
@@ -768,6 +877,17 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
         });
       });
 
+      root.querySelectorAll("[data-dismiss-activity-id]").forEach((button) => {
+        shieldOverlayControl(button);
+        button.addEventListener("click", (event) => {
+          event.stopPropagation();
+          const itemId = text(button.getAttribute("data-dismiss-activity-id"));
+          if (itemId) {
+            pushEvent(state, { itemId, type: "dismissActivity" });
+          }
+        });
+      });
+
       const send = root.querySelector('[data-role="send"]');
       if (send) {
         shieldOverlayControl(send);
@@ -800,7 +920,13 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
       }
       if (!state || state.host !== host || state.root !== host.shadowRoot) {
         state = {
-          config: { activityItems: [], contextRefs: [], defaultSelectedTargetIds: [], targets: [] },
+          config: {
+            activityItems: [],
+            autoDismissCompleted: false,
+            contextRefs: [],
+            defaultSelectedTargetIds: [],
+            targets: [],
+          },
           didAutofocus: false,
           error: "",
           events: [],
@@ -880,6 +1006,7 @@ function buildWebAgentPromptOverlayScript(action, config = {}) {
     const state = ensureState();
     state.config = {
       activityItems: normalizeActivityItems(CONFIG.activityItems),
+      autoDismissCompleted: Boolean(CONFIG.autoDismissCompleted),
       contextRefs: array(CONFIG.contextRefs),
       defaultSelectedTargetIds: array(CONFIG.defaultSelectedTargetIds).map(text).filter(Boolean),
       targets: normalizeTargets(CONFIG.targets)
@@ -895,6 +1022,7 @@ function normalizeOverlayEvents(value) {
 }
 
 export function useWebAgentPromptOverlay({
+  autoDismissCompleted = false,
   activityItems = [],
   contextRefs = [],
   defaultSelectedTargetIds = [],
@@ -902,6 +1030,7 @@ export function useWebAgentPromptOverlay({
   evaluate,
   onClearContext = null,
   onClose = null,
+  onDismissCompletedItem = null,
   onSubmit = null,
   panelKind = "",
   panelPaneId = "",
@@ -913,6 +1042,7 @@ export function useWebAgentPromptOverlay({
   const closeRef = useRef(onClose);
   const contextRefsRef = useRef(contextRefs);
   const defaultSelectedTargetIdsRef = useRef(defaultSelectedTargetIds);
+  const dismissCompletedItemRef = useRef(onDismissCompletedItem);
   const evaluateRef = useRef(evaluate);
   const panelKindRef = useRef(panelKind);
   const panelPaneIdRef = useRef(panelPaneId);
@@ -925,6 +1055,7 @@ export function useWebAgentPromptOverlay({
   closeRef.current = onClose;
   contextRefsRef.current = contextRefs;
   defaultSelectedTargetIdsRef.current = defaultSelectedTargetIds;
+  dismissCompletedItemRef.current = onDismissCompletedItem;
   evaluateRef.current = evaluate;
   panelKindRef.current = panelKind;
   panelPaneIdRef.current = panelPaneId;
@@ -934,11 +1065,12 @@ export function useWebAgentPromptOverlay({
 
   const nativeEnabled = Boolean(enabled) && hasTauriRuntime() && typeof evaluate === "function";
   const config = useMemo(() => buildOverlayConfig({
+    autoDismissCompleted,
     activityItems,
     contextRefs,
     defaultSelectedTargetIds,
     targets,
-  }), [activityItems, contextRefs, defaultSelectedTargetIds, targets]);
+  }), [activityItems, autoDismissCompleted, contextRefs, defaultSelectedTargetIds, targets]);
   const configRef = useRef(config);
   configRef.current = config;
   const configSignature = useMemo(() => JSON.stringify(config), [config]);
@@ -1002,6 +1134,7 @@ export function useWebAgentPromptOverlay({
           }
           if (type === "missing") {
             await runOverlayAction("show", buildOverlayConfig({
+              autoDismissCompleted: configRef.current.autoDismissCompleted,
               activityItems: activityItemsRef.current,
               contextRefs: contextRefsRef.current,
               defaultSelectedTargetIds: defaultSelectedTargetIdsRef.current,
@@ -1011,6 +1144,13 @@ export function useWebAgentPromptOverlay({
           }
           if (type === "clearContext") {
             await clearContextRef.current?.();
+            continue;
+          }
+          if (type === "dismissActivity") {
+            const itemId = cleanText(event.itemId || event.item_id);
+            if (itemId) {
+              dismissCompletedItemRef.current?.(itemId);
+            }
             continue;
           }
           if (type !== "submit") {
@@ -1035,6 +1175,7 @@ export function useWebAgentPromptOverlay({
             if (disposed) {
               return;
             }
+            await clearContextRef.current?.();
             await runOverlayAction("submitted", {}, { expectResult: false }).catch(() => {});
           } catch (err) {
             if (disposed) {
@@ -1049,6 +1190,7 @@ export function useWebAgentPromptOverlay({
         // Navigations briefly tear down the external document; the next poll will
         // reinstall the overlay through the config effect.
         void runOverlayAction("show", buildOverlayConfig({
+          autoDismissCompleted: configRef.current.autoDismissCompleted,
           activityItems: activityItemsRef.current,
           contextRefs: contextRefsRef.current,
           defaultSelectedTargetIds: defaultSelectedTargetIdsRef.current,

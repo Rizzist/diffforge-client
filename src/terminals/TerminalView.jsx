@@ -156,6 +156,7 @@ import AccountTokenomicsView from "../tokenomics/AccountTokenomicsView.jsx";
 import PanelAgentPromptActivity from "./PanelAgentPromptActivity.jsx";
 import PanelAgentPromptComposer from "./PanelAgentPromptComposer.jsx";
 import {
+  PANEL_AGENT_PROMPT_ACTIVITY_DISMISS_EVENT,
   PANEL_AGENT_PROMPT_ACTIVITY_EVENT,
   PANEL_AGENT_PROMPT_ACTIVITY_REQUEST_EVENT,
   PANEL_AGENT_PROMPT_RESULT_EVENT,
@@ -371,6 +372,15 @@ const PANEL_AGENT_PROMPT_SETTLED_STATUSES = new Set([
   "interrupted",
   "timed_out",
 ]);
+const PANEL_AGENT_PROMPT_FAILED_STATUSES = new Set([
+  "error",
+  "errored",
+  "failed",
+  "failure",
+  "timed_out",
+  "timeout",
+]);
+const PANEL_AGENT_PROMPT_INTERRUPTED_STATUSES = new Set(["cancelled", "canceled", "interrupted"]);
 const TODO_QUEUE_CLOSED_TURN_STATES = new Set([
   "cancelled",
   "canceled",
@@ -3415,6 +3425,16 @@ const VOICE_PLAN_TIMED_OUT_STATUSES = new Set([
   "timed_out",
   "timeout",
 ]);
+
+function readTerminalDocumentFocused() {
+  if (typeof document === "undefined") {
+    return true;
+  }
+  return (
+    document.visibilityState !== "hidden"
+    && (typeof document.hasFocus !== "function" || document.hasFocus())
+  );
+}
 const VOICE_PLAN_RUNNING_STATUSES = new Set([
   "active",
   "dispatched",
@@ -22703,6 +22723,7 @@ function TerminalView({
   const [terminalLayoutRects, setTerminalLayoutRects] = useState({});
   const [terminalPanelRect, setTerminalPanelRect] = useState(null);
   const [terminalDragState, setTerminalDragState] = useState(null);
+  const [terminalDocumentFocused, setTerminalDocumentFocused] = useState(readTerminalDocumentFocused);
   const [terminalDocumentPanelRect, setTerminalDocumentPanelRect] = useState(null);
   const [terminalDocumentPanelRows, setTerminalDocumentPanelRows] = useState(null);
   const [terminalBreakoutPhase, setTerminalBreakoutPhase] = useState(TERMINAL_BREAKOUT_PHASE_GRID);
@@ -22766,6 +22787,21 @@ function TerminalView({
   const [terminalBreakoutTerminalScale, setTerminalBreakoutTerminalScale] = useState(TERMINAL_BREAKOUT_DEFAULT_TERMINAL_SCALE);
   const [terminalBreakoutPanning, setTerminalBreakoutPanning] = useState(false);
   const workspaceDocumentPanelAvailable = Boolean(workspaceDocumentPanelEnabled);
+  useEffect(() => {
+    const updateFocused = () => {
+      setTerminalDocumentFocused(readTerminalDocumentFocused());
+    };
+    updateFocused();
+    window.addEventListener("focus", updateFocused);
+    window.addEventListener("blur", updateFocused);
+    document.addEventListener("visibilitychange", updateFocused);
+    return () => {
+      window.removeEventListener("focus", updateFocused);
+      window.removeEventListener("blur", updateFocused);
+      document.removeEventListener("visibilitychange", updateFocused);
+    };
+  }, []);
+
   useEffect(() => {
     if (!workspaceDocumentPanelAvailable) {
       setDocumentPanelAgentPromptOpen(false);
@@ -34296,7 +34332,7 @@ function TerminalView({
       return;
     }
     const itemById = new Map(todoQueueItems.map((item) => [String(item?.id || "").trim(), item]));
-    const completedItemIds = [];
+    const nonWebCompletedItemIds = [];
     setPanelAgentPromptActivityItems((currentItems) => {
       let changed = false;
       const nextItems = currentItems
@@ -34309,7 +34345,7 @@ function TerminalView({
           const queueItem = itemById.get(itemId) || null;
           const pendingItem = todoQueuePendingItems[itemId] || null;
           if (!queueItem && !pendingItem) {
-            if (activityItem.status === "completed") {
+            if (["completed", "failed", "interrupted"].includes(activityItem.status)) {
               return activityItem;
             }
             changed = true;
@@ -34317,15 +34353,22 @@ function TerminalView({
           }
           const lifecycleStatus = queueItem ? getTodoQueueCanonicalLifecycleStatus(queueItem) : "";
           const pendingPhase = pendingItem ? getTodoQueuePendingPhase(pendingItem) : "";
-          const nextStatus = PANEL_AGENT_PROMPT_SETTLED_STATUSES.has(lifecycleStatus)
-            ? "completed"
-            : pendingPhase && pendingPhase !== "queued"
-              ? "running"
-              : lifecycleStatus === "running"
-                ? "running"
-                : "queued";
-          if (nextStatus === "completed") {
-            completedItemIds.push(itemId);
+          const nextStatus = PANEL_AGENT_PROMPT_FAILED_STATUSES.has(lifecycleStatus)
+            ? "failed"
+            : PANEL_AGENT_PROMPT_INTERRUPTED_STATUSES.has(lifecycleStatus)
+              ? "interrupted"
+              : PANEL_AGENT_PROMPT_SETTLED_STATUSES.has(lifecycleStatus)
+                ? "completed"
+                : pendingPhase && pendingPhase !== "queued"
+                  ? "running"
+                  : lifecycleStatus === "running"
+                    ? "running"
+                    : "queued";
+          if (
+            nextStatus === "completed"
+            && String(activityItem.panelKind || "").trim() !== "web"
+          ) {
+            nonWebCompletedItemIds.push(itemId);
           }
           if (nextStatus === activityItem.status) {
             return activityItem;
@@ -34340,8 +34383,8 @@ function TerminalView({
         .filter(Boolean);
       return changed ? nextItems : currentItems;
     });
-    if (completedItemIds.length) {
-      schedulePanelAgentPromptActivityRemoval(completedItemIds);
+    if (nonWebCompletedItemIds.length) {
+      schedulePanelAgentPromptActivityRemoval(nonWebCompletedItemIds);
     }
   }, [
     panelAgentPromptActivityItems.length,
@@ -34361,6 +34404,7 @@ function TerminalView({
       if (!itemId) {
         return;
       }
+      const nonWebCompletedItemIds = [];
       setPanelAgentPromptActivityItems((currentItems) => {
         let changed = false;
         const nextItems = currentItems.map((item) => {
@@ -34371,6 +34415,9 @@ function TerminalView({
             return item;
           }
           changed = true;
+          if (String(item.panelKind || "").trim() !== "web") {
+            nonWebCompletedItemIds.push(itemId);
+          }
           return {
             ...item,
             completedAtMs: Date.now(),
@@ -34379,7 +34426,9 @@ function TerminalView({
         });
         return changed ? nextItems : currentItems;
       });
-      schedulePanelAgentPromptActivityRemoval(itemId);
+      if (nonWebCompletedItemIds.length) {
+        schedulePanelAgentPromptActivityRemoval(nonWebCompletedItemIds);
+      }
     };
     window.addEventListener(TODO_COMPLETED_NOTIFICATION_EVENT, handleTodoCompleted);
     return () => {
@@ -34501,6 +34550,17 @@ function TerminalView({
       emitPanelAgentPromptActivitySnapshot(payload);
     });
 
+    register(PANEL_AGENT_PROMPT_ACTIVITY_DISMISS_EVENT, (event) => {
+      const payload = event?.payload || {};
+      if (!payloadMatchesWorkspace(payload)) {
+        return;
+      }
+      const itemId = String(payload.itemId || payload.item_id || payload.id || "").trim();
+      if (itemId) {
+        removePanelAgentPromptActivityItems(itemId);
+      }
+    });
+
     register(PANEL_AGENT_PROMPT_SUBMIT_EVENT, (event) => {
       const payload = event?.payload || {};
       if (!payloadMatchesWorkspace(payload)) {
@@ -34556,6 +34616,7 @@ function TerminalView({
     defaultPanelAgentPromptTargetIds,
     emitPanelAgentPromptActivitySnapshot,
     panelAgentPromptTargets,
+    removePanelAgentPromptActivityItems,
     submitPanelAgentPrompt,
     terminalWorkspace?.id,
   ]);
@@ -38879,6 +38940,7 @@ function TerminalView({
                   defaultPanelAgentPromptTargetIds={defaultPanelAgentPromptTargetIds}
                   initialUrl={webPaneUrlsRef.current[terminalPaneId] || DEFAULT_WEB_URL}
                   isActive={isWorkspaceSurfaceVisible && !tabHidden && webSurfaceReady}
+                  isFocused={terminalActive && terminalDocumentFocused && isWorkspaceSurfaceVisible && !tabHidden && webSurfaceReady}
                   isFullscreen={fullscreenThisTerminal}
                   fullscreenActive={fullscreenActive}
                   dragActive={terminalDragActive}
@@ -38914,6 +38976,7 @@ function TerminalView({
                   onReturnFromBreakout={(index, pid) => returnWebPanelToGrid(pid)}
                   onFocusBreakout={focusWebPanel}
                   onNavigate={(url) => rememberWebPaneUrl(terminalPaneId, url)}
+                  onDismissPanelAgentPromptActivityItem={removePanelAgentPromptActivityItems}
                   onSubmitPanelAgentPrompt={submitPanelAgentPrompt}
                   panelAgentPromptActivityItems={panelAgentPromptActivityItems.filter((item) => (
                     String(item.panelPaneId || "").trim() === terminalPaneId

@@ -554,6 +554,10 @@ export default function TranscriptPanel({
     }
   }, [savedSegments]);
 
+  // Export is instant: write the file and show WHERE it went inline — the
+  // old auto-reveal spawned a Finder activation on every click, which is
+  // what froze the machine for a beat. Revealing is now opt-in.
+  const [exportedFile, setExportedFile] = useState(null); // { outputPath, name }
   const exportAs = useCallback(
     (format) => {
       if (!repoPath || !asset?.path) {
@@ -561,14 +565,20 @@ export default function TranscriptPanel({
       }
       invoke("video_transcript_export", { repoPath, path: asset.path, format })
         .then((result) => {
-          if (result?.outputPath) {
-            revealItemInDir(result.outputPath).catch(() => {});
+          const outputPath = String(result?.outputPath || "");
+          if (outputPath) {
+            const segments = outputPath.split(/[\\/]/);
+            setExportedFile({ outputPath, name: segments[segments.length - 1] || outputPath });
           }
         })
         .catch((err) => setError(String(err)));
     },
     [asset?.path, repoPath],
   );
+
+  useEffect(() => {
+    setExportedFile(null);
+  }, [asset?.path]);
 
   const toggleWord = useCallback((segIndex, wordIndex) => {
     setStruckWords((current) => {
@@ -615,12 +625,6 @@ export default function TranscriptPanel({
           </VideoPaneButton>
           {transcript ? (
             <>
-              <VideoSecondaryButton onClick={() => exportAs("srt")} type="button">
-                SRT
-              </VideoSecondaryButton>
-              <VideoSecondaryButton onClick={() => exportAs("vtt")} type="button">
-                VTT
-              </VideoSecondaryButton>
               <VideoSecondaryButton
                 onClick={() => {
                   try {
@@ -797,6 +801,33 @@ export default function TranscriptPanel({
           >
             Generate captions
           </VideoPaneButton>
+          <VideoSecondaryButton onClick={() => exportAs("srt")} title="Save as .srt into media/exports" type="button">
+            SRT
+          </VideoSecondaryButton>
+          <VideoSecondaryButton onClick={() => exportAs("vtt")} title="Save as .vtt into media/exports" type="button">
+            VTT
+          </VideoSecondaryButton>
+          {exportedFile ? (
+            <VideoHint style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+              ✓ {exportedFile.name}
+              <button
+                onClick={() => revealItemInDir(exportedFile.outputPath).catch(() => {})}
+                style={{
+                  appearance: "none",
+                  border: "none",
+                  background: "transparent",
+                  color: "#93c5fd",
+                  cursor: "pointer",
+                  font: "inherit",
+                  padding: 0,
+                  textDecoration: "underline",
+                }}
+                type="button"
+              >
+                Show
+              </button>
+            </VideoHint>
+          ) : null}
           {mode === "words" && struckWords.length ? (
             <VideoPaneButton onClick={removeStruckFromCut} type="button">
               ✂ Remove {struckWords.length} word{struckWords.length === 1 ? "" : "s"} from cut

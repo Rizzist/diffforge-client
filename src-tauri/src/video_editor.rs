@@ -606,6 +606,14 @@ fn video_ensure_media_dirs(media_root: &std::path::Path) -> Result<(), String> {
     }
     std::fs::create_dir_all(media_root.join(VIDEO_CACHE_DIR).join(VIDEO_THUMBS_DIR))
         .map_err(|error| format!("Unable to create video thumbnail cache directory: {error}"))?;
+    // .cache holds regenerable derived data (thumbs, filmstrips, waveforms,
+    // probe/transcribe caches) — self-ignore it so it never dirties the
+    // workspace's git status.
+    let gitignore_path = media_root.join(VIDEO_CACHE_DIR).join(".gitignore");
+    if !gitignore_path.exists() {
+        std::fs::write(&gitignore_path, "*\n")
+            .map_err(|error| format!("Unable to write media cache .gitignore: {error}"))?;
+    }
     Ok(())
 }
 
