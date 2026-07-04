@@ -178,6 +178,35 @@ export default function WebPane({
     onNativeLabelChange?.(paneId, label);
   }, [onNativeLabelChange, paneId]);
 
+  const effectiveBreakoutReturnUrl = normalizeWebInput(breakoutReturnUrl)
+    || String(breakoutReturnUrl || "").trim()
+    || currentUrl;
+
+  // Returning from a pop-out window with a living webview to adopt: the page is
+  // wherever the window last navigated, so sync the pane's own history/address
+  // bar to it (the loaded-url guard in the hook keeps this from reloading).
+  const prevPoppedOutRef = useRef(poppedOut);
+  useEffect(() => {
+    const wasPoppedOut = prevPoppedOutRef.current;
+    prevPoppedOutRef.current = poppedOut;
+    if (!wasPoppedOut || poppedOut) {
+      return;
+    }
+    const returnUrl = normalizeWebInput(breakoutReturnUrl) || String(breakoutReturnUrl || "").trim();
+    if (!returnUrl) {
+      return;
+    }
+    setHistory((previous) => {
+      const activeIndex = Math.min(Math.max(historyIndex, 0), Math.max(0, previous.length - 1));
+      if ((previous[activeIndex] || "") === returnUrl) {
+        return previous;
+      }
+      return [...previous.slice(0, activeIndex + 1), returnUrl];
+    });
+    setHistoryIndex((index) => ((history[index] || "") === returnUrl ? index : index + 1));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [poppedOut]);
+
   const { evaluate, reload } = useNativeWebview({
     layoutKey,
     viewportRef,
@@ -190,6 +219,7 @@ export default function WebPane({
     suspended: poppedOut,
     adoptLabel,
     adoptNonce,
+    adoptCurrentUrl: effectiveBreakoutReturnUrl,
     onLabelChange: handleNativeLabelChange,
     viewportInsetBottom: agentPromptOpen && !nativeAgentPromptOverlayActive
       ? agentPromptTargetMenuOpen
@@ -395,10 +425,6 @@ export default function WebPane({
       ) : null}
     </>
   );
-  const effectiveBreakoutReturnUrl = normalizeWebInput(breakoutReturnUrl)
-    || String(breakoutReturnUrl || "").trim()
-    || currentUrl;
-
   return (
     <WebPaneSurface data-workspace-web-surface="true" data-active={isActive ? "true" : undefined}>
       <WebPaneRail data-terminal-control="true" data-toolbar-inline-nav={inlineToolbarInNav ? "true" : undefined}>
@@ -630,61 +656,20 @@ const WebPaneRail = styled(TerminalRestartPill)`
     grid-row: 2;
   }
 
-  @container (max-width: 760px) {
+  /* The controls row stays beside the drag handle at every pane width (the old
+     760px container fallback pushed it to a second row on ordinary panes);
+     TerminalPaneInlineRailControls flex-wraps naturally if space truly runs out. */
+  && [data-web-pane-rail-section="controls"] {
+    min-width: 0;
+    flex-wrap: wrap;
+  }
+
+  /* Neutralize the inherited TerminalRestartPill 520px fallback: this rail
+     keeps its base single-row layout at every width. */
+  @container (max-width: 520px) {
     && {
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: start;
-    }
-
-    && [data-web-pane-rail-section="identity"] {
-      grid-column: 1;
-      grid-row: 1;
-    }
-
-    && [data-web-pane-rail-section="primary"] {
-      grid-column: 2;
-      grid-row: 1;
-    }
-
-    && [data-web-pane-rail-section="controls"] {
-      grid-column: 1 / -1;
-      grid-row: 2;
-      width: 100%;
-      justify-self: stretch;
-      flex-wrap: wrap;
-    }
-
-    && [data-web-pane-rail-section="nav"] {
-      grid-column: 1 / -1;
-      grid-row: 3;
-    }
-
-    && [data-web-pane-rail-section="secondary"] {
-      grid-column: 1 / -1;
-      grid-row: 2;
-      width: 100%;
-      justify-self: start;
-      flex-wrap: wrap;
-    }
-
-    && [data-web-pane-rail-section="activity"] {
-      grid-column: 1 / -1;
-      grid-row: 4;
-    }
-
-    &&[data-toolbar-inline-nav="true"] {
-      grid-template-columns: minmax(0, 1fr);
-      grid-template-rows: minmax(24px, auto);
-    }
-
-    &&[data-toolbar-inline-nav="true"] [data-web-pane-rail-section="nav"] {
-      grid-column: 1 / -1;
-      grid-row: 1;
-    }
-
-    &&[data-toolbar-inline-nav="true"] [data-web-pane-rail-section="activity"] {
-      grid-column: 1 / -1;
-      grid-row: 2;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
     }
   }
 `;

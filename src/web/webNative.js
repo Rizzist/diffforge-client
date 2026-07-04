@@ -352,6 +352,9 @@ export function useNativeWebview({
   // own window instead of creating a fresh one — preserving the live page.
   adoptLabel = "",
   adoptNonce = 0,
+  // The url the adopted webview is believed to be showing; lets later url-prop
+  // syncs to that value skip a needless reload right after adoption.
+  adoptCurrentUrl = "",
   onLabelChange,
 }) {
   const [status, setStatus] = useState("idle");
@@ -360,6 +363,7 @@ export function useNativeWebview({
   const labelRef = useRef("");
   const generationRef = useRef(0);
   const openKeyRef = useRef("");
+  const openBaseKeyRef = useRef("");
   const rectKeyRef = useRef("");
   const visibleRef = useRef(visible);
   const onNavigateRef = useRef(onNavigate);
@@ -371,12 +375,22 @@ export function useNativeWebview({
   // Adoption is one-shot per nonce: once consumed, later url/reload changes go
   // through the normal open-and-navigate path instead of re-adopting.
   const consumedAdoptNonceRef = useRef(0);
+  // adoptLabel is read through a ref (NOT part of the open key or effect deps):
+  // callers store the current label in state/session, so keying the open effect
+  // on it creates an open → label change → re-open feedback loop.
+  const adoptLabelRef = useRef("");
+  const adoptCurrentUrlRef = useRef("");
+  // The url the current webview itself last reported loading. When the url prop
+  // catches up to a navigation the page already made, no re-open is needed.
+  const lastLoadedUrlRef = useRef("");
 
   visibleRef.current = visible;
   onNavigateRef.current = onNavigate;
   onErrorRef.current = onError;
   suspendedRef.current = Boolean(suspended);
   onLabelChangeRef.current = onLabelChange;
+  adoptLabelRef.current = String(adoptLabel || "").trim();
+  adoptCurrentUrlRef.current = String(adoptCurrentUrl || "").trim();
 
   const runtimeEnabled = Boolean(enabled) && hasTauriRuntime();
   const safeViewportInsetBottom = Math.max(0, Math.round(Number(viewportInsetBottom) || 0));
@@ -400,6 +414,12 @@ export function useNativeWebview({
   const fit = useCallback((label, nextVisible, options = {}) => {
     const safeLabel = String(label || "").trim();
     if (!safeLabel || !hasTauriRuntime() || suspendedRef.current) {
+      return;
+    }
+    // Late fit-burst frames can fire for a label this hook no longer owns;
+    // acting on them re-registers stale visible rects (and re-shows webviews
+    // that were already closed or handed to another window).
+    if (safeLabel !== labelRef.current) {
       return;
     }
     const shouldShow = Boolean(nextVisible);
@@ -488,6 +508,8 @@ export function useNativeWebview({
     assignLabel("");
     rectKeyRef.current = "";
     openKeyRef.current = "";
+    openBaseKeyRef.current = "";
+    lastLoadedUrlRef.current = "";
     generationRef.current += 1;
     if (label) {
       clearNativeWebviewVisibleRect(label);
@@ -528,12 +550,13 @@ export function useNativeWebview({
       return undefined;
     }
 
-    const openKey = webviewOpenKey({
+    const openBaseKey = webviewOpenKey({
       parentWindowLabel,
-      reloadKey: `${reloadKey}|${adoptLabel}|${adoptNonce}`,
+      reloadKey: `${reloadKey}|${adoptNonce}`,
       scopeParts,
-      url,
+      url: "",
     });
+    const openKey = `${openBaseKey}${url}`;
 
     if (!visible) {
       fit(labelRef.current, false, { force: true });
@@ -542,6 +565,21 @@ export function useNativeWebview({
     }
 
     if (labelRef.current && openKeyRef.current === openKey) {
+      fit(labelRef.current, true, { force: true });
+      scheduleFitBurst(labelRef.current, true, { delays: [80, 180], frames: 3 });
+      return undefined;
+    }
+
+    // Only the url changed, and it changed to the page the webview itself
+    // reported loading (in-page navigation echoed back through onNavigate):
+    // the webview is already there — re-opening would flash a full reload.
+    if (
+      labelRef.current
+      && openBaseKeyRef.current === openBaseKey
+      && lastLoadedUrlRef.current
+      && lastLoadedUrlRef.current === url
+    ) {
+      openKeyRef.current = openKey;
       fit(labelRef.current, true, { force: true });
       scheduleFitBurst(labelRef.current, true, { delays: [80, 180], frames: 3 });
       return undefined;
@@ -568,7 +606,7 @@ export function useNativeWebview({
 
       // Adoption first: take over the living webview (same page, same session,
       // no reload) instead of creating a fresh one. Falls through on failure.
-      const targetAdoptLabel = String(adoptLabel || "").trim();
+      const targetAdoptLabel = adoptLabelRef.current;
       const adoptionPending = Boolean(targetAdoptLabel)
         && adoptNonce > 0
         && consumedAdoptNonceRef.current !== adoptNonce;
@@ -586,6 +624,8 @@ export function useNativeWebview({
           if (adopted) {
             assignLabel(targetAdoptLabel);
             openKeyRef.current = openKey;
+            openBaseKeyRef.current = openBaseKey;
+            lastLoadedUrlRef.current = adoptCurrentUrlRef.current || url;
             rectKeyRef.current = "";
             if (previousLabel && previousLabel !== targetAdoptLabel) {
               clearNativeWebviewVisibleRect(previousLabel);
@@ -609,6 +649,8 @@ export function useNativeWebview({
       const label = webviewLabel(scopeParts, generation);
       assignLabel(label);
       openKeyRef.current = openKey;
+      openBaseKeyRef.current = openBaseKey;
+      lastLoadedUrlRef.current = "";
       rectKeyRef.current = "";
 
       if (previousLabel) {
@@ -619,6 +661,7 @@ export function useNativeWebview({
         if (generationRef.current === generation && labelRef.current === label) {
           assignLabel("");
           openKeyRef.current = "";
+          openBaseKeyRef.current = "";
         }
         return;
       }
@@ -639,6 +682,7 @@ export function useNativeWebview({
         if (!disposed && generationRef.current === generation) {
           assignLabel("");
           openKeyRef.current = "";
+          openBaseKeyRef.current = "";
           if (mountedRef.current) {
             setStatus("error");
           }
@@ -677,7 +721,9 @@ export function useNativeWebview({
     return () => {
       disposed = true;
     };
-  }, [runtimeEnabled, url, reloadKey, parentWindowLabel, viewportRef, scopeParts, fit, scheduleFitBurst, closeCurrent, visible, safeViewportInsetBottom, suspended, adoptLabel, adoptNonce, assignLabel]);
+    // adoptLabel is intentionally NOT a dep (read via adoptLabelRef): it tracks
+    // whichever label this hook last reported, so keying on it would loop.
+  }, [runtimeEnabled, url, reloadKey, parentWindowLabel, viewportRef, scopeParts, fit, scheduleFitBurst, closeCurrent, visible, safeViewportInsetBottom, suspended, adoptNonce, assignLabel]);
 
   // Re-fit (and show/hide) whenever visibility flips.
   useEffect(() => {
@@ -843,6 +889,7 @@ export function useNativeWebview({
         scheduleFitBurst(labelRef.current, visibleRef.current, { delays: [80, 180], frames: 3 });
         const loadedUrl = String(payload.url || "").trim();
         if (loadedUrl) {
+          lastLoadedUrlRef.current = loadedUrl;
           onNavigateRef.current?.(loadedUrl);
         }
       }

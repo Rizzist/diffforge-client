@@ -1630,32 +1630,37 @@ fn desktop_auth_cli_home_dir() -> Option<PathBuf> {
 }
 
 fn desktop_auth_cli_app_data_dir() -> Result<PathBuf, String> {
+    cloud_mcp_native_data_root()
+        .ok_or_else(|| "Unable to resolve Diff Forge device data directory.".to_string())
+}
+
+fn desktop_auth_cli_legacy_app_data_dir() -> Result<PathBuf, String> {
     if cfg!(target_os = "windows") {
         if let Some(appdata) = env::var_os("APPDATA").map(PathBuf::from) {
-            return Ok(appdata.join("ai.diffforge.desktop"));
+            return Ok(appdata.join(PROD_BUNDLE_IDENTIFIER));
         }
         if let Some(home) = desktop_auth_cli_home_dir() {
             return Ok(home
                 .join("AppData")
                 .join("Roaming")
-                .join("ai.diffforge.desktop"));
+                .join(PROD_BUNDLE_IDENTIFIER));
         }
     } else if cfg!(target_os = "macos") {
         if let Some(home) = desktop_auth_cli_home_dir() {
             return Ok(home
                 .join("Library")
                 .join("Application Support")
-                .join("ai.diffforge.desktop"));
+                .join(PROD_BUNDLE_IDENTIFIER));
         }
     } else {
         if let Some(data_home) = env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
-            return Ok(data_home.join("ai.diffforge.desktop"));
+            return Ok(data_home.join(PROD_BUNDLE_IDENTIFIER));
         }
         if let Some(home) = desktop_auth_cli_home_dir() {
             return Ok(home
                 .join(".local")
                 .join("share")
-                .join("ai.diffforge.desktop"));
+                .join(PROD_BUNDLE_IDENTIFIER));
         }
     }
 
@@ -1669,14 +1674,25 @@ fn desktop_auth_cli_state_path() -> Result<PathBuf, String> {
     Ok(state_dir.join(format!("{DESKTOP_AUTH_STATE_KEY}.json")))
 }
 
+fn desktop_auth_cli_legacy_state_path() -> Result<PathBuf, String> {
+    Ok(desktop_auth_cli_legacy_app_data_dir()?
+        .join("app-state")
+        .join(format!("{DESKTOP_AUTH_STATE_KEY}.json")))
+}
+
 fn desktop_auth_cli_read_snapshot() -> Value {
-    let Ok(path) = desktop_auth_cli_state_path() else {
-        return desktop_auth_snapshot_from_raw(json!(null));
-    };
-    let raw = fs::read_to_string(path).ok();
-    let value = raw
-        .as_deref()
-        .and_then(|body| serde_json::from_str::<Value>(body).ok())
+    if let Ok(path) = desktop_auth_cli_state_path() {
+        if let Ok(raw) = fs::read_to_string(&path) {
+            if let Ok(value) = serde_json::from_str::<Value>(&raw) {
+                return desktop_auth_snapshot_from_raw(value);
+            }
+        }
+    }
+
+    let value = desktop_auth_cli_legacy_state_path()
+        .ok()
+        .and_then(|path| fs::read_to_string(path).ok())
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok())
         .unwrap_or(json!(null));
     desktop_auth_snapshot_from_raw(value)
 }

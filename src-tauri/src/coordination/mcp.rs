@@ -7,19 +7,19 @@ use std::{
     process::{Command, Stdio},
     sync::mpsc,
     sync::{
-        Arc, Mutex as StdMutex, OnceLock,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex as StdMutex, OnceLock,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use serde_json::{Map, Value, json};
+use serde_json::{json, Map, Value};
 use uuid::Uuid;
 
 use super::{
-    db::{REPO_ID, coordination_daemon_info_path},
-    kernel::{CoordinationKernel, EventRefs, api_error, api_ok},
+    db::{coordination_daemon_info_path, REPO_ID},
+    kernel::{api_error, api_ok, CoordinationKernel, EventRefs},
 };
 
 pub const TOOL_NAMES: &[&str] = &[
@@ -5689,13 +5689,11 @@ mod tests {
         );
         assert_eq!(denied["ok"].as_bool(), Some(false));
         assert_eq!(denied["error"]["code"].as_str(), Some("unknown_tool"));
-        assert!(
-            !denied["error"]["details"]["allowed_tools"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|tool| tool.as_str() == Some("start_task"))
-        );
+        assert!(!denied["error"]["details"]["allowed_tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool.as_str() == Some("start_task")));
 
         let session_context = McpContext {
             session_id: Some("session-1".to_string()),

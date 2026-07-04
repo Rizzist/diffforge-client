@@ -3032,7 +3032,7 @@ export const WorkspaceButton = styled.button`
   &:hover,
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}[data-native-hovered="true"] &,
-  ${WorkspaceRow}:focus-within & {
+  ${WorkspaceRow}:has(:focus-visible) & {
     border-color: var(--workspace-card-hover-border);
     background: var(--workspace-card-hover-bg);
     padding-right: 34px;
@@ -3071,7 +3071,7 @@ export const WorkspaceButton = styled.button`
     &:hover,
     ${WorkspaceRow}:hover &,
     ${WorkspaceRow}[data-native-hovered="true"] &,
-    ${WorkspaceRow}:focus-within & {
+    ${WorkspaceRow}:has(:focus-visible) & {
       padding-right: 34px;
     }
 
@@ -3237,7 +3237,7 @@ export const WorkspaceNotificationBadge = styled.span`
 
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}[data-native-hovered="true"] &,
-  ${WorkspaceRow}:focus-within & {
+  ${WorkspaceRow}:has(:focus-visible) & {
     right: 36px;
   }
 
@@ -3280,7 +3280,7 @@ export const WorkspaceNotificationBadge = styled.span`
 
     ${WorkspaceRow}:hover &,
     ${WorkspaceRow}[data-native-hovered="true"] &,
-    ${WorkspaceRow}:focus-within & {
+    ${WorkspaceRow}:has(:focus-visible) & {
       right: 36px;
     }
   }
@@ -3335,7 +3335,7 @@ export const WorkspaceSettingsButton = styled.button`
 
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}[data-native-hovered="true"] &,
-  ${WorkspaceRow}:focus-within & {
+  ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 1;
     pointer-events: auto;
     transform: translateY(-50%);
@@ -3344,7 +3344,7 @@ export const WorkspaceSettingsButton = styled.button`
   ${WorkspaceRail}[data-collapsed="true"] &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:hover &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}[data-native-hovered="true"] &,
-  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:focus-within & {
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 0;
     pointer-events: none;
     transform: translate(8px, -50%) scale(0.86);
@@ -3353,7 +3353,7 @@ export const WorkspaceSettingsButton = styled.button`
   @media (max-width: 760px) {
     ${WorkspaceRow}:hover &,
     ${WorkspaceRow}[data-native-hovered="true"] &,
-    ${WorkspaceRow}:focus-within & {
+    ${WorkspaceRow}:has(:focus-visible) & {
       opacity: 1;
       pointer-events: auto;
       transform: translateY(-50%);
@@ -3408,7 +3408,7 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
 
   ${WorkspaceRow}:hover &,
   ${WorkspaceRow}[data-native-hovered="true"] &,
-  ${WorkspaceRow}:focus-within & {
+  ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 1;
     pointer-events: auto;
     transform: translateY(-50%) scale(1);
@@ -3417,7 +3417,7 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
   ${WorkspaceRail}[data-collapsed="true"] &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:hover &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}[data-native-hovered="true"] &,
-  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:focus-within & {
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 0;
     pointer-events: none;
     transform: translate(-8px, -50%) scale(0.86);
@@ -3454,12 +3454,8 @@ export const WorkspaceAccent = styled.span`
     transform: scale(1.08);
   }
 
-  ${WorkspaceButton}[data-selected="true"] & {
-    border-color: rgba(var(--forge-accent-soft-rgb), 0.7);
-    background: var(--forge-accent);
-    box-shadow: 0 0 8px rgba(var(--forge-accent-rgb), 0.55);
-    transform: scale(1.08);
-  }
+  /* Selection alone must NOT light the status square — only runtime state
+     (activating/activated above) does; selection is carried by the row. */
 
   ${WorkspaceRail}[data-collapsed="true"] & {
     position: absolute;
@@ -3488,6 +3484,56 @@ export const WorkspaceAccent = styled.span`
     height: 10px;
     opacity: 1;
     transform: none;
+  }
+`;
+
+const railSkeletonPulse = keyframes`
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+
+  50% {
+    opacity: 0.9;
+  }
+`;
+
+export const RailRowSkeleton = styled.div`
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  gap: 7px;
+  align-items: center;
+  min-height: 38px;
+  padding: 4px 8px 4px 7px;
+  border: 1px dashed rgba(144, 155, 170, 0.22);
+  border-radius: 8px;
+  box-sizing: border-box;
+  animation: ${railSkeletonPulse} 1.3s ease-in-out infinite;
+
+  &:nth-child(2) {
+    animation-delay: 160ms;
+  }
+
+  > span {
+    display: block;
+    height: 10px;
+    max-width: 74%;
+    border-radius: 4px;
+    background: rgba(230, 236, 245, 0.08);
+  }
+
+  > span:first-child {
+    width: 18px;
+    height: 18px;
+    border-radius: 6px;
+  }
+
+  &:nth-child(2) > span:last-child {
+    max-width: 56%;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
   }
 `;
 
@@ -22722,7 +22768,6 @@ export const WorkspaceCreateDirGrid = styled.div`
   padding: 2px 1px 7px;
   scrollbar-gutter: stable;
   overscroll-behavior-inline: contain;
-  scroll-snap-type: x proximity;
   -webkit-overflow-scrolling: touch;
 
   &:focus-visible {
@@ -22740,7 +22785,6 @@ export const WorkspaceCreateDirChip = styled.button`
   max-width: min(190px, 42vw);
   min-width: 0;
   min-height: 36px;
-  scroll-snap-align: start;
   padding: 7px 11px;
   border: 1px solid var(--forge-border);
   border-radius: 9px;

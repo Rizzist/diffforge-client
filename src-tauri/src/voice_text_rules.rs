@@ -321,12 +321,11 @@ struct VoiceTextRules {
 }
 
 fn voice_text_rules_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?;
-
-    Ok(app_data_dir.join(VOICE_TEXT_RULES_FILE))
+    device_data_path(
+        app,
+        Path::new(VOICE_TEXT_RULES_FILE),
+        DeviceDataMigrationStrategy::PreferNewest,
+    )
 }
 
 fn truncate_voice_rule_text(value: &str, max_chars: usize) -> String {

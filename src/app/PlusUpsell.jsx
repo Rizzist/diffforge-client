@@ -13,8 +13,6 @@ import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderabil
  * left edge and the overlay re-arms on every sign-in.
  */
 
-const MUTE_STORAGE_KEY = "diffforge.plusUpsell.sfxMuted";
-
 const TRACK_PERKS = [
   { glyph: "▣", title: "Native app", sub: "Mac · Win · Linux" },
   { glyph: "◆", title: "10k credits", sub: "every month" },
@@ -197,6 +195,10 @@ function createSfx() {
         src.stop(t0 + 0.32);
       });
     },
+    /* pre-warm/resume the context on a user gesture (autoplay policies) */
+    unlock() {
+      ensure();
+    },
     close() {
       if (ctx) ctx.close().catch(() => {});
       ctx = null;
@@ -282,6 +284,12 @@ function createEmberEngine(canvas, prefersReducedMotion) {
 
   let ambientAccumulator = 0;
   let ctaAccumulator = 0;
+  // Full cinematic ember density for the intro, then wind down the ambient
+  // field so an overlay left open doesn't keep burning a full-screen canvas
+  // at showtime rates. CTA embers (hover-driven) are unaffected.
+  const createdAt = performance.now();
+  const AMBIENT_WIND_DOWN_MS = 45_000;
+  const ambientRate = (now) => (now - createdAt < AMBIENT_WIND_DOWN_MS ? 8 : 2);
 
   const stopFrame = () => {
     if (raf) {
@@ -305,7 +313,7 @@ function createEmberEngine(canvas, prefersReducedMotion) {
     const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
 
-    ambientAccumulator += dt * 8;
+    ambientAccumulator += dt * ambientRate(now);
     while (ambientAccumulator >= 1) {
       ambientAccumulator -= 1;
       spawnAmbient();
@@ -404,24 +412,27 @@ function createEmberEngine(canvas, prefersReducedMotion) {
 
 /* ---------------------------------------------------------- component */
 
-export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
+export function PlusUpsellOverlay({
+  onDismiss,
+  onUpgrade,
+  onTitleBarMouseDown,
+  windowPlatform,
+  isWindowFrameExpanded,
+}) {
   // 0 open · 1 emblem slam · 2 perk track · 3 purchase card armed
   const [phase, setPhase] = useState(0);
   const [leaving, setLeaving] = useState(false);
-  const [muted, setMuted] = useState(() => {
-    try {
-      return window.localStorage.getItem(MUTE_STORAGE_KEY) === "1";
-    } catch {
-      return false;
-    }
-  });
+  // sound is ON by default every time the overlay shows; mute is session-only
+  const [muted, setMuted] = useState(false);
   const [creditCount, setCreditCount] = useState(0);
   const [tilesLanded, setTilesLanded] = useState(0);
+  const [runId, setRunId] = useState(0);
 
   const canvasRef = useRef(null);
   const engineRef = useRef(null);
   const emblemRef = useRef(null);
   const ctaRef = useRef(null);
+  const scrollerRef = useRef(null);
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
 
@@ -446,6 +457,18 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
       sfx.close();
     };
   }, [prefersReducedMotion, sfx]);
+
+  // WebAudio contexts can start suspended until a user gesture — unlock on
+  // the first interaction so the timeline sounds are never silently eaten.
+  useEffect(() => {
+    const unlock = () => sfx.unlock();
+    window.addEventListener("pointerdown", unlock);
+    window.addEventListener("keydown", unlock);
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("keydown", unlock);
+    };
+  }, [sfx]);
 
   const emblemCanvasPoint = useCallback(() => {
     const emblem = emblemRef.current;
@@ -502,7 +525,7 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
     });
 
     return () => timers.forEach((timer) => window.clearTimeout(timer));
-  }, [emblemCanvasPoint, sound]);
+  }, [emblemCanvasPoint, sound, runId]);
 
   // credits odometer once the purchase card is in
   useEffect(() => {
@@ -523,10 +546,13 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
     if (phase < 3) return undefined;
     const sync = () => syncCtaEmitter(12);
     const settle = window.setTimeout(sync, 460); // after the card slide settles
+    const scroller = scrollerRef.current;
     window.addEventListener("resize", sync);
+    scroller?.addEventListener("scroll", sync, { passive: true });
     return () => {
       window.clearTimeout(settle);
       window.removeEventListener("resize", sync);
+      scroller?.removeEventListener("scroll", sync);
     };
   }, [phase >= 3, syncCtaEmitter]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -554,16 +580,19 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
   }, [leaving, onDismiss, sound]);
 
   const toggleMuted = useCallback(() => {
-    setMuted((current) => {
-      const next = !current;
-      try {
-        window.localStorage.setItem(MUTE_STORAGE_KEY, next ? "1" : "0");
-      } catch {
-        // storage unavailable — session-only mute
-      }
-      return next;
-    });
+    setMuted((current) => !current);
   }, []);
+
+  const handleReplay = useCallback(() => {
+    if (leaving) return;
+    sfx.unlock();
+    setPhase(0);
+    setTilesLanded(0);
+    setCreditCount(0);
+    engineRef.current?.setCtaRect(null, 0);
+    scrollerRef.current?.scrollTo({ top: 0 });
+    setRunId((current) => current + 1);
+  }, [leaving, sfx]);
 
   useEffect(() => {
     const onKey = (event) => {
@@ -574,14 +603,29 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
   }, [handleDismiss]);
 
   return (
-    <Backdrop aria-label="Upgrade to Diff Forge Plus" data-leaving={leaving} role="dialog">
+    <Backdrop
+      aria-label="Upgrade to Diff Forge Plus"
+      data-leaving={leaving}
+      data-window-expanded={isWindowFrameExpanded ? "true" : "false"}
+      data-window-platform={windowPlatform}
+      role="dialog"
+    >
       <GodRays aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
-      <Streak aria-hidden="true" data-lane="high" />
-      <Streak aria-hidden="true" data-lane="low" />
+      <Streak aria-hidden="true" data-lane="high" key={`streak-high-${runId}`} />
+      <Streak aria-hidden="true" data-lane="low" key={`streak-low-${runId}`} />
       <ImpactFlash aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+      <Vignette aria-hidden="true" />
       <EmberCanvas aria-hidden="true" ref={canvasRef} />
 
-      <Stage data-shake={phase === 1 ? "true" : undefined}>
+      {/* frameless window: keep a draggable strip along the top edge */}
+      <DragStrip
+        aria-hidden="true"
+        data-tauri-drag-region
+        onMouseDown={onTitleBarMouseDown}
+      />
+
+      <StageScroller ref={scrollerRef}>
+        <Stage data-shake={phase === 1 ? "true" : undefined} key={`stage-${runId}`}>
         {/* ------------------------------------------------ showcase (φ) */}
         <Showcase>
           <TierKicker>
@@ -629,8 +673,9 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
 
         {/* ------------------------------------------- purchase card (1) */}
         <PurchaseCard data-armed={phase >= 3 ? "true" : undefined}>
+          <ValueBadge aria-hidden="true">Best value</ValueBadge>
           <PurchaseHeader>
-            <span>Season pass</span>
+            <span>AI Access Pass</span>
             <strong>Gold Flame</strong>
           </PurchaseHeader>
 
@@ -689,10 +734,22 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
           </CtaWrap>
           <CtaHint>Instant activation · billed monthly</CtaHint>
         </PurchaseCard>
-      </Stage>
+        </Stage>
+      </StageScroller>
 
       {/* quiet rail on the left edge */}
       <SideRail>
+        <SideRailButton
+          aria-label="Replay intro"
+          onClick={handleReplay}
+          title="Replay intro"
+          type="button"
+        >
+          <svg fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24">
+            <polyline points="1 4 1 10 7 10" />
+            <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+          </svg>
+        </SideRailButton>
         <SideRailButton
           aria-label={muted ? "Unmute sound effects" : "Mute sound effects"}
           aria-pressed={muted}
@@ -849,10 +906,35 @@ const Backdrop = styled.div`
   transition: opacity 260ms ease;
   ${reducedMotion};
 
+  /* frameless macOS window — clip to the same radius as AppFrame so the
+     opaque backdrop doesn't paint square corners over the transparent shell */
+  &[data-window-platform="macos"][data-window-expanded="false"] {
+    border-radius: 12px;
+  }
+
   &[data-leaving="true"] {
     opacity: 0;
     pointer-events: none;
   }
+`;
+
+/* draggable strip along the top edge — the overlay hides the titlebar */
+const DragStrip = styled.div`
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  z-index: 5;
+  height: 34px;
+`;
+
+const Vignette = styled.div`
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse at 50% 42%, transparent 52%, rgba(0, 0, 0, 0.44) 100%),
+    linear-gradient(180deg, rgba(0, 0, 0, 0.3), transparent 12%, transparent 88%, rgba(0, 0, 0, 0.32));
+  pointer-events: none;
 `;
 
 const GodRays = styled.div`
@@ -936,14 +1018,30 @@ const EmberCanvas = styled.canvas`
   pointer-events: none;
 `;
 
+/* scroll shell — if the stage is ever taller than the window (small or
+   stacked layouts) the content scrolls instead of getting clipped */
+const StageScroller = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  display: flex;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: clamp(40px, 6vh, 60px) clamp(20px, 2.6vw, 48px) clamp(22px, 4.5vh, 48px) 72px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 209, 102, 0.25) transparent;
+`;
+
 /* golden-ratio stage: showcase φ · purchase card 1 */
 const Stage = styled.div`
   position: relative;
   display: grid;
   grid-template-columns: minmax(0, 1.618fr) minmax(330px, 1fr);
   align-items: center;
-  gap: clamp(30px, 4vw, 62px);
-  width: min(1220px, calc(100% - 150px));
+  gap: clamp(26px, 3.4vw, 62px);
+  width: min(1220px, 100%);
+  margin: auto;
   animation: ${cameraPush} 1.3s cubic-bezier(0.2, 0.7, 0.2, 1) both;
 
   &[data-shake="true"] {
@@ -953,11 +1051,11 @@ const Stage = styled.div`
   }
   ${reducedMotion};
 
-  @media (max-width: 1100px) {
+  @media (max-width: 979px) {
     grid-template-columns: minmax(0, 1fr);
     justify-items: center;
     gap: 26px;
-    width: min(680px, calc(100% - 130px));
+    width: min(640px, 100%);
   }
 `;
 
@@ -1218,6 +1316,14 @@ const PerkTile = styled.li`
   padding: 13px 6px 11px;
   border: 1px solid rgba(255, 209, 102, 0.2);
   border-radius: 8px;
+  transition: border-color 220ms ease, box-shadow 220ms ease;
+
+  &[data-landed="true"] {
+    border-color: rgba(255, 209, 102, 0.42);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 236, 189, 0.16),
+      0 0 22px rgba(255, 176, 66, 0.14);
+  }
   background:
     linear-gradient(180deg, rgba(255, 176, 66, 0.1), rgba(255, 176, 66, 0.015) 62%),
     rgba(8, 7, 5, 0.82);
@@ -1229,7 +1335,7 @@ const PerkTile = styled.li`
     color: #fdf3dc;
     font-size: 12.5px;
     font-weight: 880;
-    white-space: nowrap;
+    line-height: 1.2;
   }
 
   span {
@@ -1237,8 +1343,16 @@ const PerkTile = styled.li`
     font-size: 10px;
     font-weight: 720;
     letter-spacing: 0.03em;
+    line-height: 1.3;
     text-transform: uppercase;
-    white-space: nowrap;
+  }
+
+  @media (max-width: 1240px) {
+    padding: 12px 5px 10px;
+
+    strong {
+      font-size: 11.5px;
+    }
   }
 `;
 
@@ -1281,6 +1395,18 @@ const PurchaseCard = styled.aside`
   opacity: 0;
   visibility: hidden;
 
+  /* forged top edge */
+  &::before {
+    content: "";
+    position: absolute;
+    top: 0;
+    right: 0;
+    left: 18px;
+    height: 2px;
+    background: linear-gradient(90deg, rgba(255, 236, 189, 0.85), rgba(255, 190, 92, 0.25) 70%, transparent);
+    pointer-events: none;
+  }
+
   &[data-armed="true"] {
     visibility: visible;
     animation: ${cardIn} 480ms cubic-bezier(0.18, 0.9, 0.24, 1) both;
@@ -1292,6 +1418,30 @@ const PurchaseCard = styled.aside`
     opacity: 1;
     visibility: visible;
   }
+
+  @media (max-width: 979px) {
+    width: min(440px, 100%);
+  }
+`;
+
+/* battle-pass corner ribbon — clipped by the card's clip-path on purpose */
+const ValueBadge = styled.span`
+  position: absolute;
+  top: 24px;
+  right: -36px;
+  z-index: 1;
+  width: 152px;
+  padding: 5px 0;
+  background: linear-gradient(180deg, #ffe1a0, #f5a623);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+  color: #2a1602;
+  font-size: 9.5px;
+  font-weight: 950;
+  letter-spacing: 0.26em;
+  text-align: center;
+  text-transform: uppercase;
+  transform: rotate(45deg);
+  pointer-events: none;
 `;
 
 const PurchaseHeader = styled.header`

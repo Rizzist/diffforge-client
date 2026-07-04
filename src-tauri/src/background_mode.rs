@@ -284,7 +284,7 @@ pub(crate) fn app_enter_background_internal(app: &AppHandle) {
         // as a black menu bar instead of the dropdown).
         #[cfg(target_os = "macos")]
         let _ = main_app.set_activation_policy(tauri::ActivationPolicy::Accessory);
-        if let Some(main) = main_app.get_webview_window("main") {
+        if let Some(main) = main_app.get_window("main") {
             let _ = main.hide();
         }
         // Pre-create the hidden popover so monitor actions are instant.
@@ -314,7 +314,7 @@ pub(crate) fn app_exit_background_internal(app: &AppHandle) {
         // Restore the main window FIRST: even if tray/popover teardown were
         // to fail, the user always gets their window back.
         let _ = restore_main_window(&main_app);
-        if let Some(main) = main_app.get_webview_window("main") {
+        if let Some(main) = main_app.get_window("main") {
             let _ = main.show();
             let _ = main.set_focus();
         }
@@ -358,7 +358,7 @@ fn app_background_mode_state() -> Result<Value, String> {
 #[tauri::command]
 async fn background_monitor_open_activity(app: AppHandle) -> Result<(), String> {
     let main_visible = app
-        .get_webview_window("main")
+        .get_window("main")
         .map(|main| main.is_visible().unwrap_or(false))
         .unwrap_or(false);
     if app_is_in_background_mode() || !main_visible {
@@ -371,7 +371,7 @@ async fn background_monitor_open_activity(app: AppHandle) -> Result<(), String> 
         });
         return Ok(());
     }
-    if let Some(main) = app.get_webview_window("main") {
+    if let Some(main) = app.get_window("main") {
         let _ = main.show();
         let _ = main.set_focus();
     }

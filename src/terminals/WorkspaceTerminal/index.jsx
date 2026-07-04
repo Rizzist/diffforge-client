@@ -6091,27 +6091,63 @@ function WorkspaceTerminal({
         terminalRunningSinceRef.current = 0;
       }
       setTerminalState(state);
-      setTerminalStatus({
-        detail,
-        title,
-        visible: state !== "running" && state !== "prewarmed" && state !== "closed" && !terminalClosed,
-      });
+      const nextVisible = state !== "running" && state !== "prewarmed" && state !== "closed" && !terminalClosed;
+      // Identity-stable: hidden panes re-announce the same stage repeatedly
+      // (layout wait loop); a fresh-but-equal object per call re-rendered the
+      // whole pane each time.
+      setTerminalStatus((current) => (
+        current
+          && current.detail === detail
+          && current.title === title
+          && current.visible === nextVisible
+          ? current
+          : { detail, title, visible: nextVisible }
+      ));
     };
 
     setPaneStage("starting", "Preparing Terminal", "Creating terminal renderer.");
 
-    const waitForStartupMetricPoll = (delayMs) => new Promise((resolve) => {
+    const waitForStartupMetricPoll = (delayMs, watchElement = null) => new Promise((resolve) => {
       if (isDisposed) {
         resolve();
         return;
       }
 
+      // While parked on a slow fallback poll, a ResizeObserver on the pane
+      // container ends the wait the instant the hidden runtime gains size, so
+      // slow polling never delays a reveal.
+      let observer = null;
+      const settle = () => {
+        if (observer) {
+          observer.disconnect();
+          observer = null;
+        }
+        resolve();
+      };
+
       const timer = window.setTimeout(() => {
         startupMetricTimers.delete(timer);
-        resolve();
+        settle();
       }, Math.max(0, delayMs));
 
       startupMetricTimers.add(timer);
+
+      if (watchElement && typeof ResizeObserver !== "undefined") {
+        try {
+          observer = new ResizeObserver((entries) => {
+            const entry = entries[entries.length - 1];
+            const box = entry?.contentRect;
+            if (box && box.width > 0 && box.height > 0) {
+              window.clearTimeout(timer);
+              startupMetricTimers.delete(timer);
+              settle();
+            }
+          });
+          observer.observe(watchElement);
+        } catch {
+          observer = null;
+        }
+      }
     });
 
     container.dataset.scrollbarPlatform = TERMINAL_SCROLLBAR_PLATFORM;
@@ -6502,7 +6538,7 @@ function WorkspaceTerminal({
         const pollMs = waitMs < TERMINAL_START_LAYOUT_WAIT_MS
           ? TERMINAL_START_METRIC_POLL_MS
           : TERMINAL_START_LAYOUT_HIDDEN_POLL_MS;
-        await waitForStartupMetricPoll(pollMs);
+        await waitForStartupMetricPoll(pollMs, container);
 
         if (isDisposed) {
           return false;
@@ -7489,7 +7525,7 @@ function WorkspaceTerminal({
         const pollMs = waitMs < TERMINAL_START_METRIC_WAIT_MS
           ? TERMINAL_START_METRIC_POLL_MS
           : TERMINAL_START_LAYOUT_HIDDEN_POLL_MS;
-        await waitForStartupMetricPoll(pollMs);
+        await waitForStartupMetricPoll(pollMs, container);
 
         if (isDisposed) {
           return null;

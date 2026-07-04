@@ -1,3 +1,6 @@
+// Must be first: installs the React commit-storm watchdog hook before
+// react-dom evaluates and captures __REACT_DEVTOOLS_GLOBAL_HOOK__.
+import "./app/renderLoopProbe.js";
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { StyleSheetManager } from "styled-components";

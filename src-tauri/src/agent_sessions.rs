@@ -44,6 +44,20 @@ struct AgentThreadTranscriptWatchRequest {
     workspace_id: Option<String>,
 }
 
+#[derive(Clone, Default)]
+struct AgentThreadTranscriptNativeWatchRequest {
+    agent_id: String,
+    cwd: String,
+    instance_id: Option<u64>,
+    pane_id: String,
+    provider_session_id: String,
+    source: String,
+    terminal_index: Option<i64>,
+    thread_id: String,
+    transcript_path: Option<String>,
+    workspace_id: String,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CodexThreadSessionDiscoverRequest {
@@ -145,6 +159,7 @@ struct AgentThreadTranscriptWatchContext {
 struct AgentThreadTranscriptWatchEntry {
     context: Arc<StdMutex<AgentThreadTranscriptWatchContext>>,
     last_signature: String,
+    owners: HashSet<String>,
     pending: Arc<AtomicBool>,
     touched_ms: u64,
     _watcher: notify::RecommendedWatcher,
@@ -2125,6 +2140,42 @@ mod agent_sessions_tests {
             .map(|duration| duration.as_nanos())
             .unwrap_or(0);
         env::temp_dir().join(format!("{name}-{suffix}"))
+    }
+
+    #[test]
+    fn transcript_watch_owner_priority_preserves_webview_context() {
+        let native_owner =
+            agent_thread_transcript_native_watch_owner_key("pane-a", Some(42));
+        let webview_owner = agent_thread_transcript_webview_watch_owner_key();
+        let mut owners = HashSet::new();
+
+        assert!(agent_thread_transcript_watch_entry_replace_context(
+            &owners,
+            &native_owner,
+        ));
+        owners.insert(webview_owner.clone());
+        assert!(!agent_thread_transcript_watch_entry_replace_context(
+            &owners,
+            &native_owner,
+        ));
+        assert!(agent_thread_transcript_watch_entry_replace_context(
+            &owners,
+            &webview_owner,
+        ));
+    }
+
+    #[test]
+    fn native_transcript_watch_path_prefers_explicit_path() {
+        let path = agent_thread_transcript_native_watch_path(
+            "codex",
+            "session-a",
+            Some("/tmp/diffforge-explicit-transcript.jsonl"),
+        );
+
+        assert_eq!(
+            path.as_deref(),
+            Some(Path::new("/tmp/diffforge-explicit-transcript.jsonl"))
+        );
     }
 
 	    fn opencode_step_finish(data: Value) -> Vec<CodexThreadTranscriptMessage> {
@@ -4625,8 +4676,86 @@ fn agent_thread_transcript_watch_key(
     )
 }
 
+fn agent_thread_transcript_webview_watch_owner_key() -> String {
+    "webview".to_string()
+}
+
+fn agent_thread_transcript_native_watch_owner_key(pane_id: &str, instance_id: Option<u64>) -> String {
+    format!(
+        "terminal:{}:{}",
+        pane_id.trim(),
+        instance_id
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_string())
+    )
+}
+
+fn agent_thread_transcript_native_watch_context(
+    request: &AgentThreadTranscriptNativeWatchRequest,
+) -> AgentThreadTranscriptWatchContext {
+    AgentThreadTranscriptWatchContext {
+        agent_id: clean_codex_id(&request.agent_id).to_lowercase(),
+        allow_timestamp_fallback: false,
+        cwd: request.cwd.clone(),
+        expected_message_created_at: String::new(),
+        expected_user_message: String::new(),
+        instance_id: request.instance_id,
+        max_messages: CODEX_TRANSCRIPT_DEFAULT_LIMIT,
+        pane_id: request.pane_id.clone(),
+        poll_until_turn_complete: false,
+        prompt_event_id: String::new(),
+        prompt_event_submitted_at: String::new(),
+        provider_session_id: clean_codex_id(&request.provider_session_id),
+        source: request.source.clone(),
+        submitted_at: String::new(),
+        terminal_index: request.terminal_index,
+        terminal_prompt_accepted: false,
+        thread_id: request.thread_id.clone(),
+        workspace_id: request.workspace_id.clone(),
+    }
+}
+
+fn agent_thread_transcript_native_watch_path(
+    agent_id: &str,
+    provider_session_id: &str,
+    transcript_path: Option<&str>,
+) -> Option<PathBuf> {
+    if let Some(path) = transcript_path.map(str::trim).filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    match clean_codex_id(agent_id).to_lowercase().as_str() {
+        "claude" => claude_session_transcript_path(provider_session_id),
+        "opencode" => opencode_db_path(),
+        _ => codex_session_transcript_path(provider_session_id),
+    }
+}
+
+fn agent_thread_transcript_watch_entry_replace_context(
+    owners: &HashSet<String>,
+    owner_key: &str,
+) -> bool {
+    owner_key == agent_thread_transcript_webview_watch_owner_key()
+        || !owners.contains(&agent_thread_transcript_webview_watch_owner_key())
+}
+
+fn trim_agent_thread_transcript_native_owner_from_other_watches(
+    watches: &mut HashMap<String, AgentThreadTranscriptWatchEntry>,
+    owner_key: &str,
+    keep_key: &str,
+) {
+    if !owner_key.starts_with("terminal:") {
+        return;
+    }
+    watches.retain(|key, entry| {
+        if key != keep_key {
+            entry.owners.remove(owner_key);
+        }
+        !entry.owners.is_empty()
+    });
+}
+
 fn agent_thread_transcript_watch_target(agent_id: &str, watch_path: &Path) -> PathBuf {
-    if agent_id == "opencode" && watch_path.is_file() {
+    if (agent_id == "opencode" && watch_path.is_file()) || !watch_path.exists() {
         return watch_path
             .parent()
             .map(Path::to_path_buf)
@@ -4775,38 +4904,34 @@ async fn emit_agent_thread_transcript_watch_update(
     }
 }
 
-fn register_agent_thread_transcript_watch(
+fn register_agent_thread_transcript_watch_internal(
     app: &AppHandle,
-    request: &AgentThreadTranscriptWatchRequest,
-    result: &CodexThreadTranscriptResult,
+    context: AgentThreadTranscriptWatchContext,
+    watch_path: PathBuf,
+    initial_signature: String,
+    owner_key: String,
 ) -> Result<(), String> {
-    let mut context = agent_thread_transcript_watch_context(request);
     if context.provider_session_id.trim().is_empty() {
-        context.provider_session_id = result.session_id.clone();
-    }
-    if context.cwd.trim().is_empty() {
-        context.cwd = result.cwd.clone();
-    }
-    if context.provider_session_id.trim().is_empty() {
-        return Ok(());
-    }
-    if agent_thread_transcript_result_is_cloud_backed(result) {
-        return Ok(());
-    }
-
-    let watch_path = PathBuf::from(result.rollout_path.trim());
-    if result.rollout_path.trim().is_empty() || !watch_path.exists() {
         return Ok(());
     }
     let key = agent_thread_transcript_watch_key(&context, &watch_path);
-    let initial_signature = agent_thread_transcript_signature(result);
     let watches = AGENT_THREAD_TRANSCRIPT_WATCHES.get_or_init(|| StdMutex::new(HashMap::new()));
     if let Ok(mut entries) = watches.lock() {
+        trim_agent_thread_transcript_native_owner_from_other_watches(
+            &mut entries,
+            &owner_key,
+            &key,
+        );
         if let Some(entry) = entries.get_mut(&key) {
-            if let Ok(mut existing_context) = entry.context.lock() {
-                *existing_context = context;
+            if agent_thread_transcript_watch_entry_replace_context(&entry.owners, &owner_key) {
+                if let Ok(mut existing_context) = entry.context.lock() {
+                    *existing_context = context;
+                }
             }
-            entry.last_signature = initial_signature;
+            if !initial_signature.is_empty() {
+                entry.last_signature = initial_signature;
+            }
+            entry.owners.insert(owner_key);
             entry.touched_ms = current_time_ms();
             return Ok(());
         }
@@ -4849,6 +4974,9 @@ fn register_agent_thread_transcript_watch(
     })
     .map_err(|error| format!("Unable to create transcript watcher: {error}"))?;
     let watch_target = agent_thread_transcript_watch_target(&context.agent_id, &watch_path);
+    if !watch_path.exists() && !watch_target.exists() {
+        return Ok(());
+    }
     watcher
         .watch(&watch_target, notify::RecursiveMode::NonRecursive)
         .map_err(|error| {
@@ -4861,6 +4989,7 @@ fn register_agent_thread_transcript_watch(
     let entry = AgentThreadTranscriptWatchEntry {
         context: Arc::new(StdMutex::new(context)),
         last_signature: initial_signature,
+        owners: HashSet::from([owner_key]),
         pending,
         touched_ms: current_time_ms(),
         _watcher: watcher,
@@ -4870,6 +4999,71 @@ fn register_agent_thread_transcript_watch(
         trim_agent_thread_transcript_watches(&mut entries);
     }
     Ok(())
+}
+
+fn register_agent_thread_transcript_watch(
+    app: &AppHandle,
+    request: &AgentThreadTranscriptWatchRequest,
+    result: &CodexThreadTranscriptResult,
+) -> Result<(), String> {
+    if agent_thread_transcript_result_is_cloud_backed(result) {
+        return Ok(());
+    }
+    let mut context = agent_thread_transcript_watch_context(request);
+    if context.provider_session_id.trim().is_empty() {
+        context.provider_session_id = result.session_id.clone();
+    }
+    if context.cwd.trim().is_empty() {
+        context.cwd = result.cwd.clone();
+    }
+    if result.rollout_path.trim().is_empty() {
+        return Ok(());
+    }
+    register_agent_thread_transcript_watch_internal(
+        app,
+        context,
+        PathBuf::from(result.rollout_path.trim()),
+        agent_thread_transcript_signature(result),
+        agent_thread_transcript_webview_watch_owner_key(),
+    )
+}
+
+fn register_agent_thread_transcript_native_watch(
+    app: &AppHandle,
+    request: &AgentThreadTranscriptNativeWatchRequest,
+) -> Result<(), String> {
+    let context = agent_thread_transcript_native_watch_context(request);
+    if context.provider_session_id.trim().is_empty() {
+        return Ok(());
+    }
+    let Some(watch_path) = agent_thread_transcript_native_watch_path(
+        &context.agent_id,
+        &context.provider_session_id,
+        request.transcript_path.as_deref(),
+    ) else {
+        return Ok(());
+    };
+    register_agent_thread_transcript_watch_internal(
+        app,
+        context,
+        watch_path,
+        String::new(),
+        agent_thread_transcript_native_watch_owner_key(&request.pane_id, request.instance_id),
+    )
+}
+
+fn unregister_agent_thread_transcript_native_watch(pane_id: &str, instance_id: Option<u64>) {
+    let owner_key = agent_thread_transcript_native_watch_owner_key(pane_id, instance_id);
+    let Some(watches) = AGENT_THREAD_TRANSCRIPT_WATCHES.get() else {
+        return;
+    };
+    let Ok(mut entries) = watches.lock() else {
+        return;
+    };
+    entries.retain(|_, entry| {
+        entry.owners.remove(&owner_key);
+        !entry.owners.is_empty()
+    });
 }
 
 #[tauri::command]

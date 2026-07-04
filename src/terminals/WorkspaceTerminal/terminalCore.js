@@ -41,7 +41,10 @@ function detectTerminalWebglRendererDefault() {
 
 export const TERMINAL_ENABLE_WEBGL_RENDERER = detectTerminalWebglRendererDefault();
 export const TERMINAL_START_LAYOUT_WAIT_MS = 4000;
-export const TERMINAL_START_LAYOUT_HIDDEN_POLL_MS = 120;
+// Hidden-runtime fallback poll. A ResizeObserver on the pane container ends
+// the wait instantly on reveal, so this only bounds a rare observer miss —
+// it used to be 120ms, which kept every hidden keep-alive pane hot forever.
+export const TERMINAL_START_LAYOUT_HIDDEN_POLL_MS = 1500;
 export const TERMINAL_START_LAYOUT_STILL_WAITING_LOG_MS = 4000;
 export const TERMINAL_START_METRIC_WAIT_MS = 900;
 export const TERMINAL_START_METRIC_STILL_WAITING_LOG_MS = 4000;

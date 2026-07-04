@@ -34,7 +34,10 @@ const TOKENOMICS_PROVIDER_LIMIT_RECENT_USAGE_SECS: u64 = 7 * 24 * 60 * 60;
 const TOKENOMICS_SUMMARY_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_LIVE_LIMITS_CACHE_TTL_MS: u64 = 60_000;
 const TOKENOMICS_PERIODIC_SAMPLE_INTERVAL_MS: u64 = 60 * 1000;
-const TOKENOMICS_PERIODIC_PROVIDER_REFRESH_INTERVAL_MS: u64 = 5 * 60 * 1000;
+// Provider limits refresh on the same 60s cadence as the sample cycle (the
+// scheduler already measures the gap end-of-cycle → start-of-next). Kept
+// cheap by the in-use-only profile gating + per-cycle fetch memo + UA cache.
+const TOKENOMICS_PERIODIC_PROVIDER_REFRESH_INTERVAL_MS: u64 = 60 * 1000;
 const TOKENOMICS_PERIODIC_SOURCE_DISCOVERY_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_PERIODIC_CANDIDATE_DISCOVERY_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_PERIODIC_FINGERPRINT_FILES_PER_ROOT: usize = 16;

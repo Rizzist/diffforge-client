@@ -476,6 +476,7 @@ import {
   RailHistoryIcon,
   RailSettingsIcon,
   RailSignOutIcon,
+  RailRowSkeleton,
   RailSnippingIcon,
   RailTerminalIcon,
   RailTokenomicsIcon,
@@ -14545,7 +14546,13 @@ function scrollWorkspaceHorizontalStripFromWheel(strip, event) {
 
   const deltaX = Number(event.deltaX) || 0;
   const deltaY = Number(event.deltaY) || 0;
-  const rawDelta = deltaX !== 0 ? deltaX : deltaY;
+  // Horizontal trackpad gestures already scroll the strip natively with
+  // inertia; intercepting them replaces momentum with per-event jumps. Only
+  // remap vertical wheel input (mouse wheels have no horizontal axis here).
+  if (Math.abs(deltaX) >= Math.abs(deltaY)) {
+    return false;
+  }
+  const rawDelta = deltaY;
   if (!rawDelta) {
     return false;
   }
@@ -15548,9 +15555,15 @@ function appScriptRunLogFromEvent(payload = {}, fallback = {}) {
   if (stage === "output") {
     const stream = appScriptText(payload.stream, "stdout") === "stderr" ? "stderr" : "stdout";
     const text = String(payload.chunk ?? "");
+    // Bound the retained log: chatty/looping scripts otherwise grow the chunk
+    // array and stream strings without limit (memory + render cost per event).
+    const grownChunks = [...(fallback.chunks || []), { stream, text }];
+    const nextChunks = grownChunks.length > 600 ? grownChunks.slice(-480) : grownChunks;
+    const grownStream = `${fallback[stream] || ""}${text}`;
+    const nextStream = grownStream.length > 262144 ? grownStream.slice(-262144) : grownStream;
     return {
       ...fallback,
-      chunks: [...(fallback.chunks || []), { stream, text }],
+      chunks: nextChunks,
       pathKey,
       runId: appScriptText(payload.run_id || payload.runId, fallback.runId || appScriptRunId(pathKey)),
       state: "running",
@@ -15558,7 +15571,7 @@ function appScriptRunLogFromEvent(payload = {}, fallback = {}) {
       loopRuntimeNodeId: appScriptText(payload.loop_runtime_node_id || payload.loopRuntimeNodeId, fallback.loopRuntimeNodeId || ""),
       loopRuntimeRunId: appScriptText(payload.loop_runtime_run_id || payload.loopRuntimeRunId, fallback.loopRuntimeRunId || ""),
       loopspaceId: appScriptText(payload.loopspace_id || payload.loopspaceId, fallback.loopspaceId || ""),
-      [stream]: `${fallback[stream] || ""}${text}`,
+      [stream]: nextStream,
       triggerId: appScriptText(payload.trigger_id || payload.triggerId, fallback.triggerId || ""),
       triggerRunId: appScriptText(payload.trigger_run_id || payload.triggerRunId, fallback.triggerRunId || ""),
       updatedAt: Date.now(),
@@ -22412,6 +22425,9 @@ export default function App() {
   const [loopspaceName, setLoopspaceName] = useState("");
   const [loopspaceState, setLoopspaceState] = useState("idle");
   const [loopspaceError, setLoopspaceError] = useState("");
+  // False while the loops list fetch (local snapshot + cloud sync) is still in
+  // flight, so the rail can tell "loading" apart from "fetched empty".
+  const [loopspacesHydrated, setLoopspacesHydrated] = useState(false);
   const [loopspaceRenameDraft, setLoopspaceRenameDraft] = useState("");
   const [loopspaceActionState, setLoopspaceActionState] = useState("idle");
   const [loopspaceSettingsPanelId, setLoopspaceSettingsPanelId] = useState("");
@@ -22955,8 +22971,10 @@ export default function App() {
     if (!shelf) return undefined;
     const onWheel = (event) => {
       if (shelf.scrollWidth <= shelf.clientWidth) return;
-      const horizontalIntent = Math.abs(event.deltaX) >= Math.abs(event.deltaY);
-      const delta = horizontalIntent ? event.deltaX : event.deltaY;
+      // Horizontal gestures keep native inertial scrolling; only remap
+      // vertical wheel input, which has no native horizontal path here.
+      if (Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
+      const delta = event.deltaY;
       if (delta === 0) return;
       shelf.scrollLeft += delta;
       event.preventDefault();
@@ -22968,22 +22986,58 @@ export default function App() {
   useEffect(() => {
     let disposed = false;
     let unlisten = null;
+    let pendingOutputEvents = [];
+    let outputFlushTimer = 0;
+
+    const applyScriptEvents = (payloads) => {
+      if (disposed || !payloads.length) return;
+      setAppScriptRunResults((current) => {
+        let next = current;
+        for (const payload of payloads) {
+          const pathKey = appScriptText(payload.path_key || payload.pathKey);
+          if (!pathKey) continue;
+          const runId = appScriptText(payload.run_id || payload.runId);
+          const log = appScriptRunLogFromEvent(payload, next[runId] || next[pathKey] || { pathKey, runId });
+          if (!log) continue;
+          const nextRunId = log.runId || runId;
+          next = {
+            ...next,
+            [pathKey]: log,
+            ...(nextRunId ? { [nextRunId]: log } : {}),
+          };
+        }
+        return next;
+      });
+    };
+
+    const flushPendingOutputs = () => {
+      outputFlushTimer = 0;
+      const payloads = pendingOutputEvents;
+      pendingOutputEvents = [];
+      applyScriptEvents(payloads);
+    };
+
     void listen(LOCAL_SCRIPT_RUN_EVENT, (event) => {
       if (disposed) return;
       const payload = event?.payload || {};
       const pathKey = appScriptText(payload.path_key || payload.pathKey);
       if (!pathKey) return;
-      setAppScriptRunResults((current) => {
-        const runId = appScriptText(payload.run_id || payload.runId);
-        const next = appScriptRunLogFromEvent(payload, current[runId] || current[pathKey] || { pathKey, runId });
-        if (!next) return current;
-        const nextRunId = next.runId || runId;
-        return {
-          ...current,
-          [pathKey]: next,
-          ...(nextRunId ? { [nextRunId]: next } : {}),
-        };
-      });
+      if (payload.stage === "output") {
+        // A chatty script can emit hundreds of output events per second;
+        // committing each one re-rendered the whole shell at print speed.
+        // Buffer and apply at most ~6x/second.
+        pendingOutputEvents.push(payload);
+        if (!outputFlushTimer) {
+          outputFlushTimer = window.setTimeout(flushPendingOutputs, 150);
+        }
+        return;
+      }
+      // Keep ordering: drain buffered output before start/finish records.
+      if (outputFlushTimer) {
+        window.clearTimeout(outputFlushTimer);
+        flushPendingOutputs();
+      }
+      applyScriptEvents([payload]);
       if (payload.stage === "queued" || payload.stage === "start") {
         setAppScriptsState("running");
       } else if (payload.stage === "finish") {
@@ -22998,6 +23052,7 @@ export default function App() {
     }).catch(() => {});
     return () => {
       disposed = true;
+      if (outputFlushTimer) window.clearTimeout(outputFlushTimer);
       if (typeof unlisten === "function") unlisten();
     };
   }, []);
@@ -25236,6 +25291,30 @@ export default function App() {
       });
     };
 
+    // The native cursor watcher samples at a decayed cadence (up to 400ms
+    // still / 500ms unfocused), so its highlight can lag one row behind the
+    // CSS :hover row on a fast move — two rows then show hovered (with close
+    // buttons) at once. Real DOM mouse events are authoritative whenever they
+    // flow: snap the native highlight to the row under the real cursor. No-op
+    // (single ref read) while no native highlight is set.
+    const reconcileNativeHoverWithMouse = (event) => {
+      const currentRow = workspaceRailNativeHoverElementRef.current;
+      if (!currentRow) {
+        return;
+      }
+      const row = event.target?.closest?.("[data-workspace-rail-row-key]");
+      if (row === currentRow) {
+        return;
+      }
+      const rail = workspaceRailRef.current;
+      setNativeHoverRow(row && rail && rail.contains(row) ? row : null);
+    };
+    document.addEventListener("mousemove", reconcileNativeHoverWithMouse, { passive: true });
+    // The pointer can exit the window between native cursor samples — never
+    // leave a row stuck in its hovered state.
+    document.addEventListener("mouseleave", clearNativeHover);
+    window.addEventListener("blur", clearNativeHover);
+
     listen(MAIN_WINDOW_CURSOR_EVENT, (event) => {
       if (cancelled) {
         return;
@@ -25256,6 +25335,9 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      document.removeEventListener("mousemove", reconcileNativeHoverWithMouse);
+      document.removeEventListener("mouseleave", clearNativeHover);
+      window.removeEventListener("blur", clearNativeHover);
       if (typeof unlistenMainWindowCursor === "function") {
         unlistenMainWindowCursor();
       }
@@ -25884,6 +25966,99 @@ export default function App() {
     };
   }, []);
 
+  // localStorage is per-origin (dev serves http://127.0.0.1:1420, prod serves
+  // tauri://localhost), so mirrors that only hydrate from localStorage split
+  // between builds. The Rust app-state copy is device-level and shared: prefer
+  // it on boot, and seed it from this origin's mirror while it is still empty.
+  useEffect(() => {
+    let cancelled = false;
+
+    const hasEntries = (value) => Boolean(
+      value
+        && typeof value === "object"
+        && !Array.isArray(value)
+        && Object.keys(value).length > 0,
+    );
+
+    invoke("app_local_state_load", { key: "workspace-settings" })
+      .then((stored) => {
+        if (cancelled) {
+          return;
+        }
+        if (!hasEntries(stored)) {
+          const local = readWorkspaceSettings();
+          if (hasEntries(local)) {
+            void persistWorkspaceSettings(local);
+          }
+          return;
+        }
+        const merged = normalizeWorkspaceSettings({ ...readWorkspaceSettings(), ...stored });
+        setWorkspaceSettings(merged);
+        try {
+          window.localStorage.setItem(WORKSPACE_SETTINGS_STORAGE_KEY, JSON.stringify(merged));
+        } catch {
+          // In-memory state is hydrated either way.
+        }
+      })
+      .catch(() => {});
+
+    invoke("app_local_state_load", { key: "agent-launch-defaults" })
+      .then((stored) => {
+        if (cancelled) {
+          return;
+        }
+        if (!hasEntries(stored?.providers ?? stored)) {
+          void invoke("app_local_state_store", {
+            key: "agent-launch-defaults",
+            value: readAgentLaunchDefaultsSettings(),
+          }).catch(() => {});
+          return;
+        }
+        const merged = normalizeAgentLaunchDefaults(stored);
+        setAgentLaunchDefaults(merged);
+        try {
+          window.localStorage.setItem(AGENT_LAUNCH_DEFAULTS_STORAGE_KEY, JSON.stringify(merged));
+        } catch {
+          // In-memory state is hydrated either way.
+        }
+      })
+      .catch(() => {});
+
+    invoke("app_local_state_load", { key: "workspace-lifecycle" })
+      .then((stored) => {
+        if (cancelled) {
+          return;
+        }
+        const storedDefault = typeof stored?.defaultWorkspaceId === "string"
+          ? stored.defaultWorkspaceId.trim()
+          : "";
+        if (!storedDefault) {
+          const local = readWorkspaceLifecycleSettings();
+          if (local.defaultWorkspaceId) {
+            persistWorkspaceLifecycleSettings(local);
+          }
+          return;
+        }
+        setWorkspaceLifecycleSettings((current) => ({
+          ...current,
+          defaultWorkspaceId: storedDefault,
+        }));
+        try {
+          window.localStorage.setItem(WORKSPACE_LIFECYCLE_STORAGE_KEY, JSON.stringify({
+            defaultWorkspaceId: storedDefault,
+            enabledWorkspaceIds: [],
+          }));
+        } catch {
+          // The startup default only matters on the next boot.
+        }
+      })
+      .catch(() => {});
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   useEffect(() => {
     if (!agentStatusCacheHitRef.current) {
       return;
@@ -26010,6 +26185,13 @@ export default function App() {
     }
     loopspacesRef.current = nextLoopspaces;
     setLoopspaces(nextLoopspaces);
+    if (
+      nextLoopspaces.length
+      || loopspaceSnapshotHasSyncState(value)
+      || loopspaceSnapshotHasRemoteResponse(value)
+    ) {
+      setLoopspacesHydrated(true);
+    }
     setSelectedLoopspaceId((currentId) => {
       if (!currentId) {
         selectedLoopspaceIdRef.current = "";
@@ -26068,7 +26250,12 @@ export default function App() {
       }
     };
 
-    loadLoopspaces();
+    setLoopspacesHydrated(false);
+    loadLoopspaces().finally(() => {
+      if (!cancelled) {
+        setLoopspacesHydrated(true);
+      }
+    });
     return () => {
       cancelled = true;
     };
@@ -27033,7 +27220,13 @@ export default function App() {
 
     const nextWidth = Math.round(element.getBoundingClientRect().width || 0);
     setWorkspaceToolLayoutWidth((currentWidth) => (
-      currentWidth === nextWidth ? currentWidth : nextWidth
+      // Dead-band: panel resize()/scrollbar toggles can shift the measured
+      // width by a few px, and that width feeds back into the derived panel
+      // sizes → resize() → measure again. Ignore sub-8px wiggle (real layout
+      // changes — rail collapse, window resize — move far more than that).
+      currentWidth !== 0 && Math.abs(currentWidth - nextWidth) < 8
+        ? currentWidth
+        : nextWidth
     ));
   }, []);
 
@@ -27394,6 +27587,14 @@ export default function App() {
         reason: "workspace_not_found",
         source,
       }, { trace });
+      // A missing workspace can never activate: clear the pending latch so
+      // the "Opening…" splash doesn't wedge waiting on it.
+      if (workspacePendingActivationIdRef.current === safeWorkspaceId) {
+        workspacePendingActivationIdRef.current = "";
+      }
+      setWorkspacePendingActivationId((currentPendingId) => (
+        currentPendingId === safeWorkspaceId ? "" : currentPendingId
+      ));
       return false;
     }
 
@@ -27548,17 +27749,15 @@ export default function App() {
         source,
         token,
       }, { trace });
-      // The activation commit mounts the entire workspace runtime (TerminalView,
-      // panes, tools panel) on top of a full-shell render. As a transition,
-      // React time-slices that render so the click and the pending-activation
-      // state keep painting instead of freezing the shell; the pending badge
-      // clears in the same commit that reveals the runtime.
-      startTransition(() => {
-        setWorkspacePendingActivationId((currentPendingId) => (
-          currentPendingId === safeWorkspaceId ? "" : currentPendingId
-        ));
-        activateWorkspace(safeWorkspaceId, source, trace);
-      });
+      // Restored pre-optimization behavior: activate synchronously. The
+      // time-sliced startTransition variant let steady background updates
+      // interrupt/restart the huge runtime-mount render, which could starve
+      // the activation ("no active workspace" with a selected row) and pin
+      // the webview until WebKit's CPU watchdog killed it.
+      setWorkspacePendingActivationId((currentPendingId) => (
+        currentPendingId === safeWorkspaceId ? "" : currentPendingId
+      ));
+      activateWorkspace(safeWorkspaceId, source, trace);
     };
 
     const scheduleIdleActivation = () => {
@@ -27888,11 +28087,36 @@ export default function App() {
     if (previousPendingActivationId && previousPendingActivationId !== workspace.id) {
       cancelDeferredWorkspaceActivation();
       workspacePendingActivationIdRef.current = "";
-      setWorkspacePendingActivationId("");
       logWorkspaceActivationTrace("workspace.open.rail_select_pending_activation_cancelled", previousPendingActivationId, {
         nextSelectedWorkspaceId: workspace.id,
         previousSelectedWorkspaceId,
       });
+    }
+    // The pending STATE can outlive the ref when an activation commit is lost
+    // (blocked by an in-flight deactivation or a dropped transition). A stale
+    // latch here wedges the whole shell ("No active workspace."), so clear it
+    // by value instead of trusting the ref.
+    setWorkspacePendingActivationId((currentPendingId) => (
+      currentPendingId && currentPendingId !== workspace.id ? "" : currentPendingId
+    ));
+
+    if (
+      transitionKind === "reselect_active_runtime"
+      && spaceModeRef.current === APP_SPACE_MODE_WORKSPACES
+    ) {
+      // Re-clicking the already-selected workspace: skip the full urgent
+      // setState batch — it re-renders the entire shell per click and starves
+      // any in-flight activation transition. Only the cheap, idempotent
+      // cleanups that a reselect can still need run here.
+      setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspace.id));
+      setWorkspaceCreateModalOpen(false);
+      setWorkspaceSettingsModalId("");
+      showView(DEFAULT_WORKSPACE_VIEW, {
+        immediate: true,
+        telemetrySource: "workspace_rail_reselect",
+        telemetryWorkspaceId: workspace.id,
+      });
+      return;
     }
 
     selectedWorkspaceIdRef.current = workspace.id;
@@ -28137,6 +28361,50 @@ export default function App() {
     }
     requestWorkspaceActivation(workspaceId, "workspace_rail_toggle");
   }, [deactivateWorkspace, requestWorkspaceActivation]);
+
+  // Self-healing for the pending-activation latch. An activation commit can
+  // be lost after the splash is already up: activateWorkspace early-returns
+  // while a deactivation holds the terminal lifecycle (its Rust side can run
+  // for up to 30s), and a time-sliced activation transition can be dropped
+  // under urgent-render pressure. Both leave "Opening…" wedged forever. This
+  // watchdog retries once the blocker drains and force-clears the latch if
+  // the workspace still cannot activate within the deadline.
+  useEffect(() => {
+    if (!workspacePendingActivationId) {
+      return undefined;
+    }
+    const pendingWorkspaceId = workspacePendingActivationId;
+    const deadlineAtMs = Date.now() + 60000;
+    const timer = window.setInterval(() => {
+      if (workspaceDeactivationInFlightRef.current && Date.now() < deadlineAtMs) {
+        return;
+      }
+      // Give a legitimately scheduled activation its normal path: the
+      // deferred slot still naming this workspace means rAF/idle + the
+      // transition have not had a chance to run yet.
+      if (deferredWorkspaceActivationRef.current.workspaceId === pendingWorkspaceId
+        && Date.now() < deadlineAtMs) {
+        return;
+      }
+      const activated = Date.now() < deadlineAtMs
+        && selectedWorkspaceIdRef.current === pendingWorkspaceId
+        && activateWorkspace(pendingWorkspaceId, "pending_activation_watchdog");
+      if (!activated) {
+        logWorkspaceActivationTrace("workspace.open.pending_watchdog_cleared", pendingWorkspaceId, {
+          deadlineExceeded: Date.now() >= deadlineAtMs,
+          deactivationInFlight: Boolean(workspaceDeactivationInFlightRef.current),
+          selectedWorkspaceId: selectedWorkspaceIdRef.current,
+        });
+        if (workspacePendingActivationIdRef.current === pendingWorkspaceId) {
+          workspacePendingActivationIdRef.current = "";
+        }
+        setWorkspacePendingActivationId((currentPendingId) => (
+          currentPendingId === pendingWorkspaceId ? "" : currentPendingId
+        ));
+      }
+    }, 1500);
+    return () => window.clearInterval(timer);
+  }, [activateWorkspace, logWorkspaceActivationTrace, workspacePendingActivationId]);
 
   const deleteWorkspaceFromForge = useCallback(async (workspaceId) => {
     const targetWorkspaceId = String(workspaceId || "").trim();
@@ -29820,9 +30088,20 @@ export default function App() {
 
       // Local-first create: mint the id here, commit the row instantly, and
       // let the cloud workspace catalog ack + registration run in background.
+      // A folder that previously hosted a workspace revives its tombstoned id
+      // so settings, threads, and PCB ownership re-link instead of orphaning.
+      let revivedWorkspaceId = "";
+      try {
+        revivedWorkspaceId = String(await invoke("local_workspace_reusable_id_for_root", {
+          scopeKey: activeAccountScopeKey,
+          rootPath: rootDirectory,
+        }) || "").trim();
+      } catch {
+        // Reviving is best-effort; a fresh id is always safe.
+      }
       const nowIso = new Date().toISOString();
       const workspace = {
-        id: mintLocalWorkspaceId(),
+        id: revivedWorkspaceId || mintLocalWorkspaceId(),
         name,
         createdAt: nowIso,
         updatedAt: nowIso,
@@ -32675,6 +32954,15 @@ export default function App() {
         logTerminalStatus("frontend.app_close.error", {
           message: closeError?.message || String(closeError || ""),
         });
+        // The graceful path wedged (e.g. the terminal lifecycle lock is held
+        // by a hung deactivation). The user asked to close: force the exit
+        // instead of silently dropping the overlay and staying open.
+        try {
+          await invoke("app_force_exit_now", { reason: "app_close_graceful_timeout" });
+        } catch {
+          // Force-exit command unavailable (old backend): fall back to the
+          // pre-force behavior of resetting the overlay so the app stays usable.
+        }
         workspaceCloseAllowNativeRef.current = false;
         workspaceCloseInFlightRef.current = false;
         setWorkspaceCloseState(WORKSPACE_CLOSE_INITIAL_STATE);
@@ -32902,6 +33190,12 @@ export default function App() {
     let pendingDemotion = null;
 
     const applySyncStatus = (normalized) => {
+      // Sync-status events repeat identical payloads at high rate during
+      // active syncs; a fresh-but-equal object per event re-rendered the
+      // whole shell each time.
+      if (lastApplied && JSON.stringify(lastApplied) === JSON.stringify(normalized)) {
+        return;
+      }
       lastApplied = normalized;
       setCloudSyncStatus(normalized);
     };
@@ -36848,8 +37142,25 @@ export default function App() {
 
   useEffect(() => {
     const frameId = window.requestAnimationFrame(() => {
-      workspaceToolMainPanelRef.current?.resize?.(`${workspaceMainPanelSize}%`);
-      workspaceToolPanelRef.current?.resize?.(`${workspaceToolPanelSize}%`);
+      // Only issue imperative resizes when the target actually moved: a
+      // same-size resize() still runs the panel-group layout pass and
+      // re-renders every Panel/Separator subscriber, which can feed back
+      // into the measured layout width and loop.
+      const mainPanel = workspaceToolMainPanelRef.current;
+      const toolPanel = workspaceToolPanelRef.current;
+      // react-resizable-panels v4 getSize() returns { asPercentage, inPixels }.
+      const panelPercent = (panel) => {
+        const size = panel?.getSize?.();
+        return typeof size === "number" ? size : Number(size?.asPercentage);
+      };
+      const mainCurrent = panelPercent(mainPanel);
+      const toolCurrent = panelPercent(toolPanel);
+      if (!Number.isFinite(mainCurrent) || Math.abs(mainCurrent - workspaceMainPanelSize) > 0.5) {
+        mainPanel?.resize?.(`${workspaceMainPanelSize}%`);
+      }
+      if (!Number.isFinite(toolCurrent) || Math.abs(toolCurrent - workspaceToolPanelSize) > 0.5) {
+        toolPanel?.resize?.(`${workspaceToolPanelSize}%`);
+      }
     });
 
     return () => window.cancelAnimationFrame(frameId);
@@ -50235,7 +50546,21 @@ export default function App() {
                             />
                           ))}
                           {!loopspaces.length && (
-                            <WorkspaceMuted>No loops</WorkspaceMuted>
+                            loopspacesHydrated ? (
+                              <WorkspaceMuted>No loops</WorkspaceMuted>
+                            ) : (
+                              <>
+                                <RailRowSkeleton aria-hidden="true">
+                                  <span />
+                                  <span />
+                                </RailRowSkeleton>
+                                <RailRowSkeleton aria-hidden="true">
+                                  <span />
+                                  <span />
+                                </RailRowSkeleton>
+                                <WorkspaceMuted role="status">Loading loops…</WorkspaceMuted>
+                              </>
+                            )
                           )}
                         </>
                       ) : (
@@ -52685,10 +53010,13 @@ export default function App() {
 
         {plusUpsellState === "shown" && (
           <PlusUpsellOverlay
+            isWindowFrameExpanded={isWindowFrameExpanded}
             onDismiss={() => setPlusUpsellState("dismissed")}
+            onTitleBarMouseDown={handleTitleBarMouseDown}
             onUpgrade={() => {
               openUrl("https://diffforge.ai/pricing").catch(() => {});
             }}
+            windowPlatform={windowControlPlatform}
           />
         )}
 

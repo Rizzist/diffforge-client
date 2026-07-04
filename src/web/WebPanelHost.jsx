@@ -106,6 +106,9 @@ export default function WebPanelHost() {
   const [agentPromptTargets, setAgentPromptTargets] = useState([]);
   const [defaultAgentPromptTargetIds, setDefaultAgentPromptTargetIds] = useState([]);
   const [windowFocused, setWindowFocused] = useState(readWebPanelDocumentFocused);
+  // Once a return to the grid starts, this window must stop touching the native
+  // webview (the grid is adopting it) — the hook goes silent.
+  const [returningToGrid, setReturningToGrid] = useState(false);
   const viewportRef = useRef(null);
   const agentPromptTargetsRequestIdRef = useRef("");
 
@@ -189,10 +192,12 @@ export default function WebPanelHost() {
         : PANEL_AGENT_PROMPT_WEBVIEW_BOTTOM_INSET
       : 0,
     onNavigate: handleLoadedUrl,
+    suspended: returningToGrid,
     // Adopt the grid pane's living webview (passed via the window URL) instead
     // of loading the page from scratch.
     adoptLabel: params.adoptLabel,
     adoptNonce: params.adoptLabel ? 1 : 0,
+    adoptCurrentUrl: params.url,
     onLabelChange: (label) => {
       nativeLabelRef.current = label;
     },
@@ -478,6 +483,7 @@ export default function WebPanelHost() {
   }, [currentWindow]);
 
   const returnToGrid = useCallback(() => {
+    setReturningToGrid(true);
     emit(WEB_PANEL_CONTROL_EVENT, {
       control: WEB_PANEL_CONTROL_RETURN,
       paneId: params.paneId,
@@ -488,6 +494,11 @@ export default function WebPanelHost() {
       .catch(() => {})
       .finally(() => {
         currentWindow.close().catch(() => {});
+        // A window that survives close() leaves the pane doubled (grid +
+        // window); destroy is the backstop after preserve had time to run.
+        window.setTimeout(() => {
+          currentWindow.destroy().catch(() => {});
+        }, 900);
       });
   }, [currentUrl, currentWindow, params.paneId, windowLabel]);
 
@@ -801,38 +812,28 @@ const HostTopRail = styled(TerminalRestartPill)`
     grid-row: 3;
   }
 
-  @container (max-width: 780px) {
+  /* All buttons share row 1 at every window width (min window width is 480px
+     and the full control set is ~160px; the old 780px container fallback split
+     them onto a second row on ordinary windows). This also neutralizes the
+     inherited TerminalRestartPill 520px fallback, which pushed the secondary
+     controls to their own row. */
+  @container (max-width: 520px) {
     && {
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: start;
+      grid-template-columns: auto minmax(0, 1fr) auto;
+      align-items: center;
     }
 
-    && [data-host-rail-section="identity"] {
-      grid-column: 1;
+    && [data-rail-row="primary"] {
+      grid-column: 3;
       grid-row: 1;
+      width: auto;
     }
 
-    && [data-host-rail-section="primary"] {
+    && [data-rail-row="secondary"] {
       grid-column: 2;
       grid-row: 1;
-    }
-
-    && [data-host-rail-section="nav"] {
-      grid-column: 1 / -1;
-      grid-row: 3;
-    }
-
-    && [data-host-rail-section="secondary"] {
-      grid-column: 1 / -1;
-      grid-row: 2;
-      width: 100%;
-      justify-self: start;
-      flex-wrap: wrap;
-    }
-
-    && [data-host-rail-section="activity"] {
-      grid-column: 1 / -1;
-      grid-row: 4;
+      width: auto;
+      justify-self: end;
     }
   }
 `;

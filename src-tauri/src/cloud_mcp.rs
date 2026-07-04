@@ -248,6 +248,7 @@ struct CloudMcpBackgroundSync {
     pending: Arc<Mutex<HashMap<String, CloudMcpBackgroundSyncJob>>>,
     notify: Arc<tokio::sync::Notify>,
     started: Arc<AtomicBool>,
+    expedited_agent_chat_draining: Arc<AtomicBool>,
     tokenomics_pending: Arc<Mutex<Option<CloudMcpTokenomicsSyncJob>>>,
     tokenomics_notify: Arc<tokio::sync::Notify>,
     tokenomics_started: Arc<AtomicBool>,
@@ -811,6 +812,7 @@ impl CloudMcpState {
                 pending: Arc::new(Mutex::new(HashMap::new())),
                 notify: Arc::new(tokio::sync::Notify::new()),
                 started: Arc::new(AtomicBool::new(false)),
+                expedited_agent_chat_draining: Arc::new(AtomicBool::new(false)),
                 tokenomics_pending: Arc::new(Mutex::new(None)),
                 tokenomics_notify: Arc::new(tokio::sync::Notify::new()),
                 tokenomics_started: Arc::new(AtomicBool::new(false)),
@@ -872,10 +874,7 @@ impl CloudMcpMacosThreadQosGuard {
             } else {
                 None
             };
-            let _ = libc::pthread_set_qos_class_self_np(
-                libc::qos_class_t::QOS_CLASS_UTILITY,
-                0,
-            );
+            let _ = libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0);
             Self { previous }
         }
     }
@@ -884,10 +883,9 @@ impl CloudMcpMacosThreadQosGuard {
 #[cfg(target_os = "macos")]
 impl Drop for CloudMcpMacosThreadQosGuard {
     fn drop(&mut self) {
-        let (restore_class, restore_priority) = self.previous.unwrap_or((
-            libc::qos_class_t::QOS_CLASS_DEFAULT,
-            0,
-        ));
+        let (restore_class, restore_priority) = self
+            .previous
+            .unwrap_or((libc::qos_class_t::QOS_CLASS_DEFAULT, 0));
         let (restore_class, restore_priority) =
             if restore_class as u32 == libc::qos_class_t::QOS_CLASS_UNSPECIFIED as u32 {
                 (libc::qos_class_t::QOS_CLASS_DEFAULT, 0)
@@ -1328,6 +1326,57 @@ fn cloud_mcp_remember_deleted_workspace_id(workspace_id: &str) -> Result<bool, S
     fs::rename(&temp_path, &path)
         .map_err(|error| format!("Unable to finalize deleted workspace ledger: {error}"))?;
     Ok(inserted)
+}
+
+fn cloud_mcp_forget_deleted_workspace_ids(
+    workspace_ids: &HashSet<String>,
+) -> Result<usize, String> {
+    if workspace_ids.is_empty() {
+        return Ok(0);
+    }
+    let mut ids = cloud_mcp_deleted_workspace_ids();
+    let original_len = ids.len();
+    ids.retain(|workspace_id| !workspace_ids.contains(workspace_id));
+    let removed = original_len.saturating_sub(ids.len());
+    if removed == 0 {
+        return Ok(0);
+    }
+
+    let path = cloud_mcp_deleted_workspace_ids_path()
+        .ok_or_else(|| "Unable to resolve deleted workspace ledger path.".to_string())?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Unable to create deleted workspace ledger directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let mut sorted_ids = ids.into_iter().collect::<Vec<_>>();
+    sorted_ids.sort();
+    let payload = json!({
+        "version": 1,
+        "workspace_ids": sorted_ids,
+        "updated_at_ms": cloud_mcp_now_ms(),
+    });
+    let serialized = serde_json::to_vec_pretty(&payload)
+        .map_err(|error| format!("Unable to serialize deleted workspace ledger: {error}"))?;
+    let temp_path = path.with_extension("json.tmp");
+    fs::write(&temp_path, serialized)
+        .map_err(|error| format!("Unable to write deleted workspace ledger: {error}"))?;
+    fs::rename(&temp_path, &path)
+        .map_err(|error| format!("Unable to finalize deleted workspace ledger: {error}"))?;
+    Ok(removed)
+}
+
+fn cloud_mcp_forget_deleted_workspace_id(workspace_id: &str) -> Result<bool, String> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Ok(false);
+    }
+    let ids = HashSet::from([workspace_id.to_string()]);
+    cloud_mcp_forget_deleted_workspace_ids(&ids).map(|removed| removed > 0)
 }
 
 fn cloud_mcp_outbox_db_path() -> Option<PathBuf> {
@@ -4534,6 +4583,86 @@ fn cloud_mcp_outbox_claim_due_rows(limit: usize) -> Result<Vec<CloudMcpOutboxRow
     Ok(values)
 }
 
+fn cloud_mcp_outbox_claim_expedited_agent_chat_rows(
+    limit: usize,
+) -> Result<Vec<CloudMcpOutboxRow>, String> {
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let now = cloud_mcp_now_ms() as i64;
+    conn.execute(
+        &format!(
+            "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+             SET status='in_flight', updated_at_ms=?1
+             WHERE outbox_id IN (
+                SELECT outbox_id
+                FROM {CLOUD_MCP_OUTBOX_TABLE}
+                WHERE status='queued'
+                  AND event_kind=?2
+                  AND attempt_count=0
+                  AND next_attempt_at_ms<=?1
+                ORDER BY priority ASC, created_at_ms ASC, rowid ASC
+                LIMIT ?3
+             )"
+        ),
+        rusqlite::params![
+            now,
+            CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT,
+            limit as i64
+        ],
+    )
+    .map_err(|error| format!("Unable to claim expedited agent chat sync rows: {error}"))?;
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT outbox_id, idempotency_key, event_kind, payload_json, attempt_count
+             FROM {CLOUD_MCP_OUTBOX_TABLE}
+             WHERE status='in_flight'
+               AND updated_at_ms=?2
+               AND event_kind=?3
+               AND attempt_count=0
+             ORDER BY priority ASC, created_at_ms ASC, rowid ASC
+             LIMIT ?1"
+        ))
+        .map_err(|error| format!("Unable to prepare expedited agent chat sync query: {error}"))?;
+    let rows = statement
+        .query_map(
+            rusqlite::params![
+                limit as i64,
+                now,
+                CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT
+            ],
+            cloud_mcp_outbox_row_from_statement_row,
+        )
+        .map_err(|error| format!("Unable to read expedited agent chat sync rows: {error}"))?;
+    let mut values = Vec::new();
+    for row in rows {
+        values.push(
+            row.map_err(|error| format!("Unable to decode expedited agent chat sync row: {error}"))?,
+        );
+    }
+    Ok(values)
+}
+
+fn cloud_mcp_outbox_release_claimed_rows(rows: Vec<CloudMcpOutboxRow>) {
+    if rows.is_empty() {
+        return;
+    }
+    let Ok(conn) = cloud_mcp_open_outbox_conn() else {
+        return;
+    };
+    let now = cloud_mcp_now_ms() as i64;
+    for row in rows {
+        let _ = conn.execute(
+            &format!(
+                "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+                 SET status='queued', updated_at_ms=?1
+                 WHERE outbox_id=?2
+                   AND status='in_flight'"
+            ),
+            rusqlite::params![now, row.outbox_id],
+        );
+    }
+    cloud_mcp_outbox_note_may_have_work();
+}
+
 fn cloud_mcp_outbox_mark_in_flight(row: &CloudMcpOutboxRow) -> Result<(), String> {
     let conn = cloud_mcp_open_outbox_conn()?;
     let now = cloud_mcp_now_ms() as i64;
@@ -6627,8 +6756,8 @@ fn cloud_mcp_agent_chat_mark_session_acked_from_payload(
     });
     let content_hash =
         cloud_mcp_payload_text(payload, &["content_hash", "contentHash", "ch"]).unwrap_or_default();
-    let metadata_hash =
-        cloud_mcp_payload_text(payload, &["metadata_hash", "metadataHash", "mh"]).unwrap_or_default();
+    let metadata_hash = cloud_mcp_payload_text(payload, &["metadata_hash", "metadataHash", "mh"])
+        .unwrap_or_default();
     let payload_hash =
         cloud_mcp_payload_text(payload, &["payload_hash", "payloadHash", "ph"]).unwrap_or_default();
     let idempotency_key =
@@ -7253,8 +7382,10 @@ async fn cloud_mcp_enqueue_background_sync(
         );
         return;
     }
+    let mut queued_agent_chat_row = false;
     match cloud_mcp_outbox_enqueue_event(&event_kind, &payload, priority, &reason) {
         Ok(row) => {
+            queued_agent_chat_row = event_kind == CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT;
             if cloud_mcp_tokenomics_device_packet_kind(&event_kind) {
                 cloud_mcp_record_tokenomics_sync_log(
                     "outbox_queued",
@@ -7324,6 +7455,9 @@ async fn cloud_mcp_enqueue_background_sync(
         }
     }
     state.background_sync.notify.notify_one();
+    if queued_agent_chat_row {
+        cloud_mcp_spawn_expedited_agent_chat_drain(state);
+    }
 }
 
 /// Cheap auth-material probe for the outbox drain: when there is no static
@@ -7341,6 +7475,173 @@ async fn cloud_mcp_auth_material_present(state: &CloudMcpState) -> bool {
 
 const CLOUD_MCP_OUTBOX_AUTH_WAIT_INITIAL_RETRY_MS: u64 = 3_000;
 const CLOUD_MCP_OUTBOX_AUTH_WAIT_MAX_RETRY_MS: u64 = 60_000;
+
+struct CloudMcpOutboxDrainOutcome {
+    had_error: bool,
+}
+
+async fn cloud_mcp_send_claimed_outbox_rows(
+    state: &CloudMcpState,
+    rows: Vec<CloudMcpOutboxRow>,
+    idle_delay_between_rows: bool,
+    release_remaining_on_error: bool,
+) -> CloudMcpOutboxDrainOutcome {
+    let mut had_error = false;
+    let mut rows = rows.into_iter();
+    while let Some(row) = rows.next() {
+        if cloud_mcp_task_event_kind_removed(&row.event_kind) {
+            let response = cloud_mcp_task_event_removed_outbox_response(&row.event_kind);
+            let _ = cloud_mcp_outbox_mark_acked(&row, &response);
+            log_terminal_status_event(
+                "backend.cloud_mcp.outbox.skipped",
+                json!({
+                    "event_kind": row.event_kind,
+                    "outbox_id": row.outbox_id,
+                    "idempotency_key": row.idempotency_key,
+                    "reason": "cloud_task_sync_removed",
+                }),
+            );
+            continue;
+        }
+        if cloud_mcp_tokenomics_device_packet_kind(&row.event_kind) {
+            cloud_mcp_record_tokenomics_sync_log(
+                "outbox_send_start",
+                "active",
+                &row.event_kind,
+                json!({
+                    "event_kind": row.event_kind,
+                    "outbox_id": row.outbox_id,
+                    "idempotency_key": row.idempotency_key,
+                    "attempt_count": row.attempt_count,
+                }),
+            );
+        }
+        let result = cloud_mcp_send_outbox_row_now(state, &row).await;
+        match result {
+            Ok(response) => {
+                let _ = cloud_mcp_outbox_mark_acked(&row, &response);
+                if cloud_mcp_tokenomics_device_packet_kind(&row.event_kind) {
+                    cloud_mcp_record_tokenomics_sync_log(
+                        "outbox_acked",
+                        "synced",
+                        &row.event_kind,
+                        json!({
+                            "event_kind": row.event_kind,
+                            "outbox_id": row.outbox_id,
+                            "idempotency_key": row.idempotency_key,
+                            "cloud_event_id": cloud_mcp_outbox_cloud_event_id(&response),
+                        }),
+                    );
+                }
+                log_terminal_status_event(
+                    "backend.cloud_mcp.outbox.done",
+                    json!({
+                        "event_kind": row.event_kind,
+                        "outbox_id": row.outbox_id,
+                        "idempotency_key": row.idempotency_key,
+                        "response": response,
+                    }),
+                );
+            }
+            Err(error) => {
+                had_error = true;
+                let _ = cloud_mcp_outbox_mark_retry(&row, &error);
+                if cloud_mcp_tokenomics_device_packet_kind(&row.event_kind) {
+                    cloud_mcp_record_tokenomics_sync_log(
+                        "outbox_retry",
+                        "retrying",
+                        &row.event_kind,
+                        json!({
+                            "event_kind": row.event_kind,
+                            "outbox_id": row.outbox_id,
+                            "idempotency_key": row.idempotency_key,
+                            "attempt_count": row.attempt_count,
+                            "error": error,
+                        }),
+                    );
+                }
+                log_terminal_status_event(
+                    "backend.cloud_mcp.outbox.error",
+                    json!({
+                        "error": clean_terminal_telemetry_text(&error),
+                        "event_kind": row.event_kind,
+                        "outbox_id": row.outbox_id,
+                        "idempotency_key": row.idempotency_key,
+                    }),
+                );
+                if release_remaining_on_error {
+                    cloud_mcp_outbox_release_claimed_rows(rows.collect());
+                    break;
+                }
+            }
+        }
+        if idle_delay_between_rows {
+            sleep(Duration::from_millis(
+                CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS,
+            ))
+            .await;
+        }
+    }
+    CloudMcpOutboxDrainOutcome { had_error }
+}
+
+async fn cloud_mcp_drain_expedited_agent_chat_rows(state: CloudMcpState) {
+    cloud_mcp_outbox_recover_stale_in_flight();
+    if !cloud_mcp_auth_material_present(&state).await {
+        return;
+    }
+    let claimed_rows = {
+        let _span = BackendCpuSpan::new("cloud_mcp.background_sync.claim_expedited_agent_chat_rows");
+        cloud_mcp_outbox_claim_expedited_agent_chat_rows(CLOUD_MCP_OUTBOX_DRAIN_LIMIT)
+    };
+    let rows = match claimed_rows {
+        Ok(rows) => rows,
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.outbox.expedited_drain_error",
+                json!({"error": clean_terminal_telemetry_text(&error)}),
+            );
+            return;
+        }
+    };
+    if rows.is_empty() {
+        return;
+    }
+    cloud_mcp_outbox_note_may_have_work();
+    cloud_mcp_emit_sync_status(Some(true));
+    let outcome = cloud_mcp_send_claimed_outbox_rows(&state, rows, false, true).await;
+    if outcome.had_error {
+        state.background_sync.notify.notify_one();
+    }
+}
+
+fn cloud_mcp_spawn_expedited_agent_chat_drain(state: &CloudMcpState) {
+    if state
+        .background_sync
+        .expedited_agent_chat_draining
+        .swap(true, Ordering::SeqCst)
+    {
+        return;
+    }
+    let worker_state = state.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = std::panic::AssertUnwindSafe(cloud_mcp_drain_expedited_agent_chat_rows(
+            worker_state.clone(),
+        ))
+        .catch_unwind()
+        .await;
+        worker_state
+            .background_sync
+            .expedited_agent_chat_draining
+            .store(false, Ordering::SeqCst);
+        if result.is_err() {
+            log_terminal_status_event(
+                "backend.cloud_mcp.outbox.expedited_worker_crashed",
+                json!({ "event_kind": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT }),
+            );
+        }
+    });
+}
 
 async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
     cloud_mcp_outbox_recover_stale_in_flight();
@@ -7377,6 +7678,13 @@ async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
                 break;
             }
             auth_wait_retry_ms = CLOUD_MCP_OUTBOX_AUTH_WAIT_INITIAL_RETRY_MS;
+            if state.global_ws_perma_offline.load(Ordering::SeqCst) {
+                // Explicit offline mode ("Click Reconnect"): park the backlog
+                // quietly until reconnect instead of claiming and failing every
+                // row on a cadence — that spammed retries, sync-status emits,
+                // and the status log while the app idled.
+                break;
+            }
             let mut drained_any = false;
             let claimed_rows = {
                 let _span = BackendCpuSpan::new("cloud_mcp.background_sync.claim_due_rows");
@@ -7392,94 +7700,7 @@ async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
                         let pending = cloud_mcp_outbox_has_pending_rows();
                         cloud_mcp_outbox_note_known_empty(!pending);
                     }
-                    for row in rows {
-                        if cloud_mcp_task_event_kind_removed(&row.event_kind) {
-                            let response =
-                                cloud_mcp_task_event_removed_outbox_response(&row.event_kind);
-                            let _ = cloud_mcp_outbox_mark_acked(&row, &response);
-                            log_terminal_status_event(
-                                "backend.cloud_mcp.outbox.skipped",
-                                json!({
-                                    "event_kind": row.event_kind,
-                                    "outbox_id": row.outbox_id,
-                                    "idempotency_key": row.idempotency_key,
-                                    "reason": "cloud_task_sync_removed",
-                                }),
-                            );
-                            continue;
-                        }
-                        if cloud_mcp_tokenomics_device_packet_kind(&row.event_kind) {
-                            cloud_mcp_record_tokenomics_sync_log(
-                                "outbox_send_start",
-                                "active",
-                                &row.event_kind,
-                                json!({
-                                    "event_kind": row.event_kind,
-                                    "outbox_id": row.outbox_id,
-                                    "idempotency_key": row.idempotency_key,
-                                    "attempt_count": row.attempt_count,
-                                }),
-                            );
-                        }
-                        let result = cloud_mcp_send_outbox_row_now(&state, &row).await;
-                        match result {
-                            Ok(response) => {
-                                let _ = cloud_mcp_outbox_mark_acked(&row, &response);
-                                if cloud_mcp_tokenomics_device_packet_kind(&row.event_kind) {
-                                    cloud_mcp_record_tokenomics_sync_log(
-                                        "outbox_acked",
-                                        "synced",
-                                        &row.event_kind,
-                                        json!({
-                                            "event_kind": row.event_kind,
-                                            "outbox_id": row.outbox_id,
-                                            "idempotency_key": row.idempotency_key,
-                                            "cloud_event_id": cloud_mcp_outbox_cloud_event_id(&response),
-                                        }),
-                                    );
-                                }
-                                log_terminal_status_event(
-                                    "backend.cloud_mcp.outbox.done",
-                                    json!({
-                                        "event_kind": row.event_kind,
-                                        "outbox_id": row.outbox_id,
-                                        "idempotency_key": row.idempotency_key,
-                                        "response": response,
-                                    }),
-                                );
-                            }
-                            Err(error) => {
-                                let _ = cloud_mcp_outbox_mark_retry(&row, &error);
-                                if cloud_mcp_tokenomics_device_packet_kind(&row.event_kind) {
-                                    cloud_mcp_record_tokenomics_sync_log(
-                                        "outbox_retry",
-                                        "retrying",
-                                        &row.event_kind,
-                                        json!({
-                                            "event_kind": row.event_kind,
-                                            "outbox_id": row.outbox_id,
-                                            "idempotency_key": row.idempotency_key,
-                                            "attempt_count": row.attempt_count,
-                                            "error": error,
-                                        }),
-                                    );
-                                }
-                                log_terminal_status_event(
-                                    "backend.cloud_mcp.outbox.error",
-                                    json!({
-                                        "error": clean_terminal_telemetry_text(&error),
-                                        "event_kind": row.event_kind,
-                                        "outbox_id": row.outbox_id,
-                                        "idempotency_key": row.idempotency_key,
-                                    }),
-                                );
-                            }
-                        }
-                        sleep(Duration::from_millis(
-                            CLOUD_MCP_BACKGROUND_SYNC_IDLE_DELAY_MS,
-                        ))
-                        .await;
-                    }
+                    let _ = cloud_mcp_send_claimed_outbox_rows(&state, rows, true, false).await;
                 }
                 Err(error) => {
                     log_terminal_status_event(
@@ -19408,9 +19629,8 @@ fn cloud_mcp_apply_remote_terminal_interrupt_lever(
     ) {
         return false;
     }
-    let workspace_id =
-        cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
-            .unwrap_or_default();
+    let workspace_id = cloud_mcp_remote_command_field_text(event, &["workspace_id", "workspaceId"])
+        .unwrap_or_default();
     let target_terminal_id = cloud_mcp_remote_command_field_text(
         event,
         &[
@@ -19423,12 +19643,10 @@ fn cloud_mcp_apply_remote_terminal_interrupt_lever(
         ],
     )
     .unwrap_or_default();
-    let instance_id = cloud_mcp_remote_command_field_i64(
-        event,
-        &["terminal_instance_id", "terminalInstanceId"],
-    )
-        .and_then(|value| u64::try_from(value).ok())
-        .filter(|value| *value > 0);
+    let instance_id =
+        cloud_mcp_remote_command_field_i64(event, &["terminal_instance_id", "terminalInstanceId"])
+            .and_then(|value| u64::try_from(value).ok())
+            .filter(|value| *value > 0);
     let app = app.clone();
     let state = state.clone();
     let event = event.clone();
@@ -21085,7 +21303,10 @@ async fn cloud_mcp_record_agent_chat_model_config(
     let provider = terminal_normalize_agent_kind(Some(&provider))
         .unwrap_or_else(|| provider.trim().to_ascii_lowercase().replace('-', "_"));
     if !matches!(provider.as_str(), "codex" | "claude" | "opencode") {
-        return Err("Agent chat model config record requires provider codex, claude, or opencode.".to_string());
+        return Err(
+            "Agent chat model config record requires provider codex, claude, or opencode."
+                .to_string(),
+        );
     }
     let provider_session_id = provider_session_id
         .as_deref()
@@ -21100,7 +21321,10 @@ async fn cloud_mcp_record_agent_chat_model_config(
     let session_id = provider_session_id
         .clone()
         .or_else(|| agent_chat_session_id.clone())
-        .ok_or_else(|| "Agent chat model config record requires provider_session_id or agent_chat_session_id.".to_string())?;
+        .ok_or_else(|| {
+            "Agent chat model config record requires provider_session_id or agent_chat_session_id."
+                .to_string()
+        })?;
     let workspace_id = workspace_id.trim().to_string();
     if workspace_id.is_empty() {
         return Err("Agent chat model config record requires workspace_id.".to_string());
@@ -21120,7 +21344,9 @@ async fn cloud_mcp_record_agent_chat_model_config(
         .filter(|value| !value.is_empty())
         .map(|value| value.to_ascii_lowercase());
     if model_id.is_none() && reasoning_effort.is_none() {
-        return Err("Agent chat model config record requires model_id or reasoning_effort.".to_string());
+        return Err(
+            "Agent chat model config record requires model_id or reasoning_effort.".to_string(),
+        );
     }
 
     let now = timestamp
@@ -21211,8 +21437,9 @@ async fn cloud_mcp_record_agent_chat_model_config(
     let idempotency_key = format!(
         "agent-chat-session:model-config:v1:{scope_key}:{device_id}:{workspace_id}:{provider}:{session_id}:{command_id}:{payload_hash}"
     );
-    let provider_session_id_value =
-        provider_session_id.clone().unwrap_or_else(|| session_id.clone());
+    let provider_session_id_value = provider_session_id
+        .clone()
+        .unwrap_or_else(|| session_id.clone());
     let agent_chat_session_id_value = agent_chat_session_id.clone().unwrap_or_default();
     let workspace_name_value = workspace_name.unwrap_or_default();
     let thread_id_value = thread_id.unwrap_or_default();
@@ -21966,12 +22193,13 @@ fn cloud_mcp_live_state_merge_object(target: &mut Value, incoming: Value) {
                     &incoming_workspace,
                     &["terminalListEmptyAuthoritative"],
                     false,
-                )) && cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
-                    &incoming_workspace,
-                    "",
-                    &requested_terminal_clear_reason,
-                    workspace_active,
-                );
+                ))
+                    && cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
+                        &incoming_workspace,
+                        "",
+                        &requested_terminal_clear_reason,
+                        workspace_active,
+                    );
                 if incoming_terminals_empty
                     && (existing_terminals_non_empty || !empty_authoritative)
                     && !empty_authoritative
@@ -22070,8 +22298,7 @@ fn cloud_mcp_compact_terminal_live_state(terminal: &Value, index: usize) -> Valu
             .or_insert_with(|| terminal_id.clone());
         item.entry("pane_id".to_string())
             .or_insert_with(|| terminal_id.clone());
-        item.entry("paneId".to_string())
-            .or_insert(terminal_id);
+        item.entry("paneId".to_string()).or_insert(terminal_id);
     }
     cloud_mcp_compact_insert_value(
         &mut item,
@@ -22139,18 +22366,9 @@ fn cloud_mcp_compact_terminal_live_state(terminal: &Value, index: usize) -> Valu
         ),
         ("readiness", &["readiness"][..]),
         ("turn_status", &["turn_status", "turnStatus"][..]),
-        (
-            "prompt_event_id",
-            &["prompt_event_id", "promptEventId"][..],
-        ),
-        (
-            "user_message",
-            &["user_message", "userMessage"][..],
-        ),
-        (
-            "current_prompt",
-            &["current_prompt", "currentPrompt"][..],
-        ),
+        ("prompt_event_id", &["prompt_event_id", "promptEventId"][..]),
+        ("user_message", &["user_message", "userMessage"][..]),
+        ("current_prompt", &["current_prompt", "currentPrompt"][..]),
         ("last_prompt", &["last_prompt", "lastPrompt"][..]),
         ("commandable", &["commandable"][..]),
         ("connected", &["connected"][..]),
@@ -22296,17 +22514,15 @@ fn cloud_mcp_compact_workspace_live_state(workspace: &Value, index: usize) -> (S
         let requested_terminal_clear_reason =
             cloud_mcp_payload_text(workspace, &["terminal_clear_reason", "terminalClearReason"])
                 .unwrap_or_default();
-        let terminal_empty_authoritative = (cloud_mcp_payload_bool(
-            workspace,
-            &["terminal_list_empty_authoritative"],
-            false,
-        ) || cloud_mcp_payload_bool(workspace, &["terminalListEmptyAuthoritative"], false))
-            && cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
-                workspace,
-                "",
-                &requested_terminal_clear_reason,
-                workspace_active,
-            );
+        let terminal_empty_authoritative =
+            (cloud_mcp_payload_bool(workspace, &["terminal_list_empty_authoritative"], false)
+                || cloud_mcp_payload_bool(workspace, &["terminalListEmptyAuthoritative"], false))
+                && cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
+                    workspace,
+                    "",
+                    &requested_terminal_clear_reason,
+                    workspace_active,
+                );
         if !terminal_values.is_empty() || terminal_empty_authoritative {
             let terminals = terminal_values
                 .into_iter()
@@ -26079,7 +26295,10 @@ fn cloud_mcp_live_text_looks_cumulative_snapshot(cached_text: &str, incoming_tex
         return true;
     }
     let common_prefix = cloud_mcp_common_prefix_len(cached_text, incoming_text);
-    let shorter_len = cached_text.chars().count().min(incoming_text.chars().count());
+    let shorter_len = cached_text
+        .chars()
+        .count()
+        .min(incoming_text.chars().count());
     common_prefix >= 8 && common_prefix * 2 >= shorter_len
 }
 
@@ -26556,8 +26775,7 @@ async fn cloud_mcp_publish_agent_chat_live_delta(
             if is_final {
                 entry.updated_at_ms = payload.observed_at_ms;
             }
-            cached_text_summary =
-                cloud_mcp_agent_stream_text_summary(Some(entry.text.as_str()));
+            cached_text_summary = cloud_mcp_agent_stream_text_summary(Some(entry.text.as_str()));
         }
         if live_text.len() > 512 {
             let stale_keys = live_text
@@ -26622,12 +26840,21 @@ async fn cloud_mcp_publish_agent_chat_live_tool_delta(
         .as_deref()
         .or(payload.provider_turn_id.as_deref())
         .unwrap_or(provider_session_id);
-    let tool_name = cloud_mcp_compact_turn_text(payload.tool_name.as_ref(), 96)
-        .unwrap_or_else(|| if matches!(event_code, "ss" | "se") { "Subtask" } else { "Tool" }.to_string());
-    let call_id = cloud_mcp_compact_turn_text(payload.tool_use_id.as_ref(), 160).unwrap_or_default();
+    let tool_name =
+        cloud_mcp_compact_turn_text(payload.tool_name.as_ref(), 96).unwrap_or_else(|| {
+            if matches!(event_code, "ss" | "se") {
+                "Subtask"
+            } else {
+                "Tool"
+            }
+            .to_string()
+        });
+    let call_id =
+        cloud_mcp_compact_turn_text(payload.tool_use_id.as_ref(), 160).unwrap_or_default();
     let asp_event_type =
         cloud_mcp_agent_turn_asp_event_type(event_code, payload, state_value, turn_status);
-    let item_id = cloud_mcp_agent_turn_asp_item_id(stream_key, turn_id, event_code, payload, "tool");
+    let item_id =
+        cloud_mcp_agent_turn_asp_item_id(stream_key, turn_id, event_code, payload, "tool");
     let status = match event_code {
         "xf" => "failed",
         "xe" | "se" => "completed",
@@ -27098,7 +27325,11 @@ async fn cloud_mcp_publish_agent_turn_event_now(
         data["toolInput"] = tool_input.clone();
         data["tool_input"] = tool_input.clone();
     }
-    if let Some(tool_output) = payload.tool_output.as_ref().filter(|value| !value.is_null()) {
+    if let Some(tool_output) = payload
+        .tool_output
+        .as_ref()
+        .filter(|value| !value.is_null())
+    {
         data["toolOutput"] = tool_output.clone();
         data["tool_output"] = tool_output.clone();
     }
@@ -27123,8 +27354,9 @@ async fn cloud_mcp_publish_agent_turn_event_now(
         }
     }
     if prompt_submission {
-        if let Some(user_message) = cloud_mcp_compact_turn_text(payload.user_message.as_ref(), 12_000)
-            .or_else(|| cloud_mcp_compact_turn_text(payload.message.as_ref(), 12_000))
+        if let Some(user_message) =
+            cloud_mcp_compact_turn_text(payload.user_message.as_ref(), 12_000)
+                .or_else(|| cloud_mcp_compact_turn_text(payload.message.as_ref(), 12_000))
         {
             data["um"] = json!(user_message.as_str());
             data["user_message"] = json!(user_message.as_str());
@@ -27277,8 +27509,8 @@ async fn cloud_mcp_publish_agent_turn_event_now(
         )
         .await;
     }
-	    let turn_is_final = matches!(turn_status, "completed" | "interrupted" | "failed")
-	        || matches!(state_value, "idle" | "error" | "interrupted");
+    let turn_is_final = matches!(turn_status, "completed" | "interrupted" | "failed")
+        || matches!(state_value, "idle" | "error" | "interrupted");
     if matches!(event_code, "xs" | "xe" | "xf" | "ss" | "se") {
         cloud_mcp_publish_agent_chat_live_tool_delta(
             state,
@@ -27292,8 +27524,8 @@ async fn cloud_mcp_publish_agent_turn_event_now(
         )
         .await;
     }
-	    if event_code == "md"
-	        || payload.live_text_delta.is_some()
+    if event_code == "md"
+        || payload.live_text_delta.is_some()
         || payload.live_text_snapshot.is_some()
         || turn_is_final
     {
@@ -27702,9 +27934,16 @@ fn cloud_mcp_workspace_explicit_active_state(workspace: &Value) -> Option<bool> 
                 return Some(false);
             }
             if ["1", "true", "yes", "on"].contains(&token.as_str())
-                || ["active", "connected", "online", "ready", "running", "starting"]
-                    .iter()
-                    .any(|needle| token.contains(needle))
+                || [
+                    "active",
+                    "connected",
+                    "online",
+                    "ready",
+                    "running",
+                    "starting",
+                ]
+                .iter()
+                .any(|needle| token.contains(needle))
             {
                 return Some(true);
             }
@@ -27737,9 +27976,16 @@ fn cloud_mcp_workspace_explicit_active_state(workspace: &Value) -> Option<bool> 
     {
         return Some(false);
     }
-    if ["active", "connected", "online", "ready", "running", "starting"]
-        .iter()
-        .any(|needle| status.contains(needle))
+    if [
+        "active",
+        "connected",
+        "online",
+        "ready",
+        "running",
+        "starting",
+    ]
+    .iter()
+    .any(|needle| status.contains(needle))
     {
         return Some(true);
     }
@@ -27760,12 +28006,22 @@ fn cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
             requested,
         );
     }
-    let workspace_clear_reason =
-        cloud_mcp_payload_text(workspace, &["workspace_clear_reason", "workspaceClearReason"])
-            .unwrap_or_default();
-    let workspace_event_reason =
-        cloud_mcp_payload_text(workspace, &["reason", "event_kind", "eventKind", "event_type", "eventType"])
-            .unwrap_or_default();
+    let workspace_clear_reason = cloud_mcp_payload_text(
+        workspace,
+        &["workspace_clear_reason", "workspaceClearReason"],
+    )
+    .unwrap_or_default();
+    let workspace_event_reason = cloud_mcp_payload_text(
+        workspace,
+        &[
+            "reason",
+            "event_kind",
+            "eventKind",
+            "event_type",
+            "eventType",
+        ],
+    )
+    .unwrap_or_default();
     [
         requested,
         snapshot_reason,
@@ -27812,12 +28068,22 @@ fn cloud_mcp_workspace_panel_empty_clear_is_explicit(
     workspace_active: bool,
 ) -> bool {
     if !workspace_active {
-        let workspace_clear_reason =
-            cloud_mcp_payload_text(workspace, &["workspace_clear_reason", "workspaceClearReason"])
-                .unwrap_or_default();
-        let workspace_event_reason =
-            cloud_mcp_payload_text(workspace, &["reason", "event_kind", "eventKind", "event_type", "eventType"])
-                .unwrap_or_default();
+        let workspace_clear_reason = cloud_mcp_payload_text(
+            workspace,
+            &["workspace_clear_reason", "workspaceClearReason"],
+        )
+        .unwrap_or_default();
+        let workspace_event_reason = cloud_mcp_payload_text(
+            workspace,
+            &[
+                "reason",
+                "event_kind",
+                "eventKind",
+                "event_type",
+                "eventType",
+            ],
+        )
+        .unwrap_or_default();
         return [
             requested_panel_clear_reason,
             snapshot_reason,
@@ -30710,6 +30976,9 @@ async fn cloud_mcp_reconnect_now(
     state.global_ws_perma_offline.store(false, Ordering::SeqCst);
     cloud_mcp_reconnect_window_reset(state);
     state.global_ws_reconnect.notify_waiters();
+    // Wake the parked background-sync worker so the offline backlog drains
+    // as soon as the user reconnects.
+    state.background_sync.notify.notify_one();
     cloud_mcp_connect_state(state).await
 }
 
@@ -32128,12 +32397,13 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         let requested_terminal_clear_reason =
             cloud_mcp_payload_text(workspace, &["terminal_clear_reason", "terminalClearReason"])
                 .unwrap_or_default();
-        let terminal_empty_clear_explicit = cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
-            workspace,
-            &reason,
-            &requested_terminal_clear_reason,
-            workspace_active,
-        );
+        let terminal_empty_clear_explicit =
+            cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
+                workspace,
+                &reason,
+                &requested_terminal_clear_reason,
+                workspace_active,
+            );
         let mut terminal_list_last_known_fallback = false;
         if terminals.is_empty() && !terminal_empty_clear_explicit {
             if let Some(cached) = cached_last_known_terminals.get(&workspace_id) {
@@ -32322,9 +32592,10 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
             ],
         )
         .unwrap_or(workspace_index as u64);
-        let terminal_list_authoritative =
-            !terminal_list_last_known_fallback && (!terminals.is_empty() || terminal_empty_clear_explicit);
-        let terminal_list_empty_authoritative = terminals.is_empty() && terminal_empty_clear_explicit;
+        let terminal_list_authoritative = !terminal_list_last_known_fallback
+            && (!terminals.is_empty() || terminal_empty_clear_explicit);
+        let terminal_list_empty_authoritative =
+            terminals.is_empty() && terminal_empty_clear_explicit;
         let panel_list_authoritative =
             !panel_list_last_known_fallback && (!panels.is_empty() || panel_empty_clear_explicit);
         let panel_list_empty_authoritative = panels.is_empty() && panel_empty_clear_explicit;
@@ -33723,6 +33994,96 @@ fn cloud_mcp_restore_empty_workspace_snapshot_after_delete(
             source, reason, count_kind,
         ));
     }
+}
+
+fn cloud_mcp_post_workspace_revived_events(state: CloudMcpState, workspaces: Vec<Value>) {
+    if workspaces.is_empty() {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        for workspace in workspaces {
+            let workspace_id =
+                cloud_mcp_payload_text(&workspace, &["id", "workspace_id", "workspaceId"])
+                    .unwrap_or_default();
+            if workspace_id.trim().is_empty() {
+                continue;
+            }
+            if let Err(error) = cloud_mcp_post_workspace_revived_event(&state, &workspace).await {
+                log_terminal_status_event(
+                    "backend.cloud_mcp.workspace_revived_post_failed",
+                    json!({
+                        "workspaceId": workspace_id,
+                        "error": error,
+                    }),
+                );
+            }
+        }
+    });
+}
+
+async fn cloud_mcp_post_workspace_revived_event(
+    state: &CloudMcpState,
+    workspace: &Value,
+) -> Result<Value, String> {
+    let workspace_id = cloud_mcp_payload_text(workspace, &["id", "workspace_id", "workspaceId"])
+        .ok_or_else(|| "Workspace revive requires a workspace id.".to_string())?;
+    let workspace_name =
+        cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"])
+            .unwrap_or_else(|| workspace_id.clone());
+    let root_text = cloud_mcp_payload_text(
+        workspace,
+        &[
+            "rootDirectory",
+            "root_directory",
+            "workspaceRoot",
+            "workspace_root",
+            "repoPath",
+            "repo_path",
+        ],
+    );
+    let root = root_text
+        .as_deref()
+        .and_then(|root| resolve_workspace_root_directory(Some(root)).ok());
+    let repo_id = root
+        .as_ref()
+        .map(|root| cloud_mcp_repo_id_for_root(root))
+        .or_else(|| cloud_mcp_payload_text(workspace, &["repo_id", "repoId"]));
+    let repo_ids = repo_id.iter().cloned().collect::<Vec<_>>();
+    let root_display = root
+        .as_ref()
+        .map(|root| workspace_path_display(root))
+        .or_else(|| root_text.clone());
+    let workspace_location_fingerprint = root
+        .as_ref()
+        .map(|root| cloud_mcp_workspace_location_fingerprint(root));
+    let device_profile = cloud_mcp_desktop_device_profile();
+    let payload = json!({
+        "source": "rust-diffforge-workspace-revive",
+        "event_kind": "workspace_revived",
+        "repo_id": repo_id,
+        "repo_ids": repo_ids,
+        "workspace_id": workspace_id,
+        "workspace_name": workspace_name,
+        "workspace_location_fingerprint": workspace_location_fingerprint,
+        "workspace_root": root_display,
+        "device": device_profile.clone(),
+        "device_id": device_profile["device_id"].clone(),
+        "device_name": device_profile["device_name"].clone(),
+        "machine_id": device_profile["device_id"].clone(),
+        "machine_name": device_profile["machine_name"].clone(),
+        "platform": device_profile["platform"].clone(),
+        "form_factor": device_profile["form_factor"].clone(),
+        "client_kind": device_profile["client_kind"].clone(),
+        "agent_id": "rust-diffforge",
+        "agent_label": "Diff Forge Desktop",
+        "reason": "workspace_revive",
+        "summary": "Desktop workspace revived in Diff Forge.",
+        "ts_ms": cloud_mcp_now_ms(),
+    });
+    let _ = state
+        .global_ws_events
+        .send(cloud_mcp_event_envelope("workspace_revived", &payload));
+    cloud_mcp_post_event_endpoint(state, "workspace_revived", &payload).await
 }
 
 #[tauri::command]
@@ -42199,12 +42560,9 @@ async fn cloud_mcp_unpublish_account_asset(
         object.insert("asset_id".to_string(), json!(asset_id));
         object.insert("assetId".to_string(), json!(asset_id));
     }
-    let response = cloud_mcp_post_json_endpoint(
-        state.inner(),
-        "/v1/assets/unpublish-public",
-        &payload,
-    )
-    .await?;
+    let response =
+        cloud_mcp_post_json_endpoint(state.inner(), "/v1/assets/unpublish-public", &payload)
+            .await?;
     let data = response.get("data").cloned().unwrap_or(response);
     cloud_mcp_update_asset_library_from_response(
         "asset_unpublish_public",
@@ -43341,10 +43699,7 @@ fn cloud_mcp_asset_cache_rebuild_table(
     conn.execute_batch("SAVEPOINT asset_cache_schema_migration;")?;
     let result = (|| -> rusqlite::Result<()> {
         conn.execute(&format!("DROP TABLE IF EXISTS {backup_table}"), [])?;
-        conn.execute(
-            &format!("ALTER TABLE {table} RENAME TO {backup_table}"),
-            [],
-        )?;
+        conn.execute(&format!("ALTER TABLE {table} RENAME TO {backup_table}"), [])?;
         conn.execute(
             &format!("CREATE TABLE {table}({})", column_defs.join(", ")),
             [],
@@ -43451,11 +43806,7 @@ fn cloud_mcp_asset_library_prepare_core_tables(
         ("base_url", "base_url TEXT NOT NULL DEFAULT ''", "''"),
         ("direction", "direction TEXT NOT NULL DEFAULT ''", "''"),
         ("status", "status TEXT NOT NULL DEFAULT ''", "''"),
-        (
-            "bytes_total",
-            "bytes_total INTEGER NOT NULL DEFAULT 0",
-            "0",
-        ),
+        ("bytes_total", "bytes_total INTEGER NOT NULL DEFAULT 0", "0"),
         ("bytes_done", "bytes_done INTEGER NOT NULL DEFAULT 0", "0"),
         ("updated_at", "updated_at TEXT NOT NULL DEFAULT ''", "''"),
         (
@@ -52157,10 +52508,7 @@ mod cloud_mcp_tests {
             }),
         );
 
-        assert_eq!(
-            target["terminals"].as_array().map(Vec::len),
-            Some(1),
-        );
+        assert_eq!(target["terminals"].as_array().map(Vec::len), Some(1),);
 
         cloud_mcp_live_state_merge_object(
             &mut target,
@@ -52173,10 +52521,7 @@ mod cloud_mcp_tests {
             }),
         );
 
-        assert_eq!(
-            target["terminals"].as_array().map(Vec::len),
-            Some(1),
-        );
+        assert_eq!(target["terminals"].as_array().map(Vec::len), Some(1),);
 
         cloud_mcp_live_state_merge_object(
             &mut target,
@@ -52189,10 +52534,7 @@ mod cloud_mcp_tests {
             }),
         );
 
-        assert_eq!(
-            target["terminals"].as_array().map(Vec::len),
-            Some(0),
-        );
+        assert_eq!(target["terminals"].as_array().map(Vec::len), Some(0),);
     }
 
     #[test]
@@ -52202,36 +52544,42 @@ mod cloud_mcp_tests {
             "terminal_clear_reason": "all_terminals_closed",
         });
 
-        assert!(!cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
-            &inactive_workspace,
-            "device_workspaces_changed",
-            "all_terminals_closed",
-            false,
-        ));
+        assert!(
+            !cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
+                &inactive_workspace,
+                "device_workspaces_changed",
+                "all_terminals_closed",
+                false,
+            )
+        );
 
         let active_workspace = json!({
             "workspace_active": true,
             "terminal_clear_reason": "all_terminals_closed",
         });
 
-        assert!(cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
-            &active_workspace,
-            "device_workspaces_changed",
-            "all_terminals_closed",
-            true,
-        ));
+        assert!(
+            cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
+                &active_workspace,
+                "device_workspaces_changed",
+                "all_terminals_closed",
+                true,
+            )
+        );
 
         let deleted_workspace = json!({
             "workspace_active": false,
             "workspace_clear_reason": "workspace_deleted",
         });
 
-        assert!(cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
-            &deleted_workspace,
-            "device_workspaces_changed",
-            "",
-            false,
-        ));
+        assert!(
+            cloud_mcp_workspace_inactive_terminal_empty_clear_is_explicit(
+                &deleted_workspace,
+                "device_workspaces_changed",
+                "",
+                false,
+            )
+        );
     }
 
     #[test]
@@ -57081,6 +57429,66 @@ mod cloud_mcp_tests {
             .unwrap();
         assert_eq!(session_rows, 0);
         assert_eq!(record_rows, 0);
+        drop(conn);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn expedited_agent_chat_claim_selects_only_first_attempt_chat_rows() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let root = test_cloud_root("agent-chat-expedited-claim");
+        let data_root = root.join("data");
+        let cache_root = root.join("cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let conn = cloud_mcp_open_outbox_conn().unwrap();
+        let now = cloud_mcp_now_ms() as i64;
+        for (outbox_id, event_kind, attempt_count) in [
+            ("chat-first", CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT, 0),
+            ("chat-retry", CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT, 1),
+            ("live-first", "device_live_state_snapshot", 0),
+        ] {
+            conn.execute(
+                &format!(
+                    "INSERT INTO {CLOUD_MCP_OUTBOX_TABLE}(
+                        outbox_id, idempotency_key, coalesce_key, event_kind, priority,
+                        payload_hash, payload_json, status, attempt_count, next_attempt_at_ms,
+                        last_error, cloud_event_id, response_json, created_at_ms, updated_at_ms, acked_at_ms
+                     ) VALUES(?1, ?2, '', ?3, 0, ?4, '{{}}', 'queued', ?5, 0, '', '', '', ?6, ?6, 0)"
+                ),
+                rusqlite::params![
+                    outbox_id,
+                    format!("idem-{outbox_id}"),
+                    event_kind,
+                    format!("hash-{outbox_id}"),
+                    attempt_count,
+                    now,
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let rows = cloud_mcp_outbox_claim_expedited_agent_chat_rows(24).unwrap();
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].outbox_id, "chat-first");
+        let conn = cloud_mcp_open_outbox_conn().unwrap();
+        let statuses = ["chat-first", "chat-retry", "live-first"]
+            .into_iter()
+            .map(|outbox_id| {
+                conn.query_row(
+                    &format!("SELECT status FROM {CLOUD_MCP_OUTBOX_TABLE} WHERE outbox_id=?1"),
+                    rusqlite::params![outbox_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, vec!["in_flight", "queued", "queued"]);
         drop(conn);
         let _ = fs::remove_dir_all(root);
     }

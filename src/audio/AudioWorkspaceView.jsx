@@ -8798,8 +8798,12 @@ export function AudioWidgetWindow() {
       status: AUDIO_TRANSCRIPTION_STATUS_INSERTED,
     }).catch(() => {});
     try {
-      await invoke("insert_handsfree_transcribed_text", { text: pending.entry.text });
-      setMessage("Inserted into target");
+      const insertResult = await invoke("insert_handsfree_transcribed_text", { text: pending.entry.text });
+      if (insertResult?.method === "none") {
+        setMessage("No text field focused — saved to Audio tab");
+      } else {
+        setMessage("Inserted into target");
+      }
     } catch (insertError) {
       setMessage("Sent to Audio tab");
       setError(getErrorMessage(insertError, "Transcript saved, but focused insertion failed."));
@@ -9178,13 +9182,17 @@ export function AudioWidgetWindow() {
 
       try {
         setMessage("Inserting into target");
-        await invoke("insert_handsfree_transcribed_text", {
+        const insertResult = await invoke("insert_handsfree_transcribed_text", {
           text: nextTranscript,
         });
         if (recordingRunRef.current !== recordingRunId) {
           return;
         }
-        setMessage("Inserted into target");
+        if (insertResult?.method === "none") {
+          setMessage("No text field focused — saved to Audio tab");
+        } else {
+          setMessage("Inserted into target");
+        }
       } catch (insertError) {
         if (recordingRunRef.current !== recordingRunId) {
           return;

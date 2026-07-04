@@ -158,7 +158,9 @@ fn web_panel_open(
         .collect::<String>();
     let label = web_panel_label(&pane_text);
 
-    if let Some(window) = app.get_webview_window(&label) {
+    // NOT get_webview_window: once a page webview is attached as a child, the
+    // window fails is_webview_window() (labels differ) and lookups return None.
+    if let Some(window) = app.get_window(&label) {
         let _ = window.show();
         let _ = window.set_focus();
         return Ok(WebPanelOpenResult { label });
@@ -223,9 +225,12 @@ fn web_panel_open(
 #[tauri::command]
 fn web_panel_focus(app: AppHandle, label: String) -> Result<bool, String> {
     validate_web_panel_label(&label)?;
-    let Some(window) = app.get_webview_window(&label) else {
+    // get_window, NOT get_webview_window: a web panel hosting a child page
+    // webview never passes is_webview_window(), so that lookup returns None.
+    let Some(window) = app.get_window(&label) else {
         return Ok(false);
     };
+    let _ = window.unminimize();
     let _ = window.show();
     let _ = window.set_focus();
     Ok(true)
@@ -234,8 +239,25 @@ fn web_panel_focus(app: AppHandle, label: String) -> Result<bool, String> {
 #[tauri::command]
 fn web_panel_close(app: AppHandle, label: String) -> Result<(), String> {
     validate_web_panel_label(&label)?;
-    if let Some(window) = app.get_webview_window(&label) {
+    // get_window, NOT get_webview_window: a web panel hosting a child page
+    // webview never passes is_webview_window(), so that lookup returns None —
+    // which made this command a silent no-op exactly when a page was loaded
+    // (the "window survives Return to Grid" bug).
+    if let Some(window) = app.get_window(&label) {
         let _ = window.close();
+        // A web panel window that survives close() leaves the pane doubled
+        // (grid + window). close() already ran the CloseRequested preserve
+        // guard, so any child webview is safe in the main window; destroy is
+        // the backstop for a window that ignored the close request.
+        let app_for_destroy = app.clone();
+        let label_for_destroy = label.clone();
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+            if let Some(window) = app_for_destroy.get_window(&label_for_destroy) {
+                preserve_web_panel_child_webviews(&app_for_destroy, &label_for_destroy, "");
+                let _ = window.destroy();
+            }
+        });
     } else {
         emit_web_panel_closed(&app, &label, "");
     }

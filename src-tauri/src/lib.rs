@@ -1,7 +1,7 @@
 #![recursion_limit = "512"]
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     env, fs,
     io::{BufRead, Read, SeekFrom, Write},
     net::ToSocketAddrs,
@@ -34,7 +34,7 @@ use tauri_plugin_notification::NotificationExt;
 use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::{mpsc, oneshot, Mutex, RwLock},
+    sync::{mpsc, oneshot, Mutex, OwnedMutexGuard, RwLock},
     time::{sleep, timeout},
 };
 use tokio_tungstenite::{
@@ -138,6 +138,12 @@ const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DEPTH: usize = 2;
 const WORKSPACE_PROJECT_MOUNT_SCAN_ROOT_FANOUT: usize = 100;
 const WORKSPACE_PROJECT_MOUNT_SCAN_CHILD_FANOUT: usize = 20;
 const WORKSPACE_PROJECT_MOUNT_SCAN_MAX_DIRECTORIES: usize = 500;
+const PROD_BUNDLE_IDENTIFIER: &str = "ai.diffforge.desktop";
+const DEV_BUNDLE_IDENTIFIER: &str = "ai.diffforge.desktop.dev";
+const DEVICE_APP_STATE_DIR: &str = "app-state";
+const DEVICE_WORKSPACE_CATALOG_DIR: &str = "workspace-catalog";
+const DEVICE_DATA_MIGRATION_LOCK_STALE_SECS: u64 = 30 * 60;
+const LOCAL_WORKSPACE_TOMBSTONE_RETENTION_MS: u64 = 90 * 24 * 60 * 60 * 1000;
 const WORKSPACE_PROJECT_MOUNT_CACHE_TTL_MS: u64 = 60_000;
 const MAX_WORKSPACE_FILE_READ_BYTES: u64 = 1024 * 1024;
 const MAX_WORKSPACE_IMAGE_PREVIEW_BYTES: u64 = 10 * 1024 * 1024;
@@ -157,6 +163,9 @@ const APP_CLOSE_EXIT_REQUEST_DELAY_MS: u64 = 50;
 const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
 const APP_CLOSE_FORCE_EXIT_FALLBACK_DELAY_MS: u64 = 45_000;
+const APP_SHUTDOWN_LIFECYCLE_LOCK_TIMEOUT_SECS: u64 = 10;
+const WORKSPACE_DEACTIVATE_TERMINAL_TIMEOUT_SECS: u64 = 25;
+const TERMINAL_CLOSE_ALL_LIFECYCLE_TIMEOUT_SECS: u64 = 25;
 const APP_SHUTDOWN_PHASE_RUNNING: u8 = 0;
 const APP_SHUTDOWN_PHASE_QUIESCING: u8 = 1;
 const APP_SHUTDOWN_PHASE_STOPPING_WATCHERS: u8 = 2;
@@ -292,6 +301,7 @@ const WHISPER_MODEL_OPTIONS: &[WhisperModelDefinition] = &[
 static APP_PANIC_LOG_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
 static APP_CLOSE_SHUTDOWN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static APP_CLOSE_FORCE_EXIT_SCHEDULED: AtomicBool = AtomicBool::new(false);
+static APP_CLOSE_FORCE_EXIT_STARTED: AtomicBool = AtomicBool::new(false);
 static APP_SHUTDOWN_PHASE: AtomicU8 = AtomicU8::new(APP_SHUTDOWN_PHASE_RUNNING);
 static TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static THREAD_BRIDGE_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
@@ -2924,6 +2934,11 @@ fn voice_orchestrator_diagnostics_enabled() -> bool {
         .unwrap_or(true)
 }
 
+/// Size cap for terminal-statuses.jsonl: on overflow the current file rotates
+/// to `<name>.1` (replacing any previous rotation) so the always-on status log
+/// can never grow unbounded (it had reached 722 MB in the wild).
+const TERMINAL_STATUS_LOG_MAX_BYTES: u64 = 32 * 1024 * 1024;
+
 fn write_terminal_status_log_entry(entry: Value) {
     if !TERMINAL_STATUS_LOGGING_ENABLED {
         return;
@@ -2942,6 +2957,14 @@ fn write_terminal_status_log_entry(entry: Value) {
     let Ok(_guard) = lock.lock() else {
         return;
     };
+
+    if fs::metadata(&log_path)
+        .map(|metadata| metadata.len() >= TERMINAL_STATUS_LOG_MAX_BYTES)
+        .unwrap_or(false)
+    {
+        let rotated = log_path.with_extension("jsonl.1");
+        let _ = fs::rename(&log_path, rotated);
+    }
 
     let Ok(mut file) = fs::OpenOptions::new()
         .create(true)
@@ -3376,7 +3399,7 @@ fn schedule_app_exit_after_terminal_shutdown(
 
             thread::sleep(Duration::from_millis(APP_CLOSE_DESTROY_FALLBACK_DELAY_MS));
 
-            if let Some(window) = app_for_exit.get_webview_window(&window_label) {
+            if let Some(window) = app_for_exit.get_window(&window_label) {
                 let _ = window.destroy();
             }
 
@@ -3390,43 +3413,152 @@ fn schedule_app_exit_after_terminal_shutdown(
         .map_err(|error| format!("Failed to schedule app close: {error}"))
 }
 
+fn mark_app_force_exit_scheduled(flag: &AtomicBool) -> bool {
+    flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+fn mark_app_force_exit_started(flag: &AtomicBool) -> bool {
+    flag.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+fn normalize_app_force_exit_reason(reason: Option<String>, fallback: &str) -> String {
+    reason
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(clean_terminal_telemetry_text)
+        .unwrap_or_else(|| fallback.to_string())
+}
+
+fn run_app_force_exit_tail(app_for_exit: AppHandle, window_label: Option<String>, reason: String) {
+    if !mark_app_force_exit_started(&APP_CLOSE_FORCE_EXIT_STARTED) {
+        return;
+    }
+
+    log_terminal_crash_forensics_event(
+        "backend.app_force_exit.start",
+        json!({
+            "reason": reason,
+            "window_label": window_label.as_deref().unwrap_or(""),
+        }),
+    );
+    cloud_mcp_send_shutdown_goodbye_blocking();
+    let _ = close_workspace_webviews(&app_for_exit);
+    advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_EXITING);
+    cleanup_windows_headless_console_hosts();
+    app_for_exit.exit(0);
+
+    thread::sleep(Duration::from_millis(APP_CLOSE_DESTROY_FALLBACK_DELAY_MS));
+
+    if let Some(window_label) = window_label.as_deref() {
+        if let Some(window) = app_for_exit.get_window(window_label) {
+            let _ = window.destroy();
+        }
+    }
+
+    thread::sleep(Duration::from_millis(
+        APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS,
+    ));
+    cleanup_windows_headless_console_hosts();
+    std::process::exit(0);
+}
+
+fn spawn_app_force_exit_thread(
+    app_for_exit: AppHandle,
+    window_label: Option<String>,
+    delay: Duration,
+    thread_name: &'static str,
+    reason: String,
+) -> Result<(), String> {
+    thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            if delay > Duration::from_millis(0) {
+                thread::sleep(delay);
+            }
+            run_app_force_exit_tail(app_for_exit, window_label, reason);
+        })
+        .map(|_| ())
+        .map_err(|error| format!("Failed to schedule app force exit: {error}"))
+}
+
 fn schedule_app_force_exit(app_for_exit: AppHandle, window_label: String) -> Result<(), String> {
-    if APP_CLOSE_FORCE_EXIT_SCHEDULED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
+    if !mark_app_force_exit_scheduled(&APP_CLOSE_FORCE_EXIT_SCHEDULED) {
         return Ok(());
     }
 
-    match thread::Builder::new()
-        .name("diffforge-app-close-watchdog".to_string())
-        .spawn(move || {
-            thread::sleep(Duration::from_millis(
-                APP_CLOSE_FORCE_EXIT_FALLBACK_DELAY_MS,
-            ));
-            cloud_mcp_send_shutdown_goodbye_blocking();
-            let _ = close_workspace_webviews(&app_for_exit);
-            advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_EXITING);
-            cleanup_windows_headless_console_hosts();
-            app_for_exit.exit(0);
-
-            thread::sleep(Duration::from_millis(APP_CLOSE_DESTROY_FALLBACK_DELAY_MS));
-
-            if let Some(window) = app_for_exit.get_webview_window(&window_label) {
-                let _ = window.destroy();
-            }
-
-            thread::sleep(Duration::from_millis(
-                APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS,
-            ));
-            cleanup_windows_headless_console_hosts();
-            std::process::exit(0);
-        }) {
-        Ok(_) => Ok(()),
+    match spawn_app_force_exit_thread(
+        app_for_exit,
+        Some(window_label),
+        Duration::from_millis(APP_CLOSE_FORCE_EXIT_FALLBACK_DELAY_MS),
+        "diffforge-app-close-watchdog",
+        "watchdog".to_string(),
+    ) {
+        Ok(()) => Ok(()),
         Err(error) => {
             APP_CLOSE_FORCE_EXIT_SCHEDULED.store(false, Ordering::Release);
-            Err(format!("Failed to schedule app close watchdog: {error}"))
+            Err(error)
         }
+    }
+}
+
+async fn lock_lifecycle_with_timeout(
+    lifecycle_lock: Arc<Mutex<()>>,
+    timeout_duration: Duration,
+) -> Option<OwnedMutexGuard<()>> {
+    timeout(timeout_duration, lifecycle_lock.lock_owned())
+        .await
+        .ok()
+}
+
+#[cfg(test)]
+mod app_shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn app_force_exit_schedule_marker_is_idempotent() {
+        let scheduled = AtomicBool::new(false);
+
+        assert!(mark_app_force_exit_scheduled(&scheduled));
+        assert!(!mark_app_force_exit_scheduled(&scheduled));
+
+        scheduled.store(false, Ordering::Release);
+        assert!(mark_app_force_exit_scheduled(&scheduled));
+    }
+
+    #[test]
+    fn app_force_exit_started_marker_is_idempotent_and_separate() {
+        let scheduled = AtomicBool::new(false);
+        let started = AtomicBool::new(false);
+
+        assert!(mark_app_force_exit_scheduled(&scheduled));
+        assert!(mark_app_force_exit_started(&started));
+        assert!(!mark_app_force_exit_started(&started));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lifecycle_lock_timeout_returns_none_when_held() {
+        let lifecycle_lock = Arc::new(Mutex::new(()));
+        let _held = lifecycle_lock.lock().await;
+
+        let guard =
+            lock_lifecycle_with_timeout(Arc::clone(&lifecycle_lock), Duration::from_millis(10))
+                .await;
+
+        assert!(guard.is_none());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lifecycle_lock_timeout_returns_guard_when_available() {
+        let lifecycle_lock = Arc::new(Mutex::new(()));
+
+        let guard =
+            lock_lifecycle_with_timeout(Arc::clone(&lifecycle_lock), Duration::from_millis(100))
+                .await;
+
+        assert!(guard.is_some());
     }
 }
 
@@ -3489,14 +3621,41 @@ async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: Str
         let terminal_state = app_for_shutdown.state::<TerminalState>();
         let cloud_mcp_state = app_for_shutdown.state::<CloudMcpState>();
         let lifecycle_lock = Arc::clone(&terminal_state.lifecycle_lock);
-        let _lifecycle_guard = lifecycle_lock.lock().await;
-        close_all_terminal_sessions(
+        let lifecycle_guard = lock_lifecycle_with_timeout(
+            lifecycle_lock,
+            Duration::from_secs(APP_SHUTDOWN_LIFECYCLE_LOCK_TIMEOUT_SECS),
+        )
+        .await;
+        if lifecycle_guard.is_none() {
+            let message = format!(
+                "Timed out after {APP_SHUTDOWN_LIFECYCLE_LOCK_TIMEOUT_SECS}s acquiring terminal lifecycle lock during app shutdown; proceeding without guard."
+            );
+            eprintln!("{message}");
+            log_terminal_crash_forensics_event(
+                "backend.app_shutdown.lifecycle_lock_timeout",
+                json!({
+                    "timeout_secs": APP_SHUTDOWN_LIFECYCLE_LOCK_TIMEOUT_SECS,
+                    "window_label": clean_terminal_telemetry_text(&window_label),
+                }),
+            );
+            log_terminal_diagnostic_event(
+                &app_for_shutdown,
+                "app_shutdown.lifecycle_lock_timeout",
+                json!({
+                    "timeout_secs": APP_SHUTDOWN_LIFECYCLE_LOCK_TIMEOUT_SECS,
+                    "window_label": clean_terminal_telemetry_text(&window_label),
+                }),
+            );
+        }
+        let result = close_all_terminal_sessions(
             app_for_shutdown.clone(),
             &terminal_state,
             cloud_mcp_state.inner(),
             None,
         )
-        .await
+        .await;
+        drop(lifecycle_guard);
+        result
     };
     let _ = cloud_mcp_request_desktop_close(&app_for_shutdown, "app_shutdown").await;
 
@@ -3581,18 +3740,56 @@ async fn deactivate_workspace_runtime(
     );
 
     let terminal_started_at = Instant::now();
+    let mut terminal_timeout_error = None;
     let terminal_result = {
         let terminal_state = app.state::<TerminalState>();
         let cloud_mcp_state = app.state::<CloudMcpState>();
         let lifecycle_lock = Arc::clone(&terminal_state.lifecycle_lock);
-        let _lifecycle_guard = lifecycle_lock.lock().await;
-        close_all_terminal_sessions(
-            app.clone(),
-            &terminal_state,
-            cloud_mcp_state.inner(),
-            workspace_id.as_deref(),
+        let close_result = timeout(
+            Duration::from_secs(WORKSPACE_DEACTIVATE_TERMINAL_TIMEOUT_SECS),
+            async {
+                let _lifecycle_guard = lifecycle_lock.lock().await;
+                close_all_terminal_sessions(
+                    app.clone(),
+                    &terminal_state,
+                    cloud_mcp_state.inner(),
+                    workspace_id.as_deref(),
+                )
+                .await
+            },
         )
-        .await
+        .await;
+
+        match close_result {
+            Ok(result) => result,
+            Err(_) => {
+                let error = format!(
+                    "Timed out after {WORKSPACE_DEACTIVATE_TERMINAL_TIMEOUT_SECS}s closing terminals while deactivating workspace runtime."
+                );
+                eprintln!(
+                    "{error} workspace_id={} repo_path={} reason={}",
+                    workspace_id.as_deref().unwrap_or(""),
+                    repo_path.as_deref().unwrap_or(""),
+                    reason
+                );
+                log_terminal_crash_forensics_event(
+                    "backend.workspace_deactivate_runtime.terminal_timeout",
+                    json!({
+                        "reason": reason,
+                        "repo_path": repo_path.as_deref().unwrap_or(""),
+                        "timeout_secs": WORKSPACE_DEACTIVATE_TERMINAL_TIMEOUT_SECS,
+                        "workspace_id": workspace_id.as_deref().unwrap_or(""),
+                    }),
+                );
+                let error = format!(
+                    "{error} workspace_id={} repo_path={}",
+                    workspace_id.as_deref().unwrap_or(""),
+                    repo_path.as_deref().unwrap_or("")
+                );
+                terminal_timeout_error = Some(error.clone());
+                Err(error)
+            }
+        }
     };
     let (closed_terminals, terminal_error) = match terminal_result {
         Ok(closed) => (closed, None),
@@ -3679,6 +3876,10 @@ async fn deactivate_workspace_runtime(
             "duration_ms": terminal_diagnostic_elapsed_ms(started_at),
         }),
     );
+
+    if let Some(error) = terminal_timeout_error {
+        return Err(error);
+    }
 
     Ok(result)
 }
@@ -3977,6 +4178,1285 @@ async fn delete_workspace_local_metadata(
     .map_err(|error| format!("Unable to delete workspace metadata: {error}"))?
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeviceDataMigrationStrategy {
+    PreferNewest,
+    MergeWorkspaceCatalog,
+    MergeAppStateWorkspaceSettings,
+}
+
+struct DeviceDataMigrationLock {
+    path: PathBuf,
+}
+
+impl Drop for DeviceDataMigrationLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn device_data_root(app: &AppHandle) -> Result<PathBuf, String> {
+    if let Some(root) = cloud_mcp_native_data_root() {
+        return Ok(root);
+    }
+
+    app.path()
+        .data_dir()
+        .map(|data_dir| data_dir.join("DiffForge"))
+        .map_err(|error| format!("Unable to resolve Diff Forge device data directory: {error}"))
+}
+
+fn legacy_identifier_data_dirs(app: &AppHandle) -> Vec<PathBuf> {
+    app.path()
+        .data_dir()
+        .map(|data_dir| {
+            vec![
+                data_dir.join(PROD_BUNDLE_IDENTIFIER),
+                data_dir.join(DEV_BUNDLE_IDENTIFIER),
+            ]
+        })
+        .unwrap_or_default()
+}
+
+fn device_data_target_path(root: &Path, rel_path: &Path) -> Result<PathBuf, String> {
+    if rel_path.as_os_str().is_empty() {
+        return Err("Device data relative path is required.".to_string());
+    }
+
+    let mut target = root.to_path_buf();
+    for component in rel_path.components() {
+        match component {
+            Component::Normal(part) => target.push(part),
+            _ => {
+                return Err(format!(
+                    "Invalid device data relative path: {}",
+                    rel_path.display()
+                ));
+            }
+        }
+    }
+    Ok(target)
+}
+
+fn ensure_device_migrated<P: AsRef<Path>>(
+    app: &AppHandle,
+    rel_path: P,
+    strategy: DeviceDataMigrationStrategy,
+) -> Result<(), String> {
+    let device_root = device_data_root(app)?;
+    let legacy_roots = legacy_identifier_data_dirs(app);
+    ensure_device_migrated_for_roots(&device_root, &legacy_roots, rel_path.as_ref(), strategy)
+}
+
+fn device_data_path<P: AsRef<Path>>(
+    app: &AppHandle,
+    rel_path: P,
+    strategy: DeviceDataMigrationStrategy,
+) -> Result<PathBuf, String> {
+    let rel_path = rel_path.as_ref();
+    ensure_device_migrated(app, rel_path, strategy)?;
+    device_data_target_path(&device_data_root(app)?, rel_path)
+}
+
+fn ensure_device_migrated_for_roots(
+    device_root: &Path,
+    legacy_roots: &[PathBuf],
+    rel_path: &Path,
+    strategy: DeviceDataMigrationStrategy,
+) -> Result<(), String> {
+    let target = device_data_target_path(device_root, rel_path)?;
+    if target.exists() {
+        return Ok(());
+    }
+
+    let Some(_lock) = device_data_migration_acquire_lock(&target)? else {
+        return Ok(());
+    };
+    if target.exists() {
+        return Ok(());
+    }
+
+    match strategy {
+        DeviceDataMigrationStrategy::PreferNewest => {
+            let candidates = device_data_legacy_candidates(legacy_roots, rel_path);
+            device_data_migrate_prefer_newest(&target, &candidates)
+        }
+        DeviceDataMigrationStrategy::MergeWorkspaceCatalog => {
+            device_data_migrate_workspace_catalog(device_root, legacy_roots, &target)
+        }
+        DeviceDataMigrationStrategy::MergeAppStateWorkspaceSettings => {
+            let candidates = device_data_legacy_candidates(legacy_roots, rel_path);
+            if let Some(payload) = merge_app_state_workspace_settings_files(&candidates)? {
+                device_data_write_json_atomic(&target, &payload, "app state workspace settings")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+fn device_data_legacy_candidates(legacy_roots: &[PathBuf], rel_path: &Path) -> Vec<PathBuf> {
+    legacy_roots
+        .iter()
+        .map(|root| root.join(rel_path))
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn device_data_migration_now_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default()
+}
+
+fn device_data_migration_temp_path(target: &Path) -> PathBuf {
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let mut file_name = target
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("device-data"));
+    file_name.push(format!(
+        ".migration-{}-{}-{counter}.tmp",
+        std::process::id(),
+        device_data_migration_now_nanos()
+    ));
+    target.with_file_name(file_name)
+}
+
+fn device_data_migration_lock_path(target: &Path) -> PathBuf {
+    let mut file_name = target
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("device-data"));
+    file_name.push(".migration.lock");
+    target.with_file_name(file_name)
+}
+
+fn device_data_migration_lock_is_stale(path: &Path) -> bool {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .map(|age| age.as_secs() >= DEVICE_DATA_MIGRATION_LOCK_STALE_SECS)
+        .unwrap_or(false)
+}
+
+fn device_data_migration_acquire_lock(
+    target: &Path,
+) -> Result<Option<DeviceDataMigrationLock>, String> {
+    let lock_path = device_data_migration_lock_path(target);
+    if let Some(parent) = lock_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create device migration directory: {error}"))?;
+    }
+
+    for _ in 0..1200 {
+        if target.exists() {
+            return Ok(None);
+        }
+
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(
+                    file,
+                    "{{\"pid\":{},\"createdAtNanos\":{}}}",
+                    std::process::id(),
+                    device_data_migration_now_nanos()
+                );
+                return Ok(Some(DeviceDataMigrationLock { path: lock_path }));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if device_data_migration_lock_is_stale(&lock_path) {
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Unable to acquire device migration lock {}: {error}",
+                    lock_path.display()
+                ));
+            }
+        }
+    }
+
+    if target.exists() {
+        Ok(None)
+    } else {
+        Err(format!(
+            "Timed out waiting for device migration lock {}.",
+            lock_path.display()
+        ))
+    }
+}
+
+fn device_data_path_newest_modified(path: &Path) -> Option<SystemTime> {
+    let metadata = fs::metadata(path).ok()?;
+    let mut newest = metadata.modified().ok();
+    if metadata.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                if let Some(modified) = device_data_path_newest_modified(&entry.path()) {
+                    if newest.map(|current| modified > current).unwrap_or(true) {
+                        newest = Some(modified);
+                    }
+                }
+            }
+        }
+    }
+    newest
+}
+
+fn device_data_newest_candidate(candidates: &[PathBuf]) -> Option<PathBuf> {
+    let mut selected: Option<(&PathBuf, SystemTime)> = None;
+    for candidate in candidates {
+        let modified = device_data_path_newest_modified(candidate).unwrap_or(UNIX_EPOCH);
+        if selected
+            .as_ref()
+            .map(|(_, current)| modified > *current)
+            .unwrap_or(true)
+        {
+            selected = Some((candidate, modified));
+        }
+    }
+    selected.map(|(path, _)| path.clone())
+}
+
+fn device_data_finalize_temp_path(
+    temp_path: &Path,
+    target: &Path,
+    label: &str,
+) -> Result<(), String> {
+    if target.exists() {
+        let _ = if temp_path.is_dir() {
+            fs::remove_dir_all(temp_path)
+        } else {
+            fs::remove_file(temp_path)
+        };
+        return Ok(());
+    }
+
+    match fs::rename(temp_path, target) {
+        Ok(_) => Ok(()),
+        Err(_error) if target.exists() => {
+            let _ = if temp_path.is_dir() {
+                fs::remove_dir_all(temp_path)
+            } else {
+                fs::remove_file(temp_path)
+            };
+            Ok(())
+        }
+        Err(error) => {
+            let _ = if temp_path.is_dir() {
+                fs::remove_dir_all(temp_path)
+            } else {
+                fs::remove_file(temp_path)
+            };
+            Err(format!(
+                "Unable to finalize migrated {label} {}: {error}",
+                target.display()
+            ))
+        }
+    }
+}
+
+fn device_data_copy_dir_recursive(source: &Path, target: &Path) -> Result<(), String> {
+    fs::create_dir_all(target).map_err(|error| {
+        format!(
+            "Unable to create migrated directory {}: {error}",
+            target.display()
+        )
+    })?;
+    for entry in fs::read_dir(source).map_err(|error| {
+        format!(
+            "Unable to read legacy directory {}: {error}",
+            source.display()
+        )
+    })? {
+        let entry = entry.map_err(|error| {
+            format!(
+                "Unable to read legacy directory entry {}: {error}",
+                source.display()
+            )
+        })?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "Unable to inspect legacy entry {}: {error}",
+                source_path.display()
+            )
+        })?;
+        if file_type.is_dir() {
+            device_data_copy_dir_recursive(&source_path, &target_path)?;
+        } else {
+            if let Some(parent) = target_path.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    format!(
+                        "Unable to create migrated file parent {}: {error}",
+                        parent.display()
+                    )
+                })?;
+            }
+            fs::copy(&source_path, &target_path).map_err(|error| {
+                format!(
+                    "Unable to copy legacy file {} to {}: {error}",
+                    source_path.display(),
+                    target_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn device_data_copy_file_atomic(source: &Path, target: &Path, label: &str) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create migrated {label} directory: {error}"))?;
+    }
+    let temp_path = device_data_migration_temp_path(target);
+    fs::copy(source, &temp_path).map_err(|error| {
+        let _ = fs::remove_file(&temp_path);
+        format!(
+            "Unable to copy legacy {label} {} to {}: {error}",
+            source.display(),
+            target.display()
+        )
+    })?;
+    device_data_finalize_temp_path(&temp_path, target, label)
+}
+
+fn device_data_copy_dir_atomic(source: &Path, target: &Path, label: &str) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create migrated {label} directory: {error}"))?;
+    }
+    let temp_path = device_data_migration_temp_path(target);
+    if temp_path.exists() {
+        let _ = fs::remove_dir_all(&temp_path);
+    }
+    device_data_copy_dir_recursive(source, &temp_path).map_err(|error| {
+        let _ = fs::remove_dir_all(&temp_path);
+        error
+    })?;
+    device_data_finalize_temp_path(&temp_path, target, label)
+}
+
+fn device_data_migrate_prefer_newest(target: &Path, candidates: &[PathBuf]) -> Result<(), String> {
+    let Some(source) = device_data_newest_candidate(candidates) else {
+        return Ok(());
+    };
+    let metadata = fs::metadata(&source).map_err(|error| {
+        format!(
+            "Unable to inspect legacy store {}: {error}",
+            source.display()
+        )
+    })?;
+    if metadata.is_dir() {
+        device_data_copy_dir_atomic(&source, target, "device store")
+    } else {
+        device_data_copy_file_atomic(&source, target, "device store")
+    }
+}
+
+fn device_data_read_json(path: &Path) -> Option<Value> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+}
+
+fn device_data_write_json_atomic(target: &Path, value: &Value, label: &str) -> Result<(), String> {
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create migrated {label} directory: {error}"))?;
+    }
+    let serialized = serde_json::to_vec_pretty(value)
+        .map_err(|error| format!("Unable to serialize migrated {label}: {error}"))?;
+    let temp_path = device_data_migration_temp_path(target);
+    fs::write(&temp_path, serialized)
+        .map_err(|error| format!("Unable to write migrated {label}: {error}"))?;
+    device_data_finalize_temp_path(&temp_path, target, label)
+}
+
+fn merge_app_state_workspace_settings_files(
+    candidates: &[PathBuf],
+) -> Result<Option<Value>, String> {
+    let mut merged = serde_json::Map::new();
+    let mut key_mtimes: HashMap<String, SystemTime> = HashMap::new();
+    let mut saw_object = false;
+
+    for candidate in candidates {
+        let Some(Value::Object(object)) = device_data_read_json(candidate) else {
+            continue;
+        };
+        saw_object = true;
+        let modified = fs::metadata(candidate)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH);
+        for (key, value) in object {
+            let should_replace = key_mtimes
+                .get(&key)
+                .map(|existing| modified > *existing)
+                .unwrap_or(true);
+            if should_replace {
+                key_mtimes.insert(key.clone(), modified);
+                merged.insert(key, value);
+            }
+        }
+    }
+
+    Ok(saw_object.then_some(Value::Object(merged)))
+}
+
+fn device_data_workspace_settings_for_catalog(
+    device_root: &Path,
+    legacy_roots: &[PathBuf],
+) -> Value {
+    let target = device_root
+        .join(DEVICE_APP_STATE_DIR)
+        .join("workspace-settings.json");
+    if let Some(Value::Object(object)) = device_data_read_json(&target) {
+        return Value::Object(object);
+    }
+
+    let rel_path = PathBuf::from(DEVICE_APP_STATE_DIR).join("workspace-settings.json");
+    let candidates = device_data_legacy_candidates(legacy_roots, &rel_path);
+    merge_app_state_workspace_settings_files(&candidates)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| json!({}))
+}
+
+fn device_data_workspace_catalog_scope_files(candidate_dirs: &[PathBuf]) -> Vec<String> {
+    let mut names = BTreeSet::new();
+    for dir in candidate_dirs {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                continue;
+            }
+            if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                names.insert(name.to_string());
+            }
+        }
+    }
+    names.into_iter().collect()
+}
+
+fn workspace_catalog_entry_updated_key(entry: &Value) -> (u8, u128, String) {
+    for key in [
+        "updatedAtMs",
+        "updated_at_ms",
+        "modifiedAtMs",
+        "modified_at_ms",
+        "createdAtMs",
+        "created_at_ms",
+    ] {
+        if let Some(value) = entry.get(key) {
+            if let Some(number) = value.as_u64() {
+                return (2, number as u128, String::new());
+            }
+            if let Some(number) = value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .and_then(|value| value.parse::<u128>().ok())
+            {
+                return (2, number, String::new());
+            }
+        }
+    }
+
+    for key in [
+        "updatedAt",
+        "updated_at",
+        "modifiedAt",
+        "modified_at",
+        "createdAt",
+        "created_at",
+    ] {
+        if let Some(value) = entry
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if let Ok(number) = value.parse::<u128>() {
+                return (2, number, String::new());
+            }
+            return (1, 0, value.to_string());
+        }
+    }
+
+    (0, 0, String::new())
+}
+
+fn mark_workspace_catalog_entry_deleted(entry: &mut Value) {
+    if let Value::Object(object) = entry {
+        object.insert("pendingDelete".to_string(), json!(true));
+        object.insert("deleted".to_string(), json!(true));
+    }
+}
+
+fn resolve_workspace_catalog_root_collisions(items: &mut [Value], workspace_settings: &Value) {
+    let mut root_owners: HashMap<String, usize> = HashMap::new();
+    for index in 0..items.len() {
+        if local_workspace_catalog_entry_is_deleted(&items[index]) {
+            continue;
+        }
+        let Some((root_identity, _)) =
+            local_workspace_catalog_root_identity(&items[index], workspace_settings)
+        else {
+            continue;
+        };
+        let workspace_id =
+            local_workspace_catalog_text(&items[index], &["id", "workspace_id", "workspaceId"])
+                .unwrap_or_default();
+        if workspace_id.is_empty() {
+            continue;
+        }
+
+        if let Some(existing_index) = root_owners.get(&root_identity).copied() {
+            let existing_id = local_workspace_catalog_text(
+                &items[existing_index],
+                &["id", "workspace_id", "workspaceId"],
+            )
+            .unwrap_or_default();
+            if existing_id == workspace_id {
+                continue;
+            }
+            if workspace_catalog_entry_updated_key(&items[index])
+                > workspace_catalog_entry_updated_key(&items[existing_index])
+            {
+                mark_workspace_catalog_entry_deleted(&mut items[existing_index]);
+                root_owners.insert(root_identity, index);
+            } else {
+                mark_workspace_catalog_entry_deleted(&mut items[index]);
+            }
+        } else {
+            root_owners.insert(root_identity, index);
+        }
+    }
+}
+
+fn merge_workspace_catalog_files(
+    candidates: &[PathBuf],
+    workspace_settings: &Value,
+) -> Result<Option<Value>, String> {
+    let mut items: Vec<Value> = Vec::new();
+    let mut indexes_by_id: HashMap<String, usize> = HashMap::new();
+    let mut saw_catalog = false;
+
+    for candidate in candidates {
+        let Some(value) = device_data_read_json(candidate) else {
+            continue;
+        };
+        saw_catalog = true;
+        let Some(workspaces) = value.get("workspaces").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in workspaces {
+            let item = item.clone();
+            let workspace_id =
+                local_workspace_catalog_text(&item, &["id", "workspace_id", "workspaceId"]);
+            let Some(workspace_id) = workspace_id else {
+                items.push(item);
+                continue;
+            };
+            if let Some(existing_index) = indexes_by_id.get(&workspace_id).copied() {
+                if workspace_catalog_entry_updated_key(&item)
+                    > workspace_catalog_entry_updated_key(&items[existing_index])
+                {
+                    items[existing_index] = item;
+                }
+            } else {
+                indexes_by_id.insert(workspace_id, items.len());
+                items.push(item);
+            }
+        }
+    }
+
+    if !saw_catalog {
+        return Ok(None);
+    }
+
+    resolve_workspace_catalog_root_collisions(&mut items, workspace_settings);
+    let items = local_workspace_catalog_normalize_items(items, workspace_settings)?;
+    Ok(Some(json!({
+        "version": 1,
+        "workspaces": items,
+    })))
+}
+
+fn device_data_migrate_workspace_catalog(
+    device_root: &Path,
+    legacy_roots: &[PathBuf],
+    target: &Path,
+) -> Result<(), String> {
+    let candidate_dirs: Vec<PathBuf> = legacy_roots
+        .iter()
+        .map(|root| root.join(DEVICE_WORKSPACE_CATALOG_DIR))
+        .filter(|path| path.is_dir())
+        .collect();
+    if candidate_dirs.is_empty() {
+        return Ok(());
+    }
+
+    let scope_files = device_data_workspace_catalog_scope_files(&candidate_dirs);
+    if scope_files.is_empty() {
+        return Ok(());
+    }
+
+    let workspace_settings = device_data_workspace_settings_for_catalog(device_root, legacy_roots);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "Unable to create migrated workspace catalog parent {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let temp_dir = device_data_migration_temp_path(target);
+    fs::create_dir_all(&temp_dir).map_err(|error| {
+        format!(
+            "Unable to create migrated workspace catalog temp directory {}: {error}",
+            temp_dir.display()
+        )
+    })?;
+
+    let mut wrote_any = false;
+    for scope_file in scope_files {
+        let candidates: Vec<PathBuf> = candidate_dirs
+            .iter()
+            .map(|dir| dir.join(&scope_file))
+            .filter(|path| path.is_file())
+            .collect();
+        if let Some(payload) = merge_workspace_catalog_files(&candidates, &workspace_settings)? {
+            let target_file = temp_dir.join(scope_file);
+            let serialized = serde_json::to_vec_pretty(&payload).map_err(|error| {
+                format!("Unable to serialize migrated workspace catalog: {error}")
+            })?;
+            fs::write(&target_file, serialized).map_err(|error| {
+                format!(
+                    "Unable to write migrated workspace catalog {}: {error}",
+                    target_file.display()
+                )
+            })?;
+            wrote_any = true;
+        }
+    }
+
+    if !wrote_any {
+        let _ = fs::remove_dir_all(&temp_dir);
+        return Ok(());
+    }
+
+    device_data_finalize_temp_path(&temp_dir, target, "workspace catalog")
+}
+
+#[cfg(test)]
+mod device_data_migration_tests {
+    use super::*;
+
+    static DEVICE_DATA_MIGRATION_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    struct TestDir {
+        path: PathBuf,
+    }
+
+    impl TestDir {
+        fn new(prefix: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let suffix = format!(
+                "{}-{}",
+                device_data_migration_now_nanos(),
+                COUNTER.fetch_add(1, Ordering::Relaxed)
+            );
+            let path = env::temp_dir().join(format!("{prefix}-{suffix}"));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    struct ScopedDeviceDataEnv {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl ScopedDeviceDataEnv {
+        fn set(key: &'static str, value: &Path) -> Self {
+            let previous = env::var_os(key);
+            env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for ScopedDeviceDataEnv {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.take() {
+                env::set_var(self.key, previous);
+            } else {
+                env::remove_var(self.key);
+            }
+        }
+    }
+
+    fn write_json(path: &Path, value: &Value) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, serde_json::to_vec_pretty(value).unwrap()).unwrap();
+    }
+
+    fn read_json(path: &Path) -> Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    fn legacy_roots(root: &Path) -> Vec<PathBuf> {
+        vec![
+            root.join(PROD_BUNDLE_IDENTIFIER),
+            root.join(DEV_BUNDLE_IDENTIFIER),
+        ]
+    }
+
+    fn workspace_by_id<'a>(catalog: &'a Value, id: &str) -> &'a Value {
+        catalog["workspaces"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|workspace| {
+                local_workspace_catalog_text(workspace, &["id", "workspace_id", "workspaceId"])
+                    .as_deref()
+                    == Some(id)
+            })
+            .unwrap_or_else(|| panic!("missing workspace {id}"))
+    }
+
+    fn workspace_item_by_id<'a>(items: &'a [Value], id: &str) -> &'a Value {
+        items
+            .iter()
+            .find(|workspace| local_workspace_catalog_entry_id(workspace).as_deref() == Some(id))
+            .unwrap_or_else(|| panic!("missing workspace {id}"))
+    }
+
+    #[test]
+    fn workspace_catalog_migration_unions_tombstones_and_tombstones_older_root_collision() {
+        let root = TestDir::new("diffforge-device-catalog-migration");
+        let device_root = root.path().join("device");
+        let legacy_roots = legacy_roots(root.path());
+        let catalog_rel = Path::new(DEVICE_WORKSPACE_CATALOG_DIR);
+        let prod_catalog = legacy_roots[0]
+            .join(DEVICE_WORKSPACE_CATALOG_DIR)
+            .join("personal.json");
+        let dev_catalog = legacy_roots[1]
+            .join(DEVICE_WORKSPACE_CATALOG_DIR)
+            .join("personal.json");
+
+        write_json(
+            &prod_catalog,
+            &json!({
+                "version": 1,
+                "workspaces": [
+                    {
+                        "id": "prod-only",
+                        "name": "Prod",
+                        "rootIdentity": "prod-root",
+                        "rootDirectory": "/tmp/prod-root",
+                        "updatedAtMs": 100
+                    },
+                    {
+                        "id": "deleted-preserved",
+                        "name": "Deleted",
+                        "rootIdentity": "deleted-root",
+                        "pendingDelete": true,
+                        "updatedAtMs": 110
+                    },
+                    {
+                        "id": "older-root-owner",
+                        "name": "Older root owner",
+                        "rootIdentity": "shared-root",
+                        "rootDirectory": "/tmp/shared-old",
+                        "updatedAtMs": 120
+                    },
+                    {
+                        "id": "same-id",
+                        "name": "Older same id",
+                        "rootIdentity": "same-id-old-root",
+                        "rootDirectory": "/tmp/same-id-old",
+                        "updatedAtMs": 130
+                    }
+                ]
+            }),
+        );
+        write_json(
+            &dev_catalog,
+            &json!({
+                "version": 1,
+                "workspaces": [
+                    {
+                        "id": "dev-only",
+                        "name": "Dev",
+                        "rootIdentity": "dev-root",
+                        "rootDirectory": "/tmp/dev-root",
+                        "updatedAtMs": 200
+                    },
+                    {
+                        "id": "newer-root-owner",
+                        "name": "Newer root owner",
+                        "rootIdentity": "shared-root",
+                        "rootDirectory": "/tmp/shared-new",
+                        "updatedAtMs": 300
+                    },
+                    {
+                        "id": "same-id",
+                        "name": "Newer same id",
+                        "rootIdentity": "same-id-new-root",
+                        "rootDirectory": "/tmp/same-id-new",
+                        "updatedAtMs": 400
+                    }
+                ]
+            }),
+        );
+
+        ensure_device_migrated_for_roots(
+            &device_root,
+            &legacy_roots,
+            catalog_rel,
+            DeviceDataMigrationStrategy::MergeWorkspaceCatalog,
+        )
+        .unwrap();
+
+        let catalog = read_json(
+            &device_root
+                .join(DEVICE_WORKSPACE_CATALOG_DIR)
+                .join("personal.json"),
+        );
+        let workspaces = catalog["workspaces"].as_array().unwrap();
+        assert_eq!(workspaces.len(), 6);
+        assert_eq!(
+            workspace_by_id(&catalog, "prod-only")["name"],
+            json!("Prod")
+        );
+        assert_eq!(workspace_by_id(&catalog, "dev-only")["name"], json!("Dev"));
+        assert_eq!(
+            workspace_by_id(&catalog, "same-id")["name"],
+            json!("Newer same id")
+        );
+        assert!(local_workspace_catalog_entry_is_deleted(workspace_by_id(
+            &catalog,
+            "deleted-preserved"
+        )));
+        assert!(local_workspace_catalog_entry_is_deleted(workspace_by_id(
+            &catalog,
+            "older-root-owner"
+        )));
+        assert!(!local_workspace_catalog_entry_is_deleted(workspace_by_id(
+            &catalog,
+            "newer-root-owner"
+        )));
+
+        local_workspace_catalog_normalize_items(workspaces.clone(), &json!({})).unwrap();
+    }
+
+    #[test]
+    fn workspace_settings_migration_unions_maps_and_prefers_newer_conflicts() {
+        let root = TestDir::new("diffforge-device-settings-migration");
+        let device_root = root.path().join("device");
+        let legacy_roots = legacy_roots(root.path());
+        let rel = PathBuf::from(DEVICE_APP_STATE_DIR).join("workspace-settings.json");
+        write_json(
+            &legacy_roots[0].join(&rel),
+            &json!({
+                "prod-workspace": { "rootDirectory": "/tmp/prod" },
+                "shared-workspace": { "rootDirectory": "/tmp/prod-shared" }
+            }),
+        );
+        thread::sleep(Duration::from_millis(20));
+        write_json(
+            &legacy_roots[1].join(&rel),
+            &json!({
+                "dev-workspace": { "rootDirectory": "/tmp/dev" },
+                "shared-workspace": { "rootDirectory": "/tmp/dev-shared" }
+            }),
+        );
+
+        ensure_device_migrated_for_roots(
+            &device_root,
+            &legacy_roots,
+            &rel,
+            DeviceDataMigrationStrategy::MergeAppStateWorkspaceSettings,
+        )
+        .unwrap();
+
+        let merged = read_json(&device_root.join(&rel));
+        assert_eq!(
+            merged["prod-workspace"]["rootDirectory"],
+            json!("/tmp/prod")
+        );
+        assert_eq!(merged["dev-workspace"]["rootDirectory"], json!("/tmp/dev"));
+        assert_eq!(
+            merged["shared-workspace"]["rootDirectory"],
+            json!("/tmp/dev-shared")
+        );
+    }
+
+    #[test]
+    fn prefer_newest_file_migration_picks_newest_and_is_idempotent() {
+        let root = TestDir::new("diffforge-device-prefer-newest");
+        let device_root = root.path().join("device");
+        let legacy_roots = legacy_roots(root.path());
+        let rel = Path::new("voice-text-rules.json");
+        fs::create_dir_all(&legacy_roots[0]).unwrap();
+        fs::create_dir_all(&legacy_roots[1]).unwrap();
+        fs::write(legacy_roots[0].join(rel), "prod").unwrap();
+        thread::sleep(Duration::from_millis(20));
+        fs::write(legacy_roots[1].join(rel), "dev").unwrap();
+
+        ensure_device_migrated_for_roots(
+            &device_root,
+            &legacy_roots,
+            rel,
+            DeviceDataMigrationStrategy::PreferNewest,
+        )
+        .unwrap();
+        let target = device_root.join(rel);
+        assert_eq!(fs::read_to_string(&target).unwrap(), "dev");
+
+        fs::write(legacy_roots[1].join(rel), "changed-after-migration").unwrap();
+        ensure_device_migrated_for_roots(
+            &device_root,
+            &legacy_roots,
+            rel,
+            DeviceDataMigrationStrategy::PreferNewest,
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "dev");
+    }
+
+    #[test]
+    fn desktop_auth_cli_read_falls_back_to_legacy_prod_when_device_file_missing() {
+        let _guard = DEVICE_DATA_MIGRATION_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let root = TestDir::new("diffforge-desktop-auth-cli-fallback");
+        let device_root = root.path().join("device");
+        let home = root.path().join("home");
+        let xdg_data = root.path().join("xdg-data");
+        let appdata = root.path().join("appdata");
+        let localappdata = root.path().join("localappdata");
+        let _data_env = ScopedDeviceDataEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &device_root);
+        let _home_env = ScopedDeviceDataEnv::set("HOME", &home);
+        let _userprofile_env = ScopedDeviceDataEnv::set("USERPROFILE", &home);
+        let _xdg_data_env = ScopedDeviceDataEnv::set("XDG_DATA_HOME", &xdg_data);
+        let _appdata_env = ScopedDeviceDataEnv::set("APPDATA", &appdata);
+        let _localappdata_env = ScopedDeviceDataEnv::set("LOCALAPPDATA", &localappdata);
+
+        let legacy_path = desktop_auth_cli_legacy_state_path().unwrap();
+        write_json(
+            &legacy_path,
+            &json!({
+                "status": "authenticated",
+                "token": "abcdefghijklmnopqrstuvwxyz123456",
+                "user": { "id": "legacy-user" }
+            }),
+        );
+
+        let legacy_snapshot = desktop_auth_cli_read_snapshot();
+        assert_eq!(legacy_snapshot["status"], json!("authenticated"));
+        assert_eq!(legacy_snapshot["user"]["id"], json!("legacy-user"));
+
+        let device_path = desktop_auth_cli_state_path().unwrap();
+        write_json(
+            &device_path,
+            &json!({
+                "status": "signedOut",
+                "token": "",
+                "user": null
+            }),
+        );
+        let device_snapshot = desktop_auth_cli_read_snapshot();
+        assert_eq!(device_snapshot["status"], json!("signedOut"));
+    }
+
+    #[test]
+    fn local_workspace_store_tombstones_absent_existing_entries() {
+        let now_ms = 2_000_000;
+        let stored = local_workspace_catalog_store_items(
+            vec![
+                json!({
+                    "id": "ws-kept",
+                    "name": "Kept",
+                    "rootIdentity": "root-kept",
+                    "rootDirectory": "/tmp/kept"
+                }),
+                json!({
+                    "id": "ws-removed",
+                    "name": "Removed",
+                    "rootIdentity": "root-removed",
+                    "rootDirectory": "/tmp/removed"
+                }),
+            ],
+            vec![json!({
+                "id": "ws-kept",
+                "name": "Kept",
+                "rootIdentity": "root-kept",
+                "rootDirectory": "/tmp/kept"
+            })],
+            &json!({}),
+            now_ms,
+        )
+        .unwrap();
+
+        assert_eq!(stored.len(), 2);
+        assert!(!local_workspace_catalog_entry_is_deleted(
+            workspace_item_by_id(&stored, "ws-kept")
+        ));
+        let removed = workspace_item_by_id(&stored, "ws-removed");
+        assert!(local_workspace_catalog_entry_is_deleted(removed));
+        assert_eq!(removed["deleted"], json!(true));
+        assert_eq!(removed["deletedAtMs"], json!(now_ms));
+    }
+
+    #[test]
+    fn local_workspace_store_revives_matching_tombstoned_entry() {
+        let stored = local_workspace_catalog_store_items(
+            vec![json!({
+                "id": "ws-revive",
+                "name": "Deleted before",
+                "rootIdentity": "root-revive",
+                "rootDirectory": "/tmp/revive",
+                "deleted": true,
+                "deletedAtMs": 100
+            })],
+            vec![json!({
+                "id": "ws-revive",
+                "name": "Revived",
+                "rootIdentity": "root-revive",
+                "rootDirectory": "/tmp/revive",
+                "deleted": true,
+                "deletedAtMs": 100,
+                "status": "deleted",
+                "current": false
+            })],
+            &json!({}),
+            200,
+        )
+        .unwrap();
+
+        assert_eq!(stored.len(), 1);
+        let revived = workspace_item_by_id(&stored, "ws-revive");
+        assert!(!local_workspace_catalog_entry_is_deleted(revived));
+        assert_eq!(revived["name"], json!("Revived"));
+        assert!(revived.get("deleted").is_none());
+        assert!(revived.get("deletedAtMs").is_none());
+        assert_eq!(revived["current"], json!(true));
+    }
+
+    #[test]
+    fn local_workspace_reusable_id_for_root_matches_only_same_scope_tombstones() {
+        let root = TestDir::new("diffforge-reusable-workspace-id");
+        let store_dir = root.path().join("catalog");
+        let deleted_root = root.path().join("deleted-root");
+        let live_root = root.path().join("live-root");
+        let other_scope_root = root.path().join("other-scope-root");
+        let unknown_root = root.path().join("unknown-root");
+        for path in [&deleted_root, &live_root, &other_scope_root, &unknown_root] {
+            fs::create_dir_all(path).unwrap();
+        }
+        write_json(
+            &store_dir.join("personal.json"),
+            &json!({
+                "version": 1,
+                "workspaces": [
+                    {
+                        "id": "ws-deleted",
+                        "rootDirectory": deleted_root.display().to_string(),
+                        "deleted": true,
+                        "deletedAtMs": local_workspace_catalog_now_ms()
+                    },
+                    {
+                        "id": "ws-live",
+                        "rootDirectory": live_root.display().to_string()
+                    }
+                ]
+            }),
+        );
+        write_json(
+            &store_dir.join("work.json"),
+            &json!({
+                "version": 1,
+                "workspaces": [
+                    {
+                        "id": "ws-other-scope",
+                        "rootDirectory": other_scope_root.display().to_string(),
+                        "deleted": true,
+                        "deletedAtMs": local_workspace_catalog_now_ms()
+                    }
+                ]
+            }),
+        );
+
+        assert_eq!(
+            local_workspace_reusable_id_for_root_in_dir(
+                &store_dir,
+                "personal",
+                &deleted_root.display().to_string(),
+                &json!({})
+            )
+            .unwrap(),
+            Some("ws-deleted".to_string())
+        );
+        assert_eq!(
+            local_workspace_reusable_id_for_root_in_dir(
+                &store_dir,
+                "personal",
+                &live_root.display().to_string(),
+                &json!({})
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            local_workspace_reusable_id_for_root_in_dir(
+                &store_dir,
+                "personal",
+                &unknown_root.display().to_string(),
+                &json!({})
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            local_workspace_reusable_id_for_root_in_dir(
+                &store_dir,
+                "personal",
+                &other_scope_root.display().to_string(),
+                &json!({})
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn local_workspace_prune_keeps_tombstoned_settings_until_expiry() {
+        let root = TestDir::new("diffforge-prune-workspace-settings");
+        let store_dir = root.path().join("catalog");
+        let now_ms = 10_000_000_000;
+        write_json(
+            &store_dir.join("personal.json"),
+            &json!({
+                "version": 1,
+                "workspaces": [
+                    { "id": "ws-live", "rootIdentity": "root-live" },
+                    {
+                        "id": "ws-tombstone",
+                        "rootIdentity": "root-tombstone",
+                        "deleted": true,
+                        "deletedAtMs": now_ms - 1_000
+                    },
+                    {
+                        "id": "ws-expired",
+                        "rootIdentity": "root-expired",
+                        "deleted": true,
+                        "deletedAtMs": now_ms - LOCAL_WORKSPACE_TOMBSTONE_RETENTION_MS - 1
+                    }
+                ]
+            }),
+        );
+        let retained =
+            local_workspace_catalog_retained_workspace_ids_from_dir(&store_dir, now_ms).unwrap();
+        let (pruned, removed) = local_workspace_catalog_pruned_workspace_settings(
+            &json!({
+                "ws-live": { "rootDirectory": "/tmp/live" },
+                "ws-tombstone": { "rootDirectory": "/tmp/tombstone" },
+                "ws-expired": { "rootDirectory": "/tmp/expired" },
+                "ws-unknown": { "rootDirectory": "/tmp/unknown" }
+            }),
+            &retained,
+        )
+        .unwrap();
+
+        assert_eq!(removed, 2);
+        assert!(pruned.get("ws-live").is_some());
+        assert!(pruned.get("ws-tombstone").is_some());
+        assert!(pruned.get("ws-expired").is_none());
+        assert!(pruned.get("ws-unknown").is_none());
+    }
+
+    #[test]
+    fn local_workspace_store_prunes_expired_tombstones() {
+        let now_ms = LOCAL_WORKSPACE_TOMBSTONE_RETENTION_MS + 10_000;
+        let stored = local_workspace_catalog_store_items(
+            vec![
+                json!({
+                    "id": "ws-expired",
+                    "rootIdentity": "root-expired",
+                    "deleted": true,
+                    "deletedAtMs": now_ms - LOCAL_WORKSPACE_TOMBSTONE_RETENTION_MS - 1
+                }),
+                json!({
+                    "id": "ws-fresh",
+                    "rootIdentity": "root-fresh",
+                    "deleted": true,
+                    "deletedAtMs": now_ms - 1_000
+                }),
+            ],
+            vec![],
+            &json!({}),
+            now_ms,
+        )
+        .unwrap();
+
+        assert!(stored
+            .iter()
+            .all(|item| local_workspace_catalog_entry_id(item).as_deref() != Some("ws-expired")));
+        assert!(local_workspace_catalog_entry_is_deleted(
+            workspace_item_by_id(&stored, "ws-fresh")
+        ));
+    }
+
+    #[test]
+    fn local_workspace_load_visible_items_filters_tombstones() {
+        let visible = local_workspace_catalog_visible_items(vec![
+            json!({ "id": "ws-live", "rootIdentity": "root-live" }),
+            json!({
+                "id": "ws-deleted",
+                "rootIdentity": "root-deleted",
+                "deleted": true,
+                "deletedAtMs": 100
+            }),
+        ]);
+
+        assert_eq!(visible.len(), 1);
+        assert_eq!(
+            local_workspace_catalog_entry_id(&visible[0]).as_deref(),
+            Some("ws-live")
+        );
+    }
+}
+
 fn local_workspace_scope_file_key(scope_key: &str) -> String {
     let cleaned = scope_key
         .trim()
@@ -3999,11 +5479,11 @@ fn local_workspace_scope_file_key(scope_key: &str) -> String {
 }
 
 fn local_workspace_store_dir(app: &AppHandle) -> Result<PathBuf, String> {
-    let store_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?
-        .join("workspace-catalog");
+    let store_dir = device_data_path(
+        app,
+        Path::new(DEVICE_WORKSPACE_CATALOG_DIR),
+        DeviceDataMigrationStrategy::MergeWorkspaceCatalog,
+    )?;
     fs::create_dir_all(&store_dir)
         .map_err(|error| format!("Unable to create workspace catalog directory: {error}"))?;
     Ok(store_dir)
@@ -4017,6 +5497,27 @@ fn local_workspace_store_path(app: &AppHandle, scope_key: &str) -> Result<PathBu
     )))
 }
 
+fn local_workspace_catalog_read_items_from_path(path: &Path) -> Result<Vec<Value>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("Unable to read local workspace catalog: {error}"))?;
+    let value = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}));
+    Ok(value
+        .get("workspaces")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn local_workspace_catalog_visible_items(items: Vec<Value>) -> Vec<Value> {
+    items
+        .into_iter()
+        .filter(|item| !local_workspace_catalog_entry_is_deleted(item))
+        .collect()
+}
+
 /// Workspaces are local-first: the UI commits to this store instantly and the
 /// cloud workspace catalog reconciles in the background.
 #[tauri::command]
@@ -4026,14 +5527,9 @@ async fn local_workspaces_load(app: AppHandle, scope_key: String) -> Result<Valu
         if !path.exists() {
             return Ok(json!({ "workspaces": [], "loaded": false }));
         }
-        let text = fs::read_to_string(&path)
-            .map_err(|error| format!("Unable to read local workspace catalog: {error}"))?;
-        let value = serde_json::from_str::<Value>(&text).unwrap_or_else(|_| json!({}));
-        let workspaces = value
-            .get("workspaces")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let workspaces = local_workspace_catalog_visible_items(
+            local_workspace_catalog_read_items_from_path(&path)?,
+        );
         Ok(json!({ "workspaces": workspaces, "loaded": true }))
     })
     .await
@@ -4046,13 +5542,42 @@ async fn local_workspaces_store(
     scope_key: String,
     workspaces: Value,
 ) -> Result<Value, String> {
+    let cloud_mcp_state = app.state::<CloudMcpState>().inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         let path = local_workspace_store_path(&app, &scope_key)?;
         let workspace_settings = app_local_state_read(&app, "workspace-settings");
-        let items = local_workspace_catalog_normalize_items(
+        let existing_items = local_workspace_catalog_read_items_from_path(&path)?;
+        let now_ms = local_workspace_catalog_now_ms();
+        let items = local_workspace_catalog_store_items(
+            existing_items,
             workspaces.as_array().cloned().unwrap_or_default(),
             &workspace_settings,
+            now_ms,
         )?;
+        let live_count = items
+            .iter()
+            .filter(|item| !local_workspace_catalog_entry_is_deleted(item))
+            .count();
+        let live_workspace_ids = local_workspace_catalog_live_workspace_ids(&items);
+        let deleted_workspace_ids = cloud_mcp_deleted_workspace_ids();
+        let revived_workspace_ids = live_workspace_ids
+            .intersection(&deleted_workspace_ids)
+            .cloned()
+            .collect::<HashSet<_>>();
+        let revived_workspace_items = if revived_workspace_ids.is_empty() {
+            Vec::new()
+        } else {
+            items
+                .iter()
+                .filter(|item| !local_workspace_catalog_entry_is_deleted(item))
+                .filter(|item| {
+                    local_workspace_catalog_entry_id(item)
+                        .as_ref()
+                        .is_some_and(|workspace_id| revived_workspace_ids.contains(workspace_id))
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
         let payload = json!({
             "version": 1,
             "workspaces": items,
@@ -4064,16 +5589,78 @@ async fn local_workspaces_store(
             .map_err(|error| format!("Unable to write local workspace catalog: {error}"))?;
         fs::rename(&temp_path, &path)
             .map_err(|error| format!("Unable to finalize local workspace catalog: {error}"))?;
+        let _removed_revived_workspace_count = if revived_workspace_ids.len() == 1 {
+            if let Some(workspace_id) = revived_workspace_ids.iter().next() {
+                match cloud_mcp_forget_deleted_workspace_id(workspace_id) {
+                    Ok(true) => 1,
+                    Ok(false) => 0,
+                    Err(error) => {
+                        log_terminal_status_event(
+                            "backend.local_workspaces.revive_ledger_cleanup_failed",
+                            json!({
+                                "workspaceId": workspace_id,
+                                "error": error,
+                            }),
+                        );
+                        0
+                    }
+                }
+            } else {
+                0
+            }
+        } else if !revived_workspace_ids.is_empty() {
+            match cloud_mcp_forget_deleted_workspace_ids(&revived_workspace_ids) {
+                Ok(removed) => removed,
+                Err(error) => {
+                    let mut workspace_ids =
+                        revived_workspace_ids.iter().cloned().collect::<Vec<_>>();
+                    workspace_ids.sort();
+                    log_terminal_status_event(
+                        "backend.local_workspaces.revive_ledger_cleanup_failed",
+                        json!({
+                            "workspaceIds": workspace_ids,
+                            "error": error,
+                        }),
+                    );
+                    0
+                }
+            }
+        } else {
+            0
+        };
+        if !revived_workspace_items.is_empty() {
+            cloud_mcp_post_workspace_revived_events(cloud_mcp_state, revived_workspace_items);
+        }
         let pruned_workspace_settings =
             local_workspace_catalog_prune_orphan_workspace_settings(&app)?;
         Ok(json!({
             "ok": true,
-            "count": items.len(),
+            "count": live_count,
             "prunedWorkspaceSettings": pruned_workspace_settings,
         }))
     })
     .await
     .map_err(|error| format!("Unable to store local workspace catalog: {error}"))?
+}
+
+#[tauri::command]
+async fn local_workspace_reusable_id_for_root(
+    app: AppHandle,
+    scope_key: String,
+    root_path: String,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let store_dir = local_workspace_store_dir(&app)?;
+        let workspace_settings = app_local_state_read(&app, "workspace-settings");
+        local_workspace_reusable_id_for_root_in_dir(
+            &store_dir,
+            &scope_key,
+            &root_path,
+            &workspace_settings,
+        )
+    })
+    .await
+    .map_err(|error| format!("Unable to resolve reusable workspace id: {error}"))?
 }
 
 fn html_document_preview_file_name(title: Option<String>) -> String {
@@ -4150,11 +5737,11 @@ async fn open_html_document_in_browser(
                 bytes.len()
             ));
         }
-        let preview_dir = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| format!("Unable to resolve app data directory: {error}"))?
-            .join("html-document-previews");
+        let preview_dir = device_data_path(
+            &app,
+            Path::new("html-document-previews"),
+            DeviceDataMigrationStrategy::PreferNewest,
+        )?;
         fs::create_dir_all(&preview_dir)
             .map_err(|error| format!("Unable to create HTML preview directory: {error}"))?;
         let preview_path = preview_dir.join(html_document_preview_file_name(title));
@@ -4232,6 +5819,162 @@ fn local_workspace_catalog_root_identity(
     (!identity.is_empty()).then_some((identity, Some(root_text)))
 }
 
+fn local_workspace_catalog_now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn local_workspace_catalog_entry_id(entry: &Value) -> Option<String> {
+    local_workspace_catalog_text(entry, &["id", "workspace_id", "workspaceId"])
+}
+
+fn local_workspace_catalog_entry_deleted_at_ms(entry: &Value) -> Option<u64> {
+    for key in ["deletedAtMs", "deleted_at_ms", "deletedAt", "deleted_at"] {
+        if let Some(value) = entry.get(key) {
+            if let Some(number) = value.as_u64() {
+                return Some(number);
+            }
+            if let Some(number) = value
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .and_then(|value| value.parse::<u64>().ok())
+            {
+                return Some(number);
+            }
+        }
+    }
+    None
+}
+
+fn local_workspace_catalog_tombstone_is_expired(entry: &Value, now_ms: u64) -> bool {
+    local_workspace_catalog_entry_is_deleted(entry)
+        && local_workspace_catalog_entry_deleted_at_ms(entry)
+            .map(|deleted_at_ms| {
+                now_ms.saturating_sub(deleted_at_ms) >= LOCAL_WORKSPACE_TOMBSTONE_RETENTION_MS
+            })
+            .unwrap_or(false)
+}
+
+fn local_workspace_catalog_mark_tombstoned(entry: &mut Value, now_ms: u64) {
+    if let Value::Object(object) = entry {
+        object.insert("deleted".to_string(), json!(true));
+        object.insert("deletedAtMs".to_string(), json!(now_ms));
+    }
+}
+
+fn local_workspace_catalog_ensure_tombstone_shape(entry: &mut Value, now_ms: u64) {
+    if let Value::Object(object) = entry {
+        object.insert("deleted".to_string(), json!(true));
+        if !object.contains_key("deletedAtMs") && !object.contains_key("deleted_at_ms") {
+            object.insert("deletedAtMs".to_string(), json!(now_ms));
+        }
+    }
+}
+
+fn local_workspace_catalog_clear_tombstone(entry: &mut Value) {
+    let Value::Object(object) = entry else {
+        return;
+    };
+    for key in [
+        "pendingDelete",
+        "pending_delete",
+        "deleted",
+        "removed",
+        "tombstoned",
+        "deletedAtMs",
+        "deleted_at_ms",
+        "deletedAt",
+        "deleted_at",
+    ] {
+        object.remove(key);
+    }
+    for key in ["status", "workspace_status"] {
+        let should_remove = object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(|status| matches!(status, "deleted" | "archived" | "removed"))
+            .unwrap_or(false);
+        if should_remove {
+            object.remove(key);
+        }
+    }
+    if object
+        .get("current")
+        .and_then(Value::as_bool)
+        .map(|current| !current)
+        .unwrap_or(false)
+    {
+        object.insert("current".to_string(), json!(true));
+    }
+}
+
+fn local_workspace_catalog_live_workspace_ids(items: &[Value]) -> HashSet<String> {
+    items
+        .iter()
+        .filter(|item| !local_workspace_catalog_entry_is_deleted(item))
+        .filter_map(local_workspace_catalog_entry_id)
+        .collect()
+}
+
+fn local_workspace_catalog_store_items(
+    existing_items: Vec<Value>,
+    incoming_items: Vec<Value>,
+    workspace_settings: &Value,
+    now_ms: u64,
+) -> Result<Vec<Value>, String> {
+    let existing_tombstoned_ids = existing_items
+        .iter()
+        .filter(|item| local_workspace_catalog_entry_is_deleted(item))
+        .filter_map(local_workspace_catalog_entry_id)
+        .collect::<HashSet<_>>();
+    let mut incoming_ids = HashSet::new();
+    let mut prepared_incoming = Vec::with_capacity(incoming_items.len());
+
+    for mut item in incoming_items {
+        if let Some(workspace_id) = local_workspace_catalog_entry_id(&item) {
+            incoming_ids.insert(workspace_id.clone());
+            if existing_tombstoned_ids.contains(&workspace_id) {
+                local_workspace_catalog_clear_tombstone(&mut item);
+            }
+        }
+        prepared_incoming.push(item);
+    }
+
+    let mut merged_items =
+        local_workspace_catalog_normalize_items(prepared_incoming, workspace_settings)?;
+    for mut existing in existing_items {
+        let is_absent = local_workspace_catalog_entry_id(&existing)
+            .map(|workspace_id| !incoming_ids.contains(&workspace_id))
+            .unwrap_or(true);
+        if !is_absent {
+            continue;
+        }
+        if local_workspace_catalog_entry_is_deleted(&existing) {
+            local_workspace_catalog_ensure_tombstone_shape(&mut existing, now_ms);
+        } else {
+            local_workspace_catalog_mark_tombstoned(&mut existing, now_ms);
+        }
+        merged_items.push(existing);
+    }
+
+    let normalized_items =
+        local_workspace_catalog_normalize_items(merged_items, workspace_settings)?;
+    let mut retained_items = Vec::with_capacity(normalized_items.len());
+    for mut item in normalized_items {
+        if local_workspace_catalog_entry_is_deleted(&item) {
+            local_workspace_catalog_ensure_tombstone_shape(&mut item, now_ms);
+            if local_workspace_catalog_tombstone_is_expired(&item, now_ms) {
+                continue;
+            }
+        }
+        retained_items.push(item);
+    }
+    Ok(retained_items)
+}
+
 fn local_workspace_catalog_normalize_items(
     items: Vec<Value>,
     workspace_settings: &Value,
@@ -4276,6 +6019,118 @@ fn local_workspace_catalog_normalize_items(
     Ok(normalized_items)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LocalWorkspaceRootMatch {
+    Live,
+    Tombstoned(String),
+}
+
+fn local_workspace_catalog_scope_root_match(
+    path: &Path,
+    root_identity: &str,
+    workspace_settings: &Value,
+    now_ms: u64,
+) -> Result<Option<LocalWorkspaceRootMatch>, String> {
+    let items = local_workspace_catalog_read_items_from_path(path)?;
+    let mut tombstoned_match: Option<Value> = None;
+
+    for item in items {
+        if local_workspace_catalog_entry_is_deleted(&item)
+            && local_workspace_catalog_tombstone_is_expired(&item, now_ms)
+        {
+            continue;
+        }
+        let Some((candidate_identity, _)) =
+            local_workspace_catalog_root_identity(&item, workspace_settings)
+        else {
+            continue;
+        };
+        if candidate_identity != root_identity {
+            continue;
+        }
+        if !local_workspace_catalog_entry_is_deleted(&item) {
+            return Ok(Some(LocalWorkspaceRootMatch::Live));
+        }
+        if local_workspace_catalog_entry_id(&item).is_some() {
+            let should_replace = tombstoned_match
+                .as_ref()
+                .map(|current| {
+                    workspace_catalog_entry_updated_key(&item)
+                        > workspace_catalog_entry_updated_key(current)
+                })
+                .unwrap_or(true);
+            if should_replace {
+                tombstoned_match = Some(item);
+            }
+        }
+    }
+
+    Ok(tombstoned_match
+        .as_ref()
+        .and_then(local_workspace_catalog_entry_id)
+        .map(LocalWorkspaceRootMatch::Tombstoned))
+}
+
+fn local_workspace_reusable_id_for_root_in_dir(
+    store_dir: &Path,
+    scope_key: &str,
+    root_path: &str,
+    workspace_settings: &Value,
+) -> Result<Option<String>, String> {
+    let probe = json!({ "rootDirectory": root_path });
+    let Some((root_identity, _)) =
+        local_workspace_catalog_root_identity(&probe, workspace_settings)
+    else {
+        return Ok(None);
+    };
+    let now_ms = local_workspace_catalog_now_ms();
+    let primary_name = format!("{}.json", local_workspace_scope_file_key(scope_key));
+    let primary_path = store_dir.join(&primary_name);
+    match local_workspace_catalog_scope_root_match(
+        &primary_path,
+        &root_identity,
+        workspace_settings,
+        now_ms,
+    )? {
+        Some(LocalWorkspaceRootMatch::Live) => return Ok(None),
+        Some(LocalWorkspaceRootMatch::Tombstoned(workspace_id)) => return Ok(Some(workspace_id)),
+        None => {}
+    }
+
+    let entries = match fs::read_dir(store_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "Unable to read local workspace catalog directory: {error}"
+            ));
+        }
+    };
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("Unable to read workspace catalog entry: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        if path.file_name().and_then(|name| name.to_str()) == Some(primary_name.as_str()) {
+            continue;
+        }
+        if local_workspace_catalog_scope_root_match(
+            &path,
+            &root_identity,
+            workspace_settings,
+            now_ms,
+        )?
+        .is_some()
+        {
+            return Ok(None);
+        }
+    }
+
+    Ok(None)
+}
+
 fn local_workspace_catalog_all_workspace_ids(app: &AppHandle) -> Result<HashSet<String>, String> {
     let store_dir = local_workspace_store_dir(app)?;
     let mut ids = HashSet::new();
@@ -4315,24 +6170,74 @@ fn local_workspace_catalog_all_workspace_ids(app: &AppHandle) -> Result<HashSet<
     Ok(ids)
 }
 
-fn local_workspace_catalog_prune_orphan_workspace_settings(
-    app: &AppHandle,
-) -> Result<usize, String> {
-    let workspace_ids = local_workspace_catalog_all_workspace_ids(app)?;
-    let current = app_local_state_read(app, "workspace-settings");
-    let Some(current_object) = current.as_object() else {
-        return Ok(0);
+fn local_workspace_catalog_retained_workspace_ids_from_dir(
+    store_dir: &Path,
+    now_ms: u64,
+) -> Result<HashSet<String>, String> {
+    let mut ids = HashSet::new();
+    let entries = match fs::read_dir(store_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(ids),
+        Err(error) => {
+            return Err(format!(
+                "Unable to read local workspace catalog directory: {error}"
+            ));
+        }
     };
 
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("Unable to read workspace catalog entry: {error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        for item in local_workspace_catalog_read_items_from_path(&path)? {
+            if local_workspace_catalog_entry_is_deleted(&item)
+                && local_workspace_catalog_tombstone_is_expired(&item, now_ms)
+            {
+                continue;
+            }
+            if let Some(id) = local_workspace_catalog_entry_id(&item) {
+                ids.insert(id);
+            }
+        }
+    }
+
+    Ok(ids)
+}
+
+fn local_workspace_catalog_pruned_workspace_settings(
+    current: &Value,
+    retained_workspace_ids: &HashSet<String>,
+) -> Option<(Value, usize)> {
+    let current_object = current.as_object()?;
     let mut next_object = serde_json::Map::new();
     for (workspace_id, settings) in current_object {
-        if workspace_ids.contains(workspace_id) {
+        if retained_workspace_ids.contains(workspace_id) {
             next_object.insert(workspace_id.clone(), settings.clone());
         }
     }
     let removed = current_object.len().saturating_sub(next_object.len());
+    Some((Value::Object(next_object), removed))
+}
+
+fn local_workspace_catalog_prune_orphan_workspace_settings(
+    app: &AppHandle,
+) -> Result<usize, String> {
+    let store_dir = local_workspace_store_dir(app)?;
+    let workspace_ids = local_workspace_catalog_retained_workspace_ids_from_dir(
+        &store_dir,
+        local_workspace_catalog_now_ms(),
+    )?;
+    let current = app_local_state_read(app, "workspace-settings");
+    let Some((next, removed)) =
+        local_workspace_catalog_pruned_workspace_settings(&current, &workspace_ids)
+    else {
+        return Ok(0);
+    };
     if removed > 0 {
-        app_local_state_write(app, "workspace-settings", &Value::Object(next_object))?;
+        app_local_state_write(app, "workspace-settings", &next)?;
     }
     Ok(removed)
 }
@@ -4371,7 +6276,7 @@ fn local_workspace_catalog_entry_is_deleted(entry: &Value) -> bool {
         .unwrap_or(false)
 }
 
-/// Rust-owned app-local state files (app-data/app-state/<key>.json). These
+/// Rust-owned app-local state files (device-root/app-state/<key>.json). These
 /// replace webview localStorage for state that headless flows must read or
 /// mutate (workspace settings, lifecycle defaults, remote-control intents).
 /// The webview keeps localStorage as a synchronous cache and writes through.
@@ -4392,14 +6297,19 @@ fn app_local_state_path(app: &AppHandle, key: &str) -> Result<PathBuf, String> {
     if safe_key.is_empty() {
         return Err("App local state key is required.".to_string());
     }
-    let store_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?
-        .join("app-state");
+    let rel_path = PathBuf::from(DEVICE_APP_STATE_DIR).join(format!("{safe_key}.json"));
+    let strategy = if safe_key == "workspace-settings" {
+        DeviceDataMigrationStrategy::MergeAppStateWorkspaceSettings
+    } else {
+        DeviceDataMigrationStrategy::PreferNewest
+    };
+    let path = device_data_path(app, &rel_path, strategy)?;
+    let store_dir = path
+        .parent()
+        .ok_or_else(|| "Unable to resolve app state directory.".to_string())?;
     fs::create_dir_all(&store_dir)
         .map_err(|error| format!("Unable to create app state directory: {error}"))?;
-    Ok(store_dir.join(format!("{safe_key}.json")))
+    Ok(path)
 }
 
 pub(crate) fn app_local_state_read(app: &AppHandle, key: &str) -> Value {
@@ -4625,9 +6535,7 @@ fn tray_click_cached_action(background: bool) -> TrayClickAction {
     TrayClickAction::from_code(action)
 }
 
-fn tray_click_settings_read_or_seed(
-    app: &AppHandle,
-) -> Result<(TrayClickSettings, bool), String> {
+fn tray_click_settings_read_or_seed(app: &AppHandle) -> Result<(TrayClickSettings, bool), String> {
     let raw = app_local_state_read(app, TRAY_CLICK_SETTINGS_STATE_KEY);
     let (settings, should_write) = tray_click_settings_from_value(&raw);
     if should_write {
@@ -4641,10 +6549,7 @@ fn tray_click_settings_read_or_seed(
     Ok((settings, should_write))
 }
 
-fn tray_click_settings_save(
-    app: &AppHandle,
-    settings: TrayClickSettings,
-) -> Result<Value, String> {
+fn tray_click_settings_save(app: &AppHandle, settings: TrayClickSettings) -> Result<Value, String> {
     app_local_state_write(
         app,
         TRAY_CLICK_SETTINGS_STATE_KEY,
@@ -4885,12 +6790,12 @@ async fn tray_click_settings_update(
         let (mut settings, _) = tray_click_settings_read_or_seed(&app)?;
         let default_settings = TrayClickSettings::default();
         if let Some(action) = foreground_action.as_deref() {
-            settings.foreground_action = TrayClickAction::from_wire(action)
-                .unwrap_or(default_settings.foreground_action);
+            settings.foreground_action =
+                TrayClickAction::from_wire(action).unwrap_or(default_settings.foreground_action);
         }
         if let Some(action) = background_action.as_deref() {
-            settings.background_action = TrayClickAction::from_wire(action)
-                .unwrap_or(default_settings.background_action);
+            settings.background_action =
+                TrayClickAction::from_wire(action).unwrap_or(default_settings.background_action);
         }
         tray_click_settings_save(&app, settings)
     })
@@ -4953,12 +6858,47 @@ async fn close_app_after_terminal_shutdown(
     window: tauri::WebviewWindow,
 ) -> Result<(), String> {
     let window_label = window.label().to_string();
-    start_backend_app_shutdown(app, window_label)
+    let force_exit_result = schedule_app_force_exit(app.clone(), window_label.clone());
+    start_backend_app_shutdown_with_watchdog(app, window_label, force_exit_result)
+}
+
+#[tauri::command]
+async fn app_force_exit_now(app: AppHandle, reason: Option<String>) -> Result<(), String> {
+    let reason = normalize_app_force_exit_reason(reason, "app_force_exit_now");
+    log_terminal_crash_forensics_event(
+        "backend.app_force_exit_now.requested",
+        json!({
+            "reason": reason,
+        }),
+    );
+
+    match spawn_app_force_exit_thread(
+        app.clone(),
+        Some("main".to_string()),
+        Duration::from_millis(0),
+        "diffforge-app-force-exit-now",
+        reason.clone(),
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            eprintln!("Failed to spawn immediate app force-exit thread: {error}");
+            run_app_force_exit_tail(app, Some("main".to_string()), reason);
+            Ok(())
+        }
+    }
 }
 
 fn start_backend_app_shutdown(app: AppHandle, window_label: String) -> Result<(), String> {
-    let _ = begin_app_shutdown();
     let force_exit_result = schedule_app_force_exit(app.clone(), window_label.clone());
+    start_backend_app_shutdown_with_watchdog(app, window_label, force_exit_result)
+}
+
+fn start_backend_app_shutdown_with_watchdog(
+    app: AppHandle,
+    window_label: String,
+    force_exit_result: Result<(), String>,
+) -> Result<(), String> {
+    let _ = begin_app_shutdown();
 
     if APP_CLOSE_SHUTDOWN_IN_FLIGHT.swap(true, Ordering::SeqCst) {
         return force_exit_result;
@@ -4977,7 +6917,7 @@ fn restore_main_window(app: &AppHandle) -> bool {
         let _ = app.show();
     }
 
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_window("main") {
         let was_minimized = window.is_minimized().unwrap_or(false);
 
         if was_minimized {
@@ -5007,7 +6947,7 @@ fn present_main_window(app: &AppHandle) {
 }
 
 #[cfg(target_os = "macos")]
-fn main_window_apply_macos_mouse_moved_style(window: &tauri::WebviewWindow) {
+fn main_window_apply_macos_mouse_moved_style(window: &tauri::Window) {
     let window_for_main = window.clone();
     let _ = window.run_on_main_thread(move || {
         snipping_catch_objc("main_window_apply_mouse_moved_style", || {
@@ -5036,7 +6976,7 @@ fn start_main_window_cursor_watcher(app: &AppHandle) {
         let mut unchanged_focused_samples = 0u32;
 
         loop {
-            let Some(window) = app.get_webview_window("main") else {
+            let Some(window) = app.get_window("main") else {
                 last_snapshot = None;
                 focused_poll_ms = MAIN_WINDOW_CURSOR_POLL_MS;
                 unchanged_focused_samples = 0;
@@ -5155,7 +7095,7 @@ fn emit_deep_link_urls(app: &AppHandle, urls: Vec<String>) {
 fn focus_restored_main_window(app: &AppHandle) {
     let _ = app.show();
 
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_window("main") {
         if window.is_minimized().unwrap_or(false) {
             return;
         }
@@ -5313,7 +7253,7 @@ mod workspace_delete_local_metadata_tests {
 
 #[cfg(target_os = "macos")]
 fn main_window_needs_attention(app: &AppHandle) -> bool {
-    app.get_webview_window("main")
+    app.get_window("main")
         .map(|window| {
             window.is_minimized().unwrap_or(false)
                 || !window.is_visible().unwrap_or(true)
@@ -5560,7 +7500,7 @@ pub fn run() {
 
             #[cfg(windows)]
             {
-                if let Some(window) = app.get_webview_window("main") {
+                if let Some(window) = app.get_window("main") {
                     if let Ok(hwnd) = window.hwnd() {
                         pin_windows_hang_icon(hwnd.0);
                     }
@@ -5569,7 +7509,7 @@ pub fn run() {
 
             #[cfg(target_os = "macos")]
             {
-                if let Some(window) = app.get_webview_window("main") {
+                if let Some(window) = app.get_window("main") {
                     let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
                     main_window_apply_macos_mouse_moved_style(&window);
                 }
@@ -5593,6 +7533,7 @@ pub fn run() {
             desktop_auth_sign_out,
             local_workspaces_load,
             local_workspaces_store,
+            local_workspace_reusable_id_for_root,
             open_html_document_in_browser,
             workspace_webview_open,
             workspace_webview_adopt,
@@ -6077,7 +8018,8 @@ pub fn run() {
             coordination::tauri_commands::coordination_resolve_approval,
             coordination::tauri_commands::coordination_scan_workspace_violations,
             deactivate_workspace_runtime,
-            close_app_after_terminal_shutdown
+            close_app_after_terminal_shutdown,
+            app_force_exit_now
         ])
         .build(tauri::generate_context!())
         .expect("error while building Diff Forge AI desktop")

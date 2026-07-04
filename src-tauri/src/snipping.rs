@@ -1060,21 +1060,19 @@ fn default_snipping_settings() -> SnippingSettings {
 }
 
 fn snipping_shortcut_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?;
-
-    Ok(app_data_dir.join(SNIPPING_SHORTCUT_SETTINGS_FILE))
+    device_data_path(
+        app,
+        Path::new(SNIPPING_SHORTCUT_SETTINGS_FILE),
+        DeviceDataMigrationStrategy::PreferNewest,
+    )
 }
 
 fn snipping_dismissed_toasts_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?;
-
-    Ok(app_data_dir.join(SNIPPING_DISMISSED_TOASTS_FILE))
+    device_data_path(
+        app,
+        Path::new(SNIPPING_DISMISSED_TOASTS_FILE),
+        DeviceDataMigrationStrategy::PreferNewest,
+    )
 }
 
 fn snipping_shortcut_error_text(error: String) -> String {
@@ -1230,12 +1228,11 @@ struct SnippingDesktopIconsMarker {
 }
 
 fn snipping_desktop_icons_marker_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?;
-
-    Ok(app_data_dir.join(SNIPPING_DESKTOP_ICONS_MARKER_FILE))
+    device_data_path(
+        app,
+        Path::new(SNIPPING_DESKTOP_ICONS_MARKER_FILE),
+        DeviceDataMigrationStrategy::PreferNewest,
+    )
 }
 
 // Screen-side hides leave state worth a crash marker so a later app launch can
@@ -1759,7 +1756,7 @@ fn focus_main_window_for_snipping_permission(app: &AppHandle) {
         let _ = app.show();
     }
 
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
@@ -2503,7 +2500,7 @@ fn snipping_area_monitor_from_tauri_monitor(monitor: &tauri::Monitor) -> Snippin
 }
 
 fn snipping_current_area_monitor(app: &AppHandle) -> Result<SnippingAreaMonitor, String> {
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_window("main") {
         if let Ok(Some(monitor)) = window.current_monitor() {
             return Ok(snipping_area_monitor_from_tauri_monitor(&monitor));
         }
@@ -7981,7 +7978,7 @@ fn snipping_window_token(path: &Path) -> String {
 
 fn snipping_center_floating_window(app: &AppHandle, window: &tauri::WebviewWindow) {
     let monitor = app
-        .get_webview_window("main")
+        .get_window("main")
         .and_then(|main_window| main_window.current_monitor().ok().flatten())
         .or_else(|| window.current_monitor().ok().flatten());
     let Some(monitor) = monitor else {
@@ -8083,7 +8080,7 @@ fn snipping_open_annotation_editor_for_paths(
     // instead of floating inside empty chrome: image logical size plus the
     // tool rail / title bar / composer, clamped to the monitor work area.
     let monitor = app
-        .get_webview_window("main")
+        .get_window("main")
         .and_then(|main_window| main_window.current_monitor().ok().flatten());
     let scale = monitor
         .as_ref()
@@ -11445,7 +11442,7 @@ fn snipping_preview_stack_monitor_for_rect(
             })
         })
         .or_else(|| {
-            app.get_webview_window("main")
+            app.get_window("main")
                 .and_then(|main_window| main_window.current_monitor().ok().flatten())
         })
         .or_else(|| app.primary_monitor().ok().flatten())
@@ -11456,7 +11453,7 @@ fn snipping_preview_stack_active_monitor(app: &AppHandle) -> Option<tauri::Monit
         .ok()
         .and_then(|cursor| app.monitor_from_point(cursor.x, cursor.y).ok().flatten())
         .or_else(|| {
-            app.get_webview_window("main")
+            app.get_window("main")
                 .and_then(|main_window| main_window.current_monitor().ok().flatten())
         })
         .or_else(|| app.primary_monitor().ok().flatten())
@@ -12181,7 +12178,7 @@ fn snipping_preview_point_in_main(
     app: &AppHandle,
     preview: &tauri::WebviewWindow,
 ) -> Option<(f64, f64)> {
-    let main = app.get_webview_window("main")?;
+    let main = app.get_window("main")?;
     if !main.is_visible().unwrap_or(false) || main.is_minimized().unwrap_or(false) {
         return None;
     }

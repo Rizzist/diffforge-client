@@ -1308,6 +1308,62 @@ fn terminal_record_workspace_provider_session_binding(
     provider_session_id: String,
     source: impl Into<String>,
 ) {
+    terminal_record_workspace_provider_session_binding_with_transcript_path(
+        app,
+        instance,
+        provider_session_id,
+        source,
+        None,
+    );
+}
+
+fn terminal_register_native_transcript_watch(
+    app: &AppHandle,
+    instance: &TerminalInstance,
+    provider_session_id: &str,
+    transcript_path: Option<&str>,
+    source: &str,
+) {
+    let metadata = instance.metadata.clone();
+    let agent_id = terminal_normalize_agent_kind(Some(&metadata.agent_kind))
+        .or_else(|| terminal_normalize_agent_kind(Some(&metadata.agent_id)))
+        .unwrap_or_else(|| metadata.agent_id.clone());
+    let request = AgentThreadTranscriptNativeWatchRequest {
+        agent_id,
+        cwd: instance.working_directory.to_string_lossy().to_string(),
+        instance_id: Some(instance.id),
+        pane_id: metadata.pane_id,
+        provider_session_id: provider_session_id.to_string(),
+        source: source.to_string(),
+        terminal_index: metadata.terminal_index.map(i64::from),
+        thread_id: metadata.thread_id,
+        transcript_path: transcript_path
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        workspace_id: metadata.workspace_id,
+    };
+    if let Err(error) = register_agent_thread_transcript_native_watch(app, &request) {
+        log_terminal_status_event(
+            "backend.agent_thread_transcript.native_watch_error",
+            json!({
+                "error": clean_terminal_diagnostic_log_text(&error),
+                "instance_id": instance.id,
+                "pane_id": clean_terminal_diagnostic_log_text(&request.pane_id),
+                "provider_session_id_present": !provider_session_id.trim().is_empty(),
+                "source": source,
+            }),
+        );
+    }
+}
+
+fn terminal_record_workspace_provider_session_binding_with_transcript_path(
+    app: Option<AppHandle>,
+    instance: &TerminalInstance,
+    provider_session_id: String,
+    source: impl Into<String>,
+    transcript_path: Option<&str>,
+) {
     let source = source.into();
     let Some(binding) =
         terminal_provider_session_binding_payload(instance, &provider_session_id, &source)
@@ -1324,12 +1380,21 @@ fn terminal_record_workspace_provider_session_binding(
         instance,
         None,
         None,
-            &history_status,
+        &history_status,
         format!("{source}:provider-session"),
         None,
     );
     let root_directory = terminal_provider_session_binding_root(instance);
     let emit_app = app.clone();
+    if let Some(app) = app.as_ref() {
+        terminal_register_native_transcript_watch(
+            app,
+            instance,
+            &provider_session_id,
+            transcript_path,
+            &source,
+        );
+    }
     tauri::async_runtime::spawn_blocking(move || {
         match workspace_threads_record_provider_session_binding(
             Some(root_directory.as_str()),
@@ -1634,11 +1699,12 @@ fn spawn_terminal_codex_session_discovery(
                 &provider_session_id,
                 "codex-transcript-discovery",
             );
-            terminal_record_workspace_provider_session_binding(
+            terminal_record_workspace_provider_session_binding_with_transcript_path(
                 Some(app.clone()),
                 &current_instance,
                 provider_session_id.clone(),
                 "codex-transcript-discovery",
+                Some(discovered.rollout_path.as_str()),
             );
             if let Some(coordination) = current_instance.coordination.clone() {
                 terminal_record_coordination_provider_session_id(
@@ -1940,7 +2006,7 @@ fn emit_terminal_audio_input_refocus(
     target: &TerminalAudioInputTarget,
     inserted_text: Option<&str>,
 ) {
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_window("main") {
         let _ = window.show();
         let _ = window.set_focus();
     }
@@ -2639,6 +2705,7 @@ fn cleanup_terminal_instance_with_context(
         app_control_mcp_requested: _,
     } = instance;
     let metadata_fields = terminal_metadata_forensics_json(&metadata);
+    unregister_agent_thread_transcript_native_watch(&metadata.pane_id, Some(id));
     log_terminal_crash_forensics_event(
         "backend.terminal_cleanup.begin",
         json!({
@@ -14187,11 +14254,12 @@ fn apply_terminal_activity_hook_payload(
             terminal_recordable_provider_session_id_for_metadata(&instance.metadata, Some(value))
         })
     {
-        terminal_record_workspace_provider_session_binding(
+        terminal_record_workspace_provider_session_binding_with_transcript_path(
             Some(app.clone()),
             instance,
             provider_session_id.clone(),
             "terminal_activity_hook",
+            payload.transcript_path.as_deref(),
         );
         if let Some(coordination) = instance.coordination.clone() {
             terminal_record_coordination_provider_session_id(
@@ -17449,8 +17517,30 @@ async fn terminal_close_all(
     cloud_mcp_state: State<'_, CloudMcpState>,
 ) -> Result<TerminalCloseAllResult, String> {
     let lifecycle_lock = Arc::clone(&state.lifecycle_lock);
-    let _lifecycle_guard = lifecycle_lock.lock().await;
-    let closed = close_all_terminal_sessions(app, &state, cloud_mcp_state.inner(), None).await?;
+    let close_result = timeout(
+        Duration::from_secs(TERMINAL_CLOSE_ALL_LIFECYCLE_TIMEOUT_SECS),
+        async {
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            close_all_terminal_sessions(app, &state, cloud_mcp_state.inner(), None).await
+        },
+    )
+    .await;
+    let closed = match close_result {
+        Ok(result) => result?,
+        Err(_) => {
+            let error = format!(
+                "Timed out after {TERMINAL_CLOSE_ALL_LIFECYCLE_TIMEOUT_SECS}s closing all terminal sessions."
+            );
+            eprintln!("{error}");
+            log_terminal_crash_forensics_event(
+                "backend.terminal_close_all.lifecycle_timeout",
+                json!({
+                    "timeout_secs": TERMINAL_CLOSE_ALL_LIFECYCLE_TIMEOUT_SECS,
+                }),
+            );
+            return Err(error);
+        }
+    };
 
     Ok(TerminalCloseAllResult { closed })
 }
@@ -17765,7 +17855,7 @@ fn terminal_drag_spawn_watcher(app: AppHandle, generation: u64) {
             sleep(Duration::from_millis(TERMINAL_DRAG_POLL_MS)).await;
 
             // Backstop: never outlive the main window or a sane drag duration.
-            if app.get_webview_window("main").is_none()
+            if app.get_window("main").is_none()
                 || terminal_now_ms().saturating_sub(started_ms) > TERMINAL_DRAG_MAX_MS
             {
                 clear_active(&active_label);

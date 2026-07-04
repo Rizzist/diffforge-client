@@ -10,6 +10,7 @@
     "core:window:allow-available-monitors",
     "core:window:allow-close",
     "core:window:allow-current-monitor",
+    "core:window:allow-destroy",
     "core:window:allow-is-fullscreen",
     "core:window:allow-is-maximized",
     "core:window:allow-minimize",

@@ -25,11 +25,11 @@ const AUDIO_HISTORY_IDLE_CLOSE_SECS: u64 = 30;
 static AUDIO_HISTORY_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn audio_history_db_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?
-        .join(AUDIO_HISTORY_DB_DIR);
+    let dir = device_data_path(
+        app,
+        Path::new(AUDIO_HISTORY_DB_DIR),
+        DeviceDataMigrationStrategy::PreferNewest,
+    )?;
     fs::create_dir_all(&dir)
         .map_err(|error| format!("Unable to create audio history directory: {error}"))?;
     Ok(dir.join(AUDIO_HISTORY_DB_FILE))

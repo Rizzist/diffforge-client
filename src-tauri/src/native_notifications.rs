@@ -38,7 +38,7 @@ fn diffforge_native_notify(
 }
 
 fn diffforge_main_window_focused(app: &AppHandle) -> bool {
-    app.get_webview_window("main")
+    app.get_window("main")
         .and_then(|window| window.is_focused().ok())
         .unwrap_or(false)
 }

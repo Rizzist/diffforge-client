@@ -3163,12 +3163,11 @@ fn finish_native_audio_capture_for_session(
 }
 
 fn whisper_model_directory(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?;
-
-    Ok(app_data_dir.join("whisper"))
+    device_data_path(
+        app,
+        Path::new("whisper"),
+        DeviceDataMigrationStrategy::PreferNewest,
+    )
 }
 
 fn whisper_model_definition(model_id: &str) -> Option<&'static WhisperModelDefinition> {
@@ -6740,7 +6739,7 @@ fn audio_widget_macos_screen_for_mouse(
 
 #[cfg(target_os = "macos")]
 fn audio_widget_macos_screen_for_tauri_window(
-    window: &tauri::WebviewWindow,
+    window: &tauri::Window,
 ) -> Option<objc2::rc::Retained<objc2_app_kit::NSScreen>> {
     let Ok(ns_ptr) = window.ns_window() else {
         return None;
@@ -6791,7 +6790,7 @@ fn audio_widget_macos_target_screen_for_bottom_bar(
         .or_else(|| audio_widget_macos_screen_for_mouse(main_thread_marker))
         .or_else(|| ns_window.screen())
         .or_else(|| {
-            app.get_webview_window("main")
+            app.get_window("main")
                 .and_then(|window| audio_widget_macos_screen_for_tauri_window(&window))
         })
         .or_else(|| objc2_app_kit::NSScreen::mainScreen(main_thread_marker))

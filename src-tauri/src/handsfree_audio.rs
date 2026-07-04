@@ -13,6 +13,16 @@ const MACOS_KEYBOARD_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.Keyboard-Settings.extension";
 #[cfg(target_os = "macos")]
 const MACOS_FN_KEY_CODE: u16 = 63;
+#[cfg(target_os = "macos")]
+const MACOS_HANDSFREE_AX_ERROR_NO_VALUE: i32 = -25212;
+#[cfg(target_os = "macos")]
+const MACOS_HANDSFREE_AX_ERROR_ATTRIBUTE_UNSUPPORTED: i32 = -25205;
+#[cfg(target_os = "macos")]
+const MACOS_HANDSFREE_AX_ERROR_UNTRUSTED: i32 = -40_001;
+#[cfg(target_os = "macos")]
+const MACOS_HANDSFREE_AX_ERROR_SYSTEM_WIDE_UNAVAILABLE: i32 = -40_002;
+#[cfg(target_os = "macos")]
+const MACOS_HANDSFREE_AX_ERROR_UNEXPECTED_ATTRIBUTE_TYPE: i32 = -40_003;
 
 static AUDIO_PUSH_TO_TALK_IS_DOWN: AtomicBool = AtomicBool::new(false);
 static AUDIO_FN_BINDING_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -50,6 +60,14 @@ static AUDIO_CONTEXT_MENU_HOOK_APP: OnceLock<StdMutex<Option<AppHandle>>> = Once
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     static kAXTrustedCheckOptionPrompt: *const std::ffi::c_void;
+    #[link_name = "AXUIElementCreateSystemWide"]
+    fn handsfree_ax_ui_element_create_system_wide() -> *const std::ffi::c_void;
+    #[link_name = "AXUIElementIsAttributeSettable"]
+    fn handsfree_ax_ui_element_is_attribute_settable(
+        element: *const std::ffi::c_void,
+        attribute: *const std::ffi::c_void,
+        settable: *mut std::os::raw::c_uchar,
+    ) -> i32;
     fn AXIsProcessTrusted() -> std::os::raw::c_uchar;
     fn AXIsProcessTrustedWithOptions(
         options: *const std::ffi::c_void,
@@ -220,12 +238,11 @@ fn default_audio_shortcut_bindings() -> AudioShortcutBindings {
 }
 
 fn audio_shortcut_settings_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("Unable to resolve app data directory: {error}"))?;
-
-    Ok(app_data_dir.join(AUDIO_SHORTCUT_SETTINGS_FILE))
+    device_data_path(
+        app,
+        Path::new(AUDIO_SHORTCUT_SETTINGS_FILE),
+        DeviceDataMigrationStrategy::PreferNewest,
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1975,7 +1992,7 @@ fn focus_main_window_for_audio_attention(app: &AppHandle) {
         let _ = app.show();
     }
 
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = app.get_window("main") {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
@@ -2360,6 +2377,187 @@ fn insert_text_with_enigo(text: &str) -> Result<(), String> {
         .map_err(|error| format!("Unable to insert transcript into the focused target: {error}"))
 }
 
+fn handsfree_focused_element_attributes_are_editable(
+    role: Option<&str>,
+    subrole: Option<&str>,
+    value_attribute_settable: bool,
+) -> bool {
+    const EDITABLE_ROLES: &[&str] = &["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"];
+    const EDITABLE_SUBROLES: &[&str] = &["AXSecureTextField", "AXSearchField"];
+
+    role.is_some_and(|role| EDITABLE_ROLES.contains(&role))
+        || subrole.is_some_and(|subrole| EDITABLE_SUBROLES.contains(&subrole))
+        || value_attribute_settable
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HandsfreeFocusedElementAttributes {
+    role: Option<String>,
+    subrole: Option<String>,
+    value_attribute_settable: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl HandsfreeFocusedElementAttributes {
+    fn is_editable(&self) -> bool {
+        handsfree_focused_element_attributes_are_editable(
+            self.role.as_deref(),
+            self.subrole.as_deref(),
+            self.value_attribute_settable,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HandsfreeFocusedElementProbe {
+    Editable(HandsfreeFocusedElementAttributes),
+    NotEditable(HandsfreeFocusedElementAttributes),
+    NoFocusedElement,
+}
+
+#[cfg(target_os = "macos")]
+fn handsfree_ax_attribute_is_absent(error: i32) -> bool {
+    matches!(
+        error,
+        MACOS_AX_ERROR_SUCCESS
+            | MACOS_HANDSFREE_AX_ERROR_NO_VALUE
+            | MACOS_HANDSFREE_AX_ERROR_ATTRIBUTE_UNSUPPORTED
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn handsfree_ax_optional_string_attribute(
+    element: *const std::ffi::c_void,
+    attribute: &'static str,
+) -> Result<Option<String>, i32> {
+    match audio_widget_ax_copy_attribute_value(element, attribute) {
+        Ok(value) => {
+            let cf_value = unsafe { &*value.cast::<objc2_core_foundation::CFType>() };
+            let result = cf_value
+                .downcast_ref::<objc2_core_foundation::CFString>()
+                .map(ToString::to_string)
+                .ok_or(MACOS_HANDSFREE_AX_ERROR_UNEXPECTED_ATTRIBUTE_TYPE);
+            audio_widget_cf_release(value);
+            result.map(Some)
+        }
+        Err(error) if handsfree_ax_attribute_is_absent(error) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn handsfree_ax_value_attribute_settable(
+    element: *const std::ffi::c_void,
+) -> Result<bool, i32> {
+    let attribute_string = objc2_core_foundation::CFString::from_static_str("AXValue");
+    let attribute_ref =
+        attribute_string.as_ref() as *const objc2_core_foundation::CFString;
+    let mut settable: std::os::raw::c_uchar = 0;
+    let error = unsafe {
+        handsfree_ax_ui_element_is_attribute_settable(
+            element,
+            attribute_ref.cast(),
+            &mut settable,
+        )
+    };
+
+    if error == MACOS_AX_ERROR_SUCCESS {
+        Ok(settable != 0)
+    } else if handsfree_ax_attribute_is_absent(error) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn handsfree_ax_focused_element_probe() -> Result<HandsfreeFocusedElementProbe, i32> {
+    if unsafe { audio_widget_ax_is_process_trusted() == 0 } {
+        return Err(MACOS_HANDSFREE_AX_ERROR_UNTRUSTED);
+    }
+
+    let system_wide = unsafe { handsfree_ax_ui_element_create_system_wide() };
+    if system_wide.is_null() {
+        return Err(MACOS_HANDSFREE_AX_ERROR_SYSTEM_WIDE_UNAVAILABLE);
+    }
+
+    let focused_element =
+        match audio_widget_ax_copy_attribute_value(system_wide, "AXFocusedUIElement") {
+            Ok(focused_element) => Some(focused_element),
+            Err(error)
+                if matches!(error, MACOS_AX_ERROR_SUCCESS | MACOS_HANDSFREE_AX_ERROR_NO_VALUE) =>
+            {
+                None
+            }
+            Err(error) => {
+                audio_widget_cf_release(system_wide);
+                return Err(error);
+            }
+        };
+    audio_widget_cf_release(system_wide);
+
+    let Some(focused_element) = focused_element else {
+        return Ok(HandsfreeFocusedElementProbe::NoFocusedElement);
+    };
+
+    let attributes: Result<HandsfreeFocusedElementAttributes, i32> = (|| {
+        let role = handsfree_ax_optional_string_attribute(focused_element, "AXRole")?;
+        let subrole = handsfree_ax_optional_string_attribute(focused_element, "AXSubrole")?;
+        let value_attribute_settable = handsfree_ax_value_attribute_settable(focused_element)?;
+        Ok(HandsfreeFocusedElementAttributes {
+            role,
+            subrole,
+            value_attribute_settable,
+        })
+    })();
+    audio_widget_cf_release(focused_element);
+
+    let attributes = attributes?;
+    if attributes.is_editable() {
+        Ok(HandsfreeFocusedElementProbe::Editable(attributes))
+    } else {
+        Ok(HandsfreeFocusedElementProbe::NotEditable(attributes))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn handsfree_ax_focused_element_probe_on_main_thread(
+    app: &AppHandle,
+) -> Result<HandsfreeFocusedElementProbe, i32> {
+    match run_audio_widget_action_on_main_thread(
+        app,
+        "handsfree_focused_element_probe",
+        |_| Ok(handsfree_ax_focused_element_probe()),
+    ) {
+        Ok(probe_result) => probe_result,
+        Err(error) => {
+            log_audio_diagnostic_event(
+                "audio.handsfree.insert.focus_probe.main_thread_error",
+                json!({
+                    "error": clean_whisper_local_audio_log_text(&error),
+                }),
+            );
+            Err(MACOS_HANDSFREE_AX_ERROR_SYSTEM_WIDE_UNAVAILABLE)
+        }
+    }
+}
+
+fn handsfree_insert_result(inserted: bool, method: &'static str, reason: Option<&'static str>) -> Value {
+    match reason {
+        Some(reason) => json!({
+            "inserted": inserted,
+            "method": method,
+            "reason": reason,
+        }),
+        None => json!({
+            "inserted": inserted,
+            "method": method,
+        }),
+    }
+}
+
 #[tauri::command]
 async fn audio_shortcuts_status(app: AppHandle) -> Result<AudioShortcutSettingsStatus, String> {
     log_audio_diagnostic_event("audio.shortcuts.status.command", json!({}));
@@ -2428,12 +2626,8 @@ async fn insert_handsfree_transcribed_text(
     terminal_state: State<'_, TerminalState>,
     cloud_mcp_state: State<'_, CloudMcpState>,
     text: String,
-) -> Result<AudioWidgetVisibility, String> {
+) -> Result<Value, String> {
     let text = clean_transcript_for_insert(text)?;
-    let widget_visible = app
-        .get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
-        .and_then(|window| window.is_visible().ok())
-        .unwrap_or(false);
     let terminal_target = active_terminal_audio_input_target(&terminal_state)?;
     let terminal_target_owned_insert =
         terminal_audio_target_should_own_insert(&app, &terminal_state, terminal_target.as_ref())?;
@@ -2441,11 +2635,7 @@ async fn insert_handsfree_transcribed_text(
     if write_to_active_terminal_audio_input_target(&app, &terminal_state, &cloud_mcp_state, &text)
         .await?
     {
-        return Ok(AudioWidgetVisibility {
-            visible: widget_visible,
-            installed: whisper_model_status_for(&app)?.installed,
-            shortcut: audio_push_to_talk_shortcut_for(&app),
-        });
+        return Ok(handsfree_insert_result(true, "terminal", None));
     }
 
     if terminal_target_owned_insert {
@@ -2459,20 +2649,65 @@ async fn insert_handsfree_transcribed_text(
 
     let insert_result = tauri::async_runtime::spawn_blocking(move || {
         thread::sleep(Duration::from_millis(AUDIO_HANDSFREE_INSERT_DELAY_MS));
-        insert_text_with_enigo(&text)
+
+        #[cfg(target_os = "macos")]
+        match handsfree_ax_focused_element_probe_on_main_thread(&app) {
+            Ok(HandsfreeFocusedElementProbe::Editable(attributes)) => {
+                log_audio_diagnostic_event(
+                    "audio.handsfree.insert.focus_probe.editable",
+                    json!({
+                        "role": attributes.role,
+                        "subrole": attributes.subrole,
+                        "value_attribute_settable": attributes.value_attribute_settable,
+                    }),
+                );
+                insert_text_with_enigo(&text)?;
+                return Ok(handsfree_insert_result(true, "keystrokes", None));
+            }
+            Ok(HandsfreeFocusedElementProbe::NotEditable(attributes)) => {
+                log_audio_diagnostic_event(
+                    "audio.handsfree.insert.focus_probe.not_editable",
+                    json!({
+                        "role": attributes.role,
+                        "subrole": attributes.subrole,
+                        "value_attribute_settable": attributes.value_attribute_settable,
+                    }),
+                );
+                // Typing into a non-editable target makes macOS ring the alert
+                // sound for every keystroke. The transcript is already saved in
+                // the Audio tab, and the user's clipboard must stay untouched.
+                return Ok(handsfree_insert_result(
+                    false,
+                    "none",
+                    Some("no_editable_focus"),
+                ));
+            }
+            Ok(HandsfreeFocusedElementProbe::NoFocusedElement) => {
+                log_audio_diagnostic_event(
+                    "audio.handsfree.insert.focus_probe.no_focused_element",
+                    json!({}),
+                );
+                return Ok(handsfree_insert_result(
+                    false,
+                    "none",
+                    Some("no_editable_focus"),
+                ));
+            }
+            Err(error) => {
+                log_audio_diagnostic_event(
+                    "audio.handsfree.insert.focus_probe.error_fallback",
+                    json!({ "error": error }),
+                );
+            }
+        }
+
+        insert_text_with_enigo(&text)?;
+        Ok(handsfree_insert_result(true, "keystrokes", None))
     })
     .await
     .map_err(|error| format!("Unable to insert transcript: {error}"))?;
 
-    if let Err(error) = insert_result {
-        return Err(error);
-    }
-
-    Ok(AudioWidgetVisibility {
-        visible: widget_visible,
-        installed: whisper_model_status_for(&app)?.installed,
-        shortcut: audio_push_to_talk_shortcut_for(&app),
-    })
+    insert_result
 }
 
 #[cfg(test)]
@@ -2525,5 +2760,71 @@ mod tests {
             false,
             "Alt+KeyP",
         ));
+    }
+
+    #[test]
+    fn focused_element_classifier_accepts_editable_roles() {
+        for role in ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"] {
+            assert!(handsfree_focused_element_attributes_are_editable(
+                Some(role),
+                None,
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn focused_element_classifier_accepts_secure_and_search_subroles() {
+        for subrole in ["AXSecureTextField", "AXSearchField"] {
+            assert!(handsfree_focused_element_attributes_are_editable(
+                Some("AXGroup"),
+                Some(subrole),
+                false,
+            ));
+        }
+    }
+
+    #[test]
+    fn focused_element_classifier_accepts_settable_value_attribute() {
+        assert!(handsfree_focused_element_attributes_are_editable(
+            Some("AXButton"),
+            None,
+            true,
+        ));
+    }
+
+    #[test]
+    fn focused_element_classifier_rejects_non_editable_combinations() {
+        assert!(!handsfree_focused_element_attributes_are_editable(
+            Some("AXButton"),
+            None,
+            false,
+        ));
+        assert!(!handsfree_focused_element_attributes_are_editable(
+            None,
+            Some("AXStandardWindow"),
+            false,
+        ));
+        assert!(!handsfree_focused_element_attributes_are_editable(
+            None,
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn handsfree_insert_result_matches_return_contract() {
+        assert_eq!(
+            handsfree_insert_result(true, "terminal", None),
+            json!({ "inserted": true, "method": "terminal" }),
+        );
+        assert_eq!(
+            handsfree_insert_result(false, "none", Some("no_editable_focus")),
+            json!({
+                "inserted": false,
+                "method": "none",
+                "reason": "no_editable_focus",
+            }),
+        );
     }
 }

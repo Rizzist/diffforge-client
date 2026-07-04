@@ -4,6 +4,9 @@ import react from "@vitejs/plugin-react";
 export default defineConfig({
   clearScreen: false,
   envPrefix: ["VITE_", "TAURI_"],
+  // Keep component/function names through minification so runtime diagnostics
+  // (renderLoopProbe commit-storm censuses) report real names, not "ti"/"Zo".
+  esbuild: { keepNames: true },
   plugins: [react()],
   server: {
     host: "127.0.0.1",

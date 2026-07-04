@@ -636,7 +636,11 @@ async function loadAccountSkills({ force = false } = {}) {
       applyAccountSkills(mergeSkillUnits(workspaceToolsStore.skills, units));
     } catch {
       // Offline or transient failure: keep the local cache. Docs are account
-      // data, not a tab-scoped loading surface.
+      // data, not a tab-scoped loading surface. A FAILED revalidate must still
+      // arm the TTL: leaving skillsFetchedAtMs unset let every caller refetch
+      // at full speed while offline (fast-failing cloud invoke → store notify
+      // → re-render → refetch = a commit storm). Change events still force.
+      workspaceToolsStore.skillsFetchedAtMs = Date.now();
       if (!workspaceToolsStore.skillsLoaded) {
         applyAccountSkills([]);
       }

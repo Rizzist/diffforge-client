@@ -485,6 +485,8 @@ const EMPTY_ORCHESTRATOR_VOICE_STATS = {
   rms: 0,
   timeDomainSamples: [],
 };
+/* Floor between React commits of live mic stats (~17x/s at the source). */
+const ORCHESTRATOR_VOICE_STATS_MIN_MS = 150;
 
 function clampOrchestratorVoiceLevel(value) {
   const level = Number(value);
@@ -17224,11 +17226,6 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     String(workspaceToolTabMemoryRef?.current || "").trim() || "orchestrator"
   ));
   const activeWorkspaceTool = controlledWorkspaceToolId || uncontrolledActiveWorkspaceTool || "orchestrator";
-  // Docs/Tokens keep-alive: once a tab has been visited its surface stays
-  // mounted (hidden via [hidden]) so switching back is instant instead of a
-  // full remount (store subscriptions, tokenomics polling setup, chart build).
-  const [visitedWorkspaceTools] = useState(() => new Set());
-  visitedWorkspaceTools.add(activeWorkspaceTool);
   const [spaceMode, setSpaceMode] = useState(getForgeSpaceMode);
   const loopspacesModeActive = spaceMode === "loopspaces";
   useEffect(() => {
@@ -17264,9 +17261,16 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     const loopspaceToolAvailable = LOOPSPACE_ONLY_WORKSPACE_TOOL_TAB_IDS.has(activeWorkspaceTool)
       && getForgeSpaceMode() === "loopspaces";
     if (!workspaceToolTabs.some((tool) => tool.id === activeWorkspaceTool) && !loopspaceToolAvailable) {
-      commitWorkspaceToolTab("orchestrator");
+      // LOCAL fallback only (pre-optimization behavior). Committing here wrote
+      // the shared memory ref and notified the App: with two keep-alive
+      // runtime panels mounted, the visible panel re-pinned its tab into the
+      // shared ref while a panel without that tab pushed "orchestrator" back
+      // — an infinite cross-instance commit ping-pong that pegged the webview
+      // until WebKit's CPU watchdog killed it ("crash" on opening a second
+      // workspace).
+      setUncontrolledActiveWorkspaceTool("orchestrator");
     }
-  }, [activeWorkspaceTool, commitWorkspaceToolTab, workspaceToolTabs]);
+  }, [activeWorkspaceTool, workspaceToolTabs]);
   const selectWorkspaceToolTab = useCallback((toolId) => {
     const safeToolId = String(toolId || "").trim();
     const loopspaceToolAvailable = LOOPSPACE_ONLY_WORKSPACE_TOOL_TAB_IDS.has(safeToolId)
@@ -17277,24 +17281,28 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     commitWorkspaceToolTab(safeToolId);
     return true;
   }, [commitWorkspaceToolTab, workspaceToolTabs]);
+  const selectWorkspaceToolTabRef = useRef(selectWorkspaceToolTab);
+  selectWorkspaceToolTabRef.current = selectWorkspaceToolTab;
   useEffect(() => {
     if (!workspaceToolTabControlRef) {
       return undefined;
     }
-    workspaceToolTabControlRef.current = selectWorkspaceToolTab;
-    // A programmatic switch can land between render and this effect (it writes
-    // the memory ref but finds the control ref still null) — reconcile so the
-    // request isn't dropped for the current mount.
+    const invoke = (toolId) => selectWorkspaceToolTabRef.current(toolId);
+    workspaceToolTabControlRef.current = invoke;
+    // Mount-only reconcile: catch a programmatic switch that landed between
+    // render and this effect. Re-running this on every tab change re-pushed
+    // the shared memory ref into every mounted panel and could loop.
     const rememberedTool = String(workspaceToolTabMemoryRef?.current || "").trim();
     if (rememberedTool && rememberedTool !== activeWorkspaceTool) {
-      selectWorkspaceToolTab(rememberedTool);
+      invoke(rememberedTool);
     }
     return () => {
-      if (workspaceToolTabControlRef.current === selectWorkspaceToolTab) {
+      if (workspaceToolTabControlRef.current === invoke) {
         workspaceToolTabControlRef.current = null;
       }
     };
-  }, [activeWorkspaceTool, selectWorkspaceToolTab, workspaceToolTabControlRef, workspaceToolTabMemoryRef]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [workspaceToolTabControlRef, workspaceToolTabMemoryRef]);
 
   // Prefetch account docs as soon as the orchestrator panel mounts so the Docs
   // tab opens instantly, never "loading".
@@ -17378,6 +17386,31 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   const orchestratorVoiceEventRuntimeRef = useRef({});
   const orchestratorVoiceMonitorRef = useRef(null);
   const orchestratorVoiceRunRef = useRef(0);
+  // Mic stats arrive ~17x/second while a voice session is live; committing
+  // each one re-renders this entire component. Latest value lands in the ref
+  // and React state updates at most once per ORCHESTRATOR_VOICE_STATS_MIN_MS.
+  const orchestratorVoiceLatestStatsRef = useRef(null);
+  const orchestratorVoiceStatsTimerRef = useRef(0);
+
+  const pushOrchestratorVoiceStats = useCallback((runId, stats) => {
+    if (orchestratorVoiceRunRef.current !== runId) {
+      return;
+    }
+    orchestratorVoiceLatestStatsRef.current = stats || {};
+    if (orchestratorVoiceStatsTimerRef.current) {
+      return;
+    }
+    orchestratorVoiceStatsTimerRef.current = window.setTimeout(() => {
+      orchestratorVoiceStatsTimerRef.current = 0;
+      if (orchestratorVoiceRunRef.current !== runId) {
+        return;
+      }
+      setOrchestratorVoiceStats({
+        ...EMPTY_ORCHESTRATOR_VOICE_STATS,
+        ...(orchestratorVoiceLatestStatsRef.current || {}),
+      });
+    }, ORCHESTRATOR_VOICE_STATS_MIN_MS);
+  }, []);
   const orchestratorVoiceSessionRef = useRef(Date.now());
   const orchestratorVoiceClientSessionIdRef = useRef("");
   const orchestratorVoiceServerSessionIdRef = useRef("");
@@ -19855,14 +19888,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       monitor = await startLowPowerAudioBuffer({
         deviceId: readSelectedAudioInputDeviceId(),
         owner: ORCHESTRATOR_VOICE_OWNER,
-        onStats: (stats) => {
-          if (orchestratorVoiceRunRef.current === runId) {
-            setOrchestratorVoiceStats({
-              ...EMPTY_ORCHESTRATOR_VOICE_STATS,
-              ...(stats || {}),
-            });
-          }
-        },
+        onStats: (stats) => pushOrchestratorVoiceStats(runId, stats),
       });
 
       if (orchestratorVoiceRunRef.current !== runId) {
@@ -19982,14 +20008,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       monitor = await startLowPowerAudioBuffer({
         deviceId: readSelectedAudioInputDeviceId(),
         owner: ORCHESTRATOR_VOICE_OWNER,
-        onStats: (stats) => {
-          if (orchestratorVoiceRunRef.current === runId) {
-            setOrchestratorVoiceStats({
-              ...EMPTY_ORCHESTRATOR_VOICE_STATS,
-              ...(stats || {}),
-            });
-          }
-        },
+        onStats: (stats) => pushOrchestratorVoiceStats(runId, stats),
       });
       if (orchestratorVoiceRunRef.current !== runId) {
         await monitor?.close?.().catch(() => {});
@@ -21359,8 +21378,12 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           />
         </WorkspaceToolSurface>
       )}
-      {visitedWorkspaceTools.has("tools") ? (
-        <WorkspaceToolSurface data-tool="tools" hidden={activeWorkspaceTool !== "tools"}>
+      {/* Restored pre-optimization behavior: only the ACTIVE tool tab is
+          mounted. The keep-alive variant left hidden surfaces subscribed to
+          live stores (tokenomics scans, agent accounts), re-rendering behind
+          [hidden] at event rate for every keep-alive workspace runtime. */}
+      {activeWorkspaceTool === "tools" ? (
+        <WorkspaceToolSurface data-tool="tools">
           <WorkspaceToolsDragPanel
             coordinationTargets={coordinationTargets}
             documentPanelEnabled={documentPanelEnabled}
@@ -21512,7 +21535,13 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
               ref={appControlAgentSurfaceRef}
             >
               <ResizePanelGroup
-                id="orchestrator-agent-terminal-panes"
+                // MUST be instance-unique: react-resizable-panels keys its
+                // module-level layout store by this id. Two keep-alive
+                // workspace runtimes both mounting the fixed id registered
+                // into ONE store entry and re-laid each other out in an
+                // infinite notify loop (webview pegged → WebKit CPU-kill)
+                // whenever a second workspace was opened.
+                id={`orchestrator-agent-terminal-panes-${orchestratorPanelWorkspaceId || rootDirectory || "default"}`}
                 orientation="vertical"
               >
                 {appControlAgentTerminals.map((terminal, terminalOrderIndex) => (
@@ -22500,8 +22529,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             ) : null}
           </OrchestratorContent>
         </OrchestratorView>
-      {visitedWorkspaceTools.has("tokenomics") ? (
-        <WorkspaceToolSurface data-tool="tokenomics" hidden={activeWorkspaceTool !== "tokenomics"}>
+      {activeWorkspaceTool === "tokenomics" ? (
+        <WorkspaceToolSurface data-tool="tokenomics">
           <AccountTokenomicsView
             accountKey={accountKey}
             billingStatus={billingStatus}
@@ -28475,9 +28504,29 @@ function TerminalView({
     }
 
     const frameId = window.requestAnimationFrame(() => {
-      terminalGridPanelRef.current?.resize?.(`${terminalGridPanelSize}%`);
-      todoQueuePanelRef.current?.resize?.(`${todoQueuePanelSize}%`);
-      scheduleMeasureTerminalLayout();
+      // Guarded imperative resize: an unconditional resize() notifies the
+      // panel-group store (re-rendering every Panel/Separator subscriber) and
+      // the follow-up measure feeds back into the derived sizes — with float
+      // jitter that looped at full speed. v4 getSize() returns
+      // { asPercentage, inPixels }.
+      const panelPercent = (panel) => {
+        const size = panel?.getSize?.();
+        return typeof size === "number" ? size : Number(size?.asPercentage);
+      };
+      let resized = false;
+      const gridCurrent = panelPercent(terminalGridPanelRef.current);
+      if (!Number.isFinite(gridCurrent) || Math.abs(gridCurrent - terminalGridPanelSize) > 0.5) {
+        terminalGridPanelRef.current?.resize?.(`${terminalGridPanelSize}%`);
+        resized = true;
+      }
+      const queueCurrent = panelPercent(todoQueuePanelRef.current);
+      if (!Number.isFinite(queueCurrent) || Math.abs(queueCurrent - todoQueuePanelSize) > 0.5) {
+        todoQueuePanelRef.current?.resize?.(`${todoQueuePanelSize}%`);
+        resized = true;
+      }
+      if (resized) {
+        scheduleMeasureTerminalLayout();
+      }
     });
 
     return () => window.cancelAnimationFrame(frameId);
@@ -29594,6 +29643,13 @@ function TerminalView({
       return;
     }
     invoke("web_panel_focus", { label }).catch(() => {});
+    // Fallback: the host window raises itself (its own set_focus permission)
+    // in case the Rust-side focus is ignored by the OS.
+    emit(WEB_PANEL_COMMAND_EVENT, {
+      action: "focus",
+      paneId: safePaneId,
+      windowId: label,
+    }).catch(() => {});
   }, []);
 
   // ---- PCB pane pop-out (its own native panel window) ----
@@ -40028,6 +40084,7 @@ function TerminalView({
                   dragActive={terminalDragActive}
                   layoutKey={webLayoutKey}
                   poppedOut={Boolean(webBreakoutPanes[terminalPaneId])}
+                  breakoutReturnUrl={webPaneUrlsRef.current[terminalPaneId] || ""}
                   webviewObscured={workspaceWebviewObscured}
                   adoptLabel={webPaneAdoptions[terminalPaneId]?.label || ""}
                   adoptNonce={webPaneAdoptions[terminalPaneId]?.nonce || 0}
