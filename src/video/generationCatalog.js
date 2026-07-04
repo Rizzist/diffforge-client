@@ -138,7 +138,6 @@ export const GENERATION_MODELS = [
     kind: "video",
     jobType: "kling3_0",
     displayName: "Kling 3.0",
-    disabled: true,
     caps: {
       durations: [5, 10],
       defaultDuration: 5,
@@ -157,7 +156,6 @@ export const GENERATION_MODELS = [
     kind: "video",
     jobType: "kling3_0_turbo",
     displayName: "Kling 3.0 Turbo",
-    disabled: true,
     caps: {
       durations: [5, 10],
       defaultDuration: 5,
@@ -175,7 +173,6 @@ export const GENERATION_MODELS = [
     kind: "video",
     jobType: "kling2_6",
     displayName: "Kling 2.6",
-    disabled: true,
     caps: {
       durations: [5, 10],
       defaultDuration: 5,
@@ -193,25 +190,26 @@ export const GENERATION_MODELS = [
     kind: "video",
     jobType: "seedance_2_0",
     displayName: "Seedance 2.0",
-    disabled: true,
+    description: "Multimodal, native audio (via fal)",
     caps: {
-      durations: [4, 5, 8, 10, 12],
+      durations: [4, 5, 8, 10, 12, 15],
       defaultDuration: 5,
       aspectRatios: VIDEO_ASPECTS,
+      // fal caps: 720p for start-frame runs, 1080p with references only.
       resolutions: ["480p", "720p", "1080p"],
       supportsStartFrame: true,
       supportsEndFrame: true,
       maxReferenceImages: 4,
-      supportsSound: false,
+      supportsSound: true,
     },
-    est: { usdPerSecond: 0.05 },
+    // fal standard tier ≈ $0.30/s at 720p.
+    est: { usdPerSecond: 0.30 },
   },
   {
     id: "seedance-1.5-pro",
     kind: "video",
     jobType: "seedance_1_5_pro",
     displayName: "Seedance 1.5 Pro",
-    disabled: true,
     caps: {
       durations: [5, 10],
       defaultDuration: 5,
@@ -229,7 +227,6 @@ export const GENERATION_MODELS = [
     kind: "video",
     jobType: "veo3_1",
     displayName: "Veo 3.1",
-    disabled: true,
     caps: {
       durations: [4, 6, 8],
       defaultDuration: 8,
@@ -247,7 +244,6 @@ export const GENERATION_MODELS = [
     kind: "video",
     jobType: "veo3_1_lite",
     displayName: "Veo 3.1 Lite",
-    disabled: true,
     caps: {
       durations: [4, 6, 8],
       defaultDuration: 8,
@@ -265,7 +261,6 @@ export const GENERATION_MODELS = [
     kind: "video",
     jobType: "wan2_7",
     displayName: "Wan 2.7",
-    disabled: true,
     caps: {
       durations: [5, 10],
       defaultDuration: 5,
@@ -283,7 +278,6 @@ export const GENERATION_MODELS = [
     kind: "video",
     jobType: "minimax_hailuo",
     displayName: "MiniMax Hailuo",
-    disabled: true,
     caps: {
       durations: [6, 10],
       defaultDuration: 6,
@@ -301,7 +295,6 @@ export const GENERATION_MODELS = [
     kind: "video",
     jobType: "grok_video_1_5",
     displayName: "Grok Video 1.5",
-    disabled: true,
     caps: {
       durations: [6],
       defaultDuration: 6,
@@ -375,7 +368,6 @@ export const GENERATION_MODELS = [
     kind: "image",
     jobType: "nano_banana_pro",
     displayName: "Nano Banana Pro",
-    disabled: true,
     caps: {
       aspectRatios: IMAGE_ASPECTS,
       resolutions: ["1k", "2k", "4k"],
@@ -389,7 +381,6 @@ export const GENERATION_MODELS = [
     kind: "image",
     jobType: "nano_banana_2",
     displayName: "Nano Banana 2",
-    disabled: true,
     caps: {
       aspectRatios: IMAGE_ASPECTS,
       resolutions: ["1k", "2k"],
@@ -403,7 +394,6 @@ export const GENERATION_MODELS = [
     kind: "image",
     jobType: "flux_2",
     displayName: "FLUX.2",
-    disabled: true,
     caps: {
       aspectRatios: IMAGE_ASPECTS,
       resolutions: ["1k", "2k"],
@@ -418,7 +408,6 @@ export const GENERATION_MODELS = [
     jobType: "flux_kontext",
     displayName: "FLUX Kontext",
     description: "Edit an existing image with instructions",
-    disabled: true,
     caps: {
       aspectRatios: IMAGE_ASPECTS,
       maxImages: 1,
@@ -432,7 +421,6 @@ export const GENERATION_MODELS = [
     kind: "image",
     jobType: "gpt_image_2",
     displayName: "GPT Image 2",
-    disabled: true,
     caps: {
       aspectRatios: ["1:1", "3:2", "2:3"],
       qualities: ["low", "medium", "high"],
@@ -447,7 +435,6 @@ export const GENERATION_MODELS = [
     jobType: "text2image_soul_v2",
     displayName: "Soul V2",
     description: "Higgsfield's photorealistic portrait model",
-    disabled: true,
     caps: {
       aspectRatios: ["1:1", "3:4"],
       qualities: ["standard", "hd"],
@@ -461,7 +448,6 @@ export const GENERATION_MODELS = [
     kind: "image",
     jobType: "seedream_v4_5",
     displayName: "Seedream 4.5",
-    disabled: true,
     caps: {
       aspectRatios: IMAGE_ASPECTS,
       resolutions: ["2k", "4k"],
@@ -475,7 +461,6 @@ export const GENERATION_MODELS = [
     kind: "image",
     jobType: "seedream_v5_lite",
     displayName: "Seedream V5 Lite",
-    disabled: true,
     caps: {
       aspectRatios: IMAGE_ASPECTS,
       resolutions: ["1k", "2k"],
@@ -489,7 +474,6 @@ export const GENERATION_MODELS = [
     kind: "image",
     jobType: "grok_image",
     displayName: "Grok Image",
-    disabled: true,
     caps: {
       aspectRatios: ["16:9", "9:16", "1:1"],
       maxImages: 4,
@@ -502,7 +486,6 @@ export const GENERATION_MODELS = [
     kind: "image",
     jobType: "recraft_v4_1",
     displayName: "Recraft V4.1",
-    disabled: true,
     caps: {
       aspectRatios: IMAGE_ASPECTS,
       maxImages: 4,

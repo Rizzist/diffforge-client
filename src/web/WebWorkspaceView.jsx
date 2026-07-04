@@ -286,6 +286,7 @@ export default function WebWorkspaceView({
       breakoutReturnUrl={currentUrl}
       defaultPanelAgentPromptTargetIds={defaultAgentPromptTargetIds}
       initialUrl={currentUrl}
+      inlineToolbarInNav
       isActive={isActive}
       layoutKey={layoutKey}
       onAgentPromptOpenChange={handleAgentPromptOpenChange}

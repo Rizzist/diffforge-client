@@ -429,6 +429,7 @@ import {
   IntroCopy,
   Kicker,
   Headline,
+  HeadlineAccent,
   Lede,
   IntroFeatureList,
   IntroFeature,
@@ -936,6 +937,7 @@ import {
   VIEW_TRANSITION_MS
 } from "./appStyles";
 import WorkspaceIdleState, { AuthSquareBackdrop } from "./WorkspaceIdleState.jsx";
+import { PlusUpsellOverlay } from "./PlusUpsell.jsx";
 import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
 import {
   accountDocumentHydrateRequestFromSkill,
@@ -2357,8 +2359,26 @@ function liveCreditHasMeaningfulSnapshot(credits) {
   return creditSnapshotHasMeaningfulData(credits);
 }
 
-function normalizeLiveCreditWallet(wallet, previous = {}) {
-  return normalizeCreditWallet(wallet, previous);
+function normalizeLiveCreditWallet(wallet, previous = {}, options = {}) {
+  return normalizeCreditWallet(wallet, previous, options);
+}
+
+function liveCreditEventKind(value) {
+  return String(value?.kind || value?.event_kind || value?.eventKind || "").trim();
+}
+
+function liveCreditSnapshotIsAuthoritative(wallet, snapshot = {}) {
+  const object = liveCreditObject(liveCreditObject(wallet)?.credits)
+    || liveCreditObject(liveCreditObject(wallet)?.wallet)
+    || liveCreditObject(wallet);
+  if (!object) return false;
+  if (object.known === false && object.live !== true) return false;
+  const eventKind = liveCreditEventKind(snapshot);
+  return snapshot?.contract === "diffforge.account_usage.v1"
+    || eventKind === "account_usage_snapshot"
+    || eventKind.startsWith("credit_wallet_")
+    || object.known === true
+    || object.live === true;
 }
 
 function billingStatusHasMeaningfulData(status) {
@@ -2372,7 +2392,7 @@ function billingStatusHasMeaningfulData(status) {
   );
 }
 
-function mergeBillingStatusSnapshot(previous, incoming) {
+function mergeBillingStatusSnapshot(previous, incoming, options = {}) {
   if (!billingStatusHasMeaningfulData(incoming)) {
     return previous || null;
   }
@@ -2387,7 +2407,9 @@ function mergeBillingStatusSnapshot(previous, incoming) {
     ...(incoming || {}),
   };
   if (incomingCredits) {
-    next.credits = normalizeLiveCreditWallet(incomingCredits, previousCredits) || incomingCredits;
+    next.credits = normalizeLiveCreditWallet(incomingCredits, previousCredits, {
+      preferIncomingTotals: Boolean(options?.preferIncomingCredits),
+    }) || incomingCredits;
   } else if (previousCredits && liveCreditHasMeaningfulSnapshot(previousCredits)) {
     next.credits = previousCredits;
   }
@@ -4962,22 +4984,78 @@ function cloudStorageUsageFromRuntimeStatus(status) {
 
 function cloudAccountUsageSnapshotFromEventPayload(payload) {
   const envelope = payload && typeof payload === "object" ? payload : {};
-  const direct = envelope.accountUsage
+  const liveRuntime = envelope.liveRuntimeStatus || envelope.live_runtime_status || {};
+  const data = envelope.data && typeof envelope.data === "object" ? envelope.data : null;
+  const payloadObject = envelope.payload && typeof envelope.payload === "object" ? envelope.payload : null;
+  const direct = envelope.accountUsageSnapshot
+    || envelope.account_usage_snapshot
+    || envelope.runtimeAccountUsage
+    || envelope.runtime_account_usage
+    || envelope.accountUsage
     || envelope.account_usage
-    || envelope.data
+    || envelope.billingStatus
+    || envelope.billing_status
+    || envelope.accountStatus
+    || envelope.account_status
+    || liveRuntime.accountUsageSnapshot
+    || liveRuntime.account_usage_snapshot
+    || liveRuntime.runtimeAccountUsage
+    || liveRuntime.runtime_account_usage
+    || liveRuntime.accountUsage
+    || liveRuntime.account_usage
+    || payloadObject?.accountUsageSnapshot
+    || payloadObject?.account_usage_snapshot
+    || payloadObject?.runtimeAccountUsage
+    || payloadObject?.runtime_account_usage
+    || payloadObject?.accountUsage
+    || payloadObject?.account_usage
+    || payloadObject?.billingStatus
+    || payloadObject?.billing_status
+    || data?.accountUsageSnapshot
+    || data?.account_usage_snapshot
+    || data?.runtimeAccountUsage
+    || data?.runtime_account_usage
+    || data?.accountUsage
+    || data?.account_usage
+    || data?.billingStatus
+    || data?.billing_status
+    || (data && Object.keys(data).length ? data : null)
+    || (String(envelope.contract || "") === "diffforge.account_usage.v1"
+      ? envelope.payload
+      : null)
     || (String(envelope.kind || envelope.event_kind || envelope.eventKind || "") === "account_usage_snapshot"
       ? envelope.payload
       : null)
     || envelope;
   const snapshot = direct && typeof direct === "object" ? direct : {};
+  const nestedData = snapshot.data && typeof snapshot.data === "object" ? snapshot.data : {};
   const nestedPayload = snapshot.payload && typeof snapshot.payload === "object" ? snapshot.payload : {};
+  const billingStatus = snapshot.billingStatus
+    || snapshot.billing_status
+    || snapshot.accountStatus
+    || snapshot.account_status
+    || nestedData.billingStatus
+    || nestedData.billing_status
+    || nestedData.accountStatus
+    || nestedData.account_status
+    || nestedPayload.billingStatus
+    || nestedPayload.billing_status
+    || nestedPayload.accountStatus
+    || nestedPayload.account_status
+    || {};
   const credits = snapshot.credits
     || snapshot.wallet
+    || billingStatus.credits
+    || billingStatus.wallet
+    || nestedData.credits
+    || nestedData.wallet
     || nestedPayload.credits
     || nestedPayload.wallet
     || null;
   const storageUsage = snapshot.storageUsage
     || snapshot.storage_usage
+    || nestedData.storageUsage
+    || nestedData.storage_usage
     || nestedPayload.storageUsage
     || nestedPayload.storage_usage
     || null;
@@ -4986,6 +5064,33 @@ function cloudAccountUsageSnapshotFromEventPayload(payload) {
     credits: credits && typeof credits === "object" ? credits : null,
     storageUsage: storageUsage && typeof storageUsage === "object" ? storageUsage : null,
   };
+}
+
+function billingStatusFromAccountUsagePayload(payload, previousBillingStatus = null) {
+  const { snapshot, credits } = cloudAccountUsageSnapshotFromEventPayload(payload);
+  const sourceCredits = credits || snapshot?.credits;
+  if (!liveCreditHasMeaningfulSnapshot(sourceCredits)) {
+    return null;
+  }
+  const preferIncomingCredits = liveCreditSnapshotIsAuthoritative(sourceCredits, snapshot);
+  if (!preferIncomingCredits && sourceCredits?.known === false && sourceCredits?.live !== true) {
+    return null;
+  }
+  const normalizedCredits = normalizeLiveCreditWallet(sourceCredits, previousBillingStatus?.credits, {
+    preferIncomingTotals: preferIncomingCredits,
+  });
+  if (!normalizedCredits) {
+    return null;
+  }
+  return mergeBillingStatusSnapshot(previousBillingStatus, {
+    credits: normalizedCredits,
+    planName: normalizedCredits.planName || snapshot?.planName || snapshot?.plan_name || previousBillingStatus?.planName || previousBillingStatus?.plan_name,
+    plan_name: normalizedCredits.planName || snapshot?.plan_name || snapshot?.planName || previousBillingStatus?.plan_name || previousBillingStatus?.planName,
+    planStatus: snapshot?.planStatus || snapshot?.plan_status || previousBillingStatus?.planStatus || previousBillingStatus?.plan_status || "paid",
+    plan_status: snapshot?.plan_status || snapshot?.planStatus || previousBillingStatus?.plan_status || previousBillingStatus?.planStatus || "paid",
+  }, {
+    preferIncomingCredits,
+  });
 }
 
 function sanitizeWorkspaceMcpServerForCloud(server) {
@@ -8427,6 +8532,8 @@ function LoopspaceRuntimeView({
   const sendMessageCheckpointDragPositionsRef = useRef({});
   const nodeSizesRef = useRef({});
   const nodeResizeObserverRef = useRef(null);
+  const nodeResizeObserverFrameRef = useRef(0);
+  const nodeResizeObserverEntriesRef = useRef(new Map());
   const nodeElementsRef = useRef(new Map());
   const loopspaceAgentLaunchDefaultsRef = useRef(agentLaunchDefaults);
 
@@ -8506,10 +8613,23 @@ function LoopspaceRuntimeView({
       return nodeResizeObserverRef.current;
     }
     const observer = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        const nodeId = entry.target?.getAttribute?.("data-loopspace-graph-node-id");
-        if (nodeId) recordGraphNodeSize(nodeId, entry.target);
+      Array.from(entries || []).forEach((entry) => {
+        if (entry?.target) {
+          nodeResizeObserverEntriesRef.current.set(entry.target, entry);
+        }
+      });
+      if (nodeResizeObserverFrameRef.current) {
+        window.cancelAnimationFrame(nodeResizeObserverFrameRef.current);
       }
+      nodeResizeObserverFrameRef.current = window.requestAnimationFrame(() => {
+        nodeResizeObserverFrameRef.current = 0;
+        const nextEntries = Array.from(nodeResizeObserverEntriesRef.current.values());
+        nodeResizeObserverEntriesRef.current.clear();
+        for (const entry of nextEntries) {
+          const nodeId = entry.target?.getAttribute?.("data-loopspace-graph-node-id");
+          if (nodeId) recordGraphNodeSize(nodeId, entry.target);
+        }
+      });
     });
     nodeResizeObserverRef.current = observer;
     return observer;
@@ -8543,8 +8663,13 @@ function LoopspaceRuntimeView({
   }, [ensureNodeResizeObserver, recordGraphNodeSize]);
 
   useEffect(() => () => {
+    if (nodeResizeObserverFrameRef.current) {
+      window.cancelAnimationFrame(nodeResizeObserverFrameRef.current);
+      nodeResizeObserverFrameRef.current = 0;
+    }
     nodeResizeObserverRef.current?.disconnect?.();
     nodeResizeObserverRef.current = null;
+    nodeResizeObserverEntriesRef.current.clear();
     nodeElementsRef.current = new Map();
   }, []);
 
@@ -18123,39 +18248,18 @@ function getWorkspaceDocumentCount(workspaceSettings, workspaceId) {
 }
 
 function getWorkspacePcbCount(workspaceSettings, workspaceId) {
-  const settings = workspaceSettings?.[workspaceId];
   const paneCount = getWorkspacePcbPaneIndexes(workspaceSettings, workspaceId).length;
-  if (paneCount > 0) {
-    return normalizeWorkspacePcbCount(paneCount);
-  }
-  if (!settings || !Object.prototype.hasOwnProperty.call(settings, "pcbCount")) {
-    return DEFAULT_WORKSPACE_PCB_COUNT;
-  }
-  return normalizeWorkspacePcbCount(settings.pcbCount);
+  return normalizeWorkspacePcbCount(paneCount);
 }
 
 function getWorkspaceVmCount(workspaceSettings, workspaceId) {
-  const settings = workspaceSettings?.[workspaceId];
   const paneCount = getWorkspaceVmPaneIndexes(workspaceSettings, workspaceId).length;
-  if (paneCount > 0) {
-    return normalizeWorkspaceVmCount(paneCount);
-  }
-  if (!settings || !Object.prototype.hasOwnProperty.call(settings, "vmCount")) {
-    return DEFAULT_WORKSPACE_VM_COUNT;
-  }
-  return normalizeWorkspaceVmCount(settings.vmCount);
+  return normalizeWorkspaceVmCount(paneCount);
 }
 
 function getWorkspaceVideoCount(workspaceSettings, workspaceId) {
-  const settings = workspaceSettings?.[workspaceId];
   const paneCount = getWorkspaceVideoPaneIndexes(workspaceSettings, workspaceId).length;
-  if (paneCount > 0) {
-    return normalizeWorkspaceVideoCount(paneCount);
-  }
-  if (!settings || !Object.prototype.hasOwnProperty.call(settings, "videoCount")) {
-    return DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT;
-  }
-  return normalizeWorkspaceVideoCount(settings.videoCount);
+  return normalizeWorkspaceVideoCount(paneCount);
 }
 
 function getWorkspaceTerminalRoleIds(roleOptions = WORKSPACE_TERMINAL_ROLE_OPTIONS) {
@@ -18799,61 +18903,15 @@ function normalizeWorkspaceSettings(value) {
             ? MAX_WORKSPACE_DOCUMENT_COUNT
             : DEFAULT_WORKSPACE_DOCUMENT_COUNT;
         const hasDefaultDocumentsCount = documentsCount === DEFAULT_WORKSPACE_DOCUMENT_COUNT;
-        const hasPcbCount = Object.prototype.hasOwnProperty.call(settings || {}, "pcbCount");
-        let pcbCount = hasPcbCount
-          ? normalizeWorkspacePcbCount(settings.pcbCount)
-          : DEFAULT_WORKSPACE_PCB_COUNT;
-        const hasVmCount = Object.prototype.hasOwnProperty.call(settings || {}, "vmCount");
-        let vmCount = hasVmCount
-          ? normalizeWorkspaceVmCount(settings.vmCount)
-          : DEFAULT_WORKSPACE_VM_COUNT;
-        const hasVideoCount = Object.prototype.hasOwnProperty.call(settings || {}, "videoCount");
-        let videoCount = hasVideoCount
-          ? normalizeWorkspaceVideoCount(settings.videoCount)
-          : DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT;
         let paneKinds = {
           ...normalizeWorkspacePaneKinds(settings?.paneKinds),
           ...inputPaneKinds,
         };
-        const existingPcbPaneCount = workspacePaneKindsPcbIndexes(paneKinds).length;
-        if (!hasPcbCount && existingPcbPaneCount > 0) {
-          pcbCount = normalizeWorkspacePcbCount(existingPcbPaneCount);
-        }
-        const existingVmPaneCount = workspacePaneKindsVmIndexes(paneKinds).length;
-        if (!hasVmCount && existingVmPaneCount > 0) {
-          vmCount = normalizeWorkspaceVmCount(existingVmPaneCount);
-        }
-        const existingVideoPaneCount = workspacePaneKindsVideoIndexes(paneKinds).length;
-        if (!hasVideoCount && existingVideoPaneCount > 0) {
-          videoCount = normalizeWorkspaceVideoCount(existingVideoPaneCount);
-        }
-        let hydratedPanes = ensureWorkspacePaneKindCount(
-          paneKinds,
-          terminalRoles,
-          WORKSPACE_PANE_KIND_PCB,
-          pcbCount,
-          terminalRoles[0] || "codex",
-        );
-        hydratedPanes = ensureWorkspacePaneKindCount(
-          hydratedPanes.paneKinds,
-          hydratedPanes.terminalRoles,
-          WORKSPACE_PANE_KIND_VM,
-          vmCount,
-          terminalRoles[0] || "codex",
-        );
-        hydratedPanes = ensureWorkspacePaneKindCount(
-          hydratedPanes.paneKinds,
-          hydratedPanes.terminalRoles,
-          WORKSPACE_PANE_KIND_VIDEO,
-          videoCount,
-          terminalRoles[0] || "codex",
-        );
-        paneKinds = hydratedPanes.paneKinds;
-        terminalRoles = hydratedPanes.terminalRoles;
+        terminalRoles = expandTerminalRolesForPaneKinds(terminalRoles, paneKinds, terminalRoles[0] || "codex");
         terminalCount = terminalRoles.length;
-        pcbCount = workspacePaneKindsPcbIndexes(paneKinds).length;
-        vmCount = workspacePaneKindsVmIndexes(paneKinds).length;
-        videoCount = workspacePaneKindsVideoIndexes(paneKinds).length;
+        const pcbCount = workspacePaneKindsPcbIndexes(paneKinds).length;
+        const vmCount = workspacePaneKindsVmIndexes(paneKinds).length;
+        const videoCount = workspacePaneKindsVideoIndexes(paneKinds).length;
         const hasLogicalTerminalIndexes = Object.prototype.hasOwnProperty.call(settings || {}, "logicalTerminalIndexes");
         const logicalTerminalIndexes = hasLogicalTerminalIndexes
           ? normalizePersistedWorkspaceLogicalIndexes(settings.logicalTerminalIndexes, terminalCount, paneKinds)
@@ -18871,9 +18929,15 @@ function normalizeWorkspaceSettings(value) {
           );
           terminalCount = terminalRoles.length;
         }
+        const minimizedPaneIndexes = Array.isArray(logicalTerminalIndexes)
+          ? normalizeWorkspaceMinimizedPaneIndexes(settings?.minimizedPaneIndexes, logicalTerminalIndexes)
+          : [];
+        const visibleLogicalTerminalIndexes = Array.isArray(logicalTerminalIndexes)
+          ? getWorkspaceVisibleLogicalTerminalIndexes(logicalTerminalIndexes, minimizedPaneIndexes)
+          : [];
         const hasDisplayRows = Object.prototype.hasOwnProperty.call(settings || {}, "displayRows");
         const displayRows = hasDisplayRows && Array.isArray(logicalTerminalIndexes)
-          ? normalizePersistedWorkspaceDisplayRows(settings.displayRows, logicalTerminalIndexes)
+          ? normalizePersistedWorkspaceDisplayRows(settings.displayRows, visibleLogicalTerminalIndexes)
           : null;
         const hasDefaultPcbCount = pcbCount === DEFAULT_WORKSPACE_PCB_COUNT;
         const hasDefaultVmCount = vmCount === DEFAULT_WORKSPACE_VM_COUNT;
@@ -18938,6 +19002,7 @@ function normalizeWorkspaceSettings(value) {
             ...(hasPanelPanes ? { paneKinds } : {}),
             ...(Array.isArray(logicalTerminalIndexes) ? { logicalTerminalIndexes } : {}),
             ...(Array.isArray(displayRows) ? { displayRows } : {}),
+            ...(minimizedPaneIndexes.length ? { minimizedPaneIndexes } : {}),
             agentPermissions,
           },
         ];
@@ -21429,6 +21494,11 @@ function getWorkspaceVideoPaneIndexes(workspaceSettings, workspaceId) {
   return workspacePaneKindsVideoIndexes(getWorkspacePaneKinds(workspaceSettings, workspaceId));
 }
 
+function getWorkspaceMinimizedPaneIndexes(workspaceSettings, workspaceId, logicalTerminalIndexes = null) {
+  const settings = workspaceSettings?.[workspaceId] || {};
+  return normalizeWorkspaceMinimizedPaneIndexes(settings?.minimizedPaneIndexes, logicalTerminalIndexes);
+}
+
 function expandTerminalRolesForPaneKinds(terminalRoles, paneKinds, fallbackRole = "codex") {
   const nextRoles = Array.isArray(terminalRoles) ? terminalRoles.slice(0, MAX_WORKSPACE_TERMINAL_COUNT) : [];
   const paneIndexes = workspacePaneKindsIndexes(paneKinds);
@@ -21457,28 +21527,6 @@ function expandTerminalRolesForSlotIndexes(terminalRoles, slotIndexes, fallbackR
   }
 
   return nextRoles;
-}
-
-function ensureWorkspacePaneKindCount(paneKinds, terminalRoles, paneKind, targetCount, fallbackRole = "codex") {
-  const nextPaneKinds = normalizeWorkspacePaneKinds(paneKinds);
-  const nextRoles = expandTerminalRolesForPaneKinds(terminalRoles, nextPaneKinds, fallbackRole);
-  let paneIndexes = workspacePaneKindsIndexes(nextPaneKinds, paneKind);
-  const desiredCount = Math.max(0, Math.min(
-    MAX_WORKSPACE_TERMINAL_COUNT,
-    Number.parseInt(targetCount, 10) || 0,
-  ));
-
-  while (paneIndexes.length < desiredCount && nextRoles.length < MAX_WORKSPACE_TERMINAL_COUNT) {
-    const paneIndex = nextRoles.length;
-    nextPaneKinds[paneIndex] = paneKind;
-    nextRoles.push(fallbackRole || "codex");
-    paneIndexes = [...paneIndexes, paneIndex];
-  }
-
-  return {
-    paneKinds: nextPaneKinds,
-    terminalRoles: nextRoles,
-  };
 }
 
 function normalizeWorkspaceWebPanelCount(value) {
@@ -21511,6 +21559,20 @@ function normalizeWorkspaceTerminalSlotIndexes(indexes) {
 
     return normalizedIndexes;
   }, []);
+}
+
+function normalizeWorkspaceMinimizedPaneIndexes(indexes, logicalTerminalIndexes = null) {
+  const logicalIndexSet = Array.isArray(logicalTerminalIndexes)
+    ? new Set(normalizeWorkspaceTerminalSlotIndexes(logicalTerminalIndexes))
+    : null;
+  return normalizeWorkspaceTerminalSlotIndexes(indexes)
+    .filter((terminalIndex) => !logicalIndexSet || logicalIndexSet.has(terminalIndex));
+}
+
+function getWorkspaceVisibleLogicalTerminalIndexes(logicalTerminalIndexes, minimizedPaneIndexes = []) {
+  const minimizedIndexSet = new Set(normalizeWorkspaceMinimizedPaneIndexes(minimizedPaneIndexes, logicalTerminalIndexes));
+  return normalizeWorkspaceTerminalSlotIndexes(logicalTerminalIndexes)
+    .filter((terminalIndex) => !minimizedIndexSet.has(terminalIndex));
 }
 
 function reconcileWorkspaceTerminalSlotIndexes(indexes, count) {
@@ -21580,6 +21642,9 @@ function flattenWorkspaceDisplayRows(rows) {
 
 function normalizeWorkspaceDisplayTerminalRows(layoutRows, terminalIndexes) {
   const logicalIndexes = normalizeWorkspaceTerminalSlotIndexes(terminalIndexes);
+  if (!logicalIndexes.length) {
+    return [];
+  }
   const logicalIndexSet = new Set(logicalIndexes);
   const usedIndexes = new Set();
   const rows = [];
@@ -21722,7 +21787,9 @@ function workspaceSettingsDisplayLayouts(workspaceSettings = {}) {
         ])
         : normalizeWorkspaceTerminalIndexes(undefined, terminalCount)
     );
-    const displayRows = normalizePersistedWorkspaceDisplayRows(settings.displayRows, logicalIndexes);
+    const minimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(settings?.minimizedPaneIndexes, logicalIndexes);
+    const visibleLogicalIndexes = getWorkspaceVisibleLogicalTerminalIndexes(logicalIndexes, minimizedPaneIndexes);
+    const displayRows = normalizePersistedWorkspaceDisplayRows(settings.displayRows, visibleLogicalIndexes);
     if (Array.isArray(displayRows)) {
       layouts[workspaceId] = displayRows;
     }
@@ -21830,10 +21897,8 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
   const hasTerminalRoles = Object.prototype.hasOwnProperty.call(nextValues, "terminalRoles");
   const hasLogicalTerminalIndexes = Object.prototype.hasOwnProperty.call(nextValues, "logicalTerminalIndexes");
   const hasDisplayRows = Object.prototype.hasOwnProperty.call(nextValues, "displayRows");
+  const hasMinimizedPaneIndexes = Object.prototype.hasOwnProperty.call(nextValues, "minimizedPaneIndexes");
   const hasDocumentsCount = Object.prototype.hasOwnProperty.call(nextValues, "documentsCount");
-  const hasPcbCount = Object.prototype.hasOwnProperty.call(nextValues, "pcbCount");
-  const hasVmCount = Object.prototype.hasOwnProperty.call(nextValues, "vmCount");
-  const hasVideoCount = Object.prototype.hasOwnProperty.call(nextValues, "videoCount");
   const hasPaneKinds = Object.prototype.hasOwnProperty.call(nextValues, "paneKinds");
   const hasPanes = Object.prototype.hasOwnProperty.call(nextValues, "panes");
   const hasAgentPermissions = Object.prototype.hasOwnProperty.call(nextValues, "agentPermissions");
@@ -21842,9 +21907,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     || hasLogicalTerminalIndexes
     || hasTerminalCount
     || hasTerminalRoles
-    || hasPcbCount
-    || hasVmCount
-    || hasVideoCount;
+    || hasMinimizedPaneIndexes;
   const inputPanes = normalizeWorkspacePaneRecords(
     hasPanes
       ? nextValues.panes
@@ -21901,72 +21964,17 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
           : DEFAULT_WORKSPACE_DOCUMENT_COUNT,
   );
   const hasDefaultDocumentsCount = documentsCount === DEFAULT_WORKSPACE_DOCUMENT_COUNT;
-  let pcbCount = normalizeWorkspacePcbCount(
-    hasPcbCount
-      ? nextValues.pcbCount
-      : Object.prototype.hasOwnProperty.call(currentSettings, "pcbCount")
-        ? currentSettings.pcbCount
-        : DEFAULT_WORKSPACE_PCB_COUNT,
-  );
-  let vmCount = normalizeWorkspaceVmCount(
-    hasVmCount
-      ? nextValues.vmCount
-      : Object.prototype.hasOwnProperty.call(currentSettings, "vmCount")
-        ? currentSettings.vmCount
-        : DEFAULT_WORKSPACE_VM_COUNT,
-  );
-  let videoCount = normalizeWorkspaceVideoCount(
-    hasVideoCount
-      ? nextValues.videoCount
-      : Object.prototype.hasOwnProperty.call(currentSettings, "videoCount")
-        ? currentSettings.videoCount
-        : DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT,
-  );
   let paneKinds = {
     ...normalizeWorkspacePaneKinds(
       hasPaneKinds ? nextValues.paneKinds : currentSettings.paneKinds,
     ),
     ...inputPaneKinds,
   };
-  const existingPcbPaneCount = workspacePaneKindsPcbIndexes(paneKinds).length;
-  if (!hasPcbCount && existingPcbPaneCount > 0) {
-    pcbCount = normalizeWorkspacePcbCount(existingPcbPaneCount);
-  }
-  const existingVmPaneCount = workspacePaneKindsVmIndexes(paneKinds).length;
-  if (!hasVmCount && existingVmPaneCount > 0) {
-    vmCount = normalizeWorkspaceVmCount(existingVmPaneCount);
-  }
-  const existingVideoPaneCount = workspacePaneKindsVideoIndexes(paneKinds).length;
-  if (!hasVideoCount && existingVideoPaneCount > 0) {
-    videoCount = normalizeWorkspaceVideoCount(existingVideoPaneCount);
-  }
-  let hydratedPanes = ensureWorkspacePaneKindCount(
-    paneKinds,
-    terminalRoles,
-    WORKSPACE_PANE_KIND_PCB,
-    pcbCount,
-    fallbackRole,
-  );
-  hydratedPanes = ensureWorkspacePaneKindCount(
-    hydratedPanes.paneKinds,
-    hydratedPanes.terminalRoles,
-    WORKSPACE_PANE_KIND_VM,
-    vmCount,
-    fallbackRole,
-  );
-  hydratedPanes = ensureWorkspacePaneKindCount(
-    hydratedPanes.paneKinds,
-    hydratedPanes.terminalRoles,
-    WORKSPACE_PANE_KIND_VIDEO,
-    videoCount,
-    fallbackRole,
-  );
-  paneKinds = hydratedPanes.paneKinds;
-  terminalRoles = hydratedPanes.terminalRoles;
+  terminalRoles = expandTerminalRolesForPaneKinds(terminalRoles, paneKinds, fallbackRole);
   terminalCount = terminalRoles.length;
-  pcbCount = workspacePaneKindsPcbIndexes(paneKinds).length;
-  vmCount = workspacePaneKindsVmIndexes(paneKinds).length;
-  videoCount = workspacePaneKindsVideoIndexes(paneKinds).length;
+  const pcbCount = workspacePaneKindsPcbIndexes(paneKinds).length;
+  const vmCount = workspacePaneKindsVmIndexes(paneKinds).length;
+  const videoCount = workspacePaneKindsVideoIndexes(paneKinds).length;
   const shouldPersistLogicalIndexes = hasLogicalTerminalIndexes
     || Object.prototype.hasOwnProperty.call(currentSettings || {}, "logicalTerminalIndexes");
   const logicalTerminalIndexes = shouldPersistLogicalIndexes
@@ -21989,12 +21997,21 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     );
     terminalCount = terminalRoles.length;
   }
+  const minimizedPaneIndexes = Array.isArray(logicalTerminalIndexes)
+    ? normalizeWorkspaceMinimizedPaneIndexes(
+      hasMinimizedPaneIndexes ? nextValues.minimizedPaneIndexes : currentSettings.minimizedPaneIndexes,
+      logicalTerminalIndexes,
+    )
+    : [];
+  const visibleLogicalTerminalIndexes = Array.isArray(logicalTerminalIndexes)
+    ? getWorkspaceVisibleLogicalTerminalIndexes(logicalTerminalIndexes, minimizedPaneIndexes)
+    : [];
   const shouldPersistDisplayRows = hasDisplayRows
     || Object.prototype.hasOwnProperty.call(currentSettings || {}, "displayRows");
   const displayRows = shouldPersistDisplayRows && Array.isArray(logicalTerminalIndexes)
     ? normalizePersistedWorkspaceDisplayRows(
       hasDisplayRows ? nextValues.displayRows : currentSettings.displayRows,
-      logicalTerminalIndexes,
+      visibleLogicalTerminalIndexes,
     )
     : null;
   const hasDefaultPcbCount = pcbCount === DEFAULT_WORKSPACE_PCB_COUNT;
@@ -22063,6 +22080,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     ...(hasPanelPanes ? { paneKinds } : {}),
     ...(Array.isArray(logicalTerminalIndexes) ? { logicalTerminalIndexes } : {}),
     ...(Array.isArray(displayRows) ? { displayRows } : {}),
+    ...(minimizedPaneIndexes.length ? { minimizedPaneIndexes } : {}),
     agentPermissions,
   };
 
@@ -28430,6 +28448,25 @@ export default function App() {
     }
 
     try {
+      const cloudRuntimeStatus = await invoke("cloud_mcp_get_status").catch(() => null);
+      const websocketConnected = Boolean(
+        cloudRuntimeStatus?.globalWsConnected
+          ?? cloudRuntimeStatus?.global_ws_connected
+          ?? cloudRuntimeStatus?.connected,
+      );
+      if (websocketConnected) {
+        const liveBillingStatus = billingStatusFromAccountUsagePayload(
+          cloudRuntimeStatus,
+          billingStatusRef.current,
+        );
+        if (liveBillingStatus) {
+          await authStore.applyBillingStatus(liveBillingStatus).catch(() => {});
+          setBillingStatus(liveBillingStatus);
+          setBillingStatusState("ready");
+          setBillingStatusError("");
+          return liveBillingStatus;
+        }
+      }
       const nextBillingStatus = await invoke("cloud_mcp_get_billing_status");
       const mergedBillingStatus = mergeBillingStatusSnapshot(
         billingStatusRef.current,
@@ -29772,17 +29809,25 @@ export default function App() {
       const effectivePcbCount = workspacePaneKindsPcbIndexes(settingsStoredPaneKinds).length;
       const effectiveVmCount = workspacePaneKindsVmIndexes(settingsStoredPaneKinds).length;
       const effectiveVideoCount = workspacePaneKindsVideoIndexes(settingsStoredPaneKinds).length;
+      const effectiveMinimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(
+        getWorkspaceMinimizedPaneIndexes(workspaceSettings, selectedWorkspace.id, currentTerminalIndexes),
+        nextTerminalIndexes,
+      );
+      const visibleNextTerminalIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+        nextTerminalIndexes,
+        effectiveMinimizedPaneIndexes,
+      );
       const nextTerminalIndexSet = new Set(nextTerminalIndexes);
       const nextTerminalRoleByIndex = new Map(nextTerminalIndexes.map((terminalIndex, index) => (
         [terminalIndex, effectiveTerminalRoles[index]]
       )));
       const layoutPaneCountChanged = effectiveTerminalCount !== currentTerminalCount;
       const persistedDisplayRows = layoutPaneCountChanged
-        ? getDefaultWorkspaceDisplayTerminalRows(nextTerminalIndexes)
+        ? getDefaultWorkspaceDisplayTerminalRows(visibleNextTerminalIndexes)
         : getWorkspaceDisplayTerminalRows(
           workspaceTerminalDisplayLayoutsRef.current,
           selectedWorkspace.id,
-          nextTerminalIndexes,
+          visibleNextTerminalIndexes,
         ).map((row) => row.terminalIndexes.slice());
       const gitWorktreesChanged = agentSessionMode !== currentAgentSessionMode;
       const rootWasEmptyAtSelection = rootDirectory
@@ -29954,6 +29999,7 @@ export default function App() {
           paneKinds: settingsStoredPaneKinds,
           logicalTerminalIndexes: nextTerminalIndexes,
           displayRows: persistedDisplayRows,
+          minimizedPaneIndexes: effectiveMinimizedPaneIndexes,
           agentPermissions,
         });
         workspaceSettingsRef.current = nextSettings;
@@ -29968,9 +30014,7 @@ export default function App() {
         };
         const nextDisplayLayouts = {
           ...workspaceTerminalDisplayLayoutsRef.current,
-          [selectedWorkspace.id]: persistedDisplayRows.length
-            ? persistedDisplayRows
-            : getDefaultWorkspaceDisplayTerminalRows(nextTerminalIndexes),
+          [selectedWorkspace.id]: persistedDisplayRows,
         };
         workspaceTerminalLogicalIndexesRef.current = nextLogicalIndexesByWorkspace;
         workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
@@ -30095,11 +30139,36 @@ export default function App() {
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
     const nextVmCount = workspacePaneKindsVmIndexes(nextPaneKinds).length;
     const nextVideoCount = workspacePaneKindsVideoIndexes(nextPaneKinds).length;
+    const currentMinimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+      currentSettings,
+      workspaceId,
+      currentIndexes,
+    );
+    const nextMinimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(
+      currentMinimizedPaneIndexes.filter((index) => index !== removedTerminalIndex),
+      nextIndexes,
+    );
+    const currentVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      currentIndexes,
+      currentMinimizedPaneIndexes,
+    );
+    const nextVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      nextIndexes,
+      nextMinimizedPaneIndexes,
+    );
+    const currentDisplayRows = getWorkspaceDisplayTerminalRows(
+      currentDisplayLayouts,
+      workspaceId,
+      currentVisibleIndexes,
+    );
+    const nextDisplayRows = normalizePersistedWorkspaceDisplayRows(
+      removeLogicalTerminalFromDisplayRows(currentDisplayRows, removedTerminalIndex),
+      nextVisibleIndexes,
+    ) || [];
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
       [workspaceId]: nextIndexes,
     };
-    const nextDisplayRows = getDefaultWorkspaceDisplayTerminalRows(nextIndexes);
     const nextDisplayLayouts = {
       ...currentDisplayLayouts,
       [workspaceId]: nextDisplayRows,
@@ -30113,6 +30182,7 @@ export default function App() {
       paneKinds: nextPaneKinds,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
+      minimizedPaneIndexes: nextMinimizedPaneIndexes,
     });
     let clearedPreparedTerminal = false;
 
@@ -30154,6 +30224,138 @@ export default function App() {
     workspaceTerminalFallbackRole,
     workspaceTerminalRoleOptions,
   ]);
+
+  const minimizeWorkspacePane = useCallback(({ workspaceId, terminalIndex }) => {
+    if (!workspaceId) {
+      return;
+    }
+
+    const currentSettings = workspaceSettingsRef.current;
+    const currentLogicalIndexesByWorkspace = workspaceTerminalLogicalIndexesRef.current;
+    const currentDisplayLayouts = workspaceTerminalDisplayLayoutsRef.current;
+    const terminalCount = getWorkspaceTerminalCount(currentSettings, workspaceId);
+    const currentIndexes = getWorkspaceLogicalTerminalIndexes(
+      currentLogicalIndexesByWorkspace,
+      workspaceId,
+      terminalCount,
+    );
+    const targetTerminalIndex = Number.parseInt(terminalIndex, 10);
+    if (!Number.isInteger(targetTerminalIndex) || !currentIndexes.includes(targetTerminalIndex)) {
+      return;
+    }
+
+    const currentMinimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+      currentSettings,
+      workspaceId,
+      currentIndexes,
+    );
+    if (currentMinimizedPaneIndexes.includes(targetTerminalIndex)) {
+      return;
+    }
+
+    const nextMinimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(
+      [...currentMinimizedPaneIndexes, targetTerminalIndex],
+      currentIndexes,
+    );
+    const currentVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      currentIndexes,
+      currentMinimizedPaneIndexes,
+    );
+    const nextVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      currentIndexes,
+      nextMinimizedPaneIndexes,
+    );
+    const currentRows = getWorkspaceDisplayTerminalRows(
+      currentDisplayLayouts,
+      workspaceId,
+      currentVisibleIndexes,
+    );
+    const nextDisplayRows = normalizePersistedWorkspaceDisplayRows(
+      removeLogicalTerminalFromDisplayRows(currentRows, targetTerminalIndex),
+      nextVisibleIndexes,
+    ) || [];
+    const nextDisplayLayouts = {
+      ...currentDisplayLayouts,
+      [workspaceId]: nextDisplayRows,
+    };
+    const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
+      logicalTerminalIndexes: currentIndexes,
+      displayRows: nextDisplayRows,
+      minimizedPaneIndexes: nextMinimizedPaneIndexes,
+    });
+
+    workspaceSettingsRef.current = nextSettings;
+    workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
+    setWorkspaceSettings(nextSettings);
+    setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
+    persistWorkspaceSettings(nextSettings);
+  }, []);
+
+  const restoreWorkspacePane = useCallback(({ workspaceId, terminalIndex }) => {
+    if (!workspaceId) {
+      return;
+    }
+
+    const currentSettings = workspaceSettingsRef.current;
+    const currentLogicalIndexesByWorkspace = workspaceTerminalLogicalIndexesRef.current;
+    const currentDisplayLayouts = workspaceTerminalDisplayLayoutsRef.current;
+    const terminalCount = getWorkspaceTerminalCount(currentSettings, workspaceId);
+    const currentIndexes = getWorkspaceLogicalTerminalIndexes(
+      currentLogicalIndexesByWorkspace,
+      workspaceId,
+      terminalCount,
+    );
+    const targetTerminalIndex = Number.parseInt(terminalIndex, 10);
+    if (!Number.isInteger(targetTerminalIndex) || !currentIndexes.includes(targetTerminalIndex)) {
+      return;
+    }
+
+    const currentMinimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+      currentSettings,
+      workspaceId,
+      currentIndexes,
+    );
+    if (!currentMinimizedPaneIndexes.includes(targetTerminalIndex)) {
+      return;
+    }
+
+    const nextMinimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(
+      currentMinimizedPaneIndexes.filter((index) => index !== targetTerminalIndex),
+      currentIndexes,
+    );
+    const currentVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      currentIndexes,
+      currentMinimizedPaneIndexes,
+    );
+    const nextVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      currentIndexes,
+      nextMinimizedPaneIndexes,
+    );
+    const currentRows = getWorkspaceDisplayTerminalRows(
+      currentDisplayLayouts,
+      workspaceId,
+      currentVisibleIndexes,
+    );
+    const nextDisplayRows = normalizePersistedWorkspaceDisplayRows(
+      appendLogicalTerminalToBottomDisplayRow(currentRows, currentVisibleIndexes, targetTerminalIndex),
+      nextVisibleIndexes,
+    ) || [];
+    const nextDisplayLayouts = {
+      ...currentDisplayLayouts,
+      [workspaceId]: nextDisplayRows,
+    };
+    const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
+      logicalTerminalIndexes: currentIndexes,
+      displayRows: nextDisplayRows,
+      minimizedPaneIndexes: nextMinimizedPaneIndexes,
+    });
+
+    workspaceSettingsRef.current = nextSettings;
+    workspaceTerminalDisplayLayoutsRef.current = nextDisplayLayouts;
+    setWorkspaceSettings(nextSettings);
+    setWorkspaceTerminalDisplayLayouts(nextDisplayLayouts);
+    persistWorkspaceSettings(nextSettings);
+  }, []);
 
   const closeTrackedProcessTerminal = useCallback(async (target = {}) => {
     const paneId = String(target.paneId || "").trim();
@@ -30240,14 +30442,31 @@ export default function App() {
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
     const nextVmCount = workspacePaneKindsVmIndexes(nextPaneKinds).length;
     const nextVideoCount = workspacePaneKindsVideoIndexes(nextPaneKinds).length;
-    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
-    const nextDisplayRows = insertLogicalTerminalInDisplayRows(
-      currentRows,
-      terminalIndex,
-      nextTerminalIndex,
-      direction,
-    );
     const nextIndexes = normalizeWorkspaceTerminalSlotIndexes([...currentIndexes, nextTerminalIndex]);
+    const currentMinimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+      currentSettings,
+      workspaceId,
+      currentIndexes,
+    );
+    const nextMinimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(currentMinimizedPaneIndexes, nextIndexes);
+    const currentVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      currentIndexes,
+      currentMinimizedPaneIndexes,
+    );
+    const nextVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      nextIndexes,
+      nextMinimizedPaneIndexes,
+    );
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentVisibleIndexes);
+    const nextDisplayRows = normalizePersistedWorkspaceDisplayRows(
+      insertLogicalTerminalInDisplayRows(
+        currentRows,
+        terminalIndex,
+        nextTerminalIndex,
+        direction,
+      ),
+      nextVisibleIndexes,
+    ) || [];
     const nextTerminalCount = Math.min(MAX_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
     const nextTerminalRoles = nextIndexes.map((index) => (
       index === nextTerminalIndex ? sourceRole : roleByIndex[index] || workspaceTerminalFallbackRole
@@ -30261,6 +30480,7 @@ export default function App() {
       paneKinds: nextPaneKinds,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
+      minimizedPaneIndexes: nextMinimizedPaneIndexes,
     });
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
@@ -30415,18 +30635,36 @@ export default function App() {
     ));
     const nextPaneKinds = { ...getWorkspacePaneKinds(currentSettings, workspaceId) };
     delete nextPaneKinds[nextTerminalIndex];
-    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
-    const nextDisplayRows = appendLogicalTerminalToBottomDisplayRow(
-      currentRows,
+    const currentMinimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+      currentSettings,
+      workspaceId,
       currentIndexes,
-      nextTerminalIndex,
     );
+    const nextMinimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(currentMinimizedPaneIndexes, nextIndexes);
+    const currentVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      currentIndexes,
+      currentMinimizedPaneIndexes,
+    );
+    const nextVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      nextIndexes,
+      nextMinimizedPaneIndexes,
+    );
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentVisibleIndexes);
+    const nextDisplayRows = normalizePersistedWorkspaceDisplayRows(
+      appendLogicalTerminalToBottomDisplayRow(
+        currentRows,
+        currentVisibleIndexes,
+        nextTerminalIndex,
+      ),
+      nextVisibleIndexes,
+    ) || [];
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
       paneKinds: nextPaneKinds,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
+      minimizedPaneIndexes: nextMinimizedPaneIndexes,
     });
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
@@ -30565,12 +30803,29 @@ export default function App() {
     const nextPcbCount = workspacePaneKindsPcbIndexes(nextPaneKinds).length;
     const nextVmCount = workspacePaneKindsVmIndexes(nextPaneKinds).length;
     const nextVideoCount = workspacePaneKindsVideoIndexes(nextPaneKinds).length;
-    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
-    const nextDisplayRows = appendLogicalTerminalToBottomDisplayRow(
-      currentRows,
+    const currentMinimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+      currentSettings,
+      workspaceId,
       currentIndexes,
-      nextTerminalIndex,
     );
+    const nextMinimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(currentMinimizedPaneIndexes, nextIndexes);
+    const currentVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      currentIndexes,
+      currentMinimizedPaneIndexes,
+    );
+    const nextVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      nextIndexes,
+      nextMinimizedPaneIndexes,
+    );
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentVisibleIndexes);
+    const nextDisplayRows = normalizePersistedWorkspaceDisplayRows(
+      appendLogicalTerminalToBottomDisplayRow(
+        currentRows,
+        currentVisibleIndexes,
+        nextTerminalIndex,
+      ),
+      nextVisibleIndexes,
+    ) || [];
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
@@ -30580,6 +30835,7 @@ export default function App() {
       paneKinds: nextPaneKinds,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
+      minimizedPaneIndexes: nextMinimizedPaneIndexes,
     });
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
@@ -30797,17 +31053,35 @@ export default function App() {
       index === nextTerminalIndex ? agentId : roleByIndex[index] || workspaceTerminalFallbackRole
     ));
     const nextPaneKinds = getWorkspacePaneKinds(currentSettings, workspaceId);
-    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
-    const nextDisplayRows = appendLogicalTerminalToBottomDisplayRow(
-      currentRows,
+    const currentMinimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+      currentSettings,
+      workspaceId,
       currentIndexes,
-      nextTerminalIndex,
     );
+    const nextMinimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(currentMinimizedPaneIndexes, nextIndexes);
+    const currentVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      currentIndexes,
+      currentMinimizedPaneIndexes,
+    );
+    const nextVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      nextIndexes,
+      nextMinimizedPaneIndexes,
+    );
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentVisibleIndexes);
+    const nextDisplayRows = normalizePersistedWorkspaceDisplayRows(
+      appendLogicalTerminalToBottomDisplayRow(
+        currentRows,
+        currentVisibleIndexes,
+        nextTerminalIndex,
+      ),
+      nextVisibleIndexes,
+    ) || [];
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextTerminalRoles,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
+      minimizedPaneIndexes: nextMinimizedPaneIndexes,
     });
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
@@ -30940,15 +31214,24 @@ export default function App() {
       return;
     }
 
+    const minimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+      currentSettings,
+      workspaceId,
+      logicalIndexes,
+    );
+    const visibleLogicalIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      logicalIndexes,
+      minimizedPaneIndexes,
+    );
     const nextDisplayRows = getWorkspaceDisplayTerminalRows(
       { [workspaceId]: displayRows },
       workspaceId,
-      logicalIndexes,
+      visibleLogicalIndexes,
     ).map((row) => row.terminalIndexes.slice());
     const currentDisplayRows = getWorkspaceDisplayTerminalRows(
       currentDisplayLayouts,
       workspaceId,
-      logicalIndexes,
+      visibleLogicalIndexes,
     ).map((row) => row.terminalIndexes.slice());
 
     if (areWorkspaceDisplayRowsEqual(currentDisplayRows, nextDisplayRows)) {
@@ -30962,6 +31245,7 @@ export default function App() {
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       logicalTerminalIndexes: logicalIndexes,
       displayRows: nextDisplayRows,
+      minimizedPaneIndexes,
     });
 
     workspaceSettingsRef.current = nextSettings;
@@ -31009,6 +31293,15 @@ export default function App() {
     let roleIndex = nextIndexes.indexOf(targetTerminalIndex);
     let nextTerminalCount = terminalCount;
     let nextDisplayLayouts = currentDisplayLayouts;
+    const currentMinimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+      currentSettings,
+      workspaceId,
+      currentIndexes,
+    );
+    let nextMinimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(
+      currentMinimizedPaneIndexes,
+      nextIndexes,
+    );
 
     if (roleIndex < 0) {
       if (nextIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
@@ -31019,14 +31312,29 @@ export default function App() {
       roleIndex = nextIndexes.indexOf(targetTerminalIndex);
       nextTerminalCount = Math.max(MIN_WORKSPACE_TERMINAL_COUNT, nextIndexes.length);
       workspaceTerminalExplicitEmptyRef.current.delete(workspaceId);
-      const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
+      nextMinimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(
+        currentMinimizedPaneIndexes,
+        nextIndexes,
+      );
+      const currentVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+        currentIndexes,
+        currentMinimizedPaneIndexes,
+      );
+      const nextVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+        nextIndexes,
+        nextMinimizedPaneIndexes,
+      );
+      const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentVisibleIndexes);
       nextDisplayLayouts = {
         ...currentDisplayLayouts,
-        [workspaceId]: appendLogicalTerminalToBottomDisplayRow(
-          currentRows,
-          currentIndexes,
-          targetTerminalIndex,
-        ),
+        [workspaceId]: normalizePersistedWorkspaceDisplayRows(
+          appendLogicalTerminalToBottomDisplayRow(
+            currentRows,
+            currentVisibleIndexes,
+            targetTerminalIndex,
+          ),
+          nextVisibleIndexes,
+        ) || [],
       };
     }
 
@@ -31060,7 +31368,7 @@ export default function App() {
     const nextDisplayRows = getWorkspaceDisplayTerminalRows(
       nextDisplayLayouts,
       workspaceId,
-      nextIndexes,
+      getWorkspaceVisibleLogicalTerminalIndexes(nextIndexes, nextMinimizedPaneIndexes),
     ).map((row) => row.terminalIndexes.slice());
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
@@ -31071,6 +31379,7 @@ export default function App() {
       terminalRoles: nextRoles,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextDisplayRows,
+      minimizedPaneIndexes: nextMinimizedPaneIndexes,
     });
 
     workspaceSettingsRef.current = nextSettings;
@@ -31245,18 +31554,34 @@ export default function App() {
       addedIndexes.includes(index) ? agentId : roleByIndex[index] || workspaceTerminalFallbackRole
     ));
     const nextPaneKinds = getWorkspacePaneKinds(currentSettings, workspaceId);
-    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentIndexes);
+    const currentMinimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+      currentSettings,
+      workspaceId,
+      currentIndexes,
+    );
+    const nextMinimizedPaneIndexes = normalizeWorkspaceMinimizedPaneIndexes(currentMinimizedPaneIndexes, nextIndexes);
+    const currentVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      currentIndexes,
+      currentMinimizedPaneIndexes,
+    );
+    const nextVisibleIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+      nextIndexes,
+      nextMinimizedPaneIndexes,
+    );
+    const currentRows = getWorkspaceDisplayTerminalRows(currentDisplayLayouts, workspaceId, currentVisibleIndexes);
     let nextRows = currentRows.map((row) => row.terminalIndexes.slice());
-    let appendedIndexes = currentIndexes;
+    let appendedIndexes = currentVisibleIndexes;
     addedIndexes.forEach((terminalIndex) => {
       nextRows = appendLogicalTerminalToBottomDisplayRow(nextRows, appendedIndexes, terminalIndex);
       appendedIndexes = normalizeWorkspaceTerminalSlotIndexes([...appendedIndexes, terminalIndex]);
     });
+    nextRows = normalizePersistedWorkspaceDisplayRows(nextRows, nextVisibleIndexes) || [];
     const nextSettings = updateWorkspaceLocalSettings(currentSettings, workspaceId, {
       terminalCount: nextTerminalCount,
       terminalRoles: nextRoles,
       logicalTerminalIndexes: nextIndexes,
       displayRows: nextRows,
+      minimizedPaneIndexes: nextMinimizedPaneIndexes,
     });
     const nextLogicalIndexesByWorkspace = {
       ...currentLogicalIndexesByWorkspace,
@@ -33418,18 +33743,28 @@ export default function App() {
           ) !== WORKSPACE_TERMINAL_ROLE_GENERIC
           && Boolean(terminalRenderAgentsByIndex[terminalIndex])
         ));
+        const minimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+          workspaceSettings,
+          runtimeWorkspace.id,
+          logicalTerminalIndexes,
+        );
+        const visibleLogicalTerminalIndexes = getWorkspaceVisibleLogicalTerminalIndexes(
+          logicalTerminalIndexes,
+          minimizedPaneIndexes,
+        );
 
         return {
           agentTerminalEntries,
-          displayRows: logicalTerminalIndexes.length
+          displayRows: visibleLogicalTerminalIndexes.length
             ? getWorkspaceDisplayTerminalRows(
               workspaceTerminalDisplayLayouts,
               runtimeWorkspace.id,
-              logicalTerminalIndexes,
+              visibleLogicalTerminalIndexes,
             )
             : [],
           logicalTerminalCount: logicalTerminalIndexes.length,
           logicalTerminalIndexes,
+          minimizedPaneIndexes,
           paneKinds,
           renderAgent: getReadyWorkspaceTerminalAgent(
             agentStatuses,
@@ -35130,16 +35465,25 @@ export default function App() {
     workspaceThreadsHydrated,
   ]);
   const activatedWorkspaceDisplayTerminalRows = useMemo(
-    () => (
-      activatedWorkspaceLogicalTerminalIndexes.length
-        ? getWorkspaceDisplayTerminalRows(
-          workspaceTerminalDisplayLayouts,
-          activatedWorkspace?.id,
+    () => {
+      if (!activatedWorkspaceLogicalTerminalIndexes.length) {
+        return [];
+      }
+      const minimizedPaneIndexes = getWorkspaceMinimizedPaneIndexes(
+        workspaceSettings,
+        activatedWorkspace?.id,
+        activatedWorkspaceLogicalTerminalIndexes,
+      );
+      return getWorkspaceDisplayTerminalRows(
+        workspaceTerminalDisplayLayouts,
+        activatedWorkspace?.id,
+        getWorkspaceVisibleLogicalTerminalIndexes(
           activatedWorkspaceLogicalTerminalIndexes,
-        )
-        : []
-    ),
-    [activatedWorkspace?.id, activatedWorkspaceLogicalTerminalIndexes, workspaceTerminalDisplayLayouts],
+          minimizedPaneIndexes,
+        ),
+      );
+    },
+    [activatedWorkspace?.id, activatedWorkspaceLogicalTerminalIndexes, workspaceSettings, workspaceTerminalDisplayLayouts],
   );
   const selectedWorkspaceFileRoot = selectedWorkspace
     ? selectedWorkspaceRootDirectory || defaultWorkingDirectory
@@ -36018,24 +36362,41 @@ export default function App() {
       return undefined;
     }
 
+    let widthFrame = 0;
     const updateWidth = () => {
-      if (workspaceRailAnimatingRef.current) {
-        return;
+      if (widthFrame) {
+        window.cancelAnimationFrame(widthFrame);
       }
+      widthFrame = window.requestAnimationFrame(() => {
+        widthFrame = 0;
+        if (workspaceRailAnimatingRef.current) {
+          return;
+        }
 
-      measureWorkspaceToolLayoutWidth();
+        measureWorkspaceToolLayoutWidth();
+      });
     };
 
     measureWorkspaceToolLayoutWidth();
 
     if (typeof ResizeObserver === "undefined") {
       window.addEventListener("resize", updateWidth);
-      return () => window.removeEventListener("resize", updateWidth);
+      return () => {
+        if (widthFrame) {
+          window.cancelAnimationFrame(widthFrame);
+        }
+        window.removeEventListener("resize", updateWidth);
+      };
     }
 
     const observer = new ResizeObserver(updateWidth);
     observer.observe(element);
-    return () => observer.disconnect();
+    return () => {
+      if (widthFrame) {
+        window.cancelAnimationFrame(widthFrame);
+      }
+      observer.disconnect();
+    };
   }, [authState, measureWorkspaceToolLayoutWidth]);
 
   useEffect(() => {
@@ -37037,16 +37398,12 @@ export default function App() {
           updatedAt: Date.now(),
         }));
       }
-      const normalizedCredits = normalizeLiveCreditWallet(credits || snapshot?.credits, billingStatusRef.current?.credits);
-      if (normalizedCredits) {
+      if (credits || snapshot?.credits) {
         const currentBillingStatus = billingStatusRef.current;
-        const mergedBillingStatus = mergeBillingStatusSnapshot(currentBillingStatus, {
-          credits: normalizedCredits,
-          planName: normalizedCredits.planName || snapshot?.planName || snapshot?.plan_name || currentBillingStatus?.planName || currentBillingStatus?.plan_name,
-          plan_name: normalizedCredits.planName || snapshot?.plan_name || snapshot?.planName || currentBillingStatus?.plan_name || currentBillingStatus?.planName,
-          planStatus: currentBillingStatus?.planStatus || currentBillingStatus?.plan_status || "paid",
-          plan_status: currentBillingStatus?.plan_status || currentBillingStatus?.planStatus || "paid",
-        });
+        const mergedBillingStatus = billingStatusFromAccountUsagePayload(
+          event?.payload,
+          currentBillingStatus,
+        );
         if (mergedBillingStatus) {
           billingStatusRef.current = mergedBillingStatus;
           void authStore.applyBillingStatus(mergedBillingStatus).catch(() => {});
@@ -49010,6 +49367,24 @@ export default function App() {
       || workspaceSettingsSafeModeRequiresGit,
   );
   const isWorkspaceStartupOverlayVisible = shouldShowStartupPhases && workspaceState !== "ready";
+  // Free-plan tier-up moment: once per sign-in, after the startup overlay
+  // clears and billing has actually reported a plan.
+  const [plusUpsellState, setPlusUpsellState] = useState("idle");
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      setPlusUpsellState("idle");
+      return;
+    }
+    if (
+      plusUpsellState === "idle"
+      && billingStatus
+      // TEMP: show for every plan while testing — restore the free-plan gate:
+      // && billingPlanName === "free"
+      && !isWorkspaceStartupOverlayVisible
+    ) {
+      setPlusUpsellState("shown");
+    }
+  }, [authState, billingPlanName, billingStatus, isWorkspaceStartupOverlayVisible, plusUpsellState]);
   const settingsPermissionsAreLoading = settingsPermissionState.status === "loading";
   const settingsAudioInputPermission = settingsPermissionState.audioInput;
   const settingsAudioShortcutPermissions = settingsPermissionState.audioShortcuts?.permissions || null;
@@ -49612,6 +49987,8 @@ export default function App() {
                             addWorkspaceWebPane={addWorkspaceWebPane}
                             paneKinds={runtimeDescriptor.paneKinds}
                             closeWorkspaceTerminal={closeWorkspaceTerminal}
+                            minimizeWorkspacePane={minimizeWorkspacePane}
+                            restoreWorkspacePane={restoreWorkspacePane}
                             changeWorkspaceTerminalRole={changeWorkspaceTerminalRole}
                             createWorkspaceThreadTerminal={createWorkspaceThreadTerminal}
                             createFirstWorkspace={createFirstWorkspace}
@@ -49662,6 +50039,7 @@ export default function App() {
                             showSettingsView={showSettingsView}
                             splitWorkspaceTerminal={splitWorkspaceTerminal}
                             terminalDisplayRows={runtimeDescriptor.displayRows}
+                            minimizedPaneIndexes={runtimeDescriptor.minimizedPaneIndexes}
                             terminalThreadsByIndex={runtimeDescriptor.threadsByIndex}
                             viewMotion={viewMotion}
                             workspaceAgentLaunchEpoch={runtimeVisible ? workspaceAgentLaunchEpoch : 0}
@@ -51400,6 +51778,18 @@ export default function App() {
                                   documentPanelEnabled={selectedWorkspaceDocumentsEnabled}
                                   dropError={accountToolError}
                                   draft={accountToolDraft}
+                                  gitRepositoriesPreload={workspaceGitRepositoryPreloads[
+                                    workspaceGitPullPromptCheckKey(
+                                      selectedWorkspace?.id || "",
+                                      selectedWorkspaceFileRoot || defaultWorkingDirectory,
+                                    )
+                                  ] || null}
+                                  gitSnapshotsPreload={workspaceGitSnapshotPreloads[
+                                    workspaceGitPullPromptCheckKey(
+                                      selectedWorkspace?.id || "",
+                                      selectedWorkspaceFileRoot || defaultWorkingDirectory,
+                                    )
+                                  ] || null}
                                   items={accountToolComposerItems}
                                   knownDevices={cloudWorkspaceProgress.knownDevices}
                                   localDesktopProfile={cloudDesktopDeviceProfile}
@@ -51408,6 +51798,8 @@ export default function App() {
                                   onActiveWorkspaceToolChange={setAccountWorkspaceToolTab}
                                   onDraftChange={setAccountToolDraft}
                                   onMinimizePane={minimizeWorkspaceToolPane}
+                                  onRefreshGitRepositories={refreshWorkspaceGitRepositoryPreload}
+                                  onRefreshGitSnapshot={refreshWorkspaceGitSnapshotPreload}
                                   onOpenDocumentPanel={openSelectedWorkspaceDocumentPanel}
                                   onOpenWorkspaceSettings={openSelectedWorkspaceSettings}
                                   onQueueAllItems={queueAllAccountToolTodos}
@@ -51592,23 +51984,29 @@ export default function App() {
                   </BrandMark>
 
                   <IntroCopy>
-                    <Kicker>Web sign in</Kicker>
-                    <Headline id="desktop-title">Sign in to {BRAND_NAME}</Headline>
+                    <Kicker>The Agentic Development Environment</Kicker>
+                    <Headline id="desktop-title">
+                      Your agents.
+                      <br />
+                      <HeadlineAccent>Your forge.</HeadlineAccent>
+                    </Headline>
                     <Lede>
-                      Use your browser for secure {BRAND_NAME} authentication, then return to this native app.
+                      Run Codex, Claude Code, and OpenCode side by side — coordinated by
+                      file leases, steered by voice, synced to every device. Sign in with
+                      your browser to light the forge.
                     </Lede>
-                    <IntroFeatureList aria-label="Desktop auth status">
+                    <IntroFeatureList aria-label="What Diff Forge coordinates">
                       <IntroFeature data-tone="blue">
                         <span />
-                        Browser handoff
+                        Codex · Claude Code · OpenCode terminals
                       </IntroFeature>
                       <IntroFeature data-tone="orange">
                         <span />
-                        Deep-link callback
+                        Voice orchestrator + local dictation
                       </IntroFeature>
-                      <IntroFeature>
+                      <IntroFeature data-tone="green">
                         <span />
-                        Server session check
+                        Merge-safe coordination kernel
                       </IntroFeature>
                     </IntroFeatureList>
                   </IntroCopy>
@@ -51644,7 +52042,7 @@ export default function App() {
                         );
                       })}
                     </AuthStepRail>
-                    <PrimaryButton disabled={isAuthBusy} onClick={startWebLogin} type="button">
+                    <PrimaryButton data-login-cta="true" disabled={isAuthBusy} onClick={startWebLogin} type="button">
                       <ButtonBrowserIcon aria-hidden="true" />
                       <span>{authButtonLabel}</span>
                     </PrimaryButton>
@@ -51662,6 +52060,15 @@ export default function App() {
             </LoginScreen>
           )}
 	        </AppContent>
+
+        {plusUpsellState === "shown" && (
+          <PlusUpsellOverlay
+            onDismiss={() => setPlusUpsellState("dismissed")}
+            onUpgrade={() => {
+              openUrl("https://diffforge.ai/pricing").catch(() => {});
+            }}
+          />
+        )}
 
         {appCloseConfirmState.isOpen && (
           <AppCloseOverlay>

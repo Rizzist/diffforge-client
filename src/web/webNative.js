@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 
 // Shared building blocks for the native Tauri child-webview overlay used by the
 // left-nav Web view, the in-grid Web pane, and the Web pane breakout window.
@@ -16,6 +16,44 @@ export const WORKSPACE_WEBVIEW_LOAD_EVENT = "workspace-webview-load";
 
 const LOCAL_HOST_PATTERN = /^(localhost|127(?:\.\d{1,3}){3}|\[::1\])(?::\d+)?(?:[/?#]|$)/i;
 const MIN_NATIVE_DIMENSION = 24;
+const HIDDEN_NATIVE_WEBVIEW_OFFSET = 100000;
+const NATIVE_WEBVIEW_EXCLUSION_SELECTOR = "[data-native-webview-exclusion]";
+const NATIVE_WEBVIEW_EXCLUSION_MARGIN = 4;
+
+function hiddenNativeRect() {
+  const viewportWidth = typeof window !== "undefined" ? Number(window.innerWidth || 0) : 0;
+  const viewportHeight = typeof window !== "undefined" ? Number(window.innerHeight || 0) : 0;
+  return {
+    height: MIN_NATIVE_DIMENSION,
+    width: MIN_NATIVE_DIMENSION,
+    x: Math.max(HIDDEN_NATIVE_WEBVIEW_OFFSET, Math.round(viewportWidth + HIDDEN_NATIVE_WEBVIEW_OFFSET)),
+    y: Math.max(HIDDEN_NATIVE_WEBVIEW_OFFSET, Math.round(viewportHeight + HIDDEN_NATIVE_WEBVIEW_OFFSET)),
+  };
+}
+
+function nativeWebviewExclusionInsetBottom({ bottom, left, right, top }) {
+  if (typeof document === "undefined") {
+    return 0;
+  }
+
+  let insetBottom = 0;
+  document.querySelectorAll(NATIVE_WEBVIEW_EXCLUSION_SELECTOR).forEach((element) => {
+    const exclusionRect = element?.getBoundingClientRect?.();
+    if (!exclusionRect || exclusionRect.width <= 0 || exclusionRect.height <= 0) {
+      return;
+    }
+
+    const horizontalOverlap = Math.min(right, exclusionRect.right) - Math.max(left, exclusionRect.left);
+    const verticalOverlap = Math.min(bottom, exclusionRect.bottom) - Math.max(top, exclusionRect.top);
+    if (horizontalOverlap <= 0 || verticalOverlap <= 0) {
+      return;
+    }
+
+    const exclusionTop = Math.max(top, exclusionRect.top - NATIVE_WEBVIEW_EXCLUSION_MARGIN);
+    insetBottom = Math.max(insetBottom, bottom - exclusionTop);
+  });
+  return Math.max(0, Math.round(insetBottom));
+}
 
 export function hasTauriRuntime() {
   return typeof window !== "undefined" && Boolean(window.__TAURI_INTERNALS__);
@@ -122,8 +160,14 @@ export function viewportNativeRect(viewport, options = {}) {
   const right = Math.min(bounds.right, rect.right);
   const rawBottom = Math.min(bounds.bottom, rect.bottom);
   const heightBeforeInset = Math.max(0, rawBottom - top);
+  const exclusionInsetBottom = nativeWebviewExclusionInsetBottom({
+    bottom: rawBottom,
+    left,
+    right,
+    top,
+  });
   const effectiveInsetBottom = Math.min(
-    insetBottom,
+    insetBottom + exclusionInsetBottom,
     Math.max(0, heightBeforeInset - MIN_NATIVE_DIMENSION),
   );
   const bottom = rawBottom - effectiveInsetBottom;
@@ -235,21 +279,23 @@ export function useNativeWebview({
   }, []);
 
   const fit = useCallback((label, nextVisible, options = {}) => {
-    const viewport = viewportRef.current;
     const safeLabel = String(label || "").trim();
-    if (!safeLabel || !viewport || !hasTauriRuntime()) {
+    if (!safeLabel || !hasTauriRuntime()) {
       return;
     }
-    const rect = viewportNativeRect(viewport, { insetBottom: safeViewportInsetBottom });
+    const shouldShow = Boolean(nextVisible);
+    const viewport = viewportRef.current;
+    const rect = shouldShow
+      ? viewportNativeRect(viewport, { insetBottom: safeViewportInsetBottom })
+      : hiddenNativeRect();
     if (!rect) {
       return;
     }
     if (rect.width < MIN_NATIVE_DIMENSION || rect.height < MIN_NATIVE_DIMENSION) {
       rectKeyRef.current = "";
-      void invokeWebviewFit({ label: safeLabel, rect, visible: false }).catch(() => {});
+      void invokeWebviewFit({ label: safeLabel, rect: hiddenNativeRect(), visible: false }).catch(() => {});
       return;
     }
-    const shouldShow = Boolean(nextVisible);
     const rectKey = `${rect.x}:${rect.y}:${rect.width}:${rect.height}:${shouldShow ? "show" : "hide"}`;
     if (options.force === true || rectKeyRef.current !== rectKey) {
       rectKeyRef.current = rectKey;
@@ -322,6 +368,16 @@ export function useNativeWebview({
       void invokeWebviewClose(label);
     }
   }, []);
+
+  useLayoutEffect(() => {
+    const label = labelRef.current;
+    if (!runtimeEnabled || visible || !label) {
+      return undefined;
+    }
+    fit(label, false, { force: true });
+    scheduleFitBurst(label, false, { delays: [0, 32, 80], frames: 3 });
+    return undefined;
+  }, [fit, runtimeEnabled, scheduleFitBurst, visible]);
 
   const evaluate = useCallback((script, options = {}) => {
     const label = labelRef.current;
@@ -497,6 +553,11 @@ export function useNativeWebview({
       if (surface && surface !== viewport) {
         observer.observe(surface);
       }
+    }
+    if (typeof document !== "undefined") {
+      document.querySelectorAll(NATIVE_WEBVIEW_EXCLUSION_SELECTOR).forEach((element) => {
+        observer.observe(element);
+      });
     }
     window.addEventListener("resize", scheduleFit);
     window.addEventListener("scroll", scheduleFit, true);

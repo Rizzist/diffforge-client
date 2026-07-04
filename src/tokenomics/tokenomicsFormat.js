@@ -225,12 +225,13 @@ export function creditSnapshotHasMeaningfulData(credits) {
   );
 }
 
-export function normalizeCreditWallet(wallet, previous = null) {
+export function normalizeCreditWallet(wallet, previous = null, options = {}) {
   const credits = plainObject(wallet?.credits) || plainObject(wallet?.wallet) || plainObject(wallet) || {};
   const previousCredits = creditSnapshotHasMeaningfulData(previous) ? previous : {};
   if (!creditSnapshotHasMeaningfulData(credits)) {
     return creditSnapshotHasMeaningfulData(previousCredits) ? previousCredits : null;
   }
+  const preferIncoming = Boolean(options?.preferIncoming || options?.preferIncomingTotals);
 
   const total = plainObject(credits.total) || plainObject(credits.totalCredits) || {};
   const term = plainObject(credits.term) || {};
@@ -250,7 +251,7 @@ export function normalizeCreditWallet(wallet, previous = null) {
     : rawTermEnd && previousTermEnd
       ? rawTermEnd === previousTermEnd
       : true);
-  const sameTermPreviousCredits = sameTerm ? previousCredits : {};
+  const sameTermPreviousCredits = sameTerm && !preferIncoming ? previousCredits : {};
   const used = maxFiniteNumber(
     total.used_credits,
     total.usedCredits,

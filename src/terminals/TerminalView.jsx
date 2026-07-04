@@ -89,6 +89,7 @@ import {
   SetupInput,
   TerminalAgentLabel,
   TerminalCloseButton,
+  TerminalPaneInlineRailControls,
   TerminalRailControls,
   TerminalRailIdentity,
   TerminalRestartButton,
@@ -260,6 +261,10 @@ import {
   clearActiveWorkspaceToolDrag,
   getActiveWorkspaceToolDrag,
 } from "../tools/workspaceToolDragTypes.js";
+
+function isWorkspaceWebTabPaneId(value) {
+  return String(value || "").trim().startsWith("workspace-web-tab-");
+}
 
 // Cross-window drag bridge (Rust -> main window). Emitted by the terminal drag
 // watcher in src-tauri/src/terminals.rs while a drag is active and at least one
@@ -1179,6 +1184,7 @@ const TerminalWorkspaceMain = styled.div`
   min-width: 0;
   min-height: 0;
   display: flex;
+  flex-direction: column;
   overflow: hidden;
   background: #020304;
 
@@ -1221,6 +1227,82 @@ const TerminalWorkspaceMain = styled.div`
     box-shadow:
       0 30px 70px rgba(15, 23, 42, 0.16),
       0 0 0 1px rgba(0, 0, 0, 0.08);
+  }
+`;
+
+const TerminalWorkspaceGridRegion = styled.div`
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+
+  > * {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+  }
+`;
+
+const TerminalPaneDock = styled.aside`
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: 5px 8px;
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+  background: rgba(5, 9, 15, 0.96);
+  scrollbar-width: thin;
+
+  html[data-forge-theme="light"] & {
+    border-top-color: rgba(15, 23, 42, 0.1);
+    background: rgba(248, 250, 252, 0.96);
+  }
+`;
+
+const TerminalPaneDockChip = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: 0 0 auto;
+  max-width: min(220px, 44vw);
+  min-height: 25px;
+  padding: 0 9px;
+  border: 1px solid rgba(var(--forge-tint-soft-rgb), 0.3);
+  border-radius: 7px;
+  color: var(--forge-text, #f4f7fa);
+  background: rgba(15, 23, 42, 0.72);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 760;
+  letter-spacing: 0;
+
+  &:hover {
+    border-color: rgba(var(--forge-tint-soft-rgb), 0.56);
+    background: rgba(30, 41, 59, 0.82);
+  }
+
+  svg {
+    width: 14px;
+    height: 14px;
+    flex: 0 0 auto;
+  }
+
+  span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1e293b;
+    background: rgba(255, 255, 255, 0.92);
   }
 `;
 
@@ -2867,6 +2949,9 @@ const TerminalPcbPanelBody = styled.div`
 `;
 
 const TerminalPcbBreakoutOverlay = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 8;
   display: grid;
   width: 100%;
   height: 100%;
@@ -22320,6 +22405,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
 });
 
 function WorkspacePcbGridPane({
+  breakoutBoard = undefined,
   controlCommand = null,
   defaultPanelAgentPromptTargetIds = [],
   dragActive = false,
@@ -22330,6 +22416,7 @@ function WorkspacePcbGridPane({
   onBoardChange = null,
   onDragHandlePointerDown = null,
   onFocusBreakout = null,
+  onMinimize = null,
   onPopOut = null,
   onReturnFromBreakout = null,
   onSplit = null,
@@ -22370,6 +22457,13 @@ function WorkspacePcbGridPane({
     onBoardChange?.(nextBoard);
   }, [onBoardChange]);
 
+  useEffect(() => {
+    if (!poppedOut || breakoutBoard === undefined) {
+      return;
+    }
+    setBoard(breakoutBoard || null);
+  }, [breakoutBoard, poppedOut]);
+
   return (
     <TerminalPcbPanelShell
       data-active={isActive ? "true" : "false"}
@@ -22395,17 +22489,7 @@ function WorkspacePcbGridPane({
             {boardTitle}
           </TerminalPcbPanelTitle>
         </TerminalPcbPanelIdentity>
-        <TerminalRailControls data-rail-row="primary">
-          <TerminalCloseButton
-            aria-label="Close PCB panel"
-            onClick={() => onClose?.(terminalIndex, paneId)}
-            title="Close PCB panel"
-            type="button"
-          >
-            <ButtonCloseIcon aria-hidden="true" />
-          </TerminalCloseButton>
-        </TerminalRailControls>
-        <TerminalRailControls data-rail-row="secondary">
+        <TerminalPaneInlineRailControls data-rail-row="inline">
           <PanelAgentPromptActivity items={panelAgentPromptActivityItems} />
           <TerminalRestartButton
             aria-label="Prompt terminal agents"
@@ -22480,6 +22564,15 @@ function WorkspacePcbGridPane({
             <OpenInNew aria-hidden="true" />
           </TerminalRestartButton>
           <TerminalRestartButton
+            aria-label="Minimize PCB panel"
+            disabled={poppedOut}
+            onClick={() => onMinimize?.(terminalIndex, paneId)}
+            title={poppedOut ? "Return to grid before minimizing" : "Minimize"}
+            type="button"
+          >
+            <TitleMinimizeIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
             aria-label={isFullscreen ? "Restore PCB panel" : "Maximize PCB panel"}
             disabled={fullscreenActive && !isFullscreen}
             onClick={() => onToggleFullscreen?.(terminalIndex, paneId)}
@@ -22492,9 +22585,30 @@ function WorkspacePcbGridPane({
               <ButtonFullscreenIcon aria-hidden="true" />
             )}
           </TerminalRestartButton>
-        </TerminalRailControls>
+          <TerminalCloseButton
+            aria-label="Close PCB panel"
+            onClick={() => onClose?.(terminalIndex, paneId)}
+            title="Close PCB panel"
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </TerminalCloseButton>
+        </TerminalPaneInlineRailControls>
       </TerminalPcbPanelHeader>
       <TerminalPcbPanelBody>
+        <PcbWorkspacePane
+          key={`pcb-${paneId}-${repoPath}-${resumeNonce}`}
+          controlCommand={controlCommand}
+          createRequestNonce={createRequestNonce}
+          deleteRequestNonce={deleteRequestNonce}
+          externalBoard={poppedOut ? breakoutBoard : undefined}
+          isActive={isActive && !poppedOut}
+          onBoardChange={handleBoardChange}
+          paneId={paneId}
+          refreshRequestNonce={refreshRequestNonce}
+          repoPath={repoPath}
+          workspaceId={workspaceId}
+        />
         {poppedOut ? (
           <TerminalPcbBreakoutOverlay>
             <strong>Opened in window</strong>
@@ -22507,20 +22621,7 @@ function WorkspacePcbGridPane({
               </TerminalPcbBreakoutButton>
             </TerminalPcbBreakoutActions>
           </TerminalPcbBreakoutOverlay>
-        ) : (
-          <PcbWorkspacePane
-            key={`pcb-${paneId}-${repoPath}-${resumeNonce}`}
-            controlCommand={controlCommand}
-            createRequestNonce={createRequestNonce}
-            deleteRequestNonce={deleteRequestNonce}
-            isActive={isActive}
-            onBoardChange={handleBoardChange}
-            paneId={paneId}
-            refreshRequestNonce={refreshRequestNonce}
-            repoPath={repoPath}
-            workspaceId={workspaceId}
-          />
-        )}
+        ) : null}
         {agentPromptOpen ? (
           <PanelAgentPromptComposer
             autoFocus
@@ -22538,6 +22639,7 @@ function WorkspacePcbGridPane({
 }
 
 function WorkspaceVideoGridPane({
+  breakoutProject = undefined,
   controlCommand = null,
   defaultPanelAgentPromptTargetIds = [],
   dragActive = false,
@@ -22547,6 +22649,7 @@ function WorkspaceVideoGridPane({
   onClose = null,
   onDragHandlePointerDown = null,
   onFocusBreakout = null,
+  onMinimize = null,
   onPopOut = null,
   onProjectChange = null,
   onReturnFromBreakout = null,
@@ -22589,6 +22692,13 @@ function WorkspaceVideoGridPane({
     setProject(nextProject);
     onProjectChange?.(nextProject);
   }, [onProjectChange]);
+
+  useEffect(() => {
+    if (!poppedOut || breakoutProject === undefined) {
+      return;
+    }
+    setProject(breakoutProject || null);
+  }, [breakoutProject, poppedOut]);
 
   const submitVideoPanelAgentPrompt = useCallback(async (payload = {}) => {
     const contextText = project?.path
@@ -22718,6 +22828,15 @@ function WorkspaceVideoGridPane({
             <OpenInNew aria-hidden="true" />
           </TerminalRestartButton>
           <TerminalRestartButton
+            aria-label="Minimize Video panel"
+            disabled={poppedOut}
+            onClick={() => onMinimize?.(terminalIndex, paneId)}
+            title={poppedOut ? "Return to grid before minimizing" : "Minimize"}
+            type="button"
+          >
+            <TitleMinimizeIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
             aria-label={isFullscreen ? "Restore Video panel" : "Maximize Video panel"}
             disabled={fullscreenActive && !isFullscreen}
             onClick={() => onToggleFullscreen?.(terminalIndex, paneId)}
@@ -22733,6 +22852,20 @@ function WorkspaceVideoGridPane({
         </TerminalRailControls>
       </TerminalVideoPanelHeader>
       <TerminalVideoPanelBody>
+        <VideoWorkspacePane
+          key={`video-${paneId}-${repoPath}-${resumeNonce}`}
+          controlCommand={controlCommand}
+          createRequestName={createRequestName}
+          createRequestNonce={createRequestNonce}
+          deleteRequestNonce={deleteRequestNonce}
+          externalProject={poppedOut ? breakoutProject : undefined}
+          isActive={isActive && !poppedOut}
+          onProjectChange={handleProjectChange}
+          paneId={paneId}
+          refreshRequestNonce={refreshRequestNonce}
+          repoPath={repoPath}
+          workspaceId={workspaceId}
+        />
         {poppedOut ? (
           <TerminalVideoBreakoutOverlay>
             <strong>Opened in window</strong>
@@ -22745,21 +22878,7 @@ function WorkspaceVideoGridPane({
               </TerminalVideoBreakoutButton>
             </TerminalVideoBreakoutActions>
           </TerminalVideoBreakoutOverlay>
-        ) : (
-          <VideoWorkspacePane
-            key={`video-${paneId}-${repoPath}-${resumeNonce}`}
-            controlCommand={controlCommand}
-            createRequestName={createRequestName}
-            createRequestNonce={createRequestNonce}
-            deleteRequestNonce={deleteRequestNonce}
-            isActive={isActive}
-            onProjectChange={handleProjectChange}
-            paneId={paneId}
-            refreshRequestNonce={refreshRequestNonce}
-            repoPath={repoPath}
-            workspaceId={workspaceId}
-          />
-        )}
+        ) : null}
         {agentPromptOpen ? (
           <PanelAgentPromptComposer
             autoFocus
@@ -22809,6 +22928,8 @@ function TerminalView({
   paneKinds = {},
   changeWorkspaceTerminalRole,
   closeWorkspaceTerminal,
+  minimizeWorkspacePane = null,
+  restoreWorkspacePane = null,
   createWorkspaceThreadTerminal,
   createFirstWorkspace,
   chooseNewWorkspaceRootDirectory = () => {},
@@ -22851,6 +22972,7 @@ function TerminalView({
   showSettingsView,
   splitWorkspaceTerminal,
   terminalDisplayRows,
+  minimizedPaneIndexes = [],
   viewMotion,
   workspaceAgentLaunchEpoch,
   workspaceError,
@@ -22884,6 +23006,29 @@ function TerminalView({
     ? terminalWorkspaceLogicalIndexes
     : [];
   const logicalTerminalIndexSignature = logicalTerminalIndexes.join(",");
+  const normalizedMinimizedPaneIndexes = useMemo(() => {
+    const logicalIndexSet = new Set(logicalTerminalIndexes);
+    const usedIndexes = new Set();
+    return (Array.isArray(minimizedPaneIndexes) ? minimizedPaneIndexes : [])
+      .map((index) => Number.parseInt(index, 10))
+      .filter((index) => {
+        if (!Number.isInteger(index) || !logicalIndexSet.has(index) || usedIndexes.has(index)) {
+          return false;
+        }
+        usedIndexes.add(index);
+        return true;
+      });
+  }, [logicalTerminalIndexSignature, logicalTerminalIndexes, minimizedPaneIndexes]);
+  const minimizedPaneIndexSignature = normalizedMinimizedPaneIndexes.join(",");
+  const minimizedPaneIndexSet = useMemo(
+    () => new Set(normalizedMinimizedPaneIndexes),
+    [minimizedPaneIndexSignature, normalizedMinimizedPaneIndexes],
+  );
+  const visibleLogicalTerminalIndexes = useMemo(
+    () => logicalTerminalIndexes.filter((terminalIndex) => !minimizedPaneIndexSet.has(terminalIndex)),
+    [logicalTerminalIndexSignature, logicalTerminalIndexes, minimizedPaneIndexSet],
+  );
+  const visibleLogicalTerminalIndexSignature = visibleLogicalTerminalIndexes.join(",");
   const logicalTerminalIndexesRef = useRef(logicalTerminalIndexes);
   logicalTerminalIndexesRef.current = logicalTerminalIndexes;
   const normalizedTerminalWorkspaceCoordinationTargets = useMemo(
@@ -22935,9 +23080,12 @@ function TerminalView({
   // PCB panes popped out into their own native panel windows.
   const [pcbBreakoutPanes, setPcbBreakoutPanes] = useState({});
   const pcbBreakoutPanesRef = useRef(pcbBreakoutPanes);
+  const pcbPanelWorkspaceIdsRef = useRef({});
   // Bumped per pane when the PCB window returns so the in-grid pane rereads
   // the selected board from shared pane storage.
   const [pcbPaneResumeNonces, setPcbPaneResumeNonces] = useState({});
+  const pcbPaneBreakoutSyncRef = useRef({});
+  const [pcbPaneBreakoutSyncedPanes, setPcbPaneBreakoutSyncedPanes] = useState({});
   const [pcbPaneCommands, setPcbPaneCommands] = useState({});
   const [pcbPaneBoards, setPcbPaneBoards] = useState({});
   const pcbPaneBoardsRef = useRef(pcbPaneBoards);
@@ -22945,9 +23093,12 @@ function TerminalView({
   // Video panes popped out into their own native panel windows.
   const [videoBreakoutPanes, setVideoBreakoutPanes] = useState({});
   const videoBreakoutPanesRef = useRef(videoBreakoutPanes);
+  const videoPanelWorkspaceIdsRef = useRef({});
   // Bumped per pane when the Video window returns so the in-grid pane rereads
   // the selected project from shared pane storage.
   const [videoPaneResumeNonces, setVideoPaneResumeNonces] = useState({});
+  const videoPaneBreakoutSyncRef = useRef({});
+  const [videoPaneBreakoutSyncedPanes, setVideoPaneBreakoutSyncedPanes] = useState({});
   const [videoPaneCommands, setVideoPaneCommands] = useState({});
   const [videoPaneProjects, setVideoPaneProjects] = useState({});
   const videoPaneProjectsRef = useRef(videoPaneProjects);
@@ -22999,27 +23150,31 @@ function TerminalView({
   const documentPanelDisplayRows = useMemo(() => reconcileDocumentPanelRows({
     currentRows: terminalDocumentPanelRows,
     documentPanelAvailable: workspaceDocumentPanelAvailable,
-    terminalIndexes: logicalTerminalIndexes,
+    terminalIndexes: visibleLogicalTerminalIndexes,
     terminalRows: displayTerminalRows,
   }), [
     displayTerminalRows,
-    logicalTerminalIndexSignature,
-    logicalTerminalIndexes,
     terminalDocumentPanelRows,
+    visibleLogicalTerminalIndexSignature,
+    visibleLogicalTerminalIndexes,
     workspaceDocumentPanelAvailable,
   ]);
   const terminalPanelRowOptions = useMemo(() => ({
     allowDocumentPanel: workspaceDocumentPanelAvailable,
-    terminalIndexes: logicalTerminalIndexes,
+    terminalIndexes: visibleLogicalTerminalIndexes,
   }), [
-    logicalTerminalIndexSignature,
-    logicalTerminalIndexes,
+    visibleLogicalTerminalIndexSignature,
+    visibleLogicalTerminalIndexes,
     workspaceDocumentPanelAvailable,
   ]);
   const activeDisplayRows = terminalDragState?.previewRows || documentPanelDisplayRows;
   const activeDisplayRowsSignature = serializeTerminalRows(activeDisplayRows, terminalPanelRowOptions);
-  const hasVisibleWorkspacePanels = hasWorkspaceTerminals && activeDisplayRows.length > 0;
-  const draggableWorkspacePaneCount = logicalTerminalIndexes.length + (workspaceDocumentPanelAvailable ? 1 : 0);
+  const allWorkspacePanesMinimized = hasWorkspaceTerminals
+    && logicalTerminalIndexes.length > 0
+    && activeDisplayRows.length === 0
+    && normalizedMinimizedPaneIndexes.length > 0;
+  const hasVisibleWorkspacePanels = hasWorkspaceTerminals && (activeDisplayRows.length > 0 || allWorkspacePanesMinimized);
+  const draggableWorkspacePaneCount = visibleLogicalTerminalIndexes.length + (workspaceDocumentPanelAvailable ? 1 : 0);
   const terminalDragActive = Boolean(terminalDragState);
   const fullscreenActive = Number.isInteger(fullscreenTerminalIndex)
     && logicalTerminalIndexes.includes(fullscreenTerminalIndex);
@@ -23083,7 +23238,7 @@ function TerminalView({
   const [activeTabTerminals, setActiveTabTerminals] = useState([]);
   void activeTabTerminals;
   const tabVisibilityByTerminal = useMemo(() => new Map(), []);
-  const visibleTabTerminalIndexes = logicalTerminalIndexes;
+  const visibleTabTerminalIndexes = visibleLogicalTerminalIndexes;
   const todoQueueVisible = Boolean(
     !workspaceToolOwnedByAppShell
     && hasVisibleWorkspaceTerminalPanes
@@ -24155,17 +24310,33 @@ function TerminalView({
       return next;
     });
     const nextBreakouts = { ...pcbBreakoutPanesRef.current };
+    const nextBreakoutSync = { ...pcbPaneBreakoutSyncRef.current };
+    const nextPanelWorkspaceIds = { ...pcbPanelWorkspaceIdsRef.current };
     let removedBreakout = false;
     pcbPaneIds.forEach((paneId) => {
       if (!nextBreakouts[paneId]) {
         return;
       }
       delete nextBreakouts[paneId];
+      delete nextBreakoutSync[paneId];
+      delete nextPanelWorkspaceIds[paneId];
       removedBreakout = true;
-      invoke("pcb_panel_close", { paneId, workspaceId }).catch(() => {});
+      const panelWorkspaceId = String(pcbPanelWorkspaceIdsRef.current[paneId] || workspaceId || "").trim();
+      if (panelWorkspaceId) {
+        invoke("pcb_panel_close", { paneId, workspaceId: panelWorkspaceId }).catch(() => {});
+      }
     });
     if (removedBreakout) {
       pcbBreakoutPanesRef.current = nextBreakouts;
+      pcbPaneBreakoutSyncRef.current = nextBreakoutSync;
+      pcbPanelWorkspaceIdsRef.current = nextPanelWorkspaceIds;
+      setPcbPaneBreakoutSyncedPanes((current) => {
+        const next = { ...current };
+        pcbPaneIds.forEach((paneId) => {
+          delete next[paneId];
+        });
+        return next;
+      });
       setPcbBreakoutPanes(nextBreakouts);
     }
   }, [
@@ -24227,17 +24398,33 @@ function TerminalView({
       return next;
     });
     const nextBreakouts = { ...videoBreakoutPanesRef.current };
+    const nextBreakoutSync = { ...videoPaneBreakoutSyncRef.current };
+    const nextPanelWorkspaceIds = { ...videoPanelWorkspaceIdsRef.current };
     let removedBreakout = false;
     videoPaneIds.forEach((paneId) => {
       if (!nextBreakouts[paneId]) {
         return;
       }
       delete nextBreakouts[paneId];
+      delete nextBreakoutSync[paneId];
+      delete nextPanelWorkspaceIds[paneId];
       removedBreakout = true;
-      invoke("video_panel_close", { paneId, workspaceId }).catch(() => {});
+      const panelWorkspaceId = String(videoPanelWorkspaceIdsRef.current[paneId] || workspaceId || "").trim();
+      if (panelWorkspaceId) {
+        invoke("video_panel_close", { paneId, workspaceId: panelWorkspaceId }).catch(() => {});
+      }
     });
     if (removedBreakout) {
       videoBreakoutPanesRef.current = nextBreakouts;
+      videoPaneBreakoutSyncRef.current = nextBreakoutSync;
+      videoPanelWorkspaceIdsRef.current = nextPanelWorkspaceIds;
+      setVideoPaneBreakoutSyncedPanes((current) => {
+        const next = { ...current };
+        videoPaneIds.forEach((paneId) => {
+          delete next[paneId];
+        });
+        return next;
+      });
       setVideoBreakoutPanes(nextBreakouts);
     }
   }, [
@@ -24254,7 +24441,15 @@ function TerminalView({
       return false;
     }
     const paneId = getTerminalPaneId(terminalIndex);
-    return Boolean(paneId && windowBreakoutPanesRef.current?.[paneId]);
+    return Boolean(
+      paneId
+      && (
+        windowBreakoutPanesRef.current?.[paneId]
+        || webBreakoutPanesRef.current?.[paneId]
+        || pcbBreakoutPanesRef.current?.[paneId]
+        || videoBreakoutPanesRef.current?.[paneId]
+      ),
+    );
   }, [getTerminalPaneId]);
   const terminalParkedPromptListenerStateRef = useRef({
     getTerminalPaneId,
@@ -24375,10 +24570,10 @@ function TerminalView({
       return null;
     }
 
-    // A terminal hosted in its own breakout window only leaves a placeholder in
-    // the grid. Dropping on the placeholder must never resolve a target — the
-    // real window is resolved by the cross-window watcher instead, so the
-    // placeholder reads as empty space and never false-highlights.
+    // A pane hosted in its own breakout window only leaves a placeholder in the
+    // grid. Dropping on the placeholder must never resolve a target — the real
+    // window is resolved by the cross-window watcher instead, so the placeholder
+    // reads as empty space and never false-highlights.
     if (isTerminalIndexWindowBreakoutHosted(candidateSurfaceSlotIndex)) {
       return null;
     }
@@ -24534,9 +24729,9 @@ function TerminalView({
   }, [resolveTerminalDropTarget, terminalWorkspace?.id, updateWorkspaceFileDragState]);
   const visibleTerminalPaneIds = useMemo(() => (
     terminalWorkspace
-      ? logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex))
+      ? visibleLogicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex))
       : []
-  ), [getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace]);
+  ), [getTerminalPaneId, terminalWorkspace, visibleLogicalTerminalIndexes]);
   const visibleTerminalPaneIdSignature = visibleTerminalPaneIds.join("|");
   const activePaneId = activeTerminalPaneId || visibleTerminalPaneIds[0] || "";
   const isWorkspaceRuntimeVisibleRef = useRef(Boolean(isWorkspaceRuntimeVisible));
@@ -28085,24 +28280,48 @@ function TerminalView({
       return undefined;
     }
 
+    let widthFrame = 0;
     const updateWidth = () => {
+      if (widthFrame) {
+        window.cancelAnimationFrame(widthFrame);
+      }
+      widthFrame = window.requestAnimationFrame(() => {
+        widthFrame = 0;
+        const nextWidth = Math.round(element.getBoundingClientRect().width || 0);
+        setTerminalWorkspaceMainWidth((currentWidth) => (
+          currentWidth === nextWidth ? currentWidth : nextWidth
+        ));
+      });
+    };
+
+    const measureWidthNow = () => {
       const nextWidth = Math.round(element.getBoundingClientRect().width || 0);
       setTerminalWorkspaceMainWidth((currentWidth) => (
         currentWidth === nextWidth ? currentWidth : nextWidth
       ));
     };
 
-    updateWidth();
+    measureWidthNow();
 
     if (typeof ResizeObserver === "undefined") {
       window.addEventListener("resize", updateWidth);
-      return () => window.removeEventListener("resize", updateWidth);
+      return () => {
+        if (widthFrame) {
+          window.cancelAnimationFrame(widthFrame);
+        }
+        window.removeEventListener("resize", updateWidth);
+      };
     }
 
     const observer = new ResizeObserver(updateWidth);
     observer.observe(element);
 
-    return () => observer.disconnect();
+    return () => {
+      if (widthFrame) {
+        window.cancelAnimationFrame(widthFrame);
+      }
+      observer.disconnect();
+    };
   }, [shouldShowWorkspaceSetup]);
 
   useEffect(() => {
@@ -28184,6 +28403,17 @@ function TerminalView({
       setFullscreenMotion(TERMINAL_FULLSCREEN_DEFAULT_MOTION);
     }
   }, [clearFullscreenTransitionTimer, fullscreenTerminalIndex, logicalTerminalIndexes]);
+
+  useEffect(() => {
+    if (
+      Number.isInteger(fullscreenTerminalIndex)
+      && minimizedPaneIndexSet.has(fullscreenTerminalIndex)
+    ) {
+      clearFullscreenTransitionTimer();
+      setFullscreenTerminalIndex(null);
+      setFullscreenMotion(TERMINAL_FULLSCREEN_DEFAULT_MOTION);
+    }
+  }, [clearFullscreenTransitionTimer, fullscreenTerminalIndex, minimizedPaneIndexSet]);
 
   const handleActivateTerminalPane = useCallback(({ paneId }) => {
     if (paneId) {
@@ -28636,6 +28866,74 @@ function TerminalView({
       : `Terminal ${terminalIndex + 1}`;
   }, [getTerminalAgent, getTerminalThread]);
 
+  const minimizedPaneDockItems = useMemo(() => (
+    normalizedMinimizedPaneIndexes.map((terminalIndex) => {
+      const paneId = getTerminalPaneId(terminalIndex);
+      const paneKind = paneKinds?.[terminalIndex] === "web"
+        ? "web"
+        : paneKinds?.[terminalIndex] === "pcb"
+          ? "pcb"
+          : paneKinds?.[terminalIndex] === "vm"
+            ? "vm"
+            : paneKinds?.[terminalIndex] === "video"
+              ? "video"
+              : "terminal";
+      const poppedOut = Boolean(
+        windowBreakoutPanes[paneId]
+        || webBreakoutPanes[paneId]
+        || pcbBreakoutPanes[paneId]
+        || videoBreakoutPanes[paneId],
+      );
+      const windowSuffix = poppedOut ? " · in window" : "";
+      if (paneKind === "web") {
+        let label = "Web";
+        const urlText = String(webPaneUrlsRef.current[paneId] || DEFAULT_WEB_URL || "").trim();
+        if (urlText) {
+          try {
+            label = new URL(urlText).hostname || label;
+          } catch {
+            label = urlText.replace(/^https?:\/\//i, "").split(/[/?#]/)[0] || label;
+          }
+        }
+        return { kind: paneKind, label: `${label}${windowSuffix}`, paneId, poppedOut, terminalIndex };
+      }
+      if (paneKind === "pcb") {
+        const board = pcbPaneBoards[paneId] || null;
+        return { kind: paneKind, label: `${board?.name || "PCB"}${windowSuffix}`, paneId, poppedOut, terminalIndex };
+      }
+      if (paneKind === "vm") {
+        return { kind: paneKind, label: "VM Sandbox", paneId, terminalIndex };
+      }
+      if (paneKind === "video") {
+        const project = videoPaneProjects[paneId] || null;
+        const projectName = String(project?.name || project?.title || project?.projectName || "").trim();
+        return { kind: paneKind, label: `${projectName || "Video editor"}${windowSuffix}`, paneId, poppedOut, terminalIndex };
+      }
+      const roleId = String(getTerminalRole(terminalIndex) || WORKSPACE_TERMINAL_ROLE_GENERIC).toLowerCase();
+      return {
+        kind: paneKind,
+        label: `${getTerminalWindowTitle(terminalIndex) || getManagedAgentLabel(roleId)}${windowSuffix}`,
+        paneId,
+        poppedOut,
+        roleId,
+        terminalIndex,
+      };
+    })
+  ), [
+    getTerminalPaneId,
+    getTerminalRole,
+    getTerminalWindowTitle,
+    minimizedPaneIndexSignature,
+    normalizedMinimizedPaneIndexes,
+    paneKinds,
+    pcbPaneBoards,
+    pcbBreakoutPanes,
+    videoPaneProjects,
+    videoBreakoutPanes,
+    webBreakoutPanes,
+    windowBreakoutPanes,
+  ]);
+
   const openTerminalWindowForIndex = useCallback((terminalIndex, paneId) => {
     const rect = terminalLayoutRectsRef.current?.[terminalIndex] || null;
     return invoke("terminal_window_open", {
@@ -28848,6 +29146,29 @@ function TerminalView({
       .catch(() => {});
   }, [openTerminalWindowForIndex]);
 
+  const restoreWorkspacePaneIfMinimized = useCallback((paneId) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return false;
+    }
+    const terminalIndex = logicalTerminalIndexes.find((index) => getTerminalPaneId(index) === safePaneId);
+    if (!Number.isInteger(terminalIndex) || !minimizedPaneIndexSet.has(terminalIndex)) {
+      return false;
+    }
+    restoreWorkspacePane?.({
+      terminalIndex,
+      workspaceId: terminalWorkspace?.id || "",
+    });
+    return true;
+  }, [
+    getTerminalPaneId,
+    logicalTerminalIndexSignature,
+    logicalTerminalIndexes,
+    minimizedPaneIndexSet,
+    restoreWorkspacePane,
+    terminalWorkspace?.id,
+  ]);
+
   // ---- Web pane breakout (its own in-app browser window) ----
 
   const rememberWebPaneUrl = useCallback((paneId, url) => {
@@ -28940,10 +29261,19 @@ function TerminalView({
     return nextCommand;
   }, [terminalWorkspace?.id]);
 
-  const recordPcbPaneBoard = useCallback((paneId, board) => {
+  const recordPcbPaneBoard = useCallback((paneId, board, options = {}) => {
     const safePaneId = String(paneId || "").trim();
     if (!safePaneId) {
       return;
+    }
+    if (options?.breakoutSync) {
+      pcbPaneBreakoutSyncRef.current = {
+        ...pcbPaneBreakoutSyncRef.current,
+        [safePaneId]: true,
+      };
+      setPcbPaneBreakoutSyncedPanes((current) => (
+        current[safePaneId] ? current : { ...current, [safePaneId]: true }
+      ));
     }
     setPcbPaneBoards((current) => {
       const next = { ...current };
@@ -28952,14 +29282,24 @@ function TerminalView({
       } else {
         delete next[safePaneId];
       }
+      pcbPaneBoardsRef.current = next;
       return next;
     });
   }, []);
 
-  const recordVideoPaneProject = useCallback((paneId, project) => {
+  const recordVideoPaneProject = useCallback((paneId, project, options = {}) => {
     const safePaneId = String(paneId || "").trim();
     if (!safePaneId) {
       return;
+    }
+    if (options?.breakoutSync) {
+      videoPaneBreakoutSyncRef.current = {
+        ...videoPaneBreakoutSyncRef.current,
+        [safePaneId]: true,
+      };
+      setVideoPaneBreakoutSyncedPanes((current) => (
+        current[safePaneId] ? current : { ...current, [safePaneId]: true }
+      ));
     }
     setVideoPaneProjects((current) => {
       const next = { ...current };
@@ -28968,6 +29308,7 @@ function TerminalView({
       } else {
         delete next[safePaneId];
       }
+      videoPaneProjectsRef.current = next;
       return next;
     });
   }, []);
@@ -28995,6 +29336,7 @@ function TerminalView({
         webPanelLabelsRef.current = { ...webPanelLabelsRef.current, [safePaneId]: label };
       }
       setWebBreakoutPanes((current) => ({ ...current, [safePaneId]: true }));
+      webBreakoutPanesRef.current = { ...webBreakoutPanesRef.current, [safePaneId]: true };
     } catch {
       // If the window fails to open, the pane simply stays in the grid.
     }
@@ -29031,12 +29373,13 @@ function TerminalView({
     });
 
     if (hadLabel || wasPoppedOut) {
+      restoreWorkspacePaneIfMinimized(safePaneId);
       setWebPaneResumeNonces((current) => ({
         ...current,
         [safePaneId]: (current[safePaneId] || 0) + 1,
       }));
     }
-  }, []);
+  }, [restoreWorkspacePaneIfMinimized]);
 
   const returnWebPanelToGrid = useCallback((paneId, url) => {
     const safePaneId = String(paneId || "").trim();
@@ -29063,16 +29406,36 @@ function TerminalView({
 
   // ---- PCB pane pop-out (its own native panel window) ----
 
-  const clearPcbPanelBreakout = useCallback((paneId) => {
+  const clearPcbPanelBreakout = useCallback((paneId, options = {}) => {
     const safePaneId = String(paneId || "").trim();
     if (!safePaneId) {
       return;
     }
     const wasPoppedOut = Boolean(pcbBreakoutPanesRef.current[safePaneId]);
+    const hadBreakoutSync = Boolean(pcbPaneBreakoutSyncRef.current[safePaneId]);
+    const dropSyncedState = options?.dropSyncedState === true || !wasPoppedOut || !hadBreakoutSync;
+    if ((wasPoppedOut || hadBreakoutSync) && dropSyncedState) {
+      const nextSync = { ...pcbPaneBreakoutSyncRef.current };
+      delete nextSync[safePaneId];
+      pcbPaneBreakoutSyncRef.current = nextSync;
+      setPcbPaneBreakoutSyncedPanes((current) => {
+        if (!current[safePaneId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[safePaneId];
+        return next;
+      });
+    }
     if (wasPoppedOut) {
       const nextBreakouts = { ...pcbBreakoutPanesRef.current };
       delete nextBreakouts[safePaneId];
       pcbBreakoutPanesRef.current = nextBreakouts;
+    }
+    if (wasPoppedOut || pcbPanelWorkspaceIdsRef.current[safePaneId]) {
+      const nextPanelWorkspaceIds = { ...pcbPanelWorkspaceIdsRef.current };
+      delete nextPanelWorkspaceIds[safePaneId];
+      pcbPanelWorkspaceIdsRef.current = nextPanelWorkspaceIds;
     }
     setPcbBreakoutPanes((current) => {
       if (!current[safePaneId]) {
@@ -29083,12 +29446,15 @@ function TerminalView({
       return next;
     });
     if (wasPoppedOut) {
+      restoreWorkspacePaneIfMinimized(safePaneId);
+    }
+    if (wasPoppedOut && !hadBreakoutSync) {
       setPcbPaneResumeNonces((current) => ({
         ...current,
         [safePaneId]: (current[safePaneId] || 0) + 1,
       }));
     }
-  }, []);
+  }, [restoreWorkspacePaneIfMinimized]);
 
   const popOutPcbPanelForIndex = useCallback(async (terminalIndex, paneId) => {
     const safePaneId = String(paneId || "").trim();
@@ -29111,8 +29477,23 @@ function TerminalView({
         width: rect?.width || null,
         workspaceId,
       });
+      const nextSync = { ...pcbPaneBreakoutSyncRef.current };
+      delete nextSync[safePaneId];
+      pcbPaneBreakoutSyncRef.current = nextSync;
+      setPcbPaneBreakoutSyncedPanes((current) => {
+        if (!current[safePaneId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[safePaneId];
+        return next;
+      });
       setPcbBreakoutPanes((current) => ({ ...current, [safePaneId]: true }));
       pcbBreakoutPanesRef.current = { ...pcbBreakoutPanesRef.current, [safePaneId]: true };
+      pcbPanelWorkspaceIdsRef.current = {
+        ...pcbPanelWorkspaceIdsRef.current,
+        [safePaneId]: workspaceId,
+      };
       return true;
     } catch {
       return false;
@@ -29121,7 +29502,7 @@ function TerminalView({
 
   const returnPcbPanelToGrid = useCallback((paneId) => {
     const safePaneId = String(paneId || "").trim();
-    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    const workspaceId = String(pcbPanelWorkspaceIdsRef.current[safePaneId] || terminalWorkspace?.id || "").trim();
     if (!safePaneId || !workspaceId) {
       return;
     }
@@ -29131,7 +29512,7 @@ function TerminalView({
 
   const focusPcbPanel = useCallback((terminalIndex, paneId) => {
     const safePaneId = String(paneId || "").trim();
-    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    const workspaceId = String(pcbPanelWorkspaceIdsRef.current[safePaneId] || terminalWorkspace?.id || "").trim();
     if (!safePaneId || !workspaceId) {
       return;
     }
@@ -29140,16 +29521,36 @@ function TerminalView({
 
   // ---- Video pane pop-out (its own native panel window) ----
 
-  const clearVideoPanelBreakout = useCallback((paneId) => {
+  const clearVideoPanelBreakout = useCallback((paneId, options = {}) => {
     const safePaneId = String(paneId || "").trim();
     if (!safePaneId) {
       return;
     }
     const wasPoppedOut = Boolean(videoBreakoutPanesRef.current[safePaneId]);
+    const hadBreakoutSync = Boolean(videoPaneBreakoutSyncRef.current[safePaneId]);
+    const dropSyncedState = options?.dropSyncedState === true || !wasPoppedOut || !hadBreakoutSync;
+    if ((wasPoppedOut || hadBreakoutSync) && dropSyncedState) {
+      const nextSync = { ...videoPaneBreakoutSyncRef.current };
+      delete nextSync[safePaneId];
+      videoPaneBreakoutSyncRef.current = nextSync;
+      setVideoPaneBreakoutSyncedPanes((current) => {
+        if (!current[safePaneId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[safePaneId];
+        return next;
+      });
+    }
     if (wasPoppedOut) {
       const nextBreakouts = { ...videoBreakoutPanesRef.current };
       delete nextBreakouts[safePaneId];
       videoBreakoutPanesRef.current = nextBreakouts;
+    }
+    if (wasPoppedOut || videoPanelWorkspaceIdsRef.current[safePaneId]) {
+      const nextPanelWorkspaceIds = { ...videoPanelWorkspaceIdsRef.current };
+      delete nextPanelWorkspaceIds[safePaneId];
+      videoPanelWorkspaceIdsRef.current = nextPanelWorkspaceIds;
     }
     setVideoBreakoutPanes((current) => {
       if (!current[safePaneId]) {
@@ -29160,12 +29561,15 @@ function TerminalView({
       return next;
     });
     if (wasPoppedOut) {
+      restoreWorkspacePaneIfMinimized(safePaneId);
+    }
+    if (wasPoppedOut && !hadBreakoutSync) {
       setVideoPaneResumeNonces((current) => ({
         ...current,
         [safePaneId]: (current[safePaneId] || 0) + 1,
       }));
     }
-  }, []);
+  }, [restoreWorkspacePaneIfMinimized]);
 
   const popOutVideoPanelForIndex = useCallback(async (terminalIndex, paneId) => {
     const safePaneId = String(paneId || "").trim();
@@ -29188,8 +29592,23 @@ function TerminalView({
         width: rect?.width || null,
         workspaceId,
       });
+      const nextSync = { ...videoPaneBreakoutSyncRef.current };
+      delete nextSync[safePaneId];
+      videoPaneBreakoutSyncRef.current = nextSync;
+      setVideoPaneBreakoutSyncedPanes((current) => {
+        if (!current[safePaneId]) {
+          return current;
+        }
+        const next = { ...current };
+        delete next[safePaneId];
+        return next;
+      });
       setVideoBreakoutPanes((current) => ({ ...current, [safePaneId]: true }));
       videoBreakoutPanesRef.current = { ...videoBreakoutPanesRef.current, [safePaneId]: true };
+      videoPanelWorkspaceIdsRef.current = {
+        ...videoPanelWorkspaceIdsRef.current,
+        [safePaneId]: workspaceId,
+      };
       return true;
     } catch {
       return false;
@@ -29198,7 +29617,7 @@ function TerminalView({
 
   const returnVideoPanelToGrid = useCallback((paneId) => {
     const safePaneId = String(paneId || "").trim();
-    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    const workspaceId = String(videoPanelWorkspaceIdsRef.current[safePaneId] || terminalWorkspace?.id || "").trim();
     if (!safePaneId || !workspaceId) {
       return;
     }
@@ -29208,7 +29627,7 @@ function TerminalView({
 
   const focusVideoPanel = useCallback((terminalIndex, paneId) => {
     const safePaneId = String(paneId || "").trim();
-    const workspaceId = String(terminalWorkspace?.id || "").trim();
+    const workspaceId = String(videoPanelWorkspaceIdsRef.current[safePaneId] || terminalWorkspace?.id || "").trim();
     if (!safePaneId || !workspaceId) {
       return;
     }
@@ -29226,7 +29645,7 @@ function TerminalView({
         return;
       }
       const paneId = String(event.payload?.paneId || "").trim();
-      if (!paneId) {
+      if (!paneId || isWorkspaceWebTabPaneId(paneId)) {
         return;
       }
       clearWebPanelBreakout(paneId);
@@ -29258,7 +29677,7 @@ function TerminalView({
       const payload = event?.payload || {};
       const control = String(payload.control || "").trim();
       const paneId = String(payload.paneId || "").trim();
-      if (!paneId) {
+      if (!paneId || isWorkspaceWebTabPaneId(paneId)) {
         return;
       }
       if (control === WEB_PANEL_CONTROL_NAVIGATE) {
@@ -29339,7 +29758,7 @@ function TerminalView({
         return;
       }
       if (control === PCB_PANEL_CONTROL_BOARD_CHANGE) {
-        recordPcbPaneBoard(paneId, payload.board || null);
+        recordPcbPaneBoard(paneId, payload.board || null, { breakoutSync: true });
         return;
       }
       if (control === PCB_PANEL_CONTROL_RETURN) {
@@ -29416,7 +29835,7 @@ function TerminalView({
         return;
       }
       if (control === VIDEO_PANEL_CONTROL_PROJECT_CHANGE) {
-        recordVideoPaneProject(paneId, payload.project || null);
+        recordVideoPaneProject(paneId, payload.project || null, { breakoutSync: true });
         return;
       }
       if (control === VIDEO_PANEL_CONTROL_RETURN) {
@@ -29452,6 +29871,7 @@ function TerminalView({
       if (!paneId) {
         return;
       }
+      restoreWorkspacePaneIfMinimized(paneId);
       setWindowBreakoutPanes((current) => {
         if (!current[paneId]) {
           return current;
@@ -29474,7 +29894,7 @@ function TerminalView({
       disposed = true;
       unlisten();
     };
-  }, []);
+  }, [restoreWorkspacePaneIfMinimized]);
 
   // Close breakout windows whose panes no longer exist (terminal closed,
   // workspace switched, agent slot reassigned).
@@ -29498,34 +29918,12 @@ function TerminalView({
         pendingForkWindowBreakoutPanesRef.current.delete(paneId);
       }
     });
-	  }, [getTerminalPaneId, logicalTerminalIndexes]);
+  }, [getTerminalPaneId, logicalTerminalIndexes]);
 
-	  // Close web panel windows whose panes no longer exist.
-	  useEffect(() => {
-	    const currentPaneIds = Object.keys(webBreakoutPanesRef.current);
-	    if (!currentPaneIds.length) {
-	      return;
-	    }
-
-	    const validPaneIds = new Set(
-	      logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex)),
-	    );
-	    currentPaneIds.forEach((paneId) => {
-	      if (validPaneIds.has(paneId)) {
-	        return;
-	      }
-	      const label = webPanelLabelsRef.current[paneId];
-	      if (label) {
-	        invoke("web_panel_close", { label }).catch(() => {});
-	      }
-	      clearWebPanelBreakout(paneId);
-	    });
-	  }, [clearWebPanelBreakout, getTerminalPaneId, logicalTerminalIndexes]);
-
-	  // Close PCB panel windows whose panes no longer exist.
-	  useEffect(() => {
-	    const currentPaneIds = Object.keys(pcbBreakoutPanesRef.current);
-    if (!currentPaneIds.length || !terminalWorkspace?.id) {
+  // Close web panel windows whose panes no longer exist.
+  useEffect(() => {
+    const currentPaneIds = Object.keys(webBreakoutPanesRef.current);
+    if (!currentPaneIds.length) {
       return;
     }
 
@@ -29533,34 +29931,76 @@ function TerminalView({
       logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex)),
     );
     currentPaneIds.forEach((paneId) => {
-      if (!validPaneIds.has(paneId)) {
+      if (validPaneIds.has(paneId)) {
+        return;
+      }
+      const label = webPanelLabelsRef.current[paneId];
+      if (label) {
+        invoke("web_panel_close", { label }).catch(() => {});
+      }
+      clearWebPanelBreakout(paneId);
+    });
+  }, [clearWebPanelBreakout, getTerminalPaneId, logicalTerminalIndexes]);
+
+  // Close PCB panel windows whose panes no longer exist.
+  useEffect(() => {
+    const currentPaneIds = Array.from(new Set([
+      ...Object.keys(pcbBreakoutPanesRef.current),
+      ...Object.keys(pcbPaneBreakoutSyncRef.current),
+      ...Object.keys(pcbPanelWorkspaceIdsRef.current),
+    ]));
+    if (!currentPaneIds.length) {
+      return;
+    }
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
+
+    const validPaneIds = new Set(
+      logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex)),
+    );
+    currentPaneIds.forEach((paneId) => {
+      if (validPaneIds.has(paneId)) {
+        return;
+      }
+      const panelWorkspaceId = String(pcbPanelWorkspaceIdsRef.current[paneId] || workspaceId || "").trim();
+      if (panelWorkspaceId) {
         invoke("pcb_panel_close", {
           paneId,
-          workspaceId: terminalWorkspace.id,
+          workspaceId: panelWorkspaceId,
         }).catch(() => {});
       }
+      clearPcbPanelBreakout(paneId, { dropSyncedState: true });
     });
-  }, [getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace?.id]);
+  }, [clearPcbPanelBreakout, getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace?.id]);
 
   // Close Video panel windows whose panes no longer exist.
   useEffect(() => {
-    const currentPaneIds = Object.keys(videoBreakoutPanesRef.current);
-    if (!currentPaneIds.length || !terminalWorkspace?.id) {
+    const currentPaneIds = Array.from(new Set([
+      ...Object.keys(videoBreakoutPanesRef.current),
+      ...Object.keys(videoPaneBreakoutSyncRef.current),
+      ...Object.keys(videoPanelWorkspaceIdsRef.current),
+    ]));
+    if (!currentPaneIds.length) {
       return;
     }
+    const workspaceId = String(terminalWorkspace?.id || "").trim();
 
     const validPaneIds = new Set(
       logicalTerminalIndexes.map((terminalIndex) => getTerminalPaneId(terminalIndex)),
     );
     currentPaneIds.forEach((paneId) => {
-      if (!validPaneIds.has(paneId)) {
+      if (validPaneIds.has(paneId)) {
+        return;
+      }
+      const panelWorkspaceId = String(videoPanelWorkspaceIdsRef.current[paneId] || workspaceId || "").trim();
+      if (panelWorkspaceId) {
         invoke("video_panel_close", {
           paneId,
-          workspaceId: terminalWorkspace.id,
+          workspaceId: panelWorkspaceId,
         }).catch(() => {});
       }
+      clearVideoPanelBreakout(paneId, { dropSyncedState: true });
     });
-  }, [getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace?.id]);
+  }, [clearVideoPanelBreakout, getTerminalPaneId, logicalTerminalIndexes, terminalWorkspace?.id]);
 
   const resetTerminalBreakoutLayout = useCallback(() => {
     if (!terminalBreakoutVisible) {
@@ -38802,6 +39242,46 @@ function TerminalView({
     getTerminalPaneId,
   ]);
 
+  const handleMinimizeWorkspacePane = useCallback((index) => {
+    const targetTerminalIndex = Number.parseInt(index, 10);
+    if (!Number.isInteger(targetTerminalIndex) || !logicalTerminalIndexes.includes(targetTerminalIndex)) {
+      return;
+    }
+    if (fullscreenActive && fullscreenTerminalIndex === targetTerminalIndex) {
+      clearFullscreenTransitionTimer();
+      setFullscreenTerminalIndex(null);
+      setFullscreenMotion(TERMINAL_FULLSCREEN_DEFAULT_MOTION);
+    }
+    minimizeWorkspacePane?.({
+      terminalIndex: targetTerminalIndex,
+      workspaceId: terminalWorkspace?.id || "",
+    });
+  }, [
+    clearFullscreenTransitionTimer,
+    fullscreenActive,
+    fullscreenTerminalIndex,
+    logicalTerminalIndexSignature,
+    logicalTerminalIndexes,
+    minimizeWorkspacePane,
+    terminalWorkspace?.id,
+  ]);
+
+  const handleRestoreWorkspacePane = useCallback((index) => {
+    const targetTerminalIndex = Number.parseInt(index, 10);
+    if (!Number.isInteger(targetTerminalIndex) || !logicalTerminalIndexes.includes(targetTerminalIndex)) {
+      return;
+    }
+    restoreWorkspacePane?.({
+      terminalIndex: targetTerminalIndex,
+      workspaceId: terminalWorkspace?.id || "",
+    });
+  }, [
+    logicalTerminalIndexSignature,
+    logicalTerminalIndexes,
+    restoreWorkspacePane,
+    terminalWorkspace?.id,
+  ]);
+
   const minimizeTodoQueuePane = useCallback(() => {
     if (workspaceToolPortaled && onMinimizeWorkspaceToolPane) {
       onMinimizeWorkspaceToolPane();
@@ -39026,70 +39506,72 @@ function TerminalView({
         aria-hidden={terminalBreakoutVisible ? "true" : undefined}
         data-breakout-visible={terminalBreakoutVisible ? "true" : "false"}
       >
-        <ResizePanelGroup
-          defaultLayout={terminalGridDefaultRowsLayout}
-          id={`workspace-terminal-layout-${terminalWorkspace.id}`}
-          key={`workspace-terminal-layout-${terminalGridLayoutWorkspaceId}-${terminalGridLayoutSignature}`}
-          onLayoutChanged={handleTerminalGridRowsLayoutChanged}
-          orientation="vertical"
-        >
-          {activeDisplayRows.map((row, rowOrderIndex) => {
-            const rowDefaultColumnLayout = getTerminalGridColumnDefaultLayout(row);
+        {activeDisplayRows.length > 0 && (
+          <ResizePanelGroup
+            defaultLayout={terminalGridDefaultRowsLayout}
+            id={`workspace-terminal-layout-${terminalWorkspace.id}`}
+            key={`workspace-terminal-layout-${terminalGridLayoutWorkspaceId}-${terminalGridLayoutSignature}`}
+            onLayoutChanged={handleTerminalGridRowsLayoutChanged}
+            orientation="vertical"
+          >
+            {activeDisplayRows.map((row, rowOrderIndex) => {
+              const rowDefaultColumnLayout = getTerminalGridColumnDefaultLayout(row);
 
-            return (
-              <Fragment key={`row-${row.rowIndex}`}>
-                {rowOrderIndex > 0 && (
-                  <ResizeHandle
-                    data-direction="vertical"
-                  />
-                )}
-                <ResizePanel
-                  data-terminal-row="true"
-                  defaultSize={`${100 / activeDisplayRows.length}%`}
-                  id={getTerminalGridRowPanelId(terminalWorkspace.id, row.rowIndex)}
-                  minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
-                >
-                  <ResizePanelGroup
-                    defaultLayout={rowDefaultColumnLayout}
-                    id={getTerminalGridColumnGroupId(terminalWorkspace.id, row.rowIndex)}
-                    onLayoutChanged={(layout) => queueTerminalGridLayoutWrite("columns", layout, row.rowIndex)}
-                    orientation="horizontal"
+              return (
+                <Fragment key={`row-${row.rowIndex}`}>
+                  {rowOrderIndex > 0 && (
+                    <ResizeHandle
+                      data-direction="vertical"
+                    />
+                  )}
+                  <ResizePanel
+                    data-terminal-row="true"
+                    defaultSize={`${100 / activeDisplayRows.length}%`}
+                    id={getTerminalGridRowPanelId(terminalWorkspace.id, row.rowIndex)}
+                    minSize={getTerminalPaneMinSizePercent(activeDisplayRows.length)}
                   >
-                    {row.terminalIndexes.map((paneKey, columnOrderIndex) => {
-                      const documentPanelPane = isTerminalDocumentPanelPane(paneKey);
-                      const paneIdPart = terminalPaneLayoutDomIdPart(paneKey);
-                      const draggingThisPane = terminalDragState?.mode !== "canvas"
-                        && terminalPaneLayoutKeyIdentity(terminalDragState?.terminalIndex) === terminalPaneLayoutKeyIdentity(paneKey);
-                      return (
-                        <Fragment key={`${terminalWorkspace.id}-${paneIdPart}`}>
-                          {columnOrderIndex > 0 && (
-                            <ResizeHandle
-                              data-direction="horizontal"
-                            />
-                          )}
-                          <ResizePanel
-                            data-terminal-column="true"
-                            data-terminal-document-panel-column={documentPanelPane ? "true" : undefined}
-                            defaultSize={`${100 / row.terminalIndexes.length}%`}
-                            id={getTerminalGridPanePanelId(terminalWorkspace.id, row.rowIndex, paneKey)}
-                            minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
-                          >
-                            <TerminalPanelAnchor
-                              data-terminal-document-panel-anchor={documentPanelPane ? "true" : undefined}
-                              data-terminal-drag-placeholder={draggingThisPane ? "true" : undefined}
-                              data-terminal-index={Number.isInteger(paneKey) ? paneKey : undefined}
-                              data-terminal-panel-anchor={documentPanelPane ? undefined : "true"}
-                            />
-                          </ResizePanel>
-                        </Fragment>
-                      );
-                    })}
-                  </ResizePanelGroup>
-                </ResizePanel>
-              </Fragment>
-            );
-          })}
-        </ResizePanelGroup>
+                    <ResizePanelGroup
+                      defaultLayout={rowDefaultColumnLayout}
+                      id={getTerminalGridColumnGroupId(terminalWorkspace.id, row.rowIndex)}
+                      onLayoutChanged={(layout) => queueTerminalGridLayoutWrite("columns", layout, row.rowIndex)}
+                      orientation="horizontal"
+                    >
+                      {row.terminalIndexes.map((paneKey, columnOrderIndex) => {
+                        const documentPanelPane = isTerminalDocumentPanelPane(paneKey);
+                        const paneIdPart = terminalPaneLayoutDomIdPart(paneKey);
+                        const draggingThisPane = terminalDragState?.mode !== "canvas"
+                          && terminalPaneLayoutKeyIdentity(terminalDragState?.terminalIndex) === terminalPaneLayoutKeyIdentity(paneKey);
+                        return (
+                          <Fragment key={`${terminalWorkspace.id}-${paneIdPart}`}>
+                            {columnOrderIndex > 0 && (
+                              <ResizeHandle
+                                data-direction="horizontal"
+                              />
+                            )}
+                            <ResizePanel
+                              data-terminal-column="true"
+                              data-terminal-document-panel-column={documentPanelPane ? "true" : undefined}
+                              defaultSize={`${100 / row.terminalIndexes.length}%`}
+                              id={getTerminalGridPanePanelId(terminalWorkspace.id, row.rowIndex, paneKey)}
+                              minSize={getTerminalPaneMinSizePercent(row.terminalIndexes.length)}
+                            >
+                              <TerminalPanelAnchor
+                                data-terminal-document-panel-anchor={documentPanelPane ? "true" : undefined}
+                                data-terminal-drag-placeholder={draggingThisPane ? "true" : undefined}
+                                data-terminal-index={Number.isInteger(paneKey) ? paneKey : undefined}
+                                data-terminal-panel-anchor={documentPanelPane ? undefined : "true"}
+                              />
+                            </ResizePanel>
+                          </Fragment>
+                        );
+                      })}
+                    </ResizePanelGroup>
+                  </ResizePanel>
+                </Fragment>
+              );
+            })}
+          </ResizePanelGroup>
+        )}
       </TerminalGridScaffold>
       <TerminalBreakoutCanvas
         aria-hidden={terminalBreakoutVisible ? undefined : "true"}
@@ -39186,6 +39668,7 @@ function TerminalView({
         {logicalTerminalIndexes.map((terminalIndex) => {
           const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
           const fullscreenThisTerminal = fullscreenActive && terminalIndex === fullscreenTerminalIndex;
+          const paneMinimized = minimizedPaneIndexSet.has(terminalIndex);
           const terminalPaneId = getTerminalPaneId(terminalIndex);
           const terminalActive = activePaneId === terminalPaneId;
           const terminalBreakoutPlan = terminalBreakoutLivePlansByIndex.get(terminalIndex) || null;
@@ -39210,10 +39693,12 @@ function TerminalView({
             || (fullscreenThisTerminal ? terminalPanelRect : null);
           // Inactive tabs stay mounted (PTY preserved) but invisible: every
           // tab in a group shares the group's anchor rect.
-          const tabHidden = !terminalBreakoutLayoutActive
+          const tabHidden = paneMinimized || (
+            !terminalBreakoutLayoutActive
             && !fullscreenThisTerminal
             && !draggingThisTerminal
-            && tabVisibilityByTerminal.get(terminalIndex) === false;
+            && tabVisibilityByTerminal.get(terminalIndex) === false
+          );
           const terminalAgent = getTerminalAgent(terminalIndex);
           const terminalRole = getTerminalRole(terminalIndex);
           const terminalAgentId = String(terminalAgent?.id || "").trim().toLowerCase();
@@ -39245,6 +39730,7 @@ function TerminalView({
               fullscreenThisTerminal ? "fullscreen" : "grid",
               terminalBreakoutLayoutActive ? "breakout" : "stack",
               tabHidden ? "tab-hidden" : "tab-visible",
+              paneMinimized ? "minimized" : "restored",
               webBreakoutPanes[terminalPaneId] ? "popped-out" : "in-grid",
               webLayoutRect
                 ? `${Math.round(webLayoutRect.left)},${Math.round(webLayoutRect.top)},${Math.round(webLayoutRect.width)},${Math.round(webLayoutRect.height)}`
@@ -39258,7 +39744,7 @@ function TerminalView({
                 data-terminal-active={terminalActive ? "true" : "false"}
                 data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
                 data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
-                data-terminal-hidden={webSurfaceReady ? "false" : "true"}
+                data-terminal-hidden={webSurfaceReady && !tabHidden ? "false" : "true"}
                 data-terminal-index={terminalIndex}
                 data-terminal-surface-slot="true"
                 data-terminal-tab-hidden={tabHidden ? "true" : "false"}
@@ -39304,10 +39790,11 @@ function TerminalView({
                     });
                   }}
                   onSplit={handleSplitTerminal}
+                  onMinimize={handleMinimizeWorkspacePane}
                   onToggleFullscreen={(index, pid) => handleToggleFullscreenTerminal({ paneId: pid, terminalIndex: index })}
                   onClose={(index) => closeWorkspaceTerminal({ workspaceId: terminalWorkspace?.id || "", terminalIndex: index })}
                   onPopOut={popOutWebPanelForIndex}
-                  onReturnFromBreakout={(index, pid) => returnWebPanelToGrid(pid)}
+                  onReturnFromBreakout={(index, pid, returnUrl) => returnWebPanelToGrid(pid, returnUrl)}
                   onFocusBreakout={focusWebPanel}
                   onNavigate={(url) => rememberWebPaneUrl(terminalPaneId, url)}
                   onDismissPanelAgentPromptActivityItem={removePanelAgentPromptActivityItems}
@@ -39329,7 +39816,7 @@ function TerminalView({
                 data-terminal-breakout={terminalBreakoutLayoutActive ? "true" : "false"}
                 data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
                 data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
-                data-terminal-hidden="false"
+                data-terminal-hidden={tabHidden ? "true" : "false"}
                 data-terminal-index={terminalIndex}
                 data-terminal-interacting={terminalBreakoutCanvasInteracting ? "true" : "false"}
                 data-terminal-pcb-pane="true"
@@ -39340,6 +39827,7 @@ function TerminalView({
                 style={getTerminalSlotStyle(terminalIndex)}
               >
                 <WorkspacePcbGridPane
+                  breakoutBoard={pcbPaneBreakoutSyncedPanes[terminalPaneId] ? (pcbPaneBoards[terminalPaneId] || null) : undefined}
                   dragActive={terminalDragActive}
                   defaultPanelAgentPromptTargetIds={defaultPanelAgentPromptTargetIds}
                   fullscreenActive={fullscreenActive}
@@ -39371,6 +39859,7 @@ function TerminalView({
                     });
                   }}
                   onFocusBreakout={focusPcbPanel}
+                  onMinimize={handleMinimizeWorkspacePane}
                   onPopOut={popOutPcbPanelForIndex}
                   onReturnFromBreakout={(index, pid) => returnPcbPanelToGrid(pid)}
                   onSplit={handleSplitTerminal}
@@ -39415,7 +39904,7 @@ function TerminalView({
                 data-terminal-breakout={terminalBreakoutLayoutActive ? "true" : "false"}
                 data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
                 data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
-                data-terminal-hidden="false"
+                data-terminal-hidden={tabHidden ? "true" : "false"}
                 data-terminal-index={terminalIndex}
                 data-terminal-interacting={terminalBreakoutCanvasInteracting ? "true" : "false"}
                 data-terminal-surface-slot="true"
@@ -39426,6 +39915,7 @@ function TerminalView({
                 style={getTerminalSlotStyle(terminalIndex)}
               >
                 <WorkspaceVideoGridPane
+                  breakoutProject={videoPaneBreakoutSyncedPanes[terminalPaneId] ? (videoPaneProjects[terminalPaneId] || null) : undefined}
                   dragActive={terminalDragActive}
                   defaultPanelAgentPromptTargetIds={defaultPanelAgentPromptTargetIds}
                   fullscreenActive={fullscreenActive}
@@ -39457,6 +39947,7 @@ function TerminalView({
                     });
                   }}
                   onFocusBreakout={focusVideoPanel}
+                  onMinimize={handleMinimizeWorkspacePane}
                   onPopOut={popOutVideoPanelForIndex}
                   onReturnFromBreakout={(index, pid) => returnVideoPanelToGrid(pid)}
                   onSplit={handleSplitTerminal}
@@ -39501,7 +39992,7 @@ function TerminalView({
                 data-terminal-breakout={terminalBreakoutLayoutActive ? "true" : "false"}
                 data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
                 data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
-                data-terminal-hidden="false"
+                data-terminal-hidden={tabHidden ? "true" : "false"}
                 data-terminal-index={terminalIndex}
                 data-terminal-interacting={terminalBreakoutCanvasInteracting ? "true" : "false"}
                 data-terminal-surface-slot="true"
@@ -39540,6 +40031,7 @@ function TerminalView({
                     });
                   }}
                   onSplit={handleSplitTerminal}
+                  onMinimize={handleMinimizeWorkspacePane}
                   onToggleFullscreen={(index, pid) => handleToggleFullscreenTerminal({ paneId: pid, terminalIndex: index })}
                   paneId={terminalPaneId}
                   paneLimitReached={terminalPaneLimitReached}
@@ -39571,7 +40063,7 @@ function TerminalView({
               data-terminal-breakout={terminalBreakoutLayoutActive ? "true" : "false"}
               data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
               data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
-              data-terminal-hidden={hasMeasuredRect ? "false" : "true"}
+              data-terminal-hidden={hasMeasuredRect && !tabHidden ? "false" : "true"}
               data-terminal-index={terminalIndex}
               data-terminal-interacting={terminalBreakoutCanvasInteracting ? "true" : "false"}
               data-terminal-surface-slot="true"
@@ -39843,7 +40335,7 @@ function TerminalView({
                 agentStatusState={agentStatusState}
                 draggablePaneCount={draggableWorkspacePaneCount}
                 fullscreenState={fullscreenState}
-                isActive={terminalActive}
+                isActive={terminalActive && !tabHidden}
                 isFullscreen={fullscreenThisTerminal}
                 onActivateTerminal={handleActivateTerminalPane}
                 onBeginTerminalDrag={handleBeginTerminalDrag}
@@ -39855,6 +40347,7 @@ function TerminalView({
                 onPreparedTerminalChange={handlePreparedTerminalChange}
                 onRecheckAgents={refreshAgentStatuses}
                 onForkTerminal={handleForkTerminal}
+                onMinimizeTerminal={handleMinimizeWorkspacePane}
                 onSplitTerminal={handleSplitTerminal}
                 onSelectWorkspaceThread={handleSelectWorkspaceThreadFromTerminal}
                 onToggleWorkspaceThreadPinned={onToggleWorkspaceThreadPinned}
@@ -39969,18 +40462,7 @@ function TerminalView({
                     Docs
                   </TerminalDocumentPanelTitle>
                 </TerminalDocumentPanelIdentity>
-                <TerminalRailControls data-rail-row="primary">
-                  <TerminalCloseButton
-                    aria-label="Close Docs panel"
-                    onClick={closeWorkspaceDocumentPanel}
-                    onPointerDown={(event) => event.stopPropagation()}
-                    title="Close Docs panel"
-                    type="button"
-                  >
-                    <ButtonCloseIcon aria-hidden="true" />
-                  </TerminalCloseButton>
-                </TerminalRailControls>
-                <TerminalRailControls data-rail-row="secondary">
+                <TerminalPaneInlineRailControls data-rail-row="inline">
                   <PanelAgentPromptActivity
                     items={panelAgentPromptActivityItems.filter((item) => (
                       String(item.panelPaneId || "").trim() === TERMINAL_DOCUMENT_PANEL_ID
@@ -40022,7 +40504,16 @@ function TerminalView({
                       <ButtonFullscreenIcon aria-hidden="true" />
                     )}
                   </TerminalRestartButton>
-                </TerminalRailControls>
+                  <TerminalCloseButton
+                    aria-label="Close Docs panel"
+                    onClick={closeWorkspaceDocumentPanel}
+                    onPointerDown={(event) => event.stopPropagation()}
+                    title="Close Docs panel"
+                    type="button"
+                  >
+                    <ButtonCloseIcon aria-hidden="true" />
+                  </TerminalCloseButton>
+                </TerminalPaneInlineRailControls>
               </TerminalDocumentPanelHeader>
               <TerminalDocumentPanelBody>
                 <ToolsWorkspaceView
@@ -40061,6 +40552,7 @@ function TerminalView({
       </TerminalSurfaceLayer>
       {!terminalBreakoutLayoutActive && !fullscreenActive && hasVisibleWorkspaceTerminalPanes && (
         <TerminalToolboxFloating
+          data-native-webview-exclusion="terminal-toolbox"
           data-terminal-control="true"
           onPointerDown={(event) => event.stopPropagation()}
           onPointerLeave={handleTerminalToolboxPointerLeave}
@@ -40606,41 +41098,63 @@ function TerminalView({
           data-workspace-tool-fullscreen={!workspaceToolPortaled && todoQueuePaneFullscreen ? "true" : "false"}
           data-workspace-tool-pane-mode={effectiveTodoQueuePaneMode}
           ref={terminalWorkspaceMainRef}
-        >
-          {hasVisibleWorkspacePanels ? (
-            <ResizePanelGroup
-              id={`workspace-terminal-main-${terminalWorkspace.id}`}
-              orientation="horizontal"
-            >
-              <ResizePanel
-                data-workspace-tool-main-grid="true"
-                defaultSize={!workspaceToolPortaled && todoQueueVisible ? `${terminalGridPanelSize}%` : "100%"}
-                id={`workspace-terminal-main-grid-${terminalWorkspace.id}`}
-                minSize={!workspaceToolPortaled && todoQueueVisible ? `${terminalGridPanelMinSize}%` : "100%"}
-                ref={terminalGridPanelRef}
-              >
-                {terminalWorkspaceContent}
-              </ResizePanel>
-              {!workspaceToolPortaled && todoQueueVisible && (
-                <>
-                  <ResizeHandle data-direction="horizontal" data-workspace-tool-resize-handle="true" />
-                  <ResizePanel
-                    data-pane-mode={effectiveTodoQueuePaneMode}
-                    data-workspace-tool-panel="true"
-                    defaultSize={`${todoQueuePanelSize}%`}
-                    id={`workspace-terminal-todo-queue-${terminalWorkspace.id}`}
-                    maxSize={`${todoQueuePanelMaxSize}%`}
-                    minSize={todoQueuePanelMinSize}
-                    ref={todoQueuePanelRef}
-                  >
-                    {workspaceToolPaneContent}
-                  </ResizePanel>
-                </>
-              )}
-            </ResizePanelGroup>
-          ) : terminalWorkspaceContent}
-        </TerminalWorkspaceMain>
-      )}
+	        >
+	          <TerminalWorkspaceGridRegion>
+	            {hasVisibleWorkspacePanels ? (
+	              <ResizePanelGroup
+	                id={`workspace-terminal-main-${terminalWorkspace.id}`}
+	                orientation="horizontal"
+	              >
+	                <ResizePanel
+	                  data-workspace-tool-main-grid="true"
+	                  defaultSize={!workspaceToolPortaled && todoQueueVisible ? `${terminalGridPanelSize}%` : "100%"}
+	                  id={`workspace-terminal-main-grid-${terminalWorkspace.id}`}
+	                  minSize={!workspaceToolPortaled && todoQueueVisible ? `${terminalGridPanelMinSize}%` : "100%"}
+	                  ref={terminalGridPanelRef}
+	                >
+	                  {terminalWorkspaceContent}
+	                </ResizePanel>
+	                {!workspaceToolPortaled && todoQueueVisible && (
+	                  <>
+	                    <ResizeHandle data-direction="horizontal" data-workspace-tool-resize-handle="true" />
+	                    <ResizePanel
+	                      data-pane-mode={effectiveTodoQueuePaneMode}
+	                      data-workspace-tool-panel="true"
+	                      defaultSize={`${todoQueuePanelSize}%`}
+	                      id={`workspace-terminal-todo-queue-${terminalWorkspace.id}`}
+	                      maxSize={`${todoQueuePanelMaxSize}%`}
+	                      minSize={todoQueuePanelMinSize}
+	                      ref={todoQueuePanelRef}
+	                    >
+	                      {workspaceToolPaneContent}
+	                    </ResizePanel>
+	                  </>
+	                )}
+	              </ResizePanelGroup>
+	            ) : terminalWorkspaceContent}
+	          </TerminalWorkspaceGridRegion>
+	          {minimizedPaneDockItems.length > 0 && (
+	            <TerminalPaneDock aria-label="Minimized panes">
+	              {minimizedPaneDockItems.map((item) => (
+	                <TerminalPaneDockChip
+	                  aria-label={`Restore ${item.label}`}
+	                  key={item.paneId}
+	                  onClick={() => handleRestoreWorkspacePane(item.terminalIndex)}
+	                  title={`Restore ${item.label}`}
+	                  type="button"
+	                >
+	                  {item.kind === "terminal" ? (
+	                    <TerminalEmptyAgentLauncherGlyph roleId={item.roleId} />
+	                  ) : (
+	                    <TerminalToolboxPanelGlyph panelId={item.kind} />
+	                  )}
+	                  <span>{item.label}</span>
+	                </TerminalPaneDockChip>
+	              ))}
+	            </TerminalPaneDock>
+	          )}
+	        </TerminalWorkspaceMain>
+	      )}
       {crashResumeCandidates.length > 0 && (
         <TodoResumeOverlay aria-label="Resume interrupted todos" aria-modal="true" role="dialog">
           <TodoResumeDialog>

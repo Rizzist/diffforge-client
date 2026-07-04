@@ -1148,6 +1148,9 @@ const TERMINAL_THREAD_PROMPT_READY_MIN_MS = 450;
 const TERMINAL_THREAD_PROMPT_ECHO_READY_SUPPRESS_MS = 2500;
 const TERMINAL_THREAD_PROMPT_ECHO_MIN_SUPPRESS_MS = 600;
 const TERMINAL_PARKED_PROMPT_BLOCKING_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
+const TERMINAL_WEBGL_LRU_CAP = 12;
+const terminalWebglAddonRegistry = new Map();
+let terminalWebglAddonRegistrySequence = 0;
 const SHELL_LAUNCHER_MODE_TERMINAL = "generic";
 const SHELL_LAUNCHER_AGENT_OPTIONS = Object.freeze([
   { id: SHELL_LAUNCHER_MODE_TERMINAL, label: "Terminal", command: "" },
@@ -1157,6 +1160,81 @@ const SHELL_LAUNCHER_AGENT_OPTIONS = Object.freeze([
 ]);
 const SHELL_LAUNCHER_AGENT_IDS = new Set(SHELL_LAUNCHER_AGENT_OPTIONS.map((option) => option.id));
 const SHELL_LAUNCHER_AGENT_COMMAND_DELAY_MS = 950;
+
+function removeTerminalWebglRegistryEntry(registryKey, addon = null) {
+  const key = String(registryKey || "");
+  if (!key) {
+    return false;
+  }
+  const entry = terminalWebglAddonRegistry.get(key);
+  if (!entry || (addon && entry.addon !== addon)) {
+    return false;
+  }
+  terminalWebglAddonRegistry.delete(key);
+  return true;
+}
+
+function disposeTerminalWebglRegistryEntry(registryKey, reason = "webgl_registry_dispose") {
+  const key = String(registryKey || "");
+  if (!key) {
+    return false;
+  }
+  const entry = terminalWebglAddonRegistry.get(key);
+  if (!entry) {
+    return false;
+  }
+  terminalWebglAddonRegistry.delete(key);
+  try {
+    entry.dispose?.(reason);
+  } catch (_error) {
+    // WebGL disposal is best effort; xterm keeps its DOM/canvas renderer.
+  }
+  return true;
+}
+
+function touchTerminalWebglRegistryEntry(registryKey) {
+  const entry = terminalWebglAddonRegistry.get(String(registryKey || ""));
+  if (!entry) {
+    return false;
+  }
+  entry.lastActive = ++terminalWebglAddonRegistrySequence;
+  return true;
+}
+
+function trimTerminalWebglRegistryForAttach(exemptRegistryKey = "") {
+  const exemptKey = String(exemptRegistryKey || "");
+  while (terminalWebglAddonRegistry.size >= TERMINAL_WEBGL_LRU_CAP) {
+    let staleKey = "";
+    let staleSequence = Number.POSITIVE_INFINITY;
+    terminalWebglAddonRegistry.forEach((entry, key) => {
+      if (key === exemptKey) {
+        return;
+      }
+      const lastActive = Number(entry?.lastActive || 0);
+      if (lastActive < staleSequence) {
+        staleKey = key;
+        staleSequence = lastActive;
+      }
+    });
+    if (!staleKey) {
+      return;
+    }
+    disposeTerminalWebglRegistryEntry(staleKey, "webgl_lru_cap");
+  }
+}
+
+function registerTerminalWebglRegistryEntry(registryKey, entry) {
+  const key = String(registryKey || "");
+  if (!key || !entry?.addon) {
+    return false;
+  }
+  disposeTerminalWebglRegistryEntry(key, "webgl_replaced");
+  terminalWebglAddonRegistry.set(key, {
+    ...entry,
+    lastActive: ++terminalWebglAddonRegistrySequence,
+  });
+  return true;
+}
 
 function normalizeShellLauncherAgentId(value) {
   const normalized = String(value || "").trim().toLowerCase().replace(/[\s_]+/g, "-");
@@ -2037,6 +2115,7 @@ function WorkspaceTerminal({
   onBeginTerminalDrag,
   onCreateWorkspaceThreadTerminal,
   onForkTerminal,
+  onMinimizeTerminal,
   onSplitTerminal,
   onSelectWorkspaceThread,
   onToggleWorkspaceThreadPinned,
@@ -2167,6 +2246,8 @@ function WorkspaceTerminal({
         && (typeof document.hasFocus !== "function" || document.hasFocus()),
   );
   const attachDeferredWebglRef = useRef(null);
+  const resetTerminalWebglRendererRef = useRef(null);
+  const touchTerminalWebglRendererRef = useRef(null);
   const terminalOutputWorkerSessionRef = useRef(null);
   const terminalOutputFlushNowRef = useRef(null);
   const terminalPointerSelectionPendingRef = useRef(false);
@@ -5249,6 +5330,7 @@ function WorkspaceTerminal({
       const instanceId = terminalInstanceIdRef.current || 0;
       setActiveTerminalKeyboardTarget(paneId, instanceId);
       setTerminalAudioInputTarget(true, instanceId, "terminal_active_prop");
+      touchTerminalWebglRendererRef.current?.("terminal_active_prop");
       if (!wasActiveProp) {
         attachDeferredWebglRef.current?.("terminal_activated");
         // Resizes are skipped while a pane's surface is hidden; activation is
@@ -5265,6 +5347,7 @@ function WorkspaceTerminal({
     const instanceId = terminalInstanceIdRef.current || 0;
     clearActiveTerminalKeyboardTargetIfCurrent(paneId, instanceId);
     setTerminalAudioInputTarget(false, instanceId, "terminal_inactive_prop");
+    resetTerminalWebglRendererRef.current?.("terminal_deactivated");
     return undefined;
   }, [isActive, paneId, setTerminalAudioInputTarget, updateTerminalInteractiveState]);
 
@@ -5859,6 +5942,43 @@ function WorkspaceTerminal({
     const startupMetricTimers = new Set();
     const terminalInstanceId = getNextWorkspaceTerminalInstanceId();
     const renderSchedulerId = `${paneId}:${terminalInstanceId}`;
+    const webglRegistryKey = `${paneId}:${terminalInstanceId}`;
+    const disposeWebglAddon = (webglAddon, reason = "webgl_dispose") => {
+      if (!webglAddon) {
+        return false;
+      }
+      removeTerminalWebglRegistryEntry(webglRegistryKey, webglAddon);
+      if (activeWebglAddon === webglAddon) {
+        activeWebglAddon = null;
+        webglAttachAttempted = false;
+        webglBackgroundDeferred = false;
+        rendererMode = "canvas";
+      }
+      try {
+        webglAddon.dispose();
+      } catch (_error) {
+        // WebGL disposal is best effort; xterm keeps its DOM/canvas renderer.
+      }
+      logTerminalDiagnosticEvent("frontend.webgl.dispose", {
+        paneId,
+        reason,
+        terminalIndex,
+      });
+      return true;
+    };
+    const disposeActiveWebglAddon = (reason = "webgl_dispose_active") => {
+      if (!activeWebglAddon) {
+        return false;
+      }
+      const webglAddon = activeWebglAddon;
+      if (disposeTerminalWebglRegistryEntry(webglRegistryKey, reason)) {
+        return true;
+      }
+      return disposeWebglAddon(webglAddon, reason);
+    };
+    const touchActiveWebglAddon = () => {
+      touchTerminalWebglRegistryEntry(webglRegistryKey);
+    };
     let lastTerminalSizeDesyncSignature = "";
     const checkTerminalSizeDesyncOnInput = (reason) => {
       const nativeSize = resizeController?.getLastNativeAppliedSize?.();
@@ -6976,42 +7096,68 @@ function WorkspaceTerminal({
         return;
       }
 
-      webglAttachAttempted = true;
-      const webglStartedAt = performance.now();
-      const webglAddon = new WebglAddon();
+	      webglAttachAttempted = true;
+	      const webglStartedAt = performance.now();
+	      trimTerminalWebglRegistryForAttach(webglRegistryKey);
+	      const webglAddon = new WebglAddon();
 
-      try {
-        terminal.loadAddon(webglAddon);
-        rendererMode = "webgl";
-        activeWebglAddon = webglAddon;
-        disposables.push(webglAddon);
-        disposables.push(webglAddon.onContextLoss(() => {
-          rendererMode = "canvas";
-          if (activeWebglAddon === webglAddon) {
-            activeWebglAddon = null;
-          }
-          logTerminalDiagnosticEvent("frontend.webgl.context_loss", {
-            paneId,
-            reason,
-            terminalIndex,
-          });
-          webglAddon.dispose();
-        }));
-        patchTerminalMetrics({ webglMs: performance.now() - webglStartedAt });
-        logTerminalDiagnosticDuration("frontend.webgl.attach_done", webglStartedAt, {
-          paneId,
-          reason,
-          terminalIndex,
-        });
-        refreshTerminalRenderer("webgl_attach_done", { reason });
-      } catch {
-        // WebGL is best-effort; xterm keeps its canvas renderer when WebGL2 is unavailable.
-        rendererMode = "canvas";
-        webglAddon.dispose();
-        patchTerminalMetrics({ webglMs: performance.now() - webglStartedAt });
-        logTerminalDiagnosticDuration("frontend.webgl.attach_failed", webglStartedAt, {
-          paneId,
-          reason,
+	      try {
+	        terminal.loadAddon(webglAddon);
+	        rendererMode = "webgl";
+	        activeWebglAddon = webglAddon;
+	        registerTerminalWebglRegistryEntry(webglRegistryKey, {
+	          addon: webglAddon,
+	          dispose: (disposeReason = "webgl_registry_dispose") => {
+	            if (activeWebglAddon === webglAddon) {
+	              activeWebglAddon = null;
+	              webglAttachAttempted = false;
+	              webglBackgroundDeferred = false;
+	              rendererMode = "canvas";
+	            }
+	            try {
+	              webglAddon.dispose();
+	            } catch (_error) {
+	              // WebGL disposal is best effort; xterm keeps its DOM/canvas renderer.
+	            }
+	            logTerminalDiagnosticEvent("frontend.webgl.dispose", {
+	              paneId,
+	              reason: disposeReason,
+	              terminalIndex,
+	            });
+	          },
+	        });
+	        disposables.push(() => disposeWebglAddon(webglAddon, "terminal_cleanup"));
+	        disposables.push(webglAddon.onContextLoss(() => {
+	          rendererMode = "canvas";
+	          if (activeWebglAddon === webglAddon) {
+	            activeWebglAddon = null;
+	          }
+	          webglAttachAttempted = false;
+	          webglBackgroundDeferred = false;
+	          removeTerminalWebglRegistryEntry(webglRegistryKey, webglAddon);
+	          logTerminalDiagnosticEvent("frontend.webgl.context_loss", {
+	            paneId,
+	            reason,
+	            terminalIndex,
+	          });
+	          disposeWebglAddon(webglAddon, "webgl_context_loss");
+	        }));
+	        patchTerminalMetrics({ webglMs: performance.now() - webglStartedAt });
+	        logTerminalDiagnosticDuration("frontend.webgl.attach_done", webglStartedAt, {
+	          paneId,
+	          reason,
+	          terminalIndex,
+	        });
+	        refreshTerminalRenderer("webgl_attach_done", { reason });
+	      } catch {
+	        // WebGL is best-effort; xterm keeps its canvas renderer when WebGL2 is unavailable.
+	        rendererMode = "canvas";
+	        webglBackgroundDeferred = false;
+	        disposeWebglAddon(webglAddon, "webgl_attach_failed");
+	        patchTerminalMetrics({ webglMs: performance.now() - webglStartedAt });
+	        logTerminalDiagnosticDuration("frontend.webgl.attach_failed", webglStartedAt, {
+	          paneId,
+	          reason,
           terminalIndex,
         });
       }
@@ -7069,20 +7215,13 @@ function WorkspaceTerminal({
         webglAttachAt = 0;
       }
 
-      const hadAttempt = webglAttachAttempted;
-      const hadAddon = Boolean(activeWebglAddon);
-      if (activeWebglAddon) {
-        try {
-          activeWebglAddon.dispose();
-        } catch (_error) {
-          // xterm renderer reset is best effort; the forced refresh below
-          // still leaves the DOM/canvas renderer available.
-        }
-      }
+	      const hadAttempt = webglAttachAttempted;
+	      const hadAddon = Boolean(activeWebglAddon);
+	      disposeActiveWebglAddon(reason);
 
-      activeWebglAddon = null;
-      webglAttachAttempted = false;
-      webglBackgroundDeferred = false;
+	      activeWebglAddon = null;
+	      webglAttachAttempted = false;
+	      webglBackgroundDeferred = false;
       rendererMode = "webgl_pending";
       logTerminalDiagnosticEvent("frontend.webgl.reset_for_reveal", {
         hadAddon,
@@ -7090,9 +7229,19 @@ function WorkspaceTerminal({
         paneId,
         reason,
         terminalIndex,
-      });
-      return hadAddon || hadAttempt;
-    };
+	      });
+	      return hadAddon || hadAttempt;
+	    };
+	    resetTerminalWebglRendererRef.current = resetTerminalWebglRenderer;
+	    touchTerminalWebglRendererRef.current = touchActiveWebglAddon;
+	    disposables.push(() => {
+	      if (resetTerminalWebglRendererRef.current === resetTerminalWebglRenderer) {
+	        resetTerminalWebglRendererRef.current = null;
+	      }
+	      if (touchTerminalWebglRendererRef.current === touchActiveWebglAddon) {
+	        touchTerminalWebglRendererRef.current = null;
+	      }
+	    });
 
     const clearTerminalRendererRows = (reason, extraFields = {}) => {
       if (isDisposed || !container?.isConnected) {
@@ -10399,23 +10548,28 @@ function WorkspaceTerminal({
           attachDeferredWebglRef.current?.(reason);
         }
         scheduleVisibleOutputRefresh(`${reason}_retry`, {}, 48);
-      };
+	      };
 
-      const revealTimers = new Set();
-      const scheduleRevealRecovery = (reason, options = {}) => {
-        const delays = Array.isArray(options.delays) && options.delays.length
-          ? options.delays
-          : [0, 80, 220];
-        delays.forEach((delayMs) => {
-          const timer = window.setTimeout(() => {
-            revealTimers.delete(timer);
-            recoverRevealedTerminalPaint(delayMs ? `${reason}_settled` : reason, {
-              resetWebgl: delayMs === 0,
-            });
-          }, Math.max(0, Number(delayMs) || 0));
-          revealTimers.add(timer);
-        });
-      };
+	      const revealTimers = new Set();
+	      let revealWebglResetScheduled = false;
+	      const scheduleRevealRecovery = (reason, options = {}) => {
+	        const delays = Array.isArray(options.delays) && options.delays.length
+	          ? options.delays
+	          : [0, 80, 220];
+	        const shouldResetWebgl = options.resetWebgl !== false && !revealWebglResetScheduled;
+	        if (shouldResetWebgl) {
+	          revealWebglResetScheduled = true;
+	        }
+	        delays.forEach((delayMs) => {
+	          const timer = window.setTimeout(() => {
+	            revealTimers.delete(timer);
+	            recoverRevealedTerminalPaint(delayMs ? `${reason}_settled` : reason, {
+	              resetWebgl: delayMs === 0 && shouldResetWebgl,
+	            });
+	          }, Math.max(0, Number(delayMs) || 0));
+	          revealTimers.add(timer);
+	        });
+	      };
 
       const observeTargets = [];
       let ancestor = terminalSurfaceSlot || container;
@@ -10430,11 +10584,14 @@ function WorkspaceTerminal({
       let surfaceWasVisible = terminalVisibleForPaint();
       const handleRevealCandidate = (reason, options = {}) => {
         const surfaceVisibleNow = terminalVisibleForPaint();
-        if (surfaceVisibleNow && (!surfaceWasVisible || options.force === true)) {
-          scheduleRevealRecovery(reason, options);
-        }
-        surfaceWasVisible = surfaceVisibleNow;
-      };
+	        if (surfaceVisibleNow && (!surfaceWasVisible || options.force === true)) {
+	          scheduleRevealRecovery(reason, options);
+	        }
+	        if (!surfaceVisibleNow) {
+	          revealWebglResetScheduled = false;
+	        }
+	        surfaceWasVisible = surfaceVisibleNow;
+	      };
 
       const revealObserver = new MutationObserver(() => {
         handleRevealCandidate("surface_revealed");
@@ -13839,7 +13996,7 @@ function WorkspaceTerminal({
 	        resizeControllerRef.current = null;
 	      }
       resizeController?.dispose();
-      activeWebglAddon = null;
+      disposeActiveWebglAddon("terminal_cleanup");
       if (webglAttachTimer) {
         window.clearTimeout(webglAttachTimer);
       }
@@ -15764,10 +15921,21 @@ function WorkspaceTerminal({
   const splitTerminalHorizontal = useCallback(() => {
     splitTerminal("vertical");
   }, [splitTerminal]);
-  const splitTerminalVertical = useCallback(() => {
-    splitTerminal("horizontal");
-  }, [splitTerminal]);
-  const forkTerminalHere = useCallback((providerSessionIdOverride = "") => {
+	  const splitTerminalVertical = useCallback(() => {
+	    splitTerminal("horizontal");
+	  }, [splitTerminal]);
+	  const minimizeTerminal = useCallback(() => {
+	    if (terminalClosed || terminalClosing) {
+	      return;
+	    }
+	    onMinimizeTerminal?.(terminalIndex);
+	  }, [
+	    onMinimizeTerminal,
+	    terminalClosed,
+	    terminalClosing,
+	    terminalIndex,
+	  ]);
+	  const forkTerminalHere = useCallback((providerSessionIdOverride = "") => {
     const sourceProviderSessionId = String(
       providerSessionIdOverride || forkSourceProviderSessionId || "",
     ).trim();
@@ -16470,9 +16638,18 @@ function WorkspaceTerminal({
           {!terminalChromeDocked && (
             <>
               <TerminalRestartButton
-                aria-label={isFullscreen ? "Restore terminal" : "Maximize terminal"}
-                disabled={terminalClosed || terminalClosing}
-                onClick={toggleTerminalFullscreen}
+                aria-label="Minimize terminal"
+                disabled={terminalClosed || terminalClosing || windowBreakoutHosted}
+                onClick={minimizeTerminal}
+                title={windowBreakoutHosted ? "Return to grid before minimizing" : "Minimize"}
+                type="button"
+              >
+                <TitleMinimizeIcon aria-hidden="true" />
+              </TerminalRestartButton>
+	              <TerminalRestartButton
+	                aria-label={isFullscreen ? "Restore terminal" : "Maximize terminal"}
+	                disabled={terminalClosed || terminalClosing}
+	                onClick={toggleTerminalFullscreen}
                 title={isFullscreen ? "Restore terminal" : "Maximize terminal"}
                 type="button"
               >

@@ -17,10 +17,11 @@ import {
   ButtonSplitHorizontalIcon,
   ButtonSplitVerticalIcon,
   TerminalCloseButton,
+  TerminalPaneInlineRailControls,
   TerminalRailIdentity,
-  TerminalRailControls,
   TerminalRestartPill,
   TerminalRestartButton,
+  TitleMinimizeIcon,
 } from "../app/appStyles";
 
 export const VM_SANDBOX_RUNTIME_PROGRESS_EVENT = "forge-vm-sandbox-runtime-progress";
@@ -678,6 +679,7 @@ export default function VmSandboxPane({
   isFullscreen = false,
   onClose = null,
   onDragHandlePointerDown = null,
+  onMinimize = null,
   onSplit = null,
   onToggleFullscreen = null,
   paneId = "",
@@ -816,17 +818,7 @@ export default function VmSandboxPane({
             <span>{runtimeSubtitle}</span>
           </VmSandboxTitleBlock>
         </VmSandboxIdentity>
-        <TerminalRailControls data-rail-row="primary">
-          <TerminalCloseButton
-            aria-label="Close VM Sandbox panel"
-            onClick={() => onClose?.(terminalIndex, paneId)}
-            title="Close VM Sandbox panel"
-            type="button"
-          >
-            <ButtonCloseIcon aria-hidden="true" />
-          </TerminalCloseButton>
-        </TerminalRailControls>
-        <TerminalRailControls data-rail-row="secondary">
+        <TerminalPaneInlineRailControls data-rail-row="inline">
           <TerminalRestartButton
             aria-label="Recheck VM Sandbox runtime"
             disabled={statusState === "loading" || installing}
@@ -855,6 +847,14 @@ export default function VmSandboxPane({
             <ButtonSplitVerticalIcon aria-hidden="true" />
           </TerminalRestartButton>
           <TerminalRestartButton
+            aria-label="Minimize VM Sandbox panel"
+            onClick={() => onMinimize?.(terminalIndex, paneId)}
+            title="Minimize"
+            type="button"
+          >
+            <TitleMinimizeIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
             aria-label={isFullscreen ? "Restore VM Sandbox panel" : "Maximize VM Sandbox panel"}
             disabled={fullscreenActive && !isFullscreen}
             onClick={() => onToggleFullscreen?.(terminalIndex, paneId)}
@@ -867,7 +867,15 @@ export default function VmSandboxPane({
               <ButtonFullscreenIcon aria-hidden="true" />
             )}
           </TerminalRestartButton>
-        </TerminalRailControls>
+          <TerminalCloseButton
+            aria-label="Close VM Sandbox panel"
+            onClick={() => onClose?.(terminalIndex, paneId)}
+            title="Close VM Sandbox panel"
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </TerminalCloseButton>
+        </TerminalPaneInlineRailControls>
       </VmSandboxHeader>
 
       <VmSandboxBody>

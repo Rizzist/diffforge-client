@@ -600,16 +600,39 @@ export default function GitWorkspaceView({
     workspaceId,
   ]);
 
-  const refreshRepositories = useCallback((options = {}) => {
-    if (typeof onRefreshRepositories !== "function" || !rootDirectory || !workspaceId) {
-      return Promise.resolve(null);
+  const refreshRepositories = useCallback(async (options = {}) => {
+    if (!rootDirectory || !workspaceId) {
+      return null;
     }
-    return onRefreshRepositories({
-      refresh: options.refresh === true,
-      rootDirectory,
+    if (typeof onRefreshRepositories === "function") {
+      return onRefreshRepositories({
+        refresh: options.refresh === true,
+        rootDirectory,
+        workspaceId,
+        workspaceName: workspace?.name || "",
+      });
+    }
+    // No parent preload plumbing on this render path (defensive): load
+    // directly so the Git tab can never sit in "Loading repositories..."
+    // waiting for a preload prop that will never arrive.
+    const response = await invoke("workspace_git_pull_candidates", {
+      repoPath: rootDirectory,
       workspaceId,
       workspaceName: workspace?.name || "",
+      refresh: options.refresh === true,
+      fetchRemote: false,
     });
+    const nextRepositories = Array.isArray(response?.repositories)
+      ? response.repositories.filter((repo) => repo && repo.path)
+      : [];
+    setRepositories(nextRepositories);
+    setSelectedRepoPath((current) => {
+      if (current && nextRepositories.some((repo) => repo.path === current)) return current;
+      return nextRepositories[0]?.path || "";
+    });
+    setRepositoriesError("");
+    setRepositoriesState("ready");
+    return { allRepositories: nextRepositories, response };
   }, [onRefreshRepositories, rootDirectory, workspace?.name, workspaceId]);
 
   const handleRetryRepositories = useCallback(() => {
@@ -667,7 +690,6 @@ export default function GitWorkspaceView({
       && repositoryPreloadLoadingStale(repositoriesPreload);
     if (
       (preloadMatches && !shouldRecoverStaleLoading)
-      || typeof onRefreshRepositories !== "function"
       || !rootDirectory
       || !workspaceId
     ) {
@@ -770,6 +792,15 @@ export default function GitWorkspaceView({
     selectedSnapshotSignature,
     snapshotsPreloadMatches,
   ]);
+
+  // Defensive twin of the repositories fallback: without parent snapshot
+  // plumbing nothing else would ever fetch history for the selected repo.
+  useEffect(() => {
+    if (typeof onRefreshSnapshot === "function" || !selectedRepoPath) {
+      return;
+    }
+    void loadSnapshot(selectedRepoPath);
+  }, [loadSnapshot, onRefreshSnapshot, selectedRepoPath]);
 
   useEffect(() => {
     setExpandedHistoryKeys((current) => {

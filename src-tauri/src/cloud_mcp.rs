@@ -574,6 +574,7 @@ struct CloudMcpRuntime {
     global_ws_last_connected_ms: Option<u64>,
     global_ws_connection_id: Option<String>,
     global_ws_message_token: Option<String>,
+    account_usage_snapshot: Option<Value>,
     account_device_live_state_snapshot: Option<Value>,
     last_device_heartbeat_ms: Option<u64>,
     registered_workspaces: HashMap<String, CloudMcpWorkspaceStatus>,
@@ -686,6 +687,7 @@ struct CloudMcpStatus {
     global_ws_last_error: String,
     global_ws_last_connected_ms: Option<u64>,
     connection_contract: String,
+    account_usage_snapshot: Option<Value>,
     account_device_live_state_snapshot: Option<Value>,
     device_live_state_snapshot: Option<Value>,
     workspace_todos: Option<Value>,
@@ -772,6 +774,7 @@ impl CloudMcpState {
                 global_ws_last_connected_ms: None,
                 global_ws_connection_id: None,
                 global_ws_message_token: None,
+                account_usage_snapshot: None,
                 account_device_live_state_snapshot: None,
                 last_device_heartbeat_ms: None,
                 registered_workspaces: HashMap::new(),
@@ -11120,6 +11123,7 @@ fn cloud_mcp_snapshot(runtime: &CloudMcpRuntime) -> CloudMcpStatus {
         global_ws_last_error,
         global_ws_last_connected_ms: runtime.global_ws_last_connected_ms,
         connection_contract: "diffforge.app_ws.v1".to_string(),
+        account_usage_snapshot: runtime.account_usage_snapshot.clone(),
         account_device_live_state_snapshot: runtime.account_device_live_state_snapshot.clone(),
         device_live_state_snapshot: None,
         workspace_todos: None,
@@ -11173,7 +11177,7 @@ fn cloud_mcp_status_cache_fingerprint(runtime: &CloudMcpRuntime) -> String {
         .collect::<Vec<_>>();
     registered_workspace_bits.sort();
     format!(
-        "{}:{}:{}:{}:{}:{:?}:{}:{}:{:?}:{}:{}",
+        "{}:{}:{}:{}:{}:{:?}:{}:{}:{:?}:{}:{}:{}",
         runtime.base_url,
         runtime.connected,
         runtime.status,
@@ -11183,6 +11187,12 @@ fn cloud_mcp_status_cache_fingerprint(runtime: &CloudMcpRuntime) -> String {
         runtime.global_ws_status,
         runtime.global_ws_last_error,
         runtime.global_ws_last_connected_ms,
+        runtime
+            .account_usage_snapshot
+            .as_ref()
+            .and_then(|value| serde_json::to_string(value).ok())
+            .map(|value| cloud_mcp_short_hash(&value))
+            .unwrap_or_default(),
         runtime.account_device_live_state_snapshot.is_some(),
         registered_workspace_bits.join("|"),
     )
@@ -12452,6 +12462,70 @@ fn cloud_mcp_account_device_live_state_snapshot_from_event(event: &Value) -> Opt
     cloud_mcp_account_live_state_from_value(event)
 }
 
+fn cloud_mcp_account_usage_snapshot_from_event(event: &Value) -> Option<Value> {
+    cloud_mcp_account_usage_from_value(event)
+}
+
+fn cloud_mcp_account_usage_from_value(value: &Value) -> Option<Value> {
+    cloud_mcp_account_usage_from_value_depth(value, 0)
+}
+
+fn cloud_mcp_account_usage_from_value_depth(value: &Value, depth: usize) -> Option<Value> {
+    if depth > 5 || !value.is_object() {
+        return None;
+    }
+    if cloud_mcp_value_is_account_usage(value) {
+        return Some(value.clone());
+    }
+    for key in [
+        "initial_account_usage",
+        "initialAccountUsage",
+        "runtime_account_usage",
+        "runtimeAccountUsage",
+        "account_usage",
+        "accountUsage",
+        "account_usage_snapshot",
+        "accountUsageSnapshot",
+        "billing_status",
+        "billingStatus",
+        "data",
+        "payload",
+        "event",
+    ] {
+        if let Some(candidate) = value.get(key) {
+            if let Some(snapshot) = cloud_mcp_account_usage_from_value_depth(candidate, depth + 1) {
+                return Some(snapshot);
+            }
+        }
+    }
+    None
+}
+
+fn cloud_mcp_value_is_account_usage(value: &Value) -> bool {
+    if !value.is_object() {
+        return false;
+    }
+    let kind =
+        cloud_mcp_payload_text(value, &["kind", "event_kind", "eventKind"]).unwrap_or_default();
+    let contract = cloud_mcp_payload_text(value, &["contract"]).unwrap_or_default();
+    if contract == "diffforge.account_usage.v1"
+        || kind == "account_usage_snapshot"
+        || kind.starts_with("credit_wallet_")
+    {
+        return true;
+    }
+    if cloud_mcp_value_is_account_live_state(value) {
+        return false;
+    }
+    let has_usage_payload = value.get("credits").is_some()
+        || value.get("wallet").is_some()
+        || value.get("storage_usage").is_some()
+        || value.get("storageUsage").is_some()
+        || value.get("credit_sources").is_some()
+        || value.get("creditSources").is_some();
+    has_usage_payload
+}
+
 fn cloud_mcp_account_live_state_from_value(value: &Value) -> Option<Value> {
     cloud_mcp_account_live_state_from_value_depth(value, 0)
 }
@@ -12560,6 +12634,14 @@ async fn cloud_mcp_cache_account_device_live_state_snapshot(state: &CloudMcpStat
         runtime.account_device_live_state_snapshot.as_ref(),
         snapshot,
     ));
+}
+
+async fn cloud_mcp_cache_account_usage_snapshot(state: &CloudMcpState, event: &Value) {
+    let Some(snapshot) = cloud_mcp_account_usage_snapshot_from_event(event) else {
+        return;
+    };
+    let mut runtime = state.inner.lock().await;
+    runtime.account_usage_snapshot = Some(snapshot);
 }
 
 async fn cloud_mcp_apply_account_device_live_state_snapshot(
@@ -16646,13 +16728,15 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
                 .cloned()
                 .filter(|value| !value.is_null())
             {
-                let _ = state_for_initial.global_ws_events.send(json!({
+                let event = json!({
                     "kind": "account_usage_snapshot",
                     "event_kind": "account_usage_snapshot",
                     "contract": "diffforge.account_usage.v1",
                     "reason": "global_ws_ready",
                     "payload": initial_account_usage,
-                }));
+                });
+                cloud_mcp_cache_account_usage_snapshot(&state_for_initial, &event).await;
+                let _ = state_for_initial.global_ws_events.send(event);
             }
             if let Some(initial_native_sessions) = ready_message
                 .get("initial_native_sessions")
@@ -16864,6 +16948,11 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         cloud_mcp_payload_text(&message, &["event_kind", "eventKind", "kind"]).unwrap_or_default();
     let direct_request_kind =
         cloud_mcp_payload_text(&message, &["request_kind", "requestKind"]).unwrap_or_default();
+    if cloud_mcp_value_is_account_usage(&message) {
+        cloud_mcp_cache_account_usage_snapshot(state, &message).await;
+        let _ = state.global_ws_events.send(message);
+        return;
+    }
     if cloud_mcp_handle_terminal_output_subscription(state, &message, &direct_kind) {
         return;
     }
@@ -17079,6 +17168,9 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         }
         if event_kind == "account_device_live_state_snapshot" {
             cloud_mcp_cache_account_device_live_state_snapshot(state, &event).await;
+        }
+        if cloud_mcp_value_is_account_usage(&event) {
+            cloud_mcp_cache_account_usage_snapshot(state, &event).await;
         }
         if event_kind == CLOUD_MCP_TOKENOMICS_INGEST_ACK_EVENT
             || cloud_mcp_tokenomics_strict_ingest_ack_response(&event)
@@ -30697,6 +30789,7 @@ async fn cloud_mcp_apply_desktop_auth_session(
         }
         {
             let mut runtime = state.inner.lock().await;
+            runtime.account_usage_snapshot = None;
             runtime.account_device_live_state_snapshot = None;
             runtime.registered_workspaces.clear();
         }

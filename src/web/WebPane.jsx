@@ -15,10 +15,11 @@ import {
   ButtonBotIcon,
   ButtonDragIcon,
   TerminalCloseButton,
-  TerminalRailControls,
+  TerminalPaneInlineRailControls,
   TerminalRailIdentity,
   TerminalRestartButton,
   TerminalRestartPill,
+  TitleMinimizeIcon,
 } from "../app/appStyles.js";
 import {
   DEFAULT_WEB_URL,
@@ -61,6 +62,7 @@ export default function WebPane({
   webviewObscured = false,
   onDragHandlePointerDown,
   onSplit,
+  onMinimize,
   onToggleFullscreen,
   onClose,
   onPopOut,
@@ -80,6 +82,8 @@ export default function WebPane({
   showCloseButton = true,
   showDragHandle = true,
   showFullscreenControl = true,
+  inlineToolbarInNav = false,
+  showMinimizeControl = true,
   showPopOutControl = true,
   showSplitControls = true,
 }) {
@@ -286,16 +290,104 @@ export default function WebPane({
   const closeButtonVisible = showCloseButton && typeof onClose === "function";
   const splitControlsVisible = showSplitControls && typeof onSplit === "function";
   const popOutControlVisible = showPopOutControl && typeof onPopOut === "function";
+  const minimizeControlVisible = showMinimizeControl && typeof onMinimize === "function";
   const fullscreenControlVisible = showFullscreenControl && typeof onToggleFullscreen === "function";
   const hasPanelAgentPromptActivity = Array.isArray(panelAgentPromptActivityItems)
     && panelAgentPromptActivityItems.length > 0;
+  const toolbarControlsVisible = agentPromptControlVisible
+    || splitControlsVisible
+    || popOutControlVisible
+    || minimizeControlVisible
+    || fullscreenControlVisible;
+  const toolbarControls = (
+    <>
+      {agentPromptControlVisible ? (
+        <>
+          <WebPaneIconButton
+            aria-label="Prompt terminal agents"
+            aria-pressed={agentPromptOpen ? "true" : "false"}
+            data-active={agentPromptOpen ? "true" : undefined}
+            onClick={() => setAgentPromptOpen((open) => !open)}
+            title="Prompt terminal agents"
+            type="button"
+          >
+            <ButtonBotIcon aria-hidden="true" />
+          </WebPaneIconButton>
+          {agentPromptOpen ? (
+            <WebPaneIconButton
+              aria-label="Select web element"
+              aria-pressed={webElementPicker.armed || webElementPicker.contextRefs.length ? "true" : "false"}
+              data-active={webElementPicker.armed || webElementPicker.contextRefs.length ? "true" : undefined}
+              disabled={!visible || poppedOut}
+              onClick={webElementPicker.togglePicker}
+              title="Select web element"
+              type="button"
+            >
+              <AdsClick aria-hidden="true" />
+            </WebPaneIconButton>
+          ) : null}
+        </>
+      ) : null}
+      {splitControlsVisible ? (
+        <>
+          <WebPaneIconButton
+            aria-label="Split right"
+            onClick={() => onSplit?.({ direction: "vertical", terminalIndex, paneId })}
+            title="Split right"
+            type="button"
+          >
+            <LayoutSplit aria-hidden="true" />
+          </WebPaneIconButton>
+          <WebPaneIconButton
+            aria-label="Split down"
+            onClick={() => onSplit?.({ direction: "horizontal", terminalIndex, paneId })}
+            title="Split down"
+            type="button"
+          >
+            <LayoutRow aria-hidden="true" />
+          </WebPaneIconButton>
+        </>
+      ) : null}
+      {popOutControlVisible ? (
+        <WebPaneIconButton
+          aria-label="Open in window"
+          onClick={() => onPopOut?.(terminalIndex, paneId, currentUrl)}
+          title="Open in window"
+          type="button"
+        >
+          <PopOutGlyph aria-hidden="true" />
+        </WebPaneIconButton>
+      ) : null}
+      {minimizeControlVisible ? (
+        <WebPaneIconButton
+          aria-label="Minimize web panel"
+          disabled={poppedOut}
+          onClick={() => onMinimize?.(terminalIndex, paneId)}
+          title={poppedOut ? "Return to grid before minimizing" : "Minimize"}
+          type="button"
+        >
+          <TitleMinimizeIcon aria-hidden="true" />
+        </WebPaneIconButton>
+      ) : null}
+      {fullscreenControlVisible ? (
+        <WebPaneIconButton
+          aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+          onClick={() => onToggleFullscreen?.(terminalIndex, paneId)}
+          title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+          type="button"
+        >
+          {isFullscreen ? <FullscreenExit aria-hidden="true" /> : <Fullscreen aria-hidden="true" />}
+        </WebPaneIconButton>
+      ) : null}
+    </>
+  );
   const effectiveBreakoutReturnUrl = normalizeWebInput(breakoutReturnUrl)
     || String(breakoutReturnUrl || "").trim()
     || currentUrl;
 
   return (
     <WebPaneSurface data-workspace-web-surface="true" data-active={isActive ? "true" : undefined}>
-      <WebPaneRail data-terminal-control="true">
+      <WebPaneRail data-terminal-control="true" data-toolbar-inline-nav={inlineToolbarInNav ? "true" : undefined}>
         {dragHandleVisible ? (
           <WebPaneIdentity data-web-pane-rail-section="identity">
             <WebPaneDragButton
@@ -352,89 +444,28 @@ export default function WebPane({
             spellCheck="false"
             value={addressValue}
           />
+          {inlineToolbarInNav && toolbarControlsVisible ? (
+            <WebPaneNavControls aria-label="Web controls" role="group">
+              {toolbarControls}
+            </WebPaneNavControls>
+          ) : null}
         </WebPaneNav>
-        {closeButtonVisible ? (
-          <WebPaneRailControls data-rail-row="primary" data-web-pane-rail-section="primary">
-            <WebPaneCloseButton
-              aria-label="Close web panel"
-              data-tone="close"
-              onClick={() => onClose?.(terminalIndex, paneId)}
-              title="Close"
-              type="button"
-            >
-              <Close aria-hidden="true" />
-            </WebPaneCloseButton>
+        {(!inlineToolbarInNav || closeButtonVisible) && (toolbarControlsVisible || closeButtonVisible) ? (
+          <WebPaneRailControls data-rail-row="inline" data-web-pane-rail-section="controls">
+            {!inlineToolbarInNav ? toolbarControls : null}
+            {closeButtonVisible ? (
+              <WebPaneCloseButton
+                aria-label="Close web panel"
+                data-tone="close"
+                onClick={() => onClose?.(terminalIndex, paneId)}
+                title="Close"
+                type="button"
+              >
+                <Close aria-hidden="true" />
+              </WebPaneCloseButton>
+            ) : null}
           </WebPaneRailControls>
         ) : null}
-        <WebPaneRailControls data-rail-row="secondary" data-web-pane-rail-section="secondary">
-          {agentPromptControlVisible ? (
-            <>
-              <WebPaneIconButton
-                aria-label="Prompt terminal agents"
-                aria-pressed={agentPromptOpen ? "true" : "false"}
-                data-active={agentPromptOpen ? "true" : undefined}
-                onClick={() => setAgentPromptOpen((open) => !open)}
-                title="Prompt terminal agents"
-                type="button"
-              >
-                <ButtonBotIcon aria-hidden="true" />
-              </WebPaneIconButton>
-              {agentPromptOpen ? (
-                <WebPaneIconButton
-                  aria-label="Select web element"
-                  aria-pressed={webElementPicker.armed || webElementPicker.contextRefs.length ? "true" : "false"}
-                  data-active={webElementPicker.armed || webElementPicker.contextRefs.length ? "true" : undefined}
-                  disabled={!visible || poppedOut}
-                  onClick={webElementPicker.togglePicker}
-                  title="Select web element"
-                  type="button"
-                >
-                  <AdsClick aria-hidden="true" />
-                </WebPaneIconButton>
-              ) : null}
-            </>
-          ) : null}
-          {splitControlsVisible ? (
-            <>
-              <WebPaneIconButton
-                aria-label="Split right"
-                onClick={() => onSplit?.({ direction: "vertical", terminalIndex, paneId })}
-                title="Split right"
-                type="button"
-              >
-                <LayoutSplit aria-hidden="true" />
-              </WebPaneIconButton>
-              <WebPaneIconButton
-                aria-label="Split down"
-                onClick={() => onSplit?.({ direction: "horizontal", terminalIndex, paneId })}
-                title="Split down"
-                type="button"
-              >
-                <LayoutRow aria-hidden="true" />
-              </WebPaneIconButton>
-            </>
-          ) : null}
-          {popOutControlVisible ? (
-            <WebPaneIconButton
-              aria-label="Open in window"
-              onClick={() => onPopOut?.(terminalIndex, paneId, currentUrl)}
-              title="Open in window"
-              type="button"
-            >
-              <PopOutGlyph aria-hidden="true" />
-            </WebPaneIconButton>
-          ) : null}
-          {fullscreenControlVisible ? (
-            <WebPaneIconButton
-              aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
-              onClick={() => onToggleFullscreen?.(terminalIndex, paneId)}
-              title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
-              type="button"
-            >
-              {isFullscreen ? <FullscreenExit aria-hidden="true" /> : <Fullscreen aria-hidden="true" />}
-            </WebPaneIconButton>
-          ) : null}
-        </WebPaneRailControls>
         {hasPanelAgentPromptActivity ? (
           <WebPaneActivityRow data-web-pane-rail-section="activity">
             <PanelAgentPromptActivity
@@ -546,6 +577,11 @@ const WebPaneRail = styled(TerminalRestartPill)`
     grid-row: 2;
   }
 
+  && [data-web-pane-rail-section="controls"] {
+    grid-column: 2 / -1;
+    grid-row: 1;
+  }
+
   && [data-web-pane-rail-section="secondary"] {
     grid-column: 2;
     grid-row: 1;
@@ -565,6 +601,21 @@ const WebPaneRail = styled(TerminalRestartPill)`
     grid-row: 3;
   }
 
+  &&[data-toolbar-inline-nav="true"] {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(24px, auto);
+  }
+
+  &&[data-toolbar-inline-nav="true"] [data-web-pane-rail-section="nav"] {
+    grid-column: 1 / -1;
+    grid-row: 1;
+  }
+
+  &&[data-toolbar-inline-nav="true"] [data-web-pane-rail-section="activity"] {
+    grid-column: 1 / -1;
+    grid-row: 2;
+  }
+
   @container (max-width: 760px) {
     && {
       grid-template-columns: minmax(0, 1fr) auto;
@@ -579,6 +630,14 @@ const WebPaneRail = styled(TerminalRestartPill)`
     && [data-web-pane-rail-section="primary"] {
       grid-column: 2;
       grid-row: 1;
+    }
+
+    && [data-web-pane-rail-section="controls"] {
+      grid-column: 1 / -1;
+      grid-row: 2;
+      width: 100%;
+      justify-self: stretch;
+      flex-wrap: wrap;
     }
 
     && [data-web-pane-rail-section="nav"] {
@@ -598,6 +657,21 @@ const WebPaneRail = styled(TerminalRestartPill)`
       grid-column: 1 / -1;
       grid-row: 4;
     }
+
+    &&[data-toolbar-inline-nav="true"] {
+      grid-template-columns: minmax(0, 1fr);
+      grid-template-rows: minmax(24px, auto);
+    }
+
+    &&[data-toolbar-inline-nav="true"] [data-web-pane-rail-section="nav"] {
+      grid-column: 1 / -1;
+      grid-row: 1;
+    }
+
+    &&[data-toolbar-inline-nav="true"] [data-web-pane-rail-section="activity"] {
+      grid-column: 1 / -1;
+      grid-row: 2;
+    }
   }
 `;
 
@@ -610,17 +684,8 @@ const WebPaneDragButton = styled(TerminalRestartButton)`
   color: var(--web-text);
 `;
 
-const WebPaneRailControls = styled(TerminalRailControls)`
-  &[data-rail-row="primary"] {
-    grid-column: 3;
-    grid-row: 1;
-  }
-
-  &[data-rail-row="secondary"] {
-    grid-column: 2;
-    grid-row: 1;
-    width: auto;
-  }
+const WebPaneRailControls = styled(TerminalPaneInlineRailControls)`
+  color: var(--web-text);
 `;
 
 const WebPaneIconButton = styled(TerminalRestartButton)`
@@ -637,11 +702,23 @@ const WebPaneNav = styled.form`
   grid-row: 2;
   width: 100%;
   min-width: 0;
+  flex-wrap: wrap;
   align-items: center;
+  align-content: center;
   gap: 2px;
   padding: 0;
   border: 0;
   background: transparent;
+`;
+
+const WebPaneNavControls = styled.span`
+  display: inline-flex;
+  min-width: 0;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
 `;
 
 const WebPaneActivityRow = styled.div`

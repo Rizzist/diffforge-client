@@ -49,18 +49,12 @@ import { Terminal as TerminalIcon } from "@styled-icons/material-rounded/Termina
 import { TerminalFill as AgentTerminalGlyph } from "@styled-icons/bootstrap/TerminalFill";
 import { LayoutSplit } from "@styled-icons/bootstrap/LayoutSplit";
 import { LayoutRow } from "@styled-icons/remix-line/LayoutRow";
-import { Cloud as RailCloudGlyph } from "@styled-icons/fluentui-system-regular/Cloud";
-import { Cube as RailCubeGlyph } from "@styled-icons/fluentui-system-regular/Cube";
-import { Cut as RailCutGlyph } from "@styled-icons/fluentui-system-regular/Cut";
-import { Folder as RailFolderGlyph } from "@styled-icons/fluentui-system-regular/Folder";
-import { Globe as RailGlobeGlyph } from "@styled-icons/fluentui-system-regular/Globe";
-import { History as RailHistoryGlyph } from "@styled-icons/fluentui-system-regular/History";
-import { Mic as RailMicGlyph } from "@styled-icons/fluentui-system-regular/Mic";
-import { QuestionCircle as RailQuestionCircleGlyph } from "@styled-icons/fluentui-system-regular/QuestionCircle";
-import { Settings as RailSettingsGlyph } from "@styled-icons/fluentui-system-regular/Settings";
-import { SignOut as RailSignOutGlyph } from "@styled-icons/fluentui-system-regular/SignOut";
-import { WindowConsole as RailTerminalGlyph } from "@styled-icons/fluentui-system-regular/WindowConsole";
-import { WrenchScrewdriver as RailWrenchScrewdriverGlyph } from "@styled-icons/fluentui-system-regular/WrenchScrewdriver";
+import { CloudQueue as RailCloudGlyph } from "@styled-icons/material-rounded/CloudQueue";
+import { Token as RailCubeGlyph } from "@styled-icons/material-rounded/Token";
+import { Public as RailGlobeGlyph } from "@styled-icons/material-rounded/Public";
+import { History as RailHistoryGlyph } from "@styled-icons/material-rounded/History";
+import { Help as RailQuestionCircleGlyph } from "@styled-icons/material-rounded/Help";
+import { Handyman as RailWrenchScrewdriverGlyph } from "@styled-icons/material-rounded/Handyman";
 import CodexBrandGlyph from "@likec4/icons/tech/openai-icon";
 import ClaudeBrandGlyph from "@likec4/icons/tech/claude-icon";
 
@@ -1704,6 +1698,11 @@ export const LaunchActions = styled.div`
   }
 `;
 
+const loginGlowDrift = keyframes`
+  0%, 100% { transform: translate3d(0, 0, 0) scale(1); opacity: 0.85; }
+  50% { transform: translate3d(-2.5%, 2%, 0) scale(1.06); opacity: 1; }
+`;
+
 export const LoginScreen = styled.main`
   position: relative;
   display: grid;
@@ -1713,8 +1712,33 @@ export const LoginScreen = styled.main`
   overflow: hidden;
   background: #030508;
 
+  /* brand glow field — paints above the square grid, below the layout */
+  &::after {
+    content: "";
+    position: absolute;
+    inset: -12%;
+    z-index: 0;
+    background:
+      radial-gradient(ellipse at 16% 22%, rgba(47, 128, 255, 0.15), transparent 46%),
+      radial-gradient(ellipse at 86% 84%, rgba(255, 122, 24, 0.12), transparent 46%),
+      radial-gradient(ellipse at 78% 12%, rgba(126, 231, 255, 0.05), transparent 38%);
+    animation: ${loginGlowDrift} 13s ease-in-out infinite;
+    pointer-events: none;
+    will-change: transform;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &::after {
+      animation: none;
+    }
+  }
+
   html[data-forge-theme="light"] & {
     background: var(--forge-bg);
+  }
+
+  html[data-forge-theme="light"] &::after {
+    display: none;
   }
 `;
 
@@ -1894,9 +1918,54 @@ export const BrandMark = styled.a`
   }
 `;
 
+const introRise = keyframes`
+  from { opacity: 0; transform: translateY(18px); }
+  to { opacity: 1; transform: translateY(0); }
+`;
+
 export const IntroCopy = styled.div`
   display: grid;
   gap: clamp(12px, 2.4vh, 18px);
+
+  > * {
+    animation: ${introRise} 460ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+
+  > *:nth-child(1) { animation-delay: 90ms; }
+  > *:nth-child(2) { animation-delay: 170ms; }
+  > *:nth-child(3) { animation-delay: 260ms; }
+  > *:nth-child(4) { animation-delay: 350ms; }
+
+  @media (prefers-reduced-motion: reduce) {
+    > * {
+      animation: none;
+    }
+  }
+`;
+
+const headlineGradientShift = keyframes`
+  0%, 100% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+`;
+
+export const HeadlineAccent = styled.em`
+  display: inline-block;
+  background: linear-gradient(92deg, #62a0ff 0%, #7ee7ff 34%, #ff9a3d 72%, #ffd166 100%);
+  background-clip: text;
+  -webkit-background-clip: text;
+  background-size: 220% 100%;
+  color: transparent;
+  font-style: normal;
+  animation: ${headlineGradientShift} 7s ease-in-out infinite;
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: none;
+    color: var(--forge-blue);
+  }
 `;
 
 export const Kicker = styled.p`
@@ -1968,17 +2037,32 @@ export const IntroFeatureList = styled.ul`
 `;
 
 export const IntroFeature = styled.li`
-  display: flex;
+  --intro-feature-tone: 247, 249, 255;
+  display: inline-flex;
+  width: fit-content;
   min-width: 0;
   align-items: center;
   gap: 10px;
-  color: #a7b2c2;
-  font-size: 14px;
-  font-weight: 720;
-  line-height: 1.5;
+  padding: 8px 15px;
+  border: 1px solid rgba(var(--intro-feature-tone), 0.22);
+  border-radius: 999px;
+  color: #c6d2e4;
+  background:
+    linear-gradient(90deg, rgba(var(--intro-feature-tone), 0.09), transparent 72%),
+    rgba(6, 10, 16, 0.72);
+  font-size: 13.5px;
+  font-weight: 740;
+  line-height: 1.4;
+  transition: border-color 150ms ease, transform 150ms ease;
+
+  &:hover {
+    border-color: rgba(var(--intro-feature-tone), 0.45);
+    transform: translateX(3px);
+  }
 
   html[data-forge-theme="light"] & {
     color: var(--forge-text-soft);
+    background: var(--forge-surface);
   }
 
   span {
@@ -1986,15 +2070,20 @@ export const IntroFeature = styled.li`
     height: 8px;
     flex: 0 0 auto;
     border-radius: 999px;
-    background: #f7f9ff;
+    background: rgb(var(--intro-feature-tone));
+    box-shadow: 0 0 10px rgba(var(--intro-feature-tone), 0.8);
   }
 
-  &[data-tone="blue"] span {
-    background: #2f80ff;
+  &[data-tone="blue"] {
+    --intro-feature-tone: 47, 128, 255;
   }
 
-  &[data-tone="orange"] span {
-    background: #ff7a18;
+  &[data-tone="orange"] {
+    --intro-feature-tone: 255, 122, 24;
+  }
+
+  &[data-tone="green"] {
+    --intro-feature-tone: 61, 220, 132;
   }
 
   html[data-forge-theme="light"] &[data-tone="orange"] span {
@@ -3530,8 +3619,8 @@ export const RailActionButton = styled.button`
   svg {
     display: block;
     flex: 0 0 auto;
-    width: 16px;
-    height: 16px;
+    width: 15px;
+    height: 15px;
     justify-self: center;
     margin: 0;
     color: var(--forge-text-muted);
@@ -4282,8 +4371,10 @@ export const LoopspaceRuntimeToolbar = styled.div`
   min-width: 0;
   min-height: 48px;
   padding: 8px 10px;
-  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
-  background: rgba(0, 0, 0, 0.92);
+  border-bottom: 1px solid rgba(255, 209, 102, 0.12);
+  background:
+    linear-gradient(180deg, rgba(255, 209, 102, 0.05), rgba(255, 209, 102, 0.012)),
+    rgba(3, 4, 6, 0.94);
 
   @media (max-width: 640px) {
     grid-template-columns: 32px minmax(0, 1fr);
@@ -4450,6 +4541,9 @@ export const LoopspaceRuntimeTabButton = styled.button`
   &[data-active="true"] {
     color: #fff6df;
     background: rgba(255, 209, 102, 0.16);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.07),
+      0 0 14px rgba(255, 209, 102, 0.14);
   }
 
   &:hover,
@@ -4472,10 +4566,10 @@ export const LoopspaceGraphCanvas = styled.div`
     linear-gradient(90deg, rgba(255, 255, 255, 0.025) 1px, transparent 1px),
     linear-gradient(rgba(255, 209, 102, 0.055) 1px, transparent 1px),
     linear-gradient(90deg, rgba(255, 209, 102, 0.055) 1px, transparent 1px),
-    linear-gradient(rgba(255, 209, 102, 0.16), rgba(255, 209, 102, 0.16)),
-    linear-gradient(90deg, rgba(255, 209, 102, 0.16), rgba(255, 209, 102, 0.16)),
-    radial-gradient(circle at var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%), rgba(255, 209, 102, 0.12), transparent 90px),
-    #000;
+    linear-gradient(rgba(255, 209, 102, 0.2), rgba(255, 209, 102, 0.2)),
+    linear-gradient(90deg, rgba(255, 209, 102, 0.2), rgba(255, 209, 102, 0.2)),
+    radial-gradient(circle at var(--loopspace-origin-x, 50%) var(--loopspace-origin-y, 50%), rgba(255, 209, 102, 0.1), transparent 170px),
+    #020304;
   background-size:
     var(--loopspace-grid-size, 32px) var(--loopspace-grid-size, 32px),
     var(--loopspace-grid-size, 32px) var(--loopspace-grid-size, 32px),
@@ -4494,10 +4588,28 @@ export const LoopspaceGraphCanvas = styled.div`
     var(--loopspace-origin-x, 50%) 0,
     0 0,
     0 0;
+  background-repeat:
+    repeat,
+    repeat,
+    repeat,
+    repeat,
+    no-repeat,
+    no-repeat,
+    no-repeat,
+    no-repeat;
   cursor: grab;
   touch-action: none;
   user-select: none;
   -webkit-user-select: none;
+
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: 0;
+    background: radial-gradient(ellipse at 50% 42%, transparent 58%, rgba(0, 0, 0, 0.4) 100%);
+    pointer-events: none;
+  }
 
   &[data-panning="true"] {
     cursor: grabbing;
@@ -4620,12 +4732,43 @@ const loopspaceActiveEdge = keyframes`
 
 export const LoopspaceGraphEdgePath = styled.path`
   fill: none;
-  stroke: rgba(255, 209, 102, 0.46);
+  stroke: rgba(255, 209, 102, 0.44);
   stroke-width: 2;
   stroke-linecap: round;
   filter: drop-shadow(0 0 8px rgba(255, 209, 102, 0.18));
   pointer-events: stroke;
   cursor: pointer;
+  transition: stroke 120ms ease, stroke-width 120ms ease;
+
+  &[data-branch="exec"] {
+    stroke: rgba(125, 211, 252, 0.44);
+    filter: drop-shadow(0 0 8px rgba(125, 211, 252, 0.16));
+  }
+
+  &[data-branch="success"] {
+    stroke: rgba(52, 211, 153, 0.46);
+    filter: drop-shadow(0 0 8px rgba(52, 211, 153, 0.16));
+  }
+
+  &[data-branch="failure"] {
+    stroke: rgba(251, 113, 133, 0.44);
+    filter: drop-shadow(0 0 8px rgba(251, 113, 133, 0.16));
+  }
+
+  &[data-branch="interrupt"] {
+    stroke: rgba(250, 204, 21, 0.4);
+    filter: drop-shadow(0 0 8px rgba(250, 204, 21, 0.14));
+  }
+
+  &[data-branch="docs"],
+  &[data-branch="assets"] {
+    stroke: rgba(94, 234, 212, 0.42);
+    filter: drop-shadow(0 0 8px rgba(94, 234, 212, 0.15));
+  }
+
+  &:hover {
+    stroke-width: 3;
+  }
 
   &[data-active="true"] {
     stroke: rgba(134, 239, 172, 0.94);
@@ -4644,9 +4787,10 @@ export const LoopspaceGraphConnectionPreview = styled(LoopspaceGraphEdgePath)`
 `;
 
 export const LoopspaceGraphEdgeLabel = styled.text`
-  fill: rgba(248, 250, 252, 0.62);
-  font-size: 10px;
-  font-weight: 850;
+  fill: rgba(248, 250, 252, 0.48);
+  font-size: 9px;
+  font-weight: 880;
+  letter-spacing: 0.07em;
   paint-order: stroke;
   pointer-events: auto;
   stroke: rgba(0, 0, 0, 0.72);
@@ -4671,13 +4815,17 @@ export const LoopspaceGraphNode = styled.div`
   align-items: center;
   gap: 10px;
   padding: 10px 12px;
-  border: 1px solid rgba(var(--loop-node-accent), 0.34);
-  border-radius: 8px;
+  border: 1px solid rgba(var(--loop-node-accent), 0.3);
+  border-radius: 10px;
   color: #f8fafc;
   background:
-    linear-gradient(135deg, rgba(var(--loop-node-accent), 0.13), rgba(255, 255, 255, 0.035)),
-    rgba(6, 6, 6, 0.94);
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.42);
+    linear-gradient(180deg, rgba(var(--loop-node-accent), 0.13), rgba(var(--loop-node-accent), 0.03) 46px, transparent 84px),
+    linear-gradient(180deg, rgba(14, 18, 25, 0.97), rgba(8, 11, 16, 0.97));
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.05),
+    0 18px 48px rgba(0, 0, 0, 0.5),
+    0 0 22px rgba(var(--loop-node-accent), 0.05);
+  transition: border-color 140ms ease, box-shadow 140ms ease;
   pointer-events: auto;
   transform: translate3d(var(--loopspace-node-x, 0px), var(--loopspace-node-y, 0px), 0);
   user-select: none;
@@ -4709,10 +4857,10 @@ export const LoopspaceGraphNode = styled.div`
     --loopspace-output-gutter: var(--loopspace-node-output-gutter, 92px);
     padding: 14px var(--loopspace-output-gutter) 16px 16px;
     background:
-      linear-gradient(135deg, rgba(var(--loop-node-accent), 0.12), rgba(255, 255, 255, 0.025)),
-      rgba(5, 10, 11, 0.72);
+      linear-gradient(180deg, rgba(var(--loop-node-accent), 0.09), rgba(var(--loop-node-accent), 0.02) 56px, transparent 120px),
+      rgba(7, 11, 16, 0.78);
     box-shadow:
-      inset 0 0 0 1px rgba(255, 255, 255, 0.025),
+      inset 0 1px 0 rgba(255, 255, 255, 0.045),
       0 22px 60px rgba(0, 0, 0, 0.48);
     backdrop-filter: blur(10px) saturate(120%);
   }
@@ -4749,6 +4897,14 @@ export const LoopspaceGraphNode = styled.div`
   }
   &[data-kind="loop"] {
     --loop-node-accent: 255, 209, 102;
+  }
+
+  &:hover {
+    border-color: rgba(var(--loop-node-accent), 0.5);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      0 20px 52px rgba(0, 0, 0, 0.52),
+      0 0 26px rgba(var(--loop-node-accent), 0.1);
   }
 
   &[data-runtime] {
@@ -4936,10 +5092,10 @@ export const LoopspaceGraphNodePort = styled.button`
   padding: 0;
   border: 1px solid rgba(var(--loop-node-accent), 0.72);
   border-radius: 999px;
-  background: #050505;
+  background: #05070b;
   box-shadow:
-    0 0 0 3px rgba(var(--loop-node-accent), 0.1),
-    0 0 16px rgba(var(--loop-node-accent), 0.18);
+    0 0 0 2px rgba(var(--loop-node-accent), 0.08),
+    0 0 10px rgba(var(--loop-node-accent), 0.14);
   cursor: crosshair;
   line-height: 0;
   transform: translateY(-50%);
@@ -4992,11 +5148,17 @@ export const LoopspaceGraphNodeOutputPort = styled.span`
     max-width: 74px;
     padding: 2px 4px;
     border-radius: 4px;
-    background: rgba(0, 0, 0, 0.56);
+    background: rgba(0, 0, 0, 0.44);
     overflow: hidden;
+    opacity: 0.55;
     text-shadow: 0 1px 2px rgba(0, 0, 0, 0.72);
     text-overflow: ellipsis;
     white-space: nowrap;
+    transition: opacity 120ms ease;
+  }
+
+  &:hover > span {
+    opacity: 1;
   }
 
   &[data-tone="exec"] {
@@ -5033,10 +5195,13 @@ export const LoopspaceGraphNodeIcon = styled.span`
   width: 34px;
   height: 34px;
   place-items: center;
-  border: 1px solid rgba(var(--loop-node-accent), 0.38);
-  border-radius: 8px;
-  color: #fff7dd;
-  background: rgba(var(--loop-node-accent), 0.14);
+  border: 1px solid rgba(var(--loop-node-accent), 0.42);
+  border-radius: 9px;
+  color: color-mix(in srgb, rgb(var(--loop-node-accent)) 55%, #ffffff);
+  background: rgba(var(--loop-node-accent), 0.13);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.09),
+    0 0 14px rgba(var(--loop-node-accent), 0.14);
 
   svg {
     width: 18px;
@@ -5104,12 +5269,12 @@ export const LoopspaceGraphNodeSelectButton = styled.button`
   min-width: 168px;
   margin-top: 5px;
   padding: 6px 9px;
-  border: 1px solid rgba(var(--loop-node-accent), 0.32);
-  border-radius: 7px;
+  border: 1px solid rgba(var(--loop-node-accent), 0.28);
+  border-radius: 8px;
   color: #f8fafc;
   background:
-    linear-gradient(135deg, rgba(var(--loop-node-accent), 0.14), rgba(255, 255, 255, 0.03)),
-    rgba(5, 5, 5, 0.92);
+    linear-gradient(180deg, rgba(var(--loop-node-accent), 0.07), rgba(var(--loop-node-accent), 0.02)),
+    rgba(5, 8, 12, 0.94);
   text-align: left;
   cursor: pointer;
   pointer-events: auto;
@@ -7280,11 +7445,12 @@ export const LoopspaceRuntimePanel = styled.div`
   min-width: 0;
   min-height: 0;
   overflow: hidden;
-  border-top: 0;
+  border-top: 1px solid rgba(255, 209, 102, 0.12);
   color: #f8fafc;
   background:
-    linear-gradient(180deg, rgba(255, 209, 102, 0.04), rgba(255, 209, 102, 0.012)),
-    rgba(5, 5, 5, 0.96);
+    linear-gradient(180deg, rgba(255, 209, 102, 0.045), rgba(255, 209, 102, 0.01) 42px, transparent),
+    linear-gradient(180deg, rgba(9, 12, 17, 0.98), rgba(5, 7, 10, 0.98));
+  box-shadow: 0 -16px 40px rgba(0, 0, 0, 0.35);
   cursor: default;
   user-select: none;
 
@@ -7592,13 +7758,18 @@ export const LoopspaceRuntimePanelEmpty = styled.div`
   display: grid;
   place-items: center;
   align-content: center;
-  gap: 5px;
+  gap: 6px;
   min-height: 82px;
+  margin: 10px 12px;
+  padding: 14px;
+  border: 1px dashed rgba(255, 209, 102, 0.16);
+  border-radius: 10px;
   color: rgba(248, 250, 252, 0.54);
+  background: rgba(255, 209, 102, 0.02);
   text-align: center;
 
   strong {
-    color: rgba(248, 250, 252, 0.78);
+    color: rgba(255, 246, 223, 0.85);
     font-size: 12px;
     font-weight: 860;
   }
@@ -21043,19 +21214,35 @@ export const AppearanceThemeButton = styled.button`
   }
 `;
 
+const loginCardFloat = keyframes`
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
+`;
+
 export const LoginCard = styled.section`
   position: relative;
   z-index: 1;
   width: 100%;
   padding: clamp(20px, 4vh, 30px);
-  border: 1px solid rgba(255, 255, 255, 0.18);
-  border-radius: 8px;
+  border: 1px solid rgba(125, 160, 205, 0.28);
+  border-radius: 14px;
   background:
-    radial-gradient(circle at 86% 10%, rgba(47, 128, 255, 0.16), transparent 14rem),
-    linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.018)),
-    rgba(10, 15, 23, 0.88);
-  box-shadow: 0 28px 90px rgba(0, 0, 0, 0.46);
-  animation: ${sideReveal} 320ms cubic-bezier(0.2, 0.8, 0.2, 1) 110ms both;
+    radial-gradient(circle at 86% 8%, rgba(47, 128, 255, 0.17), transparent 15rem),
+    radial-gradient(circle at 10% 100%, rgba(255, 122, 24, 0.07), transparent 12rem),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.05), rgba(255, 255, 255, 0.015)),
+    rgba(9, 13, 21, 0.9);
+  backdrop-filter: blur(10px) saturate(120%);
+  box-shadow:
+    0 28px 90px rgba(0, 0, 0, 0.5),
+    0 0 44px rgba(47, 128, 255, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  animation:
+    ${sideReveal} 380ms cubic-bezier(0.2, 0.8, 0.2, 1) 140ms both,
+    ${loginCardFloat} 7s ease-in-out 1.2s infinite;
+
+  @media (prefers-reduced-motion: reduce) {
+    animation: none;
+  }
 
   html[data-forge-theme="light"] & {
     border-color: var(--forge-border);
@@ -21118,16 +21305,39 @@ export const LoginCardBadge = styled.span`
   }
 `;
 
+const loginIconPulse = keyframes`
+  0% { opacity: 0.55; transform: scale(0.86); }
+  100% { opacity: 0; transform: scale(1.5); }
+`;
+
 export const LoginIconWrap = styled.span`
+  position: relative;
   display: grid;
   width: clamp(38px, 6vh, 44px);
   height: clamp(38px, 6vh, 44px);
   place-items: center;
   border: 1px solid rgba(47, 128, 255, 0.42);
-  border-radius: 8px;
+  border-radius: 10px;
   color: #62a0ff;
   background: rgba(47, 128, 255, 0.14);
   box-shadow: 0 0 18px rgba(47, 128, 255, 0.14);
+
+  &::after {
+    content: "";
+    position: absolute;
+    inset: -1px;
+    border: 1px solid rgba(98, 160, 255, 0.5);
+    border-radius: inherit;
+    animation: ${loginIconPulse} 2.6s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
+    pointer-events: none;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &::after {
+      animation: none;
+      opacity: 0;
+    }
+  }
   transition:
     background 180ms ease,
     border-color 180ms ease,
@@ -21362,6 +21572,11 @@ export const AuthStep = styled.div`
   }
 `;
 
+const loginCtaSheen = keyframes`
+  0%, 55% { transform: translateX(-140%) skewX(-22deg); }
+  100% { transform: translateX(320%) skewX(-22deg); }
+`;
+
 export const PrimaryButton = styled.button`
   display: inline-flex;
   min-width: 0;
@@ -21413,6 +21628,49 @@ export const PrimaryButton = styled.button`
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+
+  /* login screen hero CTA: gradient face + repeating sheen sweep */
+  &[data-login-cta="true"] {
+    position: relative;
+    overflow: hidden;
+    min-height: clamp(48px, 7vh, 54px);
+    border-color: rgba(126, 184, 255, 0.5);
+    background: linear-gradient(92deg, #125dcc 0%, #2f80ff 55%, #2a9ae0 100%);
+    box-shadow:
+      0 14px 34px rgba(18, 93, 204, 0.34),
+      inset 0 1px 0 rgba(255, 255, 255, 0.22);
+    font-size: 15px;
+    font-weight: 830;
+    letter-spacing: 0.015em;
+  }
+
+  &[data-login-cta="true"]::after {
+    content: "";
+    position: absolute;
+    top: -40%;
+    bottom: -40%;
+    left: 0;
+    width: 34%;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.24), transparent);
+    transform: translateX(-140%) skewX(-22deg);
+    animation: ${loginCtaSheen} 3.2s cubic-bezier(0.3, 0, 0.3, 1) 1.4s infinite;
+    pointer-events: none;
+  }
+
+  &[data-login-cta="true"]:hover:not(:disabled) {
+    box-shadow:
+      0 18px 44px rgba(18, 93, 204, 0.48),
+      0 0 34px rgba(47, 128, 255, 0.3),
+      inset 0 1px 0 rgba(255, 255, 255, 0.28);
+    transform: translateY(-2px);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &[data-login-cta="true"]::after {
+      animation: none;
+      opacity: 0;
+    }
   }
 `;
 
@@ -21536,11 +21794,11 @@ const railActionIconSize = `
   flex: 0 0 auto;
 `;
 
-export const RailTerminalIcon = styled(RailTerminalGlyph)`
+export const RailTerminalIcon = styled(TerminalIcon)`
   ${railActionIconSize}
 `;
 
-export const RailFilesIcon = styled(RailFolderGlyph)`
+export const RailFilesIcon = styled(FolderOpen)`
   ${railActionIconSize}
 `;
 
@@ -21560,11 +21818,11 @@ export const RailAssetsIcon = styled(RailCloudGlyph)`
   ${railActionIconSize}
 `;
 
-export const RailSnippingIcon = styled(RailCutGlyph)`
+export const RailSnippingIcon = styled(ContentCut)`
   ${railActionIconSize}
 `;
 
-export const RailAudioIcon = styled(RailMicGlyph)`
+export const RailAudioIcon = styled(Mic)`
   ${railActionIconSize}
 `;
 
@@ -21572,7 +21830,7 @@ export const RailTokenomicsIcon = styled(RailCubeGlyph)`
   ${railActionIconSize}
 `;
 
-export const RailSettingsIcon = styled(RailSettingsGlyph)`
+export const RailSettingsIcon = styled(Settings)`
   ${railActionIconSize}
 `;
 
@@ -21580,7 +21838,7 @@ export const RailHelpIcon = styled(RailQuestionCircleGlyph)`
   ${railActionIconSize}
 `;
 
-export const RailSignOutIcon = styled(RailSignOutGlyph)`
+export const RailSignOutIcon = styled(Logout)`
   ${railActionIconSize}
 `;
 
@@ -22681,4 +22939,30 @@ export const WorkspaceArchiveActions = styled.div`
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
+`;
+
+export const TerminalPaneInlineRailControls = styled(TerminalRailControls)`
+  grid-column: 2 / -1;
+  grid-row: 1;
+  width: 100%;
+  min-width: 0;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-content: center;
+  justify-content: flex-end;
+  justify-self: stretch;
+  row-gap: 2px;
+
+  &[data-rail-row] {
+    grid-column: 2 / -1;
+    grid-row: 1;
+  }
+
+  @container (max-width: 520px) {
+    && {
+      grid-column: 1 / -1;
+      grid-row: 2;
+      justify-content: flex-end;
+    }
+  }
 `;

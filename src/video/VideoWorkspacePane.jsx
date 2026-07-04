@@ -409,6 +409,46 @@ function formatRelativeTime(ms) {
   return `${Math.round(deltaHours / 24)}d ago`;
 }
 
+function normalizeStringList(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.map((entry) => String(entry || "").trim()).filter(Boolean);
+}
+
+function sameStringList(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+    return false;
+  }
+  return left.every((entry, index) => entry === right[index]);
+}
+
+function normalizeTimelineRanges(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((range) => {
+      const startMs = Math.max(0, Math.round(Number(range?.startMs) || 0));
+      const endMs = Math.max(0, Math.round(Number(range?.endMs) || 0));
+      return {
+        startMs: Math.min(startMs, endMs),
+        endMs: Math.max(startMs, endMs),
+      };
+    })
+    .filter((range) => range.endMs > range.startMs);
+}
+
+function sameTimelineRanges(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right) || left.length !== right.length) {
+    return false;
+  }
+  return left.every((range, index) => (
+    Math.round(Number(range?.startMs) || 0) === Math.round(Number(right[index]?.startMs) || 0)
+    && Math.round(Number(range?.endMs) || 0) === Math.round(Number(right[index]?.endMs) || 0)
+  ));
+}
+
 // The Video Editor grid pane. Window chrome (drag/split/popout/maximize/
 // close/agent toggle) comes from the TerminalView wrapper. Inside: a project
 // menu screen, and an editing surface with one thin nav rail — Library /
@@ -419,6 +459,7 @@ export default function VideoWorkspacePane({
   createRequestNonce = 0,
   createRequestName = "",
   deleteRequestNonce = 0,
+  externalProject = undefined,
   refreshRequestNonce = 0,
   isActive = false,
   onProjectChange,
@@ -512,6 +553,8 @@ export default function VideoWorkspacePane({
   const historyRef = useRef({ past: [], future: [] });
 
   const storageKey = useMemo(() => slotStorageKey(workspaceId, paneId, repoPath), [paneId, repoPath, workspaceId]);
+  const externalProjectProvided = externalProject !== undefined;
+  const externalProjectPath = String(externalProject?.path || "").trim();
   const ffmpegReady = Boolean(tools?.ffmpeg?.installed && tools?.ffprobe?.installed);
   const wide = paneWidth >= WIDE_MIN_WIDTH;
 
@@ -677,6 +720,64 @@ export default function VideoWorkspacePane({
   );
 
   useEffect(() => {
+    if (!externalProjectProvided) {
+      return;
+    }
+    if (externalProjectPath) {
+      if (projectPathRef.current !== externalProjectPath) {
+        openProject(externalProjectPath);
+        return;
+      }
+      setView("editor");
+      if (Array.isArray(externalProject?.selectedClipIds)) {
+        const nextSelectedClipIds = normalizeStringList(externalProject.selectedClipIds);
+        setSelectedClipIds((current) => (
+          sameStringList(current, nextSelectedClipIds) ? current : nextSelectedClipIds
+        ));
+      }
+      if (Array.isArray(externalProject?.ranges)) {
+        const nextRanges = normalizeTimelineRanges(externalProject.ranges);
+        setRanges((current) => (
+          sameTimelineRanges(current, nextRanges) ? current : nextRanges
+        ));
+      }
+      const nextPlayheadMs = Number(externalProject?.playheadMs);
+      if (Number.isFinite(nextPlayheadMs)) {
+        const safePlayheadMs = Math.max(0, Math.round(nextPlayheadMs));
+        if (Math.abs(playback.getMs() - safePlayheadMs) > 1) {
+          playback.setMs(safePlayheadMs);
+        }
+        setPlayheadUiMs((current) => (Math.abs(current - safePlayheadMs) > 1 ? safePlayheadMs : current));
+      }
+      if (externalProject?.playing === false) {
+        setPlaybackPlaying(false);
+      }
+      return;
+    }
+    if (!projectPathRef.current) {
+      return;
+    }
+    setProject(null);
+    setProjectPath("");
+    setSelectedClipIds([]);
+    playback.setMs(0);
+    playback.setPlaying(false);
+    setPlayheadUiMs(0);
+    setPlaying(false);
+    setView("menu");
+    resetHistory();
+  }, [
+    externalProject,
+    externalProjectPath,
+    externalProjectProvided,
+    openProject,
+    playback,
+    projectPath,
+    resetHistory,
+    setPlaybackPlaying,
+  ]);
+
+  useEffect(() => {
     refreshTools();
   }, [refreshTools]);
 
@@ -735,12 +836,26 @@ export default function VideoWorkspacePane({
         ? {
             path: projectPath,
             name: project?.name || "",
+            playheadMs: Math.round(playbackRef.current?.getMs?.() || 0),
+            playing,
+            ranges: ranges.map((range) => ({ startMs: range.startMs, endMs: range.endMs })),
+            selectedClipIds,
             selectionContext,
             prepareContext: prepareAgentContextStable,
           }
         : null,
     );
-  }, [onProjectChange, prepareAgentContextStable, project?.name, projectPath, selectionContext]);
+  }, [
+    onProjectChange,
+    playheadUiMs,
+    playing,
+    prepareAgentContextStable,
+    project?.name,
+    projectPath,
+    ranges,
+    selectedClipIds,
+    selectionContext,
+  ]);
 
   // Mirror the pane's live selection state into Rust so the video MCP tools
   // (video_context) can report ranges/playhead/selection to agents. While

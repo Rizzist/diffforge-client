@@ -186,3 +186,24 @@ test("credit wallet normalization does not let unknown zero snapshots wipe same-
   assert.equal(normalized.termUsedCredits, 9700);
   assert.equal(normalized.termRemainingCredits, 300);
 });
+
+test("credit wallet normalization can let live websocket totals replace stale auth credits", () => {
+  const normalized = normalizeCreditWallet({
+    known: true,
+    live: true,
+    planName: "plus",
+    termTotalCredits: 10000,
+    termUsedCredits: 9000,
+    termRemainingCredits: 1000,
+  }, {
+    planName: "plus",
+    termTotalCredits: 10000,
+    termUsedCredits: 7642,
+    termRemainingCredits: 2358,
+  }, {
+    preferIncomingTotals: true,
+  });
+
+  assert.equal(normalized.termUsedCredits, 9000);
+  assert.equal(normalized.termRemainingCredits, 1000);
+});

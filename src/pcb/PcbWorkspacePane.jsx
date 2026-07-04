@@ -325,6 +325,7 @@ export default function PcbWorkspacePane({
   createRequestNonce = 0,
   createRequestName = "",
   deleteRequestNonce = 0,
+  externalBoard = undefined,
   isActive = true,
   onBoardChange = null,
   paneId = "",
@@ -354,6 +355,8 @@ export default function PcbWorkspacePane({
     () => storageKeyForPane(workspaceId, paneId, repoPath),
     [paneId, repoPath, workspaceId],
   );
+  const externalBoardProvided = externalBoard !== undefined;
+  const externalBoardPath = String(externalBoard?.path || "").trim();
 
   const refreshBoardList = useCallback(() => {
     if (!repoPath) {
@@ -565,6 +568,19 @@ export default function PcbWorkspacePane({
     selectBoardPath(match.path, { closeChooser: true });
     return true;
   }, [availableBoards, selectBoardPath]);
+
+  useEffect(() => {
+    if (!externalBoardProvided) {
+      return;
+    }
+    if (externalBoardPath) {
+      selectBoardPath(externalBoardPath, { closeChooser: true, refreshFirst: true });
+      refreshBoardList().catch(() => {});
+      return;
+    }
+    setSelectedBoardPath("");
+    setCreating(false);
+  }, [externalBoardPath, externalBoardProvided, refreshBoardList, selectBoardPath]);
 
   const openCreateBoard = useCallback((initialName = "") => {
     if (!repoPath || busy) {
