@@ -27,9 +27,11 @@ import { Schedule } from "@styled-icons/material-rounded/Schedule";
 import { Send } from "@styled-icons/material-rounded/Send";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Webhook } from "@styled-icons/material-rounded/Webhook";
-import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { ZoomOutMap } from "@styled-icons/material-rounded/ZoomOutMap";
+import { Fragment, memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
+import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
 import {
   cleanAgentLaunchModelId,
   getAgentLaunchDefault,
@@ -575,6 +577,7 @@ import {
   LoopspaceGraphNavMap,
   LoopspaceGraphNavViewport,
   LoopspaceGraphNavOrigin,
+  LoopspaceGraphNavNodeDot,
   LoopspaceGraphNavStats,
   LoopspaceGraphPaletteIcon,
   LoopspaceGraphPaletteText,
@@ -785,7 +788,6 @@ import {
   CrashRecoveryMeta,
   WorkspaceSettingsInput,
   AgentSettingsPanel,
-  AgentPanelActions,
   AgentReadyPill,
   AgentCardGrid,
   AgentCard,
@@ -806,7 +808,6 @@ import {
   AgentLaunchField,
   AgentActions,
   AgentActionTooltip,
-  PanelHeaderRow,
   PanelKicker,
   PanelHeading,
   SettingsPage,
@@ -822,6 +823,9 @@ import {
   SettingsPermissionActions,
   SettingsPermissionHighlight,
   AccountSettingsPanel,
+  SettingsSectionHeader,
+  TrayClickGroup,
+  TrayClickOptionGrid,
   AccountCard,
   AccountCardHeader,
   AccountCardFooter,
@@ -971,6 +975,7 @@ import {
   WEB_PANEL_CONTROL_EVENT,
   WEB_PANEL_CONTROL_NAVIGATE,
   WEB_PANEL_CONTROL_RETURN,
+  WEB_PANEL_WEBVIEW_PRESERVED_EVENT,
 } from "../web/webPanelBridge.js";
 import ArchitectureWorkspaceView from "../architecture/ArchitectureWorkspaceView.jsx";
 import AppSelect from "./AppSelect.jsx";
@@ -2675,6 +2680,80 @@ function readMainWindowFocusedFallback() {
   return document.visibilityState !== "hidden" && document.hasFocus();
 }
 
+function readMainWindowRenderableFallback() {
+  return getRenderabilitySnapshot().renderable;
+}
+
+function scheduleRenderableTimeout(callback, delayMs) {
+  let cancelled = false;
+  let timer = 0;
+  let startedAt = 0;
+  let remainingMs = Math.max(0, Number.parseInt(delayMs, 10) || 0);
+  let unsubscribe = null;
+
+  const clearTimer = () => {
+    if (!timer) {
+      return;
+    }
+    window.clearTimeout(timer);
+    timer = 0;
+  };
+
+  const cleanup = () => {
+    clearTimer();
+    if (typeof unsubscribe === "function") {
+      unsubscribe();
+      unsubscribe = null;
+    }
+  };
+
+  const arm = () => {
+    if (cancelled || timer || !readMainWindowRenderableFallback()) {
+      return;
+    }
+    startedAt = Date.now();
+    timer = window.setTimeout(() => {
+      timer = 0;
+      cleanup();
+      if (!cancelled) {
+        callback();
+      }
+    }, remainingMs);
+  };
+
+  const pause = () => {
+    if (!timer) {
+      return;
+    }
+    remainingMs = Math.max(0, remainingMs - (Date.now() - startedAt));
+    clearTimer();
+  };
+
+  unsubscribe = subscribeToRenderability((nextSnapshot) => {
+    if (nextSnapshot.renderable) {
+      arm();
+    } else {
+      pause();
+    }
+  });
+  arm();
+
+  return () => {
+    cancelled = true;
+    cleanup();
+  };
+}
+
+function cancelRenderableTimer(request) {
+  if (typeof request?.cancelTimer === "function") {
+    request.cancelTimer();
+    return;
+  }
+  if (request?.timer) {
+    window.clearTimeout(request.timer);
+  }
+}
+
 const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
 const APP_SHUTDOWN_PROGRESS_EVENT = "forge-app-shutdown-progress";
 const APP_CLOSE_REQUESTED_EVENT = "forge-app-close-requested";
@@ -2718,6 +2797,45 @@ const APP_THEME_OPTIONS = [
     label: "Light",
   },
 ];
+const TRAY_CLICK_ACTION_SNIP_STRIP = "snipStrip";
+const TRAY_CLICK_ACTION_MONITOR = "monitor";
+const TRAY_CLICK_ACTION_OPEN_APP = "openApp";
+const TRAY_CLICK_ACTIONS = [
+  TRAY_CLICK_ACTION_SNIP_STRIP,
+  TRAY_CLICK_ACTION_MONITOR,
+  TRAY_CLICK_ACTION_OPEN_APP,
+];
+const TRAY_CLICK_ACTION_OPTIONS = [
+  {
+    detail: "Recent snips drag bar",
+    icon: "snipStrip",
+    id: TRAY_CLICK_ACTION_SNIP_STRIP,
+    label: "Snip strip",
+  },
+  {
+    detail: "Activity & tokens popover",
+    icon: "monitor",
+    id: TRAY_CLICK_ACTION_MONITOR,
+    label: "Monitor",
+  },
+  {
+    detail: "Focus the main window",
+    icon: "openApp",
+    id: TRAY_CLICK_ACTION_OPEN_APP,
+    label: "Open Diff Forge",
+  },
+];
+
+function normalizeTrayClickAction(action, fallbackAction) {
+  return TRAY_CLICK_ACTIONS.includes(action) ? action : fallbackAction;
+}
+
+function normalizeTrayClickSettings(settings) {
+  return {
+    foregroundAction: normalizeTrayClickAction(settings?.foregroundAction, TRAY_CLICK_ACTION_SNIP_STRIP),
+    backgroundAction: normalizeTrayClickAction(settings?.backgroundAction, TRAY_CLICK_ACTION_MONITOR),
+  };
+}
 const WORKSPACE_RAIL_ANIMATION_MS = 220;
 const WORKSPACE_ACTIVE_SWITCH_OPENING_MS = 90;
 const WORKSPACE_APP_STARTUP_SCAN_IDLE_DELAY_MS = 700;
@@ -2938,6 +3056,46 @@ const VOICE_PLAN_TASK_LIFECYCLE_EVENT = "diffforge:voice-plan-task-lifecycle";
 const TERMINAL_IDLE_STATUS_EVENT_TYPES = new Set([
   "provider-turn-completed",
 ]);
+const TERMINAL_ACTIVITY_HOOK_IMMEDIATE_EVENT_TYPES = new Set([
+  "provider-turn-started",
+  "provider-turn-completed",
+  "provider-turn-error",
+  "provider-turn-interrupted",
+  "provider-user-input-required",
+  "provider-user-prompt-started",
+]);
+
+function terminalActivityHookPayloadQueueKey(payload = {}) {
+  const workspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
+  const threadId = String(payload.threadId || payload.thread_id || "").trim();
+  const terminalIndex = String(payload.terminalIndex ?? payload.terminal_index ?? "").trim();
+  const paneId = String(payload.paneId || payload.pane_id || "").trim();
+  const instanceId = String(payload.instanceId ?? payload.instance_id ?? "").trim();
+  return [
+    workspaceId,
+    threadId || `terminal:${terminalIndex}`,
+    paneId,
+    instanceId,
+  ].join("::");
+}
+
+function terminalActivityHookEventFlushesImmediately(hookEvent = {}) {
+  const payload = hookEvent?.payload || {};
+  const type = String(payload.eventType || payload.event_type || payload.type || "").trim().toLowerCase();
+  return Boolean(
+    TERMINAL_ACTIVITY_HOOK_IMMEDIATE_EVENT_TYPES.has(type)
+      || type === "error"
+      || type.includes("error")
+      || type.endsWith("-failed")
+      || payload.terminalIsPromptingUser === true
+      || payload.terminal_is_prompting_user === true
+      || payload.promptingUser === true
+      || payload.prompting_user === true
+      || payload.requiresUserInput === true
+      || payload.requires_user_input === true
+      || terminalStatusEventHasExplicitPermissionPrompt(payload),
+  );
+}
 
 function terminalStatusEventForcesIdle(eventType) {
   return TERMINAL_IDLE_STATUS_EVENT_TYPES.has(String(eventType || "").trim().toLowerCase());
@@ -5764,6 +5922,19 @@ function loopspaceGraphFiniteNumber(value, fallback = 0) {
 const LOOPSPACE_GRAPH_MIN_ZOOM = 0.35;
 const LOOPSPACE_GRAPH_MAX_ZOOM = 2.4;
 const LOOPSPACE_GRAPH_ZOOM_STEP = 1.18;
+const LOOPSPACE_GRAPH_NAV_NODE_ACCENTS = {
+  asset_read: "45, 212, 191",
+  asset_write: "45, 212, 191",
+  cron: "96, 165, 250",
+  device: "255, 209, 102",
+  dispatch_todos: "56, 189, 248",
+  document_read: "96, 165, 250",
+  document_write: "96, 165, 250",
+  manual: "251, 191, 36",
+  run_script: "251, 191, 36",
+  send_message: "125, 176, 255",
+  webhook: "45, 212, 191",
+};
 const LOOPSPACE_GRAPH_NODE_WIDTH = 220;
 const LOOPSPACE_GRAPH_NODE_HEIGHT = 66;
 const LOOPSPACE_GRAPH_PORT_SIZE = 18;
@@ -10706,6 +10877,41 @@ function LoopspaceRuntimeView({
     applyGraphViewport({ x: 0, y: 0 }, 1);
   }, [applyGraphViewport]);
 
+  const fitGraphViewport = useCallback(() => {
+    const rect = graphCanvasRef.current?.getBoundingClientRect?.();
+    if (!rect || !visibleGraphNodes.length) {
+      resetGraphViewport();
+      return;
+    }
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    visibleGraphNodes.forEach((node, index) => {
+      const layout = graphNodeLayouts.get(node.id) || loopspaceGraphNodeLayout(node, index);
+      minX = Math.min(minX, layout.x);
+      minY = Math.min(minY, layout.y);
+      maxX = Math.max(maxX, layout.x + layout.width);
+      maxY = Math.max(maxY, layout.y + layout.height);
+    });
+    if (!Number.isFinite(minX) || !Number.isFinite(minY)) {
+      resetGraphViewport();
+      return;
+    }
+    const padding = 88;
+    const boundsWidth = Math.max(1, maxX - minX);
+    const boundsHeight = Math.max(1, maxY - minY);
+    const zoom = clampLoopspaceGraphZoom(Math.min(
+      Math.max(1, rect.width - padding) / boundsWidth,
+      Math.max(1, rect.height - padding) / boundsHeight,
+      1.2,
+    ));
+    applyGraphViewport({
+      x: -((minX + (boundsWidth / 2)) * zoom),
+      y: -((minY + (boundsHeight / 2)) * zoom),
+    }, zoom);
+  }, [applyGraphViewport, graphNodeLayouts, resetGraphViewport, visibleGraphNodes]);
+
   const centerLoopspaceGraphOnNode = useCallback((node) => {
     const nodeId = String(node?.id || "").trim();
     if (!nodeId) return;
@@ -13555,6 +13761,14 @@ function LoopspaceRuntimeView({
                 <span aria-hidden="true">+</span>
               </LoopspaceGraphControlButton>
               <LoopspaceGraphControlButton
+                aria-label="Fit graph to view"
+                onClick={fitGraphViewport}
+                title="Fit to view"
+                type="button"
+              >
+                <ZoomOutMap aria-hidden="true" />
+              </LoopspaceGraphControlButton>
+              <LoopspaceGraphControlButton
                 aria-label="Reset graph view"
                 onClick={resetGraphViewport}
                 title="Reset view"
@@ -13570,6 +13784,21 @@ function LoopspaceRuntimeView({
               onWheel={(event) => event.stopPropagation()}
             >
               <LoopspaceGraphNavMap>
+                {visibleGraphNodes.map((node, index) => {
+                  const layout = graphNodeLayouts.get(node.id) || loopspaceGraphNodeLayout(node, index);
+                  const tone = runtimeStateByNodeId.get(node.id)?.tone;
+                  return (
+                    <LoopspaceGraphNavNodeDot
+                      data-tone={tone && tone !== "neutral" ? tone : undefined}
+                      key={`nav:${node.id}`}
+                      style={{
+                        "--loop-node-accent": LOOPSPACE_GRAPH_NAV_NODE_ACCENTS[node.nodeKind] || "255, 209, 102",
+                        "--loopspace-nav-node-x": `${Math.max(-34, Math.min(34, (layout.x + (layout.width / 2)) * 0.045))}px`,
+                        "--loopspace-nav-node-y": `${Math.max(-22, Math.min(22, (layout.y + (layout.height / 2)) * 0.045))}px`,
+                      }}
+                    />
+                  );
+                })}
                 <LoopspaceGraphNavOrigin />
                 <LoopspaceGraphNavViewport
                   style={{
@@ -22240,6 +22469,9 @@ export default function App() {
   const [appStartupSettings, setAppStartupSettings] = useState(() => normalizeAppStartupSettings(null));
   const [appStartupSettingsState, setAppStartupSettingsState] = useState("idle");
   const [appStartupSettingsError, setAppStartupSettingsError] = useState("");
+  const [trayClickSettings, setTrayClickSettings] = useState(() => normalizeTrayClickSettings(null));
+  const [trayClickSettingsState, setTrayClickSettingsState] = useState("idle");
+  const [trayClickSettingsError, setTrayClickSettingsError] = useState("");
   const [workspaceTerminalLogicalIndexes, setWorkspaceTerminalLogicalIndexes] = useState(
     () => workspaceSettingsLogicalIndexLayouts(workspaceSettings),
   );
@@ -22256,7 +22488,11 @@ export default function App() {
   const [workspaceGitRepositoryPreloads, setWorkspaceGitRepositoryPreloads] = useState({});
   const [workspaceGitSnapshotPreloads, setWorkspaceGitSnapshotPreloads] = useState({});
   const [workspaceToolPaneMode, setWorkspaceToolPaneMode] = useState(TODO_QUEUE_PANE_MODE_MINIMIZED);
-  const [accountWorkspaceToolTab, setAccountWorkspaceToolTab] = useState("orchestrator");
+  // The account tools-panel tab lives inside TodoQueuePanel; App only keeps
+  // refs so remote tab switches reach the panel without re-rendering the shell
+  // on every Orch/Docs/Tokens click.
+  const accountWorkspaceToolTabControlRef = useRef(null);
+  const accountWorkspaceToolTabMemoryRef = useRef("orchestrator");
   const [workspaceToolLayoutWidth, setWorkspaceToolLayoutWidth] = useState(0);
   const [workspaceToolRuntimeBridges, setWorkspaceToolRuntimeBridges] = useState({});
   const workspaceToolRuntimeBridgesRef = useRef(workspaceToolRuntimeBridges);
@@ -22394,6 +22630,10 @@ export default function App() {
   const workspaceThreadTranscriptEventHandlerRef = useRef(null);
   const terminalPromptSubmittedHandlerRef = useRef(null);
   const terminalActivityHookHandlerRef = useRef(null);
+  const terminalActivityHookQueueRef = useRef([]);
+  const terminalActivityHookFlushFrameRef = useRef(0);
+  const terminalActivityHookFlushTimerRef = useRef(0);
+  const terminalActivityHookLifecycleReducersRef = useRef(null);
   const terminalProviderSessionBindingHandlerRef = useRef(null);
   const workspacePendingPromptDeliveriesRef = useRef(new Map());
   const workspaceTerminalLogicalIndexesRef = useRef(workspaceTerminalLogicalIndexes);
@@ -24909,6 +25149,26 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (typeof document === "undefined") {
+      return undefined;
+    }
+
+    const applyRenderability = (nextSnapshot = getRenderabilitySnapshot()) => {
+      if (nextSnapshot.renderable) {
+        delete document.documentElement.dataset.renderPaused;
+      } else {
+        document.documentElement.dataset.renderPaused = "true";
+      }
+    };
+
+    applyRenderability();
+    const unsubscribe = subscribeToRenderability(applyRenderability);
+    return () => {
+      unsubscribe();
+    };
+  }, []);
+
+  useEffect(() => {
     workspacesRef.current = workspaces;
   }, [workspaces]);
 
@@ -25565,7 +25825,10 @@ export default function App() {
     workspaceLifecycleSettingsRef.current = workspaceLifecycleSettings;
   }, [workspaceLifecycleSettings]);
 
-  useEffect(() => {
+  // Layout effect so the html[data-forge-space] flip commits in the same frame
+  // as the React render that changed spaceMode — a plain effect repaints the
+  // whole document a second time one frame later, which reads as toggle lag.
+  useLayoutEffect(() => {
     applyForgeThemePreference(appAppearanceSettings.theme, spaceMode);
   }, [appAppearanceSettings.theme, spaceMode]);
 
@@ -25588,6 +25851,32 @@ export default function App() {
         }
         setAppStartupSettingsState("error");
         setAppStartupSettingsError(getErrorMessage(error, "Unable to load startup settings."));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    setTrayClickSettingsState("loading");
+    invoke("tray_click_settings_state")
+      .then((settings) => {
+        if (cancelled) {
+          return;
+        }
+        setTrayClickSettings(normalizeTrayClickSettings(settings));
+        setTrayClickSettingsState("ready");
+        setTrayClickSettingsError("");
+      })
+      .catch((error) => {
+        if (cancelled) {
+          return;
+        }
+        setTrayClickSettingsState("error");
+        setTrayClickSettingsError(getErrorMessage(error, "Unable to load tray click settings."));
       });
 
     return () => {
@@ -26101,15 +26390,38 @@ export default function App() {
     if (!safePaneId) {
       return;
     }
+    const currentSession = workspaceWebTabSessionsRef.current[safePaneId] || {};
+    const label = String(currentSession.popoutLabel || currentSession.label || "").trim();
     setWorkspaceWebTabSession(safePaneId, (current) => {
       const wasPoppedOut = Boolean(current.poppedOut || current.popoutLabel || current.label);
+      // When the window's living webview survived (reported via control events
+      // or Rust's preserved event), the tab ADOPTS it — no remount, no reload.
+      const canAdopt = wasPoppedOut && Boolean(String(current.webviewLabel || "").trim());
       return {
+        adoptNonce: canAdopt ? Number(current.adoptNonce || 0) + 1 : Number(current.adoptNonce || 0),
         currentUrl: url ? normalizeWorkspaceWebTabSessionUrl(url) : current.currentUrl,
         poppedOut: false,
         popoutLabel: "",
-        resumeNonce: wasPoppedOut ? Number(current.resumeNonce || 0) + 1 : Number(current.resumeNonce || 0),
+        resumeNonce: wasPoppedOut && !canAdopt
+          ? Number(current.resumeNonce || 0) + 1
+          : Number(current.resumeNonce || 0),
         workspaceId: current.workspaceId || "",
       };
+    });
+    if (label) {
+      invoke("web_panel_close", { label }).catch(() => {});
+    }
+  }, [setWorkspaceWebTabSession]);
+
+  // Tracks the web tab's current native webview label so pop-out and return can
+  // move the living page between windows instead of reloading it.
+  const rememberWorkspaceWebTabNativeLabel = useCallback((paneId, label) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return;
+    }
+    setWorkspaceWebTabSession(safePaneId, {
+      webviewLabel: String(label || "").trim(),
     });
   }, [setWorkspaceWebTabSession]);
 
@@ -26146,6 +26458,8 @@ export default function App() {
 
     try {
       const result = await invoke("web_panel_open", {
+        // Hand the tab's living webview to the window (reparent, no reload).
+        adoptLabel: String(currentSession.webviewLabel || "").trim(),
         height: null,
         paneId: safePaneId,
         theme: document.documentElement?.dataset?.forgeTheme || "",
@@ -26255,6 +26569,42 @@ export default function App() {
     };
   }, [clearWorkspaceWebTabBreakout]);
 
+  // Rust preserved a closing web-tab popout's living webview (reparented to the
+  // main window, hidden); remember its label so the tab adopts it back.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(WEB_PANEL_WEBVIEW_PRESERVED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const paneId = String(payload.paneId || payload.pane_id || "").trim();
+      if (!paneId || !isWorkspaceWebTabPaneId(paneId)) {
+        return;
+      }
+      const labels = Array.isArray(payload.webviewLabels) ? payload.webviewLabels : [];
+      const label = String(labels[0] || "").trim();
+      if (label) {
+        rememberWorkspaceWebTabNativeLabel(paneId, label);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [rememberWorkspaceWebTabNativeLabel]);
+
   useEffect(() => {
     let disposed = false;
     let unlisten = () => {};
@@ -26269,6 +26619,9 @@ export default function App() {
         return;
       }
       const control = String(payload.control || "").trim();
+      if (payload.webviewLabel) {
+        rememberWorkspaceWebTabNativeLabel(paneId, payload.webviewLabel);
+      }
       if (control === WEB_PANEL_CONTROL_NAVIGATE) {
         rememberWorkspaceWebTabUrl({
           paneId,
@@ -26318,6 +26671,10 @@ export default function App() {
       const label = String(session?.popoutLabel || session?.label || "").trim();
       if (label) {
         invoke("web_panel_close", { label }).catch(() => {});
+      }
+      const webviewLabel = String(session?.webviewLabel || "").trim();
+      if (webviewLabel) {
+        invoke("workspace_webview_close", { label: webviewLabel }).catch(() => {});
       }
     });
     setWorkspaceWebTabSessions((current) => {
@@ -26948,6 +27305,40 @@ export default function App() {
     }
   }, []);
 
+  const updateTrayClickAction = useCallback(async (field, action) => {
+    if (field !== "foregroundAction" && field !== "backgroundAction") {
+      return;
+    }
+    const nextAction = normalizeTrayClickAction(action, "");
+    if (!nextAction) {
+      return;
+    }
+
+    setTrayClickSettingsError("");
+    setTrayClickSettingsState("saving");
+    setTrayClickSettings((settings) => normalizeTrayClickSettings({
+      ...settings,
+      [field]: nextAction,
+    }));
+
+    try {
+      const nextSettings = await invoke("tray_click_settings_update", {
+        [field]: nextAction,
+      });
+      setTrayClickSettings(normalizeTrayClickSettings(nextSettings));
+      setTrayClickSettingsState("ready");
+    } catch (error) {
+      setTrayClickSettingsState("error");
+      setTrayClickSettingsError(getErrorMessage(error, "Unable to update tray click behavior."));
+      try {
+        const currentSettings = await invoke("tray_click_settings_state");
+        setTrayClickSettings(normalizeTrayClickSettings(currentSettings));
+      } catch {
+        setTrayClickSettings((settings) => normalizeTrayClickSettings(settings));
+      }
+    }
+  }, []);
+
   const cancelDeferredWorkspaceActivation = useCallback(() => {
     const pending = deferredWorkspaceActivationRef.current;
 
@@ -27135,14 +27526,14 @@ export default function App() {
         workspaceId: "",
       };
 
-      setWorkspacePendingActivationId((currentPendingId) => (
-        currentPendingId === safeWorkspaceId ? "" : currentPendingId
-      ));
       if (workspacePendingActivationIdRef.current === safeWorkspaceId) {
         workspacePendingActivationIdRef.current = "";
       }
 
       if (selectedWorkspaceIdRef.current !== safeWorkspaceId) {
+        setWorkspacePendingActivationId((currentPendingId) => (
+          currentPendingId === safeWorkspaceId ? "" : currentPendingId
+        ));
         logWorkspaceActivationTrace("workspace.open.deferred_selection_changed", safeWorkspaceId, {
           elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - scheduledAtMs),
           selectedWorkspaceId: selectedWorkspaceIdRef.current,
@@ -27157,7 +27548,17 @@ export default function App() {
         source,
         token,
       }, { trace });
-      activateWorkspace(safeWorkspaceId, source, trace);
+      // The activation commit mounts the entire workspace runtime (TerminalView,
+      // panes, tools panel) on top of a full-shell render. As a transition,
+      // React time-slices that render so the click and the pending-activation
+      // state keep painting instead of freezing the shell; the pending badge
+      // clears in the same commit that reveals the runtime.
+      startTransition(() => {
+        setWorkspacePendingActivationId((currentPendingId) => (
+          currentPendingId === safeWorkspaceId ? "" : currentPendingId
+        ));
+        activateWorkspace(safeWorkspaceId, source, trace);
+      });
     };
 
     const scheduleIdleActivation = () => {
@@ -32604,22 +33005,37 @@ export default function App() {
     let cancelled = false;
     let refreshTimer = 0;
     let unlistenSyncStatus = null;
+    let unsubscribeRenderability = null;
     const refresh = (quiet = true) => {
-      if (!cancelled) {
+      if (!cancelled && readMainWindowRenderableFallback()) {
         void refreshNetworkingDiagnostics({ quiet });
       }
     };
-
-    refresh(false);
-    // Skip the 1s poll while the window is hidden/backgrounded — the
-    // cloud-mcp-sync-status listener below still refreshes on real changes,
-    // so there's nothing to gain from polling diagnostics nobody can see.
-    refreshTimer = window.setInterval(() => {
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") {
+    const stopRefreshTimer = () => {
+      if (refreshTimer) {
+        window.clearInterval(refreshTimer);
+        refreshTimer = 0;
+      }
+    };
+    const startRefreshTimer = () => {
+      if (refreshTimer || !readMainWindowRenderableFallback()) {
         return;
       }
-      refresh(true);
-    }, 1000);
+      refreshTimer = window.setInterval(() => {
+        refresh(true);
+      }, 1000);
+    };
+
+    refresh(false);
+    startRefreshTimer();
+    unsubscribeRenderability = subscribeToRenderability((nextSnapshot) => {
+      if (nextSnapshot.renderable) {
+        refresh(true);
+        startRefreshTimer();
+      } else {
+        stopRefreshTimer();
+      }
+    });
 
     listen("cloud-mcp-sync-status", () => refresh(true)).then((unlisten) => {
       if (cancelled) {
@@ -32631,8 +33047,9 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      if (refreshTimer) {
-        window.clearInterval(refreshTimer);
+      stopRefreshTimer();
+      if (typeof unsubscribeRenderability === "function") {
+        unsubscribeRenderability();
       }
       if (unlistenSyncStatus) {
         unlistenSyncStatus();
@@ -32711,35 +33128,57 @@ export default function App() {
 
     let cancelled = false;
     let lastRefreshAt = 0;
+    let intervalId = 0;
+    let unsubscribeRenderability = null;
     let unlistenSyncStatus = null;
     const refresh = async (quiet = false, { force = false, minAgeMs = 0 } = {}) => {
-      if (!cancelled && (force || readMainWindowFocusedFallback())) {
-        const now = Date.now();
-        if (minAgeMs > 0 && lastRefreshAt > 0 && now - lastRefreshAt < minAgeMs) {
-          return;
-        }
-        lastRefreshAt = now;
-        await refreshBillingStatus({ quiet });
+      if (cancelled || !readMainWindowRenderableFallback()) {
+        return;
       }
+      const now = Date.now();
+      if (minAgeMs > 0 && lastRefreshAt > 0 && now - lastRefreshAt < minAgeMs) {
+        return;
+      }
+      lastRefreshAt = now;
+      await refreshBillingStatus({ quiet });
+    };
+    const stopInterval = () => {
+      if (intervalId) {
+        window.clearInterval(intervalId);
+        intervalId = 0;
+      }
+    };
+    const startInterval = () => {
+      if (intervalId || !readMainWindowRenderableFallback()) {
+        return;
+      }
+      intervalId = window.setInterval(() => {
+        refresh(true);
+      }, BILLING_STATUS_REFRESH_MS);
     };
     const refreshOnForeground = () => {
       void refresh(true, {
-        force: readMainWindowFocusedFallback(),
+        force: true,
       });
     };
     const refreshAfterSyncStatus = () => {
       void refresh(true, {
-        force: readMainWindowFocusedFallback(),
+        force: true,
         minAgeMs: BILLING_STATUS_EVENT_REFRESH_MIN_MS,
       });
     };
 
     refresh(false, { force: true });
-    const intervalId = window.setInterval(() => {
-      refresh(true);
-    }, BILLING_STATUS_REFRESH_MS);
+    startInterval();
+    unsubscribeRenderability = subscribeToRenderability((nextSnapshot) => {
+      if (nextSnapshot.renderable) {
+        startInterval();
+        void refresh(true, { force: true });
+      } else {
+        stopInterval();
+      }
+    });
     window.addEventListener("focus", refreshOnForeground);
-    document.addEventListener("visibilitychange", refreshOnForeground);
     listen("cloud-mcp-sync-status", refreshAfterSyncStatus).then((unlisten) => {
       if (cancelled) {
         unlisten();
@@ -32750,9 +33189,11 @@ export default function App() {
 
     return () => {
       cancelled = true;
-      window.clearInterval(intervalId);
+      stopInterval();
+      if (typeof unsubscribeRenderability === "function") {
+        unsubscribeRenderability();
+      }
       window.removeEventListener("focus", refreshOnForeground);
-      document.removeEventListener("visibilitychange", refreshOnForeground);
       if (typeof unlistenSyncStatus === "function") {
         unlistenSyncStatus();
       }
@@ -44272,7 +44713,8 @@ export default function App() {
           if (tab.scope === "workspace-tool") {
             setWorkspaceToolPaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
             if (tab.workspaceTool) {
-              setAccountWorkspaceToolTab(tab.workspaceTool);
+              accountWorkspaceToolTabMemoryRef.current = tab.workspaceTool;
+              accountWorkspaceToolTabControlRef.current?.(tab.workspaceTool);
             }
             const bridge = workspace?.id ? workspaceToolRuntimeBridges[workspace.id] || null : null;
             const bridgeSelected = Boolean(bridge?.onSelectWorkspaceTool?.(tab.workspaceTool));
@@ -45170,7 +45612,7 @@ export default function App() {
       return;
     }
     if (existingRequest?.timer) {
-      window.clearTimeout(existingRequest.timer);
+      cancelRenderableTimer(existingRequest);
       logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.replace_timer", {
         agentId,
         requestKey,
@@ -45308,7 +45750,7 @@ export default function App() {
         });
         workspaceThreadTranscriptRequestsRef.current.delete(requestKey);
         if (shouldContinuePolling) {
-          window.setTimeout(() => {
+          scheduleRenderableTimeout(() => {
             requestWorkspaceThreadTranscript({
               ...event,
               delayMs: 0,
@@ -45383,7 +45825,7 @@ export default function App() {
         });
         workspaceThreadTranscriptRequestsRef.current.delete(requestKey);
         if (shouldContinuePolling) {
-          window.setTimeout(() => {
+          scheduleRenderableTimeout(() => {
             requestWorkspaceThreadTranscript({
               ...event,
               delayMs: 0,
@@ -45892,7 +46334,7 @@ export default function App() {
               workspaceId,
             });
             if (shouldContinuePolling) {
-              window.setTimeout(() => {
+              scheduleRenderableTimeout(() => {
                 requestWorkspaceThreadTranscript({
                   ...event,
                   delayMs: 0,
@@ -45970,7 +46412,7 @@ export default function App() {
               });
             }
             if (shouldContinuePolling) {
-              window.setTimeout(() => {
+              scheduleRenderableTimeout(() => {
                 requestWorkspaceThreadTranscript({
                   ...event,
                   delayMs: 0,
@@ -46021,7 +46463,7 @@ export default function App() {
               workspaceId,
             });
             if (shouldContinuePolling) {
-              window.setTimeout(() => {
+              scheduleRenderableTimeout(() => {
                 requestWorkspaceThreadTranscript({
                   ...event,
                   delayMs: 0,
@@ -46087,7 +46529,7 @@ export default function App() {
               workspaceId,
             });
             if (shouldContinuePolling) {
-              window.setTimeout(() => {
+              scheduleRenderableTimeout(() => {
                 requestWorkspaceThreadTranscript({
                   ...event,
                   delayMs: 0,
@@ -46292,7 +46734,7 @@ export default function App() {
               workspaceId,
             });
             if (shouldContinuePolling) {
-              window.setTimeout(() => {
+              scheduleRenderableTimeout(() => {
                 requestWorkspaceThreadTranscript({
                   ...event,
                   delayMs: 0,
@@ -46322,7 +46764,7 @@ export default function App() {
               workspaceId,
             });
             if (shouldContinueCloudRefresh) {
-              window.setTimeout(() => {
+              scheduleRenderableTimeout(() => {
                 requestWorkspaceThreadTranscript({
                   ...event,
                   delayMs: 0,
@@ -46364,7 +46806,7 @@ export default function App() {
             workspaceId,
           });
           if (shouldContinuePolling) {
-            window.setTimeout(() => {
+            scheduleRenderableTimeout(() => {
               requestWorkspaceThreadTranscript({
                 ...event,
                 delayMs: 0,
@@ -46392,16 +46834,17 @@ export default function App() {
       : 250;
     const hotDelayMs = inputReadyTranscriptEvent ? 0 : getTerminalInputHotDelayMs(900);
     const delayMs = Math.max(requestedDelayMs, minimumDelayMs, hotDelayMs);
-    const timer = window.setTimeout(runRequest, delayMs);
+    const cancelTimer = scheduleRenderableTimeout(runRequest, delayMs);
     workspaceThreadTranscriptRequestsRef.current.set(requestKey, {
       acceptanceKeys: requestAcceptanceKeys,
       agentId,
+      cancelTimer,
       expectedUserMessage,
       inFlight: false,
       promptEventId,
       terminalPromptAccepted: terminalSubmitPromptAccepted,
       threadId,
-      timer,
+      timer: 1,
       workspaceId,
     });
     logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.schedule", {
@@ -47138,7 +47581,7 @@ export default function App() {
       return;
     }
 
-    setWorkspaceThreads((threads) => {
+    const applyWorkspaceThreadLifecycleUpdate = (threads) => {
       const beforeSnapshot = getWorkspaceThreadDiagnosticSnapshot(
         threads,
         lifecycleWorkspaceId,
@@ -47476,7 +47919,12 @@ export default function App() {
         });
       }
       return nextThreads;
-    });
+    };
+    if (Array.isArray(terminalActivityHookLifecycleReducersRef.current)) {
+      terminalActivityHookLifecycleReducersRef.current.push(applyWorkspaceThreadLifecycleUpdate);
+    } else {
+      setWorkspaceThreads(applyWorkspaceThreadLifecycleUpdate);
+    }
 
     const lifecycleHasOutputText = Boolean(lifecycleEvent.outputText || lifecycleEvent.text);
     const lifecycleThreadForTranscript = workspaceThreadsRef.current?.[lifecycleWorkspaceId]?.threads?.[lifecycleThreadId];
@@ -47710,11 +48158,16 @@ export default function App() {
       workspaceThreadAcceptedPromptsRef.current,
       acceptedPromptDetail,
     );
-    setWorkspaceThreads((threads) => clearWorkspaceThreadPendingPrompt(threads, {
+    const clearAcceptedPrompt = (threads) => clearWorkspaceThreadPendingPrompt(threads, {
       promptEventId,
       threadId,
       workspaceId,
-    }));
+    });
+    if (Array.isArray(terminalActivityHookLifecycleReducersRef.current)) {
+      terminalActivityHookLifecycleReducersRef.current.push(clearAcceptedPrompt);
+    } else {
+      setWorkspaceThreads(clearAcceptedPrompt);
+    }
     window.dispatchEvent(new CustomEvent(WORKSPACE_THREAD_PROMPT_ACCEPTED_EVENT, {
       detail: acceptedPromptDetail,
     }));
@@ -47938,12 +48391,102 @@ export default function App() {
   useEffect(() => {
     let unlistenActivityHook = null;
     let cancelled = false;
+    let sequence = 0;
+
+    const clearScheduledActivityHookFlush = () => {
+      if (terminalActivityHookFlushFrameRef.current) {
+        window.cancelAnimationFrame(terminalActivityHookFlushFrameRef.current);
+        terminalActivityHookFlushFrameRef.current = 0;
+      }
+      if (terminalActivityHookFlushTimerRef.current) {
+        window.clearTimeout(terminalActivityHookFlushTimerRef.current);
+        terminalActivityHookFlushTimerRef.current = 0;
+      }
+    };
+
+    const flushActivityHookQueue = () => {
+      clearScheduledActivityHookFlush();
+      if (cancelled || !terminalActivityHookQueueRef.current.length) {
+        return;
+      }
+      const queuedByKey = new Map();
+      terminalActivityHookQueueRef.current.forEach((entry) => {
+        const key = entry.key || "";
+        const bucket = queuedByKey.get(key) || [];
+        bucket.push(entry);
+        queuedByKey.set(key, bucket);
+      });
+      const queued = Array.from(queuedByKey.values())
+        .flat()
+        .sort((left, right) => left.sequence - right.sequence);
+      terminalActivityHookQueueRef.current = [];
+      const lifecycleReducers = [];
+      terminalActivityHookLifecycleReducersRef.current = lifecycleReducers;
+      try {
+        queued.forEach(({ hookEvent }) => {
+          if (!cancelled) {
+            terminalActivityHookHandlerRef.current?.(hookEvent);
+          }
+        });
+      } finally {
+        terminalActivityHookLifecycleReducersRef.current = null;
+      }
+      if (lifecycleReducers.length) {
+        setWorkspaceThreads((threads) => lifecycleReducers.reduce((nextThreads, reducer) => (
+          reducer(nextThreads)
+        ), threads));
+      }
+    };
+
+    const scheduleActivityHookFlush = () => {
+      if (
+        terminalActivityHookFlushFrameRef.current
+        || terminalActivityHookFlushTimerRef.current
+      ) {
+        return;
+      }
+      if (typeof document !== "undefined" && document.hidden) {
+        terminalActivityHookFlushTimerRef.current = window.setTimeout(flushActivityHookQueue, 40);
+        return;
+      }
+      terminalActivityHookFlushFrameRef.current = window.requestAnimationFrame(flushActivityHookQueue);
+    };
+
+    const handleActivityHookVisibilityChange = () => {
+      if (
+        typeof document === "undefined"
+        || !document.hidden
+        || !terminalActivityHookFlushFrameRef.current
+      ) {
+        return;
+      }
+      window.cancelAnimationFrame(terminalActivityHookFlushFrameRef.current);
+      terminalActivityHookFlushFrameRef.current = 0;
+      if (!terminalActivityHookFlushTimerRef.current) {
+        terminalActivityHookFlushTimerRef.current = window.setTimeout(flushActivityHookQueue, 40);
+      }
+    };
+
+    if (typeof document !== "undefined") {
+      document.addEventListener("visibilitychange", handleActivityHookVisibilityChange);
+    }
 
     listen(TERMINAL_ACTIVITY_HOOK_EVENT, (hookEvent) => {
       if (cancelled) {
         return;
       }
-      terminalActivityHookHandlerRef.current?.(hookEvent);
+      const payload = hookEvent?.payload || {};
+      terminalActivityHookQueueRef.current.push({
+        hookEvent,
+        key: terminalActivityHookPayloadQueueKey(payload),
+        sequence,
+      });
+      sequence += 1;
+      if (terminalActivityHookEventFlushesImmediately(hookEvent)) {
+        flushActivityHookQueue();
+      } else {
+        scheduleActivityHookFlush();
+      }
     }).then((unlisten) => {
       if (cancelled) {
         unlisten();
@@ -47954,6 +48497,12 @@ export default function App() {
 
     return () => {
       cancelled = true;
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", handleActivityHookVisibilityChange);
+      }
+      clearScheduledActivityHookFlush();
+      terminalActivityHookQueueRef.current = [];
+      terminalActivityHookLifecycleReducersRef.current = null;
       if (unlistenActivityHook) {
         unlistenActivityHook();
       }
@@ -48149,7 +48698,7 @@ export default function App() {
             return;
           }
           if (request?.timer) {
-            window.clearTimeout(request.timer);
+            cancelRenderableTimer(request);
           }
           workspaceThreadTranscriptRequestsRef.current.delete(requestKey);
           logWorkspaceThreadDiagnosticEvent("frontend.thread_transcript.accepted_timer_cancelled", {
@@ -49380,11 +49929,12 @@ export default function App() {
       && billingStatus
       // TEMP: show for every plan while testing — restore the free-plan gate:
       // && billingPlanName === "free"
-      && !isWorkspaceStartupOverlayVisible
     ) {
+      // The overlay is opaque and stacks above the startup overlay, so the
+      // tier-up plays BEFORE the user ever sees the main app area.
       setPlusUpsellState("shown");
     }
-  }, [authState, billingPlanName, billingStatus, isWorkspaceStartupOverlayVisible, plusUpsellState]);
+  }, [authState, billingPlanName, billingStatus, plusUpsellState]);
   const settingsPermissionsAreLoading = settingsPermissionState.status === "loading";
   const settingsAudioInputPermission = settingsPermissionState.audioInput;
   const settingsAudioShortcutPermissions = settingsPermissionState.audioShortcuts?.permissions || null;
@@ -50579,65 +51129,47 @@ export default function App() {
                   {settingsTab === SETTINGS_TAB_GENERAL ? (
                     <>
                   <AccountSettingsPanel>
-                    <PanelHeaderRow>
-                      <div>
-                        <PanelKicker>Appearance</PanelKicker>
-                        <PanelHeading>Theme preset</PanelHeading>
-                      </div>
-                      <AgentReadyPill data-tone="blue">
-                        {activeAppTheme === APP_THEME_LIGHT ? (
-                          <ButtonLightModeIcon aria-hidden="true" />
-                        ) : (
-                          <ButtonDarkModeIcon aria-hidden="true" />
-                        )}
-                        <span>{activeAppTheme === APP_THEME_LIGHT ? "Light" : "Dark"}</span>
-                      </AgentReadyPill>
-                    </PanelHeaderRow>
+                    <SettingsSectionHeader>
+                      <span>Appearance · Theme preset</span>
+                      <em data-tone="blue">{activeAppTheme === APP_THEME_LIGHT ? "Light" : "Dark"}</em>
+                    </SettingsSectionHeader>
 
-                    <AccountCard data-tone="blue">
-                      <AppearanceThemeGrid aria-label="App theme" role="radiogroup">
-                        {APP_THEME_OPTIONS.map((option) => {
-                          const selected = activeAppTheme === option.id;
+                    <AppearanceThemeGrid aria-label="App theme" role="radiogroup">
+                      {APP_THEME_OPTIONS.map((option) => {
+                        const selected = activeAppTheme === option.id;
 
-                          return (
-                            <AppearanceThemeButton
-                              aria-checked={selected}
-                              aria-label={`${option.label} theme`}
-                              data-selected={selected ? "true" : undefined}
-                              key={option.id}
-                              onClick={() => updateAppTheme(option.id)}
-                              role="radio"
-                              type="button"
-                            >
-                              <span aria-hidden="true">
-                                {option.icon === "light" ? (
-                                  <ButtonLightModeIcon />
-                                ) : (
-                                  <ButtonDarkModeIcon />
-                                )}
-                              </span>
-                              <div>
-                                <strong>{option.label}</strong>
-                                <small>{option.detail}</small>
-                              </div>
-                            </AppearanceThemeButton>
-                          );
-                        })}
-                      </AppearanceThemeGrid>
-                    </AccountCard>
+                        return (
+                          <AppearanceThemeButton
+                            aria-checked={selected}
+                            aria-label={`${option.label} theme`}
+                            data-selected={selected ? "true" : undefined}
+                            key={option.id}
+                            onClick={() => updateAppTheme(option.id)}
+                            role="radio"
+                            type="button"
+                          >
+                            <span aria-hidden="true">
+                              {option.icon === "light" ? (
+                                <ButtonLightModeIcon />
+                              ) : (
+                                <ButtonDarkModeIcon />
+                              )}
+                            </span>
+                            <div>
+                              <strong>{option.label}</strong>
+                              <small>{option.detail}</small>
+                            </div>
+                          </AppearanceThemeButton>
+                        );
+                      })}
+                    </AppearanceThemeGrid>
                   </AccountSettingsPanel>
 
                   <AccountSettingsPanel>
-                    <PanelHeaderRow>
-                      <div>
-                        <PanelKicker>Startup</PanelKicker>
-                        <PanelHeading>Auto-open Diff Forge</PanelHeading>
-                      </div>
-                      <AgentReadyPill data-tone={appStartupStatusTone}>
-                        <ButtonSettingsIcon aria-hidden="true" />
-                        <span>{appStartupStatusLabel}</span>
-                      </AgentReadyPill>
-                    </PanelHeaderRow>
+                    <SettingsSectionHeader>
+                      <span>Startup · Auto-open Diff Forge</span>
+                      <em data-tone={appStartupStatusTone}>{appStartupStatusLabel}</em>
+                    </SettingsSectionHeader>
 
                     <AccountCard data-tone={appStartupEnabled ? "blue" : "orange"}>
                       <AccountCardHeader>
@@ -50691,23 +51223,132 @@ export default function App() {
                     </AccountCard>
                   </AccountSettingsPanel>
 
+                  <AccountSettingsPanel>
+                    <SettingsSectionHeader>
+                      <span>Background mode · Menu-bar click</span>
+                      <em data-tone={trayClickSettingsState === "error" ? "orange" : "blue"}>
+                        {trayClickSettingsState === "loading"
+                          ? "Checking"
+                          : trayClickSettingsState === "saving"
+                            ? "Saving"
+                            : trayClickSettingsState === "error"
+                              ? "Error"
+                              : "Synced"}
+                      </em>
+                    </SettingsSectionHeader>
+
+                    <AccountCard data-tone="blue">
+                      <TrayClickGroup>
+                        <div>
+                          <SettingsLabel>While the app is open</SettingsLabel>
+                          <SettingsHint>
+                            What a left-click on the menu-bar icon does while the main window is up.
+                          </SettingsHint>
+                        </div>
+                        <TrayClickOptionGrid aria-label="Menu-bar click while app is open" role="radiogroup">
+                          {TRAY_CLICK_ACTION_OPTIONS.map((option) => {
+                            const selected = trayClickSettings.foregroundAction === option.id;
+
+                            return (
+                              <AppearanceThemeButton
+                                aria-checked={selected}
+                                aria-label={`${option.label} while app is open`}
+                                data-selected={selected ? "true" : undefined}
+                                disabled={trayClickSettingsState === "loading"}
+                                key={option.id}
+                                onClick={() => {
+                                  void updateTrayClickAction("foregroundAction", option.id);
+                                }}
+                                role="radio"
+                                type="button"
+                              >
+                                <span aria-hidden="true">
+                                  {option.icon === "snipStrip" ? (
+                                    <ButtonSnippingIcon />
+                                  ) : option.icon === "monitor" ? (
+                                    <ButtonProcessIcon />
+                                  ) : (
+                                    <ButtonForgeIcon />
+                                  )}
+                                </span>
+                                <div>
+                                  <strong>{option.label}</strong>
+                                  <small>{option.detail}</small>
+                                </div>
+                              </AppearanceThemeButton>
+                            );
+                          })}
+                        </TrayClickOptionGrid>
+                      </TrayClickGroup>
+
+                      <TrayClickGroup>
+                        <div>
+                          <SettingsLabel>While backgrounded</SettingsLabel>
+                          <SettingsHint>
+                            What the same click does when Diff Forge is hidden in the background.
+                          </SettingsHint>
+                        </div>
+                        <TrayClickOptionGrid aria-label="Menu-bar click while backgrounded" role="radiogroup">
+                          {TRAY_CLICK_ACTION_OPTIONS.map((option) => {
+                            const selected = trayClickSettings.backgroundAction === option.id;
+
+                            return (
+                              <AppearanceThemeButton
+                                aria-checked={selected}
+                                aria-label={`${option.label} while backgrounded`}
+                                data-selected={selected ? "true" : undefined}
+                                disabled={trayClickSettingsState === "loading"}
+                                key={option.id}
+                                onClick={() => {
+                                  void updateTrayClickAction("backgroundAction", option.id);
+                                }}
+                                role="radio"
+                                type="button"
+                              >
+                                <span aria-hidden="true">
+                                  {option.icon === "snipStrip" ? (
+                                    <ButtonSnippingIcon />
+                                  ) : option.icon === "monitor" ? (
+                                    <ButtonProcessIcon />
+                                  ) : (
+                                    <ButtonForgeIcon />
+                                  )}
+                                </span>
+                                <div>
+                                  <strong>{option.label}</strong>
+                                  <small>{option.detail}</small>
+                                </div>
+                              </AppearanceThemeButton>
+                            );
+                          })}
+                        </TrayClickOptionGrid>
+                      </TrayClickGroup>
+
+                      <SettingsHint>
+                        A click always stops an active snip recording first. Right-click keeps the full tray menu.
+                      </SettingsHint>
+
+                      {trayClickSettingsError && <FormMessage $state="error">{trayClickSettingsError}</FormMessage>}
+                    </AccountCard>
+                  </AccountSettingsPanel>
+
                   <AgentSettingsPanel>
-                    <PanelHeaderRow>
-                      <div>
-                        <PanelKicker>Terminal harnesses</PanelKicker>
-                        <PanelHeading>Codex, Claude Code, and OpenCode</PanelHeading>
-                      </div>
-                      <AgentPanelActions>
-                        <AgentReadyPill data-tone={connectedAgentCount > 0 ? "blue" : "orange"}>
-                          <ButtonBotIcon aria-hidden="true" />
-                          <span>{connectedAgentCount}/{AGENT_PROVIDERS.length} ready</span>
-                        </AgentReadyPill>
-                        <SecondaryButton disabled={agentStatusState === "checking"} onClick={refreshAgentStatuses} type="button">
-                          <ButtonRefreshIcon aria-hidden="true" />
-                          <span>{agentStatusState === "checking" ? "Checking..." : "Recheck"}</span>
-                        </SecondaryButton>
-                      </AgentPanelActions>
-                    </PanelHeaderRow>
+                    <SettingsSectionHeader>
+                      <span>Terminal harnesses</span>
+                      <em
+                        data-tone={connectedAgentCount === AGENT_PROVIDERS.length
+                          ? "green"
+                          : connectedAgentCount > 0
+                            ? "blue"
+                            : "orange"}
+                      >
+                        {connectedAgentCount}/{AGENT_PROVIDERS.length} ready
+                      </em>
+                      <SecondaryButton disabled={agentStatusState === "checking"} onClick={refreshAgentStatuses} type="button">
+                        <ButtonRefreshIcon aria-hidden="true" />
+                        <span>{agentStatusState === "checking" ? "Checking..." : "Recheck"}</span>
+                      </SecondaryButton>
+                    </SettingsSectionHeader>
 
                     {agentStatusError && <FormMessage $state="error">{agentStatusError}</FormMessage>}
 
@@ -50772,11 +51413,11 @@ export default function App() {
                                 )}
                               </AgentIcon>
                               <div>
-                                <AgentName>{agent.label}</AgentName>
+                                <AgentName data-agent={agent.id}>{agent.label}</AgentName>
                                 <AgentMeta>{agent.version}</AgentMeta>
                               </div>
                             </AgentCardHeader>
-                            <AgentStatusText>{agent.authMessage}</AgentStatusText>
+                            <AgentStatusText data-tone={getAgentTone(agent)}>{agent.authMessage}</AgentStatusText>
 
                             {!agent.installed && (
                               <AgentInstallPanel>
@@ -50975,12 +51616,12 @@ export default function App() {
                   </AgentSettingsPanel>
 
                   <AccountSettingsPanel>
-                    <PanelHeaderRow>
-                      <div>
-                        <PanelKicker>Workspaces</PanelKicker>
-                        <PanelHeading>Auto-activate workspace</PanelHeading>
-                      </div>
-                    </PanelHeaderRow>
+                    <SettingsSectionHeader>
+                      <span>Workspaces · Auto-activate</span>
+                      <em data-tone={activatedWorkspace ? "green" : "orange"}>
+                        {activatedWorkspace ? "Active" : "Idle"}
+                      </em>
+                    </SettingsSectionHeader>
 
                     <AccountCard data-tone={activatedWorkspace ? "blue" : "orange"}>
                       <AccountCardHeader>
@@ -50999,10 +51640,6 @@ export default function App() {
                             </SettingsHint>
                           </SetupField>
                         </div>
-                        <AgentReadyPill data-tone={activatedWorkspace ? "blue" : "orange"}>
-                          <ButtonTerminalIcon aria-hidden="true" />
-                          <span>{activatedWorkspace ? "Active" : "Idle"}</span>
-                        </AgentReadyPill>
                       </AccountCardHeader>
 
                       <SettingsIdentityGrid>
@@ -51050,12 +51687,10 @@ export default function App() {
 
                     </AccountSettingsPanel>
                   <AccountSettingsPanel>
-                    <PanelHeaderRow>
-                      <div>
-                        <PanelKicker>Account info</PanelKicker>
-                        <PanelHeading>Signed-in desktop account</PanelHeading>
-                      </div>
-                    </PanelHeaderRow>
+                    <SettingsSectionHeader>
+                      <span>Account · Signed-in desktop session</span>
+                      <em data-tone={userIsPaid ? "blue" : "orange"}>{planLabel} plan</em>
+                    </SettingsSectionHeader>
 
                     <AccountCard data-tone="blue">
                       <AccountCardHeader>
@@ -51064,10 +51699,6 @@ export default function App() {
                           <SettingsValue>{displayName}</SettingsValue>
                           <SettingsHint>Server-returned desktop session user.</SettingsHint>
                         </div>
-                        <AgentReadyPill data-tone={userIsPaid ? "blue" : "orange"}>
-                          <ButtonCheckIcon aria-hidden="true" />
-                          <span>{planLabel} plan</span>
-                        </AgentReadyPill>
                       </AccountCardHeader>
 
                       <SettingsIdentityGrid>
@@ -51145,30 +51776,20 @@ export default function App() {
                     </>
                   ) : (
                     <AccountSettingsPanel>
-                      <PanelHeaderRow>
-                        <div>
-                          <PanelKicker>Permissions</PanelKicker>
-                          <PanelHeading>Device access</PanelHeading>
-                        </div>
-                        <AgentPanelActions>
-                          <AgentReadyPill data-tone={settingsPermissionsAreLoading ? "orange" : "blue"}>
-                            {settingsPermissionsAreLoading ? (
-                              <PendingIcon aria-hidden="true" />
-                            ) : (
-                              <ButtonSecurityIcon aria-hidden="true" />
-                            )}
-                            <span>{settingsPermissionsAreLoading ? "Checking" : "Ready to check"}</span>
-                          </AgentReadyPill>
-                          <SecondaryButton
-                            disabled={settingsPermissionsAreLoading}
-                            onClick={loadSettingsPermissionState}
-                            type="button"
-                          >
-                            {settingsPermissionsAreLoading ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
-                            <span>{settingsPermissionsAreLoading ? "Checking..." : "Recheck"}</span>
-                          </SecondaryButton>
-                        </AgentPanelActions>
-                      </PanelHeaderRow>
+                      <SettingsSectionHeader>
+                        <span>Permissions · Device access</span>
+                        <em data-tone={settingsPermissionsAreLoading ? "orange" : "blue"}>
+                          {settingsPermissionsAreLoading ? "Checking" : "Ready to check"}
+                        </em>
+                        <SecondaryButton
+                          disabled={settingsPermissionsAreLoading}
+                          onClick={loadSettingsPermissionState}
+                          type="button"
+                        >
+                          {settingsPermissionsAreLoading ? <PendingIcon aria-hidden="true" /> : <ButtonRefreshIcon aria-hidden="true" />}
+                          <span>{settingsPermissionsAreLoading ? "Checking..." : "Recheck"}</span>
+                        </SecondaryButton>
+                      </SettingsSectionHeader>
 
                       {settingsPermissionState.error && (
                         <FormMessage $state="error">{settingsPermissionState.error}</FormMessage>
@@ -51454,6 +52075,7 @@ export default function App() {
                       onFocusWebTabPopout={focusWorkspaceWebTabPopout}
                       onPopOutWebTab={openWorkspaceWebTabPopout}
                       onReturnWebTabPopout={returnWorkspaceWebTabPopout}
+                      onWebTabNativeLabel={rememberWorkspaceWebTabNativeLabel}
                       onWebTabNavigate={rememberWorkspaceWebTabUrl}
                       webTabSession={selectedWorkspaceWebTabSession}
                       webviewObscured={workspaceNativeWebviewObscured}
@@ -51766,7 +52388,6 @@ export default function App() {
                               >
                                 <TodoQueuePanel
                                   accountKey={resolvedTokenomicsAccountKey}
-                                  activeWorkspaceToolId={accountWorkspaceToolTab}
                                   agentStatuses={agentStatuses}
                                   billingStatus={billingStatus}
                                   connectedDevices={cloudWorkspaceProgress.connectedDevices}
@@ -51795,7 +52416,6 @@ export default function App() {
                                   localDesktopProfile={cloudDesktopDeviceProfile}
                                   onBeginTodoDrag={selectedWorkspaceToolRuntimeBridge?.onBeginTodoDrag}
                                   onCancelQueuedItem={cancelAccountToolQueuedTodo}
-                                  onActiveWorkspaceToolChange={setAccountWorkspaceToolTab}
                                   onDraftChange={setAccountToolDraft}
                                   onMinimizePane={minimizeWorkspaceToolPane}
                                   onRefreshGitRepositories={refreshWorkspaceGitRepositoryPreload}
@@ -51822,6 +52442,8 @@ export default function App() {
                                   workspaceId={selectedWorkspace?.id || ""}
                                   workspaceScopedTabsEnabled={Boolean(selectedWorkspace)}
                                   workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
+                                  workspaceToolTabControlRef={accountWorkspaceToolTabControlRef}
+                                  workspaceToolTabMemoryRef={accountWorkspaceToolTabMemoryRef}
                                   windowBreakoutActive={Boolean(selectedWorkspaceToolRuntimeBridge?.windowBreakoutActive)}
                                 />
                               </div>

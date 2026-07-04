@@ -47,6 +47,7 @@ import {
   WEB_PANEL_CONTROL_EVENT,
   WEB_PANEL_CONTROL_NAVIGATE,
   WEB_PANEL_CONTROL_RETURN,
+  WEB_PANEL_WEBVIEW_PRESERVED_EVENT,
 } from "../web/webPanelBridge.js";
 import { ZoomIn } from "@styled-icons/material-rounded/ZoomIn";
 import { ZoomOut } from "@styled-icons/material-rounded/ZoomOut";
@@ -55,6 +56,7 @@ import { Smartphone as DeviceSmartphoneIcon } from "@styled-icons/material-round
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal, flushSync } from "react-dom";
 import styled, { keyframes } from "styled-components";
+import { getRenderabilitySnapshot, subscribeToRenderability } from "../app/renderability.js";
 
 import {
   ButtonAddIcon,
@@ -281,6 +283,7 @@ const TERMINAL_GRID_LAYOUT_SIGNATURE_LIMIT = 8;
 const TERMINAL_DOCUMENT_PANEL_ID = "workspace-document-panel";
 const TERMINAL_DOCUMENT_PANEL_KIND = "docs";
 const TERMINAL_GRID_MAX_BALANCED_COLUMNS = 3;
+const TERMINAL_GRID_DRAG_STRUCTURAL_HYSTERESIS_PX = 20;
 const TERMINAL_EMPTY_AGENT_LAUNCHERS = Object.freeze([
   { id: "codex", label: "Codex" },
   { id: "claude", label: "Claude Code" },
@@ -5707,11 +5710,13 @@ const orchestratorHistorySpinner = keyframes`
 
 const orchestratorHistorySendPulse = keyframes`
   0%, 100% {
-    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.22);
+    opacity: 0.42;
+    transform: scale(0.86);
   }
 
   50% {
-    box-shadow: 0 0 0 5px rgba(255, 255, 255, 0.06);
+    opacity: 0.12;
+    transform: scale(1.34);
   }
 `;
 
@@ -6269,6 +6274,7 @@ const OrchestratorHistorySendButton = styled.button`
   border-radius: 999px;
   color: #8d9aac;
   background: rgba(21, 27, 36, 0.94);
+  isolation: isolate;
   line-height: 1;
   outline: none;
   cursor: pointer;
@@ -6292,7 +6298,19 @@ const OrchestratorHistorySendButton = styled.button`
   }
 
   &[data-animated="true"] {
-    animation: ${orchestratorHistorySendPulse} 900ms ease-in-out infinite;
+    &::after {
+      content: "";
+      position: absolute;
+      inset: -5px;
+      z-index: -1;
+      border-radius: inherit;
+      background: rgba(255, 255, 255, 0.22);
+      opacity: 0.42;
+      transform: scale(0.86);
+      animation: ${orchestratorHistorySendPulse} 900ms ease-in-out infinite;
+      pointer-events: none;
+      will-change: opacity, transform;
+    }
   }
 
   &:disabled {
@@ -9034,10 +9052,20 @@ function insertTerminalInRows(rows, terminalIndex, target, options = {}) {
   }
 
   const rowIndex = Math.max(0, Math.min(Number.parseInt(target?.rowIndex, 10) || 0, withoutTerminal.length));
+  const newRow = target?.newRow === true;
   const nextRows = withoutTerminal.map((row) => row.terminalIndexes.slice());
 
-  if (rowIndex >= nextRows.length) {
+  if (newRow) {
+    nextRows.splice(rowIndex, 0, [paneKey]);
+  } else if (rowIndex >= nextRows.length) {
     nextRows.push([paneKey]);
+  } else if (nextRows[rowIndex].length >= TERMINAL_GRID_MAX_BALANCED_COLUMNS) {
+    const rawColumnIndex = Number.parseInt(target?.columnIndex, 10);
+    const fallbackRowIndex = Number.isInteger(rawColumnIndex)
+      && rawColumnIndex <= Math.floor(nextRows[rowIndex].length / 2)
+      ? rowIndex
+      : rowIndex + 1;
+    nextRows.splice(Math.max(0, Math.min(fallbackRowIndex, nextRows.length)), 0, [paneKey]);
   } else {
     const columnIndex = Math.max(
       0,
@@ -9319,7 +9347,7 @@ function getDragTargetFromPoint({
 }) {
   const rowOptions = { allowDocumentPanel: includeDocumentPanel };
   const draggedIdentity = terminalPaneLayoutKeyIdentity(draggedTerminalIndex);
-  const normalizedRows = cloneTerminalRows(rows, rowOptions);
+  const normalizedRows = removeTerminalFromRows(rows, draggedTerminalIndex, rowOptions);
   const rowMetrics = getRowsWithMetrics(
     normalizedRows,
     rects,
@@ -9344,6 +9372,21 @@ function getDragTargetFromPoint({
         continue;
       }
 
+      const topBandBottom = rect.top + rect.height * 0.25;
+      const bottomBandTop = rect.bottom - rect.height * 0.25;
+      if (clientY <= topBandBottom) {
+        return {
+          newRow: true,
+          rowIndex: position.rowIndex,
+        };
+      }
+      if (clientY >= bottomBandTop) {
+        return {
+          newRow: true,
+          rowIndex: position.rowIndex + 1,
+        };
+      }
+
       return {
         columnIndex: position.columnIndex + (clientX >= rect.left + rect.width / 2 ? 1 : 0),
         rowIndex: position.rowIndex,
@@ -9352,18 +9395,18 @@ function getDragTargetFromPoint({
   }
 
   if (!rowMetrics.length) {
-    return { columnIndex: 0, rowIndex: 0 };
+    return { newRow: true, rowIndex: 0 };
   }
 
   const firstRow = rowMetrics[0];
   const lastRow = rowMetrics[rowMetrics.length - 1];
 
   if (clientY < firstRow.top) {
-    return { columnIndex: 0, rowIndex: 0 };
+    return { newRow: true, rowIndex: 0 };
   }
 
   if (clientY > lastRow.bottom) {
-    return { columnIndex: 0, rowIndex: normalizedRows.length };
+    return { newRow: true, rowIndex: normalizedRows.length };
   }
 
   const nearestRow = rowMetrics.reduce((bestRow, row) => {
@@ -16908,11 +16951,42 @@ function OrchestratorVoiceCanvasRing({
 
   useEffect(() => {
     let disposed = false;
+    let renderable = getRenderabilitySnapshot().renderable;
 
-    const renderFrame = (timestamp) => {
-      if (disposed) {
+    const stopScheduledRender = () => {
+      if (animationFrameRef.current) {
+        window.cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = 0;
+      }
+      if (animationTimerRef.current) {
+        window.clearTimeout(animationTimerRef.current);
+        animationTimerRef.current = 0;
+      }
+    };
+
+    const scheduleRenderFrame = () => {
+      if (disposed || !renderable || animationFrameRef.current) {
         return;
       }
+      animationFrameRef.current = window.requestAnimationFrame(renderFrame);
+    };
+
+    const scheduleIdleRender = () => {
+      if (disposed || !renderable || animationTimerRef.current) {
+        return;
+      }
+      animationTimerRef.current = window.setTimeout(() => {
+        animationTimerRef.current = 0;
+        renderFrame(window.performance?.now?.() ?? Date.now());
+      }, 1000);
+    };
+
+    const renderFrame = (timestamp) => {
+      if (disposed || !renderable) {
+        animationFrameRef.current = 0;
+        return;
+      }
+      animationFrameRef.current = 0;
 
       const canvas = canvasRef.current;
       const context = canvas?.getContext?.("2d");
@@ -17030,27 +17104,27 @@ function OrchestratorVoiceCanvasRing({
         || currentWaveformRef.current.some((value) => Math.abs(value || 0) > 0.001)
         || smoothedEnvelopeRef.current.some((value) => Math.abs(value || 0) > 0.001);
       if (shouldAnimateContinuously) {
-        animationFrameRef.current = window.requestAnimationFrame(renderFrame);
+        scheduleRenderFrame();
         return;
       }
 
-      animationFrameRef.current = 0;
-      animationTimerRef.current = window.setTimeout(() => {
-        animationTimerRef.current = 0;
-        renderFrame(window.performance?.now?.() ?? Date.now());
-      }, 1000);
+      scheduleIdleRender();
     };
 
-    animationFrameRef.current = window.requestAnimationFrame(renderFrame);
+    const unsubscribeRenderability = subscribeToRenderability((nextSnapshot) => {
+      renderable = nextSnapshot.renderable;
+      if (renderable) {
+        scheduleRenderFrame();
+      } else {
+        stopScheduledRender();
+      }
+    });
+    scheduleRenderFrame();
 
     return () => {
       disposed = true;
-      if (animationFrameRef.current) {
-        window.cancelAnimationFrame(animationFrameRef.current);
-      }
-      if (animationTimerRef.current) {
-        window.clearTimeout(animationTimerRef.current);
-      }
+      unsubscribeRenderability();
+      stopScheduledRender();
     };
   }, []);
 
@@ -17132,6 +17206,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   documentPanelEnabled = false,
   workspaceScopedTabsEnabled = true,
   workspaceTodos = null,
+  workspaceToolTabControlRef = null,
+  workspaceToolTabMemoryRef = null,
   workspaces = [],
 }) {
   const orchestratorPanelWorkspaceId = workspaceId || workspace?.id || "";
@@ -17140,8 +17216,19 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     [orchestratorPanelWorkspaceId, rootDirectory],
   );
   const controlledWorkspaceToolId = String(activeWorkspaceToolId || "").trim();
-  const [uncontrolledActiveWorkspaceTool, setUncontrolledActiveWorkspaceTool] = useState("orchestrator");
+  // Tab state stays inside the panel so a tab click re-renders only this panel,
+  // never the shell/TerminalView monolith that renders it. Parents that need to
+  // switch tabs programmatically use workspaceToolTabControlRef, and
+  // workspaceToolTabMemoryRef preserves the active tab across remounts.
+  const [uncontrolledActiveWorkspaceTool, setUncontrolledActiveWorkspaceTool] = useState(() => (
+    String(workspaceToolTabMemoryRef?.current || "").trim() || "orchestrator"
+  ));
   const activeWorkspaceTool = controlledWorkspaceToolId || uncontrolledActiveWorkspaceTool || "orchestrator";
+  // Docs/Tokens keep-alive: once a tab has been visited its surface stays
+  // mounted (hidden via [hidden]) so switching back is instant instead of a
+  // full remount (store subscriptions, tokenomics polling setup, chart build).
+  const [visitedWorkspaceTools] = useState(() => new Set());
+  visitedWorkspaceTools.add(activeWorkspaceTool);
   const [spaceMode, setSpaceMode] = useState(getForgeSpaceMode);
   const loopspacesModeActive = spaceMode === "loopspaces";
   useEffect(() => {
@@ -17166,10 +17253,13 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   const commitWorkspaceToolTab = useCallback((toolId) => {
     const safeToolId = String(toolId || "").trim() || "orchestrator";
     setUncontrolledActiveWorkspaceTool(safeToolId);
+    if (workspaceToolTabMemoryRef) {
+      workspaceToolTabMemoryRef.current = safeToolId;
+    }
     if (typeof onActiveWorkspaceToolChange === "function") {
       onActiveWorkspaceToolChange(safeToolId);
     }
-  }, [onActiveWorkspaceToolChange]);
+  }, [onActiveWorkspaceToolChange, workspaceToolTabMemoryRef]);
   useEffect(() => {
     const loopspaceToolAvailable = LOOPSPACE_ONLY_WORKSPACE_TOOL_TAB_IDS.has(activeWorkspaceTool)
       && getForgeSpaceMode() === "loopspaces";
@@ -17187,6 +17277,24 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     commitWorkspaceToolTab(safeToolId);
     return true;
   }, [commitWorkspaceToolTab, workspaceToolTabs]);
+  useEffect(() => {
+    if (!workspaceToolTabControlRef) {
+      return undefined;
+    }
+    workspaceToolTabControlRef.current = selectWorkspaceToolTab;
+    // A programmatic switch can land between render and this effect (it writes
+    // the memory ref but finds the control ref still null) — reconcile so the
+    // request isn't dropped for the current mount.
+    const rememberedTool = String(workspaceToolTabMemoryRef?.current || "").trim();
+    if (rememberedTool && rememberedTool !== activeWorkspaceTool) {
+      selectWorkspaceToolTab(rememberedTool);
+    }
+    return () => {
+      if (workspaceToolTabControlRef.current === selectWorkspaceToolTab) {
+        workspaceToolTabControlRef.current = null;
+      }
+    };
+  }, [activeWorkspaceTool, selectWorkspaceToolTab, workspaceToolTabControlRef, workspaceToolTabMemoryRef]);
 
   // Prefetch account docs as soon as the orchestrator panel mounts so the Docs
   // tab opens instantly, never "loading".
@@ -21251,8 +21359,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           />
         </WorkspaceToolSurface>
       )}
-      {activeWorkspaceTool === "tools" ? (
-        <WorkspaceToolSurface data-tool="tools">
+      {visitedWorkspaceTools.has("tools") ? (
+        <WorkspaceToolSurface data-tool="tools" hidden={activeWorkspaceTool !== "tools"}>
           <WorkspaceToolsDragPanel
             coordinationTargets={coordinationTargets}
             documentPanelEnabled={documentPanelEnabled}
@@ -21261,7 +21369,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             workspaceId={workspace?.id || workspaceId || ""}
           />
         </WorkspaceToolSurface>
-      ) : activeWorkspaceTool === "triggers" && loopspacesModeActive ? (
+      ) : null}
+      {activeWorkspaceTool === "triggers" && loopspacesModeActive ? (
         <WorkspaceToolSurface data-tool="triggers">
           <LoopspaceTriggersPanel />
         </WorkspaceToolSurface>
@@ -22391,8 +22500,8 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             ) : null}
           </OrchestratorContent>
         </OrchestratorView>
-      {activeWorkspaceTool === "tokenomics" ? (
-        <WorkspaceToolSurface data-tool="tokenomics">
+      {visitedWorkspaceTools.has("tokenomics") ? (
+        <WorkspaceToolSurface data-tool="tokenomics" hidden={activeWorkspaceTool !== "tokenomics"}>
           <AccountTokenomicsView
             accountKey={accountKey}
             billingStatus={billingStatus}
@@ -23074,9 +23183,15 @@ function TerminalView({
   // navigation) so the grid pane resumes there after the window returns.
   const webPaneUrlsRef = useRef({});
   // Bumped per pane when it returns from a breakout window so the in-grid
-  // WebPane remounts at the synced URL.
+  // WebPane remounts at the synced URL. Only the fallback path when no living
+  // webview survived to adopt (see webPaneAdoptions).
   const [webPaneResumeNonces, setWebPaneResumeNonces] = useState({});
   const [webPaneCommands, setWebPaneCommands] = useState({});
+  // Current native webview label per web pane (reported by the pane's hook and
+  // by the breakout window). On return the grid pane ADOPTS this living webview
+  // — same page, same session, no reload — instead of remounting.
+  const webPaneNativeLabelsRef = useRef({});
+  const [webPaneAdoptions, setWebPaneAdoptions] = useState({});
   // PCB panes popped out into their own native panel windows.
   const [pcbBreakoutPanes, setPcbBreakoutPanes] = useState({});
   const pcbBreakoutPanesRef = useRef(pcbBreakoutPanes);
@@ -23210,7 +23325,11 @@ function TerminalView({
   const [todoQueueDispatchRevision, setTodoQueueDispatchRevision] = useState(0);
   const [todoDispatchStartupReconcileActive, setTodoDispatchStartupReconcileActive] = useState(true);
   const [todoQueuePaneMode, setTodoQueuePaneMode] = useState(TODO_QUEUE_PANE_MODE_NORMAL);
-  const [activeWorkspaceToolTab, setActiveWorkspaceToolTab] = useState("orchestrator");
+  // The active tools-panel tab lives inside TodoQueuePanel; TerminalView only
+  // keeps refs so programmatic tab switches (remote-control bridge) reach the
+  // panel without a TerminalView-wide re-render per tab click.
+  const workspaceToolTabControlRef = useRef(null);
+  const workspaceToolTabMemoryRef = useRef("orchestrator");
   const [appBackgroundMode, setAppBackgroundMode] = useState(false);
   const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
   const workspaceToolPortaled = Boolean(workspaceToolPortalTarget);
@@ -23228,7 +23347,8 @@ function TerminalView({
       return false;
     }
 
-    setActiveWorkspaceToolTab(safeToolId);
+    workspaceToolTabMemoryRef.current = safeToolId;
+    workspaceToolTabControlRef.current?.(safeToolId);
     return true;
   }, [workspaceScopedToolTabsEnabled]);
   // No terminal tabs: every terminal is always visible in the resize grid
@@ -25423,24 +25543,43 @@ function TerminalView({
     }
 
     let cancelled = false;
+    let intervalId = 0;
+    let unsubscribeRenderability = null;
     const load = (silent = false) => {
-      // Skip the poll when nobody is looking: cancelled, hidden window, or the
-      // app isn't focused (user is in another app). It resumes on the next tick.
-      if (
-        cancelled
-        || document.visibilityState === "hidden"
-        || (typeof document.hasFocus === "function" && !document.hasFocus())
-      ) {
+      if (cancelled || !getRenderabilitySnapshot().renderable) {
         return;
       }
       void loadTerminalBreakoutActivitySnapshots(terminalBreakoutActivityTargets, { silent });
     };
-    load(false);
-    const intervalId = window.setInterval(() => load(true), TERMINAL_BREAKOUT_ACTIVITY_REFRESH_MS);
+    const stopInterval = () => {
+      if (intervalId) {
+        window.clearInterval(intervalId);
+        intervalId = 0;
+      }
+    };
+    const startInterval = (silent = false) => {
+      if (intervalId || !getRenderabilitySnapshot().renderable) {
+        return;
+      }
+      load(silent);
+      intervalId = window.setInterval(() => load(true), TERMINAL_BREAKOUT_ACTIVITY_REFRESH_MS);
+    };
+
+    startInterval(false);
+    unsubscribeRenderability = subscribeToRenderability((nextSnapshot) => {
+      if (nextSnapshot.renderable) {
+        startInterval(true);
+      } else {
+        stopInterval();
+      }
+    });
 
     return () => {
       cancelled = true;
-      window.clearInterval(intervalId);
+      stopInterval();
+      if (typeof unsubscribeRenderability === "function") {
+        unsubscribeRenderability();
+      }
     };
   }, [
     loadTerminalBreakoutActivitySnapshots,
@@ -29179,6 +29318,33 @@ function TerminalView({
     }
   }, []);
 
+  // Track the current native webview label per web pane. Fed by the in-grid
+  // pane's hook, by breakout-window control events, and by the Rust preserved
+  // event — whichever last owned the living webview.
+  const rememberWebPaneNativeLabel = useCallback((paneId, label) => {
+    const safePaneId = String(paneId || "").trim();
+    if (!safePaneId) {
+      return;
+    }
+    const safeLabel = String(label || "").trim();
+    const next = { ...webPaneNativeLabelsRef.current };
+    if (safeLabel) {
+      next[safePaneId] = safeLabel;
+    } else {
+      delete next[safePaneId];
+    }
+    webPaneNativeLabelsRef.current = next;
+  }, []);
+
+  const handleWebPaneNativeLabelChange = useCallback((paneId, label) => {
+    // While popped out the grid hook is suspended and keeps its stale label;
+    // the breakout window is authoritative then, so ignore grid-side updates.
+    if (webBreakoutPanesRef.current[String(paneId || "").trim()]) {
+      return;
+    }
+    rememberWebPaneNativeLabel(paneId, label);
+  }, [rememberWebPaneNativeLabel]);
+
   const sendWebPaneCommand = useCallback((paneId, command = {}) => {
     const safePaneId = String(paneId || "").trim();
     if (!safePaneId) {
@@ -29323,6 +29489,8 @@ function TerminalView({
     try {
       const rect = terminalLayoutRectsRef.current?.[terminalIndex] || null;
       const result = await invoke("web_panel_open", {
+        // Hand the pane's living webview to the window (reparent, no reload).
+        adoptLabel: webPaneNativeLabelsRef.current[safePaneId] || "",
         height: rect?.height || null,
         paneId: safePaneId,
         theme: document.documentElement?.dataset?.forgeTheme || "",
@@ -29348,7 +29516,8 @@ function TerminalView({
       return;
     }
 
-    const hadLabel = Boolean(webPanelLabelsRef.current[safePaneId]);
+    const label = String(webPanelLabelsRef.current[safePaneId] || "").trim();
+    const hadLabel = Boolean(label);
     const wasPoppedOut = Boolean(webBreakoutPanesRef.current[safePaneId]);
 
     if (hadLabel) {
@@ -29374,10 +29543,33 @@ function TerminalView({
 
     if (hadLabel || wasPoppedOut) {
       restoreWorkspacePaneIfMinimized(safePaneId);
-      setWebPaneResumeNonces((current) => ({
-        ...current,
-        [safePaneId]: (current[safePaneId] || 0) + 1,
-      }));
+      const nativeLabel = String(webPaneNativeLabelsRef.current[safePaneId] || "").trim();
+      if (nativeLabel) {
+        // The window's living webview survived (or was preserved by Rust on
+        // close): adopt it back — same page, same session, no reload.
+        setWebPaneAdoptions((current) => ({
+          ...current,
+          [safePaneId]: {
+            label: nativeLabel,
+            nonce: (current[safePaneId]?.nonce || 0) + 1,
+          },
+        }));
+      } else {
+        // No webview to adopt; remount fresh at the last synced URL.
+        setWebPaneResumeNonces((current) => ({
+          ...current,
+          [safePaneId]: (current[safePaneId] || 0) + 1,
+        }));
+      }
+    }
+
+    if (label) {
+      invoke("web_panel_close", { label }).catch(() => {});
+    } else if (wasPoppedOut) {
+      emit(WEB_PANEL_COMMAND_EVENT, {
+        action: "return",
+        paneId: safePaneId,
+      }).catch(() => {});
     }
   }, [restoreWorkspacePaneIfMinimized]);
 
@@ -29412,6 +29604,7 @@ function TerminalView({
       return;
     }
     const wasPoppedOut = Boolean(pcbBreakoutPanesRef.current[safePaneId]);
+    const panelWorkspaceId = String(pcbPanelWorkspaceIdsRef.current[safePaneId] || terminalWorkspace?.id || "").trim();
     const hadBreakoutSync = Boolean(pcbPaneBreakoutSyncRef.current[safePaneId]);
     const dropSyncedState = options?.dropSyncedState === true || !wasPoppedOut || !hadBreakoutSync;
     if ((wasPoppedOut || hadBreakoutSync) && dropSyncedState) {
@@ -29454,7 +29647,10 @@ function TerminalView({
         [safePaneId]: (current[safePaneId] || 0) + 1,
       }));
     }
-  }, [restoreWorkspacePaneIfMinimized]);
+    if (wasPoppedOut && panelWorkspaceId) {
+      invoke("pcb_panel_close", { paneId: safePaneId, workspaceId: panelWorkspaceId }).catch(() => {});
+    }
+  }, [restoreWorkspacePaneIfMinimized, terminalWorkspace?.id]);
 
   const popOutPcbPanelForIndex = useCallback(async (terminalIndex, paneId) => {
     const safePaneId = String(paneId || "").trim();
@@ -29527,6 +29723,7 @@ function TerminalView({
       return;
     }
     const wasPoppedOut = Boolean(videoBreakoutPanesRef.current[safePaneId]);
+    const panelWorkspaceId = String(videoPanelWorkspaceIdsRef.current[safePaneId] || terminalWorkspace?.id || "").trim();
     const hadBreakoutSync = Boolean(videoPaneBreakoutSyncRef.current[safePaneId]);
     const dropSyncedState = options?.dropSyncedState === true || !wasPoppedOut || !hadBreakoutSync;
     if ((wasPoppedOut || hadBreakoutSync) && dropSyncedState) {
@@ -29569,7 +29766,10 @@ function TerminalView({
         [safePaneId]: (current[safePaneId] || 0) + 1,
       }));
     }
-  }, [restoreWorkspacePaneIfMinimized]);
+    if (wasPoppedOut && panelWorkspaceId) {
+      invoke("video_panel_close", { paneId: safePaneId, workspaceId: panelWorkspaceId }).catch(() => {});
+    }
+  }, [restoreWorkspacePaneIfMinimized, terminalWorkspace?.id]);
 
   const popOutVideoPanelForIndex = useCallback(async (terminalIndex, paneId) => {
     const safePaneId = String(paneId || "").trim();
@@ -29680,6 +29880,9 @@ function TerminalView({
       if (!paneId || isWorkspaceWebTabPaneId(paneId)) {
         return;
       }
+      if (payload.webviewLabel) {
+        rememberWebPaneNativeLabel(paneId, payload.webviewLabel);
+      }
       if (control === WEB_PANEL_CONTROL_NAVIGATE) {
         rememberWebPaneUrl(paneId, payload.url);
         return;
@@ -29701,7 +29904,44 @@ function TerminalView({
       disposed = true;
       unlisten();
     };
-  }, [rememberWebPaneUrl, returnWebPanelToGrid]);
+  }, [rememberWebPaneNativeLabel, rememberWebPaneUrl, returnWebPanelToGrid]);
+
+  // Rust preserved this window's living webview (reparented to main, hidden)
+  // just before the window closed — remember its label so the grid pane adopts
+  // it instead of reloading.
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+
+    listen(WEB_PANEL_WEBVIEW_PRESERVED_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      const paneId = String(payload.paneId || "").trim();
+      if (!paneId || isWorkspaceWebTabPaneId(paneId)) {
+        return;
+      }
+      const labels = Array.isArray(payload.webviewLabels) ? payload.webviewLabels : [];
+      const label = String(labels[0] || "").trim();
+      if (label) {
+        rememberWebPaneNativeLabel(paneId, label);
+      }
+    })
+      .then((nextUnlisten) => {
+        if (disposed) {
+          nextUnlisten();
+          return;
+        }
+        unlisten = nextUnlisten;
+      })
+      .catch(() => {});
+
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [rememberWebPaneNativeLabel]);
 
   // A PCB panel window closing returns the pane to the grid and remounts it so
   // it rereads the selected board written by the pop-out window.
@@ -29939,8 +30179,16 @@ function TerminalView({
         invoke("web_panel_close", { label }).catch(() => {});
       }
       clearWebPanelBreakout(paneId);
+      // The pane is gone for good: also close its native webview (the window
+      // close above preserved it parked on the main window; nothing will ever
+      // adopt it back).
+      const nativeLabel = String(webPaneNativeLabelsRef.current[paneId] || "").trim();
+      if (nativeLabel) {
+        invoke("workspace_webview_close", { label: nativeLabel }).catch(() => {});
+        rememberWebPaneNativeLabel(paneId, "");
+      }
     });
-  }, [clearWebPanelBreakout, getTerminalPaneId, logicalTerminalIndexes]);
+  }, [clearWebPanelBreakout, getTerminalPaneId, logicalTerminalIndexes, rememberWebPaneNativeLabel]);
 
   // Close PCB panel windows whose panes no longer exist.
   useEffect(() => {
@@ -38045,15 +38293,28 @@ function TerminalView({
           terminalIndexes: logicalTerminalIndexesRef.current,
         },
       );
+      const rowCompareOptions = {
+        allowDocumentPanel: workspaceDocumentPanelAvailableRef.current,
+        terminalIndexes: logicalTerminalIndexesRef.current,
+      };
+      const structuralChange = !areTerminalRowsEqual(currentDrag.previewRows, nextPreviewRows, rowCompareOptions);
+      const lastStructuralChange = currentDrag.lastStructuralChange || null;
+      const structuralDistance = lastStructuralChange
+        ? Math.hypot(
+          Number(event.clientX || 0) - Number(lastStructuralChange.x || 0),
+          Number(event.clientY || 0) - Number(lastStructuralChange.y || 0),
+        )
+        : Infinity;
+      const acceptStructuralChange = structuralChange
+        && (!lastStructuralChange || structuralDistance >= TERMINAL_GRID_DRAG_STRUCTURAL_HYSTERESIS_PX);
+      const previewRows = acceptStructuralChange ? nextPreviewRows : currentDrag.previewRows;
 
       updateTerminalDragState({
         ...currentDrag,
-        previewRows: areTerminalRowsEqual(currentDrag.previewRows, nextPreviewRows, {
-          allowDocumentPanel: workspaceDocumentPanelAvailableRef.current,
-          terminalIndexes: logicalTerminalIndexesRef.current,
-        })
-          ? currentDrag.previewRows
-          : nextPreviewRows,
+        lastStructuralChange: acceptStructuralChange
+          ? { x: event.clientX, y: event.clientY }
+          : lastStructuralChange,
+        previewRows,
         x: event.clientX - containerRect.left - currentDrag.offsetX,
         y: event.clientY - containerRect.top - currentDrag.offsetY,
       });
@@ -38335,6 +38596,7 @@ function TerminalView({
     const nextState = {
       containerRect,
       height: Number(sourceRect.height || 0),
+      lastStructuralChange: null,
       offsetX,
       offsetY,
       paneId: event.paneId || "",
@@ -39767,6 +40029,9 @@ function TerminalView({
                   layoutKey={webLayoutKey}
                   poppedOut={Boolean(webBreakoutPanes[terminalPaneId])}
                   webviewObscured={workspaceWebviewObscured}
+                  adoptLabel={webPaneAdoptions[terminalPaneId]?.label || ""}
+                  adoptNonce={webPaneAdoptions[terminalPaneId]?.nonce || 0}
+                  onNativeLabelChange={handleWebPaneNativeLabelChange}
                   onDragHandlePointerDown={(event, index, pid) => {
                     if (event.button !== 0) {
                       return;
@@ -40904,7 +41169,6 @@ function TerminalView({
       <TodoQueuePanel
         accountKey={accountKey}
         activeDragItemId={todoDragState?.itemId || ""}
-        activeWorkspaceToolId={activeWorkspaceToolTab}
         agentStatuses={agentStatuses}
         agentStatusError={agentStatusError}
         agentStatusState={agentStatusState}
@@ -40931,7 +41195,6 @@ function TerminalView({
         onCancelQueuedItem={cancelQueuedTodoQueueItem}
         onCancelVoicePlan={handleCancelVoicePlan}
         onCancelVoicePlanTask={handleCancelVoicePlanTask}
-        onActiveWorkspaceToolChange={setActiveWorkspaceToolTab}
         onDraftChange={setTodoQueueDraft}
         onDispatchTodoToTarget={dispatchTodoQueueItemToTarget}
         onMinimizePane={minimizeTodoQueuePane}
@@ -40969,6 +41232,8 @@ function TerminalView({
         workspaceId={terminalWorkspace?.id || ""}
         workspaceScopedTabsEnabled={workspaceScopedToolTabsEnabled}
         workspaceTodos={workspaceTodos}
+        workspaceToolTabControlRef={workspaceToolTabControlRef}
+        workspaceToolTabMemoryRef={workspaceToolTabMemoryRef}
         workspaces={workspaces}
       />
     )

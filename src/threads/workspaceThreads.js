@@ -4349,6 +4349,59 @@ function workspaceThreadsJsonEqual(left, right) {
   }
 }
 
+const WORKSPACE_THREAD_ACTIVITY_STAMP_THROTTLE_MS = 1000;
+const WORKSPACE_THREAD_ACTIVITY_STAMP_KEYS = new Set([
+  "hookHealthObservedAtMs",
+  "hook_health_observed_at_ms",
+  "updatedAt",
+  "updated_at",
+]);
+
+function workspaceThreadActivityStamplessValue(value) {
+  if (Array.isArray(value)) {
+    return value.map((item) => workspaceThreadActivityStamplessValue(item));
+  }
+  if (!value || typeof value !== "object") {
+    return value;
+  }
+
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !WORKSPACE_THREAD_ACTIVITY_STAMP_KEYS.has(key))
+      .map(([key, item]) => [key, workspaceThreadActivityStamplessValue(item)]),
+  );
+}
+
+function workspaceThreadActivitySemanticallyEqual(left, right) {
+  return workspaceThreadsJsonEqual(
+    workspaceThreadActivityStamplessValue(left),
+    workspaceThreadActivityStamplessValue(right),
+  );
+}
+
+function workspaceThreadActivityStampMs(value) {
+  if (!value || typeof value !== "object") {
+    return 0;
+  }
+  const updatedAtMs = Date.parse(value.updatedAt || value.updated_at || "");
+  const hookObservedAtMs = Number(value.hookHealthObservedAtMs || value.hook_health_observed_at_ms || 0);
+  return Math.max(
+    Number.isFinite(updatedAtMs) ? updatedAtMs : 0,
+    Number.isFinite(hookObservedAtMs) ? hookObservedAtMs : 0,
+  );
+}
+
+function workspaceThreadIdenticalActivityStampIsThrottled(now, ...records) {
+  const nowMs = Date.parse(now || "");
+  if (!Number.isFinite(nowMs) || nowMs <= 0) {
+    return false;
+  }
+  const previousMs = records.reduce((latest, record) => (
+    Math.max(latest, workspaceThreadActivityStampMs(record))
+  ), 0);
+  return previousMs > 0 && nowMs - previousMs < WORKSPACE_THREAD_ACTIVITY_STAMP_THROTTLE_MS;
+}
+
 function workspaceThreadPersistRows(currentRows, previousRows) {
   const rows = [];
   Object.entries(currentRows || {}).forEach(([threadId, thread]) => {
@@ -7505,7 +7558,9 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
   };
   const terminalKey = getTerminalKeyForEvent(entry, event);
   const terminals = { ...entry.terminals };
+  let previousTerminal = null;
   if (terminalKey && terminals[terminalKey]) {
+    previousTerminal = terminals[terminalKey];
     const terminalPromptingFields = promptingUserFieldsForTerminalEvent(event, terminals[terminalKey], {
       clear: terminalReadinessIgnoredEvent ? false : !inputReady || marksInputReady,
       eventType,
@@ -7527,6 +7582,36 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
       updatedAt: now,
     };
   }
+  const nextThreadActivityStatus = existing.currentAgent === agentId ? activityStatus : existing.activityStatus;
+  const nextThreadStatus = existing.currentAgent === agentId && eventStatus ? eventStatus : existing.status;
+  const threadSemanticallyUnchanged = workspaceThreadActivitySemanticallyEqual(
+    {
+      activityStatus: existing.activityStatus,
+      providerBindings: existing.providerBindings,
+      status: existing.status,
+    },
+    {
+      activityStatus: nextThreadActivityStatus,
+      providerBindings,
+      status: nextThreadStatus,
+    },
+  );
+  const terminalSemanticallyUnchanged = !previousTerminal || workspaceThreadActivitySemanticallyEqual(
+    previousTerminal,
+    terminals[terminalKey],
+  );
+  if (
+    threadSemanticallyUnchanged
+    && terminalSemanticallyUnchanged
+    && workspaceThreadIdenticalActivityStampIsThrottled(
+      now,
+      existing,
+      previousProviderBinding,
+      previousTerminal,
+    )
+  ) {
+    return state || {};
+  }
 
   return {
     ...currentState,
@@ -7537,9 +7622,9 @@ export function markWorkspaceThreadAgentActivity(state, event = {}) {
         ...entry.threads,
         [threadId]: {
           ...existing,
-          activityStatus: existing.currentAgent === agentId ? activityStatus : existing.activityStatus,
+          activityStatus: nextThreadActivityStatus,
           providerBindings,
-          status: existing.currentAgent === agentId && eventStatus ? eventStatus : existing.status,
+          status: nextThreadStatus,
           updatedAt: now,
         },
       },

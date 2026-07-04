@@ -29,10 +29,14 @@ const TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS: u64 = 7 * 24 * 60 * 60;
 const TOKENOMICS_CLAUDE_USAGE_CACHE_KEY_PREFIX: &str = "claude_usage_api_cache:";
 const TOKENOMICS_CLAUDE_USAGE_CACHE_TTL_SECS: u64 = 5 * 60;
 const TOKENOMICS_CLAUDE_USAGE_CACHE_STALE_SECS: u64 = 30 * 60;
+const TOKENOMICS_CLAUDE_USER_AGENT_CACHE_TTL_SECS: u64 = 60 * 60;
+const TOKENOMICS_PROVIDER_LIMIT_RECENT_USAGE_SECS: u64 = 7 * 24 * 60 * 60;
 const TOKENOMICS_SUMMARY_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_LIVE_LIMITS_CACHE_TTL_MS: u64 = 60_000;
-const TOKENOMICS_PERIODIC_PROVIDER_REFRESH_INTERVAL_MS: u64 = 60 * 1000;
+const TOKENOMICS_PERIODIC_SAMPLE_INTERVAL_MS: u64 = 60 * 1000;
+const TOKENOMICS_PERIODIC_PROVIDER_REFRESH_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_PERIODIC_SOURCE_DISCOVERY_INTERVAL_MS: u64 = 5 * 60 * 1000;
+const TOKENOMICS_PERIODIC_CANDIDATE_DISCOVERY_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_PERIODIC_FINGERPRINT_FILES_PER_ROOT: usize = 16;
 const TOKENOMICS_PERIODIC_SENTINEL_MAX_ENTRIES_PER_ROOT: usize = 512;
 const TOKENOMICS_PERIODIC_SENTINEL_MAX_DEPTH: usize = 3;
@@ -44,6 +48,7 @@ const TOKENOMICS_CLOUD_PROVIDER_LIMITS_KEY: &str = "cloud_provider_limits";
 const TOKENOMICS_LIMITS_CHANGED_SYNC_REASON: &str = "tokenomics_limits_changed";
 const TOKENOMICS_DEVICE_IDENTITIES_KEY: &str = "device_identities";
 const TOKENOMICS_CLOUD_ACCOUNT_SYNC_CURSOR_KEY_PREFIX: &str = "cloud_account_sync_cursor:";
+const TOKENOMICS_CODEX_USAGE_CACHE_ALIAS_KEY_PREFIX: &str = "codex_usage_api_cache_alias:";
 static TOKENOMICS_SCAN_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TOKENOMICS_DB_WRITE_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TOKENOMICS_SUMMARY_CACHE: OnceLock<StdMutex<Option<TokenomicsSummaryCacheEntry>>> =
@@ -51,6 +56,12 @@ static TOKENOMICS_SUMMARY_CACHE: OnceLock<StdMutex<Option<TokenomicsSummaryCache
 static TOKENOMICS_LIVE_LIMITS_CACHE: OnceLock<StdMutex<Option<TokenomicsLiveLimitsCacheEntry>>> =
     OnceLock::new();
 static TOKENOMICS_PERIODIC_GATE: OnceLock<StdMutex<TokenomicsPeriodicGateState>> = OnceLock::new();
+static TOKENOMICS_PERIODIC_CANDIDATE_DISCOVERY_CACHE: OnceLock<
+    StdMutex<HashMap<String, TokenomicsPeriodicCandidateDiscoveryCacheEntry>>,
+> = OnceLock::new();
+static TOKENOMICS_CLAUDE_USER_AGENT_CACHE: OnceLock<
+    StdMutex<Option<TokenomicsClaudeUserAgentCacheEntry>>,
+> = OnceLock::new();
 
 #[derive(Clone)]
 struct TokenomicsSummaryCacheEntry {
@@ -66,6 +77,11 @@ struct TokenomicsLiveLimitsCacheEntry {
     summary: Value,
 }
 
+struct TokenomicsClaudeUserAgentCacheEntry {
+    cached_at: Instant,
+    user_agent: String,
+}
+
 #[derive(Clone, Default, PartialEq, Eq)]
 struct TokenomicsPeriodicInputFingerprint {
     hash: String,
@@ -78,6 +94,7 @@ struct TokenomicsPeriodicInputFingerprint {
 struct TokenomicsPeriodicGateState {
     fingerprint: Option<TokenomicsPeriodicInputFingerprint>,
     last_run_ms: u64,
+    last_provider_refresh_ms: u64,
     known_paths: Vec<PathBuf>,
     source_sentinel_hash: String,
     last_discovery_ms: u64,
@@ -90,7 +107,16 @@ struct TokenomicsPeriodicGateDecision {
     fingerprint: TokenomicsPeriodicInputFingerprint,
 }
 
-use std::io::{BufRead as _, Seek as _};
+#[derive(Clone)]
+struct TokenomicsPeriodicCandidateDiscoveryCacheEntry {
+    sentinel_hash: String,
+    latest_modified_ms: u64,
+    total_bytes: u64,
+    cached_at_ms: u64,
+    files: Vec<PathBuf>,
+}
+
+use std::io::Seek as _;
 
 #[tauri::command]
 async fn tokenomics_scan_usage(
@@ -333,6 +359,36 @@ fn tokenomics_with_db_write_lock<T>(
     operation()
 }
 
+fn tokenomics_with_db_write_transaction<T>(
+    conn: &mut rusqlite::Connection,
+    context: &str,
+    operation: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, String>,
+) -> Result<T, String> {
+    let _guard = if conn.is_autocommit() {
+        Some(match tokenomics_db_write_lock().lock() {
+            Ok(guard) => guard,
+            Err(error) => error.into_inner(),
+        })
+    } else {
+        None
+    };
+    let transaction = conn
+        .transaction()
+        .map_err(|error| format!("Unable to start {context}: {error}"))?;
+    match operation(&transaction) {
+        Ok(value) => {
+            transaction
+                .commit()
+                .map_err(|error| format!("Unable to commit {context}: {error}"))?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = transaction.rollback();
+            Err(error)
+        }
+    }
+}
+
 fn tokenomics_sqlite_error_is_locked(error: &rusqlite::Error) -> bool {
     matches!(
         error.sqlite_error_code(),
@@ -548,12 +604,14 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
 	           scanner_version TEXT NOT NULL,
 	           last_line_index INTEGER NOT NULL DEFAULT -1,
 	           last_byte_offset INTEGER NOT NULL DEFAULT 0,
-	           resume_fingerprint TEXT NOT NULL DEFAULT '',
-	           last_seen_mtime INTEGER NOT NULL DEFAULT 0,
-	           last_seen_size INTEGER NOT NULL DEFAULT 0,
-	           last_event_timestamp INTEGER NOT NULL DEFAULT 0,
-	           coverage_start_unix INTEGER NOT NULL DEFAULT 9223372036854775807,
-	           updated_at TEXT NOT NULL,
+		           resume_fingerprint TEXT NOT NULL DEFAULT '',
+		           last_seen_mtime INTEGER NOT NULL DEFAULT 0,
+		           last_seen_size INTEGER NOT NULL DEFAULT 0,
+		           last_seen_file_dev INTEGER,
+		           last_seen_file_ino INTEGER,
+		           last_event_timestamp INTEGER NOT NULL DEFAULT 0,
+		           coverage_start_unix INTEGER NOT NULL DEFAULT 9223372036854775807,
+		           updated_at TEXT NOT NULL,
 	           PRIMARY KEY(provider, agent_kind, source_path)
 	         );
 	         CREATE TABLE IF NOT EXISTS tokenomics_source_imports(
@@ -568,11 +626,13 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
 	           last_event_timestamp INTEGER NOT NULL DEFAULT 0,
 	           last_line_index INTEGER NOT NULL DEFAULT -1,
 	           last_byte_offset INTEGER NOT NULL DEFAULT 0,
-	           resume_fingerprint TEXT NOT NULL DEFAULT '',
-	           last_seen_mtime INTEGER NOT NULL DEFAULT 0,
-	           last_seen_size INTEGER NOT NULL DEFAULT 0,
-	           coverage_start_unix INTEGER NOT NULL DEFAULT 9223372036854775807,
-	           event_count INTEGER NOT NULL DEFAULT 0,
+		           resume_fingerprint TEXT NOT NULL DEFAULT '',
+		           last_seen_mtime INTEGER NOT NULL DEFAULT 0,
+		           last_seen_size INTEGER NOT NULL DEFAULT 0,
+		           last_seen_file_dev INTEGER,
+		           last_seen_file_ino INTEGER,
+		           coverage_start_unix INTEGER NOT NULL DEFAULT 9223372036854775807,
+		           event_count INTEGER NOT NULL DEFAULT 0,
 	           raw_available INTEGER NOT NULL DEFAULT 1,
 	           raw_deleted_at TEXT,
 	           import_status TEXT NOT NULL DEFAULT 'unknown',
@@ -658,6 +718,12 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
         "INTEGER NOT NULL DEFAULT 9223372036854775807",
     )?;
     for (column, column_type) in [
+        ("last_seen_file_dev", "INTEGER"),
+        ("last_seen_file_ino", "INTEGER"),
+    ] {
+        tokenomics_ensure_column(conn, "tokenomics_source_offsets", column, column_type)?;
+    }
+    for (column, column_type) in [
         ("source_id", "TEXT NOT NULL DEFAULT ''"),
         ("source_session_id", "TEXT"),
         ("source_kind", "TEXT NOT NULL DEFAULT 'jsonl'"),
@@ -668,6 +734,8 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
         ("resume_fingerprint", "TEXT NOT NULL DEFAULT ''"),
         ("last_seen_mtime", "INTEGER NOT NULL DEFAULT 0"),
         ("last_seen_size", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_seen_file_dev", "INTEGER"),
+        ("last_seen_file_ino", "INTEGER"),
         (
             "coverage_start_unix",
             "INTEGER NOT NULL DEFAULT 9223372036854775807",
@@ -919,9 +987,10 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
          CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_subscription_label ON tokenomics_cloud_rollups(provider, agent_kind, subscription_key, provider_account_label);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_cloud_rollups_scope ON tokenomics_cloud_rollups(billing_scope_type, billing_team_id, bucket_width, bucket_start);
          CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_observed ON tokenomics_usage_events(observed_at);
-	         CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_source_path ON tokenomics_usage_events(provider, agent_kind, source_path);
-	         CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_account_label ON tokenomics_usage_events(provider, agent_kind, provider_account_key, provider_account_label);
-	         CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_subscription_label ON tokenomics_usage_events(provider, agent_kind, subscription_key, provider_account_label);
+         CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_bucket_account ON tokenomics_usage_events(bucket_hour, provider, agent_kind, provider_account_key, subscription_key);
+		         CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_source_path ON tokenomics_usage_events(provider, agent_kind, source_path);
+		         CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_account_label ON tokenomics_usage_events(provider, agent_kind, provider_account_key, provider_account_label);
+		         CREATE INDEX IF NOT EXISTS idx_tokenomics_usage_events_subscription_label ON tokenomics_usage_events(provider, agent_kind, subscription_key, provider_account_label);
 	         CREATE INDEX IF NOT EXISTS idx_tokenomics_source_offsets_provider ON tokenomics_source_offsets(provider, agent_kind, updated_at);
 	         CREATE INDEX IF NOT EXISTS idx_tokenomics_source_imports_provider ON tokenomics_source_imports(provider, agent_kind, updated_at);
 	         CREATE INDEX IF NOT EXISTS idx_tokenomics_source_imports_raw ON tokenomics_source_imports(raw_available, import_status, event_count);
@@ -973,6 +1042,7 @@ fn tokenomics_live_limits_snapshot_from_conn_with_options(
     let recorded_samples = tokenomics_record_provider_limit_samples(conn, &limits)?;
     tokenomics_apply_provider_limit_sample_pacing(conn, &mut limits)?;
     let recorded_windows = tokenomics_record_latest_windows(conn, &limits)?;
+    tokenomics_strip_provider_limit_refresh_mode(&mut limits);
     tokenomics_invalidate_summary_snapshots(conn)?;
     tokenomics_clear_summary_cache();
     let scope = tokenomics_current_billing_scope();
@@ -1691,7 +1761,64 @@ fn tokenomics_periodic_fingerprint_from_paths(paths: &[PathBuf]) -> TokenomicsPe
     }
 }
 
-fn tokenomics_periodic_discover_input_paths() -> Vec<PathBuf> {
+fn tokenomics_periodic_candidate_cache(
+) -> &'static StdMutex<HashMap<String, TokenomicsPeriodicCandidateDiscoveryCacheEntry>> {
+    TOKENOMICS_PERIODIC_CANDIDATE_DISCOVERY_CACHE.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn tokenomics_periodic_root_fingerprint(root: &Path) -> (u64, u64) {
+    fs::metadata(root)
+        .ok()
+        .map(|metadata| (tokenomics_metadata_modified_ms(&metadata), metadata.len()))
+        .unwrap_or((0, 0))
+}
+
+fn tokenomics_collect_periodic_candidate_files(
+    root: &Path,
+    limit: usize,
+    min_modified_unix: Option<u64>,
+    sentinel_hash: &str,
+) -> Vec<PathBuf> {
+    let now = current_time_ms();
+    let (latest_modified_ms, total_bytes) = tokenomics_periodic_root_fingerprint(root);
+    let cache_key = format!(
+        "{}\u{1f}{limit}\u{1f}{}",
+        root.display(),
+        min_modified_unix.unwrap_or(0)
+    );
+    if let Ok(cache) = tokenomics_periodic_candidate_cache().lock() {
+        if let Some(entry) = cache.get(&cache_key) {
+            if entry.sentinel_hash == sentinel_hash
+                && entry.latest_modified_ms == latest_modified_ms
+                && entry.total_bytes == total_bytes
+                && now.saturating_sub(entry.cached_at_ms)
+                    < TOKENOMICS_PERIODIC_CANDIDATE_DISCOVERY_CACHE_TTL_MS
+            {
+                return entry.files.clone();
+            }
+        }
+    }
+
+    let files = tokenomics_collect_candidate_files_with_min_mtime(root, limit, min_modified_unix);
+    if let Ok(mut cache) = tokenomics_periodic_candidate_cache().lock() {
+        if cache.len() > 128 {
+            cache.clear();
+        }
+        cache.insert(
+            cache_key,
+            TokenomicsPeriodicCandidateDiscoveryCacheEntry {
+                sentinel_hash: sentinel_hash.to_string(),
+                latest_modified_ms,
+                total_bytes,
+                cached_at_ms: now,
+                files: files.clone(),
+            },
+        );
+    }
+    files
+}
+
+fn tokenomics_periodic_discover_input_paths(source_sentinel_hash: &str) -> Vec<PathBuf> {
     let _span = BackendCpuSpan::new("tokenomics.periodic_discover_inputs");
     let mut paths = Vec::new();
     let mut seen = HashSet::new();
@@ -1709,10 +1836,11 @@ fn tokenomics_periodic_discover_input_paths() -> Vec<PathBuf> {
 
     for source in tokenomics_sources() {
         for root in source.roots {
-            let candidates = tokenomics_collect_candidate_files_with_min_mtime(
+            let candidates = tokenomics_collect_periodic_candidate_files(
                 &root,
                 TOKENOMICS_PERIODIC_FINGERPRINT_FILES_PER_ROOT,
                 None,
+                source_sentinel_hash,
             );
             for path in candidates {
                 add_path(path);
@@ -1803,7 +1931,7 @@ fn tokenomics_periodic_gate_decision() -> TokenomicsPeriodicGateDecision {
         || now.saturating_sub(previous_discovery_ms)
             >= TOKENOMICS_PERIODIC_SOURCE_DISCOVERY_INTERVAL_MS;
     let known_paths = if discovery_due {
-        tokenomics_periodic_discover_input_paths()
+        tokenomics_periodic_discover_input_paths(&source_sentinel_hash)
     } else {
         previous_known_paths
     };
@@ -1822,9 +1950,12 @@ fn tokenomics_periodic_gate_decision() -> TokenomicsPeriodicGateDecision {
         .as_ref()
         .map(|previous| previous != &fingerprint)
         .unwrap_or(true);
-    let provider_refresh_due = state.last_run_ms == 0
-        || now.saturating_sub(state.last_run_ms) >= TOKENOMICS_PERIODIC_PROVIDER_REFRESH_INTERVAL_MS;
-    let should_run = scan_inputs_changed || provider_refresh_due;
+    let cycle_due = state.last_run_ms == 0
+        || now.saturating_sub(state.last_run_ms) >= TOKENOMICS_PERIODIC_SAMPLE_INTERVAL_MS;
+    let provider_refresh_due = state.last_provider_refresh_ms == 0
+        || now.saturating_sub(state.last_provider_refresh_ms)
+            >= TOKENOMICS_PERIODIC_PROVIDER_REFRESH_INTERVAL_MS;
+    let should_run = scan_inputs_changed || cycle_due || provider_refresh_due;
     if discovery_due {
         state.known_paths = known_paths;
         state.source_sentinel_hash = source_sentinel_hash;
@@ -1833,6 +1964,9 @@ fn tokenomics_periodic_gate_decision() -> TokenomicsPeriodicGateDecision {
     if should_run {
         state.fingerprint = Some(fingerprint.clone());
         state.last_run_ms = now;
+        if provider_refresh_due {
+            state.last_provider_refresh_ms = now;
+        }
     }
 
     TokenomicsPeriodicGateDecision {
@@ -1841,6 +1975,26 @@ fn tokenomics_periodic_gate_decision() -> TokenomicsPeriodicGateDecision {
         provider_refresh_due,
         fingerprint,
     }
+}
+
+fn tokenomics_periodic_gate_forget_fingerprint(fingerprint_hash: &str) {
+    let Ok(mut state) = tokenomics_periodic_gate().lock() else {
+        return;
+    };
+    if state
+        .fingerprint
+        .as_ref()
+        .is_some_and(|fingerprint| fingerprint.hash == fingerprint_hash)
+    {
+        state.fingerprint = None;
+    }
+}
+
+fn tokenomics_periodic_gate_defer_provider_refresh() {
+    let Ok(mut state) = tokenomics_periodic_gate().lock() else {
+        return;
+    };
+    state.last_provider_refresh_ms = 0;
 }
 
 fn tokenomics_clear_summary_cache() {
@@ -2049,6 +2203,7 @@ fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String
                     "backend.tokenomics.periodic_token_scan_failed",
                     json!({ "error": error }),
                 );
+                tokenomics_periodic_gate_forget_fingerprint(&gate.fingerprint.hash);
                 "error"
             }
         }
@@ -2056,6 +2211,9 @@ fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String
         "skipped_unchanged"
     };
     if token_scan == "already_running" {
+        if gate.provider_refresh_due {
+            tokenomics_periodic_gate_defer_provider_refresh();
+        }
         return Ok(json!({
             "token_scan": token_scan,
             "recorded_samples": 0,
@@ -2071,6 +2229,9 @@ fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String
     {
         Ok(guard) => guard,
         Err(std::sync::TryLockError::WouldBlock) => {
+            if gate.provider_refresh_due {
+                tokenomics_periodic_gate_defer_provider_refresh();
+            }
             return Ok(json!({
                 "token_scan": "already_running",
                 "recorded_samples": 0,
@@ -2083,7 +2244,7 @@ fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String
         Err(std::sync::TryLockError::Poisoned(error)) => error.into_inner(),
     };
 
-    let conn = tokenomics_open_db(app)?;
+    let mut conn = tokenomics_open_db(app)?;
     tokenomics_reconcile_current_provider_accounts(&conn)?;
     // include_cloud_last_known = false  -> ignore inbound server tokenomics.
     // include_stale_provider_cache = false -> only stamp freshly observed %s
@@ -2091,12 +2252,19 @@ fn tokenomics_run_periodic_sample_cycle(app: &AppHandle) -> Result<Value, String
     // reconcile_accounts = true -> keep provider-account identity current.
     let mut limits =
         tokenomics_provider_limits(&conn, false, false, gate.provider_refresh_due, true)?;
-    let recorded_samples = tokenomics_record_provider_limit_samples(&conn, &limits)?;
-    tokenomics_apply_provider_limit_sample_pacing(&conn, &mut limits)?;
-    let recorded_windows = tokenomics_record_latest_windows(&conn, &limits)?;
-    // Drop the stored summary snapshot so the next UI read regenerates from the
-    // freshly stamped windows instead of returning a stale cached payload.
-    tokenomics_invalidate_summary_snapshots(&conn)?;
+    let (recorded_samples, recorded_windows) = tokenomics_with_db_write_transaction(
+        &mut conn,
+        "Tokenomics periodic provider limit write batch",
+        |transaction| {
+            let recorded_samples = tokenomics_record_provider_limit_samples(transaction, &limits)?;
+            tokenomics_apply_provider_limit_sample_pacing(transaction, &mut limits)?;
+            let recorded_windows = tokenomics_record_latest_windows(transaction, &limits)?;
+            // Drop the stored summary snapshot so the next UI read regenerates from the
+            // freshly stamped windows instead of returning a stale cached payload.
+            tokenomics_invalidate_summary_snapshots(transaction)?;
+            Ok((recorded_samples, recorded_windows))
+        },
+    )?;
     drop(conn);
     tokenomics_clear_summary_cache();
 
@@ -2288,6 +2456,138 @@ fn tokenomics_purge_retired_limit_samples(
     Ok(())
 }
 
+struct TokenomicsProviderLimitRefreshScope {
+    force_all: bool,
+    codex_active_profile_id: String,
+    claude_active_profile_id: String,
+    recent_account_keys: HashSet<String>,
+}
+
+impl TokenomicsProviderLimitRefreshScope {
+    fn active_profile_id(&self, agent_kind: &str) -> &str {
+        if agent_kind == "claude" {
+            self.claude_active_profile_id.as_str()
+        } else {
+            self.codex_active_profile_id.as_str()
+        }
+    }
+
+    fn should_fetch_live_for_account_keys(
+        &self,
+        provider: &str,
+        agent_kind: &str,
+        profile_id: &str,
+        provider_account_keys: &[String],
+    ) -> bool {
+        if self.force_all || profile_id == self.active_profile_id(agent_kind) {
+            return true;
+        }
+        provider_account_keys.iter().any(|provider_account_key| {
+            self.recent_account_keys
+                .contains(&tokenomics_provider_limit_recent_account_key(
+                    provider,
+                    agent_kind,
+                    provider_account_key,
+                ))
+        })
+    }
+}
+
+fn tokenomics_provider_limit_recent_account_key(
+    provider: &str,
+    agent_kind: &str,
+    provider_account_key: &str,
+) -> String {
+    format!(
+        "{}\u{1f}{}\u{1f}{}",
+        provider.trim().to_ascii_lowercase(),
+        agent_kind.trim().to_ascii_lowercase(),
+        provider_account_key.trim()
+    )
+}
+
+fn tokenomics_recent_local_usage_account_keys(
+    conn: &rusqlite::Connection,
+) -> Result<HashSet<String>, String> {
+    let cutoff = tokenomics_unix_now().saturating_sub(TOKENOMICS_PROVIDER_LIMIT_RECENT_USAGE_SECS);
+    let (_, cutoff_hour) = tokenomics_utc_hour_bucket_from_unix(cutoff);
+    let mut statement = conn
+        .prepare(
+            "SELECT provider, agent_kind, account_key
+             FROM (
+               SELECT provider,
+                      agent_kind,
+                      COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, '')) AS account_key
+               FROM tokenomics_rollups
+               WHERE bucket_width='hour'
+                 AND bucket_start >= ?1
+                 AND COALESCE(total_tokens, 0) > 0
+                 AND ((provider='openai' AND agent_kind='codex')
+                   OR (provider='anthropic' AND agent_kind='claude'))
+               UNION ALL
+               SELECT provider,
+                      agent_kind,
+                      COALESCE(NULLIF(provider_account_key, ''), NULLIF(subscription_key, '')) AS account_key
+               FROM tokenomics_usage_events
+               WHERE bucket_hour >= ?1
+                 AND COALESCE(total_tokens, 0) > 0
+                 AND ((provider='openai' AND agent_kind='codex')
+                   OR (provider='anthropic' AND agent_kind='claude'))
+             )
+             WHERE account_key IS NOT NULL
+               AND TRIM(account_key) != ''
+               AND LOWER(TRIM(account_key)) NOT LIKE '%:unknown'",
+        )
+        .map_err(|error| format!("Unable to prepare recent Tokenomics usage account query: {error}"))?;
+    let rows = statement
+        .query_map(rusqlite::params![cutoff_hour.as_str()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|error| format!("Unable to query recent Tokenomics usage accounts: {error}"))?;
+    let mut keys = HashSet::new();
+    for row in rows {
+        let (provider, agent_kind, provider_account_key) =
+            row.map_err(|error| format!("Unable to read recent usage account row: {error}"))?;
+        let provider = provider.trim().to_ascii_lowercase();
+        let agent_kind = agent_kind.trim().to_ascii_lowercase();
+        if !matches!(
+            (provider.as_str(), agent_kind.as_str()),
+            ("openai", "codex") | ("anthropic", "claude")
+        ) {
+            continue;
+        }
+        keys.insert(tokenomics_provider_limit_recent_account_key(
+            &provider,
+            &agent_kind,
+            &provider_account_key,
+        ));
+    }
+    Ok(keys)
+}
+
+fn tokenomics_provider_limit_refresh_scope(
+    conn: &rusqlite::Connection,
+    force_provider_refresh: bool,
+    codex_active_profile_id: &str,
+    claude_active_profile_id: &str,
+) -> Result<TokenomicsProviderLimitRefreshScope, String> {
+    let recent_account_keys = if force_provider_refresh {
+        HashSet::new()
+    } else {
+        tokenomics_recent_local_usage_account_keys(conn)?
+    };
+    Ok(TokenomicsProviderLimitRefreshScope {
+        force_all: force_provider_refresh,
+        codex_active_profile_id: codex_active_profile_id.to_string(),
+        claude_active_profile_id: claude_active_profile_id.to_string(),
+        recent_account_keys,
+    })
+}
+
 #[derive(Clone)]
 struct TokenomicsProviderAccount {
     key: String,
@@ -2386,6 +2686,40 @@ fn tokenomics_tag_limit_agent_profile(
         object.insert("activeAgentProfile".to_string(), json!(active));
         object.insert("active_provider_account".to_string(), json!(active));
         object.insert("activeProviderAccount".to_string(), json!(active));
+    }
+}
+
+fn tokenomics_tag_dormant_cached_provider_limits(limits: &mut [Value]) {
+    for limit in limits {
+        let Some(object) = limit.as_object_mut() else {
+            continue;
+        };
+        object.insert(
+            "provider_limit_refresh_mode".to_string(),
+            json!("cached_dormant"),
+        );
+        object.insert(
+            "providerLimitRefreshMode".to_string(),
+            json!("cached_dormant"),
+        );
+    }
+}
+
+fn tokenomics_provider_limit_is_dormant_cached(limit: &Value) -> bool {
+    tokenomics_value_string(
+        limit,
+        &["provider_limit_refresh_mode", "providerLimitRefreshMode"],
+    )
+    .is_some_and(|value| value == "cached_dormant")
+}
+
+fn tokenomics_strip_provider_limit_refresh_mode(limits: &mut [Value]) {
+    for limit in limits {
+        let Some(object) = limit.as_object_mut() else {
+            continue;
+        };
+        object.remove("provider_limit_refresh_mode");
+        object.remove("providerLimitRefreshMode");
     }
 }
 
@@ -3553,8 +3887,23 @@ struct TokenomicsSourceOffset {
     resume_fingerprint: String,
     last_seen_mtime: u64,
     last_seen_size: u64,
+    last_seen_file_dev: Option<u64>,
+    last_seen_file_ino: Option<u64>,
     last_event_timestamp: u64,
     coverage_start_unix: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TokenomicsSourceFileIdentity {
+    dev: u64,
+    ino: u64,
+}
+
+#[derive(Clone, Copy)]
+struct TokenomicsSourceFileSnapshot {
+    mtime: u64,
+    size: u64,
+    identity: Option<TokenomicsSourceFileIdentity>,
 }
 
 fn tokenomics_delete_provider_rows(
@@ -4598,6 +4947,11 @@ fn tokenomics_reconcile_codex_provider_account_from_usage(
             provider_account.key.as_str(),
             &canonical_account,
         )?;
+        tokenomics_store_codex_usage_cache_alias(
+            conn,
+            provider_account.key.as_str(),
+            canonical_account.key.as_str(),
+        )?;
     }
     tokenomics_reconcile_provider_account_label(conn, "openai", "codex", &canonical_account)?;
     let canonical_cache_key = tokenomics_codex_usage_cache_key(&canonical_account);
@@ -4948,9 +5302,9 @@ fn tokenomics_normalize_unix_timestamp(value: i64) -> u64 {
     }
 }
 
-fn tokenomics_file_mtime_size(path: &Path) -> (u64, u64) {
+fn tokenomics_file_snapshot(path: &Path) -> Option<TokenomicsSourceFileSnapshot> {
     let Ok(metadata) = fs::metadata(path) else {
-        return (0, 0);
+        return None;
     };
     let modified = metadata
         .modified()
@@ -4958,7 +5312,66 @@ fn tokenomics_file_mtime_size(path: &Path) -> (u64, u64) {
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
         .unwrap_or(0);
-    (modified, metadata.len())
+    Some(TokenomicsSourceFileSnapshot {
+        mtime: modified,
+        size: metadata.len(),
+        identity: tokenomics_file_identity(&metadata),
+    })
+}
+
+#[cfg(unix)]
+fn tokenomics_file_identity(metadata: &fs::Metadata) -> Option<TokenomicsSourceFileIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some(TokenomicsSourceFileIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn tokenomics_file_identity(_metadata: &fs::Metadata) -> Option<TokenomicsSourceFileIdentity> {
+    None
+}
+
+fn tokenomics_file_mtime_size(path: &Path) -> (u64, u64) {
+    tokenomics_file_snapshot(path)
+        .map(|snapshot| (snapshot.mtime, snapshot.size))
+        .unwrap_or((0, 0))
+}
+
+fn tokenomics_file_identity_parts(
+    snapshot: Option<TokenomicsSourceFileSnapshot>,
+) -> (Option<i64>, Option<i64>) {
+    let Some(identity) = snapshot.and_then(|snapshot| snapshot.identity) else {
+        return (None, None);
+    };
+    (
+        Some(identity.dev.min(i64::MAX as u64) as i64),
+        Some(identity.ino.min(i64::MAX as u64) as i64),
+    )
+}
+
+fn tokenomics_source_offset_identity_matches(
+    offset: &TokenomicsSourceOffset,
+    snapshot: &TokenomicsSourceFileSnapshot,
+) -> bool {
+    match (
+        offset.last_seen_file_dev,
+        offset.last_seen_file_ino,
+        snapshot.identity,
+    ) {
+        (Some(dev), Some(ino), Some(identity)) => identity.dev == dev && identity.ino == ino,
+        _ => true,
+    }
+}
+
+fn tokenomics_source_offset_metadata_unchanged(
+    offset: &TokenomicsSourceOffset,
+    snapshot: &TokenomicsSourceFileSnapshot,
+) -> bool {
+    offset.last_seen_mtime == snapshot.mtime
+        && offset.last_seen_size == snapshot.size
+        && tokenomics_source_offset_identity_matches(offset, snapshot)
 }
 
 fn tokenomics_source_resume_fingerprint(path: &Path, byte_offset: u64) -> String {
@@ -4988,15 +5401,26 @@ fn tokenomics_source_offset_can_resume(
     scanner_version: &str,
     required_coverage_start_unix: u64,
 ) -> bool {
-    let (mtime, size) = tokenomics_file_mtime_size(path);
-    offset.scanner_version == scanner_version
-        && offset.coverage_start_unix <= required_coverage_start_unix
-        && size >= offset.last_seen_size
-        && mtime >= offset.last_seen_mtime
-        && offset.last_byte_offset <= size
-        && !offset.resume_fingerprint.is_empty()
-        && tokenomics_source_resume_fingerprint(path, offset.last_byte_offset)
-            == offset.resume_fingerprint
+    let Some(snapshot) = tokenomics_file_snapshot(path) else {
+        return offset.scanner_version == scanner_version
+            && offset.coverage_start_unix <= required_coverage_start_unix
+            && !offset.resume_fingerprint.is_empty()
+            && tokenomics_source_resume_fingerprint(path, offset.last_byte_offset)
+                == offset.resume_fingerprint;
+    };
+    if offset.scanner_version != scanner_version
+        || offset.coverage_start_unix > required_coverage_start_unix
+        || snapshot.size < offset.last_seen_size
+        || snapshot.mtime < offset.last_seen_mtime
+        || offset.last_byte_offset > snapshot.size
+        || offset.resume_fingerprint.is_empty()
+    {
+        return false;
+    }
+    if tokenomics_source_offset_metadata_unchanged(offset, &snapshot) {
+        return true;
+    }
+    tokenomics_source_resume_fingerprint(path, offset.last_byte_offset) == offset.resume_fingerprint
 }
 
 fn tokenomics_jsonl_line_has_terminator(line: &str) -> bool {
@@ -5259,7 +5683,9 @@ fn tokenomics_get_source_offset(
 ) -> Result<Option<TokenomicsSourceOffset>, String> {
     let source_path = path.display().to_string();
     match conn.query_row(
-        "SELECT scanner_version, last_line_index, last_byte_offset, resume_fingerprint, last_seen_mtime, last_seen_size, last_event_timestamp, coverage_start_unix
+        "SELECT scanner_version, last_line_index, last_byte_offset, resume_fingerprint,
+                last_seen_mtime, last_seen_size, last_seen_file_dev, last_seen_file_ino,
+                last_event_timestamp, coverage_start_unix
          FROM tokenomics_source_offsets
          WHERE provider=?1 AND agent_kind=?2 AND source_path=?3",
         rusqlite::params![provider, agent_kind, source_path],
@@ -5271,9 +5697,19 @@ fn tokenomics_get_source_offset(
                 resume_fingerprint: row.get::<_, String>(3).unwrap_or_default(),
                 last_seen_mtime: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
                 last_seen_size: row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
-                last_event_timestamp: row.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
+                last_seen_file_dev: row
+                    .get::<_, Option<i64>>(6)
+                    .ok()
+                    .flatten()
+                    .map(|value| value.max(0) as u64),
+                last_seen_file_ino: row
+                    .get::<_, Option<i64>>(7)
+                    .ok()
+                    .flatten()
+                    .map(|value| value.max(0) as u64),
+                last_event_timestamp: row.get::<_, i64>(8).unwrap_or(0).max(0) as u64,
                 coverage_start_unix: row
-                    .get::<_, i64>(7)
+                    .get::<_, i64>(9)
                     .unwrap_or(TOKENOMICS_UNKNOWN_OFFSET_COVERAGE_START_UNIX as i64)
                     .max(0) as u64,
             })
@@ -5293,7 +5729,9 @@ fn tokenomics_get_source_import_offset(
 ) -> Result<Option<TokenomicsSourceOffset>, String> {
     let source_path = path.display().to_string();
     match conn.query_row(
-        "SELECT scanner_version, last_line_index, last_byte_offset, resume_fingerprint, last_seen_mtime, last_seen_size, last_event_timestamp, coverage_start_unix
+        "SELECT scanner_version, last_line_index, last_byte_offset, resume_fingerprint,
+                last_seen_mtime, last_seen_size, last_seen_file_dev, last_seen_file_ino,
+                last_event_timestamp, coverage_start_unix
          FROM tokenomics_source_imports
          WHERE provider=?1
            AND agent_kind=?2
@@ -5309,9 +5747,19 @@ fn tokenomics_get_source_import_offset(
                 resume_fingerprint: row.get::<_, String>(3).unwrap_or_default(),
                 last_seen_mtime: row.get::<_, i64>(4).unwrap_or(0).max(0) as u64,
                 last_seen_size: row.get::<_, i64>(5).unwrap_or(0).max(0) as u64,
-                last_event_timestamp: row.get::<_, i64>(6).unwrap_or(0).max(0) as u64,
+                last_seen_file_dev: row
+                    .get::<_, Option<i64>>(6)
+                    .ok()
+                    .flatten()
+                    .map(|value| value.max(0) as u64),
+                last_seen_file_ino: row
+                    .get::<_, Option<i64>>(7)
+                    .ok()
+                    .flatten()
+                    .map(|value| value.max(0) as u64),
+                last_event_timestamp: row.get::<_, i64>(8).unwrap_or(0).max(0) as u64,
                 coverage_start_unix: row
-                    .get::<_, i64>(7)
+                    .get::<_, i64>(9)
                     .unwrap_or(TOKENOMICS_UNKNOWN_OFFSET_COVERAGE_START_UNIX as i64)
                     .max(0) as u64,
             })
@@ -5409,7 +5857,11 @@ fn tokenomics_upsert_source_offset_with_byte_offset(
     last_event_timestamp: u64,
     coverage_start_unix: u64,
 ) -> Result<(), String> {
-    let (last_seen_mtime, last_seen_size) = tokenomics_file_mtime_size(path);
+    let file_snapshot = tokenomics_file_snapshot(path);
+    let (last_seen_mtime, last_seen_size) = file_snapshot
+        .map(|snapshot| (snapshot.mtime, snapshot.size))
+        .unwrap_or((0, 0));
+    let (last_seen_file_dev, last_seen_file_ino) = tokenomics_file_identity_parts(file_snapshot);
     let last_byte_offset = last_byte_offset.min(last_seen_size);
     let resume_fingerprint = tokenomics_source_resume_fingerprint(path, last_byte_offset);
     let source_path = path.display().to_string();
@@ -5420,17 +5872,20 @@ fn tokenomics_upsert_source_offset_with_byte_offset(
                 "INSERT INTO tokenomics_source_offsets(
                    provider, agent_kind, source_path, scanner_version, last_line_index,
                    last_byte_offset, resume_fingerprint, last_seen_mtime, last_seen_size,
-                   last_event_timestamp, coverage_start_unix, updated_at
-                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                   last_seen_file_dev, last_seen_file_ino, last_event_timestamp,
+                   coverage_start_unix, updated_at
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                  ON CONFLICT(provider, agent_kind, source_path)
                  DO UPDATE SET
                    scanner_version=excluded.scanner_version,
                    last_line_index=excluded.last_line_index,
                    last_byte_offset=excluded.last_byte_offset,
-                   resume_fingerprint=excluded.resume_fingerprint,
-                   last_seen_mtime=excluded.last_seen_mtime,
-                   last_seen_size=excluded.last_seen_size,
-                   last_event_timestamp=excluded.last_event_timestamp,
+	                   resume_fingerprint=excluded.resume_fingerprint,
+	                   last_seen_mtime=excluded.last_seen_mtime,
+	                   last_seen_size=excluded.last_seen_size,
+	                   last_seen_file_dev=excluded.last_seen_file_dev,
+	                   last_seen_file_ino=excluded.last_seen_file_ino,
+	                   last_event_timestamp=excluded.last_event_timestamp,
                    coverage_start_unix=CASE
                      WHEN tokenomics_source_offsets.scanner_version=excluded.scanner_version
                      THEN MIN(tokenomics_source_offsets.coverage_start_unix, excluded.coverage_start_unix)
@@ -5447,6 +5902,8 @@ fn tokenomics_upsert_source_offset_with_byte_offset(
                     resume_fingerprint.as_str(),
                     last_seen_mtime as i64,
                     last_seen_size as i64,
+                    last_seen_file_dev,
+                    last_seen_file_ino,
                     last_event_timestamp as i64,
                     coverage_start_unix.min(TOKENOMICS_UNKNOWN_OFFSET_COVERAGE_START_UNIX) as i64,
                     now.as_str(),
@@ -5543,7 +6000,11 @@ fn tokenomics_upsert_source_import(
     scan: &TokenomicsFileScanResult,
     coverage_start_unix: u64,
 ) -> Result<(), String> {
-    let (last_seen_mtime, last_seen_size) = tokenomics_file_mtime_size(path);
+    let file_snapshot = tokenomics_file_snapshot(path);
+    let (last_seen_mtime, last_seen_size) = file_snapshot
+        .map(|snapshot| (snapshot.mtime, snapshot.size))
+        .unwrap_or((0, 0));
+    let (last_seen_file_dev, last_seen_file_ino) = tokenomics_file_identity_parts(file_snapshot);
     let last_byte_offset = scan.last_byte_offset.min(last_seen_size);
     let resume_fingerprint = tokenomics_source_resume_fingerprint(path, last_byte_offset);
     let source_path = path.display().to_string();
@@ -5584,8 +6045,9 @@ fn tokenomics_upsert_source_import(
            provider, agent_kind, source_path, source_id, source_session_id, source_kind,
            scanner_version, first_event_timestamp, last_event_timestamp, last_line_index,
            last_byte_offset, resume_fingerprint, last_seen_mtime, last_seen_size,
-           coverage_start_unix, event_count, raw_available, raw_deleted_at, import_status, updated_at
-         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, 1, NULL, ?17, ?18)
+           last_seen_file_dev, last_seen_file_ino, coverage_start_unix, event_count,
+           raw_available, raw_deleted_at, import_status, updated_at
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, 1, NULL, ?19, ?20)
          ON CONFLICT(provider, agent_kind, source_path)
          DO UPDATE SET
            source_id=excluded.source_id,
@@ -5602,10 +6064,12 @@ fn tokenomics_upsert_source_import(
            last_event_timestamp=MAX(tokenomics_source_imports.last_event_timestamp, excluded.last_event_timestamp),
            last_line_index=excluded.last_line_index,
            last_byte_offset=excluded.last_byte_offset,
-           resume_fingerprint=excluded.resume_fingerprint,
-           last_seen_mtime=excluded.last_seen_mtime,
-           last_seen_size=excluded.last_seen_size,
-           coverage_start_unix=CASE
+	           resume_fingerprint=excluded.resume_fingerprint,
+	           last_seen_mtime=excluded.last_seen_mtime,
+	           last_seen_size=excluded.last_seen_size,
+	           last_seen_file_dev=excluded.last_seen_file_dev,
+	           last_seen_file_ino=excluded.last_seen_file_ino,
+	           coverage_start_unix=CASE
              WHEN tokenomics_source_imports.scanner_version=excluded.scanner_version
              THEN MIN(tokenomics_source_imports.coverage_start_unix, excluded.coverage_start_unix)
              ELSE excluded.coverage_start_unix
@@ -5630,6 +6094,8 @@ fn tokenomics_upsert_source_import(
             resume_fingerprint,
             last_seen_mtime as i64,
             last_seen_size as i64,
+            last_seen_file_dev,
+            last_seen_file_ino,
             coverage_start_unix.min(TOKENOMICS_UNKNOWN_OFFSET_COVERAGE_START_UNIX) as i64,
             event_count,
             import_status,
@@ -5755,14 +6221,26 @@ fn tokenomics_source_offset_is_current_for_range(
     scanner_version: &str,
     required_coverage_start_unix: u64,
 ) -> bool {
-    let (mtime, size) = tokenomics_file_mtime_size(path);
-    offset.scanner_version == scanner_version
-        && offset.last_seen_mtime == mtime
-        && offset.last_seen_size == size
-        && offset.coverage_start_unix <= required_coverage_start_unix
-        && !offset.resume_fingerprint.is_empty()
-        && tokenomics_source_resume_fingerprint(path, offset.last_byte_offset)
-            == offset.resume_fingerprint
+    let Some(snapshot) = tokenomics_file_snapshot(path) else {
+        return offset.scanner_version == scanner_version
+            && offset.coverage_start_unix <= required_coverage_start_unix
+            && !offset.resume_fingerprint.is_empty()
+            && tokenomics_source_resume_fingerprint(path, offset.last_byte_offset)
+                == offset.resume_fingerprint;
+    };
+    if offset.scanner_version != scanner_version
+        || offset.coverage_start_unix > required_coverage_start_unix
+        || offset.resume_fingerprint.is_empty()
+    {
+        return false;
+    }
+    if offset.last_seen_size != snapshot.size {
+        return false;
+    }
+    if tokenomics_source_offset_metadata_unchanged(offset, &snapshot) {
+        return true;
+    }
+    tokenomics_source_resume_fingerprint(path, offset.last_byte_offset) == offset.resume_fingerprint
 }
 
 fn tokenomics_scan_day_is_complete(
@@ -9259,7 +9737,9 @@ fn tokenomics_record_latest_windows(
     let device_id = tokenomics_local_device_id();
     let mut count = 0usize;
     for limit in limits.iter().take(128) {
-        if tokenomics_provider_limit_is_unknown(limit) {
+        if tokenomics_provider_limit_is_unknown(limit)
+            || tokenomics_provider_limit_is_dormant_cached(limit)
+        {
             continue;
         }
         if tokenomics_upsert_latest_window(conn, limit, &fallback_scope, &device_id, Some("local"))?
@@ -9928,7 +10408,9 @@ fn tokenomics_record_provider_limit_samples(
     let device_id = tokenomics_local_device_id();
     let mut count = 0usize;
     for limit in limits.iter().take(32) {
-        if tokenomics_provider_limit_is_unknown(limit) {
+        if tokenomics_provider_limit_is_unknown(limit)
+            || tokenomics_provider_limit_is_dormant_cached(limit)
+        {
             continue;
         }
         if tokenomics_upsert_provider_limit_sample(
@@ -12305,16 +12787,36 @@ fn tokenomics_provider_limits(
     reconcile_accounts: bool,
 ) -> Result<Vec<Value>, String> {
     let mut limits = Vec::new();
+    let mut fetch_memo = TokenomicsProviderUsageFetchMemo::default();
 
     let codex_active_profile_id = agent_accounts_active_profile_id_for_tokenomics("codex");
+    let claude_active_profile_id = agent_accounts_active_profile_id_for_tokenomics("claude");
+    let refresh_scope = tokenomics_provider_limit_refresh_scope(
+        conn,
+        force_provider_refresh,
+        &codex_active_profile_id,
+        &claude_active_profile_id,
+    )?;
     let codex_plan = tokenomics_codex_plan_state();
     let codex_account = tokenomics_provider_account("openai", "codex");
+    let codex_refresh_keys =
+        tokenomics_provider_account_refresh_keys(conn, "openai", "codex", &codex_account);
+    let codex_should_fetch_live = refresh_scope.should_fetch_live_for_account_keys(
+        "openai",
+        "codex",
+        AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+        &codex_refresh_keys,
+    );
+    let codex_allow_stale_cache =
+        include_stale_provider_cache || (!force_provider_refresh && !codex_should_fetch_live);
     if let Some(codex_usage) = tokenomics_codex_live_usage(
         conn,
         &codex_plan,
         &codex_account,
-        include_stale_provider_cache,
+        codex_allow_stale_cache,
         force_provider_refresh,
+        codex_should_fetch_live,
+        &mut fetch_memo,
     ) {
         let codex_account = if reconcile_accounts {
             tokenomics_reconcile_codex_provider_account_from_usage(
@@ -12332,6 +12834,9 @@ fn tokenomics_provider_limits(
             AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
             &codex_active_profile_id,
         );
+        if !force_provider_refresh && !codex_should_fetch_live {
+            tokenomics_tag_dormant_cached_provider_limits(&mut codex_limits);
+        }
         limits.extend(codex_limits);
     } else {
         let mut codex_limits = vec![
@@ -12390,12 +12895,24 @@ fn tokenomics_provider_limits(
                     }),
             };
         }
+        let profile_refresh_keys =
+            tokenomics_provider_account_refresh_keys(conn, "openai", "codex", &profile_account);
+        let profile_should_fetch_live = refresh_scope.should_fetch_live_for_account_keys(
+            "openai",
+            "codex",
+            &profile_id,
+            &profile_refresh_keys,
+        );
+        let profile_allow_stale_cache = include_stale_provider_cache
+            || (!force_provider_refresh && !profile_should_fetch_live);
         if let Some(profile_usage) = tokenomics_codex_live_usage(
             conn,
             &profile_plan,
             &profile_account,
-            include_stale_provider_cache,
+            profile_allow_stale_cache,
             force_provider_refresh,
+            profile_should_fetch_live,
+            &mut fetch_memo,
         ) {
             let profile_account = if reconcile_accounts {
                 tokenomics_reconcile_codex_provider_account_from_usage(
@@ -12416,20 +12933,34 @@ fn tokenomics_provider_limits(
                 &profile_id,
                 &codex_active_profile_id,
             );
+            if !force_provider_refresh && !profile_should_fetch_live {
+                tokenomics_tag_dormant_cached_provider_limits(&mut profile_limits);
+            }
             limits.extend(profile_limits);
         }
     }
 
-    let claude_active_profile_id = agent_accounts_active_profile_id_for_tokenomics("claude");
     let claude_plan = tokenomics_claude_plan_state();
     let claude_account = tokenomics_provider_account("anthropic", "claude");
     let _ = tokenomics_ensure_claude_statusline_collector(&claude_plan);
+    let claude_refresh_keys =
+        tokenomics_provider_account_refresh_keys(conn, "anthropic", "claude", &claude_account);
+    let claude_should_fetch_live = refresh_scope.should_fetch_live_for_account_keys(
+        "anthropic",
+        "claude",
+        AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
+        &claude_refresh_keys,
+    );
+    let claude_allow_stale_cache =
+        include_stale_provider_cache || (!force_provider_refresh && !claude_should_fetch_live);
     if let Some(claude_usage) =
         tokenomics_claude_live_usage(
             conn,
             &claude_account,
-            include_stale_provider_cache,
+            claude_allow_stale_cache,
             force_provider_refresh,
+            claude_should_fetch_live,
+            &mut fetch_memo,
         )
     {
         let mut claude_limits =
@@ -12439,6 +12970,9 @@ fn tokenomics_provider_limits(
             AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
             &claude_active_profile_id,
         );
+        if !force_provider_refresh && !claude_should_fetch_live {
+            tokenomics_tag_dormant_cached_provider_limits(&mut claude_limits);
+        }
         limits.extend(claude_limits);
     } else if let Some(claude_limits) =
         tokenomics_claude_statusline_limits(&claude_plan, &claude_account)
@@ -12449,6 +12983,9 @@ fn tokenomics_provider_limits(
             AGENT_ACCOUNTS_DEFAULT_PROFILE_ID,
             &claude_active_profile_id,
         );
+        if !force_provider_refresh && !claude_should_fetch_live {
+            tokenomics_tag_dormant_cached_provider_limits(&mut claude_limits);
+        }
         limits.extend(claude_limits);
     } else {
         let mut claude_limits = vec![
@@ -12496,12 +13033,24 @@ fn tokenomics_provider_limits(
             key: format!("anthropic:claude:profile:{profile_id}"),
             label: format!("Claude · {profile_label}"),
         };
+        let profile_refresh_keys =
+            tokenomics_provider_account_refresh_keys(conn, "anthropic", "claude", &profile_account);
+        let profile_should_fetch_live = refresh_scope.should_fetch_live_for_account_keys(
+            "anthropic",
+            "claude",
+            &profile_id,
+            &profile_refresh_keys,
+        );
+        let profile_allow_stale_cache = include_stale_provider_cache
+            || (!force_provider_refresh && !profile_should_fetch_live);
         if let Some(profile_usage) = tokenomics_claude_live_usage_with_token(
             conn,
             &access_token,
             &profile_account,
-            include_stale_provider_cache,
+            profile_allow_stale_cache,
             force_provider_refresh,
+            profile_should_fetch_live,
+            &mut fetch_memo,
         ) {
             let mut profile_limits = tokenomics_claude_live_limit_snapshots(
                 &profile_plan,
@@ -12513,6 +13062,9 @@ fn tokenomics_provider_limits(
                 &profile_id,
                 &claude_active_profile_id,
             );
+            if !force_provider_refresh && !profile_should_fetch_live {
+                tokenomics_tag_dormant_cached_provider_limits(&mut profile_limits);
+            }
             limits.extend(profile_limits);
         }
     }
@@ -12741,10 +13293,80 @@ fn tokenomics_codex_usage_cache_key_from_account_key(provider_account_key: &str)
     format!("{TOKENOMICS_CODEX_USAGE_CACHE_KEY_PREFIX}{provider_account_key}")
 }
 
-fn tokenomics_codex_canonical_usage_cache_key(usage: &Value) -> Option<String> {
-    tokenomics_codex_usage_account_id(usage)
-        .map(|account_id| tokenomics_codex_provider_account_key_from_usage_account_id(&account_id))
-        .map(|account_key| tokenomics_codex_usage_cache_key_from_account_key(&account_key))
+fn tokenomics_codex_usage_cache_alias_key(provider_account_key: &str) -> String {
+    format!("{TOKENOMICS_CODEX_USAGE_CACHE_ALIAS_KEY_PREFIX}{provider_account_key}")
+}
+
+fn tokenomics_read_codex_usage_cache_alias(
+    conn: &rusqlite::Connection,
+    provider_account_key: &str,
+) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM tokenomics_meta WHERE key=?1",
+        rusqlite::params![tokenomics_codex_usage_cache_alias_key(provider_account_key)],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+}
+
+fn tokenomics_store_codex_usage_cache_alias(
+    conn: &rusqlite::Connection,
+    alias_account_key: &str,
+    canonical_account_key: &str,
+) -> Result<(), String> {
+    if alias_account_key.trim().is_empty()
+        || canonical_account_key.trim().is_empty()
+        || alias_account_key == canonical_account_key
+    {
+        return Ok(());
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO tokenomics_meta(key, value) VALUES(?1, ?2)",
+        rusqlite::params![
+            tokenomics_codex_usage_cache_alias_key(alias_account_key),
+            canonical_account_key
+        ],
+    )
+    .map_err(|error| format!("Unable to store Codex usage cache alias: {error}"))?;
+    Ok(())
+}
+
+fn tokenomics_codex_usage_cache_keys(
+    conn: &rusqlite::Connection,
+    provider_account: &TokenomicsProviderAccount,
+) -> Vec<String> {
+    let mut keys = vec![tokenomics_codex_usage_cache_key(provider_account)];
+    if let Some(canonical_account_key) =
+        tokenomics_read_codex_usage_cache_alias(conn, &provider_account.key)
+    {
+        let canonical_cache_key =
+            tokenomics_codex_usage_cache_key_from_account_key(&canonical_account_key);
+        if !keys.iter().any(|key| key == &canonical_cache_key) {
+            keys.push(canonical_cache_key);
+        }
+    }
+    keys
+}
+
+fn tokenomics_provider_account_refresh_keys(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    agent_kind: &str,
+    provider_account: &TokenomicsProviderAccount,
+) -> Vec<String> {
+    let mut keys = vec![provider_account.key.clone()];
+    if provider == "openai" && agent_kind == "codex" {
+        if let Some(canonical_account_key) =
+            tokenomics_read_codex_usage_cache_alias(conn, &provider_account.key)
+        {
+            if !keys.iter().any(|key| key == &canonical_account_key) {
+                keys.push(canonical_account_key);
+            }
+        }
+    }
+    keys
 }
 
 fn tokenomics_strip_account_usage_fields(value: &mut Value) {
@@ -12856,11 +13478,16 @@ fn tokenomics_rewrite_codex_usage_cache_alias(
     usage: &Value,
     fetched_at_unix: u64,
 ) -> Result<(), String> {
-    let Some(canonical_cache_key) = tokenomics_codex_canonical_usage_cache_key(usage) else {
+    let Some(account_id) = tokenomics_codex_usage_account_id(usage) else {
         return Ok(());
     };
+    let canonical_account_key = tokenomics_codex_provider_account_key_from_usage_account_id(&account_id);
+    let canonical_cache_key = tokenomics_codex_usage_cache_key_from_account_key(&canonical_account_key);
     if canonical_cache_key == cache_key {
         return Ok(());
+    }
+    if let Some(alias_account_key) = cache_key.strip_prefix(TOKENOMICS_CODEX_USAGE_CACHE_KEY_PREFIX) {
+        tokenomics_store_codex_usage_cache_alias(conn, alias_account_key, &canonical_account_key)?;
     }
     tokenomics_store_codex_usage_cache_at(conn, &canonical_cache_key, usage, fetched_at_unix)?;
     tokenomics_delete_codex_usage_cache(conn, cache_key)
@@ -12905,47 +13532,85 @@ fn tokenomics_mark_usage_updated_at(usage: &mut Value, updated_at: String) {
     object.insert("lastKnownAt".to_string(), json!(updated_at));
 }
 
+#[derive(Default)]
+struct TokenomicsProviderUsageFetchMemo {
+    codex: HashMap<String, Option<Value>>,
+    claude: HashMap<String, Option<Value>>,
+}
+
+impl TokenomicsProviderUsageFetchMemo {
+    fn codex(&mut self, access_token: &str) -> Option<Value> {
+        let key = tokenomics_hash(access_token.trim());
+        if let Some(cached) = self.codex.get(&key) {
+            return cached.clone();
+        }
+        let fetched = tokenomics_fetch_codex_live_usage(access_token);
+        self.codex.insert(key, fetched.clone());
+        fetched
+    }
+
+    fn claude(&mut self, access_token: &str) -> Option<Value> {
+        let key = tokenomics_hash(access_token.trim());
+        if let Some(cached) = self.claude.get(&key) {
+            return cached.clone();
+        }
+        let fetched = tokenomics_fetch_claude_live_usage(access_token);
+        self.claude.insert(key, fetched.clone());
+        fetched
+    }
+}
+
 fn tokenomics_codex_live_usage(
     conn: &rusqlite::Connection,
     plan: &Value,
     provider_account: &TokenomicsProviderAccount,
     allow_stale_cache: bool,
     force_provider_refresh: bool,
+    allow_live_fetch: bool,
+    fetch_memo: &mut TokenomicsProviderUsageFetchMemo,
 ) -> Option<Value> {
     let access_token = plan
         .get("access_token")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())?;
-    let cache_key = tokenomics_codex_usage_cache_key(provider_account);
+    let cache_keys = tokenomics_codex_usage_cache_keys(conn, provider_account);
     let now_unix = tokenomics_unix_now();
     if !force_provider_refresh {
-        if let Ok(Some(cached)) = tokenomics_cached_codex_usage(
-            conn,
-            &cache_key,
-            now_unix,
-            TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS,
-        ) {
-            return Some(cached);
+        for cache_key in &cache_keys {
+            if let Ok(Some(cached)) = tokenomics_cached_codex_usage(
+                conn,
+                cache_key,
+                now_unix,
+                TOKENOMICS_CODEX_USAGE_CACHE_TTL_SECS,
+            ) {
+                return Some(cached);
+            }
         }
     }
-    let fetched = tokenomics_fetch_codex_live_usage(access_token);
-    if let Some(mut usage) = fetched {
-        tokenomics_mark_usage_updated_at(&mut usage, tokenomics_now_iso_like());
-        let _ = tokenomics_store_codex_usage_cache(conn, &cache_key, &usage);
-        return Some(usage);
+    if force_provider_refresh || allow_live_fetch {
+        let fetched = fetch_memo.codex(access_token);
+        if let Some(mut usage) = fetched {
+            tokenomics_mark_usage_updated_at(&mut usage, tokenomics_now_iso_like());
+            let cache_key = tokenomics_codex_usage_cache_key(provider_account);
+            let _ = tokenomics_store_codex_usage_cache(conn, &cache_key, &usage);
+            return Some(usage);
+        }
     }
     if !allow_stale_cache {
         return None;
     }
-    tokenomics_cached_codex_usage(
-        conn,
-        &cache_key,
-        now_unix,
-        TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS,
-    )
-    .ok()
-    .flatten()
+    for cache_key in &cache_keys {
+        if let Ok(Some(cached)) = tokenomics_cached_codex_usage(
+            conn,
+            cache_key,
+            now_unix,
+            TOKENOMICS_CODEX_USAGE_CACHE_STALE_SECS,
+        ) {
+            return Some(cached);
+        }
+    }
+    None
 }
 
 fn tokenomics_fetch_codex_live_usage(access_token: &str) -> Option<Value> {
@@ -13022,6 +13687,8 @@ fn tokenomics_claude_live_usage(
     provider_account: &TokenomicsProviderAccount,
     allow_stale_cache: bool,
     force_provider_refresh: bool,
+    allow_live_fetch: bool,
+    fetch_memo: &mut TokenomicsProviderUsageFetchMemo,
 ) -> Option<Value> {
     let access_token = tokenomics_claude_access_token()?;
     tokenomics_claude_live_usage_with_token(
@@ -13030,6 +13697,8 @@ fn tokenomics_claude_live_usage(
         provider_account,
         allow_stale_cache,
         force_provider_refresh,
+        allow_live_fetch,
+        fetch_memo,
     )
 }
 
@@ -13042,6 +13711,8 @@ fn tokenomics_claude_live_usage_with_token(
     provider_account: &TokenomicsProviderAccount,
     allow_stale_cache: bool,
     force_provider_refresh: bool,
+    allow_live_fetch: bool,
+    fetch_memo: &mut TokenomicsProviderUsageFetchMemo,
 ) -> Option<Value> {
     let cache_key = tokenomics_claude_usage_cache_key(provider_account);
     let now_unix = tokenomics_unix_now();
@@ -13055,11 +13726,13 @@ fn tokenomics_claude_live_usage_with_token(
             return Some(cached);
         }
     }
-    let fetched = tokenomics_fetch_claude_live_usage(access_token);
-    if let Some(mut usage) = fetched {
-        tokenomics_mark_usage_updated_at(&mut usage, tokenomics_now_iso_like());
-        let _ = tokenomics_store_claude_usage_cache(conn, &cache_key, &usage);
-        return Some(usage);
+    if force_provider_refresh || allow_live_fetch {
+        let fetched = fetch_memo.claude(access_token);
+        if let Some(mut usage) = fetched {
+            tokenomics_mark_usage_updated_at(&mut usage, tokenomics_now_iso_like());
+            let _ = tokenomics_store_claude_usage_cache(conn, &cache_key, &usage);
+            return Some(usage);
+        }
     }
     if !allow_stale_cache {
         return None;
@@ -13090,7 +13763,32 @@ fn tokenomics_fetch_claude_live_usage(access_token: &str) -> Option<Value> {
     response.json::<Value>().ok()
 }
 
+fn tokenomics_claude_user_agent_cache(
+) -> &'static StdMutex<Option<TokenomicsClaudeUserAgentCacheEntry>> {
+    TOKENOMICS_CLAUDE_USER_AGENT_CACHE.get_or_init(|| StdMutex::new(None))
+}
+
 fn tokenomics_claude_code_user_agent() -> String {
+    if let Ok(cache) = tokenomics_claude_user_agent_cache().lock() {
+        if let Some(entry) = cache.as_ref() {
+            if entry.cached_at.elapsed()
+                < Duration::from_secs(TOKENOMICS_CLAUDE_USER_AGENT_CACHE_TTL_SECS)
+            {
+                return entry.user_agent.clone();
+            }
+        }
+    }
+    let user_agent = tokenomics_claude_code_user_agent_uncached();
+    if let Ok(mut cache) = tokenomics_claude_user_agent_cache().lock() {
+        *cache = Some(TokenomicsClaudeUserAgentCacheEntry {
+            cached_at: Instant::now(),
+            user_agent: user_agent.clone(),
+        });
+    }
+    user_agent
+}
+
+fn tokenomics_claude_code_user_agent_uncached() -> String {
     let version = Command::new("claude")
         .arg("--version")
         .output()

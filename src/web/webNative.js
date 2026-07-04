@@ -19,6 +19,8 @@ const MIN_NATIVE_DIMENSION = 24;
 const HIDDEN_NATIVE_WEBVIEW_OFFSET = 100000;
 const NATIVE_WEBVIEW_EXCLUSION_SELECTOR = "[data-native-webview-exclusion]";
 const NATIVE_WEBVIEW_EXCLUSION_MARGIN = 4;
+const NATIVE_WEBVIEW_EXCLUSION_LIFT_DATASET_KEY = "nativeWebviewExclusionLift";
+const nativeWebviewVisibleRects = new Map();
 
 function hiddenNativeRect() {
   const viewportWidth = typeof window !== "undefined" ? Number(window.innerWidth || 0) : 0;
@@ -31,28 +33,112 @@ function hiddenNativeRect() {
   };
 }
 
-function nativeWebviewExclusionInsetBottom({ bottom, left, right, top }) {
+function rectsOverlap(leftRect, rightRect) {
+  if (!leftRect || !rightRect) {
+    return false;
+  }
+  const horizontalOverlap = Math.min(leftRect.right, rightRect.right) - Math.max(leftRect.left, rightRect.left);
+  const verticalOverlap = Math.min(leftRect.bottom, rightRect.bottom) - Math.max(leftRect.top, rightRect.top);
+  return horizontalOverlap > 0 && verticalOverlap > 0;
+}
+
+function nativeRectToViewportRect(rect) {
+  if (!rect) {
+    return null;
+  }
+  const left = Number(rect.x || 0);
+  const top = Number(rect.y || 0);
+  const width = Number(rect.width || 0);
+  const height = Number(rect.height || 0);
+  if (!Number.isFinite(left) || !Number.isFinite(top) || width <= 0 || height <= 0) {
+    return null;
+  }
+  return {
+    bottom: top + height,
+    height,
+    left,
+    right: left + width,
+    top,
+    width,
+    x: left,
+    y: top,
+  };
+}
+
+export function applyNativeWebviewExclusionLifts() {
   if (typeof document === "undefined") {
-    return 0;
+    return;
   }
 
-  let insetBottom = 0;
+  const visibleRects = Array.from(nativeWebviewVisibleRects.values())
+    .map(nativeRectToViewportRect)
+    .filter(Boolean);
+
   document.querySelectorAll(NATIVE_WEBVIEW_EXCLUSION_SELECTOR).forEach((element) => {
+    const currentLift = Math.max(
+      0,
+      Number.parseFloat(element?.dataset?.[NATIVE_WEBVIEW_EXCLUSION_LIFT_DATASET_KEY] || "0") || 0,
+    );
     const exclusionRect = element?.getBoundingClientRect?.();
     if (!exclusionRect || exclusionRect.width <= 0 || exclusionRect.height <= 0) {
+      delete element.dataset[NATIVE_WEBVIEW_EXCLUSION_LIFT_DATASET_KEY];
+      element.style.transform = "";
       return;
     }
 
-    const horizontalOverlap = Math.min(right, exclusionRect.right) - Math.max(left, exclusionRect.left);
-    const verticalOverlap = Math.min(bottom, exclusionRect.bottom) - Math.max(top, exclusionRect.top);
-    if (horizontalOverlap <= 0 || verticalOverlap <= 0) {
-      return;
-    }
+    const baseRect = {
+      bottom: exclusionRect.bottom + currentLift,
+      height: exclusionRect.height,
+      left: exclusionRect.left,
+      right: exclusionRect.right,
+      top: exclusionRect.top + currentLift,
+      width: exclusionRect.width,
+    };
 
-    const exclusionTop = Math.max(top, exclusionRect.top - NATIVE_WEBVIEW_EXCLUSION_MARGIN);
-    insetBottom = Math.max(insetBottom, bottom - exclusionTop);
+    let nextLift = 0;
+    visibleRects.forEach((nativeRect) => {
+      if (!rectsOverlap(baseRect, nativeRect)) {
+        return;
+      }
+      nextLift = Math.max(
+        nextLift,
+        baseRect.bottom + NATIVE_WEBVIEW_EXCLUSION_MARGIN - nativeRect.top,
+      );
+    });
+
+    nextLift = Math.max(0, Math.ceil(nextLift));
+    nextLift = Math.min(nextLift, Math.max(0, Math.floor(baseRect.top)));
+
+    if (nextLift > 0) {
+      element.dataset[NATIVE_WEBVIEW_EXCLUSION_LIFT_DATASET_KEY] = String(nextLift);
+      element.style.transform = `translateY(-${nextLift}px)`;
+    } else {
+      delete element.dataset[NATIVE_WEBVIEW_EXCLUSION_LIFT_DATASET_KEY];
+      element.style.transform = "";
+    }
   });
-  return Math.max(0, Math.round(insetBottom));
+}
+
+function setNativeWebviewVisibleRect(label, rect) {
+  const safeLabel = String(label || "").trim();
+  const visibleRect = nativeRectToViewportRect(rect);
+  if (!safeLabel || !visibleRect) {
+    return;
+  }
+  nativeWebviewVisibleRects.set(safeLabel, {
+    height: visibleRect.height,
+    width: visibleRect.width,
+    x: visibleRect.x,
+    y: visibleRect.y,
+  });
+  applyNativeWebviewExclusionLifts();
+}
+
+function clearNativeWebviewVisibleRect(label) {
+  const safeLabel = String(label || "").trim();
+  if (safeLabel && nativeWebviewVisibleRects.delete(safeLabel)) {
+    applyNativeWebviewExclusionLifts();
+  }
 }
 
 export function hasTauriRuntime() {
@@ -160,14 +246,8 @@ export function viewportNativeRect(viewport, options = {}) {
   const right = Math.min(bounds.right, rect.right);
   const rawBottom = Math.min(bounds.bottom, rect.bottom);
   const heightBeforeInset = Math.max(0, rawBottom - top);
-  const exclusionInsetBottom = nativeWebviewExclusionInsetBottom({
-    bottom: rawBottom,
-    left,
-    right,
-    top,
-  });
   const effectiveInsetBottom = Math.min(
-    insetBottom + exclusionInsetBottom,
+    insetBottom,
     Math.max(0, heightBeforeInset - MIN_NATIVE_DIMENSION),
   );
   const bottom = rawBottom - effectiveInsetBottom;
@@ -204,6 +284,20 @@ export async function invokeWebviewOpen({ label, url, rect, parentWindowLabel })
   });
 }
 
+// Moves a living webview into `parentWindowLabel` without reloading it. Resolves
+// false when no webview exists for the label (caller falls back to a fresh open).
+export async function invokeWebviewAdopt({ label, rect, parentWindowLabel }) {
+  const adopted = await invoke("workspace_webview_adopt", {
+    height: rect.height,
+    label,
+    width: rect.width,
+    windowLabel: parentWindowLabel || undefined,
+    x: rect.x,
+    y: rect.y,
+  });
+  return adopted === true;
+}
+
 export async function invokeWebviewFit({ label, rect, visible }) {
   await invoke("workspace_webview_fit", {
     height: rect.height,
@@ -220,6 +314,7 @@ export async function invokeWebviewClose(label) {
   if (!safeLabel) {
     return;
   }
+  clearNativeWebviewVisibleRect(safeLabel);
   await invoke("workspace_webview_close", { label: safeLabel }).catch(() => {});
 }
 
@@ -250,6 +345,14 @@ export function useNativeWebview({
   viewportInsetBottom = 0,
   onNavigate,
   onError,
+  // While suspended the hook does not touch the native webview at all — another
+  // window owns it (pop-out adoption). The label is kept so it can be re-adopted.
+  suspended = false,
+  // When set (with a nonce bump), the hook adopts this existing webview into its
+  // own window instead of creating a fresh one — preserving the live page.
+  adoptLabel = "",
+  adoptNonce = 0,
+  onLabelChange,
 }) {
   const [status, setStatus] = useState("idle");
   const [reloadKey, setReloadKey] = useState(0);
@@ -263,10 +366,17 @@ export function useNativeWebview({
   const onErrorRef = useRef(onError);
   const mountedRef = useRef(false);
   const fitBurstCleanupRef = useRef(null);
+  const suspendedRef = useRef(Boolean(suspended));
+  const onLabelChangeRef = useRef(onLabelChange);
+  // Adoption is one-shot per nonce: once consumed, later url/reload changes go
+  // through the normal open-and-navigate path instead of re-adopting.
+  const consumedAdoptNonceRef = useRef(0);
 
   visibleRef.current = visible;
   onNavigateRef.current = onNavigate;
   onErrorRef.current = onError;
+  suspendedRef.current = Boolean(suspended);
+  onLabelChangeRef.current = onLabelChange;
 
   const runtimeEnabled = Boolean(enabled) && hasTauriRuntime();
   const safeViewportInsetBottom = Math.max(0, Math.round(Number(viewportInsetBottom) || 0));
@@ -278,9 +388,18 @@ export function useNativeWebview({
     };
   }, []);
 
+  const assignLabel = useCallback((nextLabel) => {
+    const safeLabel = String(nextLabel || "").trim();
+    if (labelRef.current === safeLabel) {
+      return;
+    }
+    labelRef.current = safeLabel;
+    onLabelChangeRef.current?.(safeLabel);
+  }, []);
+
   const fit = useCallback((label, nextVisible, options = {}) => {
     const safeLabel = String(label || "").trim();
-    if (!safeLabel || !hasTauriRuntime()) {
+    if (!safeLabel || !hasTauriRuntime() || suspendedRef.current) {
       return;
     }
     const shouldShow = Boolean(nextVisible);
@@ -293,8 +412,14 @@ export function useNativeWebview({
     }
     if (rect.width < MIN_NATIVE_DIMENSION || rect.height < MIN_NATIVE_DIMENSION) {
       rectKeyRef.current = "";
+      clearNativeWebviewVisibleRect(safeLabel);
       void invokeWebviewFit({ label: safeLabel, rect: hiddenNativeRect(), visible: false }).catch(() => {});
       return;
+    }
+    if (shouldShow) {
+      setNativeWebviewVisibleRect(safeLabel, rect);
+    } else {
+      clearNativeWebviewVisibleRect(safeLabel);
     }
     const rectKey = `${rect.x}:${rect.y}:${rect.width}:${rect.height}:${shouldShow ? "show" : "hide"}`;
     if (options.force === true || rectKeyRef.current !== rectKey) {
@@ -360,14 +485,15 @@ export function useNativeWebview({
 
   const closeCurrent = useCallback(() => {
     const label = labelRef.current;
-    labelRef.current = "";
+    assignLabel("");
     rectKeyRef.current = "";
     openKeyRef.current = "";
     generationRef.current += 1;
     if (label) {
+      clearNativeWebviewVisibleRect(label);
       void invokeWebviewClose(label);
     }
-  }, []);
+  }, [assignLabel]);
 
   useLayoutEffect(() => {
     const label = labelRef.current;
@@ -393,12 +519,21 @@ export function useNativeWebview({
 
   // Open (or re-open) the webview when the url / reload counter / parent changes.
   useEffect(() => {
+    if (suspended) {
+      // Another window owns the webview right now; leave it entirely alone.
+      return undefined;
+    }
     if (!runtimeEnabled || !url) {
       closeCurrent();
       return undefined;
     }
 
-    const openKey = webviewOpenKey({ parentWindowLabel, reloadKey, scopeParts, url });
+    const openKey = webviewOpenKey({
+      parentWindowLabel,
+      reloadKey: `${reloadKey}|${adoptLabel}|${adoptNonce}`,
+      scopeParts,
+      url,
+    });
 
     if (!visible) {
       fit(labelRef.current, false, { force: true });
@@ -430,17 +565,59 @@ export function useNativeWebview({
       const generation = generationRef.current + 1;
       generationRef.current = generation;
       const previousLabel = labelRef.current;
+
+      // Adoption first: take over the living webview (same page, same session,
+      // no reload) instead of creating a fresh one. Falls through on failure.
+      const targetAdoptLabel = String(adoptLabel || "").trim();
+      const adoptionPending = Boolean(targetAdoptLabel)
+        && adoptNonce > 0
+        && consumedAdoptNonceRef.current !== adoptNonce;
+      if (adoptionPending) {
+        consumedAdoptNonceRef.current = adoptNonce;
+        try {
+          const adopted = await invokeWebviewAdopt({
+            label: targetAdoptLabel,
+            parentWindowLabel,
+            rect,
+          });
+          if (disposed || generationRef.current !== generation) {
+            return;
+          }
+          if (adopted) {
+            assignLabel(targetAdoptLabel);
+            openKeyRef.current = openKey;
+            rectKeyRef.current = "";
+            if (previousLabel && previousLabel !== targetAdoptLabel) {
+              clearNativeWebviewVisibleRect(previousLabel);
+              void invokeWebviewClose(previousLabel);
+            }
+            if (mountedRef.current) {
+              setStatus("ready");
+            }
+            fit(targetAdoptLabel, visibleRef.current, { force: true });
+            scheduleFitBurst(targetAdoptLabel, visibleRef.current, { delays: [80, 180, 320], frames: 4 });
+            return;
+          }
+        } catch {
+          // The webview is gone or could not be moved; open a fresh one below.
+        }
+        if (disposed || generationRef.current !== generation) {
+          return;
+        }
+      }
+
       const label = webviewLabel(scopeParts, generation);
-      labelRef.current = label;
+      assignLabel(label);
       openKeyRef.current = openKey;
       rectKeyRef.current = "";
 
       if (previousLabel) {
+        clearNativeWebviewVisibleRect(previousLabel);
         await invokeWebviewClose(previousLabel);
       }
       if (disposed || generationRef.current !== generation) {
         if (generationRef.current === generation && labelRef.current === label) {
-          labelRef.current = "";
+          assignLabel("");
           openKeyRef.current = "";
         }
         return;
@@ -460,7 +637,7 @@ export function useNativeWebview({
         scheduleFitBurst(label, visibleRef.current, { delays: [80, 180, 320], frames: 4 });
       } catch (error) {
         if (!disposed && generationRef.current === generation) {
-          labelRef.current = "";
+          assignLabel("");
           openKeyRef.current = "";
           if (mountedRef.current) {
             setStatus("error");
@@ -500,13 +677,32 @@ export function useNativeWebview({
     return () => {
       disposed = true;
     };
-  }, [runtimeEnabled, url, reloadKey, parentWindowLabel, viewportRef, scopeParts, fit, scheduleFitBurst, closeCurrent, visible, safeViewportInsetBottom]);
+  }, [runtimeEnabled, url, reloadKey, parentWindowLabel, viewportRef, scopeParts, fit, scheduleFitBurst, closeCurrent, visible, safeViewportInsetBottom, suspended, adoptLabel, adoptNonce, assignLabel]);
 
   // Re-fit (and show/hide) whenever visibility flips.
   useEffect(() => {
     fit(labelRef.current, visible, { force: true });
     scheduleFitBurst(labelRef.current, visible, { delays: [80, 180], frames: visible ? 3 : 2 });
   }, [fit, scheduleFitBurst, visible]);
+
+  // Entering suspension: park the webview offscreen ONCE, then go silent so the
+  // adopting window can take ownership without the grid fighting its fits.
+  const prevSuspendedRef = useRef(false);
+  useEffect(() => {
+    const wasSuspended = prevSuspendedRef.current;
+    prevSuspendedRef.current = Boolean(suspended);
+    if (!suspended || wasSuspended) {
+      return;
+    }
+    const label = labelRef.current;
+    if (!label || !hasTauriRuntime()) {
+      return;
+    }
+    stopFitBurst();
+    rectKeyRef.current = "";
+    clearNativeWebviewVisibleRect(label);
+    void invokeWebviewFit({ label, rect: hiddenNativeRect(), visible: false }).catch(() => {});
+  }, [stopFitBurst, suspended]);
 
   // Native child webviews do not inherit CSS transforms from their DOM
   // placeholders. Fullscreen/restore and grid reflow move the pane with
@@ -546,6 +742,7 @@ export function useNativeWebview({
       }
     };
     const observer = new ResizeObserver(scheduleFit);
+    const exclusionObserver = new ResizeObserver(applyNativeWebviewExclusionLifts);
     const viewport = viewportRef.current;
     if (viewport) {
       observer.observe(viewport);
@@ -556,7 +753,7 @@ export function useNativeWebview({
     }
     if (typeof document !== "undefined") {
       document.querySelectorAll(NATIVE_WEBVIEW_EXCLUSION_SELECTOR).forEach((element) => {
-        observer.observe(element);
+        exclusionObserver.observe(element);
       });
     }
     window.addEventListener("resize", scheduleFit);
@@ -564,6 +761,7 @@ export function useNativeWebview({
     frameHandle = window.requestAnimationFrame(burstFit);
     return () => {
       observer.disconnect();
+      exclusionObserver.disconnect();
       window.removeEventListener("resize", scheduleFit);
       window.removeEventListener("scroll", scheduleFit, true);
       window.cancelAnimationFrame(frameHandle);
@@ -665,10 +863,13 @@ export function useNativeWebview({
     };
   }, [fit, scheduleFitBurst]);
 
-  // Close on unmount.
+  // Close on unmount — unless suspended: then a pop-out window owns the webview
+  // and closing it here would blank that window.
   useEffect(() => () => {
     stopFitBurst();
-    closeCurrent();
+    if (!suspendedRef.current) {
+      closeCurrent();
+    }
   }, [closeCurrent, stopFitBurst]);
 
   const reload = useCallback(() => {
@@ -676,5 +877,7 @@ export function useNativeWebview({
     setReloadKey((key) => key + 1);
   }, []);
 
-  return { status, reload, evaluate };
+  const getNativeLabel = useCallback(() => labelRef.current, []);
+
+  return { status, reload, evaluate, getNativeLabel };
 }

@@ -12,6 +12,7 @@ import {
   ButtonCloseIcon,
   ButtonDragIcon,
   ButtonForgeIcon,
+  ButtonFullscreenExitIcon,
   ButtonFullscreenIcon,
   ButtonRefreshIcon,
   ButtonSplitHorizontalIcon,
@@ -29,6 +30,7 @@ import {
   TerminalRestartPill,
   TerminalStateDebugBadge,
 } from "../app/appStyles.js";
+import { usePopoutWindowFullscreen } from "../app/usePopoutWindowFullscreen.js";
 import { measureTerminalGrid } from "./terminalResizeController";
 import { guardXtermDuringPushToTalk } from "./xtermPushToTalkGuard.js";
 import {
@@ -293,6 +295,8 @@ export default function TerminalWindowHost() {
   const terminalInstanceIdRef = useRef(0);
   const fitTerminalRef = useRef(() => {});
   const restartMenuRef = useRef(null);
+  const currentWindow = useMemo(() => getCurrentWindow(), []);
+  const { isFullscreen, toggleFullscreen } = usePopoutWindowFullscreen(currentWindow);
   const [status, setStatus] = useState("connecting");
   const [statusDetail, setStatusDetail] = useState("");
   const [restartMenuOpen, setRestartMenuOpen] = useState(false);
@@ -799,6 +803,19 @@ export default function TerminalWindowHost() {
           </TerminalStateDebugBadge>
         </TerminalRailIdentity>
         <TerminalRailControls data-rail-row="primary">
+          <TerminalRestartButton
+            aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+            aria-pressed={isFullscreen ? "true" : "false"}
+            onClick={toggleFullscreen}
+            title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+            type="button"
+          >
+            {isFullscreen ? (
+              <ButtonFullscreenExitIcon aria-hidden="true" />
+            ) : (
+              <ButtonFullscreenIcon aria-hidden="true" />
+            )}
+          </TerminalRestartButton>
           <TerminalCloseButton
             aria-label="Close terminal"
             onClick={() => sendControl(TERMINAL_WINDOW_CONTROL_CLOSE_TERMINAL)}

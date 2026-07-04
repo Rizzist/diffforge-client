@@ -25,6 +25,7 @@ export default function WebWorkspaceView({
   onFocusWebTabPopout = null,
   onPopOutWebTab = null,
   onReturnWebTabPopout = null,
+  onWebTabNativeLabel = null,
   onWebTabNavigate = null,
   webTabSession = null,
   webviewObscured = false,
@@ -46,6 +47,12 @@ export default function WebWorkspaceView({
   const popoutLabel = String(webTabSession?.popoutLabel || webTabSession?.label || "").trim();
   const poppedOut = Boolean(webTabSession?.poppedOut || popoutLabel);
   const resumeNonce = Number(webTabSession?.resumeNonce || 0);
+  const adoptWebviewLabel = String(webTabSession?.webviewLabel || "").trim();
+  const adoptNonce = Number(webTabSession?.adoptNonce || 0);
+
+  const handleNativeLabelChange = useCallback((_paneId, label) => {
+    onWebTabNativeLabel?.(paneId, label);
+  }, [onWebTabNativeLabel, paneId]);
 
   const [currentUrl, setCurrentUrl] = useState(sessionUrl);
   const [agentPromptActivityItems, setAgentPromptActivityItems] = useState([]);
@@ -283,12 +290,15 @@ export default function WebWorkspaceView({
   return (
     <WebPane
       key={`web-tab-${paneId}-${resumeNonce}`}
+      adoptLabel={adoptWebviewLabel}
+      adoptNonce={adoptNonce}
       breakoutReturnUrl={currentUrl}
       defaultPanelAgentPromptTargetIds={defaultAgentPromptTargetIds}
       initialUrl={currentUrl}
       inlineToolbarInNav
       isActive={isActive}
       layoutKey={layoutKey}
+      onNativeLabelChange={handleNativeLabelChange}
       onAgentPromptOpenChange={handleAgentPromptOpenChange}
       onFocusBreakout={focusWebTabPopout}
       onNavigate={rememberUrl}

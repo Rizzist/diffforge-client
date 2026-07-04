@@ -1,23 +1,26 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes, css } from "styled-components";
+import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
 
 /*
- * PlusUpsellOverlay — the "battle pass" moment shown to free accounts after
- * sign-in. One canvas drives every particle (embers, slam sparks, CTA
- * flare-ups) so the DOM only animates transform/opacity; sounds are
- * synthesized on the fly with WebAudio (no audio assets to ship). The quiet
- * escape hatch ("Keep using Free") rides the left edge next to the SFX mute
- * toggle, and the overlay returns on every fresh sign-in by design.
+ * PlusUpsellOverlay — the "battle pass" tier-up shown right after sign-in,
+ * BEFORE the app shell is revealed (opaque backdrop, above the startup
+ * overlay). Layout rides the golden ratio: a 1.618fr cinematic showcase
+ * (emblem, god rays, perk track) beside a 1fr purchase card whose glowing
+ * CTA is the single hottest pixel on screen. One canvas drives all
+ * particles; every DOM animation is transform/opacity; SFX are synthesized
+ * with WebAudio at runtime. The quiet "keep using Free" escape lives on the
+ * left edge and the overlay re-arms on every sign-in.
  */
 
 const MUTE_STORAGE_KEY = "diffforge.plusUpsell.sfxMuted";
 
-const PERKS = [
-  { title: "Native desktop app", detail: "Mac, Windows, and Linux license" },
-  { title: "10,000 credits / month", detail: "Included Diff Forge AI allowance" },
-  { title: "Up to 4 devices", detail: "Personal multi-device sync" },
-  { title: "10 GB workspace storage", detail: "3 GB SQLite + 7 GB assets" },
-  { title: "Priority support", detail: "Faster plan and setup help" },
+const TRACK_PERKS = [
+  { glyph: "▣", title: "Native app", sub: "Mac · Win · Linux" },
+  { glyph: "◆", title: "10k credits", sub: "every month" },
+  { glyph: "⌁", title: "4 devices", sub: "personal sync" },
+  { glyph: "▤", title: "10 GB storage", sub: "SQLite + assets" },
+  { glyph: "★", title: "Priority", sub: "support lane" },
 ];
 
 /* ------------------------------------------------------------- audio */
@@ -51,39 +54,57 @@ function createSfx() {
   };
 
   return {
-    /* low airy sweep as the overlay lands */
-    whoosh() {
+    /* tension riser into the slam */
+    riser() {
+      play((audio, t0) => {
+        const src = audio.createBufferSource();
+        src.buffer = noiseBuffer(audio, 0.62);
+        const filter = audio.createBiquadFilter();
+        filter.type = "lowpass";
+        filter.frequency.setValueAtTime(160, t0);
+        filter.frequency.exponentialRampToValueAtTime(2600, t0 + 0.52);
+        const gain = audio.createGain();
+        gain.gain.setValueAtTime(0.0001, t0);
+        gain.gain.exponentialRampToValueAtTime(0.14, t0 + 0.48);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.6);
+        src.connect(filter).connect(gain).connect(audio.destination);
+        src.start(t0);
+        src.stop(t0 + 0.64);
+      });
+    },
+    /* airy sweep (open + purchase card slide) */
+    whoosh(bright = false) {
       play((audio, t0) => {
         const src = audio.createBufferSource();
         src.buffer = noiseBuffer(audio, 0.9);
         const filter = audio.createBiquadFilter();
         filter.type = "bandpass";
         filter.Q.value = 0.8;
-        filter.frequency.setValueAtTime(220, t0);
-        filter.frequency.exponentialRampToValueAtTime(2400, t0 + 0.5);
-        filter.frequency.exponentialRampToValueAtTime(320, t0 + 0.85);
+        filter.frequency.setValueAtTime(bright ? 480 : 220, t0);
+        filter.frequency.exponentialRampToValueAtTime(bright ? 3600 : 2400, t0 + 0.42);
+        filter.frequency.exponentialRampToValueAtTime(bright ? 700 : 320, t0 + 0.8);
         const gain = audio.createGain();
         gain.gain.setValueAtTime(0.0001, t0);
-        gain.gain.exponentialRampToValueAtTime(0.16, t0 + 0.16);
-        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.9);
+        gain.gain.exponentialRampToValueAtTime(bright ? 0.1 : 0.16, t0 + 0.14);
+        gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.85);
         src.connect(filter).connect(gain).connect(audio.destination);
         src.start(t0);
-        src.stop(t0 + 0.95);
+        src.stop(t0 + 0.9);
       });
     },
-    /* emblem slam: thump + metallic ring + spark sizzle */
+    /* emblem slam: sub thump + metallic triad + spark sizzle */
     slam() {
       play((audio, t0) => {
         const osc = audio.createOscillator();
         osc.type = "sine";
-        osc.frequency.setValueAtTime(150, t0);
-        osc.frequency.exponentialRampToValueAtTime(38, t0 + 0.24);
+        osc.frequency.setValueAtTime(160, t0);
+        osc.frequency.exponentialRampToValueAtTime(34, t0 + 0.28);
         const oscGain = audio.createGain();
-        oscGain.gain.setValueAtTime(0.5, t0);
-        oscGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.32);
+        oscGain.gain.setValueAtTime(0.62, t0);
+        oscGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.38);
         osc.connect(oscGain).connect(audio.destination);
         osc.start(t0);
-        osc.stop(t0 + 0.34);
+        osc.stop(t0 + 0.4);
 
         [523.25, 783.99, 1046.5].forEach((freq, index) => {
           const ring = audio.createOscillator();
@@ -91,27 +112,26 @@ function createSfx() {
           ring.frequency.value = freq * 1.003;
           const ringGain = audio.createGain();
           ringGain.gain.setValueAtTime(0.0001, t0);
-          ringGain.gain.exponentialRampToValueAtTime(0.07 / (index + 1), t0 + 0.012);
-          ringGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.7 + index * 0.12);
+          ringGain.gain.exponentialRampToValueAtTime(0.075 / (index + 1), t0 + 0.012);
+          ringGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.75 + index * 0.13);
           ring.connect(ringGain).connect(audio.destination);
           ring.start(t0);
-          ring.stop(t0 + 0.95);
+          ring.stop(t0 + 1);
         });
 
         const sizzle = audio.createBufferSource();
-        sizzle.buffer = noiseBuffer(audio, 0.5);
+        sizzle.buffer = noiseBuffer(audio, 0.55);
         const sizzleFilter = audio.createBiquadFilter();
         sizzleFilter.type = "highpass";
-        sizzleFilter.frequency.value = 3800;
+        sizzleFilter.frequency.value = 3600;
         const sizzleGain = audio.createGain();
-        sizzleGain.gain.setValueAtTime(0.12, t0 + 0.01);
-        sizzleGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.5);
+        sizzleGain.gain.setValueAtTime(0.14, t0 + 0.01);
+        sizzleGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.55);
         sizzle.connect(sizzleFilter).connect(sizzleGain).connect(audio.destination);
         sizzle.start(t0 + 0.01);
-        sizzle.stop(t0 + 0.55);
+        sizzle.stop(t0 + 0.6);
       });
     },
-    /* perk row tick */
     tick(step = 0) {
       play((audio, t0) => {
         const osc = audio.createOscillator();
@@ -126,7 +146,6 @@ function createSfx() {
         osc.stop(t0 + 0.1);
       });
     },
-    /* CTA hover flare */
     flare() {
       play((audio, t0) => {
         const src = audio.createBufferSource();
@@ -145,7 +164,6 @@ function createSfx() {
         src.stop(t0 + 0.36);
       });
     },
-    /* upgrade click stinger: rising fifth + shimmer */
     stinger() {
       play((audio, t0) => {
         [392, 587.33, 783.99].forEach((freq, index) => {
@@ -163,7 +181,6 @@ function createSfx() {
         });
       });
     },
-    /* soft dismiss puff */
     dismiss() {
       play((audio, t0) => {
         const src = audio.createBufferSource();
@@ -192,7 +209,7 @@ function createSfx() {
 function createEmberEngine(canvas, prefersReducedMotion) {
   const context = canvas.getContext("2d");
   if (!context || prefersReducedMotion) {
-    return { burst: () => {}, setCtaRect: () => {}, destroy: () => {} };
+    return { burst: () => {}, ringBurst: () => {}, setCtaRect: () => {}, destroy: () => {} };
   }
 
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -207,14 +224,16 @@ function createEmberEngine(canvas, prefersReducedMotion) {
   spriteCtx.fillStyle = spriteGradient;
   spriteCtx.fillRect(0, 0, 32, 32);
 
-  const MAX_PARTICLES = 150;
+  const MAX_PARTICLES = 170;
   const particles = [];
   let ctaRect = null;
+  let ctaRate = 0;
   let width = 0;
   let height = 0;
   let raf = 0;
   let last = performance.now();
   let destroyed = false;
+  let renderable = getRenderabilitySnapshot().renderable;
 
   const resize = () => {
     width = canvas.clientWidth;
@@ -250,7 +269,7 @@ function createEmberEngine(canvas, prefersReducedMotion) {
     if (!ctaRect) return;
     spawn({
       x: ctaRect.x + Math.random() * ctaRect.width,
-      y: ctaRect.y + ctaRect.height * 0.4,
+      y: ctaRect.y + ctaRect.height * 0.35,
       vx: (Math.random() - 0.5) * 26,
       vy: -(40 + Math.random() * 70),
       life: 0,
@@ -263,53 +282,76 @@ function createEmberEngine(canvas, prefersReducedMotion) {
 
   let ambientAccumulator = 0;
   let ctaAccumulator = 0;
-  let ctaRate = 10; // particles / second rising from the CTA
+
+  const stopFrame = () => {
+    if (raf) {
+      cancelAnimationFrame(raf);
+      raf = 0;
+    }
+  };
+
+  const requestFrame = () => {
+    if (!destroyed && renderable && !raf) {
+      raf = requestAnimationFrame(step);
+    }
+  };
 
   const step = (now) => {
     if (destroyed) return;
+    raf = 0;
+    if (!renderable) {
+      return;
+    }
     const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
 
-    if (!document.hidden) {
-      ambientAccumulator += dt * 7;
-      while (ambientAccumulator >= 1) {
-        ambientAccumulator -= 1;
-        spawnAmbient();
-      }
-      ctaAccumulator += dt * ctaRate;
-      while (ctaAccumulator >= 1) {
-        ctaAccumulator -= 1;
-        spawnCta();
-      }
-
-      context.clearRect(0, 0, width, height);
-      context.globalCompositeOperation = "lighter";
-      for (let i = particles.length - 1; i >= 0; i -= 1) {
-        const p = particles[i];
-        p.life += dt;
-        if (p.life >= p.ttl) {
-          particles.splice(i, 1);
-          continue;
-        }
-        p.wobble += dt * 2.2;
-        p.x += (p.vx + Math.sin(p.wobble) * 9) * dt;
-        p.y += p.vy * dt;
-        if (p.kind === "spark") {
-          p.vy += 150 * dt; // gravity pulls slam sparks back down
-          p.vx *= 1 - 0.9 * dt;
-        }
-        const t = p.life / p.ttl;
-        const fade = t < 0.12 ? t / 0.12 : 1 - (t - 0.12) / 0.88;
-        const size = p.size * (p.kind === "spark" ? 1 - t * 0.5 : 1);
-        context.globalAlpha = Math.max(0, fade) * (p.kind === "cta" ? 0.9 : 0.7);
-        context.drawImage(sprite, p.x - size, p.y - size, size * 2, size * 2);
-      }
-      context.globalAlpha = 1;
-      context.globalCompositeOperation = "source-over";
+    ambientAccumulator += dt * 8;
+    while (ambientAccumulator >= 1) {
+      ambientAccumulator -= 1;
+      spawnAmbient();
     }
-    raf = requestAnimationFrame(step);
+    ctaAccumulator += dt * ctaRate;
+    while (ctaAccumulator >= 1) {
+      ctaAccumulator -= 1;
+      spawnCta();
+    }
+
+    context.clearRect(0, 0, width, height);
+    context.globalCompositeOperation = "lighter";
+    for (let i = particles.length - 1; i >= 0; i -= 1) {
+      const p = particles[i];
+      p.life += dt;
+      if (p.life >= p.ttl) {
+        particles.splice(i, 1);
+        continue;
+      }
+      p.wobble += dt * 2.2;
+      p.x += (p.vx + Math.sin(p.wobble) * 9) * dt;
+      p.y += p.vy * dt;
+      if (p.kind === "spark") {
+        p.vy += 150 * dt;
+        p.vx *= 1 - 0.9 * dt;
+      }
+      const t = p.life / p.ttl;
+      const fade = t < 0.12 ? t / 0.12 : 1 - (t - 0.12) / 0.88;
+      const size = p.size * (p.kind === "spark" ? 1 - t * 0.5 : 1);
+      context.globalAlpha = Math.max(0, fade) * (p.kind === "cta" ? 0.9 : 0.7);
+      context.drawImage(sprite, p.x - size, p.y - size, size * 2, size * 2);
+    }
+    context.globalAlpha = 1;
+    context.globalCompositeOperation = "source-over";
+    requestFrame();
   };
-  raf = requestAnimationFrame(step);
+  const unsubscribeRenderability = subscribeToRenderability((nextSnapshot) => {
+    renderable = nextSnapshot.renderable;
+    if (renderable) {
+      last = performance.now();
+      requestFrame();
+    } else {
+      stopFrame();
+    }
+  });
+  requestFrame();
 
   return {
     burst(x, y, count = 42) {
@@ -329,13 +371,32 @@ function createEmberEngine(canvas, prefersReducedMotion) {
         });
       }
     },
+    /* sparks that ride the shockwave ring outward */
+    ringBurst(x, y, count = 26, radius = 96) {
+      for (let i = 0; i < count; i += 1) {
+        const angle = (i / count) * Math.PI * 2 + Math.random() * 0.2;
+        const speed = 150 + Math.random() * 110;
+        spawn({
+          x: x + Math.cos(angle) * radius * 0.4,
+          y: y + Math.sin(angle) * radius * 0.4,
+          vx: Math.cos(angle) * speed,
+          vy: Math.sin(angle) * speed * 0.72,
+          life: 0,
+          ttl: 0.6 + Math.random() * 0.5,
+          size: 1.4 + Math.random() * 2.4,
+          wobble: Math.random() * Math.PI * 2,
+          kind: "spark",
+        });
+      }
+    },
     setCtaRect(rect, rate = 10) {
       ctaRect = rect;
       ctaRate = rate;
     },
     destroy() {
       destroyed = true;
-      cancelAnimationFrame(raf);
+      stopFrame();
+      unsubscribeRenderability();
       window.removeEventListener("resize", onResize);
     },
   };
@@ -344,7 +405,8 @@ function createEmberEngine(canvas, prefersReducedMotion) {
 /* ---------------------------------------------------------- component */
 
 export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
-  const [phase, setPhase] = useState(0); // 0 sweep · 1 emblem slam · 2 perks · 3 armed
+  // 0 open · 1 emblem slam · 2 perk track · 3 purchase card armed
+  const [phase, setPhase] = useState(0);
   const [leaving, setLeaving] = useState(false);
   const [muted, setMuted] = useState(() => {
     try {
@@ -354,6 +416,7 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
     }
   });
   const [creditCount, setCreditCount] = useState(0);
+  const [tilesLanded, setTilesLanded] = useState(0);
 
   const canvasRef = useRef(null);
   const engineRef = useRef(null);
@@ -373,7 +436,6 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
     if (!mutedRef.current) sfx[name](...args);
   }, [sfx]);
 
-  // particle engine lifecycle
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return undefined;
@@ -385,70 +447,88 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
     };
   }, [prefersReducedMotion, sfx]);
 
+  const emblemCanvasPoint = useCallback(() => {
+    const emblem = emblemRef.current;
+    const canvas = canvasRef.current;
+    if (!emblem || !canvas) return null;
+    const emblemRect = emblem.getBoundingClientRect();
+    const canvasRect = canvas.getBoundingClientRect();
+    return {
+      x: emblemRect.left + emblemRect.width / 2 - canvasRect.left,
+      y: emblemRect.top + emblemRect.height / 2 - canvasRect.top,
+    };
+  }, []);
+
+  const syncCtaEmitter = useCallback((rate) => {
+    const cta = ctaRef.current;
+    const canvas = canvasRef.current;
+    if (!cta || !canvas || !engineRef.current) return;
+    const ctaRect = cta.getBoundingClientRect();
+    const canvasRect = canvas.getBoundingClientRect();
+    engineRef.current.setCtaRect({
+      x: ctaRect.left - canvasRect.left,
+      y: ctaRect.top - canvasRect.top,
+      width: ctaRect.width,
+      height: ctaRect.height,
+    }, rate);
+  }, []);
+
   // opening timeline
   useEffect(() => {
     const timers = [];
     const at = (ms, fn) => timers.push(window.setTimeout(fn, ms));
 
-    at(60, () => sound("whoosh"));
-    at(430, () => {
+    at(40, () => sound("riser"));
+    at(90, () => sound("whoosh"));
+    at(560, () => {
       setPhase(1);
       sound("slam");
-      const emblem = emblemRef.current;
-      const canvas = canvasRef.current;
-      if (emblem && canvas && engineRef.current) {
-        const emblemRect = emblem.getBoundingClientRect();
-        const canvasRect = canvas.getBoundingClientRect();
-        engineRef.current.burst(
-          emblemRect.left + emblemRect.width / 2 - canvasRect.left,
-          emblemRect.top + emblemRect.height / 2 - canvasRect.top,
-          56,
-        );
+      const point = emblemCanvasPoint();
+      if (point && engineRef.current) {
+        engineRef.current.burst(point.x, point.y, 60);
+        engineRef.current.ringBurst(point.x, point.y, 30, 110);
       }
     });
-    at(980, () => setPhase(2));
-    PERKS.forEach((_, index) => {
-      at(1050 + index * 110, () => sound("tick", index));
+    at(1040, () => setPhase(2));
+    TRACK_PERKS.forEach((_, index) => {
+      at(1100 + index * 95, () => {
+        sound("tick", index);
+        setTilesLanded(index + 1);
+      });
     });
-    at(1050 + PERKS.length * 110 + 160, () => setPhase(3));
+    at(1560, () => {
+      setPhase(3);
+      sound("whoosh", true);
+    });
 
     return () => timers.forEach((timer) => window.clearTimeout(timer));
-  }, [sound]);
+  }, [emblemCanvasPoint, sound]);
 
-  // credits count-up once perks land
+  // credits odometer once the purchase card is in
   useEffect(() => {
-    if (phase < 2) return undefined;
+    if (phase < 3) return undefined;
     const started = performance.now();
     let raf = 0;
     const tickUp = (now) => {
-      const t = Math.min(1, (now - started) / 900);
+      const t = Math.min(1, (now - started) / 950);
       setCreditCount(Math.round((1 - (1 - t) ** 3) * 10000));
       if (t < 1) raf = requestAnimationFrame(tickUp);
     };
     raf = requestAnimationFrame(tickUp);
     return () => cancelAnimationFrame(raf);
-  }, [phase >= 2]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [phase >= 3]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // keep the CTA ember emitter pinned to the button
+  // pin the ember emitter to the CTA once armed
   useEffect(() => {
     if (phase < 3) return undefined;
-    const sync = () => {
-      const cta = ctaRef.current;
-      const canvas = canvasRef.current;
-      if (!cta || !canvas || !engineRef.current) return;
-      const ctaRect = cta.getBoundingClientRect();
-      const canvasRect = canvas.getBoundingClientRect();
-      engineRef.current.setCtaRect({
-        x: ctaRect.left - canvasRect.left,
-        y: ctaRect.top - canvasRect.top,
-        width: ctaRect.width,
-        height: ctaRect.height,
-      });
-    };
-    sync();
+    const sync = () => syncCtaEmitter(12);
+    const settle = window.setTimeout(sync, 460); // after the card slide settles
     window.addEventListener("resize", sync);
-    return () => window.removeEventListener("resize", sync);
-  }, [phase >= 3]); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => {
+      window.clearTimeout(settle);
+      window.removeEventListener("resize", sync);
+    };
+  }, [phase >= 3, syncCtaEmitter]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleUpgrade = useCallback(() => {
     sound("stinger");
@@ -460,7 +540,7 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
       engineRef.current.burst(
         ctaRect.left + ctaRect.width / 2 - canvasRect.left,
         ctaRect.top + ctaRect.height / 2 - canvasRect.top,
-        70,
+        80,
       );
     }
     onUpgrade();
@@ -470,7 +550,7 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
     if (leaving) return;
     sound("dismiss");
     setLeaving(true);
-    window.setTimeout(onDismiss, 260);
+    window.setTimeout(onDismiss, 280);
   }, [leaving, onDismiss, sound]);
 
   const toggleMuted = useCallback(() => {
@@ -495,81 +575,120 @@ export function PlusUpsellOverlay({ onDismiss, onUpgrade }) {
 
   return (
     <Backdrop aria-label="Upgrade to Diff Forge Plus" data-leaving={leaving} role="dialog">
-      <LightSweep aria-hidden="true" />
+      <GodRays aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+      <Streak aria-hidden="true" data-lane="high" />
+      <Streak aria-hidden="true" data-lane="low" />
+      <ImpactFlash aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
       <EmberCanvas aria-hidden="true" ref={canvasRef} />
 
-      <Stage data-phase={phase} data-shake={phase === 1 ? "true" : undefined}>
-        <TierKicker>
-          <i />
-          Diff Forge AI · Tier up
-          <i />
-        </TierKicker>
+      <Stage data-shake={phase === 1 ? "true" : undefined}>
+        {/* ------------------------------------------------ showcase (φ) */}
+        <Showcase>
+          <TierKicker>
+            <i />
+            Diff Forge AI · Tier up
+            <i />
+          </TierKicker>
 
-        <Emblem data-landed={phase >= 1 ? "true" : undefined} ref={emblemRef}>
-          <EmblemRing aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
-          <EmblemArt alt="" draggable={false} src="/pricing/forge-plus-gold.webp" />
-          <EmblemWord>PLUS</EmblemWord>
-          <EmblemHeat>GOLD FLAME</EmblemHeat>
-        </Emblem>
+          <EmblemBlock>
+            <Emblem data-landed={phase >= 1 ? "true" : undefined} ref={emblemRef}>
+              <EmblemRing aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+              <EmblemRing aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} data-late="true" />
+              <EmblemArt alt="" draggable={false} src="/pricing/forge-plus-gold.webp" />
+              <EmblemWord>PLUS</EmblemWord>
+              <EmblemHeat>Gold flame pass</EmblemHeat>
+            </Emblem>
+            <FloorGlow aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+            <HorizonLine aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+          </EmblemBlock>
 
-        <Pitch data-visible={phase >= 2 ? "true" : undefined}>
-          Three agents. One codebase. <em>Zero chaos.</em>
-        </Pitch>
+          <Pitch data-visible={phase >= 2 ? "true" : undefined}>
+            Three agents. One codebase. <em>Zero chaos.</em>
+          </Pitch>
 
-        <PerkList aria-label="Plus plan benefits" data-visible={phase >= 2 ? "true" : undefined}>
-          {PERKS.map((perk, index) => (
-            <PerkRow key={perk.title} style={{ "--perk-index": index }}>
-              <PerkDiamond aria-hidden="true" />
-              <strong>
-                {perk.title === "10,000 credits / month"
-                  ? `${creditCount.toLocaleString()} credits / month`
-                  : perk.title}
-              </strong>
-              <span>{perk.detail}</span>
-            </PerkRow>
-          ))}
-        </PerkList>
+          {/* battle-pass reward track */}
+          <PerkTrack aria-label="Plus plan benefits" data-visible={phase >= 2 ? "true" : undefined}>
+            <PerkRail aria-hidden="true">
+              <i style={{ transform: `scaleX(${tilesLanded / TRACK_PERKS.length})` }} />
+            </PerkRail>
+            {TRACK_PERKS.map((perk, index) => (
+              <PerkTile
+                data-landed={tilesLanded > index ? "true" : undefined}
+                key={perk.title}
+                style={{ "--tile-index": index }}
+              >
+                <PerkGlyph aria-hidden="true">
+                  <b>{perk.glyph}</b>
+                </PerkGlyph>
+                <strong>{perk.title}</strong>
+                <span>{perk.sub}</span>
+              </PerkTile>
+            ))}
+          </PerkTrack>
+        </Showcase>
 
-        <CtaRow data-armed={phase >= 3 ? "true" : undefined}>
-          <CtaButton
-            onClick={handleUpgrade}
-            onMouseEnter={() => {
-              sound("flare");
-              const cta = ctaRef.current;
-              const canvas = canvasRef.current;
-              if (cta && canvas && engineRef.current) {
-                const ctaRect = cta.getBoundingClientRect();
-                const canvasRect = canvas.getBoundingClientRect();
-                engineRef.current.setCtaRect({
-                  x: ctaRect.left - canvasRect.left,
-                  y: ctaRect.top - canvasRect.top,
-                  width: ctaRect.width,
-                  height: ctaRect.height,
-                }, 30);
-              }
-            }}
-            onMouseLeave={() => {
-              const cta = ctaRef.current;
-              const canvas = canvasRef.current;
-              if (cta && canvas && engineRef.current) {
-                const ctaRect = cta.getBoundingClientRect();
-                const canvasRect = canvas.getBoundingClientRect();
-                engineRef.current.setCtaRect({
-                  x: ctaRect.left - canvasRect.left,
-                  y: ctaRect.top - canvasRect.top,
-                  width: ctaRect.width,
-                  height: ctaRect.height,
-                }, 10);
-              }
-            }}
-            ref={ctaRef}
-            type="button"
-          >
-            <span>Upgrade to Plus</span>
-            <b>$60/mo</b>
-          </CtaButton>
-          <CtaHint>Cancel anytime · billed monthly</CtaHint>
-        </CtaRow>
+        {/* ------------------------------------------- purchase card (1) */}
+        <PurchaseCard data-armed={phase >= 3 ? "true" : undefined}>
+          <PurchaseHeader>
+            <span>Season pass</span>
+            <strong>Gold Flame</strong>
+          </PurchaseHeader>
+
+          <PriceRow>
+            <b>$60</b>
+            <span>
+              per month
+              <br />
+              cancel anytime
+            </span>
+          </PriceRow>
+
+          <CreditsMeter>
+            <div>
+              <strong>{creditCount.toLocaleString()}</strong>
+              <span>credits / month</span>
+            </div>
+            <MeterTrack aria-hidden="true">
+              <i style={{ transform: `scaleX(${creditCount / 10000})` }} />
+            </MeterTrack>
+          </CreditsMeter>
+
+          <StampList>
+            <li>
+              <i />
+              Native desktop license
+            </li>
+            <li>
+              <i />
+              Up to 4 synced devices
+            </li>
+            <li>
+              <i />
+              10 GB workspace storage
+            </li>
+            <li>
+              <i />
+              Priority support lane
+            </li>
+          </StampList>
+
+          <CtaWrap>
+            <CtaHalo aria-hidden="true" />
+            <CtaButton
+              onClick={handleUpgrade}
+              onMouseEnter={() => {
+                sound("flare");
+                syncCtaEmitter(32);
+              }}
+              onMouseLeave={() => syncCtaEmitter(12)}
+              ref={ctaRef}
+              type="button"
+            >
+              Upgrade to Plus
+            </CtaButton>
+          </CtaWrap>
+          <CtaHint>Instant activation · billed monthly</CtaHint>
+        </PurchaseCard>
       </Stage>
 
       {/* quiet rail on the left edge */}
@@ -611,10 +730,31 @@ const backdropIn = keyframes`
   to { opacity: 1; }
 `;
 
-const sweepAcross = keyframes`
-  0% { transform: translateX(-130%) skewX(-18deg); opacity: 0; }
-  18% { opacity: 1; }
-  100% { transform: translateX(160%) skewX(-18deg); opacity: 0; }
+const cameraPush = keyframes`
+  from { transform: scale(1.055); }
+  to { transform: scale(1); }
+`;
+
+const raysSpin = keyframes`
+  from { transform: translate(-50%, -50%) rotate(0deg); }
+  to { transform: translate(-50%, -50%) rotate(360deg); }
+`;
+
+const raysIn = keyframes`
+  from { opacity: 0; }
+  to { opacity: 1; }
+`;
+
+const streakSweep = keyframes`
+  0% { transform: translateX(-120%) scaleX(0.6); opacity: 0; }
+  16% { opacity: 1; }
+  100% { transform: translateX(120vw) scaleX(1.4); opacity: 0; }
+`;
+
+const flashPop = keyframes`
+  0% { opacity: 0; }
+  14% { opacity: 0.5; }
+  100% { opacity: 0; }
 `;
 
 const kickerIn = keyframes`
@@ -623,43 +763,66 @@ const kickerIn = keyframes`
 `;
 
 const emblemSlam = keyframes`
-  0% { opacity: 0; transform: scale(2.5) translateY(-26px); filter: blur(7px); }
-  62% { opacity: 1; transform: scale(0.94) translateY(2px); filter: blur(0); }
-  80% { transform: scale(1.04) translateY(0); }
+  0% { opacity: 0; transform: scale(2.6) translateY(-30px); filter: blur(8px); }
+  60% { opacity: 1; transform: scale(0.93) translateY(3px); filter: blur(0); }
+  80% { transform: scale(1.05) translateY(0); }
   100% { opacity: 1; transform: scale(1) translateY(0); filter: blur(0); }
 `;
 
 const ringBlast = keyframes`
-  0% { opacity: 0.9; transform: scale(0.4); }
-  100% { opacity: 0; transform: scale(2.1); }
+  0% { opacity: 0.95; transform: scale(0.36); }
+  100% { opacity: 0; transform: scale(2.3); }
 `;
 
 const stageShake = keyframes`
   0%, 100% { transform: translate(0, 0); }
-  20% { transform: translate(-4px, 3px); }
-  40% { transform: translate(4px, -2px); }
-  60% { transform: translate(-3px, -2px); }
-  80% { transform: translate(2px, 2px); }
+  18% { transform: translate(-5px, 4px); }
+  36% { transform: translate(5px, -3px); }
+  54% { transform: translate(-4px, -3px); }
+  72% { transform: translate(3px, 3px); }
+  88% { transform: translate(-2px, 1px); }
 `;
 
-const perkIn = keyframes`
-  from { opacity: 0; transform: translateX(46px); }
+const horizonIn = keyframes`
+  from { transform: scaleX(0); opacity: 0.9; }
+  to { transform: scaleX(1); opacity: 1; }
+`;
+
+const floorIn = keyframes`
+  from { opacity: 0; transform: scaleX(0.4); }
+  to { opacity: 1; transform: scaleX(1); }
+`;
+
+const tilePop = keyframes`
+  0% { opacity: 0; transform: translateY(22px) scale(0.62); }
+  62% { opacity: 1; transform: translateY(-3px) scale(1.06); }
+  100% { opacity: 1; transform: translateY(0) scale(1); }
+`;
+
+const cardIn = keyframes`
+  from { opacity: 0; transform: translateX(72px); }
   to { opacity: 1; transform: translateX(0); }
 `;
 
 const sheenSweep = keyframes`
-  0%, 58% { transform: translateX(-130%) skewX(-24deg); }
-  100% { transform: translateX(240%) skewX(-24deg); }
+  0%, 56% { transform: translateX(-130%) skewX(-24deg); }
+  100% { transform: translateX(260%) skewX(-24deg); }
+`;
+
+const haloPulse = keyframes`
+  0% { opacity: 0.7; transform: scale(0.97); }
+  70% { opacity: 0; transform: scale(1.22); }
+  100% { opacity: 0; transform: scale(1.22); }
 `;
 
 const emblemFloat = keyframes`
   0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-7px); }
+  50% { transform: translateY(-8px); }
 `;
 
 const wordGlow = keyframes`
-  0%, 100% { text-shadow: 0 0 24px rgba(255, 190, 92, 0.4), 0 2px 0 rgba(120, 66, 0, 0.8); }
-  50% { text-shadow: 0 0 44px rgba(255, 190, 92, 0.75), 0 2px 0 rgba(120, 66, 0, 0.8); }
+  0%, 100% { opacity: 0.42; transform: scale(0.96); }
+  50% { opacity: 0.82; transform: scale(1.08); }
 `;
 
 const reducedMotion = css`
@@ -672,17 +835,18 @@ const reducedMotion = css`
 const Backdrop = styled.div`
   position: fixed;
   inset: 0;
-  z-index: 240;
+  z-index: 400;
   display: grid;
   place-items: center;
   overflow: hidden;
+  /* fully opaque — the app shell stays hidden until this resolves */
   background:
-    radial-gradient(ellipse at 50% 118%, rgba(255, 122, 24, 0.17), transparent 52%),
-    radial-gradient(ellipse at 82% -12%, rgba(255, 190, 92, 0.1), transparent 46%),
-    radial-gradient(ellipse at 12% 8%, rgba(47, 128, 255, 0.07), transparent 42%),
-    rgba(2, 3, 5, 0.97);
-  animation: ${backdropIn} 340ms ease both;
-  transition: opacity 240ms ease;
+    radial-gradient(ellipse at 50% 120%, rgba(120, 58, 8, 0.5), transparent 56%),
+    radial-gradient(ellipse at 84% -14%, rgba(96, 62, 12, 0.34), transparent 46%),
+    radial-gradient(ellipse at 10% 6%, rgba(16, 38, 82, 0.4), transparent 44%),
+    linear-gradient(180deg, #05060a 0%, #030405 58%, #0a0602 100%);
+  animation: ${backdropIn} 320ms ease both;
+  transition: opacity 260ms ease;
   ${reducedMotion};
 
   &[data-leaving="true"] {
@@ -691,23 +855,76 @@ const Backdrop = styled.div`
   }
 `;
 
-const LightSweep = styled.div`
+const GodRays = styled.div`
   position: absolute;
-  top: -12%;
-  bottom: -12%;
-  left: 0;
-  width: 34%;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    rgba(255, 214, 138, 0.075) 40%,
-    rgba(255, 231, 178, 0.12) 50%,
-    rgba(255, 214, 138, 0.075) 60%,
-    transparent
+  top: 38.2%; /* golden section — rays center on the emblem */
+  left: 30%;
+  width: 150vmin;
+  height: 150vmin;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg 22deg,
+    rgba(255, 190, 92, 0.05) 26deg 34deg,
+    transparent 38deg 82deg,
+    rgba(255, 190, 92, 0.04) 88deg 96deg,
+    transparent 100deg 150deg,
+    rgba(255, 214, 138, 0.06) 156deg 165deg,
+    transparent 170deg 222deg,
+    rgba(255, 190, 92, 0.045) 228deg 238deg,
+    transparent 242deg 294deg,
+    rgba(255, 214, 138, 0.05) 300deg 310deg,
+    transparent 314deg 360deg
   );
-  animation: ${sweepAcross} 1.35s cubic-bezier(0.3, 0, 0.24, 1) 120ms both;
+  mask-image: radial-gradient(circle at 50% 50%, #000 0%, transparent 62%);
+  -webkit-mask-image: radial-gradient(circle at 50% 50%, #000 0%, transparent 62%);
+  opacity: 0;
   pointer-events: none;
   will-change: transform;
+  transform: translate(-50%, -50%);
+
+  &[data-landed="true"] {
+    animation:
+      ${raysIn} 900ms ease 100ms both,
+      ${raysSpin} 52s linear infinite;
+  }
+  ${reducedMotion};
+`;
+
+const Streak = styled.div`
+  position: absolute;
+  left: -30%;
+  width: 46%;
+  height: 2px;
+  background: linear-gradient(90deg, transparent, rgba(255, 224, 158, 0.5), transparent);
+  pointer-events: none;
+  will-change: transform;
+  animation: ${streakSweep} 1.05s cubic-bezier(0.3, 0, 0.2, 1) both;
+  ${reducedMotion};
+
+  &[data-lane="high"] {
+    top: 24%;
+    animation-delay: 120ms;
+  }
+
+  &[data-lane="low"] {
+    top: 71%;
+    height: 1px;
+    opacity: 0.7;
+    animation-delay: 300ms;
+    animation-duration: 1.3s;
+  }
+`;
+
+const ImpactFlash = styled.div`
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at 38% 42%, rgba(255, 236, 200, 0.9), rgba(255, 190, 92, 0.3) 40%, transparent 70%);
+  opacity: 0;
+  pointer-events: none;
+
+  &[data-landed="true"] {
+    animation: ${flashPop} 460ms ease-out both;
+  }
   ${reducedMotion};
 `;
 
@@ -719,19 +936,36 @@ const EmberCanvas = styled.canvas`
   pointer-events: none;
 `;
 
+/* golden-ratio stage: showcase φ · purchase card 1 */
 const Stage = styled.div`
   position: relative;
   display: grid;
-  justify-items: center;
-  gap: clamp(12px, 2.6vh, 22px);
-  width: min(660px, calc(100% - 130px));
-  padding: 10px 0;
-  text-align: center;
+  grid-template-columns: minmax(0, 1.618fr) minmax(330px, 1fr);
+  align-items: center;
+  gap: clamp(30px, 4vw, 62px);
+  width: min(1220px, calc(100% - 150px));
+  animation: ${cameraPush} 1.3s cubic-bezier(0.2, 0.7, 0.2, 1) both;
 
   &[data-shake="true"] {
-    animation: ${stageShake} 320ms linear 1;
+    animation:
+      ${stageShake} 340ms linear 1,
+      ${cameraPush} 1.3s cubic-bezier(0.2, 0.7, 0.2, 1) both;
   }
   ${reducedMotion};
+
+  @media (max-width: 1100px) {
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: center;
+    gap: 26px;
+    width: min(680px, calc(100% - 130px));
+  }
+`;
+
+const Showcase = styled.div`
+  display: grid;
+  justify-items: center;
+  gap: clamp(10px, 2.4vh, 20px);
+  text-align: center;
 `;
 
 const TierKicker = styled.p`
@@ -740,15 +974,15 @@ const TierKicker = styled.p`
   gap: 16px;
   margin: 0;
   color: rgba(255, 214, 138, 0.88);
-  font-size: 12px;
+  font-size: 12.5px;
   font-weight: 900;
   letter-spacing: 0.34em;
   text-transform: uppercase;
-  animation: ${kickerIn} 700ms cubic-bezier(0.2, 0.8, 0.2, 1) 180ms both;
+  animation: ${kickerIn} 700ms cubic-bezier(0.2, 0.8, 0.2, 1) 200ms both;
   ${reducedMotion};
 
   i {
-    width: 46px;
+    width: 52px;
     height: 1px;
     background: linear-gradient(90deg, transparent, rgba(255, 214, 138, 0.55));
   }
@@ -758,8 +992,16 @@ const TierKicker = styled.p`
   }
 `;
 
+const EmblemBlock = styled.div`
+  position: relative;
+  display: grid;
+  justify-items: center;
+  padding-bottom: 18px;
+`;
+
 const Emblem = styled.div`
   position: relative;
+  z-index: 1;
   display: grid;
   justify-items: center;
   gap: 2px;
@@ -769,8 +1011,8 @@ const Emblem = styled.div`
   &[data-landed="true"] {
     opacity: 1;
     animation:
-      ${emblemSlam} 480ms cubic-bezier(0.16, 1.1, 0.3, 1) both,
-      ${emblemFloat} 5.5s ease-in-out 1.4s infinite;
+      ${emblemSlam} 500ms cubic-bezier(0.16, 1.1, 0.3, 1) both,
+      ${emblemFloat} 5.5s ease-in-out 1.5s infinite;
   }
   ${reducedMotion};
 
@@ -781,62 +1023,129 @@ const Emblem = styled.div`
 
 const EmblemRing = styled.i`
   position: absolute;
-  top: calc(50% - 96px);
-  left: calc(50% - 96px);
-  width: 192px;
-  height: 192px;
-  border: 2px solid rgba(255, 208, 126, 0.75);
+  top: calc(50% - 110px);
+  left: calc(50% - 110px);
+  width: 220px;
+  height: 220px;
+  border: 2px solid rgba(255, 208, 126, 0.8);
   border-radius: 50%;
   opacity: 0;
   pointer-events: none;
 
   &[data-landed="true"] {
-    animation: ${ringBlast} 700ms cubic-bezier(0.2, 0.7, 0.3, 1) 60ms both;
+    animation: ${ringBlast} 720ms cubic-bezier(0.2, 0.7, 0.3, 1) 40ms both;
+  }
+
+  &[data-late="true"] {
+    border-width: 1px;
+    border-color: rgba(255, 236, 189, 0.6);
+  }
+
+  &[data-landed="true"][data-late="true"] {
+    animation-delay: 190ms;
+    animation-duration: 860ms;
   }
   ${reducedMotion};
 `;
 
 const EmblemArt = styled.img`
-  width: clamp(132px, 21vh, 188px);
-  height: clamp(132px, 21vh, 188px);
+  width: clamp(150px, 24vh, 214px);
+  height: clamp(150px, 24vh, 214px);
   object-fit: contain;
   /* the plan art ships on a black plate — feather it into the backdrop */
   mask-image: radial-gradient(circle at 50% 47%, #000 52%, transparent 72%);
   -webkit-mask-image: radial-gradient(circle at 50% 47%, #000 52%, transparent 72%);
   filter:
-    drop-shadow(0 14px 34px rgba(0, 0, 0, 0.6))
-    drop-shadow(0 0 30px rgba(255, 170, 60, 0.34));
+    drop-shadow(0 16px 38px rgba(0, 0, 0, 0.62))
+    drop-shadow(0 0 34px rgba(255, 170, 60, 0.36));
   user-select: none;
   -webkit-user-drag: none;
 `;
 
 const EmblemWord = styled.strong`
-  margin-top: -8px;
+  position: relative;
+  margin-top: -10px;
   background: linear-gradient(180deg, #ffe9bd 8%, #ffc963 38%, #b97818 62%, #ffdf9c 88%);
   background-clip: text;
   -webkit-background-clip: text;
   color: transparent;
-  font-size: clamp(44px, 8vh, 66px);
+  font-size: clamp(52px, 9.6vh, 80px);
   font-weight: 950;
-  letter-spacing: 0.16em;
+  letter-spacing: 0.17em;
   line-height: 1;
-  animation: ${wordGlow} 3.4s ease-in-out infinite;
+  isolation: isolate;
   ${reducedMotion};
+
+  &::after {
+    content: "";
+    position: absolute;
+    inset: -18% -12%;
+    z-index: -1;
+    border-radius: 999px;
+    background:
+      radial-gradient(ellipse at 50% 50%, rgba(255, 190, 92, 0.78), rgba(255, 190, 92, 0.18) 42%, transparent 72%);
+    filter: blur(14px);
+    opacity: 0.42;
+    transform: scale(0.96);
+    animation: ${wordGlow} 3.4s ease-in-out infinite;
+    pointer-events: none;
+    will-change: opacity, transform;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    &::after {
+      animation: none !important;
+    }
+  }
 `;
 
 const EmblemHeat = styled.span`
   color: rgba(255, 214, 138, 0.62);
-  font-size: 10.5px;
+  font-size: 11px;
   font-weight: 900;
-  letter-spacing: 0.42em;
+  letter-spacing: 0.44em;
   text-transform: uppercase;
+`;
+
+const FloorGlow = styled.i`
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  width: 74%;
+  height: 34px;
+  margin-left: -37%;
+  background: radial-gradient(ellipse at 50% 100%, rgba(255, 176, 66, 0.3), transparent 68%);
+  opacity: 0;
+  pointer-events: none;
+  transform-origin: 50% 100%;
+
+  &[data-landed="true"] {
+    animation: ${floorIn} 600ms ease-out 120ms both;
+  }
+  ${reducedMotion};
+`;
+
+const HorizonLine = styled.i`
+  position: absolute;
+  bottom: 0;
+  left: 6%;
+  width: 88%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 208, 126, 0.65) 30%, rgba(255, 236, 189, 0.9) 50%, rgba(255, 208, 126, 0.65) 70%, transparent);
+  opacity: 0;
+  pointer-events: none;
+
+  &[data-landed="true"] {
+    animation: ${horizonIn} 560ms cubic-bezier(0.2, 0.8, 0.2, 1) 80ms both;
+  }
+  ${reducedMotion};
 `;
 
 const Pitch = styled.p`
   margin: 0;
-  color: rgba(226, 232, 240, 0.88);
-  font-size: clamp(15px, 2.3vh, 18px);
-  font-weight: 740;
+  color: rgba(226, 232, 240, 0.9);
+  font-size: clamp(15px, 2.4vh, 19px);
+  font-weight: 760;
   opacity: 0;
   transform: translateY(10px);
   transition: opacity 420ms ease, transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
@@ -854,21 +1163,25 @@ const Pitch = styled.p`
   ${reducedMotion};
 `;
 
-const PerkList = styled.ul`
+/* -------------------------------------------------- battle-pass track */
+
+const PerkTrack = styled.ul`
+  position: relative;
   display: grid;
-  gap: 7px;
-  width: min(430px, 100%);
-  margin: 0;
-  padding: 0;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+  margin: 6px 0 0;
+  padding: 14px 0 0;
   list-style: none;
 
   li {
     visibility: hidden;
   }
 
-  &[data-visible="true"] li {
+  &[data-visible="true"] li[data-landed="true"] {
     visibility: visible;
-    animation: ${perkIn} 360ms cubic-bezier(0.18, 0.9, 0.26, 1) calc(var(--perk-index) * 110ms) both;
+    animation: ${tilePop} 380ms cubic-bezier(0.2, 1, 0.3, 1) both;
   }
   ${reducedMotion};
 
@@ -879,90 +1192,265 @@ const PerkList = styled.ul`
   }
 `;
 
-const PerkRow = styled.li`
+const PerkRail = styled.div`
+  position: absolute;
+  top: 0;
+  right: 4%;
+  left: 4%;
+  height: 2px;
+  background: rgba(255, 209, 102, 0.14);
+
+  i {
+    display: block;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, rgba(255, 190, 92, 0.9), rgba(255, 236, 189, 0.9));
+    box-shadow: 0 0 12px rgba(255, 190, 92, 0.55);
+    transform-origin: 0 50%;
+    transition: transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  }
+`;
+
+const PerkTile = styled.li`
   display: grid;
-  grid-template-columns: 22px minmax(0, auto) minmax(0, 1fr);
-  align-items: baseline;
-  gap: 10px;
-  padding: 8px 14px;
-  border: 1px solid rgba(255, 209, 102, 0.14);
-  border-left: 2px solid rgba(255, 190, 92, 0.55);
-  border-radius: 4px;
-  background: linear-gradient(90deg, rgba(255, 176, 66, 0.08), rgba(255, 176, 66, 0.014) 62%, transparent);
-  clip-path: polygon(0 0, 100% 0, calc(100% - 10px) 100%, 0 100%);
-  text-align: left;
+  justify-items: center;
+  gap: 3px;
+  padding: 13px 6px 11px;
+  border: 1px solid rgba(255, 209, 102, 0.2);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(255, 176, 66, 0.1), rgba(255, 176, 66, 0.015) 62%),
+    rgba(8, 7, 5, 0.82);
+  box-shadow: inset 0 1px 0 rgba(255, 236, 189, 0.1);
+  clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
+  text-align: center;
 
   strong {
     color: #fdf3dc;
-    font-size: 13px;
-    font-weight: 860;
+    font-size: 12.5px;
+    font-weight: 880;
     white-space: nowrap;
   }
 
   span {
-    overflow: hidden;
-    color: rgba(203, 213, 225, 0.6);
-    font-size: 11.5px;
-    font-weight: 680;
-    text-overflow: ellipsis;
+    color: rgba(203, 213, 225, 0.55);
+    font-size: 10px;
+    font-weight: 720;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
     white-space: nowrap;
   }
 `;
 
-const PerkDiamond = styled.i`
-  align-self: center;
-  width: 9px;
-  height: 9px;
-  background: linear-gradient(135deg, #ffe9bd, #f5a623);
-  box-shadow: 0 0 10px rgba(255, 176, 66, 0.6);
+const PerkGlyph = styled.i`
+  display: grid;
+  width: 30px;
+  height: 30px;
+  place-items: center;
+  margin-bottom: 4px;
+  background: linear-gradient(135deg, rgba(255, 233, 189, 0.95), rgba(245, 166, 35, 0.95));
+  box-shadow: 0 0 14px rgba(255, 176, 66, 0.5);
   transform: rotate(45deg);
+  border-radius: 6px;
+
+  b {
+    color: #2a1602;
+    font-size: 14px;
+    font-style: normal;
+    transform: rotate(-45deg);
+  }
 `;
 
-const CtaRow = styled.div`
+/* ---------------------------------------------------- purchase card */
+
+const PurchaseCard = styled.aside`
+  position: relative;
   display: grid;
-  justify-items: center;
-  gap: 9px;
-  margin-top: 4px;
+  gap: clamp(12px, 2.2vh, 18px);
+  padding: clamp(20px, 3.4vh, 30px) clamp(20px, 2.2vw, 30px);
+  border: 1px solid rgba(255, 209, 102, 0.34);
+  border-radius: 12px;
+  background:
+    linear-gradient(160deg, rgba(255, 190, 92, 0.1), rgba(255, 190, 92, 0.02) 34%),
+    linear-gradient(180deg, rgba(16, 13, 8, 0.96), rgba(8, 7, 5, 0.96));
+  box-shadow:
+    0 30px 90px rgba(0, 0, 0, 0.6),
+    0 0 60px rgba(255, 170, 60, 0.12),
+    inset 0 1px 0 rgba(255, 236, 189, 0.14);
+  clip-path: polygon(18px 0, 100% 0, 100% calc(100% - 18px), calc(100% - 18px) 100%, 0 100%, 0 18px);
   opacity: 0;
-  transform: translateY(14px);
-  transition: opacity 420ms ease, transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
+  visibility: hidden;
 
   &[data-armed="true"] {
+    visibility: visible;
+    animation: ${cardIn} 480ms cubic-bezier(0.18, 0.9, 0.24, 1) both;
     opacity: 1;
-    transform: translateY(0);
   }
+  ${reducedMotion};
+
+  @media (prefers-reduced-motion: reduce) {
+    opacity: 1;
+    visibility: visible;
+  }
+`;
+
+const PurchaseHeader = styled.header`
+  display: grid;
+  gap: 2px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid rgba(255, 209, 102, 0.16);
+
+  span {
+    color: rgba(255, 214, 138, 0.6);
+    font-size: 10.5px;
+    font-weight: 900;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+  }
+
+  strong {
+    background: linear-gradient(180deg, #ffe9bd 10%, #ffc963 55%, #d9952c 90%);
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    font-size: 25px;
+    font-weight: 950;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+  }
+`;
+
+const PriceRow = styled.div`
+  display: flex;
+  align-items: baseline;
+  gap: 13px;
+
+  b {
+    color: #fff6df;
+    font-size: clamp(44px, 7vh, 56px);
+    font-weight: 950;
+    letter-spacing: -0.02em;
+    line-height: 0.9;
+    text-shadow: 0 0 30px rgba(255, 190, 92, 0.28);
+  }
+
+  span {
+    color: rgba(203, 213, 225, 0.6);
+    font-size: 11.5px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    line-height: 1.5;
+    text-transform: uppercase;
+  }
+`;
+
+const CreditsMeter = styled.div`
+  display: grid;
+  gap: 7px;
+
+  div {
+    display: flex;
+    align-items: baseline;
+    gap: 9px;
+  }
+
+  strong {
+    color: #ffd166;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 21px;
+    font-weight: 900;
+    letter-spacing: 0.02em;
+  }
+
+  span {
+    color: rgba(203, 213, 225, 0.55);
+    font-size: 10.5px;
+    font-weight: 800;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+`;
+
+const MeterTrack = styled.div`
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.07);
+
+  i {
+    display: block;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, #b97818, #ffc963 60%, #ffe9bd);
+    box-shadow: 0 0 14px rgba(255, 190, 92, 0.6);
+    transform-origin: 0 50%;
+    transition: transform 120ms linear;
+  }
+`;
+
+const StampList = styled.ul`
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+
+  li {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: rgba(226, 232, 240, 0.82);
+    font-size: 12.5px;
+    font-weight: 780;
+  }
+
+  i {
+    width: 8px;
+    height: 8px;
+    flex: 0 0 auto;
+    background: linear-gradient(135deg, #ffe9bd, #f5a623);
+    box-shadow: 0 0 9px rgba(255, 176, 66, 0.6);
+    transform: rotate(45deg);
+  }
+`;
+
+const CtaWrap = styled.div`
+  position: relative;
+  margin-top: 2px;
+`;
+
+const CtaHalo = styled.i`
+  position: absolute;
+  inset: -7px;
+  border: 2px solid rgba(255, 208, 126, 0.7);
+  border-radius: 10px;
+  animation: ${haloPulse} 2.1s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
+  pointer-events: none;
   ${reducedMotion};
 `;
 
 const CtaButton = styled.button`
   position: relative;
-  display: inline-flex;
-  align-items: center;
-  gap: 14px;
-  padding: 15px 34px;
+  display: grid;
+  width: 100%;
+  place-items: center;
+  padding: 17px 20px;
   overflow: hidden;
-  border: 1px solid rgba(255, 222, 150, 0.65);
-  border-radius: 6px;
+  border: 1px solid rgba(255, 222, 150, 0.7);
+  border-radius: 7px;
   color: #1c1002;
   background: linear-gradient(180deg, #ffe1a0 0%, #ffb43e 46%, #e8901c 58%, #ffcf7a 100%);
   box-shadow:
-    0 10px 34px rgba(232, 144, 28, 0.36),
-    0 0 54px rgba(255, 170, 60, 0.22),
+    0 12px 38px rgba(232, 144, 28, 0.42),
+    0 0 64px rgba(255, 170, 60, 0.26),
     inset 0 1px 0 rgba(255, 255, 255, 0.65);
   cursor: pointer;
-  font-size: 16px;
+  font-size: 16.5px;
   font-weight: 950;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.11em;
   text-transform: uppercase;
   transition: transform 140ms ease, box-shadow 140ms ease;
   will-change: transform;
-
-  b {
-    padding-left: 14px;
-    border-left: 1px solid rgba(64, 36, 2, 0.35);
-    font-size: 13.5px;
-    letter-spacing: 0.04em;
-  }
 
   &::after {
     content: "";
@@ -971,8 +1459,8 @@ const CtaButton = styled.button`
     bottom: -30%;
     left: 0;
     width: 34%;
-    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.55), transparent);
-    animation: ${sheenSweep} 2.6s cubic-bezier(0.3, 0, 0.3, 1) infinite;
+    background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.6), transparent);
+    animation: ${sheenSweep} 2.4s cubic-bezier(0.3, 0, 0.3, 1) infinite;
     pointer-events: none;
   }
   ${reducedMotion};
@@ -980,11 +1468,11 @@ const CtaButton = styled.button`
   &:hover,
   &:focus-visible {
     outline: none;
-    transform: translateY(-2px) scale(1.025);
+    transform: translateY(-2px) scale(1.02);
     box-shadow:
-      0 16px 44px rgba(232, 144, 28, 0.5),
-      0 0 74px rgba(255, 170, 60, 0.4),
-      inset 0 1px 0 rgba(255, 255, 255, 0.7);
+      0 18px 50px rgba(232, 144, 28, 0.56),
+      0 0 84px rgba(255, 170, 60, 0.44),
+      inset 0 1px 0 rgba(255, 255, 255, 0.72);
   }
 
   &:active {
@@ -993,12 +1481,15 @@ const CtaButton = styled.button`
 `;
 
 const CtaHint = styled.span`
-  color: rgba(203, 213, 225, 0.42);
+  color: rgba(203, 213, 225, 0.45);
   font-size: 10.5px;
-  font-weight: 760;
-  letter-spacing: 0.08em;
+  font-weight: 780;
+  letter-spacing: 0.09em;
+  text-align: center;
   text-transform: uppercase;
 `;
+
+/* ------------------------------------------------------- side rail */
 
 const SideRail = styled.div`
   position: absolute;

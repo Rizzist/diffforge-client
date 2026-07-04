@@ -4,7 +4,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { Terminal as XTerm } from "@xterm/xterm";
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import {
   getAgentLaunchDefault,
@@ -443,7 +443,9 @@ import {
   TERMINAL_OUTPUT_DIAGNOSTIC_WINDOW_MS,
   TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES,
   TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES,
+  TERMINAL_OUTPUT_FLUSH_HIDDEN_MAX_BYTES,
   TERMINAL_OUTPUT_FLUSH_MIN_BYTES,
+  TERMINAL_OUTPUT_HIDDEN_BATCH_MAX_BYTES,
   TERMINAL_OUTPUT_WRITE_DIAGNOSTIC_SLOW_MS,
   TERMINAL_OUTPUT_WRITE_MIN_BYTES,
   TERMINAL_OUTPUT_WRITE_TARGET_MS,
@@ -2156,15 +2158,17 @@ function WorkspaceTerminal({
   const shellLauncherInputRef = useRef(null);
   const resizeControllerRef = useRef(null);
   const windowBreakoutHostedRef = useRef(windowBreakoutHosted);
+  const terminalOutputFlushNowRef = useRef(null);
 
   // While a pane is hosted in its own Window Breakout window, the native
   // window owns the PTY size; the grid's resize controller stands down and
   // re-asserts the grid geometry the moment the pane returns.
-  useEffect(() => {
+  useLayoutEffect(() => {
     const wasHosted = windowBreakoutHostedRef.current;
     windowBreakoutHostedRef.current = windowBreakoutHosted;
 
     if (wasHosted && !windowBreakoutHosted) {
+      terminalOutputFlushNowRef.current?.("window_breakout_return");
       resizeControllerRef.current?.resizeNow("window_breakout_return", {
         force: true,
         forceNative: true,
@@ -2249,7 +2253,6 @@ function WorkspaceTerminal({
   const resetTerminalWebglRendererRef = useRef(null);
   const touchTerminalWebglRendererRef = useRef(null);
   const terminalOutputWorkerSessionRef = useRef(null);
-  const terminalOutputFlushNowRef = useRef(null);
   const terminalPointerSelectionPendingRef = useRef(false);
   const lastAgentLaunchEpochRef = useRef(0);
   const startAgentInPrewarmedTerminalRef = useRef(null);
@@ -5319,7 +5322,7 @@ function WorkspaceTerminal({
     activateTerminalPane("terminal_ui_view_pointer", { focusKeyboard: false });
   }, [activateTerminalPane]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const nextActive = Boolean(isActive);
     const wasActiveProp = terminalActivePropRef.current === true;
     terminalActivePropRef.current = nextActive;
@@ -5904,7 +5907,17 @@ function WorkspaceTerminal({
     let pendingOutputBytes = 0;
     let outputBatchQueuedAt = 0;
     let outputWriteInFlight = false;
+    let forceOutputFlushAfterWriteReason = "";
     let outputAdaptiveFlushMaxBytes = TERMINAL_OUTPUT_BATCH_MAX_BYTES;
+    let terminalOutputRenderVisible = () => !windowBreakoutHostedRef.current;
+    const isTerminalOutputRenderVisible = () => {
+      try {
+        return terminalOutputRenderVisible() !== false;
+      } catch (_error) {
+        return terminalActiveRef.current === true && !windowBreakoutHostedRef.current;
+      }
+    };
+    const isTerminalOutputHidden = () => !isTerminalOutputRenderVisible();
     let visibleOutputRefreshTimer = 0;
     let sawFirstOutput = false;
     let sawFirstVisibleOutput = false;
@@ -7606,7 +7619,14 @@ function WorkspaceTerminal({
       return combined;
     };
 
-    const getTerminalOutputFlushByteBudget = () => {
+    const getTerminalOutputFlushByteBudget = (options = {}) => {
+      if (options.flushAll === true) {
+        return Math.max(TERMINAL_OUTPUT_FLUSH_MIN_BYTES, pendingOutputBytes);
+      }
+      if (isTerminalOutputHidden()) {
+        return TERMINAL_OUTPUT_FLUSH_HIDDEN_MAX_BYTES;
+      }
+
       const active = terminalActiveRef.current;
       const baseBudget = active
         ? TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES
@@ -7618,7 +7638,11 @@ function WorkspaceTerminal({
       );
     };
 
-    const recordTerminalOutputWriteTiming = (writeCallbackMs, batchBytes) => {
+    const recordTerminalOutputWriteTiming = (writeCallbackMs, batchBytes, options = {}) => {
+      if (options.hidden === true) {
+        return;
+      }
+
       const elapsedMs = Math.max(0, Number(writeCallbackMs || 0));
       const bytes = Math.max(0, Number(batchBytes || 0));
       const active = terminalActiveRef.current;
@@ -7724,16 +7748,35 @@ function WorkspaceTerminal({
       };
     };
 
-    const flushTerminalOutputBatch = (reason) => {
+    function scheduleRemainingTerminalOutputWrites() {
+      if (!pendingOutputWrites.length) {
+        forceOutputFlushAfterWriteReason = "";
+        return;
+      }
+
+      const forcedFlushReason = forceOutputFlushAfterWriteReason;
+      forceOutputFlushAfterWriteReason = "";
+      if (forcedFlushReason) {
+        flushTerminalOutputBatch(forcedFlushReason, { flushAll: true });
+      } else {
+        scheduleTerminalOutputBatchFlush();
+      }
+    }
+
+    const flushTerminalOutputBatch = (reason, options = {}) => {
       if (isDisposed || !pendingOutputWrites.length) {
         cancelTerminalOutputBatchTimers();
         pendingOutputWrites.length = 0;
         pendingOutputBytes = 0;
         outputBatchQueuedAt = 0;
+        forceOutputFlushAfterWriteReason = "";
         return;
       }
 
       if (outputWriteInFlight) {
+        if (options.flushAll === true) {
+          forceOutputFlushAfterWriteReason = reason || "flush_now";
+        }
         scheduleTerminalOutputBatchFlush();
         return;
       }
@@ -7745,7 +7788,7 @@ function WorkspaceTerminal({
         queuedMs,
         remainingBytes,
         writes,
-      } = takeTerminalOutputBatch(getTerminalOutputFlushByteBudget());
+      } = takeTerminalOutputBatch(getTerminalOutputFlushByteBudget(options));
       if (!writes.length || batchBytes <= 0) {
         scheduleTerminalOutputBatchFlush();
         return;
@@ -7778,9 +7821,7 @@ function WorkspaceTerminal({
         reason,
         writes: writes.length,
       })) {
-        if (pendingOutputWrites.length) {
-          scheduleTerminalOutputBatchFlush();
-        }
+        scheduleRemainingTerminalOutputWrites();
         return;
       }
       if (shouldDropClaudeResizeDuplicateRepaint(batchData, {
@@ -7788,9 +7829,7 @@ function WorkspaceTerminal({
         reason,
         writes: writes.length,
       })) {
-        if (pendingOutputWrites.length) {
-          scheduleTerminalOutputBatchFlush();
-        }
+        scheduleRemainingTerminalOutputWrites();
         return;
       }
       if (terminalDiagnosticsEnabled) {
@@ -7805,6 +7844,7 @@ function WorkspaceTerminal({
         outputDiagnosticFlushReasons[reason] = (outputDiagnosticFlushReasons[reason] || 0) + 1;
       }
       const writeStartedAt = performance.now();
+      const outputHiddenAtWrite = isTerminalOutputHidden();
       outputWriteInFlight = true;
       const handleTerminalWriteComplete = () => {
         outputWriteInFlight = false;
@@ -7818,7 +7858,9 @@ function WorkspaceTerminal({
           writes: writes.length,
         });
         const writeCallbackMs = performance.now() - writeStartedAt;
-        recordTerminalOutputWriteTiming(writeCallbackMs, batchBytes);
+        recordTerminalOutputWriteTiming(writeCallbackMs, batchBytes, {
+          hidden: outputHiddenAtWrite,
+        });
         const elapsedMs = performance.now() - flushStartedAt;
         if (terminalDiagnosticsEnabled) {
           outputDiagnosticWriteCallbackMs += writeCallbackMs;
@@ -7963,9 +8005,7 @@ function WorkspaceTerminal({
           }, TERMINAL_SLASH_COMMAND_OUTPUT_PROBE_DELAYS_MS);
         }
 
-        if (pendingOutputWrites.length) {
-          scheduleTerminalOutputBatchFlush();
-        }
+        scheduleRemainingTerminalOutputWrites();
 
         if (isFirstOutputChunk) {
           refreshTerminalRenderer("first_output_written", {
@@ -8010,18 +8050,16 @@ function WorkspaceTerminal({
           terminalIndex,
           writes: writes.length,
         });
-        if (pendingOutputWrites.length) {
-          scheduleTerminalOutputBatchFlush();
-        }
+        scheduleRemainingTerminalOutputWrites();
       }
     };
 
     const scheduleTerminalOutputBatchFlush = () => {
       terminalGlobalRenderScheduler.request(renderSchedulerId);
     };
-    const flushCurrentOutputNow = () => {
+    const flushCurrentOutputNow = (reason = "flush_now") => {
       if (pendingOutputWrites.length) {
-        terminalGlobalRenderScheduler.request(renderSchedulerId);
+        flushTerminalOutputBatch(reason, { flushAll: true });
       }
     };
     terminalOutputFlushNowRef.current = flushCurrentOutputNow;
@@ -8030,13 +8068,16 @@ function WorkspaceTerminal({
       flush: (reason) => flushTerminalOutputBatch(reason),
       getPendingBytes: () => pendingOutputBytes,
       getQueuedAt: () => outputBatchQueuedAt,
-      hasPriorityPending: () => terminalActiveRef.current && pendingOutputWrites.some((write) => (
-        write?.isFirstOutputChunk === true
-        || write?.isFirstVisibleOutputChunk === true
-      )),
+      hasPriorityPending: () => terminalActiveRef.current
+        && isTerminalOutputRenderVisible()
+        && pendingOutputWrites.some((write) => (
+          write?.isFirstOutputChunk === true
+          || write?.isFirstVisibleOutputChunk === true
+        )),
       hasPending: () => !isDisposed && !outputWriteInFlight && pendingOutputWrites.length > 0,
       id: renderSchedulerId,
-      isActive: () => terminalActiveRef.current,
+      isActive: () => terminalActiveRef.current && isTerminalOutputRenderVisible(),
+      isVisible: () => isTerminalOutputRenderVisible(),
     });
     disposables.push(() => {
       if (terminalOutputFlushNowRef.current === flushCurrentOutputNow) {
@@ -8075,7 +8116,10 @@ function WorkspaceTerminal({
 	      });
       pendingOutputBytes += queuedData.byteLength;
 
-      if (pendingOutputBytes >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+      const outputBatchMaxBytes = isTerminalOutputHidden()
+        ? TERMINAL_OUTPUT_HIDDEN_BATCH_MAX_BYTES
+        : TERMINAL_OUTPUT_BATCH_MAX_BYTES;
+      if (pendingOutputBytes >= outputBatchMaxBytes) {
         scheduleTerminalOutputBatchFlush();
         return;
       }
@@ -10428,6 +10472,7 @@ function WorkspaceTerminal({
 
       return true;
     };
+    terminalOutputRenderVisible = () => terminalVisibleForPaint() && !windowBreakoutHostedRef.current;
 
     resizeController = createTerminalResizeController({
       canResize: () => hasOpenPty && !isDisposed && !windowBreakoutHostedRef.current,
@@ -10548,28 +10593,28 @@ function WorkspaceTerminal({
           attachDeferredWebglRef.current?.(reason);
         }
         scheduleVisibleOutputRefresh(`${reason}_retry`, {}, 48);
-	      };
+      };
 
-	      const revealTimers = new Set();
-	      let revealWebglResetScheduled = false;
-	      const scheduleRevealRecovery = (reason, options = {}) => {
-	        const delays = Array.isArray(options.delays) && options.delays.length
-	          ? options.delays
-	          : [0, 80, 220];
-	        const shouldResetWebgl = options.resetWebgl !== false && !revealWebglResetScheduled;
-	        if (shouldResetWebgl) {
-	          revealWebglResetScheduled = true;
-	        }
-	        delays.forEach((delayMs) => {
-	          const timer = window.setTimeout(() => {
-	            revealTimers.delete(timer);
-	            recoverRevealedTerminalPaint(delayMs ? `${reason}_settled` : reason, {
-	              resetWebgl: delayMs === 0 && shouldResetWebgl,
-	            });
-	          }, Math.max(0, Number(delayMs) || 0));
-	          revealTimers.add(timer);
-	        });
-	      };
+      const revealTimers = new Set();
+      let revealWebglResetScheduled = false;
+      const scheduleRevealRecovery = (reason, options = {}) => {
+        const delays = Array.isArray(options.delays) && options.delays.length
+          ? options.delays
+          : [0, 80, 220];
+        const shouldResetWebgl = options.resetWebgl !== false && !revealWebglResetScheduled;
+        if (shouldResetWebgl) {
+          revealWebglResetScheduled = true;
+        }
+        delays.forEach((delayMs) => {
+          const timer = window.setTimeout(() => {
+            revealTimers.delete(timer);
+            recoverRevealedTerminalPaint(delayMs ? `${reason}_settled` : reason, {
+              resetWebgl: delayMs === 0 && shouldResetWebgl,
+            });
+          }, Math.max(0, Number(delayMs) || 0));
+          revealTimers.add(timer);
+        });
+      };
 
       const observeTargets = [];
       let ancestor = terminalSurfaceSlot || container;
@@ -10582,16 +10627,22 @@ function WorkspaceTerminal({
       }
 
       let surfaceWasVisible = terminalVisibleForPaint();
+      let outputWasVisible = isTerminalOutputRenderVisible();
       const handleRevealCandidate = (reason, options = {}) => {
         const surfaceVisibleNow = terminalVisibleForPaint();
-	        if (surfaceVisibleNow && (!surfaceWasVisible || options.force === true)) {
-	          scheduleRevealRecovery(reason, options);
-	        }
-	        if (!surfaceVisibleNow) {
-	          revealWebglResetScheduled = false;
-	        }
-	        surfaceWasVisible = surfaceVisibleNow;
-	      };
+        const outputVisibleNow = isTerminalOutputRenderVisible();
+        if (outputVisibleNow && (!outputWasVisible || options.force === true)) {
+          flushCurrentOutputNow(reason);
+        }
+        if (surfaceVisibleNow && (!surfaceWasVisible || options.force === true)) {
+          scheduleRevealRecovery(reason, options);
+        }
+        if (!surfaceVisibleNow) {
+          revealWebglResetScheduled = false;
+        }
+        surfaceWasVisible = surfaceVisibleNow;
+        outputWasVisible = outputVisibleNow;
+      };
 
       const revealObserver = new MutationObserver(() => {
         handleRevealCandidate("surface_revealed");

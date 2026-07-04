@@ -14,6 +14,7 @@ import {
   projectDurationMs,
 } from "./videoEditorModel.js";
 import { VideoIconButton } from "./videoStyles.js";
+import { getRenderabilitySnapshot, subscribeToRenderability } from "../app/renderability.js";
 
 const PRELOAD_AHEAD_MS = 3000;
 const EVICT_BEHIND_MS = 5000;
@@ -511,6 +512,22 @@ export default function VideoEditor({
     [getGainEvaluator],
   );
 
+  const audioIsActivelyPlaying = useCallback(() => {
+    for (const entry of mediaPoolRef.current.values()) {
+      const element = entry?.element;
+      if (
+        element
+        && !element.paused
+        && !element.ended
+        && !element.muted
+        && Number(element.volume || 0) > 0.001
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }, []);
+
   const syncMediaForTime = useCallback(
     (timelineMs, { now = performance.now(), playing: shouldPlay = playingRef.current, seekActive = false } = {}) => {
       const currentProject = projectRef.current;
@@ -735,6 +752,8 @@ export default function VideoEditor({
     if (!playing) {
       return undefined;
     }
+    let disposed = false;
+    let renderable = getRenderabilitySnapshot().renderable;
 
     const writeClockMs = (nextMs) => {
       if (playback?.setMs) {
@@ -747,11 +766,39 @@ export default function VideoEditor({
       }
     };
 
+    const shouldRunClock = () => renderable || audioIsActivelyPlaying();
+    const pauseHiddenSilentPlayback = () => {
+      const currentMs = playback?.getMs?.() ?? playheadMsRef.current;
+      syncMediaForTime(currentMs, { now: performance.now(), playing: false, seekActive: false });
+    };
+    const stopClock = () => {
+      if (rafRef.current) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = 0;
+      }
+      lastGapTickRef.current = 0;
+    };
+    const scheduleClock = () => {
+      if (disposed || rafRef.current || !shouldRunClock()) {
+        return;
+      }
+      rafRef.current = window.requestAnimationFrame(tick);
+    };
+
     const startMs = playback?.getMs?.() ?? playheadMsRef.current;
-    const startSync = syncMediaForTime(startMs, { now: performance.now(), playing: true, seekActive: true });
+    const startShouldPlay = shouldRunClock();
+    const startSync = syncMediaForTime(startMs, { now: performance.now(), playing: startShouldPlay, seekActive: true });
     primaryClockIdRef.current = startSync.primary?.clip.id || "";
 
     const tick = (now) => {
+      rafRef.current = 0;
+      if (disposed) {
+        return;
+      }
+      if (!shouldRunClock()) {
+        pauseHiddenSilentPlayback();
+        return;
+      }
       const currentMs = playback?.getMs?.() ?? startMs;
       let sync = syncMediaForTime(currentMs, { now, playing: true, seekActive: false });
       const primaryId = sync.primary?.clip.id || "";
@@ -790,14 +837,31 @@ export default function VideoEditor({
       }
 
       writeClockMs(nextMs);
-      rafRef.current = window.requestAnimationFrame(tick);
+      scheduleClock();
     };
 
-    rafRef.current = window.requestAnimationFrame(tick);
-    return () => window.cancelAnimationFrame(rafRef.current);
+    const unsubscribeRenderability = subscribeToRenderability((nextSnapshot) => {
+      renderable = nextSnapshot.renderable;
+      if (shouldRunClock()) {
+        scheduleClock();
+      } else {
+        stopClock();
+        pauseHiddenSilentPlayback();
+      }
+    });
+    if (shouldRunClock()) {
+      scheduleClock();
+    } else {
+      pauseHiddenSilentPlayback();
+    }
+    return () => {
+      disposed = true;
+      unsubscribeRenderability();
+      stopClock();
+    };
     // playheadMs deliberately read via ref: the 200ms UI-cadence prop must
     // not restart the playback loop (each restart re-seeks the primary).
-  }, [applyPreviewStyles, onTogglePlay, playback, playing, syncMediaForTime, updateTransportDom]);
+  }, [applyPreviewStyles, audioIsActivelyPlaying, onTogglePlay, playback, playing, syncMediaForTime, updateTransportDom]);
 
   // Tear the pool down on unmount.
   useEffect(

@@ -1,5 +1,6 @@
 const WEB_PANEL_LABEL_PREFIX: &str = "web-panel-";
 const WEB_PANEL_CLOSED_EVENT: &str = "forge-web-panel-closed";
+const WEB_PANEL_WEBVIEW_PRESERVED_EVENT: &str = "forge-web-panel-webview-preserved";
 const WEB_PANEL_DEFAULT_WIDTH: f64 = 1024.0;
 const WEB_PANEL_DEFAULT_HEIGHT: f64 = 720.0;
 const WEB_PANEL_MIN_WIDTH: f64 = 480.0;
@@ -83,6 +84,41 @@ fn emit_web_panel_closed(app: &AppHandle, window_id: &str, pane_id: &str) {
     );
 }
 
+// Before a web panel window closes, hand its child workspace webviews back to the
+// main window (hidden, parked offscreen) so the living page survives the window
+// and the grid pane can adopt it without a reload.
+fn preserve_web_panel_child_webviews(app: &AppHandle, window_id: &str, pane_id: &str) {
+    let Some(window) = app.get_window(window_id) else {
+        return;
+    };
+    let Some(main_window) = app.get_window("main") else {
+        return;
+    };
+    let mut preserved: Vec<String> = Vec::new();
+    for webview in window.webviews() {
+        let label = webview.label().to_string();
+        if validate_workspace_webview_label(&label).is_err() {
+            continue;
+        }
+        if webview.reparent(&main_window).is_err() {
+            continue;
+        }
+        let _ = webview.hide();
+        let _ = webview.set_position(tauri::LogicalPosition::new(100_000.0, 100_000.0));
+        preserved.push(label);
+    }
+    if !preserved.is_empty() {
+        let _ = app.emit(
+            WEB_PANEL_WEBVIEW_PRESERVED_EVENT,
+            json!({
+                "paneId": pane_id,
+                "webviewLabels": preserved,
+                "windowId": window_id,
+            }),
+        );
+    }
+}
+
 #[tauri::command]
 fn web_panel_open(
     app: AppHandle,
@@ -93,6 +129,7 @@ fn web_panel_open(
     workspace_id: Option<String>,
     width: Option<f64>,
     height: Option<f64>,
+    adopt_label: Option<String>,
 ) -> Result<WebPanelOpenResult, String> {
     let pane_text = pane_id.trim().chars().take(512).collect::<String>();
     if pane_text.is_empty() {
@@ -135,14 +172,23 @@ fn web_panel_open(
         .filter(|value| value.is_finite() && *value > 0.0)
         .map(|value| value.clamp(WEB_PANEL_MIN_HEIGHT, 1800.0))
         .unwrap_or(WEB_PANEL_DEFAULT_HEIGHT);
+    // A validated adopt label lets the host window take over the caller's living
+    // webview (reparent) instead of loading the page from scratch.
+    let adopt_text = adopt_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && validate_workspace_webview_label(value).is_ok())
+        .unwrap_or_default()
+        .to_string();
     let app_url = format!(
-        "index.html#/web-panel?paneId={}&url={}&theme={}&title={}&windowId={}&workspaceId={}",
+        "index.html#/web-panel?paneId={}&url={}&theme={}&title={}&windowId={}&workspaceId={}&adoptLabel={}",
         percent_encode_query_component(&pane_text),
         percent_encode_query_component(&url_text),
         percent_encode_query_component(&theme_text),
         percent_encode_query_component(&title_text),
         percent_encode_query_component(&label),
         percent_encode_query_component(&workspace_text),
+        percent_encode_query_component(&adopt_text),
     );
 
     let window = WebviewWindowBuilder::new(&app, label.clone(), WebviewUrl::App(app_url.into()))
@@ -163,6 +209,9 @@ fn web_panel_open(
     let pane_for_events = pane_text.clone();
     let label_for_events = label.clone();
     window.on_window_event(move |event| {
+        if matches!(event, WindowEvent::CloseRequested { .. }) {
+            preserve_web_panel_child_webviews(&app_for_events, &label_for_events, &pane_for_events);
+        }
         if matches!(event, WindowEvent::Destroyed) {
             emit_web_panel_closed(&app_for_events, &label_for_events, &pane_for_events);
         }

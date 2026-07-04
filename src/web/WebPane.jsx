@@ -60,6 +60,9 @@ export default function WebPane({
   poppedOut = false,
   breakoutReturnUrl = "",
   webviewObscured = false,
+  adoptLabel = "",
+  adoptNonce = 0,
+  onNativeLabelChange = null,
   onDragHandlePointerDown,
   onSplit,
   onMinimize,
@@ -171,12 +174,23 @@ export default function WebPane({
     }
   }, [history, historyIndex, onNavigate]);
 
+  const handleNativeLabelChange = useCallback((label) => {
+    onNativeLabelChange?.(paneId, label);
+  }, [onNativeLabelChange, paneId]);
+
   const { evaluate, reload } = useNativeWebview({
     layoutKey,
     viewportRef,
     url: currentUrl,
     visible,
     scopeParts,
+    // While popped out, the breakout window owns the native webview: never fit,
+    // re-open, or close it from the grid side. On return the pane adopts the
+    // window's living webview back via adoptLabel/adoptNonce (no reload).
+    suspended: poppedOut,
+    adoptLabel,
+    adoptNonce,
+    onLabelChange: handleNativeLabelChange,
     viewportInsetBottom: agentPromptOpen && !nativeAgentPromptOverlayActive
       ? agentPromptTargetMenuOpen
         ? PANEL_AGENT_PROMPT_MENU_WEBVIEW_BOTTOM_INSET

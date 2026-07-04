@@ -13,6 +13,8 @@ import {
   ButtonBotIcon,
   ButtonCloseIcon,
   ButtonDragIcon,
+  ButtonFullscreenExitIcon,
+  ButtonFullscreenIcon,
   GlobalStyle,
   TerminalCloseButton,
   TerminalRailControls,
@@ -20,6 +22,7 @@ import {
   TerminalRestartButton,
   TerminalRestartPill,
 } from "../app/appStyles.js";
+import { usePopoutWindowFullscreen } from "../app/usePopoutWindowFullscreen.js";
 import {
   DEFAULT_WEB_URL,
   hasTauriRuntime,
@@ -55,13 +58,14 @@ const PANEL_AGENT_PROMPT_MENU_WEBVIEW_BOTTOM_INSET = 224;
 
 function parseWebPanelParams() {
   if (typeof window === "undefined") {
-    return { paneId: "", url: DEFAULT_WEB_URL, theme: "dark", windowId: "", workspaceId: "" };
+    return { adoptLabel: "", paneId: "", url: DEFAULT_WEB_URL, theme: "dark", windowId: "", workspaceId: "" };
   }
   const hash = window.location.hash || "";
   const queryIndex = hash.indexOf("?");
   const params = new URLSearchParams(queryIndex >= 0 ? hash.slice(queryIndex + 1) : "");
   const theme = String(params.get("theme") || "dark").toLowerCase() === "light" ? "light" : "dark";
   return {
+    adoptLabel: String(params.get("adoptLabel") || "").trim(),
     paneId: params.get("paneId") || "",
     theme,
     url: normalizeWebInput(params.get("url") || "") || DEFAULT_WEB_URL,
@@ -83,6 +87,7 @@ function readWebPanelDocumentFocused() {
 export default function WebPanelHost() {
   const params = useMemo(() => parseWebPanelParams(), []);
   const currentWindow = useMemo(() => getCurrentWindow(), []);
+  const { isFullscreen, toggleFullscreen } = usePopoutWindowFullscreen(currentWindow);
   const windowLabel = useMemo(() => {
     try {
       return currentWindow.label || params.windowId || "";
@@ -138,6 +143,10 @@ export default function WebPanelHost() {
 
   const scopeParts = useMemo(() => [params.paneId || "pane"], [params.paneId]);
 
+  // The grid tracks this window's current native webview label so it can adopt
+  // the living page back on return (or after an OS close) without a reload.
+  const nativeLabelRef = useRef(params.adoptLabel || "");
+
   const emitNavigate = useCallback((url) => {
     if (!params.paneId || !url) {
       return;
@@ -146,6 +155,7 @@ export default function WebPanelHost() {
       control: WEB_PANEL_CONTROL_NAVIGATE,
       paneId: params.paneId,
       url,
+      webviewLabel: nativeLabelRef.current || "",
       windowId: windowLabel,
     }).catch(() => {});
   }, [params.paneId, windowLabel]);
@@ -179,6 +189,13 @@ export default function WebPanelHost() {
         : PANEL_AGENT_PROMPT_WEBVIEW_BOTTOM_INSET
       : 0,
     onNavigate: handleLoadedUrl,
+    // Adopt the grid pane's living webview (passed via the window URL) instead
+    // of loading the page from scratch.
+    adoptLabel: params.adoptLabel,
+    adoptNonce: params.adoptLabel ? 1 : 0,
+    onLabelChange: (label) => {
+      nativeLabelRef.current = label;
+    },
   });
 
   const webElementPicker = useWebElementPicker({
@@ -465,6 +482,7 @@ export default function WebPanelHost() {
       control: WEB_PANEL_CONTROL_RETURN,
       paneId: params.paneId,
       url: currentUrl,
+      webviewLabel: nativeLabelRef.current || "",
       windowId: windowLabel,
     })
       .catch(() => {})
@@ -602,6 +620,19 @@ export default function WebPanelHost() {
           </HostNav>
 
           <HostRailControls data-rail-row="primary" data-host-rail-section="primary">
+            <HostIconButton
+              aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+              aria-pressed={isFullscreen ? "true" : "false"}
+              onClick={toggleFullscreen}
+              title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+              type="button"
+            >
+              {isFullscreen ? (
+                <ButtonFullscreenExitIcon aria-hidden="true" />
+              ) : (
+                <ButtonFullscreenIcon aria-hidden="true" />
+              )}
+            </HostIconButton>
             <HostCloseButton aria-label="Close" onClick={() => currentWindow.close().catch(() => {})} title="Close" type="button">
               <ButtonCloseIcon aria-hidden="true" />
             </HostCloseButton>

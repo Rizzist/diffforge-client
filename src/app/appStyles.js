@@ -386,6 +386,12 @@ export const GlobalStyle = createGlobalStyle`
     scrollbar-color: rgba(var(--forge-accent-rgb), 0.34) rgba(245, 245, 247, 0.9);
   }
 
+  html[data-render-paused="true"] *,
+  html[data-render-paused="true"] *::before,
+  html[data-render-paused="true"] *::after {
+    animation-play-state: paused !important;
+  }
+
   * {
     box-sizing: border-box;
     scrollbar-color: rgba(125, 160, 205, 0.52) rgba(10, 14, 20, 0.86);
@@ -4647,14 +4653,12 @@ export const LoopspaceGraphEdges = styled.svg`
 
 const loopspaceRuntimeSignalPulse = keyframes`
   0%, 100% {
-    box-shadow:
-      0 0 0 3px color-mix(in srgb, var(--loopspace-signal-color, #86efac) 18%, transparent),
-      0 0 18px color-mix(in srgb, var(--loopspace-signal-color, #86efac) 34%, transparent);
+    opacity: 0.38;
+    transform: scale(0.84);
   }
   50% {
-    box-shadow:
-      0 0 0 6px color-mix(in srgb, var(--loopspace-signal-color, #86efac) 10%, transparent),
-      0 0 28px color-mix(in srgb, var(--loopspace-signal-color, #86efac) 48%, transparent);
+    opacity: 0.62;
+    transform: scale(1.36);
   }
 `;
 
@@ -4676,6 +4680,7 @@ export const LoopspaceRuntimeSignalDot = styled.div`
   border: 2px solid rgba(2, 6, 23, 0.94);
   border-radius: 999px;
   background: var(--loopspace-signal-color);
+  isolation: isolate;
   pointer-events: none;
   transform: translate3d(
     calc(var(--loopspace-signal-x, 0px) - 50%),
@@ -4685,7 +4690,19 @@ export const LoopspaceRuntimeSignalDot = styled.div`
   transition:
     transform 90ms linear,
     opacity 180ms ease;
-  animation: ${loopspaceRuntimeSignalPulse} 1.25s ease-in-out infinite;
+
+  &::before {
+    content: "";
+    position: absolute;
+    inset: -8px;
+    z-index: -1;
+    border-radius: inherit;
+    background: var(--loopspace-signal-color);
+    opacity: 0.38;
+    transform: scale(0.84);
+    animation: ${loopspaceRuntimeSignalPulse} 1.25s ease-in-out infinite;
+    will-change: opacity, transform;
+  }
 
   &::after {
     content: "";
@@ -4732,38 +4749,38 @@ const loopspaceActiveEdge = keyframes`
 
 export const LoopspaceGraphEdgePath = styled.path`
   fill: none;
-  stroke: rgba(255, 209, 102, 0.44);
+  stroke: rgba(255, 209, 102, 0.62);
   stroke-width: 2;
   stroke-linecap: round;
-  filter: drop-shadow(0 0 8px rgba(255, 209, 102, 0.18));
+  filter: drop-shadow(0 0 8px rgba(255, 209, 102, 0.2));
   pointer-events: stroke;
   cursor: pointer;
   transition: stroke 120ms ease, stroke-width 120ms ease;
 
   &[data-branch="exec"] {
-    stroke: rgba(125, 211, 252, 0.44);
-    filter: drop-shadow(0 0 8px rgba(125, 211, 252, 0.16));
+    stroke: rgba(125, 211, 252, 0.62);
+    filter: drop-shadow(0 0 8px rgba(125, 211, 252, 0.18));
   }
 
   &[data-branch="success"] {
-    stroke: rgba(52, 211, 153, 0.46);
-    filter: drop-shadow(0 0 8px rgba(52, 211, 153, 0.16));
+    stroke: rgba(52, 211, 153, 0.64);
+    filter: drop-shadow(0 0 8px rgba(52, 211, 153, 0.18));
   }
 
   &[data-branch="failure"] {
-    stroke: rgba(251, 113, 133, 0.44);
-    filter: drop-shadow(0 0 8px rgba(251, 113, 133, 0.16));
+    stroke: rgba(251, 113, 133, 0.62);
+    filter: drop-shadow(0 0 8px rgba(251, 113, 133, 0.18));
   }
 
   &[data-branch="interrupt"] {
-    stroke: rgba(250, 204, 21, 0.4);
-    filter: drop-shadow(0 0 8px rgba(250, 204, 21, 0.14));
+    stroke: rgba(250, 204, 21, 0.58);
+    filter: drop-shadow(0 0 8px rgba(250, 204, 21, 0.16));
   }
 
   &[data-branch="docs"],
   &[data-branch="assets"] {
-    stroke: rgba(94, 234, 212, 0.42);
-    filter: drop-shadow(0 0 8px rgba(94, 234, 212, 0.15));
+    stroke: rgba(94, 234, 212, 0.6);
+    filter: drop-shadow(0 0 8px rgba(94, 234, 212, 0.17));
   }
 
   &:hover {
@@ -4787,7 +4804,7 @@ export const LoopspaceGraphConnectionPreview = styled(LoopspaceGraphEdgePath)`
 `;
 
 export const LoopspaceGraphEdgeLabel = styled.text`
-  fill: rgba(248, 250, 252, 0.48);
+  fill: rgba(248, 250, 252, 0.74);
   font-size: 9px;
   font-weight: 880;
   letter-spacing: 0.07em;
@@ -4834,7 +4851,7 @@ export const LoopspaceGraphNode = styled.div`
   &[data-kind="cron"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="webhook"] { --loop-node-accent: 45, 212, 191; }
   &[data-kind="manual"] { --loop-node-accent: 251, 191, 36; }
-  &[data-kind="send_message"] { --loop-node-accent: 148, 163, 184; }
+  &[data-kind="send_message"] { --loop-node-accent: 125, 176, 255; }
   &[data-kind="dispatch_todos"] { --loop-node-accent: 56, 189, 248; }
   &[data-kind="document_read"] { --loop-node-accent: 96, 165, 250; }
   &[data-kind="document_write"] { --loop-node-accent: 96, 165, 250; }
@@ -4915,20 +4932,54 @@ export const LoopspaceGraphNode = styled.div`
       0 18px 48px rgba(0, 0, 0, 0.42);
   }
 
-  &[data-kind="send_message"][data-runtime] {
-    border-color: rgba(148, 163, 184, 0.58);
+  &[data-runtime="queued"],
+  &[data-runtime="blocked"],
+  &[data-runtime="awaiting_device"] {
+    border-color: rgba(250, 204, 21, 0.68);
     box-shadow:
-      0 0 0 1px rgba(148, 163, 184, 0.12),
-      0 0 24px rgba(148, 163, 184, 0.12),
+      0 0 0 1px rgba(250, 204, 21, 0.16),
+      0 0 26px rgba(250, 204, 21, 0.14),
+      0 18px 48px rgba(0, 0, 0, 0.42);
+  }
+
+  &[data-runtime="running"],
+  &[data-runtime="active"] {
+    border-color: rgba(125, 211, 252, 0.72);
+    box-shadow:
+      0 0 0 1px rgba(125, 211, 252, 0.18),
+      0 0 26px rgba(125, 211, 252, 0.16),
+      0 18px 48px rgba(0, 0, 0, 0.42);
+  }
+
+  &[data-runtime="failed"],
+  &[data-runtime="error"],
+  &[data-runtime="timed_out"] {
+    border-color: rgba(251, 113, 133, 0.74);
+    box-shadow:
+      0 0 0 1px rgba(251, 113, 133, 0.2),
+      0 0 26px rgba(251, 113, 133, 0.18),
+      0 18px 48px rgba(0, 0, 0, 0.42);
+  }
+
+  &[data-runtime="interrupted"],
+  &[data-runtime="cancelled"],
+  &[data-runtime="paused"] {
+    border-color: rgba(192, 132, 252, 0.68);
+    box-shadow:
+      0 0 0 1px rgba(192, 132, 252, 0.16),
+      0 0 26px rgba(192, 132, 252, 0.14),
       0 18px 48px rgba(0, 0, 0, 0.42);
   }
 
   &[data-runtime-selected="true"] {
-    border-color: rgba(255, 209, 102, 0.78);
     box-shadow:
-      0 0 0 2px rgba(255, 209, 102, 0.14),
+      0 0 0 2px rgba(255, 209, 102, 0.34),
       0 0 28px rgba(255, 209, 102, 0.16),
       0 20px 54px rgba(0, 0, 0, 0.44);
+  }
+
+  &[data-runtime-selected="true"]:not([data-runtime]) {
+    border-color: rgba(255, 209, 102, 0.78);
   }
 
   &[data-pending="true"] {
@@ -5150,7 +5201,7 @@ export const LoopspaceGraphNodeOutputPort = styled.span`
     border-radius: 4px;
     background: rgba(0, 0, 0, 0.44);
     overflow: hidden;
-    opacity: 0.55;
+    opacity: 0.85;
     text-shadow: 0 1px 2px rgba(0, 0, 0, 0.72);
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -5162,22 +5213,27 @@ export const LoopspaceGraphNodeOutputPort = styled.span`
   }
 
   &[data-tone="exec"] {
+    --loop-node-accent: 125, 211, 252;
     color: rgba(147, 197, 253, 0.9);
   }
 
   &[data-tone="asset"] {
+    --loop-node-accent: 94, 234, 212;
     color: rgba(94, 234, 212, 0.9);
   }
 
   &[data-tone="success"] {
+    --loop-node-accent: 52, 211, 153;
     color: rgba(134, 239, 172, 0.92);
   }
 
   &[data-tone="failure"] {
+    --loop-node-accent: 251, 113, 133;
     color: rgba(252, 165, 165, 0.92);
   }
 
   &[data-tone="interrupt"] {
+    --loop-node-accent: 250, 204, 21;
     color: rgba(253, 224, 71, 0.9);
   }
 
@@ -5223,7 +5279,7 @@ export const LoopspaceGraphNodeText = styled.div`
   }
 
   & > span {
-    color: rgba(248, 250, 252, 0.56);
+    color: rgba(248, 250, 252, 0.68);
     font-size: 10px;
     font-weight: 740;
     letter-spacing: 0;
@@ -7253,6 +7309,42 @@ export const LoopspaceGraphNavOrigin = styled.span`
   transform: translate(-50%, -50%);
 `;
 
+export const LoopspaceGraphNavNodeDot = styled.span`
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(var(--loop-node-accent, 148, 163, 184), 0.85);
+  transform: translate3d(
+    calc(-50% + var(--loopspace-nav-node-x, 0px)),
+    calc(-50% + var(--loopspace-nav-node-y, 0px)),
+    0
+  );
+  pointer-events: none;
+
+  &[data-tone="error"] {
+    background: #fb7185;
+    box-shadow: 0 0 6px rgba(251, 113, 133, 0.65);
+  }
+
+  &[data-tone="active"] {
+    background: #67e8f9;
+    box-shadow: 0 0 6px rgba(103, 232, 249, 0.6);
+  }
+
+  &[data-tone="queued"] {
+    background: #facc15;
+    box-shadow: 0 0 6px rgba(250, 204, 21, 0.55);
+  }
+
+  &[data-tone="good"] {
+    background: #34d399;
+    box-shadow: 0 0 6px rgba(52, 211, 153, 0.55);
+  }
+`;
+
 export const LoopspaceGraphNavStats = styled.div`
   display: grid;
   gap: 3px;
@@ -7502,6 +7594,8 @@ export const LoopspaceRuntimePanelResizeHandle = styled.div`
 `;
 
 export const LoopspaceRuntimePanelHeader = styled.div`
+  position: relative;
+  z-index: 2;
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto;
   align-items: center;
@@ -7509,8 +7603,9 @@ export const LoopspaceRuntimePanelHeader = styled.div`
   min-width: 0;
   min-height: 34px;
   padding: 0 10px;
-  border-bottom: 1px solid rgba(255, 209, 102, 0.1);
-  background: rgba(4, 8, 12, 0.92);
+  border-bottom: 1px solid rgba(255, 209, 102, 0.14);
+  background: rgba(4, 8, 12, 0.98);
+  box-shadow: 0 8px 16px rgba(0, 0, 0, 0.45);
 
   &[data-collapsed="true"] {
     grid-template-columns: minmax(0, 1fr) auto;
@@ -18458,43 +18553,65 @@ export const NetworkingHeroState = styled.div`
 
 export const NetworkingHeroGlyph = styled.span`
   @keyframes forgeNetworkingPulse {
-    0% {
-      box-shadow: 0 0 0 0 rgba(60, 203, 127, 0.4);
+    0%,
+    100% {
+      opacity: 0.44;
+      transform: scale(1);
     }
     70% {
-      box-shadow: 0 0 0 9px rgba(60, 203, 127, 0);
-    }
-    100% {
-      box-shadow: 0 0 0 0 rgba(60, 203, 127, 0);
+      opacity: 0;
+      transform: scale(2.5);
     }
   }
 
   @keyframes forgeNetworkingPulseBlue {
-    0% {
-      box-shadow: 0 0 0 0 rgba(96, 165, 250, 0.4);
+    0%,
+    100% {
+      opacity: 0.44;
+      transform: scale(1);
     }
     70% {
-      box-shadow: 0 0 0 9px rgba(96, 165, 250, 0);
-    }
-    100% {
-      box-shadow: 0 0 0 0 rgba(96, 165, 250, 0);
+      opacity: 0;
+      transform: scale(2.5);
     }
   }
 
+  position: relative;
   flex: 0 0 auto;
   width: 12px;
   height: 12px;
   border-radius: 50%;
   background: #64748b;
+  isolation: isolate;
+
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: inherit;
+    opacity: 0;
+    transform: scale(1);
+    will-change: opacity, transform;
+  }
 
   &[data-state="live"] {
     background: #3ccb7f;
+  }
+
+  &[data-state="live"]::after {
+    background: rgba(60, 203, 127, 0.4);
     animation: forgeNetworkingPulse 2.4s ease-out infinite;
   }
 
   &[data-state="syncing"],
   &[data-state="connecting"] {
     background: #60a5fa;
+  }
+
+  &[data-state="syncing"]::after,
+  &[data-state="connecting"]::after {
+    background: rgba(96, 165, 250, 0.4);
     animation: forgeNetworkingPulseBlue 1.4s ease-out infinite;
   }
 
@@ -18504,6 +18621,10 @@ export const NetworkingHeroGlyph = styled.span`
 
   @media (prefers-reduced-motion: reduce) {
     animation: none !important;
+
+    &::after {
+      animation: none !important;
+    }
   }
 `;
 
@@ -20096,23 +20217,6 @@ export const AgentSettingsPanel = styled.section`
   align-self: start;
   min-width: 0;
   min-height: 0;
-  overflow: hidden;
-  padding: 12px;
-  border: 1px solid var(--settings-border, var(--forge-border));
-  border-radius: 8px;
-  background:
-    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    var(--settings-panel-bg, rgba(17, 22, 29, 0.8));
-  box-shadow: inset 0 1px 0 rgba(244, 247, 250, 0.04);
-
-  html[data-forge-theme="light"] & {
-    background: var(--forge-surface);
-    box-shadow: none;
-  }
-
-  &::before {
-    display: none;
-  }
 `;
 
 export const AgentPanelActions = styled.div`
@@ -20175,25 +20279,16 @@ export const AgentCard = styled.section`
   position: relative;
   display: grid;
   align-content: start;
-  gap: 11px;
+  gap: 10px;
   min-height: 0;
   overflow: hidden;
-  padding: 14px 14px 14px 16px;
+  padding: 12px 13px;
   border: 1px solid var(--settings-border-soft, var(--forge-border));
   border-radius: 11px;
-  background: var(--settings-panel-bg-soft, rgba(13, 17, 23, 0.55));
+  background: var(--settings-panel-bg-soft, #0d1117);
   transition:
     border-color 150ms ease,
     background 150ms ease;
-
-  &::before {
-    position: absolute;
-    inset: 6px auto 6px 0;
-    width: 2px;
-    border-radius: 0 2px 2px 0;
-    background: transparent;
-    content: "";
-  }
 
   &:hover {
     border-color: var(--settings-border-strong, var(--forge-border-strong));
@@ -20201,14 +20296,6 @@ export const AgentCard = styled.section`
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
-  }
-
-  &[data-tone="ready"]::before {
-    background: var(--forge-green);
-  }
-
-  &[data-tone="needsAuth"]::before {
-    background: var(--forge-amber);
   }
 `;
 
@@ -20251,10 +20338,30 @@ export const AgentName = styled.h3`
   margin: 0;
   overflow: hidden;
   color: var(--forge-text);
-  font-size: 12px;
-  font-weight: 760;
+  font-size: 13px;
+  font-weight: 800;
   text-overflow: ellipsis;
   white-space: nowrap;
+
+  &[data-agent="codex"] {
+    color: var(--forge-tint-soft, #7db0ff);
+  }
+
+  &[data-agent="claude"] {
+    color: #d97935;
+  }
+
+  &[data-agent="opencode"] {
+    color: #7fe0ae;
+  }
+
+  html[data-forge-theme="light"] &[data-agent="claude"] {
+    color: #b85f1f;
+  }
+
+  html[data-forge-theme="light"] &[data-agent="opencode"] {
+    color: #1f9e63;
+  }
 `;
 
 export const AgentMeta = styled.p`
@@ -20273,6 +20380,25 @@ export const AgentStatusText = styled.p`
   color: var(--forge-text-soft);
   font-size: 11px;
   line-height: 1.32;
+
+  &[data-tone="ready"],
+  &[data-tone="needsAuth"] {
+    font-size: 10px;
+    font-weight: 800;
+  }
+
+  &[data-tone="ready"] {
+    color: var(--forge-green);
+  }
+
+  &[data-tone="needsAuth"] {
+    color: var(--forge-amber);
+  }
+
+  &[data-tone="ready"]::before,
+  &[data-tone="needsAuth"]::before {
+    content: "● ";
+  }
 `;
 
 export const AgentInstallPanel = styled.div`
@@ -20349,21 +20475,71 @@ export const AgentInstallCommand = styled.code`
 
 export const AgentLaunchDefaultsGrid = styled.div`
   display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: 1fr;
   gap: 6px;
-
-  @media (max-width: 640px) {
-    grid-template-columns: 1fr;
-  }
 `;
 
 export const AgentLaunchField = styled.label`
-  display: grid;
+  display: flex;
   min-width: 0;
-  gap: 4px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 30px;
+  padding: 2px 3px 2px 9px;
+  border: 1px solid var(--settings-border-soft, var(--forge-border));
+  border-radius: 7px;
+  background: var(--settings-inset-bg, rgba(2, 6, 23, 0.38));
+
+  html[data-forge-theme="light"] & {
+    background: var(--forge-surface-control);
+  }
 
   &[data-wide="true"] {
     grid-column: 1 / -1;
+  }
+
+  > p {
+    flex: none;
+    font-size: 8.5px;
+    font-weight: 850;
+    letter-spacing: 0.06em;
+  }
+
+  > div {
+    flex: 1;
+    min-width: 0;
+  }
+
+  input {
+    flex: 1;
+    min-width: 0;
+    min-height: 26px;
+    border: none;
+    background: transparent;
+    font-size: 10.5px;
+    text-align: right;
+  }
+
+  .app-select__control {
+    min-height: 26px !important;
+    border: 1px solid transparent !important;
+    background: transparent !important;
+    box-shadow: none !important;
+  }
+
+  .app-select__value-container {
+    justify-content: flex-end;
+    padding: 0 4px !important;
+  }
+
+  .app-select__single-value {
+    font-size: 10.5px !important;
+    font-weight: 650 !important;
+  }
+
+  .app-select__dropdown-indicator {
+    padding: 2px 4px !important;
   }
 `;
 
@@ -20494,8 +20670,9 @@ export const SettingsPage = styled.section`
   --settings-border-soft: rgba(230, 236, 245, 0.1);
   --settings-border-strong: rgba(230, 236, 245, 0.16);
   --settings-panel-bg: rgba(17, 22, 29, 0.8);
-  --settings-panel-bg-soft: rgba(13, 17, 23, 0.78);
+  --settings-panel-bg-soft: #0d1117;
   --settings-panel-bg-muted: rgba(21, 27, 35, 0.5);
+  --settings-inset-bg: rgba(2, 6, 23, 0.38);
   --settings-control-bg: rgba(21, 27, 35, 0.72);
   --settings-control-bg-hover: rgba(17, 22, 29, 0.88);
   --settings-tab-bg: rgba(7, 10, 16, 0.64);
@@ -20511,10 +20688,10 @@ export const SettingsPage = styled.section`
   min-width: 0;
   align-content: start;
   grid-auto-rows: max-content;
-  gap: 12px;
+  gap: 10px;
   min-height: 0;
   overflow: auto;
-  padding: 16px;
+  padding: 16px 18px;
   background: var(--settings-surface-bg);
   background-size: var(--settings-surface-bg-size);
   animation: ${panelEnter} ${VIEW_TRANSITION_MS + 90}ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
@@ -20533,6 +20710,7 @@ export const SettingsPage = styled.section`
     --settings-panel-bg: rgba(14, 10, 5, 0.8);
     --settings-panel-bg-soft: rgba(13, 9, 4, 0.72);
     --settings-panel-bg-muted: rgba(8, 6, 3, 0.52);
+    --settings-inset-bg: rgba(6, 4, 2, 0.5);
     --settings-control-bg: rgba(15, 10, 4, 0.74);
     --settings-control-bg-hover: rgba(22, 15, 6, 0.86);
     --settings-tab-bg: rgba(8, 6, 3, 0.72);
@@ -20547,6 +20725,7 @@ export const SettingsPage = styled.section`
     --settings-panel-bg: var(--forge-surface);
     --settings-panel-bg-soft: var(--forge-surface);
     --settings-panel-bg-muted: var(--forge-surface-control);
+    --settings-inset-bg: rgba(15, 23, 42, 0.05);
     --settings-control-bg: var(--forge-surface-control);
     --settings-control-bg-hover: var(--forge-surface-control);
     --settings-tab-bg: var(--forge-surface-control);
@@ -20601,7 +20780,7 @@ export const SettingsTabNav = styled.nav`
   width: min(100%, 620px);
   padding: 4px;
   border: 1px solid var(--settings-border, var(--forge-border));
-  border-radius: 8px;
+  border-radius: 12px;
   background: var(--settings-tab-bg, rgba(7, 10, 16, 0.64));
 
   html[data-forge-theme="light"] & {
@@ -20618,10 +20797,10 @@ export const SettingsTabButton = styled.button`
   gap: 8px;
   padding: 0 14px;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: 9px;
   color: var(--forge-text-muted);
   background: transparent;
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 780;
   letter-spacing: 0;
   cursor: pointer;
@@ -20806,15 +20985,85 @@ export const AccountSettingsPanel = styled.section`
   padding-top: 0;
 `;
 
+export const SettingsSectionHeader = styled.div`
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 10px;
+  margin-top: 4px;
+  flex-wrap: wrap;
+
+  > span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--forge-text-muted);
+    font-size: 10.5px;
+    font-weight: 780;
+    letter-spacing: 0.06em;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
+  }
+
+  em {
+    flex: none;
+    padding: 2px 9px;
+    border: 1px solid var(--settings-border, var(--forge-border));
+    border-radius: 999px;
+    color: var(--forge-text-soft);
+    font-size: 9.5px;
+    font-style: normal;
+    font-weight: 780;
+    letter-spacing: 0.02em;
+  }
+
+  em[data-tone="green"] {
+    border-color: rgba(60, 203, 127, 0.3);
+    color: var(--forge-green);
+  }
+
+  em[data-tone="blue"] {
+    border-color: rgba(var(--forge-tint-rgb), 0.32);
+    color: var(--forge-tint-soft);
+  }
+
+  em[data-tone="orange"] {
+    border-color: rgba(223, 165, 90, 0.3);
+    color: var(--forge-amber);
+  }
+
+  > button {
+    min-height: 28px;
+    margin-left: auto;
+    padding-inline: 10px;
+    font-size: 11px;
+  }
+`;
+
+export const TrayClickGroup = styled.div`
+  display: grid;
+  min-width: 0;
+  gap: 8px;
+`;
+
+export const TrayClickOptionGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  min-width: 0;
+
+  @media (max-width: 720px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
 export const AccountCard = styled.section`
   display: grid;
   gap: 12px;
-  padding: 14px;
+  padding: 13px 14px;
   border: 1px solid var(--settings-border-soft, var(--forge-border));
-  border-radius: 8px;
-  background:
-    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    var(--settings-panel-bg-soft, rgba(17, 22, 29, 0.78));
+  border-radius: 11px;
+  background: var(--settings-panel-bg-soft, #0d1117);
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface);
@@ -20901,22 +21150,26 @@ export const SettingsIdentityGrid = styled.div`
 `;
 
 export const SettingsIdentityItem = styled.div`
-  display: grid;
+  display: flex;
   min-width: 0;
-  gap: 4px;
-  padding: 9px 10px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 30px;
+  padding: 5px 9px;
   border: 1px solid var(--settings-border-soft, var(--forge-border));
-  border-radius: 8px;
-  background: var(--settings-panel-bg-muted, rgba(21, 27, 35, 0.5));
+  border-radius: 7px;
+  background: var(--settings-inset-bg, rgba(2, 6, 23, 0.38));
 
   html[data-forge-theme="light"] & {
     background: var(--forge-surface-control);
   }
 
   span {
+    flex: none;
     color: var(--forge-text-muted);
-    font-size: 11px;
-    font-weight: 760;
+    font-size: 8.5px;
+    font-weight: 850;
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
@@ -20925,8 +21178,9 @@ export const SettingsIdentityItem = styled.div`
     min-width: 0;
     overflow: hidden;
     color: var(--forge-text);
-    font-size: 12px;
-    font-weight: 720;
+    font-size: 11px;
+    font-weight: 680;
+    text-align: right;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
@@ -21103,17 +21357,15 @@ export const AppearanceThemeGrid = styled.div`
 export const AppearanceThemeButton = styled.button`
   display: grid;
   min-width: 0;
-  min-height: 72px;
-  grid-template-columns: 36px minmax(0, 1fr);
+  min-height: 64px;
+  grid-template-columns: 34px minmax(0, 1fr);
   align-items: center;
-  gap: 10px;
-  padding: 10px;
+  gap: 12px;
+  padding: 12px 14px;
   border: 1px solid var(--settings-border-soft, var(--forge-border));
-  border-radius: 8px;
+  border-radius: 12px;
   color: var(--forge-text-soft);
-  background:
-    linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-    var(--settings-panel-bg-muted, rgba(21, 27, 35, 0.56));
+  background: var(--settings-panel-bg-soft, #0d1117);
   text-align: left;
   transition:
     border-color 160ms ease,
@@ -21124,9 +21376,6 @@ export const AppearanceThemeButton = styled.button`
   &:hover {
     border-color: var(--settings-border-strong, var(--forge-border-strong));
     color: var(--forge-text);
-    background:
-      linear-gradient(180deg, rgba(244, 247, 250, 0.042), rgba(244, 247, 250, 0.014)),
-      var(--settings-control-bg-hover, rgba(21, 27, 35, 0.72));
   }
 
   &:disabled {
@@ -21137,20 +21386,14 @@ export const AppearanceThemeButton = styled.button`
   &:disabled:hover {
     border-color: var(--settings-border-soft, var(--forge-border));
     color: var(--forge-text-soft);
-    background:
-      linear-gradient(180deg, rgba(244, 247, 250, 0.032), rgba(244, 247, 250, 0.01)),
-      var(--settings-panel-bg-muted, rgba(21, 27, 35, 0.56));
+    background: var(--settings-panel-bg-soft, #0d1117);
   }
 
   &[data-selected="true"] {
-    border-color: rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.38);
+    border-color: rgba(var(--settings-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.5);
     color: var(--forge-text);
-    background:
-      linear-gradient(180deg, rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.12), rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.045)),
-      var(--settings-control-bg, rgba(21, 27, 35, 0.82));
-    box-shadow:
-      inset 0 0 0 1px rgba(var(--settings-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.12),
-      0 0 18px rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.08);
+    background: var(--settings-panel-bg-soft, #0d1117);
+    box-shadow: 0 0 0 1px rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.24);
   }
 
   html[data-forge-theme="light"] & {
@@ -21169,19 +21412,19 @@ export const AppearanceThemeButton = styled.button`
 
   > span {
     display: grid;
-    width: 36px;
-    height: 36px;
+    width: 34px;
+    height: 34px;
     place-items: center;
     border: 1px solid var(--settings-border-soft, var(--forge-border));
-    border-radius: 8px;
+    border-radius: 99px;
     color: var(--forge-text-muted);
-    background: rgba(var(--settings-accent-soft-rgb, var(--forge-tint-soft-rgb)), 0.04);
+    background: var(--settings-control-bg, rgba(21, 27, 35, 0.72));
   }
 
   &[data-selected="true"] > span {
-    border-color: rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.34);
-    color: var(--settings-accent-soft, var(--forge-tint-soft));
-    background: rgba(var(--settings-accent-rgb, var(--forge-tint-rgb)), 0.1);
+    border-color: transparent;
+    color: #fff;
+    background: var(--settings-accent, var(--forge-tint));
   }
 
   svg {
@@ -22956,13 +23199,5 @@ export const TerminalPaneInlineRailControls = styled(TerminalRailControls)`
   &[data-rail-row] {
     grid-column: 2 / -1;
     grid-row: 1;
-  }
-
-  @container (max-width: 520px) {
-    && {
-      grid-column: 1 / -1;
-      grid-row: 2;
-      justify-content: flex-end;
-    }
   }
 `;

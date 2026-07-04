@@ -181,6 +181,45 @@ fn workspace_webview_open(
     Ok(())
 }
 
+// Moves a living workspace webview into another host window (main <-> web panel
+// pop-out) without reloading it, preserving page/session/JS state. Returns false
+// when no webview exists for the label so callers can fall back to a fresh open.
+#[tauri::command]
+fn workspace_webview_adopt(
+    app: AppHandle,
+    label: String,
+    window_label: Option<String>,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<bool, String> {
+    validate_workspace_webview_label(&label)?;
+    let Some(webview) = workspace_webview_for_label(&app, &label) else {
+        return Ok(false);
+    };
+    let parent_label = window_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("main");
+    let window = app
+        .get_window(parent_label)
+        .ok_or_else(|| "Host window is unavailable.".to_string())?;
+    webview
+        .reparent(&window)
+        .map_err(|error| format!("Unable to move workspace web view: {error}"))?;
+    webview
+        .set_position(tauri::LogicalPosition::new(x.max(0.0), y.max(0.0)))
+        .map_err(|error| format!("Unable to position workspace web view: {error}"))?;
+    webview
+        .set_size(tauri::LogicalSize::new(width.max(24.0), height.max(24.0)))
+        .map_err(|error| format!("Unable to size workspace web view: {error}"))?;
+    let _ = webview.show();
+    let _ = webview.set_focus();
+    Ok(true)
+}
+
 #[tauri::command]
 fn workspace_webview_fit(
     app: AppHandle,

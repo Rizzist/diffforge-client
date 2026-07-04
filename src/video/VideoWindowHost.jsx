@@ -9,6 +9,8 @@ import {
   ButtonBotIcon,
   ButtonCloseIcon,
   ButtonDragIcon,
+  ButtonFullscreenExitIcon,
+  ButtonFullscreenIcon,
   GlobalStyle,
   TerminalAgentLabel,
   TerminalCloseButton,
@@ -17,6 +19,7 @@ import {
   TerminalRestartButton,
   TerminalRestartPill,
 } from "../app/appStyles.js";
+import { usePopoutWindowFullscreen } from "../app/usePopoutWindowFullscreen.js";
 import VideoWorkspacePane from "./VideoWorkspacePane.jsx";
 import PanelAgentPromptActivity from "../terminals/PanelAgentPromptActivity.jsx";
 import PanelAgentPromptComposer from "../terminals/PanelAgentPromptComposer.jsx";
@@ -75,6 +78,7 @@ export default function VideoWindowHost() {
   const [agentPromptTargets, setAgentPromptTargets] = useState([]);
   const [defaultAgentPromptTargetIds, setDefaultAgentPromptTargetIds] = useState([]);
   const currentWindow = useMemo(() => getCurrentWindow(), []);
+  const { isFullscreen, toggleFullscreen } = usePopoutWindowFullscreen(currentWindow);
   const agentPromptTargetsRequestIdRef = useRef("");
   const windowLabel = useMemo(() => {
     try {
@@ -412,6 +416,19 @@ export default function VideoWindowHost() {
           </PanelTitle>
         </PanelIdentity>
         <TerminalRailControls data-rail-row="primary">
+          <PanelIconButton
+            aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+            aria-pressed={isFullscreen ? "true" : "false"}
+            onClick={toggleFullscreen}
+            title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+            type="button"
+          >
+            {isFullscreen ? (
+              <ButtonFullscreenExitIcon aria-hidden="true" />
+            ) : (
+              <ButtonFullscreenIcon aria-hidden="true" />
+            )}
+          </PanelIconButton>
           <PanelCloseButton
             aria-label="Close"
             onClick={() => safeTauriWindowCall(currentWindow, "close")}

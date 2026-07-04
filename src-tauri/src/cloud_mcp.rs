@@ -851,6 +851,65 @@ const CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS: u64 = 60;
 /// Short settle delay before the first cycle so app startup isn't contended.
 const CLOUD_MCP_TOKENOMICS_PERIODIC_STARTUP_DELAY_SECS: u64 = 15;
 
+#[cfg(target_os = "macos")]
+struct CloudMcpMacosThreadQosGuard {
+    previous: Option<(libc::qos_class_t, libc::c_int)>,
+}
+
+#[cfg(target_os = "macos")]
+impl CloudMcpMacosThreadQosGuard {
+    fn utility() -> Self {
+        let mut previous_class = libc::qos_class_t::QOS_CLASS_DEFAULT;
+        let mut previous_priority: libc::c_int = 0;
+        unsafe {
+            let previous = if libc::pthread_get_qos_class_np(
+                libc::pthread_self(),
+                &mut previous_class,
+                &mut previous_priority,
+            ) == 0
+            {
+                Some((previous_class, previous_priority))
+            } else {
+                None
+            };
+            let _ = libc::pthread_set_qos_class_self_np(
+                libc::qos_class_t::QOS_CLASS_UTILITY,
+                0,
+            );
+            Self { previous }
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for CloudMcpMacosThreadQosGuard {
+    fn drop(&mut self) {
+        let (restore_class, restore_priority) = self.previous.unwrap_or((
+            libc::qos_class_t::QOS_CLASS_DEFAULT,
+            0,
+        ));
+        let (restore_class, restore_priority) =
+            if restore_class as u32 == libc::qos_class_t::QOS_CLASS_UNSPECIFIED as u32 {
+                (libc::qos_class_t::QOS_CLASS_DEFAULT, 0)
+            } else {
+                (restore_class, restore_priority)
+            };
+        unsafe {
+            let _ = libc::pthread_set_qos_class_self_np(restore_class, restore_priority);
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+struct CloudMcpMacosThreadQosGuard;
+
+#[cfg(not(target_os = "macos"))]
+impl CloudMcpMacosThreadQosGuard {
+    fn utility() -> Self {
+        Self
+    }
+}
+
 /// Drives the always-on Tokenomics refresh while the app is running: every
 /// minute it stamps the current usage percentages into the local history,
 /// re-scans the current-day token tail, then best-effort pushes the delta to
@@ -891,6 +950,7 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
             // issue blocking HTTP for the live provider limits.
             let cycle_app = app.clone();
             let cycle_status = match tauri::async_runtime::spawn_blocking(move || {
+                let _qos_guard = CloudMcpMacosThreadQosGuard::utility();
                 tokenomics_run_periodic_sample_cycle(&cycle_app)
             })
             .await
@@ -7279,10 +7339,12 @@ async fn cloud_mcp_auth_material_present(state: &CloudMcpState) -> bool {
     auth.appwrite_jwt.is_some() || auth.desktop_session_token.is_some()
 }
 
-const CLOUD_MCP_OUTBOX_AUTH_WAIT_RETRY_MS: u64 = 3_000;
+const CLOUD_MCP_OUTBOX_AUTH_WAIT_INITIAL_RETRY_MS: u64 = 3_000;
+const CLOUD_MCP_OUTBOX_AUTH_WAIT_MAX_RETRY_MS: u64 = 60_000;
 
 async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
     cloud_mcp_outbox_recover_stale_in_flight();
+    let mut auth_wait_retry_ms = CLOUD_MCP_OUTBOX_AUTH_WAIT_INITIAL_RETRY_MS;
     loop {
         let idle_wake_ms = if cloud_mcp_outbox_known_empty() {
             CLOUD_MCP_BACKGROUND_SYNC_EMPTY_IDLE_WAKE_MS
@@ -7302,14 +7364,19 @@ async fn cloud_mcp_background_sync_worker(state: CloudMcpState) {
             cloud_mcp_outbox_recover_stale_in_flight();
             if !cloud_mcp_auth_material_present(&state).await {
                 // Hold the backlog instead of failing every row; re-check
-                // shortly (sign-in also notifies through the ready path).
+                // with backoff (sign-in also notifies through the ready path).
+                let retry_ms = auth_wait_retry_ms;
+                auth_wait_retry_ms = auth_wait_retry_ms
+                    .saturating_mul(2)
+                    .min(CLOUD_MCP_OUTBOX_AUTH_WAIT_MAX_RETRY_MS);
                 let notify = state.background_sync.notify.clone();
                 tauri::async_runtime::spawn(async move {
-                    sleep(Duration::from_millis(CLOUD_MCP_OUTBOX_AUTH_WAIT_RETRY_MS)).await;
+                    sleep(Duration::from_millis(retry_ms)).await;
                     notify.notify_one();
                 });
                 break;
             }
+            auth_wait_retry_ms = CLOUD_MCP_OUTBOX_AUTH_WAIT_INITIAL_RETRY_MS;
             let mut drained_any = false;
             let claimed_rows = {
                 let _span = BackendCpuSpan::new("cloud_mcp.background_sync.claim_due_rows");

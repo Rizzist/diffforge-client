@@ -1,4 +1,6 @@
+import { useEffect, useState } from "react";
 import { PlanFlame } from "./PlanFlame.jsx";
+import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
 import {
   AUTH_TILE_SIZE,
   ButtonAddIcon,
@@ -26,9 +28,19 @@ const AUTH_TILE_BURSTS = Array.from({ length: 156 }, (_, index) => {
 });
 
 export function AuthSquareBackdrop({ tone = "default" } = {}) {
+  const [renderable, setRenderable] = useState(() => getRenderabilitySnapshot().renderable);
+
+  useEffect(() => {
+    const unsubscribeRenderability = subscribeToRenderability((nextSnapshot) => {
+      setRenderable(nextSnapshot.renderable);
+    });
+    setRenderable(getRenderabilitySnapshot().renderable);
+    return unsubscribeRenderability;
+  }, []);
+
   return (
     <SquareField aria-hidden="true" data-tone={tone}>
-      {AUTH_TILE_BURSTS.map(([col, row, delay, duration, peak]) => (
+      {renderable && AUTH_TILE_BURSTS.map(([col, row, delay, duration, peak]) => (
         <SquarePulse
           key={`${col}-${row}-${delay}`}
           style={{

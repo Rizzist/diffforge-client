@@ -905,10 +905,17 @@ export default function GitWorkspaceView({
     const handleWheel = (event) => {
       if (rail.scrollWidth <= rail.clientWidth + 1) return;
 
-      const delta = Math.abs(event.deltaX) > Math.abs(event.deltaY)
+      const raw = Math.abs(event.deltaX) > Math.abs(event.deltaY)
         ? event.deltaX
         : event.deltaY;
-      if (!delta) return;
+      if (!raw) return;
+      // Mice/webviews that report line- or page-mode deltas would otherwise
+      // move ~1px per notch and feel like the rail isn't scrollable at all.
+      const delta = event.deltaMode === 1
+        ? raw * 16
+        : event.deltaMode === 2
+          ? raw * rail.clientWidth
+          : raw;
 
       const maxScrollLeft = rail.scrollWidth - rail.clientWidth;
       const nextScrollLeft = Math.max(0, Math.min(maxScrollLeft, rail.scrollLeft + delta));
@@ -1315,8 +1322,11 @@ const RepoRail = styled.div`
 
 const RepoButton = styled.button`
   display: grid;
-  flex: 0 0 auto;
-  width: min(128px, 100%);
+  /* Grow into free rail space (so one or two repos don't truncate their
+     change summary against a hard 128px cap) but keep a compact basis so
+     many repos still overflow into a horizontally scrollable rail. */
+  flex: 1 0 128px;
+  max-width: 224px;
   min-width: 0;
   min-height: 0;
   align-content: start;

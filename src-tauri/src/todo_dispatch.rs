@@ -571,6 +571,44 @@ fn todo_dispatch_remote_command_is_queue_action(command_kind: &str) -> bool {
     )
 }
 
+fn todo_dispatch_remote_command_is_orchestrator_send_message(command_kind: &str) -> bool {
+    let command_kind = command_kind
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['.', ' ', '-'], "_");
+    matches!(
+        command_kind.as_str(),
+        "terminal_orchestrator_send_message"
+            | "terminal_send_message"
+            | "orchestrator_send_message"
+            | "loopspace_send_message"
+            | "send_message"
+    )
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum TodoDispatchRemoteIntakeScopeDecision {
+    Continue,
+    MissingScope,
+    IgnoreOrchestratorSend,
+}
+
+fn todo_dispatch_remote_intake_scope_decision(
+    command_kind: &str,
+    command_id: &str,
+    workspace_id: &str,
+) -> TodoDispatchRemoteIntakeScopeDecision {
+    if workspace_id.is_empty()
+        && todo_dispatch_remote_command_is_orchestrator_send_message(command_kind)
+    {
+        return TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend;
+    }
+    if command_id.is_empty() || workspace_id.is_empty() {
+        return TodoDispatchRemoteIntakeScopeDecision::MissingScope;
+    }
+    TodoDispatchRemoteIntakeScopeDecision::Continue
+}
+
 fn todo_dispatch_remote_intake_field_matches(item: &Value, keys: &[&str], expected: &str) -> bool {
     let expected = expected.trim();
     if expected.is_empty() {
@@ -708,20 +746,29 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
     }
     let command_id = todo_dispatch_text(event, &["command_id", "commandId"]);
     let workspace_id = todo_dispatch_text(event, &["workspace_id", "workspaceId"]);
-    if command_id.is_empty() || workspace_id.is_empty() {
-        return Some(json!({
-            "status": "failed",
-            "message": "Remote todo intent was missing workspace or command id.",
-            "details": {
-                "reason": "missing_scope",
-                "command_id": command_id,
-                "commandId": command_id,
-                "workspace_id": workspace_id,
-                "workspaceId": workspace_id,
-                "intent_id": todo_dispatch_text(event, &["intent_id", "intentId"]),
-                "intentId": todo_dispatch_text(event, &["intent_id", "intentId"]),
-            },
-        }));
+    match todo_dispatch_remote_intake_scope_decision(&command_kind, &command_id, &workspace_id) {
+        TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend => {
+            // Orchestrator-targeted sends have no workspace scope; failing them
+            // here makes cloud kill the loop runtime run while delivery still
+            // succeeds through the webview orchestrator route.
+            return None;
+        }
+        TodoDispatchRemoteIntakeScopeDecision::MissingScope => {
+            return Some(json!({
+                "status": "failed",
+                "message": "Remote todo intent was missing workspace or command id.",
+                "details": {
+                    "reason": "missing_scope",
+                    "command_id": command_id,
+                    "commandId": command_id,
+                    "workspace_id": workspace_id,
+                    "workspaceId": workspace_id,
+                    "intent_id": todo_dispatch_text(event, &["intent_id", "intentId"]),
+                    "intentId": todo_dispatch_text(event, &["intent_id", "intentId"]),
+                },
+            }));
+        }
+        TodoDispatchRemoteIntakeScopeDecision::Continue => {}
     }
     let text = todo_dispatch_text(event, &["body", "message", "prompt", "text"]);
     let workspace_name = todo_dispatch_text(event, &["workspace_name", "workspaceName"]);
@@ -1637,6 +1684,7 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
 
 const TODO_DISPATCH_DISPATCHER_LEASE_MS: u64 = 15_000;
 const TODO_DISPATCH_BACKEND_TICK_MS: u64 = 5_000;
+const TODO_DISPATCH_BACKEND_SAFETY_FULL_PASS_TICKS: u64 = 12;
 const TODO_DISPATCH_TERMINAL_RUNTIME_TTL_MS: u64 = 6 * 60 * 60 * 1000;
 const TODO_DISPATCH_JOURNAL_MAX_ENTRIES: usize = 200;
 const TODO_DISPATCH_STARTUP_RECONCILE_EVENT: &str = "todo-dispatch-startup-reconcile";
@@ -1680,6 +1728,29 @@ fn todo_dispatch_data_workspace_files(kind: &str) -> Vec<PathBuf> {
         .flatten()
         .map(|entry| entry.path())
         .filter(|path| path.extension().and_then(|ext| ext.to_str()) == Some("json"))
+        .collect()
+}
+
+#[derive(Clone, Eq, PartialEq)]
+struct TodoDispatchQueueFileFingerprint {
+    path: PathBuf,
+    len: Option<u64>,
+    modified: Option<SystemTime>,
+}
+
+fn todo_dispatch_queue_files_fingerprint() -> Vec<TodoDispatchQueueFileFingerprint> {
+    let mut paths = todo_dispatch_data_workspace_files("queues");
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let metadata = fs::metadata(&path).ok();
+            TodoDispatchQueueFileFingerprint {
+                path,
+                len: metadata.as_ref().map(|metadata| metadata.len()),
+                modified: metadata.and_then(|metadata| metadata.modified().ok()),
+            }
+        })
         .collect()
 }
 
@@ -6855,6 +6926,72 @@ mod todo_store_tests {
     }
 
     #[test]
+    fn todo_dispatch_intake_ignores_orchestrator_send_without_workspace() {
+        let event = json!({
+            "command_kind": "terminal_orchestrator_send_message",
+            "commandId": "run-1",
+            "workspaceId": "",
+        });
+        let command_kind =
+            todo_dispatch_text(&event, &["command_kind", "commandKind", "action", "command"]);
+        let command_id = todo_dispatch_text(&event, &["command_id", "commandId"]);
+        let workspace_id = todo_dispatch_text(&event, &["workspace_id", "workspaceId"]);
+
+        assert_eq!(
+            todo_dispatch_remote_intake_scope_decision(
+                &command_kind,
+                &command_id,
+                &workspace_id
+            ),
+            TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend
+        );
+    }
+
+    #[test]
+    fn todo_dispatch_intake_keeps_workspace_send_message_in_queue_flow() {
+        let event = json!({
+            "command_kind": "terminal_orchestrator_send_message",
+            "commandId": "run-1",
+            "workspaceId": "workspace-1",
+        });
+        let command_kind =
+            todo_dispatch_text(&event, &["command_kind", "commandKind", "action", "command"]);
+        let command_id = todo_dispatch_text(&event, &["command_id", "commandId"]);
+        let workspace_id = todo_dispatch_text(&event, &["workspace_id", "workspaceId"]);
+
+        assert_eq!(
+            todo_dispatch_remote_intake_scope_decision(
+                &command_kind,
+                &command_id,
+                &workspace_id
+            ),
+            TodoDispatchRemoteIntakeScopeDecision::Continue
+        );
+    }
+
+    #[test]
+    fn todo_dispatch_intake_still_fails_create_task_without_workspace() {
+        let event = json!({
+            "command_kind": "create_task",
+            "commandId": "command-1",
+            "workspaceId": "",
+        });
+        let command_kind =
+            todo_dispatch_text(&event, &["command_kind", "commandKind", "action", "command"]);
+        let command_id = todo_dispatch_text(&event, &["command_id", "commandId"]);
+        let workspace_id = todo_dispatch_text(&event, &["workspace_id", "workspaceId"]);
+
+        assert_eq!(
+            todo_dispatch_remote_intake_scope_decision(
+                &command_kind,
+                &command_id,
+                &workspace_id
+            ),
+            TodoDispatchRemoteIntakeScopeDecision::MissingScope
+        );
+    }
+
+    #[test]
     fn remote_intake_success_ack_is_progress_not_completion() {
         let event = json!({
             "command_kind": "todo_queue",
@@ -11328,12 +11465,24 @@ pub(crate) fn todo_dispatch_wake_background_dispatcher(app: AppHandle) {
 /// tick catches missed readiness events without polling aggressively.
 pub(crate) fn todo_dispatch_start_background_dispatcher(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        let mut queue_fingerprint: Option<Vec<TodoDispatchQueueFileFingerprint>> = None;
+        let mut tick_count = 0u64;
         loop {
             sleep(Duration::from_millis(TODO_DISPATCH_BACKEND_TICK_MS)).await;
             if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
                 continue;
             }
-            todo_dispatch_backend_tick(&app).await;
+            tick_count = tick_count.wrapping_add(1);
+            let next_queue_fingerprint = todo_dispatch_queue_files_fingerprint();
+            let queue_changed = queue_fingerprint.as_ref() != Some(&next_queue_fingerprint);
+            let force_full_pass =
+                tick_count % TODO_DISPATCH_BACKEND_SAFETY_FULL_PASS_TICKS == 0;
+            if queue_changed || force_full_pass {
+                queue_fingerprint = Some(next_queue_fingerprint);
+                todo_dispatch_backend_tick(&app).await;
+            } else {
+                queue_fingerprint = Some(next_queue_fingerprint);
+            }
         }
     });
 }

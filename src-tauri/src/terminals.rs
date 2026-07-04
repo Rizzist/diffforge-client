@@ -13586,6 +13586,32 @@ async fn read_terminal_activity_hook_chunk(
     Ok((next_offset, chunk))
 }
 
+#[derive(Clone, Eq, PartialEq)]
+struct TerminalActivityHookFileFingerprint {
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+async fn terminal_activity_hook_file_fingerprint(
+    path: &Path,
+) -> Option<TerminalActivityHookFileFingerprint> {
+    let metadata = tokio::fs::metadata(path).await.ok()?;
+    Some(TerminalActivityHookFileFingerprint {
+        len: metadata.len(),
+        modified: metadata.modified().ok(),
+    })
+}
+
+fn terminal_activity_hook_next_poll_ms(current_poll_ms: u64) -> u64 {
+    if current_poll_ms < TERMINAL_ACTIVITY_HOOK_BACKOFF_POLL_MS {
+        TERMINAL_ACTIVITY_HOOK_BACKOFF_POLL_MS
+    } else if current_poll_ms < TERMINAL_ACTIVITY_HOOK_IDLE_POLL_MS {
+        TERMINAL_ACTIVITY_HOOK_IDLE_POLL_MS
+    } else {
+        TERMINAL_ACTIVITY_HOOK_FALLBACK_POLL_MS
+    }
+}
+
 async fn handle_terminal_activity_hook_event(
     app: &AppHandle,
     terminals: &Arc<RwLock<HashMap<String, TerminalInstance>>>,
@@ -14437,6 +14463,10 @@ fn spawn_terminal_activity_hook_watcher(
         let mut debug_offset = 0u64;
         let mut partial = String::new();
         let mut debug_partial = String::new();
+        let mut last_activity_fingerprint: Option<TerminalActivityHookFileFingerprint> = None;
+        let mut last_debug_fingerprint: Option<TerminalActivityHookFileFingerprint> = None;
+        let mut current_poll_ms = poll_ms;
+        let mut unchanged_polls = 0u32;
         loop {
             if app_shutdown_requested() {
                 break;
@@ -14447,118 +14477,143 @@ fn spawn_terminal_activity_hook_watcher(
                 break;
             };
 
-            match read_terminal_activity_hook_chunk(&activity_events_path, offset).await {
-                Ok((next_offset, chunk)) => {
-                    if next_offset < offset {
-                        partial.clear();
-                    }
-                    offset = next_offset;
-                    if !chunk.is_empty() {
-                        partial.push_str(&chunk);
-                        let has_complete_tail = partial.ends_with('\n');
-                        let mut lines = partial.lines().map(str::to_string).collect::<Vec<_>>();
-                        partial = if has_complete_tail {
-                            String::new()
-                        } else {
-                            lines.pop().unwrap_or_default()
-                        };
+            let activity_fingerprint =
+                terminal_activity_hook_file_fingerprint(&activity_events_path).await;
+            let debug_fingerprint =
+                terminal_activity_hook_file_fingerprint(&activity_debug_path).await;
+            let activity_changed = activity_fingerprint != last_activity_fingerprint;
+            let debug_changed = debug_fingerprint != last_debug_fingerprint;
+            if activity_changed || debug_changed {
+                current_poll_ms = TERMINAL_ACTIVITY_HOOK_POLL_MS;
+                unchanged_polls = 0;
+            } else {
+                unchanged_polls = unchanged_polls.saturating_add(1);
+                if unchanged_polls >= TERMINAL_ACTIVITY_HOOK_BACKOFF_UNCHANGED_POLLS {
+                    current_poll_ms = terminal_activity_hook_next_poll_ms(current_poll_ms);
+                    unchanged_polls = 0;
+                }
+                sleep(Duration::from_millis(current_poll_ms)).await;
+                continue;
+            }
+            last_activity_fingerprint = activity_fingerprint;
+            last_debug_fingerprint = debug_fingerprint;
 
-                        for line in lines {
-                            let line = line.trim();
-                            if line.is_empty() {
-                                continue;
-                            }
-                            let Ok(event) = serde_json::from_str::<Value>(line) else {
-                                continue;
+            if activity_changed {
+                match read_terminal_activity_hook_chunk(&activity_events_path, offset).await {
+                    Ok((next_offset, chunk)) => {
+                        if next_offset < offset {
+                            partial.clear();
+                        }
+                        offset = next_offset;
+                        if !chunk.is_empty() {
+                            partial.push_str(&chunk);
+                            let has_complete_tail = partial.ends_with('\n');
+                            let mut lines = partial.lines().map(str::to_string).collect::<Vec<_>>();
+                            partial = if has_complete_tail {
+                                String::new()
+                            } else {
+                                lines.pop().unwrap_or_default()
                             };
-                            process_terminal_activity_hook_event(
-                                &app,
-                                &terminals,
-                                &cloud_mcp_state,
-                                &pane_id,
-                                instance_id,
-                                &instance,
-                                &event,
-                                "jsonl",
-                            )
-                            .await;
+
+                            for line in lines {
+                                let line = line.trim();
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                let Ok(event) = serde_json::from_str::<Value>(line) else {
+                                    continue;
+                                };
+                                process_terminal_activity_hook_event(
+                                    &app,
+                                    &terminals,
+                                    &cloud_mcp_state,
+                                    &pane_id,
+                                    instance_id,
+                                    &instance,
+                                    &event,
+                                    "jsonl",
+                                )
+                                .await;
+                            }
                         }
                     }
-                }
-                Err(error) => {
-                    if activity_events_path.exists() {
-                        log_terminal_status_event(
-                            "backend.terminal_activity_hook.read_error",
-                            json!({
-                                "error": clean_terminal_diagnostic_log_text(&error),
-                                "instance_id": instance_id,
-                                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                            }),
-                        );
-                    }
-                }
-            }
-
-            match read_terminal_activity_hook_chunk(&activity_debug_path, debug_offset).await {
-                Ok((next_offset, chunk)) => {
-                    if next_offset < debug_offset {
-                        debug_partial.clear();
-                    }
-                    debug_offset = next_offset;
-                    if !chunk.is_empty() {
-                        debug_partial.push_str(&chunk);
-                        let has_complete_tail = debug_partial.ends_with('\n');
-                        let mut lines = debug_partial
-                            .lines()
-                            .map(str::to_string)
-                            .collect::<Vec<_>>();
-                        debug_partial = if has_complete_tail {
-                            String::new()
-                        } else {
-                            lines.pop().unwrap_or_default()
-                        };
-
-                        for line in lines {
-                            let line = line.trim();
-                            if line.is_empty() {
-                                continue;
-                            }
-                            let Ok(event) = serde_json::from_str::<Value>(line) else {
-                                continue;
-                            };
+                    Err(error) => {
+                        if activity_events_path.exists() {
                             log_terminal_status_event(
-                                "backend.terminal_activity_hook.debug",
+                                "backend.terminal_activity_hook.read_error",
                                 json!({
-                                    "activity_path": event.get("activityPath").and_then(Value::as_str).unwrap_or_default(),
-                                    "debug_phase": event.get("phase").and_then(Value::as_str).unwrap_or_default(),
-                                    "details": event.get("details").cloned().unwrap_or(Value::Null),
-                                    "hook_instance_id": event.get("instanceId").and_then(Value::as_u64).unwrap_or_default(),
-                                    "hook_pane_id": clean_terminal_diagnostic_log_text(event.get("paneId").and_then(Value::as_str).unwrap_or_default()),
-                                    "hook_provider": event.get("provider").and_then(Value::as_str).unwrap_or_default(),
+                                    "error": clean_terminal_diagnostic_log_text(&error),
                                     "instance_id": instance_id,
                                     "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                                    "terminal_index": event.get("terminalIndex").and_then(Value::as_str).unwrap_or_default(),
-                                    "workspace_id": event.get("workspaceId").and_then(Value::as_str).unwrap_or_default(),
                                 }),
                             );
                         }
                     }
                 }
-                Err(error) => {
-                    if activity_debug_path.exists() {
-                        log_terminal_status_event(
-                            "backend.terminal_activity_hook.debug_read_error",
-                            json!({
-                                "error": clean_terminal_diagnostic_log_text(&error),
-                                "instance_id": instance_id,
-                                "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
-                            }),
-                        );
+            }
+
+            if debug_changed {
+                match read_terminal_activity_hook_chunk(&activity_debug_path, debug_offset).await {
+                    Ok((next_offset, chunk)) => {
+                        if next_offset < debug_offset {
+                            debug_partial.clear();
+                        }
+                        debug_offset = next_offset;
+                        if !chunk.is_empty() {
+                            debug_partial.push_str(&chunk);
+                            let has_complete_tail = debug_partial.ends_with('\n');
+                            let mut lines = debug_partial
+                                .lines()
+                                .map(str::to_string)
+                                .collect::<Vec<_>>();
+                            debug_partial = if has_complete_tail {
+                                String::new()
+                            } else {
+                                lines.pop().unwrap_or_default()
+                            };
+
+                            for line in lines {
+                                let line = line.trim();
+                                if line.is_empty() {
+                                    continue;
+                                }
+                                let Ok(event) = serde_json::from_str::<Value>(line) else {
+                                    continue;
+                                };
+                                log_terminal_status_event(
+                                    "backend.terminal_activity_hook.debug",
+                                    json!({
+                                        "activity_path": event.get("activityPath").and_then(Value::as_str).unwrap_or_default(),
+                                        "debug_phase": event.get("phase").and_then(Value::as_str).unwrap_or_default(),
+                                        "details": event.get("details").cloned().unwrap_or(Value::Null),
+                                        "hook_instance_id": event.get("instanceId").and_then(Value::as_u64).unwrap_or_default(),
+                                        "hook_pane_id": clean_terminal_diagnostic_log_text(event.get("paneId").and_then(Value::as_str).unwrap_or_default()),
+                                        "hook_provider": event.get("provider").and_then(Value::as_str).unwrap_or_default(),
+                                        "instance_id": instance_id,
+                                        "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                                        "terminal_index": event.get("terminalIndex").and_then(Value::as_str).unwrap_or_default(),
+                                        "workspace_id": event.get("workspaceId").and_then(Value::as_str).unwrap_or_default(),
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        if activity_debug_path.exists() {
+                            log_terminal_status_event(
+                                "backend.terminal_activity_hook.debug_read_error",
+                                json!({
+                                    "error": clean_terminal_diagnostic_log_text(&error),
+                                    "instance_id": instance_id,
+                                    "pane_id": clean_terminal_diagnostic_log_text(&pane_id),
+                                }),
+                            );
+                        }
                     }
                 }
             }
 
-            sleep(Duration::from_millis(poll_ms)).await;
+            sleep(Duration::from_millis(current_poll_ms)).await;
         }
         log_terminal_status_event(
             "backend.terminal_activity_hook.watcher_stopped",

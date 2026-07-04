@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
+import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
 
 export const PLAN_FLAME_OPTIONS = [
   { key: "free", label: "Free" },
@@ -465,6 +466,7 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
       let pendingWidth = 0;
       let pendingHeight = 0;
       let needsResize = false;
+      let renderable = getRenderabilitySnapshot().renderable;
 
       // Layout reads happen only on actual size changes; the render loop
       // consumes the cached size so it never forces synchronous layout.
@@ -527,7 +529,7 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
       function shouldRender() {
         return (
           !reduceMotion
-          && document.visibilityState !== "hidden"
+          && renderable
           && isIntersecting
         );
       }
@@ -562,8 +564,9 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
         }
       }
 
-      function handleVisibilityChange() {
-        if (document.visibilityState === "hidden") {
+      function handleRenderabilityChange(nextSnapshot) {
+        renderable = nextSnapshot.renderable;
+        if (!renderable) {
           stopRendering();
         } else if (reportedReady) {
           startRendering();
@@ -601,16 +604,16 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
         });
         intersectionObserver.observe(canvas);
       }
-      document.addEventListener("visibilitychange", handleVisibilityChange);
+      const unsubscribeRenderability = subscribeToRenderability(handleRenderabilityChange);
       measure();
 
-      if (document.visibilityState !== "hidden") {
+      if (renderable) {
         render(startTime);
       }
 
       return () => {
         stopRendering();
-        document.removeEventListener("visibilitychange", handleVisibilityChange);
+        unsubscribeRenderability();
         if (intersectionObserver) {
           intersectionObserver.disconnect();
         }
@@ -641,36 +644,25 @@ export function PlanFlame({ active = true, plan, showControls = false }) {
   const [animationEnabled, setAnimationEnabled] = useState(readPlanFlameAnimationEnabled);
   const flameLayerSequenceRef = useRef(0);
   const activeFlameLayerRef = useRef(null);
-  const [pageVisible, setPageVisible] = useState(() => (
-    typeof document === "undefined" || document.visibilityState !== "hidden"
-  ));
+  const [renderable, setRenderable] = useState(() => getRenderabilitySnapshot().renderable);
 
   useEffect(() => {
     setPreviewPlan(planKey);
   }, [planKey]);
 
   useEffect(() => {
-    if (typeof document === "undefined") {
-      return undefined;
-    }
-
-    const handleVisibilityChange = () => {
-      setPageVisible(document.visibilityState !== "hidden");
-    };
-
-    document.addEventListener("visibilitychange", handleVisibilityChange);
-    handleVisibilityChange();
-
-    return () => {
-      document.removeEventListener("visibilitychange", handleVisibilityChange);
-    };
+    const unsubscribeRenderability = subscribeToRenderability((nextSnapshot) => {
+      setRenderable(nextSnapshot.renderable);
+    });
+    setRenderable(getRenderabilitySnapshot().renderable);
+    return unsubscribeRenderability;
   }, []);
 
   const planPreviewOptions = planFlamePreviewOptionsForPlan(planKey);
   const previewPlanAllowed = planPreviewOptions.some((option) => option.key === previewPlan);
   const activePlan = normalizePlanFlameKey(previewPlanAllowed ? previewPlan : "", planKey);
   const preset = PLAN_FLAME_PRESETS[activePlan];
-  const flameActive = Boolean(active && pageVisible && preset);
+  const flameActive = Boolean(active && renderable && preset);
   const activeLayerVisible = flameLayers.some((layer) => layer.active && layer.visible);
   const showPlanSwitch = Boolean(animationEnabled && planPreviewOptions.length > 1);
   const animationToggleLabel = animationEnabled

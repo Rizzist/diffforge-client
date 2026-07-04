@@ -82,11 +82,15 @@ export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MS = 180;
 export const TERMINAL_OUTPUT_BATCH_MAX_BYTES = 16 * 1024;
 export const TERMINAL_OUTPUT_FLUSH_ACTIVE_MAX_BYTES = TERMINAL_OUTPUT_BATCH_MAX_BYTES;
 export const TERMINAL_OUTPUT_FLUSH_BACKGROUND_MAX_BYTES = TERMINAL_OUTPUT_BATCH_MAX_BYTES;
+export const TERMINAL_OUTPUT_HIDDEN_BATCH_MAX_BYTES = 256 * 1024;
+export const TERMINAL_OUTPUT_FLUSH_HIDDEN_MAX_BYTES = TERMINAL_OUTPUT_HIDDEN_BATCH_MAX_BYTES;
 export const TERMINAL_OUTPUT_FLUSH_MIN_BYTES = 512;
 export const TERMINAL_OUTPUT_WRITE_MIN_BYTES = 2 * 1024;
 export const TERMINAL_OUTPUT_WRITE_TARGET_MS = 8;
 export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS = TERMINAL_GLOBAL_RENDER_BACKGROUND_MS;
 export const TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS = 700;
+export const TERMINAL_GLOBAL_RENDER_HIDDEN_MIN_MS = 1000;
+export const TERMINAL_GLOBAL_RENDER_HIDDEN_MAX_MS = 1500;
 export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS = 420;
 export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS = 1200;
 export const TERMINAL_GLOBAL_RENDER_INTERACTIVE_GRACE_MS = 900;
@@ -571,9 +575,38 @@ export const terminalGlobalRenderScheduler = (() => {
 
   const isEntryActive = (entry) => Boolean(entry.isActive?.());
 
+  const isEntryVisible = (entry) => (
+    isEntryActive(entry)
+      || (typeof entry.isVisible === "function" ? entry.isVisible() !== false : true)
+  );
+
   const entryHasPriority = (entry) => Boolean(entry.hasPriorityPending?.());
 
   const isInteractiveWindow = (now = terminalRenderNow()) => interactiveUntil > now;
+
+  const entryByteLimit = (entry) => (
+    isEntryVisible(entry)
+      ? TERMINAL_OUTPUT_BATCH_MAX_BYTES
+      : TERMINAL_OUTPUT_HIDDEN_BATCH_MAX_BYTES
+  );
+
+  const entryBackgroundMinMs = (entry, now = terminalRenderNow()) => {
+    if (!isEntryVisible(entry)) {
+      return TERMINAL_GLOBAL_RENDER_HIDDEN_MIN_MS;
+    }
+    return isInputHotWindow(now)
+      ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS
+      : TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS;
+  };
+
+  const entryBackgroundMaxMs = (entry, now = terminalRenderNow()) => {
+    if (!isEntryVisible(entry)) {
+      return TERMINAL_GLOBAL_RENDER_HIDDEN_MAX_MS;
+    }
+    return isInputHotWindow(now)
+      ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
+      : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS;
+  };
 
   const getGlobalInputHotRemainingMs = () => {
     if (!hasWindow()) {
@@ -607,15 +640,11 @@ export const terminalGlobalRenderScheduler = (() => {
       return true;
     }
 
-    if (isInteractiveWindow(now)) {
-      return age >= TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS;
-    }
-
-    if (entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+    if (entryBytes(entry) >= entryByteLimit(entry)) {
       return true;
     }
 
-    return age >= TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS;
+    return age >= entryBackgroundMinMs(entry, now);
   };
 
   const nextDelayMs = (now = terminalRenderNow()) => {
@@ -636,15 +665,31 @@ export const terminalGlobalRenderScheduler = (() => {
         return;
       }
 
+      if (entryBytes(entry) >= entryByteLimit(entry)) {
+        delay = 0;
+        return;
+      }
+
       const age = entryAge(entry, now);
-      const backgroundMinMs = isInputHotWindow(now)
-        ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MIN_MS
-        : TERMINAL_GLOBAL_RENDER_BACKGROUND_MIN_MS;
-      const remaining = Math.max(0, backgroundMinMs - age);
+      const remaining = Math.max(0, entryBackgroundMinMs(entry, now) - age);
       delay = delay == null ? remaining : Math.min(delay, remaining);
     });
 
     return delay;
+  };
+
+  const nextDelayCapMs = (now = terminalRenderNow()) => {
+    let cap = null;
+
+    entries.forEach((entry) => {
+      if (!entry.hasPending?.()) {
+        return;
+      }
+      const entryCap = entryBackgroundMaxMs(entry, now);
+      cap = cap == null ? entryCap : Math.min(cap, entryCap);
+    });
+
+    return cap == null ? TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS : cap;
   };
 
   const scheduleFrame = () => {
@@ -679,12 +724,7 @@ export const terminalGlobalRenderScheduler = (() => {
     timerId = window.setTimeout(() => {
       timerId = 0;
       scheduleFrame();
-    }, Math.min(
-      delay,
-      isInputHotWindow()
-        ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
-        : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS,
-    ));
+    }, Math.min(delay, nextDelayCapMs()));
   };
 
   const scheduleNext = () => {
@@ -724,11 +764,8 @@ export const terminalGlobalRenderScheduler = (() => {
 
     const leftAge = entryAge(left, now);
     const rightAge = entryAge(right, now);
-    const backgroundMaxMs = isInputHotWindow(now)
-      ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
-      : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS;
-    const leftOverdue = leftAge >= backgroundMaxMs;
-    const rightOverdue = rightAge >= backgroundMaxMs;
+    const leftOverdue = leftAge >= entryBackgroundMaxMs(left, now);
+    const rightOverdue = rightAge >= entryBackgroundMaxMs(right, now);
     if (leftOverdue !== rightOverdue) {
       return leftOverdue ? -1 : 1;
     }
@@ -744,7 +781,7 @@ export const terminalGlobalRenderScheduler = (() => {
 
   const flushReasonForEntry = (entry, now) => {
     const age = entryAge(entry, now);
-    if (entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+    if (entryBytes(entry) >= entryByteLimit(entry)) {
       return "global_max_bytes_frame";
     }
     if (isEntryActive(entry)) {
@@ -753,11 +790,12 @@ export const terminalGlobalRenderScheduler = (() => {
     if (entryHasPriority(entry)) {
       return "global_priority_frame";
     }
-    if (age >= (
-      isInputHotWindow(now)
-        ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
-        : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS
-    )) {
+    if (!isEntryVisible(entry)) {
+      return age >= TERMINAL_GLOBAL_RENDER_HIDDEN_MAX_MS
+        ? "global_hidden_max_latency_frame"
+        : "global_hidden_frame";
+    }
+    if (age >= entryBackgroundMaxMs(entry, now)) {
       return "global_background_max_latency_frame";
     }
     return "global_background_frame";
@@ -781,11 +819,7 @@ export const terminalGlobalRenderScheduler = (() => {
       const active = isEntryActive(entry);
       const age = entryAge(entry, frameStartedAt);
       const priority = entryHasPriority(entry);
-      const starved = age >= (
-        isInputHotWindow(frameStartedAt)
-          ? TERMINAL_GLOBAL_RENDER_INTERACTIVE_BACKGROUND_MAX_MS
-          : TERMINAL_GLOBAL_RENDER_BACKGROUND_MAX_MS
-      );
+      const starved = age >= entryBackgroundMaxMs(entry, frameStartedAt);
       const elapsedMs = terminalRenderNow() - frameStartedAt;
       const reachedPaneBudget = flushed >= TERMINAL_GLOBAL_RENDER_MAX_PANES_PER_FRAME;
       const reachedBackgroundBudget = !active
@@ -851,7 +885,7 @@ export const terminalGlobalRenderScheduler = (() => {
         scheduleNext();
         return;
       }
-      if (isEntryActive(entry) || entryHasPriority(entry) || entryBytes(entry) >= TERMINAL_OUTPUT_BATCH_MAX_BYTES) {
+      if (isEntryActive(entry) || entryHasPriority(entry) || entryBytes(entry) >= entryByteLimit(entry)) {
         clearTimer();
         scheduleFrame();
       } else {

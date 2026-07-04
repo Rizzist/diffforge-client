@@ -2,7 +2,7 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main desktop window.",
-  "windows": ["audio-widget", "audio-widget-error", "activity-overlay", "background-monitor", "snipping-overlay*", "snipping-toasts", "snipping-strip", "snipping-editor-*", "snip-float-*", "terminal-window-*", "tools-window-*", "web-panel-*", "pcb-panel-*", "pcb-window-*"],
+  "windows": ["audio-widget", "audio-widget-error", "activity-overlay", "background-monitor", "snipping-overlay*", "snipping-toasts", "snipping-strip", "snipping-editor-*", "snip-float-*", "terminal-window-*", "tools-window-*", "web-panel-*", "pcb-panel-*", "pcb-window-*", "video-panel-*"],
   "webviews": ["main"],
   "permissions": [
     "core:default",

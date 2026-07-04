@@ -47,6 +47,7 @@ pub mod coordination;
 const DEFAULT_API_BASE_URL: &str = "https://diffforge.ai/api";
 const DEFAULT_WEB_LOGIN_URL: &str = "https://diffforge.ai/desktop/login";
 const STARTUP_SETTINGS_STATE_KEY: &str = "startup-settings";
+const TRAY_CLICK_SETTINGS_STATE_KEY: &str = "tray-click-settings";
 const STARTUP_LAUNCH_MODE_BACKGROUND: &str = "background";
 const STARTUP_BACKGROUND_ARG: &str = "--background-startup";
 
@@ -120,7 +121,10 @@ const TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES: usize = 512 * 1024;
 const TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS: u64 = 120;
 const TERMINAL_PARKED_RESUME_SUBMIT_SEQUENCE: &str = "\r";
 const TERMINAL_ACTIVITY_HOOK_POLL_MS: u64 = 50;
+const TERMINAL_ACTIVITY_HOOK_BACKOFF_POLL_MS: u64 = 250;
+const TERMINAL_ACTIVITY_HOOK_IDLE_POLL_MS: u64 = 1_000;
 const TERMINAL_ACTIVITY_HOOK_FALLBACK_POLL_MS: u64 = 2_000;
+const TERMINAL_ACTIVITY_HOOK_BACKOFF_UNCHANGED_POLLS: u32 = 4;
 const TERMINAL_ACTIVITY_TRANSPORT_CONNECT_TIMEOUT_MS: u64 = 150;
 const TERMINAL_ACTIVITY_TRANSPORT_IO_TIMEOUT_MS: u64 = 1_000;
 const TERMINAL_ENTER_SEQUENCE: &str = "\x1b[13u";
@@ -216,8 +220,11 @@ const TERMINAL_TODO_PLAN_UPDATED_EVENT: &str = "forge-terminal-todo-plan-updated
 const WORKSPACE_NOTIFICATION_EVENT: &str = "diffforge:workspace-notification-event";
 const MAIN_WINDOW_CURSOR_EVENT: &str = "forge-main-window-cursor";
 const MAIN_WINDOW_CURSOR_POLL_MS: u64 = 50;
+const MAIN_WINDOW_CURSOR_BACKOFF_POLL_MS: u64 = 150;
+const MAIN_WINDOW_CURSOR_FOCUSED_IDLE_POLL_MS: u64 = 400;
 const MAIN_WINDOW_CURSOR_IDLE_POLL_MS: u64 = 500;
 const MAIN_WINDOW_CURSOR_HIDDEN_POLL_MS: u64 = 5_000;
+const MAIN_WINDOW_CURSOR_BACKOFF_UNCHANGED_SAMPLES: u32 = 4;
 const AUDIO_WIDGET_WINDOW_LABEL: &str = "audio-widget";
 const AUDIO_WIDGET_ERROR_WINDOW_LABEL: &str = "audio-widget-error";
 const AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT: &str = "forge-audio-widget-visibility-changed";
@@ -4495,6 +4502,176 @@ async fn app_local_state_merge_command(
     .map_err(|error| format!("App state merge worker failed: {error}"))?
 }
 
+const TRAY_CLICK_ACTION_SNIP_STRIP: u8 = 0;
+const TRAY_CLICK_ACTION_MONITOR: u8 = 1;
+const TRAY_CLICK_ACTION_OPEN_APP: u8 = 2;
+
+static TRAY_CLICK_FOREGROUND_ACTION: AtomicU8 = AtomicU8::new(TRAY_CLICK_ACTION_SNIP_STRIP);
+static TRAY_CLICK_BACKGROUND_ACTION: AtomicU8 = AtomicU8::new(TRAY_CLICK_ACTION_MONITOR);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrayClickAction {
+    SnipStrip,
+    Monitor,
+    OpenApp,
+}
+
+impl TrayClickAction {
+    fn from_wire(value: &str) -> Option<Self> {
+        match value.trim() {
+            "snipStrip" => Some(Self::SnipStrip),
+            "monitor" => Some(Self::Monitor),
+            "openApp" => Some(Self::OpenApp),
+            _ => None,
+        }
+    }
+
+    fn from_code(value: u8) -> Self {
+        match value {
+            TRAY_CLICK_ACTION_MONITOR => Self::Monitor,
+            TRAY_CLICK_ACTION_OPEN_APP => Self::OpenApp,
+            _ => Self::SnipStrip,
+        }
+    }
+
+    fn code(self) -> u8 {
+        match self {
+            Self::SnipStrip => TRAY_CLICK_ACTION_SNIP_STRIP,
+            Self::Monitor => TRAY_CLICK_ACTION_MONITOR,
+            Self::OpenApp => TRAY_CLICK_ACTION_OPEN_APP,
+        }
+    }
+
+    fn wire_value(self) -> &'static str {
+        match self {
+            Self::SnipStrip => "snipStrip",
+            Self::Monitor => "monitor",
+            Self::OpenApp => "openApp",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TrayClickSettings {
+    foreground_action: TrayClickAction,
+    background_action: TrayClickAction,
+}
+
+impl Default for TrayClickSettings {
+    fn default() -> Self {
+        Self {
+            foreground_action: TrayClickAction::SnipStrip,
+            background_action: TrayClickAction::Monitor,
+        }
+    }
+}
+
+fn tray_click_action_from_object(
+    object: &serde_json::Map<String, Value>,
+    key: &str,
+    default_action: TrayClickAction,
+) -> (TrayClickAction, bool) {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .and_then(TrayClickAction::from_wire)
+        .map(|action| (action, false))
+        .unwrap_or((default_action, true))
+}
+
+fn tray_click_settings_from_value(value: &Value) -> (TrayClickSettings, bool) {
+    let Some(object) = value.as_object() else {
+        return (TrayClickSettings::default(), true);
+    };
+    let default_settings = TrayClickSettings::default();
+    let (foreground_action, foreground_defaulted) = tray_click_action_from_object(
+        object,
+        "foregroundAction",
+        default_settings.foreground_action,
+    );
+    let (background_action, background_defaulted) = tray_click_action_from_object(
+        object,
+        "backgroundAction",
+        default_settings.background_action,
+    );
+
+    (
+        TrayClickSettings {
+            foreground_action,
+            background_action,
+        },
+        foreground_defaulted || background_defaulted,
+    )
+}
+
+fn tray_click_settings_to_value(settings: &TrayClickSettings) -> Value {
+    json!({
+        "foregroundAction": settings.foreground_action.wire_value(),
+        "backgroundAction": settings.background_action.wire_value(),
+    })
+}
+
+fn tray_click_settings_apply_cache(settings: &TrayClickSettings) {
+    TRAY_CLICK_FOREGROUND_ACTION.store(settings.foreground_action.code(), Ordering::Release);
+    TRAY_CLICK_BACKGROUND_ACTION.store(settings.background_action.code(), Ordering::Release);
+}
+
+fn tray_click_cached_action(background: bool) -> TrayClickAction {
+    let action = if background {
+        TRAY_CLICK_BACKGROUND_ACTION.load(Ordering::Acquire)
+    } else {
+        TRAY_CLICK_FOREGROUND_ACTION.load(Ordering::Acquire)
+    };
+    TrayClickAction::from_code(action)
+}
+
+fn tray_click_settings_read_or_seed(
+    app: &AppHandle,
+) -> Result<(TrayClickSettings, bool), String> {
+    let raw = app_local_state_read(app, TRAY_CLICK_SETTINGS_STATE_KEY);
+    let (settings, should_write) = tray_click_settings_from_value(&raw);
+    if should_write {
+        app_local_state_write(
+            app,
+            TRAY_CLICK_SETTINGS_STATE_KEY,
+            &tray_click_settings_to_value(&settings),
+        )?;
+    }
+    tray_click_settings_apply_cache(&settings);
+    Ok((settings, should_write))
+}
+
+fn tray_click_settings_save(
+    app: &AppHandle,
+    settings: TrayClickSettings,
+) -> Result<Value, String> {
+    app_local_state_write(
+        app,
+        TRAY_CLICK_SETTINGS_STATE_KEY,
+        &tray_click_settings_to_value(&settings),
+    )?;
+    tray_click_settings_apply_cache(&settings);
+    Ok(tray_click_settings_to_value(&settings))
+}
+
+fn tray_click_settings_initialize(app: &AppHandle) {
+    let Ok((settings, defaulted)) = tray_click_settings_read_or_seed(app) else {
+        log_terminal_status_event(
+            "backend.tray_click_settings.seed_error",
+            json!({ "state_key": TRAY_CLICK_SETTINGS_STATE_KEY }),
+        );
+        return;
+    };
+    log_terminal_status_event(
+        "backend.tray_click_settings.ready",
+        json!({
+            "foregroundAction": settings.foreground_action.wire_value(),
+            "backgroundAction": settings.background_action.wire_value(),
+            "defaulted": defaulted,
+        }),
+    );
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StartupSettings {
@@ -4689,6 +4866,88 @@ async fn app_startup_settings_update(
 }
 
 #[tauri::command]
+async fn tray_click_settings_state(app: AppHandle) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (settings, _) = tray_click_settings_read_or_seed(&app)?;
+        Ok(tray_click_settings_to_value(&settings))
+    })
+    .await
+    .map_err(|error| format!("Tray click settings worker failed: {error}"))?
+}
+
+#[tauri::command]
+async fn tray_click_settings_update(
+    app: AppHandle,
+    foreground_action: Option<String>,
+    background_action: Option<String>,
+) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (mut settings, _) = tray_click_settings_read_or_seed(&app)?;
+        let default_settings = TrayClickSettings::default();
+        if let Some(action) = foreground_action.as_deref() {
+            settings.foreground_action = TrayClickAction::from_wire(action)
+                .unwrap_or(default_settings.foreground_action);
+        }
+        if let Some(action) = background_action.as_deref() {
+            settings.background_action = TrayClickAction::from_wire(action)
+                .unwrap_or(default_settings.background_action);
+        }
+        tray_click_settings_save(&app, settings)
+    })
+    .await
+    .map_err(|error| format!("Tray click settings worker failed: {error}"))?
+}
+
+#[cfg(test)]
+mod tray_click_settings_tests {
+    use super::*;
+
+    #[test]
+    fn tray_click_settings_from_value_defaults_on_garbage() {
+        let (settings, defaulted) = tray_click_settings_from_value(&json!("garbage"));
+        assert!(defaulted);
+        assert_eq!(settings, TrayClickSettings::default());
+
+        let (settings, defaulted) = tray_click_settings_from_value(&json!({
+            "foregroundAction": "openApp",
+            "backgroundAction": "notAnAction",
+        }));
+        assert!(defaulted);
+        assert_eq!(settings.foreground_action, TrayClickAction::OpenApp);
+        assert_eq!(settings.background_action, TrayClickAction::Monitor);
+
+        let (settings, defaulted) = tray_click_settings_from_value(&json!({
+            "foregroundAction": 42,
+            "backgroundAction": "snipStrip",
+        }));
+        assert!(defaulted);
+        assert_eq!(settings.foreground_action, TrayClickAction::SnipStrip);
+        assert_eq!(settings.background_action, TrayClickAction::SnipStrip);
+    }
+
+    #[test]
+    fn tray_click_settings_to_value_round_trips() {
+        let settings = TrayClickSettings {
+            foreground_action: TrayClickAction::Monitor,
+            background_action: TrayClickAction::OpenApp,
+        };
+
+        let value = tray_click_settings_to_value(&settings);
+        assert_eq!(
+            value,
+            json!({
+                "foregroundAction": "monitor",
+                "backgroundAction": "openApp",
+            })
+        );
+
+        let (parsed, defaulted) = tray_click_settings_from_value(&value);
+        assert!(!defaulted);
+        assert_eq!(parsed, settings);
+    }
+}
+
+#[tauri::command]
 async fn close_app_after_terminal_shutdown(
     app: AppHandle,
     window: tauri::WebviewWindow,
@@ -4773,10 +5032,14 @@ fn start_main_window_cursor_watcher(app: &AppHandle) {
     let app = app.clone();
     tauri::async_runtime::spawn(async move {
         let mut last_snapshot: Option<(bool, i32, i32, bool)> = None;
+        let mut focused_poll_ms = MAIN_WINDOW_CURSOR_POLL_MS;
+        let mut unchanged_focused_samples = 0u32;
 
         loop {
             let Some(window) = app.get_webview_window("main") else {
                 last_snapshot = None;
+                focused_poll_ms = MAIN_WINDOW_CURSOR_POLL_MS;
+                unchanged_focused_samples = 0;
                 sleep(Duration::from_millis(MAIN_WINDOW_CURSOR_IDLE_POLL_MS)).await;
                 continue;
             };
@@ -4809,8 +5072,12 @@ fn start_main_window_cursor_watcher(app: &AppHandle) {
             let rounded_x = if hovered { client_x.round() as i32 } else { -1 };
             let rounded_y = if hovered { client_y.round() as i32 } else { -1 };
             let snapshot = (hovered, rounded_x, rounded_y, focused);
+            let snapshot_changed = last_snapshot != Some(snapshot);
+            let focus_transition = last_snapshot
+                .map(|previous| previous.3 != focused)
+                .unwrap_or(false);
 
-            if last_snapshot != Some(snapshot) {
+            if snapshot_changed {
                 let payload = if hovered {
                     json!({
                         "hovered": true,
@@ -4828,11 +5095,31 @@ fn start_main_window_cursor_watcher(app: &AppHandle) {
                 last_snapshot = Some(snapshot);
             }
 
+            if visible && focused {
+                if snapshot_changed || focus_transition {
+                    focused_poll_ms = MAIN_WINDOW_CURSOR_POLL_MS;
+                    unchanged_focused_samples = 0;
+                } else {
+                    unchanged_focused_samples = unchanged_focused_samples.saturating_add(1);
+                    if unchanged_focused_samples >= MAIN_WINDOW_CURSOR_BACKOFF_UNCHANGED_SAMPLES {
+                        focused_poll_ms = if focused_poll_ms < MAIN_WINDOW_CURSOR_BACKOFF_POLL_MS {
+                            MAIN_WINDOW_CURSOR_BACKOFF_POLL_MS
+                        } else {
+                            MAIN_WINDOW_CURSOR_FOCUSED_IDLE_POLL_MS
+                        };
+                        unchanged_focused_samples = 0;
+                    }
+                }
+            } else {
+                focused_poll_ms = MAIN_WINDOW_CURSOR_POLL_MS;
+                unchanged_focused_samples = 0;
+            }
+
             // Only poll at the fast hover cadence when the window is the active
             // (visible AND focused) window. A visible-but-unfocused/background
             // window drops to the slow idle cadence instead of waking ~20-30x/sec.
             let cursor_poll_ms = if visible && focused {
-                MAIN_WINDOW_CURSOR_POLL_MS
+                focused_poll_ms
             } else if visible {
                 MAIN_WINDOW_CURSOR_IDLE_POLL_MS
             } else {
@@ -5193,6 +5480,7 @@ pub fn run() {
         .setup(move |app| {
             pty_pool.ensure_warm_async();
             startup_settings_initialize(app.handle());
+            tray_click_settings_initialize(app.handle());
             cloud_mcp_register_sync_status_app(app.handle());
             cloud_mcp_start_local_device_bridge();
             let app_control_bridge_app = app.handle().clone();
@@ -5244,8 +5532,8 @@ pub fn run() {
             // Background dispatcher: dormant while the webview heartbeats;
             // takes over queued-todo submission when the window goes away.
             todo_dispatch_start_background_dispatcher(app.handle().clone());
-            // Always-present tray: with the main window up its click toggles
-            // the recent-snips strip; in background mode, the monitor popover.
+            // Always-present tray: left-click behavior is driven by the
+            // persisted tray-click settings seeded above.
             // (Setup runs on the main thread, which NSStatusItem requires.)
             background_tray_create(app.handle());
             todo_store_orphan_sweep_start(app.handle().clone());
@@ -5307,6 +5595,7 @@ pub fn run() {
             local_workspaces_store,
             open_html_document_in_browser,
             workspace_webview_open,
+            workspace_webview_adopt,
             workspace_webview_fit,
             workspace_webview_eval,
             workspace_webview_close,
@@ -5315,6 +5604,8 @@ pub fn run() {
             app_local_state_merge_command,
             app_startup_settings_state,
             app_startup_settings_update,
+            tray_click_settings_state,
+            tray_click_settings_update,
             agent_statuses,
             start_agent_login,
             start_agent_account_login,

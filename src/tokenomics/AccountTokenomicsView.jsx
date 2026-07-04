@@ -40,6 +40,7 @@ const TOKENOMICS_VIEW_POLL_INTERVAL_MS = 60_000;
 const TOKENOMICS_HOT_TAIL_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TOKENOMICS_LIVE_LIMIT_REFRESH_INTERVAL_MS = 60_000;
 const TOKENOMICS_SUMMARY_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const TOKENOMICS_HIDDEN_NOTIFY_DELAY_MS = 250;
 const TOKENOMICS_LIMIT_CLOUD_SYNC_REASON = "tokenomics_limits_changed";
 const TOKENOMICS_DAILY_WINDOW_DAYS = 30;
 const TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS = TOKENOMICS_DAILY_WINDOW_DAYS;
@@ -2777,13 +2778,162 @@ const tokenomicsStore = {
   progressUnlisten: null,
   updatedListenerPromise: null,
   updatedUnlisten: null,
+  notifyFrame: 0,
+  notifyTimer: 0,
+  notifyVisibilityListening: false,
+  notifiedStateSignature: "",
   subscribers: new Set(),
 };
 
-function notifyTokenomicsSubscribers() {
+const tokenomicsSummaryNotifySignatureCache = new WeakMap();
+
+function tokenomicsHashNotifyText(hash, value) {
+  const text = String(value ?? "");
+  let next = hash;
+  for (let index = 0; index < text.length; index += 1) {
+    next = Math.imul(next ^ text.charCodeAt(index), 16777619);
+  }
+  return next >>> 0;
+}
+
+function tokenomicsHashNotifyValue(hash, value) {
+  if (Array.isArray(value)) {
+    return value.reduce(
+      (next, item) => tokenomicsHashNotifyValue(next, item),
+      tokenomicsHashNotifyText(hash, `array:${value.length}`),
+    );
+  }
+  if (value && typeof value === "object") {
+    return Object.keys(value).sort().reduce(
+      (next, key) => tokenomicsHashNotifyValue(tokenomicsHashNotifyText(next, key), value[key]),
+      hash,
+    );
+  }
+  return tokenomicsHashNotifyText(hash, value);
+}
+
+function tokenomicsProgressNotifySignature(progress) {
+  if (!progress || typeof progress !== "object") return progress ? String(progress) : "";
+  return [
+    progress.phase,
+    progress.provider,
+    progress.agent_kind ?? progress.agentKind,
+    progress.provider_account_key ?? progress.providerAccountKey,
+    progress.provider_account_label ?? progress.providerAccountLabel,
+    progress.day_index ?? progress.dayIndex,
+    progress.day_total ?? progress.dayTotal,
+    progress.day_label ?? progress.dayLabel,
+    progress.files_scanned ?? progress.filesScanned,
+    progress.inserted_events ?? progress.insertedEvents,
+    progress.day_files_scanned ?? progress.dayFilesScanned,
+    progress.day_inserted_events ?? progress.dayInsertedEvents,
+    progress.candidate_count ?? progress.candidateCount,
+    progress.day_candidate_count ?? progress.dayCandidateCount,
+    progress.cached,
+    progress.mode,
+  ].map((value) => String(value ?? "")).join("\u001f");
+}
+
+function tokenomicsSummaryNotifySignature(summary) {
+  if (!summary || typeof summary !== "object") return "";
+  const cached = tokenomicsSummaryNotifySignatureCache.get(summary);
+  if (cached) return cached;
+  const signature = tokenomicsHashNotifyValue(2166136261, summary).toString(36);
+  tokenomicsSummaryNotifySignatureCache.set(summary, signature);
+  return signature;
+}
+
+function tokenomicsSubscriberStateSignature(state = {}) {
+  return [
+    state.status,
+    state.error,
+    state.selectedProvider,
+    state.selectedAccountKey,
+    PROVIDER_ACCOUNT_FILTER_PROVIDERS
+      .map((providerId) => `${providerId}:${accountKeyForProvider(state.selectedProviderAccountKeys, providerId)}`)
+      .join("\u001e"),
+    tokenomicsProgressNotifySignature(state.scanProgress),
+    tokenomicsSummaryNotifySignature(state.summary),
+  ].map((value) => String(value ?? "")).join("\u001f");
+}
+
+function stopTokenomicsNotifyVisibilityListener() {
+  if (!tokenomicsStore.notifyVisibilityListening || typeof document === "undefined") {
+    return;
+  }
+  document.removeEventListener("visibilitychange", handleTokenomicsNotifyVisibilityChange);
+  tokenomicsStore.notifyVisibilityListening = false;
+}
+
+function moveTokenomicsNotifyToHiddenTimer() {
+  if (typeof window === "undefined" || tokenomicsStore.notifyTimer || !tokenomicsStore.notifyFrame) {
+    return false;
+  }
+  if (typeof window.cancelAnimationFrame === "function") {
+    window.cancelAnimationFrame(tokenomicsStore.notifyFrame);
+  }
+  tokenomicsStore.notifyFrame = 0;
+  stopTokenomicsNotifyVisibilityListener();
+  tokenomicsStore.notifyTimer = window.setTimeout(flushTokenomicsSubscribers, TOKENOMICS_HIDDEN_NOTIFY_DELAY_MS);
+  return true;
+}
+
+function handleTokenomicsNotifyVisibilityChange() {
+  if (typeof document !== "undefined" && document.hidden) {
+    moveTokenomicsNotifyToHiddenTimer();
+  }
+}
+
+function ensureTokenomicsNotifyVisibilityListener() {
+  if (tokenomicsStore.notifyVisibilityListening || typeof document === "undefined") {
+    return;
+  }
+  document.addEventListener("visibilitychange", handleTokenomicsNotifyVisibilityChange);
+  tokenomicsStore.notifyVisibilityListening = true;
+}
+
+function flushTokenomicsSubscribers() {
+  tokenomicsStore.notifyFrame = 0;
+  tokenomicsStore.notifyTimer = 0;
+  stopTokenomicsNotifyVisibilityListener();
+  const signature = tokenomicsSubscriberStateSignature(tokenomicsStore.state);
+  if (signature === tokenomicsStore.notifiedStateSignature) {
+    return;
+  }
+  tokenomicsStore.notifiedStateSignature = signature;
   for (const subscriber of tokenomicsStore.subscribers) {
     subscriber(tokenomicsStore.state);
   }
+}
+
+function notifyTokenomicsSubscribers() {
+  if (!tokenomicsStore.subscribers.size) {
+    return;
+  }
+  if (typeof window === "undefined") {
+    flushTokenomicsSubscribers();
+    return;
+  }
+  const hidden = typeof document !== "undefined" && document.hidden;
+  if (hidden && !tokenomicsStore.notifyTimer) {
+    if (moveTokenomicsNotifyToHiddenTimer()) {
+      return;
+    }
+    tokenomicsStore.notifyTimer = window.setTimeout(flushTokenomicsSubscribers, TOKENOMICS_HIDDEN_NOTIFY_DELAY_MS);
+    return;
+  }
+  if (tokenomicsStore.notifyFrame || tokenomicsStore.notifyTimer) {
+    return;
+  }
+  if (typeof window.requestAnimationFrame !== "function") {
+    tokenomicsStore.notifyTimer = window.setTimeout(
+      flushTokenomicsSubscribers,
+      hidden ? TOKENOMICS_HIDDEN_NOTIFY_DELAY_MS : 0,
+    );
+    return;
+  }
+  ensureTokenomicsNotifyVisibilityListener();
+  tokenomicsStore.notifyFrame = window.requestAnimationFrame(flushTokenomicsSubscribers);
 }
 
 function updateTokenomicsStore(patchOrUpdater) {
@@ -2801,6 +2951,9 @@ function updateTokenomicsStore(patchOrUpdater) {
 function subscribeTokenomicsStore(subscriber) {
   tokenomicsStore.subscribers.add(subscriber);
   subscriber(tokenomicsStore.state);
+  if (tokenomicsStore.subscribers.size === 1 && !tokenomicsStore.notifyFrame && !tokenomicsStore.notifyTimer) {
+    tokenomicsStore.notifiedStateSignature = tokenomicsSubscriberStateSignature(tokenomicsStore.state);
+  }
   return () => {
     tokenomicsStore.subscribers.delete(subscriber);
   };
@@ -3182,8 +3335,13 @@ function startTokenomicsViewPolling() {
   document.addEventListener("visibilitychange", refreshVisibleTokenomics);
 
   if (!tokenomicsStore.pollInterval) {
+    // The shared interval must not close over any one subscriber's disposed
+    // flag: with multiple mounted views (route view + kept-alive tool panel),
+    // the first subscriber unmounting would otherwise leave a permanently
+    // no-op interval behind for the survivors. Its lifetime is already gated
+    // by pollSubscriberCount below.
     tokenomicsStore.pollInterval = window.setInterval(() => {
-      refreshVisibleTokenomics();
+      void refreshVisibleTokenomicsLimits({ force: false, forceProviderRefresh: false });
     }, TOKENOMICS_VIEW_POLL_INTERVAL_MS);
   }
 

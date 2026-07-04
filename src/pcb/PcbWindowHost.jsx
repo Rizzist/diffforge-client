@@ -8,6 +8,8 @@ import {
   ButtonBotIcon,
   ButtonCloseIcon,
   ButtonDragIcon,
+  ButtonFullscreenExitIcon,
+  ButtonFullscreenIcon,
   ButtonProcessIcon,
   GlobalStyle,
   TerminalAgentLabel,
@@ -17,6 +19,7 @@ import {
   TerminalRestartButton,
   TerminalRestartPill,
 } from "../app/appStyles.js";
+import { usePopoutWindowFullscreen } from "../app/usePopoutWindowFullscreen.js";
 import PcbPanel from "./PcbPanel.jsx";
 import PcbWorkspacePane from "./PcbWorkspacePane.jsx";
 import PanelAgentPromptActivity from "../terminals/PanelAgentPromptActivity.jsx";
@@ -88,6 +91,7 @@ export default function PcbWindowHost() {
   const [agentPromptTargets, setAgentPromptTargets] = useState([]);
   const [defaultAgentPromptTargetIds, setDefaultAgentPromptTargetIds] = useState([]);
   const currentWindow = useMemo(() => getCurrentWindow(), []);
+  const { isFullscreen, toggleFullscreen } = usePopoutWindowFullscreen(currentWindow);
   const agentPromptTargetsRequestIdRef = React.useRef("");
   const windowLabel = useMemo(() => {
     try {
@@ -418,6 +422,19 @@ export default function PcbWindowHost() {
             </PanelTitle>
           </PanelIdentity>
           <TerminalRailControls data-rail-row="primary">
+            <PanelIconButton
+              aria-label={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+              aria-pressed={isFullscreen ? "true" : "false"}
+              onClick={toggleFullscreen}
+              title={isFullscreen ? "Exit fullscreen" : "Fullscreen"}
+              type="button"
+            >
+              {isFullscreen ? (
+                <ButtonFullscreenExitIcon aria-hidden="true" />
+              ) : (
+                <ButtonFullscreenIcon aria-hidden="true" />
+              )}
+            </PanelIconButton>
             <PanelCloseButton aria-label="Close" onClick={() => safeTauriWindowCall(currentWindow, "close")} title="Close" type="button">
               <ButtonCloseIcon aria-hidden="true" />
             </PanelCloseButton>

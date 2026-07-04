@@ -2,7 +2,7 @@
 // small monitor window (activity + tokenomics tabs, plus a Snippets button
 // that dismisses the popover and launches the full-width recent-snips strip)
 // as the visible surface. The cross-platform tray icon lives for the whole
-// app lifetime — while the main window is up its click toggles that strip.
+// app lifetime, with configurable foreground/background click behavior.
 // Entering/leaving background never tears anything down — terminals, sync,
 // hotkeys, and the todo ledger are process-scoped.
 
@@ -287,7 +287,7 @@ pub(crate) fn app_enter_background_internal(app: &AppHandle) {
         if let Some(main) = main_app.get_webview_window("main") {
             let _ = main.hide();
         }
-        // Pre-create the hidden popover so the first tray click is instant.
+        // Pre-create the hidden popover so monitor actions are instant.
         let _ = background_monitor_window(&main_app);
         background_mode_emit_changed(&main_app, true);
         todo_dispatch_wake_background_dispatcher(main_app.clone());
@@ -394,8 +394,8 @@ fn background_monitor_open_snip_strip(app: AppHandle) -> Result<(), String> {
 }
 
 /// Cross-platform tray icon, present for the whole app lifetime. Left click
-/// is mode-aware: with the main window up it toggles the recent-snips strip
-/// (CleanShot-style bar); in background mode it toggles the monitor popover.
+/// uses persisted foreground/background actions, defaulting to the historical
+/// recent-snips strip in foreground and monitor popover in background.
 /// Quit routes through the existing graceful-shutdown choreography by
 /// emitting the same close-requested event the window close path uses.
 pub(crate) fn background_tray_create(app: &AppHandle) {
@@ -471,13 +471,13 @@ pub(crate) fn background_tray_create(app: &AppHandle) {
                     let _ = snipping_stop_recording_for(app, "tray-click");
                     return;
                 }
-                if app_is_in_background_mode() {
-                    background_monitor_toggle_at(app, Some((position.x, position.y)));
-                } else {
-                    // Main window is up: the tray becomes the recent-snips
-                    // bar toggle (the monitor popover stays a background-mode
-                    // surface — its restore button makes no sense here).
-                    snipping_strip_toggle(app);
+                let background = app_is_in_background_mode();
+                match tray_click_cached_action(background) {
+                    TrayClickAction::SnipStrip => snipping_strip_toggle(app),
+                    TrayClickAction::Monitor => {
+                        background_monitor_toggle_at(app, Some((position.x, position.y)));
+                    }
+                    TrayClickAction::OpenApp => present_main_window(app),
                 }
             }
         })
@@ -489,7 +489,7 @@ pub(crate) fn background_tray_create(app: &AppHandle) {
         );
     }
     // Pre-create the hidden strip so its webview is booted before the first
-    // tray click: an open-anim event emitted into a still-loading webview is
-    // lost, which showed as an invisible-but-clickable bar.
+    // snip-strip action: an open-anim event emitted into a still-loading
+    // webview is lost, which showed as an invisible-but-clickable bar.
     let _ = snipping_strip_window(app);
 }

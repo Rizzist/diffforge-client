@@ -4,12 +4,14 @@ import {
   takeDiagnosticIpcBudget,
   withDiagnosticIpcDropCount,
 } from "../diagnostics/diagnosticIpcBudget.js";
+import { getRenderabilitySnapshot, subscribeToRenderability } from "../app/renderability.js";
 
 export const TERMINAL_DIAGNOSTIC_LOGGING_ENABLED = false;
 export const TERMINAL_DIAGNOSTIC_FORCE_LOGGING_ENABLED = false;
 export const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED = false;
 
 const TERMINAL_DIAGNOSTIC_HEARTBEAT_MS = 100;
+const TERMINAL_DIAGNOSTIC_HIDDEN_HEARTBEAT_MS = 60000;
 const TERMINAL_DIAGNOSTIC_MAIN_THREAD_GAP_MS = 120;
 const TERMINAL_DIAGNOSTIC_DEFAULT_SAMPLE_MS = 1000;
 const TERMINAL_DIAGNOSTIC_MAIN_THREAD_GAP_SAMPLE_MS = 2500;
@@ -20,7 +22,9 @@ let backendLoggingSynced = null;
 let backendLoggingSyncInFlight = null;
 let backendLoggingForceEnabled = false;
 let heartbeatTimer = 0;
+let heartbeatIntervalMs = 0;
 let heartbeatLastMs = 0;
+let heartbeatUnsubscribe = null;
 const terminalDiagnosticSampleState = new Map();
 const threadBridgeDiagnosticSampleState = new Map();
 
@@ -225,7 +229,7 @@ export function startTerminalDiagnosticHeartbeat() {
 
   syncTerminalDiagnosticLogging();
   heartbeatLastMs = nowMs();
-  heartbeatTimer = window.setInterval(() => {
+  const runHeartbeat = () => {
     const nextMs = nowMs();
     const gapMs = nextMs - heartbeatLastMs;
     heartbeatLastMs = nextMs;
@@ -233,8 +237,28 @@ export function startTerminalDiagnosticHeartbeat() {
     if (gapMs >= TERMINAL_DIAGNOSTIC_MAIN_THREAD_GAP_MS) {
       logTerminalDiagnosticEvent("frontend.main_thread_gap", {
         elapsedMs: gapMs,
-        expectedMs: TERMINAL_DIAGNOSTIC_HEARTBEAT_MS,
+        expectedMs: heartbeatIntervalMs || TERMINAL_DIAGNOSTIC_HEARTBEAT_MS,
       });
     }
-  }, TERMINAL_DIAGNOSTIC_HEARTBEAT_MS);
+  };
+  const configureHeartbeat = (renderable) => {
+    const nextIntervalMs = renderable
+      ? TERMINAL_DIAGNOSTIC_HEARTBEAT_MS
+      : TERMINAL_DIAGNOSTIC_HIDDEN_HEARTBEAT_MS;
+    if (heartbeatTimer && heartbeatIntervalMs === nextIntervalMs) {
+      return;
+    }
+    if (heartbeatTimer) {
+      window.clearInterval(heartbeatTimer);
+      heartbeatTimer = 0;
+    }
+    heartbeatIntervalMs = nextIntervalMs;
+    heartbeatLastMs = nowMs();
+    heartbeatTimer = window.setInterval(runHeartbeat, nextIntervalMs);
+  };
+
+  configureHeartbeat(getRenderabilitySnapshot().renderable);
+  heartbeatUnsubscribe = subscribeToRenderability((nextSnapshot) => {
+    configureHeartbeat(nextSnapshot.renderable);
+  });
 }

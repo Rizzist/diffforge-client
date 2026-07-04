@@ -8,6 +8,10 @@ export const WEB_PANEL_META_REQUEST_EVENT = "forge-web-panel-meta-request";
 export const WEB_PANEL_CONTROL_EVENT = "forge-web-panel-control";
 export const WEB_PANEL_CLOSED_EVENT = "forge-web-panel-closed";
 export const WEB_PANEL_COMMAND_EVENT = "forge-web-panel-command";
+// Emitted by Rust just before a web panel window closes: its child workspace
+// webviews were reparented to the main window (hidden) so the grid can adopt
+// the living page back without a reload.
+export const WEB_PANEL_WEBVIEW_PRESERVED_EVENT = "forge-web-panel-webview-preserved";
 
 // Controls the breakout window sends back to the main grid.
 export const WEB_PANEL_CONTROL_CLOSE = "close";
