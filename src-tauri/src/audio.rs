@@ -368,7 +368,7 @@ fn audio_widget_bottom_bar_debug_log_path() -> PathBuf {
 }
 
 fn write_audio_widget_bottom_bar_debug_log_entry(entry: Value) {
-    if !AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED {
+    if !audio_widget_bottom_bar_debug_logging_enabled() {
         return;
     }
 
@@ -398,7 +398,7 @@ fn write_audio_widget_bottom_bar_debug_log_entry(entry: Value) {
 }
 
 fn log_audio_widget_bottom_bar_debug_event(phase: &str, fields: Value) {
-    if !AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED {
+    if !audio_widget_bottom_bar_debug_logging_enabled() {
         return;
     }
 
@@ -4748,7 +4748,6 @@ fn ensure_audio_widget_window(app: &AppHandle) -> Result<tauri::WebviewWindow, S
     )
     .title("Diff Forge Audio")
     .inner_size(64.0, 64.0)
-    .min_inner_size(56.0, 56.0)
     .resizable(false)
     .decorations(false)
     .always_on_top(true)
@@ -4989,6 +4988,8 @@ static AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
+static AUDIO_WIDGET_BOTTOM_BAR_INVALIDATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
 static AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(target_os = "macos")]
@@ -5193,6 +5194,10 @@ fn log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
     target_screen: Option<&objc2_app_kit::NSScreen>,
     extra: Value,
 ) {
+    if !audio_widget_bottom_bar_debug_logging_enabled() {
+        return;
+    }
+
     let fields =
         audio_widget_bottom_bar_debug_context_on_main_thread(app, ns_window, target_screen, extra);
     log_audio_widget_bottom_bar_debug_event(phase, fields);
@@ -5204,7 +5209,7 @@ fn log_audio_widget_bottom_bar_debug_snapshot_for(
     phase: &'static str,
     extra: Value,
 ) {
-    if !AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED {
+    if !audio_widget_bottom_bar_debug_logging_enabled() {
         return;
     }
 
@@ -5231,7 +5236,7 @@ fn log_audio_widget_bottom_bar_debug_snapshot_for(
 
 #[cfg(target_os = "macos")]
 fn audio_widget_start_bottom_bar_debug_sampler(app: &AppHandle) {
-    if !AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED {
+    if !audio_widget_bottom_bar_debug_logging_enabled() {
         return;
     }
     if AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLER_STARTED.swap(true, Ordering::SeqCst) {
@@ -5749,21 +5754,29 @@ fn register_audio_widget_bar_hover_mouse_monitors(app: &AppHandle) {
 fn audio_widget_queue_bottom_bar_position(
     app: &AppHandle,
     request: AudioWidgetBottomBarPositionRequest,
-    reason: &'static str,
+    reason: AudioWidgetBottomBarPlacementReason,
 ) -> Result<(), String> {
     let requested_animate = request.animate;
-    let prefer_stored_screen = reason == "stored_reposition";
+    let prefer_stored_screen = reason.prefers_stored_screen();
 
     let mut native_request = request.clone();
     native_request.animate = false;
-    let generation = AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION
-        .fetch_add(1, Ordering::AcqRel)
-        .saturating_add(1);
+    let generation = if reason.is_command() {
+        let previous_generation =
+            AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.fetch_add(1, Ordering::AcqRel);
+        audio_widget_bottom_bar_next_generation_for_reason(previous_generation, reason)
+    } else {
+        AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.load(Ordering::Acquire)
+    };
+    let invalidation_generation =
+        AUDIO_WIDGET_BOTTOM_BAR_INVALIDATION_GENERATION.load(Ordering::Acquire);
     log_audio_widget_bottom_bar_debug_event(
         "audio.widget.bottom_bar.position.queue",
         json!({
             "generation": generation,
-            "reason": reason,
+            "invalidation_generation": invalidation_generation,
+            "reason": reason.as_str(),
+            "request_id": request.request_id.as_str(),
             "width": request.width,
             "height": request.height,
             "margin": request.margin,
@@ -5772,17 +5785,44 @@ fn audio_widget_queue_bottom_bar_position(
         }),
     );
 
+    let schedule_error_request = request.clone();
+    let schedule_error_native_animate = native_request.animate;
     let app_for_main = app.clone();
     app.run_on_main_thread(move || {
-        if AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.load(Ordering::Acquire) != generation {
+        let mut metadata = AudioWidgetBottomBarLayoutEventMetadata {
+            request_id: request.request_id.clone(),
+            reason,
+            requested_animate,
+            native_animate: native_request.animate,
+            applied: false,
+            superseded: false,
+        };
+        let current_generation = AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.load(Ordering::Acquire);
+        let current_invalidation_generation =
+            AUDIO_WIDGET_BOTTOM_BAR_INVALIDATION_GENERATION.load(Ordering::Acquire);
+        if audio_widget_bottom_bar_generation_is_stale(generation, current_generation)
+            || audio_widget_bottom_bar_generation_is_stale(
+                invalidation_generation,
+                current_invalidation_generation,
+            )
+        {
             log_audio_widget_bottom_bar_debug_event(
                 "audio.widget.bottom_bar.position.queue.skipped_stale",
                 json!({
                     "generation": generation,
-                    "current_generation": AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION
-                        .load(Ordering::Acquire),
-                    "reason": reason,
+                    "current_generation": current_generation,
+                    "invalidation_generation": invalidation_generation,
+                    "current_invalidation_generation": current_invalidation_generation,
+                    "reason": reason.as_str(),
+                    "request_id": request.request_id.as_str(),
                 }),
+            );
+            metadata.superseded = true;
+            audio_widget_emit_bottom_bar_layout_resolution_on_main_thread(
+                &app_for_main,
+                Some(&request),
+                &metadata,
+                prefer_stored_screen,
             );
             return;
         }
@@ -5794,7 +5834,9 @@ fn audio_widget_queue_bottom_bar_position(
             None,
             json!({
                 "generation": generation,
-                "reason": reason,
+                "invalidation_generation": invalidation_generation,
+                "reason": reason.as_str(),
+                "request_id": request.request_id.as_str(),
                 "requested_animate": requested_animate,
                 "native_animate": native_request.animate,
             }),
@@ -5806,6 +5848,7 @@ fn audio_widget_queue_bottom_bar_position(
                 &window,
                 native_request,
                 prefer_stored_screen,
+                metadata.clone(),
             ),
             None => Err("Audio widget window is unavailable for bottom bar placement.".to_string()),
         };
@@ -5817,7 +5860,9 @@ fn audio_widget_queue_bottom_bar_position(
                     "audio.widget.bottom_bar.position.queue.done",
                     json!({
                         "generation": generation,
-                        "reason": reason,
+                        "invalidation_generation": invalidation_generation,
+                        "reason": reason.as_str(),
+                        "request_id": request.request_id.as_str(),
                         "x": position.x,
                         "y": position.y,
                         "width": position.width,
@@ -5827,24 +5872,226 @@ fn audio_widget_queue_bottom_bar_position(
                 );
                 audio_widget_reposition_error_overlay_for(&app_for_main, false);
             }
-            Err(error) => log_audio_widget_bottom_bar_debug_snapshot_for(
-                &app_for_main,
-                "audio.widget.bottom_bar.position.queue.error",
-                json!({
-                    "generation": generation,
-                    "reason": reason,
-                    "error": clean_whisper_local_audio_log_text(error),
-                }),
-            ),
+            Err(error) => {
+                log_audio_widget_bottom_bar_debug_snapshot_for(
+                    &app_for_main,
+                    "audio.widget.bottom_bar.position.queue.error",
+                    json!({
+                        "generation": generation,
+                        "invalidation_generation": invalidation_generation,
+                        "reason": reason.as_str(),
+                        "request_id": request.request_id.as_str(),
+                        "error": clean_whisper_local_audio_log_text(error),
+                    }),
+                );
+                audio_widget_emit_bottom_bar_layout_resolution_on_main_thread(
+                    &app_for_main,
+                    Some(&request),
+                    &metadata,
+                    prefer_stored_screen,
+                );
+            }
         }
     })
     .map_err(|error| {
         let message = format!("Unable to schedule audio widget bottom bar placement: {error}");
+        let metadata = AudioWidgetBottomBarLayoutEventMetadata {
+            request_id: schedule_error_request.request_id.clone(),
+            reason,
+            requested_animate,
+            native_animate: schedule_error_native_animate,
+            applied: false,
+            superseded: false,
+        };
+        let result = audio_widget_fallback_bottom_bar_position_result(Some(&schedule_error_request));
+        audio_widget_emit_bottom_bar_layout_event(app, &result, &metadata);
         log_audio_widget_bottom_bar_debug_event(
             "audio.widget.bottom_bar.position.queue.schedule_error",
             json!({
                 "generation": generation,
-                "reason": reason,
+                "invalidation_generation": invalidation_generation,
+                "reason": reason.as_str(),
+                "request_id": schedule_error_request.request_id.as_str(),
+                "error": clean_whisper_local_audio_log_text(&message),
+            }),
+        );
+        message
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_queue_stored_bottom_bar_position(
+    app: &AppHandle,
+    animate: bool,
+    reason: AudioWidgetBottomBarPlacementReason,
+    generation: u64,
+    invalidation_generation: u64,
+) -> Result<(), String> {
+    let requested_animate = animate;
+    let native_animate = false;
+    let prefer_stored_screen = true;
+    log_audio_widget_bottom_bar_debug_event(
+        "audio.widget.bottom_bar.position.queue",
+        json!({
+            "generation": generation,
+            "invalidation_generation": invalidation_generation,
+            "reason": reason.as_str(),
+            "request_id": "",
+            "requested_animate": requested_animate,
+            "native_animate": native_animate,
+            "stored_layout_deferred_to_main_thread": true,
+        }),
+    );
+
+    let app_for_main = app.clone();
+    app.run_on_main_thread(move || {
+        let mut metadata = AudioWidgetBottomBarLayoutEventMetadata {
+            request_id: String::new(),
+            reason,
+            requested_animate,
+            native_animate,
+            applied: false,
+            superseded: false,
+        };
+        let current_generation = AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.load(Ordering::Acquire);
+        let current_invalidation_generation =
+            AUDIO_WIDGET_BOTTOM_BAR_INVALIDATION_GENERATION.load(Ordering::Acquire);
+        if audio_widget_bottom_bar_generation_is_stale(generation, current_generation)
+            || audio_widget_bottom_bar_generation_is_stale(
+                invalidation_generation,
+                current_invalidation_generation,
+            )
+        {
+            log_audio_widget_bottom_bar_debug_event(
+                "audio.widget.bottom_bar.position.queue.skipped_stale",
+                json!({
+                    "generation": generation,
+                    "current_generation": current_generation,
+                    "invalidation_generation": invalidation_generation,
+                    "current_invalidation_generation": current_invalidation_generation,
+                    "reason": reason.as_str(),
+                    "request_id": "",
+                }),
+            );
+            metadata.superseded = true;
+            audio_widget_emit_bottom_bar_layout_resolution_on_main_thread(
+                &app_for_main,
+                None,
+                &metadata,
+                prefer_stored_screen,
+            );
+            return;
+        }
+
+        let Some(layout) = audio_widget_last_bottom_bar_layout() else {
+            log_audio_widget_bottom_bar_debug_event(
+                "audio.widget.bottom_bar.position.queue.no_stored_layout",
+                json!({
+                    "generation": generation,
+                    "invalidation_generation": invalidation_generation,
+                    "reason": reason.as_str(),
+                    "animate": requested_animate,
+                }),
+            );
+            audio_widget_emit_bottom_bar_layout_resolution_on_main_thread(
+                &app_for_main,
+                None,
+                &metadata,
+                prefer_stored_screen,
+            );
+            return;
+        };
+        let mut native_request = layout.into_request(requested_animate);
+        native_request.animate = native_animate;
+
+        log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
+            &app_for_main,
+            "audio.widget.bottom_bar.position.queue.fire",
+            None,
+            None,
+            json!({
+                "generation": generation,
+                "invalidation_generation": invalidation_generation,
+                "reason": reason.as_str(),
+                "request_id": "",
+                "width": native_request.width,
+                "height": native_request.height,
+                "margin": native_request.margin,
+                "requested_animate": requested_animate,
+                "native_animate": native_animate,
+            }),
+        );
+
+        let result = match app_for_main.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) {
+            Some(window) => audio_widget_position_bottom_bar_on_main_thread(
+                &app_for_main,
+                &window,
+                native_request.clone(),
+                prefer_stored_screen,
+                metadata.clone(),
+            ),
+            None => Err("Audio widget window is unavailable for bottom bar placement.".to_string()),
+        };
+
+        match &result {
+            Ok(position) => {
+                log_audio_widget_bottom_bar_debug_snapshot_for(
+                    &app_for_main,
+                    "audio.widget.bottom_bar.position.queue.done",
+                    json!({
+                        "generation": generation,
+                        "invalidation_generation": invalidation_generation,
+                        "reason": reason.as_str(),
+                        "request_id": "",
+                        "x": position.x,
+                        "y": position.y,
+                        "width": position.width,
+                        "height": position.height,
+                        "source": position.source,
+                    }),
+                );
+                audio_widget_reposition_error_overlay_for(&app_for_main, false);
+            }
+            Err(error) => {
+                log_audio_widget_bottom_bar_debug_snapshot_for(
+                    &app_for_main,
+                    "audio.widget.bottom_bar.position.queue.error",
+                    json!({
+                        "generation": generation,
+                        "invalidation_generation": invalidation_generation,
+                        "reason": reason.as_str(),
+                        "request_id": "",
+                        "error": clean_whisper_local_audio_log_text(error),
+                    }),
+                );
+                audio_widget_emit_bottom_bar_layout_resolution_on_main_thread(
+                    &app_for_main,
+                    Some(&native_request),
+                    &metadata,
+                    prefer_stored_screen,
+                );
+            }
+        }
+    })
+    .map_err(|error| {
+        let message = format!("Unable to schedule audio widget bottom bar placement: {error}");
+        let metadata = AudioWidgetBottomBarLayoutEventMetadata {
+            request_id: String::new(),
+            reason,
+            requested_animate,
+            native_animate,
+            applied: false,
+            superseded: false,
+        };
+        let result = audio_widget_fallback_bottom_bar_position_result(None);
+        audio_widget_emit_bottom_bar_layout_event(app, &result, &metadata);
+        log_audio_widget_bottom_bar_debug_event(
+            "audio.widget.bottom_bar.position.queue.schedule_error",
+            json!({
+                "generation": generation,
+                "invalidation_generation": invalidation_generation,
+                "reason": reason.as_str(),
+                "request_id": "",
                 "error": clean_whisper_local_audio_log_text(&message),
             }),
         );
@@ -5854,26 +6101,35 @@ fn audio_widget_queue_bottom_bar_position(
 
 #[cfg(target_os = "macos")]
 fn audio_widget_reposition_stored_bottom_bar_for(app: &AppHandle, animate: bool) -> bool {
-    let Some(layout) = audio_widget_last_bottom_bar_layout() else {
+    if audio_widget_last_bottom_bar_layout().is_none() {
         log_audio_widget_bottom_bar_debug_event(
             "audio.widget.bottom_bar.reposition_stored.skipped",
             json!({ "reason": "no_stored_layout", "animate": animate }),
         );
         return false;
     };
-    let request = layout.into_request(animate);
+    let generation = AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.load(Ordering::Acquire);
+    let invalidation_generation =
+        AUDIO_WIDGET_BOTTOM_BAR_INVALIDATION_GENERATION.load(Ordering::Acquire);
     log_audio_widget_bottom_bar_debug_snapshot_for(
         app,
         "audio.widget.bottom_bar.reposition_stored.request",
         json!({
-            "width": request.width,
-            "height": request.height,
-            "margin": request.margin,
-            "animate": request.animate,
+            "animate": animate,
+            "generation": generation,
+            "invalidation_generation": invalidation_generation,
+            "stored_layout_deferred_to_main_thread": true,
             "caller_on_main_thread": objc2::MainThreadMarker::new().is_some(),
         }),
     );
-    audio_widget_queue_bottom_bar_position(app, request, "stored_reposition").is_ok()
+    audio_widget_queue_stored_bottom_bar_position(
+        app,
+        animate,
+        AudioWidgetBottomBarPlacementReason::StoredReposition,
+        generation,
+        invalidation_generation,
+    )
+    .is_ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -5950,11 +6206,16 @@ fn audio_widget_schedule_stored_bottom_bar_reposition(app: &AppHandle) {
     let generation = AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION
         .fetch_add(1, Ordering::AcqRel)
         .saturating_add(1);
+    let placement_generation = AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.load(Ordering::Acquire);
+    let invalidation_generation =
+        AUDIO_WIDGET_BOTTOM_BAR_INVALIDATION_GENERATION.load(Ordering::Acquire);
     log_audio_widget_bottom_bar_debug_snapshot_for(
         app,
         "audio.widget.bottom_bar.reposition_schedule",
         json!({
             "generation": generation,
+            "placement_generation": placement_generation,
+            "invalidation_generation": invalidation_generation,
             "delays_ms": AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS,
         }),
     );
@@ -5969,6 +6230,8 @@ fn audio_widget_schedule_stored_bottom_bar_reposition(app: &AppHandle) {
                     "audio.widget.bottom_bar.reposition_schedule.skipped_stale",
                     json!({
                         "generation": generation,
+                        "placement_generation": placement_generation,
+                        "invalidation_generation": invalidation_generation,
                         "delay_ms": delay_ms,
                         "current_generation": AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION
                             .load(Ordering::Acquire),
@@ -5981,16 +6244,33 @@ fn audio_widget_schedule_stored_bottom_bar_reposition(app: &AppHandle) {
                 "audio.widget.bottom_bar.reposition_schedule.fire",
                 json!({
                     "generation": generation,
+                    "placement_generation": placement_generation,
+                    "invalidation_generation": invalidation_generation,
                     "delay_ms": delay_ms,
                 }),
             );
-            let repositioned = audio_widget_reassert_open_state(&app, true);
+            let reason = if delay_ms == 0 {
+                AudioWidgetBottomBarPlacementReason::SpaceChanged
+            } else {
+                AudioWidgetBottomBarPlacementReason::StoredReposition
+            };
+            let repositioned = audio_widget_queue_stored_bottom_bar_position(
+                &app,
+                true,
+                reason,
+                placement_generation,
+                invalidation_generation,
+            )
+            .is_ok();
             log_audio_widget_bottom_bar_debug_snapshot_for(
                 &app,
                 "audio.widget.bottom_bar.reposition_schedule.done",
                 json!({
                     "generation": generation,
+                    "placement_generation": placement_generation,
+                    "invalidation_generation": invalidation_generation,
                     "delay_ms": delay_ms,
+                    "reason": reason.as_str(),
                     "repositioned": repositioned,
                 }),
             );
@@ -6232,13 +6512,26 @@ fn show_audio_widget_window_on_main_thread(app: &AppHandle, focus: bool) -> Resu
             let _ = window.unminimize();
             let mut prepositioned = false;
             if let Some(layout) = audio_widget_last_bottom_bar_layout() {
-                let _ = audio_widget_position_bottom_bar_on_main_thread(
+                let metadata = AudioWidgetBottomBarLayoutEventMetadata {
+                    request_id: String::new(),
+                    reason: AudioWidgetBottomBarPlacementReason::StoredReposition,
+                    requested_animate: false,
+                    native_animate: false,
+                    applied: false,
+                    superseded: false,
+                };
+                if audio_widget_position_bottom_bar_on_main_thread(
                     app,
                     &window,
                     layout.into_request(false),
                     true,
-                );
-                prepositioned = true;
+                    metadata,
+                )
+                .is_ok()
+                {
+                    audio_widget_reposition_error_overlay_for(app, false);
+                    prepositioned = true;
+                }
             }
             log_audio_widget_bottom_bar_debug_snapshot_for(
                 app,
@@ -6433,6 +6726,7 @@ struct AudioWidgetBottomBarPositionRequest {
     height: f64,
     margin: f64,
     animate: bool,
+    request_id: String,
 }
 
 impl Default for AudioWidgetBottomBarPositionRequest {
@@ -6442,8 +6736,62 @@ impl Default for AudioWidgetBottomBarPositionRequest {
             height: 0.0,
             margin: 0.0,
             animate: false,
+            request_id: String::new(),
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AudioWidgetBottomBarPlacementReason {
+    Command,
+    StoredReposition,
+    SpaceChanged,
+}
+
+impl AudioWidgetBottomBarPlacementReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Command => "command",
+            Self::StoredReposition => "stored_reposition",
+            Self::SpaceChanged => "space_changed",
+        }
+    }
+
+    fn prefers_stored_screen(self) -> bool {
+        !matches!(self, Self::Command)
+    }
+
+    fn is_command(self) -> bool {
+        matches!(self, Self::Command)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AudioWidgetBottomBarLayoutEventMetadata {
+    request_id: String,
+    reason: AudioWidgetBottomBarPlacementReason,
+    requested_animate: bool,
+    native_animate: bool,
+    applied: bool,
+    superseded: bool,
+}
+
+fn audio_widget_bottom_bar_next_generation_for_reason(
+    current_generation: u64,
+    reason: AudioWidgetBottomBarPlacementReason,
+) -> u64 {
+    if reason.is_command() {
+        current_generation.saturating_add(1)
+    } else {
+        current_generation
+    }
+}
+
+fn audio_widget_bottom_bar_generation_is_stale(
+    captured_generation: u64,
+    current_generation: u64,
+) -> bool {
+    captured_generation != current_generation
 }
 
 #[derive(Deserialize, Clone)]
@@ -6527,6 +6875,7 @@ impl AudioWidgetBottomBarLayout {
             height: self.height,
             margin: self.margin,
             animate,
+            request_id: String::new(),
         }
     }
 
@@ -6647,7 +6996,7 @@ fn audio_widget_clear_bottom_bar_position_request() {
     #[cfg(target_os = "macos")]
     {
         AUDIO_WIDGET_NATIVE_REPOSITION_GENERATION.fetch_add(1, Ordering::AcqRel);
-        AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.fetch_add(1, Ordering::AcqRel);
+        AUDIO_WIDGET_BOTTOM_BAR_INVALIDATION_GENERATION.fetch_add(1, Ordering::AcqRel);
     }
     if let Ok(mut current) = audio_widget_bottom_bar_layout_slot().lock() {
         *current = None;
@@ -6678,37 +7027,239 @@ struct AudioWidgetBottomBarPositionResult {
     use_full_monitor_bounds: bool,
 }
 
+fn audio_widget_fallback_bottom_bar_position_result(
+    request: Option<&AudioWidgetBottomBarPositionRequest>,
+) -> AudioWidgetBottomBarPositionResult {
+    let width = audio_widget_positive_dimension(request.map(|request| request.width).unwrap_or(0.0), 64.0);
+    let height =
+        audio_widget_positive_dimension(request.map(|request| request.height).unwrap_or(0.0), 64.0);
+    AudioWidgetBottomBarPositionResult {
+        x: 0.0,
+        y: 0.0,
+        width,
+        height,
+        anchor_x: 0.0,
+        anchor_y: 0.0,
+        anchor_width: width,
+        anchor_height: height,
+        scale_factor: 1.0,
+        source: "unresolved".to_string(),
+        use_full_monitor_bounds: false,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_current_bottom_bar_position_result_on_main_thread(
+    app: &AppHandle,
+    prefer_stored_screen: bool,
+) -> Option<AudioWidgetBottomBarPositionResult> {
+    let window = app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)?;
+    let ns_ptr = window.ns_window().ok()?;
+    if ns_ptr.is_null() {
+        return None;
+    }
+    let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+    let main_thread_marker = objc2::MainThreadMarker::new()?;
+    let stored_layout = if prefer_stored_screen {
+        audio_widget_last_bottom_bar_layout()
+    } else {
+        None
+    };
+    let screen = audio_widget_macos_target_screen_for_bottom_bar(
+        app,
+        ns_window,
+        main_thread_marker,
+        stored_layout.as_ref(),
+    )?;
+    let screen_frame = screen.frame();
+    let visible_frame = screen.visibleFrame();
+    let bounds_resolution =
+        macos_resolve_active_space_full_monitor_bounds_for_screen_on_main_thread(Some(
+            screen.as_ref(),
+        ));
+    let anchor_frame = if bounds_resolution.use_full_monitor_bounds {
+        screen_frame
+    } else {
+        visible_frame
+    };
+    let frame = ns_window.frame();
+    Some(AudioWidgetBottomBarPositionResult {
+        x: frame.origin.x,
+        y: frame.origin.y,
+        width: frame.size.width,
+        height: frame.size.height,
+        anchor_x: anchor_frame.origin.x,
+        anchor_y: anchor_frame.origin.y,
+        anchor_width: anchor_frame.size.width,
+        anchor_height: anchor_frame.size.height,
+        scale_factor: screen.backingScaleFactor(),
+        source: if bounds_resolution.use_full_monitor_bounds {
+            "appkit-screen-frame"
+        } else {
+            "appkit-visible-frame"
+        }
+        .to_string(),
+        use_full_monitor_bounds: bounds_resolution.use_full_monitor_bounds,
+    })
+}
+
 fn audio_widget_emit_bottom_bar_layout_event(
     app: &AppHandle,
     result: &AudioWidgetBottomBarPositionResult,
-    requested_animate: bool,
-    native_animate: bool,
+    metadata: &AudioWidgetBottomBarLayoutEventMetadata,
 ) {
     let _ = app.emit(
         FLOATING_SURFACE_LAYOUT_CHANGED_EVENT,
-        json!({
-            "source": "audio_widget_bottom_bar",
-            "surface": "audio-widget",
-            "layout": "bottom-bar",
-            "requestedAnimate": requested_animate,
-            "nativeAnimate": native_animate,
-            "positionSource": result.source,
-            "useFullMonitorBounds": result.use_full_monitor_bounds,
-            "scaleFactor": result.scale_factor,
-            "frame": {
-                "x": result.x,
-                "y": result.y,
-                "width": result.width,
-                "height": result.height,
-            },
-            "anchor": {
-                "x": result.anchor_x,
-                "y": result.anchor_y,
-                "width": result.anchor_width,
-                "height": result.anchor_height,
-            },
-        }),
+        audio_widget_bottom_bar_layout_event_payload(result, metadata),
     );
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_emit_bottom_bar_layout_resolution_on_main_thread(
+    app: &AppHandle,
+    request: Option<&AudioWidgetBottomBarPositionRequest>,
+    metadata: &AudioWidgetBottomBarLayoutEventMetadata,
+    prefer_stored_screen: bool,
+) {
+    let result = audio_widget_current_bottom_bar_position_result_on_main_thread(
+        app,
+        prefer_stored_screen,
+    )
+    .unwrap_or_else(|| audio_widget_fallback_bottom_bar_position_result(request));
+    audio_widget_emit_bottom_bar_layout_event(app, &result, metadata);
+}
+
+fn audio_widget_bottom_bar_layout_event_payload(
+    result: &AudioWidgetBottomBarPositionResult,
+    metadata: &AudioWidgetBottomBarLayoutEventMetadata,
+) -> Value {
+    json!({
+        "source": "audio_widget_bottom_bar",
+        "surface": "audio-widget",
+        "layout": "bottom-bar",
+        "requestId": metadata.request_id.as_str(),
+        "reason": metadata.reason.as_str(),
+        "applied": metadata.applied,
+        "superseded": metadata.superseded,
+        "requestedAnimate": metadata.requested_animate,
+        "nativeAnimate": metadata.native_animate,
+        "positionSource": result.source,
+        "useFullMonitorBounds": result.use_full_monitor_bounds,
+        "scaleFactor": result.scale_factor,
+        "frame": {
+            "x": result.x,
+            "y": result.y,
+            "width": result.width,
+            "height": result.height,
+        },
+        "anchor": {
+            "x": result.anchor_x,
+            "y": result.anchor_y,
+            "width": result.anchor_width,
+            "height": result.anchor_height,
+        },
+    })
+}
+
+#[cfg(test)]
+mod audio_widget_bottom_bar_protocol_tests {
+    use super::*;
+
+    #[test]
+    fn bottom_bar_generation_only_commands_advance() {
+        assert_eq!(
+            audio_widget_bottom_bar_next_generation_for_reason(
+                7,
+                AudioWidgetBottomBarPlacementReason::Command,
+            ),
+            8
+        );
+        assert_eq!(
+            audio_widget_bottom_bar_next_generation_for_reason(
+                7,
+                AudioWidgetBottomBarPlacementReason::StoredReposition,
+            ),
+            7
+        );
+        assert_eq!(
+            audio_widget_bottom_bar_next_generation_for_reason(
+                7,
+                AudioWidgetBottomBarPlacementReason::SpaceChanged,
+            ),
+            7
+        );
+        assert!(audio_widget_bottom_bar_generation_is_stale(7, 8));
+        assert!(!audio_widget_bottom_bar_generation_is_stale(8, 8));
+        assert!(audio_widget_bottom_bar_generation_is_stale(3, 4));
+        assert!(!audio_widget_bottom_bar_generation_is_stale(4, 4));
+    }
+
+    #[test]
+    fn bottom_bar_request_accepts_optional_request_id() {
+        let with_id: AudioWidgetBottomBarPositionRequest = serde_json::from_value(json!({
+            "width": 320.0,
+            "height": 44.0,
+            "margin": 8.0,
+            "animate": true,
+            "requestId": "command-42",
+        }))
+        .expect("request with requestId should deserialize");
+        assert_eq!(with_id.request_id, "command-42");
+
+        let without_id: AudioWidgetBottomBarPositionRequest = serde_json::from_value(json!({
+            "width": 320.0,
+            "height": 44.0,
+            "margin": 8.0,
+            "animate": true,
+        }))
+        .expect("request without requestId should deserialize");
+        assert_eq!(without_id.request_id, "");
+    }
+
+    #[test]
+    fn bottom_bar_layout_event_payload_preserves_legacy_fields_and_adds_protocol_fields() {
+        let result = AudioWidgetBottomBarPositionResult {
+            x: 12.0,
+            y: 34.0,
+            width: 320.0,
+            height: 44.0,
+            anchor_x: 0.0,
+            anchor_y: 20.0,
+            anchor_width: 1440.0,
+            anchor_height: 880.0,
+            scale_factor: 2.0,
+            source: "appkit-visible-frame".to_string(),
+            use_full_monitor_bounds: false,
+        };
+        let metadata = AudioWidgetBottomBarLayoutEventMetadata {
+            request_id: "command-42".to_string(),
+            reason: AudioWidgetBottomBarPlacementReason::Command,
+            requested_animate: true,
+            native_animate: false,
+            applied: false,
+            superseded: true,
+        };
+
+        let payload = audio_widget_bottom_bar_layout_event_payload(&result, &metadata);
+
+        assert_eq!(payload["source"], "audio_widget_bottom_bar");
+        assert_eq!(payload["surface"], "audio-widget");
+        assert_eq!(payload["layout"], "bottom-bar");
+        assert_eq!(payload["requestedAnimate"], true);
+        assert_eq!(payload["nativeAnimate"], false);
+        assert_eq!(payload["positionSource"], "appkit-visible-frame");
+        assert_eq!(payload["useFullMonitorBounds"], false);
+        assert_eq!(payload["scaleFactor"], 2.0);
+        assert_eq!(payload["frame"], json!({"x": 12.0, "y": 34.0, "width": 320.0, "height": 44.0}));
+        assert_eq!(
+            payload["anchor"],
+            json!({"x": 0.0, "y": 20.0, "width": 1440.0, "height": 880.0})
+        );
+        assert_eq!(payload["requestId"], "command-42");
+        assert_eq!(payload["reason"], "command");
+        assert_eq!(payload["applied"], false);
+        assert_eq!(payload["superseded"], true);
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -7563,6 +8114,7 @@ fn audio_widget_position_bottom_bar_on_main_thread(
     window: &tauri::WebviewWindow,
     request: AudioWidgetBottomBarPositionRequest,
     prefer_stored_screen: bool,
+    mut metadata: AudioWidgetBottomBarLayoutEventMetadata,
 ) -> Result<AudioWidgetBottomBarPositionResult, String> {
     snipping_catch_objc_result("audio_widget_position_bottom_bar", || {
         let width = audio_widget_positive_dimension(request.width, 64.0);
@@ -7579,9 +8131,11 @@ fn audio_widget_position_bottom_bar_on_main_thread(
                 "height": request.height,
                 "margin": request.margin,
                 "animate": request.animate,
+                "request_id": request.request_id.as_str(),
                 "normalized_width": width,
                 "normalized_height": height,
                 "normalized_margin": margin,
+                "reason": metadata.reason.as_str(),
             }),
         );
         let Ok(ns_ptr) = window.ns_window() else {
@@ -7671,9 +8225,9 @@ fn audio_widget_position_bottom_bar_on_main_thread(
 
         let frame_matches_target =
             audio_widget_rect_nearly_matches(&frame_before, &target_frame);
-        let requested_animate = request.animate;
+        let requested_animate = metadata.requested_animate;
         let would_animate = requested_animate && !frame_matches_target;
-        let animate = false;
+        let animate = metadata.native_animate;
         log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
             app,
             "audio.widget.bottom_bar.position.before_set_frame",
@@ -7685,7 +8239,9 @@ fn audio_widget_position_bottom_bar_on_main_thread(
                     "height": request.height,
                     "margin": request.margin,
                     "animate": request.animate,
+                    "request_id": request.request_id.as_str(),
                 },
+                "reason": metadata.reason.as_str(),
                 "prefer_stored_screen": prefer_stored_screen,
                 "normalized": {
                     "width": width,
@@ -7819,7 +8375,9 @@ fn audio_widget_position_bottom_bar_on_main_thread(
             screen.as_ref(),
             bounds_resolution.use_full_monitor_bounds,
         );
-        audio_widget_emit_bottom_bar_layout_event(app, &result, requested_animate, animate);
+        metadata.applied = !frame_matches_target;
+        metadata.superseded = false;
+        audio_widget_emit_bottom_bar_layout_event(app, &result, &metadata);
         Ok(result)
     })
 }
@@ -7837,9 +8395,11 @@ fn audio_widget_position_bottom_bar_for(
             "height": request.height,
             "margin": request.margin,
             "animate": request.animate,
+            "request_id": request.request_id.as_str(),
         }),
     );
-    let result = audio_widget_queue_bottom_bar_position(app, request, "command");
+    let result =
+        audio_widget_queue_bottom_bar_position(app, request, AudioWidgetBottomBarPlacementReason::Command);
     match &result {
         Ok(()) => log_audio_widget_bottom_bar_debug_snapshot_for(
             app,
@@ -7902,7 +8462,15 @@ fn audio_widget_position_bottom_bar_for(
         source: "tauri-work-area".to_string(),
         use_full_monitor_bounds: false,
     };
-    audio_widget_emit_bottom_bar_layout_event(app, &result, request.animate, request.animate);
+    let metadata = AudioWidgetBottomBarLayoutEventMetadata {
+        request_id: request.request_id.clone(),
+        reason: AudioWidgetBottomBarPlacementReason::Command,
+        requested_animate: request.animate,
+        native_animate: request.animate,
+        applied: true,
+        superseded: false,
+    };
+    audio_widget_emit_bottom_bar_layout_event(app, &result, &metadata);
     audio_widget_reposition_error_overlay_for(app, reposition_error_overlay);
     Ok(())
 }

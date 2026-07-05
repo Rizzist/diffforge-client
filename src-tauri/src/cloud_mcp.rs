@@ -229,6 +229,8 @@ static CLOUD_MCP_WS_LAST_PONG_RECEIVED_MS: AtomicU64 = AtomicU64::new(0);
 static CLOUD_MCP_NETWORK_RECENT_FRAMES: OnceLock<StdMutex<VecDeque<Value>>> = OnceLock::new();
 static CLOUD_MCP_TOKENOMICS_SYNC_LOGS: OnceLock<StdMutex<VecDeque<Value>>> = OnceLock::new();
 static CLOUD_MCP_OUTBOX_KNOWN_EMPTY: AtomicBool = AtomicBool::new(false);
+static CLOUD_MCP_OUTBOX_SCHEMA_PREPARED_PATHS: OnceLock<StdMutex<HashSet<PathBuf>>> =
+    OnceLock::new();
 
 static CLOUD_MCP_LOCAL_DEVICE_BRIDGE_STARTED: AtomicBool = AtomicBool::new(false);
 static CLOUD_MCP_BACKGROUND_EVENT_SENDER: OnceLock<
@@ -2322,7 +2324,7 @@ fn cloud_mcp_agent_chat_sync_state_prepare_schema(
     Ok(())
 }
 
-fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+fn cloud_mcp_outbox_maintenance_sql() -> String {
     // The outbox is a transport journal, not a payload archive. Active rows
     // keep their body; completed rows keep only compact hash metadata long
     // enough to avoid local resend loops.
@@ -2349,7 +2351,7 @@ fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<(
              LIMIT {CLOUD_MCP_OUTBOX_REJECTED_LIMIT}
            );"
     );
-    let maintenance_sql = format!(
+    format!(
         "-- Legacy heartbeat rows used stable identity-based idempotency
          -- keys (coalesce_key='') with mutable payloads; the server rejects
          -- every retry as an idempotency conflict and each new heartbeat used
@@ -2521,12 +2523,14 @@ fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<(
                  AND o.status='acked'
            );
          {prune_sql}"
-    );
+    )
+}
+
+fn cloud_mcp_outbox_prepare_schema(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     cloud_mcp_agent_chat_sync_state_prepare_schema(conn)?;
     conn.execute_batch(&format!(
         "
         PRAGMA journal_mode = WAL;
-        PRAGMA synchronous = NORMAL;
         PRAGMA auto_vacuum = INCREMENTAL;
         CREATE TABLE IF NOT EXISTS {CLOUD_MCP_OUTBOX_TABLE}(
             outbox_id TEXT PRIMARY KEY,
@@ -2730,7 +2734,6 @@ fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<(
             manifest_hash TEXT NOT NULL DEFAULT '',
             updated_at_ms INTEGER NOT NULL DEFAULT 0
         );
-        {maintenance_sql}
         "
     ))?;
     cloud_mcp_add_table_column_if_missing(
@@ -2740,8 +2743,92 @@ fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<(
         "metadata_hash TEXT NOT NULL DEFAULT ''",
     )?;
     cloud_mcp_backfill_loopspace_trigger_run_loopspace_rows(conn)?;
+    Ok(())
+}
+
+fn cloud_mcp_outbox_configure_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.execute_batch("PRAGMA synchronous = NORMAL;")
+}
+
+fn cloud_mcp_outbox_run_maintenance(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let maintenance_sql = cloud_mcp_outbox_maintenance_sql();
+    conn.execute_batch(&maintenance_sql)?;
     cloud_mcp_outbox_reclaim_storage_if_sparse(conn);
     Ok(())
+}
+
+fn cloud_mcp_outbox_error_may_reflect_schema_change(error: &rusqlite::Error) -> bool {
+    match error.sqlite_error_code() {
+        Some(
+            rusqlite::ErrorCode::SchemaChanged
+            | rusqlite::ErrorCode::DatabaseCorrupt
+            | rusqlite::ErrorCode::NotADatabase,
+        ) => return true,
+        Some(rusqlite::ErrorCode::Unknown) => {}
+        _ => return false,
+    }
+
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("no such table")
+        || message.contains("no such column")
+        || message.contains("has no column named")
+}
+
+#[cfg(test)]
+fn cloud_mcp_outbox_init_conn(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    cloud_mcp_outbox_configure_conn(conn)?;
+    cloud_mcp_outbox_prepare_schema(conn)?;
+    cloud_mcp_outbox_run_maintenance(conn)
+}
+
+fn cloud_mcp_outbox_schema_prepared_paths() -> &'static StdMutex<HashSet<PathBuf>> {
+    CLOUD_MCP_OUTBOX_SCHEMA_PREPARED_PATHS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn cloud_mcp_outbox_schema_cache_key(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn cloud_mcp_outbox_forget_prepared_schema(path: &Path) {
+    let key = cloud_mcp_outbox_schema_cache_key(path);
+    let mut prepared_paths = cloud_mcp_outbox_schema_prepared_paths().lock().unwrap();
+    prepared_paths.remove(&key);
+}
+
+fn cloud_mcp_outbox_prepare_schema_once(
+    conn: &rusqlite::Connection,
+    path: &Path,
+) -> rusqlite::Result<bool> {
+    let key = cloud_mcp_outbox_schema_cache_key(path);
+    let mut prepared_paths = cloud_mcp_outbox_schema_prepared_paths().lock().unwrap();
+    if prepared_paths.contains(&key) {
+        return Ok(false);
+    }
+    cloud_mcp_outbox_prepare_schema(conn)?;
+    prepared_paths.insert(key);
+    Ok(true)
+}
+
+fn cloud_mcp_outbox_init_conn_for_path(
+    conn: &rusqlite::Connection,
+    path: &Path,
+) -> rusqlite::Result<()> {
+    cloud_mcp_outbox_configure_conn(conn)?;
+    let prepared_now = cloud_mcp_outbox_prepare_schema_once(conn, path)?;
+    match cloud_mcp_outbox_run_maintenance(conn) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if !cloud_mcp_outbox_error_may_reflect_schema_change(&error) {
+                return Err(error);
+            }
+            cloud_mcp_outbox_forget_prepared_schema(path);
+            if prepared_now {
+                return Err(error);
+            }
+            cloud_mcp_outbox_prepare_schema_once(conn, path)?;
+            cloud_mcp_outbox_run_maintenance(conn)
+        }
+    }
 }
 
 fn cloud_mcp_backfill_loopspace_trigger_run_loopspace_rows(
@@ -2837,11 +2924,11 @@ fn cloud_mcp_open_outbox_conn() -> Result<rusqlite::Connection, String> {
         fs::create_dir_all(parent)
             .map_err(|error| format!("Unable to create Cloud sync outbox directory: {error}"))?;
     }
-    let conn = rusqlite::Connection::open(path)
+    let conn = rusqlite::Connection::open(&path)
         .map_err(|error| format!("Unable to open Cloud sync outbox SQLite cache: {error}"))?;
     conn.busy_timeout(Duration::from_millis(2_500))
         .map_err(|error| format!("Unable to configure Cloud sync outbox SQLite cache: {error}"))?;
-    cloud_mcp_outbox_init_conn(&conn)
+    cloud_mcp_outbox_init_conn_for_path(&conn, &path)
         .map_err(|error| format!("Unable to initialize Cloud sync outbox SQLite cache: {error}"))?;
     Ok(conn)
 }
@@ -12928,6 +13015,12 @@ async fn cloud_mcp_cache_account_usage_snapshot(state: &CloudMcpState, event: &V
     let Some(snapshot) = cloud_mcp_account_usage_snapshot_from_event(event) else {
         return;
     };
+    // Slim ONCE at the ingest boundary: server usage snapshots arrive with
+    // full duplicated ledger/history arrays. Caching them raw meant every
+    // downstream consumer (get_billing_status polls → frontend →
+    // desktop_auth_apply_billing_status) re-ran the deep slim pass over the
+    // fat payload — a measured recurring CPU spike.
+    let snapshot = desktop_auth_slim_billing_status(snapshot);
     let mut runtime = state.inner.lock().await;
     runtime.account_usage_snapshot = Some(snapshot);
 }
@@ -31341,7 +31434,12 @@ async fn cloud_mcp_get_billing_status_for_state(state: &CloudMcpState) -> Result
 
     let billing = read_api_response(response, "Unable to load billing status.").await?;
     let ledger = cloud_mcp_diffforge_credit_ledger_summary(100);
-    Ok(cloud_mcp_merge_diffforge_credit_ledger(billing, ledger))
+    // Slim at the fetch boundary: the server response carries full duplicated
+    // ledger/history arrays, and every downstream consumer used to re-walk
+    // them (apply/merge/persist/emit) on each poll.
+    Ok(desktop_auth_slim_billing_status(
+        cloud_mcp_merge_diffforge_credit_ledger(billing, ledger),
+    ))
 }
 
 #[tauri::command]

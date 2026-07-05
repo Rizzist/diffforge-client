@@ -7,6 +7,10 @@ import evalWebWorkerBlobUrl from "@tscircuit/eval/blob-url";
 import manifoldModuleUrl from "manifold-3d/manifold.js?url";
 import manifoldWasmUrl from "manifold-3d/manifold.wasm?url";
 import runframeStandalonePreviewUrl from "@tscircuit/runframe/standalone-preview?url";
+import {
+  normalizePcbElementContexts,
+  resolvePcbPickedElementContext,
+} from "./pcbElementContext.js";
 
 export const PCB_VIEW_TABS = [
   { id: "pcb", label: "PCB" },
@@ -1069,12 +1073,16 @@ const PreviewFrame = styled.iframe`
   background: #ffffff;
 `;
 
-function ManagedPreviewFrame({ srcDoc, title }) {
+function ManagedPreviewFrame({ onFrame = null, srcDoc, title }) {
   const frameRef = useRef(null);
+  const onFrameRef = useRef(onFrame);
+  onFrameRef.current = onFrame;
 
   useEffect(() => {
     const frame = frameRef.current;
+    onFrameRef.current?.(frame);
     return () => {
+      onFrameRef.current?.(null);
       resetPreviewFrame(frame);
     };
   }, []);
@@ -1132,6 +1140,7 @@ export default function PcbPanel({
   isActive = false,
   onActivate,
   onClose,
+  onElementPickerChange = null,
   onPopOut,
   showHeader = true,
 }) {
@@ -1150,6 +1159,15 @@ export default function PcbPanel({
   const [error, setError] = useState("");
   const readSeqRef = useRef(0);
   const renderSeqRef = useRef(0);
+  // Element picker: the iframe owns hit-testing (bootstrap picker), the host
+  // owns held selections — tab switches re-key the srcDoc and rebuild the
+  // iframe, so picks are merged across iframe sessions here.
+  const pickerFrameRef = useRef(null);
+  const pickerEnabledRef = useRef(false);
+  const pickerSessionIdsRef = useRef(new Set());
+  const [pickerEnabled, setPickerEnabled] = useState(false);
+  const [pickerThreeD, setPickerThreeD] = useState(false);
+  const [pickerHeldSelections, setPickerHeldSelections] = useState([]);
   const normalizedRepoPath = useMemo(() => normalizeRepoIdentity(repoPath), [repoPath]);
   const fsMap = useMemo(() => {
     if (typeof source !== "string") {
@@ -1230,6 +1248,123 @@ export default function PcbPanel({
       URL.revokeObjectURL(bootstrapUrl);
     };
   }, [circuitJson, previewPayloadSignature, previewProps]);
+
+  const postPickerAction = useCallback((action) => {
+    pickerFrameRef.current?.contentWindow?.postMessage(
+      { action, type: "diffforge:pcb:element-picker" },
+      "*",
+    );
+  }, []);
+
+  useEffect(() => {
+    const handlePickerMessage = (event) => {
+      const frame = pickerFrameRef.current;
+      if (!frame || event.source !== frame.contentWindow) {
+        return;
+      }
+      const data = event.data;
+      if (!data || data.type !== "diffforge:pcb:element-picker-state") {
+        return;
+      }
+      setPickerThreeD(Boolean(data.capabilities?.threeD));
+      const reason = String(data.reason || "");
+      if (reason === "ready") {
+        // Fresh iframe session (first load or tab-switch rebuild): its
+        // selection list starts empty; re-arm if the user had the pointer on.
+        pickerSessionIdsRef.current = new Set();
+        if (pickerEnabledRef.current) {
+          postPickerAction("enable");
+        }
+        return;
+      }
+      if (reason === "clear" || reason === "escape") {
+        pickerSessionIdsRef.current = new Set();
+        setPickerHeldSelections([]);
+        if (reason === "escape") {
+          pickerEnabledRef.current = false;
+          setPickerEnabled(false);
+        }
+        return;
+      }
+      if (reason === "disable") {
+        pickerEnabledRef.current = false;
+        setPickerEnabled(false);
+      } else if (reason === "enable") {
+        pickerEnabledRef.current = true;
+        setPickerEnabled(true);
+      }
+      const selections = (Array.isArray(data.selections) ? data.selections : [])
+        .filter((item) => item && typeof item === "object" && item.id);
+      const previousSessionIds = pickerSessionIdsRef.current;
+      const messageIds = new Set(selections.map((item) => item.id));
+      setPickerHeldSelections((current) => {
+        // Items unpicked in the live iframe session drop; picks held from
+        // earlier sessions stay; new picks append. Cap keeps latest 3.
+        const kept = current.filter((item) => (
+          !previousSessionIds.has(item.id) || messageIds.has(item.id)
+        ));
+        const knownIds = new Set(kept.map((item) => item.id));
+        const next = [...kept, ...selections.filter((item) => !knownIds.has(item.id))];
+        return next.length > 3 ? next.slice(next.length - 3) : next;
+      });
+      pickerSessionIdsRef.current = messageIds;
+    };
+    window.addEventListener("message", handlePickerMessage);
+    return () => window.removeEventListener("message", handlePickerMessage);
+  }, [postPickerAction]);
+
+  useEffect(() => {
+    pickerSessionIdsRef.current = new Set();
+    setPickerHeldSelections([]);
+    pickerEnabledRef.current = false;
+    setPickerEnabled(false);
+  }, [boardPath]);
+
+  const togglePicker = useCallback(() => {
+    if (pickerEnabledRef.current) {
+      pickerEnabledRef.current = false;
+      setPickerEnabled(false);
+      postPickerAction("disable");
+      return;
+    }
+    pickerEnabledRef.current = true;
+    setPickerEnabled(true);
+    postPickerAction("enable");
+  }, [postPickerAction]);
+
+  const clearPicker = useCallback(() => {
+    pickerSessionIdsRef.current = new Set();
+    setPickerHeldSelections([]);
+    postPickerAction("clear");
+  }, [postPickerAction]);
+
+  const pickerContexts = useMemo(() => {
+    if (!pickerHeldSelections.length) {
+      return [];
+    }
+    return normalizePcbElementContexts(pickerHeldSelections
+      .map((pick) => resolvePcbPickedElementContext(pick, {
+        boardPath,
+        boardTitle: board?.name || "",
+        circuitJson,
+        source,
+      }))
+      .filter(Boolean));
+  }, [board?.name, boardPath, circuitJson, pickerHeldSelections, source]);
+
+  useEffect(() => {
+    if (typeof onElementPickerChange !== "function") {
+      return;
+    }
+    onElementPickerChange({
+      clear: clearPicker,
+      contexts: pickerContexts,
+      count: pickerContexts.length,
+      enabled: pickerEnabled,
+      threeD: pickerThreeD,
+      toggle: togglePicker,
+    });
+  }, [clearPicker, onElementPickerChange, pickerContexts, pickerEnabled, pickerThreeD, togglePicker]);
 
   const readSource = useCallback(() => {
     const readSeq = readSeqRef.current + 1;
@@ -1581,6 +1716,9 @@ export default function PcbPanel({
             ) : null}
             <ManagedPreviewFrame
               key={previewFrameKey}
+              onFrame={(frame) => {
+                pickerFrameRef.current = frame;
+              }}
               srcDoc={previewSrcDoc}
               title={`${board?.name || "PCB"} renderer`}
             />

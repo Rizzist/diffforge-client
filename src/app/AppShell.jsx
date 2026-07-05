@@ -133,6 +133,7 @@ import TerminalView, {
   TODO_QUEUE_PANE_MODE_MINIMIZED,
   TODO_QUEUE_PANE_MODE_NORMAL,
   TodoQueuePanel,
+  useTerminalGridSeparatorDragGate,
 } from "../terminals/TerminalView.jsx";
 
 const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
@@ -603,6 +604,7 @@ import {
   LoopspaceRuntimeDetail,
   LoopspaceRuntimeDetailGrid,
   LoopspaceRuntimeDetailHeader,
+  LoopspaceRuntimeDetailHistory,
   LoopspaceRuntimeDetailMessage,
   LoopspaceRuntimeStatusPill,
   LoopspaceRuntimeTimeline,
@@ -1032,7 +1034,11 @@ const OPEN_BROWSER_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MS = 5000;
 const BACKEND_HELLO_TIMEOUT_MESSAGE = "Diff Forge API check timed out.";
 const BILLING_STATUS_REFRESH_MS = 5 * 60 * 1000;
-const BILLING_STATUS_EVENT_REFRESH_MIN_MS = 10 * 1000;
+// Sync-status events fire several times a minute during agent activity; the
+// event-driven billing refresh is an HTTP fallback (live credits already ride
+// the ws), so a 10s floor meant a fat /v1/billing/status fetch + merge +
+// persist every ~15s — the recurring idle energy spike.
+const BILLING_STATUS_EVENT_REFRESH_MIN_MS = 90 * 1000;
 const TODO_DISPATCH_HEARTBEAT_ACTIVE_MS = 5000;
 const TODO_DISPATCH_HEARTBEAT_IDLE_MS = 10000;
 const LOW_CREDIT_WARNING_STORAGE_KEY = "diffforge.lowCreditWarning.dismissed.v1";
@@ -1051,7 +1057,6 @@ const WINDOW_RESIZE_EDGES = [
   { placement: "bottom-left", direction: "SouthWest" },
 ];
 const DEFAULT_WORKSPACE_VIEW = "terminals";
-const MAIN_WINDOW_CURSOR_EVENT = "forge-main-window-cursor";
 const SETTINGS_TAB_GENERAL = "general";
 const SETTINGS_TAB_PERMISSIONS = "permissions";
 const SETTINGS_PERMISSION_HIGHLIGHT_MS = 4200;
@@ -1069,6 +1074,7 @@ const WORKSPACE_TAB_VIEW_BY_ID = {
 };
 const WORKSPACE_TAB_IDS = new Set(Object.keys(WORKSPACE_TAB_VIEW_BY_ID));
 const ACCOUNT_APP_VIEW_IDS = new Set(["tools", "assets", "snipping", "audio", "tokenomics", "settings"]);
+const ACCOUNT_KEEP_ALIVE_VIEW_IDS = new Set(["audio", "tokenomics"]);
 const DEVICE_LEVEL_APP_VIEW_IDS = new Set([...ACCOUNT_APP_VIEW_IDS, "architectures", "mcps", "clis", "scripts"]);
 const APP_SCRIPT_LEGACY_WORKSPACE_BUTTON_COLOR = "#1f3f7a";
 const APP_SCRIPT_LEGACY_LOOPSPACE_BUTTON_COLOR = "#4b3512";
@@ -11470,7 +11476,6 @@ function LoopspaceRuntimeView({
         : "";
       const timeMs = loopspaceRuntimeTimestampMs(event) || 0;
       const runId = loopspaceRuntimeEventRunId(event);
-      const edgeId = loopspaceRuntimeEventEdgeId(event);
       const sortValue = loopspaceRuntimeEventSortValue(event) || timeMs || eventIndex;
       const statusLabel = loopspaceRuntimeEventStatusLabel(event, "Event");
       const message = loopspaceRuntimeFriendlyMessage(event, title, status);
@@ -11494,10 +11499,6 @@ function LoopspaceRuntimeView({
           targetLabel ? ["Target", targetLabel] : null,
           scriptLabel && scriptLabel !== title ? ["Script", scriptLabel] : null,
           timeMs ? ["Updated", formatLoopspaceRuntimeTime(timeMs) || formatLoopspaceRuntimeConsoleTime(timeMs)] : null,
-          runId ? ["Run ID", runId] : null,
-          nodeId ? ["Node ID", nodeId] : null,
-          edgeId ? ["Edge ID", edgeId] : null,
-          event?.id ? ["Event ID", event.id] : null,
         ].filter(Boolean),
         icon: loopspaceRuntimeEventTimelineIcon(event),
         id: `event:${event?.id || `${nodeId || "runtime"}:${sortValue}`}`,
@@ -11524,9 +11525,6 @@ function LoopspaceRuntimeView({
         detailRows: [
           ["Type", "Loop runtime"],
           timeMs ? ["Updated", formatLoopspaceRuntimeTime(timeMs) || formatLoopspaceRuntimeConsoleTime(timeMs)] : null,
-          runtimeHeadRunId ? ["Run ID", runtimeHeadRunId] : null,
-          runtimeHeadNodeId ? ["Node ID", runtimeHeadNodeId] : null,
-          runtimeHeadEdgeId ? ["Edge ID", runtimeHeadEdgeId] : null,
         ].filter(Boolean),
         icon: loopspaceRuntimeTimelineIconForStatus(status),
         id: `head:${runtimeHeadRunId || runtimeHeadNodeId || "runtime"}`,
@@ -11544,7 +11542,38 @@ function LoopspaceRuntimeView({
         tone: loopspaceNodeRuntimeStatusTone(status),
       });
     }
-    return rows.sort((left, right) => (
+    // One row per node per run: the row carries the LATEST event's state (the
+    // animated icon/status), and every earlier state change rides along as
+    // `history` for the detail panel.
+    const groups = new Map();
+    for (const row of rows) {
+      const groupKey = `${row.runId || "run"}:${row.nodeId || "loop"}`;
+      const bucket = groups.get(groupKey);
+      if (bucket) {
+        bucket.push(row);
+      } else {
+        groups.set(groupKey, [row]);
+      }
+    }
+    const nodeRows = Array.from(groups.entries()).map(([groupKey, bucket]) => {
+      bucket.sort((left, right) => (
+        (left.sortValue || 0) - (right.sortValue || 0)
+        || String(left.id).localeCompare(String(right.id))
+      ));
+      const latest = bucket[bucket.length - 1];
+      return {
+        ...latest,
+        history: bucket.map((entry) => ({
+          id: entry.id,
+          message: entry.sourceMessage || entry.message,
+          statusLabel: entry.statusLabel,
+          timeMs: entry.timeMs,
+          tone: entry.tone,
+        })),
+        id: `node:${groupKey}`,
+      };
+    });
+    return nodeRows.sort((left, right) => (
       (left.sortValue || 0) - (right.sortValue || 0)
       || String(left.id).localeCompare(String(right.id))
     ));
@@ -11993,7 +12022,12 @@ function LoopspaceRuntimeView({
     const panelBody = runtimePanelBodyRef.current;
     if (!panelBody || runtimePanelTab === "nodes" || runtimePanelTab === "settings") return;
     if (runtimePanelTab === "logs" && runtimeEventsPaginationRef.current.loading) return;
-    panelBody.scrollTop = (runtimePanelTab === "logs" || runtimePanelTab === "runtime") ? panelBody.scrollHeight : 0;
+    // The runtime tab scrolls its history list column, not the whole body —
+    // following there must never drag the list under the panel header.
+    const scroller = runtimePanelTab === "runtime"
+      ? panelBody.querySelector('[data-runtime-timeline-scroll="true"]') || panelBody
+      : panelBody;
+    scroller.scrollTop = (runtimePanelTab === "logs" || runtimePanelTab === "runtime") ? scroller.scrollHeight : 0;
   }, [
     currentRuntimeSegments.length,
     logs.length,
@@ -13902,7 +13936,11 @@ function LoopspaceRuntimeView({
                 {runtimePanelTab === "runtime" ? (
                   runtimeTimelineRows.length ? (
                     <LoopspaceRuntimeTimeline>
-                      <LoopspaceRuntimeTimelineList aria-label="Live runtime timeline">
+                      <LoopspaceRuntimeTimelineList
+                        aria-label="Live runtime timeline"
+                        data-runtime-timeline-scroll="true"
+                        onScroll={onRuntimePanelScroll}
+                      >
                         {runtimeTimelineRows.map((row) => {
                           const selected = selectedRuntimeRow?.id === row.id;
                           return (
@@ -13998,7 +14036,19 @@ function LoopspaceRuntimeView({
                             </Fragment>
                           ) : null}
                         </LoopspaceRuntimeDetailGrid>
-                        {selectedRuntimeRow?.sourceMessage ? (
+                        {selectedRuntimeRow?.history?.length ? (
+                          <LoopspaceRuntimeDetailHistory aria-label="State changes in this run">
+                            {selectedRuntimeRow.history.map((entry) => (
+                              <li key={entry.id}>
+                                <span>{formatLoopspaceRuntimeConsoleTime(entry.timeMs)}</span>
+                                <LoopspaceRuntimeStatusPill data-tone={entry.tone}>
+                                  {entry.statusLabel}
+                                </LoopspaceRuntimeStatusPill>
+                                <em title={entry.message}>{entry.message}</em>
+                              </li>
+                            ))}
+                          </LoopspaceRuntimeDetailHistory>
+                        ) : selectedRuntimeRow?.sourceMessage ? (
                           <LoopspaceRuntimeDetailMessage>
                             {selectedRuntimeRow.sourceMessage}
                           </LoopspaceRuntimeDetailMessage>
@@ -20515,6 +20565,18 @@ function getWorkspaceRootWasEmptyAtSelection(workspaceSettings, workspaceId) {
   return Boolean(workspaceSettings?.[workspaceId]?.rootWasEmptyAtSelection);
 }
 
+function useRailRowHover() {
+  const [hovered, setHovered] = useState(false);
+  const onMouseEnter = useCallback(() => setHovered(true), []);
+  const onMouseLeave = useCallback(() => setHovered(false), []);
+  // WebKit does not dispatch mouseleave when an overlay (settings modal)
+  // appears under a stationary pointer — the hit target changes without a
+  // pointer crossing, stranding the hover state. Interactions that open an
+  // overlay clear it explicitly; a real re-hover fires mouseenter again.
+  const clearHovered = useCallback(() => setHovered(false), []);
+  return { clearHovered, hovered, onMouseEnter, onMouseLeave };
+}
+
 const LoopspaceRailRow = memo(function LoopspaceRailRow({
   loopspaceId,
   loopspaceName,
@@ -20524,24 +20586,31 @@ const LoopspaceRailRow = memo(function LoopspaceRailRow({
 }) {
   const runtimeState = selected ? "activated" : "closed";
   const rowKey = `loopspace:${loopspaceId}`;
+  const { clearHovered, hovered, onMouseEnter, onMouseLeave } = useRailRowHover();
   const handleSelect = useCallback(() => {
+    clearHovered();
     onSelect(loopspaceId);
-  }, [loopspaceId, onSelect]);
+  }, [clearHovered, loopspaceId, onSelect]);
   const handleSettings = useCallback((event) => {
     event.stopPropagation();
+    clearHovered();
     onSettings(loopspaceId);
-  }, [loopspaceId, onSettings]);
+  }, [clearHovered, loopspaceId, onSettings]);
 
   return (
     <WorkspaceRow
+      data-hovered={hovered ? "true" : undefined}
       data-runtime={runtimeState}
       data-selected={selected}
       data-workspace-rail-row-key={rowKey}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
     >
       <WorkspaceButton
         aria-label={loopspaceName}
         data-runtime={runtimeState}
         data-selected={selected}
+        data-space="loop"
         onClick={handleSelect}
         title={loopspaceName}
         type="button"
@@ -20585,11 +20654,12 @@ const WorkspaceRailWorkspaceRow = memo(function WorkspaceRailWorkspaceRow({
   selected,
   workspaceId,
   workspaceName,
-  workspaceSettings,
+  workspaceRootDirectory = "",
   workspaceState,
 }) {
-  const workspaceRoot = getWorkspaceRootDirectory(workspaceSettings, workspaceId);
+  const workspaceRoot = workspaceRootDirectory;
   const rowKey = `workspace:${workspaceId}`;
+  const { clearHovered, hovered, onMouseEnter, onMouseLeave } = useRailRowHover();
   const runtimeState = pendingActivation
     ? "activating"
     : workspaceId === activatedWorkspaceId
@@ -20619,23 +20689,28 @@ const WorkspaceRailWorkspaceRow = memo(function WorkspaceRailWorkspaceRow({
       ? `Opening ${workspaceName}`
       : `Activate ${workspaceName}`;
   const handleSelect = useCallback(() => {
+    clearHovered();
     onSelect(workspaceId);
-  }, [onSelect, workspaceId]);
+  }, [clearHovered, onSelect, workspaceId]);
   const handleLifecycle = useCallback((event) => {
     event.stopPropagation();
     onLifecycle(workspaceId, enabled);
   }, [enabled, onLifecycle, workspaceId]);
   const handleSettings = useCallback((event) => {
     event.stopPropagation();
+    clearHovered();
     onSettings(workspaceId);
-  }, [onSettings, workspaceId]);
+  }, [clearHovered, onSettings, workspaceId]);
 
   return (
     <WorkspaceRow
+      data-hovered={hovered ? "true" : undefined}
       data-notification-highlight={notificationHighlighted ? "true" : undefined}
       data-runtime={runtimeState}
       data-selected={selected}
       data-workspace-rail-row-key={rowKey}
+      onMouseEnter={onMouseEnter}
+      onMouseLeave={onMouseLeave}
     >
       <WorkspaceButton
         aria-label={workspaceButtonLabel}
@@ -20691,6 +20766,86 @@ const WorkspaceRailWorkspaceRow = memo(function WorkspaceRailWorkspaceRow({
     </WorkspaceRow>
   );
 });
+
+function dormantAccountSurfacePropsEqual(previousProps, nextProps) {
+  if (!previousProps.active && !nextProps.active) {
+    return true;
+  }
+  const previousKeys = Object.keys(previousProps);
+  const nextKeys = Object.keys(nextProps);
+  return previousKeys.length === nextKeys.length
+    && previousKeys.every((key) => Object.is(previousProps[key], nextProps[key]));
+}
+
+const AccountTokenomicsWorkspaceSurface = memo(function AccountTokenomicsWorkspaceSurface({
+  accountKey,
+  active,
+  billingStatus,
+  motion,
+  storageUsage,
+}) {
+  return (
+    <ForgeWorkspace aria-label="Account Tokenomics" data-motion={active ? motion : "entered"}>
+      <AccountTokenomicsView
+        accountKey={accountKey}
+        active={active}
+        billingStatus={billingStatus}
+        storageUsage={storageUsage}
+      />
+    </ForgeWorkspace>
+  );
+}, dormantAccountSurfacePropsEqual);
+
+const AudioAccountWorkspaceSurface = memo(function AudioAccountWorkspaceSurface({
+  active,
+  audioActionState,
+  audioDownloadProgress,
+  audioError,
+  audioHotkeyAttention,
+  audioModelStatus,
+  audioStatusState,
+  audioWidgetVisible,
+  authState,
+  billingStatus,
+  billingStatusError,
+  billingStatusState,
+  motion,
+  onCloseWidget,
+  onDownloadModel,
+  onOpenWidget,
+  onRefreshBillingStatus,
+  onRefreshStatus,
+  onSelectModel,
+  onUninstallModel,
+  workspace,
+}) {
+  return (
+    <ForgeWorkspace aria-label="Workspace audio" data-motion={active ? motion : "entered"}>
+      <AudioWorkspaceView
+        active={active}
+        audioActionState={audioActionState}
+        audioDownloadProgress={audioDownloadProgress}
+        audioError={audioError}
+        audioHotkeyAttention={audioHotkeyAttention}
+        audioModelStatus={audioModelStatus}
+        audioStatusState={audioStatusState}
+        audioWidgetVisible={audioWidgetVisible}
+        authState={authState}
+        billingStatus={billingStatus}
+        billingStatusError={billingStatusError}
+        billingStatusState={billingStatusState}
+        onDownloadModel={onDownloadModel}
+        onCloseWidget={onCloseWidget}
+        onOpenWidget={onOpenWidget}
+        onRefreshBillingStatus={onRefreshBillingStatus}
+        onRefreshStatus={onRefreshStatus}
+        onSelectModel={onSelectModel}
+        onUninstallModel={onUninstallModel}
+        workspace={workspace}
+      />
+    </ForgeWorkspace>
+  );
+}, dormantAccountSurfacePropsEqual);
 
 const AGENT_SESSION_MODE_WORKTREE = "worktree_coordination";
 const AGENT_SESSION_MODE_COORDINATED = "direct_coordination";
@@ -22393,6 +22548,10 @@ export default function App() {
   const [apiMessage, setApiMessage] = useState("Checking connection");
   const [activeView, setActiveView] = useState(DEFAULT_WORKSPACE_VIEW);
   const [visibleView, setVisibleView] = useState(DEFAULT_WORKSPACE_VIEW);
+  const [visitedAccountViews, setVisitedAccountViews] = useState(() => ({
+    audio: false,
+    tokenomics: false,
+  }));
   const [viewMotion, setViewMotion] = useState("entered");
   const [activeAgent, setActiveAgent] = useState("codex");
   const [agentStatuses, setAgentStatuses] = useState(readCachedAgentStatuses);
@@ -22589,8 +22748,6 @@ export default function App() {
   const workspaceRailRef = useRef(null);
   const workspaceRailAnimationFrameRef = useRef(0);
   const workspaceRailAnimatingRef = useRef(false);
-  const workspaceRailNativeHoverFrameRef = useRef(0);
-  const workspaceRailNativeHoverElementRef = useRef(null);
   const workspaceGitPullPromptCheckRef = useRef("");
   const workspaceGitPullPromptSkippedRef = useRef(new Set());
   const viewTransitionTimeoutRef = useRef(null);
@@ -25037,6 +25194,20 @@ export default function App() {
   }, [visibleView]);
 
   useEffect(() => {
+    if (!ACCOUNT_KEEP_ALIVE_VIEW_IDS.has(visibleView)) {
+      return;
+    }
+    setVisitedAccountViews((current) => (
+      current[visibleView]
+        ? current
+        : {
+            ...current,
+            [visibleView]: true,
+          }
+    ));
+  }, [visibleView]);
+
+  useEffect(() => {
     // Report whether dictation may route into the selected terminal pane.
     // Pane selection is sticky (grey outline), so the backend needs to know
     // what the user is actually looking at: the terminal route is allowed
@@ -25232,138 +25403,8 @@ export default function App() {
   }, [workspaceCatalog]);
 
   useEffect(() => {
-    let cancelled = false;
-    let unlistenMainWindowCursor = null;
-
-    const setNativeHoverRow = (nextRow) => {
-      const currentRow = workspaceRailNativeHoverElementRef.current;
-      if (currentRow && currentRow !== nextRow) {
-        currentRow.removeAttribute("data-native-hovered");
-      }
-      if (nextRow) {
-        nextRow.setAttribute("data-native-hovered", "true");
-        workspaceRailNativeHoverElementRef.current = nextRow;
-        return;
-      }
-      workspaceRailNativeHoverElementRef.current = null;
-    };
-
-    const clearNativeHover = () => {
-      if (workspaceRailNativeHoverFrameRef.current) {
-        window.cancelAnimationFrame(workspaceRailNativeHoverFrameRef.current);
-        workspaceRailNativeHoverFrameRef.current = 0;
-      }
-      setNativeHoverRow(null);
-    };
-
-    const scheduleNativeHoverFromPoint = (clientX, clientY) => {
-      const x = Number(clientX);
-      const y = Number(clientY);
-      if (
-        !Number.isFinite(x)
-        || !Number.isFinite(y)
-        || typeof document === "undefined"
-        || typeof document.elementFromPoint !== "function"
-      ) {
-        clearNativeHover();
-        return;
-      }
-
-      if (workspaceRailNativeHoverFrameRef.current) {
-        window.cancelAnimationFrame(workspaceRailNativeHoverFrameRef.current);
-      }
-
-      workspaceRailNativeHoverFrameRef.current = window.requestAnimationFrame(() => {
-        workspaceRailNativeHoverFrameRef.current = 0;
-        if (cancelled) {
-          return;
-        }
-        const rail = workspaceRailRef.current;
-        if (!rail) {
-          setNativeHoverRow(null);
-          return;
-        }
-
-        const target = document.elementFromPoint(x, y);
-        const row = target?.closest?.("[data-workspace-rail-row-key]");
-        const nextRow = row && rail.contains(row) ? row : null;
-        setNativeHoverRow(nextRow);
-      });
-    };
-
-    // The native cursor watcher samples at a decayed cadence (up to 400ms
-    // still / 500ms unfocused), so its highlight can lag one row behind the
-    // CSS :hover row on a fast move — two rows then show hovered (with close
-    // buttons) at once. Real DOM mouse events are authoritative whenever they
-    // flow: snap the native highlight to the row under the real cursor. No-op
-    // (single ref read) while no native highlight is set.
-    const reconcileNativeHoverWithMouse = (event) => {
-      const currentRow = workspaceRailNativeHoverElementRef.current;
-      if (!currentRow) {
-        return;
-      }
-      const row = event.target?.closest?.("[data-workspace-rail-row-key]");
-      if (row === currentRow) {
-        return;
-      }
-      const rail = workspaceRailRef.current;
-      setNativeHoverRow(row && rail && rail.contains(row) ? row : null);
-    };
-    document.addEventListener("mousemove", reconcileNativeHoverWithMouse, { passive: true });
-    // The pointer can exit the window between native cursor samples — never
-    // leave a row stuck in its hovered state.
-    document.addEventListener("mouseleave", clearNativeHover);
-    window.addEventListener("blur", clearNativeHover);
-
-    listen(MAIN_WINDOW_CURSOR_EVENT, (event) => {
-      if (cancelled) {
-        return;
-      }
-      const payload = event?.payload || {};
-      if (payload.hovered !== true) {
-        clearNativeHover();
-        return;
-      }
-      scheduleNativeHoverFromPoint(payload.clientX ?? payload.client_x, payload.clientY ?? payload.client_y);
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenMainWindowCursor = unlisten;
-    }).catch(() => {});
-
-    return () => {
-      cancelled = true;
-      document.removeEventListener("mousemove", reconcileNativeHoverWithMouse);
-      document.removeEventListener("mouseleave", clearNativeHover);
-      window.removeEventListener("blur", clearNativeHover);
-      if (typeof unlistenMainWindowCursor === "function") {
-        unlistenMainWindowCursor();
-      }
-      if (workspaceRailNativeHoverFrameRef.current) {
-        window.cancelAnimationFrame(workspaceRailNativeHoverFrameRef.current);
-        workspaceRailNativeHoverFrameRef.current = 0;
-      }
-      setNativeHoverRow(null);
-    };
-  }, []);
-
-  useEffect(() => {
     workspaceSettingsRef.current = workspaceSettings;
   }, [workspaceSettings]);
-
-  useLayoutEffect(() => {
-    const currentRow = workspaceRailNativeHoverElementRef.current;
-    const rail = workspaceRailRef.current;
-    if (!currentRow) {
-      return;
-    }
-    if (!rail || !currentRow.isConnected || !rail.contains(currentRow)) {
-      currentRow.removeAttribute("data-native-hovered");
-      workspaceRailNativeHoverElementRef.current = null;
-    }
-  }, [loopspaces, spaceMode, workspaces]);
 
   useEffect(() => {
     agentLaunchDefaultsRef.current = agentLaunchDefaults;
@@ -27230,6 +27271,10 @@ export default function App() {
     ));
   }, []);
 
+  // Dragging the tool-panel divider resizes the terminal grid per frame;
+  // gate xterm refits for the drag so the reflow happens once on release.
+  const handleWorkspaceToolSeparatorPointerDown = useTerminalGridSeparatorDragGate();
+
   const beginWorkspaceRailAnimation = useCallback(() => {
     const shell = dashboardShellRef.current;
     const rail = workspaceRailRef.current;
@@ -27934,12 +27979,14 @@ export default function App() {
     const safeWorkspaceId = String(workspaceId || "").trim();
 
     if (workspaceDeactivationInFlightRef.current) {
-      logWorkspaceActivationTrace("workspace.open.activation_request_blocked", safeWorkspaceId, {
-        reason: "workspace_deactivation_in_flight",
+      // Don't drop the click: proceed so the pending latch + splash go up;
+      // activateWorkspace will refuse while the deactivation holds the
+      // terminal lifecycle, and the pending-activation watchdog retries the
+      // commit once it drains.
+      logWorkspaceActivationTrace("workspace.open.activation_requested_during_deactivation", safeWorkspaceId, {
         source,
         workspaceDeactivationInFlight: workspaceDeactivationInFlightRef.current,
       });
-      return false;
     }
 
     if (!workspace) {
@@ -27962,8 +28009,10 @@ export default function App() {
       ...activeWorkspaceIds,
       previousActivatedWorkspaceId,
     ]);
-    const workspaceAlreadyActive = activeWorkspaceIds.includes(workspace.id)
-      || previousActivatedWorkspaceId === workspace.id;
+    // Lifecycle enabled set only: a stale activatedWorkspaceIdRef (wedged
+    // activation, interrupted deactivation) must not make a dead workspace
+    // look active — the "already active" branch skips real activation.
+    const workspaceAlreadyActive = activeWorkspaceIds.includes(workspace.id);
     const transitionKind = workspaceAlreadyActive
       ? previousSelectedWorkspaceId === workspace.id
         ? "reselect_active_runtime"
@@ -28066,7 +28115,13 @@ export default function App() {
     ]);
     const previousSelectedWorkspaceId = selectedWorkspaceIdRef.current;
     const previousPendingActivationId = workspacePendingActivationIdRef.current;
-    const workspaceAlreadyActive = activeRuntimeWorkspaceIds.includes(workspace.id);
+    // Trust only the lifecycle enabled set for "runtime is on" decisions:
+    // activatedWorkspaceIdRef can go stale (wedged activation, interrupted
+    // deactivation) and a disabled workspace misjudged as active would skip
+    // the settings panel the user needs to enable it.
+    const workspaceRuntimeEnabled = activeWorkspaceIds.includes(workspace.id);
+    const workspaceAlreadyActive = workspaceRuntimeEnabled
+      || activeRuntimeWorkspaceIds.includes(workspace.id);
     const transitionKind = workspaceAlreadyActive
       ? previousSelectedWorkspaceId === workspace.id
         ? "reselect_active_runtime"
@@ -28102,6 +28157,7 @@ export default function App() {
 
     if (
       transitionKind === "reselect_active_runtime"
+      && workspaceRuntimeEnabled
       && spaceModeRef.current === APP_SPACE_MODE_WORKSPACES
     ) {
       // Re-clicking the already-selected workspace: skip the full urgent
@@ -28135,10 +28191,10 @@ export default function App() {
     setWorkspaceSettingsMessage("");
     setWorkspaceDeleteConfirmId("");
     setWorkspaceError("");
-    setWorkspaceSettingsModalId(workspaceAlreadyActive ? "" : workspace.id);
+    setWorkspaceSettingsModalId(workspaceRuntimeEnabled ? "" : workspace.id);
     showView(DEFAULT_WORKSPACE_VIEW, {
       immediate: true,
-      telemetrySource: workspaceAlreadyActive ? "workspace_rail_select" : "workspace_rail_select_settings",
+      telemetrySource: workspaceRuntimeEnabled ? "workspace_rail_select" : "workspace_rail_select_settings",
       telemetryWorkspaceId: workspace.id,
     });
   }, [
@@ -36569,6 +36625,15 @@ export default function App() {
     || workspaceToolLayoutWidth >= WORKSPACE_TOOL_VISIBLE_MIN_WIDTH;
   const settingsViewVisible = visibleView === "settings";
   const globalToolsViewVisible = GLOBAL_TOOLS_VIEWS.has(visibleView);
+  const assetsViewVisible = visibleView === "assets";
+  const audioViewVisible = visibleView === "audio";
+  const snippingViewVisible = visibleView === "snipping";
+  const tokenomicsViewVisible = visibleView === "tokenomics";
+  const accountKeepAliveViewVisible = audioViewVisible || tokenomicsViewVisible;
+  const audioViewActive = audioViewVisible && viewMotion !== "exiting";
+  const tokenomicsViewActive = tokenomicsViewVisible && viewMotion !== "exiting";
+  const audioViewMounted = audioViewVisible || visitedAccountViews.audio;
+  const tokenomicsViewMounted = tokenomicsViewVisible || visitedAccountViews.tokenomics;
   const workspaceToolPaneAvailable = !shouldShowWorkspaceSetup;
   const workspaceToolPaneVisible = workspaceToolPaneAvailable;
   const workspaceToolPaneMinimized = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
@@ -50569,6 +50634,7 @@ export default function App() {
                             const workspaceIsRuntimeEnabled = enabledRuntimeWorkspaceIds.includes(workspace.id);
                             const workspaceIsPendingActivation = workspacePendingActivationId === workspace.id;
                             const notificationSummary = workspaceNotificationSummaries[workspace.id] || EMPTY_OBJECT;
+                            const workspaceRootDirectory = getWorkspaceRootDirectory(workspaceSettings, workspace.id);
 
                             return (
                               <WorkspaceRailWorkspaceRow
@@ -50590,7 +50656,7 @@ export default function App() {
                                 selected={workspace.id === selectedWorkspaceId}
                                 workspaceId={workspace.id}
                                 workspaceName={workspace.name}
-                                workspaceSettings={workspaceSettings}
+                                workspaceRootDirectory={workspaceRootDirectory}
                                 workspaceState={workspaceState}
                               />
                             );
@@ -52356,7 +52422,7 @@ export default function App() {
                       />
                     </ForgeWorkspace>
                   </WorkspaceRuntimeLayer>
-              {settingsViewVisible || globalToolsViewVisible ? (
+              {settingsViewVisible || globalToolsViewVisible || accountKeepAliveViewVisible ? (
                 null
               ) : visibleView === "files" ? (
                 <ForgeWorkspace aria-label="Workspace files" data-motion={viewMotion} data-surface="files">
@@ -52439,7 +52505,7 @@ export default function App() {
                     <WorkspaceIdleState detail="Select a workspace to view task history." viewMotion={viewMotion} />
                   )}
                 </ForgeWorkspace>
-              ) : visibleView === "assets" ? (
+              ) : assetsViewVisible ? (
                 <ForgeWorkspace aria-label="Account Assets" data-motion={viewMotion}>
                   <AccountAssetsView
                     assetWorkspaces={assetWorkspaceOptions}
@@ -52460,15 +52526,7 @@ export default function App() {
                     onUntrackedRename={untrackedAssetsLibrary.renameAsset}
                   />
                 </ForgeWorkspace>
-              ) : visibleView === "tokenomics" ? (
-                <ForgeWorkspace aria-label="Account Tokenomics" data-motion={viewMotion}>
-                  <AccountTokenomicsView
-                    accountKey={resolvedTokenomicsAccountKey}
-                    billingStatus={billingStatus}
-                    storageUsage={cloudWorkspaceProgress.storageUsage}
-                  />
-                </ForgeWorkspace>
-              ) : visibleView === "snipping" ? (
+              ) : snippingViewVisible ? (
                 <ForgeWorkspace aria-label="Snipping" data-motion={viewMotion}>
                   <SnippingWorkspaceView
                     untrackedLibrary={untrackedAssetsLibrary.library}
@@ -52478,33 +52536,53 @@ export default function App() {
                     captureAttention={snippingCaptureAttention}
                   />
                 </ForgeWorkspace>
-              ) : visibleView === "audio" ? (
-                <ForgeWorkspace aria-label="Workspace audio" data-motion={viewMotion}>
-                  <AudioWorkspaceView
-                    audioActionState={audioActionState}
-                    audioDownloadProgress={audioDownloadProgress}
-                    audioError={audioError}
-                    audioHotkeyAttention={audioHotkeyAttention}
-                    audioModelStatus={audioModelStatus}
-                    audioStatusState={audioStatusState}
-                    audioWidgetVisible={audioWidgetVisible}
-                    authState={authState}
-                    billingStatus={billingStatus}
-                    billingStatusError={billingStatusError}
-                    billingStatusState={billingStatusState}
-                    onDownloadModel={downloadAudioModel}
-                    onCloseWidget={closeAudioWidget}
-                    onOpenWidget={openAudioWidget}
-                    onRefreshBillingStatus={refreshBillingStatus}
-                    onRefreshStatus={refreshAudioModelStatus}
-                    onSelectModel={selectAudioModel}
-                    onUninstallModel={uninstallAudioModel}
-                    workspace={selectedWorkspace}
-                  />
-                </ForgeWorkspace>
               ) : (
                 null
               )}
+                  {tokenomicsViewMounted ? (
+                    <WorkspaceRuntimeLayer
+                      aria-hidden={!tokenomicsViewVisible}
+                      data-visible={tokenomicsViewVisible}
+                    >
+                      <AccountTokenomicsWorkspaceSurface
+                        accountKey={resolvedTokenomicsAccountKey}
+                        active={tokenomicsViewActive}
+                        billingStatus={billingStatus}
+                        motion={viewMotion}
+                        storageUsage={cloudWorkspaceProgress.storageUsage}
+                      />
+                    </WorkspaceRuntimeLayer>
+                  ) : null}
+                  {audioViewMounted ? (
+                    <WorkspaceRuntimeLayer
+                      aria-hidden={!audioViewVisible}
+                      data-visible={audioViewVisible}
+                    >
+                      <AudioAccountWorkspaceSurface
+                        active={audioViewActive}
+                        audioActionState={audioActionState}
+                        audioDownloadProgress={audioDownloadProgress}
+                        audioError={audioError}
+                        audioHotkeyAttention={audioHotkeyAttention}
+                        audioModelStatus={audioModelStatus}
+                        audioStatusState={audioStatusState}
+                        audioWidgetVisible={audioWidgetVisible}
+                        authState={authState}
+                        billingStatus={billingStatus}
+                        billingStatusError={billingStatusError}
+                        billingStatusState={billingStatusState}
+                        motion={viewMotion}
+                        onDownloadModel={downloadAudioModel}
+                        onCloseWidget={closeAudioWidget}
+                        onOpenWidget={openAudioWidget}
+                        onRefreshBillingStatus={refreshBillingStatus}
+                        onRefreshStatus={refreshAudioModelStatus}
+                        onSelectModel={selectAudioModel}
+                        onUninstallModel={uninstallAudioModel}
+                        workspace={selectedWorkspace}
+                      />
+                    </WorkspaceRuntimeLayer>
+                  ) : null}
                 </WorkspaceViewPane>
                 {shouldShowWorkspaceGitPullPrompt && (
                   <WorkspaceGitPullOverlay aria-label="Git pull prompt">
@@ -52670,7 +52748,12 @@ export default function App() {
                   </ResizePanel>
                   <>
                     {workspaceToolPaneVisible && (
-                      <ResizeHandle data-direction="horizontal" data-workspace-tool-resize-handle="true" />
+                      <ResizeHandle
+                        data-direction="horizontal"
+                        data-workspace-tool-resize-handle="true"
+                        onPointerDown={handleWorkspaceToolSeparatorPointerDown}
+                        title="Drag to resize · Double-click to reset"
+                      />
                     )}
                       <ResizePanel
                         aria-hidden={workspaceToolPaneVisible ? undefined : "true"}

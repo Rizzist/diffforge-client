@@ -1,13 +1,14 @@
 use std::{
-    collections::HashMap,
+    collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet},
     env, fs,
+    hash::{Hash, Hasher},
     io::{self, BufRead, BufReader, Read, Write},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
     sync::mpsc,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex as StdMutex, OnceLock,
     },
     thread,
@@ -89,7 +90,16 @@ const WORKSPACE_GATEWAY_VIDEO_BRIDGE_TIMEOUT_MS: u64 = 60 * 60 * 1000;
 const WORKSPACE_MCP_EXPOSURE_LAZY: &str = "lazy";
 const WORKSPACE_MCP_EXPOSURE_PINNED: &str = "pinned";
 const WORKSPACE_MCP_EXPOSURE_HIDDEN: &str = "hidden";
+/// Parked shared daemons stay available until they have been idle this long.
+const SHARED_DAEMON_IDLE_TTL_MS: u64 = 900_000;
+/// Parked daemon reap checks run infrequently to keep the app process quiet.
+const SHARED_DAEMON_REAPER_TICK_MS: u64 = 60_000;
+/// Gateway stdio MCP children are reused until this idle age is exceeded.
+const WORKSPACE_GATEWAY_CHILD_POOL_IDLE_TTL_MS: u64 = 120_000;
+/// Each gateway process keeps a small LRU pool of initialized stdio children.
+const WORKSPACE_GATEWAY_CHILD_POOL_MAX: usize = 6;
 static SHARED_DAEMONS: OnceLock<StdMutex<HashMap<String, SharedMcpDaemonInfo>>> = OnceLock::new();
+static SHARED_DAEMON_REAPER_RUNNING: OnceLock<AtomicBool> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 struct SharedMcpDaemonInfo {
@@ -100,6 +110,9 @@ struct SharedMcpDaemonInfo {
     info_path: PathBuf,
     started_at_ms: u64,
     shutdown: Arc<AtomicBool>,
+    parked: Arc<AtomicBool>,
+    last_activity_ms: Arc<AtomicU64>,
+    live_connections: Arc<AtomicUsize>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -323,7 +336,11 @@ pub fn ensure_shared_daemon_for_paths(repo_path: &Path, db_path: &Path) -> Resul
         let guard = daemons
             .lock()
             .map_err(|_| "Unable to lock shared MCP daemon registry.".to_string())?;
-        guard.get(&key).cloned()
+        guard.get(&key).map(|info| {
+            info.parked.store(false, Ordering::SeqCst);
+            info.last_activity_ms.store(mcp_now_ms(), Ordering::SeqCst);
+            info.clone()
+        })
     };
     if let Some(info) = existing {
         write_shared_daemon_info_file(&info)?;
@@ -346,6 +363,9 @@ pub fn ensure_shared_daemon_for_paths(repo_path: &Path, db_path: &Path) -> Resul
         info_path,
         started_at_ms: mcp_now_ms(),
         shutdown: Arc::new(AtomicBool::new(false)),
+        parked: Arc::new(AtomicBool::new(false)),
+        last_activity_ms: Arc::new(AtomicU64::new(mcp_now_ms())),
+        live_connections: Arc::new(AtomicUsize::new(0)),
     };
 
     // Blocking accept: stop_shared_daemon_info() pokes the endpoint on shutdown
@@ -355,6 +375,10 @@ pub fn ensure_shared_daemon_for_paths(repo_path: &Path, db_path: &Path) -> Resul
             .lock()
             .map_err(|_| "Unable to lock shared MCP daemon registry.".to_string())?;
         if let Some(existing) = guard.get(&key).cloned() {
+            existing.parked.store(false, Ordering::SeqCst);
+            existing
+                .last_activity_ms
+                .store(mcp_now_ms(), Ordering::SeqCst);
             Some(existing)
         } else {
             guard.insert(key.clone(), info.clone());
@@ -382,6 +406,8 @@ pub fn ensure_shared_daemon_for_paths(repo_path: &Path, db_path: &Path) -> Resul
     let listener_db_path = db_path_text.clone();
     let listener_token = token.clone();
     let listener_shutdown = Arc::clone(&info.shutdown);
+    let listener_last_activity_ms = Arc::clone(&info.last_activity_ms);
+    let listener_live_connections = Arc::clone(&info.live_connections);
     thread::spawn(move || {
         run_shared_daemon_listener(
             listener,
@@ -389,8 +415,11 @@ pub fn ensure_shared_daemon_for_paths(repo_path: &Path, db_path: &Path) -> Resul
             listener_repo_path,
             listener_db_path,
             listener_shutdown,
+            listener_last_activity_ms,
+            listener_live_connections,
         );
     });
+    start_shared_daemon_reaper_if_needed();
 
     if let Ok((kernel, _)) = CoordinationKernel::open_for_terminal_launch(
         &repo_path_text,
@@ -447,6 +476,74 @@ pub fn stop_shared_daemon_for_repo(
     }
 }
 
+pub fn park_shared_daemon_for_repo(
+    repo_path: impl AsRef<Path>,
+    reason: &str,
+) -> Result<Value, String> {
+    let repo_path = repo_path
+        .as_ref()
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.as_ref().to_path_buf());
+    let repo_path_text = repo_path.display().to_string();
+    let key = shared_daemon_registry_key(&repo_path_text);
+    let daemons = SHARED_DAEMONS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let info = {
+        let guard = daemons
+            .lock()
+            .map_err(|_| "Unable to lock shared MCP daemon registry.".to_string())?;
+        guard.get(&key).map(|info| {
+            info.parked.store(true, Ordering::SeqCst);
+            info.last_activity_ms.store(mcp_now_ms(), Ordering::SeqCst);
+            info.clone()
+        })
+    };
+
+    if let Some(info) = info {
+        let now_ms = info.last_activity_ms.load(Ordering::SeqCst);
+        if let Ok(kernel) =
+            CoordinationKernel::open(&info.repo_path, Some(PathBuf::from(&info.db_path)))
+        {
+            let _ = kernel.emit_event(
+                "mcp_shared_daemon_parked",
+                "kernel",
+                REPO_ID,
+                EventRefs::default(),
+                json!({
+                    "endpoint": &info.endpoint,
+                    "info_path": info.info_path.display().to_string(),
+                    "reason": reason,
+                    "repo_path": &info.repo_path,
+                }),
+            );
+        }
+        start_shared_daemon_reaper_if_needed();
+        return Ok(json!({
+            "status": "parked",
+            "stopped": false,
+            "parked": true,
+            "endpoint": &info.endpoint,
+            "info_path": info.info_path.display().to_string(),
+            "info_file_removed": false,
+            "reason": reason,
+            "repo_path": &info.repo_path,
+            "started_at_ms": info.started_at_ms,
+            "last_activity_ms": now_ms,
+            "live_connections": info.live_connections.load(Ordering::SeqCst),
+        }));
+    }
+
+    let info_path = daemon_info_path_for_repo(&repo_path);
+    Ok(json!({
+        "status": "not_running",
+        "stopped": false,
+        "parked": false,
+        "reason": reason,
+        "repo_path": repo_path_text,
+        "info_path": info_path.display().to_string(),
+        "info_file_removed": false,
+    }))
+}
+
 pub fn stop_all_shared_daemons(reason: &str) -> Result<Value, String> {
     let daemons = SHARED_DAEMONS.get_or_init(|| StdMutex::new(HashMap::new()));
     let infos = {
@@ -468,6 +565,84 @@ pub fn stop_all_shared_daemons(reason: &str) -> Result<Value, String> {
         "total": total,
         "daemons": stopped,
     }))
+}
+
+fn start_shared_daemon_reaper_if_needed() {
+    let running = SHARED_DAEMON_REAPER_RUNNING.get_or_init(|| AtomicBool::new(false));
+    if running
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    thread::spawn(|| loop {
+        thread::sleep(Duration::from_millis(SHARED_DAEMON_REAPER_TICK_MS));
+        reap_idle_shared_daemons(mcp_now_ms());
+
+        let empty = SHARED_DAEMONS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .map(|guard| guard.is_empty())
+            .unwrap_or(false);
+        if !empty {
+            continue;
+        }
+
+        let running = SHARED_DAEMON_REAPER_RUNNING.get_or_init(|| AtomicBool::new(false));
+        running.store(false, Ordering::SeqCst);
+        let still_empty = SHARED_DAEMONS
+            .get_or_init(|| StdMutex::new(HashMap::new()))
+            .lock()
+            .map(|guard| guard.is_empty())
+            .unwrap_or(false);
+        if still_empty
+            || running
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            break;
+        }
+    });
+}
+
+fn reap_idle_shared_daemons(now_ms: u64) {
+    let daemons = SHARED_DAEMONS.get_or_init(|| StdMutex::new(HashMap::new()));
+    let infos = {
+        let mut guard = match daemons.lock() {
+            Ok(guard) => guard,
+            Err(_) => return,
+        };
+        let keys = guard
+            .iter()
+            .filter_map(|(key, info)| {
+                shared_daemon_reap_eligible(
+                    info.parked.load(Ordering::SeqCst),
+                    info.live_connections.load(Ordering::SeqCst),
+                    now_ms,
+                    info.last_activity_ms.load(Ordering::SeqCst),
+                    SHARED_DAEMON_IDLE_TTL_MS,
+                )
+                .then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| guard.remove(&key))
+            .collect::<Vec<_>>()
+    };
+
+    for info in infos {
+        let _ = stop_shared_daemon_info(info, "idle_ttl");
+    }
+}
+
+fn shared_daemon_reap_eligible(
+    parked: bool,
+    live_connections: usize,
+    now_ms: u64,
+    last_activity_ms: u64,
+    idle_ttl_ms: u64,
+) -> bool {
+    parked && live_connections == 0 && now_ms.saturating_sub(last_activity_ms) > idle_ttl_ms
 }
 
 fn shared_daemon_registry_key(repo_path_text: &str) -> String {
@@ -529,11 +704,14 @@ fn shared_daemon_info_value(info: &SharedMcpDaemonInfo, started: bool) -> Value 
     json!({
         "status": "ready",
         "started": started,
+        "parked": info.parked.load(Ordering::SeqCst),
         "endpoint": info.endpoint,
         "info_path": info.info_path.display().to_string(),
         "repo_path": info.repo_path,
         "db_path": info.db_path,
         "started_at_ms": info.started_at_ms,
+        "last_activity_ms": info.last_activity_ms.load(Ordering::SeqCst),
+        "live_connections": info.live_connections.load(Ordering::SeqCst),
     })
 }
 
@@ -549,6 +727,8 @@ fn write_shared_daemon_info_file(info: &SharedMcpDaemonInfo) -> Result<(), Strin
         "db_path": info.db_path,
         "pid": std::process::id(),
         "started_at_ms": info.started_at_ms,
+        "parked": info.parked.load(Ordering::SeqCst),
+        "last_activity_ms": info.last_activity_ms.load(Ordering::SeqCst),
         "transport": "tcp-json-line",
     });
     fs::write(&info.info_path, payload.to_string())
@@ -561,6 +741,8 @@ fn run_shared_daemon_listener(
     repo_path: String,
     db_path: String,
     shutdown: Arc<AtomicBool>,
+    last_activity_ms: Arc<AtomicU64>,
+    live_connections: Arc<AtomicUsize>,
 ) {
     for stream in listener.incoming() {
         if shutdown.load(Ordering::SeqCst) {
@@ -568,15 +750,42 @@ fn run_shared_daemon_listener(
         }
         match stream {
             Ok(stream) => {
+                last_activity_ms.store(mcp_now_ms(), Ordering::SeqCst);
+                live_connections.fetch_add(1, Ordering::SeqCst);
                 let token = token.clone();
                 let repo_path = repo_path.clone();
                 let db_path = db_path.clone();
+                let connection_last_activity_ms = Arc::clone(&last_activity_ms);
+                let connection_live_connections = Arc::clone(&live_connections);
                 thread::spawn(move || {
-                    let _ = handle_shared_daemon_connection(stream, token, repo_path, db_path);
+                    let _guard = SharedDaemonConnectionGuard::new(connection_live_connections);
+                    let _ = handle_shared_daemon_connection(
+                        stream,
+                        token,
+                        repo_path,
+                        db_path,
+                        connection_last_activity_ms,
+                    );
                 });
             }
             Err(_) => break,
         }
+    }
+}
+
+struct SharedDaemonConnectionGuard {
+    live_connections: Arc<AtomicUsize>,
+}
+
+impl SharedDaemonConnectionGuard {
+    fn new(live_connections: Arc<AtomicUsize>) -> Self {
+        Self { live_connections }
+    }
+}
+
+impl Drop for SharedDaemonConnectionGuard {
+    fn drop(&mut self) {
+        self.live_connections.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -585,6 +794,7 @@ fn handle_shared_daemon_connection(
     token: String,
     repo_path: String,
     db_path: String,
+    last_activity_ms: Arc<AtomicU64>,
 ) -> Result<(), String> {
     let reader_stream = stream
         .try_clone()
@@ -637,6 +847,7 @@ fn handle_shared_daemon_connection(
         if bytes == 0 {
             return Ok(());
         }
+        last_activity_ms.store(mcp_now_ms(), Ordering::SeqCst);
         let envelope: Value = match serde_json::from_str(line.trim_end()) {
             Ok(value) => value,
             Err(error) => {
@@ -887,6 +1098,312 @@ pub fn run_stdio_server(context: McpContext) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Clone)]
+struct WorkspaceGatewayRuntime {
+    child_pool: Arc<WorkspaceGatewayChildPool>,
+    tools_cache: Arc<WorkspaceGatewayToolsCache>,
+}
+
+impl WorkspaceGatewayRuntime {
+    fn new() -> Self {
+        Self {
+            child_pool: Arc::new(WorkspaceGatewayChildPool::new()),
+            tools_cache: Arc::new(WorkspaceGatewayToolsCache::new()),
+        }
+    }
+}
+
+struct WorkspaceGatewayToolsCacheEntry {
+    generation: String,
+    tools: Vec<Value>,
+}
+
+struct WorkspaceGatewayToolsCache {
+    entries: StdMutex<HashMap<String, WorkspaceGatewayToolsCacheEntry>>,
+}
+
+impl WorkspaceGatewayToolsCache {
+    fn new() -> Self {
+        Self {
+            entries: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, server_key: &str, generation: &str) -> Option<Vec<Value>> {
+        let guard = self.entries.lock().ok()?;
+        let entry = guard.get(server_key)?;
+        (entry.generation == generation).then(|| entry.tools.clone())
+    }
+
+    fn store(&self, server_key: &str, generation: &str, tools: Vec<Value>) {
+        if let Ok(mut guard) = self.entries.lock() {
+            guard.insert(
+                server_key.to_string(),
+                WorkspaceGatewayToolsCacheEntry {
+                    generation: generation.to_string(),
+                    tools,
+                },
+            );
+        }
+    }
+
+    fn retain_servers(&self, server_keys: &HashSet<String>) {
+        if let Ok(mut guard) = self.entries.lock() {
+            guard.retain(|server_key, _| server_keys.contains(server_key));
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkspaceGatewayChildPoolKey {
+    server_key: String,
+    fingerprint: String,
+}
+
+struct WorkspaceGatewayChildPool {
+    entries: StdMutex<HashMap<String, Arc<WorkspaceGatewayPooledChild>>>,
+}
+
+impl WorkspaceGatewayChildPool {
+    fn new() -> Self {
+        Self {
+            entries: StdMutex::new(HashMap::new()),
+        }
+    }
+
+    fn request(
+        &self,
+        server: &Value,
+        method: &str,
+        params: Value,
+        key: &WorkspaceGatewayChildPoolKey,
+        initialize_timeout: Duration,
+        cancel: Arc<AtomicBool>,
+        pid_tx: mpsc::Sender<u32>,
+    ) -> Result<Value, String> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(format!("Workspace MCP child request `{method}` timed out."));
+        }
+        // Check-on-use reaping keeps gateway terminals quiet when idle; every
+        // inbound gateway request also reaps, so tools/list cache hits participate.
+        self.reap_idle();
+        self.remove_stale_server_entries(key);
+
+        if let Some(entry) = self.entry(key) {
+            let _ = pid_tx.send(entry.pid);
+            if entry.is_alive() {
+                return entry.request(method, params, &cancel);
+            }
+            let _ = self.remove_entry_and_terminate(key);
+        }
+
+        if cancel.load(Ordering::SeqCst) {
+            return Err(format!("Workspace MCP child request `{method}` timed out."));
+        }
+        let entry = Arc::new(spawn_workspace_gateway_pooled_child(
+            server,
+            key,
+            method,
+            initialize_timeout,
+            Arc::clone(&cancel),
+            pid_tx,
+        )?);
+        self.insert_entry(key, Arc::clone(&entry));
+        entry.request(method, params, &cancel)
+    }
+
+    fn entry(
+        &self,
+        key: &WorkspaceGatewayChildPoolKey,
+    ) -> Option<Arc<WorkspaceGatewayPooledChild>> {
+        let guard = self.entries.lock().ok()?;
+        guard
+            .get(&workspace_gateway_child_pool_map_key(key))
+            .cloned()
+    }
+
+    fn insert_entry(
+        &self,
+        key: &WorkspaceGatewayChildPoolKey,
+        entry: Arc<WorkspaceGatewayPooledChild>,
+    ) {
+        let evicted = {
+            let Ok(mut guard) = self.entries.lock() else {
+                return;
+            };
+            guard.insert(workspace_gateway_child_pool_map_key(key), entry);
+            workspace_gateway_pool_lru_evictions(&mut guard, WORKSPACE_GATEWAY_CHILD_POOL_MAX)
+        };
+        for entry in evicted {
+            entry.terminate_without_wait();
+        }
+    }
+
+    fn reap_idle(&self) {
+        let now_ms = mcp_now_ms();
+        let expired = {
+            let Ok(mut guard) = self.entries.lock() else {
+                return;
+            };
+            let keys = guard
+                .iter()
+                .filter_map(|(map_key, entry)| {
+                    (now_ms.saturating_sub(entry.last_used_ms.load(Ordering::SeqCst))
+                        > WORKSPACE_GATEWAY_CHILD_POOL_IDLE_TTL_MS)
+                        .then(|| map_key.clone())
+                })
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|map_key| guard.remove(&map_key))
+                .collect::<Vec<_>>()
+        };
+        for entry in expired {
+            let _ = entry.terminate_and_stderr();
+        }
+    }
+
+    fn remove_stale_server_entries(&self, key: &WorkspaceGatewayChildPoolKey) {
+        let stale = {
+            let Ok(mut guard) = self.entries.lock() else {
+                return;
+            };
+            let keys = guard
+                .iter()
+                .filter_map(|(map_key, entry)| {
+                    (entry.server_key == key.server_key
+                        && !workspace_gateway_pool_entry_reusable(
+                            &entry.fingerprint,
+                            &key.fingerprint,
+                        ))
+                    .then(|| map_key.clone())
+                })
+                .collect::<Vec<_>>();
+            keys.into_iter()
+                .filter_map(|map_key| guard.remove(&map_key))
+                .collect::<Vec<_>>()
+        };
+        for entry in stale {
+            let _ = entry.terminate_and_stderr();
+        }
+    }
+
+    fn remove_entry_and_terminate(&self, key: &WorkspaceGatewayChildPoolKey) -> Option<String> {
+        let entry = self
+            .entries
+            .lock()
+            .ok()?
+            .remove(&workspace_gateway_child_pool_map_key(key))?;
+        entry.terminate_and_stderr()
+    }
+
+    fn remove_entry_for_timeout(&self, key: &WorkspaceGatewayChildPoolKey) {
+        let entry = self
+            .entries
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.remove(&workspace_gateway_child_pool_map_key(key)));
+        if let Some(entry) = entry {
+            entry.terminate_without_wait();
+        }
+    }
+
+    fn shutdown_all(&self) {
+        let entries = self
+            .entries
+            .lock()
+            .map(|mut guard| guard.drain().map(|(_, entry)| entry).collect::<Vec<_>>())
+            .unwrap_or_default();
+        for entry in entries {
+            let _ = entry.terminate_and_stderr();
+        }
+    }
+}
+
+impl Drop for WorkspaceGatewayChildPool {
+    fn drop(&mut self) {
+        self.shutdown_all();
+    }
+}
+
+struct WorkspaceGatewayPooledChild {
+    server_key: String,
+    fingerprint: String,
+    pid: u32,
+    state: StdMutex<WorkspaceGatewayPooledChildState>,
+    last_used_ms: AtomicU64,
+}
+
+impl WorkspaceGatewayPooledChild {
+    fn is_alive(&self) -> bool {
+        self.state
+            .lock()
+            .map(|mut state| matches!(state.child.try_wait(), Ok(None)))
+            .unwrap_or(false)
+    }
+
+    fn request(&self, method: &str, params: Value, cancel: &AtomicBool) -> Result<Value, String> {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(format!("Workspace MCP child request `{method}` timed out."));
+        }
+        self.last_used_ms.store(mcp_now_ms(), Ordering::SeqCst);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Unable to lock pooled workspace MCP child.".to_string())?;
+        if cancel.load(Ordering::SeqCst) {
+            return Err(format!("Workspace MCP child request `{method}` timed out."));
+        }
+        if !matches!(state.child.try_wait(), Ok(None)) {
+            return Err(format!("MCP child closed before responding to {method}."));
+        }
+        let id = state.next_request_id;
+        state.next_request_id += 1;
+        let transport = state.rpc_transport;
+        let WorkspaceGatewayPooledChildState { stdin, reader, .. } = &mut *state;
+        let result = workspace_gateway_child_send(stdin, reader, id, method, params, transport);
+        self.last_used_ms.store(mcp_now_ms(), Ordering::SeqCst);
+        result
+    }
+
+    fn terminate_and_stderr(&self) -> Option<String> {
+        let mut state = self.state.lock().ok()?;
+        state.terminate()
+    }
+
+    fn terminate_without_wait(&self) {
+        terminate_workspace_gateway_child(self.pid);
+    }
+}
+
+impl Drop for WorkspaceGatewayPooledChild {
+    fn drop(&mut self) {
+        terminate_workspace_gateway_child(self.pid);
+        if let Ok(mut state) = self.state.try_lock() {
+            let _ = state.terminate();
+        }
+    }
+}
+
+struct WorkspaceGatewayPooledChildState {
+    child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<ChildStdout>,
+    rpc_transport: RpcTransport,
+    next_request_id: i64,
+    stderr_reader: Option<thread::JoinHandle<String>>,
+}
+
+impl WorkspaceGatewayPooledChildState {
+    fn terminate(&mut self) -> Option<String> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.stderr_reader
+            .take()
+            .and_then(|reader| reader.join().ok())
+            .and_then(workspace_gateway_stderr_snippet)
+    }
+}
+
 pub fn run_workspace_gateway_stdio_server(context: McpContext) -> Result<(), String> {
     record_mcp_client_event(
         &context,
@@ -901,8 +1418,10 @@ pub fn run_workspace_gateway_stdio_server(context: McpContext) -> Result<(), Str
     let stdin = io::stdin();
     let mut reader = io::BufReader::new(stdin.lock());
     let stdout = Arc::new(StdMutex::new(io::stdout()));
+    let runtime = WorkspaceGatewayRuntime::new();
 
     while let Some(read_result) = read_rpc_message(&mut reader)? {
+        runtime.child_pool.reap_idle();
         let (request, transport) = match read_result {
             Ok(value) => value,
             Err((transport, message)) => {
@@ -919,9 +1438,10 @@ pub fn run_workspace_gateway_stdio_server(context: McpContext) -> Result<(), Str
         };
         if workspace_gateway_request_is_video_tool_call(&request) {
             let context = context.clone();
+            let runtime = runtime.clone();
             let stdout = Arc::clone(&stdout);
             thread::spawn(move || {
-                let response = handle_workspace_gateway_json_rpc(&context, request);
+                let response = handle_workspace_gateway_json_rpc(&context, &runtime, request);
                 if !response.is_null() {
                     if let Ok(mut stdout) = stdout.lock() {
                         let _ = write_rpc_response(&mut *stdout, transport, &response);
@@ -930,7 +1450,7 @@ pub fn run_workspace_gateway_stdio_server(context: McpContext) -> Result<(), Str
             });
             continue;
         }
-        let response = handle_workspace_gateway_json_rpc(&context, request);
+        let response = handle_workspace_gateway_json_rpc(&context, &runtime, request);
         if !response.is_null() {
             let mut stdout = stdout
                 .lock()
@@ -939,6 +1459,7 @@ pub fn run_workspace_gateway_stdio_server(context: McpContext) -> Result<(), Str
         }
     }
 
+    runtime.child_pool.shutdown_all();
     Ok(())
 }
 
@@ -949,7 +1470,11 @@ fn workspace_gateway_request_is_video_tool_call(request: &Value) -> bool {
             .is_some_and(workspace_gateway_is_video_tool)
 }
 
-fn handle_workspace_gateway_json_rpc(context: &McpContext, request: Value) -> Value {
+fn handle_workspace_gateway_json_rpc(
+    context: &McpContext,
+    runtime: &WorkspaceGatewayRuntime,
+    request: Value,
+) -> Value {
     let id_value = request.get("id").cloned();
     let id = id_value.clone().unwrap_or(Value::Null);
     let method = request["method"].as_str().unwrap_or("");
@@ -978,7 +1503,7 @@ fn handle_workspace_gateway_json_rpc(context: &McpContext, request: Value) -> Va
             })
         }
         "tools/list" => {
-            let tools = workspace_gateway_tools(context);
+            let tools = workspace_gateway_tools(context, runtime);
             let tool_count = tools.len();
             record_mcp_client_event_async(
                 context,
@@ -1002,7 +1527,7 @@ fn handle_workspace_gateway_json_rpc(context: &McpContext, request: Value) -> Va
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let result = workspace_gateway_dispatch_tool(context, name, args);
+            let result = workspace_gateway_dispatch_tool_with_runtime(context, runtime, name, args);
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -1015,7 +1540,7 @@ fn handle_workspace_gateway_json_rpc(context: &McpContext, request: Value) -> Va
     }
 }
 
-fn workspace_gateway_tools(context: &McpContext) -> Vec<Value> {
+fn workspace_gateway_tools(context: &McpContext, runtime: &WorkspaceGatewayRuntime) -> Vec<Value> {
     let secrets_enabled = workspace_gateway_secrets_enabled(context);
     let video_enabled = workspace_gateway_video_tools_enabled(context);
     let mut tools = WORKSPACE_GATEWAY_BUILTIN_TOOLS
@@ -1039,6 +1564,7 @@ fn workspace_gateway_tools(context: &McpContext) -> Vec<Value> {
     let Ok(servers) = workspace_gateway_servers(&kernel, &workspace_id) else {
         return tools;
     };
+    workspace_gateway_retain_tools_cache_servers(runtime, &servers);
 
     for server in servers
         .iter()
@@ -1049,11 +1575,15 @@ fn workspace_gateway_tools(context: &McpContext) -> Vec<Value> {
         if server_key.is_empty() {
             continue;
         }
-        let child_tools =
-            match workspace_gateway_refresh_child_tools(&kernel, &workspace_id, server) {
-                Ok(child_tools) => child_tools,
-                Err(_) => continue,
-            };
+        let child_tools = match workspace_gateway_refresh_child_tools(
+            Some(runtime),
+            &kernel,
+            &workspace_id,
+            server,
+        ) {
+            Ok(child_tools) => child_tools,
+            Err(_) => continue,
+        };
         for tool in child_tools {
             let Some(tool_name) = tool["name"].as_str().filter(|value| !value.is_empty()) else {
                 continue;
@@ -1075,15 +1605,26 @@ fn workspace_gateway_tools(context: &McpContext) -> Vec<Value> {
     tools
 }
 
+#[cfg(test)]
 pub(crate) fn workspace_gateway_dispatch_tool(
     context: &McpContext,
     tool: &str,
     input: Value,
 ) -> Value {
+    let runtime = WorkspaceGatewayRuntime::new();
+    workspace_gateway_dispatch_tool_with_runtime(context, &runtime, tool, input)
+}
+
+fn workspace_gateway_dispatch_tool_with_runtime(
+    context: &McpContext,
+    runtime: &WorkspaceGatewayRuntime,
+    tool: &str,
+    input: Value,
+) -> Value {
     let result = if WORKSPACE_GATEWAY_BUILTIN_TOOLS.contains(&tool) {
-        workspace_gateway_builtin_tool(context, tool, input)
+        workspace_gateway_builtin_tool(context, runtime, tool, input)
     } else {
-        workspace_gateway_external_tool(context, tool, input)
+        workspace_gateway_external_tool(context, runtime, tool, input)
     };
     let ok = result["isError"].as_bool() != Some(true);
     record_mcp_client_event(
@@ -1192,7 +1733,12 @@ fn workspace_gateway_forward_video_tool(
     Ok(response)
 }
 
-fn workspace_gateway_builtin_tool(context: &McpContext, tool: &str, input: Value) -> Value {
+fn workspace_gateway_builtin_tool(
+    context: &McpContext,
+    runtime: &WorkspaceGatewayRuntime,
+    tool: &str,
+    input: Value,
+) -> Value {
     if tool.starts_with("secrets__") && !workspace_gateway_secrets_enabled(context) {
         return workspace_gateway_error_content(
             "The Secrets MCP is disabled for this workspace. Enable it in the Diff Forge MCPs tab before using secrets tools."
@@ -1226,21 +1772,24 @@ fn workspace_gateway_builtin_tool(context: &McpContext, tool: &str, input: Value
             })),
             Err(error) => workspace_gateway_error_content(error),
         },
-        "workspace_mcp__search_tools" => match workspace_gateway_search_tools(context, &input) {
-            Ok(result) => workspace_gateway_content(result),
-            Err(error) => workspace_gateway_error_content(error),
-        },
-        "workspace_mcp__list_tools" => match workspace_gateway_list_tools(context, &input) {
-            Ok(result) => workspace_gateway_content(result),
-            Err(error) => workspace_gateway_error_content(error),
-        },
-        "workspace_mcp__get_tool_schema" => {
-            match workspace_gateway_get_tool_schema(context, &input) {
+        "workspace_mcp__search_tools" => {
+            match workspace_gateway_search_tools(context, runtime, &input) {
                 Ok(result) => workspace_gateway_content(result),
                 Err(error) => workspace_gateway_error_content(error),
             }
         }
-        "workspace_mcp__call_tool" => match workspace_gateway_call_tool(context, &input) {
+        "workspace_mcp__list_tools" => match workspace_gateway_list_tools(context, runtime, &input)
+        {
+            Ok(result) => workspace_gateway_content(result),
+            Err(error) => workspace_gateway_error_content(error),
+        },
+        "workspace_mcp__get_tool_schema" => {
+            match workspace_gateway_get_tool_schema(context, runtime, &input) {
+                Ok(result) => workspace_gateway_content(result),
+                Err(error) => workspace_gateway_error_content(error),
+            }
+        }
+        "workspace_mcp__call_tool" => match workspace_gateway_call_tool(context, runtime, &input) {
             Ok(result) => result,
             Err(error) => workspace_gateway_error_content(error),
         },
@@ -1296,7 +1845,12 @@ fn workspace_gateway_builtin_tool(context: &McpContext, tool: &str, input: Value
     }
 }
 
-fn workspace_gateway_external_tool(context: &McpContext, tool: &str, input: Value) -> Value {
+fn workspace_gateway_external_tool(
+    context: &McpContext,
+    runtime: &WorkspaceGatewayRuntime,
+    tool: &str,
+    input: Value,
+) -> Value {
     let Some((server_key, child_tool)) = tool.split_once("__") else {
         return workspace_gateway_error_content(format!(
             "Unknown workspace MCP tool `{tool}`. Call workspace_mcp__sync_manifest for the current manifest."
@@ -1330,7 +1884,7 @@ fn workspace_gateway_external_tool(context: &McpContext, tool: &str, input: Valu
             "Workspace MCP `{server_key}` is in lazy exposure mode. Use workspace_mcp__call_tool with server_key `{server_key}` and tool_name `{child_tool}`."
         ));
     }
-    match workspace_gateway_child_call_tool(&server, child_tool, input) {
+    match workspace_gateway_child_call_tool(Some(runtime), &server, child_tool, input) {
         Ok(result) => result,
         Err(error) => {
             let _ = kernel.record_workspace_mcp_probe_result(
@@ -1625,7 +2179,11 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
     }
 }
 
-fn workspace_gateway_search_tools(context: &McpContext, input: &Value) -> Result<Value, String> {
+fn workspace_gateway_search_tools(
+    context: &McpContext,
+    runtime: &WorkspaceGatewayRuntime,
+    input: &Value,
+) -> Result<Value, String> {
     let query = input["query"]
         .as_str()
         .unwrap_or_default()
@@ -1641,7 +2199,7 @@ fn workspace_gateway_search_tools(context: &McpContext, input: &Value) -> Result
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let limit = workspace_gateway_limit(input, 25, 100);
-    let mut rows = workspace_gateway_collect_tool_rows(context, server_key, 200)?;
+    let mut rows = workspace_gateway_collect_tool_rows(context, runtime, server_key, 200)?;
     if !terms.is_empty() {
         rows.retain(|row| {
             let haystack = [
@@ -1673,13 +2231,17 @@ fn workspace_gateway_search_tools(context: &McpContext, input: &Value) -> Result
     }))
 }
 
-fn workspace_gateway_list_tools(context: &McpContext, input: &Value) -> Result<Value, String> {
+fn workspace_gateway_list_tools(
+    context: &McpContext,
+    runtime: &WorkspaceGatewayRuntime,
+    input: &Value,
+) -> Result<Value, String> {
     let server_key = input["server_key"]
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let limit = workspace_gateway_limit(input, 100, 200);
-    let rows = workspace_gateway_collect_tool_rows(context, server_key, limit)?;
+    let rows = workspace_gateway_collect_tool_rows(context, runtime, server_key, limit)?;
     let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
     let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
     Ok(json!({
@@ -1693,12 +2255,17 @@ fn workspace_gateway_list_tools(context: &McpContext, input: &Value) -> Result<V
     }))
 }
 
-fn workspace_gateway_get_tool_schema(context: &McpContext, input: &Value) -> Result<Value, String> {
+fn workspace_gateway_get_tool_schema(
+    context: &McpContext,
+    runtime: &WorkspaceGatewayRuntime,
+    input: &Value,
+) -> Result<Value, String> {
     let (server_key, tool_name) = workspace_gateway_tool_identity(input)?;
     let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
     let server = workspace_gateway_required_callable_server(&kernel, &workspace_id, &server_key)?;
     let generation = workspace_gateway_generation(&kernel, &workspace_id)?;
-    let child_tools = workspace_gateway_refresh_child_tools(&kernel, &workspace_id, &server)?;
+    let child_tools =
+        workspace_gateway_refresh_child_tools(Some(runtime), &kernel, &workspace_id, &server)?;
     let tool = child_tools
         .into_iter()
         .find(|tool| tool["name"].as_str() == Some(tool_name.as_str()))
@@ -1719,12 +2286,16 @@ fn workspace_gateway_get_tool_schema(context: &McpContext, input: &Value) -> Res
     }))
 }
 
-fn workspace_gateway_call_tool(context: &McpContext, input: &Value) -> Result<Value, String> {
+fn workspace_gateway_call_tool(
+    context: &McpContext,
+    runtime: &WorkspaceGatewayRuntime,
+    input: &Value,
+) -> Result<Value, String> {
     let (server_key, tool_name) = workspace_gateway_tool_identity(input)?;
     let arguments = input.get("arguments").cloned().unwrap_or_else(|| json!({}));
     let (kernel, workspace_id) = workspace_gateway_kernel(context)?;
     let server = workspace_gateway_required_callable_server(&kernel, &workspace_id, &server_key)?;
-    match workspace_gateway_child_call_tool(&server, &tool_name, arguments) {
+    match workspace_gateway_child_call_tool(Some(runtime), &server, &tool_name, arguments) {
         Ok(result) => Ok(result),
         Err(error) => {
             let _ = kernel.record_workspace_mcp_probe_result(
@@ -1741,6 +2312,7 @@ fn workspace_gateway_call_tool(context: &McpContext, input: &Value) -> Result<Va
 
 fn workspace_gateway_collect_tool_rows(
     context: &McpContext,
+    runtime: &WorkspaceGatewayRuntime,
     server_key_filter: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Value>, String> {
@@ -1749,14 +2321,19 @@ fn workspace_gateway_collect_tool_rows(
     let explicit_server = server_key_filter.is_some();
     let servers =
         workspace_gateway_candidate_tool_servers(&kernel, &workspace_id, server_key_filter)?;
+    workspace_gateway_retain_tools_cache_servers(runtime, &servers);
     let mut rows = Vec::new();
     for server in servers {
-        let child_tools =
-            match workspace_gateway_refresh_child_tools(&kernel, &workspace_id, &server) {
-                Ok(child_tools) => child_tools,
-                Err(error) if explicit_server => return Err(error),
-                Err(_) => continue,
-            };
+        let child_tools = match workspace_gateway_refresh_child_tools(
+            Some(runtime),
+            &kernel,
+            &workspace_id,
+            &server,
+        ) {
+            Ok(child_tools) => child_tools,
+            Err(error) if explicit_server => return Err(error),
+            Err(_) => continue,
+        };
         for tool in child_tools {
             let Some(tool_name) = tool["name"].as_str().filter(|value| !value.is_empty()) else {
                 continue;
@@ -1812,12 +2389,20 @@ fn workspace_gateway_required_callable_server(
 }
 
 fn workspace_gateway_refresh_child_tools(
+    runtime: Option<&WorkspaceGatewayRuntime>,
     kernel: &CoordinationKernel,
     workspace_id: &str,
     server: &Value,
 ) -> Result<Vec<Value>, String> {
     let server_key = server["server_key"].as_str().unwrap_or_default();
-    match workspace_gateway_child_list_tools(server) {
+    let generation = workspace_gateway_generation(kernel, workspace_id)?;
+    if let Some(runtime) = runtime {
+        workspace_gateway_retain_tools_cache_for_manifest(runtime, kernel, workspace_id);
+        if let Some(tools) = runtime.tools_cache.get(server_key, &generation) {
+            return Ok(tools);
+        }
+    }
+    match workspace_gateway_child_list_tools(runtime, server) {
         Ok(child_tools) => {
             let tools = child_tools
                 .iter()
@@ -1835,6 +2420,13 @@ fn workspace_gateway_refresh_child_tools(
                 ),
                 Some(json!(tools)),
             );
+            if let Some(runtime) = runtime {
+                let generation =
+                    workspace_gateway_generation(kernel, workspace_id).unwrap_or(generation);
+                runtime
+                    .tools_cache
+                    .store(server_key, &generation, child_tools.clone());
+            }
             Ok(child_tools)
         }
         Err(error) => {
@@ -1848,6 +2440,29 @@ fn workspace_gateway_refresh_child_tools(
             Err(error)
         }
     }
+}
+
+fn workspace_gateway_retain_tools_cache_for_manifest(
+    runtime: &WorkspaceGatewayRuntime,
+    kernel: &CoordinationKernel,
+    workspace_id: &str,
+) {
+    if let Ok(servers) = workspace_gateway_servers(kernel, workspace_id) {
+        workspace_gateway_retain_tools_cache_servers(runtime, &servers);
+    }
+}
+
+fn workspace_gateway_retain_tools_cache_servers(
+    runtime: &WorkspaceGatewayRuntime,
+    servers: &[Value],
+) {
+    let server_keys = servers
+        .iter()
+        .filter_map(|server| server["server_key"].as_str())
+        .filter(|server_key| !server_key.trim().is_empty())
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+    runtime.tools_cache.retain_servers(&server_keys);
 }
 
 fn workspace_gateway_compact_tool_row(
@@ -2703,7 +3318,7 @@ fn workspace_gateway_config_value(config_values: &Value, key: &str) -> Option<St
 }
 
 pub(super) fn probe_workspace_mcp_server_connection(server: &Value) -> Value {
-    match workspace_gateway_child_list_tools(server) {
+    match workspace_gateway_child_list_tools(None, server) {
         Ok(child_tools) => {
             let tools = child_tools
                 .iter()
@@ -2751,17 +3366,22 @@ fn workspace_gateway_connection_error_status(error: &str) -> &'static str {
     }
 }
 
-fn workspace_gateway_child_list_tools(server: &Value) -> Result<Vec<Value>, String> {
-    let result = workspace_gateway_child_request(server, "tools/list", json!({}))?;
+fn workspace_gateway_child_list_tools(
+    runtime: Option<&WorkspaceGatewayRuntime>,
+    server: &Value,
+) -> Result<Vec<Value>, String> {
+    let result = workspace_gateway_child_request(runtime, server, "tools/list", json!({}))?;
     Ok(result["tools"].as_array().cloned().unwrap_or_default())
 }
 
 fn workspace_gateway_child_call_tool(
+    runtime: Option<&WorkspaceGatewayRuntime>,
     server: &Value,
     tool: &str,
     arguments: Value,
 ) -> Result<Value, String> {
     workspace_gateway_child_request(
+        runtime,
         server,
         "tools/call",
         json!({
@@ -2772,6 +3392,7 @@ fn workspace_gateway_child_call_tool(
 }
 
 fn workspace_gateway_child_request(
+    runtime: Option<&WorkspaceGatewayRuntime>,
     server: &Value,
     method: &str,
     params: Value,
@@ -2783,6 +3404,15 @@ fn workspace_gateway_child_request(
     };
     let transport = server["transport"].as_str().unwrap_or("stdio");
     if transport == "stdio" {
+        if let Some(runtime) = runtime {
+            return workspace_gateway_pooled_child_request_with_timeout(
+                runtime.clone(),
+                server.clone(),
+                method.to_string(),
+                params,
+                timeout,
+            );
+        }
         let mut errors = Vec::new();
         for rpc_transport in [RpcTransport::JsonLine, RpcTransport::ContentLength] {
             match workspace_gateway_child_request_with_timeout(
@@ -2810,6 +3440,104 @@ fn workspace_gateway_child_request(
         timeout,
         RpcTransport::ContentLength,
     )
+}
+
+fn workspace_gateway_pooled_child_request_with_timeout(
+    runtime: WorkspaceGatewayRuntime,
+    server: Value,
+    method: String,
+    params: Value,
+    timeout: Duration,
+) -> Result<Value, String> {
+    let key = workspace_gateway_child_pool_key(&server)?;
+    let mut last_error = None;
+    for attempt in 0..2 {
+        let (result_tx, result_rx) = mpsc::channel();
+        let (pid_tx, pid_rx) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let runtime_for_worker = runtime.clone();
+        let server_for_worker = server.clone();
+        let method_for_worker = method.clone();
+        let params_for_worker = params.clone();
+        let key_for_worker = key.clone();
+        let cancel_for_worker = Arc::clone(&cancel);
+        thread::spawn(move || {
+            let result = runtime_for_worker
+                .child_pool
+                .request(
+                    &server_for_worker,
+                    &method_for_worker,
+                    params_for_worker,
+                    &key_for_worker,
+                    timeout,
+                    cancel_for_worker,
+                    pid_tx,
+                )
+                .map_err(|error| {
+                    if workspace_gateway_child_error_restartable(&error) {
+                        let stderr = runtime_for_worker
+                            .child_pool
+                            .remove_entry_and_terminate(&key_for_worker);
+                        workspace_gateway_error_with_optional_stderr(error, stderr)
+                    } else {
+                        error
+                    }
+                });
+            let _ = result_tx.send(result);
+        });
+
+        match result_rx.recv_timeout(timeout) {
+            Ok(Ok(value)) => return Ok(value),
+            Ok(Err(error)) => {
+                let restartable = workspace_gateway_child_error_restartable(&error);
+                last_error = Some(error);
+                if restartable && attempt == 0 {
+                    continue;
+                }
+                return Err(last_error
+                    .unwrap_or_else(|| format!("Workspace MCP child request `{method}` failed.")));
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                cancel.store(true, Ordering::SeqCst);
+                terminate_workspace_gateway_latest_child(pid_rx);
+                runtime.child_pool.remove_entry_for_timeout(&key);
+                return Err(format!(
+                    "Workspace MCP child timed out while handling `{method}`."
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                runtime.child_pool.remove_entry_for_timeout(&key);
+                last_error = Some(format!("Workspace MCP child request `{method}` failed."));
+                if attempt == 0 {
+                    continue;
+                }
+                return Err(last_error.unwrap());
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| format!("Workspace MCP child request `{method}` failed.")))
+}
+
+fn terminate_workspace_gateway_latest_child(pid_rx: mpsc::Receiver<u32>) {
+    let mut latest_pid = None;
+    while let Ok(pid) = pid_rx.try_recv() {
+        latest_pid = Some(pid);
+    }
+    if let Some(pid) = latest_pid {
+        terminate_workspace_gateway_child(pid);
+    }
+}
+
+fn workspace_gateway_child_error_restartable(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("closed before")
+        || lower.contains("did not answer")
+        || lower.contains("parse error")
+        || lower.contains("unable to read")
+        || lower.contains("unable to write")
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("unexpected eof")
 }
 
 fn workspace_gateway_child_request_with_timeout(
@@ -2947,23 +3675,327 @@ fn workspace_gateway_child_request_blocking(
     }
 }
 
+#[derive(Clone)]
+struct WorkspaceGatewayStdioChildConfig {
+    command: String,
+    args: Vec<String>,
+    env: HashMap<String, String>,
+}
+
+fn workspace_gateway_stdio_child_config(
+    server: &Value,
+) -> Result<WorkspaceGatewayStdioChildConfig, String> {
+    let command = server["command"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "Workspace MCP `{}` has no command configured.",
+                server["name"].as_str().unwrap_or("unknown")
+            )
+        })?
+        .to_string();
+    let args = server["args_json"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(str::to_string))
+        .collect::<Vec<_>>();
+    Ok(WorkspaceGatewayStdioChildConfig {
+        command,
+        args,
+        env: workspace_gateway_child_env(server),
+    })
+}
+
+fn workspace_gateway_child_pool_key(
+    server: &Value,
+) -> Result<WorkspaceGatewayChildPoolKey, String> {
+    let server_key = server["server_key"]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Workspace MCP server row has no server_key.".to_string())?
+        .to_string();
+    Ok(WorkspaceGatewayChildPoolKey {
+        server_key,
+        fingerprint: workspace_gateway_child_config_fingerprint(server)?,
+    })
+}
+
+fn workspace_gateway_child_config_fingerprint(server: &Value) -> Result<String, String> {
+    let config = workspace_gateway_stdio_child_config(server)?;
+    let env = config
+        .env
+        .iter()
+        .fold(BTreeMap::new(), |mut acc, (key, value)| {
+            acc.insert(key.clone(), value.clone());
+            acc
+        });
+    let transport = server["transport"].as_str().unwrap_or("stdio").trim();
+    let normalized = json!({
+        "transport": transport,
+        "command": config.command,
+        "args": config.args,
+        "env": env,
+    });
+    let mut hasher = DefaultHasher::new();
+    normalized.to_string().hash(&mut hasher);
+    Ok(format!("{:016x}", hasher.finish()))
+}
+
+fn workspace_gateway_pool_entry_reusable(
+    existing_fingerprint: &str,
+    next_fingerprint: &str,
+) -> bool {
+    existing_fingerprint == next_fingerprint
+}
+
+fn workspace_gateway_child_pool_map_key(key: &WorkspaceGatewayChildPoolKey) -> String {
+    format!("{}\n{}", key.server_key, key.fingerprint)
+}
+
+fn workspace_gateway_pool_lru_evictions(
+    entries: &mut HashMap<String, Arc<WorkspaceGatewayPooledChild>>,
+    max_entries: usize,
+) -> Vec<Arc<WorkspaceGatewayPooledChild>> {
+    let mut evicted = Vec::new();
+    while entries.len() > max_entries {
+        let Some(oldest_key) = entries
+            .iter()
+            .min_by_key(|(_, entry)| entry.last_used_ms.load(Ordering::SeqCst))
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        if let Some(entry) = entries.remove(&oldest_key) {
+            evicted.push(entry);
+        }
+    }
+    evicted
+}
+
+fn spawn_workspace_gateway_pooled_child(
+    server: &Value,
+    key: &WorkspaceGatewayChildPoolKey,
+    method: &str,
+    initialize_timeout: Duration,
+    cancel: Arc<AtomicBool>,
+    pid_tx: mpsc::Sender<u32>,
+) -> Result<WorkspaceGatewayPooledChild, String> {
+    let config = workspace_gateway_stdio_child_config(server)?;
+    let mut errors = Vec::new();
+    for rpc_transport in [RpcTransport::JsonLine, RpcTransport::ContentLength] {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(format!("Workspace MCP child request `{method}` timed out."));
+        }
+        match spawn_workspace_gateway_pooled_child_attempt_with_timeout(
+            server.clone(),
+            config.clone(),
+            rpc_transport,
+            initialize_timeout,
+            Arc::clone(&cancel),
+            pid_tx.clone(),
+        ) {
+            Ok((pid, state)) => {
+                return Ok(WorkspaceGatewayPooledChild {
+                    server_key: key.server_key.clone(),
+                    fingerprint: key.fingerprint.clone(),
+                    pid,
+                    state: StdMutex::new(state),
+                    last_used_ms: AtomicU64::new(mcp_now_ms()),
+                });
+            }
+            Err(error) => {
+                errors.push(format!("{}: {error}", rpc_transport_label(rpc_transport)));
+            }
+        }
+    }
+    Err(format!(
+        "Workspace MCP stdio request `{method}` failed with JSON-line and Content-Length framing. {}",
+        errors.join(" | ")
+    ))
+}
+
+fn spawn_workspace_gateway_pooled_child_attempt_with_timeout(
+    server: Value,
+    config: WorkspaceGatewayStdioChildConfig,
+    rpc_transport: RpcTransport,
+    timeout: Duration,
+    request_cancel: Arc<AtomicBool>,
+    pid_tx: mpsc::Sender<u32>,
+) -> Result<(u32, WorkspaceGatewayPooledChildState), String> {
+    let (result_tx, result_rx) = mpsc::channel();
+    let (attempt_pid_tx, attempt_pid_rx) = mpsc::channel();
+    let attempt_cancel = Arc::new(AtomicBool::new(false));
+    let attempt_cancel_for_worker = Arc::clone(&attempt_cancel);
+    thread::spawn(move || {
+        let result = spawn_workspace_gateway_pooled_child_attempt(
+            &server,
+            &config,
+            rpc_transport,
+            request_cancel,
+            attempt_cancel_for_worker,
+            vec![attempt_pid_tx, pid_tx],
+        );
+        let _ = result_tx.send(result);
+    });
+    match result_rx.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            attempt_cancel.store(true, Ordering::SeqCst);
+            terminate_workspace_gateway_latest_child(attempt_pid_rx);
+            Err(format!(
+                "Workspace MCP child timed out while initializing with {} framing.",
+                rpc_transport_label(rpc_transport)
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(format!(
+            "Workspace MCP child failed while initializing with {} framing.",
+            rpc_transport_label(rpc_transport)
+        )),
+    }
+}
+
+fn spawn_workspace_gateway_pooled_child_attempt(
+    server: &Value,
+    config: &WorkspaceGatewayStdioChildConfig,
+    rpc_transport: RpcTransport,
+    request_cancel: Arc<AtomicBool>,
+    attempt_cancel: Arc<AtomicBool>,
+    pid_txs: Vec<mpsc::Sender<u32>>,
+) -> Result<(u32, WorkspaceGatewayPooledChildState), String> {
+    if request_cancel.load(Ordering::SeqCst) || attempt_cancel.load(Ordering::SeqCst) {
+        return Err(format!(
+            "Workspace MCP child initialization with {} framing was cancelled.",
+            rpc_transport_label(rpc_transport)
+        ));
+    }
+    let mut child = Command::new(&config.command)
+        .args(&config.args)
+        .envs(config.env.clone())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "Unable to start workspace MCP `{}` with `{}`: {error}",
+                server["name"].as_str().unwrap_or(&config.command),
+                config.command
+            )
+        })?;
+    let pid = child.id();
+    for pid_tx in pid_txs {
+        let _ = pid_tx.send(pid);
+    }
+    if request_cancel.load(Ordering::SeqCst) || attempt_cancel.load(Ordering::SeqCst) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(format!(
+            "Workspace MCP child initialization with {} framing was cancelled.",
+            rpc_transport_label(rpc_transport)
+        ));
+    }
+    let mut child_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "Workspace MCP child stdin was unavailable.".to_string())?;
+    let child_stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Workspace MCP child stdout was unavailable.".to_string())?;
+    let stderr_reader = child.stderr.take().map(|stderr| {
+        thread::spawn(move || {
+            let mut text = String::new();
+            let mut reader = BufReader::new(stderr);
+            let _ = reader.read_to_string(&mut text);
+            text
+        })
+    });
+    let mut child_reader = BufReader::new(child_stdout);
+    let result = (|| {
+        workspace_gateway_child_send(
+            &mut child_stdin,
+            &mut child_reader,
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "diffforge-workspace-mcp-gateway", "version": "0.1.0"}
+            }),
+            rpc_transport,
+        )?;
+        write_rpc_response(
+            &mut child_stdin,
+            rpc_transport,
+            &json!({"jsonrpc":"2.0","method":"notifications/initialized","params":{}}),
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            if request_cancel.load(Ordering::SeqCst) || attempt_cancel.load(Ordering::SeqCst) {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(workspace_gateway_error_with_stderr(
+                    format!(
+                        "Workspace MCP child initialization with {} framing was cancelled.",
+                        rpc_transport_label(rpc_transport)
+                    ),
+                    stderr_reader,
+                ));
+            }
+            Ok((
+                pid,
+                WorkspaceGatewayPooledChildState {
+                    child,
+                    stdin: child_stdin,
+                    reader: child_reader,
+                    rpc_transport,
+                    next_request_id: 2,
+                    stderr_reader,
+                },
+            ))
+        }
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(workspace_gateway_error_with_stderr(error, stderr_reader))
+        }
+    }
+}
+
 fn workspace_gateway_error_with_stderr(
     error: String,
     stderr_reader: Option<thread::JoinHandle<String>>,
 ) -> String {
     let stderr = stderr_reader
         .and_then(|reader| reader.join().ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
+        .and_then(workspace_gateway_stderr_snippet);
+    workspace_gateway_error_with_optional_stderr(error, stderr)
+}
+
+fn workspace_gateway_error_with_optional_stderr(error: String, stderr: Option<String>) -> String {
     let Some(stderr) = stderr else {
         return error;
     };
+    format!("{error}. Child stderr: {stderr}")
+}
+
+fn workspace_gateway_stderr_snippet(stderr: String) -> Option<String> {
+    let stderr = stderr.trim().to_string();
+    if stderr.is_empty() {
+        return None;
+    }
     let snippet = if stderr.chars().count() > 1200 {
         format!("{}...", stderr.chars().take(1200).collect::<String>())
     } else {
         stderr
     };
-    format!("{error}. Child stderr: {snippet}")
+    Some(snippet)
 }
 
 fn workspace_gateway_http_request(
@@ -5966,6 +6998,108 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn shared_daemon_reap_eligibility_requires_parked_idle_without_live_connections() {
+        let now_ms = 10_000;
+        let ttl_ms = 1_000;
+
+        assert!(shared_daemon_reap_eligible(
+            true,
+            0,
+            now_ms,
+            now_ms - ttl_ms - 1,
+            ttl_ms
+        ));
+        assert!(!shared_daemon_reap_eligible(
+            false,
+            0,
+            now_ms,
+            now_ms - ttl_ms - 1,
+            ttl_ms
+        ));
+        assert!(!shared_daemon_reap_eligible(
+            true,
+            1,
+            now_ms,
+            now_ms - ttl_ms - 1,
+            ttl_ms
+        ));
+        assert!(!shared_daemon_reap_eligible(
+            true,
+            0,
+            now_ms,
+            now_ms - ttl_ms,
+            ttl_ms
+        ));
+    }
+
+    #[test]
+    fn workspace_gateway_child_pool_fingerprint_changes_force_respawn() {
+        let server = json!({
+            "server_key": "demo",
+            "name": "Demo",
+            "transport": "stdio",
+            "command": "demo-mcp",
+            "args_json": ["--stdio"],
+            "env_schema_json": [{"key": "DEMO_TOKEN"}],
+            "config_values_json": {"DEMO_TOKEN": "one"}
+        });
+        let same = json!({
+            "server_key": "demo",
+            "name": "Demo",
+            "transport": "stdio",
+            "command": "demo-mcp",
+            "args_json": ["--stdio"],
+            "env_schema_json": [{"key": "DEMO_TOKEN"}],
+            "config_values_json": {"DEMO_TOKEN": "one"}
+        });
+        let changed = json!({
+            "server_key": "demo",
+            "name": "Demo",
+            "transport": "stdio",
+            "command": "demo-mcp",
+            "args_json": ["--stdio"],
+            "env_schema_json": [{"key": "DEMO_TOKEN"}],
+            "config_values_json": {"DEMO_TOKEN": "two"}
+        });
+
+        let original = workspace_gateway_child_config_fingerprint(&server).unwrap();
+        let same_fingerprint = workspace_gateway_child_config_fingerprint(&same).unwrap();
+        let changed_fingerprint = workspace_gateway_child_config_fingerprint(&changed).unwrap();
+
+        assert!(workspace_gateway_pool_entry_reusable(
+            &original,
+            &same_fingerprint
+        ));
+        assert!(!workspace_gateway_pool_entry_reusable(
+            &original,
+            &changed_fingerprint
+        ));
+    }
+
+    #[test]
+    fn workspace_gateway_tools_cache_invalidates_on_generation_change() {
+        let cache = WorkspaceGatewayToolsCache::new();
+        cache.store("demo", "1", vec![json!({"name": "first"})]);
+
+        assert_eq!(
+            cache.get("demo", "1").unwrap()[0]["name"].as_str(),
+            Some("first")
+        );
+        assert!(cache.get("demo", "2").is_none());
+
+        cache.store("demo", "2", vec![json!({"name": "second"})]);
+        assert!(cache.get("demo", "1").is_none());
+        assert_eq!(
+            cache.get("demo", "2").unwrap()[0]["name"].as_str(),
+            Some("second")
+        );
+
+        cache.store("removed", "2", vec![json!({"name": "stale"})]);
+        cache.retain_servers(&HashSet::from(["demo".to_string()]));
+        assert!(cache.get("removed", "2").is_none());
     }
 
     #[test]

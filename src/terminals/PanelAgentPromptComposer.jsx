@@ -83,6 +83,10 @@ function contextRefLabel(context) {
   if (!context || typeof context !== "object") {
     return "";
   }
+  if (typeof context.label === "string" && context.label.trim()) {
+    // PCB element contexts carry a prebuilt pill label (designator/net).
+    return context.label.trim();
+  }
   const element = String(context.element || context.tagName || context.tag_name || "element").trim();
   const host = (() => {
     try {
@@ -424,16 +428,16 @@ export default function PanelAgentPromptComposer({
             return (
               <ContextChip
                 key={context.id || context.selector || `${selectedContextLabel}:${index}`}
-                title={selectedContextLabel || "Selected web element"}
+                title={selectedContextLabel || "Selected element"}
               >
-                <ContextChipKind>Element</ContextChipKind>
-                <ContextChipText>{selectedContextLabel || "Selected web element"}</ContextChipText>
+                <ContextChipKind>{context.kind === "pcb-element" ? "PCB" : "Element"}</ContextChipKind>
+                <ContextChipText>{selectedContextLabel || "Selected element"}</ContextChipText>
                 {typeof onClearContext === "function" && index === selectedContexts.length - 1 ? (
                   <ContextChipButton
-                    aria-label="Clear selected web elements"
+                    aria-label="Clear selected elements"
                     disabled={submitting}
                     onClick={onClearContext}
-                    title="Clear selected web elements"
+                    title="Clear selected elements"
                     type="button"
                   >
                     <Close aria-hidden="true" />

@@ -830,8 +830,14 @@ export default function VideoWorkspacePane({
     [],
   );
 
+  // Notify through a ref keyed on project VALUES only: parents pass inline
+  // callbacks (new identity per render), and depending on that identity while
+  // the parent stores the project in state renders → notify → setState →
+  // render forever (React #185).
+  const onProjectChangeRef = useRef(onProjectChange);
+  onProjectChangeRef.current = onProjectChange;
   useEffect(() => {
-    onProjectChange?.(
+    onProjectChangeRef.current?.(
       projectPath
         ? {
             path: projectPath,
@@ -846,7 +852,6 @@ export default function VideoWorkspacePane({
         : null,
     );
   }, [
-    onProjectChange,
     playheadUiMs,
     playing,
     prepareAgentContextStable,

@@ -192,6 +192,7 @@ async fn backend_ping() -> Result<BackendStatus, String> {
 const DESKTOP_AUTH_STATE_KEY: &str = "desktop-auth";
 const DESKTOP_AUTH_STATE_CHANGED_EVENT: &str = "desktop-auth-state-changed";
 const DESKTOP_AUTH_DEFAULT_MESSAGE: &str = "Sign in with your Diff Forge AI web account.";
+const DESKTOP_AUTH_BILLING_HISTORY_LIMIT: usize = 100;
 
 fn desktop_auth_text(value: &Value, keys: &[&str]) -> Option<String> {
     let mut current = value;
@@ -237,6 +238,202 @@ fn desktop_auth_i64(value: &Value, keys: &[&str]) -> Option<i64> {
             None
         }
     })
+}
+
+fn desktop_auth_canonical_billing_snapshot_key(key: &str) -> Option<&'static str> {
+    match key {
+        "audio_seconds" => Some("audioSeconds"),
+        "billing_history" => Some("billingHistory"),
+        "bucket_day" => Some("bucketDay"),
+        "bucket_start" => Some("bucketStart"),
+        "by_meter" => Some("byMeter"),
+        "billed_credits" => Some("billedCredits"),
+        "bytes_per_credit" => Some("bytesPerCredit"),
+        "cached_input_tokens" => Some("cachedInputTokens"),
+        "created_at" => Some("createdAt"),
+        "created_at_ms" => Some("createdAtMs"),
+        "credit_ledger" => Some("creditLedger"),
+        "daily_30d" => Some("daily30d"),
+        "dedupe_key" => Some("dedupeKey"),
+        "entity_id" => Some("entityId"),
+        "entity_type" => Some("entityType"),
+        "event_count" => Some("eventCount"),
+        "input_tokens" => Some("inputTokens"),
+        "local_metered_used_credits" => Some("localMeteredUsedCredits"),
+        "low_credit_state" => Some("lowCreditState"),
+        "output_tokens" => Some("outputTokens"),
+        "pending_event_count" => Some("pendingEventCount"),
+        "plan_name" => Some("planName"),
+        "plan_status" => Some("planStatus"),
+        "provider_cost_microusd" => Some("providerCostMicrousd"),
+        "remaining_credits" => Some("remainingCredits"),
+        "remainder_bytes" => Some("remainderBytes"),
+        "repo_id" => Some("repoId"),
+        "reserved_credits" => Some("reservedCredits"),
+        "reset_at" => Some("resetAt"),
+        "source_event_id" => Some("sourceEventId"),
+        "term_end" => Some("termEnd"),
+        "term_id" => Some("termId"),
+        "term_remaining_credits" => Some("termRemainingCredits"),
+        "term_reserved_credits" => Some("termReservedCredits"),
+        "term_total_credits" => Some("termTotalCredits"),
+        "term_used_credits" => Some("termUsedCredits"),
+        "total_bytes" => Some("totalBytes"),
+        "total_credits" => Some("totalCredits"),
+        "tts_characters" => Some("ttsCharacters"),
+        "updated_at" => Some("updatedAt"),
+        "usage_by_meter" => Some("usageByMeter"),
+        "usage_history" => Some("usageHistory"),
+        "used_credits" => Some("usedCredits"),
+        "wallet_version" => Some("walletVersion"),
+        "web_search_calls" => Some("webSearchCalls"),
+        "workspace_id" => Some("workspaceId"),
+        _ => None,
+    }
+}
+
+fn desktop_auth_billing_history_array_key(key: &str) -> bool {
+    matches!(key, "billingHistory" | "history" | "items" | "usageHistory")
+}
+
+fn desktop_auth_billing_history_item_ms(value: &Value) -> Option<i64> {
+    [
+        &["createdAtMs"][..],
+        &["updatedAtMs"][..],
+        &["timestampMs"][..],
+        &["tsMs"][..],
+    ]
+    .iter()
+    .find_map(|path| desktop_auth_i64(value, path))
+}
+
+fn desktop_auth_trim_billing_history_array(mut items: Vec<Value>) -> Vec<Value> {
+    if items.len() <= DESKTOP_AUTH_BILLING_HISTORY_LIMIT {
+        return items;
+    }
+
+    if items
+        .iter()
+        .any(|item| desktop_auth_billing_history_item_ms(item).is_some())
+    {
+        items.sort_by(|left, right| {
+            let left_ms = desktop_auth_billing_history_item_ms(left).unwrap_or(i64::MIN);
+            let right_ms = desktop_auth_billing_history_item_ms(right).unwrap_or(i64::MIN);
+            right_ms.cmp(&left_ms)
+        });
+    }
+    items.truncate(DESKTOP_AUTH_BILLING_HISTORY_LIMIT);
+    items
+}
+
+fn desktop_auth_remove_duplicate_usage_history(value: Option<&mut Value>, canonical_items: &Value) {
+    let Some(object) = value.and_then(Value::as_object_mut) else {
+        return;
+    };
+    if object.get("usageHistory") == Some(canonical_items) {
+        object.remove("usageHistory");
+    }
+}
+
+fn desktop_auth_prune_duplicate_billing_history_aliases(object: &mut serde_json::Map<String, Value>) {
+    if let Some(items) = object.get("items").cloned() {
+        if object.get("history") == Some(&items) {
+            object.remove("history");
+        }
+    }
+
+    let Some(ledger_items) = object
+        .get("creditLedger")
+        .and_then(|ledger| ledger.get("items"))
+        .cloned()
+    else {
+        return;
+    };
+
+    if object.get("billingHistory") == Some(&ledger_items) {
+        object.remove("billingHistory");
+    }
+    desktop_auth_remove_duplicate_usage_history(object.get_mut("credits"), &ledger_items);
+    desktop_auth_remove_duplicate_usage_history(
+        object
+            .get_mut("user")
+            .and_then(|user| user.get_mut("credits")),
+        &ledger_items,
+    );
+}
+
+fn desktop_auth_slim_billing_snapshot_value(value: Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(desktop_auth_slim_billing_snapshot_value)
+                .collect(),
+        ),
+        Value::Object(object) => {
+            let mut slimmed = serde_json::Map::new();
+            for (key, value) in object {
+                let canonical_key =
+                    desktop_auth_canonical_billing_snapshot_key(&key).unwrap_or(key.as_str());
+                let canonical_key_is_original = canonical_key == key;
+                let mut value = desktop_auth_slim_billing_snapshot_value(value);
+                if desktop_auth_billing_history_array_key(canonical_key) {
+                    if let Value::Array(items) = value {
+                        value = Value::Array(desktop_auth_trim_billing_history_array(items));
+                    }
+                }
+
+                match slimmed.entry(canonical_key.to_string()) {
+                    serde_json::map::Entry::Occupied(mut entry) => {
+                        if canonical_key_is_original {
+                            entry.insert(value);
+                        }
+                    }
+                    serde_json::map::Entry::Vacant(entry) => {
+                        entry.insert(value);
+                    }
+                }
+            }
+            desktop_auth_prune_duplicate_billing_history_aliases(&mut slimmed);
+            Value::Object(slimmed)
+        }
+        value => value,
+    }
+}
+
+/// Marker key stamped on a slimmed billingStatus so repeated passes are O(1).
+/// Billing payloads bounce between Rust, the webview, disk, and the cloud ws
+/// cache; every boundary defensively slims, and before this marker each hop
+/// re-walked the full structure (a measured recurring CPU spike).
+const DESKTOP_AUTH_BILLING_SLIM_MARKER: &str = "desktopSlimV";
+
+fn desktop_auth_slim_billing_status(billing_status: Value) -> Value {
+    if !billing_status.is_object() {
+        return billing_status;
+    }
+    if billing_status.get(DESKTOP_AUTH_BILLING_SLIM_MARKER).is_some() {
+        return billing_status;
+    }
+    let mut slimmed = desktop_auth_slim_billing_snapshot_value(billing_status);
+    if let Some(object) = slimmed.as_object_mut() {
+        object.insert(DESKTOP_AUTH_BILLING_SLIM_MARKER.to_string(), json!(1));
+    }
+    slimmed
+}
+
+fn desktop_auth_slim_user_snapshot(user: Value) -> Value {
+    match user {
+        Value::Object(mut object) => {
+            if let Some(credits) = object.remove("credits") {
+                object.insert(
+                    "credits".to_string(),
+                    desktop_auth_slim_billing_snapshot_value(credits),
+                );
+            }
+            Value::Object(object)
+        }
+        value => value,
+    }
 }
 
 fn desktop_auth_personal_scope() -> Value {
@@ -642,11 +839,18 @@ fn desktop_auth_billing_status_has_meaningful_data(billing_status: &Value) -> bo
 }
 
 fn desktop_auth_merge_billing_status(previous: &Value, incoming: Value) -> Value {
+    // `previous` always comes from a snapshot that already went through
+    // desktop_auth_snapshot_from_raw (which slims billingStatus), so only the
+    // incoming server payload needs the slim pass. Re-slimming previous — and
+    // the merged result below — on every ws billing message was itself a
+    // measured CPU hotspot.
+    let previous = previous.clone();
+    let incoming = desktop_auth_slim_billing_status(incoming);
     if !desktop_auth_billing_status_has_meaningful_data(&incoming) {
-        return previous.clone();
+        return previous;
     }
     let Some(incoming_object) = incoming.as_object() else {
-        return previous.clone();
+        return previous;
     };
     let mut merged = previous
         .as_object()
@@ -689,7 +893,7 @@ fn desktop_auth_merge_billing_status(previous: &Value, incoming: Value) -> Value
             merged.insert("credits".to_string(), previous_credits.clone());
         }
     }
-    Value::Object(merged)
+    desktop_auth_slim_billing_status(Value::Object(merged))
 }
 
 fn desktop_auth_entitlements(snapshot: &Value) -> Value {
@@ -773,7 +977,11 @@ fn desktop_auth_account_key(user: Option<&Value>) -> String {
 
 fn desktop_auth_snapshot_from_raw(raw: Value) -> Value {
     let raw = raw.as_object().cloned().unwrap_or_default();
-    let user = raw.get("user").cloned().filter(Value::is_object);
+    let user = raw
+        .get("user")
+        .cloned()
+        .filter(Value::is_object)
+        .map(desktop_auth_slim_user_snapshot);
     let token = raw
         .get("token")
         .and_then(Value::as_str)
@@ -826,7 +1034,9 @@ fn desktop_auth_snapshot_from_raw(raw: Value) -> Value {
         .map(|scope| desktop_auth_normalize_scope(scope, user.as_ref()))
         .unwrap_or_else(desktop_auth_personal_scope);
     let account_scopes = desktop_auth_account_scopes(user.as_ref());
-    let billing_status = raw.get("billingStatus").cloned().unwrap_or(Value::Null);
+    let billing_status = desktop_auth_slim_billing_status(
+        raw.get("billingStatus").cloned().unwrap_or(Value::Null),
+    );
     let mut snapshot = json!({
         "status": status,
         "stage": stage,
@@ -846,8 +1056,70 @@ fn desktop_auth_snapshot_from_raw(raw: Value) -> Value {
     snapshot
 }
 
+/// Cache for the normalized desktop auth snapshot keyed by the state file's
+/// (mtime, size). desktop_auth_snapshot() is on hot paths (ws billing
+/// messages, many commands); before this cache every call re-read and
+/// re-parsed the JSON from disk and re-ran the slim pass — brutal while the
+/// legacy file was ~2 MB.
+static DESKTOP_AUTH_SNAPSHOT_CACHE: std::sync::OnceLock<
+    std::sync::Mutex<Option<(u64, u64, Value)>>,
+> = std::sync::OnceLock::new();
+/// One-time migration marker: rewrite a fat legacy state file with the
+/// slimmed snapshot so subsequent cold reads stay cheap.
+static DESKTOP_AUTH_SLIM_MIGRATED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn desktop_auth_state_file_stamp(app: &AppHandle) -> Option<(u64, u64)> {
+    let path = app_local_state_path(app, DESKTOP_AUTH_STATE_KEY).ok()?;
+    let metadata = fs::metadata(path).ok()?;
+    let modified_ms = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some((modified_ms, metadata.len()))
+}
+
 fn desktop_auth_snapshot(app: &AppHandle) -> Value {
-    desktop_auth_snapshot_from_raw(app_local_state_read(app, DESKTOP_AUTH_STATE_KEY))
+    let stamp = desktop_auth_state_file_stamp(app);
+    let cache = DESKTOP_AUTH_SNAPSHOT_CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let (Some((modified_ms, size)), Ok(cached)) = (stamp, cache.lock()) {
+        if let Some((cached_modified, cached_size, snapshot)) = cached.as_ref() {
+            if *cached_modified == modified_ms && *cached_size == size {
+                return snapshot.clone();
+            }
+        }
+    }
+
+    let raw = app_local_state_read(app, DESKTOP_AUTH_STATE_KEY);
+    let raw_was_fat = stamp.map(|(_, size)| size > 256 * 1024).unwrap_or(false);
+    let snapshot = desktop_auth_snapshot_from_raw(raw);
+
+    // Migrate a fat legacy file to the slimmed shape once so cold reads and
+    // the frontend localStorage mirror stop paying for megabytes of
+    // duplicated billing history.
+    if raw_was_fat
+        && !DESKTOP_AUTH_SLIM_MIGRATED.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        let write_result = app_local_state_write(app, DESKTOP_AUTH_STATE_KEY, &snapshot);
+        log_terminal_status_event(
+            "backend.desktop_auth.slim_migration",
+            json!({
+                "ok": write_result.is_ok(),
+                "error": write_result.err().unwrap_or_default(),
+                "bytesBefore": stamp.map(|(_, size)| size).unwrap_or(0),
+                "bytesAfter": serde_json::to_string(&snapshot).map(|s| s.len()).unwrap_or(0),
+            }),
+        );
+    }
+
+    if let (Some((modified_ms, size)), Ok(mut cached)) =
+        (desktop_auth_state_file_stamp(app), cache.lock())
+    {
+        *cached = Some((modified_ms, size, snapshot.clone()));
+    }
+    snapshot
 }
 
 fn desktop_auth_exchange_lock() -> &'static Mutex<()> {
@@ -855,7 +1127,52 @@ fn desktop_auth_exchange_lock() -> &'static Mutex<()> {
     DESKTOP_AUTH_EXCHANGE_LOCK.get_or_init(|| Mutex::new(()))
 }
 
+/// Cheap scalar identity of a billing snapshot for burst dedupe: no history
+/// walks, only shallow gets. Empty when the payload lacks the scalars.
+fn desktop_auth_billing_shallow_fingerprint(billing_status: &Value) -> String {
+    let credits = billing_status
+        .get("credits")
+        .or_else(|| billing_status.get("user").and_then(|user| user.get("credits")));
+    let field = |source: Option<&Value>, keys: &[&str]| -> String {
+        let Some(source) = source else {
+            return String::new();
+        };
+        for key in keys {
+            if let Some(value) = source.get(*key) {
+                if !value.is_null() {
+                    return value.to_string();
+                }
+            }
+        }
+        String::new()
+    };
+    let wallet = billing_status
+        .get("wallet")
+        .or_else(|| credits.and_then(|credits| credits.get("wallet")));
+    let parts = [
+        field(Some(billing_status), &["walletVersion", "wallet_version"]),
+        field(Some(billing_status), &["updatedAt", "updated_at", "updatedAtMs", "updated_at_ms"]),
+        field(Some(billing_status), &["planName", "plan_name"]),
+        field(credits, &["termUsedCredits", "term_used_credits", "usedCredits", "used_credits"]),
+        field(credits, &["termRemainingCredits", "term_remaining_credits", "remainingCredits", "remaining_credits"]),
+        field(credits, &["walletVersion", "wallet_version"]),
+        field(credits, &["updatedAt", "updated_at", "updatedAtMs", "updated_at_ms"]),
+        field(wallet, &["walletVersion", "wallet_version", "version"]),
+        field(wallet, &["usedCredits", "used_credits"]),
+        field(wallet, &["remainingCredits", "remaining_credits"]),
+        field(wallet, &["updatedAt", "updated_at", "updatedAtMs", "updated_at_ms"]),
+    ];
+    if parts.iter().all(String::is_empty) {
+        return String::new();
+    }
+    parts.join("|")
+}
+
 fn desktop_auth_public_snapshot(snapshot: &Value) -> Value {
+    // Callers always pass a snapshot produced by desktop_auth_snapshot_from_raw
+    // (or by merge paths that slim their inputs), so billingStatus/user are
+    // already slim — re-slimming here ran the full deep pass on every command
+    // response and event emit, which showed up in CPU spike samples.
     let mut public_snapshot = snapshot.clone();
     if let Some(object) = public_snapshot.as_object_mut() {
         object.remove("token");
@@ -1481,6 +1798,18 @@ async fn desktop_auth_apply_billing_status(
     billing_status: Value,
 ) -> Result<Value, String> {
     let mut snapshot = desktop_auth_snapshot(&app);
+    // Shallow burst dedupe: metering sends the same wallet snapshot many
+    // times in quick succession; comparing a handful of scalar fields skips
+    // the deep slim+merge+persist pipeline for repeats.
+    let incoming_fingerprint = desktop_auth_billing_shallow_fingerprint(&billing_status);
+    if !incoming_fingerprint.is_empty() {
+        let current_fingerprint = desktop_auth_billing_shallow_fingerprint(
+            snapshot.get("billingStatus").unwrap_or(&Value::Null),
+        );
+        if incoming_fingerprint == current_fingerprint {
+            return Ok(desktop_auth_public_snapshot(&snapshot));
+        }
+    }
     let next_billing_status = desktop_auth_merge_billing_status(
         snapshot.get("billingStatus").unwrap_or(&Value::Null),
         billing_status,
@@ -2028,6 +2357,102 @@ mod desktop_auth_tests {
             public_snapshot.get("accountKey").and_then(Value::as_str),
             Some("user-1")
         );
+    }
+
+    #[test]
+    fn snapshot_normalization_slims_billing_status_history_duplicates() {
+        let ledger_items = (0..150)
+            .map(|index| {
+                json!({
+                    "id": format!("row-{index}"),
+                    "entity_type": "workspace",
+                    "entityType": "workspace",
+                    "entity_id": format!("entity-{index}"),
+                    "entityId": format!("entity-{index}"),
+                    "workspace_id": "workspace-1",
+                    "workspaceId": "workspace-1",
+                    "created_at_ms": index,
+                    "createdAtMs": index,
+                    "credits": 1,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let snapshot = desktop_auth_snapshot_from_raw(json!({
+            "status": "authenticated",
+            "stage": "authenticated",
+            "message": "ok",
+            "token": "a".repeat(MIN_AUTH_VALUE_LENGTH),
+            "user": {
+                "id": "user-1",
+                "email": "user@example.com",
+                "credits": {
+                    "usage_history": ledger_items.clone(),
+                    "usageHistory": ledger_items.clone(),
+                },
+            },
+            "billingStatus": {
+                "plan_name": "plus",
+                "planName": "plus",
+                "plan_status": "paid",
+                "planStatus": "paid",
+                "credit_ledger": {
+                    "items": ledger_items.clone(),
+                    "history": ledger_items.clone(),
+                    "total_credits": 150,
+                    "totalCredits": 150,
+                },
+                "creditLedger": {
+                    "items": ledger_items.clone(),
+                    "history": ledger_items.clone(),
+                    "total_credits": 150,
+                    "totalCredits": 150,
+                },
+                "billing_history": ledger_items.clone(),
+                "billingHistory": ledger_items.clone(),
+                "credits": {
+                    "plan_name": "plus",
+                    "planName": "plus",
+                    "term_remaining_credits": 42,
+                    "termRemainingCredits": 42,
+                    "usage_history": ledger_items.clone(),
+                    "usageHistory": ledger_items.clone(),
+                },
+                "user": {
+                    "credits": {
+                        "usage_history": ledger_items.clone(),
+                        "usageHistory": ledger_items,
+                    },
+                },
+            },
+        }));
+
+        let billing_status = &snapshot["billingStatus"];
+        assert!(billing_status.get("plan_name").is_none());
+        assert_eq!(billing_status["planName"].as_str(), Some("plus"));
+        assert!(billing_status.get("credit_ledger").is_none());
+        assert!(billing_status.get("billing_history").is_none());
+        assert!(billing_status.get("billingHistory").is_none());
+        assert!(billing_status["credits"].get("usage_history").is_none());
+        assert!(billing_status["credits"].get("usageHistory").is_none());
+        assert!(billing_status["user"]["credits"].get("usageHistory").is_none());
+
+        let items = billing_status["creditLedger"]["items"]
+            .as_array()
+            .expect("slimmed ledger items");
+        assert_eq!(items.len(), DESKTOP_AUTH_BILLING_HISTORY_LIMIT);
+        assert_eq!(items[0]["createdAtMs"].as_i64(), Some(149));
+        assert_eq!(items[99]["createdAtMs"].as_i64(), Some(50));
+        assert!(billing_status["creditLedger"].get("history").is_none());
+        assert!(items[0].get("entity_type").is_none());
+        assert_eq!(items[0]["entityType"].as_str(), Some("workspace"));
+
+        let user_history = snapshot["user"]["credits"]["usageHistory"]
+            .as_array()
+            .expect("top-level user credit history");
+        assert_eq!(user_history.len(), DESKTOP_AUTH_BILLING_HISTORY_LIMIT);
+        assert_eq!(user_history[0]["createdAtMs"].as_i64(), Some(149));
+        assert!(snapshot["user"]["credits"].get("usage_history").is_none());
     }
 
     #[test]

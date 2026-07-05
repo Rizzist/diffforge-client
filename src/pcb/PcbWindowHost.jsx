@@ -3,6 +3,7 @@ import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { AdsClick } from "@styled-icons/material-rounded/AdsClick";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
 import {
   ButtonBotIcon,
@@ -87,6 +88,7 @@ export default function PcbWindowHost() {
   const [params] = useState(parsePcbWindowParams);
   const [panelCommand, setPanelCommand] = useState(null);
   const [agentPromptOpen, setAgentPromptOpen] = useState(false);
+  const [elementPicker, setElementPicker] = useState(null);
   const [agentPromptActivityItems, setAgentPromptActivityItems] = useState([]);
   const [agentPromptTargets, setAgentPromptTargets] = useState([]);
   const [defaultAgentPromptTargetIds, setDefaultAgentPromptTargetIds] = useState([]);
@@ -268,7 +270,7 @@ export default function PcbWindowHost() {
     };
   }, [params.workspaceId, windowLabel]);
 
-  const submitAgentPrompt = useCallback(async ({ targetIds, targetTerminalIndexes, text }) => {
+  const submitAgentPrompt = useCallback(async ({ contextRefs, targetIds, targetTerminalIndexes, text }) => {
     const requestId = createPanelAgentPromptRequestId("pcb-panel-submit");
     let unlisten = () => {};
     return new Promise((resolve, reject) => {
@@ -307,6 +309,7 @@ export default function PcbWindowHost() {
           } else {
             unlisten = nextUnlisten;
             emit(PANEL_AGENT_PROMPT_SUBMIT_EVENT, {
+              contextRefs: Array.isArray(contextRefs) ? contextRefs : [],
               panelKind: "pcb",
               paneId: params.paneId,
               requestId,
@@ -451,6 +454,20 @@ export default function PcbWindowHost() {
             >
               <ButtonBotIcon aria-hidden="true" />
             </PanelIconButton>
+            {agentPromptOpen && elementPicker ? (
+              <PanelIconButton
+                aria-label="Select board element"
+                aria-pressed={elementPicker.enabled || elementPicker.count ? "true" : "false"}
+                data-active={elementPicker.enabled || elementPicker.count ? "true" : undefined}
+                onClick={elementPicker.toggle}
+                title={elementPicker.count
+                  ? `Select board element (${elementPicker.count} held)`
+                  : "Select board element"}
+                type="button"
+              >
+                <AdsClick aria-hidden="true" />
+              </PanelIconButton>
+            ) : null}
             <PanelIconButton
               aria-label="Return PCB panel to the app"
               aria-pressed="true"
@@ -468,6 +485,7 @@ export default function PcbWindowHost() {
             controlCommand={panelCommand}
             isActive
             onBoardChange={handlePanelBoardChange}
+            onElementPickerChange={setElementPicker}
             paneId={params.paneId}
             repoPath={params.repoPath}
             workspaceId={params.workspaceId}
@@ -475,7 +493,9 @@ export default function PcbWindowHost() {
           {agentPromptOpen ? (
             <PanelAgentPromptComposer
               autoFocus
+              contextRefs={elementPicker?.contexts || []}
               defaultSelectedTargetIds={defaultAgentPromptTargetIds}
+              onClearContext={elementPicker?.clear}
               onClose={() => setAgentPromptOpen(false)}
               onSubmit={submitAgentPrompt}
               panelKind="pcb"

@@ -1365,13 +1365,16 @@ fn tokenomics_scan_usage_for_mode(
                         source_files += 1;
                         scanned_files += 1;
                         let scan = tokenomics_run_write_batch(&conn, || {
-                            let replaced_existing_source_events =
+                            let replaced_existing_source_events = if scan_mode.is_realtime() {
+                                false
+                            } else {
                                 tokenomics_delete_source_usage_events_without_rollup_rebuild(
                                     &conn,
                                     source.provider,
                                     source.agent_kind,
                                     file,
-                                )? > 0;
+                                )? > 0
+                            };
                             let scan = tokenomics_scan_file(
                                 &conn,
                                 source.provider,
@@ -1442,7 +1445,8 @@ fn tokenomics_scan_usage_for_mode(
                     } else {
                         0
                     };
-                    let should_clear_existing_source_events = !can_resume_from_offset
+                    let should_clear_existing_source_events = !scan_mode.is_realtime()
+                        && !can_resume_from_offset
                         && (offset.last_byte_offset > 0 || offset.last_line_index >= 0);
                     source_files += 1;
                     scanned_files += 1;
@@ -6726,7 +6730,11 @@ fn tokenomics_scan_codex_state_db(
                    updated_at
                  FROM threads
                  WHERE COALESCE(rollout_path, '') != ''
-                   AND (?1 = 0 OR updated_at >= ?1 OR updated_at >= ?2)
+                   AND (
+                     ?1 = 0
+                     OR (updated_at < 100000000000 AND updated_at >= ?1)
+                     OR (updated_at >= 100000000000 AND updated_at >= ?2)
+                   )
                  ORDER BY updated_at DESC
                  LIMIT ?3",
             )
@@ -6883,13 +6891,16 @@ fn tokenomics_scan_codex_state_db(
             let Some((offset, _offset_source)) = offset else {
                 files_scanned += 1;
                 let file_scan = tokenomics_run_write_batch(conn, || {
-                    let replaced_existing_source_events =
+                    let replaced_existing_source_events = if scan_mode.is_realtime() {
+                        false
+                    } else {
                         tokenomics_delete_source_usage_events_without_rollup_rebuild(
                             conn,
                             "openai",
                             "codex",
                             &candidate.rollout_path,
-                        )? > 0;
+                        )? > 0
+                    };
                     let file_scan = tokenomics_scan_codex_session_file(
                         conn,
                         &candidate.thread_id,
@@ -6963,7 +6974,8 @@ fn tokenomics_scan_codex_state_db(
             } else {
                 0
             };
-            let should_clear_existing_source_events = !can_resume_from_offset
+            let should_clear_existing_source_events = !scan_mode.is_realtime()
+                && !can_resume_from_offset
                 && offset.scanner_version == TOKENOMICS_CODEX_SCANNER_VERSION
                 && offset.last_byte_offset > 0;
             files_scanned += 1;

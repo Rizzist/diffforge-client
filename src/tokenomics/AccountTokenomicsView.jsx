@@ -1,6 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 import { Refresh } from "@styled-icons/material-rounded/Refresh";
 import { FilterListOff } from "@styled-icons/material-rounded/FilterListOff";
@@ -427,7 +427,7 @@ const AgentAccountEditorForm = styled.form`
    in a terminal — signing into another account in any terminal is captured
    automatically by the Rust watcher. Switching only affects NEW terminal
    spawns; running panes show a restart chip instead (never forced). */
-function useAgentAccountsState() {
+function useAgentAccountsState(active = true) {
   const [accounts, setAccounts] = useState(null);
   const refresh = useCallback(() => {
     invoke("agent_accounts_state").then((state) => {
@@ -436,6 +436,9 @@ function useAgentAccountsState() {
   }, []);
 
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
     let cancelled = false;
     let unlisten = null;
     refresh();
@@ -454,7 +457,7 @@ function useAgentAccountsState() {
       window.clearInterval(interval);
       if (unlisten) unlisten();
     };
-  }, [refresh]);
+  }, [active, refresh]);
 
   return { accounts, refresh };
 }
@@ -522,7 +525,7 @@ function collapseAgentProfilesByEmail(profiles = []) {
   return visible;
 }
 
-function AgentAccountsManager() {
+function AgentAccountsManager({ active = true }) {
   const [accounts, setAccounts] = useState(null);
   const [editing, setEditing] = useState(null);
   const [confirmDeleteKey, setConfirmDeleteKey] = useState("");
@@ -538,6 +541,9 @@ function AgentAccountsManager() {
   }, []);
 
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
     let cancelled = false;
     let unlisten = null;
     refresh();
@@ -571,7 +577,7 @@ function AgentAccountsManager() {
         unlisten();
       }
     };
-  }, [refresh]);
+  }, [active, refresh]);
 
   const setActive = useCallback((kind, profileId) => {
     setActionError("");
@@ -3087,6 +3093,10 @@ function ensureTokenomicsProgressListener() {
       }
     })
       .then((handler) => {
+        if (tokenomicsStore.pollSubscriberCount <= 0) {
+          handler();
+          return;
+        }
         tokenomicsStore.progressUnlisten = handler;
       })
       .catch(() => {})
@@ -3100,12 +3110,35 @@ function ensureTokenomicsProgressListener() {
       void refreshTokenomicsSummaryIfStale({ force: true });
     })
       .then((handler) => {
+        if (tokenomicsStore.pollSubscriberCount <= 0) {
+          handler();
+          return;
+        }
         tokenomicsStore.updatedUnlisten = handler;
       })
       .catch(() => {})
       .finally(() => {
         tokenomicsStore.updatedListenerPromise = null;
       });
+  }
+}
+
+function stopTokenomicsProgressListener() {
+  if (tokenomicsStore.progressUnlisten) {
+    try {
+      tokenomicsStore.progressUnlisten();
+    } catch {
+      // ignore
+    }
+    tokenomicsStore.progressUnlisten = null;
+  }
+  if (tokenomicsStore.updatedUnlisten) {
+    try {
+      tokenomicsStore.updatedUnlisten();
+    } catch {
+      // ignore
+    }
+    tokenomicsStore.updatedUnlisten = null;
   }
 }
 
@@ -3354,6 +3387,9 @@ function startTokenomicsViewPolling() {
       window.clearInterval(tokenomicsStore.pollInterval);
       tokenomicsStore.pollInterval = null;
     }
+    if (tokenomicsStore.pollSubscriberCount === 0) {
+      stopTokenomicsProgressListener();
+    }
   };
 }
 
@@ -3452,7 +3488,12 @@ function ProviderLimitGroup({ fiveHour, providerId, weekly }) {
   );
 }
 
-export default function AccountTokenomicsView({ accountKey = "", billingStatus = null, storageUsage = null } = {}) {
+const AccountTokenomicsView = memo(function AccountTokenomicsView({
+  accountKey = "",
+  active = true,
+  billingStatus = null,
+  storageUsage = null,
+} = {}) {
   const [{
     summary,
     status,
@@ -3464,7 +3505,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   }, setTokenomicsState] = useState(() => tokenomicsStore.state);
   const [dailyWindowDays, setDailyWindowDays] = useState(TOKENOMICS_DEFAULT_DAILY_WINDOW_DAYS);
   const [usageRateWindowKind, setUsageRateWindowKind] = useState("5_hour");
-  const { accounts: agentAccounts } = useAgentAccountsState();
+  const { accounts: agentAccounts } = useAgentAccountsState(active);
   const agentCredentialSignature = useMemo(
     () => tokenomicsAgentCredentialSignature(agentAccounts),
     [agentAccounts],
@@ -3483,8 +3524,11 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   // The provider filter buttons were removed — the three color-coded provider
   // rows always render, so pin any persisted store filter back to "all".
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     setSelectedProvider("all");
-  }, [setSelectedProvider]);
+  }, [active, setSelectedProvider]);
 
   const setSelectedProviderAccountKey = useCallback((providerId, nextAccountKey) => {
     updateTokenomicsStore((previous) => ({
@@ -3497,21 +3541,35 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
   }, []);
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     resetTokenomicsStoreForAccount(accountKey);
     void refreshVisibleTokenomicsLimits({ force: true, forceProviderRefresh: true });
     void loadTokenomicsStore({ background: true, force: false, summaryOnly: true });
-  }, [accountKey]);
+  }, [accountKey, active]);
+
+  useLayoutEffect(() => {
+    if (active) {
+      setTokenomicsState(tokenomicsStore.state);
+    }
+  }, [active]);
 
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
+    setTokenomicsState(tokenomicsStore.state);
     const unsubscribeStore = subscribeTokenomicsStore(setTokenomicsState);
     const stopPolling = startTokenomicsViewPolling();
     return () => {
       stopPolling();
       unsubscribeStore();
     };
-  }, []);
+  }, [active]);
 
   useEffect(() => {
+    if (!active) return;
     if (!agentCredentialSignature) return;
     const previousSignature = lastAgentCredentialSignatureRef.current;
     lastAgentCredentialSignatureRef.current = agentCredentialSignature;
@@ -3523,7 +3581,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
     }).finally(() => {
       void refreshTokenomicsSummaryIfStale({ force: true });
     });
-  }, [agentCredentialSignature]);
+  }, [active, agentCredentialSignature]);
 
   const visibleSummary = useMemo(
     () => (summary
@@ -3922,7 +3980,7 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
           </StorageRows>
         </StorageCard>
 
-        <AgentAccountsManager />
+        <AgentAccountsManager active={active} />
 
         <TokenomicsFooter>
           <span>{lastUpdatedText(summary?.updated_at || summary?.updatedAt)}</span>
@@ -3941,7 +3999,9 @@ export default function AccountTokenomicsView({ accountKey = "", billingStatus =
       </TokenomicsPanel>
     </TokenomicsShell>
   );
-}
+});
+
+export default AccountTokenomicsView;
 
 function ClockIcon(props) {
   return (

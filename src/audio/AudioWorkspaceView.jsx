@@ -1,7 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { availableMonitors, currentMonitor, getCurrentWindow, LogicalSize, PhysicalPosition } from "@tauri-apps/api/window";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes } from "styled-components";
 
 import {
@@ -268,16 +268,8 @@ import {
   AudioLocalModelMeta,
   AudioLocalModelPill,
   AudioLocalModelActions,
-  AudioGeneralToolbar,
-  AudioGeneralColumn,
-  AudioProviderPanel,
-  AudioRecorderPanel,
-  AudioRecorderActions,
-  AudioDevicePanel,
-  AudioDeviceHeader,
   AudioCloudField,
   AudioCloudInput,
-  AudioInputHeaderControls,
   AudioInputMeter,
   AudioInputMeta,
   AudioInputMicButton,
@@ -460,13 +452,13 @@ import {
   PanelHeading,
   SettingsPage,
   AccountSettingsPanel,
-  AccountCard,
   AccountCardHeader,
-  AccountCardFooter,
   SettingsLabel,
-  SettingsValue,
   SettingsHint,
   SettingsIdentityGrid,
+  SettingsIdentityItem,
+  SettingsSectionHeader,
+  TrayClickGroup,
   LoginCard,
   LoginPanel,
   SessionPanel,
@@ -700,18 +692,31 @@ const audioHotkeyAttentionPulse = keyframes`
   100% { opacity: 0; }
 `;
 
-const AudioInputSourcePanel = styled(AudioDevicePanel)`
-  position: relative;
-  align-self: start;
-  overflow: visible;
+const AudioSettingsSection = styled.section`
+  display: grid;
+  gap: 8px;
+  min-width: 0;
 `;
 
-const AudioShortcutSettingsPanel = styled(AudioDevicePanel)`
+const AudioSettingsCard = styled.section`
   position: relative;
+  display: grid;
+  align-content: start;
+  container-type: inline-size;
+  min-width: 0;
+  gap: 10px;
+  padding: 13px 14px;
   overflow: visible;
+  border: 1px solid var(--audio-border-soft, var(--forge-border));
+  border-radius: 11px;
+  background: var(--audio-card-bg, #0d1117);
 `;
 
-const AudioRecorderAttentionPanel = styled(AudioRecorderPanel)`
+const AudioSettingsIdentityItem = styled(SettingsIdentityItem)`
+  background: var(--audio-inset-bg, rgba(2, 6, 23, 0.38));
+`;
+
+const AudioPermissionActionButton = styled(SecondaryButton)`
   position: relative;
   overflow: visible;
 `;
@@ -2736,6 +2741,7 @@ function buildAudioHistoryVirtualWindow(rows, viewport, rowHeights) {
 }
 
 function AudioHistoryVirtualRow({
+  active = true,
   copied,
   entering,
   expanded,
@@ -2750,6 +2756,9 @@ function AudioHistoryVirtualRow({
   const rowRef = useRef(null);
 
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
     const node = rowRef.current;
     if (!node) {
       return undefined;
@@ -2791,7 +2800,7 @@ function AudioHistoryVirtualRow({
         window.removeEventListener("resize", measure);
       }
     };
-  }, [expanded, onMeasure, row.entryKey, row.entryText, row.snippetChanges, row.variant?.id]);
+  }, [active, expanded, onMeasure, row.entryKey, row.entryText, row.snippetChanges, row.variant?.id]);
 
   return (
     <AudioHistoryRow
@@ -2891,7 +2900,8 @@ function AudioHistoryVirtualRow({
   );
 }
 
-export default function AudioWorkspaceView({
+const AudioWorkspaceView = memo(function AudioWorkspaceView({
+  active = true,
   audioActionState,
   audioDownloadProgress,
   audioError,
@@ -3378,6 +3388,9 @@ export default function AudioWorkspaceView({
   // summary unless the History tab is already open -- all history IPC stays
   // bound to the tab being up.
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
     let cancelled = false;
     (async () => {
       await migrateLocalAudioHistoryToBackend(readAudioTranscriptionHistory());
@@ -3389,13 +3402,13 @@ export default function AudioWorkspaceView({
     return () => {
       cancelled = true;
     };
-  }, [refreshAudioHistorySummary, resetAudioHistoryPageCache]);
+  }, [active, refreshAudioHistorySummary, resetAudioHistoryPageCache]);
 
   // Energy gating: only do summary/window work while the History tab is the
   // active view. Opening it (or returning after background appends) refreshes
   // the count/insights and reloads the visible window from the durable store.
   useEffect(() => {
-    if (activeAudioTab !== "history") {
+    if (!active || activeAudioTab !== "history") {
       return;
     }
     if (audioHistoryRefreshPendingRef.current) {
@@ -3403,13 +3416,13 @@ export default function AudioWorkspaceView({
       resetAudioHistoryPageCache();
     }
     refreshAudioHistorySummary();
-  }, [activeAudioTab, refreshAudioHistorySummary, resetAudioHistoryPageCache]);
+  }, [active, activeAudioTab, refreshAudioHistorySummary, resetAudioHistoryPageCache]);
 
   // Fetch only the pages covering the visible window, in fixed-size pages, so
   // the IPC payload stays tiny. Loaded entries are cached by absolute index and
   // far pages are evicted to bound memory.
   useEffect(() => {
-    if (activeAudioTab !== "history" || audioHistoryTotal <= 0) {
+    if (!active || activeAudioTab !== "history" || audioHistoryTotal <= 0) {
       return;
     }
     const { startIndex, endIndex } = audioHistoryWindow;
@@ -3456,11 +3469,14 @@ export default function AudioWorkspaceView({
           inflight.delete(offset);
         });
     });
-  }, [activeAudioTab, audioHistoryTotal, audioHistoryWindow]);
+  }, [active, activeAudioTab, audioHistoryTotal, audioHistoryWindow]);
 
   // New/changed entries arrive via backend events. Handle them only while the
   // History tab is active; otherwise note a pending refresh for the next open.
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
     let disposed = false;
     const unlisteners = [];
 
@@ -3537,6 +3553,7 @@ export default function AudioWorkspaceView({
     prependAudioHistoryEntry,
     refreshAudioHistorySummary,
     resetAudioHistoryPageCache,
+    active,
   ]);
 
   useEffect(() => () => {
@@ -3562,7 +3579,7 @@ export default function AudioWorkspaceView({
   }, [audioHistoryCacheVersion]);
 
   useEffect(() => {
-    if (activeAudioTab !== "history") {
+    if (!active || activeAudioTab !== "history") {
       return undefined;
     }
 
@@ -3588,7 +3605,7 @@ export default function AudioWorkspaceView({
         window.removeEventListener("resize", sync);
       }
     };
-  }, [activeAudioTab, syncAudioHistoryViewport]);
+  }, [active, activeAudioTab, syncAudioHistoryViewport]);
 
   useEffect(() => () => {
     if (
@@ -3610,6 +3627,20 @@ export default function AudioWorkspaceView({
       await audioInputPreview.close().catch(() => {});
     }
   }, []);
+
+  useEffect(() => {
+    if (active) {
+      return;
+    }
+    const previousState = audioInputStateRef.current;
+    void stopAudioInputPreview();
+    if (previousState === "previewing" || previousState === "starting") {
+      audioInputStateRef.current = "ready";
+      setAudioInputState("ready");
+      setAudioInputStats(EMPTY_AUDIO_INPUT_STATS);
+      setAudioInputMessage("Input monitor paused.");
+    }
+  }, [active, stopAudioInputPreview]);
 
   useEffect(() => {
     audioInputDeviceIdRef.current = audioInputDeviceId;
@@ -4047,7 +4078,7 @@ export default function AudioWorkspaceView({
   }, [addDictionaryEditorTerms]);
 
   useEffect(() => {
-    if (activeAudioTab !== "dictionary" || voiceRuleEditor?.kind !== "dictionary") {
+    if (!active || activeAudioTab !== "dictionary" || voiceRuleEditor?.kind !== "dictionary") {
       setDictionaryWordListNeedsBottomJump(false);
       return undefined;
     }
@@ -4057,6 +4088,7 @@ export default function AudioWorkspaceView({
       window.cancelAnimationFrame(frame);
     };
   }, [
+    active,
     activeAudioTab,
     updateDictionaryWordListBottomState,
     visibleVoiceRuleEditorTerms.length,
@@ -4224,6 +4256,9 @@ export default function AudioWorkspaceView({
   }, [onRefreshBillingStatus]);
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     if (
       (isForgeMode || isForgeAgentMode)
       && authState === "authenticated"
@@ -4231,9 +4266,12 @@ export default function AudioWorkspaceView({
     ) {
       refreshForgeBilling();
     }
-  }, [authState, billingStatusState, isForgeAgentMode, isForgeMode, refreshForgeBilling]);
+  }, [active, authState, billingStatusState, isForgeAgentMode, isForgeMode, refreshForgeBilling]);
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     // Keep a pre-authenticated cloud dictation websocket parked whenever
     // Diff Forge Cloud dictation is the selected provider so press-to-talk
     // starts instantly instead of paying the connect handshake.
@@ -4243,7 +4281,7 @@ export default function AudioWorkspaceView({
     if (isForgeAgentMode) {
       prewarmCloudVoiceAgentStream().catch(() => {});
     }
-  }, [isForgeAgentMode, isForgeMode]);
+  }, [active, isForgeAgentMode, isForgeMode]);
 
   const toggleForgeLlmCleanup = useCallback(() => {
     setForgeLlmCleanup((currentValue) => {
@@ -4261,6 +4299,9 @@ export default function AudioWorkspaceView({
   }, []);
 
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
     let cancelled = false;
     let unlistenPreferences = null;
 
@@ -4316,7 +4357,7 @@ export default function AudioWorkspaceView({
         unlistenPreferences();
       }
     };
-  }, []);
+  }, [active]);
 
   const updatePolishingSystemPrompt = useCallback((event) => {
     const nextPrompt = normalizeAudioPolishingSystemPrompt(event.target.value);
@@ -4429,10 +4470,16 @@ export default function AudioWorkspaceView({
   }, [audioModelStatus?.shortcuts]);
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     loadAudioShortcutStatus();
-  }, [loadAudioShortcutStatus]);
+  }, [active, loadAudioShortcutStatus]);
 
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
     const attentionId = Number(audioHotkeyAttention?.id || 0);
     if (!attentionId) {
       return undefined;
@@ -4467,9 +4514,12 @@ export default function AudioWorkspaceView({
       window.cancelAnimationFrame(scrollFrame);
       window.clearTimeout(clearTimer);
     };
-  }, [audioHotkeyAttention, loadAudioInputDevices, loadAudioShortcutStatus]);
+  }, [active, audioHotkeyAttention, loadAudioInputDevices, loadAudioShortcutStatus]);
 
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
     loadVoiceTextRules().then(setVoiceRules).catch(() => {});
 
     return () => {
@@ -4477,9 +4527,12 @@ export default function AudioWorkspaceView({
         window.clearTimeout(voiceRulesSaveTimerRef.current);
       }
     };
-  }, []);
+  }, [active]);
 
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
     let disposed = false;
     let unlisten = () => {};
 
@@ -4502,10 +4555,10 @@ export default function AudioWorkspaceView({
       disposed = true;
       unlisten();
     };
-  }, []);
+  }, [active]);
 
   useEffect(() => {
-    if (!capturingAudioShortcut) {
+    if (!active || !capturingAudioShortcut) {
       return undefined;
     }
 
@@ -4529,9 +4582,12 @@ export default function AudioWorkspaceView({
     return () => {
       window.removeEventListener("keydown", onKeyDown, true);
     };
-  }, [applyAudioShortcut, capturingAudioShortcut]);
+  }, [active, applyAudioShortcut, capturingAudioShortcut]);
 
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
     loadAudioInputDevices();
 
     const handleRefresh = () => {
@@ -4551,9 +4607,12 @@ export default function AudioWorkspaceView({
       window.removeEventListener("focus", handleRefresh);
       document.removeEventListener("visibilitychange", handleVisibilityChange);
     };
-  }, [loadAudioInputDevices]);
+  }, [active, loadAudioInputDevices]);
 
   useEffect(() => {
+    if (!active) {
+      return undefined;
+    }
     let disposed = false;
     let unlisten = () => {};
 
@@ -4599,7 +4658,7 @@ export default function AudioWorkspaceView({
       window.removeEventListener("storage", handleStorage);
       window.removeEventListener(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_EVENT, handleOrchestratorModeChanged);
     };
-  }, []);
+  }, [active]);
 
   useEffect(() => () => {
     if (copiedAudioHistoryTimerRef.current) {
@@ -4741,680 +4800,726 @@ export default function AudioWorkspaceView({
             id="audio-tabpanel-general"
             role="tabpanel"
           >
-        <AudioInputSourcePanel aria-label="Audio input settings" ref={audioInputSourcePanelRef}>
-          {shouldHighlightAudioInput && (
-            <AudioAttentionFlash
-              aria-hidden="true"
-              key={`audio-input-highlight-${audioHotkeyHighlight.id}`}
-            />
-          )}
-          <AudioDeviceHeader>
-            <div>
-              <SettingsLabel>Input source</SettingsLabel>
-              <SettingsHint>{audioInputMessage}</SettingsHint>
-            </div>
-            <AudioInputHeaderControls>
-              <AudioInputInitializeButton
-                aria-label={audioInputPermissionMissing
-                  ? audioInputPrimaryActionLabel
-                  : audioInputState === "previewing"
-                    ? "Mute input monitor"
-                    : "Initialize input source"}
-                aria-pressed={audioInputState === "previewing"}
-                data-active={audioInputState === "previewing" ? "true" : "false"}
-                disabled={audioInputState === "checking" || audioInputState === "starting" || isOpeningAudioInputPermissions}
-                onClick={toggleAudioInputPreview}
-                title={audioInputPrimaryActionTitle}
-                type="button"
-              >
-                {audioInputState === "previewing" ? (
-                  <ButtonMicOffIcon aria-hidden="true" />
-                ) : (
-                  <ButtonMicIcon aria-hidden="true" />
-                )}
-                <span>{audioInputPrimaryActionLabel}</span>
-                {shouldHighlightAudioInput && (
-                  <AudioButtonAttentionFlash
-                    aria-hidden="true"
-                    key={`audio-input-button-highlight-${audioHotkeyHighlight.id}`}
-                  />
-                )}
-              </AudioInputInitializeButton>
-              <AudioStatePill data-installed={audioInputState === "previewing"}>
-                {audioInputDisplayStatusLabel}
-              </AudioStatePill>
-            </AudioInputHeaderControls>
-          </AudioDeviceHeader>
+              <AudioSettingsSection>
+                <SettingsSectionHeader>
+                  <span>Microphone · Input source</span>
+                  <em
+                    data-tone={audioInputPermissionMissing
+                      ? "orange"
+                      : audioInputState === "previewing"
+                        ? "green"
+                        : "blue"}
+                  >
+                    {audioInputDisplayStatusLabel}
+                  </em>
+                  <AudioInputInitializeButton
+                    aria-label={audioInputPermissionMissing
+                      ? audioInputPrimaryActionLabel
+                      : audioInputState === "previewing"
+                        ? "Mute input monitor"
+                        : "Initialize input source"}
+                    aria-pressed={audioInputState === "previewing"}
+                    data-active={audioInputState === "previewing" ? "true" : "false"}
+                    disabled={audioInputState === "checking" || audioInputState === "starting" || isOpeningAudioInputPermissions}
+                    onClick={toggleAudioInputPreview}
+                    title={audioInputPrimaryActionTitle}
+                    type="button"
+                  >
+                    {audioInputState === "previewing" ? (
+                      <ButtonMicOffIcon aria-hidden="true" />
+                    ) : (
+                      <ButtonMicIcon aria-hidden="true" />
+                    )}
+                    <span>{audioInputPrimaryActionLabel}</span>
+                    {shouldHighlightAudioInput && (
+                      <AudioButtonAttentionFlash
+                        aria-hidden="true"
+                        key={`audio-input-button-highlight-${audioHotkeyHighlight.id}`}
+                      />
+                    )}
+                  </AudioInputInitializeButton>
+                </SettingsSectionHeader>
 
-          <AudioInputPill data-live={audioInputState === "previewing" ? "true" : "false"}>
-            <AudioInputMicButton
-              aria-label={audioInputPermissionMissing
-                ? audioInputPrimaryActionLabel
-                : audioInputState === "previewing" ? "Stop monitor" : "Enable input"}
-              data-live={audioInputState === "previewing" ? "true" : "false"}
-              disabled={audioInputState === "checking" || audioInputState === "starting" || isOpeningAudioInputPermissions}
-              onClick={toggleAudioInputPreview}
-              title={audioInputPrimaryActionTitle}
-              type="button"
-            >
-              <ButtonMicIcon aria-hidden="true" />
-            </AudioInputMicButton>
-            <div style={{ flex: "1 1 auto", minWidth: 0 }}>
-              <AppSelect
-                aria-label="Microphone input source"
-                isDisabled={audioInputState === "checking" || audioInputState === "starting"}
-                onChange={(value) => selectAudioInputDevice({ target: { value } })}
-                options={audioInputDevices.length
-                  ? audioInputDevices.map((device) => ({ value: device.deviceId, label: device.label }))
-                  : [{ value: "default", label: "Default microphone" }]}
-                value={audioInputDeviceId}
-              />
-            </div>
-            <AudioInputMeter
-              aria-hidden="true"
-              data-active={audioInputState === "previewing"}
-              data-signal={audioInputState === "previewing" && audioInputHasSignal ? "live" : "quiet"}
-            >
-              {Array.from({ length: AUDIO_INPUT_METER_BARS }, (_, index) => (
-                <span
-                  key={index}
-                  style={buildInputMeterBarStyle(index, audioInputLevel, audioInputState === "previewing")}
-                />
-              ))}
-            </AudioInputMeter>
-            <AudioInputPillIconButton
-              aria-label="Refresh input sources"
-              disabled={audioInputState === "checking" || audioInputState === "starting"}
-              onClick={loadAudioInputDevices}
-              title="Refresh input sources"
-              type="button"
-            >
-              <ButtonRefreshIcon aria-hidden="true" />
-            </AudioInputPillIconButton>
-          </AudioInputPill>
-          <AudioInputMeta>
-            {selectedAudioInputLabel} / level {formatAudioLevel(audioInputLevel)} / buffer {Math.round((audioInputStats.bufferMs || 0) / 1000)}s
-          </AudioInputMeta>
-          {audioInputPermissionMissing && (
-            <AudioRecorderOptionRow>
-              <SettingsHint>System Settings / Privacy & Security / Microphone</SettingsHint>
-              <SecondaryButton
-                disabled={isOpeningAudioInputPermissions}
-                onClick={openAudioInputPermissionSettings}
-                type="button"
-              >
-                <ButtonMicIcon aria-hidden="true" />
-                <span>{audioInputPrimaryActionLabel}</span>
-              </SecondaryButton>
-            </AudioRecorderOptionRow>
-          )}
-        </AudioInputSourcePanel>
-
-        <AudioGeneralToolbar>
-          <AudioGeneralColumn>
-          <AudioProviderPanel aria-label="Transcription provider">
-            <AudioDeviceHeader>
-              <div>
-                <SettingsLabel>Provider</SettingsLabel>
-                <SettingsHint>{isForgeMode
-                  ? "Diff Forge Cloud"
-                  : isForgeAgentMode
-                    ? "Diff Forge AI voice"
-                    : isCloudMode
-                      ? "Deepgram Nova-3"
-                      : "Local Whisper"}</SettingsHint>
-              </div>
-              <AudioStatePill data-installed={recorderReady}>
-                {audioModeStatusLabel}
-              </AudioStatePill>
-            </AudioDeviceHeader>
-            <AudioModeList role="group" aria-label="Transcription mode">
-              <AudioModeButton
-                aria-pressed={isForgeMode}
-                onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_FORGE)}
-                type="button"
-              >
-                <ButtonHubIcon aria-hidden="true" />
-                <span>
-                  <strong>Diff Forge Cloud</strong>
-                  <span>Nova-3 + LLM cleanup</span>
-                </span>
-              </AudioModeButton>
-              <AudioModeButton
-                aria-pressed={!isCloudMode && !isForgeMode && !isForgeAgentMode}
-                onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_LOCAL)}
-                type="button"
-              >
-                <ButtonMicIcon aria-hidden="true" />
-                <span>
-                  <strong>Local</strong>
-                  <span>Whisper on this device</span>
-                </span>
-              </AudioModeButton>
-              {SHOW_OWN_KEY_DEEPGRAM_PROVIDER && (
-                <AudioModeButton
-                  aria-pressed={isCloudMode}
-                  onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_CLOUD)}
-                  type="button"
-                >
-                  <ButtonHubIcon aria-hidden="true" />
-                  <span>
-                    <strong>Cloud</strong>
-                    <span>Your Deepgram key</span>
-                  </span>
-                </AudioModeButton>
-              )}
-            </AudioModeList>
-            {!isCloudMode && !isForgeMode && !isForgeAgentMode && (
-              <AudioLocalModelList aria-label="Local Whisper model">
-                {localWhisperModels.map((model) => {
-                  const modelId = model.modelId || model.model_id || "";
-                  const modelInstalled = Boolean(model.installed);
-                  const modelSelected = model.selected || modelId === selectedWhisperModelId;
-                  const modelDownloading = audioActionState === "downloading"
-                    && (!downloadingModelId || downloadingModelId === modelId);
-                  const otherModelDownloading = audioActionState === "downloading"
-                    && downloadingModelId
-                    && downloadingModelId !== modelId;
-                  const modelActionDisabled = audioActionState === "uninstalling"
-                    || audioActionState === "opening"
-                    || audioActionState === "closing"
-                    || modelDownloading
-                    || otherModelDownloading
-                    || (modelInstalled && modelSelected);
-                  const ModelActionButton = modelInstalled ? SecondaryButton : PrimaryButton;
-
-                  return (
-                    <AudioLocalModelRow
-                      data-installed={modelInstalled ? "true" : "false"}
-                      data-selected={modelSelected ? "true" : "false"}
-                      key={modelId || model.modelName}
+                <AudioSettingsCard aria-label="Audio input settings" ref={audioInputSourcePanelRef}>
+                  {shouldHighlightAudioInput && (
+                    <AudioAttentionFlash
+                      aria-hidden="true"
+                      key={`audio-input-highlight-${audioHotkeyHighlight.id}`}
+                    />
+                  )}
+                  <AudioInputPill data-live={audioInputState === "previewing" ? "true" : "false"}>
+                    <AudioInputMicButton
+                      aria-label={audioInputPermissionMissing
+                        ? audioInputPrimaryActionLabel
+                        : audioInputState === "previewing" ? "Stop monitor" : "Enable input"}
+                      data-live={audioInputState === "previewing" ? "true" : "false"}
+                      disabled={audioInputState === "checking" || audioInputState === "starting" || isOpeningAudioInputPermissions}
+                      onClick={toggleAudioInputPreview}
+                      title={audioInputPrimaryActionTitle}
+                      type="button"
                     >
-                      <AudioLocalModelCopy>
-                        <strong>{formatWhisperModelTitle(model)}</strong>
-                        <span>{model.description || formatWhisperModelMeta(model)}</span>
-                        <AudioLocalModelMeta>
-                          <AudioLocalModelPill>{formatWhisperModelMeta(model)}</AudioLocalModelPill>
-                          <AudioLocalModelPill data-tone={modelInstalled ? "ready" : undefined}>
-                            {modelInstalled ? (modelSelected ? "Selected" : "Downloaded") : "Not installed"}
-                          </AudioLocalModelPill>
-                        </AudioLocalModelMeta>
-                      </AudioLocalModelCopy>
-                      <AudioLocalModelActions>
-                        <ModelActionButton
-                          disabled={modelActionDisabled}
-                          onClick={() => {
-                            if (!modelId) {
-                              return;
-                            }
-                            if (modelInstalled) {
-                              selectLocalWhisperModel(modelId);
-                            } else {
-                              installLocalWhisperModel(modelId);
-                            }
-                          }}
+                      <ButtonMicIcon aria-hidden="true" />
+                    </AudioInputMicButton>
+                    <div style={{ flex: "1 1 auto", minWidth: 0 }}>
+                      <AppSelect
+                        aria-label="Microphone input source"
+                        isDisabled={audioInputState === "checking" || audioInputState === "starting"}
+                        onChange={(value) => selectAudioInputDevice({ target: { value } })}
+                        options={audioInputDevices.length
+                          ? audioInputDevices.map((device) => ({ value: device.deviceId, label: device.label }))
+                          : [{ value: "default", label: "Default microphone" }]}
+                        value={audioInputDeviceId}
+                      />
+                    </div>
+                    <AudioInputMeter
+                      aria-hidden="true"
+                      data-active={audioInputState === "previewing"}
+                      data-signal={audioInputState === "previewing" && audioInputHasSignal ? "live" : "quiet"}
+                    >
+                      {Array.from({ length: AUDIO_INPUT_METER_BARS }, (_, index) => (
+                        <span
+                          key={index}
+                          style={buildInputMeterBarStyle(index, audioInputLevel, audioInputState === "previewing")}
+                        />
+                      ))}
+                    </AudioInputMeter>
+                    <AudioInputPillIconButton
+                      aria-label="Refresh input sources"
+                      disabled={audioInputState === "checking" || audioInputState === "starting"}
+                      onClick={loadAudioInputDevices}
+                      title="Refresh input sources"
+                      type="button"
+                    >
+                      <ButtonRefreshIcon aria-hidden="true" />
+                    </AudioInputPillIconButton>
+                  </AudioInputPill>
+                  <SettingsIdentityGrid>
+                    <AudioSettingsIdentityItem>
+                      <span>Device</span>
+                      <strong>{selectedAudioInputLabel}</strong>
+                    </AudioSettingsIdentityItem>
+                    <AudioSettingsIdentityItem>
+                      <span>Level</span>
+                      <strong>{formatAudioLevel(audioInputLevel)}</strong>
+                    </AudioSettingsIdentityItem>
+                    <AudioSettingsIdentityItem>
+                      <span>Buffer</span>
+                      <strong>{Math.round((audioInputStats.bufferMs || 0) / 1000)}s</strong>
+                    </AudioSettingsIdentityItem>
+                  </SettingsIdentityGrid>
+                  <SettingsHint>{audioInputMessage}</SettingsHint>
+                  {audioInputPermissionMissing && (
+                    <AudioRecorderOptionRow>
+                      <SettingsHint>System Settings / Privacy & Security / Microphone</SettingsHint>
+                      <AudioPermissionActionButton
+                        disabled={isOpeningAudioInputPermissions}
+                        onClick={openAudioInputPermissionSettings}
+                        type="button"
+                      >
+                        <ButtonMicIcon aria-hidden="true" />
+                        <span>{audioInputPrimaryActionLabel}</span>
+                        {shouldHighlightAudioInput && (
+                          <AudioButtonAttentionFlash
+                            aria-hidden="true"
+                            key={`audio-input-permission-button-highlight-${audioHotkeyHighlight.id}`}
+                          />
+                        )}
+                      </AudioPermissionActionButton>
+                    </AudioRecorderOptionRow>
+                  )}
+                </AudioSettingsCard>
+              </AudioSettingsSection>
+
+              <AudioSettingsSection>
+                <SettingsSectionHeader>
+                  <span>Transcription · Provider</span>
+                  <em data-tone={recorderReady ? "green" : "orange"}>{audioModeStatusLabel}</em>
+                </SettingsSectionHeader>
+
+                <AudioSettingsCard aria-label="Transcription provider">
+                  <AudioModeList aria-label="Transcription mode" role="group">
+                    <AudioModeButton
+                      aria-pressed={isForgeMode}
+                      onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_FORGE)}
+                      type="button"
+                    >
+                      <ButtonHubIcon aria-hidden="true" />
+                      <span>
+                        <strong>Diff Forge Cloud</strong>
+                        <span>Nova-3 + LLM cleanup</span>
+                      </span>
+                    </AudioModeButton>
+                    <AudioModeButton
+                      aria-pressed={!isCloudMode && !isForgeMode && !isForgeAgentMode}
+                      onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_LOCAL)}
+                      type="button"
+                    >
+                      <ButtonMicIcon aria-hidden="true" />
+                      <span>
+                        <strong>Local</strong>
+                        <span>Whisper on this device</span>
+                      </span>
+                    </AudioModeButton>
+                    {SHOW_OWN_KEY_DEEPGRAM_PROVIDER && (
+                      <AudioModeButton
+                        aria-pressed={isCloudMode}
+                        onClick={() => selectAudioMode(AUDIO_TRANSCRIPTION_PROVIDER_CLOUD)}
+                        type="button"
+                      >
+                        <ButtonHubIcon aria-hidden="true" />
+                        <span>
+                          <strong>Cloud</strong>
+                          <span>Your Deepgram key</span>
+                        </span>
+                      </AudioModeButton>
+                    )}
+                  </AudioModeList>
+                  {!isCloudMode && !isForgeMode && !isForgeAgentMode && (
+                    <AudioLocalModelList aria-label="Local Whisper model">
+                      {localWhisperModels.map((model) => {
+                        const modelId = model.modelId || model.model_id || "";
+                        const modelInstalled = Boolean(model.installed);
+                        const modelSelected = model.selected || modelId === selectedWhisperModelId;
+                        const modelDownloading = audioActionState === "downloading"
+                          && (!downloadingModelId || downloadingModelId === modelId);
+                        const otherModelDownloading = audioActionState === "downloading"
+                          && downloadingModelId
+                          && downloadingModelId !== modelId;
+                        const modelActionDisabled = audioActionState === "uninstalling"
+                          || audioActionState === "opening"
+                          || audioActionState === "closing"
+                          || modelDownloading
+                          || otherModelDownloading
+                          || (modelInstalled && modelSelected);
+                        const ModelActionButton = modelInstalled ? SecondaryButton : PrimaryButton;
+
+                        return (
+                          <AudioLocalModelRow
+                            data-installed={modelInstalled ? "true" : "false"}
+                            data-selected={modelSelected ? "true" : "false"}
+                            key={modelId || model.modelName}
+                          >
+                            <AudioLocalModelCopy>
+                              <strong>{formatWhisperModelTitle(model)}</strong>
+                              <span>{model.description || formatWhisperModelMeta(model)}</span>
+                              <AudioLocalModelMeta>
+                                <AudioLocalModelPill>{formatWhisperModelMeta(model)}</AudioLocalModelPill>
+                                <AudioLocalModelPill data-tone={modelInstalled ? "ready" : undefined}>
+                                  {modelInstalled ? (modelSelected ? "Selected" : "Downloaded") : "Not installed"}
+                                </AudioLocalModelPill>
+                              </AudioLocalModelMeta>
+                            </AudioLocalModelCopy>
+                            <AudioLocalModelActions>
+                              <ModelActionButton
+                                disabled={modelActionDisabled}
+                                onClick={() => {
+                                  if (!modelId) {
+                                    return;
+                                  }
+                                  if (modelInstalled) {
+                                    selectLocalWhisperModel(modelId);
+                                  } else {
+                                    installLocalWhisperModel(modelId);
+                                  }
+                                }}
+                                type="button"
+                              >
+                                {modelInstalled && modelSelected ? (
+                                  <ButtonCheckIcon aria-hidden="true" />
+                                ) : (
+                                  <ButtonMicIcon aria-hidden="true" />
+                                )}
+                                <span>
+                                  {modelDownloading
+                                    ? "Downloading..."
+                                    : modelInstalled
+                                      ? (modelSelected ? "Selected" : "Use")
+                                      : "Install"}
+                                </span>
+                              </ModelActionButton>
+                            </AudioLocalModelActions>
+                          </AudioLocalModelRow>
+                        );
+                      })}
+                    </AudioLocalModelList>
+                  )}
+                  {(isCloudMode || isForgeMode) && (
+                    <AudioCloudField>
+                      Language
+                      <div style={{ width: "100%" }}>
+                        <AppSelect
+                          aria-label="Transcription language"
+                          onChange={updateDeepgramLanguage}
+                          options={DEEPGRAM_LANGUAGE_OPTIONS}
+                          placeholder="English"
+                          value={deepgramLanguage}
+                        />
+                      </div>
+                    </AudioCloudField>
+                  )}
+                  {isCloudMode && (
+                    <>
+                      <AudioCloudField>
+                        API key
+                        <AudioCloudInput
+                          autoComplete="off"
+                          onChange={updateDeepgramApiKey}
+                          placeholder="Deepgram API key"
+                          type="password"
+                          value={deepgramApiKey}
+                        />
+                      </AudioCloudField>
+                      <AudioRecorderOptionRow>
+                        <SettingsHint>
+                          Deepgram Nova-3 streams push-to-talk audio over a live WebSocket.
+                        </SettingsHint>
+                        <AudioStatePill data-installed={deepgramReady}>
+                          {deepgramReady ? "Key saved" : "Key required"}
+                        </AudioStatePill>
+                      </AudioRecorderOptionRow>
+                    </>
+                  )}
+                  {(isForgeMode || isForgeAgentMode) && (
+                    <>
+                      <AudioRecorderOptionRow>
+                        <SettingsHint>
+                          {forgeBilling.state === "loading"
+                            ? (isForgeAgentMode ? "Working.." : "Checking Diff Forge Cloud credits...")
+                            : forgeBilling.state === "auth_required" || forgeBilling.state === "billing_error"
+                              ? forgeBilling.error
+                              : forgeCreditsExhausted
+                                ? "No Diff Forge Cloud credits remaining. Top up to use cloud audio."
+                                : isForgeAgentMode
+                                  ? "Streams mic audio to Diff Forge Cloud, runs the voice agent, and plays the response back here."
+                                  : "Realtime Nova-3 in Diff Forge Cloud. Billed from your credits: audio input, LLM cleanup, and transfer per MB."}
+                        </SettingsHint>
+                        {isForgeAgentMode && (
+                          <SecondaryButton onClick={refreshForgeBilling} type="button">
+                            <ButtonRefreshIcon aria-hidden="true" />
+                            <span>{forgeBilling.state === "loading" ? "Working.." : "Recheck credits"}</span>
+                          </SecondaryButton>
+                        )}
+                      </AudioRecorderOptionRow>
+                      {isForgeMode && (
+                        <AudioRecorderOptionRow>
+                          <SettingsHint>
+                            {forgeLlmCleanup
+                              ? "A cheap LLM polishes the final transcript (punctuation, fillers, false starts)."
+                              : "Raw Nova-3 transcript is returned without the LLM pass."}
+                          </SettingsHint>
+                          <McpSwitchButton
+                            aria-pressed={forgeLlmCleanup}
+                            onClick={toggleForgeLlmCleanup}
+                            type="button"
+                          >
+                            <span aria-hidden="true" />
+                            LLM cleanup
+                          </McpSwitchButton>
+                        </AudioRecorderOptionRow>
+                      )}
+                    </>
+                  )}
+                  {!isCloudMode && audioModelStatus && !audioModelStatus.runtimeInstalled && (
+                    <AudioRuntimeHint>{audioModelStatus.runtimeInstallHint}</AudioRuntimeHint>
+                  )}
+                  {!isCloudMode && audioDownloadProgress && (
+                    <AudioProgressPanel>
+                      <AudioProgressTopline>
+                        <strong>{audioDownloadProgress.message || "Downloading local Whisper weights."}</strong>
+                        <span>{formatAudioPercent(downloadPercent)}</span>
+                      </AudioProgressTopline>
+                      <AudioProgressTrack aria-hidden="true">
+                        <AudioProgressBar $progress={Number(downloadPercent) || 0} />
+                      </AudioProgressTrack>
+                      <AudioProgressMeta>
+                        {formatFileSize(audioDownloadProgress.downloadedBytes || 0)}
+                        {audioDownloadProgress.totalBytes ? ` / ${formatFileSize(audioDownloadProgress.totalBytes)}` : ""}
+                      </AudioProgressMeta>
+                    </AudioProgressPanel>
+                  )}
+                  {!isCloudMode && (
+                    <AudioActionRow>
+                      <SecondaryButton disabled={isBusy} onClick={onRefreshStatus} type="button">
+                        <ButtonRefreshIcon aria-hidden="true" />
+                        <span>{audioStatusState === "checking" ? "Checking..." : "Recheck"}</span>
+                      </SecondaryButton>
+                      {canUninstall && (
+                        <PrimaryDangerButton disabled={isBusy} onClick={() => setUninstallModalOpen(true)} type="button">
+                          <ButtonDeleteIcon aria-hidden="true" />
+                          <span>{audioActionState === "uninstalling" ? "Uninstalling..." : "Uninstall Whisper"}</span>
+                        </PrimaryDangerButton>
+                      )}
+                    </AudioActionRow>
+                  )}
+                </AudioSettingsCard>
+              </AudioSettingsSection>
+
+              <AudioSettingsSection>
+                <SettingsSectionHeader>
+                  <span>Orchestrator · Voice control</span>
+                  <em data-tone="blue">{isManualOrchestratorMode ? "Manual" : "Auto"}</em>
+                </SettingsSectionHeader>
+
+                <AudioSettingsCard aria-label="Orchestrator voice controls">
+                  <TrayClickGroup>
+                    <div>
+                      <SettingsLabel>Submission</SettingsLabel>
+                      <SettingsHint>{isManualOrchestratorMode ? "Press to submit" : "Submit on pause"}</SettingsHint>
+                    </div>
+                    <AudioModeGrid aria-label="Orchestrator voice submission mode" role="group">
+                      <AudioModeButton
+                        aria-pressed={orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO}
+                        onClick={() => updateOrchestratorSubmissionMode(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO)}
+                        type="button"
+                      >
+                        <ButtonCheckIcon aria-hidden="true" />
+                        <span>
+                          <strong>Auto</strong>
+                          <span>Submit on pause</span>
+                        </span>
+                      </AudioModeButton>
+                      <AudioModeButton
+                        aria-pressed={orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL}
+                        onClick={() => updateOrchestratorSubmissionMode(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL)}
+                        type="button"
+                      >
+                        <ButtonKeyIcon aria-hidden="true" />
+                        <span>
+                          <strong>Manual</strong>
+                          <span>Press to submit</span>
+                        </span>
+                      </AudioModeButton>
+                    </AudioModeGrid>
+                  </TrayClickGroup>
+                  <TrayClickGroup>
+                    <div>
+                      <SettingsLabel>Engine</SettingsLabel>
+                      <SettingsHint>
+                        {orchestratorRealtimeEnabled
+                          ? "Native speech-to-speech"
+                          : "Deepgram transcription, LLM orchestration, Aura speech"}
+                      </SettingsHint>
+                    </div>
+                    <AudioModeGrid aria-label="Orchestrator voice engine" role="group">
+                      <AudioModeButton
+                        aria-pressed={orchestratorRealtimeEnabled}
+                        onClick={() => updateOrchestratorRealtimeEnabled(true)}
+                        title="One native speech-to-speech GPT-Realtime session: faster, more natural, with the same orchestrator tools."
+                        type="button"
+                      >
+                        <ButtonBotIcon aria-hidden="true" />
+                        <span>
+                          <strong>GPT-Realtime 2.0</strong>
+                          <span>Native speech-to-speech</span>
+                        </span>
+                      </AudioModeButton>
+                      <AudioModeButton
+                        aria-pressed={!orchestratorRealtimeEnabled}
+                        onClick={() => updateOrchestratorRealtimeEnabled(false)}
+                        title="Classic pipeline: Deepgram transcription, LLM orchestration, Aura speech."
+                        type="button"
+                      >
+                        <ButtonHubIcon aria-hidden="true" />
+                        <span>
+                          <strong>Pipeline</strong>
+                          <span>STT → LLM → TTS</span>
+                        </span>
+                      </AudioModeButton>
+                    </AudioModeGrid>
+                  </TrayClickGroup>
+                </AudioSettingsCard>
+              </AudioSettingsSection>
+
+              <AudioSettingsSection>
+                <SettingsSectionHeader>
+                  <span>Recorder · Floating widget</span>
+                  <em data-tone="blue">{audioWidgetThemeLabel}</em>
+                  <RecorderOpenButton disabled={recorderActionDisabled} onClick={recorderAction} type="button">
+                    {recorderOpen ? (
+                      <ButtonCloseIcon aria-hidden="true" />
+                    ) : (
+                      <ButtonMicIcon aria-hidden="true" />
+                    )}
+                    <span>{recorderButtonLabel}</span>
+                  </RecorderOpenButton>
+                </SettingsSectionHeader>
+
+                <AudioSettingsCard aria-label="Recorder controls" ref={audioRecorderPanelRef}>
+                  {shouldHighlightAudioRecorder && (
+                    <AudioAttentionFlash
+                      aria-hidden="true"
+                      key={`audio-recorder-highlight-${audioHotkeyHighlight.id}`}
+                    />
+                  )}
+                  <AccountCardHeader>
+                    <div>
+                      <SettingsLabel>Auto-open</SettingsLabel>
+                      <SettingsHint>{recorderHint}</SettingsHint>
+                    </div>
+                    <McpSwitchButton aria-pressed={autoOpenRecorder} onClick={toggleAutoOpenRecorder} type="button">
+                      <span aria-hidden="true" />
+                      Auto-open
+                    </McpSwitchButton>
+                  </AccountCardHeader>
+                  <TrayClickGroup>
+                    <div>
+                      <SettingsLabel>Widget theme</SettingsLabel>
+                      <SettingsHint>
+                        {AUDIO_WIDGET_THEME_OPTIONS.find((option) => option.id === audioWidgetTheme)?.detail
+                          || "Match the floating recorder to the workspace."}
+                      </SettingsHint>
+                    </div>
+                    <AudioModeGrid aria-label="Floating recorder theme" role="group">
+                      {AUDIO_WIDGET_THEME_OPTIONS.map((option) => (
+                        <AudioModeButton
+                          aria-pressed={audioWidgetTheme === option.id}
+                          key={option.id}
+                          onClick={() => updateAudioWidgetTheme(option.id)}
                           type="button"
                         >
-                          {modelInstalled && modelSelected ? (
+                          {option.icon === "light" ? (
+                            <ButtonLightModeIcon aria-hidden="true" />
+                          ) : (
+                            <ButtonDarkModeIcon aria-hidden="true" />
+                          )}
+                          <span>
+                            <strong>{option.label}</strong>
+                            <span>{option.detail}</span>
+                          </span>
+                        </AudioModeButton>
+                      ))}
+                    </AudioModeGrid>
+                  </TrayClickGroup>
+                  <TrayClickGroup>
+                    <div>
+                      <SettingsLabel>Widget style</SettingsLabel>
+                      <SettingsHint>
+                        {AUDIO_WIDGET_STYLE_OPTIONS.find((option) => option.id === audioWidgetStyleSetting)?.detail
+                          || "Choose how the recorder appears while idle."}
+                      </SettingsHint>
+                    </div>
+                    <AudioModeGrid aria-label="Floating recorder style" role="group">
+                      {AUDIO_WIDGET_STYLE_OPTIONS.map((option) => (
+                        <AudioModeButton
+                          aria-pressed={audioWidgetStyleSetting === option.id}
+                          key={option.id}
+                          onClick={() => updateAudioWidgetStyle(option.id)}
+                          type="button"
+                        >
+                          {option.id === AUDIO_WIDGET_STYLE_BAR ? (
                             <ButtonCheckIcon aria-hidden="true" />
+                          ) : option.id === AUDIO_WIDGET_STYLE_HIDDEN ? (
+                            <ButtonDarkModeIcon aria-hidden="true" />
                           ) : (
                             <ButtonMicIcon aria-hidden="true" />
                           )}
                           <span>
-                            {modelDownloading
-                              ? "Downloading..."
-                              : modelInstalled
-                                ? (modelSelected ? "Selected" : "Use")
-                                : "Install"}
+                            <strong>{option.label}</strong>
+                            <span>{option.detail}</span>
                           </span>
-                        </ModelActionButton>
-                      </AudioLocalModelActions>
-                    </AudioLocalModelRow>
-                  );
-                })}
-              </AudioLocalModelList>
-            )}
-            {(isCloudMode || isForgeMode) && (
-              <AudioCloudField>
-                Language
-                <div style={{ width: "100%" }}>
-                  <AppSelect
-                    aria-label="Transcription language"
-                    onChange={updateDeepgramLanguage}
-                    options={DEEPGRAM_LANGUAGE_OPTIONS}
-                    placeholder="English"
-                    value={deepgramLanguage}
-                  />
-                </div>
-              </AudioCloudField>
-            )}
-            {isCloudMode && (
-              <>
-                <AudioCloudField>
-                  API key
-                  <AudioCloudInput
-                    autoComplete="off"
-                    onChange={updateDeepgramApiKey}
-                    placeholder="Deepgram API key"
-                    type="password"
-                    value={deepgramApiKey}
-                  />
-                </AudioCloudField>
-                <AudioRecorderOptionRow>
+                        </AudioModeButton>
+                      ))}
+                    </AudioModeGrid>
+                  </TrayClickGroup>
                   <SettingsHint>
-                    Deepgram Nova-3 streams push-to-talk audio over a live WebSocket.
+                    {audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_BAR
+                      ? "A thin line sits at the bottom of the screen. Hover it for the record button (the orange hint is the shortcut); while recording it becomes a slim bar with an X to cancel."
+                      : audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_HIDDEN
+                        ? "The bubble stays invisible until you start speaking."
+                        : "The bubble stays visible and draggable at all times."}
                   </SettingsHint>
-                  <AudioStatePill data-installed={deepgramReady}>
-                    {deepgramReady ? "Key saved" : "Key required"}
-                  </AudioStatePill>
-                </AudioRecorderOptionRow>
-              </>
-            )}
-            {(isForgeMode || isForgeAgentMode) && (
-              <>
-                <AudioRecorderOptionRow>
-                  <SettingsHint>
-                    {forgeBilling.state === "loading"
-                      ? (isForgeAgentMode ? "Working.." : "Checking Diff Forge Cloud credits...")
-                      : forgeBilling.state === "auth_required" || forgeBilling.state === "billing_error"
-                        ? forgeBilling.error
-                        : forgeCreditsExhausted
-                          ? "No Diff Forge Cloud credits remaining. Top up to use cloud audio."
-                          : isForgeAgentMode
-                            ? "Streams mic audio to Diff Forge Cloud, runs the voice agent, and plays the response back here."
-                            : "Realtime Nova-3 in Diff Forge Cloud. Billed from your credits: audio input, LLM cleanup, and transfer per MB."}
-                  </SettingsHint>
-                  {isForgeAgentMode && (
-                    <SecondaryButton onClick={refreshForgeBilling} type="button">
-                      <ButtonRefreshIcon aria-hidden="true" />
-                      <span>{forgeBilling.state === "loading" ? "Working.." : "Recheck credits"}</span>
-                    </SecondaryButton>
-                  )}
-                </AudioRecorderOptionRow>
-                {isForgeMode && (
-                  <AudioRecorderOptionRow>
-                  <SettingsHint>
-                    {forgeLlmCleanup
-                      ? "A cheap LLM polishes the final transcript (punctuation, fillers, false starts)."
-                      : "Raw Nova-3 transcript is returned without the LLM pass."}
-                  </SettingsHint>
-                  <McpSwitchButton
-                    aria-pressed={forgeLlmCleanup}
-                    onClick={toggleForgeLlmCleanup}
-                    type="button"
+                </AudioSettingsCard>
+              </AudioSettingsSection>
+
+              <AudioSettingsSection>
+                <SettingsSectionHeader>
+                  <span>Shortcuts · Recorder bindings</span>
+                  <em
+                    data-tone={isSavingShortcut || isOpeningShortcutPermissions
+                      ? "blue"
+                      : shortcutPermissionMissing
+                        || shortcutQuarantineDetected
+                        || pushToTalkShortcutError
+                        || cancelShortcutError
+                          ? "orange"
+                          : "green"}
                   >
-                    <span aria-hidden="true" />
-                    LLM cleanup
-                  </McpSwitchButton>
-                  </AudioRecorderOptionRow>
-                )}
-              </>
-            )}
-          </AudioProviderPanel>
-
-          <AudioRecorderPanel aria-label="Orchestrator voice controls">
-            <AudioDeviceHeader>
-              <div>
-                <SettingsLabel>Orchestrator</SettingsLabel>
-                <SettingsHint>
-                  {`${orchestratorRealtimeEnabled ? "GPT-Realtime" : "Pipeline"} engine · ${isManualOrchestratorMode ? "manual submit" : "auto submit"}`}
-                </SettingsHint>
-              </div>
-              <AudioStatePill data-installed="true">
-                {isManualOrchestratorMode ? "Manual" : "Auto"}
-              </AudioStatePill>
-            </AudioDeviceHeader>
-            <AudioCloudField as="div">
-              Submission
-              <AudioModeGrid role="group" aria-label="Orchestrator voice submission mode">
-                <AudioModeButton
-                  aria-pressed={orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO}
-                  onClick={() => updateOrchestratorSubmissionMode(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_AUTO)}
-                  type="button"
-                >
-                  <ButtonCheckIcon aria-hidden="true" />
-                  <span>
-                    <strong>Auto</strong>
-                    <span>Submit on pause</span>
-                  </span>
-                </AudioModeButton>
-                <AudioModeButton
-                  aria-pressed={orchestratorSubmissionMode === AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL}
-                  onClick={() => updateOrchestratorSubmissionMode(AUDIO_ORCHESTRATOR_SUBMISSION_MODE_MANUAL)}
-                  type="button"
-                >
-                  <ButtonKeyIcon aria-hidden="true" />
-                  <span>
-                    <strong>Manual</strong>
-                    <span>Press to submit</span>
-                  </span>
-                </AudioModeButton>
-              </AudioModeGrid>
-            </AudioCloudField>
-            <AudioCloudField as="div">
-              Engine
-              <AudioModeGrid role="group" aria-label="Orchestrator voice engine">
-                <AudioModeButton
-                  aria-pressed={orchestratorRealtimeEnabled}
-                  onClick={() => updateOrchestratorRealtimeEnabled(true)}
-                  title="One native speech-to-speech GPT-Realtime session: faster, more natural, with the same orchestrator tools."
-                  type="button"
-                >
-                  <ButtonBotIcon aria-hidden="true" />
-                  <span>
-                    <strong>GPT-Realtime 2.0</strong>
-                    <span>Native speech-to-speech</span>
-                  </span>
-                </AudioModeButton>
-                <AudioModeButton
-                  aria-pressed={!orchestratorRealtimeEnabled}
-                  onClick={() => updateOrchestratorRealtimeEnabled(false)}
-                  title="Classic pipeline: Deepgram transcription, LLM orchestration, Aura speech."
-                  type="button"
-                >
-                  <ButtonHubIcon aria-hidden="true" />
-                  <span>
-                    <strong>Pipeline</strong>
-                    <span>STT → LLM → TTS</span>
-                  </span>
-                </AudioModeButton>
-              </AudioModeGrid>
-            </AudioCloudField>
-          </AudioRecorderPanel>
-          </AudioGeneralColumn>
-
-          <AudioRecorderAttentionPanel aria-label="Recorder controls" ref={audioRecorderPanelRef}>
-            {shouldHighlightAudioRecorder && (
-              <AudioAttentionFlash
-                aria-hidden="true"
-                key={`audio-recorder-highlight-${audioHotkeyHighlight.id}`}
-              />
-            )}
-            <AudioDeviceHeader>
-              <div>
-                <SettingsLabel>Recorder</SettingsLabel>
-                <SettingsHint>{recorderHint}</SettingsHint>
-              </div>
-              <AudioStatePill data-installed="true">
-                {audioWidgetThemeLabel}
-              </AudioStatePill>
-            </AudioDeviceHeader>
-            <AudioRecorderActions>
-              <McpSwitchButton aria-pressed={autoOpenRecorder} onClick={toggleAutoOpenRecorder} type="button">
-                <span aria-hidden="true" />
-                Auto-open
-              </McpSwitchButton>
-              <RecorderOpenButton disabled={recorderActionDisabled} onClick={recorderAction} type="button">
-                {recorderOpen ? (
-                  <ButtonCloseIcon aria-hidden="true" />
-                ) : (
-                  <ButtonMicIcon aria-hidden="true" />
-                )}
-                <span>{recorderButtonLabel}</span>
-              </RecorderOpenButton>
-            </AudioRecorderActions>
-            <AudioCloudField as="div">
-              Widget theme
-              <AudioModeGrid role="group" aria-label="Floating recorder theme">
-                {AUDIO_WIDGET_THEME_OPTIONS.map((option) => (
-                  <AudioModeButton
-                    aria-pressed={audioWidgetTheme === option.id}
-                    key={option.id}
-                    onClick={() => updateAudioWidgetTheme(option.id)}
-                    type="button"
-                  >
-                    {option.icon === "light" ? (
-                      <ButtonLightModeIcon aria-hidden="true" />
-                    ) : (
-                      <ButtonDarkModeIcon aria-hidden="true" />
-                    )}
-                    <span>
-                      <strong>{option.label}</strong>
-                      <span>{option.detail}</span>
-                    </span>
-                  </AudioModeButton>
-                ))}
-              </AudioModeGrid>
-            </AudioCloudField>
-            <AudioCloudField as="div">
-              Widget style
-              <AudioModeGrid role="group" aria-label="Floating recorder style">
-                {AUDIO_WIDGET_STYLE_OPTIONS.map((option) => (
-                  <AudioModeButton
-                    aria-pressed={audioWidgetStyleSetting === option.id}
-                    key={option.id}
-                    onClick={() => updateAudioWidgetStyle(option.id)}
-                    type="button"
-                  >
-                    {option.id === AUDIO_WIDGET_STYLE_BAR ? (
-                      <ButtonCheckIcon aria-hidden="true" />
-                    ) : option.id === AUDIO_WIDGET_STYLE_HIDDEN ? (
-                      <ButtonDarkModeIcon aria-hidden="true" />
-                    ) : (
-                      <ButtonMicIcon aria-hidden="true" />
-                    )}
-                    <span>
-                      <strong>{option.label}</strong>
-                      <span>{option.detail}</span>
-                    </span>
-                  </AudioModeButton>
-                ))}
-              </AudioModeGrid>
-            </AudioCloudField>
-            <SettingsHint>
-              {audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_BAR
-                ? "A thin line sits at the bottom of the screen. Hover it for the record button (the orange hint is the shortcut); while recording it becomes a slim bar with an X to cancel."
-                : audioWidgetStyleSetting === AUDIO_WIDGET_STYLE_HIDDEN
-                  ? "The bubble stays invisible until you start speaking."
-                  : "The bubble stays visible and draggable at all times."}
-            </SettingsHint>
-          </AudioRecorderAttentionPanel>
-
-        </AudioGeneralToolbar>
-
-        <AudioShortcutSettingsPanel aria-label="Audio shortcut settings" ref={audioShortcutSettingsPanelRef}>
-          {shouldHighlightAudioPermissions && (
-            <AudioAttentionFlash
-              aria-hidden="true"
-              key={`audio-permissions-highlight-${audioHotkeyHighlight.id}`}
-            />
-          )}
-          <AudioDeviceHeader>
-            <div>
-              <SettingsLabel>Bindings</SettingsLabel>
-              <SettingsHint>{recorderMode === AUDIO_RECORDER_MODE_HYBRID
-                ? "Hold to record, double-tap to lock, tap to stop."
-                : isToggleRecorderMode
-                  ? "Recorder shortcut toggles start and submit."
-                  : "Recorder shortcut records while held."}</SettingsHint>
-            </div>
-            <AudioStatePill data-installed={shortcutReady}>
-              {isSavingShortcut || isOpeningShortcutPermissions
-                ? "Checking"
-                : shortcutPermissionMissing || shortcutQuarantineDetected
-                  ? "Needs access"
-                  : pushToTalkShortcutError || cancelShortcutError
-                    ? "Conflict"
-                    : "Ready"}
-            </AudioStatePill>
-          </AudioDeviceHeader>
-
-          <AudioCloudField as="div">
-            Mode
-            <AudioModeGrid role="group" aria-label="Recorder mode">
-              <AudioModeButton
-                aria-pressed={recorderMode === AUDIO_RECORDER_MODE_HYBRID}
-                onClick={() => updateRecorderMode(AUDIO_RECORDER_MODE_HYBRID)}
-                type="button"
-              >
-                <ButtonKeyIcon aria-hidden="true" />
-                <span>
-                  <strong>Hybrid</strong>
-                  <span>Hold / 2x tap locks</span>
-                </span>
-              </AudioModeButton>
-              <AudioModeButton
-                aria-pressed={recorderMode === AUDIO_RECORDER_MODE_PUSH_TO_TALK}
-                onClick={() => updateRecorderMode(AUDIO_RECORDER_MODE_PUSH_TO_TALK)}
-                type="button"
-              >
-                <ButtonKeyIcon aria-hidden="true" />
-                <span>
-                  <strong>Push to Talk</strong>
-                  <span>Hold shortcut</span>
-                </span>
-              </AudioModeButton>
-              <AudioModeButton
-                aria-pressed={recorderMode === AUDIO_RECORDER_MODE_TOGGLE_TO_TALK}
-                onClick={() => updateRecorderMode(AUDIO_RECORDER_MODE_TOGGLE_TO_TALK)}
-                type="button"
-              >
-                <ButtonMicIcon aria-hidden="true" />
-                <span>
-                  <strong>Toggle to Talk</strong>
-                  <span>Press start / stop</span>
-                </span>
-              </AudioModeButton>
-            </AudioModeGrid>
-          </AudioCloudField>
-
-          <AudioShortcutGrid>
-            <AudioShortcutCard data-error={Boolean(pushToTalkShortcutError)}>
-              <span>Record shortcut</span>
-              <AudioShortcutKey data-capturing={capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK}>
-                {capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK
-                  ? "Press key"
-                  : formatShortcutLabel(pushToTalkShortcut)}
-              </AudioShortcutKey>
-              <AudioShortcutActions>
-                <SecondaryButton
-                  disabled={isSavingShortcut}
-                  onClick={() => setCapturingAudioShortcut(AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK)}
-                  type="button"
-                >
-                  <ButtonKeyIcon aria-hidden="true" />
-                  <span>{capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK ? "Listening..." : "Change"}</span>
-                </SecondaryButton>
-                {isMacPlatform() && pushToTalkShortcut !== "Fn" && (
-                  <SecondaryButton
-                    disabled={isSavingShortcut}
-                    onClick={() => applyAudioShortcut(AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK, "Fn")}
-                    title="Bind the Fn (Globe) key: hold to record, double-tap to lock"
-                    type="button"
-                  >
-                    <ButtonKeyIcon aria-hidden="true" />
-                    <span>Use Fn</span>
+                    {isSavingShortcut || isOpeningShortcutPermissions
+                      ? "Checking"
+                      : shortcutPermissionMissing || shortcutQuarantineDetected
+                        ? "Needs access"
+                        : pushToTalkShortcutError || cancelShortcutError
+                          ? "Conflict"
+                          : "Ready"}
+                  </em>
+                  <SecondaryButton disabled={isSavingShortcut} onClick={resetAudioShortcuts} type="button">
+                    <ButtonRefreshIcon aria-hidden="true" />
+                    <span>Reset defaults</span>
                   </SecondaryButton>
-                )}
-              </AudioShortcutActions>
-              {pushToTalkShortcutError && <AudioInputMeta>{pushToTalkShortcutError}</AudioInputMeta>}
-            </AudioShortcutCard>
+                </SettingsSectionHeader>
 
-            <AudioShortcutCard data-error={Boolean(cancelShortcutError)}>
-              <span>Cancel</span>
-              <AudioShortcutKey data-capturing={capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_CANCEL}>
-                {capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_CANCEL
-                  ? "Press key"
-                  : formatShortcutLabel(cancelShortcut)}
-              </AudioShortcutKey>
-              <AudioShortcutActions>
-                <SecondaryButton
-                  disabled={isSavingShortcut}
-                  onClick={() => setCapturingAudioShortcut(AUDIO_SHORTCUT_ACTION_CANCEL)}
-                  type="button"
-                >
-                  <ButtonKeyIcon aria-hidden="true" />
-                  <span>{capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_CANCEL ? "Listening..." : "Change"}</span>
-                </SecondaryButton>
-              </AudioShortcutActions>
-              {cancelShortcutError && <AudioInputMeta>{cancelShortcutError}</AudioInputMeta>}
-            </AudioShortcutCard>
-          </AudioShortcutGrid>
+                <AudioSettingsCard aria-label="Audio shortcut settings" ref={audioShortcutSettingsPanelRef}>
+                  {shouldHighlightAudioPermissions && (
+                    <AudioAttentionFlash
+                      aria-hidden="true"
+                      key={`audio-permissions-highlight-${audioHotkeyHighlight.id}`}
+                    />
+                  )}
+                  <TrayClickGroup>
+                    <div>
+                      <SettingsLabel>Mode</SettingsLabel>
+                      <SettingsHint>{recorderMode === AUDIO_RECORDER_MODE_HYBRID
+                        ? "Hold to record, double-tap to lock, tap to stop."
+                        : isToggleRecorderMode
+                          ? "Recorder shortcut toggles start and submit."
+                          : "Recorder shortcut records while held."}</SettingsHint>
+                    </div>
+                    <AudioModeGrid aria-label="Recorder mode" role="group">
+                      <AudioModeButton
+                        aria-pressed={recorderMode === AUDIO_RECORDER_MODE_HYBRID}
+                        onClick={() => updateRecorderMode(AUDIO_RECORDER_MODE_HYBRID)}
+                        type="button"
+                      >
+                        <ButtonKeyIcon aria-hidden="true" />
+                        <span>
+                          <strong>Hybrid</strong>
+                          <span>Hold / 2x tap locks</span>
+                        </span>
+                      </AudioModeButton>
+                      <AudioModeButton
+                        aria-pressed={recorderMode === AUDIO_RECORDER_MODE_PUSH_TO_TALK}
+                        onClick={() => updateRecorderMode(AUDIO_RECORDER_MODE_PUSH_TO_TALK)}
+                        type="button"
+                      >
+                        <ButtonKeyIcon aria-hidden="true" />
+                        <span>
+                          <strong>Push to Talk</strong>
+                          <span>Hold shortcut</span>
+                        </span>
+                      </AudioModeButton>
+                      <AudioModeButton
+                        aria-pressed={recorderMode === AUDIO_RECORDER_MODE_TOGGLE_TO_TALK}
+                        onClick={() => updateRecorderMode(AUDIO_RECORDER_MODE_TOGGLE_TO_TALK)}
+                        type="button"
+                      >
+                        <ButtonMicIcon aria-hidden="true" />
+                        <span>
+                          <strong>Toggle to Talk</strong>
+                          <span>Press start / stop</span>
+                        </span>
+                      </AudioModeButton>
+                    </AudioModeGrid>
+                  </TrayClickGroup>
 
-          <AudioRecorderOptionRow>
-            <SettingsHint>Default: {formatShortcutLabel(effectiveShortcutStatus.pushToTalk?.defaultShortcut || defaultPushToTalkShortcut())} / {formatShortcutLabel(effectiveShortcutStatus.cancel?.defaultShortcut || "Escape")}</SettingsHint>
-            <SecondaryButton disabled={isSavingShortcut} onClick={resetAudioShortcuts} type="button">
-              <ButtonRefreshIcon aria-hidden="true" />
-              <span>Reset defaults</span>
-            </SecondaryButton>
-          </AudioRecorderOptionRow>
+                  <AudioShortcutGrid>
+                    <AudioShortcutCard data-error={Boolean(pushToTalkShortcutError)}>
+                      <span>Record shortcut</span>
+                      <AudioShortcutKey data-capturing={capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK}>
+                        {capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK
+                          ? "Press key"
+                          : formatShortcutLabel(pushToTalkShortcut)}
+                      </AudioShortcutKey>
+                      <AudioShortcutActions>
+                        <SecondaryButton
+                          disabled={isSavingShortcut}
+                          onClick={() => setCapturingAudioShortcut(AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK)}
+                          type="button"
+                        >
+                          <ButtonKeyIcon aria-hidden="true" />
+                          <span>{capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK ? "Listening..." : "Change"}</span>
+                        </SecondaryButton>
+                        {isMacPlatform() && pushToTalkShortcut !== "Fn" && (
+                          <SecondaryButton
+                            disabled={isSavingShortcut}
+                            onClick={() => applyAudioShortcut(AUDIO_SHORTCUT_ACTION_PUSH_TO_TALK, "Fn")}
+                            title="Bind the Fn (Globe) key: hold to record, double-tap to lock"
+                            type="button"
+                          >
+                            <ButtonKeyIcon aria-hidden="true" />
+                            <span>Use Fn</span>
+                          </SecondaryButton>
+                        )}
+                      </AudioShortcutActions>
+                      {pushToTalkShortcutError && <AudioInputMeta>{pushToTalkShortcutError}</AudioInputMeta>}
+                    </AudioShortcutCard>
 
-          {pushToTalkShortcut === "Fn" && (
-            <AudioRecorderOptionRow>
-              <SettingsHint>
-                Set the macOS Globe/Fn key to &quot;Do Nothing&quot; in Keyboard settings so it
-                doesn&apos;t also trigger Dictation or input switching.
-              </SettingsHint>
-              <SecondaryButton onClick={openMacFnKeySettings} type="button">
-                <ButtonKeyIcon aria-hidden="true" />
-                <span>Keyboard Settings</span>
-              </SecondaryButton>
-            </AudioRecorderOptionRow>
-          )}
+                    <AudioShortcutCard data-error={Boolean(cancelShortcutError)}>
+                      <span>Cancel</span>
+                      <AudioShortcutKey data-capturing={capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_CANCEL}>
+                        {capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_CANCEL
+                          ? "Press key"
+                          : formatShortcutLabel(cancelShortcut)}
+                      </AudioShortcutKey>
+                      <AudioShortcutActions>
+                        <SecondaryButton
+                          disabled={isSavingShortcut}
+                          onClick={() => setCapturingAudioShortcut(AUDIO_SHORTCUT_ACTION_CANCEL)}
+                          type="button"
+                        >
+                          <ButtonKeyIcon aria-hidden="true" />
+                          <span>{capturingAudioShortcut === AUDIO_SHORTCUT_ACTION_CANCEL ? "Listening..." : "Change"}</span>
+                        </SecondaryButton>
+                      </AudioShortcutActions>
+                      {cancelShortcutError && <AudioInputMeta>{cancelShortcutError}</AudioInputMeta>}
+                    </AudioShortcutCard>
+                  </AudioShortcutGrid>
 
-          {shortcutPermissionMissing && (
-            <>
-              <AudioRuntimeHint>{shortcutPermissions.message || "Enable Accessibility for Diff Forge AI, then restart the app."}</AudioRuntimeHint>
-              <AudioRecorderOptionRow>
-                <SettingsHint>System Settings / Privacy & Security / Accessibility</SettingsHint>
-                <SecondaryButton disabled={isOpeningShortcutPermissions} onClick={openAudioShortcutPermissions} type="button">
-                  <ButtonKeyIcon aria-hidden="true" />
-                  <span>{isOpeningShortcutPermissions ? "Opening..." : "Open Settings"}</span>
-                </SecondaryButton>
-              </AudioRecorderOptionRow>
-            </>
-          )}
+                  <SettingsHint>
+                    Default: {formatShortcutLabel(effectiveShortcutStatus.pushToTalk?.defaultShortcut || defaultPushToTalkShortcut())} / {formatShortcutLabel(effectiveShortcutStatus.cancel?.defaultShortcut || "Escape")}
+                  </SettingsHint>
 
-          {shortcutQuarantineDetected && (
-            <>
-              <AudioRuntimeHint>
-                {shortcutPermissions.message || "Remove the macOS quarantine attribute, then restart the app."}
-              </AudioRuntimeHint>
-              {shortcutPermissions.quarantineFixCommand && (
-                <AudioShortcutKey>{shortcutPermissions.quarantineFixCommand}</AudioShortcutKey>
-              )}
-            </>
-          )}
+                  {pushToTalkShortcut === "Fn" && (
+                    <AudioRecorderOptionRow>
+                      <SettingsHint>
+                        Set the macOS Globe/Fn key to &quot;Do Nothing&quot; in Keyboard settings so it
+                        doesn&apos;t also trigger Dictation or input switching.
+                      </SettingsHint>
+                      <SecondaryButton onClick={openMacFnKeySettings} type="button">
+                        <ButtonKeyIcon aria-hidden="true" />
+                        <span>Keyboard Settings</span>
+                      </SecondaryButton>
+                    </AudioRecorderOptionRow>
+                  )}
 
-          {audioShortcutError && <FormMessage $state="error">{audioShortcutError}</FormMessage>}
-        </AudioShortcutSettingsPanel>
+                  {shortcutPermissionMissing && (
+                    <>
+                      <AudioRuntimeHint>{shortcutPermissions.message || "Enable Accessibility for Diff Forge AI, then restart the app."}</AudioRuntimeHint>
+                      <AudioRecorderOptionRow>
+                        <SettingsHint>System Settings / Privacy & Security / Accessibility</SettingsHint>
+                        <AudioPermissionActionButton
+                          disabled={isOpeningShortcutPermissions}
+                          onClick={openAudioShortcutPermissions}
+                          type="button"
+                        >
+                          <ButtonKeyIcon aria-hidden="true" />
+                          <span>{isOpeningShortcutPermissions ? "Opening..." : "Open Settings"}</span>
+                          {shouldHighlightAudioPermissions && (
+                            <AudioButtonAttentionFlash
+                              aria-hidden="true"
+                              key={`audio-shortcut-permission-button-highlight-${audioHotkeyHighlight.id}`}
+                            />
+                          )}
+                        </AudioPermissionActionButton>
+                      </AudioRecorderOptionRow>
+                    </>
+                  )}
 
-        {!isCloudMode && audioModelStatus && !audioModelStatus.runtimeInstalled && (
-          <AudioRuntimeHint>{audioModelStatus.runtimeInstallHint}</AudioRuntimeHint>
-        )}
+                  {shortcutQuarantineDetected && (
+                    <>
+                      <AudioRuntimeHint>
+                        {shortcutPermissions.message || "Remove the macOS quarantine attribute, then restart the app."}
+                      </AudioRuntimeHint>
+                      {shortcutPermissions.quarantineFixCommand && (
+                        <AudioShortcutKey>{shortcutPermissions.quarantineFixCommand}</AudioShortcutKey>
+                      )}
+                    </>
+                  )}
 
-        {!isCloudMode && audioDownloadProgress && (
-          <AudioProgressPanel>
-            <AudioProgressTopline>
-              <strong>{audioDownloadProgress.message || "Downloading local Whisper weights."}</strong>
-              <span>{formatAudioPercent(downloadPercent)}</span>
-            </AudioProgressTopline>
-            <AudioProgressTrack aria-hidden="true">
-              <AudioProgressBar $progress={Number(downloadPercent) || 0} />
-            </AudioProgressTrack>
-            <AudioProgressMeta>
-              {formatFileSize(audioDownloadProgress.downloadedBytes || 0)}
-              {audioDownloadProgress.totalBytes ? ` / ${formatFileSize(audioDownloadProgress.totalBytes)}` : ""}
-            </AudioProgressMeta>
-          </AudioProgressPanel>
-        )}
+                  {audioShortcutError && <FormMessage $state="error">{audioShortcutError}</FormMessage>}
+                </AudioSettingsCard>
+              </AudioSettingsSection>
 
-        {audioError && <FormMessage $state="error">{audioError}</FormMessage>}
-
-        {!isCloudMode && (
-          <AudioActionRow>
-            <SecondaryButton disabled={isBusy} onClick={onRefreshStatus} type="button">
-              <ButtonRefreshIcon aria-hidden="true" />
-              <span>{audioStatusState === "checking" ? "Checking..." : "Recheck"}</span>
-            </SecondaryButton>
-            {canUninstall && (
-              <PrimaryDangerButton disabled={isBusy} onClick={() => setUninstallModalOpen(true)} type="button">
-                <ButtonDeleteIcon aria-hidden="true" />
-                <span>{audioActionState === "uninstalling" ? "Uninstalling..." : "Uninstall Whisper"}</span>
-              </PrimaryDangerButton>
-            )}
-          </AudioActionRow>
-        )}
+              {audioError && <FormMessage $state="error">{audioError}</FormMessage>}
           </AudioTabPanel>
         )}
 
@@ -5957,6 +6062,7 @@ export default function AudioWorkspaceView({
 
                     return (
                       <AudioHistoryVirtualRow
+                        active={active}
                         copied={copied}
                         entering={entering}
                         expanded={expanded}
@@ -6029,7 +6135,9 @@ export default function AudioWorkspaceView({
       )}
     </AudioWorkspaceSurface>
   );
-}
+});
+
+export default AudioWorkspaceView;
 
 export function AudioWidgetWindow() {
   const [modelStatus, setModelStatus] = useState(null);
@@ -7708,11 +7816,13 @@ export function AudioWidgetWindow() {
         && !modeGeometryChanged
         && !noticeGeometryChanged;
       const nativeOwnsBarPlacement = isMacPlatform();
+      const placementRequestId = `barplace_${placementGeneration.toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
       if (nativeOwnsBarPlacement) {
         clearBarNativePlacementFallback();
         barNativePlacementPendingRef.current = {
           generation: placementGeneration,
           key: targetKey,
+          requestId: placementRequestId,
         };
       }
       const nativePlacement = await positionAudioBarWindowNatively({
@@ -7720,6 +7830,7 @@ export function AudioWidgetWindow() {
         height: target.height,
         margin,
         animate: shouldAnimatePlacement,
+        requestId: placementRequestId,
       });
       if (!isCurrentPlacement()) {
         const pending = barNativePlacementPendingRef.current;
@@ -7730,24 +7841,9 @@ export function AudioWidgetWindow() {
         return;
       }
       if (nativePlacement) {
-        const pending = barNativePlacementPendingRef.current;
-        if (!pending || pending.generation !== placementGeneration || pending.key !== targetKey) {
-          return;
-        }
-        barNativePlacementFallbackTimerRef.current = window.setTimeout(() => {
-          const fallbackPending = barNativePlacementPendingRef.current;
-          if (
-            !fallbackPending
-            || fallbackPending.generation !== placementGeneration
-            || fallbackPending.key !== targetKey
-            || !isCurrentPlacement()
-          ) {
-            return;
-          }
-          barNativePlacementPendingRef.current = null;
-          barNativePlacementFallbackTimerRef.current = 0;
-          markBarPlacementReady(targetKey);
-        }, 180);
+        // Rust acknowledges every placement request with a layout event
+        // (applied, frame-matched, or superseded) — the listener below clears
+        // the pending entry. No timer fallback: the protocol is event-driven.
         return;
       }
       if (nativeOwnsBarPlacement) {
@@ -7803,6 +7899,11 @@ export function AudioWidgetWindow() {
     usesBottomAnchoredStyle,
   ]);
 
+  const positionBottomAnchoredWidgetRef = useRef(positionBottomAnchoredWidget);
+  useEffect(() => {
+    positionBottomAnchoredWidgetRef.current = positionBottomAnchoredWidget;
+  }, [positionBottomAnchoredWidget]);
+
   useEffect(() => {
     let disposed = false;
     let unlistenLayout = () => {};
@@ -7820,19 +7921,51 @@ export function AudioWidgetWindow() {
       ) {
         return;
       }
-
-      const pending = barNativePlacementPendingRef.current;
-      if (
-        !pending
-        || barPlacementGenerationRef.current !== pending.generation
-        || widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR
-      ) {
+      if (widgetStyleRef.current !== AUDIO_WIDGET_STYLE_BAR) {
         return;
       }
 
-      barNativePlacementPendingRef.current = null;
-      clearBarNativePlacementFallback();
-      markBarPlacementReady(pending.key);
+      const payloadRequestId = typeof payload.requestId === "string" ? payload.requestId : "";
+      const reason = typeof payload.reason === "string" ? payload.reason : "";
+      const pending = barNativePlacementPendingRef.current;
+      const pendingIsCurrent = Boolean(
+        pending && barPlacementGenerationRef.current === pending.generation,
+      );
+
+      if (payloadRequestId) {
+        // Acknowledgment for a specific JS-commanded placement.
+        if (!pendingIsCurrent || pending.requestId !== payloadRequestId) {
+          return;
+        }
+        barNativePlacementPendingRef.current = null;
+        clearBarNativePlacementFallback();
+        if (payload.superseded === true) {
+          // The command lost a race natively; re-place with current geometry.
+          positionBottomAnchoredWidgetRef.current?.({ animate: false });
+          return;
+        }
+        markBarPlacementReady(pending.key);
+        return;
+      }
+
+      // Rust-initiated placement (Space change / stored reposition). A Space
+      // switch is the one moment native state can drift from the rendered
+      // geometry: re-place once with the CURRENT React geometry so the frame
+      // always matches what the widget is showing. Rust skips the setFrame
+      // when the frame already matches, so this is cheap and cannot loop
+      // (our re-place is a "command" and echoes a requestId).
+      if (reason === "space_changed") {
+        positionBottomAnchoredWidgetRef.current?.({ animate: false });
+        return;
+      }
+
+      // Legacy backend (no requestId/reason fields): keep the old behavior of
+      // treating any bar layout event as the pending placement settling.
+      if (!reason && pendingIsCurrent) {
+        barNativePlacementPendingRef.current = null;
+        clearBarNativePlacementFallback();
+        markBarPlacementReady(pending.key);
+      }
     })
       .then((nextUnlisten) => {
         if (disposed) {
@@ -8191,22 +8324,44 @@ export function AudioWidgetWindow() {
     let handoffFrame = 0;
     let resizeFrame = 0;
     let compactFrame = 0;
+    let expandCancelled = false;
 
     setWidgetChromeReady(false);
 
     if (wantsFocus) {
       setWidgetFrameMode("opening");
-      runWidgetWindowAction((windowHandle) => (
-        windowHandle.setSize(new LogicalSize(AUDIO_WIDGET_FOCUS_SIZE.width, AUDIO_WIDGET_FOCUS_SIZE.height))
-      ));
-      firstFrame = window.requestAnimationFrame(() => {
-        secondFrame = window.requestAnimationFrame(() => {
-          if (!isFocusedAudioWidgetState(widgetStateRef.current)) {
-            return;
-          }
+      // The focus UI must never reveal into a compact-sized window: await the
+      // resize (with one retry — a concurrent Space/focus transition can
+      // reject the first attempt) before the frame-mode handoff.
+      const expandWindow = async () => {
+        const focusSize = new LogicalSize(AUDIO_WIDGET_FOCUS_SIZE.width, AUDIO_WIDGET_FOCUS_SIZE.height);
+        const windowHandle = getCurrentWindow();
+        try {
+          await windowHandle.setSize(focusSize);
+        } catch {
+          await windowHandle.setSize(focusSize).catch(() => {});
+        }
+      };
+      let expandPromise;
+      try {
+        expandPromise = expandWindow();
+      } catch {
+        // Non-Tauri previews have no native window; proceed unsized.
+        expandPromise = Promise.resolve();
+      }
+      expandPromise.catch(() => {}).then(() => {
+        if (expandCancelled) {
+          return;
+        }
+        firstFrame = window.requestAnimationFrame(() => {
+          secondFrame = window.requestAnimationFrame(() => {
+            if (!isFocusedAudioWidgetState(widgetStateRef.current)) {
+              return;
+            }
 
-          setWidgetFrameMode("focus");
-          setWidgetChromeReady(true);
+            setWidgetFrameMode("focus");
+            setWidgetChromeReady(true);
+          });
         });
       });
     } else if (widgetFrameModeRef.current === "focus" || widgetFrameModeRef.current === "opening") {
@@ -8257,6 +8412,7 @@ export function AudioWidgetWindow() {
     }
 
     return () => {
+      expandCancelled = true;
       if (firstFrame) {
         window.cancelAnimationFrame(firstFrame);
       }

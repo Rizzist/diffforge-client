@@ -2934,6 +2934,21 @@ fn voice_orchestrator_diagnostics_enabled() -> bool {
         .unwrap_or(true)
 }
 
+fn audio_widget_bottom_bar_debug_logging_enabled() -> bool {
+    if AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGGING_ENABLED {
+        return true;
+    }
+
+    env::var("RUST_DIFFFORGE_AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGS")
+        .or_else(|_| env::var("DIFFFORGE_AUDIO_WIDGET_BOTTOM_BAR_DEBUG_LOGS"))
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
 /// Size cap for terminal-statuses.jsonl: on overflow the current file rotates
 /// to `<name>.1` (replacing any previous rotation) so the always-on status log
 /// can never grow unbounded (it had reached 722 MB in the wild).
@@ -3808,7 +3823,7 @@ async fn deactivate_workspace_runtime(
 
     let mcp_started_at = Instant::now();
     let (mcp, mcp_error) = if let Some(repo_path) = repo_path.as_deref() {
-        match coordination::mcp::stop_shared_daemon_for_repo(PathBuf::from(repo_path), &reason) {
+        match coordination::mcp::park_shared_daemon_for_repo(PathBuf::from(repo_path), &reason) {
             Ok(value) => (value, None),
             Err(error) => (
                 json!({
@@ -6375,6 +6390,12 @@ fn app_local_state_is_desktop_auth_key(key: &str) -> bool {
 #[tauri::command]
 async fn app_local_state_load(app: AppHandle, key: String) -> Result<Value, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // Auth state goes through the cached snapshot: the raw path re-read
+        // and re-slimmed the (legacy ~2 MB) file on every call and bypassed
+        // the one-time slim migration.
+        if app_local_state_is_desktop_auth_key(&key) {
+            return Ok(desktop_auth_public_snapshot(&desktop_auth_snapshot(&app)));
+        }
         let value = app_local_state_read(&app, &key);
         Ok(app_local_state_public_value(&key, value))
     })

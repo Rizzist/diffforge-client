@@ -2645,9 +2645,10 @@ export const WorkspaceRail = styled.aside`
     backdrop-filter: none;
   }
 
+  /* Collapsing only narrows the rail: vertical metrics (gap, top/bottom
+     padding) stay identical so icons never shift vertically between states. */
   &[data-collapsed="true"] {
-    gap: 7px;
-    padding: 8px 6px;
+    padding: 10px 6px;
   }
 
   @media (max-width: 760px) {
@@ -2662,12 +2663,22 @@ export const WorkspaceRail = styled.aside`
 
 export const RailTop = styled.div`
   display: grid;
+  /* Track the rail width, not content width: the workspace list keeps a fixed
+     expanded width even while hidden, and without this it would stretch the
+     column and push the (centered) header controls outside the collapsed rail. */
+  grid-template-columns: minmax(0, 1fr);
   align-content: start;
   gap: 9px;
   min-height: 0;
   overflow-x: hidden;
   overflow-y: auto;
   padding-bottom: 4px;
+
+  /* Collapsed keeps the (invisible) workspace list in layout; without this the
+     rail top could scroll the header/expand button out of view. */
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    overflow-y: hidden;
+  }
 `;
 
 export const RailHeader = styled.div`
@@ -2835,15 +2846,26 @@ export const RailCreateWorkspaceButton = styled(RailCollapseButton)`
 export const WorkspaceList = styled.div`
   display: grid;
   min-width: 0;
-  max-width: 100%;
+  max-width: none;
   gap: 6px;
   /* RailTop owns scrolling; this stays a simple stack of workspace rows. */
   overflow: visible;
   padding-right: 2px;
+  /* Fixed expanded width: while the rail animates, rows are CLIPPED by the
+     rail instead of reflowing/wrapping every frame; visibility (not
+     display:none) keeps the row reveal animations from restarting on expand. */
+  width: calc(var(--workspace-rail-width) - 20px);
+  opacity: 1;
+  transition: opacity 150ms ease, visibility 0s;
 
   ${WorkspaceRail}[data-collapsed="true"] & {
-    display: none;
-    padding-right: 0;
+    visibility: hidden;
+    opacity: 0;
+    transition: opacity 150ms ease, visibility 0s 150ms;
+  }
+
+  @media (max-width: 760px) {
+    width: auto;
   }
 `;
 
@@ -3029,9 +3051,7 @@ export const WorkspaceButton = styled.button`
     --workspace-card-hover-border: rgba(var(--forge-accent-rgb), 0.18);
   }
 
-  &:hover,
-  ${WorkspaceRow}:hover &,
-  ${WorkspaceRow}[data-native-hovered="true"] &,
+  ${WorkspaceRow}[data-hovered="true"] &,
   ${WorkspaceRow}:has(:focus-visible) & {
     border-color: var(--workspace-card-hover-border);
     background: var(--workspace-card-hover-bg);
@@ -3068,9 +3088,7 @@ export const WorkspaceButton = styled.button`
     padding: 4px 8px 4px 7px;
     text-align: left;
 
-    &:hover,
-    ${WorkspaceRow}:hover &,
-    ${WorkspaceRow}[data-native-hovered="true"] &,
+    ${WorkspaceRow}[data-hovered="true"] &,
     ${WorkspaceRow}:has(:focus-visible) & {
       padding-right: 34px;
     }
@@ -3235,8 +3253,7 @@ export const WorkspaceNotificationBadge = styled.span`
     right 210ms cubic-bezier(0.2, 0.8, 0.2, 1),
     top 210ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
-  ${WorkspaceRow}:hover &,
-  ${WorkspaceRow}[data-native-hovered="true"] &,
+  ${WorkspaceRow}[data-hovered="true"] &,
   ${WorkspaceRow}:has(:focus-visible) & {
     right: 36px;
   }
@@ -3278,8 +3295,7 @@ export const WorkspaceNotificationBadge = styled.span`
     padding: 0 5px;
     font-size: 9px;
 
-    ${WorkspaceRow}:hover &,
-    ${WorkspaceRow}[data-native-hovered="true"] &,
+    ${WorkspaceRow}[data-hovered="true"] &,
     ${WorkspaceRow}:has(:focus-visible) & {
       right: 36px;
     }
@@ -3333,8 +3349,7 @@ export const WorkspaceSettingsButton = styled.button`
     background: var(--forge-surface-control);
   }
 
-  ${WorkspaceRow}:hover &,
-  ${WorkspaceRow}[data-native-hovered="true"] &,
+  ${WorkspaceRow}[data-hovered="true"] &,
   ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 1;
     pointer-events: auto;
@@ -3342,8 +3357,7 @@ export const WorkspaceSettingsButton = styled.button`
   }
 
   ${WorkspaceRail}[data-collapsed="true"] &,
-  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:hover &,
-  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}[data-native-hovered="true"] &,
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}[data-hovered="true"] &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 0;
     pointer-events: none;
@@ -3351,8 +3365,7 @@ export const WorkspaceSettingsButton = styled.button`
   }
 
   @media (max-width: 760px) {
-    ${WorkspaceRow}:hover &,
-    ${WorkspaceRow}[data-native-hovered="true"] &,
+    ${WorkspaceRow}[data-hovered="true"] &,
     ${WorkspaceRow}:has(:focus-visible) & {
       opacity: 1;
       pointer-events: auto;
@@ -3406,8 +3419,7 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
     background: var(--forge-surface);
   }
 
-  ${WorkspaceRow}:hover &,
-  ${WorkspaceRow}[data-native-hovered="true"] &,
+  ${WorkspaceRow}[data-hovered="true"] &,
   ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 1;
     pointer-events: auto;
@@ -3415,8 +3427,7 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
   }
 
   ${WorkspaceRail}[data-collapsed="true"] &,
-  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:hover &,
-  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}[data-native-hovered="true"] &,
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}[data-hovered="true"] &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 0;
     pointer-events: none;
@@ -3429,10 +3440,12 @@ export const WorkspaceAccent = styled.span`
   justify-self: center;
   width: 12px;
   height: 12px;
-  border: 1px solid var(--workspace-card-status-border);
+  /* Matches the landing page LiveAppDemo WorkspaceAccent: subtle grey square
+     at rest, solid blue with a light ring + glow when the workspace is live. */
+  border: 1px solid rgba(144, 155, 170, 0.4);
   border-radius: 3px;
   box-sizing: border-box;
-  background: rgba(230, 236, 245, 0.025);
+  background: rgba(144, 155, 170, 0.14);
   box-shadow: none;
   transition:
     background 180ms ease,
@@ -3441,17 +3454,24 @@ export const WorkspaceAccent = styled.span`
     transform 180ms ease;
 
   ${WorkspaceButton}[data-runtime="activating"] & {
-    border-color: var(--workspace-card-status-border);
+    border-color: rgba(216, 179, 106, 0.6);
     background: var(--workspace-card-status);
-    box-shadow: 0 0 10px rgba(216, 179, 106, 0.18);
+    box-shadow: 0 0 8px rgba(216, 179, 106, 0.4);
     transform: scale(1.08);
   }
 
   ${WorkspaceButton}[data-runtime="activated"] & {
-    border-color: var(--workspace-card-status-border);
-    background: var(--workspace-card-status);
-    box-shadow: 0 0 10px rgba(var(--forge-accent-rgb), 0.2);
+    border-color: rgba(125, 176, 255, 0.7);
+    background: #3b82f6;
+    box-shadow: 0 0 8px rgba(59, 130, 246, 0.55);
     transform: scale(1.08);
+  }
+
+  /* Loopspace rows carry the loop theme: dark gold, not workspace blue. */
+  ${WorkspaceButton}[data-space="loop"][data-runtime="activated"] & {
+    border-color: rgba(255, 209, 102, 0.68);
+    background: #d8b36a;
+    box-shadow: 0 0 8px rgba(216, 179, 106, 0.5);
   }
 
   /* Selection alone must NOT light the status square — only runtime state
@@ -3565,6 +3585,11 @@ export const RailFooter = styled.div`
     gap 180ms cubic-bezier(0.2, 0.8, 0.2, 1),
     padding 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
+  /* The 2px scrollbar clearance skews the collapsed icon groups off-center. */
+  ${WorkspaceRail}[data-collapsed="true"] & {
+    padding-right: 0;
+  }
+
   html[data-forge-theme="light"] & {
     background: transparent;
   }
@@ -3585,7 +3610,7 @@ export const RailViewActions = styled.div`
     background 160ms ease;
 
   ${WorkspaceRail}[data-collapsed="true"] & {
-    padding: 3px;
+    padding: 5px 3px;
     border-color: rgba(230, 236, 245, 0.075);
   }
 
@@ -3613,8 +3638,7 @@ export const RailGlobalActions = styled.div`
     background 160ms ease;
 
   ${WorkspaceRail}[data-collapsed="true"] & {
-    margin-top: 6px;
-    padding: 3px;
+    padding: 5px 3px;
     border-color: rgba(230, 236, 245, 0.075);
   }
 
@@ -3837,33 +3861,25 @@ export const RailActionButton = styled.button`
     color: var(--forge-red);
   }
 
+  /* Collapsed keeps the SAME grid (30px icon column + collapsed label column)
+     and the SAME min-height: the icon lands dead-center because the button is
+     36px wide with symmetric 3px padding (3 + 30 + 3), and its position is a
+     pure function of the animating rail width — no grid flip, no jump, no
+     vertical shift. */
   ${WorkspaceRail}[data-collapsed="true"] & {
-    min-height: 30px;
-    grid-template-columns: 1fr;
-    justify-items: center;
-    gap: 0;
-    padding: 0;
+    padding: 0 3px;
   }
 
+  /* No selection underline while collapsed — the active border/background on
+     the button already carries selection, and the bar reads as clutter. */
   ${WorkspaceRail}[data-collapsed="true"] &::before {
-    left: 50%;
-    right: auto;
-    bottom: 3px;
-    top: auto;
-    width: 16px;
-    height: 2px;
-    transform: translateX(-50%);
+    display: none;
   }
 
   ${WorkspaceRail}[data-collapsed="true"] & span {
     max-width: 0;
     opacity: 0;
     transform: translateX(-4px);
-  }
-
-  ${WorkspaceRail}[data-collapsed="true"] &[data-scope="global"] {
-    min-height: 32px;
-    padding-left: 0;
   }
 
   @media (max-width: 760px) {
@@ -4721,9 +4737,9 @@ export const LoopspaceRuntimeSignalDot = styled.div`
   position: absolute;
   left: 0;
   top: 0;
-  width: 18px;
-  height: 18px;
-  border: 2px solid rgba(2, 6, 23, 0.94);
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid rgba(2, 6, 23, 0.9);
   border-radius: 999px;
   background: var(--loopspace-signal-color);
   isolation: isolate;
@@ -4740,12 +4756,12 @@ export const LoopspaceRuntimeSignalDot = styled.div`
   &::before {
     content: "";
     position: absolute;
-    inset: -8px;
+    inset: -4px;
     z-index: -1;
     border-radius: inherit;
     background: var(--loopspace-signal-color);
-    opacity: 0.38;
-    transform: scale(0.84);
+    opacity: 0.18;
+    transform: scale(0.88);
     animation: ${loopspaceRuntimeSignalPulse} 1.25s ease-in-out infinite;
     will-change: opacity, transform;
   }
@@ -4753,9 +4769,9 @@ export const LoopspaceRuntimeSignalDot = styled.div`
   &::after {
     content: "";
     position: absolute;
-    inset: 4px;
+    inset: 2.5px;
     border-radius: inherit;
-    background: rgba(255, 255, 255, 0.62);
+    background: rgba(255, 255, 255, 0.45);
   }
 
   &[data-tone="active"] {
@@ -4970,30 +4986,33 @@ export const LoopspaceGraphNode = styled.div`
       0 0 26px rgba(var(--loop-node-accent), 0.1);
   }
 
+  /* Completed/settled runtime states: quiet success green. */
   &[data-runtime] {
-    border-color: rgba(134, 239, 172, 0.72);
+    border-color: rgba(134, 239, 172, 0.48);
     box-shadow:
-      0 0 0 1px rgba(134, 239, 172, 0.18),
-      0 0 26px rgba(134, 239, 172, 0.18),
+      0 0 0 1px rgba(134, 239, 172, 0.1),
+      0 0 18px rgba(134, 239, 172, 0.1),
       0 18px 48px rgba(0, 0, 0, 0.42);
   }
 
+  /* Waiting states: the theme's dark gold. */
   &[data-runtime="queued"],
   &[data-runtime="blocked"],
   &[data-runtime="awaiting_device"] {
-    border-color: rgba(250, 204, 21, 0.68);
+    border-color: rgba(216, 179, 106, 0.6);
     box-shadow:
-      0 0 0 1px rgba(250, 204, 21, 0.16),
-      0 0 26px rgba(250, 204, 21, 0.14),
+      0 0 0 1px rgba(216, 179, 106, 0.14),
+      0 0 20px rgba(216, 179, 106, 0.12),
       0 18px 48px rgba(0, 0, 0, 0.42);
   }
 
+  /* The CURRENT node: the theme's light gold, not sky blue. */
   &[data-runtime="running"],
   &[data-runtime="active"] {
-    border-color: rgba(125, 211, 252, 0.72);
+    border-color: rgba(255, 209, 102, 0.92);
     box-shadow:
-      0 0 0 1px rgba(125, 211, 252, 0.18),
-      0 0 26px rgba(125, 211, 252, 0.16),
+      0 0 0 1.5px rgba(255, 209, 102, 0.26),
+      0 0 26px rgba(255, 209, 102, 0.2),
       0 18px 48px rgba(0, 0, 0, 0.42);
   }
 
@@ -7893,6 +7912,12 @@ export const LoopspaceRuntimePanelBody = styled.div`
   &[data-tab="nodes"] {
     overflow: hidden;
   }
+
+  /* The runtime tab scrolls per-column (history list / detail) so the
+     Follow auto-scroll can never push list rows under the panel header. */
+  &[data-tab="runtime"] {
+    overflow: hidden;
+  }
 `;
 
 export const LoopspaceRuntimePanelEmpty = styled.div`
@@ -8907,7 +8932,8 @@ export const LoopspaceRuntimeTimeline = styled.div`
   display: grid;
   grid-template-columns: minmax(220px, 0.382fr) minmax(320px, 0.618fr);
   min-width: 0;
-  min-height: 100%;
+  height: 100%;
+  min-height: 0;
   color: rgba(233, 238, 244, 0.9);
   background:
     linear-gradient(180deg, rgba(0, 0, 0, 0.16), transparent 46px),
@@ -8921,12 +8947,32 @@ export const LoopspaceRuntimeTimeline = styled.div`
 
 export const LoopspaceRuntimeTimelineList = styled.div`
   display: grid;
-  align-content: end;
+  align-content: start;
   min-width: 0;
-  min-height: 100%;
+  min-height: 0;
+  max-height: 100%;
   padding: 8px 0;
   border-right: 1px solid rgba(255, 209, 102, 0.08);
-  overflow: visible;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 209, 102, 0.28) transparent;
+
+  /* Bottom-anchor the newest row WITHOUT align-content: end — end-aligned
+     grid content that overflows a scroller is clipped above the start edge
+     and can never be scrolled back into view. */
+  > *:first-child {
+    margin-top: auto;
+  }
+
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(255, 209, 102, 0.26);
+  }
 
   @media (max-width: 820px) {
     border-right: 0;
@@ -9101,7 +9147,12 @@ export const LoopspaceRuntimeDetail = styled.aside`
   align-content: start;
   gap: 10px;
   min-width: 0;
-  min-height: 100%;
+  min-height: 0;
+  max-height: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 209, 102, 0.28) transparent;
   padding: 11px 12px;
   background:
     linear-gradient(135deg, rgba(255, 209, 102, 0.04), rgba(255, 255, 255, 0.012)),
@@ -9193,6 +9244,56 @@ export const LoopspaceRuntimeDetailMessage = styled.pre`
   line-height: 1.45;
   white-space: pre-wrap;
   word-break: break-word;
+`;
+
+/* Full state-change history for the selected runtime node — every event of
+   the run in order, since the list itself shows one row per node. */
+export const LoopspaceRuntimeDetailHistory = styled.ol`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  max-height: 148px;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  list-style: none;
+  scrollbar-width: thin;
+
+  li {
+    display: grid;
+    grid-template-columns: 62px auto minmax(0, 1fr);
+    align-items: baseline;
+    gap: 7px;
+    min-width: 0;
+    padding: 3px 6px;
+    border-radius: 6px;
+    background: rgba(15, 23, 42, 0.32);
+  }
+
+  li > span {
+    color: rgba(148, 163, 184, 0.72);
+    font-size: 9.5px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+  }
+
+  li > em {
+    min-width: 0;
+    overflow: hidden;
+    color: rgba(203, 213, 225, 0.85);
+    font-size: 10px;
+    font-style: normal;
+    font-weight: 650;
+    line-height: 1.4;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  li:last-child > em {
+    white-space: normal;
+    word-break: break-word;
+  }
 `;
 
 export const LoopspaceGraphEmpty = styled.div`
@@ -9356,6 +9457,7 @@ export const TerminalWorkspaceSurface = styled.section`
   width: 100%;
   height: 100%;
   padding: 0;
+  contain: layout style;
   overflow: hidden;
   background: ${TERMINAL_THEME_BACKGROUND};
   transition:
@@ -9517,6 +9619,12 @@ export const ResizePanel = styled(Panel)`
   overflow: hidden;
   background: ${TERMINAL_THEME_BACKGROUND};
 
+  &[data-terminal-row="true"],
+  &[data-terminal-column="true"],
+  &[data-terminal-leaf="true"] {
+    contain: layout style;
+  }
+
   &[data-surface="files"] {
     background: var(--files-vscode-editor, #030405);
   }
@@ -9548,21 +9656,40 @@ export const ResizeHandle = styled(Separator)`
   position: relative;
   z-index: 48;
   flex: 0 0 auto;
-  background: rgba(255, 255, 255, 0.08);
-  transition:
-    background 140ms ease,
-    box-shadow 140ms ease;
+  background: transparent;
+
+  /* The root is a wide invisible hit target; ::before carries the visible
+     9px gutter so widening the grab area doesn't widen the divider. */
+  &::before {
+    position: absolute;
+    inset: 0;
+    background: rgba(255, 255, 255, 0.08);
+    transition:
+      background 140ms ease,
+      box-shadow 140ms ease;
+    content: "";
+  }
 
   &[data-direction="horizontal"] {
-    width: 9px;
-    margin: 0 -4px;
+    width: 13px;
+    margin: 0 -6px;
     cursor: col-resize;
   }
 
+  &[data-direction="horizontal"]::before {
+    left: 2px;
+    right: 2px;
+  }
+
   &[data-direction="vertical"] {
-    height: 9px;
-    margin: -4px 0;
+    height: 13px;
+    margin: -6px 0;
     cursor: row-resize;
+  }
+
+  &[data-direction="vertical"]::before {
+    top: 2px;
+    bottom: 2px;
   }
 
   ${WorkspaceTerminalPanels}[data-terminal-dragging="true"] &,
@@ -9580,31 +9707,32 @@ export const ResizeHandle = styled(Separator)`
   }
 
   &[data-direction="horizontal"]::after {
-    left: 4px;
-    right: 4px;
+    left: 6px;
+    right: 6px;
     background: rgba(255, 255, 255, 0.1);
   }
 
   &[data-direction="vertical"]::after {
-    top: 4px;
-    bottom: 4px;
+    top: 6px;
+    bottom: 6px;
     background: rgba(255, 255, 255, 0.1);
   }
 
-  &:hover,
-  &[data-resize-handle-state="drag"] {
+  &:hover::before,
+  &[data-separator="active"]::before,
+  &[data-separator="focus"]::before {
     background: rgba(var(--forge-tint-rgb), 0.28);
     box-shadow: 0 0 16px rgba(var(--forge-tint-rgb), 0.18);
   }
 
-  &[data-surface="files"] {
+  &[data-surface="files"]::before {
     background: transparent;
     box-shadow: none;
   }
 
   &[data-surface="files"][data-direction="horizontal"] {
-    width: 7px;
-    margin: 0 -3px;
+    width: 13px;
+    margin: 0 -6px;
   }
 
   &[data-surface="files"]::after {
@@ -9612,20 +9740,22 @@ export const ResizeHandle = styled(Separator)`
   }
 
   &[data-surface="files"][data-direction="horizontal"]::after {
-    left: 3px;
+    left: 6px;
     right: auto;
     width: 1px;
     background: var(--files-vscode-border, #1d222b);
   }
 
-  &[data-surface="files"]:hover,
-  &[data-surface="files"][data-resize-handle-state="drag"] {
+  &[data-surface="files"]:hover::before,
+  &[data-surface="files"][data-separator="active"]::before,
+  &[data-surface="files"][data-separator="focus"]::before {
     background: transparent;
     box-shadow: none;
   }
 
   &[data-surface="files"]:hover::after,
-  &[data-surface="files"][data-resize-handle-state="drag"]::after {
+  &[data-surface="files"][data-separator="active"]::after,
+  &[data-surface="files"][data-separator="focus"]::after {
     background: var(--files-vscode-focus, #007fd4);
   }
 `;
@@ -12178,6 +12308,8 @@ export const AudioWorkspaceSurface = styled(VaultWorkspaceSurface)`
   --audio-border: rgba(125, 160, 205, 0.2);
   --audio-border-soft: rgba(125, 160, 205, 0.16);
   --audio-border-strong: rgba(125, 160, 205, 0.36);
+  --audio-card-bg: #0d1117;
+  --audio-inset-bg: rgba(2, 6, 23, 0.38);
   --audio-panel-bg: rgba(17, 22, 29, 0.86);
   --audio-panel-bg-soft: rgba(13, 17, 23, 0.58);
   --audio-panel-bg-muted: rgba(7, 9, 13, 0.42);
@@ -12210,6 +12342,8 @@ export const AudioWorkspaceSurface = styled(VaultWorkspaceSurface)`
     --audio-border: rgba(var(--forge-tint-soft-rgb), 0.16);
     --audio-border-soft: rgba(var(--forge-tint-soft-rgb), 0.11);
     --audio-border-strong: rgba(var(--forge-tint-soft-rgb), 0.32);
+    --audio-card-bg: rgba(13, 9, 4, 0.72);
+    --audio-inset-bg: rgba(6, 4, 2, 0.5);
     --audio-panel-bg: rgba(14, 10, 5, 0.8);
     --audio-panel-bg-soft: rgba(13, 9, 4, 0.58);
     --audio-panel-bg-muted: rgba(8, 6, 3, 0.52);
@@ -12226,6 +12360,8 @@ export const AudioWorkspaceSurface = styled(VaultWorkspaceSurface)`
     --audio-border: var(--forge-border);
     --audio-border-soft: var(--forge-border);
     --audio-border-strong: rgba(var(--forge-tint-rgb), 0.22);
+    --audio-card-bg: var(--forge-surface);
+    --audio-inset-bg: rgba(15, 23, 42, 0.05);
     --audio-panel-bg: var(--forge-surface);
     --audio-panel-bg-soft: var(--forge-surface-control);
     --audio-panel-bg-muted: var(--forge-surface);
@@ -12244,6 +12380,8 @@ export const AudioWorkspaceSurface = styled(VaultWorkspaceSurface)`
     --audio-border: rgba(var(--forge-tint-rgb), 0.16);
     --audio-border-soft: rgba(var(--forge-tint-rgb), 0.1);
     --audio-border-strong: rgba(var(--forge-tint-rgb), 0.26);
+    --audio-card-bg: var(--forge-surface);
+    --audio-inset-bg: rgba(15, 23, 42, 0.05);
     --audio-panel-bg-soft: rgba(var(--forge-tint-rgb), 0.045);
     --audio-control-selected-bg: rgba(var(--forge-tint-rgb), 0.1);
   }

@@ -68,6 +68,11 @@ extern "C" {
         attribute: *const std::ffi::c_void,
         settable: *mut std::os::raw::c_uchar,
     ) -> i32;
+    #[link_name = "AXUIElementGetPid"]
+    fn handsfree_ax_ui_element_get_pid(
+        element: *const std::ffi::c_void,
+        pid: *mut i32,
+    ) -> i32;
     fn AXIsProcessTrusted() -> std::os::raw::c_uchar;
     fn AXIsProcessTrustedWithOptions(
         options: *const std::ffi::c_void,
@@ -2413,8 +2418,33 @@ impl HandsfreeFocusedElementAttributes {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HandsfreeFocusedElementProbe {
     Editable(HandsfreeFocusedElementAttributes),
-    NotEditable(HandsfreeFocusedElementAttributes),
-    NoFocusedElement,
+    NotEditable {
+        attributes: HandsfreeFocusedElementAttributes,
+        // Focus inside THIS app: WKWebView child webviews (web panes, popouts)
+        // often surface as a non-editable container to the system-wide AX
+        // query even when a page input (e.g. Discord's composer) has focus —
+        // keystrokes there go to web content and never beep, so insertion is
+        // safe and expected.
+        owned_by_app: bool,
+    },
+    NoFocusedElement {
+        app_frontmost: bool,
+    },
+}
+
+#[cfg(target_os = "macos")]
+fn handsfree_ax_element_owned_by_app(element: *const std::ffi::c_void) -> bool {
+    let mut pid: i32 = 0;
+    let error = unsafe { handsfree_ax_ui_element_get_pid(element, &mut pid) };
+    error == MACOS_AX_ERROR_SUCCESS && pid > 0 && pid as u32 == std::process::id()
+}
+
+#[cfg(target_os = "macos")]
+fn handsfree_frontmost_app_is_self() -> bool {
+    objc2_app_kit::NSWorkspace::sharedWorkspace()
+        .frontmostApplication()
+        .map(|application| unsafe { application.processIdentifier() })
+        .is_some_and(|pid| pid > 0 && pid as u32 == std::process::id())
 }
 
 #[cfg(target_os = "macos")]
@@ -2499,9 +2529,12 @@ fn handsfree_ax_focused_element_probe() -> Result<HandsfreeFocusedElementProbe, 
     audio_widget_cf_release(system_wide);
 
     let Some(focused_element) = focused_element else {
-        return Ok(HandsfreeFocusedElementProbe::NoFocusedElement);
+        return Ok(HandsfreeFocusedElementProbe::NoFocusedElement {
+            app_frontmost: handsfree_frontmost_app_is_self(),
+        });
     };
 
+    let owned_by_app = handsfree_ax_element_owned_by_app(focused_element);
     let attributes: Result<HandsfreeFocusedElementAttributes, i32> = (|| {
         let role = handsfree_ax_optional_string_attribute(focused_element, "AXRole")?;
         let subrole = handsfree_ax_optional_string_attribute(focused_element, "AXSubrole")?;
@@ -2518,7 +2551,10 @@ fn handsfree_ax_focused_element_probe() -> Result<HandsfreeFocusedElementProbe, 
     if attributes.is_editable() {
         Ok(HandsfreeFocusedElementProbe::Editable(attributes))
     } else {
-        Ok(HandsfreeFocusedElementProbe::NotEditable(attributes))
+        Ok(HandsfreeFocusedElementProbe::NotEditable {
+            attributes,
+            owned_by_app,
+        })
     }
 }
 
@@ -2650,6 +2686,12 @@ async fn insert_handsfree_transcribed_text(
     let insert_result = tauri::async_runtime::spawn_blocking(move || {
         thread::sleep(Duration::from_millis(AUDIO_HANDSFREE_INSERT_DELAY_MS));
 
+        // The AX focus probe is diagnostics-only: gating insertion on it broke
+        // dictation into native child webviews (web panes/popouts report a
+        // non-editable container even when a page input has focus), so the
+        // transcript is ALWAYS typed into whatever is focused — the original
+        // behavior. The occasional alert beep on a non-editable target is an
+        // accepted trade-off.
         #[cfg(target_os = "macos")]
         match handsfree_ax_focused_element_probe_on_main_thread(&app) {
             Ok(HandsfreeFocusedElementProbe::Editable(attributes)) => {
@@ -2661,37 +2703,26 @@ async fn insert_handsfree_transcribed_text(
                         "value_attribute_settable": attributes.value_attribute_settable,
                     }),
                 );
-                insert_text_with_enigo(&text)?;
-                return Ok(handsfree_insert_result(true, "keystrokes", None));
             }
-            Ok(HandsfreeFocusedElementProbe::NotEditable(attributes)) => {
+            Ok(HandsfreeFocusedElementProbe::NotEditable {
+                attributes,
+                owned_by_app,
+            }) => {
                 log_audio_diagnostic_event(
                     "audio.handsfree.insert.focus_probe.not_editable",
                     json!({
+                        "owned_by_app": owned_by_app,
                         "role": attributes.role,
                         "subrole": attributes.subrole,
                         "value_attribute_settable": attributes.value_attribute_settable,
                     }),
                 );
-                // Typing into a non-editable target makes macOS ring the alert
-                // sound for every keystroke. The transcript is already saved in
-                // the Audio tab, and the user's clipboard must stay untouched.
-                return Ok(handsfree_insert_result(
-                    false,
-                    "none",
-                    Some("no_editable_focus"),
-                ));
             }
-            Ok(HandsfreeFocusedElementProbe::NoFocusedElement) => {
+            Ok(HandsfreeFocusedElementProbe::NoFocusedElement { app_frontmost }) => {
                 log_audio_diagnostic_event(
                     "audio.handsfree.insert.focus_probe.no_focused_element",
-                    json!({}),
+                    json!({ "app_frontmost": app_frontmost }),
                 );
-                return Ok(handsfree_insert_result(
-                    false,
-                    "none",
-                    Some("no_editable_focus"),
-                ));
             }
             Err(error) => {
                 log_audio_diagnostic_event(

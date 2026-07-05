@@ -328,6 +328,7 @@ export default function PcbWorkspacePane({
   externalBoard = undefined,
   isActive = true,
   onBoardChange = null,
+  onElementPickerChange = null,
   paneId = "",
   refreshRequestNonce = 0,
   repoPath = "",
@@ -456,21 +457,26 @@ export default function PcbWorkspacePane({
     [availableBoards],
   );
 
+  const selectedBoardName = selectedBoardPath ? boardNameForPath(selectedBoardPath) : "";
   const selectedBoard = useMemo(() => {
     if (!selectedBoardPath) {
       return null;
     }
     return {
-      name: boardNameForPath(selectedBoardPath),
+      name: selectedBoardName,
       path: selectedBoardPath,
     };
-  }, [boardNameForPath, selectedBoardPath]);
+  }, [selectedBoardName, selectedBoardPath]);
 
+  // Notify through a ref keyed on the board VALUE only: parents pass inline
+  // callbacks (new identity per render), and depending on that identity while
+  // the parent stores the board in state renders → notify → setState → render
+  // forever (React #185, the black-screen crash on pcb pop-out).
+  const onBoardChangeRef = useRef(onBoardChange);
+  onBoardChangeRef.current = onBoardChange;
   useEffect(() => {
-    if (typeof onBoardChange === "function") {
-      onBoardChange(selectedBoard);
-    }
-  }, [onBoardChange, selectedBoard]);
+    onBoardChangeRef.current?.(selectedBoard);
+  }, [selectedBoard]);
 
   const requestDeleteBoard = useCallback((target = null) => {
     const nextTarget = target || selectedBoard;
@@ -753,6 +759,7 @@ export default function PcbWorkspacePane({
             embedded
             isActive={isActive}
             key={`${workspaceId}:${repoIdentity}:${selectedBoard.path}`}
+            onElementPickerChange={onElementPickerChange}
             repoPath={repoPath}
             showHeader={false}
             workspaceId={workspaceId}

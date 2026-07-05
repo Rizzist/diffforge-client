@@ -173,6 +173,10 @@ import {
 } from "./panelAgentPromptBridge.js";
 import { logTerminalStatus } from "./terminalStatusLog.js";
 import {
+  beginTerminalLayoutAnimation,
+  endTerminalLayoutAnimation,
+} from "./terminalResizeController.js";
+import {
   appControlMessageHasExplicitTerminalTarget,
   getLoopspaceAutomationAutoSpawnMaxTotal,
   isLoopspaceAutomationAppControlMessage,
@@ -264,6 +268,8 @@ import {
   getActiveWorkspaceToolDrag,
 } from "../tools/workspaceToolDragTypes.js";
 
+const EMPTY_PANEL_AGENT_PROMPT_ACTIVITY_ITEMS = Object.freeze([]);
+
 function isWorkspaceWebTabPaneId(value) {
   return String(value || "").trim().startsWith("workspace-web-tab-");
 }
@@ -284,6 +290,25 @@ const TERMINAL_DOCUMENT_PANEL_ID = "workspace-document-panel";
 const TERMINAL_DOCUMENT_PANEL_KIND = "docs";
 const TERMINAL_GRID_MAX_BALANCED_COLUMNS = 3;
 const TERMINAL_GRID_DRAG_STRUCTURAL_HYSTERESIS_PX = 20;
+// Dragging a breakout window against the canvas edge pans the viewport so
+// windows can be moved past the visible area without dropping the drag.
+const TERMINAL_BREAKOUT_EDGE_SCROLL_ZONE_PX = 36;
+const TERMINAL_BREAKOUT_EDGE_SCROLL_MAX_STEP_PX = 14;
+
+function terminalBreakoutEdgeScrollStepPx(pointer, start, end) {
+  const zone = TERMINAL_BREAKOUT_EDGE_SCROLL_ZONE_PX;
+  const maxStep = TERMINAL_BREAKOUT_EDGE_SCROLL_MAX_STEP_PX;
+  if (end - start <= zone * 2) {
+    return 0;
+  }
+  if (pointer < start + zone) {
+    return -maxStep * Math.min(1, (start + zone - pointer) / zone);
+  }
+  if (pointer > end - zone) {
+    return maxStep * Math.min(1, (pointer - (end - zone)) / zone);
+  }
+  return 0;
+}
 const TERMINAL_EMPTY_AGENT_LAUNCHERS = Object.freeze([
   { id: "codex", label: "Codex" },
   { id: "claude", label: "Claude Code" },
@@ -1633,6 +1658,7 @@ const TerminalSurfaceSlot = styled.div`
   min-height: 0;
   overflow: visible;
   background: #020304;
+  contain: layout style;
   pointer-events: auto;
   transform: translate3d(var(--terminal-slot-x, 0px), var(--terminal-slot-y, 0px), 0) scale(var(--terminal-slot-scale, 1));
   transform-origin: 0 0;
@@ -17140,6 +17166,40 @@ function OrchestratorVoiceCanvasRing({
   );
 }
 
+// Divider drags emit a layout tick per frame; pausing xterm refits for the
+// duration (slots still track their anchors visually) means the buffer
+// reflow + PTY resize happen once on release instead of per tick.
+export function useTerminalGridSeparatorDragGate() {
+  const cleanupRef = useRef(null);
+
+  useEffect(() => () => {
+    cleanupRef.current?.();
+  }, []);
+
+  return useCallback((event) => {
+    if (event.pointerType === "mouse" && event.button !== 0) {
+      return;
+    }
+    if (cleanupRef.current) {
+      return;
+    }
+
+    beginTerminalLayoutAnimation();
+    const finish = () => {
+      if (cleanupRef.current !== finish) {
+        return;
+      }
+      cleanupRef.current = null;
+      window.removeEventListener("pointerup", finish, true);
+      window.removeEventListener("pointercancel", finish, true);
+      endTerminalLayoutAnimation("terminal_grid_separator_drag_end");
+    };
+    cleanupRef.current = finish;
+    window.addEventListener("pointerup", finish, true);
+    window.addEventListener("pointercancel", finish, true);
+  }, []);
+}
+
 export const TodoQueuePanel = memo(function TodoQueuePanel({
   accountKey = "",
   activeDragItemId = "",
@@ -17213,6 +17273,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   workspaces = [],
 }) {
   const orchestratorPanelWorkspaceId = workspaceId || workspace?.id || "";
+  const handleGridSeparatorPointerDown = useTerminalGridSeparatorDragGate();
   const orchestratorVoiceHistoryStoreKey = useMemo(
     () => `${rootDirectory || ""}:${getOrchestratorVoiceHistoryWorkspaceId(orchestratorPanelWorkspaceId)}`,
     [orchestratorPanelWorkspaceId, rootDirectory],
@@ -17226,6 +17287,29 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     String(workspaceToolTabMemoryRef?.current || "").trim() || "orchestrator"
   ));
   const activeWorkspaceTool = controlledWorkspaceToolId || uncontrolledActiveWorkspaceTool || "orchestrator";
+  const [visitedDormantWorkspaceTools, setVisitedDormantWorkspaceTools] = useState(() => ({
+    tokenomics: false,
+    tools: false,
+  }));
+  const toolsTabActive = activeWorkspaceTool === "tools";
+  const tokenomicsTabActive = activeWorkspaceTool === "tokenomics";
+  const toolsTabMounted = toolsTabActive || visitedDormantWorkspaceTools.tools;
+  const tokenomicsTabMounted = tokenomicsTabActive || visitedDormantWorkspaceTools.tokenomics;
+  useEffect(() => {
+    if (!toolsTabActive && !tokenomicsTabActive) {
+      return;
+    }
+    setVisitedDormantWorkspaceTools((current) => {
+      const nextTools = current.tools || toolsTabActive;
+      const nextTokenomics = current.tokenomics || tokenomicsTabActive;
+      return nextTools === current.tools && nextTokenomics === current.tokenomics
+        ? current
+        : {
+            tools: nextTools,
+            tokenomics: nextTokenomics,
+          };
+    });
+  }, [tokenomicsTabActive, toolsTabActive]);
   const [spaceMode, setSpaceMode] = useState(getForgeSpaceMode);
   const loopspacesModeActive = spaceMode === "loopspaces";
   useEffect(() => {
@@ -21378,13 +21462,10 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           />
         </WorkspaceToolSurface>
       )}
-      {/* Restored pre-optimization behavior: only the ACTIVE tool tab is
-          mounted. The keep-alive variant left hidden surfaces subscribed to
-          live stores (tokenomics scans, agent accounts), re-rendering behind
-          [hidden] at event rate for every keep-alive workspace runtime. */}
-      {activeWorkspaceTool === "tools" ? (
-        <WorkspaceToolSurface data-tool="tools">
+      {toolsTabMounted ? (
+        <WorkspaceToolSurface data-tool="tools" hidden={!toolsTabActive}>
           <WorkspaceToolsDragPanel
+            active={toolsTabActive}
             coordinationTargets={coordinationTargets}
             documentPanelEnabled={documentPanelEnabled}
             onOpenDocumentPanel={onOpenDocumentPanel}
@@ -21547,7 +21628,11 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
                 {appControlAgentTerminals.map((terminal, terminalOrderIndex) => (
                   <Fragment key={terminal.paneId}>
                     {terminalOrderIndex > 0 && (
-                      <ResizeHandle data-direction="vertical" />
+                      <ResizeHandle
+                        data-direction="vertical"
+                        onPointerDown={handleGridSeparatorPointerDown}
+                        title="Drag to resize · Double-click to reset"
+                      />
                     )}
                     <ResizePanel
                       data-app-control-agent-dragging={
@@ -22529,10 +22614,11 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
             ) : null}
           </OrchestratorContent>
         </OrchestratorView>
-      {activeWorkspaceTool === "tokenomics" ? (
-        <WorkspaceToolSurface data-tool="tokenomics">
+      {tokenomicsTabMounted ? (
+        <WorkspaceToolSurface data-tool="tokenomics" hidden={!tokenomicsTabActive}>
           <AccountTokenomicsView
             accountKey={accountKey}
+            active={tokenomicsTabActive}
             billingStatus={billingStatus}
             storageUsage={storageUsage}
           />
@@ -22575,6 +22661,7 @@ function WorkspacePcbGridPane({
   const [deleteRequestNonce, setDeleteRequestNonce] = useState(0);
   const [refreshRequestNonce, setRefreshRequestNonce] = useState(0);
   const [agentPromptOpen, setAgentPromptOpen] = useState(false);
+  const [elementPicker, setElementPicker] = useState(null);
   const boardTitle = board?.name || "PCB";
   const splitTitle = paneLimitReached ? "Panel limit reached" : "Split PCB panel";
 
@@ -22591,7 +22678,14 @@ function WorkspacePcbGridPane({
   }, []);
 
   const handleBoardChange = useCallback((nextBoard) => {
-    setBoard(nextBoard);
+    setBoard((previous) => (
+      previous === nextBoard
+      || (previous && nextBoard
+        && previous.path === nextBoard.path
+        && previous.name === nextBoard.name)
+        ? previous
+        : nextBoard
+    ));
     onBoardChange?.(nextBoard);
   }, [onBoardChange]);
 
@@ -22599,7 +22693,15 @@ function WorkspacePcbGridPane({
     if (!poppedOut || breakoutBoard === undefined) {
       return;
     }
-    setBoard(breakoutBoard || null);
+    setBoard((previous) => {
+      const nextBoard = breakoutBoard || null;
+      return previous === nextBoard
+        || (previous && nextBoard
+          && previous.path === nextBoard.path
+          && previous.name === nextBoard.name)
+        ? previous
+        : nextBoard;
+    });
   }, [breakoutBoard, poppedOut]);
 
   return (
@@ -22639,6 +22741,20 @@ function WorkspacePcbGridPane({
           >
             <ButtonBotIcon aria-hidden="true" />
           </TerminalRestartButton>
+          {agentPromptOpen && elementPicker ? (
+            <TerminalRestartButton
+              aria-label="Select board element"
+              aria-pressed={elementPicker.enabled || elementPicker.count ? "true" : "false"}
+              data-active={elementPicker.enabled || elementPicker.count ? "true" : undefined}
+              onClick={elementPicker.toggle}
+              title={elementPicker.count
+                ? `Select board element (${elementPicker.count} held)`
+                : "Select board element"}
+              type="button"
+            >
+              <AdsClick aria-hidden="true" />
+            </TerminalRestartButton>
+          ) : null}
           <TerminalRestartButton
             aria-label="New or switch PCB board"
             disabled={!repoPath}
@@ -22742,6 +22858,7 @@ function WorkspacePcbGridPane({
           externalBoard={poppedOut ? breakoutBoard : undefined}
           isActive={isActive && !poppedOut}
           onBoardChange={handleBoardChange}
+          onElementPickerChange={setElementPicker}
           paneId={paneId}
           refreshRequestNonce={refreshRequestNonce}
           repoPath={repoPath}
@@ -22763,7 +22880,9 @@ function WorkspacePcbGridPane({
         {agentPromptOpen ? (
           <PanelAgentPromptComposer
             autoFocus
+            contextRefs={elementPicker?.contexts || []}
             defaultSelectedTargetIds={defaultPanelAgentPromptTargetIds}
+            onClearContext={elementPicker?.clear}
             onClose={() => setAgentPromptOpen(false)}
             onSubmit={onSubmitPanelAgentPrompt}
             panelKind="pcb"
@@ -23349,6 +23468,27 @@ function TerminalView({
   const [todoQueueItems, setTodoQueueItems] = useState([]);
   const [todoQueuePendingItems, setTodoQueuePendingItems] = useState({});
   const [panelAgentPromptActivityItems, setPanelAgentPromptActivityItems] = useState([]);
+  const panelAgentPromptActivityItemsByPanel = useMemo(() => {
+    if (!panelAgentPromptActivityItems.length) {
+      return null;
+    }
+    const groupedItems = new Map();
+    panelAgentPromptActivityItems.forEach((item) => {
+      const paneId = String(item.panelPaneId || "").trim();
+      const panelKind = String(item.panelKind || "").trim();
+      if (!paneId || !panelKind) {
+        return;
+      }
+      const key = `${panelKind}:${paneId}`;
+      const items = groupedItems.get(key);
+      if (items) {
+        items.push(item);
+      } else {
+        groupedItems.set(key, [item]);
+      }
+    });
+    return groupedItems;
+  }, [panelAgentPromptActivityItems]);
   const panelAgentPromptActivityPaneIdsRef = useRef(new Set());
   const panelAgentPromptActivityTimersRef = useRef(new Map());
   const [todoQueueDispatchRevision, setTodoQueueDispatchRevision] = useState(0);
@@ -29491,9 +29631,21 @@ function TerminalView({
       ));
     }
     setPcbPaneBoards((current) => {
+      // Bail on no-op updates: this setter runs from child notify effects, so
+      // unconditionally returning a new object re-renders → re-notifies → loops.
+      const existing = current[safePaneId] || null;
+      const nextBoard = board || null;
+      if (
+        existing === nextBoard
+        || (existing && nextBoard
+          && existing.path === nextBoard.path
+          && existing.name === nextBoard.name)
+      ) {
+        return current;
+      }
       const next = { ...current };
-      if (board) {
-        next[safePaneId] = board;
+      if (nextBoard) {
+        next[safePaneId] = nextBoard;
       } else {
         delete next[safePaneId];
       }
@@ -29517,6 +29669,10 @@ function TerminalView({
       ));
     }
     setVideoPaneProjects((current) => {
+      // Bail on no-op updates (same notify-loop hazard as recordPcbPaneBoard).
+      if ((current[safePaneId] || null) === (project || null)) {
+        return current;
+      }
       const next = { ...current };
       if (project) {
         next[safePaneId] = project;
@@ -38193,6 +38349,8 @@ function TerminalView({
     ]);
   }, []);
 
+  const handleGridSeparatorPointerDown = useTerminalGridSeparatorDragGate();
+
   const updateTerminalDragState = useCallback((updater) => {
     setTerminalDragState((currentState) => {
       const nextState = typeof updater === "function" ? updater(currentState) : updater;
@@ -38214,6 +38372,187 @@ function TerminalView({
     document.body.style.cursor = initialDragState?.resizeCursor || "grabbing";
     document.body.style.userSelect = "none";
 
+    let gridDragMoveFrame = 0;
+    let pendingGridDragMove = null;
+    let canvasEdgeScrollFrame = 0;
+    let lastCanvasPointer = null;
+
+    const applyCanvasDragMove = (clientX, clientY) => {
+      const currentDrag = terminalDragStateRef.current;
+      if (!currentDrag || currentDrag.mode !== "canvas") {
+        return;
+      }
+
+      const containerRect = currentDrag.containerRect
+        || getPlainDomRect(terminalPanelsRef.current?.getBoundingClientRect?.());
+      const currentPlacement = normalizeBreakoutPlacement(
+        terminalBreakoutPlacementsRef.current?.[currentDrag.terminalIndex],
+      );
+      if (!containerRect || !currentPlacement) {
+        return;
+      }
+
+      const viewport = terminalBreakoutViewportRef.current;
+      const normalizedViewport = normalizeBreakoutViewport(viewport);
+      const zoom = Math.max(0.001, normalizedViewport.zoom);
+      const terminalScale = clampBreakoutTerminalScale(terminalBreakoutTerminalScaleRef.current);
+      const effectiveScale = Math.max(0.001, zoom * terminalScale);
+      const nextPlacement = {
+        ...currentPlacement,
+        x: (
+          clientX
+          - containerRect.left
+          - normalizedViewport.x
+          - (currentDrag.offsetX * effectiveScale)
+        ) / zoom,
+        y: (
+          clientY
+          - containerRect.top
+          - normalizedViewport.y
+          - (currentDrag.offsetY * effectiveScale)
+        ) / zoom,
+      };
+
+      scheduleTerminalBreakoutPlacementsFrame({
+        ...terminalBreakoutPlacementsRef.current,
+        [currentDrag.terminalIndex]: nextPlacement,
+      });
+    };
+
+    const stopCanvasEdgeScroll = () => {
+      if (canvasEdgeScrollFrame) {
+        window.cancelAnimationFrame(canvasEdgeScrollFrame);
+        canvasEdgeScrollFrame = 0;
+      }
+      lastCanvasPointer = null;
+    };
+
+    const canvasEdgeScrollStep = () => {
+      canvasEdgeScrollFrame = 0;
+      const currentDrag = terminalDragStateRef.current;
+      if (!currentDrag || currentDrag.mode !== "canvas" || !lastCanvasPointer) {
+        return;
+      }
+
+      const containerRect = currentDrag.containerRect
+        || getPlainDomRect(terminalPanelsRef.current?.getBoundingClientRect?.());
+      if (!containerRect) {
+        return;
+      }
+
+      const stepX = terminalBreakoutEdgeScrollStepPx(
+        lastCanvasPointer.clientX,
+        containerRect.left,
+        containerRect.right,
+      );
+      const stepY = terminalBreakoutEdgeScrollStepPx(
+        lastCanvasPointer.clientY,
+        containerRect.top,
+        containerRect.bottom,
+      );
+      if (!stepX && !stepY) {
+        return;
+      }
+
+      scheduleTerminalBreakoutViewportFrame((viewport) => ({
+        ...viewport,
+        x: (viewport.x || 0) - stepX,
+        y: (viewport.y || 0) - stepY,
+      }));
+      // Re-anchor the dragged window to the (stationary) cursor in the
+      // freshly panned viewport.
+      applyCanvasDragMove(lastCanvasPointer.clientX, lastCanvasPointer.clientY);
+      canvasEdgeScrollFrame = window.requestAnimationFrame(canvasEdgeScrollStep);
+    };
+
+    const applyGridDragMove = (clientX, clientY) => {
+      const currentDrag = terminalDragStateRef.current;
+      if (!currentDrag || currentDrag.mode === "canvas" || currentDrag.mode === "canvas-resize") {
+        return;
+      }
+
+      const containerRect = currentDrag.containerRect
+        || getPlainDomRect(terminalPanelsRef.current?.getBoundingClientRect?.());
+      if (!containerRect) {
+        return;
+      }
+
+      const layoutRects = {
+        ...terminalLayoutRectsRef.current,
+        ...(terminalDocumentPanelRectRef.current
+          ? { [TERMINAL_DOCUMENT_PANEL_ID]: terminalDocumentPanelRectRef.current }
+          : {}),
+      };
+      const target = getDragTargetFromPoint({
+        clientX,
+        clientY,
+        containerRect,
+        draggedTerminalIndex: currentDrag.terminalIndex,
+        includeDocumentPanel: workspaceDocumentPanelAvailableRef.current,
+        rects: layoutRects,
+        rows: currentDrag.previewRows,
+      });
+      const nextPreviewRows = insertTerminalInRows(
+        currentDrag.previewRows,
+        currentDrag.terminalIndex,
+        target,
+        {
+          allowDocumentPanel: workspaceDocumentPanelAvailableRef.current,
+          terminalIndexes: logicalTerminalIndexesRef.current,
+        },
+      );
+      const rowCompareOptions = {
+        allowDocumentPanel: workspaceDocumentPanelAvailableRef.current,
+        terminalIndexes: logicalTerminalIndexesRef.current,
+      };
+      const structuralChange = !areTerminalRowsEqual(currentDrag.previewRows, nextPreviewRows, rowCompareOptions);
+      const lastStructuralChange = currentDrag.lastStructuralChange || null;
+      const structuralDistance = lastStructuralChange
+        ? Math.hypot(
+          Number(clientX || 0) - Number(lastStructuralChange.x || 0),
+          Number(clientY || 0) - Number(lastStructuralChange.y || 0),
+        )
+        : Infinity;
+      const acceptStructuralChange = structuralChange
+        && (!lastStructuralChange || structuralDistance >= TERMINAL_GRID_DRAG_STRUCTURAL_HYSTERESIS_PX);
+      const previewRows = acceptStructuralChange ? nextPreviewRows : currentDrag.previewRows;
+
+      const nextDragState = {
+        ...currentDrag,
+        lastStructuralChange: acceptStructuralChange
+          ? { x: clientX, y: clientY }
+          : lastStructuralChange,
+        previewRows,
+        x: clientX - containerRect.left - currentDrag.offsetX,
+        y: clientY - containerRect.top - currentDrag.offsetY,
+      };
+      // Commit-time flushes read the ref synchronously, before React runs the
+      // state updater.
+      terminalDragStateRef.current = nextDragState;
+      updateTerminalDragState(nextDragState);
+    };
+
+    const flushGridDragMove = () => {
+      gridDragMoveFrame = 0;
+      const pending = pendingGridDragMove;
+      pendingGridDragMove = null;
+      if (pending) {
+        applyGridDragMove(pending.clientX, pending.clientY);
+      }
+    };
+
+    const settleGridDragMove = () => {
+      if (gridDragMoveFrame) {
+        window.cancelAnimationFrame(gridDragMoveFrame);
+        gridDragMoveFrame = 0;
+      }
+      const pending = pendingGridDragMove;
+      pendingGridDragMove = null;
+      if (pending) {
+        applyGridDragMove(pending.clientX, pending.clientY);
+      }
+    };
+
     const handlePointerMove = (event) => {
       const currentDrag = terminalDragStateRef.current;
       if (!currentDrag || event.pointerId !== currentDrag.pointerId) {
@@ -38226,40 +38565,13 @@ function TerminalView({
       }
 
       if (currentDrag.mode === "canvas") {
-        const containerRect = currentDrag.containerRect
-          || getPlainDomRect(terminalPanelsRef.current?.getBoundingClientRect?.());
-        const currentPlacement = normalizeBreakoutPlacement(
-          terminalBreakoutPlacementsRef.current?.[currentDrag.terminalIndex],
-        );
-        if (!containerRect || !currentPlacement) {
-          return;
+        lastCanvasPointer = { clientX: event.clientX, clientY: event.clientY };
+        applyCanvasDragMove(event.clientX, event.clientY);
+        // The step loop self-terminates outside the edge zones and keeps
+        // panning while the cursor parks against an edge.
+        if (!canvasEdgeScrollFrame) {
+          canvasEdgeScrollFrame = window.requestAnimationFrame(canvasEdgeScrollStep);
         }
-
-        const viewport = terminalBreakoutViewportRef.current;
-        const normalizedViewport = normalizeBreakoutViewport(viewport);
-        const zoom = Math.max(0.001, normalizedViewport.zoom);
-        const terminalScale = clampBreakoutTerminalScale(terminalBreakoutTerminalScaleRef.current);
-        const effectiveScale = Math.max(0.001, zoom * terminalScale);
-        const nextPlacement = {
-          ...currentPlacement,
-          x: (
-            event.clientX
-            - containerRect.left
-            - normalizedViewport.x
-            - (currentDrag.offsetX * effectiveScale)
-          ) / zoom,
-          y: (
-            event.clientY
-            - containerRect.top
-            - normalizedViewport.y
-            - (currentDrag.offsetY * effectiveScale)
-          ) / zoom,
-        };
-
-        scheduleTerminalBreakoutPlacementsFrame({
-          ...terminalBreakoutPlacementsRef.current,
-          [currentDrag.terminalIndex]: nextPlacement,
-        });
         return;
       }
 
@@ -38319,65 +38631,18 @@ function TerminalView({
         return;
       }
 
-      const containerRect = currentDrag.containerRect
-        || getPlainDomRect(terminalPanelsRef.current?.getBoundingClientRect?.());
-      if (!containerRect) {
-        return;
+      // Grid pane drags coalesce to one preview recompute per frame; pointer
+      // events can arrive faster than the display refreshes, and running
+      // insertTerminalInRows + a React commit per event is what makes large
+      // grids stutter mid-drag.
+      pendingGridDragMove = { clientX: event.clientX, clientY: event.clientY };
+      if (!gridDragMoveFrame) {
+        gridDragMoveFrame = window.requestAnimationFrame(flushGridDragMove);
       }
-
-      const layoutRects = {
-        ...terminalLayoutRectsRef.current,
-        ...(terminalDocumentPanelRectRef.current
-          ? { [TERMINAL_DOCUMENT_PANEL_ID]: terminalDocumentPanelRectRef.current }
-          : {}),
-      };
-      const target = getDragTargetFromPoint({
-        clientX: event.clientX,
-        clientY: event.clientY,
-        containerRect,
-        draggedTerminalIndex: currentDrag.terminalIndex,
-        includeDocumentPanel: workspaceDocumentPanelAvailableRef.current,
-        rects: layoutRects,
-        rows: currentDrag.previewRows,
-      });
-      const nextPreviewRows = insertTerminalInRows(
-        currentDrag.previewRows,
-        currentDrag.terminalIndex,
-        target,
-        {
-          allowDocumentPanel: workspaceDocumentPanelAvailableRef.current,
-          terminalIndexes: logicalTerminalIndexesRef.current,
-        },
-      );
-      const rowCompareOptions = {
-        allowDocumentPanel: workspaceDocumentPanelAvailableRef.current,
-        terminalIndexes: logicalTerminalIndexesRef.current,
-      };
-      const structuralChange = !areTerminalRowsEqual(currentDrag.previewRows, nextPreviewRows, rowCompareOptions);
-      const lastStructuralChange = currentDrag.lastStructuralChange || null;
-      const structuralDistance = lastStructuralChange
-        ? Math.hypot(
-          Number(event.clientX || 0) - Number(lastStructuralChange.x || 0),
-          Number(event.clientY || 0) - Number(lastStructuralChange.y || 0),
-        )
-        : Infinity;
-      const acceptStructuralChange = structuralChange
-        && (!lastStructuralChange || structuralDistance >= TERMINAL_GRID_DRAG_STRUCTURAL_HYSTERESIS_PX);
-      const previewRows = acceptStructuralChange ? nextPreviewRows : currentDrag.previewRows;
-
-      updateTerminalDragState({
-        ...currentDrag,
-        lastStructuralChange: acceptStructuralChange
-          ? { x: event.clientX, y: event.clientY }
-          : lastStructuralChange,
-        previewRows,
-        x: event.clientX - containerRect.left - currentDrag.offsetX,
-        y: event.clientY - containerRect.top - currentDrag.offsetY,
-      });
     };
 
     const commitDrag = () => {
-      const currentDrag = terminalDragStateRef.current;
+      let currentDrag = terminalDragStateRef.current;
       if (!currentDrag) {
         return;
       }
@@ -38385,6 +38650,14 @@ function TerminalView({
       if (currentDrag.mode === "canvas" || currentDrag.mode === "canvas-resize") {
         updateTerminalDragState(null);
         stopTerminalDragListeners();
+        return;
+      }
+
+      // Apply any pointer movement still waiting on the next frame so the
+      // drop lands where the cursor actually is.
+      settleGridDragMove();
+      currentDrag = terminalDragStateRef.current;
+      if (!currentDrag) {
         return;
       }
 
@@ -38414,6 +38687,12 @@ function TerminalView({
     };
 
     const cancelDrag = () => {
+      if (gridDragMoveFrame) {
+        window.cancelAnimationFrame(gridDragMoveFrame);
+        gridDragMoveFrame = 0;
+      }
+      pendingGridDragMove = null;
+      stopCanvasEdgeScroll();
       updateTerminalDragState(null);
       stopTerminalDragListeners();
     };
@@ -38444,6 +38723,12 @@ function TerminalView({
     window.addEventListener("pointerup", handlePointerUp, { capture: true, passive: false });
     window.addEventListener("pointercancel", handlePointerCancel, { capture: true });
     terminalDragCleanupRef.current = () => {
+      if (gridDragMoveFrame) {
+        window.cancelAnimationFrame(gridDragMoveFrame);
+        gridDragMoveFrame = 0;
+      }
+      pendingGridDragMove = null;
+      stopCanvasEdgeScroll();
       document.body.style.cursor = previousCursor;
       document.body.style.userSelect = previousUserSelect;
       window.removeEventListener("pointermove", handlePointerMove, true);
@@ -38454,6 +38739,7 @@ function TerminalView({
     activateTerminalTabInRows,
     reorderWorkspaceTerminalDisplayLayout,
     scheduleTerminalBreakoutPlacementsFrame,
+    scheduleTerminalBreakoutViewportFrame,
     stopTerminalDragListeners,
     updateTerminalDragState,
   ]);
@@ -39840,6 +40126,8 @@ function TerminalView({
                   {rowOrderIndex > 0 && (
                     <ResizeHandle
                       data-direction="vertical"
+                      onPointerDown={handleGridSeparatorPointerDown}
+                      title="Drag to resize · Double-click to reset"
                     />
                   )}
                   <ResizePanel
@@ -39864,6 +40152,8 @@ function TerminalView({
                             {columnOrderIndex > 0 && (
                               <ResizeHandle
                                 data-direction="horizontal"
+                                onPointerDown={handleGridSeparatorPointerDown}
+                                title="Drag to resize · Double-click to reset"
                               />
                             )}
                             <ResizePanel
@@ -40121,10 +40411,10 @@ function TerminalView({
                   onNavigate={(url) => rememberWebPaneUrl(terminalPaneId, url)}
                   onDismissPanelAgentPromptActivityItem={removePanelAgentPromptActivityItems}
                   onSubmitPanelAgentPrompt={submitPanelAgentPrompt}
-                  panelAgentPromptActivityItems={panelAgentPromptActivityItems.filter((item) => (
-                    String(item.panelPaneId || "").trim() === terminalPaneId
-                    && String(item.panelKind || "").trim() === "web"
-                  ))}
+                  panelAgentPromptActivityItems={
+                    panelAgentPromptActivityItemsByPanel?.get(`web:${terminalPaneId}`)
+                    || EMPTY_PANEL_AGENT_PROMPT_ACTIVITY_ITEMS
+                  }
                   panelAgentPromptTargets={panelAgentPromptTargets}
                   controlCommand={webPaneCommands[terminalPaneId] || null}
                 />
@@ -40189,10 +40479,10 @@ function TerminalView({
                   onToggleFullscreen={(index, pid) => handleToggleFullscreenTerminal({ paneId: pid, terminalIndex: index })}
                   paneId={terminalPaneId}
                   paneLimitReached={terminalPaneLimitReached}
-                  panelAgentPromptActivityItems={panelAgentPromptActivityItems.filter((item) => (
-                    String(item.panelPaneId || "").trim() === terminalPaneId
-                    && String(item.panelKind || "").trim() === "pcb"
-                  ))}
+                  panelAgentPromptActivityItems={
+                    panelAgentPromptActivityItemsByPanel?.get(`pcb:${terminalPaneId}`)
+                    || EMPTY_PANEL_AGENT_PROMPT_ACTIVITY_ITEMS
+                  }
                   panelAgentPromptTargets={panelAgentPromptTargets}
                   poppedOut={Boolean(pcbBreakoutPanes[terminalPaneId])}
                   repoPath={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || ""}
@@ -40277,10 +40567,10 @@ function TerminalView({
                   onToggleFullscreen={(index, pid) => handleToggleFullscreenTerminal({ paneId: pid, terminalIndex: index })}
                   paneId={terminalPaneId}
                   paneLimitReached={terminalPaneLimitReached}
-                  panelAgentPromptActivityItems={panelAgentPromptActivityItems.filter((item) => (
-                    String(item.panelPaneId || "").trim() === terminalPaneId
-                    && String(item.panelKind || "").trim() === "video"
-                  ))}
+                  panelAgentPromptActivityItems={
+                    panelAgentPromptActivityItemsByPanel?.get(`video:${terminalPaneId}`)
+                    || EMPTY_PANEL_AGENT_PROMPT_ACTIVITY_ITEMS
+                  }
                   panelAgentPromptTargets={panelAgentPromptTargets}
                   poppedOut={Boolean(videoBreakoutPanes[terminalPaneId])}
                   repoPath={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || ""}

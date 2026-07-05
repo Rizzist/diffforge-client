@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { memo, useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import { Architecture } from "@styled-icons/material-rounded/Architecture";
 import { Article } from "@styled-icons/material-rounded/Article";
 import { OpenInNew } from "@styled-icons/material-rounded/OpenInNew";
@@ -156,7 +156,10 @@ function docDragPayload(entry, sendOnDrop) {
  * Drag-and-drop sources for account docs. Cards can be dragged into terminals
  * or other tool-aware drop zones; send-on-drop controls terminal dispatch.
  */
-export default function WorkspaceToolsDragPanel({
+const noopWorkspaceToolsSubscribe = () => {};
+
+const WorkspaceToolsDragPanel = memo(function WorkspaceToolsDragPanel({
+  active = true,
   coordinationTargets = [],
   documentPanelEnabled = false,
   onOpenDocumentPanel = null,
@@ -173,11 +176,23 @@ export default function WorkspaceToolsDragPanel({
     () => workspaceToolsRepoDescriptors(coordinationTargets, rootDirectory),
     [coordinationTargets, rootDirectory],
   );
-  const storeVersion = useSyncExternalStore(subscribeWorkspaceTools, getWorkspaceToolsVersion);
+  const subscribeWorkspaceToolsWhenActive = useCallback((onStoreChange) => (
+    active ? subscribeWorkspaceTools(onStoreChange) : noopWorkspaceToolsSubscribe
+  ), [active]);
+  const getWorkspaceToolsSnapshot = useCallback(() => (
+    active ? getWorkspaceToolsVersion() : 0
+  ), [active]);
+  const storeVersion = useSyncExternalStore(
+    subscribeWorkspaceToolsWhenActive,
+    getWorkspaceToolsSnapshot,
+  );
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     ensureWorkspaceToolsFresh(repoDescriptors);
-  }, [repoDescriptors]);
+  }, [active, repoDescriptors]);
 
   const docs = useMemo(
     () => getWorkspaceToolsAccountSkills()
@@ -326,7 +341,9 @@ export default function WorkspaceToolsDragPanel({
       </ItemsScroll>
     </Panel>
   );
-}
+});
+
+export default WorkspaceToolsDragPanel;
 
 const Panel = styled.div`
   display: grid;

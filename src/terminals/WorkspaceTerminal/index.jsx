@@ -1151,8 +1151,12 @@ const TERMINAL_THREAD_PROMPT_ECHO_READY_SUPPRESS_MS = 2500;
 const TERMINAL_THREAD_PROMPT_ECHO_MIN_SUPPRESS_MS = 600;
 const TERMINAL_PARKED_PROMPT_BLOCKING_STATUSES = new Set(["parked", "resume_ready", "resume_requested"]);
 const TERMINAL_WEBGL_LRU_CAP = 12;
+const TERMINAL_RENDERER_ATTACH_MAX_PER_FRAME = 2;
 const terminalWebglAddonRegistry = new Map();
 let terminalWebglAddonRegistrySequence = 0;
+const terminalRendererAttachQueue = [];
+let terminalRendererAttachFrameScheduled = false;
+let terminalRendererAttachFrameRemaining = TERMINAL_RENDERER_ATTACH_MAX_PER_FRAME;
 const SHELL_LAUNCHER_MODE_TERMINAL = "generic";
 const SHELL_LAUNCHER_AGENT_OPTIONS = Object.freeze([
   { id: SHELL_LAUNCHER_MODE_TERMINAL, label: "Terminal", command: "" },
@@ -1162,6 +1166,58 @@ const SHELL_LAUNCHER_AGENT_OPTIONS = Object.freeze([
 ]);
 const SHELL_LAUNCHER_AGENT_IDS = new Set(SHELL_LAUNCHER_AGENT_OPTIONS.map((option) => option.id));
 const SHELL_LAUNCHER_AGENT_COMMAND_DELAY_MS = 950;
+
+function requestTerminalRendererAttachFrame(callback) {
+  if (typeof window !== "undefined" && typeof window.requestAnimationFrame === "function") {
+    window.requestAnimationFrame(callback);
+    return;
+  }
+
+  setTimeout(callback, 16);
+}
+
+function scheduleTerminalRendererAttachFrame() {
+  if (terminalRendererAttachFrameScheduled) {
+    return;
+  }
+
+  terminalRendererAttachFrameScheduled = true;
+  requestTerminalRendererAttachFrame(() => {
+    terminalRendererAttachFrameScheduled = false;
+    terminalRendererAttachFrameRemaining = TERMINAL_RENDERER_ATTACH_MAX_PER_FRAME;
+    flushTerminalRendererAttachQueue();
+  });
+}
+
+function flushTerminalRendererAttachQueue() {
+  while (
+    terminalRendererAttachFrameRemaining > 0
+    && terminalRendererAttachQueue.length > 0
+  ) {
+    terminalRendererAttachFrameRemaining -= 1;
+    terminalRendererAttachQueue.shift()?.();
+  }
+
+  if (terminalRendererAttachQueue.length > 0) {
+    scheduleTerminalRendererAttachFrame();
+  }
+}
+
+function waitForTerminalRendererAttachTurn() {
+  if (
+    terminalRendererAttachQueue.length === 0
+    && terminalRendererAttachFrameRemaining > 0
+  ) {
+    terminalRendererAttachFrameRemaining -= 1;
+    scheduleTerminalRendererAttachFrame();
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    terminalRendererAttachQueue.push(resolve);
+    scheduleTerminalRendererAttachFrame();
+  });
+}
 
 function removeTerminalWebglRegistryEntry(registryKey, addon = null) {
   const key = String(registryKey || "");
@@ -6424,7 +6480,7 @@ function WorkspaceTerminal({
           && containerWidth >= 1,
       };
     };
-    const openTerminalRenderer = (reason, fields = {}) => {
+    const openTerminalRenderer = async (reason, fields = {}) => {
       if (terminalRendererOpened) {
         return true;
       }
@@ -6433,7 +6489,22 @@ function WorkspaceTerminal({
         return false;
       }
 
-      const measurement = getTerminalOpenContainerMeasurement();
+      let measurement = getTerminalOpenContainerMeasurement();
+      if (!measurement.ok) {
+        return false;
+      }
+
+      await waitForTerminalRendererAttachTurn();
+
+      if (terminalRendererOpened) {
+        return true;
+      }
+
+      if (isDisposed) {
+        return false;
+      }
+
+      measurement = getTerminalOpenContainerMeasurement();
       if (!measurement.ok) {
         return false;
       }
@@ -6517,7 +6588,7 @@ function WorkspaceTerminal({
       return true;
     };
     const waitForTerminalRendererOpen = async (reason) => {
-      if (openTerminalRenderer(reason, { attempts: 1, waitMs: 0 })) {
+      if (await openTerminalRenderer(reason, { attempts: 1, waitMs: 0 })) {
         return true;
       }
 
@@ -6547,7 +6618,7 @@ function WorkspaceTerminal({
         attempts += 1;
         const attemptedAt = performance.now();
         if (
-          openTerminalRenderer(reason, {
+          await openTerminalRenderer(reason, {
             attempts,
             waitMs: attemptedAt - waitStartedAt,
           })

@@ -1273,15 +1273,52 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
                 }
             }
 
+            // Only credential files matter for capture. The watched CLI home
+            // dirs (~/.claude, ~/.codex, opencode data home) also churn with
+            // agent session/history writes many times a minute; re-running a
+            // full identity/capture pass (which re-reads and re-parses large
+            // state files) on every unrelated write produced ~15s CPU spikes
+            // whenever any agent was active.
+            let event_is_credential_related = |event: &notify::Event| {
+                event.paths.iter().any(|path| {
+                    matches!(
+                        path.file_name().and_then(|name| name.to_str()),
+                        Some(".credentials.json" | "auth.json" | ".claude.json")
+                    )
+                })
+            };
+            const EVENT_CAPTURE_MIN_GAP_SECS: u64 = 30;
+            let mut last_event_capture = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(EVENT_CAPTURE_MIN_GAP_SECS))
+                .unwrap_or_else(std::time::Instant::now);
             loop {
                 match rx.recv_timeout(std::time::Duration::from_secs(300)) {
-                    Ok(_) => {
+                    Ok(event) => {
                         // A login writes several files in a burst; drain the
                         // burst (quiet for 400ms) and capture once.
-                        while rx
-                            .recv_timeout(std::time::Duration::from_millis(400))
-                            .is_ok()
-                        {}
+                        let mut relevant = event
+                            .as_ref()
+                            .map(&event_is_credential_related)
+                            .unwrap_or(false);
+                        while let Ok(next_event) =
+                            rx.recv_timeout(std::time::Duration::from_millis(400))
+                        {
+                            relevant = relevant
+                                || next_event
+                                    .as_ref()
+                                    .map(&event_is_credential_related)
+                                    .unwrap_or(false);
+                        }
+                        if !relevant {
+                            continue;
+                        }
+                        if last_event_capture.elapsed()
+                            < std::time::Duration::from_secs(EVENT_CAPTURE_MIN_GAP_SECS)
+                        {
+                            // The 300s backstop still covers anything skipped.
+                            continue;
+                        }
+                        last_event_capture = std::time::Instant::now();
                         capture_all();
                     }
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => capture_all(),

@@ -1,3 +1,5 @@
+import { normalizePcbElementContexts } from "../pcb/pcbElementContext.js";
+
 export const PANEL_AGENT_PROMPT_TARGETS_REQUEST_EVENT = "diffforge:panel-agent-prompt-targets-request";
 export const PANEL_AGENT_PROMPT_TARGETS_EVENT = "diffforge:panel-agent-prompt-targets";
 export const PANEL_AGENT_PROMPT_SUBMIT_EVENT = "diffforge:panel-agent-prompt-submit";
@@ -28,6 +30,66 @@ function compactPanelAgentPromptMultilineText(value, maxLength = 1600) {
     return normalized;
   }
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
+}
+
+function clampPanelAgentPromptMultilineText(value, maxLength = 1600) {
+  const text = String(value || "").trim();
+  if (!text || text.length <= maxLength) {
+    return text;
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 1)).trimEnd()}...`;
+}
+
+function truncatePanelAgentPromptBlock(value, maxLength) {
+  const text = String(value || "").trim();
+  if (!text || text.length <= maxLength) {
+    return text;
+  }
+  if (maxLength <= 3) {
+    return text.slice(0, Math.max(0, maxLength));
+  }
+  return `${text.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+function clampPanelAgentPromptBlocks(blocks, maxLength = 1600) {
+  const cleanBlocks = blocks.map((block) => String(block || "").trim()).filter(Boolean);
+  if (!cleanBlocks.length) {
+    return "";
+  }
+  const separator = "\n\n";
+  const joined = cleanBlocks.join(separator);
+  if (joined.length <= maxLength) {
+    return joined;
+  }
+  const separatorBudget = separator.length * Math.max(0, cleanBlocks.length - 1);
+  let remaining = Math.max(cleanBlocks.length, maxLength - separatorBudget);
+  const budgets = Array(cleanBlocks.length).fill(0);
+  let pending = cleanBlocks.map((_block, index) => index);
+  while (pending.length) {
+    const share = Math.max(1, Math.floor(remaining / pending.length));
+    const nextPending = [];
+    for (const index of pending) {
+      if (cleanBlocks[index].length <= share) {
+        budgets[index] = cleanBlocks[index].length;
+        remaining -= budgets[index];
+      } else {
+        nextPending.push(index);
+      }
+    }
+    if (nextPending.length === pending.length) {
+      const base = Math.max(1, Math.floor(remaining / nextPending.length));
+      let extra = remaining - base * nextPending.length;
+      for (const index of nextPending) {
+        budgets[index] = base + (extra > 0 ? 1 : 0);
+        extra -= 1;
+      }
+      break;
+    }
+    pending = nextPending;
+  }
+  return cleanBlocks
+    .map((block, index) => truncatePanelAgentPromptBlock(block, budgets[index]))
+    .join(separator);
 }
 
 function panelAgentPromptNumber(value) {
@@ -128,13 +190,18 @@ export function normalizePanelAgentPromptContextRefs(value) {
       ? [value]
       : [];
   return values
-    .map((context) => normalizeWebElementContextRef(context))
+    .map((context) => {
+      const kind = String(context?.kind || context?.type || "").trim().toLowerCase();
+      if (kind === "pcb-element") {
+        return normalizePcbElementContexts([context])[0] || null;
+      }
+      return normalizeWebElementContextRef(context);
+    })
     .filter(Boolean)
     .slice(0, 3);
 }
 
-export function formatPanelAgentPromptContextNote(contextRefs) {
-  const contexts = normalizePanelAgentPromptContextRefs(contextRefs);
+function formatWebPanelAgentPromptContextNote(contexts) {
   if (!contexts.length) {
     return null;
   }
@@ -194,6 +261,77 @@ export function formatPanelAgentPromptContextNote(contextRefs) {
   return {
     title: contexts.length === 1 ? "Selected web element" : "Selected web elements",
     text: compactPanelAgentPromptMultilineText(lines.join("\n"), 1600),
+  };
+}
+
+function joinPanelAgentPromptParts(parts) {
+  return parts.map((part) => compactPanelAgentPromptText(part, 120)).filter(Boolean).join(" · ");
+}
+
+function formatPcbElementBlock(context) {
+  const lines = ["Selected PCB element context:"];
+  if (context.boardTitle || context.sourceAnchor?.path) {
+    const board = context.boardTitle && context.sourceAnchor?.path
+      ? `${context.boardTitle} (${context.sourceAnchor.path})`
+      : context.boardTitle || context.sourceAnchor?.path;
+    lines.push(`- board: ${board}`);
+  }
+  if (context.tab) {
+    lines.push(`- view: ${context.tab}`);
+  }
+  const element = joinPanelAgentPromptParts([
+    context.designator,
+    context.elementType,
+    context.footprint,
+    context.value,
+  ]);
+  if (element) {
+    lines.push(`- element: ${element}`);
+  } else if (context.label) {
+    lines.push(`- element: ${context.label}`);
+  }
+  if (context.position) {
+    const position = `(${context.position.xMm}, ${context.position.yMm}) mm`;
+    lines.push(`- position: ${position}${context.layer ? `, layer ${context.layer}` : ""}`);
+  }
+  if (context.pads?.length) {
+    lines.push(`- pads: ${context.pads.map((pad) => (
+      [pad.pin, pad.net].filter(Boolean).join(" → ")
+    )).filter(Boolean).join(", ")}`);
+  }
+  if (context.neighbors?.length) {
+    lines.push(`- connected: ${context.neighbors.join("; ")}`);
+  }
+  if (context.sourceAnchor?.path && context.sourceAnchor.line) {
+    lines.push(`- source: ${context.sourceAnchor.path}:${context.sourceAnchor.line}`);
+    if (context.sourceAnchor.snippet) {
+      lines.push(`  ${context.sourceAnchor.snippet.split(/\n/).join("\n  ")}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+export function formatPanelAgentPromptContextNote(contextRefs) {
+  const contexts = normalizePanelAgentPromptContextRefs(contextRefs);
+  if (!contexts.length) {
+    return null;
+  }
+  const webContexts = contexts.filter((context) => context.kind === "web-element");
+  const pcbContexts = contexts.filter((context) => context.kind === "pcb-element");
+  if (webContexts.length === contexts.length) {
+    return formatWebPanelAgentPromptContextNote(webContexts);
+  }
+  const blocks = contexts.map((context) => {
+    if (context.kind === "pcb-element") {
+      return formatPcbElementBlock(context);
+    }
+    return formatWebPanelAgentPromptContextNote([context])?.text || "";
+  }).filter(Boolean);
+  return {
+    title: pcbContexts.length && !webContexts.length
+      ? (pcbContexts.length === 1 ? "Selected PCB element" : "Selected PCB elements")
+      : "Selected panel contexts",
+    text: clampPanelAgentPromptBlocks(blocks, 1600),
   };
 }
 
