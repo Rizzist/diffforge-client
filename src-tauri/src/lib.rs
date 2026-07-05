@@ -2682,6 +2682,7 @@ include!("workspace_threads_store.rs");
 include!("architectures.rs");
 include!("pcb.rs");
 include!("video_editor.rs");
+include!("video_code.rs");
 include!("workspace_web.rs");
 include!("developer_processes.rs");
 include!("app_control_mcp.rs");
@@ -3654,6 +3655,7 @@ async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: Str
     );
     advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_STOPPING_WATCHERS);
     let _ = coordination::watcher::stop_all_file_watchers("app_close");
+    video_code_preview_stop_all();
     emit_app_shutdown_progress(
         &app_for_shutdown,
         "stopping_syncs",
@@ -7596,6 +7598,7 @@ pub fn run() {
             desktop_auth_set_active_scope,
             desktop_auth_apply_billing_status,
             desktop_auth_sign_out,
+            desktop_billing_start_topup_checkout,
             local_workspaces_load,
             local_workspaces_store,
             local_workspace_reusable_id_for_root,
@@ -7694,6 +7697,12 @@ pub fn run() {
             video_generate_start,
             video_generate_resume,
             video_generate_cancel,
+            video_generate_code_render,
+            video_code_tools_status,
+            video_code_tools_install,
+            video_code_tools_install_cancel,
+            video_code_preview_start,
+            video_code_preview_stop,
             video_jobs_list,
             video_generation_providers,
             video_lora_list,
@@ -7824,6 +7833,7 @@ pub fn run() {
             cloud_mcp_get_network_diagnostics,
             cloud_mcp_get_cached_workspace_todos,
             cloud_mcp_get_billing_status,
+            cloud_mcp_refresh_billing_status,
             cloud_mcp_register_workspace,
             cloud_mcp_sync_workspace,
             cloud_mcp_sync_agent_installations,

@@ -9,6 +9,7 @@ import {
 import {
   MAX_WORKSPACE_TERMINAL_COUNT,
   MIN_WORKSPACE_TERMINAL_COUNT,
+  DEFAULT_WORKSPACE_TERMINAL_COUNT,
   TERMINAL_AGENT_COLOR_SLOT_COUNT,
   TERMINAL_MAX_COLS,
   TERMINAL_MAX_ROWS,
@@ -89,11 +90,18 @@ function getSubmitSequenceDiagnosticFields(sequence) {
   };
 }
 
-export function normalizeWorkspaceTerminalCount(value) {
+export function normalizeWorkspaceTerminalCount(value, fallback = DEFAULT_WORKSPACE_TERMINAL_COUNT) {
   const count = Number.parseInt(value, 10);
 
   if (!Number.isFinite(count)) {
-    return MIN_WORKSPACE_TERMINAL_COUNT;
+    const fallbackCount = Number.parseInt(fallback, 10);
+    return Math.min(
+      MAX_WORKSPACE_TERMINAL_COUNT,
+      Math.max(
+        MIN_WORKSPACE_TERMINAL_COUNT,
+        Number.isFinite(fallbackCount) ? fallbackCount : DEFAULT_WORKSPACE_TERMINAL_COUNT,
+      ),
+    );
   }
 
   return Math.min(MAX_WORKSPACE_TERMINAL_COUNT, Math.max(MIN_WORKSPACE_TERMINAL_COUNT, count));
@@ -156,7 +164,7 @@ export function getTerminalPanelRows(terminalIndexes) {
   const indexes = Array.isArray(terminalIndexes)
     ? terminalIndexes
     : getDefaultTerminalIndexes(terminalIndexes);
-  const visibleIndexes = indexes.length ? indexes : getDefaultTerminalIndexes(MIN_WORKSPACE_TERMINAL_COUNT);
+  const visibleIndexes = indexes.length ? indexes : getDefaultTerminalIndexes(DEFAULT_WORKSPACE_TERMINAL_COUNT);
   const rowCount = Math.max(1, Math.ceil(visibleIndexes.length / 3));
   const baseRowSize = Math.floor(visibleIndexes.length / rowCount);
   const largerRowCount = visibleIndexes.length % rowCount;

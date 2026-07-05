@@ -3,6 +3,7 @@ export const VIDEO_TOOLS_INSTALL_PROGRESS_EVENT = "video-tools-install-progress"
 export const VIDEO_EXPORT_PROGRESS_EVENT = "video-export-progress";
 export const VIDEO_GENERATE_PROGRESS_EVENT = "video-generate-progress";
 export const VIDEO_LORA_PROGRESS_EVENT = "video-lora-progress";
+export const VIDEO_CODE_TOOLS_PROGRESS_EVENT = "video-code-tools-progress";
 export const VIDEO_TRANSCRIBE_PROGRESS_EVENT = "video-transcribe-progress";
 export const VIDEO_PANEL_CLOSED_EVENT = "video-panel-closed";
 export const VIDEO_PANEL_CONTROL_EVENT = "video-panel-control";

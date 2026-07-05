@@ -3051,7 +3051,7 @@ export const WorkspaceButton = styled.button`
     --workspace-card-hover-border: rgba(var(--forge-accent-rgb), 0.18);
   }
 
-  ${WorkspaceRow}[data-hovered="true"] &,
+  ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:has(:focus-visible) & {
     border-color: var(--workspace-card-hover-border);
     background: var(--workspace-card-hover-bg);
@@ -3088,7 +3088,7 @@ export const WorkspaceButton = styled.button`
     padding: 4px 8px 4px 7px;
     text-align: left;
 
-    ${WorkspaceRow}[data-hovered="true"] &,
+    ${WorkspaceRow}:hover &,
     ${WorkspaceRow}:has(:focus-visible) & {
       padding-right: 34px;
     }
@@ -3253,7 +3253,7 @@ export const WorkspaceNotificationBadge = styled.span`
     right 210ms cubic-bezier(0.2, 0.8, 0.2, 1),
     top 210ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
-  ${WorkspaceRow}[data-hovered="true"] &,
+  ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:has(:focus-visible) & {
     right: 36px;
   }
@@ -3295,7 +3295,7 @@ export const WorkspaceNotificationBadge = styled.span`
     padding: 0 5px;
     font-size: 9px;
 
-    ${WorkspaceRow}[data-hovered="true"] &,
+    ${WorkspaceRow}:hover &,
     ${WorkspaceRow}:has(:focus-visible) & {
       right: 36px;
     }
@@ -3349,7 +3349,7 @@ export const WorkspaceSettingsButton = styled.button`
     background: var(--forge-surface-control);
   }
 
-  ${WorkspaceRow}[data-hovered="true"] &,
+  ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 1;
     pointer-events: auto;
@@ -3357,7 +3357,7 @@ export const WorkspaceSettingsButton = styled.button`
   }
 
   ${WorkspaceRail}[data-collapsed="true"] &,
-  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}[data-hovered="true"] &,
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:hover &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 0;
     pointer-events: none;
@@ -3365,7 +3365,7 @@ export const WorkspaceSettingsButton = styled.button`
   }
 
   @media (max-width: 760px) {
-    ${WorkspaceRow}[data-hovered="true"] &,
+    ${WorkspaceRow}:hover &,
     ${WorkspaceRow}:has(:focus-visible) & {
       opacity: 1;
       pointer-events: auto;
@@ -3419,7 +3419,7 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
     background: var(--forge-surface);
   }
 
-  ${WorkspaceRow}[data-hovered="true"] &,
+  ${WorkspaceRow}:hover &,
   ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 1;
     pointer-events: auto;
@@ -3427,7 +3427,7 @@ export const WorkspaceLifecycleButton = styled(WorkspaceSettingsButton)`
   }
 
   ${WorkspaceRail}[data-collapsed="true"] &,
-  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}[data-hovered="true"] &,
+  ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:hover &,
   ${WorkspaceRail}[data-collapsed="true"] ${WorkspaceRow}:has(:focus-visible) & {
     opacity: 0;
     pointer-events: none;

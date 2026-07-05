@@ -3249,48 +3249,15 @@ fn cloud_mcp_tokenomics_sync_state(
     ))
 }
 
+#[allow(dead_code)]
 fn cloud_mcp_tokenomics_claim_device_seq(
     device_id: &str,
     billing_scope_key: &str,
 ) -> Result<u64, String> {
     let conn = cloud_mcp_open_outbox_conn()?;
-    let now = cloud_mcp_now_ms() as i64;
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("Unable to start Tokenomics sync-state transaction: {error}"))?;
-    let result = (|| -> Result<u64, String> {
-        conn.execute(
-            &format!(
-                "INSERT OR IGNORE INTO {CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE}(
-                    device_id, billing_scope_key, next_device_seq, updated_at_ms
-                 ) VALUES(?1, ?2, 1, ?3)"
-            ),
-            rusqlite::params![device_id, billing_scope_key, now],
-        )
-        .map_err(|error| format!("Unable to initialize Tokenomics sync state: {error}"))?;
-        let seq = conn
-            .query_row(
-                &format!(
-                    "SELECT next_device_seq
-                     FROM {CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE}
-                     WHERE device_id=?1 AND billing_scope_key=?2"
-                ),
-                rusqlite::params![device_id, billing_scope_key],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap_or(1)
-            .max(1) as u64;
-        let next_seq = seq.saturating_add(1).min(i64::MAX as u64) as i64;
-        conn.execute(
-            &format!(
-                "UPDATE {CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE}
-                 SET next_device_seq=?3, updated_at_ms=?4
-                 WHERE device_id=?1 AND billing_scope_key=?2"
-            ),
-            rusqlite::params![device_id, billing_scope_key, next_seq, now],
-        )
-        .map_err(|error| format!("Unable to advance Tokenomics device sequence: {error}"))?;
-        Ok(seq)
-    })();
+    let result = cloud_mcp_tokenomics_claim_device_seq_on_conn(&conn, device_id, billing_scope_key);
     match result {
         Ok(seq) => {
             conn.execute_batch("COMMIT")
@@ -3302,6 +3269,46 @@ fn cloud_mcp_tokenomics_claim_device_seq(
             Err(error)
         }
     }
+}
+
+fn cloud_mcp_tokenomics_claim_device_seq_on_conn(
+    conn: &rusqlite::Connection,
+    device_id: &str,
+    billing_scope_key: &str,
+) -> Result<u64, String> {
+    let now = cloud_mcp_now_ms() as i64;
+    conn.execute(
+        &format!(
+            "INSERT OR IGNORE INTO {CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE}(
+                device_id, billing_scope_key, next_device_seq, updated_at_ms
+             ) VALUES(?1, ?2, 1, ?3)"
+        ),
+        rusqlite::params![device_id, billing_scope_key, now],
+    )
+    .map_err(|error| format!("Unable to initialize Tokenomics sync state: {error}"))?;
+    let seq = conn
+        .query_row(
+            &format!(
+                "SELECT next_device_seq
+                 FROM {CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE}
+                 WHERE device_id=?1 AND billing_scope_key=?2"
+            ),
+            rusqlite::params![device_id, billing_scope_key],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(1)
+        .max(1) as u64;
+    let next_seq = seq.saturating_add(1).min(i64::MAX as u64) as i64;
+    conn.execute(
+        &format!(
+            "UPDATE {CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE}
+             SET next_device_seq=?3, updated_at_ms=?4
+             WHERE device_id=?1 AND billing_scope_key=?2"
+        ),
+        rusqlite::params![device_id, billing_scope_key, next_seq, now],
+    )
+    .map_err(|error| format!("Unable to advance Tokenomics device sequence: {error}"))?;
+    Ok(seq)
 }
 
 fn cloud_mcp_tokenomics_clear_sync_state(
@@ -3352,23 +3359,89 @@ fn cloud_mcp_tokenomics_day_sync_state_from_conn(
     .ok()
 }
 
-fn cloud_mcp_tokenomics_outbox_acked_at_for_idempotency(
+fn cloud_mcp_tokenomics_legacy_day_packet_idempotency_key(
+    billing_scope_key: &str,
+    device_id: &str,
+    day_key: &str,
+    content_hash: &str,
+) -> String {
+    format!("tokenomics:v4:{billing_scope_key}:{device_id}:day:{day_key}:{content_hash}")
+}
+
+fn cloud_mcp_tokenomics_day_packet_idempotency_prefix(
+    billing_scope_key: &str,
+    device_id: &str,
+    day_key: &str,
+    content_hash: &str,
+) -> String {
+    format!("tokenomics:v5:{billing_scope_key}:{device_id}:day:{day_key}:{content_hash}:seq:")
+}
+
+fn cloud_mcp_tokenomics_day_packet_idempotency_key(
+    billing_scope_key: &str,
+    device_id: &str,
+    day_key: &str,
+    content_hash: &str,
+    device_seq: u64,
+) -> String {
+    format!(
+        "{}{}",
+        cloud_mcp_tokenomics_day_packet_idempotency_prefix(
+            billing_scope_key,
+            device_id,
+            day_key,
+            content_hash,
+        ),
+        device_seq
+    )
+}
+
+fn cloud_mcp_tokenomics_outbox_acked_day_packet(
     conn: &rusqlite::Connection,
-    idempotency_key: &str,
-) -> Option<i64> {
+    device_id: &str,
+    billing_scope_key: &str,
+    day_start_ms: i64,
+    content_hash: &str,
+) -> Option<(String, i64)> {
+    let day_key = cloud_mcp_tokenomics_day_key(day_start_ms);
+    let legacy_idempotency_key = cloud_mcp_tokenomics_legacy_day_packet_idempotency_key(
+        billing_scope_key,
+        device_id,
+        &day_key,
+        content_hash,
+    );
+    let seq_idempotency_prefix = cloud_mcp_tokenomics_day_packet_idempotency_prefix(
+        billing_scope_key,
+        device_id,
+        &day_key,
+        content_hash,
+    );
     conn.query_row(
         &format!(
-            "SELECT CASE WHEN acked_at_ms>0 THEN acked_at_ms ELSE updated_at_ms END
+            "SELECT idempotency_key,
+                    CASE WHEN acked_at_ms>0 THEN acked_at_ms ELSE updated_at_ms END
              FROM {CLOUD_MCP_OUTBOX_TABLE}
-             WHERE idempotency_key=?1 AND status='acked'
+             WHERE status='acked'
+               AND payload_hash=?1
+               AND (
+                   idempotency_key=?2
+                   OR substr(idempotency_key, 1, ?3)=?4
+               )
+             ORDER BY CASE WHEN acked_at_ms>0 THEN acked_at_ms ELSE updated_at_ms END DESC,
+                      updated_at_ms DESC
              LIMIT 1"
         ),
-        rusqlite::params![idempotency_key],
-        |row| row.get::<_, i64>(0),
+        rusqlite::params![
+            content_hash,
+            legacy_idempotency_key,
+            seq_idempotency_prefix.len() as i64,
+            seq_idempotency_prefix,
+        ],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
     )
     .ok()
-    .map(|value| value.max(0))
-    .filter(|value| *value > 0)
+    .map(|(idempotency_key, value)| (idempotency_key, value.max(0)))
+    .filter(|(_, value)| *value > 0)
 }
 
 fn cloud_mcp_tokenomics_restore_day_ack_from_outbox(
@@ -3379,6 +3452,7 @@ fn cloud_mcp_tokenomics_restore_day_ack_from_outbox(
     content_hash: &str,
     idempotency_key: &str,
     acked_at_ms: i64,
+    content_observed_at_ms: i64,
 ) -> Result<TokenomicsUsageEventPruneCloudAckSeed, String> {
     let now = cloud_mcp_now_ms() as i64;
     conn.execute(
@@ -3408,7 +3482,13 @@ fn cloud_mcp_tokenomics_restore_day_ack_from_outbox(
     tokenomics_usage_event_prune_cloud_ack_seed(
         billing_scope_key,
         day_start_ms,
-        &tokenomics_usage_event_prune_cloud_ack_cursor(idempotency_key, acked_at_ms),
+        // The idempotency key encodes the current content hash, so the acked
+        // outbox row proves the content observed at content_observed_at_ms was
+        // synced — the cursor may advance to the observation time.
+        &tokenomics_usage_event_prune_cloud_ack_cursor(
+            idempotency_key,
+            acked_at_ms.max(content_observed_at_ms),
+        ),
     )
     .ok_or_else(|| "Unable to build Tokenomics prune ack seed from restored day ack.".to_string())
 }
@@ -3418,6 +3498,7 @@ fn cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
     billing_scope_key: &str,
     day_start_ms: i64,
     content_hash: &str,
+    content_observed_at_ms: i64,
     force_send: bool,
 ) -> Result<CloudMcpTokenomicsDaySyncDecisionOutcome, String> {
     let conn = cloud_mcp_open_outbox_conn()?;
@@ -3436,9 +3517,15 @@ fn cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
     if let Some(state) = state {
         if state.content_hash == content_hash {
             if state.acked_at_ms > 0 {
+                // The current content hash (observed at content_observed_at_ms)
+                // still equals the acked hash, so the rollups provably haven't
+                // changed since the ack. Advance the prune cursor to the
+                // observation time — otherwise a rollup rebuild (which bumps
+                // updated_at without changing content) would permanently block
+                // pruning for every day acked before the rebuild.
                 let cursor = tokenomics_usage_event_prune_cloud_ack_cursor(
                     &state.idempotency_key,
-                    state.acked_at_ms,
+                    state.acked_at_ms.max(content_observed_at_ms),
                 );
                 return Ok(CloudMcpTokenomicsDaySyncDecisionOutcome {
                     decision: CloudMcpTokenomicsDaySyncDecision::CurrentAcked,
@@ -3469,7 +3556,14 @@ fn cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
                         });
                     }
                     Some("acked") => {
-                        let now = cloud_mcp_now_ms() as i64;
+                        // Stamp the ack with the content observation time, not
+                        // now: the prune cursor must not postdate the rollup
+                        // state the acked hash was computed from.
+                        let acked_at = if content_observed_at_ms > 0 {
+                            content_observed_at_ms
+                        } else {
+                            cloud_mcp_now_ms() as i64
+                        };
                         let _ = conn.execute(
                             &format!(
                                 "UPDATE {CLOUD_MCP_TOKENOMICS_DAY_SYNC_STATE_TABLE}
@@ -3482,13 +3576,13 @@ fn cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
                                 device_id,
                                 billing_scope_key,
                                 day_start_ms,
-                                now,
+                                acked_at,
                                 content_hash
                             ],
                         );
                         let cursor = tokenomics_usage_event_prune_cloud_ack_cursor(
                             &state.idempotency_key,
-                            now,
+                            acked_at,
                         );
                         return Ok(CloudMcpTokenomicsDaySyncDecisionOutcome {
                             decision: CloudMcpTokenomicsDaySyncDecision::CurrentAcked,
@@ -3504,24 +3598,22 @@ fn cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
             }
         }
     }
-    let day_key = cloud_mcp_tokenomics_day_key(day_start_ms);
-    let expected_idempotency_key = cloud_mcp_tokenomics_day_packet_idempotency_key(
-        billing_scope_key,
+    if let Some((acked_idempotency_key, acked_at_ms)) = cloud_mcp_tokenomics_outbox_acked_day_packet(
+        &conn,
         device_id,
-        &day_key,
+        billing_scope_key,
+        day_start_ms,
         content_hash,
-    );
-    if let Some(acked_at_ms) =
-        cloud_mcp_tokenomics_outbox_acked_at_for_idempotency(&conn, &expected_idempotency_key)
-    {
+    ) {
         let prune_ack_seed = cloud_mcp_tokenomics_restore_day_ack_from_outbox(
             &conn,
             device_id,
             billing_scope_key,
             day_start_ms,
             content_hash,
-            &expected_idempotency_key,
+            &acked_idempotency_key,
             acked_at_ms,
+            content_observed_at_ms,
         )?;
         return Ok(CloudMcpTokenomicsDaySyncDecisionOutcome {
             decision: CloudMcpTokenomicsDaySyncDecision::CurrentAcked,
@@ -3547,11 +3639,13 @@ fn cloud_mcp_tokenomics_day_sync_decision(
         billing_scope_key,
         day_start_ms,
         content_hash,
+        cloud_mcp_now_ms() as i64,
         force_send,
     )
     .map(|outcome| outcome.decision)
 }
 
+#[allow(dead_code)]
 fn cloud_mcp_tokenomics_mark_day_pending(
     device_id: &str,
     billing_scope_key: &str,
@@ -3561,6 +3655,26 @@ fn cloud_mcp_tokenomics_mark_day_pending(
     idempotency_key: &str,
 ) -> Result<(), String> {
     let conn = cloud_mcp_open_outbox_conn()?;
+    cloud_mcp_tokenomics_mark_day_pending_on_conn(
+        &conn,
+        device_id,
+        billing_scope_key,
+        bucket,
+        device_seq,
+        payload_hash,
+        idempotency_key,
+    )
+}
+
+fn cloud_mcp_tokenomics_mark_day_pending_on_conn(
+    conn: &rusqlite::Connection,
+    device_id: &str,
+    billing_scope_key: &str,
+    bucket: &CloudMcpTokenomicsPacketBucket,
+    device_seq: u64,
+    payload_hash: &str,
+    idempotency_key: &str,
+) -> Result<(), String> {
     let now = cloud_mcp_now_ms() as i64;
     conn.execute(
         &format!(
@@ -3591,6 +3705,107 @@ fn cloud_mcp_tokenomics_mark_day_pending(
     Ok(())
 }
 
+struct CloudMcpTokenomicsEnqueuedDayPacket {
+    device_seq: u64,
+    payload: Value,
+    payload_hash: String,
+    idempotency_key: String,
+    outbox_row: CloudMcpOutboxRow,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cloud_mcp_tokenomics_claim_and_enqueue_day_packet(
+    summary: &Value,
+    device_profile: &Value,
+    billing_scope_type: &str,
+    team_id: Option<&str>,
+    billing_scope_key: &str,
+    device_id: &str,
+    event_kind: &str,
+    reason: &str,
+    force_resync: bool,
+    bucket: &CloudMcpTokenomicsPacketBucket,
+    priority: u8,
+) -> Result<CloudMcpTokenomicsEnqueuedDayPacket, String> {
+    let conn = cloud_mcp_open_outbox_conn()?;
+    conn.execute_batch("BEGIN IMMEDIATE").map_err(|error| {
+        format!("Unable to start Tokenomics packet enqueue transaction: {error}")
+    })?;
+    let result = (|| -> Result<CloudMcpTokenomicsEnqueuedDayPacket, String> {
+        let device_seq =
+            cloud_mcp_tokenomics_claim_device_seq_on_conn(&conn, device_id, billing_scope_key)?;
+        let packet_sync_state =
+            cloud_mcp_tokenomics_sync_state_from_conn(&conn, device_id, billing_scope_key);
+        let storage_payload = cloud_mcp_tokenomics_device_packet_payload(
+            summary,
+            device_profile,
+            billing_scope_type,
+            team_id,
+            billing_scope_key,
+            &packet_sync_state,
+            device_seq,
+            event_kind,
+            reason,
+            force_resync,
+            Some(bucket),
+        )?;
+        let (payload, idempotency_key, payload_hash, coalesce_key) =
+            cloud_mcp_outbox_payload_with_idempotency(event_kind, &storage_payload);
+        // Read the packet's own claimed sequence ("ds"). The generic
+        // cloud_mcp_tokenomics_device_seq_from_value is a RESPONSE parser that
+        // prefers "ads" (acked seq) and would misreport every outgoing packet.
+        let payload_device_seq =
+            cloud_mcp_tokenomics_response_u64(&payload, &["ds", "device_seq", "deviceSeq"])
+                .ok_or_else(|| {
+                    "Tokenomics day packet did not include a device sequence.".to_string()
+                })?;
+        if payload_device_seq != device_seq {
+            return Err(format!(
+                "Tokenomics day packet sequence mismatch: claimed {device_seq}, payload {payload_device_seq}."
+            ));
+        }
+        cloud_mcp_tokenomics_mark_day_pending_on_conn(
+            &conn,
+            device_id,
+            billing_scope_key,
+            bucket,
+            device_seq,
+            &payload_hash,
+            &idempotency_key,
+        )?;
+        let outbox_row = cloud_mcp_outbox_enqueue_prepared_event(
+            &conn,
+            event_kind,
+            &payload,
+            priority,
+            reason,
+            &idempotency_key,
+            &payload_hash,
+            &coalesce_key,
+        )?;
+        Ok(CloudMcpTokenomicsEnqueuedDayPacket {
+            device_seq,
+            payload,
+            payload_hash,
+            idempotency_key,
+            outbox_row,
+        })
+    })();
+    match result {
+        Ok(packet) => {
+            conn.execute_batch("COMMIT")
+                .map_err(|error| format!("Unable to commit Tokenomics packet enqueue: {error}"))?;
+            cloud_mcp_outbox_note_may_have_work();
+            cloud_mcp_emit_sync_status(None);
+            Ok(packet)
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn cloud_mcp_tokenomics_day_start_from_value(value: &Value) -> Option<i64> {
     cloud_mcp_payload_i64(
         value,
@@ -3606,15 +3821,6 @@ fn cloud_mcp_tokenomics_day_start_from_value(value: &Value) -> Option<i64> {
 
 fn cloud_mcp_tokenomics_day_content_hash_from_value(value: &Value) -> Option<String> {
     cloud_mcp_tokenomics_response_text(value, &["h", "sync_content_hash", "syncContentHash"])
-}
-
-fn cloud_mcp_tokenomics_day_packet_idempotency_key(
-    billing_scope_key: &str,
-    device_id: &str,
-    day_key: &str,
-    content_hash: &str,
-) -> String {
-    format!("tokenomics:v4:{billing_scope_key}:{device_id}:day:{day_key}:{content_hash}")
 }
 
 fn cloud_mcp_tokenomics_mark_day_acked_from_payload(
@@ -3760,24 +3966,24 @@ fn cloud_mcp_tokenomics_mark_day_acked_from_payload(
     .map_err(|error| format!("Unable to mark Tokenomics day bucket acked: {error}"))?;
     if prune_ack_seed_safe {
         if let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get() {
-        let local_cursor = source_payload
-            .and_then(cloud_mcp_tokenomics_payload_local_cursor_from_value)
-            .or_else(|| cloud_mcp_tokenomics_local_cursor_from_value(response))
-            .filter(|cursor| !cursor.trim().is_empty())
-            .or_else(|| {
-                let cursor =
-                    tokenomics_usage_event_prune_cloud_ack_cursor(&idempotency_key, now);
-                (!cursor.trim().is_empty()).then_some(cursor)
-            })
-            .unwrap_or_default();
-        if !local_cursor.trim().is_empty() {
-            let _ = tokenomics_record_usage_event_prune_cloud_ack(
-                app,
-                &billing_scope_key,
-                Some(day_start_ms),
-                &local_cursor,
-            );
-        }
+            let local_cursor = source_payload
+                .and_then(cloud_mcp_tokenomics_payload_local_cursor_from_value)
+                .or_else(|| cloud_mcp_tokenomics_local_cursor_from_value(response))
+                .filter(|cursor| !cursor.trim().is_empty())
+                .or_else(|| {
+                    let cursor =
+                        tokenomics_usage_event_prune_cloud_ack_cursor(&idempotency_key, now);
+                    (!cursor.trim().is_empty()).then_some(cursor)
+                })
+                .unwrap_or_default();
+            if !local_cursor.trim().is_empty() {
+                let _ = tokenomics_record_usage_event_prune_cloud_ack(
+                    app,
+                    &billing_scope_key,
+                    Some(day_start_ms),
+                    &local_cursor,
+                );
+            }
         }
     }
     Ok(true)
@@ -4830,17 +5036,19 @@ fn cloud_mcp_outbox_row_from_statement_row(
     })
 }
 
-fn cloud_mcp_outbox_enqueue_event(
+fn cloud_mcp_outbox_enqueue_prepared_event(
+    conn: &rusqlite::Connection,
     event_kind: &str,
     payload: &Value,
     priority: u8,
     reason: &str,
+    idempotency_key: &str,
+    payload_hash: &str,
+    coalesce_key: &str,
 ) -> Result<CloudMcpOutboxRow, String> {
-    let (payload, idempotency_key, payload_hash, coalesce_key) =
-        cloud_mcp_outbox_payload_with_idempotency(event_kind, payload);
-    let conn = cloud_mcp_open_outbox_conn()?;
     let now = cloud_mcp_now_ms() as i64;
-    if !coalesce_key.is_empty() {
+    let tokenomics_device_packet = cloud_mcp_tokenomics_device_packet_kind(event_kind);
+    if !coalesce_key.is_empty() && !tokenomics_device_packet {
         conn.execute(
             &format!(
                 "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
@@ -4854,53 +5062,77 @@ fn cloud_mcp_outbox_enqueue_event(
         .map_err(|error| format!("Unable to coalesce Cloud sync outbox row: {error}"))?;
     }
     let outbox_id = format!("outbox-{}-{}", cloud_mcp_now_ms(), uuid::Uuid::new_v4());
-    conn.execute(
-        &format!(
-            "INSERT INTO {CLOUD_MCP_OUTBOX_TABLE}(
-                outbox_id, idempotency_key, coalesce_key, event_kind, priority,
-                payload_hash, payload_json, status, attempt_count, next_attempt_at_ms,
-                last_error, cloud_event_id, response_json, created_at_ms, updated_at_ms, acked_at_ms
-             )
-             VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 0, 0, '', '', '', ?8, ?8, 0)
-             ON CONFLICT(idempotency_key) DO UPDATE SET
-                coalesce_key=excluded.coalesce_key,
-                priority=MIN(priority, excluded.priority),
-                payload_hash=excluded.payload_hash,
-                payload_json=CASE
-                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status IN ('acked', 'rejected')
-                        THEN {CLOUD_MCP_OUTBOX_TABLE}.payload_json
-                    ELSE excluded.payload_json
-                END,
-                status=CASE
-                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status IN ('acked', 'rejected')
-                        THEN {CLOUD_MCP_OUTBOX_TABLE}.status
-                    ELSE 'queued'
-                END,
-                next_attempt_at_ms=CASE
-                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status IN ('acked', 'rejected')
-                        THEN {CLOUD_MCP_OUTBOX_TABLE}.next_attempt_at_ms
-                    ELSE 0
-                END,
-                last_error=CASE
-                    WHEN {CLOUD_MCP_OUTBOX_TABLE}.status IN ('acked', 'rejected')
-                        THEN {CLOUD_MCP_OUTBOX_TABLE}.last_error
-                    ELSE ''
-                END,
-                updated_at_ms=excluded.updated_at_ms"
-        ),
-        rusqlite::params![
-            outbox_id,
-            idempotency_key,
-            coalesce_key,
-            event_kind,
-            priority as i64,
-            payload_hash,
-            payload.to_string(),
-            now
-        ],
-    )
-    .map_err(|error| format!("Unable to enqueue Cloud sync outbox row for {reason}: {error}"))?;
-    cloud_mcp_outbox_note_may_have_work();
+    if tokenomics_device_packet {
+        conn.execute(
+            &format!(
+                "INSERT INTO {CLOUD_MCP_OUTBOX_TABLE}(
+                    outbox_id, idempotency_key, coalesce_key, event_kind, priority,
+                    payload_hash, payload_json, status, attempt_count, next_attempt_at_ms,
+                    last_error, cloud_event_id, response_json, created_at_ms, updated_at_ms, acked_at_ms
+                 )
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 0, 0, '', '', '', ?8, ?8, 0)
+                 ON CONFLICT(idempotency_key) DO NOTHING"
+            ),
+            rusqlite::params![
+                outbox_id,
+                idempotency_key,
+                coalesce_key,
+                event_kind,
+                priority as i64,
+                payload_hash,
+                payload.to_string(),
+                now
+            ],
+        )
+        .map_err(|error| format!("Unable to enqueue Cloud sync outbox row for {reason}: {error}"))?;
+    } else {
+        conn.execute(
+            &format!(
+                "INSERT INTO {CLOUD_MCP_OUTBOX_TABLE}(
+                    outbox_id, idempotency_key, coalesce_key, event_kind, priority,
+                    payload_hash, payload_json, status, attempt_count, next_attempt_at_ms,
+                    last_error, cloud_event_id, response_json, created_at_ms, updated_at_ms, acked_at_ms
+                 )
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, 'queued', 0, 0, '', '', '', ?8, ?8, 0)
+                 ON CONFLICT(idempotency_key) DO UPDATE SET
+                    coalesce_key=excluded.coalesce_key,
+                    priority=MIN(priority, excluded.priority),
+                    payload_hash=excluded.payload_hash,
+                    payload_json=CASE
+                        WHEN {CLOUD_MCP_OUTBOX_TABLE}.status IN ('acked', 'rejected')
+                            THEN {CLOUD_MCP_OUTBOX_TABLE}.payload_json
+                        ELSE excluded.payload_json
+                    END,
+                    status=CASE
+                        WHEN {CLOUD_MCP_OUTBOX_TABLE}.status IN ('acked', 'rejected')
+                            THEN {CLOUD_MCP_OUTBOX_TABLE}.status
+                        ELSE 'queued'
+                    END,
+                    next_attempt_at_ms=CASE
+                        WHEN {CLOUD_MCP_OUTBOX_TABLE}.status IN ('acked', 'rejected')
+                            THEN {CLOUD_MCP_OUTBOX_TABLE}.next_attempt_at_ms
+                        ELSE 0
+                    END,
+                    last_error=CASE
+                        WHEN {CLOUD_MCP_OUTBOX_TABLE}.status IN ('acked', 'rejected')
+                            THEN {CLOUD_MCP_OUTBOX_TABLE}.last_error
+                        ELSE ''
+                    END,
+                    updated_at_ms=excluded.updated_at_ms"
+            ),
+            rusqlite::params![
+                outbox_id,
+                idempotency_key,
+                coalesce_key,
+                event_kind,
+                priority as i64,
+                payload_hash,
+                payload.to_string(),
+                now
+            ],
+        )
+        .map_err(|error| format!("Unable to enqueue Cloud sync outbox row for {reason}: {error}"))?;
+    }
     let row = conn
         .query_row(
             &format!(
@@ -4912,6 +5144,29 @@ fn cloud_mcp_outbox_enqueue_event(
             cloud_mcp_outbox_row_from_statement_row,
         )
         .map_err(|error| format!("Unable to read queued Cloud sync outbox row: {error}"))?;
+    Ok(row)
+}
+
+fn cloud_mcp_outbox_enqueue_event(
+    event_kind: &str,
+    payload: &Value,
+    priority: u8,
+    reason: &str,
+) -> Result<CloudMcpOutboxRow, String> {
+    let (payload, idempotency_key, payload_hash, coalesce_key) =
+        cloud_mcp_outbox_payload_with_idempotency(event_kind, payload);
+    let conn = cloud_mcp_open_outbox_conn()?;
+    let row = cloud_mcp_outbox_enqueue_prepared_event(
+        &conn,
+        event_kind,
+        &payload,
+        priority,
+        reason,
+        &idempotency_key,
+        &payload_hash,
+        &coalesce_key,
+    )?;
+    cloud_mcp_outbox_note_may_have_work();
     cloud_mcp_emit_sync_status(None);
     if event_kind == CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT {
         cloud_mcp_emit_agent_chat_session_sync_status_changed(&payload, "waiting");
@@ -7380,6 +7635,16 @@ fn cloud_mcp_outbox_error_is_permanent_rejection(error: &str) -> bool {
         "id is required to delete a workspace",
         "reached the workspace limit",
         "idempotency key was reused with a different payload",
+        // Tokenomics day packets: the server pinned this packet_id/device_seq
+        // to a different payload hash; retrying the identical packet can never
+        // succeed. Rejection resets the day sync state below so the day
+        // re-enqueues with a freshly claimed device_seq.
+        "was reused with a different payload hash",
+        // The server does not speak this event kind at all; resending the same
+        // payload can never succeed. (58 stale todo.live_state rows retrying
+        // this error for days — amplified by reconnect backlog release — got
+        // this machine Cloudflare-1015 banned on 2026-07-05.)
+        "Unknown app websocket message kind",
         "workspace delete requires a workspace_id",
         "voice plan task was not found",
         // Orphan-entity rejections: the parent record is gone server-side and
@@ -7399,7 +7664,16 @@ fn cloud_mcp_outbox_mark_retry(row: &CloudMcpOutboxRow, error: &str) -> Result<(
     // dead letters. The backoff caps at 5 minutes and the websocket-ready path
     // releases the whole backlog immediately on reconnect. Only contract
     // rejections the server will never accept park as 'rejected'.
-    let (status, next_attempt_at) = if cloud_mcp_outbox_error_is_permanent_rejection(error) {
+    //
+    // Attempt-cap backstop: a row the server has refused this many times is a
+    // contract failure we failed to pattern-match. Park it as 'rejected'
+    // (never revived by reconnect) — unbounded retries across dozens of rows,
+    // re-released on every reconnect, are how this client rate-limit-banned
+    // the whole machine off Cloudflare.
+    const CLOUD_MCP_OUTBOX_MAX_ATTEMPTS: i64 = 100;
+    let (status, next_attempt_at) = if cloud_mcp_outbox_error_is_permanent_rejection(error)
+        || next_attempt_count >= CLOUD_MCP_OUTBOX_MAX_ATTEMPTS
+    {
         ("rejected", 0)
     } else {
         (
@@ -7430,6 +7704,33 @@ fn cloud_mcp_outbox_mark_retry(row: &CloudMcpOutboxRow, error: &str) -> Result<(
         ],
     )
     .map_err(|error| format!("Unable to mark Cloud sync outbox row retrying: {error}"))?;
+    if status == "rejected" && cloud_mcp_tokenomics_device_packet_kind(&row.event_kind) {
+        // The server will never accept this exact packet (e.g. a device_seq
+        // pinned to a different payload hash). Drop the day's sync state so
+        // the next sync cycle re-enqueues it with a fresh device_seq instead
+        // of leaving the day permanently unsynced and unprunable.
+        if let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) {
+            let device_id = payload.get("did").and_then(Value::as_str).unwrap_or("");
+            let scope_key = payload.get("sk").and_then(Value::as_str).unwrap_or("");
+            let day_start_ms = payload.get("sdm").and_then(Value::as_i64).unwrap_or(0);
+            if !device_id.is_empty() && !scope_key.is_empty() && day_start_ms > 0 {
+                let _ = conn.execute(
+                    &format!(
+                        "DELETE FROM {CLOUD_MCP_TOKENOMICS_DAY_SYNC_STATE_TABLE}
+                         WHERE device_id=?1 AND billing_scope_key=?2 AND day_start_ms=?3"
+                    ),
+                    rusqlite::params![device_id, scope_key, day_start_ms],
+                );
+                log_cloud_sync_event(
+                    "outbox.tokenomics_day_state_reset_on_rejection",
+                    json!({
+                        "day_start_ms": day_start_ms,
+                        "error": clean_terminal_telemetry_text(error),
+                    }),
+                );
+            }
+        }
+    }
     if status == "retrying" {
         cloud_mcp_outbox_note_may_have_work();
     }
@@ -10218,6 +10519,7 @@ fn cloud_mcp_tokenomics_device_packet_payload(
             &device_id,
             &bucket.day_key,
             &bucket.content_hash,
+            device_seq,
         );
         return Ok(cloud_mcp_tokenomics_payload_with_identity(
             payload,
@@ -10317,8 +10619,7 @@ fn cloud_mcp_tokenomics_prepare_historical_prune_ack_plan(
         .and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|value| *value >= 0);
     let now_ms = cloud_mcp_now_ms();
-    let current_day_start =
-        cloud_mcp_tokenomics_day_start_ms(now_ms.min(i64::MAX as u64) as i64);
+    let current_day_start = cloud_mcp_tokenomics_day_start_ms(now_ms.min(i64::MAX as u64) as i64);
     let oldest_sync_day_start = current_day_start.saturating_sub(
         CLOUD_MCP_TOKENOMICS_SYNC_LOOKBACK_DAYS
             .saturating_sub(1)
@@ -10347,7 +10648,8 @@ fn cloud_mcp_tokenomics_prepare_historical_prune_ack_plan(
     let mut enqueue_buckets = Vec::<CloudMcpTokenomicsDayBucket>::new();
     let mut planned_progress_day_start_ms = after_day_start_ms;
     let mut seed_progress_day_start_ms = after_day_start_ms;
-    let mut reached_end = candidate_days.len() < CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_BATCH_DAYS;
+    let mut reached_end =
+        candidate_days.len() < CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_BATCH_DAYS;
     for day_start_ms in candidate_days {
         if enqueue_buckets.len() >= CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_ENQUEUE_LIMIT {
             reached_end = false;
@@ -10378,9 +10680,12 @@ fn cloud_mcp_tokenomics_prepare_historical_prune_ack_plan(
         );
         if let Some(state) = state.filter(|state| state.acked_at_ms > 0) {
             if state.content_hash == bucket.content_hash {
+                // Hash re-verified against rollups read after now_ms was
+                // captured, so the cursor may advance to now_ms — otherwise a
+                // rollup rebuild would permanently block pruning these days.
                 let cursor = tokenomics_usage_event_prune_cloud_ack_cursor(
                     &state.idempotency_key,
-                    state.acked_at_ms,
+                    state.acked_at_ms.max(now_ms.min(i64::MAX as u64) as i64),
                 );
                 if let Some(seed) = tokenomics_usage_event_prune_cloud_ack_seed(
                     &billing_scope_key,
@@ -10519,87 +10824,55 @@ async fn cloud_mcp_tokenomics_run_historical_prune_ack_seed(
             day_key: bucket.day_key.clone(),
             content_hash: bucket.content_hash.clone(),
         };
-        let device_seq = match cloud_mcp_tokenomics_claim_device_seq(device_id, billing_scope_key) {
-            Ok(device_seq) => device_seq,
-            Err(error) => {
-                cloud_mcp_record_tokenomics_sync_error(
-                    "historical_prune_ack_device_seq_error",
-                    reason,
-                    &error,
-                );
-                break;
-            }
-        };
-        let packet_sync_state =
-            match cloud_mcp_tokenomics_sync_state(device_id, billing_scope_key) {
-                Ok(sync_state) => sync_state,
-                Err(error) => {
-                    cloud_mcp_record_tokenomics_sync_error(
-                        "historical_prune_ack_sync_state_error",
-                        reason,
-                        &error,
-                    );
-                    break;
-                }
-            };
-        let storage_payload = match cloud_mcp_tokenomics_device_packet_payload(
+        let enqueued_packet = match cloud_mcp_tokenomics_claim_and_enqueue_day_packet(
             &bucket.summary,
             device_profile,
             billing_scope_type,
             team_id,
             billing_scope_key,
-            &packet_sync_state,
-            device_seq,
+            device_id,
             CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
             "historical_prune_ack_seed",
             false,
-            Some(&packet_bucket),
+            &packet_bucket,
+            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
         ) {
-            Ok(payload) => payload,
+            Ok(packet) => packet,
             Err(error) => {
                 cloud_mcp_record_tokenomics_sync_error(
-                    "historical_prune_ack_payload_error",
+                    "historical_prune_ack_enqueue_error",
                     reason,
                     &error,
                 );
                 break;
             }
         };
-        let payload_hash =
-            cloud_mcp_payload_text(&storage_payload, &["ph", "payload_hash", "payloadHash"])
-                .unwrap_or_default();
-        let idempotency_key = cloud_mcp_payload_text(
-            &storage_payload,
-            &["pid", "idempotency_key", "idempotencyKey"],
-        )
-        .unwrap_or_default();
-        if let Err(error) = cloud_mcp_tokenomics_mark_day_pending(
-            device_id,
-            billing_scope_key,
-            &packet_bucket,
-            device_seq,
-            &payload_hash,
-            &idempotency_key,
-        ) {
-            cloud_mcp_record_tokenomics_sync_error(
-                "historical_prune_ack_day_pending_error",
-                reason,
-                &error,
-            );
-            break;
-        }
-        cloud_mcp_enqueue_background_sync(
-            worker_state,
-            format!(
-                "tokenomics:{billing_scope_key}:historical-prune-ack-day:{}",
-                packet_bucket.day_start_ms
-            ),
-            CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
-            storage_payload,
-            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+        cloud_mcp_background_sync_ensure_started(worker_state);
+        worker_state.background_sync.notify.notify_one();
+        let outbox_key = format!(
+            "tokenomics:{billing_scope_key}:historical-prune-ack-day:{}",
+            packet_bucket.day_start_ms
+        );
+        cloud_mcp_record_tokenomics_sync_log(
+            "outbox_queued",
+            "queued",
             "historical_prune_ack_seed",
-        )
-        .await;
+            json!({
+                "event_kind": CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
+                "outbox_id": &enqueued_packet.outbox_row.outbox_id,
+                "idempotency_key": &enqueued_packet.idempotency_key,
+            }),
+        );
+        log_terminal_status_event(
+            "backend.cloud_mcp.outbox.queued",
+            json!({
+                "event_kind": CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
+                "key": outbox_key,
+                "reason": "historical_prune_ack_seed",
+                "outbox_id": &enqueued_packet.outbox_row.outbox_id,
+                "idempotency_key": &enqueued_packet.idempotency_key,
+            }),
+        );
         enqueue_progress_day_start_ms = Some(packet_bucket.day_start_ms);
         enqueued_day_count = enqueued_day_count.saturating_add(1);
     }
@@ -10758,6 +11031,9 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             Some(cursor)
         }
     };
+    // Captured before the summary worker reads the rollups: prune-ack cursors
+    // derived from this pass must not postdate the rollup state they hash.
+    let summary_observed_at_ms = cloud_mcp_now_ms() as i64;
     let summary_app = app.clone();
     let summary_scope = tokenomics_scope.clone();
     let summary_task = tauri::async_runtime::spawn_blocking(move || {
@@ -11021,6 +11297,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             &tokenomics_scope_key,
             bucket.day_start_ms,
             &bucket.content_hash,
+            summary_observed_at_ms,
             force_full || force_resync,
         ) {
             Ok(decision) => decision,
@@ -11063,76 +11340,30 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT
         };
         last_event_kind = tokenomics_event_kind;
-        let device_seq =
-            match cloud_mcp_tokenomics_claim_device_seq(&device_id, &tokenomics_scope_key) {
-                Ok(device_seq) => device_seq,
-                Err(error) => {
-                    if let Some(activity_key) = tokenomics_activity_key.as_deref() {
-                        cloud_mcp_fail_sync_activity_key(activity_key);
-                    }
-                    cloud_mcp_record_tokenomics_sync_error(
-                        "device_seq_error",
-                        &reason_for_worker,
-                        &error,
-                    );
-                    log_terminal_status_event(
-                        "backend.cloud_mcp.tokenomics_background.error",
-                        json!({
-                            "error": clean_terminal_telemetry_text(&error),
-                            "reason": reason_for_worker,
-                            "day_start_ms": bucket.day_start_ms,
-                        }),
-                    );
-                    return;
-                }
-            };
         let packet_bucket = CloudMcpTokenomicsPacketBucket {
             day_start_ms: bucket.day_start_ms,
             day_key: bucket.day_key.clone(),
             content_hash: bucket.content_hash.clone(),
         };
-        let packet_sync_state =
-            match cloud_mcp_tokenomics_sync_state(&device_id, &tokenomics_scope_key) {
-                Ok(sync_state) => sync_state,
-                Err(error) => {
-                    if let Some(activity_key) = tokenomics_activity_key.as_deref() {
-                        cloud_mcp_fail_sync_activity_key(activity_key);
-                    }
-                    cloud_mcp_record_tokenomics_sync_error(
-                        "sync_state_error",
-                        &reason_for_worker,
-                        &error,
-                    );
-                    log_terminal_status_event(
-                        "backend.cloud_mcp.tokenomics_background.error",
-                        json!({
-                            "error": clean_terminal_telemetry_text(&error),
-                            "reason": reason_for_worker,
-                            "day_start_ms": bucket.day_start_ms,
-                        }),
-                    );
-                    return;
-                }
-            };
-        let storage_payload = match cloud_mcp_tokenomics_device_packet_payload(
+        let enqueued_packet = match cloud_mcp_tokenomics_claim_and_enqueue_day_packet(
             &bucket.summary,
             &device_profile,
             &billing_scope_type,
             team_id.as_deref(),
             &tokenomics_scope_key,
-            &packet_sync_state,
-            device_seq,
+            &device_id,
             tokenomics_event_kind,
             &reason_for_worker,
             force_resync,
-            Some(&packet_bucket),
+            &packet_bucket,
+            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
         ) {
-            Ok(payload) => payload,
+            Ok(packet) => packet,
             Err(error) => {
                 if let Some(activity_key) = tokenomics_activity_key.as_deref() {
                     cloud_mcp_fail_sync_activity_key(activity_key);
                 }
-                cloud_mcp_record_tokenomics_sync_error("payload_error", &reason_for_worker, &error);
+                cloud_mcp_record_tokenomics_sync_error("enqueue_error", &reason_for_worker, &error);
                 log_terminal_status_event(
                     "backend.cloud_mcp.tokenomics_background.error",
                     json!({
@@ -11144,36 +11375,10 @@ async fn cloud_mcp_run_tokenomics_sync_job(
                 return;
             }
         };
-        let payload_hash =
-            cloud_mcp_payload_text(&storage_payload, &["ph", "payload_hash", "payloadHash"])
-                .unwrap_or_default();
-        let idempotency_key = cloud_mcp_payload_text(
-            &storage_payload,
-            &["pid", "idempotency_key", "idempotencyKey"],
-        )
-        .unwrap_or_default();
-        if let Err(error) = cloud_mcp_tokenomics_mark_day_pending(
-            &device_id,
-            &tokenomics_scope_key,
-            &packet_bucket,
-            device_seq,
-            &payload_hash,
-            &idempotency_key,
-        ) {
-            if let Some(activity_key) = tokenomics_activity_key.as_deref() {
-                cloud_mcp_fail_sync_activity_key(activity_key);
-            }
-            cloud_mcp_record_tokenomics_sync_error("day_pending_error", &reason_for_worker, &error);
-            log_terminal_status_event(
-                "backend.cloud_mcp.tokenomics_background.error",
-                json!({
-                    "error": clean_terminal_telemetry_text(&error),
-                    "reason": reason_for_worker,
-                    "day_start_ms": bucket.day_start_ms,
-                }),
-            );
-            return;
-        }
+        let device_seq = enqueued_packet.device_seq;
+        let storage_payload = enqueued_packet.payload.clone();
+        let payload_hash = enqueued_packet.payload_hash.clone();
+        let idempotency_key = enqueued_packet.idempotency_key.clone();
         let bucket_hourly_count = bucket
             .summary
             .get("hourly")
@@ -11215,18 +11420,32 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             "ph": payload_hash,
             "pid": idempotency_key,
         });
-        cloud_mcp_enqueue_background_sync(
-            &worker_state,
-            format!(
-                "tokenomics:{tokenomics_scope_key}:{tokenomics_event_kind}:day:{}",
-                packet_bucket.day_start_ms
-            ),
-            tokenomics_event_kind,
-            storage_payload,
-            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
-            reason_for_worker.clone(),
-        )
-        .await;
+        cloud_mcp_background_sync_ensure_started(&worker_state);
+        worker_state.background_sync.notify.notify_one();
+        let outbox_key = format!(
+            "tokenomics:{tokenomics_scope_key}:{tokenomics_event_kind}:day:{}",
+            packet_bucket.day_start_ms
+        );
+        cloud_mcp_record_tokenomics_sync_log(
+            "outbox_queued",
+            "queued",
+            &reason_for_worker,
+            json!({
+                "event_kind": tokenomics_event_kind,
+                "outbox_id": &enqueued_packet.outbox_row.outbox_id,
+                "idempotency_key": &enqueued_packet.idempotency_key,
+            }),
+        );
+        log_terminal_status_event(
+            "backend.cloud_mcp.outbox.queued",
+            json!({
+                "event_kind": tokenomics_event_kind,
+                "key": outbox_key,
+                "reason": reason_for_worker,
+                "outbox_id": &enqueued_packet.outbox_row.outbox_id,
+                "idempotency_key": &enqueued_packet.idempotency_key,
+            }),
+        );
         cloud_mcp_record_tokenomics_sync_log(
             "outbox_handoff",
             "queued",
@@ -11237,12 +11456,9 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     }
 
     if enqueued_day_count == 0 {
-        let stored_prune_ack_seed_count = cloud_mcp_tokenomics_store_prune_ack_seeds(
-            &app,
-            prune_ack_seeds,
-            &reason_for_worker,
-        )
-        .await;
+        let stored_prune_ack_seed_count =
+            cloud_mcp_tokenomics_store_prune_ack_seeds(&app, prune_ack_seeds, &reason_for_worker)
+                .await;
         if stored_prune_ack_seed_count > 0 {
             cloud_mcp_record_tokenomics_sync_log(
                 "prune_ack_seeds",
@@ -11290,12 +11506,8 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         return;
     }
 
-    let stored_prune_ack_seed_count = cloud_mcp_tokenomics_store_prune_ack_seeds(
-        &app,
-        prune_ack_seeds,
-        &reason_for_worker,
-    )
-    .await;
+    let stored_prune_ack_seed_count =
+        cloud_mcp_tokenomics_store_prune_ack_seeds(&app, prune_ack_seeds, &reason_for_worker).await;
     if stored_prune_ack_seed_count > 0 {
         cloud_mcp_record_tokenomics_sync_log(
             "prune_ack_seeds",
@@ -32445,6 +32657,19 @@ async fn cloud_mcp_get_cached_workspace_todos(
 }
 
 async fn cloud_mcp_get_billing_status_for_state(state: &CloudMcpState) -> Result<Value, String> {
+    cloud_mcp_billing_status_request(state, false, None).await
+}
+
+/// `refresh: true` asks cloud-diffforge to drop its cached hot credit wallet
+/// and re-read the shared billing DB before answering — used right after a
+/// credit top-up purchase so the new balance lands without waiting for the
+/// next natural wallet rebuild. The refreshed snapshot is also re-broadcast
+/// by the server to every connected device.
+async fn cloud_mcp_billing_status_request(
+    state: &CloudMcpState,
+    refresh: bool,
+    reason: Option<&str>,
+) -> Result<Value, String> {
     let token = cloud_mcp_authorization_bearer(state)
         .await?
         .ok_or_else(|| "Cloud MCP auth token is not available.".to_string())?;
@@ -32453,6 +32678,17 @@ async fn cloud_mcp_get_billing_status_for_state(state: &CloudMcpState) -> Result
         .map_err(|error| format!("Cloud billing direct route unavailable: {error}"))?;
     let (billing_scope_type, team_id) = cloud_mcp_account_scope(state).await;
 
+    let mut request_body = json!({
+        "scopeType": billing_scope_type,
+        "teamId": team_id,
+    });
+    if refresh {
+        request_body["refresh"] = json!(true);
+        if let Some(reason) = reason {
+            request_body["reason"] = json!(reason);
+        }
+    }
+
     let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
     let response = client
         .post(&target.url)
@@ -32460,10 +32696,7 @@ async fn cloud_mcp_get_billing_status_for_state(state: &CloudMcpState) -> Result
             Some(token.as_str()),
             target.route_token.as_deref(),
         )?)
-        .json(&json!({
-            "scopeType": billing_scope_type,
-            "teamId": team_id,
-        }))
+        .json(&request_body)
         .send()
         .await
         .map_err(|error| format!("Unable to load billing status: {error}"))?;
@@ -32481,6 +32714,14 @@ async fn cloud_mcp_get_billing_status_for_state(state: &CloudMcpState) -> Result
 #[tauri::command]
 async fn cloud_mcp_get_billing_status(state: State<'_, CloudMcpState>) -> Result<Value, String> {
     cloud_mcp_get_billing_status_for_state(state.inner()).await
+}
+
+#[tauri::command]
+async fn cloud_mcp_refresh_billing_status(
+    state: State<'_, CloudMcpState>,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    cloud_mcp_billing_status_request(state.inner(), true, reason.as_deref()).await
 }
 
 #[tauri::command]
@@ -57843,7 +58084,7 @@ mod cloud_mcp_tests {
         assert!(packet.get("payloadHash").is_none());
         assert!(packet.get("idempotency_key").is_none());
         let expected_idempotency_key =
-            format!("tokenomics:v4:personal:device-a:day:{day_key}:content-hash-a");
+            format!("tokenomics:v5:personal:device-a:day:{day_key}:content-hash-a:seq:7");
         assert_eq!(
             packet["pid"].as_str(),
             Some(expected_idempotency_key.as_str())
@@ -58162,7 +58403,7 @@ mod cloud_mcp_tests {
     }
 
     #[test]
-    fn tokenomics_day_packet_coalesces_outbox_by_device_scope_and_day() {
+    fn tokenomics_day_packet_identity_includes_device_seq() {
         let day_start_ms = cloud_mcp_tokenomics_timestamp_ms("2026-06-16T00:00:00Z").unwrap();
         let day_key = cloud_mcp_tokenomics_day_key(day_start_ms);
         let summary = json!({
@@ -58215,7 +58456,7 @@ mod cloud_mcp_tests {
         assert_eq!(packet["sdm"].as_i64(), Some(day_start_ms));
         assert_eq!(packet["h"].as_str(), Some("content-hash-a"));
         let expected_idempotency_key =
-            format!("tokenomics:v4:personal:device-a:day:{day_key}:content-hash-a");
+            format!("tokenomics:v5:personal:device-a:day:{day_key}:content-hash-a:seq:7");
         assert_eq!(
             packet["pid"].as_str(),
             Some(expected_idempotency_key.as_str())
@@ -58234,7 +58475,7 @@ mod cloud_mcp_tests {
             Some(&bucket),
         )
         .unwrap();
-        assert_eq!(next_seq_packet["pid"].as_str(), packet["pid"].as_str());
+        assert_ne!(next_seq_packet["pid"].as_str(), packet["pid"].as_str());
         assert_eq!(next_seq_packet["ph"].as_str(), packet["ph"].as_str());
         assert_eq!(packet["ph"].as_str(), Some("content-hash-a"));
         assert_eq!(
@@ -58244,6 +58485,141 @@ mod cloud_mcp_tests {
             ),
             Some(format!("tokenomics:personal:device-a:day:{day_start_ms}"))
         );
+    }
+
+    #[test]
+    fn day_packet_outbox_keeps_claimed_seq_payload_immutable() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let cache_root = test_cloud_root("diffforge-tokenomics-immutable-seq-cache");
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let day_start_ms = cloud_mcp_tokenomics_timestamp_ms("2026-06-16T00:00:00Z").unwrap();
+        let day_key = cloud_mcp_tokenomics_day_key(day_start_ms);
+        let packet_id = cloud_mcp_tokenomics_day_packet_idempotency_key(
+            "personal",
+            "device-a",
+            &day_key,
+            "content-hash-a",
+            7,
+        );
+        let first_payload = json!({
+            "c": CLOUD_MCP_TOKENOMICS_CONTRACT,
+            "m": "delta",
+            "did": "device-a",
+            "sk": "personal",
+            "ds": 7,
+            "sdm": day_start_ms,
+            "sd": day_key.clone(),
+            "h": "content-hash-a",
+            "ph": "content-hash-a",
+            "pid": packet_id.clone(),
+        });
+        let changed_payload = json!({
+            "c": CLOUD_MCP_TOKENOMICS_CONTRACT,
+            "m": "delta",
+            "did": "device-a",
+            "sk": "personal",
+            "ds": 7,
+            "sdm": day_start_ms,
+            "sd": day_key.clone(),
+            "h": "content-hash-b",
+            "ph": "content-hash-b",
+            "pid": packet_id,
+        });
+
+        let first_row = cloud_mcp_outbox_enqueue_event(
+            CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
+            &first_payload,
+            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+            "unit_test",
+        )
+        .unwrap();
+        let conn = cloud_mcp_open_outbox_conn().unwrap();
+        conn.execute(
+            &format!(
+                "UPDATE {CLOUD_MCP_OUTBOX_TABLE}
+                 SET status='retrying', attempt_count=3, last_error='transient'
+                 WHERE outbox_id=?1"
+            ),
+            rusqlite::params![first_row.outbox_id.as_str()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let same_row = cloud_mcp_outbox_enqueue_event(
+            CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
+            &changed_payload,
+            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+            "unit_test",
+        )
+        .unwrap();
+        assert_eq!(same_row.outbox_id, first_row.outbox_id);
+
+        let conn = cloud_mcp_open_outbox_conn().unwrap();
+        let (payload_hash, payload_json, status, attempt_count): (String, String, String, i64) =
+            conn.query_row(
+                &format!(
+                    "SELECT payload_hash, payload_json, status, attempt_count
+                     FROM {CLOUD_MCP_OUTBOX_TABLE}
+                     WHERE outbox_id=?1"
+                ),
+                rusqlite::params![first_row.outbox_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        let stored_payload: Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(payload_hash, "content-hash-a");
+        assert_eq!(stored_payload["ds"].as_i64(), Some(7));
+        assert_eq!(stored_payload["h"].as_str(), Some("content-hash-a"));
+        assert_eq!(stored_payload["ph"].as_str(), Some("content-hash-a"));
+        assert_eq!(status, "retrying");
+        assert_eq!(attempt_count, 3);
+
+        let fresh_packet_id = cloud_mcp_tokenomics_day_packet_idempotency_key(
+            "personal",
+            "device-a",
+            &day_key,
+            "content-hash-b",
+            8,
+        );
+        let fresh_payload = json!({
+            "c": CLOUD_MCP_TOKENOMICS_CONTRACT,
+            "m": "delta",
+            "did": "device-a",
+            "sk": "personal",
+            "ds": 8,
+            "sdm": day_start_ms,
+            "sd": day_key,
+            "h": "content-hash-b",
+            "ph": "content-hash-b",
+            "pid": fresh_packet_id,
+        });
+        let fresh_row = cloud_mcp_outbox_enqueue_event(
+            CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
+            &fresh_payload,
+            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+            "unit_test",
+        )
+        .unwrap();
+        assert_ne!(fresh_row.outbox_id, first_row.outbox_id);
+
+        let active_same_day: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*)
+                     FROM {CLOUD_MCP_OUTBOX_TABLE}
+                     WHERE coalesce_key=?1
+                       AND status IN ('queued', 'retrying', 'in_flight')"
+                ),
+                rusqlite::params![format!("tokenomics:personal:device-a:day:{day_start_ms}")],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(active_same_day, 2);
+        drop(conn);
+        let _ = fs::remove_dir_all(cache_root);
     }
 
     #[test]
@@ -58262,6 +58638,7 @@ mod cloud_mcp_tests {
             "device-a",
             &day_key,
             content_hash,
+            7,
         );
         let source_payload = json!({
             "did": "device-a",
@@ -58324,6 +58701,7 @@ mod cloud_mcp_tests {
             "device-a",
             &day_key,
             content_hash,
+            7,
         );
         let source_payload = json!({
             "did": "device-a",
@@ -58349,6 +58727,7 @@ mod cloud_mcp_tests {
             "personal",
             day_start_ms,
             content_hash,
+            0,
             false,
         )
         .unwrap();
@@ -58380,7 +58759,8 @@ mod cloud_mcp_tests {
             1
         );
         let (bucket_day, _) = tokenomics_utc_hour_bucket_from_unix((day_start_ms / 1000) as u64);
-        let meta_key = format!("{TOKENOMICS_USAGE_EVENT_PRUNE_ACK_DAY_META_PREFIX}personal:{bucket_day}");
+        let meta_key =
+            format!("{TOKENOMICS_USAGE_EVENT_PRUNE_ACK_DAY_META_PREFIX}personal:{bucket_day}");
         let stored: String = tokenomics_conn
             .query_row(
                 "SELECT value FROM tokenomics_meta WHERE key=?1",
@@ -58390,11 +58770,30 @@ mod cloud_mcp_tests {
             .unwrap();
         assert_eq!(stored, expected_cursor);
 
+        // A matching content hash observed after the ack advances the prune
+        // cursor to the observation time (rollup rebuilds must not wedge it).
+        let observed_at_ms = state.acked_at_ms + 90_000;
+        let advanced = cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
+            "device-a",
+            "personal",
+            day_start_ms,
+            content_hash,
+            observed_at_ms,
+            false,
+        )
+        .unwrap();
+        let advanced_seed = advanced.prune_ack_seed.expect("CurrentAcked seed");
+        assert_eq!(
+            advanced_seed.local_cursor,
+            tokenomics_usage_event_prune_cloud_ack_cursor(&state.idempotency_key, observed_at_ms)
+        );
+
         let mismatch = cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
             "device-a",
             "personal",
             day_start_ms,
             "different-content-hash",
+            0,
             false,
         )
         .unwrap();

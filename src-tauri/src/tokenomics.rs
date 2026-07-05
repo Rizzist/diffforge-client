@@ -58,6 +58,8 @@ const TOKENOMICS_USAGE_EVENT_PRUNE_VACUUM_DONE_META_KEY: &str =
     "usage_event_prune_vacuum_done_v1";
 const TOKENOMICS_USAGE_EVENT_PRUNE_VACUUM_PENDING_META_KEY: &str =
     "usage_event_prune_vacuum_pending_v1";
+const TOKENOMICS_USAGE_EVENT_PRUNE_DELETED_SINCE_VACUUM_META_KEY: &str =
+    "usage_event_prune_deleted_since_vacuum_v1";
 const TOKENOMICS_USAGE_EVENT_PRUNE_ACK_DAY_META_PREFIX: &str =
     "usage_event_prune_acked_day_v1:";
 const TOKENOMICS_LIMITS_CHANGED_SYNC_REASON: &str = "tokenomics_limits_changed";
@@ -2567,6 +2569,7 @@ fn tokenomics_record_usage_event_prune_cloud_acks(
     }
     tokenomics_with_db_write_lock(conn, || {
         let mut stored = 0usize;
+        let mut newly_acked_days = 0usize;
         for seed in seeds {
             let day_start_unix = (seed.day_start_ms as u64) / 1000;
             let (bucket_day, _) = tokenomics_utc_hour_bucket_from_unix(day_start_unix);
@@ -2577,6 +2580,9 @@ fn tokenomics_record_usage_event_prune_cloud_acks(
                 "{TOKENOMICS_USAGE_EVENT_PRUNE_ACK_DAY_META_PREFIX}{}:{bucket_day}",
                 seed.billing_scope_key
             );
+            if tokenomics_meta_string(conn, &key).is_none() {
+                newly_acked_days = newly_acked_days.saturating_add(1);
+            }
             tokenomics_retry_sqlite_write("Unable to store Tokenomics prune day cursor", || {
                 conn.execute(
                     "INSERT INTO tokenomics_meta(key, value) VALUES(?1, ?2)
@@ -2592,6 +2598,18 @@ fn tokenomics_record_usage_event_prune_cloud_acks(
                 )
             })?;
             stored = stored.saturating_add(1);
+        }
+        if newly_acked_days > 0 {
+            // A day just became prune-eligible for the first time; drop the 24h
+            // gate so the next periodic cycle prunes it instead of waiting out
+            // the interval (acks routinely land seconds after a prune check).
+            tokenomics_retry_sqlite_write("Unable to reset Tokenomics prune check gate", || {
+                conn.execute(
+                    "DELETE FROM tokenomics_meta WHERE key=?1",
+                    rusqlite::params![TOKENOMICS_USAGE_EVENT_PRUNE_LAST_CHECKED_META_KEY],
+                )
+            })?;
+            TOKENOMICS_USAGE_EVENT_PRUNE_LAST_ATTEMPT_UNIX.store(0, Ordering::Release);
         }
         Ok(stored)
     })
@@ -2683,23 +2701,94 @@ fn tokenomics_prune_usage_events(
     conn.execute("DELETE FROM tokenomics_prune_candidate_rowids", [])
         .map_err(|error| format!("Unable to clear Tokenomics prune candidates: {error}"))?;
 
+    // Iterate day by day: one day whose ack cursor is stale must not occupy
+    // the candidate window forever and starve prunable days behind it.
+    let prune_days: Vec<String> = {
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT bucket_day FROM tokenomics_usage_events
+                 WHERE bucket_hour < ?1 AND bucket_day GLOB '????-??-??'
+                 ORDER BY bucket_day ASC",
+            )
+            .map_err(|error| format!("Unable to list Tokenomics prune days: {error}"))?;
+        let rows = statement
+            .query_map(rusqlite::params![retention_cutoff_hour], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|error| format!("Unable to list Tokenomics prune days: {error}"))?;
+        rows.filter_map(Result::ok).collect()
+    };
+
     let mut deleted_total = 0usize;
-    loop {
-        let deleted = tokenomics_prune_usage_event_chunk(conn, &retention_cutoff_hour)?;
-        if deleted == 0 {
-            break;
+    for prune_day in &prune_days {
+        loop {
+            let deleted =
+                tokenomics_prune_usage_event_chunk(conn, &retention_cutoff_hour, prune_day)?;
+            if deleted == 0 {
+                break;
+            }
+            deleted_total = deleted_total.saturating_add(deleted);
+            thread::sleep(Duration::from_millis(25));
+            if deleted < TOKENOMICS_USAGE_EVENT_PRUNE_CHUNK_ROWS {
+                break;
+            }
         }
-        deleted_total = deleted_total.saturating_add(deleted);
-        thread::sleep(Duration::from_millis(25));
-        if deleted < TOKENOMICS_USAGE_EVENT_PRUNE_CHUNK_ROWS {
-            break;
-        }
+    }
+
+    // Rows past retention with a day ack can still be rejected by the
+    // rollup-coverage guard when the ack cursor predates a rollup rebuild.
+    // Those cursors refresh on the next cloud sync cycle, so a blocked run
+    // backdates its check gate to retry in ~1h instead of a full interval.
+    let blocked = deleted_total == 0
+        && conn
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1
+                   FROM tokenomics_usage_events e
+                   JOIN tokenomics_meta day_ack
+                     ON day_ack.key=?2 ||
+                       CASE
+                         WHEN COALESCE(NULLIF(e.billing_scope_type, ''), 'unknown')='team'
+                           AND NULLIF(e.billing_team_id, '') IS NOT NULL
+                         THEN 'team:' || e.billing_team_id
+                         WHEN COALESCE(NULLIF(e.billing_scope_type, ''), 'unknown')='personal'
+                         THEN 'personal'
+                         ELSE 'unknown'
+                       END || ':' || e.bucket_day
+                    AND NULLIF(day_ack.value, '') IS NOT NULL
+                   WHERE e.bucket_hour < ?1
+                   LIMIT 1
+                 )",
+                rusqlite::params![
+                    retention_cutoff_hour,
+                    TOKENOMICS_USAGE_EVENT_PRUNE_ACK_DAY_META_PREFIX
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap_or(false);
+    let recheck_gate_unix = if blocked {
+        now_unix.saturating_sub(TOKENOMICS_USAGE_EVENT_PRUNE_INTERVAL_SECS.saturating_sub(3_600))
+    } else {
+        now_unix
+    };
+    if blocked {
+        TOKENOMICS_USAGE_EVENT_PRUNE_LAST_ATTEMPT_UNIX.store(recheck_gate_unix, Ordering::Release);
+        // Blocked rows usually mean stale ack cursors on days outside the
+        // cloud sync window. Re-open the one-time historical seeding pass so
+        // the next sync cycle re-verifies those days' content hashes and
+        // reseeds fresh cursors.
+        let _ = conn.execute(
+            "DELETE FROM tokenomics_meta
+             WHERE key LIKE 'usage_event_prune_historical_day_ack_seed_done_v1:%'
+                OR key LIKE 'usage_event_prune_historical_day_ack_seed_progress_v1:%'",
+            [],
+        );
     }
 
     tokenomics_store_meta_value(
         conn,
         TOKENOMICS_USAGE_EVENT_PRUNE_LAST_CHECKED_META_KEY,
-        &now_unix.to_string(),
+        &recheck_gate_unix.to_string(),
     )?;
 
     let vacuum = tokenomics_maybe_vacuum_after_usage_event_prune(
@@ -2877,6 +2966,7 @@ fn tokenomics_capture_prune_source_import_identities(
 fn tokenomics_prune_usage_event_chunk(
     conn: &mut rusqlite::Connection,
     retention_cutoff_hour: &str,
+    bucket_day: &str,
 ) -> Result<usize, String> {
     let now = tokenomics_now_iso_like();
     let chunk_limit = TOKENOMICS_USAGE_EVENT_PRUNE_CHUNK_ROWS as i64;
@@ -2912,6 +3002,9 @@ fn tokenomics_prune_usage_event_chunk(
                    END || ':' || e.bucket_day
                 AND NULLIF(day_ack.value, '') IS NOT NULL
                WHERE e.bucket_hour < ?1
+                 AND e.bucket_hour>=?4 || 'T00:00:00Z'
+                 AND e.bucket_hour<=?4 || 'T23:59:59Z'
+                 AND e.bucket_day=?4
                  AND e.bucket_hour GLOB '????-??-??T??:00:00Z'
                  AND e.bucket_day GLOB '????-??-??'
                ORDER BY e.bucket_hour ASC, e.rowid ASC
@@ -3003,7 +3096,8 @@ fn tokenomics_prune_usage_event_chunk(
         rusqlite::params![
             retention_cutoff_hour,
             TOKENOMICS_USAGE_EVENT_PRUNE_ACK_DAY_META_PREFIX,
-            chunk_limit
+            chunk_limit,
+            bucket_day
         ],
     )
     .map_err(|error| format!("Unable to select Tokenomics prune chunk: {error}"))?;
@@ -3018,7 +3112,7 @@ fn tokenomics_prune_usage_event_chunk(
     if inserted == 0 {
         return Ok(0);
     }
-    tokenomics_with_db_write_transaction(
+    let deleted = tokenomics_with_db_write_transaction(
         conn,
         "Tokenomics usage event prune chunk",
         |transaction| {
@@ -3119,7 +3213,8 @@ fn tokenomics_prune_usage_event_chunk(
                 .map_err(|error| format!("Unable to clear Tokenomics prune chunk: {error}"))?;
             Ok(deleted)
         },
-    )
+    )?;
+    Ok(deleted)
 }
 
 fn tokenomics_maybe_vacuum_after_usage_event_prune(
@@ -3128,14 +3223,31 @@ fn tokenomics_maybe_vacuum_after_usage_event_prune(
     deleted_total: usize,
     vacuum_pending: bool,
 ) -> Result<Value, String> {
-    if tokenomics_meta_string(conn, TOKENOMICS_USAGE_EVENT_PRUNE_VACUUM_DONE_META_KEY).is_some() {
-        return Ok(json!({ "status": "skipped", "reason": "already_done" }));
+    // Deletes accumulate across prune runs; vacuum whenever enough rows have
+    // been reclaimed since the last vacuum, not just once ever. The DB-size
+    // trigger stays first-vacuum-only so a large-but-stable file does not
+    // re-vacuum on every small prune.
+    let deleted_since_vacuum = tokenomics_meta_u64(
+        conn,
+        TOKENOMICS_USAGE_EVENT_PRUNE_DELETED_SINCE_VACUUM_META_KEY,
+    )
+    .unwrap_or(0)
+    .saturating_add(deleted_total as u64);
+    if deleted_total > 0 {
+        tokenomics_store_meta_value(
+            conn,
+            TOKENOMICS_USAGE_EVENT_PRUNE_DELETED_SINCE_VACUUM_META_KEY,
+            &deleted_since_vacuum.to_string(),
+        )?;
     }
+    let first_vacuum_done =
+        tokenomics_meta_string(conn, TOKENOMICS_USAGE_EVENT_PRUNE_VACUUM_DONE_META_KEY).is_some();
     let db_size = fs::metadata(db_path).map(|metadata| metadata.len()).unwrap_or(0);
     let should_vacuum = vacuum_pending
-        || (deleted_total > 0
-            && (deleted_total >= TOKENOMICS_USAGE_EVENT_VACUUM_MIN_DELETED_ROWS
-                || db_size >= TOKENOMICS_USAGE_EVENT_VACUUM_MIN_DB_BYTES));
+        || deleted_since_vacuum >= TOKENOMICS_USAGE_EVENT_VACUUM_MIN_DELETED_ROWS as u64
+        || (!first_vacuum_done
+            && deleted_total > 0
+            && db_size >= TOKENOMICS_USAGE_EVENT_VACUUM_MIN_DB_BYTES);
     if !should_vacuum {
         return Ok(json!({ "status": "skipped", "reason": "below_threshold" }));
     }
@@ -3187,6 +3299,12 @@ fn tokenomics_maybe_vacuum_after_usage_event_prune(
             conn.execute(
                 "DELETE FROM tokenomics_meta WHERE key=?1",
                 rusqlite::params![TOKENOMICS_USAGE_EVENT_PRUNE_VACUUM_PENDING_META_KEY],
+            )
+        })?;
+        tokenomics_retry_sqlite_write("Unable to reset Tokenomics vacuum delete counter", || {
+            conn.execute(
+                "DELETE FROM tokenomics_meta WHERE key=?1",
+                rusqlite::params![TOKENOMICS_USAGE_EVENT_PRUNE_DELETED_SINCE_VACUUM_META_KEY],
             )
         })?;
         Ok(())
@@ -16638,7 +16756,8 @@ mod tokenomics_tests {
         .unwrap();
 
         let deleted =
-            tokenomics_prune_usage_event_chunk(&mut conn, "9999-12-31T23:00:00Z").unwrap();
+            tokenomics_prune_usage_event_chunk(&mut conn, "9999-12-31T23:00:00Z", &bucket_day)
+                .unwrap();
         assert_eq!(deleted, 1);
         let raw_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM tokenomics_usage_events", [], |row| {

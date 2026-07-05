@@ -27,6 +27,9 @@ const VIDEO_CODE_DEFAULT_FPS: u32 = 30;
 static VIDEO_CODE_INSTALL_JOBS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, VideoJobHandle>>,
 > = std::sync::OnceLock::new();
+static VIDEO_CODE_PREVIEW_START_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
+
 static VIDEO_CODE_PREVIEWS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, VideoCodePreviewEntry>>,
 > = std::sync::OnceLock::new();
@@ -1021,6 +1024,39 @@ fn video_code_render_blocking(
         .take()
         .ok_or_else(|| "Unable to read hyperframes render output.".to_string())?;
     let stderr = child.stderr.take();
+    let child = std::sync::Arc::new(std::sync::Mutex::new(child));
+
+    // The stdout loop below blocks on lines(); a hung child that keeps the
+    // pipe open but silent would never hit the in-loop cancel/timeout checks.
+    // This supervisor enforces them independently by killing the child, which
+    // closes the pipe and unblocks the reader.
+    let started_at = std::time::Instant::now();
+    let supervisor_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let supervisor = {
+        let child = child.clone();
+        let cancel = cancel.clone();
+        let stop = supervisor_stop.clone();
+        std::thread::spawn(move || {
+            loop {
+                if stop.load(std::sync::atomic::Ordering::Acquire) {
+                    return;
+                }
+                if let Ok(mut guard) = child.lock() {
+                    if matches!(guard.try_wait(), Ok(Some(_)) | Err(_)) {
+                        return;
+                    }
+                    if cancel.load(std::sync::atomic::Ordering::Acquire)
+                        || app_shutdown_requested()
+                        || started_at.elapsed().as_secs() > VIDEO_CODE_RENDER_TIMEOUT_SECS
+                    {
+                        let _ = guard.kill();
+                        return;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
+            }
+        })
+    };
 
     // Drain stderr on a side thread so the child can't block on a full pipe;
     // keep a small tail for diagnostics.
@@ -1043,7 +1079,6 @@ fn video_code_render_blocking(
         })
     });
 
-    let started_at = std::time::Instant::now();
     let mut reported_error: Option<String> = None;
     let mut saw_done = false;
     {
@@ -1051,12 +1086,6 @@ fn video_code_render_blocking(
         let reader = std::io::BufReader::new(stdout);
         for line in reader.lines() {
             if cancel.load(std::sync::atomic::Ordering::Acquire) || app_shutdown_requested() {
-                let _ = child.kill();
-                break;
-            }
-            if started_at.elapsed().as_secs() > VIDEO_CODE_RENDER_TIMEOUT_SECS {
-                let _ = child.kill();
-                reported_error = Some("Hyperframes render timed out.".to_string());
                 break;
             }
             let Ok(line) = line else {
@@ -1097,9 +1126,30 @@ fn video_code_render_blocking(
             }
         }
     }
-    let exit = child
-        .wait()
-        .map_err(|error| format!("Unable to wait for hyperframes render: {error}"))?;
+    // Stdout closed; give the child a short grace period to exit on its own
+    // before forcing it down (never wait() under the lock — the supervisor
+    // needs it to stay able to kill).
+    let exit = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let waited = child
+                .lock()
+                .map_err(|_| "Hyperframes render child lock is poisoned.".to_string())?
+                .try_wait()
+                .map_err(|error| format!("Unable to wait for hyperframes render: {error}"))?;
+            if let Some(status) = waited {
+                break status;
+            }
+            if std::time::Instant::now() >= deadline {
+                if let Ok(mut guard) = child.lock() {
+                    let _ = guard.kill();
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    };
+    supervisor_stop.store(true, std::sync::atomic::Ordering::Release);
+    let _ = supervisor.join();
     if let Some(thread) = stderr_thread {
         let _ = thread.join();
     }
@@ -1108,6 +1158,9 @@ fn video_code_render_blocking(
     }
     if saw_done && exit.success() && output_abs.is_file() {
         return Ok(());
+    }
+    if reported_error.is_none() && started_at.elapsed().as_secs() > VIDEO_CODE_RENDER_TIMEOUT_SECS {
+        reported_error = Some("Hyperframes render timed out.".to_string());
     }
     if let Some(error) = reported_error {
         return Err(format!("Hyperframes render failed: {error}"));
@@ -1173,6 +1226,12 @@ fn video_code_preview_start_blocking(
     app: &tauri::AppHandle,
     project_dir: &std::path::Path,
 ) -> Result<serde_json::Value, String> {
+    // Serialize starts: concurrent callers could otherwise pick the same free
+    // port, and the loser would mistake the winner's server for its own.
+    let _start_guard = VIDEO_CODE_PREVIEW_START_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .map_err(|_| "Hyperframes preview start lock is poisoned.".to_string())?;
     let key = video_code_preview_key(project_dir);
     if let Ok(previews) = video_code_previews().lock() {
         if let Some(entry) = previews.get(&key) {
@@ -1278,12 +1337,23 @@ fn video_code_resolve_source(
             "Composition source not found: {source_path}. Write the HTML file first."
         ));
     }
-    let entry = abs
+    // Lexical containment is not enough: a symlink inside media/code/ could
+    // point anywhere. Compare resolved paths too.
+    let canonical = abs
+        .canonicalize()
+        .map_err(|error| format!("Unable to resolve composition source: {error}"))?;
+    let canonical_code_root = code_root
+        .canonicalize()
+        .map_err(|error| format!("Unable to resolve media/code directory: {error}"))?;
+    if !canonical.starts_with(&canonical_code_root) {
+        return Err("Composition sources must live under media/code/.".to_string());
+    }
+    let entry = canonical
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("index.html")
         .to_string();
-    let project_dir = abs
+    let project_dir = canonical
         .parent()
         .map(std::path::Path::to_path_buf)
         .ok_or_else(|| "Composition source has no parent directory.".to_string())?;
@@ -1301,6 +1371,15 @@ async fn video_code_tools_status(
 
 #[tauri::command]
 async fn video_code_tools_install(app: tauri::AppHandle) -> Result<VideoJobStartResult, String> {
+    // The install steps delete and rebuild the managed Node/harness dirs;
+    // two overlapping installs would corrupt them.
+    if let Some(lock) = VIDEO_CODE_INSTALL_JOBS.get() {
+        if let Ok(jobs) = lock.lock() {
+            if !jobs.is_empty() {
+                return Err("Hyperframes tools install is already running.".to_string());
+            }
+        }
+    }
     let (job_id, cancel) = video_job_registry_insert(&VIDEO_CODE_INSTALL_JOBS)?;
     tauri::async_runtime::spawn(video_code_tools_install_worker(
         app,
@@ -1350,4 +1429,134 @@ async fn video_code_preview_stop(repo_path: String, source_path: String) -> Resu
     })
     .await
     .map_err(|error| format!("Unable to stop hyperframes preview: {error}"))?
+}
+
+#[cfg(test)]
+mod video_code_tests {
+    #[test]
+    fn parse_duration_reads_composition_root() {
+        let html = r#"<div id="root" data-composition-id="main" data-start="0" data-duration="12.5" data-width="1920">"#;
+        assert_eq!(super::video_code_parse_duration_ms(html), Some(12_500));
+    }
+
+    #[test]
+    fn parse_duration_ignores_clip_durations_outside_the_root_tag() {
+        let html = concat!(
+            r#"<div data-composition-id="main" data-duration="8">"#,
+            r#"<h1 class="clip" data-start="0" data-duration="2">Hi</h1></div>"#,
+        );
+        assert_eq!(super::video_code_parse_duration_ms(html), Some(8_000));
+    }
+
+    #[test]
+    fn parse_duration_rejects_missing_or_invalid_values() {
+        assert_eq!(super::video_code_parse_duration_ms("<div data-duration=\"5\">"), None);
+        assert_eq!(
+            super::video_code_parse_duration_ms(
+                "<div data-composition-id=\"main\" data-duration=\"-3\">"
+            ),
+            None
+        );
+        assert_eq!(
+            super::video_code_parse_duration_ms(
+                "<div data-composition-id=\"main\" data-duration=\"abc\">"
+            ),
+            None
+        );
+        assert_eq!(
+            super::video_code_parse_duration_ms("<div data-composition-id=\"main\">"),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_duration_supports_single_quotes_and_whitespace() {
+        let html = "<div data-composition-id='main' data-duration = '4.2'>";
+        assert_eq!(super::video_code_parse_duration_ms(html), Some(4_200));
+    }
+
+    #[test]
+    fn scaffold_creates_parseable_composition_and_uniquifies_slugs() {
+        let temp = std::env::temp_dir().join(format!(
+            "diffforge-video-code-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = temp.clone();
+        let media_root = root.join("media");
+        std::fs::create_dir_all(&media_root).unwrap();
+
+        let first = super::video_code_scaffold_composition(
+            &root,
+            &media_root,
+            "My Intro Video",
+            9_000,
+            1280,
+            720,
+            24,
+        )
+        .unwrap();
+        assert_eq!(first, "media/code/my-intro-video/index.html");
+        let html = std::fs::read_to_string(root.join(&first)).unwrap();
+        assert_eq!(super::video_code_parse_duration_ms(&html), Some(9_000));
+        assert!(html.contains("data-width=\"1280\""));
+        assert!(root
+            .join("media/code/my-intro-video/AGENTS.md")
+            .is_file());
+
+        let second = super::video_code_scaffold_composition(
+            &root,
+            &media_root,
+            "My Intro Video",
+            5_000,
+            1920,
+            1080,
+            30,
+        )
+        .unwrap();
+        assert_eq!(second, "media/code/my-intro-video-2/index.html");
+
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
+
+    #[test]
+    fn resolve_source_confines_to_media_code() {
+        let temp = std::env::temp_dir().join(format!(
+            "diffforge-video-code-resolve-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let root = temp.clone();
+        let media_root = root.join("media");
+        std::fs::create_dir_all(media_root.join("code/comp")).unwrap();
+        std::fs::write(media_root.join("code/comp/index.html"), "<html></html>").unwrap();
+        std::fs::write(root.join("secret.html"), "<html></html>").unwrap();
+
+        let (project_dir, entry) =
+            super::video_code_resolve_source(&root, &media_root, "media/code/comp/index.html")
+                .unwrap();
+        assert_eq!(entry, "index.html");
+        assert!(project_dir.ends_with("media/code/comp") || project_dir.is_dir());
+
+        assert!(super::video_code_resolve_source(&root, &media_root, "secret.html").is_err());
+        assert!(
+            super::video_code_resolve_source(&root, &media_root, "media/code/missing/index.html")
+                .is_err()
+        );
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(
+                root.join("secret.html"),
+                media_root.join("code/comp/link.html"),
+            )
+            .unwrap();
+            assert!(super::video_code_resolve_source(
+                &root,
+                &media_root,
+                "media/code/comp/link.html"
+            )
+            .is_err());
+        }
+
+        std::fs::remove_dir_all(&temp).unwrap();
+    }
 }

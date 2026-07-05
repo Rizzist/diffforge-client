@@ -1594,6 +1594,40 @@ async fn desktop_auth_start_login(app: AppHandle) -> Result<Value, String> {
     }))
 }
 
+/// Start a one-time credit top-up checkout for the signed-in account. The web
+/// backend validates the desktop session token and returns a Stripe Checkout
+/// URL the shell opens in the system browser, so the user lands on Stripe
+/// already identified — no interim sign-in page.
+#[tauri::command]
+async fn desktop_billing_start_topup_checkout(
+    app: AppHandle,
+    packs: Option<u32>,
+) -> Result<Value, String> {
+    let snapshot = desktop_auth_snapshot(&app);
+    let token = snapshot
+        .get("token")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| is_safe_auth_value(value))
+        .map(str::to_string)
+        .ok_or_else(|| "Sign in to Diff Forge before buying credits.".to_string())?;
+    let packs = packs.unwrap_or(1).clamp(1, 25);
+
+    let client = http_client(Duration::from_secs(DEFAULT_API_TIMEOUT_SECS))?;
+    let response = client
+        .post(api_endpoint("desktop/topup-checkout"))
+        .bearer_auth(token)
+        .json(&json!({
+            "packs": packs,
+            "desktopCallbackScheme": desktop_auth_callback_scheme(),
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("Unable to start credit top-up checkout: {error}"))?;
+
+    read_api_response(response, "Unable to start credit top-up checkout.").await
+}
+
 #[tauri::command]
 async fn desktop_auth_validate_session(
     app: AppHandle,

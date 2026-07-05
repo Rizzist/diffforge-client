@@ -1,7 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { useNativeWebview } from "../web/webNative.js";
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { ArrowBack } from "@styled-icons/material-rounded/ArrowBack";
 import { AutoAwesome } from "@styled-icons/material-rounded/AutoAwesome";
@@ -57,6 +60,128 @@ import {
 
 const SLOT_STORAGE_PREFIX = "diffforge.video.gridPaneSlot.";
 const LAYOUT_STORAGE_PREFIX = "diffforge.video.paneLayout.";
+
+// Right-click menu for hyperframes code clips (open source / preview / re-render).
+const ClipMenu = styled.div`
+  position: fixed;
+  z-index: 60;
+  min-width: 200px;
+  display: grid;
+  padding: 4px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 9px;
+  background: rgba(7, 12, 22, 0.98);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.55);
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+    border-color: rgba(15, 23, 42, 0.14);
+    box-shadow: 0 14px 34px rgba(15, 23, 42, 0.18);
+  }
+`;
+
+const ClipMenuItem = styled.button`
+  appearance: none;
+  border: none;
+  background: transparent;
+  text-align: left;
+  padding: 6px 9px;
+  border-radius: 6px;
+  font-size: 11px;
+  font-weight: 650;
+  color: rgba(226, 232, 240, 0.94);
+  cursor: pointer;
+
+  &:hover {
+    background: rgba(37, 99, 235, 0.2);
+  }
+
+  &:disabled {
+    opacity: 0.45;
+    cursor: default;
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1e293b;
+  }
+`;
+
+const ClipMenuHint = styled.div`
+  padding: 4px 9px 5px;
+  font-size: 9px;
+  font-weight: 600;
+  color: #8fa0b8;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 260px;
+`;
+
+const CodePreviewViewport = styled.div`
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+  background: #05070c;
+`;
+
+// Live Hyperframes Studio preview for a composition, embedded as a native
+// child webview over a sheet-sized viewport (same machinery as web panes).
+function CodePreviewSheet({ repoPath, sourcePath, onClose }) {
+  const viewportRef = useRef(null);
+  const [url, setUrl] = useState("");
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let disposed = false;
+    setUrl("");
+    setError("");
+    invoke("video_code_preview_start", { repoPath, sourcePath })
+      .then((result) => {
+        if (!disposed) {
+          setUrl(String(result?.url || ""));
+        }
+      })
+      .catch((err) => {
+        if (!disposed) {
+          setError(String(err));
+        }
+      });
+    return () => {
+      disposed = true;
+    };
+  }, [repoPath, sourcePath]);
+
+  useNativeWebview({
+    viewportRef,
+    url,
+    visible: Boolean(url),
+    enabled: Boolean(url),
+    layoutKey: `video-code-preview:${sourcePath}`,
+    scopeParts: ["video-code-preview", repoPath, sourcePath],
+  });
+
+  return (
+    <VideoSheet>
+      <VideoSheetHeader>
+        Composition preview
+        <VideoHint style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {sourcePath}
+        </VideoHint>
+        <VideoRailSpacer />
+        <VideoIconButton onClick={onClose} title="Close preview" type="button">
+          <Close aria-hidden="true" />
+        </VideoIconButton>
+      </VideoSheetHeader>
+      <CodePreviewViewport ref={viewportRef}>
+        {error ? (
+          <VideoErrorText style={{ padding: 10 }}>{error}</VideoErrorText>
+        ) : !url ? (
+          <VideoHint style={{ padding: 10 }}>Starting the Hyperframes preview server…</VideoHint>
+        ) : null}
+      </CodePreviewViewport>
+    </VideoSheet>
+  );
+}
 
 // Everything about the pane's surface that should survive a restart:
 // which panels are open, which asset's transcript/details, and the split
@@ -771,6 +896,25 @@ export default function VideoWorkspacePane({
   const [generationByPath, setGenerationByPath] = useState({});
   const seedNonceRef = useRef(0);
   const restoredPanelAssetRef = useRef(false);
+
+  // Hyperframes code clips: right-click menu, embedded Studio preview, and
+  // re-render swaps (jobId → { oldPath, newPath } applied when the job lands).
+  const [codeMenu, setCodeMenu] = useState(null);
+  const [codePreviewSource, setCodePreviewSource] = useState("");
+  const codeReRenderRef = useRef(new Map());
+
+  useEffect(() => {
+    if (!codeMenu) {
+      return undefined;
+    }
+    const close = () => setCodeMenu(null);
+    window.addEventListener("pointerdown", close);
+    window.addEventListener("blur", close);
+    return () => {
+      window.removeEventListener("pointerdown", close);
+      window.removeEventListener("blur", close);
+    };
+  }, [codeMenu]);
 
   // Persist the surface flags whenever they change (layouts save separately,
   // debounced, from the split groups' onLayoutChanged).
@@ -1866,11 +2010,42 @@ export default function VideoWorkspacePane({
             if (payload.done || payload.error) {
               delete next[path];
             } else {
-              next[path] = { model: payload.model || "", percent: payload.percent ?? null };
+              next[path] = {
+                model: payload.model || "",
+                percent: payload.percent ?? null,
+                state: payload.state || "",
+              };
             }
           }
           return next;
         });
+      }
+      // A finished re-render swaps every clip from the old mp4 onto the
+      // freshly rendered one (versioned path — the old file stays).
+      const swap = payload.done ? codeReRenderRef.current.get(payload.jobId) : null;
+      if (swap) {
+        codeReRenderRef.current.delete(payload.jobId);
+        if (!payload.error && swap.newPath) {
+          const currentProject = projectStateRef.current;
+          if (currentProject) {
+            let changed = false;
+            const tracks = (currentProject.tracks || []).map((track) => {
+              let trackChanged = false;
+              const clips = (track.clips || []).map((clip) => {
+                if (clip.assetPath === swap.oldPath) {
+                  trackChanged = true;
+                  return { ...clip, assetPath: swap.newPath };
+                }
+                return clip;
+              });
+              changed = changed || trackChanged;
+              return trackChanged ? { ...track, clips } : track;
+            });
+            if (changed) {
+              handleProjectChange({ ...currentProject, tracks }, { transient: false });
+            }
+          }
+        }
       }
       // Success: swap the ghost for the real asset even when the Generate
       // panel (whose onGenerated normally refreshes) has been closed.
@@ -1915,7 +2090,7 @@ export default function VideoWorkspacePane({
   }, [handleProjectChange, refreshAssets]);
 
   const addPlannedClip = useCallback(
-    (plannedPath, durationMs) => {
+    (plannedPath, durationMs, { model = "" } = {}) => {
       const current = projectStateRef.current;
       if (!current || !plannedPath) {
         return;
@@ -1931,10 +2106,100 @@ export default function VideoWorkspacePane({
       // event may take a beat to arrive with the model + percent.
       setGenerationByPath((currentMap) => ({
         ...currentMap,
-        [plannedPath]: currentMap[plannedPath] || { model: "", percent: null },
+        [plannedPath]: currentMap[plannedPath] || { model, percent: null, state: "" },
       }));
     },
     [currentPlayheadMs, handleProjectChange],
+  );
+
+  // Hyperframes code clips: a rendered mp4 carries a hyperframes-render
+  // relation back to its composition; a still-pending ghost is matched to its
+  // job in the ledger by planned path.
+  const resolveCodeSource = useCallback(
+    async (assetPath) => {
+      const asset = assetsByPath[assetPath];
+      const relation = (asset?.relations || []).find((rel) => rel.via === "hyperframes-render");
+      if (relation?.path) {
+        return relation.path;
+      }
+      try {
+        const result = await invoke("video_jobs_list", { repoPath });
+        const jobs = Array.isArray(result?.jobs) ? result.jobs : [];
+        const job = jobs.find(
+          (entry) => entry.sourcePath && (entry.plannedPaths || []).includes(assetPath),
+        );
+        return job?.sourcePath || "";
+      } catch {
+        return "";
+      }
+    },
+    [assetsByPath, repoPath],
+  );
+
+  const handleClipContextMenu = useCallback(
+    (event, clip, track) => {
+      if (track.kind !== "video" || !clip.assetPath) {
+        return;
+      }
+      const asset = assetsByPath[clip.assetPath];
+      const isCode =
+        (asset?.relations || []).some((rel) => rel.via === "hyperframes-render") ||
+        (asset?.pending && asset?.model === "hyperframes");
+      if (!isCode) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      setCodeMenu({
+        x: event.clientX,
+        y: event.clientY,
+        assetPath: clip.assetPath,
+        pending: Boolean(asset?.pending),
+        sourcePath: "",
+      });
+      resolveCodeSource(clip.assetPath).then((sourcePath) => {
+        setCodeMenu((current) =>
+          current && current.assetPath === clip.assetPath ? { ...current, sourcePath } : current,
+        );
+      });
+    },
+    [assetsByPath, resolveCodeSource],
+  );
+
+  // Re-render: a fresh job renders the composition to a NEW generated path
+  // (the old mp4 stays as a version); clips swap over when the render lands.
+  const reRenderCodeClip = useCallback(
+    async (assetPath, sourcePath) => {
+      setCodeMenu(null);
+      if (!sourcePath) {
+        return;
+      }
+      try {
+        const started = await invoke("video_generate_start", {
+          repoPath,
+          request: {
+            providerId: "hyperframes",
+            model: "hyperframes",
+            mode: "code-render",
+            prompt: "",
+            inputAssetPaths: [],
+            audioAssetPaths: [],
+            params: { sourcePath },
+            loraId: null,
+            auth: null,
+          },
+        });
+        const newPath = Array.isArray(started?.plannedPaths) ? started.plannedPaths[0] || "" : "";
+        if (started?.jobId && newPath) {
+          codeReRenderRef.current.set(started.jobId, { oldPath: assetPath, newPath });
+        }
+        // The composition is already authored — skip straight to rendering.
+        await invoke("video_generate_code_render", { repoPath, jobId: started.jobId });
+      } catch (err) {
+        setPaneError(String(err));
+      }
+    },
+    [repoPath],
   );
 
   // Preview text drag → clip style updates (transient while dragging).
@@ -2253,6 +2518,7 @@ export default function VideoWorkspacePane({
       canUndo={canUndo}
       generationByPath={generationByPath}
       onChange={handleProjectChange}
+      onClipContextMenu={handleClipContextMenu}
       onRangesChange={setRanges}
       onRedo={redo}
       onSeek={commitSeek}
@@ -2274,6 +2540,7 @@ export default function VideoWorkspacePane({
       onGenerated={refreshAssets}
       onInsertAsset={insertAssetPath}
       onPlannedClip={addPlannedClip}
+      onPreviewCode={setCodePreviewSource}
       paneToken={paneId || "video-pane"}
       repoPath={repoPath}
       seed={generateSeed}
@@ -2577,10 +2844,64 @@ export default function VideoWorkspacePane({
                   ) : null}
                 </>
               )}
+              {codePreviewSource ? (
+                <CodePreviewSheet
+                  onClose={() => setCodePreviewSource("")}
+                  repoPath={repoPath}
+                  sourcePath={codePreviewSource}
+                />
+              ) : null}
             </EditorArea>
           </>
         )}
       </PaneBody>
+      {codeMenu
+        ? createPortal(
+            <ClipMenu
+              onPointerDown={(event) => event.stopPropagation()}
+              style={{ left: `${codeMenu.x + 2}px`, top: `${codeMenu.y + 2}px` }}
+            >
+              <ClipMenuHint>
+                {codeMenu.sourcePath || "Hyperframes composition"}
+              </ClipMenuHint>
+              <ClipMenuItem
+                disabled={!codeMenu.sourcePath}
+                onClick={() => {
+                  setCodeMenu(null);
+                  revealItemInDir(
+                    `${repoPath.replace(/\/$/, "")}/${codeMenu.sourcePath}`,
+                  ).catch(() => {});
+                }}
+                type="button"
+              >
+                ⌁ Open composition source
+              </ClipMenuItem>
+              <ClipMenuItem
+                disabled={!codeMenu.sourcePath}
+                onClick={() => {
+                  setCodeMenu(null);
+                  setCodePreviewSource(codeMenu.sourcePath);
+                }}
+                type="button"
+              >
+                ◉ Preview composition
+              </ClipMenuItem>
+              <ClipMenuItem
+                disabled={!codeMenu.sourcePath || codeMenu.pending}
+                onClick={() => reRenderCodeClip(codeMenu.assetPath, codeMenu.sourcePath)}
+                title={
+                  codeMenu.pending
+                    ? "Still rendering — re-render becomes available once the clip lands"
+                    : "Render the composition again to a new file and swap this clip onto it"
+                }
+                type="button"
+              >
+                ↻ Re-render
+              </ClipMenuItem>
+            </ClipMenu>,
+            document.body,
+          )
+        : null}
     </PaneSurface>
   );
 }

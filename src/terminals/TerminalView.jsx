@@ -23169,6 +23169,7 @@ function TerminalView({
   terminalRolesByIndex = {},
   terminalThreadsByIndex = {},
   terminalWorkspaceCoordinationTargets = [],
+  terminalWorkspaceExplicitEmpty = false,
   terminalWorkspaceRootWasEmptyAtSelection = false,
   terminalWorkspaceWorkingDirectory,
   terminalWorkspaceLogicalIndexes,
@@ -23259,7 +23260,7 @@ function TerminalView({
       && !isAppClosing
       && !isWorkspaceRuntimeDeactivating,
   );
-  const logicalTerminalIndexes = Array.isArray(terminalWorkspaceLogicalIndexes)
+  const logicalTerminalIndexes = !terminalWorkspaceExplicitEmpty && Array.isArray(terminalWorkspaceLogicalIndexes)
     ? terminalWorkspaceLogicalIndexes
     : [];
   const logicalTerminalIndexSignature = logicalTerminalIndexes.join(",");
@@ -40436,6 +40437,16 @@ function TerminalView({
           const isPcbPane = paneKinds?.[terminalIndex] === "pcb";
           const isVmPane = paneKinds?.[terminalIndex] === "vm";
           const isVideoPane = paneKinds?.[terminalIndex] === "video";
+          const confirmedTerminalPane = Boolean(
+            terminalWorkspace?.id
+              && !terminalWorkspaceExplicitEmpty
+              && terminalWorkspaceLogicalTerminalCount > 0
+              && logicalTerminalIndexes.includes(terminalIndex)
+              && !isWebPane
+              && !isPcbPane
+              && !isVmPane
+              && !isVideoPane,
+          );
           if (isWebPane) {
             const webSurfaceReady = hasMeasuredRect;
             const webLayoutRect = slotRectForLayout ? {
@@ -41059,6 +41070,7 @@ function TerminalView({
                 agentStatuses={agentStatuses}
                 agentStatusError={agentStatusError}
                 agentStatusState={agentStatusState}
+                confirmedTerminalPane={confirmedTerminalPane}
                 draggablePaneCount={draggableWorkspacePaneCount}
                 fullscreenState={fullscreenState}
                 isActive={terminalActive && !tabHidden}

@@ -623,6 +623,7 @@ export default function Timeline({
   canUndo = false,
   generationByPath = {},
   onChange,
+  onClipContextMenu,
   onRangesChange,
   onRedo,
   onSeek,
@@ -1531,19 +1532,25 @@ export default function Timeline({
                   // file yet, so dress it as a pulsing ghost until the job lands.
                   const generating = Boolean(asset?.pending);
                   const generation = generating ? generationByPath[clip.assetPath] : null;
-                  const generationModel = generation?.model
-                    ? GENERATION_MODEL_NAMES.get(generation.model) || generation.model
+                  // Restart-safe: pending library items carry the job's model
+                  // even before any live progress event has been seen.
+                  const generationModelId = generation?.model || asset?.model || "";
+                  const generationModel = generationModelId
+                    ? GENERATION_MODEL_NAMES.get(generationModelId) || generationModelId
                     : "";
+                  // Progress events carry percent on a 0-100 scale.
                   const generationPercent =
                     typeof generation?.percent === "number" && Number.isFinite(generation.percent)
-                      ? ` ${Math.round(Math.max(0, Math.min(1, generation.percent)) * 100)}%`
+                      ? ` ${Math.round(Math.max(0, Math.min(100, generation.percent)))}%`
                       : "";
+                  const generationVerb = generation?.state === "authoring" ? "authoring…" : "generating…";
                   return (
                     <ClipBlock
                       $kind={track.kind}
                       data-generating={generating ? "true" : "false"}
                       data-selected={selectedSet.has(clip.id) ? "true" : "false"}
                       key={clip.id}
+                      onContextMenu={(event) => onClipContextMenu?.(event, clip, track)}
                       onPointerDown={(event) => beginClipDrag(event, track.id, clip, "move")}
                       style={{ left: `${clip.timelineStartMs * pxPerMs}px`, width: `${widthPx}px` }}
                       title={
@@ -1574,7 +1581,7 @@ export default function Timeline({
                       ) : null}
                       <ClipLabel data-generating={generating ? "true" : "false"}>
                         {generating
-                          ? `✦ ${generationModel || "veo"} · generating…${generationPercent}`
+                          ? `✦ ${generationModel || "AI"} · ${generationVerb}${generationPercent}`
                           : clipDisplayName(clip, track)}
                       </ClipLabel>
                       {clip.linkId ? (

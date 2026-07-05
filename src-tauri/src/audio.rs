@@ -4992,6 +4992,145 @@ static AUDIO_WIDGET_BOTTOM_BAR_INVALIDATION_GENERATION: AtomicU64 = AtomicU64::n
 #[cfg(target_os = "macos")]
 static AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLER_STARTED: AtomicBool = AtomicBool::new(false);
 
+// Animated frame moves (Space-change slides). AppKit's
+// setFrame:display:animate: runs a blocking NSAnimation that swallows
+// in-flight input events, so animated placements go through the non-blocking
+// NSAnimationContext animator proxy instead. The in-flight destination is
+// tracked per window so (a) reposition retries and the JS space_changed
+// handoff that resolve to the slide's own destination do not restart it, and
+// (b) followers such as the error overlay can anchor to where the bar is
+// going rather than a mid-flight frame.
+#[cfg(target_os = "macos")]
+const AUDIO_WIDGET_FRAME_ANIMATION_MIN_SECS: f64 = 0.18;
+#[cfg(target_os = "macos")]
+const AUDIO_WIDGET_FRAME_ANIMATION_MAX_SECS: f64 = 0.42;
+#[cfg(target_os = "macos")]
+const AUDIO_WIDGET_FRAME_ANIMATION_SLACK_SECS: f64 = 0.25;
+#[cfg(target_os = "macos")]
+const AUDIO_WIDGET_FRAME_ANIMATION_MIN_DISTANCE: f64 = 2.0;
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+struct AudioWidgetFrameAnimation {
+    target: (f64, f64, f64, f64),
+    started: Instant,
+    duration: f64,
+}
+
+#[cfg(target_os = "macos")]
+impl AudioWidgetFrameAnimation {
+    fn target_rect(&self) -> objc2_core_foundation::CGRect {
+        objc2_core_foundation::CGRect::new(
+            objc2_core_foundation::CGPoint::new(self.target.0, self.target.1),
+            objc2_core_foundation::CGSize::new(self.target.2, self.target.3),
+        )
+    }
+
+    fn remaining_secs(&self) -> f64 {
+        (self.duration - self.started.elapsed().as_secs_f64()).max(0.0)
+    }
+}
+
+#[cfg(target_os = "macos")]
+static AUDIO_WIDGET_BOTTOM_BAR_FRAME_ANIMATION: StdMutex<Option<AudioWidgetFrameAnimation>> =
+    StdMutex::new(None);
+#[cfg(target_os = "macos")]
+static AUDIO_WIDGET_ERROR_OVERLAY_FRAME_ANIMATION: StdMutex<Option<AudioWidgetFrameAnimation>> =
+    StdMutex::new(None);
+
+#[cfg(target_os = "macos")]
+fn audio_widget_active_frame_animation(
+    slot: &StdMutex<Option<AudioWidgetFrameAnimation>>,
+) -> Option<AudioWidgetFrameAnimation> {
+    let animation = (*slot.lock().ok()?)?;
+    let elapsed = animation.started.elapsed().as_secs_f64();
+    if elapsed <= animation.duration + AUDIO_WIDGET_FRAME_ANIMATION_SLACK_SECS {
+        Some(animation)
+    } else {
+        None
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_store_frame_animation(
+    slot: &StdMutex<Option<AudioWidgetFrameAnimation>>,
+    animation: Option<AudioWidgetFrameAnimation>,
+) {
+    if let Ok(mut guard) = slot.lock() {
+        *guard = animation;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_frame_animation_duration(
+    current: &objc2_core_foundation::CGRect,
+    target: &objc2_core_foundation::CGRect,
+) -> f64 {
+    let dx = target.origin.x - current.origin.x;
+    let dy = target.origin.y - current.origin.y;
+    let dw = (target.size.width - current.size.width).abs();
+    let dh = (target.size.height - current.size.height).abs();
+    let distance = (dx * dx + dy * dy).sqrt().max(dw).max(dh);
+    if !distance.is_finite() || distance < AUDIO_WIDGET_FRAME_ANIMATION_MIN_DISTANCE {
+        return 0.0;
+    }
+    (AUDIO_WIDGET_FRAME_ANIMATION_MIN_SECS + distance / 2000.0)
+        .min(AUDIO_WIDGET_FRAME_ANIMATION_MAX_SECS)
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_set_ns_window_frame(
+    ns_window: &NSWindow,
+    target: objc2_core_foundation::CGRect,
+    duration: f64,
+    retarget_in_flight: bool,
+) {
+    use objc2_app_kit::{NSAnimatablePropertyContainer, NSAnimationContext};
+
+    if duration > 0.0 {
+        NSAnimationContext::beginGrouping();
+        NSAnimationContext::currentContext().setDuration(duration);
+        ns_window.animator().setFrame_display(target, true);
+        NSAnimationContext::endGrouping();
+        return;
+    }
+    if retarget_in_flight {
+        // A direct setFrame would be overwritten by the remaining ticks of an
+        // in-flight animator slide; a zero-duration retarget cancels it first.
+        NSAnimationContext::beginGrouping();
+        NSAnimationContext::currentContext().setDuration(0.0);
+        ns_window.animator().setFrame_display(target, true);
+        NSAnimationContext::endGrouping();
+    }
+    ns_window.setFrame_display_animate(target, true, false);
+}
+
+#[cfg(target_os = "macos")]
+fn audio_widget_cancel_bottom_bar_frame_animation(app: &AppHandle) {
+    if audio_widget_active_frame_animation(&AUDIO_WIDGET_BOTTOM_BAR_FRAME_ANIMATION).is_none() {
+        return;
+    }
+    audio_widget_store_frame_animation(&AUDIO_WIDGET_BOTTOM_BAR_FRAME_ANIMATION, None);
+    let app_for_main = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        let Some(window) = app_for_main.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL) else {
+            return;
+        };
+        let Ok(ns_ptr) = window.ns_window() else {
+            return;
+        };
+        if ns_ptr.is_null() {
+            return;
+        }
+        let ns_window: &NSWindow = unsafe { &*ns_ptr.cast::<NSWindow>() };
+        let frame = ns_window.frame();
+        audio_widget_set_ns_window_frame(ns_window, frame, 0.0, true);
+    });
+}
+
+#[cfg(not(target_os = "macos"))]
+fn audio_widget_cancel_bottom_bar_frame_animation(_app: &AppHandle) {}
+
 #[cfg(target_os = "macos")]
 fn macos_clear_active_space_full_monitor_sticky(reason: &'static str) {
     MACOS_ACTIVE_SPACE_FULL_MONITOR_STICKY_UNTIL_MS.store(0, Ordering::Release);
@@ -5760,7 +5899,7 @@ fn audio_widget_queue_bottom_bar_position(
     let prefer_stored_screen = reason.prefers_stored_screen();
 
     let mut native_request = request.clone();
-    native_request.animate = false;
+    native_request.animate = requested_animate;
     let generation = if reason.is_command() {
         let previous_generation =
             AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.fetch_add(1, Ordering::AcqRel);
@@ -5928,7 +6067,7 @@ fn audio_widget_queue_stored_bottom_bar_position(
     invalidation_generation: u64,
 ) -> Result<(), String> {
     let requested_animate = animate;
-    let native_animate = false;
+    let native_animate = animate;
     let prefer_stored_screen = true;
     log_audio_widget_bottom_bar_debug_event(
         "audio.widget.bottom_bar.position.queue",
@@ -7165,6 +7304,65 @@ fn audio_widget_bottom_bar_layout_event_payload(
 mod audio_widget_bottom_bar_protocol_tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bottom_bar_animation_duration_scales_with_distance_and_clamps() {
+        let rect = |x: f64, y: f64| {
+            objc2_core_foundation::CGRect::new(
+                objc2_core_foundation::CGPoint::new(x, y),
+                objc2_core_foundation::CGSize::new(600.0, 44.0),
+            )
+        };
+        // Sub-pixel drift must not animate.
+        assert_eq!(
+            audio_widget_frame_animation_duration(&rect(0.0, 0.0), &rect(1.0, 0.0)),
+            0.0
+        );
+        let short = audio_widget_frame_animation_duration(&rect(0.0, 0.0), &rect(0.0, 40.0));
+        let long = audio_widget_frame_animation_duration(&rect(0.0, 0.0), &rect(2000.0, 0.0));
+        assert!(short >= AUDIO_WIDGET_FRAME_ANIMATION_MIN_SECS);
+        assert!(short < long);
+        assert!(long <= AUDIO_WIDGET_FRAME_ANIMATION_MAX_SECS);
+        // A pure resize (mode-height change) still counts as movement.
+        let resize_target = objc2_core_foundation::CGRect::new(
+            objc2_core_foundation::CGPoint::new(0.0, 0.0),
+            objc2_core_foundation::CGSize::new(600.0, 96.0),
+        );
+        assert!(audio_widget_frame_animation_duration(&rect(0.0, 0.0), &resize_target) > 0.0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn bottom_bar_frame_animation_tracker_expires_and_matches() {
+        let slot: StdMutex<Option<AudioWidgetFrameAnimation>> = StdMutex::new(None);
+        assert!(audio_widget_active_frame_animation(&slot).is_none());
+
+        let animation = AudioWidgetFrameAnimation {
+            target: (10.0, 20.0, 600.0, 44.0),
+            started: Instant::now(),
+            duration: 0.3,
+        };
+        audio_widget_store_frame_animation(&slot, Some(animation));
+        let active = audio_widget_active_frame_animation(&slot).expect("animation active");
+        let target = active.target_rect();
+        assert!(audio_widget_rect_nearly_matches(&target, &animation.target_rect()));
+        assert!(active.remaining_secs() <= 0.3);
+
+        // An animation whose duration + slack has elapsed no longer counts.
+        audio_widget_store_frame_animation(
+            &slot,
+            Some(AudioWidgetFrameAnimation {
+                target: (10.0, 20.0, 600.0, 44.0),
+                started: Instant::now()
+                    - Duration::from_secs_f64(1.0 + AUDIO_WIDGET_FRAME_ANIMATION_SLACK_SECS),
+                duration: 0.3,
+            }),
+        );
+        assert!(audio_widget_active_frame_animation(&slot).is_none());
+        audio_widget_store_frame_animation(&slot, None);
+        assert!(audio_widget_active_frame_animation(&slot).is_none());
+    }
+
     #[test]
     fn bottom_bar_generation_only_commands_advance() {
         assert_eq!(
@@ -7429,7 +7627,13 @@ fn audio_widget_position_error_overlay_on_main_thread(
         } else {
             visible_frame
         };
-        let bar_frame = bar_ns_window.frame();
+        let bar_animation =
+            audio_widget_active_frame_animation(&AUDIO_WIDGET_BOTTOM_BAR_FRAME_ANIMATION);
+        // Anchor to where the bar is going, not a mid-slide frame, and ride
+        // along with the remainder of the bar's animation.
+        let bar_frame = bar_animation
+            .map(|animation| animation.target_rect())
+            .unwrap_or_else(|| bar_ns_window.frame());
         let frame_before = overlay_ns_window.frame();
         let raw_x = bar_frame.origin.x + ((bar_frame.size.width - width) / 2.0);
         let raw_y = bar_frame.origin.y + bar_frame.size.height + gap;
@@ -7449,9 +7653,24 @@ fn audio_widget_position_error_overlay_on_main_thread(
         );
         let frame_matches_target =
             audio_widget_rect_nearly_matches(&frame_before, &target_frame);
+        let overlay_in_flight =
+            audio_widget_active_frame_animation(&AUDIO_WIDGET_ERROR_OVERLAY_FRAME_ANIMATION);
+        let animation_matches_target = overlay_in_flight
+            .map(|animation| {
+                audio_widget_rect_nearly_matches(&animation.target_rect(), &target_frame)
+            })
+            .unwrap_or(false);
+        let frame_settled = frame_matches_target || animation_matches_target;
         let was_visible = overlay.is_visible().unwrap_or(false);
         let requested_animate = request.animate && was_visible && !frame_matches_target;
-        let animate = false;
+        let animation_duration = if was_visible && !frame_settled {
+            bar_animation
+                .map(|animation| animation.remaining_secs().max(0.12))
+                .unwrap_or(0.0)
+        } else {
+            0.0
+        };
+        let animate = animation_duration > 0.0;
 
         log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
             app,
@@ -7475,6 +7694,8 @@ fn audio_widget_position_error_overlay_on_main_thread(
                 "target_frame": audio_widget_rect_debug_value(&target_frame),
                 "was_visible": was_visible,
                 "requested_animate": requested_animate,
+                "animation_matches_target": animation_matches_target,
+                "animation_duration": animation_duration,
                 "animate": animate,
                 "bounds_resolution": macos_full_monitor_bounds_resolution_debug_value(
                     &bounds_resolution,
@@ -7482,8 +7703,21 @@ fn audio_widget_position_error_overlay_on_main_thread(
             }),
         );
 
-        if !frame_matches_target {
-            overlay_ns_window.setFrame_display_animate(target_frame, true, animate);
+        if !frame_settled {
+            audio_widget_set_ns_window_frame(
+                overlay_ns_window,
+                target_frame,
+                animation_duration,
+                overlay_in_flight.is_some(),
+            );
+            audio_widget_store_frame_animation(
+                &AUDIO_WIDGET_ERROR_OVERLAY_FRAME_ANIMATION,
+                animate.then(|| AudioWidgetFrameAnimation {
+                    target: (x, y, width, height),
+                    started: Instant::now(),
+                    duration: animation_duration,
+                }),
+            );
         }
         overlay
             .show()
@@ -7551,6 +7785,8 @@ fn audio_widget_reposition_error_overlay_for(app: &AppHandle, animate: bool) {
 
 fn audio_widget_hide_error_overlay_now(app: &AppHandle) -> Result<(), String> {
     audio_widget_clear_error_overlay_layout();
+    #[cfg(target_os = "macos")]
+    audio_widget_store_frame_animation(&AUDIO_WIDGET_ERROR_OVERLAY_FRAME_ANIMATION, None);
     if let Some(window) = app.get_webview_window(AUDIO_WIDGET_ERROR_WINDOW_LABEL) {
         let _ = window.set_ignore_cursor_events(true);
         window
@@ -8225,9 +8461,25 @@ fn audio_widget_position_bottom_bar_on_main_thread(
 
         let frame_matches_target =
             audio_widget_rect_nearly_matches(&frame_before, &target_frame);
+        let in_flight_animation =
+            audio_widget_active_frame_animation(&AUDIO_WIDGET_BOTTOM_BAR_FRAME_ANIMATION);
+        let animation_matches_target = in_flight_animation
+            .map(|animation| {
+                audio_widget_rect_nearly_matches(&animation.target_rect(), &target_frame)
+            })
+            .unwrap_or(false);
+        // Requests that resolve to an in-flight slide's own destination must
+        // not restart the animation; they count as already settled.
+        let frame_settled = frame_matches_target || animation_matches_target;
         let requested_animate = metadata.requested_animate;
+        let animation_duration =
+            if metadata.native_animate && !frame_settled && ns_window.isVisible() {
+                audio_widget_frame_animation_duration(&frame_before, &target_frame)
+            } else {
+                0.0
+            };
+        let animate = animation_duration > 0.0;
         let would_animate = requested_animate && !frame_matches_target;
-        let animate = metadata.native_animate;
         log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
             app,
             "audio.widget.bottom_bar.position.before_set_frame",
@@ -8266,7 +8518,9 @@ fn audio_widget_position_bottom_bar_on_main_thread(
                     "delta_y_from_current": y - frame_before.origin.y,
                 },
                 "frame_matches_target": frame_matches_target,
-                "frame_update_skipped": frame_matches_target,
+                "animation_matches_target": animation_matches_target,
+                "frame_update_skipped": frame_settled,
+                "animation_duration": animation_duration,
                 "dock_or_menu_gap": {
                     "bottom": visible_frame.origin.y - screen_frame.origin.y,
                     "top": (screen_frame.origin.y + screen_frame.size.height)
@@ -8284,12 +8538,32 @@ fn audio_widget_position_bottom_bar_on_main_thread(
                 "animate": animate,
             }),
         );
-        if !frame_matches_target {
-            ns_window.setFrame_display_animate(target_frame, true, animate);
+        if !frame_settled {
+            audio_widget_set_ns_window_frame(
+                ns_window,
+                target_frame,
+                animation_duration,
+                in_flight_animation.is_some(),
+            );
+            audio_widget_store_frame_animation(
+                &AUDIO_WIDGET_BOTTOM_BAR_FRAME_ANIMATION,
+                animate.then(|| AudioWidgetFrameAnimation {
+                    target: (x, y, width, height),
+                    started: Instant::now(),
+                    duration: animation_duration,
+                }),
+            );
         }
         ns_window.orderFrontRegardless();
 
-        let frame = ns_window.frame();
+        // While a slide is in flight the native frame is mid-animation;
+        // report the destination so stored anchors and JS never see a
+        // transient position.
+        let frame = if animate || animation_matches_target {
+            target_frame
+        } else {
+            ns_window.frame()
+        };
         let result = AudioWidgetBottomBarPositionResult {
             x: frame.origin.x,
             y: frame.origin.y,
@@ -8359,7 +8633,9 @@ fn audio_widget_position_bottom_bar_on_main_thread(
                     "y": y,
                 },
                 "frame_matches_target": frame_matches_target,
-                "frame_update_skipped": frame_matches_target,
+                "animation_matches_target": animation_matches_target,
+                "frame_update_skipped": frame_settled,
+                "animation_duration": animation_duration,
                 "chosen_target": chosen_target,
                 "bounds_resolution": macos_full_monitor_bounds_resolution_debug_value(
                     &bounds_resolution,
@@ -8375,7 +8651,7 @@ fn audio_widget_position_bottom_bar_on_main_thread(
             screen.as_ref(),
             bounds_resolution.use_full_monitor_bounds,
         );
-        metadata.applied = !frame_matches_target;
+        metadata.applied = !frame_settled;
         metadata.superseded = false;
         audio_widget_emit_bottom_bar_layout_event(app, &result, &metadata);
         Ok(result)
@@ -13632,6 +13908,9 @@ async fn audio_widget_position_bottom_bar(
 #[tauri::command]
 async fn audio_widget_clear_bottom_bar_position(app: AppHandle) -> Result<(), String> {
     audio_widget_clear_bottom_bar_position_request();
+    // Leaving bar mode hands frame ownership back to JS; a still-ticking
+    // slide would stomp the bubble placement it is about to apply.
+    audio_widget_cancel_bottom_bar_frame_animation(&app);
     audio_widget_hide_error_overlay_for(&app)?;
     Ok(())
 }

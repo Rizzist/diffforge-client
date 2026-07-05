@@ -1081,6 +1081,643 @@ export const PlusUpsellOverlay = memo(function PlusUpsellOverlay({
   );
 });
 
+/* ----------------------------------------------- low-credits top-up */
+
+/*
+ * LowCreditsOverlay — the startup "credit reserve low" moment. Shown once
+ * per sign-in, before the shell, when the account has burned >90% of its
+ * term credits. Same battle-pass stagecraft as the tier-up overlay (shared
+ * canvas embers, WebAudio SFX, golden-ratio stage), but the story is a
+ * warning + refuel: a red depleted-balance strip makes "you're low" loud
+ * and unmistakable, and the purchase card sells one-time credit packs that
+ * check out through Stripe in the system browser.
+ */
+
+const CREDIT_PACKS = [
+  {
+    key: "refill",
+    label: "Refill",
+    word: "REFILL",
+    heat: "10,000 credit pack",
+    passName: "Ember Refill",
+    badge: "Quick fix",
+    art: "/pricing/forge-plus-gold.webp",
+    price: "$40",
+    packs: 1,
+    credits: 10000,
+    pitch: (
+      <>
+        Running on embers. <em>Refuel the forge.</em>
+      </>
+    ),
+    track: [
+      { glyph: "◆", title: "+10k credits", sub: "one payment" },
+      { glyph: "⚡", title: "Instant", sub: "applied on payment" },
+      { glyph: "▣", title: "This term", sub: "boosts your balance" },
+      { glyph: "⌁", title: "All devices", sub: "synced everywhere" },
+      { glyph: "★", title: "Same rate", sub: "$40 per 10k" },
+    ],
+    theme: PLAN_TIERS[0].theme,
+  },
+  {
+    key: "reserve",
+    label: "Reserve",
+    word: "RESERVE",
+    heat: "30,000 credit pack",
+    passName: "Forge Reserve",
+    badge: "Best value",
+    art: "/pricing/forge-pro-platinum.webp",
+    price: "$120",
+    packs: 3,
+    credits: 30000,
+    pitch: (
+      <>
+        Three packs deep. <em>Weeks of headroom.</em>
+      </>
+    ),
+    track: [
+      { glyph: "◆", title: "+30k credits", sub: "one payment" },
+      { glyph: "⚡", title: "Instant", sub: "applied on payment" },
+      { glyph: "▣", title: "This term", sub: "boosts your balance" },
+      { glyph: "⌁", title: "All devices", sub: "synced everywhere" },
+      { glyph: "★", title: "Same rate", sub: "$40 per 10k" },
+    ],
+    theme: PLAN_TIERS[1].theme,
+  },
+  {
+    key: "stockpile",
+    label: "Stockpile",
+    word: "STOCKPILE",
+    heat: "100,000 credit pack",
+    passName: "Full Stockpile",
+    badge: "Max heat",
+    art: "/pricing/forge-ultra-violet.webp",
+    price: "$400",
+    packs: 10,
+    credits: 100000,
+    pitch: (
+      <>
+        One hundred thousand credits. <em>Never think about it.</em>
+      </>
+    ),
+    track: [
+      { glyph: "◆", title: "+100k credits", sub: "one payment" },
+      { glyph: "⚡", title: "Instant", sub: "applied on payment" },
+      { glyph: "▣", title: "This term", sub: "boosts your balance" },
+      { glyph: "⌁", title: "All devices", sub: "synced everywhere" },
+      { glyph: "★", title: "Same rate", sub: "$40 per 10k" },
+    ],
+    theme: PLAN_TIERS[2].theme,
+  },
+];
+
+const CREDIT_PACK_STAMPS = [
+  "One-time payment — no plan change",
+  "Applied to your current term instantly",
+  "Shared across every synced device",
+  "Secure Stripe checkout",
+];
+
+function formatOverlayCredits(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric < 0) return "0";
+  return Math.round(numeric).toLocaleString();
+}
+
+export const LowCreditsOverlay = memo(function LowCreditsOverlay({
+  onDismiss,
+  onTopup,
+  onTitleBarMouseDown,
+  windowPlatform,
+  isWindowFrameExpanded,
+  remainingCredits,
+  totalCredits,
+  percentRemaining,
+  resetLabel,
+  checkoutState,
+  checkoutError,
+  creditsAdded,
+}) {
+  // 0 open · 1 emblem slam · 2 balance alert + perk track · 3 card armed
+  const [phase, setPhase] = useState(0);
+  const [leaving, setLeaving] = useState(false);
+  const [muted, setMuted] = useState(false);
+  const [creditCount, setCreditCount] = useState(0);
+  const [tilesLanded, setTilesLanded] = useState(0);
+  const [runId, setRunId] = useState(0);
+  const [packIndex, setPackIndex] = useState(0);
+  const [switchDir, setSwitchDir] = useState("");
+
+  const canvasRef = useRef(null);
+  const engineRef = useRef(null);
+  const emblemRef = useRef(null);
+  const ctaRef = useRef(null);
+  const scrollerRef = useRef(null);
+  const mutedRef = useRef(muted);
+  mutedRef.current = muted;
+  const packIndexRef = useRef(packIndex);
+  packIndexRef.current = packIndex;
+  const successHandledRef = useRef(false);
+
+  const activePack = CREDIT_PACKS[packIndex];
+  const theme = activePack.theme;
+  const topupSucceeded = Number(creditsAdded) > 0;
+
+  const prefersReducedMotion = useMemo(
+    () => typeof window !== "undefined"
+      && window.matchMedia("(prefers-reduced-motion: reduce)").matches,
+    [],
+  );
+
+  const sfx = useMemo(() => createSfx(), []);
+  const sound = useCallback((name, ...args) => {
+    if (!mutedRef.current) sfx[name](...args);
+  }, [sfx]);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return undefined;
+    const engine = createEmberEngine(canvas, prefersReducedMotion);
+    engineRef.current = engine;
+    return () => {
+      engine.destroy();
+      sfx.close();
+    };
+  }, [prefersReducedMotion, sfx]);
+
+  useEffect(() => {
+    const unlock = () => sfx.unlock();
+    window.addEventListener("pointerdown", unlock);
+    window.addEventListener("keydown", unlock);
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("keydown", unlock);
+    };
+  }, [sfx]);
+
+  const emblemCanvasPoint = useCallback(() => {
+    const emblem = emblemRef.current;
+    const canvas = canvasRef.current;
+    if (!emblem || !canvas) return null;
+    const emblemRect = emblem.getBoundingClientRect();
+    const canvasRect = canvas.getBoundingClientRect();
+    return {
+      x: emblemRect.left + emblemRect.width / 2 - canvasRect.left,
+      y: emblemRect.top + emblemRect.height / 2 - canvasRect.top,
+    };
+  }, []);
+
+  const syncCtaEmitter = useCallback((rate) => {
+    const cta = ctaRef.current;
+    const canvas = canvasRef.current;
+    if (!cta || !canvas || !engineRef.current) return;
+    const ctaRect = cta.getBoundingClientRect();
+    const canvasRect = canvas.getBoundingClientRect();
+    engineRef.current.setCtaRect({
+      x: ctaRect.left - canvasRect.left,
+      y: ctaRect.top - canvasRect.top,
+      width: ctaRect.width,
+      height: ctaRect.height,
+    }, rate);
+  }, []);
+
+  // opening timeline — same beats as the tier-up, so the moment feels kin
+  useEffect(() => {
+    const timers = [];
+    const at = (ms, fn) => timers.push(window.setTimeout(fn, ms));
+
+    at(40, () => sound("riser"));
+    at(90, () => sound("whoosh"));
+    at(560, () => {
+      setPhase(1);
+      sound("slam");
+      const point = emblemCanvasPoint();
+      if (point && engineRef.current) {
+        engineRef.current.burst(point.x, point.y, 60);
+        engineRef.current.ringBurst(point.x, point.y, 30, 110);
+      }
+    });
+    at(1040, () => setPhase(2));
+    for (let index = 0; index < PERK_TRACK_STEPS; index += 1) {
+      at(1100 + index * 95, () => {
+        sound("tick", index);
+        setTilesLanded(index + 1);
+      });
+    }
+    at(1560, () => {
+      setPhase(3);
+      sound("whoosh", true);
+    });
+
+    return () => timers.forEach((timer) => window.clearTimeout(timer));
+  }, [emblemCanvasPoint, sound, runId]);
+
+  // credits odometer once the purchase card is in (re-runs per pack switch)
+  useEffect(() => {
+    if (phase < 3) return undefined;
+    const target = activePack.credits;
+    const started = performance.now();
+    let raf = 0;
+    const tickUp = (now) => {
+      const t = Math.min(1, (now - started) / 950);
+      setCreditCount(Math.round((1 - (1 - t) ** 3) * target));
+      if (t < 1) raf = requestAnimationFrame(tickUp);
+    };
+    raf = requestAnimationFrame(tickUp);
+    return () => cancelAnimationFrame(raf);
+  }, [phase >= 3, activePack.credits]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (phase < 3 || topupSucceeded) return undefined;
+    const sync = () => syncCtaEmitter(12);
+    const settle = window.setTimeout(sync, 460);
+    const scroller = scrollerRef.current;
+    window.addEventListener("resize", sync);
+    scroller?.addEventListener("scroll", sync, { passive: true });
+    return () => {
+      window.clearTimeout(settle);
+      window.removeEventListener("resize", sync);
+      scroller?.removeEventListener("scroll", sync);
+    };
+  }, [phase >= 3, packIndex, syncCtaEmitter, topupSucceeded]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    engineRef.current?.setPalette(theme.ember);
+  }, [theme]);
+
+  const handleDismiss = useCallback(() => {
+    if (leaving) return;
+    sound("dismiss");
+    setLeaving(true);
+    window.setTimeout(onDismiss, 280);
+  }, [leaving, onDismiss, sound]);
+
+  // payment landed: unlock stinger + full-screen burst, then bow out
+  useEffect(() => {
+    if (!topupSucceeded || successHandledRef.current) return undefined;
+    successHandledRef.current = true;
+    sound("unlock");
+    sound("stinger");
+    engineRef.current?.setCtaRect(null, 0);
+    const canvas = canvasRef.current;
+    if (canvas && engineRef.current) {
+      const width = canvas.clientWidth;
+      const height = canvas.clientHeight;
+      engineRef.current.burst(width / 2, height * 0.42, 90);
+      engineRef.current.ringBurst(width / 2, height * 0.42, 34, 150);
+    }
+    const timer = window.setTimeout(() => {
+      handleDismiss();
+    }, 3600);
+    return () => window.clearTimeout(timer);
+  }, [topupSucceeded, handleDismiss, sound]);
+
+  const switchPack = useCallback((nextIndex) => {
+    const clamped = Math.max(0, Math.min(CREDIT_PACKS.length - 1, nextIndex));
+    if (clamped === packIndexRef.current || leaving) return;
+    setSwitchDir(clamped > packIndexRef.current ? "up" : "down");
+    setCreditCount(0);
+    setPackIndex(clamped);
+    sound("flameShift", [0.35, 0.65, 1][clamped] ?? 0.6);
+    window.setTimeout(() => {
+      const point = emblemCanvasPoint();
+      if (point && engineRef.current) {
+        engineRef.current.burst(point.x, point.y, 46);
+        engineRef.current.ringBurst(point.x, point.y, 24, 96);
+      }
+    }, 220);
+  }, [emblemCanvasPoint, leaving, sound]);
+
+  const handleTopup = useCallback(() => {
+    if (checkoutState === "opening" || topupSucceeded) return;
+    sound("stinger");
+    const cta = ctaRef.current;
+    const canvas = canvasRef.current;
+    if (cta && canvas && engineRef.current) {
+      const ctaRect = cta.getBoundingClientRect();
+      const canvasRect = canvas.getBoundingClientRect();
+      engineRef.current.burst(
+        ctaRect.left + ctaRect.width / 2 - canvasRect.left,
+        ctaRect.top + ctaRect.height / 2 - canvasRect.top,
+        80,
+      );
+    }
+    onTopup(activePack.packs, activePack.key);
+  }, [activePack.key, activePack.packs, checkoutState, onTopup, sound, topupSucceeded]);
+
+  const toggleMuted = useCallback(() => {
+    setMuted((current) => !current);
+  }, []);
+
+  const handleReplay = useCallback(() => {
+    if (leaving) return;
+    sfx.unlock();
+    setPhase(0);
+    setTilesLanded(0);
+    setCreditCount(0);
+    setSwitchDir("");
+    engineRef.current?.setCtaRect(null, 0);
+    scrollerRef.current?.scrollTo({ top: 0 });
+    setRunId((current) => current + 1);
+  }, [leaving, sfx]);
+
+  useEffect(() => {
+    const onKey = (event) => {
+      if (event.key === "Escape") handleDismiss();
+      if (event.key === "ArrowRight") switchPack(packIndexRef.current + 1);
+      if (event.key === "ArrowLeft") switchPack(packIndexRef.current - 1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [handleDismiss, switchPack]);
+
+  const themeVars = {
+    "--up-cream": theme.cream,
+    "--up-light": theme.light,
+    "--up-mid": theme.mid,
+    "--up-hot": theme.hot,
+    "--up-core": theme.core,
+    "--up-deep": theme.deep,
+    "--up-accent": theme.accent,
+    "--up-ink": theme.ink,
+    "--up-price": theme.price,
+    "--up-floor": theme.floor,
+    "--up-corner": theme.corner,
+    "--up-base-bottom": theme.baseBottom,
+  };
+
+  const safeTotal = Math.max(0, Number(totalCredits) || 0);
+  const safeRemaining = Math.max(0, Number(remainingCredits) || 0);
+  const clampedPercent = Math.max(
+    0,
+    Math.min(100, Number.isFinite(Number(percentRemaining)) ? Number(percentRemaining) : 0),
+  );
+  const ctaLabel = checkoutState === "opening"
+    ? "Opening checkout…"
+    : `Top up ${activePack.credits.toLocaleString()} credits`;
+
+  return (
+    <Backdrop
+      aria-label="Your Diff Forge credits are running low"
+      data-leaving={leaving}
+      data-window-expanded={isWindowFrameExpanded ? "true" : "false"}
+      data-window-platform={windowPlatform}
+      role="dialog"
+      style={themeVars}
+    >
+      <GodRays aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+      <Streak aria-hidden="true" data-lane="high" key={`streak-high-${runId}`} />
+      <Streak aria-hidden="true" data-lane="low" key={`streak-low-${runId}`} />
+      <ImpactFlash
+        aria-hidden="true"
+        data-landed={phase >= 1 ? "true" : undefined}
+        key={`flash-${runId}-${activePack.key}`}
+      />
+      <Vignette aria-hidden="true" />
+      <EmberCanvas aria-hidden="true" ref={canvasRef} />
+
+      <PlanFlame active={!leaving} plan={PLAN_TIERS[packIndex].key} showControls={false} />
+
+      <DragStrip
+        aria-hidden="true"
+        data-tauri-drag-region
+        onMouseDown={onTitleBarMouseDown}
+      />
+
+      <StageScroller ref={scrollerRef}>
+        <Stage data-shake={phase === 1 ? "true" : undefined} key={`stage-${runId}`}>
+        {/* ------------------------------------------------ showcase (φ) */}
+        <Showcase>
+          <TierKicker>
+            <i />
+            Diff Forge AI · Credit reserve low
+            <i />
+          </TierKicker>
+
+          {/* the warning strip is the headline of this overlay: it lands with
+              the emblem slam and stays on screen for every pack */}
+          <AlertStrip data-visible={phase >= 1 ? "true" : undefined} role="status">
+            <AlertHead>
+              <AlertBeacon aria-hidden="true">
+                <svg fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.2" viewBox="0 0 24 24">
+                  <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+                  <line x1="12" x2="12" y1="9" y2="13" />
+                  <line x1="12" x2="12.01" y1="17" y2="17" />
+                </svg>
+              </AlertBeacon>
+              <strong>Credits running low</strong>
+              <b>{clampedPercent}% left</b>
+            </AlertHead>
+            <AlertMeter aria-hidden="true">
+              <i style={{ transform: `scaleX(${Math.max(0.02, clampedPercent / 100)})` }} />
+            </AlertMeter>
+            <AlertDetail>
+              {formatOverlayCredits(safeRemaining)}
+              {safeTotal > 0 ? ` of ${formatOverlayCredits(safeTotal)}` : ""} credits left this term
+              {resetLabel ? ` · ${resetLabel}` : ""}
+            </AlertDetail>
+          </AlertStrip>
+
+          {/* pack switcher: arrows + one pill per credit pack */}
+          <TierNav aria-label="Choose a credit pack" data-visible={phase >= 2 ? "true" : undefined}>
+            <TierArrow
+              aria-label="Previous pack"
+              disabled={packIndex === 0}
+              onClick={() => switchPack(packIndex - 1)}
+              type="button"
+            >
+              <svg fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.4" viewBox="0 0 24 24">
+                <polyline points="15 18 9 12 15 6" />
+              </svg>
+            </TierArrow>
+            <TierPills>
+              {CREDIT_PACKS.map((pack, index) => (
+                <TierPill
+                  aria-pressed={index === packIndex}
+                  data-active={index === packIndex ? "true" : undefined}
+                  data-tier={PLAN_TIERS[index].key}
+                  key={pack.key}
+                  onClick={() => switchPack(index)}
+                  type="button"
+                >
+                  <i aria-hidden="true" />
+                  {pack.label}
+                </TierPill>
+              ))}
+            </TierPills>
+            <TierArrow
+              aria-label="Next pack"
+              data-more={packIndex < CREDIT_PACKS.length - 1 ? "true" : undefined}
+              disabled={packIndex === CREDIT_PACKS.length - 1}
+              onClick={() => switchPack(packIndex + 1)}
+              type="button"
+            >
+              <svg fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.4" viewBox="0 0 24 24">
+                <polyline points="9 18 15 12 9 6" />
+              </svg>
+            </TierArrow>
+          </TierNav>
+
+          <TierSwap data-dir={switchDir || undefined} key={`swap-${activePack.key}`}>
+            <EmblemBlock>
+              <Emblem data-landed={phase >= 1 ? "true" : undefined} ref={emblemRef}>
+                <EmblemRing aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+                <EmblemRing aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} data-late="true" />
+                <EmblemArt alt="" draggable={false} src={activePack.art} />
+                <EmblemWord>{activePack.word}</EmblemWord>
+                <EmblemHeat>{activePack.heat}</EmblemHeat>
+              </Emblem>
+              <FloorGlow aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+              <HorizonLine aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+            </EmblemBlock>
+
+            <Pitch data-visible={phase >= 2 ? "true" : undefined}>
+              {activePack.pitch}
+            </Pitch>
+
+            <PerkTrack aria-label={`${activePack.label} pack details`} data-visible={phase >= 2 ? "true" : undefined}>
+              <PerkRail aria-hidden="true">
+                <i style={{ transform: `scaleX(${tilesLanded / PERK_TRACK_STEPS})` }} />
+              </PerkRail>
+              {activePack.track.map((perk, index) => (
+                <PerkTile
+                  data-landed={tilesLanded > index ? "true" : undefined}
+                  key={perk.title}
+                  style={{ "--tile-index": index }}
+                >
+                  <PerkGlyph aria-hidden="true">
+                    <b>{perk.glyph}</b>
+                  </PerkGlyph>
+                  <strong>{perk.title}</strong>
+                  <span>{perk.sub}</span>
+                </PerkTile>
+              ))}
+            </PerkTrack>
+          </TierSwap>
+        </Showcase>
+
+        {/* ------------------------------------------- purchase card (1) */}
+        <PurchaseCard data-armed={phase >= 3 ? "true" : undefined} key={`card-${activePack.key}`}>
+          {topupSucceeded ? (
+            <SuccessPanel>
+              <SuccessGlyph aria-hidden="true">
+                <svg fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.6" viewBox="0 0 24 24">
+                  <polyline points="20 6 9 17 4 12" />
+                </svg>
+              </SuccessGlyph>
+              <strong>Credits added</strong>
+              <b>+{formatOverlayCredits(creditsAdded)}</b>
+              <span>Your balance is refuelled on every device. Back to the forge.</span>
+            </SuccessPanel>
+          ) : (
+            <>
+              <ValueBadge aria-hidden="true">{activePack.badge}</ValueBadge>
+              <PurchaseHeader>
+                <span>Credit top-up</span>
+                <strong>{activePack.passName}</strong>
+              </PurchaseHeader>
+
+              <PriceRow data-compact={activePack.price.length > 4 ? "true" : undefined}>
+                <b>{activePack.price}</b>
+                <span>
+                  one-time
+                  <br />
+                  instant delivery
+                </span>
+              </PriceRow>
+
+              <CreditsMeter>
+                <div>
+                  <strong>{creditCount.toLocaleString()}</strong>
+                  <span>credits added</span>
+                </div>
+                <MeterTrack aria-hidden="true">
+                  <i style={{ transform: `scaleX(${creditCount / activePack.credits})` }} />
+                </MeterTrack>
+              </CreditsMeter>
+
+              <StampList>
+                {CREDIT_PACK_STAMPS.map((stamp) => (
+                  <li key={stamp}>
+                    <i />
+                    {stamp}
+                  </li>
+                ))}
+              </StampList>
+
+              <CtaWrap>
+                <CtaHalo aria-hidden="true" />
+                <CtaButton
+                  disabled={checkoutState === "opening"}
+                  onClick={handleTopup}
+                  onMouseEnter={() => {
+                    sound("flare");
+                    syncCtaEmitter(32);
+                  }}
+                  onMouseLeave={() => syncCtaEmitter(12)}
+                  ref={ctaRef}
+                  type="button"
+                >
+                  {ctaLabel}
+                </CtaButton>
+              </CtaWrap>
+              {checkoutError ? (
+                <CtaError role="alert">{checkoutError}</CtaError>
+              ) : checkoutState === "waiting" ? (
+                <CtaHint data-live="true">
+                  Finish in your browser — credits land here automatically
+                </CtaHint>
+              ) : (
+                <CtaHint>Secure Stripe checkout · Applied instantly</CtaHint>
+              )}
+            </>
+          )}
+        </PurchaseCard>
+        </Stage>
+      </StageScroller>
+
+      <SideRail>
+        <SideRailButton
+          aria-label="Replay intro"
+          onClick={handleReplay}
+          title="Replay intro"
+          type="button"
+        >
+          <svg fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24">
+            <polyline points="1 4 1 10 7 10" />
+            <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10" />
+          </svg>
+        </SideRailButton>
+        <SideRailButton
+          aria-label={muted ? "Unmute sound effects" : "Mute sound effects"}
+          aria-pressed={muted}
+          onClick={toggleMuted}
+          title={muted ? "Unmute sound effects" : "Mute sound effects"}
+          type="button"
+        >
+          {muted ? (
+            <svg fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M11 5 6 9H2v6h4l5 4V5z" />
+              <line x1="23" x2="17" y1="9" y2="15" />
+              <line x1="17" x2="23" y1="9" y2="15" />
+            </svg>
+          ) : (
+            <svg fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" viewBox="0 0 24 24">
+              <path d="M11 5 6 9H2v6h4l5 4V5z" />
+              <path d="M15.54 8.46a5 5 0 0 1 0 7.07" />
+              <path d="M19.07 4.93a10 10 0 0 1 0 14.14" />
+            </svg>
+          )}
+        </SideRailButton>
+        <SideRailDivider aria-hidden="true" />
+        <KeepFreeButton onClick={handleDismiss} type="button">
+          Top up <b>later</b>
+        </KeepFreeButton>
+      </SideRail>
+    </Backdrop>
+  );
+});
+
 /* ------------------------------------------------------------- styles */
 
 const backdropIn = keyframes`
@@ -2106,6 +2743,12 @@ const CtaButton = styled.button`
   &:active {
     transform: translateY(0) scale(0.99);
   }
+
+  &:disabled {
+    cursor: wait;
+    transform: none;
+    filter: saturate(0.72) brightness(0.92);
+  }
 `;
 
 const CtaHint = styled.span`
@@ -2115,6 +2758,11 @@ const CtaHint = styled.span`
   letter-spacing: 0.09em;
   text-align: center;
   text-transform: uppercase;
+
+  /* checkout handed off to the browser — keep the guidance line readable */
+  &[data-live="true"] {
+    color: rgba(var(--up-light), 0.85);
+  }
 `;
 
 /* ------------------------------------------------------- side rail */
@@ -2185,4 +2833,182 @@ const KeepFreeButton = styled.button`
     color: rgba(226, 232, 240, 0.9);
     border-color: rgba(255, 255, 255, 0.3);
   }
+`;
+
+/* ----------------------------------------- low-credits alert + success */
+
+const alertBeaconPulse = keyframes`
+  0%, 100% { opacity: 0.85; transform: scale(1); }
+  50% { opacity: 1; transform: scale(1.12); }
+`;
+
+const alertMeterThrob = keyframes`
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.55; }
+`;
+
+/* fixed ember-red palette on purpose: the warning must read as a warning no
+   matter which pack theme is active behind it */
+const AlertStrip = styled.div`
+  display: grid;
+  gap: 8px;
+  width: min(520px, 100%);
+  padding: 12px 16px 13px;
+  border: 1px solid rgba(255, 110, 64, 0.5);
+  border-radius: 10px;
+  background:
+    linear-gradient(180deg, rgba(84, 22, 8, 0.62), rgba(38, 10, 5, 0.86));
+  box-shadow:
+    0 0 36px rgba(255, 84, 40, 0.18),
+    inset 0 1px 0 rgba(255, 176, 130, 0.2);
+  opacity: 0;
+  transform: translateY(10px);
+  transition: opacity 420ms ease, transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  &[data-visible="true"] {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  ${reducedMotion};
+`;
+
+const AlertHead = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 9px;
+
+  strong {
+    flex: 1;
+    color: #ffd9c4;
+    font-size: 12px;
+    font-weight: 950;
+    letter-spacing: 0.24em;
+    text-align: left;
+    text-transform: uppercase;
+  }
+
+  b {
+    color: #ff9d73;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 13px;
+    font-weight: 900;
+    letter-spacing: 0.04em;
+  }
+`;
+
+const AlertBeacon = styled.i`
+  display: grid;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 auto;
+  place-items: center;
+  border: 1px solid rgba(255, 130, 80, 0.55);
+  border-radius: 8px;
+  color: #ffb38a;
+  background: rgba(255, 96, 42, 0.14);
+  animation: ${alertBeaconPulse} 1.7s ease-in-out infinite;
+  ${reducedMotion};
+
+  svg {
+    width: 14px;
+    height: 14px;
+  }
+`;
+
+const AlertMeter = styled.div`
+  height: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+
+  i {
+    display: block;
+    width: 100%;
+    height: 100%;
+    background: linear-gradient(90deg, #ff3b1f, #ff7a3c 70%, #ffb057);
+    box-shadow: 0 0 14px rgba(255, 96, 42, 0.7);
+    transform-origin: 0 50%;
+    transition: transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
+    animation: ${alertMeterThrob} 2.2s ease-in-out infinite;
+  }
+  ${reducedMotion};
+`;
+
+const AlertDetail = styled.span`
+  color: rgba(255, 214, 190, 0.78);
+  font-size: 11.5px;
+  font-weight: 780;
+  letter-spacing: 0.05em;
+  text-align: left;
+`;
+
+const successPop = keyframes`
+  0% { opacity: 0; transform: scale(0.6); }
+  60% { opacity: 1; transform: scale(1.08); }
+  100% { opacity: 1; transform: scale(1); }
+`;
+
+const SuccessPanel = styled.div`
+  display: grid;
+  justify-items: center;
+  gap: 8px;
+  padding: clamp(22px, 5vh, 44px) 8px;
+  text-align: center;
+
+  strong {
+    color: rgba(var(--up-light), 0.85);
+    font-size: 12px;
+    font-weight: 950;
+    letter-spacing: 0.3em;
+    text-transform: uppercase;
+  }
+
+  b {
+    background: linear-gradient(180deg, rgb(var(--up-cream)) 10%, rgb(var(--up-light)) 55%, rgb(var(--up-core)) 90%);
+    background-clip: text;
+    -webkit-background-clip: text;
+    color: transparent;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: clamp(36px, 6vh, 48px);
+    font-weight: 950;
+    letter-spacing: 0.01em;
+    line-height: 1;
+    animation: ${successPop} 460ms cubic-bezier(0.16, 1.1, 0.3, 1) both;
+  }
+
+  span {
+    max-width: 300px;
+    color: rgba(226, 232, 240, 0.72);
+    font-size: 12.5px;
+    font-weight: 740;
+    line-height: 1.5;
+  }
+  ${reducedMotion};
+`;
+
+const SuccessGlyph = styled.i`
+  display: grid;
+  width: 52px;
+  height: 52px;
+  place-items: center;
+  margin-bottom: 4px;
+  border-radius: 50%;
+  color: var(--up-ink);
+  background: linear-gradient(135deg, rgb(var(--up-cream)), rgb(var(--up-hot)));
+  box-shadow: 0 0 34px rgba(var(--up-hot), 0.55);
+  animation: ${successPop} 420ms cubic-bezier(0.16, 1.1, 0.3, 1) both;
+  ${reducedMotion};
+
+  svg {
+    width: 26px;
+    height: 26px;
+  }
+`;
+
+const CtaError = styled.span`
+  color: #ff9d8a;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-align: center;
 `;

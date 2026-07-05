@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import AppSelect from "../app/AppSelect.jsx";
 import { emitVideoAssetDrag } from "./videoDragEvents.js";
 import {
@@ -12,7 +13,7 @@ import {
   generationModels,
   getGenerationModel,
 } from "./generationCatalog.js";
-import { VIDEO_GENERATE_PROGRESS_EVENT } from "./videoPanelBridge.js";
+import { VIDEO_CODE_TOOLS_PROGRESS_EVENT, VIDEO_GENERATE_PROGRESS_EVENT } from "./videoPanelBridge.js";
 import {
   VideoErrorText,
   VideoHint,
@@ -536,6 +537,7 @@ export default function GeneratePanel({
   onGenerated,
   onInsertAsset,
   onPlannedClip,
+  onPreviewCode,
   paneToken = "video-pane",
   repoPath = "",
   seed = null,
@@ -563,6 +565,82 @@ export default function GeneratePanel({
   const [historyOpen, setHistoryOpen] = useState(false);
   const [historyJobs, setHistoryJobs] = useState([]);
   const seedSeenRef = useRef(0);
+
+  // Code (Hyperframes) local-render runtime: status + one-click install.
+  const isCodeKind = kind === "code";
+  const [codeTools, setCodeTools] = useState(null);
+  const [codeInstall, setCodeInstall] = useState(null);
+  const [codeFps, setCodeFps] = useState(30);
+
+  const refreshCodeTools = useCallback(() => {
+    invoke("video_code_tools_status")
+      .then((status) => setCodeTools(status || null))
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (isCodeKind) {
+      refreshCodeTools();
+    }
+  }, [isCodeKind, refreshCodeTools]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten = () => {};
+    listen(VIDEO_CODE_TOOLS_PROGRESS_EVENT, (event) => {
+      if (disposed) {
+        return;
+      }
+      const payload = event?.payload || {};
+      if (payload.done) {
+        setCodeInstall(null);
+        refreshCodeTools();
+        if (payload.error) {
+          setError(String(payload.error));
+        }
+      } else {
+        setCodeInstall(payload);
+      }
+    })
+      .then((next) => {
+        if (disposed) {
+          unlisten = () => {};
+          next();
+        } else {
+          unlisten = next;
+        }
+      })
+      .catch(() => {});
+    return () => {
+      disposed = true;
+      unlisten();
+    };
+  }, [refreshCodeTools]);
+
+  const startCodeToolsInstall = useCallback(() => {
+    setError("");
+    setCodeInstall({ jobId: "", message: "Starting install…", percent: 0 });
+    invoke("video_code_tools_install")
+      .then((result) => {
+        setCodeInstall((current) =>
+          current && !current.jobId ? { ...current, jobId: result?.jobId || "" } : current,
+        );
+      })
+      .catch((err) => {
+        setCodeInstall(null);
+        setError(String(err));
+      });
+  }, []);
+
+  const revealCodeSource = useCallback(
+    (sourcePath) => {
+      if (!repoPath || !sourcePath) {
+        return;
+      }
+      revealItemInDir(`${repoPath.replace(/\/$/, "")}/${sourcePath}`).catch(() => {});
+    },
+    [repoPath],
+  );
 
   // Job history (persisted registry) — every job's request snapshot can be
   // reloaded into the form for editing/re-running.
@@ -872,6 +950,32 @@ export default function GeneratePanel({
       return;
     }
     try {
+      if (model.kind === "code") {
+        // Two-phase local render: this only declares the job + scaffolds the
+        // composition; the Render action in history runs the actual render.
+        const result = await invoke("video_generate_start", {
+          repoPath,
+          request: {
+            providerId: "hyperframes",
+            model: "hyperframes",
+            mode: "code-render",
+            prompt: prompt.trim(),
+            inputAssetPaths: [],
+            audioAssetPaths: [],
+            params: { durationSec, title: prompt.trim(), fps: codeFps },
+            loraId: null,
+            auth: null,
+          },
+        });
+        const planned = Array.isArray(result?.plannedPaths) ? result.plannedPaths : [];
+        if (intoTimeline && planned.length) {
+          onPlannedClip?.(planned[0], (Number(durationSec) || 10) * 1000, { model: "hyperframes" });
+        }
+        setPrompt("");
+        loadHistory();
+        setHistoryOpen(true);
+        return;
+      }
       const referenceImagePaths = slots.references.filter(Boolean);
       const isImageToVideo = model.kind === "video" && Boolean(slots.startFrame);
       // The cloud glue reads inputAssetPaths POSITIONALLY by mode:
@@ -927,7 +1031,7 @@ export default function GeneratePanel({
     } catch (err) {
       setError(String(err));
     }
-  }, [aspect, caps, durationSec, genMode, intoTimeline, loadHistory, model, numImages, onPlannedClip, prompt, quality, repoPath, resolution, slots, sound, voice]);
+  }, [aspect, caps, codeFps, durationSec, genMode, intoTimeline, loadHistory, model, numImages, onPlannedClip, prompt, quality, repoPath, resolution, slots, sound, voice]);
 
   const estUsd = estimateModelUsd(model, { durationSec, numImages });
 
@@ -983,9 +1087,59 @@ export default function GeneratePanel({
           <VideoLabel as="span" style={{ display: "inline" }}>
             Provider
           </VideoLabel>
-          <ProviderChip>⚡ {GENERATION_PROVIDER_LABEL}</ProviderChip>
+          <ProviderChip>{isCodeKind ? "⌁ Local render" : `⚡ ${GENERATION_PROVIDER_LABEL}`}</ProviderChip>
           <span style={{ flex: 1 }} />
         </ProviderRow>
+        {isCodeKind ? (
+          codeInstall ? (
+            <div style={{ display: "grid", gap: 4 }}>
+              <VideoHint>{codeInstall.message || "Installing hyperframes runtime…"}</VideoHint>
+              <VideoProgressTrack>
+                <VideoProgressFill
+                  style={{ width: `${Math.min(100, Math.max(3, codeInstall.percent || 3))}%` }}
+                />
+              </VideoProgressTrack>
+              {codeInstall.jobId ? (
+                <InlineRow>
+                  <VideoSecondaryButton
+                    onClick={() =>
+                      invoke("video_code_tools_install_cancel", { jobId: codeInstall.jobId }).catch(() => {})
+                    }
+                    type="button"
+                  >
+                    Cancel install
+                  </VideoSecondaryButton>
+                </InlineRow>
+              ) : null}
+            </div>
+          ) : codeTools && !(codeTools.ready && codeTools.ffmpegReady) ? (
+            <div style={{ display: "grid", gap: 4 }}>
+              <VideoHint>
+                Local render runtime missing:{" "}
+                {[
+                  !codeTools.node?.installed ? "Node" : "",
+                  !codeTools.harness?.installed ? "Hyperframes" : "",
+                  !codeTools.chrome?.installed ? "Chrome headless" : "",
+                  !codeTools.ffmpegReady ? "ffmpeg (install from the media library)" : "",
+                ]
+                  .filter(Boolean)
+                  .join(", ")}
+              </VideoHint>
+              {codeTools.installable ? (
+                <InlineRow>
+                  <VideoSecondaryButton onClick={startCodeToolsInstall} type="button">
+                    ⬇ Install runtime
+                  </VideoSecondaryButton>
+                </InlineRow>
+              ) : null}
+            </div>
+          ) : codeTools ? (
+            <VideoHint>
+              ✓ Hyperframes runtime ready (v{codeTools.hyperframesVersion}) — compositions live in media/code/,
+              renders land in media/generated/.
+            </VideoHint>
+          ) : null
+        ) : null}
         <VideoLabel>
           Model
           <CompactSelect>
@@ -1083,6 +1237,23 @@ export default function GeneratePanel({
             </ChipRow>
           </div>
         ) : null}
+        {caps.fpsOptions ? (
+          <div style={{ display: "grid", gap: 4 }}>
+            <VideoLabel as="div">FPS</VideoLabel>
+            <ChipRow>
+              {caps.fpsOptions.map((value) => (
+                <ParamChip
+                  data-active={codeFps === value ? "true" : "false"}
+                  key={value}
+                  onClick={() => setCodeFps(value)}
+                  type="button"
+                >
+                  {value}
+                </ParamChip>
+              ))}
+            </ChipRow>
+          </div>
+        ) : null}
         {caps.aspectRatios ? (
           <div style={{ display: "grid", gap: 4 }}>
             <VideoLabel as="div">Aspect</VideoLabel>
@@ -1164,7 +1335,7 @@ export default function GeneratePanel({
         {error ? <VideoErrorText>{error}</VideoErrorText> : null}
         <InlineRow>
           <VideoPaneButton disabled={!repoPath || !model} onClick={startGenerate} type="button">
-            Generate
+            {isCodeKind ? "Create composition" : "Generate"}
           </VideoPaneButton>
           <VideoSecondaryButton
             onClick={() => {
@@ -1179,7 +1350,7 @@ export default function GeneratePanel({
           {estUsd != null ? (
             <VideoHint title="Ballpark cost — billed through your Diff Forge cloud">≈ ${estUsd.toFixed(2)}</VideoHint>
           ) : null}
-          {model?.kind === "video" ? (
+          {model?.kind === "video" || model?.kind === "code" ? (
             <VideoHint
               as="label"
               style={{ display: "inline-flex", alignItems: "center", gap: 4, cursor: "pointer" }}
@@ -1191,6 +1362,12 @@ export default function GeneratePanel({
                 type="checkbox"
               />
               into timeline
+            </VideoHint>
+          ) : null}
+          {isCodeKind ? (
+            <VideoHint>
+              Creates an editable HTML composition — you (or an agent) author it, then press Render in
+              History.
             </VideoHint>
           ) : null}
         </InlineRow>
@@ -1207,9 +1384,12 @@ export default function GeneratePanel({
           {displayJobs.length ? (
             displayJobs.map((job) => {
               const previewAsset = resolvePreviewAsset(job);
-              const status = job.error ? "error" : job.done ? "done" : "running";
+              const isCodeJob = job.providerId === "hyperframes" || job.request?.model === "hyperframes";
+              const isAuthoring = isCodeJob && !job.done && (job.state === "authoring" || !job.state);
+              const status = job.error ? "error" : job.done ? "done" : isAuthoring ? "authoring" : "running";
               const promptText = job.request?.prompt || job.message || "";
               const canReuse =
+                !isCodeJob &&
                 job.request &&
                 job.request.kind !== "upscale" &&
                 !String(job.request.mode || "").startsWith("upscale");
@@ -1225,16 +1405,18 @@ export default function GeneratePanel({
                         ? `${previewAsset.name}\nDrag onto the timeline · double-click adds at the playhead`
                         : status === "running"
                           ? "Generating…"
-                          : status === "error"
-                            ? "Failed — no media"
-                            : "Media not in the library anymore"
+                          : status === "authoring"
+                            ? "Waiting for the composition HTML — render when it's ready"
+                            : status === "error"
+                              ? "Failed — no media"
+                              : "Media not in the library anymore"
                     }
                   >
                     {previewAsset?.thumbnailDataUrl ? (
                       <img alt="" draggable={false} src={previewAsset.thumbnailDataUrl} />
                     ) : (
                       <HistGlyph aria-hidden data-status={status}>
-                        {status === "running" ? "✦" : status === "error" ? "⚠" : "◇"}
+                        {status === "running" ? "✦" : status === "authoring" ? "✎" : status === "error" ? "⚠" : "◇"}
                       </HistGlyph>
                     )}
                   </HistThumb>
@@ -1254,9 +1436,43 @@ export default function GeneratePanel({
                     <HistStatus data-status={status}>
                       {status === "running" ? `${Math.round(job.percent || 0)}%` : status}
                     </HistStatus>
-                    {status === "running" ? (
+                    {isCodeJob && (status === "authoring" || status === "error") ? (
                       <VideoSecondaryButton
-                        onClick={() => invoke("video_generate_cancel", { jobId: job.jobId }).catch(() => {})}
+                        onClick={() => {
+                          setError("");
+                          invoke("video_generate_code_render", { repoPath, jobId: job.jobId })
+                            .then(() => loadHistory())
+                            .catch((err) => setError(String(err)));
+                        }}
+                        title="Render the composition HTML to mp4 with the local Hyperframes runtime"
+                        type="button"
+                      >
+                        ▶ Render
+                      </VideoSecondaryButton>
+                    ) : null}
+                    {isCodeJob && job.sourcePath ? (
+                      <VideoSecondaryButton
+                        onClick={() => revealCodeSource(job.sourcePath)}
+                        title={`Reveal the composition source\n${job.sourcePath}`}
+                        type="button"
+                      >
+                        ⌁ Source
+                      </VideoSecondaryButton>
+                    ) : null}
+                    {isCodeJob && job.sourcePath && onPreviewCode ? (
+                      <VideoSecondaryButton
+                        onClick={() => onPreviewCode(job.sourcePath)}
+                        title="Open the live Hyperframes Studio preview for this composition"
+                        type="button"
+                      >
+                        ◉ Preview
+                      </VideoSecondaryButton>
+                    ) : null}
+                    {status === "running" || status === "authoring" ? (
+                      <VideoSecondaryButton
+                        onClick={() =>
+                          invoke("video_generate_cancel", { jobId: job.jobId, repoPath }).catch(() => {})
+                        }
                         type="button"
                       >
                         Cancel

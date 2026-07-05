@@ -1949,7 +1949,7 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
             "List, search, import, and organize Video Editor media. Search returns filename matches plus transcript moments from cached transcripts."
         }
         "video_generate" => {
-            "List models, start, poll, or cancel Diff Forge Cloud generation (video/image/audio). start returns jobId; poll status."
+            "List models, start, poll, or cancel media generation. Cloud models cover video/image/audio; model \"hyperframes\" (kind code) renders an HTML composition locally: start scaffolds media/code/<slug>/index.html and returns jobId+sourcePath+plannedPaths (add plannedPaths[0] to the timeline now for a placeholder clip at the expected duration), author the HTML per its AGENTS.md, then action render with that jobId; re-render by starting a new job with sourcePath."
         }
         "video_export" => {
             "Start full or draft Video Editor exports and poll progress. start returns jobId; poll status."
@@ -2128,18 +2128,25 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
             "type": "object",
             "properties": {
                 "repoPath": {"type": "string"},
-                "action": {"type": "string", "enum": ["models", "start", "status", "cancel"]},
-                "kind": {"type": "string", "enum": ["video", "image", "audio"]},
-                "model": {"type": "string", "description": "Cloud jobType id from models."},
+                "action": {"type": "string", "enum": ["models", "start", "render", "status", "cancel"]},
+                "kind": {"type": "string", "enum": ["video", "image", "audio", "code"]},
+                "model": {"type": "string", "description": "Cloud jobType id from models, or \"hyperframes\" for local HTML code render."},
                 "prompt": {"type": "string"},
                 "mode": {"type": "string"},
                 "inputAssetPaths": {"type": "array", "items": {"type": "string"}},
                 "audioAssetPaths": {"type": "array", "items": {"type": "string"}},
                 "params": {"type": "object", "additionalProperties": true},
-                "jobId": {"type": "string"}
+                "jobId": {"type": "string", "description": "Required for render/cancel; optional filter for status."},
+                "title": {"type": "string", "description": "hyperframes start: composition title (names the media/code/<slug>/ folder)."},
+                "expectedDurationMs": {"type": "integer", "minimum": 200, "description": "hyperframes start: declared duration for the timeline placeholder before the render lands (default 10000). The composition's data-duration wins once authored."},
+                "fps": {"type": "integer", "minimum": 1, "maximum": 120, "description": "hyperframes: render fps (default 30)."},
+                "width": {"type": "integer", "description": "hyperframes start: composition width px (default 1920)."},
+                "height": {"type": "integer", "description": "hyperframes start: composition height px (default 1080)."},
+                "quality": {"type": "string", "enum": ["draft", "standard", "high"], "description": "hyperframes render quality (default standard)."},
+                "sourcePath": {"type": "string", "description": "hyperframes start: existing media/code/ composition entry HTML to re-render as a new output instead of scaffolding."}
             },
             "required": ["action"],
-            "description": "Use models first for Diff Forge Cloud generation (video/image/audio). start returns jobId; poll status.",
+            "description": "models first. Cloud (video/image/audio): start returns jobId; poll status. Local code render (model \"hyperframes\"): start declares the job and scaffolds sourcePath; author the HTML; then action render with jobId; poll status until done.",
             "additionalProperties": true
         }),
         "video_export" => json!({

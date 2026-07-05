@@ -462,7 +462,6 @@ import {
   TERMINAL_START_GEOMETRY_WAIT_MS,
   TERMINAL_START_LAYOUT_HIDDEN_POLL_MS,
   TERMINAL_START_LAYOUT_STILL_WAITING_LOG_MS,
-  TERMINAL_START_LAYOUT_WAIT_MS,
   TERMINAL_START_METRIC_POLL_MS,
   TERMINAL_START_METRIC_STILL_WAITING_LOG_MS,
   TERMINAL_START_METRIC_WAIT_MS,
@@ -2157,6 +2156,7 @@ function WorkspaceTerminal({
   agentStatusError,
   agentStatusState,
   appControlMcp = false,
+  confirmedTerminalPane = true,
   defaultSessionMode = "",
   dockedChrome = false,
   fullscreenState = "idle",
@@ -2407,6 +2407,14 @@ function WorkspaceTerminal({
   const paneAgentId = isGenericTerminal ? "generic" : agent?.id;
   const paneId = String(paneIdOverride || "").trim()
     || getWorkspaceTerminalPaneId(workspace?.id, terminalIndex, paneAgentId);
+  const terminalPaneConfirmed = Boolean(
+    confirmedTerminalPane
+      && paneId
+      && Number.isInteger(Number.parseInt(terminalIndex, 10))
+      && Number.parseInt(terminalCount, 10) > 0,
+  );
+  const terminalPaneConfirmedRef = useRef(terminalPaneConfirmed);
+  terminalPaneConfirmedRef.current = terminalPaneConfirmed;
   const appControlTerminalSurface = isAppControlTerminalSurface({
     paneId,
     workspaceId: workspace?.id,
@@ -6588,6 +6596,16 @@ function WorkspaceTerminal({
       return true;
     };
     const waitForTerminalRendererOpen = async (reason) => {
+      if (!terminalPaneConfirmedRef.current) {
+        logTerminalDiagnosticEvent("frontend.terminal_mount_skipped_unconfirmed_pane", {
+          paneId,
+          reason,
+          terminalCount,
+          terminalIndex,
+        });
+        return false;
+      }
+
       if (await openTerminalRenderer(reason, { attempts: 1, waitMs: 0 })) {
         return true;
       }
@@ -6595,6 +6613,7 @@ function WorkspaceTerminal({
       const waitStartedAt = performance.now();
       let attempts = 1;
       let lastWaitingLogAt = waitStartedAt;
+      let nextPollMs = TERMINAL_START_METRIC_POLL_MS;
       const firstMeasurement = getTerminalOpenContainerMeasurement();
       logTerminalDiagnosticEvent("frontend.terminal_mount_deferred", {
         ...firstMeasurement,
@@ -6604,14 +6623,12 @@ function WorkspaceTerminal({
       });
       setPaneStage("starting", "Preparing Terminal", "Waiting for terminal layout.");
 
-      while (!isDisposed) {
-        const waitMs = performance.now() - waitStartedAt;
-        const pollMs = waitMs < TERMINAL_START_LAYOUT_WAIT_MS
-          ? TERMINAL_START_METRIC_POLL_MS
-          : TERMINAL_START_LAYOUT_HIDDEN_POLL_MS;
+      while (!isDisposed && terminalPaneConfirmedRef.current) {
+        const pollMs = nextPollMs;
+        nextPollMs = TERMINAL_START_LAYOUT_HIDDEN_POLL_MS;
         await waitForStartupMetricPoll(pollMs, container);
 
-        if (isDisposed) {
+        if (isDisposed || !terminalPaneConfirmedRef.current) {
           return false;
         }
 
@@ -11203,26 +11220,28 @@ function WorkspaceTerminal({
           });
         };
 
-        const terminalOutputWorkerSession = createTerminalOutputWorkerSession({
-          coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
-          id: `${paneId}:${terminalInstanceId}:output`,
-          onTransportStatus: (event) => {
-            if (event?.type === "transport-ready") {
-              outputTransportReady = true;
-              return;
-            }
-            if (event?.type === "transport-error" || event?.type === "transport-closed") {
-              outputTransportFallback = true;
-            }
-          },
-          onOutput: processPreparedTerminalOutput,
-        });
         let outputTransportPreferred = false;
         let outputTransportReady = false;
         let outputTransportFallback = false;
+        const terminalOutputWorkerSession = terminalPaneConfirmedRef.current
+          ? createTerminalOutputWorkerSession({
+            coreRepoPath: collapseFunctionalRepoPathToCoreRepoPath(workingDirectory || ""),
+            id: `${paneId}:${terminalInstanceId}:output`,
+            onTransportStatus: (event) => {
+              if (event?.type === "transport-ready") {
+                outputTransportReady = true;
+                return;
+              }
+              if (event?.type === "transport-error" || event?.type === "transport-closed") {
+                outputTransportFallback = true;
+              }
+            },
+            onOutput: processPreparedTerminalOutput,
+          })
+          : null;
         terminalOutputWorkerSessionRef.current = terminalOutputWorkerSession;
         terminalOutputWorkerSession?.setActive(terminalActiveRef.current === true);
-        if (typeof terminalOutputWorkerSession?.prepareTransport === "function") {
+        if (typeof terminalOutputWorkerSession?.prepareTransport === "function" && terminalPaneConfirmedRef.current) {
           outputTransportPreferred = true;
           terminalOutputWorkerSession.prepareTransport({
             active: terminalActiveRef.current === true,

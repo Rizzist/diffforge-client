@@ -10,6 +10,7 @@ export const GENERATION_KINDS = [
   { id: "image", label: "Image" },
   { id: "video", label: "Video" },
   { id: "audio", label: "Audio" },
+  { id: "code", label: "Code" },
 ];
 
 export const GENERATION_PROVIDER_LABEL = "Higgsfield";
@@ -549,6 +550,24 @@ export const GENERATION_MODELS = [
       promptLabel: "Describe the sound",
     },
     est: { usdPerSecond: 0.015 },
+  },
+
+  // --- Code (local Hyperframes HTML render — no cloud cost) ---
+  {
+    id: "hyperframes",
+    kind: "code",
+    jobType: "hyperframes",
+    displayName: "Hyperframes",
+    description: "HTML composition rendered locally to mp4",
+    caps: {
+      twoPhase: true,
+      localRender: true,
+      durations: [5, 10, 15, 30],
+      defaultDuration: 10,
+      fpsOptions: [24, 30, 60],
+      promptLabel: "Composition title",
+    },
+    est: {},
   },
 
   // --- Upscalers (three providers: fal.ai, Topaz Labs, Replicate) ---

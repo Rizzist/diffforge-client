@@ -944,7 +944,7 @@ import {
   VIEW_TRANSITION_MS
 } from "./appStyles";
 import WorkspaceIdleState, { AuthSquareBackdrop } from "./WorkspaceIdleState.jsx";
-import { PlusUpsellOverlay } from "./PlusUpsell.jsx";
+import { LowCreditsOverlay, PlusUpsellOverlay } from "./PlusUpsell.jsx";
 import ToolsWorkspaceView from "../tools/ToolsWorkspaceView.jsx";
 import {
   accountDocumentHydrateRequestFromSkill,
@@ -1043,6 +1043,27 @@ const TODO_DISPATCH_HEARTBEAT_ACTIVE_MS = 5000;
 const TODO_DISPATCH_HEARTBEAT_IDLE_MS = 10000;
 const LOW_CREDIT_WARNING_STORAGE_KEY = "diffforge.lowCreditWarning.dismissed.v1";
 const LOW_CREDIT_WARNING_THRESHOLD = 1000;
+// Startup-only "credit reserve low" overlay: shown once per sign-in when the
+// term balance is under this percentage.
+const LOW_CREDITS_UPSELL_THRESHOLD_PERCENT = 10;
+// A balance jump at least this large while a top-up checkout is pending is
+// treated as the purchase landing (smallest pack is 10k; reserved-credit
+// releases stay well below this).
+const LOW_CREDITS_TOPUP_SUCCESS_MIN_CREDITS = 5000;
+// Return deep link sent by the web topup-complete page after Stripe checkout.
+const TOPUP_DEEP_LINK_PATTERN = /^diffforge(?:-dev)?:\/\/billing\/topup(?:[/?#]|$)/i;
+
+function topupDeepLinkStatus(url) {
+  if (!TOPUP_DEEP_LINK_PATTERN.test(String(url || ""))) {
+    return null;
+  }
+  try {
+    const status = new URL(url).searchParams.get("status");
+    return String(status || "success").toLowerCase();
+  } catch {
+    return "success";
+  }
+}
 const LOGOUT_TIMEOUT_MS = 5000;
 const WINDOW_FRAME_STATE_DEFAULT = { isFullscreen: false, isMaximized: false };
 const WINDOW_VIEWPORT_MARGIN_PX = 12;
@@ -4103,8 +4124,9 @@ function logWorkspaceThreadDiagnosticEvent(phase, fields = {}) {
 const MCP_REGISTRY_STORAGE_KEY = "diffforge.mcpRegistry.v1";
 const MCP_TEXT_LIMIT = 12000;
 const MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH = 2048;
-const MIN_WORKSPACE_TERMINAL_COUNT = 1;
+const MIN_WORKSPACE_TERMINAL_COUNT = 0;
 const MAX_WORKSPACE_TERMINAL_COUNT = 24;
+const DEFAULT_WORKSPACE_TERMINAL_COUNT = 1;
 const MIN_WORKSPACE_DOCUMENT_COUNT = 0;
 const MAX_WORKSPACE_DOCUMENT_COUNT = 1;
 const DEFAULT_WORKSPACE_DOCUMENT_COUNT = 0;
@@ -18476,14 +18498,68 @@ function isDisallowedWorkspaceRootDirectory(value) {
     || isBroadUserFolderRoot(value);
 }
 
-function normalizeWorkspaceTerminalCount(value) {
+function normalizeWorkspaceTerminalCount(value, fallback = DEFAULT_WORKSPACE_TERMINAL_COUNT) {
   const count = Number.parseInt(value, 10);
 
   if (!Number.isFinite(count)) {
-    return MIN_WORKSPACE_TERMINAL_COUNT;
+    const fallbackCount = Number.parseInt(fallback, 10);
+    return Math.min(
+      MAX_WORKSPACE_TERMINAL_COUNT,
+      Math.max(
+        MIN_WORKSPACE_TERMINAL_COUNT,
+        Number.isFinite(fallbackCount) ? fallbackCount : DEFAULT_WORKSPACE_TERMINAL_COUNT,
+      ),
+    );
   }
 
   return Math.min(MAX_WORKSPACE_TERMINAL_COUNT, Math.max(MIN_WORKSPACE_TERMINAL_COUNT, count));
+}
+
+function workspaceSettingsHasOwn(settings, key) {
+  return Object.prototype.hasOwnProperty.call(settings || {}, key);
+}
+
+function getWorkspaceTerminalCountFallbackForSettings(settings, workspaceId = "") {
+  if (!settings || typeof settings !== "object" || Array.isArray(settings)) {
+    return DEFAULT_WORKSPACE_TERMINAL_COUNT;
+  }
+
+  if (workspaceSettingsHasOwn(settings, "terminalRoles") && Array.isArray(settings.terminalRoles)) {
+    return settings.terminalRoles.length;
+  }
+
+  if (workspaceSettingsHasOwn(settings, "logicalTerminalIndexes") && Array.isArray(settings.logicalTerminalIndexes)) {
+    return normalizeWorkspaceTerminalSlotIndexes(settings.logicalTerminalIndexes).length;
+  }
+
+  const panes = normalizeWorkspacePaneRecords(settings.panes, { workspaceId });
+  const paneKinds = {
+    ...normalizeWorkspacePaneKinds(settings.paneKinds),
+    ...workspacePaneKindsFromPaneRecords(panes),
+  };
+  const configuredSlotIndexes = normalizeWorkspaceTerminalSlotIndexes([
+    ...workspacePaneRecordsSlotIndexes(panes),
+    ...workspacePaneKindsIndexes(paneKinds),
+  ]);
+
+  if (configuredSlotIndexes.length) {
+    return configuredSlotIndexes.length;
+  }
+
+  return cleanWorkspaceRootDirectory(settings.rootDirectory)
+    ? MIN_WORKSPACE_TERMINAL_COUNT
+    : DEFAULT_WORKSPACE_TERMINAL_COUNT;
+}
+
+function normalizeWorkspaceTerminalCountForSettings(settings, workspaceId = "") {
+  if (workspaceSettingsHasOwn(settings, "terminalCount")) {
+    return normalizeWorkspaceTerminalCount(settings.terminalCount);
+  }
+
+  return normalizeWorkspaceTerminalCount(
+    undefined,
+    getWorkspaceTerminalCountFallbackForSettings(settings, workspaceId),
+  );
 }
 
 function normalizeWorkspaceDocumentCount(value) {
@@ -18679,7 +18755,7 @@ function adjustWorkspaceAgentCardRoles(
   options = {},
 ) {
   const maxTotal = Math.max(
-    MIN_WORKSPACE_TERMINAL_COUNT,
+    DEFAULT_WORKSPACE_TERMINAL_COUNT,
     Math.min(MAX_WORKSPACE_TERMINAL_COUNT, Number(options.maxTotal) || MAX_WORKSPACE_TERMINAL_COUNT),
   );
   const minimumTotal = Math.max(0, Math.min(maxTotal, Number(options.minimumTotal) || 0));
@@ -19185,7 +19261,7 @@ function normalizeWorkspaceSettings(value) {
         const inputPaneSlotIndexes = workspacePaneRecordsSlotIndexes(inputPanes);
         const inputHasPanes = Object.prototype.hasOwnProperty.call(settings || {}, "panes");
         const inputHasDocsPane = workspacePaneRecordsHasKind(inputPanes, WORKSPACE_PANE_KIND_DOCS);
-        let terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
+        let terminalCount = normalizeWorkspaceTerminalCountForSettings(settings, workspaceId);
         let terminalRoles = normalizeWorkspaceTerminalRoles(settings?.terminalRoles, terminalCount);
         const hasCustomTerminalRoles = terminalRoles.some((role) => role !== "codex");
         const hasDocumentsCount = Object.prototype.hasOwnProperty.call(settings || {}, "documentsCount");
@@ -19262,7 +19338,7 @@ function normalizeWorkspaceSettings(value) {
           !workspaceId
           || (
             !rootDirectory
-            && terminalCount <= MIN_WORKSPACE_TERMINAL_COUNT
+            && terminalCount <= DEFAULT_WORKSPACE_TERMINAL_COUNT
             && !hasCustomTerminalRoles
             && hasDefaultDocumentsCount
             && hasDefaultPcbCount
@@ -20565,18 +20641,6 @@ function getWorkspaceRootWasEmptyAtSelection(workspaceSettings, workspaceId) {
   return Boolean(workspaceSettings?.[workspaceId]?.rootWasEmptyAtSelection);
 }
 
-function useRailRowHover() {
-  const [hovered, setHovered] = useState(false);
-  const onMouseEnter = useCallback(() => setHovered(true), []);
-  const onMouseLeave = useCallback(() => setHovered(false), []);
-  // WebKit does not dispatch mouseleave when an overlay (settings modal)
-  // appears under a stationary pointer — the hit target changes without a
-  // pointer crossing, stranding the hover state. Interactions that open an
-  // overlay clear it explicitly; a real re-hover fires mouseenter again.
-  const clearHovered = useCallback(() => setHovered(false), []);
-  return { clearHovered, hovered, onMouseEnter, onMouseLeave };
-}
-
 const LoopspaceRailRow = memo(function LoopspaceRailRow({
   loopspaceId,
   loopspaceName,
@@ -20586,25 +20650,19 @@ const LoopspaceRailRow = memo(function LoopspaceRailRow({
 }) {
   const runtimeState = selected ? "activated" : "closed";
   const rowKey = `loopspace:${loopspaceId}`;
-  const { clearHovered, hovered, onMouseEnter, onMouseLeave } = useRailRowHover();
   const handleSelect = useCallback(() => {
-    clearHovered();
     onSelect(loopspaceId);
-  }, [clearHovered, loopspaceId, onSelect]);
+  }, [loopspaceId, onSelect]);
   const handleSettings = useCallback((event) => {
     event.stopPropagation();
-    clearHovered();
     onSettings(loopspaceId);
-  }, [clearHovered, loopspaceId, onSettings]);
+  }, [loopspaceId, onSettings]);
 
   return (
     <WorkspaceRow
-      data-hovered={hovered ? "true" : undefined}
       data-runtime={runtimeState}
       data-selected={selected}
       data-workspace-rail-row-key={rowKey}
-      onMouseEnter={onMouseEnter}
-      onMouseLeave={onMouseLeave}
     >
       <WorkspaceButton
         aria-label={loopspaceName}
@@ -20659,7 +20717,6 @@ const WorkspaceRailWorkspaceRow = memo(function WorkspaceRailWorkspaceRow({
 }) {
   const workspaceRoot = workspaceRootDirectory;
   const rowKey = `workspace:${workspaceId}`;
-  const { clearHovered, hovered, onMouseEnter, onMouseLeave } = useRailRowHover();
   const runtimeState = pendingActivation
     ? "activating"
     : workspaceId === activatedWorkspaceId
@@ -20689,28 +20746,23 @@ const WorkspaceRailWorkspaceRow = memo(function WorkspaceRailWorkspaceRow({
       ? `Opening ${workspaceName}`
       : `Activate ${workspaceName}`;
   const handleSelect = useCallback(() => {
-    clearHovered();
     onSelect(workspaceId);
-  }, [clearHovered, onSelect, workspaceId]);
+  }, [onSelect, workspaceId]);
   const handleLifecycle = useCallback((event) => {
     event.stopPropagation();
     onLifecycle(workspaceId, enabled);
   }, [enabled, onLifecycle, workspaceId]);
   const handleSettings = useCallback((event) => {
     event.stopPropagation();
-    clearHovered();
     onSettings(workspaceId);
-  }, [clearHovered, onSettings, workspaceId]);
+  }, [onSettings, workspaceId]);
 
   return (
     <WorkspaceRow
-      data-hovered={hovered ? "true" : undefined}
       data-notification-highlight={notificationHighlighted ? "true" : undefined}
       data-runtime={runtimeState}
       data-selected={selected}
       data-workspace-rail-row-key={rowKey}
-      onMouseEnter={onMouseEnter}
-      onMouseLeave={onMouseLeave}
     >
       <WorkspaceButton
         aria-label={workspaceButtonLabel}
@@ -20994,7 +21046,11 @@ function getWorkspaceThreadStoreKey(targets) {
 }
 
 function getWorkspaceTerminalCount(workspaceSettings, workspaceId) {
-  return normalizeWorkspaceTerminalCount(workspaceSettings?.[workspaceId]?.terminalCount);
+  return normalizeWorkspaceTerminalCountForSettings(workspaceSettings?.[workspaceId], workspaceId);
+}
+
+function getRuntimeWorkspaceTerminalCount(workspaceSettings, workspaceId, explicitEmpty = false) {
+  return explicitEmpty ? MIN_WORKSPACE_TERMINAL_COUNT : getWorkspaceTerminalCount(workspaceSettings, workspaceId);
 }
 
 function getWorkspaceTerminalRoles(
@@ -22142,7 +22198,7 @@ function workspaceSettingsLogicalIndexLayouts(workspaceSettings = {}) {
       ...normalizeWorkspacePaneKinds(settings?.paneKinds),
       ...workspacePaneKindsFromPaneRecords(panes),
     };
-    const terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
+    const terminalCount = normalizeWorkspaceTerminalCountForSettings(settings, workspaceId);
     const logicalIndexes = hasLogicalTerminalIndexes
       ? normalizePersistedWorkspaceLogicalIndexes(
         settings.logicalTerminalIndexes,
@@ -22171,7 +22227,7 @@ function workspaceSettingsDisplayLayouts(workspaceSettings = {}) {
       ...normalizeWorkspacePaneKinds(settings?.paneKinds),
       ...workspacePaneKindsFromPaneRecords(panes),
     };
-    const terminalCount = normalizeWorkspaceTerminalCount(settings?.terminalCount);
+    const terminalCount = normalizeWorkspaceTerminalCountForSettings(settings, workspaceId);
     const logicalIndexes = normalizePersistedWorkspaceLogicalIndexes(
       settings?.logicalTerminalIndexes,
       terminalCount,
@@ -22195,7 +22251,11 @@ function workspaceSettingsDisplayLayouts(workspaceSettings = {}) {
 }
 
 function getDefaultWorkspaceDisplayTerminalRows(logicalTerminalIndexes) {
-  return getTerminalPanelRows(logicalTerminalIndexes).map((row) => row.terminalIndexes);
+  const indexes = normalizeWorkspaceTerminalSlotIndexes(logicalTerminalIndexes);
+  if (!indexes.length) {
+    return [];
+  }
+  return getTerminalPanelRows(indexes).map((row) => row.terminalIndexes);
 }
 
 function appendLogicalTerminalToBottomDisplayRow(rows, currentTerminalIndexes, newTerminalIndex) {
@@ -22341,8 +22401,17 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
     ? Boolean(hasRootGitRepository ? nextValues.rootGitRepository : currentSettings.rootGitRepository)
     : false;
   const safeModeAvailable = !rootGitRepositoryKnown || rootGitRepository;
+  const terminalCountSettings = {
+    ...currentSettings,
+    rootDirectory,
+    ...(hasTerminalRoles ? { terminalRoles: nextValues.terminalRoles } : {}),
+    ...(hasLogicalTerminalIndexes ? { logicalTerminalIndexes: nextValues.logicalTerminalIndexes } : {}),
+    ...(hasPaneKinds ? { paneKinds: nextValues.paneKinds } : {}),
+    ...(hasPanes ? { panes: nextValues.panes } : layoutTouched ? { panes: null } : {}),
+  };
   let terminalCount = normalizeWorkspaceTerminalCount(
     hasTerminalCount ? nextValues.terminalCount : currentSettings.terminalCount,
+    getWorkspaceTerminalCountFallbackForSettings(terminalCountSettings, workspaceId),
   );
   const fallbackRole = currentSettings.terminalRoles?.[0] || "codex";
   let terminalRoles = normalizeWorkspaceTerminalRoles(
@@ -22447,7 +22516,7 @@ function updateWorkspaceLocalSettings(settings, workspaceId, nextValues = {}) {
 
   if (
     !rootDirectory
-    && terminalCount <= MIN_WORKSPACE_TERMINAL_COUNT
+    && terminalCount <= DEFAULT_WORKSPACE_TERMINAL_COUNT
     && !hasCustomTerminalRoles
     && hasDefaultDocumentsCount
     && hasDefaultPcbCount
@@ -22598,7 +22667,7 @@ export default function App() {
   const [newWorkspaceRootDraft, setNewWorkspaceRootDraft] = useState("");
   const [workspaceCreateModalOpen, setWorkspaceCreateModalOpen] = useState(false);
   const [workspaceNameDraft, setWorkspaceNameDraft] = useState("");
-  const [workspaceTerminalCountDraft, setWorkspaceTerminalCountDraft] = useState("1");
+  const [workspaceTerminalCountDraft, setWorkspaceTerminalCountDraft] = useState(String(DEFAULT_WORKSPACE_TERMINAL_COUNT));
   const [workspaceTerminalRolesDraft, setWorkspaceTerminalRolesDraft] = useState(["codex"]);
   const [workspaceDocumentCountDraft, setWorkspaceDocumentCountDraft] = useState(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
   const [workspaceWebPanelCountDraft, setWorkspaceWebPanelCountDraft] = useState(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
@@ -26392,8 +26461,8 @@ export default function App() {
     setWorkspaceHydrationReady(false);
     setWorkspaceName("");
     setWorkspaceNameDraft("");
-    setWorkspaceTerminalCountDraft("1");
-    setWorkspaceTerminalRolesDraft(["codex"]);
+    setWorkspaceTerminalCountDraft(String(DEFAULT_WORKSPACE_TERMINAL_COUNT));
+    setWorkspaceTerminalRolesDraft(normalizeWorkspaceTerminalRoles([], DEFAULT_WORKSPACE_TERMINAL_COUNT));
     setWorkspaceDocumentCountDraft(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
     setWorkspaceWebPanelCountDraft(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
     setWorkspacePcbCountDraft(String(DEFAULT_WORKSPACE_PCB_COUNT));
@@ -26474,8 +26543,8 @@ export default function App() {
     setWorkspacePendingActivationId("");
     workspacePendingActivationIdRef.current = "";
     setWorkspaceNameDraft("");
-    setWorkspaceTerminalCountDraft("1");
-    setWorkspaceTerminalRolesDraft(["codex"]);
+    setWorkspaceTerminalCountDraft(String(DEFAULT_WORKSPACE_TERMINAL_COUNT));
+    setWorkspaceTerminalRolesDraft(normalizeWorkspaceTerminalRoles([], DEFAULT_WORKSPACE_TERMINAL_COUNT));
     setWorkspaceDocumentCountDraft(String(DEFAULT_WORKSPACE_DOCUMENT_COUNT));
     setWorkspaceWebPanelCountDraft(String(DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
     setWorkspacePcbCountDraft(String(DEFAULT_WORKSPACE_PCB_COUNT));
@@ -29214,6 +29283,90 @@ export default function App() {
     }
   }, [authState]);
 
+  // ----- low-credits startup top-up -----
+  // idle | shown | skipped | dismissed — decided once per sign-in from the
+  // first ready billing snapshot, so the overlay only ever appears at startup.
+  const [lowCreditsUpsellState, setLowCreditsUpsellState] = useState("idle");
+  // idle | opening | waiting — waiting means checkout was handed to the browser.
+  const [lowCreditsCheckoutState, setLowCreditsCheckoutState] = useState("idle");
+  const [lowCreditsCheckoutError, setLowCreditsCheckoutError] = useState("");
+  // Balance when the overlay first showed; a >= pack-size jump above it while
+  // a checkout is pending is the purchase landing.
+  const lowCreditsBaselineRemainingRef = useRef(null);
+  const cloudCreditsRefreshSeqRef = useRef(0);
+
+  const handleLowCreditsDismiss = useCallback(() => {
+    cloudCreditsRefreshSeqRef.current += 1;
+    setLowCreditsUpsellState("dismissed");
+    setLowCreditsCheckoutState("idle");
+    setLowCreditsCheckoutError("");
+  }, []);
+
+  const handleLowCreditsTopup = useCallback(async (packs) => {
+    setLowCreditsCheckoutState("opening");
+    setLowCreditsCheckoutError("");
+    try {
+      const checkout = await invoke("desktop_billing_start_topup_checkout", { packs });
+      const checkoutUrl = String(checkout?.url || "");
+      if (!/^https:\/\//i.test(checkoutUrl)) {
+        throw new Error("Checkout link unavailable. Try again.");
+      }
+      await openUrl(checkoutUrl);
+      setLowCreditsCheckoutState("waiting");
+    } catch (error) {
+      setLowCreditsCheckoutState("idle");
+      setLowCreditsCheckoutError(getErrorMessage(error, "Unable to start checkout. Try again."));
+    }
+  }, []);
+
+  // Stripe's webhook can trail the browser redirect by a few seconds. Ask
+  // cloud to drop its cached wallet and re-read the billing DB a few times;
+  // the refreshed snapshot also re-broadcasts to every connected device.
+  const requestCloudCreditsRefresh = useCallback(async () => {
+    const seq = cloudCreditsRefreshSeqRef.current + 1;
+    cloudCreditsRefreshSeqRef.current = seq;
+    const delaysMs = [0, 3500, 9000, 20000];
+    for (const delayMs of delaysMs) {
+      if (delayMs) {
+        await new Promise((resolve) => window.setTimeout(resolve, delayMs));
+      }
+      if (cloudCreditsRefreshSeqRef.current !== seq) {
+        return;
+      }
+      try {
+        await invoke("cloud_mcp_refresh_billing_status", { reason: "credits_topup_return" });
+      } catch {
+        // fall through to the regular status pipeline
+      }
+      const refreshed = await refreshBillingStatus({ quiet: true }).catch(() => null);
+      const remaining = Number(refreshed?.credits?.termRemainingCredits);
+      const baseline = Number(lowCreditsBaselineRemainingRef.current);
+      if (
+        Number.isFinite(remaining)
+        && Number.isFinite(baseline)
+        && remaining - baseline >= LOW_CREDITS_TOPUP_SUCCESS_MIN_CREDITS
+      ) {
+        return;
+      }
+    }
+  }, [refreshBillingStatus]);
+
+  // Handles <scheme>://billing/topup?status=... deep links from the web
+  // topup-complete page. Returns true when the URL was a topup return.
+  const handleTopupDeepLink = useCallback((url) => {
+    const status = topupDeepLinkStatus(url);
+    if (!status) {
+      return false;
+    }
+    if (status === "cancelled") {
+      setLowCreditsCheckoutState((current) => (current === "waiting" ? "idle" : current));
+      return true;
+    }
+    setLowCreditsCheckoutState((current) => (current === "idle" ? "waiting" : current));
+    void requestCloudCreditsRefresh();
+    return true;
+  }, [requestCloudCreditsRefresh]);
+
   useEffect(() => {
     const accountKey = String(resolvedTokenomicsAccountKey || "").trim();
     if (!accountKey || tokenomicsWarmAccountKeyRef.current === accountKey) {
@@ -30171,7 +30324,7 @@ export default function App() {
       const existingCatalog = Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [];
       const nextCatalog = updateCatalogWorkspace(existingCatalog, workspace);
       const nextWorkspaces = visibleWorkspaceCatalog(nextCatalog);
-      const terminalRoles = Array.isArray(requestedTerminalRoles) && requestedTerminalRoles.length
+      const terminalRoles = Array.isArray(requestedTerminalRoles)
         ? requestedTerminalRoles.slice(0, MAX_WORKSPACE_TERMINAL_COUNT)
         : null;
       const documentsCount = normalizeWorkspaceDocumentCount(
@@ -30196,7 +30349,7 @@ export default function App() {
         ...Array.from({ length: videoCount }, () => WORKSPACE_PANE_KIND_VIDEO),
       ];
       if (requestedGridPanels.length > 0) {
-        const baseTerminalRoles = terminalRoles && terminalRoles.length ? terminalRoles : ["codex"];
+        const baseTerminalRoles = terminalRoles && terminalRoles.length ? terminalRoles : [];
         const panelStartIndex = baseTerminalRoles.length;
         const combinedRoles = [
           ...baseTerminalRoles,
@@ -30214,12 +30367,16 @@ export default function App() {
         seededVmCount = workspacePaneKindsVmIndexes(seededPaneKinds).length;
         seededVideoCount = workspacePaneKindsVideoIndexes(seededPaneKinds).length;
       }
-      const seededLogicalIndexes = seededTerminalRoles?.length
+      const seededLogicalIndexes = Array.isArray(seededTerminalRoles)
         ? normalizeWorkspaceTerminalIndexes(undefined, seededTerminalRoles.length)
         : null;
-      const seededDisplayRows = seededLogicalIndexes
+      const seededDisplayRows = Array.isArray(seededLogicalIndexes)
         ? getDefaultWorkspaceDisplayTerminalRows(seededLogicalIndexes)
         : null;
+      const seededExplicitEmptyWorkspace = Array.isArray(seededLogicalIndexes)
+        && seededLogicalIndexes.length === 0
+        && requestedGridPanels.length === 0
+        && documentsCount === 0;
       const agentPermissions = normalizeWorkspaceAgentPermissions(
         requestedAgentPermissions,
         WORKSPACE_TERMINAL_ROLE_OPTIONS,
@@ -30270,6 +30427,11 @@ export default function App() {
       setNewWorkspaceRootDraft(rootDirectory);
       setWorkspaceCreateModalOpen(false);
       setWorkspaceSyncState("idle");
+      if (seededExplicitEmptyWorkspace) {
+        workspaceTerminalExplicitEmptyRef.current.add(workspace.id);
+      } else {
+        workspaceTerminalExplicitEmptyRef.current.delete(workspace.id);
+      }
 
       const scopeKey = activeAccountScopeKey;
       void invoke("local_workspaces_store", { scopeKey, workspaces: nextCatalog }).catch(() => {});
@@ -30299,6 +30461,7 @@ export default function App() {
   ]);
 
   const openWorkspaceSettings = useCallback((workspaceId) => {
+    selectedWorkspaceIdRef.current = workspaceId;
     selectedLoopspaceIdRef.current = "";
     spaceModeRef.current = APP_SPACE_MODE_WORKSPACES;
     setSpaceMode(APP_SPACE_MODE_WORKSPACES);
@@ -33716,6 +33879,11 @@ export default function App() {
       }
 
       for (const url of urls) {
+        // Top-up returns are lightweight state updates, not auth flows —
+        // route them first so a pending login callback keeps working.
+        if (handleTopupDeepLink(url)) {
+          continue;
+        }
         const handled = await completeDesktopLogin(url);
 
         if (!isMounted || handled) {
@@ -33765,6 +33933,9 @@ export default function App() {
 
         if (Array.isArray(startUrls)) {
           for (const url of startUrls) {
+            if (handleTopupDeepLink(url)) {
+              continue;
+            }
             const handled = await completeDesktopLogin(url);
             handledDeepLink = handled || handledDeepLink;
 
@@ -33802,7 +33973,7 @@ export default function App() {
         unlistenDeepLinks();
       }
     };
-  }, [completeAuthStartup, completeDesktopLogin, setSignedOut, validateStoredSession]);
+  }, [completeAuthStartup, completeDesktopLogin, handleTopupDeepLink, setSignedOut, validateStoredSession]);
 
   useEffect(() => {
     if (!authInitialized) {
@@ -34123,8 +34294,12 @@ export default function App() {
   const shouldShowWorkspaceSetup = workspaceSyncState !== "loading" && workspaces.length === 0;
   const shouldPrewarmWorkspaceTerminals = true;
   const selectedWorkspaceTerminalCount = selectedWorkspace && !shouldShowWorkspaceSetup
-    ? getWorkspaceTerminalCount(workspaceSettings, selectedWorkspace.id)
-    : MIN_WORKSPACE_TERMINAL_COUNT;
+    ? getRuntimeWorkspaceTerminalCount(
+      workspaceSettings,
+      selectedWorkspace.id,
+      workspaceTerminalExplicitEmptyRef.current.has(selectedWorkspace.id),
+    )
+    : DEFAULT_WORKSPACE_TERMINAL_COUNT;
   const selectedWorkspaceDocumentCount = selectedWorkspace && !shouldShowWorkspaceSetup
     ? getWorkspaceDocumentCount(workspaceSettings, selectedWorkspace.id)
     : DEFAULT_WORKSPACE_DOCUMENT_COUNT;
@@ -34132,8 +34307,12 @@ export default function App() {
     selectedWorkspace && selectedWorkspaceDocumentCount > 0,
   );
   const activatedWorkspaceTerminalCount = activatedWorkspace && !shouldShowWorkspaceSetup
-    ? getWorkspaceTerminalCount(workspaceSettings, activatedWorkspace.id)
-    : MIN_WORKSPACE_TERMINAL_COUNT;
+    ? getRuntimeWorkspaceTerminalCount(
+      workspaceSettings,
+      activatedWorkspace.id,
+      workspaceTerminalExplicitEmptyRef.current.has(activatedWorkspace.id),
+    )
+    : DEFAULT_WORKSPACE_TERMINAL_COUNT;
   const selectedWorkspaceTerminalRoles = useMemo(
     () => (
       selectedWorkspace && !shouldShowWorkspaceSetup
@@ -34146,7 +34325,7 @@ export default function App() {
         )
         : normalizeWorkspaceTerminalRoles(
           [],
-          MIN_WORKSPACE_TERMINAL_COUNT,
+          DEFAULT_WORKSPACE_TERMINAL_COUNT,
           workspaceTerminalFallbackRole,
           workspaceTerminalRoleOptions,
         )
@@ -34265,7 +34444,7 @@ export default function App() {
         )
         : normalizeWorkspaceTerminalRoles(
           [],
-          MIN_WORKSPACE_TERMINAL_COUNT,
+          DEFAULT_WORKSPACE_TERMINAL_COUNT,
           workspaceTerminalFallbackRole,
           workspaceTerminalRoleOptions,
         )
@@ -34304,7 +34483,7 @@ export default function App() {
           activatedWorkspace.id,
           activatedWorkspaceTerminalCount,
         )
-        : getDefaultTerminalIndexes(MIN_WORKSPACE_TERMINAL_COUNT)
+        : getDefaultTerminalIndexes(DEFAULT_WORKSPACE_TERMINAL_COUNT)
     ),
     [
       activatedWorkspace?.id,
@@ -34469,7 +34648,12 @@ export default function App() {
           workspaceSettings,
           runtimeWorkspace.id,
         );
-        const terminalCount = getWorkspaceTerminalCount(workspaceSettings, runtimeWorkspace.id);
+        const terminalExplicitEmpty = workspaceTerminalExplicitEmptyRef.current.has(runtimeWorkspace.id);
+        const terminalCount = getRuntimeWorkspaceTerminalCount(
+          workspaceSettings,
+          runtimeWorkspace.id,
+          terminalExplicitEmpty,
+        );
         const terminalRoles = getWorkspaceTerminalRoles(
           workspaceSettings,
           runtimeWorkspace.id,
@@ -34482,11 +34666,13 @@ export default function App() {
           runtimeWorkspace.id,
           workspaceTerminalRoleOptions,
         );
-        const logicalTerminalIndexes = getWorkspaceLogicalTerminalIndexes(
-          workspaceTerminalLogicalIndexes,
-          runtimeWorkspace.id,
-          terminalCount,
-        );
+        const logicalTerminalIndexes = terminalExplicitEmpty
+          ? []
+          : getWorkspaceLogicalTerminalIndexes(
+            workspaceTerminalLogicalIndexes,
+            runtimeWorkspace.id,
+            terminalCount,
+          );
         const paneKinds = getWorkspacePaneKinds(workspaceSettings, runtimeWorkspace.id);
         const terminalRoleEntries = logicalTerminalIndexes.map((terminalIndex, index) => ({
           permissionMode: getWorkspaceAgentPermissionMode(
@@ -34555,6 +34741,7 @@ export default function App() {
             : [],
           logicalTerminalCount: logicalTerminalIndexes.length,
           logicalTerminalIndexes,
+          terminalExplicitEmpty,
           minimizedPaneIndexes,
           paneKinds,
           renderAgent: getReadyWorkspaceTerminalAgent(
@@ -36604,6 +36791,15 @@ export default function App() {
       && enabledRuntimeWorkspaceIds.includes(selectedWorkspace.id)
       && !workspaceActivationDeferred,
   );
+  const selectedWorkspaceToolWorkspace = selectedWorkspaceIsActivated ? selectedWorkspace : null;
+  const selectedWorkspaceToolWorkspaceId = selectedWorkspaceToolWorkspace?.id || "";
+  const selectedWorkspaceToolFileRoot = selectedWorkspaceToolWorkspace ? selectedWorkspaceFileRoot : "";
+  const selectedWorkspaceToolCoordinationTargets = selectedWorkspaceToolWorkspace
+    ? selectedWorkspaceCoordinationTargets
+    : EMPTY_ARRAY;
+  const selectedWorkspaceToolDocumentsEnabled = Boolean(
+    selectedWorkspaceToolWorkspace && selectedWorkspaceDocumentsEnabled,
+  );
   const shouldShowWorkspacePendingActivation = Boolean(
     selectedWorkspace?.id
       && workspacePendingActivationId === selectedWorkspace.id,
@@ -36666,8 +36862,8 @@ export default function App() {
     ? workspaceToolPaneMinimized ? 72 : 30
     : 100;
   const shouldRenderAccountToolPanel = workspaceToolPaneAvailable;
-  const selectedWorkspaceToolRuntimeBridge = selectedWorkspace?.id
-    ? workspaceToolRuntimeBridges[selectedWorkspace.id] || null
+  const selectedWorkspaceToolRuntimeBridge = selectedWorkspaceToolWorkspaceId
+    ? workspaceToolRuntimeBridges[selectedWorkspaceToolWorkspaceId] || null
     : null;
   const selectedWorkspaceOpenDocumentPanel = selectedWorkspaceToolRuntimeBridge?.onOpenDocumentPanel;
   const openSelectedWorkspaceDocumentPanel = useCallback((entry) => {
@@ -36901,7 +37097,7 @@ export default function App() {
     || cloudDesktopDeviceProfile?.machine_id
     || cloudDesktopDeviceProfile?.machineId
     || "";
-  const refreshAccountToolItemsFromRust = useCallback(async (workspaceId = selectedWorkspace?.id || "") => {
+  const refreshAccountToolItemsFromRust = useCallback(async (workspaceId = selectedWorkspaceToolWorkspaceId) => {
     const safeWorkspaceId = String(workspaceId || "").trim();
     if (!safeWorkspaceId) {
       setAccountToolItems([]);
@@ -36911,10 +37107,10 @@ export default function App() {
     const items = normalizeAccountToolTodoItems(snapshot?.items, safeWorkspaceId);
     setAccountToolItems(items);
     return items;
-  }, [selectedWorkspace?.id]);
+  }, [selectedWorkspaceToolWorkspaceId]);
 
   useEffect(() => {
-    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
     if (!workspaceId) {
       setAccountToolItems([]);
       return undefined;
@@ -36935,10 +37131,10 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [refreshAccountToolItemsFromRust, selectedWorkspace?.id]);
+  }, [refreshAccountToolItemsFromRust, selectedWorkspaceToolWorkspaceId]);
 
   useEffect(() => {
-    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
     if (!workspaceId) {
       return undefined;
     }
@@ -36971,13 +37167,13 @@ export default function App() {
         unlisten();
       }
     };
-  }, [refreshAccountToolItemsFromRust, selectedWorkspace?.id]);
+  }, [refreshAccountToolItemsFromRust, selectedWorkspaceToolWorkspaceId]);
 
   const submitAccountToolDraft = useCallback(async (options = {}) => {
     const text = String(accountToolDraft || "").trim();
     const images = Array.isArray(options?.images) ? options.images.filter(Boolean) : [];
     const note = options?.note && typeof options.note === "object" ? options.note : null;
-    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
     if ((!text && !images.length && !note) || !workspaceId) {
       return [];
     }
@@ -37014,11 +37210,11 @@ export default function App() {
     accountToolDraft,
     accountToolTodoDeviceId,
     refreshAccountToolItemsFromRust,
-    selectedWorkspace?.id,
+    selectedWorkspaceToolWorkspaceId,
   ]);
   const removeAccountToolTodo = useCallback((itemId) => {
     const todoId = String(itemId || "").trim();
-    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
     if (!todoId || !workspaceId) {
       return;
     }
@@ -37035,11 +37231,11 @@ export default function App() {
     }).catch((error) => {
       setAccountToolError(error?.message || String(error || "Unable to delete todo"));
     });
-  }, [refreshAccountToolItemsFromRust, selectedWorkspace?.id]);
+  }, [refreshAccountToolItemsFromRust, selectedWorkspaceToolWorkspaceId]);
   const updateAccountToolTodoText = useCallback((itemId, text) => {
     const todoId = String(itemId || "").trim();
     const nextText = String(text || "").trim();
-    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
     if (!todoId || !workspaceId) {
       return;
     }
@@ -37070,11 +37266,11 @@ export default function App() {
   }, [
     refreshAccountToolItemsFromRust,
     removeAccountToolTodo,
-    selectedWorkspace?.id,
+    selectedWorkspaceToolWorkspaceId,
   ]);
   const setAccountToolTodoStatus = useCallback((itemId, status, reason, item = null) => {
     const todoId = String(itemId || item?.id || "").trim();
-    const workspaceId = String(selectedWorkspace?.id || item?.workspaceId || item?.workspace_id || "").trim();
+    const workspaceId = String(selectedWorkspaceToolWorkspaceId || item?.workspaceId || item?.workspace_id || "").trim();
     if (!todoId || !workspaceId) {
       return;
     }
@@ -37106,13 +37302,13 @@ export default function App() {
   }, [
     accountToolItems,
     refreshAccountToolItemsFromRust,
-    selectedWorkspace?.id,
+    selectedWorkspaceToolWorkspaceId,
   ]);
   const queueAccountToolTodo = useCallback((itemId, item = null) => {
     setAccountToolTodoStatus(itemId || item?.id, "queued", "account_tool_todo_queued", item);
   }, [setAccountToolTodoStatus]);
   const queueAllAccountToolTodos = useCallback(() => {
-    const workspaceId = String(selectedWorkspace?.id || "").trim();
+    const workspaceId = String(selectedWorkspaceToolWorkspaceId || "").trim();
     if (!workspaceId) {
       return;
     }
@@ -37150,7 +37346,7 @@ export default function App() {
   }, [
     accountToolComposerItems,
     refreshAccountToolItemsFromRust,
-    selectedWorkspace?.id,
+    selectedWorkspaceToolWorkspaceId,
   ]);
   const cancelAccountToolQueuedTodo = useCallback((itemId, item = null) => {
     setAccountToolTodoStatus(itemId || item?.id, "listed", "account_tool_todo_unqueued", item);
@@ -49912,7 +50108,7 @@ export default function App() {
 
   useEffect(() => {
     setWorkspaceNameDraft(selectedWorkspace?.name || "");
-    setWorkspaceTerminalCountDraft(String(selectedWorkspace ? selectedWorkspaceTerminalOnlyCount : MIN_WORKSPACE_TERMINAL_COUNT));
+    setWorkspaceTerminalCountDraft(String(selectedWorkspace ? selectedWorkspaceTerminalOnlyCount : DEFAULT_WORKSPACE_TERMINAL_COUNT));
     setWorkspaceDocumentCountDraft(String(selectedWorkspace ? selectedWorkspaceDocumentCount : DEFAULT_WORKSPACE_DOCUMENT_COUNT));
     setWorkspaceWebPanelCountDraft(String(selectedWorkspace ? selectedWorkspaceWebPanelCount : DEFAULT_WORKSPACE_WEB_PANEL_COUNT));
     setWorkspacePcbCountDraft(String(selectedWorkspace ? selectedWorkspacePcbPanelCount : DEFAULT_WORKSPACE_PCB_COUNT));
@@ -49920,7 +50116,7 @@ export default function App() {
     setWorkspaceVideoPanelCountDraft(String(selectedWorkspace ? selectedWorkspaceVideoPanelCount : DEFAULT_WORKSPACE_VIDEO_PANEL_COUNT));
     setWorkspaceTerminalRolesDraft(selectedWorkspace ? selectedWorkspaceTerminalOnlyRoles : normalizeWorkspaceTerminalRoles(
       [],
-      MIN_WORKSPACE_TERMINAL_COUNT,
+      DEFAULT_WORKSPACE_TERMINAL_COUNT,
       workspaceTerminalFallbackRole,
       workspaceTerminalRoleOptions,
     ));
@@ -50303,6 +50499,53 @@ export default function App() {
   const handlePlusUpsellUpgrade = useCallback(() => {
     openUrl("https://diffforge.ai/pricing").catch(() => {});
   }, []);
+  // Low-credits gate: decided exactly once per sign-in, from the first ready
+  // billing snapshot. Mid-session dips do NOT re-trigger it — the overlay is
+  // a startup moment; the LowCreditWarningToast owns in-session warnings.
+  useEffect(() => {
+    if (authState !== "authenticated") {
+      setLowCreditsUpsellState("idle");
+      setLowCreditsCheckoutState("idle");
+      setLowCreditsCheckoutError("");
+      lowCreditsBaselineRemainingRef.current = null;
+      return;
+    }
+    if (lowCreditsUpsellState !== "idle" || billingStatusState !== "ready") {
+      return;
+    }
+    const lowCreditsTermTotal = Number(billingCredits?.termTotalCredits || 0);
+    const isLowOnCredits = userIsPaid
+      && lowCreditsTermTotal > 0
+      && billingCreditPercent < LOW_CREDITS_UPSELL_THRESHOLD_PERCENT;
+    if (isLowOnCredits) {
+      lowCreditsBaselineRemainingRef.current = billingRemainingCredits;
+      setLowCreditsUpsellState("shown");
+    } else {
+      setLowCreditsUpsellState("skipped");
+    }
+  }, [
+    authState,
+    billingCreditPercent,
+    billingCredits,
+    billingRemainingCredits,
+    billingStatusState,
+    lowCreditsUpsellState,
+    userIsPaid,
+  ]);
+  // Credits landing from a pending top-up: live ws snapshots raise the
+  // balance past the sign-in baseline; the overlay flips to its success
+  // scene and dismisses itself.
+  const lowCreditsCreditsAdded = useMemo(() => {
+    if (lowCreditsUpsellState !== "shown" || lowCreditsCheckoutState !== "waiting") {
+      return 0;
+    }
+    const baseline = Number(lowCreditsBaselineRemainingRef.current);
+    if (!Number.isFinite(baseline)) {
+      return 0;
+    }
+    const added = billingRemainingCredits - baseline;
+    return added >= LOW_CREDITS_TOPUP_SUCCESS_MIN_CREDITS ? added : 0;
+  }, [billingRemainingCredits, lowCreditsCheckoutState, lowCreditsUpsellState]);
   useEffect(() => {
     if (authState !== "authenticated") {
       setPlusUpsellState("idle");
@@ -50311,6 +50554,9 @@ export default function App() {
     if (
       plusUpsellState === "idle"
       && billingStatus
+      // Wait for the low-credits decision so the two startup overlays never
+      // stack; a shown/dismissed low-credits moment consumes this sign-in.
+      && lowCreditsUpsellState === "skipped"
       // TEMP: show for every plan while testing — restore the free-plan gate:
       // && billingPlanName === "free"
     ) {
@@ -50318,7 +50564,7 @@ export default function App() {
       // tier-up plays BEFORE the user ever sees the main app area.
       setPlusUpsellState("shown");
     }
-  }, [authState, billingPlanName, billingStatus, plusUpsellState]);
+  }, [authState, billingPlanName, billingStatus, lowCreditsUpsellState, plusUpsellState]);
   const settingsPermissionsAreLoading = settingsPermissionState.status === "loading";
   const settingsAudioInputPermission = settingsPermissionState.audioInput;
   const settingsAudioShortcutPermissions = settingsPermissionState.audioShortcuts?.permissions || null;
@@ -50923,6 +51169,7 @@ export default function App() {
                             terminalWorkspaceCoordinationTargets={
                               workspaceRuntimeCoordinationTargetsByWorkspaceId.get(runtimeWorkspace.id) || EMPTY_ARRAY
                             }
+                            terminalWorkspaceExplicitEmpty={runtimeDescriptor.terminalExplicitEmpty}
                             terminalWorkspaceLogicalIndexes={runtimeDescriptor.logicalTerminalIndexes}
                             terminalWorkspaceLogicalTerminalCount={runtimeDescriptor.logicalTerminalCount}
                             agentLaunchDefaults={agentLaunchDefaults}
@@ -52807,24 +53054,22 @@ export default function App() {
                                   agentStatuses={agentStatuses}
                                   billingStatus={billingStatus}
                                   connectedDevices={cloudWorkspaceProgress.connectedDevices}
-                                  coordinationTargets={selectedWorkspace
-                                    ? selectedWorkspaceCoordinationTargets
-                                    : EMPTY_ARRAY}
+                                  coordinationTargets={selectedWorkspaceToolCoordinationTargets}
                                   defaultWorkingDirectory={defaultWorkingDirectory}
                                   deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
-                                  documentPanelEnabled={selectedWorkspaceDocumentsEnabled}
+                                  documentPanelEnabled={selectedWorkspaceToolDocumentsEnabled}
                                   dropError={accountToolError}
                                   draft={accountToolDraft}
                                   gitRepositoriesPreload={workspaceGitRepositoryPreloads[
                                     workspaceGitPullPromptCheckKey(
-                                      selectedWorkspace?.id || "",
-                                      selectedWorkspaceFileRoot || defaultWorkingDirectory,
+                                      selectedWorkspaceToolWorkspaceId,
+                                      selectedWorkspaceToolFileRoot || defaultWorkingDirectory,
                                     )
                                   ] || null}
                                   gitSnapshotsPreload={workspaceGitSnapshotPreloads[
                                     workspaceGitPullPromptCheckKey(
-                                      selectedWorkspace?.id || "",
-                                      selectedWorkspaceFileRoot || defaultWorkingDirectory,
+                                      selectedWorkspaceToolWorkspaceId,
+                                      selectedWorkspaceToolFileRoot || defaultWorkingDirectory,
                                     )
                                   ] || null}
                                   items={accountToolComposerItems}
@@ -52851,12 +53096,12 @@ export default function App() {
                                   paneMode={workspaceToolPaneMode}
                                   pendingItems={accountToolPendingItems}
                                   queueItems={accountToolComposerItems}
-                                  rootDirectory={selectedWorkspaceFileRoot || defaultWorkingDirectory}
+                                  rootDirectory={selectedWorkspaceToolFileRoot || defaultWorkingDirectory}
                                   storageUsage={cloudWorkspaceProgress.storageUsage}
                                   terminalBreakoutActive={Boolean(selectedWorkspaceToolRuntimeBridge?.terminalBreakoutActive)}
-                                  workspace={selectedWorkspace || null}
-                                  workspaceId={selectedWorkspace?.id || ""}
-                                  workspaceScopedTabsEnabled={Boolean(selectedWorkspace)}
+                                  workspace={selectedWorkspaceToolWorkspace}
+                                  workspaceId={selectedWorkspaceToolWorkspaceId}
+                                  workspaceScopedTabsEnabled={Boolean(selectedWorkspaceToolWorkspace)}
                                   workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
                                   workspaceToolTabControlRef={accountWorkspaceToolTabControlRef}
                                   workspaceToolTabMemoryRef={accountWorkspaceToolTabMemoryRef}
@@ -53098,6 +53343,23 @@ export default function App() {
             </LoginScreen>
           )}
 	        </AppContent>
+
+        {lowCreditsUpsellState === "shown" && (
+          <LowCreditsOverlay
+            checkoutError={lowCreditsCheckoutError}
+            checkoutState={lowCreditsCheckoutState}
+            creditsAdded={lowCreditsCreditsAdded}
+            isWindowFrameExpanded={isWindowFrameExpanded}
+            onDismiss={handleLowCreditsDismiss}
+            onTitleBarMouseDown={handleTitleBarMouseDown}
+            onTopup={handleLowCreditsTopup}
+            percentRemaining={billingCreditPercent}
+            remainingCredits={billingRemainingCredits}
+            resetLabel={billingResetLabel}
+            totalCredits={Number(billingCredits?.termTotalCredits || 0)}
+            windowPlatform={windowControlPlatform}
+          />
+        )}
 
         {plusUpsellState === "shown" && (
           <PlusUpsellOverlay

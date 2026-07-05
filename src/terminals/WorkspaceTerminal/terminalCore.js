@@ -6,8 +6,9 @@ import { stripLiveViewControlSequences } from "../liveViewSanitizer.js";
 
 export const TERMINAL_THEME_BACKGROUND = "#020304";
 export const WORKSPACE_TERMINAL_PANE_PREFIX = "workspace-terminal";
-export const MIN_WORKSPACE_TERMINAL_COUNT = 1;
+export const MIN_WORKSPACE_TERMINAL_COUNT = 0;
 export const MAX_WORKSPACE_TERMINAL_COUNT = 24;
+export const DEFAULT_WORKSPACE_TERMINAL_COUNT = 1;
 export const WORKSPACE_TERMINAL_PRIMARY_COLUMNS = 2;
 export const WORKSPACE_TERMINAL_WIDE_START_INDEX = 4;
 export const WORKSPACE_TERMINAL_WIDE_COLUMNS = 4;
@@ -40,7 +41,6 @@ function detectTerminalWebglRendererDefault() {
 }
 
 export const TERMINAL_ENABLE_WEBGL_RENDERER = detectTerminalWebglRendererDefault();
-export const TERMINAL_START_LAYOUT_WAIT_MS = 4000;
 // Hidden-runtime fallback poll. A ResizeObserver on the pane container ends
 // the wait instantly on reveal, so this only bounds a rare observer miss —
 // it used to be 120ms, which kept every hidden keep-alive pane hot forever.

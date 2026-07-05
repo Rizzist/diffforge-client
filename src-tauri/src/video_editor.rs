@@ -180,6 +180,9 @@ struct VideoJobStartResult {
 struct VideoGenerateStartResult {
     job_id: String,
     planned_paths: Vec<String>,
+    // Only set for code-render (hyperframes) jobs: the composition entry HTML.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -229,6 +232,9 @@ struct VideoMediaItem {
     has_transcript: bool,
     transcript_inherited: bool,
     thumbnail_data_url: Option<String>,
+    // Generation model for pending placeholders (e.g. "hyperframes"), so the
+    // frontend can label ghost tiles/clips before the asset exists.
+    model: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -514,6 +520,18 @@ const VIDEO_GENERATION_PROVIDERS: &[VideoProviderDefinition] = &[
         requires_secret_key: false,
     },
     VideoProviderDefinition {
+        // Local code-render provider: agent/user authors an HTML composition
+        // under media/code/, the app renders it with the managed Hyperframes
+        // runtime (video_code.rs). Two-phase: start declares + scaffolds, a
+        // separate render action produces the planned mp4.
+        id: "hyperframes",
+        label: "Hyperframes",
+        kind: "video",
+        default_base_url: "",
+        models: &["hyperframes"],
+        requires_secret_key: false,
+    },
+    VideoProviderDefinition {
         id: "higgsfield",
         label: "Higgsfield",
         kind: "video",
@@ -594,6 +612,10 @@ struct VideoPersistentGenerateJob {
     created_at_ms: u64,
     done: bool,
     error: Option<String>,
+    // Code-render (hyperframes) jobs: declared timeline length for the ghost
+    // clip before the render lands, and the composition entry HTML path.
+    expected_duration_ms: Option<u64>,
+    source_path: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1631,6 +1653,7 @@ fn video_build_media_item(
         has_transcript,
         transcript_inherited,
         thumbnail_data_url,
+        model: None,
     })
 }
 
@@ -1674,13 +1697,14 @@ fn video_pending_generated_media_items(
                 job_id: Some(job.job_id.clone()),
                 size_bytes: 0,
                 modified_at_ms: job.created_at_ms,
-                duration_ms: None,
+                duration_ms: job.expected_duration_ms,
                 width: None,
                 height: None,
                 has_audio: None,
                 has_transcript: false,
                 transcript_inherited: false,
                 thumbnail_data_url: None,
+                model: Some(job.model.clone()),
             });
         }
     }
@@ -6019,6 +6043,7 @@ fn video_mcp_generate_models(kind: Option<&str>) -> Vec<serde_json::Value> {
         serde_json::json!({"id":"text2speech_v2","kind":"audio","name":"Text to Speech","caps":{"voices":["elevenlabs","minimax","seed_speech","vibe_voice","cozy_voice"]},"estUsdPerImage":0.03}),
         serde_json::json!({"id":"sonilo_music","kind":"audio","name":"Sonilo Music","caps":{"durations":[10,20,30,60]},"estUsdPerSecond":0.01}),
         serde_json::json!({"id":"mirelo_sfx","kind":"audio","name":"Mirelo SFX","caps":{"durations":[5,10,15]},"estUsdPerSecond":0.015}),
+        serde_json::json!({"id":"hyperframes","kind":"code","name":"Hyperframes (HTML code render)","caps":{"twoPhase":true,"localRender":true},"estUsdPerSecond":0.0}),
     ];
     match kind {
         Some(kind) => rows
@@ -6113,7 +6138,7 @@ fn video_mcp_generate_job_json(job: &VideoPersistentGenerateJob) -> serde_json::
     } else {
         Vec::new()
     };
-    serde_json::json!({
+    let mut row = serde_json::json!({
         "jobId": job.job_id,
         "state": job.state,
         "percent": job.percent,
@@ -6121,7 +6146,14 @@ fn video_mcp_generate_job_json(job: &VideoPersistentGenerateJob) -> serde_json::
         "error": job.error,
         "outputPaths": output_paths,
         "plannedPaths": job.planned_paths,
-    })
+    });
+    if let Some(source_path) = &job.source_path {
+        row["sourcePath"] = serde_json::json!(source_path);
+    }
+    if let Some(expected_duration_ms) = job.expected_duration_ms {
+        row["expectedDurationMs"] = serde_json::json!(expected_duration_ms);
+    }
+    row
 }
 
 fn video_mcp_generate_status_value(
@@ -7514,6 +7546,38 @@ fn video_mcp_clip_duration_for_asset(
         .max(VIDEO_MCP_MIN_CLIP_DURATION_MS))
 }
 
+// Lets addClip accept a planned-but-not-yet-rendered output of an active
+// code-render job: the clip lands at the job's declared duration and shows
+// as a generating placeholder until the render resolves the path.
+fn video_mcp_pending_planned_asset_info(
+    root: &std::path::Path,
+    media_root: &std::path::Path,
+    asset_path: &str,
+) -> Option<VideoMcpAssetInfo> {
+    let normalized = video_normalize_relative_path(asset_path).ok()?;
+    let abs = root.join(&normalized);
+    if abs.exists() || !abs.starts_with(media_root.join(VIDEO_GENERATED_DIR)) {
+        return None;
+    }
+    let jobs = video_read_generation_jobs(&video_generation_jobs_path(media_root)).ok()?;
+    let job = jobs.iter().find(|job| {
+        !job.done
+            && job.error.is_none()
+            && job.expected_duration_ms.is_some()
+            && job.planned_paths.iter().any(|planned| {
+                video_normalize_relative_path(planned)
+                    .map(|planned| planned == normalized)
+                    .unwrap_or(false)
+            })
+    })?;
+    Some(VideoMcpAssetInfo {
+        rel_path: video_relative_path(root, &abs),
+        kind: "video",
+        duration_ms: job.expected_duration_ms,
+        has_audio: false,
+    })
+}
+
 fn video_mcp_add_clip(
     project: &mut VideoMcpProject,
     root: &std::path::Path,
@@ -7526,7 +7590,10 @@ fn video_mcp_add_clip(
     ffprobe_path: Option<&str>,
     state: &mut VideoMcpEditState,
 ) -> Result<(), String> {
-    let info = video_mcp_probe_asset_info(root, media_root, asset_path, ffprobe_path)?;
+    let info = match video_mcp_pending_planned_asset_info(root, media_root, asset_path) {
+        Some(info) => info,
+        None => video_mcp_probe_asset_info(root, media_root, asset_path, ffprobe_path)?,
+    };
     let wanted_kind = if info.kind == "audio" {
         "audio"
     } else {
@@ -10662,6 +10729,8 @@ struct VideoGenerateJobContext {
     created_at_ms: u64,
     registry_path: std::path::PathBuf,
     last_registry_write_ms: std::sync::Arc<std::sync::Mutex<u64>>,
+    expected_duration_ms: Option<u64>,
+    source_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -10808,6 +10877,8 @@ fn video_update_generation_job(
             created_at_ms: context.created_at_ms,
             done,
             error: error.map(str::to_string),
+            expected_duration_ms: context.expected_duration_ms,
+            source_path: context.source_path.clone(),
         });
     }
     video_write_generation_jobs(&context.registry_path, &mut jobs)
@@ -10838,6 +10909,8 @@ fn video_set_generation_provider_ref(
         created_at_ms: context.created_at_ms,
         done: false,
         error: None,
+        expected_duration_ms: context.expected_duration_ms,
+        source_path: context.source_path.clone(),
     });
     video_write_generation_jobs(&context.registry_path, &mut jobs)
 }
@@ -12773,6 +12846,18 @@ async fn video_generate_worker(
                 );
                 video_generate_kling(&context, &request, provider, &cancel).await?
             }
+            "hyperframes" => {
+                video_emit_generate_progress(
+                    &context,
+                    "rendering",
+                    Some(0.0),
+                    "Rendering composition with Hyperframes.",
+                    false,
+                    None,
+                    &[],
+                );
+                video_generate_hyperframes(&context, &request, &cancel).await?
+            }
             "gpt-image-2" => video_generate_openai_image(&context, &request, provider).await?,
             "nano-banana" => video_generate_nano_banana(&context, &request, provider).await?,
             "flux-lora" => video_generate_flux_lora(&context, &request, provider, &cancel).await?,
@@ -12856,6 +12941,15 @@ async fn video_generate_start(
         .ok_or_else(|| format!("Unknown video generation provider: {}", request.provider_id))?;
     let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
     video_ensure_media_dirs(&media_root)?;
+    if provider.id == "hyperframes" {
+        // Two-phase code render: start only declares the job (scaffolding the
+        // composition when needed); a later render action spawns the worker.
+        return tauri::async_runtime::spawn_blocking(move || {
+            video_generate_start_hyperframes(app, root, media_root, provider, request)
+        })
+        .await
+        .map_err(|error| format!("Hyperframes start worker failed: {error}"))?;
+    }
     let (job_id, cancel) = video_job_registry_insert(&VIDEO_GENERATE_JOBS)?;
     let created_at_ms = video_now_millis();
     let model = if request.model.trim().is_empty() {
@@ -12886,6 +12980,8 @@ async fn video_generate_start(
         created_at_ms,
         done: false,
         error: None,
+        expected_duration_ms: None,
+        source_path: None,
     };
     video_upsert_generation_job(&registry_path, entry)?;
     let context = VideoGenerateJobContext {
@@ -12902,12 +12998,339 @@ async fn video_generate_start(
         created_at_ms,
         registry_path,
         last_registry_write_ms: std::sync::Arc::new(std::sync::Mutex::new(created_at_ms)),
+        expected_duration_ms: None,
+        source_path: None,
     };
     tauri::async_runtime::spawn(video_generate_worker(context, request, cancel));
     Ok(VideoGenerateStartResult {
         job_id,
         planned_paths,
+        source_path: None,
     })
+}
+
+fn video_generate_params_extra_text(request: &VideoGenerateRequest, key: &str) -> Option<String> {
+    request
+        .params
+        .as_ref()
+        .and_then(|params| params.extra.get(key))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn video_generate_params_extra_u64(request: &VideoGenerateRequest, key: &str) -> Option<u64> {
+    request
+        .params
+        .as_ref()
+        .and_then(|params| params.extra.get(key))
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_f64().filter(|v| *v >= 0.0).map(|v| v.round() as u64))
+        })
+}
+
+fn video_generate_start_hyperframes(
+    app: tauri::AppHandle,
+    root: std::path::PathBuf,
+    media_root: std::path::PathBuf,
+    provider: &'static VideoProviderDefinition,
+    request: VideoGenerateRequest,
+) -> Result<VideoGenerateStartResult, String> {
+    let width = video_generate_params_extra_u64(&request, "width")
+        .map(|value| value.clamp(16, 7680) as u32)
+        .unwrap_or(VIDEO_CODE_DEFAULT_WIDTH);
+    let height = video_generate_params_extra_u64(&request, "height")
+        .map(|value| value.clamp(16, 7680) as u32)
+        .unwrap_or(VIDEO_CODE_DEFAULT_HEIGHT);
+    let fps = video_generate_params_extra_u64(&request, "fps")
+        .map(|value| value.clamp(1, 120) as u32)
+        .unwrap_or(VIDEO_CODE_DEFAULT_FPS);
+    let mut expected_duration_ms = request
+        .params
+        .as_ref()
+        .and_then(|params| params.duration_sec)
+        .filter(|seconds| seconds.is_finite() && *seconds > 0.0)
+        .map(|seconds| (seconds * 1000.0).round() as u64)
+        .or_else(|| video_generate_params_extra_u64(&request, "expectedDurationMs"))
+        .unwrap_or(VIDEO_CODE_DEFAULT_DURATION_MS)
+        .max(200);
+    let title = video_generate_params_extra_text(&request, "title")
+        .or_else(|| {
+            let prompt = request.prompt.trim();
+            (!prompt.is_empty()).then(|| prompt.chars().take(64).collect::<String>())
+        })
+        .unwrap_or_else(|| "composition".to_string());
+    let source_path = match video_generate_params_extra_text(&request, "sourcePath") {
+        Some(raw) => {
+            // Re-render of an existing composition: trust its declared
+            // data-duration over the caller's expectation.
+            let (project_dir, entry) = video_code_resolve_source(&root, &media_root, &raw)?;
+            let entry_abs = project_dir.join(&entry);
+            if let Some(parsed) = std::fs::read_to_string(&entry_abs)
+                .ok()
+                .as_deref()
+                .and_then(video_code_parse_duration_ms)
+            {
+                expected_duration_ms = parsed;
+            }
+            video_relative_path(&root, &entry_abs)
+        }
+        None => video_code_scaffold_composition(
+            &root,
+            &media_root,
+            &title,
+            expected_duration_ms,
+            width,
+            height,
+            fps,
+        )?,
+    };
+    let created_at_ms = video_now_millis();
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let recorded_request = video_recorded_generate_request("video", "hyperframes", &request);
+    let planned_paths =
+        video_plan_generated_paths(&root, &media_root, provider, &request, "video", created_at_ms);
+    let registry_path = video_generation_jobs_path(&media_root);
+    video_upsert_generation_job(
+        &registry_path,
+        VideoPersistentGenerateJob {
+            job_id: job_id.clone(),
+            provider_id: provider.id.to_string(),
+            model: "hyperframes".to_string(),
+            mode: "code-render".to_string(),
+            request: recorded_request,
+            state: "authoring".to_string(),
+            percent: None,
+            planned_paths: planned_paths.clone(),
+            provider_ref: None,
+            created_at_ms,
+            done: false,
+            error: None,
+            expected_duration_ms: Some(expected_duration_ms),
+            source_path: Some(source_path.clone()),
+        },
+    )?;
+    video_emit_generate_progress_event(
+        &app,
+        &job_id,
+        provider.id,
+        "authoring",
+        None,
+        "Composition ready to author. Edit the HTML source, then render.",
+        false,
+        None,
+        &[],
+        "hyperframes",
+        &planned_paths,
+    );
+    let _ = app.emit(
+        VIDEO_STORE_CHANGED_EVENT,
+        serde_json::json!({
+            "repoPath": root.to_string_lossy().to_string(),
+            "paths": [source_path.clone()],
+            "changedAtMs": video_now_millis(),
+        }),
+    );
+    Ok(VideoGenerateStartResult {
+        job_id,
+        planned_paths,
+        source_path: Some(source_path),
+    })
+}
+
+fn video_update_generation_job_expected_duration(
+    registry_path: &std::path::Path,
+    job_id: &str,
+    expected_duration_ms: u64,
+) -> Result<(), String> {
+    let _guard = video_generation_jobs_guard()?;
+    let mut jobs = video_read_generation_jobs(registry_path)?;
+    let Some(job) = jobs.iter_mut().find(|job| job.job_id == job_id) else {
+        return Ok(());
+    };
+    if job.expected_duration_ms == Some(expected_duration_ms) {
+        return Ok(());
+    }
+    job.expected_duration_ms = Some(expected_duration_ms);
+    video_write_generation_jobs(registry_path, &mut jobs)
+}
+
+/// Kicks the render phase of a declared hyperframes job. Re-parses the
+/// composition's data-duration so the ledger (and any ghost clip refreshes)
+/// reconcile with what the author actually wrote.
+#[tauri::command]
+async fn video_generate_code_render(
+    app: tauri::AppHandle,
+    repo_path: String,
+    job_id: String,
+) -> Result<VideoGenerateStartResult, String> {
+    let (root, media_root) = video_workspace_media_root(repo_path.as_str())?;
+    video_ensure_media_dirs(&media_root)?;
+    let registry_path = video_generation_jobs_path(&media_root);
+    let job = video_read_generation_jobs(&registry_path)?
+        .into_iter()
+        .find(|job| job.job_id == job_id)
+        .ok_or_else(|| format!("Video generation job not found: {job_id}"))?;
+    if job.provider_id != "hyperframes" {
+        return Err("Only hyperframes code jobs can be rendered with this command.".to_string());
+    }
+    if job.done && job.error.is_none() {
+        return Err(
+            "This job already rendered. Start a new job with sourcePath set to this composition to re-render."
+                .to_string(),
+        );
+    }
+    let source_path = job
+        .source_path
+        .clone()
+        .ok_or_else(|| "Hyperframes job is missing its composition sourcePath.".to_string())?;
+    let (project_dir, entry) = video_code_resolve_source(&root, &media_root, &source_path)?;
+    let entry_abs = project_dir.join(&entry);
+    let expected_duration_ms = std::fs::read_to_string(&entry_abs)
+        .ok()
+        .as_deref()
+        .and_then(video_code_parse_duration_ms)
+        .or(job.expected_duration_ms);
+    if let Some(expected) = expected_duration_ms {
+        let _ = video_update_generation_job_expected_duration(&registry_path, &job.job_id, expected);
+    }
+    let status = video_code_tools_status_for(&app);
+    if let Some(error) = video_code_ready_error(&status) {
+        return Err(error);
+    }
+    let cancel = video_job_registry_insert_with_id(&VIDEO_GENERATE_JOBS, &job.job_id)?;
+    let context = VideoGenerateJobContext {
+        app,
+        root,
+        media_root: media_root.clone(),
+        generated_dir: media_root.join(VIDEO_GENERATED_DIR),
+        job_id: job.job_id.clone(),
+        provider_id: job.provider_id.clone(),
+        model: job.model.clone(),
+        mode: job.mode.clone(),
+        request: job.request.clone(),
+        planned_paths: job.planned_paths.clone(),
+        created_at_ms: job.created_at_ms,
+        registry_path,
+        last_registry_write_ms: std::sync::Arc::new(std::sync::Mutex::new(0)),
+        expected_duration_ms,
+        source_path: Some(source_path.clone()),
+    };
+    let request = VideoGenerateRequest {
+        provider_id: job.provider_id.clone(),
+        model: job.model.clone(),
+        mode: job.mode.clone(),
+        prompt: job.request.prompt.clone(),
+        input_asset_paths: Vec::new(),
+        audio_asset_paths: Vec::new(),
+        params: job.request.params.clone(),
+        lora_id: None,
+        auth: None,
+    };
+    tauri::async_runtime::spawn(video_generate_worker(context, request, cancel));
+    Ok(VideoGenerateStartResult {
+        job_id: job.job_id,
+        planned_paths: job.planned_paths,
+        source_path: Some(source_path),
+    })
+}
+
+async fn video_generate_hyperframes(
+    context: &VideoGenerateJobContext,
+    request: &VideoGenerateRequest,
+    cancel: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Vec<String>, String> {
+    let source_path = context
+        .source_path
+        .clone()
+        .ok_or_else(|| "Hyperframes job is missing its composition sourcePath.".to_string())?;
+    let (project_dir, entry) =
+        video_code_resolve_source(&context.root, &context.media_root, &source_path)?;
+    let output_abs =
+        video_planned_output_abs(&context.root, &context.media_root, &context.planned_paths, 0)?;
+    let fps = video_generate_params_extra_u64(request, "fps")
+        .map(|value| value.clamp(1, 120) as u32)
+        .unwrap_or(VIDEO_CODE_DEFAULT_FPS);
+    let quality = video_generate_params_extra_text(request, "quality")
+        .filter(|value| matches!(value.as_str(), "draft" | "standard" | "high"))
+        .unwrap_or_else(|| "standard".to_string());
+    let temp_output = context
+        .media_root
+        .join(VIDEO_CACHE_DIR)
+        .join(format!("hyperframes-render-{}.mp4", context.job_id));
+    let app = context.app.clone();
+    let worker_context = context.clone();
+    let worker_cancel = cancel.clone();
+    let worker_temp = temp_output.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        // Throttle: the harness reports per-frame; the UI only needs coarse
+        // updates and each emit also touches the persisted ledger.
+        let mut last_emit = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let mut last_percent = -1.0f64;
+        let mut on_progress = |percent: f64, _stage: &str, message: &str| {
+            if percent - last_percent < 1.0 && last_emit.elapsed().as_millis() < 400 {
+                return;
+            }
+            last_percent = percent;
+            last_emit = std::time::Instant::now();
+            video_emit_generate_progress(
+                &worker_context,
+                "rendering",
+                Some(percent),
+                message,
+                false,
+                None,
+                &[],
+            );
+        };
+        video_code_render_blocking(
+            &app,
+            &project_dir,
+            &entry,
+            &worker_temp,
+            fps,
+            &quality,
+            &worker_cancel,
+            &mut on_progress,
+        )
+    })
+    .await
+    .map_err(|error| format!("Hyperframes render worker failed: {error}"))??;
+    if let Some(parent) = output_abs.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create generated media directory: {error}"))?;
+    }
+    std::fs::rename(&temp_output, &output_abs)
+        .map_err(|error| format!("Unable to move rendered video into media/generated: {error}"))?;
+    let planned_path = context
+        .planned_paths
+        .first()
+        .cloned()
+        .ok_or_else(|| "Hyperframes job has no planned output path.".to_string())?;
+    // Record where the mp4 came from so the timeline can offer "open
+    // composition source" / re-render on the clip.
+    let manifest_path = video_media_manifest_path(&context.media_root);
+    if let Ok(_guard) = video_media_manifest_guard() {
+        let mut manifest = video_read_media_manifest(&manifest_path);
+        if let Ok(output_rel) =
+            video_manifest_asset_path(&context.root, &context.media_root, &planned_path)
+        {
+            if video_manifest_add_relation(
+                &mut manifest,
+                &output_rel,
+                &source_path,
+                "hyperframes-render",
+                None,
+            ) {
+                let _ = video_write_media_manifest(&manifest_path, &manifest);
+                video_emit_manifest_changed(&context.app, &context.root, &manifest_path);
+            }
+        }
+    }
+    Ok(vec![planned_path])
 }
 
 async fn video_generate_resume_from_ref(
@@ -13289,6 +13712,12 @@ async fn video_generate_resume(
     if job.done {
         return Err("Video generation job is already done.".to_string());
     }
+    if job.provider_id == "hyperframes" {
+        // Local code render: resuming just re-runs the render from the
+        // composition source on disk.
+        video_generate_code_render(app, repo_path, job.job_id).await?;
+        return Ok(VideoGenerateResumeResponse { ok: true });
+    }
     if job.provider_ref.is_none() {
         return Err("Video generation job does not have a providerRef to resume.".to_string());
     }
@@ -13313,6 +13742,8 @@ async fn video_generate_resume(
             created_at_ms: job.created_at_ms,
             registry_path,
             last_registry_write_ms: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            expected_duration_ms: job.expected_duration_ms,
+            source_path: job.source_path.clone(),
         };
         video_cloud_register_generation_job(&cloud_job_id, context.clone(), cancel)?;
         video_emit_generate_progress(
@@ -13342,28 +13773,72 @@ async fn video_generate_resume(
         created_at_ms: job.created_at_ms,
         registry_path,
         last_registry_write_ms: std::sync::Arc::new(std::sync::Mutex::new(0)),
+        expected_duration_ms: job.expected_duration_ms,
+        source_path: job.source_path.clone(),
     };
     tauri::async_runtime::spawn(video_generate_resume_worker(context, job, auth, cancel));
     Ok(VideoGenerateResumeResponse { ok: true })
 }
 
+// Marks a ledger-only job (hyperframes "authoring" — no live worker to
+// signal) as cancelled so its ghost tiles and placeholder clips clear.
+fn video_generate_cancel_ledger_job(app: &tauri::AppHandle, repo_path: Option<&str>, job_id: &str) -> Result<(), String> {
+    let Some(repo_path) = repo_path else {
+        return Err("Unknown job".to_string());
+    };
+    let (_root, media_root) = video_workspace_media_root(repo_path)?;
+    let registry_path = video_generation_jobs_path(&media_root);
+    let job = {
+        let _guard = video_generation_jobs_guard()?;
+        let mut jobs = video_read_generation_jobs(&registry_path)?;
+        let Some(job) = jobs.iter_mut().find(|job| job.job_id == job_id && !job.done) else {
+            return Err("Unknown job".to_string());
+        };
+        job.done = true;
+        job.state = "cancelled".to_string();
+        job.error = Some("Cancelled.".to_string());
+        let job = job.clone();
+        video_write_generation_jobs(&registry_path, &mut jobs)?;
+        job
+    };
+    video_emit_generate_progress_event(
+        app,
+        &job.job_id,
+        &job.provider_id,
+        "cancelled",
+        Some(100.0),
+        "Generation cancelled.",
+        true,
+        None,
+        &[],
+        &job.model,
+        &job.planned_paths,
+    );
+    Ok(())
+}
+
 // Cancels generation AND LoRA-training jobs: the frontend shows both in one
-// jobs list and cancels either through this command.
+// jobs list and cancels either through this command. repo_path lets it also
+// cancel ledger-only jobs (hyperframes authoring) that have no live worker.
 #[tauri::command]
-fn video_generate_cancel(job_id: String) -> Result<(), String> {
+fn video_generate_cancel(
+    app: tauri::AppHandle,
+    job_id: String,
+    repo_path: Option<String>,
+) -> Result<(), String> {
     match video_job_registry_cancel(&VIDEO_GENERATE_JOBS, &job_id) {
         Ok(()) => {
             let _ = video_cloud_cancel_generation_job(&job_id);
             Ok(())
         }
         Err(error) if error == "Unknown job" => {
-            video_job_registry_cancel(&VIDEO_LORA_JOBS, &job_id).map_err(|lora_error| {
-                if lora_error == "Unknown job" {
-                    "Unknown job".to_string()
-                } else {
-                    lora_error
+            match video_job_registry_cancel(&VIDEO_LORA_JOBS, &job_id) {
+                Ok(()) => Ok(()),
+                Err(lora_error) if lora_error == "Unknown job" => {
+                    video_generate_cancel_ledger_job(&app, repo_path.as_deref(), &job_id)
                 }
-            })
+                Err(lora_error) => Err(lora_error),
+            }
         }
         Err(error) => Err(error),
     }
@@ -13416,6 +13891,43 @@ fn video_mcp_prepare_generate_start_request(
     let mode = video_mcp_input_text(input, &["mode"]).unwrap_or_else(|| {
         video_mcp_generate_default_mode(&kind, &input_asset_paths, &audio_asset_paths)
     });
+    if model == "hyperframes" || kind == "code" {
+        if model != "hyperframes" {
+            return Err(format!(
+                "Unknown code generation model: {model}. Valid code model ids: hyperframes"
+            ));
+        }
+        let mut params = input
+            .get("params")
+            .cloned()
+            .map(serde_json::from_value::<VideoGenerateParams>)
+            .transpose()
+            .map_err(|error| format!("Unable to decode video_generate params: {error}"))?
+            .unwrap_or_default();
+        // Top-level conveniences for the code flow ride in params.extra so
+        // the recorded request round-trips through the job ledger.
+        for key in ["title", "sourcePath", "quality"] {
+            if let Some(value) = video_mcp_input_text(input, &[key]) {
+                params.extra.insert(key.to_string(), serde_json::json!(value));
+            }
+        }
+        for key in ["expectedDurationMs", "fps", "width", "height"] {
+            if let Some(value) = input.get(key).and_then(serde_json::Value::as_u64) {
+                params.extra.insert(key.to_string(), serde_json::json!(value));
+            }
+        }
+        return Ok(VideoGenerateRequest {
+            provider_id: "hyperframes".to_string(),
+            model: "hyperframes".to_string(),
+            mode: "code-render".to_string(),
+            prompt,
+            input_asset_paths: Vec::new(),
+            audio_asset_paths: Vec::new(),
+            params: Some(params),
+            lora_id: None,
+            auth: None,
+        });
+    }
     let (root, media_root) = video_workspace_media_root(repo_path)?;
     video_ensure_media_dirs(&media_root)?;
     video_mcp_validate_generate_start(
@@ -13460,18 +13972,39 @@ async fn video_mcp_generate(
         "models" => {
             let kind = video_mcp_input_text(&input, &["kind"]);
             if let Some(kind) = kind.as_deref() {
-                if !matches!(kind, "video" | "image" | "audio") {
-                    return Err("kind must be video, image, or audio.".to_string());
+                if !matches!(kind, "video" | "image" | "audio" | "code") {
+                    return Err("kind must be video, image, audio, or code.".to_string());
                 }
             }
             Ok(serde_json::json!({ "models": video_mcp_generate_models(kind.as_deref()) }))
         }
         "start" => {
             let request = video_mcp_prepare_generate_start_request(repo_path.as_str(), &input)?;
+            let is_code = request.provider_id == "hyperframes";
             let result = video_generate_start(app, repo_path, request).await?;
+            let mut row = serde_json::json!({
+                "jobId": result.job_id,
+                "plannedPaths": result.planned_paths,
+            });
+            if let Some(source_path) = result.source_path {
+                row["sourcePath"] = serde_json::json!(source_path);
+            }
+            if is_code {
+                row["note"] = serde_json::json!(
+                    "Composition declared. Author the HTML at sourcePath (see the AGENTS.md beside it; keep the root data-duration accurate), then call video_generate with action \"render\" and this jobId. The mp4 lands at plannedPaths[0]; a timeline clip added at that path shows as a placeholder until then."
+                );
+            }
+            Ok(row)
+        }
+        "render" => {
+            let job_id = video_mcp_input_text(&input, &["jobId", "job_id"])
+                .ok_or_else(|| "video_generate render requires jobId.".to_string())?;
+            let result = video_generate_code_render(app, repo_path, job_id).await?;
             Ok(serde_json::json!({
                 "jobId": result.job_id,
                 "plannedPaths": result.planned_paths,
+                "sourcePath": result.source_path,
+                "note": "Render started. Poll with action \"status\" and this jobId until done.",
             }))
         }
         "status" => {
@@ -13482,7 +14015,7 @@ async fn video_mcp_generate(
         "cancel" => {
             let job_id = video_mcp_input_text(&input, &["jobId", "job_id"])
                 .ok_or_else(|| "video_generate cancel requires jobId.".to_string())?;
-            video_generate_cancel(job_id.clone())?;
+            video_generate_cancel(app, job_id.clone(), Some(repo_path))?;
             Ok(serde_json::json!({ "ok": true, "jobId": job_id }))
         }
         _ => Err(format!("Unknown video_generate action: {action}")),

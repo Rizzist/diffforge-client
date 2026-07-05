@@ -7952,10 +7952,12 @@ export function AudioWidgetWindow() {
       // switch is the one moment native state can drift from the rendered
       // geometry: re-place once with the CURRENT React geometry so the frame
       // always matches what the widget is showing. Rust skips the setFrame
-      // when the frame already matches, so this is cheap and cannot loop
-      // (our re-place is a "command" and echoes a requestId).
+      // when the frame already matches (or is already sliding there), so
+      // this is cheap and cannot loop (our re-place is a "command" and
+      // echoes a requestId). Animated so a real correction glides in with
+      // the same slide the native Space reposition uses.
       if (reason === "space_changed") {
-        positionBottomAnchoredWidgetRef.current?.({ animate: false });
+        positionBottomAnchoredWidgetRef.current?.({ animate: true });
         return;
       }
 
