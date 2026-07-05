@@ -23,6 +23,8 @@ static TODO_DISPATCH_DRAIN_NOTIFIED_AT: OnceLock<StdMutex<HashMap<String, u64>>>
 static TODO_DISPATCH_ATTENTION_NOTIFIED_AT: OnceLock<StdMutex<HashMap<String, u64>>> =
     OnceLock::new();
 static TODO_DISPATCH_APP_STARTED_MS: OnceLock<u64> = OnceLock::new();
+static TODO_STORE_ORPHAN_SWEEP_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
+static TODO_STORE_ORPHAN_SWEEP_DEBOUNCE_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn todo_dispatch_now_ms() -> u64 {
     SystemTime::now()
@@ -530,6 +532,9 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
     let next = todo_dispatch_prune(&next, now_ms);
     let after_active = todo_dispatch_active_count(&next);
     todo_dispatch_save(workspace_id, &next);
+    if before_active != after_active || todo_dispatch_status_is_active(&status) {
+        todo_store_orphan_sweep_trigger("todo_dispatch_receipt_status_changed");
+    }
 
     if let Some(app) = app {
         let _ = app.emit(
@@ -1273,6 +1278,7 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                         && changed_kind != "remote_todo_already_current"
                     {
                         todo_dispatch_queue_write(&workspace_id, &items);
+                        todo_store_orphan_sweep_trigger("remote_todo_intake");
                         todo_store_emit_changed(app, &workspace_id, "remote_todo_intake", "store");
                         notify_remote_arrival = true;
                         if !todo_dispatch_webview_dispatcher_active() {
@@ -2285,9 +2291,41 @@ pub(crate) const TODO_STORE_CHANGED_EVENT: &str = "todo-store-changed";
 pub(crate) const TODO_STORE_CANCEL_REQUESTED_EVENT: &str = "todo-store-cancel-requested";
 const TODO_STORE_TOMBSTONE_MAX: usize = 2000;
 const TODO_STORE_ORPHAN_AFTER_MS: u64 = 15 * 60 * 1000;
-const TODO_STORE_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 300;
+const TODO_STORE_ORPHAN_SWEEP_INTERVAL_SECS: u64 = 30 * 60;
 const TODO_STORE_ORPHAN_SWEEP_INITIAL_DELAY_SECS: u64 = 90;
+const TODO_STORE_ORPHAN_SWEEP_DEBOUNCE_MS: u64 = 7_000;
 const TODO_STORE_ACTIVE_RUN_STATUSES: [&str; 2] = ["running", "sending"];
+
+fn todo_store_orphan_sweep_notify() -> Arc<tokio::sync::Notify> {
+    TODO_STORE_ORPHAN_SWEEP_NOTIFY
+        .get_or_init(|| Arc::new(tokio::sync::Notify::new()))
+        .clone()
+}
+
+pub(crate) fn todo_store_orphan_sweep_shutdown_notify() {
+    todo_store_orphan_sweep_notify().notify_one();
+}
+
+pub(crate) fn todo_store_orphan_sweep_trigger(_reason: &'static str) {
+    if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
+        return;
+    }
+    let notify = todo_store_orphan_sweep_notify();
+    if TODO_STORE_ORPHAN_SWEEP_DEBOUNCE_PENDING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        sleep(Duration::from_millis(TODO_STORE_ORPHAN_SWEEP_DEBOUNCE_MS)).await;
+        TODO_STORE_ORPHAN_SWEEP_DEBOUNCE_PENDING.store(false, Ordering::Release);
+        if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
+            return;
+        }
+        notify.notify_one();
+    });
+}
 
 fn todo_store_tombstones_read(workspace_id: &str) -> serde_json::Map<String, Value> {
     let Some(path) = todo_dispatch_data_path("tombstones", workspace_id) else {
@@ -5443,14 +5481,41 @@ pub(crate) fn todo_store_startup_sweep(app: &AppHandle) {
 }
 
 pub(crate) fn todo_store_orphan_sweep_start(app: AppHandle) {
+    let notify = todo_store_orphan_sweep_notify();
     tauri::async_runtime::spawn(async move {
-        sleep(Duration::from_secs(
+        let initial_delay = sleep(Duration::from_secs(
             TODO_STORE_ORPHAN_SWEEP_INITIAL_DELAY_SECS,
-        ))
-        .await;
+        ));
+        tokio::pin!(initial_delay);
         loop {
+            tokio::select! {
+                _ = &mut initial_delay => break,
+                _ = notify.notified() => {
+                    if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
+                        return;
+                    }
+                }
+            }
+        }
+        if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
+            return;
+        }
+        todo_store_orphan_sweep_tick(&app).await;
+        if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
+            return;
+        }
+        loop {
+            tokio::select! {
+                _ = notify.notified() => {}
+                _ = sleep(Duration::from_secs(TODO_STORE_ORPHAN_SWEEP_INTERVAL_SECS)) => {}
+            }
+            if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
+                return;
+            }
             todo_store_orphan_sweep_tick(&app).await;
-            sleep(Duration::from_secs(TODO_STORE_ORPHAN_SWEEP_INTERVAL_SECS)).await;
+            if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) != APP_SHUTDOWN_PHASE_RUNNING {
+                return;
+            }
         }
     });
 }
@@ -6578,6 +6643,7 @@ fn todo_dispatch_queue_mark_settled(
         .collect::<Vec<_>>();
     if changed {
         todo_dispatch_queue_write(workspace_id, &next_items);
+        todo_store_orphan_sweep_trigger("todo_queue_backend_settled");
         if let Some(app) = app {
             let settled_items_for_sync = settled_items.clone();
             todo_store_push_corrections(
@@ -8705,6 +8771,7 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
                 capture_item = parent.clone();
             }
             todo_dispatch_queue_write(workspace_id, &items);
+            todo_store_orphan_sweep_trigger("terminal_direct_input_appended");
             todo_store_push_items(
                 app,
                 workspace_id,
@@ -8832,6 +8899,7 @@ pub(crate) fn todo_dispatch_capture_direct_prompt_todo(
         }
         if wrote {
             todo_dispatch_queue_write(workspace_id, &items);
+            todo_store_orphan_sweep_trigger("terminal_direct_submit");
             if let Some(sync_item) = sync_item {
                 todo_store_push_items(app, workspace_id, vec![sync_item], "terminal_direct_submit");
             }
@@ -9493,6 +9561,7 @@ async fn todo_dispatch_queue_sync(
         let items = todo_store_retain_settled_items_core(stored_items, items, &tombstoned);
         let changed_items = todo_store_changed_items_for_sync(&previous_items, &items);
         todo_dispatch_queue_write(&workspace_id, &items);
+        todo_store_orphan_sweep_trigger("todo_dispatch_queue_sync");
         todo_store_push_items(&app, &workspace_id, changed_items, &reason);
         // Origin "webview": the webview's own changed-listener skips these to
         // avoid sync feedback loops; other windows still refresh.
@@ -10907,6 +10976,7 @@ fn todo_dispatch_backend_try_claim_item(
     }
     if claimed.is_some() {
         todo_dispatch_queue_write(workspace_id, &items);
+        todo_store_orphan_sweep_trigger("todo_queue_backend_dispatch_claim");
     }
     claimed
 }
@@ -10941,6 +11011,7 @@ fn todo_dispatch_backend_release_claim(workspace_id: &str, item: &Value, reason:
     }
     if changed {
         todo_dispatch_queue_write(workspace_id, &items);
+        todo_store_orphan_sweep_trigger("todo_queue_backend_release_claim");
     }
 }
 
@@ -11277,6 +11348,7 @@ async fn todo_dispatch_backend_submit(
                 })
                 .collect::<Vec<_>>();
             todo_dispatch_queue_write(workspace_id, &next_items);
+            todo_store_orphan_sweep_trigger("todo_queue_backend_submit");
         }
     }
     if let Some(running_item) = running_item {

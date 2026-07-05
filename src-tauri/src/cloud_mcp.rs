@@ -148,6 +148,12 @@ const CLOUD_MCP_TOKENOMICS_SYNC_STATE_TABLE: &str = "tokenomics_v2_sync_state";
 const CLOUD_MCP_TOKENOMICS_DAY_SYNC_STATE_TABLE: &str = "tokenomics_v2_day_sync_state";
 const CLOUD_MCP_TOKENOMICS_DAY_MS: i64 = 86_400_000;
 const CLOUD_MCP_TOKENOMICS_SYNC_LOOKBACK_DAYS: i64 = 30;
+const CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_BATCH_DAYS: usize = 80;
+const CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_ENQUEUE_LIMIT: usize = 40;
+const CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_DONE_META_PREFIX: &str =
+    "usage_event_prune_historical_day_ack_seed_done_v1:";
+const CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_PROGRESS_META_PREFIX: &str =
+    "usage_event_prune_historical_day_ack_seed_progress_v1:";
 const CLOUD_MCP_TOKENOMICS_CONTRACT: &str = "diffforge.tokenomics.v3";
 const CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL: &str = "tokenomics.device.graph_facts.v1";
 const CLOUD_MCP_TOKENOMICS_SYNC_SCHEMA_VERSION: u64 = 4;
@@ -454,6 +460,20 @@ enum CloudMcpTokenomicsDaySyncDecision {
     Enqueue,
     CurrentAcked,
     CurrentPending,
+}
+
+struct CloudMcpTokenomicsDaySyncDecisionOutcome {
+    decision: CloudMcpTokenomicsDaySyncDecision,
+    prune_ack_seed: Option<TokenomicsUsageEventPruneCloudAckSeed>,
+}
+
+struct CloudMcpTokenomicsHistoricalPruneAckPlan {
+    skipped_done: bool,
+    reached_end: bool,
+    planned_progress_day_start_ms: Option<i64>,
+    seed_progress_day_start_ms: Option<i64>,
+    seeds: Vec<TokenomicsUsageEventPruneCloudAckSeed>,
+    enqueue_buckets: Vec<CloudMcpTokenomicsDayBucket>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -849,11 +869,19 @@ fn cloud_mcp_background_sync_ack(kind: &str, key: &str, reason: &str, extra: Val
 /// activity surface so the periodic sync does not flash a spinner each minute.
 const CLOUD_MCP_TOKENOMICS_PERIODIC_REASON: &str = "tokenomics_periodic";
 const CLOUD_MCP_TOKENOMICS_STARTUP_REASON: &str = "tokenomics_startup";
-/// Idle gap between the end of one stamp cycle and the start of the next. The
-/// SQLite handle is closed while we wait so the loop stays energy-cheap.
-const CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS: u64 = 60;
+/// Safety-net fallback when filesystem events are missed. Provider limit sample
+/// buckets are 15 minutes, so this preserves history without minute polling.
+const CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS: u64 = 15 * 60;
+/// Coalescing window for transcript file events. Streaming agents append
+/// continuously, so this bounds the cycle rate while active — one stamp per
+/// window — instead of re-running the gate every few seconds.
+const CLOUD_MCP_TOKENOMICS_WATCH_DEBOUNCE_MS: u64 = 30_000;
 /// Short settle delay before the first cycle so app startup isn't contended.
 const CLOUD_MCP_TOKENOMICS_PERIODIC_STARTUP_DELAY_SECS: u64 = 15;
+const CLOUD_MCP_BACKGROUND_SCHEDULER_SHUTDOWN_POLL_SECS: u64 = 30;
+
+static CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER: OnceLock<StdMutex<Option<notify::RecommendedWatcher>>> =
+    OnceLock::new();
 
 #[cfg(target_os = "macos")]
 struct CloudMcpMacosThreadQosGuard {
@@ -910,11 +938,172 @@ impl CloudMcpMacosThreadQosGuard {
     }
 }
 
-/// Drives the always-on Tokenomics refresh while the app is running: every
-/// minute it stamps the current usage percentages into the local history,
-/// re-scans the current-day token tail, then best-effort pushes the delta to
-/// the server. Inbound server tokenomics is ignored for now. The database is
-/// only opened for the duration of each cycle.
+fn cloud_mcp_watch_event_is_relevant(event: &notify::Event) -> bool {
+    matches!(
+        event.kind,
+        notify::event::EventKind::Any
+            | notify::event::EventKind::Create(_)
+            | notify::event::EventKind::Modify(_)
+            | notify::event::EventKind::Remove(_)
+    )
+}
+
+fn cloud_mcp_spawn_fs_event_debounce_forwarder(
+    name: &'static str,
+    receiver: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    notify: Arc<tokio::sync::Notify>,
+    debounce: Duration,
+    before_notify: Option<fn()>,
+) {
+    thread::spawn(move || loop {
+        if app_shutdown_requested() {
+            return;
+        }
+        let first = match receiver.recv_timeout(Duration::from_secs(
+            CLOUD_MCP_BACKGROUND_SCHEDULER_SHUTDOWN_POLL_SECS,
+        )) {
+            Ok(event) => event,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+        let Ok(first) = first else {
+            continue;
+        };
+        if !cloud_mcp_watch_event_is_relevant(&first) {
+            continue;
+        }
+
+        let window_started = Instant::now();
+        while window_started.elapsed() < debounce {
+            if app_shutdown_requested() {
+                return;
+            }
+            let remaining = debounce.saturating_sub(window_started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            match receiver.recv_timeout(remaining) {
+                Ok(_) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            }
+        }
+
+        log_terminal_status_event(
+            "backend.cloud_mcp.fs_watcher.debounced_wake",
+            json!({ "name": name }),
+        );
+        if let Some(before_notify) = before_notify {
+            before_notify();
+        }
+        notify.notify_one();
+    });
+}
+
+async fn cloud_mcp_wait_for_background_scheduler_wake(
+    notify: &tokio::sync::Notify,
+    fallback: Duration,
+) -> bool {
+    let started = Instant::now();
+    loop {
+        if app_shutdown_requested() {
+            return false;
+        }
+        let elapsed = started.elapsed();
+        if elapsed >= fallback {
+            return true;
+        }
+        let remaining = fallback.saturating_sub(elapsed);
+        let poll = remaining.min(Duration::from_secs(
+            CLOUD_MCP_BACKGROUND_SCHEDULER_SHUTDOWN_POLL_SECS,
+        ));
+        tokio::select! {
+            _ = notify.notified() => return true,
+            _ = sleep(poll) => {}
+        }
+    }
+}
+
+async fn cloud_mcp_wait_for_background_scheduler_delay(delay: Duration) -> bool {
+    let notify = tokio::sync::Notify::new();
+    cloud_mcp_wait_for_background_scheduler_wake(&notify, delay).await
+}
+
+fn cloud_mcp_tokenomics_source_watcher_slot(
+) -> &'static StdMutex<Option<notify::RecommendedWatcher>> {
+    CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER.get_or_init(|| StdMutex::new(None))
+}
+
+fn cloud_mcp_start_tokenomics_source_watcher(notify: Arc<tokio::sync::Notify>) -> bool {
+    use notify::Watcher as _;
+
+    let slot = cloud_mcp_tokenomics_source_watcher_slot();
+    let Ok(mut guard) = slot.lock() else {
+        return false;
+    };
+    if guard.is_some() {
+        return true;
+    }
+
+    let roots = tokenomics_periodic_watch_roots();
+    if roots.is_empty() {
+        log_terminal_status_event(
+            "backend.cloud_mcp.tokenomics_scheduler.watch_roots_empty",
+            json!({}),
+        );
+        return false;
+    }
+
+    let (sender, receiver) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = match notify::recommended_watcher(sender) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.tokenomics_scheduler.watch_create_error",
+                json!({ "error": clean_terminal_telemetry_text(&error.to_string()) }),
+            );
+            return false;
+        }
+    };
+
+    let mut watched_roots = Vec::new();
+    for root in roots {
+        match watcher.watch(&root, notify::RecursiveMode::Recursive) {
+            Ok(()) => watched_roots.push(root.display().to_string()),
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.cloud_mcp.tokenomics_scheduler.watch_root_error",
+                    json!({
+                        "root": root.display().to_string(),
+                        "error": clean_terminal_telemetry_text(&error.to_string()),
+                    }),
+                );
+            }
+        }
+    }
+    if watched_roots.is_empty() {
+        return false;
+    }
+
+    cloud_mcp_spawn_fs_event_debounce_forwarder(
+        "tokenomics",
+        receiver,
+        notify,
+        Duration::from_millis(CLOUD_MCP_TOKENOMICS_WATCH_DEBOUNCE_MS),
+        Some(tokenomics_periodic_force_source_discovery),
+    );
+    *guard = Some(watcher);
+    log_terminal_status_event(
+        "backend.cloud_mcp.tokenomics_scheduler.watch_started",
+        json!({ "roots": watched_roots }),
+    );
+    true
+}
+
+/// Drives the always-on Tokenomics refresh while the app is running: filesystem
+/// changes wake it quickly, and a slow fallback stamps provider history if an
+/// event is missed. Inbound server tokenomics is ignored for now. The database
+/// is only opened for the duration of each cycle.
 pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudMcpState) {
     if state
         .background_sync
@@ -925,6 +1114,10 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
     }
 
     tauri::async_runtime::spawn(async move {
+        let tokenomics_wake = Arc::new(tokio::sync::Notify::new());
+        let _watching_tokenomics =
+            cloud_mcp_start_tokenomics_source_watcher(tokenomics_wake.clone());
+
         sleep(Duration::from_secs(
             CLOUD_MCP_TOKENOMICS_PERIODIC_STARTUP_DELAY_SECS,
         ))
@@ -938,10 +1131,22 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
                 false,
             )
             .await;
+            tokenomics_wake.notify_one();
         }
 
         let mut tokenomics_sync_pending_after_offline = false;
         loop {
+            if app_shutdown_requested() {
+                break;
+            }
+            if !cloud_mcp_wait_for_background_scheduler_wake(
+                &tokenomics_wake,
+                Duration::from_secs(CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS),
+            )
+            .await
+            {
+                break;
+            }
             if app_shutdown_requested() {
                 break;
             }
@@ -1004,12 +1209,6 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
                 .await;
                 tokenomics_sync_pending_after_offline = false;
             }
-
-            // Gap measured from the end of this cycle to the start of the next.
-            sleep(Duration::from_secs(
-                CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS,
-            ))
-            .await;
         }
 
         state
@@ -3180,7 +3379,7 @@ fn cloud_mcp_tokenomics_restore_day_ack_from_outbox(
     content_hash: &str,
     idempotency_key: &str,
     acked_at_ms: i64,
-) -> Result<(), String> {
+) -> Result<TokenomicsUsageEventPruneCloudAckSeed, String> {
     let now = cloud_mcp_now_ms() as i64;
     conn.execute(
         &format!(
@@ -3206,19 +3405,27 @@ fn cloud_mcp_tokenomics_restore_day_ack_from_outbox(
         ],
     )
     .map_err(|error| format!("Unable to restore Tokenomics day ack from outbox: {error}"))?;
-    Ok(())
+    tokenomics_usage_event_prune_cloud_ack_seed(
+        billing_scope_key,
+        day_start_ms,
+        &tokenomics_usage_event_prune_cloud_ack_cursor(idempotency_key, acked_at_ms),
+    )
+    .ok_or_else(|| "Unable to build Tokenomics prune ack seed from restored day ack.".to_string())
 }
 
-fn cloud_mcp_tokenomics_day_sync_decision(
+fn cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
     device_id: &str,
     billing_scope_key: &str,
     day_start_ms: i64,
     content_hash: &str,
     force_send: bool,
-) -> Result<CloudMcpTokenomicsDaySyncDecision, String> {
+) -> Result<CloudMcpTokenomicsDaySyncDecisionOutcome, String> {
     let conn = cloud_mcp_open_outbox_conn()?;
     if force_send {
-        return Ok(CloudMcpTokenomicsDaySyncDecision::Enqueue);
+        return Ok(CloudMcpTokenomicsDaySyncDecisionOutcome {
+            decision: CloudMcpTokenomicsDaySyncDecision::Enqueue,
+            prune_ack_seed: None,
+        });
     }
     let state = cloud_mcp_tokenomics_day_sync_state_from_conn(
         &conn,
@@ -3229,7 +3436,18 @@ fn cloud_mcp_tokenomics_day_sync_decision(
     if let Some(state) = state {
         if state.content_hash == content_hash {
             if state.acked_at_ms > 0 {
-                return Ok(CloudMcpTokenomicsDaySyncDecision::CurrentAcked);
+                let cursor = tokenomics_usage_event_prune_cloud_ack_cursor(
+                    &state.idempotency_key,
+                    state.acked_at_ms,
+                );
+                return Ok(CloudMcpTokenomicsDaySyncDecisionOutcome {
+                    decision: CloudMcpTokenomicsDaySyncDecision::CurrentAcked,
+                    prune_ack_seed: tokenomics_usage_event_prune_cloud_ack_seed(
+                        billing_scope_key,
+                        day_start_ms,
+                        &cursor,
+                    ),
+                });
             }
             if !state.idempotency_key.trim().is_empty() {
                 let outbox_status = conn
@@ -3245,7 +3463,10 @@ fn cloud_mcp_tokenomics_day_sync_decision(
                     .ok();
                 match outbox_status.as_deref() {
                     Some("queued" | "retrying" | "in_flight") => {
-                        return Ok(CloudMcpTokenomicsDaySyncDecision::CurrentPending);
+                        return Ok(CloudMcpTokenomicsDaySyncDecisionOutcome {
+                            decision: CloudMcpTokenomicsDaySyncDecision::CurrentPending,
+                            prune_ack_seed: None,
+                        });
                     }
                     Some("acked") => {
                         let now = cloud_mcp_now_ms() as i64;
@@ -3265,7 +3486,18 @@ fn cloud_mcp_tokenomics_day_sync_decision(
                                 content_hash
                             ],
                         );
-                        return Ok(CloudMcpTokenomicsDaySyncDecision::CurrentAcked);
+                        let cursor = tokenomics_usage_event_prune_cloud_ack_cursor(
+                            &state.idempotency_key,
+                            now,
+                        );
+                        return Ok(CloudMcpTokenomicsDaySyncDecisionOutcome {
+                            decision: CloudMcpTokenomicsDaySyncDecision::CurrentAcked,
+                            prune_ack_seed: tokenomics_usage_event_prune_cloud_ack_seed(
+                                billing_scope_key,
+                                day_start_ms,
+                                &cursor,
+                            ),
+                        });
                     }
                     _ => {}
                 }
@@ -3282,7 +3514,7 @@ fn cloud_mcp_tokenomics_day_sync_decision(
     if let Some(acked_at_ms) =
         cloud_mcp_tokenomics_outbox_acked_at_for_idempotency(&conn, &expected_idempotency_key)
     {
-        cloud_mcp_tokenomics_restore_day_ack_from_outbox(
+        let prune_ack_seed = cloud_mcp_tokenomics_restore_day_ack_from_outbox(
             &conn,
             device_id,
             billing_scope_key,
@@ -3291,9 +3523,33 @@ fn cloud_mcp_tokenomics_day_sync_decision(
             &expected_idempotency_key,
             acked_at_ms,
         )?;
-        return Ok(CloudMcpTokenomicsDaySyncDecision::CurrentAcked);
+        return Ok(CloudMcpTokenomicsDaySyncDecisionOutcome {
+            decision: CloudMcpTokenomicsDaySyncDecision::CurrentAcked,
+            prune_ack_seed: Some(prune_ack_seed),
+        });
     }
-    Ok(CloudMcpTokenomicsDaySyncDecision::Enqueue)
+    Ok(CloudMcpTokenomicsDaySyncDecisionOutcome {
+        decision: CloudMcpTokenomicsDaySyncDecision::Enqueue,
+        prune_ack_seed: None,
+    })
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn cloud_mcp_tokenomics_day_sync_decision(
+    device_id: &str,
+    billing_scope_key: &str,
+    day_start_ms: i64,
+    content_hash: &str,
+    force_send: bool,
+) -> Result<CloudMcpTokenomicsDaySyncDecision, String> {
+    cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
+        device_id,
+        billing_scope_key,
+        day_start_ms,
+        content_hash,
+        force_send,
+    )
+    .map(|outcome| outcome.decision)
 }
 
 fn cloud_mcp_tokenomics_mark_day_pending(
@@ -3432,6 +3688,9 @@ fn cloud_mcp_tokenomics_mark_day_acked_from_payload(
     {
         return Ok(false);
     }
+    let prune_ack_seed_safe = existing_content_hash
+        .as_deref()
+        .is_some_and(|current| !current.is_empty() && current == content_hash);
     let payload_hash = source_payload
         .and_then(|payload| {
             cloud_mcp_tokenomics_response_text(payload, &["ph", "payload_hash", "payloadHash"])
@@ -3499,6 +3758,28 @@ fn cloud_mcp_tokenomics_mark_day_acked_from_payload(
         ],
     )
     .map_err(|error| format!("Unable to mark Tokenomics day bucket acked: {error}"))?;
+    if prune_ack_seed_safe {
+        if let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get() {
+        let local_cursor = source_payload
+            .and_then(cloud_mcp_tokenomics_payload_local_cursor_from_value)
+            .or_else(|| cloud_mcp_tokenomics_local_cursor_from_value(response))
+            .filter(|cursor| !cursor.trim().is_empty())
+            .or_else(|| {
+                let cursor =
+                    tokenomics_usage_event_prune_cloud_ack_cursor(&idempotency_key, now);
+                (!cursor.trim().is_empty()).then_some(cursor)
+            })
+            .unwrap_or_default();
+        if !local_cursor.trim().is_empty() {
+            let _ = tokenomics_record_usage_event_prune_cloud_ack(
+                app,
+                &billing_scope_key,
+                Some(day_start_ms),
+                &local_cursor,
+            );
+        }
+        }
+    }
     Ok(true)
 }
 
@@ -3628,10 +3909,20 @@ fn cloud_mcp_tokenomics_local_cursor_from_value(value: &Value) -> Option<String>
         &[
             "local_sync_cursor",
             "localSyncCursor",
-            "sync_cursor",
-            "syncCursor",
+            "next_local_cursor",
+            "nextLocalCursor",
         ],
     )
+}
+
+fn cloud_mcp_tokenomics_payload_local_cursor_from_value(value: &Value) -> Option<String> {
+    cloud_mcp_tokenomics_response_text(value, &["lc", "local_sync_cursor", "localSyncCursor"])
+}
+
+fn cloud_mcp_tokenomics_payload_is_day_packet(value: &Value) -> bool {
+    cloud_mcp_tokenomics_response_text(value, &["sb", "sync_bucket", "syncBucket"])
+        .map(|bucket| bucket.eq_ignore_ascii_case("day"))
+        .unwrap_or(false)
 }
 
 fn cloud_mcp_tokenomics_delivery_id_from_value(value: &Value) -> Option<String> {
@@ -3883,7 +4174,8 @@ fn cloud_mcp_tokenomics_persist_ingest_ack(
         .or_else(|| source_payload.and_then(cloud_mcp_tokenomics_device_seq_from_value));
     let server_cursor = cloud_mcp_tokenomics_server_cursor_from_value(response);
     let local_cursor = source_payload
-        .and_then(cloud_mcp_tokenomics_local_cursor_from_value)
+        .filter(|payload| !cloud_mcp_tokenomics_payload_is_day_packet(payload))
+        .and_then(cloud_mcp_tokenomics_payload_local_cursor_from_value)
         .or_else(|| cloud_mcp_tokenomics_local_cursor_from_value(response));
     let payload_hash = source_payload
         .and_then(|payload| {
@@ -3962,12 +4254,12 @@ fn cloud_mcp_tokenomics_persist_ingest_ack(
         rusqlite::params![
             device_id,
             billing_scope_key,
-            next_server_cursor,
-            next_local_cursor,
+            next_server_cursor.as_str(),
+            next_local_cursor.as_str(),
             next_acked.min(i64::MAX as u64) as i64,
             next_device_seq.min(i64::MAX as u64) as i64,
-            next_payload_hash,
-            next_idempotency_key,
+            next_payload_hash.as_str(),
+            next_idempotency_key.as_str(),
             now,
         ],
     )
@@ -4690,11 +4982,7 @@ fn cloud_mcp_outbox_claim_expedited_agent_chat_rows(
                 LIMIT ?3
              )"
         ),
-        rusqlite::params![
-            now,
-            CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT,
-            limit as i64
-        ],
+        rusqlite::params![now, CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT, limit as i64],
     )
     .map_err(|error| format!("Unable to claim expedited agent chat sync rows: {error}"))?;
     let mut statement = conn
@@ -4711,18 +4999,16 @@ fn cloud_mcp_outbox_claim_expedited_agent_chat_rows(
         .map_err(|error| format!("Unable to prepare expedited agent chat sync query: {error}"))?;
     let rows = statement
         .query_map(
-            rusqlite::params![
-                limit as i64,
-                now,
-                CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT
-            ],
+            rusqlite::params![limit as i64, now, CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT],
             cloud_mcp_outbox_row_from_statement_row,
         )
         .map_err(|error| format!("Unable to read expedited agent chat sync rows: {error}"))?;
     let mut values = Vec::new();
     for row in rows {
         values.push(
-            row.map_err(|error| format!("Unable to decode expedited agent chat sync row: {error}"))?,
+            row.map_err(|error| {
+                format!("Unable to decode expedited agent chat sync row: {error}")
+            })?,
         );
     }
     Ok(values)
@@ -6980,9 +7266,6 @@ fn cloud_mcp_outbox_mark_acked(row: &CloudMcpOutboxRow, response: &Value) -> Res
     if cloud_mcp_tokenomics_device_packet_kind(&row.event_kind) {
         if let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) {
             let _ = cloud_mcp_tokenomics_persist_ingest_ack(Some(&payload), response);
-            if cloud_mcp_tokenomics_ack_accepted(response) {
-                let _ = cloud_mcp_tokenomics_mark_day_acked_from_payload(Some(&payload), response);
-            }
         }
     }
     if row.event_kind == CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT {
@@ -7678,7 +7961,8 @@ async fn cloud_mcp_drain_expedited_agent_chat_rows(state: CloudMcpState) {
         return;
     }
     let claimed_rows = {
-        let _span = BackendCpuSpan::new("cloud_mcp.background_sync.claim_expedited_agent_chat_rows");
+        let _span =
+            BackendCpuSpan::new("cloud_mcp.background_sync.claim_expedited_agent_chat_rows");
         cloud_mcp_outbox_claim_expedited_agent_chat_rows(CLOUD_MCP_OUTBOX_DRAIN_LIMIT)
     };
     let rows = match claimed_rows {
@@ -8501,6 +8785,16 @@ fn cloud_mcp_tokenomics_day_buckets(
             .saturating_sub(1)
             .saturating_mul(CLOUD_MCP_TOKENOMICS_DAY_MS),
     );
+    cloud_mcp_tokenomics_day_buckets_for_range(summary, now_ms, oldest_day_start, current_day_start)
+}
+
+fn cloud_mcp_tokenomics_day_buckets_for_range(
+    summary: &Value,
+    now_ms: u64,
+    oldest_day_start: i64,
+    newest_day_start: i64,
+) -> Vec<CloudMcpTokenomicsDayBucket> {
+    let current_day_start = cloud_mcp_tokenomics_day_start_ms(now_ms.min(i64::MAX as u64) as i64);
     let mut rows_by_day = HashMap::<i64, Vec<Value>>::new();
     for row in cloud_mcp_tokenomics_summary_array(summary, &["hourly"]) {
         let account_key = cloud_mcp_tokenomics_provider_account_key(&row);
@@ -8511,7 +8805,7 @@ fn cloud_mcp_tokenomics_day_buckets(
             continue;
         };
         let day_start_ms = cloud_mcp_tokenomics_day_start_ms(bucket_start_ms);
-        if day_start_ms < oldest_day_start || day_start_ms > current_day_start {
+        if day_start_ms < oldest_day_start || day_start_ms > newest_day_start {
             continue;
         }
         rows_by_day.entry(day_start_ms).or_default().push(row);
@@ -8542,7 +8836,7 @@ fn cloud_mcp_tokenomics_day_buckets(
             continue;
         };
         let day_start_ms = cloud_mcp_tokenomics_day_start_ms(sample_ms);
-        if day_start_ms < oldest_day_start || day_start_ms > current_day_start {
+        if day_start_ms < oldest_day_start || day_start_ms > newest_day_start {
             continue;
         }
         limit_samples_by_day
@@ -8552,6 +8846,8 @@ fn cloud_mcp_tokenomics_day_buckets(
     }
     if rows_by_day.is_empty()
         && (!limits.is_empty() || !latest_windows.is_empty() || !limit_samples_by_day.is_empty())
+        && current_day_start >= oldest_day_start
+        && current_day_start <= newest_day_start
     {
         rows_by_day.entry(current_day_start).or_default();
     }
@@ -9935,6 +10231,421 @@ fn cloud_mcp_tokenomics_device_packet_payload(
     ))
 }
 
+async fn cloud_mcp_tokenomics_store_prune_ack_seeds(
+    app: &AppHandle,
+    seeds: Vec<TokenomicsUsageEventPruneCloudAckSeed>,
+    reason: &str,
+) -> usize {
+    if seeds.is_empty() {
+        return 0;
+    }
+    let seed_app = app.clone();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_prune_ack_seeds");
+        let conn = tokenomics_open_db(&seed_app)?;
+        tokenomics_record_usage_event_prune_cloud_acks(&conn, &seeds)
+    })
+    .await
+    {
+        Ok(Ok(stored)) => stored,
+        Ok(Err(error)) => {
+            cloud_mcp_record_tokenomics_sync_error("prune_ack_seed_error", reason, &error);
+            0
+        }
+        Err(error) => {
+            cloud_mcp_record_tokenomics_sync_error(
+                "prune_ack_seed_join_error",
+                reason,
+                &error.to_string(),
+            );
+            0
+        }
+    }
+}
+
+fn cloud_mcp_tokenomics_historical_prune_ack_meta_suffix(
+    device_id: &str,
+    billing_scope_key: &str,
+) -> String {
+    format!("{device_id}:{billing_scope_key}")
+}
+
+fn cloud_mcp_tokenomics_historical_prune_ack_done_key(
+    device_id: &str,
+    billing_scope_key: &str,
+) -> String {
+    format!(
+        "{CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_DONE_META_PREFIX}{}",
+        cloud_mcp_tokenomics_historical_prune_ack_meta_suffix(device_id, billing_scope_key)
+    )
+}
+
+fn cloud_mcp_tokenomics_historical_prune_ack_progress_key(
+    device_id: &str,
+    billing_scope_key: &str,
+) -> String {
+    format!(
+        "{CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_PROGRESS_META_PREFIX}{}",
+        cloud_mcp_tokenomics_historical_prune_ack_meta_suffix(device_id, billing_scope_key)
+    )
+}
+
+fn cloud_mcp_tokenomics_prepare_historical_prune_ack_plan(
+    app: AppHandle,
+    device_profile: Value,
+    device_id: String,
+    billing_scope: TokenomicsBillingScope,
+    billing_scope_key: String,
+) -> Result<CloudMcpTokenomicsHistoricalPruneAckPlan, String> {
+    let conn = tokenomics_open_db(&app)?;
+    let done_key =
+        cloud_mcp_tokenomics_historical_prune_ack_done_key(&device_id, &billing_scope_key);
+    if tokenomics_meta_string(&conn, &done_key).is_some() {
+        return Ok(CloudMcpTokenomicsHistoricalPruneAckPlan {
+            skipped_done: true,
+            reached_end: true,
+            planned_progress_day_start_ms: None,
+            seed_progress_day_start_ms: None,
+            seeds: Vec::new(),
+            enqueue_buckets: Vec::new(),
+        });
+    }
+
+    let progress_key =
+        cloud_mcp_tokenomics_historical_prune_ack_progress_key(&device_id, &billing_scope_key);
+    let after_day_start_ms = tokenomics_meta_string(&conn, &progress_key)
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value >= 0);
+    let now_ms = cloud_mcp_now_ms();
+    let current_day_start =
+        cloud_mcp_tokenomics_day_start_ms(now_ms.min(i64::MAX as u64) as i64);
+    let oldest_sync_day_start = current_day_start.saturating_sub(
+        CLOUD_MCP_TOKENOMICS_SYNC_LOOKBACK_DAYS
+            .saturating_sub(1)
+            .saturating_mul(CLOUD_MCP_TOKENOMICS_DAY_MS),
+    );
+    let candidate_days = tokenomics_historical_prune_ack_candidate_days(
+        &conn,
+        &billing_scope,
+        oldest_sync_day_start,
+        after_day_start_ms,
+        CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_BATCH_DAYS,
+    )?;
+    if candidate_days.is_empty() {
+        return Ok(CloudMcpTokenomicsHistoricalPruneAckPlan {
+            skipped_done: false,
+            reached_end: true,
+            planned_progress_day_start_ms: after_day_start_ms,
+            seed_progress_day_start_ms: after_day_start_ms,
+            seeds: Vec::new(),
+            enqueue_buckets: Vec::new(),
+        });
+    }
+
+    let outbox_conn = cloud_mcp_open_outbox_conn()?;
+    let mut seeds = Vec::<TokenomicsUsageEventPruneCloudAckSeed>::new();
+    let mut enqueue_buckets = Vec::<CloudMcpTokenomicsDayBucket>::new();
+    let mut planned_progress_day_start_ms = after_day_start_ms;
+    let mut seed_progress_day_start_ms = after_day_start_ms;
+    let mut reached_end = candidate_days.len() < CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_BATCH_DAYS;
+    for day_start_ms in candidate_days {
+        if enqueue_buckets.len() >= CLOUD_MCP_TOKENOMICS_HISTORICAL_PRUNE_ACK_ENQUEUE_LIMIT {
+            reached_end = false;
+            break;
+        }
+        let mut summary =
+            tokenomics_sync_delta_for_day_from_conn(&conn, Some(&billing_scope), day_start_ms)?;
+        cloud_mcp_tag_tokenomics_summary_device(&mut summary, &device_profile);
+        let mut buckets = cloud_mcp_tokenomics_day_buckets_for_range(
+            &summary,
+            now_ms,
+            day_start_ms,
+            day_start_ms,
+        );
+        let Some(bucket) = buckets
+            .drain(..)
+            .find(|bucket| bucket.day_start_ms == day_start_ms)
+        else {
+            planned_progress_day_start_ms = Some(day_start_ms);
+            seed_progress_day_start_ms = Some(day_start_ms);
+            continue;
+        };
+        let state = cloud_mcp_tokenomics_day_sync_state_from_conn(
+            &outbox_conn,
+            &device_id,
+            &billing_scope_key,
+            day_start_ms,
+        );
+        if let Some(state) = state.filter(|state| state.acked_at_ms > 0) {
+            if state.content_hash == bucket.content_hash {
+                let cursor = tokenomics_usage_event_prune_cloud_ack_cursor(
+                    &state.idempotency_key,
+                    state.acked_at_ms,
+                );
+                if let Some(seed) = tokenomics_usage_event_prune_cloud_ack_seed(
+                    &billing_scope_key,
+                    day_start_ms,
+                    &cursor,
+                ) {
+                    seeds.push(seed);
+                }
+                planned_progress_day_start_ms = Some(day_start_ms);
+                seed_progress_day_start_ms = Some(day_start_ms);
+                continue;
+            }
+        }
+        enqueue_buckets.push(bucket);
+        planned_progress_day_start_ms = Some(day_start_ms);
+    }
+
+    Ok(CloudMcpTokenomicsHistoricalPruneAckPlan {
+        skipped_done: false,
+        reached_end,
+        planned_progress_day_start_ms,
+        seed_progress_day_start_ms,
+        seeds,
+        enqueue_buckets,
+    })
+}
+
+async fn cloud_mcp_tokenomics_finish_historical_prune_ack_seed(
+    app: &AppHandle,
+    device_id: &str,
+    billing_scope_key: &str,
+    seeds: Vec<TokenomicsUsageEventPruneCloudAckSeed>,
+    progress_day_start_ms: Option<i64>,
+    mark_done: bool,
+    reason: &str,
+) -> (usize, bool) {
+    let finish_app = app.clone();
+    let device_id = device_id.to_string();
+    let billing_scope_key = billing_scope_key.to_string();
+    match tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_historical_prune_ack_finish");
+        let conn = tokenomics_open_db(&finish_app)?;
+        let stored = tokenomics_record_usage_event_prune_cloud_acks(&conn, &seeds)?;
+        if let Some(progress_day_start_ms) = progress_day_start_ms {
+            let progress_key = cloud_mcp_tokenomics_historical_prune_ack_progress_key(
+                &device_id,
+                &billing_scope_key,
+            );
+            tokenomics_store_meta_value(&conn, &progress_key, &progress_day_start_ms.to_string())?;
+        }
+        if mark_done {
+            let done_key =
+                cloud_mcp_tokenomics_historical_prune_ack_done_key(&device_id, &billing_scope_key);
+            tokenomics_store_meta_value(&conn, &done_key, &cloud_mcp_now_ms().to_string())?;
+        }
+        Ok::<_, String>((stored, mark_done))
+    })
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            cloud_mcp_record_tokenomics_sync_error(
+                "historical_prune_ack_finish_error",
+                reason,
+                &error,
+            );
+            (0, false)
+        }
+        Err(error) => {
+            cloud_mcp_record_tokenomics_sync_error(
+                "historical_prune_ack_finish_join_error",
+                reason,
+                &error.to_string(),
+            );
+            (0, false)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn cloud_mcp_tokenomics_run_historical_prune_ack_seed(
+    app: &AppHandle,
+    worker_state: &CloudMcpState,
+    device_profile: &Value,
+    billing_scope_type: &str,
+    team_id: Option<&str>,
+    billing_scope: &TokenomicsBillingScope,
+    billing_scope_key: &str,
+    device_id: &str,
+    reason: &str,
+) {
+    let plan_app = app.clone();
+    let plan_device_profile = device_profile.clone();
+    let plan_device_id = device_id.to_string();
+    let plan_billing_scope = billing_scope.clone();
+    let plan_billing_scope_key = billing_scope_key.to_string();
+    let plan_result = tauri::async_runtime::spawn_blocking(move || {
+        let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_historical_prune_ack_plan");
+        cloud_mcp_tokenomics_prepare_historical_prune_ack_plan(
+            plan_app,
+            plan_device_profile,
+            plan_device_id,
+            plan_billing_scope,
+            plan_billing_scope_key,
+        )
+    })
+    .await;
+    let plan = match plan_result {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(error)) => {
+            cloud_mcp_record_tokenomics_sync_error(
+                "historical_prune_ack_plan_error",
+                reason,
+                &error,
+            );
+            return;
+        }
+        Err(error) => {
+            cloud_mcp_record_tokenomics_sync_error(
+                "historical_prune_ack_plan_join_error",
+                reason,
+                &error.to_string(),
+            );
+            return;
+        }
+    };
+    if plan.skipped_done {
+        return;
+    }
+
+    let mut enqueue_progress_day_start_ms = None::<i64>;
+    let mut enqueued_day_count = 0usize;
+    for bucket in &plan.enqueue_buckets {
+        let packet_bucket = CloudMcpTokenomicsPacketBucket {
+            day_start_ms: bucket.day_start_ms,
+            day_key: bucket.day_key.clone(),
+            content_hash: bucket.content_hash.clone(),
+        };
+        let device_seq = match cloud_mcp_tokenomics_claim_device_seq(device_id, billing_scope_key) {
+            Ok(device_seq) => device_seq,
+            Err(error) => {
+                cloud_mcp_record_tokenomics_sync_error(
+                    "historical_prune_ack_device_seq_error",
+                    reason,
+                    &error,
+                );
+                break;
+            }
+        };
+        let packet_sync_state =
+            match cloud_mcp_tokenomics_sync_state(device_id, billing_scope_key) {
+                Ok(sync_state) => sync_state,
+                Err(error) => {
+                    cloud_mcp_record_tokenomics_sync_error(
+                        "historical_prune_ack_sync_state_error",
+                        reason,
+                        &error,
+                    );
+                    break;
+                }
+            };
+        let storage_payload = match cloud_mcp_tokenomics_device_packet_payload(
+            &bucket.summary,
+            device_profile,
+            billing_scope_type,
+            team_id,
+            billing_scope_key,
+            &packet_sync_state,
+            device_seq,
+            CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
+            "historical_prune_ack_seed",
+            false,
+            Some(&packet_bucket),
+        ) {
+            Ok(payload) => payload,
+            Err(error) => {
+                cloud_mcp_record_tokenomics_sync_error(
+                    "historical_prune_ack_payload_error",
+                    reason,
+                    &error,
+                );
+                break;
+            }
+        };
+        let payload_hash =
+            cloud_mcp_payload_text(&storage_payload, &["ph", "payload_hash", "payloadHash"])
+                .unwrap_or_default();
+        let idempotency_key = cloud_mcp_payload_text(
+            &storage_payload,
+            &["pid", "idempotency_key", "idempotencyKey"],
+        )
+        .unwrap_or_default();
+        if let Err(error) = cloud_mcp_tokenomics_mark_day_pending(
+            device_id,
+            billing_scope_key,
+            &packet_bucket,
+            device_seq,
+            &payload_hash,
+            &idempotency_key,
+        ) {
+            cloud_mcp_record_tokenomics_sync_error(
+                "historical_prune_ack_day_pending_error",
+                reason,
+                &error,
+            );
+            break;
+        }
+        cloud_mcp_enqueue_background_sync(
+            worker_state,
+            format!(
+                "tokenomics:{billing_scope_key}:historical-prune-ack-day:{}",
+                packet_bucket.day_start_ms
+            ),
+            CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT,
+            storage_payload,
+            CLOUD_MCP_BACKGROUND_SYNC_PRIORITY_HIGH,
+            "historical_prune_ack_seed",
+        )
+        .await;
+        enqueue_progress_day_start_ms = Some(packet_bucket.day_start_ms);
+        enqueued_day_count = enqueued_day_count.saturating_add(1);
+    }
+
+    let progress_day_start_ms = match (
+        plan.seed_progress_day_start_ms,
+        enqueue_progress_day_start_ms,
+    ) {
+        (Some(seed), Some(enqueued)) => Some(seed.max(enqueued)),
+        (Some(seed), None) => Some(seed),
+        (None, Some(enqueued)) => Some(enqueued),
+        (None, None) => plan.planned_progress_day_start_ms,
+    };
+    let mark_done = plan.reached_end
+        && match (plan.planned_progress_day_start_ms, progress_day_start_ms) {
+            (Some(planned), Some(progress)) => progress >= planned,
+            (None, _) => true,
+            (Some(_), None) => false,
+        };
+    let seed_count = plan.seeds.len();
+    let (stored_seed_count, marked_done) = cloud_mcp_tokenomics_finish_historical_prune_ack_seed(
+        app,
+        device_id,
+        billing_scope_key,
+        plan.seeds,
+        progress_day_start_ms,
+        mark_done,
+        reason,
+    )
+    .await;
+    if seed_count > 0 || enqueued_day_count > 0 || marked_done {
+        cloud_mcp_record_tokenomics_sync_log(
+            "historical_prune_ack_seed",
+            "active",
+            reason,
+            json!({
+                "seed_count": seed_count,
+                "stored_seed_count": stored_seed_count,
+                "enqueued_day_count": enqueued_day_count,
+                "progress_day_start_ms": progress_day_start_ms,
+                "done": marked_done,
+            }),
+        );
+    }
+}
+
 async fn cloud_mcp_run_tokenomics_sync_job(
     app: AppHandle,
     worker_state: CloudMcpState,
@@ -10047,27 +10758,29 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             Some(cursor)
         }
     };
+    let summary_app = app.clone();
+    let summary_scope = tokenomics_scope.clone();
     let summary_task = tauri::async_runtime::spawn_blocking(move || {
         let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_sync.summary_worker");
         if force_resync {
-            tokenomics_scan_usage_for(&app, false, true)?;
+            tokenomics_scan_usage_for(&summary_app, false, true)?;
         } else if force_full {
-            tokenomics_scan_usage_for(&app, false, false)?;
+            tokenomics_scan_usage_for(&summary_app, false, false)?;
         }
-        let conn = tokenomics_open_db(&app)?;
+        let conn = tokenomics_open_db(&summary_app)?;
         tokenomics_reconcile_current_provider_accounts(&conn)?;
         if limits_only {
             return tokenomics_sync_delta_from_conn_with_limit_sampling(
                 &conn,
                 summary_since_cursor.as_deref(),
-                Some(&tokenomics_scope),
+                Some(&summary_scope),
                 true,
             );
         }
         tokenomics_sync_delta_from_conn_with_limit_sampling(
             &conn,
             summary_since_cursor.as_deref(),
-            Some(&tokenomics_scope),
+            Some(&summary_scope),
             true,
         )
     });
@@ -10153,6 +10866,18 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         );
     }
     if empty_non_full_delta {
+        cloud_mcp_tokenomics_run_historical_prune_ack_seed(
+            &app,
+            &worker_state,
+            &device_profile,
+            &billing_scope_type,
+            team_id.as_deref(),
+            &tokenomics_scope,
+            &tokenomics_scope_key,
+            &device_id,
+            &reason_for_worker,
+        )
+        .await;
         cloud_mcp_clear_sync_activity_key(CLOUD_MCP_TOKENOMICS_ACTIVITY_KEY);
         cloud_mcp_record_tokenomics_sync_log(
             "skipped",
@@ -10231,6 +10956,18 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         }),
     );
     if day_buckets.is_empty() {
+        cloud_mcp_tokenomics_run_historical_prune_ack_seed(
+            &app,
+            &worker_state,
+            &device_profile,
+            &billing_scope_type,
+            team_id.as_deref(),
+            &tokenomics_scope,
+            &tokenomics_scope_key,
+            &device_id,
+            &reason_for_worker,
+        )
+        .await;
         cloud_mcp_clear_sync_activity_key(CLOUD_MCP_TOKENOMICS_ACTIVITY_KEY);
         cloud_mcp_record_tokenomics_sync_log(
             "skipped",
@@ -10277,8 +11014,9 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     let mut enqueued_hourly_count = 0usize;
     let mut enqueued_limit_count = 0usize;
     let mut last_event_kind = CLOUD_MCP_TOKENOMICS_DEVICE_DELTA_EVENT;
+    let mut prune_ack_seeds = Vec::<TokenomicsUsageEventPruneCloudAckSeed>::new();
     for bucket in day_buckets {
-        let decision = match cloud_mcp_tokenomics_day_sync_decision(
+        let decision_outcome = match cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
             &device_id,
             &tokenomics_scope_key,
             bucket.day_start_ms,
@@ -10306,6 +11044,10 @@ async fn cloud_mcp_run_tokenomics_sync_job(
                 return;
             }
         };
+        if let Some(seed) = decision_outcome.prune_ack_seed {
+            prune_ack_seeds.push(seed);
+        }
+        let decision = decision_outcome.decision;
         if decision == CloudMcpTokenomicsDaySyncDecision::CurrentAcked {
             skipped_acked_day_count = skipped_acked_day_count.saturating_add(1);
             continue;
@@ -10495,6 +11237,32 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     }
 
     if enqueued_day_count == 0 {
+        let stored_prune_ack_seed_count = cloud_mcp_tokenomics_store_prune_ack_seeds(
+            &app,
+            prune_ack_seeds,
+            &reason_for_worker,
+        )
+        .await;
+        if stored_prune_ack_seed_count > 0 {
+            cloud_mcp_record_tokenomics_sync_log(
+                "prune_ack_seeds",
+                "acked",
+                &reason_for_worker,
+                json!({ "stored_count": stored_prune_ack_seed_count }),
+            );
+        }
+        cloud_mcp_tokenomics_run_historical_prune_ack_seed(
+            &app,
+            &worker_state,
+            &device_profile,
+            &billing_scope_type,
+            team_id.as_deref(),
+            &tokenomics_scope,
+            &tokenomics_scope_key,
+            &device_id,
+            &reason_for_worker,
+        )
+        .await;
         cloud_mcp_clear_sync_activity_key(CLOUD_MCP_TOKENOMICS_ACTIVITY_KEY);
         cloud_mcp_record_tokenomics_sync_log(
             "skipped",
@@ -10521,6 +11289,34 @@ async fn cloud_mcp_run_tokenomics_sync_job(
         );
         return;
     }
+
+    let stored_prune_ack_seed_count = cloud_mcp_tokenomics_store_prune_ack_seeds(
+        &app,
+        prune_ack_seeds,
+        &reason_for_worker,
+    )
+    .await;
+    if stored_prune_ack_seed_count > 0 {
+        cloud_mcp_record_tokenomics_sync_log(
+            "prune_ack_seeds",
+            "acked",
+            &reason_for_worker,
+            json!({ "stored_count": stored_prune_ack_seed_count }),
+        );
+    }
+
+    cloud_mcp_tokenomics_run_historical_prune_ack_seed(
+        &app,
+        &worker_state,
+        &device_profile,
+        &billing_scope_type,
+        team_id.as_deref(),
+        &tokenomics_scope,
+        &tokenomics_scope_key,
+        &device_id,
+        &reason_for_worker,
+    )
+    .await;
 
     cloud_mcp_record_sync_activity_with_progress(
         "tokenomics",
@@ -17075,6 +17871,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             "ws.ready",
             json!({ "connection_id": connection_id.clone() }),
         );
+        agent_chat_session_sync_mark_all_workspace_history_dirty("global_ws_ready");
         cloud_mcp_note_sync_connection(false, "desktop_registering");
         let ready_message = message.clone();
         let state_for_initial = state.clone();
@@ -17293,6 +18090,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             runtime.global_ws_last_connected_ms = Some(cloud_mcp_now_ms());
         }
         cloud_mcp_note_sync_connection(true, "connected");
+        agent_chat_session_sync_mark_all_workspace_history_dirty("websocket_hello_ack");
         log_cloud_sync_event(
             "ws.desktop_registered",
             json!({
@@ -17327,6 +18125,17 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
     }
     let direct_kind =
         cloud_mcp_payload_text(&message, &["event_kind", "eventKind", "kind"]).unwrap_or_default();
+    if matches!(
+        direct_kind.as_str(),
+        "session.gap"
+            | "session_gap"
+            | "agent_session_gap"
+            | "turn.gap"
+            | "turn_gap"
+            | "agent_turn_gap"
+    ) {
+        agent_chat_session_sync_mark_payload_workspace_history_dirty(&message, &direct_kind);
+    }
     let direct_request_kind =
         cloud_mcp_payload_text(&message, &["request_kind", "requestKind"]).unwrap_or_default();
     if cloud_mcp_value_is_account_usage(&message) {
@@ -19386,9 +20195,208 @@ pub(crate) fn cloud_mcp_start_architecture_event_sync(app: AppHandle, state: Clo
 
 const CLOUD_MCP_AGENT_INVENTORY_EVENT: &str = "agent-inventory-changed";
 const CLOUD_MCP_AGENT_INVENTORY_INITIAL_DELAY_SECS: u64 = 90;
-const CLOUD_MCP_AGENT_INVENTORY_SCAN_INTERVAL_SECS: u64 = 600;
+const CLOUD_MCP_AGENT_INVENTORY_FALLBACK_INTERVAL_SECS: u64 = 6 * 60 * 60;
+const CLOUD_MCP_AGENT_INVENTORY_WATCH_DEBOUNCE_MS: u64 = 10_000;
 
 static CLOUD_MCP_AGENT_INVENTORY_SIGNATURE: OnceLock<StdMutex<String>> = OnceLock::new();
+static CLOUD_MCP_AGENT_INVENTORY_WATCHER: OnceLock<StdMutex<Option<notify::RecommendedWatcher>>> =
+    OnceLock::new();
+
+fn cloud_mcp_agent_inventory_watcher_slot() -> &'static StdMutex<Option<notify::RecommendedWatcher>>
+{
+    CLOUD_MCP_AGENT_INVENTORY_WATCHER.get_or_init(|| StdMutex::new(None))
+}
+
+fn cloud_mcp_agent_inventory_add_watch_root(
+    roots: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    path: PathBuf,
+) {
+    if !path.is_dir() {
+        return;
+    }
+    let path = fs::canonicalize(&path).unwrap_or(path);
+    if seen.insert(path.clone()) {
+        roots.push(path);
+    }
+}
+
+fn cloud_mcp_agent_inventory_add_npm_roots(
+    roots: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    prefix: &Path,
+) {
+    #[cfg(windows)]
+    let node_modules = prefix.join("node_modules");
+    #[cfg(not(windows))]
+    let node_modules = prefix.join("lib").join("node_modules");
+
+    cloud_mcp_agent_inventory_add_watch_root(roots, seen, node_modules.clone());
+    for provider in [
+        AgentProvider::Codex,
+        AgentProvider::Claude,
+        AgentProvider::OpenCode,
+    ] {
+        let package = agent_definition(provider).install_package;
+        if let Some((scope, name)) = package.split_once('/') {
+            let scope_root = node_modules.join(scope);
+            cloud_mcp_agent_inventory_add_watch_root(roots, seen, scope_root.clone());
+            cloud_mcp_agent_inventory_add_watch_root(roots, seen, scope_root.join(name));
+        } else {
+            cloud_mcp_agent_inventory_add_watch_root(roots, seen, node_modules.join(package));
+        }
+    }
+
+    #[cfg(windows)]
+    cloud_mcp_agent_inventory_add_watch_root(roots, seen, prefix.to_path_buf());
+    #[cfg(not(windows))]
+    cloud_mcp_agent_inventory_add_watch_root(roots, seen, prefix.join("bin"));
+}
+
+fn cloud_mcp_agent_inventory_binary_candidates(directory: &Path, binary: &str) -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let suffixes = [".cmd", ".exe", ".bat", ""];
+        suffixes
+            .iter()
+            .map(|suffix| directory.join(format!("{binary}{suffix}")))
+            .collect()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![directory.join(binary)]
+    }
+}
+
+fn cloud_mcp_agent_inventory_resolve_command_path(command: &str) -> Option<PathBuf> {
+    let command = command.trim();
+    if command.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(command);
+    if (path.is_absolute() || path.components().count() > 1) && path.is_file() {
+        return Some(fs::canonicalize(&path).unwrap_or(path));
+    }
+
+    let path_value = env::var_os("PATH")?;
+    for directory in env::split_paths(&path_value) {
+        for candidate in cloud_mcp_agent_inventory_binary_candidates(&directory, command) {
+            if candidate.is_file() {
+                return Some(fs::canonicalize(&candidate).unwrap_or(candidate));
+            }
+        }
+    }
+    None
+}
+
+fn cloud_mcp_agent_inventory_watch_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(prefix) = npm_global_prefix() {
+        cloud_mcp_agent_inventory_add_npm_roots(&mut roots, &mut seen, &prefix);
+    } else {
+        log_terminal_status_event(
+            "backend.cloud_mcp.agent_inventory_watcher.npm_prefix_unavailable",
+            json!({}),
+        );
+    }
+
+    for provider in [
+        AgentProvider::Codex,
+        AgentProvider::Claude,
+        AgentProvider::OpenCode,
+    ] {
+        let definition = agent_definition(provider);
+        if let Some(path) = cloud_mcp_agent_inventory_resolve_command_path(definition.binary) {
+            if let Some(parent) = path.parent() {
+                cloud_mcp_agent_inventory_add_watch_root(
+                    &mut roots,
+                    &mut seen,
+                    parent.to_path_buf(),
+                );
+            }
+        }
+    }
+
+    roots
+}
+
+fn cloud_mcp_clear_agent_inventory_command_candidate_cache() {
+    for provider in [
+        AgentProvider::Codex,
+        AgentProvider::Claude,
+        AgentProvider::OpenCode,
+    ] {
+        clear_agent_command_candidate_cache(provider);
+    }
+}
+
+fn cloud_mcp_start_agent_inventory_fs_watcher(notify: Arc<tokio::sync::Notify>) -> bool {
+    use notify::Watcher as _;
+
+    let slot = cloud_mcp_agent_inventory_watcher_slot();
+    let Ok(mut guard) = slot.lock() else {
+        return false;
+    };
+    if guard.is_some() {
+        return true;
+    }
+
+    let roots = cloud_mcp_agent_inventory_watch_roots();
+    if roots.is_empty() {
+        log_terminal_status_event(
+            "backend.cloud_mcp.agent_inventory_watcher.watch_roots_empty",
+            json!({}),
+        );
+        return false;
+    }
+
+    let (sender, receiver) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher = match notify::recommended_watcher(sender) {
+        Ok(watcher) => watcher,
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.cloud_mcp.agent_inventory_watcher.watch_create_error",
+                json!({ "error": clean_terminal_telemetry_text(&error.to_string()) }),
+            );
+            return false;
+        }
+    };
+
+    let mut watched_roots = Vec::new();
+    for root in roots {
+        match watcher.watch(&root, notify::RecursiveMode::NonRecursive) {
+            Ok(()) => watched_roots.push(root.display().to_string()),
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.cloud_mcp.agent_inventory_watcher.watch_root_error",
+                    json!({
+                        "root": root.display().to_string(),
+                        "error": clean_terminal_telemetry_text(&error.to_string()),
+                    }),
+                );
+            }
+        }
+    }
+    if watched_roots.is_empty() {
+        return false;
+    }
+
+    cloud_mcp_spawn_fs_event_debounce_forwarder(
+        "agent_inventory",
+        receiver,
+        notify,
+        Duration::from_millis(CLOUD_MCP_AGENT_INVENTORY_WATCH_DEBOUNCE_MS),
+        Some(cloud_mcp_clear_agent_inventory_command_candidate_cache),
+    );
+    *guard = Some(watcher);
+    log_terminal_status_event(
+        "backend.cloud_mcp.agent_inventory_watcher.watch_started",
+        json!({ "roots": watched_roots }),
+    );
+    true
+}
 
 /// Probes the coding-agent CLI inventory (installed, version, npm latest,
 /// auth, update availability) natively, and on change emits the webview event
@@ -19439,23 +20447,47 @@ pub(crate) async fn cloud_mcp_agent_inventory_probe_and_sync(
 /// `npm i -g @openai/codex` in a terminal — including in background mode.
 pub(crate) fn cloud_mcp_start_agent_inventory_watcher(app: AppHandle, state: CloudMcpState) {
     tauri::async_runtime::spawn(async move {
-        sleep(Duration::from_secs(
+        let inventory_wake = Arc::new(tokio::sync::Notify::new());
+        let inventory_wake_for_setup = inventory_wake.clone();
+        let _ = tauri::async_runtime::spawn_blocking(move || {
+            cloud_mcp_start_agent_inventory_fs_watcher(inventory_wake_for_setup)
+        });
+
+        if !cloud_mcp_wait_for_background_scheduler_delay(Duration::from_secs(
             CLOUD_MCP_AGENT_INVENTORY_INITIAL_DELAY_SECS,
         ))
-        .await;
+        .await
+        {
+            return;
+        }
+        if app_shutdown_requested() {
+            return;
+        }
+        cloud_mcp_agent_inventory_probe_and_sync(&app, &state, "agent_inventory_watcher", false)
+            .await;
+
         loop {
-            if APP_SHUTDOWN_PHASE.load(Ordering::Acquire) == APP_SHUTDOWN_PHASE_RUNNING {
-                cloud_mcp_agent_inventory_probe_and_sync(
-                    &app,
-                    &state,
-                    "agent_inventory_watcher",
-                    false,
-                )
-                .await;
+            if app_shutdown_requested() {
+                break;
             }
-            sleep(Duration::from_secs(
-                CLOUD_MCP_AGENT_INVENTORY_SCAN_INTERVAL_SECS,
-            ))
+            if !cloud_mcp_wait_for_background_scheduler_wake(
+                &inventory_wake,
+                Duration::from_secs(CLOUD_MCP_AGENT_INVENTORY_FALLBACK_INTERVAL_SECS),
+            )
+            .await
+            {
+                break;
+            }
+            if app_shutdown_requested() {
+                break;
+            }
+            cloud_mcp_clear_agent_inventory_command_candidate_cache();
+            cloud_mcp_agent_inventory_probe_and_sync(
+                &app,
+                &state,
+                "agent_inventory_watcher",
+                false,
+            )
             .await;
         }
     });
@@ -25897,6 +26929,10 @@ fn cloud_mcp_handle_terminal_output_subscription(
         let active = !(matches!(kind.as_str(), "turn.unsub" | "agent_turn_unsubscribe")
             || message.get("active").and_then(Value::as_bool) == Some(false));
         if active {
+            agent_chat_session_sync_mark_stream_workspace_history_dirty(
+                &stream_key,
+                "agent_turn_subscribe",
+            );
             let state = state.clone();
             tauri::async_runtime::spawn(async move {
                 let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
@@ -32822,6 +33858,11 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                 object.insert("updated_at_ms".to_string(), json!(cloud_mcp_now_ms()));
                 object.insert("updatedAtMs".to_string(), json!(cloud_mcp_now_ms()));
             }
+            agent_chat_session_sync_mark_workspace_history_dirty(
+                workspace_id,
+                None,
+                "workspace_snapshot_transient_gap_backfill",
+            );
             normalized_workspaces.push(workspace);
             reported_workspace_ids.insert(workspace_id.clone());
             workspace_snapshot_fallback_count += 1;
@@ -34198,6 +35239,7 @@ async fn cloud_mcp_delete_workspace(
     }
     let deleted_ledger_inserted = cloud_mcp_remember_deleted_workspace_id(&workspace_id)?;
     let purged_todo_mirror_rows = cloud_mcp_todo_mirror_purge_workspace(&workspace_id).unwrap_or(0);
+    todo_store_orphan_sweep_trigger("workspace_deleted");
     let purged_agent_chat_sync_rows =
         cloud_mcp_agent_chat_purge_workspace_local_sync_state(&workspace_id).unwrap_or(0);
 
@@ -43238,6 +44280,7 @@ async fn cloud_mcp_archive_workspace_todos(
     // Local state is removed immediately; todo.live_state/todo.content own account
     // convergence for recreated workspaces.
     let purged_mirror_rows = cloud_mcp_todo_mirror_purge_workspace(&workspace_id).unwrap_or(0);
+    todo_store_orphan_sweep_trigger("workspace_todo_archive");
     let device_profile = cloud_mcp_desktop_device_profile();
     let payload = json!({
         "event_kind": "workspace_todo_workspace_removed",
@@ -57261,6 +58304,105 @@ mod cloud_mcp_tests {
             .unwrap(),
             CloudMcpTokenomicsDaySyncDecision::Enqueue
         ));
+
+        let _ = fs::remove_dir_all(cache_root);
+    }
+
+    #[test]
+    fn tokenomics_current_acked_decision_seeds_prune_ack_meta() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let cache_root = test_cloud_root("diffforge-tokenomics-current-acked-prune-cache");
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let day_start_ms = cloud_mcp_tokenomics_timestamp_ms("2026-06-16T00:00:00Z").unwrap();
+        let day_key = cloud_mcp_tokenomics_day_key(day_start_ms);
+        let content_hash = "content-hash-a";
+        let idempotency_key = cloud_mcp_tokenomics_day_packet_idempotency_key(
+            "personal",
+            "device-a",
+            &day_key,
+            content_hash,
+        );
+        let source_payload = json!({
+            "did": "device-a",
+            "sk": "personal",
+            "sdm": day_start_ms,
+            "h": content_hash,
+            "ph": content_hash,
+            "pid": idempotency_key,
+            "ds": 7
+        });
+        assert!(cloud_mcp_tokenomics_mark_day_acked_from_payload(
+            Some(&source_payload),
+            &json!({
+                "did": "device-a",
+                "sk": "personal",
+                "server_cursor": "server-cursor"
+            })
+        )
+        .unwrap());
+
+        let outcome = cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
+            "device-a",
+            "personal",
+            day_start_ms,
+            content_hash,
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            outcome.decision,
+            CloudMcpTokenomicsDaySyncDecision::CurrentAcked
+        ));
+        let seed = outcome.prune_ack_seed.expect("CurrentAcked seed");
+        assert_eq!(seed.billing_scope_key, "personal");
+        assert_eq!(seed.day_start_ms, day_start_ms);
+        let outbox_conn = cloud_mcp_open_outbox_conn().unwrap();
+        let state = cloud_mcp_tokenomics_day_sync_state_from_conn(
+            &outbox_conn,
+            "device-a",
+            "personal",
+            day_start_ms,
+        )
+        .unwrap();
+        let expected_cursor = tokenomics_usage_event_prune_cloud_ack_cursor(
+            &state.idempotency_key,
+            state.acked_at_ms,
+        );
+        assert_eq!(seed.local_cursor, expected_cursor);
+
+        let tokenomics_conn = rusqlite::Connection::open_in_memory().unwrap();
+        tokenomics_prepare_db(&tokenomics_conn).unwrap();
+        assert_eq!(
+            tokenomics_record_usage_event_prune_cloud_acks(&tokenomics_conn, &[seed]).unwrap(),
+            1
+        );
+        let (bucket_day, _) = tokenomics_utc_hour_bucket_from_unix((day_start_ms / 1000) as u64);
+        let meta_key = format!("{TOKENOMICS_USAGE_EVENT_PRUNE_ACK_DAY_META_PREFIX}personal:{bucket_day}");
+        let stored: String = tokenomics_conn
+            .query_row(
+                "SELECT value FROM tokenomics_meta WHERE key=?1",
+                rusqlite::params![meta_key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored, expected_cursor);
+
+        let mismatch = cloud_mcp_tokenomics_day_sync_decision_with_ack_seed(
+            "device-a",
+            "personal",
+            day_start_ms,
+            "different-content-hash",
+            false,
+        )
+        .unwrap();
+        assert!(matches!(
+            mismatch.decision,
+            CloudMcpTokenomicsDaySyncDecision::Enqueue
+        ));
+        assert!(mismatch.prune_ack_seed.is_none());
 
         let _ = fs::remove_dir_all(cache_root);
     }

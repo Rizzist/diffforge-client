@@ -56,6 +56,7 @@ import {
   updateClip,
   updateTrack,
 } from "./videoEditorModel.js";
+import { GENERATION_MODELS } from "./generationCatalog.js";
 import {
   VideoDangerButton,
   VideoIconButton,
@@ -327,6 +328,29 @@ const ClipBlock = styled.div`
     border-color: rgba(16, 185, 129, 0.85);
     box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.45);
   }
+
+  /* Generating ghost: the reserved clip pulses emerald until the job's file
+     lands (same treatment as the library's pending tiles, timeline-sized). */
+  &[data-generating="true"] {
+    border: 1.5px dashed rgba(110, 231, 183, 0.75);
+    background: rgba(16, 185, 129, 0.1);
+    animation: video-clip-ghost-pulse 1.6s ease-in-out infinite;
+  }
+
+  &[data-generating="true"][data-selected="true"] {
+    border-color: rgba(110, 231, 183, 0.95);
+    box-shadow: 0 0 0 1px rgba(16, 185, 129, 0.45);
+  }
+
+  @keyframes video-clip-ghost-pulse {
+    0%,
+    100% {
+      opacity: 0.62;
+    }
+    50% {
+      opacity: 1;
+    }
+  }
 `;
 
 const ClipLabel = styled.div`
@@ -339,6 +363,11 @@ const ClipLabel = styled.div`
   overflow: hidden;
   text-overflow: ellipsis;
   pointer-events: none;
+
+  &[data-generating="true"] {
+    color: #6ee7b7;
+    font-weight: 800;
+  }
 `;
 
 const ClipThumb = styled.img`
@@ -580,6 +609,11 @@ function clipDisplayName(clip, track) {
   return segments[segments.length - 1] || "clip";
 }
 
+// jobType → human model name for the generating ghost-clip label.
+const GENERATION_MODEL_NAMES = new Map(
+  GENERATION_MODELS.map((model) => [model.jobType, model.displayName]),
+);
+
 // Interactive multi-track timeline. All edits flow through the pure model
 // helpers and surface as a whole-project onChange (the pane owns autosave and
 // history). Media arrives via the pane-scoped pointer-drag channel.
@@ -587,6 +621,7 @@ export default function Timeline({
   assetsByPath = {},
   canRedo = false,
   canUndo = false,
+  generationByPath = {},
   onChange,
   onRangesChange,
   onRedo,
@@ -1492,14 +1527,30 @@ export default function Timeline({
                   const filmstripFrames =
                     track.kind === "video" && widthPx > 90 && visuals?.frames?.length ? visuals.frames : null;
                   const waveformPeaks = track.kind === "audio" && visuals?.peaks?.length ? visuals.peaks : null;
+                  // Placeholder-first generation clip: the reserved path has no
+                  // file yet, so dress it as a pulsing ghost until the job lands.
+                  const generating = Boolean(asset?.pending);
+                  const generation = generating ? generationByPath[clip.assetPath] : null;
+                  const generationModel = generation?.model
+                    ? GENERATION_MODEL_NAMES.get(generation.model) || generation.model
+                    : "";
+                  const generationPercent =
+                    typeof generation?.percent === "number" && Number.isFinite(generation.percent)
+                      ? ` ${Math.round(Math.max(0, Math.min(1, generation.percent)) * 100)}%`
+                      : "";
                   return (
                     <ClipBlock
                       $kind={track.kind}
+                      data-generating={generating ? "true" : "false"}
                       data-selected={selectedSet.has(clip.id) ? "true" : "false"}
                       key={clip.id}
                       onPointerDown={(event) => beginClipDrag(event, track.id, clip, "move")}
                       style={{ left: `${clip.timelineStartMs * pxPerMs}px`, width: `${widthPx}px` }}
-                      title={`${clipDisplayName(clip, track)} · ${formatTimecode(clip.timelineStartMs)} → ${formatTimecode(clipEndMs(clip))}`}
+                      title={
+                        generating
+                          ? `Generating${generationModel ? ` with ${generationModel}` : ""} — the clip fills in when the job finishes`
+                          : `${clipDisplayName(clip, track)} · ${formatTimecode(clip.timelineStartMs)} → ${formatTimecode(clipEndMs(clip))}`
+                      }
                     >
                       {filmstripFrames ? (
                         <Filmstrip>
@@ -1521,7 +1572,11 @@ export default function Timeline({
                           />
                         </WaveformSvg>
                       ) : null}
-                      <ClipLabel>{clipDisplayName(clip, track)}</ClipLabel>
+                      <ClipLabel data-generating={generating ? "true" : "false"}>
+                        {generating
+                          ? `✦ ${generationModel || "veo"} · generating…${generationPercent}`
+                          : clipDisplayName(clip, track)}
+                      </ClipLabel>
                       {clip.linkId ? (
                         <LinkBadge title="Linked clip">
                           <Link aria-hidden="true" />

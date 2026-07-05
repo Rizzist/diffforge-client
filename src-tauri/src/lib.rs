@@ -43,6 +43,7 @@ use tokio_tungstenite::{
 };
 
 pub mod coordination;
+mod energy_impact;
 
 const DEFAULT_API_BASE_URL: &str = "https://diffforge.ai/api";
 const DEFAULT_WEB_LOGIN_URL: &str = "https://diffforge.ai/desktop/login";
@@ -185,12 +186,12 @@ const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_FILE: &str = "workspace-activation.jsonl";
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
-const TERMINAL_STATUS_LOGGING_ENABLED: bool = true;
+const TERMINAL_STATUS_LOGGING_ENABLED: bool = false;
 const TERMINAL_STATUS_LOG_FILE: &str = "terminal-statuses.jsonl";
 /// Persist the cloud sync/connect loop into logs/cloud-sync.jsonl:
 /// every connection-state note, ws phase change, route resolution, open
 /// attempt (with durations), disconnect reason, and outbox depth.
-const CLOUD_SYNC_LOGGING_ENABLED: bool = true;
+const CLOUD_SYNC_LOGGING_ENABLED: bool = false;
 const CLOUD_SYNC_LOG_FILE: &str = "cloud-sync.jsonl";
 const TERMINAL_CRASH_FORENSICS_LOGGING_ENABLED: bool = false;
 const TERMINAL_CRASH_FORENSICS_LOG_FILE: &str = "terminal-crash-forensics.jsonl";
@@ -310,6 +311,8 @@ static WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLo
 static VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TERMINAL_STATUS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static CLOUD_SYNC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+static TERMINAL_STATUS_LOGGING_RESOLVED: OnceLock<bool> = OnceLock::new();
+static CLOUD_SYNC_LOGGING_RESOLVED: OnceLock<bool> = OnceLock::new();
 static TERMINAL_CRASH_FORENSICS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 const WHISPER_RUNTIME_NAME: &str = "whisper.cpp CLI";
@@ -500,6 +503,7 @@ fn begin_app_shutdown() -> bool {
         )
         .is_ok();
     if changed {
+        todo_store_orphan_sweep_shutdown_notify();
         log_terminal_crash_forensics_event(
             "backend.app_shutdown.phase",
             json!({
@@ -2704,7 +2708,7 @@ include!("handsfree_audio.rs");
 include!("voice_text_rules.rs");
 include!("snipping.rs");
 
-fn diagnostic_log_path(file_name: &str) -> PathBuf {
+pub(crate) fn diagnostic_log_path(file_name: &str) -> PathBuf {
     let tauri_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let project_root = tauri_root
         .parent()
@@ -2736,6 +2740,28 @@ fn voice_orchestrator_diagnostic_log_path() -> PathBuf {
 
 fn terminal_status_log_path() -> PathBuf {
     diagnostic_log_path(TERMINAL_STATUS_LOG_FILE)
+}
+
+fn diagnostic_env_truthy(name: &str) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "" | "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+fn terminal_status_logging_enabled() -> bool {
+    *TERMINAL_STATUS_LOGGING_RESOLVED.get_or_init(|| {
+        TERMINAL_STATUS_LOGGING_ENABLED || diagnostic_env_truthy("DIFFFORGE_TERMINAL_STATUS_LOG")
+    })
+}
+
+fn cloud_sync_logging_enabled() -> bool {
+    *CLOUD_SYNC_LOGGING_RESOLVED.get_or_init(|| {
+        CLOUD_SYNC_LOGGING_ENABLED || diagnostic_env_truthy("DIFFFORGE_CLOUD_SYNC_LOG")
+    })
 }
 
 fn terminal_crash_forensics_log_path() -> PathBuf {
@@ -2955,7 +2981,7 @@ fn audio_widget_bottom_bar_debug_logging_enabled() -> bool {
 const TERMINAL_STATUS_LOG_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 fn write_terminal_status_log_entry(entry: Value) {
-    if !TERMINAL_STATUS_LOGGING_ENABLED {
+    if !terminal_status_logging_enabled() {
         return;
     }
 
@@ -3078,6 +3104,11 @@ fn log_terminal_diagnostic_event(app: &AppHandle, phase: &str, fields: Value) {
 }
 
 fn log_terminal_status_event(phase: &str, fields: Value) {
+    if !terminal_status_logging_enabled() {
+        forward_terminal_status_to_energy_if_needed(phase, "backend", fields);
+        return;
+    }
+
     write_terminal_status_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": clean_terminal_diagnostic_log_text(phase),
@@ -3088,10 +3119,16 @@ fn log_terminal_status_event(phase: &str, fields: Value) {
     }));
 }
 
+fn forward_terminal_status_to_energy_if_needed(phase: &str, source: &str, fields: Value) {
+    if phase.starts_with("frontend.render_probe") {
+        energy_impact::energy_impact_log_render_storm(phase, source, fields);
+    }
+}
+
 /// Cloud sync/connect loop trace (gated by CLOUD_SYNC_LOGGING_ENABLED),
 /// written to logs/cloud-sync.jsonl in the project root.
 fn log_cloud_sync_event(phase: &str, fields: Value) {
-    if !CLOUD_SYNC_LOGGING_ENABLED {
+    if !cloud_sync_logging_enabled() {
         return;
     }
 
@@ -3301,6 +3338,11 @@ fn log_voice_orchestrator_diagnostic_event(phase: &str, fields: Value) {
 
 #[tauri::command]
 fn terminal_status_log(phase: String, fields: Value) -> Result<(), String> {
+    if !terminal_status_logging_enabled() {
+        forward_terminal_status_to_energy_if_needed(&phase, "frontend", fields);
+        return Ok(());
+    }
+
     write_terminal_status_log_entry(json!({
         "ts_ms": current_time_ms(),
         "phase": clean_terminal_diagnostic_log_text(&phase),
@@ -3820,6 +3862,7 @@ async fn deactivate_workspace_runtime(
             "duration_ms": terminal_diagnostic_elapsed_ms(terminal_started_at),
         }),
     );
+    todo_store_orphan_sweep_trigger("workspace_deactivate_runtime");
 
     let mcp_started_at = Instant::now();
     let (mcp, mcp_error) = if let Some(repo_path) = repo_path.as_deref() {
@@ -7333,7 +7376,7 @@ pub fn run() {
         "backend.process_start",
         json!({
             "log_file": terminal_crash_forensics_log_path().display().to_string(),
-            "terminal_status_logging_enabled": TERMINAL_STATUS_LOGGING_ENABLED,
+            "terminal_status_logging_enabled": terminal_status_logging_enabled(),
             "windows": cfg!(windows),
             "windows_build_number": terminal_windows_build_number(),
         }),
@@ -7480,6 +7523,7 @@ pub fn run() {
                 app.handle().clone(),
                 app.state::<CloudMcpState>().inner().clone(),
             );
+            energy_impact::energy_impact_start();
             video_cloud_generation_events_start(
                 app.handle().clone(),
                 app.state::<CloudMcpState>().inner().clone(),

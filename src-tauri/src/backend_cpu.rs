@@ -8,6 +8,8 @@ struct BackendCpuAttributionMetric {
     count: u64,
     wall_total_ns: u128,
     cpu_total_ns: u128,
+    window_cpu_ns: u128,
+    window_count: u64,
     cpu_sample_count: u64,
     wall_max_ns: u128,
     cpu_max_ns: u128,
@@ -74,20 +76,38 @@ impl Drop for BackendCpuSpan {
 
 static BACKEND_CPU_ATTRIBUTION_STATE: OnceLock<StdMutex<BackendCpuAttributionState>> =
     OnceLock::new();
+static BACKEND_CPU_ATTRIBUTION_ENV_ENABLED: OnceLock<bool> = OnceLock::new();
 
-fn backend_cpu_attribution_enabled() -> bool {
+fn backend_cpu_env_truthy(name: &str) -> bool {
+    env::var(name)
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "" | "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+fn backend_cpu_attribution_env_enabled() -> bool {
     if !BACKEND_CPU_ATTRIBUTION_ENABLED {
         return false;
     }
     // Default OFF: this instrumentation does a pair of Mach thread_info syscalls on
     // every instrumented span and writes a JSON snapshot to disk every 5s, so it must
     // not run in normal use. Re-enable on demand with DIFFFORGE_BACKEND_CPU_ATTRIBUTION=1.
-    env::var("DIFFFORGE_BACKEND_CPU_ATTRIBUTION")
-        .map(|value| {
-            let value = value.trim().to_ascii_lowercase();
-            !matches!(value.as_str(), "0" | "false" | "off" | "no")
-        })
-        .unwrap_or(false)
+    *BACKEND_CPU_ATTRIBUTION_ENV_ENABLED
+        .get_or_init(|| backend_cpu_env_truthy("DIFFFORGE_BACKEND_CPU_ATTRIBUTION"))
+}
+
+pub(crate) fn backend_cpu_attribution_enabled() -> bool {
+    if !BACKEND_CPU_ATTRIBUTION_ENABLED {
+        return false;
+    }
+
+    backend_cpu_attribution_env_enabled() || energy_impact::energy_impact_enabled()
+}
+
+fn backend_cpu_attribution_dump_enabled() -> bool {
+    BACKEND_CPU_ATTRIBUTION_DUMP_ENABLED && backend_cpu_attribution_env_enabled()
 }
 
 fn backend_cpu_attribution_now_ms() -> u64 {
@@ -171,6 +191,7 @@ fn backend_cpu_attribution_record(tag: &'static str, wall_ns: u128, cpu_ns: Opti
         };
         let metric = state.metrics.entry(tag).or_default();
         metric.count = metric.count.saturating_add(1);
+        metric.window_count = metric.window_count.saturating_add(1);
         metric.wall_total_ns = metric.wall_total_ns.saturating_add(wall_ns);
         metric.wall_max_ns = metric.wall_max_ns.max(wall_ns);
         metric.wall_last_ns = wall_ns;
@@ -178,11 +199,12 @@ fn backend_cpu_attribution_record(tag: &'static str, wall_ns: u128, cpu_ns: Opti
         if let Some(cpu_ns) = cpu_ns {
             metric.cpu_sample_count = metric.cpu_sample_count.saturating_add(1);
             metric.cpu_total_ns = metric.cpu_total_ns.saturating_add(cpu_ns);
+            metric.window_cpu_ns = metric.window_cpu_ns.saturating_add(cpu_ns);
             metric.cpu_max_ns = metric.cpu_max_ns.max(cpu_ns);
             metric.cpu_last_ns = Some(cpu_ns);
         }
 
-        BACKEND_CPU_ATTRIBUTION_DUMP_ENABLED
+        backend_cpu_attribution_dump_enabled()
             && now_ms.saturating_sub(state.last_dump_ms) >= BACKEND_CPU_ATTRIBUTION_DUMP_INTERVAL_MS
             && {
                 state.last_dump_ms = now_ms;
@@ -197,6 +219,38 @@ fn backend_cpu_attribution_record(tag: &'static str, wall_ns: u128, cpu_ns: Opti
 
 fn backend_cpu_ns_to_ms(value: u128) -> f64 {
     value as f64 / 1_000_000.0
+}
+
+pub(crate) fn backend_cpu_attribution_take_window() -> Vec<(String, f64, u64)> {
+    let now_ms = backend_cpu_attribution_now_ms();
+    let state = BACKEND_CPU_ATTRIBUTION_STATE
+        .get_or_init(|| StdMutex::new(BackendCpuAttributionState::new(now_ms)));
+    let Ok(mut state) = state.lock() else {
+        return Vec::new();
+    };
+
+    let mut window = state
+        .metrics
+        .iter_mut()
+        .filter_map(|(tag, metric)| {
+            if metric.window_count == 0 {
+                return None;
+            }
+            let cpu_ms = backend_cpu_ns_to_ms(metric.window_cpu_ns);
+            let count = metric.window_count;
+            metric.window_cpu_ns = 0;
+            metric.window_count = 0;
+            Some(((*tag).to_string(), cpu_ms, count))
+        })
+        .collect::<Vec<_>>();
+
+    window.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    window
 }
 
 fn backend_cpu_attribution_snapshot_value(reset: bool) -> Value {
@@ -277,7 +331,7 @@ fn backend_cpu_attribution_dump_path() -> PathBuf {
 }
 
 fn backend_cpu_attribution_dump_snapshot(reason: &str) {
-    if !backend_cpu_attribution_enabled() || !BACKEND_CPU_ATTRIBUTION_DUMP_ENABLED {
+    if !backend_cpu_attribution_dump_enabled() {
         return;
     }
     let mut payload = backend_cpu_attribution_snapshot_value(false);

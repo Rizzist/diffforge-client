@@ -5371,6 +5371,7 @@ fn spawn_terminal_reader(
                     false,
                     Some(cleanup_tracker),
                 );
+                todo_store_orphan_sweep_trigger("terminal_reader_exit");
             }
 
             let _ = cleanup_app.emit(
@@ -5512,6 +5513,7 @@ async fn close_terminal_session(
             "terminal_close:terminal_detached",
             None,
         );
+        todo_store_orphan_sweep_trigger("terminal_close");
         let cleanup_tracker = Arc::clone(&state.cleanup_tracker);
         let cleanup_task = tauri::async_runtime::spawn_blocking(move || {
             let _cleanup_guard = cleanup_tracker.begin("terminal_close", Some(cleanup_instance_id));
@@ -5690,6 +5692,9 @@ async fn close_all_terminal_sessions(
             format!("{close_reason}:terminal_detached"),
             None,
         );
+    }
+    if closed > 0 {
+        todo_store_orphan_sweep_trigger("terminal_close_all");
     }
 
     let mut notify_tasks = Vec::new();

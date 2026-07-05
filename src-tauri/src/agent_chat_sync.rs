@@ -37,17 +37,29 @@ const AGENT_CHAT_SESSION_SYNC_MAX_RECORDS_PER_PACKET: usize = 128;
 const AGENT_CHAT_SESSION_HISTORY_BACKFILL_LIMIT: usize = 100;
 const AGENT_CHAT_SESSION_HISTORY_BACKFILL_SPAWN_LIMIT: usize = 24;
 const AGENT_CHAT_SESSION_HISTORY_BACKFILL_INTERVAL_MS: u64 = 60_000;
-const AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS: u64 = 5 * 60_000;
+const AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS: u64 = 30 * 60_000;
 const AGENT_CHAT_SESSION_SYNC_BUILD_CONCURRENCY: usize = 4;
 const AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION: u64 = 2;
 
 static AGENT_CHAT_SESSION_HISTORY_BACKFILL_LAST: OnceLock<StdMutex<HashMap<String, u64>>> =
     OnceLock::new();
+static AGENT_CHAT_SESSION_HISTORY_BACKFILL_WORKSPACES: OnceLock<
+    StdMutex<HashMap<String, AgentChatSessionHistoryBackfillWorkspace>>,
+> = OnceLock::new();
+static AGENT_CHAT_SESSION_HISTORY_BACKFILL_ALL_DIRTY_SINCE: AtomicU64 = AtomicU64::new(0);
 static AGENT_CHAT_SESSION_HISTORY_SOURCE_FINGERPRINTS: OnceLock<
     StdMutex<HashMap<String, AgentChatSessionHistorySourceFingerprint>>,
 > = OnceLock::new();
 static AGENT_CHAT_SESSION_SYNC_BUILD_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> =
     OnceLock::new();
+
+#[derive(Clone, Copy, Default)]
+struct AgentChatSessionHistoryBackfillWorkspace {
+    dirty_since_ms: Option<u64>,
+    last_full_pass_spawned: Option<bool>,
+    last_full_pass_ms: u64,
+    all_dirty_seen_ms: u64,
+}
 
 #[derive(Clone, PartialEq, Eq)]
 struct AgentChatSessionHistorySourceFingerprint {
@@ -65,6 +77,112 @@ fn agent_chat_session_sync_build_semaphore() -> Arc<tokio::sync::Semaphore> {
 fn agent_chat_session_history_source_fingerprints(
 ) -> &'static StdMutex<HashMap<String, AgentChatSessionHistorySourceFingerprint>> {
     AGENT_CHAT_SESSION_HISTORY_SOURCE_FINGERPRINTS.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn agent_chat_session_history_backfill_workspaces(
+) -> &'static StdMutex<HashMap<String, AgentChatSessionHistoryBackfillWorkspace>> {
+    AGENT_CHAT_SESSION_HISTORY_BACKFILL_WORKSPACES.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn agent_chat_session_history_backfill_workspace_key(workspace_id: &str) -> Option<String> {
+    let workspace_id = workspace_id.trim();
+    (!workspace_id.is_empty()).then(|| workspace_id.to_string())
+}
+
+fn agent_chat_session_history_backfill_root_key(
+    workspace_id: &str,
+    root_directory: Option<&str>,
+) -> Option<String> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{}\n{}",
+        workspace_id,
+        root_directory.unwrap_or_default().trim()
+    ))
+}
+
+fn agent_chat_session_sync_mark_workspace_history_dirty(
+    workspace_id: &str,
+    _root_directory: Option<&str>,
+    _reason: &str,
+) {
+    let Some(key) = agent_chat_session_history_backfill_workspace_key(workspace_id) else {
+        return;
+    };
+    let now = current_time_ms().max(1);
+    let Ok(mut entries) = agent_chat_session_history_backfill_workspaces().lock() else {
+        return;
+    };
+    let entry = entries.entry(key).or_default();
+    entry.dirty_since_ms = Some(
+        entry
+            .dirty_since_ms
+            .map(|dirty_since| dirty_since.min(now))
+            .unwrap_or(now),
+    );
+}
+
+fn agent_chat_session_sync_mark_payload_workspace_history_dirty(payload: &Value, reason: &str) {
+    let workspace_id = cloud_mcp_payload_text(
+        payload,
+        &[
+            "workspace_id",
+            "workspaceId",
+            "w",
+            "repo_id",
+            "repoId",
+            "target_workspace_id",
+            "targetWorkspaceId",
+        ],
+    )
+    .unwrap_or_default();
+    let root_directory = cloud_mcp_payload_text(
+        payload,
+        &[
+            "root_directory",
+            "rootDirectory",
+            "workspace_root",
+            "workspaceRoot",
+            "repo_path",
+            "repoPath",
+            "cwd",
+        ],
+    );
+    agent_chat_session_sync_mark_workspace_history_dirty(
+        &workspace_id,
+        root_directory.as_deref(),
+        reason,
+    );
+}
+
+fn agent_chat_session_sync_mark_stream_workspace_history_dirty(stream_key: &str, reason: &str) {
+    let workspace_id = stream_key
+        .split(':')
+        .nth(1)
+        .map(str::trim)
+        .unwrap_or_default();
+    agent_chat_session_sync_mark_workspace_history_dirty(workspace_id, None, reason);
+}
+
+fn agent_chat_session_sync_mark_all_workspace_history_dirty(_reason: &str) {
+    let now = current_time_ms().max(1);
+    AGENT_CHAT_SESSION_HISTORY_BACKFILL_ALL_DIRTY_SINCE.store(now, Ordering::Release);
+    if let Some(workspaces) = AGENT_CHAT_SESSION_HISTORY_BACKFILL_WORKSPACES.get() {
+        if let Ok(mut entries) = workspaces.lock() {
+            for entry in entries.values_mut() {
+                entry.dirty_since_ms = Some(
+                    entry
+                        .dirty_since_ms
+                        .map(|dirty_since| dirty_since.min(now))
+                        .unwrap_or(now),
+                );
+                entry.all_dirty_seen_ms = now;
+            }
+        }
+    }
 }
 
 fn agent_chat_session_history_source_fingerprint_for_path(
@@ -2026,6 +2144,11 @@ fn agent_chat_session_sync_spawn(
             }
         };
         for payload in payloads {
+            agent_chat_session_sync_mark_workspace_history_dirty(
+                &context.workspace_id,
+                Some(cwd.as_str()),
+                reason,
+            );
             let key = format!(
                 "agent-chat-session:{}:{}:{}:{}",
                 cloud_mcp_payload_text(&payload, &["workspace_id", "workspaceId"])
@@ -2069,6 +2192,11 @@ fn agent_chat_session_sync_spawn_from_result(
         );
         return;
     }
+    agent_chat_session_sync_mark_workspace_history_dirty(
+        &context.workspace_id,
+        Some(result.cwd.as_str()),
+        reason,
+    );
     let app_for_task = app.clone();
     let agent_id = provider.to_string();
     let result = result.clone();
@@ -2193,6 +2321,11 @@ fn agent_chat_session_sync_spawn_from_history_record(
     if provider_session_id.trim().is_empty() {
         return;
     }
+    agent_chat_session_sync_mark_workspace_history_dirty(
+        &record.workspace_id,
+        Some(record.cwd.as_str()),
+        reason,
+    );
     let context = AgentChatSessionSyncContext {
         workspace_id: record.workspace_id.clone(),
         workspace_name: record.workspace_name.clone(),
@@ -2423,26 +2556,82 @@ fn agent_chat_session_sync_spawn_from_history_items(
 fn agent_chat_session_sync_should_backfill_workspace(
     workspace_id: &str,
     root_directory: Option<&str>,
-) -> bool {
-    let workspace_id = workspace_id.trim();
-    if workspace_id.is_empty() {
-        return false;
-    }
-    let key = format!("{}\n{}", workspace_id, root_directory.unwrap_or_default().trim());
+) -> Option<u64> {
     let now = current_time_ms();
+    let workspace_key = agent_chat_session_history_backfill_workspace_key(workspace_id)?;
+    let root_key = agent_chat_session_history_backfill_root_key(workspace_id, root_directory)?;
+    let should_scan = {
+        let all_dirty_since =
+            AGENT_CHAT_SESSION_HISTORY_BACKFILL_ALL_DIRTY_SINCE.load(Ordering::Acquire);
+        let workspaces = agent_chat_session_history_backfill_workspaces();
+        match workspaces.lock() {
+            Ok(mut entries) => {
+                let entry = entries.entry(workspace_key.clone()).or_insert(
+                    AgentChatSessionHistoryBackfillWorkspace {
+                        dirty_since_ms: Some(0),
+                        last_full_pass_spawned: None,
+                        last_full_pass_ms: 0,
+                        all_dirty_seen_ms: all_dirty_since,
+                    },
+                );
+                if all_dirty_since > entry.all_dirty_seen_ms {
+                    entry.dirty_since_ms = Some(
+                        entry
+                            .dirty_since_ms
+                            .map(|dirty_since| dirty_since.min(all_dirty_since))
+                            .unwrap_or(all_dirty_since),
+                    );
+                    entry.all_dirty_seen_ms = all_dirty_since;
+                }
+                let verify_due = entry.last_full_pass_spawned == Some(false)
+                    && entry.last_full_pass_ms > 0
+                    && now.saturating_sub(entry.last_full_pass_ms)
+                        >= AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS;
+                entry.dirty_since_ms.is_some()
+                    || entry.last_full_pass_spawned.unwrap_or(true)
+                    || verify_due
+            }
+            Err(_) => true,
+        }
+    };
+    if !should_scan {
+        return None;
+    }
     let ledger = AGENT_CHAT_SESSION_HISTORY_BACKFILL_LAST
         .get_or_init(|| StdMutex::new(HashMap::new()));
     let Ok(mut entries) = ledger.lock() else {
-        return true;
+        return Some(now);
     };
     if entries
-        .get(&key)
+        .get(&root_key)
         .is_some_and(|last| now.saturating_sub(*last) < AGENT_CHAT_SESSION_HISTORY_BACKFILL_INTERVAL_MS)
     {
-        return false;
+        return None;
     }
-    entries.insert(key, now);
-    true
+    entries.insert(root_key, now);
+    Some(now)
+}
+
+fn agent_chat_session_sync_finish_backfill_workspace(
+    workspace_id: &str,
+    started_at_ms: u64,
+    spawned: usize,
+) {
+    let Some(workspace_key) = agent_chat_session_history_backfill_workspace_key(workspace_id) else {
+        return;
+    };
+    let Ok(mut entries) = agent_chat_session_history_backfill_workspaces().lock() else {
+        return;
+    };
+    let entry = entries.entry(workspace_key).or_default();
+    if entry
+        .dirty_since_ms
+        .is_some_and(|dirty_since| dirty_since <= started_at_ms)
+    {
+        entry.dirty_since_ms = None;
+    }
+    entry.last_full_pass_spawned = Some(spawned > 0);
+    entry.last_full_pass_ms = started_at_ms;
 }
 
 fn agent_chat_session_sync_backfill_workspace_history(
@@ -2451,9 +2640,12 @@ fn agent_chat_session_sync_backfill_workspace_history(
     root_directory: Option<String>,
     reason: &'static str,
 ) {
-    if !agent_chat_session_sync_should_backfill_workspace(&workspace_id, root_directory.as_deref()) {
+    let Some(started_at_ms) =
+        agent_chat_session_sync_should_backfill_workspace(&workspace_id, root_directory.as_deref())
+    else {
         return;
-    }
+    };
+    let requested_workspace_id = workspace_id.clone();
     tauri::async_runtime::spawn(async move {
         let request = WorkspaceAgentSessionHistoryListRequest {
             fast: Some(false),
@@ -2473,6 +2665,11 @@ fn agent_chat_session_sync_backfill_workspace_history(
                     app,
                     &history.items,
                     reason,
+                );
+                agent_chat_session_sync_finish_backfill_workspace(
+                    &requested_workspace_id,
+                    started_at_ms,
+                    queued,
                 );
                 if queued > 0 {
                     log_terminal_status_event(
@@ -2518,6 +2715,13 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
     {
         return false;
     }
+    let cwd = cloud_mcp_payload_text(payload, &["cwd", "workspace_root", "workspaceRoot"])
+        .unwrap_or_default();
+    agent_chat_session_sync_mark_workspace_history_dirty(
+        &workspace_id,
+        Some(cwd.as_str()),
+        reason,
+    );
     let context = AgentChatSessionSyncContext {
         workspace_id,
         workspace_name: cloud_mcp_payload_text(payload, &["workspace_name", "workspaceName"])
@@ -2556,8 +2760,6 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
         )
         .unwrap_or_default(),
     };
-    let cwd = cloud_mcp_payload_text(payload, &["cwd", "workspace_root", "workspaceRoot"])
-        .unwrap_or_default();
     agent_chat_session_sync_spawn(app, provider, provider_session_id, cwd, context, reason);
     true
 }

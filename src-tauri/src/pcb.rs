@@ -307,6 +307,15 @@ fn pcb_resolve_board_abs(
     Ok(abs)
 }
 
+fn pcb_file_modified_ms(path: &std::path::Path) -> u64 {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|dur| dur.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn pcb_collect_boards(hardware: &std::path::Path, root: &std::path::Path, out: &mut Vec<serde_json::Value>) {
     let Ok(entries) = std::fs::read_dir(hardware) else {
         return;
@@ -319,6 +328,7 @@ fn pcb_collect_boards(hardware: &std::path::Path, root: &std::path::Path, out: &
                     "id": pcb_board_id(&path),
                     "name": pcb_board_id(&path),
                     "path": pcb_relative_path(root, &path),
+                    "updatedAtMs": pcb_file_modified_ms(&path),
                 }));
             }
         } else if path.is_dir() {
@@ -331,6 +341,7 @@ fn pcb_collect_boards(hardware: &std::path::Path, root: &std::path::Path, out: &
                             "id": pcb_board_id(&child_path),
                             "name": pcb_board_id(&child_path),
                             "path": pcb_relative_path(root, &child_path),
+                            "updatedAtMs": pcb_file_modified_ms(&child_path),
                         }));
                     }
                 }

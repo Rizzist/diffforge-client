@@ -23776,6 +23776,119 @@ function TerminalView({
       getTerminalGridColumnPanelIds(terminalGridLayoutWorkspaceId, row),
     ) || undefined
   ), [terminalGridLayoutWorkspaceId, terminalGridSavedLayout]);
+  const seedTerminalGridLayoutForSplit = useCallback(({ direction, terminalIndex }) => {
+    // Splitting changes the grid-layout signature, which remounts both panel
+    // groups with equal default sizes. Seed the next signature's stored layout
+    // from the current one so a split only halves the pane being split and
+    // every other row/column keeps its size. If the predicted next structure
+    // ends up differing (e.g. a rebalance), the seed is simply never read.
+    flushTerminalGridLayoutWrite();
+
+    const currentEntry = readTerminalGridLayoutEntry(terminalGridLayoutStorageKey, terminalGridLayoutSignature);
+    if (!currentEntry) {
+      return;
+    }
+
+    const workspaceId = terminalGridLayoutWorkspaceId;
+    const currentRows = cloneTerminalRows(activeDisplayRows, { allowDocumentPanel: true });
+    const targetIdentity = terminalPaneLayoutKeyIdentity(terminalIndex);
+    const sourceRowIndex = currentRows.findIndex((row) => (
+      row.terminalIndexes.some((paneKey) => terminalPaneLayoutKeyIdentity(paneKey) === targetIdentity)
+    ));
+    if (sourceRowIndex < 0) {
+      return;
+    }
+
+    let newTerminalIndex = -1;
+    for (let index = 0; index < MAX_WORKSPACE_TERMINAL_COUNT; index += 1) {
+      if (!logicalTerminalIndexes.includes(index)) {
+        newTerminalIndex = index;
+        break;
+      }
+    }
+    if (newTerminalIndex < 0) {
+      return;
+    }
+
+    const sameRowSplit = direction === "vertical";
+    const nextRowValues = currentRows.map((row) => row.terminalIndexes.slice());
+    if (sameRowSplit) {
+      const columnIndex = nextRowValues[sourceRowIndex].findIndex((paneKey) => (
+        terminalPaneLayoutKeyIdentity(paneKey) === targetIdentity
+      ));
+      nextRowValues[sourceRowIndex].splice(columnIndex + 1, 0, newTerminalIndex);
+    } else {
+      nextRowValues.splice(sourceRowIndex + 1, 0, [newTerminalIndex]);
+    }
+    const nextRows = nextRowValues.map((terminalIndexes, rowIndex) => ({ rowIndex, terminalIndexes }));
+    const nextSignature = getTerminalGridLayoutSignature(nextRows, {
+      ...paneKinds,
+      [newTerminalIndex]: getTerminalGridPaneKind(terminalIndex, paneKinds),
+    });
+    if (!nextSignature || nextSignature === terminalGridLayoutSignature) {
+      return;
+    }
+
+    const currentRowPanelIds = currentRows.map((row) => getTerminalGridRowPanelId(workspaceId, row.rowIndex));
+    const currentRowsLayout = normalizeTerminalGridLayoutMap(currentEntry.rows, currentRowPanelIds)
+      || Object.fromEntries(currentRowPanelIds.map((panelId) => [panelId, 100 / currentRowPanelIds.length]));
+    const nextRowsLayout = {};
+    const nextColumns = {};
+
+    currentRows.forEach((row, rowIndex) => {
+      const rowSize = currentRowsLayout[currentRowPanelIds[rowIndex]];
+      if (sameRowSplit || rowIndex < sourceRowIndex) {
+        nextRowsLayout[getTerminalGridRowPanelId(workspaceId, rowIndex)] = rowSize;
+      } else if (rowIndex === sourceRowIndex) {
+        nextRowsLayout[getTerminalGridRowPanelId(workspaceId, rowIndex)] = rowSize / 2;
+        nextRowsLayout[getTerminalGridRowPanelId(workspaceId, rowIndex + 1)] = rowSize / 2;
+      } else {
+        nextRowsLayout[getTerminalGridRowPanelId(workspaceId, rowIndex + 1)] = rowSize;
+      }
+    });
+
+    currentRows.forEach((row, rowIndex) => {
+      const storedColumnsLayout = normalizeTerminalGridLayoutMap(
+        currentEntry.columns?.[String(rowIndex)],
+        getTerminalGridColumnPanelIds(workspaceId, row),
+      );
+      if (!storedColumnsLayout) {
+        return;
+      }
+
+      if (sameRowSplit && rowIndex === sourceRowIndex) {
+        const sourcePanelId = getTerminalGridPanePanelId(workspaceId, rowIndex, terminalIndex);
+        const halfSize = (storedColumnsLayout[sourcePanelId] || 0) / 2;
+        nextColumns[String(rowIndex)] = Object.fromEntries(nextRows[rowIndex].terminalIndexes.map((paneKey) => {
+          const panelId = getTerminalGridPanePanelId(workspaceId, rowIndex, paneKey);
+          return [
+            panelId,
+            paneKey === newTerminalIndex || panelId === sourcePanelId ? halfSize : storedColumnsLayout[panelId],
+          ];
+        }));
+        return;
+      }
+
+      const nextRowIndex = !sameRowSplit && rowIndex > sourceRowIndex ? rowIndex + 1 : rowIndex;
+      nextColumns[String(nextRowIndex)] = Object.fromEntries(row.terminalIndexes.map((paneKey) => [
+        getTerminalGridPanePanelId(workspaceId, nextRowIndex, paneKey),
+        storedColumnsLayout[getTerminalGridPanePanelId(workspaceId, rowIndex, paneKey)],
+      ]));
+    });
+
+    writeTerminalGridLayoutEntry(terminalGridLayoutStorageKey, nextSignature, {
+      columns: nextColumns,
+      rows: nextRowsLayout,
+    });
+  }, [
+    activeDisplayRows,
+    flushTerminalGridLayoutWrite,
+    logicalTerminalIndexes,
+    paneKinds,
+    terminalGridLayoutSignature,
+    terminalGridLayoutStorageKey,
+    terminalGridLayoutWorkspaceId,
+  ]);
   useEffect(() => () => {
     if (terminalGridLayoutWriteTimerRef.current) {
       window.clearTimeout(terminalGridLayoutWriteTimerRef.current);
@@ -28752,12 +28865,13 @@ function TerminalView({
   }, []);
 
   const handleSplitTerminal = useCallback(({ direction, terminalIndex }) => {
+    seedTerminalGridLayoutForSplit({ direction, terminalIndex });
     splitWorkspaceTerminal?.({
       direction,
       terminalIndex,
       workspaceId: terminalWorkspace?.id || "",
     });
-  }, [splitWorkspaceTerminal, terminalWorkspace?.id]);
+  }, [seedTerminalGridLayoutForSplit, splitWorkspaceTerminal, terminalWorkspace?.id]);
 
   const handleForkTerminal = useCallback(({
     model = "",

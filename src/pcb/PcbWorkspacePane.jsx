@@ -3,6 +3,8 @@ import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+import { Memory } from "@styled-icons/material-rounded/Memory";
+
 import AppSelect from "../app/AppSelect.jsx";
 import PcbPanel, { PCB_STORE_CHANGED_EVENT } from "./PcbPanel.jsx";
 
@@ -11,6 +13,25 @@ const PCB_SELECT_MENU_MAX_HEIGHT = 132;
 
 function normalizeRepoIdentity(repoPath) {
   return String(repoPath || "").trim().replace(/\\/g, "/").replace(/\/+$/g, "");
+}
+
+function formatRelativeTime(ms) {
+  const at = Number(ms) || 0;
+  if (!at) {
+    return "";
+  }
+  const deltaMinutes = Math.round((Date.now() - at) / 60000);
+  if (deltaMinutes < 1) {
+    return "just now";
+  }
+  if (deltaMinutes < 60) {
+    return `${deltaMinutes}m ago`;
+  }
+  const deltaHours = Math.round(deltaMinutes / 60);
+  if (deltaHours < 48) {
+    return `${deltaHours}h ago`;
+  }
+  return `${Math.round(deltaHours / 24)}d ago`;
 }
 
 function storageSegment(value) {
@@ -84,6 +105,10 @@ const PaneBody = styled.div`
   container: pcb-pane / size;
 `;
 
+// The create/open screen wears a muted "bare substrate" theme for the
+// hardware crowd: soldermask-green black, a faint routing grid, and quiet
+// copper accents on the actions. Decoration stays under ~8% opacity so the
+// pane never shouts inside a busy grid.
 const EmptyPane = styled.div`
   display: grid;
   width: 100%;
@@ -96,18 +121,26 @@ const EmptyPane = styled.div`
   overscroll-behavior: contain;
   color: rgba(203, 213, 225, 0.82);
   background:
-    linear-gradient(135deg, rgba(16, 185, 129, 0.08), transparent 34%),
-    #04070d;
+    radial-gradient(ellipse at 16% -12%, rgba(217, 119, 6, 0.07), transparent 52%),
+    radial-gradient(ellipse at 88% 114%, rgba(16, 185, 129, 0.09), transparent 55%),
+    linear-gradient(rgba(52, 211, 153, 0.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(52, 211, 153, 0.03) 1px, transparent 1px),
+    #040a07;
+  background-size: auto, auto, 24px 24px, 24px 24px, auto;
 
   @container pcb-pane (max-height: 360px) {
     align-items: start;
+    padding: 10px;
+  }
+
+  @container pcb-pane (max-width: 340px) {
     padding: 10px;
   }
 `;
 
 const EmptyCard = styled.div`
   display: flex;
-  width: min(360px, 100%);
+  width: min(400px, 100%);
   min-width: 0;
   max-height: 100%;
   flex-direction: column;
@@ -118,9 +151,10 @@ const EmptyCard = styled.div`
   overscroll-behavior: contain;
   scrollbar-color: rgba(148, 163, 184, 0.48) transparent;
   scrollbar-width: thin;
-  border: 1px solid rgba(148, 163, 184, 0.18);
-  border-radius: 8px;
-  background: rgba(11, 14, 20, 0.88);
+  border: 1px solid rgba(52, 211, 153, 0.14);
+  border-radius: 9px;
+  background: rgba(5, 12, 9, 0.88);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.42);
 
   &::-webkit-scrollbar {
     width: 6px;
@@ -139,6 +173,46 @@ const EmptyCard = styled.div`
   @container pcb-pane (max-height: 260px) {
     gap: 6px;
     padding: 10px;
+  }
+`;
+
+const EmptyHeader = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+`;
+
+const EmptyHeaderText = styled.div`
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+`;
+
+const EmptyBadge = styled.div`
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(217, 119, 6, 0.34);
+  border-radius: 8px;
+  background: linear-gradient(160deg, rgba(217, 119, 6, 0.2), rgba(217, 119, 6, 0.05));
+  color: #edb266;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  @container pcb-pane (max-height: 260px) {
+    width: 26px;
+    height: 26px;
+
+    svg {
+      width: 14px;
+      height: 14px;
+    }
   }
 `;
 
@@ -167,16 +241,16 @@ const EmptyHint = styled.div`
 const PaneButton = styled.button`
   appearance: none;
   min-height: 30px;
-  border: 1px solid rgba(16, 185, 129, 0.34);
+  border: 1px solid rgba(217, 119, 6, 0.4);
   border-radius: 7px;
-  color: #d1fae5;
-  background: rgba(16, 185, 129, 0.12);
+  color: #fcd9a8;
+  background: rgba(217, 119, 6, 0.12);
   font-size: 12px;
   font-weight: 850;
   cursor: pointer;
 
   &:hover:not(:disabled) {
-    background: rgba(16, 185, 129, 0.2);
+    background: rgba(217, 119, 6, 0.2);
   }
 
   &:disabled {
@@ -219,7 +293,7 @@ const CreateOverlay = styled.div`
   padding: 18px;
   overflow: auto;
   overscroll-behavior: contain;
-  background: rgba(2, 3, 4, 0.72);
+  background: rgba(2, 5, 3, 0.74);
   backdrop-filter: blur(10px);
 
   @container pcb-pane (max-height: 420px) {
@@ -245,8 +319,8 @@ const CreateInput = styled.input`
   font-weight: 750;
 
   &:focus {
-    border-color: rgba(16, 185, 129, 0.55);
-    box-shadow: 0 0 0 3px rgba(16, 185, 129, 0.14);
+    border-color: rgba(217, 119, 6, 0.55);
+    box-shadow: 0 0 0 3px rgba(217, 119, 6, 0.13);
   }
 
   &::placeholder {
@@ -310,6 +384,60 @@ const PaneError = styled.div`
 
 const CreatePickerWrap = styled.div`
   min-width: 0;
+`;
+
+const RecentList = styled.div`
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+`;
+
+const RecentRow = styled.button`
+  appearance: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 32px;
+  padding: 0 10px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 7px;
+  background: rgba(3, 8, 6, 0.6);
+  cursor: pointer;
+  text-align: left;
+
+  &:hover:not(:disabled) {
+    border-color: rgba(217, 119, 6, 0.45);
+    background: rgba(217, 119, 6, 0.07);
+  }
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+
+  @container pcb-pane (max-height: 260px) {
+    min-height: 28px;
+  }
+`;
+
+const RecentName = styled.span`
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 780;
+  color: rgba(236, 253, 245, 0.92);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+`;
+
+const RecentMeta = styled.span`
+  flex: none;
+  font-size: 9.5px;
+  font-weight: 650;
+  color: rgba(232, 178, 102, 0.66);
+  white-space: nowrap;
 `;
 
 const CreateLabel = styled.div`
@@ -531,6 +659,15 @@ export default function PcbWorkspacePane({
 
   const boardOptions = useMemo(
     () => availableBoards.map((board) => ({ label: board.name || board.path, value: board.path })),
+    [availableBoards],
+  );
+
+  // Quick-open shortcuts: most recently edited boards first (file mtime from
+  // pcb_documents_list; older backends report 0 and keep the list order).
+  const recentBoards = useMemo(
+    () => [...availableBoards]
+      .sort((left, right) => (Number(right?.updatedAtMs) || 0) - (Number(left?.updatedAtMs) || 0))
+      .slice(0, 3),
     [availableBoards],
   );
 
@@ -767,20 +904,50 @@ export default function PcbWorkspacePane({
         ) : (
           <EmptyPane>
             <EmptyCard>
-              <EmptyTitle>PCB design</EmptyTitle>
-              <EmptyHint>Create a board or open an existing design in this panel.</EmptyHint>
+              <EmptyHeader>
+                <EmptyBadge>
+                  <Memory aria-hidden="true" />
+                </EmptyBadge>
+                <EmptyHeaderText>
+                  <EmptyTitle>PCB design</EmptyTitle>
+                  <EmptyHint>Create a board or open an existing design in this panel.</EmptyHint>
+                </EmptyHeaderText>
+              </EmptyHeader>
               <PaneButton disabled={busy || deleting || !repoPath} onClick={() => openCreateBoard()} type="button">
                 + New board
               </PaneButton>
-              <AppSelect
-                isDisabled={!availableBoards.length || busy || deleting}
-                maxMenuHeight={PCB_SELECT_MENU_MAX_HEIGHT}
-                menuShouldScrollIntoView={false}
-                onChange={selectBoardPath}
-                options={boardOptions}
-                placeholder={availableBoards.length ? "Open existing design" : "No saved designs yet"}
-                value={null}
-              />
+              {recentBoards.length ? (
+                <>
+                  <CreateLabel>Recent boards</CreateLabel>
+                  <RecentList>
+                    {recentBoards.map((board) => (
+                      <RecentRow
+                        disabled={busy || deleting}
+                        key={board.path}
+                        onClick={() => selectBoardPath(board.path)}
+                        title={board.path}
+                        type="button"
+                      >
+                        <RecentName>{board.name || board.path}</RecentName>
+                        {formatRelativeTime(board.updatedAtMs) ? (
+                          <RecentMeta>{formatRelativeTime(board.updatedAtMs)}</RecentMeta>
+                        ) : null}
+                      </RecentRow>
+                    ))}
+                  </RecentList>
+                </>
+              ) : null}
+              {availableBoards.length > recentBoards.length ? (
+                <AppSelect
+                  isDisabled={busy || deleting}
+                  maxMenuHeight={PCB_SELECT_MENU_MAX_HEIGHT}
+                  menuShouldScrollIntoView={false}
+                  onChange={selectBoardPath}
+                  options={boardOptions}
+                  placeholder="All designs"
+                  value={null}
+                />
+              ) : null}
               {error ? <PaneError role="alert">{error}</PaneError> : null}
             </EmptyCard>
           </EmptyPane>
@@ -788,8 +955,36 @@ export default function PcbWorkspacePane({
         {creating ? (
           <CreateOverlay>
             <CreateCard as="form" onSubmit={submitCreateBoard}>
-              <EmptyTitle>PCB board</EmptyTitle>
-              <EmptyHint>Create a new board or switch to an existing design.</EmptyHint>
+              <EmptyHeader>
+                <EmptyBadge>
+                  <Memory aria-hidden="true" />
+                </EmptyBadge>
+                <EmptyHeaderText>
+                  <EmptyTitle>PCB board</EmptyTitle>
+                  <EmptyHint>Create a new board or switch to an existing design.</EmptyHint>
+                </EmptyHeaderText>
+              </EmptyHeader>
+              {recentBoards.length ? (
+                <>
+                  <CreateLabel>Recent boards</CreateLabel>
+                  <RecentList>
+                    {recentBoards.map((board) => (
+                      <RecentRow
+                        disabled={busy || deleting}
+                        key={board.path}
+                        onClick={() => selectBoardFromPicker(board.path)}
+                        title={board.path}
+                        type="button"
+                      >
+                        <RecentName>{board.name || board.path}</RecentName>
+                        {formatRelativeTime(board.updatedAtMs) ? (
+                          <RecentMeta>{formatRelativeTime(board.updatedAtMs)}</RecentMeta>
+                        ) : null}
+                      </RecentRow>
+                    ))}
+                  </RecentList>
+                </>
+              ) : null}
               <CreateLabel>Existing boards</CreateLabel>
               <CreatePickerWrap>
                 <AppSelect

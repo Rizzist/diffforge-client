@@ -8,6 +8,7 @@ import { AutoAwesome } from "@styled-icons/material-rounded/AutoAwesome";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { Delete } from "@styled-icons/material-rounded/Delete";
 import { FileDownload } from "@styled-icons/material-rounded/FileDownload";
+import { Movie } from "@styled-icons/material-rounded/Movie";
 import { PermMedia } from "@styled-icons/material-rounded/PermMedia";
 import { SmartToy } from "@styled-icons/material-rounded/SmartToy";
 import AgentActivityPanel from "./AgentActivityPanel.jsx";
@@ -331,24 +332,275 @@ const InstallChip = styled.button`
   }
 `;
 
+// The project menu wears a muted "cutting room" theme for the creator crowd:
+// charcoal-violet backdrop, film-strip sprocket rows, quiet violet accents on
+// the actions. Decoration stays under ~9% opacity so the screen never shouts,
+// and everything gets a light-theme variant since the pane surface flips.
 const MenuScreen = styled.div`
+  position: relative;
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
   display: flex;
   align-items: safe center;
   justify-content: center;
-  padding: 14px;
+  padding: 16px;
+  background:
+    radial-gradient(ellipse at 14% -10%, rgba(139, 92, 246, 0.09), transparent 52%),
+    radial-gradient(ellipse at 88% 114%, rgba(236, 72, 153, 0.05), transparent 55%),
+    #06040c;
+
+  &::before,
+  &::after {
+    content: "";
+    position: absolute;
+    left: 0;
+    right: 0;
+    height: 8px;
+    background: repeating-linear-gradient(
+      90deg,
+      rgba(196, 181, 253, 0.055) 0 12px,
+      transparent 12px 24px
+    );
+    pointer-events: none;
+  }
+
+  &::before {
+    top: 14px;
+  }
+
+  &::after {
+    bottom: 14px;
+  }
+
+  html[data-forge-theme="light"] & {
+    background:
+      radial-gradient(ellipse at 14% -10%, rgba(139, 92, 246, 0.1), transparent 52%),
+      radial-gradient(ellipse at 88% 114%, rgba(236, 72, 153, 0.07), transparent 55%),
+      #eef0f8;
+
+    &::before,
+    &::after {
+      background: repeating-linear-gradient(
+        90deg,
+        rgba(109, 40, 217, 0.07) 0 12px,
+        transparent 12px 24px
+      );
+    }
+  }
+
+  @container video-pane (max-height: 380px) {
+    padding: 10px;
+
+    &::before,
+    &::after {
+      display: none;
+    }
+  }
 `;
 
 const MenuCard = styled(VideoCard)`
-  width: min(420px, 100%);
+  width: min(460px, 100%);
+  gap: 10px;
+  padding: 14px;
+  border-color: rgba(167, 139, 250, 0.16);
+  background: rgba(11, 8, 20, 0.78);
+  box-shadow: 0 18px 44px rgba(0, 0, 0, 0.42);
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(109, 40, 217, 0.16);
+    background: rgba(255, 255, 255, 0.88);
+    box-shadow: 0 18px 44px rgba(76, 29, 149, 0.1);
+  }
+`;
+
+const MenuHeader = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+`;
+
+const MenuHeaderText = styled.div`
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+`;
+
+const MenuBadge = styled.div`
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid rgba(167, 139, 250, 0.32);
+  border-radius: 8px;
+  background: linear-gradient(160deg, rgba(139, 92, 246, 0.22), rgba(139, 92, 246, 0.06));
+  color: #c4b5fd;
+
+  svg {
+    width: 16px;
+    height: 16px;
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(109, 40, 217, 0.28);
+    background: linear-gradient(160deg, rgba(139, 92, 246, 0.16), rgba(139, 92, 246, 0.04));
+    color: #6d28d9;
+  }
 `;
 
 const MenuTitle = styled.div`
   font-size: 13px;
   font-weight: 850;
-  color: #d1fae5;
+  color: #ede9fe;
+
+  html[data-forge-theme="light"] & {
+    color: #312e81;
+  }
+`;
+
+const MenuHint = styled(VideoHint)`
+  html[data-forge-theme="light"] & {
+    color: #64748b;
+  }
+`;
+
+const MenuSectionLabel = styled.div`
+  font-size: 9.5px;
+  font-weight: 850;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: rgba(196, 181, 253, 0.6);
+
+  html[data-forge-theme="light"] & {
+    color: rgba(91, 33, 182, 0.55);
+  }
+`;
+
+const MenuCreateButton = styled(VideoPaneButton)`
+  min-height: 30px;
+  font-size: 12px;
+  border-color: rgba(167, 139, 250, 0.38);
+  background: rgba(139, 92, 246, 0.13);
+  color: #ddd6fe;
+
+  &:hover:not(:disabled) {
+    background: rgba(139, 92, 246, 0.22);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(109, 40, 217, 0.35);
+    background: rgba(139, 92, 246, 0.12);
+    color: #5b21b6;
+
+    &:hover:not(:disabled) {
+      background: rgba(139, 92, 246, 0.2);
+    }
+  }
+`;
+
+const MenuInput = styled(VideoInput)`
+  min-height: 30px;
+  font-size: 12px;
+
+  &:focus {
+    border-color: rgba(167, 139, 250, 0.55);
+    box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.13);
+  }
+
+  html[data-forge-theme="light"] & {
+    color: #1e1b4b;
+    background: rgba(255, 255, 255, 0.9);
+    border-color: rgba(100, 116, 139, 0.35);
+
+    &::placeholder {
+      color: rgba(100, 116, 139, 0.7);
+    }
+  }
+`;
+
+const RecentGrid = styled.div`
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(122px, 1fr));
+  gap: 7px;
+  min-width: 0;
+
+  @container video-pane (max-width: 340px) {
+    grid-template-columns: 1fr;
+  }
+`;
+
+const RecentCard = styled.div`
+  position: relative;
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+  padding: 9px 10px;
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 8px;
+  background: rgba(8, 6, 16, 0.72);
+  cursor: pointer;
+
+  &:hover {
+    border-color: rgba(167, 139, 250, 0.5);
+    background: rgba(139, 92, 246, 0.08);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(100, 116, 139, 0.25);
+    background: rgba(255, 255, 255, 0.75);
+
+    &:hover {
+      border-color: rgba(109, 40, 217, 0.45);
+      background: rgba(139, 92, 246, 0.07);
+    }
+  }
+`;
+
+const RecentCardName = styled.div`
+  min-width: 0;
+  padding-right: 16px;
+  font-size: 11.5px;
+  font-weight: 780;
+  color: rgba(237, 233, 254, 0.94);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+
+  html[data-forge-theme="light"] & {
+    color: #1e1b4b;
+  }
+`;
+
+const RecentCardMeta = styled.div`
+  font-size: 9.5px;
+  font-weight: 650;
+  color: rgba(196, 181, 253, 0.55);
+  white-space: nowrap;
+
+  html[data-forge-theme="light"] & {
+    color: rgba(91, 33, 182, 0.5);
+  }
+`;
+
+const RecentCardDelete = styled(VideoIconButton)`
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 18px;
+  height: 18px;
+  opacity: 0;
+
+  svg {
+    width: 11px;
+    height: 11px;
+  }
+
+  ${RecentCard}:hover &,
+  &:focus-visible {
+    opacity: 1;
+  }
 `;
 
 const ProjectRow = styled.div`
@@ -358,11 +610,20 @@ const ProjectRow = styled.div`
   padding: 7px 9px;
   border: 1px solid rgba(148, 163, 184, 0.13);
   border-radius: 7px;
-  background: rgba(4, 8, 14, 0.6);
+  background: rgba(8, 6, 16, 0.6);
   cursor: pointer;
 
   &:hover {
-    border-color: rgba(16, 185, 129, 0.45);
+    border-color: rgba(167, 139, 250, 0.5);
+  }
+
+  html[data-forge-theme="light"] & {
+    border-color: rgba(100, 116, 139, 0.25);
+    background: rgba(255, 255, 255, 0.75);
+
+    &:hover {
+      border-color: rgba(109, 40, 217, 0.45);
+    }
   }
 `;
 
@@ -375,6 +636,10 @@ const ProjectRowName = styled.span`
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+
+  html[data-forge-theme="light"] & {
+    color: #1e1b4b;
+  }
 `;
 
 const ProjectRowMeta = styled.span`
@@ -388,6 +653,10 @@ const CreateRow = styled.form`
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   gap: 6px;
+
+  @container video-pane (max-width: 300px) {
+    grid-template-columns: 1fr;
+  }
 `;
 
 function formatRelativeTime(ms) {
@@ -497,6 +766,9 @@ export default function VideoWorkspacePane({
   const [selectedAssetPath, setSelectedAssetPath] = useState("");
   const [transcriptAsset, setTranscriptAsset] = useState(null);
   const [generateSeed, setGenerateSeed] = useState(null);
+  // plannedPath → { model, percent } for jobs still running; feeds the
+  // timeline's ghost-clip treatment on placeholder clips.
+  const [generationByPath, setGenerationByPath] = useState({});
   const seedNonceRef = useRef(0);
   const restoredPanelAssetRef = useRef(false);
 
@@ -1584,6 +1856,27 @@ export default function VideoWorkspacePane({
       }
       const payload = event?.payload || {};
       const planned = Array.isArray(payload.plannedPaths) ? payload.plannedPaths.filter(Boolean) : [];
+      // Live ghost-clip telemetry: the timeline dresses placeholder clips
+      // with the job's model + percent while it runs, and drops the entry
+      // the moment the job settles (the real asset takes over on refresh).
+      if (planned.length) {
+        setGenerationByPath((current) => {
+          const next = { ...current };
+          for (const path of planned) {
+            if (payload.done || payload.error) {
+              delete next[path];
+            } else {
+              next[path] = { model: payload.model || "", percent: payload.percent ?? null };
+            }
+          }
+          return next;
+        });
+      }
+      // Success: swap the ghost for the real asset even when the Generate
+      // panel (whose onGenerated normally refreshes) has been closed.
+      if (payload.done && !payload.error && planned.length) {
+        refreshAssets();
+      }
       if (!payload.error || !planned.length) {
         return;
       }
@@ -1634,6 +1927,12 @@ export default function VideoWorkspacePane({
       );
       handleProjectChange(result.project, { transient: false });
       setSelectedClipIds([result.clipId]);
+      // Dress the placeholder as a ghost immediately — the first progress
+      // event may take a beat to arrive with the model + percent.
+      setGenerationByPath((currentMap) => ({
+        ...currentMap,
+        [plannedPath]: currentMap[plannedPath] || { model: "", percent: null },
+      }));
     },
     [currentPlayheadMs, handleProjectChange],
   );
@@ -1952,6 +2251,7 @@ export default function VideoWorkspacePane({
       assetsByPath={assetsByPath}
       canRedo={canRedo}
       canUndo={canUndo}
+      generationByPath={generationByPath}
       onChange={handleProjectChange}
       onRangesChange={setRanges}
       onRedo={redo}
@@ -2011,11 +2311,18 @@ export default function VideoWorkspacePane({
         {view === "menu" || !project ? (
           <MenuScreen>
             <MenuCard>
-              <MenuTitle>Video projects</MenuTitle>
-              <VideoHint>
-                Cut clips, keyframe audio, add titles, generate AI footage, and export — all inside
-                this workspace's media/ folder. Agents can edit the same timeline files.
-              </VideoHint>
+              <MenuHeader>
+                <MenuBadge>
+                  <Movie aria-hidden="true" />
+                </MenuBadge>
+                <MenuHeaderText>
+                  <MenuTitle>Video projects</MenuTitle>
+                  <MenuHint>
+                    Cut clips, keyframe audio, add titles, generate AI footage, and export — all
+                    inside this workspace's media/ folder. Agents can edit the same timeline files.
+                  </MenuHint>
+                </MenuHeaderText>
+              </MenuHeader>
               {tools && !ffmpegReady ? (
                 installBusy ? (
                   <div style={{ display: "grid", gap: 4 }}>
@@ -2024,14 +2331,14 @@ export default function VideoWorkspacePane({
                         style={{ width: `${Math.min(100, Math.max(3, installProgress?.percent || 3))}%` }}
                       />
                     </VideoProgressTrack>
-                    <VideoHint>{installProgress?.message || "Installing ffmpeg…"}</VideoHint>
+                    <MenuHint>{installProgress?.message || "Installing ffmpeg…"}</MenuHint>
                   </div>
                 ) : (
                   <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
-                    <VideoPaneButton onClick={installTools} type="button">
+                    <VideoSecondaryButton onClick={installTools} type="button">
                       Install ffmpeg (~90 MB)
-                    </VideoPaneButton>
-                    <VideoHint>Powers thumbnails, preview metadata, and export.</VideoHint>
+                    </VideoSecondaryButton>
+                    <MenuHint>Powers thumbnails, preview metadata, and export.</MenuHint>
                   </div>
                 )
               ) : null}
@@ -2042,35 +2349,64 @@ export default function VideoWorkspacePane({
                   createProject(draftName);
                 }}
               >
-                <VideoInput
+                <MenuInput
                   aria-label="New project name"
                   onChange={(event) => setDraftName(event.target.value)}
                   placeholder="New project name…"
                   ref={createInputRef}
                   value={draftName}
                 />
-                <VideoPaneButton disabled={!draftName.trim() || !repoPath} type="submit">
+                <MenuCreateButton disabled={!draftName.trim() || !repoPath} type="submit">
                   Create
-                </VideoPaneButton>
+                </MenuCreateButton>
               </CreateRow>
-              {projects.map((entry) => (
-                <ProjectRow key={entry.path} onClick={() => openProject(entry.path)}>
-                  <ProjectRowName>{entry.name}</ProjectRowName>
-                  <ProjectRowMeta>{formatRelativeTime(entry.updatedAtMs)}</ProjectRowMeta>
-                  <VideoIconButton
-                    aria-label={`Delete project ${entry.name}`}
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      deleteProject(entry.path);
-                    }}
-                    title="Delete project"
-                    type="button"
-                  >
-                    <Delete aria-hidden="true" />
-                  </VideoIconButton>
-                </ProjectRow>
-              ))}
-              {!projects.length ? <VideoHint>No projects yet — name one above to start.</VideoHint> : null}
+              {projects.length ? (
+                <>
+                  <MenuSectionLabel>Recent</MenuSectionLabel>
+                  <RecentGrid>
+                    {projects.slice(0, 3).map((entry) => (
+                      <RecentCard key={entry.path} onClick={() => openProject(entry.path)} title={entry.name}>
+                        <RecentCardName>{entry.name}</RecentCardName>
+                        <RecentCardMeta>{formatRelativeTime(entry.updatedAtMs) || "—"}</RecentCardMeta>
+                        <RecentCardDelete
+                          aria-label={`Delete project ${entry.name}`}
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            deleteProject(entry.path);
+                          }}
+                          title="Delete project"
+                          type="button"
+                        >
+                          <Delete aria-hidden="true" />
+                        </RecentCardDelete>
+                      </RecentCard>
+                    ))}
+                  </RecentGrid>
+                </>
+              ) : null}
+              {projects.length > 3 ? (
+                <>
+                  <MenuSectionLabel>All projects</MenuSectionLabel>
+                  {projects.slice(3).map((entry) => (
+                    <ProjectRow key={entry.path} onClick={() => openProject(entry.path)}>
+                      <ProjectRowName>{entry.name}</ProjectRowName>
+                      <ProjectRowMeta>{formatRelativeTime(entry.updatedAtMs)}</ProjectRowMeta>
+                      <VideoIconButton
+                        aria-label={`Delete project ${entry.name}`}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          deleteProject(entry.path);
+                        }}
+                        title="Delete project"
+                        type="button"
+                      >
+                        <Delete aria-hidden="true" />
+                      </VideoIconButton>
+                    </ProjectRow>
+                  ))}
+                </>
+              ) : null}
+              {!projects.length ? <MenuHint>No projects yet — name one above to start.</MenuHint> : null}
               {paneError ? <VideoErrorText>{paneError}</VideoErrorText> : null}
             </MenuCard>
           </MenuScreen>

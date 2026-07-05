@@ -50295,6 +50295,14 @@ export default function App() {
   // Free-plan tier-up moment: once per sign-in, after the startup overlay
   // clears and billing has actually reported a plan.
   const [plusUpsellState, setPlusUpsellState] = useState("idle");
+  // Stable handlers: the overlay is memoized so App-level state churn
+  // (connection/activity events) doesn't re-render its whole subtree.
+  const handlePlusUpsellDismiss = useCallback(() => {
+    setPlusUpsellState("dismissed");
+  }, []);
+  const handlePlusUpsellUpgrade = useCallback(() => {
+    openUrl("https://diffforge.ai/pricing").catch(() => {});
+  }, []);
   useEffect(() => {
     if (authState !== "authenticated") {
       setPlusUpsellState("idle");
@@ -53094,11 +53102,9 @@ export default function App() {
         {plusUpsellState === "shown" && (
           <PlusUpsellOverlay
             isWindowFrameExpanded={isWindowFrameExpanded}
-            onDismiss={() => setPlusUpsellState("dismissed")}
+            onDismiss={handlePlusUpsellDismiss}
             onTitleBarMouseDown={handleTitleBarMouseDown}
-            onUpgrade={() => {
-              openUrl("https://diffforge.ai/pricing").catch(() => {});
-            }}
+            onUpgrade={handlePlusUpsellUpgrade}
             windowPlatform={windowControlPlatform}
           />
         )}

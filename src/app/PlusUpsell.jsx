@@ -1,24 +1,160 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import styled, { keyframes, css } from "styled-components";
 import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
+import { PlanFlame } from "./PlanFlame.jsx";
 
 /*
  * PlusUpsellOverlay — the "battle pass" tier-up shown right after sign-in,
  * BEFORE the app shell is revealed (opaque backdrop, above the startup
  * overlay). Layout rides the golden ratio: a 1.618fr cinematic showcase
  * (emblem, god rays, perk track) beside a 1fr purchase card whose glowing
- * CTA is the single hottest pixel on screen. One canvas drives all
- * particles; every DOM animation is transform/opacity; SFX are synthesized
- * with WebAudio at runtime. The quiet "keep using Free" escape lives on the
- * left edge and the overlay re-arms on every sign-in.
+ * CTA is the single hottest pixel on screen. The overlay sells all three
+ * paid tiers — Plus, Pro, Ultra — with a tier switcher; every scene color
+ * rides per-tier CSS variables and the pricing-page PlanFlame burns along
+ * the bottom in the active tier's palette. One canvas drives all particles;
+ * every DOM animation is transform/opacity; SFX are synthesized with
+ * WebAudio at runtime. The quiet "keep using Free" escape lives on the left
+ * edge and the overlay re-arms on every sign-in.
  */
 
-const TRACK_PERKS = [
-  { glyph: "▣", title: "Native app", sub: "Mac · Win · Linux" },
-  { glyph: "◆", title: "10k credits", sub: "every month" },
-  { glyph: "⌁", title: "4 devices", sub: "personal sync" },
-  { glyph: "▤", title: "10 GB storage", sub: "SQLite + assets" },
-  { glyph: "★", title: "Priority", sub: "support lane" },
+const PERK_TRACK_STEPS = 5;
+
+const PLAN_TIERS = [
+  {
+    key: "plus",
+    label: "Plus",
+    word: "PLUS",
+    heat: "Gold flame pass",
+    passName: "Gold Flame",
+    badge: "Best value",
+    art: "/pricing/forge-plus-gold.webp",
+    price: "$60",
+    credits: 10000,
+    pitch: (
+      <>
+        Three agents. One codebase. <em>Zero chaos.</em>
+      </>
+    ),
+    track: [
+      { glyph: "▣", title: "Native app", sub: "Mac · Win · Linux" },
+      { glyph: "◆", title: "10k credits", sub: "every month" },
+      { glyph: "⌁", title: "4 devices", sub: "personal sync" },
+      { glyph: "▤", title: "10 GB storage", sub: "SQLite + assets" },
+      { glyph: "★", title: "Priority", sub: "support lane" },
+    ],
+    stamps: [
+      "Native desktop license",
+      "Up to 4 synced devices",
+      "10 GB workspace storage",
+      "Priority support lane",
+    ],
+    cta: "Upgrade to Plus",
+    theme: {
+      cream: "255, 236, 189",
+      light: "255, 214, 138",
+      mid: "255, 190, 92",
+      hot: "255, 176, 66",
+      core: "232, 144, 28",
+      deep: "185, 120, 24",
+      accent: "#ffd166",
+      ink: "#2a1602",
+      price: "#fff6df",
+      floor: "120, 58, 8",
+      corner: "96, 62, 12",
+      baseBottom: "#0a0602",
+      ember: [[255, 236, 189], [255, 186, 84], [255, 122, 24]],
+    },
+  },
+  {
+    key: "pro",
+    label: "Pro",
+    word: "PRO",
+    heat: "Platinum flame pass",
+    passName: "Platinum Flame",
+    badge: "Most popular",
+    art: "/pricing/forge-pro-platinum.webp",
+    price: "$400",
+    credits: 30000,
+    pitch: (
+      <>
+        Fifteen devices. One forge. <em>Platinum heat.</em>
+      </>
+    ),
+    track: [
+      { glyph: "▣", title: "Native app", sub: "Mac · Win · Linux" },
+      { glyph: "◆", title: "30k credits", sub: "every month" },
+      { glyph: "⌁", title: "15 devices", sub: "workstation mix" },
+      { glyph: "▤", title: "50 GB storage", sub: "SQLite + assets" },
+      { glyph: "✦", title: "1 team", sub: "dedicated · soon" },
+    ],
+    stamps: [
+      "Native desktop license",
+      "Up to 15 synced devices",
+      "50 GB workspace storage",
+      "1 dedicated team · coming soon",
+    ],
+    cta: "Upgrade to Pro",
+    theme: {
+      cream: "240, 247, 255",
+      light: "205, 227, 250",
+      mid: "148, 197, 244",
+      hot: "108, 168, 238",
+      core: "66, 128, 216",
+      deep: "42, 94, 170",
+      accent: "#cfe6ff",
+      ink: "#08182e",
+      price: "#f3faff",
+      floor: "10, 44, 96",
+      corner: "16, 50, 96",
+      baseBottom: "#020610",
+      ember: [[236, 246, 255], [148, 203, 255], [36, 108, 255]],
+    },
+  },
+  {
+    key: "ultra",
+    label: "Ultra",
+    word: "ULTRA",
+    heat: "Ultra flame pass",
+    passName: "Ultra Flame",
+    badge: "Max heat",
+    art: "/pricing/forge-ultra-violet.webp",
+    price: "$2,000",
+    credits: 100000,
+    pitch: (
+      <>
+        One hundred thousand credits. <em>Zero limits.</em>
+      </>
+    ),
+    track: [
+      { glyph: "▣", title: "Native app", sub: "Mac · Win · Linux" },
+      { glyph: "◆", title: "100k credits", sub: "every month" },
+      { glyph: "⌁", title: "50 devices", sub: "lab scale" },
+      { glyph: "▤", title: "250 GB storage", sub: "SQLite + assets" },
+      { glyph: "✦", title: "3 teams", sub: "dedicated · soon" },
+    ],
+    stamps: [
+      "Native desktop license",
+      "Up to 50 synced devices",
+      "250 GB workspace storage",
+      "3 dedicated teams · coming soon",
+    ],
+    cta: "Upgrade to Ultra",
+    theme: {
+      cream: "233, 224, 255",
+      light: "199, 178, 255",
+      mid: "158, 118, 255",
+      hot: "132, 88, 250",
+      core: "104, 58, 232",
+      deep: "74, 40, 164",
+      accent: "#c4b5fd",
+      ink: "#1c0836",
+      price: "#f5f0ff",
+      floor: "56, 18, 110",
+      corner: "60, 24, 116",
+      baseBottom: "#070312",
+      ember: [[240, 232, 255], [178, 130, 255], [122, 42, 255]],
+    },
+  },
 ];
 
 /* ------------------------------------------------------------- audio */
@@ -144,6 +280,61 @@ function createSfx() {
         osc.stop(t0 + 0.1);
       });
     },
+    /* soft flame lick for tier switches: warm noise swell + ember crackle +
+       low glow. level 0..1 scales the body (light/low/strong per tier) —
+       gentle by design so switching never feels like a punishment. */
+    flameShift(level = 0.6) {
+      play((audio, t0) => {
+        // warm body: lowpass noise swelling up then settling back down
+        const body = audio.createBufferSource();
+        body.buffer = noiseBuffer(audio, 0.55);
+        const bodyFilter = audio.createBiquadFilter();
+        bodyFilter.type = "lowpass";
+        bodyFilter.Q.value = 0.7;
+        bodyFilter.frequency.setValueAtTime(240, t0);
+        bodyFilter.frequency.exponentialRampToValueAtTime(900 + level * 900, t0 + 0.16);
+        bodyFilter.frequency.exponentialRampToValueAtTime(260, t0 + 0.5);
+        const bodyGain = audio.createGain();
+        bodyGain.gain.setValueAtTime(0.0001, t0);
+        bodyGain.gain.exponentialRampToValueAtTime(0.05 + level * 0.05, t0 + 0.09);
+        bodyGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.52);
+        body.connect(bodyFilter).connect(bodyGain).connect(audio.destination);
+        body.start(t0);
+        body.stop(t0 + 0.55);
+
+        // ember crackle: a few tiny bandpass pops scattered across the lick
+        const crackles = 3 + Math.round(level * 3);
+        for (let i = 0; i < crackles; i += 1) {
+          const at = t0 + 0.05 + Math.random() * 0.3;
+          const pop = audio.createBufferSource();
+          pop.buffer = noiseBuffer(audio, 0.05);
+          const popFilter = audio.createBiquadFilter();
+          popFilter.type = "bandpass";
+          popFilter.Q.value = 3.2;
+          popFilter.frequency.value = 1600 + Math.random() * 2600;
+          const popGain = audio.createGain();
+          popGain.gain.setValueAtTime(0.0001, at);
+          popGain.gain.exponentialRampToValueAtTime(0.02 + level * 0.025, at + 0.006);
+          popGain.gain.exponentialRampToValueAtTime(0.0001, at + 0.045);
+          pop.connect(popFilter).connect(popGain).connect(audio.destination);
+          pop.start(at);
+          pop.stop(at + 0.06);
+        }
+
+        // low warm glow underneath, a touch stronger for hotter tiers
+        const glow = audio.createOscillator();
+        glow.type = "sine";
+        glow.frequency.setValueAtTime(120, t0);
+        glow.frequency.exponentialRampToValueAtTime(58, t0 + 0.4);
+        const glowGain = audio.createGain();
+        glowGain.gain.setValueAtTime(0.0001, t0);
+        glowGain.gain.exponentialRampToValueAtTime(0.02 + level * 0.05, t0 + 0.08);
+        glowGain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.45);
+        glow.connect(glowGain).connect(audio.destination);
+        glow.start(t0);
+        glow.stop(t0 + 0.5);
+      });
+    },
     flare() {
       play((audio, t0) => {
         const src = audio.createBufferSource();
@@ -211,7 +402,13 @@ function createSfx() {
 function createEmberEngine(canvas, prefersReducedMotion) {
   const context = canvas.getContext("2d");
   if (!context || prefersReducedMotion) {
-    return { burst: () => {}, ringBurst: () => {}, setCtaRect: () => {}, destroy: () => {} };
+    return {
+      burst: () => {},
+      ringBurst: () => {},
+      setCtaRect: () => {},
+      setPalette: () => {},
+      destroy: () => {},
+    };
   }
 
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
@@ -219,12 +416,16 @@ function createEmberEngine(canvas, prefersReducedMotion) {
   sprite.width = 32;
   sprite.height = 32;
   const spriteCtx = sprite.getContext("2d");
-  const spriteGradient = spriteCtx.createRadialGradient(16, 16, 0, 16, 16, 16);
-  spriteGradient.addColorStop(0, "rgba(255, 236, 189, 1)");
-  spriteGradient.addColorStop(0.35, "rgba(255, 186, 84, 0.85)");
-  spriteGradient.addColorStop(1, "rgba(255, 122, 24, 0)");
-  spriteCtx.fillStyle = spriteGradient;
-  spriteCtx.fillRect(0, 0, 32, 32);
+  const paintSprite = (palette) => {
+    spriteCtx.clearRect(0, 0, 32, 32);
+    const spriteGradient = spriteCtx.createRadialGradient(16, 16, 0, 16, 16, 16);
+    spriteGradient.addColorStop(0, `rgba(${palette[0].join(", ")}, 1)`);
+    spriteGradient.addColorStop(0.35, `rgba(${palette[1].join(", ")}, 0.85)`);
+    spriteGradient.addColorStop(1, `rgba(${palette[2].join(", ")}, 0)`);
+    spriteCtx.fillStyle = spriteGradient;
+    spriteCtx.fillRect(0, 0, 32, 32);
+  };
+  paintSprite(PLAN_TIERS[0].theme.ember);
 
   const MAX_PARTICLES = 170;
   const particles = [];
@@ -401,6 +602,10 @@ function createEmberEngine(canvas, prefersReducedMotion) {
       ctaRect = rect;
       ctaRate = rate;
     },
+    /* retint the shared ember sprite to the active tier's palette */
+    setPalette(palette) {
+      if (Array.isArray(palette) && palette.length === 3) paintSprite(palette);
+    },
     destroy() {
       destroyed = true;
       stopFrame();
@@ -412,7 +617,10 @@ function createEmberEngine(canvas, prefersReducedMotion) {
 
 /* ---------------------------------------------------------- component */
 
-export function PlusUpsellOverlay({
+// memo: App re-renders constantly on connection/activity events; with stable
+// handler props from AppShell this keeps the overlay subtree (1,200+ fibers of
+// styled-components) out of every App commit.
+export const PlusUpsellOverlay = memo(function PlusUpsellOverlay({
   onDismiss,
   onUpgrade,
   onTitleBarMouseDown,
@@ -427,6 +635,8 @@ export function PlusUpsellOverlay({
   const [creditCount, setCreditCount] = useState(0);
   const [tilesLanded, setTilesLanded] = useState(0);
   const [runId, setRunId] = useState(0);
+  const [planIndex, setPlanIndex] = useState(0);
+  const [switchDir, setSwitchDir] = useState("");
 
   const canvasRef = useRef(null);
   const engineRef = useRef(null);
@@ -435,6 +645,11 @@ export function PlusUpsellOverlay({
   const scrollerRef = useRef(null);
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
+  const planIndexRef = useRef(planIndex);
+  planIndexRef.current = planIndex;
+
+  const activeTier = PLAN_TIERS[planIndex];
+  const theme = activeTier.theme;
 
   const prefersReducedMotion = useMemo(
     () => typeof window !== "undefined"
@@ -513,12 +728,12 @@ export function PlusUpsellOverlay({
       }
     });
     at(1040, () => setPhase(2));
-    TRACK_PERKS.forEach((_, index) => {
+    for (let index = 0; index < PERK_TRACK_STEPS; index += 1) {
       at(1100 + index * 95, () => {
         sound("tick", index);
         setTilesLanded(index + 1);
       });
-    });
+    }
     at(1560, () => {
       setPhase(3);
       sound("whoosh", true);
@@ -527,21 +742,23 @@ export function PlusUpsellOverlay({
     return () => timers.forEach((timer) => window.clearTimeout(timer));
   }, [emblemCanvasPoint, sound, runId]);
 
-  // credits odometer once the purchase card is in
+  // credits odometer once the purchase card is in (re-runs per tier switch)
   useEffect(() => {
     if (phase < 3) return undefined;
+    const target = activeTier.credits;
     const started = performance.now();
     let raf = 0;
     const tickUp = (now) => {
       const t = Math.min(1, (now - started) / 950);
-      setCreditCount(Math.round((1 - (1 - t) ** 3) * 10000));
+      setCreditCount(Math.round((1 - (1 - t) ** 3) * target));
       if (t < 1) raf = requestAnimationFrame(tickUp);
     };
     raf = requestAnimationFrame(tickUp);
     return () => cancelAnimationFrame(raf);
-  }, [phase >= 3]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [phase >= 3, activeTier.credits]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // pin the ember emitter to the CTA once armed
+  // pin the ember emitter to the CTA once armed (and re-pin per tier switch —
+  // the purchase card remounts, so the CTA node is new)
   useEffect(() => {
     if (phase < 3) return undefined;
     const sync = () => syncCtaEmitter(12);
@@ -554,7 +771,31 @@ export function PlusUpsellOverlay({
       window.removeEventListener("resize", sync);
       scroller?.removeEventListener("scroll", sync);
     };
-  }, [phase >= 3, syncCtaEmitter]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [phase >= 3, planIndex, syncCtaEmitter]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // retint the ember sprite whenever the tier changes
+  useEffect(() => {
+    engineRef.current?.setPalette(theme.ember);
+  }, [theme]);
+
+  const switchTier = useCallback((nextIndex) => {
+    const clamped = Math.max(0, Math.min(PLAN_TIERS.length - 1, nextIndex));
+    if (clamped === planIndexRef.current || leaving) return;
+    setSwitchDir(clamped > planIndexRef.current ? "up" : "down");
+    setCreditCount(0);
+    setPlanIndex(clamped);
+    // gentle flame lick, not the intro slam — light for Plus, low for Pro,
+    // strong for Ultra
+    sound("flameShift", [0.35, 0.65, 1][clamped] ?? 0.6);
+    // burst once the remounted emblem has landed
+    window.setTimeout(() => {
+      const point = emblemCanvasPoint();
+      if (point && engineRef.current) {
+        engineRef.current.burst(point.x, point.y, 46);
+        engineRef.current.ringBurst(point.x, point.y, 24, 96);
+      }
+    }, 220);
+  }, [emblemCanvasPoint, leaving, sound]);
 
   const handleUpgrade = useCallback(() => {
     sound("stinger");
@@ -569,8 +810,8 @@ export function PlusUpsellOverlay({
         80,
       );
     }
-    onUpgrade();
-  }, [onUpgrade, sound]);
+    onUpgrade(activeTier.key);
+  }, [activeTier.key, onUpgrade, sound]);
 
   const handleDismiss = useCallback(() => {
     if (leaving) return;
@@ -589,6 +830,7 @@ export function PlusUpsellOverlay({
     setPhase(0);
     setTilesLanded(0);
     setCreditCount(0);
+    setSwitchDir("");
     engineRef.current?.setCtaRect(null, 0);
     scrollerRef.current?.scrollTo({ top: 0 });
     setRunId((current) => current + 1);
@@ -597,25 +839,51 @@ export function PlusUpsellOverlay({
   useEffect(() => {
     const onKey = (event) => {
       if (event.key === "Escape") handleDismiss();
+      if (event.key === "ArrowRight") switchTier(planIndexRef.current + 1);
+      if (event.key === "ArrowLeft") switchTier(planIndexRef.current - 1);
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [handleDismiss]);
+  }, [handleDismiss, switchTier]);
+
+  const themeVars = {
+    "--up-cream": theme.cream,
+    "--up-light": theme.light,
+    "--up-mid": theme.mid,
+    "--up-hot": theme.hot,
+    "--up-core": theme.core,
+    "--up-deep": theme.deep,
+    "--up-accent": theme.accent,
+    "--up-ink": theme.ink,
+    "--up-price": theme.price,
+    "--up-floor": theme.floor,
+    "--up-corner": theme.corner,
+    "--up-base-bottom": theme.baseBottom,
+  };
 
   return (
     <Backdrop
-      aria-label="Upgrade to Diff Forge Plus"
+      aria-label="Upgrade your Diff Forge plan"
       data-leaving={leaving}
       data-window-expanded={isWindowFrameExpanded ? "true" : "false"}
       data-window-platform={windowPlatform}
       role="dialog"
+      style={themeVars}
     >
       <GodRays aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
       <Streak aria-hidden="true" data-lane="high" key={`streak-high-${runId}`} />
       <Streak aria-hidden="true" data-lane="low" key={`streak-low-${runId}`} />
-      <ImpactFlash aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+      <ImpactFlash
+        aria-hidden="true"
+        data-landed={phase >= 1 ? "true" : undefined}
+        key={`flash-${runId}-${activeTier.key}`}
+      />
       <Vignette aria-hidden="true" />
       <EmberCanvas aria-hidden="true" ref={canvasRef} />
+
+      {/* pricing-page shader flame burning in the active tier's palette;
+          PlanFlame crossfades between tier presets on its own */}
+      <PlanFlame active={!leaving} plan={activeTier.key} showControls={false} />
 
       {/* frameless window: keep a draggable strip along the top edge */}
       <DragStrip
@@ -634,53 +902,96 @@ export function PlusUpsellOverlay({
             <i />
           </TierKicker>
 
-          <EmblemBlock>
-            <Emblem data-landed={phase >= 1 ? "true" : undefined} ref={emblemRef}>
-              <EmblemRing aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
-              <EmblemRing aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} data-late="true" />
-              <EmblemArt alt="" draggable={false} src="/pricing/forge-plus-gold.webp" />
-              <EmblemWord>PLUS</EmblemWord>
-              <EmblemHeat>Gold flame pass</EmblemHeat>
-            </Emblem>
-            <FloorGlow aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
-            <HorizonLine aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
-          </EmblemBlock>
+          {/* tier switcher: arrows + one pill per paid plan */}
+          <TierNav aria-label="Choose your plan" data-visible={phase >= 2 ? "true" : undefined}>
+            <TierArrow
+              aria-label="Previous plan"
+              disabled={planIndex === 0}
+              onClick={() => switchTier(planIndex - 1)}
+              type="button"
+            >
+              <svg fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.4" viewBox="0 0 24 24">
+                <polyline points="15 18 9 12 15 6" />
+              </svg>
+            </TierArrow>
+            <TierPills>
+              {PLAN_TIERS.map((tier, index) => (
+                <TierPill
+                  aria-pressed={index === planIndex}
+                  data-active={index === planIndex ? "true" : undefined}
+                  data-tier={tier.key}
+                  key={tier.key}
+                  onClick={() => switchTier(index)}
+                  type="button"
+                >
+                  <i aria-hidden="true" />
+                  {tier.label}
+                </TierPill>
+              ))}
+            </TierPills>
+            <TierArrow
+              aria-label="Next plan"
+              data-more={planIndex < PLAN_TIERS.length - 1 ? "true" : undefined}
+              disabled={planIndex === PLAN_TIERS.length - 1}
+              onClick={() => switchTier(planIndex + 1)}
+              type="button"
+            >
+              <svg fill="none" stroke="currentColor" strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.4" viewBox="0 0 24 24">
+                <polyline points="9 18 15 12 9 6" />
+              </svg>
+            </TierArrow>
+          </TierNav>
 
-          <Pitch data-visible={phase >= 2 ? "true" : undefined}>
-            Three agents. One codebase. <em>Zero chaos.</em>
-          </Pitch>
+          {/* keyed swap: remounting replays the slam/rings for the new tier */}
+          <TierSwap data-dir={switchDir || undefined} key={`swap-${activeTier.key}`}>
+            <EmblemBlock>
+              <Emblem data-landed={phase >= 1 ? "true" : undefined} ref={emblemRef}>
+                <EmblemRing aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+                <EmblemRing aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} data-late="true" />
+                <EmblemArt alt="" draggable={false} src={activeTier.art} />
+                <EmblemWord>{activeTier.word}</EmblemWord>
+                <EmblemHeat>{activeTier.heat}</EmblemHeat>
+              </Emblem>
+              <FloorGlow aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+              <HorizonLine aria-hidden="true" data-landed={phase >= 1 ? "true" : undefined} />
+            </EmblemBlock>
 
-          {/* battle-pass reward track */}
-          <PerkTrack aria-label="Plus plan benefits" data-visible={phase >= 2 ? "true" : undefined}>
-            <PerkRail aria-hidden="true">
-              <i style={{ transform: `scaleX(${tilesLanded / TRACK_PERKS.length})` }} />
-            </PerkRail>
-            {TRACK_PERKS.map((perk, index) => (
-              <PerkTile
-                data-landed={tilesLanded > index ? "true" : undefined}
-                key={perk.title}
-                style={{ "--tile-index": index }}
-              >
-                <PerkGlyph aria-hidden="true">
-                  <b>{perk.glyph}</b>
-                </PerkGlyph>
-                <strong>{perk.title}</strong>
-                <span>{perk.sub}</span>
-              </PerkTile>
-            ))}
-          </PerkTrack>
+            <Pitch data-visible={phase >= 2 ? "true" : undefined}>
+              {activeTier.pitch}
+            </Pitch>
+
+            {/* battle-pass reward track */}
+            <PerkTrack aria-label={`${activeTier.label} plan benefits`} data-visible={phase >= 2 ? "true" : undefined}>
+              <PerkRail aria-hidden="true">
+                <i style={{ transform: `scaleX(${tilesLanded / PERK_TRACK_STEPS})` }} />
+              </PerkRail>
+              {activeTier.track.map((perk, index) => (
+                <PerkTile
+                  data-landed={tilesLanded > index ? "true" : undefined}
+                  key={perk.title}
+                  style={{ "--tile-index": index }}
+                >
+                  <PerkGlyph aria-hidden="true">
+                    <b>{perk.glyph}</b>
+                  </PerkGlyph>
+                  <strong>{perk.title}</strong>
+                  <span>{perk.sub}</span>
+                </PerkTile>
+              ))}
+            </PerkTrack>
+          </TierSwap>
         </Showcase>
 
         {/* ------------------------------------------- purchase card (1) */}
-        <PurchaseCard data-armed={phase >= 3 ? "true" : undefined}>
-          <ValueBadge aria-hidden="true">Best value</ValueBadge>
+        <PurchaseCard data-armed={phase >= 3 ? "true" : undefined} key={`card-${activeTier.key}`}>
+          <ValueBadge aria-hidden="true">{activeTier.badge}</ValueBadge>
           <PurchaseHeader>
             <span>AI Access Pass</span>
-            <strong>Gold Flame</strong>
+            <strong>{activeTier.passName}</strong>
           </PurchaseHeader>
 
-          <PriceRow>
-            <b>$60</b>
+          <PriceRow data-compact={activeTier.price.length > 4 ? "true" : undefined}>
+            <b>{activeTier.price}</b>
             <span>
               per month
               <br />
@@ -694,27 +1005,17 @@ export function PlusUpsellOverlay({
               <span>credits / month</span>
             </div>
             <MeterTrack aria-hidden="true">
-              <i style={{ transform: `scaleX(${creditCount / 10000})` }} />
+              <i style={{ transform: `scaleX(${creditCount / activeTier.credits})` }} />
             </MeterTrack>
           </CreditsMeter>
 
           <StampList>
-            <li>
-              <i />
-              Native desktop license
-            </li>
-            <li>
-              <i />
-              Up to 4 synced devices
-            </li>
-            <li>
-              <i />
-              10 GB workspace storage
-            </li>
-            <li>
-              <i />
-              Priority support lane
-            </li>
+            {activeTier.stamps.map((stamp) => (
+              <li key={stamp}>
+                <i />
+                {stamp}
+              </li>
+            ))}
           </StampList>
 
           <CtaWrap>
@@ -729,7 +1030,7 @@ export function PlusUpsellOverlay({
               ref={ctaRef}
               type="button"
             >
-              Upgrade to Plus
+              {activeTier.cta}
             </CtaButton>
           </CtaWrap>
           <CtaHint>Instant activation · billed monthly</CtaHint>
@@ -778,7 +1079,7 @@ export function PlusUpsellOverlay({
       </SideRail>
     </Backdrop>
   );
-}
+});
 
 /* ------------------------------------------------------------- styles */
 
@@ -882,6 +1183,21 @@ const wordGlow = keyframes`
   50% { opacity: 0.82; transform: scale(1.08); }
 `;
 
+const swapInFromRight = keyframes`
+  from { opacity: 0; transform: translateX(52px) scale(0.98); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+`;
+
+const swapInFromLeft = keyframes`
+  from { opacity: 0; transform: translateX(-52px) scale(0.98); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+`;
+
+const arrowBeckon = keyframes`
+  0%, 100% { transform: translateX(0); opacity: 0.8; }
+  50% { transform: translateX(3px); opacity: 1; }
+`;
+
 const reducedMotion = css`
   @media (prefers-reduced-motion: reduce) {
     animation: none !important;
@@ -898,10 +1214,10 @@ const Backdrop = styled.div`
   overflow: hidden;
   /* fully opaque — the app shell stays hidden until this resolves */
   background:
-    radial-gradient(ellipse at 50% 120%, rgba(120, 58, 8, 0.5), transparent 56%),
-    radial-gradient(ellipse at 84% -14%, rgba(96, 62, 12, 0.34), transparent 46%),
+    radial-gradient(ellipse at 50% 120%, rgba(var(--up-floor), 0.5), transparent 56%),
+    radial-gradient(ellipse at 84% -14%, rgba(var(--up-corner), 0.34), transparent 46%),
     radial-gradient(ellipse at 10% 6%, rgba(16, 38, 82, 0.4), transparent 44%),
-    linear-gradient(180deg, #05060a 0%, #030405 58%, #0a0602 100%);
+    linear-gradient(180deg, #05060a 0%, #030405 58%, var(--up-base-bottom) 100%);
   animation: ${backdropIn} 320ms ease both;
   transition: opacity 260ms ease;
   ${reducedMotion};
@@ -946,15 +1262,15 @@ const GodRays = styled.div`
   background: conic-gradient(
     from 0deg,
     transparent 0deg 22deg,
-    rgba(255, 190, 92, 0.05) 26deg 34deg,
+    rgba(var(--up-mid), 0.05) 26deg 34deg,
     transparent 38deg 82deg,
-    rgba(255, 190, 92, 0.04) 88deg 96deg,
+    rgba(var(--up-mid), 0.04) 88deg 96deg,
     transparent 100deg 150deg,
-    rgba(255, 214, 138, 0.06) 156deg 165deg,
+    rgba(var(--up-light), 0.06) 156deg 165deg,
     transparent 170deg 222deg,
-    rgba(255, 190, 92, 0.045) 228deg 238deg,
+    rgba(var(--up-mid), 0.045) 228deg 238deg,
     transparent 242deg 294deg,
-    rgba(255, 214, 138, 0.05) 300deg 310deg,
+    rgba(var(--up-light), 0.05) 300deg 310deg,
     transparent 314deg 360deg
   );
   mask-image: radial-gradient(circle at 50% 50%, #000 0%, transparent 62%);
@@ -977,7 +1293,7 @@ const Streak = styled.div`
   left: -30%;
   width: 46%;
   height: 2px;
-  background: linear-gradient(90deg, transparent, rgba(255, 224, 158, 0.5), transparent);
+  background: linear-gradient(90deg, transparent, rgba(var(--up-cream), 0.5), transparent);
   pointer-events: none;
   will-change: transform;
   animation: ${streakSweep} 1.05s cubic-bezier(0.3, 0, 0.2, 1) both;
@@ -1000,7 +1316,7 @@ const Streak = styled.div`
 const ImpactFlash = styled.div`
   position: absolute;
   inset: 0;
-  background: radial-gradient(ellipse at 38% 42%, rgba(255, 236, 200, 0.9), rgba(255, 190, 92, 0.3) 40%, transparent 70%);
+  background: radial-gradient(ellipse at 38% 42%, rgba(var(--up-cream), 0.9), rgba(var(--up-mid), 0.3) 40%, transparent 70%);
   opacity: 0;
   pointer-events: none;
 
@@ -1030,7 +1346,7 @@ const StageScroller = styled.div`
   overscroll-behavior: contain;
   padding: clamp(40px, 6vh, 60px) clamp(20px, 2.6vw, 48px) clamp(22px, 4.5vh, 48px) 72px;
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 209, 102, 0.25) transparent;
+  scrollbar-color: rgba(var(--up-mid), 0.25) transparent;
 `;
 
 /* golden-ratio stage: showcase φ · purchase card 1 */
@@ -1066,12 +1382,30 @@ const Showcase = styled.div`
   text-align: center;
 `;
 
+/* keyed wrapper so a tier switch remounts (and re-slams) the showcase */
+const TierSwap = styled.div`
+  display: grid;
+  justify-items: center;
+  gap: clamp(10px, 2.4vh, 20px);
+  width: 100%;
+  text-align: center;
+
+  &[data-dir="up"] {
+    animation: ${swapInFromRight} 340ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+
+  &[data-dir="down"] {
+    animation: ${swapInFromLeft} 340ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+  }
+  ${reducedMotion};
+`;
+
 const TierKicker = styled.p`
   display: inline-flex;
   align-items: center;
   gap: 16px;
   margin: 0;
-  color: rgba(255, 214, 138, 0.88);
+  color: rgba(var(--up-light), 0.88);
   font-size: 12.5px;
   font-weight: 900;
   letter-spacing: 0.34em;
@@ -1082,11 +1416,149 @@ const TierKicker = styled.p`
   i {
     width: 52px;
     height: 1px;
-    background: linear-gradient(90deg, transparent, rgba(255, 214, 138, 0.55));
+    background: linear-gradient(90deg, transparent, rgba(var(--up-light), 0.55));
   }
 
   i:last-child {
     transform: scaleX(-1);
+  }
+`;
+
+/* --------------------------------------------------- tier switcher */
+
+const TierNav = styled.div`
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  opacity: 0;
+  transform: translateY(8px);
+  transition: opacity 420ms ease, transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  &[data-visible="true"] {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  ${reducedMotion};
+`;
+
+const TierPills = styled.div`
+  display: inline-flex;
+  gap: 4px;
+  padding: 4px;
+  border: 1px solid rgba(var(--up-mid), 0.26);
+  border-radius: 999px;
+  background: rgba(6, 6, 8, 0.72);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.07),
+    0 10px 30px rgba(0, 0, 0, 0.4);
+`;
+
+const TierPill = styled.button`
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 30px;
+  padding: 0 14px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  color: rgba(226, 232, 240, 0.62);
+  background: transparent;
+  cursor: pointer;
+  font-size: 11.5px;
+  font-weight: 900;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  transition: color 160ms ease, background 160ms ease, border-color 160ms ease, box-shadow 160ms ease;
+
+  i {
+    width: 7px;
+    height: 7px;
+    border-radius: 999px;
+    opacity: 0.55;
+    transition: opacity 160ms ease, box-shadow 160ms ease;
+  }
+
+  /* each pill keeps its own tier flame color so bigger plans read at a glance */
+  &[data-tier="plus"] i {
+    background: #ffc247;
+  }
+
+  &[data-tier="pro"] i {
+    background: #dcedff;
+  }
+
+  &[data-tier="ultra"] i {
+    background: #8d6bff;
+  }
+
+  &[data-active="true"] {
+    color: #ffffff;
+    border-color: rgba(var(--up-mid), 0.55);
+    background: rgba(var(--up-mid), 0.16);
+    box-shadow:
+      0 0 22px rgba(var(--up-hot), 0.3),
+      inset 0 1px 0 rgba(255, 255, 255, 0.14);
+  }
+
+  &[data-active="true"][data-tier="plus"] i {
+    opacity: 1;
+    box-shadow: 0 0 10px rgba(255, 194, 71, 0.9);
+  }
+
+  &[data-active="true"][data-tier="pro"] i {
+    opacity: 1;
+    box-shadow: 0 0 10px rgba(220, 237, 255, 0.9);
+  }
+
+  &[data-active="true"][data-tier="ultra"] i {
+    opacity: 1;
+    box-shadow: 0 0 10px rgba(141, 107, 255, 0.9);
+  }
+
+  &:hover {
+    color: #ffffff;
+  }
+
+  &:focus-visible {
+    outline: 2px solid rgba(var(--up-mid), 0.8);
+    outline-offset: 2px;
+  }
+`;
+
+const TierArrow = styled.button`
+  display: grid;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border: 1px solid rgba(var(--up-mid), 0.3);
+  border-radius: 999px;
+  color: rgba(var(--up-cream), 0.85);
+  background: rgba(6, 6, 8, 0.72);
+  cursor: pointer;
+  transition: color 140ms ease, border-color 140ms ease, box-shadow 140ms ease, opacity 140ms ease;
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  /* beckon toward the bigger plan so people know there's more above */
+  &[data-more="true"] svg {
+    animation: ${arrowBeckon} 1.6s ease-in-out infinite;
+  }
+  ${reducedMotion};
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.28;
+  }
+
+  &:not(:disabled):hover,
+  &:not(:disabled):focus-visible {
+    outline: none;
+    color: #ffffff;
+    border-color: rgba(var(--up-mid), 0.7);
+    box-shadow: 0 0 18px rgba(var(--up-hot), 0.35);
   }
 `;
 
@@ -1125,7 +1597,7 @@ const EmblemRing = styled.i`
   left: calc(50% - 110px);
   width: 220px;
   height: 220px;
-  border: 2px solid rgba(255, 208, 126, 0.8);
+  border: 2px solid rgba(var(--up-light), 0.8);
   border-radius: 50%;
   opacity: 0;
   pointer-events: none;
@@ -1136,7 +1608,7 @@ const EmblemRing = styled.i`
 
   &[data-late="true"] {
     border-width: 1px;
-    border-color: rgba(255, 236, 189, 0.6);
+    border-color: rgba(var(--up-cream), 0.6);
   }
 
   &[data-landed="true"][data-late="true"] {
@@ -1155,7 +1627,7 @@ const EmblemArt = styled.img`
   -webkit-mask-image: radial-gradient(circle at 50% 47%, #000 52%, transparent 72%);
   filter:
     drop-shadow(0 16px 38px rgba(0, 0, 0, 0.62))
-    drop-shadow(0 0 34px rgba(255, 170, 60, 0.36));
+    drop-shadow(0 0 34px rgba(var(--up-hot), 0.36));
   user-select: none;
   -webkit-user-drag: none;
 `;
@@ -1163,7 +1635,7 @@ const EmblemArt = styled.img`
 const EmblemWord = styled.strong`
   position: relative;
   margin-top: -10px;
-  background: linear-gradient(180deg, #ffe9bd 8%, #ffc963 38%, #b97818 62%, #ffdf9c 88%);
+  background: linear-gradient(180deg, rgb(var(--up-cream)) 8%, rgb(var(--up-light)) 38%, rgb(var(--up-deep)) 62%, rgb(var(--up-light)) 88%);
   background-clip: text;
   -webkit-background-clip: text;
   color: transparent;
@@ -1181,7 +1653,7 @@ const EmblemWord = styled.strong`
     z-index: -1;
     border-radius: 999px;
     background:
-      radial-gradient(ellipse at 50% 50%, rgba(255, 190, 92, 0.78), rgba(255, 190, 92, 0.18) 42%, transparent 72%);
+      radial-gradient(ellipse at 50% 50%, rgba(var(--up-mid), 0.78), rgba(var(--up-mid), 0.18) 42%, transparent 72%);
     filter: blur(14px);
     opacity: 0.42;
     transform: scale(0.96);
@@ -1198,7 +1670,7 @@ const EmblemWord = styled.strong`
 `;
 
 const EmblemHeat = styled.span`
-  color: rgba(255, 214, 138, 0.62);
+  color: rgba(var(--up-light), 0.62);
   font-size: 11px;
   font-weight: 900;
   letter-spacing: 0.44em;
@@ -1212,7 +1684,7 @@ const FloorGlow = styled.i`
   width: 74%;
   height: 34px;
   margin-left: -37%;
-  background: radial-gradient(ellipse at 50% 100%, rgba(255, 176, 66, 0.3), transparent 68%);
+  background: radial-gradient(ellipse at 50% 100%, rgba(var(--up-hot), 0.3), transparent 68%);
   opacity: 0;
   pointer-events: none;
   transform-origin: 50% 100%;
@@ -1229,7 +1701,7 @@ const HorizonLine = styled.i`
   left: 6%;
   width: 88%;
   height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(255, 208, 126, 0.65) 30%, rgba(255, 236, 189, 0.9) 50%, rgba(255, 208, 126, 0.65) 70%, transparent);
+  background: linear-gradient(90deg, transparent, rgba(var(--up-light), 0.65) 30%, rgba(var(--up-cream), 0.9) 50%, rgba(var(--up-light), 0.65) 70%, transparent);
   opacity: 0;
   pointer-events: none;
 
@@ -1249,7 +1721,7 @@ const Pitch = styled.p`
   transition: opacity 420ms ease, transform 420ms cubic-bezier(0.2, 0.8, 0.2, 1);
 
   em {
-    color: #ffd166;
+    color: var(--up-accent);
     font-style: normal;
     font-weight: 900;
   }
@@ -1280,6 +1752,7 @@ const PerkTrack = styled.ul`
   &[data-visible="true"] li[data-landed="true"] {
     visibility: visible;
     animation: ${tilePop} 380ms cubic-bezier(0.2, 1, 0.3, 1) both;
+    animation-delay: calc(var(--tile-index, 0) * 45ms);
   }
   ${reducedMotion};
 
@@ -1296,14 +1769,14 @@ const PerkRail = styled.div`
   right: 4%;
   left: 4%;
   height: 2px;
-  background: rgba(255, 209, 102, 0.14);
+  background: rgba(var(--up-mid), 0.14);
 
   i {
     display: block;
     width: 100%;
     height: 100%;
-    background: linear-gradient(90deg, rgba(255, 190, 92, 0.9), rgba(255, 236, 189, 0.9));
-    box-shadow: 0 0 12px rgba(255, 190, 92, 0.55);
+    background: linear-gradient(90deg, rgba(var(--up-mid), 0.9), rgba(var(--up-cream), 0.9));
+    box-shadow: 0 0 12px rgba(var(--up-mid), 0.55);
     transform-origin: 0 50%;
     transition: transform 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
   }
@@ -1314,25 +1787,25 @@ const PerkTile = styled.li`
   justify-items: center;
   gap: 3px;
   padding: 13px 6px 11px;
-  border: 1px solid rgba(255, 209, 102, 0.2);
+  border: 1px solid rgba(var(--up-mid), 0.2);
   border-radius: 8px;
   transition: border-color 220ms ease, box-shadow 220ms ease;
 
   &[data-landed="true"] {
-    border-color: rgba(255, 209, 102, 0.42);
+    border-color: rgba(var(--up-mid), 0.42);
     box-shadow:
-      inset 0 1px 0 rgba(255, 236, 189, 0.16),
-      0 0 22px rgba(255, 176, 66, 0.14);
+      inset 0 1px 0 rgba(var(--up-cream), 0.16),
+      0 0 22px rgba(var(--up-hot), 0.14);
   }
   background:
-    linear-gradient(180deg, rgba(255, 176, 66, 0.1), rgba(255, 176, 66, 0.015) 62%),
+    linear-gradient(180deg, rgba(var(--up-hot), 0.1), rgba(var(--up-hot), 0.015) 62%),
     rgba(8, 7, 5, 0.82);
-  box-shadow: inset 0 1px 0 rgba(255, 236, 189, 0.1);
+  box-shadow: inset 0 1px 0 rgba(var(--up-cream), 0.1);
   clip-path: polygon(10px 0, 100% 0, 100% calc(100% - 10px), calc(100% - 10px) 100%, 0 100%, 0 10px);
   text-align: center;
 
   strong {
-    color: #fdf3dc;
+    color: rgb(var(--up-cream));
     font-size: 12.5px;
     font-weight: 880;
     line-height: 1.2;
@@ -1362,13 +1835,13 @@ const PerkGlyph = styled.i`
   height: 30px;
   place-items: center;
   margin-bottom: 4px;
-  background: linear-gradient(135deg, rgba(255, 233, 189, 0.95), rgba(245, 166, 35, 0.95));
-  box-shadow: 0 0 14px rgba(255, 176, 66, 0.5);
+  background: linear-gradient(135deg, rgb(var(--up-cream)), rgb(var(--up-hot)));
+  box-shadow: 0 0 14px rgba(var(--up-hot), 0.5);
   transform: rotate(45deg);
   border-radius: 6px;
 
   b {
-    color: #2a1602;
+    color: var(--up-ink);
     font-size: 14px;
     font-style: normal;
     transform: rotate(-45deg);
@@ -1382,15 +1855,15 @@ const PurchaseCard = styled.aside`
   display: grid;
   gap: clamp(12px, 2.2vh, 18px);
   padding: clamp(20px, 3.4vh, 30px) clamp(20px, 2.2vw, 30px);
-  border: 1px solid rgba(255, 209, 102, 0.34);
+  border: 1px solid rgba(var(--up-mid), 0.34);
   border-radius: 12px;
   background:
-    linear-gradient(160deg, rgba(255, 190, 92, 0.1), rgba(255, 190, 92, 0.02) 34%),
+    linear-gradient(160deg, rgba(var(--up-mid), 0.1), rgba(var(--up-mid), 0.02) 34%),
     linear-gradient(180deg, rgba(16, 13, 8, 0.96), rgba(8, 7, 5, 0.96));
   box-shadow:
     0 30px 90px rgba(0, 0, 0, 0.6),
-    0 0 60px rgba(255, 170, 60, 0.12),
-    inset 0 1px 0 rgba(255, 236, 189, 0.14);
+    0 0 60px rgba(var(--up-hot), 0.12),
+    inset 0 1px 0 rgba(var(--up-cream), 0.14);
   clip-path: polygon(18px 0, 100% 0, 100% calc(100% - 18px), calc(100% - 18px) 100%, 0 100%, 0 18px);
   opacity: 0;
   visibility: hidden;
@@ -1403,7 +1876,7 @@ const PurchaseCard = styled.aside`
     right: 0;
     left: 18px;
     height: 2px;
-    background: linear-gradient(90deg, rgba(255, 236, 189, 0.85), rgba(255, 190, 92, 0.25) 70%, transparent);
+    background: linear-gradient(90deg, rgba(var(--up-cream), 0.85), rgba(var(--up-mid), 0.25) 70%, transparent);
     pointer-events: none;
   }
 
@@ -1432,9 +1905,9 @@ const ValueBadge = styled.span`
   z-index: 1;
   width: 152px;
   padding: 5px 0;
-  background: linear-gradient(180deg, #ffe1a0, #f5a623);
+  background: linear-gradient(180deg, rgb(var(--up-cream)), rgb(var(--up-hot)));
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
-  color: #2a1602;
+  color: var(--up-ink);
   font-size: 9.5px;
   font-weight: 950;
   letter-spacing: 0.26em;
@@ -1448,10 +1921,10 @@ const PurchaseHeader = styled.header`
   display: grid;
   gap: 2px;
   padding-bottom: 12px;
-  border-bottom: 1px solid rgba(255, 209, 102, 0.16);
+  border-bottom: 1px solid rgba(var(--up-mid), 0.16);
 
   span {
-    color: rgba(255, 214, 138, 0.6);
+    color: rgba(var(--up-light), 0.6);
     font-size: 10.5px;
     font-weight: 900;
     letter-spacing: 0.3em;
@@ -1459,7 +1932,7 @@ const PurchaseHeader = styled.header`
   }
 
   strong {
-    background: linear-gradient(180deg, #ffe9bd 10%, #ffc963 55%, #d9952c 90%);
+    background: linear-gradient(180deg, rgb(var(--up-cream)) 10%, rgb(var(--up-light)) 55%, rgb(var(--up-core)) 90%);
     background-clip: text;
     -webkit-background-clip: text;
     color: transparent;
@@ -1476,12 +1949,17 @@ const PriceRow = styled.div`
   gap: 13px;
 
   b {
-    color: #fff6df;
+    color: var(--up-price);
     font-size: clamp(44px, 7vh, 56px);
     font-weight: 950;
     letter-spacing: -0.02em;
     line-height: 0.9;
-    text-shadow: 0 0 30px rgba(255, 190, 92, 0.28);
+    text-shadow: 0 0 30px rgba(var(--up-mid), 0.28);
+  }
+
+  /* longer figures ($2,000) get a notch smaller so the row never wraps */
+  &[data-compact="true"] b {
+    font-size: clamp(38px, 5.8vh, 48px);
   }
 
   span {
@@ -1505,7 +1983,7 @@ const CreditsMeter = styled.div`
   }
 
   strong {
-    color: #ffd166;
+    color: var(--up-accent);
     font-family: ui-monospace, "SF Mono", Menlo, monospace;
     font-size: 21px;
     font-weight: 900;
@@ -1531,8 +2009,8 @@ const MeterTrack = styled.div`
     display: block;
     width: 100%;
     height: 100%;
-    background: linear-gradient(90deg, #b97818, #ffc963 60%, #ffe9bd);
-    box-shadow: 0 0 14px rgba(255, 190, 92, 0.6);
+    background: linear-gradient(90deg, rgb(var(--up-deep)), rgb(var(--up-light)) 60%, rgb(var(--up-cream)));
+    box-shadow: 0 0 14px rgba(var(--up-mid), 0.6);
     transform-origin: 0 50%;
     transition: transform 120ms linear;
   }
@@ -1558,8 +2036,8 @@ const StampList = styled.ul`
     width: 8px;
     height: 8px;
     flex: 0 0 auto;
-    background: linear-gradient(135deg, #ffe9bd, #f5a623);
-    box-shadow: 0 0 9px rgba(255, 176, 66, 0.6);
+    background: linear-gradient(135deg, rgb(var(--up-cream)), rgb(var(--up-hot)));
+    box-shadow: 0 0 9px rgba(var(--up-hot), 0.6);
     transform: rotate(45deg);
   }
 `;
@@ -1572,7 +2050,7 @@ const CtaWrap = styled.div`
 const CtaHalo = styled.i`
   position: absolute;
   inset: -7px;
-  border: 2px solid rgba(255, 208, 126, 0.7);
+  border: 2px solid rgba(var(--up-light), 0.7);
   border-radius: 10px;
   animation: ${haloPulse} 2.1s cubic-bezier(0.2, 0.6, 0.4, 1) infinite;
   pointer-events: none;
@@ -1586,13 +2064,13 @@ const CtaButton = styled.button`
   place-items: center;
   padding: 17px 20px;
   overflow: hidden;
-  border: 1px solid rgba(255, 222, 150, 0.7);
+  border: 1px solid rgba(var(--up-cream), 0.7);
   border-radius: 7px;
-  color: #1c1002;
-  background: linear-gradient(180deg, #ffe1a0 0%, #ffb43e 46%, #e8901c 58%, #ffcf7a 100%);
+  color: var(--up-ink);
+  background: linear-gradient(180deg, rgb(var(--up-cream)) 0%, rgb(var(--up-hot)) 46%, rgb(var(--up-core)) 58%, rgb(var(--up-light)) 100%);
   box-shadow:
-    0 12px 38px rgba(232, 144, 28, 0.42),
-    0 0 64px rgba(255, 170, 60, 0.26),
+    0 12px 38px rgba(var(--up-core), 0.42),
+    0 0 64px rgba(var(--up-hot), 0.26),
     inset 0 1px 0 rgba(255, 255, 255, 0.65);
   cursor: pointer;
   font-size: 16.5px;
@@ -1620,8 +2098,8 @@ const CtaButton = styled.button`
     outline: none;
     transform: translateY(-2px) scale(1.02);
     box-shadow:
-      0 18px 50px rgba(232, 144, 28, 0.56),
-      0 0 84px rgba(255, 170, 60, 0.44),
+      0 18px 50px rgba(var(--up-core), 0.56),
+      0 0 84px rgba(var(--up-hot), 0.44),
       inset 0 1px 0 rgba(255, 255, 255, 0.72);
   }
 
@@ -1672,8 +2150,8 @@ const SideRailButton = styled.button`
   &:hover,
   &:focus-visible {
     outline: none;
-    color: #ffe9bd;
-    border-color: rgba(255, 209, 102, 0.4);
+    color: rgb(var(--up-cream));
+    border-color: rgba(var(--up-mid), 0.4);
   }
 `;
 
