@@ -2,6 +2,7 @@ const BACKEND_CPU_ATTRIBUTION_ENABLED: bool = true;
 const BACKEND_CPU_ATTRIBUTION_DUMP_ENABLED: bool = true;
 const BACKEND_CPU_ATTRIBUTION_DUMP_INTERVAL_MS: u64 = 5_000;
 const BACKEND_CPU_ATTRIBUTION_FILE_NAME: &str = "diffforge-backend-cpu-attribution.json";
+const BACKEND_HEAVY_JOB_PERMITS: usize = 2;
 
 #[derive(Clone, Default)]
 struct BackendCpuAttributionMetric {
@@ -77,6 +78,86 @@ impl Drop for BackendCpuSpan {
 static BACKEND_CPU_ATTRIBUTION_STATE: OnceLock<StdMutex<BackendCpuAttributionState>> =
     OnceLock::new();
 static BACKEND_CPU_ATTRIBUTION_ENV_ENABLED: OnceLock<bool> = OnceLock::new();
+static BACKEND_HEAVY_JOB_SEMAPHORE: OnceLock<BackendHeavyJobSemaphore> = OnceLock::new();
+
+thread_local! {
+    static BACKEND_HEAVY_JOB_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+struct BackendHeavyJobSemaphore {
+    permits: StdMutex<usize>,
+    available: std::sync::Condvar,
+}
+
+impl BackendHeavyJobSemaphore {
+    fn new() -> Self {
+        Self {
+            permits: StdMutex::new(BACKEND_HEAVY_JOB_PERMITS),
+            available: std::sync::Condvar::new(),
+        }
+    }
+}
+
+struct BackendHeavyJobPermit {
+    acquired: bool,
+    _tag: &'static str,
+}
+
+fn backend_heavy_job_semaphore() -> &'static BackendHeavyJobSemaphore {
+    BACKEND_HEAVY_JOB_SEMAPHORE.get_or_init(BackendHeavyJobSemaphore::new)
+}
+
+fn backend_heavy_job_acquire(tag: &'static str) -> BackendHeavyJobPermit {
+    let nested = BACKEND_HEAVY_JOB_DEPTH.with(|depth| {
+        let current = depth.get();
+        depth.set(current.saturating_add(1));
+        current > 0
+    });
+    if nested {
+        return BackendHeavyJobPermit {
+            acquired: false,
+            _tag: tag,
+        };
+    }
+
+    let _span = BackendCpuSpan::new("backend.heavy_job.wait");
+    let semaphore = backend_heavy_job_semaphore();
+    let mut permits = match semaphore.permits.lock() {
+        Ok(permits) => permits,
+        Err(error) => error.into_inner(),
+    };
+    while *permits == 0 {
+        permits = match semaphore.available.wait(permits) {
+            Ok(permits) => permits,
+            Err(error) => error.into_inner(),
+        };
+    }
+    *permits = permits.saturating_sub(1);
+    drop(permits);
+    BackendHeavyJobPermit {
+        acquired: true,
+        _tag: tag,
+    }
+}
+
+impl Drop for BackendHeavyJobPermit {
+    fn drop(&mut self) {
+        BACKEND_HEAVY_JOB_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current.saturating_sub(1));
+        });
+        if !self.acquired {
+            return;
+        }
+        let semaphore = backend_heavy_job_semaphore();
+        let mut permits = match semaphore.permits.lock() {
+            Ok(permits) => permits,
+            Err(error) => error.into_inner(),
+        };
+        *permits = (*permits).saturating_add(1).min(BACKEND_HEAVY_JOB_PERMITS);
+        semaphore.available.notify_one();
+    }
+}
 
 fn backend_cpu_env_truthy(name: &str) -> bool {
     env::var(name)

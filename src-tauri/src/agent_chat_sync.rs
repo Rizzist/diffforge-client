@@ -2111,6 +2111,9 @@ fn agent_chat_session_sync_spawn(
             context.clone(),
         );
         let result = tauri::async_runtime::spawn_blocking(move || {
+            let _heavy_permit =
+                backend_heavy_job_acquire("agent_chat_session_sync.build_payloads");
+            let _span = BackendCpuSpan::new("agent_chat_session_sync.build_payloads");
             agent_chat_session_sync_payloads(
                 &build_agent_id,
                 &build_provider_session_id,
@@ -2653,11 +2656,15 @@ fn agent_chat_session_sync_backfill_workspace_history(
             root_directory,
             limit: Some(AGENT_CHAT_SESSION_HISTORY_BACKFILL_LIMIT),
         };
-        let result =
-            tauri::async_runtime::spawn_blocking(move || workspace_agent_session_history_list_blocking(request))
-                .await
-                .map_err(|error| format!("Workspace session history backfill read failed: {error}"))
-                .and_then(|value| value);
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let _heavy_permit =
+                backend_heavy_job_acquire("agent_chat_session_sync.history_backfill_list");
+            let _span = BackendCpuSpan::new("agent_chat_session_sync.history_backfill_list");
+            workspace_agent_session_history_list_blocking(request)
+        })
+        .await
+        .map_err(|error| format!("Workspace session history backfill read failed: {error}"))
+        .and_then(|value| value);
         match result {
             Ok(mut history) => {
                 workspace_agent_session_history_enrich_chat_sync(&mut history.items);

@@ -20745,7 +20745,8 @@ const WorkspaceRailWorkspaceRow = memo(function WorkspaceRailWorkspaceRow({
     : pendingActivation
       ? `Opening ${workspaceName}`
       : `Activate ${workspaceName}`;
-  const handleSelect = useCallback(() => {
+  const handleSelect = useCallback((event) => {
+    event.stopPropagation();
     onSelect(workspaceId);
   }, [onSelect, workspaceId]);
   const handleLifecycle = useCallback((event) => {
@@ -28162,6 +28163,10 @@ export default function App() {
     workspaces,
   ]);
 
+  // Workspace rail clicks behave exactly like the bottom rail view buttons
+  // (Tokenomics/Settings/Audio/...): select the row and show the workspace
+  // view, nothing else. No auto-opened settings surface, no shell-wide urgent
+  // state batch — the row's gear/lifecycle buttons own those flows explicitly.
   const selectWorkspaceFromRail = useCallback((workspaceId) => {
     const workspace = findWorkspaceById(workspaces, workspaceId);
     if (!workspace) {
@@ -28172,98 +28177,40 @@ export default function App() {
       return;
     }
 
-    const workspaceRoot = getWorkspaceRootDirectory(workspaceSettingsRef.current, workspace.id)
-      || defaultWorkingDirectoryRef.current
-      || "";
-    const activeWorkspaceIds = normalizeEnabledWorkspaceIds(
-      workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds,
-    );
-    const activeRuntimeWorkspaceIds = normalizeEnabledWorkspaceIds([
-      ...activeWorkspaceIds,
-      activatedWorkspaceIdRef.current,
-    ]);
-    const previousSelectedWorkspaceId = selectedWorkspaceIdRef.current;
-    const previousPendingActivationId = workspacePendingActivationIdRef.current;
-    // Trust only the lifecycle enabled set for "runtime is on" decisions:
-    // activatedWorkspaceIdRef can go stale (wedged activation, interrupted
-    // deactivation) and a disabled workspace misjudged as active would skip
-    // the settings panel the user needs to enable it.
-    const workspaceRuntimeEnabled = activeWorkspaceIds.includes(workspace.id);
-    const workspaceAlreadyActive = workspaceRuntimeEnabled
-      || activeRuntimeWorkspaceIds.includes(workspace.id);
-    const transitionKind = workspaceAlreadyActive
-      ? previousSelectedWorkspaceId === workspace.id
-        ? "reselect_active_runtime"
-        : "select_active_runtime"
-      : "select_inactive_runtime";
-    logWorkspaceActivationTrace("workspace.open.rail_select", workspace.id, {
-      activeRuntimeWorkspaceCount: activeRuntimeWorkspaceIds.length,
-      activeRuntimeWorkspaceIds,
-      alreadyActive: workspaceAlreadyActive,
-      pendingActivationId: previousPendingActivationId,
-      previousSelectedWorkspaceId,
-      rootDirectory: workspaceRoot,
-      selectedWorkspaceId: previousSelectedWorkspaceId,
-      transitionKind,
-      workspaceName: workspace.name || "",
-    });
-
-    if (previousPendingActivationId && previousPendingActivationId !== workspace.id) {
+    // A pending activation for a DIFFERENT workspace is stale the moment the
+    // user picks this row; clear it by value (the ref can lag the state and a
+    // stale latch wedges the shell on "No active workspace.").
+    if (workspacePendingActivationIdRef.current && workspacePendingActivationIdRef.current !== workspace.id) {
       cancelDeferredWorkspaceActivation();
       workspacePendingActivationIdRef.current = "";
-      logWorkspaceActivationTrace("workspace.open.rail_select_pending_activation_cancelled", previousPendingActivationId, {
-        nextSelectedWorkspaceId: workspace.id,
-        previousSelectedWorkspaceId,
-      });
     }
-    // The pending STATE can outlive the ref when an activation commit is lost
-    // (blocked by an in-flight deactivation or a dropped transition). A stale
-    // latch here wedges the whole shell ("No active workspace."), so clear it
-    // by value instead of trusting the ref.
     setWorkspacePendingActivationId((currentPendingId) => (
       currentPendingId && currentPendingId !== workspace.id ? "" : currentPendingId
     ));
 
-    if (
-      transitionKind === "reselect_active_runtime"
-      && workspaceRuntimeEnabled
-      && spaceModeRef.current === APP_SPACE_MODE_WORKSPACES
-    ) {
-      // Re-clicking the already-selected workspace: skip the full urgent
-      // setState batch — it re-renders the entire shell per click and starves
-      // any in-flight activation transition. Only the cheap, idempotent
-      // cleanups that a reselect can still need run here.
-      setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspace.id));
-      setWorkspaceCreateModalOpen(false);
-      setWorkspaceSettingsModalId("");
-      showView(DEFAULT_WORKSPACE_VIEW, {
-        immediate: true,
-        telemetrySource: "workspace_rail_reselect",
-        telemetryWorkspaceId: workspace.id,
-      });
-      return;
+    setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspace.id));
+
+    const isReselect = selectedWorkspaceIdRef.current === workspace.id
+      && spaceModeRef.current === APP_SPACE_MODE_WORKSPACES;
+    if (!isReselect) {
+      selectedWorkspaceIdRef.current = workspace.id;
+      selectedLoopspaceIdRef.current = "";
+      spaceModeRef.current = APP_SPACE_MODE_WORKSPACES;
+      setSelectedWorkspaceId(workspace.id);
+      setSelectedLoopspaceId("");
+      setSpaceMode(APP_SPACE_MODE_WORKSPACES);
+      setWorkspaceError("");
     }
 
-    selectedWorkspaceIdRef.current = workspace.id;
-    selectedLoopspaceIdRef.current = "";
-    spaceModeRef.current = APP_SPACE_MODE_WORKSPACES;
-    setSelectedWorkspaceId(workspace.id);
-    setSelectedLoopspaceId("");
-    setSpaceMode(APP_SPACE_MODE_WORKSPACES);
-    setLoopspaceCreatePanelOpen(false);
-    setLoopspaceSettingsPanelId("");
-    setLoopspaceError("");
-    setLoopspaceActionState("idle");
-    setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, workspace.id));
+    // Explicit closes: the create panel and settings surface are inline layers
+    // on the workspace view, so a workspace click must dismiss them itself —
+    // showView clears the settings surface too, but it early-returns when the
+    // workspace view is already active (reselect with a surface up).
     setWorkspaceCreateModalOpen(false);
-    setWorkspaceSettingsError("");
-    setWorkspaceSettingsMessage("");
-    setWorkspaceDeleteConfirmId("");
-    setWorkspaceError("");
-    setWorkspaceSettingsModalId(workspaceRuntimeEnabled ? "" : workspace.id);
+    setWorkspaceSettingsModalId("");
     showView(DEFAULT_WORKSPACE_VIEW, {
       immediate: true,
-      telemetrySource: workspaceRuntimeEnabled ? "workspace_rail_select" : "workspace_rail_select_settings",
+      telemetrySource: isReselect ? "workspace_rail_reselect" : "workspace_rail_select",
       telemetryWorkspaceId: workspace.id,
     });
   }, [

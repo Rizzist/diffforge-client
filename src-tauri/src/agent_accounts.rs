@@ -1238,11 +1238,12 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
     let _ = std::thread::Builder::new()
         .name("agent-accounts-capture".to_string())
         .spawn(move || {
-            let capture_all = || {
+            let capture_all = |capture_app: &AppHandle| {
+                let _heavy_permit = backend_heavy_job_acquire("agent_accounts.capture_all");
                 let _span = BackendCpuSpan::new("agent_accounts.capture_all");
                 for kind in ["claude", "codex", "opencode"] {
                     if agent_accounts_capture_kind(kind) {
-                        let _ = app.emit(
+                        let _ = capture_app.emit(
                             AGENT_ACCOUNTS_CHANGED_EVENT,
                             json!({ "kind": kind, "captured": true }),
                         );
@@ -1250,8 +1251,23 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
                 }
             };
 
-            // Capture whatever is already on disk once at startup.
-            capture_all();
+            // Capture whatever is already on disk once after first paint has had time to settle.
+            let startup_capture_app = app.clone();
+            let _ = thread::Builder::new()
+                .name("agent-accounts-startup-capture".to_string())
+                .spawn(move || {
+                    thread::sleep(Duration::from_secs(45));
+                    let _heavy_permit = backend_heavy_job_acquire("agent_accounts.capture_all");
+                    let _span = BackendCpuSpan::new("agent_accounts.capture_all");
+                    for kind in ["claude", "codex", "opencode"] {
+                        if agent_accounts_capture_kind(kind) {
+                            let _ = startup_capture_app.emit(
+                                AGENT_ACCOUNTS_CHANGED_EVENT,
+                                json!({ "kind": kind, "captured": true }),
+                            );
+                        }
+                    }
+                });
 
             // Event-driven instead of a fixed poll: watch the CLI auth dirs and
             // re-capture only when their files actually change (login / logout /
@@ -1319,13 +1335,13 @@ pub(crate) fn agent_accounts_capture_watch_start(app: AppHandle) {
                             continue;
                         }
                         last_event_capture = std::time::Instant::now();
-                        capture_all();
+                        capture_all(&app);
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => capture_all(),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => capture_all(&app),
                     Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                         // Watcher unavailable: degrade to a slow safety poll.
                         std::thread::sleep(std::time::Duration::from_secs(300));
-                        capture_all();
+                        capture_all(&app);
                     }
                 }
             }

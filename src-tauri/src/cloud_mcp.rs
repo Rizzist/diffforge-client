@@ -876,8 +876,8 @@ const CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS: u64 = 15 * 60;
 /// continuously, so this bounds the cycle rate while active — one stamp per
 /// window — instead of re-running the gate every few seconds.
 const CLOUD_MCP_TOKENOMICS_WATCH_DEBOUNCE_MS: u64 = 30_000;
-/// Short settle delay before the first cycle so app startup isn't contended.
-const CLOUD_MCP_TOKENOMICS_PERIODIC_STARTUP_DELAY_SECS: u64 = 15;
+/// Settle delay before the first cycle so app startup and first paint aren't contended.
+const CLOUD_MCP_TOKENOMICS_PERIODIC_STARTUP_DELAY_SECS: u64 = 45;
 const CLOUD_MCP_BACKGROUND_SCHEDULER_SHUTDOWN_POLL_SECS: u64 = 30;
 
 static CLOUD_MCP_TOKENOMICS_SOURCE_WATCHER: OnceLock<StdMutex<Option<notify::RecommendedWatcher>>> =
@@ -1127,7 +1127,7 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
                 app.clone(),
                 &state,
                 CLOUD_MCP_TOKENOMICS_STARTUP_REASON.to_string(),
-                true,
+                false,
                 false,
             )
             .await;
@@ -1135,6 +1135,7 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
         }
 
         let mut tokenomics_sync_pending_after_offline = false;
+        let paced_realtime_wake_scheduled = Arc::new(AtomicBool::new(false));
         loop {
             if app_shutdown_requested() {
                 break;
@@ -1179,6 +1180,25 @@ pub(crate) fn cloud_mcp_start_tokenomics_scheduler(app: AppHandle, state: CloudM
 
             if app_shutdown_requested() {
                 break;
+            }
+
+            if let Some(retry_after_ms) = cycle_status
+                .as_ref()
+                .and_then(|status| status.get("realtime_scan_retry_after_ms"))
+                .and_then(Value::as_u64)
+                .filter(|value| *value > 0)
+            {
+                if !paced_realtime_wake_scheduled.swap(true, Ordering::SeqCst) {
+                    let wake = tokenomics_wake.clone();
+                    let scheduled = paced_realtime_wake_scheduled.clone();
+                    tauri::async_runtime::spawn(async move {
+                        sleep(Duration::from_millis(retry_after_ms.saturating_add(250))).await;
+                        scheduled.store(false, Ordering::SeqCst);
+                        if !app_shutdown_requested() {
+                            wake.notify_one();
+                        }
+                    });
+                }
             }
 
             // Best-effort outbound sync. Only attempt while a live connection
@@ -10543,6 +10563,7 @@ async fn cloud_mcp_tokenomics_store_prune_ack_seeds(
     }
     let seed_app = app.clone();
     match tauri::async_runtime::spawn_blocking(move || {
+        let _heavy_permit = backend_heavy_job_acquire("cloud_mcp.tokenomics_prune_ack_seeds");
         let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_prune_ack_seeds");
         let conn = tokenomics_open_db(&seed_app)?;
         tokenomics_record_usage_event_prune_cloud_acks(&conn, &seeds)
@@ -10726,6 +10747,8 @@ async fn cloud_mcp_tokenomics_finish_historical_prune_ack_seed(
     let device_id = device_id.to_string();
     let billing_scope_key = billing_scope_key.to_string();
     match tauri::async_runtime::spawn_blocking(move || {
+        let _heavy_permit =
+            backend_heavy_job_acquire("cloud_mcp.tokenomics_historical_prune_ack_finish");
         let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_historical_prune_ack_finish");
         let conn = tokenomics_open_db(&finish_app)?;
         let stored = tokenomics_record_usage_event_prune_cloud_acks(&conn, &seeds)?;
@@ -10783,6 +10806,8 @@ async fn cloud_mcp_tokenomics_run_historical_prune_ack_seed(
     let plan_billing_scope = billing_scope.clone();
     let plan_billing_scope_key = billing_scope_key.to_string();
     let plan_result = tauri::async_runtime::spawn_blocking(move || {
+        let _heavy_permit =
+            backend_heavy_job_acquire("cloud_mcp.tokenomics_historical_prune_ack_plan");
         let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_historical_prune_ack_plan");
         cloud_mcp_tokenomics_prepare_historical_prune_ack_plan(
             plan_app,
@@ -11037,6 +11062,7 @@ async fn cloud_mcp_run_tokenomics_sync_job(
     let summary_app = app.clone();
     let summary_scope = tokenomics_scope.clone();
     let summary_task = tauri::async_runtime::spawn_blocking(move || {
+        let _heavy_permit = backend_heavy_job_acquire("cloud_mcp.tokenomics_sync.summary_worker");
         let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_sync.summary_worker");
         if force_resync {
             tokenomics_scan_usage_for(&summary_app, false, true)?;
@@ -11106,40 +11132,74 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             "empty_non_full_delta": empty_non_full_delta,
         }),
     );
-    let provider_accounts_for_identity =
-        cloud_mcp_tokenomics_provider_accounts(&summary, cloud_mcp_now_ms());
-    let provider_identity_counts = match cloud_mcp_sync_provider_account_identity_units(
-        &worker_state,
-        &device_profile,
-        &billing_scope_type,
-        team_id.as_deref(),
-        &tokenomics_scope_key,
-        &provider_accounts_for_identity,
-        &reason_for_worker,
-    )
-    .await
-    {
-        Ok(counts) => counts,
-        Err(error) => {
-            cloud_mcp_record_tokenomics_sync_error(
-                "provider_identity_error",
-                &reason_for_worker,
-                &error,
-            );
-            (0, 0)
+    if empty_non_full_delta && reason_for_worker == CLOUD_MCP_TOKENOMICS_STARTUP_REASON {
+        let identity_app = app.clone();
+        let identity_scope = tokenomics_scope.clone();
+        let identity_accounts = match tauri::async_runtime::spawn_blocking(move || {
+            let _heavy_permit =
+                backend_heavy_job_acquire("cloud_mcp.tokenomics_sync.provider_identity_refresh");
+            let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_sync.provider_identity_refresh");
+            let conn = tokenomics_open_db(&identity_app)?;
+            tokenomics_reconcile_current_provider_accounts(&conn)?;
+            let identity_summary =
+                tokenomics_provider_account_identity_summary_from_conn(&conn, Some(&identity_scope))?;
+            Ok::<Vec<Value>, String>(cloud_mcp_tokenomics_provider_accounts(
+                &identity_summary,
+                cloud_mcp_now_ms(),
+            ))
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(format!(
+                "Unable to join startup provider identity refresh: {error}"
+            )),
+        };
+        match identity_accounts {
+            Ok(provider_accounts_for_identity) => {
+                let provider_identity_counts = match cloud_mcp_sync_provider_account_identity_units(
+                    &worker_state,
+                    &device_profile,
+                    &billing_scope_type,
+                    team_id.as_deref(),
+                    &tokenomics_scope_key,
+                    &provider_accounts_for_identity,
+                    &reason_for_worker,
+                )
+                .await
+                {
+                    Ok(counts) => counts,
+                    Err(error) => {
+                        cloud_mcp_record_tokenomics_sync_error(
+                            "provider_identity_error",
+                            &reason_for_worker,
+                            &error,
+                        );
+                        (0, 0)
+                    }
+                };
+                if !provider_accounts_for_identity.is_empty() {
+                    cloud_mcp_record_tokenomics_sync_log(
+                        "provider_identity_units",
+                        "active",
+                        &reason_for_worker,
+                        json!({
+                            "provider_account_count": provider_accounts_for_identity.len(),
+                            "sent_count": provider_identity_counts.0,
+                            "skipped_count": provider_identity_counts.1,
+                            "source": "startup_empty_delta",
+                        }),
+                    );
+                }
+            }
+            Err(error) => {
+                cloud_mcp_record_tokenomics_sync_error(
+                    "provider_identity_refresh_error",
+                    &reason_for_worker,
+                    &error,
+                );
+            }
         }
-    };
-    if !provider_accounts_for_identity.is_empty() {
-        cloud_mcp_record_tokenomics_sync_log(
-            "provider_identity_units",
-            "active",
-            &reason_for_worker,
-            json!({
-                "provider_account_count": provider_accounts_for_identity.len(),
-                "sent_count": provider_identity_counts.0,
-                "skipped_count": provider_identity_counts.1,
-            }),
-        );
     }
     if empty_non_full_delta {
         cloud_mcp_tokenomics_run_historical_prune_ack_seed(
@@ -11175,6 +11235,42 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             }),
         );
         return;
+    }
+
+    let provider_accounts_for_identity =
+        cloud_mcp_tokenomics_provider_accounts(&summary, cloud_mcp_now_ms());
+    let provider_identity_counts = match cloud_mcp_sync_provider_account_identity_units(
+        &worker_state,
+        &device_profile,
+        &billing_scope_type,
+        team_id.as_deref(),
+        &tokenomics_scope_key,
+        &provider_accounts_for_identity,
+        &reason_for_worker,
+    )
+    .await
+    {
+        Ok(counts) => counts,
+        Err(error) => {
+            cloud_mcp_record_tokenomics_sync_error(
+                "provider_identity_error",
+                &reason_for_worker,
+                &error,
+            );
+            (0, 0)
+        }
+    };
+    if !provider_accounts_for_identity.is_empty() {
+        cloud_mcp_record_tokenomics_sync_log(
+            "provider_identity_units",
+            "active",
+            &reason_for_worker,
+            json!({
+                "provider_account_count": provider_accounts_for_identity.len(),
+                "sent_count": provider_identity_counts.0,
+                "skipped_count": provider_identity_counts.1,
+            }),
+        );
     }
 
     if tokenomics_activity_key.is_none() {

@@ -1101,7 +1101,9 @@ const CREDIT_PACKS = [
     heat: "10,000 credit pack",
     passName: "Ember Refill",
     badge: "Quick fix",
-    art: "/pricing/forge-plus-gold.webp",
+    // dedicated credits art (anvil-crest coin) — the pricing/forge-* images
+    // communicate plan tiers, not credits
+    art: "/credits/credits-coin-refill.png",
     price: "$40",
     packs: 1,
     credits: 10000,
@@ -1126,7 +1128,7 @@ const CREDIT_PACKS = [
     heat: "30,000 credit pack",
     passName: "Forge Reserve",
     badge: "Best value",
-    art: "/pricing/forge-pro-platinum.webp",
+    art: "/credits/credits-coin-reserve.png",
     price: "$120",
     packs: 3,
     credits: 30000,
@@ -1151,7 +1153,7 @@ const CREDIT_PACKS = [
     heat: "100,000 credit pack",
     passName: "Full Stockpile",
     badge: "Max heat",
-    art: "/pricing/forge-ultra-violet.webp",
+    art: "/credits/credits-coin-stockpile.png",
     price: "$400",
     packs: 10,
     credits: 100000,
