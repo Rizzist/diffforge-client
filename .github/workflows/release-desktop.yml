@@ -1,14 +1,14 @@
 name: Desktop Release
 
 # Builds the desktop app for macOS/Windows/Linux and publishes the release to
-# the public distribution repo Rizzist/diffforge-client (source stays private).
+# the public distribution repo Rizzist/diffforge-client-releases (source stays private).
 #
 # Triggers:
 #   - tag push v*          -> build + publish
 #   - workflow_dispatch    -> build only, unless the "publish" input is true
 #
 # Required secret for publishing: RELEASES_GITHUB_TOKEN
-#   (fine-grained PAT, repo Rizzist/diffforge-client, Contents: Read and write).
+#   (fine-grained PAT, repo Rizzist/diffforge-client-releases, Contents: Read and write).
 # Without it the workflow still builds and uploads a "release-bundle" workflow
 # artifact, and the publish step is skipped with a warning.
 
@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish a release to Rizzist/diffforge-client"
+        description: "Publish a release to Rizzist/diffforge-client-releases"
         type: boolean
         default: false
 
@@ -189,7 +189,7 @@ jobs:
           for (const [file, key, format] of entries) {
             if (!sums[file]) continue;
             platforms[key] = {
-              url: `https://github.com/Rizzist/diffforge-client/releases/download/v${version}/${file}`,
+              url: `https://github.com/Rizzist/diffforge-client-releases/releases/download/v${version}/${file}`,
               sha256: sums[file],
               format,
               size: fs.statSync(`out/${file}`).size,
@@ -215,7 +215,7 @@ jobs:
         run: |
           if [ -z "$RELEASES_TOKEN" ]; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::RELEASES_GITHUB_TOKEN is not set — skipping publish to Rizzist/diffforge-client"
+            echo "::warning::RELEASES_GITHUB_TOKEN is not set — skipping publish to Rizzist/diffforge-client-releases"
           elif [ "${{ github.ref_type }}" = "tag" ] || [ "${{ inputs.publish }}" = "true" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
@@ -226,7 +226,7 @@ jobs:
         if: steps.gate.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          repository: Rizzist/diffforge-client
+          repository: Rizzist/diffforge-client-releases
           token: ${{ secrets.RELEASES_GITHUB_TOKEN }}
           tag_name: v${{ steps.version.outputs.version }}
           name: Diff Forge AI v${{ steps.version.outputs.version }}
