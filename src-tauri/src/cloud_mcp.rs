@@ -46619,6 +46619,75 @@ fn cloud_mcp_asset_merge_local_overlay_row(remote: &mut Value, local: &Value) {
     }
 }
 
+/// Compact fanout item rows omit blob/object identity and the per-cloud
+/// status arrays, and blob-less rows report cloud_status "local_only" even
+/// when the content is uploaded. row_json is replaced wholesale on ingest, so
+/// backfill those fields from the stored row or the "in cloud" state flips
+/// off every time a compact row lands.
+fn cloud_mcp_asset_merge_cloud_identity_row(incoming: &mut Value, existing: &Value) {
+    let incoming_blob_was_empty =
+        cloud_mcp_asset_row_text(incoming, &["blob_id", "blobId"]).is_empty();
+    let Some(incoming_object) = incoming.as_object_mut() else {
+        return;
+    };
+    for key in ["blob_id", "blobId", "object_key", "objectKey", "sha256"] {
+        let missing = incoming_object
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .is_empty();
+        if missing {
+            if let Some(value) = existing
+                .get(key)
+                .filter(|value| !value.as_str().unwrap_or_default().trim().is_empty())
+            {
+                incoming_object.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    for key in ["clouds", "cloudStatuses", "cloud_statuses", "cloud_status_by_cloud", "cloudStatusByCloud"] {
+        let missing = match incoming_object.get(key) {
+            Some(Value::Array(values)) => values.is_empty(),
+            Some(Value::Object(map)) => map.is_empty(),
+            Some(_) | None => true,
+        };
+        let existing_value = existing.get(key).filter(|value| match value {
+            Value::Array(values) => !values.is_empty(),
+            Value::Object(map) => !map.is_empty(),
+            _ => false,
+        });
+        if missing {
+            if let Some(value) = existing_value {
+                incoming_object.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    let incoming_status = incoming_object
+        .get("cloud_status")
+        .or_else(|| incoming_object.get("cloudStatus"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let existing_status = existing
+        .get("cloud_status")
+        .or_else(|| existing.get("cloudStatus"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let incoming_downgrades = incoming_status.is_empty()
+        || incoming_status == "unknown"
+        || (incoming_status == "local_only" && incoming_blob_was_empty);
+    if incoming_downgrades && existing_status == "cloud_available" {
+        incoming_object.insert("cloud_status".to_string(), json!("cloud_available"));
+        incoming_object.insert("cloudStatus".to_string(), json!("cloud_available"));
+        incoming_object.insert("cloud_available".to_string(), json!(true));
+        incoming_object.insert("cloudAvailable".to_string(), json!(true));
+    }
+}
+
 fn cloud_mcp_asset_transfer_progress_is_client_local(row: &Value) -> bool {
     matches!(
         cloud_mcp_asset_row_text(row, &["progress_source", "progressSource"]).as_str(),
@@ -46878,6 +46947,7 @@ fn cloud_mcp_update_asset_library_conn_inner(
                     &existing_local_status,
                 );
                 cloud_mcp_asset_merge_local_overlay_row(&mut item, &existing);
+                cloud_mcp_asset_merge_cloud_identity_row(&mut item, &existing);
             }
         }
         if cloud_mcp_asset_row_text(&item, &["local_path", "localPath", "path"]).is_empty() {

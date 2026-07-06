@@ -28419,7 +28419,24 @@ function TerminalView({
       // the notification reducer file it as turn.completed (no fanfare-tier
       // SFX, lighter cue). When an in-flight prompt exists its settle path
       // owns the notification event so the unread list gets the todo text.
-      if (eventType === "provider-turn-completed") {
+      //
+      // Prompt evidence required: agent STARTUP reaching idle synthesizes a
+      // Stop with no prompt/turn identity and no user message — flashing and
+      // notifying on it made every workspace open "celebrate" freshly
+      // launched agents. No evidence of a real turn → no feedback at all.
+      const turnPromptEvidence = Boolean(
+        String(
+          payload.promptEventId
+            || payload.prompt_event_id
+            || payload.turnId
+            || payload.turn_id
+            || payload.pendingPromptId
+            || payload.promptId
+            || "",
+        ).trim()
+        || String(payload.userMessage || payload.message || "").trim(),
+      );
+      if (eventType === "provider-turn-completed" && turnPromptEvidence) {
         triggerTodoCompletionFlash(payloadPaneId || getTerminalPaneId(terminalIndex));
         if (!todoQueueTerminalInFlightPromptsRef.current.get(terminalIndex)) {
           window.dispatchEvent(new CustomEvent(TODO_COMPLETED_NOTIFICATION_EVENT, {

@@ -700,11 +700,20 @@ function createAssetToastId(kind = "toast") {
 async function copyTextToClipboard(value) {
   const normalized = text(value);
   if (!normalized) return false;
-  if (typeof navigator !== "undefined" && navigator?.clipboard?.writeText) {
+  try {
+    await invoke("snipping_copy_text_to_clipboard", { text: normalized });
+    return true;
+  } catch {
+    // Fall back to the Web Clipboard API for webview contexts where the native
+    // command is unavailable.
+  }
+  if (typeof navigator === "undefined" || !navigator?.clipboard?.writeText) return false;
+  try {
     await navigator.clipboard.writeText(normalized);
     return true;
+  } catch {
+    return false;
   }
-  return false;
 }
 
 export default function AccountAssetsView({
@@ -1289,8 +1298,8 @@ function AssetsPanel({
           if (copied) {
             showAssetToast("success", "Public URL copied", "Public URL copied to clipboard.", [publicUrl]);
           } else {
-            const message = "Public URL created, but clipboard access is unavailable.";
-            showAssetToast("error", "Copy failed", message, [publicUrl]);
+            const message = "Asset is public. Clipboard access was unavailable, so copy the URL from the asset row.";
+            showAssetToast("success", "Public URL created", message, [publicUrl]);
           }
         }
       } else if (action === "unpublish") {

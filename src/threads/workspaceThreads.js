@@ -516,7 +516,11 @@ function normalizeThreadToolValue(value) {
   }
   if (Array.isArray(value) || typeof value === "object") {
     try {
-      return JSON.parse(JSON.stringify(value));
+      // structuredClone beats stringify+parse severalfold, and this runs per
+      // tool message on every hydration normalize.
+      return typeof structuredClone === "function"
+        ? structuredClone(value)
+        : JSON.parse(JSON.stringify(value));
     } catch {
       const text = cleanMessageText(String(value));
       return text || undefined;
@@ -4613,6 +4617,15 @@ export function persistWorkspaceThreads(threads) {
     compactPersistence: true,
     stripLiveBindings: true,
   });
+}
+
+// One-time hydration hash backfill: threads persisted before projection
+// hashes existed re-pay full hash recomputation on EVERY workspace open (the
+// dirty-set correctly never re-persists unchanged threads, so they never gain
+// hashes on their own). Marking a workspace's hydrated threads dirty once
+// re-persists them WITH hashes; every later open takes the fast path.
+export function markWorkspaceThreadsPersistDirtyForHashBackfill(workspaceId, threadIds = []) {
+  markWorkspaceThreadsPersistDirty(workspaceId, threadIds, { shell: false });
 }
 
 export function mergeHydratedWorkspaceThreads(currentThreads, loadedThreads, options = {}) {

@@ -358,6 +358,7 @@ import {
   invalidateWorkspaceThreadProviderSession,
   markWorkspaceThreadAgentActivity,
   markWorkspaceThreadTerminalDetached,
+  markWorkspaceThreadsPersistDirtyForHashBackfill,
   materializeWorkspaceThreadForTerminal,
   mergeHydratedWorkspaceThreads,
   normalizeWorkspaceThreads,
@@ -25363,11 +25364,17 @@ export default function App() {
         if (disposed) {
           return;
         }
+        // Stage timing: elapsedMs alone can't distinguish the rust read/IPC
+        // from the normalize pass from scheduling gaps — these fields do.
+        const hydrationInvokeDoneAtMs = getWorkspaceActivationDiagnosticNowMs();
         const loadedThreads = normalizeWorkspaceThreads(result?.threads || {}, {
           stripLiveBindings: true,
         });
+        const hydrationNormalizeDoneAtMs = getWorkspaceActivationDiagnosticNowMs();
         logWorkspaceActivationTrace("workspace.open.threads_hydration.done", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
-          elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+          elapsedMs: Math.max(0, hydrationNormalizeDoneAtMs - startedAtMs),
+          invokeMs: Math.max(0, Math.round(hydrationInvokeDoneAtMs - startedAtMs)),
+          normalizeMs: Math.max(0, Math.round(hydrationNormalizeDoneAtMs - hydrationInvokeDoneAtMs)),
           loadedWorkspaceCount: Object.keys(loadedThreads).length,
           storeKey,
           targetCount: targets.length,
@@ -25412,6 +25419,34 @@ export default function App() {
             targets,
           });
         });
+        // One-time hash backfill: rows persisted before projection hashes
+        // existed re-pay full hash recomputation on every open. Mark each
+        // hydrated workspace's threads dirty once so the next flush persists
+        // them WITH hashes; later opens take the trusted-hash fast path.
+        try {
+          const backfillFlagKey = "diffforge.threadsHashBackfill.v1";
+          const backfilled = JSON.parse(window.localStorage?.getItem?.(backfillFlagKey) || "{}");
+          let backfillChanged = false;
+          Object.entries(loadedThreads).forEach(([loadedWorkspaceId, entry]) => {
+            if (backfilled[loadedWorkspaceId]) {
+              return;
+            }
+            const threadIds = [
+              ...Object.keys(entry?.threads || {}),
+              ...Object.keys(entry?.archivedThreads || {}),
+            ];
+            if (threadIds.length) {
+              markWorkspaceThreadsPersistDirtyForHashBackfill(loadedWorkspaceId, threadIds);
+            }
+            backfilled[loadedWorkspaceId] = Date.now();
+            backfillChanged = true;
+          });
+          if (backfillChanged) {
+            window.localStorage?.setItem?.(backfillFlagKey, JSON.stringify(backfilled));
+          }
+        } catch {
+          // backfill is an optimization; never block hydration
+        }
         workspaceThreadsBaselinePendingKeyRef.current = storeKey;
         workspaceThreadsBaselinePendingRef.current = {
           loadedThreads,
@@ -28777,6 +28812,14 @@ export default function App() {
     let runtimeCleanupCompleted = false;
 
     workspaceDeactivationInFlightRef.current = targetWorkspaceId;
+    // Close-path tracing: deactivation had zero phase marks, so close-time
+    // freezes could not be attributed (open has full coverage). The mark also
+    // feeds the freeze probe's activation correlation.
+    const deactivateStartedAtMs = getWorkspaceActivationDiagnosticNowMs();
+    logWorkspaceActivationTrace("workspace.close.begin", targetWorkspaceId, {
+      expectedTerminalTotal,
+      source,
+    });
     setWorkspaceDeactivationState({
       isActive: true,
       workspaceId: targetWorkspaceId,
@@ -28878,6 +28921,19 @@ export default function App() {
 
       workspaceDeactivationInFlightRef.current = "";
       setWorkspaceDeactivationState(WORKSPACE_DEACTIVATION_INITIAL_STATE);
+      logWorkspaceActivationTrace("workspace.close.done", targetWorkspaceId, {
+        elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - deactivateStartedAtMs),
+        runtimeCleanupCompleted,
+        source,
+      }, { force: true });
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          logWorkspaceActivationTrace("workspace.close.first_paint", targetWorkspaceId, {
+            elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - deactivateStartedAtMs),
+            source,
+          }, { force: true });
+        });
+      });
     }
   }, [
     clearPreparedWorkspaceTerminals,
