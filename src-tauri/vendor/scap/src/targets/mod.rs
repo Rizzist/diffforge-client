@@ -40,6 +40,14 @@ pub enum Target {
     Display(Display),
 }
 
+// SAFETY: on Windows the raw handles are HWND/HMONITOR — plain process-wide
+// handle values with no thread affinity; we only carry them across threads
+// as opaque identifiers.
+#[cfg(target_os = "windows")]
+unsafe impl Send for Window {}
+#[cfg(target_os = "windows")]
+unsafe impl Send for Display {}
+
 /// Returns a list of targets that can be captured
 pub fn get_all_targets() -> Vec<Target> {
     #[cfg(target_os = "macos")]
