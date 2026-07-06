@@ -54,6 +54,9 @@ const SNIPPING_RECORDING_TARGET_FPS: u32 = 60;
 const SNIPPING_RECORDING_FALLBACK_FPS: u32 = 30;
 const SNIPPING_RECORDING_MAX_OUTPUT_PIXELS: u64 = 1920 * 1080;
 const SNIPPING_RECORDING_TIMESTAMP_NS_PER_SECOND: u64 = 1_000_000_000;
+#[cfg(windows)]
+const SNIPPING_RECORDING_UNSUPPORTED_WINDOWS_ERROR: &str =
+    "Screen recording is not yet supported on Windows.";
 #[cfg(target_os = "macos")]
 const SNIPPING_SCREEN_CAPTURE_KIT_SETUP_TIMEOUT_MS: u64 = 4_500;
 #[cfg(target_os = "macos")]
@@ -4927,6 +4930,7 @@ fn snipping_recording_frame_index_timestamp_ns(frame_index: u64, fps: u32) -> Re
     u64::try_from(timestamp).map_err(|_| "Screen recording timestamp is too large.".to_string())
 }
 
+#[cfg(not(windows))]
 fn snipping_recording_vp9_config(
     width: u32,
     height: u32,
@@ -4967,6 +4971,7 @@ fn snipping_recording_vp9_config(
     Ok(config)
 }
 
+#[cfg(not(windows))]
 fn snipping_open_recording_segment(
     session: &SnippingRecordingSession,
     fps: u32,
@@ -5025,6 +5030,7 @@ fn snipping_open_recording_segment(
     Ok((encoder, builder.build(), video_track))
 }
 
+#[cfg(not(windows))]
 fn snipping_write_pending_vp9_frames(
     encoder: &mut shiguredo_libvpx::Encoder,
     segment: &mut webm::mux::Segment<std::io::BufWriter<fs::File>>,
@@ -5044,6 +5050,7 @@ fn snipping_write_pending_vp9_frames(
     Ok(())
 }
 
+#[cfg(not(windows))]
 fn snipping_encode_recording_yuv_frame(
     encoder: &mut shiguredo_libvpx::Encoder,
     segment: &mut webm::mux::Segment<std::io::BufWriter<fs::File>>,
@@ -5090,6 +5097,7 @@ fn snipping_encode_recording_yuv_frame(
     snipping_write_pending_vp9_frames(encoder, segment, video_track, pending_pts_ns, sample_count)
 }
 
+#[cfg(not(windows))]
 fn snipping_finalize_recording_segment(
     app: &AppHandle,
     session: &SnippingRecordingSession,
@@ -6776,7 +6784,8 @@ fn snipping_windows_graphics_capture_start(
     }
 }
 
-#[cfg(windows)]
+// Disabled until screen recording has a Windows-safe encoder backend.
+#[cfg(all(windows, not(windows)))]
 #[allow(clippy::too_many_arguments)]
 fn snipping_recording_loop_inner_windows_graphics_capture(
     app: &AppHandle,
@@ -7189,79 +7198,21 @@ fn snipping_recording_loop_inner(
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments)]
 fn snipping_recording_loop_inner(
-    app: &AppHandle,
-    session: &SnippingRecordingSession,
-    monitor: SnippingAreaMonitor,
-    source_x: u32,
-    source_y: u32,
-    source_width: u32,
-    source_height: u32,
-    frame_x: u32,
-    frame_y: u32,
-    frame_width: u32,
-    frame_height: u32,
-    reason: String,
-    shortcut: String,
+    _app: &AppHandle,
+    _session: &SnippingRecordingSession,
+    _monitor: SnippingAreaMonitor,
+    _source_x: u32,
+    _source_y: u32,
+    _source_width: u32,
+    _source_height: u32,
+    _frame_x: u32,
+    _frame_y: u32,
+    _frame_width: u32,
+    _frame_height: u32,
+    _reason: String,
+    _shortcut: String,
 ) -> Result<(), String> {
-    match snipping_recording_loop_inner_windows_graphics_capture(
-        app,
-        session,
-        &monitor,
-        source_x,
-        source_y,
-        source_width,
-        source_height,
-        frame_x,
-        frame_y,
-        frame_width,
-        frame_height,
-        &reason,
-        &shortcut,
-    ) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let fallback_stage = match &error {
-                SnippingWindowsGraphicsCaptureRecordingError::Setup(_) => "setup",
-                SnippingWindowsGraphicsCaptureRecordingError::Runtime(_) => "runtime",
-            };
-            let error_message = error.message().to_string();
-            if fallback_stage != "setup" && session.stop.load(Ordering::Acquire) {
-                return Err(error_message);
-            }
-            let _ = fs::remove_file(&session.tmp_path);
-            log_terminal_status_event(
-                "backend.snipping.recording.wgc_fallback",
-                json!({
-                    "stage": fallback_stage,
-                    "error": error_message.clone(),
-                    "fallback": "scap",
-                }),
-            );
-            log_snipping_area_cursor_debug_event(
-                "native.recording_wgc_fallback",
-                json!({
-                    "stage": fallback_stage,
-                    "error": error_message.clone(),
-                    "fallback": "scap",
-                }),
-            );
-            snipping_recording_loop_inner_scap(
-                app,
-                session,
-                monitor,
-                source_x,
-                source_y,
-                source_width,
-                source_height,
-                frame_x,
-                frame_y,
-                frame_width,
-                frame_height,
-                reason,
-                shortcut,
-            )
-        }
-    }
+    Err(SNIPPING_RECORDING_UNSUPPORTED_WINDOWS_ERROR.to_string())
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
@@ -7298,6 +7249,7 @@ fn snipping_recording_loop_inner(
     )
 }
 
+#[cfg(not(windows))]
 #[allow(clippy::too_many_arguments)]
 fn snipping_recording_loop_inner_scap(
     app: &AppHandle,
@@ -7810,6 +7762,16 @@ fn snipping_recording_area_from_selection(
     )
 }
 
+#[cfg(windows)]
+fn snipping_start_area_recording_for(
+    _app: &AppHandle,
+    _overlay_label: &str,
+    _request: SnippingAreaSelectionRequest,
+) -> Result<Value, String> {
+    Err(SNIPPING_RECORDING_UNSUPPORTED_WINDOWS_ERROR.to_string())
+}
+
+#[cfg(not(windows))]
 fn snipping_start_area_recording_for(
     app: &AppHandle,
     overlay_label: &str,
@@ -9594,6 +9556,16 @@ fn snipping_begin_area_snip_for(
     snipping_begin_area_for(app, reason, shortcut, SnippingAreaMode::Image)
 }
 
+#[cfg(windows)]
+fn snipping_begin_area_recording_for(
+    _app: &AppHandle,
+    _reason: &str,
+    _shortcut: String,
+) -> Result<Value, String> {
+    Err(SNIPPING_RECORDING_UNSUPPORTED_WINDOWS_ERROR.to_string())
+}
+
+#[cfg(not(windows))]
 fn snipping_begin_area_recording_for(
     app: &AppHandle,
     reason: &str,
@@ -14563,6 +14535,7 @@ mod snipping_recording_webm_tests {
         assert!(result.is_err());
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn recording_vp9_webm_encoder_writes_valid_file() {
         let path = write_test_recording("encoded-recording", &[]);
