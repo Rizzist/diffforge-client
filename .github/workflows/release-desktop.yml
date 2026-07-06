@@ -89,7 +89,9 @@ jobs:
           if-no-files-found: error
 
   build-linux:
-    runs-on: ubuntu-22.04
+    # 24.04: libspa 0.8 (pipewire bindings, via scap) needs newer pipewire
+    # headers than 22.04's pipewire 0.3.48 provides.
+    runs-on: ubuntu-24.04
     continue-on-error: true
     timeout-minutes: 90
     steps:
