@@ -22,6 +22,48 @@ const NATIVE_WEBVIEW_EXCLUSION_MARGIN = 4;
 const NATIVE_WEBVIEW_EXCLUSION_LIFT_DATASET_KEY = "nativeWebviewExclusionLift";
 const nativeWebviewVisibleRects = new Map();
 
+// Native child webviews composite above ALL DOM, so full-window overlays (the
+// app close confirmation, and any future blocking modal) cannot paint over
+// them. Such overlays register as suppressors: while at least one suppressor
+// is active, every webview owned by this window is parked off-screen.
+const nativeWebviewSuppressors = new Set();
+const nativeWebviewSuppressionListeners = new Set();
+
+export function setNativeWebviewsSuppressed(key, active) {
+  const safeKey = String(key || "").trim();
+  if (!safeKey) {
+    return;
+  }
+  const before = nativeWebviewSuppressors.size > 0;
+  if (active) {
+    nativeWebviewSuppressors.add(safeKey);
+  } else {
+    nativeWebviewSuppressors.delete(safeKey);
+  }
+  const after = nativeWebviewSuppressors.size > 0;
+  if (before === after) {
+    return;
+  }
+  nativeWebviewSuppressionListeners.forEach((listener) => {
+    try {
+      listener(after);
+    } catch {
+      // One broken listener must not stop the rest from re-fitting.
+    }
+  });
+}
+
+function nativeWebviewsSuppressed() {
+  return nativeWebviewSuppressors.size > 0;
+}
+
+function subscribeNativeWebviewSuppression(listener) {
+  nativeWebviewSuppressionListeners.add(listener);
+  return () => {
+    nativeWebviewSuppressionListeners.delete(listener);
+  };
+}
+
 function hiddenNativeRect() {
   const viewportWidth = typeof window !== "undefined" ? Number(window.innerWidth || 0) : 0;
   const viewportHeight = typeof window !== "undefined" ? Number(window.innerHeight || 0) : 0;
@@ -359,6 +401,7 @@ export function useNativeWebview({
 }) {
   const [status, setStatus] = useState("idle");
   const [reloadKey, setReloadKey] = useState(0);
+  const [webviewsSuppressed, setWebviewsSuppressed] = useState(nativeWebviewsSuppressed);
 
   const labelRef = useRef("");
   const generationRef = useRef(0);
@@ -384,7 +427,9 @@ export function useNativeWebview({
   // catches up to a navigation the page already made, no re-open is needed.
   const lastLoadedUrlRef = useRef("");
 
-  visibleRef.current = visible;
+  const effectiveVisible = Boolean(visible) && !webviewsSuppressed;
+
+  visibleRef.current = effectiveVisible;
   onNavigateRef.current = onNavigate;
   onErrorRef.current = onError;
   suspendedRef.current = Boolean(suspended);
@@ -401,6 +446,12 @@ export function useNativeWebview({
       mountedRef.current = false;
     };
   }, []);
+
+  useEffect(() => subscribeNativeWebviewSuppression((suppressed) => {
+    if (mountedRef.current) {
+      setWebviewsSuppressed(suppressed);
+    }
+  }), []);
 
   const assignLabel = useCallback((nextLabel) => {
     const safeLabel = String(nextLabel || "").trim();
@@ -519,13 +570,13 @@ export function useNativeWebview({
 
   useLayoutEffect(() => {
     const label = labelRef.current;
-    if (!runtimeEnabled || visible || !label) {
+    if (!runtimeEnabled || effectiveVisible || !label) {
       return undefined;
     }
     fit(label, false, { force: true });
     scheduleFitBurst(label, false, { delays: [0, 32, 80], frames: 3 });
     return undefined;
-  }, [fit, runtimeEnabled, scheduleFitBurst, visible]);
+  }, [effectiveVisible, fit, runtimeEnabled, scheduleFitBurst]);
 
   const evaluate = useCallback((script, options = {}) => {
     const label = labelRef.current;
@@ -725,11 +776,12 @@ export function useNativeWebview({
     // whichever label this hook last reported, so keying on it would loop.
   }, [runtimeEnabled, url, reloadKey, parentWindowLabel, viewportRef, scopeParts, fit, scheduleFitBurst, closeCurrent, visible, safeViewportInsetBottom, suspended, adoptNonce, assignLabel]);
 
-  // Re-fit (and show/hide) whenever visibility flips.
+  // Re-fit (and show/hide) whenever visibility flips — including suppression by
+  // a full-window DOM overlay.
   useEffect(() => {
-    fit(labelRef.current, visible, { force: true });
-    scheduleFitBurst(labelRef.current, visible, { delays: [80, 180], frames: visible ? 3 : 2 });
-  }, [fit, scheduleFitBurst, visible]);
+    fit(labelRef.current, effectiveVisible, { force: true });
+    scheduleFitBurst(labelRef.current, effectiveVisible, { delays: [80, 180], frames: effectiveVisible ? 3 : 2 });
+  }, [effectiveVisible, fit, scheduleFitBurst]);
 
   // Entering suspension: park the webview offscreen ONCE, then go silent so the
   // adopting window can take ownership without the grid fighting its fits.

@@ -136,6 +136,7 @@ import TerminalView, {
   TodoQueuePanel,
   useTerminalGridSeparatorDragGate,
 } from "../terminals/TerminalView.jsx";
+import { useWorkspaceToolPanelBridge } from "../terminals/workspaceToolPanelBridge.js";
 
 const TODO_STORE_CHANGED_TAURI_EVENT = "todo-store-changed";
 const EMPTY_ARRAY = Object.freeze([]);
@@ -977,7 +978,7 @@ import {
 } from "../tools/workspaceToolDragTypes.js";
 import FilesWorkspaceView, { getDirectoryName } from "../files/FilesWorkspaceView.jsx";
 import WebWorkspaceView, { workspaceWebTabPaneId } from "../web/WebWorkspaceView.jsx";
-import { DEFAULT_WEB_URL, normalizeWebInput } from "../web/webNative.js";
+import { DEFAULT_WEB_URL, normalizeWebInput, setNativeWebviewsSuppressed } from "../web/webNative.js";
 import {
   WEB_PANEL_CLOSED_EVENT,
   WEB_PANEL_CONTROL_EVENT,
@@ -22807,6 +22808,12 @@ export default function App() {
   const [workspaceToolLayoutWidth, setWorkspaceToolLayoutWidth] = useState(0);
   const [workspaceToolRuntimeBridges, setWorkspaceToolRuntimeBridges] = useState({});
   const workspaceToolRuntimeBridgesRef = useRef(workspaceToolRuntimeBridges);
+  const workspaceToolPanelBridge = useWorkspaceToolPanelBridge();
+  const workspaceToolPanelData = workspaceToolPanelBridge.data || EMPTY_OBJECT;
+  const workspaceToolPanelActuators = workspaceToolPanelBridge.actuators || EMPTY_OBJECT;
+  const workspaceToolPanelHasRuntime = Boolean(
+    workspaceToolPanelBridge.hasRuntime && workspaceToolPanelBridge.activeWorkspaceId,
+  );
   const workspaceWebTabSessionsRef = useRef(workspaceWebTabSessions);
   workspaceWebTabSessionsRef.current = workspaceWebTabSessions;
   useEffect(() => {
@@ -24080,6 +24087,16 @@ export default function App() {
   useEffect(() => {
     appCloseConfirmStateRef.current = appCloseConfirmState;
   }, [appCloseConfirmState]);
+
+  // The close confirmation is a full-window DOM overlay; native child webviews
+  // composite above all DOM, so park them while it is open (or loading).
+  useEffect(() => {
+    const overlayActive = Boolean(appCloseConfirmState.isOpen || appCloseConfirmState.isLoading);
+    setNativeWebviewsSuppressed("app-close-confirm", overlayActive);
+    return () => {
+      setNativeWebviewsSuppressed("app-close-confirm", false);
+    };
+  }, [appCloseConfirmState.isLoading, appCloseConfirmState.isOpen]);
 
   const setWorkspaceGraphStatus = useCallback((repoPath, workspaceId, statusPatch) => {
     const key = workspaceGraphStateKey(repoPath, workspaceId);
@@ -25375,6 +25392,7 @@ export default function App() {
           elapsedMs: Math.max(0, hydrationNormalizeDoneAtMs - startedAtMs),
           invokeMs: Math.max(0, Math.round(hydrationInvokeDoneAtMs - startedAtMs)),
           normalizeMs: Math.max(0, Math.round(hydrationNormalizeDoneAtMs - hydrationInvokeDoneAtMs)),
+          rustTimings: result?.timings || null,
           loadedWorkspaceCount: Object.keys(loadedThreads).length,
           storeKey,
           targetCount: targets.length,
@@ -37310,7 +37328,7 @@ export default function App() {
   const tokenomicsViewActive = tokenomicsViewVisible && viewMotion !== "exiting";
   const audioViewMounted = audioViewVisible || visitedAccountViews.audio;
   const tokenomicsViewMounted = tokenomicsViewVisible || visitedAccountViews.tokenomics;
-  const workspaceToolPaneAvailable = !shouldShowWorkspaceSetup;
+  const workspaceToolPaneAvailable = !shouldShowWorkspaceSetup && visibleView === DEFAULT_WORKSPACE_VIEW;
   const workspaceToolPaneVisible = workspaceToolPaneAvailable;
   const workspaceToolPaneMinimized = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
   const workspaceToolPaneFullscreen = workspaceToolPaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
@@ -37341,7 +37359,7 @@ export default function App() {
   const workspaceMainPanelMinSize = workspaceToolPaneVisible
     ? workspaceToolPaneMinimized ? 72 : 30
     : 100;
-  const shouldRenderAccountToolPanel = workspaceToolPaneAvailable;
+  const shouldRenderWorkspaceToolPanel = workspaceToolPaneAvailable;
   const selectedWorkspaceToolRuntimeBridge = selectedWorkspaceToolWorkspaceId
     ? workspaceToolRuntimeBridges[selectedWorkspaceToolWorkspaceId] || null
     : null;
@@ -51647,7 +51665,6 @@ export default function App() {
                             workspaceDocumentPanelEnabled={getWorkspaceDocumentCount(workspaceSettings, runtimeWorkspace.id) > 0}
                             workspaceToolPaneMode={workspaceToolPaneMode}
                             workspaceToolPaneVisible={workspaceToolPaneVisible}
-                            workspaceToolPortalTarget={null}
                             terminalWorkspace={runtimeWorkspace}
                             terminalRenderAgentsByIndex={runtimeDescriptor.terminalRenderAgentsByIndex}
                             terminalPermissionsByIndex={runtimeDescriptor.terminalPermissionsByIndex}
@@ -51710,7 +51727,6 @@ export default function App() {
                             onOpenWorkspacePcbPanel={openSelectedWorkspacePcbPanel}
                             plan={billingPlanName}
                             onMinimizeWorkspaceToolPane={minimizeWorkspaceToolPane}
-                            onRestoreWorkspaceToolPane={restoreWorkspaceToolPane}
                             onToggleFullscreenWorkspaceToolPane={toggleFullscreenWorkspaceToolPane}
                             onWorkspaceToolRuntimeBridgeChange={updateWorkspaceToolRuntimeBridge}
                             onWorkspaceThreadsViewStateChange={updateWorkspaceThreadsViewStateFromOverlay}
@@ -53514,7 +53530,7 @@ export default function App() {
                         <WorkspaceAppToolPortalHost
                           aria-hidden={workspaceToolPaneVisible ? undefined : "true"}
                         >
-                          {shouldRenderAccountToolPanel ? (
+                          {shouldRenderWorkspaceToolPanel ? (
                             <>
                               {workspaceToolPaneMinimized ? (
                                 <WorkspaceAppToolMinimizedRail aria-label="App tools minimized">
@@ -53539,64 +53555,125 @@ export default function App() {
                                   minHeight: 0,
                                 }}
                               >
+                                <Profiler
+                                  id={`runtime-tools:${workspaceToolPanelData.workspaceId || "tools"}`}
+                                  onRender={onRuntimeProfilerRender}
+                                >
                                 <TodoQueuePanel
                                   accountKey={resolvedTokenomicsAccountKey}
+                                  activeDragItemId={workspaceToolPanelData.activeDragItemId || ""}
                                   agentStatuses={agentStatuses}
+                                  agentStatusError={agentStatusError}
+                                  agentStatusState={agentStatusState}
                                   billingStatus={billingStatus}
                                   connectedDevices={cloudWorkspaceProgress.connectedDevices}
-                                  coordinationTargets={selectedWorkspaceToolCoordinationTargets}
+                                  coordinationTargets={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelData.coordinationTargets || EMPTY_ARRAY
+                                      : EMPTY_ARRAY
+                                  }
                                   defaultWorkingDirectory={defaultWorkingDirectory}
                                   deviceLiveState={cloudWorkspaceProgress.deviceLiveState}
-                                  documentPanelEnabled={selectedWorkspaceToolDocumentsEnabled}
-                                  dropError={accountToolError}
-                                  draft={accountToolDraft}
-                                  gitRepositoriesPreload={workspaceGitRepositoryPreloads[
-                                    workspaceGitPullPromptCheckKey(
-                                      selectedWorkspaceToolWorkspaceId,
-                                      selectedWorkspaceToolFileRoot || defaultWorkingDirectory,
-                                    )
-                                  ] || null}
-                                  gitSnapshotsPreload={workspaceGitSnapshotPreloads[
-                                    workspaceGitPullPromptCheckKey(
-                                      selectedWorkspaceToolWorkspaceId,
-                                      selectedWorkspaceToolFileRoot || defaultWorkingDirectory,
-                                    )
-                                  ] || null}
-                                  items={accountToolComposerItems}
+                                  dispatchTargets={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelData.dispatchTargets || EMPTY_ARRAY
+                                      : EMPTY_ARRAY
+                                  }
+                                  documentPanelEnabled={Boolean(
+                                    workspaceToolPanelHasRuntime && workspaceToolPanelData.documentPanelEnabled,
+                                  )}
+                                  draft={workspaceToolPanelHasRuntime ? workspaceToolPanelData.draft || "" : ""}
+                                  dropError={workspaceToolPanelHasRuntime ? workspaceToolPanelData.dropError || "" : ""}
+                                  getItemAccentColor={workspaceToolPanelData.getItemAccentColor || null}
+                                  gitRepositoriesPreload={workspaceToolPanelData.gitRepositoriesPreload || null}
+                                  gitSnapshotsPreload={workspaceToolPanelData.gitSnapshotsPreload || null}
+                                  items={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelData.items || EMPTY_ARRAY
+                                      : EMPTY_ARRAY
+                                  }
                                   knownDevices={cloudWorkspaceProgress.knownDevices}
                                   localDesktopProfile={cloudDesktopDeviceProfile}
-                                  onBeginTodoDrag={selectedWorkspaceToolRuntimeBridge?.onBeginTodoDrag}
-                                  onCancelQueuedItem={cancelAccountToolQueuedTodo}
-                                  onDraftChange={setAccountToolDraft}
-                                  onMinimizePane={minimizeWorkspaceToolPane}
-                                  onRefreshGitRepositories={refreshWorkspaceGitRepositoryPreload}
-                                  onRefreshGitSnapshot={refreshWorkspaceGitSnapshotPreload}
-                                  onOpenDocumentPanel={openSelectedWorkspaceDocumentPanel}
-                                  onOpenWorkspaceSettings={openSelectedWorkspaceSettings}
-                                  onQueueAllItems={queueAllAccountToolTodos}
-                                  onQueueItem={queueAccountToolTodo}
-                                  onRemoveItem={removeAccountToolTodo}
-                                  onSubmitDraft={submitAccountToolDraft}
-                                  onToggleTerminalBreakout={selectedWorkspaceToolRuntimeBridge?.onToggleTerminalBreakout}
-                                  onToggleWindowBreakout={selectedWorkspaceToolRuntimeBridge?.onToggleWindowBreakout}
-                                  onToggleFullscreenPane={toggleFullscreenWorkspaceToolPane}
-                                  onUpdateItem={updateAccountToolTodoText}
-                                  onVoiceAgentToolCall={selectedWorkspaceToolRuntimeBridge?.onVoiceAgentToolCall}
-                                  onVoicePlanServerResult={selectedWorkspaceToolRuntimeBridge?.onVoicePlanServerResult}
+                                  onAddToolTodo={workspaceToolPanelActuators.onAddToolTodo}
+                                  onBeginTodoDrag={workspaceToolPanelActuators.onBeginTodoDrag}
+                                  onBeginWorkspaceFileDrag={workspaceToolPanelActuators.onBeginWorkspaceFileDrag}
+                                  onCancelQueuedItem={workspaceToolPanelActuators.onCancelQueuedItem}
+                                  onCancelVoicePlan={workspaceToolPanelActuators.onCancelVoicePlan}
+                                  onCancelVoicePlanTask={workspaceToolPanelActuators.onCancelVoicePlanTask}
+                                  onDispatchTodoToTarget={workspaceToolPanelActuators.onDispatchTodoToTarget}
+                                  onDraftChange={workspaceToolPanelActuators.onDraftChange}
+                                  onMinimizePane={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelActuators.onMinimizePane
+                                      : minimizeWorkspaceToolPane
+                                  }
+                                  onRefreshGitRepositories={workspaceToolPanelActuators.onRefreshGitRepositories}
+                                  onRefreshGitSnapshot={workspaceToolPanelActuators.onRefreshGitSnapshot}
+                                  onRecheckAgents={workspaceToolPanelActuators.onRecheckAgents}
+                                  onOpenDocumentPanel={workspaceToolPanelActuators.onOpenDocumentPanel}
+                                  onOpenWorkspaceSettings={workspaceToolPanelActuators.onOpenWorkspaceSettings}
+                                  onQueueAllItems={workspaceToolPanelActuators.onQueueAllItems}
+                                  onQueueItem={workspaceToolPanelActuators.onQueueItem}
+                                  onRemoveItem={workspaceToolPanelActuators.onRemoveItem}
+                                  onRemoveItemAttachment={workspaceToolPanelActuators.onRemoveItemAttachment}
+                                  onReorderItem={workspaceToolPanelActuators.onReorderItem}
+                                  onResumePlan={workspaceToolPanelActuators.onResumePlan}
+                                  onResumeTodoSession={workspaceToolPanelActuators.onResumeTodoSession}
+                                  onRequeueVoicePlanTask={workspaceToolPanelActuators.onRequeueVoicePlanTask}
+                                  onRequeueVoicePlanUnfinished={workspaceToolPanelActuators.onRequeueVoicePlanUnfinished}
+                                  onSubmitDraft={workspaceToolPanelActuators.onSubmitDraft}
+                                  onToggleTerminalBreakout={workspaceToolPanelActuators.onToggleTerminalBreakout}
+                                  onToggleWindowBreakout={workspaceToolPanelActuators.onToggleWindowBreakout}
+                                  onToggleFullscreenPane={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelActuators.onToggleFullscreenPane
+                                      : toggleFullscreenWorkspaceToolPane
+                                  }
+                                  onUpdateItem={workspaceToolPanelActuators.onUpdateItem}
+                                  onVoiceAgentToolCall={workspaceToolPanelActuators.onVoiceAgentToolCall}
+                                  onVoicePlanNeedsRequeue={workspaceToolPanelActuators.onVoicePlanNeedsRequeue}
+                                  onVoicePlanServerResult={workspaceToolPanelActuators.onVoicePlanServerResult}
                                   paneMode={workspaceToolPaneMode}
-                                  pendingItems={accountToolPendingItems}
-                                  queueItems={accountToolComposerItems}
-                                  rootDirectory={selectedWorkspaceToolFileRoot || defaultWorkingDirectory}
+                                  peerItems={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelData.peerItems || EMPTY_ARRAY
+                                      : EMPTY_ARRAY
+                                  }
+                                  pendingItems={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelData.pendingItems || EMPTY_OBJECT
+                                      : EMPTY_OBJECT
+                                  }
+                                  queueItems={
+                                    workspaceToolPanelHasRuntime
+                                      ? workspaceToolPanelData.queueItems || EMPTY_ARRAY
+                                      : EMPTY_ARRAY
+                                  }
+                                  rootDirectory={workspaceToolPanelData.rootDirectory || defaultWorkingDirectory}
+                                  selectedTerminalPlanTarget={workspaceToolPanelData.selectedTerminalPlanTarget || null}
                                   storageUsage={cloudWorkspaceProgress.storageUsage}
-                                  terminalBreakoutActive={Boolean(selectedWorkspaceToolRuntimeBridge?.terminalBreakoutActive)}
-                                  workspace={selectedWorkspaceToolWorkspace}
-                                  workspaceId={selectedWorkspaceToolWorkspaceId}
-                                  workspaceScopedTabsEnabled={Boolean(selectedWorkspaceToolWorkspace)}
+                                  terminalBreakoutActive={Boolean(
+                                    workspaceToolPanelHasRuntime && workspaceToolPanelData.terminalBreakoutActive,
+                                  )}
+                                  windowBreakoutActive={Boolean(
+                                    workspaceToolPanelHasRuntime && workspaceToolPanelData.windowBreakoutActive,
+                                  )}
+                                  workspace={workspaceToolPanelHasRuntime ? workspaceToolPanelData.workspace : null}
+                                  workspaceError={workspaceToolPanelHasRuntime ? workspaceToolPanelData.workspaceError || "" : ""}
+                                  workspaceId={workspaceToolPanelHasRuntime ? workspaceToolPanelData.workspaceId || "" : ""}
+                                  workspaceScopedTabsEnabled={Boolean(
+                                    workspaceToolPanelHasRuntime && workspaceToolPanelData.workspaceScopedTabsEnabled,
+                                  )}
                                   workspaceTodos={cloudWorkspaceProgress.workspaceTodos}
-                                  workspaceToolTabControlRef={accountWorkspaceToolTabControlRef}
-                                  workspaceToolTabMemoryRef={accountWorkspaceToolTabMemoryRef}
-                                  windowBreakoutActive={Boolean(selectedWorkspaceToolRuntimeBridge?.windowBreakoutActive)}
+                                  workspaceToolTabControlRef={
+                                    workspaceToolPanelData.workspaceToolTabControlRef || accountWorkspaceToolTabControlRef
+                                  }
+                                  workspaceToolTabMemoryRef={
+                                    workspaceToolPanelData.workspaceToolTabMemoryRef || accountWorkspaceToolTabMemoryRef
+                                  }
+                                  workspaces={workspaces}
                                 />
+                                </Profiler>
                               </div>
                             </>
                           ) : null}

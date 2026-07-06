@@ -127,7 +127,29 @@ function startUntrackedAssetsLibrarySync() {
     return Promise.resolve(untrackedAssetsStore.state.library);
   }
   untrackedAssetsStore.initialized = true;
-  return refreshUntrackedAssetsLibrary({ silent: true });
+  // The initial listing is a multi-MB payload; loading it during app boot /
+  // workspace open competed with activation for the main thread. Defer to
+  // idle — the change listener/watcher above keep later updates live.
+  return new Promise((resolve) => {
+    const run = () => {
+      // Never land the multi-MB initial listing inside a workspace-activation
+      // window — re-defer while an activation is recent.
+      const mark = typeof window !== "undefined" ? window.__DF_LAST_ACTIVATION_MARK : null;
+      const msSinceActivation = mark ? performance.now() - Number(mark.t || 0) : Infinity;
+      if (msSinceActivation < 3000) {
+        window.setTimeout(run, 3000);
+        return;
+      }
+      resolve(refreshUntrackedAssetsLibrary({ silent: true }));
+    };
+    if (typeof window !== "undefined" && typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(run, { timeout: 8000 });
+    } else if (typeof window !== "undefined") {
+      window.setTimeout(run, 3000);
+    } else {
+      run();
+    }
+  });
 }
 
 async function runUntrackedMutation(command, payload) {

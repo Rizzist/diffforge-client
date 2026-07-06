@@ -179,6 +179,10 @@ import {
   endTerminalLayoutAnimation,
 } from "./terminalResizeController.js";
 import {
+  clearWorkspaceToolPanelState,
+  publishWorkspaceToolPanelState,
+} from "./workspaceToolPanelBridge.js";
+import {
   appControlMessageHasExplicitTerminalTarget,
   getLoopspaceAutomationAutoSpawnMaxTotal,
   isLoopspaceAutomationAppControlMessage,
@@ -3496,9 +3500,6 @@ const TODO_QUEUE_REMOTE_COMMAND_BLOCKING_RECEIPT_STATES = new Set([
   "interrupted",
   "timed_out",
 ]);
-const TODO_QUEUE_VISIBLE_MIN_WIDTH = 760;
-const TODO_QUEUE_MINIMIZED_WIDTH_PX = 32;
-const TODO_QUEUE_RESTORED_MIN_WIDTH_PX = 300;
 const TODO_QUEUE_MAX_ITEMS = 120;
 const TODO_QUEUE_MAX_TEXT_LENGTH = 2_000_000;
 const TODO_QUEUE_MAX_NOTE_TEXT_LENGTH = 2_000_000;
@@ -17303,6 +17304,15 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
     String(workspaceToolTabMemoryRef?.current || "").trim() || "orchestrator"
   ));
   const activeWorkspaceTool = controlledWorkspaceToolId || uncontrolledActiveWorkspaceTool || "orchestrator";
+  useEffect(() => {
+    if (controlledWorkspaceToolId) {
+      return;
+    }
+    const rememberedTool = String(workspaceToolTabMemoryRef?.current || "").trim() || "orchestrator";
+    setUncontrolledActiveWorkspaceTool((currentTool) => (
+      currentTool === rememberedTool ? currentTool : rememberedTool
+    ));
+  }, [controlledWorkspaceToolId, orchestratorPanelWorkspaceId, workspaceToolTabMemoryRef]);
   const [visitedDormantWorkspaceTools, setVisitedDormantWorkspaceTools] = useState(() => ({
     tokenomics: false,
     tools: false,
@@ -23326,7 +23336,6 @@ function TerminalView({
   onAppControlContextChange = null,
   onAppControlDocumentActions = null,
   onMinimizeWorkspaceToolPane = null,
-  onRestoreWorkspaceToolPane = null,
   onToggleFullscreenWorkspaceToolPane = null,
   onWorkspaceToolRuntimeBridgeChange = null,
   onOpenWorkspaceDocumentPanel = null,
@@ -23373,7 +23382,6 @@ function TerminalView({
   workspaceScopedToolTabsEnabled = true,
   workspaceToolPaneMode = "",
   workspaceToolPaneVisible = false,
-  workspaceToolPortalTarget = null,
   workspaceWebviewObscured = false,
   workspaceThreads = {},
   workspaceTodos = null,
@@ -23438,6 +23446,29 @@ function TerminalView({
   const hasVisibleWorkspaceTerminalPanes = hasWorkspaceTerminals && displayTerminalRows.length > 0;
   const [activeTerminalPaneId, setActiveTerminalPaneId] = useState("");
   const [fullscreenTerminalIndex, setFullscreenTerminalIndex] = useState(null);
+  // Staged runtime mount: the first pane renders on the initial commit; each
+  // additional pane is released one frame later. Mounting every pane's full
+  // subtree (xterm chrome, composer, headers) in ONE commit measured ~740ms
+  // on a 2-pane workspace — the single biggest block in workspace-open lag.
+  // Frames between releases let the shell paint and input stay live.
+  const [paneMountBudget, setPaneMountBudget] = useState(1);
+  const paneMountBudgetRef = useRef(1);
+  useEffect(() => {
+    const total = logicalTerminalIndexes.length;
+    if (paneMountBudgetRef.current >= total) {
+      return undefined;
+    }
+    let frame = 0;
+    const release = () => {
+      paneMountBudgetRef.current = Math.min(total, paneMountBudgetRef.current + 1);
+      setPaneMountBudget(paneMountBudgetRef.current);
+      if (paneMountBudgetRef.current < total) {
+        frame = window.requestAnimationFrame(release);
+      }
+    };
+    frame = window.requestAnimationFrame(release);
+    return () => window.cancelAnimationFrame(frame);
+  }, [logicalTerminalIndexes.length]);
   const [fullscreenMotion, setFullscreenMotion] = useState(TERMINAL_FULLSCREEN_DEFAULT_MOTION);
   const [terminalLayoutRects, setTerminalLayoutRects] = useState({});
   const [terminalPanelRect, setTerminalPanelRect] = useState(null);
@@ -23628,10 +23659,11 @@ function TerminalView({
   // panel without a TerminalView-wide re-render per tab click.
   const workspaceToolTabControlRef = useRef(null);
   const workspaceToolTabMemoryRef = useRef("orchestrator");
+  const workspaceToolPanelBridgeOwnerRef = useRef("");
+  if (!workspaceToolPanelBridgeOwnerRef.current) {
+    workspaceToolPanelBridgeOwnerRef.current = `terminal-tools:${Math.random().toString(36).slice(2)}`;
+  }
   const [appBackgroundMode, setAppBackgroundMode] = useState(false);
-  const [terminalWorkspaceMainWidth, setTerminalWorkspaceMainWidth] = useState(0);
-  const workspaceToolPortaled = Boolean(workspaceToolPortalTarget);
-  const workspaceToolOwnedByAppShell = Boolean(workspaceToolPaneVisible && !workspaceToolPortaled);
   const effectiveTodoQueuePaneMode = workspaceToolPaneMode || todoQueuePaneMode;
   const selectRuntimeWorkspaceToolTab = useCallback((toolId) => {
     const safeToolId = String(toolId || "").trim();
@@ -23657,35 +23689,10 @@ function TerminalView({
   void activeTabTerminals;
   const tabVisibilityByTerminal = useMemo(() => new Map(), []);
   const visibleTabTerminalIndexes = visibleLogicalTerminalIndexes;
-  const todoQueueVisible = Boolean(
-    !workspaceToolOwnedByAppShell
-    && hasVisibleWorkspaceTerminalPanes
-    && terminalWorkspaceMainWidth >= TODO_QUEUE_VISIBLE_MIN_WIDTH,
-  );
-  const effectiveTodoQueueVisible = workspaceToolPortaled
-    ? Boolean(hasWorkspaceTerminals)
-    : todoQueueVisible;
   const todoQueuePaneMinimized = effectiveTodoQueuePaneMode === TODO_QUEUE_PANE_MODE_MINIMIZED;
-  const todoQueuePaneFullscreen = effectiveTodoQueuePaneMode === TODO_QUEUE_PANE_MODE_FULLSCREEN;
-  const todoQueueMinimizedSize = terminalWorkspaceMainWidth > 0
-    ? Math.min(4, Math.max(2.8, (TODO_QUEUE_MINIMIZED_WIDTH_PX / terminalWorkspaceMainWidth) * 100))
-    : 3.2;
-  const todoQueueRestoredMinSize = terminalWorkspaceMainWidth > 0
-    ? Math.min(70, Math.max(20, (TODO_QUEUE_RESTORED_MIN_WIDTH_PX / terminalWorkspaceMainWidth) * 100))
-    : 20;
-  const todoQueuePanelSize = todoQueuePaneMinimized
-    ? todoQueueMinimizedSize
-    : todoQueuePaneFullscreen
-      ? 62
-      : Math.max(30, todoQueueRestoredMinSize);
-  const terminalGridPanelSize = 100 - todoQueuePanelSize;
-  const todoQueuePanelMinSize = todoQueuePaneMinimized
-    ? `${todoQueueMinimizedSize}%`
-    : `${TODO_QUEUE_RESTORED_MIN_WIDTH_PX}px`;
-  const todoQueuePanelMaxSize = todoQueuePaneMinimized ? todoQueueMinimizedSize : 70;
-  const terminalGridPanelMinSize = todoQueuePaneMinimized ? 72 : 30;
+  const workspaceToolPaneExpanded = Boolean(workspaceToolPaneVisible && !todoQueuePaneMinimized);
   useEffect(() => {
-    if (effectiveTodoQueueVisible && !todoQueuePaneMinimized) {
+    if (workspaceToolPaneExpanded) {
       return undefined;
     }
     let disposed = false;
@@ -23727,7 +23734,7 @@ function TerminalView({
       disposed = true;
       unlisten();
     };
-  }, [effectiveTodoQueueVisible, todoQueuePaneMinimized]);
+  }, [workspaceToolPaneExpanded]);
   const fullscreenTransitionTimerRef = useRef(0);
   const terminalBreakoutTransitionTimerRef = useRef(0);
   const terminalBreakoutPanStateRef = useRef(null);
@@ -23759,11 +23766,8 @@ function TerminalView({
   const terminalDocumentPanelRectRef = useRef(null);
   const terminalLayoutRectsRef = useRef({});
   const terminalPanelRectRef = useRef(null);
-  const terminalGridPanelRef = useRef(null);
-  const terminalWorkspaceMainRef = useRef(null);
   const terminalPanelsRef = useRef(null);
   const terminalToolboxRef = useRef(null);
-  const todoQueuePanelRef = useRef(null);
   const todoDragStateRef = useRef(null);
   // Cross-window drag: index of the breakout-window terminal currently under
   // the cursor (null when over the main window or nothing). Set from the Rust
@@ -28867,103 +28871,6 @@ function TerminalView({
       setTodoQueueDispatchRevision((revision) => revision + 1);
     }
     }, [resolveTodoQueueLiveTerminal, terminalWorkspace?.id, workspaceThreadEntry]);
-
-  useEffect(() => {
-    const element = terminalWorkspaceMainRef.current;
-    if (!element) {
-      return undefined;
-    }
-
-    let widthFrame = 0;
-    const updateWidth = () => {
-      if (widthFrame) {
-        window.cancelAnimationFrame(widthFrame);
-      }
-      widthFrame = window.requestAnimationFrame(() => {
-        widthFrame = 0;
-        const nextWidth = Math.round(element.getBoundingClientRect().width || 0);
-        setTerminalWorkspaceMainWidth((currentWidth) => (
-          currentWidth === nextWidth ? currentWidth : nextWidth
-        ));
-      });
-    };
-
-    const measureWidthNow = () => {
-      const nextWidth = Math.round(element.getBoundingClientRect().width || 0);
-      setTerminalWorkspaceMainWidth((currentWidth) => (
-        currentWidth === nextWidth ? currentWidth : nextWidth
-      ));
-    };
-
-    measureWidthNow();
-
-    if (typeof ResizeObserver === "undefined") {
-      window.addEventListener("resize", updateWidth);
-      return () => {
-        if (widthFrame) {
-          window.cancelAnimationFrame(widthFrame);
-        }
-        window.removeEventListener("resize", updateWidth);
-      };
-    }
-
-    const observer = new ResizeObserver(updateWidth);
-    observer.observe(element);
-
-    return () => {
-      if (widthFrame) {
-        window.cancelAnimationFrame(widthFrame);
-      }
-      observer.disconnect();
-    };
-  }, [shouldShowWorkspaceSetup]);
-
-  useEffect(() => {
-    if (!workspaceToolPortaled && !todoQueueVisible && todoQueuePaneMode !== TODO_QUEUE_PANE_MODE_NORMAL) {
-      setTodoQueuePaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
-    }
-  }, [todoQueuePaneMode, todoQueueVisible, workspaceToolPortaled]);
-
-  useEffect(() => {
-    if (workspaceToolPortaled || !todoQueueVisible || !hasVisibleWorkspaceTerminalPanes) {
-      return undefined;
-    }
-
-    const frameId = window.requestAnimationFrame(() => {
-      // Guarded imperative resize: an unconditional resize() notifies the
-      // panel-group store (re-rendering every Panel/Separator subscriber) and
-      // the follow-up measure feeds back into the derived sizes — with float
-      // jitter that looped at full speed. v4 getSize() returns
-      // { asPercentage, inPixels }.
-      const panelPercent = (panel) => {
-        const size = panel?.getSize?.();
-        return typeof size === "number" ? size : Number(size?.asPercentage);
-      };
-      let resized = false;
-      const gridCurrent = panelPercent(terminalGridPanelRef.current);
-      if (!Number.isFinite(gridCurrent) || Math.abs(gridCurrent - terminalGridPanelSize) > 0.5) {
-        terminalGridPanelRef.current?.resize?.(`${terminalGridPanelSize}%`);
-        resized = true;
-      }
-      const queueCurrent = panelPercent(todoQueuePanelRef.current);
-      if (!Number.isFinite(queueCurrent) || Math.abs(queueCurrent - todoQueuePanelSize) > 0.5) {
-        todoQueuePanelRef.current?.resize?.(`${todoQueuePanelSize}%`);
-        resized = true;
-      }
-      if (resized) {
-        scheduleMeasureTerminalLayout();
-      }
-    });
-
-    return () => window.cancelAnimationFrame(frameId);
-  }, [
-    hasVisibleWorkspaceTerminalPanes,
-    scheduleMeasureTerminalLayout,
-    terminalGridPanelSize,
-    todoQueuePanelSize,
-    todoQueueVisible,
-    workspaceToolPortaled,
-  ]);
 
   useLayoutEffect(() => {
     measureTerminalLayout();
@@ -40351,23 +40258,15 @@ function TerminalView({
   ]);
 
   const minimizeTodoQueuePane = useCallback(() => {
-    if (workspaceToolPortaled && onMinimizeWorkspaceToolPane) {
+    if (onMinimizeWorkspaceToolPane) {
       onMinimizeWorkspaceToolPane();
       return;
     }
     setTodoQueuePaneMode(TODO_QUEUE_PANE_MODE_MINIMIZED);
-  }, [onMinimizeWorkspaceToolPane, workspaceToolPortaled]);
-
-  const restoreTodoQueuePane = useCallback(() => {
-    if (workspaceToolPortaled && onRestoreWorkspaceToolPane) {
-      onRestoreWorkspaceToolPane();
-      return;
-    }
-    setTodoQueuePaneMode(TODO_QUEUE_PANE_MODE_NORMAL);
-  }, [onRestoreWorkspaceToolPane, workspaceToolPortaled]);
+  }, [onMinimizeWorkspaceToolPane]);
 
   const toggleFullscreenTodoQueuePane = useCallback(() => {
-    if (workspaceToolPortaled && onToggleFullscreenWorkspaceToolPane) {
+    if (onToggleFullscreenWorkspaceToolPane) {
       onToggleFullscreenWorkspaceToolPane();
       return;
     }
@@ -40376,7 +40275,7 @@ function TerminalView({
         ? TODO_QUEUE_PANE_MODE_NORMAL
         : TODO_QUEUE_PANE_MODE_FULLSCREEN
     ));
-  }, [onToggleFullscreenWorkspaceToolPane, workspaceToolPortaled]);
+  }, [onToggleFullscreenWorkspaceToolPane]);
 
   const getTerminalSlotStyle = useCallback((terminalIndex) => {
     const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
@@ -40741,7 +40640,8 @@ function TerminalView({
         data-terminal-breakout={terminalBreakoutVisible ? "true" : "false"}
         onWheelCapture={handleBreakoutCanvasWheel}
       >
-        {logicalTerminalIndexes.map((terminalIndex) => {
+        {logicalTerminalIndexes.map((terminalIndex, paneOrderIndex) => {
+          const paneMountReleased = paneOrderIndex < paneMountBudget;
           const draggingThisTerminal = terminalDragState?.terminalIndex === terminalIndex;
           const fullscreenThisTerminal = fullscreenActive && terminalIndex === fullscreenTerminalIndex;
           const paneMinimized = minimizedPaneIndexSet.has(terminalIndex);
@@ -41499,6 +41399,13 @@ function TerminalView({
                   </TerminalBreakoutActivityList>
                 </TerminalBreakoutActivityPanel>
               )}
+              {!paneMountReleased ? (
+                <div
+                  data-pane-mount-pending="true"
+                  key={`${terminalWorkspace.id}-${terminalIndex}`}
+                  style={{ background: "var(--terminal-pane-bg, #0a0d12)", height: "100%", width: "100%" }}
+                />
+              ) : (
               <WorkspaceTerminal
                 key={`${terminalWorkspace.id}-${terminalIndex}`}
                 agent={terminalAgent}
@@ -41560,6 +41467,7 @@ function TerminalView({
                 selectedWorkspaceThreadId={selectedWorkspaceThreadId}
                 selectedWorkspaceThreadIdOverride={false}
               />
+              )}
               {Boolean(windowBreakoutPanes[terminalPaneId]) && !fullscreenThisTerminal && (
                 <TerminalWindowBreakoutOverlay data-terminal-control="true">
                   <strong>{getTerminalWindowTitle(terminalIndex)}</strong>
@@ -42073,97 +41981,144 @@ function TerminalView({
     </WorkspaceIdleState>
   );
 
-  const workspaceToolPaneContent = effectiveTodoQueueVisible ? (
-    todoQueuePaneMinimized ? (
-      <WorkspaceToolMinimizedRail aria-label="Workspace docs minimized">
-        <WorkspaceToolRailControls>
-          <WorkspaceToolControlButton
-            aria-label="Unminimize workspace docs"
-            onClick={restoreTodoQueuePane}
-            title="Unminimize"
-            type="button"
-          >
-            <TitleRestoreIcon aria-hidden="true" />
-          </WorkspaceToolControlButton>
-        </WorkspaceToolRailControls>
-        <WorkspaceToolRailLabel>Docs</WorkspaceToolRailLabel>
-      </WorkspaceToolMinimizedRail>
-    ) : (
-      <TodoQueuePanel
-        accountKey={accountKey}
-        activeDragItemId={todoDragState?.itemId || ""}
-        agentStatuses={agentStatuses}
-        agentStatusError={agentStatusError}
-        agentStatusState={agentStatusState}
-        billingStatus={billingStatus}
-        connectedDevices={connectedDevices}
-        coordinationTargets={normalizedTerminalWorkspaceCoordinationTargets}
-        defaultWorkingDirectory={defaultWorkingDirectory}
-        deviceLiveState={deviceLiveState}
-        documentPanelEnabled={workspaceDocumentPanelEnabled}
-        dispatchTargets={workspaceTodoDispatchTargets}
-        draft={todoQueueDraft}
-        dropError={todoDropError}
-        getItemAccentColor={getTodoQueueItemAccentColor}
-        gitRepositoriesPreload={gitRepositoriesPreload}
-        gitSnapshotsPreload={gitSnapshotsPreload}
-        items={visibleTodoQueueItems}
-        knownDevices={knownDevices}
-        localDesktopProfile={cloudDesktopDeviceProfile}
-        onRefreshGitRepositories={onRefreshGitRepositories}
-        onRefreshGitSnapshot={onRefreshGitSnapshot}
-        onRecheckAgents={refreshAgentStatuses}
-        onBeginWorkspaceFileDrag={handleBeginWorkspaceFileDrag}
-        onBeginTodoDrag={handleBeginTodoDrag}
-        onCancelQueuedItem={cancelQueuedTodoQueueItem}
-        onCancelVoicePlan={handleCancelVoicePlan}
-        onCancelVoicePlanTask={handleCancelVoicePlanTask}
-        onDraftChange={setTodoQueueDraft}
-        onDispatchTodoToTarget={dispatchTodoQueueItemToTarget}
-        onMinimizePane={minimizeTodoQueuePane}
-        onOpenDocumentPanel={openWorkspaceDocumentPanel}
-        onOpenWorkspaceSettings={onOpenWorkspaceSettings}
-        onAddToolTodo={addWorkspaceToolTodo}
-        onQueueAllItems={queueAllTodoQueueItems}
-        onQueueItem={queueTodoQueueItem}
-        onVoicePlanNeedsRequeue={handleVoicePlanNeedsRequeue}
-        onRequeueVoicePlanUnfinished={handleRequeueVoicePlanUnfinished}
-        onRequeueVoicePlanTask={handleRequeueVoicePlanTask}
-        onRemoveItem={removeTodoQueueItem}
-        onRemoveItemAttachment={removeTodoQueueItemAttachment}
-        onReorderItem={reorderTodoQueueItem}
-        onResumePlan={handleResumeTerminalPlan}
-        onResumeTodoSession={handleResumeTodoSession}
-        onSubmitDraft={submitTodoQueueDraft}
-        onToggleTerminalBreakout={toggleTerminalBreakout}
-        onToggleWindowBreakout={toggleWindowBreakout}
-        windowBreakoutActive={windowBreakoutActive}
-        onToggleFullscreenPane={toggleFullscreenTodoQueuePane}
-        onUpdateItem={updateTodoQueueItemText}
-        onVoiceAgentToolCall={handleVoiceAgentToolCall}
-        onVoicePlanServerResult={handleVoicePlanServerResult}
-        paneMode={effectiveTodoQueuePaneMode}
-        peerItems={workspaceTodoPeerItems}
-        pendingItems={todoQueuePendingItems}
-        queueItems={todoQueueItems}
-        rootDirectory={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory}
-        selectedTerminalPlanTarget={selectedTerminalPlanTarget}
-        storageUsage={storageUsage}
-        terminalBreakoutActive={terminalBreakoutVisible}
-        workspace={terminalWorkspace}
-        workspaceError={workspaceError}
-        workspaceId={terminalWorkspace?.id || ""}
-        workspaceScopedTabsEnabled={workspaceScopedToolTabsEnabled}
-        workspaceTodos={workspaceTodos}
-        workspaceToolTabControlRef={workspaceToolTabControlRef}
-        workspaceToolTabMemoryRef={workspaceToolTabMemoryRef}
-        workspaces={workspaces}
-      />
-    )
-  ) : null;
-  const workspaceToolPortal = workspaceToolPortaled && workspaceToolPaneContent
-    ? createPortal(workspaceToolPaneContent, workspaceToolPortalTarget)
-    : null;
+  const workspaceToolPanelBridgeData = useMemo(() => ({
+    activeDragItemId: todoDragState?.itemId || "",
+    coordinationTargets: normalizedTerminalWorkspaceCoordinationTargets,
+    dispatchTargets: workspaceTodoDispatchTargets,
+    documentPanelEnabled: workspaceDocumentPanelEnabled,
+    draft: todoQueueDraft,
+    dropError: todoDropError,
+    getItemAccentColor: getTodoQueueItemAccentColor,
+    gitRepositoriesPreload,
+    gitSnapshotsPreload,
+    items: visibleTodoQueueItems,
+    paneMode: effectiveTodoQueuePaneMode,
+    peerItems: workspaceTodoPeerItems,
+    pendingItems: todoQueuePendingItems,
+    queueItems: todoQueueItems,
+    rootDirectory: terminalWorkspaceWorkingDirectory || defaultWorkingDirectory,
+    selectedTerminalPlanTarget,
+    terminalBreakoutActive: terminalBreakoutVisible,
+    windowBreakoutActive,
+    workspace: terminalWorkspace,
+    workspaceError,
+    workspaceId: terminalWorkspace?.id || "",
+    workspaceScopedTabsEnabled: workspaceScopedToolTabsEnabled,
+    workspaceToolTabControlRef,
+    workspaceToolTabMemoryRef,
+  }), [
+    defaultWorkingDirectory,
+    effectiveTodoQueuePaneMode,
+    getTodoQueueItemAccentColor,
+    gitRepositoriesPreload,
+    gitSnapshotsPreload,
+    normalizedTerminalWorkspaceCoordinationTargets,
+    selectedTerminalPlanTarget,
+    terminalBreakoutVisible,
+    terminalWorkspace,
+    terminalWorkspace?.id,
+    terminalWorkspaceWorkingDirectory,
+    todoDragState?.itemId,
+    todoDropError,
+    todoQueueDraft,
+    todoQueueItems,
+    todoQueuePendingItems,
+    visibleTodoQueueItems,
+    windowBreakoutActive,
+    workspaceDocumentPanelEnabled,
+    workspaceError,
+    workspaceScopedToolTabsEnabled,
+    workspaceTodoDispatchTargets,
+    workspaceTodoPeerItems,
+  ]);
+  const workspaceToolPanelBridgeActuators = useMemo(() => ({
+    onAddToolTodo: addWorkspaceToolTodo,
+    onBeginTodoDrag: handleBeginTodoDrag,
+    onBeginWorkspaceFileDrag: handleBeginWorkspaceFileDrag,
+    onCancelQueuedItem: cancelQueuedTodoQueueItem,
+    onCancelVoicePlan: handleCancelVoicePlan,
+    onCancelVoicePlanTask: handleCancelVoicePlanTask,
+    onDispatchTodoToTarget: dispatchTodoQueueItemToTarget,
+    onDraftChange: setTodoQueueDraft,
+    onMinimizePane: minimizeTodoQueuePane,
+    onOpenDocumentPanel: openWorkspaceDocumentPanel,
+    onOpenWorkspaceSettings,
+    onQueueAllItems: queueAllTodoQueueItems,
+    onQueueItem: queueTodoQueueItem,
+    onRefreshGitRepositories,
+    onRefreshGitSnapshot,
+    onRecheckAgents: refreshAgentStatuses,
+    onRemoveItem: removeTodoQueueItem,
+    onRemoveItemAttachment: removeTodoQueueItemAttachment,
+    onReorderItem: reorderTodoQueueItem,
+    onRequeueVoicePlanTask: handleRequeueVoicePlanTask,
+    onRequeueVoicePlanUnfinished: handleRequeueVoicePlanUnfinished,
+    onResumePlan: handleResumeTerminalPlan,
+    onResumeTodoSession: handleResumeTodoSession,
+    onSubmitDraft: submitTodoQueueDraft,
+    onToggleFullscreenPane: toggleFullscreenTodoQueuePane,
+    onToggleTerminalBreakout: toggleTerminalBreakout,
+    onToggleWindowBreakout: toggleWindowBreakout,
+    onUpdateItem: updateTodoQueueItemText,
+    onVoiceAgentToolCall: handleVoiceAgentToolCall,
+    onVoicePlanNeedsRequeue: handleVoicePlanNeedsRequeue,
+    onVoicePlanServerResult: handleVoicePlanServerResult,
+  }), [
+    addWorkspaceToolTodo,
+    cancelQueuedTodoQueueItem,
+    dispatchTodoQueueItemToTarget,
+    handleBeginTodoDrag,
+    handleBeginWorkspaceFileDrag,
+    handleCancelVoicePlan,
+    handleCancelVoicePlanTask,
+    handleResumeTerminalPlan,
+    handleResumeTodoSession,
+    handleRequeueVoicePlanTask,
+    handleRequeueVoicePlanUnfinished,
+    handleVoiceAgentToolCall,
+    handleVoicePlanNeedsRequeue,
+    handleVoicePlanServerResult,
+    minimizeTodoQueuePane,
+    onOpenWorkspaceSettings,
+    onRefreshGitRepositories,
+    onRefreshGitSnapshot,
+    openWorkspaceDocumentPanel,
+    queueAllTodoQueueItems,
+    queueTodoQueueItem,
+    refreshAgentStatuses,
+    removeTodoQueueItem,
+    removeTodoQueueItemAttachment,
+    reorderTodoQueueItem,
+    submitTodoQueueDraft,
+    toggleFullscreenTodoQueuePane,
+    toggleTerminalBreakout,
+    toggleWindowBreakout,
+    updateTodoQueueItemText,
+  ]);
+  const workspaceToolPanelBridgeActive = Boolean(
+    isWorkspaceSurfaceVisible
+      && hasWorkspaceTerminals
+      && terminalWorkspace?.id,
+  );
+  useEffect(() => {
+    const ownerId = workspaceToolPanelBridgeOwnerRef.current;
+    if (!workspaceToolPanelBridgeActive) {
+      clearWorkspaceToolPanelState(ownerId);
+      return undefined;
+    }
+    publishWorkspaceToolPanelState(
+      ownerId,
+      workspaceToolPanelBridgeData,
+      workspaceToolPanelBridgeActuators,
+    );
+    return () => {
+      clearWorkspaceToolPanelState(ownerId);
+    };
+  }, [
+    workspaceToolPanelBridgeActive,
+    workspaceToolPanelBridgeActuators,
+    workspaceToolPanelBridgeData,
+  ]);
   const floatingDragPreviews = (todoDragState || workspaceFileDragState) ? (
     <>
       {todoDragState && (
@@ -42230,7 +42185,6 @@ function TerminalView({
 
   return (
     <ForgeWorkspace aria-label="Forge workspace" data-motion={viewMotion}>
-      {workspaceToolPortal}
       {floatingDragPreviewPortal}
       {shouldShowWorkspaceSetup ? (
         <WorkspaceSetupPanel onSubmit={createFirstWorkspace}>
@@ -42283,9 +42237,7 @@ function TerminalView({
         </WorkspaceSetupPanel>
       ) : (
         <TerminalWorkspaceMain
-          data-workspace-tool-fullscreen={!workspaceToolPortaled && todoQueuePaneFullscreen ? "true" : "false"}
           data-workspace-tool-pane-mode={effectiveTodoQueuePaneMode}
-          ref={terminalWorkspaceMainRef}
 	        >
 	          <TerminalWorkspaceGridRegion>
 	            {hasVisibleWorkspacePanels ? (
@@ -42295,29 +42247,12 @@ function TerminalView({
 	              >
 	                <ResizePanel
 	                  data-workspace-tool-main-grid="true"
-	                  defaultSize={!workspaceToolPortaled && todoQueueVisible ? `${terminalGridPanelSize}%` : "100%"}
+	                  defaultSize="100%"
 	                  id={`workspace-terminal-main-grid-${terminalWorkspace.id}`}
-	                  minSize={!workspaceToolPortaled && todoQueueVisible ? `${terminalGridPanelMinSize}%` : "100%"}
-	                  ref={terminalGridPanelRef}
+	                  minSize="100%"
 	                >
 	                  {terminalWorkspaceContent}
 	                </ResizePanel>
-	                {!workspaceToolPortaled && todoQueueVisible && (
-	                  <>
-	                    <ResizeHandle data-direction="horizontal" data-workspace-tool-resize-handle="true" />
-	                    <ResizePanel
-	                      data-pane-mode={effectiveTodoQueuePaneMode}
-	                      data-workspace-tool-panel="true"
-	                      defaultSize={`${todoQueuePanelSize}%`}
-	                      id={`workspace-terminal-todo-queue-${terminalWorkspace.id}`}
-	                      maxSize={`${todoQueuePanelMaxSize}%`}
-	                      minSize={todoQueuePanelMinSize}
-	                      ref={todoQueuePanelRef}
-	                    >
-	                      {workspaceToolPaneContent}
-	                    </ResizePanel>
-	                  </>
-	                )}
 	              </ResizePanelGroup>
 	            ) : terminalWorkspaceContent}
 	          </TerminalWorkspaceGridRegion>

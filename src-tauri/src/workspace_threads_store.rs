@@ -24,6 +24,9 @@ struct WorkspaceThreadsReadWorkspaceResult {
 #[serde(rename_all = "camelCase")]
 struct WorkspaceThreadsReadResult {
     threads: Value,
+    /// Wall-clock stage timings per workspace (open/read/parse), surfaced in
+    /// the frontend hydration trace — the read was a 3s black box otherwise.
+    timings: Value,
     workspaces: Vec<WorkspaceThreadsReadWorkspaceResult>,
 }
 
@@ -2050,12 +2053,18 @@ fn workspace_threads_read_blocking(
 ) -> Result<WorkspaceThreadsReadResult, String> {
     let mut threads = serde_json::Map::new();
     let mut results = Vec::new();
+    let mut timings = Vec::new();
+    let read_started = std::time::Instant::now();
 
     for workspace in request.workspaces {
+        let workspace_started = std::time::Instant::now();
         let workspace_id = workspace_threads_clean_workspace_id(&workspace.workspace_id)?;
         let (mut connection, root, db_path) =
             workspace_threads_open_store(workspace.root_directory.as_deref(), true)?;
+        let open_ms = workspace_started.elapsed().as_millis() as u64;
+        let split_started = std::time::Instant::now();
         let split_state = workspace_threads_read_split_state(&connection, &workspace_id)?;
+        let split_ms = split_started.elapsed().as_millis() as u64;
         let state_text = match connection.query_row(
             "SELECT state_json FROM workspace_thread_state WHERE workspace_id = ?1",
             rusqlite::params![workspace_id.as_str()],
@@ -2134,6 +2143,12 @@ fn workspace_threads_read_blocking(
                 threads.insert(workspace_id.clone(), state);
             }
         }
+        timings.push(json!({
+            "openMs": open_ms,
+            "splitMs": split_ms,
+            "totalMs": workspace_started.elapsed().as_millis() as u64,
+            "workspaceId": workspace_id.clone(),
+        }));
         results.push(WorkspaceThreadsReadWorkspaceResult {
             workspace_id,
             root_directory: workspace_path_display(&root),
@@ -2144,6 +2159,10 @@ fn workspace_threads_read_blocking(
 
     Ok(WorkspaceThreadsReadResult {
         threads: Value::Object(threads),
+        timings: json!({
+            "perWorkspace": timings,
+            "rustTotalMs": read_started.elapsed().as_millis() as u64,
+        }),
         workspaces: results,
     })
 }

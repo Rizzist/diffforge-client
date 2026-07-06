@@ -2730,7 +2730,8 @@ function mergeTokenomicsSummary(previous, next) {
     by_device_provider: next.by_device_provider || (clearLegacyRows ? undefined : previous.by_device_provider),
     by_device_account: next.by_device_account || (clearLegacyRows ? undefined : previous.by_device_account),
     by_device_model: next.by_device_model || (clearLegacyRows ? undefined : previous.by_device_model),
-    daily_by_device_provider: next.daily_by_device_provider || (clearLegacyRows ? undefined : previous.daily_by_device_provider),
+    daily_by_device_provider: next.daily_by_device_provider || next.dailyByDeviceProvider
+      || (clearLegacyRows ? undefined : (previous.daily_by_device_provider || previous.dailyByDeviceProvider)),
     monthly_by_device_provider: next.monthly_by_device_provider || (clearLegacyRows ? undefined : previous.monthly_by_device_provider),
     hourly: next.hourly || previous.hourly,
     sources: next.sources || previous.sources,
@@ -3362,8 +3363,34 @@ function startTokenomicsViewPolling() {
     if (disposed) return;
     void refreshVisibleTokenomicsLimits({ force, forceProviderRefresh });
   };
-  refreshVisibleTokenomics({ force: true });
-  void loadTokenomicsStore({ background: true, force: false, summaryOnly: true });
+  // Tokenomics is DEVICE-level state: view activation (workspace switches
+  // re-activate the keep-alive Tokens tab) must only subscribe and render the
+  // cached store. The shared interval below + focus/visibility listeners +
+  // rust push events own freshness; force-refreshing here made every
+  // workspace open pay account-level provider HTTP + a multi-MB summary.
+  refreshVisibleTokenomics({ force: false });
+  // Summary staleness check rides idle so it can never land inside the
+  // activation window; the 5-minute guard makes repeated activations free.
+  {
+    const deferSummaryRefresh = () => {
+      if (disposed) return;
+      // Idle callbacks can land inside a workspace-activation window (opens
+      // have idle gaps between commits). Re-defer while an activation is
+      // recent so the multi-MB summary parse never competes with an open.
+      const mark = window.__DF_LAST_ACTIVATION_MARK;
+      const msSinceActivation = mark ? performance.now() - Number(mark.t || 0) : Infinity;
+      if (msSinceActivation < 3000) {
+        window.setTimeout(deferSummaryRefresh, 3000);
+        return;
+      }
+      void refreshTokenomicsSummaryIfStale();
+    };
+    if (typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(deferSummaryRefresh, { timeout: 4000 });
+    } else {
+      window.setTimeout(deferSummaryRefresh, 1500);
+    }
+  }
   window.addEventListener("focus", refreshVisibleTokenomics);
   document.addEventListener("visibilitychange", refreshVisibleTokenomics);
 

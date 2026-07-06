@@ -11536,13 +11536,15 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
     "limit_sample_count": limit_samples.len(),
     "limitSampleCount": limit_samples.len(),
     "hourly": hourly,
-    "daily_by_device_provider": daily_by_device_provider.clone(),
+    // UI summary payload diet: the big arrays used to ship in BOTH snake and
+    // camel case, doubling a multi-MB response that the webview parses on the
+    // main thread mid-workspace-open (measured 5.5MB → native parse + GC was
+    // a top open-lag component). Frontend readers fall back across casings;
+    // camelCase is canonical here. Cloud sync-delta builders keep their dual
+    // casing — the server contract parses those.
     "dailyByDeviceProvider": daily_by_device_provider,
-    "provider_accounts": provider_accounts.clone(),
     "providerAccounts": provider_accounts,
-    "latest_windows": latest_windows.clone(),
     "latestWindows": latest_windows,
-    "limit_samples": limit_samples.clone(),
     "limitSamples": limit_samples,
     "sources": [
         {"provider": "anthropic", "agent_kind": "claude", "label": "Claude Code"},
@@ -11550,7 +11552,6 @@ fn tokenomics_summary_from_conn_with_cloud_for_scope(
         {"provider": "opencode", "agent_kind": "opencode", "label": "OpenCode"}
     ],
     "limits": limits,
-    "scan_index": scan_index.clone(),
     "scanIndex": scan_index,
     "retired_account_keys": retired_account_keys.clone(),
     "retiredAccountKeys": retired_account_keys,
@@ -18602,7 +18603,7 @@ mod tokenomics_tests {
 
         let summary = tokenomics_summary_from_conn(&conn, false, None).unwrap();
         let hourly = summary["hourly"].as_array().unwrap();
-        let provider_accounts = summary["provider_accounts"].as_array().unwrap();
+        let provider_accounts = summary["providerAccounts"].as_array().unwrap();
 
         assert_eq!(summary["schema_version"], json!("tokenomics_v2"));
         assert_eq!(summary["total"]["total_tokens"], json!(42));
@@ -18773,7 +18774,7 @@ mod tokenomics_tests {
         assert_eq!(summary["total"]["total_tokens"], json!(12));
         assert_eq!(summary["hourly"][0]["total_tokens"], json!(12));
         assert_eq!(
-            summary["daily_by_device_provider"][0]["total_tokens"],
+            summary["dailyByDeviceProvider"][0]["total_tokens"],
             json!(12)
         );
         assert_eq!(
@@ -18969,7 +18970,7 @@ mod tokenomics_tests {
 
         let summary = tokenomics_summary_from_conn(&conn, false, None).unwrap();
         assert_eq!(summary["schema_version"], json!("tokenomics_v2"));
-        let daily = summary["daily_by_device_provider"].as_array().unwrap();
+        let daily = summary["dailyByDeviceProvider"].as_array().unwrap();
         assert_eq!(daily.len(), TOKENOMICS_INITIAL_BACKFILL_DAYS as usize);
         assert!(summary.get("daily").is_none());
         assert!(summary.get("monthly").is_none());

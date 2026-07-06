@@ -57,6 +57,56 @@ function reportSlow(kind, ms, bytes) {
 }
 
 try {
+  // Tauri IPC rides window.fetch on the ipc:// scheme, and big responses can
+  // be parsed via native Response.json()/text() — invisible to the
+  // JSON.parse wrap. Wrapping fetch names the command and measures both the
+  // transfer size and the native parse.
+  if (typeof window.fetch === "function" && !window.fetch.__dfProbe) {
+    const originalFetch = window.fetch.bind(window);
+    const probedFetch = (input, init) => {
+      const url = String(typeof input === "string" ? input : input?.url || "");
+      const isIpc = url.startsWith("ipc://") || url.includes("/__TAURI");
+      if (!isIpc) {
+        return originalFetch(input, init);
+      }
+      const started = performance.now();
+      return originalFetch(input, init).then((response) => {
+        try {
+          const size = Number(response.headers?.get?.("content-length") || 0);
+          const transferMs = performance.now() - started;
+          if (size >= 2_000_000 || transferMs >= 400) {
+            reportSlow(`ipc:${url.slice(0, 90)}`, transferMs, size);
+          }
+          for (const method of ["json", "text", "arrayBuffer"]) {
+            const original = response[method]?.bind(response);
+            if (!original) continue;
+            Object.defineProperty(response, method, {
+              configurable: true,
+              value: (...args) => {
+                const parseStarted = performance.now();
+                const result = original(...args);
+                if (result && typeof result.finally === "function") {
+                  return result.finally(() => {
+                    const ms = performance.now() - parseStarted;
+                    if (ms >= SLOW_MS) {
+                      reportSlow(`ipc-${method}:${url.slice(0, 80)}`, ms, size);
+                    }
+                  });
+                }
+                return result;
+              },
+            });
+          }
+        } catch {
+          // observation only
+        }
+        return response;
+      });
+    };
+    probedFetch.__dfProbe = true;
+    window.fetch = probedFetch;
+  }
+
   const originalStringify = JSON.stringify.bind(JSON);
   JSON.stringify = function stringifyProbed(value, replacer, space) {
     if (inProbe) return originalStringify(value, replacer, space);
