@@ -6,6 +6,9 @@ app_path="$repo_root/src-tauri/target/debug/bundle/macos/Diff Forge AI Dev.app"
 legacy_conflicting_app_path="$repo_root/src-tauri/target/debug/bundle/macos/Diff Forge AI.app"
 signing_identity="${APPLE_SIGNING_IDENTITY:-Diff Forge AI Local Development}"
 dev_keychain="$HOME/Library/Keychains/diffforge-dev.keychain-db"
+# Guards only the throwaway dev keychain created below (self-signed dev cert).
+# Override per machine if desired; changing it just makes the script recreate
+# the keychain on its next run.
 dev_keychain_password="${DIFFFORGE_DEV_KEYCHAIN_PASSWORD:-diffforge-dev-keychain}"
 lsregister="/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister"
 dev_bundle_identifier="ai.diffforge.desktop.dev"
@@ -136,7 +139,7 @@ replace_dev_keychain() {
 
 if [[ -f "$dev_keychain" ]]; then
   if ! unlock_dev_keychain; then
-    echo "Existing Diff Forge AI development keychain did not unlock with password $dev_keychain_password; recreating it."
+    echo "Existing Diff Forge AI development keychain did not unlock with the configured password; recreating it."
     replace_dev_keychain
   fi
 else

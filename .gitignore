@@ -14,3 +14,8 @@ logs/
 /pwa/Diff Forge AI - Google Play package/signing-key-info.txt
 /pwa/Diff Forge AI - Google Play package/signing.keystore
 /docs
+.DS_Store
+.claude/settings.local.json
+*.pem
+*.p12
+*.keychain-db
