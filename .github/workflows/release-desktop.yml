@@ -37,8 +37,8 @@ jobs:
         include:
           - target: aarch64-apple-darwin
             label: macos-aarch64
-          - target: x86_64-apple-darwin
-            label: macos-x86_64
+          # x86_64-apple-darwin is unsupported: shiguredo_libvpx's build
+          # script rejects os=macos, arch=x86_64 (Intel Macs not supported).
     runs-on: macos-14
     continue-on-error: true
     timeout-minutes: 90
@@ -100,7 +100,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev \
             libssl-dev libayatana-appindicator3-dev librsvg2-dev \
-            libasound2-dev libudev-dev
+            libasound2-dev libudev-dev libpipewire-0.3-dev
       - uses: actions/setup-node@v4
         with:
           node-version: 22

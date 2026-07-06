@@ -76,6 +76,10 @@ windows-sys = { version = "0.61", features = ["Wdk_System_SystemServices", "Win3
 [patch.crates-io]
 cidre = { path = "vendor/cidre" }
 portable-pty = { path = "vendor/portable-pty" }
+# crates.io 0.1.0-beta.1 predates windows-capture 1.5's API and fails to
+# compile on Windows; this rev is upstream's "fix windows build" on the same
+# version number.
+scap = { git = "https://github.com/CapSoftware/scap", rev = "c03f15a4631f40cd8d2e36807befb83b314cfeb7" }
 
 # Production build is tuned for runtime energy: thin LTO inlines across crate
 # boundaries (hot paths here are serde_json IPC (de)serialization and rusqlite
