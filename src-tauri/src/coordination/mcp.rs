@@ -1937,7 +1937,7 @@ fn workspace_gateway_builtin_tool_description(tool: &str) -> &'static str {
             "Read Video Editor timeline, selection, transcripts, and jobs. Call this first; clip ids are stable only within one context/edit exchange, so re-fetch after edits."
         }
         "video_edit" => {
-            "Apply atomic Video Editor edits after video_context. ops support split, trim, move, remove, rippleDeleteRange, removeWords, addClip, addText, addCaptions, setProps; use video_media search moments as addClip sourceInMs/durationMs, use removeWords with transcript word indexes, and call video_transcribe first if transcript data is missing."
+            "Apply atomic Video Editor edits after video_context. ops support split, trim, move, remove, rippleDeleteRange, removeWords, addClip, addText, addCaptions, setProps; use video_media search moments as addClip sourceInMs/durationMs, use removeWords with transcript word indexes, and call video_transcribe first if transcript data is missing. Still images (import them into media/ first) become video-track clips — give them motion via addClip/setProps motion presets (kenburns-in/out, pan-left/right/up/down, drift) which compile aspect-aware x/y/scale keyframes."
         }
         "video_transcribe" => {
             "Read or start transcripts for video assets. Use before removeWords/addCaptions when video_context reports missing transcripts."
@@ -2070,7 +2070,7 @@ fn workspace_gateway_builtin_tool_input_schema(tool: &str) -> Value {
                 "ops": {
                     "type": "array",
                     "items": {"type": "object", "additionalProperties": true},
-                    "description": "Required edit ops with op discriminator: split, trim, move, remove, rippleDeleteRange, removeWords, addClip, addText, addCaptions, setProps. For addClip, pass assetPath, atMs, optional sourceInMs/durationMs, and optional trackHint."
+                    "description": "Required edit ops with op discriminator: split, trim, move, remove, rippleDeleteRange, removeWords, addClip, addText, addCaptions, setProps. For addClip, pass assetPath, atMs, optional sourceInMs/durationMs, optional trackHint, and optional motion. motion applies a motion preset to a video-track clip (great for still images): \"kenburns-in\" | \"kenburns-out\" | \"pan-left\" | \"pan-right\" | \"pan-up\" | \"pan-down\" | \"drift\" | \"none\", or { preset, strength: \"subtle\"|\"normal\"|\"bold\" }; it compiles aspect-aware x/y/scale keyframes (cover-fit zoom, edge-safe pan) onto the clip. setProps patch supports speed, gain, transform {x,y,scale,opacity}, motion (same values), and raw kf keyframes { x|y|scale|opacity: [{ atMs, value, easing: \"linear\"|\"hold\"|\"smooth\" }] } — atMs is clip-relative; x/y are frame fractions."
                 },
                 "includePipe": {"type": "boolean"}
             },

@@ -88,3 +88,12 @@ opt-level = 3
 lto = "thin"
 strip = true
 panic = "unwind"
+
+# Debug builds are the daily driver, and the hot paths live in dependencies:
+# measured on this machine, serde_json parses 19x slower and bundled SQLite
+# 2-4x slower at -O0. Optimizing ONLY dependencies keeps the workspace crate
+# at -O0 (fast incremental builds, debug assertions intact — the energy/
+# diagnostic instrumentation defaults key off cfg!(debug_assertions)) while
+# the serde/sqlite cycles run at production speed.
+[profile.dev.package."*"]
+opt-level = 2

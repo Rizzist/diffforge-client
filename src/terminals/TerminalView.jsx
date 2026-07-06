@@ -23170,6 +23170,7 @@ function WorkspaceVideoGridPane({
 
 function WorkspaceSwarmGridPane({
   dragActive = false,
+  floatingAddObstructed = false,
   fullscreenActive = false,
   isActive = false,
   isFullscreen = false,
@@ -23266,6 +23267,7 @@ function WorkspaceSwarmGridPane({
       <TerminalSwarmPanelBody>
         <SwarmWorkspacePane
           key={`swarm-${paneId}`}
+          avoidFloatingAdd={floatingAddObstructed}
           isActive={isActive}
           paneId={paneId}
           repoPath={repoPath}
@@ -41099,6 +41101,10 @@ function TerminalView({
               >
                 <WorkspaceSwarmGridPane
                   dragActive={terminalDragActive}
+                  floatingAddObstructed={
+                    fullscreenThisTerminal
+                    || (logicalTerminalIndexes.length - normalizedMinimizedPaneIndexes.length) <= 1
+                  }
                   fullscreenActive={fullscreenActive}
                   isActive={isWorkspaceSurfaceVisible && !tabHidden}
                   isFullscreen={fullscreenThisTerminal}

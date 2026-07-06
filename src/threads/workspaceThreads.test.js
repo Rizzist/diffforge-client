@@ -5,10 +5,13 @@ import {
   appendWorkspaceThreadProjectionEvents,
   applyWorkspaceThreadProviderSessionBinding,
   bindWorkspaceThreadTerminal,
+  buildWorkspaceThreadsPersistDelta,
+  clearWorkspaceThreadsPersistDirtySnapshot,
   clearWorkspaceThreadPendingPrompt,
   createWorkspaceThreadLiveTextProjectionEvents,
   createWorkspaceThreadToolProjectionEvents,
   deleteWorkspaceThread,
+  getWorkspaceThreadsPersistDirtySnapshot,
   getWorkspaceThreadForTerminalIndex,
   getWorkspaceThreadSelectionForLiveTerminal,
   getWorkspaceThreadTerminalNickname,
@@ -18,9 +21,212 @@ import {
   materializeWorkspaceThreadForTerminal,
   normalizeWorkspaceThreads,
   persistWorkspaceThreads,
+  resetWorkspaceThreadsPersistDirty,
   updateWorkspaceActiveTerminal,
   updateWorkspaceThreadProviderSession,
+  updateWorkspaceThreadProviderModel,
 } from "./workspaceThreads.js";
+
+function createPersistDirtyTestState() {
+  const workspaceId = "workspace-dirty-persist";
+  return {
+    [workspaceId]: {
+      activeThreadId: "thread-a",
+      archivedThreadOrder: ["thread-archived"],
+      archivedThreads: {
+        "thread-archived": {
+          archivedAt: "2026-07-01T00:00:00.000Z",
+          currentAgent: "codex",
+          id: "thread-archived",
+          materialized: true,
+          messageCount: 1,
+          messages: [{
+            createdAt: "2026-07-01T00:00:00.000Z",
+            id: "archived-message",
+            role: "user",
+            text: "archived prompt",
+          }],
+          providerBindings: {
+            codex: {
+              nativeSessionId: "session-archived",
+            },
+          },
+          workspaceId,
+        },
+      },
+      terminalThreadIds: {},
+      terminals: {},
+      threadOrder: ["thread-a", "thread-b"],
+      threads: {
+        "thread-a": {
+          currentAgent: "codex",
+          id: "thread-a",
+          materialized: true,
+          messageCount: 1,
+          messages: [{
+            createdAt: "2026-07-01T00:00:00.000Z",
+            id: "message-a",
+            role: "user",
+            text: "first prompt",
+          }],
+          providerBindings: {
+            codex: {
+              nativeSessionId: "session-a",
+            },
+          },
+          status: "idle",
+          workspaceId,
+        },
+        "thread-b": {
+          currentAgent: "codex",
+          id: "thread-b",
+          materialized: true,
+          messageCount: 1,
+          messages: [{
+            createdAt: "2026-07-01T00:01:00.000Z",
+            id: "message-b",
+            role: "user",
+            text: "second prompt",
+          }],
+          providerBindings: {
+            codex: {
+              nativeSessionId: "session-b",
+            },
+          },
+          status: "idle",
+          workspaceId,
+        },
+      },
+      threadsView: {
+        selectedThreadId: "thread-a",
+        selectedWorkspaceId: workspaceId,
+      },
+    },
+  };
+}
+
+test("workspace thread dirty tracking ignores semantic no-op mutations", () => {
+  resetWorkspaceThreadsPersistDirty();
+  const state = createPersistDirtyTestState();
+  const previous = persistWorkspaceThreads(state);
+  const next = updateWorkspaceThreadProviderModel(state, {
+    agentId: "codex",
+    modelId: "",
+    threadId: "thread-a",
+    workspaceId: "workspace-dirty-persist",
+  });
+
+  assert.equal(next, state);
+  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  assert.deepEqual(dirtySnapshot.workspaces, {});
+
+  const { request } = buildWorkspaceThreadsPersistDelta(
+    next,
+    previous,
+    [{ workspaceId: "workspace-dirty-persist" }],
+    { dirtySnapshot },
+  );
+  assert.deepEqual(request.workspaces, []);
+});
+
+test("workspace thread dirty tracking persists only marked thread rows", () => {
+  resetWorkspaceThreadsPersistDirty();
+  const state = createPersistDirtyTestState();
+  const previous = persistWorkspaceThreads(state);
+  const next = updateWorkspaceThreadProviderModel(state, {
+    agentId: "codex",
+    modelId: "gpt-5",
+    threadId: "thread-a",
+    workspaceId: "workspace-dirty-persist",
+  });
+
+  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  const { request } = buildWorkspaceThreadsPersistDelta(
+    next,
+    previous,
+    [{ workspaceId: "workspace-dirty-persist" }],
+    { dirtySnapshot },
+  );
+
+  assert.equal(request.workspaces.length, 1);
+  assert.deepEqual(
+    request.workspaces[0].threads.map((row) => row.threadId),
+    ["thread-a"],
+  );
+  assert.equal(request.workspaces[0].archivedThreads, undefined);
+});
+
+test("workspace thread dirty tracking retains marks until successful clear", () => {
+  resetWorkspaceThreadsPersistDirty();
+  const state = createPersistDirtyTestState();
+  updateWorkspaceThreadProviderModel(state, {
+    agentId: "codex",
+    modelId: "gpt-5",
+    threadId: "thread-a",
+    workspaceId: "workspace-dirty-persist",
+  });
+
+  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  assert.equal(
+    dirtySnapshot.workspaces["workspace-dirty-persist"].threadVersions["thread-a"] > 0,
+    true,
+  );
+
+  const retainedSnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  assert.equal(
+    retainedSnapshot.workspaces["workspace-dirty-persist"].threadVersions["thread-a"],
+    dirtySnapshot.workspaces["workspace-dirty-persist"].threadVersions["thread-a"],
+  );
+});
+
+test("workspace thread dirty tracking preserves marks added during in-flight persist", () => {
+  resetWorkspaceThreadsPersistDirty();
+  const state = createPersistDirtyTestState();
+  const first = updateWorkspaceThreadProviderModel(state, {
+    agentId: "codex",
+    modelId: "gpt-5",
+    threadId: "thread-a",
+    workspaceId: "workspace-dirty-persist",
+  });
+  const inFlightSnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+
+  updateWorkspaceThreadProviderModel(first, {
+    agentId: "codex",
+    modelId: "gpt-5.1",
+    threadId: "thread-b",
+    workspaceId: "workspace-dirty-persist",
+  });
+  clearWorkspaceThreadsPersistDirtySnapshot(inFlightSnapshot);
+
+  const remainingSnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  assert.equal(
+    remainingSnapshot.workspaces["workspace-dirty-persist"].threadVersions["thread-a"],
+    undefined,
+  );
+  assert.equal(
+    remainingSnapshot.workspaces["workspace-dirty-persist"].threadVersions["thread-b"] > 0,
+    true,
+  );
+});
+
+test("workspace thread dirty tracking still detects removed active and archived rows", () => {
+  resetWorkspaceThreadsPersistDirty();
+  const state = createPersistDirtyTestState();
+  const previous = persistWorkspaceThreads(state);
+  const withoutActive = deleteWorkspaceThread(state, "workspace-dirty-persist", "thread-a");
+  const withoutBoth = deleteWorkspaceThread(withoutActive, "workspace-dirty-persist", "thread-archived");
+  const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot([{ workspaceId: "workspace-dirty-persist" }]);
+  const { request } = buildWorkspaceThreadsPersistDelta(
+    withoutBoth,
+    previous,
+    [{ workspaceId: "workspace-dirty-persist" }],
+    { dirtySnapshot },
+  );
+
+  assert.equal(request.workspaces.length, 1);
+  assert.deepEqual(request.workspaces[0].removedThreadIds, ["thread-a"]);
+  assert.deepEqual(request.workspaces[0].removedArchivedThreadIds, ["thread-archived"]);
+});
 
 test("deleteWorkspaceThread hard-removes active and archived thread state", () => {
   const workspaceId = "workspace-delete-thread";

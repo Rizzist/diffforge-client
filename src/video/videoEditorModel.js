@@ -95,6 +95,141 @@ export function normalizeKf(kf) {
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Motion presets — tasteful still-image (and video) movement compiled into
+// the EXISTING transform + x/y/scale keyframes, so preview and export need no
+// new render paths. Aspect-aware: the base scale includes the cover ratio
+// (media is contain-fitted by default, and Ken Burns over letterbox bars
+// looks broken), and pan amplitudes clamp so an edge can never slide into
+// frame. KEEP IN SYNC with the Rust mirror in src-tauri/src/video_editor.rs
+// (video_mcp_motion_patch) — parity is covered by tests on both sides.
+
+export const MOTION_PRESET_IDS = [
+  "none",
+  "kenburns-in",
+  "kenburns-out",
+  "pan-left",
+  "pan-right",
+  "pan-up",
+  "pan-down",
+  "drift",
+];
+
+export const MOTION_STRENGTHS = { subtle: 0.6, normal: 1, bold: 1.6 };
+
+// preset/strength → { motion, transform, kf } patch for updateClip/setProps.
+// assetWidth/Height come from the media probe (unknown → cover ratio 1);
+// frameWidth/Height from project.settings. existingKf keeps opacity frames.
+export function motionPresetPatch(preset, {
+  durationMs = 4000,
+  assetWidth = 0,
+  assetHeight = 0,
+  frameWidth = 1920,
+  frameHeight = 1080,
+  strength = "normal",
+  existingKf = null,
+  existingTransform = null,
+} = {}) {
+  const id = MOTION_PRESET_IDS.includes(preset) ? preset : "none";
+  const keepOpacity = existingKf?.opacity ? { opacity: existingKf.opacity } : {};
+  const baseOpacity = Number.isFinite(Number(existingTransform?.opacity))
+    ? Number(existingTransform.opacity)
+    : 1;
+  if (id === "none") {
+    return {
+      motion: "",
+      transform: { x: 0, y: 0, scale: 1, opacity: baseOpacity },
+      kf: { ...keepOpacity },
+    };
+  }
+  const s = MOTION_STRENGTHS[strength] ?? 1;
+  const frameAspect = frameWidth > 0 && frameHeight > 0 ? frameWidth / frameHeight : 16 / 9;
+  const assetAspect = assetWidth > 0 && assetHeight > 0 ? assetWidth / assetHeight : frameAspect;
+  // Contain-fit fractions of the frame each axis actually fills.
+  const fx = Math.min(1, assetAspect / frameAspect);
+  const fy = Math.min(1, frameAspect / assetAspect);
+  const cover = 1 / Math.min(fx, fy);
+
+  let zoomStart = 1;
+  let zoomEnd = 1;
+  let xAmp = 0;
+  let yAmp = 0;
+  let xFrom = 0;
+  let yFrom = 0;
+  if (id === "kenburns-in" || id === "kenburns-out") {
+    zoomStart = 1.02;
+    zoomEnd = 1.02 + 0.12 * s;
+    xAmp = 0.012 * s;
+    yAmp = 0.008 * s;
+    xFrom = -1;
+    yFrom = 1;
+    if (id === "kenburns-out") {
+      [zoomStart, zoomEnd] = [zoomEnd, zoomStart];
+      xFrom = -xFrom;
+      yFrom = -yFrom;
+    }
+  } else if (id.startsWith("pan-")) {
+    zoomStart = 1 + 0.1 * s;
+    zoomEnd = zoomStart;
+    const amp = 0.055 * s;
+    if (id === "pan-left") {
+      xAmp = amp;
+      xFrom = 1; // image drifts leftwards across the frame
+    } else if (id === "pan-right") {
+      xAmp = amp;
+      xFrom = -1;
+    } else if (id === "pan-up") {
+      yAmp = amp;
+      yFrom = 1;
+    } else {
+      yAmp = amp;
+      yFrom = -1;
+    }
+  } else {
+    // drift: slow diagonal float with a gentle zoom.
+    zoomStart = 1.03;
+    zoomEnd = 1.03 + 0.05 * s;
+    xAmp = 0.01 * s;
+    yAmp = 0.008 * s;
+    xFrom = -1;
+    yFrom = 1;
+  }
+  const scaleStart = Math.min(8, cover * zoomStart);
+  const scaleEnd = Math.min(8, cover * zoomEnd);
+  const minScale = Math.min(scaleStart, scaleEnd);
+  // Never pan far enough to reveal an edge, at any point of the move.
+  const slackX = Math.max(0, (minScale * fx - 1) / 2);
+  const slackY = Math.max(0, (minScale * fy - 1) / 2);
+  xAmp = Math.min(xAmp, slackX);
+  yAmp = Math.min(yAmp, slackY);
+
+  const endMs = Math.max(100, Math.round(durationMs));
+  const frames = (from, to) => [
+    { atMs: 0, value: Number(from.toFixed(4)), easing: "smooth" },
+    { atMs: endMs, value: Number(to.toFixed(4)), easing: "smooth" },
+  ];
+  const kf = { ...keepOpacity };
+  if (scaleStart !== scaleEnd) {
+    kf.scale = frames(scaleStart, scaleEnd);
+  }
+  if (xAmp > 0) {
+    kf.x = frames(xFrom * xAmp, -xFrom * xAmp);
+  }
+  if (yAmp > 0) {
+    kf.y = frames(yFrom * yAmp, -yFrom * yAmp);
+  }
+  return {
+    motion: id,
+    transform: {
+      x: xAmp > 0 ? Number((xFrom * xAmp).toFixed(4)) : 0,
+      y: yAmp > 0 ? Number((yFrom * yAmp).toFixed(4)) : 0,
+      scale: Number(scaleStart.toFixed(4)),
+      opacity: baseOpacity,
+    },
+    kf,
+  };
+}
+
 function smoothstep(t) {
   return t * t * (3 - 2 * t);
 }
@@ -209,6 +344,9 @@ export function normalizeClip(clip, trackKind) {
     transform: normalizeTransform(clip.transform),
     kf: normalizeKf(clip.kf),
     linkId: cleanText(clip.linkId),
+    // Applied motion-preset name (metadata only — the compiled transform/kf
+    // above are what actually render; this lets UI/agents see what was used).
+    motion: MOTION_PRESET_IDS.includes(cleanText(clip.motion)) ? cleanText(clip.motion) : "",
   };
 }
 
@@ -1251,6 +1389,14 @@ export function updateClip(project, clipId, patch) {
       }
       if (patch?.transform && typeof patch.transform === "object") {
         clip.transform = normalizeTransform({ ...clip.transform, ...patch.transform });
+      }
+      // Keyframes replace wholesale: motion presets own the whole x/y/scale
+      // envelope (they carry existing opacity frames through themselves).
+      if (patch?.kf && typeof patch.kf === "object") {
+        clip.kf = normalizeKf(patch.kf);
+      }
+      if (typeof patch?.motion === "string") {
+        clip.motion = MOTION_PRESET_IDS.includes(patch.motion) ? patch.motion : "";
       }
       if (Number.isFinite(Number(patch?.speed))) {
         clip.speed = Math.min(8, Math.max(0.1, Number(patch.speed)));

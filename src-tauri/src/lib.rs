@@ -182,7 +182,9 @@ const THREAD_BRIDGE_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const THREAD_BRIDGE_DIAGNOSTIC_LOG_FILE: &str = "thread-bridge.jsonl";
 const BIGVIEW_SYNC_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const BIGVIEW_SYNC_DIAGNOSTIC_LOG_FILE: &str = "bigview-sync.jsonl";
-const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
+// Dev builds trace every workspace activation (logs/workspace-activation.jsonl)
+// so "switching is laggy" reports are attributable without an env-var launch.
+const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED: bool = cfg!(debug_assertions);
 const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_FILE: &str = "workspace-activation.jsonl";
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED: bool = false;
 const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOG_FILE: &str = "voice-orchestrator.jsonl";
@@ -3131,7 +3133,12 @@ fn log_terminal_status_event(phase: &str, fields: Value) {
 }
 
 fn forward_terminal_status_to_energy_if_needed(phase: &str, source: &str, fields: Value) {
-    if phase.starts_with("frontend.render_probe") || phase.starts_with("frontend.invoke_probe") {
+    if phase.starts_with("frontend.render_probe")
+        || phase.starts_with("frontend.invoke_probe")
+        || phase.starts_with("frontend.freeze_probe")
+        || phase.starts_with("frontend.commit_profiler")
+        || phase.starts_with("frontend.stringify_probe")
+    {
         energy_impact::energy_impact_log_render_storm(phase, source, fields);
     }
 }

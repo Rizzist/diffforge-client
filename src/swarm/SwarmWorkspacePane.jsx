@@ -2,6 +2,21 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import styled, { keyframes } from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { Add } from "@styled-icons/material-rounded/Add";
+import { ArrowUpward } from "@styled-icons/material-rounded/ArrowUpward";
+import { CenterFocusStrong } from "@styled-icons/material-rounded/CenterFocusStrong";
+import { Remove } from "@styled-icons/material-rounded/Remove";
+import { Stop } from "@styled-icons/material-rounded/Stop";
+import {
+  WorkspaceCreateAgentClaudeIcon,
+  WorkspaceCreateAgentCodexIcon,
+  WorkspaceCreateAgentOpenCodeIcon,
+  WorkspaceCreateAgentTerminalIcon,
+} from "../app/appStyles.js";
+import {
+  BUILTIN_AGENT_LAUNCH_DEFAULTS,
+  getAgentLaunchModelOption,
+} from "../agents/agentLaunchDefaults.js";
 
 // Contract: docs/swarm-panel-v1-contract.md. The swarm id is deterministic per
 // workspace slot so the pane reattaches to its members/ledger across reloads.
@@ -20,6 +35,43 @@ const SWARM_STATE_EVENT = "diffforge://swarm-state";
 const SWARM_RUN_EVENT = "diffforge://swarm-run-event";
 const SWARM_MAX_MEMBERS = 5;
 const TAKE_FLASH_MS = 2600;
+const SWARM_STAGE_MIN_ZOOM = 0.55;
+const SWARM_STAGE_MAX_ZOOM = 2.2;
+const SWARM_STAGE_PAN_LIMIT = 280;
+
+function clampSwarmStageView(view) {
+  const zoom = Math.min(SWARM_STAGE_MAX_ZOOM, Math.max(SWARM_STAGE_MIN_ZOOM, Number(view.zoom) || 1));
+  const limit = SWARM_STAGE_PAN_LIMIT * zoom;
+  return {
+    x: Math.min(limit, Math.max(-limit, Number(view.x) || 0)),
+    y: Math.min(limit, Math.max(-limit, Number(view.y) || 0)),
+    zoom,
+  };
+}
+
+function SwarmHarnessIcon({ provider }) {
+  const normalized = String(provider || "").trim().toLowerCase();
+  if (normalized === "codex") {
+    return <WorkspaceCreateAgentCodexIcon aria-hidden="true" />;
+  }
+  if (normalized === "claude") {
+    return <WorkspaceCreateAgentClaudeIcon aria-hidden="true" />;
+  }
+  if (normalized === "opencode") {
+    return (
+      <WorkspaceCreateAgentOpenCodeIcon
+        aria-hidden="true"
+        fill="none"
+        viewBox="0 0 24 30"
+        xmlns="http://www.w3.org/2000/svg"
+      >
+        <path d="M18 24H6V12H18V24Z" fill="currentColor" opacity="0.72" />
+        <path d="M18 6H6V24H18V6ZM24 30H0V0H24V30Z" fill="currentColor" />
+      </WorkspaceCreateAgentOpenCodeIcon>
+    );
+  }
+  return <WorkspaceCreateAgentTerminalIcon aria-hidden="true" />;
+}
 
 const SWARM_PROVIDERS = Object.freeze([
   { id: "codex", label: "Codex", color: "#4c8dff", glyph: "CX" },
@@ -61,9 +113,20 @@ function memberDisplayName(member) {
   if (label) {
     return label;
   }
-  const meta = providerMeta(member?.provider);
-  const model = String(member?.model || "").trim();
-  return model ? `${meta.label} · ${model}` : meta.label;
+  return providerMeta(member?.provider).label;
+}
+
+// Resolved model shown in the UI: the member's explicit model, else the app's
+// launch-default model for that harness (what the CLI actually starts with).
+function memberModelText(member) {
+  const provider = String(member?.provider || "").trim().toLowerCase();
+  const modelId = String(member?.model || "").trim()
+    || String(BUILTIN_AGENT_LAUNCH_DEFAULTS[provider]?.model || "").trim();
+  if (!modelId) {
+    return "";
+  }
+  const option = getAgentLaunchModelOption(provider, modelId);
+  return String(option?.label || modelId);
 }
 
 function describeSwarmRunEvent(event, membersById) {
@@ -131,13 +194,13 @@ function isMissingCommandError(error) {
 /* ---------------------------------- styles --------------------------------- */
 
 const orbFloat = keyframes`
-  0%, 100% { transform: translate(-50%, -50%) translateY(0); }
-  50% { transform: translate(-50%, -50%) translateY(-4px); }
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-5px); }
 `;
 
 const orbPulse = keyframes`
   0% { box-shadow: 0 0 0 0 var(--swarm-orb-glow); }
-  70% { box-shadow: 0 0 0 12px rgba(0, 0, 0, 0); }
+  70% { box-shadow: 0 0 0 14px rgba(0, 0, 0, 0); }
   100% { box-shadow: 0 0 0 0 rgba(0, 0, 0, 0); }
 `;
 
@@ -145,14 +208,44 @@ const ringSpin = keyframes`
   to { transform: rotate(360deg); }
 `;
 
+const auraSpin = keyframes`
+  to { transform: translate(-50%, -50%) rotate(360deg); }
+`;
+
 const edgeFlow = keyframes`
   to { stroke-dashoffset: -14; }
 `;
 
+const orbitDashFlow = keyframes`
+  to { stroke-dashoffset: -120; }
+`;
+
 const takePop = keyframes`
-  0% { transform: translate(-50%, -50%) scale(1); }
-  40% { transform: translate(-50%, -50%) scale(1.22); }
-  100% { transform: translate(-50%, -50%) scale(1); }
+  0% { transform: scale(1); }
+  40% { transform: scale(1.24); }
+  100% { transform: scale(1); }
+`;
+
+const takeRipple = keyframes`
+  0% { opacity: 0.85; transform: scale(1); }
+  100% { opacity: 0; transform: scale(2.1); }
+`;
+
+const orbDrift = keyframes`
+  0%, 100% { transform: translate(0px, 0px); }
+  25% { transform: translate(3px, -2px); }
+  50% { transform: translate(0px, -4px); }
+  75% { transform: translate(-3px, -2px); }
+`;
+
+const starTwinkle = keyframes`
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 0.75; }
+`;
+
+const nucleusBreath = keyframes`
+  0%, 100% { box-shadow: 0 0 0 0 rgba(76, 141, 255, 0.0), 0 0 22px 0 rgba(76, 141, 255, 0.08); }
+  50% { box-shadow: 0 0 0 0 rgba(76, 141, 255, 0.0), 0 0 30px 4px rgba(76, 141, 255, 0.16); }
 `;
 
 const SwarmPaneRoot = styled.div`
@@ -163,6 +256,7 @@ const SwarmPaneRoot = styled.div`
   height: 100%;
   min-height: 0;
   overflow: hidden;
+  container: swarm-pane / size;
   background:
     radial-gradient(1200px 480px at 50% -12%, rgba(76, 141, 255, 0.08), transparent 60%),
     #0a0f1a;
@@ -292,6 +386,10 @@ const SwarmViewRailStatus = styled.span`
   color: rgba(139, 148, 158, 0.9);
   white-space: nowrap;
   padding-right: 2px;
+
+  @container swarm-pane (max-width: 340px) {
+    display: none;
+  }
 `;
 
 const SwarmConstellation = styled.div`
@@ -299,6 +397,192 @@ const SwarmConstellation = styled.div`
   flex: 1 1 auto;
   min-height: 150px;
   overflow: hidden;
+  cursor: grab;
+  touch-action: none;
+
+  &[data-panning="true"] {
+    cursor: grabbing;
+  }
+
+  &[data-live="false"] * {
+    animation-play-state: paused !important;
+  }
+`;
+
+const SwarmStars = styled.div`
+  position: absolute;
+  inset: -40%;
+  pointer-events: none;
+  background-image:
+    radial-gradient(1.2px 1.2px at 12% 24%, rgba(230, 237, 243, 0.5), transparent 60%),
+    radial-gradient(1px 1px at 31% 68%, rgba(230, 237, 243, 0.38), transparent 60%),
+    radial-gradient(1.4px 1.4px at 47% 12%, rgba(158, 203, 255, 0.42), transparent 60%),
+    radial-gradient(1px 1px at 63% 82%, rgba(230, 237, 243, 0.32), transparent 60%),
+    radial-gradient(1.2px 1.2px at 78% 36%, rgba(230, 237, 243, 0.44), transparent 60%),
+    radial-gradient(1px 1px at 89% 64%, rgba(158, 203, 255, 0.34), transparent 60%),
+    radial-gradient(1px 1px at 22% 88%, rgba(230, 237, 243, 0.3), transparent 60%),
+    radial-gradient(1.3px 1.3px at 55% 46%, rgba(230, 237, 243, 0.26), transparent 60%);
+  opacity: 0.55;
+
+  &::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+      radial-gradient(1px 1px at 8% 52%, rgba(230, 237, 243, 0.5), transparent 60%),
+      radial-gradient(1.3px 1.3px at 38% 34%, rgba(158, 203, 255, 0.46), transparent 60%),
+      radial-gradient(1px 1px at 58% 74%, rgba(230, 237, 243, 0.4), transparent 60%),
+      radial-gradient(1.2px 1.2px at 72% 18%, rgba(230, 237, 243, 0.42), transparent 60%),
+      radial-gradient(1px 1px at 92% 44%, rgba(158, 203, 255, 0.36), transparent 60%);
+    animation: ${starTwinkle} 5.5s ease-in-out infinite;
+  }
+
+  html[data-forge-theme="light"] & {
+    display: none;
+  }
+`;
+
+const SwarmStage = styled.div`
+  position: absolute;
+  inset: 0;
+  transform-origin: 50% 50%;
+  will-change: transform;
+  transition: transform 150ms ease;
+
+  &[data-panning="true"] {
+    transition: none;
+  }
+`;
+
+const SwarmNucleusAura = styled.div`
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 168px;
+  height: 168px;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  pointer-events: none;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    rgba(76, 141, 255, 0.55) 80deg,
+    transparent 160deg,
+    rgba(63, 185, 80, 0.35) 250deg,
+    transparent 330deg
+  );
+  filter: blur(18px);
+  opacity: 0;
+  transition: opacity 400ms ease;
+  animation: ${auraSpin} 3.2s linear infinite;
+
+  &[data-on="true"] {
+    opacity: 0.85;
+  }
+
+  @container swarm-pane (max-width: 420px) {
+    width: 132px;
+    height: 132px;
+  }
+
+  @container swarm-pane (max-height: 230px) {
+    width: 100px;
+    height: 100px;
+  }
+
+  html[data-forge-theme="light"] & {
+    opacity: 0;
+
+    &[data-on="true"] {
+      opacity: 0.35;
+    }
+  }
+`;
+
+const SwarmViewControls = styled.div`
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  z-index: 5;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+
+  @container swarm-pane (max-height: 250px) {
+    flex-direction: row;
+    bottom: 6px;
+    right: 6px;
+
+    button {
+      width: 22px;
+      height: 22px;
+
+      svg { width: 13px; height: 13px; }
+    }
+  }
+`;
+
+const SwarmActivateDock = styled.div`
+  position: absolute;
+  left: 50%;
+  bottom: 14px;
+  transform: translateX(-50%);
+  z-index: 4;
+  max-width: calc(100% - 16px);
+
+  @container swarm-pane (max-height: 300px) {
+    bottom: 8px;
+
+    button {
+      padding: 5px 10px;
+      font-size: 11px;
+    }
+  }
+
+  @container swarm-pane (max-height: 230px) {
+    left: 8px;
+    transform: none;
+
+    button {
+      padding: 4px 9px;
+      font-size: 10.5px;
+    }
+  }
+`;
+
+const SwarmViewControlButton = styled.button`
+  appearance: none;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  border: 1px solid rgba(139, 148, 158, 0.28);
+  background: rgba(13, 17, 23, 0.85);
+  color: rgba(230, 237, 243, 0.75);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+
+  svg {
+    width: 15px;
+    height: 15px;
+  }
+
+  &:hover:not(:disabled) {
+    border-color: rgba(76, 141, 255, 0.55);
+    color: #e6edf3;
+  }
+
+  &:disabled {
+    opacity: 0.4;
+    cursor: default;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(255, 255, 255, 0.9);
+    border-color: rgba(31, 35, 40, 0.18);
+    color: rgba(31, 35, 40, 0.7);
+  }
 `;
 
 const SwarmEdgeSvg = styled.svg`
@@ -309,13 +593,13 @@ const SwarmEdgeSvg = styled.svg`
   pointer-events: none;
 
   line {
-    stroke: rgba(139, 148, 158, 0.22);
-    stroke-width: 1.4px;
+    stroke: rgba(139, 148, 158, 0.2);
+    stroke-width: 1.3px;
     vector-effect: non-scaling-stroke;
   }
 
   line[data-live="true"] {
-    stroke: rgba(139, 148, 158, 0.4);
+    stroke: rgba(139, 148, 158, 0.42);
     stroke-dasharray: 5 9;
     animation: ${edgeFlow} 1.1s linear infinite;
   }
@@ -327,39 +611,88 @@ const SwarmEdgeSvg = styled.svg`
     animation: ${edgeFlow} 0.55s linear infinite;
   }
 
-  html[data-forge-theme="light"] & line {
-    stroke: rgba(31, 35, 40, 0.18);
+  ellipse[data-orbit] {
+    fill: none;
+    stroke: rgba(139, 148, 158, 0.16);
+    stroke-width: 1px;
+    vector-effect: non-scaling-stroke;
+    stroke-dasharray: 3 8;
+    animation: ${orbitDashFlow} 30s linear infinite;
+  }
+
+  ellipse[data-orbit="inner"] {
+    stroke: rgba(139, 148, 158, 0.11);
+    animation-direction: reverse;
+    animation-duration: 42s;
+  }
+
+  circle[data-packet] {
+    filter: drop-shadow(0 0 2px var(--swarm-edge-color, #4c8dff));
+  }
+
+  html[data-forge-theme="light"] & {
+    line {
+      stroke: rgba(31, 35, 40, 0.16);
+    }
+
+    ellipse[data-orbit] {
+      stroke: rgba(31, 35, 40, 0.12);
+    }
   }
 `;
 
-const SwarmOrb = styled.button`
+const SwarmOrbAnchor = styled.div`
   position: absolute;
-  width: 46px;
-  height: 46px;
-  padding: 0;
   transform: translate(-50%, -50%);
+`;
+
+const SwarmOrbDrift = styled.div`
+  animation: ${orbDrift} 9s ease-in-out infinite;
+  animation-delay: var(--swarm-orb-delay, 0ms);
+`;
+
+const SwarmOrb = styled.button`
+  position: relative;
+  width: 48px;
+  height: 48px;
+  padding: 0;
   border-radius: 50%;
   border: 2px solid var(--swarm-orb-color, #8b949e);
-  background: rgba(13, 17, 23, 0.92);
+  background:
+    radial-gradient(circle at 32% 28%, color-mix(in srgb, var(--swarm-orb-color, #8b949e) 26%, transparent), transparent 62%),
+    rgba(13, 17, 23, 0.94);
   color: var(--swarm-orb-color, #8b949e);
-  font-weight: 700;
-  font-size: 12px;
-  letter-spacing: 0.04em;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
-  transition: border-color 160ms ease, opacity 160ms ease, filter 160ms ease;
+  transition: border-color 160ms ease, opacity 160ms ease, filter 160ms ease, transform 160ms ease;
   animation: ${orbFloat} 5.2s ease-in-out infinite;
   animation-delay: var(--swarm-orb-delay, 0ms);
 
+  svg {
+    width: 20px;
+    height: 20px;
+  }
+
+  &::after {
+    content: "";
+    position: absolute;
+    inset: -2px;
+    border-radius: 50%;
+    border: 2px solid var(--swarm-orb-color, #8b949e);
+    opacity: 0;
+    pointer-events: none;
+  }
+
   &:hover {
-    filter: brightness(1.2);
+    filter: brightness(1.25);
+    transform: scale(1.06);
   }
 
   &[data-selected="true"] {
     outline: 2px solid rgba(230, 237, 243, 0.55);
-    outline-offset: 2px;
+    outline-offset: 3px;
   }
 
   &[data-status="working"] {
@@ -385,10 +718,38 @@ const SwarmOrb = styled.button`
 
   &[data-flash="true"] {
     animation: ${takePop} 0.6s ease;
+
+    &::after {
+      animation: ${takeRipple} 0.9s ease-out;
+    }
+  }
+
+  @container swarm-pane (max-width: 420px) {
+    width: 40px;
+    height: 40px;
+
+    svg { width: 17px; height: 17px; }
+  }
+
+  @container swarm-pane (max-height: 300px) {
+    width: 38px;
+    height: 38px;
+
+    svg { width: 16px; height: 16px; }
+  }
+
+  @container swarm-pane (max-height: 230px) {
+    width: 32px;
+    height: 32px;
+    border-width: 1.5px;
+
+    svg { width: 14px; height: 14px; }
   }
 
   html[data-forge-theme="light"] & {
-    background: #ffffff;
+    background:
+      radial-gradient(circle at 32% 28%, color-mix(in srgb, var(--swarm-orb-color, #8b949e) 14%, transparent), transparent 62%),
+      #ffffff;
     box-shadow: 0 2px 8px rgba(31, 35, 40, 0.12);
   }
 `;
@@ -437,17 +798,47 @@ const SwarmOrbLabel = styled.span`
   top: calc(100% + 5px);
   left: 50%;
   transform: translateX(-50%);
-  max-width: 108px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 9.5px;
-  font-weight: 600;
-  color: rgba(230, 237, 243, 0.72);
+  width: 116px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 1px;
   pointer-events: none;
 
+  span {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 9.5px;
+    font-weight: 600;
+    color: rgba(230, 237, 243, 0.72);
+  }
+
+  span[data-model="true"] {
+    font-size: 8.5px;
+    font-weight: 500;
+    color: rgba(139, 148, 158, 0.85);
+  }
+
+  @container swarm-pane (max-width: 420px) {
+    width: 92px;
+
+    span { font-size: 8.5px; }
+    span[data-model="true"] { font-size: 8px; }
+  }
+
+  @container swarm-pane (max-height: 260px) {
+    span[data-model="true"] { display: none; }
+  }
+
+  @container swarm-pane (max-height: 210px) {
+    display: none;
+  }
+
   html[data-forge-theme="light"] & {
-    color: rgba(31, 35, 40, 0.66);
+    span { color: rgba(31, 35, 40, 0.66); }
+    span[data-model="true"] { color: rgba(31, 35, 40, 0.48); }
   }
 `;
 
@@ -481,6 +872,35 @@ const SwarmNucleus = styled.div`
     line-height: 1.3;
   }
 
+  animation: ${nucleusBreath} 4.5s ease-in-out infinite;
+
+  @container swarm-pane (max-width: 420px) {
+    width: 96px;
+    height: 96px;
+    padding: 8px;
+
+    strong { font-size: 10px; }
+    small { font-size: 8.5px; }
+  }
+
+  @container swarm-pane (max-height: 300px) {
+    width: 88px;
+    height: 88px;
+    padding: 7px;
+
+    strong { font-size: 9.5px; }
+    small { font-size: 8.5px; }
+  }
+
+  @container swarm-pane (max-height: 230px) {
+    width: 72px;
+    height: 72px;
+    padding: 6px;
+
+    strong { font-size: 9px; }
+    small { display: none; }
+  }
+
   &[data-run-status="done"] { border-color: rgba(63, 185, 80, 0.65); }
   &[data-run-status="failed"] { border-color: rgba(248, 81, 73, 0.65); }
   &[data-run-status="cancelled"] { border-color: rgba(210, 153, 34, 0.6); }
@@ -510,6 +930,9 @@ const SwarmSetupCard = styled.div`
   top: 50%;
   transform: translate(-50%, -50%);
   width: min(360px, calc(100% - 32px));
+  max-height: calc(100% - 20px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -518,6 +941,13 @@ const SwarmSetupCard = styled.div`
   border: 1px solid rgba(139, 148, 158, 0.24);
   background: #0d1117;
   text-align: center;
+
+  @container swarm-pane (max-height: 300px) {
+    gap: 7px;
+    padding: 10px 12px;
+
+    p { display: none; }
+  }
 
   h3 {
     margin: 0;
@@ -552,6 +982,11 @@ const SwarmSetupChip = styled.button`
   display: inline-flex;
   align-items: center;
   gap: 6px;
+
+  svg {
+    width: 12px;
+    height: 12px;
+  }
   border: 1px solid color-mix(in srgb, var(--swarm-chip-color) 55%, transparent);
   border-radius: 999px;
   padding: 4px 10px;
@@ -746,6 +1181,11 @@ const SwarmMemberBadge = styled.span`
   justify-content: center;
   font-size: 9px;
   font-weight: 700;
+
+  svg {
+    width: 13px;
+    height: 13px;
+  }
 `;
 
 const SwarmMemberMain = styled.div`
@@ -857,39 +1297,68 @@ const SwarmRunRow = styled.button`
 
 const SwarmComposerShell = styled.form`
   flex: 0 0 auto;
+  padding: 8px 10px 10px;
+
+  /* The workspace's floating "+ Add" launcher overlays the bottom-right
+     corner when this pane is fullscreen or the only visible pane — reserve
+     that corner so the send circle never hides behind it. */
+  &[data-avoid-fab="true"] {
+    padding-right: 118px;
+  }
+
+  @container swarm-pane (max-width: 380px) {
+    padding: 6px 8px 8px;
+
+    &[data-avoid-fab="true"] {
+      padding-right: 104px;
+    }
+  }
+`;
+
+// One ChatGPT-style bubble: input on top, options + circular send inside the
+// same rounded container.
+const SwarmComposerBubble = styled.div`
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 8px 10px 10px;
-  border-top: 1px solid rgba(139, 148, 158, 0.18);
+  gap: 4px;
+  width: 100%;
+  max-width: 860px;
+  margin: 0 auto;
+  border: 1px solid rgba(139, 148, 158, 0.3);
+  border-radius: 16px;
   background: #0d1117;
+  padding: 9px 10px 8px;
+  transition: border-color 140ms ease;
+
+  &:focus-within {
+    border-color: rgba(76, 141, 255, 0.62);
+  }
 
   html[data-forge-theme="light"] & {
     background: #ffffff;
-    border-top-color: rgba(31, 35, 40, 0.12);
+    border-color: rgba(31, 35, 40, 0.18);
+    box-shadow: 0 2px 10px rgba(31, 35, 40, 0.06);
   }
 `;
 
 const SwarmComposerInput = styled.textarea`
   width: 100%;
   resize: none;
-  min-height: 44px;
+  min-height: 40px;
   max-height: 120px;
-  border: 1px solid rgba(139, 148, 158, 0.3);
-  border-radius: 8px;
-  background: rgba(110, 118, 129, 0.08);
+  border: none;
+  background: transparent;
   color: inherit;
   font-size: 12px;
   line-height: 1.45;
-  padding: 7px 9px;
+  padding: 1px 2px 3px;
   font-family: inherit;
 
-  &:focus { outline: none; border-color: rgba(76, 141, 255, 0.65); }
+  &:focus { outline: none; }
   &:disabled { opacity: 0.55; }
 
-  html[data-forge-theme="light"] & {
-    background: rgba(31, 35, 40, 0.04);
-    border-color: rgba(31, 35, 40, 0.18);
+  &::placeholder {
+    color: rgba(139, 148, 158, 0.75);
   }
 `;
 
@@ -901,29 +1370,46 @@ const SwarmComposerControls = styled.div`
 
 const SwarmModeToggle = styled.div`
   display: inline-flex;
-  border: 1px solid rgba(139, 148, 158, 0.3);
-  border-radius: 7px;
-  overflow: hidden;
+  flex: 0 0 auto;
+  gap: 2px;
+  border-radius: 999px;
+  background: rgba(110, 118, 129, 0.14);
+  padding: 2px;
 
   button {
     appearance: none;
     border: none;
+    border-radius: 999px;
     background: transparent;
     color: rgba(139, 148, 158, 0.95);
     font-size: 10.5px;
     font-weight: 600;
-    padding: 4px 10px;
+    padding: 3px 10px;
     cursor: pointer;
   }
 
   button[data-active="true"] {
-    background: rgba(76, 141, 255, 0.2);
-    color: #79b8ff;
+    background: rgba(76, 141, 255, 0.24);
+    color: #9ecbff;
   }
 
-  html[data-forge-theme="light"] & button[data-active="true"] {
-    background: rgba(9, 105, 218, 0.1);
-    color: #0969da;
+  @container swarm-pane (max-width: 340px) {
+    button {
+      padding: 3px 7px;
+      font-size: 10px;
+    }
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(31, 35, 40, 0.06);
+
+    button { color: rgba(31, 35, 40, 0.6); }
+
+    button[data-active="true"] {
+      background: #ffffff;
+      color: #0969da;
+      box-shadow: 0 1px 3px rgba(31, 35, 40, 0.16);
+    }
   }
 `;
 
@@ -934,6 +1420,65 @@ const SwarmComposerHint = styled.span`
   text-overflow: ellipsis;
   white-space: nowrap;
   flex: 1 1 auto;
+
+  @container swarm-pane (max-width: 300px) {
+    display: none;
+  }
+`;
+
+const SwarmSendCircle = styled.button`
+  appearance: none;
+  flex: 0 0 auto;
+  width: 30px;
+  height: 30px;
+  border-radius: 50%;
+  border: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  background: #4c8dff;
+  color: #06101f;
+  transition: background 140ms ease, opacity 140ms ease;
+
+  svg {
+    width: 17px;
+    height: 17px;
+  }
+
+  &:hover:not(:disabled) {
+    background: #6ba1ff;
+  }
+
+  &:disabled {
+    background: rgba(110, 118, 129, 0.26);
+    color: rgba(230, 237, 243, 0.4);
+    cursor: default;
+  }
+
+  &[data-stop="true"] {
+    background: #e6edf3;
+    color: #0d1117;
+  }
+
+  &[data-stop="true"]:hover {
+    background: #ffffff;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #0969da;
+    color: #ffffff;
+
+    &:disabled {
+      background: rgba(31, 35, 40, 0.12);
+      color: rgba(31, 35, 40, 0.4);
+    }
+
+    &[data-stop="true"] {
+      background: #1f2328;
+      color: #ffffff;
+    }
+  }
 `;
 
 const SwarmMemberSheet = styled.div`
@@ -1000,6 +1545,7 @@ const SwarmSheetBody = styled.div`
 /* --------------------------------- component -------------------------------- */
 
 export default function SwarmWorkspacePane({
+  avoidFloatingAdd = false,
   isActive = true,
   paneId = "",
   repoPath = "",
@@ -1026,6 +1572,8 @@ export default function SwarmWorkspacePane({
   const [setupCounts, setSetupCounts] = useState({ claude: 1, codex: 1, opencode: 0 });
   const [addProvider, setAddProvider] = useState("codex");
   const [addModel, setAddModel] = useState("");
+  const [stageView, setStageView] = useState({ x: 0, y: 0, zoom: 1 });
+  const [stagePanning, setStagePanning] = useState(false);
 
   const swarmRef = useRef(null);
   swarmRef.current = swarm;
@@ -1033,6 +1581,10 @@ export default function SwarmWorkspacePane({
   selectedRunIdRef.current = selectedRunId;
   const mountedRef = useRef(true);
   const flashTimersRef = useRef(new Map());
+  const constellationRef = useRef(null);
+  const stageViewRef = useRef(stageView);
+  stageViewRef.current = stageView;
+  const stagePanRef = useRef(null);
 
   const members = useMemo(() => (Array.isArray(swarm?.members) ? swarm.members : []), [swarm?.members]);
   const membersById = useMemo(() => new Map(members.map((member) => [member.memberId, member])), [members]);
@@ -1412,6 +1964,105 @@ export default function SwarmWorkspacePane({
     });
   }, []);
 
+  // Bounded pan/zoom for the constellation stage. Wheel zooms around the
+  // cursor; dragging empty space pans; both are clamped so the graph can
+  // never be lost off-screen.
+  useEffect(() => {
+    const node = constellationRef.current;
+    if (!node || activeTab !== "overview") {
+      return undefined;
+    }
+    const handleWheel = (event) => {
+      event.preventDefault();
+      const current = stageViewRef.current;
+      const factor = Math.exp(-event.deltaY * 0.0016);
+      const nextZoom = Math.min(
+        SWARM_STAGE_MAX_ZOOM,
+        Math.max(SWARM_STAGE_MIN_ZOOM, current.zoom * factor),
+      );
+      if (nextZoom === current.zoom) {
+        return;
+      }
+      const rect = node.getBoundingClientRect();
+      const cursorX = event.clientX - rect.left - rect.width / 2;
+      const cursorY = event.clientY - rect.top - rect.height / 2;
+      const scale = nextZoom / current.zoom;
+      setStageView(clampSwarmStageView({
+        x: cursorX - (cursorX - current.x) * scale,
+        y: cursorY - (cursorY - current.y) * scale,
+        zoom: nextZoom,
+      }));
+    };
+    node.addEventListener("wheel", handleWheel, { passive: false });
+    return () => node.removeEventListener("wheel", handleWheel);
+  }, [activeTab, hasMembers]);
+
+  const handleStagePointerDown = useCallback((event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    if (event.target.closest("button, select, input, textarea, a")) {
+      return;
+    }
+    const node = constellationRef.current;
+    if (!node) {
+      return;
+    }
+    stagePanRef.current = {
+      originX: stageViewRef.current.x,
+      originY: stageViewRef.current.y,
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+    };
+    setStagePanning(true);
+    node.setPointerCapture?.(event.pointerId);
+  }, []);
+
+  const handleStagePointerMove = useCallback((event) => {
+    const pan = stagePanRef.current;
+    if (!pan || event.pointerId !== pan.pointerId) {
+      return;
+    }
+    setStageView((current) => clampSwarmStageView({
+      x: pan.originX + (event.clientX - pan.startX),
+      y: pan.originY + (event.clientY - pan.startY),
+      zoom: current.zoom,
+    }));
+  }, []);
+
+  const handleStagePointerEnd = useCallback((event) => {
+    const pan = stagePanRef.current;
+    if (!pan || event.pointerId !== pan.pointerId) {
+      return;
+    }
+    stagePanRef.current = null;
+    setStagePanning(false);
+    constellationRef.current?.releasePointerCapture?.(event.pointerId);
+  }, []);
+
+  const zoomStageBy = useCallback((factor) => {
+    setStageView((current) => {
+      const nextZoom = Math.min(
+        SWARM_STAGE_MAX_ZOOM,
+        Math.max(SWARM_STAGE_MIN_ZOOM, current.zoom * factor),
+      );
+      const scale = nextZoom / current.zoom;
+      return clampSwarmStageView({ x: current.x * scale, y: current.y * scale, zoom: nextZoom });
+    });
+  }, []);
+
+  const resetStageView = useCallback(() => {
+    setStageView({ x: 0, y: 0, zoom: 1 });
+  }, []);
+
+  const handleStageDoubleClick = useCallback((event) => {
+    if (event.target.closest("button, select, input, textarea, a")) {
+      return;
+    }
+    resetStageView();
+  }, [resetStageView]);
+
   const orbPlacements = useMemo(() => {
     const count = members.length;
     return members.map((member, index) => {
@@ -1542,60 +2193,137 @@ export default function SwarmWorkspacePane({
       ) : null}
 
       {activeTab === "overview" ? (
-      <SwarmConstellation>
+      <SwarmConstellation
+        data-live={isActive ? "true" : "false"}
+        data-panning={stagePanning ? "true" : undefined}
+        onDoubleClick={handleStageDoubleClick}
+        onPointerCancel={handleStagePointerEnd}
+        onPointerDown={handleStagePointerDown}
+        onPointerMove={handleStagePointerMove}
+        onPointerUp={handleStagePointerEnd}
+        ref={constellationRef}
+      >
+        <SwarmStars aria-hidden="true" />
         {hasMembers ? (
           <>
-            <SwarmEdgeSvg preserveAspectRatio="none" viewBox="0 0 100 100">
-              {orbPlacements.map(({ member, x, y }) => (
-                <line
-                  data-flash={takeFlashes.has(member.memberId) ? "true" : undefined}
-                  data-live={member.status === "working" ? "true" : undefined}
-                  key={member.memberId}
-                  style={{ "--swarm-edge-color": providerMeta(member.provider).color }}
-                  x1={x}
-                  x2={50}
-                  y1={y}
-                  y2={50}
-                />
-              ))}
-            </SwarmEdgeSvg>
-            {nucleusContent ? (
-              <SwarmNucleus data-run-status={nucleusContent.status || undefined}>
-                {nucleusContent.running ? <SwarmNucleusRing aria-hidden="true" /> : null}
-                <strong>{nucleusContent.title}</strong>
-                <small>{nucleusContent.detail}</small>
-              </SwarmNucleus>
-            ) : null}
-            {orbPlacements.map(({ member, x, y }, index) => {
-              const meta = providerMeta(member.provider);
-              return (
-                <SwarmOrb
-                  aria-label={`Inspect ${memberDisplayName(member)}`}
-                  data-flash={takeFlashes.has(member.memberId) ? "true" : undefined}
-                  data-selected={selectedMemberId === member.memberId ? "true" : undefined}
-                  data-status={member.status || "offline"}
-                  key={member.memberId}
-                  onClick={() => setSelectedMemberId((current) => (
-                    current === member.memberId ? "" : member.memberId
-                  ))}
-                  style={{
-                    "--swarm-orb-color": meta.color,
-                    "--swarm-orb-delay": `${index * 420}ms`,
-                    left: `${x}%`,
-                    top: `${y}%`,
-                  }}
-                  title={`${memberDisplayName(member)} — ${member.status || "offline"}`}
-                  type="button"
-                >
-                  {meta.glyph}
-                  <SwarmOrbStatusDot aria-hidden="true" />
-                  {Number(member.score || 0) !== 0 ? (
-                    <SwarmOrbScore aria-hidden="true">{member.score > 0 ? `+${member.score}` : member.score}</SwarmOrbScore>
-                  ) : null}
-                  <SwarmOrbLabel aria-hidden="true">{memberDisplayName(member)}</SwarmOrbLabel>
-                </SwarmOrb>
-              );
-            })}
+            <SwarmStage
+              data-panning={stagePanning ? "true" : undefined}
+              style={{ transform: `translate(${stageView.x}px, ${stageView.y}px) scale(${stageView.zoom})` }}
+            >
+              <SwarmEdgeSvg preserveAspectRatio="none" viewBox="0 0 100 100">
+                <ellipse cx="50" cy="50" data-orbit="outer" rx="37" ry="34" />
+                <ellipse cx="50" cy="50" data-orbit="inner" rx="23" ry="20.5" />
+                {orbPlacements.map(({ member, x, y }) => (
+                  <line
+                    data-flash={takeFlashes.has(member.memberId) ? "true" : undefined}
+                    data-live={member.status === "working" ? "true" : undefined}
+                    key={member.memberId}
+                    style={{ "--swarm-edge-color": providerMeta(member.provider).color }}
+                    x1={x}
+                    x2={50}
+                    y1={y}
+                    y2={50}
+                  />
+                ))}
+                {isActive ? orbPlacements.map(({ member, x, y }) => {
+                  const flashing = takeFlashes.has(member.memberId);
+                  if (member.status !== "working" && !flashing) {
+                    return null;
+                  }
+                  const meta = providerMeta(member.provider);
+                  return (
+                    <circle
+                      data-packet="true"
+                      fill={meta.color}
+                      key={`packet-${member.memberId}`}
+                      r={flashing ? 1.1 : 0.85}
+                      style={{ "--swarm-edge-color": meta.color }}
+                    >
+                      <animateMotion
+                        dur={flashing ? "0.6s" : "1.6s"}
+                        path={`M ${x} ${y} L 50 50`}
+                        repeatCount="indefinite"
+                      />
+                    </circle>
+                  );
+                }) : null}
+              </SwarmEdgeSvg>
+              <SwarmNucleusAura aria-hidden="true" data-on={activeRunId ? "true" : undefined} />
+              {nucleusContent ? (
+                <SwarmNucleus data-run-status={nucleusContent.status || undefined}>
+                  {nucleusContent.running ? <SwarmNucleusRing aria-hidden="true" /> : null}
+                  <strong>{nucleusContent.title}</strong>
+                  <small>{nucleusContent.detail}</small>
+                </SwarmNucleus>
+              ) : null}
+              {orbPlacements.map(({ member, x, y }, index) => {
+                const meta = providerMeta(member.provider);
+                return (
+                  <SwarmOrbAnchor
+                    key={member.memberId}
+                    style={{ left: `${x}%`, top: `${y}%` }}
+                  >
+                    <SwarmOrbDrift style={{ "--swarm-orb-delay": `${index * 420}ms` }}>
+                      <SwarmOrb
+                        aria-label={`Inspect ${memberDisplayName(member)}`}
+                        data-flash={takeFlashes.has(member.memberId) ? "true" : undefined}
+                        data-selected={selectedMemberId === member.memberId ? "true" : undefined}
+                        data-status={member.status || "offline"}
+                        onClick={() => setSelectedMemberId((current) => (
+                          current === member.memberId ? "" : member.memberId
+                        ))}
+                        style={{
+                          "--swarm-orb-color": meta.color,
+                          "--swarm-orb-delay": `${index * 420}ms`,
+                        }}
+                        title={`${memberDisplayName(member)} — ${member.status || "offline"}`}
+                        type="button"
+                      >
+                        <SwarmHarnessIcon provider={member.provider} />
+                        <SwarmOrbStatusDot aria-hidden="true" />
+                        {Number(member.score || 0) !== 0 ? (
+                          <SwarmOrbScore aria-hidden="true">{member.score > 0 ? `+${member.score}` : member.score}</SwarmOrbScore>
+                        ) : null}
+                        <SwarmOrbLabel aria-hidden="true">
+                          <span>{memberDisplayName(member)}</span>
+                          {memberModelText(member) ? (
+                            <span data-model="true">{memberModelText(member)}</span>
+                          ) : null}
+                        </SwarmOrbLabel>
+                      </SwarmOrb>
+                    </SwarmOrbDrift>
+                  </SwarmOrbAnchor>
+                );
+              })}
+            </SwarmStage>
+            <SwarmViewControls data-terminal-control="true">
+              <SwarmViewControlButton
+                aria-label="Zoom in"
+                disabled={stageView.zoom >= SWARM_STAGE_MAX_ZOOM - 0.001}
+                onClick={() => zoomStageBy(1.25)}
+                title="Zoom in"
+                type="button"
+              >
+                <Add aria-hidden="true" />
+              </SwarmViewControlButton>
+              <SwarmViewControlButton
+                aria-label="Zoom out"
+                disabled={stageView.zoom <= SWARM_STAGE_MIN_ZOOM + 0.001}
+                onClick={() => zoomStageBy(1 / 1.25)}
+                title="Zoom out"
+                type="button"
+              >
+                <Remove aria-hidden="true" />
+              </SwarmViewControlButton>
+              <SwarmViewControlButton
+                aria-label="Reset view"
+                onClick={resetStageView}
+                title="Reset view (double-click background)"
+                type="button"
+              >
+                <CenterFocusStrong aria-hidden="true" />
+              </SwarmViewControlButton>
+            </SwarmViewControls>
           </>
         ) : (
           <SwarmSetupCard>
@@ -1623,6 +2351,7 @@ export default function SwarmWorkspacePane({
                     style={{ "--swarm-chip-color": provider.color }}
                     type="button"
                   >
+                    <SwarmHarnessIcon provider={provider.id} />
                     {provider.label}
                     <span data-count="true">{count}</span>
                   </SwarmSetupChip>
@@ -1640,15 +2369,7 @@ export default function SwarmWorkspacePane({
           </SwarmSetupCard>
         )}
         {swarmParked ? (
-          <div
-            style={{
-              position: "absolute",
-              left: "50%",
-              bottom: 14,
-              transform: "translateX(-50%)",
-              zIndex: 4,
-            }}
-          >
+          <SwarmActivateDock>
             <SwarmPrimaryButton
               disabled={busy || backendMissing}
               onClick={() => handleActivateSwarm()}
@@ -1661,7 +2382,7 @@ export default function SwarmWorkspacePane({
                   ? "Activate swarm"
                   : `Activate swarm · ${parkedMemberCount} offline`}
             </SwarmPrimaryButton>
-          </div>
+          </SwarmActivateDock>
         ) : null}
       </SwarmConstellation>
       ) : null}
@@ -1670,7 +2391,7 @@ export default function SwarmWorkspacePane({
           <SwarmMemberSheet>
             <header>
               <SwarmMemberBadge style={{ "--swarm-orb-color": providerMeta(selectedMember.provider).color }}>
-                {providerMeta(selectedMember.provider).glyph}
+                <SwarmHarnessIcon provider={selectedMember.provider} />
               </SwarmMemberBadge>
               <strong>{memberDisplayName(selectedMember)}</strong>
               <SwarmGhostButton onClick={() => setSelectedMemberId("")} type="button">Close</SwarmGhostButton>
@@ -1701,6 +2422,10 @@ export default function SwarmWorkspacePane({
                 <strong>
                   {String(swarm?.scoutMemberId || "") === selectedMember.memberId ? "Scout" : "Member"}
                 </strong>
+              </div>
+              <div style={{ gridColumn: "1 / -1" }}>
+                <small>Model</small>
+                <strong>{memberModelText(selectedMember) || "harness default"}</strong>
               </div>
             </SwarmSheetStats>
             <SwarmComposerControls>
@@ -1779,6 +2504,7 @@ export default function SwarmWorkspacePane({
                     {members.map((member) => (
                       <option key={member.memberId} value={member.memberId}>
                         {memberDisplayName(member)}
+                        {memberModelText(member) ? ` — ${memberModelText(member)}` : ""}
                       </option>
                     ))}
                   </select>
@@ -1788,10 +2514,13 @@ export default function SwarmWorkspacePane({
                 const meta = providerMeta(member.provider);
                 return (
                   <SwarmMemberRow key={member.memberId}>
-                    <SwarmMemberBadge style={{ "--swarm-orb-color": meta.color }}>{meta.glyph}</SwarmMemberBadge>
+                    <SwarmMemberBadge style={{ "--swarm-orb-color": meta.color }}>
+                      <SwarmHarnessIcon provider={member.provider} />
+                    </SwarmMemberBadge>
                     <SwarmMemberMain>
                       <strong>{memberDisplayName(member)}</strong>
                       <small>
+                        {memberModelText(member) ? `${memberModelText(member)} · ` : ""}
                         score {Number(member.score || 0)}
                         {" · "}takes {Number(member.stats?.takesDelivered || 0)}
                         {" · "}champion {Number(member.stats?.championRuns || 0)}
@@ -1869,7 +2598,11 @@ export default function SwarmWorkspacePane({
         </SwarmLowerBody>
       ) : null}
 
-      <SwarmComposerShell onSubmit={handleSubmitTask}>
+      <SwarmComposerShell
+        data-avoid-fab={avoidFloatingAdd ? "true" : undefined}
+        onSubmit={handleSubmitTask}
+      >
+        <SwarmComposerBubble>
           <SwarmComposerInput
             disabled={composerDisabled}
             onChange={(event) => setPrompt(event.target.value)}
@@ -1894,18 +2627,28 @@ export default function SwarmWorkspacePane({
             </SwarmModeToggle>
             <SwarmComposerHint>{composerHint}</SwarmComposerHint>
             {activeRunId ? (
-              <SwarmGhostButton data-danger="true" onClick={handleCancelRun} type="button">
-                Cancel run
-              </SwarmGhostButton>
-            ) : null}
-            <SwarmPrimaryButton
-              disabled={composerDisabled || !prompt.trim() || readyMemberCount === 0}
-              type="submit"
-            >
-              {activeRunId ? "Running…" : "Send to swarm"}
-            </SwarmPrimaryButton>
+              <SwarmSendCircle
+                aria-label="Cancel swarm run"
+                data-stop="true"
+                onClick={handleCancelRun}
+                title="Cancel run"
+                type="button"
+              >
+                <Stop aria-hidden="true" />
+              </SwarmSendCircle>
+            ) : (
+              <SwarmSendCircle
+                aria-label="Send to swarm"
+                disabled={composerDisabled || !prompt.trim() || readyMemberCount === 0}
+                title="Send to swarm"
+                type="submit"
+              >
+                <ArrowUpward aria-hidden="true" />
+              </SwarmSendCircle>
+            )}
           </SwarmComposerControls>
-        </SwarmComposerShell>
+        </SwarmComposerBubble>
+      </SwarmComposerShell>
     </SwarmPaneRoot>
   );
 }

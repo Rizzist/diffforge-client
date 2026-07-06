@@ -875,7 +875,12 @@ const CLOUD_MCP_TOKENOMICS_PERIODIC_INTERVAL_SECS: u64 = 15 * 60;
 /// Coalescing window for transcript file events. Streaming agents append
 /// continuously, so this bounds the cycle rate while active — one stamp per
 /// window — instead of re-running the gate every few seconds.
-const CLOUD_MCP_TOKENOMICS_WATCH_DEBOUNCE_MS: u64 = 30_000;
+/// 90s: each expiry runs the full sync cluster (summary_worker +
+/// periodic_sample_cycle + provider limits, ~3-4s CPU at 200-300%) — at 30s
+/// that was an Energy Impact spike >1k every ~95s during agent streaming.
+/// Cross-device usage freshness lags at most ~90s; live limit sampling has
+/// its own cadence and is unaffected.
+const CLOUD_MCP_TOKENOMICS_WATCH_DEBOUNCE_MS: u64 = 90_000;
 /// Settle delay before the first cycle so app startup and first paint aren't contended.
 const CLOUD_MCP_TOKENOMICS_PERIODIC_STARTUP_DELAY_SECS: u64 = 45;
 const CLOUD_MCP_BACKGROUND_SCHEDULER_SHUTDOWN_POLL_SECS: u64 = 30;

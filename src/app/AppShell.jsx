@@ -28,8 +28,9 @@ import { Send } from "@styled-icons/material-rounded/Send";
 import { Terminal } from "@styled-icons/material-rounded/Terminal";
 import { Webhook } from "@styled-icons/material-rounded/Webhook";
 import { ZoomOutMap } from "@styled-icons/material-rounded/ZoomOutMap";
-import { Fragment, memo, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { Fragment, memo, Profiler, startTransition, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
+import { onRuntimeProfilerRender } from "../diagnostics/commitProfiler.js";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
 import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
 import {
@@ -337,6 +338,7 @@ import {
   applyWorkspaceThreadProviderSessionBinding,
   bindWorkspaceThreadTerminal,
   buildWorkspaceThreadsPersistDelta,
+  clearWorkspaceThreadsPersistDirtySnapshot,
   clearWorkspaceThreadsBrowserPersistence,
   clearWorkspaceThreadPendingPrompt,
   createWorkspaceThreadLiveTextProjectionEvents,
@@ -351,6 +353,7 @@ import {
   getWorkspaceThreadProviderBinding,
   getWorkspaceThreadTerminalNickname,
   getWorkspaceThreadsByTerminalIndex,
+  getWorkspaceThreadsPersistDirtySnapshot,
   hydrateWorkspaceThreadSessionTranscript,
   invalidateWorkspaceThreadProviderSession,
   markWorkspaceThreadAgentActivity,
@@ -5138,9 +5141,25 @@ function cloudDeviceLiveStateFromAccountSnapshot(snapshot, previous = null) {
   if (!snapshot || typeof snapshot !== "object" || Array.isArray(snapshot)) {
     return previous && typeof previous === "object" ? previous : null;
   }
+  // Strip the self-embed keys from BOTH sides before merging. The previous
+  // version embedded the whole prior merged object under two keys per event,
+  // so each live-state event nested one level deeper — shared references in
+  // memory, but JSON.stringify (equality checks, persistence, IPC) expands
+  // them to 2^depth: measured 27MB→54→108→216→432→864MB doubling per event,
+  // 3.7s single stringify calls, the dominant workspace-switch freeze.
+  const {
+    accountDeviceLiveStateSnapshot: _previousSnapshotRef,
+    account_device_live_state_snapshot: _previousSnakeSnapshotRef,
+    ...previousRest
+  } = previous && typeof previous === "object" ? previous : {};
+  const {
+    accountDeviceLiveStateSnapshot: _nextSnapshotRef,
+    account_device_live_state_snapshot: _nextSnakeSnapshotRef,
+    ...snapshotRest
+  } = snapshot;
   const merged = {
-    ...(previous && typeof previous === "object" ? previous : {}),
-    ...snapshot,
+    ...previousRest,
+    ...snapshotRest,
   };
   return {
     ...merged,
@@ -25675,12 +25694,15 @@ export default function App() {
         return;
       }
       workspaceThreadsPersistPendingRef.current = null;
+      const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot(pending.targets);
       const { normalizedThreads, request } = buildWorkspaceThreadsPersistDelta(
         pending.workspaceThreads,
         workspaceThreadsLastPersistedRef.current,
         pending.targets,
+        { dirtySnapshot },
       );
       if (!request.workspaces.length) {
+        clearWorkspaceThreadsPersistDirtySnapshot(dirtySnapshot);
         return;
       }
       workspaceThreadsPersistInFlightRef.current = true;
@@ -25688,7 +25710,9 @@ export default function App() {
         request,
       }).then(() => {
         workspaceThreadsLastPersistedRef.current = normalizedThreads;
+        clearWorkspaceThreadsPersistDirtySnapshot(dirtySnapshot);
       }).catch((error) => {
+        workspaceThreadsPersistPendingRef.current = workspaceThreadsPersistPendingRef.current || pending;
         logThreadBridgeDiagnosticEvent("frontend.workspace_threads_sqlite_persist.failed", {
           message: getErrorMessage(error, "Unable to persist workspace threads to SQLite."),
           workspaceCount: request.workspaces.length,
@@ -27980,7 +28004,19 @@ export default function App() {
       }, { trace });
     };
 
-    const frame = window.requestAnimationFrame(() => {
+    // The frame waits exist so the "Opening…" splash paints before the heavy
+    // runtime mount. Under main-thread churn (streaming terminals in other
+    // mounted workspaces) WebKit can starve rAF for SECONDS — measured 2.77s
+    // click→first frame — so every frame wait races a hard timeout cap:
+    // whichever fires first proceeds, the other is cancelled. Worst case the
+    // splash skips a paint; activation latency stays bounded.
+    const FRAME_WAIT_CAP_MS = 120;
+    let firstFrameSettled = false;
+    const onFirstFrame = (via) => {
+      if (firstFrameSettled) {
+        return;
+      }
+      firstFrameSettled = true;
       const current = deferredWorkspaceActivationRef.current;
       if (current.token !== token || current.workspaceId !== safeWorkspaceId) {
         logWorkspaceActivationTrace("workspace.open.deferred_frame_stale", safeWorkspaceId, {
@@ -27991,23 +28027,52 @@ export default function App() {
         }, { trace });
         return;
       }
+      if (current.frame) {
+        window.cancelAnimationFrame(current.frame);
+      }
+      if (current.timeout) {
+        window.clearTimeout(current.timeout);
+      }
 
       logWorkspaceActivationTrace("workspace.open.deferred_first_frame", safeWorkspaceId, {
         elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - scheduledAtMs),
         source,
         token,
+        via,
       }, { trace });
-      const secondFrame = window.requestAnimationFrame(scheduleIdleActivation);
+
+      let secondFrameSettled = false;
+      const onSecondFrame = () => {
+        if (secondFrameSettled) {
+          return;
+        }
+        secondFrameSettled = true;
+        const latest = deferredWorkspaceActivationRef.current;
+        if (latest.secondFrame) {
+          window.cancelAnimationFrame(latest.secondFrame);
+        }
+        if (latest.timeout) {
+          window.clearTimeout(latest.timeout);
+        }
+        scheduleIdleActivation();
+      };
+      const secondFrame = window.requestAnimationFrame(onSecondFrame);
+      const secondFrameCap = window.setTimeout(onSecondFrame, FRAME_WAIT_CAP_MS);
       deferredWorkspaceActivationRef.current = {
         ...current,
         frame: 0,
         secondFrame,
+        timeout: secondFrameCap,
       };
-    });
+    };
+
+    const frame = window.requestAnimationFrame(() => onFirstFrame("frame"));
+    const frameCap = window.setTimeout(() => onFirstFrame("cap"), FRAME_WAIT_CAP_MS);
 
     deferredWorkspaceActivationRef.current = {
       ...deferredWorkspaceActivationRef.current,
       frame,
+      timeout: frameCap,
     };
   }, [activateWorkspace, cancelDeferredWorkspaceActivation, logWorkspaceActivationTrace]);
 
@@ -28073,7 +28138,15 @@ export default function App() {
       }, { trace, force: true });
     };
 
-    const frame = window.requestAnimationFrame(() => {
+    // Same frame-wait starvation cap as deferred activation: rAF can stall
+    // for seconds under terminal-streaming churn, wedging the switch splash.
+    const SWITCH_FRAME_WAIT_CAP_MS = 120;
+    let switchFrameSettled = false;
+    const onSwitchFrame = (via) => {
+      if (switchFrameSettled) {
+        return;
+      }
+      switchFrameSettled = true;
       const current = deferredWorkspaceActivationRef.current;
       if (current.token !== token || current.workspaceId !== safeWorkspaceId) {
         logWorkspaceActivationTrace("workspace.open.active_runtime_switch_frame_stale", safeWorkspaceId, {
@@ -28085,6 +28158,12 @@ export default function App() {
         }, { trace });
         return;
       }
+      if (current.frame) {
+        window.cancelAnimationFrame(current.frame);
+      }
+      if (current.timeout) {
+        window.clearTimeout(current.timeout);
+      }
 
       logWorkspaceActivationTrace("workspace.open.active_runtime_switch_first_frame", safeWorkspaceId, {
         ...fields,
@@ -28092,6 +28171,7 @@ export default function App() {
         openingMs: WORKSPACE_ACTIVE_SWITCH_OPENING_MS,
         source,
         token,
+        via,
       }, { trace });
       const timeout = window.setTimeout(finishSwitch, WORKSPACE_ACTIVE_SWITCH_OPENING_MS);
       deferredWorkspaceActivationRef.current = {
@@ -28099,11 +28179,15 @@ export default function App() {
         frame: 0,
         timeout,
       };
-    });
+    };
+
+    const frame = window.requestAnimationFrame(() => onSwitchFrame("frame"));
+    const frameCap = window.setTimeout(() => onSwitchFrame("cap"), SWITCH_FRAME_WAIT_CAP_MS);
 
     deferredWorkspaceActivationRef.current = {
       ...deferredWorkspaceActivationRef.current,
       frame,
+      timeout: frameCap,
     };
   }, [cancelDeferredWorkspaceActivation, logWorkspaceActivationTrace]);
 
@@ -51217,6 +51301,9 @@ export default function App() {
                           data-visible={visibleView === DEFAULT_WORKSPACE_VIEW && runtimeVisible}
                           key={runtimeWorkspace.id}
                         >
+                          {/* Profiler: names slow runtime commits behind switch-lag
+                              freezes (react-dom/profiling in debug bundles). */}
+                          <Profiler id={`runtime:${runtimeWorkspace.id}`} onRender={onRuntimeProfilerRender}>
                           <TerminalView
                             accountKey={resolvedTokenomicsAccountKey}
                             architectureTerminalActivity={workspaceArchitectureTerminalActivity[runtimeWorkspace.id]?.latest || null}
@@ -51331,6 +51418,7 @@ export default function App() {
                             workspaces={workspaces}
                             useDefaultNewWorkspaceRoot={useDefaultNewWorkspaceRoot}
                           />
+                          </Profiler>
                         </WorkspaceRuntimeLayer>
                       );
                     })

@@ -2643,13 +2643,20 @@ fn agent_chat_session_sync_backfill_workspace_history(
     root_directory: Option<String>,
     reason: &'static str,
 ) {
-    let Some(started_at_ms) =
-        agent_chat_session_sync_should_backfill_workspace(&workspace_id, root_directory.as_deref())
-    else {
-        return;
-    };
     let requested_workspace_id = workspace_id.clone();
     tauri::async_runtime::spawn(async move {
+        // Workspace-snapshot rebuilds fire this during workspace activation,
+        // and the full history list can burn seconds of CPU/disk exactly while
+        // the runtime mounts (user-visible switch lag). Let the switch settle
+        // first; the dirty latch is checked after the delay so work another
+        // pass already served is skipped.
+        tokio::time::sleep(std::time::Duration::from_millis(5_000)).await;
+        let Some(started_at_ms) = agent_chat_session_sync_should_backfill_workspace(
+            &workspace_id,
+            root_directory.as_deref(),
+        ) else {
+            return;
+        };
         let request = WorkspaceAgentSessionHistoryListRequest {
             fast: Some(false),
             workspace_id,

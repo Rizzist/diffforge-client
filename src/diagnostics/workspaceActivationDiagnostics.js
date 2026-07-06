@@ -170,6 +170,18 @@ function flushWorkspaceActivationDiagnosticEvents({ force = false } = {}) {
 }
 
 export function logWorkspaceActivationDiagnosticEvent(phase, fields = {}, options = {}) {
+  // Stamp before any gating: the UI freeze probe correlates main-thread
+  // blocking with the most recent activation phase even when file logging
+  // is disabled.
+  try {
+    window.__DF_LAST_ACTIVATION_MARK = {
+      phase: String(phase || ""),
+      t: performance.now(),
+      workspaceId: String(fields?.workspaceId || ""),
+    };
+  } catch {
+    // never let diagnostics interfere
+  }
   if (workspaceActivationLoggingResolved === false) {
     return;
   }

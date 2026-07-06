@@ -34,6 +34,7 @@ import {
   gainAtMs,
   linkClips,
   MEME_TEXT_STYLE,
+  motionPresetPatch,
   moveClip,
   moveClips,
   moveClipToTrack,
@@ -1869,6 +1870,38 @@ export default function Timeline({
             </>
           ) : (
             <>
+              {selected.track.kind === "video" ? (
+                <VideoLabel>
+                  Motion
+                  <AppSelect
+                    onChange={(value) => {
+                      const asset = assetsByPath[selected.clip.assetPath] || {};
+                      updateSelectedClip(
+                        motionPresetPatch(value, {
+                          durationMs: selected.clip.durationMs,
+                          assetWidth: asset.width || 0,
+                          assetHeight: asset.height || 0,
+                          frameWidth: project?.settings?.width || 1920,
+                          frameHeight: project?.settings?.height || 1080,
+                          existingKf: selected.clip.kf,
+                          existingTransform: selected.clip.transform,
+                        }),
+                      );
+                    }}
+                    options={[
+                      { value: "none", label: "None" },
+                      { value: "kenburns-in", label: "Ken Burns in" },
+                      { value: "kenburns-out", label: "Ken Burns out" },
+                      { value: "pan-left", label: "Pan left" },
+                      { value: "pan-right", label: "Pan right" },
+                      { value: "pan-up", label: "Pan up" },
+                      { value: "pan-down", label: "Pan down" },
+                      { value: "drift", label: "Drift" },
+                    ]}
+                    value={selected.clip.motion || "none"}
+                  />
+                </VideoLabel>
+              ) : null}
               <SliderLabel>
                 Volume · {Math.round((selectedGain?.level ?? 1) * 100)}%
                 <input

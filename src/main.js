@@ -3,6 +3,12 @@
 import "./app/renderLoopProbe.js";
 // IPC invoke-storm watchdog: names the commands behind cold-start IPC bursts.
 import "./app/invokeProbe.js";
+// Main-thread freeze watchdog: measures UI blocking and maps it to the
+// workspace-activation phase it happened inside.
+import "./diagnostics/uiFreezeProbe.js";
+// Serialization watchdog: names the caller behind slow JSON.stringify/parse
+// and localStorage writes (the confirmed freeze class from native sampling).
+import "./diagnostics/serializationProbe.js";
 // Focus-edge watchdog: names what the user clicked right before the webview
 // lost focus (the "hover goes dead until I click the app" bug class).
 import "./diagnostics/windowFocusDiagnostics.js";

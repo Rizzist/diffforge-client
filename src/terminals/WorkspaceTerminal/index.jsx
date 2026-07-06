@@ -8182,8 +8182,17 @@ function WorkspaceTerminal({
       terminalGlobalRenderScheduler.request(renderSchedulerId);
     };
     const flushCurrentOutputNow = (reason = "flush_now") => {
+      if (!pendingOutputWrites.length) {
+        return;
+      }
+      // Reveal used to drain the ENTIRE hidden backlog (≤256KB/pane, several
+      // panes at once on a workspace switch) through xterm synchronously —
+      // measured 2.5-3s main-thread freezes per switch. Catch up in normal
+      // active-budget chunks instead; the render scheduler keeps this pane
+      // flushing every frame until the backlog is gone (~16KB/frame).
+      flushTerminalOutputBatch(reason);
       if (pendingOutputWrites.length) {
-        flushTerminalOutputBatch(reason, { flushAll: true });
+        scheduleTerminalOutputBatchFlush();
       }
     };
     terminalOutputFlushNowRef.current = flushCurrentOutputNow;

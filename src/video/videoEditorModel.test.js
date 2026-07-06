@@ -16,6 +16,7 @@ import {
   kfValueAtMs,
   linkClips,
   makeStarterProject,
+  motionPresetPatch,
   moveClip,
   moveClips,
   moveClipToTrack,
@@ -517,4 +518,62 @@ test("formats timecodes", () => {
   assert.equal(formatTimecode(65000), "1:05");
   assert.equal(formatTimecode(3723000), "1:02:03");
   assert.equal(formatTimecode(1500, { withMs: true }), "0:01.500");
+});
+
+// Motion presets — parity with the Rust mirror (video_mcp_apply_motion_preset
+// in src-tauri/src/video_editor.rs); both suites assert the same numbers.
+test("motionPresetPatch kenburns-in covers a square image and clamps the pan", () => {
+  const patch = motionPresetPatch("kenburns-in", {
+    durationMs: 4000,
+    assetWidth: 1000,
+    assetHeight: 1000,
+    frameWidth: 1920,
+    frameHeight: 1080,
+  });
+  assert.equal(patch.motion, "kenburns-in");
+  assert.equal(patch.kf.scale[0].atMs, 0);
+  assert.equal(patch.kf.scale[1].atMs, 4000);
+  assert.ok(Math.abs(patch.kf.scale[0].value - 1.8133) < 0.0005);
+  assert.ok(Math.abs(patch.kf.scale[1].value - 2.0267) < 0.0005);
+  // Desired x amplitude 0.012 clamps to the 0.01 slack left by the zoom.
+  assert.ok(Math.abs(patch.kf.x[0].value + 0.01) < 0.0005);
+  assert.ok(Math.abs(patch.kf.x[1].value - 0.01) < 0.0005);
+  assert.equal(patch.kf.scale[0].easing, "smooth");
+  assert.ok(Math.abs(patch.transform.scale - 1.8133) < 0.0005);
+});
+
+test("motionPresetPatch pan-left with matching aspect keeps constant zoom on transform", () => {
+  const patch = motionPresetPatch("pan-left", {
+    durationMs: 3000,
+    assetWidth: 1920,
+    assetHeight: 1080,
+    frameWidth: 1920,
+    frameHeight: 1080,
+  });
+  assert.equal(patch.kf.scale, undefined);
+  assert.ok(Math.abs(patch.transform.scale - 1.1) < 0.0005);
+  assert.ok(Math.abs(patch.kf.x[0].value - 0.05) < 0.0005);
+  assert.ok(Math.abs(patch.kf.x[1].value + 0.05) < 0.0005);
+  assert.equal(patch.kf.y, undefined);
+});
+
+test("motionPresetPatch none clears motion but keeps opacity keyframes", () => {
+  const patch = motionPresetPatch("none", {
+    existingKf: { opacity: [{ atMs: 0, value: 0, easing: "linear" }] },
+    existingTransform: { opacity: 0.8 },
+  });
+  assert.equal(patch.motion, "");
+  assert.equal(patch.kf.scale, undefined);
+  assert.equal(patch.kf.x, undefined);
+  assert.equal(patch.kf.opacity.length, 1);
+  assert.equal(patch.transform.scale, 1);
+  assert.equal(patch.transform.opacity, 0.8);
+});
+
+test("motionPresetPatch strength scales amplitudes", () => {
+  const subtle = motionPresetPatch("kenburns-in", { durationMs: 2000, strength: "subtle" });
+  const bold = motionPresetPatch("kenburns-in", { durationMs: 2000, strength: "bold" });
+  const subtleZoom = subtle.kf.scale[1].value - subtle.kf.scale[0].value;
+  const boldZoom = bold.kf.scale[1].value - bold.kf.scale[0].value;
+  assert.ok(boldZoom > subtleZoom * 2);
 });

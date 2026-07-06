@@ -14,13 +14,49 @@ const STORM_THRESHOLD = 150;
 const TOP_LIMIT = 24;
 
 const invokeCounts = new Map();
+const invokeDurations = new Map();
 const eventCounts = new Map();
+const slowCalls = [];
 let windowInvokes = 0;
 let windowEvents = 0;
 let totalInvokes = 0;
 let totalEvents = 0;
 let stormWindows = 0;
 let reporting = false;
+let slowReporting = false;
+
+const SLOW_CALL_MS = 500;
+const SLOW_CALL_LIMIT = 10;
+
+function recordDuration(cmd, ms) {
+  // The probe's own reporting channels must not report themselves.
+  if (cmd === "terminal_status_log" || cmd === "workspace_activation_diagnostic_log_many") {
+    return;
+  }
+  invokeDurations.set(cmd, (invokeDurations.get(cmd) || 0) + ms);
+  if (ms >= SLOW_CALL_MS && slowCalls.length < SLOW_CALL_LIMIT) {
+    const mark = window.__DF_LAST_ACTIVATION_MARK;
+    slowCalls.push({
+      cmd,
+      ms: Math.round(ms),
+      activationPhase: mark ? String(mark.phase || "") : "",
+      activationMsAgo: mark ? Math.round(performance.now() - Number(mark.t || 0)) : -1,
+    });
+    reportSlowCalls();
+  }
+}
+
+function reportSlowCalls() {
+  if (slowReporting || !slowCalls.length) return;
+  slowReporting = true;
+  const calls = slowCalls.splice(0, slowCalls.length);
+  invoke("terminal_status_log", {
+    phase: "frontend.invoke_probe.slow_calls",
+    fields: { calls },
+  }).catch(() => {}).finally(() => {
+    slowReporting = false;
+  });
+}
 
 let installFailed = false;
 
@@ -60,7 +96,13 @@ function installProbe() {
     windowInvokes += 1;
     totalInvokes += 1;
     invokeCounts.set(cmd, (invokeCounts.get(cmd) || 0) + 1);
-    return originalInvoke(cmd, args, options);
+    const started = performance.now();
+    const result = originalInvoke(cmd, args, options);
+    if (result && typeof result.finally === "function") {
+      return result.finally(() => recordDuration(cmd, performance.now() - started));
+    }
+    recordDuration(cmd, performance.now() - started);
+    return result;
   };
   const originalTransform = typeof internals.transformCallback === "function"
     ? internals.transformCallback
@@ -125,7 +167,8 @@ function flushWindow() {
   const topInvokes = [...invokeCounts.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, TOP_LIMIT)
-    .map(([name, count]) => `${name}x${count}`);
+    .map(([name, count]) => `${name}x${count}=${Math.round(invokeDurations.get(name) || 0)}ms`);
+  invokeDurations.clear();
   const topEvents = [...eventCounts.entries()]
     .sort((a, b) => b[1] - a[1])
     .slice(0, TOP_LIMIT)

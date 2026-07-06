@@ -5519,6 +5519,9 @@ struct VideoMcpClip {
     kf: std::collections::BTreeMap<String, Vec<VideoMcpPropKeyframe>>,
     style: serde_json::Value,
     caption_group: String,
+    // Applied motion-preset name (metadata; the compiled transform/kf render).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    motion: String,
 }
 
 impl Default for VideoMcpClip {
@@ -5537,6 +5540,7 @@ impl Default for VideoMcpClip {
             kf: std::collections::BTreeMap::new(),
             style: serde_json::Value::Null,
             caption_group: String::new(),
+            motion: String::new(),
         }
     }
 }
@@ -7427,6 +7431,8 @@ struct VideoMcpAssetInfo {
     kind: &'static str,
     duration_ms: Option<u64>,
     has_audio: bool,
+    width: Option<u32>,
+    height: Option<u32>,
 }
 
 fn video_mcp_probe_asset_info(
@@ -7474,6 +7480,8 @@ fn video_mcp_probe_asset_info(
             .as_ref()
             .and_then(|probe| probe.has_audio)
             .unwrap_or(false),
+        width: probe.as_ref().and_then(|probe| probe.width),
+        height: probe.as_ref().and_then(|probe| probe.height),
     })
 }
 
@@ -7580,6 +7588,8 @@ fn video_mcp_pending_planned_asset_info(
         kind: "video",
         duration_ms: job.expected_duration_ms,
         has_audio: false,
+        width: None,
+        height: None,
     })
 }
 
@@ -7592,9 +7602,11 @@ fn video_mcp_add_clip(
     source_in_ms: u64,
     duration_ms: Option<u64>,
     track_hint: Option<&str>,
+    motion: Option<&serde_json::Value>,
     ffprobe_path: Option<&str>,
     state: &mut VideoMcpEditState,
 ) -> Result<(), String> {
+    let frame_dims = video_mcp_project_frame_dims(project);
     let info = match video_mcp_pending_planned_asset_info(root, media_root, asset_path) {
         Some(info) => info,
         None => video_mcp_probe_asset_info(root, media_root, asset_path, ffprobe_path)?,
@@ -7637,6 +7649,17 @@ fn video_mcp_add_clip(
     };
     if wants_linked_audio {
         clip.gain.level = 0.0;
+    }
+    if let Some(motion) = motion {
+        if wanted_kind != "video" {
+            return Err("motion presets only apply to video-track clips".to_string());
+        }
+        let (preset, strength) = video_mcp_motion_request(motion)?;
+        let asset_dims = match (info.width, info.height) {
+            (Some(width), Some(height)) => Some((width, height)),
+            _ => None,
+        };
+        video_mcp_apply_motion_preset(&mut clip, &preset, strength, asset_dims, frame_dims);
     }
     project.tracks[track_index].clips.push(clip);
     video_mcp_sort_track(&mut project.tracks[track_index]);
@@ -8394,8 +8417,175 @@ fn video_mcp_merge_text_style(
     video_mcp_text_style(Some(&serde_json::Value::Object(merged)))
 }
 
+// Motion presets — mirror of motionPresetPatch in src/video/videoEditorModel.js
+// (KEEP IN SYNC; parity covered by tests on both sides). Presets compile into
+// the existing transform + x/y/scale keyframes: the base scale includes the
+// cover ratio (media is contain-fitted, and motion over letterbox bars looks
+// broken) and pan amplitudes clamp so an edge never slides into frame.
+const VIDEO_MOTION_PRESET_IDS: &[&str] = &[
+    "none",
+    "kenburns-in",
+    "kenburns-out",
+    "pan-left",
+    "pan-right",
+    "pan-up",
+    "pan-down",
+    "drift",
+];
+
+fn video_mcp_motion_round(value: f64) -> f64 {
+    (value * 10_000.0).round() / 10_000.0
+}
+
+/// Accepts "kenburns-in" or { preset, strength: subtle|normal|bold }.
+fn video_mcp_motion_request(value: &serde_json::Value) -> Result<(String, f64), String> {
+    let (preset, strength) = if let Some(name) = value.as_str() {
+        (name.trim().to_string(), "normal".to_string())
+    } else {
+        (
+            value
+                .get("preset")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            value
+                .get("strength")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("normal")
+                .trim()
+                .to_string(),
+        )
+    };
+    if !VIDEO_MOTION_PRESET_IDS.contains(&preset.as_str()) {
+        return Err(format!(
+            "unknown motion preset: {preset}. Valid presets: {}",
+            VIDEO_MOTION_PRESET_IDS.join(", ")
+        ));
+    }
+    let factor = match strength.as_str() {
+        "subtle" => 0.6,
+        "bold" => 1.6,
+        "" | "normal" => 1.0,
+        other => {
+            return Err(format!(
+                "unknown motion strength: {other}. Valid strengths: subtle, normal, bold"
+            ));
+        }
+    };
+    Ok((preset, factor))
+}
+
+fn video_mcp_project_frame_dims(project: &VideoMcpProject) -> (f64, f64) {
+    let width = project
+        .settings
+        .get("width")
+        .and_then(video_mcp_value_f64)
+        .filter(|value| *value > 0.0)
+        .unwrap_or(1920.0);
+    let height = project
+        .settings
+        .get("height")
+        .and_then(video_mcp_value_f64)
+        .filter(|value| *value > 0.0)
+        .unwrap_or(1080.0);
+    (width, height)
+}
+
+fn video_mcp_apply_motion_preset(
+    clip: &mut VideoMcpClip,
+    preset: &str,
+    strength: f64,
+    asset_dims: Option<(u32, u32)>,
+    frame_dims: (f64, f64),
+) {
+    // Presets own the whole x/y/scale envelope; opacity frames stay untouched.
+    clip.kf.remove("x");
+    clip.kf.remove("y");
+    clip.kf.remove("scale");
+    if preset == "none" {
+        clip.motion = String::new();
+        clip.transform.x = 0.0;
+        clip.transform.y = 0.0;
+        clip.transform.scale = 1.0;
+        return;
+    }
+    let s = strength;
+    let frame_aspect = frame_dims.0 / frame_dims.1;
+    let asset_aspect = asset_dims
+        .filter(|(width, height)| *width > 0 && *height > 0)
+        .map(|(width, height)| width as f64 / height as f64)
+        .unwrap_or(frame_aspect);
+    // Contain-fit fractions of the frame each axis actually fills.
+    let fx = (asset_aspect / frame_aspect).min(1.0);
+    let fy = (frame_aspect / asset_aspect).min(1.0);
+    let cover = 1.0 / fx.min(fy);
+
+    let (zoom_start, zoom_end, mut x_amp, mut y_amp, x_from, y_from) = match preset {
+        "kenburns-in" => (1.02, 1.02 + 0.12 * s, 0.012 * s, 0.008 * s, -1.0, 1.0),
+        "kenburns-out" => (1.02 + 0.12 * s, 1.02, 0.012 * s, 0.008 * s, 1.0, -1.0),
+        "pan-left" => (1.0 + 0.1 * s, 1.0 + 0.1 * s, 0.055 * s, 0.0, 1.0, 0.0),
+        "pan-right" => (1.0 + 0.1 * s, 1.0 + 0.1 * s, 0.055 * s, 0.0, -1.0, 0.0),
+        "pan-up" => (1.0 + 0.1 * s, 1.0 + 0.1 * s, 0.0, 0.055 * s, 0.0, 1.0),
+        "pan-down" => (1.0 + 0.1 * s, 1.0 + 0.1 * s, 0.0, 0.055 * s, 0.0, -1.0),
+        // drift: slow diagonal float with a gentle zoom.
+        _ => (1.03, 1.03 + 0.05 * s, 0.01 * s, 0.008 * s, -1.0, 1.0),
+    };
+    let scale_start = (cover * zoom_start).min(8.0);
+    let scale_end = (cover * zoom_end).min(8.0);
+    let min_scale = scale_start.min(scale_end);
+    // Never pan far enough to reveal an edge, at any point of the move.
+    let slack_x = ((min_scale * fx - 1.0) / 2.0).max(0.0);
+    let slack_y = ((min_scale * fy - 1.0) / 2.0).max(0.0);
+    x_amp = x_amp.min(slack_x);
+    y_amp = y_amp.min(slack_y);
+
+    let end_ms = clip.duration_ms.max(100);
+    let frames = |from: f64, to: f64| {
+        vec![
+            VideoMcpPropKeyframe {
+                at_ms: 0,
+                value: video_mcp_motion_round(from),
+                easing: "smooth".to_string(),
+            },
+            VideoMcpPropKeyframe {
+                at_ms: end_ms,
+                value: video_mcp_motion_round(to),
+                easing: "smooth".to_string(),
+            },
+        ]
+    };
+    if scale_start != scale_end {
+        clip.kf
+            .insert("scale".to_string(), frames(scale_start, scale_end));
+    }
+    if x_amp > 0.0 {
+        clip.kf
+            .insert("x".to_string(), frames(x_from * x_amp, -x_from * x_amp));
+    }
+    if y_amp > 0.0 {
+        clip.kf
+            .insert("y".to_string(), frames(y_from * y_amp, -y_from * y_amp));
+    }
+    clip.motion = preset.to_string();
+    clip.transform.x = if x_amp > 0.0 {
+        video_mcp_motion_round(x_from * x_amp)
+    } else {
+        0.0
+    };
+    clip.transform.y = if y_amp > 0.0 {
+        video_mcp_motion_round(y_from * y_amp)
+    } else {
+        0.0
+    };
+    clip.transform.scale = video_mcp_motion_round(scale_start);
+}
+
 fn video_mcp_set_props(
     project: &mut VideoMcpProject,
+    root: &std::path::Path,
+    media_root: &std::path::Path,
+    ffprobe_path: Option<&str>,
     clip_id: &str,
     patch: &serde_json::Value,
     state: &mut VideoMcpEditState,
@@ -8406,6 +8596,7 @@ fn video_mcp_set_props(
         return Err(format!("clip {clip_id} is on a locked track"));
     }
     let track_kind = project.tracks[track_index].kind.clone();
+    let frame_dims = video_mcp_project_frame_dims(project);
     let clip = &mut project.tracks[track_index].clips[clip_index];
     if track_kind == "text" {
         if let Some(text) = patch.get("text").and_then(|value| value.as_str()) {
@@ -8426,6 +8617,22 @@ fn video_mcp_set_props(
         }
         if let Some(kf) = patch.get("kf") {
             video_mcp_apply_kf_patch(clip, kf);
+        }
+        // Motion after raw kf: when both are supplied, the preset wins the
+        // x/y/scale envelope (it keeps opacity frames untouched either way).
+        if let Some(motion) = patch.get("motion") {
+            if track_kind != "video" {
+                return Err("motion presets only apply to clips on video tracks".to_string());
+            }
+            let (preset, strength) = video_mcp_motion_request(motion)?;
+            let asset_dims =
+                video_mcp_probe_asset_info(root, media_root, &clip.asset_path, ffprobe_path)
+                    .ok()
+                    .and_then(|info| match (info.width, info.height) {
+                        (Some(width), Some(height)) => Some((width, height)),
+                        _ => None,
+                    });
+            video_mcp_apply_motion_preset(clip, &preset, strength, asset_dims, frame_dims);
         }
     }
     state.changed_clip_ids.insert(clip_id.to_string());
@@ -8557,6 +8764,7 @@ fn video_mcp_apply_ops(
                         .and_then(serde_json::Value::as_str)
                         .map(str::trim)
                         .filter(|value| !value.is_empty());
+                    let motion = op_value.get("motion").filter(|value| !value.is_null());
                     video_mcp_add_clip(
                         project,
                         root,
@@ -8566,6 +8774,7 @@ fn video_mcp_apply_ops(
                         source_in_ms,
                         duration_ms,
                         track_hint,
+                        motion,
                         ffprobe_path,
                         &mut state,
                     )
@@ -8607,7 +8816,15 @@ fn video_mcp_apply_ops(
                     let patch = op_value
                         .get("patch")
                         .ok_or_else(|| "patch is required".to_string())?;
-                    video_mcp_set_props(project, clip_id, patch, &mut state)
+                    video_mcp_set_props(
+                        project,
+                        root,
+                        media_root,
+                        ffprobe_path,
+                        clip_id,
+                        patch,
+                        &mut state,
+                    )
                 }
                 _ => Err("unknown op".to_string()),
             }
@@ -14793,12 +15010,116 @@ mod video_mcp_tests {
         let mut state = edit_state(&project);
         super::video_mcp_set_props(
             &mut project,
+            std::path::Path::new("/tmp"),
+            std::path::Path::new("/tmp/media"),
+            None,
             "text-1",
             &serde_json::json!({ "style": { "fontFamily": "Open Sans" } }),
             &mut state,
         )
         .expect("set text props");
         assert_eq!(clips(&project, "text")[0].style["fontFamily"], "Open Sans");
+    }
+
+    // Parity with motionPresetPatch in src/video/videoEditorModel.js — the JS
+    // tests assert the same numbers for the same inputs.
+    #[test]
+    fn video_mcp_motion_preset_kenburns_covers_and_clamps_square_image() {
+        let mut clip = super::VideoMcpClip {
+            id: "img-1".to_string(),
+            asset_path: "media/assets/a.png".to_string(),
+            duration_ms: 4000,
+            ..super::VideoMcpClip::default()
+        };
+        // Square image in a 16:9 frame: cover = 16/9, pan clamps to the slack.
+        super::video_mcp_apply_motion_preset(
+            &mut clip,
+            "kenburns-in",
+            1.0,
+            Some((1000, 1000)),
+            (1920.0, 1080.0),
+        );
+        assert_eq!(clip.motion, "kenburns-in");
+        let scale = clip.kf.get("scale").expect("scale keyframes");
+        assert_eq!(scale[0].at_ms, 0);
+        assert_eq!(scale[1].at_ms, 4000);
+        assert!((scale[0].value - 1.8133).abs() < 0.0005, "{}", scale[0].value);
+        assert!((scale[1].value - 2.0267).abs() < 0.0005, "{}", scale[1].value);
+        // Desired x amplitude 0.012 clamps to slack 0.01.
+        let x = clip.kf.get("x").expect("x keyframes");
+        assert!((x[0].value + 0.01).abs() < 0.0005, "{}", x[0].value);
+        assert!((x[1].value - 0.01).abs() < 0.0005, "{}", x[1].value);
+        assert_eq!(scale[0].easing, "smooth");
+        assert!((clip.transform.scale - 1.8133).abs() < 0.0005);
+    }
+
+    #[test]
+    fn video_mcp_motion_preset_pan_left_matching_aspect() {
+        let mut clip = super::VideoMcpClip {
+            id: "img-1".to_string(),
+            duration_ms: 3000,
+            ..super::VideoMcpClip::default()
+        };
+        super::video_mcp_apply_motion_preset(
+            &mut clip,
+            "pan-left",
+            1.0,
+            Some((1920, 1080)),
+            (1920.0, 1080.0),
+        );
+        // Matching aspect: cover 1, zoom 1.1, slack (1.1-1)/2 = 0.05 clamps 0.055.
+        assert!(clip.kf.get("scale").is_none(), "constant zoom lives on transform");
+        assert!((clip.transform.scale - 1.1).abs() < 0.0005);
+        let x = clip.kf.get("x").expect("x keyframes");
+        assert!((x[0].value - 0.05).abs() < 0.0005, "{}", x[0].value);
+        assert!((x[1].value + 0.05).abs() < 0.0005, "{}", x[1].value);
+        assert!(clip.kf.get("y").is_none());
+    }
+
+    #[test]
+    fn video_mcp_motion_preset_none_clears_motion_but_keeps_opacity_kf() {
+        let mut clip = super::VideoMcpClip {
+            id: "img-1".to_string(),
+            duration_ms: 3000,
+            ..super::VideoMcpClip::default()
+        };
+        clip.kf.insert(
+            "opacity".to_string(),
+            vec![super::VideoMcpPropKeyframe {
+                at_ms: 0,
+                value: 0.0,
+                easing: "linear".to_string(),
+            }],
+        );
+        super::video_mcp_apply_motion_preset(&mut clip, "drift", 1.0, None, (1920.0, 1080.0));
+        assert!(!clip.kf.get("scale").unwrap().is_empty());
+        assert!(clip.kf.contains_key("opacity"));
+        super::video_mcp_apply_motion_preset(&mut clip, "none", 1.0, None, (1920.0, 1080.0));
+        assert_eq!(clip.motion, "");
+        assert!(clip.kf.get("scale").is_none());
+        assert!(clip.kf.get("x").is_none());
+        assert!(clip.kf.contains_key("opacity"), "opacity keyframes survive");
+        assert!((clip.transform.scale - 1.0).abs() < 0.0005);
+    }
+
+    #[test]
+    fn video_mcp_motion_request_parses_string_and_object() {
+        assert_eq!(
+            super::video_mcp_motion_request(&serde_json::json!("pan-up")).unwrap(),
+            ("pan-up".to_string(), 1.0)
+        );
+        assert_eq!(
+            super::video_mcp_motion_request(
+                &serde_json::json!({ "preset": "drift", "strength": "bold" })
+            )
+            .unwrap(),
+            ("drift".to_string(), 1.6)
+        );
+        assert!(super::video_mcp_motion_request(&serde_json::json!("zoom-blast")).is_err());
+        assert!(super::video_mcp_motion_request(
+            &serde_json::json!({ "preset": "drift", "strength": "extreme" })
+        )
+        .is_err());
     }
 
     #[test]
