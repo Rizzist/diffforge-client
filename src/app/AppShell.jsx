@@ -1,5 +1,4 @@
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 import {
   availableMonitors,
   currentMonitor,
@@ -32,6 +31,7 @@ import { Fragment, memo, Profiler, startTransition, useCallback, useEffect, useL
 import { createPortal } from "react-dom";
 import { onRuntimeProfilerRender } from "../diagnostics/commitProfiler.js";
 import { authStore, DEFAULT_AUTH_MESSAGE, useAuthSnapshot } from "../authStore";
+import { listenShared } from "./sharedTauriEvents.js";
 import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
 import {
   cleanAgentLaunchModelId,
@@ -9275,33 +9275,19 @@ function LoopspaceRuntimeView({
 
   useEffect(() => {
     let disposed = false;
-    let unlistenTriggers = null;
-    let unlistenLoopspaces = null;
-    void listen(CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT, (event) => {
+    const unsubscribeTriggers = listenShared(CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT, (event) => {
       if (disposed) return;
       applyTriggerSnapshot(event?.payload || event);
       void refreshLoopspaceLogs(loopspaceId, refreshGenerationRef.current, false, { mergeEvents: true });
-    }).then((unlisten) => {
-      if (disposed) {
-        unlisten();
-      } else {
-        unlistenTriggers = unlisten;
-      }
-    }).catch(() => {});
-    void listen(CLOUD_MCP_LOOPSPACES_UPDATED_EVENT, (event) => {
+    });
+    const unsubscribeLoopspaces = listenShared(CLOUD_MCP_LOOPSPACES_UPDATED_EVENT, (event) => {
       if (disposed) return;
       applyGraphSnapshot(event?.payload || event);
-    }).then((unlisten) => {
-      if (disposed) {
-        unlisten();
-      } else {
-        unlistenLoopspaces = unlisten;
-      }
-    }).catch(() => {});
+    });
     return () => {
       disposed = true;
-      if (typeof unlistenTriggers === "function") unlistenTriggers();
-      if (typeof unlistenLoopspaces === "function") unlistenLoopspaces();
+      unsubscribeTriggers();
+      unsubscribeLoopspaces();
     };
   }, [applyGraphSnapshot, applyTriggerSnapshot, loopspaceId, refreshLoopspaceLogs]);
 
@@ -23299,7 +23285,6 @@ export default function App() {
 
   useEffect(() => {
     let disposed = false;
-    let unlisten = null;
     let pendingOutputEvents = [];
     let outputFlushTimer = 0;
 
@@ -23331,7 +23316,7 @@ export default function App() {
       applyScriptEvents(payloads);
     };
 
-    void listen(LOCAL_SCRIPT_RUN_EVENT, (event) => {
+    const unsubscribe = listenShared(LOCAL_SCRIPT_RUN_EVENT, (event) => {
       if (disposed) return;
       const payload = event?.payload || {};
       const pathKey = appScriptText(payload.path_key || payload.pathKey);
@@ -23357,17 +23342,11 @@ export default function App() {
       } else if (payload.stage === "finish") {
         setAppScriptsState("ready");
       }
-    }).then((nextUnlisten) => {
-      if (disposed) {
-        nextUnlisten();
-      } else {
-        unlisten = nextUnlisten;
-      }
-    }).catch(() => {});
+    });
     return () => {
       disposed = true;
       if (outputFlushTimer) window.clearTimeout(outputFlushTimer);
-      if (typeof unlisten === "function") unlisten();
+      unsubscribe();
     };
   }, []);
 
@@ -23586,7 +23565,6 @@ export default function App() {
 
   useEffect(() => {
     let disposed = false;
-    let unlisten = null;
 
     const emitWorkspaceMcpRegistryUpdated = (detail) => {
       if (typeof window === "undefined") {
@@ -23597,7 +23575,7 @@ export default function App() {
       }));
     };
 
-    listen(WORKSPACE_MCP_BACKGROUND_JOB_EVENT, (event) => {
+    const unsubscribe = listenShared(WORKSPACE_MCP_BACKGROUND_JOB_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -23703,25 +23681,11 @@ export default function App() {
         }
         sharedMcpBackgroundJobsRef.current.delete(jobKey);
       }
-    })
-      .then((handler) => {
-        if (disposed) {
-          handler();
-        } else {
-          unlisten = handler;
-        }
-      })
-      .catch((error) => {
-        logBigViewSyncDiagnosticEvent("workspace_mcp.background_listener.failed", {
-          message: getErrorMessage(error, "Unable to listen for workspace MCP background jobs."),
-        });
-      });
+    });
 
     return () => {
       disposed = true;
-      if (typeof unlisten === "function") {
-        unlisten();
-      }
+      unsubscribe();
     };
   }, [logWorkspaceActivationTrace]);
 
@@ -24950,13 +24914,12 @@ export default function App() {
     };
 
     ["architecture-store-changed", "cloud-mcp-workspace-architectures-updated"].forEach((eventName) => {
-      void listen(eventName, scheduleAutoRefresh).then((unlisten) => {
-        if (disposed) {
-          unlisten();
-          return;
-        }
-        unlisteners.push(unlisten);
-      }).catch(() => {});
+      const unsubscribe = listenShared(eventName, scheduleAutoRefresh);
+      if (disposed) {
+        unsubscribe();
+        return;
+      }
+      unlisteners.push(unsubscribe);
     });
 
     return () => {
@@ -26127,8 +26090,7 @@ export default function App() {
 
   useEffect(() => {
     let disposed = false;
-    let unlistenCaptureSaved = null;
-    listen("forge-snipping-capture-saved", (event) => {
+    const unsubscribe = listenShared("forge-snipping-capture-saved", (event) => {
       // Annotation-editor saves reuse the capture-saved event for library
       // refreshes; only fresh captures get the shutter cue.
       const reason = String(event?.payload?.reason || "");
@@ -26136,16 +26098,10 @@ export default function App() {
         return;
       }
       playNotificationSfx("snip.captured");
-    }).then((unlisten) => {
-      if (disposed) {
-        unlisten();
-      } else {
-        unlistenCaptureSaved = unlisten;
-      }
-    }).catch(() => {});
+    });
     return () => {
       disposed = true;
-      unlistenCaptureSaved?.();
+      unsubscribe();
     };
   }, []);
 
@@ -26261,10 +26217,9 @@ export default function App() {
   }, [workspaceNotificationReducerOptions, workspaceNotificationRoots]);
 
   useEffect(() => {
-    let unlistenNotification = null;
     let cancelled = false;
 
-    listen(WORKSPACE_NOTIFICATION_EVENT, (notificationEvent) => {
+    const unsubscribe = listenShared(WORKSPACE_NOTIFICATION_EVENT, (notificationEvent) => {
       const payload = notificationEvent?.payload || {};
       const workspaceId = resolveWorkspaceIdForNotificationEvent(
         payload,
@@ -26281,27 +26236,18 @@ export default function App() {
         },
         workspaceNotificationReducerOptions(workspaceId),
       ));
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenNotification = unlisten;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
-      if (typeof unlistenNotification === "function") {
-        unlistenNotification();
-      }
+      unsubscribe();
     };
   }, [workspaceNotificationReducerOptions, workspaceNotificationRoots]);
 
   useEffect(() => {
-    let unlistenParkedPrompt = null;
     let cancelled = false;
 
-    listen(TERMINAL_PARKED_PROMPT_EVENT, (parkedEvent) => {
+    const unsubscribe = listenShared(TERMINAL_PARKED_PROMPT_EVENT, (parkedEvent) => {
       const payload = parkedEvent?.payload || {};
       const workspaceId = String(
         payload.workspaceId
@@ -26363,19 +26309,11 @@ export default function App() {
         },
         workspaceNotificationReducerOptions(workspaceId),
       ));
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenParkedPrompt = unlisten;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
-      if (typeof unlistenParkedPrompt === "function") {
-        unlistenParkedPrompt();
-      }
+      unsubscribe();
     };
   }, [workspaceNotificationReducerOptions]);
 
@@ -26575,30 +26513,19 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    let unlistenDownloadProgress = null;
     let cancelled = false;
 
-    listen(AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, (progressEvent) => {
+    const unsubscribe = listenShared(AUDIO_MODEL_DOWNLOAD_PROGRESS_EVENT, (progressEvent) => {
       setAudioDownloadProgress(progressEvent.payload);
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-
-      unlistenDownloadProgress = unlisten;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
-      if (unlistenDownloadProgress) {
-        unlistenDownloadProgress();
-      }
+      unsubscribe();
     };
   }, []);
 
   useEffect(() => {
-    let unlistenVisibility = null;
     let cancelled = false;
 
     const syncAudioWidgetVisibility = async () => {
@@ -26615,22 +26542,13 @@ export default function App() {
     };
 
     syncAudioWidgetVisibility();
-    listen(AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT, (visibilityEvent) => {
+    const unsubscribe = listenShared(AUDIO_WIDGET_VISIBILITY_CHANGED_EVENT, (visibilityEvent) => {
       setAudioWidgetVisible(Boolean(visibilityEvent.payload?.visible));
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-
-      unlistenVisibility = unlisten;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
-      if (unlistenVisibility) {
-        unlistenVisibility();
-      }
+      unsubscribe();
     };
   }, []);
   const workspaceById = useMemo(() => {
@@ -26771,27 +26689,18 @@ export default function App() {
 
   useEffect(() => {
     let disposed = false;
-    let unlistenLoopspaces = null;
 
-    listen(CLOUD_MCP_LOOPSPACES_UPDATED_EVENT, (event) => {
+    const unsubscribe = listenShared(CLOUD_MCP_LOOPSPACES_UPDATED_EVENT, (event) => {
       if (!disposed) {
         applyLoopspaceSnapshot(event?.payload || event, {
           allowEmptyPersist: true,
         });
       }
-    }).then((unlisten) => {
-      if (disposed) {
-        unlisten();
-      } else {
-        unlistenLoopspaces = unlisten;
-      }
-    }).catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      if (unlistenLoopspaces) {
-        unlistenLoopspaces();
-      }
+      unsubscribe();
     };
   }, [applyLoopspaceSnapshot]);
 
@@ -27229,9 +27138,8 @@ export default function App() {
 
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(WEB_PANEL_CLOSED_EVENT, (event) => {
+    const unsubscribe = listenShared(WEB_PANEL_CLOSED_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -27248,19 +27156,11 @@ export default function App() {
         return;
       }
       clearWorkspaceWebTabBreakout(paneId, payload.url);
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [clearWorkspaceWebTabBreakout]);
 
@@ -27268,9 +27168,8 @@ export default function App() {
   // main window, hidden); remember its label so the tab adopts it back.
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(WEB_PANEL_WEBVIEW_PRESERVED_EVENT, (event) => {
+    const unsubscribe = listenShared(WEB_PANEL_WEBVIEW_PRESERVED_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -27284,27 +27183,18 @@ export default function App() {
       if (label) {
         rememberWorkspaceWebTabNativeLabel(paneId, label);
       }
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [rememberWorkspaceWebTabNativeLabel]);
 
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(WEB_PANEL_CONTROL_EVENT, (event) => {
+    const unsubscribe = listenShared(WEB_PANEL_CONTROL_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -27333,19 +27223,11 @@ export default function App() {
           workspaceId: payload.workspaceId || payload.workspace_id || "",
         });
       }
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [rememberWorkspaceWebTabUrl, returnWorkspaceWebTabPopout]);
 
@@ -27586,30 +27468,20 @@ export default function App() {
   // main window and asks for the Audio view, where dictation history lives.
   useEffect(() => {
     let cancelled = false;
-    let unlistenOpenAudio = null;
-    listen("forge-open-audio-history", () => {
+    const unsubscribe = listenShared("forge-open-audio-history", () => {
       if (!cancelled) {
         showView("audio");
       }
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenOpenAudio = unlisten;
-    }).catch(() => {});
+    });
     return () => {
       cancelled = true;
-      if (unlistenOpenAudio) {
-        unlistenOpenAudio();
-      }
+      unsubscribe();
     };
   }, [showView]);
 
   useEffect(() => {
     let cancelled = false;
-    let unlistenSnippingPermissionAttention = null;
-    listen(SNIPPING_PERMISSION_ATTENTION_EVENT, (attentionEvent) => {
+    const unsubscribe = listenShared(SNIPPING_PERMISSION_ATTENTION_EVENT, (attentionEvent) => {
       if (cancelled) {
         return;
       }
@@ -27620,25 +27492,16 @@ export default function App() {
         immediate: true,
         telemetrySource: "snipping_permission_attention",
       });
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenSnippingPermissionAttention = unlisten;
-    }).catch(() => {});
+    });
     return () => {
       cancelled = true;
-      if (unlistenSnippingPermissionAttention) {
-        unlistenSnippingPermissionAttention();
-      }
+      unsubscribe();
     };
   }, [highlightSettingsPermission, showView]);
 
   useEffect(() => {
     let cancelled = false;
-    let unlistenSnippingCaptureAttention = null;
-    listen(SNIPPING_CAPTURE_ATTENTION_EVENT, (attentionEvent) => {
+    const unsubscribe = listenShared(SNIPPING_CAPTURE_ATTENTION_EVENT, (attentionEvent) => {
       if (cancelled) {
         return;
       }
@@ -27654,25 +27517,16 @@ export default function App() {
         immediate: true,
         telemetrySource: "snipping_capture_attention",
       });
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenSnippingCaptureAttention = unlisten;
-    }).catch(() => {});
+    });
     return () => {
       cancelled = true;
-      if (unlistenSnippingCaptureAttention) {
-        unlistenSnippingCaptureAttention();
-      }
+      unsubscribe();
     };
   }, [showView]);
 
   useEffect(() => {
     let cancelled = false;
-    let unlistenAudioHotkeyAttention = null;
-    listen(AUDIO_HOTKEY_ATTENTION_EVENT, (attentionEvent) => {
+    const unsubscribe = listenShared(AUDIO_HOTKEY_ATTENTION_EVENT, (attentionEvent) => {
       if (cancelled) {
         return;
       }
@@ -27701,18 +27555,10 @@ export default function App() {
         immediate: true,
         telemetrySource: "audio_hotkey_attention",
       });
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenAudioHotkeyAttention = unlisten;
-    }).catch(() => {});
+    });
     return () => {
       cancelled = true;
-      if (unlistenAudioHotkeyAttention) {
-        unlistenAudioHotkeyAttention();
-      }
+      unsubscribe();
     };
   }, [highlightSettingsPermission, showView]);
 
@@ -28856,30 +28702,68 @@ export default function App() {
     workspaceAgentBatchInFlightSessionKeysRef.current.clear();
     setWorkspaceAgentBatchSentLaunchKey("");
 
-    try {
-      unlistenCloseProgress = await listen(TERMINAL_CLOSE_ALL_PROGRESS_EVENT, (progressEvent) => {
-        const nextProgress = normalizeTerminalCloseProgress(progressEvent.payload);
-
-        setWorkspaceDeactivationState((currentState) => {
-          if (!currentState.isActive || currentState.workspaceId !== targetWorkspaceId) {
-            return currentState;
-          }
-          if (nextProgress.workspaceId && nextProgress.workspaceId !== targetWorkspaceId) {
-            return currentState;
-          }
-
-          const currentProgress = normalizeTerminalCloseProgress(currentState);
-
-          return {
-            ...currentState,
-            closed: Math.max(currentProgress.closed, nextProgress.closed),
-            total: Math.max(currentProgress.total, nextProgress.total),
-          };
-        });
+    // Optimistic close: the UI transition (disable workspace → runtime
+    // unmounts, selection/view update) runs BEFORE the backend teardown.
+    // Awaiting PTY kills first held the closing workspace on screen for
+    // 1-4s; the deactivation state keeps the rail indicator alive while
+    // the teardown drains, and reactivation during teardown is guarded by
+    // workspaceDeactivationInFlightRef + the rust lifecycle lock.
+    {
+      const previousLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
+      const nextEnabledWorkspaceIds = normalizeEnabledWorkspaceIds(
+        previousLifecycleSettings.enabledWorkspaceIds,
+      ).filter((enabledWorkspaceId) => enabledWorkspaceId !== targetWorkspaceId);
+      updateWorkspaceLifecycleSettings({
+        defaultWorkspaceId: previousLifecycleSettings.defaultWorkspaceId === targetWorkspaceId
+          ? ""
+          : previousLifecycleSettings.defaultWorkspaceId,
+        enabledWorkspaceIds: nextEnabledWorkspaceIds,
       });
-    } catch {
-      // Progress events are a UI nicety; cleanup still belongs to the backend command.
+      if (activatedWorkspaceIdRef.current === targetWorkspaceId) {
+        const nextActivatedWorkspace = nextEnabledWorkspaceIds
+          .map((enabledWorkspaceId) => findWorkspaceById(workspacesRef.current, enabledWorkspaceId))
+          .find(Boolean);
+        const nextActivatedWorkspaceId = nextActivatedWorkspace?.id || "";
+        activatedWorkspaceIdRef.current = nextActivatedWorkspaceId;
+        setActivatedWorkspaceId(nextActivatedWorkspaceId);
+      }
+      if (selectedWorkspaceIdRef.current === targetWorkspaceId) {
+        selectedWorkspaceIdRef.current = targetWorkspaceId;
+        setSelectedWorkspaceId(targetWorkspaceId);
+        setWorkspaceCreateModalOpen(false);
+        setWorkspaceSettingsModalId(targetWorkspaceId);
+        showView(DEFAULT_WORKSPACE_VIEW, {
+          immediate: true,
+          telemetrySource: `${source}_workspace_deactivated`,
+          telemetryWorkspaceId: targetWorkspaceId,
+        });
+      }
+      logWorkspaceActivationTrace("workspace.close.ui_parked", targetWorkspaceId, {
+        elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - deactivateStartedAtMs),
+        source,
+      }, { force: true });
     }
+
+    unlistenCloseProgress = listenShared(TERMINAL_CLOSE_ALL_PROGRESS_EVENT, (progressEvent) => {
+      const nextProgress = normalizeTerminalCloseProgress(progressEvent.payload);
+
+      setWorkspaceDeactivationState((currentState) => {
+        if (!currentState.isActive || currentState.workspaceId !== targetWorkspaceId) {
+          return currentState;
+        }
+        if (nextProgress.workspaceId && nextProgress.workspaceId !== targetWorkspaceId) {
+          return currentState;
+        }
+
+        const currentProgress = normalizeTerminalCloseProgress(currentState);
+
+        return {
+          ...currentState,
+          closed: Math.max(currentProgress.closed, nextProgress.closed),
+          total: Math.max(currentProgress.total, nextProgress.total),
+        };
+      });
+    });
 
     try {
       await withTimeout(
@@ -28904,37 +28788,6 @@ export default function App() {
         if (runtimeKey) {
           sharedMcpActiveRuntimeTargetsRef.current.delete(runtimeKey);
         }
-      }
-
-      const previousLifecycleSettings = workspaceLifecycleSettingsRef.current || {};
-      const nextEnabledWorkspaceIds = normalizeEnabledWorkspaceIds(
-        previousLifecycleSettings.enabledWorkspaceIds,
-      ).filter((enabledWorkspaceId) => enabledWorkspaceId !== targetWorkspaceId);
-      updateWorkspaceLifecycleSettings({
-        defaultWorkspaceId: previousLifecycleSettings.defaultWorkspaceId === targetWorkspaceId
-          ? ""
-          : previousLifecycleSettings.defaultWorkspaceId,
-        enabledWorkspaceIds: nextEnabledWorkspaceIds,
-      });
-
-      if (activatedWorkspaceIdRef.current === targetWorkspaceId) {
-        const nextActivatedWorkspace = nextEnabledWorkspaceIds
-          .map((enabledWorkspaceId) => findWorkspaceById(workspacesRef.current, enabledWorkspaceId))
-          .find(Boolean);
-        const nextActivatedWorkspaceId = nextActivatedWorkspace?.id || "";
-        activatedWorkspaceIdRef.current = nextActivatedWorkspaceId;
-        setActivatedWorkspaceId(nextActivatedWorkspaceId);
-      }
-      if (selectedWorkspaceIdRef.current === targetWorkspaceId) {
-        selectedWorkspaceIdRef.current = targetWorkspaceId;
-        setSelectedWorkspaceId(targetWorkspaceId);
-        setWorkspaceCreateModalOpen(false);
-        setWorkspaceSettingsModalId(targetWorkspaceId);
-        showView(DEFAULT_WORKSPACE_VIEW, {
-          immediate: true,
-          telemetrySource: `${source}_workspace_deactivated`,
-          telemetryWorkspaceId: targetWorkspaceId,
-        });
       }
 
       workspaceDeactivationInFlightRef.current = "";
@@ -29986,8 +29839,7 @@ export default function App() {
   // gates and Tools tab stay current without polling.
   useEffect(() => {
     let disposed = false;
-    let unlisten = null;
-    void listen("agent-inventory-changed", (event) => {
+    const unsubscribe = listenShared("agent-inventory-changed", (event) => {
       if (disposed) {
         return;
       }
@@ -30004,18 +29856,10 @@ export default function App() {
       persistAgentStatusCache(nextStatuses);
       agentStatusesRef.current = nextStatuses;
       setAgentStatuses(nextStatuses);
-    }).then((dispose) => {
-      if (disposed) {
-        dispose();
-      } else {
-        unlisten = dispose;
-      }
-    }).catch(() => {});
+    });
     return () => {
       disposed = true;
-      if (typeof unlisten === "function") {
-        unlisten();
-      }
+      unsubscribe();
     };
   }, []);
 
@@ -33567,11 +33411,7 @@ export default function App() {
     });
 
     runWindowAction(async () => {
-      let unlistenCloseProgress = null;
-      let unlistenShutdownProgress = null;
-      let releaseCloseProgressListener = false;
-
-      listen(TERMINAL_CLOSE_ALL_PROGRESS_EVENT, (progressEvent) => {
+      const unlistenCloseProgress = listenShared(TERMINAL_CLOSE_ALL_PROGRESS_EVENT, (progressEvent) => {
         const nextProgress = normalizeTerminalCloseProgress(progressEvent.payload);
 
         setWorkspaceCloseState((currentCloseState) => {
@@ -33599,19 +33439,8 @@ export default function App() {
             totalSteps: currentCloseState.totalSteps || WORKSPACE_SHUTDOWN_STEPS.length,
           };
         });
-      })
-        .then((unlisten) => {
-          if (releaseCloseProgressListener && typeof unlisten === "function") {
-            unlisten();
-            return;
-          }
-
-          unlistenCloseProgress = unlisten;
-        })
-        .catch(() => {
-          // Missing progress events should not block the close sequence.
-        });
-      listen(APP_SHUTDOWN_PROGRESS_EVENT, (progressEvent) => {
+      });
+      const unlistenShutdownProgress = listenShared(APP_SHUTDOWN_PROGRESS_EVENT, (progressEvent) => {
         const nextProgress = normalizeShutdownProgress(progressEvent.payload);
 
         setWorkspaceCloseState((currentCloseState) => {
@@ -33641,17 +33470,6 @@ export default function App() {
             ),
           };
         });
-      })
-        .then((unlisten) => {
-          if (releaseCloseProgressListener && typeof unlisten === "function") {
-            unlisten();
-            return;
-          }
-
-          unlistenShutdownProgress = unlisten;
-        })
-        .catch(() => {
-          // Phase events are UI-only; backend shutdown is still authoritative.
       });
 
       try {
@@ -33674,13 +33492,8 @@ export default function App() {
         workspaceCloseInFlightRef.current = false;
         setWorkspaceCloseState(WORKSPACE_CLOSE_INITIAL_STATE);
       } finally {
-        releaseCloseProgressListener = true;
-        if (typeof unlistenCloseProgress === "function") {
-          unlistenCloseProgress();
-        }
-        if (typeof unlistenShutdownProgress === "function") {
-          unlistenShutdownProgress();
-        }
+        unlistenCloseProgress();
+        unlistenShutdownProgress();
       }
     });
   }, []);
@@ -33857,31 +33670,15 @@ export default function App() {
   }, [closeWindow]);
 
   useEffect(() => {
-    let isMounted = true;
-    let unlistenAppCloseRequested = null;
-
-    listen(APP_CLOSE_REQUESTED_EVENT, (event) => {
+    const unsubscribe = listenShared(APP_CLOSE_REQUESTED_EVENT, (event) => {
       const payload = event.payload || {};
       closeWindow({
         reason: payload.reason || payload.source || "app_exit_requested",
       });
-    })
-      .then((unlisten) => {
-        if (!isMounted && typeof unlisten === "function") {
-          unlisten();
-          return;
-        }
-
-        unlistenAppCloseRequested = unlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
-      isMounted = false;
-
-      if (typeof unlistenAppCloseRequested === "function") {
-        unlistenAppCloseRequested();
-      }
+      unsubscribe();
     };
   }, [closeWindow]);
 
@@ -33891,7 +33688,6 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    let unlistenSyncStatus = null;
     let lastApplied = null;
     let demoteTimer = 0;
     let pendingDemotion = null;
@@ -33958,7 +33754,7 @@ export default function App() {
       }
     }).catch(() => {});
 
-    listen("cloud-mcp-sync-status", (event) => {
+    const unsubscribe = listenShared("cloud-mcp-sync-status", (event) => {
       if (cancelled) {
         return;
       }
@@ -33967,22 +33763,14 @@ export default function App() {
         return;
       }
       handleSyncStatus(normalized);
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenSyncStatus = unlisten;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
       if (demoteTimer) {
         window.clearTimeout(demoteTimer);
       }
-      if (unlistenSyncStatus) {
-        unlistenSyncStatus();
-      }
+      unsubscribe();
     };
   }, []);
 
@@ -34015,7 +33803,6 @@ export default function App() {
 
     let cancelled = false;
     let refreshTimer = 0;
-    let unlistenSyncStatus = null;
     let unsubscribeRenderability = null;
     const refresh = (quiet = true) => {
       if (!cancelled && readMainWindowRenderableFallback()) {
@@ -34048,13 +33835,7 @@ export default function App() {
       }
     });
 
-    listen("cloud-mcp-sync-status", () => refresh(true)).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenSyncStatus = unlisten;
-    }).catch(() => {});
+    const unsubscribeSyncStatus = listenShared("cloud-mcp-sync-status", () => refresh(true));
 
     return () => {
       cancelled = true;
@@ -34062,9 +33843,7 @@ export default function App() {
       if (typeof unsubscribeRenderability === "function") {
         unsubscribeRenderability();
       }
-      if (unlistenSyncStatus) {
-        unlistenSyncStatus();
-      }
+      unsubscribeSyncStatus();
     };
   }, [networkingOverlayOpen, refreshNetworkingDiagnostics]);
 
@@ -34141,7 +33920,6 @@ export default function App() {
     let lastRefreshAt = 0;
     let intervalId = 0;
     let unsubscribeRenderability = null;
-    let unlistenSyncStatus = null;
     const refresh = async (quiet = false, { force = false, minAgeMs = 0 } = {}) => {
       if (cancelled || !readMainWindowRenderableFallback()) {
         return;
@@ -34190,13 +33968,7 @@ export default function App() {
       }
     });
     window.addEventListener("focus", refreshOnForeground);
-    listen("cloud-mcp-sync-status", refreshAfterSyncStatus).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenSyncStatus = unlisten;
-    }).catch(() => {});
+    const unsubscribeSyncStatus = listenShared("cloud-mcp-sync-status", refreshAfterSyncStatus);
 
     return () => {
       cancelled = true;
@@ -34205,9 +33977,7 @@ export default function App() {
         unsubscribeRenderability();
       }
       window.removeEventListener("focus", refreshOnForeground);
-      if (typeof unlistenSyncStatus === "function") {
-        unlistenSyncStatus();
-      }
+      unsubscribeSyncStatus();
     };
   }, [authState, refreshBillingStatus]);
 
@@ -37123,9 +36893,8 @@ export default function App() {
   ]);
   useEffect(() => {
     let disposed = false;
-    let unlistenAnnotationTodo = null;
 
-    listen(SNIPPING_ANNOTATION_TODO_EVENT, (annotationEvent) => {
+    const unsubscribe = listenShared(SNIPPING_ANNOTATION_TODO_EVENT, (annotationEvent) => {
       if (disposed) return;
       const payload = annotationEvent?.payload && typeof annotationEvent.payload === "object"
         ? annotationEvent.payload
@@ -37213,21 +36982,11 @@ export default function App() {
           workspaceName: String(payload.workspaceName || payload.workspace_name || selectedWorkspace?.name || "").trim(),
         },
       }));
-    })
-      .then((unlisten) => {
-        if (disposed) {
-          unlisten();
-          return;
-        }
-        unlistenAnnotationTodo = unlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      if (typeof unlistenAnnotationTodo === "function") {
-        unlistenAnnotationTodo();
-      }
+      unsubscribe();
     };
   }, [
     selectedWorkspace?.id,
@@ -37637,8 +37396,7 @@ export default function App() {
       return undefined;
     }
     let disposed = false;
-    let unlisten = null;
-    listen(TODO_STORE_CHANGED_TAURI_EVENT, (event) => {
+    const unsubscribe = listenShared(TODO_STORE_CHANGED_TAURI_EVENT, (event) => {
       const eventWorkspaceId = String(
         event?.payload?.workspaceId
           || event?.payload?.workspace_id
@@ -37650,20 +37408,10 @@ export default function App() {
       void refreshAccountToolItemsFromRust(workspaceId).catch((error) => {
         setAccountToolError(error?.message || String(error || "Unable to refresh todos"));
       });
-    }).then((dispose) => {
-      if (disposed) {
-        dispose();
-        return;
-      }
-      unlisten = dispose;
-    }).catch((error) => {
-      setAccountToolError(error?.message || String(error || "Unable to subscribe to todos"));
     });
     return () => {
       disposed = true;
-      if (typeof unlisten === "function") {
-        unlisten();
-      }
+      unsubscribe();
     };
   }, [refreshAccountToolItemsFromRust, selectedWorkspaceToolWorkspaceId]);
 
@@ -38728,7 +38476,6 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    let unlistenArchitectureActivity = null;
     const refreshTimers = new Set();
 
     const handleArchitectureActivity = (event) => {
@@ -38810,21 +38557,11 @@ export default function App() {
       refreshTimers.add(timer);
     };
 
-    listen(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, handleArchitectureActivity)
-      .then((unlisten) => {
-        if (cancelled) {
-          unlisten();
-          return;
-        }
-        unlistenArchitectureActivity = unlisten;
-      })
-      .catch(() => {});
+    const unsubscribe = listenShared(TERMINAL_ARCHITECTURE_ACTIVITY_EVENT, handleArchitectureActivity);
 
     return () => {
       cancelled = true;
-      if (unlistenArchitectureActivity) {
-        unlistenArchitectureActivity();
-      }
+      unsubscribe();
       refreshTimers.forEach((timer) => window.clearTimeout(timer));
       refreshTimers.clear();
     };
@@ -38835,9 +38572,6 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    let unlistenAccountLiveState = null;
-    let unlistenAccountUsage = null;
-    let unlistenWorkspaceTodos = null;
     let workspaceTodoRefreshTimer = 0;
 
     const refreshCloudWorkspaceTodos = () => {
@@ -38867,7 +38601,7 @@ export default function App() {
       }, 80);
     };
 
-    listen(CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT, (event) => {
+    const unsubscribeAccountLiveState = listenShared(CLOUD_MCP_ACCOUNT_DEVICE_LIVE_STATE_EVENT, (event) => {
       if (cancelled) {
         return;
       }
@@ -38889,15 +38623,9 @@ export default function App() {
           updatedAt: Date.now(),
         }, current);
       });
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenAccountLiveState = unlisten;
-    }).catch(() => {});
+    });
 
-    listen(CLOUD_MCP_ACCOUNT_USAGE_EVENT, (event) => {
+    const unsubscribeAccountUsage = listenShared(CLOUD_MCP_ACCOUNT_USAGE_EVENT, (event) => {
       if (cancelled) {
         return;
       }
@@ -38923,23 +38651,11 @@ export default function App() {
           setBillingStatusError("");
         }
       }
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenAccountUsage = unlisten;
-    }).catch(() => {});
+    });
 
-    listen(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, () => {
+    const unsubscribeWorkspaceTodos = listenShared(CLOUD_MCP_WORKSPACE_TODOS_UPDATED_EVENT, () => {
       refreshCloudWorkspaceTodos();
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenWorkspaceTodos = unlisten;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
@@ -38947,15 +38663,9 @@ export default function App() {
         window.clearTimeout(workspaceTodoRefreshTimer);
         workspaceTodoRefreshTimer = 0;
       }
-      if (unlistenAccountLiveState) {
-        unlistenAccountLiveState();
-      }
-      if (unlistenAccountUsage) {
-        unlistenAccountUsage();
-      }
-      if (unlistenWorkspaceTodos) {
-        unlistenWorkspaceTodos();
-      }
+      unsubscribeAccountLiveState();
+      unsubscribeAccountUsage();
+      unsubscribeWorkspaceTodos();
     };
   }, []);
 
@@ -41493,11 +41203,16 @@ export default function App() {
     const startRemoteCommandListener = async () => {
       try {
         await invoke("cloud_mcp_start_remote_command_listener");
-        unlistenDeviceDeleted = await listen(CLOUD_MCP_DEVICE_DELETED_EVENT, async () => {
+        const nextUnlistenDeviceDeleted = listenShared(CLOUD_MCP_DEVICE_DELETED_EVENT, async () => {
           if (disposed) return;
           await logout();
         });
-        unlistenRemoteCommand = await listen(CLOUD_MCP_REMOTE_COMMAND_EVENT, async (remoteEvent) => {
+        if (disposed) {
+          nextUnlistenDeviceDeleted();
+          return;
+        }
+        unlistenDeviceDeleted = nextUnlistenDeviceDeleted;
+        const nextUnlistenRemoteCommand = listenShared(CLOUD_MCP_REMOTE_COMMAND_EVENT, async (remoteEvent) => {
           if (disposed) return;
           const event = remoteEvent?.payload || {};
           const commandId = String(event.command_id || event.commandId || event.payload?.command_id || event.payload?.commandId || "").trim()
@@ -42018,6 +41733,11 @@ export default function App() {
             { commandId, commandKind, targetTerminalName, workspaceId },
           );
         });
+        if (disposed) {
+          nextUnlistenRemoteCommand();
+          return;
+        }
+        unlistenRemoteCommand = nextUnlistenRemoteCommand;
       } catch (error) {
         logBigViewSyncDiagnosticEvent("remote_control.listener_error", {
           message: getErrorMessage(error, "Remote command listener failed."),
@@ -42040,7 +41760,6 @@ export default function App() {
 
   useEffect(() => {
     let disposed = false;
-    let unlisten = null;
     const activeRuntimeWorkspaceIds = new Set(
       normalizeEnabledWorkspaceIds(workspaceLifecycleSettings?.enabledWorkspaceIds),
     );
@@ -45997,28 +45716,16 @@ export default function App() {
       }
     };
 
-    listen(APP_CONTROL_MCP_REQUEST_EVENT, (event) => {
+    const unsubscribe = listenShared(APP_CONTROL_MCP_REQUEST_EVENT, (event) => {
       if (disposed) {
         return;
       }
       void handleAppControlRequest(event);
-    }).then((dispose) => {
-      if (disposed) {
-        dispose();
-      } else {
-        unlisten = dispose;
-      }
-    }).catch((error) => {
-      logBigViewSyncDiagnosticEvent("app_control_mcp.listen_error", {
-        message: getErrorMessage(error, "Unable to listen for app-control MCP requests."),
-      });
     });
 
     return () => {
       disposed = true;
-      if (typeof unlisten === "function") {
-        unlisten();
-      }
+      unsubscribe();
     };
   }, [
     addWorkspacePcbPane,
@@ -48025,26 +47732,17 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    let unlistenTranscriptUpdated = null;
 
-    listen(AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT, (transcriptEvent) => {
+    const unsubscribe = listenShared(AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT, (transcriptEvent) => {
       if (cancelled) {
         return;
       }
       workspaceThreadTranscriptEventHandlerRef.current?.(transcriptEvent);
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenTranscriptUpdated = unlisten;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
-      if (unlistenTranscriptUpdated) {
-        unlistenTranscriptUpdated();
-      }
+      unsubscribe();
     };
   }, []);
 
@@ -49464,7 +49162,6 @@ export default function App() {
   }, [handleThreadTerminalLifecycle]);
 
   useEffect(() => {
-    let unlistenActivityHook = null;
     let cancelled = false;
     let sequence = 0;
 
@@ -49546,7 +49243,7 @@ export default function App() {
       document.addEventListener("visibilitychange", handleActivityHookVisibilityChange);
     }
 
-    listen(TERMINAL_ACTIVITY_HOOK_EVENT, (hookEvent) => {
+    const unsubscribe = listenShared(TERMINAL_ACTIVITY_HOOK_EVENT, (hookEvent) => {
       if (cancelled) {
         return;
       }
@@ -49562,13 +49259,7 @@ export default function App() {
       } else {
         scheduleActivityHookFlush();
       }
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenActivityHook = unlisten;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
@@ -49578,34 +49269,23 @@ export default function App() {
       clearScheduledActivityHookFlush();
       terminalActivityHookQueueRef.current = [];
       terminalActivityHookLifecycleReducersRef.current = null;
-      if (unlistenActivityHook) {
-        unlistenActivityHook();
-      }
+      unsubscribe();
     };
   }, []);
 
   useEffect(() => {
-    let unlistenProviderSessionBound = null;
     let cancelled = false;
 
-    listen(TERMINAL_PROVIDER_SESSION_BOUND_EVENT, (sessionEvent) => {
+    const unsubscribe = listenShared(TERMINAL_PROVIDER_SESSION_BOUND_EVENT, (sessionEvent) => {
       if (cancelled) {
         return;
       }
       terminalProviderSessionBindingHandlerRef.current?.(sessionEvent);
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenProviderSessionBound = unlisten;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
-      if (unlistenProviderSessionBound) {
-        unlistenProviderSessionBound();
-      }
+      unsubscribe();
     };
   }, []);
 
@@ -49848,25 +49528,15 @@ export default function App() {
   }, [requestWorkspaceThreadTranscript]);
 
   useEffect(() => {
-    let unlistenPromptSubmitted = null;
     let cancelled = false;
 
-    listen(TERMINAL_PROMPT_SUBMITTED_EVENT, (promptEvent) => {
+    const unsubscribe = listenShared(TERMINAL_PROMPT_SUBMITTED_EVENT, (promptEvent) => {
       terminalPromptSubmittedHandlerRef.current?.(promptEvent);
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-
-      unlistenPromptSubmitted = unlisten;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
-      if (unlistenPromptSubmitted) {
-        unlistenPromptSubmitted();
-      }
+      unsubscribe();
     };
   }, []);
 
@@ -51002,6 +50672,16 @@ export default function App() {
   const handlePlusUpsellUpgrade = useCallback(() => {
     openUrl("https://diffforge.ai/pricing").catch(() => {});
   }, []);
+  // The tier-up and low-credits overlays are full-window DOM takeovers, but
+  // native web panes composite above ALL DOM — park them while either
+  // overlay is up (same contract as the app-close confirmation).
+  useEffect(() => {
+    const overlayActive = plusUpsellState === "shown" || lowCreditsUpsellState === "shown";
+    setNativeWebviewsSuppressed("billing-upsell-overlay", overlayActive);
+    return () => {
+      setNativeWebviewsSuppressed("billing-upsell-overlay", false);
+    };
+  }, [plusUpsellState, lowCreditsUpsellState]);
   // Low-credits gate: decided exactly once per sign-in, from the first ready
   // billing snapshot. Mid-session dips do NOT re-trigger it — the overlay is
   // a startup moment; the LowCreditWarningToast owns in-session warnings.

@@ -541,6 +541,7 @@ function AssetAvailabilityBadges({
   availability,
   cloudLabel = "Cloud",
   currentDeviceName = "this device",
+  isPublic = false,
   remoteDeviceNames = [],
 }) {
   const remoteCount = numberValue(availability?.remoteCount);
@@ -575,6 +576,11 @@ function AssetAvailabilityBadges({
       {availability?.hasRemote && (
         <AssetAvailabilityBadge aria-label={remoteTitle} data-kind="remote" title={remoteTitle}>
           <span aria-hidden="true">{remoteLabel}</span>
+        </AssetAvailabilityBadge>
+      )}
+      {isPublic && (
+        <AssetAvailabilityBadge aria-label="Public link active" data-kind="public" title="Public link active — anyone with the URL can view">
+          <Public aria-hidden="true" />
         </AssetAvailabilityBadge>
       )}
     </AssetAvailabilityBadgeGroup>
@@ -634,6 +640,15 @@ function assetPublicUrl(asset) {
       || link?.public_url
       || link?.url,
   );
+}
+
+/* The explicit boolean wins: unpublish fanout arrives as public:false with no
+   URL keys, and the field-level merge keeps the stale URL string around, so
+   URL presence alone would leave the card stuck on "Make private". */
+function assetIsPublic(asset) {
+  const explicit = asset?.public ?? asset?.isPublic ?? asset?.is_public;
+  if (typeof explicit === "boolean") return explicit;
+  return Boolean(assetPublicUrl(asset));
 }
 
 function assetTransferFailureDetails({
@@ -1581,7 +1596,7 @@ function AssetsPanel({
             const localPath = availability.hasLocal ? assetLocalPath(asset) : "";
             const previewUrl = localPath ? assetPreviewUrl(asset) : "";
             const publicUrl = assetPublicUrl(asset);
-            const isPublic = Boolean(publicUrl);
+            const isPublic = assetIsPublic(asset);
             const previewKey = `${id}:${previewUrl}`;
             const shouldShowImagePreview = Boolean(previewUrl && !failedPreviewKeys.has(previewKey));
             // Assets are account-level: actions only need the asset id, so
@@ -1688,6 +1703,7 @@ function AssetsPanel({
                   availability={availability}
                   cloudLabel={selectedCloudLabel}
                   currentDeviceName={currentDeviceName}
+                  isPublic={isPublic}
                   remoteDeviceNames={remoteDeviceNames}
                 />
                 {primaryCloudAction && (
@@ -1747,7 +1763,7 @@ function AssetsPanel({
                   {selected ? <CheckBox aria-hidden="true" /> : <CheckBoxOutlineBlank aria-hidden="true" />}
                 </AssetSelectButton>
                 {availability.hasCloud && (
-                  <AssetShareActions data-visible="true">
+                  <AssetShareActions>
                     {!isPublic && (
                       <AssetShareButton
                         aria-label={`Make ${name} public and copy URL`}
@@ -1977,7 +1993,7 @@ function AssetInfoSheet({
               <span>Cloud</span>
               <strong>{availability?.hasCloud ? `${shortLabel(cloudLabel, 22)} · ${cloudStatus}` : "Not uploaded"}</strong>
             </AssetInfoRow>
-            {publicUrl && (
+            {assetIsPublic(asset) && publicUrl && (
               <AssetInfoRow>
                 <span>Public link</span>
                 <strong title={publicUrl}>Available</strong>
@@ -4036,6 +4052,12 @@ const AssetAvailabilityBadge = styled.span`
     border-color: rgba(var(--forge-accent-soft-rgb), 0.28);
     color: var(--forge-accent-soft, rgba(207, 227, 255, 0.94));
     background: rgba(var(--forge-accent-rgb), 0.18);
+  }
+
+  &[data-kind="public"] {
+    border-color: rgba(103, 232, 249, 0.3);
+    color: rgba(165, 243, 252, 0.95);
+    background: rgba(21, 94, 117, 0.26);
   }
 
   &[data-kind="unavailable"] {

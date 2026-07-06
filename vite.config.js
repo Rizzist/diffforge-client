@@ -1,11 +1,11 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// Debug/dev bundles swap in React's profiling build so <Profiler> onRender
-// reports real commit durations (names the slow subtree behind UI freezes).
-// The tauri debug pipeline (`tauri build --debug`) exports TAURI_ENV_DEBUG.
-const useReactProfiling = process.env.TAURI_ENV_DEBUG === "true"
-  || process.env.VITE_REACT_PROFILING === "1";
+// Opt-in only: React's profiling build makes <Profiler> onRender report real
+// commit durations (names the slow subtree behind UI freezes), but it also
+// slows every commit — measured as a large share of workspace-open lag in
+// daily debug builds. Export VITE_REACT_PROFILING=1 to re-enable for hunts.
+const useReactProfiling = process.env.VITE_REACT_PROFILING === "1";
 
 export default defineConfig({
   clearScreen: false,

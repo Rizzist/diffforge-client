@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import { emit, listen } from "@tauri-apps/api/event";
+import { emit } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { Android as DeviceAndroidIcon } from "@styled-icons/fa-brands/Android";
 import { Apple as DeviceAppleIcon } from "@styled-icons/fa-brands/Apple";
@@ -23,6 +23,7 @@ import { ToggleOn } from "@styled-icons/material-rounded/ToggleOn";
 import { Webhook } from "@styled-icons/material-rounded/Webhook";
 import { ScatterPlot as SwarmPanelIcon } from "@styled-icons/material-rounded/ScatterPlot";
 import { TERMINAL_WINDOW_CLOSED_EVENT } from "./TerminalWindowHost.jsx";
+import { listenShared } from "../app/sharedTauriEvents.js";
 import WebPane from "../web/WebPane.jsx";
 import PcbWorkspacePane from "../pcb/PcbWorkspacePane.jsx";
 import VideoWorkspacePane from "../video/VideoWorkspacePane.jsx";
@@ -1671,7 +1672,12 @@ const TerminalSurfaceSlot = styled.div`
   background: #020304;
   contain: layout style;
   pointer-events: auto;
-  transform: translate3d(var(--terminal-slot-x, 0px), var(--terminal-slot-y, 0px), 0) scale(var(--terminal-slot-scale, 1));
+  /* 2D translate at rest: translate3d (like will-change) forces a permanent
+     compositing layer per slot — the second timeline recording proved
+     removing will-change alone left compositing flat (~4s/26s, 108ms/frame).
+     Interaction states below restore translate3d for compositor-driven
+     movement while dragging/breaking out. */
+  transform: translate(var(--terminal-slot-x, 0px), var(--terminal-slot-y, 0px)) scale(var(--terminal-slot-scale, 1));
   transform-origin: 0 0;
   /* Never transition width/height: animating the slot box re-layouts every
      frame, so each pane's ResizeObserver fires per frame and xterm reflows
@@ -1681,11 +1687,23 @@ const TerminalSurfaceSlot = styled.div`
     transform 170ms cubic-bezier(0.2, 0.8, 0.2, 1),
     filter 140ms ease,
     opacity 140ms ease;
-  will-change: transform;
+  /* Layer diet: permanent will-change promoted EVERY slot to its own GPU
+     layer — timeline profiling measured compositing at ~61ms per frame (4s
+     of a 26s recording). At rest slots stay unpromoted; promotion applies
+     only while dragging/interacting/breakout, and WebKit auto-promotes for
+     the duration of the transform transition. */
+  will-change: auto;
 
   &[data-terminal-tab-hidden="true"] {
     visibility: hidden;
     pointer-events: none;
+  }
+
+  &[data-terminal-breakout="true"],
+  &[data-terminal-dragging="true"],
+  [data-terminal-grid-dragging="true"] & {
+    transform: translate3d(var(--terminal-slot-x, 0px), var(--terminal-slot-y, 0px), 0) scale(var(--terminal-slot-scale, 1));
+    will-change: transform;
   }
 
   &[data-terminal-breakout="true"][data-terminal-interacting="true"],
@@ -7068,21 +7086,14 @@ const LoopspaceTriggersPanel = memo(function LoopspaceTriggersPanel() {
 
   useEffect(() => {
     let disposed = false;
-    let unlistenTriggers = null;
-    void listen(CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT, (event) => {
+    const unsubscribe = listenShared(CLOUD_MCP_LOOPSPACE_TRIGGERS_UPDATED_EVENT, (event) => {
       if (!disposed) {
         applyTriggerSnapshot(event?.payload || event);
       }
-    }).then((dispose) => {
-      if (disposed) {
-        dispose();
-      } else {
-        unlistenTriggers = dispose;
-      }
-    }).catch(() => {});
+    });
     return () => {
       disposed = true;
-      if (typeof unlistenTriggers === "function") unlistenTriggers();
+      unsubscribe();
     };
   }, [applyTriggerSnapshot]);
 
@@ -17451,8 +17462,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   // microphone and hands it back when it finishes.
   useEffect(() => {
     let disposed = false;
-    let unlisten = null;
-    void listen("forge-voice-agent-mic", (event) => {
+    const unsubscribe = listenShared("forge-voice-agent-mic", (event) => {
       if (disposed) return;
       const micState = String(event?.payload?.state || "");
       const reason = String(event?.payload?.reason || "");
@@ -17466,16 +17476,10 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
       } else if (micState === "paused" && !borrowed) {
         setOrchestratorVoiceInputEnabled(false);
       }
-    }).then((dispose) => {
-      if (disposed) {
-        dispose();
-      } else {
-        unlisten = dispose;
-      }
-    }).catch(() => {});
+    });
     return () => {
       disposed = true;
-      if (typeof unlisten === "function") unlisten();
+      unsubscribe();
     };
   }, []);
 
@@ -18928,8 +18932,7 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
   ]);
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
-    listen(TOOLS_WINDOW_AGENT_COMPANION_EVENT, (event) => {
+    const unsubscribe = listenShared(TOOLS_WINDOW_AGENT_COMPANION_EVENT, (event) => {
       if (disposed) return;
       const action = String(event?.payload?.action || TOOLS_WINDOW_AGENT_COMPANION_OPEN).trim()
         || TOOLS_WINDOW_AGENT_COMPANION_OPEN;
@@ -18956,18 +18959,10 @@ export const TodoQueuePanel = memo(function TodoQueuePanel({
           width: 520,
         }).catch(() => {});
       })();
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [activeAppControlAgentPaneId, appControlAgentTerminals]);
   const appControlAgentPanelMinSize = getTerminalPaneMinSizePercent(appControlAgentTerminalCount);
@@ -23696,8 +23691,7 @@ function TerminalView({
       return undefined;
     }
     let disposed = false;
-    let unlisten = () => {};
-    listen(TOOLS_WINDOW_AGENT_COMPANION_EVENT, (event) => {
+    const unsubscribe = listenShared(TOOLS_WINDOW_AGENT_COMPANION_EVENT, (event) => {
       if (disposed) return;
       const action = String(event?.payload?.action || TOOLS_WINDOW_AGENT_COMPANION_OPEN).trim()
         || TOOLS_WINDOW_AGENT_COMPANION_OPEN;
@@ -23721,18 +23715,10 @@ function TerminalView({
           width: 520,
         }).catch(() => {});
       })();
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [workspaceToolPaneExpanded]);
   const fullscreenTransitionTimerRef = useRef(0);
@@ -24386,7 +24372,6 @@ function TerminalView({
 
   useEffect(() => {
     let cancelled = false;
-    let unlistenStartupReconcile = null;
 
     const clearRefreshTimer = () => {
       if (todoDispatchStartupReconcileTimerRef.current) {
@@ -24420,20 +24405,14 @@ function TerminalView({
     };
 
     refreshStartupReconcileState();
-    listen(TODO_DISPATCH_STARTUP_RECONCILE_TAURI_EVENT, (event) => {
+    const unsubscribe = listenShared(TODO_DISPATCH_STARTUP_RECONCILE_TAURI_EVENT, (event) => {
       applyStartupReconcileState(event?.payload || {});
-    }).then((unlisten) => {
-      if (cancelled) {
-        unlisten();
-        return;
-      }
-      unlistenStartupReconcile = unlisten;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
       clearRefreshTimer();
-      if (unlistenStartupReconcile) unlistenStartupReconcile();
+      unsubscribe();
     };
   }, []);
 
@@ -24465,8 +24444,7 @@ function TerminalView({
       return undefined;
     }
     let cancelled = false;
-    let unlistenReceipts = null;
-    listen(TODO_DISPATCH_RECEIPTS_UPDATED_EVENT, (event) => {
+    const unsubscribe = listenShared(TODO_DISPATCH_RECEIPTS_UPDATED_EVENT, (event) => {
       if (cancelled) return;
       const payload = event?.payload || {};
       const eventWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
@@ -24478,18 +24456,10 @@ function TerminalView({
       // Backend-dispatched items settle through the Rust ledger; mirror the
       // final receipt status onto the local queue item.
       todoQueueBackendReconcileRef.current?.(merged);
-    })
-      .then((unlisten) => {
-        if (cancelled) {
-          unlisten();
-          return;
-        }
-        unlistenReceipts = unlisten;
-      })
-      .catch(() => {});
+    });
     return () => {
       cancelled = true;
-      if (unlistenReceipts) unlistenReceipts();
+      unsubscribe();
     };
   }, [terminalWorkspace?.id]);
 
@@ -25275,7 +25245,6 @@ function TerminalView({
   }, [isWorkspaceRuntimeVisible]);
   useEffect(() => {
     let disposed = false;
-    let unlistenBackgroundMode = null;
     const setBackgroundMode = (background) => {
       if (disposed) {
         return;
@@ -25290,23 +25259,13 @@ function TerminalView({
       })
       .catch(() => {});
 
-    listen(BACKGROUND_MODE_CHANGED_EVENT, (event) => {
+    const unsubscribe = listenShared(BACKGROUND_MODE_CHANGED_EVENT, (event) => {
       setBackgroundMode(Boolean(event?.payload?.background));
-    })
-      .then((unlisten) => {
-        if (disposed) {
-          unlisten();
-          return;
-        }
-        unlistenBackgroundMode = unlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      if (typeof unlistenBackgroundMode === "function") {
-        unlistenBackgroundMode();
-      }
+      unsubscribe();
     };
   }, []);
   const isWorkspaceSurfaceVisibleRef = useRef(Boolean(isWorkspaceSurfaceVisible));
@@ -26339,9 +26298,8 @@ function TerminalView({
 
   useEffect(() => {
     let cancelled = false;
-    let unlisten = null;
 
-    listen(TERMINAL_BREAKOUT_PLAN_UPDATED_EVENT, (event) => {
+    const unsubscribe = listenShared(TERMINAL_BREAKOUT_PLAN_UPDATED_EVENT, (event) => {
       if (cancelled || !terminalBreakoutLayoutActiveRef.current) {
         return;
       }
@@ -26393,19 +26351,11 @@ function TerminalView({
         return nextSnapshots;
       });
       setTerminalBreakoutPlanRefreshNonce((nonce) => nonce + 1);
-    }).then((dispose) => {
-      if (cancelled) {
-        dispose();
-        return;
-      }
-      unlisten = dispose;
-    }).catch(() => {});
+    });
 
     return () => {
       cancelled = true;
-      if (unlisten) {
-        unlisten();
-      }
+      unsubscribe();
     };
   }, []);
   const findTerminalIndexForSessionOrTask = useCallback(({ sessionId = "", taskId = "" } = {}) => {
@@ -26843,7 +26793,6 @@ function TerminalView({
 
   useEffect(() => {
     let disposed = false;
-    let unlisten = null;
 
     const resolvePayloadTerminalIndex = (payload = {}) => {
       const {
@@ -26866,7 +26815,7 @@ function TerminalView({
       return Number.isInteger(matchingIndex) ? matchingIndex : null;
     };
 
-    listen(TERMINAL_PARKED_PROMPT_EVENT, (event) => {
+    const unsubscribe = listenShared(TERMINAL_PARKED_PROMPT_EVENT, (event) => {
       const currentWorkspaceId = terminalParkedPromptListenerStateRef.current?.workspaceId || "";
       const payload = event?.payload || {};
       const payloadWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
@@ -26962,21 +26911,11 @@ function TerminalView({
           workspaceId: currentLock.workspaceId || currentWorkspaceId,
         });
       }
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-        } else {
-          unlisten = nextUnlisten;
-        }
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      if (unlisten) {
-        unlisten();
-      }
+      unsubscribe();
     };
   }, []);
 
@@ -28318,7 +28257,6 @@ function TerminalView({
 
   useEffect(() => {
     let cancelled = false;
-    let unlistenActivityHook = null;
 
     const handleActivityHookEvent = (hookEvent) => {
       if (cancelled) {
@@ -28691,21 +28629,11 @@ function TerminalView({
       });
     };
 
-    listen(TERMINAL_ACTIVITY_HOOK_EVENT, handleActivityHookEvent)
-      .then((unlisten) => {
-        if (cancelled) {
-          unlisten();
-          return;
-        }
-        unlistenActivityHook = unlisten;
-      })
-      .catch(() => {});
+    const unsubscribe = listenShared(TERMINAL_ACTIVITY_HOOK_EVENT, handleActivityHookEvent);
 
     return () => {
       cancelled = true;
-      if (unlistenActivityHook) {
-        unlistenActivityHook();
-      }
+      unsubscribe();
     };
   }, [
     getTerminalPaneId,
@@ -30249,9 +30177,8 @@ function TerminalView({
   // resume nonce so the in-grid WebPane remounts at the last URL.
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(WEB_PANEL_CLOSED_EVENT, (event) => {
+    const unsubscribe = listenShared(WEB_PANEL_CLOSED_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -30260,28 +30187,19 @@ function TerminalView({
         return;
       }
       clearWebPanelBreakout(paneId);
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [clearWebPanelBreakout]);
 
   // Track navigations inside a breakout window so the grid resumes there.
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(WEB_PANEL_CONTROL_EVENT, (event) => {
+    const unsubscribe = listenShared(WEB_PANEL_CONTROL_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -30301,19 +30219,11 @@ function TerminalView({
       if (control === WEB_PANEL_CONTROL_RETURN) {
         returnWebPanelToGrid(paneId, payload.url);
       }
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [rememberWebPaneNativeLabel, rememberWebPaneUrl, returnWebPanelToGrid]);
 
@@ -30322,9 +30232,8 @@ function TerminalView({
   // it instead of reloading.
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(WEB_PANEL_WEBVIEW_PRESERVED_EVENT, (event) => {
+    const unsubscribe = listenShared(WEB_PANEL_WEBVIEW_PRESERVED_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -30338,19 +30247,11 @@ function TerminalView({
       if (label) {
         rememberWebPaneNativeLabel(paneId, label);
       }
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [rememberWebPaneNativeLabel]);
 
@@ -30358,9 +30259,8 @@ function TerminalView({
   // it rereads the selected board written by the pop-out window.
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(PCB_PANEL_CLOSED_EVENT, (event) => {
+    const unsubscribe = listenShared(PCB_PANEL_CLOSED_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -30373,28 +30273,19 @@ function TerminalView({
         return;
       }
       clearPcbPanelBreakout(paneId);
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [clearPcbPanelBreakout, terminalWorkspace?.id]);
 
   // Track control clicks inside a PCB pop-out window.
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(PCB_PANEL_CONTROL_EVENT, (event) => {
+    const unsubscribe = listenShared(PCB_PANEL_CONTROL_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -30415,19 +30306,11 @@ function TerminalView({
       if (control === PCB_PANEL_CONTROL_RETURN) {
         clearPcbPanelBreakout(paneId);
       }
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [clearPcbPanelBreakout, recordPcbPaneBoard, terminalWorkspace?.id]);
 
@@ -30435,9 +30318,8 @@ function TerminalView({
   // it rereads the selected project written by the pop-out window.
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(VIDEO_PANEL_CLOSED_EVENT, (event) => {
+    const unsubscribe = listenShared(VIDEO_PANEL_CLOSED_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -30450,28 +30332,19 @@ function TerminalView({
         return;
       }
       clearVideoPanelBreakout(paneId);
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [clearVideoPanelBreakout, terminalWorkspace?.id]);
 
   // Track control clicks inside a Video pop-out window.
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(VIDEO_PANEL_CONTROL_EVENT, (event) => {
+    const unsubscribe = listenShared(VIDEO_PANEL_CONTROL_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -30492,19 +30365,11 @@ function TerminalView({
       if (control === VIDEO_PANEL_CONTROL_RETURN) {
         clearVideoPanelBreakout(paneId);
       }
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [clearVideoPanelBreakout, recordVideoPaneProject, terminalWorkspace?.id]);
 
@@ -30512,9 +30377,8 @@ function TerminalView({
   // returns the pane to the grid and re-asserts the grid's PTY size.
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(TERMINAL_WINDOW_CLOSED_EVENT, (event) => {
+    const unsubscribe = listenShared(TERMINAL_WINDOW_CLOSED_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -30531,19 +30395,11 @@ function TerminalView({
         delete next[paneId];
         return next;
       });
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [restoreWorkspacePaneIfMinimized]);
 
@@ -31581,9 +31437,8 @@ function TerminalView({
 
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(SNIP_PREVIEW_DRAG_OVER_EVENT, (event) => {
+    const unsubscribe = listenShared(SNIP_PREVIEW_DRAG_OVER_EVENT, (event) => {
       if (disposed || !isWorkspaceRuntimeVisibleRef.current) {
         return;
       }
@@ -31595,28 +31450,19 @@ function TerminalView({
         return;
       }
       setSnipDropHighlightElement(resolveSnipDropElement(clientX, clientY));
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
       setSnipDropHighlightElement(null);
     };
   }, [resolveSnipDropElement, setSnipDropHighlightElement]);
 
   useEffect(() => {
     let disposed = false;
-    let unlisten = () => {};
 
-    listen(SNIP_PREVIEW_DROP_EVENT, async (event) => {
+    const unsubscribe = listenShared(SNIP_PREVIEW_DROP_EVENT, async (event) => {
       if (disposed || !isWorkspaceRuntimeVisibleRef.current) {
         return;
       }
@@ -31721,19 +31567,11 @@ function TerminalView({
           invoke("snipping_consume_snip_preview", { label, path }).catch(() => {});
         }
       }
-    })
-      .then((nextUnlisten) => {
-        if (disposed) {
-          nextUnlisten();
-          return;
-        }
-        unlisten = nextUnlisten;
-      })
-      .catch(() => {});
+    });
 
     return () => {
       disposed = true;
-      unlisten();
+      unsubscribe();
     };
   }, [
     buildDroppedImageFromDataUrl,
@@ -33308,9 +33146,8 @@ function TerminalView({
 
   useEffect(() => {
     let disposed = false;
-    let unlisten = null;
 
-    listen(VOICE_PLAN_SERVER_RESULT_EVENT, (event) => {
+    const unsubscribe = listenShared(VOICE_PLAN_SERVER_RESULT_EVENT, (event) => {
       if (disposed) {
         return;
       }
@@ -33344,22 +33181,11 @@ function TerminalView({
         });
       }
       handleVoicePlanServerResult(payload.result || payload);
-    }).then((nextUnlisten) => {
-      if (disposed) {
-        nextUnlisten?.();
-        return;
-      }
-      unlisten = nextUnlisten;
-    }).catch((error) => {
-      logTerminalStatus("frontend.voice_plan.backend_server_result_listen_error", {
-        message: error?.message || String(error || ""),
-        workspaceId: terminalWorkspace?.id || "",
-      });
     });
 
     return () => {
       disposed = true;
-      unlisten?.();
+      unsubscribe();
     };
   }, [handleVoicePlanServerResult, terminalWorkspace?.id]);
 
@@ -34875,7 +34701,6 @@ function TerminalView({
       return undefined;
     }
     let cancelled = false;
-    let unlistenChanged = null;
 
     const reconcileFromStore = () => {
       invoke("todo_store_snapshot", { workspaceId: storeWorkspaceId }).then((snapshot) => {
@@ -35073,7 +34898,7 @@ function TerminalView({
       }).catch(() => {});
     };
 
-    listen(TODO_STORE_CHANGED_TAURI_EVENT, (event) => {
+    const unsubscribe = listenShared(TODO_STORE_CHANGED_TAURI_EVENT, (event) => {
       if (cancelled) {
         return;
       }
@@ -35086,13 +34911,7 @@ function TerminalView({
         return;
       }
       reconcileFromStore();
-    }).then((nextUnlisten) => {
-      if (cancelled) {
-        nextUnlisten();
-        return;
-      }
-      unlistenChanged = nextUnlisten;
-    }).catch(() => {});
+    });
 
     // Mount-time pass: prune tombstoned local survivors and adopt
     // store rows written while no webview was alive.
@@ -35100,9 +34919,7 @@ function TerminalView({
 
     return () => {
       cancelled = true;
-      if (unlistenChanged) {
-        unlistenChanged();
-      }
+      unsubscribe();
     };
   }, [
     getTerminalPaneId,
@@ -35121,8 +34938,7 @@ function TerminalView({
       return undefined;
     }
     let cancelled = false;
-    let unlistenCancel = null;
-    listen(TODO_STORE_CANCEL_REQUESTED_TAURI_EVENT, (event) => {
+    const unsubscribe = listenShared(TODO_STORE_CANCEL_REQUESTED_TAURI_EVENT, (event) => {
       if (cancelled) {
         return;
       }
@@ -35163,18 +34979,10 @@ function TerminalView({
         }
         setTodoQueueDispatchRevision((revision) => revision + 1);
       });
-    }).then((nextUnlisten) => {
-      if (cancelled) {
-        nextUnlisten();
-        return;
-      }
-      unlistenCancel = nextUnlisten;
-    }).catch(() => {});
+    });
     return () => {
       cancelled = true;
-      if (unlistenCancel) {
-        unlistenCancel();
-      }
+      unsubscribe();
     };
   }, [clearTodoQueueItemPending, interruptVoicePlanTaskTerminal, terminalWorkspace?.id]);
 
@@ -35327,8 +35135,7 @@ function TerminalView({
       return undefined;
     }
     let cancelled = false;
-    let unlistenCapture = null;
-    listen("todo-dispatch-direct-todo-captured", (event) => {
+    const unsubscribe = listenShared("todo-dispatch-direct-todo-captured", (event) => {
       if (cancelled) return;
       const payload = event?.payload || {};
       const eventWorkspaceId = String(payload.workspaceId || payload.workspace_id || "").trim();
@@ -35413,18 +35220,10 @@ function TerminalView({
       }).catch(() => {
         applyCaptureItem(item);
       });
-    })
-      .then((unlisten) => {
-        if (cancelled) {
-          unlisten();
-          return;
-        }
-        unlistenCapture = unlisten;
-      })
-      .catch(() => {});
+    });
     return () => {
       cancelled = true;
-      if (unlistenCapture) unlistenCapture();
+      unsubscribe();
     };
   }, [terminalWorkspace?.id, updateTodoQueueItems]);
 
@@ -36021,15 +35820,12 @@ function TerminalView({
     }
 
     const register = (eventName, handler) => {
-      listen(eventName, handler)
-        .then((unlisten) => {
-          if (disposed) {
-            unlisten();
-          } else {
-            unlisteners.push(unlisten);
-          }
-        })
-        .catch(() => {});
+      const unsubscribe = listenShared(eventName, handler);
+      if (disposed) {
+        unsubscribe();
+      } else {
+        unlisteners.push(unsubscribe);
+      }
     };
 
     const payloadMatchesWorkspace = (payload = {}) => {
@@ -39848,15 +39644,12 @@ function TerminalView({
     let disposed = false;
     const unlisteners = [];
     const register = (eventName, handler) => {
-      listen(eventName, handler)
-        .then((unlisten) => {
-          if (disposed) {
-            unlisten();
-            return;
-          }
-          unlisteners.push(unlisten);
-        })
-        .catch(() => {});
+      const unsubscribe = listenShared(eventName, handler);
+      if (disposed) {
+        unsubscribe();
+        return;
+      }
+      unlisteners.push(unsubscribe);
     };
 
     register(TERMINAL_DRAG_MOVE_EVENT, (event) => {
@@ -40638,6 +40431,7 @@ function TerminalView({
       <TerminalSurfaceLayer
         aria-hidden={false}
         data-terminal-breakout={terminalBreakoutVisible ? "true" : "false"}
+        data-terminal-grid-dragging={terminalDragState ? "true" : undefined}
         onWheelCapture={handleBreakoutCanvasWheel}
       >
         {logicalTerminalIndexes.map((terminalIndex, paneOrderIndex) => {

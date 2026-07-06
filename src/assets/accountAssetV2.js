@@ -248,7 +248,7 @@ export function accountAssetFanoutFromValue(value = {}) {
     });
 
     compactRows(payload, "a").forEach((row) => {
-      const object = compactRowObject(row, cols.a || ["aid", "bid", "n", "k", "mt", "sz", "sha", "st", "ut", "src", "fold", "dom"]);
+      const object = compactRowObject(row, cols.a || ["aid", "bid", "n", "k", "mt", "sz", "sha", "st", "ut", "src", "fold", "dom", "pub", "purl"]);
       const assetId = text(object?.aid, object?.asset_id, object?.assetId, object?.id);
       if (!assetId) return;
       const blobId = text(object.bid, object.blob_id, object.blobId);
@@ -258,7 +258,21 @@ export function accountAssetFanoutFromValue(value = {}) {
       if (assetDocBacked({ source_kind: sourceKind, folder, doc_domain: docDomain })) {
         return;
       }
+      /* "pub" is tri-state: 1/0 when the cloud resolved the public link,
+         absent on older payloads — omit the fields then so merges keep
+         prior knowledge instead of reading "unknown" as "private". */
+      const publicState = object.pub === undefined || object.pub === null
+        ? null
+        : Boolean(Number(object.pub));
+      const publicFields = publicState === null ? {} : {
+        public: publicState,
+        is_public: publicState,
+        isPublic: publicState,
+        public_url: publicState ? text(object.purl, object.public_url, object.publicUrl) : "",
+        publicUrl: publicState ? text(object.purl, object.public_url, object.publicUrl) : "",
+      };
       itemsById.set(assetId, {
+        ...publicFields,
         asset_id: assetId,
         assetId: assetId,
         id: assetId,

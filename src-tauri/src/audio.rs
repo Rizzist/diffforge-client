@@ -10890,8 +10890,12 @@ async fn start_cloud_voice_agent_stream(
         workspace_name,
         workspace_root,
         realtime,
+        language,
     } = request;
     let realtime_engine = realtime.unwrap_or(false);
+    // Lenient: the cloud validates against its own supported set and falls
+    // back to English, so an unknown code must not block voice start.
+    let voice_language = clean_deepgram_language(language).unwrap_or_else(|_| "en".to_string());
     let owner_id = clean_cloud_voice_agent_text(owner_id, 120);
     let owner_id = if owner_id.is_empty() {
         "unscoped".to_string()
@@ -11145,6 +11149,8 @@ async fn start_cloud_voice_agent_stream(
             "recentAgentSessions": agent_session_context["sessions"].clone(),
             "submission_mode": submission_mode.clone(),
             "input_mode": submission_mode.clone(),
+            "language": voice_language.clone(),
+            "voice_language": voice_language.clone(),
             "turn_policy": {
                 "input_submission": submission_mode.clone(),
             },

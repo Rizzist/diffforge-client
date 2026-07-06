@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
+import { readDeepgramLanguage } from "./audioCapture.js";
+
 export const CLOUD_VOICE_AGENT_EVENT = "forge-cloud-voice-agent-event";
 export const VOICE_ORCHESTRATOR_DIAGNOSTIC_LOGGING_ENABLED = false;
 const CLOUD_VOICE_AGENT_PREWARM_FRESH_MS = 15_000;
@@ -71,7 +73,17 @@ export function startCloudVoiceAgentStream(request = {}) {
     submissionMode: request?.submissionMode || request?.submission_mode || "",
     workspaceId: request?.workspaceId || request?.workspace_id || "",
   });
-  return invoke("start_cloud_voice_agent_stream", { request })
+  /* The audio-settings language rides every session start so the cloud can
+     speak its "let me think about that" acknowledgement in the user's
+     language. Callers may override; the setting is the default. */
+  let language = "";
+  try {
+    language = String(request?.language || readDeepgramLanguage() || "").trim();
+  } catch {
+    /* settings read must not block voice start */
+  }
+  const requestWithLanguage = language ? { ...request, language } : request;
+  return invoke("start_cloud_voice_agent_stream", { request: requestWithLanguage })
     .then((result) => {
       logVoiceOrchestratorDiagnosticEvent("voice_agent.frontend.start_stream.ok", {
         active: Boolean(result?.active),

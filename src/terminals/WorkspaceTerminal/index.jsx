@@ -7220,7 +7220,7 @@ function WorkspaceTerminal({
       if (!useWebglRenderer || isDisposed || webglAttachAttempted || !terminalRendererOpened) {
         return;
       }
-      if (!terminalActiveRef.current && reason !== "terminal_activated") {
+      if (!terminalActiveRef.current && reason !== "terminal_activated" && reason !== "background_visible") {
         rendererMode = "canvas_deferred";
         if (!webglBackgroundDeferred) {
           webglBackgroundDeferred = true;
@@ -7229,7 +7229,20 @@ function WorkspaceTerminal({
             reason,
             terminalIndex,
           });
+          // Visible-but-unfocused panes stream constantly, and canvas2d for a
+          // streaming pane costs far more per composite (~50-60ms measured)
+          // than a WebGL context. Attach after a stagger instead of waiting
+          // for focus; hidden tabs bail below via checkVisibility.
+          scheduleWebglAttach(
+            "background_visible",
+            TERMINAL_WEBGL_BACKGROUND_DELAY_MS + terminalIndex * TERMINAL_WEBGL_STAGGER_MS,
+          );
         }
+        return;
+      }
+      if (reason === "background_visible" && container?.checkVisibility && !container.checkVisibility()) {
+        // Hidden tab/minimized pane: stay on the cheap renderer; activation
+        // re-schedules the attach.
         return;
       }
 
@@ -7242,6 +7255,11 @@ function WorkspaceTerminal({
 	        terminal.loadAddon(webglAddon);
 	        rendererMode = "webgl";
 	        activeWebglAddon = webglAddon;
+	        // The addon's canvas holds a live WebGL context until GC even after
+	        // addon.dispose() — WebKit caps ~16 contexts per page, and open/close
+	        // cycling exhausted them ("too many active WebGL contexts", oldest
+	        // killed). Capture the canvas so dispose can release it explicitly.
+	        const webglCanvas = container.querySelector(".xterm-screen canvas:last-of-type");
 	        registerTerminalWebglRegistryEntry(webglRegistryKey, {
 	          addon: webglAddon,
 	          dispose: (disposeReason = "webgl_registry_dispose") => {
@@ -7256,6 +7274,16 @@ function WorkspaceTerminal({
 	            } catch (_error) {
 	              // WebGL disposal is best effort; xterm keeps its DOM/canvas renderer.
 	            }
+	            try {
+	              const gl = webglCanvas?.getContext?.("webgl2") || webglCanvas?.getContext?.("webgl");
+	              gl?.getExtension?.("WEBGL_lose_context")?.loseContext?.();
+	            } catch (_error) {
+	              // Context release is best effort; GC reclaims it eventually.
+	            }
+	            void invoke("terminal_status_log", {
+	              phase: "frontend.webgl_mode",
+	              fields: { mode: "canvas_fallback", paneId, reason: disposeReason, terminalIndex },
+	            }).catch(() => {});
 	            logTerminalDiagnosticEvent("frontend.webgl.dispose", {
 	              paneId,
 	              reason: disposeReason,
@@ -7263,6 +7291,10 @@ function WorkspaceTerminal({
 	            });
 	          },
 	        });
+	        void invoke("terminal_status_log", {
+	          phase: "frontend.webgl_mode",
+	          fields: { mode: "webgl", paneId, terminalIndex },
+	        }).catch(() => {});
 	        disposables.push(() => disposeWebglAddon(webglAddon, "terminal_cleanup"));
 	        disposables.push(webglAddon.onContextLoss(() => {
 	          rendererMode = "canvas";
@@ -7272,6 +7304,10 @@ function WorkspaceTerminal({
 	          webglAttachAttempted = false;
 	          webglBackgroundDeferred = false;
 	          removeTerminalWebglRegistryEntry(webglRegistryKey, webglAddon);
+	          void invoke("terminal_status_log", {
+	            phase: "frontend.webgl_mode",
+	            fields: { mode: "context_loss", paneId, terminalIndex },
+	          }).catch(() => {});
 	          logTerminalDiagnosticEvent("frontend.webgl.context_loss", {
 	            paneId,
 	            reason,

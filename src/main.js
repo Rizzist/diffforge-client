@@ -79,12 +79,24 @@ const loadRootComponent = hash === "#/snipping-overlay"
   ? import("./video/VideoWindowHost.jsx").then((module) => module.default)
   : import("./App.jsx").then((module) => module.default);
 
-loadRootComponent.then((RootComponent) => {
+loadRootComponent.then(async (RootComponent) => {
+  // The OTA update banner rides only the main window; utility windows keep
+  // their narrow chunks, and the backend never restarts without a click.
+  const AppUpdateBanner = mainWindowBoot
+    ? (await import("./app/AppUpdateBanner.jsx")).default
+    : null;
   createRoot(document.querySelector("#app")).render(
     React.createElement(
       StyleSheetManager,
       { disableCSSOMInjection: true },
-      React.createElement(RootComponent),
+      AppUpdateBanner
+        ? React.createElement(
+          React.Fragment,
+          null,
+          React.createElement(RootComponent),
+          React.createElement(AppUpdateBanner),
+        )
+        : React.createElement(RootComponent),
     ),
   );
 });

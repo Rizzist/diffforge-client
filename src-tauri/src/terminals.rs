@@ -15105,8 +15105,16 @@ fn spawn_terminal_input_transport_listener(
 ) {
     tauri::async_runtime::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
+            // A transient accept error (ECONNABORTED/EMFILE under fd
+            // pressure) must not kill the accept loop: the endpoint stays
+            // cached, so a dead listener strands every future connection
+            // ("Socket is not connected" storms). Back off and keep serving.
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
             };
             let app_handle = app.clone();
             let token = expected_token.clone();
@@ -15124,8 +15132,16 @@ fn spawn_terminal_output_transport_listener(
 ) {
     tauri::async_runtime::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
+            // A transient accept error (ECONNABORTED/EMFILE under fd
+            // pressure) must not kill the accept loop: the endpoint stays
+            // cached, so a dead listener strands every future connection
+            // ("Socket is not connected" storms). Back off and keep serving.
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
             };
             let app_handle = app.clone();
             let token = expected_token.clone();
@@ -15139,8 +15155,16 @@ fn spawn_terminal_output_transport_listener(
 fn spawn_terminal_activity_transport_listener(app: AppHandle, listener: TcpListener) {
     tauri::async_runtime::spawn(async move {
         loop {
-            let Ok((stream, _)) = listener.accept().await else {
-                break;
+            // A transient accept error (ECONNABORTED/EMFILE under fd
+            // pressure) must not kill the accept loop: the endpoint stays
+            // cached, so a dead listener strands every future connection
+            // ("Socket is not connected" storms). Back off and keep serving.
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
             };
             let app_handle = app.clone();
             tauri::async_runtime::spawn(async move {

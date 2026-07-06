@@ -115,8 +115,12 @@ const TERMINAL_INPUT_QUEUE_IDLE_SECS: u64 = 30;
 const MAX_TERMINAL_START_AGENT_BATCH: usize = 32;
 const TERMINAL_PTY_POOL_TARGET: usize = 0;
 const TERMINAL_OUTPUT_READ_BUFFER_BYTES: usize = 8192;
-const TERMINAL_OUTPUT_COALESCE_WINDOW_MS: u64 = 6;
-const TERMINAL_OUTPUT_COALESCE_MAX_BYTES: usize = 16 * 1024;
+// One display frame: under agent output floods the previous 6ms window still
+// crossed the IPC bridge ~166x/sec/terminal — the webview timeline measured
+// the resulting message-event + microtask storm at ~5s of a 26s recording.
+// 16ms halves-to-thirds the event rate at an imperceptible echo latency.
+const TERMINAL_OUTPUT_COALESCE_WINDOW_MS: u64 = 16;
+const TERMINAL_OUTPUT_COALESCE_MAX_BYTES: usize = 64 * 1024;
 const TERMINAL_OUTPUT_COALESCE_QUEUE_CAPACITY: usize = 64;
 const TERMINAL_HEADLESS_OUTPUT_TAIL_BYTES: usize = 512 * 1024;
 const TERMINAL_PARKED_RESUME_SUBMIT_DELAY_MS: u64 = 120;
@@ -2582,6 +2586,9 @@ struct CloudVoiceAgentStartRequest {
     /// GPT-Realtime engine opt-in: one native speech-to-speech session on the
     /// cloud instead of the STT → LLM → TTS pipeline.
     realtime: Option<bool>,
+    /// Audio-settings language code; the cloud speaks its fast
+    /// acknowledgement line in this language.
+    language: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2707,6 +2714,7 @@ include!("activity_overlay.rs");
 include!("todo_dispatch.rs");
 include!("agent_accounts.rs");
 include!("background_mode.rs");
+include!("app_updater.rs");
 include!("vm_sandbox.rs");
 include!("audio.rs");
 include!("audio_history.rs");
@@ -3138,6 +3146,7 @@ fn forward_terminal_status_to_energy_if_needed(phase: &str, source: &str, fields
         || phase.starts_with("frontend.freeze_probe")
         || phase.starts_with("frontend.commit_profiler")
         || phase.starts_with("frontend.stringify_probe")
+        || phase.starts_with("frontend.webgl_mode")
     {
         energy_impact::energy_impact_log_render_storm(phase, source, fields);
     }
@@ -7456,6 +7465,7 @@ pub fn run() {
 
     #[cfg(desktop)]
     {
+        builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             let deep_link_urls = deep_link_urls_from_args(&argv);
             let background_startup = startup_args_request_background(&argv);
@@ -7583,6 +7593,11 @@ pub fn run() {
             // Background dispatcher: dormant while the webview heartbeats;
             // takes over queued-todo submission when the window goes away.
             todo_dispatch_start_background_dispatcher(app.handle().clone());
+            #[cfg(desktop)]
+            {
+                app_update_settings_initialize(app.handle());
+                app_updater_start(app.handle());
+            }
             // Always-present tray: left-click behavior is driven by the
             // persisted tray-click settings seeded above.
             // (Setup runs on the main thread, which NSStatusItem requires.)
@@ -7634,6 +7649,11 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            app_update_status,
+            app_update_check_now,
+            app_update_install_and_restart,
+            app_update_settings_state,
+            app_update_settings_update,
             backend_ping,
             backend_cpu_attribution_snapshot,
             desktop_auth_snapshot_command,

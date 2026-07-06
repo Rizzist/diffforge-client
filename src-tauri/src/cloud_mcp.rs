@@ -45879,6 +45879,7 @@ fn cloud_mcp_asset_v2_expanded_from_response(value: &Value) -> Option<CloudMcpAs
             "a",
             &[
                 "aid", "bid", "n", "k", "mt", "sz", "sha", "st", "ut", "src", "fold", "dom",
+                "pub", "purl",
             ],
         ) {
             let asset_id = cloud_mcp_asset_row_text(&row, &["aid", "asset_id", "assetId", "id"]);
@@ -45892,6 +45893,15 @@ fn cloud_mcp_asset_v2_expanded_from_response(value: &Value) -> Option<CloudMcpAs
                 cloud_mcp_asset_row_text(&row, &["src", "source_kind", "sourceKind", "source"]);
             let folder = cloud_mcp_asset_folder_from_value(&row, CLOUD_MCP_ASSET_FOLDER_DEFAULT);
             let doc_domain = cloud_mcp_asset_row_text(&row, &["dom", "doc_domain", "docDomain"]);
+            // "pub" is tri-state: 1/0 from rows that resolved the public
+            // link, absent/null from older payloads — leave the fields off
+            // then so the sticky merge keeps prior knowledge.
+            let public_state = row
+                .get("pub")
+                .and_then(Value::as_i64)
+                .or_else(|| row.get("pub").and_then(Value::as_bool).map(i64::from));
+            let public_url = cloud_mcp_asset_row_text(&row, &["purl", "public_url", "publicUrl"]);
+            let asset_id_for_public = asset_id.clone();
             items_by_id.insert(
                 asset_id.clone(),
                 json!({
@@ -45923,6 +45933,20 @@ fn cloud_mcp_asset_v2_expanded_from_response(value: &Value) -> Option<CloudMcpAs
                     "updatedAt": cloud_mcp_asset_v2_updated_at(&row),
                 }),
             );
+            if let Some(public_state) = public_state {
+                if let Some(item) = items_by_id
+                    .get_mut(&asset_id_for_public)
+                    .and_then(Value::as_object_mut)
+                {
+                    let is_public = public_state != 0;
+                    item.insert("public".to_string(), json!(is_public));
+                    item.insert("is_public".to_string(), json!(is_public));
+                    item.insert("isPublic".to_string(), json!(is_public));
+                    let effective_url = if is_public { public_url.clone() } else { String::new() };
+                    item.insert("public_url".to_string(), json!(effective_url.clone()));
+                    item.insert("publicUrl".to_string(), json!(effective_url));
+                }
+            }
         }
 
         for row in cloud_mcp_asset_v2_rows(&payload, "r", &["aid", "ut"]) {
@@ -46660,6 +46684,29 @@ fn cloud_mcp_asset_merge_cloud_identity_row(incoming: &mut Value, existing: &Val
         if missing {
             if let Some(value) = existing_value {
                 incoming_object.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+    // Public-link state: rows that resolved it carry an explicit boolean
+    // (true/false). Only when the boolean is entirely absent (older payloads)
+    // do we keep what the stored row knew.
+    let incoming_has_public_state = ["public", "is_public", "isPublic"]
+        .iter()
+        .any(|key| incoming_object.get(*key).and_then(Value::as_bool).is_some());
+    if !incoming_has_public_state {
+        for key in [
+            "public",
+            "is_public",
+            "isPublic",
+            "public_url",
+            "publicUrl",
+            "public_link",
+            "publicLink",
+        ] {
+            if incoming_object.get(key).is_none() {
+                if let Some(value) = existing.get(key) {
+                    incoming_object.insert(key.to_string(), value.clone());
+                }
             }
         }
     }
@@ -47655,6 +47702,13 @@ fn cloud_mcp_asset_library_merge_local(mut remote: Value, local: Value) -> Value
                     }
                 }
             }
+            // The refreshed remote list is the UI's base row, but clouds that
+            // predate the pub/purl + blob-binding contract send items without
+            // public-link state and with blob-less "local_only" statuses.
+            // Backfill from the local store row (which ingested the full
+            // publish/upload responses) or a publish/upload visibly reverts
+            // on the very next refresh.
+            cloud_mcp_asset_merge_cloud_identity_row(existing, &local_item);
         } else {
             items.push(local_item);
         }
