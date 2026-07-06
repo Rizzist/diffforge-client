@@ -133,27 +133,32 @@ fn process_callback(stream: &StreamRef, user_data: &mut ListenerUserData) {
                 .to_vec()
             };
 
+            // The refactored VideoFrame carries SystemTime; pipewire's pts is
+            // monotonic (not epoch-based), so stamp arrival time instead —
+            // same approach as the Windows engine.
+            let _ = timestamp;
+            let frame_display_time = std::time::SystemTime::now();
             if let Err(e) = match user_data.format.format() {
                 VideoFormat::RGBx => user_data.tx.send(Frame::Video(VideoFrame::RGBx(RGBxFrame {
-                    display_time: timestamp as u64,
+                    display_time: frame_display_time,
                     width: frame_size.width as i32,
                     height: frame_size.height as i32,
                     data: frame_data,
                 }))),
                 VideoFormat::RGB => user_data.tx.send(Frame::Video(VideoFrame::RGB(RGBFrame {
-                    display_time: timestamp as u64,
+                    display_time: frame_display_time,
                     width: frame_size.width as i32,
                     height: frame_size.height as i32,
                     data: frame_data,
                 }))),
                 VideoFormat::xBGR => user_data.tx.send(Frame::Video(VideoFrame::XBGR(XBGRFrame {
-                    display_time: timestamp as u64,
+                    display_time: frame_display_time,
                     width: frame_size.width as i32,
                     height: frame_size.height as i32,
                     data: frame_data,
                 }))),
                 VideoFormat::BGRx => user_data.tx.send(Frame::Video(VideoFrame::BGRx(BGRxFrame {
-                    display_time: timestamp as u64,
+                    display_time: frame_display_time,
                     width: frame_size.width as i32,
                     height: frame_size.height as i32,
                     data: frame_data,
