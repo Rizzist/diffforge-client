@@ -4963,8 +4963,13 @@ fn audio_widget_resign_key_window_if_needed(
 const AUDIO_WIDGET_REASSERT_SHOW_MS: u64 = 120;
 #[cfg(target_os = "macos")]
 const AUDIO_WIDGET_COLD_BOOT_REASSERT_MS: u64 = 300;
+// One immediate placement per Space/screen notification. The old timer
+// retry ladder ([150..3000]ms) is gone: late corrections are event-driven
+// via the widget window's occlusion-state observer, which fires exactly when
+// the window becomes visible on the new Space (the timers all raced the
+// transition and could be retired wholesale by one command placement).
 #[cfg(target_os = "macos")]
-const AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS: [u64; 6] = [0, 150, 350, 800, 1_600, 3_000];
+const AUDIO_WIDGET_SPACE_REPOSITION_DELAYS_MS: [u64; 1] = [0];
 #[cfg(target_os = "macos")]
 const AUDIO_WIDGET_BOTTOM_BAR_DEBUG_SAMPLE_MS: u64 = 500;
 #[cfg(target_os = "macos")]
@@ -5441,6 +5446,15 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
                                 || notification_name == "NSApplicationDidChangeScreenParametersNotification";
                         if should_clear_full_monitor_sticky {
                             macos_clear_active_space_full_monitor_sticky("workspace_or_screen_change");
+                            // A Space switch kills any in-flight NSWindow
+                            // animator mid-slide, but the stored animation
+                            // record keeps claiming the slide is running for
+                            // duration+slack — long enough that the immediate
+                            // SpaceChanged placement below reads
+                            // animation_matches_target and strands the bar at
+                            // its interrupted frame. Drop the dead record
+                            // first.
+                            audio_widget_cancel_bottom_bar_frame_animation(&callback_app);
                             audio_widget_schedule_stored_bottom_bar_reposition(&callback_app);
                         }
                     });
@@ -5511,6 +5525,65 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
                     &block,
                 )
             };
+            // Event-driven Space heal: the workspace notification fires while
+            // the widget window is still detached from the incoming Space
+            // (isVisible() is false, so placements teleport and animations
+            // are skipped — and a frame stranded by the transition stays
+            // wherever it was interrupted). The occlusion observer fires
+            // exactly when the window becomes visible again; one stored
+            // reposition there replaces the old timer retry ladder.
+            let occlusion_app = app_handle.clone();
+            let occlusion_block = block2::RcBlock::new(
+                move |notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
+                    snipping_catch_objc("audio_widget_occlusion_observer_callback", || {
+                        let Some(widget_window) =
+                            occlusion_app.get_webview_window(AUDIO_WIDGET_WINDOW_LABEL)
+                        else {
+                            return;
+                        };
+                        let Ok(widget_ptr) = widget_window.ns_window() else {
+                            return;
+                        };
+                        if widget_ptr.is_null() {
+                            return;
+                        }
+                        let Some(notification_object) =
+                            unsafe { notification.as_ref() }.object()
+                        else {
+                            return;
+                        };
+                        let object_ptr = objc2::rc::Retained::as_ptr(&notification_object)
+                            as *const core::ffi::c_void;
+                        if object_ptr != widget_ptr.cast_const() {
+                            return;
+                        }
+                        let ns_window: &NSWindow = unsafe { &*widget_ptr.cast::<NSWindow>() };
+                        let visible = ns_window
+                            .occlusionState()
+                            .contains(objc2_app_kit::NSWindowOcclusionState::Visible);
+                        log_audio_widget_bottom_bar_debug_event(
+                            "audio.widget.bottom_bar.occlusion_changed",
+                            json!({ "visible": visible }),
+                        );
+                        if !visible {
+                            return;
+                        }
+                        // Frame-matched placements are skipped natively, so
+                        // this is a cheap no-op when nothing drifted; when the
+                        // Space switch stranded the bar, the window is visible
+                        // now and the correction slides in animated.
+                        let _ = audio_widget_reposition_stored_bottom_bar_for(&occlusion_app, true);
+                    });
+                },
+            );
+            let occlusion_token = unsafe {
+                app_center.addObserverForName_object_queue_usingBlock(
+                    Some(objc2_app_kit::NSWindowDidChangeOcclusionStateNotification),
+                    None,
+                    None,
+                    &occlusion_block,
+                )
+            };
             // The observer lives for the app's lifetime.
             std::mem::forget(active_space_token);
             std::mem::forget(active_app_token);
@@ -5520,6 +5593,7 @@ fn register_audio_widget_space_change_observer(app: &AppHandle) {
             std::mem::forget(launch_app_token);
             std::mem::forget(terminate_app_token);
             std::mem::forget(screen_parameters_token);
+            std::mem::forget(occlusion_token);
             log_audio_widget_bottom_bar_debug_snapshot_on_main_thread(
                 &app_handle,
                 "audio.widget.bottom_bar.observer.registered",
@@ -6106,7 +6180,15 @@ fn audio_widget_queue_stored_bottom_bar_position(
         let current_generation = AUDIO_WIDGET_BOTTOM_BAR_PLACEMENT_GENERATION.load(Ordering::Acquire);
         let current_invalidation_generation =
             AUDIO_WIDGET_BOTTOM_BAR_INVALIDATION_GENERATION.load(Ordering::Acquire);
-        if audio_widget_bottom_bar_generation_is_stale(generation, current_generation)
+        // Command-priority staleness only applies to delayed/stored
+        // repositions. A SpaceChanged placement describes state NEWER than
+        // any command that raced the schedule→main-thread hop (commands that
+        // land after us still win — they run later on this same thread), so
+        // retiring it here left the bar stranded wherever the Space switch
+        // interrupted it.
+        let placement_stale = !matches!(reason, AudioWidgetBottomBarPlacementReason::SpaceChanged)
+            && audio_widget_bottom_bar_generation_is_stale(generation, current_generation);
+        if placement_stale
             || audio_widget_bottom_bar_generation_is_stale(
                 invalidation_generation,
                 current_invalidation_generation,

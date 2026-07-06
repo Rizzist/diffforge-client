@@ -177,6 +177,9 @@ fn toggle_activity_overlay_for(app: &AppHandle) -> Result<ActivityOverlayVisibil
 }
 
 fn register_activity_overlay_shortcut(app: &AppHandle) {
+    if crate::daemon_mode_active() {
+        return;
+    }
     let shortcut = Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
     let result = app.global_shortcut().on_shortcut(shortcut, |app, _shortcut, event| {
         if event.state == ShortcutState::Pressed {

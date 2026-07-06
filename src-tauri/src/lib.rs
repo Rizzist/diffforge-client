@@ -306,6 +306,8 @@ const WHISPER_MODEL_OPTIONS: &[WhisperModelDefinition] = &[
     },
 ];
 static APP_PANIC_LOG_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+static DAEMON_MODE: AtomicBool = AtomicBool::new(false);
+static DAEMON_LOCK_PATH: OnceLock<PathBuf> = OnceLock::new();
 static APP_CLOSE_SHUTDOWN_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 static APP_CLOSE_FORCE_EXIT_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static APP_CLOSE_FORCE_EXIT_STARTED: AtomicBool = AtomicBool::new(false);
@@ -410,6 +412,14 @@ static MAIN_WINDOW_RESTORE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static MAIN_WINDOW_MINIMIZE_REQUESTED_AT_MS: AtomicU64 = AtomicU64::new(0);
 static MAIN_WINDOW_CURSOR_WATCHER_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+pub fn daemon_mode_active() -> bool {
+    DAEMON_MODE.load(Ordering::Relaxed)
+}
+
+fn set_daemon_mode_active(active: bool) {
+    DAEMON_MODE.store(active, Ordering::Relaxed);
+}
 
 #[cfg(windows)]
 const WINDOWS_APP_ICON_RESOURCE_ID: u16 = 32512;
@@ -3505,6 +3515,7 @@ fn schedule_app_exit_after_terminal_shutdown(
             thread::sleep(Duration::from_millis(APP_CLOSE_EXIT_REQUEST_DELAY_MS));
             let _ = close_workspace_webviews(&app_for_exit);
             cleanup_windows_headless_console_hosts();
+            daemon_lockfile_remove_current();
             app_for_exit.exit(0);
 
             thread::sleep(Duration::from_millis(APP_CLOSE_DESTROY_FALLBACK_DELAY_MS));
@@ -3558,6 +3569,7 @@ fn run_app_force_exit_tail(app_for_exit: AppHandle, window_label: Option<String>
     let _ = close_workspace_webviews(&app_for_exit);
     advance_app_shutdown_phase(APP_SHUTDOWN_PHASE_EXITING);
     cleanup_windows_headless_console_hosts();
+    daemon_lockfile_remove_current();
     app_for_exit.exit(0);
 
     thread::sleep(Duration::from_millis(APP_CLOSE_DESTROY_FALLBACK_DELAY_MS));
@@ -6775,12 +6787,18 @@ fn startup_settings_state_value(
 }
 
 fn startup_autostart_is_enabled(app: &AppHandle) -> Result<bool, String> {
+    if daemon_mode_active() {
+        return Ok(false);
+    }
     app.autolaunch()
         .is_enabled()
         .map_err(|error| format!("Unable to read startup registration: {error}"))
 }
 
 fn startup_apply_autostart(app: &AppHandle, enabled: bool) -> Result<(), String> {
+    if daemon_mode_active() {
+        return Ok(());
+    }
     let autostart = app.autolaunch();
     if enabled {
         autostart
@@ -7417,13 +7435,266 @@ fn restore_main_window_after_reopen(app: AppHandle, has_visible_windows: bool) {
     });
 }
 
+fn daemon_lockfile_path() -> Result<PathBuf, String> {
+    let state_dir = cloud_mcp_native_data_root()
+        .ok_or_else(|| "Unable to resolve Diff Forge device data directory.".to_string())?
+        .join(DEVICE_APP_STATE_DIR);
+    fs::create_dir_all(&state_dir)
+        .map_err(|error| format!("Unable to create daemon state directory: {error}"))?;
+    Ok(state_dir.join("daemon.lock"))
+}
+
+fn daemon_lockfile_pid(path: &Path) -> Option<u32> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok())
+}
+
+// Only removes the lockfile while it still names this process: a SIGTERM'd
+// daemon lingers for seconds in the force-exit fallback delays, long enough
+// for a supervisor to start a successor that owns a fresh lock.
+fn daemon_lockfile_remove_current() {
+    if let Some(path) = DAEMON_LOCK_PATH.get() {
+        if daemon_lockfile_pid(path) == Some(std::process::id()) {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+fn daemon_process_identity_refresh_kind() -> sysinfo::ProcessRefreshKind {
+    // Plain refresh_processes does NOT fetch cmd/exe in sysinfo 0.39 —
+    // identity checks silently see cmd=[] without these update kinds.
+    sysinfo::ProcessRefreshKind::nothing()
+        .with_cmd(sysinfo::UpdateKind::Always)
+        .with_exe(sysinfo::UpdateKind::Always)
+        .without_tasks()
+}
+
+// A live pid alone is not enough: after a crash leaves a stale lock, the OS
+// can recycle that pid onto an unrelated process and lock the daemon out
+// forever. The lock holder must also look like a diffforge daemon process —
+// but when identity CANNOT be determined, a live pid counts as a live daemon:
+// mutual exclusion is the invariant, pid-reuse recovery the convenience.
+fn daemon_pid_is_live_daemon(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return false;
+    }
+    let sys_pid = sysinfo::Pid::from_u32(pid);
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::Some(&[sys_pid]),
+        true,
+        daemon_process_identity_refresh_kind(),
+    );
+    let Some(process) = system.process(sys_pid) else {
+        return false;
+    };
+    let current_exe_name = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.file_name().map(|name| name.to_os_string()));
+    if let (Some(current), Some(exe)) = (current_exe_name.as_deref(), process.exe()) {
+        if let Some(exe_name) = exe.file_name() {
+            if exe_name != current {
+                return false;
+            }
+        }
+    }
+    let cmd = process.cmd();
+    if cmd.is_empty() {
+        return true;
+    }
+    cmd.iter()
+        .skip(1)
+        .any(|arg| arg.to_string_lossy() == "daemon")
+}
+
+fn daemon_lockfile_acquire() -> Result<PathBuf, String> {
+    let path = daemon_lockfile_path()?;
+    // At most one stale-lock removal, then a read-back ownership check: two
+    // daemons racing the same stale lock can otherwise both pass create_new
+    // (the loser's remove_file deletes the winner's fresh lock).
+    for attempt in 0..2 {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut file) => {
+                if let Err(error) = writeln!(file, "{}", std::process::id()) {
+                    let _ = fs::remove_file(&path);
+                    return Err(format!("Unable to write daemon lockfile: {error}"));
+                }
+                drop(file);
+                thread::sleep(Duration::from_millis(50));
+                if daemon_lockfile_pid(&path) != Some(std::process::id()) {
+                    return Err(format!(
+                        "diffforge daemon lost a startup race for {}; another daemon is starting.",
+                        path.display()
+                    ));
+                }
+                let _ = DAEMON_LOCK_PATH.set(path.clone());
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Some(pid) = daemon_lockfile_pid(&path) {
+                    if daemon_pid_is_live_daemon(pid) {
+                        return Err(format!(
+                            "diffforge daemon is already running with pid {pid} ({})",
+                            path.display()
+                        ));
+                    }
+                }
+                if attempt > 0 {
+                    return Err(format!(
+                        "diffforge daemon could not acquire {}; another daemon is starting.",
+                        path.display()
+                    ));
+                }
+                fs::remove_file(&path)
+                    .map_err(|error| format!("Unable to remove stale daemon lockfile: {error}"))?;
+            }
+            Err(error) => {
+                return Err(format!("Unable to create daemon lockfile: {error}"));
+            }
+        }
+    }
+    Err(format!(
+        "diffforge daemon could not acquire {}.",
+        path.display()
+    ))
+}
+
+// Same device identity, shared SQLite/PTY/MCP state: a daemon running next
+// to the desktop app will claim cloud remote commands the GUI could have
+// executed and answer them "blocked". Warn loudly; BYOC boxes have no GUI.
+fn daemon_warn_if_gui_instance_running() {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(exe_name) = current_exe.file_name().map(|name| name.to_os_string()) else {
+        return;
+    };
+    let mut system = sysinfo::System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        daemon_process_identity_refresh_kind(),
+    );
+    let current_pid = std::process::id();
+    for process in system.processes().values() {
+        if process.pid().as_u32() == current_pid {
+            continue;
+        }
+        let exe_matches = process
+            .exe()
+            .map(|exe| exe.file_name() == Some(exe_name.as_os_str()))
+            .unwrap_or(false);
+        if !exe_matches {
+            continue;
+        }
+        // GUI = plain launch or --background-startup; every other subcommand
+        // (daemon, auth, the --*-mcp/helper family) is windowless. Empty cmd
+        // means the args could not be read — skip rather than misclassify.
+        let cmd = process.cmd();
+        if cmd.is_empty() {
+            continue;
+        }
+        let first_arg = cmd
+            .get(1)
+            .map(|arg| arg.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let is_gui_instance = first_arg.is_empty()
+            || first_arg == STARTUP_BACKGROUND_ARG
+            || !(first_arg.starts_with("--") || first_arg == "daemon" || first_arg == "auth");
+        if is_gui_instance {
+            eprintln!(
+                "diffforge daemon: WARNING — the Diff Forge desktop app appears to be running (pid {}). Both processes share this device's identity; cloud remote commands may be claimed by the daemon and answered \"blocked\" instead of reaching the app.",
+                process.pid().as_u32()
+            );
+            return;
+        }
+    }
+}
+
+fn daemon_spawn_signal_handler(app: AppHandle) {
+    #[cfg(unix)]
+    async fn daemon_wait_for_shutdown_signal(sigterm: &mut Option<tokio::signal::unix::Signal>) {
+        if let Some(sigterm) = sigterm.as_mut() {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {}
+                _ = sigterm.recv() => {}
+            }
+        } else {
+            let _ = tokio::signal::ctrl_c().await;
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn daemon_wait_for_shutdown_signal(_sigterm: &mut Option<()>) {
+        let _ = tokio::signal::ctrl_c().await;
+    }
+
+    tauri::async_runtime::spawn(async move {
+        #[cfg(unix)]
+        let mut sigterm =
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                Ok(stream) => Some(stream),
+                Err(error) => {
+                    eprintln!("diffforge daemon: unable to register SIGTERM handler: {error}");
+                    None
+                }
+            };
+        #[cfg(not(unix))]
+        let mut sigterm: Option<()> = None;
+
+        daemon_wait_for_shutdown_signal(&mut sigterm).await;
+        eprintln!("diffforge daemon: shutdown signal received");
+        let _ = start_backend_app_shutdown(app.clone(), "main".to_string());
+        app.exit(0);
+
+        // A second signal must still work when the graceful path hangs:
+        // release the lock (ownership-checked) and hard-exit.
+        daemon_wait_for_shutdown_signal(&mut sigterm).await;
+        eprintln!("diffforge daemon: second shutdown signal received, forcing exit");
+        daemon_lockfile_remove_current();
+        std::process::exit(130);
+    });
+}
+
 pub fn run() {
+    run_app(false)
+}
+
+pub fn run_daemon() {
+    set_daemon_mode_active(true);
+    run_app(true)
+}
+
+fn run_app(daemon: bool) {
+    set_daemon_mode_active(daemon);
     configure_windows_process_error_mode();
     configure_safe_process_current_directory();
     install_app_panic_log_hook();
 
     let startup_args = env::args().collect::<Vec<_>>();
     let background_startup_requested = startup_args_request_background(&startup_args);
+    let daemon_lock_path = if daemon {
+        match daemon_lockfile_acquire() {
+            Ok(path) => {
+                daemon_warn_if_gui_instance_running();
+                Some(path)
+            }
+            Err(error) => {
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        None
+    };
     let mut builder = tauri::Builder::default();
     let pty_pool = Arc::new(PtyPool::new());
     log_terminal_crash_forensics_event(
@@ -7466,21 +7737,23 @@ pub fn run() {
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
-        builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            let deep_link_urls = deep_link_urls_from_args(&argv);
-            let background_startup = startup_args_request_background(&argv);
+        if !daemon {
+            builder = builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+                let deep_link_urls = deep_link_urls_from_args(&argv);
+                let background_startup = startup_args_request_background(&argv);
 
-            if background_startup && deep_link_urls.is_empty() {
-                app_enter_background_internal(app);
-            } else {
-                present_main_window(app);
-            }
+                if background_startup && deep_link_urls.is_empty() {
+                    app_enter_background_internal(app);
+                } else {
+                    present_main_window(app);
+                }
 
-            emit_deep_link_urls(app, deep_link_urls);
-        }));
+                emit_deep_link_urls(app, deep_link_urls);
+            }));
+        }
     }
 
-    builder
+    builder = builder
         .manage(TerminalState {
             terminals: Arc::new(RwLock::new(HashMap::new())),
             terminal_input_queues: Arc::new(StdMutex::new(HashMap::new())),
@@ -7527,17 +7800,35 @@ pub fn run() {
             local_whisper_partial_generation: Arc::new(AtomicU64::new(0)),
         })
         .manage(VmSandboxState::default())
-        .manage(SnippingState::new())
-        .plugin(tauri_plugin_autostart::init(
-            MacosLauncher::LaunchAgent,
-            Some(vec![STARTUP_BACKGROUND_ARG]),
-        ))
-        .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
-        .plugin(tauri_plugin_notification::init())
-        .plugin(tauri_plugin_opener::init())
+        .manage(SnippingState::new());
+
+    if !daemon {
+        builder = builder
+            .plugin(tauri_plugin_autostart::init(
+                MacosLauncher::LaunchAgent,
+                Some(vec![STARTUP_BACKGROUND_ARG]),
+            ))
+            .plugin(tauri_plugin_deep_link::init())
+            .plugin(tauri_plugin_dialog::init())
+            .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+            .plugin(tauri_plugin_notification::init())
+            .plugin(tauri_plugin_opener::init());
+    }
+
+    let daemon_lock_path_for_setup = daemon_lock_path.clone();
+    let daemon_lock_path_for_run = daemon_lock_path.clone();
+    let mut context = tauri::generate_context!();
+    if daemon {
+        context.config_mut().app.windows.clear();
+    }
+
+    let mut app = builder
         .setup(move |app| {
+            if daemon {
+                #[cfg(target_os = "macos")]
+                app.set_activation_policy(tauri::ActivationPolicy::Prohibited);
+                daemon_spawn_signal_handler(app.handle().clone());
+            }
             pty_pool.ensure_warm_async();
             startup_settings_initialize(app.handle());
             tray_click_settings_initialize(app.handle());
@@ -7558,11 +7849,20 @@ pub fn run() {
                 // Restore the persisted desktop session before the first
                 // connect so cloud auth comes up without waiting for the
                 // webview (background-capable startup).
-                let _restored_auth = desktop_auth_restore_cloud_session_for_startup(
+                let restored_auth = desktop_auth_restore_cloud_session_for_startup(
                     &cloud_mcp_app,
                     &cloud_mcp_state,
                 )
                 .await;
+                if daemon {
+                    if restored_auth {
+                        eprintln!("diffforge daemon: cloud session restored");
+                    } else {
+                        eprintln!(
+                            "diffforge daemon: no cloud session -- run 'diff-forge auth login' on this machine"
+                        );
+                    }
+                }
                 let cloud_connected = cloud_mcp_connect_state(&cloud_mcp_state).await.is_ok();
                 if cloud_connected
                     && env::var_os("DIFFFORGE_PREWARM_CLOUD_VOICE_ON_STARTUP").is_some()
@@ -7601,7 +7901,9 @@ pub fn run() {
             // Always-present tray: left-click behavior is driven by the
             // persisted tray-click settings seeded above.
             // (Setup runs on the main thread, which NSStatusItem requires.)
-            background_tray_create(app.handle());
+            if !daemon {
+                background_tray_create(app.handle());
+            }
             todo_store_orphan_sweep_start(app.handle().clone());
             agent_accounts_capture_watch_start(app.handle().clone());
             // Startup todo recovery is bounded, not destructive: queued work
@@ -7612,38 +7914,63 @@ pub fn run() {
             register_terminal_input_event_listener(app);
             register_terminal_coordination_event_bridge(app);
 
-            register_audio_shortcuts(app.handle());
-            register_snipping_shortcuts(app.handle());
-            if SNIPPING_STARTUP_PREWARM_ENABLED {
-                prewarm_snipping_overlay_window(app.handle());
+            if !daemon {
+                register_audio_shortcuts(app.handle());
+                register_snipping_shortcuts(app.handle());
+                if SNIPPING_STARTUP_PREWARM_ENABLED {
+                    prewarm_snipping_overlay_window(app.handle());
+                }
+                register_activity_overlay_shortcut(app.handle());
             }
-            register_activity_overlay_shortcut(app.handle());
 
             #[cfg(any(windows, target_os = "linux"))]
             {
-                use tauri_plugin_deep_link::DeepLinkExt;
-                app.deep_link().register_all()?;
+                if !daemon {
+                    use tauri_plugin_deep_link::DeepLinkExt;
+                    app.deep_link().register_all()?;
+                }
             }
 
             #[cfg(windows)]
             {
-                if let Some(window) = app.get_window("main") {
-                    if let Ok(hwnd) = window.hwnd() {
-                        pin_windows_hang_icon(hwnd.0);
+                if !daemon {
+                    if let Some(window) = app.get_window("main") {
+                        if let Ok(hwnd) = window.hwnd() {
+                            pin_windows_hang_icon(hwnd.0);
+                        }
                     }
                 }
             }
 
             #[cfg(target_os = "macos")]
             {
-                if let Some(window) = app.get_window("main") {
-                    let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
-                    main_window_apply_macos_mouse_moved_style(&window);
+                if !daemon {
+                    if let Some(window) = app.get_window("main") {
+                        let _ = window.set_background_color(Some(Color(0, 0, 0, 0)));
+                        main_window_apply_macos_mouse_moved_style(&window);
+                    }
                 }
             }
-            start_main_window_cursor_watcher(app.handle());
-            if background_startup_requested {
-                app_enter_background_internal(app.handle());
+            if !daemon {
+                start_main_window_cursor_watcher(app.handle());
+                if background_startup_requested {
+                    app_enter_background_internal(app.handle());
+                }
+            }
+
+            if daemon {
+                let lock_path = daemon_lock_path_for_setup
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default();
+                eprintln!("diffforge daemon: services started (pid {})", std::process::id());
+                log_terminal_crash_forensics_event(
+                    "backend.daemon_ready",
+                    json!({
+                        "pid": std::process::id(),
+                        "lock_path": lock_path,
+                    }),
+                );
             }
 
             Ok(())
@@ -8173,37 +8500,50 @@ pub fn run() {
             close_app_after_terminal_shutdown,
             app_force_exit_now
         ])
-        .build(tauri::generate_context!())
-        .expect("error while building Diff Forge AI desktop")
-        .run(|app, event| {
-            if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
-                let phase = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
+        .build(context)
+        .expect("error while building Diff Forge AI desktop");
 
-                if phase == APP_SHUTDOWN_PHASE_RUNNING {
-                    api.prevent_exit();
-                    let _ = start_backend_app_shutdown(app.clone(), "main".to_string());
-                    return;
-                }
+    app.run(move |app, event| {
+        if let tauri::RunEvent::ExitRequested { ref api, .. } = event {
+            let phase = APP_SHUTDOWN_PHASE.load(Ordering::Acquire);
 
-                if phase < APP_SHUTDOWN_PHASE_EXITING {
-                    api.prevent_exit();
-                    let _ = start_backend_app_shutdown(app.clone(), "main".to_string());
-                    return;
-                }
-
-                cleanup_windows_headless_console_hosts();
+            if phase == APP_SHUTDOWN_PHASE_RUNNING {
+                api.prevent_exit();
+                let _ = start_backend_app_shutdown(app.clone(), "main".to_string());
+                return;
             }
 
-            #[cfg(not(target_os = "macos"))]
-            let _ = app;
-
-            #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen {
-                has_visible_windows: _,
-                ..
-            } = event
-            {
-                present_main_window(app);
+            if phase < APP_SHUTDOWN_PHASE_EXITING {
+                api.prevent_exit();
+                let _ = start_backend_app_shutdown(app.clone(), "main".to_string());
+                return;
             }
-        });
+
+            cleanup_windows_headless_console_hosts();
+        }
+
+        if daemon {
+            if let tauri::RunEvent::Exit = event {
+                if let Some(path) = daemon_lock_path_for_run.as_ref() {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        let _ = app;
+
+        #[cfg(target_os = "macos")]
+        {
+            if !daemon {
+                if let tauri::RunEvent::Reopen {
+                    has_visible_windows: _,
+                    ..
+                } = event
+                {
+                    present_main_window(app);
+                }
+            }
+        }
+    });
 }

@@ -66,6 +66,9 @@ fn diffforge_native_notify(
     urgency: NativeNotificationUrgency,
     suppress_when_focused: bool,
 ) -> Result<(), String> {
+    if crate::daemon_mode_active() {
+        return Ok(());
+    }
     let title = title.trim();
     if title.is_empty() {
         return Err("Native notification title is empty.".to_string());

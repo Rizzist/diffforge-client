@@ -28866,7 +28866,7 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [activateWorkspace, logWorkspaceActivationTrace, workspacePendingActivationId]);
 
-  const deleteWorkspaceFromForge = useCallback(async (workspaceId) => {
+  const deleteWorkspaceFromForge = useCallback(async (workspaceId, options = {}) => {
     const targetWorkspaceId = String(workspaceId || "").trim();
     const targetWorkspace = findWorkspaceById(workspaceCatalogRef.current, targetWorkspaceId)
       || findWorkspaceById(workspacesRef.current, targetWorkspaceId);
@@ -28874,13 +28874,13 @@ export default function App() {
     if (!targetWorkspaceId || !targetWorkspace) {
       setWorkspaceSettingsError("Choose a workspace before deleting it.");
       setWorkspaceError("Choose a workspace before deleting it.");
-      return;
+      return false;
     }
 
     if (workspaceDeactivationInFlightRef.current || workspaceSettingsState === "deleting") {
       setWorkspaceSettingsError("Workspace delete is already running.");
       setWorkspaceError("Workspace delete is already running.");
-      return;
+      return false;
     }
 
     const workspaceName = String(targetWorkspace.name || targetWorkspaceId).trim();
@@ -28892,15 +28892,18 @@ export default function App() {
     if (!repoPath) {
       setWorkspaceSettingsError("Workspace root is missing. Choose a root before deleting this workspace.");
       setWorkspaceError("Workspace root is missing. Choose a root before deleting this workspace.");
-      return;
+      return false;
     }
 
-    if (workspaceDeleteConfirmId !== targetWorkspaceId) {
+    // Remote/API deletes pass skipConfirm — the API key's workspaces:write
+    // scope is the authorization; the two-click confirm is a pointer-slip
+    // guard for the local UI only.
+    if (!options.skipConfirm && workspaceDeleteConfirmId !== targetWorkspaceId) {
       setWorkspaceDeleteConfirmId(targetWorkspaceId);
       setWorkspaceSettingsError("");
       setWorkspaceError("");
       setWorkspaceSettingsMessage(`Click "Confirm delete" to remove "${workspaceName}" from Diff Forge. Project files stay on disk.`);
-      return;
+      return false;
     }
 
     setWorkspaceSettingsState("deleting");
@@ -29076,6 +29079,7 @@ export default function App() {
     })();
 
     setWorkspaceSettingsState("idle");
+    return true;
   }, [
     activeAccountScopeKey,
     clearPreparedWorkspaceTerminals,
@@ -40009,6 +40013,119 @@ export default function App() {
         });
         return;
       }
+      if (["workspace_create", "create_workspace"].includes(normalizedKind)) {
+        const requestedName = remoteCommandStringField(event, [
+          "workspace_name",
+          "workspaceName",
+          "name",
+        ]);
+        const requestedRoot = cleanWorkspaceRootDirectory(remoteCommandStringField(event, [
+          "workspace_root",
+          "workspaceRoot",
+          "root_directory",
+          "rootDirectory",
+          "root",
+        ]));
+        if (!requestedName || requestedName.length > 80) {
+          await recordRemoteCommandStatus(event, "failed", "Workspace create needs a workspace_name of 80 characters or fewer.", {
+            commandId,
+            commandKind,
+          });
+          return;
+        }
+        if (!requestedRoot || requestedRoot.length > MAX_WORKSPACE_ROOT_DIRECTORY_LENGTH) {
+          await recordRemoteCommandStatus(event, "failed", "Workspace create needs a valid workspace_root directory path.", {
+            commandId,
+            commandKind,
+          });
+          return;
+        }
+        try {
+          const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRoot });
+          const rootDirectory = normalizedRoot?.workingDirectory || "";
+          if (!rootDirectory) {
+            throw new Error("Workspace root directory was not returned by validation.");
+          }
+          const rootIdentity = normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory);
+          const rootGitRepository = Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository);
+          const duplicateWorkspace = findWorkspaceByEffectiveRoot(
+            workspaceCatalogRef.current,
+            workspaceSettingsRef.current,
+            rootDirectory,
+            defaultWorkingDirectoryRef.current,
+          );
+          if (duplicateWorkspace) {
+            await recordRemoteCommandStatus(event, "failed", `That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`, {
+              commandId,
+              commandKind,
+              duplicateWorkspaceId: duplicateWorkspace.id,
+            });
+            return;
+          }
+          // Mirror the local-first create: revive a tombstoned id for a folder
+          // that previously hosted a workspace so settings/threads re-link.
+          let revivedWorkspaceId = "";
+          try {
+            revivedWorkspaceId = String(await invoke("local_workspace_reusable_id_for_root", {
+              scopeKey: activeAccountScopeKey,
+              rootPath: rootDirectory,
+            }) || "").trim();
+          } catch {
+            // Reviving is best-effort; a fresh id is always safe.
+          }
+          const nowIso = new Date().toISOString();
+          const workspace = {
+            id: revivedWorkspaceId || mintLocalWorkspaceId(),
+            name: requestedName,
+            createdAt: nowIso,
+            updatedAt: nowIso,
+            rootDirectory,
+            rootIdentity,
+            localArchived: false,
+            localArchivedAt: "",
+            syncState: "pending",
+          };
+          const existingCatalog = Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [];
+          const nextCatalog = updateCatalogWorkspace(existingCatalog, workspace);
+          const nextWorkspaces = visibleWorkspaceCatalog(nextCatalog);
+          const nextWorkspaceSettings = updateWorkspaceLocalSettings(workspaceSettingsRef.current, workspace.id, {
+            rootDirectory,
+            rootWasEmptyAtSelection: Boolean(normalizedRoot?.emptyDirectory),
+            rootGitRepository,
+          });
+          workspaceSettingsRef.current = nextWorkspaceSettings;
+          persistWorkspaceSettings(nextWorkspaceSettings);
+          setWorkspaceSettings(nextWorkspaceSettings);
+          workspaceCatalogRef.current = nextCatalog;
+          setWorkspaceCatalog(nextCatalog);
+          workspacesRef.current = nextWorkspaces;
+          setWorkspaces(nextWorkspaces);
+          void invoke("local_workspaces_store", {
+            scopeKey: activeAccountScopeKey,
+            workspaces: nextCatalog,
+          }).catch(() => {});
+          void invoke("coordination_bootstrap_workspace", {
+            repoPath: rootDirectory,
+            agentSessionMode: normalizeAgentSessionMode(AGENT_SESSION_MODE_COORDINATED, false, rootGitRepository),
+          }).catch(() => {});
+          // Registered but not runtime-enabled and not selected: an API create
+          // must not yank the desktop UI; the activate action does that.
+          await syncRemoteControlState("remote_workspace_create");
+          await recordRemoteCommandStatus(event, "completed", `Workspace "${requestedName}" created on this desktop.`, {
+            commandId,
+            commandKind,
+            workspaceId: workspace.id,
+            workspaceRoot: rootDirectory,
+            revived: Boolean(revivedWorkspaceId),
+          });
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Unable to create the workspace on this desktop."), {
+            commandId,
+            commandKind,
+          });
+        }
+        return;
+      }
 	      if (!targetWorkspace) {
 	        await recordRemoteCommandStatus(event, "failed", "Workspace is not available on this desktop.", {
 	          commandId,
@@ -40270,6 +40387,207 @@ export default function App() {
           "Workspace activation and selection synced from this desktop.",
           lifecycleDetails,
         );
+        return;
+      }
+      if (["workspace_delete", "delete_workspace"].includes(normalizedKind)) {
+        const { blockers, terminals } = collectRemoteControlWorkspaceBlockers(workspaceId);
+        if (blockers.length > 0) {
+          await recordRemoteCommandStatus(event, "blocked", "Workspace still has non-idle terminals, so it was not deleted.", {
+            blockers,
+            commandId,
+            commandKind,
+            terminalCount: terminals.length,
+            workspaceId,
+          });
+          return;
+        }
+        await recordRemoteCommandStatus(event, "running", "Workspace is being deleted on this desktop.", {
+          commandId,
+          commandKind,
+          workspaceId,
+        });
+        const deleted = await deleteWorkspaceFromForge(workspaceId, { skipConfirm: true });
+        if (!deleted || findWorkspaceById(workspaceCatalogRef.current, workspaceId)) {
+          await recordRemoteCommandStatus(event, "failed", "Workspace delete did not complete on this desktop.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        await syncRemoteControlState("remote_workspace_delete");
+        await recordRemoteCommandStatus(event, "completed", `Workspace "${targetWorkspace.name || workspaceId}" deleted from Diff Forge; project files stay on disk.`, {
+          commandId,
+          commandKind,
+          workspaceId,
+        });
+        return;
+      }
+      if ([
+        "workspace_settings_update",
+        "workspace_settings",
+        "update_workspace_settings",
+      ].includes(normalizedKind)) {
+        const payload = event?.payload && typeof event.payload === "object" ? event.payload : {};
+        const request = event?.request && typeof event.request === "object" ? event.request : {};
+        const settingsInput = [event?.settings, payload.settings, request.settings]
+          .find((value) => value && typeof value === "object") || null;
+        if (!settingsInput) {
+          await recordRemoteCommandStatus(event, "failed", "Workspace settings update did not include a settings object.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        const requestedName = String(settingsInput.workspace_name ?? settingsInput.workspaceName ?? settingsInput.name ?? "").trim();
+        const requestedRootInput = String(
+          settingsInput.workspace_root ?? settingsInput.workspaceRoot
+            ?? settingsInput.root_directory ?? settingsInput.rootDirectory ?? "",
+        ).trim();
+        const requestedTerminalCountInput = settingsInput.terminal_count ?? settingsInput.terminalCount;
+        const wantsTerminalCount = requestedTerminalCountInput !== undefined && requestedTerminalCountInput !== null;
+        if (!requestedName && !requestedRootInput && !wantsTerminalCount) {
+          await recordRemoteCommandStatus(event, "failed", "Workspace settings update supports workspace_name, workspace_root, and terminal_count; none were provided.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        // Root and terminal-count changes rewire live panes/PTYs; the local
+        // settings panel runs a full slot reconciliation for that. Remotely we
+        // only apply them to deactivated workspaces, where activation rebuilds
+        // the grid from settings anyway.
+        const runtimeActive = normalizeEnabledWorkspaceIds(workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds).includes(workspaceId)
+          || activatedWorkspaceIdRef.current === workspaceId;
+        if ((requestedRootInput || wantsTerminalCount) && runtimeActive) {
+          await recordRemoteCommandStatus(event, "blocked", "Deactivate the workspace before changing its root or terminal count remotely; only workspace_name can change while it is active.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        if (requestedName && requestedName.length > 80) {
+          await recordRemoteCommandStatus(event, "failed", "Workspace name must be 80 characters or fewer.", {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        const requestedTerminalCount = wantsTerminalCount
+          ? Number.parseInt(String(requestedTerminalCountInput), 10)
+          : null;
+        if (wantsTerminalCount
+          && (!Number.isInteger(requestedTerminalCount)
+            || requestedTerminalCount < 1
+            || requestedTerminalCount > MAX_WORKSPACE_TERMINAL_COUNT)) {
+          await recordRemoteCommandStatus(event, "failed", `terminal_count must be an integer between 1 and ${MAX_WORKSPACE_TERMINAL_COUNT}.`, {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+          return;
+        }
+        try {
+          const appliedSettings = {};
+          let nextSettingsValues = null;
+          let catalogPatch = null;
+          if (requestedRootInput) {
+            const normalizedRoot = await invoke("validate_workspace_root_directory", { path: requestedRootInput });
+            const rootDirectory = normalizedRoot?.workingDirectory || "";
+            if (!rootDirectory) {
+              throw new Error("Workspace root directory was not returned by validation.");
+            }
+            const duplicateWorkspace = findWorkspaceByEffectiveRoot(
+              workspaceCatalogRef.current,
+              workspaceSettingsRef.current,
+              rootDirectory,
+              defaultWorkingDirectoryRef.current,
+              workspaceId,
+            );
+            if (duplicateWorkspace) {
+              await recordRemoteCommandStatus(event, "failed", `That folder is already attached to ${duplicateWorkspace.name || "another workspace"}.`, {
+                commandId,
+                commandKind,
+                duplicateWorkspaceId: duplicateWorkspace.id,
+                workspaceId,
+              });
+              return;
+            }
+            nextSettingsValues = {
+              ...(nextSettingsValues || {}),
+              rootDirectory,
+              rootWasEmptyAtSelection: Boolean(normalizedRoot?.emptyDirectory),
+              rootGitRepository: Boolean(normalizedRoot?.gitRepository || normalizedRoot?.git_repository),
+            };
+            catalogPatch = {
+              ...(catalogPatch || {}),
+              rootDirectory,
+              rootIdentity: normalizedRoot?.rootIdentity || getWorkspaceRootIdentity(rootDirectory),
+            };
+            appliedSettings.workspaceRoot = rootDirectory;
+            void invoke("coordination_bootstrap_workspace", {
+              repoPath: rootDirectory,
+              agentSessionMode: getWorkspaceAgentSessionMode(workspaceSettingsRef.current, workspaceId),
+            }).catch(() => {});
+          }
+          if (wantsTerminalCount) {
+            // Stored count only; activation normalizes roles/slot indexes for
+            // the new count when the workspace next boots.
+            nextSettingsValues = {
+              ...(nextSettingsValues || {}),
+              terminalCount: requestedTerminalCount,
+            };
+            appliedSettings.terminalCount = requestedTerminalCount;
+          }
+          if (requestedName) {
+            catalogPatch = { ...(catalogPatch || {}), name: requestedName };
+            appliedSettings.workspaceName = requestedName;
+          }
+          if (nextSettingsValues) {
+            const nextWorkspaceSettings = updateWorkspaceLocalSettings(
+              workspaceSettingsRef.current,
+              workspaceId,
+              nextSettingsValues,
+            );
+            workspaceSettingsRef.current = nextWorkspaceSettings;
+            persistWorkspaceSettings(nextWorkspaceSettings);
+            setWorkspaceSettings(nextWorkspaceSettings);
+          }
+          if (catalogPatch) {
+            const existingCatalog = Array.isArray(workspaceCatalogRef.current) ? workspaceCatalogRef.current : [];
+            const nextCatalog = updateCatalogWorkspace(existingCatalog, {
+              ...targetWorkspace,
+              ...catalogPatch,
+              updatedAt: new Date().toISOString(),
+            });
+            const nextWorkspaces = visibleWorkspaceCatalog(nextCatalog);
+            workspaceCatalogRef.current = nextCatalog;
+            setWorkspaceCatalog(nextCatalog);
+            workspacesRef.current = nextWorkspaces;
+            setWorkspaces(nextWorkspaces);
+            void invoke("local_workspaces_store", {
+              scopeKey: activeAccountScopeKey,
+              workspaces: nextCatalog,
+            }).catch(() => {});
+          }
+          await syncRemoteControlState("remote_workspace_settings_update");
+          await recordRemoteCommandStatus(event, "completed", "Workspace settings updated on this desktop.", {
+            appliedSettings,
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+        } catch (error) {
+          await recordRemoteCommandStatus(event, "failed", getErrorMessage(error, "Unable to update workspace settings on this desktop."), {
+            commandId,
+            commandKind,
+            workspaceId,
+          });
+        }
         return;
       }
       if ([
@@ -41756,7 +42074,7 @@ export default function App() {
         unlistenDeviceDeleted();
       }
     };
-  }, [activateWorkspace, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, logout, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, showView, syncAgentInstallationsToCloud, workspaces]);
+  }, [activateWorkspace, activeAccountScopeKey, addWorkspaceTerminal, agentStatuses, changeWorkspaceTerminalRole, closeWorkspaceTerminal, deactivateWorkspace, deleteWorkspaceFromForge, logout, manageWorkspaceAgents, refreshAgentStatuses, requestWorkspaceActivation, requestWorkspaceTerminalFocus, showView, syncAgentInstallationsToCloud, workspaces]);
 
   useEffect(() => {
     let disposed = false;

@@ -17996,6 +17996,14 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
             )
             .await;
         }
+        if crate::daemon_mode_active() && (intake_outcome.is_some() || delete_outcome.is_some()) {
+            applied += 1;
+            continue;
+        }
+        if cloud_mcp_apply_daemon_remote_command_guard(state, &event).await {
+            applied += 1;
+            continue;
+        }
         let remote_lever_handled = cloud_mcp_apply_remote_workspace_lever(&app, state, &event)
             || cloud_mcp_apply_remote_terminal_interrupt_lever(&app, state, &event)
             || cloud_mcp_apply_remote_terminal_lever(&app, state, &event)
@@ -18005,7 +18013,25 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
             || cloud_mcp_apply_remote_local_script_lever(&app, state, &event)
             || cloud_mcp_apply_remote_device_lever(&app, state, &event);
         if !remote_lever_handled && !cloud_mcp_remote_command_is_rust_owned(&event) {
-            let _ = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
+            if crate::daemon_mode_active() {
+                let details = json!({
+                    "reason": "daemon_mode",
+                    "daemon_mode": true,
+                    "daemonMode": true,
+                    "command_kind": cloud_mcp_remote_command_kind(&event),
+                    "commandKind": cloud_mcp_remote_command_kind(&event),
+                });
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    state,
+                    &event,
+                    "failed",
+                    "Remote command requires the desktop UI and is unavailable in daemon mode.",
+                    Some(&details),
+                )
+                .await;
+            } else {
+                let _ = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
+            }
         }
         applied += 1;
     }
@@ -19342,6 +19368,83 @@ fn cloud_mcp_remote_command_kind(event: &Value) -> String {
     .replace(['.', ' ', '-'], "_")
 }
 
+fn cloud_mcp_daemon_gui_block_message(command_kind: &str) -> Option<&'static str> {
+    match command_kind {
+        "app_show_window" | "show_window" | "open_app_window" | "app_open_window"
+        | "app_hide_window" | "hide_window" | "app_background" | "hide_app_window" => {
+            Some("Window visibility controls are unavailable in daemon mode.")
+        }
+        // workspace_activate/open_workspace intentionally NOT blocked: the
+        // workspace lever persists pendingActivationWorkspaceId to shared
+        // disk state and answers "queued", so the intent survives a later
+        // GUI launch even when received by the daemon.
+        "app_view_select" | "select_app_view" | "switch_app_view" | "app_navigate"
+        | "app_open_view" | "workspace_select" | "select_workspace" | "switch_workspace"
+        | "workspace_tab_select" | "select_workspace_tab" | "switch_workspace_tab"
+        | "workspace_open_tab" => {
+            Some("Remote navigation controls are unavailable in daemon mode.")
+        }
+        "workspace_panel_close" | "close_workspace_panel" | "panel_close" | "close_panel"
+        | "terminal_window_breakout" | "breakout_terminal" | "breakout_terminals"
+        | "terminal_breakout" | "open_terminal_window" | "terminal_window_open"
+        | "terminal_window_return" | "return_terminal_window" | "return_terminal_to_grid"
+        | "close_terminal_window" | "terminal_window_close" => {
+            Some("Remote panel and window controls are unavailable in daemon mode.")
+        }
+        "terminal_open" | "open_terminal" | "open_terminals" | "terminal_spawn"
+        | "spawn_terminals" | "agent_chat_session_open" | "open_agent_chat_session"
+        | "session_open" | "open_session" | "resume_agent_chat_session" | "resume_session"
+        | "terminal_relaunch_agent" | "relaunch_terminal_agent" | "relaunch_terminal"
+        | "terminal_relaunch" | "terminal_restart" | "terminal_restart_agent"
+        | "restart_terminal" | "restart_terminal_agent" | "terminal_switch_agent"
+        | "switch_terminal_agent" => {
+            Some("Remote terminal foreground controls are unavailable in daemon mode.")
+        }
+        "agent_chat_change_model" | "change_agent_chat_model" | "agent_chat_model_change"
+        | "change_session_model" | "session_model_change" | "agent_chat_change_effort"
+        | "change_agent_chat_effort" | "agent_chat_effort_change"
+        | "change_session_effort" | "session_effort_change" => {
+            Some("Remote live-session configuration is unavailable in daemon mode.")
+        }
+        "todo_requeue" | "requeue_todo" | "todo_retry" | "retry_todo" | "todo_unqueue"
+        | "unqueue_todo" | "workspace_todo_unqueue" | "todo_dequeue" | "dequeue_todo" => {
+            Some("Remote todo queue panel controls are unavailable in daemon mode.")
+        }
+        _ => None,
+    }
+}
+
+async fn cloud_mcp_apply_daemon_remote_command_guard(
+    state: &CloudMcpState,
+    event: &Value,
+) -> bool {
+    if !crate::daemon_mode_active() {
+        return false;
+    }
+    let command_kind = cloud_mcp_remote_command_kind(event);
+    let Some(message) = cloud_mcp_daemon_gui_block_message(command_kind.as_str()) else {
+        return false;
+    };
+    let details = json!({
+        "reason": "daemon_mode",
+        "daemon_mode": true,
+        "daemonMode": true,
+        "requires_gui": true,
+        "requiresGui": true,
+        "command_kind": command_kind.clone(),
+        "commandKind": command_kind,
+    });
+    let _ = cloud_mcp_send_remote_command_status_event(
+        state,
+        event,
+        "blocked",
+        message,
+        Some(&details),
+    )
+    .await;
+    true
+}
+
 fn cloud_mcp_remote_command_is_cancel(event: &Value) -> bool {
     matches!(
         cloud_mcp_remote_command_kind(event).as_str(),
@@ -20140,6 +20243,14 @@ async fn cloud_mcp_start_remote_command_listener(
                 )
                 .await;
             }
+            if crate::daemon_mode_active()
+                && (intake_outcome.is_some() || delete_outcome.is_some())
+            {
+                continue;
+            }
+            if cloud_mcp_apply_daemon_remote_command_guard(&state_clone, &event).await {
+                continue;
+            }
             let remote_lever_handled =
                 cloud_mcp_apply_remote_workspace_lever(&app, &state_clone, &event)
                     || cloud_mcp_apply_remote_terminal_interrupt_lever(&app, &state_clone, &event)
@@ -20150,6 +20261,24 @@ async fn cloud_mcp_start_remote_command_listener(
                     || cloud_mcp_apply_remote_local_script_lever(&app, &state_clone, &event)
                     || cloud_mcp_apply_remote_device_lever(&app, &state_clone, &event);
             if remote_lever_handled || cloud_mcp_remote_command_is_rust_owned(&event) {
+                continue;
+            }
+            if crate::daemon_mode_active() {
+                let details = json!({
+                    "reason": "daemon_mode",
+                    "daemon_mode": true,
+                    "daemonMode": true,
+                    "command_kind": cloud_mcp_remote_command_kind(&event),
+                    "commandKind": cloud_mcp_remote_command_kind(&event),
+                });
+                let _ = cloud_mcp_send_remote_command_status_event(
+                    &state_clone,
+                    &event,
+                    "failed",
+                    "Remote command requires the desktop UI and is unavailable in daemon mode.",
+                    Some(&details),
+                )
+                .await;
                 continue;
             }
             let emit_result = app.emit(CLOUD_MCP_REMOTE_COMMAND_EVENT, event.clone());
@@ -21553,6 +21682,16 @@ fn cloud_mcp_show_native_notification(
     title: &str,
     body: &str,
 ) -> Result<(), String> {
+    // The notification plugin is not registered in daemon mode, so
+    // diffforge_native_notify silently no-ops there. A remote device_notify
+    // must not report "shown" for a notification nobody saw — cloud Web Push
+    // is the daemon-mode notification channel.
+    if crate::daemon_mode_active() {
+        return Err(
+            "Native notifications are unavailable in daemon mode; use web push instead."
+                .to_string(),
+        );
+    }
     diffforge_native_notify(
         app,
         title,

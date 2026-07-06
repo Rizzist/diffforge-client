@@ -1842,6 +1842,9 @@ fn register_snipping_shortcut_handler(
     action: SnippingShortcutAction,
     shortcut_text: &str,
 ) -> Result<(), String> {
+    if crate::daemon_mode_active() {
+        return Ok(());
+    }
     let shortcut = parse_snipping_shortcut(shortcut_text)?;
 
     app.global_shortcut()
@@ -1912,6 +1915,9 @@ fn register_snipping_shortcut_handler(
 }
 
 fn unregister_snipping_shortcut(app: &AppHandle, shortcut_text: &str) {
+    if crate::daemon_mode_active() {
+        return;
+    }
     if let Ok(shortcut) = parse_snipping_shortcut(shortcut_text) {
         let _ = app.global_shortcut().unregister(shortcut);
     }

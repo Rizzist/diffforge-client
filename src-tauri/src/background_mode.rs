@@ -27,6 +27,9 @@ pub(crate) fn app_is_in_background_mode() -> bool {
 /// always on top, hidden from the taskbar/dock, and auto-hiding on focus
 /// loss — a menu-bar dropdown on macOS, an above-tray flyout on Windows.
 fn background_monitor_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
+    if crate::daemon_mode_active() {
+        return None;
+    }
     if let Some(window) = app.get_webview_window(BACKGROUND_MONITOR_WINDOW_LABEL) {
         return Some(window);
     }
@@ -274,6 +277,9 @@ fn background_mode_emit_changed(app: &AppHandle, background: bool) {
 // runtime, so all UI work below is marshalled onto the main thread; the mode
 // flag flips synchronously so toggling stays race-free for callers.
 pub(crate) fn app_enter_background_internal(app: &AppHandle) {
+    if crate::daemon_mode_active() {
+        return;
+    }
     APP_BACKGROUND_MODE.store(true, Ordering::Release);
     let main_app = app.clone();
     let scheduled = app.run_on_main_thread(move || {
@@ -306,6 +312,9 @@ pub(crate) fn app_enter_background_internal(app: &AppHandle) {
 }
 
 pub(crate) fn app_exit_background_internal(app: &AppHandle) {
+    if crate::daemon_mode_active() {
+        return;
+    }
     APP_BACKGROUND_MODE.store(false, Ordering::Release);
     let main_app = app.clone();
     let scheduled = app.run_on_main_thread(move || {
@@ -357,6 +366,9 @@ fn app_background_mode_state() -> Result<Value, String> {
 /// forward on its Audio view.
 #[tauri::command]
 async fn background_monitor_open_activity(app: AppHandle) -> Result<(), String> {
+    if crate::daemon_mode_active() {
+        return Ok(());
+    }
     let main_visible = app
         .get_window("main")
         .map(|main| main.is_visible().unwrap_or(false))
@@ -384,6 +396,9 @@ async fn background_monitor_open_activity(app: AppHandle) -> Result<(), String> 
 /// surface the bar in its place.
 #[tauri::command]
 fn background_monitor_open_snip_strip(app: AppHandle) -> Result<(), String> {
+    if crate::daemon_mode_active() {
+        return Ok(());
+    }
     if let Some(window) = app.get_webview_window(BACKGROUND_MONITOR_WINDOW_LABEL) {
         if window.is_visible().unwrap_or(false) {
             background_monitor_hide_animated(&app, window, false);
@@ -399,6 +414,9 @@ fn background_monitor_open_snip_strip(app: AppHandle) -> Result<(), String> {
 /// Quit routes through the existing graceful-shutdown choreography by
 /// emitting the same close-requested event the window close path uses.
 pub(crate) fn background_tray_create(app: &AppHandle) {
+    if crate::daemon_mode_active() {
+        return;
+    }
     if app.tray_by_id("diffforge-tray").is_some() {
         return;
     }

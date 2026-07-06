@@ -678,6 +678,9 @@ fn escape_scope_trigger_debounced(app: &AppHandle, source: &str) {
 }
 
 fn escape_scope_sync_registration(app: &AppHandle) {
+    if crate::daemon_mode_active() {
+        return;
+    }
     if escape_scope_any_active() {
         if ESCAPE_SCOPE_REGISTERED.swap(true, Ordering::AcqRel) {
             return;
@@ -1103,6 +1106,9 @@ fn register_audio_shortcut_handler(
     action: AudioShortcutAction,
     shortcut_text: &str,
 ) -> Result<(), String> {
+    if crate::daemon_mode_active() {
+        return Ok(());
+    }
     let shortcut = parse_audio_shortcut(shortcut_text)?;
 
     match action {
@@ -1154,6 +1160,9 @@ fn register_audio_shortcut_handler(
 }
 
 fn unregister_audio_shortcut(app: &AppHandle, shortcut_text: &str) {
+    if crate::daemon_mode_active() {
+        return;
+    }
     if audio_shortcut_is_fn_key(shortcut_text) {
         AUDIO_FN_BINDING_ACTIVE.store(false, Ordering::Release);
         log_audio_diagnostic_event(
