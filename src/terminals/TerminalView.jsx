@@ -13709,6 +13709,9 @@ function buildTodoQueueAgentModelCommand(agentId, model, reasoningEffort, curren
 }
 
 function getTodoQueueTargetTerminalName(item) {
+  if (String(item?.targetKind || item?.target_kind || "").trim().toLowerCase() === "swarm") {
+    return "Swarm agents";
+  }
   const queueMeta = getTodoQueueRawQueueMetadata(item);
   const queueTargetExplicit = todoQueueMetadataTargetIsExplicit(queueMeta);
   const directTargetTerminalName = normalizeTodoTerminalName(
@@ -34235,6 +34238,18 @@ function TerminalView({
         targetTerminalId: "",
         targetTerminalIndex: "",
         targetThreadId: "",
+      } : Number.isInteger(overrideTargetTerminalIndex) && String(paneKinds?.[overrideTargetTerminalIndex] || "") === "swarm" ? {
+        targetAgentId: "",
+        targetColorSlot: overrideColorSlot ?? "",
+        targetExplicit: true,
+        targetKind: "swarm",
+        targetRole: "",
+        targetSwarmId: getSwarmPaneSwarmId(item.workspaceId || terminalWorkspace?.id || "", overrideTargetTerminalIndex),
+        targetTerminalColor: terminalColorForSlot(overrideColorSlot ?? overrideTargetTerminalIndex),
+        targetTerminalId: overridePaneId,
+        targetTerminalIndex: overrideTargetTerminalIndex,
+        targetTerminalName: "Swarm agents",
+        targetThreadId: "",
       } : Number.isInteger(overrideTargetTerminalIndex) ? {
         targetAgentId: getTerminalRole(overrideTargetTerminalIndex) || basePendingFields.targetAgentId || "",
         targetColorSlot: overrideColorSlot ?? "",
@@ -34308,6 +34323,7 @@ function TerminalView({
     getTerminalPaneId,
     getTerminalRole,
     getTerminalThread,
+    paneKinds,
     recordVoicePlanTaskStatus,
     setTodoQueueItemPending,
     terminalWorkspace?.id,
@@ -35576,6 +35592,23 @@ function TerminalView({
       return null;
     }
 
+    if (String(paneKinds?.[terminalIndex] || "") === "swarm") {
+      const swarmPaneId = getTerminalPaneId(terminalIndex);
+      const swarmColorSlot = getTerminalAgentColorSlot(terminalIndex);
+      return {
+        explicitTarget: true,
+        targetColorSlot: swarmColorSlot,
+        targetExplicit: true,
+        targetKind: "swarm",
+        targetSwarmId: getSwarmPaneSwarmId(terminalWorkspace?.id || "", terminalIndex),
+        targetTerminalColor: terminalColorForSlot(swarmColorSlot),
+        targetTerminalId: swarmPaneId,
+        targetTerminalIndex: terminalIndex,
+        targetTerminalName: "Swarm agents",
+        userPinnedTarget: true,
+      };
+    }
+
     const paneId = getTerminalPaneId(terminalIndex);
     const targetRole = String(getTerminalRole(terminalIndex) || "").toLowerCase();
     const targetThread = getTerminalThread(terminalIndex);
@@ -35597,6 +35630,8 @@ function TerminalView({
     getTerminalRole,
     getTerminalThread,
     logicalTerminalIndexes,
+    paneKinds,
+    terminalWorkspace?.id,
   ]);
 
   const addWorkspaceToolTodo = useCallback(async (text, { send = false, targetTerminalIndex = null } = {}) => {
@@ -35639,7 +35674,26 @@ function TerminalView({
   const panelAgentPromptTargets = useMemo(() => (
     logicalTerminalIndexes
       .map((terminalIndex) => {
-        if (String(paneKinds?.[terminalIndex] || "").trim()) {
+        const slotPaneKind = String(paneKinds?.[terminalIndex] || "").trim();
+        if (slotPaneKind === "swarm") {
+          const swarmPaneId = getTerminalPaneId(terminalIndex);
+          if (!swarmPaneId) {
+            return null;
+          }
+          const swarmColorSlot = getTerminalAgentColorSlot(terminalIndex);
+          return {
+            color: terminalColorForSlot(swarmColorSlot),
+            id: String(terminalIndex),
+            label: "Swarm agents",
+            paneId: swarmPaneId,
+            role: "swarm",
+            short: "Swarm",
+            swarm: true,
+            terminalIndex,
+            title: `Swarm agents (${swarmPaneId})`,
+          };
+        }
+        if (slotPaneKind) {
           return null;
         }
         const role = resolveTodoQueueTerminalAgentRole(
@@ -38565,6 +38619,9 @@ function TerminalView({
       targetAgentId: fields.targetAgentId || fields.targetRole || "",
       targetColorSlot: fields.targetColorSlot ?? "",
       targetExplicit: true,
+      ...(fields.targetKind ? { targetKind: fields.targetKind } : {}),
+      ...(fields.targetSwarmId ? { targetSwarmId: fields.targetSwarmId } : {}),
+      ...(fields.targetTerminalName ? { targetTerminalName: fields.targetTerminalName } : {}),
       targetTerminalColor: fields.targetTerminalColor || "",
       targetTerminalId: fields.targetTerminalId || fields.paneId || "",
       targetTerminalIndex,
@@ -39521,6 +39578,60 @@ function TerminalView({
         const source = getTodoQueueItemPlanTask(currentDrag)
             ? TODO_QUEUE_SOURCE_VOICE_PLAN
             : "tui-todo-drop";
+        if (String(paneKinds?.[targetTerminalIndex] || "") === "swarm") {
+          // Dropping onto the swarm pane is always a successful targeted queue:
+          // the Rust dispatcher starts a swarm run when the swarm is free and
+          // the receipt settles on run completion, not prompt delivery.
+          const swarmPaneId = getTerminalPaneId(targetTerminalIndex);
+          const swarmColorSlot = getTerminalAgentColorSlot(targetTerminalIndex);
+          const swarmDropFields = {
+            targetAgentId: "",
+            targetColorSlot: swarmColorSlot,
+            targetKind: "swarm",
+            targetSwarmId: getSwarmPaneSwarmId(
+              currentDrag.workspaceId || terminalWorkspace?.id || "",
+              targetTerminalIndex,
+            ),
+            targetTerminalColor: terminalColorForSlot(swarmColorSlot),
+            targetTerminalId: swarmPaneId,
+            targetTerminalIndex,
+            targetTerminalName: "Swarm agents",
+            targetThreadId: "",
+          };
+          updateTodoDragState(null);
+          if (currentDrag.itemId) {
+            setTodoQueueItemPending(currentDrag.itemId, {
+              item: getTodoQueueItemLogSummary([currentDrag])[0] || null,
+              paneId: swarmPaneId,
+              phase: "queued",
+              reason: "todo_swarm_drop_queued",
+              skipCloudSync: true,
+              source,
+              ...swarmDropFields,
+              targetExplicit: true,
+              targetRole: "",
+              workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+            });
+            markTodoDropQueuedInRust(currentDrag, {
+              ...swarmDropFields,
+              paneId: swarmPaneId,
+              reason: "todo_swarm_drop_queued",
+              source,
+              targetRole: "",
+            });
+          }
+          setTodoDropError("");
+          logBigViewSyncDiagnosticEvent("tui.todo.drop_queued_for_swarm", {
+            hasImage: Boolean(getTodoQueueItemImage(currentDrag)),
+            paneId: swarmPaneId,
+            source,
+            surface: "tui_terminal_grid",
+            targetSwarmId: swarmDropFields.targetSwarmId,
+            targetTerminalIndex,
+            workspaceId: currentDrag.workspaceId || terminalWorkspace?.id || "",
+          });
+          return;
+        }
         const target = getTodoQueueTerminalSendTarget(targetTerminalIndex, currentDrag, {
           allowSendableActivityAgentReadyFallback: true,
           allowGeneric: false,
@@ -39749,6 +39860,7 @@ function TerminalView({
     getTodoQueueTerminalSendTarget,
     logicalTerminalIndexes,
     markTodoDropQueuedInRust,
+    paneKinds,
     recordVoicePlanTaskStatus,
     resolveTerminalDropTarget,
     setTodoQueueItemPending,

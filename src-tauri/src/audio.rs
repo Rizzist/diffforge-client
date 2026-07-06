@@ -5579,6 +5579,10 @@ fn audio_widget_set_bubble_hover_enabled(app: &AppHandle, enabled: bool) {
 
 const AUDIO_WIDGET_BAR_ACTIVE_WIDTH: f64 = 124.0;
 const AUDIO_WIDGET_BAR_ACTIVE_HEIGHT: f64 = 44.0;
+// Recording bar with the floating live transcript line above it; must stay
+// in sync with AUDIO_WIDGET_BAR_TRANSCRIPT_SIZE in AudioWorkspaceView.jsx.
+const AUDIO_WIDGET_BAR_TRANSCRIPT_WIDTH: f64 = 460.0;
+const AUDIO_WIDGET_BAR_TRANSCRIPT_HEIGHT: f64 = 88.0;
 const AUDIO_WIDGET_BAR_ERROR_WIDTH: f64 = 320.0;
 const AUDIO_WIDGET_BAR_ERROR_HEIGHT: f64 = 112.0;
 const AUDIO_WIDGET_BAR_NOTICE_WIDTH: f64 = 392.0;
@@ -5628,6 +5632,12 @@ fn audio_widget_bar_frame_is_whole_hover_size(width: f64, height: f64) -> bool {
         AUDIO_WIDGET_BAR_ACTIVE_WIDTH,
         AUDIO_WIDGET_BAR_ACTIVE_HEIGHT,
     );
+    let transcript_size = audio_widget_bar_frame_matches_size(
+        width,
+        height,
+        AUDIO_WIDGET_BAR_TRANSCRIPT_WIDTH,
+        AUDIO_WIDGET_BAR_TRANSCRIPT_HEIGHT,
+    );
     let error_size = audio_widget_bar_frame_matches_size(
         width,
         height,
@@ -5643,6 +5653,7 @@ fn audio_widget_bar_frame_is_whole_hover_size(width: f64, height: f64) -> bool {
 
     audio_widget_bar_frame_is_idle_hover_size(width, height)
         || active_size
+        || transcript_size
         || error_size
         || notice_size
 }
@@ -14041,6 +14052,26 @@ async fn insert_transcribed_text(
 
     #[cfg(target_os = "macos")]
     let _ = audio_widget_release_keyboard_focus_on_main_thread(&app);
+
+    // The widget's hover-focus resigns key without keying a successor, so the
+    // app can be active (frontmost) with NO key window right here — and enigo
+    // keystrokes need a key window to land anywhere. Restore the main window
+    // in that state; when the user is dictating into another app, Diff Forge
+    // is not active and this is a no-op, so enigo still types into that app.
+    #[cfg(target_os = "macos")]
+    {
+        let app_is_active =
+            unsafe { objc2_app_kit::NSRunningApplication::currentApplication().isActive() };
+        let any_window_focused = app
+            .webview_windows()
+            .values()
+            .any(|window| window.is_focused().unwrap_or(false));
+        if app_is_active && !any_window_focused {
+            if let Some(main_window) = app.get_webview_window("main") {
+                let _ = main_window.set_focus();
+            }
+        }
+    }
 
     let insert_result = tauri::async_runtime::spawn_blocking(move || {
         thread::sleep(Duration::from_millis(220));

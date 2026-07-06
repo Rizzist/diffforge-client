@@ -1212,10 +1212,29 @@ fn desktop_auth_current_validation_snapshot(app: &AppHandle, token: &str) -> Opt
 }
 
 fn desktop_auth_persist_snapshot(app: &AppHandle, mut snapshot: Value) -> Result<Value, String> {
-    let previous_version = desktop_auth_snapshot(app)
-        .get("version")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let previous = desktop_auth_snapshot(app);
+    let previous_version = previous.get("version").and_then(Value::as_u64).unwrap_or(0);
+    // Dedupe before stamping version/updatedAtMs: a persist that changes
+    // nothing else must not write the (multi-hundred-KB) state file, chmod it,
+    // and emit a full snapshot over IPC. Repeated no-op persists have driven
+    // event→apply→persist feedback loops at hundreds of iterations/second
+    // (the 800% cold-start burn).
+    {
+        let mut prev_cmp = previous.clone();
+        let mut next_cmp = snapshot.clone();
+        for key in ["version", "updatedAtMs"] {
+            if let Some(object) = prev_cmp.as_object_mut() {
+                object.remove(key);
+            }
+            if let Some(object) = next_cmp.as_object_mut() {
+                object.remove(key);
+            }
+        }
+        let next_cmp = desktop_auth_snapshot_from_raw(next_cmp);
+        if prev_cmp == next_cmp {
+            return Ok(previous);
+        }
+    }
     snapshot["version"] = json!(previous_version.saturating_add(1));
     snapshot["updatedAtMs"] = json!(current_time_ms());
     let snapshot = desktop_auth_snapshot_from_raw(snapshot);

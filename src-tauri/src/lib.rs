@@ -313,6 +313,7 @@ static TERMINAL_STATUS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static CLOUD_SYNC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static TERMINAL_STATUS_LOGGING_RESOLVED: OnceLock<bool> = OnceLock::new();
 static CLOUD_SYNC_LOGGING_RESOLVED: OnceLock<bool> = OnceLock::new();
+static WORKSPACE_ACTIVATION_LOGGING_RESOLVED: OnceLock<bool> = OnceLock::new();
 static TERMINAL_CRASH_FORENSICS_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 static WINDOWS_TERMINAL_DIAGNOSTIC_LOG_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 const WHISPER_RUNTIME_NAME: &str = "whisper.cpp CLI";
@@ -2683,6 +2684,7 @@ include!("architectures.rs");
 include!("pcb.rs");
 include!("video_editor.rs");
 include!("video_code.rs");
+include!("video_polish.rs");
 include!("workspace_web.rs");
 include!("developer_processes.rs");
 include!("app_control_mcp.rs");
@@ -2763,6 +2765,13 @@ fn terminal_status_logging_enabled() -> bool {
 fn cloud_sync_logging_enabled() -> bool {
     *CLOUD_SYNC_LOGGING_RESOLVED.get_or_init(|| {
         CLOUD_SYNC_LOGGING_ENABLED || diagnostic_env_truthy("DIFFFORGE_CLOUD_SYNC_LOG")
+    })
+}
+
+fn workspace_activation_logging_enabled() -> bool {
+    *WORKSPACE_ACTIVATION_LOGGING_RESOLVED.get_or_init(|| {
+        WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED
+            || diagnostic_env_truthy("DIFFFORGE_WORKSPACE_ACTIVATION_LOG")
     })
 }
 
@@ -2881,7 +2890,7 @@ fn write_bigview_sync_diagnostic_log_entry(entry: Value) {
 }
 
 fn write_workspace_activation_diagnostic_log_entries(entries: Vec<Value>) {
-    if !WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED || entries.is_empty() {
+    if !workspace_activation_logging_enabled() || entries.is_empty() {
         return;
     }
 
@@ -3122,7 +3131,7 @@ fn log_terminal_status_event(phase: &str, fields: Value) {
 }
 
 fn forward_terminal_status_to_energy_if_needed(phase: &str, source: &str, fields: Value) {
-    if phase.starts_with("frontend.render_probe") {
+    if phase.starts_with("frontend.render_probe") || phase.starts_with("frontend.invoke_probe") {
         energy_impact::energy_impact_log_render_storm(phase, source, fields);
     }
 }
@@ -3311,6 +3320,13 @@ fn workspace_activation_diagnostic_log_many(
     write_workspace_activation_diagnostic_log_entries(entries);
 
     Ok(())
+}
+
+/// Lets the frontend skip building/sending activation diagnostic batches when
+/// the sink is off. Enabled by the build const or DIFFFORGE_WORKSPACE_ACTIVATION_LOG=1.
+#[tauri::command]
+fn workspace_activation_diagnostic_logging_status() -> bool {
+    workspace_activation_logging_enabled()
 }
 
 #[tauri::command]
@@ -7399,7 +7415,7 @@ pub fn run() {
         "app_pid": std::process::id(),
         "thread": terminal_diagnostic_thread_label(),
         "fields": {
-            "enabled": WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED,
+            "enabled": workspace_activation_logging_enabled(),
             "log_file": workspace_activation_diagnostic_log_path().display().to_string(),
         },
     }));
@@ -7705,6 +7721,8 @@ pub fn run() {
             video_code_tools_install_cancel,
             video_code_preview_start,
             video_code_preview_stop,
+            video_polish_start,
+            video_polish_cancel,
             video_jobs_list,
             video_generation_providers,
             video_lora_list,
@@ -7978,6 +7996,7 @@ pub fn run() {
             swarm_get_state,
             swarm_configure,
             swarm_member_restart,
+            swarm_activate,
             swarm_submit_task,
             swarm_cancel_run,
             swarm_run_events,
@@ -8011,6 +8030,7 @@ pub fn run() {
             bigview_sync_diagnostic_log,
             workspace_activation_diagnostic_log,
             workspace_activation_diagnostic_log_many,
+            workspace_activation_diagnostic_logging_status,
             terminal_status_log,
             windows_terminal_set_diagnostic_logging,
             windows_terminal_diagnostic_log,

@@ -16058,8 +16058,9 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
       ? previous.storageUsage
       : null;
 
+  let next;
   if (previousStatus === "connected" && nextStatus !== "error") {
-    return {
+    next = {
       ...previous,
       connectedDevices,
       deviceLiveState,
@@ -16068,10 +16069,8 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
       updatedAt: Date.now(),
       workspaceTodos,
     };
-  }
-
-  if (!["connected", "error"].includes(nextStatus) && nextRank < previousRank) {
-    return {
+  } else if (!["connected", "error"].includes(nextStatus) && nextRank < previousRank) {
+    next = {
       ...previous,
       attempt: Math.max(
         Number(progress?.attempt ?? 0) || 0,
@@ -16084,21 +16083,44 @@ function normalizeCloudWorkspaceProgress(progress, previous = CLOUD_WORKSPACE_PR
       updatedAt: Date.now(),
       workspaceTodos,
     };
+  } else {
+    next = {
+      attempt: Number(progress?.attempt ?? previous.attempt ?? 0) || 0,
+      connectedDevices,
+      detail: String(progress?.detail || previous.detail || ""),
+      deviceLiveState,
+      knownDevices,
+      stage: nextStage,
+      status: nextStatus,
+      storageUsage,
+      title: String(progress?.title || previous.title || "Cloud workspace"),
+      updatedAt: Date.now(),
+      workspaceTodos,
+    };
   }
 
-  return {
-    attempt: Number(progress?.attempt ?? previous.attempt ?? 0) || 0,
-    connectedDevices,
-    detail: String(progress?.detail || previous.detail || ""),
-    deviceLiveState,
-    knownDevices,
-    stage: nextStage,
-    status: nextStatus,
-    storageUsage,
-    title: String(progress?.title || previous.title || "Cloud workspace"),
-    updatedAt: Date.now(),
-    workspaceTodos,
-  };
+  // Value-identical progress must return `previous` UNCHANGED (same reference)
+  // so the functional setState bails out and nothing re-renders: device/status
+  // progress events repeat identical payloads at high rate during connects,
+  // and the fresh `updatedAt: Date.now()` stamp used to make every one of
+  // them a full-shell commit (the boot-time "2,400 commits/5s" render storm).
+  if (cloudWorkspaceProgressValueEquals(next, previous)) {
+    return previous;
+  }
+  return next;
+}
+
+function cloudWorkspaceProgressValueEquals(next, previous) {
+  if (!next || !previous) {
+    return false;
+  }
+  try {
+    const { updatedAt: _nextStamp, ...nextRest } = next;
+    const { updatedAt: _previousStamp, ...previousRest } = previous;
+    return JSON.stringify(nextRest) === JSON.stringify(previousRest);
+  } catch {
+    return false;
+  }
 }
 
 function isCloudWorkspaceProgressReady(progress) {
@@ -22802,6 +22824,14 @@ export default function App() {
   // and flickered the app between login and dashboard.
   const billingStatusRef = useRef(null);
   billingStatusRef.current = billingStatus;
+  // Same contract for authState: refreshBillingStatus feeds (via
+  // requestCloudCreditsRefresh → handleTopupDeepLink) into the auth startup
+  // effect's deps, so keying it on authState re-armed that effect on every
+  // status flip during session restore — validateStoredSession re-ran, flipped
+  // the status again, and the loop stormed the shell (~1,700 commits/5s at
+  // boot) while hammering desktop_auth_validate_session.
+  const authStateRef = useRef(authState);
+  authStateRef.current = authState;
   const tokenomicsWarmAccountKeyRef = useRef("");
   const workspaceToolLayoutRef = useRef(null);
   const workspaceToolPanelRef = useRef(null);
@@ -27891,7 +27921,21 @@ export default function App() {
       setWorkspacePendingActivationId((currentPendingId) => (
         currentPendingId === safeWorkspaceId ? "" : currentPendingId
       ));
+      const activateCalledAtMs = getWorkspaceActivationDiagnosticNowMs();
       activateWorkspace(safeWorkspaceId, source, trace);
+      // Time the runtime-mount commit: activate call → the frame after the
+      // mount paints. This is the "activation feels laggy" number — everything
+      // between these two points runs synchronously on the main thread.
+      window.requestAnimationFrame(() => {
+        window.requestAnimationFrame(() => {
+          logWorkspaceActivationTrace("workspace.open.activate.first_paint", safeWorkspaceId, {
+            commitToPaintMs: Math.round(
+              Math.max(0, getWorkspaceActivationDiagnosticNowMs() - activateCalledAtMs),
+            ),
+            source,
+          }, { force: true, trace });
+        });
+      });
     };
 
     const scheduleIdleActivation = () => {
@@ -28182,10 +28226,35 @@ export default function App() {
     workspaces,
   ]);
 
+  // Selecting an unactivated workspace reveals its settings surface, but only
+  // AFTER the selection itself has painted: the click commit stays as cheap as
+  // a bottom-rail view switch (row highlight + view flip render this frame),
+  // and the heavier settings card mounts in its own follow-up commit one frame
+  // later. A double rAF is the first moment after that paint.
+  const workspaceSettingsRevealFrameRef = useRef(0);
+  const scheduleWorkspaceSettingsRevealAfterPaint = useCallback((workspaceId) => {
+    window.cancelAnimationFrame(workspaceSettingsRevealFrameRef.current);
+    workspaceSettingsRevealFrameRef.current = window.requestAnimationFrame(() => {
+      workspaceSettingsRevealFrameRef.current = window.requestAnimationFrame(() => {
+        workspaceSettingsRevealFrameRef.current = 0;
+        // Stale reveal: the user already moved to another row (or cleared the
+        // selection) before the frame fired.
+        if (selectedWorkspaceIdRef.current !== workspaceId) {
+          return;
+        }
+        setWorkspaceSettingsModalId(workspaceId);
+      });
+    });
+  }, []);
+
+  useEffect(() => () => {
+    window.cancelAnimationFrame(workspaceSettingsRevealFrameRef.current);
+  }, []);
+
   // Workspace rail clicks behave exactly like the bottom rail view buttons
   // (Tokenomics/Settings/Audio/...): select the row and show the workspace
-  // view, nothing else. No auto-opened settings surface, no shell-wide urgent
-  // state batch — the row's gear/lifecycle buttons own those flows explicitly.
+  // view. The one addition: an unactivated workspace also reveals its settings
+  // surface (after paint) so the user can configure/activate it immediately.
   const selectWorkspaceFromRail = useCallback((workspaceId) => {
     const workspace = findWorkspaceById(workspaces, workspaceId);
     if (!workspace) {
@@ -28226,15 +28295,33 @@ export default function App() {
     // showView clears the settings surface too, but it early-returns when the
     // workspace view is already active (reselect with a surface up).
     setWorkspaceCreateModalOpen(false);
-    setWorkspaceSettingsModalId("");
+    // Trust only the lifecycle enabled set for "runtime is on": a stale
+    // activatedWorkspaceIdRef must not hide the settings surface the user
+    // needs to enable the workspace.
+    const workspaceRuntimeEnabled = normalizeEnabledWorkspaceIds(
+      workspaceLifecycleSettingsRef.current?.enabledWorkspaceIds,
+    ).includes(workspace.id);
+    // Keep the surface up (no one-frame flicker) when re-clicking the row it
+    // already shows; anything else closes now and re-reveals after paint.
+    setWorkspaceSettingsModalId((currentModalId) => (
+      !workspaceRuntimeEnabled && currentModalId === workspace.id ? currentModalId : ""
+    ));
+    if (!workspaceRuntimeEnabled) {
+      scheduleWorkspaceSettingsRevealAfterPaint(workspace.id);
+    }
     showView(DEFAULT_WORKSPACE_VIEW, {
       immediate: true,
-      telemetrySource: isReselect ? "workspace_rail_reselect" : "workspace_rail_select",
+      telemetrySource: isReselect
+        ? "workspace_rail_reselect"
+        : workspaceRuntimeEnabled
+          ? "workspace_rail_select"
+          : "workspace_rail_select_settings",
       telemetryWorkspaceId: workspace.id,
     });
   }, [
     cancelDeferredWorkspaceActivation,
     logWorkspaceActivationTrace,
+    scheduleWorkspaceSettingsRevealAfterPaint,
     showView,
     workspaces,
   ]);
@@ -29194,7 +29281,9 @@ export default function App() {
   }, []);
 
   const refreshBillingStatus = useCallback(async ({ quiet = false } = {}) => {
-    if (authState !== "authenticated") {
+    // authState via ref keeps this callback's identity stable — it sits in the
+    // auth startup effect's dependency chain (see authStateRef above).
+    if (authStateRef.current !== "authenticated") {
       setBillingStatus(null);
       setBillingStatusState("idle");
       setBillingStatusError("");
@@ -29247,7 +29336,7 @@ export default function App() {
       setBillingStatusError(message);
       return null;
     }
-  }, [authState]);
+  }, []);
 
   // ----- low-credits startup top-up -----
   // idle | shown | skipped | dismissed — decided once per sign-in from the
@@ -33378,11 +33467,21 @@ export default function App() {
     let demoteTimer = 0;
     let pendingDemotion = null;
 
+    const comparableSyncStatusKey = (status) => {
+      if (!status) {
+        return "";
+      }
+      // Ignore the per-emit updatedAtMs stamp: Rust stamps every event, so
+      // comparing it made "identical" payloads always look new and defeated
+      // this dedup entirely (a full-shell commit per event during connects).
+      const { updatedAtMs: _stamp, ...rest } = status;
+      return JSON.stringify(rest);
+    };
     const applySyncStatus = (normalized) => {
       // Sync-status events repeat identical payloads at high rate during
       // active syncs; a fresh-but-equal object per event re-rendered the
       // whole shell each time.
-      if (lastApplied && JSON.stringify(lastApplied) === JSON.stringify(normalized)) {
+      if (lastApplied && comparableSyncStatusKey(lastApplied) === comparableSyncStatusKey(normalized)) {
         return;
       }
       lastApplied = normalized;

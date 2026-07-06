@@ -1,6 +1,8 @@
 // Must be first: installs the React commit-storm watchdog hook before
 // react-dom evaluates and captures __REACT_DEVTOOLS_GLOBAL_HOOK__.
 import "./app/renderLoopProbe.js";
+// IPC invoke-storm watchdog: names the commands behind cold-start IPC bursts.
+import "./app/invokeProbe.js";
 // Focus-edge watchdog: names what the user clicked right before the webview
 // lost focus (the "hover goes dead until I click the app" bug class).
 import "./diagnostics/windowFocusDiagnostics.js";

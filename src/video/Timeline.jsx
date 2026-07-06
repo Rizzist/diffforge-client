@@ -49,6 +49,7 @@ import {
   serializeClips,
   setClipKeyframe,
   snapMs,
+  splitClip,
   splitLinkedAt,
   trimClipEnd,
   trimClipStart,
@@ -184,6 +185,9 @@ const TimelineCanvas = styled.div`
   position: relative;
   min-width: 100%;
   padding-bottom: 6px;
+  /* Marquee/clip drags must never highlight clip labels or tick text. */
+  user-select: none;
+  -webkit-user-select: none;
 `;
 
 const RulerRow = styled.div`
@@ -609,9 +613,16 @@ function clipDisplayName(clip, track) {
   return segments[segments.length - 1] || "clip";
 }
 
-// jobType → human model name for the generating ghost-clip label.
+// jobType → human model name for the generating ghost-clip label. Direct
+// (BYOK) runs report the provider's own model id, so map those too.
 const GENERATION_MODEL_NAMES = new Map(
-  GENERATION_MODELS.map((model) => [model.jobType, model.displayName]),
+  GENERATION_MODELS.flatMap((model) => {
+    const pairs = [[model.jobType, model.displayName]];
+    if (model.direct?.model) {
+      pairs.push([model.direct.model, model.displayName]);
+    }
+    return pairs;
+  }),
 );
 
 // Interactive multi-track timeline. All edits flow through the pure model
@@ -670,6 +681,29 @@ export default function Timeline({
   const [tool, setTool] = useState("pointer"); // pointer | razor
   const [snapLineMs, setSnapLineMs] = useState(null);
   const [marquee, setMarquee] = useState(null); // { x0, y0, x1, y1 } client coords
+  // The clip inspector opens on double-click only — a single click is pure
+  // selection (highlight → delete/move) and must not pop UI.
+  const [inspectorOpen, setInspectorOpen] = useState(false);
+  // A/V link mode: when on (default), linked video+audio move/trim/delete as
+  // one; when off, they are independent clips. Persisted per user.
+  const [linkedMode, setLinkedMode] = useState(() => {
+    try {
+      return window.localStorage.getItem("diffforge.video.timeline.linkedMode") !== "0";
+    } catch {
+      return true;
+    }
+  });
+  const toggleLinkedMode = useCallback(() => {
+    setLinkedMode((current) => {
+      const next = !current;
+      try {
+        window.localStorage.setItem("diffforge.video.timeline.linkedMode", next ? "1" : "0");
+      } catch {
+        // best-effort persistence only
+      }
+      return next;
+    });
+  }, []);
   const pxPerMs = zoom / 1000;
   const toolRef = useRef(tool);
   toolRef.current = tool;
@@ -741,6 +775,13 @@ export default function Timeline({
     () => (selectedClipId ? findClip(project, selectedClipId) : null),
     [project, selectedClipId],
   );
+
+  // Selection cleared (or went multi / clip deleted) → the inspector follows.
+  useEffect(() => {
+    if (!selected) {
+      setInspectorOpen(false);
+    }
+  }, [selected]);
 
   const timeFromClientX = useCallback(
     (clientX) => {
@@ -912,7 +953,10 @@ export default function Timeline({
       event.stopPropagation();
       if (toolRef.current === "razor" && mode === "move") {
         const at = timeFromClientX(event.clientX);
-        onChange?.(splitLinkedAt(project, clip.id, at), { transient: false });
+        onChange?.(
+          linkedMode ? splitLinkedAt(project, clip.id, at) : splitClip(project, clip.id, at),
+          { transient: false },
+        );
         return;
       }
       const additive = event.shiftKey && mode === "move";
@@ -921,7 +965,7 @@ export default function Timeline({
         selectClip(clip.id, { additive: true });
         return; // shift-click is pure selection, never a drag
       }
-      const ignoreLinks = event.altKey;
+      const ignoreLinks = event.altKey || !linkedMode;
       const baseIds = partOfSelection && selectedClipIds.length > 1 ? selectedClipIds : [clip.id];
       const groupIds = ignoreLinks ? baseIds : expandWithLinks(project, baseIds);
       const rippleMode = event.shiftKey && mode !== "move";
@@ -944,6 +988,8 @@ export default function Timeline({
         moved: false,
         latest: project,
       };
+      document.body.style.userSelect = "none";
+      document.body.style.webkitUserSelect = "none";
       const handleMove = (moveEvent) => {
         const drag = dragRef.current;
         if (!drag) {
@@ -1017,6 +1063,8 @@ export default function Timeline({
         window.removeEventListener("pointermove", handleMove);
         window.removeEventListener("pointerup", handleUp);
         window.removeEventListener("pointercancel", handleUp);
+        document.body.style.userSelect = "";
+        document.body.style.webkitUserSelect = "";
         setSnapLineMs(null);
         if (drag?.moved && drag.latest && drag.latest !== project) {
           onChange?.(drag.latest, { transient: false });
@@ -1026,7 +1074,7 @@ export default function Timeline({
       window.addEventListener("pointerup", handleUp);
       window.addEventListener("pointercancel", handleUp);
     },
-    [getPlayheadMs, onChange, project, pxPerMs, selectClip, selectedClipIds, selectedSet, timeFromClientX, trackIdFromPoint],
+    [getPlayheadMs, linkedMode, onChange, project, pxPerMs, selectClip, selectedClipIds, selectedSet, timeFromClientX, trackIdFromPoint],
   );
 
   // Empty-lane press: click seeks + clears; drag = marquee selection across
@@ -1039,6 +1087,8 @@ export default function Timeline({
       const startX = event.clientX;
       const startY = event.clientY;
       let moved = false;
+      document.body.style.userSelect = "none";
+      document.body.style.webkitUserSelect = "none";
       const handleMove = (moveEvent) => {
         if (!moved && Math.abs(moveEvent.clientX - startX) + Math.abs(moveEvent.clientY - startY) > 5) {
           moved = true;
@@ -1056,6 +1106,8 @@ export default function Timeline({
         window.removeEventListener("pointermove", handleMove);
         window.removeEventListener("pointerup", handleUp);
         window.removeEventListener("pointercancel", handleUp);
+        document.body.style.userSelect = "";
+        document.body.style.webkitUserSelect = "";
         setMarquee(null);
         if (!moved) {
           onSelectClips?.([]);
@@ -1081,13 +1133,13 @@ export default function Timeline({
             }
           }
         }
-        onSelectClips?.(expandWithLinks(projectRef.current, picked));
+        onSelectClips?.(linkedMode ? expandWithLinks(projectRef.current, picked) : picked);
       };
       window.addEventListener("pointermove", handleMove);
       window.addEventListener("pointerup", handleUp);
       window.addEventListener("pointercancel", handleUp);
     },
-    [onSeek, onSelectClips, playback, timeFromClientX],
+    [linkedMode, onSeek, onSelectClips, playback, timeFromClientX],
   );
 
   // Track reorder: vertical drag on a track's label rail.
@@ -1174,7 +1226,8 @@ export default function Timeline({
         }
         if (key === "a") {
           event.preventDefault();
-          onSelectClips?.(expandWithLinks(project, clipIdsFromMs(project, getPlayheadMs())));
+          const atPlayhead = clipIdsFromMs(project, getPlayheadMs());
+          onSelectClips?.(linkedMode ? expandWithLinks(project, atPlayhead) : atPlayhead);
           return;
         }
       }
@@ -1183,21 +1236,27 @@ export default function Timeline({
       }
       if (event.key === "Delete" || event.key === "Backspace") {
         event.preventDefault();
-        const ids = event.altKey ? selectedClipIds : expandWithLinks(project, selectedClipIds);
+        const ids =
+          event.altKey || !linkedMode ? selectedClipIds : expandWithLinks(project, selectedClipIds);
         onChange?.(removeClips(project, ids), { transient: false });
         onSelectClips?.([]);
       }
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [getPlayheadMs, onChange, onRedo, onSelectClips, onUndo, project, selectedClipIds]);
+  }, [getPlayheadMs, linkedMode, onChange, onRedo, onSelectClips, onUndo, project, selectedClipIds]);
 
   const splitSelectedAtPlayhead = useCallback(() => {
     if (!selectedClipId) {
       return;
     }
-    onChange?.(splitLinkedAt(project, selectedClipId, getPlayheadMs()), { transient: false });
-  }, [getPlayheadMs, onChange, project, selectedClipId]);
+    onChange?.(
+      linkedMode
+        ? splitLinkedAt(project, selectedClipId, getPlayheadMs())
+        : splitClip(project, selectedClipId, getPlayheadMs()),
+      { transient: false },
+    );
+  }, [getPlayheadMs, linkedMode, onChange, project, selectedClipId]);
 
   const rulerTicks = useMemo(() => {
     const targetPx = 90;
@@ -1347,6 +1406,18 @@ export default function Timeline({
           <ContentCut aria-hidden="true" />
         </VideoIconButton>
         <ToolbarDivider />
+        <VideoIconButton
+          data-active={linkedMode ? "true" : "false"}
+          onClick={toggleLinkedMode}
+          title={
+            linkedMode
+              ? "A/V linked: video and its audio move, trim, and delete together (click for independent clips; Alt-drag ignores links once)"
+              : "A/V independent: video and audio move and delete separately (click to link them back together)"
+          }
+          type="button"
+        >
+          {linkedMode ? <Link aria-hidden="true" /> : <LinkOff aria-hidden="true" />}
+        </VideoIconButton>
         {selectedClipIds.length >= 2 ? (
           <VideoIconButton
             onClick={() => onChange?.(linkClips(project, selectedClipIds), { transient: false })}
@@ -1376,7 +1447,8 @@ export default function Timeline({
         <VideoIconButton
           disabled={!selectedClipIds.length}
           onClick={() => {
-            onChange?.(removeClips(project, selectedClipIds), { transient: false });
+            const ids = linkedMode ? expandWithLinks(project, selectedClipIds) : selectedClipIds;
+            onChange?.(removeClips(project, ids), { transient: false });
             onSelectClips?.([]);
           }}
           title={selectedClipIds.length > 1 ? `Delete ${selectedClipIds.length} clips` : "Delete clip"}
@@ -1400,6 +1472,8 @@ export default function Timeline({
             const result = addTextClip(project, { timelineStartMs: getPlayheadMs() });
             onChange?.(result.project, { transient: false });
             onSelectClips?.([result.clipId]);
+            // Explicit "add text" means "type now" — open the editor directly.
+            setInspectorOpen(true);
           }}
           title="Add text at playhead"
           type="button"
@@ -1551,6 +1625,10 @@ export default function Timeline({
                       data-selected={selectedSet.has(clip.id) ? "true" : "false"}
                       key={clip.id}
                       onContextMenu={(event) => onClipContextMenu?.(event, clip, track)}
+                      onDoubleClick={() => {
+                        selectClip(clip.id);
+                        setInspectorOpen(true);
+                      }}
                       onPointerDown={(event) => beginClipDrag(event, track.id, clip, "move")}
                       style={{ left: `${clip.timelineStartMs * pxPerMs}px`, width: `${widthPx}px` }}
                       title={
@@ -1657,11 +1735,11 @@ export default function Timeline({
         />
         ,document.body,
       ) : null}
-      {selected ? (
+      {selected && inspectorOpen ? (
         <InspectorPopover data-video-clip-inspector="true">
           <InspectorHeader>
             <span>{clipDisplayName(selected.clip, selected.track)}</span>
-            <VideoIconButton onClick={() => onSelectClips?.([])} title="Close" type="button">
+            <VideoIconButton onClick={() => setInspectorOpen(false)} title="Close (clip stays selected)" type="button">
               <Close aria-hidden="true" />
             </VideoIconButton>
           </InspectorHeader>

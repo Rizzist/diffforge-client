@@ -153,6 +153,27 @@ export function writeOrchestratorRealtimeEnabled(enabled) {
   }
 }
 
+const AUDIO_REALTIME_TRANSCRIPT_OVERLAY_STORAGE_KEY = "diffforge.audio.realtimeTranscriptOverlay.v1";
+
+/// Floating realtime dictation: a one-line live transcript pill above the
+/// recording bubble / bottom bar. Enabled by default; the stored value only
+/// records an explicit opt-out.
+export function readAudioRealtimeTranscriptOverlayEnabled() {
+  if (!canUseStorage()) {
+    return true;
+  }
+  return window.localStorage.getItem(AUDIO_REALTIME_TRANSCRIPT_OVERLAY_STORAGE_KEY) !== "false";
+}
+
+export function writeAudioRealtimeTranscriptOverlayEnabled(enabled) {
+  if (canUseStorage()) {
+    window.localStorage.setItem(
+      AUDIO_REALTIME_TRANSCRIPT_OVERLAY_STORAGE_KEY,
+      enabled === false ? "false" : "true",
+    );
+  }
+}
+
 export function normalizeAudioWidgetTheme(value) {
   return value === AUDIO_WIDGET_THEME_LIGHT ? AUDIO_WIDGET_THEME_LIGHT : AUDIO_WIDGET_THEME_DARK;
 }

@@ -15518,6 +15518,93 @@ export const AudioWidgetErrorPopover = styled.div`
   }
 `;
 
+/* One-line live transcript pill floated above the recorder while dictating
+   (the landing video's status-pill formula). Newest words win: the rtl
+   scroller keeps the tail of the line visible and puts the ellipsis on the
+   left once the text overflows; the inner ltr bdi keeps word order intact. */
+export const AudioRealtimeTranscriptPill = styled.div`
+  display: flex;
+  align-items: center;
+  box-sizing: border-box;
+  max-width: min(100%, 432px);
+  min-width: 0;
+  margin: 0 auto 8px;
+  padding: 6px 14px;
+  border: 1px solid rgba(147, 197, 253, 0.32);
+  border-radius: 999px;
+  color: #e6ebf2;
+  background: linear-gradient(180deg, rgba(10, 14, 22, 0.95), rgba(5, 8, 13, 0.9));
+  box-shadow:
+    0 10px 24px rgba(0, 0, 0, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.1);
+  font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12.5px;
+  font-weight: 550;
+  line-height: 1.4;
+  pointer-events: none;
+  animation: audioRealtimeTranscriptIn 170ms ease-out both;
+
+  @keyframes audioRealtimeTranscriptIn {
+    from {
+      opacity: 0;
+      transform: translateY(5px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
+  }
+
+  > span {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    direction: rtl;
+    text-align: left;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  bdi {
+    direction: ltr;
+    unicode-bidi: isolate;
+  }
+
+  &[data-empty="true"] {
+    color: rgba(230, 236, 245, 0.5);
+  }
+
+  *[data-theme="light"] & {
+    border-color: rgba(0, 102, 204, 0.28);
+    color: #1d1d1f;
+    background: linear-gradient(180deg, rgba(255, 255, 255, 0.97), rgba(244, 246, 250, 0.94));
+    box-shadow:
+      0 10px 24px rgba(0, 0, 0, 0.14),
+      inset 0 1px 0 rgba(255, 255, 255, 0.85);
+  }
+
+  *[data-theme="light"] &[data-empty="true"] {
+    color: rgba(29, 29, 31, 0.45);
+  }
+`;
+
+/* Positions the live transcript pill above the bubble-style recording pill;
+   the widget window grows upward by the same headroom while it shows. */
+export const AudioWidgetTranscriptPopover = styled.div`
+  position: fixed;
+  bottom: 71px;
+  left: 2px;
+  right: 2px;
+  z-index: 28;
+  display: flex;
+  justify-content: center;
+  pointer-events: none;
+
+  ${AudioRealtimeTranscriptPill} {
+    margin-bottom: 0;
+  }
+`;
+
 export const AudioWidgetErrorOverlayShell = styled.div`
   position: fixed;
   inset: 0;
@@ -15975,7 +16062,8 @@ export const AudioBarHistoryButton = styled.button`
 /* Drain bar for the cancel notice. Inset from the pill's rounded ends (the
    surface clips overflow, so a full-bleed bottom line would lose its edges
    to the corner radius and look like it never reaches 0). The short delay
-   with fill-mode both holds it at 100% until the resized bar has painted. */
+   with fill-mode both holds it at 100% until the resized bar has painted.
+   The drain never pauses — hovering must not stall the auto-dismiss. */
 export const AudioBarNoticeProgress = styled.span`
   position: absolute;
   left: 16px;
@@ -15990,10 +16078,6 @@ export const AudioBarNoticeProgress = styled.span`
   @keyframes audioBarNoticeDrain {
     from { transform: scaleX(1); }
     to { transform: scaleX(0); }
-  }
-
-  [data-paused="true"] & {
-    animation-play-state: paused;
   }
 `;
 

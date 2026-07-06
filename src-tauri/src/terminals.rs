@@ -2027,6 +2027,24 @@ fn webview_window_is_focused(app: &AppHandle, label: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `is_focused` is key-window status, and the audio widget's hover-focus
+/// resigns key WITHOUT keying a successor — so while Diff Forge is the active
+/// (frontmost) app, there can be NO key window at the exact moment a
+/// transcript lands. Insertion gates must not read that state as "the user is
+/// in another app": app-active is the signal that dictation belongs to us.
+/// When the user really is in another app this is false, and transcripts still
+/// fall through to the focused input there.
+#[cfg(target_os = "macos")]
+fn app_process_is_active() -> bool {
+    // NSRunningApplication is documented thread-safe, unlike NSApplication.
+    unsafe { objc2_app_kit::NSRunningApplication::currentApplication().isActive() }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn app_process_is_active() -> bool {
+    false
+}
+
 fn app_has_focused_terminal_window(app: &AppHandle) -> bool {
     app.webview_windows().into_iter().any(|(label, window)| {
         label.starts_with(TERMINAL_WINDOW_LABEL_PREFIX) && window.is_focused().unwrap_or(false)
@@ -2037,6 +2055,7 @@ fn app_has_focused_audio_input_window(app: &AppHandle) -> bool {
     webview_window_is_focused(app, "main")
         || webview_window_is_focused(app, AUDIO_WIDGET_WINDOW_LABEL)
         || app_has_focused_terminal_window(app)
+        || app_process_is_active()
 }
 
 fn terminal_audio_input_target_window_is_focused(
@@ -2053,6 +2072,7 @@ fn app_has_focused_audio_input_window_for_target(
     webview_window_is_focused(app, "main")
         || webview_window_is_focused(app, AUDIO_WIDGET_WINDOW_LABEL)
         || terminal_audio_input_target_window_is_focused(app, target)
+        || app_process_is_active()
 }
 
 fn terminal_audio_target_should_own_insert(
@@ -2073,7 +2093,8 @@ fn terminal_audio_target_should_own_insert(
     }
 
     Ok(webview_window_is_focused(app, "main")
-        || webview_window_is_focused(app, AUDIO_WIDGET_WINDOW_LABEL))
+        || webview_window_is_focused(app, AUDIO_WIDGET_WINDOW_LABEL)
+        || app_process_is_active())
 }
 
 async fn write_terminal_input(

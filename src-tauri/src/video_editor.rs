@@ -1843,6 +1843,11 @@ fn video_find_inherited_transcript(
             if relation.relation_type != "derived-from" || !visited.insert(relation.path.clone()) {
                 continue;
             }
+            // Polished cuts re-time the media — inheriting the source
+            // transcript would be wrong; polish writes its own remapped copy.
+            if relation.via == "polish" {
+                continue;
+            }
             let relation_abs = video_resolve_media_abs(root, media_root, relation.path.as_str())?;
             if !relation_abs.is_file() {
                 continue;

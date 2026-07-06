@@ -7,6 +7,29 @@ import {
 
 export const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED = false;
 
+// Runtime gate: the build const above OR DIFFFORGE_WORKSPACE_ACTIVATION_LOG=1
+// in the app's environment (resolved from Rust once, matching the other
+// diagnostic sinks). `null` = still resolving — events queue in the normal
+// pending buffer and flush or drop when the answer lands.
+let workspaceActivationLoggingResolved = WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED ? true : null;
+if (workspaceActivationLoggingResolved === null) {
+  invoke("workspace_activation_diagnostic_logging_status")
+    .then((enabled) => {
+      workspaceActivationLoggingResolved = enabled === true;
+      if (workspaceActivationLoggingResolved) {
+        scheduleWorkspaceActivationDiagnosticFlush();
+      } else {
+        pendingDiagnosticEvents = [];
+        pendingDiagnosticDropCount = 0;
+      }
+    })
+    .catch(() => {
+      workspaceActivationLoggingResolved = false;
+      pendingDiagnosticEvents = [];
+      pendingDiagnosticDropCount = 0;
+    });
+}
+
 const WORKSPACE_ACTIVATION_DIAGNOSTIC_FLUSH_MS = 32;
 const WORKSPACE_ACTIVATION_DIAGNOSTIC_MAX_QUEUED_EVENTS = 256;
 const WORKSPACE_ACTIVATION_DIAGNOSTIC_LOG_MAX_TEXT = 512;
@@ -102,6 +125,19 @@ function flushWorkspaceActivationDiagnosticEvents({ force = false } = {}) {
     pendingDiagnosticFlushHandle = null;
   }
 
+  if (workspaceActivationLoggingResolved === null) {
+    // Gate still resolving: hold the queue, try again next window.
+    if (pendingDiagnosticEvents.length) {
+      scheduleWorkspaceActivationDiagnosticFlush();
+    }
+    return;
+  }
+  if (workspaceActivationLoggingResolved === false) {
+    pendingDiagnosticEvents = [];
+    pendingDiagnosticDropCount = 0;
+    return;
+  }
+
   if (!pendingDiagnosticEvents.length) {
     return;
   }
@@ -134,7 +170,7 @@ function flushWorkspaceActivationDiagnosticEvents({ force = false } = {}) {
 }
 
 export function logWorkspaceActivationDiagnosticEvent(phase, fields = {}, options = {}) {
-  if (!WORKSPACE_ACTIVATION_DIAGNOSTIC_LOGGING_ENABLED) {
+  if (workspaceActivationLoggingResolved === false) {
     return;
   }
 

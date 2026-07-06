@@ -1,8 +1,10 @@
 const SWARM_STATE_EVENT: &str = "diffforge://swarm-state";
 const SWARM_RUN_EVENT: &str = "diffforge://swarm-run-event";
 const SWARM_TAKE_SENTINEL: &str = "SWARM_TAKE_END";
+const SWARM_PACK_SENTINEL: &str = "SWARM_PACK_END";
 const SWARM_MAX_MEMBERS: usize = 5;
 const SWARM_RUN_SUMMARY_LIMIT: usize = 50;
+const SWARM_CONTEXT_PACK_TIMEOUT_SECS: u64 = 8 * 60;
 const SWARM_TAKE_TIMEOUT_SECS: u64 = 15 * 60;
 const SWARM_SYNTHESIS_TIMEOUT_SECS: u64 = 20 * 60;
 const SWARM_PROMPT_ACK_TIMEOUT_SECS: u64 = 8;
@@ -10,6 +12,7 @@ const SWARM_SPAWN_READY_MONITOR_SECS: u64 = 120;
 const SWARM_IDLE_POLL_MS: u64 = 750;
 const SWARM_MIN_IDLE_AFTER_PROMPT_MS: u64 = 5_000;
 const SWARM_CAPTURE_MAX_CHARS: usize = 48_000;
+const SWARM_CONTEXT_PACK_BUILT_AT_PREFIX: &str = "<!-- diffforge-swarm-context-pack-built-at-ms:";
 
 #[derive(Clone)]
 struct SwarmRuntimeState {
@@ -42,6 +45,7 @@ struct SwarmConfig {
     workspace_id: String,
     repo_path: String,
     champion_member_id: String,
+    scout_member_id: String,
     members: Vec<MemberSpec>,
     updated_at: u64,
 }
@@ -53,6 +57,7 @@ struct MemberStats {
     champion_runs: u64,
     reaps: u64,
     errors: u64,
+    scout_runs: u64,
 }
 
 #[derive(Clone)]
@@ -86,6 +91,7 @@ struct RunSummary {
 struct SwarmRuntimeData {
     config: SwarmConfig,
     members: HashMap<String, SwarmMemberRuntime>,
+    context_pack: Option<SwarmContextPackCache>,
     active_run_id: String,
     active_run_cancel: Option<Arc<AtomicBool>>,
     runs: Vec<RunSummary>,
@@ -94,6 +100,7 @@ struct SwarmRuntimeData {
 #[derive(Clone)]
 struct SwarmMemberRef {
     member_id: String,
+    provider: String,
     pane_id: String,
     instance_id: u64,
 }
@@ -102,6 +109,19 @@ struct SwarmMemberRef {
 struct SwarmTakeResult {
     member_id: String,
     text: String,
+}
+
+#[derive(Clone)]
+struct SwarmContextPackCache {
+    at: u64,
+    text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ContextPackSummary {
+    at: u64,
+    chars: usize,
 }
 
 #[derive(Serialize)]
@@ -126,6 +146,8 @@ struct SwarmState {
     workspace_id: String,
     repo_path: String,
     champion_member_id: String,
+    scout_member_id: String,
+    context_pack: Value,
     members: Vec<MemberState>,
     active_run_id: String,
     runs: Vec<RunSummary>,
@@ -200,6 +222,10 @@ fn swarm_config_path(workspace_id: &str, swarm_id: &str) -> Result<PathBuf, Stri
     Ok(swarm_dir(workspace_id, swarm_id)?.join("config.json"))
 }
 
+fn swarm_context_pack_path(workspace_id: &str, swarm_id: &str) -> Result<PathBuf, String> {
+    Ok(swarm_dir(workspace_id, swarm_id)?.join("context-pack.md"))
+}
+
 fn swarm_runs_dir(workspace_id: &str, swarm_id: &str) -> Result<PathBuf, String> {
     Ok(swarm_dir(workspace_id, swarm_id)?.join("runs"))
 }
@@ -217,10 +243,26 @@ fn swarm_now_ms() -> u64 {
     terminal_now_ms()
 }
 
+fn swarm_system_time_ms(value: std::time::SystemTime) -> u64 {
+    value
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn swarm_member_score(stats: &MemberStats) -> i64 {
     (2 * stats.champion_runs as i64) + stats.takes_delivered as i64
         - stats.reaps as i64
         - stats.errors as i64
+}
+
+fn swarm_provider_cost_rank(provider: &str) -> u8 {
+    match provider {
+        "opencode" => 0,
+        "codex" => 1,
+        "claude" => 2,
+        _ => 9,
+    }
 }
 
 fn swarm_normalize_provider(provider: &str) -> Result<String, String> {
@@ -269,6 +311,26 @@ fn swarm_normalize_member_id(value: &str) -> String {
         "member".to_string()
     } else {
         normalized
+    }
+}
+
+fn swarm_member_spec_ids(members: &[MemberSpec]) -> HashSet<String> {
+    members
+        .iter()
+        .filter_map(|spec| spec.member_id.clone())
+        .collect()
+}
+
+fn swarm_resolve_member_pin(value: Option<String>, members: &[MemberSpec]) -> String {
+    let value = value.unwrap_or_default();
+    if value.trim().is_empty() {
+        return String::new();
+    }
+    let normalized = swarm_normalize_member_id(&value);
+    if swarm_member_spec_ids(members).contains(&normalized) {
+        normalized
+    } else {
+        String::new()
     }
 }
 
@@ -347,12 +409,15 @@ fn swarm_config_from_parts(
     repo_path: &str,
     members: Vec<MemberSpec>,
     champion_member_id: Option<String>,
+    scout_member_id: Option<String>,
 ) -> SwarmConfig {
+    let scout_member_id = swarm_resolve_member_pin(scout_member_id, &members);
     SwarmConfig {
         swarm_id: swarm_id.to_string(),
         workspace_id: workspace_id.to_string(),
         repo_path: repo_path.trim().to_string(),
         champion_member_id: champion_member_id.unwrap_or_default().trim().to_string(),
+        scout_member_id,
         members,
         updated_at: swarm_now_ms(),
     }
@@ -380,6 +445,8 @@ fn swarm_load_config(workspace_id: &str, swarm_id: &str) -> SwarmConfig {
     config.swarm_id = swarm_id.to_string();
     config.workspace_id = workspace_id.to_string();
     config.members = swarm_resolve_member_specs(config.members).unwrap_or_default();
+    config.scout_member_id =
+        swarm_resolve_member_pin(Some(config.scout_member_id.clone()), &config.members);
     config
 }
 
@@ -392,6 +459,78 @@ fn swarm_save_config(config: &SwarmConfig) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(config)
         .map_err(|error| format!("Unable to serialize swarm config: {error}"))?;
     fs::write(path, bytes).map_err(|error| format!("Unable to write swarm config: {error}"))
+}
+
+fn swarm_context_pack_file_text(pack: &SwarmContextPackCache) -> String {
+    format!(
+        "{}{} -->\n{}\n",
+        SWARM_CONTEXT_PACK_BUILT_AT_PREFIX,
+        pack.at,
+        pack.text.trim()
+    )
+}
+
+fn swarm_parse_context_pack_file(raw: &str, fallback_at: u64) -> Option<SwarmContextPackCache> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let mut at = fallback_at;
+    let mut text = raw;
+    if let Some(rest) = raw.strip_prefix(SWARM_CONTEXT_PACK_BUILT_AT_PREFIX) {
+        if let Some((timestamp, body)) = rest.split_once("-->") {
+            at = timestamp.trim().parse::<u64>().unwrap_or(fallback_at);
+            text = body.trim_start_matches('\n').trim();
+        }
+    }
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(SwarmContextPackCache {
+            at,
+            text: text.trim().to_string(),
+        })
+    }
+}
+
+fn swarm_load_context_pack(workspace_id: &str, swarm_id: &str) -> Option<SwarmContextPackCache> {
+    let path = swarm_context_pack_path(workspace_id, swarm_id).ok()?;
+    let raw = fs::read_to_string(&path).ok()?;
+    let fallback_at = fs::metadata(&path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .map(swarm_system_time_ms)
+        .unwrap_or(0);
+    swarm_parse_context_pack_file(&raw, fallback_at)
+}
+
+fn swarm_save_context_pack(
+    workspace_id: &str,
+    swarm_id: &str,
+    text: &str,
+) -> Result<SwarmContextPackCache, String> {
+    let pack = SwarmContextPackCache {
+        at: swarm_now_ms(),
+        text: text.trim().to_string(),
+    };
+    let path = swarm_context_pack_path(workspace_id, swarm_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create swarm context pack directory: {error}"))?;
+    }
+    fs::write(path, swarm_context_pack_file_text(&pack))
+        .map_err(|error| format!("Unable to write swarm context pack: {error}"))?;
+    Ok(pack)
+}
+
+fn swarm_context_pack_summary(pack: Option<&SwarmContextPackCache>) -> Value {
+    pack.map(|pack| {
+        json!(ContextPackSummary {
+            at: pack.at,
+            chars: pack.text.chars().count(),
+        })
+    })
+    .unwrap_or_else(|| json!({}))
 }
 
 fn swarm_summary_text(value: &str) -> String {
@@ -417,9 +556,11 @@ fn swarm_new_runtime_data(workspace_id: &str, swarm_id: &str) -> SwarmRuntimeDat
             member.stats = member_stats;
         }
     }
+    let context_pack = swarm_load_context_pack(workspace_id, swarm_id);
     SwarmRuntimeData {
         config,
         members,
+        context_pack,
         active_run_id: String::new(),
         active_run_cancel: None,
         runs,
@@ -524,6 +665,7 @@ fn swarm_apply_event_stats(stats: &mut HashMap<String, MemberStats>, event: &Swa
         "synthesis_started" => {
             member_stats.champion_runs = member_stats.champion_runs.saturating_add(1)
         }
+        "context_pack_ready" => member_stats.scout_runs = member_stats.scout_runs.saturating_add(1),
         "member_reaped" => member_stats.reaps = member_stats.reaps.saturating_add(1),
         "member_error" => member_stats.errors = member_stats.errors.saturating_add(1),
         _ => {}
@@ -591,10 +733,56 @@ fn swarm_state_from_data(data: &SwarmRuntimeData) -> SwarmState {
         workspace_id: data.config.workspace_id.clone(),
         repo_path: data.config.repo_path.clone(),
         champion_member_id: data.config.champion_member_id.clone(),
+        scout_member_id: data.config.scout_member_id.clone(),
+        context_pack: swarm_context_pack_summary(data.context_pack.as_ref()),
         members,
         active_run_id: data.active_run_id.clone(),
         runs,
     }
+}
+
+fn swarm_ready_member_refs_from_data(data: &SwarmRuntimeData) -> Vec<SwarmMemberRef> {
+    let mut refs = Vec::new();
+    for spec in &data.config.members {
+        let Some(member_id) = spec.member_id.as_deref() else {
+            continue;
+        };
+        let Some(member) = data.members.get(member_id) else {
+            continue;
+        };
+        if member.status == "ready" && member.input_ready {
+            if let Some(instance_id) = member.instance_id {
+                refs.push(SwarmMemberRef {
+                    member_id: member.member_id.clone(),
+                    provider: member.provider.clone(),
+                    pane_id: member.pane_id.clone(),
+                    instance_id,
+                });
+            }
+        }
+    }
+    refs
+}
+
+fn swarm_choose_auto_scout(ready_members: &[SwarmMemberRef]) -> Option<SwarmMemberRef> {
+    ready_members
+        .iter()
+        .enumerate()
+        .min_by_key(|(index, member)| (swarm_provider_cost_rank(&member.provider), *index))
+        .map(|(_, member)| member.clone())
+}
+
+fn swarm_choose_scout_from_data(
+    data: &SwarmRuntimeData,
+    ready_members: &[SwarmMemberRef],
+) -> Option<SwarmMemberRef> {
+    if !data.config.scout_member_id.trim().is_empty() {
+        return ready_members
+            .iter()
+            .find(|member| member.member_id == data.config.scout_member_id)
+            .cloned();
+    }
+    swarm_choose_auto_scout(ready_members)
 }
 
 fn swarm_emit_state(app: &AppHandle, workspace_id: &str, swarm_id: &str) {
@@ -850,18 +1038,74 @@ async fn swarm_enqueue_prompt(
     }
 }
 
-fn swarm_take_prompt(original_prompt: &str, member: &SwarmMemberRef) -> String {
+fn swarm_context_pack_prompt(
+    original_prompt: &str,
+    repo_path: &str,
+    cached_pack: Option<&SwarmContextPackCache>,
+) -> String {
+    let mut body = String::new();
+    body.push_str("You are the scout for a Diff Forge Swarm Agents Panel run.\n\n");
+    body.push_str("Build a STRICTLY FACTUAL context pack for the other agents. Do not recommend an approach. Do not rank options. Do not include opinions or strategic preferences. Do not edit files.\n\n");
+    body.push_str("Include only:\n");
+    body.push_str("- Repo map: important directories/files and what they contain.\n");
+    body.push_str("- Existing conventions relevant to this task.\n");
+    body.push_str("- Build/test/check commands that appear valid for this repo.\n");
+    body.push_str("- Task-relevant file paths with one-line whys and short key excerpts.\n");
+    body.push_str("- Explicit constraints from the user prompt and repository context.\n\n");
+    body.push_str("Verify facts from the repo before keeping them. If uncertain, say what is unverified. End your reply with a final line containing only `");
+    body.push_str(SWARM_PACK_SENTINEL);
+    body.push_str("`.\n\nRepo root:\n");
+    body.push_str(repo_path);
+    body.push_str("\n\nTask:\n");
+    body.push_str(original_prompt);
+    if let Some(pack) = cached_pack {
+        body.push_str("\n\nPrevious context pack. Update it incrementally for this new task instead of re-deriving everything from scratch:\n");
+        body.push_str(&pack.text);
+    }
+    body
+}
+
+fn swarm_context_pack_prompt_block(context_pack: Option<&str>) -> String {
+    let Some(context_pack) = context_pack else {
+        return String::new();
+    };
+    if context_pack.trim().is_empty() {
+        return String::new();
+    }
     format!(
-        "You are swarm member `{}` in a Diff Forge Swarm Agents Panel run.\n\nTask:\n{}\n\nReturn an independent take: analyze the task, identify risks, and propose a concrete plan. Do not edit files or run destructive commands in this take phase. End your reply with a final line containing only `{}`.",
-        member.member_id, original_prompt, SWARM_TAKE_SENTINEL
+        "\n\nCONTEXT PACK (factual reference — verify before relying on it)\n{}\n",
+        context_pack.trim()
     )
 }
 
-fn swarm_synthesis_prompt(original_prompt: &str, mode: &str, takes: &[SwarmTakeResult]) -> String {
+fn swarm_take_prompt(
+    original_prompt: &str,
+    member: &SwarmMemberRef,
+    context_pack: Option<&str>,
+) -> String {
+    let mut body = String::new();
+    body.push_str("You are swarm member `");
+    body.push_str(&member.member_id);
+    body.push_str("` in a Diff Forge Swarm Agents Panel run.\n\nTask:\n");
+    body.push_str(original_prompt);
+    body.push_str(&swarm_context_pack_prompt_block(context_pack));
+    body.push_str("\nReturn an independent take: analyze the task, identify risks, and propose a concrete plan. Do not edit files or run destructive commands in this take phase. You may verify the context pack before relying on it and may explore beyond it. End your reply with a final line containing only `");
+    body.push_str(SWARM_TAKE_SENTINEL);
+    body.push_str("`.");
+    body
+}
+
+fn swarm_synthesis_prompt(
+    original_prompt: &str,
+    mode: &str,
+    takes: &[SwarmTakeResult],
+    context_pack: Option<&str>,
+) -> String {
     let mut body = String::new();
     body.push_str("You are the champion member for a Diff Forge Swarm Agents Panel run.\n\n");
     body.push_str("Original task:\n");
     body.push_str(original_prompt);
+    body.push_str(&swarm_context_pack_prompt_block(context_pack));
     body.push_str("\n\nIndependent member takes:\n");
     for take in takes {
         body.push_str("\n--- ");
@@ -878,12 +1122,16 @@ fn swarm_synthesis_prompt(original_prompt: &str, mode: &str, takes: &[SwarmTakeR
     body
 }
 
-fn swarm_strip_take_sentinel(text: &str) -> String {
+fn swarm_strip_sentinel(text: &str, sentinel: &str) -> String {
     let before_sentinel = text
-        .rfind(SWARM_TAKE_SENTINEL)
+        .rfind(sentinel)
         .map(|index| &text[..index])
         .unwrap_or(text);
     before_sentinel.trim().to_string()
+}
+
+fn swarm_strip_pack_sentinel(text: &str) -> String {
+    swarm_strip_sentinel(text, SWARM_PACK_SENTINEL)
 }
 
 fn swarm_tail_text_for_instance(instance: &TerminalInstance) -> Result<String, String> {
@@ -895,10 +1143,10 @@ fn swarm_tail_text_for_instance(instance: &TerminalInstance) -> Result<String, S
     Ok(String::from_utf8_lossy(&bytes).to_string())
 }
 
-fn swarm_capture_from_tail(text: &str) -> Option<String> {
+fn swarm_capture_from_tail(text: &str, sentinel: &str) -> Option<String> {
     let cleaned = cloud_mcp_clean_terminal_state_text(text);
-    let candidate = if cleaned.contains(SWARM_TAKE_SENTINEL) {
-        swarm_strip_take_sentinel(&cleaned)
+    let candidate = if cleaned.contains(sentinel) {
+        swarm_strip_sentinel(&cleaned, sentinel)
     } else {
         cleaned.trim().to_string()
     };
@@ -922,6 +1170,7 @@ async fn swarm_capture_final_message(
     terminal_state: &TerminalState,
     workspace_id: &str,
     member: &SwarmMemberRef,
+    sentinel: &str,
 ) -> Result<String, String> {
     let instance = {
         let terminals = terminal_state.terminals.read().await;
@@ -959,7 +1208,7 @@ async fn swarm_capture_final_message(
                     && message.kind != "tool"
                     && !message.text.trim().is_empty()
             }) {
-                let text = swarm_strip_take_sentinel(&message.text);
+                let text = swarm_strip_sentinel(&message.text, sentinel);
                 if !text.trim().is_empty() {
                     return Ok(text);
                 }
@@ -967,7 +1216,8 @@ async fn swarm_capture_final_message(
         }
     }
     let tail = swarm_tail_text_for_instance(&instance)?;
-    swarm_capture_from_tail(&tail).ok_or_else(|| "No assistant message was captured.".to_string())
+    swarm_capture_from_tail(&tail, sentinel)
+        .ok_or_else(|| "No assistant message was captured.".to_string())
 }
 
 async fn swarm_wait_member_idle(
@@ -1030,6 +1280,7 @@ async fn swarm_member_take_task(
     swarm_id: String,
     run_id: String,
     prompt: String,
+    context_pack: Option<String>,
     member: SwarmMemberRef,
     cancel: Arc<AtomicBool>,
 ) -> SwarmTakeResult {
@@ -1046,7 +1297,7 @@ async fn swarm_member_take_task(
     .await;
     swarm_emit_state(&app, &workspace_id, &swarm_id);
 
-    let prompt_text = swarm_take_prompt(&prompt, &member);
+    let prompt_text = swarm_take_prompt(&prompt, &member, context_pack.as_deref());
     let prompted = swarm_enqueue_prompt(&app, &member, &run_id, "take", prompt_text).await;
     if let Err(error) = prompted {
         let _ = swarm_append_run_event(
@@ -1153,7 +1404,14 @@ async fn swarm_member_take_task(
         };
     }
 
-    match swarm_capture_final_message(terminal_state.inner(), &workspace_id, &member).await {
+    match swarm_capture_final_message(
+        terminal_state.inner(),
+        &workspace_id,
+        &member,
+        SWARM_TAKE_SENTINEL,
+    )
+    .await
+    {
         Ok(text) => {
             if cancel.load(Ordering::SeqCst) {
                 return SwarmTakeResult {
@@ -1221,6 +1479,218 @@ async fn swarm_member_take_task(
     }
 }
 
+async fn swarm_context_pack_phase(
+    app: &AppHandle,
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    run_id: &str,
+    prompt: &str,
+    ready_members: &[SwarmMemberRef],
+    cancel: Arc<AtomicBool>,
+) -> Option<String> {
+    let (scout, repo_path, cached_pack) = {
+        let entry = swarm_entry(state, workspace_id, swarm_id).await;
+        let data = entry.lock().await;
+        (
+            swarm_choose_scout_from_data(&data, ready_members),
+            data.config.repo_path.clone(),
+            data.context_pack.clone(),
+        )
+    };
+    let Some(scout) = scout else {
+        let _ = swarm_append_run_event(
+            app,
+            state,
+            workspace_id,
+            swarm_id,
+            run_id,
+            "note",
+            None,
+            Some(
+                "No ready scout member was available; proceeding without context pack.".to_string(),
+            ),
+            Some(json!({ "phase": "context_pack" })),
+        )
+        .await;
+        return None;
+    };
+    if cancel.load(Ordering::SeqCst) {
+        return None;
+    }
+
+    let incremental = cached_pack.is_some();
+    let _ = swarm_append_run_event(
+        app,
+        state,
+        workspace_id,
+        swarm_id,
+        run_id,
+        "context_pack_started",
+        Some(scout.member_id.clone()),
+        Some("Context pack scout started.".to_string()),
+        Some(json!({ "incremental": incremental })),
+    )
+    .await;
+    swarm_update_member_status(
+        state,
+        workspace_id,
+        swarm_id,
+        &scout.member_id,
+        "working",
+        Some(false),
+        Some(swarm_now_ms()),
+        None,
+    )
+    .await;
+    swarm_emit_state(app, workspace_id, swarm_id);
+
+    let scout_prompt = swarm_context_pack_prompt(prompt, &repo_path, cached_pack.as_ref());
+    if let Err(error) =
+        swarm_enqueue_prompt(app, &scout, run_id, "context_pack", scout_prompt).await
+    {
+        let _ = swarm_append_run_event(
+            app,
+            state,
+            workspace_id,
+            swarm_id,
+            run_id,
+            "note",
+            Some(scout.member_id.clone()),
+            Some(format!(
+                "Scout prompt failed — proceeding without context pack: {error}"
+            )),
+            Some(json!({ "phase": "context_pack" })),
+        )
+        .await;
+        return None;
+    }
+
+    let terminal_state = app.state::<TerminalState>();
+    let idle = swarm_wait_member_idle(
+        state,
+        terminal_state.inner(),
+        app,
+        workspace_id,
+        swarm_id,
+        &scout,
+        Arc::clone(&cancel),
+        Duration::from_secs(SWARM_CONTEXT_PACK_TIMEOUT_SECS),
+    )
+    .await;
+    if let Err(error) = idle {
+        if cancel.load(Ordering::SeqCst) {
+            return None;
+        }
+        let text = if error.contains("Timed out") {
+            "scout timed out — proceeding without context pack".to_string()
+        } else {
+            format!("Scout failed — proceeding without context pack: {error}")
+        };
+        let _ = swarm_append_run_event(
+            app,
+            state,
+            workspace_id,
+            swarm_id,
+            run_id,
+            "note",
+            Some(scout.member_id.clone()),
+            Some(text),
+            Some(json!({ "phase": "context_pack" })),
+        )
+        .await;
+        return None;
+    }
+
+    let pack_text = match swarm_capture_final_message(
+        terminal_state.inner(),
+        workspace_id,
+        &scout,
+        SWARM_PACK_SENTINEL,
+    )
+    .await
+    {
+        Ok(text) => swarm_strip_pack_sentinel(&text),
+        Err(error) => {
+            if cancel.load(Ordering::SeqCst) {
+                return None;
+            }
+            let _ = swarm_append_run_event(
+                app,
+                state,
+                workspace_id,
+                swarm_id,
+                run_id,
+                "note",
+                Some(scout.member_id.clone()),
+                Some(format!(
+                    "Scout capture failed — proceeding without context pack: {error}"
+                )),
+                Some(json!({ "phase": "context_pack" })),
+            )
+            .await;
+            return None;
+        }
+    };
+    if pack_text.trim().is_empty() {
+        let _ = swarm_append_run_event(
+            app,
+            state,
+            workspace_id,
+            swarm_id,
+            run_id,
+            "note",
+            Some(scout.member_id.clone()),
+            Some(
+                "Scout returned an empty context pack; proceeding without context pack."
+                    .to_string(),
+            ),
+            Some(json!({ "phase": "context_pack" })),
+        )
+        .await;
+        return None;
+    }
+
+    match swarm_save_context_pack(workspace_id, swarm_id, &pack_text) {
+        Ok(cache) => {
+            let entry = swarm_entry(state, workspace_id, swarm_id).await;
+            let mut data = entry.lock().await;
+            data.context_pack = Some(cache);
+        }
+        Err(error) => {
+            let _ = swarm_append_run_event(
+                app,
+                state,
+                workspace_id,
+                swarm_id,
+                run_id,
+                "note",
+                Some(scout.member_id.clone()),
+                Some(format!("Unable to cache context pack: {error}")),
+                Some(json!({ "phase": "context_pack" })),
+            )
+            .await;
+        }
+    }
+
+    let chars = pack_text.chars().count();
+    let _ = swarm_append_run_event(
+        app,
+        state,
+        workspace_id,
+        swarm_id,
+        run_id,
+        "context_pack_ready",
+        Some(scout.member_id.clone()),
+        Some(pack_text.clone()),
+        Some(json!({ "chars": chars, "incremental": incremental })),
+    )
+    .await;
+    swarm_increment_member_stat(state, workspace_id, swarm_id, &scout.member_id, "scoutRuns").await;
+    swarm_emit_state(app, workspace_id, swarm_id);
+    Some(pack_text)
+}
+
 async fn swarm_increment_member_stat(
     state: &SwarmRuntimeState,
     workspace_id: &str,
@@ -1240,6 +1710,7 @@ async fn swarm_increment_member_stat(
         "championRuns" => member.stats.champion_runs = member.stats.champion_runs.saturating_add(1),
         "reaps" => member.stats.reaps = member.stats.reaps.saturating_add(1),
         "errors" => member.stats.errors = member.stats.errors.saturating_add(1),
+        "scoutRuns" => member.stats.scout_runs = member.stats.scout_runs.saturating_add(1),
         _ => {}
     }
 }
@@ -1289,6 +1760,13 @@ async fn swarm_mark_run_settled(
         )
         .await?;
         swarm_emit_state(app, workspace_id, swarm_id);
+        let _ = todo_dispatch_mark_active_for_swarm_completed(
+            app,
+            workspace_id,
+            swarm_id,
+            run_id,
+            status,
+        );
     }
     Ok(should_emit)
 }
@@ -1355,14 +1833,39 @@ async fn swarm_run_conductor(
     )
     .await;
 
+    let context_pack = swarm_context_pack_phase(
+        &app,
+        &state,
+        &workspace_id,
+        &swarm_id,
+        &run_id,
+        &prompt,
+        &ready_members,
+        Arc::clone(&cancel),
+    )
+    .await;
+    if cancel.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let terminal_state = app.state::<TerminalState>();
+    swarm_refresh_members_from_terminals(&state, terminal_state.inner(), &workspace_id, &swarm_id)
+        .await;
+    let take_members = {
+        let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+        let data = entry.lock().await;
+        swarm_ready_member_refs_from_data(&data)
+    };
+
     let mut tasks = Vec::new();
-    for member in ready_members.clone() {
+    for member in take_members.clone() {
         let task_app = app.clone();
         let task_state = state.clone();
         let task_workspace_id = workspace_id.clone();
         let task_swarm_id = swarm_id.clone();
         let task_run_id = run_id.clone();
         let task_prompt = prompt.clone();
+        let task_context_pack = context_pack.clone();
         let task_cancel = Arc::clone(&cancel);
         tasks.push(tauri::async_runtime::spawn(async move {
             swarm_member_take_task(
@@ -1372,6 +1875,7 @@ async fn swarm_run_conductor(
                 task_swarm_id,
                 task_run_id,
                 task_prompt,
+                task_context_pack,
                 member,
                 task_cancel,
             )
@@ -1426,7 +1930,7 @@ async fn swarm_run_conductor(
     }
 
     let Some(champion) =
-        swarm_choose_champion(&state, &workspace_id, &swarm_id, &takes, &ready_members).await
+        swarm_choose_champion(&state, &workspace_id, &swarm_id, &takes, &take_members).await
     else {
         let _ = swarm_mark_run_settled(
             &app,
@@ -1462,7 +1966,7 @@ async fn swarm_run_conductor(
     )
     .await;
 
-    let synthesis_prompt = swarm_synthesis_prompt(&prompt, &mode, &takes);
+    let synthesis_prompt = swarm_synthesis_prompt(&prompt, &mode, &takes, context_pack.as_deref());
     if let Err(error) =
         swarm_enqueue_prompt(&app, &champion, &run_id, "synthesis", synthesis_prompt).await
     {
@@ -1491,7 +1995,6 @@ async fn swarm_run_conductor(
         return;
     }
 
-    let terminal_state = app.state::<TerminalState>();
     match swarm_wait_member_idle(
         &state,
         terminal_state.inner(),
@@ -1505,8 +2008,13 @@ async fn swarm_run_conductor(
     .await
     {
         Ok(()) => {
-            match swarm_capture_final_message(terminal_state.inner(), &workspace_id, &champion)
-                .await
+            match swarm_capture_final_message(
+                terminal_state.inner(),
+                &workspace_id,
+                &champion,
+                SWARM_TAKE_SENTINEL,
+            )
+            .await
             {
                 Ok(text) => {
                     if cancel.load(Ordering::SeqCst) {
@@ -1786,6 +2294,7 @@ async fn swarm_configure(
     repo_path: String,
     members: Vec<MemberSpec>,
     champion_member_id: Option<String>,
+    scout_member_id: Option<String>,
 ) -> Result<SwarmState, String> {
     let repo_path = repo_path.trim().to_string();
     if repo_path.is_empty() {
@@ -1798,6 +2307,7 @@ async fn swarm_configure(
         &repo_path,
         resolved_members.clone(),
         champion_member_id,
+        scout_member_id,
     );
     swarm_save_config(&config)?;
 
@@ -1885,50 +2395,133 @@ async fn swarm_member_restart(
     Ok(swarm_state_from_data(&data))
 }
 
+async fn swarm_activate_internal(
+    app: &AppHandle,
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    repo_path: &str,
+    member_id: Option<String>,
+) -> Result<SwarmState, String> {
+    let repo_path = repo_path.trim().to_string();
+    let target_member_id = member_id
+        .map(|value| swarm_normalize_member_id(&value))
+        .filter(|value| !value.trim().is_empty());
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
+    let (to_close, to_spawn) = {
+        let mut data = entry.lock().await;
+        if !repo_path.is_empty() && data.config.repo_path != repo_path {
+            data.config.repo_path = repo_path.clone();
+            data.config.updated_at = swarm_now_ms();
+            let _ = swarm_save_config(&data.config);
+        }
+        if data.config.repo_path.trim().is_empty() {
+            return Err("repo_path is required.".to_string());
+        }
+        let mut to_close = Vec::new();
+        let mut to_spawn = Vec::new();
+        for member in data.members.values_mut() {
+            if let Some(target_member_id) = target_member_id.as_deref() {
+                if member.member_id != target_member_id {
+                    continue;
+                }
+            }
+            let needs_spawn = matches!(member.status.as_str(), "offline" | "dead" | "error")
+                || member.instance_id.is_none();
+            if !needs_spawn {
+                continue;
+            }
+            if member.instance_id.is_some() {
+                to_close.push(member.clone());
+            }
+            member.status = "spawning".to_string();
+            member.input_ready = false;
+            member.last_activity_at = swarm_now_ms();
+            member.last_error.clear();
+            to_spawn.push(member.member_id.clone());
+        }
+        (to_close, to_spawn)
+    };
+    for member in to_close {
+        let _ = swarm_close_member(app, &member).await;
+    }
+    for member_id in to_spawn {
+        swarm_spawn_member_and_update(app, state, workspace_id, swarm_id, &member_id).await;
+    }
+    swarm_emit_state(app, workspace_id, swarm_id);
+    let data = entry.lock().await;
+    Ok(swarm_state_from_data(&data))
+}
+
 #[tauri::command]
-async fn swarm_submit_task(
+async fn swarm_activate(
     app: AppHandle,
     state: State<'_, SwarmRuntimeState>,
-    terminal_state: State<'_, TerminalState>,
     workspace_id: String,
     swarm_id: String,
-    prompt: String,
-    mode: Option<String>,
-) -> Result<SwarmSubmitTaskResult, String> {
+    repo_path: String,
+    member_id: Option<String>,
+) -> Result<SwarmState, String> {
+    swarm_activate_internal(
+        &app,
+        state.inner(),
+        &workspace_id,
+        &swarm_id,
+        &repo_path,
+        member_id,
+    )
+    .await
+}
+
+pub(crate) async fn swarm_can_submit_task_internal(
+    state: &SwarmRuntimeState,
+    terminal_state: &TerminalState,
+    workspace_id: &str,
+    swarm_id: &str,
+) -> Result<(), String> {
+    swarm_refresh_members_from_terminals(state, terminal_state, workspace_id, swarm_id).await;
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
+    let data = entry.lock().await;
+    if !data.active_run_id.trim().is_empty() {
+        return Err("A swarm run is already active.".to_string());
+    }
+    if swarm_ready_member_refs_from_data(&data).is_empty() {
+        return Err("No swarm members are ready.".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) async fn swarm_submit_task_internal(
+    app: &AppHandle,
+    state: &SwarmRuntimeState,
+    terminal_state: &TerminalState,
+    workspace_id: &str,
+    swarm_id: &str,
+    prompt: &str,
+    mode: &str,
+) -> Result<String, String> {
     let prompt = prompt.trim().to_string();
     if prompt.is_empty() {
         return Err("prompt is required.".to_string());
     }
-    let mode = mode
-        .unwrap_or_else(|| "plan".to_string())
-        .trim()
-        .to_ascii_lowercase();
+    let mode = mode.trim().to_ascii_lowercase();
+    let mode = if mode.is_empty() {
+        "plan".to_string()
+    } else {
+        mode
+    };
     if !matches!(mode.as_str(), "plan" | "implement") {
         return Err("Swarm mode must be plan or implement.".to_string());
     }
 
-    swarm_refresh_members_from_terminals(&state, &terminal_state, &workspace_id, &swarm_id).await;
-    let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+    swarm_refresh_members_from_terminals(state, terminal_state, workspace_id, swarm_id).await;
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
     let (run_id, ready_members, cancel) = {
         let mut data = entry.lock().await;
         if !data.active_run_id.trim().is_empty() {
             return Err("A swarm run is already active.".to_string());
         }
-        let ready_members = data
-            .members
-            .values()
-            .filter_map(|member| {
-                if member.status == "ready" && member.input_ready {
-                    member.instance_id.map(|instance_id| SwarmMemberRef {
-                        member_id: member.member_id.clone(),
-                        pane_id: member.pane_id.clone(),
-                        instance_id,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
+        let ready_members = swarm_ready_member_refs_from_data(&data);
         if ready_members.is_empty() {
             return Err("No swarm members are ready.".to_string());
         }
@@ -1950,12 +2543,12 @@ async fn swarm_submit_task(
         );
         (run_id, ready_members, cancel)
     };
-    swarm_emit_state(&app, &workspace_id, &swarm_id);
+    swarm_emit_state(app, workspace_id, swarm_id);
 
     let task_app = app.clone();
-    let task_state = state.inner().clone();
-    let task_workspace_id = workspace_id.clone();
-    let task_swarm_id = swarm_id.clone();
+    let task_state = state.clone();
+    let task_workspace_id = workspace_id.to_string();
+    let task_swarm_id = swarm_id.to_string();
     let task_run_id = run_id.clone();
     let task_prompt = prompt.clone();
     let task_mode = mode.clone();
@@ -1974,6 +2567,29 @@ async fn swarm_submit_task(
         .await;
     });
 
+    Ok(run_id)
+}
+
+#[tauri::command]
+async fn swarm_submit_task(
+    app: AppHandle,
+    state: State<'_, SwarmRuntimeState>,
+    terminal_state: State<'_, TerminalState>,
+    workspace_id: String,
+    swarm_id: String,
+    prompt: String,
+    mode: Option<String>,
+) -> Result<SwarmSubmitTaskResult, String> {
+    let run_id = swarm_submit_task_internal(
+        &app,
+        state.inner(),
+        terminal_state.inner(),
+        &workspace_id,
+        &swarm_id,
+        &prompt,
+        mode.as_deref().unwrap_or("plan"),
+    )
+    .await?;
     Ok(SwarmSubmitTaskResult { run_id })
 }
 
@@ -2104,6 +2720,7 @@ mod swarm_runtime_tests {
             champion_runs: 2,
             reaps: 1,
             errors: 2,
+            scout_runs: 99,
         };
         assert_eq!(swarm_member_score(&stats), 4);
     }
@@ -2138,6 +2755,89 @@ mod swarm_runtime_tests {
             ..MemberSpec::default()
         }])
         .is_err());
+    }
+
+    #[test]
+    fn swarm_auto_scout_prefers_lowest_cost_then_member_order() {
+        let members = vec![
+            SwarmMemberRef {
+                member_id: "codex_first".to_string(),
+                provider: "codex".to_string(),
+                pane_id: "swarm:test:codex_first".to_string(),
+                instance_id: 1,
+            },
+            SwarmMemberRef {
+                member_id: "open_first".to_string(),
+                provider: "opencode".to_string(),
+                pane_id: "swarm:test:open_first".to_string(),
+                instance_id: 2,
+            },
+            SwarmMemberRef {
+                member_id: "open_second".to_string(),
+                provider: "opencode".to_string(),
+                pane_id: "swarm:test:open_second".to_string(),
+                instance_id: 3,
+            },
+            SwarmMemberRef {
+                member_id: "claude_last".to_string(),
+                provider: "claude".to_string(),
+                pane_id: "swarm:test:claude_last".to_string(),
+                instance_id: 4,
+            },
+        ];
+        let scout = swarm_choose_auto_scout(&members).unwrap();
+        assert_eq!(scout.member_id, "open_first");
+    }
+
+    #[test]
+    fn swarm_config_resolves_scout_member_id_to_auto_when_unknown() {
+        let members = swarm_resolve_member_specs(vec![
+            MemberSpec {
+                member_id: Some("researcher.one".to_string()),
+                provider: "codex".to_string(),
+                ..MemberSpec::default()
+            },
+            MemberSpec {
+                member_id: Some("cheap".to_string()),
+                provider: "opencode".to_string(),
+                ..MemberSpec::default()
+            },
+        ])
+        .unwrap();
+        let config = swarm_config_from_parts(
+            "workspace",
+            "swarm-abc",
+            "/repo",
+            members.clone(),
+            None,
+            Some("researcher.one".to_string()),
+        );
+        assert_eq!(config.scout_member_id, "researcher_one");
+        let auto_config = swarm_config_from_parts(
+            "workspace",
+            "swarm-abc",
+            "/repo",
+            members,
+            None,
+            Some("missing".to_string()),
+        );
+        assert_eq!(auto_config.scout_member_id, "");
+    }
+
+    #[test]
+    fn swarm_context_pack_file_round_trips_metadata() {
+        let pack = SwarmContextPackCache {
+            at: 42,
+            text: "Repo map\n- src-tauri: backend".to_string(),
+        };
+        let file_text = swarm_context_pack_file_text(&pack);
+        let parsed = swarm_parse_context_pack_file(&file_text, 7).unwrap();
+        assert_eq!(parsed.at, 42);
+        assert_eq!(parsed.text, pack.text);
+
+        let legacy = swarm_parse_context_pack_file("legacy pack", 7).unwrap();
+        assert_eq!(legacy.at, 7);
+        assert_eq!(legacy.text, "legacy pack");
     }
 
     #[test]

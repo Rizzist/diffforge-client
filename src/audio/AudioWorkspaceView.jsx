@@ -58,6 +58,8 @@ import {
   writeAudioWidgetStyle,
   readOrchestratorRealtimeEnabled,
   readOrchestratorVoiceSubmissionMode,
+  readAudioRealtimeTranscriptOverlayEnabled,
+  writeAudioRealtimeTranscriptOverlayEnabled,
   readAudioTranscriptionHistory,
   readAudioTranscriptionProvider,
   readAutoOpenAudioRecorder,
@@ -365,6 +367,8 @@ import {
   AudioBarCopyButton,
   AudioBarHistoryButton,
   AudioBarNoticeProgress,
+  AudioRealtimeTranscriptPill,
+  AudioWidgetTranscriptPopover,
   AudioBarIdleShell,
   AudioBarIdleReveal,
   AudioBarIdleLine,
@@ -570,6 +574,15 @@ const SHOW_OWN_KEY_DEEPGRAM_PROVIDER = false;
 // Recording: a slim Wispr-style pill bottom-center (X to cancel + waveform +
 // stop/spinner on the right), hovering just above the Dock/taskbar edge.
 const AUDIO_WIDGET_BAR_SIZE = { width: 124, height: 44 };
+// With the floating live transcript enabled the recording window carries a
+// one-line transcript pill above the bar, so it needs width for the line and
+// headroom above the 44px pill. Keep the Rust whole-hover constants in
+// src-tauri/src/audio.rs in sync with this size.
+const AUDIO_WIDGET_BAR_TRANSCRIPT_SIZE = { width: 460, height: 88 };
+// Extra window height for the live transcript pill above the bubble-style
+// recording pill; the window shifts up by the same amount (error-popover
+// mechanics) so the pill stays put on screen.
+const AUDIO_WIDGET_TRANSCRIPT_POPOVER_HEIGHT = 44;
 // The cancel notice needs room for its label plus close/copy/undo/history
 // controls, so the pill widens while it is showing. The bubble style reuses
 // the same pill (the window morphs to it in place, then morphs back).
@@ -857,7 +870,7 @@ const AudioDictionaryBottomJumpButton = styled.button`
   }
 `;
 
-function getAudioWidgetBarGeometry(cancelNoticeActive, barVisible, barIdleHover) {
+function getAudioWidgetBarGeometry(cancelNoticeActive, barVisible, barIdleHover, transcriptOverlay) {
   if (cancelNoticeActive) {
     return {
       key: "notice",
@@ -868,9 +881,9 @@ function getAudioWidgetBarGeometry(cancelNoticeActive, barVisible, barIdleHover)
 
   if (barVisible) {
     return {
-      key: "active",
+      key: transcriptOverlay ? "active-transcript" : "active",
       margin: AUDIO_WIDGET_BAR_BOTTOM_MARGIN,
-      size: AUDIO_WIDGET_BAR_SIZE,
+      size: transcriptOverlay ? AUDIO_WIDGET_BAR_TRANSCRIPT_SIZE : AUDIO_WIDGET_BAR_SIZE,
     };
   }
 
@@ -2935,6 +2948,9 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
   const [deepgramApiKey, setDeepgramApiKey] = useState(readDeepgramApiKey);
   const [deepgramLanguage, setDeepgramLanguage] = useState(readDeepgramLanguage);
   const [autoOpenRecorder, setAutoOpenRecorder] = useState(readAutoOpenAudioRecorder);
+  const [realtimeOverlayEnabled, setRealtimeOverlayEnabled] = useState(
+    readAudioRealtimeTranscriptOverlayEnabled,
+  );
   const [recorderMode, setRecorderMode] = useState(readAudioRecorderMode);
   const [orchestratorSubmissionMode, setOrchestratorSubmissionMode] = useState(readOrchestratorVoiceSubmissionMode);
   const [orchestratorRealtimeEnabled, setOrchestratorRealtimeEnabled] = useState(readOrchestratorRealtimeEnabled);
@@ -3888,6 +3904,15 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
       writeAutoOpenAudioRecorder(nextValue);
       return nextValue;
     });
+  }, []);
+
+  const toggleRealtimeOverlay = useCallback(() => {
+    setRealtimeOverlayEnabled((currentValue) => {
+      const nextValue = !currentValue;
+      writeAudioRealtimeTranscriptOverlayEnabled(nextValue);
+      return nextValue;
+    });
+    notifyAudioSettingsChanged("realtime-transcript-overlay");
   }, []);
 
   const updateRecorderMode = useCallback((nextMode) => {
@@ -5261,6 +5286,18 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                       Auto-open
                     </McpSwitchButton>
                   </AccountCardHeader>
+                  <AccountCardHeader>
+                    <div>
+                      <SettingsLabel>Floating live transcript</SettingsLabel>
+                      <SettingsHint>
+                        While you dictate, the realtime transcript floats in one line above the recorder.
+                      </SettingsHint>
+                    </div>
+                    <McpSwitchButton aria-pressed={realtimeOverlayEnabled} onClick={toggleRealtimeOverlay} type="button">
+                      <span aria-hidden="true" />
+                      Live transcript
+                    </McpSwitchButton>
+                  </AccountCardHeader>
                   <TrayClickGroup>
                     <div>
                       <SettingsLabel>Widget theme</SettingsLabel>
@@ -6163,7 +6200,9 @@ export function AudioWidgetWindow() {
   // while the pipeline is still arming or draining the final audio.
   const [finishPending, setFinishPending] = useState(false);
   const [cancelNotice, setCancelNotice] = useState(null);
-  const [cancelNoticePaused, setCancelNoticePaused] = useState(false);
+  const [widgetRealtimeOverlayEnabled, setWidgetRealtimeOverlayEnabled] = useState(
+    readAudioRealtimeTranscriptOverlayEnabled,
+  );
   const [widgetHistory, setWidgetHistory] = useState(readAudioTranscriptionHistory);
   const [historyTrayOpen, setHistoryTrayOpen] = useState(false);
   const [historyTrayClosing, setHistoryTrayClosing] = useState(false);
@@ -7273,6 +7312,20 @@ export function AudioWidgetWindow() {
   const sharedErrorFrameActive = Boolean(errorFrameText);
   const errorFrameActive = sharedErrorFrameActive && !usesBottomAnchoredStyle;
   const barErrorFrameActive = sharedErrorFrameActive && usesBottomAnchoredStyle;
+  // Floating live transcript: only while a take is actually in flight (the
+  // stale line must not linger through the close fade or the error state),
+  // and never while the error popover owns the headroom above the pill.
+  const transcriptTakeInFlight = widgetState === "arming"
+    || widgetState === "recording"
+    || widgetState === "transcribing";
+  const bubbleTranscriptFrameActive = widgetRealtimeOverlayEnabled
+    && !usesBottomAnchoredStyle
+    && !errorFrameActive
+    && transcriptTakeInFlight;
+  const barTranscriptPillVisible = widgetRealtimeOverlayEnabled
+    && usesBottomAnchoredStyle
+    && !cancelNoticeActive
+    && transcriptTakeInFlight;
   const barVisible = usesBottomAnchoredStyle
     && (widgetActive || cancelNoticeActive);
   const barActivePillVisible = usesBottomAnchoredStyle && barVisible && !cancelNoticeActive;
@@ -7288,7 +7341,12 @@ export function AudioWidgetWindow() {
     key: barGeometryKey,
     margin: barGeometryMargin,
     size: barGeometrySize,
-  } = getAudioWidgetBarGeometry(cancelNoticeActive, barGeometryVisible, barIdleHover);
+  } = getAudioWidgetBarGeometry(
+    cancelNoticeActive,
+    barGeometryVisible,
+    barIdleHover,
+    widgetRealtimeOverlayEnabled,
+  );
   const barGeometryReady = !usesBottomAnchoredStyle || barPlacementReadyKey === barGeometryKey;
   // Bubble style shows the same cancel notice pill as the bar: the window
   // morphs to the pill in place while it shows, then morphs back.
@@ -8485,6 +8543,49 @@ export function AudioWidgetWindow() {
     };
   }, [errorFrameActive, runWidgetWindowAction, widgetDragging]);
 
+  // Floating live transcript (bubble style): while dictating, the window
+  // grows upward by the pill headroom — error-popover mechanics — so the
+  // one-line realtime transcript can float above the recording pill without
+  // moving it on screen.
+  useEffect(() => {
+    if (!bubbleTranscriptFrameActive || widgetDragging) {
+      return undefined;
+    }
+    let savedPosition = null;
+    runWidgetWindowAction(async (windowHandle) => {
+      if (widgetDraggingRef.current) {
+        return;
+      }
+      const scale = await windowHandle.scaleFactor().catch(() => 1);
+      savedPosition = await windowHandle.outerPosition();
+      if (widgetDraggingRef.current) {
+        return;
+      }
+      await windowHandle.setSize(new LogicalSize(
+        AUDIO_WIDGET_FOCUS_SIZE.width,
+        AUDIO_WIDGET_FOCUS_SIZE.height + AUDIO_WIDGET_TRANSCRIPT_POPOVER_HEIGHT,
+      ));
+      await windowHandle.setPosition(new PhysicalPosition(
+        savedPosition.x,
+        savedPosition.y - Math.round(AUDIO_WIDGET_TRANSCRIPT_POPOVER_HEIGHT * (scale || 1)),
+      ));
+    });
+    return () => {
+      runWidgetWindowAction(async (windowHandle) => {
+        if (widgetDraggingRef.current) {
+          return;
+        }
+        await windowHandle.setSize(new LogicalSize(
+          AUDIO_WIDGET_FOCUS_SIZE.width,
+          AUDIO_WIDGET_FOCUS_SIZE.height,
+        ));
+        if (savedPosition && !widgetDraggingRef.current) {
+          await windowHandle.setPosition(savedPosition);
+        }
+      });
+    };
+  }, [bubbleTranscriptFrameActive, runWidgetWindowAction, widgetDragging]);
+
   // Bubble-style cancel notice: morph the window into the notice pill at the
   // bubble's spot (nudged left if it would run off-screen), then restore the
   // compact bubble exactly where it was once the notice dismisses.
@@ -8858,7 +8959,6 @@ export function AudioWidgetWindow() {
 
   const dismissCancelNotice = useCallback(() => {
     setCancelNotice(null);
-    setCancelNoticePaused(false);
   }, []);
 
   // Live-stream mirror for the Activity widget: while a take is in flight,
@@ -8933,7 +9033,6 @@ export function AudioWidgetWindow() {
 
   const showCancelNotice = useCallback(() => {
     cancelNoticeIdRef.current += 1;
-    setCancelNoticePaused(false);
     setCancelNotice({ id: cancelNoticeIdRef.current });
   }, []);
 
@@ -8941,7 +9040,6 @@ export function AudioWidgetWindow() {
     const noticeId = cancelNoticeIdRef.current;
     undoRequestedIdRef.current = noticeId;
     setCancelNotice(null);
-    setCancelNoticePaused(false);
 
     const pending = lastCancelledRef.current;
     if (pending?.noticeId !== noticeId || !pending?.entry?.text) {
@@ -9902,6 +10000,7 @@ export function AudioWidgetWindow() {
       setRecorderMode(readAudioRecorderMode());
       setAudioWidgetTheme(readAudioWidgetTheme());
       setWidgetStyle(nextWidgetStyle);
+      setWidgetRealtimeOverlayEnabled(readAudioRealtimeTranscriptOverlayEnabled());
       setTranscriptionProvider(readAudioTranscriptionProvider());
       setDeepgramApiKey(readDeepgramApiKey());
       setDeepgramLanguage(readDeepgramLanguage());
@@ -10705,12 +10804,7 @@ export function AudioWidgetWindow() {
   // One cancel-notice surface for both widget styles: X to dismiss now, copy,
   // undo (paste into target), open history, and the drain-to-zero auto-close.
   const cancelNoticeSurface = cancelNotice ? (
-    <AudioBarSurface
-      data-paused={cancelNoticePaused ? "true" : undefined}
-      onMouseEnter={() => setCancelNoticePaused(true)}
-      onMouseLeave={() => setCancelNoticePaused(false)}
-      role="status"
-    >
+    <AudioBarSurface role="status">
       <AudioBarCancelButton
         aria-label="Dismiss"
         onClick={(event) => {
@@ -10829,6 +10923,16 @@ export function AudioWidgetWindow() {
           data-theme={audioWidgetTheme}
           data-visible={barVisible && !barClosingActive && barGeometryReady ? "true" : "false"}
         >
+          {barTranscriptPillVisible ? (
+            <AudioRealtimeTranscriptPill
+              aria-live="polite"
+              data-empty={realtimeTranscript ? undefined : "true"}
+            >
+              <span>
+                <bdi>{realtimeTranscript || "Listening…"}</bdi>
+              </span>
+            </AudioRealtimeTranscriptPill>
+          ) : null}
           {cancelNotice ? cancelNoticeSurface : (
             <AudioBarSurface
               key={barGeometryReady ? `${barGeometryKey}-ready` : `${barGeometryKey}-pending`}
@@ -10913,6 +11017,18 @@ export function AudioWidgetWindow() {
         <AudioWidgetErrorPopover data-theme={audioWidgetTheme} role="alert" title={errorFrameText}>
           {errorFrameText}
         </AudioWidgetErrorPopover>
+      )}
+      {bubbleTranscriptFrameActive && !widgetDragging && (
+        <AudioWidgetTranscriptPopover data-theme={audioWidgetTheme}>
+          <AudioRealtimeTranscriptPill
+            aria-live="polite"
+            data-empty={realtimeTranscript ? undefined : "true"}
+          >
+            <span>
+              <bdi>{realtimeTranscript || "Listening…"}</bdi>
+            </span>
+          </AudioRealtimeTranscriptPill>
+        </AudioWidgetTranscriptPopover>
       )}
       <AudioWidgetShell
         aria-label={widgetLabel}

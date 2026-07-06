@@ -3,20 +3,29 @@ import { createPortal } from "react-dom";
 import styled from "styled-components";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { revealItemInDir } from "@tauri-apps/plugin-opener";
+import { openUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import AppSelect from "../app/AppSelect.jsx";
 import { emitVideoAssetDrag } from "./videoDragEvents.js";
 import {
   GENERATION_KINDS,
-  GENERATION_PROVIDER_LABEL,
+  estimateModelCredits,
   estimateModelUsd,
   generationModels,
   getGenerationModel,
+  readGenerationRouting,
+  writeGenerationRouting,
 } from "./generationCatalog.js";
+import {
+  getVideoProvider,
+  videoProviderAuth,
+  videoProviderKeyReady,
+  writeVideoProviderKey,
+} from "./videoProviders.js";
 import { VIDEO_CODE_TOOLS_PROGRESS_EVENT, VIDEO_GENERATE_PROGRESS_EVENT } from "./videoPanelBridge.js";
 import {
   VideoErrorText,
   VideoHint,
+  VideoInput,
   VideoLabel,
   VideoPaneButton,
   VideoProgressFill,
@@ -82,6 +91,118 @@ const HistoryList = styled.div`
   gap: 6px;
   padding: 10px;
   align-content: start;
+`;
+
+// Cloud-vs-API-key chooser: slides over the whole form on first open (no
+// routing chosen yet) and whenever the ⚙ routing button is pressed.
+const ModeSlide = styled.div`
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 12px;
+  overflow-y: auto;
+  background: #020304;
+
+  html[data-forge-theme="light"] & {
+    background: #f4f6fb;
+  }
+`;
+
+const ModeCard = styled.button`
+  appearance: none;
+  text-align: left;
+  display: grid;
+  gap: 7px;
+  padding: 12px;
+  border-radius: 11px;
+  border: 1px solid rgba(148, 163, 184, 0.2);
+  background: rgba(9, 13, 20, 0.72);
+  color: inherit;
+  cursor: pointer;
+
+  &:hover {
+    border-color: rgba(96, 165, 250, 0.55);
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(16, 185, 129, 0.6);
+    background: rgba(16, 185, 129, 0.08);
+  }
+
+  html[data-forge-theme="light"] & {
+    background: #ffffff;
+  }
+`;
+
+const ModeCardTitle = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 850;
+  color: rgba(226, 232, 240, 0.96);
+
+  html[data-forge-theme="light"] & {
+    color: #0f172a;
+  }
+`;
+
+const ModeCardBody = styled.div`
+  font-size: 10.5px;
+  font-weight: 550;
+  line-height: 1.45;
+  color: #8fa0b8;
+`;
+
+const ModeWarn = styled.div`
+  display: grid;
+  gap: 6px;
+  padding: 8px 9px;
+  border-radius: 8px;
+  border: 1px solid rgba(251, 191, 36, 0.35);
+  background: rgba(251, 191, 36, 0.08);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1.45;
+  color: #fcd34d;
+
+  html[data-forge-theme="light"] & {
+    color: #92400e;
+  }
+`;
+
+const ModeChip = styled.button`
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  background: rgba(9, 13, 20, 0.6);
+  color: #cbd5f5;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  padding: 4px 10px;
+  border-radius: 999px;
+  white-space: nowrap;
+  cursor: pointer;
+
+  &[data-route="cloud"] {
+    border-color: rgba(96, 165, 250, 0.45);
+    color: #bfdbfe;
+  }
+
+  &[data-route="api"] {
+    border-color: rgba(16, 185, 129, 0.45);
+    color: #a7f3d0;
+  }
+
+  &:hover {
+    border-color: rgba(226, 232, 240, 0.5);
+  }
 `;
 
 const KindTabs = styled.div`
@@ -642,6 +763,74 @@ export default function GeneratePanel({
     [repoPath],
   );
 
+  // Billing routing: Diff Forge Cloud credits vs the user's own provider
+  // keys. Unset on first open → the chooser slide is forced until picked.
+  const [routing, setRouting] = useState(readGenerationRouting);
+  const [routingOpen, setRoutingOpen] = useState(false);
+  // Bumped whenever a key field changes so key-derived render state refreshes
+  // (the keys themselves live in localStorage via videoProviders.js).
+  const [, setProviderKeysVersion] = useState(0);
+  const chooseRouting = useCallback((mode) => {
+    writeGenerationRouting(mode);
+    setRouting(mode);
+    setRoutingOpen(false);
+  }, []);
+
+  // Remaining Diff Forge credit balance — shown beside the cloud estimate so
+  // "do I have enough for this run?" is answered before submitting.
+  const [creditsRemaining, setCreditsRemaining] = useState(null);
+  const refreshCreditsRemaining = useCallback(() => {
+    invoke("cloud_mcp_get_billing_status")
+      .then((status) => {
+        const credits = status?.credits || {};
+        const remaining = Number(
+          credits.termRemainingCredits ?? credits.term_remaining_credits,
+        );
+        setCreditsRemaining(Number.isFinite(remaining) ? remaining : null);
+      })
+      .catch(() => {});
+  }, []);
+  useEffect(() => {
+    refreshCreditsRemaining();
+  }, [refreshCreditsRemaining]);
+
+  const [buyingCredits, setBuyingCredits] = useState(false);
+  const buyCredits = useCallback(async () => {
+    setBuyingCredits(true);
+    setError("");
+    try {
+      const checkout = await invoke("desktop_billing_start_topup_checkout", { packs: 1 });
+      const url = String(checkout?.url || "");
+      if (!/^https:\/\//i.test(url)) {
+        throw new Error("Checkout link unavailable — make sure you're signed in.");
+      }
+      await openUrl(url);
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setBuyingCredits(false);
+    }
+  }, []);
+
+  const setProviderKeyField = useCallback((providerId, field, value) => {
+    writeVideoProviderKey(providerId, { [field]: value });
+    setProviderKeysVersion((version) => version + 1);
+  }, []);
+
+  // The route the CURRENT model would take: api only when the user chose it
+  // AND the model has a direct provider mapping — everything else stays cloud.
+  const directRoute = routing === "api" && !isCodeKind ? model?.direct || null : null;
+  const directProvider = directRoute ? getVideoProvider(directRoute.providerId) : null;
+  const directAuth = directRoute ? videoProviderAuth(directRoute.providerId) : null;
+  const directKeyReady = directRoute ? videoProviderKeyReady(directRoute.providerId) : false;
+  const routingChooserVisible = !routing || routingOpen;
+
+  useEffect(() => {
+    if (routingChooserVisible) {
+      refreshCreditsRemaining();
+    }
+  }, [refreshCreditsRemaining, routingChooserVisible]);
+
   // Job history (persisted registry) — every job's request snapshot can be
   // reloaded into the form for editing/re-running.
   const loadHistory = useCallback(() => {
@@ -794,6 +983,8 @@ export default function GeneratePanel({
       // shows the final state (and output previews) without reopening.
       if (payload.done || payload.error) {
         loadHistory();
+        // Settled cloud jobs captured credits — refresh the balance readout.
+        refreshCreditsRemaining();
       }
     })
       .then((next) => {
@@ -809,7 +1000,7 @@ export default function GeneratePanel({
       disposed = true;
       unlisten();
     };
-  }, [loadHistory, onGenerated]);
+  }, [loadHistory, onGenerated, refreshCreditsRemaining]);
 
   // History display list: registry snapshots overlaid with live progress
   // (percent/state/error) by jobId; live jobs not yet in the registry lead.
@@ -949,6 +1140,14 @@ export default function GeneratePanel({
       setError(`${model.displayName} needs a voice audio input.`);
       return;
     }
+    if (directRoute && !directKeyReady) {
+      setError(
+        `Enter your ${directProvider?.label || "provider"} API key${
+          directProvider?.requiresSecretKey ? " and secret" : ""
+        } below (or switch to Cloud via the routing chip).`,
+      );
+      return;
+    }
     try {
       if (model.kind === "code") {
         // Two-phase local render: this only declares the job + scaffolds the
@@ -986,9 +1185,11 @@ export default function GeneratePanel({
       const result = await invoke("video_generate_start", {
         repoPath,
         request: {
-          providerId: "cloud",
-          // The cloud's model table is keyed by provider job-type ids.
-          model: model.jobType,
+          // Cloud runs by jobType with server-side keys; the api route hits
+          // the provider directly with the locally stored key. Either way the
+          // same planned-path ghost + progress pipeline drives the timeline.
+          providerId: directRoute ? directRoute.providerId : "cloud",
+          model: directRoute ? directRoute.model : model.jobType,
           kind: model.kind,
           mode:
             model.kind === "audio"
@@ -1015,7 +1216,9 @@ export default function GeneratePanel({
             seed: null,
           },
           loraId: null,
-          auth: { apiKey: "", secretKey: "", baseUrl: "" },
+          auth: directRoute
+            ? videoProviderAuth(directRoute.providerId)
+            : { apiKey: "", secretKey: "", baseUrl: "" },
         },
       });
       const planned = Array.isArray(result?.plannedPaths) ? result.plannedPaths : [];
@@ -1031,9 +1234,16 @@ export default function GeneratePanel({
     } catch (err) {
       setError(String(err));
     }
-  }, [aspect, caps, codeFps, durationSec, genMode, intoTimeline, loadHistory, model, numImages, onPlannedClip, prompt, quality, repoPath, resolution, slots, sound, voice]);
+  }, [aspect, caps, codeFps, directKeyReady, directProvider, directRoute, durationSec, genMode, intoTimeline, loadHistory, model, numImages, onPlannedClip, prompt, quality, repoPath, resolution, slots, sound, voice]);
 
   const estUsd = estimateModelUsd(model, { durationSec, numImages });
+  const estCredits = estimateModelCredits(model, { durationSec, numImages });
+  const insufficientCredits =
+    !directRoute
+    && !isCodeKind
+    && estCredits != null
+    && creditsRemaining != null
+    && creditsRemaining < estCredits;
 
   const referenceSlotCount = Math.min(caps.maxReferenceImages || 0, 4);
   const showSlots = caps.supportsStartFrame || caps.supportsEndFrame || referenceSlotCount > 0 || caps.requiresInputAudio;
@@ -1066,7 +1276,7 @@ export default function GeneratePanel({
 
   return (
     <PanelRoot data-video-generate="true">
-      <FormScroll {...(historyOpen ? { inert: "" } : {})}>
+      <FormScroll {...(historyOpen || routingChooserVisible ? { inert: "" } : {})}>
       <KindTabs>
         {GENERATION_KINDS.map((entry) => (
           <KindTab
@@ -1085,11 +1295,33 @@ export default function GeneratePanel({
       <Section>
         <ProviderRow>
           <VideoLabel as="span" style={{ display: "inline" }}>
-            Provider
+            {isCodeKind ? "Provider" : "Billing"}
           </VideoLabel>
-          <ProviderChip>{isCodeKind ? "⌁ Local render" : `⚡ ${GENERATION_PROVIDER_LABEL}`}</ProviderChip>
+          {isCodeKind ? (
+            <ProviderChip>⌁ Local render</ProviderChip>
+          ) : (
+            <ModeChip
+              data-route={directRoute ? "api" : "cloud"}
+              onClick={() => setRoutingOpen(true)}
+              title={
+                directRoute
+                  ? `Runs on your ${directProvider?.label || ""} API key — billed by the provider at cost. Click to change.`
+                  : "Runs on Diff Forge Cloud and bills your credits. Click to change."
+              }
+              type="button"
+            >
+              {directRoute ? `🔑 ${directProvider?.label || "API"} key` : "☁ Cloud credits"}
+              <span aria-hidden>⚙</span>
+            </ModeChip>
+          )}
           <span style={{ flex: 1 }} />
         </ProviderRow>
+        {routing === "api" && !isCodeKind && model && !model.direct ? (
+          <VideoHint>
+            {model.displayName} has no direct API route yet — this one runs on Diff Forge Cloud
+            credits.
+          </VideoHint>
+        ) : null}
         {isCodeKind ? (
           codeInstall ? (
             <div style={{ display: "grid", gap: 4 }}>
@@ -1147,12 +1379,45 @@ export default function GeneratePanel({
               onChange={setModelId}
               options={models.map((entry) => ({
                 value: entry.id,
-                label: entry.displayName + (entry.description ? ` — ${entry.description}` : ""),
+                label:
+                  entry.displayName +
+                  (entry.description ? ` — ${entry.description}` : "") +
+                  (routing === "api" && !isCodeKind ? (entry.direct ? " · API" : " · Cloud") : ""),
               }))}
               value={model?.id || ""}
             />
           </CompactSelect>
         </VideoLabel>
+        {directRoute && directProvider ? (
+          <div style={{ display: "grid", gap: 6 }}>
+            <VideoLabel>
+              {directProvider.label} API key
+              <VideoInput
+                autoComplete="off"
+                onChange={(event) => setProviderKeyField(directRoute.providerId, "apiKey", event.target.value)}
+                placeholder={directProvider.keyHint || "API key"}
+                type="password"
+                value={directAuth?.apiKey || ""}
+              />
+            </VideoLabel>
+            {directProvider.requiresSecretKey ? (
+              <VideoLabel>
+                {directProvider.label} secret key
+                <VideoInput
+                  autoComplete="off"
+                  onChange={(event) => setProviderKeyField(directRoute.providerId, "secretKey", event.target.value)}
+                  placeholder="Secret key"
+                  type="password"
+                  value={directAuth?.secretKey || ""}
+                />
+              </VideoLabel>
+            ) : null}
+            <VideoHint>
+              Stored on this device only and sent straight to {directProvider.label} with each
+              request — never through Diff Forge Cloud.
+            </VideoHint>
+          </div>
+        ) : null}
         <VideoLabel>
           {caps.promptLabel || "Prompt"}
           <VideoTextArea
@@ -1347,8 +1612,38 @@ export default function GeneratePanel({
           >
             History
           </VideoSecondaryButton>
-          {estUsd != null ? (
-            <VideoHint title="Ballpark cost — billed through your Diff Forge cloud">≈ ${estUsd.toFixed(2)}</VideoHint>
+          {!isCodeKind && directRoute && estUsd != null ? (
+            <VideoHint title="Ballpark — billed by the provider directly to your API key">
+              ≈ ${estUsd.toFixed(2)} via your key
+            </VideoHint>
+          ) : null}
+          {!isCodeKind && !directRoute && estCredits != null ? (
+            <>
+              <VideoHint title="Matches the cloud's reserve formula for this model — billed as Diff Forge credits. AI video generation is expensive; consider your own API keys for regular use.">
+                ≈ {estCredits.toLocaleString()} credits
+              </VideoHint>
+              {creditsRemaining != null ? (
+                <VideoHint
+                  style={insufficientCredits ? { color: "#fca5a5", fontWeight: 700 } : undefined}
+                  title={
+                    insufficientCredits
+                      ? "Not enough credits for this run — top up or switch to your own API key."
+                      : "Your remaining Diff Forge credit balance."
+                  }
+                >
+                  · {creditsRemaining.toLocaleString()} left
+                  {insufficientCredits ? " — not enough" : ""}
+                </VideoHint>
+              ) : null}
+              <VideoSecondaryButton
+                disabled={buyingCredits}
+                onClick={buyCredits}
+                title="Top up Diff Forge credits (Stripe checkout)"
+                type="button"
+              >
+                {buyingCredits ? "Opening…" : "＋ Credits"}
+              </VideoSecondaryButton>
+            </>
           ) : null}
           {model?.kind === "video" || model?.kind === "code" ? (
             <VideoHint
@@ -1373,6 +1668,102 @@ export default function GeneratePanel({
         </InlineRow>
       </Section>
       </FormScroll>
+      {routingChooserVisible ? (
+        <ModeSlide>
+          <SectionTitle>AI generation billing</SectionTitle>
+          <VideoHint>
+            Choose how generations run. You can change this anytime from the billing chip in the
+            form.
+          </VideoHint>
+          <ModeCard
+            as="div"
+            data-active={routing === "api" ? "true" : "false"}
+            onClick={() => chooseRouting("api")}
+            role="button"
+            tabIndex={0}
+          >
+            <ModeCardTitle>
+              🔑 Your API keys
+              <span
+                style={{
+                  fontSize: 9,
+                  fontWeight: 800,
+                  letterSpacing: "0.05em",
+                  textTransform: "uppercase",
+                  color: "#a7f3d0",
+                  border: "1px solid rgba(16, 185, 129, 0.4)",
+                  borderRadius: 999,
+                  padding: "1px 7px",
+                }}
+              >
+                Recommended
+              </span>
+            </ModeCardTitle>
+            <ModeCardBody>
+              Bring your own provider keys (Higgsfield platform, OpenAI, …). Generations bill the
+              provider directly at cost — usually the cheapest way to generate a lot. Keys stay on
+              this device and go straight to the provider with each request. Models without a
+              direct route automatically fall back to Cloud.
+            </ModeCardBody>
+          </ModeCard>
+          <ModeCard
+            as="div"
+            data-active={routing === "cloud" ? "true" : "false"}
+            onClick={() => chooseRouting("cloud")}
+            role="button"
+            tabIndex={0}
+          >
+            <ModeCardTitle>
+              ☁ Diff Forge Cloud
+              {creditsRemaining != null ? (
+                <span
+                  style={{
+                    fontSize: 9.5,
+                    fontWeight: 800,
+                    color: "#93c5fd",
+                    border: "1px solid rgba(96, 165, 250, 0.4)",
+                    borderRadius: 999,
+                    padding: "1px 8px",
+                  }}
+                >
+                  {creditsRemaining.toLocaleString()} credits left
+                </span>
+              ) : null}
+            </ModeCardTitle>
+            <ModeCardBody>
+              Zero setup — every model works out of the box and bills your Diff Forge credits.
+            </ModeCardBody>
+            <ModeWarn>
+              <span>
+                ⚠ AI video generation is expensive and can burn through your credits quickly — a
+                single clip can cost the equivalent of several dollars. For regular use we
+                recommend your own API keys.
+              </span>
+              <span>
+                <VideoSecondaryButton
+                  disabled={buyingCredits}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    buyCredits();
+                  }}
+                  title="Top up Diff Forge credits (Stripe checkout)"
+                  type="button"
+                >
+                  {buyingCredits ? "Opening checkout…" : "＋ Buy credits"}
+                </VideoSecondaryButton>
+              </span>
+            </ModeWarn>
+          </ModeCard>
+          {routing ? (
+            <InlineRow>
+              <VideoSecondaryButton onClick={() => setRoutingOpen(false)} type="button">
+                ‹ Back
+              </VideoSecondaryButton>
+            </InlineRow>
+          ) : null}
+          {error ? <VideoErrorText>{error}</VideoErrorText> : null}
+        </ModeSlide>
+      ) : null}
       <HistorySlide data-open={historyOpen ? "true" : "false"} {...(historyOpen ? {} : { inert: "" })}>
         <HistoryHeader>
           <VideoSecondaryButton onClick={() => setHistoryOpen(false)} type="button">

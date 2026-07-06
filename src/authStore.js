@@ -141,6 +141,23 @@ function applyNativeSnapshot(nextSnapshot) {
       return snapshot;
     }
   }
+  // Value-identical snapshots (ignoring the churn counters) must be no-ops:
+  // re-persisting to localStorage and waking every listener per redundant
+  // native event is how auth-event feedback loops storm the whole app.
+  const { version: _prevVersion, updatedAtMs: _prevUpdated, ...previousRest } = snapshot;
+  const { version: _nextVersion, updatedAtMs: _nextUpdated, ...nextRest } = normalized;
+  if (snapshotValuesEqual(previousRest, nextRest)) {
+    // Keep the SAME object identity: replacing it here (even without waking
+    // listeners) made useSyncExternalStore see a "changed" store on every
+    // render pass and force another render — with the native bridge emitting
+    // redundant auth events during session restore, that chained into a
+    // full-shell render storm (~1,700+ commits/5s at boot). Only the internal
+    // ordering counters advance, mutated in place; nothing consumes them
+    // reactively.
+    snapshot.version = Number(normalized.version || 0);
+    snapshot.updatedAtMs = Number(normalized.updatedAtMs || 0);
+    return snapshot;
+  }
   snapshot = normalized;
   persistAuthenticatedSnapshot(snapshot);
   listeners.forEach((listener) => listener());

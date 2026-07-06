@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { memo, useEffect, useState } from "react";
 import { PlanFlame } from "./PlanFlame.jsx";
 import { getRenderabilitySnapshot, subscribeToRenderability } from "./renderability.js";
 import {
@@ -27,7 +27,9 @@ const AUTH_TILE_BURSTS = Array.from({ length: 156 }, (_, index) => {
   return [col, row, delay, duration, peak];
 });
 
-export function AuthSquareBackdrop({ tone = "default" } = {}) {
+// memo: the tile field is static per tone; App-level state churn (connection
+// status, sync events) must not re-reconcile 156 animated spans per commit.
+export const AuthSquareBackdrop = memo(function AuthSquareBackdrop({ tone = "default" } = {}) {
   const [renderable, setRenderable] = useState(() => getRenderabilitySnapshot().renderable);
 
   useEffect(() => {
@@ -54,7 +56,7 @@ export function AuthSquareBackdrop({ tone = "default" } = {}) {
       ))}
     </SquareField>
   );
-}
+});
 
 export default function WorkspaceIdleState({
   actionLabel = "",

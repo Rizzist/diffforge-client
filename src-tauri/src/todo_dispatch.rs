@@ -287,6 +287,12 @@ fn todo_dispatch_normalize_receipt(key: &str, receipt: &Value, now_ms: u64) -> O
             "deviceId",
             "originDeviceId",
             "targetDeviceId",
+            "targetKind",
+            "target_kind",
+            "targetSwarmId",
+            "target_swarm_id",
+            "swarmRunId",
+            "swarm_run_id",
             "workspaceName",
             "statusReason",
             "resumePending",
@@ -522,8 +528,8 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
-    let notify_completion_is_fresh =
-        status != "completed" || todo_dispatch_completed_receipt_fresh_for_notification(&Value::Object(merged.clone()));
+    let notify_completion_is_fresh = status != "completed"
+        || todo_dispatch_completed_receipt_fresh_for_notification(&Value::Object(merged.clone()));
 
     let mut next = current.clone();
     if let Some(object) = next.as_object_mut() {
@@ -541,7 +547,11 @@ pub(crate) fn todo_dispatch_record_receipt_internal(
             TODO_DISPATCH_RECEIPTS_UPDATED_EVENT,
             todo_dispatch_receipts_payload(workspace_id, &next, reason),
         );
-        if before_active > 0 && after_active == 0 && status == "completed" && notify_completion_is_fresh {
+        if before_active > 0
+            && after_active == 0
+            && status == "completed"
+            && notify_completion_is_fresh
+        {
             todo_dispatch_maybe_notify_drained(app, workspace_id, &workspace_name, &last_text);
         }
     }
@@ -560,12 +570,12 @@ fn todo_dispatch_remote_command_is_queue_action(command_kind: &str) -> bool {
         command_kind.as_str(),
         "" | "create_task"
             | "remote_command_create_task"
-	            | "task_create"
-	            | "todo_create"
-	            | "todo_queue"
-	            | "queue_todo"
-	            | "workspace_todo_queue"
-	            | "terminal_orchestrator_send_message"
+            | "task_create"
+            | "todo_create"
+            | "todo_queue"
+            | "queue_todo"
+            | "workspace_todo_queue"
+            | "terminal_orchestrator_send_message"
             | "terminal_send_message"
             | "orchestrator_send_message"
             | "loopspace_send_message"
@@ -663,19 +673,39 @@ fn todo_dispatch_remote_intake_already_current(
     }
     todo_dispatch_remote_intake_field_matches(
         item,
-        &["targetTerminalId", "target_terminal_id", "paneId", "pane_id"],
+        &[
+            "targetTerminalId",
+            "target_terminal_id",
+            "paneId",
+            "pane_id",
+        ],
         target_terminal_id,
     ) && todo_dispatch_remote_intake_i64_field_matches(
         item,
-        &["targetTerminalIndex", "target_terminal_index", "terminalIndex", "terminal_index"],
+        &[
+            "targetTerminalIndex",
+            "target_terminal_index",
+            "terminalIndex",
+            "terminal_index",
+        ],
         target_terminal_index,
     ) && todo_dispatch_remote_intake_field_matches(
         item,
-        &["targetTerminalName", "target_terminal_name", "terminalName", "terminal_name"],
+        &[
+            "targetTerminalName",
+            "target_terminal_name",
+            "terminalName",
+            "terminal_name",
+        ],
         target_terminal_name,
     ) && todo_dispatch_remote_intake_field_matches(
         item,
-        &["targetThreadId", "target_thread_id", "threadId", "thread_id"],
+        &[
+            "targetThreadId",
+            "target_thread_id",
+            "threadId",
+            "thread_id",
+        ],
         target_thread_id,
     ) && todo_dispatch_remote_intake_field_matches(
         item,
@@ -683,11 +713,21 @@ fn todo_dispatch_remote_intake_already_current(
         target_agent_id,
     ) && todo_dispatch_remote_intake_i64_field_matches(
         item,
-        &["targetColorSlot", "target_color_slot", "colorSlot", "color_slot"],
+        &[
+            "targetColorSlot",
+            "target_color_slot",
+            "colorSlot",
+            "color_slot",
+        ],
         target_color_slot,
     ) && todo_dispatch_remote_intake_field_matches(
         item,
-        &["targetTerminalColor", "target_terminal_color", "terminalColor", "terminal_color"],
+        &[
+            "targetTerminalColor",
+            "target_terminal_color",
+            "terminalColor",
+            "terminal_color",
+        ],
         target_terminal_color,
     ) && todo_dispatch_remote_intake_field_matches(
         item,
@@ -810,7 +850,8 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
             "browserClientId",
         ],
     );
-    let origin_workspace_id = todo_dispatch_text(event, &["origin_workspace_id", "originWorkspaceId"]);
+    let origin_workspace_id =
+        todo_dispatch_text(event, &["origin_workspace_id", "originWorkspaceId"]);
     let webview_dispatcher_active = todo_dispatch_webview_dispatcher_active();
     let lifecycle_owner = if webview_dispatcher_active {
         "webview"
@@ -994,9 +1035,12 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                     json!(text.chars().take(120).collect::<String>()),
                                 );
                                 object.insert("updatedAt".to_string(), json!(now_iso.clone()));
+                                object.insert(
+                                    "updatedAtMs".to_string(),
+                                    json!(todo_dispatch_now_ms()),
+                                );
                                 object
-                                    .insert("updatedAtMs".to_string(), json!(todo_dispatch_now_ms()));
-                                object.insert("workspaceId".to_string(), json!(workspace_id.clone()));
+                                    .insert("workspaceId".to_string(), json!(workspace_id.clone()));
                                 if !target_terminal_id.is_empty() {
                                     object.insert(
                                         "targetTerminalId".to_string(),
@@ -1034,9 +1078,18 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                     );
                                 }
                                 if !requested_model.is_empty() {
-                                    object.insert("model".to_string(), json!(requested_model.clone()));
-                                    object.insert("model_id".to_string(), json!(requested_model.clone()));
-                                    object.insert("modelId".to_string(), json!(requested_model.clone()));
+                                    object.insert(
+                                        "model".to_string(),
+                                        json!(requested_model.clone()),
+                                    );
+                                    object.insert(
+                                        "model_id".to_string(),
+                                        json!(requested_model.clone()),
+                                    );
+                                    object.insert(
+                                        "modelId".to_string(),
+                                        json!(requested_model.clone()),
+                                    );
                                 }
                                 if !requested_reasoning_effort.is_empty() {
                                     object.insert(
@@ -1053,7 +1106,10 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                     );
                                 }
                                 if !requested_speed.is_empty() {
-                                    object.insert("speed".to_string(), json!(requested_speed.clone()));
+                                    object.insert(
+                                        "speed".to_string(),
+                                        json!(requested_speed.clone()),
+                                    );
                                 }
                                 if target_explicit {
                                     object.insert("targetExplicit".to_string(), json!(true));
@@ -1098,7 +1154,8 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                 if let Some(remote_object) = remote.as_object_mut() {
                                     remote_object
                                         .insert("commandId".to_string(), json!(command_id.clone()));
-                                    remote_object.insert("todoId".to_string(), json!(todo_id.clone()));
+                                    remote_object
+                                        .insert("todoId".to_string(), json!(todo_id.clone()));
                                     if !target_terminal_id.is_empty() {
                                         remote_object.insert(
                                             "targetTerminalId".to_string(),
@@ -1106,8 +1163,10 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         );
                                     }
                                     if let Some(index) = target_terminal_index {
-                                        remote_object
-                                            .insert("targetTerminalIndex".to_string(), json!(index));
+                                        remote_object.insert(
+                                            "targetTerminalIndex".to_string(),
+                                            json!(index),
+                                        );
                                     }
                                     if !target_terminal_name.is_empty() {
                                         remote_object.insert(
@@ -1128,8 +1187,10 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         );
                                     }
                                     if let Some(color_slot) = target_color_slot {
-                                        remote_object
-                                            .insert("targetColorSlot".to_string(), json!(color_slot));
+                                        remote_object.insert(
+                                            "targetColorSlot".to_string(),
+                                            json!(color_slot),
+                                        );
                                     }
                                     if !target_terminal_color.is_empty() {
                                         remote_object.insert(
@@ -1138,14 +1199,18 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         );
                                     }
                                     if !requested_model.is_empty() {
-                                        remote_object
-                                            .insert("model".to_string(), json!(requested_model.clone()));
+                                        remote_object.insert(
+                                            "model".to_string(),
+                                            json!(requested_model.clone()),
+                                        );
                                         remote_object.insert(
                                             "model_id".to_string(),
                                             json!(requested_model.clone()),
                                         );
-                                        remote_object
-                                            .insert("modelId".to_string(), json!(requested_model.clone()));
+                                        remote_object.insert(
+                                            "modelId".to_string(),
+                                            json!(requested_model.clone()),
+                                        );
                                     }
                                     if !requested_reasoning_effort.is_empty() {
                                         remote_object.insert(
@@ -1162,8 +1227,10 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         );
                                     }
                                     if !requested_speed.is_empty() {
-                                        remote_object
-                                            .insert("speed".to_string(), json!(requested_speed.clone()));
+                                        remote_object.insert(
+                                            "speed".to_string(),
+                                            json!(requested_speed.clone()),
+                                        );
                                     }
                                     remote_object.insert(
                                         "originClientId".to_string(),
@@ -1181,7 +1248,11 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                                         .insert("source".to_string(), json!(remote_intake_source));
                                 }
                             }
-                            todo_store_set_item_status(existing, intake_status, "remote_todo_intake");
+                            todo_store_set_item_status(
+                                existing,
+                                intake_status,
+                                "remote_todo_intake",
+                            );
                             todo_store_set_item_lifecycle_owner(existing, lifecycle_owner);
                             changed_item = Some(existing.clone());
                             changed_kind = "remote_todo_updated";
@@ -1210,18 +1281,42 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                     }
                 } else {
                     let item = json!({
-                        "id": command_id,
-                        "kind": "todo",
-                        "text": text,
-                        "body": text,
-                        "title": text.chars().take(120).collect::<String>(),
+                    "id": command_id,
+                    "kind": "todo",
+                    "text": text,
+                    "body": text,
+                    "title": text.chars().take(120).collect::<String>(),
+                    "todoId": todo_id,
+                    "todo_id": todo_id,
+                    "todoStatus": intake_status,
+                    "status": intake_status,
+                    "createdAt": now_iso,
+                    "updatedAt": now_iso,
+                    "workspaceId": workspace_id,
+                    "targetTerminalId": target_terminal_id,
+                    "targetTerminalIndex": target_terminal_index,
+                    "targetTerminalName": target_terminal_name,
+                    "targetThreadId": target_thread_id,
+                    "targetAgentId": target_agent_id,
+                    "targetColorSlot": target_color_slot,
+                    "targetTerminalColor": target_terminal_color,
+                    "targetExplicit": target_explicit,
+                    "originClientId": origin_client_id,
+                    "origin_client_id": origin_client_id,
+                    "originDeviceId": origin_device_id,
+                    "origin_device_id": origin_device_id,
+                    "originWorkspaceId": origin_workspace_id,
+                    "origin_workspace_id": origin_workspace_id,
+                    "model": requested_model.clone(),
+                    "model_id": requested_model.clone(),
+                    "modelId": requested_model.clone(),
+                    "reasoning_effort": requested_reasoning_effort.clone(),
+                    "reasoningEffort": requested_reasoning_effort.clone(),
+                    "effort": requested_reasoning_effort.clone(),
+                    "speed": requested_speed.clone(),
+                        "remoteCommand": {
+                        "commandId": command_id,
                         "todoId": todo_id,
-                        "todo_id": todo_id,
-                        "todoStatus": intake_status,
-                        "status": intake_status,
-                        "createdAt": now_iso,
-                        "updatedAt": now_iso,
-                        "workspaceId": workspace_id,
                         "targetTerminalId": target_terminal_id,
                         "targetTerminalIndex": target_terminal_index,
                         "targetTerminalName": target_terminal_name,
@@ -1229,47 +1324,23 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
                         "targetAgentId": target_agent_id,
                         "targetColorSlot": target_color_slot,
                         "targetTerminalColor": target_terminal_color,
-                        "targetExplicit": target_explicit,
                         "originClientId": origin_client_id,
-                        "origin_client_id": origin_client_id,
                         "originDeviceId": origin_device_id,
-                        "origin_device_id": origin_device_id,
                         "originWorkspaceId": origin_workspace_id,
-                        "origin_workspace_id": origin_workspace_id,
                         "model": requested_model.clone(),
                         "model_id": requested_model.clone(),
-                        "modelId": requested_model.clone(),
+                        "modelId": requested_model,
                         "reasoning_effort": requested_reasoning_effort.clone(),
                         "reasoningEffort": requested_reasoning_effort.clone(),
-                        "effort": requested_reasoning_effort.clone(),
-                        "speed": requested_speed.clone(),
-	                        "remoteCommand": {
-                            "commandId": command_id,
-                            "todoId": todo_id,
-                            "targetTerminalId": target_terminal_id,
-                            "targetTerminalIndex": target_terminal_index,
-                            "targetTerminalName": target_terminal_name,
-                            "targetThreadId": target_thread_id,
-                            "targetAgentId": target_agent_id,
-                            "targetColorSlot": target_color_slot,
-                            "targetTerminalColor": target_terminal_color,
-                            "originClientId": origin_client_id,
-                            "originDeviceId": origin_device_id,
-                            "originWorkspaceId": origin_workspace_id,
-                            "model": requested_model.clone(),
-                            "model_id": requested_model.clone(),
-                            "modelId": requested_model,
-                            "reasoning_effort": requested_reasoning_effort.clone(),
-                            "reasoningEffort": requested_reasoning_effort.clone(),
-                            "effort": requested_reasoning_effort,
-                            "speed": requested_speed,
-	                            "source": remote_intake_source,
-	                        },
-                            "lifecycleOwner": lifecycle_owner,
-                            "lifecycle_owner": lifecycle_owner,
-                            "rustOwned": lifecycle_owner == "rust",
-                            "rust_owned": lifecycle_owner == "rust",
-	                    });
+                        "effort": requested_reasoning_effort,
+                        "speed": requested_speed,
+                            "source": remote_intake_source,
+                        },
+                        "lifecycleOwner": lifecycle_owner,
+                        "lifecycle_owner": lifecycle_owner,
+                        "rustOwned": lifecycle_owner == "rust",
+                        "rust_owned": lifecycle_owner == "rust",
+                    });
                     items.push(item.clone());
                     changed_item = Some(item);
                 }
@@ -1450,9 +1521,9 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
         "provider-turn-interrupted" => Some("interrupted"),
         _ => None,
     };
-	    let Some(settle_status) = settle_status else {
-	        return;
-	    };
+    let Some(settle_status) = settle_status else {
+        return;
+    };
     let settled_prompt_text = payload
         .user_message
         .as_deref()
@@ -1471,7 +1542,7 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
         );
         return;
     }
-	    let workspace_id = payload.workspace_id.trim().to_string();
+    let workspace_id = payload.workspace_id.trim().to_string();
     if workspace_id.is_empty() {
         log_terminal_status_event(
             "backend.todo_dispatch.hook_settle_skip",
@@ -1555,9 +1626,9 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
             .filter(|(_, _, _, score)| *score > 0)
             .cloned()
             .collect::<Vec<_>>();
-	        if matches.is_empty() && active.len() == 1 && turn_refs.is_empty() {
-	            matches = active.clone();
-	        }
+        if matches.is_empty() && active.len() == 1 && turn_refs.is_empty() {
+            matches = active.clone();
+        }
         matches.sort_by(|left, right| right.3.cmp(&left.3).then_with(|| right.2.cmp(&left.2)));
         matches
             .first()
@@ -1574,8 +1645,8 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
             })
     });
 
-	    let (command_id, receipt, match_source) = if let Some(matched) = matched {
-	        matched
+    let (command_id, receipt, match_source) = if let Some(matched) = matched {
+        matched
     } else {
         if !turn_refs.is_empty() {
             log_terminal_status_event(
@@ -3293,13 +3364,28 @@ fn todo_dispatch_todo_sync_commit_payload(
     });
     if let Some(meta_object) = meta.as_object_mut() {
         if !origin_client_id.is_empty() {
-            meta_object.insert("origin_client_id".to_string(), json!(origin_client_id.clone()));
-            meta_object.insert("originClientId".to_string(), json!(origin_client_id.clone()));
+            meta_object.insert(
+                "origin_client_id".to_string(),
+                json!(origin_client_id.clone()),
+            );
+            meta_object.insert(
+                "originClientId".to_string(),
+                json!(origin_client_id.clone()),
+            );
         }
         if !origin_device_id.is_empty() {
-            meta_object.insert("origin_device_id".to_string(), json!(origin_device_id.clone()));
-            meta_object.insert("originDeviceId".to_string(), json!(origin_device_id.clone()));
-            meta_object.insert("request_device_id".to_string(), json!(origin_device_id.clone()));
+            meta_object.insert(
+                "origin_device_id".to_string(),
+                json!(origin_device_id.clone()),
+            );
+            meta_object.insert(
+                "originDeviceId".to_string(),
+                json!(origin_device_id.clone()),
+            );
+            meta_object.insert(
+                "request_device_id".to_string(),
+                json!(origin_device_id.clone()),
+            );
             meta_object.insert("requestDeviceId".to_string(), json!(origin_device_id));
         }
         if !origin_workspace_id.is_empty() {
@@ -3376,12 +3462,7 @@ fn todo_store_delete_mode_from_text(value: &str) -> Option<TodoStoreDeleteMode> 
 fn todo_dispatch_remote_delete_mode(event: &Value) -> Option<TodoStoreDeleteMode> {
     todo_store_delete_mode_from_text(&todo_dispatch_text(
         event,
-        &[
-            "delete_mode",
-            "deleteMode",
-            "deletion_mode",
-            "deletionMode",
-        ],
+        &["delete_mode", "deleteMode", "deletion_mode", "deletionMode"],
     ))
 }
 
@@ -3533,8 +3614,7 @@ fn todo_store_enqueue_delete_todo_sync_commit(
         reason,
         origin,
         delete_mode,
-    )
-    else {
+    ) else {
         return;
     };
     let app = app.clone();
@@ -4125,33 +4205,68 @@ fn todo_store_build_created_item(
         ("command_id", &["command_id", "commandId"][..]),
         (
             "dispatchId",
-            &["dispatchId", "dispatch_id", "todoDispatchId", "todo_dispatch_id"][..],
+            &[
+                "dispatchId",
+                "dispatch_id",
+                "todoDispatchId",
+                "todo_dispatch_id",
+            ][..],
         ),
         (
             "dispatch_id",
-            &["dispatch_id", "dispatchId", "todo_dispatch_id", "todoDispatchId"][..],
+            &[
+                "dispatch_id",
+                "dispatchId",
+                "todo_dispatch_id",
+                "todoDispatchId",
+            ][..],
         ),
         (
             "lastDispatchId",
-            &["lastDispatchId", "last_dispatch_id", "dispatchId", "dispatch_id"][..],
+            &[
+                "lastDispatchId",
+                "last_dispatch_id",
+                "dispatchId",
+                "dispatch_id",
+            ][..],
         ),
         (
             "last_dispatch_id",
-            &["last_dispatch_id", "lastDispatchId", "dispatch_id", "dispatchId"][..],
+            &[
+                "last_dispatch_id",
+                "lastDispatchId",
+                "dispatch_id",
+                "dispatchId",
+            ][..],
         ),
         ("loopspaceId", &["loopspaceId", "loopspace_id"][..]),
         ("loopspace_id", &["loopspace_id", "loopspaceId"][..]),
         (
             "loopRuntimeNodeId",
-            &["loopRuntimeNodeId", "loop_runtime_node_id", "nodeId", "node_id"][..],
+            &[
+                "loopRuntimeNodeId",
+                "loop_runtime_node_id",
+                "nodeId",
+                "node_id",
+            ][..],
         ),
         (
             "loop_runtime_node_id",
-            &["loop_runtime_node_id", "loopRuntimeNodeId", "node_id", "nodeId"][..],
+            &[
+                "loop_runtime_node_id",
+                "loopRuntimeNodeId",
+                "node_id",
+                "nodeId",
+            ][..],
         ),
         (
             "nodeId",
-            &["nodeId", "node_id", "loopRuntimeNodeId", "loop_runtime_node_id"][..],
+            &[
+                "nodeId",
+                "node_id",
+                "loopRuntimeNodeId",
+                "loop_runtime_node_id",
+            ][..],
         ),
         (
             "todoNumber",
@@ -4373,7 +4488,13 @@ fn todo_store_dispatch_workspace_ids(request: &Value) -> Vec<String> {
                 let id = if item.is_object() {
                     todo_dispatch_text(
                         &item,
-                        &["workspaceId", "workspace_id", "id", "targetWorkspaceId", "target_workspace_id"],
+                        &[
+                            "workspaceId",
+                            "workspace_id",
+                            "id",
+                            "targetWorkspaceId",
+                            "target_workspace_id",
+                        ],
                     )
                 } else {
                     item.as_str().unwrap_or_default().trim().to_string()
@@ -4398,10 +4519,9 @@ fn todo_store_dispatch_workspace_ids(request: &Value) -> Vec<String> {
 }
 
 fn todo_store_dispatch_todo_drafts(request: &Value) -> Vec<Value> {
-    if let Some(items) = todo_store_dispatch_array_field(
-        request,
-        &["todoItems", "todo_items", "todos", "items"],
-    ) {
+    if let Some(items) =
+        todo_store_dispatch_array_field(request, &["todoItems", "todo_items", "todos", "items"])
+    {
         return items
             .into_iter()
             .filter_map(|item| {
@@ -4493,7 +4613,12 @@ async fn todo_store_dispatch_loopspace_batch(
         let loopspace_id = todo_dispatch_text(&request, &["loopspaceId", "loopspace_id"]);
         let node_id = todo_dispatch_text(
             &request,
-            &["nodeId", "node_id", "loopRuntimeNodeId", "loop_runtime_node_id"],
+            &[
+                "nodeId",
+                "node_id",
+                "loopRuntimeNodeId",
+                "loop_runtime_node_id",
+            ],
         );
         let requested_batch_id = todo_dispatch_text(
             &request,
@@ -4511,30 +4636,117 @@ async fn todo_store_dispatch_loopspace_batch(
         };
         let target_terminal_index = todo_store_dispatch_optional_i64(
             &request,
-            &["targetTerminalIndex", "target_terminal_index", "terminalIndex", "terminal_index"],
+            &[
+                "targetTerminalIndex",
+                "target_terminal_index",
+                "terminalIndex",
+                "terminal_index",
+            ],
         );
         let target_terminal_id = todo_dispatch_text(
             &request,
-            &["targetTerminalId", "target_terminal_id", "terminalId", "terminal_id", "paneId", "pane_id"],
+            &[
+                "targetTerminalId",
+                "target_terminal_id",
+                "terminalId",
+                "terminal_id",
+                "paneId",
+                "pane_id",
+            ],
         );
 
         let mut base = serde_json::Map::new();
         for (target_key, source_keys) in [
-            ("deviceId", &["deviceId", "device_id", "sourceDeviceId", "source_device_id"][..]),
-            ("targetDeviceId", &["targetDeviceId", "target_device_id", "deviceId", "device_id"][..]),
-            ("targetAgentId", &["targetAgentId", "target_agent_id", "agentId", "agent_id"][..]),
-            ("targetTerminalId", &["targetTerminalId", "target_terminal_id", "terminalId", "terminal_id", "paneId", "pane_id"][..]),
-            ("targetTerminalName", &["targetTerminalName", "target_terminal_name", "terminalName", "terminal_name"][..]),
-            ("targetThreadId", &["targetThreadId", "target_thread_id", "threadId", "thread_id"][..]),
+            (
+                "deviceId",
+                &[
+                    "deviceId",
+                    "device_id",
+                    "sourceDeviceId",
+                    "source_device_id",
+                ][..],
+            ),
+            (
+                "targetDeviceId",
+                &[
+                    "targetDeviceId",
+                    "target_device_id",
+                    "deviceId",
+                    "device_id",
+                ][..],
+            ),
+            (
+                "targetAgentId",
+                &["targetAgentId", "target_agent_id", "agentId", "agent_id"][..],
+            ),
+            (
+                "targetTerminalId",
+                &[
+                    "targetTerminalId",
+                    "target_terminal_id",
+                    "terminalId",
+                    "terminal_id",
+                    "paneId",
+                    "pane_id",
+                ][..],
+            ),
+            (
+                "targetTerminalName",
+                &[
+                    "targetTerminalName",
+                    "target_terminal_name",
+                    "terminalName",
+                    "terminal_name",
+                ][..],
+            ),
+            (
+                "targetThreadId",
+                &[
+                    "targetThreadId",
+                    "target_thread_id",
+                    "threadId",
+                    "thread_id",
+                ][..],
+            ),
             ("model", &["model", "modelId", "model_id"][..]),
-            ("reasoningEffort", &["reasoningEffort", "reasoning_effort", "effort"][..]),
-            ("effort", &["effort", "reasoningEffort", "reasoning_effort"][..]),
+            (
+                "reasoningEffort",
+                &["reasoningEffort", "reasoning_effort", "effort"][..],
+            ),
+            (
+                "effort",
+                &["effort", "reasoningEffort", "reasoning_effort"][..],
+            ),
             ("speed", &["speed", "serviceTier", "service_tier"][..]),
             ("loopspaceId", &["loopspaceId", "loopspace_id"][..]),
             ("loopspace_id", &["loopspace_id", "loopspaceId"][..]),
-            ("loopRuntimeNodeId", &["loopRuntimeNodeId", "loop_runtime_node_id", "nodeId", "node_id"][..]),
-            ("loop_runtime_node_id", &["loop_runtime_node_id", "loopRuntimeNodeId", "node_id", "nodeId"][..]),
-            ("nodeId", &["nodeId", "node_id", "loopRuntimeNodeId", "loop_runtime_node_id"][..]),
+            (
+                "loopRuntimeNodeId",
+                &[
+                    "loopRuntimeNodeId",
+                    "loop_runtime_node_id",
+                    "nodeId",
+                    "node_id",
+                ][..],
+            ),
+            (
+                "loop_runtime_node_id",
+                &[
+                    "loop_runtime_node_id",
+                    "loopRuntimeNodeId",
+                    "node_id",
+                    "nodeId",
+                ][..],
+            ),
+            (
+                "nodeId",
+                &[
+                    "nodeId",
+                    "node_id",
+                    "loopRuntimeNodeId",
+                    "loop_runtime_node_id",
+                ][..],
+            ),
         ] {
             todo_store_dispatch_insert_text(&mut base, &request, target_key, source_keys);
         }
@@ -4600,7 +4812,12 @@ async fn todo_store_dispatch_loopspace_batch(
                 };
                 let dispatch_id = todo_dispatch_text(
                     &Value::Object(draft_object.clone()),
-                    &["dispatchId", "dispatch_id", "todoDispatchId", "todo_dispatch_id"],
+                    &[
+                        "dispatchId",
+                        "dispatch_id",
+                        "todoDispatchId",
+                        "todo_dispatch_id",
+                    ],
                 );
                 let dispatch_id = if dispatch_id.is_empty() {
                     format!("{todo_id}-dispatch")
@@ -4617,7 +4834,10 @@ async fn todo_store_dispatch_loopspace_batch(
                 draft_object.insert("lastDispatchId".to_string(), json!(dispatch_id.clone()));
                 draft_object.insert("last_dispatch_id".to_string(), json!(dispatch_id));
                 draft_object.insert("targetWorkspaceId".to_string(), json!(workspace_id.clone()));
-                draft_object.insert("target_workspace_id".to_string(), json!(workspace_id.clone()));
+                draft_object.insert(
+                    "target_workspace_id".to_string(),
+                    json!(workspace_id.clone()),
+                );
                 draft_object.insert("workspaceId".to_string(), json!(workspace_id.clone()));
                 draft_object.insert("todoNumber".to_string(), json!(sequence));
                 draft_object.insert("todo_number".to_string(), json!(sequence));
@@ -4646,7 +4866,13 @@ async fn todo_store_dispatch_loopspace_batch(
                     let current_status = todo_store_item_status(&stored_items[index]);
                     if matches!(
                         current_status.as_str(),
-                        "running" | "completed" | "failed" | "cancelled" | "interrupted" | "timed_out" | "deleted"
+                        "running"
+                            | "completed"
+                            | "failed"
+                            | "cancelled"
+                            | "interrupted"
+                            | "timed_out"
+                            | "deleted"
                     ) {
                         result_items.push(stored_items[index].clone());
                         all_items.push(stored_items[index].clone());
@@ -5891,6 +6117,12 @@ fn todo_store_copy_lifecycle_fields_from_stored(stored: &Value, item: &mut Value
         "targetTerminalId",
         "targetTerminalIndex",
         "targetThreadId",
+        "targetKind",
+        "target_kind",
+        "targetSwarmId",
+        "target_swarm_id",
+        "swarmRunId",
+        "swarm_run_id",
         "targetExplicit",
         "explicitTarget",
         "userPinnedTarget",
@@ -6024,6 +6256,12 @@ fn todo_store_apply_newer_store_status_core(
                     "targetTerminalId",
                     "targetTerminalIndex",
                     "targetThreadId",
+                    "targetKind",
+                    "target_kind",
+                    "targetSwarmId",
+                    "target_swarm_id",
+                    "swarmRunId",
+                    "swarm_run_id",
                 ] {
                     match stored.get(key).filter(|value| !value.is_null()) {
                         Some(value) => {
@@ -6577,6 +6815,7 @@ fn todo_dispatch_active_queue_item_ids_for_pane_matching(
         .iter()
         .filter(|item| {
             todo_dispatch_queue_item_active_for_settlement(item)
+                && !todo_dispatch_value_has_swarm_target(item)
                 && todo_store_item_pane_id(item) == pane_id.trim()
                 && todo_dispatch_queue_item_fresh_for_completion_settlement(item)
                 && todo_dispatch_prompt_identity_matches_value(item, prompt_event_id, prompt_text)
@@ -6814,6 +7053,7 @@ fn todo_dispatch_mark_active_for_pane_completed(
             .iter()
             .filter(|(_, receipt)| {
                 todo_dispatch_receipt_active_for_settlement(receipt)
+                    && !todo_dispatch_value_has_swarm_target(receipt)
                     && todo_dispatch_receipt_submitted_after_app_start(receipt)
                     && todo_dispatch_text(receipt, &["paneId", "pane_id"]) == pane_id
                     && todo_dispatch_prompt_identity_matches_value(
@@ -6882,6 +7122,164 @@ fn todo_dispatch_mark_active_for_pane_completed(
             "prompt_event_id": prompt_event_id.trim(),
             "prompt_text_len": prompt_text.trim().len(),
             "reason": reason,
+            "workspace_id": workspace_id,
+        }),
+    );
+
+    settled.len()
+}
+
+fn todo_dispatch_swarm_run_status_to_todo_status(status: &str) -> &'static str {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "done" | "complete" | "completed" | "success" => "completed",
+        "cancelled" | "canceled" => "cancelled",
+        "interrupted" | "aborted" => "interrupted",
+        "timed_out" | "timeout" => "timed_out",
+        "failed" | "error" => "failed",
+        _ => "failed",
+    }
+}
+
+fn todo_dispatch_value_matches_swarm_run(
+    value: &Value,
+    swarm_id: &str,
+    run_id: &str,
+    allow_missing_run_id: bool,
+) -> bool {
+    if todo_dispatch_text(
+        value,
+        &["targetSwarmId", "target_swarm_id", "swarmId", "swarm_id"],
+    ) != swarm_id
+    {
+        return false;
+    }
+    let value_run_id =
+        todo_dispatch_text(value, &["swarmRunId", "swarm_run_id", "runId", "run_id"]);
+    value_run_id == run_id || (allow_missing_run_id && value_run_id.is_empty())
+}
+
+fn todo_dispatch_active_queue_item_ids_for_swarm(
+    workspace_id: &str,
+    swarm_id: &str,
+    run_id: &str,
+) -> Vec<String> {
+    let Some(path) = todo_dispatch_data_path("queues", workspace_id) else {
+        return Vec::new();
+    };
+    let snapshot = todo_dispatch_queue_read(&path);
+    let Some(items) = snapshot.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter(|item| {
+            todo_dispatch_queue_item_active_for_settlement(item)
+                && todo_dispatch_value_matches_swarm_run(item, swarm_id, run_id, false)
+        })
+        .map(todo_dispatch_queue_item_command_id)
+        .filter(|id| !id.trim().is_empty())
+        .collect()
+}
+
+pub(crate) fn todo_dispatch_mark_active_for_swarm_completed(
+    app: &AppHandle,
+    workspace_id: &str,
+    swarm_id: &str,
+    run_id: &str,
+    run_status: &str,
+) -> usize {
+    let workspace_id = workspace_id.trim();
+    let swarm_id = swarm_id.trim();
+    let run_id = run_id.trim();
+    if workspace_id.is_empty() || swarm_id.is_empty() || run_id.is_empty() {
+        return 0;
+    }
+
+    let todo_status = todo_dispatch_swarm_run_status_to_todo_status(run_status);
+    let reason = format!("swarm_run_{run_status}");
+    let now_iso = chrono_like_now_iso();
+    let mut settled = HashSet::<String>::new();
+
+    let receipts = todo_dispatch_load(workspace_id);
+    if let Some(entries) = receipts.as_object() {
+        let receipt_matches = entries
+            .iter()
+            .filter(|(_, receipt)| {
+                todo_dispatch_receipt_active_for_settlement(receipt)
+                    && todo_dispatch_value_matches_swarm_run(receipt, swarm_id, run_id, true)
+            })
+            .map(|(command_id, receipt)| (command_id.clone(), receipt.clone()))
+            .collect::<Vec<_>>();
+        for (command_id, mut receipt) in receipt_matches {
+            if let Some(object) = receipt.as_object_mut() {
+                object.insert("status".to_string(), json!(todo_status));
+                object.insert("statusReason".to_string(), json!(reason.clone()));
+                object.insert("targetKind".to_string(), json!("swarm"));
+                object.insert("target_kind".to_string(), json!("swarm"));
+                object.insert("targetSwarmId".to_string(), json!(swarm_id));
+                object.insert("target_swarm_id".to_string(), json!(swarm_id));
+                object.insert("swarmRunId".to_string(), json!(run_id));
+                object.insert("swarm_run_id".to_string(), json!(run_id));
+                object.insert("updatedAt".to_string(), json!(now_iso.clone()));
+                object.insert("updatedAtMs".to_string(), json!(todo_dispatch_now_ms()));
+                match todo_status {
+                    "completed" => {
+                        object.insert("completedAt".to_string(), json!(now_iso.clone()));
+                        object.insert("todoCompletedAt".to_string(), json!(now_iso.clone()));
+                    }
+                    "cancelled" => {
+                        object.insert("cancelledAt".to_string(), json!(now_iso.clone()));
+                        object.insert("todoCancelledAt".to_string(), json!(now_iso.clone()));
+                    }
+                    "failed" => {
+                        object.insert("failedAt".to_string(), json!(now_iso.clone()));
+                        object.insert("todoFailedAt".to_string(), json!(now_iso.clone()));
+                    }
+                    "interrupted" => {
+                        object.insert("interruptedAt".to_string(), json!(now_iso.clone()));
+                        object.insert("todoInterruptedAt".to_string(), json!(now_iso.clone()));
+                    }
+                    "timed_out" => {
+                        object.insert("timedOutAt".to_string(), json!(now_iso.clone()));
+                        object.insert("todoTimedOutAt".to_string(), json!(now_iso.clone()));
+                    }
+                    _ => {}
+                }
+            }
+            let _ = todo_dispatch_record_receipt_internal(
+                Some(app),
+                workspace_id,
+                receipt,
+                "swarm_run_settled",
+            );
+            if !command_id.trim().is_empty() {
+                todo_dispatch_queue_mark_settled(Some(app), workspace_id, &command_id, todo_status);
+                settled.insert(command_id);
+            }
+        }
+    }
+
+    for command_id in todo_dispatch_active_queue_item_ids_for_swarm(workspace_id, swarm_id, run_id)
+    {
+        if settled.contains(&command_id) {
+            continue;
+        }
+        todo_dispatch_queue_mark_settled(Some(app), workspace_id, &command_id, todo_status);
+        settled.insert(command_id);
+    }
+
+    log_terminal_status_event(
+        if settled.is_empty() {
+            "backend.todo_dispatch.swarm_run_settle_skip"
+        } else {
+            "backend.todo_dispatch.swarm_run_settled"
+        },
+        json!({
+            "count": settled.len(),
+            "run_id": run_id,
+            "run_status": run_status,
+            "swarm_id": swarm_id,
+            "todo_status": todo_status,
             "workspace_id": workspace_id,
         }),
     );
@@ -6975,10 +7373,10 @@ mod todo_store_tests {
     fn remote_intake_accepts_loop_send_message_aliases() {
         for command_kind in [
             "",
-	            "create_task",
-	            "todo_queue",
-	            "workspace.todo-queue",
-	            "terminal_orchestrator_send_message",
+            "create_task",
+            "todo_queue",
+            "workspace.todo-queue",
+            "terminal_orchestrator_send_message",
             "terminal.orchestrator.send-message",
             "loopspace-send-message",
             "send_message",
@@ -6998,17 +7396,15 @@ mod todo_store_tests {
             "commandId": "run-1",
             "workspaceId": "",
         });
-        let command_kind =
-            todo_dispatch_text(&event, &["command_kind", "commandKind", "action", "command"]);
+        let command_kind = todo_dispatch_text(
+            &event,
+            &["command_kind", "commandKind", "action", "command"],
+        );
         let command_id = todo_dispatch_text(&event, &["command_id", "commandId"]);
         let workspace_id = todo_dispatch_text(&event, &["workspace_id", "workspaceId"]);
 
         assert_eq!(
-            todo_dispatch_remote_intake_scope_decision(
-                &command_kind,
-                &command_id,
-                &workspace_id
-            ),
+            todo_dispatch_remote_intake_scope_decision(&command_kind, &command_id, &workspace_id),
             TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend
         );
     }
@@ -7020,17 +7416,15 @@ mod todo_store_tests {
             "commandId": "run-1",
             "workspaceId": "workspace-1",
         });
-        let command_kind =
-            todo_dispatch_text(&event, &["command_kind", "commandKind", "action", "command"]);
+        let command_kind = todo_dispatch_text(
+            &event,
+            &["command_kind", "commandKind", "action", "command"],
+        );
         let command_id = todo_dispatch_text(&event, &["command_id", "commandId"]);
         let workspace_id = todo_dispatch_text(&event, &["workspace_id", "workspaceId"]);
 
         assert_eq!(
-            todo_dispatch_remote_intake_scope_decision(
-                &command_kind,
-                &command_id,
-                &workspace_id
-            ),
+            todo_dispatch_remote_intake_scope_decision(&command_kind, &command_id, &workspace_id),
             TodoDispatchRemoteIntakeScopeDecision::Continue
         );
     }
@@ -7042,17 +7436,15 @@ mod todo_store_tests {
             "commandId": "command-1",
             "workspaceId": "",
         });
-        let command_kind =
-            todo_dispatch_text(&event, &["command_kind", "commandKind", "action", "command"]);
+        let command_kind = todo_dispatch_text(
+            &event,
+            &["command_kind", "commandKind", "action", "command"],
+        );
         let command_id = todo_dispatch_text(&event, &["command_id", "commandId"]);
         let workspace_id = todo_dispatch_text(&event, &["workspace_id", "workspaceId"]);
 
         assert_eq!(
-            todo_dispatch_remote_intake_scope_decision(
-                &command_kind,
-                &command_id,
-                &workspace_id
-            ),
+            todo_dispatch_remote_intake_scope_decision(&command_kind, &command_id, &workspace_id),
             TodoDispatchRemoteIntakeScopeDecision::MissingScope
         );
     }
@@ -9115,7 +9507,8 @@ async fn todo_dispatch_wait_for_pane_input_ready_after_model(
     pane_id: &str,
     target_instance_id: u64,
 ) -> bool {
-    let deadline = todo_dispatch_now_ms().saturating_add(TODO_DISPATCH_MODEL_SWITCH_INPUT_READY_TIMEOUT_MS);
+    let deadline =
+        todo_dispatch_now_ms().saturating_add(TODO_DISPATCH_MODEL_SWITCH_INPUT_READY_TIMEOUT_MS);
     loop {
         match todo_dispatch_pane_input_ready_authoritative(app, pane_id, target_instance_id).await {
             Some(true) => return true,
@@ -9385,17 +9778,17 @@ pub(crate) fn todo_dispatch_apply_remote_delete(app: &AppHandle, event: &Value) 
     };
     let terminal_state = todo_store_item_has_terminal_touch_evidence(&item)
         || matches!(
-        current_status.as_str(),
-        "running"
-            | "sending"
-            | "submitted"
-            | "dispatching"
-            | "dispatched"
-            | "completed"
-            | "failed"
-            | "cancelled"
-            | "interrupted"
-    );
+            current_status.as_str(),
+            "running"
+                | "sending"
+                | "submitted"
+                | "dispatching"
+                | "dispatched"
+                | "completed"
+                | "failed"
+                | "cancelled"
+                | "interrupted"
+        );
     if !status_matches || terminal_state {
         todo_store_enqueue_item_todo_sync_commit(
             app,
@@ -9524,8 +9917,13 @@ async fn todo_dispatch_queue_sync(
             .collect::<Vec<_>>();
         let mut locally_removed_ids = Vec::new();
         if !removed_ids.is_empty() {
-            let delete_result =
-                todo_store_delete_internal(&app, &workspace_id, &removed_ids, &reason, "webview_sync");
+            let delete_result = todo_store_delete_internal(
+                &app,
+                &workspace_id,
+                &removed_ids,
+                &reason,
+                "webview_sync",
+            );
             locally_removed_ids.extend(delete_result.removed_ids);
         }
         let mut tombstoned = todo_store_tombstone_ids(&workspace_id);
@@ -9957,7 +10355,9 @@ fn todo_dispatch_backend_model_command(item: &Value, target: &Value) -> String {
     if model.is_empty() || model.len() > 120 {
         return String::new();
     }
-    if !current_model.is_empty() && todo_dispatch_canonical_model_equal(&agent, &current_model, &model) {
+    if !current_model.is_empty()
+        && todo_dispatch_canonical_model_equal(&agent, &current_model, &model)
+    {
         if !valid_codex_effort || (!current_effort.is_empty() && current_effort == effort) {
             return String::new();
         }
@@ -10067,10 +10467,7 @@ mod todo_dispatch_backend_tests {
             "currentReasoningEffort": "xhigh",
         });
         assert_eq!(
-            todo_dispatch_backend_model_command(
-                &codex_alias_item,
-                &codex_alias_same_effort_target,
-            ),
+            todo_dispatch_backend_model_command(&codex_alias_item, &codex_alias_same_effort_target,),
             "",
         );
     }
@@ -10134,12 +10531,49 @@ mod todo_dispatch_backend_tests {
             .map(|entry| todo_dispatch_text(&entry, &["paneId"])),
             Some("pane-b".to_string()),
         );
-        assert!(
-            todo_dispatch_backend_pick_target_from_entries(
-                &entries,
-                &json!({ "targetThreadId": "missing-thread" }),
-            )
-            .is_none()
+        assert!(todo_dispatch_backend_pick_target_from_entries(
+            &entries,
+            &json!({ "targetThreadId": "missing-thread" }),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn backend_target_picker_accepts_swarm_without_terminal_entries() {
+        let target = todo_dispatch_backend_pick_target_from_entries(
+            &[],
+            &json!({
+                "targetKind": "swarm",
+                "targetSwarmId": "swarm-workspace-s1",
+                "targetTerminalId": "swarm-pane",
+            }),
+        )
+        .unwrap();
+        assert_eq!(todo_dispatch_text(&target, &["targetKind"]), "swarm");
+        assert_eq!(
+            todo_dispatch_text(&target, &["targetSwarmId"]),
+            "swarm-workspace-s1"
+        );
+        assert_eq!(todo_dispatch_text(&target, &["paneId"]), "swarm-pane");
+    }
+
+    #[test]
+    fn swarm_run_status_maps_to_todo_settlement_status() {
+        assert_eq!(
+            todo_dispatch_swarm_run_status_to_todo_status("done"),
+            "completed"
+        );
+        assert_eq!(
+            todo_dispatch_swarm_run_status_to_todo_status("cancelled"),
+            "cancelled"
+        );
+        assert_eq!(
+            todo_dispatch_swarm_run_status_to_todo_status("error"),
+            "failed"
+        );
+        assert_eq!(
+            todo_dispatch_swarm_run_status_to_todo_status("failed"),
+            "failed"
         );
     }
 
@@ -10496,6 +10930,8 @@ fn todo_dispatch_prepare_immediate_backend_item(
     let pane_id = todo_dispatch_text(target, &["paneId", "pane_id", "targetTerminalId"]);
     let thread_id = todo_dispatch_text(target, &["threadId", "thread_id", "targetThreadId"]);
     let target_agent = todo_dispatch_backend_target_agent(&item, target);
+    let target_kind = todo_dispatch_text(target, &["targetKind", "target_kind"]);
+    let target_swarm_id = todo_dispatch_text(target, &["targetSwarmId", "target_swarm_id"]);
     let terminal_index = target
         .get("terminalIndex")
         .or_else(|| target.get("targetTerminalIndex"))
@@ -10512,6 +10948,12 @@ fn todo_dispatch_prepare_immediate_backend_item(
         }
         if !target_agent.is_empty() {
             object.insert("targetAgentId".to_string(), json!(target_agent));
+        }
+        if target_kind.eq_ignore_ascii_case("swarm") && !target_swarm_id.is_empty() {
+            object.insert("targetKind".to_string(), json!("swarm"));
+            object.insert("target_kind".to_string(), json!("swarm"));
+            object.insert("targetSwarmId".to_string(), json!(target_swarm_id.clone()));
+            object.insert("target_swarm_id".to_string(), json!(target_swarm_id));
         }
         if let Some(index) = terminal_index {
             object.insert("targetTerminalIndex".to_string(), json!(index));
@@ -10760,10 +11202,88 @@ fn todo_dispatch_backend_entry_matches_name(entry: &Value, target_name: &str) ->
         "name",
     ]
     .iter()
-    .any(|key| todo_dispatch_normalized_terminal_name(&todo_dispatch_text(entry, &[*key])) == target_name)
+    .any(|key| {
+        todo_dispatch_normalized_terminal_name(&todo_dispatch_text(entry, &[*key])) == target_name
+    })
 }
 
-fn todo_dispatch_backend_pick_target_from_entries(entries: &[Value], item: &Value) -> Option<Value> {
+fn todo_dispatch_item_target_kind(item: &Value) -> String {
+    todo_dispatch_text(item, &["targetKind", "target_kind"])
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn todo_dispatch_item_target_swarm_id(item: &Value) -> String {
+    todo_dispatch_text(
+        item,
+        &["targetSwarmId", "target_swarm_id", "swarmId", "swarm_id"],
+    )
+    .trim()
+    .to_string()
+}
+
+fn todo_dispatch_target_is_swarm(target: &Value) -> bool {
+    todo_dispatch_text(target, &["targetKind", "target_kind"])
+        .trim()
+        .eq_ignore_ascii_case("swarm")
+}
+
+fn todo_dispatch_value_has_swarm_target(value: &Value) -> bool {
+    todo_dispatch_target_is_swarm(value) || !todo_dispatch_item_target_swarm_id(value).is_empty()
+}
+
+fn todo_dispatch_backend_swarm_target(item: &Value, workspace_id: Option<&str>) -> Option<Value> {
+    if todo_dispatch_item_target_kind(item) != "swarm" {
+        return None;
+    }
+    let swarm_id = todo_dispatch_item_target_swarm_id(item);
+    if swarm_id.is_empty() {
+        return None;
+    }
+    let workspace_id = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| todo_dispatch_text(item, &["workspaceId", "workspace_id"]));
+    let pane_id = todo_dispatch_text(
+        item,
+        &[
+            "targetTerminalId",
+            "target_terminal_id",
+            "paneId",
+            "pane_id",
+        ],
+    );
+    let mut target = json!({
+        "targetKind": "swarm",
+        "target_kind": "swarm",
+        "targetSwarmId": swarm_id,
+        "target_swarm_id": swarm_id,
+        "workspaceId": workspace_id,
+    });
+    if let Some(object) = target.as_object_mut() {
+        if !pane_id.is_empty() {
+            object.insert("paneId".to_string(), json!(pane_id.clone()));
+            object.insert("targetTerminalId".to_string(), json!(pane_id));
+        }
+        if let Some(index) = item
+            .get("targetTerminalIndex")
+            .or_else(|| item.get("target_terminal_index"))
+            .and_then(Value::as_i64)
+        {
+            object.insert("targetTerminalIndex".to_string(), json!(index));
+        }
+    }
+    Some(target)
+}
+
+fn todo_dispatch_backend_pick_target_from_entries(
+    entries: &[Value],
+    item: &Value,
+) -> Option<Value> {
+    if let Some(target) = todo_dispatch_backend_swarm_target(item, None) {
+        return Some(target);
+    }
     if entries.is_empty() {
         return None;
     }
@@ -10780,7 +11300,12 @@ fn todo_dispatch_backend_pick_target_from_entries(entries: &[Value], item: &Valu
     );
     let target_thread = todo_dispatch_text(
         item,
-        &["targetThreadId", "target_thread_id", "threadId", "thread_id"],
+        &[
+            "targetThreadId",
+            "target_thread_id",
+            "threadId",
+            "thread_id",
+        ],
     );
     let target_name = todo_dispatch_text(
         item,
@@ -10899,6 +11424,9 @@ async fn todo_dispatch_backend_pick_target(
     item: &Value,
     busy: &HashSet<String>,
 ) -> Option<Value> {
+    if let Some(target) = todo_dispatch_backend_swarm_target(item, Some(workspace_id)) {
+        return Some(target);
+    }
     let mut entries = todo_dispatch_backend_core_ready_entries(app, workspace_id, busy).await;
     for entry in todo_dispatch_backend_registry_ready_entries(workspace_id, busy) {
         let pane_id = entry
@@ -10968,6 +11496,20 @@ fn todo_dispatch_backend_try_claim_item(
             {
                 object.insert("targetThreadId".to_string(), json!(thread_id));
                 object.insert("threadId".to_string(), json!(thread_id));
+            }
+            if todo_dispatch_target_is_swarm(target) {
+                object.insert("targetKind".to_string(), json!("swarm"));
+                object.insert("target_kind".to_string(), json!("swarm"));
+                if let Some(swarm_id) = target
+                    .get("targetSwarmId")
+                    .or_else(|| target.get("target_swarm_id"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                {
+                    object.insert("targetSwarmId".to_string(), json!(swarm_id));
+                    object.insert("target_swarm_id".to_string(), json!(swarm_id));
+                }
             }
         }
         if claimed.is_none() {
@@ -11050,12 +11592,257 @@ async fn todo_dispatch_write_current_terminal_chunks(
     writer.flush().is_ok()
 }
 
+async fn todo_dispatch_backend_swarm_can_start(
+    app: &AppHandle,
+    workspace_id: &str,
+    target: &Value,
+) -> bool {
+    let swarm_id = todo_dispatch_text(target, &["targetSwarmId", "target_swarm_id"]);
+    if swarm_id.is_empty() {
+        return false;
+    }
+    let swarm_state = app.state::<SwarmRuntimeState>();
+    let terminal_state = app.state::<TerminalState>();
+    match swarm_can_submit_task_internal(
+        swarm_state.inner(),
+        terminal_state.inner(),
+        workspace_id,
+        &swarm_id,
+    )
+    .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.todo_dispatch.swarm_submit_not_ready",
+                json!({
+                    "reason": error,
+                    "swarm_id": swarm_id,
+                    "workspace_id": workspace_id,
+                }),
+            );
+            false
+        }
+    }
+}
+
+async fn todo_dispatch_backend_submit_swarm(
+    app: &AppHandle,
+    workspace_id: &str,
+    item: &Value,
+    target: &Value,
+) -> bool {
+    let swarm_id = todo_dispatch_text(target, &["targetSwarmId", "target_swarm_id"]);
+    let prompt = todo_dispatch_backend_item_text(item);
+    if swarm_id.is_empty() || prompt.is_empty() {
+        return false;
+    }
+    let swarm_state = app.state::<SwarmRuntimeState>();
+    let terminal_state = app.state::<TerminalState>();
+    let run_id = match swarm_submit_task_internal(
+        app,
+        swarm_state.inner(),
+        terminal_state.inner(),
+        workspace_id,
+        &swarm_id,
+        &prompt,
+        "implement",
+    )
+    .await
+    {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            log_terminal_status_event(
+                "backend.todo_dispatch.swarm_submit_failed",
+                json!({
+                    "reason": error,
+                    "swarm_id": swarm_id,
+                    "workspace_id": workspace_id,
+                }),
+            );
+            return false;
+        }
+    };
+
+    let item_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let command_id = todo_dispatch_queue_item_command_id(item);
+    let todo_id = item
+        .get("todoId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&item_id)
+        .to_string();
+    let dispatch_id = format!("backend-swarm-dispatch-{item_id}");
+    let submitted_at = crate::coordination::kernel::now_rfc3339();
+    let workspace_name = todo_dispatch_text(
+        item,
+        &[
+            "workspaceName",
+            "workspace_name",
+            "workspaceTitle",
+            "workspace_title",
+        ],
+    );
+    let repo_path = todo_dispatch_text(
+        item,
+        &[
+            "repoPath",
+            "repo_path",
+            "workspaceRoot",
+            "workspace_root",
+            "rootDirectory",
+            "root_directory",
+        ],
+    );
+    let pane_id = todo_dispatch_text(target, &["paneId", "pane_id", "targetTerminalId"]);
+    let origin_device_id = todo_dispatch_text(item, &["originDeviceId", "origin_device_id"]);
+
+    let mut receipt = json!({
+        "commandId": command_id,
+        "itemId": item_id,
+        "submittedAt": submitted_at.clone(),
+        "status": "running",
+        "statusReason": "todo_queue_swarm_run_started",
+        "targetKind": "swarm",
+        "target_kind": "swarm",
+        "targetSwarmId": swarm_id,
+        "target_swarm_id": swarm_id,
+        "swarmRunId": run_id,
+        "swarm_run_id": run_id,
+        "text": prompt.chars().take(180).collect::<String>(),
+        "workspaceId": workspace_id,
+        "workspaceName": workspace_name,
+    });
+    if let Some(object) = receipt.as_object_mut() {
+        if !pane_id.is_empty() {
+            object.insert("paneId".to_string(), json!(pane_id.clone()));
+            object.insert("targetTerminalId".to_string(), json!(pane_id.clone()));
+        }
+        if !origin_device_id.is_empty() {
+            object.insert(
+                "originDeviceId".to_string(),
+                json!(origin_device_id.clone()),
+            );
+        }
+    }
+    let _ = todo_dispatch_record_receipt_internal(
+        Some(app),
+        workspace_id,
+        receipt,
+        "backend_swarm_dispatch",
+    );
+
+    todo_dispatch_journal_append(
+        workspace_id,
+        json!({
+            "commandId": command_id,
+            "dispatchId": dispatch_id,
+            "itemId": item_id,
+            "targetKind": "swarm",
+            "targetSwarmId": swarm_id,
+            "swarmRunId": run_id,
+            "submittedAt": submitted_at,
+            "text": prompt.chars().take(500).collect::<String>(),
+            "todoId": todo_id,
+            "workspaceId": workspace_id,
+        }),
+    );
+
+    let mut running_item = None;
+    if let Some(path) = todo_dispatch_data_path("queues", workspace_id) {
+        let _store_guard = todo_dispatch_queue_store_guard();
+        let snapshot = todo_dispatch_queue_read(&path);
+        if let Some(items) = snapshot.get("items").and_then(Value::as_array) {
+            let next_items = items
+                .iter()
+                .cloned()
+                .map(|mut entry| {
+                    if todo_store_items_share_identity(&entry, item) {
+                        todo_store_set_item_status(
+                            &mut entry,
+                            "running",
+                            "todo_queue_swarm_run_started",
+                        );
+                        if let Some(object) = entry.as_object_mut() {
+                            object.insert("commandId".to_string(), json!(command_id.clone()));
+                            object.insert("command_id".to_string(), json!(command_id.clone()));
+                            object.insert("dispatchId".to_string(), json!(dispatch_id.clone()));
+                            object.insert("dispatch_id".to_string(), json!(dispatch_id.clone()));
+                            object.insert("lastDispatchId".to_string(), json!(dispatch_id.clone()));
+                            object
+                                .insert("last_dispatch_id".to_string(), json!(dispatch_id.clone()));
+                            object.insert("todoId".to_string(), json!(todo_id.clone()));
+                            object.insert("todo_id".to_string(), json!(todo_id.clone()));
+                            object.insert("targetKind".to_string(), json!("swarm"));
+                            object.insert("target_kind".to_string(), json!("swarm"));
+                            object.insert("targetSwarmId".to_string(), json!(swarm_id.clone()));
+                            object.insert("target_swarm_id".to_string(), json!(swarm_id.clone()));
+                            object.insert("swarmRunId".to_string(), json!(run_id.clone()));
+                            object.insert("swarm_run_id".to_string(), json!(run_id.clone()));
+                            if !pane_id.is_empty() {
+                                object
+                                    .insert("targetTerminalId".to_string(), json!(pane_id.clone()));
+                                object.insert("paneId".to_string(), json!(pane_id.clone()));
+                            }
+                            if let Some(terminal_index) = target.get("targetTerminalIndex").cloned()
+                            {
+                                object.insert("targetTerminalIndex".to_string(), terminal_index);
+                            }
+                        }
+                        running_item = Some(entry.clone());
+                    }
+                    entry
+                })
+                .collect::<Vec<_>>();
+            todo_dispatch_queue_write(workspace_id, &next_items);
+            todo_store_orphan_sweep_trigger("todo_queue_swarm_run_started");
+        }
+    }
+    if let Some(running_item) = running_item {
+        todo_store_push_corrections(
+            app,
+            workspace_id,
+            vec![running_item.clone()],
+            "todo_queue_swarm_run_started",
+        );
+        todo_store_emit_changed(app, workspace_id, "todo_queue_swarm_run_started", "store");
+        todo_dispatch_enqueue_todo_sync_commit(
+            app,
+            workspace_id,
+            &workspace_name,
+            &repo_path,
+            running_item,
+            "todo_queue_swarm_run_started",
+        )
+        .await;
+    }
+
+    log_terminal_status_event(
+        "backend.todo_dispatch.swarm_submitted",
+        json!({
+            "command_id": command_id,
+            "item_id": item_id,
+            "swarm_id": swarm_id,
+            "swarm_run_id": run_id,
+            "workspace_id": workspace_id,
+        }),
+    );
+    true
+}
+
 async fn todo_dispatch_backend_submit(
     app: &AppHandle,
     workspace_id: &str,
     item: &Value,
     target: &Value,
 ) -> bool {
+    if todo_dispatch_target_is_swarm(target) {
+        return todo_dispatch_backend_submit_swarm(app, workspace_id, item, target).await;
+    }
     let pane_id = target
         .get("paneId")
         .and_then(Value::as_str)
@@ -11197,9 +11984,9 @@ async fn todo_dispatch_backend_submit(
         {
             return false;
         }
-	        if !todo_dispatch_terminal_instance_still_current(&terminal_state, &pane_id, &instance)
-	            .await
-	        {
+        if !todo_dispatch_terminal_instance_still_current(&terminal_state, &pane_id, &instance)
+            .await
+        {
             return false;
         }
     }
@@ -11416,6 +12203,12 @@ async fn todo_dispatch_backend_submit_now(
     .await
     .map_err(|error| format!("Todo backend submit worker failed: {error}"))??;
 
+    if todo_dispatch_target_is_swarm(&target)
+        && !todo_dispatch_backend_swarm_can_start(&app, &workspace_id, &target).await
+    {
+        return Err("target_swarm_not_ready".to_string());
+    }
+
     let Some(claimed_item) = todo_dispatch_backend_try_claim_item(&workspace_id, &item, &target)
     else {
         return Err("todo_dispatch_claim_failed".to_string());
@@ -11500,6 +12293,11 @@ async fn todo_dispatch_backend_tick(app: &AppHandle) {
             else {
                 continue;
             };
+            if todo_dispatch_target_is_swarm(&target)
+                && !todo_dispatch_backend_swarm_can_start(app, &workspace_id, &target).await
+            {
+                continue;
+            }
             let pane_id = target
                 .get("paneId")
                 .and_then(Value::as_str)
@@ -11511,7 +12309,9 @@ async fn todo_dispatch_backend_tick(app: &AppHandle) {
                 continue;
             };
             if todo_dispatch_backend_submit(app, &workspace_id, &claimed_item, &target).await {
-                busy.insert(pane_id);
+                if !todo_dispatch_target_is_swarm(&target) && !pane_id.is_empty() {
+                    busy.insert(pane_id);
+                }
             } else {
                 todo_dispatch_backend_release_claim(
                     &workspace_id,
@@ -11547,8 +12347,7 @@ pub(crate) fn todo_dispatch_start_background_dispatcher(app: AppHandle) {
             tick_count = tick_count.wrapping_add(1);
             let next_queue_fingerprint = todo_dispatch_queue_files_fingerprint();
             let queue_changed = queue_fingerprint.as_ref() != Some(&next_queue_fingerprint);
-            let force_full_pass =
-                tick_count % TODO_DISPATCH_BACKEND_SAFETY_FULL_PASS_TICKS == 0;
+            let force_full_pass = tick_count % TODO_DISPATCH_BACKEND_SAFETY_FULL_PASS_TICKS == 0;
             if queue_changed || force_full_pass {
                 queue_fingerprint = Some(next_queue_fingerprint);
                 todo_dispatch_backend_tick(&app).await;

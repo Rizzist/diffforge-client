@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Select from "react-select";
 import styled from "styled-components";
 import { Close } from "@styled-icons/material-rounded/Close";
+import { ScatterPlot } from "@styled-icons/material-rounded/ScatterPlot";
 import { Send } from "@styled-icons/material-rounded/Send";
 
 import {
@@ -18,6 +19,9 @@ function AgentHarnessIcon({ role }) {
   }
   if (normalizedRole === "claude") {
     return <WorkspaceCreateAgentClaudeIcon aria-hidden="true" />;
+  }
+  if (normalizedRole === "swarm") {
+    return <ScatterPlot aria-hidden="true" />;
   }
   if (normalizedRole === "opencode") {
     return (

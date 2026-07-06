@@ -2564,6 +2564,7 @@ export default function VideoWorkspacePane({
         setSidePanel("");
       }}
       onOpenTranscript={openTranscript}
+      paneToken={paneId || "video-pane"}
       repoPath={repoPath}
     />
   ) : sidePanel === "export" ? (

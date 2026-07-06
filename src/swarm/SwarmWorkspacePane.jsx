@@ -73,6 +73,13 @@ function describeSwarmRunEvent(event, membersById) {
   switch (event?.kind) {
     case "run_started":
       return "Run started — building independent takes";
+    case "context_pack_started":
+      return `${memberName || "Scout"} is scouting the context pack`;
+    case "context_pack_ready": {
+      const chars = Number(event?.data?.chars ?? 0);
+      const incremental = Boolean(event?.data?.incremental);
+      return `Context pack ready${chars ? ` — ${Math.round(chars / 1000)}k chars` : ""}${incremental ? " (incremental update)" : ""}`;
+    }
     case "member_prompted":
       return `${memberName || "Member"} received the task`;
     case "member_take":
@@ -105,7 +112,7 @@ function describeSwarmRunEvent(event, membersById) {
 }
 
 function eventHasExpandableText(event) {
-  return (event?.kind === "member_take" || event?.kind === "run_result")
+  return (event?.kind === "member_take" || event?.kind === "run_result" || event?.kind === "context_pack_ready")
     && String(event?.text || "").trim().length > 0;
 }
 
@@ -201,9 +208,95 @@ const SwarmErrorBanner = styled.div`
   }
 `;
 
+const SwarmViewRail = styled.div`
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  padding: 5px 8px;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex: 0 0 auto;
+  min-width: 0;
+  border-bottom: 1px solid rgba(139, 148, 158, 0.16);
+  background: rgba(13, 17, 23, 0.88);
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139, 148, 158, 0.35) transparent;
+
+  &::-webkit-scrollbar {
+    height: 6px;
+  }
+
+  &::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    background: rgba(139, 148, 158, 0.35);
+    border-radius: 999px;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(255, 255, 255, 0.88);
+    border-bottom-color: rgba(31, 35, 40, 0.12);
+  }
+`;
+
+const SwarmViewTab = styled.button`
+  appearance: none;
+  border: 1px solid rgba(139, 148, 158, 0.2);
+  background: rgba(110, 118, 129, 0.1);
+  color: rgba(230, 237, 243, 0.72);
+  border-radius: 6px;
+  height: 24px;
+  padding: 0 9px;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1;
+  white-space: nowrap;
+  flex: 0 0 auto;
+  cursor: pointer;
+
+  &:hover {
+    border-color: rgba(76, 141, 255, 0.45);
+    color: #e6edf3;
+  }
+
+  &[data-active="true"] {
+    border-color: rgba(76, 141, 255, 0.62);
+    background: rgba(76, 141, 255, 0.2);
+    color: #dbeafe;
+  }
+
+  html[data-forge-theme="light"] & {
+    background: rgba(31, 35, 40, 0.04);
+    color: rgba(31, 35, 40, 0.66);
+
+    &:hover { color: #1f2328; }
+
+    &[data-active="true"] {
+      background: rgba(9, 105, 218, 0.1);
+      border-color: rgba(9, 105, 218, 0.5);
+      color: #0969da;
+    }
+  }
+`;
+
+const SwarmViewRailSpacer = styled.span`
+  flex: 1 1 auto;
+`;
+
+const SwarmViewRailStatus = styled.span`
+  flex: 0 0 auto;
+  font-size: 9.5px;
+  font-weight: 600;
+  color: rgba(139, 148, 158, 0.9);
+  white-space: nowrap;
+  padding-right: 2px;
+`;
+
 const SwarmConstellation = styled.div`
   position: relative;
-  flex: 1 1 46%;
+  flex: 1 1 auto;
   min-height: 150px;
   overflow: hidden;
 `;
@@ -526,58 +619,26 @@ const SwarmGhostButton = styled.button`
   }
 `;
 
-const SwarmLowerShell = styled.div`
-  flex: 1 1 54%;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  border-top: 1px solid rgba(139, 148, 158, 0.18);
-  background: rgba(13, 17, 23, 0.6);
-
-  html[data-forge-theme="light"] & {
-    background: rgba(255, 255, 255, 0.66);
-    border-top-color: rgba(31, 35, 40, 0.12);
-  }
-`;
-
-const SwarmTabs = styled.div`
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 6px 10px 0;
-`;
-
-const SwarmTab = styled.button`
-  appearance: none;
-  border: none;
-  border-bottom: 2px solid transparent;
-  background: transparent;
-  color: rgba(139, 148, 158, 0.95);
-  font-size: 11px;
-  font-weight: 600;
-  padding: 4px 8px 6px;
-  cursor: pointer;
-
-  &[data-active="true"] {
-    color: #e6edf3;
-    border-bottom-color: #4c8dff;
-  }
-
-  html[data-forge-theme="light"] & {
-    color: rgba(31, 35, 40, 0.6);
-    &[data-active="true"] { color: #1f2328; }
-  }
-`;
-
 const SwarmLowerBody = styled.div`
   flex: 1 1 auto;
   min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
   padding: 8px 10px;
   display: flex;
   flex-direction: column;
   gap: 6px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(139, 148, 158, 0.35) transparent;
+
+  &::-webkit-scrollbar {
+    width: 6px;
+  }
+
+  &::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(139, 148, 158, 0.35);
+  }
 `;
 
 const SwarmFeedRow = styled.div`
@@ -956,7 +1017,7 @@ export default function SwarmWorkspacePane({
   const [busy, setBusy] = useState(false);
   const [events, setEvents] = useState([]);
   const [selectedRunId, setSelectedRunId] = useState("");
-  const [activeTab, setActiveTab] = useState("activity");
+  const [activeTab, setActiveTab] = useState("overview");
   const [prompt, setPrompt] = useState("");
   const [mode, setMode] = useState("plan");
   const [selectedMemberId, setSelectedMemberId] = useState("");
@@ -1129,7 +1190,7 @@ export default function SwarmWorkspacePane({
     return () => window.clearInterval(timer);
   }, [activeRunId, backendMissing, isActive, loadRunEvents, refreshState]);
 
-  const applyMembers = useCallback(async (memberSpecs) => {
+  const applyMembers = useCallback(async (memberSpecs, scoutMemberId = undefined) => {
     if (!workspaceId || busy) {
       return;
     }
@@ -1141,6 +1202,9 @@ export default function SwarmWorkspacePane({
         swarmId,
         repoPath,
         members: memberSpecs.slice(0, SWARM_MAX_MEMBERS),
+        scoutMemberId: scoutMemberId === undefined
+          ? String(swarmRef.current?.scoutMemberId || "")
+          : String(scoutMemberId || ""),
       });
       if (mountedRef.current) {
         setSwarm(state || null);
@@ -1199,8 +1263,76 @@ export default function SwarmWorkspacePane({
     if (selectedMemberId === memberId) {
       setSelectedMemberId("");
     }
-    applyMembers(specs);
+    const currentScout = String(swarmRef.current?.scoutMemberId || "");
+    applyMembers(specs, currentScout === memberId ? "" : currentScout);
   }, [applyMembers, members, selectedMemberId]);
+
+  const handleScoutChange = useCallback((scoutMemberId) => {
+    const specs = members.map((member) => ({
+      memberId: member.memberId,
+      provider: member.provider,
+      model: member.model || "",
+      label: member.label || "",
+    }));
+    applyMembers(specs, scoutMemberId);
+  }, [applyMembers, members]);
+
+  const handleActivateSwarm = useCallback(async (memberId = "") => {
+    if (!workspaceId || busy) {
+      return;
+    }
+    setBusy(true);
+    setError("");
+    try {
+      const state = await invoke("swarm_activate", {
+        workspaceId,
+        swarmId,
+        repoPath,
+        memberId: memberId || "",
+      });
+      if (mountedRef.current) {
+        setSwarm(state || null);
+        setBackendMissing(false);
+      }
+    } catch (caught) {
+      if (!mountedRef.current) {
+        return;
+      }
+      if (isMissingCommandError(caught)) {
+        // Older backend without swarm_activate: fall back to per-member restart
+        // or an idempotent re-configure, which respawns missing sessions.
+        try {
+          const state = memberId
+            ? await invoke("swarm_member_restart", { workspaceId, swarmId, memberId })
+            : await invoke("swarm_configure", {
+              workspaceId,
+              swarmId,
+              repoPath,
+              members: (swarmRef.current?.members || []).map((member) => ({
+                memberId: member.memberId,
+                provider: member.provider,
+                model: member.model || "",
+                label: member.label || "",
+              })),
+              scoutMemberId: String(swarmRef.current?.scoutMemberId || ""),
+            });
+          if (mountedRef.current) {
+            setSwarm(state || null);
+          }
+        } catch (fallbackCaught) {
+          if (mountedRef.current) {
+            surfaceError(fallbackCaught);
+          }
+        }
+      } else {
+        surfaceError(caught);
+      }
+    } finally {
+      if (mountedRef.current) {
+        setBusy(false);
+      }
+    }
+  }, [busy, repoPath, surfaceError, swarmId, workspaceId]);
 
   const handleRestartMember = useCallback(async (memberId) => {
     if (!workspaceId || busy) {
@@ -1237,7 +1369,7 @@ export default function SwarmWorkspacePane({
       if (mountedRef.current) {
         setPrompt("");
         setSelectedRunId(String(result?.runId || ""));
-        setActiveTab("activity");
+        setActiveTab((current) => (current === "overview" ? "overview" : "activity"));
         refreshState();
       }
     } catch (caught) {
@@ -1299,13 +1431,20 @@ export default function SwarmWorkspacePane({
     if (activeRunId) {
       const takeCount = events.filter((event) => event.kind === "member_take").length;
       const synthesizing = events.some((event) => event.kind === "synthesis_started");
+      const scouting = events.some((event) => event.kind === "context_pack_started")
+        && !events.some((event) => event.kind === "context_pack_ready")
+        && !synthesizing
+        && takeCount === 0
+        && !events.some((event) => event.kind === "member_prompted");
       return {
         running: true,
         status: "running",
-        title: synthesizing ? "Synthesizing" : "Collecting takes",
+        title: synthesizing ? "Synthesizing" : scouting ? "Scouting context" : "Collecting takes",
         detail: synthesizing
           ? "fusing member takes"
-          : `${takeCount}/${members.length} takes in`,
+          : scouting
+            ? "one scout, shared context"
+            : `${takeCount}/${members.length} takes in`,
       };
     }
     const lastRun = runs[0] || null;
@@ -1319,6 +1458,14 @@ export default function SwarmWorkspacePane({
             ? "Run cancelled"
             : "Run failed",
         detail: truncateText(lastRun.resultSummary || lastRun.prompt, 52) || "—",
+      };
+    }
+    if (readyMemberCount === 0) {
+      return {
+        running: false,
+        status: "",
+        title: "Swarm parked",
+        detail: "activate members to start",
       };
     }
     return {
@@ -1336,6 +1483,11 @@ export default function SwarmWorkspacePane({
       : []
   ), [events, selectedMember]);
 
+  const parkedMemberCount = members.filter((member) => (
+    member.status === "offline" || member.status === "dead" || member.status === "error"
+  )).length;
+  const swarmParked = hasMembers && parkedMemberCount > 0 && !activeRunId;
+
   const composerDisabled = backendMissing || !hasMembers || Boolean(activeRunId) || busy;
   const composerHint = backendMissing
     ? "Swarm backend unavailable in this build"
@@ -1347,8 +1499,35 @@ export default function SwarmWorkspacePane({
           ? "Waiting for members to become ready"
           : `Fans out to ${readyMemberCount} member${readyMemberCount === 1 ? "" : "s"}, then fuses`;
 
+  const railStatusText = activeRunId
+    ? "run live"
+    : hasMembers
+      ? `${readyMemberCount}/${members.length} ready`
+      : "no members";
+
   return (
     <SwarmPaneRoot data-swarm-pane-id={paneId}>
+      <SwarmViewRail aria-label="Swarm view selector">
+        {[
+          { id: "overview", label: "Overview" },
+          { id: "activity", label: "Activity" },
+          { id: "members", label: hasMembers ? `Members (${members.length})` : "Members" },
+          { id: "runs", label: runs.length ? `Runs (${runs.length})` : "Runs" },
+        ].map((tab) => (
+          <SwarmViewTab
+            aria-pressed={activeTab === tab.id}
+            data-active={activeTab === tab.id ? "true" : undefined}
+            key={tab.id}
+            onClick={() => setActiveTab(tab.id)}
+            title={tab.label}
+            type="button"
+          >
+            {tab.label}
+          </SwarmViewTab>
+        ))}
+        <SwarmViewRailSpacer aria-hidden="true" />
+        <SwarmViewRailStatus>{railStatusText}</SwarmViewRailStatus>
+      </SwarmViewRail>
       {error ? (
         <SwarmErrorBanner role="alert">
           <span>{error}</span>
@@ -1362,6 +1541,7 @@ export default function SwarmWorkspacePane({
         </SwarmErrorBanner>
       ) : null}
 
+      {activeTab === "overview" ? (
       <SwarmConstellation>
         {hasMembers ? (
           <>
@@ -1459,8 +1639,34 @@ export default function SwarmWorkspacePane({
             </SwarmPrimaryButton>
           </SwarmSetupCard>
         )}
+        {swarmParked ? (
+          <div
+            style={{
+              position: "absolute",
+              left: "50%",
+              bottom: 14,
+              transform: "translateX(-50%)",
+              zIndex: 4,
+            }}
+          >
+            <SwarmPrimaryButton
+              disabled={busy || backendMissing}
+              onClick={() => handleActivateSwarm()}
+              title="Spawn every configured member that is not running"
+              type="button"
+            >
+              {busy
+                ? "Activating…"
+                : parkedMemberCount === members.length
+                  ? "Activate swarm"
+                  : `Activate swarm · ${parkedMemberCount} offline`}
+            </SwarmPrimaryButton>
+          </div>
+        ) : null}
+      </SwarmConstellation>
+      ) : null}
 
-        {selectedMember ? (
+      {selectedMember ? (
           <SwarmMemberSheet>
             <header>
               <SwarmMemberBadge style={{ "--swarm-orb-color": providerMeta(selectedMember.provider).color }}>
@@ -1486,11 +1692,27 @@ export default function SwarmWorkspacePane({
                 <small>Champion runs</small>
                 <strong>{Number(selectedMember.stats?.championRuns || 0)}</strong>
               </div>
+              <div>
+                <small>Scout runs</small>
+                <strong>{Number(selectedMember.stats?.scoutRuns || 0)}</strong>
+              </div>
+              <div>
+                <small>Role</small>
+                <strong>
+                  {String(swarm?.scoutMemberId || "") === selectedMember.memberId ? "Scout" : "Member"}
+                </strong>
+              </div>
             </SwarmSheetStats>
             <SwarmComposerControls>
-              <SwarmGhostButton disabled={busy} onClick={() => handleRestartMember(selectedMember.memberId)} type="button">
-                Restart
-              </SwarmGhostButton>
+              {selectedMember.status === "offline" || selectedMember.status === "dead" || selectedMember.status === "error" ? (
+                <SwarmPrimaryButton disabled={busy} onClick={() => handleActivateSwarm(selectedMember.memberId)} type="button">
+                  Start
+                </SwarmPrimaryButton>
+              ) : (
+                <SwarmGhostButton disabled={busy} onClick={() => handleRestartMember(selectedMember.memberId)} type="button">
+                  Restart
+                </SwarmGhostButton>
+              )}
               <SwarmGhostButton data-danger="true" disabled={busy} onClick={() => handleRemoveMember(selectedMember.memberId)} type="button">
                 Remove
               </SwarmGhostButton>
@@ -1504,21 +1726,8 @@ export default function SwarmWorkspacePane({
             </SwarmSheetBody>
           </SwarmMemberSheet>
         ) : null}
-      </SwarmConstellation>
 
-      <SwarmLowerShell>
-        <SwarmTabs role="tablist">
-          <SwarmTab data-active={activeTab === "activity" ? "true" : undefined} onClick={() => setActiveTab("activity")} role="tab" type="button">
-            Activity
-          </SwarmTab>
-          <SwarmTab data-active={activeTab === "members" ? "true" : undefined} onClick={() => setActiveTab("members")} role="tab" type="button">
-            Members{hasMembers ? ` (${members.length})` : ""}
-          </SwarmTab>
-          <SwarmTab data-active={activeTab === "runs" ? "true" : undefined} onClick={() => setActiveTab("runs")} role="tab" type="button">
-            Runs{runs.length ? ` (${runs.length})` : ""}
-          </SwarmTab>
-        </SwarmTabs>
-
+      {activeTab !== "overview" ? (
         <SwarmLowerBody>
           {activeTab === "activity" ? (
             events.length === 0 ? (
@@ -1555,6 +1764,26 @@ export default function SwarmWorkspacePane({
 
           {activeTab === "members" ? (
             <>
+              {hasMembers ? (
+                <SwarmAddMemberRow as="div" title="The scout builds the shared context pack before fan-out — factual repo brief only, so member takes stay independent.">
+                  <span style={{ fontSize: 10.5, fontWeight: 600, color: "rgba(139,148,158,0.95)", flex: "0 0 auto" }}>
+                    Scout
+                  </span>
+                  <select
+                    disabled={busy || backendMissing}
+                    onChange={(event) => handleScoutChange(event.target.value)}
+                    style={{ flex: "1 1 auto" }}
+                    value={String(swarm?.scoutMemberId || "")}
+                  >
+                    <option value="">Auto — cheapest ready member</option>
+                    {members.map((member) => (
+                      <option key={member.memberId} value={member.memberId}>
+                        {memberDisplayName(member)}
+                      </option>
+                    ))}
+                  </select>
+                </SwarmAddMemberRow>
+              ) : null}
               {members.map((member) => {
                 const meta = providerMeta(member.provider);
                 return (
@@ -1566,15 +1795,28 @@ export default function SwarmWorkspacePane({
                         score {Number(member.score || 0)}
                         {" · "}takes {Number(member.stats?.takesDelivered || 0)}
                         {" · "}champion {Number(member.stats?.championRuns || 0)}
+                        {Number(member.stats?.scoutRuns || 0) > 0 ? ` · scouted ${member.stats.scoutRuns}` : ""}
                         {Number(member.stats?.reaps || 0) > 0 ? ` · reaps ${member.stats.reaps}` : ""}
+                        {String(swarm?.scoutMemberId || "") === member.memberId ? " · pinned scout" : ""}
                       </small>
                     </SwarmMemberMain>
                     <SwarmMemberStatus data-status={member.status || "offline"}>
                       {member.status || "offline"}
                     </SwarmMemberStatus>
-                    <SwarmGhostButton disabled={busy} onClick={() => handleRestartMember(member.memberId)} type="button">
-                      Restart
-                    </SwarmGhostButton>
+                    {member.status === "offline" || member.status === "dead" || member.status === "error" ? (
+                      <SwarmGhostButton
+                        disabled={busy}
+                        onClick={() => handleActivateSwarm(member.memberId)}
+                        style={{ borderColor: "rgba(76, 141, 255, 0.5)", color: "#79b8ff" }}
+                        type="button"
+                      >
+                        Start
+                      </SwarmGhostButton>
+                    ) : (
+                      <SwarmGhostButton disabled={busy} onClick={() => handleRestartMember(member.memberId)} type="button">
+                        Restart
+                      </SwarmGhostButton>
+                    )}
                     <SwarmGhostButton data-danger="true" disabled={busy} onClick={() => handleRemoveMember(member.memberId)} type="button">
                       Remove
                     </SwarmGhostButton>
@@ -1625,8 +1867,9 @@ export default function SwarmWorkspacePane({
             )
           ) : null}
         </SwarmLowerBody>
+      ) : null}
 
-        <SwarmComposerShell onSubmit={handleSubmitTask}>
+      <SwarmComposerShell onSubmit={handleSubmitTask}>
           <SwarmComposerInput
             disabled={composerDisabled}
             onChange={(event) => setPrompt(event.target.value)}
@@ -1663,7 +1906,6 @@ export default function SwarmWorkspacePane({
             </SwarmPrimaryButton>
           </SwarmComposerControls>
         </SwarmComposerShell>
-      </SwarmLowerShell>
     </SwarmPaneRoot>
   );
 }
