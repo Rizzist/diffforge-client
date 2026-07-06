@@ -25311,6 +25311,26 @@ function TerminalView({
   }, [isWorkspaceSurfaceVisible]);
   const [todoCompletionFlashes, setTodoCompletionFlashes] = useState({});
   const todoCompletionFlashTimersRef = useRef(new Map());
+  // Pane-level attention hint for completion notifications: was the finishing
+  // pane actually on screen? Workspace-level "seen on arrival" used to mark
+  // completions read even when the pane was tab-hidden or minimized.
+  const isTerminalPaneVisibleNow = useCallback((terminalIndex) => {
+    try {
+      const slot = terminalPanelsRef.current?.querySelector?.(
+        `[data-terminal-surface-slot="true"][data-terminal-index="${terminalIndex}"]`,
+      );
+      if (!slot) {
+        return false;
+      }
+      if (typeof slot.checkVisibility === "function") {
+        return slot.checkVisibility({ checkVisibilityCSS: true });
+      }
+      return slot.offsetParent !== null;
+    } catch {
+      return true;
+    }
+  }, []);
+
   const triggerTodoCompletionFlash = useCallback((paneId) => {
     const safePaneId = String(paneId || "").trim();
     if (!safePaneId) {
@@ -27063,6 +27083,9 @@ function TerminalView({
           agentId: pendingItem?.targetAgentId || pendingItem?.targetRole || inFlightPrompt?.agentId || "",
           itemId,
           paneId: completedPaneId,
+          paneVisible: Number.isInteger(safeTerminalIndex)
+            ? isTerminalPaneVisibleNow(safeTerminalIndex)
+            : undefined,
           queueDrained: todoQueueDrained,
           terminalIndex: safeTerminalIndex,
           threadId: inFlightPrompt?.threadId || "",
@@ -28389,11 +28412,13 @@ function TerminalView({
         return;
       }
 
-      // Every completed turn glows the finishing terminal and rings the SFX,
-      // even with no todo-queue prompt in flight (e.g. prompts typed directly
-      // into the CLI). When an in-flight prompt exists its settle path owns
-      // the notification event so the unread list gets the todo text; the
-      // cue cooldown in the reducer keeps the SFX from ringing twice.
+      // Every completed turn glows the finishing terminal, even with no
+      // todo-queue prompt in flight (e.g. prompts typed directly into the
+      // CLI). A turn WITHOUT a todo is a lighter signal though: it must not
+      // ring the todo-completed celebration — `completionKind: "turn"` lets
+      // the notification reducer file it as turn.completed (no fanfare-tier
+      // SFX, lighter cue). When an in-flight prompt exists its settle path
+      // owns the notification event so the unread list gets the todo text.
       if (eventType === "provider-turn-completed") {
         triggerTodoCompletionFlash(payloadPaneId || getTerminalPaneId(terminalIndex));
         if (!todoQueueTerminalInFlightPromptsRef.current.get(terminalIndex)) {
@@ -28402,8 +28427,10 @@ function TerminalView({
               agentId: normalizeTodoTerminalAgentId(
                 payload.agentId || payload.agentKind || payload.agent_kind || "",
               ),
+              completionKind: "turn",
               itemId: "",
               paneId: payloadPaneId || getTerminalPaneId(terminalIndex),
+              paneVisible: isTerminalPaneVisibleNow(terminalIndex),
               queueDrained: false,
               terminalIndex,
               threadId: payload.threadId || "",
@@ -32620,6 +32647,7 @@ function TerminalView({
             ),
             itemId: "",
             paneId: backendPaneId,
+            paneVisible: isTerminalPaneVisibleNow(targetTerminalIndex),
             queueDrained: false,
             terminalIndex: targetTerminalIndex,
             threadId: eventThreadId,
@@ -35044,6 +35072,9 @@ function TerminalView({
                           agentId: storeItem?.targetAgentId || item?.targetAgentId || pendingItem?.targetAgentId || "",
                           itemId,
                           paneId: completedPaneId,
+                          paneVisible: Number.isInteger(completedTerminalIndex)
+                            ? isTerminalPaneVisibleNow(completedTerminalIndex)
+                            : undefined,
                           queueDrained: Object.keys(todoQueuePendingItemsRef.current).length === 0
                             && todoQueueTerminalInFlightPromptsRef.current.size === 0,
                           terminalIndex: Number.isInteger(completedTerminalIndex) ? completedTerminalIndex : null,
@@ -38875,6 +38906,21 @@ function TerminalView({
       // Commit-time flushes read the ref synchronously, before React runs the
       // state updater.
       terminalDragStateRef.current = nextDragState;
+      if (!acceptStructuralChange) {
+        // Position-only move: write the slot CSS vars straight to the dragged
+        // pane's DOM node. Routing every pointer frame through setState
+        // re-rendered the whole pane grid (~1,800 fibers) 30-60x/s — the
+        // measured "dragging terminals lags" storm. React commits only on
+        // structural (row-target) changes below.
+        const slot = terminalPanelsRef.current?.querySelector?.(
+          `[data-terminal-surface-slot="true"][data-terminal-index="${currentDrag.terminalIndex}"]`,
+        );
+        if (slot) {
+          slot.style.setProperty("--terminal-slot-x", `${nextDragState.x}px`);
+          slot.style.setProperty("--terminal-slot-y", `${nextDragState.y}px`);
+          return;
+        }
+      }
       updateTerminalDragState(nextDragState);
     };
 
@@ -40328,13 +40374,17 @@ function TerminalView({
       && terminalDragState?.mode !== "canvas"
       && terminalDragState?.mode !== "canvas-resize"
     ) {
+      // Position-only drag moves bypass React and land in the ref + the DOM
+      // directly (see applyGridDragMove); read the ref here so an unrelated
+      // re-render mid-drag doesn't snap the ghost back to stale state coords.
+      const liveDrag = terminalDragStateRef.current || terminalDragState;
       return {
-        "--terminal-slot-height": `${Math.max(0, terminalDragState.height || 0)}px`,
+        "--terminal-slot-height": `${Math.max(0, liveDrag.height || terminalDragState.height || 0)}px`,
         "--terminal-slot-inverse-scale": "1",
         "--terminal-slot-scale": "1",
-        "--terminal-slot-width": `${Math.max(0, terminalDragState.width || 0)}px`,
-        "--terminal-slot-x": `${terminalDragState.x || 0}px`,
-        "--terminal-slot-y": `${terminalDragState.y || 0}px`,
+        "--terminal-slot-width": `${Math.max(0, liveDrag.width || terminalDragState.width || 0)}px`,
+        "--terminal-slot-x": `${liveDrag.x ?? terminalDragState.x ?? 0}px`,
+        "--terminal-slot-y": `${liveDrag.y ?? terminalDragState.y ?? 0}px`,
       };
     }
 

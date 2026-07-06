@@ -11,6 +11,7 @@ import {
   createWorkspaceThreadLiveTextProjectionEvents,
   createWorkspaceThreadToolProjectionEvents,
   deleteWorkspaceThread,
+  ensureWorkspaceThreadsForTerminalIndexes,
   getWorkspaceThreadsPersistDirtySnapshot,
   getWorkspaceThreadForTerminalIndex,
   getWorkspaceThreadSelectionForLiveTerminal,
@@ -19,6 +20,7 @@ import {
   markWorkspaceThreadAgentActivity,
   markWorkspaceThreadTerminalDetached,
   materializeWorkspaceThreadForTerminal,
+  mergeHydratedWorkspaceThreads,
   normalizeWorkspaceThreads,
   persistWorkspaceThreads,
   resetWorkspaceThreadsPersistDirty,
@@ -104,6 +106,300 @@ function createPersistDirtyTestState() {
     },
   };
 }
+
+function legacyHydratedWorkspaceThreadsMerge(currentThreads, loadedThreads, targets, ensureTargets = []) {
+  const targetIds = new Set(targets.map((target) => target.workspaceId));
+  const normalizedCurrent = normalizeWorkspaceThreads(currentThreads);
+  let mergedThreads = Object.fromEntries(
+    Object.entries(normalizedCurrent).filter(([workspaceId]) => targetIds.has(workspaceId)),
+  );
+  targets.forEach((target) => {
+    if (loadedThreads[target.workspaceId]) {
+      mergedThreads[target.workspaceId] = loadedThreads[target.workspaceId];
+    }
+  });
+  ensureTargets.forEach((ensureTarget) => {
+    mergedThreads = ensureWorkspaceThreadsForTerminalIndexes(mergedThreads, ensureTarget);
+  });
+  return mergedThreads;
+}
+
+function deletePersistedMessageProjectionHashes(threads) {
+  const clone = JSON.parse(JSON.stringify(threads));
+  Object.values(clone).forEach((entry) => {
+    [entry?.threads, entry?.archivedThreads].forEach((rows) => {
+      Object.values(rows || {}).forEach((thread) => {
+        (Array.isArray(thread.messages) ? thread.messages : []).forEach((message) => {
+          delete message.projectionHash;
+          delete message.projection_hash;
+          delete message.stableProjectionHash;
+          delete message.stable_projection_hash;
+        });
+      });
+    });
+  });
+  return clone;
+}
+
+test("hydrated workspace thread merge matches legacy output without normalizing non-target state", () => {
+  const targets = [
+    { workspaceId: "workspace-loaded" },
+    { workspaceId: "workspace-current" },
+  ];
+  const ensureTargets = [{
+    fallbackAgent: "codex",
+    rolesByIndex: { 0: "codex" },
+    terminalIndexes: [0],
+    workspaceId: "workspace-current",
+  }];
+  const currentThreads = {
+    "workspace-loaded": {
+      activeThreadId: "thread-old",
+      threadOrder: ["thread-old"],
+      threads: {
+        "thread-old": {
+          currentAgent: "codex",
+          id: "thread-old",
+          materialized: true,
+          messages: [{
+            id: "message-old",
+            role: "user",
+            text: "this current entry is replaced by SQLite",
+          }],
+          workspaceId: "workspace-loaded",
+        },
+      },
+    },
+    "workspace-current": {
+      activeThreadId: "thread-current",
+      terminalOrder: ["0"],
+      terminalThreadIds: { 0: "thread-current" },
+      terminals: {
+        0: {
+          agentId: "codex",
+          displayName: "Ada",
+          lastActiveAt: "2026-07-01T00:00:00.000Z",
+          status: "idle",
+          terminalName: "Ada",
+          terminalNickname: "Ada",
+          terminalIndex: 0,
+          threadId: "thread-current",
+          updatedAt: "2026-07-01T00:00:00.000Z",
+        },
+      },
+      threadOrder: ["thread-current"],
+      threads: {
+        "thread-current": {
+          createdAt: "2026-07-01T00:00:00.000Z",
+          currentAgent: "codex",
+          displayName: "Ada",
+          id: "thread-current",
+          lastActiveAt: "2026-07-01T00:00:00.000Z",
+          materialized: true,
+          messages: [{
+            createdAt: "2026-07-01T00:00:00.000Z",
+            id: "message-current",
+            role: "user",
+            text: "retained current fallback",
+          }],
+          providerBindings: {
+            codex: {
+              lastActiveAt: "2026-07-01T00:00:00.000Z",
+              status: "idle",
+              terminalName: "Ada",
+              terminalNickname: "Ada",
+              updatedAt: "2026-07-01T00:00:00.000Z",
+            },
+          },
+          status: "idle",
+          terminalName: "Ada",
+          terminalNickname: "Ada",
+          terminalIndex: 0,
+          updatedAt: "2026-07-01T00:00:00.000Z",
+          workspaceId: "workspace-current",
+        },
+      },
+    },
+    "workspace-dropped": {
+      activeThreadId: "thread-dropped",
+      threadOrder: ["thread-dropped"],
+      threads: {
+        "thread-dropped": {
+          currentAgent: "codex",
+          id: "thread-dropped",
+          materialized: true,
+          messages: [{
+            id: "message-dropped",
+            role: "user",
+            text: "non-target state must not survive hydration merge",
+          }],
+          workspaceId: "workspace-dropped",
+        },
+      },
+    },
+  };
+  const loadedThreads = normalizeWorkspaceThreads({
+    "workspace-loaded": {
+      activeThreadId: "thread-loaded",
+      threadOrder: ["thread-loaded"],
+      threads: {
+        "thread-loaded": {
+          currentAgent: "codex",
+          id: "thread-loaded",
+          materialized: true,
+          messages: [{
+            createdAt: "2026-07-01T00:01:00.000Z",
+            id: "message-loaded",
+            role: "user",
+            text: "loaded from SQLite",
+          }],
+          status: "idle",
+          workspaceId: "workspace-loaded",
+        },
+      },
+    },
+  }, { stripLiveBindings: true });
+
+  const legacy = legacyHydratedWorkspaceThreadsMerge(
+    currentThreads,
+    loadedThreads,
+    targets,
+    ensureTargets,
+  );
+  const optimized = mergeHydratedWorkspaceThreads(currentThreads, loadedThreads, {
+    ensureTargets,
+    targets,
+  });
+
+  assert.deepEqual(optimized, legacy);
+  assert.equal(optimized["workspace-loaded"].activeThreadId, "thread-loaded");
+  assert.equal(optimized["workspace-current"].activeThreadId, "thread-current");
+  assert.equal(optimized["workspace-dropped"], undefined);
+});
+
+test("persisted workspace thread messages carry projection hashes without changing normalized state", () => {
+  const workspaceId = "workspace-projection-hash";
+  const threadId = "thread-projection-hash";
+  const state = {
+    [workspaceId]: {
+      activeThreadId: threadId,
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          currentAgent: "codex",
+          id: threadId,
+          materialized: true,
+          messages: [{
+            createdAt: "2026-07-01T00:00:00.000Z",
+            id: "message-user-hash",
+            role: "user",
+            text: "summarize the repository",
+          }, {
+            createdAt: "2026-07-01T00:00:01.000Z",
+            id: "message-activity-hash",
+            kind: "tool_call",
+            role: "activity",
+            text: "rg workspace_threads_read",
+            toolInput: { pattern: "workspace_threads_read" },
+            toolName: "rg",
+          }],
+          status: "idle",
+          workspaceId,
+        },
+      },
+    },
+  };
+
+  const persisted = persistWorkspaceThreads(state);
+  const persistedMessages = persisted[workspaceId].threads[threadId].messages;
+  persistedMessages.forEach((message) => {
+    assert.match(message.projectionHash, /^[a-z0-9]+$/);
+  });
+
+  const legacyPersisted = deletePersistedMessageProjectionHashes(persisted);
+  assert.deepEqual(
+    normalizeWorkspaceThreads(persisted),
+    normalizeWorkspaceThreads(legacyPersisted),
+  );
+
+  const repersistedLegacy = persistWorkspaceThreads(normalizeWorkspaceThreads(legacyPersisted));
+  repersistedLegacy[workspaceId].threads[threadId].messages.forEach((message) => {
+    assert.match(message.projectionHash, /^[a-z0-9]+$/);
+  });
+});
+
+test("stored projection hashes preserve message-bootstrap projection output", () => {
+  const workspaceId = "workspace-projection-hash-bootstrap";
+  const threadId = "thread-projection-hash-bootstrap";
+  const persisted = persistWorkspaceThreads({
+    [workspaceId]: {
+      activeThreadId: threadId,
+      threadOrder: [threadId],
+      threads: {
+        [threadId]: {
+          createdAt: "2026-07-01T00:00:00.000Z",
+          currentAgent: "codex",
+          id: threadId,
+          lastActiveAt: "2026-07-01T00:00:00.000Z",
+          materialized: true,
+          messages: [{
+            createdAt: "2026-07-01T00:00:00.000Z",
+            id: "message-user-bootstrap",
+            role: "user",
+            text: "run the frontend tests",
+            turnId: "turn-bootstrap",
+          }, {
+            createdAt: "2026-07-01T00:00:01.000Z",
+            id: "message-assistant-bootstrap",
+            role: "assistant",
+            status: "complete",
+            text: "Tests passed.",
+            turnId: "turn-bootstrap",
+          }],
+          providerBindings: {
+            codex: {
+              lastActiveAt: "2026-07-01T00:00:00.000Z",
+              lastMessageAt: "2026-07-01T00:00:01.000Z",
+              messageCount: 2,
+              status: "idle",
+              updatedAt: "2026-07-01T00:00:01.000Z",
+            },
+          },
+          status: "idle",
+          updatedAt: "2026-07-01T00:00:01.000Z",
+          workspaceId,
+        },
+      },
+    },
+  });
+  const legacyPersisted = deletePersistedMessageProjectionHashes(persisted);
+  const event = {
+    agentId: "codex",
+    createdAt: "2026-07-01T00:00:02.000Z",
+    messageId: "turn-bootstrap",
+    projectionEvents: [{
+      createdAt: "2026-07-01T00:00:02.000Z",
+      messageId: "turn-bootstrap",
+      status: "completed",
+      turnId: "turn-bootstrap",
+      type: "thread.turn.completed",
+    }],
+    threadId,
+    workspaceId,
+  };
+
+  const withStoredHashes = appendWorkspaceThreadProjectionEvents(
+    normalizeWorkspaceThreads(persisted),
+    event,
+  )[workspaceId].threads[threadId];
+  const withoutStoredHashes = appendWorkspaceThreadProjectionEvents(
+    normalizeWorkspaceThreads(legacyPersisted),
+    event,
+  )[workspaceId].threads[threadId];
+
+  assert.deepEqual(withStoredHashes.messages, withoutStoredHashes.messages);
+  assert.deepEqual(withStoredHashes.projectionEvents, withoutStoredHashes.projectionEvents);
+});
 
 test("workspace thread dirty tracking ignores semantic no-op mutations", () => {
   resetWorkspaceThreadsPersistDirty();

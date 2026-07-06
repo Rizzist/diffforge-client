@@ -33,6 +33,16 @@ const COMPLETION_LIFECYCLE_TYPES = new Set([
   "provider-turn-error",
 ]);
 
+// Only real provider turn ends may mint "terminal ready" attention. A closed/
+// exited/errored terminal still clears its active-turn accounting (the set
+// above), but a dead terminal is not "ready" — treating lifecycle death as
+// completion rang ready cues for crashes and plain window closes.
+const TURN_END_COMPLETION_TYPES = new Set([
+  "pending-prompt-error",
+  "provider-turn-completed",
+  "provider-turn-error",
+]);
+
 const ALL_DONE_COMPLETION_TYPES = new Set([
   "provider-turn-completed",
 ]);
@@ -460,6 +470,8 @@ function notificationTitleForKind(kind) {
       return "Task parked";
     case "todo.completed":
       return "Todo completed";
+    case "turn.completed":
+      return "Turn finished";
     case "task.resume.ready":
     case "task.resume_ready":
       return "Task ready to resume";
@@ -1266,7 +1278,7 @@ export function reduceThreadLifecycleNotificationEvent(state, lifecycleEvent, op
     beforeActiveCount > afterActiveCount
       && terminalIsComplete
       && (
-        COMPLETION_LIFECYCLE_TYPES.has(type)
+        TURN_END_COMPLETION_TYPES.has(type)
         || shouldUseGroundTruthCompletion
       ),
   );
@@ -1403,7 +1415,18 @@ export function reduceTodoCompletedNotificationEvent(state, completionEvent, opt
   }
   const { bucket, state: currentState } = getWorkspaceBucket(state, workspaceId);
   const createdAt = nowIso();
-  const seenOnArrival = workspaceNotificationSeenOnArrival(workspaceId, options);
+  // A completed turn with no todo identity is a lighter "turn.completed"
+  // signal, never the todo celebration: direct CLI prompts used to ring the
+  // todo-completed SFX/badge on every turn.
+  const isBareTurnCompletion = !cleanText(completionEvent?.itemId)
+    && cleanText(completionEvent?.completionKind || completionEvent?.completion_kind) === "turn";
+  const notificationKind = isBareTurnCompletion ? "turn.completed" : "todo.completed";
+  // Pane-level attention: the dispatcher stamps whether the finishing pane
+  // was actually visible. A completion in a hidden pane of the current
+  // workspace must still badge (seen-on-arrival used to swallow it).
+  const paneVisibleHint = completionEvent?.paneVisible ?? completionEvent?.pane_visible;
+  const seenOnArrival = workspaceNotificationSeenOnArrival(workspaceId, options)
+    && paneVisibleHint !== false;
   const rawTerminalIndex = Number(completionEvent?.terminalIndex ?? completionEvent?.terminal_index);
   // Stable per-completion id: the todo item id, else the turn id (so a hook
   // delivered twice updates one notification instead of minting a second),
@@ -1411,7 +1434,7 @@ export function reduceTodoCompletedNotificationEvent(state, completionEvent, opt
   const completionKey = cleanText(completionEvent?.itemId)
     || cleanText(completionEvent?.turnId || completionEvent?.turn_id)
     || String(Date.now());
-  const id = `todo-completed:${workspaceId}:${completionKey}`;
+  const id = `${isBareTurnCompletion ? "turn-completed" : "todo-completed"}:${workspaceId}:${completionKey}`;
   const notification = {
     actionability: "open_thread",
     agentId: cleanText(completionEvent?.agentId || completionEvent?.agent_id),
@@ -1421,7 +1444,7 @@ export function reduceTodoCompletedNotificationEvent(state, completionEvent, opt
     dbChangeRequestId: "",
     dedupeKey: id,
     id,
-    kind: "todo.completed",
+    kind: notificationKind,
     paneId: cleanText(completionEvent?.paneId || completionEvent?.pane_id),
     pendingAction: false,
     seenAt: seenOnArrival ? createdAt : "",
@@ -1433,7 +1456,7 @@ export function reduceTodoCompletedNotificationEvent(state, completionEvent, opt
     taskId: "",
     terminalIndex: Number.isInteger(rawTerminalIndex) ? rawTerminalIndex : null,
     threadId: cleanText(completionEvent?.threadId || completionEvent?.thread_id),
-    title: notificationTitleForKind("todo.completed"),
+    title: notificationTitleForKind(notificationKind),
     updatedAt: createdAt,
     workspaceId,
   };
@@ -1479,7 +1502,11 @@ export function reduceTodoCompletedNotificationEvent(state, completionEvent, opt
       nextState,
       nextBucket,
       workspaceId,
-      completionEvent?.queueDrained ? "todo.queue.drained" : "todo.completed",
+      completionEvent?.queueDrained
+        ? "todo.queue.drained"
+        : isBareTurnCompletion
+          ? "turn.completed"
+          : "todo.completed",
       options,
       {
         paneId: completionEvent?.paneId || completionEvent?.pane_id,

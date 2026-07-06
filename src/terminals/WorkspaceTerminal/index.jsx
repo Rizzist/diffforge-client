@@ -12619,6 +12619,17 @@ function WorkspaceTerminal({
           }
 
           const terminalGeneratedReply = isTerminalGeneratedReplyInput(safeData);
+          // Query replies (OSC 4 palette, DA, etc.) written into a dead or
+          // dying session get echoed back as raw escape text by the cooked-
+          // mode tty (seen with bun's crash reporter querying colors on the
+          // way down). A reply is only meaningful to a live foreground
+          // process — drop it for terminal states.
+          if (
+            terminalGeneratedReply
+            && ["exited", "closed", "blocked"].includes(terminalStateRef.current)
+          ) {
+            return;
+          }
           const startupControlReply = !hasOpenPty
             && startupControlReplyBridgeOpen
             && terminalGeneratedReply;

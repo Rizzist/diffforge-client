@@ -4,6 +4,61 @@ enum NativeNotificationUrgency {
     Attention,
 }
 
+/// Webview-mirrored attention state: what the user is looking at plus their
+/// native-notification preference. The webview pushes updates whenever any of
+/// these change (attention_state_update command); Rust notification paths
+/// consult it so native banners respect both the user's setting and whether
+/// they are already watching the workspace in question.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NativeAttentionState {
+    pub focused: bool,
+    pub native_enabled_override: Option<bool>,
+    pub selected_workspace_id: String,
+    pub terminals_view_visible: bool,
+}
+
+static NATIVE_ATTENTION_STATE: std::sync::OnceLock<std::sync::Mutex<NativeAttentionState>> =
+    std::sync::OnceLock::new();
+
+fn native_attention_state() -> &'static std::sync::Mutex<NativeAttentionState> {
+    NATIVE_ATTENTION_STATE.get_or_init(|| std::sync::Mutex::new(NativeAttentionState::default()))
+}
+
+pub(crate) fn native_attention_state_update(state: NativeAttentionState) {
+    if let Ok(mut current) = native_attention_state().lock() {
+        *current = state;
+    }
+}
+
+/// The user's native-notification setting (mirrored from the webview; enabled
+/// until the webview reports otherwise, so background-mode startup before the
+/// first mirror still notifies).
+pub(crate) fn native_notifications_enabled() -> bool {
+    native_attention_state()
+        .lock()
+        .map(|state| state.native_enabled_override.unwrap_or(true))
+        .unwrap_or(true)
+}
+
+/// True when the user is actively watching this workspace's terminals: app
+/// focused, that workspace selected, terminals view visible. Attention-grade
+/// notifications for a watched workspace are redundant (the in-app cue and
+/// pane chip are on screen).
+pub(crate) fn native_attention_watching_workspace(workspace_id: &str) -> bool {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return false;
+    }
+    native_attention_state()
+        .lock()
+        .map(|state| {
+            state.focused
+                && state.terminals_view_visible
+                && state.selected_workspace_id == workspace_id
+        })
+        .unwrap_or(false)
+}
+
 fn diffforge_native_notify(
     app: &AppHandle,
     title: &str,
@@ -14,6 +69,9 @@ fn diffforge_native_notify(
     let title = title.trim();
     if title.is_empty() {
         return Err("Native notification title is empty.".to_string());
+    }
+    if !native_notifications_enabled() {
+        return Ok(());
     }
     if suppress_when_focused && diffforge_main_window_focused(app) {
         return Ok(());

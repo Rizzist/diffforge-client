@@ -3361,6 +3361,25 @@ fn log_voice_orchestrator_diagnostic_event(phase: &str, fields: Value) {
     }));
 }
 
+/// Webview → Rust attention mirror: what the user is looking at plus the
+/// native-notification preference, so Rust-side notification paths can gate
+/// on watched workspaces and honor the setting (they previously could not).
+#[tauri::command]
+fn attention_state_update(
+    focused: bool,
+    selected_workspace_id: Option<String>,
+    terminals_view_visible: bool,
+    native_notifications_enabled: Option<bool>,
+) -> Result<(), String> {
+    native_attention_state_update(NativeAttentionState {
+        focused,
+        native_enabled_override: native_notifications_enabled,
+        selected_workspace_id: selected_workspace_id.unwrap_or_default().trim().to_string(),
+        terminals_view_visible,
+    });
+    Ok(())
+}
+
 #[tauri::command]
 fn terminal_status_log(phase: String, fields: Value) -> Result<(), String> {
     if !terminal_status_logging_enabled() {
@@ -8038,6 +8057,7 @@ pub fn run() {
             workspace_activation_diagnostic_log,
             workspace_activation_diagnostic_log_many,
             workspace_activation_diagnostic_logging_status,
+            attention_state_update,
             terminal_status_log,
             windows_terminal_set_diagnostic_logging,
             windows_terminal_diagnostic_log,

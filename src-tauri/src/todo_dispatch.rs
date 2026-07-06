@@ -1503,7 +1503,12 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
                 .or(payload.tool_use_id.as_deref())
                 .unwrap_or("attention"),
         );
-        if todo_dispatch_attention_should_notify(dedupe_key) {
+        // Watching the workspace's terminals means the pane chip and in-app
+        // attention cue are already on screen — a time-sensitive native
+        // banner on top of them is noise (it used to bypass focus entirely).
+        if todo_dispatch_attention_should_notify(dedupe_key)
+            && !native_attention_watching_workspace(payload.workspace_id.trim())
+        {
             let workspace_name = payload.workspace_name.trim();
             let title = "Diff Forge: approval required";
             let body = if workspace_name.is_empty() {
@@ -6609,7 +6614,16 @@ fn todo_dispatch_fresh_active_queue_item_ids_for_pane(
     let mut matches = items
         .iter()
         .filter(|item| {
-            todo_dispatch_queue_item_active_for_settlement(item)
+            // Identity-less fallback settlement: only items whose prompt was
+            // actually DISPATCHED into this terminal may be completed by an
+            // anonymous turn end. `queued` items never ran (their turn cannot
+            // have ended) and `paused` items with a real submission match via
+            // their receipt earlier in the settle chain — including either
+            // here let unrelated turns mark untouched todos completed.
+            matches!(
+                todo_store_item_status(item).as_str(),
+                "sending" | "submitted" | "running" | "dispatching"
+            )
                 && todo_store_item_pane_id(item) == pane_id.trim()
                 && todo_dispatch_queue_item_fresh_for_completion_settlement(item)
         })
@@ -6811,6 +6825,12 @@ fn todo_dispatch_active_queue_item_ids_for_pane_matching(
     };
     let has_identity = !prompt_event_id.trim().is_empty()
         || !todo_dispatch_direct_prompt_text_key(prompt_text).is_empty();
+    if !has_identity {
+        // Same rule as the receipt path: readiness without prompt identity
+        // must not complete "the newest queue item" — it proved nothing about
+        // which todo (if any) finished.
+        return Vec::new();
+    }
     let mut matches = items
         .iter()
         .filter(|item| {
@@ -6829,9 +6849,6 @@ fn todo_dispatch_active_queue_item_ids_for_pane_matching(
         .filter(|(_, id)| !id.is_empty())
         .collect::<Vec<_>>();
     matches.sort_by_key(|(updated_ms, _)| std::cmp::Reverse(*updated_ms));
-    if !has_identity {
-        matches.truncate(1);
-    }
     matches.into_iter().map(|(_, id)| id).collect()
 }
 
@@ -7072,7 +7089,13 @@ fn todo_dispatch_mark_active_for_pane_completed(
             .collect::<Vec<_>>();
         receipt_matches.sort_by_key(|(_, _, submitted_at)| std::cmp::Reverse(*submitted_at));
         if !has_identity {
-            receipt_matches.truncate(1);
+            // Terminal readiness without prompt identity proves nothing about
+            // WHICH todo finished — completing "the newest receipt" here
+            // marked unrelated todos done (user-visible false completions).
+            // Identity-less readiness is an attention signal only; real
+            // settlement comes from the hook Stop path or an identified
+            // readiness event.
+            receipt_matches.clear();
         }
         for (command_id, mut receipt, _) in receipt_matches {
             if let Some(object) = receipt.as_object_mut() {

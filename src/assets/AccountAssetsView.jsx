@@ -287,8 +287,12 @@ function assetTransferId(transfer) {
 function assetTransferPercent(transfer) {
   const total = Number(transfer?.bytesTotal ?? transfer?.bytes_total ?? 0) || 0;
   const done = Number(transfer?.bytesDone ?? transfer?.bytes_done ?? 0) || 0;
-  if (total <= 0) return done > 0 ? 100 : 0;
-  return Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+  if (total <= 0) return null;
+  const percent = Math.max(0, Math.min(100, Math.round((done / total) * 100)));
+  if (assetTransferStatusKind(transfer) === "active") {
+    return Math.min(99, percent);
+  }
+  return percent;
 }
 
 function formatAssetBytes(bytes) {
@@ -324,7 +328,8 @@ function assetTransferBytesSummary(transfer) {
   const done = Number(transfer?.bytesDone ?? transfer?.bytes_done ?? 0) || 0;
   if (total <= 0 && done <= 0) return "";
   if (total > 0) {
-    return `${formatAssetBytes(done)} of ${formatAssetBytes(total)} (${assetTransferPercent(transfer)}%)`;
+    const percent = assetTransferPercent(transfer);
+    return `${formatAssetBytes(done)} of ${formatAssetBytes(total)}${percent === null ? "" : ` (${percent}%)`}`;
   }
   return formatAssetBytes(done);
 }
@@ -1255,6 +1260,7 @@ function AssetsPanel({
     if (action === "upload") {
       setOptimisticUploadTransfer(asset, effectiveCloudId, "preparing");
     }
+    let unpublishCachePurgeFailed = false;
     try {
       if (action === "untrack") {
         // Untracking only moves the local copy back to scratch; cloud copies
@@ -1292,6 +1298,8 @@ function AssetsPanel({
           assetId: id,
         });
         adoptAccountAssetsLibraryEvent(response);
+        unpublishCachePurgeFailed = jsonArray(response?.purgeErrors || response?.purge_errors).length > 0
+          || jsonArray(response?.data?.purgeErrors || response?.data?.purge_errors).length > 0;
       } else {
         const command = action === "upload"
           ? "cloud_mcp_upload_account_asset"
@@ -1322,7 +1330,14 @@ function AssetsPanel({
       } else if (action === "deleteCloud") {
         showAssetToast("success", "Cloud copy deleted", availability?.hasLocal ? "Private and public Cloud copies were removed. Local copy is unchanged." : "Private and public Cloud copies were removed.", [name, selectedCloudLabel]);
       } else if (action === "unpublish") {
-        showAssetToast("success", "Public URL removed", "Asset is private again. Cloud copy is unchanged.", [name]);
+        showAssetToast(
+          "success",
+          "Public URL removed",
+          unpublishCachePurgeFailed
+            ? "Asset is private again. Cloud copy is unchanged. CDN cache purge failed, so already-cached copies may stay reachable until they expire."
+            : "Asset is private again. Cloud copy is unchanged.",
+          [name],
+        );
       }
     } catch (nextError) {
       if (action === "upload") {
@@ -1548,7 +1563,8 @@ function AssetsPanel({
             const transferStatus = transfer ? assetTransferStatusKind(transfer) : "";
             const transferActive = transferStatus === "active";
             const transferFailed = transferStatus === "failed";
-            const transferPercent = transfer ? assetTransferPercent(transfer) : 0;
+            const transferPercent = transfer ? assetTransferPercent(transfer) : null;
+            const transferProgressWidth = transferPercent === null ? 0 : transferPercent;
             const transferLabel = transfer ? assetTransferDirectionLabel(transfer) : "";
             const remoteDeviceNames = assetRemoteDeviceNames(asset, currentDeviceId);
             const showRemoteDeviceLine = remoteDeviceNames.length > 0;
@@ -1688,10 +1704,15 @@ function AssetsPanel({
                   <AssetTransferOverlay>
                     <AssetTransferInfo>
                       <AssetTransferLabel>
-                        {`${transferLabel} ${transferPercent}%`}
+                        {transferPercent === null ? transferLabel : `${transferLabel} ${transferPercent}%`}
                       </AssetTransferLabel>
                       <AssetTransferTrack aria-hidden="true">
-                        <AssetTransferFill style={{ width: `${transferPercent}%` }} />
+                        <AssetTransferFill
+                          style={{
+                            minWidth: transferPercent === null ? 0 : undefined,
+                            width: `${transferProgressWidth}%`,
+                          }}
+                        />
                       </AssetTransferTrack>
                     </AssetTransferInfo>
                     <AssetTransferCancel

@@ -20034,7 +20034,19 @@ async fn cloud_mcp_start_remote_command_listener(
                 continue;
             }
             if cloud_mcp_is_account_asset_wake_event(&event_kind, &event) {
-                let _ = app.emit(CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT, event.clone());
+                let event_for_ingest = event.clone();
+                let event_for_emit = tauri::async_runtime::spawn_blocking(move || {
+                    cloud_mcp_update_asset_library_from_response(
+                        "account_asset_fanout",
+                        None,
+                        &Value::Null,
+                        &event_for_ingest,
+                    );
+                    event_for_ingest
+                })
+                .await
+                .unwrap_or_else(|_| event.clone());
+                let _ = app.emit(CLOUD_MCP_ACCOUNT_ASSETS_UPDATED_EVENT, event_for_emit);
                 continue;
             }
             if cloud_mcp_is_voice_plan_result_event(&event_kind) {
@@ -43660,6 +43672,7 @@ async fn cloud_mcp_upload_account_asset_once(
                 transfer_id_for_upload,
                 cloud_id_for_upload,
                 bytes_total,
+                direct_transfer,
                 attempt_reporter,
             )
         })
@@ -43698,7 +43711,7 @@ async fn cloud_mcp_upload_account_asset_once(
                     "upload",
                     status,
                     bytes_total,
-                    0,
+                    cloud_mcp_asset_last_transfer_bytes_done(&transfer_id),
                     Some(&error),
                 );
                 let _ = cloud_mcp_send_asset_request_with_outbox(
@@ -43729,9 +43742,37 @@ async fn cloud_mcp_upload_account_asset_once(
             object.insert("cloudId".to_string(), json!(transfer_cloud_id));
         }
         let completed =
-            cloud_mcp_post_json_endpoint(state, "/v1/assets/complete-upload", &complete_payload)
-                .await?;
+            match cloud_mcp_post_json_endpoint(state, "/v1/assets/complete-upload", &complete_payload)
+                .await
+            {
+                Ok(completed) => completed,
+                Err(error) => {
+                    let bytes_done = cloud_mcp_asset_last_transfer_bytes_done(&transfer_id);
+                    let _ = cloud_mcp_asset_store_local_transfer_progress(
+                        &asset_id,
+                        &transfer_id,
+                        &transfer_cloud_id,
+                        "upload",
+                        "failed",
+                        bytes_total.max(bytes_done),
+                        bytes_done,
+                        Some(&error),
+                    );
+                    return Err(error);
+                }
+            };
         let completed_data = completed.get("data").cloned().unwrap_or(completed);
+        let completed_bytes = bytes_total.max(cloud_mcp_asset_last_transfer_bytes_done(&transfer_id));
+        let _ = cloud_mcp_asset_store_local_transfer_progress(
+            &asset_id,
+            &transfer_id,
+            &transfer_cloud_id,
+            "upload",
+            "completed",
+            completed_bytes,
+            completed_bytes,
+            None,
+        );
         cloud_mcp_update_asset_library_from_response(
             "asset_upload_direct_completed",
             Some("/v1/assets/complete-upload"),
@@ -46585,6 +46626,11 @@ fn cloud_mcp_asset_transfer_progress_is_client_local(row: &Value) -> bool {
     )
 }
 
+fn cloud_mcp_asset_transfer_mode_is_direct_presigned(row: &Value) -> bool {
+    cloud_mcp_asset_row_text(row, &["transfer_mode", "transferMode"])
+        .eq_ignore_ascii_case("direct_presigned")
+}
+
 fn cloud_mcp_asset_transfer_progress_step_bytes(bytes_total: i64) -> i64 {
     if bytes_total > 0 {
         (bytes_total / 100).clamp(128 * 1024, 4 * 1024 * 1024)
@@ -46598,6 +46644,34 @@ fn cloud_mcp_asset_merge_transfer_progress_row(
     existing: &Value,
     source: &str,
 ) {
+    // Compact fanout rows omit identity metadata like transfer_mode; the
+    // merged row replaces the stored JSON wholesale, so backfill sticky
+    // fields from the stored row or direct/proxy arbitration degrades after
+    // the first cloud echo.
+    if let Some(incoming_object) = incoming.as_object_mut() {
+        for key in [
+            "transfer_mode",
+            "transferMode",
+            "device_id",
+            "deviceId",
+            "direction",
+        ] {
+            let missing = incoming_object
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default()
+                .is_empty();
+            if missing {
+                if let Some(value) = existing
+                    .get(key)
+                    .filter(|value| !value.as_str().unwrap_or_default().trim().is_empty())
+                {
+                    incoming_object.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    }
     let existing_done = cloud_mcp_asset_row_i64(existing, &["bytes_done", "bytesDone"]);
     let incoming_done = cloud_mcp_asset_row_i64(incoming, &["bytes_done", "bytesDone"]);
     let existing_status = cloud_mcp_asset_row_text(existing, &["status"]);
@@ -46615,6 +46689,17 @@ fn cloud_mcp_asset_merge_transfer_progress_row(
         "completed" | "failed" | "interrupted" | "cancelled" | "canceled"
     );
     if incoming_terminal {
+        if existing_terminal {
+            let existing_updated = cloud_mcp_asset_row_text(existing, &["updated_at", "updatedAt"]);
+            let incoming_updated = cloud_mcp_asset_row_text(incoming, &["updated_at", "updatedAt"]);
+            if existing_updated > incoming_updated
+                || (existing_updated == incoming_updated
+                    && existing_status == "completed"
+                    && incoming_status != "completed")
+            {
+                preserve_existing_transfer_fields(incoming, existing);
+            }
+        }
         return;
     }
     if existing_terminal {
@@ -46624,8 +46709,9 @@ fn cloud_mcp_asset_merge_transfer_progress_row(
     let incoming_local = source == "local_asset_transfer_progress"
         || cloud_mcp_asset_transfer_progress_is_client_local(incoming);
     let existing_local = cloud_mcp_asset_transfer_progress_is_client_local(existing);
-    let proxy_upload_active =
-        direction.eq_ignore_ascii_case("upload") && !incoming_terminal && !existing_terminal;
+    let direct_presigned_upload = cloud_mcp_asset_transfer_mode_is_direct_presigned(incoming)
+        || cloud_mcp_asset_transfer_mode_is_direct_presigned(existing);
+    let proxy_upload_active = direction.eq_ignore_ascii_case("upload") && !direct_presigned_upload;
     if proxy_upload_active {
         if incoming_local && !existing_local {
             preserve_existing_transfer_fields(incoming, existing);
@@ -47513,12 +47599,13 @@ fn cloud_mcp_asset_library_merge_local(mut remote: Value, local: Value) -> Value
         if let Some(existing) = transfers.iter_mut().find(|transfer| {
             cloud_mcp_asset_row_text(transfer, &["transfer_id", "transferId", "id"]) == local_id
         }) {
-            let local_updated =
-                cloud_mcp_asset_row_text(&local_transfer, &["updated_at", "updatedAt"]);
-            let existing_updated = cloud_mcp_asset_row_text(existing, &["updated_at", "updatedAt"]);
-            if local_updated >= existing_updated {
-                *existing = local_transfer;
-            }
+            let mut merged_transfer = local_transfer.clone();
+            cloud_mcp_asset_merge_transfer_progress_row(
+                &mut merged_transfer,
+                existing,
+                "local_asset_transfer_progress",
+            );
+            *existing = merged_transfer;
         } else {
             transfers.push(local_transfer);
         }
@@ -61227,6 +61314,7 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
                 transfer_id.clone(),
                 transfer_cloud_id.clone(),
                 bytes_total,
+                direct_transfer,
                 upload_reporter.clone(),
             );
             match &upload_result {
@@ -61261,14 +61349,42 @@ pub(crate) fn cloud_mcp_forward_agent_upload_asset(
                 object.insert("cloud_id".to_string(), json!(transfer_cloud_id));
                 object.insert("cloudId".to_string(), json!(transfer_cloud_id));
             }
-            let response = cloud_mcp_proxy_post_json_endpoint(
+            let response = match cloud_mcp_proxy_post_json_endpoint(
                 &base_url,
                 "/v1/assets/complete-upload",
                 &complete_payload.to_string(),
-            )?;
+            ) {
+                Ok(response) => response,
+                Err(error) => {
+                    let bytes_done = cloud_mcp_asset_last_transfer_bytes_done(&transfer_id);
+                    let _ = cloud_mcp_asset_store_local_transfer_progress(
+                        &asset_id,
+                        &transfer_id,
+                        &transfer_cloud_id,
+                        "upload",
+                        "failed",
+                        bytes_total.max(bytes_done),
+                        bytes_done,
+                        Some(&error),
+                    );
+                    return Err(error);
+                }
+            };
             let parsed = serde_json::from_str::<Value>(&response)
                 .unwrap_or_else(|_| json!({"raw_response": response}));
             let completed = parsed.get("data").cloned().unwrap_or(parsed);
+            let completed_bytes =
+                bytes_total.max(cloud_mcp_asset_last_transfer_bytes_done(&transfer_id));
+            let _ = cloud_mcp_asset_store_local_transfer_progress(
+                &asset_id,
+                &transfer_id,
+                &transfer_cloud_id,
+                "upload",
+                "completed",
+                completed_bytes,
+                completed_bytes,
+                None,
+            );
             cloud_mcp_update_asset_library_from_response(
                 "agent_asset_upload_direct_completed",
                 Some("/v1/assets/complete-upload"),
@@ -61581,6 +61697,23 @@ fn cloud_mcp_asset_store_local_transfer_progress(
     update
 }
 
+fn cloud_mcp_asset_last_transfer_bytes_done(transfer_id: &str) -> i64 {
+    let transfer_id = transfer_id.trim();
+    if transfer_id.is_empty() {
+        return 0;
+    }
+    let Ok(conn) = cloud_mcp_open_asset_library_conn() else {
+        return 0;
+    };
+    conn.query_row(
+        "SELECT bytes_done FROM account_asset_transfers WHERE transfer_id=?1 LIMIT 1",
+        [transfer_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+    .max(0)
+}
+
 fn cloud_mcp_asset_transfer_progress_row(
     asset_id: &str,
     transfer_id: &str,
@@ -61811,6 +61944,7 @@ fn cloud_mcp_delete_local_asset_transfer_rows(
 struct CloudMcpAssetProgressReader {
     file: fs::File,
     progress: CloudMcpAssetTransferProgress,
+    bytes_sent: Arc<std::sync::atomic::AtomicI64>,
 }
 
 impl Read for CloudMcpAssetProgressReader {
@@ -61826,7 +61960,10 @@ impl Read for CloudMcpAssetProgressReader {
         }
         let read = self.file.read(buf)?;
         if read > 0 {
-            let done = self.progress.bytes_done.saturating_add(read as i64);
+            let done = self
+                .bytes_sent
+                .fetch_add(read as i64, Ordering::AcqRel)
+                .saturating_add(read as i64);
             self.progress.report("uploading", done, false, None);
         }
         Ok(read)
@@ -61841,6 +61978,7 @@ fn cloud_mcp_upload_asset_streaming_blocking(
     transfer_id: String,
     cloud_id: String,
     bytes_total: i64,
+    direct_transfer: bool,
     reporter: Option<mpsc::UnboundedSender<Value>>,
 ) -> Result<Value, String> {
     let fail_asset_id = asset_id.clone();
@@ -61917,7 +62055,12 @@ fn cloud_mcp_upload_asset_streaming_blocking(
         reporter,
     );
     progress.report("uploading", 0, true, None);
-    let reader = CloudMcpAssetProgressReader { file, progress };
+    let bytes_sent = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let reader = CloudMcpAssetProgressReader {
+        file,
+        progress,
+        bytes_sent: Arc::clone(&bytes_sent),
+    };
     let send_result = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(CLOUD_MCP_ASSET_TRANSFER_TIMEOUT_SECS))
         .build()
@@ -61936,6 +62079,7 @@ fn cloud_mcp_upload_asset_streaming_blocking(
             } else {
                 ("failed", format!("Asset upload failed: {error}"))
             };
+            let bytes_done = bytes_sent.load(Ordering::Acquire).max(0);
             let _ = cloud_mcp_asset_store_local_transfer_progress(
                 &fail_asset_id,
                 &fail_transfer_id,
@@ -61943,7 +62087,7 @@ fn cloud_mcp_upload_asset_streaming_blocking(
                 "upload",
                 status,
                 bytes_total,
-                0,
+                bytes_done,
                 Some(&message),
             );
             return Err(message);
@@ -61967,6 +62111,7 @@ fn cloud_mcp_upload_asset_streaming_blocking(
             .unwrap_or_else(|| "upload failed".to_string());
         let message = format!("Asset upload returned {}: {}", status.as_u16(), detail);
         if !cloud_mcp_asset_transfer_error_requires_reprepare(&message, "upload") {
+            let bytes_done = bytes_sent.load(Ordering::Acquire).max(0);
             let _ = cloud_mcp_asset_store_local_transfer_progress(
                 &fail_asset_id,
                 &fail_transfer_id,
@@ -61974,19 +62119,26 @@ fn cloud_mcp_upload_asset_streaming_blocking(
                 "upload",
                 "failed",
                 bytes_total,
-                0,
+                bytes_done,
                 Some(&message),
             );
         }
         return Err(message);
     }
-    let completed_bytes = bytes_total.max(i64::try_from(length).unwrap_or(i64::MAX));
+    let completed_bytes = bytes_total
+        .max(bytes_sent.load(Ordering::Acquire))
+        .max(i64::try_from(length).unwrap_or(i64::MAX));
+    let completed_status = if direct_transfer {
+        "committing"
+    } else {
+        "completed"
+    };
     let _ = cloud_mcp_asset_store_local_transfer_progress(
         &fail_asset_id,
         &fail_transfer_id,
         &fail_cloud_id,
         "upload",
-        "completed",
+        completed_status,
         completed_bytes,
         completed_bytes,
         None,

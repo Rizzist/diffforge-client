@@ -1656,6 +1656,7 @@ function normalizeThreadMessage(message) {
   const toolMetadata = normalizeThreadToolMetadata(message);
   const title = cleanText(message.title);
   const status = cleanText(message.status, "submitted");
+  const projectionHash = getThreadMessageProjectionHash(message);
   const isTurnCompleteMessage = safeRole === "assistant"
     && (
       kind === "task_complete"
@@ -1674,7 +1675,7 @@ function normalizeThreadMessage(message) {
     return null;
   }
 
-  return {
+  const normalizedMessage = {
     agentId: cleanAgentId(message.agentId || message.agent_id, ""),
     artifacts,
     callId: cleanText(message.callId || message.call_id),
@@ -1689,6 +1690,8 @@ function normalizeThreadMessage(message) {
     turnId: cleanText(message.turnId || message.turn_id),
     ...toolMetadata,
   };
+
+  return attachThreadMessageProjectionHash(normalizedMessage, projectionHash);
 }
 
 function normalizeThreadMessages(messages) {
@@ -1759,13 +1762,19 @@ function compactPersistedThreadMessage(message) {
     return null;
   }
 
-  return {
+  const persistedMessage = {
     ...normalizedMessage,
     text: compactPersistedThreadText(normalizedMessage.text, {
       preserveWhitespace: normalizedMessage.role === "assistant",
     }),
     ...compactPersistedThreadToolMetadata(normalizedMessage),
   };
+  const projectionHash = getThreadMessageProjectionHash(normalizedMessage)
+    || threadMessageProjectionHash(persistedMessage);
+
+  return attachThreadMessageProjectionHash(persistedMessage, projectionHash, {
+    enumerable: true,
+  });
 }
 
 function compactPersistedThreadMessages(messages) {
@@ -1784,6 +1793,56 @@ function stableProjectionHash(value) {
   }
 
   return (hash >>> 0).toString(36);
+}
+
+const THREAD_MESSAGE_PROJECTION_HASH_PATTERN = /^[a-z0-9]{1,16}$/;
+
+function normalizeThreadProjectionHash(value) {
+  const hash = cleanText(value).toLowerCase();
+  return THREAD_MESSAGE_PROJECTION_HASH_PATTERN.test(hash) ? hash : "";
+}
+
+function getThreadMessageProjectionHash(message) {
+  if (!message || typeof message !== "object") {
+    return "";
+  }
+
+  return normalizeThreadProjectionHash(
+    message.projectionHash
+      || message.projection_hash
+      || message.stableProjectionHash
+      || message.stable_projection_hash,
+  );
+}
+
+function attachThreadMessageProjectionHash(message, hash, options = {}) {
+  if (!message || typeof message !== "object") {
+    return message;
+  }
+  const safeHash = normalizeThreadProjectionHash(hash);
+  if (!safeHash) {
+    return message;
+  }
+
+  try {
+    Object.defineProperty(message, "projectionHash", {
+      configurable: true,
+      enumerable: options.enumerable === true,
+      value: safeHash,
+      writable: true,
+    });
+  } catch {
+    message.projectionHash = safeHash;
+  }
+  return message;
+}
+
+function threadMessageProjectionHash(message) {
+  const id = cleanText(message?.id, createRandomId("message"));
+  const text = cleanMessageText(message?.text);
+  const artifacts = threadArtifactsSignature(message?.artifacts);
+  const toolMetadata = JSON.stringify(normalizeThreadToolMetadata(message));
+  return stableProjectionHash(`${id}:${message?.role || ""}:${message?.kind || ""}:${text}:${artifacts}:${toolMetadata}`);
 }
 
 function stableProjectionKey(value, fallback = "event") {
@@ -2168,10 +2227,7 @@ function projectThreadProjectionMessages(events, fallbackMessages = []) {
 
 function threadMessageProjectionEventId(prefix, message, suffix = "") {
   const id = cleanText(message?.id, createRandomId("message"));
-  const text = cleanMessageText(message?.text);
-  const artifacts = threadArtifactsSignature(message?.artifacts);
-  const toolMetadata = JSON.stringify(normalizeThreadToolMetadata(message));
-  const hash = stableProjectionHash(`${id}:${message?.role || ""}:${message?.kind || ""}:${text}:${artifacts}:${toolMetadata}`);
+  const hash = getThreadMessageProjectionHash(message) || threadMessageProjectionHash(message);
   return [
     prefix,
     safeKey(id, "message"),
@@ -4557,6 +4613,46 @@ export function persistWorkspaceThreads(threads) {
     compactPersistence: true,
     stripLiveBindings: true,
   });
+}
+
+export function mergeHydratedWorkspaceThreads(currentThreads, loadedThreads, options = {}) {
+  const targetEntries = Array.isArray(options.targets) ? options.targets : [];
+  const targetIds = new Set(
+    targetEntries
+      .map((target) => cleanText(target?.workspaceId || target?.id || target))
+      .filter(Boolean),
+  );
+  if (!targetIds.size) {
+    return {};
+  }
+
+  const currentState = getWorkspaceThreadsStateObject(currentThreads);
+  const loadedState = getWorkspaceThreadsStateObject(loadedThreads);
+  let mergedThreads = {};
+
+  Object.entries(currentState).forEach(([workspaceId, entry]) => {
+    const safeWorkspaceId = cleanText(workspaceId);
+    if (!safeWorkspaceId || !targetIds.has(safeWorkspaceId)) {
+      return;
+    }
+    mergedThreads[safeWorkspaceId] = loadedState[safeWorkspaceId]
+      || normalizeWorkspaceEntry(entry, safeWorkspaceId);
+  });
+
+  targetEntries.forEach((target) => {
+    const workspaceId = cleanText(target?.workspaceId || target?.id || target);
+    if (!workspaceId || !loadedState[workspaceId]) {
+      return;
+    }
+    mergedThreads[workspaceId] = loadedState[workspaceId];
+  });
+
+  const ensureTargets = Array.isArray(options.ensureTargets) ? options.ensureTargets : [];
+  ensureTargets.forEach((ensureTarget) => {
+    mergedThreads = ensureWorkspaceThreadsForTerminalIndexes(mergedThreads, ensureTarget);
+  });
+
+  return mergedThreads;
 }
 
 function workspaceThreadsPersistShell(entry) {

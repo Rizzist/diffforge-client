@@ -359,6 +359,7 @@ import {
   markWorkspaceThreadAgentActivity,
   markWorkspaceThreadTerminalDetached,
   materializeWorkspaceThreadForTerminal,
+  mergeHydratedWorkspaceThreads,
   normalizeWorkspaceThreads,
   persistWorkspaceThreads,
   readWorkspaceThreads,
@@ -2874,6 +2875,8 @@ const WORKSPACE_APP_STARTUP_SHARED_MCP_IDLE_DELAY_MS = 450;
 const WORKSPACE_APP_STARTUP_MCP_INDEX_IDLE_DELAY_MS = 1600;
 const WORKSPACE_APP_STARTUP_WARMUP_STAGGER_MS = 350;
 const WORKSPACE_APP_STARTUP_IDLE_TIMEOUT_MS = 5000;
+const WORKSPACE_THREADS_HYDRATION_BASELINE_IDLE_TIMEOUT_MS = 80;
+const WORKSPACE_THREADS_HYDRATION_READ_STALE_MS = 15000;
 const WORKSPACE_ARCHITECTURE_GRAPH_LIST_PRELOAD_STAGGER_MS = 90;
 const WORKSPACE_AGENT_BATCH_RETRY_MS = 1500;
 const FILE_EXPLORER_LAYOUT_STORAGE_KEY = "diffforge.fileExplorerLayout.v1";
@@ -22746,6 +22749,8 @@ export default function App() {
   const [workspaceVisibleTerminalRevision, setWorkspaceVisibleTerminalRevision] = useState(0);
   const [workspaceMcpRegistries, setWorkspaceMcpRegistries] = useState({});
   const [workspaceThreadsHydratedKey, setWorkspaceThreadsHydratedKey] = useState("");
+  const [workspaceThreadsHydrationRetryEpoch, setWorkspaceThreadsHydrationRetryEpoch] = useState(0);
+  const [workspaceThreadsPersistenceReadyEpoch, setWorkspaceThreadsPersistenceReadyEpoch] = useState(0);
   const [workspaceNotifications, setWorkspaceNotifications] = useState(readWorkspaceNotifications);
   const [workspaceNotificationHighlights, setWorkspaceNotificationHighlights] = useState({});
   const [snippingPermissionAttentionId, setSnippingPermissionAttentionId] = useState(0);
@@ -22929,9 +22934,15 @@ export default function App() {
   const workspaceNotificationSnapshotKeyRef = useRef("");
   const workspaceThreadsHydratedKeyRef = useRef("");
   const workspaceThreadsPersistenceReadyRef = useRef(false);
+  const workspaceThreadsBaselinePendingKeyRef = useRef("");
+  const workspaceThreadsBaselinePendingRef = useRef(null);
+  const workspaceThreadsBaselineSeedCancelRef = useRef(null);
+  const workspaceThreadsHydrationInFlightRef = useRef(new Map());
   const workspaceThreadsPersistTimerRef = useRef(0);
   const workspaceThreadsPersistInFlightRef = useRef(false);
   const workspaceThreadsPersistPendingRef = useRef(null);
+  const workspaceThreadsPersistImmediateFlushRef = useRef(null);
+  const workspaceThreadsPersistTargetsRef = useRef([]);
   const workspaceThreadsLastPersistedRef = useRef({});
   const terminalInputHotUntilRef = useRef(0);
   const workspaceThreadTranscriptRequestsRef = useRef(new Map());
@@ -25078,11 +25089,133 @@ export default function App() {
     };
   }, []);
 
+  const flushWorkspaceThreadsPersistPendingImmediately = useCallback((reason = "immediate", fallbackPending = null) => {
+    const pendingFromRef = workspaceThreadsPersistPendingRef.current;
+    const pending = fallbackPending || pendingFromRef;
+    if (!pending) {
+      return false;
+    }
+
+    if (workspaceThreadsPersistTimerRef.current) {
+      window.clearTimeout(workspaceThreadsPersistTimerRef.current);
+      workspaceThreadsPersistTimerRef.current = 0;
+    }
+
+    if (workspaceThreadsPersistInFlightRef.current) {
+      workspaceThreadsPersistPendingRef.current = fallbackPending || pendingFromRef;
+      workspaceThreadsPersistTimerRef.current = window.setTimeout(() => {
+        workspaceThreadsPersistTimerRef.current = 0;
+        workspaceThreadsPersistImmediateFlushRef.current?.(`${reason}:retry`);
+      }, 250);
+      return false;
+    }
+
+    if (pendingFromRef || fallbackPending) {
+      workspaceThreadsPersistPendingRef.current = null;
+    }
+    const dirtySnapshot = getWorkspaceThreadsPersistDirtySnapshot(pending.targets);
+    const { normalizedThreads, request } = buildWorkspaceThreadsPersistDelta(
+      pending.workspaceThreads,
+      workspaceThreadsLastPersistedRef.current,
+      pending.targets,
+      { dirtySnapshot },
+    );
+    if (!request.workspaces.length) {
+      clearWorkspaceThreadsPersistDirtySnapshot(dirtySnapshot);
+      return false;
+    }
+
+    workspaceThreadsPersistInFlightRef.current = true;
+    invoke("workspace_threads_persist_delta", {
+      request,
+    }).then(() => {
+      workspaceThreadsLastPersistedRef.current = normalizedThreads;
+      clearWorkspaceThreadsPersistDirtySnapshot(dirtySnapshot);
+    }).catch((error) => {
+      workspaceThreadsPersistPendingRef.current = workspaceThreadsPersistPendingRef.current || pending;
+      logThreadBridgeDiagnosticEvent("frontend.workspace_threads_sqlite_persist.failed", {
+        message: getErrorMessage(error, "Unable to persist workspace threads to SQLite."),
+        reason,
+        workspaceCount: request.workspaces.length,
+      });
+    }).finally(() => {
+      workspaceThreadsPersistInFlightRef.current = false;
+      if (workspaceThreadsPersistPendingRef.current && !workspaceThreadsPersistTimerRef.current) {
+        workspaceThreadsPersistTimerRef.current = window.setTimeout(() => {
+          workspaceThreadsPersistTimerRef.current = 0;
+          workspaceThreadsPersistImmediateFlushRef.current?.(`${reason}:retry`);
+        }, 1000);
+      }
+    });
+    return true;
+  }, []);
+
+  useEffect(() => {
+    workspaceThreadsPersistImmediateFlushRef.current = flushWorkspaceThreadsPersistPendingImmediately;
+    return () => {
+      if (workspaceThreadsPersistImmediateFlushRef.current === flushWorkspaceThreadsPersistPendingImmediately) {
+        workspaceThreadsPersistImmediateFlushRef.current = null;
+      }
+    };
+  }, [flushWorkspaceThreadsPersistPendingImmediately]);
+
+  const seedWorkspaceThreadsPersistBaseline = useCallback((storeKey = "") => {
+    const pendingBaseline = workspaceThreadsBaselinePendingRef.current;
+    if (!pendingBaseline || (storeKey && pendingBaseline.storeKey !== storeKey)) {
+      return null;
+    }
+
+    if (workspaceThreadsBaselineSeedCancelRef.current) {
+      workspaceThreadsBaselineSeedCancelRef.current();
+      workspaceThreadsBaselineSeedCancelRef.current = null;
+    }
+    workspaceThreadsLastPersistedRef.current = persistWorkspaceThreads(pendingBaseline.loadedThreads);
+    workspaceThreadsBaselinePendingKeyRef.current = "";
+    workspaceThreadsBaselinePendingRef.current = null;
+    workspaceThreadsHydratedKeyRef.current = pendingBaseline.storeKey;
+    workspaceThreadsPersistenceReadyRef.current = true;
+    workspaceThreadsPersistTargetsRef.current = pendingBaseline.targets;
+    setWorkspaceThreadsHydratedKey(pendingBaseline.storeKey);
+    setWorkspaceThreadsPersistenceReadyEpoch((epoch) => epoch + 1);
+    return pendingBaseline;
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      workspaceThreadsBaselinePendingKeyRef.current = "";
+      workspaceThreadsBaselinePendingRef.current = null;
+      if (workspaceThreadsBaselineSeedCancelRef.current) {
+        workspaceThreadsBaselineSeedCancelRef.current();
+        workspaceThreadsBaselineSeedCancelRef.current = null;
+      }
+      workspaceThreadsHydrationInFlightRef.current.forEach((entry) => {
+        if (entry?.retryTimer) {
+          window.clearTimeout(entry.retryTimer);
+        }
+      });
+      workspaceThreadsHydrationInFlightRef.current.clear();
+    };
+  }, []);
+
   useEffect(() => {
     const targets = workspaceThreadStoreTargets;
     const storeKey = workspaceThreadStoreKey;
+    const flushPendingThreadsForHydrationTransition = (reason) => {
+      if (workspaceThreadsBaselinePendingRef.current) {
+        seedWorkspaceThreadsPersistBaseline(workspaceThreadsBaselinePendingRef.current.storeKey);
+      }
+      const previousTargets = workspaceThreadsPersistTargetsRef.current;
+      const fallbackPending = previousTargets.length
+        ? {
+          targets: previousTargets,
+          workspaceThreads,
+        }
+        : null;
+      return flushWorkspaceThreadsPersistPendingImmediately(reason, fallbackPending);
+    };
 
     if (workspaceActivationDeferred) {
+      flushPendingThreadsForHydrationTransition("threads_hydration_activation_deferred");
       logWorkspaceActivationTrace("workspace.open.threads_hydration.skip", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
         reason: "activation_deferred",
         targetCount: targets.length,
@@ -25092,6 +25225,7 @@ export default function App() {
     }
 
     if (!workspaceHydrationReady) {
+      flushPendingThreadsForHydrationTransition("threads_hydration_not_ready");
       logWorkspaceActivationTrace("workspace.open.threads_hydration.skip", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
         reason: "hydration_not_ready",
         targetCount: targets.length,
@@ -25099,17 +25233,32 @@ export default function App() {
       });
       workspaceThreadsHydratedKeyRef.current = "";
       workspaceThreadsPersistenceReadyRef.current = false;
+      workspaceThreadsPersistTargetsRef.current = [];
+      workspaceThreadsBaselinePendingKeyRef.current = "";
+      workspaceThreadsBaselinePendingRef.current = null;
+      if (workspaceThreadsBaselineSeedCancelRef.current) {
+        workspaceThreadsBaselineSeedCancelRef.current();
+        workspaceThreadsBaselineSeedCancelRef.current = null;
+      }
       workspaceThreadsLastPersistedRef.current = {};
       setWorkspaceThreadsHydratedKey("");
       return undefined;
     }
 
     if (!targets.length) {
+      flushPendingThreadsForHydrationTransition("threads_hydration_empty");
       logWorkspaceActivationTrace("workspace.open.threads_hydration.empty", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
         storeKey,
       });
       workspaceThreadsHydratedKeyRef.current = storeKey;
       workspaceThreadsPersistenceReadyRef.current = Boolean(workspaces.length === 0);
+      workspaceThreadsPersistTargetsRef.current = [];
+      workspaceThreadsBaselinePendingKeyRef.current = "";
+      workspaceThreadsBaselinePendingRef.current = null;
+      if (workspaceThreadsBaselineSeedCancelRef.current) {
+        workspaceThreadsBaselineSeedCancelRef.current();
+        workspaceThreadsBaselineSeedCancelRef.current = null;
+      }
       workspaceThreadsLastPersistedRef.current = {};
       setWorkspaceThreadsHydratedKey(storeKey);
       return undefined;
@@ -25121,27 +25270,95 @@ export default function App() {
         targetCount: targets.length,
       });
       workspaceThreadsPersistenceReadyRef.current = true;
+      workspaceThreadsPersistTargetsRef.current = targets;
+      workspaceThreadsBaselinePendingKeyRef.current = "";
       setWorkspaceThreadsHydratedKey(storeKey);
+      return undefined;
+    }
+
+    if (workspaceThreadsBaselinePendingKeyRef.current === storeKey) {
+      logWorkspaceActivationTrace("workspace.open.threads_hydration.baseline_pending", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+        storeKey,
+        targetCount: targets.length,
+      });
       return undefined;
     }
 
     let disposed = false;
     const startedAtMs = getWorkspaceActivationDiagnosticNowMs();
+    flushPendingThreadsForHydrationTransition("threads_hydration_restart");
     workspaceThreadsPersistenceReadyRef.current = false;
+    workspaceThreadsBaselinePendingKeyRef.current = "";
+    workspaceThreadsBaselinePendingRef.current = null;
+    if (workspaceThreadsBaselineSeedCancelRef.current) {
+      workspaceThreadsBaselineSeedCancelRef.current();
+      workspaceThreadsBaselineSeedCancelRef.current = null;
+    }
     setWorkspaceThreadsHydratedKey((currentKey) => (currentKey === storeKey ? currentKey : ""));
-    logWorkspaceActivationTrace("workspace.open.threads_hydration.start", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
-      storeKey,
-      targetCount: targets.length,
-      targets: targets.map((target) => ({
-        rootDirectory: target.rootDirectory,
-        terminalCount: target.terminalCount,
-        workspaceId: target.workspaceId,
-      })),
-    });
+    let hydrationInFlightEntry = workspaceThreadsHydrationInFlightRef.current.get(storeKey);
+    if (
+      hydrationInFlightEntry
+      && getWorkspaceActivationDiagnosticNowMs() - hydrationInFlightEntry.startedAtMs > WORKSPACE_THREADS_HYDRATION_READ_STALE_MS
+    ) {
+      logWorkspaceActivationTrace("workspace.open.threads_hydration.inflight_stale", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+        storeKey,
+        targetCount: targets.length,
+      });
+      if (hydrationInFlightEntry.retryTimer) {
+        window.clearTimeout(hydrationInFlightEntry.retryTimer);
+      }
+      workspaceThreadsHydrationInFlightRef.current.delete(storeKey);
+      hydrationInFlightEntry = null;
+    }
+    let hydrationReadPromise = hydrationInFlightEntry?.promise || null;
+    if (hydrationReadPromise) {
+      logWorkspaceActivationTrace("workspace.open.threads_hydration.inflight", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+        storeKey,
+        targetCount: targets.length,
+      });
+    } else {
+      logWorkspaceActivationTrace("workspace.open.threads_hydration.start", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+        storeKey,
+        targetCount: targets.length,
+        targets: targets.map((target) => ({
+          rootDirectory: target.rootDirectory,
+          terminalCount: target.terminalCount,
+          workspaceId: target.workspaceId,
+        })),
+      });
+      hydrationReadPromise = invoke("workspace_threads_read", {
+        request: { workspaces: targets },
+      });
+      hydrationInFlightEntry = {
+        promise: hydrationReadPromise,
+        retryTimer: 0,
+        startedAtMs: getWorkspaceActivationDiagnosticNowMs(),
+      };
+      workspaceThreadsHydrationInFlightRef.current.set(storeKey, hydrationInFlightEntry);
+      hydrationInFlightEntry.retryTimer = window.setTimeout(() => {
+        if (workspaceThreadsHydrationInFlightRef.current.get(storeKey) !== hydrationInFlightEntry) {
+          return;
+        }
+        workspaceThreadsHydrationInFlightRef.current.delete(storeKey);
+        logWorkspaceActivationTrace("workspace.open.threads_hydration.inflight_timeout", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+          storeKey,
+          targetCount: targets.length,
+        });
+        setWorkspaceThreadsHydrationRetryEpoch((epoch) => epoch + 1);
+      }, WORKSPACE_THREADS_HYDRATION_READ_STALE_MS);
+      const clearInFlight = () => {
+        if (workspaceThreadsHydrationInFlightRef.current.get(storeKey) === hydrationInFlightEntry) {
+          workspaceThreadsHydrationInFlightRef.current.delete(storeKey);
+        }
+        if (hydrationInFlightEntry.retryTimer) {
+          window.clearTimeout(hydrationInFlightEntry.retryTimer);
+          hydrationInFlightEntry.retryTimer = 0;
+        }
+      };
+      hydrationReadPromise.then(clearInFlight, clearInFlight);
+    }
 
-    invoke("workspace_threads_read", {
-      request: { workspaces: targets },
-    })
+    hydrationReadPromise
       .then((result) => {
         if (disposed) {
           return;
@@ -25149,69 +25366,92 @@ export default function App() {
         const loadedThreads = normalizeWorkspaceThreads(result?.threads || {}, {
           stripLiveBindings: true,
         });
-        workspaceThreadsLastPersistedRef.current = persistWorkspaceThreads(loadedThreads);
         logWorkspaceActivationTrace("workspace.open.threads_hydration.done", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
           elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
           loadedWorkspaceCount: Object.keys(loadedThreads).length,
           storeKey,
           targetCount: targets.length,
         });
+        const ensureTargets = [];
         const targetIds = new Set(targets.map((target) => target.workspaceId));
-        setWorkspaceThreads((currentThreads) => {
-          const normalizedCurrent = normalizeWorkspaceThreads(currentThreads);
-          let mergedThreads = Object.fromEntries(
-            Object.entries(normalizedCurrent).filter(([workspaceId]) => targetIds.has(workspaceId)),
+        workspaces.forEach((workspace) => {
+          if (!targetIds.has(workspace.id)) {
+            return;
+          }
+          const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspace.id);
+          const terminalIndexes = getWorkspaceLogicalTerminalIndexes(
+            workspaceTerminalLogicalIndexes,
+            workspace.id,
+            terminalCount,
           );
-          targets.forEach((target) => {
-            if (loadedThreads[target.workspaceId]) {
-              mergedThreads[target.workspaceId] = loadedThreads[target.workspaceId];
-            }
-          });
-          workspaces.forEach((workspace) => {
-            if (!targetIds.has(workspace.id)) {
-              return;
-            }
-            const terminalCount = getWorkspaceTerminalCount(workspaceSettings, workspace.id);
-            const terminalIndexes = getWorkspaceLogicalTerminalIndexes(
-              workspaceTerminalLogicalIndexes,
-              workspace.id,
-              terminalCount,
-            );
-            const terminalRoles = getWorkspaceTerminalRoles(
-              workspaceSettings,
-              workspace.id,
-              terminalCount,
+          const terminalRoles = getWorkspaceTerminalRoles(
+            workspaceSettings,
+            workspace.id,
+            terminalCount,
+            workspaceTerminalFallbackRole,
+            workspaceTerminalRoleOptions,
+          );
+          const rolesByIndex = Object.fromEntries(terminalIndexes.map((terminalIndex, index) => ([
+            terminalIndex,
+            normalizeWorkspaceTerminalRole(
+              terminalRoles[index] || terminalRoles[terminalIndex],
               workspaceTerminalFallbackRole,
               workspaceTerminalRoleOptions,
-            );
-            const rolesByIndex = Object.fromEntries(terminalIndexes.map((terminalIndex, index) => ([
-              terminalIndex,
-              normalizeWorkspaceTerminalRole(
-                terminalRoles[index] || terminalRoles[terminalIndex],
-                workspaceTerminalFallbackRole,
-                workspaceTerminalRoleOptions,
-              ),
-            ])));
-            mergedThreads = ensureWorkspaceThreadsForTerminalIndexes(mergedThreads, {
-              fallbackAgent: workspaceTerminalFallbackRole,
-              rolesByIndex,
-              terminalIndexes,
-              workspaceId: workspace.id,
-            });
+            ),
+          ])));
+          ensureTargets.push({
+            fallbackAgent: workspaceTerminalFallbackRole,
+            rolesByIndex,
+            terminalIndexes,
+            workspaceId: workspace.id,
           });
-          return mergedThreads;
         });
-        workspaceThreadsHydratedKeyRef.current = storeKey;
-        workspaceThreadsPersistenceReadyRef.current = true;
-        setWorkspaceThreadsHydratedKey(storeKey);
+        setWorkspaceThreads((currentThreads) => {
+          return mergeHydratedWorkspaceThreads(currentThreads, loadedThreads, {
+            ensureTargets,
+            targets,
+          });
+        });
+        workspaceThreadsBaselinePendingKeyRef.current = storeKey;
+        workspaceThreadsBaselinePendingRef.current = {
+          loadedThreads,
+          storeKey,
+          targets,
+        };
+        workspaceThreadsPersistenceReadyRef.current = false;
+        workspaceThreadsPersistTargetsRef.current = targets;
+        workspaceThreadsBaselineSeedCancelRef.current = scheduleWorkspaceStartupIdleTask(() => {
+          if (workspaceThreadsBaselinePendingKeyRef.current !== storeKey) {
+            return;
+          }
+          const seededBaseline = seedWorkspaceThreadsPersistBaseline(storeKey);
+          if (!seededBaseline) {
+            return;
+          }
+          logWorkspaceActivationTrace("workspace.open.threads_hydration.baseline_seeded", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
+            elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
+            loadedWorkspaceCount: Object.keys(seededBaseline.loadedThreads).length,
+            storeKey,
+            targetCount: targets.length,
+          });
+        }, {
+          timeoutMs: WORKSPACE_THREADS_HYDRATION_BASELINE_IDLE_TIMEOUT_MS,
+        });
       })
       .catch((error) => {
         if (disposed) {
           return;
         }
+        workspaceThreadsBaselinePendingKeyRef.current = "";
+        workspaceThreadsBaselinePendingRef.current = null;
+        if (workspaceThreadsBaselineSeedCancelRef.current) {
+          workspaceThreadsBaselineSeedCancelRef.current();
+          workspaceThreadsBaselineSeedCancelRef.current = null;
+        }
         workspaceThreadsLastPersistedRef.current = {};
         workspaceThreadsHydratedKeyRef.current = storeKey;
         workspaceThreadsPersistenceReadyRef.current = true;
+        workspaceThreadsPersistTargetsRef.current = targets;
         setWorkspaceThreadsHydratedKey(storeKey);
         logWorkspaceActivationTrace("workspace.open.threads_hydration.error", activatedWorkspaceIdRef.current || selectedWorkspaceIdRef.current, {
           elapsedMs: Math.max(0, getWorkspaceActivationDiagnosticNowMs() - startedAtMs),
@@ -25239,6 +25479,9 @@ export default function App() {
     workspaceActivationDeferred,
     logWorkspaceActivationTrace,
     workspaces,
+    workspaceThreadsHydrationRetryEpoch,
+    flushWorkspaceThreadsPersistPendingImmediately,
+    seedWorkspaceThreadsPersistBaseline,
   ]);
 
   useEffect(() => {
@@ -25668,7 +25911,11 @@ export default function App() {
     if (!targets.length || workspaceThreadsHydratedKeyRef.current !== storeKey) {
       return;
     }
+    if (workspaceThreadsBaselinePendingKeyRef.current === storeKey) {
+      return;
+    }
 
+    workspaceThreadsPersistTargetsRef.current = targets;
     workspaceThreadsPersistPendingRef.current = {
       targets,
       workspaceThreads,
@@ -25743,6 +25990,7 @@ export default function App() {
     runtimeWorkspaceIdsForHydration,
     workspaceSettings,
     workspaceThreads,
+    workspaceThreadsPersistenceReadyEpoch,
     workspaces,
   ]);
 
@@ -25892,6 +26140,29 @@ export default function App() {
     }
 
     setWorkspaceNotifications((current) => markWorkspaceNotificationsSeen(current, selectedWorkspaceId));
+  }, [activeView, mainWindowFocused, selectedWorkspaceId, visibleView]);
+
+  // Attention mirror: Rust notification paths gate native banners on what the
+  // user is watching and on the native-notification setting — signals only
+  // the webview knows. Pushed on every change; cheap fire-and-forget.
+  useEffect(() => {
+    let nativeNotificationsEnabled = true;
+    try {
+      const parsed = JSON.parse(
+        window.localStorage?.getItem?.("diffforge.nativeNotifications.v1") || "{}",
+      );
+      nativeNotificationsEnabled = parsed?.enabled !== false;
+    } catch {
+      // default enabled
+    }
+    invoke("attention_state_update", {
+      focused: Boolean(mainWindowFocused),
+      selectedWorkspaceId: selectedWorkspaceId || "",
+      terminalsViewVisible: Boolean(
+        visibleView === DEFAULT_WORKSPACE_VIEW && activeView === DEFAULT_WORKSPACE_VIEW,
+      ),
+      nativeNotificationsEnabled,
+    }).catch(() => {});
   }, [activeView, mainWindowFocused, selectedWorkspaceId, visibleView]);
 
   useEffect(() => {

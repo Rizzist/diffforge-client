@@ -117,6 +117,9 @@ const KIND_TO_TONE = {
   "todo.arrived": "arrive",
   "todo.completed": "ready",
   "todo.queue.drained": "drained",
+  // A finished turn with no todo is rail/badge-only feedback: silent by
+  // design (typed CLI prompts used to ring the todo tone on every turn).
+  "turn.completed": "none",
   "tool.failed": "alert",
   "user.input.required": "attention",
   "voice.off": "voiceOff",
@@ -321,6 +324,7 @@ export function createWorkspaceNotificationSfx() {
       const settings = readSettings();
       if (!settings.enabled) return;
       const toneKey = resolveNotificationSfxTone(kind);
+      if (toneKey === "none") return;
       const recipe = TONE_RECIPES[toneKey] || TONE_RECIPES.ready;
       if (recipe.preferDing) {
         if (await playDing(settings.volume)) {

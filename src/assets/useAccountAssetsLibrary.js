@@ -369,6 +369,104 @@ function assetHiddenFromGenericLibrary(asset) {
     || DOC_BACKED_ASSET_FOLDER_TOKENS.has(folderToken);
 }
 
+function hiddenAssetIdsFromItems(items) {
+  const hiddenIds = new Set();
+  jsonArray(items).forEach((item) => {
+    if (!assetHiddenFromGenericLibrary(item)) return;
+    const id = assetIdText(item);
+    if (id) hiddenIds.add(id);
+  });
+  return hiddenIds;
+}
+
+function transferAssetIdText(transfer) {
+  return text(transfer?.assetId || transfer?.asset_id);
+}
+
+const TERMINAL_TRANSFER_STATUSES = new Set([
+  "completed",
+  "failed",
+  "interrupted",
+  "cancelled",
+  "canceled",
+]);
+
+function transferStatus(transfer) {
+  return text(transfer?.status || transfer?.transferStatus || transfer?.transfer_status).toLowerCase();
+}
+
+function transferTerminal(transfer) {
+  return TERMINAL_TRANSFER_STATUSES.has(transferStatus(transfer));
+}
+
+function transferCompleted(transfer) {
+  return transferStatus(transfer) === "completed";
+}
+
+function transferUpdatedText(transfer) {
+  return text(transfer?.updatedAt || transfer?.updated_at || transfer?.createdAt || transfer?.created_at);
+}
+
+function transferBytesDone(transfer) {
+  const value = Number(transfer?.bytesDone ?? transfer?.bytes_done ?? 0);
+  return Number.isFinite(value) ? value : 0;
+}
+
+function transferFieldValue(row, camelKey, snakeKey = camelKey) {
+  if (Object.prototype.hasOwnProperty.call(row || {}, camelKey)) return row[camelKey];
+  if (Object.prototype.hasOwnProperty.call(row || {}, snakeKey)) return row[snakeKey];
+  return undefined;
+}
+
+function applyTransferWinnerFields(merged, winner) {
+  const status = transferFieldValue(winner, "status");
+  if (status !== undefined) merged.status = status;
+  const bytesDone = transferFieldValue(winner, "bytesDone", "bytes_done");
+  if (bytesDone !== undefined) {
+    merged.bytesDone = bytesDone;
+    merged.bytes_done = bytesDone;
+  }
+  const bytesTotal = transferFieldValue(winner, "bytesTotal", "bytes_total");
+  if (bytesTotal !== undefined) {
+    merged.bytesTotal = bytesTotal;
+    merged.bytes_total = bytesTotal;
+  }
+  const updatedAt = transferFieldValue(winner, "updatedAt", "updated_at");
+  if (updatedAt !== undefined) {
+    merged.updatedAt = updatedAt;
+    merged.updated_at = updatedAt;
+  }
+  merged.error = transferFieldValue(winner, "error") ?? "";
+  return merged;
+}
+
+function mergeTransferRows(existing, incoming) {
+  if (!existing) return incoming;
+  if (!incoming) return existing;
+  const merged = mergeAssetRows(existing, incoming);
+  const existingTerminal = transferTerminal(existing);
+  const incomingTerminal = transferTerminal(incoming);
+  if (incomingTerminal && !existingTerminal) {
+    return applyTransferWinnerFields(merged, incoming);
+  }
+  if (existingTerminal && !incomingTerminal) {
+    return applyTransferWinnerFields(merged, existing);
+  }
+  if (incomingTerminal && existingTerminal) {
+    const existingUpdated = transferUpdatedText(existing);
+    const incomingUpdated = transferUpdatedText(incoming);
+    if (
+      existingUpdated > incomingUpdated
+      || (existingUpdated === incomingUpdated && transferCompleted(existing) && !transferCompleted(incoming))
+    ) {
+      return applyTransferWinnerFields(merged, existing);
+    }
+    return applyTransferWinnerFields(merged, incoming);
+  }
+  const winner = transferBytesDone(existing) > transferBytesDone(incoming) ? existing : incoming;
+  return applyTransferWinnerFields(merged, winner);
+}
+
 function dedupeTransferRows(transfers) {
   const byKey = new Map();
   const rows = [];
@@ -392,7 +490,7 @@ function dedupeTransferRows(transfers) {
       rows.push(transfer);
       return;
     }
-    rows[existingIndex] = mergeAssetRows(rows[existingIndex], transfer);
+    rows[existingIndex] = mergeTransferRows(rows[existingIndex], transfer);
   });
   return rows;
 }
@@ -405,16 +503,17 @@ function normalizeAssetsLibrary(library) {
     ? jsonArray(payload.items)
     : jsonArray(payload.assets);
   const singularItems = [payload.asset, payload.item].filter(assetRowShaped);
-  const items = dedupeAssetRows([
+  const allItems = dedupeAssetRows([
     ...(fanout?.items || []),
     ...directItems,
     ...singularItems,
-  ]).filter((item) => !assetHiddenFromGenericLibrary(item));
-  const visibleIds = new Set(items.map((item) => text(item.assetId || item.asset_id || item.id)).filter(Boolean));
+  ]);
+  const hiddenIds = hiddenAssetIdsFromItems(allItems);
+  const items = allItems.filter((item) => !assetHiddenFromGenericLibrary(item));
   const transfers = dedupeTransferRows([
     ...(fanout?.transfers || []),
     ...jsonArray(payload.transfers),
-  ]).filter((transfer) => visibleIds.has(text(transfer.assetId || transfer.asset_id)));
+  ]).filter((transfer) => !hiddenIds.has(transferAssetIdText(transfer)));
   const clouds = jsonArray(fanout?.clouds).length
     ? jsonArray(fanout.clouds)
     : jsonArray(payload.clouds).length
@@ -451,15 +550,16 @@ function mergeAssetsLibrarySnapshot(library, snapshot) {
     return normalizedSnapshot;
   }
   const current = normalizeAssetsLibrary(library || {});
-  const nextItems = dedupeAssetRows([
+  const allItems = dedupeAssetRows([
     ...jsonArray(current?.items),
     ...jsonArray(normalizedSnapshot?.items),
-  ]).filter((item) => !assetHiddenFromGenericLibrary(item));
-  const visibleIds = new Set(nextItems.map((item) => text(item.assetId || item.asset_id || item.id)).filter(Boolean));
+  ]);
+  const hiddenIds = hiddenAssetIdsFromItems(allItems);
+  const nextItems = allItems.filter((item) => !assetHiddenFromGenericLibrary(item));
   const nextTransfers = dedupeTransferRows([
     ...jsonArray(current?.transfers),
     ...jsonArray(normalizedSnapshot?.transfers),
-  ]).filter((transfer) => visibleIds.has(text(transfer.assetId || transfer.asset_id)));
+  ]).filter((transfer) => !hiddenIds.has(transferAssetIdText(transfer)));
   const clouds = jsonArray(normalizedSnapshot?.clouds).length
     ? jsonArray(normalizedSnapshot.clouds)
     : jsonArray(current?.clouds);
@@ -510,20 +610,21 @@ function mergeAssetsLibraryEvent(library, eventPayload) {
     }
     removedIds.add(id);
   });
-  const nextItems = dedupeAssetRows([
+  const allItems = dedupeAssetRows([
     ...currentItems,
     ...items,
     ...localDeletedItems,
-  ])
+  ]);
+  const hiddenIds = hiddenAssetIdsFromItems(allItems);
+  const nextItems = allItems
     .filter((item) => !assetHiddenFromGenericLibrary(item))
     .filter((item) => !removedIds.has(text(item.assetId || item.asset_id || item.id)));
-  const visibleIds = new Set(nextItems.map((item) => text(item.assetId || item.asset_id || item.id)).filter(Boolean));
   const nextTransfers = dedupeTransferRows([
     ...jsonArray(current?.transfers),
     ...transfers,
   ])
-    .filter((transfer) => visibleIds.has(text(transfer.assetId || transfer.asset_id)))
-    .filter((transfer) => !removedIds.has(text(transfer.assetId || transfer.asset_id)));
+    .filter((transfer) => !hiddenIds.has(transferAssetIdText(transfer)))
+    .filter((transfer) => !removedIds.has(transferAssetIdText(transfer)));
   return normalizeAssetsLibrary({
     ...(current || {}),
     ...(fanout || {}),
