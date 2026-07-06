@@ -176,8 +176,13 @@ fn workspace_webview_open(
     // visible right away. Gating visibility on the page-load "finished" event is
     // unreliable for child webviews on macOS and leaves the panel blank/black when
     // the event never arrives.
+    //
+    // Deliberately NOT focused: set_focus() moves the host window's first
+    // responder into the child webview, so the main UI stops receiving
+    // mouseMoved events — every hover effect in the shell goes dead until the
+    // user clicks the app again. accept_first_mouse(true) already gives the
+    // pane focus the moment the user actually clicks inside it.
     let _ = webview.show();
-    let _ = webview.set_focus();
     Ok(())
 }
 
@@ -215,8 +220,10 @@ fn workspace_webview_adopt(
     webview
         .set_size(tauri::LogicalSize::new(width.max(24.0), height.max(24.0)))
         .map_err(|error| format!("Unable to size workspace web view: {error}"))?;
+    // No set_focus() here either: adoption runs on layout/reparent flows the
+    // user didn't click, and stealing first responder kills hover in the host
+    // window's UI (see workspace_webview_open).
     let _ = webview.show();
-    let _ = webview.set_focus();
     Ok(true)
 }
 

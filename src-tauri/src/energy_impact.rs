@@ -11,7 +11,10 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) const ENERGY_IMPACT_LOGGING_DEFAULT: bool = false;
+// Debug builds self-instrument every launch (2s sampler, no subprocesses,
+// ~zero cost) so user-reported Energy Impact numbers are always attributable
+// without orchestrating an env-var launch. Release stays opt-in via env.
+pub(crate) const ENERGY_IMPACT_LOGGING_DEFAULT: bool = cfg!(debug_assertions);
 const ENERGY_IMPACT_LOG_ENV: &str = "DIFFFORGE_ENERGY_IMPACT_LOG";
 const ENERGY_IMPACT_LOG_FILE: &str = "energy-impact.jsonl";
 const ENERGY_IMPACT_LOG_MAX_BYTES: u64 = 16 * 1024 * 1024;

@@ -21075,11 +21075,13 @@ const WORKSPACE_PANE_KIND_WEB = "web";
 const WORKSPACE_PANE_KIND_PCB = "pcb";
 const WORKSPACE_PANE_KIND_VM = "vm";
 const WORKSPACE_PANE_KIND_VIDEO = "video";
+const WORKSPACE_PANE_KIND_SWARM = "swarm";
 const WORKSPACE_PANE_KINDS = new Set([
   WORKSPACE_PANE_KIND_WEB,
   WORKSPACE_PANE_KIND_PCB,
   WORKSPACE_PANE_KIND_VM,
   WORKSPACE_PANE_KIND_VIDEO,
+  WORKSPACE_PANE_KIND_SWARM,
 ]);
 const WORKSPACE_SLOT_PANE_KINDS = new Set([
   WORKSPACE_PANE_KIND_TERMINAL,
@@ -21087,6 +21089,7 @@ const WORKSPACE_SLOT_PANE_KINDS = new Set([
   WORKSPACE_PANE_KIND_PCB,
   WORKSPACE_PANE_KIND_VM,
   WORKSPACE_PANE_KIND_VIDEO,
+  WORKSPACE_PANE_KIND_SWARM,
 ]);
 const WORKSPACE_PANE_RECORD_KINDS = new Set([
   WORKSPACE_PANE_KIND_TERMINAL,
@@ -21095,6 +21098,7 @@ const WORKSPACE_PANE_RECORD_KINDS = new Set([
   WORKSPACE_PANE_KIND_PCB,
   WORKSPACE_PANE_KIND_VM,
   WORKSPACE_PANE_KIND_VIDEO,
+  WORKSPACE_PANE_KIND_SWARM,
 ]);
 
 function normalizeWorkspacePaneKind(value, fallback = "") {
@@ -21120,6 +21124,9 @@ function normalizeWorkspacePaneKind(value, fallback = "") {
   if (["video", "video-editor", "videoeditor"].includes(normalizedKind)) {
     return WORKSPACE_PANE_KIND_VIDEO;
   }
+  if (["swarm", "swarm-agents", "agents-swarm", "swarm-panel", "swarm-agents-panel", "agent-swarm"].includes(normalizedKind)) {
+    return WORKSPACE_PANE_KIND_SWARM;
+  }
   return fallback;
 }
 
@@ -21128,6 +21135,7 @@ function workspacePaneRecordKindLabel(kind) {
   if (kind === WORKSPACE_PANE_KIND_PCB) return "PCB";
   if (kind === WORKSPACE_PANE_KIND_VM) return "VM Sandbox";
   if (kind === WORKSPACE_PANE_KIND_VIDEO) return "Video editor";
+  if (kind === WORKSPACE_PANE_KIND_SWARM) return "Swarm agents";
   if (kind === WORKSPACE_PANE_KIND_WEB) return "Web";
   return "Terminal";
 }
@@ -21477,6 +21485,7 @@ function workspacePaneKindLabel(kind) {
   if (kind === WORKSPACE_PANE_KIND_PCB) return "PCB";
   if (kind === WORKSPACE_PANE_KIND_VM) return "VM Sandbox";
   if (kind === WORKSPACE_PANE_KIND_VIDEO) return "Video editor";
+  if (kind === WORKSPACE_PANE_KIND_SWARM) return "Swarm agents";
   if (kind === WORKSPACE_PANE_KIND_WEB) return "Web";
   return "Panel";
 }
@@ -21841,6 +21850,10 @@ function workspacePaneKindsVideoIndexes(paneKinds) {
   return workspacePaneKindsIndexes(paneKinds, WORKSPACE_PANE_KIND_VIDEO);
 }
 
+function workspacePaneKindsSwarmIndexes(paneKinds) {
+  return workspacePaneKindsIndexes(paneKinds, WORKSPACE_PANE_KIND_SWARM);
+}
+
 function getWorkspaceTerminalOnlyRolesForPaneKinds(
   logicalIndexes,
   terminalRoles,
@@ -21889,6 +21902,12 @@ function getWorkspaceDraftPanelPaneKinds(paneKinds, webPanelCount, pcbCount, vmC
     .slice(0, desiredVideoCount)
     .forEach((slotIndex) => {
       nextPaneKinds[slotIndex] = WORKSPACE_PANE_KIND_VIDEO;
+    });
+  // Swarm panes have no settings-draft count control; always carry existing
+  // swarm slots through so a settings save never drops the pane.
+  workspacePaneKindsSwarmIndexes(normalizedPaneKinds)
+    .forEach((slotIndex) => {
+      nextPaneKinds[slotIndex] = WORKSPACE_PANE_KIND_SWARM;
     });
 
   return nextPaneKinds;
@@ -31736,6 +31755,10 @@ export default function App() {
 
   const addWorkspaceVideoPane = useCallback((options = {}) => (
     addWorkspacePanelPane({ ...options, paneKind: WORKSPACE_PANE_KIND_VIDEO })
+  ), [addWorkspacePanelPane]);
+
+  const addWorkspaceSwarmPane = useCallback((options = {}) => (
+    addWorkspacePanelPane({ ...options, paneKind: WORKSPACE_PANE_KIND_SWARM })
   ), [addWorkspacePanelPane]);
 
   const rejectWorkspacePromptDeliveriesForThread = useCallback((workspaceId, threadId, message = "") => {
@@ -42660,6 +42683,9 @@ export default function App() {
         if (["video", "video-editor", "videoeditor"].includes(token)) {
           return "video";
         }
+        if (["swarm", "swarm-agents", "agents-swarm", "swarm-panel", "swarm-agents-panel", "agent-swarm"].includes(token)) {
+          return "swarm";
+        }
         if ([
           "doc",
           "docs",
@@ -42862,9 +42888,11 @@ export default function App() {
         ? addWorkspacePcbPane
         : kind === "video"
           ? addWorkspaceVideoPane
-          : kind === "web"
-            ? addWorkspaceWebPane
-            : null;
+          : kind === "swarm"
+            ? addWorkspaceSwarmPane
+            : kind === "web"
+              ? addWorkspaceWebPane
+              : null;
       if (!addPane) {
         throw new Error(`Unsupported workspace panel kind: ${kind}`);
       }
@@ -51127,6 +51155,7 @@ export default function App() {
                             addWorkspacePcbPane={addWorkspacePcbPane}
                             addWorkspaceVmPane={addWorkspaceVmPane}
                             addWorkspaceVideoPane={addWorkspaceVideoPane}
+                            addWorkspaceSwarmPane={addWorkspaceSwarmPane}
                             addWorkspaceWebPane={addWorkspaceWebPane}
                             paneKinds={runtimeDescriptor.paneKinds}
                             closeWorkspaceTerminal={closeWorkspaceTerminal}

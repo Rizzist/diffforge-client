@@ -21,11 +21,13 @@ import { Schedule } from "@styled-icons/material-rounded/Schedule";
 import { ToggleOff } from "@styled-icons/material-rounded/ToggleOff";
 import { ToggleOn } from "@styled-icons/material-rounded/ToggleOn";
 import { Webhook } from "@styled-icons/material-rounded/Webhook";
+import { ScatterPlot as SwarmPanelIcon } from "@styled-icons/material-rounded/ScatterPlot";
 import { TERMINAL_WINDOW_CLOSED_EVENT } from "./TerminalWindowHost.jsx";
 import WebPane from "../web/WebPane.jsx";
 import PcbWorkspacePane from "../pcb/PcbWorkspacePane.jsx";
 import VideoWorkspacePane from "../video/VideoWorkspacePane.jsx";
 import VmSandboxPane from "../vm/VmSandboxPane.jsx";
+import SwarmWorkspacePane, { getSwarmPaneSwarmId } from "../swarm/SwarmWorkspacePane.jsx";
 import {
   PCB_PANEL_COMMAND_EVENT,
   PCB_PANEL_CLOSED_EVENT,
@@ -321,6 +323,7 @@ const TERMINAL_EMPTY_PANEL_LAUNCHERS = Object.freeze([
   { id: "pcb", label: "PCB" },
   { id: "vm", label: "VM Sandbox" },
   { id: "video", label: "Video editor" },
+  { id: "swarm", label: "Swarm agents" },
   { id: "canvas", label: "Terminal canvas" },
   { id: "windows", label: "Window breakout" },
 ]);
@@ -331,6 +334,7 @@ const TERMINAL_TOOLBOX_PANEL_LAUNCHERS = Object.freeze([
   { id: "pcb", label: "PCB" },
   { id: "vm", label: "VM Sandbox" },
   { id: "video", label: "Video editor" },
+  { id: "swarm", label: "Swarm agents" },
   { id: "whiteboard", label: "Whiteboard", unavailable: true },
 ]);
 const TERMINAL_BREAKOUT_PHASE_GRID = "grid";
@@ -1451,6 +1455,9 @@ function TerminalToolboxPanelGlyph({ panelId }) {
   }
   if (panelId === "video") {
     return <Movie aria-hidden="true" />;
+  }
+  if (panelId === "swarm") {
+    return <SwarmPanelIcon aria-hidden="true" />;
   }
   return <ButtonHubIcon aria-hidden="true" />;
 }
@@ -3038,6 +3045,12 @@ const TerminalVideoPanelIdentity = TerminalPcbPanelIdentity;
 const TerminalVideoPanelGlyph = TerminalPcbPanelGlyph;
 const TerminalVideoPanelTitle = TerminalPcbPanelTitle;
 const TerminalVideoPanelBody = TerminalPcbPanelBody;
+const TerminalSwarmPanelShell = TerminalPcbPanelShell;
+const TerminalSwarmPanelHeader = TerminalPcbPanelHeader;
+const TerminalSwarmPanelIdentity = TerminalPcbPanelIdentity;
+const TerminalSwarmPanelGlyph = TerminalPcbPanelGlyph;
+const TerminalSwarmPanelTitle = TerminalPcbPanelTitle;
+const TerminalSwarmPanelBody = TerminalPcbPanelBody;
 const TerminalVideoBreakoutOverlay = TerminalPcbBreakoutOverlay;
 const TerminalVideoBreakoutActions = TerminalPcbBreakoutActions;
 const TerminalVideoBreakoutButton = TerminalPcbBreakoutButton;
@@ -23152,6 +23165,115 @@ function WorkspaceVideoGridPane({
   );
 }
 
+function WorkspaceSwarmGridPane({
+  dragActive = false,
+  fullscreenActive = false,
+  isActive = false,
+  isFullscreen = false,
+  onClose = null,
+  onDragHandlePointerDown = null,
+  onMinimize = null,
+  onSplit = null,
+  onToggleFullscreen = null,
+  paneId = "",
+  paneLimitReached = false,
+  repoPath = "",
+  terminalIndex,
+  workspaceId = "",
+}) {
+  const splitTitle = paneLimitReached ? "Panel limit reached" : "Split Swarm panel";
+
+  return (
+    <TerminalSwarmPanelShell
+      data-active={isActive ? "true" : "false"}
+      data-drag-active={dragActive ? "true" : undefined}
+      data-workspace-swarm-shell="true"
+    >
+      <TerminalSwarmPanelHeader data-terminal-control="true">
+        <TerminalSwarmPanelIdentity>
+          <TerminalRestartButton
+            aria-label="Drag Swarm panel"
+            data-terminal-drag-handle="true"
+            disabled={isFullscreen}
+            onPointerDown={(event) => onDragHandlePointerDown?.(event, terminalIndex, paneId)}
+            title={isFullscreen ? "Exit fullscreen to reorder panels" : "Drag Swarm panel"}
+            type="button"
+          >
+            <ButtonDragIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalSwarmPanelGlyph aria-hidden="true">
+            <SwarmPanelIcon aria-hidden="true" />
+          </TerminalSwarmPanelGlyph>
+          <TerminalSwarmPanelTitle title="Swarm agents">
+            Swarm agents
+          </TerminalSwarmPanelTitle>
+        </TerminalSwarmPanelIdentity>
+        <TerminalRailControls data-rail-row="primary">
+          <TerminalCloseButton
+            aria-label="Close Swarm panel"
+            onClick={() => onClose?.(terminalIndex, paneId)}
+            title="Close Swarm panel"
+            type="button"
+          >
+            <ButtonCloseIcon aria-hidden="true" />
+          </TerminalCloseButton>
+        </TerminalRailControls>
+        <TerminalRailControls data-rail-row="secondary">
+          <TerminalRestartButton
+            aria-label="Split Swarm panel horizontally"
+            disabled={paneLimitReached}
+            onClick={() => onSplit?.({ direction: "vertical", paneId, terminalIndex, workspaceId })}
+            title={splitTitle}
+            type="button"
+          >
+            <ButtonSplitHorizontalIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Split Swarm panel vertically"
+            disabled={paneLimitReached}
+            onClick={() => onSplit?.({ direction: "horizontal", paneId, terminalIndex, workspaceId })}
+            title={splitTitle}
+            type="button"
+          >
+            <ButtonSplitVerticalIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label="Minimize Swarm panel"
+            onClick={() => onMinimize?.(terminalIndex, paneId)}
+            title="Minimize"
+            type="button"
+          >
+            <TitleMinimizeIcon aria-hidden="true" />
+          </TerminalRestartButton>
+          <TerminalRestartButton
+            aria-label={isFullscreen ? "Restore Swarm panel" : "Maximize Swarm panel"}
+            disabled={fullscreenActive && !isFullscreen}
+            onClick={() => onToggleFullscreen?.(terminalIndex, paneId)}
+            title={isFullscreen ? "Restore Swarm panel" : "Maximize Swarm panel"}
+            type="button"
+          >
+            {isFullscreen ? (
+              <ButtonFullscreenExitIcon aria-hidden="true" />
+            ) : (
+              <ButtonFullscreenIcon aria-hidden="true" />
+            )}
+          </TerminalRestartButton>
+        </TerminalRailControls>
+      </TerminalSwarmPanelHeader>
+      <TerminalSwarmPanelBody>
+        <SwarmWorkspacePane
+          key={`swarm-${paneId}`}
+          isActive={isActive}
+          paneId={paneId}
+          repoPath={repoPath}
+          terminalIndex={terminalIndex}
+          workspaceId={workspaceId}
+        />
+      </TerminalSwarmPanelBody>
+    </TerminalSwarmPanelShell>
+  );
+}
+
 function TerminalView({
   accountKey = "",
   architectureTerminalActivity = null,
@@ -23182,6 +23304,7 @@ function TerminalView({
   addWorkspacePcbPane,
   addWorkspaceVmPane,
   addWorkspaceVideoPane,
+  addWorkspaceSwarmPane,
   addWorkspaceWebPane,
   paneKinds = {},
   changeWorkspaceTerminalRole,
@@ -29320,7 +29443,9 @@ function TerminalView({
             ? "vm"
             : paneKinds?.[terminalIndex] === "video"
               ? "video"
-              : "terminal";
+              : paneKinds?.[terminalIndex] === "swarm"
+                ? "swarm"
+                : "terminal";
       const poppedOut = Boolean(
         windowBreakoutPanes[paneId]
         || webBreakoutPanes[paneId]
@@ -29351,6 +29476,9 @@ function TerminalView({
         const project = videoPaneProjects[paneId] || null;
         const projectName = String(project?.name || project?.title || project?.projectName || "").trim();
         return { kind: paneKind, label: `${projectName || "Video editor"}${windowSuffix}`, paneId, poppedOut, terminalIndex };
+      }
+      if (paneKind === "swarm") {
+        return { kind: paneKind, label: "Swarm agents", paneId, terminalIndex };
       }
       const roleId = String(getTerminalRole(terminalIndex) || WORKSPACE_TERMINAL_ROLE_GENERIC).toLowerCase();
       return {
@@ -30833,6 +30961,18 @@ function TerminalView({
     handleAddVideoPane();
   }, [handleAddVideoPane]);
 
+  const handleAddSwarmPane = useCallback(() => {
+    if (!terminalWorkspace?.id || logicalTerminalIndexes.length >= MAX_WORKSPACE_TERMINAL_COUNT) {
+      return;
+    }
+    addWorkspaceSwarmPane?.({ workspaceId: terminalWorkspace.id });
+    measureTerminalLayout();
+  }, [addWorkspaceSwarmPane, logicalTerminalIndexes.length, measureTerminalLayout, terminalWorkspace?.id]);
+
+  const handleOpenEmptyStateSwarmPanel = useCallback(() => {
+    handleAddSwarmPane();
+  }, [handleAddSwarmPane]);
+
   const handleOpenToolboxAgent = useCallback((role) => {
     openWorkspaceTerminalPane(role, "terminal_toolbox");
   }, [openWorkspaceTerminalPane]);
@@ -31004,6 +31144,27 @@ function TerminalView({
                 : "Video editor unavailable",
         };
       }
+      if (launcher.id === "swarm") {
+        const available = Boolean(
+          terminalWorkspace?.id
+            && typeof addWorkspaceSwarmPane === "function"
+            && !terminalPaneLimitReached,
+        );
+        return {
+          ...launcher,
+          detail: "Multiple agents as one",
+          disabled: !available,
+          ready: available,
+          statusLabel: terminalPaneLimitReached ? "limit" : available ? "ready" : "disabled",
+          title: !terminalWorkspace?.id
+            ? "Select a workspace"
+            : terminalPaneLimitReached
+              ? "Panel limit reached"
+              : available
+                ? "Add Swarm agents panel"
+                : "Swarm agents unavailable",
+        };
+      }
       return {
         ...launcher,
         detail: "Not available yet",
@@ -31018,6 +31179,7 @@ function TerminalView({
     addWorkspacePcbPane,
     addWorkspaceVmPane,
     addWorkspaceVideoPane,
+    addWorkspaceSwarmPane,
     onOpenWorkspaceDocumentPanel,
     onOpenWorkspacePcbPanel,
     terminalPaneLimitReached,
@@ -36996,6 +37158,9 @@ function TerminalView({
     if (["video", "video-editor", "videoeditor"].includes(token)) {
       return "video";
     }
+    if (["swarm", "swarm-agents", "agents-swarm", "swarm-panel", "swarm-agents-panel", "agent-swarm"].includes(token)) {
+      return "swarm";
+    }
     if ([
       "doc",
       "docs",
@@ -37050,7 +37215,9 @@ function TerminalView({
             ? "vm"
             : paneKinds?.[terminalIndex] === "video"
               ? "video"
-              : "terminal";
+              : paneKinds?.[terminalIndex] === "swarm"
+                ? "swarm"
+                : "terminal";
       if (filterKind && paneKind !== filterKind) {
         return;
       }
@@ -37079,7 +37246,9 @@ function TerminalView({
               ? "VM Sandbox"
               : paneKind === "video"
                 ? "Video editor"
-                : getManagedAgentLabel(role || WORKSPACE_TERMINAL_ROLE_GENERIC),
+                : paneKind === "swarm"
+                  ? "Swarm agents"
+                  : getManagedAgentLabel(role || WORKSPACE_TERMINAL_ROLE_GENERIC),
         workspaceId,
         workspace_id: workspaceId,
         workspaceName: workspaceNameText,
@@ -37328,7 +37497,9 @@ function TerminalView({
           ? addWorkspaceVmPane
           : kind === "video"
             ? addWorkspaceVideoPane
-            : null;
+            : kind === "swarm"
+              ? addWorkspaceSwarmPane
+              : null;
     if (!addPane || !terminalWorkspace?.id) {
       throw new Error("That workspace panel cannot be opened here.");
     }
@@ -37406,7 +37577,7 @@ function TerminalView({
         queueable: false,
         terminalIndex: result.terminalIndex,
         terminal_index: result.terminalIndex,
-        title: kind === "pcb" ? "PCB" : kind === "vm" ? "VM Sandbox" : kind === "video" ? "Video editor" : "Web",
+        title: kind === "pcb" ? "PCB" : kind === "vm" ? "VM Sandbox" : kind === "video" ? "Video editor" : kind === "swarm" ? "Swarm agents" : "Web",
         workspaceId: terminalWorkspace.id,
         workspace_id: terminalWorkspace.id,
         workspaceName: terminalWorkspace.name || workspaceName || "",
@@ -37422,6 +37593,7 @@ function TerminalView({
     addWorkspacePcbPane,
     addWorkspaceVmPane,
     addWorkspaceVideoPane,
+    addWorkspaceSwarmPane,
     addWorkspaceWebPane,
     defaultWorkingDirectory,
     focusWorkspacePanelFromControl,
@@ -40437,6 +40609,7 @@ function TerminalView({
           const isPcbPane = paneKinds?.[terminalIndex] === "pcb";
           const isVmPane = paneKinds?.[terminalIndex] === "vm";
           const isVideoPane = paneKinds?.[terminalIndex] === "video";
+          const isSwarmPane = paneKinds?.[terminalIndex] === "swarm";
           const confirmedTerminalPane = Boolean(
             terminalWorkspace?.id
               && !terminalWorkspaceExplicitEmpty
@@ -40445,7 +40618,8 @@ function TerminalView({
               && !isWebPane
               && !isPcbPane
               && !isVmPane
-              && !isVideoPane,
+              && !isVideoPane
+              && !isSwarmPane,
           );
           if (isWebPane) {
             const webSurfaceReady = hasMeasuredRect;
@@ -40772,6 +40946,85 @@ function TerminalView({
                   onToggleFullscreen={(index, pid) => handleToggleFullscreenTerminal({ paneId: pid, terminalIndex: index })}
                   paneId={terminalPaneId}
                   paneLimitReached={terminalPaneLimitReached}
+                  terminalIndex={terminalIndex}
+                  workspaceId={terminalWorkspace?.id || ""}
+                />
+                {terminalBreakoutLayoutActive && !fullscreenThisTerminal && terminalActive && (
+                  <TerminalBreakoutResizeHandles data-terminal-control="true">
+                    {TERMINAL_BREAKOUT_RESIZE_HANDLES.map((handle) => (
+                      <TerminalBreakoutResizeHandle
+                        aria-label={handle.label}
+                        data-handle={handle.id}
+                        data-terminal-control="true"
+                        data-terminal-resize-handle="true"
+                        key={handle.id}
+                        onPointerDown={(event) => beginTerminalBreakoutResize(event, terminalIndex, handle)}
+                        title={handle.label}
+                        type="button"
+                      />
+                    ))}
+                  </TerminalBreakoutResizeHandles>
+                )}
+              </TerminalSurfaceSlot>
+            );
+          }
+          if (isSwarmPane) {
+            return (
+              <TerminalSurfaceSlot
+                data-terminal-active={terminalActive ? "true" : "false"}
+                data-terminal-breakout={terminalBreakoutLayoutActive ? "true" : "false"}
+                data-terminal-dragging={draggingThisTerminal ? "true" : "false"}
+                data-terminal-fullscreen={fullscreenThisTerminal ? "true" : "false"}
+                data-terminal-hidden={tabHidden ? "true" : "false"}
+                data-terminal-index={terminalIndex}
+                data-terminal-interacting={terminalBreakoutCanvasInteracting ? "true" : "false"}
+                data-terminal-surface-slot="true"
+                data-terminal-swarm-pane="true"
+                data-terminal-tab-hidden={tabHidden ? "true" : "false"}
+                key={`${terminalWorkspace.id}-${terminalIndex}`}
+                onClickCapture={(event) => handleTerminalBreakoutSlotClickCapture(event, terminalIndex)}
+                style={getTerminalSlotStyle(terminalIndex)}
+              >
+                <WorkspaceSwarmGridPane
+                  dragActive={terminalDragActive}
+                  fullscreenActive={fullscreenActive}
+                  isActive={isWorkspaceSurfaceVisible && !tabHidden}
+                  isFullscreen={fullscreenThisTerminal}
+                  onClose={(index) => {
+                    invoke("swarm_dispose", {
+                      workspaceId: terminalWorkspace?.id || "",
+                      swarmId: getSwarmPaneSwarmId(terminalWorkspace?.id || "", index),
+                    }).catch(() => {});
+                    closeWorkspaceTerminal({ workspaceId: terminalWorkspace?.id || "", terminalIndex: index });
+                  }}
+                  onDragHandlePointerDown={(event, index, pid) => {
+                    if (event.button !== 0) {
+                      return;
+                    }
+                    const slotEl = event.currentTarget.closest("[data-terminal-surface-slot]");
+                    const surfaceEl = event.currentTarget.closest("[data-workspace-swarm-shell]") || slotEl;
+                    if (!surfaceEl) {
+                      return;
+                    }
+                    event.preventDefault();
+                    event.stopPropagation();
+                    handleBeginTerminalDrag({
+                      clientX: event.clientX,
+                      clientY: event.clientY,
+                      paneId: pid,
+                      panelRect: getPlainDomRect(slotEl?.getBoundingClientRect?.()),
+                      pointerId: event.pointerId,
+                      surfaceRect: getPlainDomRect(surfaceEl?.getBoundingClientRect?.()),
+                      terminalIndex: index,
+                      workspaceId: terminalWorkspace?.id || "",
+                    });
+                  }}
+                  onMinimize={handleMinimizeWorkspacePane}
+                  onSplit={handleSplitTerminal}
+                  onToggleFullscreen={(index, pid) => handleToggleFullscreenTerminal({ paneId: pid, terminalIndex: index })}
+                  paneId={terminalPaneId}
+                  paneLimitReached={terminalPaneLimitReached}
+                  repoPath={terminalWorkspaceWorkingDirectory || defaultWorkingDirectory || ""}
                   terminalIndex={terminalIndex}
                   workspaceId={terminalWorkspace?.id || ""}
                 />
@@ -41360,7 +41613,9 @@ function TerminalView({
 	                          ? handleOpenToolboxVmPanel
 	                          : option.id === "video"
 	                            ? handleOpenToolboxVideoPanel
-	                            : undefined;
+	                            : option.id === "swarm"
+	                              ? handleAddSwarmPane
+	                              : undefined;
 
                   return (
                     <TerminalToolboxOption
@@ -41544,6 +41799,7 @@ function TerminalView({
             const pcbPanel = launcher.id === "pcb";
             const vmPanel = launcher.id === "vm";
             const videoPanel = launcher.id === "video";
+            const swarmPanel = launcher.id === "swarm";
             const webEnabled = Boolean(workspaceSelected && addWorkspaceWebPane && !limitReached);
             const docsEnabled = Boolean(
               workspaceSelected
@@ -41556,6 +41812,7 @@ function TerminalView({
             );
             const vmEnabled = Boolean(workspaceSelected && addWorkspaceVmPane && !limitReached);
             const videoEnabled = Boolean(workspaceSelected && addWorkspaceVideoPane && !limitReached);
+            const swarmEnabled = Boolean(workspaceSelected && addWorkspaceSwarmPane && !limitReached);
             const enabled = webPanel
               ? webEnabled
               : docsPanel
@@ -41566,10 +41823,12 @@ function TerminalView({
 	                    ? vmEnabled
 	                    : videoPanel
 	                      ? videoEnabled
-	                      : false;
+	                      : swarmPanel
+	                        ? swarmEnabled
+	                        : false;
             const title = !workspaceSelected
               ? "Select a workspace"
-              : limitReached && (webPanel || pcbPanel || vmPanel || videoPanel)
+              : limitReached && (webPanel || pcbPanel || vmPanel || videoPanel || swarmPanel)
                 ? "Panel limit reached"
                 : webPanel
                   ? webEnabled ? "Add web panel" : "Web panel unavailable"
@@ -41581,7 +41840,9 @@ function TerminalView({
 	                        ? vmEnabled ? "Add VM Sandbox panel" : "VM Sandbox unavailable"
 	                        : videoPanel
 	                          ? videoEnabled ? "Add Video editor panel" : "Video editor unavailable"
-	                          : `${launcher.label} requires a terminal`;
+	                          : swarmPanel
+	                            ? swarmEnabled ? "Add Swarm agents panel" : "Swarm agents unavailable"
+	                            : `${launcher.label} requires a terminal`;
             const handleClick = webPanel
               ? handleOpenEmptyStateWebPanel
               : docsPanel
@@ -41592,7 +41853,9 @@ function TerminalView({
 	                    ? handleOpenEmptyStateVmPanel
 	                    : videoPanel
 	                      ? handleOpenEmptyStateVideoPanel
-	                      : undefined;
+	                      : swarmPanel
+	                        ? handleOpenEmptyStateSwarmPanel
+	                        : undefined;
 
             return (
               <TerminalNoPanelsIconButton
@@ -41605,7 +41868,9 @@ function TerminalView({
 	                        ? "Add PCB panel"
 	                        : videoPanel
 	                          ? "Add Video editor panel"
-	                          : launcher.label
+	                          : swarmPanel
+	                            ? "Add Swarm agents panel"
+	                            : launcher.label
                 }
                 data-secondary="true"
                 disabled={!enabled}

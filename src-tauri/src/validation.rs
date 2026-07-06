@@ -47,9 +47,9 @@ fn is_safe_terminal_pane_id(value: &str) -> bool {
 
     value_length >= 3
         && value_length <= 96
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':')
+        })
 }
 
 fn validate_terminal_pane_id(value: &str) -> Result<(), String> {

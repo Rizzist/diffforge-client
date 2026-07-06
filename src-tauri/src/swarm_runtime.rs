@@ -1,0 +1,2181 @@
+const SWARM_STATE_EVENT: &str = "diffforge://swarm-state";
+const SWARM_RUN_EVENT: &str = "diffforge://swarm-run-event";
+const SWARM_TAKE_SENTINEL: &str = "SWARM_TAKE_END";
+const SWARM_MAX_MEMBERS: usize = 5;
+const SWARM_RUN_SUMMARY_LIMIT: usize = 50;
+const SWARM_TAKE_TIMEOUT_SECS: u64 = 15 * 60;
+const SWARM_SYNTHESIS_TIMEOUT_SECS: u64 = 20 * 60;
+const SWARM_PROMPT_ACK_TIMEOUT_SECS: u64 = 8;
+const SWARM_SPAWN_READY_MONITOR_SECS: u64 = 120;
+const SWARM_IDLE_POLL_MS: u64 = 750;
+const SWARM_MIN_IDLE_AFTER_PROMPT_MS: u64 = 5_000;
+const SWARM_CAPTURE_MAX_CHARS: usize = 48_000;
+
+#[derive(Clone)]
+struct SwarmRuntimeState {
+    swarms: Arc<RwLock<HashMap<String, Arc<Mutex<SwarmRuntimeData>>>>>,
+    ledger_lock: Arc<Mutex<()>>,
+}
+
+impl SwarmRuntimeState {
+    fn new() -> Self {
+        Self {
+            swarms: Arc::new(RwLock::new(HashMap::new())),
+            ledger_lock: Arc::new(Mutex::new(())),
+        }
+    }
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct MemberSpec {
+    member_id: Option<String>,
+    provider: String,
+    model: Option<String>,
+    label: Option<String>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct SwarmConfig {
+    swarm_id: String,
+    workspace_id: String,
+    repo_path: String,
+    champion_member_id: String,
+    members: Vec<MemberSpec>,
+    updated_at: u64,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct MemberStats {
+    takes_delivered: u64,
+    champion_runs: u64,
+    reaps: u64,
+    errors: u64,
+}
+
+#[derive(Clone)]
+struct SwarmMemberRuntime {
+    member_id: String,
+    provider: String,
+    model: String,
+    label: String,
+    pane_id: String,
+    instance_id: Option<u64>,
+    status: String,
+    input_ready: bool,
+    stats: MemberStats,
+    last_activity_at: u64,
+    last_error: String,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct RunSummary {
+    run_id: String,
+    status: String,
+    prompt: String,
+    mode: String,
+    started_at: u64,
+    settled_at: u64,
+    result_summary: String,
+}
+
+#[derive(Clone)]
+struct SwarmRuntimeData {
+    config: SwarmConfig,
+    members: HashMap<String, SwarmMemberRuntime>,
+    active_run_id: String,
+    active_run_cancel: Option<Arc<AtomicBool>>,
+    runs: Vec<RunSummary>,
+}
+
+#[derive(Clone)]
+struct SwarmMemberRef {
+    member_id: String,
+    pane_id: String,
+    instance_id: u64,
+}
+
+#[derive(Clone)]
+struct SwarmTakeResult {
+    member_id: String,
+    text: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MemberState {
+    member_id: String,
+    provider: String,
+    model: String,
+    label: String,
+    pane_id: String,
+    status: String,
+    input_ready: bool,
+    score: i64,
+    stats: MemberStats,
+    last_activity_at: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SwarmState {
+    swarm_id: String,
+    workspace_id: String,
+    repo_path: String,
+    champion_member_id: String,
+    members: Vec<MemberState>,
+    active_run_id: String,
+    runs: Vec<RunSummary>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwarmRunEvent {
+    seq: u64,
+    run_id: String,
+    at: u64,
+    kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    member_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<Value>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SwarmSubmitTaskResult {
+    run_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SwarmRunEventsResult {
+    events: Vec<SwarmRunEvent>,
+    latest_seq: u64,
+}
+
+fn swarm_key(workspace_id: &str, swarm_id: &str) -> String {
+    format!("{workspace_id}\n{swarm_id}")
+}
+
+fn swarm_safe_component(value: &str) -> String {
+    let safe = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(120)
+        .collect::<String>();
+    if safe.is_empty() {
+        "default".to_string()
+    } else {
+        safe
+    }
+}
+
+fn swarm_root_dir() -> Result<PathBuf, String> {
+    cloud_mcp_local_data_file_path("swarm")
+        .ok_or_else(|| "Unable to resolve the local swarm data directory.".to_string())
+}
+
+fn swarm_workspace_dir(workspace_id: &str) -> Result<PathBuf, String> {
+    Ok(swarm_root_dir()?.join(swarm_safe_component(workspace_id)))
+}
+
+fn swarm_dir(workspace_id: &str, swarm_id: &str) -> Result<PathBuf, String> {
+    Ok(swarm_workspace_dir(workspace_id)?.join(swarm_safe_component(swarm_id)))
+}
+
+fn swarm_config_path(workspace_id: &str, swarm_id: &str) -> Result<PathBuf, String> {
+    Ok(swarm_dir(workspace_id, swarm_id)?.join("config.json"))
+}
+
+fn swarm_runs_dir(workspace_id: &str, swarm_id: &str) -> Result<PathBuf, String> {
+    Ok(swarm_dir(workspace_id, swarm_id)?.join("runs"))
+}
+
+fn swarm_run_ledger_path(
+    workspace_id: &str,
+    swarm_id: &str,
+    run_id: &str,
+) -> Result<PathBuf, String> {
+    Ok(swarm_runs_dir(workspace_id, swarm_id)?
+        .join(format!("{}.jsonl", swarm_safe_component(run_id))))
+}
+
+fn swarm_now_ms() -> u64 {
+    terminal_now_ms()
+}
+
+fn swarm_member_score(stats: &MemberStats) -> i64 {
+    (2 * stats.champion_runs as i64) + stats.takes_delivered as i64
+        - stats.reaps as i64
+        - stats.errors as i64
+}
+
+fn swarm_normalize_provider(provider: &str) -> Result<String, String> {
+    let normalized = provider
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_");
+    match normalized.as_str() {
+        "codex" | "claude" | "opencode" => Ok(normalized),
+        _ => Err("Swarm member provider must be codex, claude, or opencode.".to_string()),
+    }
+}
+
+fn swarm_default_member_label(provider: &str) -> String {
+    match provider {
+        "codex" => "Codex",
+        "claude" => "Claude",
+        "opencode" => "OpenCode",
+        _ => "Agent",
+    }
+    .to_string()
+}
+
+fn swarm_pane_id(swarm_id: &str, member_id: &str) -> String {
+    format!("swarm:{swarm_id}:{member_id}")
+}
+
+fn swarm_trim_text(value: Option<String>) -> String {
+    value.unwrap_or_default().trim().to_string()
+}
+
+fn swarm_normalize_member_id(value: &str) -> String {
+    let normalized = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(40)
+        .collect::<String>();
+    if normalized.is_empty() {
+        "member".to_string()
+    } else {
+        normalized
+    }
+}
+
+fn swarm_next_member_id(used: &HashSet<String>) -> String {
+    for index in 1..=SWARM_MAX_MEMBERS {
+        let candidate = format!("m{index}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+    }
+    format!("m{}", used.len().saturating_add(1))
+}
+
+fn swarm_resolve_member_specs(members: Vec<MemberSpec>) -> Result<Vec<MemberSpec>, String> {
+    if members.len() > SWARM_MAX_MEMBERS {
+        return Err(format!(
+            "Swarm v1 supports at most {SWARM_MAX_MEMBERS} members."
+        ));
+    }
+
+    let mut used = HashSet::new();
+    let mut resolved = Vec::with_capacity(members.len());
+    for mut member in members {
+        let provider = swarm_normalize_provider(&member.provider)?;
+        let member_id = member
+            .member_id
+            .as_deref()
+            .map(swarm_normalize_member_id)
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| swarm_next_member_id(&used));
+        if !used.insert(member_id.clone()) {
+            return Err(format!("Duplicate swarm member id: {member_id}"));
+        }
+        member.member_id = Some(member_id);
+        member.provider = provider;
+        member.model = Some(swarm_trim_text(member.model));
+        member.label = Some(swarm_trim_text(member.label));
+        resolved.push(member);
+    }
+    Ok(resolved)
+}
+
+fn swarm_member_from_spec(swarm_id: &str, spec: &MemberSpec) -> Result<SwarmMemberRuntime, String> {
+    let member_id = spec
+        .member_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| "Swarm member id is required.".to_string())?
+        .to_string();
+    let provider = swarm_normalize_provider(&spec.provider)?;
+    let model = swarm_trim_text(spec.model.clone());
+    let label = swarm_trim_text(spec.label.clone());
+    Ok(SwarmMemberRuntime {
+        member_id: member_id.clone(),
+        provider: provider.clone(),
+        model,
+        label: if label.is_empty() {
+            swarm_default_member_label(&provider)
+        } else {
+            label
+        },
+        pane_id: swarm_pane_id(swarm_id, &member_id),
+        instance_id: None,
+        status: "offline".to_string(),
+        input_ready: false,
+        stats: MemberStats::default(),
+        last_activity_at: 0,
+        last_error: String::new(),
+    })
+}
+
+fn swarm_config_from_parts(
+    workspace_id: &str,
+    swarm_id: &str,
+    repo_path: &str,
+    members: Vec<MemberSpec>,
+    champion_member_id: Option<String>,
+) -> SwarmConfig {
+    SwarmConfig {
+        swarm_id: swarm_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+        repo_path: repo_path.trim().to_string(),
+        champion_member_id: champion_member_id.unwrap_or_default().trim().to_string(),
+        members,
+        updated_at: swarm_now_ms(),
+    }
+}
+
+fn swarm_load_config(workspace_id: &str, swarm_id: &str) -> SwarmConfig {
+    let path = match swarm_config_path(workspace_id, swarm_id) {
+        Ok(path) => path,
+        Err(_) => {
+            return SwarmConfig {
+                swarm_id: swarm_id.to_string(),
+                workspace_id: workspace_id.to_string(),
+                ..SwarmConfig::default()
+            };
+        }
+    };
+    let mut config = fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<SwarmConfig>(&text).ok())
+        .unwrap_or_else(|| SwarmConfig {
+            swarm_id: swarm_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            ..SwarmConfig::default()
+        });
+    config.swarm_id = swarm_id.to_string();
+    config.workspace_id = workspace_id.to_string();
+    config.members = swarm_resolve_member_specs(config.members).unwrap_or_default();
+    config
+}
+
+fn swarm_save_config(config: &SwarmConfig) -> Result<(), String> {
+    let path = swarm_config_path(&config.workspace_id, &config.swarm_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create swarm config directory: {error}"))?;
+    }
+    let bytes = serde_json::to_vec_pretty(config)
+        .map_err(|error| format!("Unable to serialize swarm config: {error}"))?;
+    fs::write(path, bytes).map_err(|error| format!("Unable to write swarm config: {error}"))
+}
+
+fn swarm_summary_text(value: &str) -> String {
+    value
+        .trim()
+        .chars()
+        .take(240)
+        .collect::<String>()
+        .replace('\n', " ")
+}
+
+fn swarm_new_runtime_data(workspace_id: &str, swarm_id: &str) -> SwarmRuntimeData {
+    let config = swarm_load_config(workspace_id, swarm_id);
+    let mut members = HashMap::new();
+    for spec in &config.members {
+        if let Ok(member) = swarm_member_from_spec(swarm_id, spec) {
+            members.insert(member.member_id.clone(), member);
+        }
+    }
+    let (runs, stats) = swarm_load_run_summaries_and_stats(workspace_id, swarm_id);
+    for (member_id, member_stats) in stats {
+        if let Some(member) = members.get_mut(&member_id) {
+            member.stats = member_stats;
+        }
+    }
+    SwarmRuntimeData {
+        config,
+        members,
+        active_run_id: String::new(),
+        active_run_cancel: None,
+        runs,
+    }
+}
+
+async fn swarm_entry(
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+) -> Arc<Mutex<SwarmRuntimeData>> {
+    let key = swarm_key(workspace_id, swarm_id);
+    {
+        let swarms = state.swarms.read().await;
+        if let Some(entry) = swarms.get(&key) {
+            return Arc::clone(entry);
+        }
+    }
+    let mut swarms = state.swarms.write().await;
+    swarms
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(swarm_new_runtime_data(workspace_id, swarm_id))))
+        .clone()
+}
+
+fn swarm_load_run_events(workspace_id: &str, swarm_id: &str, run_id: &str) -> Vec<SwarmRunEvent> {
+    let path = match swarm_run_ledger_path(workspace_id, swarm_id, run_id) {
+        Ok(path) => path,
+        Err(_) => return Vec::new(),
+    };
+    let Ok(text) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<SwarmRunEvent>(line).ok())
+        .collect()
+}
+
+fn swarm_run_summary_from_events(events: &[SwarmRunEvent]) -> Option<RunSummary> {
+    let first = events.first()?;
+    let mut summary = RunSummary {
+        run_id: first.run_id.clone(),
+        status: "running".to_string(),
+        prompt: String::new(),
+        mode: "plan".to_string(),
+        started_at: first.at,
+        settled_at: 0,
+        result_summary: String::new(),
+    };
+    for event in events {
+        match event.kind.as_str() {
+            "run_started" => {
+                summary.started_at = event.at;
+                if let Some(data) = event.data.as_ref() {
+                    summary.prompt = data
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    summary.mode = data
+                        .get("mode")
+                        .and_then(Value::as_str)
+                        .unwrap_or("plan")
+                        .to_string();
+                }
+            }
+            "run_result" => {
+                if let Some(text) = event.text.as_deref() {
+                    summary.result_summary = swarm_summary_text(text);
+                }
+            }
+            "run_settled" => {
+                summary.settled_at = event.at;
+                summary.status = event
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("status"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("done")
+                    .to_string();
+                if summary.result_summary.is_empty() {
+                    if let Some(text) = event.text.as_deref() {
+                        summary.result_summary = swarm_summary_text(text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(summary)
+}
+
+fn swarm_apply_event_stats(stats: &mut HashMap<String, MemberStats>, event: &SwarmRunEvent) {
+    let Some(member_id) = event.member_id.as_deref() else {
+        return;
+    };
+    let member_stats = stats.entry(member_id.to_string()).or_default();
+    match event.kind.as_str() {
+        "member_take" => {
+            member_stats.takes_delivered = member_stats.takes_delivered.saturating_add(1)
+        }
+        "synthesis_started" => {
+            member_stats.champion_runs = member_stats.champion_runs.saturating_add(1)
+        }
+        "member_reaped" => member_stats.reaps = member_stats.reaps.saturating_add(1),
+        "member_error" => member_stats.errors = member_stats.errors.saturating_add(1),
+        _ => {}
+    }
+}
+
+fn swarm_load_run_summaries_and_stats(
+    workspace_id: &str,
+    swarm_id: &str,
+) -> (Vec<RunSummary>, HashMap<String, MemberStats>) {
+    let mut summaries = Vec::new();
+    let mut stats = HashMap::new();
+    let Ok(runs_dir) = swarm_runs_dir(workspace_id, swarm_id) else {
+        return (summaries, stats);
+    };
+    let Ok(entries) = fs::read_dir(runs_dir) else {
+        return (summaries, stats);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(path) else {
+            continue;
+        };
+        let events = text
+            .lines()
+            .filter_map(|line| serde_json::from_str::<SwarmRunEvent>(line).ok())
+            .inspect(|event| swarm_apply_event_stats(&mut stats, event))
+            .collect::<Vec<_>>();
+        if let Some(summary) = swarm_run_summary_from_events(&events) {
+            summaries.push(summary);
+        }
+    }
+    summaries.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+    summaries.truncate(SWARM_RUN_SUMMARY_LIMIT);
+    (summaries, stats)
+}
+
+fn swarm_state_from_data(data: &SwarmRuntimeData) -> SwarmState {
+    let mut members = data
+        .members
+        .values()
+        .cloned()
+        .map(|member| MemberState {
+            member_id: member.member_id,
+            provider: member.provider,
+            model: member.model,
+            label: member.label,
+            pane_id: member.pane_id,
+            status: member.status,
+            input_ready: member.input_ready,
+            score: swarm_member_score(&member.stats),
+            stats: member.stats,
+            last_activity_at: member.last_activity_at,
+        })
+        .collect::<Vec<_>>();
+    members.sort_by(|left, right| left.member_id.cmp(&right.member_id));
+    let mut runs = data.runs.clone();
+    runs.sort_by(|left, right| right.started_at.cmp(&left.started_at));
+    runs.truncate(SWARM_RUN_SUMMARY_LIMIT);
+    SwarmState {
+        swarm_id: data.config.swarm_id.clone(),
+        workspace_id: data.config.workspace_id.clone(),
+        repo_path: data.config.repo_path.clone(),
+        champion_member_id: data.config.champion_member_id.clone(),
+        members,
+        active_run_id: data.active_run_id.clone(),
+        runs,
+    }
+}
+
+fn swarm_emit_state(app: &AppHandle, workspace_id: &str, swarm_id: &str) {
+    let _ = app.emit(
+        SWARM_STATE_EVENT,
+        json!({
+            "workspaceId": workspace_id,
+            "swarmId": swarm_id,
+        }),
+    );
+}
+
+fn swarm_emit_run_event(
+    app: &AppHandle,
+    workspace_id: &str,
+    swarm_id: &str,
+    event: &SwarmRunEvent,
+) {
+    let _ = app.emit(
+        SWARM_RUN_EVENT,
+        json!({
+            "workspaceId": workspace_id,
+            "swarmId": swarm_id,
+            "runId": event.run_id,
+            "event": event,
+        }),
+    );
+}
+
+async fn swarm_append_run_event(
+    app: &AppHandle,
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    run_id: &str,
+    kind: &str,
+    member_id: Option<String>,
+    text: Option<String>,
+    data: Option<Value>,
+) -> Result<SwarmRunEvent, String> {
+    let _ledger_guard = state.ledger_lock.lock().await;
+    let path = swarm_run_ledger_path(workspace_id, swarm_id, run_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|error| format!("Unable to create swarm run directory: {error}"))?;
+    }
+    let latest_seq = fs::read_to_string(&path)
+        .ok()
+        .map(|body| {
+            body.lines()
+                .filter_map(|line| serde_json::from_str::<SwarmRunEvent>(line).ok())
+                .map(|event| event.seq)
+                .max()
+                .unwrap_or(0)
+        })
+        .unwrap_or(0);
+    let event = SwarmRunEvent {
+        seq: latest_seq.saturating_add(1),
+        run_id: run_id.to_string(),
+        at: swarm_now_ms(),
+        kind: kind.to_string(),
+        member_id,
+        text,
+        data,
+    };
+    let line = serde_json::to_string(&event)
+        .map_err(|error| format!("Unable to serialize swarm run event: {error}"))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .map_err(|error| format!("Unable to open swarm run ledger: {error}"))?;
+    file.write_all(line.as_bytes())
+        .and_then(|_| file.write_all(b"\n"))
+        .map_err(|error| format!("Unable to append swarm run ledger: {error}"))?;
+    swarm_emit_run_event(app, workspace_id, swarm_id, &event);
+    Ok(event)
+}
+
+fn swarm_upsert_run_summary(data: &mut SwarmRuntimeData, summary: RunSummary) {
+    if let Some(existing) = data
+        .runs
+        .iter_mut()
+        .find(|candidate| candidate.run_id == summary.run_id)
+    {
+        *existing = summary;
+    } else {
+        data.runs.push(summary);
+    }
+    data.runs
+        .sort_by(|left, right| right.started_at.cmp(&left.started_at));
+    data.runs.truncate(SWARM_RUN_SUMMARY_LIMIT);
+}
+
+async fn swarm_update_member_status(
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    member_id: &str,
+    status: &str,
+    input_ready: Option<bool>,
+    last_activity_at: Option<u64>,
+    error: Option<String>,
+) {
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
+    let mut data = entry.lock().await;
+    if let Some(member) = data.members.get_mut(member_id) {
+        member.status = status.to_string();
+        if let Some(input_ready) = input_ready {
+            member.input_ready = input_ready;
+        }
+        if let Some(last_activity_at) = last_activity_at {
+            member.last_activity_at = last_activity_at;
+        }
+        if let Some(error) = error {
+            member.last_error = error;
+        }
+    }
+}
+
+fn swarm_member_status_from_runtime(runtime: &TerminalRuntimeSnapshot) -> (String, bool, u64) {
+    let busy = terminal_runtime_snapshot_is_busy_turn(runtime)
+        || terminal_projection_state_is_busy(&runtime.activity_status)
+        || terminal_projection_state_is_busy(&runtime.command_phase)
+        || terminal_projection_state_is_busy(&runtime.status);
+    let idle = !busy
+        && (runtime.input_ready
+            || terminal_projection_state_is_idle(&runtime.activity_status)
+            || terminal_projection_state_is_idle(&runtime.command_phase)
+            || terminal_projection_state_is_idle(&runtime.status));
+    let error = terminal_projection_state_is_error(&runtime.activity_status)
+        || terminal_projection_state_is_error(&runtime.command_phase)
+        || terminal_projection_state_is_error(&runtime.status);
+    let spawning = terminal_runtime_snapshot_is_starting(runtime);
+    let status = if error {
+        "error"
+    } else if idle {
+        "ready"
+    } else if spawning {
+        "spawning"
+    } else {
+        "working"
+    };
+    (status.to_string(), idle, runtime.updated_at_ms)
+}
+
+async fn swarm_terminal_snapshot(
+    terminal_state: &TerminalState,
+    pane_id: &str,
+) -> Option<(u64, TerminalRuntimeSnapshot, String, String)> {
+    let instance = {
+        let terminals = terminal_state.terminals.read().await;
+        terminals.get(pane_id).cloned()
+    }?;
+    let runtime = terminal_runtime_snapshot(&instance);
+    let cwd = instance.working_directory.to_string_lossy().to_string();
+    Some((instance.id, runtime, instance.metadata.agent_kind, cwd))
+}
+
+async fn swarm_refresh_members_from_terminals(
+    state: &SwarmRuntimeState,
+    terminal_state: &TerminalState,
+    workspace_id: &str,
+    swarm_id: &str,
+) {
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
+    let members = {
+        let data = entry.lock().await;
+        data.members
+            .values()
+            .map(|member| {
+                (
+                    member.member_id.clone(),
+                    member.pane_id.clone(),
+                    member.instance_id,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut updates = Vec::new();
+    for (member_id, pane_id, expected_instance_id) in members {
+        match swarm_terminal_snapshot(terminal_state, &pane_id).await {
+            Some((instance_id, runtime, _, _))
+                if expected_instance_id.is_none() || expected_instance_id == Some(instance_id) =>
+            {
+                let (status, input_ready, last_activity_at) =
+                    swarm_member_status_from_runtime(&runtime);
+                updates.push((
+                    member_id,
+                    status,
+                    input_ready,
+                    last_activity_at,
+                    Some(instance_id),
+                ));
+            }
+            _ => updates.push((member_id, "dead".to_string(), false, swarm_now_ms(), None)),
+        }
+    }
+    let mut data = entry.lock().await;
+    for (member_id, status, input_ready, last_activity_at, instance_id) in updates {
+        if let Some(member) = data.members.get_mut(&member_id) {
+            if member.instance_id.is_none() && instance_id.is_none() && member.status == "offline" {
+                continue;
+            }
+            if let Some(instance_id) = instance_id {
+                member.instance_id = Some(instance_id);
+            }
+            member.status = status;
+            member.input_ready = input_ready;
+            member.last_activity_at = last_activity_at;
+        }
+    }
+}
+
+fn swarm_make_run_id() -> String {
+    format!("run-{}-{}", swarm_now_ms(), uuid::Uuid::new_v4().simple())
+}
+
+fn swarm_prompt_event_id(run_id: &str, member_id: &str, phase: &str) -> String {
+    format!("swarm-{run_id}-{member_id}-{phase}")
+}
+
+async fn swarm_enqueue_prompt(
+    app: &AppHandle,
+    member: &SwarmMemberRef,
+    run_id: &str,
+    phase: &str,
+    prompt: String,
+) -> Result<(), String> {
+    let payload = TerminalInputEventPayload {
+        pane_id: member.pane_id.clone(),
+        instance_id: Some(member.instance_id),
+        data: format!("{prompt}{TERMINAL_ENTER_SEQUENCE}"),
+        app_fork_enabled: Some(false),
+        prompt_event_id: Some(swarm_prompt_event_id(run_id, &member.member_id, phase)),
+        prompt_event_revision: None,
+        prompt_event_source: Some(format!("swarm_{phase}")),
+        prompt_event_submitted_at: Some(swarm_now_ms().to_string()),
+        prompt_event_text: Some(prompt),
+        todo_id: None,
+        todo_dispatch_id: None,
+        todo_command_id: None,
+        todo_action: None,
+        todo_resume_requested: None,
+        thread_id: Some(format!("swarm:{run_id}:{}", member.member_id)),
+    };
+    let ack = enqueue_terminal_input_event_with_ack(app, payload);
+    match timeout(Duration::from_secs(SWARM_PROMPT_ACK_TIMEOUT_SECS), ack).await {
+        Ok(Ok(Ok(()))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(error),
+        Ok(Err(_)) => Err("Terminal input acknowledgement channel closed.".to_string()),
+        Err(_) => Err("Terminal input write acknowledgement timed out.".to_string()),
+    }
+}
+
+fn swarm_take_prompt(original_prompt: &str, member: &SwarmMemberRef) -> String {
+    format!(
+        "You are swarm member `{}` in a Diff Forge Swarm Agents Panel run.\n\nTask:\n{}\n\nReturn an independent take: analyze the task, identify risks, and propose a concrete plan. Do not edit files or run destructive commands in this take phase. End your reply with a final line containing only `{}`.",
+        member.member_id, original_prompt, SWARM_TAKE_SENTINEL
+    )
+}
+
+fn swarm_synthesis_prompt(original_prompt: &str, mode: &str, takes: &[SwarmTakeResult]) -> String {
+    let mut body = String::new();
+    body.push_str("You are the champion member for a Diff Forge Swarm Agents Panel run.\n\n");
+    body.push_str("Original task:\n");
+    body.push_str(original_prompt);
+    body.push_str("\n\nIndependent member takes:\n");
+    for take in takes {
+        body.push_str("\n--- ");
+        body.push_str(&take.member_id);
+        body.push_str(" ---\n");
+        body.push_str(&take.text);
+        body.push('\n');
+    }
+    if mode == "implement" {
+        body.push_str("\nSynthesize these takes, choose the best path, and implement the fused plan in the repo. Use the existing project conventions and finish with a concise report of what changed and how you verified it.");
+    } else {
+        body.push_str("\nSynthesize these takes into the final answer. Do not edit files. Be concise but include the reasoning and concrete next steps the user needs.");
+    }
+    body
+}
+
+fn swarm_strip_take_sentinel(text: &str) -> String {
+    let before_sentinel = text
+        .rfind(SWARM_TAKE_SENTINEL)
+        .map(|index| &text[..index])
+        .unwrap_or(text);
+    before_sentinel.trim().to_string()
+}
+
+fn swarm_tail_text_for_instance(instance: &TerminalInstance) -> Result<String, String> {
+    let output = instance
+        .headless_output
+        .lock()
+        .map_err(|_| "Terminal output snapshot lock poisoned.".to_string())?;
+    let bytes = output.tail.iter().copied().collect::<Vec<_>>();
+    Ok(String::from_utf8_lossy(&bytes).to_string())
+}
+
+fn swarm_capture_from_tail(text: &str) -> Option<String> {
+    let cleaned = cloud_mcp_clean_terminal_state_text(text);
+    let candidate = if cleaned.contains(SWARM_TAKE_SENTINEL) {
+        swarm_strip_take_sentinel(&cleaned)
+    } else {
+        cleaned.trim().to_string()
+    };
+    if candidate.trim().is_empty() {
+        None
+    } else {
+        Some(
+            candidate
+                .chars()
+                .rev()
+                .take(SWARM_CAPTURE_MAX_CHARS)
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect(),
+        )
+    }
+}
+
+async fn swarm_capture_final_message(
+    terminal_state: &TerminalState,
+    workspace_id: &str,
+    member: &SwarmMemberRef,
+) -> Result<String, String> {
+    let instance = {
+        let terminals = terminal_state.terminals.read().await;
+        terminals
+            .get(&member.pane_id)
+            .cloned()
+            .ok_or_else(|| "Terminal session is not running.".to_string())?
+    };
+    let runtime = terminal_runtime_snapshot(&instance);
+    let provider_session_id = runtime
+        .provider_session_id
+        .as_deref()
+        .or(runtime.native_session_id.as_deref())
+        .unwrap_or_default()
+        .to_string();
+    if !provider_session_id.trim().is_empty() {
+        let agent_id = instance.metadata.agent_kind.clone();
+        let cwd = instance.working_directory.to_string_lossy().to_string();
+        let transcript_workspace_id = workspace_id.to_string();
+        let transcript = tauri::async_runtime::spawn_blocking(move || {
+            read_agent_thread_transcript(
+                &agent_id,
+                &provider_session_id,
+                &cwd,
+                Some(transcript_workspace_id.as_str()),
+                CODEX_TRANSCRIPT_DEFAULT_LIMIT,
+            )
+        })
+        .await
+        .map_err(|error| format!("Transcript read task failed: {error}"))
+        .and_then(|result| result);
+        if let Ok(result) = transcript {
+            if let Some(message) = result.messages.iter().rev().find(|message| {
+                message.role == "assistant"
+                    && message.kind != "tool"
+                    && !message.text.trim().is_empty()
+            }) {
+                let text = swarm_strip_take_sentinel(&message.text);
+                if !text.trim().is_empty() {
+                    return Ok(text);
+                }
+            }
+        }
+    }
+    let tail = swarm_tail_text_for_instance(&instance)?;
+    swarm_capture_from_tail(&tail).ok_or_else(|| "No assistant message was captured.".to_string())
+}
+
+async fn swarm_wait_member_idle(
+    state: &SwarmRuntimeState,
+    terminal_state: &TerminalState,
+    app: &AppHandle,
+    workspace_id: &str,
+    swarm_id: &str,
+    member: &SwarmMemberRef,
+    cancel: Arc<AtomicBool>,
+    wait_timeout: Duration,
+) -> Result<(), String> {
+    let started_at = Instant::now();
+    let mut saw_busy = false;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return Err("Swarm run was cancelled.".to_string());
+        }
+        if started_at.elapsed() > wait_timeout {
+            return Err("Timed out waiting for member to become idle.".to_string());
+        }
+        let Some((instance_id, runtime, _, _)) =
+            swarm_terminal_snapshot(terminal_state, &member.pane_id).await
+        else {
+            return Err("Terminal session is not running.".to_string());
+        };
+        if instance_id != member.instance_id {
+            return Err("Terminal session was replaced.".to_string());
+        }
+        let (status, input_ready, last_activity_at) = swarm_member_status_from_runtime(&runtime);
+        swarm_update_member_status(
+            state,
+            workspace_id,
+            swarm_id,
+            &member.member_id,
+            &status,
+            Some(input_ready),
+            Some(last_activity_at),
+            None,
+        )
+        .await;
+        swarm_emit_state(app, workspace_id, swarm_id);
+        if input_ready {
+            if saw_busy
+                || started_at.elapsed() >= Duration::from_millis(SWARM_MIN_IDLE_AFTER_PROMPT_MS)
+            {
+                return Ok(());
+            }
+        } else {
+            saw_busy = true;
+        }
+        sleep(Duration::from_millis(SWARM_IDLE_POLL_MS)).await;
+    }
+}
+
+async fn swarm_member_take_task(
+    app: AppHandle,
+    state: SwarmRuntimeState,
+    workspace_id: String,
+    swarm_id: String,
+    run_id: String,
+    prompt: String,
+    member: SwarmMemberRef,
+    cancel: Arc<AtomicBool>,
+) -> SwarmTakeResult {
+    swarm_update_member_status(
+        &state,
+        &workspace_id,
+        &swarm_id,
+        &member.member_id,
+        "working",
+        Some(false),
+        Some(swarm_now_ms()),
+        None,
+    )
+    .await;
+    swarm_emit_state(&app, &workspace_id, &swarm_id);
+
+    let prompt_text = swarm_take_prompt(&prompt, &member);
+    let prompted = swarm_enqueue_prompt(&app, &member, &run_id, "take", prompt_text).await;
+    if let Err(error) = prompted {
+        let _ = swarm_append_run_event(
+            &app,
+            &state,
+            &workspace_id,
+            &swarm_id,
+            &run_id,
+            "member_error",
+            Some(member.member_id.clone()),
+            Some(error.clone()),
+            None,
+        )
+        .await;
+        swarm_increment_member_stat(
+            &state,
+            &workspace_id,
+            &swarm_id,
+            &member.member_id,
+            "errors",
+        )
+        .await;
+        swarm_update_member_status(
+            &state,
+            &workspace_id,
+            &swarm_id,
+            &member.member_id,
+            "error",
+            Some(false),
+            Some(swarm_now_ms()),
+            Some(error),
+        )
+        .await;
+        swarm_emit_state(&app, &workspace_id, &swarm_id);
+        return SwarmTakeResult {
+            member_id: member.member_id,
+            text: String::new(),
+        };
+    }
+    let _ = swarm_append_run_event(
+        &app,
+        &state,
+        &workspace_id,
+        &swarm_id,
+        &run_id,
+        "member_prompted",
+        Some(member.member_id.clone()),
+        Some("Take prompt delivered.".to_string()),
+        None,
+    )
+    .await;
+
+    let terminal_state = app.state::<TerminalState>();
+    let idle = swarm_wait_member_idle(
+        &state,
+        terminal_state.inner(),
+        &app,
+        &workspace_id,
+        &swarm_id,
+        &member,
+        Arc::clone(&cancel),
+        Duration::from_secs(SWARM_TAKE_TIMEOUT_SECS),
+    )
+    .await;
+    if let Err(error) = idle {
+        if cancel.load(Ordering::SeqCst) {
+            return SwarmTakeResult {
+                member_id: member.member_id,
+                text: String::new(),
+            };
+        }
+        let kind = if error.contains("Timed out") {
+            "member_reaped"
+        } else {
+            "member_error"
+        };
+        let _ = swarm_append_run_event(
+            &app,
+            &state,
+            &workspace_id,
+            &swarm_id,
+            &run_id,
+            kind,
+            Some(member.member_id.clone()),
+            Some(error.clone()),
+            None,
+        )
+        .await;
+        swarm_increment_member_stat(
+            &state,
+            &workspace_id,
+            &swarm_id,
+            &member.member_id,
+            if kind == "member_reaped" {
+                "reaps"
+            } else {
+                "errors"
+            },
+        )
+        .await;
+        return SwarmTakeResult {
+            member_id: member.member_id,
+            text: String::new(),
+        };
+    }
+
+    match swarm_capture_final_message(terminal_state.inner(), &workspace_id, &member).await {
+        Ok(text) => {
+            if cancel.load(Ordering::SeqCst) {
+                return SwarmTakeResult {
+                    member_id: member.member_id,
+                    text: String::new(),
+                };
+            }
+            let _ = swarm_append_run_event(
+                &app,
+                &state,
+                &workspace_id,
+                &swarm_id,
+                &run_id,
+                "member_take",
+                Some(member.member_id.clone()),
+                Some(text.clone()),
+                None,
+            )
+            .await;
+            swarm_increment_member_stat(
+                &state,
+                &workspace_id,
+                &swarm_id,
+                &member.member_id,
+                "takesDelivered",
+            )
+            .await;
+            SwarmTakeResult {
+                member_id: member.member_id,
+                text,
+            }
+        }
+        Err(error) => {
+            if cancel.load(Ordering::SeqCst) {
+                return SwarmTakeResult {
+                    member_id: member.member_id,
+                    text: String::new(),
+                };
+            }
+            let _ = swarm_append_run_event(
+                &app,
+                &state,
+                &workspace_id,
+                &swarm_id,
+                &run_id,
+                "member_error",
+                Some(member.member_id.clone()),
+                Some(error.clone()),
+                None,
+            )
+            .await;
+            swarm_increment_member_stat(
+                &state,
+                &workspace_id,
+                &swarm_id,
+                &member.member_id,
+                "errors",
+            )
+            .await;
+            SwarmTakeResult {
+                member_id: member.member_id,
+                text: String::new(),
+            }
+        }
+    }
+}
+
+async fn swarm_increment_member_stat(
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    member_id: &str,
+    stat: &str,
+) {
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
+    let mut data = entry.lock().await;
+    let Some(member) = data.members.get_mut(member_id) else {
+        return;
+    };
+    match stat {
+        "takesDelivered" => {
+            member.stats.takes_delivered = member.stats.takes_delivered.saturating_add(1)
+        }
+        "championRuns" => member.stats.champion_runs = member.stats.champion_runs.saturating_add(1),
+        "reaps" => member.stats.reaps = member.stats.reaps.saturating_add(1),
+        "errors" => member.stats.errors = member.stats.errors.saturating_add(1),
+        _ => {}
+    }
+}
+
+async fn swarm_mark_run_settled(
+    app: &AppHandle,
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    run_id: &str,
+    status: &str,
+    text: &str,
+) -> Result<bool, String> {
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
+    let should_emit = {
+        let mut data = entry.lock().await;
+        if data.active_run_id != run_id {
+            false
+        } else {
+            data.active_run_id.clear();
+            data.active_run_cancel = None;
+            if let Some(summary) = data
+                .runs
+                .iter_mut()
+                .find(|summary| summary.run_id == run_id)
+            {
+                summary.status = status.to_string();
+                summary.settled_at = swarm_now_ms();
+                if summary.result_summary.is_empty() {
+                    summary.result_summary = swarm_summary_text(text);
+                }
+            }
+            true
+        }
+    };
+    if should_emit {
+        let _ = swarm_append_run_event(
+            app,
+            state,
+            workspace_id,
+            swarm_id,
+            run_id,
+            "run_settled",
+            None,
+            (!text.trim().is_empty()).then(|| text.to_string()),
+            Some(json!({ "status": status })),
+        )
+        .await?;
+        swarm_emit_state(app, workspace_id, swarm_id);
+    }
+    Ok(should_emit)
+}
+
+async fn swarm_choose_champion(
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    takes: &[SwarmTakeResult],
+    ready_members: &[SwarmMemberRef],
+) -> Option<SwarmMemberRef> {
+    if takes.len() == 1 {
+        let winner = &takes[0].member_id;
+        return ready_members
+            .iter()
+            .find(|member| &member.member_id == winner)
+            .cloned();
+    }
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
+    let data = entry.lock().await;
+    if let Some(champion) = ready_members
+        .iter()
+        .find(|member| member.member_id == data.config.champion_member_id)
+        .cloned()
+    {
+        return Some(champion);
+    }
+    ready_members
+        .iter()
+        .max_by_key(|member| {
+            data.members
+                .get(&member.member_id)
+                .map(|member| swarm_member_score(&member.stats))
+                .unwrap_or(0)
+        })
+        .cloned()
+}
+
+async fn swarm_run_conductor(
+    app: AppHandle,
+    state: SwarmRuntimeState,
+    workspace_id: String,
+    swarm_id: String,
+    run_id: String,
+    prompt: String,
+    mode: String,
+    ready_members: Vec<SwarmMemberRef>,
+    cancel: Arc<AtomicBool>,
+) {
+    let _ = swarm_append_run_event(
+        &app,
+        &state,
+        &workspace_id,
+        &swarm_id,
+        &run_id,
+        "run_started",
+        None,
+        Some("Swarm run started.".to_string()),
+        Some(json!({
+            "prompt": prompt,
+            "mode": mode,
+            "members": ready_members.len(),
+        })),
+    )
+    .await;
+
+    let mut tasks = Vec::new();
+    for member in ready_members.clone() {
+        let task_app = app.clone();
+        let task_state = state.clone();
+        let task_workspace_id = workspace_id.clone();
+        let task_swarm_id = swarm_id.clone();
+        let task_run_id = run_id.clone();
+        let task_prompt = prompt.clone();
+        let task_cancel = Arc::clone(&cancel);
+        tasks.push(tauri::async_runtime::spawn(async move {
+            swarm_member_take_task(
+                task_app,
+                task_state,
+                task_workspace_id,
+                task_swarm_id,
+                task_run_id,
+                task_prompt,
+                member,
+                task_cancel,
+            )
+            .await
+        }));
+    }
+
+    let mut takes = Vec::new();
+    for task in tasks {
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Ok(result) = task.await {
+            if !result.text.trim().is_empty() {
+                takes.push(result);
+            }
+        }
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let _ = swarm_append_run_event(
+        &app,
+        &state,
+        &workspace_id,
+        &swarm_id,
+        &run_id,
+        "gate_decision",
+        None,
+        Some(if takes.is_empty() {
+            "No member takes arrived; failing run.".to_string()
+        } else {
+            format!("Proceeding with {} member take(s).", takes.len())
+        }),
+        Some(json!({ "takes": takes.len() })),
+    )
+    .await;
+
+    if takes.is_empty() {
+        let _ = swarm_mark_run_settled(
+            &app,
+            &state,
+            &workspace_id,
+            &swarm_id,
+            &run_id,
+            "failed",
+            "No member takes arrived before the take phase completed.",
+        )
+        .await;
+        return;
+    }
+
+    let Some(champion) =
+        swarm_choose_champion(&state, &workspace_id, &swarm_id, &takes, &ready_members).await
+    else {
+        let _ = swarm_mark_run_settled(
+            &app,
+            &state,
+            &workspace_id,
+            &swarm_id,
+            &run_id,
+            "failed",
+            "No ready champion member was available for synthesis.",
+        )
+        .await;
+        return;
+    };
+
+    let _ = swarm_append_run_event(
+        &app,
+        &state,
+        &workspace_id,
+        &swarm_id,
+        &run_id,
+        "synthesis_started",
+        Some(champion.member_id.clone()),
+        Some("Synthesis started.".to_string()),
+        Some(json!({ "mode": mode })),
+    )
+    .await;
+    swarm_increment_member_stat(
+        &state,
+        &workspace_id,
+        &swarm_id,
+        &champion.member_id,
+        "championRuns",
+    )
+    .await;
+
+    let synthesis_prompt = swarm_synthesis_prompt(&prompt, &mode, &takes);
+    if let Err(error) =
+        swarm_enqueue_prompt(&app, &champion, &run_id, "synthesis", synthesis_prompt).await
+    {
+        let _ = swarm_append_run_event(
+            &app,
+            &state,
+            &workspace_id,
+            &swarm_id,
+            &run_id,
+            "member_error",
+            Some(champion.member_id.clone()),
+            Some(error.clone()),
+            None,
+        )
+        .await;
+        let _ = swarm_mark_run_settled(
+            &app,
+            &state,
+            &workspace_id,
+            &swarm_id,
+            &run_id,
+            "failed",
+            &format!("Unable to deliver synthesis prompt: {error}"),
+        )
+        .await;
+        return;
+    }
+
+    let terminal_state = app.state::<TerminalState>();
+    match swarm_wait_member_idle(
+        &state,
+        terminal_state.inner(),
+        &app,
+        &workspace_id,
+        &swarm_id,
+        &champion,
+        Arc::clone(&cancel),
+        Duration::from_secs(SWARM_SYNTHESIS_TIMEOUT_SECS),
+    )
+    .await
+    {
+        Ok(()) => {
+            match swarm_capture_final_message(terminal_state.inner(), &workspace_id, &champion)
+                .await
+            {
+                Ok(text) => {
+                    if cancel.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let _ = swarm_append_run_event(
+                        &app,
+                        &state,
+                        &workspace_id,
+                        &swarm_id,
+                        &run_id,
+                        "run_result",
+                        None,
+                        Some(text.clone()),
+                        None,
+                    )
+                    .await;
+                    {
+                        let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+                        let mut data = entry.lock().await;
+                        if let Some(summary) = data
+                            .runs
+                            .iter_mut()
+                            .find(|summary| summary.run_id == run_id)
+                        {
+                            summary.result_summary = swarm_summary_text(&text);
+                        }
+                    }
+                    let _ = swarm_mark_run_settled(
+                        &app,
+                        &state,
+                        &workspace_id,
+                        &swarm_id,
+                        &run_id,
+                        "done",
+                        "",
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    let _ = swarm_mark_run_settled(
+                        &app,
+                        &state,
+                        &workspace_id,
+                        &swarm_id,
+                        &run_id,
+                        "failed",
+                        &format!("Unable to capture synthesis result: {error}"),
+                    )
+                    .await;
+                }
+            }
+        }
+        Err(error) => {
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            let _ = swarm_mark_run_settled(
+                &app,
+                &state,
+                &workspace_id,
+                &swarm_id,
+                &run_id,
+                "failed",
+                &format!("Synthesis failed: {error}"),
+            )
+            .await;
+        }
+    }
+}
+
+async fn swarm_open_member(
+    app: &AppHandle,
+    spec: &SwarmMemberRuntime,
+    workspace_id: &str,
+    repo_path: &str,
+) -> Result<TerminalOpenResult, String> {
+    let terminal_state = app.state::<TerminalState>();
+    let cloud_mcp_state = app.state::<CloudMcpState>();
+    let app_control_mcp_state = app.state::<AppControlMcpState>();
+    let model = (!spec.model.trim().is_empty()).then(|| spec.model.clone());
+    let output_channel = Channel::new(|_body: InvokeResponseBody| Ok(()));
+    terminal_open(
+        app.clone(),
+        terminal_state,
+        cloud_mcp_state,
+        app_control_mcp_state,
+        TerminalOpenRequest {
+            pane_id: spec.pane_id.clone(),
+            instance_id: None,
+            kind: spec.provider.clone(),
+            agent_id: Some(spec.provider.clone()),
+            agent_kind: Some(spec.provider.clone()),
+            provider: Some(spec.provider.clone()),
+            provider_session_id: None,
+            fork_from_provider_session_id: None,
+            model,
+            reasoning_effort: None,
+            speed: None,
+            permission_mode: Some(TERMINAL_PERMISSION_MODE_BYPASS.to_string()),
+            plain_shell: Some(false),
+            fresh_session: Some(true),
+            preserve_coordination_session: Some(false),
+            session_mode: Some(TerminalSessionMode::General.as_str().to_string()),
+            slot_key: Some(spec.pane_id.clone()),
+            terminal_index: None,
+            thread_id: Some(format!("swarm:{}:{}", spec.pane_id, spec.member_id)),
+            working_directory: Some(repo_path.to_string()),
+            workspace_root_was_empty_at_selection: Some(false),
+            project_root: None,
+            mount_id: None,
+            workspace_id: Some(workspace_id.to_string()),
+            workspace_name: Some(workspace_id.to_string()),
+            terminal_name: Some(spec.label.clone()),
+            terminal_nickname: Some(spec.label.clone()),
+            app_control_mcp: Some(false),
+            cols: Some(TERMINAL_DEFAULT_COLS),
+            rows: Some(TERMINAL_DEFAULT_ROWS),
+            output_transport: Some(false),
+        },
+        output_channel,
+    )
+    .await
+}
+
+async fn swarm_close_member(app: &AppHandle, member: &SwarmMemberRuntime) -> Result<bool, String> {
+    let terminal_state = app.state::<TerminalState>();
+    let cloud_mcp_state = app.state::<CloudMcpState>();
+    close_terminal_session(
+        Some(app.clone()),
+        terminal_state.inner(),
+        Some(cloud_mcp_state.inner()),
+        &member.pane_id,
+        member.instance_id,
+        false,
+        false,
+    )
+    .await
+}
+
+fn swarm_terminal_open_result_status(result: &TerminalOpenResult) -> (String, bool, u64) {
+    let idle = result.input_ready
+        || terminal_projection_state_is_idle(&result.activity_status)
+        || terminal_projection_state_is_idle(&result.command_phase)
+        || terminal_projection_state_is_idle(&result.terminal_work_state);
+    let status = if idle { "ready" } else { "spawning" };
+    (status.to_string(), idle, swarm_now_ms())
+}
+
+async fn swarm_spawn_member_and_update(
+    app: &AppHandle,
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    member_id: &str,
+) {
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
+    let (member, repo_path) = {
+        let data = entry.lock().await;
+        let Some(member) = data.members.get(member_id).cloned() else {
+            return;
+        };
+        (member, data.config.repo_path.clone())
+    };
+    match swarm_open_member(app, &member, workspace_id, &repo_path).await {
+        Ok(result) => {
+            let (status, input_ready, last_activity_at) =
+                swarm_terminal_open_result_status(&result);
+            {
+                let mut data = entry.lock().await;
+                if let Some(member) = data.members.get_mut(member_id) {
+                    member.instance_id = Some(result.instance_id);
+                    member.status = status;
+                    member.input_ready = input_ready;
+                    member.last_activity_at = last_activity_at;
+                    member.last_error.clear();
+                }
+            }
+            swarm_emit_state(app, workspace_id, swarm_id);
+            swarm_spawn_readiness_monitor(
+                app.clone(),
+                state.clone(),
+                workspace_id.to_string(),
+                swarm_id.to_string(),
+                member_id.to_string(),
+                result.instance_id,
+            );
+        }
+        Err(error) => {
+            let mut data = entry.lock().await;
+            if let Some(member) = data.members.get_mut(member_id) {
+                member.status = "error".to_string();
+                member.input_ready = false;
+                member.last_activity_at = swarm_now_ms();
+                member.last_error = error;
+                member.stats.errors = member.stats.errors.saturating_add(1);
+            }
+            drop(data);
+            swarm_emit_state(app, workspace_id, swarm_id);
+        }
+    }
+}
+
+fn swarm_spawn_readiness_monitor(
+    app: AppHandle,
+    state: SwarmRuntimeState,
+    workspace_id: String,
+    swarm_id: String,
+    member_id: String,
+    instance_id: u64,
+) {
+    tauri::async_runtime::spawn(async move {
+        let terminal_state = app.state::<TerminalState>();
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(SWARM_SPAWN_READY_MONITOR_SECS) {
+            let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+            let pane_id = {
+                let data = entry.lock().await;
+                let Some(member) = data.members.get(&member_id) else {
+                    return;
+                };
+                if member.instance_id != Some(instance_id) {
+                    return;
+                }
+                member.pane_id.clone()
+            };
+            if let Some((current_instance_id, runtime, _, _)) =
+                swarm_terminal_snapshot(terminal_state.inner(), &pane_id).await
+            {
+                if current_instance_id != instance_id {
+                    return;
+                }
+                let (status, input_ready, last_activity_at) =
+                    swarm_member_status_from_runtime(&runtime);
+                swarm_update_member_status(
+                    &state,
+                    &workspace_id,
+                    &swarm_id,
+                    &member_id,
+                    &status,
+                    Some(input_ready),
+                    Some(last_activity_at),
+                    None,
+                )
+                .await;
+                swarm_emit_state(&app, &workspace_id, &swarm_id);
+                if input_ready || status == "error" {
+                    return;
+                }
+            }
+            sleep(Duration::from_millis(SWARM_IDLE_POLL_MS)).await;
+        }
+    });
+}
+
+#[tauri::command]
+async fn swarm_get_state(
+    state: State<'_, SwarmRuntimeState>,
+    terminal_state: State<'_, TerminalState>,
+    workspace_id: String,
+    swarm_id: String,
+) -> Result<SwarmState, String> {
+    let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+    drop(entry);
+    swarm_refresh_members_from_terminals(&state, &terminal_state, &workspace_id, &swarm_id).await;
+    let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+    let data = entry.lock().await;
+    Ok(swarm_state_from_data(&data))
+}
+
+#[tauri::command]
+async fn swarm_configure(
+    app: AppHandle,
+    state: State<'_, SwarmRuntimeState>,
+    workspace_id: String,
+    swarm_id: String,
+    repo_path: String,
+    members: Vec<MemberSpec>,
+    champion_member_id: Option<String>,
+) -> Result<SwarmState, String> {
+    let repo_path = repo_path.trim().to_string();
+    if repo_path.is_empty() {
+        return Err("repo_path is required.".to_string());
+    }
+    let resolved_members = swarm_resolve_member_specs(members)?;
+    let config = swarm_config_from_parts(
+        &workspace_id,
+        &swarm_id,
+        &repo_path,
+        resolved_members.clone(),
+        champion_member_id,
+    );
+    swarm_save_config(&config)?;
+
+    let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+    let (to_close, to_spawn) = {
+        let mut data = entry.lock().await;
+        data.config = config.clone();
+        let desired_ids = resolved_members
+            .iter()
+            .filter_map(|spec| spec.member_id.clone())
+            .collect::<HashSet<_>>();
+        let mut to_close = Vec::new();
+        let mut to_spawn = Vec::new();
+
+        let existing_ids = data.members.keys().cloned().collect::<Vec<_>>();
+        for existing_id in existing_ids {
+            if !desired_ids.contains(&existing_id) {
+                if let Some(member) = data.members.remove(&existing_id) {
+                    to_close.push(member);
+                }
+            }
+        }
+
+        for spec in &resolved_members {
+            let next_member = swarm_member_from_spec(&swarm_id, spec)?;
+            match data.members.get_mut(&next_member.member_id) {
+                Some(existing)
+                    if existing.provider == next_member.provider
+                        && existing.model == next_member.model =>
+                {
+                    existing.label = next_member.label;
+                }
+                Some(existing) => {
+                    to_close.push(existing.clone());
+                    let mut spawning = next_member.clone();
+                    spawning.status = "spawning".to_string();
+                    data.members.insert(spawning.member_id.clone(), spawning);
+                    to_spawn.push(next_member.member_id);
+                }
+                None => {
+                    let mut spawning = next_member.clone();
+                    spawning.status = "spawning".to_string();
+                    data.members.insert(spawning.member_id.clone(), spawning);
+                    to_spawn.push(next_member.member_id);
+                }
+            }
+        }
+        (to_close, to_spawn)
+    };
+
+    for member in to_close {
+        let _ = swarm_close_member(&app, &member).await;
+    }
+    for member_id in to_spawn {
+        swarm_spawn_member_and_update(&app, &state, &workspace_id, &swarm_id, &member_id).await;
+    }
+
+    swarm_emit_state(&app, &workspace_id, &swarm_id);
+    let data = entry.lock().await;
+    Ok(swarm_state_from_data(&data))
+}
+
+#[tauri::command]
+async fn swarm_member_restart(
+    app: AppHandle,
+    state: State<'_, SwarmRuntimeState>,
+    workspace_id: String,
+    swarm_id: String,
+    member_id: String,
+) -> Result<SwarmState, String> {
+    let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+    let member = {
+        let mut data = entry.lock().await;
+        let Some(member) = data.members.get_mut(&member_id) else {
+            return Err("Swarm member not found.".to_string());
+        };
+        member.status = "spawning".to_string();
+        member.input_ready = false;
+        member.clone()
+    };
+    let _ = swarm_close_member(&app, &member).await;
+    swarm_spawn_member_and_update(&app, &state, &workspace_id, &swarm_id, &member_id).await;
+    swarm_emit_state(&app, &workspace_id, &swarm_id);
+    let data = entry.lock().await;
+    Ok(swarm_state_from_data(&data))
+}
+
+#[tauri::command]
+async fn swarm_submit_task(
+    app: AppHandle,
+    state: State<'_, SwarmRuntimeState>,
+    terminal_state: State<'_, TerminalState>,
+    workspace_id: String,
+    swarm_id: String,
+    prompt: String,
+    mode: Option<String>,
+) -> Result<SwarmSubmitTaskResult, String> {
+    let prompt = prompt.trim().to_string();
+    if prompt.is_empty() {
+        return Err("prompt is required.".to_string());
+    }
+    let mode = mode
+        .unwrap_or_else(|| "plan".to_string())
+        .trim()
+        .to_ascii_lowercase();
+    if !matches!(mode.as_str(), "plan" | "implement") {
+        return Err("Swarm mode must be plan or implement.".to_string());
+    }
+
+    swarm_refresh_members_from_terminals(&state, &terminal_state, &workspace_id, &swarm_id).await;
+    let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+    let (run_id, ready_members, cancel) = {
+        let mut data = entry.lock().await;
+        if !data.active_run_id.trim().is_empty() {
+            return Err("A swarm run is already active.".to_string());
+        }
+        let ready_members = data
+            .members
+            .values()
+            .filter_map(|member| {
+                if member.status == "ready" && member.input_ready {
+                    member.instance_id.map(|instance_id| SwarmMemberRef {
+                        member_id: member.member_id.clone(),
+                        pane_id: member.pane_id.clone(),
+                        instance_id,
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        if ready_members.is_empty() {
+            return Err("No swarm members are ready.".to_string());
+        }
+        let run_id = swarm_make_run_id();
+        let cancel = Arc::new(AtomicBool::new(false));
+        data.active_run_id = run_id.clone();
+        data.active_run_cancel = Some(Arc::clone(&cancel));
+        swarm_upsert_run_summary(
+            &mut data,
+            RunSummary {
+                run_id: run_id.clone(),
+                status: "running".to_string(),
+                prompt: prompt.clone(),
+                mode: mode.clone(),
+                started_at: swarm_now_ms(),
+                settled_at: 0,
+                result_summary: String::new(),
+            },
+        );
+        (run_id, ready_members, cancel)
+    };
+    swarm_emit_state(&app, &workspace_id, &swarm_id);
+
+    let task_app = app.clone();
+    let task_state = state.inner().clone();
+    let task_workspace_id = workspace_id.clone();
+    let task_swarm_id = swarm_id.clone();
+    let task_run_id = run_id.clone();
+    let task_prompt = prompt.clone();
+    let task_mode = mode.clone();
+    tauri::async_runtime::spawn(async move {
+        swarm_run_conductor(
+            task_app,
+            task_state,
+            task_workspace_id,
+            task_swarm_id,
+            task_run_id,
+            task_prompt,
+            task_mode,
+            ready_members,
+            cancel,
+        )
+        .await;
+    });
+
+    Ok(SwarmSubmitTaskResult { run_id })
+}
+
+#[tauri::command]
+async fn swarm_cancel_run(
+    app: AppHandle,
+    state: State<'_, SwarmRuntimeState>,
+    workspace_id: String,
+    swarm_id: String,
+    run_id: String,
+) -> Result<SwarmState, String> {
+    let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+    let members = {
+        let data = entry.lock().await;
+        if data.active_run_id != run_id {
+            return Ok(swarm_state_from_data(&data));
+        }
+        if let Some(cancel) = data.active_run_cancel.as_ref() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        data.members.values().cloned().collect::<Vec<_>>()
+    };
+    for member in members {
+        if let Some(instance_id) = member.instance_id {
+            let _ = terminal_interrupt_agent_remote(
+                app.clone(),
+                member.pane_id.clone(),
+                Some(instance_id),
+                "swarm_cancel_run".to_string(),
+            )
+            .await;
+        }
+    }
+    let _ = swarm_mark_run_settled(
+        &app,
+        &state,
+        &workspace_id,
+        &swarm_id,
+        &run_id,
+        "cancelled",
+        "Swarm run cancelled.",
+    )
+    .await?;
+    let data = entry.lock().await;
+    Ok(swarm_state_from_data(&data))
+}
+
+#[tauri::command]
+async fn swarm_run_events(
+    workspace_id: String,
+    swarm_id: String,
+    run_id: String,
+    after_seq: Option<u64>,
+) -> Result<SwarmRunEventsResult, String> {
+    let events = swarm_load_run_events(&workspace_id, &swarm_id, &run_id);
+    let latest_seq = events.iter().map(|event| event.seq).max().unwrap_or(0);
+    let after_seq = after_seq.unwrap_or(0);
+    Ok(SwarmRunEventsResult {
+        events: events
+            .into_iter()
+            .filter(|event| event.seq > after_seq)
+            .collect(),
+        latest_seq,
+    })
+}
+
+#[tauri::command]
+async fn swarm_dispose(
+    app: AppHandle,
+    state: State<'_, SwarmRuntimeState>,
+    workspace_id: String,
+    swarm_id: String,
+) -> Result<SwarmState, String> {
+    let key = swarm_key(&workspace_id, &swarm_id);
+    let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
+    let (members, active_run_id) = {
+        let mut data = entry.lock().await;
+        if let Some(cancel) = data.active_run_cancel.as_ref() {
+            cancel.store(true, Ordering::SeqCst);
+        }
+        let active_run_id = data.active_run_id.clone();
+        data.active_run_id.clear();
+        data.active_run_cancel = None;
+        (
+            data.members.values().cloned().collect::<Vec<_>>(),
+            active_run_id,
+        )
+    };
+    if !active_run_id.trim().is_empty() {
+        let _ = swarm_append_run_event(
+            &app,
+            &state,
+            &workspace_id,
+            &swarm_id,
+            &active_run_id,
+            "run_settled",
+            None,
+            Some("Swarm disposed while run was active.".to_string()),
+            Some(json!({ "status": "cancelled" })),
+        )
+        .await;
+    }
+    for member in &members {
+        let _ = swarm_close_member(&app, member).await;
+    }
+    {
+        let mut swarms = state.swarms.write().await;
+        swarms.remove(&key);
+    }
+    swarm_emit_state(&app, &workspace_id, &swarm_id);
+    let mut disposed = swarm_new_runtime_data(&workspace_id, &swarm_id);
+    for member in disposed.members.values_mut() {
+        member.status = "offline".to_string();
+        member.input_ready = false;
+        member.instance_id = None;
+    }
+    Ok(swarm_state_from_data(&disposed))
+}
+
+#[cfg(test)]
+mod swarm_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn swarm_score_formula_matches_contract() {
+        let stats = MemberStats {
+            takes_delivered: 3,
+            champion_runs: 2,
+            reaps: 1,
+            errors: 2,
+        };
+        assert_eq!(swarm_member_score(&stats), 4);
+    }
+
+    #[test]
+    fn swarm_safe_component_is_stable_for_workspace_ids() {
+        assert_eq!(
+            swarm_safe_component("team/workspace:main"),
+            "team_workspace_main"
+        );
+        assert_eq!(swarm_safe_component(""), "default");
+    }
+
+    #[test]
+    fn swarm_member_specs_assign_ids_and_validate_providers() {
+        let members = swarm_resolve_member_specs(vec![
+            MemberSpec {
+                provider: "codex".to_string(),
+                ..MemberSpec::default()
+            },
+            MemberSpec {
+                member_id: Some("researcher.one".to_string()),
+                provider: "claude".to_string(),
+                ..MemberSpec::default()
+            },
+        ])
+        .unwrap();
+        assert_eq!(members[0].member_id.as_deref(), Some("m1"));
+        assert_eq!(members[1].member_id.as_deref(), Some("researcher_one"));
+        assert!(swarm_resolve_member_specs(vec![MemberSpec {
+            provider: "bad".to_string(),
+            ..MemberSpec::default()
+        }])
+        .is_err());
+    }
+
+    #[test]
+    fn swarm_run_summary_updates_from_events() {
+        let events = vec![
+            SwarmRunEvent {
+                seq: 1,
+                run_id: "run-1".to_string(),
+                at: 10,
+                kind: "run_started".to_string(),
+                member_id: None,
+                text: None,
+                data: Some(json!({ "prompt": "do work", "mode": "implement" })),
+            },
+            SwarmRunEvent {
+                seq: 2,
+                run_id: "run-1".to_string(),
+                at: 20,
+                kind: "run_result".to_string(),
+                member_id: None,
+                text: Some("finished".to_string()),
+                data: None,
+            },
+            SwarmRunEvent {
+                seq: 3,
+                run_id: "run-1".to_string(),
+                at: 30,
+                kind: "run_settled".to_string(),
+                member_id: None,
+                text: None,
+                data: Some(json!({ "status": "done" })),
+            },
+        ];
+        let summary = swarm_run_summary_from_events(&events).unwrap();
+        assert_eq!(summary.run_id, "run-1");
+        assert_eq!(summary.mode, "implement");
+        assert_eq!(summary.status, "done");
+        assert_eq!(summary.result_summary, "finished");
+        assert_eq!(summary.settled_at, 30);
+    }
+}

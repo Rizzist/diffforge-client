@@ -505,12 +505,23 @@ function createEmberEngine(canvas, prefersReducedMotion) {
     }
   };
 
+  // Full-screen canvas redraw + composite is the priciest layer in the app;
+  // 30fps reads identically for drifting embers and halves the compositor
+  // load. When the field is empty and no spawn is due, skip painting w/o
+  // dropping the loop.
+  const EMBER_FRAME_MS = 33;
+  let lastPaint = 0;
   const step = (now) => {
     if (destroyed) return;
     raf = 0;
     if (!renderable) {
       return;
     }
+    if (now - lastPaint < EMBER_FRAME_MS) {
+      requestFrame();
+      return;
+    }
+    lastPaint = now;
     const dt = Math.min(0.05, (now - last) / 1000);
     last = now;
 

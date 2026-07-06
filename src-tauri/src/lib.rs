@@ -2695,6 +2695,7 @@ include!("assets.rs");
 include!("agent_sessions.rs");
 include!("agent_chat_sync.rs");
 include!("terminals.rs");
+include!("swarm_runtime.rs");
 include!("tools_window.rs");
 include!("web_panel.rs");
 include!("api.rs");
@@ -7449,6 +7450,7 @@ pub fn run() {
         })
         .manage(TerminalDiagnosticState::new())
         .manage(WindowsTerminalDiagnosticState::new())
+        .manage(SwarmRuntimeState::new())
         .manage(CloudMcpState::new())
         .manage(AppControlMcpState::new())
         .manage(DeveloperProcessMonitorState::new())
@@ -7973,6 +7975,13 @@ pub fn run() {
             agent_thread_session_discover,
             agent_thread_transcript,
             agent_thread_transcript_watch,
+            swarm_get_state,
+            swarm_configure,
+            swarm_member_restart,
+            swarm_submit_task,
+            swarm_cancel_run,
+            swarm_run_events,
+            swarm_dispose,
             workspace_git_pull_candidates,
             workspace_git_pull_repositories,
             workspace_git_snapshot,
