@@ -169,7 +169,7 @@ npm run dev     # native Tauri window + Vite hot reload in the WebView
 npm run build   # production bundles
 ```
 
-`npm run dev` launches the native Tauri window and uses Vite hot reloading inside the JavaScript WebView. `npm run build` and `npm run package` create the Windows NSIS installer locally under `src-tauri/target/release/bundle/nsis/`; release CI builds and publishes **macOS, Windows, and Linux** bundles (with `latest.json` + SHA256SUMS) to the public releases repo.
+`npm run dev` launches the native Tauri window and uses Vite hot reloading inside the JavaScript WebView. `npm run build` and `npm run package` create the Windows NSIS installer locally under `src-tauri/target/release/bundle/nsis/`; release CI builds and publishes **macOS, Windows, and Linux** bundles (with `latest.json` + SHA256SUMS) as GitHub releases on this repo.
 
 During development, Vite runs on `127.0.0.1` as a private hot-reload feed for the native WebView. That URL is not the product surface and is not used by packaged builds.
 
@@ -178,6 +178,12 @@ During development, Vite runs on `127.0.0.1` as a private hot-reload feed for th
 Desktop login opens `https://diffforge.ai/desktop/login` in the system browser, receives a `diffforge://auth/callback` deep link (`diffforge-dev://` in dev builds), exchanges the one-time code with `https://diffforge.ai/api/desktop/sessions/exchange`, and validates stored desktop sessions on app launch. The Diff Forge CLI shares the same desktop auth state. In local-cloud development, the login and API base resolve to local `next-diffforge` when `RUST_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP=1`, or explicitly through `RUST_DIFFFORGE_WEB_LOGIN_URL` and `RUST_DIFFFORGE_API_BASE_URL`.
 
 Cloud MCP traffic is pinned to `https://balancer.diffforge.ai`. Cloud MCP URL overrides are ignored unless `RUST_DIFFFORGE_ALLOW_LOCAL_CLOUD_MCP=1` is set for development. After desktop login, the app keeps the desktop session token locally and exchanges it through `next-diffforge` for short-lived Appwrite JWTs before opening balancer websockets or syncing coordination events.
+
+---
+
+## 📜 License
+
+Licensed under the **[Kingdom of Abraham Permissive License (KOA-P-1.0)](LICENSE.md)** — an MIT-equivalent license for the AI Agents Era. Every copy must carry the license in full. See the [Kingdom Of Abraham Licenses](https://github.com/Rizzist/Kingdom-Of-Abraham-Licenses) collection.
 
 ---
 
