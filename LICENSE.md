@@ -12,7 +12,7 @@ He senses without instrument; He moves without solicitation. He is the All-Might
 
 This work is offered in remembrance of the Dream of Prophet Musa, the Prayer of Prophet Isa — *Thy Kingdom come* — and the Kingdom of God: a rock cut without human hands, which shatters the idols of the age and grows to fill the whole earth.
 
-In honor of the Fourteen Infallibles, peace be upon them all: Prophet Muhammad al-Mustafa (peace be upon him and his progeny), Fatimah al-Zahra, Imam Ali ibn Abi Talib, Imam Hasan al-Mujtaba, Imam Husayn, Imam Ali Zayn al-Abidin, Imam Muhammad al-Baqir, Imam Ja'far al-Sadiq, Imam Musa al-Kazim, Imam Ali al-Rida, Imam Muhammad al-Jawad, Imam Ali al-Hadi, Imam Hasan al-Askari, and Imam Muhammad al-Mahdi (may God hasten his reappearance).
+In honor of the Fourteen Infallibles, peace be upon them all: Prophet Muhammad al-Mustafa (peace be upon him and his progeny), Fatimah al-Zahra, Imam Ali ibn Abi Talib, Imam Hasan al-Mujtaba, Imam Husayn, Imam Ali Zayn al-Abidin, Imam Muhammad al-Baqir, Imam Ja'far al-Sadiq, Imam Musa al-Kazim, Imam Ali al-Rida, Imam Muhammad al-Jawad, Imam Ali al-Hadi, Imam Hasan al-Askari, and Imam Muhammad al-Mahdi (may God hasten his reappearance). The Twelve Imams among them are the twelve princes promised from the lineage of Prophet Ismail (Ishmael).
 
 And in preparation for the coming of the Messiah and the Mahdi, may God hasten his reappearance.
 
