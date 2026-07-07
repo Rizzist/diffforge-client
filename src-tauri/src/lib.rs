@@ -3922,7 +3922,11 @@ fn workspace_activation_setting_for_index<'a>(
     None
 }
 
-fn workspace_activation_role_for_index(settings: &Value, slot_index: usize, position: usize) -> String {
+fn workspace_activation_role_for_index(
+    settings: &Value,
+    slot_index: usize,
+    position: usize,
+) -> String {
     workspace_activation_setting_for_index(
         settings,
         slot_index,
@@ -3947,7 +3951,12 @@ fn workspace_activation_permission_for_index(
         settings,
         slot_index,
         position,
-        &["agentPermissions", "agent_permissions", "permissionModes", "permission_modes"],
+        &[
+            "agentPermissions",
+            "agent_permissions",
+            "permissionModes",
+            "permission_modes",
+        ],
     )
     .and_then(|value| match value {
         Value::String(text) => Some(text.as_str()),
@@ -3966,7 +3975,14 @@ fn workspace_activation_pane_kind(value: Option<&Value>) -> Option<String> {
         Value::String(text) => Some(text.trim().to_ascii_lowercase()),
         Value::Object(_) => workspace_activation_text(
             value,
-            &["kind", "paneKind", "pane_kind", "type", "surfaceKind", "surface_kind"],
+            &[
+                "kind",
+                "paneKind",
+                "pane_kind",
+                "type",
+                "surfaceKind",
+                "surface_kind",
+            ],
         )
         .map(|value| value.to_ascii_lowercase()),
         _ => None,
@@ -3993,7 +4009,15 @@ fn workspace_activation_pane_records(settings: &Value) -> HashMap<usize, Value> 
             for (fallback_index, item) in array.iter().enumerate() {
                 let index = workspace_activation_i64(
                     item,
-                    &["logicalIndex", "logical_index", "terminalIndex", "terminal_index", "slotIndex", "slot_index", "index"],
+                    &[
+                        "logicalIndex",
+                        "logical_index",
+                        "terminalIndex",
+                        "terminal_index",
+                        "slotIndex",
+                        "slot_index",
+                        "index",
+                    ],
                 )
                 .and_then(|value| (value >= 0).then_some(value as usize))
                 .unwrap_or(fallback_index);
@@ -4064,9 +4088,7 @@ fn workspace_activation_terminal_count(settings: Option<&Value>) -> usize {
     {
         return array.len().min(WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT);
     }
-    if workspace_activation_text(settings, &["rootDirectory", "root_directory"])
-        .is_some()
-    {
+    if workspace_activation_text(settings, &["rootDirectory", "root_directory"]).is_some() {
         return 0;
     }
     WORKSPACE_ACTIVATE_DEFAULT_TERMINAL_COUNT
@@ -4096,11 +4118,22 @@ fn workspace_activation_terminal_indexes(
                 Value::String(text) => text.trim().parse::<i64>().ok(),
                 Value::Object(_) => workspace_activation_i64(
                     item,
-                    &["logicalIndex", "logical_index", "terminalIndex", "terminal_index", "slotIndex", "slot_index", "index"],
+                    &[
+                        "logicalIndex",
+                        "logical_index",
+                        "terminalIndex",
+                        "terminal_index",
+                        "slotIndex",
+                        "slot_index",
+                        "index",
+                    ],
                 ),
                 _ => None,
             };
-            if let Some(index) = index.filter(|value| *value >= 0).map(|value| value as usize) {
+            if let Some(index) = index
+                .filter(|value| *value >= 0)
+                .map(|value| value as usize)
+            {
                 if !indexes.contains(&index) {
                     indexes.push(index);
                 }
@@ -4155,7 +4188,12 @@ fn workspace_activation_thread_for_index<'a>(
             threads.values().find(|thread| {
                 workspace_activation_i64(
                     thread,
-                    &["terminalIndex", "terminal_index", "logicalIndex", "logical_index"],
+                    &[
+                        "terminalIndex",
+                        "terminal_index",
+                        "logicalIndex",
+                        "logical_index",
+                    ],
                 )
                 .is_some_and(|value| value == terminal_index as i64)
             })
@@ -4197,7 +4235,8 @@ fn workspace_activation_descriptor_from_sources(
     let settings = settings.unwrap_or(&empty_settings);
     let role = workspace_activation_role_for_index(settings, terminal_index, position);
     let plain_shell = role == "generic";
-    let terminal_record = workspace_activation_terminal_record_for_index(threads_state, terminal_index);
+    let terminal_record =
+        workspace_activation_terminal_record_for_index(threads_state, terminal_index);
     let thread = workspace_activation_thread_for_index(threads_state, terminal_index);
     let binding = thread.and_then(|thread| workspace_activation_provider_binding(thread, &role));
     let pane_record = workspace_activation_pane_records(settings).remove(&terminal_index);
@@ -4206,14 +4245,29 @@ fn workspace_activation_descriptor_from_sources(
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &["paneId", "pane_id", "panelId", "panel_id", "terminalId", "terminal_id", "id"],
+                &[
+                    "paneId",
+                    "pane_id",
+                    "panelId",
+                    "panel_id",
+                    "terminalId",
+                    "terminal_id",
+                    "id",
+                ],
             )
         })
         .or_else(|| {
             binding.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &["paneId", "pane_id", "terminalId", "terminal_id", "targetTerminalId", "target_terminal_id"],
+                    &[
+                        "paneId",
+                        "pane_id",
+                        "terminalId",
+                        "terminal_id",
+                        "targetTerminalId",
+                        "target_terminal_id",
+                    ],
                 )
             })
         })
@@ -4240,11 +4294,20 @@ fn workspace_activation_descriptor_from_sources(
             terminal_record.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &["paneId", "pane_id", "terminalId", "terminal_id", "targetTerminalId", "target_terminal_id"],
+                    &[
+                        "paneId",
+                        "pane_id",
+                        "terminalId",
+                        "terminal_id",
+                        "targetTerminalId",
+                        "target_terminal_id",
+                    ],
                 )
             })
         })
-        .unwrap_or_else(|| workspace_activation_default_pane_id(&workspace.id, terminal_index, &role));
+        .unwrap_or_else(|| {
+            workspace_activation_default_pane_id(&workspace.id, terminal_index, &role)
+        });
     let slot_key = pane_record
         .as_ref()
         .and_then(|value| workspace_activation_text(value, &["slotKey", "slot_key"]))
@@ -4252,7 +4315,8 @@ fn workspace_activation_descriptor_from_sources(
             binding.and_then(|value| workspace_activation_text(value, &["slotKey", "slot_key"]))
         })
         .or_else(|| {
-            terminal_record.and_then(|value| workspace_activation_text(value, &["slotKey", "slot_key"]))
+            terminal_record
+                .and_then(|value| workspace_activation_text(value, &["slotKey", "slot_key"]))
         })
         .unwrap_or_else(|| (terminal_index + 1).to_string());
     let thread_id = thread
@@ -4265,7 +4329,9 @@ fn workspace_activation_descriptor_from_sources(
         None
     } else {
         binding
-            .and_then(|value| workspace_activation_text(value, &["provider", "agentId", "agent_id"]))
+            .and_then(|value| {
+                workspace_activation_text(value, &["provider", "agentId", "agent_id"])
+            })
             .map(|value| workspace_activation_clean_role(Some(&value)))
             .or_else(|| Some(role.clone()))
     };
@@ -4287,7 +4353,14 @@ fn workspace_activation_descriptor_from_sources(
             thread.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &["providerSessionId", "provider_session_id", "nativeSessionId", "native_session_id", "transcriptSessionId", "transcript_session_id"],
+                    &[
+                        "providerSessionId",
+                        "provider_session_id",
+                        "nativeSessionId",
+                        "native_session_id",
+                        "transcriptSessionId",
+                        "transcript_session_id",
+                    ],
                 )
             })
         })
@@ -4295,7 +4368,14 @@ fn workspace_activation_descriptor_from_sources(
             terminal_record.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &["providerSessionId", "provider_session_id", "nativeSessionId", "native_session_id", "sessionId", "session_id"],
+                    &[
+                        "providerSessionId",
+                        "provider_session_id",
+                        "nativeSessionId",
+                        "native_session_id",
+                        "sessionId",
+                        "session_id",
+                    ],
                 )
             })
         })
@@ -4312,26 +4392,48 @@ fn workspace_activation_descriptor_from_sources(
         .and_then(|value| workspace_activation_text(value, &["modelId", "model_id", "model"]))
         .or_else(|| {
             terminal_record.and_then(|value| {
-                workspace_activation_text(value, &["model", "modelId", "model_id", "currentModel", "current_model"])
+                workspace_activation_text(
+                    value,
+                    &[
+                        "model",
+                        "modelId",
+                        "model_id",
+                        "currentModel",
+                        "current_model",
+                    ],
+                )
             })
         });
     let reasoning_effort = binding
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &["reasoningEffort", "reasoning_effort", "effort", "thinkingPower", "thinking_power"],
+                &[
+                    "reasoningEffort",
+                    "reasoning_effort",
+                    "effort",
+                    "thinkingPower",
+                    "thinking_power",
+                ],
             )
         })
         .or_else(|| {
             terminal_record.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &["reasoningEffort", "reasoning_effort", "currentEffort", "current_effort"],
+                    &[
+                        "reasoningEffort",
+                        "reasoning_effort",
+                        "currentEffort",
+                        "current_effort",
+                    ],
                 )
             })
         });
     let speed = binding
-        .and_then(|value| workspace_activation_text(value, &["speed", "serviceTier", "service_tier"]))
+        .and_then(|value| {
+            workspace_activation_text(value, &["speed", "serviceTier", "service_tier"])
+        })
         .or_else(|| {
             terminal_record.and_then(|value| {
                 workspace_activation_text(value, &["speed", "serviceTier", "service_tier"])
@@ -4343,14 +4445,26 @@ fn workspace_activation_descriptor_from_sources(
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &["workingDirectory", "working_directory", "cwd", "repoPath", "repo_path"],
+                &[
+                    "workingDirectory",
+                    "working_directory",
+                    "cwd",
+                    "repoPath",
+                    "repo_path",
+                ],
             )
         })
         .or_else(|| {
             terminal_record.and_then(|value| {
                 workspace_activation_text(
                     value,
-                    &["workingDirectory", "working_directory", "cwd", "repoPath", "repo_path"],
+                    &[
+                        "workingDirectory",
+                        "working_directory",
+                        "cwd",
+                        "repoPath",
+                        "repo_path",
+                    ],
                 )
             })
         })
@@ -4368,7 +4482,13 @@ fn workspace_activation_descriptor_from_sources(
                 .or_else(|| {
                     workspace_activation_text(
                         value,
-                        &["workingDirectory", "working_directory", "cwd", "repoPath", "repo_path"],
+                        &[
+                            "workingDirectory",
+                            "working_directory",
+                            "cwd",
+                            "repoPath",
+                            "repo_path",
+                        ],
                     )
                 })
             })
@@ -4378,10 +4498,20 @@ fn workspace_activation_descriptor_from_sources(
         .and_then(|value| {
             workspace_activation_text(
                 value,
-                &["terminalName", "terminal_name", "displayName", "display_name", "name"],
+                &[
+                    "terminalName",
+                    "terminal_name",
+                    "displayName",
+                    "display_name",
+                    "name",
+                ],
             )
         })
-        .or_else(|| thread.and_then(|value| workspace_activation_text(value, &["title", "sessionName", "session_name"])))
+        .or_else(|| {
+            thread.and_then(|value| {
+                workspace_activation_text(value, &["title", "sessionName", "session_name"])
+            })
+        })
         .or_else(|| Some(workspace_activation_agent_label(&role)));
     let terminal_nickname = terminal_record
         .and_then(|value| {
@@ -4503,12 +4633,31 @@ fn workspace_activation_resolve_workspace(
         workspace_activation_find_workspace_catalog_entry(app, workspace_id, workspace_settings)?;
     let root = catalog_entry
         .as_ref()
-        .and_then(|entry| workspace_activation_catalog_entry_text(entry, &["rootDirectory", "root_directory", "root", "path", "repoPath", "repo_path"]))
+        .and_then(|entry| {
+            workspace_activation_catalog_entry_text(
+                entry,
+                &[
+                    "rootDirectory",
+                    "root_directory",
+                    "root",
+                    "path",
+                    "repoPath",
+                    "repo_path",
+                ],
+            )
+        })
         .or_else(|| {
             settings.and_then(|settings| {
                 workspace_activation_text(
                     settings,
-                    &["rootDirectory", "root_directory", "root", "path", "repoPath", "repo_path"],
+                    &[
+                        "rootDirectory",
+                        "root_directory",
+                        "root",
+                        "path",
+                        "repoPath",
+                        "repo_path",
+                    ],
                 )
             })
         })
@@ -4560,7 +4709,10 @@ fn workspace_activation_remote_intent_clear_if_matching(
     let remote_intents = app_local_state_read(app, "remote-intents");
     let pending = workspace_activation_text(
         &remote_intents,
-        &["pendingActivationWorkspaceId", "pending_activation_workspace_id"],
+        &[
+            "pendingActivationWorkspaceId",
+            "pending_activation_workspace_id",
+        ],
     );
     if pending.as_deref() != Some(workspace_id) {
         return Ok(());
@@ -4577,11 +4729,7 @@ fn workspace_activation_remote_intent_clear_if_matching(
         "pendingActivationWorkspaceTab": null,
         "pending_activation_workspace_tab": null,
     });
-    app_local_state_merge(
-        app,
-        "remote-intents",
-        &patch,
-    )?;
+    app_local_state_merge(app, "remote-intents", &patch)?;
     Ok(())
 }
 
@@ -4689,11 +4837,7 @@ async fn workspace_activation_terminal_ready(
     let ready = todo_dispatch_core_terminal_ready_for_submit(&runtime, &projected, parked);
     if ready == Some(true) {
         todo_dispatch_refresh_terminal_runtime_from_core(
-            pane_id,
-            &instance,
-            &runtime,
-            &projected,
-            true,
+            pane_id, &instance, &runtime, &projected, true,
         );
     }
     ready
@@ -4703,7 +4847,8 @@ async fn workspace_activation_wait_for_readiness(
     app: &AppHandle,
     spawned: &[WorkspaceActivationSpawnResult],
 ) -> Vec<Value> {
-    let deadline = Instant::now() + Duration::from_secs(WORKSPACE_ACTIVATE_TERMINAL_READY_TIMEOUT_SECS);
+    let deadline =
+        Instant::now() + Duration::from_secs(WORKSPACE_ACTIVATE_TERMINAL_READY_TIMEOUT_SECS);
     let mut ready_by_pane: HashMap<String, bool> = spawned
         .iter()
         .filter_map(|spawn| {
@@ -4730,7 +4875,10 @@ async fn workspace_activation_wait_for_readiness(
         if ready_by_pane.values().all(|ready| *ready) {
             break;
         }
-        sleep(Duration::from_millis(WORKSPACE_ACTIVATE_TERMINAL_READY_POLL_MS)).await;
+        sleep(Duration::from_millis(
+            WORKSPACE_ACTIVATE_TERMINAL_READY_POLL_MS,
+        ))
+        .await;
     }
     spawned
         .iter()
@@ -5088,12 +5236,18 @@ pub(crate) async fn workspace_activate_runtime_internal(
 
     let run: Result<Value, String> = async {
         let workspace_settings = app_local_state_read(app, "workspace-settings");
-        let workspace = workspace_activation_resolve_workspace(app, workspace_id, &workspace_settings)?;
+        let workspace =
+            workspace_activation_resolve_workspace(app, workspace_id, &workspace_settings)?;
         workspace_activation_remote_intent_clear_if_matching(app, &workspace.id)?;
-        let settings = workspace_activation_settings_for_workspace(&workspace_settings, &workspace.id);
-        let threads_state = workspace_activation_threads_state(&workspace.id, &workspace.root).await?;
-        let descriptors =
-            workspace_activation_terminal_descriptors_from_values(&workspace, settings, &threads_state);
+        let settings =
+            workspace_activation_settings_for_workspace(&workspace_settings, &workspace.id);
+        let threads_state =
+            workspace_activation_threads_state(&workspace.id, &workspace.root).await?;
+        let descriptors = workspace_activation_terminal_descriptors_from_values(
+            &workspace,
+            settings,
+            &threads_state,
+        );
         let mcp_daemon = workspace_activation_bootstrap_coordination_and_mcp(&workspace.root).await;
         let spawned =
             workspace_activation_spawn_terminals(app, &workspace, descriptors.clone()).await;
@@ -5154,7 +5308,12 @@ pub(crate) async fn workspace_activate_runtime_internal(
         let terminals_adopted = spawned.iter().filter(|spawn| spawn.adopted).count();
         let terminals_ready = readiness
             .iter()
-            .filter(|entry| entry.get("inputReady").and_then(Value::as_bool).unwrap_or(false))
+            .filter(|entry| {
+                entry
+                    .get("inputReady")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
             .count();
         // An activation that produced zero live terminals for a workspace
         // that expects terminals is a failure, not a "completed" — the
@@ -5224,7 +5383,9 @@ async fn workspace_activate_runtime(
     workspace_activate_runtime_internal(
         &app,
         &workspace_id,
-        reason.as_deref().unwrap_or("workspace_activate_runtime_command"),
+        reason
+            .as_deref()
+            .unwrap_or("workspace_activate_runtime_command"),
     )
     .await
 }
@@ -5297,23 +5458,35 @@ mod workspace_activation_tests {
             }
         });
 
-        let descriptors =
-            workspace_activation_terminal_descriptors_from_values(&workspace, Some(&settings), &threads);
+        let descriptors = workspace_activation_terminal_descriptors_from_values(
+            &workspace,
+            Some(&settings),
+            &threads,
+        );
 
         assert_eq!(descriptors.len(), 2);
         assert_eq!(descriptors[0].terminal_index, 0);
         assert_eq!(descriptors[0].pane_id, "workspace-terminal-ws-1-0-codex");
         assert_eq!(descriptors[0].slot_key, "1");
         assert_eq!(descriptors[0].provider.as_deref(), Some("codex"));
-        assert_eq!(descriptors[0].provider_session_id.as_deref(), Some("session-zero"));
-        assert_eq!(descriptors[0].permission_mode.as_deref(), Some("bypass_permissions"));
+        assert_eq!(
+            descriptors[0].provider_session_id.as_deref(),
+            Some("session-zero")
+        );
+        assert_eq!(
+            descriptors[0].permission_mode.as_deref(),
+            Some("bypass_permissions")
+        );
         assert_eq!(descriptors[0].working_directory, "/repo/sub");
 
         assert_eq!(descriptors[1].terminal_index, 2);
         assert_eq!(descriptors[1].pane_id, "explicit-pane-2");
         assert_eq!(descriptors[1].slot_key, "slot-three");
         assert_eq!(descriptors[1].role, "claude");
-        assert_eq!(descriptors[1].provider_session_id.as_deref(), Some("session-two"));
+        assert_eq!(
+            descriptors[1].provider_session_id.as_deref(),
+            Some("session-two")
+        );
         assert_eq!(descriptors[1].permission_mode.as_deref(), Some("ask"));
         assert_eq!(descriptors[1].terminal_name.as_deref(), Some("Review"));
     }
@@ -5324,7 +5497,10 @@ mod workspace_activation_tests {
             workspace_activate_runtime_webview_guard_for_active(true),
             Err("webview dispatcher active".to_string())
         );
-        assert_eq!(workspace_activate_runtime_webview_guard_for_active(false), Ok(()));
+        assert_eq!(
+            workspace_activate_runtime_webview_guard_for_active(false),
+            Ok(())
+        );
     }
 }
 

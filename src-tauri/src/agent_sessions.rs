@@ -1,8 +1,9 @@
 const CODEX_TRANSCRIPT_DEFAULT_LIMIT: usize = 260;
 const CODEX_TRANSCRIPT_MAX_LIMIT: usize = 420;
-const CODEX_TRANSCRIPT_MAX_TEXT: usize = 12_000;
-const CODEX_TRANSCRIPT_MAX_TOOL_TEXT: usize = 8_000;
-const CODEX_TRANSCRIPT_MAX_REASONING_TEXT: usize = 48_000;
+const CODEX_TRANSCRIPT_MAX_TEXT: usize = 65_536;
+const CODEX_TRANSCRIPT_MAX_TOOL_TEXT: usize = 65_536;
+const CODEX_TRANSCRIPT_MAX_REASONING_TEXT: usize = 65_536;
+const CODEX_TRANSCRIPT_MAX_RECORD_MESSAGES_BYTES: usize = 512 * 1024;
 const CODEX_ROLLOUT_SCAN_LIMIT: usize = 2_500;
 const AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT: &str = "forge-agent-thread-transcript-updated";
 const AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS: u64 = 300;
@@ -77,6 +78,7 @@ struct CodexThreadSessionDiscoverRequest {
 #[serde(default, rename_all = "camelCase")]
 struct CodexThreadTranscriptArtifact {
     kind: String,
+    #[serde(alias = "mime")]
     mime_type: String,
     path: String,
     url: String,
@@ -96,13 +98,41 @@ struct CodexThreadTranscriptMessage {
     id: String,
     role: String,
     kind: String,
+    #[serde(alias = "legacy_kind", skip_serializing_if = "String::is_empty")]
+    legacy_kind: String,
     text: String,
     title: String,
+    #[serde(alias = "call_id")]
     call_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    status: String,
+    #[serde(alias = "created_at")]
     created_at: String,
     source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool: Option<Value>,
+    #[serde(alias = "tool_output", skip_serializing_if = "Option::is_none")]
+    tool_output: Option<Value>,
+    #[serde(alias = "tool_error", skip_serializing_if = "Option::is_none")]
+    tool_error: Option<Value>,
+    #[serde(alias = "file_change", skip_serializing_if = "Option::is_none")]
+    file_change: Option<Value>,
+    #[serde(alias = "duration_ms", skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
+    #[serde(alias = "exit_code", skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subagent: Option<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<Value>,
+    #[serde(skip_serializing_if = "bool_is_false")]
+    truncated: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     artifacts: Vec<CodexThreadTranscriptArtifact>,
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Clone, Default)]
@@ -161,7 +191,6 @@ struct AgentThreadTranscriptWatchEntry {
     context: Arc<StdMutex<AgentThreadTranscriptWatchContext>>,
     last_signature: String,
     owners: HashSet<String>,
-    debounce: Arc<AgentThreadTranscriptWatchDebounce>,
     touched_ms: u64,
     _watcher: notify::RecommendedWatcher,
 }
@@ -590,11 +619,9 @@ fn opencode_session_last_model(session_id: &str) -> Option<String> {
         return None;
     }
     let db_path = opencode_db_path()?;
-    let connection = rusqlite::Connection::open_with_flags(
-        &db_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .ok()?;
+    let connection =
+        rusqlite::Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
 
     if let Ok(mut statement) = connection.prepare(
         "select data from message where session_id = ?1 order by time_created desc, id desc limit 200",
@@ -615,8 +642,7 @@ fn opencode_session_last_model(session_id: &str) -> Option<String> {
         }
     }
 
-    if let Ok(mut statement) =
-        connection.prepare("select model from session where id = ?1 limit 1")
+    if let Ok(mut statement) = connection.prepare("select model from session where id = ?1 limit 1")
     {
         if let Ok(mut rows) = statement.query(rusqlite::params![session_id]) {
             if let Ok(Some(row)) = rows.next() {
@@ -662,6 +688,18 @@ fn first_value_string(values: &[Option<&Value>]) -> String {
         .unwrap_or_default()
 }
 
+fn value_i64(value: Option<&Value>) -> Option<i64> {
+    value.and_then(|value| match value {
+        Value::Number(number) => number.as_i64(),
+        Value::String(text) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    })
+}
+
+fn first_value_i64(values: &[Option<&Value>]) -> Option<i64> {
+    values.iter().find_map(|value| value_i64(*value))
+}
+
 fn truncate_chars(value: &str, max_chars: usize) -> String {
     let mut output = String::new();
     for character in value.chars().take(max_chars) {
@@ -704,13 +742,32 @@ fn redact_codex_transcript_secrets(text: &str) -> String {
         })
 }
 
-fn clean_codex_transcript_text(value: impl AsRef<str>, max_chars: usize) -> String {
+fn append_transcript_truncation_marker(output: &mut String) {
+    if output.ends_with("[truncated]") {
+        return;
+    }
+    if !output.is_empty() {
+        output.push_str("\n\n");
+    }
+    output.push_str("[truncated]");
+}
+
+fn clean_codex_transcript_text_with_truncation(
+    value: impl AsRef<str>,
+    max_chars: usize,
+) -> (String, bool) {
     let redacted = redact_codex_transcript_secrets(value.as_ref());
     let mut output = String::with_capacity(redacted.len().min(max_chars));
     let mut previous_was_newline = false;
     let mut blank_lines = 0usize;
+    let mut output_chars = 0usize;
+    let mut truncated = false;
 
     for character in redacted.chars() {
+        if output_chars >= max_chars {
+            truncated = true;
+            break;
+        }
         let character = match character {
             '\r' => '\n',
             '\n' | '\t' => character,
@@ -734,16 +791,25 @@ fn clean_codex_transcript_text(value: impl AsRef<str>, max_chars: usize) -> Stri
         }
 
         output.push(character);
-        if output.chars().count() >= max_chars {
-            break;
-        }
+        output_chars = output_chars.saturating_add(1);
     }
 
-    output.trim().to_string()
+    output = output.trim().to_string();
+    if truncated {
+        append_transcript_truncation_marker(&mut output);
+    }
+    (output, truncated)
+}
+
+fn clean_codex_transcript_text(value: impl AsRef<str>, max_chars: usize) -> String {
+    clean_codex_transcript_text_with_truncation(value, max_chars).0
 }
 
 fn clean_codex_reasoning_text(value: impl AsRef<str>) -> String {
-    let cleaned = clean_codex_transcript_text(value, CODEX_TRANSCRIPT_MAX_REASONING_TEXT + 1024);
+    let (cleaned, pre_truncated) = clean_codex_transcript_text_with_truncation(
+        value,
+        CODEX_TRANSCRIPT_MAX_REASONING_TEXT + 1024,
+    );
     if cleaned.chars().count() <= CODEX_TRANSCRIPT_MAX_REASONING_TEXT {
         return cleaned;
     }
@@ -754,15 +820,15 @@ fn clean_codex_reasoning_text(value: impl AsRef<str>) -> String {
     if let Some((index, _)) = output
         .char_indices()
         .rev()
-        .take_while(|(index, _)| {
-            output.len().saturating_sub(*index) <= 1024
-        })
+        .take_while(|(index, _)| output.len().saturating_sub(*index) <= 1024)
         .find(|(_, character)| character.is_whitespace())
     {
         output.truncate(index);
     }
     output = output.trim().to_string();
-    output.push_str("\n\n[truncated]");
+    if pre_truncated || cleaned.chars().count() > CODEX_TRANSCRIPT_MAX_REASONING_TEXT {
+        append_transcript_truncation_marker(&mut output);
+    }
     output
 }
 
@@ -1429,21 +1495,28 @@ fn transcript_tool_value_has_error(value: &Value) -> bool {
     {
         return true;
     }
-    if ["status", "state", "phase"]
-        .iter()
-        .any(|key| object.get(*key).is_some_and(transcript_tool_value_status_is_error))
-    {
+    if ["status", "state", "phase"].iter().any(|key| {
+        object
+            .get(*key)
+            .is_some_and(transcript_tool_value_status_is_error)
+    }) {
         return true;
     }
     if ["error", "toolError", "tool_error", "stderr"]
         .iter()
-        .any(|key| object.get(*key).is_some_and(transcript_tool_value_has_content))
+        .any(|key| {
+            object
+                .get(*key)
+                .is_some_and(transcript_tool_value_has_content)
+        })
     {
         return true;
     }
-    ["output", "result", "response", "state"]
-        .iter()
-        .any(|key| object.get(*key).is_some_and(transcript_tool_value_has_error))
+    ["output", "result", "response", "state"].iter().any(|key| {
+        object
+            .get(*key)
+            .is_some_and(transcript_tool_value_has_error)
+    })
 }
 
 fn codex_summary_text(payload: &Value) -> String {
@@ -1470,6 +1543,701 @@ fn parse_call_arguments(arguments: &Value) -> Option<Value> {
     None
 }
 
+fn transcript_value_is_present(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::String(text) => !text.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(object) => !object.is_empty(),
+        _ => true,
+    }
+}
+
+fn transcript_tool_io_value(
+    value: Option<&Value>,
+    fallback_text: impl AsRef<str>,
+    max_chars: usize,
+) -> (Option<Value>, bool) {
+    if let Some(value) = value.filter(|value| transcript_value_is_present(value)) {
+        return match value {
+            Value::String(text) => {
+                let (text, truncated) =
+                    clean_codex_transcript_text_with_truncation(text, max_chars);
+                ((!text.is_empty()).then(|| Value::String(text)), truncated)
+            }
+            Value::Array(_) | Value::Object(_) => (Some(value.clone()), false),
+            _ => (Some(value.clone()), false),
+        };
+    }
+
+    let fallback_text = fallback_text.as_ref();
+    if fallback_text.trim().is_empty() {
+        return (None, false);
+    }
+    let (text, truncated) = clean_codex_transcript_text_with_truncation(fallback_text, max_chars);
+    ((!text.is_empty()).then(|| Value::String(text)), truncated)
+}
+
+fn transcript_tool_object(
+    name: impl AsRef<str>,
+    call_id: impl AsRef<str>,
+    status: impl AsRef<str>,
+    input: Option<Value>,
+    output: Option<Value>,
+    title: impl AsRef<str>,
+) -> Value {
+    let mut object = serde_json::Map::new();
+    let name = name.as_ref().trim();
+    if !name.is_empty() {
+        object.insert("name".to_string(), json!(name));
+    }
+    let call_id = call_id.as_ref().trim();
+    if !call_id.is_empty() {
+        object.insert("call_id".to_string(), json!(call_id));
+    }
+    let status = status.as_ref().trim();
+    if !status.is_empty() {
+        object.insert("status".to_string(), json!(status));
+    }
+    if let Some(input) = input.filter(transcript_value_is_present) {
+        object.insert("input".to_string(), input);
+    }
+    if let Some(output) = output.filter(transcript_value_is_present) {
+        object.insert("output".to_string(), output);
+    }
+    let title = title.as_ref().trim();
+    if !title.is_empty() {
+        object.insert("title".to_string(), json!(title));
+    }
+    Value::Object(object)
+}
+
+#[derive(Clone, Default)]
+struct TranscriptToolCallMetadata {
+    name: String,
+    title: String,
+}
+
+fn transcript_tool_message_name(message: &CodexThreadTranscriptMessage) -> String {
+    message
+        .tool
+        .as_ref()
+        .and_then(|tool| tool.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+fn transcript_tool_message_title(message: &CodexThreadTranscriptMessage) -> String {
+    message
+        .tool
+        .as_ref()
+        .and_then(|tool| tool.get("title"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(message.title.as_str())
+        .trim()
+        .to_string()
+}
+
+fn transcript_record_tool_call_metadata(
+    tool_metadata: &mut HashMap<String, TranscriptToolCallMetadata>,
+    message: &CodexThreadTranscriptMessage,
+) {
+    if message.kind != "tool_call" || message.call_id.trim().is_empty() {
+        return;
+    }
+    let metadata = TranscriptToolCallMetadata {
+        name: transcript_tool_message_name(message),
+        title: transcript_tool_message_title(message),
+    };
+    if metadata.name.is_empty() && metadata.title.is_empty() {
+        return;
+    }
+    tool_metadata.insert(message.call_id.clone(), metadata);
+}
+
+fn transcript_apply_tool_call_metadata(
+    tool_metadata: &HashMap<String, TranscriptToolCallMetadata>,
+    message: &mut CodexThreadTranscriptMessage,
+) {
+    if message.call_id.trim().is_empty() || message.kind == "tool_call" {
+        return;
+    }
+    let Some(metadata) = tool_metadata.get(message.call_id.as_str()) else {
+        return;
+    };
+    let Some(tool) = message.tool.as_mut().and_then(Value::as_object_mut) else {
+        return;
+    };
+    let name_is_empty = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .is_none_or(|value| value.trim().is_empty());
+    if name_is_empty && !metadata.name.trim().is_empty() {
+        tool.insert("name".to_string(), json!(metadata.name.clone()));
+    }
+    if !metadata.title.trim().is_empty() {
+        tool.insert("title".to_string(), json!(metadata.title.clone()));
+    }
+}
+
+fn push_codex_message_with_tool_metadata(
+    messages: &mut Vec<CodexThreadTranscriptMessage>,
+    seen: &mut HashSet<String>,
+    message: Option<CodexThreadTranscriptMessage>,
+    tool_metadata: &mut HashMap<String, TranscriptToolCallMetadata>,
+) {
+    let Some(mut message) = message else {
+        return;
+    };
+    transcript_apply_tool_call_metadata(tool_metadata, &mut message);
+    transcript_record_tool_call_metadata(tool_metadata, &message);
+    push_codex_message(messages, seen, Some(message));
+}
+
+fn transcript_usage_number(value: Option<&Value>) -> Option<Value> {
+    value.and_then(|value| match value {
+        Value::Number(_) => Some(value.clone()),
+        Value::String(text) if !text.trim().is_empty() => {
+            Some(Value::String(text.trim().to_string()))
+        }
+        _ => None,
+    })
+}
+
+fn transcript_usage_from_value(value: &Value) -> Option<Value> {
+    let usage = value
+        .get("usage")
+        .or_else(|| value.get("token_usage"))
+        .or_else(|| value.get("tokenUsage"))
+        .or_else(|| value.get("usage_report"))
+        .or_else(|| value.get("usageReport"))
+        .unwrap_or(value);
+    let mut object = serde_json::Map::new();
+    for (target, aliases) in [
+        (
+            "input_tokens",
+            [
+                "input_tokens",
+                "inputTokens",
+                "prompt_tokens",
+                "promptTokens",
+            ],
+        ),
+        (
+            "output_tokens",
+            [
+                "output_tokens",
+                "outputTokens",
+                "completion_tokens",
+                "completionTokens",
+            ],
+        ),
+        (
+            "cache_read_tokens",
+            [
+                "cache_read_tokens",
+                "cacheReadTokens",
+                "cache_read_input_tokens",
+                "cacheReadInputTokens",
+            ],
+        ),
+        (
+            "cache_write_tokens",
+            [
+                "cache_write_tokens",
+                "cacheWriteTokens",
+                "cache_creation_input_tokens",
+                "cacheCreationInputTokens",
+            ],
+        ),
+        ("cost_usd", ["cost_usd", "costUsd", "costUSD", "cost"]),
+    ] {
+        let value = aliases
+            .iter()
+            .find_map(|key| transcript_usage_number(usage.get(*key)));
+        if let Some(value) = value {
+            object.insert(target.to_string(), value);
+        }
+    }
+    (!object.is_empty()).then(|| Value::Object(object))
+}
+
+fn transcript_subagent_from_value(value: &Value, fallback_title: &str) -> Option<Value> {
+    let is_sidechain = value
+        .get("isSidechain")
+        .or_else(|| value.get("is_sidechain"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let parent_id = first_value_string(&[
+        value.get("parentUuid"),
+        value.get("parent_uuid"),
+        value.get("parentId"),
+        value.get("parent_id"),
+    ]);
+    let sidechain_id = first_value_string(&[
+        value.get("sidechainId"),
+        value.get("sidechain_id"),
+        value.get("sidechainUuid"),
+        value.get("sidechain_uuid"),
+    ]);
+    let subagent_id = first_value_string(&[
+        value.get("uuid"),
+        value.get("id"),
+        value.get("sessionId"),
+        value.get("session_id"),
+        value.get("subagentId"),
+        value.get("subagent_id"),
+    ]);
+    let title = first_value_string(&[
+        value.get("title"),
+        value.get("name"),
+        value.get("description"),
+        value.get("summary"),
+    ]);
+    let status = first_value_string(&[value.get("status"), value.get("state")]);
+    if !is_sidechain
+        && parent_id.trim().is_empty()
+        && sidechain_id.trim().is_empty()
+        && title.trim().is_empty()
+        && status.trim().is_empty()
+    {
+        return None;
+    }
+    let mut object = serde_json::Map::new();
+    if !subagent_id.trim().is_empty() {
+        object.insert("subagent_id".to_string(), json!(subagent_id));
+    }
+    if !parent_id.trim().is_empty() {
+        object.insert("parent_id".to_string(), json!(parent_id));
+    }
+    if !sidechain_id.trim().is_empty() {
+        object.insert("sidechain_id".to_string(), json!(sidechain_id));
+    }
+    let title = if title.trim().is_empty() {
+        fallback_title.to_string()
+    } else {
+        title
+    };
+    if !title.trim().is_empty() {
+        object.insert("title".to_string(), json!(title));
+    }
+    if !status.trim().is_empty() {
+        object.insert("status".to_string(), json!(status));
+    }
+    Some(Value::Object(object))
+}
+
+fn transcript_sidechain_subagent_from_value(value: &Value, fallback_title: &str) -> Option<Value> {
+    let is_sidechain = value
+        .get("isSidechain")
+        .or_else(|| value.get("is_sidechain"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let has_parent = !first_value_string(&[
+        value.get("parentUuid"),
+        value.get("parent_uuid"),
+        value.get("parentId"),
+        value.get("parent_id"),
+    ])
+    .trim()
+    .is_empty();
+    let has_sidechain = !first_value_string(&[
+        value.get("sidechainId"),
+        value.get("sidechain_id"),
+        value.get("sidechainUuid"),
+        value.get("sidechain_uuid"),
+    ])
+    .trim()
+    .is_empty();
+    if !is_sidechain && !has_parent && !has_sidechain {
+        return None;
+    }
+    transcript_subagent_from_value(value, fallback_title)
+}
+
+fn transcript_subagent_message(
+    id: String,
+    source: &str,
+    timestamp: &str,
+    subagent: Value,
+    fallback_title: &str,
+) -> CodexThreadTranscriptMessage {
+    let title = subagent
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(fallback_title)
+        .to_string();
+    CodexThreadTranscriptMessage {
+        id,
+        role: "activity".to_string(),
+        kind: "subagent".to_string(),
+        legacy_kind: "tool_call".to_string(),
+        text: title.clone(),
+        title,
+        created_at: timestamp.to_string(),
+        source: source.to_string(),
+        subagent: Some(subagent),
+        ..Default::default()
+    }
+}
+
+fn transcript_file_kind(value: &str) -> &'static str {
+    let value = value.trim().to_ascii_lowercase();
+    if value.contains("delete") || value.contains("remove") {
+        "delete"
+    } else if value.contains("create") || value.contains("add") || value == "new" {
+        "create"
+    } else if value.contains("rename") || value.contains("move") {
+        "rename"
+    } else {
+        "edit"
+    }
+}
+
+fn transcript_push_file_change_file(
+    files: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+    path: String,
+    kind: &str,
+    additions: Option<i64>,
+    deletions: Option<i64>,
+) {
+    let path = path.trim().trim_matches('"').to_string();
+    if path.is_empty() || path == "/dev/null" {
+        return;
+    }
+    let key = format!("{}:{}", kind, path);
+    if !seen.insert(key) {
+        return;
+    }
+    let mut object = serde_json::Map::new();
+    object.insert("path".to_string(), json!(path));
+    object.insert("kind".to_string(), json!(transcript_file_kind(kind)));
+    if let Some(additions) = additions {
+        object.insert("additions".to_string(), json!(additions.max(0)));
+    }
+    if let Some(deletions) = deletions {
+        object.insert("deletions".to_string(), json!(deletions.max(0)));
+    }
+    files.push(Value::Object(object));
+}
+
+fn transcript_line_count(value: Option<&Value>) -> Option<i64> {
+    value
+        .and_then(Value::as_str)
+        .map(|text| text.lines().count() as i64)
+}
+
+fn transcript_sum_line_counts<'a>(values: impl Iterator<Item = Option<&'a Value>>) -> Option<i64> {
+    let mut found = false;
+    let mut total = 0i64;
+    for count in values.filter_map(transcript_line_count) {
+        found = true;
+        total = total.saturating_add(count);
+    }
+    found.then_some(total)
+}
+
+fn transcript_file_change_from_files(files: Vec<Value>) -> Option<Value> {
+    if files.is_empty() {
+        return None;
+    }
+    let mut object = serde_json::Map::new();
+    object.insert("files".to_string(), Value::Array(files));
+    Some(Value::Object(object))
+}
+
+fn transcript_claude_write_kind(input: &Value) -> &'static str {
+    if [
+        "existing",
+        "existingFile",
+        "existing_file",
+        "overwrite",
+        "replace",
+    ]
+    .iter()
+    .any(|key| input.get(*key).and_then(Value::as_bool).unwrap_or(false))
+    {
+        "edit"
+    } else if [
+        "newFile", "new_file", "create", "created", "isNew", "is_new",
+    ]
+    .iter()
+    .any(|key| input.get(*key).and_then(Value::as_bool).unwrap_or(false))
+    {
+        "create"
+    } else {
+        "create"
+    }
+}
+
+fn transcript_file_change_from_claude_tool_input(name: &str, input: &Value) -> Option<Value> {
+    let normalized = name.trim().to_ascii_lowercase();
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    match normalized.as_str() {
+        "edit" => {
+            let path = first_value_string(&[input.get("file_path"), input.get("filePath")]);
+            if !path.trim().is_empty() {
+                transcript_push_file_change_file(
+                    &mut files,
+                    &mut seen,
+                    path,
+                    "edit",
+                    transcript_line_count(
+                        input.get("new_string").or_else(|| input.get("newString")),
+                    ),
+                    transcript_line_count(
+                        input.get("old_string").or_else(|| input.get("oldString")),
+                    ),
+                );
+            }
+        }
+        "write" => {
+            let path = first_value_string(&[input.get("file_path"), input.get("filePath")]);
+            if !path.trim().is_empty() {
+                transcript_push_file_change_file(
+                    &mut files,
+                    &mut seen,
+                    path,
+                    transcript_claude_write_kind(input),
+                    transcript_line_count(input.get("content")),
+                    Some(0),
+                );
+            }
+        }
+        "multiedit" => {
+            let path = first_value_string(&[input.get("file_path"), input.get("filePath")]);
+            if !path.trim().is_empty() {
+                let edits = input
+                    .get("edits")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let additions = transcript_sum_line_counts(
+                    edits
+                        .iter()
+                        .map(|edit| edit.get("new_string").or_else(|| edit.get("newString"))),
+                );
+                let deletions = transcript_sum_line_counts(
+                    edits
+                        .iter()
+                        .map(|edit| edit.get("old_string").or_else(|| edit.get("oldString"))),
+                );
+                transcript_push_file_change_file(
+                    &mut files, &mut seen, path, "edit", additions, deletions,
+                );
+            }
+        }
+        "notebookedit" => {
+            let path = first_value_string(&[
+                input.get("notebook_path"),
+                input.get("notebookPath"),
+                input.get("file_path"),
+                input.get("filePath"),
+            ]);
+            if !path.trim().is_empty() {
+                transcript_push_file_change_file(
+                    &mut files,
+                    &mut seen,
+                    path,
+                    "edit",
+                    transcript_line_count(
+                        input
+                            .get("new_source")
+                            .or_else(|| input.get("newSource"))
+                            .or_else(|| input.get("new_string"))
+                            .or_else(|| input.get("newString"))
+                            .or_else(|| input.get("source"))
+                            .or_else(|| input.get("content")),
+                    ),
+                    transcript_line_count(
+                        input
+                            .get("old_source")
+                            .or_else(|| input.get("oldSource"))
+                            .or_else(|| input.get("old_string"))
+                            .or_else(|| input.get("oldString")),
+                    ),
+                );
+            }
+        }
+        _ => {}
+    }
+    transcript_file_change_from_files(files)
+}
+
+fn transcript_collect_file_changes_from_value(
+    value: &Value,
+    files: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                transcript_collect_file_changes_from_value(item, files, seen);
+            }
+        }
+        Value::Object(object) => {
+            let path = first_value_string(&[
+                object.get("path"),
+                object.get("file"),
+                object.get("filePath"),
+                object.get("file_path"),
+                object.get("filename"),
+                object.get("name"),
+            ]);
+            if !path.trim().is_empty() {
+                let kind = first_value_string(&[
+                    object.get("kind"),
+                    object.get("type"),
+                    object.get("action"),
+                    object.get("operation"),
+                    object.get("status"),
+                ]);
+                let additions = object
+                    .get("additions")
+                    .or_else(|| object.get("added"))
+                    .and_then(Value::as_i64);
+                let deletions = object
+                    .get("deletions")
+                    .or_else(|| object.get("deleted"))
+                    .or_else(|| object.get("removals"))
+                    .and_then(Value::as_i64);
+                transcript_push_file_change_file(files, seen, path, &kind, additions, deletions);
+            }
+            for key in ["files", "changes", "edits", "diffs", "patches"] {
+                if let Some(child) = object.get(key) {
+                    transcript_collect_file_changes_from_value(child, files, seen);
+                }
+            }
+            for key in ["patch", "diff", "stdout", "stderr", "summary"] {
+                if let Some(text) = object.get(key).and_then(Value::as_str) {
+                    transcript_collect_file_changes_from_text(text, files, seen);
+                }
+            }
+        }
+        Value::String(text) => transcript_collect_file_changes_from_text(text, files, seen),
+        _ => {}
+    }
+}
+
+fn transcript_collect_file_changes_from_text(
+    text: &str,
+    files: &mut Vec<Value>,
+    seen: &mut HashSet<String>,
+) {
+    let mut current_path = String::new();
+    let mut additions = 0i64;
+    let mut deletions = 0i64;
+    let flush_current = |files: &mut Vec<Value>,
+                         seen: &mut HashSet<String>,
+                         path: &mut String,
+                         additions: &mut i64,
+                         deletions: &mut i64| {
+        if !path.trim().is_empty() {
+            transcript_push_file_change_file(
+                files,
+                seen,
+                std::mem::take(path),
+                "edit",
+                Some(*additions),
+                Some(*deletions),
+            );
+        }
+        *additions = 0;
+        *deletions = 0;
+    };
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("diff --git ") {
+            flush_current(
+                files,
+                seen,
+                &mut current_path,
+                &mut additions,
+                &mut deletions,
+            );
+            let candidate = rest
+                .split_whitespace()
+                .nth(1)
+                .or_else(|| rest.split_whitespace().next())
+                .unwrap_or_default()
+                .trim_start_matches("b/")
+                .trim_start_matches("a/")
+                .to_string();
+            current_path = candidate;
+            continue;
+        }
+        if let Some(path) = trimmed.strip_prefix("+++ b/") {
+            if current_path.trim().is_empty() {
+                current_path = path.trim().to_string();
+            }
+            continue;
+        }
+        if let Some(path) = trimmed.strip_prefix("M ") {
+            transcript_push_file_change_file(files, seen, path.to_string(), "edit", None, None);
+            continue;
+        }
+        if let Some(path) = trimmed.strip_prefix("A ") {
+            transcript_push_file_change_file(files, seen, path.to_string(), "create", None, None);
+            continue;
+        }
+        if let Some(path) = trimmed.strip_prefix("D ") {
+            transcript_push_file_change_file(files, seen, path.to_string(), "delete", None, None);
+            continue;
+        }
+        if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+            additions = additions.saturating_add(1);
+        } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+            deletions = deletions.saturating_add(1);
+        }
+    }
+    flush_current(
+        files,
+        seen,
+        &mut current_path,
+        &mut additions,
+        &mut deletions,
+    );
+}
+
+fn transcript_file_change_from_value(value: &Value, fallback_summary: &str) -> Option<Value> {
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    transcript_collect_file_changes_from_value(value, &mut files, &mut seen);
+    transcript_collect_file_changes_from_text(fallback_summary, &mut files, &mut seen);
+    if files.is_empty() && fallback_summary.trim().is_empty() {
+        return None;
+    }
+    let mut object = serde_json::Map::new();
+    object.insert("files".to_string(), Value::Array(files));
+    let summary = clean_codex_transcript_text(fallback_summary, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+    if !summary.trim().is_empty() {
+        object.insert("summary".to_string(), json!(summary));
+    }
+    Some(Value::Object(object))
+}
+
+fn transcript_codex_output_exit_code(payload: &Value, output: &Value) -> Option<i64> {
+    let payload_metadata = payload.get("metadata").unwrap_or(&Value::Null);
+    let output_metadata = output.get("metadata").unwrap_or(&Value::Null);
+    first_value_i64(&[
+        payload.get("exit_code"),
+        payload.get("exitCode"),
+        payload_metadata.get("exit_code"),
+        payload_metadata.get("exitCode"),
+        output.get("exit_code"),
+        output.get("exitCode"),
+        output_metadata.get("exit_code"),
+        output_metadata.get("exitCode"),
+    ])
+}
+
 fn command_title(command: &str, fallback: &str) -> String {
     let first_line = command.lines().next().unwrap_or(command).trim();
     if first_line.is_empty() {
@@ -1485,7 +2253,8 @@ fn transcript_task_complete_message(
     timestamp: &str,
     text: impl AsRef<str>,
 ) -> CodexThreadTranscriptMessage {
-    let text = clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TEXT);
+    let (text, truncated) =
+        clean_codex_transcript_text_with_truncation(text, CODEX_TRANSCRIPT_MAX_TEXT);
     CodexThreadTranscriptMessage {
         id,
         role: "assistant".to_string(),
@@ -1493,9 +2262,12 @@ fn transcript_task_complete_message(
         text,
         title: "Task complete".to_string(),
         call_id: String::new(),
+        status: "task_complete".to_string(),
         created_at: timestamp.to_string(),
         source: source.to_string(),
+        truncated,
         artifacts: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -1505,16 +2277,21 @@ fn transcript_error_message(
     timestamp: &str,
     text: impl AsRef<str>,
 ) -> CodexThreadTranscriptMessage {
+    let (text, truncated) =
+        clean_codex_transcript_text_with_truncation(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
     CodexThreadTranscriptMessage {
         id,
         role: "activity".to_string(),
         kind: "error".to_string(),
-        text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+        text,
         title: "Error".to_string(),
         call_id: String::new(),
+        status: "error".to_string(),
         created_at: timestamp.to_string(),
         source: source.to_string(),
+        truncated,
         artifacts: Vec::new(),
+        ..Default::default()
     }
 }
 
@@ -1571,21 +2348,37 @@ fn codex_function_call_message(
         (fallback_title, text)
     };
 
-    let text = clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+    let tool_input = parsed_arguments.clone().or_else(|| {
+        if transcript_value_is_present(arguments) {
+            Some(arguments.clone())
+        } else {
+            None
+        }
+    });
+    let (text, truncated) =
+        clean_codex_transcript_text_with_truncation(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
     if text.is_empty() && title.is_empty() {
         return None;
     }
+    let title = clean_codex_title(title, "Called tool");
 
     Some(CodexThreadTranscriptMessage {
         id: format!("codex-{line_index}-tool-call"),
         role: "activity".to_string(),
         kind: "tool_call".to_string(),
         text,
-        title: clean_codex_title(title, "Called tool"),
-        call_id,
+        title: title.clone(),
+        call_id: call_id.clone(),
+        status: "running".to_string(),
         created_at: timestamp.to_string(),
         source: "codex".to_string(),
+        tool: Some(transcript_tool_object(
+            name, call_id, "running", tool_input, None, title,
+        )),
+        usage: transcript_usage_from_value(payload),
+        truncated,
         artifacts: Vec::new(),
+        ..Default::default()
     })
 }
 
@@ -1596,11 +2389,35 @@ fn codex_function_output_message(
 ) -> Option<CodexThreadTranscriptMessage> {
     let call_id = value_string(payload.get("call_id"));
     let output_value = payload.get("output").unwrap_or(&Value::Null);
-    let raw_output = codex_content_text(output_value);
-    let output = clean_codex_transcript_text(&raw_output, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+    let exit_code = transcript_codex_output_exit_code(payload, output_value);
+    let content_output = codex_content_text(output_value);
+    let raw_output = if content_output.trim().is_empty() {
+        let stdout = first_value_string(&[output_value.get("stdout"), payload.get("stdout")]);
+        let stderr = first_value_string(&[output_value.get("stderr"), payload.get("stderr")]);
+        let combined = [stdout, stderr]
+            .into_iter()
+            .filter(|text| !text.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if combined.trim().is_empty() && exit_code.is_some() {
+            pretty_json(output_value)
+        } else {
+            combined
+        }
+    } else {
+        content_output
+    };
+    let (output, text_truncated) =
+        clean_codex_transcript_text_with_truncation(&raw_output, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+    let (tool_output, output_truncated) = transcript_tool_io_value(
+        Some(output_value),
+        &raw_output,
+        CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+    );
     let artifacts = codex_image_artifacts_from_content(output_value, &raw_output, "Tool output");
-    let has_error =
-        transcript_tool_value_has_error(payload) || transcript_tool_value_has_error(output_value);
+    let has_error = transcript_tool_value_has_error(payload)
+        || transcript_tool_value_has_error(output_value)
+        || exit_code.is_some_and(|code| code != 0);
 
     if output.is_empty() && artifacts.is_empty() {
         return None;
@@ -1621,11 +2438,26 @@ fn codex_function_output_message(
         role: "activity".to_string(),
         kind,
         text: output,
-        title,
-        call_id,
+        title: title.clone(),
+        call_id: call_id.clone(),
+        status: if has_error { "error" } else { "completed" }.to_string(),
         created_at: timestamp.to_string(),
         source: "codex".to_string(),
+        tool: Some(transcript_tool_object(
+            "",
+            &call_id,
+            if has_error { "failed" } else { "completed" },
+            None,
+            tool_output.clone(),
+            &title,
+        )),
+        tool_output: (!has_error).then(|| tool_output.clone()).flatten(),
+        tool_error: has_error.then(|| tool_output.clone()).flatten(),
+        exit_code,
+        usage: transcript_usage_from_value(payload),
+        truncated: text_truncated || output_truncated,
         artifacts,
+        ..Default::default()
     })
 }
 
@@ -1830,21 +2662,29 @@ fn codex_messages_from_event(
                 text.push_str(&format!("[{image_count} image attachment(s)]"));
             }
             let artifacts = codex_image_artifacts_from_content(payload, &text, "Attached image");
+            let (text, truncated) =
+                clean_codex_transcript_text_with_truncation(text, CODEX_TRANSCRIPT_MAX_TEXT);
             vec![CodexThreadTranscriptMessage {
                 id: format!("codex-{line_index}-user"),
                 role: "user".to_string(),
                 kind: "message".to_string(),
-                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TEXT),
+                text,
                 title: String::new(),
                 call_id: String::new(),
                 created_at: timestamp.to_string(),
                 source: "codex".to_string(),
+                usage: transcript_usage_from_value(payload),
+                truncated,
                 artifacts,
+                ..Default::default()
             }]
         }
         "agent_message" => {
             let raw_message = value_string(payload.get("message"));
-            let text = clean_codex_transcript_text(&raw_message, CODEX_TRANSCRIPT_MAX_TEXT);
+            let (text, truncated) = clean_codex_transcript_text_with_truncation(
+                &raw_message,
+                CODEX_TRANSCRIPT_MAX_TEXT,
+            );
             let artifacts =
                 codex_image_artifacts_from_content(payload, &raw_message, "Generated image");
             if text.is_empty() && artifacts.is_empty() {
@@ -1859,7 +2699,10 @@ fn codex_messages_from_event(
                     call_id: String::new(),
                     created_at: timestamp.to_string(),
                     source: "codex".to_string(),
+                    usage: transcript_usage_from_value(payload),
+                    truncated,
                     artifacts,
+                    ..Default::default()
                 }]
             }
         }
@@ -1868,7 +2711,7 @@ fn codex_messages_from_event(
             role: "assistant".to_string(),
             kind: "task_complete".to_string(),
             text: {
-                let text = clean_codex_transcript_text(
+                let (text, _) = clean_codex_transcript_text_with_truncation(
                     value_string(payload.get("last_agent_message")),
                     CODEX_TRANSCRIPT_MAX_TEXT,
                 );
@@ -1880,9 +2723,12 @@ fn codex_messages_from_event(
             },
             title: "Task complete".to_string(),
             call_id: String::new(),
+            status: "task_complete".to_string(),
             created_at: timestamp.to_string(),
             source: "codex".to_string(),
+            usage: transcript_usage_from_value(payload),
             artifacts: Vec::new(),
+            ..Default::default()
         }],
         "patch_apply_end" => {
             let success = payload
@@ -1896,21 +2742,29 @@ fn codex_messages_from_event(
                 .filter(|text| !text.trim().is_empty())
                 .collect::<Vec<_>>()
                 .join("\n");
+            let (text, truncated) =
+                clean_codex_transcript_text_with_truncation(&text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+            let title = if success {
+                "Patch applied"
+            } else {
+                "Patch failed"
+            }
+            .to_string();
+            let file_change = transcript_file_change_from_value(payload, &text);
             vec![CodexThreadTranscriptMessage {
                 id: format!("codex-{line_index}-patch"),
                 role: "activity".to_string(),
                 kind: "patch".to_string(),
-                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-                title: if success {
-                    "Patch applied"
-                } else {
-                    "Patch failed"
-                }
-                .to_string(),
+                text,
+                title,
                 call_id: String::new(),
+                status: if success { "completed" } else { "error" }.to_string(),
                 created_at: timestamp.to_string(),
                 source: "codex".to_string(),
+                file_change,
+                truncated,
                 artifacts: Vec::new(),
+                ..Default::default()
             }]
         }
         "context_compacted" => vec![CodexThreadTranscriptMessage {
@@ -1923,6 +2777,7 @@ fn codex_messages_from_event(
             created_at: timestamp.to_string(),
             source: "codex".to_string(),
             artifacts: Vec::new(),
+            ..Default::default()
         }],
         "mcp_tool_call_end" => {
             let invocation = payload.get("invocation").unwrap_or(&Value::Null);
@@ -1965,18 +2820,65 @@ fn codex_messages_from_event(
                     &artifacts,
                 )
             };
+            let (text, text_truncated) =
+                clean_codex_transcript_text_with_truncation(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+            let (tool_output, output_truncated) = transcript_tool_io_value(
+                Some(artifact_value),
+                &text,
+                CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+            );
+            let call_id = value_string(invocation.get("call_id"));
             vec![CodexThreadTranscriptMessage {
                 id: format!("codex-{line_index}-mcp"),
                 role: "activity".to_string(),
                 kind,
-                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-                title,
-                call_id: value_string(invocation.get("call_id")),
+                text,
+                title: title.clone(),
+                call_id: call_id.clone(),
+                status: if has_error { "error" } else { "completed" }.to_string(),
                 created_at: timestamp.to_string(),
                 source: "codex".to_string(),
+                tool: Some(transcript_tool_object(
+                    if server.is_empty() {
+                        tool.clone()
+                    } else if tool.is_empty() {
+                        server.clone()
+                    } else {
+                        format!("{server}/{tool}")
+                    },
+                    &call_id,
+                    if has_error { "failed" } else { "completed" },
+                    None,
+                    tool_output.clone(),
+                    &title,
+                )),
+                tool_output: (!has_error).then(|| tool_output.clone()).flatten(),
+                tool_error: has_error.then(|| tool_output.clone()).flatten(),
+                usage: transcript_usage_from_value(payload),
+                truncated: text_truncated || output_truncated,
                 artifacts,
+                ..Default::default()
             }]
         }
+        "ss" | "se" | "subagent_start" | "subagent_end" => transcript_subagent_from_value(
+            payload,
+            if event_type == "se" || event_type == "subagent_end" {
+                "Subagent finished"
+            } else {
+                "Subagent started"
+            },
+        )
+        .map(|subagent| {
+            transcript_subagent_message(
+                format!("codex-{line_index}-subagent"),
+                "codex",
+                timestamp,
+                subagent,
+                "Subagent",
+            )
+        })
+        .into_iter()
+        .collect(),
         _ => Vec::new(),
     }
 }
@@ -1998,7 +2900,8 @@ fn codex_messages_from_response_item(
                 .unwrap_or_default();
             let content = payload.get("content").unwrap_or(&Value::Null);
             let raw_text = codex_content_text(content);
-            let text = clean_codex_transcript_text(&raw_text, CODEX_TRANSCRIPT_MAX_TEXT);
+            let (text, truncated) =
+                clean_codex_transcript_text_with_truncation(&raw_text, CODEX_TRANSCRIPT_MAX_TEXT);
             let artifacts =
                 codex_image_artifacts_from_content(content, &raw_text, "Generated image");
             if role == "developer" {
@@ -2015,7 +2918,17 @@ fn codex_messages_from_response_item(
                     call_id: String::new(),
                     created_at: timestamp.to_string(),
                     source: "codex".to_string(),
+                    tool: Some(transcript_tool_object(
+                        "image_generation",
+                        "",
+                        "completed",
+                        None,
+                        None,
+                        "Generated image",
+                    )),
+                    truncated,
                     artifacts,
+                    ..Default::default()
                 }];
             }
             if role == "user" {
@@ -2031,7 +2944,10 @@ fn codex_messages_from_response_item(
                     call_id: String::new(),
                     created_at: timestamp.to_string(),
                     source: "codex".to_string(),
+                    usage: transcript_usage_from_value(payload),
+                    truncated,
                     artifacts,
+                    ..Default::default()
                 }];
             }
             if role != "assistant" {
@@ -2050,7 +2966,10 @@ fn codex_messages_from_response_item(
                 call_id: String::new(),
                 created_at: timestamp.to_string(),
                 source: "codex".to_string(),
+                usage: transcript_usage_from_value(payload),
+                truncated,
                 artifacts,
+                ..Default::default()
             }]
         }
         "function_call" | "custom_tool_call" | "custom_tool" => {
@@ -2063,58 +2982,127 @@ fn codex_messages_from_response_item(
                 .into_iter()
                 .collect()
         }
-        "tool_search_call" | "tool_search" => vec![CodexThreadTranscriptMessage {
-            id: format!("codex-{line_index}-tool-search-call"),
-            role: "activity".to_string(),
-            kind: "tool_call".to_string(),
-            text: clean_codex_transcript_text(pretty_json(payload), CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-            title: "Searched tools".to_string(),
-            call_id: first_value_string(&[payload.get("call_id"), payload.get("callId"), payload.get("id")]),
-            created_at: timestamp.to_string(),
-            source: "codex".to_string(),
-            artifacts: Vec::new(),
-        }],
-        "tool_search_output" => vec![CodexThreadTranscriptMessage {
-            id: format!("codex-{line_index}-tool-search-output"),
-            role: "activity".to_string(),
-            kind: "tool_output".to_string(),
-            text: clean_codex_transcript_text(
-                {
-                    let output = payload
-                        .get("output")
-                        .or_else(|| payload.get("result"))
-                        .or_else(|| payload.get("results"))
-                        .unwrap_or(payload);
-                    let text = codex_content_text(output);
-                    if text.trim().is_empty() {
-                        pretty_json(output)
-                    } else {
-                        text
-                    }
-                },
+        "tool_search_call" | "tool_search" => {
+            let raw_text = pretty_json(payload);
+            let (text, truncated) = clean_codex_transcript_text_with_truncation(
+                raw_text,
                 CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
-            ),
-            title: "Tool search results".to_string(),
-            call_id: first_value_string(&[payload.get("call_id"), payload.get("callId"), payload.get("id")]),
-            created_at: timestamp.to_string(),
-            source: "codex".to_string(),
-            artifacts: Vec::new(),
-        }],
-        "web_search_call" => vec![CodexThreadTranscriptMessage {
-            id: format!("codex-{line_index}-web-search"),
-            role: "activity".to_string(),
-            kind: "web".to_string(),
-            text: clean_codex_transcript_text(pretty_json(payload), CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-            title: "Searched web".to_string(),
-            call_id: value_string(payload.get("id")),
-            created_at: timestamp.to_string(),
-            source: "codex".to_string(),
-            artifacts: Vec::new(),
-        }],
+            );
+            let call_id = first_value_string(&[
+                payload.get("call_id"),
+                payload.get("callId"),
+                payload.get("id"),
+            ]);
+            vec![CodexThreadTranscriptMessage {
+                id: format!("codex-{line_index}-tool-search-call"),
+                role: "activity".to_string(),
+                kind: "tool_call".to_string(),
+                text,
+                title: "Searched tools".to_string(),
+                call_id: call_id.clone(),
+                status: "running".to_string(),
+                created_at: timestamp.to_string(),
+                source: "codex".to_string(),
+                tool: Some(transcript_tool_object(
+                    "tool_search",
+                    call_id,
+                    "running",
+                    Some(payload.clone()),
+                    None,
+                    "Searched tools",
+                )),
+                usage: transcript_usage_from_value(payload),
+                truncated,
+                artifacts: Vec::new(),
+                ..Default::default()
+            }]
+        }
+        "tool_search_output" => {
+            let output = payload
+                .get("output")
+                .or_else(|| payload.get("result"))
+                .or_else(|| payload.get("results"))
+                .unwrap_or(payload);
+            let output_text = {
+                let text = codex_content_text(output);
+                if text.trim().is_empty() {
+                    pretty_json(output)
+                } else {
+                    text
+                }
+            };
+            let (text, text_truncated) = clean_codex_transcript_text_with_truncation(
+                output_text,
+                CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+            );
+            let (tool_output, output_truncated) =
+                transcript_tool_io_value(Some(output), &text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+            let call_id = first_value_string(&[
+                payload.get("call_id"),
+                payload.get("callId"),
+                payload.get("id"),
+            ]);
+            vec![CodexThreadTranscriptMessage {
+                id: format!("codex-{line_index}-tool-search-output"),
+                role: "activity".to_string(),
+                kind: "tool_output".to_string(),
+                text,
+                title: "Tool search results".to_string(),
+                call_id: call_id.clone(),
+                status: "completed".to_string(),
+                created_at: timestamp.to_string(),
+                source: "codex".to_string(),
+                tool: Some(transcript_tool_object(
+                    "tool_search",
+                    &call_id,
+                    "completed",
+                    None,
+                    tool_output.clone(),
+                    "Tool search results",
+                )),
+                tool_output,
+                usage: transcript_usage_from_value(payload),
+                truncated: text_truncated || output_truncated,
+                artifacts: Vec::new(),
+                ..Default::default()
+            }]
+        }
+        "web_search_call" => {
+            let raw_text = pretty_json(payload);
+            let (text, truncated) = clean_codex_transcript_text_with_truncation(
+                raw_text,
+                CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+            );
+            let call_id = value_string(payload.get("id"));
+            vec![CodexThreadTranscriptMessage {
+                id: format!("codex-{line_index}-web-search"),
+                role: "activity".to_string(),
+                kind: "web".to_string(),
+                legacy_kind: "web".to_string(),
+                text,
+                title: "Searched web".to_string(),
+                call_id: call_id.clone(),
+                status: "running".to_string(),
+                created_at: timestamp.to_string(),
+                source: "codex".to_string(),
+                tool: Some(transcript_tool_object(
+                    "web_search",
+                    call_id,
+                    "running",
+                    Some(payload.clone()),
+                    None,
+                    "Searched web",
+                )),
+                usage: transcript_usage_from_value(payload),
+                truncated,
+                artifacts: Vec::new(),
+                ..Default::default()
+            }]
+        }
         "reasoning" => {
-            let summary = clean_codex_transcript_text(
+            let (summary, truncated) = clean_codex_transcript_text_with_truncation(
                 codex_summary_text(payload),
-                CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+                CODEX_TRANSCRIPT_MAX_REASONING_TEXT,
             );
             vec![CodexThreadTranscriptMessage {
                 id: format!("codex-{line_index}-reasoning"),
@@ -2129,12 +3117,19 @@ fn codex_messages_from_response_item(
                 call_id: String::new(),
                 created_at: timestamp.to_string(),
                 source: "codex".to_string(),
+                usage: transcript_usage_from_value(payload),
+                truncated,
                 artifacts: Vec::new(),
+                ..Default::default()
             }]
         }
         _ => Vec::new(),
     }
 }
+
+#[cfg(test)]
+pub(crate) static OPENCODE_DB_TEST_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
+    std::sync::OnceLock::new();
 
 #[cfg(test)]
 mod agent_sessions_tests {
@@ -2150,8 +3145,7 @@ mod agent_sessions_tests {
 
     #[test]
     fn transcript_watch_owner_priority_preserves_webview_context() {
-        let native_owner =
-            agent_thread_transcript_native_watch_owner_key("pane-a", Some(42));
+        let native_owner = agent_thread_transcript_native_watch_owner_key("pane-a", Some(42));
         let webview_owner = agent_thread_transcript_webview_watch_owner_key();
         let mut owners = HashSet::new();
 
@@ -2184,9 +3178,22 @@ mod agent_sessions_tests {
         );
     }
 
-	    fn opencode_step_finish(data: Value) -> Vec<CodexThreadTranscriptMessage> {
-	        opencode_part_message("msg1", "assistant", "part1", "2024-01-01T00:00:00Z", &data)
-	    }
+    #[test]
+    fn transcript_caps_are_phase2_sizes_and_mark_truncation() {
+        assert_eq!(CODEX_TRANSCRIPT_MAX_TEXT, 65_536);
+        assert_eq!(CODEX_TRANSCRIPT_MAX_TOOL_TEXT, 65_536);
+        assert_eq!(CODEX_TRANSCRIPT_MAX_REASONING_TEXT, 65_536);
+        let (text, truncated) = clean_codex_transcript_text_with_truncation(
+            "x".repeat(CODEX_TRANSCRIPT_MAX_TEXT + 1),
+            CODEX_TRANSCRIPT_MAX_TEXT,
+        );
+        assert!(truncated);
+        assert!(text.ends_with("[truncated]"));
+    }
+
+    fn opencode_step_finish(data: Value) -> Vec<CodexThreadTranscriptMessage> {
+        opencode_part_message("msg1", "assistant", "part1", "2024-01-01T00:00:00Z", &data)
+    }
 
     #[test]
     fn codex_response_item_handles_v142_tool_search_and_user_shapes() {
@@ -2203,6 +3210,10 @@ mod agent_sessions_tests {
         assert_eq!(custom_tool.len(), 1);
         assert_eq!(custom_tool[0].kind, "tool_call");
         assert!(custom_tool[0].text.contains("workspace tools"));
+        assert_eq!(
+            custom_tool[0].tool.as_ref().unwrap()["input"],
+            json!({"query": "workspace tools"})
+        );
 
         let tool_search = codex_messages_from_response_item(
             2,
@@ -2229,6 +3240,14 @@ mod agent_sessions_tests {
         assert_eq!(tool_search_output.len(), 1);
         assert_eq!(tool_search_output[0].kind, "tool_output");
         assert!(tool_search_output[0].text.contains("browser.open"));
+        assert_eq!(
+            tool_search_output[0].tool.as_ref().unwrap()["status"],
+            json!("completed")
+        );
+        assert_eq!(
+            tool_search_output[0].tool.as_ref().unwrap()["output"],
+            json!([{"name": "browser.open"}])
+        );
 
         let reasoning = codex_messages_from_response_item(
             4,
@@ -2255,12 +3274,11 @@ mod agent_sessions_tests {
         assert!(user_message[0].text.contains("queued prompt"));
     }
 
-	    #[test]
-	    fn opencode_step_finish_classifies_on_structured_fields_only() {
+    #[test]
+    fn opencode_step_finish_classifies_on_structured_fields_only() {
         // Normal finish reasons are control metadata, not visible messages.
         for reason in ["stop", "tool-calls", "length"] {
-            let messages =
-                opencode_step_finish(json!({"type": "step-finish", "reason": reason}));
+            let messages = opencode_step_finish(json!({"type": "step-finish", "reason": reason}));
             assert!(
                 messages.is_empty(),
                 "reason {reason} should not render a transcript message"
@@ -2330,7 +3348,10 @@ mod agent_sessions_tests {
             Some("glm-5.2".to_string())
         );
         // No model → None.
-        assert_eq!(opencode_model_from_value(&json!({"providerID": "opencode-go"})), None);
+        assert_eq!(
+            opencode_model_from_value(&json!({"providerID": "opencode-go"})),
+            None
+        );
         assert_eq!(opencode_model_from_value(&json!({})), None);
     }
 
@@ -2397,8 +3418,6 @@ mod agent_sessions_tests {
         assert_eq!(result.messages[1].text, "I found the synced transcript.");
     }
 
-    static OPENCODE_DB_TEST_LOCK: std::sync::OnceLock<StdMutex<()>> = std::sync::OnceLock::new();
-
     #[test]
     fn opencode_session_last_model_prefers_latest_assistant_then_session_column() {
         let _guard = OPENCODE_DB_TEST_LOCK
@@ -2422,10 +3441,7 @@ mod agent_sessions_tests {
             connection
                 .execute(
                     "INSERT INTO session (id, model) VALUES (?1, ?2)",
-                    rusqlite::params![
-                        "ses_1",
-                        r#"{"id":"glm-5.1","providerID":"opencode-go"}"#
-                    ],
+                    rusqlite::params!["ses_1", r#"{"id":"glm-5.1","providerID":"opencode-go"}"#],
                 )
                 .unwrap();
             connection
@@ -2450,10 +3466,7 @@ mod agent_sessions_tests {
             connection
                 .execute(
                     "INSERT INTO session (id, model) VALUES (?1, ?2)",
-                    rusqlite::params![
-                        "ses_2",
-                        r#"{"id":"glm-5.2","providerID":"opencode-go"}"#
-                    ],
+                    rusqlite::params!["ses_2", r#"{"id":"glm-5.2","providerID":"opencode-go"}"#],
                 )
                 .unwrap();
         }
@@ -2722,6 +3735,193 @@ mod agent_sessions_tests {
 
         let _ = fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn codex_rollout_enriches_output_tool_identity_and_exit_code() {
+        let root = unique_test_dir("codex-output-tool-metadata");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-test.jsonl");
+        let lines = [
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "payload": {"id": "codex-session", "cwd": "/tmp/project"}
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell_command",
+                    "call_id": "call-shell",
+                    "arguments": {"command": "cargo test", "workdir": "/tmp/project"}
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:02Z",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call-shell",
+                    "output": {"stdout": "compile failed", "exit_code": 1}
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, format!("{lines}\n")).unwrap();
+
+        let (_, messages) = parse_codex_rollout(&path, 20).unwrap();
+        let output = messages
+            .iter()
+            .find(|message| message.id.ends_with("tool-output"))
+            .expect("tool output");
+
+        assert_eq!(output.status, "error");
+        assert_eq!(output.exit_code, Some(1));
+        assert_eq!(
+            output.tool.as_ref().unwrap()["name"],
+            json!("shell_command")
+        );
+        assert_eq!(
+            output.tool.as_ref().unwrap()["title"],
+            json!("Ran cargo test")
+        );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_parser_maps_edit_tool_and_avoids_bare_uuid_subagent() {
+        let root = unique_test_dir("claude-edit-tool-file-change");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("claude-session.jsonl");
+        let lines = [
+            json!({
+                "type": "user",
+                "uuid": "message-uuid",
+                "sessionId": "claude-session",
+                "cwd": "/tmp/project",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "message": {"role": "user", "content": "please edit"}
+            }),
+            json!({
+                "type": "assistant",
+                "sessionId": "claude-session",
+                "cwd": "/tmp/project",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{
+                        "type": "tool_use",
+                        "id": "toolu-edit",
+                        "name": "Edit",
+                        "input": {
+                            "file_path": "src/main.rs",
+                            "old_string": "old one\nold two",
+                            "new_string": "new one"
+                        }
+                    }]
+                }
+            }),
+            json!({
+                "type": "user",
+                "sessionId": "claude-session",
+                "cwd": "/tmp/project",
+                "timestamp": "2026-07-02T00:00:02Z",
+                "message": {
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": "toolu-edit",
+                        "content": "Updated src/main.rs"
+                    }]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, format!("{lines}\n")).unwrap();
+
+        let (_, messages) = parse_claude_session(&path, 20).unwrap();
+        let user = messages
+            .iter()
+            .find(|message| message.id.ends_with("-user") && message.text == "please edit")
+            .expect("user message");
+        assert!(user.subagent.is_none());
+
+        let call = messages
+            .iter()
+            .find(|message| message.id.ends_with("tool-call"))
+            .expect("tool call");
+        let file_change = call.file_change.as_ref().expect("file change");
+        assert_eq!(file_change["files"][0]["path"], json!("src/main.rs"));
+        assert_eq!(file_change["files"][0]["kind"], json!("edit"));
+        assert_eq!(file_change["files"][0]["additions"], json!(1));
+        assert_eq!(file_change["files"][0]["deletions"], json!(2));
+
+        let output = messages
+            .iter()
+            .find(|message| message.id.ends_with("tool-output"))
+            .expect("tool output");
+        assert_eq!(output.tool.as_ref().unwrap()["name"], json!("Edit"));
+        assert_eq!(output.tool.as_ref().unwrap()["title"], json!("Called Edit"));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn opencode_tool_output_uses_native_part_duration() {
+        let messages = opencode_part_message(
+            "msg1",
+            "assistant",
+            "part1",
+            "1000",
+            &json!({
+                "type": "tool",
+                "tool": "bash",
+                "callID": "call-1",
+                "input": {"command": "cargo test"},
+                "output": "ok",
+                "time": {"start": 1000, "end": 2250}
+            }),
+        );
+        let output = messages
+            .iter()
+            .find(|message| message.id.ends_with("tool-output"))
+            .expect("tool output");
+        assert_eq!(output.duration_ms, Some(1250));
+    }
+
+    #[test]
+    fn direct_transcript_event_aliases_subagent_to_legacy_tool_call_kind() {
+        let result = CodexThreadTranscriptResult {
+            session_id: "session-a".to_string(),
+            session_title: "Session A".to_string(),
+            rollout_path: "/tmp/session-a.jsonl".to_string(),
+            cwd: "/tmp/project".to_string(),
+            matched_by: "sessionId".to_string(),
+            latest_timestamp: "2026-07-02T00:00:00Z".to_string(),
+            messages: vec![transcript_subagent_message(
+                "subagent-message".to_string(),
+                "claude",
+                "2026-07-02T00:00:00Z",
+                json!({"title": "Review worker", "subagent_id": "worker-a"}),
+                "Subagent",
+            )],
+        };
+
+        let value = agent_thread_transcript_direct_result_value(&result);
+        let message = &value["messages"][0];
+        assert_eq!(message["kind"], json!("tool_call"));
+        assert_eq!(message["canonicalKind"], json!("subagent"));
+        assert_eq!(message["canonical_kind"], json!("subagent"));
+        assert_eq!(message["subagent"]["title"], json!("Review worker"));
+    }
 }
 
 fn parse_codex_rollout(
@@ -2739,6 +3939,7 @@ fn parse_codex_rollout(
     };
     let mut messages = Vec::new();
     let mut seen = HashSet::new();
+    let mut tool_metadata = HashMap::<String, TranscriptToolCallMetadata>::new();
 
     for (line_index, line) in std::io::BufRead::lines(reader).enumerate() {
         let Ok(line) = line else {
@@ -2767,12 +3968,22 @@ fn parse_codex_rollout(
                     meta.title = clean_codex_title(value_string(payload.get("thread_name")), "");
                 }
                 for message in codex_messages_from_event(line_index, &timestamp, payload) {
-                    push_codex_message(&mut messages, &mut seen, Some(message));
+                    push_codex_message_with_tool_metadata(
+                        &mut messages,
+                        &mut seen,
+                        Some(message),
+                        &mut tool_metadata,
+                    );
                 }
             }
             "response_item" => {
                 for message in codex_messages_from_response_item(line_index, &timestamp, payload) {
-                    push_codex_message(&mut messages, &mut seen, Some(message));
+                    push_codex_message_with_tool_metadata(
+                        &mut messages,
+                        &mut seen,
+                        Some(message),
+                        &mut tool_metadata,
+                    );
                 }
             }
             _ => {}
@@ -2882,8 +4093,9 @@ fn resolve_codex_resume_session(
     if meta.session_id.trim().is_empty() {
         return Err("Codex rollout transcript has no resumable session id.".to_string());
     }
-    let home = codex_home_from_rollout_path(&path)
-        .ok_or_else(|| "Codex rollout transcript is not inside a sessions directory.".to_string())?;
+    let home = codex_home_from_rollout_path(&path).ok_or_else(|| {
+        "Codex rollout transcript is not inside a sessions directory.".to_string()
+    })?;
     Ok((meta.session_id, home))
 }
 
@@ -3153,20 +4365,53 @@ fn claude_activity_from_block(
             let name = value_string(block.get("name"));
             let call_id = value_string(block.get("id"));
             let input_value = block.get("input").unwrap_or(&Value::Null);
+            let subagent = if name.trim().eq_ignore_ascii_case("task")
+                || name.trim().eq_ignore_ascii_case("subagent")
+            {
+                transcript_subagent_from_value(input_value, "Subagent")
+            } else {
+                None
+            };
+            if let Some(subagent) = subagent {
+                return Some(transcript_subagent_message(
+                    format!("claude-{line_index}-{block_index}-subagent"),
+                    "claude",
+                    timestamp,
+                    subagent,
+                    "Subagent",
+                ));
+            }
             let input = block
                 .get("input")
                 .map(pretty_json)
                 .unwrap_or_else(|| "{}".to_string());
+            let (text, truncated) =
+                clean_codex_transcript_text_with_truncation(input, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+            let title = clean_codex_title(claude_tool_title(&name, input_value), "Called tool");
+            let file_change = transcript_file_change_from_claude_tool_input(&name, input_value);
             Some(CodexThreadTranscriptMessage {
                 id: format!("claude-{line_index}-{block_index}-tool-call"),
                 role: "activity".to_string(),
                 kind: "tool_call".to_string(),
-                text: clean_codex_transcript_text(input, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-                title: clean_codex_title(claude_tool_title(&name, input_value), "Called tool"),
-                call_id,
+                text,
+                title: title.clone(),
+                call_id: call_id.clone(),
+                status: "running".to_string(),
                 created_at: timestamp.to_string(),
                 source: "claude".to_string(),
+                tool: Some(transcript_tool_object(
+                    name.clone(),
+                    call_id,
+                    "running",
+                    block.get("input").cloned(),
+                    None,
+                    title,
+                )),
+                file_change,
+                usage: transcript_usage_from_value(block),
+                truncated,
                 artifacts: Vec::new(),
+                ..Default::default()
             })
         }
         "tool_result" => {
@@ -3175,7 +4420,15 @@ fn claude_activity_from_block(
                 .get("content")
                 .map(claude_content_text)
                 .unwrap_or_default();
-            let text = clean_codex_transcript_text(&content, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
+            let (text, text_truncated) = clean_codex_transcript_text_with_truncation(
+                &content,
+                CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+            );
+            let (tool_output, output_truncated) = transcript_tool_io_value(
+                block.get("content"),
+                &content,
+                CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+            );
             let artifacts = codex_image_artifacts_from_content(block, &content, "Tool output");
             let has_error = transcript_tool_value_has_error(block);
             let kind = if has_error {
@@ -3193,11 +4446,25 @@ fn claude_activity_from_block(
                 role: "activity".to_string(),
                 kind,
                 text,
-                title,
-                call_id,
+                title: title.clone(),
+                call_id: call_id.clone(),
+                status: if has_error { "error" } else { "completed" }.to_string(),
                 created_at: timestamp.to_string(),
                 source: "claude".to_string(),
+                tool: Some(transcript_tool_object(
+                    "",
+                    &call_id,
+                    if has_error { "failed" } else { "completed" },
+                    None,
+                    tool_output.clone(),
+                    &title,
+                )),
+                tool_output: (!has_error).then(|| tool_output.clone()).flatten(),
+                tool_error: has_error.then(|| tool_output.clone()).flatten(),
+                usage: transcript_usage_from_value(block),
+                truncated: text_truncated || output_truncated,
                 artifacts,
+                ..Default::default()
             })
         }
         "thinking" => {
@@ -3205,16 +4472,23 @@ fn claude_activity_from_block(
             if thinking.is_empty() {
                 None
             } else {
+                let (text, truncated) = clean_codex_transcript_text_with_truncation(
+                    thinking,
+                    CODEX_TRANSCRIPT_MAX_REASONING_TEXT,
+                );
                 Some(CodexThreadTranscriptMessage {
                     id: format!("claude-{line_index}-{block_index}-reasoning"),
                     role: "activity".to_string(),
                     kind: "reasoning".to_string(),
-                    text: clean_codex_transcript_text(thinking, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                    text,
                     title: "Reasoning".to_string(),
                     call_id: String::new(),
                     created_at: timestamp.to_string(),
                     source: "claude".to_string(),
+                    usage: transcript_usage_from_value(block),
+                    truncated,
                     artifacts: Vec::new(),
+                    ..Default::default()
                 })
             }
         }
@@ -3245,6 +4519,7 @@ fn parse_claude_session(
     };
     let mut messages = Vec::new();
     let mut seen = HashSet::new();
+    let mut tool_metadata = HashMap::<String, TranscriptToolCallMetadata>::new();
 
     for (line_index, line) in std::io::BufRead::lines(reader).enumerate() {
         let Ok(line) = line else {
@@ -3292,7 +4567,7 @@ fn parse_claude_session(
                 value.get("error"),
             ]);
             if is_error {
-                push_codex_message(
+                push_codex_message_with_tool_metadata(
                     &mut messages,
                     &mut seen,
                     Some(transcript_error_message(
@@ -3305,17 +4580,20 @@ fn parse_claude_session(
                             result_text.as_str()
                         },
                     )),
+                    &mut tool_metadata,
                 );
             } else {
-                let assistant_text =
-                    clean_codex_transcript_text(&result_text, CODEX_TRANSCRIPT_MAX_TEXT);
+                let (assistant_text, assistant_truncated) =
+                    clean_codex_transcript_text_with_truncation(
+                        &result_text,
+                        CODEX_TRANSCRIPT_MAX_TEXT,
+                    );
                 let already_has_assistant_text = !assistant_text.is_empty()
-                    && messages
-                        .iter()
-                        .rev()
-                        .any(|message| message.role == "assistant" && message.text == assistant_text);
+                    && messages.iter().rev().any(|message| {
+                        message.role == "assistant" && message.text == assistant_text
+                    });
                 if !assistant_text.is_empty() && !already_has_assistant_text {
-                    push_codex_message(
+                    push_codex_message_with_tool_metadata(
                         &mut messages,
                         &mut seen,
                         Some(CodexThreadTranscriptMessage {
@@ -3327,11 +4605,15 @@ fn parse_claude_session(
                             call_id: String::new(),
                             created_at: timestamp.clone(),
                             source: "claude".to_string(),
+                            usage: transcript_usage_from_value(&value),
+                            truncated: assistant_truncated,
                             artifacts: Vec::new(),
+                            ..Default::default()
                         }),
+                        &mut tool_metadata,
                     );
                 }
-                push_codex_message(
+                push_codex_message_with_tool_metadata(
                     &mut messages,
                     &mut seen,
                     Some(transcript_task_complete_message(
@@ -3340,6 +4622,7 @@ fn parse_claude_session(
                         &timestamp,
                         result_text,
                     )),
+                    &mut tool_metadata,
                 );
             }
             continue;
@@ -3360,12 +4643,12 @@ fn parse_claude_session(
             } else {
                 "user"
             };
-            let text = clean_codex_transcript_text(
+            let (text, truncated) = clean_codex_transcript_text_with_truncation(
                 claude_content_text(content),
                 CODEX_TRANSCRIPT_MAX_TEXT,
             );
             if !text.is_empty() {
-                push_codex_message(
+                push_codex_message_with_tool_metadata(
                     &mut messages,
                     &mut seen,
                     Some(CodexThreadTranscriptMessage {
@@ -3377,17 +4660,23 @@ fn parse_claude_session(
                         call_id: String::new(),
                         created_at: timestamp.clone(),
                         source: "claude".to_string(),
+                        subagent: transcript_sidechain_subagent_from_value(&value, "Sidechain"),
+                        usage: transcript_usage_from_value(&value),
+                        truncated,
                         artifacts: Vec::new(),
+                        ..Default::default()
                     }),
+                    &mut tool_metadata,
                 );
             }
 
             if let Some(blocks) = content.as_array() {
                 for (block_index, block) in blocks.iter().enumerate() {
-                    push_codex_message(
+                    push_codex_message_with_tool_metadata(
                         &mut messages,
                         &mut seen,
                         claude_activity_from_block(line_index, block_index, &timestamp, block),
+                        &mut tool_metadata,
                     );
                 }
             }
@@ -3399,7 +4688,7 @@ fn parse_claude_session(
                         .or_else(|| value.get("stop_reason")),
                 ))
             {
-                push_codex_message(
+                push_codex_message_with_tool_metadata(
                     &mut messages,
                     &mut seen,
                     Some(transcript_task_complete_message(
@@ -3408,6 +4697,7 @@ fn parse_claude_session(
                         &timestamp,
                         text,
                     )),
+                    &mut tool_metadata,
                 );
             }
         }
@@ -3508,6 +4798,17 @@ fn opencode_part_created_at(timestamp: &str, data: &Value, end_time: bool) -> St
     }
 }
 
+fn opencode_part_duration_ms(data: &Value) -> Option<u64> {
+    let time = data.get("time").unwrap_or(&Value::Null);
+    let state_time = data
+        .get("state")
+        .and_then(|state| state.get("time"))
+        .unwrap_or(&Value::Null);
+    let start = first_value_i64(&[time.get("start"), state_time.get("start")])?;
+    let end = first_value_i64(&[time.get("end"), state_time.get("end")])?;
+    (end >= start).then_some((end - start) as u64)
+}
+
 fn opencode_part_message(
     message_id: &str,
     role: &str,
@@ -3527,16 +4828,21 @@ fn opencode_part_message(
             if text.trim().is_empty() {
                 return Vec::new();
             }
+            let (text, truncated) =
+                clean_codex_transcript_text_with_truncation(text, CODEX_TRANSCRIPT_MAX_TEXT);
             vec![CodexThreadTranscriptMessage {
                 id: format!("opencode-{message_id}-{part_id}-text"),
                 role: message_role.to_string(),
                 kind: "message".to_string(),
-                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TEXT),
+                text,
                 title: String::new(),
                 call_id: String::new(),
                 created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
+                usage: transcript_usage_from_value(data),
+                truncated,
                 artifacts: Vec::new(),
+                ..Default::default()
             }]
         }
         "reasoning" => {
@@ -3544,16 +4850,21 @@ fn opencode_part_message(
             if text.trim().is_empty() {
                 return Vec::new();
             }
+            let text = clean_codex_reasoning_text(text);
+            let truncated = text.ends_with("[truncated]");
             vec![CodexThreadTranscriptMessage {
                 id: format!("opencode-{message_id}-{part_id}-reasoning"),
                 role: "activity".to_string(),
                 kind: "reasoning".to_string(),
-                text: clean_codex_reasoning_text(text),
+                text,
                 title: "Reasoning".to_string(),
                 call_id: String::new(),
                 created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
+                usage: transcript_usage_from_value(data),
+                truncated,
                 artifacts: Vec::new(),
+                ..Default::default()
             }]
         }
         "tool" => {
@@ -3573,22 +4884,40 @@ fn opencode_part_message(
                     .or_else(|| state.get("result")),
             );
             let error = opencode_json_text(data.get("error").or_else(|| state.get("error")));
+            let duration_ms = opencode_part_duration_ms(data);
             let mut messages = Vec::new();
             let call_text = if input.trim().is_empty() {
                 pretty_json(data)
             } else {
                 input
             };
+            let (call_text, call_truncated) = clean_codex_transcript_text_with_truncation(
+                call_text,
+                CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+            );
+            let title = clean_codex_title(opencode_tool_title(&tool, input_value), "Called tool");
             messages.push(CodexThreadTranscriptMessage {
                 id: format!("opencode-{message_id}-{part_id}-tool-call"),
                 role: "activity".to_string(),
                 kind: "tool_call".to_string(),
-                text: clean_codex_transcript_text(call_text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-                title: clean_codex_title(opencode_tool_title(&tool, input_value), "Called tool"),
+                text: call_text,
+                title: title.clone(),
                 call_id: call_id.clone(),
+                status: "running".to_string(),
                 created_at: opencode_part_created_at(timestamp, data, false),
                 source: "opencode".to_string(),
+                tool: Some(transcript_tool_object(
+                    &tool,
+                    &call_id,
+                    "running",
+                    data.get("input").or_else(|| state.get("input")).cloned(),
+                    None,
+                    &title,
+                )),
+                usage: transcript_usage_from_value(data),
+                truncated: call_truncated,
                 artifacts: Vec::new(),
+                ..Default::default()
             });
             let has_error = !error.trim().is_empty()
                 || transcript_tool_value_has_error(data)
@@ -3599,6 +4928,23 @@ fn opencode_part_message(
                 output
             };
             if !output_text.trim().is_empty() {
+                let (text, text_truncated) = clean_codex_transcript_text_with_truncation(
+                    &output_text,
+                    CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+                );
+                let output_value = if has_error {
+                    data.get("error").or_else(|| state.get("error"))
+                } else {
+                    data.get("output")
+                        .or_else(|| data.get("result"))
+                        .or_else(|| state.get("output"))
+                        .or_else(|| state.get("result"))
+                };
+                let (tool_output, output_truncated) = transcript_tool_io_value(
+                    output_value,
+                    &output_text,
+                    CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+                );
                 let artifacts =
                     codex_image_artifacts_from_content(data, &output_text, "Tool output");
                 let kind = if has_error {
@@ -3615,40 +4961,74 @@ fn opencode_part_message(
                     id: format!("opencode-{message_id}-{part_id}-tool-output"),
                     role: "activity".to_string(),
                     kind,
-                    text: clean_codex_transcript_text(output_text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-                    title,
-                    call_id,
+                    text,
+                    title: title.clone(),
+                    call_id: call_id.clone(),
+                    status: if has_error { "error" } else { "completed" }.to_string(),
                     created_at: opencode_part_created_at(timestamp, data, true),
                     source: "opencode".to_string(),
+                    tool: Some(transcript_tool_object(
+                        &tool,
+                        &call_id,
+                        if has_error { "failed" } else { "completed" },
+                        None,
+                        tool_output.clone(),
+                        &title,
+                    )),
+                    tool_output: (!has_error).then(|| tool_output.clone()).flatten(),
+                    tool_error: has_error.then(|| tool_output.clone()).flatten(),
+                    duration_ms,
+                    usage: transcript_usage_from_value(data),
+                    truncated: text_truncated || output_truncated,
                     artifacts,
+                    ..Default::default()
                 });
             }
             messages
         }
-        "patch" => vec![CodexThreadTranscriptMessage {
-            id: format!("opencode-{message_id}-{part_id}-patch"),
-            role: "activity".to_string(),
-            kind: "patch".to_string(),
-            text: clean_codex_transcript_text(pretty_json(data), CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
-            title: "Patch".to_string(),
-            call_id: String::new(),
-            created_at: timestamp.to_string(),
-            source: "opencode".to_string(),
-            artifacts: Vec::new(),
-        }],
+        "patch" => {
+            let raw_text = pretty_json(data);
+            let (text, truncated) = clean_codex_transcript_text_with_truncation(
+                &raw_text,
+                CODEX_TRANSCRIPT_MAX_TOOL_TEXT,
+            );
+            vec![CodexThreadTranscriptMessage {
+                id: format!("opencode-{message_id}-{part_id}-patch"),
+                role: "activity".to_string(),
+                kind: "patch".to_string(),
+                text: text.clone(),
+                title: "Patch".to_string(),
+                call_id: String::new(),
+                status: "completed".to_string(),
+                created_at: timestamp.to_string(),
+                source: "opencode".to_string(),
+                file_change: transcript_file_change_from_value(data, &raw_text),
+                usage: transcript_usage_from_value(data),
+                truncated,
+                artifacts: Vec::new(),
+                ..Default::default()
+            }]
+        }
         "file" => {
             let text = pretty_json(data);
             let artifacts = codex_image_artifacts_from_content(data, &text, "File");
+            let (text, truncated) =
+                clean_codex_transcript_text_with_truncation(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
             vec![CodexThreadTranscriptMessage {
                 id: format!("opencode-{message_id}-{part_id}-file"),
                 role: "activity".to_string(),
                 kind: "file".to_string(),
-                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                text: text.clone(),
                 title: "File".to_string(),
                 call_id: String::new(),
+                status: "completed".to_string(),
                 created_at: timestamp.to_string(),
                 source: "opencode".to_string(),
+                file_change: transcript_file_change_from_value(data, &text),
+                usage: transcript_usage_from_value(data),
+                truncated,
                 artifacts,
+                ..Default::default()
             }]
         }
         "step-start" => {
@@ -3658,16 +5038,20 @@ fn opencode_part_message(
             } else {
                 text
             };
+            let (text, truncated) =
+                clean_codex_transcript_text_with_truncation(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT);
             vec![CodexThreadTranscriptMessage {
                 id: format!("opencode-{message_id}-{part_id}-step-start"),
                 role: "activity".to_string(),
                 kind: "task_progress".to_string(),
-                text: clean_codex_transcript_text(text, CODEX_TRANSCRIPT_MAX_TOOL_TEXT),
+                text,
                 title: "Working".to_string(),
                 call_id: String::new(),
                 created_at: timestamp.to_string(),
                 source: "opencode".to_string(),
+                truncated,
                 artifacts: Vec::new(),
+                ..Default::default()
             }]
         }
         "step-finish" => {
@@ -3691,8 +5075,7 @@ fn opencode_part_message(
                 finish_reason.clone()
             };
             let reason_key = finish_reason.to_lowercase();
-            let reason_is_error =
-                reason_key.contains("error") || reason_key.contains("fail");
+            let reason_is_error = reason_key.contains("error") || reason_key.contains("fail");
             let reason_is_interrupted = reason_key.contains("abort")
                 || reason_key.contains("cancel")
                 || reason_key.contains("interrupt");
@@ -3732,6 +5115,7 @@ fn opencode_part_message(
             created_at: timestamp.to_string(),
             source: "opencode".to_string(),
             artifacts: Vec::new(),
+            ..Default::default()
         }],
         _ => Vec::new(),
     }
@@ -4089,6 +5473,10 @@ fn parse_opencode_session(
             message_data.get("message"),
         ]);
         if !message_text.trim().is_empty() {
+            let (message_text, truncated) = clean_codex_transcript_text_with_truncation(
+                message_text,
+                CODEX_TRANSCRIPT_MAX_TEXT,
+            );
             push_codex_message(
                 &mut messages,
                 &mut seen,
@@ -4096,12 +5484,15 @@ fn parse_opencode_session(
                     id: format!("opencode-{}-message", row.0),
                     role: role.clone(),
                     kind: "message".to_string(),
-                    text: clean_codex_transcript_text(message_text, CODEX_TRANSCRIPT_MAX_TEXT),
+                    text: message_text,
                     title: String::new(),
                     call_id: String::new(),
                     created_at: timestamp.clone(),
                     source: "opencode".to_string(),
+                    usage: transcript_usage_from_value(&message_data),
+                    truncated,
                     artifacts: Vec::new(),
+                    ..Default::default()
                 }),
             );
         }
@@ -4186,6 +5577,10 @@ fn agent_thread_cloud_message_has_content(message: &CodexThreadTranscriptMessage
     !message.text.trim().is_empty()
         || !message.title.trim().is_empty()
         || !message.artifacts.is_empty()
+        || message.tool.is_some()
+        || message.file_change.is_some()
+        || message.subagent.is_some()
+        || message.usage.is_some()
         || message.kind.trim().eq_ignore_ascii_case("task_complete")
 }
 
@@ -4209,7 +5604,10 @@ fn agent_thread_cloud_message_role(value: &Value, fallback_kind: &str) -> String
         .unwrap_or_default()
         .trim()
         .to_ascii_lowercase();
-    if matches!(role.as_str(), "assistant" | "user" | "system" | "tool" | "activity") {
+    if matches!(
+        role.as_str(),
+        "assistant" | "user" | "system" | "tool" | "activity"
+    ) {
         return role;
     }
     let kind = fallback_kind.trim().to_ascii_lowercase();
@@ -4231,9 +5629,7 @@ fn agent_thread_cloud_message_from_value(
     fallback_timestamp: &str,
     fallback_id: String,
 ) -> Option<CodexThreadTranscriptMessage> {
-    if let Ok(mut message) =
-        serde_json::from_value::<CodexThreadTranscriptMessage>(value.clone())
-    {
+    if let Ok(mut message) = serde_json::from_value::<CodexThreadTranscriptMessage>(value.clone()) {
         if message.id.trim().is_empty() {
             message.id = fallback_id.clone();
         }
@@ -4254,10 +5650,9 @@ fn agent_thread_cloud_message_from_value(
         }
     }
 
-    let kind = cloud_mcp_payload_text(value, &["kind", "type"])
-        .unwrap_or_else(|| "message".to_string());
-    let text = cloud_mcp_payload_text(value, &["text", "message", "content"])
-        .unwrap_or_default();
+    let kind =
+        cloud_mcp_payload_text(value, &["kind", "type"]).unwrap_or_else(|| "message".to_string());
+    let text = cloud_mcp_payload_text(value, &["text", "message", "content"]).unwrap_or_default();
     let title = cloud_mcp_payload_text(value, &["title"]).unwrap_or_default();
     let artifacts = agent_thread_cloud_artifacts(value);
     if text.trim().is_empty()
@@ -4283,7 +5678,27 @@ fn agent_thread_cloud_message_from_value(
         )
         .unwrap_or_else(|| fallback_timestamp.to_string()),
         source: cloud_mcp_payload_text(value, &["source"]).unwrap_or_else(|| agent_id.to_string()),
+        tool: value.get("tool").cloned(),
+        tool_output: value
+            .get("tool_output")
+            .or_else(|| value.get("toolOutput"))
+            .cloned(),
+        tool_error: value
+            .get("tool_error")
+            .or_else(|| value.get("toolError"))
+            .cloned(),
+        file_change: value
+            .get("file_change")
+            .or_else(|| value.get("fileChange"))
+            .cloned(),
+        duration_ms: first_value_i64(&[value.get("durationMs"), value.get("duration_ms")])
+            .and_then(|value| (value >= 0).then_some(value as u64)),
+        exit_code: first_value_i64(&[value.get("exitCode"), value.get("exit_code")]),
+        subagent: value.get("subagent").cloned(),
+        usage: value.get("usage").cloned(),
+        truncated: cloud_mcp_payload_bool(value, &["truncated"], false),
         artifacts,
+        ..Default::default()
     })
 }
 
@@ -4425,7 +5840,10 @@ fn read_agent_thread_cloud_transcript(
         ("provider", agent_id.to_string()),
         ("provider_session_id", provider_session_id.to_string()),
     ];
-    if let Some(workspace_id) = workspace_id.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(workspace_id) = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         list_query.push(("workspace_id", workspace_id.to_string()));
     }
     let list_response =
@@ -4437,7 +5855,9 @@ fn read_agent_thread_cloud_transcript(
         .ok_or_else(|| "Cloud session list response did not include sessions.".to_string())?;
     let session = sessions
         .iter()
-        .find(|session| agent_thread_cloud_session_matches_provider_session(session, provider_session_id))
+        .find(|session| {
+            agent_thread_cloud_session_matches_provider_session(session, provider_session_id)
+        })
         .or_else(|| sessions.first())
         .ok_or_else(|| "Cloud did not return a synced session for this provider id.".to_string())?;
     let cloud_session_id = cloud_mcp_payload_text(
@@ -4451,7 +5871,10 @@ fn read_agent_thread_cloud_transcript(
         ("record_limit", "2000".to_string()),
         ("record_direction", "latest".to_string()),
     ];
-    if let Some(workspace_id) = workspace_id.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(workspace_id) = workspace_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         detail_query.push(("workspace_id", workspace_id.to_string()));
     }
     let detail_path = format!("/v1/internal/api/sessions/{cloud_session_id}");
@@ -4465,9 +5888,7 @@ fn read_agent_thread_cloud_transcript(
     )
 }
 
-fn agent_thread_transcript_result_is_cloud_backed(
-    result: &CodexThreadTranscriptResult,
-) -> bool {
+fn agent_thread_transcript_result_is_cloud_backed(result: &CodexThreadTranscriptResult) -> bool {
     result.rollout_path.trim_start().starts_with("cloud://")
 }
 
@@ -4621,6 +6042,38 @@ fn agent_thread_transcript_signature(result: &CodexThreadTranscriptResult) -> St
     )
 }
 
+fn agent_thread_transcript_direct_message_value(message: &CodexThreadTranscriptMessage) -> Value {
+    let mut value = serde_json::to_value(message).unwrap_or_else(|_| json!({}));
+    let legacy_kind = cloud_mcp_payload_text(&value, &["legacyKind", "legacy_kind"])
+        .filter(|value| !value.trim().is_empty());
+    if let Some(legacy_kind) = legacy_kind {
+        let canonical_kind = cloud_mcp_payload_text(&value, &["kind"]).unwrap_or_default();
+        if let Some(object) = value.as_object_mut() {
+            object.insert("canonicalKind".to_string(), json!(canonical_kind.clone()));
+            object.insert("canonical_kind".to_string(), json!(canonical_kind));
+            object.insert("kind".to_string(), json!(legacy_kind));
+        }
+    }
+    value
+}
+
+fn agent_thread_transcript_direct_result_value(result: &CodexThreadTranscriptResult) -> Value {
+    let mut value = serde_json::to_value(result).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "messages".to_string(),
+            Value::Array(
+                result
+                    .messages
+                    .iter()
+                    .map(agent_thread_transcript_direct_message_value)
+                    .collect(),
+            ),
+        );
+    }
+    value
+}
+
 fn agent_thread_transcript_watch_context(
     request: &AgentThreadTranscriptWatchRequest,
 ) -> AgentThreadTranscriptWatchContext {
@@ -4686,7 +6139,10 @@ fn agent_thread_transcript_webview_watch_owner_key() -> String {
     "webview".to_string()
 }
 
-fn agent_thread_transcript_native_watch_owner_key(pane_id: &str, instance_id: Option<u64>) -> String {
+fn agent_thread_transcript_native_watch_owner_key(
+    pane_id: &str,
+    instance_id: Option<u64>,
+) -> String {
     format!(
         "terminal:{}:{}",
         pane_id.trim(),
@@ -4726,7 +6182,10 @@ fn agent_thread_transcript_native_watch_path(
     provider_session_id: &str,
     transcript_path: Option<&str>,
 ) -> Option<PathBuf> {
-    if let Some(path) = transcript_path.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(path) = transcript_path
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         return Some(PathBuf::from(path));
     }
     match clean_codex_id(agent_id).to_lowercase().as_str() {
@@ -4882,7 +6341,7 @@ async fn emit_agent_thread_transcript_watch_update(
             "providerSessionId": context.provider_session_id,
             "reason": reason,
             "requestSource": context.source,
-            "result": result,
+            "result": agent_thread_transcript_direct_result_value(&result),
             "source": "agent-transcript-watch",
             "submittedAt": context.submitted_at,
             "terminalIndex": context.terminal_index,
@@ -4918,12 +6377,12 @@ async fn agent_thread_transcript_watch_debounce_worker(
             }
             let remaining =
                 Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_MAX_WAIT_MS) - elapsed;
-            let delay = if remaining < Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS)
-            {
-                remaining
-            } else {
-                Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS)
-            };
+            let delay =
+                if remaining < Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS) {
+                    remaining
+                } else {
+                    Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS)
+                };
             sleep(delay).await;
             let latest_generation = debounce.generation.load(Ordering::SeqCst);
             if latest_generation == observed_generation
@@ -4944,11 +6403,7 @@ async fn agent_thread_transcript_watch_debounce_worker(
         }
         debounce.scheduled.store(false, Ordering::SeqCst);
         let next_generation = debounce.generation.load(Ordering::SeqCst);
-        if next_generation == latest_generation
-            || debounce
-                .scheduled
-                .swap(true, Ordering::SeqCst)
-        {
+        if next_generation == latest_generation || debounce.scheduled.swap(true, Ordering::SeqCst) {
             break;
         }
         observed_generation = next_generation;
@@ -4968,10 +6423,7 @@ fn agent_thread_transcript_note_watch_event(
         return;
     }
     tauri::async_runtime::spawn(agent_thread_transcript_watch_debounce_worker(
-        app,
-        key,
-        debounce,
-        generation,
+        app, key, debounce, generation,
     ));
 }
 
@@ -5053,7 +6505,6 @@ fn register_agent_thread_transcript_watch_internal(
         context: Arc::new(StdMutex::new(context)),
         last_signature: initial_signature,
         owners: HashSet::from([owner_key]),
-        debounce,
         touched_ms: current_time_ms(),
         _watcher: watcher,
     };

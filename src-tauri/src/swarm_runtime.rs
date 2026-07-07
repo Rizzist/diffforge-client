@@ -7,12 +7,22 @@ const SWARM_RUN_SUMMARY_LIMIT: usize = 50;
 const SWARM_CONTEXT_PACK_TIMEOUT_SECS: u64 = 8 * 60;
 const SWARM_TAKE_TIMEOUT_SECS: u64 = 15 * 60;
 const SWARM_SYNTHESIS_TIMEOUT_SECS: u64 = 20 * 60;
+const SWARM_VERIFY_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const SWARM_PROMPT_ACK_TIMEOUT_SECS: u64 = 8;
 const SWARM_SPAWN_READY_MONITOR_SECS: u64 = 120;
 const SWARM_IDLE_POLL_MS: u64 = 750;
 const SWARM_MIN_IDLE_AFTER_PROMPT_MS: u64 = 5_000;
 const SWARM_CAPTURE_MAX_CHARS: usize = 48_000;
+const SWARM_PACK_CHAR_CAP: usize = 24_000;
+const SWARM_TAKE_FUSE_CHAR_CAP: usize = 10_000;
+const SWARM_FUSE_TOTAL_CHAR_CAP: usize = 40_000;
+const SWARM_CONVERGENCE_JACCARD: f64 = 0.55;
+const SWARM_PACK_REUSE_MAX_AGE_MS: u64 = 6 * 60 * 60 * 1000;
+const SWARM_PACK_REUSE_OVERLAP: f64 = 0.45;
+const SWARM_VERIFY_OUTPUT_TAIL_CHAR_CAP: usize = 8_000;
 const SWARM_CONTEXT_PACK_BUILT_AT_PREFIX: &str = "<!-- diffforge-swarm-context-pack-built-at-ms:";
+const SWARM_PACK_TRUNCATED_MARKER: &str = "[pack truncated at cap]";
+const SWARM_TAKE_ELISION_MARKER: &str = "[… take elided …]";
 
 #[derive(Clone)]
 struct SwarmRuntimeState {
@@ -46,6 +56,7 @@ struct SwarmConfig {
     repo_path: String,
     champion_member_id: String,
     scout_member_id: String,
+    verify_command: String,
     members: Vec<MemberSpec>,
     updated_at: u64,
 }
@@ -147,6 +158,7 @@ struct SwarmState {
     repo_path: String,
     champion_member_id: String,
     scout_member_id: String,
+    verify_command: String,
     context_pack: Value,
     members: Vec<MemberState>,
     active_run_id: String,
@@ -294,6 +306,203 @@ fn swarm_trim_text(value: Option<String>) -> String {
     value.unwrap_or_default().trim().to_string()
 }
 
+fn swarm_char_count(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn swarm_byte_index_after_chars(text: &str, char_count: usize) -> usize {
+    if char_count == 0 {
+        return 0;
+    }
+    text.char_indices()
+        .nth(char_count)
+        .map(|(index, _)| index)
+        .unwrap_or(text.len())
+}
+
+fn swarm_prefix_on_line_boundary(text: &str, cap: usize) -> String {
+    if swarm_char_count(text) <= cap {
+        return text.to_string();
+    }
+    let hard_cut = swarm_byte_index_after_chars(text, cap);
+    let candidate = &text[..hard_cut];
+    if let Some(index) = candidate.rfind('\n') {
+        if index > 0 {
+            return candidate[..index].trim_end().to_string();
+        }
+    }
+    candidate.trim_end().to_string()
+}
+
+fn swarm_suffix_on_line_boundary(text: &str, cap: usize) -> String {
+    let total = swarm_char_count(text);
+    if total <= cap {
+        return text.to_string();
+    }
+    let hard_cut = swarm_byte_index_after_chars(text, total.saturating_sub(cap));
+    let candidate = &text[hard_cut..];
+    if let Some(index) = candidate.find('\n') {
+        if index + 1 < candidate.len() {
+            return candidate[index + 1..].trim_start().to_string();
+        }
+    }
+    candidate.trim_start().to_string()
+}
+
+fn swarm_tail_chars(text: &str, cap: usize) -> String {
+    let total = swarm_char_count(text);
+    if total <= cap {
+        return text.to_string();
+    }
+    let start = swarm_byte_index_after_chars(text, total.saturating_sub(cap));
+    text[start..].to_string()
+}
+
+fn swarm_truncate_pack_to_cap(text: &str) -> String {
+    let text = text.trim();
+    if swarm_char_count(text) <= SWARM_PACK_CHAR_CAP {
+        return text.to_string();
+    }
+    let marker_chars = swarm_char_count(SWARM_PACK_TRUNCATED_MARKER) + 1;
+    let content_cap = SWARM_PACK_CHAR_CAP.saturating_sub(marker_chars);
+    let truncated = swarm_prefix_on_line_boundary(text, content_cap);
+    format!("{}\n{}", truncated.trim_end(), SWARM_PACK_TRUNCATED_MARKER)
+}
+
+fn swarm_trim_take_for_fuse_with_cap(text: &str, cap: usize) -> String {
+    if swarm_char_count(text) <= cap {
+        return text.to_string();
+    }
+    let marker_chars = swarm_char_count(SWARM_TAKE_ELISION_MARKER) + 2;
+    if cap <= marker_chars {
+        return swarm_prefix_on_line_boundary(text, cap);
+    }
+    let content_cap = cap.saturating_sub(marker_chars);
+    let head_cap = (content_cap * 7) / 10;
+    let tail_cap = content_cap.saturating_sub(head_cap);
+    let head = swarm_prefix_on_line_boundary(text, head_cap);
+    let tail = swarm_suffix_on_line_boundary(text, tail_cap);
+    format!(
+        "{}\n{}\n{}",
+        head.trim_end(),
+        SWARM_TAKE_ELISION_MARKER,
+        tail.trim_start()
+    )
+}
+
+fn swarm_trim_take_for_fuse(text: &str) -> String {
+    swarm_trim_take_for_fuse_with_cap(text, SWARM_TAKE_FUSE_CHAR_CAP)
+}
+
+fn swarm_trim_takes_for_fuse_with_caps(
+    takes: &[SwarmTakeResult],
+    per_take_cap: usize,
+    total_cap: usize,
+) -> (Vec<SwarmTakeResult>, usize) {
+    let mut trimmed = takes
+        .iter()
+        .map(|take| SwarmTakeResult {
+            member_id: take.member_id.clone(),
+            text: swarm_trim_take_for_fuse_with_cap(&take.text, per_take_cap),
+        })
+        .collect::<Vec<_>>();
+    let mut total_chars = trimmed
+        .iter()
+        .map(|take| swarm_char_count(&take.text))
+        .sum::<usize>();
+    if !takes.is_empty() && total_chars > total_cap {
+        let reduced_cap = total_cap / takes.len();
+        trimmed = takes
+            .iter()
+            .map(|take| SwarmTakeResult {
+                member_id: take.member_id.clone(),
+                text: swarm_trim_take_for_fuse_with_cap(&take.text, reduced_cap),
+            })
+            .collect::<Vec<_>>();
+        total_chars = trimmed
+            .iter()
+            .map(|take| swarm_char_count(&take.text))
+            .sum::<usize>();
+    }
+    (trimmed, total_chars)
+}
+
+fn swarm_trim_takes_for_fuse(takes: &[SwarmTakeResult]) -> (Vec<SwarmTakeResult>, usize) {
+    swarm_trim_takes_for_fuse_with_caps(takes, SWARM_TAKE_FUSE_CHAR_CAP, SWARM_FUSE_TOTAL_CHAR_CAP)
+}
+
+fn swarm_distinct_content_words(text: &str) -> HashSet<String> {
+    let mut words = HashSet::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            for lower in ch.to_lowercase() {
+                current.push(lower);
+            }
+        } else {
+            if current.chars().count() >= 4 {
+                words.insert(current.clone());
+            }
+            current.clear();
+        }
+    }
+    if current.chars().count() >= 4 {
+        words.insert(current);
+    }
+    words
+}
+
+fn swarm_jaccard_similarity(left: &str, right: &str) -> f64 {
+    let left_words = swarm_distinct_content_words(left);
+    let right_words = swarm_distinct_content_words(right);
+    if left_words.is_empty() || right_words.is_empty() {
+        return 0.0;
+    }
+    let intersection = left_words.intersection(&right_words).count();
+    let union = left_words.len() + right_words.len() - intersection;
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
+fn swarm_mean_pairwise_jaccard(takes: &[SwarmTakeResult]) -> f64 {
+    if takes.len() < 2 {
+        return 0.0;
+    }
+    let mut total = 0.0;
+    let mut pairs = 0usize;
+    for left_index in 0..takes.len() {
+        for right_index in (left_index + 1)..takes.len() {
+            total += swarm_jaccard_similarity(&takes[left_index].text, &takes[right_index].text);
+            pairs += 1;
+        }
+    }
+    if pairs == 0 {
+        0.0
+    } else {
+        total / pairs as f64
+    }
+}
+
+fn swarm_pack_reuse_overlap(task: &str, pack: &str) -> Option<f64> {
+    let task_words = swarm_distinct_content_words(task);
+    if task_words.len() < 5 {
+        return None;
+    }
+    let pack_words = swarm_distinct_content_words(pack);
+    let overlap = task_words
+        .iter()
+        .filter(|word| pack_words.contains(*word))
+        .count();
+    Some(overlap as f64 / task_words.len() as f64)
+}
+
+fn swarm_round_2(value: f64) -> f64 {
+    (value * 100.0).round() / 100.0
+}
+
 fn swarm_normalize_member_id(value: &str) -> String {
     let normalized = value
         .trim()
@@ -410,6 +619,7 @@ fn swarm_config_from_parts(
     members: Vec<MemberSpec>,
     champion_member_id: Option<String>,
     scout_member_id: Option<String>,
+    verify_command: Option<String>,
 ) -> SwarmConfig {
     let scout_member_id = swarm_resolve_member_pin(scout_member_id, &members);
     SwarmConfig {
@@ -418,6 +628,7 @@ fn swarm_config_from_parts(
         repo_path: repo_path.trim().to_string(),
         champion_member_id: champion_member_id.unwrap_or_default().trim().to_string(),
         scout_member_id,
+        verify_command: verify_command.unwrap_or_default().trim().to_string(),
         members,
         updated_at: swarm_now_ms(),
     }
@@ -447,6 +658,7 @@ fn swarm_load_config(workspace_id: &str, swarm_id: &str) -> SwarmConfig {
     config.members = swarm_resolve_member_specs(config.members).unwrap_or_default();
     config.scout_member_id =
         swarm_resolve_member_pin(Some(config.scout_member_id.clone()), &config.members);
+    config.verify_command = config.verify_command.trim().to_string();
     config
 }
 
@@ -488,7 +700,7 @@ fn swarm_parse_context_pack_file(raw: &str, fallback_at: u64) -> Option<SwarmCon
     } else {
         Some(SwarmContextPackCache {
             at,
-            text: text.trim().to_string(),
+            text: swarm_truncate_pack_to_cap(text),
         })
     }
 }
@@ -511,7 +723,7 @@ fn swarm_save_context_pack(
 ) -> Result<SwarmContextPackCache, String> {
     let pack = SwarmContextPackCache {
         at: swarm_now_ms(),
-        text: text.trim().to_string(),
+        text: swarm_truncate_pack_to_cap(text),
     };
     let path = swarm_context_pack_path(workspace_id, swarm_id)?;
     if let Some(parent) = path.parent() {
@@ -653,7 +865,28 @@ fn swarm_run_summary_from_events(events: &[SwarmRunEvent]) -> Option<RunSummary>
     Some(summary)
 }
 
-fn swarm_apply_event_stats(stats: &mut HashMap<String, MemberStats>, event: &SwarmRunEvent) {
+fn swarm_apply_event_stats(
+    stats: &mut HashMap<String, MemberStats>,
+    event: &SwarmRunEvent,
+    run_mode: &str,
+) {
+    if event.kind == "gate_decision" && run_mode == "plan" {
+        if let Some(winner) = event
+            .data
+            .as_ref()
+            .filter(|data| {
+                data.get("converged")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+            })
+            .and_then(|data| data.get("winnerMemberId"))
+            .and_then(Value::as_str)
+        {
+            let member_stats = stats.entry(winner.to_string()).or_default();
+            member_stats.champion_runs = member_stats.champion_runs.saturating_add(1);
+        }
+        return;
+    }
     let Some(member_id) = event.member_id.as_deref() else {
         return;
     };
@@ -692,11 +925,24 @@ fn swarm_load_run_summaries_and_stats(
         let Ok(text) = fs::read_to_string(path) else {
             continue;
         };
-        let events = text
+        let mut events = Vec::new();
+        let mut run_mode = "plan".to_string();
+        for event in text
             .lines()
             .filter_map(|line| serde_json::from_str::<SwarmRunEvent>(line).ok())
-            .inspect(|event| swarm_apply_event_stats(&mut stats, event))
-            .collect::<Vec<_>>();
+        {
+            if event.kind == "run_started" {
+                run_mode = event
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("mode"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("plan")
+                    .to_string();
+            }
+            swarm_apply_event_stats(&mut stats, &event, &run_mode);
+            events.push(event);
+        }
         if let Some(summary) = swarm_run_summary_from_events(&events) {
             summaries.push(summary);
         }
@@ -734,6 +980,7 @@ fn swarm_state_from_data(data: &SwarmRuntimeData) -> SwarmState {
         repo_path: data.config.repo_path.clone(),
         champion_member_id: data.config.champion_member_id.clone(),
         scout_member_id: data.config.scout_member_id.clone(),
+        verify_command: data.config.verify_command.clone(),
         context_pack: swarm_context_pack_summary(data.context_pack.as_ref()),
         members,
         active_run_id: data.active_run_id.clone(),
@@ -1045,16 +1292,21 @@ fn swarm_context_pack_prompt(
 ) -> String {
     let mut body = String::new();
     body.push_str("You are the scout for a Diff Forge Swarm Agents Panel run.\n\n");
-    body.push_str("Build a STRICTLY FACTUAL context pack for the other agents. Do not recommend an approach. Do not rank options. Do not include opinions or strategic preferences. Do not edit files.\n\n");
+    body.push_str("HARD INVARIANTS:\n");
+    body.push_str("- Build a STRICTLY FACTUAL context pack only.\n");
+    body.push_str("- Do not recommend an approach, rank options, or include opinions or strategic preferences.\n");
+    body.push_str("- Do not edit files.\n");
+    body.push_str("- Keep the pack within ~24,000 chars; prioritize build/test commands, task-relevant files, and conventions, and cut anything else.\n");
+    body.push_str("- End your reply with a final line containing only `");
+    body.push_str(SWARM_PACK_SENTINEL);
+    body.push_str("`.\n\n");
     body.push_str("Include only:\n");
     body.push_str("- Repo map: important directories/files and what they contain.\n");
     body.push_str("- Existing conventions relevant to this task.\n");
     body.push_str("- Build/test/check commands that appear valid for this repo.\n");
     body.push_str("- Task-relevant file paths with one-line whys and short key excerpts.\n");
     body.push_str("- Explicit constraints from the user prompt and repository context.\n\n");
-    body.push_str("Verify facts from the repo before keeping them. If uncertain, say what is unverified. End your reply with a final line containing only `");
-    body.push_str(SWARM_PACK_SENTINEL);
-    body.push_str("`.\n\nRepo root:\n");
+    body.push_str("Verify facts from the repo before keeping them. If uncertain, say what is unverified.\n\nRepo root:\n");
     body.push_str(repo_path);
     body.push_str("\n\nTask:\n");
     body.push_str(original_prompt);
@@ -1062,6 +1314,12 @@ fn swarm_context_pack_prompt(
         body.push_str("\n\nPrevious context pack. Update it incrementally for this new task instead of re-deriving everything from scratch:\n");
         body.push_str(&pack.text);
     }
+    body.push_str("\n\nNON-NEGOTIABLE:\n");
+    body.push_str("- Factual context only: no recommendations, no preferred solution, no ranking, no advocacy.\n");
+    body.push_str("- Stay under the context-pack budget by keeping commands, relevant paths, conventions, and short excerpts only.\n");
+    body.push_str("- The last line must be exactly `");
+    body.push_str(SWARM_PACK_SENTINEL);
+    body.push_str("` and nothing else.");
     body
 }
 
@@ -1086,12 +1344,21 @@ fn swarm_take_prompt(
     let mut body = String::new();
     body.push_str("You are swarm member `");
     body.push_str(&member.member_id);
-    body.push_str("` in a Diff Forge Swarm Agents Panel run.\n\nTask:\n");
+    body.push_str("` in a Diff Forge Swarm Agents Panel run.\n\n");
+    body.push_str("HARD INVARIANTS:\n");
+    body.push_str("- This is a plan-only take phase: do NOT edit, create, or delete any file.\n");
+    body.push_str("- End your reply with a final line containing only `");
+    body.push_str(SWARM_TAKE_SENTINEL);
+    body.push_str("`.\n");
+    body.push_str("- Respect the take budget: target <= 120 lines / ~8,000 chars, decision-relevant only.\n\nTask:\n");
     body.push_str(original_prompt);
     body.push_str(&swarm_context_pack_prompt_block(context_pack));
-    body.push_str("\nReturn an independent take: analyze the task, identify risks, and propose a concrete plan. Do not edit files or run destructive commands in this take phase. You may verify the context pack before relying on it and may explore beyond it. End your reply with a final line containing only `");
+    body.push_str("\nReturn an independent take: chosen approach, key files (paths + why), risks/unknowns, and explicit points where you expect other members might disagree. No full file dumps and no exhaustive diffs. You may verify the context pack before relying on it and may explore beyond it.\n\nNON-NEGOTIABLE:\n");
+    body.push_str("- Do not change the filesystem in this take phase.\n");
+    body.push_str("- Keep the take focused and within the <= 120 line / ~8,000 char target.\n");
+    body.push_str("- The last line must be exactly `");
     body.push_str(SWARM_TAKE_SENTINEL);
-    body.push_str("`.");
+    body.push_str("` and nothing else.");
     body
 }
 
@@ -1103,6 +1370,13 @@ fn swarm_synthesis_prompt(
 ) -> String {
     let mut body = String::new();
     body.push_str("You are the champion member for a Diff Forge Swarm Agents Panel run.\n\n");
+    body.push_str("HARD INVARIANTS:\n");
+    if mode == "implement" {
+        body.push_str("- Implement mode: apply the fused plan to the repo using the existing project conventions.\n");
+    } else {
+        body.push_str("- Plan mode: do NOT edit, create, or delete any file.\n");
+    }
+    body.push_str("- The fused answer must be complete and standalone; do not rely on phrases like \"as member 2 said\".\n\n");
     body.push_str("Original task:\n");
     body.push_str(original_prompt);
     body.push_str(&swarm_context_pack_prompt_block(context_pack));
@@ -1119,6 +1393,60 @@ fn swarm_synthesis_prompt(
     } else {
         body.push_str("\nSynthesize these takes into the final answer. Do not edit files. Be concise but include the reasoning and concrete next steps the user needs.");
     }
+    body.push_str("\n\nNON-NEGOTIABLE:\n");
+    if mode == "implement" {
+        body.push_str("- You are in implement mode: make the required repo changes and report what changed plus verification.\n");
+    } else {
+        body.push_str("- You are in plan mode: do not modify files or apply changes.\n");
+    }
+    body.push_str("- Your final answer must stand on its own without referring back to member numbers or hidden context.");
+    body
+}
+
+fn swarm_converged_execution_prompt(winning_take: &str) -> String {
+    let mut body = String::new();
+    body.push_str("You are the champion member for a Diff Forge Swarm Agents Panel run.\n\n");
+    body.push_str("HARD INVARIANTS:\n");
+    body.push_str("- Implement mode: members converged on this plan — execute it in the repo.\n");
+    body.push_str(
+        "- Change only what the winning take requires and follow existing project conventions.\n",
+    );
+    body.push_str("- The final answer must be complete and standalone.\n\n");
+    body.push_str("Winning take:\n");
+    body.push_str(winning_take.trim());
+    body.push_str("\n\nNON-NEGOTIABLE:\n");
+    body.push_str("- Execute the converged plan; do not re-fuse or solicit more opinions.\n");
+    body.push_str("- Keep changes scoped to the winning take.\n");
+    body.push_str(
+        "- Your final answer must stand on its own with what changed and how you verified it.",
+    );
+    body
+}
+
+fn swarm_repair_prompt(command: &str, exit_code: i32, output_tail: &str) -> String {
+    let mut body = String::new();
+    body.push_str("You are the champion member repairing a Diff Forge Swarm implement run.\n\n");
+    body.push_str("HARD INVARIANTS:\n");
+    body.push_str("- Implement mode: fix the verification failure in the repo.\n");
+    body.push_str("- Change only what is needed for the verification command to pass.\n");
+    body.push_str("- The final answer must be complete and standalone.\n\n");
+    body.push_str("Verification command:\n");
+    body.push_str(command.trim());
+    body.push_str("\n\nExit code:\n");
+    body.push_str(&exit_code.to_string());
+    body.push_str("\n\nOutput tail:\n");
+    body.push_str(output_tail.trim());
+    body.push_str("\n\nFix the verification failure; change only what is needed.");
+    body.push_str("\n\nNON-NEGOTIABLE:\n");
+    body.push_str(
+        "- Repair the failing verification command only; do not broaden the implementation.\n",
+    );
+    body.push_str(
+        "- Preserve existing behavior unless it is directly required for the verification fix.\n",
+    );
+    body.push_str(
+        "- Your final answer must stand on its own with the repair and verification result.",
+    );
     body
 }
 
@@ -1498,6 +1826,36 @@ async fn swarm_context_pack_phase(
             data.context_pack.clone(),
         )
     };
+    if let Some(pack) = cached_pack.as_ref() {
+        let age = swarm_now_ms().saturating_sub(pack.at);
+        if age < SWARM_PACK_REUSE_MAX_AGE_MS {
+            if let Some(overlap) = swarm_pack_reuse_overlap(prompt, &pack.text) {
+                if overlap >= SWARM_PACK_REUSE_OVERLAP {
+                    let chars = swarm_char_count(&pack.text);
+                    let _ = swarm_append_run_event(
+                        app,
+                        state,
+                        workspace_id,
+                        swarm_id,
+                        run_id,
+                        "context_pack_reused",
+                        None,
+                        Some(format!(
+                            "Reused cached context pack ({chars} chars, {:.2} overlap).",
+                            swarm_round_2(overlap)
+                        )),
+                        Some(json!({
+                            "at": pack.at,
+                            "chars": chars,
+                            "overlap": swarm_round_2(overlap),
+                        })),
+                    )
+                    .await;
+                    return Some(pack.text.clone());
+                }
+            }
+        }
+    }
     let Some(scout) = scout else {
         let _ = swarm_append_run_event(
             app,
@@ -1610,7 +1968,7 @@ async fn swarm_context_pack_phase(
     )
     .await
     {
-        Ok(text) => swarm_strip_pack_sentinel(&text),
+        Ok(text) => swarm_truncate_pack_to_cap(&swarm_strip_pack_sentinel(&text)),
         Err(error) => {
             if cancel.load(Ordering::SeqCst) {
                 return None;
@@ -1805,6 +2163,501 @@ async fn swarm_choose_champion(
         .cloned()
 }
 
+async fn swarm_choose_highest_score_take(
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    takes: &[SwarmTakeResult],
+    ready_members: &[SwarmMemberRef],
+) -> Option<SwarmTakeResult> {
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
+    let data = entry.lock().await;
+    let mut best: Option<(usize, i64, SwarmTakeResult)> = None;
+    for (index, member) in ready_members.iter().enumerate() {
+        let Some(take) = takes
+            .iter()
+            .find(|candidate| candidate.member_id == member.member_id)
+        else {
+            continue;
+        };
+        let score = data
+            .members
+            .get(&member.member_id)
+            .map(|member| swarm_member_score(&member.stats))
+            .unwrap_or(0);
+        let replace = best
+            .as_ref()
+            .map(|(best_index, best_score, _)| {
+                score > *best_score || (score == *best_score && index < *best_index)
+            })
+            .unwrap_or(true);
+        if replace {
+            best = Some((index, score, take.clone()));
+        }
+    }
+    best.map(|(_, _, take)| take)
+        .or_else(|| takes.first().cloned())
+}
+
+async fn swarm_record_run_result(
+    app: &AppHandle,
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    run_id: &str,
+    text: &str,
+) {
+    let _ = swarm_append_run_event(
+        app,
+        state,
+        workspace_id,
+        swarm_id,
+        run_id,
+        "run_result",
+        None,
+        Some(text.to_string()),
+        None,
+    )
+    .await;
+    let entry = swarm_entry(state, workspace_id, swarm_id).await;
+    let mut data = entry.lock().await;
+    if let Some(summary) = data
+        .runs
+        .iter_mut()
+        .find(|summary| summary.run_id == run_id)
+    {
+        summary.result_summary = swarm_summary_text(text);
+    }
+}
+
+struct SwarmVerifyOutcome {
+    ok: bool,
+    exit_code: i32,
+    timed_out: bool,
+    output: String,
+}
+
+fn swarm_spawn_verify_output_reader<R: Read + Send + 'static>(
+    mut reader: R,
+    output: Arc<StdMutex<String>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(count) => {
+                    let text = String::from_utf8_lossy(&buffer[..count]);
+                    if let Ok(mut output) = output.lock() {
+                        output.push_str(&text);
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    })
+}
+
+fn swarm_verify_output_snapshot(output: &Arc<StdMutex<String>>) -> String {
+    output
+        .lock()
+        .map(|output| output.clone())
+        .unwrap_or_default()
+}
+
+fn swarm_prepare_verify_command_process(command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+}
+
+fn swarm_kill_verify_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        if pid > 0 {
+            unsafe {
+                let _ = libc::kill(-pid, libc::SIGKILL);
+            }
+        }
+    }
+    let _ = child.kill();
+}
+
+async fn swarm_execute_verify_command(
+    repo_path: &str,
+    command: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<SwarmVerifyOutcome, String> {
+    let mut verify_command = Command::new("sh");
+    verify_command
+        .arg("-c")
+        .arg(command)
+        .current_dir(repo_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    swarm_prepare_verify_command_process(&mut verify_command);
+    let mut child = match verify_command.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            return Ok(SwarmVerifyOutcome {
+                ok: false,
+                exit_code: -1,
+                timed_out: false,
+                output: format!("Unable to start verification command: {error}"),
+            });
+        }
+    };
+    let output = Arc::new(StdMutex::new(String::new()));
+    let mut readers = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(swarm_spawn_verify_output_reader(
+            stdout,
+            Arc::clone(&output),
+        ));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(swarm_spawn_verify_output_reader(
+            stderr,
+            Arc::clone(&output),
+        ));
+    }
+
+    let started_at = Instant::now();
+    let mut timed_out = false;
+    let status = loop {
+        if cancel.load(Ordering::SeqCst) {
+            swarm_kill_verify_child(&mut child);
+            let _ = child.wait();
+            return Err("Swarm run was cancelled.".to_string());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {}
+            Err(error) => {
+                swarm_kill_verify_child(&mut child);
+                let _ = child.wait();
+                return Ok(SwarmVerifyOutcome {
+                    ok: false,
+                    exit_code: -1,
+                    timed_out: false,
+                    output: format!("Unable to poll verification command: {error}"),
+                });
+            }
+        }
+        if started_at.elapsed() >= SWARM_VERIFY_TIMEOUT {
+            timed_out = true;
+            swarm_kill_verify_child(&mut child);
+            let _ = child
+                .wait()
+                .map_err(|error| format!("Unable to wait for timed-out verification: {error}"))?;
+            let output = swarm_verify_output_snapshot(&output);
+            return Ok(SwarmVerifyOutcome {
+                ok: false,
+                exit_code: -1,
+                timed_out,
+                output,
+            });
+        }
+        sleep(Duration::from_millis(250)).await;
+    };
+    for reader in readers {
+        let _ = reader.join();
+    }
+    let output = swarm_verify_output_snapshot(&output);
+    Ok(SwarmVerifyOutcome {
+        ok: !timed_out && status.success(),
+        exit_code: if timed_out {
+            -1
+        } else {
+            status.code().unwrap_or(-1)
+        },
+        timed_out,
+        output,
+    })
+}
+
+async fn swarm_run_verification_once(
+    app: &AppHandle,
+    state: &SwarmRuntimeState,
+    workspace_id: &str,
+    swarm_id: &str,
+    run_id: &str,
+    repo_path: &str,
+    command: &str,
+    cancel: Arc<AtomicBool>,
+) -> Result<SwarmVerifyOutcome, String> {
+    let _ = swarm_append_run_event(
+        app,
+        state,
+        workspace_id,
+        swarm_id,
+        run_id,
+        "verification_started",
+        None,
+        Some(command.to_string()),
+        None,
+    )
+    .await;
+    let outcome = swarm_execute_verify_command(repo_path, command, cancel).await?;
+    let output_tail = swarm_tail_chars(&outcome.output, SWARM_VERIFY_OUTPUT_TAIL_CHAR_CAP);
+    let _ = swarm_append_run_event(
+        app,
+        state,
+        workspace_id,
+        swarm_id,
+        run_id,
+        "verification_result",
+        None,
+        Some(output_tail),
+        Some(json!({
+            "ok": outcome.ok,
+            "exitCode": outcome.exit_code,
+            "timedOut": outcome.timed_out,
+        })),
+    )
+    .await;
+    Ok(outcome)
+}
+
+async fn swarm_finish_after_synthesis(
+    app: &AppHandle,
+    state: &SwarmRuntimeState,
+    terminal_state: &TerminalState,
+    workspace_id: &str,
+    swarm_id: &str,
+    run_id: &str,
+    mode: &str,
+    champion: &SwarmMemberRef,
+    result_text: String,
+    cancel: Arc<AtomicBool>,
+) {
+    if cancel.load(Ordering::SeqCst) {
+        return;
+    }
+    let (repo_path, verify_command) = {
+        let entry = swarm_entry(state, workspace_id, swarm_id).await;
+        let data = entry.lock().await;
+        (
+            data.config.repo_path.clone(),
+            data.config.verify_command.trim().to_string(),
+        )
+    };
+    if mode != "implement" || verify_command.is_empty() {
+        swarm_record_run_result(app, state, workspace_id, swarm_id, run_id, &result_text).await;
+        let _ =
+            swarm_mark_run_settled(app, state, workspace_id, swarm_id, run_id, "done", "").await;
+        return;
+    }
+
+    let first = match swarm_run_verification_once(
+        app,
+        state,
+        workspace_id,
+        swarm_id,
+        run_id,
+        &repo_path,
+        &verify_command,
+        Arc::clone(&cancel),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            let _ = swarm_mark_run_settled(
+                app,
+                state,
+                workspace_id,
+                swarm_id,
+                run_id,
+                "failed",
+                &format!("Verification failed: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
+    if first.ok {
+        swarm_record_run_result(app, state, workspace_id, swarm_id, run_id, &result_text).await;
+        let _ =
+            swarm_mark_run_settled(app, state, workspace_id, swarm_id, run_id, "done", "").await;
+        return;
+    }
+
+    let output_tail = swarm_tail_chars(&first.output, SWARM_VERIFY_OUTPUT_TAIL_CHAR_CAP);
+    let _ = swarm_append_run_event(
+        app,
+        state,
+        workspace_id,
+        swarm_id,
+        run_id,
+        "repair_started",
+        Some(champion.member_id.clone()),
+        Some("Repair started after verification failure.".to_string()),
+        None,
+    )
+    .await;
+    swarm_update_member_status(
+        state,
+        workspace_id,
+        swarm_id,
+        &champion.member_id,
+        "working",
+        Some(false),
+        Some(swarm_now_ms()),
+        None,
+    )
+    .await;
+    swarm_emit_state(app, workspace_id, swarm_id);
+
+    let repair_prompt = swarm_repair_prompt(&verify_command, first.exit_code, &output_tail);
+    if let Err(error) = swarm_enqueue_prompt(app, champion, run_id, "repair", repair_prompt).await {
+        let _ = swarm_append_run_event(
+            app,
+            state,
+            workspace_id,
+            swarm_id,
+            run_id,
+            "member_error",
+            Some(champion.member_id.clone()),
+            Some(error.clone()),
+            None,
+        )
+        .await;
+        let _ = swarm_mark_run_settled(
+            app,
+            state,
+            workspace_id,
+            swarm_id,
+            run_id,
+            "failed",
+            &format!("Unable to deliver repair prompt: {error}"),
+        )
+        .await;
+        return;
+    }
+    if let Err(error) = swarm_wait_member_idle(
+        state,
+        terminal_state,
+        app,
+        workspace_id,
+        swarm_id,
+        champion,
+        Arc::clone(&cancel),
+        Duration::from_secs(SWARM_SYNTHESIS_TIMEOUT_SECS),
+    )
+    .await
+    {
+        if cancel.load(Ordering::SeqCst) {
+            return;
+        }
+        let _ = swarm_mark_run_settled(
+            app,
+            state,
+            workspace_id,
+            swarm_id,
+            run_id,
+            "failed",
+            &format!("Repair failed: {error}"),
+        )
+        .await;
+        return;
+    }
+    let repair_text = match swarm_capture_final_message(
+        terminal_state,
+        workspace_id,
+        champion,
+        SWARM_TAKE_SENTINEL,
+    )
+    .await
+    {
+        Ok(text) => text,
+        Err(error) => {
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            let _ = swarm_mark_run_settled(
+                app,
+                state,
+                workspace_id,
+                swarm_id,
+                run_id,
+                "failed",
+                &format!("Unable to capture repair result: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
+    if cancel.load(Ordering::SeqCst) {
+        return;
+    }
+
+    let second = match swarm_run_verification_once(
+        app,
+        state,
+        workspace_id,
+        swarm_id,
+        run_id,
+        &repo_path,
+        &verify_command,
+        Arc::clone(&cancel),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            let _ = swarm_mark_run_settled(
+                app,
+                state,
+                workspace_id,
+                swarm_id,
+                run_id,
+                "failed",
+                &format!("Verification failed after repair: {error}"),
+            )
+            .await;
+            return;
+        }
+    };
+    if second.ok {
+        swarm_record_run_result(app, state, workspace_id, swarm_id, run_id, &repair_text).await;
+        let _ =
+            swarm_mark_run_settled(app, state, workspace_id, swarm_id, run_id, "done", "").await;
+    } else {
+        let _ = swarm_mark_run_settled(
+            app,
+            state,
+            workspace_id,
+            swarm_id,
+            run_id,
+            "failed",
+            &format!(
+                "verification failed after repair: exit {}",
+                second.exit_code
+            ),
+        )
+        .await;
+    }
+}
+
 async fn swarm_run_conductor(
     app: AppHandle,
     state: SwarmRuntimeState,
@@ -1898,6 +2751,61 @@ async fn swarm_run_conductor(
         return;
     }
 
+    let (trimmed_takes, trimmed_fuse_chars) = swarm_trim_takes_for_fuse(&takes);
+    let mut gate_data = serde_json::Map::new();
+    gate_data.insert("takes".to_string(), json!(takes.len()));
+    let mut converged_take = None;
+    let mut convergence_similarity = None;
+    if takes.len() >= 2 {
+        let similarity = swarm_mean_pairwise_jaccard(&takes);
+        let rounded_similarity = swarm_round_2(similarity);
+        let converged = similarity >= SWARM_CONVERGENCE_JACCARD;
+        gate_data.insert("converged".to_string(), json!(converged));
+        gate_data.insert("similarity".to_string(), json!(rounded_similarity));
+        convergence_similarity = Some(rounded_similarity);
+        if converged {
+            converged_take = swarm_choose_highest_score_take(
+                &state,
+                &workspace_id,
+                &swarm_id,
+                &takes,
+                &take_members,
+            )
+            .await;
+            if let Some(winner) = converged_take.as_ref() {
+                gate_data.insert(
+                    "winnerMemberId".to_string(),
+                    json!(winner.member_id.clone()),
+                );
+            }
+        }
+    }
+
+    let converged_execution_take = if mode == "implement" {
+        if let Some(winner) = converged_take.as_ref() {
+            let trimmed_winner = trimmed_takes
+                .iter()
+                .find(|take| take.member_id == winner.member_id)
+                .map(|take| take.text.clone())
+                .unwrap_or_else(|| swarm_trim_take_for_fuse(&winner.text));
+            Some(trimmed_winner)
+        } else if takes.len() == 1 {
+            Some(swarm_trim_take_for_fuse(&takes[0].text))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let fuse_chars = if mode == "plan" && converged_take.is_some() {
+        0
+    } else if let Some(winning_take) = converged_execution_take.as_ref() {
+        swarm_char_count(winning_take)
+    } else {
+        trimmed_fuse_chars
+    };
+    gate_data.insert("fuseChars".to_string(), json!(fuse_chars));
+
     let _ = swarm_append_run_event(
         &app,
         &state,
@@ -1908,10 +2816,16 @@ async fn swarm_run_conductor(
         None,
         Some(if takes.is_empty() {
             "No member takes arrived; failing run.".to_string()
+        } else if let Some(winner) = converged_take.as_ref() {
+            format!(
+                "Members converged at {:.2} similarity; winning take: {}.",
+                convergence_similarity.unwrap_or(0.0),
+                winner.member_id
+            )
         } else {
             format!("Proceeding with {} member take(s).", takes.len())
         }),
-        Some(json!({ "takes": takes.len() })),
+        Some(Value::Object(gate_data)),
     )
     .await;
 
@@ -1927,6 +2841,30 @@ async fn swarm_run_conductor(
         )
         .await;
         return;
+    }
+
+    if mode == "plan" {
+        if let Some(winner) = converged_take.as_ref() {
+            swarm_increment_member_stat(
+                &state,
+                &workspace_id,
+                &swarm_id,
+                &winner.member_id,
+                "championRuns",
+            )
+            .await;
+            let result = format!(
+                "Members converged at {:.2} similarity; using {}'s take.\n\n{}",
+                convergence_similarity.unwrap_or(0.0),
+                winner.member_id,
+                winner.text
+            );
+            swarm_record_run_result(&app, &state, &workspace_id, &swarm_id, &run_id, &result).await;
+            let _ =
+                swarm_mark_run_settled(&app, &state, &workspace_id, &swarm_id, &run_id, "done", "")
+                    .await;
+            return;
+        }
     }
 
     let Some(champion) =
@@ -1953,7 +2891,11 @@ async fn swarm_run_conductor(
         &run_id,
         "synthesis_started",
         Some(champion.member_id.clone()),
-        Some("Synthesis started.".to_string()),
+        Some(if converged_execution_take.is_some() {
+            "Converged execution started.".to_string()
+        } else {
+            "Synthesis started.".to_string()
+        }),
         Some(json!({ "mode": mode })),
     )
     .await;
@@ -1966,7 +2908,11 @@ async fn swarm_run_conductor(
     )
     .await;
 
-    let synthesis_prompt = swarm_synthesis_prompt(&prompt, &mode, &takes, context_pack.as_deref());
+    let synthesis_prompt = if let Some(winning_take) = converged_execution_take.as_ref() {
+        swarm_converged_execution_prompt(winning_take)
+    } else {
+        swarm_synthesis_prompt(&prompt, &mode, &trimmed_takes, context_pack.as_deref())
+    };
     if let Err(error) =
         swarm_enqueue_prompt(&app, &champion, &run_id, "synthesis", synthesis_prompt).await
     {
@@ -2020,37 +2966,17 @@ async fn swarm_run_conductor(
                     if cancel.load(Ordering::SeqCst) {
                         return;
                     }
-                    let _ = swarm_append_run_event(
+                    swarm_finish_after_synthesis(
                         &app,
                         &state,
+                        terminal_state.inner(),
                         &workspace_id,
                         &swarm_id,
                         &run_id,
-                        "run_result",
-                        None,
-                        Some(text.clone()),
-                        None,
-                    )
-                    .await;
-                    {
-                        let entry = swarm_entry(&state, &workspace_id, &swarm_id).await;
-                        let mut data = entry.lock().await;
-                        if let Some(summary) = data
-                            .runs
-                            .iter_mut()
-                            .find(|summary| summary.run_id == run_id)
-                        {
-                            summary.result_summary = swarm_summary_text(&text);
-                        }
-                    }
-                    let _ = swarm_mark_run_settled(
-                        &app,
-                        &state,
-                        &workspace_id,
-                        &swarm_id,
-                        &run_id,
-                        "done",
-                        "",
+                        &mode,
+                        &champion,
+                        text,
+                        Arc::clone(&cancel),
                     )
                     .await;
                 }
@@ -2295,6 +3221,7 @@ async fn swarm_configure(
     members: Vec<MemberSpec>,
     champion_member_id: Option<String>,
     scout_member_id: Option<String>,
+    verify_command: Option<String>,
 ) -> Result<SwarmState, String> {
     let repo_path = repo_path.trim().to_string();
     if repo_path.is_empty() {
@@ -2308,6 +3235,7 @@ async fn swarm_configure(
         resolved_members.clone(),
         champion_member_id,
         scout_member_id,
+        verify_command,
     );
     swarm_save_config(&config)?;
 
@@ -2811,8 +3739,10 @@ mod swarm_runtime_tests {
             members.clone(),
             None,
             Some("researcher.one".to_string()),
+            Some(" cargo test ".to_string()),
         );
         assert_eq!(config.scout_member_id, "researcher_one");
+        assert_eq!(config.verify_command, "cargo test");
         let auto_config = swarm_config_from_parts(
             "workspace",
             "swarm-abc",
@@ -2820,8 +3750,24 @@ mod swarm_runtime_tests {
             members,
             None,
             Some("missing".to_string()),
+            None,
         );
         assert_eq!(auto_config.scout_member_id, "");
+        assert_eq!(auto_config.verify_command, "");
+    }
+
+    #[test]
+    fn swarm_config_defaults_missing_verify_command() {
+        let config = serde_json::from_str::<SwarmConfig>(
+            r#"{
+                "swarmId": "swarm-abc",
+                "workspaceId": "workspace",
+                "repoPath": "/repo",
+                "members": []
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(config.verify_command, "");
     }
 
     #[test]
@@ -2838,6 +3784,113 @@ mod swarm_runtime_tests {
         let legacy = swarm_parse_context_pack_file("legacy pack", 7).unwrap();
         assert_eq!(legacy.at, 7);
         assert_eq!(legacy.text, "legacy pack");
+    }
+
+    #[test]
+    fn swarm_fuse_trim_keeps_under_cap_and_elides_head_tail() {
+        assert_eq!(
+            swarm_trim_take_for_fuse_with_cap("short take", 80),
+            "short take"
+        );
+
+        let long_take = (0..20)
+            .map(|index| format!("line{index:02} {}", "x".repeat(10)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let trimmed = swarm_trim_take_for_fuse_with_cap(&long_take, 80);
+        assert!(swarm_char_count(&trimmed) <= 80);
+        assert!(trimmed.contains(SWARM_TAKE_ELISION_MARKER));
+        assert!(trimmed.starts_with("line00"));
+        assert!(trimmed.contains("line19"));
+        assert!(!trimmed.contains("line10"));
+    }
+
+    #[test]
+    fn swarm_fuse_trim_retrims_to_total_budget() {
+        let long_take = (0..20)
+            .map(|index| format!("line{index:02} {}", "x".repeat(10)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let takes = vec![
+            SwarmTakeResult {
+                member_id: "m1".to_string(),
+                text: long_take.clone(),
+            },
+            SwarmTakeResult {
+                member_id: "m2".to_string(),
+                text: long_take.clone(),
+            },
+            SwarmTakeResult {
+                member_id: "m3".to_string(),
+                text: long_take,
+            },
+        ];
+        let (trimmed, total) = swarm_trim_takes_for_fuse_with_caps(&takes, 80, 120);
+        assert!(total <= 120);
+        assert!(trimmed
+            .iter()
+            .all(|take| swarm_char_count(&take.text) <= 40));
+    }
+
+    #[test]
+    fn swarm_jaccard_convergence_scores_expected_cases() {
+        assert_eq!(
+            swarm_jaccard_similarity("alpha beta gamma delta", "alpha beta gamma delta"),
+            1.0
+        );
+        assert_eq!(
+            swarm_jaccard_similarity("alpha beta gamma delta", "omega sigma theta lambda"),
+            0.0
+        );
+        let converged = vec![
+            SwarmTakeResult {
+                member_id: "m1".to_string(),
+                text: "alpha beta gamma delta epsilon".to_string(),
+            },
+            SwarmTakeResult {
+                member_id: "m2".to_string(),
+                text: "alpha beta gamma delta zeta".to_string(),
+            },
+        ];
+        assert!(swarm_mean_pairwise_jaccard(&converged) >= SWARM_CONVERGENCE_JACCARD);
+
+        let divergent = vec![
+            SwarmTakeResult {
+                member_id: "m1".to_string(),
+                text: "alpha beta gamma delta".to_string(),
+            },
+            SwarmTakeResult {
+                member_id: "m2".to_string(),
+                text: "omega sigma theta lambda".to_string(),
+            },
+        ];
+        assert!(swarm_mean_pairwise_jaccard(&divergent) < SWARM_CONVERGENCE_JACCARD);
+    }
+
+    #[test]
+    fn swarm_pack_reuse_overlap_rejects_vague_and_accepts_overlap() {
+        assert_eq!(swarm_pack_reuse_overlap("fix bug", "fix bug details"), None);
+        let overlap = swarm_pack_reuse_overlap(
+            "update cargo check swarm runtime verify command",
+            "The swarm runtime section documents cargo check and verify command behavior.",
+        )
+        .unwrap();
+        assert!(overlap >= SWARM_PACK_REUSE_OVERLAP);
+    }
+
+    #[test]
+    fn swarm_pack_cap_truncates_on_line_boundary_with_marker() {
+        let line = "abcdefghijklmnopqrstuvwxyz";
+        let pack = format!("{}\n", line).repeat(1_100);
+        let truncated = swarm_truncate_pack_to_cap(&pack);
+        assert!(swarm_char_count(&truncated) < swarm_char_count(&pack));
+        assert!(swarm_char_count(&truncated) <= SWARM_PACK_CHAR_CAP);
+        assert!(truncated.ends_with(SWARM_PACK_TRUNCATED_MARKER));
+        let body = truncated
+            .trim_end_matches(SWARM_PACK_TRUNCATED_MARKER)
+            .trim_end();
+        assert!(swarm_char_count(body) <= SWARM_PACK_CHAR_CAP);
+        assert!(body.lines().all(|candidate| candidate == line));
     }
 
     #[test]

@@ -143,6 +143,10 @@ function describeSwarmRunEvent(event, membersById) {
       const incremental = Boolean(event?.data?.incremental);
       return `Context pack ready${chars ? ` — ${Math.round(chars / 1000)}k chars` : ""}${incremental ? " (incremental update)" : ""}`;
     }
+    case "context_pack_reused": {
+      const chars = Number(event?.data?.chars ?? 0);
+      return `Reused cached context pack${chars ? ` — ${Math.round(chars / 1000)}k chars` : ""} (scout skipped)`;
+    }
     case "member_prompted":
       return `${memberName || "Member"} received the task`;
     case "member_take":
@@ -153,12 +157,32 @@ function describeSwarmRunEvent(event, membersById) {
       return `${memberName || "Member"} hit an error${event?.text ? ` — ${truncateText(event.text, 90)}` : ""}`;
     case "gate_decision": {
       const takes = Number(event?.data?.takes ?? 0);
+      const similarity = Number(event?.data?.similarity ?? NaN);
+      const similarityText = Number.isFinite(similarity) ? ` (similarity ${similarity.toFixed(2)})` : "";
+      if (event?.data?.converged) {
+        return `Gate: ${takes} takes converged${similarityText} — synthesis skipped`;
+      }
       return takes <= 1
         ? "Gate: single take — it carries the run"
-        : `Gate: ${takes} takes collected — fusing`;
+        : `Gate: ${takes} takes collected — fusing${similarityText}`;
     }
     case "synthesis_started":
-      return `${memberName || "Champion"} is synthesizing the fused answer`;
+      return String(event?.text || "").startsWith("Converged execution")
+        ? `${memberName || "Champion"} is executing the converged plan`
+        : `${memberName || "Champion"} is synthesizing the fused answer`;
+    case "verification_started":
+      return `Verifying result${event?.text ? ` — ${truncateText(event.text, 90)}` : ""}`;
+    case "verification_result": {
+      const ok = Boolean(event?.data?.ok);
+      if (ok) return "Verification passed";
+      const timedOut = Boolean(event?.data?.timedOut);
+      const exitCode = Number(event?.data?.exitCode ?? NaN);
+      return timedOut
+        ? "Verification timed out"
+        : `Verification failed${Number.isFinite(exitCode) ? ` (exit ${exitCode})` : ""}`;
+    }
+    case "repair_started":
+      return `${memberName || "Champion"} is repairing the verification failure`;
     case "run_result":
       return "Fused result ready";
     case "run_settled": {
@@ -174,8 +198,32 @@ function describeSwarmRunEvent(event, membersById) {
   }
 }
 
+function swarmFeedEventTone(event) {
+  switch (event?.kind) {
+    case "verification_result":
+      return event?.data?.ok ? "good" : "bad";
+    case "repair_started":
+      return "bad";
+    case "context_pack_reused":
+      return "accent";
+    case "gate_decision":
+      return event?.data?.converged ? "accent" : undefined;
+    case "run_settled": {
+      const status = String(event?.data?.status || "done");
+      if (status === "done") return "good";
+      if (status === "failed" || status === "error") return "bad";
+      return undefined;
+    }
+    default:
+      return undefined;
+  }
+}
+
 function eventHasExpandableText(event) {
-  return (event?.kind === "member_take" || event?.kind === "run_result" || event?.kind === "context_pack_ready")
+  return (event?.kind === "member_take"
+    || event?.kind === "run_result"
+    || event?.kind === "context_pack_ready"
+    || event?.kind === "verification_result")
     && String(event?.text || "").trim().length > 0;
 }
 
@@ -1085,9 +1133,33 @@ const SwarmFeedRow = styled.div`
   border: 1px solid rgba(139, 148, 158, 0.14);
   background: #0d1117;
 
+  &[data-tone="good"] {
+    border-color: rgba(63, 185, 80, 0.45);
+  }
+
+  &[data-tone="bad"] {
+    border-color: rgba(248, 81, 73, 0.5);
+  }
+
+  &[data-tone="accent"] {
+    border-color: rgba(76, 141, 255, 0.45);
+  }
+
   html[data-forge-theme="light"] & {
     background: #ffffff;
     border-color: rgba(31, 35, 40, 0.1);
+
+    &[data-tone="good"] {
+      border-color: rgba(26, 127, 55, 0.4);
+    }
+
+    &[data-tone="bad"] {
+      border-color: rgba(207, 34, 46, 0.45);
+    }
+
+    &[data-tone="accent"] {
+      border-color: rgba(9, 105, 218, 0.4);
+    }
   }
 `;
 
@@ -1572,6 +1644,7 @@ export default function SwarmWorkspacePane({
   const [setupCounts, setSetupCounts] = useState({ claude: 1, codex: 1, opencode: 0 });
   const [addProvider, setAddProvider] = useState("codex");
   const [addModel, setAddModel] = useState("");
+  const [verifyDraft, setVerifyDraft] = useState(null); // null = mirror backend value
   const [stageView, setStageView] = useState({ x: 0, y: 0, zoom: 1 });
   const [stagePanning, setStagePanning] = useState(false);
 
@@ -1742,7 +1815,7 @@ export default function SwarmWorkspacePane({
     return () => window.clearInterval(timer);
   }, [activeRunId, backendMissing, isActive, loadRunEvents, refreshState]);
 
-  const applyMembers = useCallback(async (memberSpecs, scoutMemberId = undefined) => {
+  const applyMembers = useCallback(async (memberSpecs, scoutMemberId = undefined, verifyCommand = undefined) => {
     if (!workspaceId || busy) {
       return;
     }
@@ -1757,6 +1830,9 @@ export default function SwarmWorkspacePane({
         scoutMemberId: scoutMemberId === undefined
           ? String(swarmRef.current?.scoutMemberId || "")
           : String(scoutMemberId || ""),
+        verifyCommand: verifyCommand === undefined
+          ? String(swarmRef.current?.verifyCommand || "")
+          : String(verifyCommand || ""),
       });
       if (mountedRef.current) {
         setSwarm(state || null);
@@ -1827,6 +1903,20 @@ export default function SwarmWorkspacePane({
       label: member.label || "",
     }));
     applyMembers(specs, scoutMemberId);
+  }, [applyMembers, members]);
+
+  const handleVerifyCommandCommit = useCallback((verifyCommand) => {
+    const next = String(verifyCommand || "").trim();
+    if (next === String(swarmRef.current?.verifyCommand || "")) {
+      return;
+    }
+    const specs = members.map((member) => ({
+      memberId: member.memberId,
+      provider: member.provider,
+      model: member.model || "",
+      label: member.label || "",
+    }));
+    applyMembers(specs, undefined, next);
   }, [applyMembers, members]);
 
   const handleActivateSwarm = useCallback(async (memberId = "") => {
@@ -2081,7 +2171,12 @@ export default function SwarmWorkspacePane({
     }
     if (activeRunId) {
       const takeCount = events.filter((event) => event.kind === "member_take").length;
-      const synthesizing = events.some((event) => event.kind === "synthesis_started");
+      const lastVerification = [...events].reverse().find((event) => event.kind === "verification_result");
+      const verifying = events.some((event) => event.kind === "verification_started")
+        && (!lastVerification || events.some((event) => event.kind === "verification_started" && event.seq > lastVerification.seq));
+      const repairing = events.some((event) => event.kind === "repair_started") && !verifying
+        && (!lastVerification || !lastVerification.data?.ok);
+      const synthesizing = events.some((event) => event.kind === "synthesis_started") && !verifying && !repairing;
       const scouting = events.some((event) => event.kind === "context_pack_started")
         && !events.some((event) => event.kind === "context_pack_ready")
         && !synthesizing
@@ -2090,12 +2185,24 @@ export default function SwarmWorkspacePane({
       return {
         running: true,
         status: "running",
-        title: synthesizing ? "Synthesizing" : scouting ? "Scouting context" : "Collecting takes",
-        detail: synthesizing
-          ? "fusing member takes"
-          : scouting
-            ? "one scout, shared context"
-            : `${takeCount}/${members.length} takes in`,
+        title: verifying
+          ? "Verifying"
+          : repairing
+            ? "Repairing"
+            : synthesizing
+              ? "Synthesizing"
+              : scouting
+                ? "Scouting context"
+                : "Collecting takes",
+        detail: verifying
+          ? "running verify command"
+          : repairing
+            ? "champion fixing verification failure"
+            : synthesizing
+              ? "fusing member takes"
+              : scouting
+                ? "one scout, shared context"
+                : `${takeCount}/${members.length} takes in`,
       };
     }
     const lastRun = runs[0] || null;
@@ -2467,7 +2574,7 @@ export default function SwarmWorkspacePane({
                 const expandable = eventHasExpandableText(event);
                 const expanded = expandedSeqs.has(event.seq);
                 return (
-                  <SwarmFeedRow key={`${event.runId}-${event.seq}`}>
+                  <SwarmFeedRow data-tone={swarmFeedEventTone(event)} key={`${event.runId}-${event.seq}`}>
                     <SwarmFeedLine style={meta ? { "--swarm-edge-color": meta.color } : undefined}>
                       <time>{formatSwarmTime(event.at)}</time>
                       {meta ? <span data-member-dot="true" /> : null}
@@ -2508,6 +2615,32 @@ export default function SwarmWorkspacePane({
                       </option>
                     ))}
                   </select>
+                </SwarmAddMemberRow>
+              ) : null}
+              {hasMembers ? (
+                <SwarmAddMemberRow as="div" title="Run before an implement run settles as done (e.g. npm test, cargo check). Fails once → the champion gets one repair attempt. Empty = off.">
+                  <span style={{ fontSize: 10.5, fontWeight: 600, color: "rgba(139,148,158,0.95)", flex: "0 0 auto" }}>
+                    Verify
+                  </span>
+                  <input
+                    disabled={busy || backendMissing}
+                    onBlur={() => {
+                      if (verifyDraft !== null) {
+                        handleVerifyCommandCommit(verifyDraft);
+                        setVerifyDraft(null);
+                      }
+                    }}
+                    onChange={(event) => setVerifyDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.currentTarget.blur();
+                      }
+                    }}
+                    placeholder="verify command (optional) — e.g. npm test"
+                    spellCheck={false}
+                    style={{ flex: "1 1 auto" }}
+                    value={verifyDraft === null ? String(swarm?.verifyCommand || "") : verifyDraft}
+                  />
                 </SwarmAddMemberRow>
               ) : null}
               {members.map((member) => {

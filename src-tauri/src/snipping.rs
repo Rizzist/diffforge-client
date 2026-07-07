@@ -73,6 +73,20 @@ const SNIPPING_WINDOWS_GRAPHICS_CAPTURE_FRAME_WAIT_MS: u64 = 25;
 const SNIPPING_WINDOWS_GRAPHICS_CAPTURE_FIRST_FRAME_TIMEOUT_MS: u64 = 750;
 const SNIPPING_WARM_CAPTURE_FRAME_MAX_AGE_MS: u64 = 750;
 const SNIPPING_WARM_CAPTURE_RESTART_MIN_MS: u64 = 2_000;
+/// Wall-clock ms of the most recent macOS Space change. Warm frames captured
+/// before this instant show the PREVIOUS Space; freezing one right after a
+/// three-finger swipe snips the old desktop instead of the screen the user is
+/// looking at, so frame selection treats them as expired.
+static SNIPPING_LAST_SPACE_CHANGE_MS: AtomicU64 = AtomicU64::new(0);
+
+fn snipping_last_space_change_ms() -> u64 {
+    SNIPPING_LAST_SPACE_CHANGE_MS.load(Ordering::Acquire)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn snipping_mark_space_changed_now() {
+    SNIPPING_LAST_SPACE_CHANGE_MS.store(current_time_ms(), Ordering::Release);
+}
 const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
 const SNIPPING_MIN_RECORDING_PIXELS: u32 = 8;
 const SNIPPING_RECENT_CAPTURE_TOAST_LIMIT: usize = 6;
@@ -3728,7 +3742,11 @@ fn snipping_capture_monitor_full_image(
 ) -> Result<image::RgbaImage, String> {
     let warm_capture_allowed = !exclude_desktop_icons;
     if warm_capture_allowed {
-        if let Some(image) = snipping_warm_capture_frame_for_monitor(app, monitor, 0) {
+        // Frames older than the last Space change show the previous Space —
+        // freezing one right after a swipe would snip the wrong desktop.
+        if let Some(image) =
+            snipping_warm_capture_frame_for_monitor(app, monitor, snipping_last_space_change_ms())
+        {
             return Ok(image);
         }
     }
@@ -8469,6 +8487,9 @@ fn snipping_apply_overlay_fullscreen_window_style(window: &tauri::WebviewWindow)
 
 #[cfg(target_os = "macos")]
 fn snipping_set_area_crosshair_cursor_now() {
+    if SNIPPING_AREA_SESSION_RECORDING.load(Ordering::Acquire) {
+        return;
+    }
     snipping_catch_objc("set_area_crosshair_cursor", || {
         let before = snipping_macos_current_cursor_debug_value();
         NSCursor::crosshairCursor().set();
@@ -8501,17 +8522,26 @@ fn snipping_restore_default_cursor_now() {
 
 #[cfg(target_os = "macos")]
 fn snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window: &NSWindow) {
-    ns_window.setCollectionBehavior(
-        objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
-            | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
-            | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
-            | objc2_app_kit::NSWindowCollectionBehavior::Stationary
-            | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle,
-    );
-    ns_window.setSharingType(NSWindowSharingType::None);
-    ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+    // This runs on every reassertion tick while a snip is active. Rewriting
+    // window level/behavior when nothing drifted makes the WindowServer
+    // re-evaluate the window (and with it, cursor ownership) each tick —
+    // one source of the visible crosshair flicker — so only write on change.
+    let desired_behavior = objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllSpaces
+        | objc2_app_kit::NSWindowCollectionBehavior::CanJoinAllApplications
+        | objc2_app_kit::NSWindowCollectionBehavior::FullScreenAuxiliary
+        | objc2_app_kit::NSWindowCollectionBehavior::Stationary
+        | objc2_app_kit::NSWindowCollectionBehavior::IgnoresCycle;
+    if ns_window.collectionBehavior() != desired_behavior {
+        ns_window.setCollectionBehavior(desired_behavior);
+    }
+    if ns_window.sharingType() != NSWindowSharingType::None {
+        ns_window.setSharingType(NSWindowSharingType::None);
+    }
+    if ns_window.level() != objc2_app_kit::NSScreenSaverWindowLevel {
+        ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
+    }
     ns_window.setAcceptsMouseMovedEvents(true);
-    if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
+    if snipping_area_session_claims_crosshair() {
         snipping_force_area_crosshair_for_ns_window(ns_window);
     }
 }
@@ -8519,6 +8549,11 @@ fn snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window: &NSWin
 #[cfg(target_os = "macos")]
 fn snipping_force_area_crosshair_for_ns_window(ns_window: &NSWindow) {
     ns_window.setAcceptsMouseMovedEvents(true);
+    // Recording selection keeps WebKit's cursor (CSS `pointer`); claiming the
+    // crosshair or tearing down cursor rects here would fight it.
+    if SNIPPING_AREA_SESSION_RECORDING.load(Ordering::Acquire) {
+        return;
+    }
     if ns_window.areCursorRectsEnabled() {
         ns_window.disableCursorRects();
     }
@@ -8536,9 +8571,14 @@ fn snipping_force_area_crosshair_for_visible_overlays(
         return;
     }
     snipping_catch_objc("force_area_crosshair_for_visible_overlays", || {
+        // Recording mode still needs the window reasserts below (style,
+        // ordering, key handoff across Spaces) but never the crosshair.
+        let claim_cursor = snipping_area_session_claims_crosshair();
         let should_log = force_log || snipping_area_cursor_debug_should_sample_mouse();
         let before = should_log.then(snipping_macos_current_cursor_debug_value);
-        NSCursor::crosshairCursor().set();
+        if claim_cursor {
+            NSCursor::crosshairCursor().set();
+        }
 
         let location = objc2_app_kit::NSEvent::mouseLocation();
         let mouse_button_down = snipping_left_mouse_button_pressed();
@@ -8622,7 +8662,9 @@ fn snipping_force_area_crosshair_for_visible_overlays(
             }
         }
 
-        NSCursor::crosshairCursor().set();
+        if claim_cursor {
+            NSCursor::crosshairCursor().set();
+        }
         if should_log {
             log_snipping_area_cursor_debug_event(
                 "native.force_visible_overlays",
@@ -8990,7 +9032,9 @@ fn snipping_show_area_overlay_window_for_session(
             if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
                 snipping_force_area_crosshair_for_ns_window(ns_window);
             }
-            NSCursor::crosshairCursor().set();
+            if snipping_area_session_claims_crosshair() {
+                NSCursor::crosshairCursor().set();
+            }
             log_snipping_area_cursor_debug_event(
                 "native.overlay_show_crosshair_committed",
                 json!({
@@ -9099,7 +9143,9 @@ fn snipping_make_overlay_key_sync(app: &AppHandle, window: &tauri::WebviewWindow
             if SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire) {
                 if snipping_left_mouse_button_pressed() {
                     snipping_force_area_crosshair_for_ns_window(ns_window);
-                    NSCursor::crosshairCursor().set();
+                    if snipping_area_session_claims_crosshair() {
+                        NSCursor::crosshairCursor().set();
+                    }
                     log_snipping_area_cursor_debug_event(
                         "native.key_overlay_skipped_during_drag",
                         json!({
@@ -9117,7 +9163,9 @@ fn snipping_make_overlay_key_sync(app: &AppHandle, window: &tauri::WebviewWindow
                 snipping_force_area_crosshair_for_ns_window(ns_window);
             }
             ns_window.makeKeyAndOrderFront(None);
-            NSCursor::crosshairCursor().set();
+            if snipping_area_session_claims_crosshair() {
+                NSCursor::crosshairCursor().set();
+            }
             log_snipping_area_cursor_debug_event(
                 "native.key_overlay_crosshair_committed",
                 json!({
@@ -9151,8 +9199,21 @@ fn snipping_make_overlay_key_sync(app: &AppHandle, window: &tauri::WebviewWindow
 static SNIPPING_OVERLAY_MOUSE_MONITORS_STARTED: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static SNIPPING_AREA_SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// True while the active area session selects a RECORDING region. Recording
+/// selection keeps the normal cursor (the overlay CSS asks for `pointer`), so
+/// every native crosshair claim must stand down — otherwise the NSCursor
+/// reassertion machinery fights WebKit and the user sees a crosshair (or
+/// flicker) where none belongs.
+#[cfg(target_os = "macos")]
+static SNIPPING_AREA_SESSION_RECORDING: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "macos")]
 static SNIPPING_AREA_REASSERT_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(target_os = "macos")]
+fn snipping_area_session_claims_crosshair() -> bool {
+    SNIPPING_AREA_SESSION_ACTIVE.load(Ordering::Acquire)
+        && !SNIPPING_AREA_SESSION_RECORDING.load(Ordering::Acquire)
+}
 
 /// A Space swipe can finish before AppKit/WebKit are done restoring cursor
 /// ownership. Reassert from the event that changed the Space, then a few more
@@ -9492,6 +9553,31 @@ fn snipping_area_already_active_payload(reason: &str, shortcut: String) -> Value
     })
 }
 
+/// Re-shows every overlay window that belongs to the ACTIVE area session.
+/// Idempotent recovery for overlays that never became visible (their original
+/// show timed out on a stalled main thread) or got stranded on another Space.
+fn snipping_reshow_active_area_overlays(app: &AppHandle, reason: &'static str) {
+    for (label, window) in snipping_overlay_windows(app) {
+        if snipping_area_session_monitor(app, &label).is_err() {
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        let shown = snipping_show_area_overlay_window_for_session(app, &window, &label);
+        #[cfg(not(target_os = "macos"))]
+        let shown = snipping_show_window_now(&window, "reshow_active_area_overlay");
+        log_snipping_area_cursor_debug_event(
+            "native.reshow_active_overlay",
+            json!({
+                "reason": reason,
+                "overlay_label": label,
+                "shown": shown,
+            }),
+        );
+    }
+    #[cfg(target_os = "macos")]
+    snipping_schedule_area_overlay_reassertions(app, reason);
+}
+
 fn snipping_area_session_monitor(
     app: &AppHandle,
     label: &str,
@@ -9608,6 +9694,12 @@ fn snipping_begin_area_for(
                 "cursor_position": snipping_app_cursor_position_debug_value(app),
             }),
         );
+        // A session can be active with its overlays invisible: the show call
+        // times out when the main thread stalls >750ms, and nothing retried
+        // it — every re-press landed here and did NOTHING, wedging the snip
+        // (no header, no crosshair) until Escape. Re-pressing the hotkey now
+        // re-shows the session's overlays on the current Space instead.
+        snipping_reshow_active_area_overlays(app, "begin_already_active");
         return Ok(snipping_area_already_active_payload(reason, shortcut));
     }
     snipping_clear_stale_area_begin_if_needed(app, reason, &shortcut);
@@ -9802,8 +9894,12 @@ fn snipping_begin_area_for(
     }
     #[cfg(target_os = "macos")]
     {
+        SNIPPING_AREA_SESSION_RECORDING
+            .store(matches!(mode, SnippingAreaMode::Recording), Ordering::Release);
         SNIPPING_AREA_SESSION_ACTIVE.store(true, Ordering::Release);
-        snipping_claim_area_crosshair_on_main_thread(app, "session_active");
+        if snipping_area_session_claims_crosshair() {
+            snipping_claim_area_crosshair_on_main_thread(app, "session_active");
+        }
         log_snipping_area_cursor_debug_event(
             "native.session_active",
             json!({
@@ -9850,7 +9946,13 @@ fn snipping_begin_area_for(
         snipping_wait_for_area_overlay_ready(app, label);
         #[cfg(target_os = "macos")]
         {
-            if !snipping_show_area_overlay_window_for_session(app, &window, label) {
+            // The show runs main-thread-sync with a 750ms timeout. A stalled
+            // main thread fails the first attempt while its closure is still
+            // queued; one retry lands right behind it and almost always
+            // succeeds, instead of silently leaving this display overlay-less.
+            let shown = snipping_show_area_overlay_window_for_session(app, &window, label)
+                || snipping_show_area_overlay_window_for_session(app, &window, label);
+            if !shown {
                 log_snipping_area_cursor_debug_event(
                     "native.overlay_show_failed",
                     json!({
@@ -10120,6 +10222,7 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
             let block = block2::RcBlock::new(
                 move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
                     snipping_catch_objc("space_change_observer_callback", || {
+                        snipping_mark_space_changed_now();
                         let use_full_monitor_bounds =
                             macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
                         if let Some(app) = snipping_macos_event_tap_app() {
@@ -10216,6 +10319,7 @@ fn snipping_hide_area_overlay_with_desktop_restore(app: &AppHandle, restore_desk
     #[cfg(target_os = "macos")]
     {
         SNIPPING_AREA_SESSION_ACTIVE.store(false, Ordering::Release);
+        SNIPPING_AREA_SESSION_RECORDING.store(false, Ordering::Release);
         SNIPPING_AREA_REASSERT_GENERATION.fetch_add(1, Ordering::AcqRel);
     }
     snipping_unregister_escape_cancel(app);

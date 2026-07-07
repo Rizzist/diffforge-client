@@ -17926,7 +17926,7 @@ fn tokenomics_query_rows(conn: &rusqlite::Connection, sql: &str) -> Result<Vec<V
 mod tokenomics_tests {
     use super::*;
 
-    static TOKENOMICS_OPENCODE_TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+    use super::OPENCODE_DB_TEST_LOCK as TOKENOMICS_OPENCODE_TEST_LOCK;
 
     // Single test for the whole changed-path batch state machine: the batch
     // slot is process-global, so splitting these into parallel #[test]s

@@ -159,7 +159,7 @@ const CLOUD_MCP_TOKENOMICS_SYNC_PROTOCOL: &str = "tokenomics.device.graph_facts.
 const CLOUD_MCP_TOKENOMICS_SYNC_SCHEMA_VERSION: u64 = 4;
 const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT: &str = "agent_chat_session_sync";
 const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT: &str = "diffforge.agent_chat_sessions.v1";
-const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_SCHEMA_VERSION: u64 = 1;
+const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_SCHEMA_VERSION: u64 = 2;
 const CLOUD_MCP_TERMINAL_OUTPUT_CONTRACT: &str = "diffforge.termout.v1";
 // Device live-state snapshots triggered from terminal-state live updates are
 // debounced (trailing, latest-wins) so hook storms publish at most ~6
@@ -1282,39 +1282,6 @@ fn cloud_mcp_verbose_sync_diagnostics() -> bool {
             )
         })
         .unwrap_or(false)
-}
-
-fn cloud_mcp_agent_stream_debug_enabled() -> bool {
-    cfg!(debug_assertions)
-        && [
-            "RUST_DIFFFORGE_AGENT_STREAM_DEBUG",
-            "RUST_DIFFFORGE_USE_LOCAL_DOCKER_CLOUD",
-            CLOUD_MCP_ALLOW_LOCAL_CLOUD_ENV,
-        ]
-        .iter()
-        .any(|key| {
-            env::var(key).ok().is_some_and(|value| {
-                matches!(
-                    value.trim().to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on" | "debug"
-                )
-            })
-        })
-}
-
-fn cloud_mcp_agent_stream_text_summary(value: Option<&str>) -> Value {
-    let Some(value) = value else {
-        return json!({ "present": false });
-    };
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut hasher);
-    json!({
-        "present": true,
-        "bytes": value.len(),
-        "chars": value.chars().count(),
-        "hash": format!("{:016x}", hasher.finish()),
-    })
 }
 
 fn cloud_mcp_home_dir() -> Option<PathBuf> {
@@ -7397,6 +7364,8 @@ fn cloud_mcp_agent_chat_mark_session_acked_from_payload(
             total_record_count
         }
     });
+    let metadata_only = cloud_mcp_payload_bool(payload, &["metadata_only"], false)
+        || cloud_mcp_payload_bool(payload, &["metadataOnly"], false);
     let content_hash =
         cloud_mcp_payload_text(payload, &["content_hash", "contentHash", "ch"]).unwrap_or_default();
     let metadata_hash = cloud_mcp_payload_text(payload, &["metadata_hash", "metadataHash", "mh"])
@@ -7415,7 +7384,8 @@ fn cloud_mcp_agent_chat_mark_session_acked_from_payload(
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|error| format!("Unable to start agent chat sync ack transaction: {error}"))?;
     let result = (|| -> Result<bool, String> {
-        if records.is_empty()
+        if !metadata_only
+            && records.is_empty()
             && total_record_count > 0
             && response_session_record_count < total_record_count
         {
@@ -7793,6 +7763,18 @@ fn cloud_mcp_task_event_kind_removed(event_kind: &str) -> bool {
             | "spec_activity_recorded"
             | "history_event"
             | "terminal_lifecycle"
+            | "agent_chat_session_live_delta"
+            | "agent_chat_live_delta"
+            | "live_delta"
+            | "live_delta_chunk"
+            | "diffforge.agentturn.v1"
+            | "turn.e"
+            | "agent.turn"
+            | "agentturn"
+            | "turn.sub"
+            | "turn.unsub"
+            | "agent_turn_subscribe"
+            | "agent_turn_unsubscribe"
             | "workspace_todo_snapshot"
             | "workspace_todos_snapshot"
             | "todo_queue_snapshot"
@@ -11136,8 +11118,10 @@ async fn cloud_mcp_run_tokenomics_sync_job(
             let _span = BackendCpuSpan::new("cloud_mcp.tokenomics_sync.provider_identity_refresh");
             let conn = tokenomics_open_db(&identity_app)?;
             tokenomics_reconcile_current_provider_accounts(&conn)?;
-            let identity_summary =
-                tokenomics_provider_account_identity_summary_from_conn(&conn, Some(&identity_scope))?;
+            let identity_summary = tokenomics_provider_account_identity_summary_from_conn(
+                &conn,
+                Some(&identity_scope),
+            )?;
             Ok::<Vec<Value>, String>(cloud_mcp_tokenomics_provider_accounts(
                 &identity_summary,
                 cloud_mcp_now_ms(),
@@ -18209,7 +18193,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             "ws.ready",
             json!({ "connection_id": connection_id.clone() }),
         );
-        agent_chat_session_sync_mark_all_workspace_history_dirty("global_ws_ready");
+        agent_chat_session_sync_mark_all_workspace_history_dirty();
         cloud_mcp_note_sync_connection(false, "desktop_registering");
         let ready_message = message.clone();
         let state_for_initial = state.clone();
@@ -18428,7 +18412,7 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
             runtime.global_ws_last_connected_ms = Some(cloud_mcp_now_ms());
         }
         cloud_mcp_note_sync_connection(true, "connected");
-        agent_chat_session_sync_mark_all_workspace_history_dirty("websocket_hello_ack");
+        agent_chat_session_sync_mark_all_workspace_history_dirty();
         log_cloud_sync_event(
             "ws.desktop_registered",
             json!({
@@ -18465,14 +18449,9 @@ async fn cloud_mcp_handle_global_ws_message(state: &CloudMcpState, text: &str) {
         cloud_mcp_payload_text(&message, &["event_kind", "eventKind", "kind"]).unwrap_or_default();
     if matches!(
         direct_kind.as_str(),
-        "session.gap"
-            | "session_gap"
-            | "agent_session_gap"
-            | "turn.gap"
-            | "turn_gap"
-            | "agent_turn_gap"
+        "session.gap" | "session_gap" | "agent_session_gap"
     ) {
-        agent_chat_session_sync_mark_payload_workspace_history_dirty(&message, &direct_kind);
+        agent_chat_session_sync_mark_payload_workspace_history_dirty(&message);
     }
     let direct_request_kind =
         cloud_mcp_payload_text(&message, &["request_kind", "requestKind"]).unwrap_or_default();
@@ -19377,46 +19356,88 @@ fn cloud_mcp_daemon_gui_block_message(command_kind: &str) -> Option<&'static str
         // workspace lever persists pendingActivationWorkspaceId to shared
         // disk state and answers "queued", so the intent survives a later
         // GUI launch even when received by the daemon.
-        "app_view_select" | "select_app_view" | "switch_app_view" | "app_navigate"
-        | "app_open_view" | "workspace_select" | "select_workspace" | "switch_workspace"
-        | "workspace_tab_select" | "select_workspace_tab" | "switch_workspace_tab"
+        "app_view_select"
+        | "select_app_view"
+        | "switch_app_view"
+        | "app_navigate"
+        | "app_open_view"
+        | "workspace_select"
+        | "select_workspace"
+        | "switch_workspace"
+        | "workspace_tab_select"
+        | "select_workspace_tab"
+        | "switch_workspace_tab"
         | "workspace_open_tab" => {
             Some("Remote navigation controls are unavailable in daemon mode.")
         }
-        "workspace_panel_close" | "close_workspace_panel" | "panel_close" | "close_panel"
-        | "terminal_window_breakout" | "breakout_terminal" | "breakout_terminals"
-        | "terminal_breakout" | "open_terminal_window" | "terminal_window_open"
-        | "terminal_window_return" | "return_terminal_window" | "return_terminal_to_grid"
-        | "close_terminal_window" | "terminal_window_close" => {
+        "workspace_panel_close"
+        | "close_workspace_panel"
+        | "panel_close"
+        | "close_panel"
+        | "terminal_window_breakout"
+        | "breakout_terminal"
+        | "breakout_terminals"
+        | "terminal_breakout"
+        | "open_terminal_window"
+        | "terminal_window_open"
+        | "terminal_window_return"
+        | "return_terminal_window"
+        | "return_terminal_to_grid"
+        | "close_terminal_window"
+        | "terminal_window_close" => {
             Some("Remote panel and window controls are unavailable in daemon mode.")
         }
-        "terminal_open" | "open_terminal" | "open_terminals" | "terminal_spawn"
-        | "spawn_terminals" | "agent_chat_session_open" | "open_agent_chat_session"
-        | "session_open" | "open_session" | "resume_agent_chat_session" | "resume_session"
-        | "terminal_relaunch_agent" | "relaunch_terminal_agent" | "relaunch_terminal"
-        | "terminal_relaunch" | "terminal_restart" | "terminal_restart_agent"
-        | "restart_terminal" | "restart_terminal_agent" | "terminal_switch_agent"
+        "terminal_open"
+        | "open_terminal"
+        | "open_terminals"
+        | "terminal_spawn"
+        | "spawn_terminals"
+        | "agent_chat_session_open"
+        | "open_agent_chat_session"
+        | "session_open"
+        | "open_session"
+        | "resume_agent_chat_session"
+        | "resume_session"
+        | "terminal_relaunch_agent"
+        | "relaunch_terminal_agent"
+        | "relaunch_terminal"
+        | "terminal_relaunch"
+        | "terminal_restart"
+        | "terminal_restart_agent"
+        | "restart_terminal"
+        | "restart_terminal_agent"
+        | "terminal_switch_agent"
         | "switch_terminal_agent" => {
             Some("Remote terminal foreground controls are unavailable in daemon mode.")
         }
-        "agent_chat_change_model" | "change_agent_chat_model" | "agent_chat_model_change"
-        | "change_session_model" | "session_model_change" | "agent_chat_change_effort"
-        | "change_agent_chat_effort" | "agent_chat_effort_change"
-        | "change_session_effort" | "session_effort_change" => {
+        "agent_chat_change_model"
+        | "change_agent_chat_model"
+        | "agent_chat_model_change"
+        | "change_session_model"
+        | "session_model_change"
+        | "agent_chat_change_effort"
+        | "change_agent_chat_effort"
+        | "agent_chat_effort_change"
+        | "change_session_effort"
+        | "session_effort_change" => {
             Some("Remote live-session configuration is unavailable in daemon mode.")
         }
-        "todo_requeue" | "requeue_todo" | "todo_retry" | "retry_todo" | "todo_unqueue"
-        | "unqueue_todo" | "workspace_todo_unqueue" | "todo_dequeue" | "dequeue_todo" => {
+        "todo_requeue"
+        | "requeue_todo"
+        | "todo_retry"
+        | "retry_todo"
+        | "todo_unqueue"
+        | "unqueue_todo"
+        | "workspace_todo_unqueue"
+        | "todo_dequeue"
+        | "dequeue_todo" => {
             Some("Remote todo queue panel controls are unavailable in daemon mode.")
         }
         _ => None,
     }
 }
 
-async fn cloud_mcp_apply_daemon_remote_command_guard(
-    state: &CloudMcpState,
-    event: &Value,
-) -> bool {
+async fn cloud_mcp_apply_daemon_remote_command_guard(state: &CloudMcpState, event: &Value) -> bool {
     if !crate::daemon_mode_active() {
         return false;
     }
@@ -20242,8 +20263,7 @@ async fn cloud_mcp_start_remote_command_listener(
                 )
                 .await;
             }
-            if crate::daemon_mode_active()
-                && (intake_outcome.is_some() || delete_outcome.is_some())
+            if crate::daemon_mode_active() && (intake_outcome.is_some() || delete_outcome.is_some())
             {
                 continue;
             }
@@ -29716,7 +29736,11 @@ async fn cloud_mcp_mark_device_live_terminal_closed(
             continue;
         };
         for terminal in terminals {
-            if !cloud_mcp_presence_terminal_matches_instance_for_close(terminal, pane_id, instance_id) {
+            if !cloud_mcp_presence_terminal_matches_instance_for_close(
+                terminal,
+                pane_id,
+                instance_id,
+            ) {
                 continue;
             }
             matched = matched.saturating_add(1);
@@ -32776,11 +32800,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                 object.insert("updated_at_ms".to_string(), json!(cloud_mcp_now_ms()));
                 object.insert("updatedAtMs".to_string(), json!(cloud_mcp_now_ms()));
             }
-            agent_chat_session_sync_mark_workspace_history_dirty(
-                workspace_id,
-                None,
-                "workspace_snapshot_transient_gap_backfill",
-            );
+            agent_chat_session_sync_mark_workspace_history_dirty(workspace_id);
             normalized_workspaces.push(workspace);
             reported_workspace_ids.insert(workspace_id.clone());
             workspace_snapshot_fallback_count += 1;
@@ -33592,6 +33612,189 @@ async fn cloud_mcp_publish_terminal_state_live_update(
     cloud_mcp_publish_device_live_state_snapshot_debounced(state, reason).await;
 }
 
+fn cloud_mcp_agent_chat_status_hook_is_relevant(
+    payload: &TerminalActivityHookPayload,
+    state_value: &str,
+    turn_status: &str,
+) -> bool {
+    let event_type = cloud_mcp_lifecycle_status_key(&payload.event_type);
+    let command_phase = cloud_mcp_lifecycle_status_key(&payload.command_phase);
+    payload.input_ready
+        || payload.terminal_is_prompting_user
+        || payload.provider_blocked_for_user
+        || payload.manual_approval_required
+        || matches!(
+            event_type.as_str(),
+            "provider_turn_started"
+                | "provider_turn_completed"
+                | "provider_turn_error"
+                | "provider_turn_interrupted"
+                | "provider_permission_requested"
+                | "provider_user_prompt_started"
+                | "provider_user_prompt_completed"
+                | "provider_user_prompt_answered"
+        )
+        || matches!(
+            command_phase.as_str(),
+            "awaiting_input"
+                | "awaiting_permission"
+                | "awaiting_user"
+                | "needs_input"
+                | "prompting_user"
+        )
+        || matches!(
+            state_value,
+            "paused" | "idle" | "error" | "interrupted" | "closed"
+        )
+        || matches!(
+            turn_status,
+            "completed" | "failed" | "interrupted" | "cancelled"
+        )
+}
+
+fn cloud_mcp_agent_chat_status_from_hook(
+    payload: &TerminalActivityHookPayload,
+    state_value: &str,
+) -> String {
+    let command_phase = cloud_mcp_lifecycle_status_key(&payload.command_phase);
+    if payload.input_ready
+        || payload.terminal_is_prompting_user
+        || payload.provider_blocked_for_user
+        || payload.manual_approval_required
+        || state_value == "paused"
+        || matches!(
+            command_phase.as_str(),
+            "awaiting_input"
+                | "awaiting_permission"
+                | "awaiting_user"
+                | "needs_input"
+                | "prompting_user"
+        )
+    {
+        return "awaiting_input".to_string();
+    }
+    match state_value {
+        "thinking" | "compacting" => "running".to_string(),
+        "error" => "error".to_string(),
+        "interrupted" => "interrupted".to_string(),
+        "idle" => "idle".to_string(),
+        "closed" => "closed".to_string(),
+        value if !value.trim().is_empty() => value.to_string(),
+        _ => "running".to_string(),
+    }
+}
+
+struct CloudMcpAgentChatStatusSyncRequest {
+    provider: String,
+    provider_session_id: String,
+    cwd: String,
+    context: AgentChatSessionSyncContext,
+}
+
+fn cloud_mcp_agent_chat_status_sync_request_from_hook(
+    payload: &TerminalActivityHookPayload,
+    context_entry: Option<&CloudMcpTerminalContextState>,
+    workspace_root: &str,
+    state_value: &str,
+    turn_status: &str,
+) -> Option<CloudMcpAgentChatStatusSyncRequest> {
+    if !cloud_mcp_agent_chat_status_hook_is_relevant(payload, state_value, turn_status) {
+        return None;
+    }
+    let provider_session_id = payload
+        .provider_session_id
+        .as_deref()
+        .or(payload.native_session_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let provider = [
+        payload.provider.as_str(),
+        payload.agent_kind.as_str(),
+        payload.agent_id.as_str(),
+    ]
+    .into_iter()
+    .find_map(agent_chat_session_sync_provider)?;
+    let workspace_id = if payload.workspace_id.trim().is_empty() {
+        context_entry
+            .map(|entry| entry.workspace_id.clone())
+            .unwrap_or_default()
+    } else {
+        payload.workspace_id.clone()
+    };
+    if workspace_id.trim().is_empty() {
+        return None;
+    }
+    let cwd = if workspace_root.trim().is_empty() {
+        payload.cwd.clone().unwrap_or_default()
+    } else {
+        workspace_root.to_string()
+    };
+    let context = AgentChatSessionSyncContext {
+        workspace_id,
+        workspace_name: if payload.workspace_name.trim().is_empty() {
+            context_entry
+                .map(|entry| entry.workspace_name.clone())
+                .unwrap_or_default()
+        } else {
+            payload.workspace_name.clone()
+        },
+        thread_id: if payload.thread_id.trim().is_empty() {
+            context_entry
+                .and_then(|entry| entry.thread_id.clone())
+                .unwrap_or_default()
+        } else {
+            payload.thread_id.clone()
+        },
+        pane_id: payload.pane_id.clone(),
+        terminal_instance_id: Some(payload.instance_id),
+        terminal_index: payload.terminal_index.map(i64::from),
+        session_mode: context_entry
+            .map(|entry| entry.session_mode.clone())
+            .unwrap_or_default(),
+        status: cloud_mcp_agent_chat_status_from_hook(payload, state_value),
+        source: "terminal_activity_hook_status".to_string(),
+        fork_from_provider_session_id: payload
+            .fork_from_provider_session_id
+            .clone()
+            .unwrap_or_default(),
+        metadata_only: true,
+        ..AgentChatSessionSyncContext::default()
+    };
+    Some(CloudMcpAgentChatStatusSyncRequest {
+        provider: provider.to_string(),
+        provider_session_id: provider_session_id.to_string(),
+        cwd,
+        context,
+    })
+}
+
+fn cloud_mcp_sync_agent_chat_session_status_from_hook(
+    state: &CloudMcpState,
+    payload: &TerminalActivityHookPayload,
+    context_entry: Option<&CloudMcpTerminalContextState>,
+    workspace_root: &str,
+    state_value: &str,
+    turn_status: &str,
+) {
+    let Some(request) = cloud_mcp_agent_chat_status_sync_request_from_hook(
+        payload,
+        context_entry,
+        workspace_root,
+        state_value,
+        turn_status,
+    ) else {
+        return;
+    };
+    agent_chat_session_sync_spawn_with_state(
+        state.clone(),
+        request.provider,
+        request.provider_session_id,
+        request.cwd,
+        request.context,
+        "terminal_activity_hook_status",
+    );
+}
+
 pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     state: &CloudMcpState,
     payload: &TerminalActivityHookPayload,
@@ -33662,15 +33865,14 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
     } else {
         Some(cloud_mcp_workspace_runtime_epoch(state))
     };
-    cloud_mcp_publish_agent_turn_event(
+    cloud_mcp_sync_agent_chat_session_status_from_hook(
         state,
         payload,
-        status_seq,
+        context_entry.as_ref(),
+        &workspace_root,
         state_value,
         turn_status,
-        direct_prompt_refs.as_ref(),
-    )
-    .await;
+    );
     let terminal_state_summary = format!("Terminal {}.", state_value);
     let mut delta = json!({
         "source": "rust-diffforge-activity-hook",
@@ -42339,28 +42541,32 @@ async fn cloud_mcp_upload_account_asset_once(
             object.insert("cloud_id".to_string(), json!(transfer_cloud_id));
             object.insert("cloudId".to_string(), json!(transfer_cloud_id));
         }
-        let completed =
-            match cloud_mcp_post_json_endpoint(state, "/v1/assets/complete-upload", &complete_payload)
-                .await
-            {
-                Ok(completed) => completed,
-                Err(error) => {
-                    let bytes_done = cloud_mcp_asset_last_transfer_bytes_done(&transfer_id);
-                    let _ = cloud_mcp_asset_store_local_transfer_progress(
-                        &asset_id,
-                        &transfer_id,
-                        &transfer_cloud_id,
-                        "upload",
-                        "failed",
-                        bytes_total.max(bytes_done),
-                        bytes_done,
-                        Some(&error),
-                    );
-                    return Err(error);
-                }
-            };
+        let completed = match cloud_mcp_post_json_endpoint(
+            state,
+            "/v1/assets/complete-upload",
+            &complete_payload,
+        )
+        .await
+        {
+            Ok(completed) => completed,
+            Err(error) => {
+                let bytes_done = cloud_mcp_asset_last_transfer_bytes_done(&transfer_id);
+                let _ = cloud_mcp_asset_store_local_transfer_progress(
+                    &asset_id,
+                    &transfer_id,
+                    &transfer_cloud_id,
+                    "upload",
+                    "failed",
+                    bytes_total.max(bytes_done),
+                    bytes_done,
+                    Some(&error),
+                );
+                return Err(error);
+            }
+        };
         let completed_data = completed.get("data").cloned().unwrap_or(completed);
-        let completed_bytes = bytes_total.max(cloud_mcp_asset_last_transfer_bytes_done(&transfer_id));
+        let completed_bytes =
+            bytes_total.max(cloud_mcp_asset_last_transfer_bytes_done(&transfer_id));
         let _ = cloud_mcp_asset_store_local_transfer_progress(
             &asset_id,
             &transfer_id,
@@ -44476,8 +44682,8 @@ fn cloud_mcp_asset_v2_expanded_from_response(value: &Value) -> Option<CloudMcpAs
             &payload,
             "a",
             &[
-                "aid", "bid", "n", "k", "mt", "sz", "sha", "st", "ut", "src", "fold", "dom",
-                "pub", "purl",
+                "aid", "bid", "n", "k", "mt", "sz", "sha", "st", "ut", "src", "fold", "dom", "pub",
+                "purl",
             ],
         ) {
             let asset_id = cloud_mcp_asset_row_text(&row, &["aid", "asset_id", "assetId", "id"]);
@@ -44540,7 +44746,11 @@ fn cloud_mcp_asset_v2_expanded_from_response(value: &Value) -> Option<CloudMcpAs
                     item.insert("public".to_string(), json!(is_public));
                     item.insert("is_public".to_string(), json!(is_public));
                     item.insert("isPublic".to_string(), json!(is_public));
-                    let effective_url = if is_public { public_url.clone() } else { String::new() };
+                    let effective_url = if is_public {
+                        public_url.clone()
+                    } else {
+                        String::new()
+                    };
                     item.insert("public_url".to_string(), json!(effective_url.clone()));
                     item.insert("publicUrl".to_string(), json!(effective_url));
                 }
@@ -45268,7 +45478,13 @@ fn cloud_mcp_asset_merge_cloud_identity_row(incoming: &mut Value, existing: &Val
             }
         }
     }
-    for key in ["clouds", "cloudStatuses", "cloud_statuses", "cloud_status_by_cloud", "cloudStatusByCloud"] {
+    for key in [
+        "clouds",
+        "cloudStatuses",
+        "cloud_statuses",
+        "cloud_status_by_cloud",
+        "cloudStatusByCloud",
+    ] {
         let missing = match incoming_object.get(key) {
             Some(Value::Array(values)) => values.is_empty(),
             Some(Value::Object(map)) => map.is_empty(),
@@ -52510,67 +52726,50 @@ mod cloud_mcp_tests {
 
     static CLOUD_MCP_TEST_ENV_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
 
-    #[test]
-    fn activity_hook_agents_match_frontend_set() {
-        // Must stay in sync with TERMINAL_ACTIVITY_HOOK_AGENT_KINDS in
-        // terminalActivityState.js so OpenCode's plugin owns turn state.
-        assert!(cloud_mcp_agent_uses_activity_hooks("claude"));
-        assert!(cloud_mcp_agent_uses_activity_hooks("codex"));
-        assert!(cloud_mcp_agent_uses_activity_hooks("opencode"));
-        assert!(cloud_mcp_agent_uses_activity_hooks(" OpenCode "));
-        assert!(!cloud_mcp_agent_uses_activity_hooks("shell"));
-        assert!(!cloud_mcp_agent_uses_activity_hooks("generic"));
-    }
-
-    fn test_activity_hook_payload(
-        hook_event_name: &str,
-        command_phase: &str,
-        completion_evidence: &str,
-        message: Option<&str>,
-    ) -> TerminalActivityHookPayload {
+    fn agent_chat_status_hook_test_payload(event_type: &str) -> TerminalActivityHookPayload {
         TerminalActivityHookPayload {
             pane_id: "pane-1".to_string(),
             instance_id: 1,
-            workspace_id: "workspace-1".to_string(),
-            workspace_name: "Workspace".to_string(),
+            workspace_id: "workspace-a".to_string(),
+            workspace_name: "Workspace A".to_string(),
             terminal_index: Some(0),
-            thread_id: "thread-1".to_string(),
-            agent_id: "claude".to_string(),
-            agent_kind: "claude".to_string(),
-            agent_type: String::new(),
-            agent_display_name: "Claude".to_string(),
-            display_name: "Claude".to_string(),
-            terminal_name: "Claude".to_string(),
-            terminal_nickname: "Claude".to_string(),
-            provider: "claude".to_string(),
-            event_type: "provider-turn-started".to_string(),
-            hook_event_name: hook_event_name.to_string(),
-            source: "cli-hook".to_string(),
+            thread_id: "thread-a".to_string(),
+            agent_id: "codex".to_string(),
+            agent_kind: "codex".to_string(),
+            agent_type: "codex".to_string(),
+            agent_display_name: "Codex".to_string(),
+            display_name: "Codex".to_string(),
+            terminal_name: "Codex".to_string(),
+            terminal_nickname: String::new(),
+            provider: "codex".to_string(),
+            event_type: event_type.to_string(),
+            hook_event_name: event_type.to_string(),
+            source: "test".to_string(),
             status: "active".to_string(),
             activity_status: "thinking".to_string(),
-            command_phase: command_phase.to_string(),
+            command_phase: "running".to_string(),
             execution_phase: "running".to_string(),
             native_rail_state: "thinking".to_string(),
-            native_rail_label: "Thinking".to_string(),
+            native_rail_label: "thinking".to_string(),
             readiness: "busy".to_string(),
-            terminal_lifecycle: "active".to_string(),
-            terminal_status: "active".to_string(),
+            terminal_lifecycle: "open".to_string(),
+            terminal_status: "thinking".to_string(),
             terminal_work_state: "running".to_string(),
             turn_status: "running".to_string(),
-            session_state: "running".to_string(),
+            session_state: "session_attached".to_string(),
             input_ready: false,
             input_ready_at: None,
             prompt_ready_at: None,
             completed_at: None,
-            provider_session_id: Some("session-1".to_string()),
-            native_session_id: Some("session-1".to_string()),
+            provider_session_id: Some("session-a".to_string()),
+            native_session_id: None,
             fork_from_provider_session_id: None,
-            provider_turn_id: Some("turn-1".to_string()),
-            turn_id: Some("turn-1".to_string()),
+            provider_turn_id: Some("turn-a".to_string()),
+            turn_id: Some("turn-a".to_string()),
             transcript_path: None,
-            cwd: None,
-            user_message: message.map(str::to_string),
-            message: message.map(str::to_string),
+            cwd: Some("/tmp/project".to_string()),
+            user_message: None,
+            message: None,
             live_text_delta: None,
             live_text_snapshot: None,
             live_text_kind: None,
@@ -52603,144 +52802,55 @@ mod cloud_mcp_tests {
             prompting_user_source: None,
             prompting_user_confidence: None,
             prompting_user_text: None,
-            hook_health_status: "ok".to_string(),
+            hook_health_status: "healthy".to_string(),
             hook_health_event: "ok".to_string(),
-            hook_health_observed_at_ms: 1,
-            hook_timestamp_ms: 1,
-            observed_at_ms: 1,
-            completion_evidence: completion_evidence.to_string(),
+            hook_health_observed_at_ms: 0,
+            hook_timestamp_ms: 0,
+            observed_at_ms: 0,
+            completion_evidence: String::new(),
         }
     }
 
     #[test]
-    fn agent_turn_message_gate_includes_reasoning_but_not_user_prompt() {
-        let reasoning = test_activity_hook_payload(
-            "ThinkingDelta",
-            "running",
-            "cli_hook_reasoning",
-            Some("reasoning token"),
-        );
-        assert!(cloud_mcp_agent_turn_should_include_message(
-            "ts", &reasoning
-        ));
-
-        let prompt_submit = test_activity_hook_payload(
-            "UserPromptSubmit",
-            "running",
-            "cli_hook_prompt_submit",
-            Some("user prompt should not echo"),
-        );
-        assert!(!cloud_mcp_agent_turn_should_include_message(
-            "ts",
-            &prompt_submit,
-        ));
-    }
-
-    #[test]
-    fn live_text_delta_merge_deduplicates_repaint_overlap() {
-        match cloud_mcp_merge_live_text_delta("Work", "king on it") {
-            CloudMcpLiveTextMerge::Delta(value) => assert_eq!(value, "Working on it"),
-            CloudMcpLiveTextMerge::Snapshot(_) => panic!("expected delta merge"),
+    fn agent_chat_status_hooks_map_to_metadata_only_sync_requests() {
+        for event_type in [
+            "provider-turn-started",
+            "provider-turn-completed",
+            "provider-turn-error",
+            "provider-turn-interrupted",
+            "provider-permission-requested",
+            "provider-user-prompt-started",
+        ] {
+            let payload = agent_chat_status_hook_test_payload(event_type);
+            let request = cloud_mcp_agent_chat_status_sync_request_from_hook(
+                &payload, None, "", "thinking", "running",
+            )
+            .expect("relevant hook should request metadata sync");
+            assert_eq!(request.provider, "codex");
+            assert_eq!(request.provider_session_id, "session-a");
+            assert_eq!(request.cwd, "/tmp/project");
+            assert!(request.context.metadata_only);
+            assert_eq!(request.context.source, "terminal_activity_hook_status");
+            assert_eq!(request.context.workspace_id, "workspace-a");
         }
 
-        match cloud_mcp_merge_live_text_delta("Working", "Working") {
-            CloudMcpLiveTextMerge::Delta(value) => assert_eq!(value, "WorkingWorking"),
-            CloudMcpLiveTextMerge::Snapshot(_) => panic!("expected repeated delta append"),
-        }
-
-        match cloud_mcp_merge_live_text_delta("ha ", "ha ") {
-            CloudMcpLiveTextMerge::Delta(value) => assert_eq!(value, "ha ha "),
-            CloudMcpLiveTextMerge::Snapshot(_) => panic!("expected repeated token append"),
-        }
+        let payload = agent_chat_status_hook_test_payload("provider-message-displayed");
+        assert!(cloud_mcp_agent_chat_status_sync_request_from_hook(
+            &payload, None, "", "thinking", "running",
+        )
+        .is_none());
     }
 
     #[test]
-    fn live_text_delta_merge_promotes_repaint_replacement_to_snapshot() {
-        match cloud_mcp_merge_live_text_delta("Hello world", "Hello there") {
-            CloudMcpLiveTextMerge::Snapshot(value) => assert_eq!(value, "Hello there"),
-            CloudMcpLiveTextMerge::Delta(_) => panic!("expected snapshot merge"),
-        }
-    }
-
-    #[test]
-    fn live_text_cumulative_snapshot_detection_uses_uncapped_text() {
-        let cached = "cell|".repeat(3_000);
-        let incoming = format!("{cached}tail");
-        assert!(cloud_mcp_live_text_looks_cumulative_snapshot(
-            cached.as_str(),
-            incoming.as_str(),
-        ));
-        let suffix = incoming[cached.len()..].to_string();
-        assert_eq!(
-            cloud_mcp_compact_live_turn_text(Some(&suffix), 8_192).as_deref(),
-            Some("tail")
-        );
-
-        let capped_incoming =
-            cloud_mcp_compact_live_turn_text(Some(&incoming), 8_192).unwrap_or_default();
-        assert!(
-            !capped_incoming.starts_with(cached.as_str()),
-            "the capped frame must not be used for cumulative-prefix detection"
-        );
-    }
-
-    #[test]
-    fn live_turn_text_compaction_preserves_stream_whitespace() {
-        let leading = "  leading space".to_string();
-        assert_eq!(
-            cloud_mcp_compact_live_turn_text(Some(&leading), 64).as_deref(),
-            Some("  leading space")
-        );
-
-        let whitespace = " ".to_string();
-        assert_eq!(
-            cloud_mcp_compact_live_turn_text(Some(&whitespace), 64).as_deref(),
-            Some(" ")
-        );
-
-        assert_eq!(
-            cloud_mcp_compact_turn_text(Some(&whitespace), 64).as_deref(),
-            None
-        );
-    }
-
-    #[test]
-    fn agent_turn_prompt_submission_marks_user_message_plane() {
-        let backend_prompt = test_activity_hook_payload(
-            "BackendPromptSubmit",
-            "running",
-            "backend_prompt_submit",
-            Some("route this prompt over websocket"),
-        );
-        assert!(cloud_mcp_agent_turn_is_prompt_submission(
-            "ts",
-            &backend_prompt,
-            "backendpromptsubmit",
-        ));
-
-        let cli_prompt = test_activity_hook_payload(
-            "UserPromptSubmit",
-            "running",
-            "cli_hook_prompt_submit",
-            Some("typed in the tui"),
-        );
-        assert!(cloud_mcp_agent_turn_is_prompt_submission(
-            "ts",
-            &cli_prompt,
-            "userpromptsubmit",
-        ));
-
-        let message_delta = test_activity_hook_payload(
-            "MessageDisplay",
-            "message_delta",
-            "cli_hook_message_display",
-            Some("assistant text"),
-        );
-        assert!(!cloud_mcp_agent_turn_is_prompt_submission(
-            "md",
-            &message_delta,
-            "messagedisplay",
-        ));
+    fn activity_hook_agents_match_frontend_set() {
+        // Must stay in sync with TERMINAL_ACTIVITY_HOOK_AGENT_KINDS in
+        // terminalActivityState.js so OpenCode's plugin owns turn state.
+        assert!(cloud_mcp_agent_uses_activity_hooks("claude"));
+        assert!(cloud_mcp_agent_uses_activity_hooks("codex"));
+        assert!(cloud_mcp_agent_uses_activity_hooks("opencode"));
+        assert!(cloud_mcp_agent_uses_activity_hooks(" OpenCode "));
+        assert!(!cloud_mcp_agent_uses_activity_hooks("shell"));
+        assert!(!cloud_mcp_agent_uses_activity_hooks("generic"));
     }
 
     #[test]
@@ -54870,10 +54980,7 @@ mod cloud_mcp_tests {
 
         assert_eq!(run_id, "internal-run-camel");
         assert_eq!(normalized["id"].as_str(), Some("internal-run-camel"));
-        assert_eq!(
-            normalized["run_id"].as_str(),
-            Some("internal-run-camel")
-        );
+        assert_eq!(normalized["run_id"].as_str(), Some("internal-run-camel"));
         assert_eq!(normalized["runId"].as_str(), Some("internal-run-camel"));
         assert_eq!(
             normalized["loop_run_id"].as_str(),
@@ -58054,6 +58161,113 @@ mod cloud_mcp_tests {
             .unwrap();
         assert_eq!(session_rows, 0);
         assert_eq!(record_rows, 0);
+        drop(conn);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn agent_chat_metadata_only_ack_with_nested_zero_count_preserves_sync_state() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let root = test_cloud_root("agent-chat-metadata-only-stale-ack");
+        let data_root = root.join("data");
+        let cache_root = root.join("cache");
+        let _data_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_DATA_DIR_ENV, &data_root);
+        let _cache_env = ScopedCloudMcpEnv::set(CLOUD_MCP_LOCAL_CACHE_DIR_ENV, &cache_root);
+        let scope_key = "scope-a";
+        let device_id = "device-a";
+        let workspace_id = "workspace-a";
+        let provider = "codex";
+        let session_id = "session-a";
+        let conn = cloud_mcp_open_outbox_conn().unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}(
+                    scope_key, device_id, workspace_id, provider, session_id, source_kind, source_path,
+                    content_hash, metadata_hash, payload_hash, idempotency_key, record_count,
+                    acked_at_ms, failed_at_ms, last_error, updated_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'test', '', 'content-a', 'metadata-a', 'payload-a', 'idem-a', 2, 100, 0, '', 100)"
+            ),
+            rusqlite::params![scope_key, device_id, workspace_id, provider, session_id],
+        )
+        .unwrap();
+        conn.execute(
+            &format!(
+                "INSERT INTO {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}(
+                    scope_key, device_id, workspace_id, provider, session_id, record_key, record_hash,
+                    source_cursor, acked_at_ms, updated_at_ms
+                 ) VALUES(?1, ?2, ?3, ?4, ?5, 'record-a', 'hash-a', '', 100, 100)"
+            ),
+            rusqlite::params![scope_key, device_id, workspace_id, provider, session_id],
+        )
+        .unwrap();
+        drop(conn);
+
+        let payload = json!({
+            "scope_key": scope_key,
+            "device_id": device_id,
+            "workspace_id": workspace_id,
+            "provider": provider,
+            "session_id": session_id,
+            "content_hash": "content-b",
+            "metadata_hash": "metadata-b",
+            "payload_hash": "payload-b",
+            "idempotency_key": "idem-b",
+            "total_record_count": 2,
+            "metadata_only": true,
+            "records": [],
+        });
+        let response = json!({
+            "ok": true,
+            "data": {
+                "c": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
+                "m": "ingest_ack",
+                "accepted": true,
+                "session_record_count": 0,
+            }
+        });
+
+        let recorded =
+            cloud_mcp_agent_chat_mark_session_acked_from_payload(Some(&payload), &response)
+                .unwrap();
+        assert!(recorded);
+
+        let conn = cloud_mcp_open_outbox_conn().unwrap();
+        let (session_rows, content_hash, metadata_hash, payload_hash, idempotency_key): (
+            i64,
+            String,
+            String,
+            String,
+            String,
+        ) = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*), MAX(content_hash), MAX(metadata_hash), MAX(payload_hash), MAX(idempotency_key)
+                     FROM {CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_STATE_TABLE}
+                     WHERE scope_key=?1 AND device_id=?2 AND workspace_id=?3 AND provider=?4 AND session_id=?5"
+                ),
+                rusqlite::params![scope_key, device_id, workspace_id, provider, session_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+            )
+            .unwrap();
+        let record_rows: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM {CLOUD_MCP_AGENT_CHAT_RECORD_SYNC_STATE_TABLE}
+                     WHERE scope_key=?1 AND device_id=?2 AND workspace_id=?3 AND provider=?4 AND session_id=?5"
+                ),
+                rusqlite::params![scope_key, device_id, workspace_id, provider, session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(session_rows, 1);
+        assert_eq!(record_rows, 1);
+        assert_eq!(content_hash, "content-b");
+        assert_eq!(metadata_hash, "metadata-b");
+        assert_eq!(payload_hash, "payload-b");
+        assert_eq!(idempotency_key, "idem-b");
         drop(conn);
         let _ = fs::remove_dir_all(root);
     }

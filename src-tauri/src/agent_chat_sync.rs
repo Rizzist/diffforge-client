@@ -40,7 +40,9 @@ const AGENT_CHAT_SESSION_HISTORY_BACKFILL_SPAWN_LIMIT: usize = 24;
 const AGENT_CHAT_SESSION_HISTORY_BACKFILL_INTERVAL_MS: u64 = 60_000;
 const AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS: u64 = 30 * 60_000;
 const AGENT_CHAT_SESSION_SYNC_BUILD_CONCURRENCY: usize = 4;
-const AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION: u64 = 2;
+const AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION: u64 = 3;
+const AGENT_CHAT_SESSION_SYNC_RECORD_KEY_VERSION: u64 = 2;
+const AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION: u64 = 2;
 
 static AGENT_CHAT_SESSION_HISTORY_BACKFILL_LAST: OnceLock<StdMutex<HashMap<String, u64>>> =
     OnceLock::new();
@@ -71,7 +73,11 @@ struct AgentChatSessionHistorySourceFingerprint {
 
 fn agent_chat_session_sync_build_semaphore() -> Arc<tokio::sync::Semaphore> {
     AGENT_CHAT_SESSION_SYNC_BUILD_SEMAPHORE
-        .get_or_init(|| Arc::new(tokio::sync::Semaphore::new(AGENT_CHAT_SESSION_SYNC_BUILD_CONCURRENCY)))
+        .get_or_init(|| {
+            Arc::new(tokio::sync::Semaphore::new(
+                AGENT_CHAT_SESSION_SYNC_BUILD_CONCURRENCY,
+            ))
+        })
         .clone()
 }
 
@@ -105,11 +111,7 @@ fn agent_chat_session_history_backfill_root_key(
     ))
 }
 
-fn agent_chat_session_sync_mark_workspace_history_dirty(
-    workspace_id: &str,
-    _root_directory: Option<&str>,
-    _reason: &str,
-) {
+fn agent_chat_session_sync_mark_workspace_history_dirty(workspace_id: &str) {
     let Some(key) = agent_chat_session_history_backfill_workspace_key(workspace_id) else {
         return;
     };
@@ -126,7 +128,7 @@ fn agent_chat_session_sync_mark_workspace_history_dirty(
     );
 }
 
-fn agent_chat_session_sync_mark_payload_workspace_history_dirty(payload: &Value, reason: &str) {
+fn agent_chat_session_sync_mark_payload_workspace_history_dirty(payload: &Value) {
     let workspace_id = cloud_mcp_payload_text(
         payload,
         &[
@@ -140,35 +142,10 @@ fn agent_chat_session_sync_mark_payload_workspace_history_dirty(payload: &Value,
         ],
     )
     .unwrap_or_default();
-    let root_directory = cloud_mcp_payload_text(
-        payload,
-        &[
-            "root_directory",
-            "rootDirectory",
-            "workspace_root",
-            "workspaceRoot",
-            "repo_path",
-            "repoPath",
-            "cwd",
-        ],
-    );
-    agent_chat_session_sync_mark_workspace_history_dirty(
-        &workspace_id,
-        root_directory.as_deref(),
-        reason,
-    );
+    agent_chat_session_sync_mark_workspace_history_dirty(&workspace_id);
 }
 
-fn agent_chat_session_sync_mark_stream_workspace_history_dirty(stream_key: &str, reason: &str) {
-    let workspace_id = stream_key
-        .split(':')
-        .nth(1)
-        .map(str::trim)
-        .unwrap_or_default();
-    agent_chat_session_sync_mark_workspace_history_dirty(workspace_id, None, reason);
-}
-
-fn agent_chat_session_sync_mark_all_workspace_history_dirty(_reason: &str) {
+fn agent_chat_session_sync_mark_all_workspace_history_dirty() {
     let now = current_time_ms().max(1);
     AGENT_CHAT_SESSION_HISTORY_BACKFILL_ALL_DIRTY_SINCE.store(now, Ordering::Release);
     if let Some(workspaces) = AGENT_CHAT_SESSION_HISTORY_BACKFILL_WORKSPACES.get() {
@@ -305,7 +282,9 @@ fn agent_chat_session_sync_value_has_content(value: &Value) -> bool {
         Value::Bool(value) => *value,
         Value::String(text) => !text.trim().is_empty(),
         Value::Array(items) => items.iter().any(agent_chat_session_sync_value_has_content),
-        Value::Object(object) => object.values().any(agent_chat_session_sync_value_has_content),
+        Value::Object(object) => object
+            .values()
+            .any(agent_chat_session_sync_value_has_content),
         _ => true,
     }
 }
@@ -323,9 +302,20 @@ fn agent_chat_session_sync_message_error_evidence(message: &Value) -> bool {
     if cloud_mcp_payload_bool(message, &["is_error", "isError"], false) {
         return true;
     }
+    if message
+        .get("tool")
+        .and_then(|tool| cloud_mcp_payload_text(tool, &["status"]))
+        .is_some_and(|status| status.trim().eq_ignore_ascii_case("failed"))
+    {
+        return true;
+    }
     if ["error", "tool_error", "toolError", "stderr"]
         .iter()
-        .any(|key| message.get(*key).is_some_and(agent_chat_session_sync_value_has_content))
+        .any(|key| {
+            message
+                .get(*key)
+                .is_some_and(agent_chat_session_sync_value_has_content)
+        })
     {
         return true;
     }
@@ -337,7 +327,213 @@ fn agent_chat_session_sync_message_error_evidence(message: &Value) -> bool {
         .is_some_and(|title| agent_chat_session_sync_error_text_marker(&title))
 }
 
+fn agent_chat_session_sync_insert_aliases(object: &mut serde_json::Map<String, Value>) {
+    for (camel, snake) in [
+        ("createdAt", "created_at"),
+        ("callId", "call_id"),
+        ("legacyKind", "legacy_kind"),
+        ("toolOutput", "tool_output"),
+        ("toolError", "tool_error"),
+        ("fileChange", "file_change"),
+    ] {
+        if let Some(value) = object.get(camel).cloned() {
+            object.entry(snake.to_string()).or_insert(value);
+        } else if let Some(value) = object.get(snake).cloned() {
+            object.entry(camel.to_string()).or_insert(value);
+        }
+    }
+}
+
+fn agent_chat_session_sync_normalize_artifact_aliases(value: &mut Value) {
+    let Some(artifacts) = value.get_mut("artifacts").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for artifact in artifacts {
+        let Some(object) = artifact.as_object_mut() else {
+            continue;
+        };
+        let mime = object
+            .get("mimeType")
+            .or_else(|| object.get("mime_type"))
+            .or_else(|| object.get("mime"))
+            .cloned();
+        if let Some(mime) = mime {
+            object.entry("mimeType".to_string()).or_insert(mime.clone());
+            object
+                .entry("mime_type".to_string())
+                .or_insert(mime.clone());
+            object.entry("mime".to_string()).or_insert(mime);
+        }
+    }
+}
+
+fn agent_chat_session_sync_tool_status(message: &Value) -> String {
+    message
+        .get("tool")
+        .and_then(|tool| cloud_mcp_payload_text(tool, &["status"]))
+        .unwrap_or_default()
+}
+
+fn agent_chat_session_sync_subagent_is_genuine(message: &Value) -> bool {
+    let legacy_kind = cloud_mcp_payload_text(message, &["legacyKind", "legacy_kind"])
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let kind = agent_chat_session_sync_message_kind(message);
+    if legacy_kind == "subagent" || kind == "subagent" {
+        return true;
+    }
+    let Some(subagent) = message.get("subagent") else {
+        return false;
+    };
+    subagent
+        .get("isSidechain")
+        .or_else(|| subagent.get("is_sidechain"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || cloud_mcp_payload_text(
+            subagent,
+            &[
+                "parentUuid",
+                "parent_uuid",
+                "parentId",
+                "parent_id",
+                "sidechainId",
+                "sidechain_id",
+                "sidechainUuid",
+                "sidechain_uuid",
+            ],
+        )
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn agent_chat_session_sync_canonical_kind(message: &Value, legacy_kind: &str) -> String {
+    if message
+        .get("file_change")
+        .or_else(|| message.get("fileChange"))
+        .is_some()
+    {
+        return "file_change".to_string();
+    }
+    if message.get("subagent").is_some() && agent_chat_session_sync_subagent_is_genuine(message) {
+        return "subagent".to_string();
+    }
+    if message.get("tool").is_some()
+        || matches!(
+            legacy_kind,
+            "tool_call" | "tool_output" | "tool_error" | "web" | "image_generation"
+        )
+    {
+        return "tool_call".to_string();
+    }
+    match legacy_kind {
+        "reasoning" | "error" | "usage_report" | "system_note" => legacy_kind.to_string(),
+        "patch" | "file" => "file_change".to_string(),
+        "subagent" => "subagent".to_string(),
+        _ => match agent_chat_session_sync_message_role(message).as_str() {
+            "user" => "user_message".to_string(),
+            "assistant" => "assistant_message".to_string(),
+            "system" => "system_note".to_string(),
+            _ => "system_note".to_string(),
+        },
+    }
+}
+
+fn agent_chat_session_sync_ensure_tool_value(
+    object: &mut serde_json::Map<String, Value>,
+    legacy_kind: &str,
+) {
+    let has_tool = object
+        .get("tool")
+        .is_some_and(agent_chat_session_sync_value_has_content);
+    if has_tool
+        || !matches!(
+            legacy_kind,
+            "tool_call" | "tool_output" | "tool_error" | "web" | "image_generation"
+        )
+    {
+        return;
+    }
+    let mut tool = serde_json::Map::new();
+    if let Some(call_id) = object
+        .get("call_id")
+        .or_else(|| object.get("callId"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        tool.insert("call_id".to_string(), json!(call_id));
+    }
+    if let Some(title) = object
+        .get("title")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        tool.insert("title".to_string(), json!(title));
+    }
+    let status = if agent_chat_session_sync_message_error_evidence(&Value::Object(object.clone())) {
+        "failed"
+    } else if matches!(legacy_kind, "tool_output" | "image_generation") {
+        "completed"
+    } else {
+        "running"
+    };
+    tool.insert("status".to_string(), json!(status));
+    if matches!(legacy_kind, "tool_output" | "tool_error") {
+        if let Some(text) = object
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            tool.insert("output".to_string(), json!(text));
+        }
+    } else if let Some(text) = object
+        .get("text")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        tool.insert("input".to_string(), json!(text));
+    }
+    object.insert("tool".to_string(), Value::Object(tool));
+}
+
 fn agent_chat_session_sync_normalize_message_value(mut value: Value) -> Value {
+    let legacy_kind = agent_chat_session_sync_message_kind(&value);
+    if let Some(object) = value.as_object_mut() {
+        agent_chat_session_sync_insert_aliases(object);
+        if object
+            .get("truncated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+            || object
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.trim_end().ends_with("[truncated]"))
+        {
+            object.insert("truncated".to_string(), json!(true));
+        }
+        agent_chat_session_sync_ensure_tool_value(object, &legacy_kind);
+        if let Some(tool) = object.get("tool").and_then(Value::as_object) {
+            let output = tool.get("output").cloned();
+            let status = tool
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if let Some(output) = output.filter(agent_chat_session_sync_value_has_content) {
+                if status == "failed" {
+                    object
+                        .entry("toolError".to_string())
+                        .or_insert(output.clone());
+                    object.entry("tool_error".to_string()).or_insert(output);
+                } else {
+                    object
+                        .entry("toolOutput".to_string())
+                        .or_insert(output.clone());
+                    object.entry("tool_output".to_string()).or_insert(output);
+                }
+            }
+        }
+    }
+    agent_chat_session_sync_normalize_artifact_aliases(&mut value);
     if agent_chat_session_sync_message_status(&value) == "error" {
         let kind = agent_chat_session_sync_message_kind(&value);
         let text = cloud_mcp_payload_text(&value, &["text"]).unwrap_or_default();
@@ -352,6 +548,37 @@ fn agent_chat_session_sync_normalize_message_value(mut value: Value) -> Value {
             {
                 object.insert("toolError".to_string(), json!(text.clone()));
                 object.insert("tool_error".to_string(), json!(text));
+            }
+        }
+    }
+    let legacy_kind = agent_chat_session_sync_message_kind(&value);
+    let canonical_kind = agent_chat_session_sync_canonical_kind(&value, &legacy_kind);
+    if let Some(object) = value.as_object_mut() {
+        if canonical_kind != legacy_kind {
+            object
+                .entry("legacyKind".to_string())
+                .or_insert_with(|| json!(legacy_kind.clone()));
+            object
+                .entry("legacy_kind".to_string())
+                .or_insert_with(|| json!(legacy_kind.clone()));
+        }
+        object.insert("kind".to_string(), json!(canonical_kind));
+        if let Some(tool) = object.get("tool").and_then(Value::as_object) {
+            if let Some(status) = tool
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            {
+                let top_status = if status == "failed" {
+                    "error"
+                } else if status == "completed" {
+                    "completed"
+                } else {
+                    status.as_str()
+                };
+                object
+                    .entry("status".to_string())
+                    .or_insert_with(|| json!(top_status));
             }
         }
     }
@@ -402,16 +629,39 @@ fn agent_chat_session_sync_message_turn_id(message: &Value) -> String {
 
 fn agent_chat_session_sync_message_status(message: &Value) -> String {
     let status = cloud_mcp_payload_text(message, &["status"]).unwrap_or_default();
-    if status.trim().eq_ignore_ascii_case("error") || agent_chat_session_sync_message_error_evidence(message) {
+    if status.trim().eq_ignore_ascii_case("error")
+        || agent_chat_session_sync_message_error_evidence(message)
+    {
         return "error".to_string();
     }
     if !status.trim().is_empty() {
         return status.trim().to_ascii_lowercase();
     }
+    let tool_status = agent_chat_session_sync_tool_status(message);
+    if tool_status == "failed" {
+        return "error".to_string();
+    }
+    if tool_status == "running" {
+        return "running".to_string();
+    }
+    if tool_status == "completed" {
+        return "complete".to_string();
+    }
     let kind = agent_chat_session_sync_message_kind(message);
     if matches!(kind.as_str(), "error" | "tool_error") {
         "error".to_string()
-    } else if matches!(kind.as_str(), "tool_call" | "tool_output" | "patch" | "file" | "reasoning") {
+    } else if matches!(
+        kind.as_str(),
+        "tool_call"
+            | "tool_output"
+            | "patch"
+            | "file"
+            | "file_change"
+            | "subagent"
+            | "reasoning"
+            | "usage_report"
+            | "system_note"
+    ) {
         "complete".to_string()
     } else {
         String::new()
@@ -419,10 +669,16 @@ fn agent_chat_session_sync_message_status(message: &Value) -> String {
 }
 
 fn agent_chat_session_sync_group_status(messages: &[Value]) -> String {
-    if messages.iter().any(|message| agent_chat_session_sync_message_status(message) == "error") {
+    if messages
+        .iter()
+        .any(|message| agent_chat_session_sync_message_status(message) == "error")
+    {
         return "error".to_string();
     }
-    if messages.iter().any(|message| agent_chat_session_sync_message_status(message) == "running") {
+    if messages
+        .iter()
+        .any(|message| agent_chat_session_sync_message_status(message) == "running")
+    {
         return "running".to_string();
     }
     "complete".to_string()
@@ -442,7 +698,8 @@ fn agent_chat_session_sync_flush_activity_group(items: &mut Vec<Value>, group: &
         return;
     }
     let first_id = agent_chat_session_sync_message_id(&group[0], items.len());
-    let last_id = agent_chat_session_sync_message_id(group.last().unwrap_or(&group[0]), items.len());
+    let last_id =
+        agent_chat_session_sync_message_id(group.last().unwrap_or(&group[0]), items.len());
     let mut turn_id = agent_chat_session_sync_message_turn_id(&group[0]);
     if turn_id.trim().is_empty() {
         turn_id = agent_chat_session_sync_message_turn_id(group.last().unwrap_or(&group[0]));
@@ -494,12 +751,108 @@ fn agent_chat_session_sync_flush_assistant_block(
     block_turn_id.clear();
 }
 
+fn agent_chat_session_sync_thread_detail_legacy_kind(message: &Value) -> String {
+    if let Some(kind) = cloud_mcp_payload_text(message, &["legacyKind", "legacy_kind"])
+        .filter(|value| !value.trim().is_empty())
+    {
+        return kind;
+    }
+    let kind = agent_chat_session_sync_message_kind(message);
+    match kind.as_str() {
+        "user_message" | "assistant_message" => "message".to_string(),
+        "tool_call" => {
+            let tool_status = agent_chat_session_sync_tool_status(message);
+            if tool_status == "completed" || tool_status == "failed" {
+                "tool_output".to_string()
+            } else {
+                "tool_call".to_string()
+            }
+        }
+        "file_change" => "patch".to_string(),
+        "system_note" => "activity".to_string(),
+        _ => kind,
+    }
+}
+
+fn agent_chat_session_sync_thread_detail_message(message: &Value) -> Value {
+    let mut message = message.clone();
+    let canonical_kind = agent_chat_session_sync_message_kind(&message);
+    let legacy_kind = agent_chat_session_sync_thread_detail_legacy_kind(&message);
+    if let Some(object) = message.as_object_mut() {
+        object.insert("canonicalKind".to_string(), json!(canonical_kind.clone()));
+        object.insert("canonical_kind".to_string(), json!(canonical_kind));
+        object.insert("kind".to_string(), json!(legacy_kind));
+    }
+    message
+}
+
+fn agent_chat_session_sync_file_change_value(message: &Value) -> Option<&Value> {
+    message
+        .get("file_change")
+        .or_else(|| message.get("fileChange"))
+        .filter(|value| value.is_object())
+}
+
+fn agent_chat_session_sync_thread_detail_diff_summaries(
+    messages: &[Value],
+) -> (Vec<Value>, usize, i64, i64) {
+    let mut summaries = Vec::new();
+    let mut total_files = 0usize;
+    let mut total_additions = 0i64;
+    let mut total_deletions = 0i64;
+    for (index, message) in messages.iter().enumerate() {
+        let Some(file_change) = agent_chat_session_sync_file_change_value(message) else {
+            continue;
+        };
+        let files = file_change
+            .get("files")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let additions = files
+            .iter()
+            .filter_map(|file| file.get("additions").and_then(Value::as_i64))
+            .sum::<i64>();
+        let deletions = files
+            .iter()
+            .filter_map(|file| file.get("deletions").and_then(Value::as_i64))
+            .sum::<i64>();
+        total_files = total_files.saturating_add(files.len());
+        total_additions = total_additions.saturating_add(additions);
+        total_deletions = total_deletions.saturating_add(deletions);
+        let message_id = agent_chat_session_sync_message_id(message, index);
+        let turn_id = agent_chat_session_sync_message_turn_id(message);
+        let summary = cloud_mcp_payload_text(file_change, &["summary"]).unwrap_or_default();
+        summaries.push(json!({
+            "id": format!("diff-summary-{message_id}"),
+            "messageId": message_id.as_str(),
+            "message_id": message_id.as_str(),
+            "turnId": turn_id.as_str(),
+            "turn_id": turn_id.as_str(),
+            "summary": summary,
+            "files": files,
+            "fileCount": files.len(),
+            "file_count": files.len(),
+            "additions": additions,
+            "deletions": deletions,
+        }));
+    }
+    (summaries, total_files, total_additions, total_deletions)
+}
+
 fn agent_chat_session_sync_thread_detail(
     source: &AgentChatSessionSyncSource,
     context: &AgentChatSessionSyncContext,
     model_id: &str,
     model_config: &Value,
 ) -> Value {
+    let thread_detail_messages = source
+        .thread_detail_messages
+        .iter()
+        .map(agent_chat_session_sync_thread_detail_message)
+        .collect::<Vec<_>>();
+    let (diff_summaries, file_count, additions, deletions) =
+        agent_chat_session_sync_thread_detail_diff_summaries(&source.thread_detail_messages);
     let mut items = Vec::new();
     let mut activity_group = Vec::new();
     let mut assistant_block_id = String::new();
@@ -510,7 +863,7 @@ fn agent_chat_session_sync_thread_detail(
     let mut activity_count = 0usize;
     let mut artifact_count = 0usize;
 
-    for (index, message) in source.thread_detail_messages.iter().enumerate() {
+    for (index, message) in thread_detail_messages.iter().enumerate() {
         let role = agent_chat_session_sync_message_role(message);
         let message_id = agent_chat_session_sync_message_id(message, index);
         let turn_id = agent_chat_session_sync_message_turn_id(message);
@@ -547,7 +900,10 @@ fn agent_chat_session_sync_thread_detail(
         }
 
         if role == "assistant" {
-            agent_chat_session_sync_flush_activity_group(&mut assistant_block_items, &mut activity_group);
+            agent_chat_session_sync_flush_activity_group(
+                &mut assistant_block_items,
+                &mut activity_group,
+            );
             assistant_count = assistant_count.saturating_add(1);
             assistant_block_items.push(json!({
                 "id": message_id.as_str(),
@@ -614,13 +970,13 @@ fn agent_chat_session_sync_thread_detail(
         "model_config": model_config,
         "latestTimestamp": source.latest_timestamp.as_str(),
         "latest_timestamp": source.latest_timestamp.as_str(),
-        "messages": source.thread_detail_messages.clone(),
+        "messages": thread_detail_messages.clone(),
         "items": items,
-        "diffSummaries": [],
-        "diff_summaries": [],
+        "diffSummaries": diff_summaries.clone(),
+        "diff_summaries": diff_summaries,
         "stats": {
-            "messageCount": source.thread_detail_messages.len(),
-            "message_count": source.thread_detail_messages.len(),
+            "messageCount": thread_detail_messages.len(),
+            "message_count": thread_detail_messages.len(),
             "userCount": user_count,
             "user_count": user_count,
             "assistantCount": assistant_count,
@@ -629,10 +985,10 @@ fn agent_chat_session_sync_thread_detail(
             "activity_count": activity_count,
             "artifactCount": artifact_count,
             "artifact_count": artifact_count,
-            "fileCount": 0,
-            "file_count": 0,
-            "additions": 0,
-            "deletions": 0,
+            "fileCount": file_count,
+            "file_count": file_count,
+            "additions": additions,
+            "deletions": deletions,
         },
     })
 }
@@ -751,8 +1107,8 @@ fn agent_chat_session_sync_latest_model_id(model_config: &Value, fallback: &str)
 }
 
 fn agent_chat_session_sync_model_config_fingerprint(model_config: &Value) -> String {
-    let model_id = cloud_mcp_payload_text(model_config, &["model_id", "modelId"])
-        .unwrap_or_default();
+    let model_id =
+        cloud_mcp_payload_text(model_config, &["model_id", "modelId"]).unwrap_or_default();
     let reasoning_effort = cloud_mcp_payload_text(
         model_config,
         &["reasoning_effort", "reasoningEffort", "effort"],
@@ -784,7 +1140,11 @@ fn agent_chat_session_sync_model_config_record(
     )
     .map(|value| value.to_ascii_lowercase());
     if model_id.as_deref().unwrap_or_default().trim().is_empty()
-        && reasoning_effort.as_deref().unwrap_or_default().trim().is_empty()
+        && reasoning_effort
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .is_empty()
     {
         return None;
     }
@@ -834,6 +1194,133 @@ fn agent_chat_session_sync_model_config_record(
     Some(record)
 }
 
+fn agent_chat_session_sync_messages_json_bytes(messages: &[Value]) -> usize {
+    serde_json::to_vec(messages)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
+}
+
+fn agent_chat_session_sync_largest_string_field(
+    messages: &[Value],
+) -> Option<(usize, &'static str, usize)> {
+    let mut largest: Option<(usize, &'static str, usize)> = None;
+    for (index, message) in messages.iter().enumerate() {
+        for path in [
+            "/text",
+            "/tool/input",
+            "/tool/output",
+            "/file_change/summary",
+            "/fileChange/summary",
+        ] {
+            let Some(text) = message.pointer(path).and_then(Value::as_str) else {
+                continue;
+            };
+            let len = text.chars().count();
+            if len > largest.map(|(_, _, current)| current).unwrap_or(0) {
+                largest = Some((index, path, len));
+            }
+        }
+    }
+    largest
+}
+
+fn agent_chat_session_sync_largest_structured_tool_field(
+    messages: &[Value],
+) -> Option<(usize, &'static str, usize)> {
+    let mut largest: Option<(usize, &'static str, usize)> = None;
+    for (index, message) in messages.iter().enumerate() {
+        for path in ["/tool/input", "/tool/output"] {
+            let Some(value) = message.pointer(path) else {
+                continue;
+            };
+            if !matches!(value, Value::Array(_) | Value::Object(_)) {
+                continue;
+            }
+            let len = value.to_string().len();
+            if len > largest.map(|(_, _, current)| current).unwrap_or(0) {
+                largest = Some((index, path, len));
+            }
+        }
+    }
+    largest
+}
+
+fn agent_chat_session_sync_mark_message_truncated(message: &mut Value) {
+    if let Some(object) = message.as_object_mut() {
+        object.insert("truncated".to_string(), json!(true));
+    }
+}
+
+fn agent_chat_session_sync_truncate_string_field(
+    messages: &mut [Value],
+    index: usize,
+    path: &str,
+    target_chars: usize,
+) -> bool {
+    let Some(message) = messages.get_mut(index) else {
+        return false;
+    };
+    let Some(value) = message.pointer_mut(path) else {
+        return false;
+    };
+    let Some(text) = value.as_str() else {
+        return false;
+    };
+    let mut truncated = truncate_chars(text, target_chars.max(256));
+    truncated = truncated.trim().to_string();
+    append_transcript_truncation_marker(&mut truncated);
+    *value = json!(truncated);
+    agent_chat_session_sync_mark_message_truncated(message);
+    true
+}
+
+fn agent_chat_session_sync_replace_structured_field(
+    messages: &mut [Value],
+    index: usize,
+    path: &str,
+) -> bool {
+    let Some(message) = messages.get_mut(index) else {
+        return false;
+    };
+    let Some(value) = message.pointer_mut(path) else {
+        return false;
+    };
+    if !matches!(value, Value::Array(_) | Value::Object(_)) {
+        return false;
+    }
+    *value = json!("[truncated structured JSON]");
+    agent_chat_session_sync_mark_message_truncated(message);
+    true
+}
+
+fn agent_chat_session_sync_guard_record_messages(mut messages: Vec<Value>) -> Vec<Value> {
+    let mut iterations = 0usize;
+    while agent_chat_session_sync_messages_json_bytes(&messages)
+        > CODEX_TRANSCRIPT_MAX_RECORD_MESSAGES_BYTES
+        && iterations < 48
+    {
+        iterations = iterations.saturating_add(1);
+        if let Some((index, path, len)) = agent_chat_session_sync_largest_string_field(&messages) {
+            if len > 512 {
+                let target = (len / 2).max(256);
+                if agent_chat_session_sync_truncate_string_field(&mut messages, index, path, target)
+                {
+                    continue;
+                }
+            }
+        }
+        if let Some((index, path, _)) =
+            agent_chat_session_sync_largest_structured_tool_field(&messages)
+        {
+            if agent_chat_session_sync_replace_structured_field(&mut messages, index, path) {
+                continue;
+            }
+        }
+        break;
+    }
+    messages
+}
+
 fn agent_chat_session_sync_record(
     acked: &HashMap<String, String>,
     provider: &str,
@@ -845,13 +1332,14 @@ fn agent_chat_session_sync_record(
     raw: Value,
     normalized_messages: Vec<Value>,
 ) -> Option<Value> {
-	    let record_hash = agent_chat_session_sync_hash(&json!({
-	        "provider": provider,
-        "parser_schema_version": AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION,
-	        "session_id": session_id,
-	        "record_key": record_key.clone(),
-	        "record_kind": record_kind,
-	        "raw": raw.clone(),
+    let normalized_messages = agent_chat_session_sync_guard_record_messages(normalized_messages);
+    let record_hash = agent_chat_session_sync_hash(&json!({
+                "provider": provider,
+        "parser_schema_version": AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION,
+                "session_id": session_id,
+                "record_key": record_key.clone(),
+            "record_kind": record_kind,
+            "raw": raw.clone(),
     }));
     if !agent_chat_session_sync_record_is_changed(acked, &record_key, &record_hash) {
         return None;
@@ -861,11 +1349,11 @@ fn agent_chat_session_sync_record(
         "record_key": record_key,
         "recordHash": record_hash,
         "record_hash": record_hash,
-	        "recordKind": record_kind,
-	        "record_kind": record_kind,
+            "recordKind": record_kind,
+            "record_kind": record_kind,
         "parserSchemaVersion": AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION,
         "parser_schema_version": AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION,
-	        "sourceCursor": source_cursor,
+            "sourceCursor": source_cursor,
         "source_cursor": source_cursor,
         "timestamp": timestamp,
         "createdAt": timestamp,
@@ -879,25 +1367,24 @@ fn agent_chat_session_sync_codex_messages_for_line(
     line_index: usize,
     timestamp: &str,
     value: &Value,
-) -> Vec<Value> {
+) -> Vec<CodexThreadTranscriptMessage> {
     let record_type = value
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or_default();
     let payload = value.get("payload").unwrap_or(&Value::Null);
-    let messages = match record_type {
+    match record_type {
         "event_msg" => codex_messages_from_event(line_index, timestamp, payload),
         "response_item" => codex_messages_from_response_item(line_index, timestamp, payload),
         _ => Vec::new(),
-    };
-    agent_chat_session_sync_messages_value(messages)
+    }
 }
 
 fn agent_chat_session_sync_claude_messages_for_line(
     line_index: usize,
     timestamp: &str,
     value: &Value,
-) -> Vec<Value> {
+) -> Vec<CodexThreadTranscriptMessage> {
     let mut messages = Vec::<CodexThreadTranscriptMessage>::new();
     let entry_type = value
         .get("type")
@@ -911,8 +1398,11 @@ fn agent_chat_session_sync_claude_messages_for_line(
             || value_string(value.get("subtype"))
                 .to_lowercase()
                 .contains("error");
-        let result_text =
-            first_value_string(&[value.get("result"), value.get("message"), value.get("error")]);
+        let result_text = first_value_string(&[
+            value.get("result"),
+            value.get("message"),
+            value.get("error"),
+        ]);
         if is_error {
             messages.push(transcript_error_message(
                 format!("claude-{line_index}-result-error"),
@@ -925,8 +1415,10 @@ fn agent_chat_session_sync_claude_messages_for_line(
                 },
             ));
         } else {
-            let assistant_text =
-                clean_codex_transcript_text(&result_text, CODEX_TRANSCRIPT_MAX_TEXT);
+            let (assistant_text, assistant_truncated) = clean_codex_transcript_text_with_truncation(
+                &result_text,
+                CODEX_TRANSCRIPT_MAX_TEXT,
+            );
             if !assistant_text.is_empty() {
                 messages.push(CodexThreadTranscriptMessage {
                     id: format!("claude-{line_index}-result-assistant"),
@@ -937,7 +1429,10 @@ fn agent_chat_session_sync_claude_messages_for_line(
                     call_id: String::new(),
                     created_at: timestamp.to_string(),
                     source: "claude".to_string(),
+                    usage: transcript_usage_from_value(value),
+                    truncated: assistant_truncated,
                     artifacts: Vec::new(),
+                    ..Default::default()
                 });
             }
             messages.push(transcript_task_complete_message(
@@ -947,7 +1442,7 @@ fn agent_chat_session_sync_claude_messages_for_line(
                 result_text,
             ));
         }
-        return agent_chat_session_sync_messages_value(messages);
+        return messages;
     }
 
     let Some(message) = value.get("message") else {
@@ -967,7 +1462,10 @@ fn agent_chat_session_sync_claude_messages_for_line(
     } else {
         "user"
     };
-    let text = clean_codex_transcript_text(claude_content_text(content), CODEX_TRANSCRIPT_MAX_TEXT);
+    let (text, truncated) = clean_codex_transcript_text_with_truncation(
+        claude_content_text(content),
+        CODEX_TRANSCRIPT_MAX_TEXT,
+    );
     if !text.is_empty() {
         messages.push(CodexThreadTranscriptMessage {
             id: format!("claude-{line_index}-{role}"),
@@ -978,7 +1476,11 @@ fn agent_chat_session_sync_claude_messages_for_line(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "claude".to_string(),
+            subagent: transcript_sidechain_subagent_from_value(value, "Sidechain"),
+            usage: transcript_usage_from_value(value),
+            truncated,
             artifacts: Vec::new(),
+            ..Default::default()
         });
     }
     if let Some(blocks) = content.as_array() {
@@ -1004,7 +1506,7 @@ fn agent_chat_session_sync_claude_messages_for_line(
             text,
         ));
     }
-    agent_chat_session_sync_messages_value(messages)
+    messages
 }
 
 fn agent_chat_session_sync_jsonl_source(
@@ -1015,8 +1517,12 @@ fn agent_chat_session_sync_jsonl_source(
     initial_meta: CodexRolloutMeta,
     acked: &HashMap<String, String>,
 ) -> Result<AgentChatSessionSyncSource, String> {
-    let file = fs::File::open(path)
-        .map_err(|error| format!("Unable to open agent chat source {}: {error}", path.display()))?;
+    let file = fs::File::open(path).map_err(|error| {
+        format!(
+            "Unable to open agent chat source {}: {error}",
+            path.display()
+        )
+    })?;
     let mut reader = std::io::BufReader::new(file);
     let mut offset: u64 = 0;
     let mut line_index: usize = 0;
@@ -1033,6 +1539,7 @@ fn agent_chat_session_sync_jsonl_source(
     let mut total_record_count = 0usize;
     let mut model_config = json!({});
     let mut last_model_config_fingerprint = String::new();
+    let mut tool_metadata = HashMap::<String, TranscriptToolCallMetadata>::new();
 
     loop {
         buffer.clear();
@@ -1108,7 +1615,11 @@ fn agent_chat_session_sync_jsonl_source(
             if !candidate_cwd.is_empty() {
                 cwd = candidate_cwd;
             }
-            match value.get("type").and_then(Value::as_str).unwrap_or_default() {
+            match value
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
                 "ai-title" => {
                     let candidate = clean_codex_title(value_string(value.get("aiTitle")), "");
                     if !candidate.is_empty() {
@@ -1125,11 +1636,16 @@ fn agent_chat_session_sync_jsonl_source(
             }
         }
 
-        let normalized_messages = if provider == "claude" {
+        let mut parsed_messages = if provider == "claude" {
             agent_chat_session_sync_claude_messages_for_line(line_index, &timestamp, &value)
         } else {
             agent_chat_session_sync_codex_messages_for_line(line_index, &timestamp, &value)
         };
+        for message in &mut parsed_messages {
+            transcript_apply_tool_call_metadata(&tool_metadata, message);
+            transcript_record_tool_call_metadata(&mut tool_metadata, message);
+        }
+        let normalized_messages = agent_chat_session_sync_messages_value(parsed_messages);
         thread_detail_messages.extend(normalized_messages.iter().cloned());
         let record_kind = value
             .get("type")
@@ -1137,8 +1653,8 @@ fn agent_chat_session_sync_jsonl_source(
             .unwrap_or("jsonl")
             .to_string();
         let line_hash = agent_chat_session_sync_text_hash(&raw_line);
-	        let record_key = format!(
-            "{provider}:{session_id}:jsonl:v{AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION}:{line_index}:{start_offset}:{line_hash}"
+        let record_key = format!(
+            "{provider}:{session_id}:jsonl:v{AGENT_CHAT_SESSION_SYNC_RECORD_KEY_VERSION}:{line_index}:{start_offset}:{line_hash}"
         );
         if let Some(record) = agent_chat_session_sync_record(
             acked,
@@ -1258,7 +1774,11 @@ fn agent_chat_session_sync_opencode_model_config(model: &str) -> Value {
                     "model_id": model_id,
                 }),
             );
-        } else if let Some(model_text) = value.as_str().map(str::trim).filter(|value| !value.is_empty()) {
+        } else if let Some(model_text) = value
+            .as_str()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
             agent_chat_session_sync_merge_model_config(
                 &mut config,
                 json!({
@@ -1422,23 +1942,29 @@ fn agent_chat_session_sync_opencode_source(
             message_data.get("content"),
             message_data.get("message"),
         ]);
-        let normalized_messages = if message_text.trim().is_empty()
-            || message_ids_with_parts.contains(row.0.as_str())
-        {
-            Vec::new()
-        } else {
-            agent_chat_session_sync_messages_value(vec![CodexThreadTranscriptMessage {
-                id: format!("opencode-{}-message", row.0),
-                role,
-                kind: "message".to_string(),
-                text: clean_codex_transcript_text(message_text, CODEX_TRANSCRIPT_MAX_TEXT),
-                title: String::new(),
-                call_id: String::new(),
-                created_at: timestamp.clone(),
-                source: "opencode".to_string(),
-                artifacts: Vec::new(),
-            }])
-        };
+        let normalized_messages =
+            if message_text.trim().is_empty() || message_ids_with_parts.contains(row.0.as_str()) {
+                Vec::new()
+            } else {
+                let (message_text, truncated) = clean_codex_transcript_text_with_truncation(
+                    message_text,
+                    CODEX_TRANSCRIPT_MAX_TEXT,
+                );
+                agent_chat_session_sync_messages_value(vec![CodexThreadTranscriptMessage {
+                    id: format!("opencode-{}-message", row.0),
+                    role,
+                    kind: "message".to_string(),
+                    text: message_text,
+                    title: String::new(),
+                    call_id: String::new(),
+                    created_at: timestamp.clone(),
+                    source: "opencode".to_string(),
+                    usage: transcript_usage_from_value(&message_data),
+                    truncated,
+                    artifacts: Vec::new(),
+                    ..Default::default()
+                }])
+            };
         thread_detail_messages.extend(normalized_messages.iter().cloned());
         total_record_count = total_record_count.saturating_add(1);
         if let Some(record) = agent_chat_session_sync_record(
@@ -1480,11 +2006,7 @@ fn agent_chat_session_sync_opencode_source(
             continue;
         };
         let normalized_messages = agent_chat_session_sync_messages_value(opencode_part_message(
-            &row.1,
-            &role,
-            &row.0,
-            &timestamp,
-            &part_data,
+            &row.1, &role, &row.0, &timestamp, &part_data,
         ));
         thread_detail_messages.extend(normalized_messages.iter().cloned());
         total_record_count = total_record_count.saturating_add(1);
@@ -1766,7 +2288,8 @@ fn agent_chat_session_sync_enrich_context_from_history(
         fork_from_provider_session_id,
     );
     if context.terminal_instance_id.is_none() {
-        context.terminal_instance_id = terminal_instance_id.and_then(|value| u64::try_from(value).ok());
+        context.terminal_instance_id =
+            terminal_instance_id.and_then(|value| u64::try_from(value).ok());
     }
     if context.terminal_index.is_none() {
         context.terminal_index = terminal_index;
@@ -1989,7 +2512,7 @@ fn agent_chat_session_sync_payloads(
         let records_remaining = changed_record_count
             .saturating_sub(packet_record_offset)
             .saturating_sub(record_count);
-        let payload = json!({
+        let mut payload = json!({
             "c": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
             "contract": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
             "m": mode.clone(),
@@ -2082,6 +2605,12 @@ fn agent_chat_session_sync_payloads(
             "threadDetail": thread_detail.clone(),
             "records": packet_records,
         });
+        if context.metadata_only {
+            if let Some(object) = payload.as_object_mut() {
+                object.insert("metadata_only".to_string(), json!(true));
+                object.insert("metadataOnly".to_string(), json!(true));
+            }
+        }
         payloads.push(payload);
         packet_record_offset = packet_record_offset.saturating_add(record_count);
     }
@@ -2097,7 +2626,14 @@ fn agent_chat_session_sync_spawn(
     reason: &'static str,
 ) {
     let state = app.state::<CloudMcpState>().inner().clone();
-    agent_chat_session_sync_spawn_with_state(state, agent_id, provider_session_id, cwd, context, reason);
+    agent_chat_session_sync_spawn_with_state(
+        state,
+        agent_id,
+        provider_session_id,
+        cwd,
+        context,
+        reason,
+    );
 }
 
 fn agent_chat_session_sync_spawn_with_state(
@@ -2126,8 +2662,7 @@ fn agent_chat_session_sync_spawn_with_state(
             context.clone(),
         );
         let result = tauri::async_runtime::spawn_blocking(move || {
-            let _heavy_permit =
-                backend_heavy_job_acquire("agent_chat_session_sync.build_payloads");
+            let _heavy_permit = backend_heavy_job_acquire("agent_chat_session_sync.build_payloads");
             let _span = BackendCpuSpan::new("agent_chat_session_sync.build_payloads");
             agent_chat_session_sync_payloads(
                 &build_agent_id,
@@ -2162,11 +2697,7 @@ fn agent_chat_session_sync_spawn_with_state(
             }
         };
         for payload in payloads {
-            agent_chat_session_sync_mark_workspace_history_dirty(
-                &context.workspace_id,
-                Some(cwd.as_str()),
-                reason,
-            );
+            agent_chat_session_sync_mark_workspace_history_dirty(&context.workspace_id);
             let key = format!(
                 "agent-chat-session:{}:{}:{}:{}",
                 cloud_mcp_payload_text(&payload, &["workspace_id", "workspaceId"])
@@ -2210,11 +2741,7 @@ fn agent_chat_session_sync_spawn_from_result(
         );
         return;
     }
-    agent_chat_session_sync_mark_workspace_history_dirty(
-        &context.workspace_id,
-        Some(result.cwd.as_str()),
-        reason,
-    );
+    agent_chat_session_sync_mark_workspace_history_dirty(&context.workspace_id);
     let app_for_task = app.clone();
     let agent_id = provider.to_string();
     let result = result.clone();
@@ -2339,11 +2866,7 @@ fn agent_chat_session_sync_spawn_from_history_record(
     if provider_session_id.trim().is_empty() {
         return;
     }
-    agent_chat_session_sync_mark_workspace_history_dirty(
-        &record.workspace_id,
-        Some(record.cwd.as_str()),
-        reason,
-    );
+    agent_chat_session_sync_mark_workspace_history_dirty(&record.workspace_id);
     let context = AgentChatSessionSyncContext {
         workspace_id: record.workspace_id.clone(),
         workspace_name: record.workspace_name.clone(),
@@ -2360,6 +2883,7 @@ fn agent_chat_session_sync_spawn_from_history_record(
         source: record.source.clone(),
         shared_history_id: record.shared_history_id.clone(),
         fork_from_provider_session_id: record.fork_from_provider_session_id.clone(),
+        metadata_only: false,
     };
     agent_chat_session_sync_spawn(
         app,
@@ -2534,7 +3058,9 @@ fn agent_chat_session_sync_history_item_needs_backfill(
         return false;
     }
     let sync = &item.chat_sync;
-    if sync.pending_packet_count > 0 || sync.syncing_packet_count > 0 || sync.retrying_packet_count > 0
+    if sync.pending_packet_count > 0
+        || sync.syncing_packet_count > 0
+        || sync.retrying_packet_count > 0
     {
         return false;
     }
@@ -2615,15 +3141,14 @@ fn agent_chat_session_sync_should_backfill_workspace(
     if !should_scan {
         return None;
     }
-    let ledger = AGENT_CHAT_SESSION_HISTORY_BACKFILL_LAST
-        .get_or_init(|| StdMutex::new(HashMap::new()));
+    let ledger =
+        AGENT_CHAT_SESSION_HISTORY_BACKFILL_LAST.get_or_init(|| StdMutex::new(HashMap::new()));
     let Ok(mut entries) = ledger.lock() else {
         return Some(now);
     };
-    if entries
-        .get(&root_key)
-        .is_some_and(|last| now.saturating_sub(*last) < AGENT_CHAT_SESSION_HISTORY_BACKFILL_INTERVAL_MS)
-    {
+    if entries.get(&root_key).is_some_and(|last| {
+        now.saturating_sub(*last) < AGENT_CHAT_SESSION_HISTORY_BACKFILL_INTERVAL_MS
+    }) {
         return None;
     }
     entries.insert(root_key, now);
@@ -2635,7 +3160,8 @@ fn agent_chat_session_sync_finish_backfill_workspace(
     started_at_ms: u64,
     spawned: usize,
 ) {
-    let Some(workspace_key) = agent_chat_session_history_backfill_workspace_key(workspace_id) else {
+    let Some(workspace_key) = agent_chat_session_history_backfill_workspace_key(workspace_id)
+    else {
         return;
     };
     let Ok(mut entries) = agent_chat_session_history_backfill_workspaces().lock() else {
@@ -2690,11 +3216,8 @@ fn agent_chat_session_sync_backfill_workspace_history(
         match result {
             Ok(mut history) => {
                 workspace_agent_session_history_enrich_chat_sync(&mut history.items);
-                let queued = agent_chat_session_sync_spawn_from_history_items(
-                    app,
-                    &history.items,
-                    reason,
-                );
+                let queued =
+                    agent_chat_session_sync_spawn_from_history_items(app, &history.items, reason);
                 agent_chat_session_sync_finish_backfill_workspace(
                     &requested_workspace_id,
                     started_at_ms,
@@ -2733,11 +3256,16 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
         .unwrap_or_default();
     let provider_session_id = cloud_mcp_payload_text(
         payload,
-        &["provider_session_id", "providerSessionId", "session_id", "sessionId"],
+        &[
+            "provider_session_id",
+            "providerSessionId",
+            "session_id",
+            "sessionId",
+        ],
     )
     .unwrap_or_default();
-    let workspace_id = cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"])
-        .unwrap_or_default();
+    let workspace_id =
+        cloud_mcp_payload_text(payload, &["workspace_id", "workspaceId"]).unwrap_or_default();
     if provider.trim().is_empty()
         || provider_session_id.trim().is_empty()
         || workspace_id.trim().is_empty()
@@ -2746,11 +3274,7 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
     }
     let cwd = cloud_mcp_payload_text(payload, &["cwd", "workspace_root", "workspaceRoot"])
         .unwrap_or_default();
-    agent_chat_session_sync_mark_workspace_history_dirty(
-        &workspace_id,
-        Some(cwd.as_str()),
-        reason,
-    );
+    agent_chat_session_sync_mark_workspace_history_dirty(&workspace_id);
     let context = AgentChatSessionSyncContext {
         workspace_id,
         workspace_name: cloud_mcp_payload_text(payload, &["workspace_name", "workspaceName"])
@@ -2764,7 +3288,11 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
         terminal_index: payload
             .get("terminal_index")
             .or_else(|| payload.get("terminalIndex"))
-            .and_then(|value| value.as_i64().or_else(|| value.as_u64().map(|number| number as i64))),
+            .and_then(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| value.as_u64().map(|number| number as i64))
+            }),
         model_id: cloud_mcp_payload_text(payload, &["model_id", "modelId", "model"])
             .unwrap_or_default(),
         model_source: String::new(),
@@ -2772,12 +3300,18 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
             .unwrap_or_default(),
         file_authority: cloud_mcp_payload_text(payload, &["file_authority", "fileAuthority"])
             .unwrap_or_default(),
-        coordination_mode: cloud_mcp_payload_text(payload, &["coordination_mode", "coordinationMode"])
-            .unwrap_or_default(),
+        coordination_mode: cloud_mcp_payload_text(
+            payload,
+            &["coordination_mode", "coordinationMode"],
+        )
+        .unwrap_or_default(),
         status: "waiting".to_string(),
         source: "agent_chat_ack_repair".to_string(),
-        shared_history_id: cloud_mcp_payload_text(payload, &["shared_history_id", "sharedHistoryId"])
-            .unwrap_or_default(),
+        shared_history_id: cloud_mcp_payload_text(
+            payload,
+            &["shared_history_id", "sharedHistoryId"],
+        )
+        .unwrap_or_default(),
         fork_from_provider_session_id: cloud_mcp_payload_text(
             payload,
             &[
@@ -2788,6 +3322,7 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
             ],
         )
         .unwrap_or_default(),
+        metadata_only: false,
     };
     agent_chat_session_sync_spawn(app, provider, provider_session_id, cwd, context, reason);
     true
@@ -2843,7 +3378,10 @@ mod agent_chat_session_sync_tests {
         let chunks = agent_chat_session_sync_record_chunks(records);
 
         assert_eq!(chunks.len(), 2);
-        assert_eq!(chunks[0].len(), AGENT_CHAT_SESSION_SYNC_MAX_RECORDS_PER_PACKET);
+        assert_eq!(
+            chunks[0].len(),
+            AGENT_CHAT_SESSION_SYNC_MAX_RECORDS_PER_PACKET
+        );
         assert_eq!(chunks[1].len(), 1);
     }
 
@@ -2859,12 +3397,113 @@ mod agent_chat_session_sync_tests {
             created_at: "2026-07-02T00:00:00Z".to_string(),
             source: "codex".to_string(),
             artifacts: Vec::new(),
+            ..Default::default()
         });
 
-        assert_eq!(message["kind"], json!("tool_output"));
+        assert_eq!(message["kind"], json!("tool_call"));
+        assert_eq!(message["legacy_kind"], json!("tool_output"));
         assert_eq!(message["status"], json!("error"));
         assert_eq!(message["toolError"], json!("permission denied"));
+        assert_eq!(message["tool"]["status"], json!("failed"));
+        assert_eq!(message["tool"]["output"], json!("permission denied"));
         assert_eq!(agent_chat_session_sync_message_status(&message), "error");
+    }
+
+    #[test]
+    fn agent_chat_session_sync_message_value_emits_v2_tool_contract() {
+        let message = agent_chat_session_sync_message_value(CodexThreadTranscriptMessage {
+            id: "tool-call-1".to_string(),
+            role: "activity".to_string(),
+            kind: "tool_call".to_string(),
+            text: "reading src/lib.rs".to_string(),
+            title: "Read file".to_string(),
+            call_id: "call-read".to_string(),
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            source: "codex".to_string(),
+            tool: Some(json!({
+                "name": "read_file",
+                "call_id": "call-read",
+                "status": "running",
+                "input": { "path": "src/lib.rs" },
+                "title": "Read file"
+            })),
+            usage: Some(json!({ "input_tokens": 12, "output_tokens": 3 })),
+            artifacts: Vec::new(),
+            ..Default::default()
+        });
+
+        assert_eq!(message["kind"], json!("tool_call"));
+        assert_eq!(message["call_id"], json!("call-read"));
+        assert_eq!(message["created_at"], json!("2026-07-02T00:00:00Z"));
+        assert_eq!(message["tool"]["input"], json!({ "path": "src/lib.rs" }));
+        assert_eq!(message["tool"]["status"], json!("running"));
+        assert_eq!(message["usage"]["input_tokens"], json!(12));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_record_guard_truncates_oversized_messages() {
+        let huge_text = "x".repeat(CODEX_TRANSCRIPT_MAX_RECORD_MESSAGES_BYTES + 32_000);
+        let record = agent_chat_session_sync_record(
+            &HashMap::new(),
+            "codex",
+            "session-a",
+            "codex:session-a:jsonl:v2:0:0:abc".to_string(),
+            "response_item",
+            json!({ "lineIndex": 0 }),
+            "2026-07-02T00:00:00Z".to_string(),
+            json!({ "type": "response_item" }),
+            vec![json!({
+                "id": "assistant-1",
+                "role": "assistant",
+                "kind": "assistant_message",
+                "text": huge_text,
+            })],
+        )
+        .expect("record");
+
+        let messages = record["messages"].as_array().expect("messages");
+        assert!(
+            agent_chat_session_sync_messages_json_bytes(messages)
+                <= CODEX_TRANSCRIPT_MAX_RECORD_MESSAGES_BYTES
+        );
+        assert_eq!(messages[0]["truncated"], json!(true));
+        assert!(messages[0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("[truncated]"));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_record_identity_stays_stable_across_parser_bump() {
+        let raw = json!({ "type": "response_item", "payload": { "type": "message" } });
+        let record_key =
+            format!("codex:session-a:jsonl:v{AGENT_CHAT_SESSION_SYNC_RECORD_KEY_VERSION}:0:0:abc");
+        let record = agent_chat_session_sync_record(
+            &HashMap::new(),
+            "codex",
+            "session-a",
+            record_key.clone(),
+            "response_item",
+            json!({ "lineIndex": 0 }),
+            "2026-07-02T00:00:00Z".to_string(),
+            raw.clone(),
+            Vec::new(),
+        )
+        .expect("record");
+        let expected_hash = agent_chat_session_sync_hash(&json!({
+            "provider": "codex",
+            "parser_schema_version": AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION,
+            "session_id": "session-a",
+            "record_key": record_key,
+            "record_kind": "response_item",
+            "raw": raw,
+        }));
+
+        assert_eq!(AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION, 3);
+        assert_eq!(AGENT_CHAT_SESSION_SYNC_RECORD_KEY_VERSION, 2);
+        assert_eq!(AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION, 2);
+        assert_eq!(record["parserSchemaVersion"], json!(3));
+        assert_eq!(record["recordHash"], json!(expected_hash));
     }
 
     #[test]
@@ -2919,7 +3558,8 @@ mod agent_chat_session_sync_tests {
             ..AgentChatSessionSyncContext::default()
         };
 
-        let detail = agent_chat_session_sync_thread_detail(&source, &context, "gpt-5.5", &json!({}));
+        let detail =
+            agent_chat_session_sync_thread_detail(&source, &context, "gpt-5.5", &json!({}));
         let items = detail["items"].as_array().expect("thread detail items");
 
         assert_eq!(items.len(), 2);
@@ -2932,14 +3572,73 @@ mod agent_chat_session_sync_tests {
     }
 
     #[test]
+    fn agent_chat_session_sync_thread_detail_populates_diff_summaries_from_file_change() {
+        let source = AgentChatSessionSyncSource {
+            provider: "opencode".to_string(),
+            source_kind: "opencode_sqlite".to_string(),
+            source_path: "/tmp/opencode.db".to_string(),
+            session_id: "session-a".to_string(),
+            title: "Session A".to_string(),
+            cwd: "/tmp/workspace-a".to_string(),
+            latest_timestamp: "2026-06-30T00:00:00Z".to_string(),
+            model_id: "gpt-5.5".to_string(),
+            model_config: json!({}),
+            records: Vec::new(),
+            thread_detail_messages: vec![json!({
+                "id": "patch-1",
+                "role": "activity",
+                "kind": "file_change",
+                "legacy_kind": "patch",
+                "title": "Patch",
+                "text": "edited src/lib.rs",
+                "turn_id": "turn-1",
+                "file_change": {
+                    "files": [
+                        { "path": "src/lib.rs", "kind": "edit", "additions": 2, "deletions": 1 }
+                    ],
+                    "summary": "edited src/lib.rs"
+                }
+            })],
+            total_record_count: 1,
+        };
+        let context = AgentChatSessionSyncContext {
+            workspace_id: "workspace-a".to_string(),
+            workspace_name: "Workspace A".to_string(),
+            ..AgentChatSessionSyncContext::default()
+        };
+
+        let detail =
+            agent_chat_session_sync_thread_detail(&source, &context, "gpt-5.5", &json!({}));
+        assert_eq!(detail["messages"][0]["kind"], json!("patch"));
+        assert_eq!(
+            detail["messages"][0]["canonical_kind"],
+            json!("file_change")
+        );
+        assert_eq!(detail["diffSummaries"][0]["fileCount"], json!(1));
+        assert_eq!(
+            detail["diffSummaries"][0]["files"][0]["path"],
+            json!("src/lib.rs")
+        );
+        assert_eq!(detail["stats"]["additions"], json!(2));
+        assert_eq!(detail["stats"]["deletions"], json!(1));
+    }
+
+    #[test]
     fn agent_chat_session_history_backfill_selects_only_unsynced_rows() {
-        let waiting = test_history_item("codex-session-a", WorkspaceAgentSessionHistoryChatSync::default());
-        assert!(agent_chat_session_sync_history_item_needs_backfill(&waiting));
+        let waiting = test_history_item(
+            "codex-session-a",
+            WorkspaceAgentSessionHistoryChatSync::default(),
+        );
+        assert!(agent_chat_session_sync_history_item_needs_backfill(
+            &waiting
+        ));
 
         let mut queued_sync = WorkspaceAgentSessionHistoryChatSync::default();
         queued_sync.pending_packet_count = 1;
         let queued = test_history_item("codex-session-b", queued_sync);
-        assert!(!agent_chat_session_sync_history_item_needs_backfill(&queued));
+        assert!(!agent_chat_session_sync_history_item_needs_backfill(
+            &queued
+        ));
 
         let mut fresh_synced_sync = WorkspaceAgentSessionHistoryChatSync::default();
         fresh_synced_sync.status = "synced".to_string();
@@ -2947,28 +3646,40 @@ mod agent_chat_session_sync_tests {
         fresh_synced_sync.record_total_count = 2;
         fresh_synced_sync.record_acked_count = 2;
         let fresh_synced = test_history_item("codex-session-c", fresh_synced_sync);
-        assert!(!agent_chat_session_sync_history_item_needs_backfill(&fresh_synced));
+        assert!(!agent_chat_session_sync_history_item_needs_backfill(
+            &fresh_synced
+        ));
 
         let mut stale_synced_sync = WorkspaceAgentSessionHistoryChatSync::default();
         stale_synced_sync.status = "synced".to_string();
-        stale_synced_sync.acked_at_ms =
-            current_time_ms().saturating_sub(AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS + 1);
+        stale_synced_sync.acked_at_ms = current_time_ms()
+            .saturating_sub(AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS + 1);
         stale_synced_sync.record_total_count = 2;
         stale_synced_sync.record_acked_count = 2;
         let stale_synced = test_history_item("codex-session-d", stale_synced_sync);
-        assert!(agent_chat_session_sync_history_item_needs_backfill(&stale_synced));
+        assert!(agent_chat_session_sync_history_item_needs_backfill(
+            &stale_synced
+        ));
 
         let unsupported = WorkspaceAgentSessionHistoryItem {
             provider: "shell".to_string(),
             agent_id: "shell".to_string(),
-            ..test_history_item("shell-session", WorkspaceAgentSessionHistoryChatSync::default())
+            ..test_history_item(
+                "shell-session",
+                WorkspaceAgentSessionHistoryChatSync::default(),
+            )
         };
-        assert!(!agent_chat_session_sync_history_item_needs_backfill(&unsupported));
+        assert!(!agent_chat_session_sync_history_item_needs_backfill(
+            &unsupported
+        ));
     }
 
     #[test]
     fn agent_chat_session_history_backfill_record_preserves_session_identity() {
-        let item = test_history_item("codex-session-identity", WorkspaceAgentSessionHistoryChatSync::default());
+        let item = test_history_item(
+            "codex-session-identity",
+            WorkspaceAgentSessionHistoryChatSync::default(),
+        );
 
         let record = agent_chat_session_sync_history_item_record(&item);
 
