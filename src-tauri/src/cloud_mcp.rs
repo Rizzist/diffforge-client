@@ -24832,11 +24832,6 @@ fn cloud_mcp_live_app_ws_host() -> Option<(String, String)> {
         .clone()
 }
 
-fn cloud_mcp_live_app_ws_route_requires_balancer_token(ws_url: &str, transport: &str) -> bool {
-    transport.trim().eq_ignore_ascii_case("node_dns_gateway")
-        || ws_url.contains("/_diffforge/instances/")
-}
-
 fn cloud_mcp_clear_live_app_ws_route_cache() {
     if let Ok(mut slot) = CLOUD_MCP_LIVE_APP_WS_HOST
         .get_or_init(|| StdMutex::new(None))
@@ -24895,6 +24890,85 @@ fn cloud_mcp_route_token_scope_allows_endpoint(route_token: &str, endpoint_path:
     })
 }
 
+fn cloud_mcp_clean_endpoint_path(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
+fn cloud_mcp_clean_host(value: &str) -> String {
+    let raw = value
+        .split(',')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if let Some(rest) = raw.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return rest[..end].to_string();
+        }
+    }
+    raw.split(':').next().unwrap_or_default().trim_end_matches('.').to_string()
+}
+
+fn cloud_mcp_direct_gateway_parts(pathname: &str) -> Option<(String, String)> {
+    const PREFIX: &str = "/_diffforge/instances/";
+    let rest = pathname.strip_prefix(PREFIX)?;
+    let (instance_id, upstream) = rest.split_once('/').unwrap_or((rest, ""));
+    let upstream_path = if upstream.is_empty() {
+        "/".to_string()
+    } else {
+        format!("/{upstream}")
+    };
+    Some((instance_id.to_string(), upstream_path))
+}
+
+fn cloud_mcp_route_token_compatible_with_url(
+    route_token: &str,
+    ws_url: &str,
+    endpoint_path: &str,
+) -> bool {
+    let Some(payload) = cloud_mcp_route_token_payload(route_token) else {
+        return false;
+    };
+    if payload.get("scope").and_then(Value::as_str) != Some("cloud_ws") {
+        return false;
+    }
+    let Ok(url) = reqwest::Url::parse(ws_url) else {
+        return false;
+    };
+    let requested_path = cloud_mcp_clean_endpoint_path(endpoint_path);
+    let gateway = cloud_mcp_direct_gateway_parts(url.path());
+    let upstream_path = gateway
+        .as_ref()
+        .map(|(_, path)| path.as_str())
+        .unwrap_or_else(|| url.path());
+    if cloud_mcp_clean_endpoint_path(upstream_path) != requested_path {
+        return false;
+    }
+    if !cloud_mcp_route_token_scope_allows_endpoint(route_token, upstream_path) {
+        return false;
+    }
+    let route_mode = payload
+        .get("route_mode")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let Some((instance_id, _)) = gateway else {
+        return route_mode.is_empty() || route_mode == "direct_cloud_container";
+    };
+    let node_dns = payload
+        .get("node_dns")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    route_mode == "node_dns_gateway"
+        && payload.get("backend_id").and_then(Value::as_str) == Some(instance_id.as_str())
+        && cloud_mcp_clean_host(node_dns) == cloud_mcp_clean_host(url.host_str().unwrap_or_default())
+        && !payload.get("container_port").unwrap_or(&Value::Null).is_null()
+}
+
 fn cloud_mcp_note_direct_route(target: &CloudMcpWsTarget) {
     let Some(route_token) = target.route_token.clone() else {
         return;
@@ -24931,8 +25005,12 @@ fn cloud_mcp_last_direct_route_fresh(endpoint_path: &str) -> Option<CloudMcpWsTa
     if !cloud_mcp_route_token_scope_allows_endpoint(&cached.route_token, endpoint_path) {
         return None;
     }
+    let ws_url = cloud_mcp_rewrite_ws_endpoint(&cached.ws_url, endpoint_path);
+    if !cloud_mcp_route_token_compatible_with_url(&cached.route_token, &ws_url, endpoint_path) {
+        return None;
+    }
     Some(CloudMcpWsTarget {
-        ws_url: cloud_mcp_rewrite_ws_endpoint(&cached.ws_url, endpoint_path),
+        ws_url,
         route_token: Some(cached.route_token),
         transport: cached.transport,
     })
@@ -24949,12 +25027,6 @@ async fn cloud_mcp_resolve_ws_target_via_app_ws(
 ) -> Result<CloudMcpWsTarget, String> {
     let (app_ws_url, transport) = cloud_mcp_live_app_ws_host()
         .ok_or_else(|| "Cloud app websocket host is not known yet.".to_string())?;
-    if cloud_mcp_live_app_ws_route_requires_balancer_token(&app_ws_url, &transport) {
-        return Err(
-            "Live app websocket route is node-gateway routed; resolving through the balancer for a node-bound route token."
-                .to_string(),
-        );
-    }
     // Minimal inline request path on purpose: cloud_mcp_ws_request_* starts
     // the global ws loop, and that loop awaits this resolver — calling it
     // here would make the resolver futures cyclic. The caller already gates
@@ -25021,13 +25093,24 @@ async fn cloud_mcp_resolve_ws_target_via_app_ws(
         .filter(|value| !value.is_empty())
         .ok_or_else(|| "Cloud app websocket returned no route token.".to_string())?
         .to_string();
-    if !cloud_mcp_route_token_scope_allows_endpoint(&route_token, endpoint_path) {
+    let response_ws_url = response["websocket_url"]
+        .as_str()
+        .or_else(|| response["websocketUrl"].as_str())
+        .or_else(|| response["route"]["websocket_url"].as_str())
+        .or_else(|| response["route"]["websocketUrl"].as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(app_ws_url.as_str());
+    let ws_url = cloud_mcp_rewrite_ws_endpoint(response_ws_url, endpoint_path);
+    if !cloud_mcp_route_token_scope_allows_endpoint(&route_token, endpoint_path)
+        || !cloud_mcp_route_token_compatible_with_url(&route_token, &ws_url, endpoint_path)
+    {
         return Err(format!(
-            "Cloud app websocket route token is not scoped for {endpoint_path}; resolving through the balancer."
+            "Cloud app websocket route token is not compatible with {endpoint_path}; resolving through the balancer."
         ));
     }
     let target = CloudMcpWsTarget {
-        ws_url: cloud_mcp_rewrite_ws_endpoint(&app_ws_url, endpoint_path),
+        ws_url,
         route_token: Some(route_token),
         transport,
     };
@@ -56223,12 +56306,22 @@ mod cloud_mcp_tests {
             .as_secs();
         let make_token = |exp: u64| {
             let payload = general_purpose::URL_SAFE_NO_PAD
-                .encode(serde_json::to_vec(&json!({ "exp": exp })).expect("encode claims"));
+                .encode(serde_json::to_vec(&json!({
+                    "scope": "cloud_ws",
+                    "route_mode": "direct_cloud_container",
+                    "allowed_paths": ["/v1/app/ws", "/v1/voice/ws"],
+                    "exp": exp
+                })).expect("encode claims"));
             format!("{payload}.test-signature")
         };
-        let make_scoped_token = |exp: u64, allowed_paths: Value| {
+        let make_scoped_gateway_token = |exp: u64, allowed_paths: Value| {
             let payload = general_purpose::URL_SAFE_NO_PAD.encode(
                 serde_json::to_vec(&json!({
+                    "scope": "cloud_ws",
+                    "route_mode": "node_dns_gateway",
+                    "backend_id": "abc",
+                    "node_dns": "node.example",
+                    "container_port": 20000,
                     "exp": exp,
                     "allowed_paths": allowed_paths,
                 }))
@@ -56243,7 +56336,7 @@ mod cloud_mcp_tests {
         );
 
         cloud_mcp_note_direct_route(&CloudMcpWsTarget {
-            ws_url: "wss://node.example/_diffforge/instances/abc/v1/app/ws".to_string(),
+            ws_url: "wss://mcp-abc.diffforge.ai/v1/app/ws".to_string(),
             route_token: Some(make_token(fresh_exp)),
             transport: "direct_cloud_container".to_string(),
         });
@@ -56251,7 +56344,7 @@ mod cloud_mcp_tests {
             cloud_mcp_last_direct_route_fresh("/v1/voice/ws").expect("fresh cached route");
         assert_eq!(
             derived.ws_url,
-            "wss://node.example/_diffforge/instances/abc/v1/voice/ws"
+            "wss://mcp-abc.diffforge.ai/v1/voice/ws"
         );
         assert_eq!(derived.transport, "direct_cloud_container");
         assert!(derived.route_token.is_some());
@@ -56260,7 +56353,7 @@ mod cloud_mcp_tests {
         // token for voice, because the node gateway will reject it with 403.
         cloud_mcp_note_direct_route(&CloudMcpWsTarget {
             ws_url: "wss://node.example/_diffforge/instances/abc/v1/app/ws".to_string(),
-            route_token: Some(make_scoped_token(fresh_exp, json!(["/v1/app/ws"]))),
+            route_token: Some(make_scoped_gateway_token(fresh_exp, json!(["/v1/app/ws"]))),
             transport: "node_dns_gateway".to_string(),
         });
         assert!(cloud_mcp_last_direct_route_fresh("/v1/voice/ws").is_none());
@@ -56274,7 +56367,7 @@ mod cloud_mcp_tests {
 
         // An expired (or nearly expired) token must not be offered for reuse.
         cloud_mcp_note_direct_route(&CloudMcpWsTarget {
-            ws_url: "wss://node.example/v1/app/ws".to_string(),
+            ws_url: "wss://mcp-abc.diffforge.ai/v1/app/ws".to_string(),
             route_token: Some(make_token(now_s + 5)),
             transport: "direct_cloud_container".to_string(),
         });
@@ -56385,26 +56478,54 @@ mod cloud_mcp_tests {
     }
 
     #[test]
-    fn live_app_ws_node_gateway_routes_require_balancer_token() {
-        assert!(cloud_mcp_live_app_ws_route_requires_balancer_token(
-            "wss://node-a.nodes.diffforge.ai/_diffforge/instances/backend-1/v1/app/ws",
-            "node_dns_gateway"
+    fn route_token_mode_must_match_websocket_url_shape() {
+        let now_s = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let token = |payload: Value| {
+            let payload = general_purpose::URL_SAFE_NO_PAD
+                .encode(serde_json::to_vec(&payload).expect("encode claims"));
+            format!("{payload}.test-signature")
+        };
+        let gateway_token = token(json!({
+            "scope": "cloud_ws",
+            "route_mode": "node_dns_gateway",
+            "backend_id": "backend-1",
+            "node_dns": "node-a.nodes.diffforge.ai",
+            "container_port": 20000,
+            "allowed_paths": ["/v1/voice/ws"],
+            "exp": now_s + 120
+        }));
+        let container_token = token(json!({
+            "scope": "cloud_ws",
+            "route_mode": "direct_cloud_container",
+            "allowed_paths": ["/v1/voice/ws"],
+            "exp": now_s + 120
+        }));
+        let gateway_url =
+            "wss://node-a.nodes.diffforge.ai/_diffforge/instances/backend-1/v1/voice/ws";
+        let container_url = "wss://mcp-backend.diffforge.ai/v1/voice/ws";
+
+        assert!(cloud_mcp_route_token_compatible_with_url(
+            &gateway_token,
+            gateway_url,
+            "/v1/voice/ws"
         ));
-        assert!(cloud_mcp_live_app_ws_route_requires_balancer_token(
-            "wss://node-a.nodes.diffforge.ai/_diffforge/instances/backend-1/v1/app/ws",
-            "direct_cloud_container"
+        assert!(!cloud_mcp_route_token_compatible_with_url(
+            &container_token,
+            gateway_url,
+            "/v1/voice/ws"
         ));
-        assert!(cloud_mcp_live_app_ws_route_requires_balancer_token(
-            "wss://mcp-backend.diffforge.ai/v1/app/ws",
-            "node_dns_gateway"
+        assert!(cloud_mcp_route_token_compatible_with_url(
+            &container_token,
+            container_url,
+            "/v1/voice/ws"
         ));
-        assert!(!cloud_mcp_live_app_ws_route_requires_balancer_token(
-            "ws://127.0.0.1:8080/v1/app/ws",
-            "local_docker_cloud"
-        ));
-        assert!(!cloud_mcp_live_app_ws_route_requires_balancer_token(
-            "wss://mcp-backend.diffforge.ai/v1/app/ws",
-            "direct_cloud_container"
+        assert!(!cloud_mcp_route_token_compatible_with_url(
+            &gateway_token,
+            container_url,
+            "/v1/voice/ws"
         ));
     }
 
