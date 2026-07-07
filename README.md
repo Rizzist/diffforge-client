@@ -12,7 +12,13 @@
 
 *Where AI agents, voice, screenshots, assets, loops, and your entire dev workflow are forged into one native desktop app.*
 
-![Version](https://img.shields.io/badge/Diff%20Forge-v0.6.0-2f80ff) ![Rust](https://img.shields.io/badge/Rust-core-orange?logo=rust) ![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB?logo=tauri) ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react) ![macOS](https://img.shields.io/badge/macOS-✓-black?logo=apple) ![Windows](https://img.shields.io/badge/Windows-✓-0078D4) ![Linux](https://img.shields.io/badge/Linux-✓-FCC624?logo=linux&logoColor=black)
+![Version](https://img.shields.io/github/v/release/Rizzist/diffforge-client?label=Diff%20Forge&color=2f80ff) ![Rust](https://img.shields.io/badge/Rust-core-orange?logo=rust) ![Tauri](https://img.shields.io/badge/Tauri-v2-24C8DB?logo=tauri) ![React](https://img.shields.io/badge/React-19-61DAFB?logo=react) ![macOS](https://img.shields.io/badge/macOS-✓-black?logo=apple) ![Windows](https://img.shields.io/badge/Windows-✓-0078D4) ![Linux](https://img.shields.io/badge/Linux-✓-FCC624?logo=linux&logoColor=black)
+
+<br/>
+
+### [▶️ Watch Diff Forge in action](https://www.diffforge.ai/media/diff-forge-demo.webm)
+
+*The forge at work — agents, voice, snips, loops, and the grid.*
 
 </div>
 

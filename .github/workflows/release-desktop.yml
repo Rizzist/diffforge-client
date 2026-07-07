@@ -1,16 +1,14 @@
 name: Desktop Release
 
 # Builds the desktop app for macOS/Windows/Linux and publishes the release to
-# the public distribution repo Rizzist/diffforge-client-releases (source stays private).
+# this repo, Rizzist/diffforge-client.
 #
 # Triggers:
 #   - tag push v*          -> build + publish
 #   - workflow_dispatch    -> build only, unless the "publish" input is true
 #
-# Required secret for publishing: RELEASES_GITHUB_TOKEN
-#   (fine-grained PAT, repo Rizzist/diffforge-client-releases, Contents: Read and write).
-# Without it the workflow still builds and uploads a "release-bundle" workflow
-# artifact, and the publish step is skipped with a warning.
+# Publishing uses the workflow GITHUB_TOKEN. Tag pushes publish automatically;
+# workflow_dispatch publishes only when the "publish" input is true.
 #
 # Required secret for OTA updates: TAURI_SIGNING_PRIVATE_KEY (minisign key
 # generated with `tauri signer generate`; pubkey lives in tauri.conf.json).
@@ -23,7 +21,7 @@ on:
   workflow_dispatch:
     inputs:
       publish:
-        description: "Publish a release to Rizzist/diffforge-client-releases"
+        description: "Publish a release to Rizzist/diffforge-client"
         type: boolean
         default: false
 
@@ -186,6 +184,8 @@ jobs:
     needs: [build-macos, build-windows, build-linux]
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -255,7 +255,7 @@ jobs:
           for (const [file, key, format] of entries) {
             if (!sums[file]) continue;
             platforms[key] = {
-              url: `https://github.com/Rizzist/diffforge-client-releases/releases/download/v${version}/${file}`,
+              url: `https://github.com/Rizzist/diffforge-client/releases/download/v${version}/${file}`,
               sha256: sums[file],
               format,
               size: fs.statSync(`out/${file}`).size,
@@ -288,7 +288,7 @@ jobs:
             const sigPath = `out/${file}.sig`;
             if (!fs.existsSync(`out/${file}`) || !fs.existsSync(sigPath)) continue;
             platforms[key] = {
-              url: `https://github.com/Rizzist/diffforge-client-releases/releases/download/v${version}/${file}`,
+              url: `https://github.com/Rizzist/diffforge-client/releases/download/v${version}/${file}`,
               signature: fs.readFileSync(sigPath, 'utf8').trim(),
             };
           }
@@ -306,13 +306,8 @@ jobs:
           path: out/*
       - name: Decide whether to publish
         id: gate
-        env:
-          RELEASES_TOKEN: ${{ secrets.RELEASES_GITHUB_TOKEN }}
         run: |
-          if [ -z "$RELEASES_TOKEN" ]; then
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::RELEASES_GITHUB_TOKEN is not set — skipping publish to Rizzist/diffforge-client-releases"
-          elif [ "${{ github.ref_type }}" = "tag" ] || [ "${{ inputs.publish }}" = "true" ]; then
+          if [ "${{ github.ref_type }}" = "tag" ] || [ "${{ inputs.publish }}" = "true" ]; then
             echo "publish=true" >> "$GITHUB_OUTPUT"
           else
             echo "publish=false" >> "$GITHUB_OUTPUT"
@@ -322,8 +317,7 @@ jobs:
         if: steps.gate.outputs.publish == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          repository: Rizzist/diffforge-client-releases
-          token: ${{ secrets.RELEASES_GITHUB_TOKEN }}
+          token: ${{ secrets.GITHUB_TOKEN }}
           tag_name: v${{ steps.version.outputs.version }}
           name: Diff Forge AI v${{ steps.version.outputs.version }}
           make_latest: true

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Diff Forge AI",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "identifier": "ai.diffforge.desktop",
   "build": {
     "beforeDevCommand": "npm run dev:web",
@@ -99,7 +99,8 @@
     },
     "updater": {
       "endpoints": [
-        "https://diffforge.ai/downloads/desktop/updater.json"
+        "https://diffforge.ai/downloads/desktop/updater.json",
+        "https://github.com/Rizzist/diffforge-client/releases/latest/download/updater.json"
       ],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ2RTU1NUY1ODFEOUExMkYKUldRdm9kbUI5VlhsUmdtTks2S3c1ZGZPTWo3VFRXa09wVEpLZDhYUmNJSDlESER6RllQQytLbjQK"
     }

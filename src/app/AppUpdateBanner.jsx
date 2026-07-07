@@ -5,8 +5,9 @@ import styled from "styled-components";
 
 // Over-the-wire update affordance for the main window. Backend checks the
 // signed feed on its own schedule and emits forge-app-update-* events; this
-// banner only surfaces them and triggers the explicit install+restart. It
-// never restarts the app on its own — terminals host live agent sessions.
+// banner only surfaces them and triggers explicit download/restart actions. It
+// never restarts the app without the user's idle-restart opt-in — terminals
+// host live agent sessions.
 
 const DISMISSED_VERSION_KEY = "forge-app-update-dismissed-version";
 
@@ -110,6 +111,7 @@ export default function AppUpdateBanner() {
   const [phase, setPhase] = useState("idle");
   const [progress, setProgress] = useState(null);
   const [error, setError] = useState("");
+  const [stagedInstalled, setStagedInstalled] = useState(false);
   const [autoRestart, setAutoRestart] = useState(false);
   const [dismissedVersion, setDismissedVersion] = useState(() => {
     try {
@@ -131,6 +133,12 @@ export default function AppUpdateBanner() {
         if (status?.available && status?.version) {
           setUpdate({ version: status.version, notes: status.notes || "" });
         }
+        if (status?.ready) {
+          setStagedInstalled(Boolean(status?.staged?.installed));
+          setPhase("ready");
+        } else if (status?.installing) {
+          setPhase("downloading");
+        }
         setAutoRestart(Boolean(status?.autoRestartWhenIdle));
       })
       .catch(() => {});
@@ -150,7 +158,20 @@ export default function AppUpdateBanner() {
 
     listen("forge-app-update-state", (event) => {
       const state = event?.payload?.state;
-      if (state === "downloading") setPhase("downloading");
+      const version = event?.payload?.version;
+      if (version) {
+        setUpdate((current) => ({ version, notes: current?.notes || "" }));
+      }
+      if (state === "downloading") {
+        setStagedInstalled(false);
+        setProgress(null);
+        setPhase("downloading");
+      }
+      if (state === "ready") {
+        setStagedInstalled(Boolean(event?.payload?.installed));
+        setPhase("ready");
+      }
+      if (state === "restarting") setPhase("restarting");
       if (state === "installed") setPhase("restarting");
       if (state === "failed") {
         setPhase("failed");
@@ -164,11 +185,27 @@ export default function AppUpdateBanner() {
     };
   }, []);
 
-  const startInstall = useCallback(() => {
+  const startDownload = useCallback(() => {
     setPhase("downloading");
     setError("");
     setProgress(null);
-    invoke("app_update_install_and_restart").catch((failure) => {
+    invoke("app_update_download")
+      .then((status) => {
+        if (status?.ready) {
+          setStagedInstalled(Boolean(status?.staged?.installed));
+          setPhase("ready");
+        }
+      })
+      .catch((failure) => {
+        setPhase("failed");
+        setError(String(failure || "Update failed."));
+      });
+  }, []);
+
+  const restartNow = useCallback(() => {
+    setPhase("restarting");
+    setError("");
+    invoke("app_update_restart").catch((failure) => {
       setPhase("failed");
       setError(String(failure || "Update failed."));
     });
@@ -190,7 +227,7 @@ export default function AppUpdateBanner() {
   }, []);
 
   if (!update?.version) return null;
-  if (phase === "idle" && dismissedVersion === update.version) return null;
+  if ((phase === "idle" || phase === "ready" || phase === "failed") && dismissedVersion === update.version) return null;
 
   if (phase === "downloading" || phase === "restarting") {
     const detail = phase === "restarting"
@@ -217,7 +254,28 @@ export default function AppUpdateBanner() {
           <Title>Update to {update.version} failed</Title>
           <Detail>{error}</Detail>
         </Label>
-        <RestartButton type="button" onClick={startInstall}>Retry</RestartButton>
+        <RestartButton type="button" onClick={startDownload}>Retry</RestartButton>
+        <DismissButton type="button" aria-label="Dismiss" onClick={dismiss}>×</DismissButton>
+      </Shell>
+    );
+  }
+
+  if (phase === "ready") {
+    return (
+      <Shell role="status">
+        <Label>
+          <Title>Diff Forge {update.version} is ready to restart</Title>
+          <Detail>
+            {stagedInstalled
+              ? "Restart now, or quit and reopen later."
+              : "Restart now to finish installing the downloaded update."}
+          </Detail>
+          <AutoRow>
+            <input type="checkbox" checked={autoRestart} onChange={toggleAutoRestart} />
+            Auto-restart when all terminals are idle
+          </AutoRow>
+        </Label>
+        <RestartButton type="button" onClick={restartNow}>Restart now</RestartButton>
         <DismissButton type="button" aria-label="Dismiss" onClick={dismiss}>×</DismissButton>
       </Shell>
     );
@@ -226,14 +284,14 @@ export default function AppUpdateBanner() {
   return (
     <Shell role="status">
       <Label>
-        <Title>Diff Forge {update.version} is ready</Title>
-        <Detail>Installs on restart — running agents are left alone until then.</Detail>
+        <Title>Diff Forge {update.version} is available</Title>
+        <Detail>Downloads in the background. Agents keep running until restart.</Detail>
         <AutoRow>
           <input type="checkbox" checked={autoRestart} onChange={toggleAutoRestart} />
           Auto-restart when all terminals are idle
         </AutoRow>
       </Label>
-      <RestartButton type="button" onClick={startInstall}>Restart to update</RestartButton>
+      <RestartButton type="button" onClick={startDownload}>Update</RestartButton>
       <DismissButton type="button" aria-label="Dismiss" onClick={dismiss}>×</DismissButton>
     </Shell>
   );

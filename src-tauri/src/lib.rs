@@ -9861,6 +9861,8 @@ fn run_app(daemon: bool) {
         .invoke_handler(tauri::generate_handler![
             app_update_status,
             app_update_check_now,
+            app_update_download,
+            app_update_restart,
             app_update_install_and_restart,
             app_update_settings_state,
             app_update_settings_update,
