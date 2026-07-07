@@ -7,6 +7,7 @@ const ACTIVE_FRAME_BYTES = 16 * 1024;
 const BACKGROUND_FRAME_BYTES = ACTIVE_FRAME_BYTES;
 const INSPECTION_TEXT_LIMIT = 2400;
 const INITIAL_INSPECTION_CHUNKS = 80;
+const TRANSPORT_DOOMED_SOCKET_GRACE_MS = 8_000;
 
 const sessions = new Map();
 
@@ -216,16 +217,46 @@ function closeSessionTransport(session) {
   if (!session?.transportSocket) {
     return;
   }
+  const socket = session.transportSocket;
+  session.transportSocket = null;
   try {
-    session.transportSocket.onclose = null;
-    session.transportSocket.onerror = null;
-    session.transportSocket.onmessage = null;
-    session.transportSocket.onopen = null;
-    session.transportSocket.close();
+    socket.onclose = null;
+    socket.onerror = null;
+    socket.onmessage = null;
+    if (socket.readyState === WebSocket.CONNECTING) {
+      // Aborting a CONNECTING socket makes WebKit log a failed-connection
+      // console error on every optimistic workspace close. The transport
+      // listener is app-global and outlives the workspace, so let the
+      // handshake finish and close cleanly. A grace timer bounds doomed
+      // sockets when the endpoint is genuinely dead so rapid open/close
+      // cycling cannot accumulate CONNECTING sockets indefinitely.
+      const graceTimer = setTimeout(() => {
+        if (socket.readyState === WebSocket.CONNECTING) {
+          try {
+            socket.close();
+          } catch (_error) {
+            // Best effort only.
+          }
+        }
+      }, TRANSPORT_DOOMED_SOCKET_GRACE_MS);
+      socket.onclose = () => {
+        clearTimeout(graceTimer);
+      };
+      socket.onopen = () => {
+        clearTimeout(graceTimer);
+        try {
+          socket.close();
+        } catch (_error) {
+          // Best effort only.
+        }
+      };
+      return;
+    }
+    socket.onopen = null;
+    socket.close();
   } catch (_error) {
     // Best effort only.
   }
-  session.transportSocket = null;
 }
 
 function connectTransport(message = {}) {
@@ -240,7 +271,18 @@ function connectTransport(message = {}) {
     return;
   }
 
-  const session = getSession(id);
+  // Lookup only — never recreate: a dispose that raced an in-flight endpoint
+  // resolution used to resurrect the session here and subscribe a socket
+  // nobody owned.
+  const session = sessions.get(id);
+  if (!session) {
+    postMessage({
+      error: "Terminal output transport session is not registered.",
+      id,
+      type: "transport-error",
+    });
+    return;
+  }
   closeSessionTransport(session);
   session.active = message.active === true;
   session.transportInspect = message.inspect === true;
@@ -326,6 +368,15 @@ function connectTransport(message = {}) {
 self.onmessage = (event) => {
   const message = event.data || {};
   if (message.type === "register") {
+    // Re-registering an id must not leak the previous session's live socket
+    // or its pending flush timer.
+    const previous = sessions.get(message.id);
+    if (previous) {
+      if (previous.flushTimer) {
+        clearTimeout(previous.flushTimer);
+      }
+      closeSessionTransport(previous);
+    }
     const session = createSession(message.id, message);
     sessions.set(message.id, session);
     return;

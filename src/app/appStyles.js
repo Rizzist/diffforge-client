@@ -12704,8 +12704,17 @@ export const AudioModeGrid = styled.div`
   gap: 6px;
   min-width: 0;
 
+  /* Icon-less short options (e.g. silence-hold durations) pack tighter. */
+  &[data-compact="true"] {
+    grid-template-columns: repeat(auto-fit, minmax(56px, 1fr));
+  }
+
   @media (max-width: 620px) {
     grid-template-columns: 1fr;
+
+    &[data-compact="true"] {
+      grid-template-columns: repeat(auto-fit, minmax(56px, 1fr));
+    }
   }
 `;
 
@@ -12742,6 +12751,15 @@ export const AudioModeButton = styled.button`
     display: grid;
     min-width: 0;
     gap: 2px;
+  }
+
+  /* Icon-less variant: single centered label column (the default grid would
+     drop a lone span into the 30px icon column). */
+  &[data-compact="true"] {
+    min-height: 32px;
+    grid-template-columns: minmax(0, 1fr);
+    justify-items: center;
+    padding: 5px 7px;
   }
 
   strong {

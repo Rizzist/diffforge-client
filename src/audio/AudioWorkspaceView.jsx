@@ -60,6 +60,14 @@ import {
   readOrchestratorVoiceSubmissionMode,
   readAudioRealtimeTranscriptOverlayEnabled,
   writeAudioRealtimeTranscriptOverlayEnabled,
+  AUDIO_LOCAL_WHISPER_REALTIME_MODE_OFF,
+  AUDIO_LOCAL_WHISPER_REALTIME_MODE_OPTIONS,
+  AUDIO_LOCAL_WHISPER_SILENCE_HOLD_OPTIONS,
+  readLocalWhisperPartialTuning,
+  readLocalWhisperRealtimeMode,
+  readLocalWhisperSilenceHoldMs,
+  writeLocalWhisperRealtimeMode,
+  writeLocalWhisperSilenceHoldMs,
   readAudioTranscriptionHistory,
   readAudioTranscriptionProvider,
   readAutoOpenAudioRecorder,
@@ -2951,6 +2959,12 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
   const [realtimeOverlayEnabled, setRealtimeOverlayEnabled] = useState(
     readAudioRealtimeTranscriptOverlayEnabled,
   );
+  const [localWhisperRealtimeMode, setLocalWhisperRealtimeMode] = useState(
+    readLocalWhisperRealtimeMode,
+  );
+  const [localWhisperSilenceHoldMs, setLocalWhisperSilenceHoldMs] = useState(
+    readLocalWhisperSilenceHoldMs,
+  );
   const [recorderMode, setRecorderMode] = useState(readAudioRecorderMode);
   const [orchestratorSubmissionMode, setOrchestratorSubmissionMode] = useState(readOrchestratorVoiceSubmissionMode);
   const [orchestratorRealtimeEnabled, setOrchestratorRealtimeEnabled] = useState(readOrchestratorRealtimeEnabled);
@@ -3919,6 +3933,18 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
     setRecorderMode(nextMode);
     writeAudioRecorderMode(nextMode);
     notifyAudioSettingsChanged("recorder-mode");
+  }, []);
+
+  const updateLocalWhisperRealtimeMode = useCallback((nextMode) => {
+    setLocalWhisperRealtimeMode(nextMode);
+    writeLocalWhisperRealtimeMode(nextMode);
+    notifyAudioSettingsChanged("local-whisper-realtime-mode");
+  }, []);
+
+  const updateLocalWhisperSilenceHoldMs = useCallback((nextMs) => {
+    setLocalWhisperSilenceHoldMs(nextMs);
+    writeLocalWhisperSilenceHoldMs(nextMs);
+    notifyAudioSettingsChanged("local-whisper-silence-hold");
   }, []);
 
   const scheduleVoiceRulesSave = useCallback((nextRules) => {
@@ -5067,6 +5093,71 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                         );
                       })}
                     </AudioLocalModelList>
+                  )}
+                  {!isCloudMode && !isForgeMode && !isForgeAgentMode && (
+                    <>
+                      <TrayClickGroup>
+                        <div>
+                          <SettingsLabel>Live transcript pacing</SettingsLabel>
+                          <SettingsHint>
+                            {AUDIO_LOCAL_WHISPER_REALTIME_MODE_OPTIONS
+                              .find((option) => option.id === localWhisperRealtimeMode)?.detail
+                              || "How eagerly the live transcript shows segments while you speak."}
+                          </SettingsHint>
+                        </div>
+                        <AudioModeGrid aria-label="Local Whisper live transcript pacing" role="group">
+                          {AUDIO_LOCAL_WHISPER_REALTIME_MODE_OPTIONS.map((option) => (
+                            <AudioModeButton
+                              aria-pressed={localWhisperRealtimeMode === option.id}
+                              key={option.id}
+                              onClick={() => updateLocalWhisperRealtimeMode(option.id)}
+                              title={option.detail}
+                              type="button"
+                            >
+                              {option.id === AUDIO_LOCAL_WHISPER_REALTIME_MODE_OFF ? (
+                                <ButtonMicOffIcon aria-hidden="true" />
+                              ) : (
+                                <ButtonMicIcon aria-hidden="true" />
+                              )}
+                              <span>
+                                <strong>{option.label}</strong>
+                                <span>
+                                  {option.id === AUDIO_LOCAL_WHISPER_REALTIME_MODE_OFF
+                                    ? "Transcribe at the end"
+                                    : `Segments every ~${option.minChunkMs / 1000}s+`}
+                                </span>
+                              </span>
+                            </AudioModeButton>
+                          ))}
+                        </AudioModeGrid>
+                      </TrayClickGroup>
+                      {localWhisperRealtimeMode !== AUDIO_LOCAL_WHISPER_REALTIME_MODE_OFF && (
+                        <TrayClickGroup>
+                          <div>
+                            <SettingsLabel>Silence hold</SettingsLabel>
+                            <SettingsHint>
+                              How long a pause must last before the segment you just spoke is cut and shown.
+                            </SettingsHint>
+                          </div>
+                          <AudioModeGrid aria-label="Local Whisper silence hold" data-compact="true" role="group">
+                            {AUDIO_LOCAL_WHISPER_SILENCE_HOLD_OPTIONS.map((option) => (
+                              <AudioModeButton
+                                aria-pressed={localWhisperSilenceHoldMs === option.id}
+                                data-compact="true"
+                                key={option.id}
+                                onClick={() => updateLocalWhisperSilenceHoldMs(option.id)}
+                                title={`Cut a segment after ${option.label} of silence`}
+                                type="button"
+                              >
+                                <span>
+                                  <strong>{option.label}</strong>
+                                </span>
+                              </AudioModeButton>
+                            ))}
+                          </AudioModeGrid>
+                        </TrayClickGroup>
+                      )}
+                    </>
                   )}
                   {(isCloudMode || isForgeMode) && (
                     <AudioCloudField>
@@ -6708,22 +6799,28 @@ export function AudioWidgetWindow() {
       await audioBuffer.beginCapture();
       captureBegan = true;
       if (currentProvider === AUDIO_TRANSCRIPTION_PROVIDER_LOCAL) {
-        const partialSessionId = `local-whisper-${Date.now()}-${recordingRunId}`;
-        const partialHistoryId = `local-whisper-history-${Date.now()}-${recordingRunId}`;
-        try {
-          await startLocalWhisperPartialTranscription({
-            historyId: partialHistoryId,
-            maxChunkMs: 35000,
-            minChunkMs: 10000,
-            sessionId: partialSessionId,
-            silenceMs: 750,
-          });
-          localWhisperPartialSessionIdRef.current = partialSessionId;
-          localWhisperPartialHistoryIdRef.current = partialHistoryId;
-        } catch {
-          localWhisperPartialFailedRef.current = true;
-          localWhisperPartialSessionIdRef.current = "";
-          localWhisperPartialHistoryIdRef.current = "";
+        // Pacing + silence hold come from the Audio tab; "off" skips the
+        // realtime partial session and the stop path falls through to the
+        // single full transcription, same as a failed partial start.
+        const partialTuning = readLocalWhisperPartialTuning();
+        if (partialTuning.enabled) {
+          const partialSessionId = `local-whisper-${Date.now()}-${recordingRunId}`;
+          const partialHistoryId = `local-whisper-history-${Date.now()}-${recordingRunId}`;
+          try {
+            await startLocalWhisperPartialTranscription({
+              historyId: partialHistoryId,
+              maxChunkMs: partialTuning.maxChunkMs,
+              minChunkMs: partialTuning.minChunkMs,
+              sessionId: partialSessionId,
+              silenceMs: partialTuning.silenceMs,
+            });
+            localWhisperPartialSessionIdRef.current = partialSessionId;
+            localWhisperPartialHistoryIdRef.current = partialHistoryId;
+          } catch {
+            localWhisperPartialFailedRef.current = true;
+            localWhisperPartialSessionIdRef.current = "";
+            localWhisperPartialHistoryIdRef.current = "";
+          }
         }
       }
       if (recordingRunRef.current !== recordingRunId) {

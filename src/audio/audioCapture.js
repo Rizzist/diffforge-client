@@ -174,6 +174,133 @@ export function writeAudioRealtimeTranscriptOverlayEnabled(enabled) {
   }
 }
 
+const AUDIO_LOCAL_WHISPER_REALTIME_MODE_STORAGE_KEY = "diffforge.audio.localWhisperRealtimeMode.v1";
+const AUDIO_LOCAL_WHISPER_SILENCE_HOLD_MS_STORAGE_KEY = "diffforge.audio.localWhisperSilenceHoldMs.v1";
+
+export const AUDIO_LOCAL_WHISPER_REALTIME_MODE_REALTIME = "realtime";
+export const AUDIO_LOCAL_WHISPER_REALTIME_MODE_BALANCED = "balanced";
+export const AUDIO_LOCAL_WHISPER_REALTIME_MODE_OFF = "off";
+
+// Chunk presets feed local_whisper_partial_start; the Rust chunker clamps
+// minChunkMs to [3000, 35000] and maxChunkMs to [10000, 35000], so presets
+// must stay inside those bounds to mean what the UI promises.
+export const AUDIO_LOCAL_WHISPER_REALTIME_MODE_OPTIONS = Object.freeze([
+  Object.freeze({
+    id: AUDIO_LOCAL_WHISPER_REALTIME_MODE_REALTIME,
+    label: "Real time",
+    detail: "Shows segments as fast as the engine allows (~3s), at some accuracy cost.",
+    minChunkMs: 3000,
+    maxChunkMs: 10000,
+  }),
+  Object.freeze({
+    id: AUDIO_LOCAL_WHISPER_REALTIME_MODE_BALANCED,
+    label: "Close to real time",
+    detail: "Steadier segments with better context (~10s).",
+    minChunkMs: 10000,
+    maxChunkMs: 35000,
+  }),
+  Object.freeze({
+    id: AUDIO_LOCAL_WHISPER_REALTIME_MODE_OFF,
+    label: "Off",
+    detail: "No live transcript; everything is transcribed once when you stop.",
+    minChunkMs: 0,
+    maxChunkMs: 0,
+  }),
+]);
+
+// The Rust chunker clamps the silence cut to [300, 2000] ms.
+export const AUDIO_LOCAL_WHISPER_SILENCE_HOLD_OPTIONS = Object.freeze(
+  [300, 500, 750, 1000, 1500, 2000].map((ms) => Object.freeze({
+    id: ms,
+    label: `${ms / 1000}s`,
+  })),
+);
+const AUDIO_LOCAL_WHISPER_SILENCE_HOLD_DEFAULT_MS = 750;
+
+export function normalizeLocalWhisperRealtimeMode(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (
+    normalized === AUDIO_LOCAL_WHISPER_REALTIME_MODE_REALTIME
+    || normalized === AUDIO_LOCAL_WHISPER_REALTIME_MODE_OFF
+  ) {
+    return normalized;
+  }
+  return AUDIO_LOCAL_WHISPER_REALTIME_MODE_BALANCED;
+}
+
+export function readLocalWhisperRealtimeMode() {
+  if (!canUseStorage()) {
+    return AUDIO_LOCAL_WHISPER_REALTIME_MODE_BALANCED;
+  }
+  return normalizeLocalWhisperRealtimeMode(
+    window.localStorage.getItem(AUDIO_LOCAL_WHISPER_REALTIME_MODE_STORAGE_KEY),
+  );
+}
+
+export function writeLocalWhisperRealtimeMode(mode) {
+  if (canUseStorage()) {
+    window.localStorage.setItem(
+      AUDIO_LOCAL_WHISPER_REALTIME_MODE_STORAGE_KEY,
+      normalizeLocalWhisperRealtimeMode(mode),
+    );
+  }
+}
+
+export function normalizeLocalWhisperSilenceHoldMs(value) {
+  // Number("") and Number("  ") are 0, which would silently snap a blank
+  // stored value to the shortest hold instead of the default.
+  const ms = typeof value === "string" ? Number(value.trim() || Number.NaN) : Number(value);
+  if (!Number.isFinite(ms) || ms <= 0) {
+    return AUDIO_LOCAL_WHISPER_SILENCE_HOLD_DEFAULT_MS;
+  }
+  const options = AUDIO_LOCAL_WHISPER_SILENCE_HOLD_OPTIONS;
+  let closest = options[0].id;
+  for (const option of options) {
+    if (Math.abs(option.id - ms) < Math.abs(closest - ms)) {
+      closest = option.id;
+    }
+  }
+  return closest;
+}
+
+export function readLocalWhisperSilenceHoldMs() {
+  if (!canUseStorage()) {
+    return AUDIO_LOCAL_WHISPER_SILENCE_HOLD_DEFAULT_MS;
+  }
+  return normalizeLocalWhisperSilenceHoldMs(
+    window.localStorage.getItem(AUDIO_LOCAL_WHISPER_SILENCE_HOLD_MS_STORAGE_KEY)
+      ?? AUDIO_LOCAL_WHISPER_SILENCE_HOLD_DEFAULT_MS,
+  );
+}
+
+export function writeLocalWhisperSilenceHoldMs(ms) {
+  if (canUseStorage()) {
+    window.localStorage.setItem(
+      AUDIO_LOCAL_WHISPER_SILENCE_HOLD_MS_STORAGE_KEY,
+      String(normalizeLocalWhisperSilenceHoldMs(ms)),
+    );
+  }
+}
+
+// Everything local-whisper dictation needs to start (or skip) the realtime
+// partial session, resolved from the two Audio-tab settings above.
+export function readLocalWhisperPartialTuning() {
+  const mode = readLocalWhisperRealtimeMode();
+  if (mode === AUDIO_LOCAL_WHISPER_REALTIME_MODE_OFF) {
+    return { enabled: false, mode };
+  }
+  const option = AUDIO_LOCAL_WHISPER_REALTIME_MODE_OPTIONS
+    .find((candidate) => candidate.id === mode)
+    || AUDIO_LOCAL_WHISPER_REALTIME_MODE_OPTIONS[1];
+  return {
+    enabled: true,
+    mode,
+    minChunkMs: option.minChunkMs,
+    maxChunkMs: option.maxChunkMs,
+    silenceMs: readLocalWhisperSilenceHoldMs(),
+  };
+}
+
 export function normalizeAudioWidgetTheme(value) {
   return value === AUDIO_WIDGET_THEME_LIGHT ? AUDIO_WIDGET_THEME_LIGHT : AUDIO_WIDGET_THEME_DARK;
 }

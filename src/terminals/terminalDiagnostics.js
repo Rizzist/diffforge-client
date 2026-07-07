@@ -202,15 +202,33 @@ export function logTerminalDiagnosticDuration(phase, startedAtMs, fields = {}, o
   );
 }
 
-export function getTerminalDiagnosticEnvironment() {
-  let webgl2 = false;
+let terminalDiagnosticWebgl2Probe = null;
 
+function probeTerminalDiagnosticWebgl2() {
+  if (terminalDiagnosticWebgl2Probe) {
+    return terminalDiagnosticWebgl2Probe.webgl2;
+  }
+
+  let webgl2 = false;
   try {
     const canvas = document.createElement("canvas");
-    webgl2 = Boolean(canvas.getContext("webgl2"));
+    const gl = canvas.getContext("webgl2");
+    webgl2 = Boolean(gl);
+    // The detached probe canvas holds a live GL context until GC and counts
+    // against WebKit's ~16-contexts-per-page cap; release it immediately.
+    if (gl && !gl.isContextLost?.()) {
+      gl.getExtension?.("WEBGL_lose_context")?.loseContext?.();
+    }
   } catch {
     webgl2 = false;
   }
+
+  terminalDiagnosticWebgl2Probe = { webgl2 };
+  return webgl2;
+}
+
+export function getTerminalDiagnosticEnvironment() {
+  const webgl2 = probeTerminalDiagnosticWebgl2();
 
   return {
     devicePixelRatio: window.devicePixelRatio || 1,

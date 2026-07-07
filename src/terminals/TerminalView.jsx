@@ -29405,6 +29405,11 @@ function TerminalView({
     });
   }, [getTerminalAgent, getTerminalWindowTitle, terminalWorkspace?.id]);
 
+  // Tracks native terminal-window opens that are in flight plus a cancelled
+  // latch set at unmount, so windows finishing their open after the runtime
+  // unmounts are closed instead of orphaned.
+  const terminalWindowOpenSessionRef = useRef({ cancelled: false, pending: new Set() });
+
   // Individual pop-out: one grid terminal becomes its own native window (the
   // pane-level button next to the UI View toggle). Same machinery as the
   // all-panes Window Breakout — the PTY never restarts, the window attaches
@@ -29416,13 +29421,26 @@ function TerminalView({
     if (!safePaneId || windowBreakoutPanesRef.current[safePaneId]) {
       return false;
     }
+    const windowOpenSession = terminalWindowOpenSessionRef.current;
+    if (windowOpenSession.cancelled) {
+      return false;
+    }
+    windowOpenSession.pending.add(safePaneId);
     try {
       await openTerminalWindowForIndex(terminalIndex, safePaneId);
+      if (windowOpenSession.cancelled) {
+        // The runtime unmounted while the native open was in flight; the
+        // unmount cleanup could not see this window yet, so close it here.
+        invoke("terminal_window_close", { paneId: safePaneId }).catch(() => {});
+        return false;
+      }
       setWindowBreakoutPanes((current) => ({ ...current, [safePaneId]: true }));
       return true;
     } catch {
       // Panes that have not launched a PTY yet simply stay in the grid.
       return false;
+    } finally {
+      windowOpenSession.pending.delete(safePaneId);
     }
   }, [openTerminalWindowForIndex]);
 
@@ -29484,20 +29502,33 @@ function TerminalView({
 
     closeTerminalBreakout();
 
+    const windowOpenSession = terminalWindowOpenSessionRef.current;
     const opened = {};
     for (const terminalIndex of logicalTerminalIndexes) {
+      if (windowOpenSession.cancelled) {
+        break;
+      }
       const paneId = getTerminalPaneId(terminalIndex);
       if (!paneId) {
         continue;
       }
+      windowOpenSession.pending.add(paneId);
       try {
         // Sequential on purpose: parallel window creation races the macOS
         // main-thread window builder.
         // eslint-disable-next-line no-await-in-loop
         await openTerminalWindowForIndex(terminalIndex, paneId);
+        if (windowOpenSession.cancelled) {
+          // Runtime unmounted mid-open; the cleanup could not see this
+          // window yet, so close it here and stop opening more.
+          invoke("terminal_window_close", { paneId }).catch(() => {});
+          break;
+        }
         opened[paneId] = true;
       } catch {
         // Panes that have not launched a PTY yet simply stay in the grid.
+      } finally {
+        windowOpenSession.pending.delete(paneId);
       }
     }
 
@@ -30426,6 +30457,24 @@ function TerminalView({
       }
     });
   }, [getTerminalPaneId, logicalTerminalIndexes]);
+
+  // Close every detached terminal window when this workspace runtime
+  // unmounts (workspace closed/disabled): the PTYs die with the runtime, and
+  // an orphaned window otherwise reattach-polls the transport indefinitely.
+  // Pending (still-opening) windows are closed both here and by the opener's
+  // post-await cancelled check, whichever side sees the window last.
+  useEffect(() => () => {
+    const windowOpenSession = terminalWindowOpenSessionRef.current;
+    windowOpenSession.cancelled = true;
+    windowOpenSession.pending.forEach((paneId) => {
+      invoke("terminal_window_close", { paneId }).catch(() => {});
+    });
+    windowOpenSession.pending.clear();
+    Object.keys(windowBreakoutPanesRef.current).forEach((paneId) => {
+      invoke("terminal_window_close", { paneId }).catch(() => {});
+    });
+    pendingForkWindowBreakoutPanesRef.current.clear();
+  }, []);
 
   // Close web panel windows whose panes no longer exist.
   useEffect(() => {

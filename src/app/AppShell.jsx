@@ -36659,11 +36659,14 @@ export default function App() {
       && activatedWorkspace
       && workspaceDeactivationState.workspaceId === activatedWorkspace.id,
   );
+  // Launch readiness deliberately ignores UI selection: agent launches belong
+  // to the ACTIVATED runtime, and transient selection changes (rail clicks,
+  // view swaps, reconcile paths clearing selection mid-activation) used to
+  // stall the launch key for seconds and wipe in-flight batch bookkeeping.
   const workspaceTerminalAgentLaunchReady = workspaceState === "ready"
     && workspaceHydrationReady
     && !workspaceActivationDeferred
     && Boolean(activatedWorkspace)
-    && selectedWorkspace?.id === activatedWorkspace?.id
     && workspaceThreadsHydrated
     && !isActivatedWorkspaceDeactivating
     && activatedWorkspaceAgentTerminalEntries.length > 0;
@@ -50121,13 +50124,33 @@ export default function App() {
     }
 
     if (!workspaceAgentLaunchKey) {
+      // A transiently-empty launch key for the SAME activated workspace
+      // (readiness flicker while hydrating/re-rendering) must not wipe batch
+      // bookkeeping: an in-flight terminal_start_agent_many is not cancelled
+      // by this reset, so clearing started/in-flight sets caused duplicate
+      // launch accounting churn. Only reset when the activated workspace
+      // actually changed, is deactivating, or is gone.
+      // Owner check is a prefix match on `${workspaceId}:` because workspace
+      // ids are not guaranteed colon-free (cloud catalog ids pass through
+      // normalization unmodified), so split(":")[0] would misclassify them.
+      const previousLaunchKey = String(workspaceAgentLaunchKeyRef.current || "");
+      const launchKeyEmptyTransient = Boolean(
+        previousLaunchKey
+        && activatedWorkspace?.id
+        && previousLaunchKey.startsWith(`${activatedWorkspace.id}:`)
+        && !isActivatedWorkspaceDeactivating,
+      );
       logWorkspaceActivationTrace("workspace.open.agent_batch.reset", activatedWorkspace?.id || selectedWorkspaceIdRef.current, {
         agentTerminalCount: activatedWorkspaceAgentTerminalEntries.length,
         preparedWorkspaceTerminalCount,
-        reason: "launch_key_empty",
+        reason: launchKeyEmptyTransient ? "launch_key_empty_transient" : "launch_key_empty",
         preparedWorkspaceTerminalAgentStartCount,
         workspaceTerminalAgentLaunchReady,
       });
+      if (launchKeyEmptyTransient) {
+        clearPreparedWorkspaceAgentBatchRetry();
+        return;
+      }
       workspaceAgentLaunchKeyRef.current = "";
       workspaceAgentBatchInFlightKeyRef.current = "";
       workspaceAgentBatchWaitLogKeyRef.current = "";
@@ -50585,6 +50608,7 @@ export default function App() {
     activatedWorkspaceAgentTerminalEntries.length,
     activatedWorkspaceLogicalTerminalIndexes,
     activatedWorkspaceLogicalTerminalCount,
+    isActivatedWorkspaceDeactivating,
     preparedWorkspaceTerminalAgentStartCount,
     preparedWorkspaceTerminalCount,
     preparedWorkspaceTerminalRequests,

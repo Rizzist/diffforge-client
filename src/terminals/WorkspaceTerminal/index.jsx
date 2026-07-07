@@ -1153,6 +1153,22 @@ const TERMINAL_WEBGL_LRU_CAP = 12;
 const TERMINAL_RENDERER_ATTACH_MAX_PER_FRAME = 2;
 const terminalWebglAddonRegistry = new Map();
 let terminalWebglAddonRegistrySequence = 0;
+// xterm's WebglAddon.dispose() is not idempotent; terminal cleanup can reach
+// an addon through both the registry closure and the per-addon disposable.
+const disposedTerminalWebglAddons = new WeakSet();
+
+function disposeTerminalWebglAddonOnce(addon) {
+  if (!addon || disposedTerminalWebglAddons.has(addon)) {
+    return false;
+  }
+  disposedTerminalWebglAddons.add(addon);
+  try {
+    addon.dispose();
+  } catch (_error) {
+    // WebGL disposal is best effort; xterm keeps its DOM/canvas renderer.
+  }
+  return true;
+}
 const terminalRendererAttachQueue = [];
 let terminalRendererAttachFrameScheduled = false;
 let terminalRendererAttachFrameRemaining = TERMINAL_RENDERER_ATTACH_MAX_PER_FRAME;
@@ -1238,6 +1254,24 @@ function disposeTerminalWebglRegistryEntry(registryKey, reason = "webgl_registry
   }
   const entry = terminalWebglAddonRegistry.get(key);
   if (!entry) {
+    return false;
+  }
+  terminalWebglAddonRegistry.delete(key);
+  try {
+    entry.dispose?.(reason);
+  } catch (_error) {
+    // WebGL disposal is best effort; xterm keeps its DOM/canvas renderer.
+  }
+  return true;
+}
+
+function disposeTerminalWebglRegistryEntryForAddon(registryKey, addon, reason = "webgl_registry_dispose") {
+  const key = String(registryKey || "");
+  if (!key || !addon) {
+    return false;
+  }
+  const entry = terminalWebglAddonRegistry.get(key);
+  if (!entry || entry.addon !== addon) {
     return false;
   }
   terminalWebglAddonRegistry.delete(key);
@@ -6054,6 +6088,13 @@ function WorkspaceTerminal({
       if (!webglAddon) {
         return false;
       }
+      // Prefer the registry dispose closure: it also releases the GL context
+      // explicitly. The direct path below (addon.dispose() only) leaves the
+      // context alive until GC, which exhausted WebKit's per-page cap under
+      // workspace open/close cycling.
+      if (disposeTerminalWebglRegistryEntryForAddon(webglRegistryKey, webglAddon, reason)) {
+        return true;
+      }
       removeTerminalWebglRegistryEntry(webglRegistryKey, webglAddon);
       if (activeWebglAddon === webglAddon) {
         activeWebglAddon = null;
@@ -6061,11 +6102,7 @@ function WorkspaceTerminal({
         webglBackgroundDeferred = false;
         rendererMode = "canvas";
       }
-      try {
-        webglAddon.dispose();
-      } catch (_error) {
-        // WebGL disposal is best effort; xterm keeps its DOM/canvas renderer.
-      }
+      disposeTerminalWebglAddonOnce(webglAddon);
       logTerminalDiagnosticEvent("frontend.webgl.dispose", {
         paneId,
         reason,
@@ -7299,14 +7336,14 @@ function WorkspaceTerminal({
 	              webglBackgroundDeferred = false;
 	              rendererMode = "canvas";
 	            }
-	            try {
-	              webglAddon.dispose();
-	            } catch (_error) {
-	              // WebGL disposal is best effort; xterm keeps its DOM/canvas renderer.
-	            }
+	            disposeTerminalWebglAddonOnce(webglAddon);
 	            try {
 	              const gl = webglCanvas?.getContext?.("webgl2") || webglCanvas?.getContext?.("webgl");
-	              gl?.getExtension?.("WEBGL_lose_context")?.loseContext?.();
+	              // Skip contexts WebKit already force-lost at the page cap:
+	              // losing them again raises INVALID_OPERATION console errors.
+	              if (gl && !gl.isContextLost?.()) {
+	                gl.getExtension?.("WEBGL_lose_context")?.loseContext?.();
+	              }
 	            } catch (_error) {
 	              // Context release is best effort; GC reclaims it eventually.
 	            }

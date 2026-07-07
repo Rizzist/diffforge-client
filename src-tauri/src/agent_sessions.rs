@@ -5,7 +5,8 @@ const CODEX_TRANSCRIPT_MAX_TOOL_TEXT: usize = 8_000;
 const CODEX_TRANSCRIPT_MAX_REASONING_TEXT: usize = 48_000;
 const CODEX_ROLLOUT_SCAN_LIMIT: usize = 2_500;
 const AGENT_THREAD_TRANSCRIPT_UPDATED_EVENT: &str = "forge-agent-thread-transcript-updated";
-const AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS: u64 = 180;
+const AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS: u64 = 300;
+const AGENT_THREAD_TRANSCRIPT_WATCH_MAX_WAIT_MS: u64 = 750;
 const AGENT_THREAD_TRANSCRIPT_MAX_WATCHES: usize = 128;
 const CODEX_GENERATED_IMAGE_DIR_SCAN_LIMIT: usize = 16;
 
@@ -160,9 +161,14 @@ struct AgentThreadTranscriptWatchEntry {
     context: Arc<StdMutex<AgentThreadTranscriptWatchContext>>,
     last_signature: String,
     owners: HashSet<String>,
-    pending: Arc<AtomicBool>,
+    debounce: Arc<AgentThreadTranscriptWatchDebounce>,
     touched_ms: u64,
     _watcher: notify::RecommendedWatcher,
+}
+
+struct AgentThreadTranscriptWatchDebounce {
+    generation: AtomicU64,
+    scheduled: AtomicBool,
 }
 
 static AGENT_THREAD_TRANSCRIPT_WATCHES: OnceLock<
@@ -4830,13 +4836,6 @@ async fn emit_agent_thread_transcript_watch_update(
     .and_then(Result::ok);
 
     let Some(result) = read_result else {
-        if let Some(watches) = AGENT_THREAD_TRANSCRIPT_WATCHES.get() {
-            if let Ok(entries) = watches.lock() {
-                if let Some(entry) = entries.get(&key) {
-                    entry.pending.store(false, Ordering::SeqCst);
-                }
-            }
-        }
         return;
     };
     emit_promoted_generated_asset_event(
@@ -4855,7 +4854,6 @@ async fn emit_agent_thread_transcript_watch_update(
         let Some(entry) = entries.get_mut(&key) else {
             return;
         };
-        entry.pending.store(false, Ordering::SeqCst);
         entry.touched_ms = current_time_ms();
         if entry.last_signature == signature {
             false
@@ -4904,6 +4902,79 @@ async fn emit_agent_thread_transcript_watch_update(
     }
 }
 
+async fn agent_thread_transcript_watch_debounce_worker(
+    app: AppHandle,
+    key: String,
+    debounce: Arc<AgentThreadTranscriptWatchDebounce>,
+    mut observed_generation: u64,
+) {
+    loop {
+        let window_started = Instant::now();
+        loop {
+            let elapsed = window_started.elapsed();
+            if elapsed >= Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_MAX_WAIT_MS) {
+                observed_generation = debounce.generation.load(Ordering::SeqCst);
+                break;
+            }
+            let remaining =
+                Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_MAX_WAIT_MS) - elapsed;
+            let delay = if remaining < Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS)
+            {
+                remaining
+            } else {
+                Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS)
+            };
+            sleep(delay).await;
+            let latest_generation = debounce.generation.load(Ordering::SeqCst);
+            if latest_generation == observed_generation
+                || window_started.elapsed()
+                    >= Duration::from_millis(AGENT_THREAD_TRANSCRIPT_WATCH_MAX_WAIT_MS)
+            {
+                observed_generation = latest_generation;
+                break;
+            }
+            observed_generation = latest_generation;
+        }
+
+        emit_agent_thread_transcript_watch_update(app.clone(), key.clone(), "file-change").await;
+        let latest_generation = debounce.generation.load(Ordering::SeqCst);
+        if latest_generation != observed_generation {
+            observed_generation = latest_generation;
+            continue;
+        }
+        debounce.scheduled.store(false, Ordering::SeqCst);
+        let next_generation = debounce.generation.load(Ordering::SeqCst);
+        if next_generation == latest_generation
+            || debounce
+                .scheduled
+                .swap(true, Ordering::SeqCst)
+        {
+            break;
+        }
+        observed_generation = next_generation;
+    }
+}
+
+fn agent_thread_transcript_note_watch_event(
+    app: AppHandle,
+    key: String,
+    debounce: Arc<AgentThreadTranscriptWatchDebounce>,
+) {
+    let generation = debounce
+        .generation
+        .fetch_add(1, Ordering::SeqCst)
+        .wrapping_add(1);
+    if debounce.scheduled.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tauri::async_runtime::spawn(agent_thread_transcript_watch_debounce_worker(
+        app,
+        key,
+        debounce,
+        generation,
+    ));
+}
+
 fn register_agent_thread_transcript_watch_internal(
     app: &AppHandle,
     context: AgentThreadTranscriptWatchContext,
@@ -4940,8 +5011,11 @@ fn register_agent_thread_transcript_watch_internal(
     let app_for_watch = app.clone();
     let key_for_watch = key.clone();
     let watch_path_for_filter = watch_path.clone();
-    let pending = Arc::new(AtomicBool::new(false));
-    let pending_for_watch = pending.clone();
+    let debounce = Arc::new(AgentThreadTranscriptWatchDebounce {
+        generation: AtomicU64::new(0),
+        scheduled: AtomicBool::new(false),
+    });
+    let debounce_for_watch = debounce.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         let Ok(event) = event else {
             return;
@@ -4955,22 +5029,11 @@ fn register_agent_thread_transcript_watch_internal(
         if !agent_thread_transcript_watch_event_matches(&watch_path_for_filter, &event.paths) {
             return;
         }
-        if pending_for_watch
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-        let app_for_emit = app_for_watch.clone();
-        let key_for_emit = key_for_watch.clone();
-        tauri::async_runtime::spawn(async move {
-            sleep(Duration::from_millis(
-                AGENT_THREAD_TRANSCRIPT_WATCH_DEBOUNCE_MS,
-            ))
-            .await;
-            emit_agent_thread_transcript_watch_update(app_for_emit, key_for_emit, "file-change")
-                .await;
-        });
+        agent_thread_transcript_note_watch_event(
+            app_for_watch.clone(),
+            key_for_watch.clone(),
+            debounce_for_watch.clone(),
+        );
     })
     .map_err(|error| format!("Unable to create transcript watcher: {error}"))?;
     let watch_target = agent_thread_transcript_watch_target(&context.agent_id, &watch_path);
@@ -4990,7 +5053,7 @@ fn register_agent_thread_transcript_watch_internal(
         context: Arc::new(StdMutex::new(context)),
         last_signature: initial_signature,
         owners: HashSet::from([owner_key]),
-        pending,
+        debounce,
         touched_ms: current_time_ms(),
         _watcher: watcher,
     };

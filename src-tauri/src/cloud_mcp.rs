@@ -161,14 +161,6 @@ const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_EVENT: &str = "agent_chat_session_sync";
 const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT: &str = "diffforge.agent_chat_sessions.v1";
 const CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_SCHEMA_VERSION: u64 = 1;
 const CLOUD_MCP_TERMINAL_OUTPUT_CONTRACT: &str = "diffforge.termout.v1";
-const CLOUD_MCP_AGENT_TURN_CONTRACT: &str = "diffforge.agentturn.v1";
-// Live-text `md` turn events and their chat live-delta mirrors coalesce per
-// stream key so hook storms emit merged frames instead of one ws frame per
-// token burst. State-transition turn events always flush the pending delta
-// first and are never delayed. Mirrors the PTY output coalescer
-// (TERMINAL_OUTPUT_COALESCE_WINDOW_MS / TERMINAL_OUTPUT_COALESCE_MAX_BYTES).
-const CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_WINDOW_MS: u64 = 50;
-const CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_MAX_BYTES: usize = 4 * 1024;
 // Device live-state snapshots triggered from terminal-state live updates are
 // debounced (trailing, latest-wins) so hook storms publish at most ~6
 // snapshots/sec; the content dedup in
@@ -496,19 +488,6 @@ struct CloudMcpGitRepoIdentityCacheEntry {
     cached_at_ms: u64,
 }
 
-#[derive(Clone)]
-struct CloudMcpAgentLiveTextSnapshot {
-    text: String,
-    turn_id: String,
-    message_id: String,
-    content_kind: String,
-    state: String,
-    turn_status: String,
-    is_final: bool,
-    finish_reason: String,
-    updated_at_ms: u64,
-}
-
 #[derive(Clone, Default)]
 struct CloudMcpTerminalOutputTail {
     total_bytes: u64,
@@ -537,11 +516,6 @@ struct CloudMcpState {
     global_ws_events: tokio::sync::broadcast::Sender<Value>,
     terminal_output_stream_subscriptions: Arc<StdMutex<HashSet<String>>>,
     terminal_output_tail_by_stream: Arc<StdMutex<HashMap<String, CloudMcpTerminalOutputTail>>>,
-    agent_turn_stream_snapshots: Arc<StdMutex<HashMap<String, Value>>>,
-    agent_live_text_by_stream: Arc<StdMutex<HashMap<String, CloudMcpAgentLiveTextSnapshot>>>,
-    agent_turn_delta_pending: Arc<Mutex<HashMap<String, CloudMcpPendingAgentTurnDelta>>>,
-    agent_turn_stream_locks: Arc<Mutex<HashMap<String, Arc<Mutex<()>>>>>,
-    agent_turn_delta_generation: Arc<AtomicU64>,
     device_live_snapshot_debounce: Arc<StdMutex<Option<String>>>,
     remote_command_listener_started: Arc<AtomicBool>,
     remote_command_receipts: Arc<Mutex<HashMap<String, u64>>>,
@@ -663,19 +637,6 @@ struct CloudMcpDirectPromptTodoRefs {
     todo_id: String,
     dispatch_id: String,
     command_id: String,
-}
-
-/// One coalescing window of buffered `md` (message-delta) turn activity for a
-/// stream key: the latest hook payload with the concatenated live-text delta,
-/// plus the latest seq/state so the merged frame reflects the newest state.
-#[derive(Clone)]
-struct CloudMcpPendingAgentTurnDelta {
-    payload: TerminalActivityHookPayload,
-    status_seq: u64,
-    state_value: String,
-    turn_status: String,
-    direct_prompt_refs: Option<CloudMcpDirectPromptTodoRefs>,
-    generation: u64,
 }
 
 #[derive(Clone)]
@@ -818,11 +779,6 @@ impl CloudMcpState {
             global_ws_events,
             terminal_output_stream_subscriptions: Arc::new(StdMutex::new(HashSet::new())),
             terminal_output_tail_by_stream: Arc::new(StdMutex::new(HashMap::new())),
-            agent_turn_stream_snapshots: Arc::new(StdMutex::new(HashMap::new())),
-            agent_live_text_by_stream: Arc::new(StdMutex::new(HashMap::new())),
-            agent_turn_delta_pending: Arc::new(Mutex::new(HashMap::new())),
-            agent_turn_stream_locks: Arc::new(Mutex::new(HashMap::new())),
-            agent_turn_delta_generation: Arc::new(AtomicU64::new(0)),
             device_live_snapshot_debounce: Arc::new(StdMutex::new(None)),
             remote_command_listener_started: Arc::new(AtomicBool::new(false)),
             remote_command_receipts: Arc::new(Mutex::new(HashMap::new())),
@@ -953,12 +909,17 @@ fn cloud_mcp_watch_event_is_relevant(event: &notify::Event) -> bool {
     )
 }
 
+/// Forwarder-side cap on collected event paths; consumers apply their own
+/// tighter caps. Past this the batch is delivered truncated and later events
+/// in the window only extend the debounce.
+const CLOUD_MCP_FS_EVENT_PATH_BATCH_MAX: usize = 1024;
+
 fn cloud_mcp_spawn_fs_event_debounce_forwarder(
     name: &'static str,
     receiver: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
     notify: Arc<tokio::sync::Notify>,
     debounce: Duration,
-    before_notify: Option<fn()>,
+    before_notify: Option<fn(&[PathBuf])>,
 ) {
     thread::spawn(move || loop {
         if app_shutdown_requested() {
@@ -978,6 +939,22 @@ fn cloud_mcp_spawn_fs_event_debounce_forwarder(
             continue;
         }
 
+        let mut changed_paths = Vec::<PathBuf>::new();
+        let mut paths_truncated = false;
+        let collect_paths =
+            |event: &notify::Event, changed: &mut Vec<PathBuf>, truncated: &mut bool| {
+                for path in &event.paths {
+                    if changed.len() >= CLOUD_MCP_FS_EVENT_PATH_BATCH_MAX {
+                        *truncated = true;
+                        return;
+                    }
+                    if !changed.iter().any(|known| known == path) {
+                        changed.push(path.clone());
+                    }
+                }
+            };
+        collect_paths(&first, &mut changed_paths, &mut paths_truncated);
+
         let window_started = Instant::now();
         while window_started.elapsed() < debounce {
             if app_shutdown_requested() {
@@ -988,7 +965,12 @@ fn cloud_mcp_spawn_fs_event_debounce_forwarder(
                 break;
             }
             match receiver.recv_timeout(remaining) {
-                Ok(_) => {}
+                Ok(Ok(event)) => {
+                    if cloud_mcp_watch_event_is_relevant(&event) {
+                        collect_paths(&event, &mut changed_paths, &mut paths_truncated);
+                    }
+                }
+                Ok(Err(_)) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             }
@@ -996,10 +978,18 @@ fn cloud_mcp_spawn_fs_event_debounce_forwarder(
 
         log_terminal_status_event(
             "backend.cloud_mcp.fs_watcher.debounced_wake",
-            json!({ "name": name }),
+            json!({
+                "name": name,
+                "changed_paths": changed_paths.len(),
+                "paths_truncated": paths_truncated,
+            }),
         );
         if let Some(before_notify) = before_notify {
-            before_notify();
+            // A truncated batch cannot describe the full change set; deliver
+            // it as empty so consumers treat the wake as "changes of unknown
+            // scope" and run their full sweep.
+            let delivered: &[PathBuf] = if paths_truncated { &[] } else { &changed_paths };
+            before_notify(delivered);
         }
         notify.notify_one();
     });
@@ -1095,7 +1085,7 @@ fn cloud_mcp_start_tokenomics_source_watcher(notify: Arc<tokio::sync::Notify>) -
         receiver,
         notify,
         Duration::from_millis(CLOUD_MCP_TOKENOMICS_WATCH_DEBOUNCE_MS),
-        Some(tokenomics_periodic_force_source_discovery),
+        Some(tokenomics_periodic_note_changed_paths),
     );
     *guard = Some(watcher);
     log_terminal_status_event(
@@ -13474,11 +13464,9 @@ async fn cloud_mcp_open_global_ws(
         tokio::select! {
             biased;
             _ = cloud_mcp_shutdown_goodbye_notify().notified() => {
-                // Manual quit: flush buffered turn deltas and any pending
-                // debounced snapshot through the still-open socket, then close
-                // deliberately so the cloud broadcasts the offline
-                // account-live snapshot immediately.
-                cloud_mcp_flush_all_pending_agent_turn_deltas(state).await;
+                // Manual quit: flush the pending debounced snapshot through
+                // the still-open socket, then close deliberately so the cloud
+                // broadcasts the offline account-live snapshot immediately.
                 cloud_mcp_flush_pending_device_live_snapshot(state).await;
                 while let Ok(outgoing) = rx.try_recv() {
                     let _ = write.send(Message::Text(outgoing.to_string().into())).await;
@@ -13642,9 +13630,8 @@ async fn cloud_mcp_open_global_ws(
                     .unwrap_or_default()
                     .to_string();
                 if outgoing_kind == "cloud_app_ws_close" {
-                    // Deliberate close: drain buffered turn deltas and the
-                    // pending debounced snapshot before the socket goes away.
-                    cloud_mcp_flush_all_pending_agent_turn_deltas(state).await;
+                    // Deliberate close: drain the pending debounced snapshot
+                    // before the socket goes away.
                     cloud_mcp_flush_pending_device_live_snapshot(state).await;
                     while let Ok(flushed) = rx.try_recv() {
                         let _ = write.send(Message::Text(flushed.to_string().into())).await;
@@ -20499,7 +20486,6 @@ fn cloud_mcp_apply_remote_agent_prompt_lever(
     tauri::async_runtime::spawn(async move {
         match crate::terminal_answer_agent_prompt_remote_command(app, event.clone()).await {
             Ok(details) => {
-                cloud_mcp_publish_prompt_answered_event(&state, &event, &details).await;
                 let _ = cloud_mcp_send_remote_command_status_event(
                     &state,
                     &event,
@@ -20525,177 +20511,6 @@ fn cloud_mcp_apply_remote_agent_prompt_lever(
         }
     });
     true
-}
-
-async fn cloud_mcp_publish_prompt_answered_event(
-    state: &CloudMcpState,
-    event: &Value,
-    details: &Value,
-) {
-    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
-        return;
-    };
-    let Ok(auth) = cloud_mcp_ws_auth_object(state).await else {
-        return;
-    };
-    let device_profile = cloud_mcp_desktop_device_profile();
-    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
-        .unwrap_or_else(|| "desktop-primary".to_string());
-    let workspace_id = cloud_mcp_payload_text(
-        event,
-        &[
-            "workspace_id",
-            "workspaceId",
-            "target_workspace_id",
-            "targetWorkspaceId",
-            "payload",
-            "workspace_id",
-        ],
-    )
-    .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_workspace_id"]))
-    .or_else(|| cloud_mcp_payload_text(event, &["request", "workspace_id"]))
-    .or_else(|| cloud_mcp_payload_text(event, &["request", "target_workspace_id"]))
-    .unwrap_or_default();
-    let pane_id = cloud_mcp_payload_text(details, &["pane_id"])
-        .or_else(|| {
-            cloud_mcp_payload_text(
-                event,
-                &[
-                    "target_terminal_id",
-                    "targetTerminalId",
-                    "terminal_id",
-                    "terminalId",
-                    "pane_id",
-                    "paneId",
-                ],
-            )
-        })
-        .or_else(|| cloud_mcp_payload_text(event, &["payload", "target_terminal_id"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["payload", "terminal_id"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["request", "target_terminal_id"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["request", "terminal_id"]))
-        .unwrap_or_default();
-    if workspace_id.is_empty() || pane_id.is_empty() {
-        return;
-    }
-    let instance_id = details
-        .get("terminal_instance_id")
-        .and_then(Value::as_u64)
-        .or_else(|| {
-            cloud_mcp_payload_i64(event, &["terminal_instance_id"])
-                .and_then(|value| u64::try_from(value).ok())
-        })
-        .or_else(|| {
-            cloud_mcp_payload_i64(event, &["terminalInstanceId"])
-                .and_then(|value| u64::try_from(value).ok())
-        })
-        .or_else(|| {
-            cloud_mcp_payload_i64(event, &["payload", "terminal_instance_id"])
-                .and_then(|value| u64::try_from(value).ok())
-        })
-        .or_else(|| {
-            cloud_mcp_payload_i64(event, &["request", "terminal_instance_id"])
-                .and_then(|value| u64::try_from(value).ok())
-        })
-        .unwrap_or_default();
-    let stream_key =
-        cloud_mcp_terminal_output_stream_key(&device_id, &workspace_id, &pane_id, instance_id);
-    let prompt_id = cloud_mcp_payload_text(details, &["prompt_id"])
-        .or_else(|| cloud_mcp_payload_text(event, &["prompt_id", "promptId"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["payload", "prompt_id"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["request", "prompt_id"]))
-        .unwrap_or_default();
-    let option_id = cloud_mcp_payload_text(details, &["option_id"])
-        .or_else(|| cloud_mcp_payload_text(event, &["option_id", "optionId", "choice"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["payload", "option_id"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["request", "option_id"]))
-        .unwrap_or_default();
-    let status_seq = cloud_mcp_next_terminal_lifecycle_seq(state, Some(cloud_mcp_now_ms()));
-    let turn_id = cloud_mcp_payload_text(details, &["turn_id", "turnId"])
-        .or_else(|| cloud_mcp_payload_text(details, &["provider_turn_id", "providerTurnId"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["turn_id", "turnId"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["payload", "turn_id"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["request", "turn_id"]))
-        .or_else(|| cloud_mcp_payload_text(event, &["provider_turn_id", "providerTurnId"]))
-        .unwrap_or_default();
-    let asp_item_id = [
-        "asp",
-        stream_key.as_str(),
-        turn_id.as_str(),
-        "prompt",
-        prompt_id.as_str(),
-    ]
-    .into_iter()
-    .map(cloud_mcp_agent_turn_asp_safe_id)
-    .filter(|part| !part.is_empty())
-    .collect::<Vec<_>>()
-    .join(":");
-    let envelope = json!({
-        "v": 1,
-        "k": "turn.e",
-        "kind": "turn.e",
-        "contract": CLOUD_MCP_AGENT_TURN_CONTRACT,
-        "auth": auth,
-        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "id": format!("agentturn-prompt-answer-{status_seq}"),
-        "sk": stream_key,
-        "q": status_seq,
-        "u": turn_id,
-        "t": "pa",
-        "st": "running",
-        "ts": "running",
-        "asp": {
-            "event_type": "prompt.answered",
-            "eventType": "prompt.answered",
-            "item_id": asp_item_id.as_str(),
-            "itemId": asp_item_id.as_str(),
-            "item_kind": "prompt",
-            "itemKind": "prompt",
-            "seq": status_seq,
-        },
-        "asp_event_type": "prompt.answered",
-        "aspEventType": "prompt.answered",
-        "item_id": asp_item_id.as_str(),
-        "itemId": asp_item_id.as_str(),
-        "d": device_id,
-        "w": workspace_id,
-        "p": pane_id,
-        "i": instance_id,
-        "x": {
-            "et": "provider-user-prompt-answered",
-            "hn": "RemoteAgentPromptAnswer",
-            "pid": prompt_id.as_str(),
-            "prompt_id": prompt_id.as_str(),
-            "promptId": prompt_id.as_str(),
-            "opt": option_id.as_str(),
-            "option_id": option_id.as_str(),
-            "optionId": option_id.as_str(),
-            "chosen_option_id": option_id.as_str(),
-            "chosenOptionId": option_id.as_str(),
-            "src": "remote",
-            "asp": {
-                "event_type": "prompt.answered",
-                "eventType": "prompt.answered",
-                "item_id": asp_item_id.as_str(),
-                "itemId": asp_item_id.as_str(),
-                "item_kind": "prompt",
-                "itemKind": "prompt",
-                "seq": status_seq,
-            },
-            "asp_event_type": "prompt.answered",
-            "aspEventType": "prompt.answered",
-            "item_id": asp_item_id.as_str(),
-            "itemId": asp_item_id.as_str(),
-        },
-        "at": cloud_mcp_now_ms(),
-    });
-    // Prompt answers are state transitions: drain any buffered live-text
-    // delta for the stream first so the web never sees them reordered.
-    cloud_mcp_flush_pending_agent_turn_delta(state, &stream_key).await;
-    if let Ok(mut snapshots) = state.agent_turn_stream_snapshots.lock() {
-        snapshots.insert(stream_key, envelope.clone());
-    }
-    let _ = tx.send(envelope);
 }
 
 /// Architecture file changes are local drafts. The webview listens to the store
@@ -20843,6 +20658,10 @@ fn cloud_mcp_clear_agent_inventory_command_candidate_cache() {
     }
 }
 
+fn cloud_mcp_agent_inventory_watch_changed(_changed_paths: &[PathBuf]) {
+    cloud_mcp_clear_agent_inventory_command_candidate_cache();
+}
+
 fn cloud_mcp_start_agent_inventory_fs_watcher(notify: Arc<tokio::sync::Notify>) -> bool {
     use notify::Watcher as _;
 
@@ -20899,7 +20718,7 @@ fn cloud_mcp_start_agent_inventory_fs_watcher(notify: Arc<tokio::sync::Notify>) 
         receiver,
         notify,
         Duration::from_millis(CLOUD_MCP_AGENT_INVENTORY_WATCH_DEBOUNCE_MS),
-        Some(cloud_mcp_clear_agent_inventory_command_candidate_cache),
+        Some(cloud_mcp_agent_inventory_watch_changed),
     );
     *guard = Some(watcher);
     log_terminal_status_event(
@@ -27438,153 +27257,6 @@ fn cloud_mcp_handle_terminal_output_subscription(
         }
     };
     let contract = cloud_mcp_payload_text(message, &["contract", "c"]).unwrap_or_default();
-    if contract == CLOUD_MCP_AGENT_TURN_CONTRACT
-        || matches!(
-            kind.as_str(),
-            "turn.sub" | "agent_turn_subscribe" | "turn.unsub" | "agent_turn_unsubscribe"
-        )
-    {
-        let Some(stream_key) = cloud_mcp_terminal_output_message_stream_key(message) else {
-            return true;
-        };
-        let active = !(matches!(kind.as_str(), "turn.unsub" | "agent_turn_unsubscribe")
-            || message.get("active").and_then(Value::as_bool) == Some(false));
-        if active {
-            agent_chat_session_sync_mark_stream_workspace_history_dirty(
-                &stream_key,
-                "agent_turn_subscribe",
-            );
-            let state = state.clone();
-            tauri::async_runtime::spawn(async move {
-                let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
-                    return;
-                };
-                let Ok(auth) = cloud_mcp_ws_auth_object(&state).await else {
-                    return;
-                };
-                let turn_snapshot = state
-                    .agent_turn_stream_snapshots
-                    .lock()
-                    .ok()
-                    .and_then(|snapshots| snapshots.get(&stream_key).cloned());
-                if let Some(mut snapshot) = turn_snapshot {
-                    snapshot["auth"] = auth.clone();
-                    snapshot["id"] = json!(format!("agentturn-replay-{}", cloud_mcp_now_ms()));
-                    snapshot["replay"] = json!(true);
-                    let _ = tx.send(snapshot);
-                }
-                let live_text = state
-                    .agent_live_text_by_stream
-                    .lock()
-                    .ok()
-                    .map(|items| {
-                        let prefix = format!("{stream_key}|");
-                        items
-                            .iter()
-                            .filter(|(key, snapshot)| {
-                                (*key == &stream_key || key.starts_with(&prefix))
-                                    && !snapshot.text.trim().is_empty()
-                            })
-                            .map(|(_, snapshot)| snapshot.clone())
-                            .collect::<Vec<_>>()
-                    })
-                    .unwrap_or_default();
-                for snapshot in live_text {
-                    let parts = stream_key.split(':').collect::<Vec<_>>();
-                    if parts.len() == 4 {
-                        let status_seq =
-                            cloud_mcp_next_terminal_lifecycle_seq(&state, Some(cloud_mcp_now_ms()));
-                        let item_kind = cloud_mcp_agent_turn_asp_item_kind(
-                            "md",
-                            snapshot.content_kind.as_str(),
-                        );
-                        let item_id = [
-                            "asp",
-                            stream_key.as_str(),
-                            snapshot.turn_id.as_str(),
-                            item_kind,
-                            snapshot.content_kind.as_str(),
-                        ]
-                        .into_iter()
-                        .map(cloud_mcp_agent_turn_asp_safe_id)
-                        .filter(|part| !part.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(":");
-                        let live_event_type = if snapshot.is_final {
-                            if item_kind == "reasoning" {
-                                "reasoning.completed"
-                            } else {
-                                "message.completed"
-                            }
-                        } else if item_kind == "reasoning" {
-                            "reasoning.delta"
-                        } else {
-                            "message.delta"
-                        };
-                        let envelope = json!({
-                            "v": 1,
-                            "k": "agent_chat_session_live_delta",
-                            "kind": "agent_chat_session_live_delta",
-                            "event_kind": "agent_chat_session_live_delta",
-                            "contract": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
-                            "c": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
-                            "auth": auth.clone(),
-                            "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-                            "id": format!("agentchat-live-replay-{}", cloud_mcp_now_ms()),
-                            "m": "live_delta",
-                            "mode": "live_delta",
-                            "replay": true,
-                            "sk": stream_key.as_str(),
-                            "q": status_seq,
-                            "seq": status_seq,
-                            "d": parts[0],
-                            "w": parts[1],
-                            "p": parts[2],
-                            "i": parts[3],
-                            "device_id": parts[0],
-                            "workspace_id": parts[1],
-                            "pane_id": parts[2],
-                            "terminal_instance_id": parts[3],
-                            "role": "assistant",
-                            "content_kind": snapshot.content_kind.as_str(),
-                            "contentKind": snapshot.content_kind.as_str(),
-                            "turn_id": snapshot.turn_id.as_str(),
-                            "turnId": snapshot.turn_id.as_str(),
-                            "message_id": snapshot.message_id.as_str(),
-                            "messageId": snapshot.message_id.as_str(),
-                            "item_id": item_id.as_str(),
-                            "itemId": item_id.as_str(),
-                            "snapshot_text": snapshot.text.as_str(),
-                            "snapshotText": snapshot.text.as_str(),
-                            "state": snapshot.state.as_str(),
-                            "status": snapshot.state.as_str(),
-                            "turn_status": snapshot.turn_status.as_str(),
-                            "turnStatus": snapshot.turn_status.as_str(),
-                            "is_final": snapshot.is_final,
-                            "isFinal": snapshot.is_final,
-                            "finish_reason": snapshot.finish_reason.as_str(),
-                            "finishReason": snapshot.finish_reason.as_str(),
-                            "asp": {
-                                "event_type": live_event_type,
-                                "eventType": live_event_type,
-                                "item_id": item_id.as_str(),
-                                "itemId": item_id.as_str(),
-                                "item_kind": item_kind,
-                                "itemKind": item_kind,
-                                "content_kind": snapshot.content_kind.as_str(),
-                                "contentKind": snapshot.content_kind.as_str(),
-                                "seq": status_seq,
-                            },
-                            "observed_at_ms": snapshot.updated_at_ms,
-                            "observedAtMs": snapshot.updated_at_ms,
-                        });
-                        let _ = tx.send(envelope);
-                    }
-                }
-            });
-        }
-        return true;
-    }
     if contract != CLOUD_MCP_TERMINAL_OUTPUT_CONTRACT
         && !matches!(
             kind.as_str(),
@@ -27820,843 +27492,6 @@ pub(crate) fn cloud_mcp_publish_terminal_output_delta(
     });
 }
 
-fn cloud_mcp_agent_turn_event_code(event_type: &str, command_phase: &str) -> &'static str {
-    match event_type {
-        "provider-turn-started" => "ts",
-        "provider-turn-compacting" => "cc",
-        "provider-turn-compacted" => "cd",
-        "provider-turn-completed" => "te",
-        "provider-turn-error" => "er",
-        "provider-turn-interrupted" => "te",
-        "provider-turn-background-active" => "bg",
-        "provider-work-update" => "wu",
-        "provider-tool-started" => "xs",
-        "provider-tool-completed" | "provider-tool-batch-completed" => "xe",
-        "provider-tool-failed" => "xf",
-        "provider-permission-requested" | "provider-user-prompt-started" => "pr",
-        "provider-user-prompt-answered" | "provider-user-prompt-completed" => "pa",
-        "provider-subagent-started" | "provider-task-created" => "ss",
-        "provider-subagent-completed" | "provider-task-completed" => "se",
-        "provider-message-displayed" => "md",
-        _ if matches!(
-            command_phase,
-            "running" | "tool_running" | "subagent_running"
-        ) =>
-        {
-            "ts"
-        }
-        _ if matches!(command_phase, "completed" | "complete" | "done") => "te",
-        _ => "wu",
-    }
-}
-
-fn cloud_mcp_compact_turn_text(value: Option<&String>, max_chars: usize) -> Option<String> {
-    let value = value?.trim();
-    if value.is_empty() {
-        return None;
-    }
-    Some(value.chars().take(max_chars).collect())
-}
-
-fn cloud_mcp_compact_live_turn_text(value: Option<&String>, max_chars: usize) -> Option<String> {
-    let value = value?;
-    if value.is_empty() {
-        return None;
-    }
-    Some(value.chars().take(max_chars).collect())
-}
-
-fn cloud_mcp_compact_tool_value(value: Option<&Value>, max_chars: usize) -> Option<Value> {
-    let value = value?;
-    if value.is_null() {
-        return None;
-    }
-    let text = value
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| serde_json::to_string(value).unwrap_or_default());
-    let text = text.trim();
-    if text.is_empty() {
-        return None;
-    }
-    Some(json!(text.chars().take(max_chars).collect::<String>()))
-}
-
-enum CloudMcpLiveTextMerge {
-    Delta(String),
-    Snapshot(String),
-}
-
-fn cloud_mcp_longest_suffix_prefix_overlap(left: &str, right: &str) -> usize {
-    let left_chars = left.chars().collect::<Vec<_>>();
-    let right_chars = right.chars().collect::<Vec<_>>();
-    let max_overlap = left_chars.len().min(right_chars.len()).min(4096);
-    for overlap in (1..=max_overlap).rev() {
-        if left_chars[left_chars.len() - overlap..] == right_chars[..overlap] {
-            return overlap;
-        }
-    }
-    0
-}
-
-fn cloud_mcp_common_prefix_len(left: &str, right: &str) -> usize {
-    left.chars()
-        .zip(right.chars())
-        .take_while(|(left, right)| left == right)
-        .count()
-}
-
-fn cloud_mcp_merge_live_text_delta(left: &str, right: &str) -> CloudMcpLiveTextMerge {
-    if left.is_empty() {
-        return CloudMcpLiveTextMerge::Delta(right.to_string());
-    }
-    if right.is_empty() {
-        return CloudMcpLiveTextMerge::Delta(left.to_string());
-    }
-    if left == right {
-        return CloudMcpLiveTextMerge::Delta(format!("{left}{right}"));
-    }
-    let left_len = left.chars().count();
-    let right_len = right.chars().count();
-    if right.starts_with(left) {
-        return CloudMcpLiveTextMerge::Delta(right.to_string());
-    }
-
-    let overlap = cloud_mcp_longest_suffix_prefix_overlap(left, right);
-    if overlap > 0 {
-        let suffix = right.chars().skip(overlap).collect::<String>();
-        return CloudMcpLiveTextMerge::Delta(format!("{left}{suffix}"));
-    }
-
-    let common_prefix = cloud_mcp_common_prefix_len(left, right);
-    let shorter_len = left_len.min(right_len);
-    if common_prefix >= 8 || (common_prefix >= 4 && common_prefix * 2 >= shorter_len) {
-        return CloudMcpLiveTextMerge::Snapshot(right.to_string());
-    }
-
-    CloudMcpLiveTextMerge::Delta(format!("{left}{right}"))
-}
-
-fn cloud_mcp_live_text_looks_cumulative_snapshot(cached_text: &str, incoming_text: &str) -> bool {
-    if cached_text.is_empty() || incoming_text.is_empty() {
-        return false;
-    }
-    if incoming_text.starts_with(cached_text) {
-        return true;
-    }
-    let common_prefix = cloud_mcp_common_prefix_len(cached_text, incoming_text);
-    let shorter_len = cached_text
-        .chars()
-        .count()
-        .min(incoming_text.chars().count());
-    common_prefix >= 8 && common_prefix * 2 >= shorter_len
-}
-
-fn cloud_mcp_agent_turn_hook_key(value: &str) -> String {
-    value
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .flat_map(char::to_lowercase)
-        .collect()
-}
-
-fn cloud_mcp_agent_turn_should_include_message(
-    event_code: &str,
-    payload: &TerminalActivityHookPayload,
-) -> bool {
-    if matches!(event_code, "md" | "pr" | "er") {
-        return true;
-    }
-    let hook_key = cloud_mcp_agent_turn_hook_key(payload.hook_event_name.as_str());
-    payload.command_phase == "message_delta"
-        || matches!(
-            payload.completion_evidence.as_str(),
-            "cli_hook_message_display"
-                | "cli_hook_reasoning"
-                | "cli_hook_compacting"
-                | "cli_hook_compacted"
-        )
-        || hook_key.contains("messagedisplay")
-        || hook_key.contains("messagedelta")
-        || hook_key.contains("thinking")
-        || hook_key.contains("reasoning")
-        || hook_key.contains("compact")
-}
-
-fn cloud_mcp_agent_turn_is_prompt_submission(
-    event_code: &str,
-    payload: &TerminalActivityHookPayload,
-    hook_key: &str,
-) -> bool {
-    event_code == "ts"
-        && (matches!(
-            hook_key,
-            "backendpromptsubmit"
-                | "userpromptsubmit"
-                | "userpromptsubmitted"
-                | "promptsubmit"
-                | "promptsubmitted"
-        ) || matches!(
-            payload.completion_evidence.as_str(),
-            "backend_prompt_submit" | "cli_hook_prompt_submit"
-        ))
-}
-
-fn cloud_mcp_agent_turn_prompt_options(payload: &TerminalActivityHookPayload) -> Value {
-    Value::Array(
-        payload
-            .prompt_options
-            .iter()
-            .filter(|option| !option.id.trim().is_empty())
-            .map(|option| {
-                let raw_value = option
-                    .value
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty());
-                let description = option
-                    .description
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty());
-                let mut row = vec![json!(option.id.as_str()), json!(option.label.as_str())];
-                if raw_value.is_some_and(|value| value != option.id) || description.is_some() {
-                    row.push(json!(raw_value.unwrap_or_default()));
-                }
-                if let Some(description) = description {
-                    row.push(json!(description));
-                }
-                Value::Array(row)
-            })
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn cloud_mcp_agent_turn_prompt_option_objects(payload: &TerminalActivityHookPayload) -> Value {
-    Value::Array(
-        payload
-            .prompt_options
-            .iter()
-            .filter(|option| !option.id.trim().is_empty())
-            .map(|option| {
-                let raw_value = option
-                    .value
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .unwrap_or(option.id.as_str());
-                let mut row = json!({
-                    "id": option.id.as_str(),
-                    "label": option.label.as_str(),
-                    "value": raw_value,
-                });
-                if let Some(description) = option
-                    .description
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                {
-                    row["description"] = json!(description);
-                }
-                row
-            })
-            .collect::<Vec<_>>(),
-    )
-}
-
-fn cloud_mcp_agent_turn_prompt_id(payload: &TerminalActivityHookPayload) -> Option<String> {
-    [
-        payload.prompt_id.as_deref(),
-        payload.permission_request_id.as_deref(),
-        payload.permission_prompt_id.as_deref(),
-        payload.approval_id.as_deref(),
-        payload.tool_use_id.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::trim)
-    .find(|value| !value.is_empty())
-    .map(str::to_string)
-}
-
-fn cloud_mcp_agent_turn_prompt_kind(payload: &TerminalActivityHookPayload) -> Option<String> {
-    [
-        payload.prompt_kind.as_deref(),
-        payload.prompting_user_kind.as_deref(),
-        payload.permission_mode.as_deref(),
-    ]
-    .into_iter()
-    .flatten()
-    .map(str::trim)
-    .find(|value| !value.is_empty())
-    .map(str::to_string)
-}
-
-fn cloud_mcp_agent_turn_asp_safe_id(value: &str) -> String {
-    value
-        .trim()
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .split('_')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("_")
-}
-
-fn cloud_mcp_agent_turn_asp_event_type(
-    event_code: &str,
-    payload: &TerminalActivityHookPayload,
-    state_value: &str,
-    turn_status: &str,
-) -> &'static str {
-    match event_code {
-        "ts" => "turn.started",
-        "md" => {
-            let kind = payload
-                .live_text_kind
-                .as_deref()
-                .unwrap_or_default()
-                .to_ascii_lowercase();
-            if kind.contains("reason") || kind.contains("thinking") {
-                "reasoning.delta"
-            } else {
-                "message.delta"
-            }
-        }
-        "xs" | "ss" => "tool.started",
-        "xe" | "se" => "tool.completed",
-        "xf" => "tool.failed",
-        "pr" => "prompt.opened",
-        "pa" => "prompt.answered",
-        "cc" => "context.compacting",
-        "cd" => "context.compacted",
-        "er" => "turn.error",
-        "te" if matches!(turn_status, "interrupted") || matches!(state_value, "interrupted") => {
-            "session.interrupted"
-        }
-        "te" => "turn.completed",
-        _ => "state.changed",
-    }
-}
-
-fn cloud_mcp_agent_turn_asp_item_kind(event_code: &str, content_kind: &str) -> &'static str {
-    let content_kind = content_kind.to_ascii_lowercase();
-    match event_code {
-        "md" if content_kind.contains("reason") || content_kind.contains("thinking") => "reasoning",
-        "md" => "message",
-        "xs" | "xe" | "xf" | "ss" | "se" => "tool",
-        "pr" | "pa" => "prompt",
-        "cc" | "cd" => "context",
-        _ => "turn",
-    }
-}
-
-fn cloud_mcp_agent_turn_asp_item_id(
-    stream_key: &str,
-    turn_id: &str,
-    event_code: &str,
-    payload: &TerminalActivityHookPayload,
-    content_kind: &str,
-) -> String {
-    let item_kind = cloud_mcp_agent_turn_asp_item_kind(event_code, content_kind);
-    let item_source = match item_kind {
-        "tool" => payload
-            .tool_use_id
-            .as_deref()
-            .or(payload.tool_name.as_deref())
-            .unwrap_or(item_kind),
-        "prompt" => payload
-            .prompt_id
-            .as_deref()
-            .or(payload.permission_request_id.as_deref())
-            .or(payload.permission_prompt_id.as_deref())
-            .or(payload.approval_id.as_deref())
-            .unwrap_or(item_kind),
-        "reasoning" | "message" => content_kind,
-        _ => item_kind,
-    };
-    ["asp", stream_key, turn_id, item_kind, item_source]
-        .into_iter()
-        .map(cloud_mcp_agent_turn_asp_safe_id)
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join(":")
-}
-
-async fn cloud_mcp_publish_agent_chat_live_delta(
-    state: &CloudMcpState,
-    payload: &TerminalActivityHookPayload,
-    status_seq: u64,
-    stream_key: &str,
-    device_id: &str,
-    state_value: &str,
-    turn_status: &str,
-) {
-    let mut raw_delta_text = payload
-        .live_text_delta
-        .as_ref()
-        .filter(|value| !value.is_empty())
-        .cloned();
-    let mut raw_snapshot_text = payload
-        .live_text_snapshot
-        .as_ref()
-        .filter(|value| !value.is_empty())
-        .cloned();
-    let is_final = matches!(turn_status, "completed" | "interrupted" | "failed")
-        || matches!(state_value, "idle" | "error" | "interrupted");
-    let provider_session_id = payload
-        .provider_session_id
-        .as_deref()
-        .or(payload.native_session_id.as_deref())
-        .unwrap_or("");
-    let turn_id = payload
-        .turn_id
-        .as_deref()
-        .or(payload.provider_turn_id.as_deref())
-        .unwrap_or(provider_session_id);
-    let message_id = format!(
-        "live:{}:{}:{}",
-        payload.workspace_id, payload.pane_id, turn_id
-    );
-    let content_kind = payload
-        .live_text_kind
-        .as_deref()
-        .unwrap_or("assistant")
-        .to_string();
-    if raw_snapshot_text.is_none() {
-        if let Some(delta) = raw_delta_text.clone() {
-            let cache_key = format!("{stream_key}|{content_kind}");
-            let cached_text = state
-                .agent_live_text_by_stream
-                .lock()
-                .ok()
-                .and_then(|live_text| live_text.get(&cache_key).map(|entry| entry.text.clone()))
-                .unwrap_or_default();
-            if !cached_text.is_empty() && delta.starts_with(cached_text.as_str()) {
-                let suffix = delta[cached_text.len()..].to_string();
-                raw_delta_text = (!suffix.is_empty()).then_some(suffix);
-                if cloud_mcp_agent_stream_debug_enabled() {
-                    log_terminal_status_event(
-                        "backend.cloud_mcp.agent_stream.cumulative_delta",
-                        json!({
-                            "cached": cloud_mcp_agent_stream_text_summary(Some(cached_text.as_str())),
-                            "incoming": cloud_mcp_agent_stream_text_summary(Some(delta.as_str())),
-                            "pane_id": payload.pane_id.as_str(),
-                            "provider": payload.provider.as_str(),
-                            "stream_key": stream_key,
-                            "suffix": cloud_mcp_agent_stream_text_summary(raw_delta_text.as_deref()),
-                        }),
-                    );
-                }
-            } else if cloud_mcp_live_text_looks_cumulative_snapshot(
-                cached_text.as_str(),
-                delta.as_str(),
-            ) {
-                raw_snapshot_text = Some(delta.clone());
-                raw_delta_text = None;
-                if cloud_mcp_agent_stream_debug_enabled() {
-                    log_terminal_status_event(
-                        "backend.cloud_mcp.agent_stream.cumulative_snapshot",
-                        json!({
-                            "cached": cloud_mcp_agent_stream_text_summary(Some(cached_text.as_str())),
-                            "incoming": cloud_mcp_agent_stream_text_summary(Some(delta.as_str())),
-                            "pane_id": payload.pane_id.as_str(),
-                            "provider": payload.provider.as_str(),
-                            "stream_key": stream_key,
-                        }),
-                    );
-                }
-            }
-        }
-    }
-    let delta_text = cloud_mcp_compact_live_turn_text(raw_delta_text.as_ref(), 8_192);
-    let snapshot_text = cloud_mcp_compact_live_turn_text(raw_snapshot_text.as_ref(), 32_768);
-    if delta_text.is_none() && snapshot_text.is_none() && !is_final {
-        return;
-    };
-    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
-        return;
-    };
-    let Ok(auth) = cloud_mcp_ws_auth_object(state).await else {
-        return;
-    };
-    let content_kind_token = content_kind.to_ascii_lowercase();
-    let live_event_type = if is_final {
-        if content_kind_token.contains("reason") || content_kind_token.contains("thinking") {
-            "reasoning.completed"
-        } else {
-            "message.completed"
-        }
-    } else if content_kind_token.contains("reason") || content_kind_token.contains("thinking") {
-        "reasoning.delta"
-    } else {
-        "message.delta"
-    };
-    let item_id =
-        cloud_mcp_agent_turn_asp_item_id(stream_key, turn_id, "md", payload, content_kind.as_str());
-    let mut envelope = json!({
-        "v": 1,
-        "k": "agent_chat_session_live_delta",
-        "kind": "agent_chat_session_live_delta",
-        "event_kind": "agent_chat_session_live_delta",
-        "contract": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
-        "c": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
-        "auth": auth,
-        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "id": format!("agentchat-live-{status_seq}"),
-        "m": "live_delta",
-        "mode": "live_delta",
-        "sk": stream_key,
-        "q": status_seq,
-        "seq": status_seq,
-        "device_id": device_id,
-        "deviceId": device_id,
-        "workspace_id": payload.workspace_id.as_str(),
-        "workspaceId": payload.workspace_id.as_str(),
-        "workspace_name": payload.workspace_name.as_str(),
-        "workspaceName": payload.workspace_name.as_str(),
-        "pane_id": payload.pane_id.as_str(),
-        "paneId": payload.pane_id.as_str(),
-        "terminal_id": payload.pane_id.as_str(),
-        "terminalId": payload.pane_id.as_str(),
-        "terminal_instance_id": payload.instance_id,
-        "terminalInstanceId": payload.instance_id,
-        "provider": payload.provider.as_str(),
-        "provider_session_id": provider_session_id,
-        "providerSessionId": provider_session_id,
-        "session_id": provider_session_id,
-        "sessionId": provider_session_id,
-        "turn_id": turn_id,
-        "turnId": turn_id,
-        "message_id": message_id.as_str(),
-        "messageId": message_id.as_str(),
-        "item_id": item_id.as_str(),
-        "itemId": item_id.as_str(),
-        "role": "assistant",
-        "content_kind": content_kind.as_str(),
-        "contentKind": content_kind.as_str(),
-        "state": state_value,
-        "status": state_value,
-        "turn_status": turn_status,
-        "turnStatus": turn_status,
-        "is_final": is_final,
-        "isFinal": is_final,
-        "finish_reason": if is_final { turn_status } else { "" },
-        "finishReason": if is_final { turn_status } else { "" },
-        "asp": {
-            "event_type": live_event_type,
-            "eventType": live_event_type,
-            "item_id": item_id.as_str(),
-            "itemId": item_id.as_str(),
-            "item_kind": if content_kind_token.contains("reason") || content_kind_token.contains("thinking") { "reasoning" } else { "message" },
-            "itemKind": if content_kind_token.contains("reason") || content_kind_token.contains("thinking") { "reasoning" } else { "message" },
-            "content_kind": content_kind.as_str(),
-            "contentKind": content_kind.as_str(),
-            "seq": status_seq,
-        },
-        "observed_at_ms": payload.observed_at_ms,
-        "observedAtMs": payload.observed_at_ms,
-    });
-    if let Some(delta_text) = delta_text.as_deref() {
-        envelope["delta_text"] = json!(delta_text);
-        envelope["deltaText"] = json!(delta_text);
-    }
-    if let Some(snapshot_text) = snapshot_text.as_deref() {
-        envelope["snapshot_text"] = json!(snapshot_text);
-        envelope["snapshotText"] = json!(snapshot_text);
-    }
-    let mut cached_text_summary = json!({ "present": false });
-    if let Ok(mut live_text) = state.agent_live_text_by_stream.lock() {
-        let cache_key = format!("{stream_key}|{content_kind}");
-        let finish_reason = if is_final {
-            turn_status.to_string()
-        } else {
-            String::new()
-        };
-        {
-            let entry =
-                live_text
-                    .entry(cache_key)
-                    .or_insert_with(|| CloudMcpAgentLiveTextSnapshot {
-                        text: String::new(),
-                        turn_id: turn_id.to_string(),
-                        message_id: message_id.clone(),
-                        content_kind: content_kind.clone(),
-                        state: state_value.to_string(),
-                        turn_status: turn_status.to_string(),
-                        is_final,
-                        finish_reason: finish_reason.clone(),
-                        updated_at_ms: payload.observed_at_ms,
-                    });
-            if !turn_id.is_empty() && !entry.turn_id.is_empty() && entry.turn_id != turn_id {
-                entry.text.clear();
-            }
-            entry.turn_id = turn_id.to_string();
-            entry.message_id = message_id.clone();
-            entry.content_kind = content_kind.clone();
-            entry.state = state_value.to_string();
-            entry.turn_status = turn_status.to_string();
-            entry.is_final = is_final;
-            entry.finish_reason = finish_reason;
-            entry.updated_at_ms = payload.observed_at_ms;
-            if let Some(snapshot_text) = raw_snapshot_text.as_deref() {
-                entry.text = snapshot_text.to_string();
-            } else if let Some(delta_text) = raw_delta_text.as_deref() {
-                entry.text.push_str(delta_text);
-            }
-            if entry.text.len() > 160_000 {
-                entry.text = entry
-                    .text
-                    .chars()
-                    .rev()
-                    .take(160_000)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect();
-            }
-            if is_final {
-                entry.updated_at_ms = payload.observed_at_ms;
-            }
-            cached_text_summary = cloud_mcp_agent_stream_text_summary(Some(entry.text.as_str()));
-        }
-        if live_text.len() > 512 {
-            let stale_keys = live_text
-                .keys()
-                .take(live_text.len().saturating_sub(512))
-                .cloned()
-                .collect::<Vec<_>>();
-            for key in stale_keys {
-                live_text.remove(&key);
-            }
-        }
-    }
-    if cloud_mcp_agent_stream_debug_enabled() {
-        log_terminal_status_event(
-            "backend.cloud_mcp.agent_stream.publish",
-            json!({
-                "content_kind": content_kind.as_str(),
-                "delta": cloud_mcp_agent_stream_text_summary(delta_text.as_deref()),
-                "is_final": is_final,
-                "pane_id": payload.pane_id.as_str(),
-                "provider": payload.provider.as_str(),
-                "session_id_present": !provider_session_id.is_empty(),
-                "snapshot": cloud_mcp_agent_stream_text_summary(snapshot_text.as_deref()),
-                "stream_key": stream_key,
-                "turn_id_present": !turn_id.is_empty(),
-                "cached_text": cached_text_summary,
-            }),
-        );
-    }
-    if tx.send(envelope).is_err() {
-        cloud_mcp_mark_global_ws_disconnected(
-            state,
-            "Cloud MCP app websocket live transcript sender is closed.",
-        )
-        .await;
-    }
-}
-
-async fn cloud_mcp_publish_agent_chat_live_tool_delta(
-    state: &CloudMcpState,
-    payload: &TerminalActivityHookPayload,
-    status_seq: u64,
-    stream_key: &str,
-    device_id: &str,
-    event_code: &str,
-    state_value: &str,
-    turn_status: &str,
-) {
-    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
-        return;
-    };
-    let Ok(auth) = cloud_mcp_ws_auth_object(state).await else {
-        return;
-    };
-    let provider_session_id = payload
-        .provider_session_id
-        .as_deref()
-        .or(payload.native_session_id.as_deref())
-        .unwrap_or("");
-    let turn_id = payload
-        .turn_id
-        .as_deref()
-        .or(payload.provider_turn_id.as_deref())
-        .unwrap_or(provider_session_id);
-    let tool_name =
-        cloud_mcp_compact_turn_text(payload.tool_name.as_ref(), 96).unwrap_or_else(|| {
-            if matches!(event_code, "ss" | "se") {
-                "Subtask"
-            } else {
-                "Tool"
-            }
-            .to_string()
-        });
-    let call_id =
-        cloud_mcp_compact_turn_text(payload.tool_use_id.as_ref(), 160).unwrap_or_default();
-    let asp_event_type =
-        cloud_mcp_agent_turn_asp_event_type(event_code, payload, state_value, turn_status);
-    let item_id =
-        cloud_mcp_agent_turn_asp_item_id(stream_key, turn_id, event_code, payload, "tool");
-    let status = match event_code {
-        "xf" => "failed",
-        "xe" | "se" => "completed",
-        _ => "started",
-    };
-    let mut envelope = json!({
-        "v": 1,
-        "k": "agent_chat_session_live_delta",
-        "kind": "agent_chat_session_live_delta",
-        "event_kind": "agent_chat_session_live_delta",
-        "contract": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
-        "c": CLOUD_MCP_AGENT_CHAT_SESSION_SYNC_CONTRACT,
-        "auth": auth,
-        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "id": format!("agentchat-live-tool-{status_seq}"),
-        "m": "live_delta",
-        "mode": "live_delta",
-        "sk": stream_key,
-        "q": status_seq,
-        "seq": status_seq,
-        "device_id": device_id,
-        "deviceId": device_id,
-        "workspace_id": payload.workspace_id.as_str(),
-        "workspaceId": payload.workspace_id.as_str(),
-        "workspace_name": payload.workspace_name.as_str(),
-        "workspaceName": payload.workspace_name.as_str(),
-        "pane_id": payload.pane_id.as_str(),
-        "paneId": payload.pane_id.as_str(),
-        "terminal_id": payload.pane_id.as_str(),
-        "terminalId": payload.pane_id.as_str(),
-        "terminal_instance_id": payload.instance_id,
-        "terminalInstanceId": payload.instance_id,
-        "provider": payload.provider.as_str(),
-        "provider_session_id": provider_session_id,
-        "providerSessionId": provider_session_id,
-        "session_id": provider_session_id,
-        "sessionId": provider_session_id,
-        "turn_id": turn_id,
-        "turnId": turn_id,
-        "message_id": format!("live-tool:{}:{}:{}", payload.workspace_id, payload.pane_id, if call_id.is_empty() { item_id.as_str() } else { call_id.as_str() }),
-        "messageId": format!("live-tool:{}:{}:{}", payload.workspace_id, payload.pane_id, if call_id.is_empty() { item_id.as_str() } else { call_id.as_str() }),
-        "item_id": item_id.as_str(),
-        "itemId": item_id.as_str(),
-        "call_id": call_id.as_str(),
-        "callId": call_id.as_str(),
-        "role": "assistant",
-        "content_kind": "tool",
-        "contentKind": "tool",
-        "state": state_value,
-        "status": status,
-        "turn_status": turn_status,
-        "turnStatus": turn_status,
-        "is_final": false,
-        "isFinal": false,
-        "tool_name": tool_name.as_str(),
-        "toolName": tool_name.as_str(),
-        "tool": tool_name.as_str(),
-        "asp": {
-            "event_type": asp_event_type,
-            "eventType": asp_event_type,
-            "item_id": item_id.as_str(),
-            "itemId": item_id.as_str(),
-            "item_kind": "tool",
-            "itemKind": "tool",
-            "content_kind": "tool",
-            "contentKind": "tool",
-            "seq": status_seq,
-        },
-        "observed_at_ms": payload.observed_at_ms,
-        "observedAtMs": payload.observed_at_ms,
-    });
-    if let Some(tool_input) = cloud_mcp_compact_tool_value(payload.tool_input.as_ref(), 4096) {
-        envelope["tool_input"] = tool_input.clone();
-        envelope["toolInput"] = tool_input;
-    }
-    if let Some(tool_output) = cloud_mcp_compact_tool_value(payload.tool_output.as_ref(), 4096) {
-        envelope["tool_output"] = tool_output.clone();
-        envelope["toolOutput"] = tool_output;
-    }
-    if let Some(tool_error) = cloud_mcp_compact_tool_value(payload.tool_error.as_ref(), 4096) {
-        envelope["tool_error"] = tool_error.clone();
-        envelope["toolError"] = tool_error;
-    }
-    if tx.send(envelope).is_err() {
-        cloud_mcp_mark_global_ws_disconnected(
-            state,
-            "Cloud MCP app websocket live tool sender is closed.",
-        )
-        .await;
-    }
-}
-
-async fn cloud_mcp_agent_turn_stream_lock(
-    state: &CloudMcpState,
-    stream_key: &str,
-) -> Arc<Mutex<()>> {
-    let mut locks = state.agent_turn_stream_locks.lock().await;
-    locks
-        .entry(stream_key.to_string())
-        .or_insert_with(|| Arc::new(Mutex::new(())))
-        .clone()
-}
-
-async fn cloud_mcp_flush_pending_agent_turn_delta_unlocked(
-    state: &CloudMcpState,
-    stream_key: &str,
-) {
-    let pending = {
-        let mut pending_map = state.agent_turn_delta_pending.lock().await;
-        pending_map.remove(stream_key)
-    };
-    if let Some(pending) = pending {
-        cloud_mcp_publish_agent_turn_event_now(
-            state,
-            &pending.payload,
-            pending.status_seq,
-            &pending.state_value,
-            &pending.turn_status,
-            pending.direct_prompt_refs.as_ref(),
-        )
-        .await;
-    }
-}
-
-/// Flushes and publishes any buffered message-delta frame for the stream key.
-/// Awaited before every non-delta turn event and before remote prompt-answer
-/// events so buffered live text is always sent ahead of state transitions.
-async fn cloud_mcp_flush_pending_agent_turn_delta(state: &CloudMcpState, stream_key: &str) {
-    let stream_lock = cloud_mcp_agent_turn_stream_lock(state, stream_key).await;
-    let _stream_guard = stream_lock.lock().await;
-    cloud_mcp_flush_pending_agent_turn_delta_unlocked(state, stream_key).await;
-}
-
-/// Drains every buffered coalesced turn delta and publishes it immediately.
-/// Called on deliberate websocket teardown so live text buffered inside the
-/// coalescing window is not lost with the connection.
-async fn cloud_mcp_flush_all_pending_agent_turn_deltas(state: &CloudMcpState) {
-    loop {
-        let Some(stream_key) = ({
-            let pending_map = state.agent_turn_delta_pending.lock().await;
-            pending_map.keys().next().cloned()
-        }) else {
-            break;
-        };
-        cloud_mcp_flush_pending_agent_turn_delta(state, &stream_key).await;
-    }
-}
-
-/// Publishes any pending debounced device live-state snapshot immediately.
-/// Called on deliberate websocket teardown so the final projected terminal
-/// state (idle/closed) is not lost inside the debounce window; taking the
-/// pending reason also makes the scheduled timer flush a no-op.
 async fn cloud_mcp_flush_pending_device_live_snapshot(state: &CloudMcpState) {
     let reason = state
         .device_live_snapshot_debounce
@@ -28665,530 +27500,6 @@ async fn cloud_mcp_flush_pending_device_live_snapshot(state: &CloudMcpState) {
         .and_then(|mut pending| pending.take());
     if let Some(reason) = reason {
         cloud_mcp_publish_device_live_state_snapshot(state, &reason).await;
-    }
-}
-
-/// One timer per coalescing window: fires CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_WINDOW_MS
-/// after the first buffered delta and publishes whatever merged frame is still
-/// pending for that generation. A state-transition flush that already drained
-/// the entry (or a newer window) makes this a no-op via the generation check.
-fn cloud_mcp_schedule_agent_turn_delta_flush(
-    state: &CloudMcpState,
-    stream_key: &str,
-    generation: u64,
-) {
-    let state = state.clone();
-    let stream_key = stream_key.to_string();
-    tauri::async_runtime::spawn(async move {
-        sleep(Duration::from_millis(
-            CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_WINDOW_MS,
-        ))
-        .await;
-        let stream_lock = cloud_mcp_agent_turn_stream_lock(&state, &stream_key).await;
-        let _stream_guard = stream_lock.lock().await;
-        let pending = {
-            let mut pending_map = state.agent_turn_delta_pending.lock().await;
-            if pending_map
-                .get(&stream_key)
-                .is_some_and(|entry| entry.generation == generation)
-            {
-                pending_map.remove(&stream_key)
-            } else {
-                None
-            }
-        };
-        if let Some(pending) = pending {
-            cloud_mcp_publish_agent_turn_event_now(
-                &state,
-                &pending.payload,
-                pending.status_seq,
-                &pending.state_value,
-                &pending.turn_status,
-                pending.direct_prompt_refs.as_ref(),
-            )
-            .await;
-        }
-    });
-}
-
-/// Coalescing front for agent turn events, modeled on the PTY output
-/// coalescer: `md` live-text deltas merge per stream key inside
-/// ~CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_WINDOW_MS windows (concatenated delta
-/// text, latest seq/state), while every other event code — turn/tool/prompt/
-/// compaction/subagent state transitions included — first flushes the pending
-/// delta for its stream and then publishes immediately, so transitions stay
-/// instant and buffered text is never reordered behind them.
-async fn cloud_mcp_publish_agent_turn_event(
-    state: &CloudMcpState,
-    payload: &TerminalActivityHookPayload,
-    status_seq: u64,
-    state_value: &str,
-    turn_status: &str,
-    direct_prompt_refs: Option<&CloudMcpDirectPromptTodoRefs>,
-) {
-    let device_profile = cloud_mcp_desktop_device_profile();
-    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
-        .unwrap_or_else(|| "desktop-primary".to_string());
-    let stream_key = cloud_mcp_terminal_output_stream_key(
-        &device_id,
-        &payload.workspace_id,
-        &payload.pane_id,
-        payload.instance_id,
-    );
-    let event_code = cloud_mcp_agent_turn_event_code(
-        payload.event_type.as_str(),
-        payload.command_phase.as_str(),
-    );
-    let stream_lock = cloud_mcp_agent_turn_stream_lock(state, &stream_key).await;
-    let _stream_guard = stream_lock.lock().await;
-    // Only pure message deltas coalesce; snapshot-carrying frames publish
-    // immediately, and repaint-shaped merges can promote the pending frame to
-    // a snapshot inside the coalescing window.
-    let coalescible = event_code == "md"
-        && payload.live_text_snapshot.is_none()
-        && payload
-            .live_text_delta
-            .as_deref()
-            .is_some_and(|delta| !delta.is_empty());
-    if !coalescible {
-        cloud_mcp_flush_pending_agent_turn_delta_unlocked(state, &stream_key).await;
-        cloud_mcp_publish_agent_turn_event_now(
-            state,
-            payload,
-            status_seq,
-            state_value,
-            turn_status,
-            direct_prompt_refs,
-        )
-        .await;
-        return;
-    }
-    // Publish-before-insert: a displaced (unmergeable) pending window must be
-    // fully sent before the new window is created, so a flush of the new
-    // window can never overtake the older buffered text for this stream.
-    loop {
-        let displaced = {
-            let mut pending_map = state.agent_turn_delta_pending.lock().await;
-            match pending_map.get_mut(&stream_key) {
-                Some(pending)
-                    if pending.payload.live_text_kind == payload.live_text_kind
-                        && pending.payload.turn_id == payload.turn_id
-                        && pending.payload.live_text_snapshot.is_none()
-                        && pending.payload.live_text_delta.is_some()
-                        && pending
-                            .payload
-                            .live_text_delta
-                            .as_deref()
-                            .unwrap_or_default()
-                            .len()
-                            + payload.live_text_delta.as_deref().unwrap_or_default().len()
-                            <= CLOUD_MCP_AGENT_TURN_DELTA_COALESCE_MAX_BYTES =>
-                {
-                    let merged_delta = pending.payload.live_text_delta.take().unwrap_or_default();
-                    let incoming_delta = payload.live_text_delta.as_deref().unwrap_or_default();
-                    let generation = pending.generation;
-                    let mut merged_payload = payload.clone();
-                    let merge_result =
-                        cloud_mcp_merge_live_text_delta(&merged_delta, incoming_delta);
-                    if cloud_mcp_agent_stream_debug_enabled() {
-                        let (merge_kind, result_summary) = match &merge_result {
-                            CloudMcpLiveTextMerge::Delta(delta) => (
-                                "delta",
-                                cloud_mcp_agent_stream_text_summary(Some(delta.as_str())),
-                            ),
-                            CloudMcpLiveTextMerge::Snapshot(snapshot) => (
-                                "snapshot",
-                                cloud_mcp_agent_stream_text_summary(Some(snapshot.as_str())),
-                            ),
-                        };
-                        log_terminal_status_event(
-                            "backend.cloud_mcp.agent_stream.merge",
-                            json!({
-                                "incoming": cloud_mcp_agent_stream_text_summary(Some(incoming_delta)),
-                                "merge_kind": merge_kind,
-                                "pending": cloud_mcp_agent_stream_text_summary(Some(merged_delta.as_str())),
-                                "result": result_summary,
-                                "stream_key": stream_key.as_str(),
-                                "turn_id_present": payload.turn_id.is_some() || payload.provider_turn_id.is_some(),
-                            }),
-                        );
-                    }
-                    match merge_result {
-                        CloudMcpLiveTextMerge::Delta(delta) => {
-                            merged_payload.live_text_delta = Some(delta);
-                            merged_payload.live_text_snapshot = None;
-                        }
-                        CloudMcpLiveTextMerge::Snapshot(snapshot) => {
-                            merged_payload.live_text_delta = None;
-                            merged_payload.live_text_snapshot = Some(snapshot);
-                        }
-                    }
-                    *pending = CloudMcpPendingAgentTurnDelta {
-                        payload: merged_payload,
-                        status_seq,
-                        state_value: state_value.to_string(),
-                        turn_status: turn_status.to_string(),
-                        direct_prompt_refs: direct_prompt_refs.cloned(),
-                        generation,
-                    };
-                    return;
-                }
-                // Kind/turn changed or the merged frame would exceed the byte
-                // cap: take the old window out and publish it below before a
-                // new window may exist.
-                Some(_) => pending_map.remove(&stream_key),
-                None => {
-                    let generation = state
-                        .agent_turn_delta_generation
-                        .fetch_add(1, Ordering::SeqCst)
-                        .wrapping_add(1);
-                    pending_map.insert(
-                        stream_key.clone(),
-                        CloudMcpPendingAgentTurnDelta {
-                            payload: payload.clone(),
-                            status_seq,
-                            state_value: state_value.to_string(),
-                            turn_status: turn_status.to_string(),
-                            direct_prompt_refs: direct_prompt_refs.cloned(),
-                            generation,
-                        },
-                    );
-                    cloud_mcp_schedule_agent_turn_delta_flush(state, &stream_key, generation);
-                    return;
-                }
-            }
-        };
-        if let Some(displaced) = displaced {
-            cloud_mcp_publish_agent_turn_event_now(
-                state,
-                &displaced.payload,
-                displaced.status_seq,
-                &displaced.state_value,
-                &displaced.turn_status,
-                displaced.direct_prompt_refs.as_ref(),
-            )
-            .await;
-        }
-    }
-}
-
-async fn cloud_mcp_publish_agent_turn_event_now(
-    state: &CloudMcpState,
-    payload: &TerminalActivityHookPayload,
-    status_seq: u64,
-    state_value: &str,
-    turn_status: &str,
-    direct_prompt_refs: Option<&CloudMcpDirectPromptTodoRefs>,
-) {
-    let device_profile = cloud_mcp_desktop_device_profile();
-    let device_id = cloud_mcp_payload_text(&device_profile, &["device_id", "deviceId"])
-        .unwrap_or_else(|| "desktop-primary".to_string());
-    let stream_key = cloud_mcp_terminal_output_stream_key(
-        &device_id,
-        &payload.workspace_id,
-        &payload.pane_id,
-        payload.instance_id,
-    );
-    let Ok(auth) = cloud_mcp_ws_auth_object(state).await else {
-        return;
-    };
-    let Some(tx) = state.global_ws_tx.lock().await.as_ref().cloned() else {
-        return;
-    };
-    let event_code = cloud_mcp_agent_turn_event_code(
-        payload.event_type.as_str(),
-        payload.command_phase.as_str(),
-    );
-    let hook_key = cloud_mcp_agent_turn_hook_key(payload.hook_event_name.as_str());
-    let prompt_submission =
-        cloud_mcp_agent_turn_is_prompt_submission(event_code, payload, hook_key.as_str());
-    if prompt_submission {
-        if let Ok(mut live_text) = state.agent_live_text_by_stream.lock() {
-            live_text.remove(&stream_key);
-            let prefix = format!("{stream_key}|");
-            let stale_keys = live_text
-                .keys()
-                .filter(|key| key.starts_with(&prefix))
-                .cloned()
-                .collect::<Vec<_>>();
-            for key in stale_keys {
-                live_text.remove(&key);
-            }
-        }
-    }
-    let turn_id = payload
-        .turn_id
-        .as_deref()
-        .or(payload.provider_turn_id.as_deref())
-        .or_else(|| direct_prompt_refs.map(|refs| refs.command_id.as_str()))
-        .unwrap_or("");
-    let content_kind = payload.live_text_kind.as_deref().unwrap_or_default();
-    let asp_event_type =
-        cloud_mcp_agent_turn_asp_event_type(event_code, payload, state_value, turn_status);
-    let asp_item_kind = cloud_mcp_agent_turn_asp_item_kind(event_code, content_kind);
-    let asp_item_id =
-        cloud_mcp_agent_turn_asp_item_id(&stream_key, turn_id, event_code, payload, content_kind);
-    let mut data = json!({
-        "et": payload.event_type.as_str(),
-        "hn": payload.hook_event_name.as_str(),
-        "ir": payload.input_ready,
-        "asp": {
-            "event_type": asp_event_type,
-            "eventType": asp_event_type,
-            "item_id": asp_item_id.as_str(),
-            "itemId": asp_item_id.as_str(),
-            "item_kind": asp_item_kind,
-            "itemKind": asp_item_kind,
-            "seq": status_seq,
-        },
-    });
-    if let Some(tool_name) = cloud_mcp_compact_turn_text(payload.tool_name.as_ref(), 96) {
-        data["tool"] = json!(tool_name.as_str());
-        data["toolName"] = json!(tool_name.as_str());
-        data["tool_name"] = json!(tool_name.as_str());
-    }
-    if let Some(tool_use_id) = cloud_mcp_compact_turn_text(payload.tool_use_id.as_ref(), 96) {
-        data["tool_id"] = json!(tool_use_id.as_str());
-        data["toolUseId"] = json!(tool_use_id.as_str());
-        data["tool_use_id"] = json!(tool_use_id.as_str());
-    }
-    if let Some(tool_server) = cloud_mcp_compact_turn_text(payload.tool_server.as_ref(), 96) {
-        data["toolServer"] = json!(tool_server.as_str());
-        data["tool_server"] = json!(tool_server.as_str());
-    }
-    if let Some(command) = cloud_mcp_compact_turn_text(payload.command.as_ref(), 4096) {
-        data["command"] = json!(command.as_str());
-    }
-    if let Some(file_path) = cloud_mcp_compact_turn_text(payload.file_path.as_ref(), 4096) {
-        data["filePath"] = json!(file_path.as_str());
-        data["file_path"] = json!(file_path.as_str());
-    }
-    if let Some(duration_ms) = payload.duration_ms {
-        data["durationMs"] = json!(duration_ms);
-        data["duration_ms"] = json!(duration_ms);
-    }
-    if let Some(exit_code) = payload.exit_code {
-        data["exitCode"] = json!(exit_code);
-        data["exit_code"] = json!(exit_code);
-    }
-    if let Some(tool_input) = payload.tool_input.as_ref().filter(|value| !value.is_null()) {
-        data["toolInput"] = tool_input.clone();
-        data["tool_input"] = tool_input.clone();
-    }
-    if let Some(tool_output) = payload
-        .tool_output
-        .as_ref()
-        .filter(|value| !value.is_null())
-    {
-        data["toolOutput"] = tool_output.clone();
-        data["tool_output"] = tool_output.clone();
-    }
-    if let Some(tool_error) = payload.tool_error.as_ref().filter(|value| !value.is_null()) {
-        data["toolError"] = tool_error.clone();
-        data["tool_error"] = tool_error.clone();
-    }
-    if let Some(raw_tool_payload) = payload
-        .raw_tool_payload
-        .as_ref()
-        .filter(|value| !value.is_null())
-    {
-        data["rawToolPayload"] = raw_tool_payload.clone();
-        data["raw_tool_payload"] = raw_tool_payload.clone();
-    }
-    if cloud_mcp_agent_turn_should_include_message(event_code, payload) {
-        if let Some(message) = cloud_mcp_compact_turn_text(payload.message.as_ref(), 4096) {
-            data["m"] = json!(message.as_str());
-            if event_code == "pr" {
-                data["message"] = json!(message.as_str());
-            }
-        }
-    }
-    if prompt_submission {
-        if let Some(user_message) =
-            cloud_mcp_compact_turn_text(payload.user_message.as_ref(), 12_000)
-                .or_else(|| cloud_mcp_compact_turn_text(payload.message.as_ref(), 12_000))
-        {
-            data["um"] = json!(user_message.as_str());
-            data["user_message"] = json!(user_message.as_str());
-            data["userMessage"] = json!(user_message.as_str());
-            data["user_message_id"] = json!(asp_item_id.as_str());
-            data["userMessageId"] = json!(asp_item_id.as_str());
-            data["src"] = json!(if payload.source.starts_with("cli-hook") {
-                "terminal"
-            } else {
-                "local"
-            });
-        }
-    }
-    if event_code == "pr" && data.get("m").is_none() {
-        if let Some(prompt_text) =
-            cloud_mcp_compact_turn_text(payload.prompting_user_text.as_ref(), 4096)
-        {
-            data["m"] = json!(prompt_text.as_str());
-            data["message"] = json!(prompt_text.as_str());
-        }
-    }
-    if let Some(live_text_kind) = payload.live_text_kind.as_deref() {
-        data["lt"] = json!(live_text_kind);
-    }
-    if let Some(live_text_delta) =
-        cloud_mcp_compact_live_turn_text(payload.live_text_delta.as_ref(), 4096)
-    {
-        data["dm"] = json!(live_text_delta);
-    }
-    if let Some(live_text_snapshot) =
-        cloud_mcp_compact_live_turn_text(payload.live_text_snapshot.as_ref(), 32_768)
-    {
-        data["sm"] = json!(live_text_snapshot.as_str());
-        data["snapshot_text"] = json!(live_text_snapshot.as_str());
-        data["snapshotText"] = json!(live_text_snapshot.as_str());
-    }
-    if let Some(prompt_id) = cloud_mcp_agent_turn_prompt_id(payload) {
-        data["pid"] = json!(prompt_id.as_str());
-        data["prompt_id"] = json!(prompt_id.as_str());
-        data["promptId"] = json!(prompt_id.as_str());
-    }
-    if let Some(prompt_kind) = cloud_mcp_agent_turn_prompt_kind(payload) {
-        data["pm"] = json!(prompt_kind.as_str());
-        data["prompt_kind"] = json!(prompt_kind.as_str());
-        data["promptKind"] = json!(prompt_kind.as_str());
-    }
-    if let Some(default_option) = payload
-        .prompt_default_option
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
-        data["def"] = json!(default_option);
-        data["default_option_id"] = json!(default_option);
-        data["defaultOptionId"] = json!(default_option);
-    }
-    if let Some(ttl_ms) = payload.prompt_ttl_ms {
-        data["ttl"] = json!(ttl_ms);
-        data["ttl_ms"] = json!(ttl_ms);
-        data["ttlMs"] = json!(ttl_ms);
-    }
-    if !payload.prompt_options.is_empty() {
-        data["opts"] = cloud_mcp_agent_turn_prompt_options(payload);
-        let option_objects = cloud_mcp_agent_turn_prompt_option_objects(payload);
-        data["options"] = option_objects.clone();
-        data["prompt_options"] = option_objects.clone();
-        data["promptOptions"] = option_objects;
-    }
-    if event_code == "pa" {
-        if let Some(answer_option) =
-            cloud_mcp_compact_turn_text(payload.prompt_answer_option.as_ref(), 96)
-        {
-            data["opt"] = json!(answer_option.as_str());
-            data["option_id"] = json!(answer_option.as_str());
-            data["optionId"] = json!(answer_option.as_str());
-            data["chosen_option_id"] = json!(answer_option.as_str());
-            data["chosenOptionId"] = json!(answer_option.as_str());
-        }
-        // Hook-observed answers were made locally in the terminal; the remote
-        // command answer path publishes its own `pa` tagged src=remote.
-        data["src"] = json!("local");
-    }
-    if let Some(refs) = direct_prompt_refs {
-        data["todo"] = json!(refs.todo_id.as_str());
-        data["cmd"] = json!(refs.command_id.as_str());
-    }
-    let mut envelope = json!({
-        "v": 1,
-        "k": "turn.e",
-        "kind": "turn.e",
-        "contract": CLOUD_MCP_AGENT_TURN_CONTRACT,
-        "auth": auth,
-        "client_id": CLOUD_MCP_RUST_CLIENT_ID,
-        "id": format!("agentturn-{status_seq}"),
-        "sk": stream_key,
-        "q": status_seq,
-        "u": turn_id,
-        "t": event_code,
-        "st": state_value,
-        "ts": turn_status,
-        "asp": {
-            "event_type": asp_event_type,
-            "eventType": asp_event_type,
-            "item_id": asp_item_id.as_str(),
-            "itemId": asp_item_id.as_str(),
-            "item_kind": asp_item_kind,
-            "itemKind": asp_item_kind,
-            "seq": status_seq,
-        },
-        "asp_event_type": asp_event_type,
-        "aspEventType": asp_event_type,
-        "item_id": asp_item_id.as_str(),
-        "itemId": asp_item_id.as_str(),
-        "d": device_id,
-        "w": payload.workspace_id.as_str(),
-        "p": payload.pane_id.as_str(),
-        "i": payload.instance_id,
-        "x": data,
-        "at": payload.observed_at_ms,
-    });
-    if prompt_submission {
-        if let Some(user_message) = envelope
-            .get("x")
-            .and_then(|data| data.get("um"))
-            .and_then(Value::as_str)
-            .map(str::to_string)
-        {
-            envelope["user_message"] = json!(user_message.as_str());
-            envelope["userMessage"] = json!(user_message.as_str());
-            envelope["user_message_id"] = json!(asp_item_id.as_str());
-            envelope["userMessageId"] = json!(asp_item_id.as_str());
-        }
-    }
-    if let Ok(mut snapshots) = state.agent_turn_stream_snapshots.lock() {
-        snapshots.insert(stream_key.clone(), envelope.clone());
-        if snapshots.len() > 256 {
-            let stale_keys = snapshots
-                .keys()
-                .take(snapshots.len().saturating_sub(256))
-                .cloned()
-                .collect::<Vec<_>>();
-            for key in stale_keys {
-                snapshots.remove(&key);
-            }
-        }
-    }
-    if tx.send(envelope).is_err() {
-        cloud_mcp_mark_global_ws_disconnected(
-            state,
-            "Cloud MCP app websocket agent-turn sender is closed.",
-        )
-        .await;
-    }
-    let turn_is_final = matches!(turn_status, "completed" | "interrupted" | "failed")
-        || matches!(state_value, "idle" | "error" | "interrupted");
-    if matches!(event_code, "xs" | "xe" | "xf" | "ss" | "se") {
-        cloud_mcp_publish_agent_chat_live_tool_delta(
-            state,
-            payload,
-            status_seq,
-            &stream_key,
-            &device_id,
-            event_code,
-            state_value,
-            turn_status,
-        )
-        .await;
-    }
-    if event_code == "md"
-        || payload.live_text_delta.is_some()
-        || payload.live_text_snapshot.is_some()
-        || turn_is_final
-    {
-        cloud_mcp_publish_agent_chat_live_delta(
-            state,
-            payload,
-            status_seq,
-            &stream_key,
-            &device_id,
-            state_value,
-            turn_status,
-        )
-        .await;
     }
 }
 
@@ -31237,6 +29548,48 @@ fn cloud_mcp_presence_terminal_matches_instance(
     }
 }
 
+/// Close settlement runs detached from workspace close and can arrive after
+/// the workspace reopened. A candidate without an instance id (legacy or
+/// cloud-hydrated rows) matches the lenient matcher above, which would let a
+/// LATE close for an old instance mark a reopened pane closed — so closes
+/// require an explicit instance match when we know the instance we closed.
+fn cloud_mcp_presence_terminal_matches_instance_for_close(
+    terminal: &Value,
+    pane_id: &str,
+    instance_id: u64,
+) -> bool {
+    if instance_id == 0 {
+        return cloud_mcp_presence_terminal_matches_instance(terminal, pane_id, instance_id);
+    }
+    let terminal_id = cloud_mcp_payload_text(
+        terminal,
+        &[
+            "pane_id",
+            "paneId",
+            "terminal_id",
+            "terminalId",
+            "target_terminal_id",
+            "targetTerminalId",
+        ],
+    )
+    .unwrap_or_default();
+    if terminal_id != pane_id {
+        return false;
+    }
+    matches!(
+        cloud_mcp_payload_u64(
+            terminal,
+            &[
+                "terminal_instance_id",
+                "terminalInstanceId",
+                "instance_id",
+                "instanceId",
+            ],
+        ),
+        Some(value) if value == instance_id
+    )
+}
+
 fn cloud_mcp_terminal_state_removes_from_live_snapshot(terminal: &Value) -> bool {
     [
         "status",
@@ -31363,7 +29716,7 @@ async fn cloud_mcp_mark_device_live_terminal_closed(
             continue;
         };
         for terminal in terminals {
-            if !cloud_mcp_presence_terminal_matches_instance(terminal, pane_id, instance_id) {
+            if !cloud_mcp_presence_terminal_matches_instance_for_close(terminal, pane_id, instance_id) {
                 continue;
             }
             matched = matched.saturating_add(1);
@@ -35091,7 +33444,41 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
                 cloud_mcp_live_state_merge_object(existing, terminal_value);
             }
         } else {
-            terminals.push(terminal_value);
+            // Close notifications run detached from workspace close: a late
+            // shutdown payload for an old instance must not materialize a
+            // phantom last-known row when the pane already re-registered
+            // with a newer instance.
+            let stale_shutdown_for_reopened_pane = workspace_runtime_shutdown
+                && terminal_instance_id > 0
+                && terminals.iter().any(|terminal| {
+                    cloud_mcp_payload_text(
+                        terminal,
+                        &[
+                            "pane_id",
+                            "paneId",
+                            "terminal_id",
+                            "terminalId",
+                            "target_terminal_id",
+                            "targetTerminalId",
+                        ],
+                    )
+                    .unwrap_or_default()
+                        == terminal_id
+                        && cloud_mcp_payload_u64(
+                            terminal,
+                            &[
+                                "terminal_instance_id",
+                                "terminalInstanceId",
+                                "instance_id",
+                                "instanceId",
+                            ],
+                        )
+                        .map(|value| value > terminal_instance_id)
+                        .unwrap_or(false)
+                });
+            if !stale_shutdown_for_reopened_pane {
+                terminals.push(terminal_value);
+            }
         }
         let terminal_count = terminals.len();
         let active_count = terminals

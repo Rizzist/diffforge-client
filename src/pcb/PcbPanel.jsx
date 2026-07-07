@@ -616,6 +616,9 @@ const PCB_RUNFRAME_PREVIEW_BOOTSTRAP_SOURCE = `
       ["webgl2", "webgl", "experimental-webgl"].forEach(function (contextType) {
         try {
           var context = canvas.getContext && canvas.getContext(contextType);
+          if (context && typeof context.isContextLost === "function" && context.isContextLost()) {
+            return;
+          }
           var extension = context && context.getExtension && context.getExtension("WEBGL_lose_context");
           if (extension && typeof extension.loseContext === "function") {
             extension.loseContext();
@@ -765,7 +768,9 @@ function releasePreviewFrameWebGlContexts(frame) {
     ["webgl2", "webgl", "experimental-webgl"].forEach((contextType) => {
       try {
         const context = canvas.getContext?.(contextType);
-        context?.getExtension?.("WEBGL_lose_context")?.loseContext?.();
+        if (context && !context.isContextLost?.()) {
+          context.getExtension?.("WEBGL_lose_context")?.loseContext?.();
+        }
       } catch {
         // Losing old preview contexts is best-effort; the new frame is the source of truth.
       }

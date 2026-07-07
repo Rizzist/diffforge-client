@@ -53,6 +53,7 @@ export const TERMINAL_WINDOW_CLOSED_EVENT = "forge-terminal-window-closed";
 
 const TERMINAL_WINDOW_RESIZE_DEBOUNCE_MS = 90;
 const TERMINAL_WINDOW_REATTACH_DELAY_MS = 1200;
+const TERMINAL_WINDOW_REATTACH_DELAY_MAX_MS = 15_000;
 const TERMINAL_WINDOW_FONT_SIZE_DEFAULT = 12;
 const TERMINAL_WINDOW_FONT_SIZE_MIN = 8;
 const TERMINAL_WINDOW_FONT_SIZE_MAX = 24;
@@ -481,6 +482,7 @@ export default function TerminalWindowHost() {
     let term = null;
     let resizeTimer = 0;
     let reattachTimer = 0;
+    let reattachAttempts = 0;
     let detachResize = () => {};
     let detachPushToTalkGuard = () => {};
     let detachFocusBlink = () => {};
@@ -519,17 +521,24 @@ export default function TerminalWindowHost() {
     // Restarting the terminal (e.g. from this window's restart menu) creates
     // a new PTY instance and drops the old transport stream; reattach instead
     // of dying so the window survives restarts. If the pane truly closes, the
-    // main window closes this window for us.
+    // main window closes this window for us. Backoff grows toward a 15s
+    // ceiling so a window orphaned from a closed runtime stops hammering the
+    // transport every 1.2s forever.
     const scheduleReattach = () => {
       if (disposed || reattachTimer) {
         return;
       }
       setStatus("connecting");
       setStatusDetail("Reattaching to the terminal...");
+      const reattachDelayMs = Math.min(
+        TERMINAL_WINDOW_REATTACH_DELAY_MS * (1.6 ** reattachAttempts),
+        TERMINAL_WINDOW_REATTACH_DELAY_MAX_MS,
+      );
+      reattachAttempts += 1;
       reattachTimer = window.setTimeout(() => {
         reattachTimer = 0;
         void attach();
-      }, TERMINAL_WINDOW_REATTACH_DELAY_MS);
+      }, reattachDelayMs);
     };
 
     const attach = async () => {
@@ -596,6 +605,7 @@ export default function TerminalWindowHost() {
           return;
         }
         if (typeof event.data === "string") {
+          reattachAttempts = 0;
           setStatus("ready");
           setStatusDetail("");
           return;

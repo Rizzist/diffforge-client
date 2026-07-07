@@ -5735,7 +5735,12 @@ async fn close_all_terminal_sessions(
             .await;
         }));
     }
-    if !notify_tasks.is_empty() {
+    if !notify_tasks.is_empty() && !scoped_close {
+        // Full shutdown only: give cloud close notifications a bounded window
+        // to flush before the process exits. Workspace-scoped closes must not
+        // block on network delivery — the spawned tasks keep running detached,
+        // and close settlement is identity-strict (pane_id + instance_id), so
+        // late delivery cannot clobber a reopened workspace's new instances.
         let _ = tokio::time::timeout(
             Duration::from_millis(2_000),
             futures_util::future::join_all(notify_tasks),

@@ -626,6 +626,16 @@ function FlameShaderCanvas({ active, preset, planKey, onReady }) {
           gl.deleteBuffer(buffer);
         }
         gl.deleteProgram(program);
+        try {
+          // Idle-state flames remount per workspace open/close; without an
+          // explicit release each unmounted canvas holds a live GL context
+          // until GC and counts against WebKit's ~16-contexts-per-page cap.
+          if (!gl.isContextLost?.()) {
+            gl.getExtension?.("WEBGL_lose_context")?.loseContext?.();
+          }
+        } catch (_error) {
+          // Context release is best effort; GC reclaims it eventually.
+        }
       };
     } catch {
       onReady(false);

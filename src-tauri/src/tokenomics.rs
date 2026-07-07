@@ -19,7 +19,8 @@ const TOKENOMICS_USAGE_EVENT_VACUUM_MIN_DELETED_ROWS: usize = 50_000;
 const TOKENOMICS_USAGE_EVENT_VACUUM_MIN_DB_BYTES: u64 = 200 * 1024 * 1024;
 const TOKENOMICS_USAGE_EVENT_VACUUM_STARTUP_GRACE_SECS: u64 = 3 * 60;
 const TOKENOMICS_SQLITE_BUSY_TIMEOUT_MS: u64 = 30_000;
-const TOKENOMICS_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
+const TOKENOMICS_CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
+const TOKENOMICS_CODEX_USAGE_LEGACY_URL: &str = "https://chatgpt.com/backend-api/codex/usage";
 const TOKENOMICS_CLAUDE_USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const TOKENOMICS_CODEX_SCANNER_VERSION: &str = "codex-token-count-v8-uncached-input-30d";
 const TOKENOMICS_GENERIC_SCANNER_VERSION: &str = "generic-tokenomics-v7-large-jsonl-30d";
@@ -46,9 +47,14 @@ const TOKENOMICS_PERIODIC_PROVIDER_REFRESH_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_PERIODIC_REALTIME_SCAN_MIN_INTERVAL_MS: u64 = 120_000;
 const TOKENOMICS_PERIODIC_SOURCE_DISCOVERY_INTERVAL_MS: u64 = 5 * 60 * 1000;
 const TOKENOMICS_PERIODIC_CANDIDATE_DISCOVERY_CACHE_TTL_MS: u64 = 5 * 60 * 1000;
-const TOKENOMICS_PERIODIC_FINGERPRINT_FILES_PER_ROOT: usize = 16;
+const TOKENOMICS_PERIODIC_FINGERPRINT_FILES_PER_ROOT: usize = 64;
 const TOKENOMICS_PERIODIC_SENTINEL_MAX_ENTRIES_PER_ROOT: usize = 512;
 const TOKENOMICS_PERIODIC_SENTINEL_MAX_DEPTH: usize = 3;
+// Watcher wakes carry the exact changed files so the periodic gate can skip
+// the recursive sentinel/discovery sweeps. Oversized batches overflow and
+// force a normal full sweep instead.
+const TOKENOMICS_PERIODIC_CHANGED_PATHS_MAX: usize = 256;
+const TOKENOMICS_PERIODIC_KNOWN_PATHS_MAX: usize = 512;
 const TOKENOMICS_SUMMARY_SNAPSHOT_CACHE_KEY_PREFIX: &str = "summary_snapshot_cache:";
 const TOKENOMICS_SCAN_PROGRESS_EVENT: &str = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_UPDATED_EVENT: &str = "diffforge://tokenomics-updated";
@@ -79,6 +85,9 @@ static TOKENOMICS_PROVIDER_ACCOUNT_RECONCILE_FINGERPRINT: OnceLock<StdMutex<Opti
     OnceLock::new();
 static TOKENOMICS_PERIODIC_CANDIDATE_DISCOVERY_CACHE: OnceLock<
     StdMutex<HashMap<String, TokenomicsPeriodicCandidateDiscoveryCacheEntry>>,
+> = OnceLock::new();
+static TOKENOMICS_PERIODIC_CHANGED_PATHS: OnceLock<
+    StdMutex<TokenomicsPeriodicChangedPathBatch>,
 > = OnceLock::new();
 static TOKENOMICS_CLAUDE_USER_AGENT_CACHE: OnceLock<
     StdMutex<Option<TokenomicsClaudeUserAgentCacheEntry>>,
@@ -481,6 +490,7 @@ fn tokenomics_prepare_db(conn: &rusqlite::Connection) -> Result<(), String> {
     conn.execute_batch(
         "PRAGMA journal_mode=WAL;
          PRAGMA synchronous=NORMAL;
+         PRAGMA journal_size_limit=67108864;
          CREATE TABLE IF NOT EXISTS tokenomics_usage_events(
            id TEXT PRIMARY KEY,
            device_id TEXT NOT NULL DEFAULT 'desktop-primary',
@@ -1975,6 +1985,92 @@ pub(crate) fn tokenomics_periodic_force_source_discovery() {
     }
 }
 
+#[derive(Default)]
+struct TokenomicsPeriodicChangedPathBatch {
+    pending: bool,
+    overflowed: bool,
+    paths: Vec<PathBuf>,
+}
+
+fn tokenomics_periodic_changed_paths_slot() -> &'static StdMutex<TokenomicsPeriodicChangedPathBatch>
+{
+    TOKENOMICS_PERIODIC_CHANGED_PATHS.get_or_init(|| StdMutex::new(Default::default()))
+}
+
+fn tokenomics_periodic_changed_path_is_relevant(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name.ends_with(".jsonl")
+        || name.ends_with(".json")
+        || name.ends_with(".ndjson")
+        || name.contains(".sqlite")
+        || name.ends_with(".db")
+        || name.ends_with(".db-wal")
+        || name.ends_with(".db-shm")
+}
+
+/// Records the files behind a watcher wake so the next periodic gate can skip
+/// the recursive sentinel walk and candidate rediscovery. Irrelevant paths are
+/// dropped; oversized batches overflow, which the gate treats as "run the
+/// normal full sweep".
+pub(crate) fn tokenomics_periodic_note_changed_paths(paths: &[PathBuf]) {
+    let Ok(mut batch) = tokenomics_periodic_changed_paths_slot().lock() else {
+        return;
+    };
+    batch.pending = true;
+    if batch.overflowed {
+        return;
+    }
+    for path in paths {
+        if !tokenomics_periodic_changed_path_is_relevant(path) {
+            // Extension-less non-hidden paths are almost always directory
+            // notices (FSEvents dir-level / must-scan-subdirs coalescing).
+            // They can hide file changes the batch does not name, so they
+            // poison the fast path: overflow and let the gate run the full
+            // sweep. Hidden entries (.DS_Store and friends) are just noise.
+            let hidden = path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with('.'));
+            if !hidden && path.extension().is_none() {
+                batch.overflowed = true;
+                batch.paths.clear();
+                drop(batch);
+                tokenomics_periodic_force_source_discovery();
+                return;
+            }
+            continue;
+        }
+        if batch.paths.iter().any(|known| known == path) {
+            continue;
+        }
+        if batch.paths.len() >= TOKENOMICS_PERIODIC_CHANGED_PATHS_MAX {
+            batch.overflowed = true;
+            batch.paths.clear();
+            drop(batch);
+            // An overflowed batch can no longer describe the change set, so
+            // fall back to the pre-fast-path behavior: clear the candidate
+            // cache and force a full rediscovery on the next gate run.
+            tokenomics_periodic_force_source_discovery();
+            return;
+        }
+        batch.paths.push(path.clone());
+    }
+}
+
+fn tokenomics_periodic_take_changed_paths() -> Option<TokenomicsPeriodicChangedPathBatch> {
+    let Ok(mut batch) = tokenomics_periodic_changed_paths_slot().lock() else {
+        return None;
+    };
+    if !batch.pending {
+        return None;
+    }
+    Some(std::mem::take(&mut *batch))
+}
+
 fn tokenomics_periodic_root_fingerprint(root: &Path) -> (u64, u64) {
     fs::metadata(root)
         .ok()
@@ -2125,7 +2221,7 @@ fn tokenomics_periodic_source_sentinel_hash() -> String {
 fn tokenomics_periodic_gate_decision() -> TokenomicsPeriodicGateDecision {
     let _span = BackendCpuSpan::new("tokenomics.periodic_gate");
     let now = current_time_ms();
-    let source_sentinel_hash = tokenomics_periodic_source_sentinel_hash();
+    let changed_batch = tokenomics_periodic_take_changed_paths();
     let (previous_known_paths, previous_sentinel_hash, previous_discovery_ms) =
         match tokenomics_periodic_gate().lock() {
             Ok(state) => (
@@ -2135,14 +2231,53 @@ fn tokenomics_periodic_gate_decision() -> TokenomicsPeriodicGateDecision {
             ),
             Err(_) => (Vec::new(), String::new(), 0),
         };
-    let discovery_due = previous_discovery_ms == 0
-        || previous_sentinel_hash != source_sentinel_hash
+    let discovery_interval_due = previous_discovery_ms == 0
         || now.saturating_sub(previous_discovery_ms)
             >= TOKENOMICS_PERIODIC_SOURCE_DISCOVERY_INTERVAL_MS;
-    let known_paths = if discovery_due {
-        tokenomics_periodic_discover_input_paths(&source_sentinel_hash)
+    // Event fast path: a watcher wake told us exactly which files changed, so
+    // the recursive sentinel walk and candidate rediscovery are skipped and
+    // the changed files merge straight into the fingerprint inputs. Timer
+    // wakes, overflowed batches, and the periodic discovery interval still
+    // run the full sweep as the safety net for missed events.
+    // An empty (fully filtered) batch means the events carried no usable file
+    // paths — e.g. macOS FSEvents "must scan subdirs" directory notices — so
+    // it cannot vouch for what changed and must not skip the sweep.
+    let event_fast_path = !discovery_interval_due
+        && !previous_sentinel_hash.is_empty()
+        && changed_batch
+            .as_ref()
+            .map(|batch| !batch.overflowed && !batch.paths.is_empty())
+            .unwrap_or(false);
+    let (source_sentinel_hash, discovery_due, known_paths) = if event_fast_path {
+        let mut known_paths = previous_known_paths;
+        let mut seen = known_paths.iter().cloned().collect::<HashSet<_>>();
+        for path in changed_batch.iter().flat_map(|batch| batch.paths.iter()) {
+            if seen.insert(path.clone()) {
+                known_paths.push(path.clone());
+            }
+        }
+        if known_paths.len() > TOKENOMICS_PERIODIC_KNOWN_PATHS_MAX {
+            let sentinel = tokenomics_periodic_source_sentinel_hash();
+            let paths = tokenomics_periodic_discover_input_paths(&sentinel);
+            (sentinel, true, paths)
+        } else {
+            (previous_sentinel_hash, false, known_paths)
+        }
     } else {
-        previous_known_paths
+        let sentinel = tokenomics_periodic_source_sentinel_hash();
+        let discovery_due = previous_discovery_ms == 0
+            || previous_sentinel_hash != sentinel
+            || discovery_interval_due
+            || changed_batch
+                .as_ref()
+                .map(|batch| batch.overflowed)
+                .unwrap_or(false);
+        let paths = if discovery_due {
+            tokenomics_periodic_discover_input_paths(&sentinel)
+        } else {
+            previous_known_paths
+        };
+        (sentinel, discovery_due, paths)
     };
     let fingerprint = tokenomics_periodic_fingerprint_from_paths(&known_paths);
     let Ok(mut state) = tokenomics_periodic_gate().lock() else {
@@ -2169,6 +2304,11 @@ fn tokenomics_periodic_gate_decision() -> TokenomicsPeriodicGateDecision {
         state.known_paths = known_paths;
         state.source_sentinel_hash = source_sentinel_hash;
         state.last_discovery_ms = now;
+    } else if event_fast_path {
+        // Keep the merged path set so later fingerprints keep watching the
+        // files this event introduced (dead entries fall out at the next
+        // interval-driven rediscovery).
+        state.known_paths = known_paths;
     }
     if should_run {
         state.fingerprint = Some(fingerprint.clone());
@@ -2900,6 +3040,17 @@ fn tokenomics_prune_usage_events(
         deleted_total,
         vacuum_pending,
     )?;
+    let vacuum_ran = vacuum.get("status").and_then(Value::as_str) == Some("ok");
+    if deleted_total > 0 && !vacuum_ran {
+        // Long-lived headless processes otherwise accumulate a large WAL
+        // between the rare vacuums; the daily prune is the natural point to
+        // fold it back. Best-effort with a short busy window: a busy reader
+        // makes this round skip instead of stalling the prune thread for the
+        // full 30s connection busy timeout.
+        let _ = conn.busy_timeout(Duration::from_millis(100));
+        let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        let _ = conn.busy_timeout(Duration::from_millis(TOKENOMICS_SQLITE_BUSY_TIMEOUT_MS));
+    }
 
     Ok(json!({
         "status": "ok",
@@ -16537,18 +16688,52 @@ fn tokenomics_codex_live_usage(
     None
 }
 
+/// Latched when wham/usage fails or returns an unusable shape, so refreshes
+/// stop paying a doomed extra HTTP round-trip; a later wham success (tried
+/// second) clears it. Process-lifetime only — restarts re-probe wham first.
+static TOKENOMICS_CODEX_WHAM_USAGE_UNAVAILABLE: AtomicBool = AtomicBool::new(false);
+
 fn tokenomics_fetch_codex_live_usage(access_token: &str) -> Option<Value> {
-    let response = shared_blocking_http_client()
-        .get(TOKENOMICS_CODEX_USAGE_URL)
-        .timeout(Duration::from_secs(8))
-        .bearer_auth(access_token)
-        .header("User-Agent", "DiffForge/0.1 tokenomics")
-        .send()
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
+    // Codex moved its usage endpoint to wham/usage (same rate_limit window
+    // shape); keep the legacy path as a fallback while both are deployed.
+    let wham_unavailable = TOKENOMICS_CODEX_WHAM_USAGE_UNAVAILABLE.load(Ordering::Relaxed);
+    let urls = if wham_unavailable {
+        [
+            TOKENOMICS_CODEX_USAGE_LEGACY_URL,
+            TOKENOMICS_CODEX_USAGE_URL,
+        ]
+    } else {
+        [
+            TOKENOMICS_CODEX_USAGE_URL,
+            TOKENOMICS_CODEX_USAGE_LEGACY_URL,
+        ]
+    };
+    for url in urls {
+        let wham = url == TOKENOMICS_CODEX_USAGE_URL;
+        let response = shared_blocking_http_client()
+            .get(url)
+            .timeout(Duration::from_secs(8))
+            .bearer_auth(access_token)
+            .header("User-Agent", "DiffForge/0.1 tokenomics")
+            .send();
+        let usage = response
+            .ok()
+            .filter(|response| response.status().is_success())
+            .and_then(|response| response.json::<Value>().ok());
+        // Downstream parsing (and cached-payload aging) reads `rate_limit`
+        // only, so a wham response without it must fall through to the
+        // legacy endpoint instead of being cached as an unknown payload.
+        let usable = usage
+            .as_ref()
+            .is_some_and(|usage| usage.get("rate_limit").is_some() || !wham);
+        if wham {
+            TOKENOMICS_CODEX_WHAM_USAGE_UNAVAILABLE.store(!usable, Ordering::Relaxed);
+        }
+        if usable {
+            return usage;
+        }
     }
-    response.json::<Value>().ok()
+    None
 }
 
 fn tokenomics_claude_usage_cache_key(provider_account: &TokenomicsProviderAccount) -> String {
@@ -17742,6 +17927,67 @@ mod tokenomics_tests {
     use super::*;
 
     static TOKENOMICS_OPENCODE_TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+    // Single test for the whole changed-path batch state machine: the batch
+    // slot is process-global, so splitting these into parallel #[test]s
+    // would race on it.
+    #[test]
+    fn tokenomics_periodic_changed_path_batch_note_take_and_overflow() {
+        // Start from a clean slot regardless of prior state.
+        let _ = tokenomics_periodic_take_changed_paths();
+
+        // No note() => nothing pending.
+        assert!(tokenomics_periodic_take_changed_paths().is_none());
+
+        // Hidden noise only: pending with empty paths (gate must full-sweep).
+        tokenomics_periodic_note_changed_paths(&[PathBuf::from("/tmp/tok-test/.DS_Store")]);
+        let batch = tokenomics_periodic_take_changed_paths().expect("hidden-only batch pending");
+        assert!(!batch.overflowed);
+        assert!(batch.paths.is_empty());
+        assert!(tokenomics_periodic_take_changed_paths().is_none());
+
+        // Relevant paths dedup; irrelevant extensions drop.
+        tokenomics_periodic_note_changed_paths(&[
+            PathBuf::from("/tmp/tok-test/a.jsonl"),
+            PathBuf::from("/tmp/tok-test/a.jsonl"),
+            PathBuf::from("/tmp/tok-test/state_5.sqlite-wal"),
+            PathBuf::from("/tmp/tok-test/notes.txt"),
+        ]);
+        let batch = tokenomics_periodic_take_changed_paths().expect("relevant batch pending");
+        assert!(!batch.overflowed);
+        assert_eq!(batch.paths.len(), 2);
+
+        // Extension-less non-hidden path (directory notice) poisons the
+        // batch even when relevant paths are present.
+        tokenomics_periodic_note_changed_paths(&[
+            PathBuf::from("/tmp/tok-test/b.jsonl"),
+            PathBuf::from("/tmp/tok-test/new-session-dir"),
+        ]);
+        let batch = tokenomics_periodic_take_changed_paths().expect("dir batch pending");
+        assert!(batch.overflowed);
+        assert!(batch.paths.is_empty());
+
+        // Cap overflow clears paths and flags the batch.
+        let many = (0..TOKENOMICS_PERIODIC_CHANGED_PATHS_MAX + 2)
+            .map(|index| PathBuf::from(format!("/tmp/tok-test/file-{index}.jsonl")))
+            .collect::<Vec<_>>();
+        tokenomics_periodic_note_changed_paths(&many);
+        let batch = tokenomics_periodic_take_changed_paths().expect("overflow batch pending");
+        assert!(batch.overflowed);
+        assert!(batch.paths.is_empty());
+
+        // Overflow forced a rediscovery: sentinel cleared disables the gate
+        // fast path on the next run.
+        let (sentinel_cleared, discovery_reset) = match tokenomics_periodic_gate().lock() {
+            Ok(state) => (
+                state.source_sentinel_hash.is_empty(),
+                state.last_discovery_ms == 0,
+            ),
+            Err(_) => (false, false),
+        };
+        assert!(sentinel_cleared);
+        assert!(discovery_reset);
+    }
 
     #[test]
     fn tokenomics_usage_event_prune_policy_requires_age_sync_and_rollup_coverage() {

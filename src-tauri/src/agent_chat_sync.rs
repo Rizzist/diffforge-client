@@ -15,6 +15,7 @@ struct AgentChatSessionSyncContext {
     source: String,
     shared_history_id: String,
     fork_from_provider_session_id: String,
+    metadata_only: bool,
 }
 
 struct AgentChatSessionSyncSource {
@@ -1913,6 +1914,9 @@ fn agent_chat_session_sync_payloads(
         "model_config": model_config.clone(),
         "thread_detail_hash": thread_detail_hash.as_str(),
     }));
+    if context.metadata_only {
+        source.records.clear();
+    }
     let metadata_already_acked = agent_chat_session_sync_acked_session_metadata_hash(
         &scope_key,
         &device_id,
@@ -2093,6 +2097,17 @@ fn agent_chat_session_sync_spawn(
     reason: &'static str,
 ) {
     let state = app.state::<CloudMcpState>().inner().clone();
+    agent_chat_session_sync_spawn_with_state(state, agent_id, provider_session_id, cwd, context, reason);
+}
+
+fn agent_chat_session_sync_spawn_with_state(
+    state: CloudMcpState,
+    agent_id: String,
+    provider_session_id: String,
+    cwd: String,
+    context: AgentChatSessionSyncContext,
+    reason: &'static str,
+) {
     tauri::async_runtime::spawn(async move {
         let _build_permit = match agent_chat_session_sync_build_semaphore()
             .acquire_owned()

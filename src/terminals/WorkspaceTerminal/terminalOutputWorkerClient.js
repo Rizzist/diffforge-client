@@ -139,6 +139,7 @@ export function createTerminalOutputWorkerSession(options = {}) {
     return null;
   }
 
+  let sessionDisposed = false;
   callbacks.set(id, options.onOutput);
   if (typeof options.onTransportStatus === "function") {
     transportStatusCallbacks.set(id, options.onTransportStatus);
@@ -152,6 +153,7 @@ export function createTerminalOutputWorkerSession(options = {}) {
 
   return {
     dispose() {
+      sessionDisposed = true;
       callbacks.delete(id);
       transportStatusCallbacks.delete(id);
       settleTransportHandshake(id, false, {
@@ -198,6 +200,13 @@ export function createTerminalOutputWorkerSession(options = {}) {
       let promise = null;
       promise = terminalOutputTransportEndpoint().then((endpoint) => (
         new Promise((resolve, reject) => {
+          if (sessionDisposed) {
+            // The pane unmounted while the endpoint invoke was in flight;
+            // posting connectTransport now would open a socket nobody owns.
+            transportHandshakes.delete(id);
+            reject(new Error("Terminal output worker session was disposed."));
+            return;
+          }
           const timer = window.setTimeout(() => {
             transportHandshakes.delete(id);
             reject(new Error("Timed out connecting terminal output transport."));
