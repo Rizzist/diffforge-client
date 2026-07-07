@@ -16380,6 +16380,14 @@ fn cloud_mcp_loopspace_trigger_run_normalized_row(
         .unwrap_or_default()
         .trim()
         .to_string();
+    let loop_run_id = cloud_mcp_payload_text(row, &["loop_run_id", "loopRunId"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let source = cloud_mcp_payload_text(row, &["source"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
     let created_at_ms = cloud_mcp_payload_i64(row, &["created_at_ms", "createdAtMs"])
         .unwrap_or(0)
         .max(0);
@@ -16398,6 +16406,9 @@ fn cloud_mcp_loopspace_trigger_run_normalized_row(
         object.insert("triggerType".to_string(), json!(trigger_type.clone()));
         object.insert("type".to_string(), json!(trigger_type.clone()));
         object.insert("status".to_string(), json!(status.clone()));
+        object.insert("loop_run_id".to_string(), json!(loop_run_id.clone()));
+        object.insert("loopRunId".to_string(), json!(loop_run_id.clone()));
+        object.insert("source".to_string(), json!(source.clone()));
         object.insert("created_at_ms".to_string(), json!(created_at_ms));
         object.insert("createdAtMs".to_string(), json!(created_at_ms));
         object.insert("completed_at_ms".to_string(), json!(completed_at_ms));
@@ -18005,6 +18016,7 @@ async fn cloud_mcp_apply_account_sync_resume_remote_commands(
             continue;
         }
         let remote_lever_handled = cloud_mcp_apply_remote_workspace_lever(&app, state, &event)
+            || orchestrator_pool_apply_remote_send_lever(&app, state, &event)
             || cloud_mcp_apply_remote_terminal_interrupt_lever(&app, state, &event)
             || cloud_mcp_apply_remote_terminal_lever(&app, state, &event)
             || cloud_mcp_apply_remote_agent_lever(&app, state, &event)
@@ -20253,6 +20265,7 @@ async fn cloud_mcp_start_remote_command_listener(
             }
             let remote_lever_handled =
                 cloud_mcp_apply_remote_workspace_lever(&app, &state_clone, &event)
+                    || orchestrator_pool_apply_remote_send_lever(&app, &state_clone, &event)
                     || cloud_mcp_apply_remote_terminal_interrupt_lever(&app, &state_clone, &event)
                     || cloud_mcp_apply_remote_terminal_lever(&app, &state_clone, &event)
                     || cloud_mcp_apply_remote_agent_lever(&app, &state_clone, &event)
@@ -20304,10 +20317,7 @@ async fn cloud_mcp_start_remote_command_listener(
 }
 
 /// Headless actuation for remote workspace lifecycle levers. Only runs when
-/// no webview dispatcher is alive (the webview owns actuation when open):
-/// deactivate-if-idle tears the runtime down natively; activate is recorded
-/// as a pending intent the webview consumes on its next foreground launch
-/// (terminal/agent startup is inherently a foreground concern today).
+/// no webview dispatcher is alive (the webview owns actuation when open).
 fn cloud_mcp_apply_remote_workspace_lever(
     app: &AppHandle,
     state: &CloudMcpState,
@@ -20324,28 +20334,66 @@ fn cloud_mcp_apply_remote_workspace_lever(
     }
     match command_kind.as_str() {
         "workspace_activate" | "activate_workspace" | "open_workspace" | "workspace_open" => {
-            let _ = app_local_state_merge(
-                app,
-                "remote-intents",
-                &json!({
-                    "pendingActivationWorkspaceId": workspace_id,
-                    "pendingActivationReason": "remote_control_headless",
-                    "pendingActivationAtMs": cloud_mcp_now_ms(),
-                    "pendingActivationSelectWorkspace": true,
-                    "pendingActivationWorkspaceTab": "terminals",
-                }),
-            );
+            let app = app.clone();
             let state = state.clone();
             let event = event.clone();
             tauri::async_runtime::spawn(async move {
                 let _ = cloud_mcp_send_remote_command_status_event(
                     &state,
                     &event,
-                    "queued",
-                    "Workspace activation queued; it completes when the desktop window next opens.",
+                    "running",
+                    "Activating workspace runtime headless.",
                     None,
                 )
                 .await;
+                let result = workspace_activate_runtime_internal(
+                    &app,
+                    &workspace_id,
+                    "remote_control_headless",
+                )
+                .await;
+                match result {
+                    Ok(result) => {
+                        let _ = cloud_mcp_send_remote_command_status_event(
+                            &state,
+                            &event,
+                            "completed",
+                            "Workspace runtime activated headless from the web dashboard.",
+                            Some(&result),
+                        )
+                        .await;
+                    }
+                    Err(error) => {
+                        let fallback_allowed =
+                            cloud_mcp_remote_workspace_activation_error_allows_pending(&error);
+                        if fallback_allowed {
+                            let _ = app_local_state_merge(
+                                &app,
+                                "remote-intents",
+                                &json!({
+                                    "pendingActivationWorkspaceId": workspace_id,
+                                    "pendingActivationReason": "remote_control_headless_fallback",
+                                    "pendingActivationAtMs": cloud_mcp_now_ms(),
+                                    "pendingActivationSelectWorkspace": true,
+                                    "pendingActivationWorkspaceTab": "terminals",
+                                }),
+                            );
+                        }
+                        let details = json!({
+                            "error": clean_terminal_telemetry_text(&error),
+                            "pendingActivationStored": fallback_allowed,
+                            "workspaceId": workspace_id,
+                        });
+                        let _ = cloud_mcp_send_remote_command_status_event(
+                            &state,
+                            &event,
+                            "failed",
+                            "Workspace runtime could not be activated headless.",
+                            Some(&details),
+                        )
+                        .await;
+                    }
+                }
             });
             true
         }
@@ -20418,6 +20466,15 @@ fn cloud_mcp_apply_remote_workspace_lever(
         }
         _ => false,
     }
+}
+
+fn cloud_mcp_remote_workspace_activation_error_allows_pending(error: &str) -> bool {
+    let error = error.trim().to_ascii_lowercase();
+    // "webview dispatcher active" DOES store the pending intent: the webview
+    // came alive between the lever's gate and the orchestrator's own guard,
+    // and it never saw this command (the lever consumed it) — the persisted
+    // intent is how it still gets fulfilled.
+    !(error.contains("unknown workspace") || error.contains("workspace root does not exist"))
 }
 
 fn cloud_mcp_apply_remote_agent_prompt_lever(
@@ -33621,6 +33678,21 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
     terminal_orchestrators: Option<Value>,
     reason: Option<String>,
 ) -> Result<Value, String> {
+    cloud_mcp_sync_device_workspaces_snapshot_internal(
+        state.inner(),
+        workspaces,
+        terminal_orchestrators,
+        reason,
+    )
+    .await
+}
+
+async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
+    state: &CloudMcpState,
+    workspaces: Value,
+    terminal_orchestrators: Option<Value>,
+    reason: Option<String>,
+) -> Result<Value, String> {
     let clean_option = |value: Option<String>| {
         value
             .map(|value| value.trim().to_string())
@@ -33644,7 +33716,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
     // known terminals read-only. Backfill inactive workspaces from the cached snapshots
     // instead of publishing an authoritative empty list that would clear them everywhere.
     let cached_last_known_workspaces: std::collections::BTreeMap<String, Value> = {
-        let snapshots = state.inner().runtime_snapshots.lock().await;
+        let snapshots = state.runtime_snapshots.lock().await;
         let mut cached = std::collections::BTreeMap::new();
         for snapshot in [
             snapshots.workspace_terminals.as_ref(),
@@ -34204,7 +34276,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         }
 
         let (workspace_runtime_seq, workspace_runtime_epoch) =
-            cloud_mcp_workspace_runtime_ordering(state.inner(), workspace);
+            cloud_mcp_workspace_runtime_ordering(state, workspace);
         let servers = cloud_mcp_normalize_workspace_mcp_servers_for_snapshot(workspace);
         let workspace_order = cloud_mcp_payload_u64(
             workspace,
@@ -34485,7 +34557,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
     let payload = cloud_mcp_device_live_payload_with_sync_identity(payload);
 
     {
-        let mut snapshots = state.inner().runtime_snapshots.lock().await;
+        let mut snapshots = state.runtime_snapshots.lock().await;
         snapshots.workspace_terminals = Some(payload.clone());
         snapshots.workspace_catalog = Some(payload.clone());
     }
@@ -34505,7 +34577,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
         CloudMcpDeviceLiveSyncDecision::Enqueue => {
             cloud_mcp_device_live_mark_sync_pending(&payload)?;
             match cloud_mcp_send_event_over_app_ws_once(
-                state.inner(),
+                state,
                 "device_workspaces_snapshot",
                 &payload,
                 "device-workspaces",
@@ -34523,7 +34595,7 @@ async fn cloud_mcp_sync_device_workspaces_snapshot(
                 Err(error) => {
                     queued = true;
                     cloud_mcp_enqueue_background_sync(
-                        state.inner(),
+                        state,
                         "device_workspaces_snapshot".to_string(),
                         "device_workspaces_snapshot",
                         payload.clone(),
@@ -53408,6 +53480,23 @@ async fn cloud_mcp_hydrate_workspace_todos(
     workspace_name: Option<String>,
     refs: Value,
 ) -> Result<Value, String> {
+    cloud_mcp_hydrate_workspace_todos_internal(
+        state.inner(),
+        repo_path,
+        workspace_id,
+        workspace_name,
+        refs,
+    )
+    .await
+}
+
+async fn cloud_mcp_hydrate_workspace_todos_internal(
+    state: &CloudMcpState,
+    repo_path: String,
+    workspace_id: Option<String>,
+    workspace_name: Option<String>,
+    refs: Value,
+) -> Result<Value, String> {
     let req = cloud_mcp_repo_request(repo_path, workspace_id, workspace_name);
     let refs_array = cloud_mcp_todo_body_refs_array(&refs);
     if refs_array.is_empty() {
@@ -53464,7 +53553,7 @@ async fn cloud_mcp_hydrate_workspace_todos(
             "workspaceName": req.workspace_name.clone().unwrap_or_default(),
             "refs": misses,
         });
-        let response = cloud_mcp_ws_request(state.inner(), "todo.content", &payload).await?;
+        let response = cloud_mcp_ws_request(state, "todo.content", &payload).await?;
         let data = response.get("data").cloned().unwrap_or(response);
         hydrated_items = data
             .get("items")
@@ -56370,6 +56459,65 @@ mod cloud_mcp_tests {
             cloud_mcp_route_request_url("http://127.0.0.1:8080"),
             "http://127.0.0.1:8080/v1/route"
         );
+    }
+
+    #[test]
+    fn loopspace_trigger_run_normalization_surfaces_public_run_metadata() {
+        let camel = json!({
+            "runId": "internal-run-camel",
+            "loopRunId": "lrun-11111111-1111-4111-8111-111111111111",
+            "source": "trigger-rollup",
+            "status": "running"
+        });
+        let (
+            run_id,
+            _trigger_id,
+            _trigger_type,
+            _status,
+            _created_at_ms,
+            _completed_at_ms,
+            _loopspace_ids,
+            normalized,
+        ) = cloud_mcp_loopspace_trigger_run_normalized_row(&camel)
+            .expect("run identity should still come from runId");
+
+        assert_eq!(run_id, "internal-run-camel");
+        assert_eq!(normalized["id"].as_str(), Some("internal-run-camel"));
+        assert_eq!(
+            normalized["run_id"].as_str(),
+            Some("internal-run-camel")
+        );
+        assert_eq!(normalized["runId"].as_str(), Some("internal-run-camel"));
+        assert_eq!(
+            normalized["loop_run_id"].as_str(),
+            Some("lrun-11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(
+            normalized["loopRunId"].as_str(),
+            Some("lrun-11111111-1111-4111-8111-111111111111")
+        );
+        assert_eq!(normalized["source"].as_str(), Some("trigger-rollup"));
+
+        let snake = json!({
+            "run_id": "internal-run-snake",
+            "loop_run_id": "lrun-22222222-2222-4222-8222-222222222222"
+        });
+        let (_, _, _, _, _, _, _, normalized) =
+            cloud_mcp_loopspace_trigger_run_normalized_row(&snake)
+                .expect("run identity should still come from run_id");
+        assert_eq!(
+            normalized["loop_run_id"].as_str(),
+            Some("lrun-22222222-2222-4222-8222-222222222222")
+        );
+        assert_eq!(
+            normalized["loopRunId"].as_str(),
+            Some("lrun-22222222-2222-4222-8222-222222222222")
+        );
+
+        assert!(cloud_mcp_loopspace_trigger_run_normalized_row(&json!({
+            "loop_run_id": "lrun-33333333-3333-4333-8333-333333333333"
+        }))
+        .is_none());
     }
 
     #[test]

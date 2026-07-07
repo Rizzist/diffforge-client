@@ -1979,6 +1979,147 @@ fn poll_desktop_device_authorization_blocking(device_code: &str) -> Result<Value
     Ok(body)
 }
 
+fn is_safe_desktop_provisioning_token_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_AUTH_VALUE_LENGTH
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
+fn desktop_auth_provisioning_token_file_path_from_env() -> Option<PathBuf> {
+    match env::var("DIFFFORGE_PROVISION_TOKEN_FILE") {
+        Ok(value) => {
+            let path = value.trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(PathBuf::from(path))
+            }
+        }
+        Err(env::VarError::NotUnicode(_)) => {
+            eprintln!(
+                "diffforge auth: ignoring DIFFFORGE_PROVISION_TOKEN_FILE because it is not valid UTF-8."
+            );
+            None
+        }
+        Err(env::VarError::NotPresent) => None,
+    }
+}
+
+fn desktop_auth_provisioning_token_env_has_inline_token() -> bool {
+    match env::var("DIFFFORGE_PROVISION_TOKEN") {
+        Ok(value) => !value.trim().is_empty(),
+        Err(env::VarError::NotUnicode(_)) => true,
+        Err(env::VarError::NotPresent) => false,
+    }
+}
+
+fn desktop_auth_provisioning_token_from_env() -> Option<String> {
+    match env::var("DIFFFORGE_PROVISION_TOKEN") {
+        Ok(value) => {
+            let token = value.trim();
+            if !token.is_empty() {
+                if is_safe_desktop_provisioning_token_value(token) {
+                    return Some(token.to_string());
+                }
+                eprintln!(
+                    "diffforge auth: ignoring DIFFFORGE_PROVISION_TOKEN because the token value is not safe to use."
+                );
+                return None;
+            }
+        }
+        Err(env::VarError::NotUnicode(_)) => {
+            eprintln!(
+                "diffforge auth: ignoring DIFFFORGE_PROVISION_TOKEN because it is not valid UTF-8."
+            );
+            return None;
+        }
+        Err(env::VarError::NotPresent) => {}
+    }
+
+    let path = desktop_auth_provisioning_token_file_path_from_env()?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            eprintln!("diffforge auth: unable to read DIFFFORGE_PROVISION_TOKEN_FILE: {error}");
+            return None;
+        }
+    };
+    let token = raw.trim();
+    if token.is_empty() {
+        return None;
+    }
+    if !is_safe_desktop_provisioning_token_value(token) {
+        eprintln!(
+            "diffforge auth: ignoring DIFFFORGE_PROVISION_TOKEN_FILE because the token value is not safe to use."
+        );
+        return None;
+    }
+    Some(token.to_string())
+}
+
+fn redeem_desktop_provisioning_token_blocking(token: &str) -> Result<Value, String> {
+    if !is_safe_desktop_provisioning_token_value(token) {
+        return Err("Provisioning token is invalid.".to_string());
+    }
+
+    let client = blocking_http_client(Duration::from_secs(
+        DESKTOP_AUTH_PROVISION_REDEEM_TIMEOUT_SECS,
+    ))?;
+    let response = client
+        .post(api_endpoint("desktop/provisioning-tokens/redeem"))
+        .json(&json!({
+            "token": token,
+            "device": desktop_auth_cli_device_metadata("provisioning_token"),
+        }))
+        .send()
+        .map_err(|error| format!("Unable to redeem provisioning token: {error}"))?;
+
+    read_blocking_api_response(response, "Unable to redeem provisioning token.")
+        .map_err(|error| format!("Unable to redeem provisioning token: {error}"))
+}
+
+fn desktop_auth_try_provision_from_environment() -> Result<bool, String> {
+    let Some(token) = desktop_auth_provisioning_token_from_env() else {
+        return Ok(false);
+    };
+
+    // "Already authenticated" must mean a session the cloud still accepts —
+    // a fleet box holding a revoked/expired session plus a fresh provisioning
+    // token is exactly the reprovision case. Only a validated session skips
+    // the redeem (and preserves the single-use token).
+    let current = desktop_auth_cli_read_snapshot();
+    if current.get("status").and_then(Value::as_str) == Some("authenticated") {
+        let stored_token = current
+            .get("token")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !stored_token.is_empty() && validate_desktop_session_blocking(stored_token).is_ok() {
+            return Ok(false);
+        }
+        eprintln!(
+            "diffforge auth: stored session no longer validates; redeeming provisioning token."
+        );
+    }
+
+    let token_file = if desktop_auth_provisioning_token_env_has_inline_token() {
+        None
+    } else {
+        desktop_auth_provisioning_token_file_path_from_env()
+    };
+
+    let session = redeem_desktop_provisioning_token_blocking(&token)?;
+    // The token is consumed server-side the moment the redeem succeeds —
+    // clear the file before anything else can fail, or the next boot
+    // re-redeems a burned token and loops on access_denied.
+    if let Some(path) = token_file {
+        let _ = fs::write(path, "");
+    }
+    desktop_auth_cli_snapshot_from_session(session)?;
+    Ok(true)
+}
+
 fn validate_desktop_session_blocking(token: &str) -> Result<Value, String> {
     validate_auth_value("Desktop session", token)?;
 
@@ -2349,23 +2490,113 @@ fn desktop_auth_cli_login(args: &[String]) -> i32 {
     1
 }
 
+fn desktop_auth_cli_provision(args: &[String]) -> i32 {
+    let mut token_arg: Option<String> = None;
+    let mut force = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--token" => {
+                let Some(value) = args.get(index + 1) else {
+                    eprintln!("Missing value for --token.");
+                    return 1;
+                };
+                token_arg = Some(value.clone());
+                index += 2;
+            }
+            "--force" => {
+                force = true;
+                index += 1;
+            }
+            "--help" | "-h" => {
+                desktop_auth_cli_help();
+                return 0;
+            }
+            other => {
+                eprintln!("Unknown auth provision option: {other}");
+                return 1;
+            }
+        }
+    }
+
+    // Provisioning tokens are single-use: redeeming while a valid session
+    // exists burns the token and replaces the session for nothing.
+    if !force {
+        let current = desktop_auth_cli_read_snapshot();
+        if current.get("status").and_then(Value::as_str) == Some("authenticated") {
+            let stored_token = current
+                .get("token")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !stored_token.is_empty() && validate_desktop_session_blocking(stored_token).is_ok() {
+                eprintln!(
+                    "Already signed in as {}. Pass --force to redeem the provisioning token anyway (it is single-use and will replace this session).",
+                    desktop_auth_cli_user_label(&current)
+                );
+                return 1;
+            }
+        }
+    }
+
+    let token = match token_arg {
+        Some(value) => {
+            let token = value.trim().to_string();
+            if is_safe_desktop_provisioning_token_value(&token) {
+                token
+            } else {
+                eprintln!("Provisioning token is invalid.");
+                return 1;
+            }
+        }
+        None => match desktop_auth_provisioning_token_from_env() {
+            Some(token) => token,
+            None => {
+                eprintln!(
+                    "No provisioning token provided. Pass --token or set DIFFFORGE_PROVISION_TOKEN / DIFFFORGE_PROVISION_TOKEN_FILE."
+                );
+                return 1;
+            }
+        },
+    };
+
+    match redeem_desktop_provisioning_token_blocking(&token)
+        .and_then(desktop_auth_cli_snapshot_from_session)
+    {
+        Ok(snapshot) => {
+            println!(
+                "Provisioned desktop session for {}.",
+                desktop_auth_cli_user_label(&snapshot)
+            );
+            0
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            1
+        }
+    }
+}
+
 fn desktop_auth_cli_help() {
     println!("Diff Forge authentication");
     println!();
     println!("Usage:");
     println!("  diffforge auth login [--force]");
+    println!("  diffforge auth provision [--token <token>] [--force]");
     println!("  diffforge auth status");
     println!("  diffforge auth logout");
     println!("  diffforge auth help");
     println!();
     println!("`auth login` works in GUI and headless terminals. It prints a device code");
     println!("that can be approved from any signed-in browser at https://diffforge.ai/device.");
+    println!("`auth provision` redeems a provisioning token from --token,");
+    println!("DIFFFORGE_PROVISION_TOKEN, or DIFFFORGE_PROVISION_TOKEN_FILE.");
 }
 
 pub fn run_desktop_auth_cli(args: &[String]) -> i32 {
     let command = args.first().map(String::as_str).unwrap_or("help");
     match command {
         "login" => desktop_auth_cli_login(&args[1..]),
+        "provision" => desktop_auth_cli_provision(&args[1..]),
         "status" => desktop_auth_cli_status(),
         "logout" | "signout" | "sign-out" => desktop_auth_cli_logout(),
         "help" | "--help" | "-h" => {

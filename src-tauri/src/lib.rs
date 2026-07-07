@@ -53,7 +53,11 @@ const STARTUP_LAUNCH_MODE_BACKGROUND: &str = "background";
 const STARTUP_BACKGROUND_ARG: &str = "--background-startup";
 
 fn api_base_url() -> String {
-    DEFAULT_API_BASE_URL.to_string()
+    env::var("DIFFFORGE_API_BASE_URL")
+        .ok()
+        .map(|value| value.trim().trim_end_matches('/').to_string())
+        .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+        .unwrap_or_else(|| DEFAULT_API_BASE_URL.to_string())
 }
 
 fn api_endpoint(path: &str) -> String {
@@ -80,6 +84,7 @@ const SESSION_VALIDATE_TIMEOUT_SECS: u64 = 5;
 const LOGOUT_TIMEOUT_SECS: u64 = 5;
 const DEVICE_AUTH_START_TIMEOUT_SECS: u64 = 10;
 const DEVICE_AUTH_POLL_TIMEOUT_SECS: u64 = 10;
+const DESKTOP_AUTH_PROVISION_REDEEM_TIMEOUT_SECS: u64 = 10;
 const AGENT_STATUS_TIMEOUT_SECS: u64 = 6;
 const AGENT_UPDATE_CHECK_TIMEOUT_SECS: u64 = 3;
 // Coding-agent npm packages ship multi-hundred-MB native binaries (Claude
@@ -169,6 +174,10 @@ const APP_CLOSE_DESTROY_FALLBACK_DELAY_MS: u64 = 250;
 const APP_CLOSE_PROCESS_EXIT_FALLBACK_DELAY_MS: u64 = 1_500;
 const APP_CLOSE_FORCE_EXIT_FALLBACK_DELAY_MS: u64 = 45_000;
 const APP_SHUTDOWN_LIFECYCLE_LOCK_TIMEOUT_SECS: u64 = 10;
+const WORKSPACE_ACTIVATE_TERMINAL_READY_TIMEOUT_SECS: u64 = 20;
+const WORKSPACE_ACTIVATE_TERMINAL_READY_POLL_MS: u64 = 250;
+const WORKSPACE_ACTIVATE_DEFAULT_TERMINAL_COUNT: usize = 1;
+const WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT: usize = 24;
 const WORKSPACE_DEACTIVATE_TERMINAL_TIMEOUT_SECS: u64 = 25;
 const TERMINAL_CLOSE_ALL_LIFECYCLE_TIMEOUT_SECS: u64 = 25;
 const APP_SHUTDOWN_PHASE_RUNNING: u8 = 0;
@@ -2717,6 +2726,7 @@ include!("agent_sessions.rs");
 include!("agent_chat_sync.rs");
 include!("terminals.rs");
 include!("swarm_runtime.rs");
+include!("orchestrator_pool.rs");
 include!("tools_window.rs");
 include!("web_panel.rs");
 include!("api.rs");
@@ -3684,6 +3694,1639 @@ mod app_shutdown_tests {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceActivationWorkspace {
+    id: String,
+    name: String,
+    root: String,
+    root_was_empty_at_selection: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkspaceActivationTerminalDescriptor {
+    terminal_index: u16,
+    role: String,
+    pane_id: String,
+    slot_key: String,
+    thread_id: Option<String>,
+    provider: Option<String>,
+    provider_session_id: Option<String>,
+    fork_from_provider_session_id: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    speed: Option<String>,
+    permission_mode: Option<String>,
+    working_directory: String,
+    terminal_name: Option<String>,
+    terminal_nickname: Option<String>,
+    plain_shell: bool,
+}
+
+struct WorkspaceActivationSpawnResult {
+    descriptor: WorkspaceActivationTerminalDescriptor,
+    open_result: Option<TerminalOpenResult>,
+    error: Option<String>,
+    // Pane was already live in TerminalState — kept as-is, not respawned.
+    adopted: bool,
+}
+
+fn workspace_activation_log(phase: &str, fields: Value) {
+    write_workspace_activation_diagnostic_log_entry(json!({
+        "ts_ms": current_time_ms(),
+        "phase": clean_terminal_diagnostic_log_text(phase),
+        "source": "backend",
+        "app_pid": std::process::id(),
+        "thread": terminal_diagnostic_thread_label(),
+        "fields": fields,
+    }));
+}
+
+fn workspace_activation_text(value: &Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .and_then(|value| match value {
+            Value::String(text) => Some(text.trim().to_string()),
+            Value::Number(number) => Some(number.to_string()),
+            Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        })
+        .filter(|value| !value.is_empty())
+}
+
+fn workspace_activation_bool(value: &Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .and_then(|value| match value {
+            Value::Bool(value) => Some(*value),
+            Value::String(text) => match text.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" => Some(true),
+                "0" | "false" | "no" | "off" => Some(false),
+                _ => None,
+            },
+            Value::Number(number) => Some(number.as_i64().unwrap_or_default() != 0),
+            _ => None,
+        })
+}
+
+fn workspace_activation_usize(value: &Value, keys: &[&str]) -> Option<usize> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_u64().map(|value| value as usize),
+            Value::String(text) => text.trim().parse::<usize>().ok(),
+            _ => None,
+        })
+}
+
+fn workspace_activation_i64(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_i64(),
+            Value::String(text) => text.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+}
+
+fn workspace_activation_nested_text(value: &Value, paths: &[&[&str]]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        let mut cursor = value;
+        for key in *path {
+            cursor = cursor.get(*key)?;
+        }
+        match cursor {
+            Value::String(text) => Some(text.trim().to_string()),
+            Value::Number(number) => Some(number.to_string()),
+            Value::Bool(value) => Some(value.to_string()),
+            _ => None,
+        }
+        .filter(|value| !value.is_empty())
+    })
+}
+
+fn workspace_activation_clean_role(value: Option<&str>) -> String {
+    let normalized = value
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '_'], "-");
+    match normalized.as_str() {
+        "claude-code" | "claudecode" => "claude".to_string(),
+        "open-code" | "open-code-ai" | "opencode-ai" => "opencode".to_string(),
+        "terminal" | "shell" | "plain-shell" | "plain_shell" => "generic".to_string(),
+        "claude" | "codex" | "generic" | "opencode" => normalized,
+        _ => "codex".to_string(),
+    }
+}
+
+fn workspace_activation_agent_id_for_role(role: &str) -> String {
+    if role.trim().is_empty() {
+        "agent".to_string()
+    } else {
+        workspace_activation_clean_role(Some(role))
+    }
+}
+
+fn workspace_activation_agent_label(role: &str) -> String {
+    match workspace_activation_clean_role(Some(role)).as_str() {
+        "claude" => "Claude Code".to_string(),
+        "codex" => "Codex".to_string(),
+        "generic" => "Terminal".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        other => other.to_string(),
+    }
+}
+
+// Mirrors the webview's getSafePaneToken (threadRuntime.js): invalid chars
+// map to '-', capped at 48 — pane ids must match byte-for-byte or the GUI
+// duplicates instead of adopting, and validate_terminal_pane_id rejects
+// anything outside [A-Za-z0-9_:-].
+fn workspace_activation_safe_workspace_token(workspace_id: &str) -> String {
+    let token = workspace_id
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .take(48)
+        .collect::<String>();
+    if token.is_empty() {
+        "workspace".to_string()
+    } else {
+        token
+    }
+}
+
+fn workspace_activation_default_pane_id(
+    workspace_id: &str,
+    terminal_index: usize,
+    role: &str,
+) -> String {
+    format!(
+        "workspace-terminal-{}-{}-{}",
+        workspace_activation_safe_workspace_token(workspace_id),
+        terminal_index,
+        workspace_activation_agent_id_for_role(role)
+    )
+}
+
+fn workspace_activation_clean_permission_mode(value: Option<&str>, role: &str) -> Option<String> {
+    if workspace_activation_clean_role(Some(role)) == "generic" {
+        return None;
+    }
+    let normalized = value
+        .unwrap_or("accept_edits")
+        .trim()
+        .to_ascii_lowercase()
+        .replace([' ', '-'], "_");
+    let permission = match normalized.as_str() {
+        "" | "accept" | "accept_edits" | "accept_edits_automatically" => "accept_edits",
+        "ask" | "ask_each_time" | "ask_before_editing" => "ask",
+        "bypass" | "bypass_permissions" | "bypasspermissions" => "bypass_permissions",
+        _ => "accept_edits",
+    };
+    Some(permission.to_string())
+}
+
+// Array-form settings (terminalRoles, agentPermissions) are persisted by the
+// webview POSITIONALLY aligned to logicalTerminalIndexes (see AppShell's
+// expandTerminalRolesForSlotIndexes), so arrays are read by list position;
+// object-form settings are keyed by the slot index itself.
+fn workspace_activation_setting_for_index<'a>(
+    value: &'a Value,
+    slot_index: usize,
+    position: usize,
+    keys: &[&str],
+) -> Option<&'a Value> {
+    for key in keys {
+        let Some(candidate) = value.get(*key) else {
+            continue;
+        };
+        if let Some(array) = candidate.as_array() {
+            if let Some(item) = array.get(position) {
+                return Some(item);
+            }
+        }
+        if let Some(object) = candidate.as_object() {
+            let key = slot_index.to_string();
+            if let Some(item) = object.get(&key) {
+                return Some(item);
+            }
+        }
+    }
+    None
+}
+
+fn workspace_activation_role_for_index(settings: &Value, slot_index: usize, position: usize) -> String {
+    workspace_activation_setting_for_index(
+        settings,
+        slot_index,
+        position,
+        &["terminalRoles", "terminal_roles"],
+    )
+    .and_then(|value| match value {
+        Value::String(text) => Some(text.as_str()),
+        _ => None,
+    })
+    .map(|value| workspace_activation_clean_role(Some(value)))
+    .unwrap_or_else(|| "codex".to_string())
+}
+
+fn workspace_activation_permission_for_index(
+    settings: &Value,
+    slot_index: usize,
+    position: usize,
+    role: &str,
+) -> Option<String> {
+    let raw = workspace_activation_setting_for_index(
+        settings,
+        slot_index,
+        position,
+        &["agentPermissions", "agent_permissions", "permissionModes", "permission_modes"],
+    )
+    .and_then(|value| match value {
+        Value::String(text) => Some(text.as_str()),
+        Value::Object(object) => object
+            .get("permissionMode")
+            .or_else(|| object.get("permission_mode"))
+            .or_else(|| object.get("mode"))
+            .and_then(Value::as_str),
+        _ => None,
+    });
+    workspace_activation_clean_permission_mode(raw, role)
+}
+
+fn workspace_activation_pane_kind(value: Option<&Value>) -> Option<String> {
+    let raw = value.and_then(|value| match value {
+        Value::String(text) => Some(text.trim().to_ascii_lowercase()),
+        Value::Object(_) => workspace_activation_text(
+            value,
+            &["kind", "paneKind", "pane_kind", "type", "surfaceKind", "surface_kind"],
+        )
+        .map(|value| value.to_ascii_lowercase()),
+        _ => None,
+    })?;
+    let normalized = raw.replace([' ', '_'], "-");
+    match normalized.as_str() {
+        "terminal" | "agent" | "" => None,
+        "web" | "browser" | "web-tab" => Some("web".to_string()),
+        "pcb" | "circuit" => Some("pcb".to_string()),
+        "vm" | "sandbox" => Some("vm".to_string()),
+        "video" | "video-editor" => Some("video".to_string()),
+        "swarm" | "swarm-panel" => Some("swarm".to_string()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn workspace_activation_pane_records(settings: &Value) -> HashMap<usize, Value> {
+    let mut records = HashMap::new();
+    for key in ["panes", "workspacePanes", "workspace_panes"] {
+        let Some(value) = settings.get(key) else {
+            continue;
+        };
+        if let Some(array) = value.as_array() {
+            for (fallback_index, item) in array.iter().enumerate() {
+                let index = workspace_activation_i64(
+                    item,
+                    &["logicalIndex", "logical_index", "terminalIndex", "terminal_index", "slotIndex", "slot_index", "index"],
+                )
+                .and_then(|value| (value >= 0).then_some(value as usize))
+                .unwrap_or(fallback_index);
+                records.insert(index, item.clone());
+            }
+        } else if let Some(object) = value.as_object() {
+            for (key, item) in object {
+                if let Ok(index) = key.parse::<usize>() {
+                    records.insert(index, item.clone());
+                }
+            }
+        }
+    }
+    records
+}
+
+fn workspace_activation_panel_indexes(settings: &Value) -> HashMap<usize, String> {
+    let mut indexes = HashMap::new();
+    for key in ["paneKinds", "pane_kinds", "panelKinds", "panel_kinds"] {
+        let Some(value) = settings.get(key) else {
+            continue;
+        };
+        if let Some(object) = value.as_object() {
+            for (key, item) in object {
+                let Ok(index) = key.parse::<usize>() else {
+                    continue;
+                };
+                if let Some(kind) = workspace_activation_pane_kind(Some(item)) {
+                    indexes.insert(index, kind);
+                }
+            }
+        } else if let Some(array) = value.as_array() {
+            for (index, item) in array.iter().enumerate() {
+                if let Some(kind) = workspace_activation_pane_kind(Some(item)) {
+                    indexes.insert(index, kind);
+                }
+            }
+        }
+    }
+    for (index, record) in workspace_activation_pane_records(settings) {
+        if let Some(kind) = workspace_activation_pane_kind(Some(&record)) {
+            indexes.insert(index, kind);
+        }
+    }
+    indexes
+}
+
+fn workspace_activation_terminal_count(settings: Option<&Value>) -> usize {
+    let Some(settings) = settings else {
+        return WORKSPACE_ACTIVATE_DEFAULT_TERMINAL_COUNT;
+    };
+    if let Some(count) =
+        workspace_activation_usize(settings, &["terminalCount", "terminal_count", "terminals"])
+    {
+        return count.min(WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT);
+    }
+    if let Some(array) = settings
+        .get("terminalRoles")
+        .or_else(|| settings.get("terminal_roles"))
+        .and_then(Value::as_array)
+    {
+        return array.len().min(WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT);
+    }
+    if let Some(array) = settings
+        .get("logicalTerminalIndexes")
+        .or_else(|| settings.get("logical_terminal_indexes"))
+        .and_then(Value::as_array)
+    {
+        return array.len().min(WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT);
+    }
+    if workspace_activation_text(settings, &["rootDirectory", "root_directory"])
+        .is_some()
+    {
+        return 0;
+    }
+    WORKSPACE_ACTIVATE_DEFAULT_TERMINAL_COUNT
+}
+
+// Returns (slot_index, position) pairs. Position is the index within the
+// UNFILTERED logical list (panels included) — the webview persists the
+// positional arrays (terminalRoles, agentPermissions) aligned to the full
+// logicalTerminalIndexes list, before panel slots are filtered out.
+fn workspace_activation_terminal_indexes(
+    settings: Option<&Value>,
+    terminal_count: usize,
+) -> Vec<(usize, usize)> {
+    let Some(settings) = settings else {
+        return (0..terminal_count).map(|index| (index, index)).collect();
+    };
+    let panels = workspace_activation_panel_indexes(settings);
+    let mut indexes = Vec::new();
+    if let Some(array) = settings
+        .get("logicalTerminalIndexes")
+        .or_else(|| settings.get("logical_terminal_indexes"))
+        .and_then(Value::as_array)
+    {
+        for item in array {
+            let index = match item {
+                Value::Number(number) => number.as_i64(),
+                Value::String(text) => text.trim().parse::<i64>().ok(),
+                Value::Object(_) => workspace_activation_i64(
+                    item,
+                    &["logicalIndex", "logical_index", "terminalIndex", "terminal_index", "slotIndex", "slot_index", "index"],
+                ),
+                _ => None,
+            };
+            if let Some(index) = index.filter(|value| *value >= 0).map(|value| value as usize) {
+                if !indexes.contains(&index) {
+                    indexes.push(index);
+                }
+            }
+        }
+    } else {
+        let pane_records = workspace_activation_pane_records(settings);
+        if !pane_records.is_empty() || !panels.is_empty() {
+            let mut configured = pane_records.keys().copied().collect::<Vec<_>>();
+            configured.extend(panels.keys().copied());
+            configured.sort_unstable();
+            configured.dedup();
+            indexes = configured;
+        }
+    }
+    if indexes.is_empty() {
+        indexes = (0..terminal_count).collect();
+    }
+    indexes
+        .into_iter()
+        .enumerate()
+        .map(|(position, index)| (index, position))
+        .filter(|(index, _)| !panels.contains_key(index))
+        .take(WORKSPACE_ACTIVATE_MAX_TERMINAL_COUNT)
+        .collect()
+}
+
+fn workspace_activation_thread_for_index<'a>(
+    threads_state: &'a Value,
+    terminal_index: usize,
+) -> Option<&'a Value> {
+    let terminal_index_key = terminal_index.to_string();
+    if let Some(thread_id) = threads_state
+        .get("terminalThreadIds")
+        .or_else(|| threads_state.get("terminal_thread_ids"))
+        .and_then(|value| value.get(&terminal_index_key))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        if let Some(thread) = threads_state
+            .get("threads")
+            .and_then(Value::as_object)
+            .and_then(|threads| threads.get(thread_id))
+        {
+            return Some(thread);
+        }
+    }
+    threads_state
+        .get("threads")
+        .and_then(Value::as_object)
+        .and_then(|threads| {
+            threads.values().find(|thread| {
+                workspace_activation_i64(
+                    thread,
+                    &["terminalIndex", "terminal_index", "logicalIndex", "logical_index"],
+                )
+                .is_some_and(|value| value == terminal_index as i64)
+            })
+        })
+}
+
+fn workspace_activation_terminal_record_for_index<'a>(
+    threads_state: &'a Value,
+    terminal_index: usize,
+) -> Option<&'a Value> {
+    let key = terminal_index.to_string();
+    threads_state
+        .get("terminals")
+        .and_then(Value::as_object)
+        .and_then(|terminals| terminals.get(&key))
+}
+
+fn workspace_activation_provider_binding<'a>(thread: &'a Value, role: &str) -> Option<&'a Value> {
+    let role = workspace_activation_clean_role(Some(role));
+    thread
+        .get("providerBindings")
+        .or_else(|| thread.get("provider_bindings"))
+        .and_then(Value::as_object)
+        .and_then(|bindings| {
+            bindings
+                .get(&role)
+                .or_else(|| bindings.get(&workspace_activation_agent_id_for_role(&role)))
+        })
+}
+
+fn workspace_activation_descriptor_from_sources(
+    workspace: &WorkspaceActivationWorkspace,
+    settings: Option<&Value>,
+    threads_state: &Value,
+    terminal_index: usize,
+    position: usize,
+) -> WorkspaceActivationTerminalDescriptor {
+    let empty_settings = Value::Object(serde_json::Map::new());
+    let settings = settings.unwrap_or(&empty_settings);
+    let role = workspace_activation_role_for_index(settings, terminal_index, position);
+    let plain_shell = role == "generic";
+    let terminal_record = workspace_activation_terminal_record_for_index(threads_state, terminal_index);
+    let thread = workspace_activation_thread_for_index(threads_state, terminal_index);
+    let binding = thread.and_then(|thread| workspace_activation_provider_binding(thread, &role));
+    let pane_record = workspace_activation_pane_records(settings).remove(&terminal_index);
+    let pane_id = pane_record
+        .as_ref()
+        .and_then(|value| {
+            workspace_activation_text(
+                value,
+                &["paneId", "pane_id", "panelId", "panel_id", "terminalId", "terminal_id", "id"],
+            )
+        })
+        .or_else(|| {
+            binding.and_then(|value| {
+                workspace_activation_text(
+                    value,
+                    &["paneId", "pane_id", "terminalId", "terminal_id", "targetTerminalId", "target_terminal_id"],
+                )
+            })
+        })
+        .or_else(|| {
+            thread.and_then(|value| {
+                workspace_activation_nested_text(
+                    value,
+                    &[
+                        &["terminalBinding", "paneId"],
+                        &["terminalBinding", "pane_id"],
+                        &["terminal_binding", "paneId"],
+                        &["terminal_binding", "pane_id"],
+                    ],
+                )
+                .or_else(|| {
+                    workspace_activation_text(
+                        value,
+                        &["paneId", "pane_id", "terminalId", "terminal_id"],
+                    )
+                })
+            })
+        })
+        .or_else(|| {
+            terminal_record.and_then(|value| {
+                workspace_activation_text(
+                    value,
+                    &["paneId", "pane_id", "terminalId", "terminal_id", "targetTerminalId", "target_terminal_id"],
+                )
+            })
+        })
+        .unwrap_or_else(|| workspace_activation_default_pane_id(&workspace.id, terminal_index, &role));
+    let slot_key = pane_record
+        .as_ref()
+        .and_then(|value| workspace_activation_text(value, &["slotKey", "slot_key"]))
+        .or_else(|| {
+            binding.and_then(|value| workspace_activation_text(value, &["slotKey", "slot_key"]))
+        })
+        .or_else(|| {
+            terminal_record.and_then(|value| workspace_activation_text(value, &["slotKey", "slot_key"]))
+        })
+        .unwrap_or_else(|| (terminal_index + 1).to_string());
+    let thread_id = thread
+        .and_then(|value| workspace_activation_text(value, &["id", "threadId", "thread_id"]))
+        .or_else(|| {
+            terminal_record
+                .and_then(|value| workspace_activation_text(value, &["threadId", "thread_id"]))
+        });
+    let provider = if plain_shell {
+        None
+    } else {
+        binding
+            .and_then(|value| workspace_activation_text(value, &["provider", "agentId", "agent_id"]))
+            .map(|value| workspace_activation_clean_role(Some(&value)))
+            .or_else(|| Some(role.clone()))
+    };
+    let provider_session_id = binding
+        .and_then(|value| {
+            workspace_activation_text(
+                value,
+                &[
+                    "providerSessionId",
+                    "provider_session_id",
+                    "nativeSessionId",
+                    "native_session_id",
+                    "sessionId",
+                    "session_id",
+                ],
+            )
+        })
+        .or_else(|| {
+            thread.and_then(|value| {
+                workspace_activation_text(
+                    value,
+                    &["providerSessionId", "provider_session_id", "nativeSessionId", "native_session_id", "transcriptSessionId", "transcript_session_id"],
+                )
+            })
+        })
+        .or_else(|| {
+            terminal_record.and_then(|value| {
+                workspace_activation_text(
+                    value,
+                    &["providerSessionId", "provider_session_id", "nativeSessionId", "native_session_id", "sessionId", "session_id"],
+                )
+            })
+        })
+        .filter(|_| !plain_shell);
+    let fork_from_provider_session_id = binding
+        .and_then(|value| {
+            workspace_activation_text(
+                value,
+                &["forkFromProviderSessionId", "fork_from_provider_session_id"],
+            )
+        })
+        .filter(|_| !plain_shell);
+    let model = binding
+        .and_then(|value| workspace_activation_text(value, &["modelId", "model_id", "model"]))
+        .or_else(|| {
+            terminal_record.and_then(|value| {
+                workspace_activation_text(value, &["model", "modelId", "model_id", "currentModel", "current_model"])
+            })
+        });
+    let reasoning_effort = binding
+        .and_then(|value| {
+            workspace_activation_text(
+                value,
+                &["reasoningEffort", "reasoning_effort", "effort", "thinkingPower", "thinking_power"],
+            )
+        })
+        .or_else(|| {
+            terminal_record.and_then(|value| {
+                workspace_activation_text(
+                    value,
+                    &["reasoningEffort", "reasoning_effort", "currentEffort", "current_effort"],
+                )
+            })
+        });
+    let speed = binding
+        .and_then(|value| workspace_activation_text(value, &["speed", "serviceTier", "service_tier"]))
+        .or_else(|| {
+            terminal_record.and_then(|value| {
+                workspace_activation_text(value, &["speed", "serviceTier", "service_tier"])
+            })
+        });
+    let permission_mode =
+        workspace_activation_permission_for_index(settings, terminal_index, position, &role);
+    let working_directory = binding
+        .and_then(|value| {
+            workspace_activation_text(
+                value,
+                &["workingDirectory", "working_directory", "cwd", "repoPath", "repo_path"],
+            )
+        })
+        .or_else(|| {
+            terminal_record.and_then(|value| {
+                workspace_activation_text(
+                    value,
+                    &["workingDirectory", "working_directory", "cwd", "repoPath", "repo_path"],
+                )
+            })
+        })
+        .or_else(|| {
+            thread.and_then(|value| {
+                workspace_activation_nested_text(
+                    value,
+                    &[
+                        &["coordination", "worktreePath"],
+                        &["coordination", "worktree_path"],
+                        &["worktree", "path"],
+                        &["worktree", "root"],
+                    ],
+                )
+                .or_else(|| {
+                    workspace_activation_text(
+                        value,
+                        &["workingDirectory", "working_directory", "cwd", "repoPath", "repo_path"],
+                    )
+                })
+            })
+        })
+        .unwrap_or_else(|| workspace.root.clone());
+    let terminal_name = terminal_record
+        .and_then(|value| {
+            workspace_activation_text(
+                value,
+                &["terminalName", "terminal_name", "displayName", "display_name", "name"],
+            )
+        })
+        .or_else(|| thread.and_then(|value| workspace_activation_text(value, &["title", "sessionName", "session_name"])))
+        .or_else(|| Some(workspace_activation_agent_label(&role)));
+    let terminal_nickname = terminal_record
+        .and_then(|value| {
+            workspace_activation_text(
+                value,
+                &[
+                    "terminalNickname",
+                    "terminal_nickname",
+                    "nickname",
+                    "terminalName",
+                    "terminal_name",
+                    "displayName",
+                    "display_name",
+                ],
+            )
+        })
+        .or_else(|| terminal_name.clone());
+    WorkspaceActivationTerminalDescriptor {
+        terminal_index: terminal_index.min(u16::MAX as usize) as u16,
+        role,
+        pane_id,
+        slot_key,
+        thread_id,
+        provider,
+        provider_session_id,
+        fork_from_provider_session_id,
+        model,
+        reasoning_effort,
+        speed,
+        permission_mode,
+        working_directory,
+        terminal_name,
+        terminal_nickname,
+        plain_shell,
+    }
+}
+
+fn workspace_activation_terminal_descriptors_from_values(
+    workspace: &WorkspaceActivationWorkspace,
+    settings: Option<&Value>,
+    threads_state: &Value,
+) -> Vec<WorkspaceActivationTerminalDescriptor> {
+    let terminal_count = workspace_activation_terminal_count(settings);
+    workspace_activation_terminal_indexes(settings, terminal_count)
+        .into_iter()
+        .map(|(index, position)| {
+            workspace_activation_descriptor_from_sources(
+                workspace,
+                settings,
+                threads_state,
+                index,
+                position,
+            )
+        })
+        .collect()
+}
+
+fn workspace_activation_catalog_entry_text(entry: &Value, keys: &[&str]) -> Option<String> {
+    workspace_activation_text(entry, keys)
+}
+
+fn workspace_activation_settings_for_workspace<'a>(
+    settings: &'a Value,
+    workspace_id: &str,
+) -> Option<&'a Value> {
+    settings.get(workspace_id).filter(|value| value.is_object())
+}
+
+fn workspace_activation_find_workspace_catalog_entry(
+    app: &AppHandle,
+    workspace_id: &str,
+    workspace_settings: &Value,
+) -> Result<Option<Value>, String> {
+    let catalog_dir = local_workspace_store_dir(app)?;
+    if !catalog_dir.exists() {
+        return Ok(None);
+    }
+    let entries = fs::read_dir(&catalog_dir).map_err(|error| {
+        format!(
+            "Unable to read workspace catalog directory {}: {error}",
+            catalog_dir.display()
+        )
+    })?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(items) = local_workspace_catalog_read_items_from_path(&path) else {
+            continue;
+        };
+        for item in local_workspace_catalog_visible_items(items) {
+            let id = local_workspace_catalog_entry_id(&item);
+            if id.as_deref() == Some(workspace_id) {
+                let mut item = item;
+                if let Some(root) = local_workspace_catalog_root_text(&item, workspace_settings) {
+                    if let Some(object) = item.as_object_mut() {
+                        object.insert("rootDirectory".to_string(), json!(root));
+                    }
+                }
+                return Ok(Some(item));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn workspace_activation_resolve_workspace(
+    app: &AppHandle,
+    workspace_id: &str,
+    workspace_settings: &Value,
+) -> Result<WorkspaceActivationWorkspace, String> {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() {
+        return Err("Workspace activation requires a workspace id.".to_string());
+    }
+    let settings = workspace_activation_settings_for_workspace(workspace_settings, workspace_id);
+    let catalog_entry =
+        workspace_activation_find_workspace_catalog_entry(app, workspace_id, workspace_settings)?;
+    let root = catalog_entry
+        .as_ref()
+        .and_then(|entry| workspace_activation_catalog_entry_text(entry, &["rootDirectory", "root_directory", "root", "path", "repoPath", "repo_path"]))
+        .or_else(|| {
+            settings.and_then(|settings| {
+                workspace_activation_text(
+                    settings,
+                    &["rootDirectory", "root_directory", "root", "path", "repoPath", "repo_path"],
+                )
+            })
+        })
+        .ok_or_else(|| format!("Unknown workspace: {workspace_id}"))?;
+    let resolved = resolve_workspace_root_directory(Some(&root))?;
+    if !resolved.is_dir() {
+        return Err(format!(
+            "Workspace root does not exist on disk: {}",
+            resolved.display()
+        ));
+    }
+    let name = catalog_entry
+        .as_ref()
+        .and_then(|entry| {
+            workspace_activation_catalog_entry_text(
+                entry,
+                &["name", "workspaceName", "workspace_name", "label", "title"],
+            )
+        })
+        .or_else(|| {
+            settings.and_then(|settings| {
+                workspace_activation_text(
+                    settings,
+                    &["name", "workspaceName", "workspace_name", "label", "title"],
+                )
+            })
+        })
+        .unwrap_or_else(|| workspace_id.to_string());
+    let root_was_empty_at_selection = settings
+        .and_then(|settings| {
+            workspace_activation_bool(
+                settings,
+                &["rootWasEmptyAtSelection", "root_was_empty_at_selection"],
+            )
+        })
+        .unwrap_or(false);
+    Ok(WorkspaceActivationWorkspace {
+        id: workspace_id.to_string(),
+        name,
+        root: workspace_path_display(&resolved),
+        root_was_empty_at_selection,
+    })
+}
+
+fn workspace_activation_remote_intent_clear_if_matching(
+    app: &AppHandle,
+    workspace_id: &str,
+) -> Result<(), String> {
+    let remote_intents = app_local_state_read(app, "remote-intents");
+    let pending = workspace_activation_text(
+        &remote_intents,
+        &["pendingActivationWorkspaceId", "pending_activation_workspace_id"],
+    );
+    if pending.as_deref() != Some(workspace_id) {
+        return Ok(());
+    }
+    let patch = json!({
+        "pendingActivationWorkspaceId": null,
+        "pending_activation_workspace_id": null,
+        "pendingActivationReason": null,
+        "pending_activation_reason": null,
+        "pendingActivationAtMs": null,
+        "pending_activation_at_ms": null,
+        "pendingActivationSelectWorkspace": null,
+        "pending_activation_select_workspace": null,
+        "pendingActivationWorkspaceTab": null,
+        "pending_activation_workspace_tab": null,
+    });
+    app_local_state_merge(
+        app,
+        "remote-intents",
+        &patch,
+    )?;
+    Ok(())
+}
+
+async fn workspace_activation_threads_state(
+    workspace_id: &str,
+    root: &str,
+) -> Result<Value, String> {
+    let result = workspace_threads_read(WorkspaceThreadsReadRequest {
+        workspaces: vec![WorkspaceThreadsReadWorkspace {
+            workspace_id: workspace_id.to_string(),
+            root_directory: Some(root.to_string()),
+        }],
+    })
+    .await?;
+    Ok(result
+        .threads
+        .get(workspace_id)
+        .cloned()
+        .unwrap_or_else(|| json!({})))
+}
+
+fn workspace_activation_terminal_request(
+    workspace: &WorkspaceActivationWorkspace,
+    descriptor: &WorkspaceActivationTerminalDescriptor,
+) -> TerminalOpenRequest {
+    let role = workspace_activation_clean_role(Some(&descriptor.role));
+    let kind = if descriptor.plain_shell {
+        "shell".to_string()
+    } else {
+        role.clone()
+    };
+    TerminalOpenRequest {
+        pane_id: descriptor.pane_id.clone(),
+        instance_id: None,
+        kind,
+        agent_id: Some(role.clone()),
+        agent_kind: Some(role),
+        provider: descriptor.provider.clone(),
+        provider_session_id: descriptor.provider_session_id.clone(),
+        fork_from_provider_session_id: descriptor.fork_from_provider_session_id.clone(),
+        model: descriptor.model.clone(),
+        reasoning_effort: descriptor.reasoning_effort.clone(),
+        speed: descriptor.speed.clone(),
+        permission_mode: descriptor.permission_mode.clone(),
+        plain_shell: Some(descriptor.plain_shell),
+        fresh_session: Some(false),
+        preserve_coordination_session: Some(true),
+        session_mode: Some("general".to_string()),
+        slot_key: Some(descriptor.slot_key.clone()),
+        terminal_index: Some(descriptor.terminal_index),
+        thread_id: descriptor.thread_id.clone(),
+        working_directory: Some(descriptor.working_directory.clone()),
+        workspace_root_was_empty_at_selection: Some(workspace.root_was_empty_at_selection),
+        project_root: None,
+        mount_id: None,
+        workspace_id: Some(workspace.id.clone()),
+        workspace_name: Some(workspace.name.clone()),
+        terminal_name: descriptor.terminal_name.clone(),
+        terminal_nickname: descriptor.terminal_nickname.clone(),
+        app_control_mcp: Some(false),
+        cols: Some(TERMINAL_DEFAULT_COLS),
+        rows: Some(TERMINAL_DEFAULT_ROWS),
+        output_transport: Some(false),
+    }
+}
+
+fn workspace_activation_ready_json(
+    descriptor: &WorkspaceActivationTerminalDescriptor,
+    result: &TerminalOpenResult,
+    ready: bool,
+) -> Value {
+    json!({
+        "agentId": descriptor.role,
+        "inputReady": ready,
+        "instanceId": result.instance_id,
+        "paneId": result.pane_id,
+        "providerSessionId": result.provider_session_id,
+        "slotKey": descriptor.slot_key,
+        "terminalIndex": descriptor.terminal_index,
+        "threadId": result.thread_id,
+    })
+}
+
+async fn workspace_activation_terminal_ready(
+    app: &AppHandle,
+    pane_id: &str,
+    instance_id: u64,
+) -> Option<bool> {
+    let terminal_state = app.state::<TerminalState>();
+    let instance = {
+        let guard = terminal_state.terminals.read().await;
+        guard
+            .get(pane_id)
+            .filter(|instance| instance.id == instance_id)
+            .cloned()
+    }?;
+    let parked = {
+        let guard = terminal_state.parked_prompts.read().await;
+        guard
+            .values()
+            .any(|prompt| prompt.pane_id == pane_id && prompt.instance_id == instance_id)
+    };
+    let runtime = terminal_runtime_snapshot(&instance);
+    let projected = terminal_project_runtime(&instance.metadata, &runtime, parked);
+    let ready = todo_dispatch_core_terminal_ready_for_submit(&runtime, &projected, parked);
+    if ready == Some(true) {
+        todo_dispatch_refresh_terminal_runtime_from_core(
+            pane_id,
+            &instance,
+            &runtime,
+            &projected,
+            true,
+        );
+    }
+    ready
+}
+
+async fn workspace_activation_wait_for_readiness(
+    app: &AppHandle,
+    spawned: &[WorkspaceActivationSpawnResult],
+) -> Vec<Value> {
+    let deadline = Instant::now() + Duration::from_secs(WORKSPACE_ACTIVATE_TERMINAL_READY_TIMEOUT_SECS);
+    let mut ready_by_pane: HashMap<String, bool> = spawned
+        .iter()
+        .filter_map(|spawn| {
+            spawn
+                .open_result
+                .as_ref()
+                .map(|result| (result.pane_id.clone(), false))
+        })
+        .collect();
+    while Instant::now() < deadline && ready_by_pane.values().any(|ready| !*ready) {
+        for spawn in spawned {
+            let Some(result) = spawn.open_result.as_ref() else {
+                continue;
+            };
+            if ready_by_pane.get(&result.pane_id).copied().unwrap_or(false) {
+                continue;
+            }
+            if workspace_activation_terminal_ready(app, &result.pane_id, result.instance_id).await
+                == Some(true)
+            {
+                ready_by_pane.insert(result.pane_id.clone(), true);
+            }
+        }
+        if ready_by_pane.values().all(|ready| *ready) {
+            break;
+        }
+        sleep(Duration::from_millis(WORKSPACE_ACTIVATE_TERMINAL_READY_POLL_MS)).await;
+    }
+    spawned
+        .iter()
+        .filter_map(|spawn| {
+            let result = spawn.open_result.as_ref()?;
+            Some(workspace_activation_ready_json(
+                &spawn.descriptor,
+                result,
+                ready_by_pane.get(&result.pane_id).copied().unwrap_or(false),
+            ))
+        })
+        .collect()
+}
+
+async fn workspace_activation_workspace_snapshot(
+    app: &AppHandle,
+    workspace: &WorkspaceActivationWorkspace,
+    reason: &str,
+) -> Value {
+    let terminal_state = app.state::<TerminalState>();
+    let instances = {
+        let guard = terminal_state.terminals.read().await;
+        guard
+            .iter()
+            .map(|(pane_id, instance)| (pane_id.clone(), instance.clone()))
+            .collect::<Vec<_>>()
+    };
+    let parked = {
+        let guard = terminal_state.parked_prompts.read().await;
+        guard
+            .values()
+            .map(|prompt| (prompt.pane_id.clone(), prompt.instance_id))
+            .collect::<HashSet<_>>()
+    };
+    let mut terminals = Vec::new();
+    for (pane_id, instance) in instances {
+        let metadata = instance.metadata.clone();
+        if metadata.workspace_id.trim() != workspace.id {
+            continue;
+        }
+        let runtime = terminal_runtime_snapshot(&instance);
+        let launch_metadata = instance
+            .launch_metadata
+            .lock()
+            .map(|metadata| metadata.clone())
+            .unwrap_or_default();
+        let is_parked = parked.contains(&(pane_id.clone(), instance.id));
+        let projected = terminal_project_runtime(&metadata, &runtime, is_parked);
+        let input_ready =
+            todo_dispatch_core_terminal_ready_for_submit(&runtime, &projected, is_parked)
+                == Some(true);
+        terminals.push(json!({
+            "activityStatus": runtime.activity_status.clone(),
+            "activity_status": runtime.activity_status.clone(),
+            "agentId": metadata.agent_id.clone(),
+            "agentKind": metadata.agent_kind.clone(),
+            "commandable": true,
+            "connected": true,
+            "currentEffort": launch_metadata.reasoning_effort.clone(),
+            "currentModel": launch_metadata.model.clone(),
+            "displayName": projected.display_name.clone(),
+            "display_status": projected.native_rail_label.clone(),
+            "displayStatus": projected.native_rail_label.clone(),
+            "inputReady": input_ready,
+            "input_ready": input_ready,
+            "inputReadyAt": runtime.input_ready_at.clone(),
+            "input_ready_at": runtime.input_ready_at.clone(),
+            "instanceId": instance.id,
+            "model": launch_metadata.model.clone(),
+            "nativeConnected": true,
+            "native_connected": true,
+            "native_rail_label": projected.native_rail_label.clone(),
+            "nativeRailLabel": projected.native_rail_label.clone(),
+            "native_rail_state": projected.native_rail_state.clone(),
+            "nativeRailState": projected.native_rail_state.clone(),
+            "paneId": pane_id.clone(),
+            "pane_id": pane_id.clone(),
+            "providerSessionId": runtime.provider_session_id.clone(),
+            "provider_session_id": runtime.provider_session_id.clone(),
+            "readiness": projected.readiness.clone(),
+            "sessionState": projected.session_state.clone(),
+            "session_state": projected.session_state.clone(),
+            "status": projected.terminal_status.clone(),
+            "terminalId": pane_id.clone(),
+            "terminal_id": pane_id.clone(),
+            "terminalIndex": metadata.terminal_index,
+            "terminal_index": metadata.terminal_index,
+            "terminalInstanceId": instance.id,
+            "terminal_instance_id": instance.id,
+            "terminalName": projected.terminal_name.clone(),
+            "terminal_name": projected.terminal_name.clone(),
+            "terminalNickname": projected.terminal_nickname.clone(),
+            "terminal_nickname": projected.terminal_nickname.clone(),
+            "terminalStatus": projected.terminal_status.clone(),
+            "terminal_status": projected.terminal_status.clone(),
+            "terminalWorkState": projected.terminal_work_state.clone(),
+            "threadId": metadata.thread_id.clone(),
+            "thread_id": metadata.thread_id.clone(),
+        }));
+    }
+    terminals.sort_by_key(|terminal| {
+        terminal
+            .get("terminalIndex")
+            .and_then(Value::as_u64)
+            .unwrap_or(u64::MAX)
+    });
+    json!({
+        "active": true,
+        "commandable": true,
+        "connected": true,
+        "name": workspace.name,
+        "reason": reason,
+        "repo_path": workspace.root,
+        "repoPath": workspace.root,
+        "rootDirectory": workspace.root,
+        "selected": true,
+        "status": "active",
+        "terminals": terminals,
+        "workspace_active": true,
+        "workspace_id": workspace.id,
+        "workspace_name": workspace.name,
+        "workspace_root": workspace.root,
+        "workspace_status": "active",
+        "workspaceId": workspace.id,
+        "workspaceName": workspace.name,
+        "workspaceRoot": workspace.root,
+    })
+}
+
+async fn workspace_activation_pane_is_live(app: &AppHandle, pane_id: &str) -> bool {
+    let terminal_state = app.state::<TerminalState>();
+    let guard = terminal_state.terminals.read().await;
+    guard.contains_key(pane_id)
+}
+
+async fn workspace_activation_spawn_terminals(
+    app: &AppHandle,
+    workspace: &WorkspaceActivationWorkspace,
+    descriptors: Vec<WorkspaceActivationTerminalDescriptor>,
+) -> Vec<WorkspaceActivationSpawnResult> {
+    let mut results = Vec::new();
+    for descriptor in descriptors {
+        // A live pane means the terminal already exists (possibly mid-turn):
+        // activation must be idempotent, never close-and-respawn. terminal_open
+        // closes an existing pane's session before reopening.
+        if workspace_activation_pane_is_live(app, &descriptor.pane_id).await {
+            results.push(WorkspaceActivationSpawnResult {
+                descriptor,
+                open_result: None,
+                error: None,
+                adopted: true,
+            });
+            continue;
+        }
+        // Re-check per spawn: a webview can come alive mid-activation (the
+        // readiness/spawn loop runs for seconds); the moment it heartbeats,
+        // its reconcile owns the remaining panes — abort, don't fight it.
+        if todo_dispatch_webview_dispatcher_active() {
+            workspace_activation_log(
+                "backend.workspace_activation.orchestrator.aborted",
+                json!({
+                    "paneId": descriptor.pane_id.clone(),
+                    "reason": "webview_dispatcher_became_active",
+                    "workspaceId": workspace.id,
+                }),
+            );
+            results.push(WorkspaceActivationSpawnResult {
+                descriptor,
+                open_result: None,
+                error: Some("webview dispatcher became active mid-activation".to_string()),
+                adopted: false,
+            });
+            break;
+        }
+        let request = workspace_activation_terminal_request(workspace, &descriptor);
+        let output_channel = Channel::new(|_body: InvokeResponseBody| Ok(()));
+        let terminal_state = app.state::<TerminalState>();
+        let cloud_mcp_state = app.state::<CloudMcpState>();
+        let app_control_mcp_state = app.state::<AppControlMcpState>();
+        let open_result = terminal_open(
+            app.clone(),
+            terminal_state,
+            cloud_mcp_state,
+            app_control_mcp_state,
+            request,
+            output_channel,
+        )
+        .await;
+        match open_result {
+            Ok(open_result) => results.push(WorkspaceActivationSpawnResult {
+                descriptor,
+                open_result: Some(open_result),
+                error: None,
+                adopted: false,
+            }),
+            Err(error) => {
+                workspace_activation_log(
+                    "backend.workspace_activation.orchestrator.error",
+                    json!({
+                        "error": clean_terminal_diagnostic_log_text(&error),
+                        "paneId": descriptor.pane_id.clone(),
+                        "terminalIndex": descriptor.terminal_index,
+                        "workspaceId": workspace.id,
+                    }),
+                );
+                results.push(WorkspaceActivationSpawnResult {
+                    descriptor,
+                    open_result: None,
+                    error: Some(error),
+                    adopted: false,
+                });
+            }
+        }
+    }
+    results
+}
+
+async fn workspace_activation_bootstrap_coordination_and_mcp(root: &str) -> Value {
+    let mut bootstrap_value = Value::Null;
+    let mut bootstrap_error = None;
+    match coordination::tauri_commands::coordination_bootstrap_workspace(
+        Some(root.to_string()),
+        None,
+        None,
+    ) {
+        Ok(value) => {
+            bootstrap_value = value;
+        }
+        Err(error) => {
+            bootstrap_error = Some(error);
+        }
+    }
+    let mut daemon_value = json!({
+        "active": false,
+        "repo_path": root,
+    });
+    let mut daemon_error = None;
+    match crate::coordination::kernel::CoordinationKernel::init(PathBuf::from(root), None) {
+        Ok(kernel) => {
+            match coordination::mcp::ensure_shared_daemon_for_paths(
+                &kernel.paths.repo_path,
+                &kernel.paths.db_path,
+            ) {
+                Ok(value) => {
+                    daemon_value = value;
+                }
+                Err(error) => {
+                    daemon_error = Some(error);
+                }
+            }
+        }
+        Err(error) => {
+            daemon_error = Some(error);
+        }
+    }
+    json!({
+        "bootstrap": bootstrap_value,
+        "bootstrapError": bootstrap_error,
+        "daemon": daemon_value,
+        "error": daemon_error,
+        "ok": bootstrap_error.is_none() && daemon_error.is_none(),
+    })
+}
+
+// Per-workspace activation exclusion: a second activation of the same
+// workspace refuses instead of racing, and deactivate_workspace_runtime
+// refuses while an activation is mid-flight (spawns happen one lifecycle_lock
+// acquisition at a time, so a deactivate could otherwise interleave between
+// spawns and leave a half-activated workspace).
+static WORKSPACE_ACTIVATIONS_IN_FLIGHT: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+fn workspace_activations_in_flight() -> &'static StdMutex<HashSet<String>> {
+    WORKSPACE_ACTIVATIONS_IN_FLIGHT.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn workspace_activation_begin(workspace_id: &str) -> Result<(), String> {
+    let mut guard = workspace_activations_in_flight()
+        .lock()
+        .map_err(|_| "workspace activation registry poisoned".to_string())?;
+    if !guard.insert(workspace_id.to_string()) {
+        return Err(format!(
+            "workspace activation already in flight for {workspace_id}"
+        ));
+    }
+    Ok(())
+}
+
+fn workspace_activation_end(workspace_id: &str) {
+    if let Ok(mut guard) = workspace_activations_in_flight().lock() {
+        guard.remove(workspace_id);
+    }
+}
+
+pub(crate) fn workspace_activation_in_flight(workspace_id: &str) -> bool {
+    workspace_activations_in_flight()
+        .lock()
+        .map(|guard| guard.contains(workspace_id))
+        .unwrap_or(false)
+}
+
+fn workspace_activate_runtime_webview_guard() -> Result<(), String> {
+    workspace_activate_runtime_webview_guard_for_active(todo_dispatch_webview_dispatcher_active())
+}
+
+fn workspace_activate_runtime_webview_guard_for_active(active: bool) -> Result<(), String> {
+    if active {
+        Err("webview dispatcher active".to_string())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) async fn workspace_activate_runtime_internal(
+    app: &AppHandle,
+    workspace_id: &str,
+    reason: &str,
+) -> Result<Value, String> {
+    let started_at = Instant::now();
+    let workspace_id = workspace_id.trim();
+    let reason = reason.trim();
+    let reason = if reason.is_empty() {
+        "workspace_activate_runtime"
+    } else {
+        reason
+    };
+    workspace_activation_log(
+        "backend.workspace_activation.orchestrator.start",
+        json!({
+            "reason": reason,
+            "workspaceId": workspace_id,
+        }),
+    );
+    if let Err(error) = workspace_activate_runtime_webview_guard() {
+        workspace_activation_log(
+            "backend.workspace_activation.orchestrator.error",
+            json!({
+                "error": error,
+                "reason": reason,
+                "workspaceId": workspace_id,
+            }),
+        );
+        return Err(error);
+    }
+    if let Err(error) = workspace_activation_begin(workspace_id) {
+        workspace_activation_log(
+            "backend.workspace_activation.orchestrator.error",
+            json!({
+                "error": error,
+                "reason": reason,
+                "workspaceId": workspace_id,
+            }),
+        );
+        return Err(error);
+    }
+
+    let run: Result<Value, String> = async {
+        let workspace_settings = app_local_state_read(app, "workspace-settings");
+        let workspace = workspace_activation_resolve_workspace(app, workspace_id, &workspace_settings)?;
+        workspace_activation_remote_intent_clear_if_matching(app, &workspace.id)?;
+        let settings = workspace_activation_settings_for_workspace(&workspace_settings, &workspace.id);
+        let threads_state = workspace_activation_threads_state(&workspace.id, &workspace.root).await?;
+        let descriptors =
+            workspace_activation_terminal_descriptors_from_values(&workspace, settings, &threads_state);
+        let mcp_daemon = workspace_activation_bootstrap_coordination_and_mcp(&workspace.root).await;
+        let spawned =
+            workspace_activation_spawn_terminals(app, &workspace, descriptors.clone()).await;
+        let readiness = workspace_activation_wait_for_readiness(app, &spawned).await;
+        let todos_hydrated = {
+            let cloud_mcp_state = app.state::<CloudMcpState>();
+            cloud_mcp_hydrate_workspace_todos_internal(
+                cloud_mcp_state.inner(),
+                workspace.root.clone(),
+                Some(workspace.id.clone()),
+                Some(workspace.name.clone()),
+                json!([]),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                json!({
+                    "error": error,
+                    "hydratedCount": 0,
+                    "items": [],
+                })
+            })
+        };
+        let cloud_snapshot = {
+            let cloud_mcp_state = app.state::<CloudMcpState>();
+            let workspace_snapshot =
+                workspace_activation_workspace_snapshot(app, &workspace, reason).await;
+            cloud_mcp_sync_device_workspaces_snapshot_internal(
+                cloud_mcp_state.inner(),
+                json!([workspace_snapshot]),
+                None,
+                Some("workspace_activate_runtime".to_string()),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                json!({
+                    "error": error,
+                    "queued": false,
+                    "sent": false,
+                })
+            })
+        };
+        let spawn_errors = spawned
+            .iter()
+            .filter_map(|spawn| {
+                spawn.error.as_ref().map(|error| {
+                    json!({
+                        "error": error,
+                        "paneId": spawn.descriptor.pane_id,
+                        "terminalIndex": spawn.descriptor.terminal_index,
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let terminals_spawned = spawned
+            .iter()
+            .filter(|spawn| spawn.open_result.is_some())
+            .count();
+        let terminals_adopted = spawned.iter().filter(|spawn| spawn.adopted).count();
+        let terminals_ready = readiness
+            .iter()
+            .filter(|entry| entry.get("inputReady").and_then(Value::as_bool).unwrap_or(false))
+            .count();
+        // An activation that produced zero live terminals for a workspace
+        // that expects terminals is a failure, not a "completed" — the
+        // dashboard/automation must not see success for an empty runtime.
+        if terminals_spawned == 0 && terminals_adopted == 0 && !spawned.is_empty() {
+            let first_error = spawn_errors
+                .first()
+                .and_then(|entry| entry.get("error").and_then(Value::as_str))
+                .unwrap_or("no terminals could be spawned");
+            return Err(format!(
+                "workspace activation spawned no terminals: {first_error}"
+            ));
+        }
+        Ok(json!({
+            "workspaceId": workspace.id,
+            "root": workspace.root,
+            "terminalsSpawned": terminals_spawned,
+            "terminalsAdopted": terminals_adopted,
+            "terminalsReady": terminals_ready,
+            "terminalReadiness": readiness,
+            "terminalSpawnErrors": spawn_errors,
+            "mcpDaemon": mcp_daemon,
+            "todosHydrated": todos_hydrated,
+            "cloudSnapshot": cloud_snapshot,
+            "reason": reason,
+            "durationMs": terminal_diagnostic_elapsed_ms(started_at),
+        }))
+    }
+    .await;
+    workspace_activation_end(workspace_id);
+
+    match run {
+        Ok(result) => {
+            workspace_activation_log(
+                "backend.workspace_activation.orchestrator.done",
+                json!({
+                    "durationMs": terminal_diagnostic_elapsed_ms(started_at),
+                    "reason": reason,
+                    "terminalsReady": result.get("terminalsReady").cloned().unwrap_or(Value::Null),
+                    "terminalsSpawned": result.get("terminalsSpawned").cloned().unwrap_or(Value::Null),
+                    "workspaceId": workspace_id,
+                }),
+            );
+            Ok(result)
+        }
+        Err(error) => {
+            workspace_activation_log(
+                "backend.workspace_activation.orchestrator.error",
+                json!({
+                    "durationMs": terminal_diagnostic_elapsed_ms(started_at),
+                    "error": clean_terminal_diagnostic_log_text(&error),
+                    "reason": reason,
+                    "workspaceId": workspace_id,
+                }),
+            );
+            Err(error)
+        }
+    }
+}
+
+#[tauri::command]
+async fn workspace_activate_runtime(
+    app: AppHandle,
+    workspace_id: String,
+    reason: Option<String>,
+) -> Result<Value, String> {
+    workspace_activate_runtime_internal(
+        &app,
+        &workspace_id,
+        reason.as_deref().unwrap_or("workspace_activate_runtime_command"),
+    )
+    .await
+}
+
+#[cfg(test)]
+mod workspace_activation_tests {
+    use super::*;
+
+    #[test]
+    fn descriptor_synthesis_uses_webview_pane_and_slot_scheme() {
+        let workspace = WorkspaceActivationWorkspace {
+            id: "ws 1".to_string(),
+            name: "Workspace One".to_string(),
+            root: "/repo".to_string(),
+            root_was_empty_at_selection: false,
+        };
+        let settings = json!({
+            "terminalCount": 3,
+            "logicalTerminalIndexes": [0, 1, 2],
+            "paneKinds": {
+                "1": "web"
+            },
+            "terminalRoles": ["codex", "generic", "claude"],
+            "agentPermissions": {
+                "0": "bypass_permissions",
+                "2": "ask_each_time"
+            },
+            "panes": {
+                "2": {
+                    "kind": "terminal",
+                    "paneId": "explicit-pane-2",
+                    "slotKey": "slot-three"
+                }
+            }
+        });
+        let threads = json!({
+            "terminalThreadIds": {
+                "0": "thread-zero",
+                "2": "thread-two"
+            },
+            "threads": {
+                "thread-zero": {
+                    "id": "thread-zero",
+                    "providerBindings": {
+                        "codex": {
+                            "provider": "codex",
+                            "modelId": "gpt-5",
+                            "nativeSessionId": "session-zero",
+                            "workingDirectory": "/repo/sub"
+                        }
+                    }
+                },
+                "thread-two": {
+                    "id": "thread-two",
+                    "providerBindings": {
+                        "claude": {
+                            "provider": "claude",
+                            "modelId": "sonnet",
+                            "reasoningEffort": "high",
+                            "providerSessionId": "session-two"
+                        }
+                    }
+                }
+            },
+            "terminals": {
+                "2": {
+                    "terminalName": "Review",
+                    "terminalNickname": "Reviewer"
+                }
+            }
+        });
+
+        let descriptors =
+            workspace_activation_terminal_descriptors_from_values(&workspace, Some(&settings), &threads);
+
+        assert_eq!(descriptors.len(), 2);
+        assert_eq!(descriptors[0].terminal_index, 0);
+        assert_eq!(descriptors[0].pane_id, "workspace-terminal-ws-1-0-codex");
+        assert_eq!(descriptors[0].slot_key, "1");
+        assert_eq!(descriptors[0].provider.as_deref(), Some("codex"));
+        assert_eq!(descriptors[0].provider_session_id.as_deref(), Some("session-zero"));
+        assert_eq!(descriptors[0].permission_mode.as_deref(), Some("bypass_permissions"));
+        assert_eq!(descriptors[0].working_directory, "/repo/sub");
+
+        assert_eq!(descriptors[1].terminal_index, 2);
+        assert_eq!(descriptors[1].pane_id, "explicit-pane-2");
+        assert_eq!(descriptors[1].slot_key, "slot-three");
+        assert_eq!(descriptors[1].role, "claude");
+        assert_eq!(descriptors[1].provider_session_id.as_deref(), Some("session-two"));
+        assert_eq!(descriptors[1].permission_mode.as_deref(), Some("ask"));
+        assert_eq!(descriptors[1].terminal_name.as_deref(), Some("Review"));
+    }
+
+    #[test]
+    fn activation_refuses_when_webview_dispatcher_active() {
+        assert_eq!(
+            workspace_activate_runtime_webview_guard_for_active(true),
+            Err("webview dispatcher active".to_string())
+        );
+        assert_eq!(workspace_activate_runtime_webview_guard_for_active(false), Ok(()));
+    }
+}
+
 async fn run_backend_app_shutdown(app_for_shutdown: AppHandle, window_label: String) {
     let _ = cloud_mcp_signal_desktop_closing(&app_for_shutdown, "app_shutdown").await;
 
@@ -3836,6 +5479,17 @@ async fn deactivate_workspace_runtime(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string);
+
+    // A Rust activation mid-flight spawns terminals one lifecycle_lock
+    // acquisition at a time; letting a deactivate interleave would close the
+    // already-spawned half and leave both callers reporting success.
+    if let Some(target) = workspace_id.as_deref() {
+        if workspace_activation_in_flight(target) {
+            return Err(format!(
+                "workspace activation in flight for {target}; retry deactivation shortly"
+            ));
+        }
+    }
 
     log_terminal_diagnostic_event(
         &app,
@@ -7849,6 +9503,24 @@ fn run_app(daemon: bool) {
                 // Restore the persisted desktop session before the first
                 // connect so cloud auth comes up without waiting for the
                 // webview (background-capable startup).
+                if daemon {
+                    match tauri::async_runtime::spawn_blocking(
+                        desktop_auth_try_provision_from_environment,
+                    )
+                    .await
+                    {
+                        Ok(Ok(true)) => eprintln!(
+                            "diffforge daemon: provisioning token redeemed — session established"
+                        ),
+                        Ok(Ok(false)) => {}
+                        Ok(Err(error)) => {
+                            eprintln!("diffforge daemon: provisioning token redeem failed: {error}")
+                        }
+                        Err(error) => eprintln!(
+                            "diffforge daemon: provisioning token redeem failed: worker failed: {error}"
+                        ),
+                    }
+                }
                 let restored_auth = desktop_auth_restore_cloud_session_for_startup(
                     &cloud_mcp_app,
                     &cloud_mcp_state,
@@ -8496,6 +10168,7 @@ fn run_app(daemon: bool) {
             coordination::tauri_commands::coordination_request_approval,
             coordination::tauri_commands::coordination_resolve_approval,
             coordination::tauri_commands::coordination_scan_workspace_violations,
+            workspace_activate_runtime,
             deactivate_workspace_runtime,
             close_app_after_terminal_shutdown,
             app_force_exit_now

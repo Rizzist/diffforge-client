@@ -14,6 +14,7 @@ const TODO_DISPATCH_RECEIPT_MAX_ITEMS: usize = 400;
 const TODO_DISPATCH_DRAIN_NOTIFY_DEDUPE_MS: u64 = 5_000;
 const TODO_DISPATCH_ATTENTION_DEDUPE_MS: u64 = 120_000;
 const TODO_DISPATCH_MODEL_SWITCH_INPUT_READY_TIMEOUT_MS: u64 = 8_000;
+const TODO_DISPATCH_WORKSPACE_ACTIVATION_THROTTLE_MS: u64 = 5 * 60 * 1000;
 const TODO_DISPATCH_APP_CONTROL_WORKSPACE_ID: &str = "__diffforge_app_control__";
 const TODO_DISPATCH_APP_CONTROL_WORKSPACE_ID_NORMALIZED: &str = "diffforge_app_control";
 const TODO_DISPATCH_APP_CONTROL_PANE_ID: &str = "forge-app-control-agent-terminal";
@@ -25,6 +26,8 @@ static TODO_DISPATCH_ATTENTION_NOTIFIED_AT: OnceLock<StdMutex<HashMap<String, u6
 static TODO_DISPATCH_APP_STARTED_MS: OnceLock<u64> = OnceLock::new();
 static TODO_STORE_ORPHAN_SWEEP_NOTIFY: OnceLock<Arc<tokio::sync::Notify>> = OnceLock::new();
 static TODO_STORE_ORPHAN_SWEEP_DEBOUNCE_PENDING: AtomicBool = AtomicBool::new(false);
+static TODO_DISPATCH_WORKSPACE_ACTIVATION_ATTEMPTS: OnceLock<StdMutex<HashMap<String, u64>>> =
+    OnceLock::new();
 
 fn todo_dispatch_now_ms() -> u64 {
     SystemTime::now()
@@ -606,17 +609,23 @@ enum TodoDispatchRemoteIntakeScopeDecision {
     Continue,
     MissingScope,
     IgnoreOrchestratorSend,
+    RustOrchestratorSend,
 }
 
-fn todo_dispatch_remote_intake_scope_decision(
+fn todo_dispatch_remote_intake_scope_decision_for_webview(
     command_kind: &str,
     command_id: &str,
     workspace_id: &str,
+    webview_dispatcher_active: bool,
 ) -> TodoDispatchRemoteIntakeScopeDecision {
     if workspace_id.is_empty()
         && todo_dispatch_remote_command_is_orchestrator_send_message(command_kind)
     {
-        return TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend;
+        return if webview_dispatcher_active {
+            TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend
+        } else {
+            TodoDispatchRemoteIntakeScopeDecision::RustOrchestratorSend
+        };
     }
     if command_id.is_empty() || workspace_id.is_empty() {
         return TodoDispatchRemoteIntakeScopeDecision::MissingScope;
@@ -791,11 +800,21 @@ pub(crate) fn todo_dispatch_record_remote_intake(app: &AppHandle, event: &Value)
     }
     let command_id = todo_dispatch_text(event, &["command_id", "commandId"]);
     let workspace_id = todo_dispatch_text(event, &["workspace_id", "workspaceId"]);
-    match todo_dispatch_remote_intake_scope_decision(&command_kind, &command_id, &workspace_id) {
+    match todo_dispatch_remote_intake_scope_decision_for_webview(
+        &command_kind,
+        &command_id,
+        &workspace_id,
+        todo_dispatch_webview_dispatcher_active(),
+    ) {
         TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend => {
             // Orchestrator-targeted sends have no workspace scope; failing them
             // here makes cloud kill the loop runtime run while delivery still
             // succeeds through the webview orchestrator route.
+            return None;
+        }
+        TodoDispatchRemoteIntakeScopeDecision::RustOrchestratorSend => {
+            // The Rust orchestrator-pool lever accepts this no-workspace send
+            // later in the cloud remote-command loop when no webview owns it.
             return None;
         }
         TodoDispatchRemoteIntakeScopeDecision::MissingScope => {
@@ -1529,6 +1548,9 @@ pub(crate) fn todo_dispatch_observe_activity_hook(
     let Some(settle_status) = settle_status else {
         return;
     };
+    // Orchestrator-pool sends complete on turn settlement, not PTY write —
+    // cheap map-miss no-op for every pane the pool doesn't own.
+    orchestrator_pool_observe_turn_settled(app, payload.pane_id.trim(), settle_status);
     let settled_prompt_text = payload
         .user_message
         .as_deref()
@@ -5080,9 +5102,13 @@ async fn todo_store_cancel(
         return Err("A todo id, command id, or dispatch id is required.".to_string());
     }
 
-    tauri::async_runtime::spawn_blocking(move || {
+    let mut result = tauri::async_runtime::spawn_blocking({
+        let app = app.clone();
+        move || {
         let _store_guard = todo_dispatch_queue_store_guard();
         let mut matched_item: Option<Value> = None;
+        let mut interrupt_pane_id = String::new();
+        let mut interrupt_instance_id: Option<u64> = None;
         if let Some(path) = todo_dispatch_data_path("queues", &workspace_id) {
             let mut items = todo_dispatch_queue_read(&path)
                 .get("items")
@@ -5111,6 +5137,13 @@ async fn todo_store_cancel(
             // inputReady == false means the pane is mid-turn: ask the webview
             // actuator to interrupt the terminal itself.
             if !pane_id.is_empty() && todo_dispatch_pane_input_ready(&pane_id) == Some(false) {
+                interrupt_pane_id = pane_id.clone();
+                interrupt_instance_id = item
+                    .get("terminalInstanceId")
+                    .or_else(|| item.get("terminal_instance_id"))
+                    .or_else(|| item.get("instanceId"))
+                    .or_else(|| item.get("instance_id"))
+                    .and_then(Value::as_u64);
                 let _ = app.emit(
                     TODO_STORE_CANCEL_REQUESTED_EVENT,
                     json!({
@@ -5170,17 +5203,51 @@ async fn todo_store_cancel(
             }
         }
         todo_store_emit_changed(&app, &workspace_id, "todo_store_cancel", "store");
-        Ok(json!({
+        Ok::<Value, String>(json!({
             "ok": true,
             "workspaceId": workspace_id,
             "status": "cancelled",
             "actuated": actuated,
             "corrected": corrected,
+            "interruptPaneId": interrupt_pane_id,
+            "interruptInstanceId": interrupt_instance_id,
             "matchedInStore": matched_item.is_some(),
         }))
+        }
     })
     .await
-    .map_err(|error| format!("Todo store cancel worker failed: {error}"))?
+    .map_err(|error| format!("Todo store cancel worker failed: {error}"))??;
+    if !todo_dispatch_webview_dispatcher_active() {
+        let interrupt_pane_id = todo_dispatch_text(&result, &["interruptPaneId"]);
+        let interrupt_instance_id = result
+            .get("interruptInstanceId")
+            .and_then(Value::as_u64);
+        if !interrupt_pane_id.is_empty() {
+            let interrupt_result = terminal_interrupt_agent_remote(
+                app,
+                interrupt_pane_id.clone(),
+                interrupt_instance_id,
+                "todo_store_cancel".to_string(),
+            )
+            .await;
+            if let Some(object) = result.as_object_mut() {
+                match interrupt_result {
+                    Ok(value) => {
+                        object.insert("headlessInterrupt".to_string(), json!(true));
+                        object.insert("headlessInterruptResult".to_string(), json!(value));
+                    }
+                    Err(error) => {
+                        object.insert("headlessInterrupt".to_string(), json!(false));
+                        object.insert(
+                            "headlessInterruptError".to_string(),
+                            json!(clean_terminal_telemetry_text(&error)),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(result)
 }
 
 const TODO_DROP_IMAGE_MAX_BYTES: u64 = 16 * 1024 * 1024;
@@ -7413,7 +7480,7 @@ mod todo_store_tests {
     }
 
     #[test]
-    fn todo_dispatch_intake_ignores_orchestrator_send_without_workspace() {
+    fn todo_dispatch_intake_routes_orchestrator_send_without_workspace_by_owner() {
         let event = json!({
             "command_kind": "terminal_orchestrator_send_message",
             "commandId": "run-1",
@@ -7427,8 +7494,22 @@ mod todo_store_tests {
         let workspace_id = todo_dispatch_text(&event, &["workspace_id", "workspaceId"]);
 
         assert_eq!(
-            todo_dispatch_remote_intake_scope_decision(&command_kind, &command_id, &workspace_id),
+            todo_dispatch_remote_intake_scope_decision_for_webview(
+                &command_kind,
+                &command_id,
+                &workspace_id,
+                true,
+            ),
             TodoDispatchRemoteIntakeScopeDecision::IgnoreOrchestratorSend
+        );
+        assert_eq!(
+            todo_dispatch_remote_intake_scope_decision_for_webview(
+                &command_kind,
+                &command_id,
+                &workspace_id,
+                false,
+            ),
+            TodoDispatchRemoteIntakeScopeDecision::RustOrchestratorSend
         );
     }
 
@@ -7447,7 +7528,12 @@ mod todo_store_tests {
         let workspace_id = todo_dispatch_text(&event, &["workspace_id", "workspaceId"]);
 
         assert_eq!(
-            todo_dispatch_remote_intake_scope_decision(&command_kind, &command_id, &workspace_id),
+            todo_dispatch_remote_intake_scope_decision_for_webview(
+                &command_kind,
+                &command_id,
+                &workspace_id,
+                true,
+            ),
             TodoDispatchRemoteIntakeScopeDecision::Continue
         );
     }
@@ -7467,7 +7553,12 @@ mod todo_store_tests {
         let workspace_id = todo_dispatch_text(&event, &["workspace_id", "workspaceId"]);
 
         assert_eq!(
-            todo_dispatch_remote_intake_scope_decision(&command_kind, &command_id, &workspace_id),
+            todo_dispatch_remote_intake_scope_decision_for_webview(
+                &command_kind,
+                &command_id,
+                &workspace_id,
+                true,
+            ),
             TodoDispatchRemoteIntakeScopeDecision::MissingScope
         );
     }
@@ -11470,6 +11561,105 @@ async fn todo_dispatch_backend_pick_target(
     todo_dispatch_backend_pick_target_from_entries(&entries, item)
 }
 
+fn todo_dispatch_maybe_schedule_workspace_activation(
+    app: &AppHandle,
+    workspace_id: &str,
+    item: &Value,
+) {
+    let workspace_id = workspace_id.trim();
+    if workspace_id.is_empty() || todo_dispatch_webview_dispatcher_active() {
+        return;
+    }
+    let now = todo_dispatch_now_ms();
+    let attempts =
+        TODO_DISPATCH_WORKSPACE_ACTIVATION_ATTEMPTS.get_or_init(|| StdMutex::new(HashMap::new()));
+    {
+        let Ok(mut guard) = attempts.lock() else {
+            return;
+        };
+        let last_attempt = guard.get(workspace_id).copied().unwrap_or(0);
+        if now.saturating_sub(last_attempt) < TODO_DISPATCH_WORKSPACE_ACTIVATION_THROTTLE_MS {
+            return;
+        }
+        guard.insert(workspace_id.to_string(), now);
+    }
+    let item_id = todo_store_item_sync_id(item);
+    let command_id = todo_dispatch_queue_item_command_id(item);
+    todo_dispatch_journal_append(
+        workspace_id,
+        json!({
+            "commandId": command_id,
+            "event": "workspace_activation_scheduled",
+            "itemId": item_id,
+            "reason": "no_ready_terminal",
+            "scheduledAtMs": now,
+            "workspaceId": workspace_id,
+        }),
+    );
+    log_terminal_status_event(
+        "backend.todo_dispatch.workspace_activation_scheduled",
+        json!({
+            "command_id": command_id,
+            "item_id": item_id,
+            "reason": "no_ready_terminal",
+            "workspace_id": workspace_id,
+        }),
+    );
+    let app = app.clone();
+    let workspace_id = workspace_id.to_string();
+    tauri::async_runtime::spawn(async move {
+        // "No ready target" is NOT "no terminals": a workspace whose
+        // terminals are merely mid-turn must never be re-activated —
+        // terminal_open closes an existing pane's session first, so
+        // activating here would kill in-flight agent turns. Only activate
+        // when the workspace has zero live terminals at all.
+        {
+            let terminal_state = app.state::<TerminalState>();
+            let guard = terminal_state.terminals.read().await;
+            let has_live_terminal = guard
+                .values()
+                .any(|instance| instance.metadata.workspace_id.trim() == workspace_id);
+            if has_live_terminal {
+                log_terminal_status_event(
+                    "backend.todo_dispatch.workspace_activation_skipped",
+                    json!({
+                        "reason": "workspace_has_live_terminals",
+                        "workspace_id": workspace_id,
+                    }),
+                );
+                return;
+            }
+        }
+        let result = workspace_activate_runtime_internal(
+            &app,
+            &workspace_id,
+            "todo_dispatch_no_ready_terminal",
+        )
+        .await;
+        match result {
+            Ok(value) => {
+                log_terminal_status_event(
+                    "backend.todo_dispatch.workspace_activation_complete",
+                    json!({
+                        "result": value,
+                        "workspace_id": workspace_id,
+                    }),
+                );
+                todo_dispatch_wake_background_dispatcher(app);
+            }
+            Err(error) => {
+                log_terminal_status_event(
+                    "backend.todo_dispatch.workspace_activation_failed",
+                    json!({
+                        "error": clean_terminal_telemetry_text(&error),
+                        "workspace_id": workspace_id,
+                    }),
+                );
+            }
+        }
+    });
+}
+
 fn todo_dispatch_backend_try_claim_item(
     workspace_id: &str,
     item: &Value,
@@ -12314,6 +12504,7 @@ async fn todo_dispatch_backend_tick(app: &AppHandle) {
             let Some(target) =
                 todo_dispatch_backend_pick_target(app, &workspace_id, &item, &busy).await
             else {
+                todo_dispatch_maybe_schedule_workspace_activation(app, &workspace_id, &item);
                 continue;
             };
             if todo_dispatch_target_is_swarm(&target)

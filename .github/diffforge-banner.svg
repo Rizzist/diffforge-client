@@ -1,0 +1,35 @@
+<svg xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Diff Forge AI" viewBox="0 0 759.2 128">
+  <title>Diff Forge AI</title>
+  <style>
+    text {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+      font-size: 14px;
+      font-weight: 800;
+      line-height: 18px;
+      white-space: pre;
+      paint-order: stroke fill;
+      stroke: rgba(9,17,34,0.32);
+      stroke-width: 0.55px;
+      stroke-linejoin: round;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      text {
+        stroke: rgba(255,255,255,0.10);
+        stroke-width: 0.35px;
+      }
+    }
+
+    .bright { fill: #62a0ff; }
+    .blue { fill: #2f80ff; }
+    .ai { fill: #ff9a3d; }
+  </style>
+  <g xml:space="preserve">
+    <text x="10" y="22" textLength="739.2" lengthAdjust="spacingAndGlyphs"><tspan class="bright">██████╗ ██╗███████╗███████╗    ███████╗ ██████╗ ██████╗  ██████╗ ███████╗     </tspan><tspan class="ai">█████╗ ██╗</tspan></text>
+    <text x="10" y="40" textLength="739.2" lengthAdjust="spacingAndGlyphs"><tspan class="blue">██╔══██╗██║██╔════╝██╔════╝    ██╔════╝██╔═══██╗██╔══██╗██╔════╝ ██╔════╝    </tspan><tspan class="ai">██╔══██╗██║</tspan></text>
+    <text x="10" y="58" textLength="739.2" lengthAdjust="spacingAndGlyphs"><tspan class="bright">██║  ██║██║█████╗  █████╗      █████╗  ██║   ██║██████╔╝██║  ███╗█████╗      </tspan><tspan class="ai">███████║██║</tspan></text>
+    <text x="10" y="76" textLength="739.2" lengthAdjust="spacingAndGlyphs"><tspan class="bright">██║  ██║██║██╔══╝  ██╔══╝      ██╔══╝  ██║   ██║██╔══██╗██║   ██║██╔══╝      </tspan><tspan class="ai">██╔══██║██║</tspan></text>
+    <text x="10" y="94" textLength="739.2" lengthAdjust="spacingAndGlyphs"><tspan class="blue">██████╔╝██║██║     ██║         ██║     ╚██████╔╝██║  ██║╚██████╔╝███████╗    </tspan><tspan class="ai">██║  ██║██║</tspan></text>
+    <text x="10" y="112" textLength="739.2" lengthAdjust="spacingAndGlyphs"><tspan class="bright">╚═════╝ ╚═╝╚═╝     ╚═╝         ╚═╝      ╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚══════╝    </tspan><tspan class="ai">╚═╝  ╚═╝╚═╝</tspan></text>
+  </g>
+</svg>
