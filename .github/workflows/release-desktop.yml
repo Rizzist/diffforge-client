@@ -207,9 +207,10 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           mkdir -p out
-          shopt -s nullglob
           found=0
-          for f in staging/*; do
+          # Artifacts keep their bundle-relative layout (dmg/, macos/, deb/,
+          # rpm/, appimage/; windows lands flat), so walk files recursively.
+          while IFS= read -r f; do
             base=$(basename "$f")
             # .sig patterns must precede their base patterns; the only mac
             # updater archive is arm64 (Intel is out of the matrix).
@@ -228,7 +229,7 @@ jobs:
             esac
             cp "$f" "out/$dest"
             found=1
-          done
+          done < <(find staging -type f | sort)
           if [ "$found" = "0" ]; then
             echo "::error::No build artifacts produced by any platform job"
             exit 1
