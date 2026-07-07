@@ -310,6 +310,7 @@ function fallbackSnippingStatus() {
     hideDesktopIcons: true,
     freezeScreen: false,
     uploadPublic: true,
+    visibleInCaptures: false,
     fullScreenshot: {
       shortcut: full,
       defaultShortcut: full,
@@ -511,6 +512,7 @@ export default function SnippingWorkspaceView({
   const hideDesktopIcons = status?.hideDesktopIcons !== false;
   const freezeScreen = status?.freezeScreen === true;
   const uploadPublic = status?.uploadPublic !== false;
+  const visibleInCaptures = status?.visibleInCaptures === true;
   const permissions = status?.permissions || fallbackPermissions();
   const fullShortcut = status?.fullScreenshot?.shortcut || defaultFullShortcut();
   const areaShortcut = status?.areaSnip?.shortcut || defaultAreaShortcut();
@@ -540,6 +542,7 @@ export default function SnippingWorkspaceView({
   const togglingDesktopIcons = actionState === "toggling-desktop-icons";
   const togglingFreezeScreen = actionState === "toggling-freeze-screen";
   const togglingUploadPublic = actionState === "toggling-upload-public";
+  const togglingVisibleInCaptures = actionState === "toggling-visible-in-captures";
   const capturingFull = actionState === "capturing-full";
   const capturingArea = actionState === "capturing-area";
   const capturingRecording = actionState === "capturing-recording";
@@ -619,6 +622,21 @@ export default function SnippingWorkspaceView({
       setStatus(nextStatus || fallbackSnippingStatus());
     } catch (toggleError) {
       setError(getErrorMessage(toggleError, "Unable to update the snip upload privacy setting."));
+    } finally {
+      setActionState("idle");
+    }
+  }, []);
+
+  const setVisibleInCaptures = useCallback(async (enabled) => {
+    setActionState("toggling-visible-in-captures");
+    setError("");
+    try {
+      const nextStatus = await invoke("set_snipping_visible_in_captures", {
+        request: { enabled },
+      });
+      setStatus(nextStatus || fallbackSnippingStatus());
+    } catch (toggleError) {
+      setError(getErrorMessage(toggleError, "Unable to update the capture visibility setting."));
     } finally {
       setActionState("idle");
     }
@@ -934,6 +952,22 @@ export default function SnippingWorkspaceView({
               >
                 <span aria-hidden="true" />
                 {togglingUploadPublic ? "Switching" : uploadPublic ? "Auto URL" : "Private only"}
+              </McpSwitchButton>
+            </AudioRecorderOptionRow>
+            <AudioRecorderOptionRow>
+              <SettingsHint>
+                {visibleInCaptures
+                  ? "Snip overlays and the annotation editor show up in screen sharing and recordings."
+                  : "Snip overlays and the annotation editor stay invisible to screen sharing, recordings, and captures."}
+              </SettingsHint>
+              <McpSwitchButton
+                aria-pressed={visibleInCaptures ? "true" : "false"}
+                disabled={togglingVisibleInCaptures}
+                onClick={() => setVisibleInCaptures(!visibleInCaptures)}
+                type="button"
+              >
+                <span aria-hidden="true" />
+                {togglingVisibleInCaptures ? "Switching" : visibleInCaptures ? "Visible" : "Hidden"}
               </McpSwitchButton>
             </AudioRecorderOptionRow>
             {lastCapture?.localPath && (

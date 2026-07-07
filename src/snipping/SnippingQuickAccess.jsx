@@ -2,8 +2,8 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import { emit, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { Eraser } from "@styled-icons/boxicons-solid/Eraser";
-import { ArrowForward } from "@styled-icons/material-rounded/ArrowForward";
 import { BlurOn } from "@styled-icons/material-rounded/BlurOn";
+import { CenterFocusStrong } from "@styled-icons/material-rounded/CenterFocusStrong";
 import { Check } from "@styled-icons/material-rounded/Check";
 import { Close } from "@styled-icons/material-rounded/Close";
 import { CloudOff } from "@styled-icons/material-rounded/CloudOff";
@@ -12,14 +12,13 @@ import { ContentCopy } from "@styled-icons/material-rounded/ContentCopy";
 import { Crop } from "@styled-icons/material-rounded/Crop";
 import { CropSquare } from "@styled-icons/material-rounded/CropSquare";
 import { Delete } from "@styled-icons/material-rounded/Delete";
-import { Gesture } from "@styled-icons/material-rounded/Gesture";
 import { Grain } from "@styled-icons/material-rounded/Grain";
 import { Highlight } from "@styled-icons/material-rounded/Highlight";
-import { HighlightAlt } from "@styled-icons/material-rounded/HighlightAlt";
 import { HorizontalRule } from "@styled-icons/material-rounded/HorizontalRule";
 import { Link } from "@styled-icons/material-rounded/Link";
 import { ModeEdit } from "@styled-icons/material-rounded/ModeEdit";
 import { NearMe } from "@styled-icons/material-rounded/NearMe";
+import { NorthEast } from "@styled-icons/material-rounded/NorthEast";
 import { Numbers } from "@styled-icons/material-rounded/Numbers";
 import { Pause } from "@styled-icons/material-rounded/Pause";
 import { PlayArrow } from "@styled-icons/material-rounded/PlayArrow";
@@ -91,28 +90,30 @@ let stripThumbnailActiveReads = 0;
 // parameterized by kind + fill mode (outline | solid | marker | spotlight);
 // the rail exposes the common combos directly and the bottom options bar
 // unlocks every combination when a shape tool is active.
+// Groups run most-used to least: the everyday trio (arrow/box/text) sits
+// right under select, secondary shapes and crop live near the bottom.
 const TOOL_GROUPS = [
   [
     { id: "select", label: "Select / move (Esc)", Icon: NearMe, tool: "select" },
   ],
   [
-    { id: "pen", label: "Pen", Icon: Gesture, tool: "pen" },
-    { id: "line", label: "Line", Icon: HorizontalRule, tool: "line" },
-    { id: "arrow", label: "Arrow", Icon: ArrowForward, tool: "arrow" },
+    { id: "arrow", label: "Arrow", Icon: NorthEast, tool: "arrow" },
+    { id: "rect-outline", label: "Rectangle", Icon: CropSquare, tool: "shape", shape: "rect", mode: "outline" },
+    { id: "text", label: "Text", Icon: TextFields, tool: "text" },
   ],
   [
-    { id: "rect-outline", label: "Rectangle outline", Icon: CropSquare, tool: "shape", shape: "rect", mode: "outline" },
-    { id: "rect-solid", label: "Solid rectangle", Icon: Rectangle, tool: "shape", shape: "rect", mode: "solid" },
-    { id: "oval-outline", label: "Oval outline", Icon: RadioButtonUnchecked, tool: "shape", shape: "oval", mode: "outline" },
-  ],
-  [
-    { id: "spotlight", label: "Highlight area (dims the rest)", Icon: HighlightAlt, tool: "shape", shape: "rect", mode: "spotlight" },
+    { id: "pen", label: "Pen (freehand)", Icon: ModeEdit, tool: "pen" },
     { id: "marker", label: "Highlighter", Icon: Highlight, tool: "shape", shape: "rect", mode: "marker" },
     { id: "blur", label: "Blur (redact)", Icon: BlurOn, tool: "blur" },
   ],
   [
-    { id: "text", label: "Text", Icon: TextFields, tool: "text" },
     { id: "number", label: "Number badge", Icon: Numbers, tool: "number" },
+    { id: "line", label: "Straight line", Icon: HorizontalRule, tool: "line" },
+    { id: "spotlight", label: "Spotlight (dim everything else)", Icon: CenterFocusStrong, tool: "shape", shape: "rect", mode: "spotlight" },
+  ],
+  [
+    { id: "oval-outline", label: "Ellipse", Icon: RadioButtonUnchecked, tool: "shape", shape: "oval", mode: "outline" },
+    { id: "rect-solid", label: "Filled rectangle", Icon: Rectangle, tool: "shape", shape: "rect", mode: "solid" },
     { id: "crop", label: "Crop", Icon: Crop, tool: "crop" },
   ],
   [
@@ -129,7 +130,7 @@ const SHAPE_MODE_OPTIONS = [
   { id: "outline", label: "Outline", Icon: CropSquare },
   { id: "solid", label: "Solid fill", Icon: Rectangle },
   { id: "marker", label: "Highlighter fill", Icon: Highlight },
-  { id: "spotlight", label: "Spotlight (dim the rest)", Icon: HighlightAlt },
+  { id: "spotlight", label: "Spotlight (dim the rest)", Icon: CenterFocusStrong },
 ];
 
 const BLUR_STRATEGY_OPTIONS = [
@@ -5055,18 +5056,12 @@ export function SnippingAnnotationEditorWindow() {
       setStatus("Crop set — saves and sends use the cropped area");
       return;
     }
-    const newIndex = annotations.length;
     updateActiveAnnotations((current) => [...current, annotation]);
     setStatus("Annotation added");
-    // After completing a draw, hand off to the select tool so the shape can be
-    // immediately dragged/resized — except the number badge, which is placed
-    // repeatedly (it returns earlier and never reaches here). Text/eraser also
-    // never reach this path.
-    if (["pen", "line", "arrow", "shape", "blur"].includes(annotation.type)) {
-      setTool("select");
-      setSelectedIndex(newIndex);
-    }
-  }, [annotations, updateActiveAnnotations]);
+    // The tool stays armed after a draw so repeated annotations flow without
+    // re-picking it every time; switching to select/move is always a manual
+    // click on the rail (or Esc).
+  }, [updateActiveAnnotations]);
 
   const handleCanvasPointerMove = useCallback((event) => {
     const activePointerId = annotationPointerIdRef.current;

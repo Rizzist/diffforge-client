@@ -123,6 +123,8 @@ struct CodexThreadTranscriptMessage {
     exit_code: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     subagent: Option<Value>,
+    #[serde(alias = "subagent_id", skip_serializing_if = "String::is_empty")]
+    subagent_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     usage: Option<Value>,
     #[serde(skip_serializing_if = "bool_is_false")]
@@ -1714,46 +1716,53 @@ fn transcript_usage_from_value(value: &Value) -> Option<Value> {
         .or_else(|| value.get("tokenUsage"))
         .or_else(|| value.get("usage_report"))
         .or_else(|| value.get("usageReport"))
+        .or_else(|| {
+            value
+                .get("message")
+                .and_then(|message| message.get("usage"))
+        })
         .unwrap_or(value);
     let mut object = serde_json::Map::new();
     for (target, aliases) in [
         (
             "input_tokens",
-            [
+            &[
                 "input_tokens",
                 "inputTokens",
                 "prompt_tokens",
                 "promptTokens",
-            ],
+            ][..],
         ),
         (
             "output_tokens",
-            [
+            &[
                 "output_tokens",
                 "outputTokens",
                 "completion_tokens",
                 "completionTokens",
-            ],
+            ][..],
         ),
         (
             "cache_read_tokens",
-            [
+            &[
                 "cache_read_tokens",
                 "cacheReadTokens",
                 "cache_read_input_tokens",
                 "cacheReadInputTokens",
-            ],
+                "cached_input_tokens",
+                "cachedInputTokens",
+            ][..],
         ),
         (
             "cache_write_tokens",
-            [
+            &[
                 "cache_write_tokens",
                 "cacheWriteTokens",
                 "cache_creation_input_tokens",
                 "cacheCreationInputTokens",
-            ],
+            ][..],
         ),
-        ("cost_usd", ["cost_usd", "costUsd", "costUSD", "cost"]),
+        ("cost_usd", &["cost_usd", "costUsd", "costUSD", "cost"][..]),
     ] {
         let value = aliases
             .iter()
@@ -1765,32 +1774,157 @@ fn transcript_usage_from_value(value: &Value) -> Option<Value> {
     (!object.is_empty()).then(|| Value::Object(object))
 }
 
+fn transcript_cumulative_usage_from_value(value: &Value) -> Option<Value> {
+    let usage = value
+        .get("info")
+        .and_then(|info| info.get("total_token_usage"))
+        .or_else(|| value.get("total_token_usage"))
+        .or_else(|| value.get("totalTokenUsage"))?;
+    let mut usage = transcript_usage_from_value(usage)?;
+    if let Some(object) = usage.as_object_mut() {
+        object.insert("cumulative".to_string(), json!(true));
+        object.insert("is_cumulative".to_string(), json!(true));
+        object.insert("usage_kind".to_string(), json!("cumulative"));
+    }
+    Some(usage)
+}
+
+#[derive(Clone, Default)]
+struct TranscriptClaudeSidechainRow {
+    parent_id: String,
+}
+
+#[derive(Default)]
+struct TranscriptClaudeSidechainTracker {
+    rows: HashMap<String, TranscriptClaudeSidechainRow>,
+}
+
+fn transcript_row_uuid_from_value(value: &Value) -> String {
+    first_value_string(&[value.get("uuid"), value.get("id")])
+}
+
+fn transcript_parent_id_from_value(value: &Value) -> String {
+    first_value_string(&[
+        value.get("parentUuid"),
+        value.get("parent_uuid"),
+        value.get("parentId"),
+        value.get("parent_id"),
+        value.get("parentAgentId"),
+        value.get("parent_agent_id"),
+    ])
+}
+
+fn transcript_sidechain_id_from_value(value: &Value) -> String {
+    first_value_string(&[
+        value.get("sidechainId"),
+        value.get("sidechain_id"),
+        value.get("sidechainUuid"),
+        value.get("sidechain_uuid"),
+    ])
+}
+
+fn transcript_has_explicit_sidechain_evidence(value: &Value) -> bool {
+    value
+        .get("isSidechain")
+        .or_else(|| value.get("is_sidechain"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || !transcript_sidechain_id_from_value(value).trim().is_empty()
+}
+
+fn transcript_set_subagent_id(object: &mut serde_json::Map<String, Value>, subagent_id: String) {
+    if subagent_id.trim().is_empty() {
+        return;
+    }
+    object.insert("subagent_id".to_string(), json!(subagent_id.clone()));
+    object.insert("subagentId".to_string(), json!(subagent_id));
+}
+
+impl TranscriptClaudeSidechainTracker {
+    fn root_parent_id(&self, row_id: &str, parent_id: &str) -> String {
+        let mut current = if row_id.trim().is_empty() {
+            parent_id.trim().to_string()
+        } else {
+            row_id.trim().to_string()
+        };
+        let mut seen = HashSet::new();
+        while !current.trim().is_empty() && seen.insert(current.clone()) {
+            let Some(row) = self.rows.get(current.trim()) else {
+                return current;
+            };
+            if row.parent_id.trim().is_empty() {
+                return current;
+            }
+            current = row.parent_id.trim().to_string();
+        }
+        parent_id.trim().to_string()
+    }
+
+    fn subagent_from_value(&mut self, value: &Value, fallback_title: &str) -> Option<Value> {
+        if !transcript_has_explicit_sidechain_evidence(value) {
+            return None;
+        }
+        let row_id = transcript_row_uuid_from_value(value);
+        let parent_id = transcript_parent_id_from_value(value);
+        if !row_id.trim().is_empty() {
+            self.rows.insert(
+                row_id.clone(),
+                TranscriptClaudeSidechainRow {
+                    parent_id: parent_id.clone(),
+                },
+            );
+        }
+        let explicit_sidechain_id = transcript_sidechain_id_from_value(value);
+        let subagent_id = if !explicit_sidechain_id.trim().is_empty() {
+            explicit_sidechain_id
+        } else {
+            self.root_parent_id(&row_id, &parent_id)
+        };
+        let mut subagent = transcript_sidechain_subagent_from_value(value, fallback_title)?;
+        if let Some(object) = subagent.as_object_mut() {
+            transcript_set_subagent_id(object, subagent_id);
+        }
+        Some(subagent)
+    }
+}
+
 fn transcript_subagent_from_value(value: &Value, fallback_title: &str) -> Option<Value> {
     let is_sidechain = value
         .get("isSidechain")
         .or_else(|| value.get("is_sidechain"))
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let parent_id = first_value_string(&[
-        value.get("parentUuid"),
-        value.get("parent_uuid"),
-        value.get("parentId"),
-        value.get("parent_id"),
-    ]);
-    let sidechain_id = first_value_string(&[
-        value.get("sidechainId"),
-        value.get("sidechain_id"),
-        value.get("sidechainUuid"),
-        value.get("sidechain_uuid"),
-    ]);
-    let subagent_id = first_value_string(&[
-        value.get("uuid"),
-        value.get("id"),
-        value.get("sessionId"),
-        value.get("session_id"),
+    let parent_id = transcript_parent_id_from_value(value);
+    let sidechain_id = transcript_sidechain_id_from_value(value);
+    let sidechain_like =
+        is_sidechain || !parent_id.trim().is_empty() || !sidechain_id.trim().is_empty();
+    let explicit_subagent_id = first_value_string(&[
         value.get("subagentId"),
         value.get("subagent_id"),
+        value.get("agentId"),
+        value.get("agent_id"),
     ]);
+    let subagent_id = if sidechain_like {
+        if !sidechain_id.trim().is_empty() {
+            sidechain_id.clone()
+        } else if !parent_id.trim().is_empty() {
+            parent_id.clone()
+        } else {
+            explicit_subagent_id
+        }
+    } else {
+        let native_subagent_id = first_value_string(&[
+            value.get("uuid"),
+            value.get("id"),
+            value.get("sessionId"),
+            value.get("session_id"),
+        ]);
+        if native_subagent_id.trim().is_empty() {
+            explicit_subagent_id
+        } else {
+            native_subagent_id
+        }
+    };
     let title = first_value_string(&[
         value.get("title"),
         value.get("name"),
@@ -1808,7 +1942,7 @@ fn transcript_subagent_from_value(value: &Value, fallback_title: &str) -> Option
     }
     let mut object = serde_json::Map::new();
     if !subagent_id.trim().is_empty() {
-        object.insert("subagent_id".to_string(), json!(subagent_id));
+        transcript_set_subagent_id(&mut object, subagent_id);
     }
     if !parent_id.trim().is_empty() {
         object.insert("parent_id".to_string(), json!(parent_id));
@@ -1831,31 +1965,27 @@ fn transcript_subagent_from_value(value: &Value, fallback_title: &str) -> Option
 }
 
 fn transcript_sidechain_subagent_from_value(value: &Value, fallback_title: &str) -> Option<Value> {
-    let is_sidechain = value
-        .get("isSidechain")
-        .or_else(|| value.get("is_sidechain"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let has_parent = !first_value_string(&[
-        value.get("parentUuid"),
-        value.get("parent_uuid"),
-        value.get("parentId"),
-        value.get("parent_id"),
-    ])
-    .trim()
-    .is_empty();
-    let has_sidechain = !first_value_string(&[
-        value.get("sidechainId"),
-        value.get("sidechain_id"),
-        value.get("sidechainUuid"),
-        value.get("sidechain_uuid"),
-    ])
-    .trim()
-    .is_empty();
-    if !is_sidechain && !has_parent && !has_sidechain {
+    if !transcript_has_explicit_sidechain_evidence(value) {
         return None;
     }
     transcript_subagent_from_value(value, fallback_title)
+}
+
+fn transcript_subagent_link_id(subagent: &Value) -> String {
+    first_value_string(&[
+        subagent.get("subagent_id"),
+        subagent.get("subagentId"),
+        subagent.get("agent_id"),
+        subagent.get("agentId"),
+        subagent.get("sidechain_id"),
+        subagent.get("sidechainId"),
+        subagent.get("sidechainUuid"),
+        subagent.get("sidechain_uuid"),
+        subagent.get("parent_id"),
+        subagent.get("parentId"),
+        subagent.get("parentUuid"),
+        subagent.get("parent_uuid"),
+    ])
 }
 
 fn transcript_subagent_message(
@@ -1880,8 +2010,91 @@ fn transcript_subagent_message(
         title,
         created_at: timestamp.to_string(),
         source: source.to_string(),
+        subagent_id: transcript_subagent_link_id(&subagent),
         subagent: Some(subagent),
         ..Default::default()
+    }
+}
+
+fn transcript_stamp_messages_with_subagent_scope(
+    messages: &mut [CodexThreadTranscriptMessage],
+    subagent: Option<&Value>,
+) {
+    let Some(subagent) = subagent else {
+        return;
+    };
+    let subagent_id = transcript_subagent_link_id(subagent);
+    if subagent_id.trim().is_empty() {
+        return;
+    }
+    for message in messages {
+        if message.subagent_id.trim().is_empty() {
+            message.subagent_id = subagent_id.clone();
+        }
+        if message.subagent.is_none() {
+            message.subagent = Some(subagent.clone());
+        }
+    }
+}
+
+fn transcript_codex_subagent_scope_event(payload: &Value) -> Option<(bool, bool, Value)> {
+    let event_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let is_start = matches!(event_type, "ss" | "subagent_start");
+    let is_end = matches!(event_type, "se" | "subagent_end");
+    if !is_start && !is_end {
+        return None;
+    }
+    let fallback = if is_end {
+        "Subagent finished"
+    } else {
+        "Subagent started"
+    };
+    transcript_subagent_from_value(payload, fallback)
+        .or_else(|| {
+            let subagent_id = first_value_string(&[
+                payload.get("subagentId"),
+                payload.get("subagent_id"),
+                payload.get("agentId"),
+                payload.get("agent_id"),
+                payload.get("id"),
+            ]);
+            if subagent_id.trim().is_empty() {
+                return None;
+            }
+            let mut object = serde_json::Map::new();
+            transcript_set_subagent_id(&mut object, subagent_id);
+            object.insert("title".to_string(), json!(fallback));
+            Some(Value::Object(object))
+        })
+        .map(|subagent| (is_start, is_end, subagent))
+}
+
+fn transcript_apply_codex_subagent_scope(
+    active_subagents: &mut Vec<Value>,
+    payload: &Value,
+    messages: &mut [CodexThreadTranscriptMessage],
+) {
+    let scope_event = transcript_codex_subagent_scope_event(payload);
+    if let Some((true, _, subagent)) = scope_event.as_ref() {
+        active_subagents.push(subagent.clone());
+    }
+    let active = active_subagents
+        .last()
+        .or_else(|| scope_event.as_ref().map(|(_, _, subagent)| subagent));
+    transcript_stamp_messages_with_subagent_scope(messages, active);
+    if let Some((_, true, subagent)) = scope_event {
+        let subagent_id = transcript_subagent_link_id(&subagent);
+        if let Some(index) = active_subagents
+            .iter()
+            .rposition(|active| transcript_subagent_link_id(active) == subagent_id)
+        {
+            active_subagents.remove(index);
+        } else {
+            active_subagents.pop();
+        }
     }
 }
 
@@ -2730,6 +2943,21 @@ fn codex_messages_from_event(
             artifacts: Vec::new(),
             ..Default::default()
         }],
+        "token_count" => transcript_cumulative_usage_from_value(payload)
+            .map(|usage| CodexThreadTranscriptMessage {
+                id: format!("codex-{line_index}-usage"),
+                role: "activity".to_string(),
+                kind: "usage_report".to_string(),
+                text: "Token usage updated".to_string(),
+                title: "Token usage".to_string(),
+                created_at: timestamp.to_string(),
+                source: "codex".to_string(),
+                usage: Some(usage),
+                artifacts: Vec::new(),
+                ..Default::default()
+            })
+            .into_iter()
+            .collect(),
         "patch_apply_end" => {
             let success = payload
                 .get("success")
@@ -2860,25 +3088,20 @@ fn codex_messages_from_event(
                 ..Default::default()
             }]
         }
-        "ss" | "se" | "subagent_start" | "subagent_end" => transcript_subagent_from_value(
-            payload,
-            if event_type == "se" || event_type == "subagent_end" {
-                "Subagent finished"
-            } else {
-                "Subagent started"
-            },
-        )
-        .map(|subagent| {
-            transcript_subagent_message(
-                format!("codex-{line_index}-subagent"),
-                "codex",
-                timestamp,
-                subagent,
-                "Subagent",
-            )
-        })
-        .into_iter()
-        .collect(),
+        "ss" | "se" | "subagent_start" | "subagent_end" => {
+            transcript_codex_subagent_scope_event(payload)
+                .map(|(_, _, subagent)| {
+                    transcript_subagent_message(
+                        format!("codex-{line_index}-subagent"),
+                        "codex",
+                        timestamp,
+                        subagent,
+                        "Subagent",
+                    )
+                })
+                .into_iter()
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -3272,6 +3495,32 @@ mod agent_sessions_tests {
         assert_eq!(user_message.len(), 1);
         assert_eq!(user_message[0].role, "user");
         assert!(user_message[0].text.contains("queued prompt"));
+    }
+
+    #[test]
+    fn codex_token_count_event_emits_cumulative_usage() {
+        let messages = codex_messages_from_event(
+            6,
+            "2026-07-02T00:00:05Z",
+            &json!({
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 25,
+                        "cached_input_tokens": 40
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].kind, "usage_report");
+        let usage = messages[0].usage.as_ref().expect("usage");
+        assert_eq!(usage["input_tokens"], json!(100));
+        assert_eq!(usage["output_tokens"], json!(25));
+        assert_eq!(usage["cache_read_tokens"], json!(40));
+        assert_eq!(usage["cumulative"], json!(true));
     }
 
     #[test]
@@ -3875,6 +4124,241 @@ mod agent_sessions_tests {
     }
 
     #[test]
+    fn claude_sidechain_rows_resolve_root_parent_subagent_id() {
+        let root = unique_test_dir("claude-sidechain-stable-id");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("claude-session.jsonl");
+        let lines = [
+            json!({
+                "type": "user",
+                "uuid": "row-a",
+                "parentUuid": "mainline-spawn",
+                "isSidechain": true,
+                "sessionId": "claude-session",
+                "cwd": "/tmp/project",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "message": {"role": "user", "content": "sidechain prompt"}
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "row-b",
+                "parentUuid": "row-a",
+                "isSidechain": true,
+                "sessionId": "claude-session",
+                "cwd": "/tmp/project",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [{"type": "text", "text": "sidechain answer"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, format!("{lines}\n")).unwrap();
+
+        let (_, messages) = parse_claude_session(&path, 20).unwrap();
+        let scoped = messages
+            .iter()
+            .filter(|message| message.text.contains("sidechain"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(scoped.len(), 2);
+        assert_eq!(scoped[0].subagent_id, "mainline-spawn");
+        assert_eq!(scoped[1].subagent_id, "mainline-spawn");
+        assert_ne!(scoped[0].subagent_id, "row-a");
+        assert_ne!(scoped[1].subagent_id, "row-a");
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_mainline_parent_uuid_does_not_create_subagent() {
+        let root = unique_test_dir("claude-mainline-parent-uuid");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("claude-session.jsonl");
+        let lines = [
+            json!({
+                "type": "user",
+                "uuid": "row-user",
+                "parentUuid": "previous-mainline",
+                "isSidechain": false,
+                "sessionId": "claude-session",
+                "cwd": "/tmp/project",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "message": {"role": "user", "content": "please inspect"}
+            }),
+            json!({
+                "type": "assistant",
+                "uuid": "row-assistant",
+                "parentUuid": "row-user",
+                "isSidechain": false,
+                "sessionId": "claude-session",
+                "cwd": "/tmp/project",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "I will inspect it"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu-read",
+                            "name": "Read",
+                            "input": {"file_path": "src/main.rs"}
+                        }
+                    ]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, format!("{lines}\n")).unwrap();
+
+        let (_, messages) = parse_claude_session(&path, 20).unwrap();
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == "assistant" && message.text == "I will inspect it")
+            .expect("assistant message");
+        let tool = messages
+            .iter()
+            .find(|message| message.call_id == "toolu-read")
+            .expect("tool call");
+
+        assert_eq!(assistant.kind, "message");
+        assert!(assistant.subagent.is_none());
+        assert!(assistant.subagent_id.is_empty());
+        assert_eq!(tool.kind, "tool_call");
+        assert!(tool.subagent.is_none());
+        assert!(tool.subagent_id.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn claude_message_usage_reads_nested_message_usage() {
+        let root = unique_test_dir("claude-message-usage");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("claude-session.jsonl");
+        let lines = [json!({
+            "type": "assistant",
+            "uuid": "row-usage",
+            "sessionId": "claude-session",
+            "cwd": "/tmp/project",
+            "timestamp": "2026-07-02T00:00:00Z",
+            "message": {
+                "role": "assistant",
+                "usage": {
+                    "input_tokens": 17,
+                    "output_tokens": 5,
+                    "cache_read_input_tokens": 3,
+                    "cache_creation_input_tokens": 2
+                },
+                "content": [{"type": "text", "text": "usage-bearing answer"}]
+            }
+        })]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, format!("{lines}\n")).unwrap();
+
+        let (_, messages) = parse_claude_session(&path, 20).unwrap();
+        let assistant = messages
+            .iter()
+            .find(|message| message.text == "usage-bearing answer")
+            .expect("assistant message");
+        let usage = assistant.usage.as_ref().expect("usage");
+
+        assert_eq!(usage["input_tokens"], json!(17));
+        assert_eq!(usage["output_tokens"], json!(5));
+        assert_eq!(usage["cache_read_tokens"], json!(3));
+        assert_eq!(usage["cache_write_tokens"], json!(2));
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn codex_rollout_stamps_messages_inside_subagent_scope() {
+        let root = unique_test_dir("codex-subagent-scope");
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("rollout-test.jsonl");
+        let lines = [
+            json!({
+                "type": "session_meta",
+                "timestamp": "2026-07-02T00:00:00Z",
+                "payload": {"id": "codex-session", "cwd": "/tmp/project"}
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-07-02T00:00:01Z",
+                "payload": {"type": "ss", "id": "scope-a"}
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:02Z",
+                "payload": {
+                    "type": "function_call",
+                    "name": "shell_command",
+                    "call_id": "call-scope",
+                    "arguments": {"command": "cargo test"}
+                }
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:03Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "inside scope"}]
+                }
+            }),
+            json!({
+                "type": "event_msg",
+                "timestamp": "2026-07-02T00:00:04Z",
+                "payload": {"type": "se", "id": "scope-a"}
+            }),
+            json!({
+                "type": "response_item",
+                "timestamp": "2026-07-02T00:00:05Z",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "outside scope"}]
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        fs::write(&path, format!("{lines}\n")).unwrap();
+
+        let (_, messages) = parse_codex_rollout(&path, 20).unwrap();
+        let tool = messages
+            .iter()
+            .find(|message| message.call_id == "call-scope")
+            .expect("scoped tool");
+        let inside = messages
+            .iter()
+            .find(|message| message.text == "inside scope")
+            .expect("scoped assistant");
+        let outside = messages
+            .iter()
+            .find(|message| message.text == "outside scope")
+            .expect("outside assistant");
+
+        assert_eq!(tool.subagent_id, "scope-a");
+        assert_eq!(inside.subagent_id, "scope-a");
+        assert!(outside.subagent_id.is_empty());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn opencode_tool_output_uses_native_part_duration() {
         let messages = opencode_part_message(
             "msg1",
@@ -3920,7 +4404,10 @@ mod agent_sessions_tests {
         assert_eq!(message["kind"], json!("tool_call"));
         assert_eq!(message["canonicalKind"], json!("subagent"));
         assert_eq!(message["canonical_kind"], json!("subagent"));
+        assert_eq!(message["subagentId"], json!("worker-a"));
+        assert_eq!(message["subagent_id"], json!("worker-a"));
         assert_eq!(message["subagent"]["title"], json!("Review worker"));
+        assert_eq!(message["subagent"]["subagent_id"], json!("worker-a"));
     }
 }
 
@@ -3940,6 +4427,7 @@ fn parse_codex_rollout(
     let mut messages = Vec::new();
     let mut seen = HashSet::new();
     let mut tool_metadata = HashMap::<String, TranscriptToolCallMetadata>::new();
+    let mut active_subagents = Vec::<Value>::new();
 
     for (line_index, line) in std::io::BufRead::lines(reader).enumerate() {
         let Ok(line) = line else {
@@ -3967,7 +4455,14 @@ fn parse_codex_rollout(
                 if payload.get("type").and_then(Value::as_str) == Some("thread_name_updated") {
                     meta.title = clean_codex_title(value_string(payload.get("thread_name")), "");
                 }
-                for message in codex_messages_from_event(line_index, &timestamp, payload) {
+                let mut parsed_messages =
+                    codex_messages_from_event(line_index, &timestamp, payload);
+                transcript_apply_codex_subagent_scope(
+                    &mut active_subagents,
+                    payload,
+                    &mut parsed_messages,
+                );
+                for message in parsed_messages {
                     push_codex_message_with_tool_metadata(
                         &mut messages,
                         &mut seen,
@@ -3977,7 +4472,14 @@ fn parse_codex_rollout(
                 }
             }
             "response_item" => {
-                for message in codex_messages_from_response_item(line_index, &timestamp, payload) {
+                let mut parsed_messages =
+                    codex_messages_from_response_item(line_index, &timestamp, payload);
+                transcript_apply_codex_subagent_scope(
+                    &mut active_subagents,
+                    payload,
+                    &mut parsed_messages,
+                );
+                for message in parsed_messages {
                     push_codex_message_with_tool_metadata(
                         &mut messages,
                         &mut seen,
@@ -4355,6 +4857,7 @@ fn claude_activity_from_block(
     block_index: usize,
     timestamp: &str,
     block: &Value,
+    parent_subagent: Option<&Value>,
 ) -> Option<CodexThreadTranscriptMessage> {
     let block_type = block
         .get("type")
@@ -4408,6 +4911,10 @@ fn claude_activity_from_block(
                     title,
                 )),
                 file_change,
+                subagent_id: parent_subagent
+                    .map(transcript_subagent_link_id)
+                    .unwrap_or_default(),
+                subagent: parent_subagent.cloned(),
                 usage: transcript_usage_from_value(block),
                 truncated,
                 artifacts: Vec::new(),
@@ -4461,6 +4968,10 @@ fn claude_activity_from_block(
                 )),
                 tool_output: (!has_error).then(|| tool_output.clone()).flatten(),
                 tool_error: has_error.then(|| tool_output.clone()).flatten(),
+                subagent_id: parent_subagent
+                    .map(transcript_subagent_link_id)
+                    .unwrap_or_default(),
+                subagent: parent_subagent.cloned(),
                 usage: transcript_usage_from_value(block),
                 truncated: text_truncated || output_truncated,
                 artifacts,
@@ -4485,6 +4996,10 @@ fn claude_activity_from_block(
                     call_id: String::new(),
                     created_at: timestamp.to_string(),
                     source: "claude".to_string(),
+                    subagent_id: parent_subagent
+                        .map(transcript_subagent_link_id)
+                        .unwrap_or_default(),
+                    subagent: parent_subagent.cloned(),
                     usage: transcript_usage_from_value(block),
                     truncated,
                     artifacts: Vec::new(),
@@ -4520,6 +5035,7 @@ fn parse_claude_session(
     let mut messages = Vec::new();
     let mut seen = HashSet::new();
     let mut tool_metadata = HashMap::<String, TranscriptToolCallMetadata>::new();
+    let mut sidechains = TranscriptClaudeSidechainTracker::default();
 
     for (line_index, line) in std::io::BufRead::lines(reader).enumerate() {
         let Ok(line) = line else {
@@ -4647,6 +5163,7 @@ fn parse_claude_session(
                 claude_content_text(content),
                 CODEX_TRANSCRIPT_MAX_TEXT,
             );
+            let parent_subagent = sidechains.subagent_from_value(&value, "Sidechain");
             if !text.is_empty() {
                 push_codex_message_with_tool_metadata(
                     &mut messages,
@@ -4660,7 +5177,11 @@ fn parse_claude_session(
                         call_id: String::new(),
                         created_at: timestamp.clone(),
                         source: "claude".to_string(),
-                        subagent: transcript_sidechain_subagent_from_value(&value, "Sidechain"),
+                        subagent_id: parent_subagent
+                            .as_ref()
+                            .map(transcript_subagent_link_id)
+                            .unwrap_or_default(),
+                        subagent: parent_subagent.clone(),
                         usage: transcript_usage_from_value(&value),
                         truncated,
                         artifacts: Vec::new(),
@@ -4675,7 +5196,13 @@ fn parse_claude_session(
                     push_codex_message_with_tool_metadata(
                         &mut messages,
                         &mut seen,
-                        claude_activity_from_block(line_index, block_index, &timestamp, block),
+                        claude_activity_from_block(
+                            line_index,
+                            block_index,
+                            &timestamp,
+                            block,
+                            parent_subagent.as_ref(),
+                        ),
                         &mut tool_metadata,
                     );
                 }
@@ -6044,6 +6571,20 @@ fn agent_thread_transcript_signature(result: &CodexThreadTranscriptResult) -> St
 
 fn agent_thread_transcript_direct_message_value(message: &CodexThreadTranscriptMessage) -> Value {
     let mut value = serde_json::to_value(message).unwrap_or_else(|_| json!({}));
+    if let Some(object) = value.as_object_mut() {
+        if let Some(subagent_id) = object.get("subagentId").cloned() {
+            object
+                .entry("subagent_id".to_string())
+                .or_insert(subagent_id);
+        }
+        if let Some(subagent) = object.get_mut("subagent").and_then(Value::as_object_mut) {
+            if let Some(subagent_id) = subagent.get("subagentId").cloned() {
+                subagent
+                    .entry("subagent_id".to_string())
+                    .or_insert(subagent_id);
+            }
+        }
+    }
     let legacy_kind = cloud_mcp_payload_text(&value, &["legacyKind", "legacy_kind"])
         .filter(|value| !value.trim().is_empty());
     if let Some(legacy_kind) = legacy_kind {

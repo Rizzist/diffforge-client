@@ -4957,6 +4957,22 @@ const AudioWorkspaceView = memo(function AudioWorkspaceView({
                       <span>Buffer</span>
                       <strong>{Math.round((audioInputStats.bufferMs || 0) / 1000)}s</strong>
                     </AudioSettingsIdentityItem>
+                    <AudioSettingsIdentityItem
+                      title={audioInputStats.engine === "voice_processing"
+                        ? "Apple voice processing: system echo cancellation and noise suppression. Agent speech cannot leak back into the mic."
+                        : audioInputStats.engine === "raw"
+                          ? "Raw capture (no system echo cancellation) — used when voice processing is unavailable, e.g. while another app holds the mic in call mode. The voice agent mutes its mic while it speaks in this mode."
+                          : "Shown while the live input preview is running."}
+                    >
+                      <span>Echo cancel</span>
+                      <strong>
+                        {audioInputStats.engine === "voice_processing"
+                          ? "System"
+                          : audioInputStats.engine === "raw"
+                            ? "Off (raw)"
+                            : "—"}
+                      </strong>
+                    </AudioSettingsIdentityItem>
                   </SettingsIdentityGrid>
                   <SettingsHint>{audioInputMessage}</SettingsHint>
                   {audioInputPermissionMissing && (

@@ -39,6 +39,8 @@ const AUDIO_INPUT_DEVICE_LIST_TIMEOUT_SECS: u64 = 8;
 const AUDIO_WIDGET_MAIN_THREAD_ACTION_TIMEOUT_SECS: u64 = 5;
 const NATIVE_AUDIO_COMMAND_TIMEOUT_SECS: u64 = 12;
 const NATIVE_AUDIO_FINISH_TIMEOUT_SECS: u64 = 30;
+const NATIVE_AUDIO_WORKER_POLL_MS: u64 = 250;
+const VOICE_TTS_PLAYBACK_TAIL_MS: u64 = 350;
 #[cfg(target_os = "macos")]
 const MACOS_MICROPHONE_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone";
@@ -59,6 +61,7 @@ struct ForgeVoiceCachedRoute {
 static FORGE_VOICE_ROUTE_CACHE: OnceLock<StdMutex<HashMap<String, ForgeVoiceCachedRoute>>> =
     OnceLock::new();
 static AUDIO_INPUT_DEVICE_CACHE: OnceLock<StdMutex<Vec<AudioInputDeviceSummary>>> = OnceLock::new();
+static VOICE_TTS_PLAYING_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "macos")]
 #[link(name = "AVFoundation", kind = "framework")]
@@ -198,7 +201,7 @@ async fn realtime_dictation_release_mic(
     }
     match audio_state
         .input_worker
-        .attach_realtime_stream_silent(session.audio_tx.clone())
+        .attach_voice_agent_realtime_stream_silent(session.audio_tx.clone())
     {
         Ok(_) => {
             realtime_mic_holder_set(audio_state, RealtimeMicHolder::VoiceAgent);
@@ -527,6 +530,7 @@ fn warm_whisper_model_file_cache(model_path: &Path) -> Result<u64, String> {
 
 struct NativeAudioChunk {
     duration_ms: f64,
+    realtime_replay_allowed: bool,
     samples: Vec<f32>,
     timestamp: Instant,
 }
@@ -581,10 +585,14 @@ struct NativeAudioShared {
     capture_started_at: Option<Instant>,
     chunks: VecDeque<NativeAudioChunk>,
     input_chunk_count: u64,
+    last_callback_at: Option<Instant>,
     last_stats_at: Instant,
+    digital_zero_started_at: Option<Instant>,
+    last_nonzero_input_at: Option<Instant>,
     partial_capture: Option<NativePartialCaptureState>,
     partial_finished_capture: Option<NativePartialFinishedCapture>,
     realtime_audio_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    realtime_tts_gate: bool,
     sample_rate: u32,
     total_samples: usize,
 }
@@ -599,10 +607,14 @@ impl NativeAudioShared {
             capture_started_at: None,
             chunks: VecDeque::new(),
             input_chunk_count: 0,
+            last_callback_at: None,
             last_stats_at: Instant::now(),
+            digital_zero_started_at: None,
+            last_nonzero_input_at: None,
             partial_capture: None,
             partial_finished_capture: None,
             realtime_audio_tx: None,
+            realtime_tts_gate: false,
             sample_rate,
             total_samples: 0,
         }
@@ -622,6 +634,31 @@ enum NativeAudioStreamHandle {
     VoiceProcessing(MacosVoiceProcessingCapture),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeAudioEngine {
+    Raw,
+    #[cfg(target_os = "macos")]
+    VoiceProcessing,
+}
+
+impl NativeAudioEngine {
+    fn status_engine(self) -> &'static str {
+        match self {
+            NativeAudioEngine::Raw => "raw",
+            #[cfg(target_os = "macos")]
+            NativeAudioEngine::VoiceProcessing => "voice_processing",
+        }
+    }
+
+    fn echo_cancellation(self) -> bool {
+        match self {
+            NativeAudioEngine::Raw => false,
+            #[cfg(target_os = "macos")]
+            NativeAudioEngine::VoiceProcessing => true,
+        }
+    }
+}
+
 impl NativeAudioStreamHandle {
     /// On macOS, park/engage the VoiceProcessingIO DSP. No-op for the cpal
     /// fallback (and on non-macos), which has no echo canceller to gate.
@@ -638,12 +675,16 @@ impl NativeAudioStreamHandle {
 }
 
 struct NativeAudioSession {
+    app: AppHandle,
     device_id: String,
+    engine: NativeAudioEngine,
     label: String,
     owners: HashSet<String>,
     sample_rate: u32,
     shared: Arc<StdMutex<NativeAudioShared>>,
     _stream: NativeAudioStreamHandle,
+    #[cfg(target_os = "macos")]
+    voice_processing_delivery_started_at: Option<Instant>,
 }
 
 impl NativeAudioSession {
@@ -659,6 +700,7 @@ enum NativeAudioCommand {
         // new consumer (used when mic arbitration resumes a paused consumer:
         // it must not hear what was spoken while another consumer held the mic).
         replay_buffered: bool,
+        tts_echo_gate: bool,
         response: std::sync::mpsc::Sender<Result<AudioInputMonitorStatus, String>>,
     },
     Begin {
@@ -769,23 +811,30 @@ impl NativeAudioWorker {
         &self,
         audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<AudioInputMonitorStatus, String> {
-        self.attach_realtime_stream_with_replay(audio_tx, true)
+        self.attach_realtime_stream_with_replay(audio_tx, true, false)
     }
 
-    /// Attach without replaying buffered capture-window audio: mic
-    /// arbitration resume must not feed a paused consumer the speech that was
-    /// captured while another consumer held the microphone.
-    fn attach_realtime_stream_silent(
+    fn attach_voice_agent_realtime_stream(
         &self,
         audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Result<AudioInputMonitorStatus, String> {
-        self.attach_realtime_stream_with_replay(audio_tx, false)
+        self.attach_realtime_stream_with_replay(audio_tx, true, true)
+    }
+
+    /// Reattach the voice agent without replaying audio captured while
+    /// dictation borrowed the mic.
+    fn attach_voice_agent_realtime_stream_silent(
+        &self,
+        audio_tx: mpsc::UnboundedSender<Vec<u8>>,
+    ) -> Result<AudioInputMonitorStatus, String> {
+        self.attach_realtime_stream_with_replay(audio_tx, false, true)
     }
 
     fn attach_realtime_stream_with_replay(
         &self,
         audio_tx: mpsc::UnboundedSender<Vec<u8>>,
         replay_buffered: bool,
+        tts_echo_gate: bool,
     ) -> Result<AudioInputMonitorStatus, String> {
         self.run_command_with_timeout(
             "attach_realtime",
@@ -793,6 +842,7 @@ impl NativeAudioWorker {
             |response| NativeAudioCommand::AttachRealtime {
                 audio_tx,
                 replay_buffered,
+                tts_echo_gate,
                 response,
             },
         )
@@ -901,6 +951,8 @@ fn inactive_native_audio_status() -> AudioInputMonitorStatus {
         label: String::new(),
         sample_rate: AUDIO_TARGET_SAMPLE_RATE,
         owner_count: 0,
+        engine: NativeAudioEngine::Raw.status_engine(),
+        echo_cancellation: false,
     }
 }
 
@@ -920,22 +972,194 @@ fn apply_voice_processing_bypass(
     }
 }
 
+#[cfg(target_os = "macos")]
+fn update_macos_voice_processing_delivery_state(
+    session: &mut Option<NativeAudioSession>,
+    capture_active: bool,
+    realtime_attached: bool,
+) {
+    let delivering = capture_active || realtime_attached;
+    let Some(active) = session.as_mut() else {
+        return;
+    };
+
+    if active.engine == NativeAudioEngine::VoiceProcessing && delivering {
+        if active.voice_processing_delivery_started_at.is_none() {
+            active.voice_processing_delivery_started_at = Some(Instant::now());
+            if let Ok(mut shared) = active.shared.lock() {
+                shared.digital_zero_started_at = None;
+            }
+        }
+    } else {
+        active.voice_processing_delivery_started_at = None;
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_voice_processing_dead_signal_reason(
+    session: &NativeAudioSession,
+) -> Option<(&'static str, u64)> {
+    if session.engine != NativeAudioEngine::VoiceProcessing {
+        return None;
+    }
+    let delivery_started_at = session.voice_processing_delivery_started_at?;
+    let (last_callback_at, digital_zero_started_at) = session
+        .shared
+        .lock()
+        .ok()
+        .map(|shared| (shared.last_callback_at, shared.digital_zero_started_at))?;
+    let now = Instant::now();
+    let callback_reference_at = last_callback_at
+        .filter(|last_callback_at| *last_callback_at >= delivery_started_at)
+        .unwrap_or(delivery_started_at);
+    let no_callback_ms = now
+        .saturating_duration_since(callback_reference_at)
+        .as_millis() as u64;
+
+    if no_callback_ms >= MACOS_VPIO_SILENCE_DOWNGRADE_MS {
+        return Some(("no_callbacks", no_callback_ms));
+    }
+
+    let digital_zero_started_at =
+        digital_zero_started_at.filter(|started_at| *started_at >= delivery_started_at)?;
+    let digital_zero_ms = now
+        .saturating_duration_since(digital_zero_started_at)
+        .as_millis() as u64;
+    (digital_zero_ms >= MACOS_VPIO_SILENCE_DOWNGRADE_MS)
+        .then_some(("digital_zero", digital_zero_ms))
+}
+
+#[cfg(target_os = "macos")]
+fn downgrade_macos_voice_processing_session_to_raw(
+    session: &mut Option<NativeAudioSession>,
+    reason: &'static str,
+    elapsed_ms: u64,
+) -> Result<AudioInputMonitorStatus, String> {
+    let started_at = Instant::now();
+    let Some(active_session) = session.as_ref() else {
+        return Err("Native audio session is not active.".to_string());
+    };
+    let app = active_session.app.clone();
+    let requested_device_id = active_session.device_id.clone();
+    let previous_label = active_session.label.clone();
+    let previous_sample_rate = active_session.sample_rate;
+    let owners = active_session.owners.clone();
+    let (device, device_id, label) = cpal_input_device_by_id(&requested_device_id)?;
+    let handoff = native_audio_take_session_handoff(active_session)?;
+    let old_session = session
+        .take()
+        .ok_or_else(|| "Native audio session is not active.".to_string())?;
+
+    MACOS_VPIO_SILENCE_COOLDOWN_UNTIL_MS.store(
+        audio_epoch_ms().saturating_add(MACOS_VPIO_SILENCE_COOLDOWN_MS),
+        Ordering::Release,
+    );
+
+    log_whisper_local_audio_event(
+        "audio.monitor.voice_processing_silence_downgrade",
+        None,
+        json!({
+            "reason": reason,
+            "elapsed_ms": elapsed_ms,
+            "device_id": &requested_device_id,
+            "label": &previous_label,
+            "sample_rate": previous_sample_rate,
+            "owner_count": owners.len(),
+        }),
+    );
+
+    drop(old_session);
+    let (next_session, sample_format, channels) =
+        build_raw_native_audio_session(app, device, device_id, label, owners, Some(handoff))?;
+    let status = native_audio_status(&next_session);
+    *session = Some(next_session);
+
+    log_whisper_local_audio_event(
+        "audio.monitor.voice_processing_silence_downgrade.done",
+        Some(started_at.elapsed()),
+        json!({
+            "reason": reason,
+            "elapsed_ms": elapsed_ms,
+            "device_id": &status.device_id,
+            "label": &status.label,
+            "sample_rate": status.sample_rate,
+            "sample_format": sample_format,
+            "channels": channels,
+            "engine": status.engine,
+            "echo_cancellation": status.echo_cancellation,
+            "owner_count": status.owner_count,
+        }),
+    );
+
+    Ok(status)
+}
+
+#[cfg(target_os = "macos")]
+fn maintain_macos_voice_processing_session(
+    session: &mut Option<NativeAudioSession>,
+    capture_active: &mut bool,
+    realtime_attached: &mut bool,
+) {
+    update_macos_voice_processing_delivery_state(session, *capture_active, *realtime_attached);
+    let Some(active_session) = session.as_ref() else {
+        return;
+    };
+    let Some((reason, elapsed_ms)) = macos_voice_processing_dead_signal_reason(active_session)
+    else {
+        return;
+    };
+
+    if let Err(error) =
+        downgrade_macos_voice_processing_session_to_raw(session, reason, elapsed_ms)
+    {
+        if session.is_none() {
+            *capture_active = false;
+            *realtime_attached = false;
+        }
+        log_whisper_local_audio_event(
+            "audio.monitor.voice_processing_silence_downgrade.error",
+            None,
+            json!({
+                "reason": reason,
+                "elapsed_ms": elapsed_ms,
+                "error": clean_whisper_local_audio_log_text(&error),
+            }),
+        );
+    }
+}
+
 fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCommand>) {
     let mut session: Option<NativeAudioSession> = None;
     let mut capture_active = false;
     let mut realtime_attached = false;
 
-    while let Ok(command) = command_rx.recv() {
+    loop {
+        let command = match command_rx.recv_timeout(Duration::from_millis(NATIVE_AUDIO_WORKER_POLL_MS)) {
+            Ok(command) => command,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                #[cfg(target_os = "macos")]
+                maintain_macos_voice_processing_session(
+                    &mut session,
+                    &mut capture_active,
+                    &mut realtime_attached,
+                );
+                continue;
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+
         match command {
             NativeAudioCommand::AttachRealtime {
                 audio_tx,
                 replay_buffered,
+                tts_echo_gate,
                 response,
             } => {
                 let result = attach_native_audio_realtime_stream(
                     session.as_ref(),
                     audio_tx,
                     replay_buffered,
+                    tts_echo_gate,
                 );
                 if result.is_ok() {
                     realtime_attached = true;
@@ -1029,6 +1253,13 @@ fn native_audio_worker_loop(command_rx: std::sync::mpsc::Receiver<NativeAudioCom
                 let _ = response.send(result);
             }
         }
+
+        #[cfg(target_os = "macos")]
+        maintain_macos_voice_processing_session(
+            &mut session,
+            &mut capture_active,
+            &mut realtime_attached,
+        );
     }
 }
 
@@ -1550,6 +1781,83 @@ fn audio_rms_dbfs(rms: f32) -> f32 {
     }
 }
 
+fn audio_epoch_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn native_audio_samples_are_digital_zero(samples: &[f32]) -> bool {
+    !samples.is_empty()
+        && samples
+            .iter()
+            .all(|sample| sample.is_finite() && sample.abs() <= f32::MIN_POSITIVE)
+}
+
+fn resample_native_audio_samples_to_rate(
+    samples: &[f32],
+    source_rate: u32,
+    target_rate: u32,
+) -> Vec<f32> {
+    if samples.is_empty() || source_rate == 0 || target_rate == 0 || source_rate == target_rate {
+        return samples.to_vec();
+    }
+
+    let output_len = ((samples.len() as u64 * u64::from(target_rate)
+        + u64::from(source_rate) / 2)
+        / u64::from(source_rate))
+        .max(1) as usize;
+    let step = f64::from(source_rate) / f64::from(target_rate);
+    let mut output = Vec::with_capacity(output_len);
+    for index in 0..output_len {
+        let position = index as f64 * step;
+        let left = (position.floor() as usize).min(samples.len() - 1);
+        let right = (left + 1).min(samples.len() - 1);
+        let blend = (position - left as f64) as f32;
+        output.push(samples[left] + (samples[right] - samples[left]) * blend);
+    }
+    output
+}
+
+fn voice_tts_playback_clear_deadline() {
+    VOICE_TTS_PLAYING_UNTIL_MS.store(0, Ordering::Release);
+}
+
+fn voice_tts_playback_extend_deadline(bytes: &[u8], sample_rate: u32) {
+    if bytes.len() < 2 || sample_rate == 0 {
+        return;
+    }
+
+    let sample_count = (bytes.len() / 2) as u64;
+    let duration_ms = (((sample_count as u128) * 1000 + u128::from(sample_rate) - 1)
+        / u128::from(sample_rate))
+        .min(u128::from(u64::MAX)) as u64;
+    let now = audio_epoch_ms();
+    let mut current = VOICE_TTS_PLAYING_UNTIL_MS.load(Ordering::Acquire);
+
+    loop {
+        let queued_audio_end = current.saturating_sub(VOICE_TTS_PLAYBACK_TAIL_MS);
+        let next = queued_audio_end
+            .max(now)
+            .saturating_add(duration_ms)
+            .saturating_add(VOICE_TTS_PLAYBACK_TAIL_MS);
+        match VOICE_TTS_PLAYING_UNTIL_MS.compare_exchange(
+            current,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn voice_tts_playback_active() -> bool {
+    VOICE_TTS_PLAYING_UNTIL_MS.load(Ordering::Acquire) > audio_epoch_ms()
+}
+
 fn native_partial_capture_state(
     session_id: String,
     chunk_tx: mpsc::UnboundedSender<NativePartialAudioChunk>,
@@ -1683,9 +1991,17 @@ fn process_native_audio_samples(
     app: &AppHandle,
     device_id: &str,
     shared: &Arc<StdMutex<NativeAudioShared>>,
+    engine: NativeAudioEngine,
     samples: Vec<f32>,
 ) {
     if samples.is_empty() {
+        if let Ok(mut shared) = shared.lock() {
+            let now = Instant::now();
+            shared.last_callback_at = Some(now);
+            if shared.digital_zero_started_at.is_none() {
+                shared.digital_zero_started_at = Some(now);
+            }
+        }
         return;
     }
 
@@ -1702,15 +2018,28 @@ fn process_native_audio_samples(
         let (rms, peak) = native_audio_stats(&samples);
         let sample_rate = shared.sample_rate;
         let duration_ms = (samples.len() as f64 / sample_rate as f64) * 1000.0;
+        let digital_zero = native_audio_samples_are_digital_zero(&samples);
+        let raw_tts_playback_active =
+            engine == NativeAudioEngine::Raw && voice_tts_playback_active();
+        let realtime_tts_gate_active = shared.realtime_tts_gate && raw_tts_playback_active;
         let partial_samples = if shared.partial_capture.is_some() {
             Some(samples.clone())
         } else {
             None
         };
+        shared.last_callback_at = Some(now);
+        if digital_zero {
+            if shared.digital_zero_started_at.is_none() {
+                shared.digital_zero_started_at = Some(now);
+            }
+        } else {
+            shared.digital_zero_started_at = None;
+            shared.last_nonzero_input_at = Some(now);
+        }
 
         if shared.capture_started_at.is_some() {
             realtime_audio_tx = shared.realtime_audio_tx.clone();
-            if realtime_audio_tx.is_some() {
+            if realtime_audio_tx.is_some() && !realtime_tts_gate_active {
                 realtime_audio = Some(encode_linear16_audio(&samples));
             }
         }
@@ -1718,6 +2047,7 @@ fn process_native_audio_samples(
         shared.input_chunk_count += 1;
         shared.chunks.push_back(NativeAudioChunk {
             duration_ms,
+            realtime_replay_allowed: !raw_tts_playback_active,
             samples,
             timestamp: now,
         });
@@ -1777,6 +2107,8 @@ fn process_native_audio_samples(
             );
             Some(AudioInputStats {
                 device_id: device_id.to_string(),
+                engine: engine.status_engine(),
+                echo_cancellation: engine.echo_cancellation(),
                 rms,
                 peak,
                 buffer_ms: ((shared.total_samples as f64 / shared.sample_rate as f64) * 1000.0)
@@ -1826,6 +2158,10 @@ const MACOS_VOICE_PROCESSING_SAMPLE_RATE: u32 = 48_000;
 /// or realtime attach we restore the device's natural buffer for low latency.
 #[cfg(target_os = "macos")]
 const MACOS_VOICE_STANDBY_BUFFER_FRAMES: u32 = 4096;
+#[cfg(target_os = "macos")]
+const MACOS_VPIO_SILENCE_DOWNGRADE_MS: u64 = 1_500;
+#[cfg(target_os = "macos")]
+const MACOS_VPIO_SILENCE_COOLDOWN_MS: u64 = 60_000;
 
 /// True while a VoiceProcessingIO capture session is live. The cloud voice
 /// agent checks it to route TTS playback through the unit's own output
@@ -1833,6 +2169,8 @@ const MACOS_VOICE_STANDBY_BUFFER_FRAMES: u32 = 4096;
 /// far-end signal.
 #[cfg(target_os = "macos")]
 static MACOS_VOICE_PROCESSING_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "macos")]
+static MACOS_VPIO_SILENCE_COOLDOWN_UNTIL_MS: AtomicU64 = AtomicU64::new(0);
 #[cfg(target_os = "macos")]
 static MACOS_VOICE_PLAYBACK_QUEUE: OnceLock<Arc<StdMutex<VecDeque<f32>>>> = OnceLock::new();
 /// Hard cap on queued native playback (30s at the unit rate) so a runaway
@@ -2194,6 +2532,7 @@ fn build_macos_voice_processing_capture(
             &app,
             &callback_device_id,
             &callback_shared,
+            NativeAudioEngine::VoiceProcessing,
             args.data.buffer.to_vec(),
         );
         Ok(())
@@ -2268,6 +2607,7 @@ fn build_native_audio_stream(
                         &callback_app,
                         &callback_device_id,
                         &callback_shared,
+                        NativeAudioEngine::Raw,
                         native_audio_mono_samples(data, channels, |sample| *sample),
                     );
                 },
@@ -2287,6 +2627,7 @@ fn build_native_audio_stream(
                         &callback_app,
                         &callback_device_id,
                         &callback_shared,
+                        NativeAudioEngine::Raw,
                         native_audio_mono_samples(data, channels, |sample| *sample as f32),
                     );
                 },
@@ -2306,6 +2647,7 @@ fn build_native_audio_stream(
                         &callback_app,
                         &callback_device_id,
                         &callback_shared,
+                        NativeAudioEngine::Raw,
                         native_audio_mono_samples(data, channels, |sample| {
                             *sample as f32 / i16::MAX as f32
                         }),
@@ -2327,6 +2669,7 @@ fn build_native_audio_stream(
                         &callback_app,
                         &callback_device_id,
                         &callback_shared,
+                        NativeAudioEngine::Raw,
                         native_audio_mono_samples(data, channels, |sample| {
                             ((*sample as f32) - 32768.0) / 32768.0
                         }),
@@ -2348,6 +2691,7 @@ fn build_native_audio_stream(
                         &callback_app,
                         &callback_device_id,
                         &callback_shared,
+                        NativeAudioEngine::Raw,
                         native_audio_mono_samples(data, channels, |sample| {
                             *sample as f32 / i32::MAX as f32
                         }),
@@ -2369,6 +2713,7 @@ fn build_native_audio_stream(
                         &callback_app,
                         &callback_device_id,
                         &callback_shared,
+                        NativeAudioEngine::Raw,
                         native_audio_mono_samples(data, channels, |sample| {
                             ((*sample as f64 - 2_147_483_648.0) / 2_147_483_648.0) as f32
                         }),
@@ -2588,6 +2933,147 @@ fn finish_native_whisper_audio_capture(
     )
 }
 
+struct NativeAudioSessionHandoff {
+    capture_chunk_count: u64,
+    capture_input_ms: f64,
+    capture_peak: f32,
+    capture_rms: f32,
+    capture_started_at: Option<Instant>,
+    chunks: VecDeque<NativeAudioChunk>,
+    input_chunk_count: u64,
+    partial_capture: Option<NativePartialCaptureState>,
+    partial_finished_capture: Option<NativePartialFinishedCapture>,
+    realtime_audio_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    realtime_tts_gate: bool,
+    sample_rate: u32,
+    total_samples: usize,
+}
+
+fn native_audio_take_session_handoff(
+    session: &NativeAudioSession,
+) -> Result<NativeAudioSessionHandoff, String> {
+    let mut shared = session
+        .shared
+        .lock()
+        .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
+    Ok(NativeAudioSessionHandoff {
+        capture_chunk_count: shared.capture_chunk_count,
+        capture_input_ms: shared.capture_input_ms,
+        capture_peak: shared.capture_peak,
+        capture_rms: shared.capture_rms,
+        capture_started_at: shared.capture_started_at,
+        chunks: std::mem::take(&mut shared.chunks),
+        input_chunk_count: shared.input_chunk_count,
+        partial_capture: shared.partial_capture.take(),
+        partial_finished_capture: shared.partial_finished_capture.take(),
+        realtime_audio_tx: shared.realtime_audio_tx.take(),
+        realtime_tts_gate: shared.realtime_tts_gate,
+        sample_rate: shared.sample_rate,
+        total_samples: shared.total_samples,
+    })
+}
+
+fn native_audio_apply_session_handoff(
+    shared: &Arc<StdMutex<NativeAudioShared>>,
+    handoff: NativeAudioSessionHandoff,
+) -> Result<(), String> {
+    let mut shared = shared
+        .lock()
+        .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
+    let source_rate = handoff.sample_rate;
+    let target_rate = shared.sample_rate;
+    let mut chunks = handoff.chunks;
+    if source_rate != target_rate {
+        for chunk in chunks.iter_mut() {
+            chunk.samples =
+                resample_native_audio_samples_to_rate(&chunk.samples, source_rate, target_rate);
+        }
+    }
+    let total_samples = if source_rate == target_rate {
+        handoff.total_samples
+    } else {
+        chunks.iter().map(|chunk| chunk.samples.len()).sum()
+    };
+    let mut partial_capture = handoff.partial_capture;
+    if source_rate != target_rate {
+        if let Some(partial) = partial_capture.as_mut() {
+            partial.buffered_samples = resample_native_audio_samples_to_rate(
+                &partial.buffered_samples,
+                source_rate,
+                target_rate,
+            );
+        }
+    }
+
+    shared.capture_started_at = handoff.capture_started_at;
+    shared.capture_chunk_count = handoff.capture_chunk_count;
+    shared.capture_input_ms = handoff.capture_input_ms;
+    shared.capture_peak = handoff.capture_peak;
+    shared.capture_rms = handoff.capture_rms;
+    shared.chunks = chunks;
+    shared.input_chunk_count = handoff.input_chunk_count;
+    shared.total_samples = total_samples;
+    shared.partial_capture = partial_capture;
+    shared.partial_finished_capture = handoff.partial_finished_capture;
+    shared.realtime_audio_tx = handoff.realtime_audio_tx;
+    shared.realtime_tts_gate = handoff.realtime_tts_gate;
+    shared.last_stats_at = Instant::now();
+    shared.last_callback_at = None;
+    shared.digital_zero_started_at = None;
+    shared.last_nonzero_input_at = None;
+    native_audio_trim(&mut shared);
+    Ok(())
+}
+
+fn build_raw_native_audio_session(
+    app: AppHandle,
+    device: cpal::Device,
+    device_id: String,
+    label: String,
+    owners: HashSet<String>,
+    handoff: Option<NativeAudioSessionHandoff>,
+) -> Result<(NativeAudioSession, String, u16), String> {
+    let supported_config = device
+        .default_input_config()
+        .map_err(|error| native_audio_error_message(error))?;
+    let sample_rate = supported_config.sample_rate().0;
+    let sample_format = format!("{:?}", supported_config.sample_format());
+    let channels = supported_config.channels();
+    let shared = Arc::new(StdMutex::new(NativeAudioShared::new(sample_rate)));
+    let stream = build_native_audio_stream(
+        app.clone(),
+        device_id.clone(),
+        &device,
+        &supported_config,
+        shared.clone(),
+    )?;
+
+    if let Some(handoff) = handoff {
+        native_audio_apply_session_handoff(&shared, handoff)?;
+    }
+
+    stream
+        .play()
+        .map_err(|error| native_audio_error_message(error))?;
+
+    Ok((
+        NativeAudioSession {
+            app,
+            device_id,
+            engine: NativeAudioEngine::Raw,
+            label,
+            owners,
+            sample_rate,
+            shared,
+            _stream: NativeAudioStreamHandle::Cpal(stream),
+            #[cfg(target_os = "macos")]
+            voice_processing_delivery_started_at: None,
+        },
+        sample_format,
+        channels,
+    ))
+}
+
 fn native_audio_status(session: &NativeAudioSession) -> AudioInputMonitorStatus {
     AudioInputMonitorStatus {
         monitoring: true,
@@ -2595,6 +3081,8 @@ fn native_audio_status(session: &NativeAudioSession) -> AudioInputMonitorStatus 
         label: session.label.clone(),
         sample_rate: session.sample_rate,
         owner_count: session.owners.len(),
+        engine: session.engine.status_engine(),
+        echo_cancellation: session.engine.echo_cancellation(),
     }
 }
 
@@ -2602,6 +3090,7 @@ fn attach_native_audio_realtime_stream(
     session: Option<&NativeAudioSession>,
     audio_tx: mpsc::UnboundedSender<Vec<u8>>,
     replay_buffered: bool,
+    tts_echo_gate: bool,
 ) -> Result<AudioInputMonitorStatus, String> {
     let active_session = session
         .ok_or_else(|| "Enable an input source before starting cloud transcription.".to_string())?;
@@ -2619,7 +3108,10 @@ fn attach_native_audio_realtime_stream(
                 for chunk in shared
                     .chunks
                     .iter()
-                    .filter(|chunk| native_audio_chunk_reaches(chunk, capture_started_at))
+                    .filter(|chunk| {
+                        native_audio_chunk_reaches(chunk, capture_started_at)
+                            && (!tts_echo_gate || chunk.realtime_replay_allowed)
+                    })
                 {
                     buffered_chunks += 1;
                     buffered_input_ms += chunk.duration_ms;
@@ -2629,6 +3121,7 @@ fn attach_native_audio_realtime_stream(
         }
 
         shared.realtime_audio_tx = Some(audio_tx.clone());
+        shared.realtime_tts_gate = tts_echo_gate;
 
         (
             native_audio_status(active_session),
@@ -2649,6 +3142,9 @@ fn attach_native_audio_realtime_stream(
             "device_id": &status.device_id,
             "label": &status.label,
             "sample_rate": status.sample_rate,
+            "engine": status.engine,
+            "echo_cancellation": status.echo_cancellation,
+            "tts_echo_gate": tts_echo_gate,
             "owner_count": status.owner_count,
             "buffered_chunks": buffered_chunks,
             "buffered_input_ms": buffered_input_ms,
@@ -2665,6 +3161,7 @@ fn detach_native_audio_realtime_stream(session: Option<&NativeAudioSession>) -> 
             .lock()
             .map_err(|_| "Unable to lock native audio input buffer.".to_string())?;
         shared.realtime_audio_tx = None;
+        shared.realtime_tts_gate = false;
     }
 
     Ok(())
@@ -2701,6 +3198,8 @@ fn start_native_audio_session(
                     "device_id": &status.device_id,
                     "label": &status.label,
                     "sample_rate": status.sample_rate,
+                    "engine": status.engine,
+                    "echo_cancellation": status.echo_cancellation,
                     "owner_count": status.owner_count,
                 }),
             );
@@ -2717,76 +3216,71 @@ fn start_native_audio_session(
     // mic re-acquire. Any failure (virtual devices, odd aggregates) falls back
     // to cpal.
     #[cfg(target_os = "macos")]
-    match build_macos_voice_processing_capture(app.clone(), device_id.clone(), &label) {
-        Ok((capture, shared, sample_rate)) => {
-            let mut owners = HashSet::new();
-            owners.insert(owner.clone());
-            let next_session = NativeAudioSession {
-                device_id,
-                label,
-                owners,
-                sample_rate,
-                shared,
-                _stream: NativeAudioStreamHandle::VoiceProcessing(capture),
-            };
-            let status = native_audio_status(&next_session);
-            *session = Some(next_session);
+    {
+        let cooldown_until = MACOS_VPIO_SILENCE_COOLDOWN_UNTIL_MS.load(Ordering::Acquire);
+        let now_ms = audio_epoch_ms();
+        if cooldown_until > now_ms {
             log_whisper_local_audio_event(
-                "audio.monitor.start.done",
-                Some(started_at.elapsed()),
-                json!({
-                    "owner": owner,
-                    "device_id": &status.device_id,
-                    "label": &status.label,
-                    "sample_rate": status.sample_rate,
-                    "engine": "voice_processing_io",
-                    "owner_count": status.owner_count,
-                }),
-            );
-            return Ok(status);
-        }
-        Err(error) => {
-            log_whisper_local_audio_event(
-                "audio.monitor.start.voice_processing_fallback",
+                "audio.monitor.start.voice_processing_cooldown",
                 None,
                 json!({
                     "owner": owner,
                     "device_id": &device_id,
-                    "error": error,
+                    "cooldown_remaining_ms": cooldown_until.saturating_sub(now_ms),
                 }),
             );
+        } else {
+            match build_macos_voice_processing_capture(app.clone(), device_id.clone(), &label) {
+                Ok((capture, shared, sample_rate)) => {
+                    let mut owners = HashSet::new();
+                    owners.insert(owner.clone());
+                    let next_session = NativeAudioSession {
+                        app,
+                        device_id,
+                        engine: NativeAudioEngine::VoiceProcessing,
+                        label,
+                        owners,
+                        sample_rate,
+                        shared,
+                        _stream: NativeAudioStreamHandle::VoiceProcessing(capture),
+                        voice_processing_delivery_started_at: None,
+                    };
+                    let status = native_audio_status(&next_session);
+                    *session = Some(next_session);
+                    log_whisper_local_audio_event(
+                        "audio.monitor.start.done",
+                        Some(started_at.elapsed()),
+                        json!({
+                            "owner": owner,
+                            "device_id": &status.device_id,
+                            "label": &status.label,
+                            "sample_rate": status.sample_rate,
+                            "engine": status.engine,
+                            "echo_cancellation": status.echo_cancellation,
+                            "owner_count": status.owner_count,
+                        }),
+                    );
+                    return Ok(status);
+                }
+                Err(error) => {
+                    log_whisper_local_audio_event(
+                        "audio.monitor.start.voice_processing_fallback",
+                        None,
+                        json!({
+                            "owner": owner,
+                            "device_id": &device_id,
+                            "error": error,
+                        }),
+                    );
+                }
+            }
         }
     }
 
-    let supported_config = device
-        .default_input_config()
-        .map_err(|error| native_audio_error_message(error))?;
-    let sample_rate = supported_config.sample_rate().0;
-    let sample_format = format!("{:?}", supported_config.sample_format());
-    let channels = supported_config.channels();
-    let shared = Arc::new(StdMutex::new(NativeAudioShared::new(sample_rate)));
-    let stream = build_native_audio_stream(
-        app,
-        device_id.clone(),
-        &device,
-        &supported_config,
-        shared.clone(),
-    )?;
-
-    stream
-        .play()
-        .map_err(|error| native_audio_error_message(error))?;
-
     let mut owners = HashSet::new();
     owners.insert(owner.clone());
-    let next_session = NativeAudioSession {
-        device_id,
-        label,
-        owners,
-        sample_rate,
-        shared,
-        _stream: NativeAudioStreamHandle::Cpal(stream),
-    };
+    let (next_session, sample_format, channels) =
+        build_raw_native_audio_session(app, device, device_id, label, owners, None)?;
     let status = native_audio_status(&next_session);
     *session = Some(next_session);
 
@@ -2800,6 +3294,8 @@ fn start_native_audio_session(
             "sample_rate": status.sample_rate,
             "sample_format": sample_format,
             "channels": channels,
+            "engine": status.engine,
+            "echo_cancellation": status.echo_cancellation,
             "owner_count": status.owner_count,
         }),
     );
@@ -2899,6 +3395,7 @@ fn begin_native_audio_capture_for_session(
     let buffered_ms =
         ((shared.total_samples as f64 / shared.sample_rate as f64) * 1000.0).round() as u64;
     let realtime_audio_tx = shared.realtime_audio_tx.clone();
+    let realtime_tts_gate = shared.realtime_tts_gate;
     let mut preroll_audio = Vec::new();
     let mut preroll_chunk_count = 0u64;
     let mut preroll_input_ms = 0.0f64;
@@ -2917,7 +3414,9 @@ fn begin_native_audio_capture_for_session(
         preroll_peak = preroll_peak.max(chunk_peak);
         preroll_rms = preroll_rms.max(chunk_rms);
 
-        if realtime_audio_tx.is_some() {
+        if realtime_audio_tx.is_some()
+            && (!realtime_tts_gate || chunk.realtime_replay_allowed)
+        {
             preroll_audio.push(encode_linear16_audio(&chunk.samples));
         }
     }
@@ -4549,6 +5048,7 @@ mod local_whisper_partial_tests {
         shared.total_samples = live_samples.len();
         shared.chunks.push_back(NativeAudioChunk {
             duration_ms: 3_000.0,
+            realtime_replay_allowed: true,
             samples: live_samples,
             timestamp: Instant::now(),
         });
@@ -9655,32 +10155,44 @@ fn cloud_voice_agent_ws_request(
 /// the capture unit's own output element (perfect echo-cancellation
 /// reference) instead of the webview. The payload is tagged so the webview
 /// player skips scheduling those frames.
+fn cloud_voice_agent_tts_audio_payload(payload: &Value) -> Option<(Vec<u8>, u32)> {
+    if cloud_voice_agent_event_kind(payload) != "voice_agent_tts_audio" {
+        return None;
+    }
+    let sample_rate = payload
+        .pointer("/audio/sample_rate")
+        .or_else(|| payload.pointer("/audio/sampleRate"))
+        .and_then(Value::as_u64)
+        .unwrap_or(24_000) as u32;
+    let decoded = payload
+        .pointer("/audio/base64")
+        .and_then(Value::as_str)
+        .and_then(|base64_text| general_purpose::STANDARD.decode(base64_text).ok())?;
+
+    Some((decoded, sample_rate))
+}
+
 fn cloud_voice_agent_route_tts_playback(payload: Value) -> Value {
     #[cfg(target_os = "macos")]
     {
         let mut payload = payload;
         match cloud_voice_agent_event_kind(&payload) {
             "voice_agent_tts_audio" => {
+                let audio_payload = cloud_voice_agent_tts_audio_payload(&payload);
                 if MACOS_VOICE_PROCESSING_ACTIVE.load(Ordering::Acquire) {
-                    let sample_rate = payload
-                        .pointer("/audio/sample_rate")
-                        .or_else(|| payload.pointer("/audio/sampleRate"))
-                        .and_then(Value::as_u64)
-                        .unwrap_or(24_000) as u32;
-                    let decoded = payload
-                        .pointer("/audio/base64")
-                        .and_then(Value::as_str)
-                        .and_then(|base64_text| general_purpose::STANDARD.decode(base64_text).ok());
-                    if let Some(bytes) = decoded {
+                    if let Some((bytes, sample_rate)) = audio_payload {
                         macos_voice_playback_enqueue_linear16(&bytes, sample_rate);
                         if let Some(audio) = payload.get_mut("audio") {
                             audio["native_playback"] = json!(true);
                         }
                         payload["native_playback"] = json!(true);
                     }
+                } else if let Some((bytes, sample_rate)) = audio_payload {
+                    voice_tts_playback_extend_deadline(&bytes, sample_rate);
                 }
             }
             "voice_agent_tts_error" | "voice_agent_error" => {
+                voice_tts_playback_clear_deadline();
                 macos_voice_playback_clear();
             }
             _ => {}
@@ -9688,7 +10200,20 @@ fn cloud_voice_agent_route_tts_playback(payload: Value) -> Value {
         return payload;
     }
     #[cfg(not(target_os = "macos"))]
-    payload
+    {
+        match cloud_voice_agent_event_kind(&payload) {
+            "voice_agent_tts_audio" => {
+                if let Some((bytes, sample_rate)) = cloud_voice_agent_tts_audio_payload(&payload) {
+                    voice_tts_playback_extend_deadline(&bytes, sample_rate);
+                }
+            }
+            "voice_agent_tts_error" | "voice_agent_error" => {
+                voice_tts_playback_clear_deadline();
+            }
+            _ => {}
+        }
+        payload
+    }
 }
 
 fn emit_cloud_voice_agent_event(app: &AppHandle, payload: Value) {
@@ -11167,7 +11692,10 @@ async fn start_cloud_voice_agent_stream(
         }
 
         let session_audio_tx = audio_tx.clone();
-        let status = match audio_state.input_worker.attach_realtime_stream(audio_tx) {
+        let status = match audio_state
+            .input_worker
+            .attach_voice_agent_realtime_stream(audio_tx)
+        {
             Ok(status) => status,
             Err(error) => {
                 spawn_cloud_voice_agent_desktop_log(
@@ -11548,7 +12076,7 @@ async fn set_cloud_voice_agent_input_enabled(
         RealtimeMicHolder::None => {
             match audio_state
                 .input_worker
-                .attach_realtime_stream_silent(audio_tx)
+                .attach_voice_agent_realtime_stream_silent(audio_tx)
             {
                 Ok(_) => {
                     realtime_mic_holder_set(&audio_state, RealtimeMicHolder::VoiceAgent);
@@ -11791,6 +12319,7 @@ async fn stop_cloud_voice_agent_stream(
         session_guard.take()
     };
     let Some(session) = session else {
+        voice_tts_playback_clear_deadline();
         audio_state
             .cloud_voice_agent_input_enabled
             .store(false, Ordering::SeqCst);
@@ -11798,6 +12327,7 @@ async fn stop_cloud_voice_agent_stream(
         return Ok(());
     };
 
+    voice_tts_playback_clear_deadline();
     #[cfg(target_os = "macos")]
     macos_voice_playback_clear();
     audio_state

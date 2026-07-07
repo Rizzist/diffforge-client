@@ -33,7 +33,6 @@ import {
   providerLimitKey,
   providerLimitSampleKey,
 } from "./tokenomicsProviderLimitMerge.js";
-import { ByocWizard } from "./ByocWizard.jsx";
 
 const TOKENOMICS_SCAN_PROGRESS_EVENT = "diffforge://tokenomics-scan-progress";
 const TOKENOMICS_UPDATED_EVENT = "diffforge://tokenomics-updated";
@@ -4049,8 +4048,6 @@ const AccountTokenomicsView = memo(function AccountTokenomicsView({
         </StorageCard>
 
         <AgentAccountsManager active={active} />
-
-        <ByocWizard />
 
         <TokenomicsFooter>
           <span>{lastUpdatedText(summary?.updated_at || summary?.updatedAt)}</span>

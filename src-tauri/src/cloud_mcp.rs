@@ -921,77 +921,79 @@ fn cloud_mcp_spawn_fs_event_debounce_forwarder(
     debounce: Duration,
     before_notify: Option<fn(&[PathBuf])>,
 ) {
-    thread::spawn(move || loop {
-        if app_shutdown_requested() {
-            return;
-        }
-        let first = match receiver.recv_timeout(Duration::from_secs(
-            CLOUD_MCP_BACKGROUND_SCHEDULER_SHUTDOWN_POLL_SECS,
-        )) {
-            Ok(event) => event,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
-        };
-        let Ok(first) = first else {
-            continue;
-        };
-        if !cloud_mcp_watch_event_is_relevant(&first) {
-            continue;
-        }
-
-        let mut changed_paths = Vec::<PathBuf>::new();
-        let mut paths_truncated = false;
-        let collect_paths =
-            |event: &notify::Event, changed: &mut Vec<PathBuf>, truncated: &mut bool| {
-                for path in &event.paths {
-                    if changed.len() >= CLOUD_MCP_FS_EVENT_PATH_BATCH_MAX {
-                        *truncated = true;
-                        return;
-                    }
-                    if !changed.iter().any(|known| known == path) {
-                        changed.push(path.clone());
-                    }
-                }
-            };
-        collect_paths(&first, &mut changed_paths, &mut paths_truncated);
-
-        let window_started = Instant::now();
-        while window_started.elapsed() < debounce {
+    thread::spawn(move || {
+        loop {
             if app_shutdown_requested() {
                 return;
             }
-            let remaining = debounce.saturating_sub(window_started.elapsed());
-            if remaining.is_zero() {
-                break;
-            }
-            match receiver.recv_timeout(remaining) {
-                Ok(Ok(event)) => {
-                    if cloud_mcp_watch_event_is_relevant(&event) {
-                        collect_paths(&event, &mut changed_paths, &mut paths_truncated);
-                    }
-                }
-                Ok(Err(_)) => {}
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+            let first = match receiver.recv_timeout(Duration::from_secs(
+                CLOUD_MCP_BACKGROUND_SCHEDULER_SHUTDOWN_POLL_SECS,
+            )) {
+                Ok(event) => event,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            };
+            let Ok(first) = first else {
+                continue;
+            };
+            if !cloud_mcp_watch_event_is_relevant(&first) {
+                continue;
             }
-        }
 
-        log_terminal_status_event(
-            "backend.cloud_mcp.fs_watcher.debounced_wake",
-            json!({
-                "name": name,
-                "changed_paths": changed_paths.len(),
-                "paths_truncated": paths_truncated,
-            }),
-        );
-        if let Some(before_notify) = before_notify {
-            // A truncated batch cannot describe the full change set; deliver
-            // it as empty so consumers treat the wake as "changes of unknown
-            // scope" and run their full sweep.
-            let delivered: &[PathBuf] = if paths_truncated { &[] } else { &changed_paths };
-            before_notify(delivered);
+            let mut changed_paths = Vec::<PathBuf>::new();
+            let mut paths_truncated = false;
+            let collect_paths =
+                |event: &notify::Event, changed: &mut Vec<PathBuf>, truncated: &mut bool| {
+                    for path in &event.paths {
+                        if changed.len() >= CLOUD_MCP_FS_EVENT_PATH_BATCH_MAX {
+                            *truncated = true;
+                            return;
+                        }
+                        if !changed.iter().any(|known| known == path) {
+                            changed.push(path.clone());
+                        }
+                    }
+                };
+            collect_paths(&first, &mut changed_paths, &mut paths_truncated);
+
+            let window_started = Instant::now();
+            while window_started.elapsed() < debounce {
+                if app_shutdown_requested() {
+                    return;
+                }
+                let remaining = debounce.saturating_sub(window_started.elapsed());
+                if remaining.is_zero() {
+                    break;
+                }
+                match receiver.recv_timeout(remaining) {
+                    Ok(Ok(event)) => {
+                        if cloud_mcp_watch_event_is_relevant(&event) {
+                            collect_paths(&event, &mut changed_paths, &mut paths_truncated);
+                        }
+                    }
+                    Ok(Err(_)) => {}
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
+
+            log_terminal_status_event(
+                "backend.cloud_mcp.fs_watcher.debounced_wake",
+                json!({
+                    "name": name,
+                    "changed_paths": changed_paths.len(),
+                    "paths_truncated": paths_truncated,
+                }),
+            );
+            if let Some(before_notify) = before_notify {
+                // A truncated batch cannot describe the full change set; deliver
+                // it as empty so consumers treat the wake as "changes of unknown
+                // scope" and run their full sweep.
+                let delivered: &[PathBuf] = if paths_truncated { &[] } else { &changed_paths };
+                before_notify(delivered);
+            }
+            notify.notify_one();
         }
-        notify.notify_one();
     });
 }
 
@@ -7763,6 +7765,7 @@ fn cloud_mcp_task_event_kind_removed(event_kind: &str) -> bool {
             | "spec_activity_recorded"
             | "history_event"
             | "terminal_lifecycle"
+            // Backward-compatible ingress tombstones for retired live-delta aliases.
             | "agent_chat_session_live_delta"
             | "agent_chat_live_delta"
             | "live_delta"
@@ -10500,6 +10503,21 @@ fn cloud_mcp_tokenomics_device_packet_payload(
         }
         if let Some(value) = limit_sample_day {
             object.insert("lsd".to_string(), value);
+        }
+        if snapshot {
+            // Snapshot packets carry the device's complete current account
+            // registry so the cloud can tombstone accounts retired locally
+            // (e.g. duplicate-profile cleanups). Packet usage rows alone
+            // only name accounts active in the packet's window.
+            let registry_keys = cloud_mcp_tokenomics_provider_accounts(summary, now_ms)
+                .iter()
+                .map(cloud_mcp_tokenomics_provider_account_key)
+                .filter(|key| !cloud_mcp_tokenomics_provider_account_key_is_unknown(key))
+                .collect::<Vec<_>>();
+            if !registry_keys.is_empty() {
+                object.insert("paa".to_string(), json!(true));
+                object.insert("pak".to_string(), json!(registry_keys));
+            }
         }
     }
     if let Some(bucket) = packet_bucket {
@@ -23619,6 +23637,11 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
                         .cloned()
                         .unwrap_or_else(|| json!(false)),
                 });
+                if let Some(workspace_root) = cloud_mcp_workspace_root_text(workspace) {
+                    if let Some(object) = workspace_value.as_object_mut() {
+                        object.insert("workspace_root".to_string(), json!(workspace_root));
+                    }
+                }
                 cloud_mcp_copy_workspace_runtime_ordering(&mut workspace_value, workspace);
                 workspaces.push(workspace_value);
             }
@@ -23630,7 +23653,7 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
         if !seen.insert(workspace.workspace_id.clone()) {
             continue;
         }
-        let workspace_value = json!({
+        let mut workspace_value = json!({
             "workspace_id": workspace.workspace_id,
             "workspace_name": workspace.workspace_name,
             "workspace_role": "desktop_workspace",
@@ -23638,6 +23661,11 @@ async fn cloud_mcp_lifecycle_workspaces(state: &CloudMcpState) -> Vec<Value> {
             "workspace_active": false,
             "workspace_status": "registered",
         });
+        if !workspace.root.trim().is_empty() {
+            if let Some(object) = workspace_value.as_object_mut() {
+                object.insert("workspace_root".to_string(), json!(workspace.root.trim()));
+            }
+        }
         workspaces.push(workspace_value);
     }
 
@@ -23992,6 +24020,9 @@ fn cloud_mcp_compact_workspace_live_state(workspace: &Value, index: usize) -> (S
         ),
     ] {
         cloud_mcp_compact_insert_value(&mut item, key, workspace, aliases);
+    }
+    if let Some(workspace_root) = cloud_mcp_workspace_root_text(workspace) {
+        item.insert("workspace_root".to_string(), json!(workspace_root));
     }
     if let Some(terminal_value) = workspace.get("terminals") {
         let terminal_values = cloud_mcp_live_state_values(Some(terminal_value));
@@ -28499,14 +28530,20 @@ async fn cloud_mcp_ws_send_workspace_registration(
     state: &CloudMcpState,
     workspace: &CloudMcpWorkspaceStatus,
 ) -> Result<Value, String> {
-    let payload = json!({
+    let mut payload = json!({
         "workspace_id": workspace.workspace_id,
         "workspace_name": workspace.workspace_name,
         "dashboard_workspace": workspace.dashboard_workspace,
         "workspace_role": workspace.workspace_role,
         "display_surface": workspace.display_surface,
+        "workspace_status": "registered",
         "schema_version": 1,
     });
+    if !workspace.root.trim().is_empty() {
+        if let Some(object) = payload.as_object_mut() {
+            object.insert("workspace_root".to_string(), json!(workspace.root.trim()));
+        }
+    }
     cloud_mcp_ws_request(state, "workspace_register", &payload).await
 }
 
@@ -31755,6 +31792,21 @@ fn cloud_mcp_workspace_snapshot_is_locally_archived(workspace: &Value) -> bool {
     .unwrap_or(false)
 }
 
+fn cloud_mcp_workspace_root_text(workspace: &Value) -> Option<String> {
+    cloud_mcp_payload_text(
+        workspace,
+        &[
+            "workspace_root",
+            "workspaceRoot",
+            "repo_path",
+            "repoPath",
+            "root_directory",
+            "rootDirectory",
+            "path",
+        ],
+    )
+}
+
 fn cloud_mcp_json_collection_items(value: &Value) -> Vec<Value> {
     match value {
         Value::Array(items) => items.clone(),
@@ -32135,6 +32187,17 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
                 (!panels.is_empty()).then(|| (workspace_id.clone(), panels))
             })
             .collect();
+    let registered_workspace_roots: std::collections::BTreeMap<String, String> = {
+        let runtime = state.inner.lock().await;
+        runtime
+            .registered_workspaces
+            .values()
+            .filter_map(|workspace| {
+                let root = workspace.root.trim();
+                (!root.is_empty()).then(|| (workspace.workspace_id.clone(), root.to_string()))
+            })
+            .collect()
+    };
 
     if let Some(orchestrators) = terminal_orchestrators.as_ref() {
         for terminal in cloud_mcp_json_collection_items(orchestrators)
@@ -32185,18 +32248,14 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
         let workspace_name =
             cloud_mcp_payload_text(workspace, &["workspace_name", "workspaceName", "name"])
                 .unwrap_or_else(|| workspace_id.clone());
-        let workspace_root = cloud_mcp_payload_text(
-            workspace,
-            &[
-                "repo_path",
-                "repoPath",
-                "workspace_root",
-                "workspaceRoot",
-                "root_directory",
-                "rootDirectory",
-            ],
-        )
-        .unwrap_or_default();
+        let workspace_root = cloud_mcp_workspace_root_text(workspace)
+            .or_else(|| {
+                cached_last_known_workspaces
+                    .get(&workspace_id)
+                    .and_then(cloud_mcp_workspace_root_text)
+            })
+            .or_else(|| registered_workspace_roots.get(&workspace_id).cloned())
+            .unwrap_or_default();
         let workspace_selected = workspace
             .get("selected")
             .or_else(|| workspace.get("is_selected"))
@@ -32705,14 +32764,13 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
         } else {
             requested_terminal_clear_reason
         };
-        let workspace_value = json!({
+        let mut workspace_value = json!({
             "device_id": device_profile["device_id"].clone(),
             "workspace_active": workspace_active,
             "workspace_id": workspace_id,
             "workspace_name": workspace_name,
             "repo_path": workspace_root.clone(),
             "repoPath": workspace_root.clone(),
-            "workspace_root": workspace_root.clone(),
             "workspaceRoot": workspace_root.clone(),
             "selected": workspace_selected,
             "workspace_selected": workspace_selected,
@@ -32753,6 +32811,11 @@ async fn cloud_mcp_sync_device_workspaces_snapshot_internal(
             "mcps": servers,
             "terminals": terminals,
         });
+        if !workspace_root.trim().is_empty() {
+            if let Some(object) = workspace_value.as_object_mut() {
+                object.insert("workspace_root".to_string(), json!(workspace_root.clone()));
+            }
+        }
         normalized_workspaces.push(workspace_value);
         if let Some(app) = CLOUD_MCP_SYNC_STATUS_APP.get().cloned() {
             if !workspace_root.trim().is_empty() {
@@ -33384,17 +33447,22 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
         let workspace_index = match workspace_index {
             Some(index) => index,
             None => {
-                workspaces.push(json!({
-                    "repo_id": repo_id,
-                    "workspace_id": workspace_id,
-                    "workspace_name": workspace_name,
-                    "workspace_root": workspace_root,
+                let mut workspace_value = json!({
+                    "repo_id": repo_id.clone(),
+                    "workspace_id": workspace_id.clone(),
+                    "workspace_name": workspace_name.clone(),
                     "workspace_active": true,
                     "workspace_status": "active",
                     "terminal_count": 0,
                     "active_count": 0,
                     "terminals": [],
-                }));
+                });
+                if let Some(workspace_root) = workspace_root.as_deref() {
+                    if let Some(object) = workspace_value.as_object_mut() {
+                        object.insert("workspace_root".to_string(), json!(workspace_root));
+                    }
+                }
+                workspaces.push(workspace_value);
                 workspaces.len().saturating_sub(1)
             }
         };
@@ -33404,6 +33472,9 @@ async fn cloud_mcp_apply_terminal_state_to_device_live_snapshot(
         if let Some(object) = workspace.as_object_mut() {
             object.insert("workspace_active".to_string(), json!(true));
             object.insert("workspace_status".to_string(), json!("active"));
+            if let Some(workspace_root) = workspace_root.as_deref() {
+                object.insert("workspace_root".to_string(), json!(workspace_root));
+            }
             object.insert("reason".to_string(), json!(reason));
             object.insert("ts_ms".to_string(), json!(observed_at_ms));
             object
@@ -33612,6 +33683,646 @@ async fn cloud_mcp_publish_terminal_state_live_update(
     cloud_mcp_publish_device_live_state_snapshot_debounced(state, reason).await;
 }
 
+#[derive(Clone)]
+struct CloudMcpAgentChatTurnGitSnapshot {
+    repo_root: PathBuf,
+    start_tree: String,
+    started_at: String,
+    started_at_ms: u64,
+    turn_key: String,
+}
+
+struct CloudMcpAgentChatTurnGitDiff {
+    file_change: Option<Value>,
+    raw: Value,
+}
+
+#[derive(Clone)]
+enum CloudMcpAgentChatTurnGitSnapshotState {
+    Pending { started_at_ms: u64 },
+    Ready(CloudMcpAgentChatTurnGitSnapshot),
+    Failed { started_at_ms: u64 },
+}
+
+impl CloudMcpAgentChatTurnGitSnapshotState {
+    fn started_at_ms(&self) -> u64 {
+        match self {
+            Self::Pending { started_at_ms } | Self::Failed { started_at_ms } => *started_at_ms,
+            Self::Ready(snapshot) => snapshot.started_at_ms,
+        }
+    }
+}
+
+static CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOTS: OnceLock<(
+    StdMutex<HashMap<String, CloudMcpAgentChatTurnGitSnapshotState>>,
+    std::sync::Condvar,
+)> = OnceLock::new();
+static CLOUD_MCP_AGENT_CHAT_TURN_GIT_TEMP_INDEX_SEQ: AtomicU64 = AtomicU64::new(1);
+const CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_MAX: usize = 512;
+const CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_TTL_MS: u64 = 6 * 60 * 60 * 1000;
+
+fn cloud_mcp_agent_chat_turn_git_snapshots() -> &'static (
+    StdMutex<HashMap<String, CloudMcpAgentChatTurnGitSnapshotState>>,
+    std::sync::Condvar,
+) {
+    CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOTS
+        .get_or_init(|| (StdMutex::new(HashMap::new()), std::sync::Condvar::new()))
+}
+
+fn cloud_mcp_agent_chat_turn_iso_from_ms(ms: u64) -> String {
+    let secs = (ms / 1000) as i64;
+    let millis = ms % 1000;
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { year + 1 } else { year };
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
+        year,
+        month,
+        day,
+        secs_of_day / 3_600,
+        (secs_of_day % 3_600) / 60,
+        secs_of_day % 60,
+        millis,
+    )
+}
+
+fn cloud_mcp_agent_chat_turn_hook_ms(payload: &TerminalActivityHookPayload) -> u64 {
+    payload.hook_timestamp_ms.max(payload.observed_at_ms)
+}
+
+fn cloud_mcp_agent_chat_turn_started_at(payload: &TerminalActivityHookPayload) -> String {
+    payload
+        .prompt_ready_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            cloud_mcp_agent_chat_turn_iso_from_ms(cloud_mcp_agent_chat_turn_hook_ms(payload))
+        })
+}
+
+fn cloud_mcp_agent_chat_turn_completed_at(payload: &TerminalActivityHookPayload) -> String {
+    payload
+        .completed_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            cloud_mcp_agent_chat_turn_iso_from_ms(cloud_mcp_agent_chat_turn_hook_ms(payload))
+        })
+}
+
+fn cloud_mcp_agent_chat_turn_native_id(payload: &TerminalActivityHookPayload) -> String {
+    payload
+        .provider_turn_id
+        .as_deref()
+        .or(payload.turn_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn cloud_mcp_agent_chat_turn_key_from_start(payload: &TerminalActivityHookPayload) -> String {
+    let native = cloud_mcp_agent_chat_turn_native_id(payload);
+    if !native.is_empty() {
+        return native;
+    }
+    if let Some(started_at) = payload
+        .prompt_ready_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return format!("turn-start:{started_at}");
+    }
+    format!(
+        "turn-start-ms-{}",
+        cloud_mcp_agent_chat_turn_hook_ms(payload)
+    )
+}
+
+fn cloud_mcp_agent_chat_turn_prompt_start_key(
+    payload: &TerminalActivityHookPayload,
+) -> Option<String> {
+    payload
+        .prompt_ready_at
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|started_at| format!("turn-start:{started_at}"))
+}
+
+fn cloud_mcp_agent_chat_turn_snapshot_key(
+    provider: &str,
+    session_id: &str,
+    turn_key: &str,
+) -> String {
+    format!(
+        "{}:{}:{}",
+        provider.trim(),
+        session_id.trim(),
+        turn_key.trim()
+    )
+}
+
+fn cloud_mcp_agent_chat_turn_git_env(index_path: Option<&Path>) -> Vec<(String, String)> {
+    let mut env_vars = vec![
+        ("GIT_TERMINAL_PROMPT".to_string(), "0".to_string()),
+        ("GCM_INTERACTIVE".to_string(), "Never".to_string()),
+    ];
+    if let Some(index_path) = index_path {
+        env_vars.push((
+            "GIT_INDEX_FILE".to_string(),
+            index_path.to_string_lossy().to_string(),
+        ));
+    }
+    env_vars
+}
+
+fn cloud_mcp_agent_chat_turn_git_run(
+    root: &Path,
+    args: &[&str],
+    index_path: Option<&Path>,
+) -> Result<CommandCapture, String> {
+    let safe_directory = format!("safe.directory={}", root.to_string_lossy());
+    let mut owned_args = Vec::with_capacity(args.len() + 2);
+    owned_args.push("-c".to_string());
+    owned_args.push(safe_directory);
+    owned_args.extend(args.iter().map(|arg| (*arg).to_string()));
+    let borrowed_args = owned_args.iter().map(String::as_str).collect::<Vec<_>>();
+    let env_vars = cloud_mcp_agent_chat_turn_git_env(index_path);
+    run_command_capture_with_env(
+        "git",
+        &borrowed_args,
+        None,
+        Duration::from_secs(2),
+        Some(root),
+        &env_vars,
+    )
+}
+
+fn cloud_mcp_agent_chat_turn_git_root(cwd: &str) -> Option<PathBuf> {
+    let cwd = cwd.trim();
+    if cwd.is_empty() {
+        return None;
+    }
+    let cwd = PathBuf::from(cwd);
+    if !cwd.is_dir() {
+        return None;
+    }
+    let env_vars = cloud_mcp_agent_chat_turn_git_env(None);
+    let output = run_command_capture_with_env(
+        "git",
+        &["rev-parse", "--show-toplevel"],
+        None,
+        Duration::from_secs(2),
+        Some(&cwd),
+        &env_vars,
+    )
+    .ok()?;
+    if output.exit_code != Some(0) {
+        return None;
+    }
+    let root = output.stdout.trim();
+    (!root.is_empty()).then(|| PathBuf::from(root))
+}
+
+fn cloud_mcp_agent_chat_turn_temp_index_path() -> PathBuf {
+    let seq = CLOUD_MCP_AGENT_CHAT_TURN_GIT_TEMP_INDEX_SEQ.fetch_add(1, Ordering::Relaxed);
+    env::temp_dir().join(format!(
+        "diffforge-turn-index-{}-{}-{seq}",
+        std::process::id(),
+        cloud_mcp_now_ms()
+    ))
+}
+
+fn cloud_mcp_agent_chat_turn_cleanup_index(path: &Path) {
+    let _ = fs::remove_file(path);
+    let mut lock_path = path.to_path_buf();
+    lock_path.set_extension("lock");
+    let _ = fs::remove_file(lock_path);
+}
+
+fn cloud_mcp_agent_chat_turn_git_snapshot_tree(root: &Path) -> Option<String> {
+    let index_path = cloud_mcp_agent_chat_turn_temp_index_path();
+    let read_head =
+        cloud_mcp_agent_chat_turn_git_run(root, &["read-tree", "HEAD"], Some(&index_path))
+            .ok()
+            .is_some_and(|output| output.exit_code == Some(0));
+    if !read_head {
+        let read_empty =
+            cloud_mcp_agent_chat_turn_git_run(root, &["read-tree", "--empty"], Some(&index_path))
+                .ok()
+                .is_some_and(|output| output.exit_code == Some(0));
+        if !read_empty {
+            cloud_mcp_agent_chat_turn_cleanup_index(&index_path);
+            return None;
+        }
+    }
+    let added = cloud_mcp_agent_chat_turn_git_run(root, &["add", "-A"], Some(&index_path))
+        .ok()
+        .is_some_and(|output| output.exit_code == Some(0));
+    if !added {
+        cloud_mcp_agent_chat_turn_cleanup_index(&index_path);
+        return None;
+    }
+    let tree = cloud_mcp_agent_chat_turn_git_run(root, &["write-tree"], Some(&index_path))
+        .ok()
+        .filter(|output| output.exit_code == Some(0))
+        .map(|output| output.stdout.trim().to_string())
+        .filter(|value| !value.is_empty());
+    cloud_mcp_agent_chat_turn_cleanup_index(&index_path);
+    tree
+}
+
+#[cfg(test)]
+fn cloud_mcp_agent_chat_turn_git_record_start(
+    provider: &str,
+    session_id: &str,
+    turn_key: &str,
+    cwd: &str,
+    started_at: &str,
+    started_at_ms: u64,
+) {
+    cloud_mcp_agent_chat_turn_git_mark_start(provider, session_id, turn_key, started_at_ms);
+    cloud_mcp_agent_chat_turn_git_record_start_after_mark(
+        provider,
+        session_id,
+        turn_key,
+        cwd,
+        started_at,
+        started_at_ms,
+    );
+}
+
+fn cloud_mcp_agent_chat_turn_git_mark_start(
+    provider: &str,
+    session_id: &str,
+    turn_key: &str,
+    started_at_ms: u64,
+) {
+    let key = cloud_mcp_agent_chat_turn_snapshot_key(provider, session_id, turn_key);
+    let (snapshots, wake) = cloud_mcp_agent_chat_turn_git_snapshots();
+    if let Ok(mut snapshots) = snapshots.lock() {
+        cloud_mcp_agent_chat_turn_git_prune_locked(&mut snapshots);
+        snapshots.insert(
+            key,
+            CloudMcpAgentChatTurnGitSnapshotState::Pending { started_at_ms },
+        );
+        cloud_mcp_agent_chat_turn_git_prune_locked(&mut snapshots);
+        wake.notify_all();
+    }
+}
+
+fn cloud_mcp_agent_chat_turn_git_prune_locked(
+    snapshots: &mut HashMap<String, CloudMcpAgentChatTurnGitSnapshotState>,
+) {
+    let now = cloud_mcp_now_ms();
+    snapshots.retain(|_, state| {
+        let started_at_ms = state.started_at_ms();
+        started_at_ms == 0
+            || started_at_ms > now
+            || now.saturating_sub(started_at_ms) <= CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_TTL_MS
+    });
+    while snapshots.len() > CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_MAX {
+        let Some(oldest_key) = snapshots
+            .iter()
+            .min_by_key(|(_, state)| state.started_at_ms())
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        snapshots.remove(&oldest_key);
+    }
+}
+
+fn cloud_mcp_agent_chat_turn_git_finish_start(
+    provider: &str,
+    session_id: &str,
+    turn_key: &str,
+    started_at_ms: u64,
+    snapshot: Option<CloudMcpAgentChatTurnGitSnapshot>,
+) {
+    let key = cloud_mcp_agent_chat_turn_snapshot_key(provider, session_id, turn_key);
+    let (snapshots, wake) = cloud_mcp_agent_chat_turn_git_snapshots();
+    if let Ok(mut snapshots) = snapshots.lock() {
+        if matches!(
+            snapshots.get(&key),
+            Some(CloudMcpAgentChatTurnGitSnapshotState::Pending { .. })
+        ) {
+            let state = snapshot
+                .map(CloudMcpAgentChatTurnGitSnapshotState::Ready)
+                .unwrap_or(CloudMcpAgentChatTurnGitSnapshotState::Failed { started_at_ms });
+            snapshots.insert(key, state);
+            cloud_mcp_agent_chat_turn_git_prune_locked(&mut snapshots);
+            wake.notify_all();
+        }
+    }
+}
+
+fn cloud_mcp_agent_chat_turn_git_record_start_after_mark(
+    provider: &str,
+    session_id: &str,
+    turn_key: &str,
+    cwd: &str,
+    started_at: &str,
+    started_at_ms: u64,
+) {
+    let snapshot = cloud_mcp_agent_chat_turn_git_root(cwd).and_then(|repo_root| {
+        cloud_mcp_agent_chat_turn_git_snapshot_tree(&repo_root).map(|start_tree| {
+            CloudMcpAgentChatTurnGitSnapshot {
+                repo_root,
+                start_tree,
+                started_at: started_at.to_string(),
+                started_at_ms,
+                turn_key: turn_key.to_string(),
+            }
+        })
+    });
+    cloud_mcp_agent_chat_turn_git_finish_start(
+        provider,
+        session_id,
+        turn_key,
+        started_at_ms,
+        snapshot,
+    );
+}
+
+fn cloud_mcp_agent_chat_turn_git_take_snapshot(
+    provider: &str,
+    session_id: &str,
+    turn_key: &str,
+) -> Option<CloudMcpAgentChatTurnGitSnapshot> {
+    cloud_mcp_agent_chat_turn_git_take_snapshot_key(provider, session_id, turn_key, "")
+}
+
+fn cloud_mcp_agent_chat_turn_git_take_snapshot_key(
+    provider: &str,
+    session_id: &str,
+    turn_key: &str,
+    alias_turn_key: &str,
+) -> Option<CloudMcpAgentChatTurnGitSnapshot> {
+    if turn_key.trim().is_empty() {
+        return None;
+    }
+    let (snapshots, wake) = cloud_mcp_agent_chat_turn_git_snapshots();
+    let mut snapshots = snapshots.lock().ok()?;
+    cloud_mcp_agent_chat_turn_git_prune_locked(&mut snapshots);
+    let key = cloud_mcp_agent_chat_turn_snapshot_key(provider, session_id, turn_key);
+    if !snapshots.contains_key(&key) {
+        return None;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let Some(state) = snapshots.get(&key).cloned() else {
+            return None;
+        };
+        match state {
+            CloudMcpAgentChatTurnGitSnapshotState::Ready(mut snapshot) => {
+                snapshots.remove(&key);
+                let alias_turn_key = alias_turn_key.trim();
+                if !alias_turn_key.is_empty() && alias_turn_key != snapshot.turn_key {
+                    snapshot.turn_key = alias_turn_key.to_string();
+                }
+                return Some(snapshot);
+            }
+            CloudMcpAgentChatTurnGitSnapshotState::Failed { .. } => {
+                snapshots.remove(&key);
+                return None;
+            }
+            CloudMcpAgentChatTurnGitSnapshotState::Pending { started_at_ms } => {
+                let now = Instant::now();
+                if now >= deadline {
+                    snapshots.insert(
+                        key.clone(),
+                        CloudMcpAgentChatTurnGitSnapshotState::Failed { started_at_ms },
+                    );
+                    continue;
+                }
+                let wait = deadline.saturating_duration_since(now);
+                match wake.wait_timeout(snapshots, wait) {
+                    Ok((guard, result)) => {
+                        snapshots = guard;
+                        if result.timed_out()
+                            && matches!(
+                                snapshots.get(&key),
+                                Some(CloudMcpAgentChatTurnGitSnapshotState::Pending { .. })
+                            )
+                        {
+                            snapshots.insert(
+                                key.clone(),
+                                CloudMcpAgentChatTurnGitSnapshotState::Failed { started_at_ms },
+                            );
+                        }
+                    }
+                    Err(_) => return None,
+                }
+            }
+        }
+    }
+}
+
+fn cloud_mcp_agent_chat_turn_git_take_completion_snapshot(
+    payload: &TerminalActivityHookPayload,
+    provider: &str,
+    session_id: &str,
+    native_turn_id: &str,
+) -> Option<CloudMcpAgentChatTurnGitSnapshot> {
+    let native_turn_id = native_turn_id.trim();
+    if !native_turn_id.is_empty() {
+        if let Some(snapshot) =
+            cloud_mcp_agent_chat_turn_git_take_snapshot(provider, session_id, native_turn_id)
+        {
+            return Some(snapshot);
+        }
+    }
+    if let Some(prompt_start_key) = cloud_mcp_agent_chat_turn_prompt_start_key(payload) {
+        let alias = if native_turn_id.is_empty() {
+            ""
+        } else {
+            native_turn_id
+        };
+        return cloud_mcp_agent_chat_turn_git_take_snapshot_key(
+            provider,
+            session_id,
+            &prompt_start_key,
+            alias,
+        );
+    }
+    None
+}
+
+fn cloud_mcp_agent_chat_turn_git_clear_session(provider: &str, session_id: &str) {
+    let prefix = format!("{}:{}:", provider.trim(), session_id.trim());
+    if prefix == "::" {
+        return;
+    }
+    let (snapshots, wake) = cloud_mcp_agent_chat_turn_git_snapshots();
+    if let Ok(mut snapshots) = snapshots.lock() {
+        snapshots.retain(|key, _| !key.starts_with(&prefix));
+        wake.notify_all();
+    }
+}
+
+#[cfg(test)]
+fn cloud_mcp_agent_chat_turn_git_clear_all_snapshots() {
+    let (snapshots, wake) = cloud_mcp_agent_chat_turn_git_snapshots();
+    if let Ok(mut snapshots) = snapshots.lock() {
+        snapshots.clear();
+        wake.notify_all();
+    }
+}
+
+fn cloud_mcp_agent_chat_turn_git_name_status_map(name_status: &str) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for line in name_status.lines() {
+        let mut parts = line.split('\t');
+        let status = parts.next().unwrap_or_default().to_string();
+        let path = parts.last().unwrap_or_default().trim().to_string();
+        if !path.is_empty() {
+            map.insert(path, status);
+        }
+    }
+    map
+}
+
+fn cloud_mcp_agent_chat_turn_git_parse_numstat(
+    repo_root: &Path,
+    numstat: &str,
+    name_status: &str,
+) -> Vec<Value> {
+    let status_by_path = cloud_mcp_agent_chat_turn_git_name_status_map(name_status);
+    let mut files = Vec::new();
+    for line in numstat.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let additions_text = parts.next().unwrap_or_default().trim();
+        let deletions_text = parts.next().unwrap_or_default().trim();
+        let path = parts.next().unwrap_or_default().trim();
+        if path.is_empty() {
+            continue;
+        }
+        let additions = additions_text.parse::<i64>().ok();
+        let deletions = deletions_text.parse::<i64>().ok();
+        let status = status_by_path
+            .get(path)
+            .map(String::as_str)
+            .unwrap_or_default();
+        let missing_path = !repo_root.join(path).exists();
+        let kind = if status.starts_with('A') {
+            "create"
+        } else if status.starts_with('D')
+            || (missing_path && additions.unwrap_or(0) == 0 && deletions.unwrap_or(0) >= 0)
+        {
+            "delete"
+        } else {
+            "edit"
+        };
+        let mut file = serde_json::Map::new();
+        file.insert("path".to_string(), json!(path));
+        file.insert("kind".to_string(), json!(kind));
+        if let Some(additions) = additions {
+            file.insert("additions".to_string(), json!(additions));
+        }
+        if let Some(deletions) = deletions {
+            file.insert("deletions".to_string(), json!(deletions));
+        }
+        files.push(Value::Object(file));
+    }
+    files
+}
+
+fn cloud_mcp_agent_chat_turn_git_diff(
+    snapshot: Option<CloudMcpAgentChatTurnGitSnapshot>,
+) -> CloudMcpAgentChatTurnGitDiff {
+    let Some(snapshot) = snapshot else {
+        return CloudMcpAgentChatTurnGitDiff {
+            file_change: None,
+            raw: json!({
+                "skipped": "missing_start_snapshot",
+            }),
+        };
+    };
+    let Some(end_tree) = cloud_mcp_agent_chat_turn_git_snapshot_tree(&snapshot.repo_root) else {
+        return CloudMcpAgentChatTurnGitDiff {
+            file_change: None,
+            raw: json!({
+                "repo_root": snapshot.repo_root.to_string_lossy(),
+                "start_tree": snapshot.start_tree,
+                "skipped": "end_snapshot_failed",
+            }),
+        };
+    };
+    let numstat = cloud_mcp_agent_chat_turn_git_run(
+        &snapshot.repo_root,
+        &[
+            "diff-tree",
+            "-r",
+            "--numstat",
+            &snapshot.start_tree,
+            &end_tree,
+        ],
+        None,
+    )
+    .ok()
+    .filter(|output| output.exit_code == Some(0))
+    .map(|output| output.stdout)
+    .unwrap_or_default();
+    let name_status = cloud_mcp_agent_chat_turn_git_run(
+        &snapshot.repo_root,
+        &[
+            "diff-tree",
+            "-r",
+            "--name-status",
+            &snapshot.start_tree,
+            &end_tree,
+        ],
+        None,
+    )
+    .ok()
+    .filter(|output| output.exit_code == Some(0))
+    .map(|output| output.stdout)
+    .unwrap_or_default();
+    let files =
+        cloud_mcp_agent_chat_turn_git_parse_numstat(&snapshot.repo_root, &numstat, &name_status);
+    let additions = files
+        .iter()
+        .filter_map(|file| file.get("additions").and_then(Value::as_i64))
+        .sum::<i64>();
+    let deletions = files
+        .iter()
+        .filter_map(|file| file.get("deletions").and_then(Value::as_i64))
+        .sum::<i64>();
+    let file_change = (!files.is_empty()).then(|| {
+        json!({
+            "files": files,
+            "summary": format!("{} file{} changed (+{} -{})", files.len(), if files.len() == 1 { "" } else { "s" }, additions, deletions),
+        })
+    });
+    CloudMcpAgentChatTurnGitDiff {
+        file_change,
+        raw: json!({
+            "repo_root": snapshot.repo_root.to_string_lossy(),
+            "start_tree": snapshot.start_tree,
+            "end_tree": end_tree,
+            "numstat": numstat,
+            "name_status": name_status,
+        }),
+    }
+}
+
 fn cloud_mcp_agent_chat_status_hook_is_relevant(
     payload: &TerminalActivityHookPayload,
     state_value: &str,
@@ -33785,6 +34496,12 @@ fn cloud_mcp_sync_agent_chat_session_status_from_hook(
     ) else {
         return;
     };
+    if cloud_mcp_agent_chat_turn_git_should_clear(payload, state_value, turn_status) {
+        cloud_mcp_agent_chat_turn_git_clear_session(
+            &request.provider,
+            &request.provider_session_id,
+        );
+    }
     agent_chat_session_sync_spawn_with_state(
         state.clone(),
         request.provider,
@@ -33793,6 +34510,185 @@ fn cloud_mcp_sync_agent_chat_session_status_from_hook(
         request.context,
         "terminal_activity_hook_status",
     );
+}
+
+fn cloud_mcp_agent_chat_turn_git_should_clear(
+    payload: &TerminalActivityHookPayload,
+    state_value: &str,
+    turn_status: &str,
+) -> bool {
+    let event_type = cloud_mcp_lifecycle_status_key(&payload.event_type);
+    matches!(
+        event_type.as_str(),
+        "provider_turn_error" | "provider_turn_interrupted"
+    ) || matches!(state_value, "error" | "interrupted" | "closed")
+        || matches!(turn_status, "failed" | "interrupted" | "cancelled")
+}
+
+fn cloud_mcp_agent_chat_turn_summary_context_from_hook(
+    payload: &TerminalActivityHookPayload,
+    provider: &str,
+    provider_session_id: &str,
+) -> AgentChatTurnSummaryContext {
+    let native_turn_id = cloud_mcp_agent_chat_turn_native_id(payload);
+    let snapshot = cloud_mcp_agent_chat_turn_git_take_completion_snapshot(
+        payload,
+        provider,
+        provider_session_id,
+        &native_turn_id,
+    );
+    let started_at = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.started_at.clone())
+        .unwrap_or_else(|| cloud_mcp_agent_chat_turn_started_at(payload));
+    let started_at_ms = snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.started_at_ms)
+        .unwrap_or_else(|| cloud_mcp_agent_chat_turn_hook_ms(payload));
+    let turn_key = if !native_turn_id.trim().is_empty() {
+        native_turn_id.clone()
+    } else {
+        snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.turn_key.clone())
+            .unwrap_or_else(|| cloud_mcp_agent_chat_turn_key_from_start(payload))
+    };
+    let completed_at = cloud_mcp_agent_chat_turn_completed_at(payload);
+    let completed_at_ms = cloud_mcp_agent_chat_turn_hook_ms(payload);
+    let duration_ms = payload.duration_ms.or_else(|| {
+        completed_at_ms
+            .checked_sub(started_at_ms)
+            .filter(|duration| *duration > 0)
+    });
+    let git_diff = cloud_mcp_agent_chat_turn_git_diff(snapshot);
+    let hook_raw = json!({
+        "event_type": payload.event_type.as_str(),
+        "hook_event_name": payload.hook_event_name.as_str(),
+        "source": payload.source.as_str(),
+        "provider": provider,
+        "provider_session_id": provider_session_id,
+        "native_session_id": payload.native_session_id.clone(),
+        "provider_turn_id": payload.provider_turn_id.clone(),
+        "turn_id": payload.turn_id.clone(),
+        "turn_key": turn_key.as_str(),
+        "started_at": started_at.as_str(),
+        "completed_at": completed_at.as_str(),
+        "duration_ms": duration_ms,
+        "hook_timestamp_ms": payload.hook_timestamp_ms,
+        "observed_at_ms": payload.observed_at_ms,
+    });
+    AgentChatTurnSummaryContext {
+        turn_id: native_turn_id,
+        turn_key,
+        started_at,
+        completed_at,
+        duration_ms,
+        raw: json!({
+            "hook": hook_raw,
+            "git": git_diff.raw,
+        }),
+        file_change: git_diff.file_change,
+    }
+}
+
+fn cloud_mcp_agent_chat_turn_summary_has_stable_key(payload: &TerminalActivityHookPayload) -> bool {
+    !cloud_mcp_agent_chat_turn_native_id(payload)
+        .trim()
+        .is_empty()
+        || payload
+            .prompt_ready_at
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn cloud_mcp_sync_agent_chat_turn_summary_from_hook(
+    state: &CloudMcpState,
+    payload: &TerminalActivityHookPayload,
+    context_entry: Option<&CloudMcpTerminalContextState>,
+    workspace_root: &str,
+    state_value: &str,
+    turn_status: &str,
+) {
+    let event_type = cloud_mcp_lifecycle_status_key(&payload.event_type);
+    if !matches!(
+        event_type.as_str(),
+        "provider_turn_started" | "provider_turn_completed"
+    ) {
+        return;
+    }
+    let Some(request) = cloud_mcp_agent_chat_status_sync_request_from_hook(
+        payload,
+        context_entry,
+        workspace_root,
+        state_value,
+        turn_status,
+    ) else {
+        return;
+    };
+    if event_type == "provider_turn_started" {
+        let started_at = cloud_mcp_agent_chat_turn_started_at(payload);
+        let turn_key = cloud_mcp_agent_chat_turn_key_from_start(payload);
+        let started_at_ms = cloud_mcp_agent_chat_turn_hook_ms(payload);
+        cloud_mcp_agent_chat_turn_git_mark_start(
+            &request.provider,
+            &request.provider_session_id,
+            &turn_key,
+            started_at_ms,
+        );
+        tauri::async_runtime::spawn_blocking(move || {
+            cloud_mcp_agent_chat_turn_git_record_start_after_mark(
+                &request.provider,
+                &request.provider_session_id,
+                &turn_key,
+                &request.cwd,
+                &started_at,
+                started_at_ms,
+            );
+        });
+        return;
+    }
+    if !cloud_mcp_agent_chat_turn_summary_has_stable_key(payload) {
+        return;
+    }
+    let payload = payload.clone();
+    let state = state.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
+            &payload,
+            &request.provider,
+            &request.provider_session_id,
+        );
+        let mut context = request.context;
+        context.metadata_only = false;
+        context.source = "terminal_activity_hook_turn_summary".to_string();
+        context.turn_summary = Some(summary);
+        agent_chat_session_sync_spawn_with_state(
+            state,
+            request.provider,
+            request.provider_session_id,
+            request.cwd,
+            context,
+            "terminal_activity_hook_turn_summary",
+        );
+    });
+}
+
+fn cloud_mcp_agent_chat_hook_workspace_root(
+    payload: &TerminalActivityHookPayload,
+    context_entry: Option<&CloudMcpTerminalContextState>,
+) -> String {
+    payload
+        .cwd
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            context_entry
+                .map(|entry| workspace_path_display(&entry.repo_root))
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or_default()
 }
 
 pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
@@ -33809,11 +34705,7 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         .as_ref()
         .map(|entry| entry.repo_id.clone())
         .filter(|value| !value.trim().is_empty());
-    let workspace_root = context_entry
-        .as_ref()
-        .map(|entry| workspace_path_display(&entry.repo_root))
-        .or_else(|| payload.cwd.clone())
-        .unwrap_or_default();
+    let workspace_root = cloud_mcp_agent_chat_hook_workspace_root(payload, context_entry.as_ref());
     let direct_prompt_refs = context_entry.as_ref().and_then(|entry| {
         Some(CloudMcpDirectPromptTodoRefs {
             todo_id: entry.todo_id.clone()?,
@@ -33866,6 +34758,14 @@ pub(crate) async fn cloud_mcp_sync_terminal_activity_hook_delta(
         Some(cloud_mcp_workspace_runtime_epoch(state))
     };
     cloud_mcp_sync_agent_chat_session_status_from_hook(
+        state,
+        payload,
+        context_entry.as_ref(),
+        &workspace_root,
+        state_value,
+        turn_status,
+    );
+    cloud_mcp_sync_agent_chat_turn_summary_from_hook(
         state,
         payload,
         context_entry.as_ref(),
@@ -34065,11 +34965,12 @@ fn cloud_mcp_mark_workspace_inactive_in_snapshot(
 
 fn cloud_mcp_deactivated_workspace_snapshot(
     workspace_id: &str,
+    workspace_root: Option<&str>,
     reason: &str,
     observed_at_ms: u64,
 ) -> Value {
     let device_profile = cloud_mcp_desktop_device_profile();
-    json!({
+    let mut snapshot = json!({
         "source": "rust-diffforge-workspace-runtime",
         "event_kind": "device_live_state_snapshot",
         "device": device_profile.clone(),
@@ -34107,7 +35008,21 @@ fn cloud_mcp_deactivated_workspace_snapshot(
         "ts_ms": observed_at_ms,
         "updated_at_ms": observed_at_ms,
         "updatedAtMs": observed_at_ms,
-    })
+    });
+    if let Some(workspace_root) = workspace_root
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(workspace) = snapshot
+            .get_mut("workspaces")
+            .and_then(Value::as_array_mut)
+            .and_then(|workspaces| workspaces.first_mut())
+            .and_then(Value::as_object_mut)
+        {
+            workspace.insert("workspace_root".to_string(), json!(workspace_root));
+        }
+    }
+    snapshot
 }
 
 pub(crate) async fn cloud_mcp_publish_workspace_deactivated_snapshot(
@@ -34128,6 +35043,15 @@ pub(crate) async fn cloud_mcp_publish_workspace_deactivated_snapshot(
         }
     };
     let observed_at_ms = cloud_mcp_now_ms();
+    let workspace_root = {
+        let runtime = state.inner.lock().await;
+        runtime
+            .registered_workspaces
+            .values()
+            .find(|workspace| workspace.workspace_id == workspace_id)
+            .map(|workspace| workspace.root.trim().to_string())
+            .filter(|root| !root.is_empty())
+    };
     let mut changed = false;
     {
         let mut snapshots = state.runtime_snapshots.lock().await;
@@ -34152,6 +35076,7 @@ pub(crate) async fn cloud_mcp_publish_workspace_deactivated_snapshot(
         if !changed {
             snapshots.workspace_catalog = Some(cloud_mcp_deactivated_workspace_snapshot(
                 workspace_id,
+                workspace_root.as_deref(),
                 &reason,
                 observed_at_ms,
             ));
@@ -52811,6 +53736,58 @@ mod cloud_mcp_tests {
         }
     }
 
+    fn cloud_mcp_test_dir(prefix: &str) -> PathBuf {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or(0);
+        env::temp_dir().join(format!("{prefix}-{suffix}"))
+    }
+
+    fn cloud_mcp_test_git(root: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    fn cloud_mcp_test_git_output(root: &Path, args: &[&str]) -> String {
+        Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).to_string())
+            .unwrap_or_default()
+    }
+
+    fn cloud_mcp_init_test_repo(root: &Path) -> bool {
+        if Command::new("git").arg("--version").output().is_err() {
+            return false;
+        }
+        fs::create_dir_all(root).unwrap();
+        if !cloud_mcp_test_git(root, &["init"]) {
+            return false;
+        }
+        if !cloud_mcp_test_git(root, &["config", "user.name", "Diff Forge Test"]) {
+            return false;
+        }
+        if !cloud_mcp_test_git(root, &["config", "user.email", "test@diffforge.local"]) {
+            return false;
+        }
+        fs::write(root.join("edit.txt"), "old\n").unwrap();
+        fs::write(root.join("delete.txt"), "delete me\n").unwrap();
+        if !cloud_mcp_test_git(root, &["add", "edit.txt", "delete.txt"]) {
+            return false;
+        }
+        cloud_mcp_test_git(root, &["commit", "-m", "initial"])
+    }
+
     #[test]
     fn agent_chat_status_hooks_map_to_metadata_only_sync_requests() {
         for event_type in [
@@ -52839,6 +53816,465 @@ mod cloud_mcp_tests {
             &payload, None, "", "thinking", "running",
         )
         .is_none());
+    }
+
+    #[test]
+    fn agent_chat_turn_git_capture_maps_fixture_changes_without_real_index_mutation() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+        let root = cloud_mcp_test_dir("diffforge-turn-git");
+        if !cloud_mcp_init_test_repo(&root) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let root_text = root.to_string_lossy().to_string();
+        let started_at_ms = cloud_mcp_now_ms();
+        cloud_mcp_agent_chat_turn_git_record_start(
+            "codex",
+            "session-git",
+            "turn-git",
+            &root_text,
+            "2026-07-02T00:00:00.000Z",
+            started_at_ms,
+        );
+
+        fs::write(root.join("edit.txt"), "old\nnew\n").unwrap();
+        fs::remove_file(root.join("delete.txt")).unwrap();
+        fs::write(root.join("create.txt"), "created\n").unwrap();
+
+        let snapshot =
+            cloud_mcp_agent_chat_turn_git_take_snapshot("codex", "session-git", "turn-git");
+        let diff = cloud_mcp_agent_chat_turn_git_diff(snapshot);
+        let file_change = diff.file_change.expect("file change");
+        let files = file_change["files"].as_array().expect("files");
+        let file_for = |path: &str| {
+            files
+                .iter()
+                .find(|file| file["path"] == json!(path))
+                .unwrap_or_else(|| panic!("missing file change for {path}"))
+        };
+        let create = file_for("create.txt");
+        let edit = file_for("edit.txt");
+        let delete = file_for("delete.txt");
+
+        assert_eq!(files.len(), 3);
+        assert_eq!(create["kind"], json!("create"));
+        assert_eq!(create["additions"], json!(1));
+        assert_eq!(create["deletions"], json!(0));
+        assert_eq!(edit["kind"], json!("edit"));
+        assert_eq!(edit["additions"], json!(1));
+        assert_eq!(edit["deletions"], json!(0));
+        assert_eq!(delete["kind"], json!("delete"));
+        assert_eq!(delete["additions"], json!(0));
+        assert_eq!(delete["deletions"], json!(1));
+        assert_eq!(file_change["summary"], json!("3 files changed (+2 -1)"));
+        let numstat = diff.raw["numstat"].as_str().unwrap_or_default();
+        assert!(numstat.contains("1\t0\tcreate.txt"));
+        assert!(numstat.contains("1\t0\tedit.txt"));
+        assert!(numstat.contains("0\t1\tdelete.txt"));
+        let name_status = diff.raw["name_status"].as_str().unwrap_or_default();
+        assert!(name_status.contains("A\tcreate.txt"));
+        assert!(name_status.contains("M\tedit.txt"));
+        assert!(name_status.contains("D\tdelete.txt"));
+        assert!(
+            cloud_mcp_test_git_output(&root, &["diff", "--cached", "--name-only"])
+                .trim()
+                .is_empty()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_chat_turn_git_capture_non_git_cwd_noops() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+        let root = cloud_mcp_test_dir("diffforge-turn-non-git");
+        fs::create_dir_all(&root).unwrap();
+        assert!(cloud_mcp_agent_chat_turn_git_root(&root.to_string_lossy()).is_none());
+        cloud_mcp_agent_chat_turn_git_record_start(
+            "codex",
+            "session-non-git",
+            "turn-non-git",
+            &root.to_string_lossy(),
+            "2026-07-02T00:00:00.000Z",
+            cloud_mcp_now_ms(),
+        );
+        assert!(cloud_mcp_agent_chat_turn_git_take_snapshot(
+            "codex",
+            "session-non-git",
+            "turn-non-git"
+        )
+        .is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_chat_turn_summary_aliases_prompt_start_snapshot_to_native_turn_id() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+        let root = cloud_mcp_test_dir("diffforge-turn-alias");
+        if !cloud_mcp_init_test_repo(&root) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        let mut start_payload = agent_chat_status_hook_test_payload("provider-turn-started");
+        start_payload.provider_session_id = Some("session-alias".to_string());
+        start_payload.provider_turn_id = None;
+        start_payload.turn_id = None;
+        start_payload.prompt_ready_at = Some("2026-07-02T00:00:00.000Z".to_string());
+        start_payload.cwd = Some(root.to_string_lossy().to_string());
+        start_payload.hook_timestamp_ms = cloud_mcp_now_ms();
+        start_payload.observed_at_ms = start_payload.hook_timestamp_ms;
+        let start_key = cloud_mcp_agent_chat_turn_key_from_start(&start_payload);
+        cloud_mcp_agent_chat_turn_git_record_start(
+            "codex",
+            "session-alias",
+            &start_key,
+            &root.to_string_lossy(),
+            "2026-07-02T00:00:00.000Z",
+            start_payload.hook_timestamp_ms,
+        );
+        fs::write(root.join("edit.txt"), "old\nnew\n").unwrap();
+
+        let mut completion_payload = agent_chat_status_hook_test_payload("provider-turn-completed");
+        completion_payload.provider_session_id = Some("session-alias".to_string());
+        completion_payload.provider_turn_id = Some("native-turn-alias".to_string());
+        completion_payload.turn_id = Some("native-turn-alias".to_string());
+        completion_payload.prompt_ready_at = Some("2026-07-02T00:00:00.000Z".to_string());
+        completion_payload.completed_at = Some("2026-07-02T00:00:03.000Z".to_string());
+        completion_payload.cwd = Some(root.to_string_lossy().to_string());
+        completion_payload.hook_timestamp_ms = start_payload.hook_timestamp_ms + 3000;
+        completion_payload.observed_at_ms = completion_payload.hook_timestamp_ms;
+
+        assert!(cloud_mcp_agent_chat_turn_summary_has_stable_key(
+            &completion_payload
+        ));
+        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
+            &completion_payload,
+            "codex",
+            "session-alias",
+        );
+
+        assert_eq!(summary.turn_key, "native-turn-alias");
+        assert!(summary.file_change.is_some());
+        assert!(summary.raw["git"]["numstat"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("edit.txt"));
+        assert!(
+            cloud_mcp_agent_chat_turn_git_take_snapshot("codex", "session-alias", &start_key)
+                .is_none()
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn agent_chat_turn_summary_does_not_use_latest_session_snapshot_fallback() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+        let root = cloud_mcp_test_dir("diffforge-turn-no-latest");
+        if !cloud_mcp_init_test_repo(&root) {
+            let _ = fs::remove_dir_all(&root);
+            return;
+        }
+        cloud_mcp_agent_chat_turn_git_record_start(
+            "codex",
+            "session-no-latest",
+            "turn-a",
+            &root.to_string_lossy(),
+            "2026-07-02T00:00:00.000Z",
+            cloud_mcp_now_ms(),
+        );
+        fs::write(root.join("edit.txt"), "old\nnew\n").unwrap();
+        let mut payload = agent_chat_status_hook_test_payload("provider-turn-completed");
+        payload.provider_session_id = Some("session-no-latest".to_string());
+        payload.provider_turn_id = None;
+        payload.turn_id = None;
+        payload.prompt_ready_at = None;
+        payload.completed_at = Some("2026-07-02T00:00:03.000Z".to_string());
+        payload.cwd = Some(root.to_string_lossy().to_string());
+        payload.hook_timestamp_ms = cloud_mcp_now_ms();
+        payload.observed_at_ms = payload.hook_timestamp_ms;
+
+        assert!(!cloud_mcp_agent_chat_turn_summary_has_stable_key(&payload));
+        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
+            &payload,
+            "codex",
+            "session-no-latest",
+        );
+
+        assert!(summary.file_change.is_none());
+        assert_eq!(
+            summary.raw["git"]["skipped"],
+            json!("missing_start_snapshot")
+        );
+        assert!(cloud_mcp_agent_chat_turn_git_take_snapshot(
+            "codex",
+            "session-no-latest",
+            "turn-a"
+        )
+        .is_some());
+
+        let _ = fs::remove_dir_all(&root);
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+    }
+
+    #[test]
+    fn agent_chat_turn_git_snapshot_map_prunes_ttl_and_oldest_entries() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+        let now = cloud_mcp_now_ms();
+        for index in 0..(CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_MAX + 1) {
+            cloud_mcp_agent_chat_turn_git_mark_start(
+                "codex",
+                "session-prune",
+                &format!("turn-{index}"),
+                now + index as u64,
+            );
+        }
+        let (snapshots, _) = cloud_mcp_agent_chat_turn_git_snapshots();
+        let snapshots = snapshots.lock().unwrap();
+        assert_eq!(snapshots.len(), CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_MAX);
+        assert!(
+            !snapshots.contains_key(&cloud_mcp_agent_chat_turn_snapshot_key(
+                "codex",
+                "session-prune",
+                "turn-0"
+            ))
+        );
+        drop(snapshots);
+
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+        cloud_mcp_agent_chat_turn_git_mark_start(
+            "codex",
+            "session-prune",
+            "turn-old",
+            now.saturating_sub(CLOUD_MCP_AGENT_CHAT_TURN_GIT_SNAPSHOT_TTL_MS + 1),
+        );
+        cloud_mcp_agent_chat_turn_git_mark_start("codex", "session-prune", "turn-new", now);
+        let (snapshots, _) = cloud_mcp_agent_chat_turn_git_snapshots();
+        let snapshots = snapshots.lock().unwrap();
+        assert!(
+            !snapshots.contains_key(&cloud_mcp_agent_chat_turn_snapshot_key(
+                "codex",
+                "session-prune",
+                "turn-old"
+            ))
+        );
+        assert!(
+            snapshots.contains_key(&cloud_mcp_agent_chat_turn_snapshot_key(
+                "codex",
+                "session-prune",
+                "turn-new"
+            ))
+        );
+        drop(snapshots);
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+    }
+
+    #[test]
+    fn agent_chat_hook_workspace_root_prefers_payload_cwd_over_context_root() {
+        let _guard = CLOUD_MCP_TEST_ENV_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+        let payload_root = cloud_mcp_test_dir("diffforge-turn-payload-cwd");
+        let context_root = cloud_mcp_test_dir("diffforge-turn-context-root");
+        if !cloud_mcp_init_test_repo(&payload_root) || !cloud_mcp_init_test_repo(&context_root) {
+            let _ = fs::remove_dir_all(&payload_root);
+            let _ = fs::remove_dir_all(&context_root);
+            return;
+        }
+        let payload_root_text = payload_root.to_string_lossy().to_string();
+        let context_root_text = context_root.to_string_lossy().to_string();
+        let payload_git_root_text = cloud_mcp_agent_chat_turn_git_root(&payload_root_text)
+            .unwrap_or_else(|| payload_root.clone())
+            .to_string_lossy()
+            .to_string();
+        let mut payload = agent_chat_status_hook_test_payload("provider-turn-started");
+        payload.provider_session_id = Some("session-cwd".to_string());
+        payload.provider_turn_id = Some("turn-cwd".to_string());
+        payload.turn_id = Some("turn-cwd".to_string());
+        payload.prompt_ready_at = Some("2026-07-02T00:00:00.000Z".to_string());
+        payload.cwd = Some(payload_root_text.clone());
+        payload.hook_timestamp_ms = cloud_mcp_now_ms();
+        payload.observed_at_ms = payload.hook_timestamp_ms;
+        let context = CloudMcpTerminalContextState {
+            last_prompt: String::new(),
+            repo_id: "repo-a".to_string(),
+            agent_id: "codex".to_string(),
+            working_directory: PathBuf::from("/tmp/context-workdir"),
+            repo_root: context_root.clone(),
+            prompt_event_id: None,
+            prompt_event_source: None,
+            prompt_event_submitted_at: None,
+            terminal_index: Some(0),
+            thread_id: Some("thread-a".to_string()),
+            workspace_id: "workspace-a".to_string(),
+            workspace_name: "Workspace A".to_string(),
+            session_mode: String::new(),
+            todo_id: None,
+            todo_dispatch_id: None,
+            todo_command_id: None,
+            created_ms: 0,
+            local_task_id: None,
+            saw_agent_activity: false,
+            work_brief: String::new(),
+            work_brief_reported: false,
+            done_reported: false,
+        };
+
+        let workspace_root = cloud_mcp_agent_chat_hook_workspace_root(&payload, Some(&context));
+        assert_eq!(
+            workspace_root, payload_root_text,
+            "payload cwd should win over context root"
+        );
+        let request = cloud_mcp_agent_chat_status_sync_request_from_hook(
+            &payload,
+            Some(&context),
+            &workspace_root,
+            "thinking",
+            "running",
+        )
+        .expect("hook should produce sync request");
+        assert_eq!(request.cwd, payload_root_text);
+        let turn_key = cloud_mcp_agent_chat_turn_key_from_start(&payload);
+        cloud_mcp_agent_chat_turn_git_record_start(
+            &request.provider,
+            &request.provider_session_id,
+            &turn_key,
+            &request.cwd,
+            "2026-07-02T00:00:00.000Z",
+            payload.hook_timestamp_ms,
+        );
+        fs::write(payload_root.join("payload-only.txt"), "payload\n").unwrap();
+        fs::write(context_root.join("context-only.txt"), "context\n").unwrap();
+
+        let mut completion_payload = agent_chat_status_hook_test_payload("provider-turn-completed");
+        completion_payload.provider_session_id = Some("session-cwd".to_string());
+        completion_payload.provider_turn_id = Some("turn-cwd".to_string());
+        completion_payload.turn_id = Some("turn-cwd".to_string());
+        completion_payload.prompt_ready_at = Some("2026-07-02T00:00:00.000Z".to_string());
+        completion_payload.completed_at = Some("2026-07-02T00:00:03.000Z".to_string());
+        completion_payload.cwd = Some(payload_root_text.clone());
+        completion_payload.hook_timestamp_ms = payload.hook_timestamp_ms + 3000;
+        completion_payload.observed_at_ms = completion_payload.hook_timestamp_ms;
+        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
+            &completion_payload,
+            "codex",
+            "session-cwd",
+        );
+        assert_eq!(
+            summary.raw["git"]["repo_root"],
+            json!(payload_git_root_text)
+        );
+        let files = summary
+            .file_change
+            .as_ref()
+            .and_then(|file_change| file_change["files"].as_array())
+            .expect("payload cwd file change");
+        assert!(files
+            .iter()
+            .any(|file| file["path"] == json!("payload-only.txt")));
+        assert!(!files
+            .iter()
+            .any(|file| file["path"] == json!("context-only.txt")));
+
+        payload.cwd = None;
+        assert_eq!(
+            cloud_mcp_agent_chat_hook_workspace_root(&payload, Some(&context)),
+            context_root_text
+        );
+        let _ = fs::remove_dir_all(&payload_root);
+        let _ = fs::remove_dir_all(&context_root);
+        cloud_mcp_agent_chat_turn_git_clear_all_snapshots();
+    }
+
+    #[test]
+    fn agent_chat_turn_key_fallback_uses_hook_timestamp_not_wall_clock() {
+        let mut payload = agent_chat_status_hook_test_payload("provider-turn-started");
+        payload.provider_turn_id = None;
+        payload.turn_id = None;
+        payload.prompt_ready_at = None;
+        payload.hook_timestamp_ms = 42;
+        payload.observed_at_ms = 41;
+
+        assert_eq!(
+            cloud_mcp_agent_chat_turn_key_from_start(&payload),
+            "turn-start-ms-42"
+        );
+    }
+
+    #[test]
+    fn agent_chat_turn_summary_missing_start_snapshot_has_no_file_change() {
+        let mut payload = agent_chat_status_hook_test_payload("provider-turn-completed");
+        payload.turn_status = "completed".to_string();
+        payload.provider_session_id = Some("session-missing-start".to_string());
+        payload.provider_turn_id = Some("turn-missing-start".to_string());
+        payload.turn_id = Some("turn-missing-start".to_string());
+        payload.hook_timestamp_ms = 1_788_200_001_000;
+        payload.observed_at_ms = 1_788_200_001_000;
+        payload.completed_at = Some("2026-09-01T00:00:01.000Z".to_string());
+
+        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
+            &payload,
+            "codex",
+            "session-missing-start",
+        );
+
+        assert!(summary.file_change.is_none());
+        assert_eq!(
+            summary.raw["git"]["skipped"],
+            json!("missing_start_snapshot")
+        );
+        assert_eq!(summary.turn_key, "turn-missing-start");
+    }
+
+    #[test]
+    fn agent_chat_turn_summary_app_restart_mid_turn_noops_without_snapshot() {
+        let mut payload = agent_chat_status_hook_test_payload("provider-turn-completed");
+        payload.turn_status = "completed".to_string();
+        payload.provider_session_id = Some("session-after-restart".to_string());
+        payload.provider_turn_id = None;
+        payload.turn_id = None;
+        payload.prompt_ready_at = Some("2026-09-01T00:00:00.000Z".to_string());
+        payload.completed_at = Some("2026-09-01T00:00:05.000Z".to_string());
+        payload.hook_timestamp_ms = 1_788_200_005_000;
+        payload.observed_at_ms = 1_788_200_005_000;
+
+        let summary = cloud_mcp_agent_chat_turn_summary_context_from_hook(
+            &payload,
+            "codex",
+            "session-after-restart",
+        );
+
+        assert!(summary.file_change.is_none());
+        assert_eq!(
+            summary.raw["git"]["skipped"],
+            json!("missing_start_snapshot")
+        );
+        assert_eq!(summary.turn_id, "");
+        assert_eq!(summary.turn_key, "turn-start:2026-09-01T00:00:00.000Z");
+        assert_eq!(summary.started_at, "2026-09-01T00:00:00.000Z");
+        assert_eq!(summary.completed_at, "2026-09-01T00:00:05.000Z");
     }
 
     #[test]
@@ -55255,8 +56691,7 @@ mod cloud_mcp_tests {
 
     #[test]
     fn route_pending_errors_map_to_initializing_with_bounded_retry() {
-        let error =
-            "Cloud MCP route pending: route_state=assignment_booting; backend_status=booting; retry_after_ms=12000";
+        let error = "Cloud MCP route pending: route_state=assignment_booting; backend_status=booting; retry_after_ms=12000";
         assert_eq!(
             cloud_mcp_route_error_runtime_status(error),
             Some("route_initializing")

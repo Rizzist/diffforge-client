@@ -73,19 +73,33 @@ const SNIPPING_WINDOWS_GRAPHICS_CAPTURE_FRAME_WAIT_MS: u64 = 25;
 const SNIPPING_WINDOWS_GRAPHICS_CAPTURE_FIRST_FRAME_TIMEOUT_MS: u64 = 750;
 const SNIPPING_WARM_CAPTURE_FRAME_MAX_AGE_MS: u64 = 750;
 const SNIPPING_WARM_CAPTURE_RESTART_MIN_MS: u64 = 2_000;
-/// Wall-clock ms of the most recent macOS Space change. Warm frames captured
-/// before this instant show the PREVIOUS Space; freezing one right after a
-/// three-finger swipe snips the old desktop instead of the screen the user is
-/// looking at, so frame selection treats them as expired.
-static SNIPPING_LAST_SPACE_CHANGE_MS: AtomicU64 = AtomicU64::new(0);
+/// Wall-clock ms before which warm-capture frames must not be trusted for a
+/// screen freeze. Stamped on macOS Space changes (frames from before a
+/// three-finger swipe show the PREVIOUS Space — freezing one snips the old
+/// desktop instead of the screen the user is looking at) and on overlay hide
+/// while snipping windows are visible in captures (those frames contain the
+/// overlay itself).
+static SNIPPING_WARM_FRAMES_INVALID_BEFORE_MS: AtomicU64 = AtomicU64::new(0);
 
-fn snipping_last_space_change_ms() -> u64 {
-    SNIPPING_LAST_SPACE_CHANGE_MS.load(Ordering::Acquire)
+fn snipping_warm_frames_invalid_before_ms() -> u64 {
+    SNIPPING_WARM_FRAMES_INVALID_BEFORE_MS.load(Ordering::Acquire)
 }
 
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn snipping_mark_space_changed_now() {
-    SNIPPING_LAST_SPACE_CHANGE_MS.store(current_time_ms(), Ordering::Release);
+fn snipping_invalidate_current_warm_frames() {
+    SNIPPING_WARM_FRAMES_INVALID_BEFORE_MS.store(current_time_ms(), Ordering::Release);
+}
+
+/// Cached mirror of `SnippingSettings.visible_in_captures`, inverted, for
+/// contexts that plumb window styles without an AppHandle. true = snipping
+/// windows are EXCLUDED from screen sharing/recordings (historical default).
+static SNIPPING_CAPTURE_EXCLUSION_ENABLED: AtomicBool = AtomicBool::new(true);
+
+fn snipping_capture_exclusion_enabled() -> bool {
+    SNIPPING_CAPTURE_EXCLUSION_ENABLED.load(Ordering::Acquire)
+}
+
+fn snipping_refresh_capture_exclusion_cache(visible_in_captures: bool) {
+    SNIPPING_CAPTURE_EXCLUSION_ENABLED.store(!visible_in_captures, Ordering::Release);
 }
 const SNIPPING_MIN_AREA_PIXELS: u32 = 8;
 const SNIPPING_MIN_RECORDING_PIXELS: u32 = 8;
@@ -611,6 +625,11 @@ struct SnippingState {
     /// Later resize/hover handoff steps scale this so the cursor stays on the
     /// same image point instead of recentering the window.
     preview_drag_grab_ratios: Arc<StdMutex<HashMap<String, (f64, f64)>>>,
+    /// Monotonic ticket source for per-preview drag follow watchdogs.
+    preview_drag_follow_generation: Arc<AtomicU64>,
+    /// Preview window label -> active drag follow watchdog ticket. Replacing the
+    /// ticket lets a restarted drag stop any stale watchdog for the same label.
+    preview_drag_follow_generations: Arc<StdMutex<HashMap<String, u64>>>,
     /// Preview window label -> original recent-strip slot for previews opened
     /// from the strip. Manual close returns these to the same local strip slot.
     preview_strip_origins: Arc<StdMutex<HashMap<String, SnippingPreviewStripOrigin>>>,
@@ -673,6 +692,8 @@ impl SnippingState {
             preview_strip_hover_labels: Arc::new(StdMutex::new(HashSet::new())),
             preview_drag_handoff_until_ms: Arc::new(StdMutex::new(HashMap::new())),
             preview_drag_grab_ratios: Arc::new(StdMutex::new(HashMap::new())),
+            preview_drag_follow_generation: Arc::new(AtomicU64::new(0)),
+            preview_drag_follow_generations: Arc::new(StdMutex::new(HashMap::new())),
             preview_strip_origins: Arc::new(StdMutex::new(HashMap::new())),
             strip_interaction_guard_until_ms: Arc::new(AtomicU64::new(0)),
             strip_outside_click_watcher_active: Arc::new(AtomicBool::new(false)),
@@ -738,6 +759,7 @@ struct SnippingShortcutManagerState {
     hide_desktop_icons: bool,
     freeze_screen: bool,
     upload_public: bool,
+    visible_in_captures: bool,
     full_screenshot: SnippingShortcutRegistration,
     area_snip: SnippingShortcutRegistration,
     area_recording: SnippingShortcutRegistration,
@@ -745,11 +767,13 @@ struct SnippingShortcutManagerState {
 
 impl SnippingShortcutManagerState {
     fn from_settings(settings: &SnippingSettings) -> Self {
+        snipping_refresh_capture_exclusion_cache(settings.visible_in_captures);
         Self {
             enabled: settings.enabled,
             hide_desktop_icons: settings.hide_desktop_icons,
             freeze_screen: settings.freeze_screen,
             upload_public: settings.upload_public,
+            visible_in_captures: settings.visible_in_captures,
             full_screenshot: SnippingShortcutRegistration::new(settings.full_screenshot.clone()),
             area_snip: SnippingShortcutRegistration::new(settings.area_snip.clone()),
             area_recording: SnippingShortcutRegistration::new(settings.area_recording.clone()),
@@ -762,6 +786,7 @@ impl SnippingShortcutManagerState {
             hide_desktop_icons: self.hide_desktop_icons,
             freeze_screen: self.freeze_screen,
             upload_public: self.upload_public,
+            visible_in_captures: self.visible_in_captures,
             full_screenshot: self.full_screenshot.shortcut.clone(),
             area_snip: self.area_snip.shortcut.clone(),
             area_recording: self.area_recording.shortcut.clone(),
@@ -905,6 +930,7 @@ struct SnippingSettingsStatus {
     hide_desktop_icons: bool,
     freeze_screen: bool,
     upload_public: bool,
+    visible_in_captures: bool,
     full_screenshot: SnippingShortcutRegistrationStatus,
     area_snip: SnippingShortcutRegistrationStatus,
     area_recording: SnippingShortcutRegistrationStatus,
@@ -939,6 +965,11 @@ struct SnippingSettings {
     freeze_screen: bool,
     #[serde(default = "default_snipping_upload_public")]
     upload_public: bool,
+    // Whether snipping windows (area overlay, annotation editor, previews,
+    // recording controls) appear in screen sharing/recordings/captures.
+    // Default false = excluded, the historical behavior.
+    #[serde(default)]
+    visible_in_captures: bool,
     #[serde(default)]
     full_screenshot: String,
     #[serde(default)]
@@ -968,6 +999,12 @@ struct SnippingHideDesktopIconsRequest {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SnippingFreezeScreenRequest {
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SnippingVisibleInCapturesRequest {
     enabled: bool,
 }
 
@@ -1070,6 +1107,7 @@ fn default_snipping_settings() -> SnippingSettings {
         hide_desktop_icons: true,
         freeze_screen: false,
         upload_public: true,
+        visible_in_captures: false,
         full_screenshot: SnippingShortcutAction::FullScreenshot.default_shortcut(),
         area_snip: SnippingShortcutAction::AreaSnip.default_shortcut(),
         area_recording: SnippingShortcutAction::AreaRecording.default_shortcut(),
@@ -1187,6 +1225,7 @@ fn sanitized_snipping_settings(settings: SnippingSettings) -> SnippingSettings {
         hide_desktop_icons: settings.hide_desktop_icons,
         freeze_screen: settings.freeze_screen,
         upload_public: settings.upload_public,
+        visible_in_captures: settings.visible_in_captures,
         full_screenshot,
         area_snip,
         area_recording,
@@ -1727,6 +1766,7 @@ fn snipping_status_from_state(
         hide_desktop_icons: state.hide_desktop_icons,
         freeze_screen: state.freeze_screen,
         upload_public: state.upload_public,
+        visible_in_captures: state.visible_in_captures,
         full_screenshot: snipping_shortcut_registration_status(
             SnippingShortcutAction::FullScreenshot,
             state.full_screenshot,
@@ -2265,6 +2305,7 @@ fn set_snipping_enabled_for(
         hide_desktop_icons: state.hide_desktop_icons,
         freeze_screen: state.freeze_screen,
         upload_public: state.upload_public,
+        visible_in_captures: state.visible_in_captures,
         full_screenshot: state.full_screenshot.shortcut.clone(),
         area_snip: state.area_snip.shortcut.clone(),
         area_recording: state.area_recording.shortcut.clone(),
@@ -2364,6 +2405,29 @@ fn set_snipping_upload_public_for(
 
     write_snipping_settings(app, &state.settings())?;
     manager.replace(state);
+    emit_snipping_shortcuts_changed(app);
+    snipping_status_for(app)
+}
+
+fn set_snipping_visible_in_captures_for(
+    app: &AppHandle,
+    request: SnippingVisibleInCapturesRequest,
+) -> Result<SnippingSettingsStatus, String> {
+    let manager = app.state::<SnippingState>().shortcut_manager.clone();
+    let mut state = manager.snapshot();
+    state.visible_in_captures = request.enabled;
+
+    write_snipping_settings(app, &state.settings())?;
+    manager.replace(state);
+    snipping_refresh_capture_exclusion_cache(request.enabled);
+    // Retroactively re-style every open snipping window so the toggle takes
+    // effect without reopening editors/previews already on screen.
+    let excluded = !request.enabled;
+    for (label, window) in app.webview_windows() {
+        if label.starts_with("snipping-") {
+            snipping_set_window_capture_exclusion(&window, excluded);
+        }
+    }
     emit_snipping_shortcuts_changed(app);
     snipping_status_for(app)
 }
@@ -3742,11 +3806,13 @@ fn snipping_capture_monitor_full_image(
 ) -> Result<image::RgbaImage, String> {
     let warm_capture_allowed = !exclude_desktop_icons;
     if warm_capture_allowed {
-        // Frames older than the last Space change show the previous Space —
-        // freezing one right after a swipe would snip the wrong desktop.
-        if let Some(image) =
-            snipping_warm_capture_frame_for_monitor(app, monitor, snipping_last_space_change_ms())
-        {
+        // Frames from before the last Space change (or overlay teardown while
+        // overlays are capture-visible) show the wrong content to freeze.
+        if let Some(image) = snipping_warm_capture_frame_for_monitor(
+            app,
+            monitor,
+            snipping_warm_frames_invalid_before_ms(),
+        ) {
             return Ok(image);
         }
     }
@@ -5307,7 +5373,7 @@ fn snipping_recording_controls_apply_macos_style(_window: &tauri::WebviewWindow)
 
 fn snipping_recording_controls_window(app: &AppHandle) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(SNIPPING_RECORDING_CONTROLS_WINDOW_LABEL) {
-        snipping_set_recording_controls_capture_exclusion(&window, true);
+        snipping_set_recording_controls_capture_exclusion(&window, snipping_capture_exclusion_enabled());
         #[cfg(target_os = "macos")]
         snipping_recording_controls_apply_macos_style(&window);
         return Ok(window);
@@ -5334,7 +5400,7 @@ fn snipping_recording_controls_window(app: &AppHandle) -> Result<tauri::WebviewW
     .build()
     .map_err(|error| format!("Unable to create recording controls: {error}"))?;
 
-    snipping_set_recording_controls_capture_exclusion(&window, true);
+    snipping_set_recording_controls_capture_exclusion(&window, snipping_capture_exclusion_enabled());
     #[cfg(target_os = "macos")]
     snipping_recording_controls_apply_macos_style(&window);
     {
@@ -5409,7 +5475,7 @@ fn snipping_show_recording_controls(
 ) -> Result<(), String> {
     let window = snipping_recording_controls_window(app)?;
     snipping_position_recording_controls(&window, monitor, request);
-    snipping_set_recording_controls_capture_exclusion(&window, true);
+    snipping_set_recording_controls_capture_exclusion(&window, snipping_capture_exclusion_enabled());
     #[cfg(target_os = "macos")]
     snipping_recording_controls_apply_macos_style(&window);
     snipping_show_window_now(&window, "recording_controls_show");
@@ -8045,7 +8111,7 @@ fn snipping_open_annotation_editor_for_paths(
             .map(|(open_label, open_paths)| (open_label.clone(), open_paths.clone()));
         if let Some((existing_label, existing_paths)) = existing {
             if let Some(window) = app.get_webview_window(&existing_label) {
-                snipping_set_window_capture_exclusion(&window, true);
+                snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
                 snipping_unminimize_window_now(&window, "focus_existing_editor_unminimize");
                 snipping_show_window_now(&window, "focus_existing_editor_show");
                 snipping_focus_window_now(&window, "focus_existing_editor_focus");
@@ -8151,7 +8217,7 @@ fn snipping_open_annotation_editor_for_paths(
     .shadow(true)
     .build()
     .map_err(|error| format!("Unable to create annotation editor window: {error}"))?;
-    snipping_set_window_capture_exclusion(&window, true);
+    snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
     {
         let editor_paths = app.state::<SnippingState>().editor_paths.clone();
         let label_for_destroy = label.clone();
@@ -8412,7 +8478,7 @@ fn ensure_snipping_overlay_window(
 ) -> Result<tauri::WebviewWindow, String> {
     if let Some(window) = app.get_webview_window(label) {
         size_snipping_overlay_window(&window, monitor);
-        snipping_set_window_capture_exclusion(&window, true);
+        snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
         return Ok(window);
     }
 
@@ -8450,7 +8516,7 @@ fn ensure_snipping_overlay_window(
         });
     }
     size_snipping_overlay_window(&window, monitor);
-    snipping_set_window_capture_exclusion(&window, true);
+    snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
     #[cfg(target_os = "macos")]
     {
         snipping_convert_overlay_window_to_panel(&window);
@@ -8534,8 +8600,13 @@ fn snipping_apply_overlay_fullscreen_window_style_to_ns_window(ns_window: &NSWin
     if ns_window.collectionBehavior() != desired_behavior {
         ns_window.setCollectionBehavior(desired_behavior);
     }
-    if ns_window.sharingType() != NSWindowSharingType::None {
-        ns_window.setSharingType(NSWindowSharingType::None);
+    let desired_sharing = if snipping_capture_exclusion_enabled() {
+        NSWindowSharingType::None
+    } else {
+        NSWindowSharingType::ReadOnly
+    };
+    if ns_window.sharingType() != desired_sharing {
+        ns_window.setSharingType(desired_sharing);
     }
     if ns_window.level() != objc2_app_kit::NSScreenSaverWindowLevel {
         ns_window.setLevel(objc2_app_kit::NSScreenSaverWindowLevel);
@@ -10222,7 +10293,7 @@ fn register_snipping_space_change_observer(app: &AppHandle) {
             let block = block2::RcBlock::new(
                 move |_notification: std::ptr::NonNull<objc2_foundation::NSNotification>| {
                     snipping_catch_objc("space_change_observer_callback", || {
-                        snipping_mark_space_changed_now();
+                        snipping_invalidate_current_warm_frames();
                         let use_full_monitor_bounds =
                             macos_refresh_active_space_uses_full_monitor_bounds_on_main_thread();
                         if let Some(app) = snipping_macos_event_tap_app() {
@@ -10321,6 +10392,11 @@ fn snipping_hide_area_overlay_with_desktop_restore(app: &AppHandle, restore_desk
         SNIPPING_AREA_SESSION_ACTIVE.store(false, Ordering::Release);
         SNIPPING_AREA_SESSION_RECORDING.store(false, Ordering::Release);
         SNIPPING_AREA_REASSERT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    }
+    // Capture-visible overlays are baked into any warm frame streamed while
+    // they were up; the next freeze must wait for post-hide frames.
+    if !snipping_capture_exclusion_enabled() {
+        snipping_invalidate_current_warm_frames();
     }
     snipping_unregister_escape_cancel(app);
     for (_, window) in snipping_overlay_windows(app) {
@@ -10535,6 +10611,14 @@ fn set_snipping_upload_public(
     request: SnippingUploadPublicRequest,
 ) -> Result<SnippingSettingsStatus, String> {
     set_snipping_upload_public_for(&app, request)
+}
+
+#[tauri::command]
+fn set_snipping_visible_in_captures(
+    app: AppHandle,
+    request: SnippingVisibleInCapturesRequest,
+) -> Result<SnippingSettingsStatus, String> {
+    set_snipping_visible_in_captures_for(&app, request)
 }
 
 #[tauri::command]
@@ -10976,6 +11060,8 @@ const SNIPPING_STRIP_DRAG_EVENT: &str = "forge-snip-strip-drag";
 const SNIPPING_PREVIEW_DRAG_OVER_THROTTLE_MS: u64 = 16;
 // Anything closer than this to the grab position is a click, not a drop.
 const SNIPPING_PREVIEW_DRAG_MIN_DISTANCE: i32 = 8;
+const SNIPPING_PREVIEW_DRAG_FOLLOW_POLL_MS: u64 = 12;
+const SNIPPING_PREVIEW_DRAG_FOLLOW_SLACK_LOGICAL_PX: f64 = 24.0;
 const SNIPPING_FLOAT_DISPOSE_EVENT: &str = "forge-snip-float-dispose";
 // One paint turn for the webview to unhook live-preview listeners and clear its
 // image src before the native WebKit window starts teardown.
@@ -11143,6 +11229,40 @@ fn snipping_preview_is_dragging(app: &AppHandle, label: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn snipping_clear_preview_drag_follow_generation(app: &AppHandle, label: &str) {
+    if let Ok(mut generations) = app
+        .state::<SnippingState>()
+        .preview_drag_follow_generations
+        .lock()
+    {
+        generations.remove(label);
+    }
+}
+
+fn snipping_preview_drag_follow_generation_is_current(
+    app: &AppHandle,
+    label: &str,
+    generation: u64,
+) -> bool {
+    app.state::<SnippingState>()
+        .preview_drag_follow_generations
+        .lock()
+        .map(|generations| generations.get(label).copied() == Some(generation))
+        .unwrap_or(false)
+}
+
+fn snipping_finish_preview_drag_follow_generation(app: &AppHandle, label: &str, generation: u64) {
+    if let Ok(mut generations) = app
+        .state::<SnippingState>()
+        .preview_drag_follow_generations
+        .lock()
+    {
+        if generations.get(label).copied() == Some(generation) {
+            generations.remove(label);
+        }
+    }
+}
+
 fn snipping_preview_detached_labels(app: &AppHandle) -> HashSet<String> {
     app.state::<SnippingState>()
         .preview_detached_labels
@@ -11173,6 +11293,7 @@ fn snipping_begin_preview_drag_session(
     label: &str,
     position: tauri::PhysicalPosition<i32>,
 ) {
+    snipping_clear_preview_drag_follow_generation(app, label);
     let state = app.state::<SnippingState>();
     if let Ok(mut sessions) = state.preview_drag_sessions.lock() {
         sessions.insert(label.to_string(), (position.x, position.y));
@@ -11227,6 +11348,7 @@ fn snipping_cleanup_preview_registry(app: &AppHandle, label: &str) {
     if let Ok(mut ratios) = state.preview_drag_grab_ratios.lock() {
         ratios.remove(label);
     }
+    snipping_clear_preview_drag_follow_generation(app, label);
     if let Ok(mut origins) = state.preview_strip_origins.lock() {
         origins.remove(label);
     }
@@ -11269,6 +11391,7 @@ fn snipping_begin_preview_close(app: &AppHandle, label: &str) -> bool {
     if let Ok(mut ratios) = state.preview_drag_grab_ratios.lock() {
         ratios.remove(label);
     }
+    snipping_clear_preview_drag_follow_generation(app, label);
     if let Ok(mut origins) = state.preview_strip_origins.lock() {
         origins.remove(label);
     }
@@ -11312,6 +11435,7 @@ fn snipping_park_preview_window(app: &AppHandle, label: &str, window: &tauri::We
     if let Ok(mut ratios) = state.preview_drag_grab_ratios.lock() {
         ratios.remove(label);
     }
+    snipping_clear_preview_drag_follow_generation(app, label);
     state
         .preview_post_release_check_pending
         .store(false, Ordering::SeqCst);
@@ -12688,7 +12812,7 @@ fn snipping_build_preview_window(
     .shadow(true)
     .build()
     .map_err(|error| format!("Unable to create snip preview window: {error}"))?;
-    snipping_set_window_capture_exclusion(&window, true);
+    snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
     #[cfg(target_os = "macos")]
     snipping_preview_apply_macos_space_style(&window);
     // Dragging a preview out of the bottom-left column (or closing one) frees
@@ -12804,9 +12928,19 @@ fn snipping_position_preview_under_cursor_with_offset(
     offset_x: f64,
     offset_y: f64,
 ) -> bool {
-    let Ok(cursor) = app.cursor_position() else {
+    let Some((position, _)) = snipping_preview_position_under_cursor_with_offset(
+        app, window, width, height, offset_x, offset_y,
+    ) else {
         return false;
     };
+    window.set_position(position).is_ok()
+}
+
+fn snipping_preview_cursor_and_scale_for_offset(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+) -> Option<(tauri::PhysicalPosition<f64>, f64)> {
+    let cursor = app.cursor_position().ok()?;
     let scale = app
         .monitor_from_point(cursor.x, cursor.y)
         .ok()
@@ -12815,13 +12949,125 @@ fn snipping_position_preview_under_cursor_with_offset(
         .or_else(|| app.primary_monitor().ok().flatten())
         .map(|monitor| monitor.scale_factor().max(0.1))
         .unwrap_or(1.0);
+    Some((cursor, scale))
+}
+
+fn snipping_preview_position_for_cursor_with_offset(
+    cursor: tauri::PhysicalPosition<f64>,
+    scale: f64,
+    width: f64,
+    height: f64,
+    offset_x: f64,
+    offset_y: f64,
+) -> tauri::PhysicalPosition<i32> {
     let offset_x = offset_x.clamp(0.0, width.max(0.0));
     let offset_y = offset_y.clamp(0.0, height.max(0.0));
     let x = cursor.x.round() as i32 - (offset_x * scale).round() as i32;
     let y = cursor.y.round() as i32 - (offset_y * scale).round() as i32;
-    window
-        .set_position(tauri::PhysicalPosition::new(x, y))
-        .is_ok()
+    tauri::PhysicalPosition::new(x, y)
+}
+
+fn snipping_preview_position_under_cursor_with_offset(
+    app: &AppHandle,
+    window: &tauri::WebviewWindow,
+    width: f64,
+    height: f64,
+    offset_x: f64,
+    offset_y: f64,
+) -> Option<(tauri::PhysicalPosition<i32>, f64)> {
+    let (cursor, scale) = snipping_preview_cursor_and_scale_for_offset(app, window)?;
+    Some((
+        snipping_preview_position_for_cursor_with_offset(
+            cursor, scale, width, height, offset_x, offset_y,
+        ),
+        scale,
+    ))
+}
+
+fn snipping_start_preview_drag_follow_watchdog(app: &AppHandle, label: &str) {
+    if !snipping_mouse_button_state_supported() {
+        return;
+    }
+    let label = label.trim().to_string();
+    if label.is_empty() {
+        return;
+    }
+
+    let state = app.state::<SnippingState>();
+    let generation = state
+        .preview_drag_follow_generation
+        .fetch_add(1, Ordering::SeqCst)
+        + 1;
+    if let Ok(mut generations) = state.preview_drag_follow_generations.lock() {
+        generations.insert(label.clone(), generation);
+    } else {
+        return;
+    }
+
+    let app = app.clone();
+    thread::spawn(move || {
+        let mut correcting = false;
+        loop {
+            thread::sleep(Duration::from_millis(SNIPPING_PREVIEW_DRAG_FOLLOW_POLL_MS));
+            if !snipping_left_mouse_button_pressed()
+                || !snipping_preview_drag_follow_generation_is_current(&app, &label, generation)
+                || !snipping_preview_is_dragging(&app, &label)
+                || snipping_preview_is_closing(&app, &label)
+            {
+                break;
+            }
+            let Some(window) = app.get_webview_window(&label) else {
+                break;
+            };
+            if !window.is_visible().unwrap_or(false) {
+                break;
+            }
+            let Ok(size) = window.outer_size() else {
+                continue;
+            };
+            let Ok(actual) = window.outer_position() else {
+                continue;
+            };
+            let Some((cursor, cursor_scale)) =
+                snipping_preview_cursor_and_scale_for_offset(&app, &window)
+            else {
+                continue;
+            };
+            // Compare in physical coordinates. During cross-monitor drags the
+            // window can still report its old scale, so derive the logical size
+            // from the cursor monitor scale used by the expected-position math.
+            let logical_width = f64::from(size.width.max(1)) / cursor_scale;
+            let logical_height = f64::from(size.height.max(1)) / cursor_scale;
+            let (offset_x, offset_y) =
+                snipping_preview_drag_offset_for_size(&app, &label, logical_width, logical_height);
+            let expected = snipping_preview_position_for_cursor_with_offset(
+                cursor,
+                cursor_scale,
+                logical_width,
+                logical_height,
+                offset_x,
+                offset_y,
+            );
+            let dx = f64::from(actual.x - expected.x);
+            let dy = f64::from(actual.y - expected.y);
+            let slack = (SNIPPING_PREVIEW_DRAG_FOLLOW_SLACK_LOGICAL_PX * cursor_scale).max(1.0);
+
+            // macOS performWindowDrag can silently stop after a setFrame during
+            // handoff/strip-hover resizing. While it is alive the window stays
+            // under the grab point, so observe first and only take over once the
+            // physical origin has drifted beyond the slack.
+            if correcting || dx.hypot(dy) > slack {
+                correcting = true;
+                if window.set_position(expected).is_ok() {
+                    snipping_update_preview_strip_drag_state(&app, &label, false);
+                    snipping_emit_preview_drag_over(&app, &label);
+                    snipping_live_reflow_on_drag(&app, &label);
+                    schedule_snipping_preview_stack_reflow(&app);
+                }
+            }
+        }
+        snipping_finish_preview_drag_follow_generation(&app, &label, generation);
+    });
 }
 
 /// Keeps hidden, fully booted preview windows parked so the next capture or
@@ -12948,7 +13194,7 @@ fn snipping_open_snip_preview_window_for_with_size(
         if let Some(existing) = app.get_webview_window(&existing_label) {
             let was_visible = existing.is_visible().unwrap_or(false);
             let _ = existing.set_size(tauri::LogicalSize::new(width, height));
-            snipping_set_window_capture_exclusion(&existing, true);
+            snipping_set_window_capture_exclusion(&existing, snipping_capture_exclusion_enabled());
             if explicit_position.is_some() || !was_visible {
                 snipping_position_preview_window(app, &existing, explicit_position);
             }
@@ -12978,7 +13224,7 @@ fn snipping_open_snip_preview_window_for_with_size(
     if let Some(window) = snipping_take_pooled_preview_window(app) {
         let pooled_label = window.label().to_string();
         let _ = window.set_size(tauri::LogicalSize::new(width, height));
-        snipping_set_window_capture_exclusion(&window, true);
+        snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
         snipping_position_preview_window(app, &window, explicit_position);
         if let Ok(mut paths) = app.state::<SnippingState>().preview_paths.lock() {
             paths.insert(pooled_label.clone(), path_string.clone());
@@ -13477,7 +13723,7 @@ fn snipping_close_snip_strip(app: AppHandle) -> Result<(), String> {
 
 fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     if let Some(window) = app.get_webview_window(SNIPPING_STRIP_WINDOW_LABEL) {
-        snipping_set_window_capture_exclusion(&window, true);
+        snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
         return Some(window);
     }
     let window = WebviewWindowBuilder::new(
@@ -13503,7 +13749,7 @@ fn snipping_strip_window(app: &AppHandle) -> Option<tauri::WebviewWindow> {
     .visible(false)
     .build()
     .ok()?;
-    snipping_set_window_capture_exclusion(&window, true);
+    snipping_set_window_capture_exclusion(&window, snipping_capture_exclusion_enabled());
     {
         let app_for_focus = app.clone();
         window.on_window_event(move |event| {
@@ -14065,6 +14311,7 @@ fn snipping_open_snip_float_for_drag(
         grab_offset_y,
     );
     let drag_started = window.start_dragging().is_ok();
+    snipping_start_preview_drag_follow_watchdog(&app, &label);
     let mut opened = opened;
     opened["dragStarted"] = json!(drag_started);
     Ok(opened)

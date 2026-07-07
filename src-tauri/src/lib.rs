@@ -2344,12 +2344,16 @@ struct AudioInputMonitorStatus {
     label: String,
     sample_rate: u32,
     owner_count: usize,
+    engine: &'static str,
+    echo_cancellation: bool,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct AudioInputStats {
     device_id: String,
+    engine: &'static str,
+    echo_cancellation: bool,
     rms: f32,
     peak: f32,
     buffer_ms: u64,
@@ -2720,7 +2724,6 @@ include!("terminal_cli.rs");
 include!("tokenomics.rs");
 include!("native_notifications.rs");
 include!("cloud_mcp.rs");
-include!("byoc.rs");
 include!("local_scripts.rs");
 include!("assets.rs");
 include!("agent_sessions.rs");
@@ -8346,25 +8349,11 @@ fn app_local_state_public_value(key: &str, value: Value) -> Value {
     if canonical.eq_ignore_ascii_case(DESKTOP_AUTH_STATE_KEY) {
         return desktop_auth_public_snapshot(&desktop_auth_snapshot_from_raw(value));
     }
-    if canonical.eq_ignore_ascii_case(BYOC_PROVIDERS_STATE_KEY) {
-        return byoc_saved_providers_from_state(&value);
-    }
     value
 }
 
 fn app_local_state_is_desktop_auth_key(key: &str) -> bool {
     app_local_state_canonical_key(key).eq_ignore_ascii_case(DESKTOP_AUTH_STATE_KEY)
-}
-
-// BYOC provider credentials are Rust-owned (written only by byoc_provision when
-// the user opts to save). JS must never store/merge the key directly — that
-// would both bypass the mask and rewrite the file with a lax umask.
-fn app_local_state_is_byoc_providers_key(key: &str) -> bool {
-    app_local_state_canonical_key(key).eq_ignore_ascii_case(BYOC_PROVIDERS_STATE_KEY)
-}
-
-fn app_local_state_is_rust_owned_key(key: &str) -> bool {
-    app_local_state_is_desktop_auth_key(key) || app_local_state_is_byoc_providers_key(key)
 }
 
 #[tauri::command]
@@ -8390,9 +8379,6 @@ async fn app_local_state_store(app: AppHandle, key: String, value: Value) -> Res
     if app_local_state_is_desktop_auth_key(&key) {
         return Err("Desktop auth state is owned by the native auth core.".to_string());
     }
-    if app_local_state_is_byoc_providers_key(&key) {
-        return Err("Cloud provider credentials are owned by the native BYOC core.".to_string());
-    }
     tauri::async_runtime::spawn_blocking(move || {
         app_local_state_write(&app, &key, &value)?;
         Ok(json!({ "ok": true }))
@@ -8409,9 +8395,6 @@ async fn app_local_state_merge_command(
 ) -> Result<Value, String> {
     if app_local_state_is_desktop_auth_key(&key) {
         return Err("Desktop auth state is owned by the native auth core.".to_string());
-    }
-    if app_local_state_is_byoc_providers_key(&key) {
-        return Err("Cloud provider credentials are owned by the native BYOC core.".to_string());
     }
     tauri::async_runtime::spawn_blocking(move || {
         let value = app_local_state_merge(&app, &key, &patch)?;
@@ -10055,6 +10038,7 @@ fn run_app(daemon: bool) {
             set_snipping_hide_desktop_icons,
             set_snipping_freeze_screen,
             set_snipping_upload_public,
+            set_snipping_visible_in_captures,
             set_snipping_shortcut,
             reset_snipping_shortcuts,
             open_snipping_permissions,
@@ -10122,11 +10106,6 @@ fn run_app(daemon: bool) {
             cloud_mcp_get_desktop_device_profile,
             cloud_mcp_get_status,
             cloud_mcp_get_network_diagnostics,
-            byoc_provider_catalog,
-            byoc_list_server_options,
-            byoc_provision,
-            byoc_saved_providers,
-            byoc_delete_saved_provider,
             cloud_mcp_get_cached_workspace_todos,
             cloud_mcp_get_billing_status,
             cloud_mcp_refresh_billing_status,

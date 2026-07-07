@@ -16,6 +16,18 @@ struct AgentChatSessionSyncContext {
     shared_history_id: String,
     fork_from_provider_session_id: String,
     metadata_only: bool,
+    turn_summary: Option<AgentChatTurnSummaryContext>,
+}
+
+#[derive(Clone, Default)]
+struct AgentChatTurnSummaryContext {
+    turn_id: String,
+    turn_key: String,
+    started_at: String,
+    completed_at: String,
+    duration_ms: Option<u64>,
+    raw: Value,
+    file_change: Option<Value>,
 }
 
 struct AgentChatSessionSyncSource {
@@ -33,8 +45,22 @@ struct AgentChatSessionSyncSource {
     total_record_count: usize,
 }
 
+#[derive(Default)]
+struct AgentChatTurnSummarySessionCache {
+    order: VecDeque<String>,
+    messages: HashMap<String, Value>,
+}
+
+#[derive(Default)]
+struct AgentChatTurnSummaryCache {
+    order: VecDeque<String>,
+    sessions: HashMap<String, AgentChatTurnSummarySessionCache>,
+}
+
 const AGENT_CHAT_SESSION_SYNC_TARGET_PACKET_BYTES: usize = 512 * 1024;
 const AGENT_CHAT_SESSION_SYNC_MAX_RECORDS_PER_PACKET: usize = 128;
+const AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE_MAX: usize = 200;
+const AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE_SESSION_MAX: usize = 64;
 const AGENT_CHAT_SESSION_HISTORY_BACKFILL_LIMIT: usize = 100;
 const AGENT_CHAT_SESSION_HISTORY_BACKFILL_SPAWN_LIMIT: usize = 24;
 const AGENT_CHAT_SESSION_HISTORY_BACKFILL_INTERVAL_MS: u64 = 60_000;
@@ -42,7 +68,7 @@ const AGENT_CHAT_SESSION_HISTORY_SYNC_VERIFY_INTERVAL_MS: u64 = 30 * 60_000;
 const AGENT_CHAT_SESSION_SYNC_BUILD_CONCURRENCY: usize = 4;
 const AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION: u64 = 3;
 const AGENT_CHAT_SESSION_SYNC_RECORD_KEY_VERSION: u64 = 2;
-const AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION: u64 = 2;
+const AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION: u64 = 3;
 
 static AGENT_CHAT_SESSION_HISTORY_BACKFILL_LAST: OnceLock<StdMutex<HashMap<String, u64>>> =
     OnceLock::new();
@@ -54,6 +80,8 @@ static AGENT_CHAT_SESSION_HISTORY_SOURCE_FINGERPRINTS: OnceLock<
     StdMutex<HashMap<String, AgentChatSessionHistorySourceFingerprint>>,
 > = OnceLock::new();
 static AGENT_CHAT_SESSION_SYNC_BUILD_SEMAPHORE: OnceLock<Arc<tokio::sync::Semaphore>> =
+    OnceLock::new();
+static AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE: OnceLock<StdMutex<AgentChatTurnSummaryCache>> =
     OnceLock::new();
 
 #[derive(Clone, Copy, Default)]
@@ -79,6 +107,179 @@ fn agent_chat_session_sync_build_semaphore() -> Arc<tokio::sync::Semaphore> {
             ))
         })
         .clone()
+}
+
+fn agent_chat_session_sync_turn_summary_cache() -> &'static StdMutex<AgentChatTurnSummaryCache> {
+    AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE
+        .get_or_init(|| StdMutex::new(AgentChatTurnSummaryCache::default()))
+}
+
+fn agent_chat_session_sync_turn_summary_cache_session_key(
+    provider: &str,
+    session_id: &str,
+) -> Option<String> {
+    let provider = provider.trim();
+    let session_id = session_id.trim();
+    (!provider.is_empty() && !session_id.is_empty()).then(|| format!("{provider}:{session_id}"))
+}
+
+fn agent_chat_session_sync_turn_summary_message_id(message: &Value) -> String {
+    cloud_mcp_payload_text(message, &["id"]).unwrap_or_default()
+}
+
+fn agent_chat_session_sync_touch_turn_summary_cache_session(
+    cache: &mut AgentChatTurnSummaryCache,
+    session_key: &str,
+) {
+    if !cache.sessions.contains_key(session_key) {
+        return;
+    }
+    cache.order.retain(|key| key != session_key);
+    cache.order.push_back(session_key.to_string());
+    while cache.order.len() > AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE_SESSION_MAX {
+        if let Some(oldest) = cache.order.pop_front() {
+            cache.sessions.remove(&oldest);
+        }
+    }
+}
+
+fn agent_chat_session_sync_message_has_file_change(message: &Value) -> bool {
+    message
+        .get("file_change")
+        .or_else(|| message.get("fileChange"))
+        .is_some_and(Value::is_object)
+}
+
+fn agent_chat_session_sync_turn_summary_has_git_skip(
+    summary: &AgentChatTurnSummaryContext,
+) -> bool {
+    summary.file_change.is_none()
+        && summary
+            .raw
+            .get("git")
+            .and_then(|git| git.get("skipped"))
+            .is_some()
+}
+
+fn agent_chat_session_sync_cached_turn_summary_message(
+    provider: &str,
+    session_id: &str,
+    turn_key: &str,
+) -> Option<Value> {
+    let session_key = agent_chat_session_sync_turn_summary_cache_session_key(provider, session_id)?;
+    let mut cache = agent_chat_session_sync_turn_summary_cache().lock().ok()?;
+    agent_chat_session_sync_touch_turn_summary_cache_session(&mut cache, &session_key);
+    cache
+        .sessions
+        .get(&session_key)
+        .and_then(|session| session.messages.get(turn_key.trim()).cloned())
+}
+
+fn agent_chat_session_sync_put_turn_summary_cache(
+    provider: &str,
+    session_id: &str,
+    turn_key: &str,
+    message: Value,
+) {
+    let Some(session_key) =
+        agent_chat_session_sync_turn_summary_cache_session_key(provider, session_id)
+    else {
+        return;
+    };
+    let turn_key = turn_key.trim();
+    if turn_key.is_empty() {
+        return;
+    }
+    let Ok(mut cache) = agent_chat_session_sync_turn_summary_cache().lock() else {
+        return;
+    };
+    {
+        let session = cache.sessions.entry(session_key.clone()).or_default();
+        session.order.retain(|key| key != turn_key);
+        session.order.push_back(turn_key.to_string());
+        session.messages.insert(turn_key.to_string(), message);
+        while session.order.len() > AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE_MAX {
+            if let Some(oldest) = session.order.pop_front() {
+                session.messages.remove(&oldest);
+            }
+        }
+    }
+    agent_chat_session_sync_touch_turn_summary_cache_session(&mut cache, &session_key);
+}
+
+fn agent_chat_session_sync_cached_turn_summary_messages(
+    provider: &str,
+    session_id: &str,
+) -> Vec<Value> {
+    let Some(session_key) =
+        agent_chat_session_sync_turn_summary_cache_session_key(provider, session_id)
+    else {
+        return Vec::new();
+    };
+    let Ok(mut cache) = agent_chat_session_sync_turn_summary_cache().lock() else {
+        return Vec::new();
+    };
+    agent_chat_session_sync_touch_turn_summary_cache_session(&mut cache, &session_key);
+    let Some(session) = cache.sessions.get(&session_key) else {
+        return Vec::new();
+    };
+    session
+        .order
+        .iter()
+        .filter_map(|turn_key| session.messages.get(turn_key).cloned())
+        .collect()
+}
+
+fn agent_chat_session_sync_merge_cached_turn_summary_messages(
+    provider: &str,
+    session_id: &str,
+    messages: &mut Vec<Value>,
+) {
+    let cached = agent_chat_session_sync_cached_turn_summary_messages(provider, session_id);
+    if cached.is_empty() {
+        return;
+    }
+    let mut index_by_id = HashMap::<String, usize>::new();
+    for (index, message) in messages.iter().enumerate() {
+        let message_id = agent_chat_session_sync_turn_summary_message_id(message);
+        if !message_id.trim().is_empty() {
+            index_by_id.insert(message_id, index);
+        }
+    }
+    for message in cached {
+        let message_id = agent_chat_session_sync_turn_summary_message_id(&message);
+        if let Some(index) = index_by_id.get(&message_id).copied() {
+            if agent_chat_session_sync_message_has_file_change(&message)
+                && !agent_chat_session_sync_message_has_file_change(&messages[index])
+            {
+                messages[index] = message;
+            }
+            continue;
+        }
+        if !message_id.trim().is_empty() {
+            index_by_id.insert(message_id, messages.len());
+        }
+        messages.push(message);
+    }
+}
+
+#[cfg(test)]
+fn agent_chat_session_sync_clear_turn_summary_cache() {
+    if let Ok(mut cache) = agent_chat_session_sync_turn_summary_cache().lock() {
+        cache.order.clear();
+        cache.sessions.clear();
+    }
+}
+
+#[cfg(test)]
+static AGENT_CHAT_SESSION_SYNC_TEST_LOCK: OnceLock<StdMutex<()>> = OnceLock::new();
+
+#[cfg(test)]
+fn agent_chat_session_sync_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    AGENT_CHAT_SESSION_SYNC_TEST_LOCK
+        .get_or_init(|| StdMutex::new(()))
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
 }
 
 fn agent_chat_session_history_source_fingerprints(
@@ -335,11 +536,22 @@ fn agent_chat_session_sync_insert_aliases(object: &mut serde_json::Map<String, V
         ("toolOutput", "tool_output"),
         ("toolError", "tool_error"),
         ("fileChange", "file_change"),
+        ("subagentId", "subagent_id"),
     ] {
         if let Some(value) = object.get(camel).cloned() {
             object.entry(snake.to_string()).or_insert(value);
         } else if let Some(value) = object.get(snake).cloned() {
             object.entry(camel.to_string()).or_insert(value);
+        }
+    }
+}
+
+fn agent_chat_session_sync_insert_subagent_aliases(object: &mut serde_json::Map<String, Value>) {
+    if let Some(subagent) = object.get_mut("subagent").and_then(Value::as_object_mut) {
+        if let Some(value) = subagent.get("subagentId").cloned() {
+            subagent.entry("subagent_id".to_string()).or_insert(value);
+        } else if let Some(value) = subagent.get("subagent_id").cloned() {
+            subagent.entry("subagentId".to_string()).or_insert(value);
         }
     }
 }
@@ -385,6 +597,10 @@ fn agent_chat_session_sync_subagent_is_genuine(message: &Value) -> bool {
     let Some(subagent) = message.get("subagent") else {
         return false;
     };
+    agent_chat_session_sync_subagent_has_explicit_sidechain(subagent)
+}
+
+fn agent_chat_session_sync_subagent_has_explicit_sidechain(subagent: &Value) -> bool {
     subagent
         .get("isSidechain")
         .or_else(|| subagent.get("is_sidechain"))
@@ -393,10 +609,6 @@ fn agent_chat_session_sync_subagent_is_genuine(message: &Value) -> bool {
         || cloud_mcp_payload_text(
             subagent,
             &[
-                "parentUuid",
-                "parent_uuid",
-                "parentId",
-                "parent_id",
                 "sidechainId",
                 "sidechain_id",
                 "sidechainUuid",
@@ -407,6 +619,9 @@ fn agent_chat_session_sync_subagent_is_genuine(message: &Value) -> bool {
 }
 
 fn agent_chat_session_sync_canonical_kind(message: &Value, legacy_kind: &str) -> String {
+    if legacy_kind == "turn_summary" {
+        return "turn_summary".to_string();
+    }
     if message
         .get("file_change")
         .or_else(|| message.get("fileChange"))
@@ -499,6 +714,45 @@ fn agent_chat_session_sync_normalize_message_value(mut value: Value) -> Value {
     let legacy_kind = agent_chat_session_sync_message_kind(&value);
     if let Some(object) = value.as_object_mut() {
         agent_chat_session_sync_insert_aliases(object);
+        agent_chat_session_sync_insert_subagent_aliases(object);
+        if !object
+            .get("subagent_id")
+            .or_else(|| object.get("subagentId"))
+            .is_some_and(agent_chat_session_sync_value_has_content)
+        {
+            if let Some(subagent) = object.get("subagent") {
+                let allow_parent_id = legacy_kind == "subagent"
+                    || agent_chat_session_sync_subagent_has_explicit_sidechain(subagent);
+                let subagent_id = first_value_string(&[
+                    subagent.get("subagent_id"),
+                    subagent.get("subagentId"),
+                    subagent.get("sidechainUuid"),
+                    subagent.get("sidechain_uuid"),
+                    subagent.get("sidechainId"),
+                    subagent.get("sidechain_id"),
+                    subagent.get("agent_id"),
+                    subagent.get("agentId"),
+                    subagent.get("uuid"),
+                    subagent.get("id"),
+                    subagent.get("sessionId"),
+                    subagent.get("session_id"),
+                ]);
+                let subagent_id = if subagent_id.trim().is_empty() && allow_parent_id {
+                    first_value_string(&[
+                        subagent.get("parentUuid"),
+                        subagent.get("parent_uuid"),
+                        subagent.get("parentId"),
+                        subagent.get("parent_id"),
+                    ])
+                } else {
+                    subagent_id
+                };
+                if !subagent_id.trim().is_empty() && allow_parent_id {
+                    object.insert("subagent_id".to_string(), json!(subagent_id.clone()));
+                    object.insert("subagentId".to_string(), json!(subagent_id));
+                }
+            }
+        }
         if object
             .get("truncated")
             .and_then(Value::as_bool)
@@ -613,11 +867,20 @@ fn agent_chat_session_sync_message_role(message: &Value) -> String {
         .to_ascii_lowercase()
 }
 
+fn agent_chat_session_sync_normalize_kind_token(kind: &str) -> String {
+    let kind = kind.trim().to_ascii_lowercase();
+    if kind == "turn-summary" {
+        "turn_summary".to_string()
+    } else {
+        kind
+    }
+}
+
 fn agent_chat_session_sync_message_kind(message: &Value) -> String {
-    cloud_mcp_payload_text(message, &["kind", "type"])
-        .unwrap_or_else(|| "message".to_string())
-        .trim()
-        .to_ascii_lowercase()
+    agent_chat_session_sync_normalize_kind_token(
+        &cloud_mcp_payload_text(message, &["kind", "type"])
+            .unwrap_or_else(|| "message".to_string()),
+    )
 }
 
 fn agent_chat_session_sync_message_turn_id(message: &Value) -> String {
@@ -755,6 +1018,9 @@ fn agent_chat_session_sync_thread_detail_legacy_kind(message: &Value) -> String 
     if let Some(kind) = cloud_mcp_payload_text(message, &["legacyKind", "legacy_kind"])
         .filter(|value| !value.trim().is_empty())
     {
+        if agent_chat_session_sync_normalize_kind_token(&kind) == "turn_summary" {
+            return "turn_summary".to_string();
+        }
         return kind;
     }
     let kind = agent_chat_session_sync_message_kind(message);
@@ -796,6 +1062,19 @@ fn agent_chat_session_sync_file_change_value(message: &Value) -> Option<&Value> 
 fn agent_chat_session_sync_thread_detail_diff_summaries(
     messages: &[Value],
 ) -> (Vec<Value>, usize, i64, i64) {
+    let summary_file_change_turns = messages
+        .iter()
+        .filter(|message| agent_chat_session_sync_message_kind(message) == "turn_summary")
+        .filter(|message| agent_chat_session_sync_file_change_value(message).is_some())
+        .map(agent_chat_session_sync_message_turn_id)
+        .filter(|turn_id| !turn_id.trim().is_empty())
+        .collect::<HashSet<_>>();
+    let summary_file_change_windows = messages
+        .iter()
+        .filter(|message| agent_chat_session_sync_message_kind(message) == "turn_summary")
+        .filter(|message| agent_chat_session_sync_file_change_value(message).is_some())
+        .filter_map(agent_chat_session_sync_turn_summary_window_ms)
+        .collect::<Vec<_>>();
     let mut summaries = Vec::new();
     let mut total_files = 0usize;
     let mut total_additions = 0i64;
@@ -804,6 +1083,26 @@ fn agent_chat_session_sync_thread_detail_diff_summaries(
         let Some(file_change) = agent_chat_session_sync_file_change_value(message) else {
             continue;
         };
+        let message_kind = agent_chat_session_sync_message_kind(message);
+        let turn_id = agent_chat_session_sync_message_turn_id(message);
+        if message_kind != "turn_summary"
+            && !turn_id.trim().is_empty()
+            && summary_file_change_turns.contains(&turn_id)
+        {
+            continue;
+        }
+        if message_kind != "turn_summary"
+            && turn_id.trim().is_empty()
+            && agent_chat_session_sync_message_created_at_ms(message).is_some_and(|created_at_ms| {
+                summary_file_change_windows
+                    .iter()
+                    .any(|(started_at_ms, completed_at_ms)| {
+                        created_at_ms >= *started_at_ms && created_at_ms <= *completed_at_ms
+                    })
+            })
+        {
+            continue;
+        }
         let files = file_change
             .get("files")
             .and_then(Value::as_array)
@@ -821,7 +1120,6 @@ fn agent_chat_session_sync_thread_detail_diff_summaries(
         total_additions = total_additions.saturating_add(additions);
         total_deletions = total_deletions.saturating_add(deletions);
         let message_id = agent_chat_session_sync_message_id(message, index);
-        let turn_id = agent_chat_session_sync_message_turn_id(message);
         let summary = cloud_mcp_payload_text(file_change, &["summary"]).unwrap_or_default();
         summaries.push(json!({
             "id": format!("diff-summary-{message_id}"),
@@ -840,19 +1138,402 @@ fn agent_chat_session_sync_thread_detail_diff_summaries(
     (summaries, total_files, total_additions, total_deletions)
 }
 
+fn agent_chat_session_sync_turn_summary_window_ms(message: &Value) -> Option<(i64, i64)> {
+    let started_at_ms = cloud_mcp_payload_text(message, &["started_at", "startedAt"])
+        .as_deref()
+        .and_then(agent_chat_session_sync_timestamp_ms)?;
+    let completed_at_ms = cloud_mcp_payload_text(message, &["completed_at", "completedAt"])
+        .as_deref()
+        .and_then(agent_chat_session_sync_timestamp_ms)?;
+    Some((started_at_ms, completed_at_ms))
+}
+
+fn agent_chat_session_sync_usage_i64(value: Option<&Value>) -> Option<i64> {
+    match value {
+        Some(Value::Number(number)) => number
+            .as_i64()
+            .or_else(|| number.as_u64().and_then(|value| i64::try_from(value).ok())),
+        Some(Value::String(text)) => text.trim().parse::<i64>().ok(),
+        _ => None,
+    }
+}
+
+fn agent_chat_session_sync_usage_f64(value: Option<&Value>) -> Option<f64> {
+    match value {
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::String(text)) => text.trim().parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn agent_chat_session_sync_usage_value(message: &Value) -> Option<&Value> {
+    message
+        .get("usage")
+        .or_else(|| message.get("token_usage"))
+        .or_else(|| message.get("tokenUsage"))
+        .filter(|value| value.is_object())
+}
+
+fn agent_chat_session_sync_message_created_at(message: &Value) -> String {
+    cloud_mcp_payload_text(message, &["created_at", "createdAt", "timestamp"]).unwrap_or_default()
+}
+
+fn agent_chat_session_sync_message_created_at_ms(message: &Value) -> Option<i64> {
+    agent_chat_session_sync_timestamp_ms(&agent_chat_session_sync_message_created_at(message))
+}
+
+fn agent_chat_session_sync_timestamp_ms(value: &str) -> Option<i64> {
+    let text = value.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if let Ok(number) = text.parse::<f64>() {
+        if number.is_finite() && number > 0.0 {
+            return Some(
+                (if number < 1_000_000_000_000.0 {
+                    number * 1000.0
+                } else {
+                    number
+                })
+                .round() as i64,
+            );
+        }
+    }
+    let year = text.get(0..4)?.parse::<i64>().ok()?;
+    let month = text.get(5..7)?.parse::<i64>().ok()?;
+    let day = text.get(8..10)?.parse::<i64>().ok()?;
+    let hour = text.get(11..13)?.parse::<i64>().ok()?;
+    let minute = text.get(14..16)?.parse::<i64>().ok()?;
+    let second = text.get(17..19)?.parse::<i64>().ok()?;
+    let bytes = text.as_bytes();
+    let mut index = 19usize;
+    let mut millis = 0i64;
+    if bytes.get(index) == Some(&b'.') {
+        index = index.saturating_add(1);
+        let start = index;
+        while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+            index = index.saturating_add(1);
+        }
+        let fraction = &text[start..index];
+        if !fraction.is_empty() {
+            let mut digits = fraction.chars().take(3).collect::<String>();
+            while digits.len() < 3 {
+                digits.push('0');
+            }
+            millis = digits.parse::<i64>().ok()?;
+        }
+    }
+    let mut offset_ms = 0i64;
+    if bytes
+        .get(index)
+        .is_some_and(|ch| *ch == b'+' || *ch == b'-')
+    {
+        let sign = if bytes[index] == b'-' { -1 } else { 1 };
+        let offset_hour = text.get(index + 1..index + 3)?.parse::<i64>().ok()?;
+        let offset_minute = text.get(index + 4..index + 6)?.parse::<i64>().ok()?;
+        offset_ms = sign * (offset_hour * 3_600_000 + offset_minute * 60_000);
+    }
+    Some(
+        (cloud_mcp_tokenomics_days_from_civil(year, month, day) * 86_400
+            + hour.clamp(0, 23) * 3_600
+            + minute.clamp(0, 59) * 60
+            + second.clamp(0, 59))
+            * 1000
+            + millis
+            - offset_ms,
+    )
+}
+
+fn agent_chat_session_sync_message_in_time_window(
+    message: &Value,
+    started_at: &str,
+    completed_at: &str,
+) -> bool {
+    let created_at = agent_chat_session_sync_message_created_at(message);
+    if created_at.trim().is_empty() {
+        return started_at.trim().is_empty() && completed_at.trim().is_empty();
+    }
+    if let Some(created_at_ms) = agent_chat_session_sync_timestamp_ms(&created_at) {
+        let starts_after = agent_chat_session_sync_timestamp_ms(started_at)
+            .map(|started_at_ms| created_at_ms >= started_at_ms)
+            .unwrap_or_else(|| started_at.trim().is_empty() || created_at.as_str() >= started_at);
+        let ends_before = agent_chat_session_sync_timestamp_ms(completed_at)
+            .map(|completed_at_ms| created_at_ms <= completed_at_ms)
+            .unwrap_or_else(|| {
+                completed_at.trim().is_empty() || created_at.as_str() <= completed_at
+            });
+        return starts_after && ends_before;
+    }
+    (started_at.trim().is_empty() || created_at.as_str() >= started_at)
+        && (completed_at.trim().is_empty() || created_at.as_str() <= completed_at)
+}
+
+#[derive(Clone, Default)]
+struct AgentChatSessionSyncUsageTotals {
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    cache_read_tokens: Option<i64>,
+    cache_write_tokens: Option<i64>,
+    cost_usd: Option<f64>,
+}
+
+fn agent_chat_session_sync_add_i64(target: &mut Option<i64>, value: i64) {
+    *target = Some(target.unwrap_or(0).saturating_add(value));
+}
+
+fn agent_chat_session_sync_add_f64(target: &mut Option<f64>, value: f64) {
+    *target = Some(target.unwrap_or(0.0) + value);
+}
+
+impl AgentChatSessionSyncUsageTotals {
+    fn add_usage(&mut self, usage: &Value) {
+        if let Some(value) = agent_chat_session_sync_usage_i64(
+            usage
+                .get("input_tokens")
+                .or_else(|| usage.get("inputTokens")),
+        ) {
+            agent_chat_session_sync_add_i64(&mut self.input_tokens, value);
+        }
+        if let Some(value) = agent_chat_session_sync_usage_i64(
+            usage
+                .get("output_tokens")
+                .or_else(|| usage.get("outputTokens")),
+        ) {
+            agent_chat_session_sync_add_i64(&mut self.output_tokens, value);
+        }
+        if let Some(value) = agent_chat_session_sync_usage_i64(
+            usage
+                .get("cache_read_tokens")
+                .or_else(|| usage.get("cacheReadTokens")),
+        ) {
+            agent_chat_session_sync_add_i64(&mut self.cache_read_tokens, value);
+        }
+        if let Some(value) = agent_chat_session_sync_usage_i64(
+            usage
+                .get("cache_write_tokens")
+                .or_else(|| usage.get("cacheWriteTokens")),
+        ) {
+            agent_chat_session_sync_add_i64(&mut self.cache_write_tokens, value);
+        }
+        if let Some(value) = agent_chat_session_sync_usage_f64(
+            usage.get("cost_usd").or_else(|| usage.get("costUsd")),
+        ) {
+            agent_chat_session_sync_add_f64(&mut self.cost_usd, value);
+        }
+    }
+
+    fn add_totals(&mut self, usage: &AgentChatSessionSyncUsageTotals) {
+        if let Some(value) = usage.input_tokens {
+            agent_chat_session_sync_add_i64(&mut self.input_tokens, value);
+        }
+        if let Some(value) = usage.output_tokens {
+            agent_chat_session_sync_add_i64(&mut self.output_tokens, value);
+        }
+        if let Some(value) = usage.cache_read_tokens {
+            agent_chat_session_sync_add_i64(&mut self.cache_read_tokens, value);
+        }
+        if let Some(value) = usage.cache_write_tokens {
+            agent_chat_session_sync_add_i64(&mut self.cache_write_tokens, value);
+        }
+        if let Some(value) = usage.cost_usd {
+            agent_chat_session_sync_add_f64(&mut self.cost_usd, value);
+        }
+    }
+
+    fn delta_from(&self, baseline: Option<&AgentChatSessionSyncUsageTotals>) -> Self {
+        let subtract_i64 = |current: Option<i64>, previous: Option<i64>| {
+            current.map(|value| value.saturating_sub(previous.unwrap_or(0)).max(0))
+        };
+        let subtract_f64 = |current: Option<f64>, previous: Option<f64>| {
+            current.map(|value| (value - previous.unwrap_or(0.0)).max(0.0))
+        };
+        Self {
+            input_tokens: subtract_i64(
+                self.input_tokens,
+                baseline.and_then(|usage| usage.input_tokens),
+            ),
+            output_tokens: subtract_i64(
+                self.output_tokens,
+                baseline.and_then(|usage| usage.output_tokens),
+            ),
+            cache_read_tokens: subtract_i64(
+                self.cache_read_tokens,
+                baseline.and_then(|usage| usage.cache_read_tokens),
+            ),
+            cache_write_tokens: subtract_i64(
+                self.cache_write_tokens,
+                baseline.and_then(|usage| usage.cache_write_tokens),
+            ),
+            cost_usd: subtract_f64(self.cost_usd, baseline.and_then(|usage| usage.cost_usd)),
+        }
+    }
+
+    fn into_value(self) -> Value {
+        let mut object = serde_json::Map::new();
+        if let Some(value) = self.input_tokens {
+            object.insert("input_tokens".to_string(), json!(value));
+        }
+        if let Some(value) = self.output_tokens {
+            object.insert("output_tokens".to_string(), json!(value));
+        }
+        if let Some(value) = self.cache_read_tokens {
+            object.insert("cache_read_tokens".to_string(), json!(value));
+        }
+        if let Some(value) = self.cache_write_tokens {
+            object.insert("cache_write_tokens".to_string(), json!(value));
+        }
+        if let Some(value) = self.cost_usd.and_then(serde_json::Number::from_f64) {
+            object.insert("cost_usd".to_string(), Value::Number(value));
+        }
+        Value::Object(object)
+    }
+}
+
+fn agent_chat_session_sync_usage_is_cumulative(usage: &Value) -> bool {
+    usage
+        .get("cumulative")
+        .or_else(|| usage.get("is_cumulative"))
+        .or_else(|| usage.get("isCumulative"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+        || cloud_mcp_payload_text(usage, &["usage_kind", "usageKind"])
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("cumulative"))
+}
+
+fn agent_chat_session_sync_usage_totals_from_value(
+    usage: &Value,
+) -> AgentChatSessionSyncUsageTotals {
+    let mut totals = AgentChatSessionSyncUsageTotals::default();
+    totals.add_usage(usage);
+    totals
+}
+
+fn agent_chat_session_sync_usage_rollup_from_messages<'a>(
+    messages: impl Iterator<Item = &'a Value>,
+) -> Value {
+    let mut totals = AgentChatSessionSyncUsageTotals::default();
+    let mut last_cumulative = None::<AgentChatSessionSyncUsageTotals>;
+    for message in messages {
+        let Some(usage) = agent_chat_session_sync_usage_value(message) else {
+            continue;
+        };
+        let usage_totals = agent_chat_session_sync_usage_totals_from_value(usage);
+        if agent_chat_session_sync_usage_is_cumulative(usage) {
+            last_cumulative = Some(usage_totals);
+        } else {
+            totals.add_totals(&usage_totals);
+        }
+    }
+    if let Some(usage) = last_cumulative {
+        totals.add_totals(&usage);
+    }
+    totals.into_value()
+}
+
+fn agent_chat_session_sync_thread_usage_rollup(messages: &[Value]) -> Value {
+    agent_chat_session_sync_usage_rollup_from_messages(
+        messages
+            .iter()
+            .filter(|message| agent_chat_session_sync_message_kind(message) != "turn_summary"),
+    )
+}
+
+fn agent_chat_session_sync_turn_usage_rollup(
+    messages: &[Value],
+    turn_id: &str,
+    started_at: &str,
+    completed_at: &str,
+) -> Value {
+    let turn_id = turn_id.trim();
+    let turn_matches = (!turn_id.is_empty()).then(|| {
+        messages
+            .iter()
+            .map(|message| agent_chat_session_sync_message_turn_id(message) == turn_id)
+            .collect::<Vec<_>>()
+    });
+    let selected = if let Some(turn_matches) =
+        turn_matches.filter(|matches| matches.iter().any(|matches_turn| *matches_turn))
+    {
+        turn_matches
+    } else {
+        let matching = messages
+            .iter()
+            .map(|message| {
+                agent_chat_session_sync_message_in_time_window(message, started_at, completed_at)
+            })
+            .collect::<Vec<_>>();
+        if matching.iter().any(|matches_window| *matches_window)
+            || !started_at.trim().is_empty()
+            || !completed_at.trim().is_empty()
+        {
+            matching
+        } else {
+            vec![true; messages.len()]
+        }
+    };
+    let first_selected = selected.iter().position(|value| *value);
+    let started_at_ms = agent_chat_session_sync_timestamp_ms(started_at);
+    let mut totals = AgentChatSessionSyncUsageTotals::default();
+    let mut last_cumulative_in_window = None::<AgentChatSessionSyncUsageTotals>;
+    let mut last_cumulative_before_window = None::<AgentChatSessionSyncUsageTotals>;
+
+    for (index, message) in messages.iter().enumerate() {
+        let Some(usage) = agent_chat_session_sync_usage_value(message) else {
+            continue;
+        };
+        let usage_totals = agent_chat_session_sync_usage_totals_from_value(usage);
+        let is_cumulative = agent_chat_session_sync_usage_is_cumulative(usage);
+        if selected.get(index).copied().unwrap_or(false) {
+            if is_cumulative {
+                last_cumulative_in_window = Some(usage_totals);
+            } else {
+                totals.add_totals(&usage_totals);
+            }
+            continue;
+        }
+        if !is_cumulative {
+            continue;
+        }
+        let before_window = if let Some(first_selected) = first_selected {
+            index < first_selected
+        } else if let Some(started_at_ms) = started_at_ms {
+            agent_chat_session_sync_timestamp_ms(&agent_chat_session_sync_message_created_at(
+                message,
+            ))
+            .is_some_and(|created_at_ms| created_at_ms < started_at_ms)
+        } else {
+            false
+        };
+        if before_window {
+            last_cumulative_before_window = Some(usage_totals);
+        }
+    }
+
+    if let Some(usage) = last_cumulative_in_window {
+        totals.add_totals(&usage.delta_from(last_cumulative_before_window.as_ref()));
+    }
+    totals.into_value()
+}
+
 fn agent_chat_session_sync_thread_detail(
     source: &AgentChatSessionSyncSource,
     context: &AgentChatSessionSyncContext,
     model_id: &str,
     model_config: &Value,
 ) -> Value {
-    let thread_detail_messages = source
-        .thread_detail_messages
+    let mut effective_messages = source.thread_detail_messages.clone();
+    agent_chat_session_sync_merge_cached_turn_summary_messages(
+        &source.provider,
+        &source.session_id,
+        &mut effective_messages,
+    );
+    let thread_detail_messages = effective_messages
         .iter()
         .map(agent_chat_session_sync_thread_detail_message)
         .collect::<Vec<_>>();
+    let usage = agent_chat_session_sync_thread_usage_rollup(&effective_messages);
     let (diff_summaries, file_count, additions, deletions) =
-        agent_chat_session_sync_thread_detail_diff_summaries(&source.thread_detail_messages);
+        agent_chat_session_sync_thread_detail_diff_summaries(&effective_messages);
     let mut items = Vec::new();
     let mut activity_group = Vec::new();
     let mut assistant_block_id = String::new();
@@ -864,6 +1545,9 @@ fn agent_chat_session_sync_thread_detail(
     let mut artifact_count = 0usize;
 
     for (index, message) in thread_detail_messages.iter().enumerate() {
+        if agent_chat_session_sync_message_kind(message) == "turn_summary" {
+            continue;
+        }
         let role = agent_chat_session_sync_message_role(message);
         let message_id = agent_chat_session_sync_message_id(message, index);
         let turn_id = agent_chat_session_sync_message_turn_id(message);
@@ -989,6 +1673,7 @@ fn agent_chat_session_sync_thread_detail(
             "file_count": file_count,
             "additions": additions,
             "deletions": deletions,
+            "usage": usage,
         },
     })
 }
@@ -1194,6 +1879,164 @@ fn agent_chat_session_sync_model_config_record(
     Some(record)
 }
 
+fn agent_chat_session_sync_turn_summary_message(
+    provider: &str,
+    session_id: &str,
+    summary: &AgentChatTurnSummaryContext,
+    usage: Value,
+) -> Value {
+    let turn_id = if summary.turn_id.trim().is_empty() {
+        summary.turn_key.as_str()
+    } else {
+        summary.turn_id.as_str()
+    };
+    let mut message = serde_json::Map::new();
+    message.insert(
+        "id".to_string(),
+        json!(format!(
+            "turn-summary:{provider}:{session_id}:{}",
+            summary.turn_key
+        )),
+    );
+    message.insert("role".to_string(), json!("system"));
+    message.insert("kind".to_string(), json!("turn_summary"));
+    message.insert("turn_id".to_string(), json!(turn_id));
+    message.insert("turnId".to_string(), json!(turn_id));
+    message.insert("started_at".to_string(), json!(summary.started_at.clone()));
+    message.insert("startedAt".to_string(), json!(summary.started_at.clone()));
+    message.insert(
+        "completed_at".to_string(),
+        json!(summary.completed_at.clone()),
+    );
+    message.insert(
+        "completedAt".to_string(),
+        json!(summary.completed_at.clone()),
+    );
+    if let Some(duration_ms) = summary.duration_ms {
+        message.insert("duration_ms".to_string(), json!(duration_ms));
+        message.insert("durationMs".to_string(), json!(duration_ms));
+    }
+    message.insert("usage".to_string(), usage);
+    if let Some(file_change) = summary.file_change.clone().filter(Value::is_object) {
+        message.insert("file_change".to_string(), file_change.clone());
+        message.insert("fileChange".to_string(), file_change);
+    }
+    agent_chat_session_sync_normalize_message_value(Value::Object(message))
+}
+
+fn agent_chat_session_sync_turn_summary_record(
+    acked: &HashMap<String, String>,
+    provider: &str,
+    session_id: &str,
+    summary: &AgentChatTurnSummaryContext,
+    message: Value,
+) -> Option<Value> {
+    let turn_key = summary.turn_key.trim();
+    if turn_key.is_empty() {
+        return None;
+    }
+    let timestamp = if summary.completed_at.trim().is_empty() {
+        chrono_like_now_iso()
+    } else {
+        summary.completed_at.clone()
+    };
+    let mut raw = summary.raw.clone();
+    let computed_usage = message.get("usage").cloned().unwrap_or_else(|| json!({}));
+    if let Some(object) = raw.as_object_mut() {
+        object.insert("computed_usage".to_string(), computed_usage.clone());
+        object.insert("computedUsage".to_string(), computed_usage);
+    } else {
+        raw = json!({
+            "value": raw,
+            "computed_usage": computed_usage.clone(),
+            "computedUsage": computed_usage,
+        });
+    }
+    agent_chat_session_sync_record(
+        acked,
+        provider,
+        session_id,
+        format!("turn-summary:{provider}:{session_id}:{turn_key}"),
+        "turn_summary",
+        json!({
+            "synthetic": true,
+            "sourceKind": "terminal_activity_hook_turn_summary",
+            "source_kind": "terminal_activity_hook_turn_summary",
+            "turnKey": turn_key,
+            "turn_key": turn_key,
+        }),
+        timestamp,
+        raw,
+        vec![message],
+    )
+}
+
+fn agent_chat_session_sync_apply_turn_summary(
+    source: &mut AgentChatSessionSyncSource,
+    summary: &AgentChatTurnSummaryContext,
+    acked: &HashMap<String, String>,
+) {
+    if summary.turn_key.trim().is_empty() {
+        return;
+    }
+    if agent_chat_session_sync_turn_summary_has_git_skip(summary) {
+        if let Some(cached) = agent_chat_session_sync_cached_turn_summary_message(
+            &source.provider,
+            &source.session_id,
+            &summary.turn_key,
+        ) {
+            if agent_chat_session_sync_message_has_file_change(&cached) {
+                agent_chat_session_sync_merge_cached_turn_summary_messages(
+                    &source.provider,
+                    &source.session_id,
+                    &mut source.thread_detail_messages,
+                );
+                return;
+            }
+        }
+    }
+    let usage = agent_chat_session_sync_turn_usage_rollup(
+        &source.thread_detail_messages,
+        &summary.turn_id,
+        &summary.started_at,
+        &summary.completed_at,
+    );
+    let message = agent_chat_session_sync_turn_summary_message(
+        &source.provider,
+        &source.session_id,
+        summary,
+        usage,
+    );
+    let message_id = agent_chat_session_sync_turn_summary_message_id(&message);
+    if !message_id.trim().is_empty() {
+        source.thread_detail_messages.retain(|existing| {
+            agent_chat_session_sync_turn_summary_message_id(existing) != message_id
+        });
+    }
+    agent_chat_session_sync_put_turn_summary_cache(
+        &source.provider,
+        &source.session_id,
+        &summary.turn_key,
+        message.clone(),
+    );
+    source.thread_detail_messages.push(message.clone());
+    if let Some(record) = agent_chat_session_sync_turn_summary_record(
+        acked,
+        &source.provider,
+        &source.session_id,
+        summary,
+        message,
+    ) {
+        source.records.push(record);
+    }
+    if !summary.completed_at.trim().is_empty()
+        && (source.latest_timestamp.trim().is_empty()
+            || source.latest_timestamp.as_str() < summary.completed_at.as_str())
+    {
+        source.latest_timestamp = summary.completed_at.clone();
+    }
+}
+
 fn agent_chat_session_sync_messages_json_bytes(messages: &[Value]) -> usize {
     serde_json::to_vec(messages)
         .map(|bytes| bytes.len())
@@ -1384,6 +2227,7 @@ fn agent_chat_session_sync_claude_messages_for_line(
     line_index: usize,
     timestamp: &str,
     value: &Value,
+    sidechains: &mut TranscriptClaudeSidechainTracker,
 ) -> Vec<CodexThreadTranscriptMessage> {
     let mut messages = Vec::<CodexThreadTranscriptMessage>::new();
     let entry_type = value
@@ -1466,6 +2310,7 @@ fn agent_chat_session_sync_claude_messages_for_line(
         claude_content_text(content),
         CODEX_TRANSCRIPT_MAX_TEXT,
     );
+    let parent_subagent = sidechains.subagent_from_value(value, "Sidechain");
     if !text.is_empty() {
         messages.push(CodexThreadTranscriptMessage {
             id: format!("claude-{line_index}-{role}"),
@@ -1476,7 +2321,11 @@ fn agent_chat_session_sync_claude_messages_for_line(
             call_id: String::new(),
             created_at: timestamp.to_string(),
             source: "claude".to_string(),
-            subagent: transcript_sidechain_subagent_from_value(value, "Sidechain"),
+            subagent_id: parent_subagent
+                .as_ref()
+                .map(transcript_subagent_link_id)
+                .unwrap_or_default(),
+            subagent: parent_subagent.clone(),
             usage: transcript_usage_from_value(value),
             truncated,
             artifacts: Vec::new(),
@@ -1485,9 +2334,13 @@ fn agent_chat_session_sync_claude_messages_for_line(
     }
     if let Some(blocks) = content.as_array() {
         for (block_index, block) in blocks.iter().enumerate() {
-            if let Some(message) =
-                claude_activity_from_block(line_index, block_index, timestamp, block)
-            {
+            if let Some(message) = claude_activity_from_block(
+                line_index,
+                block_index,
+                timestamp,
+                block,
+                parent_subagent.as_ref(),
+            ) {
                 messages.push(message);
             }
         }
@@ -1540,6 +2393,8 @@ fn agent_chat_session_sync_jsonl_source(
     let mut model_config = json!({});
     let mut last_model_config_fingerprint = String::new();
     let mut tool_metadata = HashMap::<String, TranscriptToolCallMetadata>::new();
+    let mut active_codex_subagents = Vec::<Value>::new();
+    let mut claude_sidechains = TranscriptClaudeSidechainTracker::default();
 
     loop {
         buffer.clear();
@@ -1636,11 +2491,24 @@ fn agent_chat_session_sync_jsonl_source(
             }
         }
 
+        let codex_payload = value.get("payload").unwrap_or(&Value::Null);
         let mut parsed_messages = if provider == "claude" {
-            agent_chat_session_sync_claude_messages_for_line(line_index, &timestamp, &value)
+            agent_chat_session_sync_claude_messages_for_line(
+                line_index,
+                &timestamp,
+                &value,
+                &mut claude_sidechains,
+            )
         } else {
             agent_chat_session_sync_codex_messages_for_line(line_index, &timestamp, &value)
         };
+        if provider == "codex" {
+            transcript_apply_codex_subagent_scope(
+                &mut active_codex_subagents,
+                codex_payload,
+                &mut parsed_messages,
+            );
+        }
         for message in &mut parsed_messages {
             transcript_apply_tool_call_metadata(&tool_metadata, message);
             transcript_record_tool_call_metadata(&mut tool_metadata, message);
@@ -2171,6 +3039,33 @@ fn agent_chat_session_sync_record_chunks(records: Vec<Value>) -> Vec<Vec<Value>>
     chunks
 }
 
+fn agent_chat_session_sync_record_is_synthetic_turn_summary(record: &Value) -> bool {
+    let record_kind = agent_chat_session_sync_normalize_kind_token(
+        &cloud_mcp_payload_text(record, &["record_kind", "recordKind"]).unwrap_or_default(),
+    );
+    let synthetic = record
+        .get("source_cursor")
+        .or_else(|| record.get("sourceCursor"))
+        .and_then(|cursor| cursor.get("synthetic"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    record_kind == "turn_summary" && synthetic
+}
+
+fn agent_chat_session_sync_base_mode(
+    changed_record_count: usize,
+    changed_native_record_count: usize,
+    total_record_count: usize,
+) -> &'static str {
+    if changed_record_count == 0 {
+        "metadata"
+    } else if changed_native_record_count > 0 && total_record_count == changed_native_record_count {
+        "snapshot"
+    } else {
+        "delta"
+    }
+}
+
 fn agent_chat_session_sync_reason_forces_metadata_probe(reason: &str) -> bool {
     matches!(
         reason,
@@ -2381,6 +3276,21 @@ fn agent_chat_session_sync_payloads(
         &device_id,
         &workspace_id,
     )?;
+    if let Some(summary) = context.turn_summary.as_ref() {
+        let acked = agent_chat_session_sync_acked_record_hashes(
+            &scope_key,
+            &device_id,
+            &workspace_id,
+            &source.provider,
+            &source.session_id,
+        );
+        agent_chat_session_sync_apply_turn_summary(&mut source, summary, &acked);
+    }
+    agent_chat_session_sync_merge_cached_turn_summary_messages(
+        &source.provider,
+        &source.session_id,
+        &mut source.thread_detail_messages,
+    );
     let mut model_config = source.model_config.clone();
     if !context.model_id.trim().is_empty() {
         let model_id = if source.model_id.trim().is_empty() {
@@ -2456,19 +3366,23 @@ fn agent_chat_session_sync_payloads(
         return Ok(Vec::new());
     }
     let changed_record_count = source.records.len();
+    let changed_native_record_count = source
+        .records
+        .iter()
+        .filter(|record| !agent_chat_session_sync_record_is_synthetic_turn_summary(record))
+        .count();
     let chunks = if changed_record_count == 0 {
         vec![Vec::new()]
     } else {
         agent_chat_session_sync_record_chunks(std::mem::take(&mut source.records))
     };
     let total_packet_count = chunks.len().max(1);
-    let base_mode = if changed_record_count == 0 {
-        "metadata".to_string()
-    } else if source.total_record_count == changed_record_count {
-        "snapshot".to_string()
-    } else {
-        "delta".to_string()
-    };
+    let base_mode = agent_chat_session_sync_base_mode(
+        changed_record_count,
+        changed_native_record_count,
+        source.total_record_count,
+    )
+    .to_string();
     let mut payloads = Vec::new();
     let mut packet_record_offset = 0usize;
     for (packet_index, packet_records) in chunks.into_iter().enumerate() {
@@ -2884,6 +3798,7 @@ fn agent_chat_session_sync_spawn_from_history_record(
         shared_history_id: record.shared_history_id.clone(),
         fork_from_provider_session_id: record.fork_from_provider_session_id.clone(),
         metadata_only: false,
+        turn_summary: None,
     };
     agent_chat_session_sync_spawn(
         app,
@@ -3323,6 +4238,7 @@ fn agent_chat_session_sync_spawn_from_payload_repair(
         )
         .unwrap_or_default(),
         metadata_only: false,
+        turn_summary: None,
     };
     agent_chat_session_sync_spawn(app, provider, provider_session_id, cwd, context, reason);
     true
@@ -3386,6 +4302,57 @@ mod agent_chat_session_sync_tests {
     }
 
     #[test]
+    fn agent_chat_session_sync_detects_synthetic_turn_summary_records() {
+        assert!(agent_chat_session_sync_record_is_synthetic_turn_summary(
+            &json!({
+                "record_kind": "turn_summary",
+                "source_cursor": { "synthetic": true }
+            })
+        ));
+        assert!(!agent_chat_session_sync_record_is_synthetic_turn_summary(
+            &json!({
+                "record_kind": "response_item",
+                "source_cursor": { "synthetic": false }
+            })
+        ));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_base_mode_ignores_synthetic_turn_summary_for_snapshot() {
+        assert_eq!(agent_chat_session_sync_base_mode(0, 0, 2), "metadata");
+        assert_eq!(agent_chat_session_sync_base_mode(1, 0, 0), "delta");
+        assert_eq!(agent_chat_session_sync_base_mode(2, 1, 2), "delta");
+        assert_eq!(agent_chat_session_sync_base_mode(3, 2, 2), "snapshot");
+    }
+
+    #[test]
+    fn agent_chat_session_sync_turn_summary_cache_evicts_old_sessions() {
+        let _guard = agent_chat_session_sync_test_lock();
+        agent_chat_session_sync_clear_turn_summary_cache();
+        for index in 0..=AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE_SESSION_MAX {
+            agent_chat_session_sync_put_turn_summary_cache(
+                "codex",
+                &format!("session-{index}"),
+                "turn-a",
+                json!({ "id": format!("summary-{index}") }),
+            );
+        }
+
+        assert!(agent_chat_session_sync_cached_turn_summary_message(
+            "codex",
+            "session-0",
+            "turn-a"
+        )
+        .is_none());
+        assert!(agent_chat_session_sync_cached_turn_summary_message(
+            "codex",
+            &format!("session-{AGENT_CHAT_SESSION_SYNC_TURN_SUMMARY_CACHE_SESSION_MAX}"),
+            "turn-a"
+        )
+        .is_some());
+    }
+
+    #[test]
     fn agent_chat_session_sync_tool_output_error_sets_status() {
         let message = agent_chat_session_sync_message_value(CodexThreadTranscriptMessage {
             id: "tool-output-1".to_string(),
@@ -3438,6 +4405,78 @@ mod agent_chat_session_sync_tests {
         assert_eq!(message["tool"]["input"], json!({ "path": "src/lib.rs" }));
         assert_eq!(message["tool"]["status"], json!("running"));
         assert_eq!(message["usage"]["input_tokens"], json!(12));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_message_value_emits_subagent_id_alias() {
+        let message = agent_chat_session_sync_message_value(CodexThreadTranscriptMessage {
+            id: "subagent-message".to_string(),
+            role: "activity".to_string(),
+            kind: "subagent".to_string(),
+            text: "Worker".to_string(),
+            title: "Worker".to_string(),
+            created_at: "2026-07-02T00:00:00Z".to_string(),
+            source: "codex".to_string(),
+            subagent_id: "worker-a".to_string(),
+            subagent: Some(json!({ "subagentId": "worker-a", "title": "Worker" })),
+            artifacts: Vec::new(),
+            ..Default::default()
+        });
+
+        assert_eq!(message["subagentId"], json!("worker-a"));
+        assert_eq!(message["subagent_id"], json!("worker-a"));
+        assert_eq!(message["subagent"]["subagentId"], json!("worker-a"));
+        assert_eq!(message["subagent"]["subagent_id"], json!("worker-a"));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_claude_mainline_parent_uuid_stays_mainline() {
+        let mut sidechains = TranscriptClaudeSidechainTracker::default();
+        let value = json!({
+            "type": "assistant",
+            "uuid": "row-assistant",
+            "parentUuid": "row-user",
+            "isSidechain": false,
+            "sessionId": "claude-session",
+            "cwd": "/tmp/project",
+            "timestamp": "2026-07-02T00:00:01Z",
+            "message": {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "mainline answer"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu-read",
+                        "name": "Read",
+                        "input": {"file_path": "src/main.rs"}
+                    }
+                ]
+            }
+        });
+        let messages = agent_chat_session_sync_messages_value(
+            agent_chat_session_sync_claude_messages_for_line(
+                0,
+                "2026-07-02T00:00:01Z",
+                &value,
+                &mut sidechains,
+            ),
+        );
+
+        let assistant = messages
+            .iter()
+            .find(|message| message["text"] == json!("mainline answer"))
+            .expect("assistant message");
+        let tool = messages
+            .iter()
+            .find(|message| message["call_id"] == json!("toolu-read"))
+            .expect("tool call");
+
+        assert_eq!(assistant["kind"], json!("assistant_message"));
+        assert!(assistant.get("subagent").is_none());
+        assert!(assistant.get("subagent_id").is_none());
+        assert_eq!(tool["kind"], json!("tool_call"));
+        assert!(tool.get("subagent").is_none());
+        assert!(tool.get("subagent_id").is_none());
     }
 
     #[test]
@@ -3501,9 +4540,453 @@ mod agent_chat_session_sync_tests {
 
         assert_eq!(AGENT_CHAT_SESSION_SYNC_PARSER_SCHEMA_VERSION, 3);
         assert_eq!(AGENT_CHAT_SESSION_SYNC_RECORD_KEY_VERSION, 2);
-        assert_eq!(AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION, 2);
+        assert_eq!(AGENT_CHAT_SESSION_SYNC_RECORD_HASH_SCHEMA_VERSION, 3);
         assert_eq!(record["parserSchemaVersion"], json!(3));
         assert_eq!(record["recordHash"], json!(expected_hash));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_turn_summary_record_shape_and_identity_are_stable() {
+        let _guard = agent_chat_session_sync_test_lock();
+        agent_chat_session_sync_clear_turn_summary_cache();
+        let mut source = AgentChatSessionSyncSource {
+            provider: "codex".to_string(),
+            source_kind: "codex_jsonl".to_string(),
+            source_path: "/tmp/session.jsonl".to_string(),
+            session_id: "session-a".to_string(),
+            title: "Session A".to_string(),
+            cwd: "/tmp/workspace-a".to_string(),
+            latest_timestamp: "2026-07-02T00:00:00.000Z".to_string(),
+            model_id: "gpt-5.5".to_string(),
+            model_config: json!({}),
+            records: Vec::new(),
+            thread_detail_messages: vec![
+                json!({
+                    "id": "assistant-1",
+                    "role": "assistant",
+                    "kind": "assistant_message",
+                    "created_at": "2026-07-02T00:00:01.000Z",
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 4,
+                        "cache_read_tokens": 2,
+                        "cost_usd": 0.03
+                    }
+                }),
+                json!({
+                    "id": "tool-1",
+                    "role": "activity",
+                    "kind": "tool_call",
+                    "created_at": "2026-07-02T00:00:02.000Z",
+                    "usage": {
+                        "input_tokens": "5",
+                        "output_tokens": 1,
+                        "cache_write_tokens": 3,
+                        "cost_usd": "0.02"
+                    }
+                }),
+            ],
+            total_record_count: 2,
+        };
+        let summary = AgentChatTurnSummaryContext {
+            turn_id: "turn-a".to_string(),
+            turn_key: "turn-a".to_string(),
+            started_at: "2026-07-02T00:00:00.000Z".to_string(),
+            completed_at: "2026-07-02T00:00:03.000Z".to_string(),
+            duration_ms: Some(3000),
+            raw: json!({
+                "hook": { "turn_key": "turn-a", "completed_at": "2026-07-02T00:00:03.000Z" },
+                "git": { "numstat": "2\t1\tsrc/lib.rs\n" }
+            }),
+            file_change: Some(json!({
+                "files": [
+                    { "path": "src/lib.rs", "kind": "edit", "additions": 2, "deletions": 1 }
+                ],
+                "summary": "1 file changed (+2 -1)"
+            })),
+        };
+
+        agent_chat_session_sync_apply_turn_summary(&mut source, &summary, &HashMap::new());
+
+        assert_eq!(source.records.len(), 1);
+        let record = &source.records[0];
+        assert_eq!(
+            record["record_key"],
+            json!("turn-summary:codex:session-a:turn-a")
+        );
+        assert_eq!(
+            record["recordKey"],
+            json!("turn-summary:codex:session-a:turn-a")
+        );
+        assert_eq!(record["recordKind"], json!("turn_summary"));
+        assert_eq!(record["source_cursor"]["synthetic"], json!(true));
+        assert_eq!(record["source_cursor"]["turn_key"], json!("turn-a"));
+        assert_eq!(record["sourceCursor"]["turnKey"], json!("turn-a"));
+        assert_eq!(record["messages"].as_array().unwrap().len(), 1);
+        let message = &record["messages"][0];
+        assert_eq!(message["id"], json!("turn-summary:codex:session-a:turn-a"));
+        assert_eq!(message["role"], json!("system"));
+        assert_eq!(message["kind"], json!("turn_summary"));
+        assert_eq!(message["turn_id"], json!("turn-a"));
+        assert_eq!(message["turnId"], json!("turn-a"));
+        assert_eq!(message["duration_ms"], json!(3000));
+        assert_eq!(message["durationMs"], json!(3000));
+        assert_eq!(message["usage"]["input_tokens"], json!(15));
+        assert_eq!(message["usage"]["output_tokens"], json!(5));
+        assert_eq!(message["usage"]["cache_read_tokens"], json!(2));
+        assert_eq!(message["usage"]["cache_write_tokens"], json!(3));
+        assert_eq!(
+            message["file_change"]["files"][0]["path"],
+            json!("src/lib.rs")
+        );
+        assert_eq!(
+            message["fileChange"]["files"][0]["path"],
+            json!("src/lib.rs")
+        );
+        assert_eq!(
+            source.thread_detail_messages.last().unwrap()["kind"],
+            json!("turn_summary")
+        );
+        let detail = agent_chat_session_sync_thread_detail(
+            &source,
+            &AgentChatSessionSyncContext::default(),
+            "gpt-5.5",
+            &json!({}),
+        );
+        assert_eq!(detail["stats"]["usage"]["input_tokens"], json!(15));
+        assert_eq!(detail["stats"]["usage"]["output_tokens"], json!(5));
+
+        let recaptured = AgentChatTurnSummaryContext {
+            raw: json!({
+                "hook": { "turn_key": "turn-a", "completed_at": "2026-07-02T00:00:03.000Z", "recapture": true },
+                "git": { "numstat": "3\t1\tsrc/lib.rs\n" }
+            }),
+            ..summary
+        };
+        let message = agent_chat_session_sync_turn_summary_message(
+            "codex",
+            "session-a",
+            &recaptured,
+            json!({}),
+        );
+        let recaptured_record = agent_chat_session_sync_turn_summary_record(
+            &HashMap::new(),
+            "codex",
+            "session-a",
+            &recaptured,
+            message,
+        )
+        .expect("recaptured record");
+        assert_eq!(recaptured_record["record_key"], record["record_key"]);
+        assert_eq!(recaptured_record["recordKey"], record["recordKey"]);
+        assert_eq!(
+            recaptured_record["messages"][0]["id"],
+            record["messages"][0]["id"]
+        );
+        assert_ne!(recaptured_record["record_hash"], record["record_hash"]);
+    }
+
+    #[test]
+    fn agent_chat_session_sync_cached_turn_summary_survives_projection_rebuild() {
+        let _guard = agent_chat_session_sync_test_lock();
+        agent_chat_session_sync_clear_turn_summary_cache();
+        let mut source = AgentChatSessionSyncSource {
+            provider: "codex".to_string(),
+            source_kind: "codex_jsonl".to_string(),
+            source_path: "/tmp/session.jsonl".to_string(),
+            session_id: "session-cache".to_string(),
+            title: "Session cache".to_string(),
+            cwd: "/tmp/workspace-a".to_string(),
+            latest_timestamp: "2026-07-02T00:00:00.000Z".to_string(),
+            model_id: "gpt-5.5".to_string(),
+            model_config: json!({}),
+            records: Vec::new(),
+            thread_detail_messages: vec![json!({
+                "id": "assistant-cache",
+                "role": "assistant",
+                "kind": "assistant_message",
+                "turn_id": "turn-cache",
+                "created_at": "2026-07-02T00:00:01.000Z",
+            })],
+            total_record_count: 1,
+        };
+        let summary = AgentChatTurnSummaryContext {
+            turn_id: "turn-cache".to_string(),
+            turn_key: "turn-cache".to_string(),
+            started_at: "2026-07-02T00:00:00.000Z".to_string(),
+            completed_at: "2026-07-02T00:00:03.000Z".to_string(),
+            duration_ms: Some(3000),
+            raw: json!({"hook": {"turn_key": "turn-cache"}, "git": {"numstat": ""}}),
+            file_change: None,
+        };
+
+        agent_chat_session_sync_apply_turn_summary(&mut source, &summary, &HashMap::new());
+        let rebuilt_source = AgentChatSessionSyncSource {
+            records: Vec::new(),
+            thread_detail_messages: vec![json!({
+                "id": "assistant-cache",
+                "role": "assistant",
+                "kind": "assistant_message",
+                "turn_id": "turn-cache",
+                "created_at": "2026-07-02T00:00:01.000Z",
+            })],
+            total_record_count: 1,
+            ..source
+        };
+
+        let detail = agent_chat_session_sync_thread_detail(
+            &rebuilt_source,
+            &AgentChatSessionSyncContext::default(),
+            "gpt-5.5",
+            &json!({}),
+        );
+        assert!(detail["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|message| message["kind"] == json!("turn_summary")));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_duplicate_skipped_summary_keeps_file_change_record() {
+        let _guard = agent_chat_session_sync_test_lock();
+        agent_chat_session_sync_clear_turn_summary_cache();
+        let mut source = AgentChatSessionSyncSource {
+            provider: "codex".to_string(),
+            source_kind: "codex_jsonl".to_string(),
+            source_path: "/tmp/session.jsonl".to_string(),
+            session_id: "session-duplicate".to_string(),
+            title: "Session duplicate".to_string(),
+            cwd: "/tmp/workspace-a".to_string(),
+            latest_timestamp: "2026-07-02T00:00:00.000Z".to_string(),
+            model_id: "gpt-5.5".to_string(),
+            model_config: json!({}),
+            records: Vec::new(),
+            thread_detail_messages: Vec::new(),
+            total_record_count: 0,
+        };
+        let successful = AgentChatTurnSummaryContext {
+            turn_id: "turn-duplicate".to_string(),
+            turn_key: "turn-duplicate".to_string(),
+            started_at: "2026-07-02T00:00:00.000Z".to_string(),
+            completed_at: "2026-07-02T00:00:03.000Z".to_string(),
+            duration_ms: Some(3000),
+            raw: json!({"hook": {"turn_key": "turn-duplicate"}, "git": {"numstat": "1\t0\tsrc/lib.rs\n"}}),
+            file_change: Some(json!({
+                "files": [{ "path": "src/lib.rs", "kind": "edit", "additions": 1, "deletions": 0 }],
+                "summary": "1 file changed (+1 -0)"
+            })),
+        };
+        agent_chat_session_sync_apply_turn_summary(&mut source, &successful, &HashMap::new());
+        let record_before = source.records[0].clone();
+        let skipped = AgentChatTurnSummaryContext {
+            raw: json!({"hook": {"turn_key": "turn-duplicate"}, "git": {"skipped": "missing_start_snapshot"}}),
+            file_change: None,
+            ..successful
+        };
+
+        agent_chat_session_sync_apply_turn_summary(&mut source, &skipped, &HashMap::new());
+
+        assert_eq!(source.records.len(), 1);
+        assert_eq!(source.records[0], record_before);
+        assert!(source
+            .thread_detail_messages
+            .iter()
+            .any(agent_chat_session_sync_message_has_file_change));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_turn_summary_hash_includes_computed_usage() {
+        let _guard = agent_chat_session_sync_test_lock();
+        agent_chat_session_sync_clear_turn_summary_cache();
+        let summary = AgentChatTurnSummaryContext {
+            turn_id: "turn-usage".to_string(),
+            turn_key: "turn-usage".to_string(),
+            started_at: "2026-07-02T00:00:00.000Z".to_string(),
+            completed_at: "2026-07-02T00:00:03.000Z".to_string(),
+            duration_ms: Some(3000),
+            raw: json!({"hook": {"turn_key": "turn-usage"}, "git": {"numstat": ""}}),
+            file_change: None,
+        };
+        let message_a = agent_chat_session_sync_turn_summary_message(
+            "codex",
+            "session-usage",
+            &summary,
+            json!({"input_tokens": 10}),
+        );
+        let record_a = agent_chat_session_sync_turn_summary_record(
+            &HashMap::new(),
+            "codex",
+            "session-usage",
+            &summary,
+            message_a.clone(),
+        )
+        .unwrap();
+        let record_b = agent_chat_session_sync_turn_summary_record(
+            &HashMap::new(),
+            "codex",
+            "session-usage",
+            &summary,
+            message_a,
+        )
+        .unwrap();
+        let message_c = agent_chat_session_sync_turn_summary_message(
+            "codex",
+            "session-usage",
+            &summary,
+            json!({"input_tokens": 11}),
+        );
+        let record_c = agent_chat_session_sync_turn_summary_record(
+            &HashMap::new(),
+            "codex",
+            "session-usage",
+            &summary,
+            message_c,
+        )
+        .unwrap();
+
+        assert_eq!(record_a["record_hash"], record_b["record_hash"]);
+        assert_ne!(record_a["record_hash"], record_c["record_hash"]);
+        assert_eq!(record_c["raw"]["computed_usage"]["input_tokens"], json!(11));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_turn_usage_rollup_sums_matching_turn_window() {
+        let messages = vec![
+            json!({
+                "id": "m1",
+                "turn_id": "turn-a",
+                "created_at": "2026-07-02T00:00:01.000Z",
+                "usage": {
+                    "input_tokens": 4,
+                    "output_tokens": 2,
+                    "cache_read_tokens": 1,
+                    "cost_usd": 0.01
+                }
+            }),
+            json!({
+                "id": "m2",
+                "turn_id": "turn-a",
+                "created_at": "2026-07-02T00:00:02.000Z",
+                "usage": {
+                    "inputTokens": "6",
+                    "outputTokens": 3,
+                    "cacheWriteTokens": 2,
+                    "costUsd": "0.04"
+                }
+            }),
+            json!({
+                "id": "m3",
+                "turn_id": "turn-b",
+                "created_at": "2026-07-02T00:00:02.500Z",
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 100
+                }
+            }),
+        ];
+
+        let usage = agent_chat_session_sync_turn_usage_rollup(
+            &messages,
+            "turn-a",
+            "2026-07-02T00:00:00.000Z",
+            "2026-07-02T00:00:03.000Z",
+        );
+
+        assert_eq!(usage["input_tokens"], json!(10));
+        assert_eq!(usage["output_tokens"], json!(5));
+        assert_eq!(usage["cache_read_tokens"], json!(1));
+        assert_eq!(usage["cache_write_tokens"], json!(2));
+        assert_eq!(usage["cost_usd"], json!(0.05));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_turn_usage_rollup_deltas_cumulative_codex_counts() {
+        let messages = vec![
+            json!({
+                "id": "before",
+                "created_at": "2026-07-02T00:00:00.000Z",
+                "usage": {
+                    "input_tokens": 10,
+                    "output_tokens": 4,
+                    "cache_read_tokens": 2,
+                    "cumulative": true
+                }
+            }),
+            json!({
+                "id": "turn-a-count",
+                "created_at": "2026-07-02T00:00:01.000Z",
+                "usage": {
+                    "input_tokens": 18,
+                    "output_tokens": 7,
+                    "cache_read_tokens": 5,
+                    "cumulative": true
+                }
+            }),
+            json!({
+                "id": "turn-b-count",
+                "created_at": "2026-07-02T00:00:03.000Z",
+                "usage": {
+                    "input_tokens": 25,
+                    "output_tokens": 10,
+                    "cache_read_tokens": 8,
+                    "cumulative": true
+                }
+            }),
+        ];
+
+        let turn_a = agent_chat_session_sync_turn_usage_rollup(
+            &messages,
+            "",
+            "2026-07-02T00:00:00.500Z",
+            "2026-07-02T00:00:01.500Z",
+        );
+        let turn_b = agent_chat_session_sync_turn_usage_rollup(
+            &messages,
+            "",
+            "2026-07-02T00:00:02.000Z",
+            "2026-07-02T00:00:04.000Z",
+        );
+        let thread = agent_chat_session_sync_thread_usage_rollup(&messages);
+
+        assert_eq!(turn_a["input_tokens"], json!(8));
+        assert_eq!(turn_a["output_tokens"], json!(3));
+        assert_eq!(turn_a["cache_read_tokens"], json!(3));
+        assert_eq!(turn_b["input_tokens"], json!(7));
+        assert_eq!(turn_b["output_tokens"], json!(3));
+        assert_eq!(turn_b["cache_read_tokens"], json!(3));
+        assert_eq!(thread["input_tokens"], json!(25));
+        assert_eq!(thread["output_tokens"], json!(10));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_turn_usage_rollup_orders_fractional_timestamps() {
+        let messages = vec![
+            json!({
+                "id": "start",
+                "created_at": "2026-07-02T00:00:00Z",
+                "usage": { "input_tokens": 1 }
+            }),
+            json!({
+                "id": "half",
+                "created_at": "2026-07-02T00:00:00.500Z",
+                "usage": { "input_tokens": 2 }
+            }),
+            json!({
+                "id": "after",
+                "created_at": "2026-07-02T00:00:00.501Z",
+                "usage": { "input_tokens": 100 }
+            }),
+        ];
+
+        let usage = agent_chat_session_sync_turn_usage_rollup(
+            &messages,
+            "",
+            "2026-07-02T00:00:00Z",
+            "2026-07-02T00:00:00.500Z",
+        );
+
+        assert_eq!(usage["input_tokens"], json!(3));
     }
 
     #[test]
@@ -3522,7 +5005,7 @@ mod agent_chat_session_sync_tests {
             provider: "codex".to_string(),
             source_kind: "jsonl".to_string(),
             source_path: "/tmp/session.jsonl".to_string(),
-            session_id: "session-a".to_string(),
+            session_id: "session-bigview".to_string(),
             title: "Session A".to_string(),
             cwd: "/tmp/workspace-a".to_string(),
             latest_timestamp: "2026-06-30T00:00:00Z".to_string(),
@@ -3621,6 +5104,73 @@ mod agent_chat_session_sync_tests {
         );
         assert_eq!(detail["stats"]["additions"], json!(2));
         assert_eq!(detail["stats"]["deletions"], json!(1));
+    }
+
+    #[test]
+    fn agent_chat_session_sync_thread_detail_prefers_turn_summary_file_change_once() {
+        let source = AgentChatSessionSyncSource {
+            provider: "claude".to_string(),
+            source_kind: "claude_jsonl".to_string(),
+            source_path: "/tmp/claude.jsonl".to_string(),
+            session_id: "session-a".to_string(),
+            title: "Session A".to_string(),
+            cwd: "/tmp/workspace-a".to_string(),
+            latest_timestamp: "2026-06-30T00:00:00Z".to_string(),
+            model_id: "claude-sonnet".to_string(),
+            model_config: json!({}),
+            records: Vec::new(),
+            thread_detail_messages: vec![
+                json!({
+                    "id": "native-edit",
+                    "role": "activity",
+                    "kind": "file_change",
+                    "legacy_kind": "patch",
+                    "created_at": "2026-06-30T00:00:10Z",
+                    "file_change": {
+                        "files": [
+                            { "path": "src/lib.rs", "kind": "edit", "additions": 2, "deletions": 1 }
+                        ],
+                        "summary": "native edit"
+                    }
+                }),
+                json!({
+                    "id": "summary-edit",
+                    "role": "system",
+                    "kind": "turn-summary",
+                    "turn_id": "turn-1",
+                    "started_at": "2026-06-30T00:00:00Z",
+                    "completed_at": "2026-06-30T00:00:30Z",
+                    "file_change": {
+                        "files": [
+                            { "path": "src/lib.rs", "kind": "edit", "additions": 2, "deletions": 1 }
+                        ],
+                        "summary": "summary edit"
+                    }
+                }),
+            ],
+            total_record_count: 2,
+        };
+
+        let detail = agent_chat_session_sync_thread_detail(
+            &source,
+            &AgentChatSessionSyncContext::default(),
+            "claude-sonnet",
+            &json!({}),
+        );
+        let items = detail["items"].as_array().expect("items");
+
+        assert_eq!(detail["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(detail["diffSummaries"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            detail["diffSummaries"][0]["messageId"],
+            json!("summary-edit")
+        );
+        assert_eq!(detail["stats"]["fileCount"], json!(1));
+        assert_eq!(detail["stats"]["additions"], json!(2));
+        assert_eq!(detail["stats"]["deletions"], json!(1));
+        assert!(!items
+            .iter()
+            .any(|item| item["id"].as_str() == Some("summary-edit")));
     }
 
     #[test]
